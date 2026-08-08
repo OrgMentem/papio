@@ -11,6 +11,21 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Added
+
+- **An agent skill (`SKILL.md`) that drives the CLI directly.** MCP was the only
+  documented way to hand *papio* to a coding agent, which put a server between
+  the agent and a CLI it can already run. The repo now ships a single root
+  `SKILL.md` — installable with `npx skills add OrgMentem/papio` or by copying
+  it into an agent's skill store — covering the acquisition loop, the `--json`
+  envelope, and the gotchas that actually bite an agent (a human gate is an
+  outcome, not an error; never drain the handoff queue; `--accept` is an
+  assertion; `zotio apply` needs the plan's exact digest). `papio mcp` is
+  unchanged and stays the path for hosts that cannot run commands.
+  `TestSkillInvocationsResolve` pins every command and flag the skill claims to
+  the live cobra tree, so it cannot drift into telling an agent to run something
+  that no longer exists.
+
 ### Changed
 
 - **Dependency: `golang.org/x/net` 0.54.0 -> 0.55.0** (GHSA-5cv4-jp36-h3mw,

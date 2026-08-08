@@ -230,11 +230,29 @@ the whole hand-off
 ## Built for agents
 
 `papio` is designed to be driven by a coding agent as naturally as by a human
-([MCP agent guide](https://orgmentem.github.io/papio/guide/agent-skill/)):
+([agent guide](https://orgmentem.github.io/papio/guide/agent-skill/)). Two
+surfaces, in preference order:
 
-- **`--json`** on any command for structured output.
-- **`papio mcp`** serves an MCP server with the same configuration,
-  background service, jobs, and zotio boundary as the CLI.
+**1. The CLI, through the agent skill.** A single
+[`SKILL.md`](SKILL.md) teaches an agent to run `papio` directly — the efficient
+path, with no server in the middle:
+
+```bash
+npx skills add OrgMentem/papio   # Claude Code, Cursor, Codex, Cline, opencode, …
+```
+
+- **`--json`** on any command for structured output. One contract everywhere: a
+  list payload is always `{"<name>": [...], "truncated": bool}`, never a bare
+  array; single-record commands return the object directly.
+- **Introspectable** — `papio --help`, `papio <command> --help`, and
+  `papio doctor --json` let an agent discover the surface at runtime instead of
+  hard-coding it.
+- **Every human gate is explicit** — `awaiting_human` and `needs_review` are
+  reportable outcomes, not errors to retry past.
+
+**2. `papio mcp`, for hosts that speak MCP rather than shell.** Same
+configuration, background service, jobs, and zotio boundary as the CLI:
+
 - **A command facade** derived from the CLI, so agents reach the whole tool
   surface through two tools without a parallel layer that can drift:
   `papio_command_search` to discover commands and `papio_command_run` to
@@ -246,16 +264,15 @@ the whole hand-off
 - **Read resources** — `papio://jobs`, `papio://artifacts`, `papio://bundles`,
   `papio://zotio/plans`, `papio://exports` — expose recent saved state
   without creating jobs or mutating anything.
-- **One writer into Zotero.** `papio_command_run` with `zotio apply` is the only
-  path that writes to Zotero, and it demands the exact confirmation SHA-256 from
-  `zotio plan`.
-
-Register it in an MCP host:
 
 ```bash
 # Claude Code
 claude mcp add papio -- papio mcp
 ```
+
+**One writer into Zotero, on both surfaces.** `papio zotio apply` is the only
+path that writes to Zotero, and it demands the exact confirmation SHA-256 from
+`papio zotio plan`.
 
 ---
 

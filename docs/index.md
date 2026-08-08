@@ -52,7 +52,7 @@ New here? Start with the [user guide](guide/user-guide.md), then tune policy in 
 - **[Getting started](guide/getting-started.md)** — prerequisites, `papio init`, and your first acquisition end to end.
 - **[User guide](guide/user-guide.md)** — the research workflow: discover, acquire in batches, follow jobs, complete a browser pass, and resolve identity reviews.
 - **[Filing: Zotero, papis & more](guide/hooks.md)** — where validated PDFs are offered: the zotio/Zotero preview boundary, and the best-effort `on_ready` hook for papis, Calibre, a plain folder, or your own script.
-- **[Use in a coding agent](guide/agent-skill.md)** — drive *papio* over MCP (`papio mcp`): the canonical acquisition loop and its safety semantics.
+- **[Use in a coding agent](guide/agent-skill.md)** — drive *papio* from an agent: the `SKILL.md` that runs the CLI directly (preferred), `papio mcp` for MCP-only hosts, the canonical acquisition loop, and its safety semantics.
 - **[Access modes & safety](concepts/access-modes.md)** — `conservative` / `assisted` / `delegated` and the non-negotiable product and safety boundaries.
 - **[Acquisition pipeline](concepts/acquisition-pipeline.md)** — the order *papio* tries sources, how candidates are ranked, job states, and download limits.
 - **[Browser handoff](concepts/browser-handoff.md)** — the ordinary-browser extension, its local connector, the minimized work window, and why *papio* never uses an automated browser.

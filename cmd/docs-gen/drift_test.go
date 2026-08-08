@@ -2,11 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
+
+	"papio/internal/cli"
 )
 
 // The repo guards code against code well: TestTerminalReasonVocabularyIsExhaustive
@@ -251,4 +256,126 @@ func TestInternalDocLinksResolve(t *testing.T) {
 	if checked == 0 {
 		t.Fatal("checked no internal links — the guard would pass vacuously")
 	}
+}
+
+// TestSkillInvocationsResolve pins SKILL.md — the root agent skill that teaches
+// a coding agent to drive the CLI directly — to the live cobra tree. The skill
+// is the one page an agent reads INSTEAD of the docs site, so a renamed command
+// or dropped flag there is not a stale sentence: it is an agent confidently
+// running something that no longer exists. commands.md cannot cover this
+// because SKILL.md lives outside docs/ and is never generated.
+//
+// It checks what it can resolve — every `papio …` invocation, plus every inline
+// span opening with a top-level command name — and treats anything else as
+// prose. Placeholders (`<job-id>`) and values are arguments, not commands.
+func TestSkillInvocationsResolve(t *testing.T) {
+	root := cli.NewRoot(io.Discard, io.Discard)
+	invocations := skillInvocations(mustRead(t, "SKILL.md"), root)
+	if len(invocations) == 0 {
+		t.Fatal("parsed no command invocations from SKILL.md — the guard would pass vacuously")
+	}
+
+	for _, tokens := range invocations {
+		cmd := root
+		for _, token := range tokens {
+			if !strings.HasPrefix(token, "-") {
+				if child := skillChild(cmd, token); child != nil {
+					cmd = child
+				}
+				continue
+			}
+			for _, flag := range strings.FieldsFunc(token, func(r rune) bool { return r == '|' || r == '/' }) {
+				if name, ok := skillFlagName(flag); ok && !skillHasFlag(cmd, name) {
+					t.Errorf("SKILL.md runs %q, but `%s` accepts no %s flag",
+						strings.Join(tokens, " "), cmd.CommandPath(), flag)
+				}
+			}
+		}
+	}
+}
+
+var (
+	skillFence = regexp.MustCompile("(?s)```[a-z]*\n(.*?)```")
+	skillSpan  = regexp.MustCompile("`([^`\n]+)`")
+	skillQuote = regexp.MustCompile(`"[^"]*"|'[^']*'`)
+)
+
+// skillInvocations returns the tokenized command lines SKILL.md claims are
+// runnable: fenced-block lines and inline spans that start with `papio` or with
+// one of its top-level command names. Frontmatter is skipped — its trigger
+// phrases are natural language that happens to share words with commands.
+func skillInvocations(body string, root *cobra.Command) [][]string {
+	if strings.HasPrefix(body, "---\n") {
+		if end := strings.Index(body[4:], "\n---\n"); end >= 0 {
+			body = body[4+end+5:]
+		}
+	}
+
+	candidates := make([]string, 0, 64)
+	for _, block := range skillFence.FindAllStringSubmatch(body, -1) {
+		candidates = append(candidates, strings.Split(block[1], "\n")...)
+	}
+	for _, span := range skillSpan.FindAllStringSubmatch(body, -1) {
+		candidates = append(candidates, span[1])
+	}
+
+	var invocations [][]string
+	for _, candidate := range candidates {
+		if i := strings.IndexByte(candidate, '#'); i >= 0 {
+			candidate = candidate[:i]
+		}
+		fields := strings.Fields(skillQuote.ReplaceAllString(candidate, "x"))
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "papio" {
+			fields = fields[1:]
+		} else if skillChild(root, fields[0]) == nil {
+			continue
+		}
+		tokens := make([]string, 0, len(fields))
+		for _, field := range fields {
+			field = strings.Trim(field, "[]().,")
+			if field == "" || field == "--" {
+				continue
+			}
+			tokens = append(tokens, field)
+		}
+		if len(tokens) > 0 {
+			invocations = append(invocations, tokens)
+		}
+	}
+	return invocations
+}
+
+func skillChild(cmd *cobra.Command, name string) *cobra.Command {
+	for _, child := range cmd.Commands() {
+		if child.Name() == name || child.HasAlias(name) {
+			return child
+		}
+	}
+	return nil
+}
+
+// skillFlagName reports the flag a token names, or ok=false when the token is
+// not a checkable flag (a bare `-`, or `--help`, which cobra installs lazily).
+func skillFlagName(token string) (string, bool) {
+	name := strings.TrimLeft(token, "-")
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+	}
+	if name == "" || name == "help" {
+		return "", false
+	}
+	return name, true
+}
+
+// skillHasFlag consults every set a real invocation could satisfy. LocalFlags
+// covers the command's own persistent flags — `Flags()` alone does not, which
+// would make the root's global `--json` and `--config` look unrecognized.
+func skillHasFlag(cmd *cobra.Command, name string) bool {
+	if len(name) == 1 {
+		return cmd.LocalFlags().ShorthandLookup(name) != nil || cmd.InheritedFlags().ShorthandLookup(name) != nil
+	}
+	return cmd.LocalFlags().Lookup(name) != nil || cmd.InheritedFlags().Lookup(name) != nil
 }

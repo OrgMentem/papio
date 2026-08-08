@@ -368,9 +368,9 @@ func renderLLMSIndex(pages []llmsPage) string {
 	b.WriteString("# papio\n\n")
 	b.WriteString("> A local paper-acquisition broker — searches scholarly works, creates acquisition jobs, validates candidate PDFs, and hands ready artifacts to Zotero through zotio.\n\n")
 	b.WriteString("For AI agents: papio is a local paper-acquisition broker. Fastest path:\n")
-	b.WriteString("1. Install: build `./cmd/papio` (see [Getting started](" + llmsSiteURL + "guide/getting-started/)); install Poppler and Tesseract for PDF validation.\n")
+	b.WriteString("1. Install: `brew install orgmentem/tap/papio`, a release archive, or build `./cmd/papio` (see [Getting started](" + llmsSiteURL + "guide/getting-started/)); install Poppler and Tesseract for PDF validation.\n")
 	b.WriteString("2. Initialize the local profile with `papio init`.\n")
-	b.WriteString("3. For MCP hosts, run `papio mcp`; its tools are `papio_*` (see [MCP tools](" + llmsSiteURL + "reference/mcp-tools/)).\n")
+	b.WriteString("3. Drive the CLI directly — `papio <command> --json`, discoverable with `papio --help` and `papio <command> --help`. The agent skill (https://github.com/OrgMentem/papio/blob/main/SKILL.md) packages this path; see [Use in a coding agent](" + llmsSiteURL + "guide/agent-skill/). Only for hosts that cannot run commands, run `papio mcp`; its tools are `papio_*` (see [MCP tools](" + llmsSiteURL + "reference/mcp-tools/)).\n")
 	b.WriteString("4. Check integration readiness with `papio doctor` after setup or configuration changes.\n\n")
 	b.WriteString("The complete documentation as one Markdown file: " + llmsSiteURL + "llms-full.txt\n\n")
 
@@ -393,7 +393,7 @@ func renderLLMSFull(pages []llmsPage) string {
 	var b strings.Builder
 	b.WriteString("# papio — full documentation\n\n")
 	b.WriteString("A local paper-acquisition broker. This file concatenates the complete docs as Markdown for AI agents. Source: " + llmsSiteURL + "\n")
-	b.WriteString("For the token-efficient path, start with the getting-started guide, then `papio init`, `papio mcp`, and `papio doctor` rather than consuming this whole file.\n")
+	b.WriteString("For the token-efficient path, start with the getting-started guide, then `papio init`, `papio <command> --json`, and `papio doctor` rather than consuming this whole file.\n")
 	for _, page := range pages {
 		b.WriteString("\n\n---\n\n> Source: " + page.url + "\n\n")
 		b.WriteString(page.body)

@@ -40,6 +40,16 @@ pymdownx **snippet includes** of `CHANGELOG.md` / `extension/CHANGELOG.md` — e
 changelogs, not the pages.
 Bump the pinned zensical version in `docs/requirements.txt` deliberately; CI installs from it.
 
+The root `SKILL.md` is the **published agent skill** — the CLI-first path a coding
+agent installs (`npx skills add OrgMentem/papio`), not an internal note, and not the
+same thing as `.agents/skills/*` (those are this repo's own working skills). It is
+outside `docs/`, so `docs/guide/agent-skill.md` links it by GitHub URL; a relative
+link would pass the on-disk link check and 404 on the site.
+`TestSkillInvocationsResolve` (`cmd/docs-gen/drift_test.go`) parses every `papio …`
+invocation in it — plus inline spans opening with a top-level command name — and
+resolves each command and flag against the live cobra tree, so renaming a command or
+dropping a flag fails there too.
+
 `dev/` is outside the site and never published. It is tiered by **lifetime**, not
 topic, because completed build plans otherwise pile up and drift back into `docs/`:
 

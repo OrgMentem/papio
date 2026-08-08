@@ -118,6 +118,33 @@ Install `zotio` and put it on your `PATH` when you want *papio* to import finish
 !!! note "Windows connector refresh"
     On Windows the connector is registered under the current-user registry (`HKCU\Software\{Google\Chrome,Mozilla}\NativeMessagingHosts`) and runs from a copy of the `papio` binary — rerun `papio init` after upgrading *papio* so that copy is refreshed. On macOS and Linux the connector is a symlink and needs no refresh.
 
+### The agent skill
+
+Optional, and only if you drive *papio* from a coding agent: a single
+[`SKILL.md`](https://github.com/OrgMentem/papio/blob/main/SKILL.md) in the repo
+teaches an agent to drive the CLI directly — the efficient path, with no MCP
+server in the middle.
+
+**Recommended — the [`skills` CLI](https://skills.sh)** (works across Claude Code,
+Cursor, Codex, Cline, opencode, and 40+ agents):
+
+```bash
+npx skills add OrgMentem/papio          # detect your agents and install
+npx skills add OrgMentem/papio --list   # preview without installing
+npx skills add OrgMentem/papio -g       # install globally (all projects)
+```
+
+**Manual:**
+
+- **Claude Code:** copy `SKILL.md` into `~/.claude/skills/papio/SKILL.md` (or your
+  project's `.claude/skills/papio/`).
+- **Any other agent:** point it at the raw file —
+  `https://raw.githubusercontent.com/OrgMentem/papio/main/SKILL.md` — or paste it
+  into your agent's skill store.
+
+See [Use in a coding agent](agent-skill.md) for how to drive it, and
+[MCP tools](../reference/mcp-tools.md) if your host speaks MCP instead of shell.
+
 ## 2. Initialize the local profile
 
 Run the guided first-run setup:
