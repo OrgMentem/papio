@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"papio/internal/cli"
 )
@@ -268,29 +269,94 @@ func TestInternalDocLinksResolve(t *testing.T) {
 // It checks what it can resolve — every `papio …` invocation, plus every inline
 // span opening with a top-level command name — and treats anything else as
 // prose. Placeholders (`<job-id>`) and values are arguments, not commands.
+// TestSkillFlagMentionsResolve covers the flags this walk cannot see.
 func TestSkillInvocationsResolve(t *testing.T) {
 	root := cli.NewRoot(io.Discard, io.Discard)
 	invocations := skillInvocations(mustRead(t, "SKILL.md"), root)
-	if len(invocations) == 0 {
-		t.Fatal("parsed no command invocations from SKILL.md — the guard would pass vacuously")
+	// A floor, not a presence check: a parser regression that quietly matched
+	// three lines instead of a hundred would otherwise keep passing.
+	if len(invocations) < 60 {
+		t.Fatalf("parsed only %d command invocations from SKILL.md — the parser, not the skill, "+
+			"is what shrank", len(invocations))
 	}
 
 	for _, tokens := range invocations {
 		cmd := root
 		for _, token := range tokens {
-			if !strings.HasPrefix(token, "-") {
-				if child := skillChild(cmd, token); child != nil {
-					cmd = child
+			parts := strings.Split(token, "|")
+			// `watch add|list|run|remove` names siblings: every alternative has
+			// to exist, and the walk continues under the first.
+			if len(parts) > 1 && skillAnyChild(cmd, parts) {
+				for _, part := range parts {
+					if skillChild(cmd, part) == nil {
+						t.Errorf("SKILL.md offers %q, but `%s` has no %s subcommand",
+							strings.Join(tokens, " "), cmd.CommandPath(), part)
+					}
+				}
+				if first := skillChild(cmd, parts[0]); first != nil {
+					cmd = first
 				}
 				continue
 			}
-			for _, flag := range strings.FieldsFunc(token, func(r rune) bool { return r == '|' || r == '/' }) {
-				if name, ok := skillFlagName(flag); ok && !skillHasFlag(cmd, name) {
-					t.Errorf("SKILL.md runs %q, but `%s` accepts no %s flag",
-						strings.Join(tokens, " "), cmd.CommandPath(), flag)
+			for _, part := range parts {
+				if !strings.HasPrefix(part, "-") {
+					if child := skillChild(cmd, part); child != nil {
+						cmd = child
+					}
+					continue
+				}
+				for _, flag := range strings.Split(part, "/") {
+					if name, ok := skillFlagName(flag); ok && !skillHasFlag(cmd, name) {
+						t.Errorf("SKILL.md runs %q, but `%s` accepts no %s flag",
+							strings.Join(tokens, " "), cmd.CommandPath(), flag)
+					}
 				}
 			}
 		}
+	}
+}
+
+// TestSkillFlagMentionsResolve checks the flags an invocation walk structurally
+// cannot: a Hero-capability bullet names its command once and then discusses
+// the flags in bare spans (`--limit`, `--oa-only`, `--desired-version`). Nearly
+// half the flag names in SKILL.md are mentioned that way, so without this the
+// skill's own promise — dropping a flag fails the build — held for the command
+// lines only. Each bullet's flags are checked against the commands that bullet
+// names; a bullet naming none falls back to "some papio command declares it",
+// which still catches a removed or renamed flag.
+func TestSkillFlagMentionsResolve(t *testing.T) {
+	root := cli.NewRoot(io.Discard, io.Discard)
+	known := skillKnownFlags(root)
+	checked := 0
+
+	for _, item := range skillListItems(mustRead(t, "SKILL.md")) {
+		contexts, orphans := skillBulletFlags(root, item)
+		for _, flag := range orphans {
+			name, ok := skillFlagName(flag)
+			if !ok {
+				continue
+			}
+			checked++
+			if len(contexts) == 0 {
+				if !known[name] {
+					t.Errorf("SKILL.md mentions %s, which no papio command declares: %q", flag, skillHead(item))
+				}
+				continue
+			}
+			accepted := false
+			paths := make([]string, 0, len(contexts))
+			for _, cmd := range contexts {
+				paths = append(paths, "`"+cmd.CommandPath()+"`")
+				accepted = accepted || skillHasFlag(cmd, name)
+			}
+			if !accepted {
+				t.Errorf("SKILL.md discusses %s under %q, but none of %s accepts it",
+					flag, skillHead(item), strings.Join(paths, ", "))
+			}
+		}
+	}
+	if checked < 20 {
+		t.Fatalf("checked only %d bare flag mentions — the bullet parser stopped matching", checked)
 	}
 }
 
@@ -305,11 +371,7 @@ var (
 // one of its top-level command names. Frontmatter is skipped — its trigger
 // phrases are natural language that happens to share words with commands.
 func skillInvocations(body string, root *cobra.Command) [][]string {
-	if strings.HasPrefix(body, "---\n") {
-		if end := strings.Index(body[4:], "\n---\n"); end >= 0 {
-			body = body[4+end+5:]
-		}
-	}
+	body = skillBody(body)
 
 	candidates := make([]string, 0, 64)
 	for _, block := range skillFence.FindAllStringSubmatch(body, -1) {
@@ -321,31 +383,52 @@ func skillInvocations(body string, root *cobra.Command) [][]string {
 
 	var invocations [][]string
 	for _, candidate := range candidates {
-		if i := strings.IndexByte(candidate, '#'); i >= 0 {
-			candidate = candidate[:i]
-		}
-		fields := strings.Fields(skillQuote.ReplaceAllString(candidate, "x"))
-		if len(fields) == 0 {
+		tokens := skillTokens(candidate)
+		if len(tokens) == 0 {
 			continue
 		}
-		if fields[0] == "papio" {
-			fields = fields[1:]
-		} else if skillChild(root, fields[0]) == nil {
+		if tokens[0] == "papio" {
+			tokens = tokens[1:]
+		} else if skillChild(root, tokens[0]) == nil {
 			continue
-		}
-		tokens := make([]string, 0, len(fields))
-		for _, field := range fields {
-			field = strings.Trim(field, "[]().,")
-			if field == "" || field == "--" {
-				continue
-			}
-			tokens = append(tokens, field)
 		}
 		if len(tokens) > 0 {
 			invocations = append(invocations, tokens)
 		}
 	}
 	return invocations
+}
+
+// skillBody drops the YAML frontmatter, whose trigger phrases are natural
+// language that happens to share words with commands ("watch for new papers").
+func skillBody(body string) string {
+	if !strings.HasPrefix(body, "---\n") {
+		return body
+	}
+	end := strings.Index(body[4:], "\n---\n")
+	if end < 0 {
+		return body
+	}
+	return body[4+end+5:]
+}
+
+// skillTokens normalizes one candidate command line: shell comment dropped,
+// quoted arguments collapsed, and Markdown's optionality brackets and sentence
+// punctuation trimmed off each token.
+func skillTokens(candidate string) []string {
+	if i := strings.IndexByte(candidate, '#'); i >= 0 {
+		candidate = candidate[:i]
+	}
+	fields := strings.Fields(skillQuote.ReplaceAllString(candidate, "x"))
+	tokens := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.Trim(field, "[]().,")
+		if field == "" || field == "--" {
+			continue
+		}
+		tokens = append(tokens, field)
+	}
+	return tokens
 }
 
 func skillChild(cmd *cobra.Command, name string) *cobra.Command {
@@ -355,6 +438,118 @@ func skillChild(cmd *cobra.Command, name string) *cobra.Command {
 		}
 	}
 	return nil
+}
+
+func skillAnyChild(cmd *cobra.Command, names []string) bool {
+	for _, name := range names {
+		if skillChild(cmd, name) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// skillListItems returns each Markdown list item of SKILL.md as one string,
+// continuation lines folded in. Fenced blocks are removed first: their contents
+// are invocations, already covered, and a fence nested in a list item would
+// otherwise glue code into the surrounding bullet.
+func skillListItems(body string) []string {
+	body = skillFence.ReplaceAllString(skillBody(body), "")
+
+	var items []string
+	var current strings.Builder
+	flush := func() {
+		if current.Len() > 0 {
+			items = append(items, current.String())
+			current.Reset()
+		}
+	}
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "- "):
+			flush()
+			current.WriteString(trimmed)
+		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
+			flush()
+		case current.Len() > 0:
+			current.WriteString(" " + trimmed)
+		}
+	}
+	flush()
+	return items
+}
+
+// skillBulletFlags splits one list item into the commands it names and the
+// flags it mentions on their own. A span that opens with a command is a
+// checked invocation already, so only bare flag spans are returned here.
+func skillBulletFlags(root *cobra.Command, item string) ([]*cobra.Command, []string) {
+	var contexts []*cobra.Command
+	var orphans []string
+	for _, span := range skillSpan.FindAllStringSubmatch(item, -1) {
+		tokens := skillTokens(span[1])
+		if len(tokens) == 0 {
+			continue
+		}
+		if tokens[0] == "papio" {
+			tokens = tokens[1:]
+		}
+		if len(tokens) > 0 && !strings.HasPrefix(tokens[0], "-") {
+			if cmd := skillResolve(root, tokens); cmd != root {
+				contexts = append(contexts, cmd)
+			}
+			continue
+		}
+		for _, token := range tokens {
+			for _, flag := range strings.FieldsFunc(token, func(r rune) bool { return r == '|' || r == '/' }) {
+				if strings.HasPrefix(flag, "-") {
+					orphans = append(orphans, flag)
+				}
+			}
+		}
+	}
+	return contexts, orphans
+}
+
+// skillResolve walks as deep into the command tree as the tokens name, ignoring
+// arguments and flags.
+func skillResolve(root *cobra.Command, tokens []string) *cobra.Command {
+	cmd := root
+	for _, token := range tokens {
+		for _, part := range strings.Split(token, "|") {
+			if child := skillChild(cmd, part); child != nil {
+				cmd = child
+				break
+			}
+		}
+	}
+	return cmd
+}
+
+func skillKnownFlags(root *cobra.Command) map[string]bool {
+	known := map[string]bool{}
+	var walk func(*cobra.Command)
+	walk = func(cmd *cobra.Command) {
+		cmd.LocalFlags().VisitAll(func(f *pflag.Flag) {
+			known[f.Name] = true
+			if f.Shorthand != "" {
+				known[f.Shorthand] = true
+			}
+		})
+		for _, child := range cmd.Commands() {
+			walk(child)
+		}
+	}
+	walk(root)
+	return known
+}
+
+// skillHead names a bullet in a failure message without reprinting all of it.
+func skillHead(item string) string {
+	if len(item) > 72 {
+		return item[:72] + "…"
+	}
+	return item
 }
 
 // skillFlagName reports the flag a token names, or ok=false when the token is

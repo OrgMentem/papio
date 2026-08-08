@@ -336,7 +336,8 @@ papio batch report latest --markdown
 Use a concrete batch ID instead of `latest` when tracking more than one run.
 Without `--markdown`, the command prints the normal table; `--json` provides the
 structured report. Outcomes include imported, browser-fetched-then-imported,
-existing-item-attached, import-failed, awaiting-human, needs-review, failed,
+existing-item-attached, acquired (validated but not imported, the normal outcome
+without `--auto-import`), import-failed, awaiting-human, needs-review, failed,
 skipped-owned, and in-progress.
 
 ## 7. Turn a successful search into a watchlist

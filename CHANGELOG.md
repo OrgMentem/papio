@@ -22,9 +22,10 @@ execution records kept during the initial build.
   outcome, not an error; never drain the handoff queue; `--accept` is an
   assertion; `zotio apply` needs the plan's exact digest). `papio mcp` is
   unchanged and stays the path for hosts that cannot run commands.
-  `TestSkillInvocationsResolve` pins every command and flag the skill claims to
-  the live cobra tree, so it cannot drift into telling an agent to run something
-  that no longer exists.
+  `TestSkillInvocationsResolve` and `TestSkillFlagMentionsResolve` pin every
+  command the skill runs and every flag it names — including the ones discussed
+  in prose rather than on a command line — to the live cobra tree, so it cannot
+  drift into telling an agent to run something that no longer exists.
 
 ### Changed
 

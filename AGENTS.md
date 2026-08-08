@@ -45,10 +45,16 @@ agent installs (`npx skills add OrgMentem/papio`), not an internal note, and not
 same thing as `.agents/skills/*` (those are this repo's own working skills). It is
 outside `docs/`, so `docs/guide/agent-skill.md` links it by GitHub URL; a relative
 link would pass the on-disk link check and 404 on the site.
-`TestSkillInvocationsResolve` (`cmd/docs-gen/drift_test.go`) parses every `papio …`
-invocation in it — plus inline spans opening with a top-level command name — and
-resolves each command and flag against the live cobra tree, so renaming a command or
-dropping a flag fails there too.
+Two tests in `cmd/docs-gen/drift_test.go` keep it honest, and they cover different
+halves of the file: `TestSkillInvocationsResolve` resolves every `papio …` invocation
+(plus inline spans opening with a top-level command name) against the live cobra tree,
+while `TestSkillFlagMentionsResolve` handles the flags a command line never contains —
+a Hero-capability bullet names its command once and then discusses `--limit`,
+`--oa-only`, `--desired-version` in bare spans, which is how nearly half the flag names
+in the file are written. Bare flags are checked against the commands their own bullet
+names, falling back to "some command declares it". Both guards carry a floor on how
+much they matched, because a parser regression otherwise shrinks them silently instead
+of failing.
 
 `dev/` is outside the site and never published. It is tiered by **lifetime**, not
 topic, because completed build plans otherwise pile up and drift back into `docs/`:

@@ -130,6 +130,8 @@ One line each; run `papio <command> --help` for the full flag set.
   MEDLINE/NBIB (`-` reads stdin). The reliable way to ingest a discovery interface's own
   export.
 - **`acquire --from-zotio`** — Queue Zotero items that have no attached PDF (`--limit`).
+  It refuses `--auto-import`, `--wait`, `--force`, `--resolver`, and every one-work
+  identity flag; import policy for those jobs comes from config (`zotio.auto_import`).
 - **Per-request policy** — `--source`/`--deny-source`, `--desired-version published|accepted|preprint|any`,
   `--max-cost`, `--access-mode`, `--resolver`, `--request-id` (idempotency key), `--force`.
 - **`jobs list --state <state>` / `jobs get <id> [--wait]` / `jobs retry <id>` / `jobs cancel <id>`**
@@ -173,8 +175,9 @@ One line each; run `papio <command> --help` for the full flag set.
 - **`export ledger|job|batch|watch`** — Normalized citations as CSL-JSON, RIS, or BibTeX
   (`--format`, `-o`; `-o` is required with `--json`).
 - **`batch report <batch-id|latest> [--markdown]`** — Manifest joined with live outcomes:
-  imported, browser-fetched-then-imported, existing-item-attached, import-failed,
-  awaiting-human, needs-review, failed, skipped-owned, in-progress.
+  imported, browser-fetched-then-imported, existing-item-attached, acquired (ready, not
+  imported), import-failed, awaiting-human, needs-review, failed, skipped-owned,
+  in-progress.
 
 ## Canonical acquisition loop
 
@@ -220,11 +223,14 @@ re-running the file creates no duplicates.
 ### Backfill Zotero items that have no PDF
 
 ```bash
-papio acquire --from-zotio --limit 25 --auto-import --json
+papio acquire --from-zotio --limit 25 --json
+papio zotio plan <job-id> --json
+papio zotio apply <plan-id> --confirm-sha256 <digest-from-the-plan>
 ```
 
-`--auto-import` routes through the same plan/apply machinery; an import failure stays
-visible in the batch report instead of failing the acquisition.
+`--from-zotio` rejects `--auto-import` outright, so either set `zotio.auto_import` in
+config or file the ready jobs with the plan/apply pass above. A batch report lists a
+ready-but-unimported job as `acquired`.
 
 ### Explain a wall of failures
 
