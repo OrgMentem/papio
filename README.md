@@ -234,16 +234,16 @@ the whole hand-off
 surfaces, in preference order:
 
 **1. The CLI, through the agent skill.** A single
-[`SKILL.md`](SKILL.md) teaches an agent to run `papio` directly — the efficient
-path, with no server in the middle:
+[`SKILL.md`](SKILL.md) teaches an agent to run `papio` directly — no server
+process, no JSON-RPC round trip:
 
 ```bash
 npx skills add OrgMentem/papio   # Claude Code, Cursor, Codex, Cline, opencode, …
 ```
 
-- **`--json`** on any command for structured output. One contract everywhere: a
-  list payload is always `{"<name>": [...], "truncated": bool}`, never a bare
-  array; single-record commands return the object directly.
+- **`--json`** on any command for structured output, under one
+  [contract](https://orgmentem.github.io/papio/reference/commands/#json-output-contract)
+  shared with the MCP resources.
 - **Introspectable** — `papio --help`, `papio <command> --help`, and
   `papio doctor --json` let an agent discover the surface at runtime instead of
   hard-coding it.

@@ -3,8 +3,8 @@
 *papio* is designed to be driven by a coding agent as naturally as by a person.
 There are two ways to do that, and they are not equal:
 
-- **The agent skill** drives the `papio` CLI directly — the efficient path, with
-  no server in the middle. Prefer it. Install it as shown in
+- **The agent skill** drives the `papio` CLI directly — no server process, no
+  JSON-RPC round trip. Prefer it. Install it as shown in
   [Getting started](getting-started.md#the-agent-skill).
 - **The MCP server** (`papio mcp`) exposes the same surface to hosts that speak
   MCP rather than shell. Use it when your host cannot run commands.
@@ -34,15 +34,15 @@ papio doctor --json         # config, daemon, connector, extension, zotio
 papio version
 ```
 
-Add `--json` to any command for structured output. The contract is one shape
-everywhere: a list-shaped payload is always
-`{"<name>": [...], "truncated": bool}`, never a bare array, and an empty result
-is `[]` rather than `null`. `truncated: true` means the row cap filled — raise
-`--limit` or paginate to see whether more exist. Commands returning a single
-record — `jobs get`, `doctor`, `status`, `batch report`, `zotio plan`, `inbox` —
-return that object directly, with no `truncated` key. The MCP resources return
-the identical envelope, so one parser serves both surfaces. The full flag set
-for every command is in the [command reference](../reference/commands.md).
+Add `--json` to any command for structured output. A list-shaped payload is
+always `{"<name>": [...], "truncated": bool}`, never a bare array; the commands
+returning a single record — `jobs get`, `doctor`, `status`, `batch report`,
+`zotio plan`, `inbox` — return that object directly, with no `truncated` key.
+The MCP resources return the identical envelope, so one parser serves both
+surfaces. The generated
+[JSON output contract](../reference/commands.md#json-output-contract) is
+authoritative on empty results and what `truncated` does and does not prove,
+and the same page carries the full flag set for every command.
 
 ## Canonical acquisition loop
 

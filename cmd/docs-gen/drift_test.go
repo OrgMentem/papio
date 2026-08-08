@@ -316,30 +316,48 @@ func TestSkillInvocationsResolve(t *testing.T) {
 	}
 }
 
+// skillAbsentFlags are flags SKILL.md names in order to say they do NOT exist.
+// The assertion is inverted for them: adding one to the CLI has to update that
+// sentence. Without this the guard cannot tell a truthful "there is no --agent
+// flag" from a typo, and the difference would rest on where the sentence sits.
+var skillAbsentFlags = map[string]bool{"agent": true}
+
 // TestSkillFlagMentionsResolve checks the flags an invocation walk structurally
-// cannot: a Hero-capability bullet names its command once and then discusses
-// the flags in bare spans (`--limit`, `--oa-only`, `--desired-version`). Nearly
-// half the flag names in SKILL.md are mentioned that way, so without this the
-// skill's own promise — dropping a flag fails the build — held for the command
-// lines only. Each bullet's flags are checked against the commands that bullet
-// names; a bullet naming none falls back to "some papio command declares it",
-// which still catches a removed or renamed flag.
+// cannot: a capability bullet names its command once and then discusses the
+// flags in bare spans (`--limit`, `--oa-only`, `--desired-version`), and a
+// recipe explains in prose what its fenced example ran. Roughly half the flag
+// names in SKILL.md are written that way, so without this the skill's promise —
+// dropping a flag fails the build — held for command lines only.
+//
+// Each flag is attributed to the commands its SECTION names — its own block's
+// spans, its siblings', and its fenced examples' — because a sentence routinely
+// discusses the flags of the command in the example above it rather than the
+// one it happens to mention. Section scope is the point: a flag list under
+// `acquire` checked against the whole tree passes while `acquire` no longer
+// declares it, as long as any other command shares the name.
 func TestSkillFlagMentionsResolve(t *testing.T) {
 	root := cli.NewRoot(io.Discard, io.Discard)
 	known := skillKnownFlags(root)
 	checked := 0
 
-	for _, item := range skillListItems(mustRead(t, "SKILL.md")) {
-		contexts, orphans := skillBulletFlags(root, item)
-		for _, flag := range orphans {
+	for _, block := range skillBlocks(mustRead(t, "SKILL.md"), root) {
+		contexts := block.section
+		for _, flag := range block.flags {
 			name, ok := skillFlagName(flag)
 			if !ok {
+				continue
+			}
+			if skillAbsentFlags[name] {
+				if known[name] {
+					t.Errorf("SKILL.md says %s does not exist, but the CLI now declares it: %q",
+						flag, skillHead(block.text))
+				}
 				continue
 			}
 			checked++
 			if len(contexts) == 0 {
 				if !known[name] {
-					t.Errorf("SKILL.md mentions %s, which no papio command declares: %q", flag, skillHead(item))
+					t.Errorf("SKILL.md mentions %s, which no papio command declares: %q", flag, skillHead(block.text))
 				}
 				continue
 			}
@@ -350,13 +368,13 @@ func TestSkillFlagMentionsResolve(t *testing.T) {
 				accepted = accepted || skillHasFlag(cmd, name)
 			}
 			if !accepted {
-				t.Errorf("SKILL.md discusses %s under %q, but none of %s accepts it",
-					flag, skillHead(item), strings.Join(paths, ", "))
+				t.Errorf("SKILL.md discusses %s in %q, but no command its section names (%s) accepts it",
+					flag, skillHead(block.text), strings.Join(paths, ", "))
 			}
 		}
 	}
 	if checked < 20 {
-		t.Fatalf("checked only %d bare flag mentions — the bullet parser stopped matching", checked)
+		t.Fatalf("checked only %d bare flag mentions — the block parser stopped matching", checked)
 	}
 }
 
@@ -449,41 +467,95 @@ func skillAnyChild(cmd *cobra.Command, names []string) bool {
 	return false
 }
 
-// skillListItems returns each Markdown list item of SKILL.md as one string,
-// continuation lines folded in. Fenced blocks are removed first: their contents
-// are invocations, already covered, and a fence nested in a list item would
-// otherwise glue code into the surrounding bullet.
-func skillListItems(body string) []string {
-	body = skillFence.ReplaceAllString(skillBody(body), "")
+// skillBlock is one prose unit of SKILL.md: a bullet with its continuation
+// lines, or a paragraph. commands are the ones the block itself names, section
+// the union named anywhere under the same heading, and flags the bare flag
+// spans — a span opening with a command is an invocation, checked already.
+type skillBlock struct {
+	text     string
+	commands []*cobra.Command
+	section  []*cobra.Command
+	flags    []string
+}
 
-	var items []string
+// skillBlocks splits SKILL.md into those units. A fence separates blocks rather
+// than folding into one — gluing code to a sentence would misattribute both —
+// but the commands it runs still count towards its section, because a recipe's
+// prose discusses the flags of the example directly above it. Paragraphs are
+// included deliberately: Recipes and the canonical loop are headings, fences,
+// and prose, with no bullet anywhere to hang a flag mention on.
+func skillBlocks(body string, root *cobra.Command) []skillBlock {
+	var blocks []skillBlock
 	var current strings.Builder
+	var fenced []*cobra.Command
+	sectionStart := 0
 	flush := func() {
-		if current.Len() > 0 {
-			items = append(items, current.String())
-			current.Reset()
+		if current.Len() == 0 {
+			return
 		}
+		text := current.String()
+		current.Reset()
+		commands, flags := skillSpanFlags(root, text)
+		blocks = append(blocks, skillBlock{text: text, commands: commands, flags: flags})
 	}
-	for _, line := range strings.Split(body, "\n") {
+	// endSection publishes the union of the section's commands to its blocks, so
+	// a bullet listing flags under a command named two bullets (or one fenced
+	// example) earlier is still checked against that command, not the whole tree.
+	endSection := func() {
+		flush()
+		var union []*cobra.Command
+		seen := map[*cobra.Command]bool{}
+		add := func(cmds []*cobra.Command) {
+			for _, cmd := range cmds {
+				if !seen[cmd] {
+					seen[cmd] = true
+					union = append(union, cmd)
+				}
+			}
+		}
+		for _, block := range blocks[sectionStart:] {
+			add(block.commands)
+		}
+		add(fenced)
+		for i := range blocks[sectionStart:] {
+			blocks[sectionStart+i].section = union
+		}
+		fenced = nil
+		sectionStart = len(blocks)
+	}
+
+	inFence := false
+	for _, line := range strings.Split(skillBody(body), "\n") {
 		trimmed := strings.TrimSpace(line)
 		switch {
+		case strings.HasPrefix(trimmed, "```"):
+			inFence = !inFence
+			flush()
+		case inFence:
+			if cmd := skillResolve(root, skillTokens(strings.TrimPrefix(trimmed, "papio "))); cmd != root {
+				fenced = append(fenced, cmd)
+			}
+		case strings.HasPrefix(trimmed, "#"):
+			endSection()
 		case strings.HasPrefix(trimmed, "- "):
 			flush()
 			current.WriteString(trimmed)
-		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
+		case trimmed == "":
 			flush()
 		case current.Len() > 0:
 			current.WriteString(" " + trimmed)
+		default:
+			current.WriteString(trimmed)
 		}
 	}
-	flush()
-	return items
+	endSection()
+	return blocks
 }
 
-// skillBulletFlags splits one list item into the commands it names and the
-// flags it mentions on their own. A span that opens with a command is a
-// checked invocation already, so only bare flag spans are returned here.
-func skillBulletFlags(root *cobra.Command, item string) ([]*cobra.Command, []string) {
+// skillSpanFlags splits one block into the commands it names and the flags it
+// mentions on their own. A span that opens with a command is a checked
+// invocation already, so only bare flag spans are returned here.
+func skillSpanFlags(root *cobra.Command, item string) ([]*cobra.Command, []string) {
 	var contexts []*cobra.Command
 	var orphans []string
 	for _, span := range skillSpan.FindAllStringSubmatch(item, -1) {

@@ -79,10 +79,9 @@ Non-obvious facts that defy reasonable assumptions — read before running comma
   retry.** No fetchable identifier (books, chapters, reports, theses) and unregistered
   DOIs settle unavailable *instead of* opening an institutional handoff. Find a real DOI
   and resubmit; retrying the same request burns nothing but time.
-- **`--json` list payloads are enveloped**, always `{"<name>": [...], "truncated": bool}`,
-  never a bare array; `truncated: true` means the row cap filled, not that more rows
-  certainly exist. Single-record commands (`jobs get`, `doctor`, `status`,
-  `batch report`, `zotio plan`, `inbox`) return the object directly with no `truncated`.
+- **`--json` list payloads are enveloped**, never a bare array, and `truncated: true`
+  means the row cap filled rather than that more rows certainly exist. Full shape under
+  **Agent mode** below.
 - **A batch caps at 50 works and skips what the user already has.** With zotio (or a
   configured `library.sources` authority) present, works already holding a PDF are
   skipped; `--include-owned` overrides. Re-running the same file is safe — normalization
@@ -224,13 +223,16 @@ re-running the file creates no duplicates.
 
 ```bash
 papio acquire --from-zotio --limit 25 --json
+papio jobs get <job-id> --wait --json          # per returned job; --wait is refused on the queue itself
 papio zotio plan <job-id> --json
 papio zotio apply <plan-id> --confirm-sha256 <digest-from-the-plan>
 ```
 
-`--from-zotio` rejects `--auto-import` outright, so either set `zotio.auto_import` in
-config or file the ready jobs with the plan/apply pass above. A batch report lists a
-ready-but-unimported job as `acquired`.
+The middle step is not optional. `--from-zotio` only queues, and refuses `--wait`, so
+its job ids are unresolved when it returns; `zotio plan` rejects any job that is not
+`ready` or `imported`. Wait per job, or poll `papio jobs list --state ready --json`.
+`--auto-import` is refused here too, so either set `zotio.auto_import` in config or run
+the plan/apply pass above. A batch report lists a ready-but-unimported job as `acquired`.
 
 ### Explain a wall of failures
 
@@ -242,11 +244,27 @@ papio artifacts validation <sample-job-id> --json
 The first groups by state, provider host, and terminal reason; the second is the
 per-candidate evidence for one job, rejected candidates included.
 
-### Snowball from a seed paper, open access only
+### Snowball from a seed paper, then acquire the hits
 
 ```bash
-papio search --cited-by 10.1000/example --limit 25 --oa-only --json
+papio search --cites 10.1000/example --limit 25 --oa-only --json
 ```
+
+`--cites` is forward — papers citing the seed. `--cited-by` is the seed's own reference
+list, and `--related-to` is OpenAlex's similarity.
+
+Search results are not an acquisition input: no command takes a search payload, so turn
+the DOIs you chose into one work per line and submit that. JSONL is the batch reader's
+native format (`{"doi": "…", "title": "…", "authors": ["…"], "year": 2024}`), each hit
+carries its identifiers under `work`, and `-` reads stdin:
+
+```bash
+papio search --cites 10.1000/example --limit 25 --oa-only --json \
+  | jq -c '.works[] | select(.work.doi != null) | {doi: .work.doi}' \
+  | papio acquire --batch - --label "citation snowball" --json
+```
+
+Prefer `papio acquire --doi <doi>` when the user picked one or two.
 
 ### Watch a topic and decide later
 
@@ -300,8 +318,9 @@ reports it as `not configured (optional)`.
 
 ## MCP server (only for MCP hosts)
 
-Driving the CLI directly is the efficient path and the one this skill takes. When the
-host speaks MCP rather than shell, papio serves the same surface over stdio:
+Driving the CLI directly is the path this skill takes: no server process, no JSON-RPC
+round trip. When the host speaks MCP rather than shell, papio serves the same surface
+over stdio:
 
 ```bash
 claude mcp add papio -- papio mcp

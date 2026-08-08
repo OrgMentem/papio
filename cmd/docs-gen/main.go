@@ -367,10 +367,10 @@ func renderLLMSIndex(pages []llmsPage) string {
 	var b strings.Builder
 	b.WriteString("# papio\n\n")
 	b.WriteString("> A local paper-acquisition broker — searches scholarly works, creates acquisition jobs, validates candidate PDFs, and hands ready artifacts to Zotero through zotio.\n\n")
-	b.WriteString("For AI agents: papio is a local paper-acquisition broker. Fastest path:\n")
+	b.WriteString("For AI agents: papio is a local paper-acquisition broker. Direct path:\n")
 	b.WriteString("1. Install: `brew install orgmentem/tap/papio`, a release archive, or build `./cmd/papio` (see [Getting started](" + llmsSiteURL + "guide/getting-started/)); install Poppler and Tesseract for PDF validation.\n")
 	b.WriteString("2. Initialize the local profile with `papio init`.\n")
-	b.WriteString("3. Drive the CLI directly — `papio <command> --json`, discoverable with `papio --help` and `papio <command> --help`. The agent skill (https://github.com/OrgMentem/papio/blob/main/SKILL.md) packages this path; see [Use in a coding agent](" + llmsSiteURL + "guide/agent-skill/). Only for hosts that cannot run commands, run `papio mcp`; its tools are `papio_*` (see [MCP tools](" + llmsSiteURL + "reference/mcp-tools/)).\n")
+	b.WriteString("3. Drive the CLI directly with `papio <command> --json`; discover commands with `papio --help` and `papio <command> --help`. The [agent skill](https://github.com/OrgMentem/papio/blob/main/SKILL.md) packages this path; see [Use in a coding agent](" + llmsSiteURL + "guide/agent-skill/). For an MCP-only host, run `papio mcp` instead; its tools are `papio_*` (see [MCP tools](" + llmsSiteURL + "reference/mcp-tools/)).\n")
 	b.WriteString("4. Check integration readiness with `papio doctor` after setup or configuration changes.\n\n")
 	b.WriteString("The complete documentation as one Markdown file: " + llmsSiteURL + "llms-full.txt\n\n")
 
