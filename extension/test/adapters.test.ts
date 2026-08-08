@@ -2261,3 +2261,30 @@ test.skipIf(mdpiArticle === null)(
     expect(interpret(article, spec, ctx()).kind).toBe("unknown");
   },
 );
+
+const hogrefeArticle = loadFixture("hogrefe", "success");
+test.skipIf(hogrefeArticle === null)(
+  "captured Hogrefe article classifies on its direct PDF anchor",
+  () => {
+    const article = hogrefeArticle as Document;
+    const spec = adapters.find((a) => a.id === "hogrefe") as AdapterSpec;
+    const verdict = interpret(article, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    expect(verdict.adapter_id).toBe("hogrefe");
+    const rule = spec.download as DownloadRule;
+    expect(rule.method).toBe("href");
+    expect(article.querySelector(rule.selector)?.getAttribute("href")).toBe(
+      "/doi/pdf/10.1024/2673-8627/a000074?download=true",
+    );
+  },
+);
+
+test.skipIf(hogrefeArticle === null)(
+  "a Hogrefe page without the direct PDF anchor stays assisted",
+  () => {
+    const article = (hogrefeArticle as Document).cloneNode(true) as Document;
+    const spec = adapters.find((a) => a.id === "hogrefe") as AdapterSpec;
+    for (const anchor of article.querySelectorAll("a[href^='/doi/pdf/']")) anchor.remove();
+    expect(interpret(article, spec, ctx()).kind).toBe("unknown");
+  },
+);

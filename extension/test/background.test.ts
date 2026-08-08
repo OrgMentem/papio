@@ -2596,6 +2596,37 @@ test("Chrome's built-in PDF viewer downloads the memory-only offered URL", async
   ]);
 });
 
+test("Wiley epdf viewer route downloads the declared direct endpoint", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs.push({
+    id: "wiley",
+    version: "0.2.0",
+    hosts: ["onlinelibrary.wiley.com"],
+    classify: [],
+    download: {
+      selector: "meta[name='citation_pdf_url']",
+      requireKind: "article",
+      method: "url",
+      viewerPathPattern: "/doi/epdf/",
+      idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
+      urlTemplate: "https://onlinelibrary.wiley.com/doi/pdfdirect/{1}?download=true",
+    },
+  });
+  const viewerURL = "https://onlinelibrary.wiley.com/doi/epdf/10.1111/rego.12568";
+  await h.bridge.start();
+  await h.port.inbound(jobOfferForHosts("job_wiley_epdf_viewer", ["onlinelibrary.wiley.com"], viewerURL));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.onUpdated.emit(tabID, { url: viewerURL, status: "complete" }, { id: tabID, url: viewerURL });
+  expect(h.downloads.started).toEqual([
+    {
+      url: "https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/rego.12568?download=true",
+      filename: "papio/job_wiley_epdf_viewer/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+});
+
 test("a pre-existing content-disposition download prevents PDF-viewer duplication", async () => {
   const h = makeHarness();
   await h.bridge.start();

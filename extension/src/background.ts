@@ -6607,7 +6607,35 @@ export class Bridge {
     if (this.isFirefoxClickDownload(job)) return;
     if (job.download_initiated === true || this.downloads.has(jobID)) return;
 
+    let downloadURL = url;
     let viewer = knownPDFViewer;
+    if (!viewer) {
+      try {
+        const current = new URL(url);
+        const spec = this.deps.adapterSpecs.find((candidate) => {
+          if (!hostMatches(current.hostname, candidate.hosts)) return false;
+          const rule = candidate.download;
+          return (
+            rule?.method === "url" &&
+            typeof rule.viewerPathPattern === "string" &&
+            current.pathname.includes(rule.viewerPathPattern)
+          );
+        });
+        const rule = spec?.download;
+        if (rule?.idPattern !== undefined && rule.urlTemplate !== undefined) {
+          const match = url.match(new RegExp(rule.idPattern));
+          if (match !== null) {
+            downloadURL = rule.urlTemplate.replace(
+              /\{(\d+|id)\}/g,
+              (_, key: string) => match[key === "id" ? 1 : Number(key)] ?? "",
+            );
+            viewer = true;
+          }
+        }
+      } catch {
+        // Invalid or non-provider URLs stay on the normal viewer path.
+      }
+    }
     if (!viewer) {
       try {
         viewer = new URL(url).pathname.toLowerCase().endsWith(".pdf");
@@ -6623,10 +6651,10 @@ export class Bridge {
     if (!job || job.download_initiated === true || this.downloads.has(jobID)) return;
     await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
 
-    this.pendingDownloadURLs.set(url, jobID);
+    this.pendingDownloadURLs.set(downloadURL, jobID);
     try {
       const id = await this.deps.downloads.download({
-        url,
+        url: downloadURL,
         filename: `papio/${jobID}/paper.pdf`,
         conflictAction: "uniquify",
         saveAs: false,
@@ -6638,7 +6666,7 @@ export class Bridge {
     } catch (e) {
       console.error("papio: PDF-viewer download initiation failed; staying assisted", e);
     } finally {
-      this.pendingDownloadURLs.delete(url);
+      this.pendingDownloadURLs.delete(downloadURL);
     }
   }
 

@@ -48,6 +48,9 @@ export interface DownloadRule {
   followupSelector?: string;
   /** Shared bounded wait for post-click gate/follow-up insertion. */
   postClickTimeoutMs?: number;
+  /** Optional provider viewer route that should be converted to the declared
+   * direct endpoint before Chrome's built-in viewer can hide the PDF URL. */
+  viewerPathPattern?: string;
   /** method "url"/"api": regex matched against the page URL; capture groups fill
    * {1},{2},… (and {id} = {1}) in urlTemplate. */
   idPattern?: string;
@@ -659,6 +662,7 @@ export const adapters: AdapterSpec[] = [
       selector: "meta[name='citation_pdf_url']",
       requireKind: "article",
       method: "url",
+      viewerPathPattern: "/doi/epdf/",
       // Wiley article/abstract/viewer paths all carry the DOI after /doi/[seg/].
       idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
       urlTemplate: "https://onlinelibrary.wiley.com/doi/pdfdirect/{1}?download=true",
@@ -1169,6 +1173,33 @@ export const adapters: AdapterSpec[] = [
     ],
     download: {
       selector: "a.UD_ArticlePDF[href*='/pdf']",
+      requireKind: "article",
+      method: "href",
+    },
+  },
+  {
+    // Captured 2026-08-08 from the public Hogrefe European Journal of
+    // Psychology Open article (fixtures/hogrefe/success.html). Hogrefe
+    // renders a viewer route for the page's visible PDF control, but the
+    // explicit `/doi/pdf/...?...download=true` anchor is the browser-download
+    // endpoint. Require the article metadata and provider-owned PDF anchor so
+    // abstract or login shells stay assisted.
+    id: "hogrefe",
+    version: "0.1.0",
+    hosts: ["econtent.hogrefe.com"],
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='publication_doi']",
+          "meta[name='citation_journal_title']",
+          "a[href^='/doi/pdf/']",
+          "h1.citation__title",
+        ],
+      },
+    ],
+    download: {
+      selector: "a[href^='/doi/pdf/']",
       requireKind: "article",
       method: "href",
     },
