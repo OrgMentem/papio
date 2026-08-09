@@ -89,6 +89,11 @@ func (r *OfferedDeliveryRecovery) recoverOne(ctx context.Context, request *deliv
 		log.Printf("papio: offered delivery recovery row %d skipped: job %q is missing", request.ID, request.JobID)
 		return nil
 	}
+	if row.RetryAt != "" {
+		if retryAt, parseErr := time.Parse(time.RFC3339Nano, row.RetryAt); parseErr == nil && r.now().Before(retryAt) {
+			return nil
+		}
+	}
 	attempts, lastAttempt, err := r.attemptState(ctx, row.ID, request.ID)
 	if err != nil {
 		return err
@@ -135,7 +140,8 @@ func (r *OfferedDeliveryRecovery) recoverOne(ctx context.Context, request *deliv
 	if err != nil {
 		return err
 	}
-	if !classified || class != illiad.FailurePreSend {
+	ambiguous := classified && class == illiad.FailureAmbiguous
+	if !ambiguous && (!classified || class != illiad.FailurePreSend) {
 		if err := r.holdForHuman(ctx, row, request, "ambiguous provider outcome"); err != nil {
 			return err
 		}
@@ -182,7 +188,28 @@ func (r *OfferedDeliveryRecovery) recoverOne(ctx context.Context, request *deliv
 		return err
 	}
 	log.Printf("papio: offered delivery recovery row %d attempt %d", request.ID, attempts+1)
-	result, err := r.svc.deliveryRoute(ctx, row, from)
+	var result DeliveryRouteResult
+	if ambiguous {
+		actions, listErr := r.svc.Jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+		if listErr != nil {
+			return listErr
+		}
+		for _, action := range actions {
+			if action.Kind == job.ActionKindDocumentDelivery {
+				return nil
+			}
+		}
+		err = r.svc.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, request)
+		outcome := map[string]any{"delivery_request_id": request.ID, "attempt": attempts + 1, "outcome": "reconcile"}
+		if err != nil {
+			outcome["error"] = err.Error()
+		}
+		if eventErr := r.svc.Jobs.RecordEvent(ctx, row.ID, "delivery.offered_recovery_outcome", outcome); eventErr != nil && err == nil {
+			err = eventErr
+		}
+		return err
+	}
+	result, err = r.svc.deliveryRoute(ctx, row, from)
 	outcome := map[string]any{"delivery_request_id": request.ID, "attempt": attempts + 1}
 	if err != nil {
 		outcome["outcome"], outcome["error"] = "error", err.Error()

@@ -190,10 +190,10 @@ func (r TransactionRequest) MarshalJSON() ([]byte, error) {
 
 // Transaction is the ILLiad transaction record as echoed by the Web
 // Platform API: the fields papio reads back for status polling,
-// reconciliation, and idempotency matching (ADR-0017 Decision 1/4).
 type Transaction struct {
 	TransactionNumber int    `json:"TransactionNumber"`
 	TransactionStatus string `json:"TransactionStatus"`
+	RequestType       string `json:"RequestType,omitempty"`
 	CreationDate      string `json:"CreationDate"`
 
 	PhotoJournalTitle          string `json:"PhotoJournalTitle,omitempty"`
@@ -281,10 +281,10 @@ func (c *Client) GetTransaction(ctx context.Context, number int) (Transaction, e
 	return tx, nil
 }
 
-// UserRequests lists a patron's transactions (GET
-// {base}/Transaction/User/{userRef}), bounded by the configured response
-// size limit. userRef is the ILLiad username or external user id used to
-// create the transactions.
+// UserRequests resolves the configured patron reference to ILLiad's
+// UserName, then lists that user's transactions. The submission path uses
+// ExternalUserID; the provider's list endpoint is keyed strictly by
+// UserName, so both reads are required and read-only.
 func (c *Client) UserRequests(ctx context.Context, userRef string) ([]Transaction, error) {
 	if c.client == nil {
 		return nil, errors.New("illiad: HTTP client is not configured")
@@ -292,8 +292,17 @@ func (c *Client) UserRequests(ctx context.Context, userRef string) ([]Transactio
 	if strings.TrimSpace(userRef) == "" {
 		return nil, errors.New("illiad: UserRequests requires a non-empty user reference")
 	}
+	var user struct {
+		UserName string `json:"UserName"`
+	}
+	if err := c.do(ctx, http.MethodGet, "Users/ExternalUserId/"+url.PathEscape(userRef), nil, &user); err != nil {
+		return nil, fmt.Errorf("illiad: resolve patron reference: %w", err)
+	}
+	if strings.TrimSpace(user.UserName) == "" {
+		return nil, errors.New("illiad: resolved patron has no UserName")
+	}
 	var txs []Transaction
-	if err := c.do(ctx, http.MethodGet, "Transaction/User/"+url.PathEscape(userRef), nil, &txs); err != nil {
+	if err := c.do(ctx, http.MethodGet, "Transaction/UserRequests/"+url.PathEscape(user.UserName), nil, &txs); err != nil {
 		return nil, err
 	}
 	return txs, nil

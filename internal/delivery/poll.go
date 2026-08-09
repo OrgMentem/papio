@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strconv"
+	"strings"
 	"time"
 
 	"papio/internal/illiad"
@@ -327,9 +328,12 @@ func (s *Service) handleNotFound(ctx context.Context, req *Request, now time.Tim
 	default:
 		matched, findErr := s.reconcileViaUserRequests(ctx, deps, req)
 		if findErr != nil {
+			var semanticErr *reconciliationSemanticError
+			if errors.As(findErr, &semanticErr) {
+				return s.persistUnknownOutcome(ctx, req, now)
+			}
 			// The listing call itself failed — ordinary transient
-			// discipline, never escalate on a failed reconciliation
-			// attempt.
+			// discipline, never escalate on a failed reconciliation attempt.
 			return s.recordPollFailure(ctx, req, now, deps, PollErrorClassTransient)
 		}
 		if matched != nil {
@@ -348,23 +352,27 @@ func (s *Service) handleNotFound(ctx context.Context, req *Request, now time.Tim
 }
 
 // reconcileViaUserRequests searches the patron's request listing for the
-// transaction that carries req's idempotency key in the configured
-// reference field — ILLiad may have re-numbered or otherwise relocated a
-// transaction that a direct-by-number lookup now 404s on.
+// transaction that carries req's idempotency key in the configured reference
+// field. It is the poll adapter over the shared exact-one matcher used by
+// ambiguous submission reconciliation.
 func (s *Service) reconcileViaUserRequests(ctx context.Context, deps PollDeps, req *Request) (*illiad.Transaction, error) {
 	if deps.PatronRef == "" || deps.ReferenceField == "" {
 		return nil, nil
 	}
-	txns, err := deps.Client.UserRequests(ctx, deps.PatronRef)
+	identity := ReconciliationIdentity{RequestClass: req.RequestClass}
+	if strings.HasPrefix(req.WorkIdentity, "doi:") {
+		identity.DOI = strings.TrimPrefix(req.WorkIdentity, "doi:")
+	} else if strings.HasPrefix(req.WorkIdentity, "pmid:") {
+		identity.PMID = strings.TrimPrefix(req.WorkIdentity, "pmid:")
+	}
+	found, reason, err := findReconciledTransaction(ctx, deps.Client, deps.PatronRef, deps.ReferenceField, req, identity)
 	if err != nil {
-		return nil, err
+		return nil, classifyReconciliationReadError(err)
 	}
-	for i := range txns {
-		if v, ok := txns[i].ReferenceValue(deps.ReferenceField); ok && v == req.IdempotencyKey {
-			return &txns[i], nil
-		}
+	if reason != "" {
+		return nil, &reconciliationSemanticError{reason: reason}
 	}
-	return nil, nil
+	return found, nil
 }
 
 // recordPollFailure applies the ordinary exponential-backoff-with-jitter

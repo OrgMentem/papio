@@ -1971,10 +1971,7 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 		duplicate = true
 		if created == nil || created.State != delivery.StateOffered || created.ProviderReference != "" {
 			// A live or otherwise-resolved request already occupies this
-			// idempotency key (a concurrent evaluation, or a settled
-			// outcome). Never open a second live request (Decision 1) —
-			// route to reconciliation so a human resolves whatever it is,
-			// rather than guessing at its state from here.
+			// idempotency key. Never open a second live request.
 			return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
 		}
 		// Fall through: nothing was ever lodged for this row: retry
@@ -1993,6 +1990,9 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 			return created, err
 		}
 		if !classified || class != illiad.FailurePreSend {
+			if classified && class == illiad.FailureAmbiguous {
+				return created, s.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, created)
+			}
 			return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
 		}
 	}
@@ -2033,7 +2033,7 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 			return created, recordErr
 		}
 		if class != illiad.FailurePreSend {
-			return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
+			return created, s.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, created)
 		}
 		return created, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
 			"reason":              "resolver_temporarily_unavailable",
@@ -2044,7 +2044,7 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 	nextCheck := delivery.NextCheck(s.Now(), 0, profile.StatusPollMinutes)
 	won, err := s.Delivery.RecordSubmission(ctx, created.ID, providerRef, nextCheck)
 	if err != nil {
-		return created, err
+		return created, s.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, created)
 	}
 	// RecordSubmission atomically made the provider reference durable before
 	// this separate job transition can fail. Re-fetch so callers — the
@@ -2075,6 +2075,109 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 		"delivery_request_id": created.ID,
 		"provider_reference":  durableProviderRef,
 	}, job.WithRetryAt(nextCheck))
+}
+
+// reconcileAmbiguousSubmission is the only application call site for the
+// shared read-only reconciliation unit. A missing token match is persisted as
+// a bounded recheck event and parks the job; it never reaches submission.
+func (s *Service) reconcileAmbiguousSubmission(ctx context.Context, row *job.Row, from string, dd *config.DocumentDelivery, profile delivery.GateProfile, req *delivery.Request) error {
+	if req == nil || dd == nil {
+		return fmt.Errorf("delivery: reconciliation requires request and configuration")
+	}
+	identity := delivery.ReconciliationIdentity{
+		DOI:          row.Work.DOI,
+		PMID:         row.Work.PMID,
+		RequestClass: req.RequestClass,
+		Title:        row.Work.Title,
+		Author:       strings.Join(row.Work.Authors, "; "),
+	}
+	result, err := s.Delivery.Reconcile(ctx, req, delivery.ReconciliationDeps{
+		Client:         illiad.New(s.illiadHTTPClient(), dd.BaseURL, dd.APIKey),
+		PatronRef:      dd.PatronRef,
+		ReferenceField: illiadIdempotencyReferenceField,
+		Identity:       identity,
+		GateAction:     delivery.ActionSubmit,
+		CurrentBinding: profile.Digest(),
+	})
+	if err != nil {
+		// A provider call already happened. Never turn a local persistence
+		// failure into a second POST; route to the same reconciliation action.
+		return s.openDeliveryReconciliationAction(ctx, row, from, req)
+	}
+	if err := s.Jobs.RecordEvent(ctx, row.ID, "delivery.reconciliation_outcome", map[string]any{
+		"delivery_request_id": req.ID,
+		"disposition":         string(result.Disposition),
+		"reason":              result.Reason,
+		"provider_reference":  result.ProviderReference,
+	}); err != nil {
+		return err
+	}
+	switch result.Disposition {
+	case delivery.ReconciliationAdopted:
+		adopted, err := s.Delivery.Get(ctx, req.ID)
+		if err != nil {
+			return err
+		}
+		if adopted == nil {
+			return fmt.Errorf("delivery: adopted request %d disappeared", req.ID)
+		}
+		next := delivery.NextCheck(s.Now(), 0, profile.StatusPollMinutes)
+		return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+			"reason":              string(job.RetryReasonDocumentDeliveryPending),
+			"delivery_request_id": req.ID,
+			"provider_reference":  adopted.ProviderReference,
+		}, job.WithRetryAt(next))
+	case delivery.ReconciliationNotFoundYet:
+		attempt := reconciliationAttemptCount(ctx, s.Jobs, row.ID, req.ID) + 1
+		if err := s.Jobs.RecordEvent(ctx, row.ID, "delivery.reconciliation_attempt", map[string]any{
+			"delivery_request_id": req.ID,
+			"attempt":             attempt,
+			"attempted_at":        s.Now().UTC().Format(time.RFC3339Nano),
+		}); err != nil {
+			return err
+		}
+		if attempt >= offeredRecoveryMaxAttempts {
+			return s.openDeliveryReconciliationAction(ctx, row, from, req)
+		}
+		delay := offeredRecoveryInitialBackoff << (attempt - 1)
+		return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+			"reason":                 string(job.RetryReasonDocumentDeliveryPending),
+			"delivery_request_id":    req.ID,
+			"reconciliation_attempt": attempt,
+		}, job.WithRetryAt(s.Now().Add(delay)))
+	default:
+		if result.Reason == delivery.ReconciliationReasonCommitConflict && result.ProviderReference != "" {
+			current, getErr := s.Delivery.Get(ctx, req.ID)
+			if getErr != nil {
+				return getErr
+			}
+			durable := ""
+			if current != nil {
+				durable = current.ProviderReference
+			}
+			return s.openProviderSubmissionConflict(ctx, row.ID, req.ID, result.ProviderReference, durable)
+		}
+		return s.openDeliveryReconciliationAction(ctx, row, from, req)
+	}
+}
+
+func reconciliationAttemptCount(ctx context.Context, jobs *job.Store, jobID string, requestID int64) int {
+	events, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, event := range events {
+		if event["kind"] != "delivery.reconciliation_attempt" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		id, _ := detail["delivery_request_id"].(float64)
+		if int64(id) == requestID {
+			count++
+		}
+	}
+	return count
 }
 
 // openProviderSubmissionConflict records the provider reference received by a

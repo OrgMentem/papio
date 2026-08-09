@@ -11,6 +11,7 @@ package delivery
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -708,20 +709,39 @@ func (s *Service) LatestGateEvent(ctx context.Context, jobID string) (*GateEvalu
 	}, nil
 }
 
-// Digest is a stable fingerprint of the compiled profile, recorded as
+// Digest is a stable, keyed fingerprint of the compiled profile, recorded as
 // delivery_requests.gate_profile_digest so a later profile recompile never
 // gets silently misattributed to an older decision (0021_delivery_requests.sql).
+//
+// The key is the credential fingerprint, not the credential itself. The
+// unattended-submission path requires that high-entropy credential, so a
+// credential rotation necessarily invalidates recorded consent. Profiles
+// without a credential use a fixed domain key; they cannot compile
+// auto_capable, so this weaker fallback is advisory rather than an
+// authorization and never permits submission.
 func (p GateProfile) Digest() string {
-	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%d\x00%t\x00%t",
-		p.Class, p.Provider, p.SubmitPolicy, p.PatronFeePolicy, p.MonthlyRequestCap, p.RequiresOperatorStep, p.LiveAccepted)
-	classes := make([]string, 0, len(p.SupportedRequestClasses))
-	for c := range p.SupportedRequestClasses {
-		classes = append(classes, c)
+	key := []byte(p.CredentialFingerprint)
+	if len(key) == 0 {
+		key = []byte("papio:delivery:gate-profile:v2")
 	}
-	sort.Strings(classes)
-	for _, c := range classes {
-		fmt.Fprintf(h, "\x00%s", c)
+	h := hmac.New(sha256.New, key)
+	fmt.Fprintf(h, "v2\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%t\x00%t\x00%s\x00%d\x00%s",
+		p.Class, p.Provider, p.ProviderEndpoint, p.ReferenceField,
+		p.SubmitPolicy, p.PatronFeePolicy, p.PatronMappingFingerprint,
+		p.MonthlyRequestCap, p.RequiresOperatorStep, p.LiveAccepted,
+		p.CredentialFingerprint, p.StatusPollMinutes, p.FulfillmentChannel)
+	configured := append([]string(nil), p.RequestClasses...)
+	sort.Strings(configured)
+	for _, c := range configured {
+		fmt.Fprintf(h, "\x00configured:%s", c)
+	}
+	supported := make([]string, 0, len(p.SupportedRequestClasses))
+	for c := range p.SupportedRequestClasses {
+		supported = append(supported, c)
+	}
+	sort.Strings(supported)
+	for _, c := range supported {
+		fmt.Fprintf(h, "\x00supported:%s", c)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,16 +69,23 @@ func newLiveRequest(t *testing.T, svc *Service, jobID string, now time.Time) *Re
 
 // sequencedIlliadServer replies to successive GetTransaction/UserRequests
 // calls with responses[0], responses[1], ... (the last response repeats
-// once exhausted). userRequests, when non-nil, answers every
-// Transaction/User/ call regardless of sequence position.
+// once exhausted). userRequests, when non-nil, answers the patron-resolution
+// and Transaction/UserRequests calls regardless of sequence position.
 func sequencedIlliadServer(t *testing.T, userRequests []illiad.Transaction, responses ...http.HandlerFunc) *illiad.Client {
 	t.Helper()
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if userRequests != nil && len(r.URL.Path) >= len("/Transaction/User/") && r.URL.Path[:len("/Transaction/User/")] == "/Transaction/User/" {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(userRequests)
-			return
+		if userRequests != nil {
+			switch {
+			case strings.HasPrefix(r.URL.Path, "/Transaction/UserRequests/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(userRequests)
+				return
+			case strings.HasPrefix(r.URL.Path, "/Users/ExternalUserId/"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"UserName":"patron1"}`))
+				return
+			}
 		}
 		idx := calls
 		if idx >= len(responses) {
@@ -639,12 +647,38 @@ func TestPoll404UnreconciledSettlesUnknownOutcomeOnlyAfterDelayedRecheck(t *test
 	// fabricating a different string, so the CAS predicate still matches
 	// the true row.
 	*clock = clock.Add(notFoundReconciliationRecheckDelay + time.Second)
+
 	result, err = svc.Poll(ctx, req, PollDeps{Client: client, PatronRef: "patron1", ReferenceField: "ItemInfo4", StatusPollMinutes: 60})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !result.Settled || result.State != StateUnknownOutcome {
 		t.Fatalf("result = %+v, want settled unknown_outcome after the delayed recheck", result)
+	}
+}
+
+func TestPoll404DuplicateTokenSettlesUnknownForHumanReconciliation(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	ctx := context.Background()
+	req := newLiveRequest(t, svc, "404-reconcile-duplicate", *clock)
+	if _, err := svc.store.DB().ExecContext(ctx, `UPDATE delivery_requests SET last_successful_poll_at = ? WHERE id = ?`, clock.Format(time.RFC3339Nano), req.ID); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userRequests := []illiad.Transaction{
+		{TransactionNumber: 1, TransactionStatus: illiadStatusAwaitingUnfilled, ItemInfo4: req.IdempotencyKey},
+		{TransactionNumber: 2, TransactionStatus: illiadStatusAwaitingUnfilled, ItemInfo4: req.IdempotencyKey},
+	}
+	client := sequencedIlliadServer(t, userRequests, statusOnly(http.StatusNotFound))
+	result, err := svc.Poll(ctx, req, PollDeps{Client: client, PatronRef: "patron1", ReferenceField: "ItemInfo4", StatusPollMinutes: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Settled || result.State != StateUnknownOutcome {
+		t.Fatalf("result = %+v, want settled unknown_outcome", result)
 	}
 }
 

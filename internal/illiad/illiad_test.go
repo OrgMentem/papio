@@ -145,13 +145,20 @@ func TestGetTransactionNotFound(t *testing.T) {
 }
 
 func TestUserRequestsParsesList(t *testing.T) {
-	var gotPath string
+	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.EscapedPath()
-		_, _ = w.Write([]byte(`[
-			{"TransactionNumber": 1, "TransactionStatus": "Delivered to Web", "CreationDate": "2026-08-01T00:00:00", "ItemInfo4": "papio:idem:a"},
-			{"TransactionNumber": 2, "TransactionStatus": "Cancelled by ILL Staff", "CreationDate": "2026-08-02T00:00:00", "ItemInfo4": "papio:idem:b"}
-		]`))
+		paths = append(paths, r.URL.EscapedPath())
+		switch r.URL.EscapedPath() {
+		case "/Users/ExternalUserId/jstudent%2Fcampus%20id@campus.example.edu":
+			_, _ = w.Write([]byte(`{"UserName":"jstudent"}`))
+		case "/Transaction/UserRequests/jstudent":
+			_, _ = w.Write([]byte(`[
+				{"TransactionNumber": 1, "TransactionStatus": "Delivered to Web", "CreationDate": "2026-08-01T00:00:00", "ItemInfo4": "papio:idem:a"},
+				{"TransactionNumber": 2, "TransactionStatus": "Cancelled by ILL Staff", "CreationDate": "2026-08-02T00:00:00", "ItemInfo4": "papio:idem:b"}
+			]`))
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	defer server.Close()
 
@@ -160,8 +167,8 @@ func TestUserRequestsParsesList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UserRequests: %v", err)
 	}
-	if gotPath != "/Transaction/User/jstudent%2Fcampus%20id@campus.example.edu" {
-		t.Fatalf("path = %q, want the path-escaped user reference", gotPath)
+	if len(paths) != 2 || paths[0] != "/Users/ExternalUserId/jstudent%2Fcampus%20id@campus.example.edu" || paths[1] != "/Transaction/UserRequests/jstudent" {
+		t.Fatalf("paths = %v, want external-id resolution followed by UserRequests", paths)
 	}
 	if len(txs) != 2 {
 		t.Fatalf("transactions = %d, want 2", len(txs))

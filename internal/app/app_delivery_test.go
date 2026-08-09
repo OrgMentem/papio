@@ -625,9 +625,14 @@ func TestSubmitDeliveryRequestTransportFailureThenRetrySubmitsOnce(t *testing.T)
 }
 
 func TestSubmissionPersistenceFailureAfterProviderSuccessDoesNotResubmit(t *testing.T) {
-	var posts atomic.Int32
+	var posts, gets atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		posts.Add(1)
+		switch r.Method {
+		case http.MethodPost:
+			posts.Add(1)
+		case http.MethodGet:
+			gets.Add(1)
+		}
 		_, _ = w.Write([]byte(`{"TransactionNumber": 9101, "TransactionStatus": "Awaiting Request Processing"}`))
 	}))
 	defer server.Close()
@@ -661,13 +666,19 @@ func TestSubmissionPersistenceFailureAfterProviderSuccessDoesNotResubmit(t *test
 		t.Fatal(err)
 	}
 	if posts.Load() != 1 {
-		t.Fatalf("provider posts after first pass = %d, want 1", posts.Load())
+		t.Fatalf("provider POSTs after first pass = %d, want 1", posts.Load())
+	}
+	if gets.Load() != 1 {
+		t.Fatalf("provider GETs after first pass = %d, want 1 reconciliation read", gets.Load())
 	}
 	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if posts.Load() != 1 {
-		t.Fatalf("provider posts after persistence failure recovery = %d, want no resubmission", posts.Load())
+		t.Fatalf("provider POSTs after persistence failure recovery = %d, want no resubmission", posts.Load())
+	}
+	if gets.Load() != 1 {
+		t.Fatalf("provider GETs after persistence failure recovery = %d, want no duplicate reconciliation read", gets.Load())
 	}
 	got, err := deliverySvc.Get(ctx, req.ID)
 	if err != nil {
@@ -763,9 +774,14 @@ func TestSubmissionCASConflictKeepsReceivedReferenceVisible(t *testing.T) {
 	}
 }
 func TestSubmitDeliveryAmbiguousFailureDoesNotRepost(t *testing.T) {
-	var posts int
+	var posts, gets atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		posts++
+		switch r.Method {
+		case http.MethodPost:
+			posts.Add(1)
+		case http.MethodGet:
+			gets.Add(1)
+		}
 		http.Error(w, "provider outcome unavailable", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
@@ -795,8 +811,11 @@ func TestSubmitDeliveryAmbiguousFailureDoesNotRepost(t *testing.T) {
 	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if posts != 1 {
-		t.Fatalf("provider posts = %d, want exactly one ambiguous attempt", posts)
+	if posts.Load() != 1 {
+		t.Fatalf("provider POSTs = %d, want exactly one ambiguous attempt", posts.Load())
+	}
+	if gets.Load() != 1 {
+		t.Fatalf("provider GETs = %d, want exactly one reconciliation read", gets.Load())
 	}
 }
 

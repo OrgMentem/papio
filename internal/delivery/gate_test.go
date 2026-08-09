@@ -4,6 +4,7 @@
 package delivery
 
 import (
+	"strings"
 	"testing"
 
 	"papio/internal/config"
@@ -291,5 +292,47 @@ func TestGateProfileDigestStableAndSensitiveToClass(t *testing.T) {
 	p3.Class = GateClassPrefillOnly
 	if p1.Digest() == p3.Digest() {
 		t.Fatal("Digest() unchanged after Class changed — recompiles would be silently misattributed")
+	}
+}
+func TestGateProfileDigestBindsSubmissionIdentity(t *testing.T) {
+	base := CompileGateProfile(config.Institution{DocumentDelivery: fullHouseDocumentDelivery()}, "campus")
+	if got, want := base.Digest(), base.Digest(); got != want {
+		t.Fatalf("Digest is not stable: first %q, second %q", got, want)
+	}
+	if strings.Contains(base.Digest(), "secret-key") || strings.Contains(base.Digest(), "configured-non-secret-reference") {
+		t.Fatalf("Digest contains a raw credential or patron mapping: %q", base.Digest())
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*GateProfile)
+	}{
+		{"patron mapping", func(p *GateProfile) { p.PatronMappingFingerprint = identityFingerprint("different-patron") }},
+		{"credential", func(p *GateProfile) { p.CredentialFingerprint = identityFingerprint("different-secret") }},
+		{"reference field", func(p *GateProfile) { p.ReferenceField = "ItemInfo5" }},
+		{"provider endpoint", func(p *GateProfile) { p.ProviderEndpoint = "https://other.example.edu/ILLiadWebPlatform" }},
+		{"request class", func(p *GateProfile) {
+			p.RequestClasses = []string{"different_request_class"}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := base
+			test.mutate(&changed)
+			if got, want := changed.Digest(), base.Digest(); got == want {
+				t.Fatalf("Digest = %q after changing %s, want a different digest", got, test.name)
+			}
+		})
+	}
+}
+
+func TestGateProfileDigestCredentialRotationInvalidatesConsent(t *testing.T) {
+	original := fullHouseDocumentDelivery()
+	rotated := *original
+	rotated.APIKey = "rotated-secret"
+	before := CompileGateProfile(config.Institution{DocumentDelivery: original}, "campus").WithLiveAcceptance(true)
+	after := CompileGateProfile(config.Institution{DocumentDelivery: &rotated}, "campus").WithLiveAcceptance(true)
+	if before.Digest() == after.Digest() {
+		t.Fatal("credential rotation preserved gate digest; existing consent could be reused")
 	}
 }

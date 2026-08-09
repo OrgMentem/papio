@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/store"
 )
@@ -826,5 +827,30 @@ func TestListRecoverableOnlyOfferedWithoutProviderReference(t *testing.T) {
 				t.Fatalf("row returned = %t, want %t; rows = %+v", found, tc.want, got)
 			}
 		})
+	}
+}
+func TestCreatePersistsOnlyIdentityDigestNotRawBindingInputs(t *testing.T) {
+	svc := testService(t, time.Now())
+	testJob(t, svc, "job_digest_identity")
+	profile := CompileGateProfile(config.Institution{DocumentDelivery: fullHouseDocumentDelivery()}, "campus")
+	const rawSecret = "secret-key"
+	const rawPatron = "configured-non-secret-reference"
+	if strings.Contains(profile.Digest(), rawSecret) || strings.Contains(profile.Digest(), rawPatron) {
+		t.Fatal("profile digest contains raw identity input")
+	}
+	if _, err := svc.Create(context.Background(), CreateRequest{
+		JobID: "job_digest_identity", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/digest",
+		GateProfileDigest: profile.Digest(),
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	var stored string
+	if err := svc.store.DB().QueryRowContext(context.Background(),
+		`SELECT gate_profile_digest FROM delivery_requests WHERE job_id = ?`, "job_digest_identity").Scan(&stored); err != nil {
+		t.Fatalf("read stored digest: %v", err)
+	}
+	if strings.Contains(stored, rawSecret) || strings.Contains(stored, rawPatron) {
+		t.Fatalf("stored digest contains raw identity input: %q", stored)
 	}
 }

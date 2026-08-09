@@ -2,6 +2,9 @@
 package delivery
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+
 	"papio/internal/config"
 )
 
@@ -21,6 +24,20 @@ const (
 // ordinary browser-handoff machinery once a request reaches fulfilled.
 // GateProfile.FulfillmentChannel is "" when no channel compiles.
 const FulfillmentChannelPatronWeb = "patron_web"
+
+// IdempotencyReferenceField is the currently deployed ILLiad general-purpose
+// field carrying papio's idempotency token. The app submission path uses the
+// same value; binding it here makes a future field change stale existing
+// consent instead of silently reusing it.
+const IdempotencyReferenceField = "ItemInfo4"
+
+func identityFingerprint(value string) string {
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
 
 // Blocker vocabulary (ADR-0017 Decision 3A) — closed, exactly these 13
 // strings. A blocker code may appear more than once on a profile with
@@ -90,14 +107,20 @@ var providerCapabilities = map[string]providerCapability{
 
 // GateProfile is the compiled Decision 3A gate profile for one institution
 // profile. CompileGateProfile produces it from configuration alone; only
-// Service.ResolveGateProfile can fold in the store-backed live-acceptance
-// fact that decides whether a structurally eligible profile actually
-// reaches GateClassAutoCapable.
 type GateProfile struct {
 	ProfileName string
 	Provider    string // the configured document_delivery.kind
 	Class       GateClass
 	Blockers    []Blocker
+
+	// Identity binding is deliberately represented by one-way fingerprints
+	// for personal/credential values. These fields are safe to carry in a
+	// compiled profile and are included in Digest; raw patron_ref and api_key
+	// never leave config loading.
+	PatronMappingFingerprint string
+	CredentialFingerprint    string
+	ReferenceField           string
+	ProviderEndpoint         string
 
 	// Snapshot of the static declarations EvaluateGate's seven-point
 	// per-request gate consults (Decision 3B), so the gate never has to
@@ -148,6 +171,10 @@ func CompileGateProfile(inst config.Institution, profileName string) GateProfile
 	}
 
 	profile.Provider = dd.Kind
+	profile.ProviderEndpoint = dd.BaseURL
+	profile.ReferenceField = IdempotencyReferenceField
+	profile.PatronMappingFingerprint = identityFingerprint(dd.PatronRef)
+	profile.CredentialFingerprint = identityFingerprint(dd.APIKey)
 	profile.SubmitPolicy = dd.SubmitPolicy
 	profile.RequestClasses = append([]string(nil), dd.RequestClasses...)
 	profile.PatronFeePolicy = dd.PatronFeePolicy
@@ -157,8 +184,7 @@ func CompileGateProfile(inst config.Institution, profileName string) GateProfile
 		// Independent of Class: compiles alongside prefill_only just as
 		// readily as auto_capable — a profile whose submission stays
 		// human still gets automatic retrieval once *something* (a human
-		// submission, or a future auto-submit) lands the request
-		// fulfilled.
+		// submission, or a future auto-submit) lands the request fulfilled.
 		profile.FulfillmentChannel = FulfillmentChannelPatronWeb
 	}
 
