@@ -58,6 +58,10 @@
   heading (it injects one whenever the Markdown has none) and render the
   article body directly. That also drops the edit/source actions, which do
   not belong on a landing page.
+
+  The page keeps both sidebars, so the article column — and its reading
+  measure — is exactly the one every other page uses; the hero's two columns
+  are sized in extra.css to line up with them.
 -#}
 {% block content %}
   {{ page.content }}

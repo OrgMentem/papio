@@ -1,8 +1,5 @@
 ---
 template: home.html
-hide:
-  - navigation
-  - toc
 ---
 
 Search for works, queue them for acquisition, check every PDF is the paper you asked for, and offer it toward your library — from the terminal or from a coding agent.

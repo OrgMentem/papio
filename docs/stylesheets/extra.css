@@ -7,17 +7,18 @@
   font-style: italic;
 }
 
-/* Hero geometry, shared with the landing body below so the two columns
-   cannot drift apart. */
-:root {
-  --mdx-hero-mark: 13rem; /* width of the art column */
-  --mdx-hero-gap: 2.4rem; /* gap between art and copy */
-  --mdx-hero-pad: 0.8rem; /* grid inset, matches .md-grid */
-  --mdx-measure: 34.4rem; /* body measure on pages that keep both sidebars */
-}
-
 /* Landing hero (overrides/home.html): animated wordmark left, positioning
-   copy right, full page width because index.md hides both sidebars. */
+   copy right.
+
+   The hero spans the full grid, but the page keeps its sidebars, so the two
+   hero columns are sized to the page's own columns: the art sits over the
+   navigation rail and the copy starts exactly where the article text does.
+   That leaves no stranded gutter and no second reading measure to maintain. */
+:root {
+  --mdx-hero-rail: 12.5rem; /* primary sidebar (12.1rem) + the article inset */
+  --mdx-hero-gap: 2.4rem; /* gap between art and copy */
+  --mdx-hero-mark: calc(var(--mdx-hero-rail) - var(--mdx-hero-gap));
+}
 
 .mdx-hero {
   border-bottom: 0.05rem solid var(--md-default-fg-color--lightest);
@@ -29,22 +30,7 @@
   grid-template-columns: minmax(0, var(--mdx-hero-mark)) minmax(0, 1fr);
   align-items: center;
   gap: var(--mdx-hero-gap);
-  padding: 2.4rem var(--mdx-hero-pad);
-}
-
-/* Hiding both sidebars would stretch body text across the full 61rem grid.
-   Hold the ordinary reading measure and start the column under the hero
-   headline, so the mark reads as a margin figure. The min() drops the indent
-   before it would squeeze the measure, so this needs no breakpoint: the text
-   slides back to the left edge on narrow viewports. Article and hero share
-   the same 0.8rem grid inset, so the indent is just the art column plus the
-   gap. */
-.mdx-landing {
-  max-width: var(--mdx-measure);
-  margin-left: min(
-    calc(var(--mdx-hero-mark) + var(--mdx-hero-gap)),
-    max(0px, 100% - var(--mdx-measure))
-  );
+  padding: 2.4rem 0.8rem;
 }
 
 /* The two ink variants are stacked and cross-faded instead of using the
@@ -84,8 +70,22 @@
   margin-left: 0.4rem;
 }
 
-/* Phones: stack, and cap the mark so it never owns the whole fold. The
-   landing page hides both sidebars, so two columns still fit on tablets. */
+/* Below the theme's desktop breakpoint there is no navigation rail to hold
+   the mark, so stack it above the copy — both flush with the article's left
+   edge, which now starts at the grid inset. */
+@media screen and (max-width: 76.1875em) {
+  .mdx-hero__inner {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.6rem;
+    padding: 2rem 0.8rem;
+  }
+
+  .mdx-hero__mark {
+    max-width: var(--mdx-hero-mark);
+  }
+}
+
+/* Phones: center the stack and cap the mark so it never owns the whole fold. */
 @media screen and (max-width: 44.9375em) {
   .mdx-hero__inner {
     grid-template-columns: 1fr;
