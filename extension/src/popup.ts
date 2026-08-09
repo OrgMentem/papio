@@ -530,9 +530,8 @@ export async function cleanupOrphanTabs(): Promise<number> {
       channel: "papio",
       action: "orphan_tabs_cleanup",
     });
-    if (typeof response !== "object" || response === null) return 0;
-    const closed = (response as Record<string, unknown>)["closed"];
-    return typeof closed === "number" ? closed : 0;
+    const focused = (response as Record<string, unknown>)["focused"];
+    return typeof focused === "number" ? focused : 0;
   } catch {
     return 0;
   }
@@ -540,9 +539,9 @@ export async function cleanupOrphanTabs(): Promise<number> {
 
 const leftoverCleanupHandlers = new WeakMap<HTMLButtonElement, () => Promise<number>>();
 
-/** Offer a one-click close of tabs papio opened in a previous extension life
- * and can no longer track (reloads wipe the session store; the durable ledger
- * and the papio tab-group sweep still recognize them). Hidden at zero. */
+/** Offer a bounded review action for tabs papio left open from an earlier
+ * session. Papio focuses one candidate; the operator closes it with browser
+ * controls. Hidden at zero. */
 export function renderLeftoverTabs(
   doc: Document,
   count: number,
@@ -565,9 +564,9 @@ export function renderLeftoverTabs(
   section.hidden = false;
   message.textContent =
     count === 1
-      ? "1 untracked tab left from an earlier session."
-      : `${count} untracked tabs left from an earlier session.`;
-  button.textContent = "Close them";
+      ? "1 papio tab is ready for review; close it with browser controls."
+      : `${count} papio tabs are ready for review; close them with browser controls.`;
+  button.textContent = "Review in browser";
   leftoverCleanupHandlers.set(button, onCleanup);
   if (!button.dataset.wired) {
     button.dataset.wired = "1";
@@ -575,14 +574,20 @@ export function renderLeftoverTabs(
       const cleanup = leftoverCleanupHandlers.get(button);
       if (cleanup === undefined) return;
       button.disabled = true;
-      button.textContent = "Closing…";
+      button.textContent = "Focusing…";
       void cleanup().then(
-        () => {
-          section.hidden = true;
+        (focused) => {
+          button.disabled = false;
+          button.textContent = "Review in browser";
+          message.textContent =
+            focused > 0
+              ? "Focused a papio tab; close it with browser controls."
+              : "No reviewable papio tabs remain.";
         },
         () => {
           button.disabled = false;
-          button.textContent = "Close them";
+          button.textContent = "Review in browser";
+          message.textContent = "Could not focus a papio tab; close it with browser controls.";
         },
       );
     });

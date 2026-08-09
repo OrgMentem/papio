@@ -1264,10 +1264,10 @@ test("a provider PDF opened in a new viewer tab is adopted for the opener job", 
   h.tabs.live.set(viewerTab, { id: viewerTab, url: pdfUrl, openerTabId: trackedTab });
   await h.tabs.onUpdated.emit(viewerTab, { status: 'complete', url: pdfUrl }, { id: viewerTab, url: pdfUrl, openerTabId: trackedTab });
 
-  // The PDF is downloaded for the opener job and the viewer tab is closed.
+  // The PDF is downloaded for the opener job and the viewer remains open.
   expect(h.downloads.started.map(d => d.url)).toContain(pdfUrl);
   expect(h.downloads.started.some(d => d.filename.includes('job_viewer_0001'))).toBe(true);
-  expect(h.tabs.live.has(viewerTab)).toBe(false);
+  expect(h.tabs.live.has(viewerTab)).toBe(true);
 });
 
 test("a stray non-opener PDF tab is not adopted", async () => {

@@ -1415,10 +1415,10 @@ test("leftover-tabs card stays hidden at zero and renders a pluralized count", (
 
   renderLeftoverTabs(doc, 3, async () => 3);
   expect(section?.hasAttribute("hidden")).toBe(false);
-  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("3 untracked tabs");
+  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("3 papio tabs");
 
   renderLeftoverTabs(doc, 1, async () => 1);
-  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("1 untracked tab left");
+  expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("1 papio tab");
 });
 
 test("leftover-tabs cleanup uses the latest callback after a rerender", async () => {
@@ -1438,7 +1438,7 @@ test("leftover-tabs cleanup uses the latest callback after a rerender", async ()
   expect(calls).toEqual(["new"]);
 });
 
-test("leftover-tabs cleanup click closes the card and a failure re-arms the button", async () => {
+test("leftover-tabs review keeps the card and a failure re-arms the button", async () => {
   const doc = popupDocument();
   let calls = 0;
   renderLeftoverTabs(doc, 2, async () => {
@@ -1456,13 +1456,15 @@ test("leftover-tabs cleanup click closes the card and a failure re-arms the butt
   // First attempt failed: the card persists and the button re-arms.
   expect(section?.hasAttribute("hidden")).toBe(false);
   expect(button.disabled).toBe(false);
-  expect(button.textContent).toBe("Close them");
+  expect(button.textContent).toBe("Review in browser");
 
   button.click();
   await Promise.resolve();
   await Promise.resolve();
   expect(calls).toBe(2);
-  expect(section?.hasAttribute("hidden")).toBe(true);
+  expect(section?.hasAttribute("hidden")).toBe(false);
+  expect(button.disabled).toBe(false);
+  expect(button.textContent).toBe("Review in browser");
 });
 
 test("a release notice keeps the card with a warm summary, never a bare heading", () => {

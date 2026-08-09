@@ -586,6 +586,12 @@ export interface PdfGrabCorrelation {
   abandonPending?: boolean;
 }
 
+type ManagedTabLedgerEntry = {
+  openedAt: number;
+  url: string;
+  windowId?: number;
+  groupId?: number;
+};
 export interface BridgeDeps {
   connectNative(name: string): NativePort;
   manifestVersion: string;
@@ -596,9 +602,9 @@ export interface BridgeDeps {
   backend: StateBackend;
   tabs: {
     create(props: { url: string; active: boolean; windowId?: number }): Promise<TabInfo>;
+    remove(tabID: number): Promise<void>;
     get(tabID: number): Promise<TabInfo>;
     reload(tabID: number): Promise<unknown>;
-    remove(tabID: number): Promise<void>;
     /** Optional: surface a work-window tab on human auth ({active}), or
      * navigate the handoff tab to a federated-login route ({url}). */
     update?(tabID: number, props: { active?: boolean; url?: string }): Promise<unknown>;
@@ -611,8 +617,6 @@ export interface BridgeDeps {
      * navigation event is still evidence the operator is looking at that
      * origin's resolver page. */
     onActivated: Listenable<[{ tabId: number; windowId: number }]>;
-    /** Optional (Chrome): add tabs to a group, creating one when groupId is
-     * omitted. Returns the group id. Absent on platforms without tab groups. */
     group?(opts: { tabIds: number[]; groupId?: number }): Promise<number>;
   };
   /** Extension-page broadcast channel (runtime.onMessage), distinct from tabs.sendMessage content-script delivery. */
@@ -628,9 +632,6 @@ export interface BridgeDeps {
       windowID: number,
       props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean },
     ): Promise<unknown>;
-    /** Close papio's dedicated work window once it holds no papio tabs, so the
-     * background window never accumulates across handoffs. */
-    remove(windowID: number): Promise<void>;
   };
   tabGroups?: {
     get(groupID: number): Promise<TabGroupInfo>;
@@ -694,14 +695,13 @@ export interface BridgeDeps {
      * tabGroups is absent. */
     getHandoffSurface(): Promise<HandoffSurface>;
   };
-  /** Durable managed-tab ledger (chrome.storage.local). The session store dies
-   * with an extension reload, orphaning every tab papio opened in its previous
-   * life; this ledger survives the reload so the popup can offer a one-click
-   * cleanup instead of leaking those tabs forever. Optional: absent disables
-   * durable orphan ownership tracking. */
+  /** Durable managed-tab ledger (chrome.storage.local). Entries carry the
+   * URL and browser surface captured when papio created the tab, so a stale
+   * id collision after restart cannot focus a foreign tab. Optional: absent
+   * disables durable orphan ownership tracking. */
   tabLedger?: {
-    load(): Promise<Record<string, number>>;
-    save(entries: Record<string, number>): Promise<void>;
+    load(): Promise<Record<string, ManagedTabLedgerEntry>>;
+    save(entries: Record<string, ManagedTabLedgerEntry>): Promise<void>;
   };
   /** Ephemeral scan snapshots (chrome.storage.session): never chrome.storage
    * local/sync, never persisted, never sent to the daemon (ADR-0019
@@ -1269,17 +1269,15 @@ export class Bridge {
   private listenersBound = false;
   private readonly downloads = new Map<string, DownloadTrack>();
   private readonly grabDownloads = new Map<string, PdfGrabTrack>();
-  /** Tabs we are intentionally closing, so onRemoved does not emit a spurious
-   * cancelled outcome for a programmatic close. */
-  private readonly closingTabs = new Set<number>();
   /** Browser-driven fixture capture shares the two-slot handoff governor. */
   private pageCaptureDriving = false;
-  private readonly pageCaptureLoadWaiters = new Map<number, (loaded: boolean) => void>();
-  /** Lazily-loaded durable ledger of broker tabs this and prior extension
-   * lives created. Keys are stringified tab ids, values open timestamps. */
   /** Serializes every managed-tab ledger load/mutate/save transaction. */
   private tabLedgerChain: Promise<void> = Promise.resolve();
-  private tabLedgerCache: Record<string, number> | undefined;
+  /** Lazily-loaded durable ledger of broker tabs papio created. Entries retain
+   * the original URL/surface identity for safe post-restart review. */
+  private tabLedgerCache: Record<string, ManagedTabLedgerEntry> | undefined;
+  private readonly pageCaptureLoadWaiters = new Map<number, (loaded: boolean) => void>();
+  private readonly adoptedViewerTabs = new Map<string, number>();
   /** A finished download keeps its broker tab open until the daemon has
    * acknowledged the adoption attempt for that job. */
   private readonly completedDownloadTabs = new Map<string, number>();
@@ -1368,7 +1366,7 @@ export class Bridge {
   private readonly handoffDriveTimeouts = new Map<string, object>();
   private handoffDriveDrainChain: Promise<void> = Promise.resolve();
   /** URLs papio has intentionally opened or navigated for each tracked job.
-   * Used only as a best-effort guard against closing a tab the user reused. */
+   * Used for managed-tab deduplication and lifecycle bookkeeping. */
   private readonly managedTabURLs = new Map<string, Set<string>>();
   /** Single reducer state for the papio tab-group's human-attention surface. */
   private handoffGroupDesiredExpanded = false;
@@ -1912,52 +1910,7 @@ export class Bridge {
     this.managedTabURLs.set(jobID, known);
   }
 
-  /** A URL is closable only when it still resembles a page papio opened for
-   * this job. A different origin is treated as user navigation and left alone. */
-  private isManagedTabURL(job: ActiveJob, rawURL: string | undefined): boolean {
-    if (rawURL === undefined || rawURL.length === 0) return false;
-    const normalized = normalizeManagedTabURL(rawURL);
-    if (this.managedTabURLs.get(job.job_id)?.has(normalized)) return true;
-    const offered = this.offerURLs.get(job.job_id);
-    if (offered !== undefined && normalizeManagedTabURL(offered) === normalized) return true;
-    try {
-      const current = new URL(rawURL);
-      if (current.hostname === CHROME_PDF_VIEWER_HOST || isAuthenticationURL(rawURL)) return true;
-      if (offered !== undefined && new URL(offered).origin === current.origin) return true;
-      return hostMatches(current.hostname, job.provider_hosts) ||
-        this.deps.adapterSpecs.some((spec) => hostMatches(current.hostname, spec.hosts));
-    } catch {
-      return false;
-    }
-  }
 
-  private async closeManagedHandoffTab(job: ActiveJob, tabID: number): Promise<boolean> {
-    if (tabID < 0) return false;
-    let tab: TabInfo;
-    try {
-      tab = await this.deps.tabs.get(tabID);
-    } catch {
-      return false;
-    }
-    if (tab.id !== tabID || !this.isManagedTabURL(job, tab.url)) return false;
-    const surface = await this.handoffSurface();
-    if (surface === "work-window" && (this.store.workWindowID === undefined || tab.windowId !== this.store.workWindowID)) {
-      return false;
-    }
-    if (surface === "tab-group") {
-      const groupID = tab.groupId;
-      if (groupID === undefined || groupID < 0 || this.deps.tabGroups === undefined) return false;
-      if ((await this.knownHandoffGroup(groupID, tab.windowId)) === undefined) return false;
-    }
-    this.closingTabs.add(tabID);
-    try {
-      await this.deps.tabs.remove(tabID);
-      return true;
-    } catch {
-      this.closingTabs.delete(tabID);
-      return false;
-    }
-  }
 
   /** Route every resolver/provider open through the selected handoff surface,
    * reusing a live tracked job tab; jobless resolver opens use URL equality
@@ -2048,8 +2001,29 @@ export class Bridge {
     if (job === undefined || job.tab_id === tabID) return;
     await this.update((s) => patchJob(s, jobID, { tab_id: tabID }));
   }
-
-  private async saveTabLedger(ledger: Record<string, number>): Promise<void> {
+  /** The authoritative get is followed immediately by remove in this turn;
+   * the residual activation gap is milliseconds and recoverable through
+   * reopen-closed-tab. */
+  private async closeOwnedTab(tabID: number, reason: string): Promise<void> {
+    const entry = this.tabLedgerCache?.[String(tabID)];
+    if (entry === undefined || findByTab(this.store, tabID) !== undefined) return;
+    if (reason === "adopted-viewer" || isPDFPage(entry.url)) return;
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(tabID);
+    } catch {
+      return;
+    }
+    if (reason === "adopted-viewer" || (tab.url !== undefined && isPDFPage(tab.url))) return;
+    const inWorkWindow = tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
+    const inPapioGroup = tab.groupId !== undefined && tab.groupId === this.store.handoffGroupID;
+    if (
+      tab.active === true ||
+      (!inWorkWindow && !inPapioGroup)
+    ) return;
+    await this.deps.tabs.remove(tabID).catch(() => undefined);
+  }
+  private async saveTabLedger(ledger: Record<string, ManagedTabLedgerEntry>): Promise<void> {
     const snapshot = { ...ledger };
     try {
       await this.deps.tabLedger?.save(snapshot);
@@ -2057,13 +2031,12 @@ export class Bridge {
       // Best-effort durability: a failed write only degrades future cleanup.
     }
   }
-
   /** Load, mutate, and persist the managed-tab ledger as one serialized
    * transaction. Every cache and storage value is a fresh snapshot so a later
    * mutation cannot rewrite an earlier save's object in place. */
   private runTabLedgerTransaction<T>(
     transaction: (
-      ledger: Record<string, number>,
+      ledger: Record<string, ManagedTabLedgerEntry>,
     ) => Promise<{ value: T; changed: boolean }> | { value: T; changed: boolean },
   ): Promise<T> {
     const operation = this.tabLedgerChain.then(async () => {
@@ -2094,14 +2067,25 @@ export class Bridge {
    * a tab it did not open. */
   private async ledgerManagedTab(tabID: number): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(tabID);
+    } catch {
+      return;
+    }
+    if (typeof tab.url !== "string" || tab.url.length === 0) return;
     await this.runTabLedgerTransaction(async (ledger) => {
       const key = String(tabID);
       if (ledger[key] !== undefined) return { value: undefined, changed: false };
-      ledger[key] = this.deps.now();
+      ledger[key] = {
+        openedAt: this.deps.now(),
+        url: tab.url!,
+        ...(tab.windowId === undefined ? {} : { windowId: tab.windowId }),
+        ...(tab.groupId === undefined ? {} : { groupId: tab.groupId }),
+      };
       return { value: undefined, changed: true };
     });
   }
-
   private async forgetLedgeredTab(tabID: number): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
     await this.runTabLedgerTransaction(async (ledger) => {
@@ -2112,20 +2096,16 @@ export class Bridge {
     });
   }
 
-  /** Classify ledgered, untracked tabs. Tabs sitting in papio's OWN surfaces
-   * (the papio tab group or the dedicated work window) are unambiguously
-   * papio's to manage and are reconciled automatically; ledgered strays
-   * elsewhere (in-window fallbacks, tabs the user pulled out of the group)
-   * only ever close through the operator's popup card. Tracked, active,
-   * and pinned (keepalive) tabs are never candidates; dead ledger entries
-   * are pruned as a side effect. */
+  /** Classify ledgered, untracked tabs without taking lifecycle action. Tabs
+   * in papio surfaces and tabs the operator can review are returned separately;
+   * dead or identity-mismatched entries are pruned. Tracked, active, and
+   * pinned (keepalive) tabs are never candidates. */
   private async classifyLedgeredTabs(): Promise<{ auto: number[]; ask: number[] }> {
     await this.ready;
     if (this.deps.tabLedger === undefined) return { auto: [], ask: [] };
     const tracked = new Set<number>();
     for (const job of this.store.activeJobs) if (job.tab_id >= 0) tracked.add(job.tab_id);
     for (const id of this.completedDownloadTabs.values()) tracked.add(id);
-    for (const id of this.closingTabs) tracked.add(id);
     return this.runTabLedgerTransaction(async (ledger) => {
       const auto = new Set<number>();
       const ask = new Set<number>();
@@ -2138,6 +2118,12 @@ export class Bridge {
           continue;
         }
         if (tracked.has(tabID)) continue;
+        const entry = ledger[key];
+        if (entry === undefined || typeof entry.url !== "string" || entry.url.length === 0) {
+          delete ledger[key];
+          changed = true;
+          continue;
+        }
         let tab: TabInfo;
         try {
           tab = await this.deps.tabs.get(tabID);
@@ -2146,8 +2132,11 @@ export class Bridge {
           changed = true;
           continue;
         }
-        // Never the tab the user is looking at, and never the keepalive
-        // resolver tab — Chrome marks it pinned, and it is papio's session.
+        if (tab.url !== entry.url) {
+          delete ledger[key];
+          changed = true;
+          continue;
+        }
         if (tab.active === true || tab.pinned === true) continue;
         let ownedSurface = tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
         if (!ownedSurface && tab.groupId !== undefined && tab.groupId >= 0) {
@@ -2171,33 +2160,25 @@ export class Bridge {
     return { count: ask.length, tab_ids: ask };
   }
 
-  /** papio owns its surfaces: silently close ledgered tabs still sitting in
-   * the papio group or work window once the daemon has had time to reclaim
-   * live work. Runs shortly after startup — no operator step required. */
+  /** papio owns its surfaces but never closes them; startup reconciliation
+   * only classifies the tabs so an operator can review them in the browser. */
   async reconcileOwnedTabs(): Promise<{ closed: number }> {
-    const { auto } = await this.classifyLedgeredTabs();
-    return { closed: await this.closeLedgeredTabs(auto) };
+    await this.classifyLedgeredTabs();
+    return { closed: 0 };
   }
 
-  private async closeLedgeredTabs(tabIDs: readonly number[]): Promise<number> {
-    let closed = 0;
-    for (const tabID of tabIDs) {
-      this.closingTabs.add(tabID);
-      try {
-        await this.deps.tabs.remove(tabID);
-        closed++;
-      } catch {
-        this.closingTabs.delete(tabID);
-      }
-      await this.forgetLedgeredTab(tabID);
-    }
-    return closed;
-  }
-
-  /** Operator-initiated: close every stray the popup card offered. */
-  async cleanupOrphanTabs(): Promise<{ closed: number }> {
+  /** Operator-initiated review focuses one bounded orphan surface; the
+   * operator closes the reviewed tab through browser UI. */
+  async cleanupOrphanTabs(): Promise<{ closed: number; focused: number }> {
     const { tab_ids } = await this.orphanTabStatus();
-    return { closed: await this.closeLedgeredTabs(tab_ids) };
+    const tabID = tab_ids[0];
+    if (tabID === undefined) return { closed: 0, focused: 0 };
+    try {
+      await this.focusManagedTab(tabID);
+      return { closed: 0, focused: 1 };
+    } catch {
+      return { closed: 0, focused: 0 };
+    }
   }
   private handoffNeedsHumanNow(): boolean {
     return this.store.activeJobs.some(
@@ -2701,30 +2682,11 @@ export class Bridge {
           }),
         );
         this.send("auth_pending", {}, jobID);
-        // parkHandoffForManual's own contract ("A challenge/auth stall leaves
-        // the exact page available to the operator") is violated if we close
-        // the tab here: a slow institutional SSO chain or an in-flight 2FA
-        // prompt can still be live on the IdP page at the 3-minute mark, and
-        // closing destroys the half-filled form with no warning. Only close
-        // when the tab is NOT sitting on a recognized auth page. An unreadable
-        // tab (already gone) falls through to the close path below — there is
-        // nothing left on it to preserve, and removing an already-gone tab id
-        // is a harmless no-op.
-        let onAuthPage = false;
-        try {
-          const tab = await this.deps.tabs.get(tabID);
-          onAuthPage = typeof tab.url === "string" && isAuthenticationURL(tab.url);
-        } catch {
-          // Tab already gone; closeManagedHandoffTab below is a no-op on it.
-        }
-        if (!onAuthPage) {
-          // Nothing worth preserving on this page, so the tab goes and the
-          // job drops its reference to it. parkHandoffForManual below records
-          // the park for the auth-page case, where tab_id survives.
-          await this.closeManagedHandoffTab(current, tabID);
-          await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
-        }
+        // Timeout releases the governor and detaches the browser tab. The
+        // operator may keep reading it, but this job no longer owns it.
+        await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
       }
+        this.closeOwnedTab(tabID, "timeout");
       await this.parkHandoffForManual(jobID);
     }, HANDOFF_DRIVE_TIMEOUT_MS);
   }
@@ -2964,8 +2926,6 @@ export class Bridge {
   async start(): Promise<void> {
     this.bindListeners();
     this.ready = this.deps.backend.load().then(async (s) => {
-      // A service-worker restart may hydrate a prior connection's hello_ack.
-      // Keep durable job correlation, but never revive its capabilities.
       this.store = clearNegotiationState(s);
       this.offerURLs.clear();
       for (const [jobID, url] of Object.entries(s.offerURLs ?? {})) {
@@ -3151,11 +3111,6 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     if (!job) return;
     this.send("provider_outcome", { outcome: "cancelled" }, jobID);
-    if (job.tab_id >= 0) {
-      await this.closeManagedHandoffTab(job, job.tab_id);
-    } else {
-      this.releaseHandoffDrive(jobID);
-    }
     this.downloads.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
     this.authStalledReported.delete(jobID);
@@ -4396,9 +4351,6 @@ export class Bridge {
       return this.onTabUpdated(tabID, change, tab);
     });
     this.deps.tabs.onRemoved.addListener((tabID) => {
-      // Synchronous before the async removal handler: per-tab epochs, settle
-      // timers and origin associations must never accumulate against a dead
-      // tab id even if onTabRemoved's own work is still pending on `ready`.
       this.keepaliveManager?.noteTabRemoved(tabID);
       return this.onTabRemoved(tabID);
     });
@@ -4600,6 +4552,7 @@ export class Bridge {
 
   private async removeJobWithOffer(jobID: string): Promise<void> {
     const job = findByJob(this.store, jobID);
+    const tabID = job?.tab_id;
     const providerKey = job === undefined ? undefined : this.providerKeyForJob(job);
     this.releaseHandoffDrive(jobID);
     this.managedTabURLs.delete(jobID);
@@ -4631,52 +4584,11 @@ export class Bridge {
       return { ...clearPendingDelivery(removeJob(s, jobID), jobID), offerURLs };
     });
     if (providerKey !== undefined) await this.releaseProviderDrainWhenUnused(providerKey);
-    await this.closeWorkWindowIfIdle();
     await this.dropStaleHandoffGroup();
     if (!this.drainingHandoffDriveQueue) await this.drainHandoffDriveQueue();
+    if (tabID !== undefined && tabID >= 0) void this.closeOwnedTab(tabID, "job-removed");
   }
 
-  /** Close papio's dedicated work window once no handoff owns a broker tab in
-   * it, so the background window does not accumulate across handoffs. A pinned
-   * tab (the keepalive resolver session) keeps the window alive; anything else
-   * left over is an orphaned broker tab and closing the window reaps it too.
-   * No-op when work-window mode is off or the platform lacks the windows API. */
-  private async closeWorkWindowIfIdle(): Promise<void> {
-    const windows = this.deps.windows;
-    const windowID = this.store.workWindowID;
-    if (windows === undefined || windowID === undefined) return;
-    if (this.store.activeJobs.some((job) => job.tab_id >= 0)) return;
-    let win: WindowInfo | undefined;
-    try {
-      win = await windows.get(windowID);
-    } catch {
-      // Already gone (user closed it): drop the stale id so the next handoff
-      // creates a fresh window rather than reusing a dead one.
-      await this.update((s) => {
-        const next = { ...s };
-        delete next.workWindowID;
-        return next;
-      });
-      return;
-    }
-    if ((win.tabs ?? []).some((tab) => tab.pinned === true)) return;
-    const trackedTabIDs = new Set(
-      this.store.activeJobs.filter((job) => job.tab_id >= 0).map((job) => job.tab_id),
-    );
-    if ((win.tabs ?? []).some((tab) => tab.id !== undefined && tab.pinned !== true && !trackedTabIDs.has(tab.id))) {
-      return;
-    }
-    try {
-      await windows.remove(windowID);
-    } catch {
-      // Raced a manual close; the id is cleared below regardless.
-    }
-    await this.update((s) => {
-      const next = { ...s };
-      delete next.workWindowID;
-      return next;
-    });
-  }
 
   /** A keepalive tab can outlive a cancellation, so clear its removed paper's
    * title before retaining the group for reuse. */
@@ -5772,17 +5684,9 @@ export class Bridge {
       }
       reply("captured");
     } finally {
+      if (tabID !== undefined) void this.closeOwnedTab(tabID, "page-capture");
       this.pageCaptureDriving = false;
       this.managedTabURLs.delete(managedKey);
-      if (tabID !== undefined) {
-        this.closingTabs.add(tabID);
-        try {
-          await this.deps.tabs.remove(tabID);
-        } catch {
-          this.closingTabs.delete(tabID);
-        }
-        await this.forgetLedgeredTab(tabID);
-      }
     }
   }
 
@@ -6203,16 +6107,6 @@ export class Bridge {
           }
           return;
         }
-        if (live) {
-          this.closingTabs.add(existing.tab_id);
-          try {
-            await this.deps.tabs.remove(existing.tab_id);
-          } catch (e) {
-            console.error("papio: could not replace prior handoff tab", e);
-            this.send("job_reject", {}, jobID);
-            return;
-          }
-        }
         await this.removeJobWithOffer(jobID);
       }
     }
@@ -6445,11 +6339,6 @@ export class Bridge {
     if (jobID === undefined) return;
     const job = findByJob(this.store, jobID);
     if (!job) return;
-    if (job.tab_id >= 0) {
-      await this.closeManagedHandoffTab(job, job.tab_id);
-    } else {
-      this.releaseHandoffDrive(jobID);
-    }
     this.downloads.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
     await this.removeJobWithOffer(jobID);
@@ -6473,13 +6362,13 @@ export class Bridge {
       await this.removeJobWithOffer(jobID);
       return;
     }
-    const tabID = this.completedDownloadTabs.get(jobID);
+    const tabID = this.adoptedViewerTabs.get(jobID) ?? this.completedDownloadTabs.get(jobID);
     if (tabID === undefined) return;
+    this.adoptedViewerTabs.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
-    const job = findByJob(this.store, jobID);
-    if (job !== undefined && tabID >= 0) await this.closeManagedHandoffTab(job, tabID);
-    this.releaseHandoffDrive(jobID);
     await this.removeJobWithOffer(jobID);
+    await this.ledgerManagedTab(tabID);
+    void this.closeOwnedTab(tabID, "adopted-viewer");
   }
 
   /** Run the bounded DOM probe for a tracked page and preserve the existing
@@ -6906,8 +6795,8 @@ export class Bridge {
    * spawned it. The adapter's click set `download_initiated` but produced a
    * viewer, not a `chrome.downloads` item — so gate on "no download tracked
    * yet" (this.downloads) rather than the latch. Downloads the URL through the
-   * browser cookie jar so the daemon's adoption/import path runs, then closes
-   * the viewer tab. Falls back to leaving the tab (assisted) on any ambiguity.
+   * browser cookie jar so the daemon's adoption/import path runs. The viewer
+   * remains open for the operator.
    */
   private async maybeAdoptViewerTab(viewerTabId: number, url: string | undefined, openerTabId: number | undefined): Promise<void> {
     if (url === undefined) return;
@@ -6933,6 +6822,7 @@ export class Bridge {
     });
     const job = candidates.length === 1 ? candidates[0] : candidates.find((j) => j.tab_id === openerTabId);
     if (!job) return;
+    this.adoptedViewerTabs.set(job.job_id, viewerTabId);
 
     this.pendingDownloadURLs.set(url, job.job_id);
     try {
@@ -6948,11 +6838,6 @@ export class Bridge {
       this.downloads.set(job.job_id, track);
       if (job.download_initiated !== true) {
         await this.update((s) => patchJob(s, job.job_id, { download_initiated: true }));
-      }
-      try {
-        await this.deps.tabs.remove(viewerTabId);
-      } catch {
-        // Viewer tab already gone; adoption still proceeds.
       }
     } catch (e) {
       console.error("papio: viewer-tab PDF adoption failed; staying assisted", e);
@@ -7586,8 +7471,6 @@ export class Bridge {
   private async settleHandoffAfterOutcome(jobID: string): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return;
-    if (job.tab_id >= 0) await this.closeManagedHandoffTab(job, job.tab_id);
-    this.releaseHandoffDrive(jobID);
     await this.removeJobWithOffer(jobID);
   }
 
@@ -7795,14 +7678,7 @@ export class Bridge {
     if (pageCaptureWaiter !== undefined) pageCaptureWaiter(false);
     this.authCountedTabs.delete(tabID);
     void this.forgetLedgeredTab(tabID);
-    // A closed tab can no longer be the live sibling any waiting job is
-    // deferring to — regardless of whether this was a programmatic close
-    // (below) or a genuine user close (further down).
     await this.clearFederatedLoginOwnerForTab(tabID);
-    if (this.closingTabs.delete(tabID)) {
-      await this.drainHandoffDriveQueue();
-      return;
-    } // programmatic close, not a user cancel
     const job = findByTab(this.store, tabID);
     if (!job) return;
     this.releaseHandoffDrive(job.job_id);
@@ -8791,14 +8667,13 @@ function realDeps(): BridgeDeps {
           windows: {
             create: (props: { url: string; focused: boolean; state: "minimized" | "normal" }) =>
               chrome.windows.create(props) as Promise<WindowInfo>,
-            // populate:true so the idle-close check can see a keepalive-pinned tab.
+            // populate:true so browser-side work-window state stays observable.
             get: (windowID: number) =>
               chrome.windows.get(windowID, { populate: true }) as Promise<WindowInfo>,
             update: (
               windowID: number,
               props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean },
             ) => chrome.windows.update(windowID, props),
-            remove: (windowID: number) => chrome.windows.remove(windowID),
           },
         }
       : {}),
@@ -8852,9 +8727,22 @@ function realDeps(): BridgeDeps {
         const got = await chrome.storage.local.get(MANAGED_TAB_LEDGER_KEY);
         const v = got[MANAGED_TAB_LEDGER_KEY];
         if (typeof v !== "object" || v === null || Array.isArray(v)) return {};
-        const entries: Record<string, number> = {};
+        const entries: Record<string, ManagedTabLedgerEntry> = {};
         for (const [key, value] of Object.entries(v as Record<string, unknown>)) {
-          if (typeof value === "number") entries[key] = value;
+          if (
+            typeof value === "object" &&
+            value !== null &&
+            typeof (value as Record<string, unknown>).openedAt === "number" &&
+            typeof (value as Record<string, unknown>).url === "string"
+          ) {
+            const item = value as Record<string, unknown>;
+            entries[key] = {
+              openedAt: item.openedAt as number,
+              url: item.url as string,
+              ...(typeof item.windowId === "number" ? { windowId: item.windowId } : {}),
+              ...(typeof item.groupId === "number" ? { groupId: item.groupId } : {}),
+            };
+          }
         }
         return entries;
       },
