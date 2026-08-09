@@ -53,51 +53,39 @@ structural (capabilities deleted + AST test) and does not depend on event
 fidelity, whereas building a faithful fake first would model `closingTabs` and
 cancellation semantics that Slice 1 immediately deletes.
 
-### Slice 1 — make closing a tab papio should not close unreachable
+### Slice 1 — one guarded close primitive (LANDED)
 
-Seven entrances exist to an invariant already re-broken three times:
-`tabs.remove` at background.ts 1954, 2187, 5780, 6209, 6953; the raw adapter at
-8777; and a transitive close via `windows.remove` at 4670. Chrome has no
-conditional compare-and-remove, so **no** check based on an earlier `tabs.get`
-can prove the invariant at the instant Chrome acts. Another re-check is not a
-fix. The live proof is 6953: an adopted PDF viewer is removed after
-download/state awaits without ever reading `active`, so a viewer the operator is
-reading can be closed.
+The total closure ban originally specified here was built, and the operator
+reversed it: trading a rare race for a guaranteed daily tab-litter chore was
+the wrong trade. What shipped instead, after six review rounds and a final
+simplification:
 
-Remove automatic tab and work-window closure. At each former close caller,
-perform the intended transition explicitly instead:
-
-- timeout — detach `tab_id`, then park;
-- cancel / settle / replacement — remove the job and release via
-  `removeJobWithOffer`, preserving central `releaseHandoffDrive`;
-- capture — stop forgetting the still-live ledger entry;
-- adopted viewer — no job state to change; leave the tab open.
-
-Then delete `remove` from the tabs and windows interfaces injected into
-`Bridge`, delete `closingTabs` and its consume branch, and leave genuine
-user-close semantics alone. No phase migration, no `onRemoved` rewrite, no
-startup reducer — none of that is required to make close impossible.
-
-Enforcement: an AST completeness test over `extension/src/**/*.ts` asserting the
-set of `.remove` calls on a `tabs`/`windows` receiver is **empty** — covering
-`chrome.tabs.remove`, `this.deps.tabs.remove`, optional chains and
-element-access forms, and window removal too, or 4670 stays an escape hatch.
-This follows the house pattern (terminal reasons, action kinds, runtime-message
-registry): the first new call fails CI.
-
-Verification is a real-browser smoke, not the fake: an active adopted viewer
-stays open; cancellation and settlement detach cleanly and drain the governor.
-
-**Residual-tab policy (product decision, stated honestly).** Banning closure does
-not make tabs vanish: roughly one source tab per completed, cancelled, replaced
-or timed-out acquisition, plus a viewer per target-blank PDF, plus one per
-explicit capture. Contain them in the dedicated papio group/window, discard for
-resource use, and surface a bounded "review papio tabs" action that focuses the
-group so the operator closes it with browser UI. If that cost is judged
-unacceptable, the only compromise is an explicit, confirmed operator sweep
-isolated from every lifecycle path — and then the invariant must be stated as
-"papio never automatically closes a tab; an operator-authorized sweep may close
-the reviewed papio-owned set", not "papio can never close the active tab".
+- **One primitive, `closeOwnedTab(tabID, reason)`.** Every lifecycle close
+  routes through it. An AST completeness test pins the call sites to exactly
+  {the primitive, the Chrome adapter that wires it, keepalive's three
+  pinned-tab teardowns} with count-based bidirectional comparison — a new
+  `.remove` anywhere fails CI.
+- **Chrome is asked at the moment of decision.** The gate is: ledger says
+  papio created it → job lifecycle settled → not a content tab → one
+  `tabs.get` → refuse if active, refuse if its CURRENT window/group is
+  outside papio's surface (dragged-out and recycled-id protection in one) →
+  remove in the same turn. The lesson from the failed rounds is written on
+  the primitive: the forbidden pattern is UNRELATED awaits between check and
+  act, not the one authoritative freshness read. No shadow-state
+  reconstruction — the six rounds of seeding races, tombstones and
+  completeness markers all existed to avoid one await, and are deleted.
+- **papio never auto-closes content.** A PDF viewer — whoever opened it, and
+  including a scaffold tab that NAVIGATED to a PDF (checked against the
+  fresh `tabs.get` url, not just the creation record) — always stays. Only
+  papio's own scaffolding (job/handoff/capture tabs) closes. This deletes
+  the durable activation-history machinery entirely; the litter the operator
+  actually reported was login tabs, which Slice 3 removes at the source.
+- Timeout keeps detach-then-park semantics (no close); cancel, settle,
+  replacement and page capture close through the primitive; the work window
+  is never closed directly — Chrome discards it when its last tab closes.
+- The inertness net: every closing route has a positive test asserting the
+  tab is genuinely gone, and per-predicate negatives proven non-vacuous
+  (each fails if its predicate is deleted).
 
 ### Slice 2 — make the harness tell the truth
 

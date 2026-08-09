@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"handoff_link_result","msg_id":"handoff-res-002","seq":3,"payload":{"request_id":"request-001","outcome":"job_gone","detail":"the requested job is no longer available"}}

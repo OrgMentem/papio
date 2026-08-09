@@ -741,7 +741,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature,
 	}) {
 		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
@@ -6289,4 +6289,89 @@ func TestPdfGrabAbandonIsIdempotentAndReportsConflicts(t *testing.T) {
 	if got := abandon(t, deleted.ID, "grab-abandon-0004"); got.Outcome != "not_found" || got.State != "" {
 		t.Fatalf("deleted abandon = %+v", got)
 	}
+}
+
+func TestHandoffLinkRoutineOutcomesAndFreshResolution(t *testing.T) {
+	t.Run("holder refusal", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		id := park(t, jobs, "wr_handoff_holder", handoffWork())
+		runSync(t, b, hello())
+		const other = "sess-secondary-000000000000000000000000"
+		runSyncAs(t, b, other, hello())
+		msgs, _ := runSyncAs(t, b, other, inFrame(t, protocol.MsgHandoffLinkRequest, "", protocol.HandoffLinkRequestPayload{JobID: id}))
+		errFrame := firstOfType(msgs, protocol.MsgError)
+		if errFrame == nil || errFrame.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+			t.Fatalf("non-holder response = %+v, want session_busy", msgs)
+		}
+	})
+
+	t.Run("job gone", func(t *testing.T) {
+		b, _, _, _ := newBridge(t)
+		runSync(t, b, hello())
+		msgs, _ := runSync(t, b, inFrame(t, protocol.MsgHandoffLinkRequest, "", protocol.HandoffLinkRequestPayload{RequestID: "request-gone-001", JobID: "job-gone-0000001"}))
+		result := firstOfType(msgs, protocol.MsgHandoffLinkResult)
+		if result == nil || result.Payload.(*protocol.HandoffLinkResultPayload).Outcome != "job_gone" {
+			t.Fatalf("missing job response = %+v", msgs)
+		}
+	})
+
+	t.Run("wrong action kind", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		id := park(t, jobs, "wr_handoff_kind", handoffWork())
+		actions, err := jobs.ListHumanActions(context.Background(), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, action := range actions {
+			if action.JobID == id && action.Kind == handoffActionKind {
+				if err := jobs.ResolveHumanAction(context.Background(), action.ID, "resolved"); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if _, err := jobs.OpenHumanAction(context.Background(), id, "manual_download", "download it yourself", job.Access(false, "")); err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := b.handoffLink(context.Background(), &protocol.HandoffLinkRequestPayload{JobID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := protocol.DecodeBrowserMessage(msgs[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := result.Payload.(*protocol.HandoffLinkResultPayload).Outcome; got != "not_open_action" {
+			t.Fatalf("wrong action response = %q, want not_open_action", got)
+		}
+	})
+
+	t.Run("does not cache action detail", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		id := park(t, jobs, "wr_handoff_fresh", handoffWork())
+		first := app.OABrowserHandoffActionDetail("https://oa.example.edu/fresh?execution=one")
+		second := app.OABrowserHandoffActionDetail("https://oa.example.edu/fresh?execution=two")
+		if _, err := jobs.OpenHumanAction(context.Background(), id, handoffActionKind, first, job.Access(false, "")); err != nil {
+			t.Fatal(err)
+		}
+		mint := func() string {
+			frames, err := b.handoffLink(context.Background(), &protocol.HandoffLinkRequestPayload{JobID: id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg, err := protocol.DecodeBrowserMessage(frames[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			return msg.Payload.(*protocol.HandoffLinkResultPayload).URL
+		}
+		if got := mint(); got != "https://oa.example.edu/fresh?execution=one" {
+			t.Fatalf("first URL = %q", got)
+		}
+		if _, err := jobs.OpenHumanAction(context.Background(), id, handoffActionKind, second, job.Access(false, "")); err != nil {
+			t.Fatal(err)
+		}
+		if got := mint(); got != "https://oa.example.edu/fresh?execution=two" {
+			t.Fatalf("second URL = %q, resolver appears cached", got)
+		}
+	})
 }

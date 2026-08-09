@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -19,7 +18,6 @@ import (
 	"papio/internal/agentjson"
 	"papio/internal/api"
 	"papio/internal/app"
-	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/ipc"
 	"papio/internal/job"
@@ -803,31 +801,7 @@ func actionURLs(actions []job.HumanAction, rows []job.Row, instFor func(string) 
 }
 
 func actionURL(action job.HumanAction, row job.Row, instFor func(string) (config.Institution, bool)) (string, bool) {
-	if direct, ok := app.OABrowserHandoffURL(action.Detail); ok {
-		return direct, true
-	}
-	if detail := strings.TrimSpace(action.Detail); validOpenURL(detail) {
-		return detail, true
-	}
-	if app.HumanActionNextStepFor(action).Command == "" {
-		return "", false
-	}
-	// Honor the job's resolver profile: an Example Institute-routed job must never open the
-	// default (Example University) resolver.
-	inst, ok := instFor(row.Policy.Resolver)
-	if !ok || inst.OpenURLBase == "" {
-		return "", false
-	}
-	target := browser.RouteURL(inst, row.Work)
-	return target, validOpenURL(target)
-}
-
-func validOpenURL(value string) bool {
-	if len(value) == 0 || len(value) > 4000 {
-		return false
-	}
-	parsed, err := url.ParseRequestURI(value)
-	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
+	return app.ResolveHumanActionURL(action, row, instFor)
 }
 
 type focusHandoffs func(context.Context, []string) (api.ActionsOpenResult, error)

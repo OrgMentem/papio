@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"handoff_link_result","msg_id":"handoff-res-001","seq":2,"payload":{"request_id":"request-001","outcome":"opened","url":"https://resolver.example.edu/openurl?execution=fresh-001"}}

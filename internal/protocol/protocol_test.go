@@ -683,6 +683,9 @@ func TestTriageFixturePayloadRoundTrips(t *testing.T) {
 		"browser-page-bulk-status-result.json":                   MsgPageBulkStatusResult,
 		"browser-page-bulk-submit-request.json":                  MsgPageBulkSubmitRequest,
 		"browser-page-bulk-submit-result.json":                   MsgPageBulkSubmitResult,
+		"browser-handoff-link-request.json":                      MsgHandoffLinkRequest,
+		"browser-handoff-link-result-opened.json":                MsgHandoffLinkResult,
+		"browser-handoff-link-result-refusal.json":               MsgHandoffLinkResult,
 	}
 	for name, wantType := range cases {
 		t.Run(name, func(t *testing.T) {

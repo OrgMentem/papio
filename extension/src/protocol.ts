@@ -14,6 +14,8 @@ export const MsgPageCapture = "page_capture" as const;
 export const MsgPageCaptureRequest = "page_capture_request" as const;
 export const MsgPageCaptureRequestResult = "page_capture_request_result" as const;
 
+export const MsgHandoffLinkRequest = "handoff_link_request" as const;
+export const MsgHandoffLinkResult = "handoff_link_result" as const;
 export type BrowserMessageType =
   | "hello"
   | "hello_ack"
@@ -47,6 +49,8 @@ export type BrowserMessageType =
   | "human_action_resolve_result"
   | "delivery_reconcile_request"
   | "delivery_reconcile_result"
+  | "handoff_link_request"
+  | "handoff_link_result"
   | "review_preview_request"
   | "review_preview_result"
   | "stats_request"
@@ -375,6 +379,19 @@ export interface DeliveryReconcileResultPayload {
   outcome: "applied" | "already_applied" | "conflict" | "error";
   detail?: string;
 }
+export interface HandoffLinkRequestPayload {
+  request_id?: string;
+  job_id: string;
+}
+
+export type HandoffLinkOutcome = "opened" | "job_gone" | "not_open_action" | "not_openurl" | "unavailable";
+
+export interface HandoffLinkResultPayload {
+  request_id?: string;
+  outcome: HandoffLinkOutcome;
+  url?: string;
+  detail?: string;
+}
 
 export interface ReviewPreviewRequestPayload {
   request_id: string;
@@ -612,6 +629,8 @@ const MSG_TYPES: Record<string, true> = {
   handoff_focus: true,
   ack: true,
   error: true,
+  handoff_link_request: true,
+  handoff_link_result: true,
   triage_snapshot_request: true,
   triage_snapshot_response: true,
   pdf_grab_request: true,
@@ -1598,6 +1617,35 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
     case "delivery_reconcile_result":
       triageResult(p, "delivery_reconcile_result");
       break;
+    case "handoff_link_request": {
+      requireFields<HandoffLinkRequestPayload>(p, "handoff_link_request", { request_id: "optional", job_id: "required" });
+      const jobID = str(p, "job_id", "handoff_link_request", 128);
+      if (!JOB_ID_RE.test(jobID)) fail("handoff_link_request.job_id is invalid");
+      if ("request_id" in p) correlationID(p, "request_id", "handoff_link_request");
+      break;
+    }
+    case "handoff_link_result": {
+      requireFields<HandoffLinkResultPayload>(p, "handoff_link_result", {
+        request_id: "optional",
+        outcome: "required",
+        url: "optional",
+        detail: "optional",
+      });
+      if ("request_id" in p) correlationID(p, "request_id", "handoff_link_result");
+      const outcome = str(p, "outcome", "handoff_link_result", 30) as HandoffLinkOutcome;
+      if (!["opened", "job_gone", "not_open_action", "not_openurl", "unavailable"].includes(outcome)) {
+        fail("handoff_link_result.outcome is invalid");
+      }
+      if (outcome === "opened") {
+        if (!("url" in p) || "detail" in p) fail("handoff_link_result.opened requires url and forbids detail");
+        triageURL(str(p, "url", "handoff_link_result", 4000), "handoff_link_result.url", "https:");
+      } else {
+        if ("url" in p) fail(`handoff_link_result.${outcome} must not carry url`);
+        if (!("detail" in p)) fail(`handoff_link_result.${outcome} requires detail`);
+        if (triageText(p, "detail", "handoff_link_result", 1000) === "") fail(`handoff_link_result.${outcome} requires detail`);
+      }
+      break;
+    }
     case "review_preview_request": {
       requireFields<ReviewPreviewRequestPayload>(p, "review_preview_request", { request_id: "required", action_id: "required" });
       correlationID(p, "request_id", "review_preview_request");

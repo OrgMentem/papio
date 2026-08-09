@@ -23,6 +23,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -74,7 +75,8 @@ const (
 	// pdfGrabV1Feature is ADR-0020's PDF-grab capability flag: it gates both
 	// the pdf_grab_request/pdf_grab_result message pair and, extension-side,
 	// whether the workspace even renders the grab row.
-	pdfGrabV1Feature = "pdf_grab_v1"
+	pdfGrabV1Feature     = "pdf_grab_v1"
+	handoffLinkV1Feature = "handoff_link_v1"
 	// pageBulkConsumer is the sole daemon-assigned consumer for every job
 	// created through page_bulk_submit_request (ADR-0019 Decision 6). The
 	// extension never supplies it.
@@ -352,7 +354,7 @@ func (source parkedGrabItemSource) SnapshotItems(ctx context.Context, tx *sql.Tx
 
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature,
 	}
 	var grabs *grab.Service
 	if jobs != nil {
@@ -856,6 +858,8 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgDeliveryReconcileRequest:
 		return b.deliveryReconcile(ctx, msg.Payload.(*protocol.DeliveryReconcilePayload))
+	case protocol.MsgHandoffLinkRequest:
+		return b.handoffLink(ctx, msg.Payload.(*protocol.HandoffLinkRequestPayload))
 
 	case protocol.MsgReviewPreviewRequest:
 		return b.reviewPreview(ctx, msg.Payload.(*protocol.ReviewPreviewRequestPayload))
@@ -1027,6 +1031,63 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	default:
 		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
 	}
+}
+
+// handoffLink mints the same fresh route used by `papio actions open`.
+// Routine misses are returned as structured outcomes; only frame construction
+// can return a transport error.
+func (b *Bridge) handoffLink(ctx context.Context, request *protocol.HandoffLinkRequestPayload) ([]json.RawMessage, error) {
+	result := func(outcome, detail, target string) ([]json.RawMessage, error) {
+		frame, err := b.frame(protocol.MsgHandoffLinkResult, "", protocol.HandoffLinkResultPayload{
+			RequestID: request.RequestID,
+			Outcome:   outcome,
+			URL:       target,
+			Detail:    truncate(detail, 1000),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{frame}, nil
+	}
+	if b.jobs == nil {
+		return result("unavailable", "handoff links are temporarily unavailable", "")
+	}
+	row, err := b.jobs.Get(ctx, request.JobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return result("job_gone", "the requested job is no longer available", "")
+	}
+	if err != nil {
+		return result("unavailable", "handoff links are temporarily unavailable", "")
+	}
+	if row.State != job.StateAwaitingHuman {
+		return result("not_open_action", "the job is no longer awaiting a handoff", "")
+	}
+	actions, err := b.jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		return result("unavailable", "handoff links are temporarily unavailable", "")
+	}
+	var action *job.HumanAction
+	for i := range actions {
+		if actions[i].JobID == request.JobID && actions[i].Kind == handoffActionKind {
+			action = &actions[i]
+			break
+		}
+	}
+	if action == nil {
+		return result("not_open_action", "the job has no open handoff action", "")
+	}
+	target, ok := app.ResolveHumanActionURL(*action, *row, b.cfg.InstitutionFor)
+	if !ok {
+		return result("not_openurl", "no usable handoff URL is configured for this job", "")
+	}
+	if len(target) == 0 || len(target) > 4000 {
+		return result("unavailable", "the generated handoff URL is unavailable", "")
+	}
+	parsed, parseErr := url.ParseRequestURI(target)
+	if parseErr != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return result("unavailable", "the generated handoff URL is unavailable", "")
+	}
+	return result("opened", "", target)
 }
 
 // pageCapture treats diagnostic content failures as local losses: disconnecting

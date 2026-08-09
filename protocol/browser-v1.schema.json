@@ -17,6 +17,8 @@
         "page_capture",
         "page_capture_request",
         "page_capture_request_result",
+        "handoff_link_request",
+        "handoff_link_result",
         "job_offer",
         "handoff_outcome",
         "job_accept",
@@ -709,6 +711,50 @@
               "outcome": { "enum": ["captured", "nav_failed", "timeout", "not_permitted", "busy"] },
               "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" }
             }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "handoff_link_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["job_id"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "handoff_link_result" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "outcome": { "enum": ["opened", "job_gone", "not_open_action", "not_openurl", "unavailable"] },
+              "url": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^https://[^\u0000]+$" },
+              "detail": { "type": "string", "minLength": 1, "maxLength": 1000, "pattern": "^[^\u0000]+$" }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "outcome": { "const": "opened" } }, "required": ["outcome"] },
+                "then": { "required": ["url"], "not": { "required": ["detail"] } }
+              },
+              {
+                "if": { "properties": { "outcome": { "enum": ["job_gone", "not_open_action", "not_openurl", "unavailable"] } }, "required": ["outcome"] },
+                "then": { "required": ["detail"], "not": { "required": ["url"] } }
+              }
+            ]
           }
         }
       }

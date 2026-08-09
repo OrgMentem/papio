@@ -835,6 +835,8 @@ const (
 	MsgPageBulkSubmitResult     = "page_bulk_submit_result"
 	MsgDeliveryReconcileRequest = "delivery_reconcile_request"
 	MsgDeliveryReconcileResult  = "delivery_reconcile_result"
+	MsgHandoffLinkRequest       = "handoff_link_request"
+	MsgHandoffLinkResult        = "handoff_link_result"
 	// MsgPdfGrabRequest/MsgPdfGrabResult are ADR-0020's PDF-grab pair (feature
 	// pdf_grab_v1). MsgPdfGrabResult is sent twice per grab: synchronously in
 	// reply to MsgPdfGrabRequest (request_id set, outcome "steering" with
@@ -932,6 +934,22 @@ type PageCaptureRequestPayload struct {
 type PageCaptureRequestResultPayload struct {
 	RequestID string `json:"request_id"`
 	Outcome   string `json:"outcome"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+// HandoffLinkRequestPayload asks the daemon to mint the current handoff URL
+// for one parked job. RequestID optionally correlates the response.
+type HandoffLinkRequestPayload struct {
+	RequestID string `json:"request_id,omitempty"`
+	JobID     string `json:"job_id"`
+}
+
+// HandoffLinkResultPayload reports a fresh handoff URL or a closed routine
+// refusal. Failures never carry a raw daemon error.
+type HandoffLinkResultPayload struct {
+	RequestID string `json:"request_id,omitempty"`
+	Outcome   string `json:"outcome"`
+	URL       string `json:"url,omitempty"`
 	Detail    string `json:"detail,omitempty"`
 }
 
@@ -1973,6 +1991,39 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		err = decodeTriagePayload(env.Payload, payloadFields, "delivery_reconcile_result", []string{"request_id", "outcome"}, p)
 		if err == nil {
 			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgHandoffLinkRequest:
+		p := &HandoffLinkRequestPayload{}
+		if err = browserRequireFields(payloadFields, "job_id"); err == nil {
+			err = browserRejectNullFields(payloadFields, "request_id")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgHandoffLinkResult:
+		p := &HandoffLinkResultPayload{}
+		if err = browserRequireFields(payloadFields, "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "request_id", "url", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		if err == nil {
+			_, hasURL := payloadFields["url"]
+			_, hasDetail := payloadFields["detail"]
+			if p.Outcome == "opened" && hasDetail {
+				err = fmt.Errorf("handoff_link_result.opened forbids detail")
+			} else if p.Outcome != "opened" && hasURL {
+				err = fmt.Errorf("handoff_link_result.%s forbids url", p.Outcome)
+			}
 		}
 		msg.Payload = p
 	case MsgReviewPreviewRequest:
@@ -3239,6 +3290,43 @@ func (p *DeliveryReconcilePayload) validate() error {
 
 func (p *DeliveryReconcileResultPayload) validate() error {
 	return (&TriageDecideResultPayload{RequestID: p.RequestID, Outcome: p.Outcome, Detail: p.Detail}).validate("delivery_reconcile_result")
+}
+func (p *HandoffLinkRequestPayload) validate() error {
+	if !requestIDRE.MatchString(p.JobID) {
+		return fmt.Errorf("handoff_link_request.job_id is invalid")
+	}
+	if p.RequestID != "" {
+		return validateCorrelationID("handoff_link_request.request_id", p.RequestID)
+	}
+	return nil
+}
+
+func (p *HandoffLinkResultPayload) validate() error {
+	if p.RequestID != "" {
+		if err := validateCorrelationID("handoff_link_result.request_id", p.RequestID); err != nil {
+			return err
+		}
+	}
+	if err := enumRequired("handoff_link_result.outcome", p.Outcome,
+		"opened", "job_gone", "not_open_action", "not_openurl", "unavailable"); err != nil {
+		return err
+	}
+	if p.Outcome == "opened" {
+		if p.Detail != "" {
+			return fmt.Errorf("handoff_link_result.opened must not carry detail")
+		}
+		return validateTriageURL("handoff_link_result.url", p.URL, "https")
+	}
+	if p.URL != "" {
+		return fmt.Errorf("handoff_link_result.%s must not carry url", p.Outcome)
+	}
+	if err := validateTriageText("handoff_link_result.detail", p.Detail, 1000); err != nil {
+		return err
+	}
+	if p.Detail == "" {
+		return fmt.Errorf("handoff_link_result.%s requires detail", p.Outcome)
+	}
+	return nil
 }
 
 func (p *ReviewPreviewRequestPayload) validate() error {
