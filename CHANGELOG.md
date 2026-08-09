@@ -26,9 +26,32 @@ execution records kept during the initial build.
   evidence is missing, are left alone. Because ILLiad has no uniqueness
   check, a retry that could duplicate a real loan request is never guessed
   at: submission failures are classified when they happen and only a request
-  whose bytes provably never left the machine is replayed, while anything
-  ambiguous goes to reconciliation. Rows are claimed under a lease so two
-  daemons cannot both submit.
+  whose bytes provably never left the machine is replayed. Rows are claimed
+  under a lease so two daemons cannot both submit.
+
+- **An ambiguous submission is investigated before anyone is interrupted.**
+  When papio cannot prove its request never reached the provider, it now
+  looks instead of asking: a read-only search of the patron's own request
+  list for papio's echoed idempotency token. Exactly one match whose every
+  exposed identity field agrees is adopted silently and resumes polling, so
+  a request that did land stops being invisible. Absence is never treated as
+  proof — no one can prove a provider's list was complete — so it can never
+  authorize a retry: it schedules bounded rechecks, then asks. Two matches, a
+  contradicting title, author, DOI or request type, a failed read, or a
+  patron mapping papio cannot look up are all human cases. The search is
+  structurally incapable of writing to the provider, which matters because
+  the failure it exists to prevent is a second real interlibrary loan.
+  Reusing the poll path's lookup surfaced two defects in it: it accepted the
+  first token match while ignoring a second, and it called a route that does
+  not exist on a conforming ILLiad, so patron-list reconciliation had never
+  actually worked.
+
+- **Recorded consent is bound to the identity that granted it.** The gate
+  digest described policy but not who authorized a submission, so a profile
+  rebound to a different patron, or a rotated credential, still matched — and
+  a stranded request could have been submitted under an identity that never
+  approved it. Patron mapping, credential, endpoint and reference field now
+  bind into a keyed digest that persists no secret and no patron identifier.
 
 - **Grab an open PDF straight from a browser tab (ADR-0020).** A tab
   rendered in Chrome's own PDF viewer has no DOM to scan, so the selection
