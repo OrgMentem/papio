@@ -146,8 +146,11 @@ func (c *Client) Preflight(ctx context.Context) (*PreflightResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("zotio capability preflight: %w", err)
 	}
-	var capabilities []Capability
-	if err := json.Unmarshal(capabilityOut, &capabilities); err != nil {
+	// zotio 0.17.0 moved machine output into an envelope ({meta, results});
+	// older builds emit a bare array. papio's floor spans both, so accept
+	// either rather than failing preflight on a peer that upgraded.
+	capabilities, err := decodeCapabilities(capabilityOut)
+	if err != nil {
 		return nil, fmt.Errorf("decoding zotio capabilities: %w", err)
 	}
 	seen := make(map[string]Capability, len(capabilities))
@@ -172,6 +175,25 @@ func (c *Client) Preflight(ctx context.Context) (*PreflightResult, error) {
 		Version:      version,
 		Capabilities: requiredSubset(seen),
 	}, nil
+}
+
+// decodeCapabilities reads zotio's capability registry in either shape it has
+// shipped: a bare array (through 0.16.x) or the {meta, results} envelope
+// adopted in 0.17.0. papio's supported zotio range spans that change, so a
+// preflight that understood only one shape would fail against a perfectly
+// healthy peer — which is exactly what happened when zotio 0.17.0 landed.
+func decodeCapabilities(raw []byte) ([]Capability, error) {
+	var envelope struct {
+		Results []Capability `json:"results"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err == nil && envelope.Results != nil {
+		return envelope.Results, nil
+	}
+	var bare []Capability
+	if err := json.Unmarshal(raw, &bare); err != nil {
+		return nil, err
+	}
+	return bare, nil
 }
 
 // MissingPDF returns Zotio's synced missing-PDF queue, optionally filtered to an exact collection key.

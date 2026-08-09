@@ -42,6 +42,43 @@ func TestPreflightRequiresVersionAndTypedCapabilities(t *testing.T) {
 	}
 }
 
+// zotio 0.17.0 wrapped machine output in {meta, results}; papio's supported
+// range still includes builds that emit a bare array, so preflight must read
+// both. Getting this wrong failed preflight against a healthy peer.
+func TestPreflightAcceptsEnvelopedCapabilities(t *testing.T) {
+	client := &Client{Executable: "zotio"}
+	client.Exec = func(_ context.Context, args ...string) ([]byte, error) {
+		switch strings.Join(args, " ") {
+		case "version --agent":
+			return []byte("zotio 0.17.0\n"), nil
+		case "capabilities":
+			capabilities := make([]Capability, 0, len(RequiredCapabilities))
+			for path, operation := range RequiredCapabilities {
+				capability := Capability{Path: path, Operation: operation}
+				if path == "attachments add" {
+					capability.WriteTarget = "web_api"
+				}
+				capabilities = append(capabilities, capability)
+			}
+			return json.Marshal(map[string]any{
+				"meta":    map[string]string{"resource_type": "capabilities", "source": "local"},
+				"results": capabilities,
+			})
+		default:
+			t.Fatalf("unexpected argv %q", args)
+			return nil, nil
+		}
+	}
+
+	result, err := client.Preflight(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Capabilities) != len(RequiredCapabilities) {
+		t.Fatalf("enveloped preflight = %+v", result)
+	}
+}
+
 func TestPreflightRejectsOldOrIncompleteZotio(t *testing.T) {
 	old := &Client{Executable: "zotio", Exec: func(_ context.Context, _ ...string) ([]byte, error) {
 		return []byte("zotio 0.9.0\n"), nil
