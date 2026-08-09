@@ -147,29 +147,21 @@ export interface ActiveJob {
    * institution's evidence was already warm), the owner's claim retiring
    * for any reason (clearFederatedLoginOwner, which always resumes that
    * claim's own waiters — never leaves one ownerless), or fresh session
-   * evidence for the same institution (recordFreshSessionEvidence). Bounded
-   * by its own SESSION_WAIT_TIMEOUT_MS governor timer: past it, the marker
-   * clears on its own and the job reverts to an ordinary parked_with_tab
-   * park — the pre-feature presentation — rather than waiting invisibly
-   * forever for an owner who may have simply walked away. Cleared the
-   * moment the job drives again (registerHandoffDrive, via
-   * clearParkedMarker) or, if its tab closes while parked, when
-   * onTabRemoved demotes it to an ordinary queued drive. */
+   * evidence for the same institution once its claim is no longer live. It
+   * stays parked until one of those real events frees it. Cleared the moment
+   * job drives again (registerHandoffDrive, via clearParkedMarker) or, if its
+   * tab closes while parked, when onTabRemoved demotes it to an ordinary
+   * queued drive. */
   waiting_for_session?: boolean;
   /** Opaque SHA-256 hex digest of the federated-login claim tuple. The raw
    * IdP origin and entityID are never persisted; this key exists only for
    * equality against federatedLoginOwners. */
   waiting_for_session_key?: string | undefined;
-  /** Absolute epoch ms past which a waiting_for_session park demotes on its
-   * own (SESSION_WAIT_TIMEOUT_MS after the FIRST park, not each re-park —
-   * see below). Persisted, not just a worker-local timer: an MV3 restart
-   * mid-wait must re-arm the SAME deadline, not grant a fresh budget merely
-   * because the worker happened to sleep. Set once, the first time a job
-   * ever parks; reused (never reset) by every subsequent re-park under a
-   * new or the same claim, so a job cannot extend its own wait indefinitely
-   * by cycling through park/resume/park. Cleared only when the deadline
-   * itself is spent (the timeout demotion fires) — a genuinely fresh future
-   * park, after that, earns a fresh budget. */
+  /** Absolute epoch ms used only as a display hint for the inbox waiting
+   * overlay. It does not demote a waiting_for_session park; the marker stays
+   * set until owner removal, startup owner validation, or fresh session
+   * evidence resumes the job. Persisted so the overlay can retain its
+   * original timestamp across a service-worker restart and re-park. */
   waiting_deadline?: number | undefined;
 }
 /** Cross-job record of the one live tab currently driving federated login for

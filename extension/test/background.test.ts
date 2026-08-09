@@ -6669,6 +6669,19 @@ test("one login tab per institution: two siblings park in waiting_for_session in
     [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA },
   });
 });
+test("waiting siblings stay parked without gaining an IdP tab over time", async () => {
+  const { h, tabB, tabC } = await primeFedLoginTriad();
+  const navigations = [...h.tabs.navigations];
+
+  h.clock.now += 3_600_000;
+
+  expect(h.timers.filter((timer) => timer.ms === 600_000)).toHaveLength(0);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")?.waiting_for_session).toBe(true);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")?.waiting_for_session).toBe(true);
+  expect(h.tabs.live.get(tabB)?.url).toBe(FED_PROVIDER_LOGIN_URL);
+  expect(h.tabs.live.get(tabC)?.url).toBe(FED_PROVIDER_LOGIN_URL);
+  expect(h.tabs.navigations).toEqual(navigations);
+});
 test("federated claim storage is opaque and one owner supplies the only sign-in badge blocker", async () => {
   const { h } = await primeFedLoginTriad();
   const persisted = JSON.stringify(h.backend.store);
@@ -6771,55 +6784,8 @@ test("the claim owner leaving the IdP resumes its waiters exactly once, through 
   expect(h.tabs.navigations).toHaveLength(1);
 });
 
-test("a service-worker restart with a LIVE claim owner re-arms the wait timer from the persisted deadline, not a fresh one", async () => {
-  const h = makeFedLoginHarness();
-  await h.bridge.start();
-  await h.port.inbound(fedLoginOffer("job_wait_a"));
-  await h.port.inbound(fedLoginOffer("job_wait_b"));
-  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_wait_a")?.tab_id ?? -1;
-  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_wait_b")?.tab_id ?? -1;
-  await landOnFedProviderWall(h, tabA);
-  await landOnFedProviderWall(h, tabB);
-  const parkedAt = h.clock.now;
-  const bBeforeRestart = h.backend.store.activeJobs.find((j) => j.job_id === "job_wait_b");
-  expect(bBeforeRestart?.waiting_for_session).toBe(true);
-  expect(bBeforeRestart?.waiting_deadline).toBe(parkedAt + 600_000);
 
-  // Two minutes pass before a service-worker restart. Both tabs survive —
-  // job_wait_a (the claim owner) is still live, still on the IdP.
-  h.clock.now += 120_000;
-  const restarted = makeHarness(JSON.parse(JSON.stringify(h.backend.store)) as StoreShape);
-  restarted.clock.now = h.clock.now;
-  restarted.deps.adapterSpecs.push(FED_LOGIN_SPEC);
-  restarted.deps.permissions.contains = async () => true;
-  restarted.deps.scripting.executeScript = h.deps.scripting.executeScript;
-  restarted.tabs.live.set(tabA, { id: tabA, url: FED_LOGIN_URL });
-  restarted.tabs.live.set(tabB, { id: tabB, url: FED_PROVIDER_LOGIN_URL });
-
-  await restarted.bridge.start();
-
-  // The claim survives the restart too (its owner's tab is still live and
-  // still on the IdP), and the persisted deadline is untouched.
-  expect(restarted.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe("job_wait_a");
-  const bAfterRestart = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_wait_b");
-  expect(bAfterRestart?.waiting_for_session).toBe(true);
-  expect(bAfterRestart?.waiting_deadline).toBe(parkedAt + 600_000);
-
-  const remaining = parkedAt + 600_000 - restarted.clock.now;
-  expect(remaining).toBe(480_000);
-  const rearmed = restarted.timers.find((t) => t.ms === remaining);
-  expect(rearmed).toBeDefined();
-
-  restarted.clock.now += remaining;
-  await rearmed?.fn();
-
-  const bDemoted = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_wait_b");
-  expect(bDemoted).toMatchObject({ waiting_for_session: false, parked_with_tab: true, tab_id: tabB });
-  expect(bDemoted?.waiting_for_session_key).toBeUndefined();
-  expect(bDemoted?.waiting_deadline).toBeUndefined();
-});
-
-test("re-parking a resumed waiter keeps its original wait deadline instead of restarting the budget", async () => {
+test("re-parking a resumed waiter keeps its original waiting overlay hint", async () => {
   const h = makeFedLoginHarness();
   await h.bridge.start();
   await h.port.inbound(fedLoginOffer("job_redeadline_a"));
@@ -6851,8 +6817,8 @@ test("re-parking a resumed waiter keeps its original wait deadline instead of re
   const bReparked = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b");
   expect(bReparked?.waiting_for_session).toBe(true);
   expect(bReparked?.waiting_for_session_key).toBe(FED_CLAIM_KEY);
-  // The original deadline survives the entire resume-then-re-park cycle
-  // untouched — re-parking never grants a fresh budget.
+  // The original display hint survives the entire resume-then-re-park cycle
+  // untouched; re-parking never resets the waiting overlay timestamp.
   expect(bReparked?.waiting_deadline).toBe(originalDeadline);
 });
 
@@ -6870,6 +6836,19 @@ test("fresh session evidence for a different institution resumes no waiting_for_
   // The registry claim for the ACTUAL institution is untouched too — the
   // scope guard cuts both ways.
   expect(h.backend.store.federatedLoginOwners).not.toEqual({});
+});
+test("fresh session evidence resumes ownerless waiting siblings", async () => {
+  const { h, tabB, tabC } = await primeFedLoginTriad();
+  h.backend.store.federatedLoginOwners = {};
+  h.tabs.navigations.splice(0);
+
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
+
+  expect(h.tabs.navigations).toHaveLength(1);
+  expect(h.tabs.navigations[0]?.url).toBe(OPENURL);
+  expect([tabB, tabC]).toContain(h.tabs.navigations[0]?.tabID ?? -1);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")?.waiting_for_session).toBe(false);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")?.waiting_for_session).toBe(false);
 });
 
 test("two institutions sharing a federated-login (DS) host never collide: distinct claim keys, and evidence for one never resumes the other's waiter", async () => {
@@ -7011,62 +6990,6 @@ test("a service-worker restart with a dead claim owner requeues its waiters inst
   expect([...restartedInternals.handoffDrives.keys()].sort()).toEqual(["job_fed_b", "job_fed_c"]);
 });
 
-test("a restart with a dead claim owner never resumes a waiter whose own wait deadline already expired — it demotes instead", async () => {
-  const h = makeFedLoginHarness();
-  await h.bridge.start();
-  await h.port.inbound(fedLoginOffer("job_race_a"));
-  await h.port.inbound(fedLoginOffer("job_race_expired"));
-  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_race_a")?.tab_id ?? -1;
-  const tabExpired = h.backend.store.activeJobs.find((j) => j.job_id === "job_race_expired")?.tab_id ?? -1;
-  await landOnFedProviderWall(h, tabA); // owns the claim
-  await landOnFedProviderWall(h, tabExpired); // parks — deadline = T0 + 600_000
-  const expiredDeadline = h.backend.store.activeJobs.find(
-    (j) => j.job_id === "job_race_expired",
-  )?.waiting_deadline;
-  expect(expiredDeadline).toBeDefined();
-
-  // Much later, a second job for the same institution arrives and also
-  // parks behind the still-live owner — its own wait budget starts fresh,
-  // well after job_race_expired's has already elapsed.
-  h.clock.now += 900_000;
-  await h.port.inbound(fedLoginOffer("job_race_live"));
-  const tabLive = h.backend.store.activeJobs.find((j) => j.job_id === "job_race_live")?.tab_id ?? -1;
-  expect(tabLive).toBeGreaterThanOrEqual(0);
-  await landOnFedProviderWall(h, tabLive);
-  const liveDeadline = h.backend.store.activeJobs.find((j) => j.job_id === "job_race_live")?.waiting_deadline;
-  expect(liveDeadline).toBe(h.clock.now + 600_000);
-  expect(h.clock.now).toBeGreaterThan(expiredDeadline!);
-
-  // Restart. job_race_a's tab (the claim owner) is dead — closed while this
-  // worker was asleep. Both waiters' tabs survive: job_race_expired's own
-  // deadline has ALREADY passed by restart time; job_race_live's has not.
-  const restarted = makeHarness(JSON.parse(JSON.stringify(h.backend.store)) as StoreShape);
-  restarted.clock.now = h.clock.now;
-  restarted.deps.adapterSpecs.push(FED_LOGIN_SPEC);
-  restarted.deps.permissions.contains = async () => true;
-  restarted.deps.scripting.executeScript = h.deps.scripting.executeScript;
-  restarted.tabs.live.set(tabExpired, { id: tabExpired, url: FED_PROVIDER_LOGIN_URL });
-  restarted.tabs.live.set(tabLive, { id: tabLive, url: FED_PROVIDER_LOGIN_URL });
-
-  await restarted.bridge.start();
-
-  // reconcileFederatedLoginOwners retires job_race_a's dead-owner claim
-  // BEFORE reconcileSessionWaitTimeouts ever runs — that retirement's own
-  // resume pass must not hand job_race_expired the navigation and drive
-  // slot its already-past deadline promised it would never get, nor leave
-  // it holding a stale, already-spent deadline.
-  const expiredAfter = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_race_expired");
-  expect(expiredAfter).toMatchObject({ waiting_for_session: false, parked_with_tab: true, tab_id: tabExpired });
-  expect(expiredAfter?.waiting_deadline).toBeUndefined();
-  expect(restarted.tabs.navigations.some((n) => n.tabID === tabExpired)).toBe(false);
-
-  // job_race_live's own deadline had not passed: the same claim retirement
-  // resumes it normally.
-  const liveAfter = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_race_live");
-  expect(liveAfter?.waiting_for_session).toBe(false);
-  expect(liveAfter?.waiting_deadline).toBe(liveDeadline);
-  expect(restarted.tabs.navigations).toContainEqual({ tabID: tabLive, url: OPENURL });
-});
 
 test("the owner completing its own login resumes waiting siblings even when institution evidence is already warm", async () => {
   const h = makeFedLoginHarness({
@@ -7105,25 +7028,20 @@ test("the owner completing its own login resumes waiting siblings even when inst
   expect(h.tabs.navigations).toContainEqual({ tabID: tabB, url: OPENURL });
   expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")?.waiting_for_session).toBe(false);
 });
-
-test("a waiting_for_session park past its wait budget demotes to an ordinary parked_with_tab park, not an invisible indefinite wait", async () => {
+test("removing a claim owner job frees its waiting siblings", async () => {
   const { h, tabB, tabC } = await primeFedLoginTriad();
-  const navigationsBefore = h.tabs.navigations.length;
-  const waitTimers = h.timers.filter((t) => t.ms === 600_000);
-  expect(waitTimers.length).toBe(2); // one per waiting sibling (job_fed_b, job_fed_c)
-  for (const timer of waitTimers) await timer.fn();
+  h.tabs.navigations.splice(0);
 
-  const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
-  const c = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
-  // Demoted to the pre-feature presentation: still parked with its tab
-  // preserved and operator-actionable, just no longer framed as "waiting on
-  // another paper's sign-in" — that framing would now be a lie.
-  expect(b).toMatchObject({ waiting_for_session: false, parked_with_tab: true, tab_id: tabB });
-  expect(c).toMatchObject({ waiting_for_session: false, parked_with_tab: true, tab_id: tabC });
-  expect(b?.waiting_for_session_key).toBeUndefined();
-  expect(c?.waiting_for_session_key).toBeUndefined();
-  // Demotion only relabels the existing park — it never drives anything.
-  expect(h.tabs.navigations.length).toBe(navigationsBefore);
+  const bridgeInternals = h.bridge as unknown as {
+    removeJobWithOffer: (jobID: string) => Promise<void>;
+  };
+  await bridgeInternals.removeJobWithOffer.call(h.bridge, "job_fed_a");
+
+  expect(h.backend.store.federatedLoginOwners).toEqual({});
+  expect(h.tabs.navigations).toContainEqual({ tabID: tabB, url: OPENURL });
+  expect(h.tabs.navigations).toContainEqual({ tabID: tabC, url: OPENURL });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")?.waiting_for_session).toBe(false);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")?.waiting_for_session).toBe(false);
 });
 
 test("a challenge-parked handoff stays parked through fresh session evidence for its own institution (scope guard)", async () => {

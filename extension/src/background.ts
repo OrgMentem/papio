@@ -119,12 +119,10 @@ const QUEUED_HANDOFF_RELEASE_MS = 45_000;
  * and daemon re-offers recover any accepted job that was waiting for a tab. */
 const HANDOFF_DRIVE_LIMIT = 2;
 const HANDOFF_DRIVE_TIMEOUT_MS = 3 * 60_000;
-/** Bounds how long a job may sit parked in waiting_for_session on another
- * job's shared federated-login claim. Past this, nothing has resumed it —
- * the owner may have simply walked away mid sign-in — so the marker clears
- * on its own and the job reverts to an ordinary parked_with_tab park: the
- * pre-feature presentation, visible and operator-actionable, instead of
- * waiting invisibly forever for a claim that may never retire. */
+/** Supplies the inbox's browser-local waiting overlay with an absolute display
+ * hint. It does not demote waiting_for_session parks; those remain parked until
+ * owner removal, startup owner validation, or fresh session evidence after the
+ * claim is no longer live. */
 const SESSION_WAIT_TIMEOUT_MS = 10 * 60_000;
 // (custom elements, React roots) upgrade after the tab reports complete and
 // after the SSO landing. Re-drive the idempotent classify path on a bounded
@@ -1310,11 +1308,6 @@ export class Bridge {
   /** Jobs whose openurl was re-driven once after federated login returned, so a
    * still-walled page doesn't loop. Cleared on job removal. */
   private readonly federatedReDriven = new Set<string>();
-  /** Token-guarded SESSION_WAIT_TIMEOUT_MS timers for waiting_for_session
-   * parks, same pattern as handoffDriveTimeouts: a stale timer that fires
-   * after the job has already resumed is a harmless no-op (checked by
-   * both map identity and the job's still being waiting_for_session). */
-  private readonly waitingForSessionTimers = new Map<string, object>();
   /** Jobs that already reported a given terminal handoff or provider outcome,
    * so retries of one drive do not spam the daemon. Cleared for a fresh drive
    * and on job removal. */
@@ -1607,9 +1600,8 @@ export class Bridge {
     await this.ready;
     return this.sessionState();
   }
-  /** Browser-local waiting markers for the inbox overlay. The daemon snapshot
-   * remains untouched; expired markers are excluded even if their timer has
-   * not run yet. */
+  /** Pure read for the inbox's browser-local waiting overlay: return markers
+   * whose display hints have not elapsed. The hint never demotes the park. */
   async waitingSessionJobsSnapshot(): Promise<{ job_id: string; deadline?: number }[]> {
     await this.ready;
     const now = this.deps.now();
@@ -2651,7 +2643,6 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return;
     if (job.parked_with_tab === true || job.waiting_for_session === true) {
-      this.waitingForSessionTimers.delete(jobID);
       void this.update((s) =>
         patchJob(s, jobID, { parked_with_tab: false, waiting_for_session: false, waiting_for_session_key: undefined }),
       );
@@ -2849,11 +2840,8 @@ export class Bridge {
    * bookkeeping as parkHandoffForManual's timeout park (parked_with_tab)
    * plus a distinct waiting_for_session marker (and the claim key it is
    * waiting on) so UI copy and the resume paths can tell the two parks
-   * apart. Bounded by armSessionWaitTimeout against a PERSISTED deadline
-   * (waiting_deadline): reused as-is if this job already carries one from
-   * an earlier park in this same wait — re-parking (resumed, hit another
-   * login wall, parked again) never grants a fresh budget — and minted
-   * fresh only the very first time this job ever parks. */
+   * apart. The persisted waiting_deadline is only a display hint for the
+   * inbox waiting overlay; it never demotes this park. */
   private async parkHandoffWaitingForSession(jobID: string, claimKey: string): Promise<void> {
     await this.ready;
     const job = findByJob(this.store, jobID);
@@ -2871,67 +2859,11 @@ export class Bridge {
         }),
       );
       await this.reduceHandoffGroupState(job.tab_id);
-      this.armSessionWaitTimeout(jobID, claimKey, deadline);
     }
     await this.drainHandoffDriveQueue();
     await this.releaseQueuedHandoffs();
   }
 
-  /** Demotes a waiting_for_session park to an ordinary parked_with_tab park
-   * (the pre-feature presentation) at the given absolute `deadline` — an
-   * MV3 restart re-arms this from the SAME persisted deadline
-   * (reconcileSessionWaitTimeouts), never a fresh SESSION_WAIT_TIMEOUT_MS
-   * window, so a worker sleeping mid-wait cannot itself extend the budget.
-   * A no-op if the job already resumed, re-parked under a different claim
-   * (a fresh call already replaced this token), or is gone. Genuinely
-   * spending the deadline also clears it: THIS wait attempt is over, so a
-   * later, unrelated park earns a fresh budget rather than inheriting an
-   * already-expired one. */
-  private armSessionWaitTimeout(jobID: string, claimKey: string, deadline: number): void {
-    const token = {};
-    this.waitingForSessionTimers.set(jobID, token);
-    const delay = Math.max(0, deadline - this.deps.now());
-    this.deps.setTimeout(async () => {
-      if (this.waitingForSessionTimers.get(jobID) !== token) return;
-      this.waitingForSessionTimers.delete(jobID);
-      const job = findByJob(this.store, jobID);
-      if (job === undefined || job.waiting_for_session !== true || job.waiting_for_session_key !== claimKey) return;
-      await this.update((s) =>
-        patchJob(s, jobID, {
-          waiting_for_session: false,
-          waiting_for_session_key: undefined,
-          waiting_deadline: undefined,
-        }),
-      );
-    }, delay);
-  }
-
-  /** Startup re-arm for every live waiting_for_session job, mirroring how
-   * parked_with_tab's own restart handling walks activeJobs: an MV3 restart
-   * drops every worker-local setTimeout, so without this a waiter's bounded
-   * wait would silently become unbounded the moment the worker slept. A
-   * deadline already past due demotes immediately, synchronously, rather
-   * than waiting for a timer that would fire with a negative delay anyway. */
-  private async reconcileSessionWaitTimeouts(): Promise<void> {
-    const now = this.deps.now();
-    for (const job of this.store.activeJobs) {
-      if (job.waiting_for_session !== true) continue;
-      const claimKey = job.waiting_for_session_key;
-      const deadline = job.waiting_deadline;
-      if (claimKey === undefined || deadline === undefined) continue;
-      if (now >= deadline) {
-        await this.update((s) =>
-          patchJob(s, job.job_id, {
-            waiting_for_session: false,
-            waiting_for_session_key: undefined,
-            waiting_deadline: undefined,
-          }),
-        );
-        continue;
-      }
-      this.armSessionWaitTimeout(job.job_id, claimKey, deadline);
-    }
-  }
 
   /** Reclaim a slot after the operator completes a challenge on the same tab.
    * No navigation occurs here; the next page update drives normal assessment.
@@ -3070,7 +3002,6 @@ export class Bridge {
     await this.syncConnectionBadge();
     await this.reconcileTabs();
     await this.reconcileFederatedLoginOwners();
-    await this.reconcileSessionWaitTimeouts();
     const governorQueuedAtRestart: string[] = [];
     for (const job of this.store.activeJobs) {
       if (job.status !== "accepted" && job.status !== "auth_pending" && job.status !== "awaiting_download") {
@@ -3193,7 +3124,6 @@ export class Bridge {
         continue;
       }
       this.beginProviderDrive(job.job_id);
-      this.waitingForSessionTimers.delete(job.job_id);
       await this.update((s) =>
         patchJob(s, job.job_id, {
           tab_id: -1,
@@ -4682,7 +4612,6 @@ export class Bridge {
     this.loginEntityIDs.delete(jobID);
     this.federatedLoginRouted.delete(jobID);
     this.federatedReDriven.delete(jobID);
-    this.waitingForSessionTimers.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
     this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
@@ -7428,37 +7357,14 @@ export class Bridge {
    * on churn from a keepalive probe repeating every few seconds while a
    * sign-in is genuinely still in progress. That job's real resume is the
    * retirement chokepoint (the moment the owner truly leaves), never a
-   * repeated evidence/landing event.
-   *
-   * A candidate whose OWN waiting_deadline has already passed is likewise
-   * never resumed here — demoted instead, the same synchronous transition
-   * armSessionWaitTimeout's own expiry and reconcileSessionWaitTimeouts use.
-   * Startup runs reconcileFederatedLoginOwners (which can retire a dead
-   * owner's claim and land here) before reconcileSessionWaitTimeouts (which
-   * would otherwise have demoted the same expired waiter moments later): a
-   * claim retiring and a waiter's own deadline expiring can coincide at
-   * exactly the same restart, and whichever runs first must not hand that
-   * waiter a navigation and a drive slot its own timeout already promised
-   * it would never get, nor leave it holding an already-spent deadline. */
+   * repeated evidence/landing event. */
   private async resumeWaitingForSessionJobs(matches: (job: ActiveJob) => boolean): Promise<void> {
-    const now = this.deps.now();
     for (const job of this.store.activeJobs) {
       if (job.waiting_for_session !== true || job.tab_id < 0 || !matches(job)) continue;
       if (
         job.waiting_for_session_key !== undefined &&
         this.store.federatedLoginOwners?.[job.waiting_for_session_key] !== undefined
       ) {
-        continue;
-      }
-      if (job.waiting_deadline !== undefined && now >= job.waiting_deadline) {
-        this.waitingForSessionTimers.delete(job.job_id);
-        await this.update((s) =>
-          patchJob(s, job.job_id, {
-            waiting_for_session: false,
-            waiting_for_session_key: undefined,
-            waiting_deadline: undefined,
-          }),
-        );
         continue;
       }
       this.enqueueHandoffDrive({
@@ -7908,7 +7814,6 @@ export class Bridge {
     // recordFreshSessionEvidence's existing queued-release path — not a
     // second, redundant resume mechanism — is what reopens it.
     if (job.waiting_for_session === true) {
-      this.waitingForSessionTimers.delete(job.job_id);
       this.beginProviderDrive(job.job_id);
       await this.update((s) =>
         patchJob(s, job.job_id, {
