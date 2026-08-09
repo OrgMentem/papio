@@ -87,7 +87,7 @@ simplification:
   tab is genuinely gone, and per-predicate negatives proven non-vacuous
   (each fails if its predicate is deleted).
 
-### Slice 2 — make the harness tell the truth
+### Slice 2 — make the harness tell the truth (LANDED)
 
 Three times this session, work was green in tests and wrong in a real browser.
 
@@ -105,6 +105,13 @@ Three times this session, work was green in tests and wrong in a real browser.
   a different token; replaying an old one must fail as stale.
 - Breakage in governor draining, self-navigation gates or cancellation is
   **signal**; mechanical helper migration is churn.
+
+The faithful event model surfaced seven production defects that the old silent
+fakes could not express: login redrives during an unfinished sign-in, outcomes
+from closed tabs, duplicate stale-page surfacing, duplicate waiter redrives,
+and three keepalive supersession races. Each is now fixed against the shared
+fake; the SAML journey fixture also pins fresh execution tokens and stale-token
+replay rejection.
 
 Correction to an earlier assumption: the manifest requests broad `tabs`
 permission, so undefined `tab.url` is **not** a current production cause. Keep

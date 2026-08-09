@@ -771,6 +771,15 @@ export class KeepaliveManager {
    * commitOriginProbe(). Identifies which probe attempt produced a given
    * committed FreshSessionEvidence — never used for admission itself. */
   private readonly probeGenerations = new Map<string, number>();
+  /** Candidate tabs currently being observed by a generation. A later
+   * generation skips a tab whose older scan is still held behind a
+   * browser/page boundary, so the stale attempt cannot block fresh sibling
+   * evidence; an expired sole candidate is retried concurrently for recovery.
+   * Older commits remain generation-gated. */
+  private readonly tabObservationGenerations = new Map<
+    number,
+    { origin: string; generation: number; deadlineAt: number }
+  >();
   /** Every origin-state write is chained after the previous one and reads
    * the CURRENT map only once it is actually its turn to run, so a burst of
    * synchronous patches (a probe's likelyAuthenticated flip, then its
@@ -1220,6 +1229,7 @@ export class KeepaliveManager {
     preferredTabID: number | undefined,
     generation: number,
   ): Promise<void> {
+    const ownershipDeadlineAt = Date.now() + PROBE_ADMISSION_DEADLINE_MS;
     const { promise, resolve } = Promise.withResolvers<void>();
     let settled = false;
     const finish = (): void => {
@@ -1228,7 +1238,7 @@ export class KeepaliveManager {
       resolve();
     };
     const timer = this.api.timers.setTimeout(finish, PROBE_ADMISSION_DEADLINE_MS);
-    void this.probeOrigin(origin, reason, preferredTabID, generation)
+    void this.probeOrigin(origin, reason, preferredTabID, generation, ownershipDeadlineAt)
       .catch(() => {})
       .finally(() => {
         this.api.timers.clearTimeout(timer);
@@ -1258,17 +1268,20 @@ export class KeepaliveManager {
    * to exactly one outcome, and commits exactly once. `preferredTabID`
    * (passed by requestProbe()'s callers for the manager's own tab, or a
    * navigation/activation's causal tab) is the causal tab when present;
-   * otherwise the focused tab is. `reason` is unused by this commit — it
-   * exists so a later commit can gate release authority (which callers may
+   * otherwise the focused tab is. `reason` is unused by this commit —
+   * it exists so a later commit can gate release authority (which callers may
    * pause/resume the owned tab) without another signature change.
    * `generation` is startProbe()'s per-origin counter for this admitted
    * attempt, passed through unchanged so commitOriginProbe() can stamp it
-   * on any FreshSessionEvidence this attempt commits. */
+   * on any FreshSessionEvidence this attempt commits. `ownershipDeadlineAt`
+   * is captured at admission, so late candidate registration still reads as
+   * expired instead of depending on timer callback ordering. */
   private async probeOrigin(
     origin: string,
     reason: ProbeReason,
     preferredTabID: number | undefined,
     generation: number,
+    ownershipDeadlineAt: number,
   ): Promise<void> {
     let resolver: URL;
     try {
@@ -1309,7 +1322,10 @@ export class KeepaliveManager {
 
     // Priority order, deduplicated by id — never raw query order: a
     // preferred/focused/owned tab's evidence must not be diluted by
-    // whichever tab happened to sort first out of tabs.query().
+    // whichever tab happened to sort first out of tabs.query(). Activation
+    // is different: it is the operator's causal tab event, so probing every
+    // sibling would make a superseded activation inject after the newer
+    // pending trigger has already won.
     const seen = new Set<number>();
     const ordered: number[] = [];
     const push = (id: number | undefined): void => {
@@ -1323,20 +1339,72 @@ export class KeepaliveManager {
     push(ownedTabID);
     for (const id of matchedIDs) push(id);
 
+    if (generation !== this.probeGenerations.get(origin)) return;
+    const candidateIDs =
+      reason === "activation" && preferredTabID !== undefined ? [preferredTabID] : ordered;
     // "A resolver-origin tab exists" is itself evidence-in-progress, shown
     // to the popup while the individual scans below are still running.
-    const likelyAuthenticated = ordered.length > 0;
+    const likelyAuthenticated = candidateIDs.length > 0;
     if (origin === this.resolver?.origin) this.likelyAuthenticated = likelyAuthenticated;
     void this.updateOriginSnapshot(origin, { likelyAuthenticated });
 
-    const truncated = ordered.length > MAX_OBSERVED_TABS_PER_ORIGIN;
-    const toObserve = ordered.slice(0, MAX_OBSERVED_TABS_PER_ORIGIN);
-    const observations = await Promise.all(toObserve.map((tabID) => this.observeTab(tabID, resolver)));
+    const boundedCandidates = candidateIDs.slice(0, MAX_OBSERVED_TABS_PER_ORIGIN);
+    const skippedOwnershipTabIDs: number[] = [];
+    const hasAlternativeCandidate = boundedCandidates.length > 1;
+    const toObserve = boundedCandidates.filter((tabID) => {
+      const active = this.tabObservationGenerations.get(tabID);
+      if (active === undefined || active.origin !== origin) return true;
+      const expired = Date.now() >= active.deadlineAt;
+      // Once an older lease expires, retry a sole candidate concurrently so
+      // an origin with one tab can recover. With siblings, skip the held tab
+      // and mark the batch incomplete instead of awaiting it and allowing a
+      // decisive sibling "out" to revoke unseen session evidence.
+      if (!expired || hasAlternativeCandidate) {
+        skippedOwnershipTabIDs.push(tabID);
+        return false;
+      }
+      return true;
+    });
+    // A tab omitted because an older generation still owns its observation
+    // is incomplete evidence just like a cap-truncated scan: "in" remains
+    // safe to commit, but "out" must not revoke a session we did not inspect.
+    const ownershipIncomplete = toObserve.length < boundedCandidates.length;
+    const truncated =
+      candidateIDs.length > MAX_OBSERVED_TABS_PER_ORIGIN || ownershipIncomplete;
+    for (const tabID of toObserve) {
+      this.tabObservationGenerations.set(tabID, { origin, generation, deadlineAt: ownershipDeadlineAt });
+    }
+    try {
+      const observations = await Promise.all(
+        toObserve.map((tabID) =>
+          this.observeTab(tabID, resolver).finally(() => {
+            const active = this.tabObservationGenerations.get(tabID);
+            if (active?.origin === origin && active.generation === generation) {
+              this.tabObservationGenerations.delete(tabID);
+            }
+          }),
+        ),
+      );
+      if (generation !== this.probeGenerations.get(origin)) return;
 
-    const causalTabID = preferredTabID ?? focusedTabID;
-    const reduction = this.reduceObservations(observations, causalTabID, truncated);
-    const ownedObservation = observations.find((observation) => observation.owned);
-    await this.commitOriginProbe(origin, reduction, ownedObservation, generation);
+      const causalTabID = ownershipIncomplete ? undefined : preferredTabID ?? focusedTabID;
+      const reduction = this.reduceObservations(observations, causalTabID, truncated);
+      const ownedObservation = observations.find((observation) => observation.owned);
+      await this.commitOriginProbe(origin, reduction, ownedObservation, generation);
+    } finally {
+      for (const tabID of skippedOwnershipTabIDs) {
+        const active = this.tabObservationGenerations.get(tabID);
+        if (active?.origin === origin && Date.now() >= active.deadlineAt) {
+          this.tabObservationGenerations.delete(tabID);
+        }
+      }
+      for (const tabID of toObserve) {
+        const active = this.tabObservationGenerations.get(tabID);
+        if (active?.origin === origin && active.generation === generation) {
+          this.tabObservationGenerations.delete(tabID);
+        }
+      }
+    }
   }
 
   /** Pure. Never writes a field, persists anything, calls an options.*
@@ -2255,6 +2323,7 @@ export class KeepaliveManager {
    * pause exactly as closeTab() does — a dead tab must never leave an
    * origin stuck "paused" with nothing left to resume it. */
   noteTabRemoved(tabID: number): void {
+    this.tabObservationGenerations.delete(tabID);
     this.tabDocumentEpochs.delete(tabID);
     const origin = this.tabResolverOrigins.get(tabID);
     this.tabResolverOrigins.delete(tabID);

@@ -25,10 +25,9 @@ import {
   type DownloadDeltaLike,
   type DownloadItemLike,
   type NativePort,
-  type TabChangeInfo,
-  type TabInfo,
 } from "../src/background";
 import { fixtureExists, loadFixture, parseHTML } from "./harness";
+import { ChromeTabsFake } from "./fake-tabs";
 import { Window } from "happy-dom";
 
 // A representative ProQuest-shaped spec. Rules are ordered; first match wins.
@@ -909,34 +908,6 @@ class FakeBackend implements StateBackend {
   }
 }
 
-class FakeTabs {
-  readonly onUpdated = new FakeEmitter<[number, TabChangeInfo, TabInfo]>();
-  readonly onRemoved = new FakeEmitter<[number, { isWindowClosing: boolean }]>();
-  readonly onActivated = new FakeEmitter<[{ tabId: number; windowId: number }]>();
-  readonly live = new Map<number, TabInfo>();
-  nextId = 200;
-  async create(props: { url: string; active: boolean }): Promise<TabInfo> {
-    const id = this.nextId++;
-    const tab: TabInfo = { id, url: props.url };
-    this.live.set(id, tab);
-    return tab;
-  }
-  async get(tabID: number): Promise<TabInfo> {
-    const tab = this.live.get(tabID);
-    if (!tab) throw new Error("no such tab");
-    return tab;
-  }
-  readonly navigations: [number, { active?: boolean; url?: string }][] = [];
-  async reload(_tabID: number): Promise<void> {}
-  async update(tabID: number, props: { active?: boolean; url?: string }): Promise<TabInfo> {
-    this.navigations.push([tabID, props]);
-    if (props.url !== undefined) this.live.set(tabID, { id: tabID, url: props.url });
-    return this.live.get(tabID) ?? { id: tabID };
-  }
-  async remove(tabID: number): Promise<void> {
-    this.live.delete(tabID);
-  }
-}
 
 class FakeDownloads {
   readonly onCreated = new FakeEmitter<[DownloadItemLike]>();
@@ -1084,13 +1055,13 @@ interface MapHarness {
   bridge: Bridge;
   port: FakePort;
   backend: FakeBackend;
-  tabs: FakeTabs;
   scripting: FakeScripting;
+  tabs: ChromeTabsFake;
   downloads: FakeDownloads;
   permissions: FakePermissions;
+  settings: { consent: TermsConsent };
   clock: { now: number };
   timers: { fn: () => void | Promise<void>; ms: number }[];
-  settings: { consent: TermsConsent };
   alarms: { created: { name: string }[]; fire(name: string): void };
   frames(): BrowserMessage[];
 }
@@ -1098,9 +1069,9 @@ interface MapHarness {
 function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   const port = new FakePort();
   const backend = new FakeBackend();
-  const tabs = new FakeTabs();
   const scripting = new FakeScripting();
   const permissions = new FakePermissions();
+  const tabs = new ChromeTabsFake();
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
@@ -1191,8 +1162,7 @@ async function landOnProvider(
   url: string = `https://${host}/pqdweb`,
 ): Promise<number> {
   const tabID = h.backend.store.activeJobs.find((j) => j.job_id === jobID)?.tab_id ?? -1;
-  h.tabs.live.set(tabID, { id: tabID, url });
-  await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, { id: tabID, url });
+  await h.tabs.completeNavigation(tabID, url);
   return tabID;
 }
 
@@ -1208,14 +1178,11 @@ test("auth return classifies the provider landing even without a complete event"
   expect(tabID).toBeGreaterThanOrEqual(0);
 
   const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
-  h.tabs.live.set(tabID, { id: tabID, url: idpURL });
-  await h.tabs.onUpdated.emit(tabID, { url: idpURL }, { id: tabID, url: idpURL });
+  await h.tabs.userNavigate(tabID, idpURL);
   expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
 
   const provURL = `https://${PROVIDER}/pqdweb?doc=1`;
-  h.tabs.live.set(tabID, { id: tabID, url: provURL });
-  // Note: no `status: "complete"` — this is the post-SSO soft landing.
-  await h.tabs.onUpdated.emit(tabID, { url: provURL }, { id: tabID, url: provURL });
+  await h.tabs.userNavigate(tabID, provURL);
 
   expect(h.frames().some((f) => f.type === "auth_returned")).toBe(true);
   expect(h.scripting.interpretTabs).toContain(tabID);
@@ -1246,7 +1213,7 @@ test("a transiently unknown provider page is reclassified until it renders", asy
   for (const timer of retryTimers) await timer.fn();
   expect(h.scripting.interpretTabs.length).toBeGreaterThanOrEqual(2);
   expect(h.downloads.started.length).toBe(1);
-  expect(h.tabs.live.get(tabID)?.url).toContain(PROVIDER);
+  expect(h.tabs.snapshot(tabID)?.url).toContain(PROVIDER);
 });
 
 test("a provider PDF opened in a new viewer tab is adopted for the opener job", async () => {
@@ -1261,13 +1228,13 @@ test("a provider PDF opened in a new viewer tab is adopted for the opener job", 
   // A new viewer tab opens on the provider .pdf, spawned by the tracked tab.
   const viewerTab = 999;
   const pdfUrl = `https://${PROVIDER}/doc/259290.pdf?refreqid=x`;
-  h.tabs.live.set(viewerTab, { id: viewerTab, url: pdfUrl, openerTabId: trackedTab });
-  await h.tabs.onUpdated.emit(viewerTab, { status: 'complete', url: pdfUrl }, { id: viewerTab, url: pdfUrl, openerTabId: trackedTab });
+  h.tabs.seed({ id: viewerTab, url: pdfUrl, openerTabId: trackedTab });
+  await h.tabs.completeNavigation(viewerTab, pdfUrl);
 
   // The PDF is downloaded for the opener job and the viewer remains open.
   expect(h.downloads.started.map(d => d.url)).toContain(pdfUrl);
   expect(h.downloads.started.some(d => d.filename.includes('job_viewer_0001'))).toBe(true);
-  expect(h.tabs.live.has(viewerTab)).toBe(true);
+  expect(h.tabs.snapshot(viewerTab)).toBeDefined();
 });
 
 test("a stray non-opener PDF tab is not adopted", async () => {
@@ -1277,10 +1244,10 @@ test("a stray non-opener PDF tab is not adopted", async () => {
   const strayTab = 998;
   const pdfUrl = `https://${PROVIDER}/doc/other.pdf`;
   // openerTabId points at an unrelated tab; no download_initiated job matches.
-  h.tabs.live.set(strayTab, { id: strayTab, url: pdfUrl, openerTabId: 12345 });
-  await h.tabs.onUpdated.emit(strayTab, { status: 'complete', url: pdfUrl }, { id: strayTab, url: pdfUrl, openerTabId: 12345 });
+  h.tabs.seed({ id: strayTab, url: pdfUrl, openerTabId: 12345 });
+  await h.tabs.completeNavigation(strayTab, pdfUrl);
   expect(h.downloads.started.length).toBe(0);
-  expect(h.tabs.live.has(strayTab)).toBe(true);
+  expect(h.tabs.snapshot(strayTab)).toBeDefined();
 });
 
 const TERMS_SPEC: AdapterSpec = {
@@ -1492,7 +1459,7 @@ test("startup reconciliation re-queues a job whose pre-download tab vanished", a
   const tabID = await landOnProvider(h, "job_recon_0001");
   expect(tabID).toBeGreaterThanOrEqual(0);
 
-  h.tabs.live.delete(tabID); // vanished while worker asleep
+  h.tabs.forget(tabID); // vanished while worker was asleep
   await h.bridge.start(); // worker wakes
 
   // Recovered: no longer pointed at the dead tab. Auth evidence from the prior
@@ -1504,7 +1471,7 @@ test("startup reconciliation re-queues a job whose pre-download tab vanished", a
   for (const t of h.timers.splice(0)) await t.fn();
   const reopened = h.backend.store.activeJobs.find((j) => j.job_id === "job_recon_0001");
   expect(reopened?.tab_id).toBeGreaterThanOrEqual(0);
-  expect(h.tabs.live.has(reopened?.tab_id ?? -1)).toBe(true);
+  expect(h.tabs.snapshot(reopened?.tab_id ?? -1)).toBeDefined();
 });
 
 test("startup reconciliation parks a past-auth job whose tab vanished", async () => {
@@ -1514,14 +1481,12 @@ test("startup reconciliation parks a past-auth job whose tab vanished", async ()
   const tabID = await landOnProvider(h, "job_recon_0002");
   // Drive through auth to awaiting_download.
   const idp = "https://idp.example.edu/sso?SAMLRequest=x";
-  h.tabs.live.set(tabID, { id: tabID, url: idp });
-  await h.tabs.onUpdated.emit(tabID, { url: idp }, { id: tabID, url: idp });
+  await h.tabs.userNavigate(tabID, idp);
   const prov = `https://${PROVIDER}/doc?x=1`;
-  h.tabs.live.set(tabID, { id: tabID, url: prov });
-  await h.tabs.onUpdated.emit(tabID, { url: prov }, { id: tabID, url: prov });
+  await h.tabs.userNavigate(tabID, prov);
   expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_recon_0002")?.status).toBe("awaiting_download");
 
-  h.tabs.live.delete(tabID);
+  await h.tabs.userClose(tabID);
   await h.bridge.start();
   // Parked: download may have landed in the adoption dir for the daemon to scan.
   expect(h.backend.store.activeJobs.some((j) => j.job_id === "job_recon_0002")).toBe(false);
@@ -1553,10 +1518,9 @@ test("repeated authentication failures cap re-driving and report human_auth_requ
     await h.port.inbound(offer("job_authstall_0001"));
     const tabID = h.backend.store.activeJobs.find((j) => j.job_id === "job_authstall_0001")?.tab_id ?? -1;
     expect(tabID).toBeGreaterThanOrEqual(0);
-    h.tabs.live.set(tabID, { id: tabID, url: idp });
-    await h.tabs.onUpdated.emit(tabID, { url: idp }, { id: tabID, url: idp });
+    await h.tabs.userNavigate(tabID, idp);
     expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_authstall_0001")?.status).toBe("auth_pending");
-    h.tabs.live.delete(tabID); // tab dies before the session ever authenticates
+    await h.tabs.userClose(tabID); // tab dies before the session ever authenticates
   }
   expect(h.backend.store.authAttempts?.["job_authstall_0001"]).toBe(3);
 
@@ -1589,9 +1553,8 @@ test("a completed download clears the auth-failure budget", async () => {
   for (let i = 0; i < 2; i++) {
     await h.port.inbound(offer("job_authreset_0001"));
     const t = h.backend.store.activeJobs.find((j) => j.job_id === "job_authreset_0001")?.tab_id ?? -1;
-    h.tabs.live.set(t, { id: t, url: idp });
-    await h.tabs.onUpdated.emit(t, { url: idp }, { id: t, url: idp });
-    h.tabs.live.delete(t);
+    await h.tabs.userNavigate(t, idp);
+    await h.tabs.userClose(t);
   }
   expect(h.backend.store.authAttempts?.["job_authreset_0001"]).toBe(2);
 
@@ -1599,11 +1562,9 @@ test("a completed download clears the auth-failure budget", async () => {
   h.scripting.verdict = { kind: "article", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] };
   await h.port.inbound(offer("job_authreset_0001"));
   const tabID = h.backend.store.activeJobs.find((j) => j.job_id === "job_authreset_0001")?.tab_id ?? -1;
-  h.tabs.live.set(tabID, { id: tabID, url: idp });
-  await h.tabs.onUpdated.emit(tabID, { url: idp }, { id: tabID, url: idp });
+  await h.tabs.userNavigate(tabID, idp);
   const prov = `https://${PROVIDER}/doc?x=1`;
-  h.tabs.live.set(tabID, { id: tabID, url: prov });
-  await h.tabs.onUpdated.emit(tabID, { url: prov }, { id: tabID, url: prov });
+  await h.tabs.userNavigate(tabID, prov);
   expect(h.downloads.started.length).toBe(1);
   await h.downloads.onChanged.emit({ id: 701, state: { current: "complete" } });
 
@@ -1910,6 +1871,8 @@ const FED_LOGIN_SPEC: AdapterSpec = {
   version: "1.0.0",
   hosts: [PROVIDER],
   classify: [{ kind: "login", all: ["#login-form"] }],
+  download: { selector: "a.download-pdf", requireKind: "article", method: "href" },
+  termsAccept: { modalSelector: "div.terms[open]", textAny: ["accept and download"] },
   federatedLogin: "https://sp.example/Shibboleth.sso/DS?entityID={entityID}&target=https://sp.example/home",
 };
 
@@ -1931,7 +1894,7 @@ test("login verdict appends the account id to the current URL, preferring it ove
   await h.bridge.start();
   await h.port.inbound(offer("job_acct_0001", undefined, [PROVIDER], "https://idp.example.edu/entity", "12345"));
   const tabID = await landOnProvider(h, "job_acct_0001", PROVIDER, `https://${PROVIDER}/openurl/handler/x`);
-  const nav = h.tabs.navigations.filter(([, p]) => p.url !== undefined).map(([, p]) => p.url);
+  const nav = h.tabs.navigations.map((navigation) => navigation.url);
   expect(nav).toContain(`https://${PROVIDER}/openurl/handler/x?accountid=12345`);
   // Account id preferred: no federated (DS) navigation.
   expect(nav.some((u) => u?.includes("Shibboleth.sso/DS"))).toBe(false);
@@ -1943,7 +1906,7 @@ test("account id unlock does not fire without an offer account id (falls back to
   await h.bridge.start();
   await h.port.inbound(offer("job_acct_noacct_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
   const tabID = await landOnProvider(h, "job_acct_noacct_0001", PROVIDER, `https://${PROVIDER}/openurl/handler/x`);
-  const nav = h.tabs.navigations.filter(([, p]) => p.url !== undefined).map(([, p]) => p.url);
+  const nav = h.tabs.navigations.map((navigation) => navigation.url);
   expect(nav.some((u) => u?.includes("accountid="))).toBe(false);
   expect(nav.some((u) => u?.includes("Shibboleth.sso/DS"))).toBe(true);
 });
@@ -1954,10 +1917,10 @@ test("login verdict routes the handoff tab to the federated login with the offer
   await h.bridge.start();
   await h.port.inbound(offer("job_fedlogin_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
   const tabID = await landOnProvider(h, "job_fedlogin_0001");
-  expect(h.tabs.navigations).toContainEqual([
+  expect(h.tabs.navigations).toContainEqual({
     tabID,
-    { url: "https://sp.example/Shibboleth.sso/DS?entityID=https%3A%2F%2Fidp.example.edu%2Fentity&target=https://sp.example/home" },
-  ]);
+    url: "https://sp.example/Shibboleth.sso/DS?entityID=https%3A%2F%2Fidp.example.edu%2Fentity&target=https://sp.example/home",
+  });
   // Still a human sign-in step: no outcome, no download.
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
   expect(h.downloads.started.length).toBe(0);
@@ -1969,7 +1932,7 @@ test("login verdict does not route without an offer entityID", async () => {
   await h.bridge.start();
   await h.port.inbound(offer("job_fedlogin_noent_0001"));
   await landOnProvider(h, "job_fedlogin_noent_0001");
-  expect(h.tabs.navigations.some(([, p]) => p.url !== undefined)).toBe(false);
+  expect(h.tabs.navigations.some((navigation) => navigation.url !== undefined)).toBe(false);
 });
 
 test("login verdict does not re-route while the human is signing in (latched)", async () => {
@@ -1979,9 +1942,22 @@ test("login verdict does not re-route while the human is signing in (latched)", 
   await h.port.inbound(offer("job_fedlogin_latch_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
   await landOnProvider(h, "job_fedlogin_latch_0001");
   await landOnProvider(h, "job_fedlogin_latch_0001");
-  const routes = h.tabs.navigations.filter(([, p]) => p.url !== undefined);
+  const routes = h.tabs.navigations;
   expect(routes.length).toBe(1);
 });
+test("duplicate loading callbacks for papio's own federated route are not operator evidence", async () => {
+  const h = makeMapHarness([FED_LOGIN_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_fedlogin_route_race_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
+  const tabID = await landOnProvider(h, "job_fedlogin_route_race_0001");
+  const route = "https://sp.example/Shibboleth.sso/DS?entityID=https%3A%2F%2Fidp.example.edu%2Fentity&target=https://sp.example/home";
+  await h.tabs.update(tabID, { url: route });
+  await h.tabs.update(tabID, { url: route });
+  await h.tabs.userNavigate(tabID, `https://${PROVIDER}/pqdweb?doc=route-race`);
+  expect(h.tabs.navigations.filter((navigation) => navigation.url === OPENURL)).toHaveLength(0);
+});
+
 
 test("federated login return re-drives the openurl once, warm, to reach the article", async () => {
   const h = makeMapHarness([FED_LOGIN_SPEC]);
@@ -1990,18 +1966,78 @@ test("federated login return re-drives the openurl once, warm, to reach the arti
   await h.port.inbound(offer("job_fedredrive_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
   const tabID = await landOnProvider(h, "job_fedredrive_0001");
   // Simulate the federated round-trip: tab goes to the IdP, then returns.
+  await h.tabs.completeNavigation(tabID, "https://sp.example/Shibboleth.sso/DS?entityID=https%3A%2F%2Fidp.example.edu%2Fentity&target=https://sp.example/home");
   const idp = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO";
-  h.tabs.live.set(tabID, { id: tabID, url: idp });
-  await h.tabs.onUpdated.emit(tabID, { url: idp }, { id: tabID, url: idp });
+  await h.tabs.userNavigate(tabID, idp);
   expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
   const prov = `https://${PROVIDER}/pqdweb?doc=1`;
-  h.tabs.live.set(tabID, { id: tabID, url: prov });
-  await h.tabs.onUpdated.emit(tabID, { url: prov }, { id: tabID, url: prov });
+  await h.tabs.userNavigate(tabID, prov);
   // On the auth return, papio re-drives the original openurl exactly once.
-  const openurlDrives = h.tabs.navigations.filter(([, p]) => p.url === OPENURL);
+  const openurlDrives = h.tabs.navigations.filter((navigation) => navigation.url === OPENURL);
   expect(openurlDrives.length).toBe(1);
-  expect(openurlDrives[0]?.[0]).toBe(tabID);
+  expect(openurlDrives[0]?.tabID).toBe(tabID);
 });
+test("soft federated SPA return re-drives only after a non-login classification", async () => {
+  const h = makeMapHarness([FED_LOGIN_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_fed_soft_article_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
+  const tabID = await landOnProvider(h, "job_fed_soft_article_0001");
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO");
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  h.scripting.verdict = { kind: "article", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.tabs.userNavigate(tabID, `https://${PROVIDER}/pqdweb?doc=soft-article`);
+  expect(h.tabs.navigations.filter((navigation) => navigation.url === OPENURL)).toHaveLength(1);
+});
+
+test("soft federated SPA return showing login does not re-drive", async () => {
+  const h = makeMapHarness([FED_LOGIN_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_fed_soft_login_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
+  const tabID = await landOnProvider(h, "job_fed_soft_login_0001");
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO");
+  await h.tabs.userNavigate(tabID, `https://${PROVIDER}/pqdweb?doc=soft-login`);
+
+  expect(h.tabs.navigations.filter((navigation) => navigation.url === OPENURL)).toHaveLength(0);
+});
+test("federated auth evidence does not apply article, terms, or terminal verdicts", async () => {
+  const kinds: PageVerdict["kind"][] = ["article", "terms", "no_entitlement", "wrong_work_check"];
+  for (const [index, kind] of kinds.entries()) {
+    const h = makeMapHarness([FED_LOGIN_SPEC]);
+    h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+    await h.bridge.start();
+    const jobID = `job_fed_evidence_only_${index}`;
+    await h.port.inbound(offer(jobID, undefined, [PROVIDER], "https://idp.example.edu/entity"));
+    const tabID = await landOnProvider(h, jobID);
+    await h.tabs.userNavigate(tabID, "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO");
+    h.scripting.verdict = { kind, adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+    await h.tabs.userNavigate(tabID, `https://${PROVIDER}/pqdweb?doc=evidence-only`);
+    expect(h.tabs.navigations.filter((navigation) => navigation.url === OPENURL)).toHaveLength(1);
+    expect(h.downloads.started).toHaveLength(0);
+    expect(h.scripting.clicked).toHaveLength(0);
+    expect(h.scripting.termsAccepts).toHaveLength(0);
+    expect(h.frames().some((frame) => frame.type === "provider_outcome")).toBe(false);
+  }
+});
+test("unknown federated soft return retries evidence after the DOM upgrades", async () => {
+  const h = makeMapHarness([FED_LOGIN_SPEC]);
+  h.scripting.verdict = { kind: "login", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_fed_evidence_retry_0001", undefined, [PROVIDER], "https://idp.example.edu/entity"));
+  const tabID = await landOnProvider(h, "job_fed_evidence_retry_0001");
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO");
+  h.scripting.verdict = { kind: "unknown", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await h.tabs.userNavigate(tabID, `https://${PROVIDER}/pqdweb?doc=evidence-retry`);
+  const evidenceTimer = h.timers.find((timer) => timer.ms === 2500);
+  expect(evidenceTimer).toBeDefined();
+  h.scripting.verdict = { kind: "article", adapter_id: "proquest", adapter_version: "1.0.0", evidence: [] };
+  await evidenceTimer?.fn();
+  expect(h.tabs.navigations.filter((navigation) => navigation.url === OPENURL)).toHaveLength(1);
+  expect(h.downloads.started).toHaveLength(0);
+});
+
+
 
 test("unknown escalates to ui_changed only on the second observation ≥5s later", async () => {
   const h = makeMapHarness();

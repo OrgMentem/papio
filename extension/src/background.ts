@@ -790,12 +790,12 @@ interface PendingNativeRequest {
   resolve(result: NativeRequestResult): void;
 }
 
-type ClassifyRetryKind = "unknown";
-
+type ClassifyRetryKind = "unknown" | "federated_evidence";
 interface ClassifyRetry {
   kind: ClassifyRetryKind;
   attempts: number;
 }
+type ClassificationDisposition = "apply" | "evidence_only";
 
 interface BrokerFailure {
   ok: false;
@@ -1303,6 +1303,16 @@ export class Bridge {
    * repeated `login` classifies do not re-navigate mid sign-in. Cleared on job
    * removal. */
   private readonly federatedLoginRouted = new Set<string>();
+  /** The exact route navigation emitted by tabs.update is not authentication
+   * evidence. Keep its first loading/complete lifecycle separate so only a
+   * later operator navigation to the IdP can enter auth_pending. */
+  private readonly federatedLoginRouteEvents = new Map<string, { url: string; loadingSeen: boolean }>();
+  /** A later operator navigation to the IdP is the local evidence that the
+   * routed page was actively used; merely completing our own route is not. */
+  private readonly federatedLoginOperatorNavigated = new Set<string>();
+  /** The papio-driven federated navigation has completed its first document;
+   * redirect-chain loads before that boundary are not operator evidence. */
+  private readonly federatedLoginRouteSettled = new Set<string>();
   /** Jobs whose openurl was re-driven once after federated login returned, so a
    * still-walled page doesn't loop. Cleared on job removal. */
   private readonly federatedReDriven = new Set<string>();
@@ -1323,6 +1333,9 @@ export class Bridge {
    * consuming multiple recovery attempts. */
   private readonly staleRecoveryEpochs = new Map<string, number>();
   private readonly staleRecoveryAttemptedEpochs = new Map<string, number>();
+  /** Stale-page surfacing is one action per tab document, even when Chrome
+   * races title and completion callbacks for that same generation. */
+  private readonly staleRecoverySurfacedEpochs = new Map<string, number>();
   private readonly staleRecoveryInFlightEpochs = new Map<string, number>();
   /** Document epoch already given its one late OpenAthens body probe. Retaining
    * the epoch after the timer fires prevents repeated title events from polling. */
@@ -1769,6 +1782,9 @@ export class Bridge {
   /** A new broker tab is a new provider attempt, so terminal classification
    * observations from its predecessor must not suppress this drive. */
   private beginProviderDrive(jobID: string): void {
+    this.federatedLoginOperatorNavigated.delete(jobID);
+    this.federatedLoginRouteSettled.delete(jobID);
+    this.federatedLoginRouteEvents.delete(jobID);
     this.classifyRetries.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
     this.challengeBlockedOutcomeSent.delete(`${jobID}:challenge_blocked`);
@@ -4564,6 +4580,9 @@ export class Bridge {
     this.classifyRetries.delete(jobID);
     this.loginEntityIDs.delete(jobID);
     this.federatedLoginRouted.delete(jobID);
+    this.federatedLoginRouteEvents.delete(jobID);
+    this.federatedLoginOperatorNavigated.delete(jobID);
+    this.federatedLoginRouteSettled.delete(jobID);
     this.federatedReDriven.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
     this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
@@ -4572,6 +4591,7 @@ export class Bridge {
     this.authFailureSurfaced.delete(jobID);
     this.staleRecoveryEpochs.delete(jobID);
     this.staleRecoveryAttemptedEpochs.delete(jobID);
+    this.staleRecoverySurfacedEpochs.delete(jobID);
     this.staleRecoveryInFlightEpochs.delete(jobID);
     this.openAthensErrorRecheckEpochs.delete(jobID);
     this.resolverNoEntitlementSent.delete(jobID);
@@ -6458,6 +6478,9 @@ export class Bridge {
       if (change.status === "complete") await this.maybeAdoptViewerTab(tabID, change.url ?? tab.url, tab.openerTabId);
       return;
     }
+    const staleRecoveryNavigationInFlight =
+      change.status === "loading" && this.staleRecoveryInFlightEpochs.has(job.job_id);
+    if (staleRecoveryNavigationInFlight) return;
     const url = change.url ?? tab.url;
     if (url === undefined) return;
     if (change.status === "loading") this.advanceStaleRecoveryEpoch(job.job_id);
@@ -6479,7 +6502,9 @@ export class Bridge {
         // Surface every recognized IdP failure. Only a terminal stale-request
         // signature is safe to navigate away from; password recovery and retry
         // forms must remain where the human can use them.
-        if (!this.authFailureSurfaced.has(job.job_id)) {
+        const surfacedEpoch = this.staleRecoverySurfacedEpochs.get(job.job_id);
+        if (surfacedEpoch !== staleRecoveryEpoch) {
+          this.staleRecoverySurfacedEpochs.set(job.job_id, staleRecoveryEpoch);
           this.authFailureSurfaced.add(job.job_id);
           await this.surfaceWorkTab(job.tab_id);
         }
@@ -6523,13 +6548,25 @@ export class Bridge {
     // the adapter registry is the authoritative host source for classification,
     // so a tracked handoff landing on any registered family is on-provider.
     const onProvider = hostMatches(host, job.provider_hosts) || adapter !== undefined;
+    if (onProvider) await this.clearFederatedLoginOwnerForTab(tabID);
     // Back on the provider means this tab left the IdP (successfully or not);
     // either way it can no longer be the live sibling any waiting job is
     // deferring to for this origin.
-    if (onProvider) await this.clearFederatedLoginOwnerForTab(tabID);
     const shouldAssessBeforeRouting =
       (change.status === "complete" || change.title !== undefined) &&
       (onProvider || isAuthenticationURL(url));
+    const routeWasSettled = this.federatedLoginRouteSettled.has(job.job_id);
+    const routedAuthNavigation =
+      !onProvider && this.consumeFederatedLoginRouteEvent(job.job_id, url, change);
+    if (
+      !onProvider &&
+      isAuthenticationURL(url) &&
+      change.status === "loading" &&
+      !routedAuthNavigation &&
+      (!this.federatedLoginRouted.has(job.job_id) || routeWasSettled)
+    ) {
+      this.federatedLoginOperatorNavigated.add(job.job_id);
+    }
     if (
       shouldAssessBeforeRouting &&
       (change.title !== undefined || !onProvider) &&
@@ -6538,6 +6575,9 @@ export class Bridge {
       return;
     }
     if (!onProvider) {
+      // The extension's own federated route is navigation mechanics, not proof
+      // that the operator reached or completed sign-in.
+      if (routedAuthNavigation) return;
       // Reuse the durable resolver-provided offer URL that produced that viewer.
       if (change.status === "complete" && host === CHROME_PDF_VIEWER_HOST) {
         const offeredURL = this.offerURLs.get(job.job_id);
@@ -6580,57 +6620,39 @@ export class Bridge {
       }
       return;
     }
-    if (job.status === "auth_pending") {
-      const started = job.auth_started_ms ?? this.deps.now();
-      const now = this.deps.now();
-      const elapsed = Math.max(0, now - started);
-      this.deliverySessionEvidence.set(job.job_id, "fresh_auth");
-      // This transition is also how a job parked with its tab preserved
-      // (parked_with_tab, state.ts) resumes: the operator finished auth in
-      // that same tab without ever going through registerHandoffDrive again,
-      // so nothing else clears the marker here. Leaving it stale would make
-      // a later restart wrongly skip re-registering this now-legitimate
-      // awaiting_download job, stranding it the same way the timeout park
-      // itself used to before parked_with_tab existed.
-      await this.update((s) => patchJob(s, job.job_id, { status: "awaiting_download", parked_with_tab: false }));
-      this.send("auth_returned", { elapsed_ms: elapsed }, job.job_id);
-      // jobInstitutionOrigin holds this producer to the same configured-origin
-      // bar as recordFreshSessionEvidence and recordInstitutionalSession: an
-      // origin outside the daemon's configured set never rides along as the
-      // hint, and an absent hint stays the documented safe default. It also
-      // survives LibKey-fronted offers, whose offer origin is libkey.io
-      // rather than the institution's resolver.
-      const authReturnedOriginHint = this.jobInstitutionOrigin(job);
-      this.emitSessionEvidence("auth_returned", authReturnedOriginHint);
-      // The human is past authentication; fold the "papio" group back away.
-      await this.recollapseHandoffGroup(tabID);
-      const institutionalSession = await this.recordInstitutionalSession(job, url, now);
-      if (!institutionalSession) await this.recordOpenAccessLanding(job);
-      // If we routed this job through federated login, the return lands on the
-      // provider's generic post-login page (the DS target), not the article.
-      // Re-drive the original openurl once so the now-warm session resolves the
-      // entitled page; the fresh navigation triggers classify below.
-      if (this.federatedLoginRouted.has(job.job_id) && !this.federatedReDriven.has(job.job_id)) {
-        const openurl = this.offerURLs.get(job.job_id);
-        if (openurl !== undefined) {
-          this.federatedReDriven.add(job.job_id);
-          await this.openManagedTab({
-            url: openurl,
-            jobId: job.job_id,
-            purpose: "redrive",
-            focusExisting: false,
-          });
-          return;
+    let currentFederatedClassification = false;
+    if (
+      this.federatedLoginRouted.has(job.job_id) &&
+      job.status === "auth_pending" &&
+      (successfulLanding || change.url !== undefined) &&
+      !this.federatedLoginOperatorNavigated.has(job.job_id)
+    ) {
+      const verdict = await this.maybeClassify(job.job_id, host, "evidence_only");
+      if (verdict === undefined) {
+        const latest = findByJob(this.store, job.job_id);
+        if (latest?.status === "auth_pending" && latest.challenge_blocked !== true) {
+          this.scheduleClassifyRetry(job.job_id, "federated_evidence");
         }
+        return;
       }
-      // The provider landing that ends authentication frequently arrives
-      // without a `status: "complete"` (SPA soft-nav, history push, or a
-      // resolver/interstitial hop), so the complete-gated classify below never
-      // runs. Classify now; interpret's settle waits for the provider's
-      // late-upgrading controls, and the download latch keeps this idempotent
-      // with any subsequent complete.
-      await this.maybeClassify(job.job_id, host);
+      if (verdict.kind === "login") return;
+      if (verdict.kind === "unknown") {
+        this.scheduleClassifyRetry(job.job_id, "federated_evidence");
+        return;
+      }
+      currentFederatedClassification = true;
     }
+    if (job.status === "auth_pending") {
+      await this.finalizeAuthReturn(
+        job.job_id,
+        tabID,
+        url,
+        host,
+        currentFederatedClassification,
+      );
+      return;
+    }
+
     // Once the provider page has finished loading on the tracked tab (past any
     // human auth), run the declarative adapter — permission-gated, tracked-tab
     // only. Re-reads fresh job state; a stale local `job` here is fine.
@@ -6639,13 +6661,59 @@ export class Bridge {
       await this.maybeClassify(job.job_id, host);
     }
   }
+  private async finalizeAuthReturn(
+    jobID: string,
+    tabID: number,
+    url: string,
+    host: string,
+    currentFederatedClassification: boolean,
+  ): Promise<boolean> {
+    const job = findByJob(this.store, jobID);
+    if (!job || job.status !== "auth_pending" || job.tab_id !== tabID) return false;
+    this.classifyRetries.delete(jobID);
+    const started = job.auth_started_ms ?? this.deps.now();
+    const now = this.deps.now();
+    const elapsed = Math.max(0, now - started);
+    this.deliverySessionEvidence.set(jobID, "fresh_auth");
+    await this.update((s) => patchJob(s, jobID, { status: "awaiting_download", parked_with_tab: false }));
+    this.send("auth_returned", { elapsed_ms: elapsed }, jobID);
+    const authReturnedOriginHint = this.jobInstitutionOrigin(job);
+    this.emitSessionEvidence("auth_returned", authReturnedOriginHint);
+    await this.recollapseHandoffGroup(tabID);
+    const institutionalSession = await this.recordInstitutionalSession(job, url, now);
+    if (!institutionalSession) await this.recordOpenAccessLanding(job);
+    const completedFederatedSignIn =
+      this.federatedLoginOperatorNavigated.has(jobID) || currentFederatedClassification;
+    if (
+      this.federatedLoginRouted.has(jobID) &&
+      completedFederatedSignIn &&
+      !this.federatedReDriven.has(jobID)
+    ) {
+      const openurl = this.offerURLs.get(jobID);
+      if (openurl !== undefined) {
+        this.federatedLoginOperatorNavigated.delete(jobID);
+        this.federatedReDriven.add(jobID);
+        await this.openManagedTab({
+          url: openurl,
+          jobId: jobID,
+          purpose: "redrive",
+          focusExisting: false,
+        });
+        return true;
+      }
+    }
+    await this.maybeClassify(jobID, host);
+    return true;
+  }
 
   /** Chrome's loading signal is the boundary between stale documents: title and
    * complete notifications for that document can run concurrently. */
 
   private advanceStaleRecoveryEpoch(jobID: string): void {
-    this.staleRecoveryEpochs.set(jobID, (this.staleRecoveryEpochs.get(jobID) ?? 0) + 1);
+    const epoch = (this.staleRecoveryEpochs.get(jobID) ?? 0) + 1;
+    this.staleRecoveryEpochs.set(jobID, epoch);
     this.staleRecoveryAttemptedEpochs.delete(jobID);
+    this.staleRecoverySurfacedEpochs.delete(jobID);
     this.staleRecoveryInFlightEpochs.delete(jobID);
   }
 
@@ -6942,10 +7010,21 @@ export class Bridge {
    * all-sites access is effective access. Adapter execution never touches a tab
    * we do not own for this job.
    */
-  private async maybeClassify(jobID: string, host: string): Promise<void> {
+  private async maybeClassify(
+    jobID: string,
+    host: string,
+    disposition: ClassificationDisposition = "apply",
+  ): Promise<PageVerdict | undefined> {
     const job = findByJob(this.store, jobID);
-    if (!job) return;
-    if (job.status !== "accepted" && job.status !== "awaiting_download") return;
+    if (!job) return undefined;
+    const allowAuthPending = disposition === "evidence_only";
+    if (
+      job.status !== "accepted" &&
+      job.status !== "awaiting_download" &&
+      !(allowAuthPending && job.status === "auth_pending")
+    ) {
+      return undefined;
+    }
     const spec = this.deps.adapterSpecs.find((candidate) => hostMatches(host, candidate.hosts));
     if (!spec) {
       // Direct-PDF delivery does not need a page adapter. Otherwise verify that
@@ -6953,6 +7032,7 @@ export class Bridge {
       // render window before declaring a durable coverage gap. Auth returns
       // and provider SPAs can replace their document after the first complete
       // event.
+      if (disposition === "evidence_only") return undefined;
       if (job.download_initiated === true || this.downloads.has(job.job_id)) return;
       const access = await this.hasEffectiveProviderAccess(host);
       if (access !== true) {
@@ -6988,15 +7068,26 @@ export class Bridge {
       }
       return;
     }
-    await this.restoreWorkWindowForAdapter(spec);
+    if (disposition === "apply") await this.restoreWorkWindowForAdapter(spec);
     const access = await this.hasEffectiveProviderAccess(host);
     if (access !== true) {
-      if (access === false) await this.reportBlockedProviderHost(jobID, host);
+      if (disposition === "apply" && access === false) {
+        await this.reportBlockedProviderHost(jobID, host);
+      }
+      return undefined;
+    }
+    if (disposition === "apply" && (await this.clearBlockedProviderHost(host))) {
+      await this.syncConnectionBadge();
+    }
+    const currentJob = findByJob(this.store, jobID);
+    if (
+      !currentJob ||
+      (currentJob.status !== "accepted" &&
+        currentJob.status !== "awaiting_download" &&
+        !(allowAuthPending && currentJob.status === "auth_pending"))
+    ) {
       return;
     }
-    if (await this.clearBlockedProviderHost(host)) await this.syncConnectionBadge();
-    const currentJob = findByJob(this.store, jobID);
-    if (!currentJob || (currentJob.status !== "accepted" && currentJob.status !== "awaiting_download")) return;
 
     let assessmentKind: DrivenPageAssessmentKind | undefined;
     try {
@@ -7018,10 +7109,11 @@ export class Bridge {
         host,
         assessmentKind === "challenge" ? "cloudflare" : "redirect_loop",
       );
-      return;
+      return undefined;
     }
     if (assessmentKind === "normal" && currentJob.challenge_blocked === true) {
-      if (!(await this.clearChallengeBlock(currentJob))) return;
+      if (disposition === "evidence_only") return undefined;
+      if (!(await this.clearChallengeBlock(currentJob))) return undefined;
     }
 
     const ctx: AdapterContext = { expected: { ...(currentJob.expected ?? {}) } };
@@ -7040,7 +7132,8 @@ export class Bridge {
       console.error("papio: adapter classification failed; staying assisted", e);
       return;
     }
-    if (!verdict) return;
+    if (!verdict) return undefined;
+    if (disposition === "evidence_only") return verdict;
     if (verdict.kind === "unknown") {
       let fallbackKind: ChallengeBlockKind | undefined;
       try {
@@ -7108,14 +7201,15 @@ export class Bridge {
     await this.blockChallenge(job, host, kind);
   }
 
-  private scheduleClassifyRetry(jobID: string): void {
+  private scheduleClassifyRetry(jobID: string, kind: ClassifyRetryKind = "unknown"): void {
     const retry = this.classifyRetries.get(jobID);
-    const attempts = retry?.kind === "unknown" ? retry.attempts : 0;
+    if (kind === "unknown" && retry?.kind === "federated_evidence") return;
+    const attempts = retry?.kind === kind ? retry.attempts : 0;
     if (attempts >= MAX_CLASSIFY_RETRIES) {
       this.classifyRetries.delete(jobID);
       return;
     }
-    const next: ClassifyRetry = { kind: "unknown", attempts: attempts + 1 };
+    const next: ClassifyRetry = { kind, attempts: attempts + 1 };
     this.classifyRetries.set(jobID, next);
     this.deps.setTimeout(() => this.retryClassify(jobID, next), CLASSIFY_RETRY_MS);
   }
@@ -7281,6 +7375,33 @@ export class Bridge {
     await this.resumeWaitingForSessionJobs((job) => job.waiting_for_session_key === claimKey);
   }
 
+  /** Consume only the browser lifecycle generated by our own federated route.
+   * A later loading event at the same IdP URL is the operator's navigation
+   * (the credential submission/return path) and is therefore allowed to enter
+   * auth_pending. */
+  private consumeFederatedLoginRouteEvent(
+    jobID: string,
+    url: string,
+    change: TabChangeInfo,
+  ): boolean {
+    const pending = this.federatedLoginRouteEvents.get(jobID);
+    if (pending === undefined || pending.url !== url) return false;
+    if (change.status === "loading") {
+      if (!pending.loadingSeen) {
+        pending.loadingSeen = true;
+        return true;
+      }
+      this.federatedLoginRouteSettled.add(jobID);
+      return true;
+    }
+    if (change.status === "complete" && pending.loadingSeen) {
+      this.federatedLoginRouteEvents.delete(jobID);
+      this.federatedLoginRouteSettled.add(jobID);
+      return false;
+    }
+    return false;
+  }
+
   /** Auto-select the institution on a provider login wall: navigate the handoff
    * tab to the adapter's federated-login entry with the offer's entityID, once
    * per drive. Institution selection is deterministic config, not a secret; the
@@ -7321,15 +7442,19 @@ export class Bridge {
       return;
     }
     this.federatedLoginRouted.add(jobID);
+    this.federatedLoginOperatorNavigated.delete(jobID);
+    this.federatedLoginRouteSettled.delete(jobID);
     await this.update((s) => ({
       ...s,
       federatedLoginOwners: { ...(s.federatedLoginOwners ?? {}), [claimKey]: { jobID, tabID: job.tab_id } },
     }));
+    this.federatedLoginRouteEvents.set(jobID, { url, loadingSeen: false });
     try {
       await this.deps.tabs.update(job.tab_id, { url });
     } catch (e) {
       // Let a later classify retry route again if this navigation failed.
       this.federatedLoginRouted.delete(jobID);
+      this.federatedLoginRouteEvents.delete(jobID);
       await this.clearFederatedLoginOwner(claimKey, jobID);
       console.error("papio: federated login route failed", e);
     }
@@ -7370,11 +7495,15 @@ export class Bridge {
   private async retryClassify(jobID: string, expected?: ClassifyRetry): Promise<void> {
     await this.ready;
     if (expected !== undefined && this.classifyRetries.get(jobID) !== expected) return;
+    if (expected?.kind === "federated_evidence") {
+      await this.retryFederatedEvidence(jobID, expected);
+      return;
+    }
     const job = findByJob(this.store, jobID);
     // Stop once the job is gone or an actual download is tracked. The guard is
     // the tracked download, NOT download_initiated: a click that latched to open
     // a terms gate has download_initiated=true but no download yet, and the
-    // retry must continue so a late-upgrading terms modal is caught. No download
+    // retry must continue so a late-upgrading terms model is caught. No download
     // can fire twice — every initiation path still bails on download_initiated.
     if (!job || this.downloads.has(jobID)) {
       this.classifyRetries.delete(jobID);
@@ -7384,7 +7513,61 @@ export class Bridge {
       this.classifyRetries.delete(jobID);
       return;
     }
+    try {
+      const live = await this.deps.tabs.get(job.tab_id);
+      if (live.id !== job.tab_id) throw new Error("tab identity changed");
+    } catch {
+      this.classifyRetries.delete(jobID);
+      return;
+    }
     await this.reclassifyCurrentProviderPage(jobID);
+  }
+  private async retryFederatedEvidence(jobID: string, expected: ClassifyRetry): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    if (
+      !job ||
+      job.status !== "auth_pending" ||
+      !this.federatedLoginRouted.has(jobID) ||
+      job.tab_id < 0
+    ) {
+      this.classifyRetries.delete(jobID);
+      return;
+    }
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(job.tab_id);
+    } catch {
+      this.classifyRetries.delete(jobID);
+      return;
+    }
+    if (tab.id !== job.tab_id || tab.url === undefined) {
+      this.classifyRetries.delete(jobID);
+      return;
+    }
+    let host: string;
+    try {
+      host = new URL(tab.url).hostname;
+    } catch {
+      this.classifyRetries.delete(jobID);
+      return;
+    }
+    const verdict = await this.maybeClassify(jobID, host, "evidence_only");
+    if (verdict === undefined) {
+      if (findByJob(this.store, jobID)?.challenge_blocked !== true) {
+        this.scheduleClassifyRetry(jobID, "federated_evidence");
+      }
+      return;
+    }
+    if (verdict.kind === "login") {
+      this.classifyRetries.delete(jobID);
+      return;
+    }
+    if (verdict.kind === "unknown") {
+      this.scheduleClassifyRetry(jobID, "federated_evidence");
+      return;
+    }
+    this.classifyRetries.delete(jobID);
+    await this.finalizeAuthReturn(jobID, tab.id, tab.url, host, true);
   }
 
 
@@ -7682,7 +7865,16 @@ export class Bridge {
     const job = findByTab(this.store, tabID);
     if (!job) return;
     this.releaseHandoffDrive(job.job_id);
-    // A tab parked only because a SIBLING job owns the shared login tab
+    if (this.classifyRetries.delete(job.job_id)) {
+      // The close has already settled the in-flight classification lifecycle;
+      // retain the durable handoff for the daemon's cancellation/re-offer path
+      // but never emit a second provider outcome from the dead-tab retry.
+      await this.update((s) => patchJob(s, job.job_id, { tab_id: -1 }));
+      await this.drainHandoffDriveQueue();
+
+      return;
+    }
+
     // (waiting_for_session) never had a chance to sign in on its own — its
     // tab closing is not the operator abandoning the job, just losing the
     // page it was quietly waiting on. Re-enter it as an ordinary queued

@@ -28,6 +28,7 @@ import {
   type ResolverMarker,
   type SessionVerdict,
 } from "../src/keepalive";
+import { ChromeTabsFake } from "./fake-tabs";
 
 const RESOLVER_OPENURL = "https://resolver.example.edu/openurl?genre=article";
 
@@ -129,79 +130,6 @@ class FakeTimers implements KeepaliveTimers {
   }
 }
 
-class FakeTabs {
-  readonly created: {
-    url: string;
-    active: boolean;
-    pinned: boolean;
-    muted: boolean;
-    windowId?: number;
-  }[] = [];
-  /** When set, creation into any windowId throws (window closed race). */
-  failWindowCreate = false;
-  readonly reloaded: number[] = [];
-  readonly removed: number[] = [];
-  readonly updates: { id: number; properties: { active?: boolean; pinned?: boolean; muted?: boolean } }[] = [];
-  readonly resolverTabs: KeepaliveTab[] = [];
-  focusedTab: KeepaliveTab | undefined;
-  queryCount = 0;
-  readonly live = new Map<number, KeepaliveTab>();
-  nextURL: string | undefined;
-
-  async create(properties: {
-    url: string;
-    active: boolean;
-    pinned: boolean;
-    muted: boolean;
-    windowId?: number;
-  }): Promise<KeepaliveTab> {
-    if (this.failWindowCreate && properties.windowId !== undefined) {
-      this.created.push(properties);
-      throw new Error("no such window");
-    }
-    const id = this.created.length + 1;
-    this.created.push(properties);
-    this.live.set(id, { id, url: properties.url });
-    return { id, url: properties.url };
-  }
-
-  async reload(id: number): Promise<void> {
-    this.reloaded.push(id);
-    const tab = this.live.get(id);
-    if (tab !== undefined && this.nextURL !== undefined) tab.url = this.nextURL;
-  }
-
-  async query(query: {
-    pinned?: boolean;
-    muted?: boolean;
-    url?: string[];
-    active?: boolean;
-    lastFocusedWindow?: boolean;
-  }): Promise<KeepaliveTab[]> {
-    this.queryCount += 1;
-    if (query.active === true) return this.focusedTab === undefined ? [] : [this.focusedTab];
-    return query.url === undefined ? [] : [...this.resolverTabs];
-  }
-
-  async get(id: number): Promise<KeepaliveTab> {
-    const tab = this.live.get(id);
-    if (tab === undefined) throw new Error("tab is gone");
-    return tab;
-  }
-
-  async remove(id: number): Promise<void> {
-    this.removed.push(id);
-    this.live.delete(id);
-  }
-
-  async update(
-    id: number,
-    properties: { active?: boolean; pinned?: boolean; muted?: boolean },
-  ): Promise<KeepaliveTab> {
-    this.updates.push({ id, properties });
-    return this.get(id);
-  }
-}
 
 /** Controls chrome.scripting.executeScript per tab: a default resolves
  * immediately from markersByTab/defaultMarkers exactly like before, but
@@ -289,7 +217,7 @@ function makeHarness(
   manager: KeepaliveManager;
   api: KeepaliveAPI;
   jobs: { count: number };
-  tabs: FakeTabs;
+  tabs: ChromeTabsFake;
   timers: FakeTimers;
   scripting: FakeScripting;
   clock: { now: () => number; advanceBy: (ms: number) => void };
@@ -314,7 +242,8 @@ function makeHarness(
   storageGate: StorageWriteGate;
 } {
   const jobs = { count: 1 };
-  const tabs = new FakeTabs();
+  const tabs = new ChromeTabsFake();
+  tabs.nextId = 1;
   const clockState = { now: REAL_DATE_NOW() };
   Date.now = () => clockState.now;
   restoreDateNow = () => {
@@ -518,6 +447,7 @@ test("papio-8f79b6ba67bdbdaa: concurrent creation attempts across sync() calls p
   expect(createCalls).toBe(1);
 
   create.resolve({ id: 1, url: "https://resolver.example.edu" });
+  h.tabs.seed({ id: 1, url: "https://resolver.example.edu", active: false, pinned: true, muted: true });
   await first;
   await second;
 
@@ -575,7 +505,7 @@ test("openReauth requesting a different origin mid-creation never rides another 
     const { promise, resolve } = Promise.withResolvers<KeepaliveTab>();
     creates.push({ url: properties.url, resolve });
     return promise.then((tab) => {
-      if (tab.id !== undefined) h.tabs.live.set(tab.id, tab);
+      if (tab.id !== undefined) h.tabs.seed(tab);
       return tab;
     });
   };
@@ -670,7 +600,7 @@ test("papio-fd8a4fcae897e58d: concurrent openReauth calls for different origins 
   expect(h.tabs.updates.map((update) => update.id)).toEqual([1, 2]);
   // Exactly one tab survives, for the origin that won.
   expect(h.tabs.removed).toEqual([1]);
-  expect([...h.tabs.live.keys()]).toEqual([2]);
+  expect(h.tabs.list().flatMap((tab) => tab.id === undefined ? [] : [tab.id])).toEqual([2]);
   expect(h.manager.getSnapshot().resolverOrigin).toBe(originB);
 });
 
@@ -742,7 +672,7 @@ test("pauses after an IdP redirect, notifies the user, and resumes on resolver r
   expect(h.timers.latestDelay()).toBe(10);
 
   h.tabs.nextURL = RESOLVER_OPENURL;
-  h.tabs.live.get(1)!.url = RESOLVER_OPENURL; // Simulate the user's completed login.
+  h.tabs.patch(1, { url: RESOLVER_OPENURL }); // Simulate the user's completed login.
   // Clear the spacing window opened by the pause-triggering probe above, so
   // the recovery probe the reauth watch fires below is admitted immediately
   // instead of deferred.
@@ -890,7 +820,7 @@ test("a live resolver tab is evidence while its probe determines the verdict", a
   const h = makeHarness();
   await h.manager.init();
   const liveTab = { id: 42, url: "https://resolver.example.edu/account" };
-  h.tabs.live.set(liveTab.id, liveTab);
+  h.tabs.seed(liveTab);
   h.tabs.resolverTabs.push(liveTab);
   const gate = h.scripting.hold(liveTab.id);
   const pending = h.manager.probeForeground();
@@ -956,7 +886,7 @@ test("resolver-origin marker verdicts are evidence-based and do not pause a live
   await h.manager.sync();
   h.resolverMarkers.splice(0, h.resolverMarkers.length, { text: "Sign in", label: "" });
   const liveTab = { id: 42, url: "https://resolver.example.edu/account" };
-  h.tabs.live.set(liveTab.id, liveTab);
+  h.tabs.seed(liveTab);
   h.tabs.resolverTabs.push(liveTab);
 
   await h.manager.probeForeground();
@@ -993,7 +923,7 @@ test("the focused resolver tab is inspected even when the URL-pattern query miss
   await h.manager.init();
   h.resolverMarkers.splice(0, h.resolverMarkers.length, { text: "Sign out", label: "" });
   const focused = { id: 77, url: "https://resolver.example.edu/account?fromLogin=true" };
-  h.tabs.live.set(focused.id, focused);
+  h.tabs.seed(focused);
   h.tabs.focusedTab = focused;
   // Field report 12:43pm: pattern query returned nothing while the operator
   // was looking at the signed-in library page in the active tab.
@@ -1022,9 +952,9 @@ test("a preferred/triggering tab decides the verdict despite three stale tabs so
   const stale1 = { id: 90, url: "https://resolver.example.edu/discovery/a" };
   const stale2 = { id: 91, url: "https://resolver.example.edu/discovery/b" };
   const stale3 = { id: 92, url: "https://resolver.example.edu/discovery/c" };
-  h.tabs.live.set(90, stale1);
-  h.tabs.live.set(91, stale2);
-  h.tabs.live.set(92, stale3);
+  h.tabs.seed(stale1);
+  h.tabs.seed(stale2);
+  h.tabs.seed(stale3);
   h.tabs.resolverTabs.push(stale1, stale2, stale3);
   h.markersByTab.set(90, [{ text: "Sign in", label: "" }]);
   h.markersByTab.set(91, [{ text: "Sign in", label: "" }]);
@@ -1056,7 +986,7 @@ test("more matching tabs than the observation cap never commits a decisive verdi
   const flood: KeepaliveTab[] = [];
   for (let id = 200; id < 200 + MAX_OBSERVED_TABS_PER_ORIGIN + 1; id++) {
     const tab = { id, url: `https://resolver.example.edu/discovery/${id}` };
-    h.tabs.live.set(id, tab);
+    h.tabs.seed(tab);
     flood.push(tab);
   }
   h.tabs.resolverTabs.push(...flood);
@@ -1089,8 +1019,8 @@ test("a decisive causal out from the focused tab is not overruled by a stale sib
   // looking at the "out" page right now.
   const focused = { id: 42, url: "https://resolver.example.edu/discovery/search" };
   const sibling = { id: 43, url: "https://resolver.example.edu/account/overview" };
-  h.tabs.live.set(42, focused);
-  h.tabs.live.set(43, sibling);
+  h.tabs.seed(focused);
+  h.tabs.seed(sibling);
   h.tabs.focusedTab = focused;
   h.tabs.resolverTabs.push(focused, sibling);
   h.markersByTab.set(42, [{ text: "Sign in", label: "" }]);
@@ -1116,8 +1046,8 @@ test("decisive in and out with no causal preference commits unknown as a conflic
   // observation to arbitrate between two tabs that disagree decisively.
   const a = { id: 51, url: "https://resolver.example.edu/discovery/a" };
   const b = { id: 52, url: "https://resolver.example.edu/discovery/b" };
-  h.tabs.live.set(51, a);
-  h.tabs.live.set(52, b);
+  h.tabs.seed(a);
+  h.tabs.seed(b);
   h.tabs.resolverTabs.push(a, b);
   h.markersByTab.set(51, [{ text: "Sign in", label: "" }]);
   h.markersByTab.set(52, [{ text: "Sign out", label: "" }]);
@@ -1139,8 +1069,8 @@ test("a sibling scan held open cannot publish an intermediate verdict", async ()
 
   const a = { id: 61, url: "https://resolver.example.edu/discovery/a" };
   const b = { id: 62, url: "https://resolver.example.edu/discovery/b" };
-  h.tabs.live.set(61, a);
-  h.tabs.live.set(62, b);
+  h.tabs.seed(a);
+  h.tabs.seed(b);
   h.tabs.resolverTabs.push(a, b);
   h.markersByTab.set(61, [{ text: "Sign in", label: "" }]); // resolves immediately: "out"
   h.markersByTab.set(62, [{ text: "Sign out", label: "" }]); // held open: would-be "in"
@@ -1205,10 +1135,10 @@ test("an owned tab parked on an authentication URL still pauses for reauth even 
   // may come from an entirely different, non-owned tab.
   const h = makeHarness();
   await h.manager.init();
-  h.tabs.live.get(1)!.url = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
+  h.tabs.patch(1, { url: "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver" });
 
   const sibling = { id: 88, url: "https://resolver.example.edu/account/overview" };
-  h.tabs.live.set(88, sibling);
+  h.tabs.seed(sibling);
   h.tabs.resolverTabs.push(sibling); // Default markers: "Sign out" -> decisive "in".
 
   await h.manager.probeForeground();
@@ -1350,7 +1280,7 @@ test("auth-shaped URL evidence stays unknown when marker inspection is empty", a
   h.resolverMarkers.splice(0, h.resolverMarkers.length);
   await h.manager.init();
   const liveTab = { id: 91, url: "https://resolver.example.edu/auth/login" };
-  h.tabs.live.set(liveTab.id, liveTab);
+  h.tabs.seed(liveTab);
   h.tabs.resolverTabs.push(liveTab);
 
   await h.manager.probeForeground();
@@ -1446,7 +1376,7 @@ test("popup check probes a live tab for a second known resolver origin", async (
   });
   await h.manager.init();
   const uwaTab = { id: 43, url: `${uwaOrigin}/account` };
-  h.tabs.live.set(uwaTab.id, uwaTab);
+  h.tabs.seed(uwaTab);
   h.tabs.resolverTabs.push(uwaTab);
   const inspected: number[] = [];
   h.api.scripting = {
@@ -1547,8 +1477,8 @@ test("all tabs signed out keeps the focused tab's verdict authoritative", async 
   await h.manager.init();
   const first = { id: 42, url: "https://resolver.example.edu/discovery/search" };
   const second = { id: 43, url: "https://resolver.example.edu/discovery/dbsearch" };
-  h.tabs.live.set(42, first);
-  h.tabs.live.set(43, second);
+  h.tabs.seed(first);
+  h.tabs.seed(second);
   h.tabs.focusedTab = first;
   h.tabs.resolverTabs.push(first, second);
   h.markersByTab.set(42, [{ text: "Sign in", label: "Sign In", visible: true }]);
@@ -1562,7 +1492,7 @@ test("closing the library tab never erases an earned warm verdict, but the next 
   const h = makeHarness();
   await h.manager.init();
   const liveTab = { id: 42, url: "https://resolver.example.edu/account" };
-  h.tabs.live.set(42, liveTab);
+  h.tabs.seed(liveTab);
   h.tabs.resolverTabs.push(liveTab);
   await h.manager.probeForeground();
   expect(h.manager.getSnapshot()).toMatchObject({ verdict: "in" });
@@ -1576,7 +1506,7 @@ test("closing the library tab never erases an earned warm verdict, but the next 
   // Unlike checkNow(), probeForeground() has no freshness gate, so the second
   // call genuinely queries again rather than being swallowed — the old test
   // here never actually reached the no-tab branch.
-  for (const id of [...h.tabs.live.keys()]) h.tabs.live.delete(id);
+  for (const id of h.tabs.list().flatMap((tab) => tab.id === undefined ? [] : [tab.id])) await h.tabs.userClose(id);
   h.tabs.resolverTabs.length = 0;
   h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS); // past the operator floor from the first probe
   await h.manager.probeForeground();
@@ -1602,7 +1532,7 @@ test("a completed navigation on a known resolver origin schedules exactly one tr
   await h.manager.init();
   const origin = "https://resolver.example.edu";
   const tab = { id: 501, url: `${origin}/discovery` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
 
   h.manager.noteResolverNavigation(tab.id, tab.url); // "url" changed event
   h.manager.noteResolverNavigation(tab.id, tab.url); // "complete" event, same document
@@ -1643,14 +1573,14 @@ test("navigating away from a known resolver to an unrelated IdP-shaped URL marks
   await h.manager.init();
   const origin = "https://resolver.example.edu";
   const tab = { id: 501, url: `${origin}/discovery` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.manager.noteResolverNavigation(tab.id, tab.url);
   await h.timers.runByDelay(1);
   await flushMicrotasks();
   expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).toBeNull();
   const knownBefore = h.manager.getOriginSnapshots().map((s) => s.origin).sort();
 
-  h.tabs.live.get(tab.id)!.url = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO";
+  h.tabs.patch(tab.id, { url: "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO" });
   h.manager.noteResolverNavigation(tab.id, "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO");
 
   const snapshot = h.manager.getOriginSnapshots().find((s) => s.origin === origin);
@@ -1666,7 +1596,7 @@ test("noteTabRemoved drops the tab's epoch and settle timer, and a probe that pr
   await h.manager.init();
   const origin = "https://resolver.example.edu";
   const tab = { id: 501, url: `${origin}/discovery` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.markersByTab.set(tab.id, [{ text: "Sign out", label: "" }]); // would-be decisive "in"
   const gate = h.scripting.hold(tab.id);
 
@@ -1674,7 +1604,7 @@ test("noteTabRemoved drops the tab's epoch and settle timer, and a probe that pr
   await flushMicrotasks();
   expect(h.scripting.injectionCounts.get(tab.id)).toBe(1); // scan in flight
 
-  h.tabs.live.delete(tab.id); // the tab closes while its scan is still pending
+  await h.tabs.userClose(tab.id); // the tab closes while its scan is still pending
   h.manager.noteTabRemoved(tab.id);
   expect(h.timers.pendingDelays()).not.toContain(1); // no settle timer survives it
 
@@ -1695,7 +1625,7 @@ test("a tab that navigates while its scan is still pending cannot commit the sta
   await h.manager.init();
   const origin = "https://resolver.example.edu";
   const tab = { id: 501, url: `${origin}/discovery` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.markersByTab.set(tab.id, [{ text: "Sign out", label: "" }]); // stale document: would-be decisive "in"
   const gate = h.scripting.hold(tab.id);
 
@@ -1705,7 +1635,7 @@ test("a tab that navigates while its scan is still pending cannot commit the sta
 
   // The operator navigates the SAME tab onward before the scan returns —
   // the epoch this bumps is what the stale scan gets checked against.
-  h.tabs.live.get(tab.id)!.url = `${origin}/checkout`;
+  h.tabs.patch(tab.id, { url: `${origin}/checkout` });
   h.manager.noteResolverNavigation(tab.id, `${origin}/checkout`);
 
   gate.release(); // the STALE document's markers resolve after the navigation
@@ -1726,7 +1656,7 @@ test("probe starts for one origin are spaced by MIN_PROBE_START_SPACING_MS, coal
   const tabA = { id: 501, url: `${origin}/a` };
   const tabB = { id: 502, url: `${origin}/b` };
   const tabC = { id: 503, url: `${origin}/c` };
-  for (const tab of [tabA, tabB, tabC]) h.tabs.live.set(tab.id, tab);
+  for (const tab of [tabA, tabB, tabC]) h.tabs.seed(tab);
 
   h.manager.noteResolverActivated(tabA.id, tabA.url); // nothing yet probed for this origin: runs immediately
   await flushMicrotasks();
@@ -1784,7 +1714,7 @@ test("probeForeground does not bypass the spacing limit, and popup-style open/cl
   // floor — the shorter operator floor above governs foreground requests
   // only.
   const liveTab = { id: 900, url: RESOLVER_OPENURL };
-  h.tabs.live.set(liveTab.id, liveTab);
+  h.tabs.seed(liveTab);
   h.manager.noteResolverNavigation(liveTab.id, liveTab.url);
   await h.timers.runByDelay(1); // reloadSettleMs: the settle timer requests the probe
   await flushMicrotasks();
@@ -1810,7 +1740,7 @@ test("a dirty origin survives a simulated worker restart and is probed by onWake
   h.jobs.count = 0;
   await h.manager.init();
   const tab = { id: 701, url: `${origin}/discovery` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.manager.noteResolverNavigation(tab.id, tab.url);
   await h.timers.runByDelay(1);
   await flushMicrotasks();
@@ -1818,7 +1748,7 @@ test("a dirty origin survives a simulated worker restart and is probed by onWake
 
   // The operator leaves for an IdP: dirtySince is written through the
   // serialized persist chain.
-  h.tabs.live.get(tab.id)!.url = "https://idp.example.edu/idp/sso";
+  h.tabs.patch(tab.id, { url: "https://idp.example.edu/idp/sso" });
   h.manager.noteResolverNavigation(tab.id, "https://idp.example.edu/idp/sso");
   await flushMicrotasks();
   const dirtyAt = h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince;
@@ -1832,7 +1762,7 @@ test("a dirty origin survives a simulated worker restart and is probed by onWake
   expect(restarted.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).toBe(dirtyAt);
 
   const liveTab = { id: 702, url: `${origin}/account` };
-  restarted.tabs.live.set(liveTab.id, liveTab);
+  restarted.tabs.seed(liveTab);
   restarted.tabs.resolverTabs.push(liveTab);
   const queriesBeforeWake = restarted.tabs.queryCount;
   await restarted.manager.onWake();
@@ -1853,7 +1783,7 @@ test("onWake() probes purely from dirty/paused/due origin state, with no daemon-
   await h.manager.init();
   const origin = "https://resolver.example.edu";
   const tab = { id: 501, url: `${origin}/discovery` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.manager.noteResolverNavigation(tab.id, tab.url); // establishes the tab<->origin association
   await h.timers.runByDelay(1);
   await flushMicrotasks();
@@ -1867,7 +1797,7 @@ test("onWake() probes purely from dirty/paused/due origin state, with no daemon-
 
   // Dirty it via a departure-shaped navigation, which marks dirty but does
   // not itself probe…
-  h.tabs.live.get(tab.id)!.url = "https://idp.example.edu/idp/sso";
+  h.tabs.patch(tab.id, { url: "https://idp.example.edu/idp/sso" });
   h.manager.noteResolverNavigation(tab.id, "https://idp.example.edu/idp/sso");
   expect(h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).not.toBeNull();
   expect(h.tabs.queryCount).toBe(queriesBefore);
@@ -1933,7 +1863,7 @@ test("a settle timer firing does not cancel the reauth watch armed for a paused 
   // auth_url observation would only re-affirm "pause", a no-op while
   // already paused.
   const liveTab = { id: 777, url: "https://resolver.example.edu/discovery" };
-  h.tabs.live.set(liveTab.id, liveTab);
+  h.tabs.seed(liveTab);
   h.markersByTab.set(liveTab.id, [{ text: "Sign in", label: "" }]); // decisive "out"
   h.manager.noteResolverNavigation(liveTab.id, liveTab.url);
   expect(h.timers.pendingDelays()).toContain(1);
@@ -1982,7 +1912,7 @@ test("resumeAfterReauth clears the logical pause even when the owned tab has clo
   // in-flight read stays valid — it is resumeAfterReauth's OWN handling of
   // a since-vanished owned tab that is under test here, not the read.
   const origin = "https://resolver.example.edu";
-  h.tabs.live.get(1)!.url = RESOLVER_OPENURL;
+  h.tabs.patch(1, { url: RESOLVER_OPENURL });
   h.markersByTab.set(1, [{ text: "Sign out", label: "" }]);
   const gate = h.scripting.hold(1);
   const probe = h.manager.probeForeground();
@@ -2013,8 +1943,8 @@ test("an older persisted write can never land after a newer one: the serialized 
 
   const tabA = { id: 601, url: `${defaultOrigin}/discovery` };
   const tabB = { id: 602, url: `${secondOrigin}/discovery` };
-  h.tabs.live.set(tabA.id, tabA);
-  h.tabs.live.set(tabB.id, tabB);
+  h.tabs.seed(tabA);
+  h.tabs.seed(tabB);
   h.manager.noteResolverNavigation(tabA.id, tabA.url);
   h.manager.noteResolverNavigation(tabB.id, tabB.url);
   await h.timers.runByDelay(1);
@@ -2024,12 +1954,12 @@ test("an older persisted write can never land after a newer one: the serialized 
   expect(h.manager.getOriginSnapshots().every((s) => s.dirtySince === null)).toBe(true);
 
   h.storageGate.arm(1); // freeze the NEXT persisted write only
-  h.tabs.live.get(tabA.id)!.url = "https://idp.example.edu/idp/sso"; // A departs for an IdP
+  h.tabs.patch(tabA.id, { url: "https://idp.example.edu/idp/sso" }); // A departs for an IdP
   h.manager.noteResolverNavigation(tabA.id, "https://idp.example.edu/idp/sso");
   await flushMicrotasks();
   expect(h.storageGate.pendingCount).toBe(1); // A's dirty-mark write is held open
 
-  h.tabs.live.get(tabB.id)!.url = "https://idp.example.edu/idp/sso"; // B departs too, moments later
+  h.tabs.patch(tabB.id, { url: "https://idp.example.edu/idp/sso" }); // B departs too, moments later
   h.manager.noteResolverNavigation(tabB.id, "https://idp.example.edu/idp/sso");
   await flushMicrotasks();
   // If the manager issued a second, concurrent storage.set() here instead of
@@ -2085,7 +2015,7 @@ test("a fresh release-grade probe after a warm-restored verdict still emits onFr
   expect(h.freshEvidence).toEqual([]);
 
   const tab = { id: 70, url: `${origin}/account` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.tabs.resolverTabs.push(tab); // default markers "Sign out" -> decisive "in"
   // The manager's own owned tab is ALSO pinned at this origin (jobs.count
   // defaults to 1, so init() maintains warm demand here) and would agree
@@ -2120,7 +2050,7 @@ test("onOriginAuthenticationChanged fires only when the committed authenticated 
   await h.manager.sync(); // close the owned tab: only the tab set up below counts
 
   const tab = { id: 40, url: `${origin}/account` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.tabs.resolverTabs.push(tab);
 
   // First probe: default markers ("Sign out") commit authenticated=true —
@@ -2176,7 +2106,7 @@ test("a preserved-verdict commit (no_tab, scan_failed, partial_scan) fires neith
   // stake — proving they truly preserve rather than trivially having
   // nothing to report either way.
   const tab = { id: 40, url: `${origin}/account` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.tabs.resolverTabs.push(tab);
   h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
   await h.manager.probeForeground();
@@ -2224,7 +2154,7 @@ test("a preserved-verdict commit (no_tab, scan_failed, partial_scan) fires neith
   const flood: KeepaliveTab[] = [];
   for (let id = 200; id < 200 + MAX_OBSERVED_TABS_PER_ORIGIN + 1; id++) {
     const floodTab = { id, url: `${origin}/discovery/${id}` };
-    h.tabs.live.set(id, floodTab);
+    h.tabs.seed(floodTab);
     h.markersByTab.set(id, []);
     flood.push(floodTab);
   }
@@ -2255,8 +2185,8 @@ test("a conflict reduction fires neither callback", async () => {
   // observation to arbitrate between two tabs that disagree decisively.
   const a = { id: 51, url: `${origin}/discovery/a` };
   const b = { id: 52, url: `${origin}/discovery/b` };
-  h.tabs.live.set(51, a);
-  h.tabs.live.set(52, b);
+  h.tabs.seed(a);
+  h.tabs.seed(b);
   h.tabs.resolverTabs.push(a, b);
   h.markersByTab.set(51, [{ text: "Sign in", label: "" }]);
   h.markersByTab.set(52, [{ text: "Sign out", label: "" }]);
@@ -2281,7 +2211,7 @@ test("exactly one onFreshSessionEvidence fires per committing probe, even when s
   await h.manager.sync();
 
   const siblings = [61, 62, 63].map((id) => ({ id, url: `${origin}/discovery/${id}` }));
-  for (const tab of siblings) h.tabs.live.set(tab.id, tab);
+  for (const tab of siblings) h.tabs.seed(tab);
   h.tabs.resolverTabs.push(...siblings); // default markers "Sign out" -> every one decisive "in"
 
   await h.manager.probeForeground();
@@ -2302,7 +2232,7 @@ test("neither callback fires before configuredOriginsReady() returns true, even 
   await h.manager.sync();
 
   const tab = { id: 40, url: "https://resolver.example.edu/account" };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.tabs.resolverTabs.push(tab); // default markers "Sign out" -> decisive "in"
 
   await h.manager.probeForeground();
@@ -2332,7 +2262,7 @@ test("once ready, an origin present only in offer traffic is not a configured me
   h.jobs.count = 0;
   await h.manager.sync();
   const tab = { id: 40, url: `${offerOrigin}/account` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.tabs.resolverTabs.push(tab); // default markers "Sign out" -> would-be decisive "in"
 
   // Even an explicit-origin probe (which bypasses candidate selection)
@@ -2404,7 +2334,7 @@ test("notifyConfiguredOriginsChanged() picks up a newly configured origin immedi
   await h.manager.init(); // pre-hello_ack: not ready, empty configured set
 
   const tab = { id: 90, url: `${origin}/account` };
-  h.tabs.live.set(tab.id, tab);
+  h.tabs.seed(tab);
   h.tabs.resolverTabs.push(tab); // default markers "Sign out" -> decisive "in"
 
   // hello_ack lands: the configured set now includes the origin, and the
@@ -2436,7 +2366,7 @@ test("a superseded generation's result never produces evidence", async () => {
   // itself is still pending in the background — the only way a second,
   // later-generation probe for the same origin can start at all.
   const tabA = { id: 71, url: `${origin}/account` };
-  h.tabs.live.set(tabA.id, tabA);
+  h.tabs.seed(tabA);
   h.tabs.focusedTab = tabA;
   const gateA = h.scripting.hold(tabA.id);
 
@@ -2452,11 +2382,10 @@ test("a superseded generation's result never produces evidence", async () => {
   // Second attempt, a fresh generation, admitted now that the slot is
   // free: a different tab answers immediately and commits "in".
   const tabB = { id: 72, url: `${origin}/account` };
-  h.tabs.live.set(tabB.id, tabB);
+  h.tabs.seed(tabB);
   h.tabs.focusedTab = tabB; // default markers "Sign out" -> decisive "in"
 
   await h.manager.probeForeground(origin);
-
   expect(h.freshEvidence).toHaveLength(1);
   const [firstEvidence] = h.freshEvidence;
 
@@ -2485,7 +2414,7 @@ test("a superseded generation cannot overwrite a fresher committed verdict, nor 
   // so it never exercises the overwrite this guards against.
 
   const tabA = { id: 71, url: `${origin}/account` };
-  h.tabs.live.set(tabA.id, tabA);
+  h.tabs.seed(tabA);
   h.tabs.focusedTab = tabA;
   const gateA = h.scripting.hold(tabA.id);
 
@@ -2497,7 +2426,7 @@ test("a superseded generation cannot overwrite a fresher committed verdict, nor 
   expect(h.freshEvidence).toEqual([]);
 
   const tabB = { id: 72, url: `${origin}/account` };
-  h.tabs.live.set(tabB.id, tabB);
+  h.tabs.seed(tabB);
   h.tabs.focusedTab = tabB; // default markers "Sign out" -> decisive "in"
   await h.manager.probeForeground(origin);
 
@@ -2532,7 +2461,7 @@ test("a superseded generation cannot overwrite a fresher committed verdict, nor 
 
   h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
   const tabD = { id: 73, url: `${origin}/account` };
-  h.tabs.live.set(tabD.id, tabD);
+  h.tabs.seed(tabD);
   h.tabs.focusedTab = tabD;
   const gateD = h.scripting.hold(tabD.id);
 
@@ -2543,7 +2472,7 @@ test("a superseded generation cannot overwrite a fresher committed verdict, nor 
   await stale2;
 
   const tabE = { id: 74, url: `${origin}/account` };
-  h.tabs.live.set(tabE.id, tabE);
+  h.tabs.seed(tabE);
   h.tabs.focusedTab = tabE; // default markers "Sign out" -> decisive "in" again
   await h.manager.probeForeground(origin);
   const freshCommitAt = h.manager.getSnapshot().lastVerdictAt;
@@ -2557,7 +2486,7 @@ test("a superseded generation cannot overwrite a fresher committed verdict, nor 
   // Tab D is gone by the time its held scan finally settles: the stale
   // attempt's own observation degrades to "stale", which reduces to a
   // "no_tab" outcome — the preserved-verdict branch.
-  h.tabs.live.delete(tabD.id);
+  await h.tabs.userClose(tabD.id);
   gateD.release();
   await flushMicrotasks();
 
@@ -2565,6 +2494,97 @@ test("a superseded generation cannot overwrite a fresher committed verdict, nor 
   expect(finalSnapshot?.dirtySince).toBe(dirtyAt);
   expect(finalSnapshot?.verdict).toBe("in");
   expect(finalSnapshot?.lastVerdictAt).toBe(freshCommitAt);
+});
+
+test("an ownership-skipped sibling makes a fresh signed-out scan incomplete", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [origin] });
+  h.configuredReady.value = true;
+  h.jobs.count = 0;
+  await h.manager.init();
+  await h.manager.sync();
+
+  // Establish warm signed-in evidence, then remove the warm tab so the
+  // superseded scan below has exactly the held candidate plus its sibling.
+  const warm = { id: 70, url: `${origin}/account` };
+  h.tabs.seed(warm);
+  h.tabs.focusedTab = warm;
+  await h.manager.probeForeground(origin);
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.tabs.userClose(warm.id);
+  h.manager.noteTabRemoved(warm.id);
+
+  const held = { id: 71, url: `${origin}/account` };
+  h.tabs.seed(held);
+  h.tabs.focusedTab = held;
+  const gate = h.scripting.hold(held.id);
+  const stale = h.manager.probeForeground(origin);
+  await flushMicrotasks();
+  h.clock.advanceBy(20_000);
+  await h.timers.runByDelay(20_000);
+  await stale;
+
+  const signedOut = { id: 72, url: `${origin}/account` };
+  h.tabs.seed(signedOut);
+  h.tabs.focusedTab = signedOut;
+  h.markersByTab.set(signedOut.id, [{ text: "Sign in", label: "" }]);
+  await h.manager.probeForeground(origin);
+
+  // The held tab was omitted after the stale generation's lease expired.
+  // Its sibling's decisive "out" cannot revoke the already earned session.
+  expect(h.manager.getSnapshot()).toMatchObject({ authenticated: true, verdict: "in" });
+  expect(h.freshEvidence).toHaveLength(1);
+  expect(h.authChanges).toEqual([{ origin, authenticated: true }]);
+
+  gate.release([{ text: "Sign out", label: "" }]);
+  await flushMicrotasks();
+});
+
+test("an expired sole-candidate ownership lease permits a later probe to recover evidence", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, { knownOrigins: [origin] });
+  h.configuredReady.value = true;
+  h.jobs.count = 0;
+  await h.manager.init();
+  await h.manager.sync();
+
+  const held = { id: 73, url: `${origin}/account` };
+  h.tabs.seed(held);
+  h.tabs.focusedTab = held;
+  const gate = h.scripting.hold(held.id);
+  const originalQuery = h.tabs.query.bind(h.tabs);
+  const queryGate = Promise.withResolvers<void>();
+  let delayFirstQuery = true;
+  h.tabs.query = async (query) => {
+    if (delayFirstQuery) {
+      delayFirstQuery = false;
+      await queryGate.promise;
+    }
+    return originalQuery(query);
+  };
+
+  // Delay candidate registration itself until after the admission deadline.
+  const stale = h.manager.probeForeground(origin);
+  await flushMicrotasks();
+  h.clock.advanceBy(20_000);
+  await h.timers.runByDelay(20_000);
+  await stale;
+  queryGate.resolve();
+  await flushMicrotasks();
+  expect(h.scripting.injectionCounts.get(held.id)).toBe(1);
+
+  // The old executeScript is still wedged, but its late-registered lease is
+  // already expired by data. A later generation must observe the sole
+  // candidate again rather than reducing it to permanent no_tab.
+  const later = h.manager.probeForeground(origin);
+  await flushMicrotasks();
+  expect(h.scripting.injectionCounts.get(held.id)).toBe(2);
+
+  gate.release();
+  await later;
+  await flushMicrotasks();
+  expect(h.manager.getSnapshot()).toMatchObject({ authenticated: true, verdict: "in" });
+  expect(h.freshEvidence).toHaveLength(1);
 });
 
 test("a pause that lands after the resolver moved on to a healthy origin does not raise reauth for the new origin", async () => {
@@ -2606,7 +2626,7 @@ test("a pause that lands after the resolver moved on to a healthy origin does no
   // The owned tab parks on an IdP redirect: commitOriginProbe's
   // disposition is "pause", which calls pauseForReauth(A) directly — NOT
   // through openReauth's serialized reauthChain.
-  h.tabs.live.get(1)!.url = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
+  h.tabs.patch(1, { url: "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver" });
   const pausing = h.manager.probeForeground();
   await flushMicrotasks();
 
@@ -2663,8 +2683,8 @@ test("a restart mid-pause does not strand the persisted pause, whether the pause
       latestOpenURL: RESOLVER_OPENURL,
       storageValues: pausedSnapshot(),
     });
-    const adopted = { id: 501, url: `${origin}/account` };
-    h.tabs.live.set(adopted.id, adopted);
+    const adopted = { id: 501, url: `${origin}/account`, active: false, pinned: true, muted: true };
+    h.tabs.seed(adopted);
     h.tabs.resolverTabs.push(adopted);
 
     await h.manager.init();
@@ -2709,7 +2729,7 @@ test("a non-decisive causal tab cedes the verdict to a decisive sibling, and pro
     await h.manager.init(); // owned tab id 1, default markers "Sign out" -> decisive "in"
 
     const focused = { id: 50, url: "https://resolver.example.edu/discovery/search" };
-    h.tabs.live.set(focused.id, focused);
+    h.tabs.seed(focused);
     h.tabs.focusedTab = focused;
     h.markersByTab.set(focused.id, []); // no markers at all
 
@@ -2731,10 +2751,10 @@ test("a non-decisive causal tab cedes the verdict to a decisive sibling, and pro
     const h = makeHarness();
     await h.manager.init(); // owned tab id 1
     h.markersByTab.set(1, []); // owned tab: no markers at all
-    h.tabs.focusedTab = h.tabs.live.get(1)!;
+    h.tabs.focusedTab = h.tabs.snapshot(1)!;
 
     const sibling = { id: 60, url: "https://resolver.example.edu/account/overview" };
-    h.tabs.live.set(sibling.id, sibling);
+    h.tabs.seed(sibling);
     h.tabs.resolverTabs.push(sibling);
     h.markersByTab.set(sibling.id, [{ text: "Sign in", label: "" }]); // decisive "out"
 
@@ -2910,7 +2930,7 @@ test("six or more resolver tabs no longer deadlock the verdict: a decisive in am
   const flood: KeepaliveTab[] = [];
   for (let id = 200; id < 200 + MAX_OBSERVED_TABS_PER_ORIGIN + 1; id++) {
     const tab = { id, url: `https://resolver.example.edu/discovery/${id}` };
-    h.tabs.live.set(id, tab);
+    h.tabs.seed(tab);
     flood.push(tab);
   }
   h.tabs.resolverTabs.push(...flood);
@@ -2944,7 +2964,7 @@ test("companion: the same truncated shape with only decisive out observations st
   const flood: KeepaliveTab[] = [];
   for (let id = 300; id < 300 + MAX_OBSERVED_TABS_PER_ORIGIN + 1; id++) {
     const tab = { id, url: `https://resolver.example.edu/discovery/${id}` };
-    h.tabs.live.set(id, tab);
+    h.tabs.seed(tab);
     flood.push(tab);
   }
   h.tabs.resolverTabs.push(...flood);
