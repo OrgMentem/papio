@@ -138,7 +138,7 @@ gate.
 
 The honest numerator is **works blocked during the interval between a source fix
 existing and an updated extension being installed.** Measure that, not causes.
-`dev/adapter-release-latency-plan.md` records what to build and what to count.
+`dev/active/adapter-release-latency-plan.md` records what to build and what to count.
 
 Note also that the 99 figure does not establish papio "reached the right article
 page". `ui_changed` proves only that a registered adapter did not classify the
@@ -165,7 +165,7 @@ Recorded here because they were found here; fixing them belongs to
 The adapter registry stays compiled-in and fixture-backed. The path from a broken
 provider to a working one stays: capture → `adapter-try` offline → source change →
 release. The investment goes into making that path fast, per
-`dev/adapter-release-latency-plan.md`.
+`dev/active/adapter-release-latency-plan.md`.
 
 If someone returns to this, the bar is: a mechanism whose safety comes from what
 it structurally cannot express, evaluated by an oracle that models the *action*
