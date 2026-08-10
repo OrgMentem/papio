@@ -14,6 +14,37 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
+## [Unreleased]
+
+### Added
+
+- **Firefox asks once before page captures leave the browser.** The Firefox
+  build now declares website-content data collection (Firefox 140+ shows the
+  built-in consent at install); on Firefox 128–139 sanitized failure captures
+  are not transmitted to the local *papio* app until a one-time settings
+  checkbox is enabled. Chrome behaviour is unchanged.
+
+### Changed
+
+- **Assisted jobs never act on their own.** When a job's negotiated access
+  mode is `assisted`, the extension no longer clicks provider download
+  controls, starts direct-file downloads, or navigates on the job's behalf —
+  it records what a click would open and leaves the action to you, while
+  anything you download or open yourself is still adopted.
+- **The requested paper is checked before an automatic download.** When the
+  provider page exposes a DOI in its citation metadata and it does not match
+  the job's DOI, the automatic download is refused and the mismatch is
+  reported as the wrong work instead of silently filing the wrong PDF.
+
+### Fixed
+
+- **Repeated handoffs no longer stack duplicate tabs.** After a service-worker
+  restart the extension recovers the job's existing broker tab from its
+  durable ledger instead of opening another copy for every re-offer.
+- **On-screen PDFs on publisher CDNs are grabbed again.** A PDF viewer tab
+  landing on a host outside the provider's own domain (e.g. a ScienceDirect
+  asset CDN) is now adopted when exactly one driven job matches it.
+
 ## [0.12.0] - 2026-08-10
 
 ### Added

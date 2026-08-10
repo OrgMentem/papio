@@ -8,6 +8,25 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records kept during the initial build.
 
+## [Unreleased]
+
+### Added
+
+- **Direct provider PDF routes.** For delegated jobs whose provider is already
+  known from resolver policy or prior browser evidence, the daemon now
+  computes direct PDF endpoint candidates from a compiled, versioned route
+  table (Wiley `pdfdirect`, SAGE `pdf`, ScienceDirect `pdfft`) and offers them
+  through the browser ahead of the ordinary institutional handoff — one
+  candidate at a time, with the route revision recorded in the job's events
+  and automatic fallback to the normal path when candidates are exhausted.
+  Requires extension 0.13.0; `[browser] direct_routes_enabled` (default
+  `true`) turns the behaviour off.
+- **Drift and safety latches.** A browser outcome that proves the wrong work,
+  a failed validation, or an unexpected effect now durably stops further
+  automatic browser offers for that job and provider; ordinary page-drift
+  outcomes latch only the exact adapter revision and host, so a repaired
+  adapter is offered again while the broken one is not.
+
 ## [0.20.0] - 2026-08-10
 
 ### Added
