@@ -43,6 +43,10 @@ export interface PendingDelivery {
  * agreeing to publisher T&C on their behalf; `"manual"` = will accept manually. */
 export type TermsConsent = "accept" | "manual" | undefined;
 export const TERMS_CONSENT_KEY = "papio_terms_consent_v1";
+/** Durable one-time consent for transmitting sanitized failure page captures
+ * from Firefox < 140 to the local papio daemon. Absent/false means off. */
+export const PAGE_CAPTURE_CONSENT_KEY = "papio_page_capture_consent_v1";
+
 
 /** Durable user choice for the dedicated background work window. `false`
  * disables routing and restores legacy in-window tabs; absent means enabled.
@@ -78,6 +82,9 @@ export interface ActiveJob {
    * navigations locally. Not sensitive — these are the resolver's declared
    * destinations, never an IdP address. */
   provider_hosts: string[];
+  /** Access policy retained from the offer for local authority checks. Legacy
+   * jobs without this field retain delegated behavior. */
+  access_mode?: "assisted" | "delegated";
   /** Epoch ms when the tab first left every provider host (auth started). */
   auth_started_ms?: number;
   /** Expected work identity from the job offer, used to build the adapter

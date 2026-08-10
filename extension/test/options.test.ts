@@ -7,6 +7,7 @@ import { Window } from "happy-dom";
 
 import { adapters } from "../src/adapters/types";
 import type { Source } from "../src/options";
+import { PAGE_CAPTURE_CONSENT_KEY } from "../src/state";
 
 const ALL_SITES_ORIGIN = "https://*/*";
 let importSerial = 0;
@@ -18,11 +19,13 @@ interface OptionsPage {
   permissionRemovals: string[][];
   containsCalls: string[][];
   grantedOrigins: Set<string>;
+  storageValues: Record<string, unknown>;
 }
 
 interface OptionsPageOptions {
   origins?: readonly string[];
   removeTakesEffect?: boolean;
+  pageCaptureConsent?: boolean;
 }
 
 async function settle(): Promise<void> {
@@ -49,6 +52,9 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
   window.document.write(readFileSync(new URL("../src/options.html", import.meta.url), "utf8"));
   const permissionRequests: string[][] = [];
   const permissionRemovals: string[][] = [];
+  const storageValues: Record<string, unknown> = {
+    ...(options.pageCaptureConsent === undefined ? {} : { [PAGE_CAPTURE_CONSENT_KEY]: options.pageCaptureConsent }),
+  };
   const containsCalls: string[][] = [];
   const grantedOrigins = new Set(options.origins ?? []);
   const removeTakesEffect = options.removeTakesEffect ?? true;
@@ -84,7 +90,17 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
       },
       storage: {
         session: { get: async () => ({}) },
-        local: { get: async () => ({}), set: async () => {} },
+        local: {
+          get: async (key: string | string[]) => {
+            const keys = Array.isArray(key) ? key : [key];
+            return Object.fromEntries(
+              keys.filter((entry) => entry in storageValues).map((entry) => [entry, storageValues[entry]]),
+            );
+          },
+          set: async (items: Record<string, unknown>) => {
+            Object.assign(storageValues, items);
+          },
+        },
       },
     },
   });
@@ -98,6 +114,7 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
   return {
     document: window.document as unknown as Document,
     providerOrigins: PROVIDER_SOURCES.map((source: Source) => source.origin),
+    storageValues,
     permissionRequests,
     permissionRemovals,
     containsCalls,
@@ -210,7 +227,23 @@ test("re-reads an individual grant after a remove reports success without changi
 test("keeps version diagnostics collapsed in settings", async () => {
   const page = await optionsDocument();
   const diagnostics = page.document.querySelector("details.diagnostics");
+
   expect(diagnostics).not.toBeNull();
   expect(diagnostics?.hasAttribute("open")).toBe(false);
   expect(diagnostics?.contains(page.document.getElementById("daemon-footer"))).toBe(true);
+});
+test("persists the Firefox page-capture consent checkbox", async () => {
+  const page = await optionsDocument();
+  const checkbox = page.document.getElementById("page-capture-consent") as HTMLInputElement;
+  expect(checkbox.checked).toBe(false);
+  expect(checkbox.disabled).toBe(false);
+
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new Event("change"));
+  await settle();
+  expect(page.storageValues[PAGE_CAPTURE_CONSENT_KEY]).toBe(true);
+
+  const restored = await optionsDocument({ pageCaptureConsent: true });
+  const restoredCheckbox = restored.document.getElementById("page-capture-consent") as HTMLInputElement;
+  expect(restoredCheckbox.checked).toBe(true);
 });

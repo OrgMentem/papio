@@ -113,9 +113,10 @@ async function buildAll(): Promise<void> {
     gecko: {
       id: "papio@orgmentem.com",
       strict_min_version: "128.0",
-      // papio's extension has no backend and collects no data; declare that
-      // explicitly. AMO requires data_collection_permissions on new add-ons.
-      data_collection_permissions: { required: ["none"] },
+      // Firefox data collection consent covers sanitized page captures sent
+      // from the extension to the local native app. Keep this Firefox-only;
+      // manifest.json remains valid for Chrome without the declaration.
+      data_collection_permissions: { required: ["websiteContent"] },
     },
   };
   await writeFile(`${firefoxRoot}/manifest.json`, `${JSON.stringify(firefoxManifest, null, 2)}\n`);

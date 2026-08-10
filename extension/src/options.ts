@@ -4,7 +4,13 @@
 // Selecting the daemon's `delegated` access mode never grants a Chrome permission
 // by itself — that only happens here, explicitly.
 
-import { chromeBackend, WORK_WINDOW_KEY, HANDOFF_SURFACE_KEY, type StoreShape } from "./state";
+import {
+  chromeBackend,
+  PAGE_CAPTURE_CONSENT_KEY,
+  WORK_WINDOW_KEY,
+  HANDOFF_SURFACE_KEY,
+  type StoreShape,
+} from "./state";
 import { renderPapio } from "./dom";
 import { adapters, type AdapterSpec } from "./adapters/types";
 import { clampKeepaliveInterval } from "./keepalive";
@@ -197,10 +203,42 @@ function wireTermsConsent(): void {
   toggle.addEventListener("click", () => {
     // Turning the switch off is an explicit "manual" choice, not back to unset.
     const next = toggle.getAttribute("aria-checked") === "true" ? "manual" : "accept";
+
     toggle.disabled = true;
     void chrome.storage.local.set({ [TERMS_CONSENT_KEY]: next }).then(renderTermsConsent, () => {
       toggle.disabled = false;
     });
+  });
+}
+/** Reflect Firefox's pre-140 page-capture consent. Chrome and Firefox 140+
+ * ignore this setting in the background, but keeping the choice durable lets
+ * an upgrade preserve the operator's decision. */
+export async function renderPageCaptureConsent(): Promise<void> {
+  const checkbox = document.getElementById("page-capture-consent");
+  if (!(checkbox instanceof HTMLElement) || checkbox.tagName !== "INPUT") return;
+  const input = checkbox as HTMLInputElement;
+  let consent = false;
+  try {
+    const got = await chrome.storage.local.get(PAGE_CAPTURE_CONSENT_KEY);
+    consent = got[PAGE_CAPTURE_CONSENT_KEY] === true;
+  } catch {
+    consent = false;
+  }
+  input.checked = consent;
+  input.disabled = false;
+}
+
+export function wirePageCaptureConsent(): void {
+  const checkbox = document.getElementById("page-capture-consent");
+  if (!(checkbox instanceof HTMLElement) || checkbox.tagName !== "INPUT") return;
+  const input = checkbox as HTMLInputElement;
+  input.addEventListener("change", () => {
+    input.disabled = true;
+    void chrome.storage.local
+      .set({ [PAGE_CAPTURE_CONSENT_KEY]: input.checked })
+      .then(renderPageCaptureConsent, () => {
+        input.disabled = false;
+      });
   });
 }
 
@@ -440,6 +478,8 @@ if (sourceList instanceof HTMLUListElement) {
 void renderPermissionLists();
 wireTermsConsent();
 void renderTermsConsent();
+wirePageCaptureConsent();
+void renderPageCaptureConsent();
 wireHandoffSurface();
 void renderHandoffSurface();
 void renderDaemonFooter();
