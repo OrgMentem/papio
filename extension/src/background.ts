@@ -514,6 +514,18 @@ export function findManagedTab(
     (candidate) => candidate.id !== undefined && candidate.url !== undefined && normalizeManagedTabURL(candidate.url) === normalized,
   );
 }
+/** Match handoff URL families across re-offers whose resolver query changes.
+ * The ledger is the ownership proof; this deliberately ignores query and
+ * fragment components only after a ledger entry has identified a papio tab. */
+function managedTabURLFamily(rawURL: string): string | undefined {
+  try {
+    const url = new URL(rawURL);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return undefined;
+  }
+}
+
 export type ManagedTabPurpose = "handoff" | "inbox-open" | "session-signin" | "redrive" | "reoffer" | "capture";
 const PRIVATE_HANDOFF_LEDGER_URL = "papio:private-handoff";
 export interface OpenManagedTabOptions {
@@ -594,10 +606,12 @@ export interface PdfGrabCorrelation {
 type ManagedTabLedgerEntry = {
   openedAt: number;
   url: string;
+  jobID?: string;
   windowId?: number;
   groupId?: number;
   privateURL?: boolean;
 };
+
 export interface BridgeDeps {
   connectNative(name: string): NativePort;
   manifestVersion: string;
@@ -1991,6 +2005,7 @@ export class Bridge {
   private async openManagedTabUnlocked(options: OpenManagedTabOptions): Promise<number | undefined> {
     const job = options.jobId === undefined ? undefined : findByJob(this.store, options.jobId);
     const trackedTabID = job !== undefined && job.tab_id >= 0 ? job.tab_id : undefined;
+    let ledgerOwnedTabID: number | undefined;
     const candidates: TabInfo[] = [];
     const seen = new Set<number>();
     const addCandidate = (candidate: TabInfo): void => {
@@ -2005,6 +2020,43 @@ export class Bridge {
         // A stale persisted id is not proof that a matching tab is absent.
       }
     }
+    if (options.jobId !== undefined) {
+      const ledger = await this.snapshotTabLedger();
+      const offerFamily = managedTabURLFamily(options.url);
+      const ledgerIDs = new Set(
+        Object.keys(ledger)
+          .map((key) => Number(key))
+          .filter((tabID) => Number.isInteger(tabID) && tabID >= 0),
+      );
+      const ledgerTabs =
+        this.deps.tabs.query === undefined
+          ? await Promise.all(
+              [...ledgerIDs].map(async (tabID) => {
+                try {
+                  return await this.deps.tabs.get(tabID);
+                } catch {
+                  return undefined;
+                }
+              }),
+            ).then((tabs) => tabs.filter((tab): tab is TabInfo => tab !== undefined))
+          : await this.deps.tabs.query({}).catch(() => []);
+      for (const candidate of ledgerTabs) {
+        if (candidate.id === undefined) continue;
+        const entry = ledger[String(candidate.id)];
+        if (entry === undefined || entry.privateURL === true) continue;
+        const ownedByJob = entry.jobID === options.jobId;
+        const trackedCandidate = findByTab(this.store, candidate.id);
+        if (trackedCandidate !== undefined && trackedCandidate.job_id !== options.jobId) continue;
+        if (!ownedByJob) {
+          const entryFamily = managedTabURLFamily(entry.url);
+          const currentFamily = typeof candidate.url === "string" ? managedTabURLFamily(candidate.url) : undefined;
+          if (offerFamily === undefined || (entryFamily !== offerFamily && currentFamily !== offerFamily)) continue;
+        } else {
+          ledgerOwnedTabID = candidate.id;
+        }
+        addCandidate(candidate);
+      }
+    }
     if (this.deps.tabs.query !== undefined && options.jobId === undefined) {
       try {
         for (const candidate of await this.deps.tabs.query({})) addCandidate(candidate);
@@ -2013,9 +2065,11 @@ export class Bridge {
       }
     }
     const reusable =
-      trackedTabID !== undefined || options.jobId === undefined
-        ? findManagedTab(candidates, options.url, trackedTabID)
-        : undefined;
+      trackedTabID !== undefined || ledgerOwnedTabID !== undefined || options.jobId === undefined
+        ? findManagedTab(candidates, options.url, trackedTabID ?? ledgerOwnedTabID)
+        : candidates.length === 1
+          ? candidates[0]
+          : undefined;
     if (reusable?.id !== undefined) {
       const shouldNavigate =
         (options.purpose === "redrive" || options.purpose === "reoffer") &&
@@ -2045,7 +2099,7 @@ export class Bridge {
     );
     if (tabID === undefined) return undefined;
     await this.recordManagedTab(options.jobId, tabID);
-    await this.ledgerManagedTab(tabID, options.privateLedgerURL === true);
+    await this.ledgerManagedTab(tabID, options.privateLedgerURL === true, options.jobId);
     if (options.purpose === "session-signin") {
       try {
         await this.focusManagedTab(tabID);
@@ -2115,6 +2169,7 @@ export class Bridge {
           cached = {};
         }
       }
+
       const ledger = { ...cached };
       const result = await transaction(ledger);
       this.tabLedgerCache = { ...ledger };
@@ -2127,12 +2182,19 @@ export class Bridge {
     );
     return operation;
   }
+  private async snapshotTabLedger(): Promise<Record<string, ManagedTabLedgerEntry>> {
+    if (this.deps.tabLedger === undefined) return {};
+    return this.runTabLedgerTransaction((ledger) => ({
+      value: { ...ledger },
+      changed: false,
+    }));
+  }
 
   /** Record a broker tab papio CREATED. Reused tabs are deliberately never
    * ledgered: a URL-matched reuse can be the user's own tab, and the ledger
    * exists to authorize closing — papio must never earn that authority over
    * a tab it did not open. */
-  private async ledgerManagedTab(tabID: number, privateURL = false): Promise<void> {
+  private async ledgerManagedTab(tabID: number, privateURL = false, jobID?: string): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
     let tab: TabInfo;
     try {
@@ -2148,6 +2210,7 @@ export class Bridge {
       ledger[key] = {
         openedAt: this.deps.now(),
         url: privateURL ? PRIVATE_HANDOFF_LEDGER_URL : tabURL,
+        ...(jobID === undefined ? {} : { jobID }),
         ...(privateURL ? { privateURL: true } : {}),
         ...(tab.windowId === undefined ? {} : { windowId: tab.windowId }),
         ...(tab.groupId === undefined ? {} : { groupId: tab.groupId }),
@@ -3189,6 +3252,39 @@ export class Bridge {
         alive = false;
       }
       if (alive) continue;
+      const offerURL = this.offerURLs.get(job.job_id);
+      const ownsFederatedLoginClaim = Object.values(this.store.federatedLoginOwners ?? {}).some(
+        (owner) => owner.jobID === job.job_id,
+      );
+      const hasQueuedGovernorWork = this.store.activeJobs.some(
+        (candidate) =>
+          candidate.status === "accepted" &&
+          candidate.tab_id < 0 &&
+          this.store.pendingDelivery?.job_id !== candidate.job_id &&
+          this.offerURLs.get(candidate.job_id) !== undefined &&
+          (!isDirectFileOffer(this.offerURLs.get(candidate.job_id)!) || candidate.requires_auth === true || candidate.access_mode === "assisted"),
+      );
+      if (
+        !ownsFederatedLoginClaim &&
+        !hasQueuedGovernorWork &&
+        job.status !== "awaiting_download" &&
+        this.store.pendingDelivery?.job_id !== job.job_id &&
+        offerURL !== undefined &&
+        (!isDirectFileOffer(offerURL) || job.requires_auth === true || job.access_mode === "assisted")
+      ) {
+        const recoveredTabID = await this.openManagedTab({
+          url: offerURL,
+          jobId: job.job_id,
+          purpose: "reoffer",
+          focusExisting: false,
+        });
+        if (recoveredTabID !== undefined) {
+          this.beginProviderDrive(job.job_id);
+          await this.update((s) => patchJob(s, job.job_id, { tab_id: recoveredTabID }));
+          this.registerHandoffDrive(job.job_id, recoveredTabID);
+          continue;
+        }
+      }
       if (this.store.pendingDelivery?.job_id === job.job_id && this.store.pendingDelivery.status !== "failed") {
         await this.update((s) => patchJob(s, job.job_id, { tab_id: -1 }));
         continue;
@@ -3636,7 +3732,7 @@ export class Bridge {
     }
     if (returnedTabID === undefined) {
       await this.recordManagedTab(jobID, tabID);
-      await this.ledgerManagedTab(tabID, true);
+      await this.ledgerManagedTab(tabID, true, jobID);
     }
     this.beginProviderDrive(jobID);
     this.registerHandoffDrive(jobID, tabID);
@@ -6399,8 +6495,14 @@ export class Bridge {
       try {
         await this.deps.tabs.get(existing.tab_id);
       } catch {
-        await this.removeJobWithOffer(jobID);
-        existing = undefined;
+        const recoveredTabID = await this.openManagedTab({
+          url: openurl,
+          jobId: jobID,
+          purpose: "reoffer",
+          focusExisting: false,
+        });
+        existing = recoveredTabID === undefined ? undefined : findByJob(this.store, jobID);
+        if (existing === undefined) await this.removeJobWithOffer(jobID);
       }
     }
     if (
@@ -6502,20 +6604,38 @@ export class Bridge {
           live = false;
         }
         if (
+          !live &&
+          (!isDirectFileOffer(openurl) || requiresAuth === true || effectiveAccessMode === "assisted")
+        ) {
+          const recoveredTabID = await this.openManagedTab({
+            url: openurl,
+            jobId: jobID,
+            purpose: "reoffer",
+            focusExisting: false,
+          });
+          if (recoveredTabID !== undefined) {
+            live = true;
+            liveTab = { id: recoveredTabID, url: openurl };
+            existing = findByJob(this.store, jobID) ?? { ...existing, tab_id: recoveredTabID };
+          }
+        }
+        if (
           live &&
           (freshLinks && requiresAuth === true ||
             priorOfferURL === undefined ||
             priorOfferURL === openurl)
         ) {
           if (
+            existing !== undefined &&
             claimKey !== undefined &&
             liveTab?.url !== undefined &&
             isAuthenticationURL(liveTab.url)
           ) {
+            const existingTabID = existing.tab_id;
             await this.update((s) => {
               const reserved = reserveFederatedClaim(s.federatedLoginOwners, claimKey, jobID);
               if (reserved === undefined) return s;
-              const bound = bindFederatedClaim(reserved, claimKey, jobID, existing.tab_id);
+              const bound = bindFederatedClaim(reserved, claimKey, jobID, existingTabID);
               if (bound === undefined) return s;
               const promoted = promoteFederatedClaim(bound, claimKey, jobID);
               if (promoted === undefined) return s;
@@ -7403,14 +7523,22 @@ export class Bridge {
     }
     if (!isPDF) return;
 
-    // Prefer the opener correlation; fall back to a unique provider-host job
-    // that clicked (download_initiated) but has no real download yet.
+    // Prefer the opener correlation; a recovered ledger id is authoritative
+    // when Chrome loses openerTabId during a cross-origin PDF navigation.
+    const ledger = await this.snapshotTabLedger();
+    const openerLedgerEntry = openerTabId === undefined ? undefined : ledger[String(openerTabId)];
     const candidates = this.store.activeJobs.filter((j) => {
       if (this.downloads.has(j.job_id)) return false;
       if (this.isFirefoxClickDownload(j)) return false;
       if (j.status !== "accepted" && j.status !== "awaiting_download") return false;
-      if (openerTabId !== undefined && j.tab_id === openerTabId) return true;
-      return openerTabId === undefined && j.download_initiated === true && hostMatches(host, j.provider_hosts);
+      const openerMatches =
+        openerTabId !== undefined &&
+        (j.tab_id === openerTabId || openerLedgerEntry?.jobID === j.job_id);
+      const providerDriveActive = this.handoffDrives.has(j.job_id) || j.download_initiated === true;
+      // A CDN viewer can lose both openerTabId and provider-host ancestry.
+      // Keep the unique-job guard below; daemon-side PDF/work identity checks
+      // remain the final authority for this broader correlation.
+      return openerMatches || (openerTabId === undefined && providerDriveActive);
     });
     const job = candidates.length === 1 ? candidates[0] : candidates.find((j) => j.tab_id === openerTabId);
     if (!job) return;
@@ -9564,6 +9692,7 @@ function realDeps(): BridgeDeps {
             entries[key] = {
               openedAt: item.openedAt as number,
               url: item.url as string,
+              ...(typeof item.jobID === "string" ? { jobID: item.jobID } : {}),
               ...(item.privateURL === true ? { privateURL: true } : {}),
               ...(typeof item.windowId === "number" ? { windowId: item.windowId } : {}),
               ...(typeof item.groupId === "number" ? { groupId: item.groupId } : {}),

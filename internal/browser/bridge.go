@@ -44,6 +44,7 @@ import (
 	"papio/internal/pdf"
 	"papio/internal/preview"
 	"papio/internal/protocol"
+	"papio/internal/routes"
 	"papio/internal/store"
 	"papio/internal/triage"
 	"papio/internal/watch"
@@ -55,23 +56,27 @@ const (
 	handoffActionKind = "openurl_handoff"
 	// MinExtensionVersion: 0.5.0 renamed the wire access mode to "delegated";
 	// older extensions fail-closed on offers carrying it.
-	MinExtensionVersion          = "0.5.0"
-	pageAcquireFeature           = "page_acquire"
-	triageSnapshotFeature        = "triage_snapshot_v1"
-	triageSnapshotSchema2Feature = "triage_snapshot_schema_v2"
-	triageMutationsFeature       = "triage_mutations_v1"
-	reviewPreviewFeature         = "review_preview_v1"
-	statsFeature                 = "browser_stats_v1"
-	pageCaptureFeature           = "page_capture_v1"
-	pageCaptureRequestFeature    = "page_capture_request_v1"
-	activityFeedFeature          = "activity_feed_v1"
-	triageCountsSchema2Feature   = "triage_counts_schema_v2"
-	sessionEvidenceFeature       = "session_evidence_v1"
-	deliveryContextFeature       = "delivery_context_v1"
-	pageCaptureTermsFeature      = "page_capture_terms_v1"
-	pageBulkAcquireFeature       = "page_bulk_acquire_v1"
-	triageSnapshotSchema3Feature = "triage_snapshot_schema_v3"
-	triageSnapshotSchema4Feature = "triage_snapshot_schema_v4"
+	MinExtensionVersion = "0.5.0"
+	// DirectRouteMinExtensionVersion is the first extension that understands
+	// direct provider-file URLs in a job_offer. Older extensions would open
+	// these URLs in a broker tab and cannot participate in route sequencing.
+	DirectRouteMinExtensionVersion = "0.13.0"
+	pageAcquireFeature             = "page_acquire"
+	triageSnapshotFeature          = "triage_snapshot_v1"
+	triageSnapshotSchema2Feature   = "triage_snapshot_schema_v2"
+	triageMutationsFeature         = "triage_mutations_v1"
+	reviewPreviewFeature           = "review_preview_v1"
+	statsFeature                   = "browser_stats_v1"
+	pageCaptureFeature             = "page_capture_v1"
+	pageCaptureRequestFeature      = "page_capture_request_v1"
+	activityFeedFeature            = "activity_feed_v1"
+	triageCountsSchema2Feature     = "triage_counts_schema_v2"
+	sessionEvidenceFeature         = "session_evidence_v1"
+	deliveryContextFeature         = "delivery_context_v1"
+	pageCaptureTermsFeature        = "page_capture_terms_v1"
+	pageBulkAcquireFeature         = "page_bulk_acquire_v1"
+	triageSnapshotSchema3Feature   = "triage_snapshot_schema_v3"
+	triageSnapshotSchema4Feature   = "triage_snapshot_schema_v4"
 	// pdfGrabV1Feature is ADR-0020's PDF-grab capability flag: it gates both
 	// the pdf_grab_request/pdf_grab_result message pair and, extension-side,
 	// whether the workspace even renders the grab row.
@@ -994,6 +999,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		} else {
 			pendingDownload.CandidateID = candidateID
 			b.pendingDownloads[key] = pendingDownload
+			_, _ = b.directRouteFailure(ctx, msg.JobID, "success")
 			if context != nil {
 				delete(b.deliveryContexts, key)
 				delete(b.pendingDownloads, key)
@@ -1025,10 +1031,18 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return nil, nil
 
 	case protocol.MsgError:
+		p := msg.Payload.(*protocol.ErrorPayload)
+		if p.Code == "download_not_pdf" {
+			if handled, err := b.directRouteFailure(ctx, msg.JobID, p.Code); err != nil {
+				log.Printf("papio: recording direct-route failure: %v", err)
+			} else if handled {
+				return nil, nil
+			}
+		}
 		// Only the normalized code is durable; the free-text message is
 		// extension-supplied and never persisted.
 		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.error",
-			map[string]any{"code": msg.Payload.(*protocol.ErrorPayload).Code}); err != nil {
+			map[string]any{"code": p.Code}); err != nil {
 			log.Printf("papio: recording browser error: %v", err)
 		}
 		return nil, nil
@@ -4512,6 +4526,51 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			heldIDs[id] = true
 			continue
 		}
+		directAction := true
+		if _, ok := app.OABrowserHandoffURL(action.Detail); ok {
+			directAction = false
+		}
+		if _, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
+			directAction = false
+		}
+		if directAction && b.directRouteEligible(row, accessMode) {
+			candidates, candidateErr := b.directRouteCandidates(ctx, row)
+			if candidateErr != nil {
+				log.Printf("papio: reading direct-route identifiers for %s: %v", id, candidateErr)
+			} else if len(candidates) != 0 {
+				events, eventErr := b.jobs.Events(ctx, id)
+				if eventErr != nil {
+					log.Printf("papio: reading direct-route history for %s: %v", id, eventErr)
+				} else {
+					ordinal, _ := directRouteProgress(events, candidates)
+					if ordinal < len(candidates) {
+						candidate := candidates[ordinal]
+						if validateDirectRouteEnvelope(candidate) {
+							offer, offerErr := b.offerAtURL(row, action, accessMode, candidate.URL)
+							if offerErr != nil {
+								return nil, offerErr
+							}
+							if err := b.jobs.S.AppendEvent(ctx, id, "browser.direct_route",
+								map[string]any{
+									"route_revision": candidate.RouteRevision,
+									"ordinal":        ordinal,
+									"phase":          "offered",
+								}); err != nil {
+								log.Printf("papio: recording direct-route offer for %s: %v", id, err)
+								continue
+							}
+							out = append(out, offer)
+							b.offered[id] = true
+							delete(b.reofferPending, id)
+							slots--
+							continue
+						}
+						// A malformed table row is fail-closed and falls
+						// through to the ordinary institutional handoff.
+					}
+				}
+			}
+		}
 		offer, err := b.offer(row, action, accessMode)
 		if err != nil {
 			return nil, err
@@ -4671,10 +4730,212 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 func (b *Bridge) offerableAccessMode(row job.Row) (string, bool) {
 	switch mode := b.cfg.EffectiveAccessMode(row.Policy.AccessMode); mode {
 	case config.ModeAssisted, config.ModeDelegated:
+
 		return mode, true
 	default:
 		return "", false
 	}
+}
+
+// directRouteCandidates loads the public identifiers that the compiled route
+// table can consume. Direct routes are provider-scoped: a missing provider
+// hint is deliberately not treated as "all providers", because that would
+// turn an arbitrary DOI into an unrelated provider navigation.
+func (b *Bridge) directRouteCandidates(ctx context.Context, row job.Row) ([]routes.Candidate, error) {
+	identifiers := make(map[string]string, 2)
+	if row.Work.DOI != "" {
+		identifiers["doi"] = row.Work.DOI
+	}
+	if row.WorkRequestID != "" {
+		var pii string
+		err := b.jobs.S.DB().QueryRowContext(ctx,
+			`SELECT value FROM identifiers WHERE work_request_id = ? AND kind = 'pii'`,
+			row.WorkRequestID).Scan(&pii)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if pii != "" {
+			identifiers["pii"] = pii
+		}
+	}
+	all := routes.CandidatesForIdentifiers(identifiers, "")
+
+	// A resolver policy may itself name a packaged provider family or route
+	// revision. Ordinary institution profile names simply produce no match and
+	// fall through to the institution URL / durable provider evidence below.
+	if hint := strings.TrimSpace(row.Policy.Resolver); hint != "" {
+		if candidates := routes.CandidatesForIdentifiers(identifiers, hint); len(candidates) != 0 {
+			return candidates, nil
+		}
+	}
+	if inst, ok := b.cfg.InstitutionFor(row.Policy.Resolver); ok {
+		if family := directRouteFamilyForHost(all, resolverHost(RouteURL(inst, row.Work))); family != "" {
+			if candidates := routes.CandidatesForIdentifiers(identifiers, family); len(candidates) != 0 {
+				return candidates, nil
+			}
+		}
+	}
+
+	events, err := b.jobs.Events(ctx, row.ID)
+	if err != nil {
+		return nil, err
+	}
+	// Only use the all-routes expansion as an internal lookup against durable
+	// evidence. No candidate from it is emitted; the matching route family is
+	// pinned and expanded again below.
+	for i := len(events) - 1; i >= 0; i-- {
+		kind, _ := events[i]["kind"].(string)
+		detail, _ := events[i]["detail"].(map[string]any)
+		if revision := stringDetail(detail, "route_revision"); kind == "browser.direct_route" && revision != "" {
+			family := revision
+			if slash := strings.LastIndexByte(family, '/'); slash > 0 {
+				family = family[:slash]
+			}
+			if candidates := routes.CandidatesForIdentifiers(identifiers, family); len(candidates) != 0 {
+				return candidates, nil
+			}
+		}
+		if kind == "browser.provider_outcome" {
+			if adapter := strings.TrimSpace(stringDetail(detail, "adapter_id")); adapter != "" {
+				for _, candidate := range all {
+					family := candidate.RouteRevision
+					if slash := strings.LastIndexByte(family, '/'); slash > 0 {
+						family = family[:slash]
+					}
+					if adapter == family || strings.HasPrefix(family, adapter+"-") {
+						if candidates := routes.CandidatesForIdentifiers(identifiers, family); len(candidates) != 0 {
+							return candidates, nil
+						}
+					}
+				}
+			}
+		}
+		host := strings.TrimSpace(stringDetail(detail, "host"))
+		if host == "" || (kind != "browser.page_capture" && kind != "browser.provider_outcome") {
+			continue
+		}
+		for _, candidate := range all {
+			if !directRouteHostMatches(host, candidate.AllowedOrigin) {
+				continue
+			}
+			family := candidate.RouteRevision
+			if slash := strings.LastIndexByte(family, '/'); slash > 0 {
+				family = family[:slash]
+			}
+			if candidates := routes.CandidatesForIdentifiers(identifiers, family); len(candidates) != 0 {
+				return candidates, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func directRouteFamilyForHost(candidates []routes.Candidate, host string) string {
+	for _, candidate := range candidates {
+		if directRouteHostMatches(host, candidate.AllowedOrigin) {
+			family := candidate.RouteRevision
+			if slash := strings.LastIndexByte(family, '/'); slash > 0 {
+				family = family[:slash]
+			}
+			return family
+		}
+	}
+	return ""
+}
+
+func directRouteHostMatches(host, origin string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	originHost := strings.TrimSuffix(strings.ToLower(resolverHost(origin)), ".")
+	return host != "" && originHost != "" &&
+		(host == originHost || strings.HasSuffix(host, "."+originHost) || strings.HasSuffix(originHost, "."+host))
+}
+
+func directRouteOrdinal(detail map[string]any) (int, bool) {
+	switch value := detail["ordinal"].(type) {
+	case int:
+		return value, value >= 0
+	case int64:
+		return int(value), value >= 0
+	case float64:
+		return int(value), value >= 0 && value == float64(int(value))
+	default:
+		return 0, false
+	}
+}
+
+// directRouteProgress projects the durable route events. An offered phase
+// without its result keeps the same ordinal in flight; only a terminal result
+// advances the next ordinal.
+func directRouteProgress(events []map[string]any, candidates []routes.Candidate) (next int, inFlight bool) {
+	for _, event := range events {
+		if event["kind"] != "browser.direct_route" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		ordinal, ok := directRouteOrdinal(detail)
+		if !ok || ordinal >= len(candidates) {
+			continue
+		}
+		revision, _ := detail["route_revision"].(string)
+		if revision == "" || revision != candidates[ordinal].RouteRevision {
+			continue
+		}
+		switch detail["phase"] {
+		case "offered":
+			if ordinal == next {
+				inFlight = true
+			}
+		case "result":
+			if ordinal == next && inFlight {
+				next++
+				inFlight = false
+			}
+		}
+	}
+	return next, inFlight
+}
+
+// validateDirectRouteEnvelope repeats the route-table envelope checks at the
+// emission boundary. This is deliberately independent of route compilation:
+// a future table edit must not turn a bad row into an arbitrary navigation.
+func validateDirectRouteEnvelope(candidate routes.Candidate) bool {
+	u, err := url.Parse(candidate.URL)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Host == "" || u.Fragment != "" {
+		return false
+	}
+	origin, err := url.Parse(candidate.AllowedOrigin)
+	if err != nil || origin.Scheme != "https" || origin.User != nil || origin.Path != "" ||
+		origin.RawQuery != "" || origin.Fragment != "" || origin.Host == "" || u.Host != origin.Host {
+		return false
+	}
+	kind, identifier, ok := strings.Cut(candidate.Identifier, ":")
+	if !ok || kind == "" || identifier == "" {
+		return false
+	}
+	placeholder := "{" + kind + "}"
+	prefix, suffix, found := strings.Cut(candidate.PathFamily, placeholder)
+	if !found || prefix == "" {
+		return false
+	}
+	expectedPath := (&url.URL{Path: prefix + identifier + suffix}).EscapedPath()
+	if u.EscapedPath() != expectedPath {
+		return false
+	}
+	if candidate.TermsPolicy != "none" {
+		return false
+	}
+	if u.RawQuery != "" && u.RawQuery != "download=true" {
+		return false
+	}
+	return true
+}
+
+func (b *Bridge) directRouteEligible(row job.Row, accessMode string) bool {
+	return accessMode == config.ModeDelegated &&
+		b.cfg.Browser.DirectRoutesEnabled &&
+		b.holder != nil &&
+		b.holder.ID != legacySessionID &&
+		compareVersion(b.holder.ExtensionVersion, DirectRouteMinExtensionVersion) >= 0
 }
 
 // browserOfferLatched projects durable job.latch events into the browser-only
@@ -4762,17 +5023,24 @@ func browserOfferHostMatches(offerHosts []string, latchHost string) bool {
 // extension goes blind exactly at the redirect. accessMode comes from
 // offerableAccessMode, so this never has to re-derive it.
 func (b *Bridge) offer(row job.Row, action job.HumanAction, accessMode string) (json.RawMessage, error) {
+	return b.offerAtURL(row, action, accessMode, "")
+}
+
+func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, directURL string) (json.RawMessage, error) {
 	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
 	libKeyURL := LibKeyURL(inst, row.Work)
-	offerURL := RouteURL(inst, row.Work)
-	if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
-		offerURL = oaURL
-	}
-	if retrievalURL, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
-		// ADR-0017's 2026-08-07 amendment: a fulfilled document-delivery
-		// request's form-75 "View PDF" URL, not the institution's
-		// ordinary resolver route.
-		offerURL = retrievalURL
+	offerURL := directURL
+	if offerURL == "" {
+		offerURL = RouteURL(inst, row.Work)
+		if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
+			offerURL = oaURL
+		}
+		if retrievalURL, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
+			// ADR-0017's 2026-08-07 amendment: a fulfilled document-delivery
+			// request's form-75 "View PDF" URL, not the institution's
+			// ordinary resolver route.
+			offerURL = retrievalURL
+		}
 	}
 	hosts := []string{}
 	if h := resolverHost(offerURL); h != "" {
@@ -4796,14 +5064,49 @@ func (b *Bridge) offer(row job.Row, action job.HumanAction, accessMode string) (
 		RequiresAuth:  action.RequiresAuth,
 		ExpiresAt:     b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339),
 	}
+
 	// Federated login-routing: hand this job's institution Shibboleth entityID
 	// and ProQuest account id to the extension so it can auto-select the
 	// institution on a provider login wall and unlock ProQuest's link-resolver.
-	// Values are per-profile (InstitutionFor), so a named institution routes its
-	// own login and never inherits the default institution's identity.
 	payload.LoginEntityID = inst.ShibbolethEntityID
 	payload.ProquestAccountID = inst.ProquestAccountID
 	return b.frame(protocol.MsgJobOffer, row.ID, payload)
+}
+
+// directRouteFailure consumes the existing error frame used by the extension's
+// direct-file path. It is deliberately a durable event transition: the next
+// route is not eligible for emission until this result has landed.
+func (b *Bridge) directRouteFailure(ctx context.Context, jobID, outcome string) (bool, error) {
+	row, err := b.jobs.Get(ctx, jobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	candidates, err := b.directRouteCandidates(ctx, *row)
+	if err != nil || len(candidates) == 0 {
+		return false, err
+	}
+	events, err := b.jobs.Events(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	ordinal, inFlight := directRouteProgress(events, candidates)
+	if !inFlight || ordinal >= len(candidates) {
+		return false, nil
+	}
+	candidate := candidates[ordinal]
+	if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.direct_route", map[string]any{
+		"route_revision": candidate.RouteRevision,
+		"ordinal":        ordinal,
+		"phase":          "result",
+		"outcome":        outcome,
+	}); err != nil {
+		return false, err
+	}
+	delete(b.offered, jobID)
+	return true, nil
 }
 
 // handoffOutcome records an extension-reported IdP failure on a parked

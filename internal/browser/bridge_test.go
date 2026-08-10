@@ -6539,3 +6539,142 @@ func TestHandoffLinkRoutineOutcomesAndFreshResolution(t *testing.T) {
 		}
 	})
 }
+
+func directRouteOfferURL(t *testing.T, msgs []*protocol.BrowserMessage) string {
+	t.Helper()
+	offer := firstOfType(msgs, protocol.MsgJobOffer)
+	if offer == nil {
+		t.Fatalf("missing job offer: %v", msgs)
+	}
+	return offer.Payload.(*protocol.JobOfferPayload).OpenURL
+}
+func parkWithProviderEvidence(t *testing.T, jobs *job.Store, reqID string, w work.Work, host string) string {
+	t.Helper()
+	id := park(t, jobs, reqID, w)
+	if err := jobs.RecordEvent(context.Background(), id, "browser.page_capture", map[string]any{
+		"host": host,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestDirectRouteOfferPrecedesInstitutionalHandoff(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	// The prior provider landing pins this job to Wiley. A plain institutional
+	// job with only a DOI must not receive an arbitrary first table entry.
+	id := parkWithProviderEvidence(t, jobs, "wr_direct_route_first", handoffWork(), "onlinelibrary.wiley.com")
+
+	msgs, _ := runSync(t, b, helloAs(DirectRouteMinExtensionVersion))
+	if countJobOffersFor(msgs, id) != 1 {
+		t.Fatalf("direct-route offer count = %d, want exactly one", countJobOffersFor(msgs, id))
+	}
+	if got := directRouteOfferURL(t, msgs); got != "https://onlinelibrary.wiley.com/doi/pdfdirect/10.1002/example.42?download=true" {
+		t.Fatalf("direct route URL = %q, want Wiley route", got)
+	}
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event["kind"] != "browser.direct_route" {
+			continue
+		}
+		detail := event["detail"].(map[string]any)
+		if detail["route_revision"] == "wiley-doi-pdfdirect/1" && detail["ordinal"] == float64(0) && detail["phase"] == "offered" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("direct-route offer event missing: %v", events)
+	}
+}
+
+func TestDirectRouteRequiresProviderEvidence(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id := park(t, jobs, "wr_direct_route_no_provider", handoffWork())
+	msgs, _ := runSync(t, b, helloAs(DirectRouteMinExtensionVersion))
+	if countJobOffersFor(msgs, id) != 1 {
+		t.Fatalf("offer count = %d, want ordinary offer", countJobOffersFor(msgs, id))
+	}
+	if got := directRouteOfferURL(t, msgs); strings.Contains(got, "onlinelibrary.wiley.com") {
+		t.Fatalf("job without provider evidence received direct route %q", got)
+	}
+}
+
+func TestDirectRoutesRequireDelegationAndExtensionFloor(t *testing.T) {
+	t.Run("assisted job receives ordinary offer only", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		parkWithPolicyMode(t, jobs, "wr_direct_route_assisted", "10.1002/assisted", config.ModeAssisted)
+		msgs, _ := runSync(t, b, helloAs(DirectRouteMinExtensionVersion))
+		if got := directRouteOfferURL(t, msgs); strings.Contains(got, "onlinelibrary.wiley.com") {
+			t.Fatalf("assisted job received direct route %q", got)
+		}
+	})
+	t.Run("old extension receives ordinary offer only", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		park(t, jobs, "wr_direct_route_old_extension", handoffWork())
+		msgs, _ := runSync(t, b, helloAs("0.12.9"))
+		if got := directRouteOfferURL(t, msgs); strings.Contains(got, "onlinelibrary.wiley.com") {
+			t.Fatalf("old extension received direct route %q", got)
+		}
+	})
+}
+
+func TestDirectRouteFailureAdvancesAfterDurableResult(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	id := parkWithProviderEvidence(t, jobs, "wr_direct_route_advance", handoffWork(), "onlinelibrary.wiley.com")
+	runSync(t, b, helloAs(DirectRouteMinExtensionVersion))
+
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgError, id, map[string]any{
+		"code": "download_not_pdf", "message": "provider returned HTML",
+	}))
+	if got := directRouteOfferURL(t, msgs); !strings.HasPrefix(got, cfg.Browser.OpenURLBase+"?") {
+		t.Fatalf("route fallback URL = %q, want institutional OpenURL", got)
+	}
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := false
+	for _, event := range events {
+		if event["kind"] != "browser.direct_route" {
+			continue
+		}
+		detail := event["detail"].(map[string]any)
+		if detail["ordinal"] == float64(0) && detail["phase"] == "result" && detail["outcome"] == "download_not_pdf" {
+			result = true
+		}
+	}
+	if !result {
+		t.Fatalf("route result event missing: %v", events)
+	}
+}
+
+func TestDirectRouteExhaustionFallsBackToInstitutionalOffer(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	id := parkWithProviderEvidence(t, jobs, "wr_direct_route_exhausted", handoffWork(), "onlinelibrary.wiley.com")
+	runSync(t, b, helloAs(DirectRouteMinExtensionVersion))
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgError, id, map[string]any{
+		"code": "download_not_pdf", "message": "Wiley did not return a PDF",
+	}))
+	got := directRouteOfferURL(t, msgs)
+	if !strings.HasPrefix(got, cfg.Browser.OpenURLBase+"?") {
+		t.Fatalf("route exhaustion URL = %q, want institutional OpenURL", got)
+	}
+}
+
+func TestLatchedJobsReceiveNoDirectRouteOffer(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id := parkWithProviderEvidence(t, jobs, "wr_direct_route_latched", handoffWork(), "onlinelibrary.wiley.com")
+	if err := jobs.RecordEvent(context.Background(), id, providerLatchEventKind, map[string]any{
+		"safety_domain": "onlinelibrary.wiley.com", "kind": "no_positive_effects",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := runSync(t, b, helloAs(DirectRouteMinExtensionVersion))
+	if countJobOffersFor(msgs, id) != 0 {
+		t.Fatalf("latched job received offers: %v", msgs)
+	}
+}

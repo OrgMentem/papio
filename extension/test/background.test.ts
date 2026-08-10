@@ -446,6 +446,25 @@ function jobOfferForHosts(jobID: string, providerHosts: string[], openurl = OPEN
   offer.payload["provider_hosts"] = providerHosts;
   return offer;
 }
+function installManagedTabLedger(
+  h: Harness,
+  initial: Record<string, { openedAt: number; url: string; jobID?: string }>,
+): { current: () => Record<string, { openedAt: number; url: string; jobID?: string }> } {
+  let ledger = { ...initial };
+  h.deps.tabLedger = {
+    load: async () => ({ ...ledger }),
+    save: async (entries) => {
+      ledger = Object.fromEntries(
+        Object.entries(entries).map(([key, entry]) => [
+          key,
+          { openedAt: entry.openedAt, url: entry.url, ...(entry.jobID === undefined ? {} : { jobID: entry.jobID }) },
+        ]),
+      );
+    },
+  };
+  return { current: () => ({ ...ledger }) };
+}
+
 
 /** Build release-grade FreshSessionEvidence for a Commit C bridge call. The
  * generation is opaque to Bridge (KeepaliveManager-internal bookkeeping), so
@@ -910,6 +929,70 @@ test("job_offer opens exactly one tab and replies job_accept", async () => {
   const accept = h.frames().find((f) => f.type === "job_accept");
   expect(accept?.job_id).toBe("job_0001_tyler");
   expect(h.backend.store.activeJobs.length).toBe(1);
+});
+test("a re-offer after a simulated worker restart recovers the durable ledger tab", async () => {
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const offer = jobOffer("job_ledger_restart");
+  await h.port.inbound(offer);
+  const originalTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(h.tabs.created).toHaveLength(1);
+
+  const internal = h.bridge as unknown as { update: (fn: (store: StoreShape) => StoreShape) => Promise<void> };
+  await internal.update((store) => ({
+    ...store,
+    activeJobs: store.activeJobs.map((job) =>
+      job.job_id === "job_ledger_restart" ? { ...job, tab_id: 999 } : job,
+    ),
+  }));
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(originalTabID);
+});
+
+test("a stale tab id with no ledger match mints once and records the replacement", async () => {
+  const jobID = "job_ledger_miss";
+  const offerURL = "https://resolver.example.edu/openurl?ledger=miss";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: jobID,
+      tab_id: 999,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "accepted",
+      provider_hosts: [PROVIDER_HOST],
+    }],
+    offerURLs: { [jobID]: offerURL },
+  });
+  const ledger = installManagedTabLedger(h, {});
+  const get = h.tabs.get.bind(h.tabs);
+  h.deps.tabs.get = async (tabID) => {
+    if (tabID === 999) throw new Error("stale tab");
+    return get(tabID);
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer(jobID, offerURL));
+
+  expect(h.tabs.created).toHaveLength(1);
+  const replacement = h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id;
+  expect(replacement).toBe(100);
+  expect(ledger.current()["100"]).toMatchObject({ url: offerURL, jobID });
+});
+
+test("repeated reoffers reuse one ledger tab without growing the browser surface", async () => {
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const offer = jobOffer("job_ledger_repeat");
+  await h.port.inbound(offer);
+  await h.port.inbound(offer);
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
 });
 
 test("direct OA file offer downloads before opening a tab and adopts only PDF MIME", async () => {
@@ -2802,6 +2885,82 @@ test("a cross-origin api download with a content-disposition rename steers into 
     (frame) => frame.type === "download_complete" && frame.job_id === "job_0004b_xorigin_api",
   );
   expect(complete?.payload["filename"]).toBe("retrieve.pdf");
+});
+
+test("a CDN PDF viewer is adopted for one uniquely driven accepted job", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: "job_cdn_single",
+      tab_id: 100,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "accepted",
+      provider_hosts: [PROVIDER_HOST],
+      download_initiated: true,
+    }],
+  });
+  h.tabs.seed({ id: 100, url: OPENURL });
+  await h.bridge.start();
+  h.tabs.seed({ id: 101, url: "about:blank" });
+  await h.tabs.completeNavigation(101, "https://pdf.sciencedirectassets.com/77/paper.pdf");
+
+  expect(h.downloads.started).toEqual([{
+    url: "https://pdf.sciencedirectassets.com/77/paper.pdf",
+    filename: "papio/job_cdn_single/paper.pdf",
+    conflictAction: "uniquify",
+    saveAs: false,
+  }]);
+});
+
+test("a CDN PDF viewer remains unadopted when two driven jobs are candidates", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [0, 1].map((index) => ({
+      job_id: `job_cdn_ambiguous_${index}`,
+      tab_id: 100 + index,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "accepted" as const,
+      provider_hosts: [PROVIDER_HOST],
+      download_initiated: true,
+    })),
+  });
+  h.tabs.seed({ id: 100, url: OPENURL });
+  h.tabs.seed({ id: 101, url: OPENURL });
+  await h.bridge.start();
+  h.tabs.seed({ id: 102, url: "about:blank" });
+  await h.tabs.completeNavigation(102, "https://pdf.sciencedirectassets.com/77/paper.pdf");
+
+  expect(h.downloads.started).toEqual([]);
+});
+
+test("Firefox keeps the CDN viewer adoption path disabled for click adapters", async () => {
+  const jobID = "job_cdn_firefox";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: jobID,
+      tab_id: 100,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "accepted",
+      provider_hosts: [PROVIDER_HOST],
+      adapter_id: "firefox-click",
+      download_initiated: true,
+    }],
+  }, { firefox: true });
+  h.deps.adapterSpecs.push({
+    ...PROVIDER_ADAPTER,
+    id: "firefox-click",
+    download: { selector: "button.download", requireKind: "article", method: "click" },
+  });
+  h.tabs.seed({ id: 100, url: OPENURL });
+  await h.bridge.start();
+  h.tabs.seed({ id: 101, url: "about:blank" });
+  await h.tabs.completeNavigation(101, "https://pdf.sciencedirectassets.com/77/paper.pdf");
+
+  expect(h.downloads.started).toEqual([]);
 });
 
 test("a PDF-viewer tab starts one download and leaves the adopted viewer open", async () => {
