@@ -74,15 +74,23 @@ simplification:
   act, not the one authoritative freshness read. No shadow-state
   reconstruction — the six rounds of seeding races, tombstones and
   completeness markers all existed to avoid one await, and are deleted.
+- **One rollback exception cannot create tab litter.** If a fresh one-use link
+  materializes after its job or claim was cancelled while `tabs.create` awaited,
+  that private tab never bound to live work. The guarded close primitive removes
+  it even if Chrome briefly marked it active or outside the managed surface;
+  the PDF/content guard still wins. Preserving it would retire the claim while
+  leaving its login live, allowing the next sibling to create a duplicate.
 - **papio never auto-closes content.** A PDF viewer — whoever opened it, and
   including a scaffold tab that NAVIGATED to a PDF (checked against the
   fresh `tabs.get` url, not just the creation record) — always stays. Only
   papio's own scaffolding (job/handoff/capture tabs) closes. This deletes
   the durable activation-history machinery entirely; the litter the operator
   actually reported was login tabs, which Slice 3 removes at the source.
-- Timeout keeps detach-then-park semantics (no close); cancel, settle,
-  replacement and page capture close through the primitive; the work window
-  is never closed directly — Chrome discards it when its last tab closes.
+- Legacy timeout keeps detach-then-park semantics (no close). A Slice 3 fresh
+  handoff has no reusable URL, so its timeout preserves the live tab as an
+  explicit manual park; cancel, settle, replacement and page capture still
+  close through the primitive. The work window is never closed directly —
+  Chrome discards it when its last tab closes.
 - The inertness net: every closing route has a positive test asserting the
   tab is genuinely gone, and per-predicate negatives proven non-vacuous
   (each fails if its predicate is deleted).
@@ -118,7 +126,7 @@ permission, so undefined `tab.url` is **not** a current production cause. Keep
 the case covered because the API type permits it, but the live risk is
 scripting/host permission across the IdP origin.
 
-### Slice 3 — cold offers are tabless until engagement
+### Slice 3 — cold offers are tabless until engagement (LANDED)
 
 Behind a negotiated `handoff_link_v1` feature flag:
 
@@ -162,6 +170,21 @@ storage; missing entity metadata stays tabless; direct-action, institutional and
 retrieval URLs match `actions open`; both skew directions stay connected;
 owner-write-before-navigate is pinned by a test; two sibling jobs racing the same
 institution produce exactly one navigation.
+
+Landed with the ship gates above. The fresh route exists only from correlated
+response through synchronous tab materialization: it is then deleted from the
+worker map, omitted from persisted job state, and represented in the managed-tab
+ledger only by a private sentinel. A durable opaque claim and fresh-handoff
+marker recover arbitration and timeout semantics after worker restart; the
+daemon's first re-offer also reassesses a login wall whose completion event ran
+while the worker was stopped. Structured failures remain in the popup/inbox
+instead of becoming session-fatal bridge errors.
+Engagement-required rows are outside every legacy queued-offer timer and
+evidence drain, while verified warm-session evidence retains the eager path.
+A re-offer also rebinds a migrated opaque claim to a live IdP tab and leaves a
+manually parked fresh tab outside governor capacity.
+A denied focus is best-effort and never retires a claim whose owner tab still
+exists.
 
 ### Slice 4 — only if field evidence still warrants it
 
@@ -210,9 +233,11 @@ Stop and reassess rather than starting another fix round when any holds:
    attempt was 2,300.
 4. A fix requires weakening an invariant listed above.
 
-## Status of the shipped stopgap
+## Outcome
 
-Deleting the governor is stable enough to sit on indefinitely. Waiters park until
-owner-claim retirement, owner job removal, or fresh session evidence. Worst case
-is one stale login tab per institution instead of fifteen; the operator resolves
-it by signing in once, or by closing the tab, which retires the claim.
+Cold institutional offers no longer create a browser surface before explicit
+engagement. One click mints one fresh route and one managed tab; sibling papers
+share its opaque institution claim, and closing or completing the owner resumes
+them without opening tabs on their behalf. Slice 4 stays conditional: collect
+field evidence before adding an explicit refresh for an already-owned stale
+in-flight tab.
