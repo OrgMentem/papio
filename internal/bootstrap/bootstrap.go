@@ -227,9 +227,23 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	}
 	service.Resolvers = entries
 	if cfg.SourcePolicy(config.SourceCrossrefMetadata).Enabled {
-		service.Enricher = enrich.NewWithOptions(enrich.Options{
+		crossrefEnricher := enrich.NewWithOptions(enrich.Options{
 			Client: metadataClient, ContactEmail: cfg.Email,
 			BaseURL: cfg.Sources[config.SourceCrossrefMetadata].BaseURLForDev,
+		})
+		service.Enricher = crossrefEnricher
+		service.MetadataEnrichers = append(service.MetadataEnrichers, app.MetadataEnricherEntry{
+			Name: config.SourceCrossrefMetadata, Enricher: crossrefEnricher,
+		})
+	}
+	if cfg.SourcePolicy(config.SourceOpenAlex).Enabled {
+		openAlexEnricher := enrich.NewOpenAlexWithOptions(enrich.OpenAlexOptions{
+			Client: metadataClient, ContactEmail: cfg.Email,
+			APIKey:  cfg.Sources[config.SourceOpenAlex].APIKey,
+			BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
+		})
+		service.MetadataEnrichers = append(service.MetadataEnrichers, app.MetadataEnricherEntry{
+			Name: config.SourceOpenAlex, Enricher: openAlexEnricher,
 		})
 	}
 	service.Fetch = func(ctx context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {

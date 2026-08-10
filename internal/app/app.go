@@ -54,6 +54,14 @@ type MetadataEnricher interface {
 	Enrich(context.Context, work.Work) (work.Work, bool, error)
 }
 
+// MetadataEnricherEntry binds one metadata source to its policy name. Entries
+// are attempted in order, allowing Crossref to remain first while OpenAlex
+// rescues title-only works that Crossref does not index.
+type MetadataEnricherEntry struct {
+	Name     string
+	Enricher MetadataEnricher
+}
+
 // WorkLookup retrieves discovery metadata for a requested DOI.
 type WorkLookup interface {
 	LookupWork(context.Context, string) (discovery.DiscoveredWork, error)
@@ -102,19 +110,20 @@ type ResolverEntry struct {
 
 // Service is the command-independent acquisition service.
 type Service struct {
-	Config        config.Config
-	Jobs          *job.Store
-	Artifacts     *artifact.Store
-	Budgets       *budget.Manager
-	Resolvers     []ResolverEntry
-	Enricher      MetadataEnricher
-	Discovery     WorkLookup
-	DOIRegistry   DOIRegistry
-	LandingReader LandingReader
-	Fetch         FetchFunc
-	Validate      ValidateFunc
-	AutoImporter  AutoImporter
-	Notifier      NotificationSink
+	Config            config.Config
+	Jobs              *job.Store
+	Artifacts         *artifact.Store
+	Budgets           *budget.Manager
+	Resolvers         []ResolverEntry
+	Enricher          MetadataEnricher
+	MetadataEnrichers []MetadataEnricherEntry
+	Discovery         WorkLookup
+	DOIRegistry       DOIRegistry
+	LandingReader     LandingReader
+	Fetch             FetchFunc
+	Validate          ValidateFunc
+	AutoImporter      AutoImporter
+	Notifier          NotificationSink
 	// Delivery is ADR-0017's document-delivery/ILL service (Decisions 1,
 	// 3A-3C, 4). Nil disables the feature entirely: exhaustedCandidates
 	// falls back to its pre-ADR-0017 OpenURL/no_entitlement behavior
@@ -1039,70 +1048,90 @@ func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) error {
 	return nil
 }
 
+func (s *Service) metadataEnricherEntries() []MetadataEnricherEntry {
+	if len(s.MetadataEnrichers) > 0 {
+		return s.MetadataEnrichers
+	}
+	if s.Enricher == nil {
+		return nil
+	}
+	// Keep the legacy single-enricher field as the Crossref seam used by
+	// callers and by typed version-relation traversal.
+	return []MetadataEnricherEntry{{
+		Name: config.SourceCrossrefMetadata, Enricher: s.Enricher,
+	}}
+}
+
 func (s *Service) enrich(ctx context.Context, row *job.Row) error {
-	if s.Enricher == nil || row.Work.DOI != "" || strings.TrimSpace(row.Work.Title) == "" {
+	if strings.TrimSpace(row.Work.Title) == "" {
 		return nil
 	}
-	name := config.SourceCrossrefMetadata
-	policy := s.Config.SourcePolicy(name)
-	if !policy.Enabled || !row.Policy.SourceAllowed(name) {
-		return nil
-	}
-	attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
-	if err != nil {
-		return err
-	}
-	if s.Budgets != nil {
-		if err := s.Budgets.Acquire(ctx, name, policy, 0); err != nil {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
-			// Enrichment is optional metadata, so both a spent budget and a
-			// gated source (daily quota reset) just skip it; neither may fail
-			// the job or hold the worker until the gate lifts.
-			var exceeded *budget.ErrExceeded
-			var deferred *budget.ErrDeferred
-			if errors.As(err, &exceeded) || errors.As(err, &deferred) {
-				return nil
-			}
+	for _, entry := range s.metadataEnricherEntries() {
+		if entry.Enricher == nil || row.Work.HasFetchableIdentifier() {
+			break
+		}
+		name := entry.Name
+		if name == "" {
+			name = config.SourceCrossrefMetadata
+		}
+		policy := s.Config.SourcePolicy(name)
+		if !policy.Enabled || !row.Policy.SourceAllowed(name) {
+			continue
+		}
+		attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
+		if err != nil {
 			return err
 		}
-	}
-	enriched, matched, err := s.Enricher.Enrich(ctx, row.Work)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if delay, temporary := resolver.Temporary(err); temporary {
-			if s.Budgets != nil {
-				_ = s.Budgets.Defer(ctx, name, policy, earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay))
+		if s.Budgets != nil {
+			if err := s.Budgets.Acquire(ctx, name, policy, 0); err != nil {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				// An optional source that is spent or gated must not prevent a
+				// later metadata source from attempting this same pass.
+				var exceeded *budget.ErrExceeded
+				var deferred *budget.ErrDeferred
+				if errors.As(err, &exceeded) || errors.As(err, &deferred) {
+					continue
+				}
+				return err
 			}
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
-		} else {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
 		}
-		return nil
+		enriched, matched, err := entry.Enricher.Enrich(ctx, row.Work)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if delay, temporary := resolver.Temporary(err); temporary {
+				if s.Budgets != nil {
+					_ = s.Budgets.Defer(ctx, name, policy, earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay))
+				}
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
+			} else {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
+			}
+			// Metadata enrichment is optional: one source's failure degrades
+			// to the next source instead of failing or short-circuiting resolve.
+			continue
+		}
+		if !matched {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_confident_match")
+			continue
+		}
+		if conflicts(row.Work, enriched) {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected")
+			continue
+		}
+		updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, enriched)
+		if err != nil {
+			return err
+		}
+		row.Work = updated.Work
+		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched")
+		// Enrichment has just given this job a strong identifier, which is the
+		// first moment papio can know it duplicates a job it is already running:
+		// submit-time dedup correctly matched nothing, because a title-only
+		// request has no canonical key.
+		_, _ = s.Jobs.RecordDuplicateWork(ctx, row.ID, row.Work)
 	}
-	if !matched {
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_confident_match")
-		return nil
-	}
-	if conflicts(row.Work, enriched) {
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected")
-		return nil
-	}
-	updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, enriched)
-	if err != nil {
-		return err
-	}
-	row.Work = updated.Work
-	_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched")
-	// Enrichment has just given this job a strong identifier, which is the
-	// first moment papio can know it duplicates a job it is already running:
-	// submit-time dedup correctly matched nothing, because a title-only request
-	// has no canonical key. The duplication is recorded and nothing is merged —
-	// see RecordDuplicateWork for why. Discarded like the attempt bookkeeping
-	// above: this is an advisory note, and failing a correct acquisition
-	// because a note could not be written would be the worse trade.
-	_, _ = s.Jobs.RecordDuplicateWork(ctx, row.ID, row.Work)
 	return nil
 }
 
@@ -1550,13 +1579,15 @@ func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string)
 // that says why.
 //
 // The syntactic half is HasFetchableIdentifier: no DOI/PMID/arXiv/OpenAlex id
-// means no route a login can open. The second half exists because a DOI that
-// merely *parses* is not a DOI that *exists*. A mistyped one survives every
-// upstream check — Crossref, OpenAlex, EuropePMC and Unpaywall all report "no
-// record" and "no open copy" as the same empty result — and then reaches the
-// link resolver, which has nothing to match and bounces the user to doi.org's
-// "DOI NOT FOUND" page. The handoff can never be completed, so it re-offers on
-// every session-live tick and re-notifies on the reminder schedule forever.
+// means no automatic fetch route a login can open; ISBN is a deliberate
+// human-assisted catalogue/ebook exception handled by exhaustedCandidates.
+// The second half exists because a DOI that merely *parses* is not a DOI that
+// exists. A mistyped one survives every upstream check — Crossref, OpenAlex,
+// EuropePMC and Unpaywall all report "no record" and "no open copy" as the
+// same empty result — and then reaches the link resolver, which has nothing to
+// match and bounces the user to doi.org's "DOI NOT FOUND" page. The handoff
+// can never be completed, so it re-offers on every session-live tick and
+// re-notifies on the reminder schedule forever.
 //
 // The registry is consulted only when a DOI is the sole fetchable identifier
 // (a PMID, arXiv id or OpenAlex id is its own route) and only where a handoff
@@ -1565,8 +1596,18 @@ func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string)
 // is far cheaper than terminating a job that was perfectly fetchable. The
 // registry client memoizes, so the once-a-minute repair sweep over every
 // parked job does not become a request per job per tick.
-func (s *Service) handoffGate(ctx context.Context, w work.Work) (ok bool, reason string, terminal job.TerminalReason) {
+func (s *Service) handoffGate(ctx context.Context, w work.Work, resolverName string) (ok bool, reason string, terminal job.TerminalReason) {
 	if !w.HasFetchableIdentifier() {
+		// ISBN is deliberately not a fetchable identifier: the resolver can
+		// locate a catalogue or ebook record, but papio cannot automatically
+		// fetch and validate a book PDF. It is nevertheless actionable in the
+		// human-assisted institutional flow when that profile has a usable
+		// OpenURL destination.
+		if w.ISBN != "" {
+			if base, configured := s.Config.OpenURLBaseFor(resolverName); configured && base != "" {
+				return true, "", ""
+			}
+		}
 		return false, "no_identifier", job.TerminalReasonNoIdentifier
 	}
 	if s.DOIRegistry == nil || w.DOI == "" || w.PMID != "" || w.ArXiv != "" || w.OpenAlex != "" {
@@ -1600,19 +1641,23 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 		}
 		institutionalExhausted := s.institutionalRouteExhausted(ctx, row.ID)
 		base, hasBase := s.Config.OpenURLBaseFor(row.Policy.Resolver)
-		routeable, gateReason, gateTerminal := s.handoffGate(ctx, row.Work)
+		routeable, gateReason, gateTerminal := s.handoffGate(ctx, row.Work, row.Policy.Resolver)
 		switch {
 		// A work with no identifier a login could act on must never be routed
-		// to an institutional sign-in. The resolver would be handed a bare
-		// title or an unregistered DOI, and the destination for a printed
-		// monograph, a report, or a typo is a catalogue record or an error
-		// page — no login produces a PDF, so a handoff here spends the user's
-		// SSO round trip, parks forever, and (since human actions are now
-		// re-notified on a schedule) nags them about impossible work.
+		// to an institutional sign-in. An ISBN is the one assisted exception:
+		// the resolver can locate a catalogue or ebook record from its book
+		// metadata, while papio leaves the human to obtain any readable file.
+		// A bare title or an unregistered DOI still lands on a catalogue/error
+		// page — no login produces a PDF, so those handoffs spend the user's SSO
+		// round trip and park forever.
 		case !routeable:
 			reason, terminal = gateReason, gateTerminal
 		case hasBase && base != "" && !institutionalExhausted:
-			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail, job.Access(true, "paywall")); err != nil {
+			detail := InstitutionalOpenURLHandoffDetail
+			if !row.Work.HasFetchableIdentifier() && row.Work.ISBN != "" {
+				detail = InstitutionalBookOpenURLHandoffDetail
+			}
+			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", detail, job.Access(true, "paywall")); err != nil {
 				return err
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
@@ -1645,7 +1690,7 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 	case config.ModeConservative:
 		// Same gate: an OpenURL built from a bare title or an unregistered DOI
 		// is not worth surfacing.
-		routeable, gateReason, gateTerminal := s.handoffGate(ctx, row.Work)
+		routeable, gateReason, gateTerminal := s.handoffGate(ctx, row.Work, row.Policy.Resolver)
 		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" && routeable {
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_available",
 				"no direct candidates; institutional OpenURL available but not opened in conservative mode",
@@ -2669,6 +2714,11 @@ func (s *Service) DrainHooks(timeout time.Duration) bool {
 // The browser bridge uses this same durable detail when a one-time OA offer
 // fails, so a re-park cannot alternate back to the OA candidate.
 const InstitutionalOpenURLHandoffDetail = "institutional OpenURL handoff: sign in to your institution first, then run 'papio actions open' — a fresh link is generated on each open; if the provider reports a stale or expired session, re-run 'papio actions open'"
+
+// InstitutionalBookOpenURLHandoffDetail explains the deliberately human-
+// assisted ISBN route. The resolver may find a catalogue or ebook record, but
+// papio does not claim it can automatically fetch and validate a book PDF.
+const InstitutionalBookOpenURLHandoffDetail = "institutional OpenURL handoff: sign in to your institution first, then run 'papio actions open' — this ISBN route can locate a catalogue or ebook record, but papio cannot automatically fetch or validate a book PDF; if you obtain a file, papio can adopt it; if the provider reports a stale or expired session, re-run 'papio actions open'"
 
 // OABrowserHandoffDetail identifies a handoff that must open the public OA
 // candidate itself rather than constructing an institutional OpenURL. The

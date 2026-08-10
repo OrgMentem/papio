@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"net/url"
 	"testing"
 	"time"
 
@@ -13,17 +14,15 @@ import (
 	"papio/internal/resolver"
 )
 
-// A measured 27% of one real 112-item missing-PDF backlog was books, chapters,
-// reports, and theses with no DOI. Every one of them used to park as an
-// institutional OpenURL handoff, because exhaustedCandidates asked only whether
-// a resolver base was configured. That told the user to spend an SSO round trip
-// on a printed monograph the library can only hand back as a catalogue record,
-// left the job parked forever, and — now that open human actions are re-notified
-// on an escalating schedule — turned each one into a recurring reminder about
-// work no login can finish.
+// A measured backlog included ISBN-only books that had no automatic resolver
+// candidate. With an institutional OpenURL destination, those works now take
+// a human-assisted book handoff: the resolver can locate a catalogue or ebook
+// record, while papio leaves any file acquisition to the human. An ISBN still
+// does not become a fetchable identifier, and a work with neither a fetchable
+// identifier nor an ISBN remains unavailable.
 //
-// The gate is a fetchable identifier, NOT the item type: a book chapter with a
-// Springer DOI resolves normally and must keep its handoff.
+// The gate is a fetchable identifier for automatic acquisition, NOT the item
+// type: a book chapter with a DOI resolves normally and must keep its handoff.
 func exhaustionService(t *testing.T) (*Service, *job.Store) {
 	t.Helper()
 	svc, jobs := newTestService(t)
@@ -84,22 +83,66 @@ func TestTitleOnlyWorkIsUnavailableRatherThanAnInstitutionalHandoff(t *testing.T
 	}
 }
 
-func TestISBNAloneDoesNotEarnAnInstitutionalHandoff(t *testing.T) {
-	// ISBN satisfies work.HasIdentifier, so gating on that would have quietly
-	// undone this fix the moment papio started carrying ISBNs out of Zotero.
+func TestISBNOnlyWorkUsesAssistedInstitutionalBookHandoff(t *testing.T) {
 	svc, jobs := exhaustionService(t)
 	got := processOnce(t, svc, jobs, protocol.WorkRequest{
 		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_isbn_only",
 		Identifiers: &protocol.Identifiers{ISBN: "9781576753484"},
-		Title:       "Evaluating training programs: the four levels", DesiredVersion: "any",
+		Title:       "Evaluating training programs: the four levels",
+		Authors:     []string{"Donald L. Kirkpatrick"}, Year: 2012, DesiredVersion: "any",
+	})
+
+	if got.State != job.StateAwaitingHuman {
+		t.Fatalf("isbn-only state = %q, want %q", got.State, job.StateAwaitingHuman)
+	}
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Kind != "openurl_handoff" || !actions[0].RequiresAuth {
+		t.Fatalf("actions = %+v, want one auth-requiring openurl_handoff", actions)
+	}
+	if actions[0].Detail != InstitutionalBookOpenURLHandoffDetail {
+		t.Fatalf("detail = %q, want ISBN-assisted guidance", actions[0].Detail)
+	}
+	target, ok := ResolveHumanActionURL(actions[0], *got, svc.Config.InstitutionFor)
+	if !ok {
+		t.Fatal("ISBN handoff did not resolve to a configured institutional URL")
+	}
+	parsed, err := url.Parse(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := parsed.Query()
+	for key, want := range map[string]string{
+		"rft_val_fmt": "info:ofi/fmt:kev:mtx:book",
+		"rft.genre":   "book",
+		"rft.isbn":    "9781576753484",
+		"rft.btitle":  "Evaluating training programs: the four levels",
+		"rft.date":    "2012",
+		"rft.au":      "Donald L. Kirkpatrick",
+	} {
+		if got := q.Get(key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestISBNOnlyWorkWithoutInstitutionStaysNoIdentifier(t *testing.T) {
+	svc, jobs := exhaustionService(t)
+	svc.Config.Browser.OpenURLBase = ""
+	got := processOnce(t, svc, jobs, protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_isbn_no_institution",
+		Identifiers: &protocol.Identifiers{ISBN: "9781576753484"},
+		Title:       "A book without a configured institution", DesiredVersion: "any",
 	})
 
 	if got.State != job.StateUnavailable || got.TerminalReason != "no_identifier" {
-		t.Fatalf("isbn-only result = state:%q reason:%q, want unavailable/no_identifier", got.State, got.TerminalReason)
+		t.Fatalf("isbn-only without institution = state:%q reason:%q, want unavailable/no_identifier", got.State, got.TerminalReason)
 	}
 	actions, _ := jobs.ListHumanActions(context.Background(), true)
 	if len(actions) != 0 {
-		t.Fatalf("actions = %+v, want none — no resolver consumes an ISBN", actions)
+		t.Fatalf("actions = %+v, want none without an institutional destination", actions)
 	}
 }
 

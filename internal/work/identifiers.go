@@ -32,11 +32,10 @@ func (w Work) HasIdentifier() bool {
 // acquisition route can actually resolve to full text.
 //
 // ISBN is deliberately excluded even though HasIdentifier counts it. No
-// resolver consumes an ISBN — every one of them keys on DOI, PMID, or arXiv id
-// — and an institutional OpenURL built from an ISBN reaches a catalogue record
-// or a DRM'd ebook reader, never a PDF papio can validate and file. Treating an
-// ISBN as fetchable is what routed printed monographs into an institutional
-// sign-in handoff that no login could ever complete.
+// automatic resolver consumes an ISBN as a full-text key — an institutional
+// OpenURL built from it reaches a catalogue record or DRM'd ebook reader, not
+// a PDF papio can automatically validate. Explicit human-assisted institutional
+// handoff may still use ISBN book metadata without changing this predicate.
 func (w Work) HasFetchableIdentifier() bool {
 	return w.DOI != "" || w.PMID != "" || w.ArXiv != "" || w.OpenAlex != ""
 }

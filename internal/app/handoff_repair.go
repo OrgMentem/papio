@@ -124,7 +124,7 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 		}
 		// After allInstitutionalHandoffs, so the registry is never probed for a
 		// park this rule would skip anyway.
-		routeable, _, _ := s.handoffGate(ctx, row.Work)
+		routeable, _, _ := s.handoffGate(ctx, row.Work, row.Policy.Resolver)
 		repair := "proven_empty_route_repair"
 		switch {
 		case !routeable:
