@@ -19,7 +19,6 @@ type failuresParams struct {
 	Since string `json:"since,omitempty"`
 	Limit int    `json:"limit,omitempty"`
 }
-
 type failuresResult struct {
 	Failures []job.FailureGroup `json:"failures"`
 	Since    string             `json:"since,omitempty"`
@@ -44,11 +43,7 @@ func listFailures(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	if failures == nil {
 		failures = []job.FailureGroup{}
 	}
-	result := failuresResult{Failures: failures}
-	if !since.IsZero() {
-		result.Since = since.UTC().Format(time.RFC3339Nano)
-	}
-	return marshal(result)
+	return marshal(failuresResult{Failures: failures})
 }
 
 func parseFailuresSince(value string, now time.Time) (time.Time, error) {

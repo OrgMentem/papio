@@ -19,6 +19,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/app"
 	"papio/internal/config"
+	"papio/internal/incident"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/store"
@@ -36,6 +37,10 @@ import (
 type jobsFailuresResult struct {
 	Failures []job.FailureGroup `json:"failures"`
 	Since    string             `json:"since,omitempty"`
+}
+
+type jobsIncidentsResult struct {
+	Incidents []incident.Group `json:"incidents"`
 }
 
 // listJobsPage and listActionsPage prefer the _v2 methods, whose `truncated` is
@@ -81,7 +86,15 @@ func listActionsPage(ctx context.Context, opt *options, openOnly bool, limit int
 
 func isUnknownMethod(err error) bool {
 	var remote *ipc.RemoteError
-	return errors.As(err, &remote) && remote.Code == "unknown_method"
+	if !errors.As(err, &remote) {
+		return false
+	}
+	switch remote.Code {
+	case "unknown_method", "method_not_found", "unsupported_method":
+		return true
+	default:
+		return false
+	}
 }
 
 // listAttributedJobsPage and listAttributedActionsPage prefer the _v3 methods,
@@ -508,9 +521,27 @@ func newJobsCommand(opt *options) *cobra.Command {
 			if err := opt.call(cmd.Context(), "jobs.failures", map[string]any{"since": failuresSince, "limit": effective}, &result); err != nil {
 				return err
 			}
+			var incidentsResult jobsIncidentsResult
+			if err := opt.call(cmd.Context(), "jobs.incidents", map[string]any{"since": failuresSince, "limit": effective}, &incidentsResult); err != nil && !isUnknownMethod(err) {
+				return err
+			}
 			if opt.jsonOutput {
+				if len(incidentsResult.Incidents) > 0 {
+					rows, truncated := agentjson.Capped(incidentsResult.Incidents, effective)
+					return printPage(opt, "failures", rows, truncated)
+				}
 				rows, truncated := agentjson.Capped(result.Failures, effective)
 				return printPage(opt, "failures", rows, truncated)
+			}
+			if len(incidentsResult.Incidents) > 0 {
+				for _, group := range incidentsResult.Incidents {
+					if _, err := fmt.Fprintf(opt.out, "%s | %s | %s | %s | %d | %s | %s\n",
+						group.Fingerprint, group.SafetyDomain, group.HostFamily, group.Outcome,
+						group.Jobs, group.FirstSeen.Format(time.RFC3339Nano), group.LastSeen.Format(time.RFC3339Nano)); err != nil {
+						return err
+					}
+				}
+				return nil
 			}
 			for _, group := range result.Failures {
 				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s (sample: %s)\n", group.Count, group.State, group.Provider, group.Reason, group.Sample); err != nil {

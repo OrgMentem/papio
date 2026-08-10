@@ -22,6 +22,15 @@ const (
 	capturesDir = "captures"
 	htmlExt     = ".html"
 	metadataExt = ".json"
+	pinExt      = ".pin.json"
+)
+
+// PinRole identifies why a capture is retained for an open incident.
+type PinRole string
+
+const (
+	PinFirstDecisive PinRole = "first_decisive"
+	PinLatest        PinRole = "latest"
 )
 
 // Retention bounds diagnostics so a provider repeatedly changing its page
@@ -147,6 +156,92 @@ func (s *Store) Purge(ctx context.Context, host string) (removed int, err error)
 	return len(files), nil
 }
 
+// Pin retains one capture outside ordinary age/count eviction. The marker is
+// kept beside the capture so this retention survives daemon restarts without a
+// schema change.
+func (s *Store) Pin(ctx context.Context, path, fingerprint string, role PinRole) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(fingerprint) == "" {
+		return errors.New("capture pin requires an incident fingerprint")
+	}
+	if role != PinFirstDecisive && role != PinLatest {
+		return fmt.Errorf("invalid capture pin role %q", role)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	file, err := s.captureFile(path)
+	if err != nil {
+		return err
+	}
+	marker := capturePin{Fingerprint: strings.TrimSpace(fingerprint), Role: role}
+	data, err := json.Marshal(marker)
+	if err != nil {
+		return fmt.Errorf("encoding capture pin: %w", err)
+	}
+	return writeAtomically(filepath.Dir(file.Path), pinPath(file.Path), data)
+}
+
+// PinIncident pins the first decisive and latest captures for one open
+// incident. A capture may serve both roles when the paths are equal.
+func (s *Store) PinIncident(ctx context.Context, fingerprint, firstPath, latestPath string) error {
+	if err := s.Pin(ctx, firstPath, fingerprint, PinFirstDecisive); err != nil {
+		return err
+	}
+	if filepath.Clean(latestPath) == filepath.Clean(firstPath) {
+		return nil
+	}
+	return s.Pin(ctx, latestPath, fingerprint, PinLatest)
+}
+
+// ReleaseIncident removes all retention markers for an incident. The next
+// Sweep applies normal age/count eviction to the formerly pinned captures.
+func (s *Store) ReleaseIncident(ctx context.Context, fingerprint string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" {
+		return errors.New("incident fingerprint is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.releaseIncidentLocked(ctx, fingerprint)
+}
+
+// Sweep applies retention to every host, including captures that became
+// unpinned after an incident resolved.
+func (s *Store) Sweep(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading capture directory: %w", err)
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			if err := s.pruneHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 type captureFile struct {
 	Capture
 	metadataPath string
@@ -155,6 +250,80 @@ type captureFile struct {
 type captureMetadata struct {
 	AdapterID      string `json:"adapter_id,omitempty"`
 	AdapterVersion string `json:"adapter_version,omitempty"`
+}
+
+type capturePin struct {
+	Fingerprint string  `json:"fingerprint"`
+	Role        PinRole `json:"role"`
+}
+
+func pinPath(path string) string {
+	return strings.TrimSuffix(path, htmlExt) + pinExt
+}
+
+func (s *Store) captureFile(path string) (captureFile, error) {
+	clean := filepath.Clean(path)
+	relative, err := filepath.Rel(s.root, clean)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return captureFile{}, errors.New("capture path is outside the capture directory")
+	}
+	files, err := scanHost(context.Background(), filepath.Dir(clean), filepath.Base(filepath.Dir(clean)))
+	if err != nil {
+		return captureFile{}, err
+	}
+	for _, file := range files {
+		if file.Path == clean {
+			return file, nil
+		}
+	}
+	return captureFile{}, fs.ErrNotExist
+}
+
+func readPin(path string) (capturePin, bool) {
+	data, err := os.ReadFile(pinPath(path))
+	if err != nil {
+		return capturePin{}, false
+	}
+	var pin capturePin
+	if json.Unmarshal(data, &pin) != nil || strings.TrimSpace(pin.Fingerprint) == "" {
+		return capturePin{}, false
+	}
+	return pin, true
+}
+
+func (s *Store) releaseIncidentLocked(ctx context.Context, fingerprint string) error {
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		files, err := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			pin, ok := readPin(file.Path)
+			if ok && pin.Fingerprint == fingerprint {
+				if err := os.Remove(pinPath(file.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) list(ctx context.Context) ([]Capture, error) {
@@ -219,6 +388,10 @@ func (s *Store) pruneHost(ctx context.Context, hostDir, host string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if pinned, _ := readPin(file.Path); pinned.Fingerprint != "" {
+			kept = append(kept, file)
+			continue
+		}
 		if file.Timestamp.Before(cutoff) {
 			if err := removeCapture(file); err != nil {
 				return err
@@ -228,14 +401,23 @@ func (s *Store) pruneHost(ctx context.Context, hostDir, host string) error {
 		kept = append(kept, file)
 	}
 	for len(kept) > s.retention.MaxPerHost {
-		if err := removeCapture(kept[0]); err != nil {
+		evict := -1
+		for i, file := range kept {
+			if _, pinned := readPin(file.Path); !pinned {
+				evict = i
+				break
+			}
+		}
+		if evict < 0 {
+			break
+		}
+		if err := removeCapture(kept[evict]); err != nil {
 			return err
 		}
-		kept = kept[1:]
+		kept = append(kept[:evict], kept[evict+1:]...)
 	}
 	return nil
 }
-
 func (s *Store) nextPath(ctx context.Context, hostDir, scenario string, timestamp time.Time) (string, time.Time, error) {
 	for candidate := timestamp; ; candidate = candidate.Add(time.Nanosecond) {
 		if err := ctx.Err(); err != nil {
@@ -373,6 +555,9 @@ func removeCapture(file captureFile) error {
 	}
 	if err := os.Remove(file.metadataPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("removing capture metadata: %w", err)
+	}
+	if err := os.Remove(pinPath(file.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("removing capture pin: %w", err)
 	}
 	return nil
 }

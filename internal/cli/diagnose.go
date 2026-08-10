@@ -131,7 +131,7 @@ func newAdapterCommand(opt *options) *cobra.Command {
 	}
 	purge.Flags().StringVar(&host, "host", "", "purge captures for one host")
 	captureCommand.AddCommand(purge)
-	command.AddCommand(diagnose, newAdapterCaptureCommand(opt), captureCommand)
+	command.AddCommand(diagnose, newAdapterCaptureCommand(opt), captureCommand, newAdapterRepairCommand(opt))
 	return command
 }
 

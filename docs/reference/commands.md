@@ -219,6 +219,19 @@ Build a sanitized support report for a job
 papio adapter diagnose <job-id>
 ```
 
+### `papio adapter repair`
+
+Scaffold a reviewed adapter repair workspace
+
+```
+papio adapter repair <capture-id-or-path> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--provider` | `string` |  | provider adapter id (required when capture metadata is absent) |
+| `--scenario` | `string` |  | fixture scenario (required when capture metadata is absent) |
+
 ## `papio artifacts`
 
 Inspect validated immutable artifacts

@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"papio/internal/incident"
 )
 
 // FailuresLimitMax and FailuresLimitDefault bound Store.Failures's limit
@@ -124,6 +127,69 @@ func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]Fa
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// IncidentFailures groups terminal and parked jobs by the installation-keyed
+// failure shape. The key is loaded from the same data directory as papio.db,
+// so fingerprints remain local and stable across daemon restarts.
+func (js *Store) IncidentFailures(ctx context.Context, since time.Time, limit int) ([]incident.Group, error) {
+	key, err := incident.LoadOrCreateKey(filepath.Dir(js.S.Path()))
+	if err != nil {
+		return nil, err
+	}
+	if limit < 1 {
+		limit = FailuresLimitDefault
+	}
+	if limit > FailuresLimitMax {
+		limit = FailuresLimitMax
+	}
+	rows, err := js.S.DB().QueryContext(ctx, `
+		SELECT id, state, updated_at
+		FROM jobs
+		WHERE state IN ('failed', 'unavailable', 'needs_review', 'awaiting_human', 'retry_wait', 'cancelled')
+		  AND (? = '' OR julianday(updated_at) >= julianday(?))`,
+		func() string {
+			if since.IsZero() {
+				return ""
+			}
+			return since.Add(-failureCutoffPad).UTC().Format(time.RFC3339Nano)
+		}(), func() string {
+			if since.IsZero() {
+				return ""
+			}
+			return since.Add(-failureCutoffPad).UTC().Format(time.RFC3339Nano)
+		}())
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	observations := make([]incident.JobObservation, 0)
+	for rows.Next() {
+		var id, state, updatedRaw string
+		if err := rows.Scan(&id, &state, &updatedRaw); err != nil {
+			return nil, err
+		}
+		updated, err := time.Parse(time.RFC3339Nano, updatedRaw)
+		if err != nil {
+			return nil, err
+		}
+		if !since.IsZero() && updated.Before(since) {
+			continue
+		}
+		events, err := js.Events(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		observations = append(observations, incident.JobObservation{JobID: id, State: state, UpdatedAt: updated, Events: events})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	groups := incident.Aggregate(key, observations)
+	if len(groups) > limit {
+		groups = groups[:limit]
+	}
+	return groups, nil
 }
 
 // FailureGroupCount returns the number of distinct recent failure groups from

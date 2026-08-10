@@ -357,6 +357,9 @@ func TestJobsFailuresCommandOutputsGroups(t *testing.T) {
 			var out, errOut bytes.Buffer
 			var gotParams map[string]any
 			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
+				if method == "jobs.incidents" {
+					return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+				}
 				if method != "jobs.failures" {
 					t.Fatalf("method = %q, want jobs.failures", method)
 				}
@@ -415,6 +418,9 @@ func TestJobsFailuresDecodesTheDaemonsSinceField(t *testing.T) {
 	const daemonJSON = `{"failures":[{"state":"failed","provider":"api.example.test","reason":"timeout","count":1,"sample":"job_01"}],"since":"2026-06-25T00:00:00Z"}`
 	var out, errOut bytes.Buffer
 	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method == "jobs.incidents" {
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		}
 		if method != "jobs.failures" {
 			t.Fatalf("method = %q, want jobs.failures", method)
 		}
