@@ -8,7 +8,7 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records kept during the initial build.
 
-## [0.20.0] - 2026-08-09
+## [0.20.0] - 2026-08-10
 
 ### Added
 
@@ -117,6 +117,12 @@ execution records kept during the initial build.
   job transitions, so a parked `downloads_access_required` (or any other
   non-advisory action) cannot survive beside a cancelled job; the
   `openurl_available` advisory remains intentionally open.
+
+- **Negative document-delivery limits no longer reject the whole config.**
+  `monthly_request_cap` and `status_poll_minutes` values below zero were
+  refused at load, which made a hand-edited config unparseable for every CLI
+  command; they now fall back to their runtime meanings (unlimited cap, the
+  default poll interval) like other tolerated values.
 
 - **Dependency: `golang.org/x/net` 0.54.0 -> 0.55.0** (GHSA-5cv4-jp36-h3mw,
   medium: HTML-parser denial of service). papio parses provider landing

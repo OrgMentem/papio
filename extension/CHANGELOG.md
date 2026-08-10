@@ -14,7 +14,7 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
-## [0.12.0] - 2026-08-09
+## [0.12.0] - 2026-08-10
 
 ### Added
 
