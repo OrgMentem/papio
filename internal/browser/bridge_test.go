@@ -3598,6 +3598,7 @@ func TestProviderOutcomeRecordsAdapterDiagnostics(t *testing.T) {
 			runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{
 				"outcome":         outcome,
 				"adapter_version": "sage-2026.07.27",
+				"adapter_id":      "sage",
 				"detail":          "download control was absent after provider landing",
 			}))
 
@@ -3616,6 +3617,7 @@ func TestProviderOutcomeRecordsAdapterDiagnostics(t *testing.T) {
 					t.Fatalf("provider outcome detail = %#v, want map", event["detail"])
 				}
 				if detail["outcome"] != outcome ||
+					detail["adapter_id"] != "sage" ||
 					detail["adapter_version"] != "sage-2026.07.27" ||
 					detail["extension_version"] != "1.2.3" ||
 					detail["detail"] != "download control was absent after provider landing" {
@@ -3682,11 +3684,13 @@ func TestProviderAdapterUpgradeRequeuesOnceForLiveRegistry(t *testing.T) {
 
 	runSync(t, b, helloWithAdapterVersions(t, "0.7.0", map[string]string{"sage": "0.1.0"}))
 	runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{
-		"outcome": "ui_changed", "adapter_version": "0.1.0",
+		"outcome": "ui_changed", "adapter_id": "sage", "adapter_version": "0.1.0",
 	}))
 	assertManualProviderPark(t, jobs, id)
 
-	runSync(t, b, helloWithAdapterVersions(t, "0.8.0", map[string]string{"sage": "0.2.0"}))
+	// The extension bundle is unchanged: the exact captured adapter version is
+	// the evidence that invalidates this park.
+	runSync(t, b, helloWithAdapterVersions(t, "0.7.0", map[string]string{"sage": "0.2.0"}))
 	row, err := jobs.Get(ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -3717,8 +3721,10 @@ func TestProviderAdapterUpgradeRequeuesOnceForLiveRegistry(t *testing.T) {
 		}
 		repairs++
 		if detail["old_extension_version"] != "0.7.0" ||
-			detail["new_extension_version"] != "0.8.0" ||
-			detail["adapter_version"] != "0.1.0" {
+			detail["new_extension_version"] != "0.7.0" ||
+			detail["adapter_id"] != "sage" ||
+			detail["old_adapter_version"] != "0.1.0" ||
+			detail["new_adapter_version"] != "0.2.0" {
 			t.Fatalf("upgrade repair detail = %#v", detail)
 		}
 	}
@@ -3733,7 +3739,7 @@ func TestProviderAdapterUpgradeRequeuesOnceForLiveRegistry(t *testing.T) {
 	if _, err := jobs.OpenHumanAction(ctx, id, "manual_download", "download the requested PDF yourself", job.Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
-	runSync(t, b, helloWithAdapterVersions(t, "0.8.0", map[string]string{"sage": "0.2.0"}))
+	runSync(t, b, helloWithAdapterVersions(t, "0.7.0", map[string]string{"sage": "0.2.0"}))
 	assertManualProviderPark(t, jobs, id)
 }
 
@@ -3754,7 +3760,9 @@ func TestProviderAdapterUpgradeDeclinesUnprovenVersions(t *testing.T) {
 			b, jobs, _, _ := newBridge(t)
 			id := manualProviderUpgradePark(t, jobs, "wr_adapter_upgrade_"+strings.ReplaceAll(tc.name, " ", "_"), tc.previous)
 
-			if err := b.svc.HandoffRepairer().RepairAdapterUpgrade(context.Background(), tc.current, extensionVersionNewer); err != nil {
+			if err := b.svc.HandoffRepairer().RepairAdapterUpgrade(
+				context.Background(), tc.current, nil, extensionVersionNewer,
+			); err != nil {
 				t.Fatal(err)
 			}
 			assertManualProviderPark(t, jobs, id)
@@ -6372,6 +6380,25 @@ func TestHandoffLinkRoutineOutcomesAndFreshResolution(t *testing.T) {
 		}
 		if got := mint(); got != "https://oa.example.edu/fresh?execution=two" {
 			t.Fatalf("second URL = %q, resolver appears cached", got)
+		}
+	})
+
+	t.Run("outbound frame violations remain fatal", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		id := park(t, jobs, "wr_handoff_invalid_frame", handoffWork())
+		detail := app.OABrowserHandoffActionDetail("https://oa.example.edu/report/{draft}")
+		if _, err := jobs.OpenHumanAction(context.Background(), id, handoffActionKind, detail, job.Access(false, "")); err != nil {
+			t.Fatal(err)
+		}
+		frames, err := b.handoffLink(context.Background(), &protocol.HandoffLinkRequestPayload{
+			RequestID: "request-invalid-frame-001",
+			JobID:     id,
+		})
+		if !errors.Is(err, ErrOutboundFrame) {
+			t.Fatalf("handoffLink error = %v, want ErrOutboundFrame", err)
+		}
+		if len(frames) != 0 {
+			t.Fatalf("handoffLink frames = %+v, want none on a self-validation failure", frames)
 		}
 	})
 }

@@ -201,6 +201,7 @@ export type ProviderOutcome =
 
 export interface ProviderOutcomePayload {
   outcome: ProviderOutcome;
+  adapter_id?: string;
   adapter_version?: string;
   detail?: string;
 }
@@ -807,8 +808,14 @@ function triageTime(obj: Record<string, unknown>, key: string, what: string): st
   return value;
 }
 
+const RFC3986_URI_TEXT_RE = /^[A-Za-z][A-Za-z0-9+.-]*:[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*$/;
+const INVALID_URI_ESCAPE_RE = /%(?![0-9A-Fa-f]{2})/;
+
 function triageURL(value: string, what: string, scheme: "http:" | "https:"): URL {
   rejectNUL(value, what);
+  if (!RFC3986_URI_TEXT_RE.test(value) || INVALID_URI_ESCAPE_RE.test(value)) {
+    fail(`${what} must be an RFC 3986 URI`);
+  }
   try {
     const parsed = new URL(value);
     if (parsed.protocol !== scheme || parsed.host === "") fail(`${what} must be a ${scheme} URL`);
@@ -1434,9 +1441,17 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "provider_outcome": {
-      requireFields<ProviderOutcomePayload>(p, "provider_outcome", { outcome: "required", adapter_version: "optional", detail: "optional" });
+      requireFields<ProviderOutcomePayload>(p, "provider_outcome", {
+        outcome: "required",
+        adapter_id: "optional",
+        adapter_version: "optional",
+        detail: "optional",
+      });
       const outcome = str(p, "outcome", "provider_outcome", 50);
       if (OUTCOMES[outcome] !== true) fail(`invalid outcome ${JSON.stringify(outcome)}`);
+      if ("adapter_id" in p && !/^[A-Za-z0-9_-]{1,64}$/.test(str(p, "adapter_id", "provider_outcome", 64))) {
+        fail("provider_outcome.adapter_id must use the id charset");
+      }
       if ("adapter_version" in p) str(p, "adapter_version", "provider_outcome", 50);
       if ("detail" in p) str(p, "detail", "provider_outcome", 500);
       break;

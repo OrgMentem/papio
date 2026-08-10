@@ -37,6 +37,12 @@ import {
   type PageCaptureRequestResultPayload,
 } from "./protocol";
 import {
+  bindFederatedClaim,
+  promoteFederatedClaim,
+  releaseFederatedClaim,
+  reserveFederatedClaim,
+} from "./federated-claim";
+import {
   emptyPageBulkScanStore,
   PAGE_BULK_SCAN_STORAGE_KEY,
   scanDocument,
@@ -63,7 +69,6 @@ import {
   type StoreShape,
   type TermsConsent,
   type ProviderDrainLease,
-  type FederatedLoginOwner,
   TERMS_CONSENT_KEY,
   WORK_WINDOW_KEY,
   HANDOFF_SURFACE_KEY,
@@ -170,28 +175,20 @@ export function registrableProviderHost(host: string): string | undefined {
   const count = PROVIDER_MULTI_LABEL_SUFFIXES[suffix] === true ? 3 : 2;
   return labels.slice(-count).join(".");
 }
-/** Persist only an opaque equality key for a federated-login claim. The
- * origin/entity pair is deliberately never written to browser storage. */
-export async function federatedLoginClaimKey(idpOrigin: string, entityID: string): Promise<string> {
-  const bytes = new TextEncoder().encode(JSON.stringify([idpOrigin, entityID]));
+/** Persist only an opaque equality key for an institution-level federated
+ * login claim. Entity IDs are global identifiers; resolver/IdP origin is
+ * intentionally excluded so a shared discovery service cannot split one
+ * institution into multiple claims. */
+export async function federatedLoginClaimKey(entityID: string): Promise<string> {
+  const bytes = new TextEncoder().encode(entityID);
   const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `v2:${hex}`;
 }
 
-/** The pre-r6 registry key was JSON.stringify([origin, entityID]). Treat
- * every such persisted key as stale during startup migration. */
+/** Every pre-v2 or malformed key is stale and removed during startup. */
 function isLegacyFederatedLoginClaimKey(value: string): boolean {
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return (
-      Array.isArray(parsed) &&
-      parsed.length === 2 &&
-      typeof parsed[0] === "string" &&
-      typeof parsed[1] === "string"
-    );
-  } catch {
-    return false;
-  }
+  return !/^v2:[0-9a-f]{64}$/.test(value);
 }
 // A job whose warm SSO session cannot complete human authentication would
 // otherwise be re-driven on every daemon re-offer and worker spin-up forever,
@@ -216,6 +213,7 @@ const TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE = "triage_snapshot_schema_v4";
 const TRIAGE_COUNTS_SCHEMA_2_FEATURE = "triage_counts_schema_v2";
 const SESSION_EVIDENCE_FEATURE = "session_evidence_v1";
 const DELIVERY_CONTEXT_FEATURE = "delivery_context_v1";
+const HANDOFF_LINK_FEATURE = "handoff_link_v1";
 const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 const STATS_FEATURE = "browser_stats_v1";
@@ -248,6 +246,7 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "pdf_grab_abandon_result",
   "delivery_reconcile_result",
   "pdf_grab_result",
+  "handoff_link_result",
 ]);
 // Fallback for a manifest without an action popup; both build targets ship
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
@@ -515,6 +514,7 @@ export function findManagedTab(
   );
 }
 export type ManagedTabPurpose = "handoff" | "inbox-open" | "session-signin" | "redrive" | "reoffer" | "capture";
+const PRIVATE_HANDOFF_LEDGER_URL = "papio:private-handoff";
 export interface OpenManagedTabOptions {
   url: string;
   jobId?: string;
@@ -525,6 +525,10 @@ export interface OpenManagedTabOptions {
   /** Set false when the caller just surfaced the tab (e.g. stale-page
    * recovery) and only needs managed URL reuse/navigation. */
   focusExisting?: boolean;
+  /** Synchronous claim binding immediately after Chrome returns a new tab. */
+  onTabMaterialized?: (tabID: number) => void;
+  /** Persist only a private ownership marker, never the one-use URL. */
+  privateLedgerURL?: boolean;
 }
 
 
@@ -591,6 +595,7 @@ type ManagedTabLedgerEntry = {
   url: string;
   windowId?: number;
   groupId?: number;
+  privateURL?: boolean;
 };
 export interface BridgeDeps {
   connectNative(name: string): NativePort;
@@ -1378,9 +1383,6 @@ export class Bridge {
   private readonly handoffDrives = new Map<string, HandoffDrive>();
   private readonly handoffDriveTimeouts = new Map<string, object>();
   private handoffDriveDrainChain: Promise<void> = Promise.resolve();
-  /** URLs papio has intentionally opened or navigated for each tracked job.
-   * Used for managed-tab deduplication and lifecycle bookkeeping. */
-  private readonly managedTabURLs = new Map<string, Set<string>>();
   /** Single reducer state for the papio tab-group's human-attention surface. */
   private handoffGroupDesiredExpanded = false;
   private handoffGroupLastStateChangeAt: number | undefined;
@@ -1880,7 +1882,11 @@ export class Bridge {
    * directly matched adapter requires its SPA to render visibly; otherwise the
    * legacy rule applies and `surfaceFallback` decides whether the tab takes
    * focus. Never throws — returns undefined on failure, matching callers. */
-  private async openBrokerTab(url: string, surfaceFallback: boolean): Promise<number | undefined> {
+  private async openBrokerTab(
+    url: string,
+    surfaceFallback: boolean,
+    onTabMaterialized?: (tabID: number) => void,
+  ): Promise<number | undefined> {
     const surface = await this.handoffSurface();
     if (surface === "work-window") {
       let targetAdapter: AdapterSpec | undefined;
@@ -1891,7 +1897,7 @@ export class Bridge {
         // The browser will reject malformed handoff URLs through the normal path.
       }
       const opened = this.workTabChain.then(() =>
-        this.openWorkWindowTab(url, needsVisibleWindow(targetAdapter)),
+        this.openWorkWindowTab(url, needsVisibleWindow(targetAdapter), onTabMaterialized),
       );
       this.workTabChain = opened.catch(() => undefined);
       try {
@@ -1902,8 +1908,7 @@ export class Bridge {
       }
     }
     if (surface === "tab-group") {
-      // Serialize like the work window so concurrent offers share one group.
-      const opened = this.workTabChain.then(() => this.openTabGroupTab(url));
+      const opened = this.workTabChain.then(() => this.openTabGroupTab(url, onTabMaterialized));
       this.workTabChain = opened.catch(() => undefined);
       try {
         return await opened;
@@ -1913,17 +1918,13 @@ export class Bridge {
       }
     }
     try {
-      return (await this.deps.tabs.create({ url, active: surfaceFallback })).id;
+      const tabID = (await this.deps.tabs.create({ url, active: surfaceFallback })).id;
+      if (tabID !== undefined) onTabMaterialized?.(tabID);
+      return tabID;
     } catch (e) {
       console.error("papio: tab creation failed", e);
       return undefined;
     }
-  }
-  private rememberManagedTabURL(jobID: string | undefined, url: string | undefined): void {
-    if (jobID === undefined || url === undefined || url.length === 0) return;
-    const known = this.managedTabURLs.get(jobID) ?? new Set<string>();
-    known.add(normalizeManagedTabURL(url));
-    this.managedTabURLs.set(jobID, known);
   }
 
 
@@ -1989,15 +1990,17 @@ export class Bridge {
         // A tab can disappear between lookup and focus; callers still retain
         // the live id and the browser removal path will recover the job.
       }
-      this.rememberManagedTabURL(options.jobId, options.url);
       await this.recordManagedTab(options.jobId, reusable.id);
       return reusable.id;
     }
-    const tabID = await this.openBrokerTab(options.url, options.surfaceFallback ?? true);
+    const tabID = await this.openBrokerTab(
+      options.url,
+      options.surfaceFallback ?? true,
+      options.onTabMaterialized,
+    );
     if (tabID === undefined) return undefined;
-    this.rememberManagedTabURL(options.jobId, options.url);
     await this.recordManagedTab(options.jobId, tabID);
-    await this.ledgerManagedTab(tabID);
+    await this.ledgerManagedTab(tabID, options.privateLedgerURL === true);
     if (options.purpose === "session-signin") {
       try {
         await this.focusManagedTab(tabID);
@@ -2017,11 +2020,14 @@ export class Bridge {
     if (job === undefined || job.tab_id === tabID) return;
     await this.update((s) => patchJob(s, jobID, { tab_id: tabID }));
   }
-  /** The authoritative get is followed immediately by remove in this turn;
-   * the residual activation gap is milliseconds and recoverable through
-   * reopen-closed-tab. */
+  /** The authoritative get is followed immediately by remove in this turn.
+   * A failed fresh-link materialization is the one surface exception: the
+   * private one-use tab never bound to a live job, so preserving it would let
+   * a sibling open a duplicate institutional login. PDF content still stays. */
   private async closeOwnedTab(tabID: number, reason: string): Promise<void> {
     const entry = this.tabLedgerCache?.[String(tabID)];
+    const rollbackPrivate =
+      reason === "fresh-materialization-rollback" && entry?.privateURL === true;
     if (entry === undefined || findByTab(this.store, tabID) !== undefined) return;
     if (reason === "adopted-viewer" || isPDFPage(entry.url)) return;
     let tab: TabInfo;
@@ -2034,8 +2040,8 @@ export class Bridge {
     const inWorkWindow = tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
     const inPapioGroup = tab.groupId !== undefined && tab.groupId === this.store.handoffGroupID;
     if (
-      tab.active === true ||
-      (!inWorkWindow && !inPapioGroup)
+      !rollbackPrivate &&
+      (tab.active === true || (!inWorkWindow && !inPapioGroup))
     ) return;
     await this.deps.tabs.remove(tabID).catch(() => undefined);
   }
@@ -2081,7 +2087,7 @@ export class Bridge {
    * ledgered: a URL-matched reuse can be the user's own tab, and the ledger
    * exists to authorize closing — papio must never earn that authority over
    * a tab it did not open. */
-  private async ledgerManagedTab(tabID: number): Promise<void> {
+  private async ledgerManagedTab(tabID: number, privateURL = false): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
     let tab: TabInfo;
     try {
@@ -2090,12 +2096,14 @@ export class Bridge {
       return;
     }
     if (typeof tab.url !== "string" || tab.url.length === 0) return;
+    const tabURL = tab.url;
     await this.runTabLedgerTransaction(async (ledger) => {
       const key = String(tabID);
       if (ledger[key] !== undefined) return { value: undefined, changed: false };
       ledger[key] = {
         openedAt: this.deps.now(),
-        url: tab.url!,
+        url: privateURL ? PRIVATE_HANDOFF_LEDGER_URL : tabURL,
+        ...(privateURL ? { privateURL: true } : {}),
         ...(tab.windowId === undefined ? {} : { windowId: tab.windowId }),
         ...(tab.groupId === undefined ? {} : { groupId: tab.groupId }),
       };
@@ -2135,7 +2143,12 @@ export class Bridge {
         }
         if (tracked.has(tabID)) continue;
         const entry = ledger[key];
-        if (entry === undefined || typeof entry.url !== "string" || entry.url.length === 0) {
+        if (
+          entry === undefined ||
+          typeof entry.url !== "string" ||
+          entry.url.length === 0 ||
+          (entry.privateURL === true && entry.url !== PRIVATE_HANDOFF_LEDGER_URL)
+        ) {
           delete ledger[key];
           changed = true;
           continue;
@@ -2148,7 +2161,7 @@ export class Bridge {
           changed = true;
           continue;
         }
-        if (tab.url !== entry.url) {
+        if (entry.privateURL !== true && tab.url !== entry.url) {
           delete ledger[key];
           changed = true;
           continue;
@@ -2267,14 +2280,13 @@ export class Bridge {
       }
     }
   }
-
-
-  /** Create the handoff tab in the user's current window and fold it into the
-   * collapsed "papio" tab group, reusing the group across handoffs. The group
-   * lives in the user's window; Chrome removes it automatically once empty. */
-  private async openTabGroupTab(url: string): Promise<number | undefined> {
+  private async openTabGroupTab(
+    url: string,
+    onTabMaterialized?: (tabID: number) => void,
+  ): Promise<number | undefined> {
     const tab = await this.deps.tabs.create({ url, active: false });
     if (tab.id === undefined) return undefined;
+    onTabMaterialized?.(tab.id);
     await this.foldIntoHandoffGroup(tab.id, tab.windowId);
     return tab.id;
   }
@@ -2469,7 +2481,11 @@ export class Bridge {
 
   /** Create the tab inside the dedicated work window, keeping a directly
    * matched visible-required adapter out of the minimized state. */
-  private async openWorkWindowTab(url: string, visible: boolean): Promise<number | undefined> {
+  private async openWorkWindowTab(
+    url: string,
+    visible: boolean,
+    onTabMaterialized?: (tabID: number) => void,
+  ): Promise<number | undefined> {
     const windows = this.deps.windows;
     if (windows === undefined) return undefined;
     const existing = this.store.workWindowID;
@@ -2479,7 +2495,9 @@ export class Bridge {
         if (visible && win.state === "minimized") {
           await windows.update(existing, { focused: false, state: "normal" });
         }
-        return (await this.deps.tabs.create({ url, active: false, windowId: existing })).id;
+        const tabID = (await this.deps.tabs.create({ url, active: false, windowId: existing })).id;
+        if (tabID !== undefined) onTabMaterialized?.(tabID);
+        return tabID;
       } catch {
         // Window closed by the user (or the tab create raced its closing):
         // fall through and recreate.
@@ -2490,6 +2508,8 @@ export class Bridge {
       focused: false,
       state: visible ? "normal" : "minimized",
     });
+    const tabID = created.tabs?.find((tab) => tab.id !== undefined)?.id;
+    if (tabID !== undefined) onTabMaterialized?.(tabID);
     // macOS Firefox often ignores `state`/`focused` at creation time
     // (bugzilla 1271047): the "minimized" work window arrives front and
     // center. Re-asserting the state after creation is the reliable form.
@@ -2504,7 +2524,7 @@ export class Bridge {
       const windowID = created.id;
       await this.update((s) => ({ ...s, workWindowID: windowID }));
     }
-    return created.tabs?.find((tab) => tab.id !== undefined)?.id;
+    return tabID;
   }
 
   /** Restore only adapters whose SPA cannot hydrate while the work window is hidden. */
@@ -2698,11 +2718,18 @@ export class Bridge {
           }),
         );
         this.send("auth_pending", {}, jobID);
-        // Timeout releases the governor and detaches the browser tab. The
-        // operator may keep reading it, but this job no longer owns it.
+        if (current.fresh_handoff === true) {
+          // A fresh link is deliberately gone after materialization. Preserve
+          // the live tab as a manual park; detaching it would leave the job
+          // with neither a reusable URL nor a way back to the operator's page.
+          await this.parkHandoffForManual(jobID);
+          return;
+        }
+        // Legacy offers retain their URL and keep the established timeout
+        // detach semantics.
         await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
       }
-        this.closeOwnedTab(tabID, "timeout");
+      this.closeOwnedTab(tabID, "timeout");
       await this.parkHandoffForManual(jobID);
     }, HANDOFF_DRIVE_TIMEOUT_MS);
   }
@@ -2944,10 +2971,20 @@ export class Bridge {
     this.ready = this.deps.backend.load().then(async (s) => {
       this.store = clearNegotiationState(s);
       this.offerURLs.clear();
-      for (const [jobID, url] of Object.entries(s.offerURLs ?? {})) {
-        if (typeof url !== "string" || findByJob(s, jobID) === undefined) continue;
+      const persistedOffers = { ...(s.offerURLs ?? {}) };
+      for (const [jobID, url] of Object.entries(persistedOffers)) {
+        const restored = findByJob(s, jobID);
+        if (typeof url !== "string" || restored === undefined) {
+          delete persistedOffers[jobID];
+          continue;
+        }
+        if (restored.requires_auth === true && restored.engagement_required === true) {
+          delete persistedOffers[jobID];
+          continue;
+        }
         this.offerURLs.set(jobID, url);
       }
+      this.store = { ...this.store, offerURLs: persistedOffers };
       const correlations = this.deps.pdfGrabCorrelations === undefined ? {} : await this.deps.pdfGrabCorrelations.get();
       for (const [grabID, correlation] of Object.entries(correlations)) {
         if (
@@ -3378,11 +3415,163 @@ export class Bridge {
       }
     }
   }
+  private async openFreshHandoff(jobID: string, job: ActiveJob): Promise<BrokerReply<{ opened: true }>> {
+    const claimKey = job.institution_claim_key;
+    if (claimKey === undefined) {
+      return failure("missing_claim", "The handoff is missing institution identity metadata");
+    }
+
+    const existingOwner = this.store.federatedLoginOwners?.[claimKey];
+    if (existingOwner !== undefined && existingOwner.jobID !== jobID) {
+      await this.update((s) =>
+        patchJob(s, jobID, {
+          status: "queued",
+          waiting_for_session: true,
+          waiting_for_session_key: claimKey,
+          waiting_deadline: this.deps.now() + SESSION_WAIT_TIMEOUT_MS,
+          engagement_required: true,
+        }),
+      );
+      // The state save above is an await boundary: the prior owner can retire
+      // while it settles. Act only on the current owner, never the stale
+      // snapshot that caused this job to park.
+      const currentOwner = this.store.federatedLoginOwners?.[claimKey];
+      if (currentOwner !== undefined && currentOwner.jobID !== jobID) {
+        if (currentOwner.tabID < 0) {
+          return failure("handoff_opening", "Another handoff is opening this institution's login");
+        }
+        let ownerLive = false;
+        try {
+          const ownerTab = await this.deps.tabs.get(currentOwner.tabID);
+          ownerLive = ownerTab.id === currentOwner.tabID;
+        } catch {
+          ownerLive = false;
+        }
+        if (!ownerLive) {
+          // Only Chrome disproving the tab retires the claim. A focus operation
+          // can be denied while the login remains live.
+          await this.clearFederatedLoginOwner(claimKey, currentOwner.jobID);
+        } else {
+          try {
+            await this.focusManagedTab(currentOwner.tabID);
+          } catch {
+            // Best effort: the tab remains in papio's managed surface.
+          }
+          const focusedOwner = this.store.federatedLoginOwners?.[claimKey];
+          if (
+            focusedOwner?.jobID === currentOwner.jobID &&
+            focusedOwner.tabID === currentOwner.tabID
+          ) {
+            return { ok: true, opened: true };
+          }
+        }
+      }
+    }
+
+    const reserved = reserveFederatedClaim(this.store.federatedLoginOwners, claimKey, jobID);
+    if (reserved === undefined) {
+      return failure("handoff_in_progress", "Another handoff owns this institution's login");
+    }
+    await this.update((s) => {
+      const withOwner = { ...s, federatedLoginOwners: reserved };
+      return patchJob(withOwner, jobID, {
+        waiting_for_session: false,
+        waiting_for_session_key: undefined,
+        waiting_deadline: undefined,
+      });
+    });
+
+    const minted = await this.requestFreshHandoffLink(jobID);
+    if (!minted.ok) {
+      await this.clearFederatedLoginOwner(claimKey, jobID);
+      return minted;
+    }
+    const current = findByJob(this.store, jobID);
+    const currentOwner = this.store.federatedLoginOwners?.[claimKey];
+    if (
+      current === undefined ||
+      currentOwner?.jobID !== jobID ||
+      currentOwner.phase !== "engaging" ||
+      current.engagement_required !== true
+    ) {
+      await this.clearFederatedLoginOwner(claimKey, jobID);
+      return failure("handoff_unavailable", "The handoff changed before it could be opened");
+    }
+
+    this.offerURLs.set(jobID, minted.url);
+    let materializedTabID: number | undefined;
+    let bindSave: Promise<void> | undefined;
+    const onTabMaterialized = (tabID: number): void => {
+      materializedTabID = tabID;
+      bindSave = this.update((s) => {
+        const next = bindFederatedClaim(s.federatedLoginOwners, claimKey, jobID, tabID);
+        if (next === undefined) return s;
+        const withOwner = { ...s, federatedLoginOwners: next };
+        return patchJob(withOwner, jobID, {
+          tab_id: tabID,
+          status: "accepted",
+          engagement_required: false,
+          fresh_handoff: true,
+          waiting_for_session: false,
+          waiting_for_session_key: undefined,
+          waiting_deadline: undefined,
+        });
+      });
+    };
+
+    let returnedTabID: number | undefined;
+    try {
+      returnedTabID = await this.openManagedTab({
+        url: minted.url,
+        jobId: jobID,
+        purpose: "session-signin",
+        onTabMaterialized,
+        privateLedgerURL: true,
+      });
+      if (bindSave !== undefined) await bindSave;
+    } catch {
+      returnedTabID = undefined;
+    } finally {
+      // A minted link is a one-call capability. It is retained only across
+      // the synchronous tab-creation handoff, never beyond materialization.
+      this.offerURLs.delete(jobID);
+    }
+    const tabID = returnedTabID ?? materializedTabID;
+    const boundOwner = this.store.federatedLoginOwners?.[claimKey];
+    if (tabID === undefined || boundOwner?.jobID !== jobID || boundOwner.tabID !== tabID) {
+      if (tabID !== undefined) await this.closeOwnedTab(tabID, "fresh-materialization-rollback");
+      await this.clearFederatedLoginOwner(claimKey, jobID);
+      return failure("tab_creation_failed", "The handoff tab could not be created");
+    }
+    if (returnedTabID === undefined) {
+      await this.recordManagedTab(jobID, tabID);
+      await this.ledgerManagedTab(tabID, true);
+    }
+    this.beginProviderDrive(jobID);
+    this.registerHandoffDrive(jobID, tabID);
+    try {
+      await this.focusManagedTab(tabID);
+    } catch {
+      // The managed tab remains available in its papio surface.
+    }
+    return { ok: true, opened: true };
+  }
+
 
   private async openHandoffUnlocked(jobID: string): Promise<BrokerReply<{ opened: true }>> {
     await this.ready;
     let job = findByJob(this.store, jobID);
-    if (job === undefined || !this.offerURLs.has(jobID)) {
+    if (job?.requires_auth === true && !this.hasCurrentHello()) {
+      await this.ensureConnected();
+      job = findByJob(this.store, jobID);
+    }
+    if (job !== undefined && job.tab_id >= 0) {
+      await this.focusManagedTab(job.tab_id);
+      return { ok: true, opened: true };
+    }
+    const engagementRequired =
+      job?.requires_auth === true && job.engagement_required === true;
+    if (job === undefined || (!engagementRequired && !this.offerURLs.has(jobID))) {
       // A just-acquired inbox item can race the native job_offer. Counts is a
       // safe read that prompts the daemon to flush its already-queued frames;
       // perform it at most once, then wait for the inbound FIFO before retrying.
@@ -3397,7 +3586,17 @@ export class Bridge {
       await this.inboundChain;
       job = findByJob(this.store, jobID);
     }
-    if (job === undefined || !this.offerURLs.has(jobID)) {
+    if (job === undefined) {
+      return failure("handoff_unavailable", "The requested handoff is not available");
+    }
+    if (job.tab_id >= 0) {
+      await this.focusManagedTab(job.tab_id);
+      return { ok: true, opened: true };
+    }
+    if (job.requires_auth === true && job.engagement_required === true) {
+      return this.openFreshHandoff(jobID, job);
+    }
+    if (!this.offerURLs.has(jobID)) {
       return failure("handoff_unavailable", "The requested handoff is not available");
     }
 
@@ -3604,6 +3803,32 @@ export class Bridge {
     }
     return { kind: "transport", code: "connection_lost", message: "The daemon is unavailable" };
   }
+  private supportsFreshHandoffLinks(): boolean {
+    return (this.store.daemonFeatures ?? []).includes(HANDOFF_LINK_FEATURE);
+  }
+
+  private async requestFreshHandoffLink(jobID: string): Promise<{ ok: true; url: string } | BrokerFailure> {
+    const result = await this.requestNative(
+      "handoff_link_request",
+      { job_id: jobID },
+      "handoff_link_result",
+      HANDOFF_LINK_FEATURE,
+      true,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    const outcome = result.payload["outcome"];
+    if (outcome === "opened" && typeof result.payload["url"] === "string") {
+      return { ok: true, url: result.payload["url"] };
+    }
+    const details: Record<string, { code: string; message: string }> = {
+      job_gone: { code: "job_gone", message: "The handoff is no longer available" },
+      not_open_action: { code: "not_open_action", message: "The handoff has no open action" },
+      not_openurl: { code: "not_openurl", message: "The handoff has no resolver URL" },
+      unavailable: { code: "unavailable", message: "The daemon could not mint a fresh handoff URL" },
+    };
+    const mapped = typeof outcome === "string" ? details[outcome] : undefined;
+    return failure(mapped?.code ?? "daemon_error", mapped?.message ?? "The daemon rejected the handoff link");
+  }
   async requestTriageSnapshot(
     request: { schema_versions: [1] | [2] | [3] | [4] | [4, 3]; limit?: number; cursor?: string },
   ): Promise<BrokerReply<{ snapshot: Record<string, unknown> }>> {
@@ -3636,11 +3861,9 @@ export class Bridge {
 
   async requestTriageCounts(): Promise<BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>> {
     const features = this.store.daemonFeatures ?? [];
-    const payload = features.includes(TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE)
-      ? { schema_versions: [4] }
-      : features.includes(TRIAGE_COUNTS_SCHEMA_2_FEATURE)
-        ? { schema_versions: [2] }
-        : {};
+    const payload = features.includes(TRIAGE_COUNTS_SCHEMA_2_FEATURE)
+      ? { schema_versions: [2] }
+      : {};
     const result = await this.requestNative(
       "triage_counts_request",
       payload,
@@ -4559,10 +4782,25 @@ export class Bridge {
     if (job.requires_auth === true) this.keepaliveManager?.learnResolver(offerURL);
     await this.update((s) => {
       const withJob = upsertJob(s, job);
+      if (this.supportsFreshHandoffLinks() && job.requires_auth === true) {
+        const offerURLs = { ...(s.offerURLs ?? {}) };
+        delete offerURLs[job.job_id];
+        return { ...withJob, offerURLs };
+      }
       return {
         ...withJob,
         offerURLs: { ...(s.offerURLs ?? {}), [job.job_id]: offerURL },
       };
+    });
+  }
+  /** Persist a tabless job without retaining the resolver URL. */
+  private async upsertJobWithoutOffer(job: ActiveJob): Promise<void> {
+    this.offerURLs.delete(job.job_id);
+    await this.update((s) => {
+      const withJob = upsertJob(s, job);
+      const offerURLs = { ...(s.offerURLs ?? {}) };
+      delete offerURLs[job.job_id];
+      return { ...withJob, offerURLs };
     });
   }
 
@@ -4571,7 +4809,6 @@ export class Bridge {
     const tabID = job?.tab_id;
     const providerKey = job === undefined ? undefined : this.providerKeyForJob(job);
     this.releaseHandoffDrive(jobID);
-    this.managedTabURLs.delete(jobID);
     this.deliveryJobs.delete(jobID);
     this.resolverRoutes.delete(jobID);
     this.deliverySessionEvidence.delete(jobID);
@@ -5266,7 +5503,7 @@ export class Bridge {
    * prevents that safety check from parking a cold handoff forever. */
   private scheduleQueuedHandoffRelease(jobID: string): void {
     const job = findByJob(this.store, jobID);
-    if (job === undefined || job.status !== "queued") {
+    if (job === undefined || job.status !== "queued" || job.engagement_required === true) {
       this.queuedHandoffTimers.delete(jobID);
       this.pendingForcedReleases.delete(jobID);
       return;
@@ -5288,7 +5525,7 @@ export class Bridge {
   private async releaseExpiredQueuedHandoffs(): Promise<void> {
     const deadline = this.deps.now() - QUEUED_HANDOFF_RELEASE_MS;
     const dueJobIDs = this.store.activeJobs
-      .filter((job) => job.status === "queued" && job.offered_at <= deadline)
+      .filter((job) => job.status === "queued" && job.engagement_required !== true && job.offered_at <= deadline)
       .map((job) => job.job_id);
     for (const jobID of dueJobIDs) await this.releaseQueuedHandoffs(jobID);
   }
@@ -5401,7 +5638,10 @@ export class Bridge {
     fallbackJobID: string | undefined,
     forceProvider: boolean,
   ): Promise<void> {
-    if (fallbackJobID !== undefined) this.pendingForcedReleases.add(fallbackJobID);
+    if (fallbackJobID !== undefined) {
+      const fallback = findByJob(this.store, fallbackJobID);
+      if (fallback?.engagement_required !== true) this.pendingForcedReleases.add(fallbackJobID);
+    }
     if (forceProvider && fallbackJobID !== undefined) {
       const forced = findByJob(this.store, fallbackJobID);
       if (forced !== undefined) await this.clearProviderDrainPark(this.providerKeyForJob(forced));
@@ -5415,6 +5655,7 @@ export class Bridge {
       (job) =>
         matchesOrigin(job) &&
         job.status === "queued" &&
+        job.engagement_required !== true &&
         this.hasHandoffReleaseEvidence(jobOrigin(job), job.requires_auth),
     );
     if (!anyQueuedEligible && this.pendingForcedReleases.size === 0) {
@@ -5435,6 +5676,7 @@ export class Bridge {
           (job) =>
             matchesOrigin(job) &&
             job.status === "queued" &&
+            job.engagement_required !== true &&
             this.hasHandoffReleaseEvidence(jobOrigin(job), job.requires_auth) &&
             !this.challengeCooldownActiveForHosts(job.provider_hosts) &&
             !this.hasActiveProviderDrainLease(job),
@@ -5443,7 +5685,11 @@ export class Bridge {
         if (selected === undefined) {
           for (const jobID of this.pendingForcedReleases) {
             const candidate = this.store.activeJobs.find(
-              (job) => matchesOrigin(job) && job.job_id === jobID && job.status === "queued",
+              (job) =>
+                matchesOrigin(job) &&
+                job.job_id === jobID &&
+                job.status === "queued" &&
+                job.engagement_required !== true,
             );
             if (candidate === undefined) {
               this.pendingForcedReleases.delete(jobID);
@@ -5706,7 +5952,6 @@ export class Bridge {
     } finally {
       if (tabID !== undefined) void this.closeOwnedTab(tabID, "page-capture");
       this.pageCaptureDriving = false;
-      this.managedTabURLs.delete(managedKey);
     }
   }
 
@@ -5890,6 +6135,25 @@ export class Bridge {
         await this.syncConnectionBadge(connectionStatus);
         this.helloAckGeneration = this.portGeneration;
         this.keepaliveManager?.notifyConfiguredOriginsChanged();
+        if (features.includes(HANDOFF_LINK_FEATURE)) {
+          const authJobIDs = this.store.activeJobs
+            .filter((job) => job.requires_auth === true)
+            .map((job) => job.job_id);
+          for (const jobID of authJobIDs) this.offerURLs.delete(jobID);
+          await this.update((s) => {
+            const offerURLs = { ...(s.offerURLs ?? {}) };
+            for (const jobID of authJobIDs) delete offerURLs[jobID];
+            return {
+              ...s,
+              offerURLs,
+              activeJobs: s.activeJobs.map((job) =>
+                job.requires_auth === true && job.tab_id < 0
+                  ? { ...job, engagement_required: true, fresh_handoff: true }
+                  : job,
+              ),
+            };
+          });
+        }
         this.settleHelloWaiters(true);
         return;
       }
@@ -5944,18 +6208,37 @@ export class Bridge {
     const expected = parseExpected(p["expected"]);
     const requiresAuth = typeof p["requires_auth"] === "boolean" ? p["requires_auth"] : undefined;
     const loginEntityID = p["login_entity_id"];
+    const previousLoginEntityID = this.loginEntityIDs.get(jobID);
+    const loginEntityRestored =
+      typeof loginEntityID === "string" &&
+      loginEntityID.length > 0 &&
+      previousLoginEntityID === undefined;
     if (typeof loginEntityID === "string" && loginEntityID.length > 0) {
-      this.loginEntityIDs.set(jobID, loginEntityID);
+      if (previousLoginEntityID === undefined || previousLoginEntityID === loginEntityID) {
+        this.loginEntityIDs.set(jobID, loginEntityID);
+      } else {
+        // Job identity is immutable. Do not let inconsistent re-offer metadata
+        // split one live login across two institution claims.
+        console.error("papio: login entity changed for a live job; retaining the original");
+      }
     }
     const proquestAccountID = p["proquest_account_id"];
+    const previousProquestAccountID = this.proquestAccountIDs.get(jobID);
     if (typeof proquestAccountID === "string" && proquestAccountID.length > 0) {
-      this.proquestAccountIDs.set(jobID, proquestAccountID);
+      if (previousProquestAccountID === undefined || previousProquestAccountID === proquestAccountID) {
+        this.proquestAccountIDs.set(jobID, proquestAccountID);
+      } else {
+        // Resolver account identity is immutable for the same live job, just
+        // like the institution entity ID above.
+        console.error("papio: ProQuest account id changed for a live job; retaining the original");
+      }
     }
+
 
     // Restart/re-offer dedup normally re-accepts a live tab. A tab-less job
     // without its durable offer URL cannot represent an in-flight download:
     // discard that stale record so this offer recreates the real browser work.
-    const existing = findByJob(this.store, jobID);
+    let existing = findByJob(this.store, jobID);
     const pendingDelivery = this.store.pendingDelivery;
     if (pendingDelivery?.job_id === jobID && pendingDelivery.status !== "failed") {
       const now = this.deps.now();
@@ -5979,6 +6262,66 @@ export class Bridge {
       );
       this.send("job_accept", {}, jobID);
       return;
+    }
+    const freshLinks = this.supportsFreshHandoffLinks();
+    const offerOrigin = this.resolverOriginHint(openurl);
+    const hasReleaseEvidence = this.hasHandoffReleaseEvidence(offerOrigin, requiresAuth);
+    const claimKey =
+      typeof loginEntityID === "string" && loginEntityID.length > 0
+        ? await federatedLoginClaimKey(loginEntityID)
+        : undefined;
+    if (freshLinks && requiresAuth === true && existing !== undefined && existing.tab_id >= 0) {
+      try {
+        await this.deps.tabs.get(existing.tab_id);
+      } catch {
+        await this.removeJobWithOffer(jobID);
+        existing = undefined;
+      }
+    }
+    if (
+      freshLinks &&
+      requiresAuth === true &&
+      !hasReleaseEvidence &&
+      (existing === undefined || existing.tab_id < 0)
+    ) {
+      const now = this.deps.now();
+      const expiresMs = Date.parse(expiresAt);
+      const coldJob: ActiveJob = {
+        ...(existing ?? {
+          job_id: jobID,
+          tab_id: -1,
+          offered_at: now,
+          expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
+          status: "queued",
+          provider_hosts: providerHosts,
+        }),
+        tab_id: -1,
+        status: "queued",
+        provider_hosts: providerHosts,
+        offered_at: now,
+        expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
+        engagement_required: true,
+        fresh_handoff: true,
+        ...(claimKey !== undefined ? { institution_claim_key: claimKey } : {}),
+        ...(expected !== undefined ? { expected } : {}),
+        requires_auth: true,
+      };
+      if (expected === undefined) delete coldJob.expected;
+      if (claimKey === undefined) delete coldJob.institution_claim_key;
+      this.queuedHandoffTimers.delete(jobID);
+      this.pendingForcedReleases.delete(jobID);
+      await this.upsertJobWithoutOffer(coldJob);
+      this.send("job_accept", {}, jobID);
+      return;
+    }
+    if (freshLinks && requiresAuth === true && existing !== undefined) {
+      this.offerURLs.delete(jobID);
+      this.keepaliveManager?.learnResolver(openurl);
+      await this.update((s) => {
+        const offerURLs = { ...(s.offerURLs ?? {}) };
+        delete offerURLs[jobID];
+        return { ...s, offerURLs };
+      });
     }
     if (existing !== undefined && existing.requires_auth !== requiresAuth) {
       // A restored job can predate this field; its first re-offer must learn the
@@ -6024,18 +6367,44 @@ export class Bridge {
         }
       } else {
         let live = false;
+        let liveTab: TabInfo | undefined;
         try {
           const tab = await this.deps.tabs.get(existing.tab_id);
           live = tab.id === existing.tab_id;
+          if (live) liveTab = tab;
         } catch {
           live = false;
         }
-        if (live && (priorOfferURL === undefined || priorOfferURL === openurl)) {
+        if (
+          live &&
+          (freshLinks && requiresAuth === true ||
+            priorOfferURL === undefined ||
+            priorOfferURL === openurl)
+        ) {
+          if (
+            claimKey !== undefined &&
+            liveTab?.url !== undefined &&
+            isAuthenticationURL(liveTab.url)
+          ) {
+            await this.update((s) => {
+              const reserved = reserveFederatedClaim(s.federatedLoginOwners, claimKey, jobID);
+              if (reserved === undefined) return s;
+              const bound = bindFederatedClaim(reserved, claimKey, jobID, existing.tab_id);
+              if (bound === undefined) return s;
+              const promoted = promoteFederatedClaim(bound, claimKey, jobID);
+              if (promoted === undefined) return s;
+              return patchJob(
+                { ...s, federatedLoginOwners: promoted },
+                jobID,
+                { institution_claim_key: claimKey },
+              );
+            });
+          }
           if (providerParked || challengeCooldown) {
             await this.update((s) => patchJob(s, jobID, { handoffAckPending: true }));
             return;
           }
-          if (!this.handoffDrives.has(jobID)) {
+          if (existing.parked_with_tab !== true && !this.handoffDrives.has(jobID)) {
             if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
               this.enqueueHandoffDrive({ jobID, purpose: "reoffer", focusExisting: false });
             } else {
@@ -6046,6 +6415,18 @@ export class Bridge {
             await this.acknowledgePendingProviderHandoffs(providerKey);
           } else {
             this.send("job_accept", {}, jobID);
+          }
+          if (
+            freshLinks &&
+            requiresAuth === true &&
+            loginEntityRestored &&
+            liveTab !== undefined
+          ) {
+            // A restarted worker may have missed this tab's completed landing
+            // and lost the worker-local entity ID. The first re-offer restores
+            // that metadata; assess the authoritative current Chrome snapshot
+            // once instead of waiting for a navigation event that already ran.
+            await this.onTabUpdated(existing.tab_id, { status: "complete" }, liveTab);
           }
           return;
         }
@@ -6178,13 +6559,13 @@ export class Bridge {
     const governorQueued =
       !providerParked &&
       !challengeCooldown &&
-      this.hasHandoffReleaseEvidence(this.resolverOriginHint(openurl), requiresAuth) &&
+      hasReleaseEvidence &&
       (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT || this.handoffDriveQueue.length > 0);
     const queueHandoff =
       providerParked ||
       challengeCooldown ||
       governorQueued ||
-      (!this.hasHandoffReleaseEvidence(this.resolverOriginHint(openurl), requiresAuth) &&
+      (!hasReleaseEvidence &&
         (requiresAuth === true ||
           this.handoffOpening ||
           this.store.activeJobs.some((job) => job.tab_id >= 0 && job.status !== "queued")));
@@ -6548,7 +6929,7 @@ export class Bridge {
     // the adapter registry is the authoritative host source for classification,
     // so a tracked handoff landing on any registered family is on-provider.
     const onProvider = hostMatches(host, job.provider_hosts) || adapter !== undefined;
-    if (onProvider) await this.clearFederatedLoginOwnerForTab(tabID);
+    if (onProvider) await this.clearFederatedLoginOwnerForTab(tabID, "auth");
     // Back on the provider means this tab left the IdP (successfully or not);
     // either way it can no longer be the live sibling any waiting job is
     // deferring to for this origin.
@@ -6916,35 +7297,37 @@ export class Bridge {
 
   /**
    * Route a resolver's first electronic service in the same tracked tab.
-   * The offer origin proves this is the institutional resolver for this job;
-   * the injected function separately accepts only same-origin Alma service
-   * links. Missing host permission or no electronic service stays assisted.
+   * A retained legacy offer or the daemon-advertised resolver-origin set proves
+   * the landing belongs to configured institutional access; the injected
+   * function separately accepts only same-origin Alma service links. Missing
+   * host permission or no electronic service stays assisted.
    */
   private async maybeRouteResolver(job: ActiveJob, currentURL: string): Promise<boolean> {
     const offered = this.offerURLs.get(job.job_id);
-    if (offered === undefined) return false;
-    let offerURL: URL;
     let landingURL: URL;
     try {
-      offerURL = new URL(offered);
       landingURL = new URL(currentURL);
     } catch {
       return false;
     }
-    // The offer origin proves this is the institutional resolver for this
-    // job — unless LibKey fronts the route, in which case the offer origin
-    // is libkey.io and the proof is the landing itself: the config-derived
-    // institution origin plus a resolver-shaped path.
-    const offerIsResolver =
-      offerURL.origin === landingURL.origin && /(?:openurl|uresolver)/i.test(offerURL.pathname);
-    const institution = this.jobInstitutionOrigin(job);
-    const landedOnInstitutionResolver =
-      institution !== undefined &&
-      landingURL.origin === institution &&
-      /(?:openurl|uresolver)/i.test(landingURL.pathname);
-    if (!offerIsResolver && !landedOnInstitutionResolver) {
-      return false;
+    let offerIsResolver = false;
+    if (offered !== undefined) {
+      try {
+        const offerURL = new URL(offered);
+        offerIsResolver =
+          offerURL.origin === landingURL.origin &&
+          /(?:openurl|uresolver)/i.test(offerURL.pathname);
+      } catch {
+        // A malformed legacy offer supplies no authority; the configured
+        // resolver-origin path below can still prove a fresh landing.
+      }
     }
+    const institution = this.jobInstitutionOrigin(job);
+    const configuredOrigin = this.knownResolverOrigins().includes(landingURL.origin);
+    const landedOnInstitutionResolver =
+      (landingURL.origin === institution || configuredOrigin) &&
+      /(?:openurl|uresolver)/i.test(landingURL.pathname);
+    if (!offerIsResolver && !landedOnInstitutionResolver) return false;
 
     let granted = false;
     try {
@@ -7215,36 +7598,30 @@ export class Bridge {
   }
 
 
-  /** Registry entries survive only as long as the tab they name; this is the
-   * one place that trusts a present entry as proof of a live sibling tab (no
-   * extra tabs.get liveness check), so every path that can end that claim's
-   * federated-login drive — tab close, navigate off the claimed origin,
-   * job removal, a dead restart-time owner — clears its entry through here
-   * or one of the two helpers below. Deliberately narrow: nothing here ever
-   * fires merely because session evidence landed (recordFreshSessionEvidence
-   * does not call this) — an owner still genuinely on the IdP survives even
-   * its own institution's evidence, so a resumed waiter can only park behind
-   * it again, never open a second tab at the same login page. Successfully
-   * clearing an entry always resumes that claim's own waiters
-   * (resumeWaitingForSessionByClaim): no path may retire a claim and leave
-   * its waiters ownerless. */
+  /** Retire one claim only while the named job still owns it. Every successful
+   * retirement resumes that claim's waiters. */
   private async clearFederatedLoginOwner(claimKey: string, jobID: string): Promise<void> {
-    if (this.store.federatedLoginOwners?.[claimKey]?.jobID !== jobID) return;
-    await this.update((s) => {
-      const next = { ...(s.federatedLoginOwners ?? {}) };
-      delete next[claimKey];
-      return { ...s, federatedLoginOwners: next };
-    });
+    const owners = this.store.federatedLoginOwners;
+    if (owners?.[claimKey]?.jobID !== jobID) return;
+    const next = releaseFederatedClaim(owners, claimKey, jobID);
+    if (next === owners) return;
+    await this.update((s) => ({ ...s, federatedLoginOwners: next ?? {} }));
     await this.resumeWaitingForSessionByClaim(claimKey);
   }
 
-  /** A closed or navigated-away tab can no longer be the live sibling any
-   * waiting job is deferring to. Called for every removed/updated tab; a
-   * no-op unless that exact tab is a current registry owner. */
-  private async clearFederatedLoginOwnerForTab(tabID: number): Promise<void> {
+  /** Retire the owner bound to a tab. Provider-return handling passes "auth"
+   * so an engaging claim survives its initial OpenURL landing; tab removal
+   * omits the filter and retires either phase. */
+  private async clearFederatedLoginOwnerForTab(
+    tabID: number,
+    phase?: "auth",
+  ): Promise<void> {
     const owners = this.store.federatedLoginOwners;
     if (owners === undefined) return;
-    const claimKey = Object.keys(owners).find((key) => owners[key]?.tabID === tabID);
+    const claimKey = Object.keys(owners).find((key) => {
+      const owner = owners[key];
+      return owner?.tabID === tabID && (phase === undefined || owner.phase === phase);
+    });
     if (claimKey === undefined) return;
     const jobID = owners[claimKey]?.jobID;
     if (jobID === undefined) return;
@@ -7258,9 +7635,10 @@ export class Bridge {
   private async clearFederatedLoginOwnerForJob(jobID: string): Promise<void> {
     const owners = this.store.federatedLoginOwners;
     if (owners === undefined) return;
-    const claimKey = Object.keys(owners).find((key) => owners[key]?.jobID === jobID);
-    if (claimKey === undefined) return;
-    await this.clearFederatedLoginOwner(claimKey, jobID);
+    const claimKeys = Object.keys(owners).filter((key) => owners[key]?.jobID === jobID);
+    for (const claimKey of claimKeys) {
+      await this.clearFederatedLoginOwner(claimKey, jobID);
+    }
   }
 
   /** Startup validation for federatedLoginOwners, mirroring parked_with_tab's
@@ -7289,20 +7667,39 @@ export class Bridge {
     for (const claimKey of legacyClaims) await this.resumeWaitingForSessionByClaim(claimKey);
     await this.update((s) => ({
       ...s,
-      activeJobs: s.activeJobs.map((job) =>
-        job.tab_id < 0 && job.waiting_for_session_key !== undefined && isLegacyFederatedLoginClaimKey(job.waiting_for_session_key)
-          ? {
-              ...job,
-              waiting_for_session: false,
-              waiting_for_session_key: undefined,
-              waiting_deadline: undefined,
-            }
-          : job,
-      ),
+      activeJobs: s.activeJobs.map((job) => {
+        let next = job;
+        if (
+          job.institution_claim_key !== undefined &&
+          isLegacyFederatedLoginClaimKey(job.institution_claim_key)
+        ) {
+          next = { ...next };
+          delete next.institution_claim_key;
+        }
+        if (
+          job.tab_id < 0 &&
+          job.waiting_for_session_key !== undefined &&
+          isLegacyFederatedLoginClaimKey(job.waiting_for_session_key)
+        ) {
+          if (next === job) next = { ...next };
+          next.waiting_for_session = false;
+          delete next.waiting_for_session_key;
+          delete next.waiting_deadline;
+          next.status = "queued";
+          next.engagement_required = true;
+        }
+        return next;
+      }),
     }));
     for (const [claimKey, owner] of Object.entries(this.store.federatedLoginOwners ?? {})) {
       const ownerJob = findByJob(this.store, owner.jobID);
-      if (ownerJob === undefined || ownerJob.tab_id !== owner.tabID) {
+      if (
+        isLegacyFederatedLoginClaimKey(claimKey) ||
+        (owner.phase !== "engaging" && owner.phase !== "auth") ||
+        owner.tabID < 0 ||
+        ownerJob === undefined ||
+        ownerJob.tab_id !== owner.tabID
+      ) {
         await this.clearFederatedLoginOwner(claimKey, owner.jobID);
       }
     }
@@ -7334,16 +7731,27 @@ export class Bridge {
    * instant either happens), so resuming here could only re-park the exact
    * same job a moment later — zero navigations and zero drive slots wasted
    * on churn from a keepalive probe repeating every few seconds while a
-   * sign-in is genuinely still in progress. That job's real resume is the
-   * retirement chokepoint (the moment the owner truly leaves), never a
-   * repeated evidence/landing event. */
+   * repeated evidence does not navigate a tabless waiter; it becomes queued
+   * and engagement-required until the operator clicks it again. */
   private async resumeWaitingForSessionJobs(matches: (job: ActiveJob) => boolean): Promise<void> {
     for (const job of this.store.activeJobs) {
-      if (job.waiting_for_session !== true || job.tab_id < 0 || !matches(job)) continue;
+      if (job.waiting_for_session !== true || !matches(job)) continue;
       if (
         job.waiting_for_session_key !== undefined &&
         this.store.federatedLoginOwners?.[job.waiting_for_session_key] !== undefined
       ) {
+        continue;
+      }
+      if (job.tab_id < 0) {
+        await this.update((s) =>
+          patchJob(s, job.job_id, {
+            waiting_for_session: false,
+            waiting_for_session_key: undefined,
+            waiting_deadline: undefined,
+            status: "queued",
+            engagement_required: true,
+          }),
+        );
         continue;
       }
       this.enqueueHandoffDrive({
@@ -7410,17 +7818,13 @@ export class Bridge {
    * sign-in (latched, cleared on job removal).
    *
    * ONE login tab per institution: before navigating, check
-   * federatedLoginOwners for the claim key this template+entityID resolves
-   * to — the destination origin ALONE is not the institution: a shared
-   * WAYF/Discovery-Service host serving many institutions exposes exactly
-   * one origin for all of them, distinguished only by entityID in the query
-   * (the real ProQuest adapter is exactly this shape), so the claim key is
-   * origin+entityID, never origin alone. An already-live sibling tab holding
-   * that claim means a second tab at the same login page would teach the
-   * human nothing, so this job parks instead (waiting_for_session) and
-   * resumes when that claim retires or fresh institution evidence lands.
-   * Otherwise this job claims the key and becomes that live tab for any
-   * siblings that arrive next. */
+   * federatedLoginOwners for the entity-ID-derived claim key. Entity IDs are
+   * global institution identifiers; the resolver or discovery-service origin
+   * is only a route and must not split one institution into multiple claims.
+   * An already-live sibling tab holding that claim means a second tab at the
+   * same login page would teach the human nothing, so this job parks instead
+   * and resumes when that claim retires or fresh institution evidence lands.
+   * Otherwise this job claims the key and becomes the live tab for siblings. */
   private async maybeRouteFederatedLogin(jobID: string, job: ActiveJob, spec: AdapterSpec): Promise<void> {
     const template = spec.federatedLogin;
     const entityID = this.loginEntityIDs.get(jobID);
@@ -7429,13 +7833,12 @@ export class Bridge {
     if (this.deps.tabs.update === undefined) return;
     const url = template.replace("{entityID}", encodeURIComponent(entityID));
     if (!url.startsWith("https://")) return;
-    let idpOrigin: string;
     try {
-      idpOrigin = new URL(url).origin;
+      new URL(url);
     } catch {
       return;
     }
-    const claimKey = await federatedLoginClaimKey(idpOrigin, entityID);
+    const claimKey = await federatedLoginClaimKey(entityID);
     const owner = this.store.federatedLoginOwners?.[claimKey];
     if (owner !== undefined && owner.jobID !== jobID) {
       await this.parkHandoffWaitingForSession(jobID, claimKey);
@@ -7444,9 +7847,30 @@ export class Bridge {
     this.federatedLoginRouted.add(jobID);
     this.federatedLoginOperatorNavigated.delete(jobID);
     this.federatedLoginRouteSettled.delete(jobID);
+    const reserved =
+      owner?.jobID === jobID
+        ? this.store.federatedLoginOwners
+        : reserveFederatedClaim(this.store.federatedLoginOwners, claimKey, jobID);
+    if (reserved === undefined) {
+      await this.parkHandoffWaitingForSession(jobID, claimKey);
+      return;
+    }
+    const bound = bindFederatedClaim(reserved, claimKey, jobID, job.tab_id);
+    if (bound === undefined) {
+      await this.parkHandoffWaitingForSession(jobID, claimKey);
+      return;
+    }
+    const promoted = promoteFederatedClaim(bound, claimKey, jobID);
+    if (promoted === undefined) {
+      await this.parkHandoffWaitingForSession(jobID, claimKey);
+      return;
+    }
     await this.update((s) => ({
       ...s,
-      federatedLoginOwners: { ...(s.federatedLoginOwners ?? {}), [claimKey]: { jobID, tabID: job.tab_id } },
+      federatedLoginOwners: promoted,
+      activeJobs: s.activeJobs.map((candidate) =>
+        candidate.job_id === jobID ? { ...candidate, institution_claim_key: claimKey } : candidate,
+      ),
     }));
     this.federatedLoginRouteEvents.set(jobID, { url, loadingSeen: false });
     try {
@@ -7635,7 +8059,7 @@ export class Bridge {
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
         if (
-          !this.send("provider_outcome", { outcome: "ui_changed", adapter_version: adapter.version }, job.job_id)
+          !this.send("provider_outcome", { outcome: "ui_changed", adapter_id: adapter.id, adapter_version: adapter.version }, job.job_id)
         ) {
           this.handoffOutcomeSent.delete(outcomeKey);
         } else {
@@ -7661,6 +8085,16 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     if (!job) return;
     const av = spec.version;
+    const ownerEntry = Object.entries(this.store.federatedLoginOwners ?? {}).find(
+      ([, owner]) => owner.jobID === jobID && owner.phase === "engaging",
+    );
+    if (
+      ownerEntry !== undefined &&
+      verdict.kind !== "unknown" &&
+      verdict.kind !== "login"
+    ) {
+      await this.clearFederatedLoginOwner(ownerEntry[0], jobID);
+    }
 
     if (verdict.kind !== "unknown" && (job.unknown_count ?? 0) !== 0) {
       // Any decisive verdict breaks the unknown streak.
@@ -7681,7 +8115,7 @@ export class Bridge {
               // The direct-endpoint fetch bypasses the publisher terms UI, so
               // gate it on recorded consent to auto-accept terms. Without
               // consent, prompt once and stay assisted — no fetch, no latch.
-              this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_version: av }, jobID);
+              this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_id: spec.id, adapter_version: av }, jobID);
               if (consent === undefined) {
                 await this.update((s) => patchJob(s, jobID, { needs_terms_consent: true }));
               }
@@ -7816,7 +8250,7 @@ export class Bridge {
             return;
           }
         }
-        this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_version: av }, jobID);
+        this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_id: spec.id, adapter_version: av }, jobID);
         // First terms gate with no recorded choice: flag for the popup's
         // one-time informed-consent prompt.
         if (consent === undefined) {
@@ -7825,13 +8259,13 @@ export class Bridge {
         return;
       }
       case "no_entitlement":
-        if (this.send("provider_outcome", { outcome: "no_entitlement", adapter_version: av }, jobID)) {
+        if (this.send("provider_outcome", { outcome: "no_entitlement", adapter_id: spec.id, adapter_version: av }, jobID)) {
           await this.settleHandoffAfterOutcome(jobID);
         }
         return;
       case "wrong_work":
       case "wrong_work_check":
-        if (this.send("provider_outcome", { outcome: "wrong_work", adapter_version: av }, jobID)) {
+        if (this.send("provider_outcome", { outcome: "wrong_work", adapter_id: spec.id, adapter_version: av }, jobID)) {
           await this.settleHandoffAfterOutcome(jobID);
         }
         return;
@@ -8931,6 +9365,7 @@ function realDeps(): BridgeDeps {
             entries[key] = {
               openedAt: item.openedAt as number,
               url: item.url as string,
+              ...(item.privateURL === true ? { privateURL: true } : {}),
               ...(typeof item.windowId === "number" ? { windowId: item.windowId } : {}),
               ...(typeof item.groupId === "number" ? { groupId: item.groupId } : {}),
             };

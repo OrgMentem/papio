@@ -1047,6 +1047,69 @@ func TestDismissHumanActionCancelsAwaitingHandoff(t *testing.T) {
 	}
 }
 
+func TestWithOpenHandoffJobHoldsAuthorizationThroughCallback(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_handoff_authorization_lock", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{StateQueued, StateResolving},
+		{StateResolving, StateAwaitingHuman},
+	} {
+		if err := js.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	actionID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "institutional handoff", Access(false, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	authorized := make(chan error, 1)
+	go func() {
+		authorized <- js.WithOpenHandoffJob(ctx, id, func(open OpenHandoffJob) error {
+			if open.Row.ID != id || open.Action.ID != actionID {
+				return fmt.Errorf("authorized row = %+v", open)
+			}
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	waitCount := js.S.DB().Stats().WaitCount
+	dismissed := make(chan error, 1)
+	go func() {
+		_, dismissErr := js.DismissHumanAction(ctx, actionID, 1)
+		dismissed <- dismissErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for js.S.DB().Stats().WaitCount == waitCount && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if js.S.DB().Stats().WaitCount == waitCount {
+		t.Fatal("concurrent dismissal did not wait for the authorization callback")
+	}
+	select {
+	case err := <-dismissed:
+		t.Fatalf("dismissal completed inside authorization callback: %v", err)
+	default:
+	}
+
+	close(release)
+	if err := <-authorized; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-dismissed; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestDismissDownloadsAccessRequiredDoesNotCancelAwaitingJob is the negative
 // case TestDismissHumanActionCancelsAwaitingHandoff pins for the ordinary
 // awaiting_human kinds: the pending download is fine, only the folder grant

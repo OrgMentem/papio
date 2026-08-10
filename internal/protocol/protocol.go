@@ -61,6 +61,7 @@ var (
 	sha256RE         = regexp.MustCompile(`^[a-f0-9]{64}$`)
 	provenanceRE     = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 	hostRE           = regexp.MustCompile(`^[a-z0-9.-]{3,253}$`)
+	rfc3986URITextRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*:[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*$`)
 	// originHostRE is the resolver-origin host grammar used ONLY by
 	// validateResolverOriginHint: lowercase RFC 1035 labels (alnum first/last
 	// character, hyphens interior only, 1-63 chars per label) joined by
@@ -135,6 +136,19 @@ func browserRejectNullFields(fields map[string]json.RawMessage, keys ...string) 
 	for _, key := range keys {
 		if browserFieldIsNull(fields, key) {
 			return fmt.Errorf("field %q cannot be null", key)
+		}
+	}
+	return nil
+}
+
+func browserRejectNoncanonicalFields(fields map[string]json.RawMessage, keys ...string) error {
+	for _, key := range keys {
+		if _, present, err := lookupJSONKey(fields, key); err != nil {
+			return err
+		} else if present {
+			if _, canonical := fields[key]; !canonical {
+				return fmt.Errorf("field %q must use canonical casing", key)
+			}
 		}
 	}
 	return nil
@@ -1095,6 +1109,7 @@ type DeliveryContextPayload struct {
 // ProviderOutcomePayload is the adapter's terminal observation for a job.
 type ProviderOutcomePayload struct {
 	Outcome        string `json:"outcome"`
+	AdapterID      string `json:"adapter_id,omitempty"`
 	AdapterVersion string `json:"adapter_version,omitempty"`
 	Detail         string `json:"detail,omitempty"`
 }
@@ -1872,10 +1887,15 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgProviderOutcome:
 		p := &ProviderOutcomePayload{}
 		if err = browserRequireFields(payloadFields, "outcome"); err == nil {
-			err = browserRejectNullFields(payloadFields, "adapter_version", "detail")
+			err = browserRejectNullFields(payloadFields, "adapter_id", "adapter_version", "detail")
 		}
 		if err == nil {
 			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			if _, present := payloadFields["adapter_id"]; present && p.AdapterID == "" {
+				err = fmt.Errorf("provider_outcome.adapter_id must not be empty when present")
+			}
 		}
 		if err == nil {
 			err = p.validate()
@@ -1996,10 +2016,18 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgHandoffLinkRequest:
 		p := &HandoffLinkRequestPayload{}
 		if err = browserRequireFields(payloadFields, "job_id"); err == nil {
+			err = browserRejectNoncanonicalFields(payloadFields, "job_id", "request_id")
+		}
+		if err == nil {
 			err = browserRejectNullFields(payloadFields, "request_id")
 		}
 		if err == nil {
 			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			if _, present := payloadFields["request_id"]; present && p.RequestID == "" {
+				err = fmt.Errorf("handoff_link_request.request_id must not be empty when present")
+			}
 		}
 		if err == nil {
 			err = p.validate()
@@ -2008,10 +2036,18 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgHandoffLinkResult:
 		p := &HandoffLinkResultPayload{}
 		if err = browserRequireFields(payloadFields, "outcome"); err == nil {
+			err = browserRejectNoncanonicalFields(payloadFields, "outcome", "request_id", "url", "detail")
+		}
+		if err == nil {
 			err = browserRejectNullFields(payloadFields, "request_id", "url", "detail")
 		}
 		if err == nil {
 			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			if _, present := payloadFields["request_id"]; present && p.RequestID == "" {
+				err = fmt.Errorf("handoff_link_result.request_id must not be empty when present")
+			}
 		}
 		if err == nil {
 			err = p.validate()
@@ -2541,6 +2577,9 @@ func (p *ProviderOutcomePayload) validate() error {
 		"no_entitlement", "document_delivery_available", "wrong_work", "ui_changed",
 		"rate_limited", "terms_acceptance_required", "human_auth_required", "cancelled"); err != nil {
 		return err
+	}
+	if p.AdapterID != "" && !adapterIDRE.MatchString(p.AdapterID) {
+		return fmt.Errorf("provider_outcome.adapter_id must use the id charset (max 64)")
 	}
 	if browserTextLen(p.AdapterVersion) > 50 {
 		return fmt.Errorf("adapter_version exceeds 50 chars")
@@ -3342,6 +3381,9 @@ func (p *ReviewPreviewRequestPayload) validate() error {
 func validateTriageURL(what, value, scheme string) error {
 	if err := validateTriageText(what, value, 4000); err != nil {
 		return err
+	}
+	if !rfc3986URITextRE.MatchString(value) {
+		return fmt.Errorf("%s must be an RFC 3986 URI", what)
 	}
 	u, err := url.ParseRequestURI(value)
 	if err != nil || u.Scheme != scheme || u.Host == "" {

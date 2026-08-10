@@ -1096,6 +1096,322 @@ test("a cold requires-auth handoff is signalled while queued and opens after its
   expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(true);
 });
 
+test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement", async () => {
+  const jobID = "job_fresh_link_cold";
+  const entityID = "https://idp.example.edu/entity";
+  const claimKey = await federatedLoginClaimKey(entityID);
+  const freshURL = `https://${PROVIDER_HOST}/openurl?fresh=1`;
+  const h = makeHarness();
+  let ledger: Record<
+    string,
+    { openedAt: number; url: string; privateURL?: boolean; windowId?: number; groupId?: number }
+  > = {};
+  h.deps.tabLedger = {
+    load: async () => ({ ...ledger }),
+    save: async (entries) => {
+      ledger = { ...entries };
+    },
+  };
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  offer.payload["login_entity_id"] = entityID;
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toEqual([]);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    job_id: jobID,
+    tab_id: -1,
+    status: "queued",
+    requires_auth: true,
+    engagement_required: true,
+    institution_claim_key: claimKey,
+  });
+  expect(h.backend.store.offerURLs?.[jobID]).toBeUndefined();
+  expect(h.timers.some((timer) => timer.ms === 45_000)).toBe(false);
+  h.clock.now += 60_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  expect(h.tabs.created).toEqual([]);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    job_id: jobID,
+    tab_id: -1,
+    status: "queued",
+    engagement_required: true,
+  });
+  const createTab = h.tabs.create.bind(h.tabs);
+  let reservationObservedBeforeCreate = false;
+  h.tabs.create = async (properties) => {
+    reservationObservedBeforeCreate =
+      h.backend.store.federatedLoginOwners?.[claimKey]?.jobID === jobID &&
+      h.backend.store.federatedLoginOwners?.[claimKey]?.tabID === -1;
+    return createTab(properties);
+  };
+
+  const opening = h.bridge.openHandoff(jobID);
+  const request = await h.port.waitForFrame("handoff_link_request");
+  expect(request.payload["job_id"]).toBe(jobID);
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "opened",
+      url: freshURL,
+    }),
+  );
+
+  await expect(opening).resolves.toEqual({ ok: true, opened: true });
+  expect(reservationObservedBeforeCreate).toBe(true);
+  expect(h.tabs.created).toEqual([{ url: freshURL, active: true }]);
+  expect(ledger["100"]).toMatchObject({
+    url: "papio:private-handoff",
+    privateURL: true,
+  });
+  expect(JSON.stringify(ledger)).not.toContain(freshURL);
+  expect(h.backend.store.offerURLs?.[jobID]).toBeUndefined();
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    tab_id: 100,
+    status: "accepted",
+    engagement_required: false,
+  });
+  expect(h.backend.store.federatedLoginOwners).toEqual({
+    [claimKey]: {
+      jobID,
+      tabID: 100,
+      phase: "engaging",
+    },
+  });
+  await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(1);
+  const driveTimeout = h.timers.find((timer) => timer.ms === 3 * 60_000);
+  expect(driveTimeout).toBeDefined();
+
+  await driveTimeout?.fn();
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    tab_id: 100,
+    status: "auth_pending",
+    parked_with_tab: true,
+  });
+  expect(h.tabs.removed).not.toContain(100);
+  const internals = h.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  const driveTimerCount = h.timers.filter((timer) => timer.ms === 3 * 60_000).length;
+  expect(internals.handoffDrives.has(jobID)).toBe(false);
+  await h.port.inbound(offer);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    tab_id: 100,
+    status: "auth_pending",
+    parked_with_tab: true,
+  });
+  expect(internals.handoffDrives.has(jobID)).toBe(false);
+  expect(h.timers.filter((timer) => timer.ms === 3 * 60_000)).toHaveLength(driveTimerCount);
+  await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(1);
+});
+
+test("handoff_link_v1 keeps a warm requires-auth offer on the eager path", async () => {
+  const jobID = "job_fresh_link_warm";
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  offer.payload["login_entity_id"] = "https://idp.example.edu/entity";
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    job_id: jobID,
+    tab_id: 100,
+    status: "accepted",
+    requires_auth: true,
+  });
+  expect(h.backend.store.activeJobs[0]?.engagement_required).toBeUndefined();
+  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toEqual([]);
+});
+
+test("a fresh tab that loses its binding to cancellation is closed", async () => {
+  const jobID = "job_fresh_link_cancel_race";
+  const entityID = "https://idp.example.edu/entity";
+  const freshURL = `https://${PROVIDER_HOST}/openurl?fresh=cancelled`;
+  const h = makeHarness();
+  let ledger: Record<
+    string,
+    { openedAt: number; url: string; privateURL?: boolean; windowId?: number; groupId?: number }
+  > = {};
+  h.deps.tabLedger = {
+    load: async () => ({ ...ledger }),
+    save: async (entries) => {
+      ledger = { ...entries };
+    },
+  };
+  const createStarted = Promise.withResolvers<void>();
+  const releaseCreate = Promise.withResolvers<void>();
+  const createTab = h.tabs.create.bind(h.tabs);
+  h.tabs.create = async (properties) => {
+    createStarted.resolve();
+    await releaseCreate.promise;
+    return createTab(properties);
+  };
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  offer.payload["login_entity_id"] = entityID;
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(offer);
+  const opening = h.bridge.openHandoff(jobID);
+  const request = await h.port.waitForFrame("handoff_link_request");
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "opened",
+      url: freshURL,
+    }),
+  );
+  await createStarted.promise;
+  await h.bridge.requestCancel(jobID);
+  releaseCreate.resolve();
+
+  await expect(opening).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "tab_creation_failed",
+      message: "The handoff tab could not be created",
+    },
+  });
+  expect(h.tabs.removed).toContain(100);
+  expect(h.tabs.snapshot(100)).toBeUndefined();
+  expect(h.backend.store.activeJobs).toEqual([]);
+  expect(h.backend.store.federatedLoginOwners ?? {}).toEqual({});
+});
+
+
+test("hello migration marks restored tabless auth jobs as fresh handoffs", async () => {
+  const jobID = "job_fresh_link_migrated";
+  const seed: StoreShape = {
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "auth_pending",
+        provider_hosts: [PROVIDER_HOST],
+        requires_auth: true,
+      },
+    ],
+    offerURLs: { [jobID]: OPENURL },
+  };
+  const h = makeHarness(seed);
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+
+  expect(h.backend.store.offerURLs?.[jobID]).toBeUndefined();
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    tab_id: -1,
+    engagement_required: true,
+    fresh_handoff: true,
+  });
+});
+
+test("missing institution metadata is a structured engagement failure and never pre-opens", async () => {
+  const jobID = "job_fresh_link_missing_claim";
+  const h = makeHarness();
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([]);
+  await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "missing_claim",
+      message: "The handoff is missing institution identity metadata",
+    },
+  });
+  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
+});
+
+test("a cold engagement re-requests its URL after a service-worker restart", async () => {
+  const jobID = "job_fresh_link_restart";
+  const first = makeHarness();
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  offer.payload["login_entity_id"] = "https://idp.example.edu/entity";
+  await first.bridge.start();
+  await first.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await first.port.inbound(offer);
+  const seed = JSON.parse(JSON.stringify(first.backend.store)) as StoreShape;
+  expect(seed.offerURLs?.[jobID]).toBeUndefined();
+
+  const restarted = makeHarness(seed);
+  await restarted.bridge.start();
+  await restarted.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  const opening = restarted.bridge.openHandoff(jobID);
+  const request = await restarted.port.waitForFrame("handoff_link_request");
+  expect(request.payload["job_id"]).toBe(jobID);
+  await restarted.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "unavailable",
+      detail: "resolver action disappeared",
+    }),
+  );
+
+  await expect(opening).resolves.toMatchObject({
+    ok: false,
+    error: { code: "unavailable" },
+  });
+  expect(restarted.tabs.created).toEqual([]);
+});
+
+test("a failed fresh-link mint rolls back its institution claim without opening a tab", async () => {
+  const jobID = "job_fresh_link_failure";
+  const entityID = "https://idp.example.edu/entity";
+  const h = makeHarness();
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  offer.payload["login_entity_id"] = entityID;
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(offer);
+
+  const opening = h.bridge.openHandoff(jobID);
+  const request = await h.port.waitForFrame("handoff_link_request");
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "unavailable",
+      detail: "resolver action disappeared",
+    }),
+  );
+
+  await expect(opening).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "unavailable",
+      message: "The daemon could not mint a fresh handoff URL",
+    },
+  });
+  expect(h.tabs.created).toEqual([]);
+  expect(h.backend.store.federatedLoginOwners).toEqual({});
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    tab_id: -1,
+    engagement_required: true,
+  });
+});
+
 test("a re-offer records its auth requirement on a restored queued handoff", async () => {
   const jobID = "job_0001a_restored_requires_auth";
   const h = makeHarness({
@@ -1217,6 +1533,48 @@ test("a tracked resolver landing routes its electronic service only with origin 
   const deniedTabID = denied.backend.store.activeJobs[0]?.tab_id ?? -1;
   await denied.tabs.completeNavigation(deniedTabID, OPENURL);
   expect(injectedWithoutPermission).toBe(false);
+});
+
+test("a fresh resolver link routes after its one-use URL is retired", async () => {
+  const jobID = "job_fresh_resolver_route";
+  const entityID = "https://idp.example.edu/entity";
+  const freshURL = "https://resolver.example.edu/openurl?fresh=private";
+  const h = makeHarness();
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  h.deps.permissions.contains = async ({ origins }) =>
+    origins.length === 1 && origins[0] === "https://resolver.example.edu/*";
+  h.deps.scripting.executeScript = async (injection) => {
+    injections.push(injection);
+    return [{ result: { kind: "routed", service: "JSTOR scholarly archive" } }];
+  };
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  offer.payload["login_entity_id"] = entityID;
+
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1"],
+      resolver_origins: ["https://resolver.example.edu"],
+    }),
+  );
+  await h.port.inbound(offer);
+  const opening = h.bridge.openHandoff(jobID);
+  const request = await h.port.waitForFrame("handoff_link_request");
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "opened",
+      url: freshURL,
+    }),
+  );
+  await expect(opening).resolves.toEqual({ ok: true, opened: true });
+  expect(h.backend.store.offerURLs?.[jobID]).toBeUndefined();
+
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.completeNavigation(tabID, freshURL);
+  expect(injections).toHaveLength(1);
+  expect(injections[0]?.func).toBe(routeResolverService);
 });
 
 test("a resolver no-entitlement route emits once and short-circuits provider classification", async () => {
@@ -1589,6 +1947,7 @@ test("a cleared Cloudflare challenge returns to the ordinary stale-adapter path"
   expect(outcomes[0]?.payload).toMatchObject({
     outcome: "ui_changed",
     adapter_version: PROVIDER_ADAPTER.version,
+    adapter_id: PROVIDER_ADAPTER.id,
   });
   expect(h.backend.store.challengeCooldowns).toEqual({});
   expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
@@ -4659,6 +5018,32 @@ test("triage snapshot uses schema 2 only after the daemon advertises it", async 
   await expect(pending).resolves.toMatchObject({ ok: true });
 });
 
+test("triage counts negotiate independently of snapshot schema 4", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_v1", "triage_snapshot_schema_v4", "triage_counts_schema_v2"],
+    }),
+  );
+
+  const pending = h.bridge.requestTriageCounts();
+  await Promise.resolve();
+  await Promise.resolve();
+  const request = h.frames().find((frame) => frame.type === "triage_counts_request");
+  expect(request?.payload["schema_versions"]).toEqual([2]);
+  const requestID = request?.payload["request_id"];
+  expect(typeof requestID).toBe("string");
+  await h.port.inbound(
+    nativeResult("triage_counts_response", {
+      request_id: requestID as string,
+      counts: triageCounts(3),
+    }),
+  );
+  await expect(pending).resolves.toMatchObject({ ok: true, counts: { pending_total: 3 } });
+});
+
 test("triage requests time out and late echoes are dropped", async () => {
   const h = makeHarness();
   await h.bridge.start();
@@ -6453,12 +6838,9 @@ test("a hello_ack immediately notifies the keepalive manager of configured-origi
 });
 
 // One login tab per institution: a cross-job federated-login registry keyed
-// by a CLAIM KEY — the federated-login destination (IdP/DS) origin PLUS the
-// offer's entityID — so three papers needing the same institution share a
-// single sign-in tab instead of each opening its own. The origin alone is
-// not enough: a shared WAYF/Discovery-Service host serving many
-// institutions exposes exactly one origin, distinguished only by entityID
-// (the real ProQuest adapter is exactly this shape).
+// by an opaque digest of the offer's entityID, so three papers needing the
+// same institution share a single sign-in tab even when discovery services
+// or resolver origins differ.
 const FED_ENTITY_ID = "https://idp.example.edu/entity";
 const FED_LOGIN_TEMPLATE =
   "https://login.idp.example.edu/Shibboleth.sso/DS?entityID={entityID}&target=https://login.idp.example.edu/home";
@@ -6475,8 +6857,8 @@ const OPENURL_B = "https://resolver-b.example.edu/openurl?ctx=xyz";
 let FED_CLAIM_KEY_B = "";
 async function ensureFedClaimKeys(): Promise<void> {
   if (FED_CLAIM_KEY !== "" && FED_CLAIM_KEY_B !== "") return;
-  FED_CLAIM_KEY = await federatedLoginClaimKey(FED_IDP_ORIGIN, FED_ENTITY_ID);
-  FED_CLAIM_KEY_B = await federatedLoginClaimKey(FED_IDP_ORIGIN, FED_ENTITY_ID_B);
+  FED_CLAIM_KEY = await federatedLoginClaimKey(FED_ENTITY_ID);
+  FED_CLAIM_KEY_B = await federatedLoginClaimKey(FED_ENTITY_ID_B);
 }
 const FED_LOGIN_SPEC: AdapterSpec = {
   id: "fedlogin",
@@ -6541,6 +6923,275 @@ async function primeFedLoginTriad(): Promise<{ h: Harness; tabA: number; tabB: n
   return { h, tabA, tabB, tabC };
 }
 
+test("a re-offer reconciles a login wall that completed while the worker was stopped", async () => {
+  await ensureFedClaimKeys();
+  const jobID = "job_fresh_restart_landing";
+  const first = makeFedLoginHarness(emptyStore());
+  const offer = fedLoginOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+
+  await first.bridge.start();
+  await first.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await first.port.inbound(offer);
+  const opening = first.bridge.openHandoff(jobID);
+  const request = await first.port.waitForFrame("handoff_link_request");
+  await first.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "opened",
+      url: FED_PROVIDER_LOGIN_URL,
+    }),
+  );
+  await expect(opening).resolves.toEqual({ ok: true, opened: true });
+  const tabID = first.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(first.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.phase).toBe("engaging");
+
+  const seed = JSON.parse(JSON.stringify(first.backend.store)) as StoreShape;
+  const restarted = makeFedLoginHarness(seed);
+  restarted.tabs.seed({ id: tabID, url: FED_PROVIDER_LOGIN_URL });
+  await restarted.bridge.start();
+  await restarted.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await restarted.port.inbound(offer);
+
+  expect(restarted.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]).toEqual({
+    jobID,
+    tabID,
+    phase: "auth",
+  });
+  expect(restarted.tabs.navigations).toContainEqual({ tabID, url: FED_LOGIN_URL });
+});
+
+test("cold same-institution engagements share one claim before any login tab exists", async () => {
+  await ensureFedClaimKeys();
+  const h = makeFedLoginHarness(emptyStore());
+  const firstID = "job_fresh_claim_a";
+  const secondID = "job_fresh_claim_b";
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  for (const jobID of [firstID, secondID]) {
+    const offer = fedLoginOffer(jobID) as { payload: Record<string, unknown> };
+    offer.payload["requires_auth"] = true;
+    await h.port.inbound(offer);
+  }
+  expect(h.tabs.created).toEqual([]);
+
+  const firstOpening = h.bridge.openHandoff(firstID);
+  const firstRequest = await h.port.waitForFrame("handoff_link_request");
+  await expect(h.bridge.openHandoff(secondID)).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "handoff_opening",
+      message: "Another handoff is opening this institution's login",
+    },
+  });
+  expect(h.tabs.created).toEqual([]);
+  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(1);
+
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: firstRequest.payload["request_id"],
+      outcome: "opened",
+      url: FED_PROVIDER_LOGIN_URL,
+    }),
+  );
+  await expect(firstOpening).resolves.toEqual({ ok: true, opened: true });
+  const firstTabID = h.backend.store.activeJobs.find((job) => job.job_id === firstID)?.tab_id ?? -1;
+  expect(h.backend.store.federatedLoginOwners).toEqual({
+    [FED_CLAIM_KEY]: { jobID: firstID, tabID: firstTabID, phase: "engaging" },
+  });
+
+  // The initial provider landing must not retire an engagement-phase claim.
+  // Its login verdict promotes that same claim before navigating to the IdP.
+  await landOnFedProviderWall(h, firstTabID);
+  expect(h.backend.store.federatedLoginOwners).toEqual({
+    [FED_CLAIM_KEY]: { jobID: firstID, tabID: firstTabID, phase: "auth" },
+  });
+  await expect(h.bridge.openHandoff(secondID)).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(1);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === secondID)).toMatchObject({
+    tab_id: -1,
+    waiting_for_session: true,
+    waiting_for_session_key: FED_CLAIM_KEY,
+    engagement_required: true,
+  });
+
+  // Closing the owning tab retires the claim without auto-opening its waiter.
+  await h.tabs.userClose(firstTabID);
+  expect(h.backend.store.federatedLoginOwners).toEqual({});
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === secondID)).toMatchObject({
+    tab_id: -1,
+    waiting_for_session: false,
+    engagement_required: true,
+  });
+  expect(h.tabs.created).toHaveLength(1);
+
+  const secondOpening = h.bridge.openHandoff(secondID);
+  for (
+    let attempt = 0;
+    attempt < 20 &&
+    h.frames().filter((frame) => frame.type === "handoff_link_request").length < 2;
+    attempt += 1
+  ) {
+    await Promise.resolve();
+  }
+  const secondRequest = h.frames()
+    .filter((frame) => frame.type === "handoff_link_request")
+    .at(-1);
+  expect(secondRequest?.payload["job_id"]).toBe(secondID);
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: secondRequest?.payload["request_id"],
+      outcome: "opened",
+      url: FED_PROVIDER_LOGIN_URL,
+    }),
+  );
+  await expect(secondOpening).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(2);
+});
+
+
+test("a sibling focus failure retains a live institutional claim", async () => {
+  await ensureFedClaimKeys();
+  const ownerID = "job_fresh_focus_owner";
+  const waiterID = "job_fresh_focus_waiter";
+  const h = makeFedLoginHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: ownerID,
+        tab_id: 100,
+        offered_at: 1,
+        expires_at: 2,
+        status: "auth_pending",
+        provider_hosts: [PROVIDER_HOST],
+        requires_auth: true,
+        fresh_handoff: true,
+        institution_claim_key: FED_CLAIM_KEY,
+      },
+      {
+        job_id: waiterID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        provider_hosts: [PROVIDER_HOST],
+        requires_auth: true,
+        engagement_required: true,
+        fresh_handoff: true,
+        institution_claim_key: FED_CLAIM_KEY,
+      },
+    ],
+    federatedLoginOwners: {
+      [FED_CLAIM_KEY]: { jobID: ownerID, tabID: 100, phase: "auth" },
+    },
+  });
+  h.tabs.seed({ id: 100, url: FED_LOGIN_URL, active: false });
+  const updateTab = h.tabs.update.bind(h.tabs);
+  h.tabs.update = async (tabID, properties) => {
+    if (tabID === 100 && properties.active === true) throw new Error("focus denied");
+    return updateTab(tabID, properties);
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await expect(h.bridge.openHandoff(waiterID)).resolves.toEqual({ ok: true, opened: true });
+
+  expect(h.backend.store.federatedLoginOwners).toEqual({
+    [FED_CLAIM_KEY]: { jobID: ownerID, tabID: 100, phase: "auth" },
+  });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === waiterID)).toMatchObject({
+    tab_id: -1,
+    waiting_for_session: true,
+    waiting_for_session_key: FED_CLAIM_KEY,
+  });
+  expect(h.tabs.created).toEqual([]);
+  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toEqual([]);
+});
+
+test("a sibling click rechecks an owner that retires while focus settles", async () => {
+  await ensureFedClaimKeys();
+  const ownerID = "job_fresh_racing_owner";
+  const waiterID = "job_fresh_racing_waiter";
+  const seed: StoreShape = {
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: ownerID,
+        tab_id: 100,
+        offered_at: 1,
+        expires_at: 2,
+        status: "auth_pending",
+        provider_hosts: [PROVIDER_HOST],
+        requires_auth: true,
+        engagement_required: false,
+        institution_claim_key: FED_CLAIM_KEY,
+        fresh_handoff: true,
+      },
+      {
+        job_id: waiterID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        provider_hosts: [PROVIDER_HOST],
+        requires_auth: true,
+        engagement_required: true,
+        institution_claim_key: FED_CLAIM_KEY,
+        fresh_handoff: true,
+      },
+    ],
+    federatedLoginOwners: {
+      [FED_CLAIM_KEY]: { jobID: ownerID, tabID: 100, phase: "auth" },
+    },
+  };
+  const h = makeFedLoginHarness(seed);
+  h.tabs.seed({ id: 100, url: FED_LOGIN_URL });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+
+  const originalGet = h.tabs.get.bind(h.tabs);
+  let releaseFocus: (() => void) | undefined;
+  let observedFocus: (() => void) | undefined;
+  const focusGate = new Promise<void>((resolve) => {
+    releaseFocus = resolve;
+  });
+  const focusObserved = new Promise<void>((resolve) => {
+    observedFocus = resolve;
+  });
+  let blockOwnerLookup = true;
+  h.tabs.get = async (tabID) => {
+    if (tabID === 100 && blockOwnerLookup) {
+      blockOwnerLookup = false;
+      observedFocus?.();
+      await focusGate;
+    }
+    return originalGet(tabID);
+  };
+
+  const opening = h.bridge.openHandoff(waiterID);
+  await focusObserved;
+  const internals = h.bridge as unknown as {
+    clearFederatedLoginOwner(claimKey: string, jobID: string): Promise<void>;
+  };
+  await internals.clearFederatedLoginOwner(FED_CLAIM_KEY, ownerID);
+  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]).toBeUndefined();
+  releaseFocus?.();
+
+  const request = await h.port.waitForFrame("handoff_link_request");
+  expect(request.payload["job_id"]).toBe(waiterID);
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "opened",
+      url: FED_PROVIDER_LOGIN_URL,
+    }),
+  );
+  await expect(opening).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toEqual([{ url: FED_PROVIDER_LOGIN_URL, active: true }]);
+});
+
 test("one login tab per institution: two siblings park in waiting_for_session instead of opening their own IdP tab", async () => {
   const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
 
@@ -6577,7 +7228,7 @@ test("one login tab per institution: two siblings park in waiting_for_session in
   expect(h.tabs.snapshot(tabC)?.url).toBe(FED_PROVIDER_LOGIN_URL);
 
   expect(h.backend.store.federatedLoginOwners).toEqual({
-    [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA },
+    [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA, phase: "auth" },
   });
 });
 test("waiting siblings stay parked without gaining an IdP tab over time", async () => {
@@ -6608,7 +7259,9 @@ test("startup drops legacy raw claim keys and resumes their waiters ownerlessly"
   const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
   const legacyKey = JSON.stringify([FED_IDP_ORIGIN, FED_ENTITY_ID]);
   const seed = JSON.parse(JSON.stringify(h.backend.store)) as StoreShape;
-  seed.federatedLoginOwners = { [legacyKey]: { jobID: "job_fed_a", tabID: tabA } };
+  seed.federatedLoginOwners = { [legacyKey]: { jobID: "job_fed_a", tabID: tabA, phase: "auth" } };
+  const ownerJob = seed.activeJobs.find((candidate) => candidate.job_id === "job_fed_a");
+  if (ownerJob !== undefined) ownerJob.institution_claim_key = legacyKey;
   for (const jobID of ["job_fed_b", "job_fed_c"]) {
     const job = seed.activeJobs.find((candidate) => candidate.job_id === jobID);
     if (job !== undefined) job.waiting_for_session_key = legacyKey;
@@ -6620,9 +7273,21 @@ test("startup drops legacy raw claim keys and resumes their waiters ownerlessly"
   await restarted.bridge.start();
   expect(restarted.backend.store.federatedLoginOwners).toEqual({});
   expect(restarted.backend.store.activeJobs.filter((job) => job.waiting_for_session === true)).toHaveLength(0);
+  expect(
+    restarted.backend.store.activeJobs.every(
+      (job) => job.institution_claim_key === undefined || /^v2:[0-9a-f]{64}$/.test(job.institution_claim_key),
+    ),
+  ).toBe(true);
   const persisted = JSON.stringify(restarted.backend.store);
   expect(persisted).not.toContain(FED_IDP_ORIGIN);
   expect(persisted).not.toContain(FED_ENTITY_ID);
+  await restarted.port.inbound(fedLoginOffer("job_fed_a"));
+  expect(restarted.backend.store.federatedLoginOwners).toEqual({
+    [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA, phase: "auth" },
+  });
+  expect(
+    restarted.backend.store.activeJobs.find((job) => job.job_id === "job_fed_a")?.institution_claim_key,
+  ).toBe(FED_CLAIM_KEY);
 });
 
 test("repeated decisive evidence events cost zero navigations for a waiter whose claim owner is still live", async () => {
@@ -6653,7 +7318,7 @@ test("repeated decisive evidence events cost zero navigations for a waiter whose
   // The claim itself is untouched too — still exactly the owner it started
   // with.
   expect(h.backend.store.federatedLoginOwners).toEqual({
-    [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA },
+    [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA, phase: "auth" },
   });
 });
 
@@ -6852,7 +7517,7 @@ test("the federated-login registry clears when the owning tab closes, so the nex
   const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_close_b");
   expect(b?.waiting_for_session).toBeUndefined();
   expect(h.backend.store.federatedLoginOwners).toEqual({
-    [FED_CLAIM_KEY]: { jobID: "job_fed_close_b", tabID: tabB },
+    [FED_CLAIM_KEY]: { jobID: "job_fed_close_b", tabID: tabB, phase: "auth" },
   });
 });
 

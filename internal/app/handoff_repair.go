@@ -60,10 +60,11 @@ func (s *Service) HandoffRepairer() *HandoffRepairer { return &HandoffRepairer{s
 // artifact or action. Move it to awaiting_human with manual_download so the
 // user can supply a browser download for adoption.
 //
-// Rule 5 (provider upgrade): a manual-download park created by an adapter
-// outcome from an older extension bundle can retry when the live browser bridge
-// proves that bundle has been upgraded. The bridge supplies that live-only
-// version signal to RepairAdapterUpgrade; maintenance alone cannot infer it.
+// Rule 5 (provider upgrade): a manual-download park created by an older
+// provider adapter can retry when the live browser registry proves that exact
+// adapter has been upgraded. Captures bind the outcome to its adapter id; old
+// events without that evidence conservatively fall back to a newer extension
+// bundle. The bridge supplies both live-only signals to RepairAdapterUpgrade.
 //
 // The transactional repair rejects a state/action snapshot that has gone
 // stale, including an adoption lease acquired after its page read.
@@ -142,13 +143,21 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 }
 
 // RepairAdapterUpgrade returns manual-download parks to resolving when a live
-// browser session proves that the extension bundle which stranded them is older.
-// The bridge owns the live-session comparison because app must not depend on the
-// browser package; newer must decline malformed versions rather than guessing.
+// browser session proves that the adapter which stranded them is newer. A
+// captured adapter id scopes the comparison to that registry entry, so changing
+// an unrelated adapter cannot churn the park. Events predating adapter-id
+// capture fall back to the extension bundle version.
 //
-// The transition event is both the audit record and the durable one-shot latch:
-// a re-park without a fresh provider outcome cannot loop on the same upgrade.
-func (r *HandoffRepairer) RepairAdapterUpgrade(ctx context.Context, liveExtensionVersion string, newer func(previous, current string) bool) error {
+// The bridge owns version comparison because app must not depend on the browser
+// package; newer must decline malformed versions rather than guessing. The
+// transition event is both the audit record and the durable one-shot latch: a
+// re-park without a fresh provider outcome cannot loop on the same upgrade.
+func (r *HandoffRepairer) RepairAdapterUpgrade(
+	ctx context.Context,
+	liveExtensionVersion string,
+	liveAdapterVersions map[string]string,
+	newer func(previous, current string) bool,
+) error {
 	if r == nil || r.svc == nil || r.svc.Jobs == nil || liveExtensionVersion == "" || newer == nil {
 		return nil
 	}
@@ -190,23 +199,48 @@ func (r *HandoffRepairer) RepairAdapterUpgrade(ctx context.Context, liveExtensio
 			record(err)
 			continue
 		}
-		previousExtensionVersion, adapterVersion, adapterOutcome := providerAdapterUpgradeSource(events)
-		if !adapterOutcome ||
-			providerRouteProvenEmpty(events) ||
-			adapterUpgradeAlreadyRepaired(events, previousExtensionVersion, liveExtensionVersion) ||
-			!newer(previousExtensionVersion, liveExtensionVersion) {
+		previousExtensionVersion, adapterID, previousAdapterVersion, adapterOutcome :=
+			providerAdapterUpgradeSource(events)
+		if !adapterOutcome || providerRouteProvenEmpty(events) {
 			continue
 		}
+
+		liveAdapterVersion := ""
+		upgradeProven := false
+		if adapterID != "" {
+			liveAdapterVersion = liveAdapterVersions[adapterID]
+			upgradeProven = newer(previousAdapterVersion, liveAdapterVersion)
+		} else {
+			upgradeProven = newer(previousExtensionVersion, liveExtensionVersion)
+		}
+		if !upgradeProven ||
+			adapterUpgradeAlreadyRepaired(
+				events,
+				previousExtensionVersion,
+				liveExtensionVersion,
+				adapterID,
+				previousAdapterVersion,
+				liveAdapterVersion,
+			) {
+			continue
+		}
+
 		actionIDs := make([]int64, 0, len(open))
 		for _, action := range open {
 			actionIDs = append(actionIDs, action.ID)
 		}
-		record(s.Jobs.RepairAwaitingHuman(ctx, row.ID, actionIDs, map[string]any{
+		detail := map[string]any{
 			"reason":                adapterUpgradeRepairReason,
-			"adapter_version":       adapterVersion,
+			"adapter_version":       previousAdapterVersion,
 			"old_extension_version": previousExtensionVersion,
 			"new_extension_version": liveExtensionVersion,
-		}))
+		}
+		if adapterID != "" {
+			detail["adapter_id"] = adapterID
+			detail["old_adapter_version"] = previousAdapterVersion
+			detail["new_adapter_version"] = liveAdapterVersion
+		}
+		record(s.Jobs.RepairAwaitingHuman(ctx, row.ID, actionIDs, detail))
 	}
 	return firstErr
 }
@@ -225,9 +259,15 @@ func allManualDownloads(actions []job.HumanAction) bool {
 	return true
 }
 
-// providerAdapterUpgradeSource intentionally inspects only the latest provider
-// outcome. An older adapter observation cannot explain a later provider result.
-func providerAdapterUpgradeSource(events []map[string]any) (extensionVersion, adapterVersion string, ok bool) {
+// providerAdapterUpgradeSource reads the latest provider outcome. Current
+// frames identify their adapter directly; historical events fall back to the
+// nearest preceding capture from the same adapter version. A capture never
+// crosses an earlier provider outcome.
+func providerAdapterUpgradeSource(events []map[string]any) (
+	extensionVersion, adapterID, adapterVersion string,
+	ok bool,
+) {
+	outcomeIndex := -1
 	for i := len(events) - 1; i >= 0; i-- {
 		event := events[i]
 		if kind, _ := event["kind"].(string); kind != "browser.provider_outcome" {
@@ -236,9 +276,33 @@ func providerAdapterUpgradeSource(events []map[string]any) (extensionVersion, ad
 		detail, _ := event["detail"].(map[string]any)
 		extensionVersion, _ = detail["extension_version"].(string)
 		adapterVersion, _ = detail["adapter_version"].(string)
-		return extensionVersion, adapterVersion, extensionVersion != "" && adapterVersion != ""
+		adapterID, _ = detail["adapter_id"].(string)
+		outcomeIndex = i
+		break
 	}
-	return "", "", false
+	if extensionVersion == "" || adapterVersion == "" {
+		return extensionVersion, "", adapterVersion, false
+	}
+	if adapterID != "" {
+		return extensionVersion, adapterID, adapterVersion, true
+	}
+	for i := outcomeIndex - 1; i >= 0; i-- {
+		event := events[i]
+		kind, _ := event["kind"].(string)
+		if kind == "browser.provider_outcome" {
+			break
+		}
+		if kind != "browser.page_capture" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		capturedVersion, _ := detail["adapter_version"].(string)
+		capturedID, _ := detail["adapter_id"].(string)
+		if capturedID != "" && capturedVersion == adapterVersion {
+			return extensionVersion, capturedID, adapterVersion, true
+		}
+	}
+	return extensionVersion, "", adapterVersion, true
 }
 
 func providerRouteProvenEmpty(events []map[string]any) bool {
@@ -250,7 +314,10 @@ func providerRouteProvenEmpty(events []map[string]any) bool {
 	return false
 }
 
-func adapterUpgradeAlreadyRepaired(events []map[string]any, previousExtensionVersion, liveExtensionVersion string) bool {
+func adapterUpgradeAlreadyRepaired(
+	events []map[string]any,
+	previousExtensionVersion, liveExtensionVersion, adapterID, previousAdapterVersion, liveAdapterVersion string,
+) bool {
 	for _, event := range events {
 		if kind, _ := event["kind"].(string); kind != "job.transition" {
 			continue
@@ -259,10 +326,18 @@ func adapterUpgradeAlreadyRepaired(events []map[string]any, previousExtensionVer
 		if reason, _ := detail["reason"].(string); reason != adapterUpgradeRepairReason {
 			continue
 		}
-		if previous, _ := detail["old_extension_version"].(string); previous != previousExtensionVersion {
+		if adapterID != "" {
+			previous, _ := detail["old_adapter_version"].(string)
+			current, _ := detail["new_adapter_version"].(string)
+			capturedID, _ := detail["adapter_id"].(string)
+			if capturedID == adapterID && previous == previousAdapterVersion && current == liveAdapterVersion {
+				return true
+			}
 			continue
 		}
-		if current, _ := detail["new_extension_version"].(string); current == liveExtensionVersion {
+		previous, _ := detail["old_extension_version"].(string)
+		current, _ := detail["new_extension_version"].(string)
+		if previous == previousExtensionVersion && current == liveExtensionVersion {
 			return true
 		}
 	}

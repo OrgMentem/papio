@@ -127,6 +127,51 @@ test("handoff_focus is an empty job-scoped frame listed by the shared schema", (
   expect(() => parseBrowserMessage({ ...frame, payload: { unexpected: true } })).toThrow(ProtocolError);
 });
 
+test("handoff link correlation and URL text stay wire-strict", () => {
+  const frame = (type: "handoff_link_request" | "handoff_link_result", payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type,
+    msg_id: "handoff-link-strict-001",
+    seq: 1,
+    payload,
+  });
+  expect(
+    parseBrowserMessage(
+      frame("handoff_link_result", {
+        request_id: "handoff-request-001",
+        outcome: "opened",
+        url: "https://resolver.example.edu/openurl?title=A%20Paper",
+      }),
+    ).payload["outcome"],
+  ).toBe("opened");
+  expect(() =>
+    parseBrowserMessage(
+      frame("handoff_link_result", {
+        request_id: "handoff-request-001",
+        outcome: "opened",
+        url: "https://resolver.example.edu/openurl?title=A Paper",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+  expect(() =>
+    parseBrowserMessage(
+      frame("handoff_link_result", {
+        request_id: "handoff-request-001",
+        outcome: "opened",
+        url: "https://resolver.example.edu/openurl?title=%zz",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+  expect(() =>
+    parseBrowserMessage(frame("handoff_link_request", { request_id: "", job_id: "job_handoff_0001" })),
+  ).toThrow(ProtocolError);
+  expect(() =>
+    parseBrowserMessage(
+      frame("handoff_link_result", { request_id: "", outcome: "unavailable", detail: "not available" }),
+    ),
+  ).toThrow(ProtocolError);
+});
+
 test("triage schema 1 keeps the locked action shape while schema 2 carries access classification", () => {
   const text = readFileSync(join(corpusRoot, "valid", "browser-triage-snapshot-response.json"), "utf8");
   expect(JSON.stringify(parseBrowserMessageBytes(text).payload))

@@ -432,12 +432,24 @@ func TestHandoffRepairerReachesOldestParkBeyondMaintenancePage(t *testing.T) {
 	}
 }
 
-func providerUpgradePark(t *testing.T, svc *Service, jobs *job.Store, requestID, extensionVersion, adapterVersion string) *job.Row {
+func providerUpgradePark(
+	t *testing.T,
+	svc *Service,
+	jobs *job.Store,
+	requestID, extensionVersion, adapterID, adapterVersion string,
+) *job.Row {
 	t.Helper()
 	ctx := context.Background()
 	row := parkedHandoffJob(t, svc, jobs, requestID)
 	if _, err := jobs.OpenHumanAction(ctx, row.ID, "manual_download", "download the requested PDF yourself", job.Access(false, "")); err != nil {
 		t.Fatal(err)
+	}
+	if adapterID != "" {
+		if err := jobs.RecordEvent(ctx, row.ID, "browser.page_capture", map[string]any{
+			"adapter_id": adapterID, "adapter_version": adapterVersion,
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := jobs.RecordEvent(ctx, row.ID, "browser.provider_outcome", map[string]any{
 		"outcome":           "ui_changed",
@@ -452,14 +464,19 @@ func providerUpgradePark(t *testing.T, svc *Service, jobs *job.Store, requestID,
 func TestHandoffRepairerRepairsAdapterUpgradeParks(t *testing.T) {
 	ctx := context.Background()
 	newer := func(previous, current string) bool {
-		return previous == "0.7.0" && current == "0.8.0"
+		return (previous == "0.7.0" && current == "0.8.0") ||
+			(previous == "0.1.0" && current == "0.2.0")
 	}
 
-	t.Run("retries once and records the extension upgrade", func(t *testing.T) {
+	t.Run("retries an exact adapter upgrade once within the same extension", func(t *testing.T) {
 		svc, jobs := newTestService(t)
-		row := providerUpgradePark(t, svc, jobs, "request_adapter_upgrade_once", "0.7.0", "0.1.0")
+		row := providerUpgradePark(
+			t, svc, jobs, "request_adapter_upgrade_once", "0.8.0", "sciencedirect", "0.1.0",
+		)
 
-		if err := svc.HandoffRepairer().RepairAdapterUpgrade(ctx, "0.8.0", newer); err != nil {
+		if err := svc.HandoffRepairer().RepairAdapterUpgrade(
+			ctx, "0.8.0", map[string]string{"sciencedirect": "0.2.0"}, newer,
+		); err != nil {
 			t.Fatal(err)
 		}
 		persisted, err := jobs.Get(ctx, row.ID)
@@ -491,9 +508,11 @@ func TestHandoffRepairerRepairsAdapterUpgradeParks(t *testing.T) {
 			}
 		}
 		if repairDetail == nil ||
-			repairDetail["old_extension_version"] != "0.7.0" ||
+			repairDetail["old_extension_version"] != "0.8.0" ||
 			repairDetail["new_extension_version"] != "0.8.0" ||
-			repairDetail["adapter_version"] != "0.1.0" {
+			repairDetail["adapter_id"] != "sciencedirect" ||
+			repairDetail["old_adapter_version"] != "0.1.0" ||
+			repairDetail["new_adapter_version"] != "0.2.0" {
 			t.Fatalf("adapter-upgrade repair event = %#v", repairDetail)
 		}
 
@@ -504,7 +523,9 @@ func TestHandoffRepairerRepairsAdapterUpgradeParks(t *testing.T) {
 		if _, err := jobs.OpenHumanAction(ctx, row.ID, "manual_download", "download the requested PDF yourself", job.Access(false, "")); err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.HandoffRepairer().RepairAdapterUpgrade(ctx, "0.8.0", newer); err != nil {
+		if err := svc.HandoffRepairer().RepairAdapterUpgrade(
+			ctx, "0.8.0", map[string]string{"sciencedirect": "0.2.0"}, newer,
+		); err != nil {
 			t.Fatal(err)
 		}
 		persisted, err = jobs.Get(ctx, row.ID)
@@ -512,14 +533,33 @@ func TestHandoffRepairerRepairsAdapterUpgradeParks(t *testing.T) {
 			t.Fatal(err)
 		}
 		if persisted.State != job.StateAwaitingHuman {
-			t.Fatalf("same extension upgrade retried again: state = %s", persisted.State)
+			t.Fatalf("same adapter upgrade retried again: state = %s", persisted.State)
 		}
 		open, err = jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(open) != 1 || open[0].Kind != "manual_download" {
-			t.Fatalf("same extension upgrade changed open actions: %+v", open)
+			t.Fatalf("same adapter upgrade changed open actions: %+v", open)
+		}
+	})
+
+	t.Run("an unrelated adapter upgrade does not churn the park", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		row := providerUpgradePark(
+			t, svc, jobs, "request_unrelated_adapter_upgrade", "0.8.0", "sciencedirect", "0.1.0",
+		)
+		if err := svc.HandoffRepairer().RepairAdapterUpgrade(
+			ctx, "0.8.0", map[string]string{"sage": "0.2.0"}, newer,
+		); err != nil {
+			t.Fatal(err)
+		}
+		persisted, err := jobs.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != job.StateAwaitingHuman {
+			t.Fatalf("unrelated adapter upgrade changed state to %s", persisted.State)
 		}
 	})
 
@@ -575,10 +615,10 @@ func TestHandoffRepairerRepairsAdapterUpgradeParks(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, jobs := newTestService(t)
-			row := providerUpgradePark(t, svc, jobs, "request_adapter_upgrade_"+strings.ReplaceAll(tc.name, " ", "_"), "0.7.0", "0.1.0")
+			row := providerUpgradePark(t, svc, jobs, "request_adapter_upgrade_"+strings.ReplaceAll(tc.name, " ", "_"), "0.7.0", "", "0.1.0")
 			tc.setup(t, svc, jobs, row)
 
-			if err := svc.HandoffRepairer().RepairAdapterUpgrade(ctx, "0.8.0", newer); err != nil {
+			if err := svc.HandoffRepairer().RepairAdapterUpgrade(ctx, "0.8.0", nil, newer); err != nil {
 				t.Fatal(err)
 			}
 			persisted, err := jobs.Get(ctx, row.ID)

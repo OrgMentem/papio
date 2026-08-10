@@ -5,10 +5,11 @@
 // is pure over an injected StateBackend so it is unit-testable without chrome.
 //
 // Privacy invariant: no identity-provider URL, host, title, query, or fragment
-// is persisted. Resolver-provided offer URLs are retained only while their
-// active jobs exist so a suspended MV3 worker can recover the exact handoff.
+// is persisted. Legacy daemons still require resolver offer URLs for restart
+// recovery; handoff_link_v1 jobs retain only an opaque institution claim key.
 
 import type { DeliverySessionEvidence } from "./protocol";
+import type { FederatedClaimPhase } from "./federated-claim";
 
 export type JobStatus = "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
 
@@ -86,6 +87,16 @@ export interface ActiveJob {
   /** True when the resolver says this offer needs a warm institutional session.
    * Queued handoffs retain it so a fallback never mints a sign-in request early. */
   requires_auth?: boolean;
+  /** Cold auth offers wait for explicit inbox/popup engagement before opening
+   * a managed tab. */
+  engagement_required?: boolean;
+  /** Opaque, versioned digest used to coordinate one institution's cold
+   * engagement without persisting its entity ID or resolver route. */
+  institution_claim_key?: string;
+  /** This job was accepted under handoff_link_v1, so no reusable URL exists
+   * after engagement. Persisted because feature negotiation can be transiently
+   * absent while a drive timeout fires. */
+  fresh_handoff?: boolean;
   /** One-download-initiation-per-job latch. Once an adapter has clicked the
    * declared download target, it can never click again for this job. The
    * source-controlled adapter id allows concurrent provider downloads to be
@@ -153,7 +164,7 @@ export interface ActiveJob {
    * tab closes while parked, when onTabRemoved demotes it to an ordinary
    * queued drive. */
   waiting_for_session?: boolean;
-  /** Opaque SHA-256 hex digest of the federated-login claim tuple. The raw
+  /** Opaque versioned SHA-256 digest of the institution entity ID. The raw
    * IdP origin and entityID are never persisted; this key exists only for
    * equality against federatedLoginOwners. */
   waiting_for_session_key?: string | undefined;
@@ -165,19 +176,19 @@ export interface ActiveJob {
   waiting_deadline?: number | undefined;
 }
 /** Cross-job record of the one live tab currently driving federated login for
- * an opaque SHA-256 claim digest. The digest is derived from the destination
- * origin and entityID but the raw tuple never enters persisted browser state.
- * Lets three papers needing the same institution share ONE login tab instead
- * of each opening its own: a job whose login verdict resolves to a digest
- * already held here parks (waiting_for_session) instead. Persisted beside
- * parked_with_tab (session storage) so a service-worker restart sees the same
- * claim; reconcileFederatedLoginOwners drops stale owners and resumes their
- * waiters through the ownerless path. Retirement is deliberately narrow: the
- * owning tab closes, navigates off the claimed origin, or its job is removed.
- * Every retirement resumes that claim's own waiters. */
+ * an opaque SHA-256 digest of the institution entity ID. Resolver and IdP
+ * origins are deliberately excluded because discovery services are shared.
+ * Lets multiple papers needing the same institution share one login tab:
+ * a job whose login verdict resolves to an existing digest parks as a waiter.
+ * Session storage preserves the claim across service-worker restarts;
+ * reconciliation drops stale owners and resumes their waiters. The owning
+ * tab closing, returning from authentication, or its job ending retires it. */
 export interface FederatedLoginOwner {
   jobID: string;
   tabID: number;
+  /** "engaging" reserves a cold click before daemon RPC; "auth" is an
+   * in-flight federated login after the provider login verdict. */
+  phase: FederatedClaimPhase;
 }
 /** A short, browser-session lease over one provider's queued handoffs. The
  * owner token stays only in the service worker; session storage retains this

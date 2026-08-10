@@ -593,37 +593,33 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
-    // The article rule is STRUCTURAL-ONLY (synthetic citation_pdf_url DOM in
-    // sciencedirect.test.ts) and NOT yet live-verified: ScienceDirect sits
-    // behind Cloudflare, which bot-challenges automated capture, so no
-    // entitled DOM could be captured under automation at build time. It
-    // follows the citation_pdf_url standard (the Highwire/Google-Scholar meta
-    // tag carrying the entitled pdfft URL that Elsevier exposes) and fetches
-    // it via the privileged downloads API — no click, no gesture — gated on
-    // recorded terms consent, exactly like the JSTOR url / EBSCO api adapters.
-    // Confirm live against a real entitled session (a warm human browser does
-    // not trip Cloudflare) before trusting it; if ScienceDirect gates the
-    // pdfft URL behind an interstitial (isDTMRedir), the meta URL fetch will
-    // need a follow-up.
+    // Verified live 2026-08-09 against a warm, entitled ScienceDirect article
+    // (fixtures/sciencedirect/success.html). ScienceDirect no longer publishes
+    // citation_pdf_url there; it renders the current article's View PDF anchor
+    // under the access bar instead. The page also carries a visible OneTrust
+    // cookie banner, which does not hide that structural control from the DOM.
+    // Activate that exact provider-owned control: Elsevier's documented flow
+    // opens the PDF in a new browser window, which papio's viewer-adoption path
+    // captures. Fetching the bare href directly redirects to Cookie Notice HTML.
     //
-    // The no_entitlement rule IS live evidence (fixtures/sciencedirect/
-    // no-entitlement.html, captured 2026-08-06 from a real institutional
-    // handoff). Without it an unentitled ScienceDirect article classified
-    // `unknown`, which papio reports to the user as "could not drive the
-    // provider page" — sending them to hunt an adapter bug when the real
-    // problem is that the resolver routed them somewhere they have no access.
-    // The two states are cleanly separable in the capture: the paywall
-    // publishes the access bar's PurchasePDF control and NO citation_pdf_url,
-    // the entitled page the reverse. `article` stays first so the positive
-    // entitlement signal always wins if a page ever carries both.
+    // The no_entitlement rule is separate live evidence (fixtures/
+    // sciencedirect/no-entitlement.html, captured 2026-08-06 from a real
+    // institutional handoff). Without it an unentitled article classified
+    // `unknown`, which papio reports as an adapter coverage gap rather than the
+    // actual lack of access. The paywall publishes PurchasePDF and no ViewPDF
+    // control. `article` stays first so the positive entitlement signal wins if
+    // a transitional page briefly carries both.
     id: "sciencedirect",
-    version: "0.2.0",
+    version: "0.4.0",
     hosts: ["sciencedirect.com"],
     settleTimeoutMs: 5000,
     classify: [
       {
         kind: "article",
-        all: ["meta[name='citation_pdf_url']", "meta[name='citation_title']"],
+        all: [
+          "meta[name='citation_title']",
+          ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdfft']",
+        ],
       },
       {
         kind: "no_entitlement",
@@ -631,11 +627,9 @@ export const adapters: AdapterSpec[] = [
       },
     ],
     download: {
-      selector: "meta[name='citation_pdf_url']",
+      selector: ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdfft']",
       requireKind: "article",
-      method: "meta",
-      metaName: "citation_pdf_url",
-      requiresTermsConsent: true,
+      method: "click",
     },
   },
   {

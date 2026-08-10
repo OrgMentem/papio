@@ -1,19 +1,23 @@
-<!-- papio-fixture: SYNTHETIC drift case. The entitled-PDF meta is renamed
-     (citation_pdf_url -> citation_pdf_link), so the article rule must fail
-     closed to unknown rather than guess a download it cannot verify. -->
+<!-- papio-fixture: SYNTHETIC drift case. The entitled ViewPDF container is
+     renamed, so the article rule must fail closed to unknown rather than guess
+     among the related-paper PDF links elsewhere in a real page. -->
 <!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="citation_title" content="Deep residual learning for image recognition" />
-    <meta name="citation_journal_title" content="Artificial Intelligence" />
     <meta
-      name="citation_pdf_link"
-      content="https://www.sciencedirect.com/science/article/pii/S0004370221000000/pdfft?md5=abc123def456&pid=main.pdf"
+      name="citation_title"
+      content="Student motivation and need satisfaction in GenAI-supported classrooms: A self-determination theory perspective"
     />
-    <title>Deep residual learning for image recognition - ScienceDirect</title>
+    <title>Student motivation and need satisfaction - ScienceDirect</title>
   </head>
   <body>
-    <h1>Deep residual learning for image recognition</h1>
+    <div class="accessbar">
+      <ul>
+        <li class="PDFViewer">
+          <a class="accessbar-utility-link" href="/science/article/pii/S2666557326000194/pdfft">View PDF</a>
+        </li>
+      </ul>
+    </div>
   </body>
 </html>

@@ -371,9 +371,9 @@ export function wirePageBulkScanLauncher(
 
 export const OPEN_HANDOFF_MESSAGE = "papio.handoff.open";
 
-/** Ask the background broker to surface the tab it already owns for this job.
- * The job id is the only handoff detail a popup may send; resolver URLs remain
- * inside the extension so a popup cannot accidentally disclose a signed link. */
+/** Ask the background broker to focus an owned tab or open a freshly minted
+ * handoff. The popup sends only a job id; resolver URLs never cross the runtime
+ * page boundary or become popup state. */
 export async function openHandoff(jobID: string): Promise<void> {
   const response: unknown = await chrome.runtime.sendMessage({
     type: OPEN_HANDOFF_MESSAGE,
@@ -387,7 +387,19 @@ export async function openHandoff(jobID: string): Promise<void> {
   ) {
     return;
   }
-  throw new Error("Could not focus the institutional sign-in");
+  const error =
+    typeof response === "object" && response !== null
+      ? (response as Record<string, unknown>)["error"]
+      : undefined;
+  const rawMessage =
+    typeof error === "object" && error !== null
+      ? (error as Record<string, unknown>)["message"]
+      : undefined;
+  const message =
+    typeof rawMessage === "string" && rawMessage.trim().length > 0
+      ? rawMessage.trim().slice(0, 1000)
+      : "Could not open institutional access";
+  throw new Error(message);
 }
 
 export type PopupSessionState = KeepaliveSnapshot & {
@@ -1095,6 +1107,14 @@ function renderWaitingOnSignIn(
   }
 
   list.replaceChildren();
+  const heading = doc.getElementById("institution-session-waiting-heading");
+  if (heading instanceof HTMLElement) {
+    heading.textContent = jobs.some(
+      (job) => job.engagement_required === true && job.tab_id < 0,
+    )
+      ? "Open institutional access"
+      : "Waiting on your sign-in";
+  }
   waiting.hidden = jobs.length === 0;
   if (jobs.length === 0) {
     if (card.dataset.hasSession !== "true") card.hidden = true;
@@ -1126,25 +1146,39 @@ function renderWaitingOnSignIn(
       list.append(row);
       continue;
     }
+    const copy = doc.createElement("div");
+    copy.className = "institution-session-origin-copy";
+    const failure = doc.createElement("p");
+    failure.className = "institution-session-waiting-status";
+    failure.hidden = true;
+    copy.append(paper, failure);
     const button = doc.createElement("button");
     button.className = "ghost";
     button.type = "button";
-    button.textContent = "Focus";
+    const actionLabel = job.engagement_required === true && job.tab_id < 0 ? "Open" : "Focus";
+    button.textContent = actionLabel;
     button.addEventListener("click", () => {
       button.disabled = true;
-      button.textContent = "Focusing…";
+      button.textContent = actionLabel === "Open" ? "Opening…" : "Focusing…";
       void onFocus(job.job_id).then(
         () => {
+          failure.hidden = true;
+          failure.textContent = "";
           button.disabled = false;
-          button.textContent = "Focus";
+          button.textContent = actionLabel;
         },
-        () => {
+        (error: unknown) => {
+          failure.textContent =
+            error instanceof Error && error.message.trim().length > 0
+              ? error.message
+              : "Institutional access could not be opened";
+          failure.hidden = false;
           button.disabled = false;
           button.textContent = "Try again";
         },
       );
     });
-    row.append(paper, button);
+    row.append(copy, button);
     list.append(row);
   }
 }
@@ -1174,7 +1208,9 @@ export function renderNeedsAttention(
     return;
   }
   const pending = jobs.filter(
-    (job) => job.status === "auth_pending" && job.challenge_blocked !== true,
+    (job) =>
+      (job.status === "auth_pending" || job.engagement_required === true) &&
+      job.challenge_blocked !== true,
   );
   renderWaitingOnSignIn(doc, pending, onFocus);
   const challengeJobs = jobs.filter(
@@ -2248,7 +2284,12 @@ export function wireDevTools(
   wireCapture(doc);
 }
 
-if (typeof document !== "undefined" && typeof chrome !== "undefined") {
+if (
+  typeof document !== "undefined" &&
+  typeof chrome !== "undefined" &&
+  typeof chrome.storage?.local?.get === "function" &&
+  (chrome.storage.session === undefined || typeof chrome.storage.session.get === "function")
+) {
   renderPageAcquire(document);
   wireDevTools();
   wireSettings();

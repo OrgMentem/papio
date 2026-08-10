@@ -465,6 +465,79 @@ test("merges auth-pending paper rows into the institution session card", async (
   expect(session?.hidden).toBe(true);
 });
 
+test("a cold institutional handoff renders an explicit Open action", async () => {
+  const doc = popupDocument();
+  const opened: string[] = [];
+  renderNeedsAttention(
+    doc,
+    [
+      job({
+        job_id: "job-cold-institution",
+        tab_id: -1,
+        status: "queued",
+        requires_auth: true,
+        engagement_required: true,
+        expected: { title: "A paper needing institutional access" },
+      }),
+    ],
+    [],
+    async (jobID) => {
+      opened.push(jobID);
+    },
+  );
+
+  const waiting = doc.getElementById("institution-session-waiting");
+  expect(waiting?.hidden).toBe(false);
+  expect(doc.getElementById("institution-session-waiting-heading")?.textContent).toBe(
+    "Open institutional access",
+  );
+  const button = waiting?.querySelector("button") as HTMLButtonElement;
+  expect(button.textContent).toBe("Open");
+  button.click();
+  expect(button.textContent).toBe("Opening…");
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(opened).toEqual(["job-cold-institution"]);
+  expect(button.disabled).toBe(false);
+  expect(button.textContent).toBe("Open");
+});
+
+test("a cold engagement failure displays its structured reason", async () => {
+  const doc = popupDocument();
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        sendMessage: async () => ({
+          ok: false,
+          error: {
+            code: "missing_claim",
+            message: "The handoff is missing institution identity metadata",
+          },
+        }),
+      },
+    },
+  });
+  renderNeedsAttention(doc, [
+    job({
+      job_id: "job-cold-invalid",
+      tab_id: -1,
+      status: "queued",
+      requires_auth: true,
+      engagement_required: true,
+    }),
+  ]);
+
+  const waiting = doc.getElementById("institution-session-waiting");
+  const button = waiting?.querySelector("button") as HTMLButtonElement;
+  button.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(button.textContent).toBe("Try again");
+  const failure = waiting?.querySelector(".institution-session-waiting-status") as HTMLElement;
+  expect(failure.hidden).toBe(false);
+  expect(failure.textContent).toBe("The handoff is missing institution identity metadata");
+});
+
 test("a waiting_for_session paper renders no Focus action and distinct copy, unlike a plain auth_pending paper", () => {
   const doc = popupDocument();
   const focused: string[] = [];
@@ -498,7 +571,9 @@ test("a waiting_for_session paper renders no Focus action and distinct copy, unl
   );
   const ownButton = ownRow.querySelector("button") as HTMLButtonElement;
   expect(ownButton.textContent).toBe("Focus");
-  expect(ownRow.querySelector(".institution-session-waiting-status")).toBeNull();
+  const ownStatus = ownRow.querySelector(".institution-session-waiting-status") as HTMLElement;
+  expect(ownStatus.hidden).toBe(true);
+  expect(ownStatus.textContent).toBe("");
   ownButton.click();
   expect(focused).toEqual(["job-own-signin"]);
 

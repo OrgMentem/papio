@@ -14,11 +14,18 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
-## [Unreleased]
-
-## [0.12.0] - 2026-08-08
+## [0.12.0] - 2026-08-09
 
 ### Added
+
+- **Institutional sign-in now starts only when you click Open.** A cold
+  `handoff_link_v1` offer stays tabless in the inbox and popup; that explicit
+  click reserves the institution's one shared login claim, asks the daemon for
+  a fresh route, and creates exactly one managed tab. Concurrent papers focus
+  or wait behind the same sign-in instead of opening duplicate IdP tabs.
+  One-use routes are discarded at tab materialization and never enter browser
+  storage or the managed-tab ledger. Worker restarts recover the live tab,
+  claim, and completed login-wall landing without persisting the entity ID.
 
 - **Inbox: "downloads access required" items.** When the daemon cannot read
   the Downloads adoption folder (macOS privacy consent), the inbox shows a
@@ -151,6 +158,18 @@ for the full pre-split extension history.
   disconnected, above ten rows frozen on "Checking availability…". Failures
   now come back as papio's own sentence, including for runtime errors the
   extension does not recognise.
+- **Heartbeat triage counts negotiate the daemon's advertised schema again.**
+  The extension had started sending triage-snapshot schema versions on the
+  separate counts request, then rejected its own frame before native messaging
+  could send it. Keepalive refreshes now request counts schema 2 only when the
+  daemon advertises that capability, preserving badge and inbox refreshes
+  across compatible daemon versions.
+- **Entitled ScienceDirect pages no longer fall through to `ui_changed` or
+  download Cookie Notice HTML.** The live article layout exposes its PDF
+  through the primary access-bar link, not the `citation_pdf_url` metadata the
+  adapter expected. Papio now recognizes and activates that exact article
+  control, then adopts the PDF viewer ScienceDirect opens, without confusing
+  related-paper PDF links for the requested work.
 - **PDF-grab status pulls reached no handler in a built extension.** The
   message type was missing from the dispatcher's accepted list, so a reopened
   grab workspace could never recover its state from the daemon. The list and

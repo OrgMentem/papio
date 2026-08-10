@@ -8,12 +8,17 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records kept during the initial build.
 
-
-## [Unreleased]
-
-## [0.20.0] - 2026-08-08
+## [0.20.0] - 2026-08-09
 
 ### Added
+
+- **Fresh, click-time institutional handoff links.** The browser bridge now
+  advertises `handoff_link_v1` and answers a correlated request only while the
+  named job is still `awaiting_human` with an open `openurl_handoff` action.
+  Each response rebuilds the route from current configuration, so a cold offer
+  no longer depends on a signed resolver URL that may have expired while it
+  waited in the inbox. Routine misses are structured outcomes and never tear
+  down the native-messaging session.
 
 - **A delivery request stranded before submission recovers itself.** Nothing
   ever retried a row left in `offered`: the status poller only follows live

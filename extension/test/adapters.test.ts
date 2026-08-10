@@ -662,6 +662,24 @@ test("Taylor and Francis still needs a rendered access badge, not just a PDF lin
   expect(interpret(page, spec, ctx()).kind).toBe("unknown");
 });
 
+const sciencedirectArticle = loadFixture("sciencedirect", "success");
+test.skipIf(sciencedirectArticle === null)(
+  "captured ScienceDirect article uses its primary PDF control despite the cookie overlay",
+  () => {
+    const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+    const page = sciencedirectArticle as Document;
+    // The live page that exposed the production failure has no
+    // citation_pdf_url and keeps OneTrust visible. Its article-specific access
+    // bar link, not a related-paper PDF link, is the positive entitlement
+    // signal and download source.
+    expect(page.querySelector("meta[name='citation_pdf_url']")).toBeNull();
+    expect(page.querySelector("#onetrust-banner-sdk")).not.toBeNull();
+    expect(page.querySelector(spec.download?.selector as string)).not.toBeNull();
+    expect(interpret(page, spec, ctx()).kind).toBe("article");
+    expect(spec.download?.method).toBe("click");
+  },
+);
+
 const sciencedirectPaywall = loadFixture("sciencedirect", "no-entitlement");
 test.skipIf(sciencedirectPaywall === null)(
   "captured ScienceDirect purchase wall reports no entitlement, not a coverage gap",
@@ -679,9 +697,11 @@ test.skipIf(sciencedirectPaywall === null)(
 test("an entitled ScienceDirect page still wins over the purchase-wall rule", () => {
   const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
   const page = parseHTML(
-    "<html><head><meta name='citation_pdf_url' content='https://www.sciencedirect.com/x.pdf'>" +
-      "<meta name='citation_title' content='A paper'></head>" +
-      "<body><div class='accessbar'><div class='PurchasePDF'>Purchase PDF</div></div></body></html>",
+    "<html><head><meta name='citation_title' content='A paper'></head>" +
+      "<body><div class='accessbar'><ul>" +
+      "<li class='ViewPDF'><a class='accessbar-utility-link' href='/science/article/pii/S1/pdfft'>View PDF</a></li>" +
+      "<li class='PurchasePDF'>Purchase PDF</li>" +
+      "</ul></div></body></html>",
   );
   expect(interpret(page, spec, ctx()).kind).toBe("article");
 });

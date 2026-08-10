@@ -3013,17 +3013,48 @@ type OpenHandoffJob struct {
 // indexed scalar lookups so the returned rows remain complete without a
 // follow-up query per job.
 func (js *Store) ListOpenHandoffJobs(ctx context.Context) ([]OpenHandoffJob, error) {
-	rows, _, err := js.listOpenHandoffJobs(ctx, 0, false)
+	rows, _, err := js.listOpenHandoffJobs(ctx, "", 0, false)
 	return rows, err
 }
 
 // ListOpenHandoffJobsPage returns one bounded oldest-first page of open
 // institutional handoffs and whether another page exists behind it.
 func (js *Store) ListOpenHandoffJobsPage(ctx context.Context, limit int) ([]OpenHandoffJob, bool, error) {
-	return js.listOpenHandoffJobs(ctx, EffectiveListLimit(limit), true)
+	return js.listOpenHandoffJobs(ctx, "", EffectiveListLimit(limit), true)
 }
 
-func (js *Store) listOpenHandoffJobs(ctx context.Context, limit int, probe bool) ([]OpenHandoffJob, bool, error) {
+// WithOpenHandoffJob holds the store's sole database connection while fn
+// inspects one currently authorized institutional handoff. State transitions
+// and action resolution cannot interleave between the conditional read and
+// the caller constructing its response.
+func (js *Store) WithOpenHandoffJob(ctx context.Context, jobID string, fn func(OpenHandoffJob) error) error {
+	tx, err := js.S.DB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, _, err := js.queryOpenHandoffJobs(ctx, tx, jobID, 1, false)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return sql.ErrNoRows
+	}
+	if err := fn(rows[0]); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type handoffQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func (js *Store) listOpenHandoffJobs(ctx context.Context, jobID string, limit int, probe bool) ([]OpenHandoffJob, bool, error) {
+	return js.queryOpenHandoffJobs(ctx, js.S.DB(), jobID, limit, probe)
+}
+
+func (js *Store) queryOpenHandoffJobs(ctx context.Context, queryer handoffQueryer, jobID string, limit int, probe bool) ([]OpenHandoffJob, bool, error) {
 	fetch := limit
 	if probe && limit > 0 {
 		fetch++
@@ -3045,14 +3076,18 @@ func (js *Store) listOpenHandoffJobs(ctx context.Context, limit int, probe bool)
 		FROM human_actions ha
 		JOIN jobs j ON j.id = ha.job_id
 		JOIN work_requests w ON w.id = j.work_request_id
-		WHERE ha.status = 'open' AND ha.kind = 'openurl_handoff' AND j.state = 'awaiting_human'
-		ORDER BY j.created_at ASC, j.id ASC, ha.id ASC`
+		WHERE ha.status = 'open' AND ha.kind = 'openurl_handoff' AND j.state = 'awaiting_human'`
 	var args []any
+	if jobID != "" {
+		query += ` AND j.id = ?`
+		args = append(args, jobID)
+	}
+	query += ` ORDER BY j.created_at ASC, j.id ASC, ha.id ASC`
 	if fetch > 0 {
 		query += ` LIMIT ?`
 		args = append(args, fetch)
 	}
-	result, err := js.S.DB().QueryContext(ctx, query, args...)
+	result, err := queryer.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, false, err
 	}

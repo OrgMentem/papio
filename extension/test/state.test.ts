@@ -74,11 +74,11 @@ test("pending delivery reducers replace, patch, and clear only the matching job"
 test("waiting-for-session persistence stores only the opaque claim digest", async () => {
   const origin = "https://login.idp.example.edu";
   const entityID = "https://idp.example.edu/entity";
-  const digest = await federatedLoginClaimKey(origin, entityID);
+  const digest = await federatedLoginClaimKey(entityID);
   const store = upsertJob(
     {
       ...emptyStore(),
-      federatedLoginOwners: { [digest]: { jobID: "job_00000001", tabID: 100 } },
+      federatedLoginOwners: { [digest]: { jobID: "job_00000001", tabID: 100, phase: "auth" } },
     },
     job({ waiting_for_session: true, waiting_for_session_key: digest }),
   );
@@ -86,4 +86,12 @@ test("waiting-for-session persistence stores only the opaque claim digest", asyn
   expect(persisted).toContain(digest);
   expect(persisted).not.toContain(origin);
   expect(persisted).not.toContain(entityID);
+});
+
+test("institution claim key is versioned and origin-independent", async () => {
+  const entityID = "https://idp.example.edu/entity";
+  const first = await federatedLoginClaimKey(entityID);
+  const second = await federatedLoginClaimKey(entityID);
+  expect(first).toBe(second);
+  expect(first).toMatch(/^v2:[0-9a-f]{64}$/);
 });

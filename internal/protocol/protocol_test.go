@@ -1255,6 +1255,97 @@ func TestDeliveryReconcilePayloadRoundTripsAndValidates(t *testing.T) {
 	}
 }
 
+func TestHandoffLinkRejectsInvalidWireShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		typ     string
+		payload map[string]any
+	}{
+		{
+			name: "request",
+			typ:  MsgHandoffLinkRequest,
+			payload: map[string]any{
+				"request_id": "", "job_id": "job_handoff_0001",
+			},
+		},
+		{
+			name: "request with noncanonical request id",
+			typ:  MsgHandoffLinkRequest,
+			payload: map[string]any{
+				"Request_ID": "handoff-request-001", "job_id": "job_handoff_0001",
+			},
+		},
+		{
+			name: "request with case-colliding job id",
+			typ:  MsgHandoffLinkRequest,
+			payload: map[string]any{
+				"job_id": "job_handoff_0001", "Job_ID": "job_handoff_0002",
+			},
+		},
+		{
+			name: "result",
+			typ:  MsgHandoffLinkResult,
+			payload: map[string]any{
+				"request_id": "", "outcome": "unavailable", "detail": "not available",
+			},
+		},
+		{
+			name: "result with noncanonical request id",
+			typ:  MsgHandoffLinkResult,
+			payload: map[string]any{
+				"Request_ID": "handoff-request-001", "outcome": "unavailable", "detail": "not available",
+			},
+		},
+		{
+			name: "result with case-colliding outcome",
+			typ:  MsgHandoffLinkResult,
+			payload: map[string]any{
+				"outcome": "unavailable", "Outcome": "opened", "detail": "not available",
+			},
+		},
+		{
+			name: "result with noncanonical URL",
+			typ:  MsgHandoffLinkResult,
+			payload: map[string]any{
+				"request_id": "handoff-request-001", "outcome": "opened",
+				"URL": "https://resolver.example.edu/openurl",
+			},
+		},
+		{
+			name: "result with noncanonical detail",
+			typ:  MsgHandoffLinkResult,
+			payload: map[string]any{
+				"request_id": "handoff-request-001", "outcome": "unavailable",
+				"Detail": "not available",
+			},
+		},
+		{
+			name: "result with raw space in URL",
+			typ:  MsgHandoffLinkResult,
+			payload: map[string]any{
+				"request_id": "handoff-request-001", "outcome": "opened",
+				"url": "https://resolver.example.edu/openurl?title=A Paper",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frame, err := json.Marshal(map[string]any{
+				"protocol": BrowserProtocolVersion,
+				"type":     tc.typ,
+				"msg_id":   "handoff-empty-request-id",
+				"seq":      1,
+				"payload":  tc.payload,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeBrowserMessage(frame); err == nil {
+				t.Fatal("invalid handoff link frame was accepted")
+			}
+		})
+	}
+}
+
 // TestEntitlementWireShapeIsCaseInsensitive pins the fail-open a review found
 // in the guard itself. encoding/json matches struct fields case-insensitively,
 // so `"Entitlement": null` populates the decoded struct — while a raw map

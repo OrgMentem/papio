@@ -688,8 +688,13 @@ func (b *Bridge) repairAdapterUpgradeParks(ctx context.Context) {
 	if b.svc == nil {
 		return
 	}
-	if err := b.svc.HandoffRepairer().RepairAdapterUpgrade(ctx, b.holder.ExtensionVersion, extensionVersionNewer); err != nil {
-		log.Printf("papio: repairing provider parks after extension upgrade: %v", err)
+	if err := b.svc.HandoffRepairer().RepairAdapterUpgrade(
+		ctx,
+		b.holder.ExtensionVersion,
+		b.holder.AdapterVersions,
+		extensionVersionNewer,
+	); err != nil {
+		log.Printf("papio: repairing provider parks after adapter upgrade: %v", err)
 	}
 }
 
@@ -1052,42 +1057,54 @@ func (b *Bridge) handoffLink(ctx context.Context, request *protocol.HandoffLinkR
 	if b.jobs == nil {
 		return result("unavailable", "handoff links are temporarily unavailable", "")
 	}
-	row, err := b.jobs.Get(ctx, request.JobID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return result("job_gone", "the requested job is no longer available", "")
-	}
-	if err != nil {
-		return result("unavailable", "handoff links are temporarily unavailable", "")
-	}
-	if row.State != job.StateAwaitingHuman {
-		return result("not_open_action", "the job is no longer awaiting a handoff", "")
-	}
-	actions, err := b.jobs.ListHumanActions(ctx, true)
-	if err != nil {
-		return result("unavailable", "handoff links are temporarily unavailable", "")
-	}
-	var action *job.HumanAction
-	for i := range actions {
-		if actions[i].JobID == request.JobID && actions[i].Kind == handoffActionKind {
-			action = &actions[i]
-			break
+	var authorized []json.RawMessage
+	var frameErr error
+	var frameOutcome, frameDetail, frameTarget string
+	err := b.jobs.WithOpenHandoffJob(ctx, request.JobID, func(open job.OpenHandoffJob) error {
+		setResult := func(outcome, detail, target string) error {
+			frameOutcome, frameDetail, frameTarget = outcome, detail, target
+			authorized, frameErr = result(outcome, detail, target)
+			return frameErr
 		}
+		target, ok := app.ResolveHumanActionURL(open.Action, open.Row, b.cfg.InstitutionFor)
+		if !ok {
+			return setResult("not_openurl", "no usable handoff URL is configured for this job", "")
+		}
+		if len(target) == 0 || len(target) > 4000 {
+			return setResult("unavailable", "the generated handoff URL is unavailable", "")
+		}
+		parsed, parseErr := url.ParseRequestURI(target)
+		if parseErr != nil || parsed.Scheme != "https" || parsed.Host == "" {
+			return setResult("unavailable", "the generated handoff URL is unavailable", "")
+		}
+		return setResult("opened", "", target)
+	})
+	if err == nil {
+		return authorized, nil
 	}
-	if action == nil {
+	if frameErr != nil {
+		// Keep frame construction inside the authorization transaction so an
+		// action cannot close before an "opened" response exists. Rebuilding
+		// only the already-failed frame here preserves the direct frame-builder
+		// error shape pinned by failclosed_test; no response can escape.
+		return result(frameOutcome, frameDetail, frameTarget)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		// A second read exists only to make routine refusal copy precise; it
+		// can never mint a URL.
+		row, getErr := b.jobs.Get(ctx, request.JobID)
+		if errors.Is(getErr, sql.ErrNoRows) {
+			return result("job_gone", "the requested job is no longer available", "")
+		}
+		if getErr != nil {
+			return result("unavailable", "handoff links are temporarily unavailable", "")
+		}
+		if row.State != job.StateAwaitingHuman {
+			return result("not_open_action", "the job is no longer awaiting a handoff", "")
+		}
 		return result("not_open_action", "the job has no open handoff action", "")
 	}
-	target, ok := app.ResolveHumanActionURL(*action, *row, b.cfg.InstitutionFor)
-	if !ok {
-		return result("not_openurl", "no usable handoff URL is configured for this job", "")
-	}
-	if len(target) == 0 || len(target) > 4000 {
-		return result("unavailable", "the generated handoff URL is unavailable", "")
-	}
-	parsed, parseErr := url.ParseRequestURI(target)
-	if parseErr != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		return result("unavailable", "the generated handoff URL is unavailable", "")
-	}
-	return result("opened", "", target)
+	return result("unavailable", "handoff links are temporarily unavailable", "")
 }
 
 // pageCapture treats diagnostic content failures as local losses: disconnecting
@@ -3327,12 +3344,16 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 	if b.holder != nil {
 		sourceExtensionVersion = b.holder.ExtensionVersion
 	}
-	if err := b.jobs.RecordEvent(ctx, jobID, "browser.provider_outcome", map[string]any{
+	detail := map[string]any{
 		"outcome":           p.Outcome,
 		"adapter_version":   p.AdapterVersion,
 		"detail":            p.Detail,
 		"extension_version": sourceExtensionVersion,
-	}); err != nil {
+	}
+	if p.AdapterID != "" {
+		detail["adapter_id"] = p.AdapterID
+	}
+	if err := b.jobs.RecordEvent(ctx, jobID, "browser.provider_outcome", detail); err != nil {
 		return err
 	}
 	switch p.Outcome {
