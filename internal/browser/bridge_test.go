@@ -3631,6 +3631,143 @@ func TestProviderOutcomeRecordsAdapterDiagnostics(t *testing.T) {
 	}
 }
 
+func countJobOffersFor(msgs []*protocol.BrowserMessage, jobID string) int {
+	n := 0
+	for _, msg := range msgs {
+		if msg.Type == protocol.MsgJobOffer && msg.JobID == jobID {
+			n++
+		}
+	}
+	return n
+}
+
+func latchEvents(t *testing.T, jobs *job.Store, id string) []map[string]any {
+	t.Helper()
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []map[string]any
+	for _, event := range events {
+		if event["kind"] == providerLatchEventKind {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
+func TestProviderWrongWorkLatchBlocksAutomaticBrowserOffer(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_latch_wrong_work", handoffWork())
+	runSync(t, b, helloWithAdapterVersions(t, "1.0.0", map[string]string{"sage": "1.0.0"}))
+	runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{
+		"outcome": "wrong_work", "adapter_id": "sage", "adapter_version": "1.0.0",
+	}))
+	latches := latchEvents(t, jobs, id)
+	if len(latches) != 1 {
+		t.Fatalf("latch events = %d, want 1", len(latches))
+	}
+	detail, _ := latches[0]["detail"].(map[string]any)
+	if detail["kind"] != "no_positive_effects" || detail["safety_domain"] != "sage" {
+		t.Fatalf("wrong-work latch = %#v", detail)
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available again", job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	delete(b.offered, id)
+	msgs, _ := runSync(t, b)
+	if got := countJobOffersFor(msgs, id); got != 0 {
+		t.Fatalf("latched wrong-work job offers = %d, want 0", got)
+	}
+}
+
+func TestProviderDriftLatchAllowsNewerAdapterRevision(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_latch_drift", handoffWork())
+	if err := jobs.RecordEvent(ctx, id, "browser.page_capture", map[string]any{
+		"host": "sagepub.com", "adapter_id": "sage", "adapter_version": "1.0.0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, helloWithAdapterVersions(t, "1.0.0", map[string]string{"sage": "1.0.0"}))
+	runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{
+		"outcome": "ui_changed", "adapter_id": "sage", "adapter_version": "1.0.0",
+	}))
+	latches := latchEvents(t, jobs, id)
+	if len(latches) != 1 {
+		t.Fatalf("latch events = %d, want 1", len(latches))
+	}
+	detail, _ := latches[0]["detail"].(map[string]any)
+	if detail["kind"] != "drift" || detail["safety_domain"] != "sage" ||
+		detail["adapter_id"] != "sage" || detail["adapter_version"] != "1.0.0" ||
+		detail["host"] != "sagepub.com" {
+		t.Fatalf("drift latch = %#v", detail)
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available again", job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	delete(b.offered, id)
+	msgs, _ := runSync(t, b)
+	if got := countJobOffersFor(msgs, id); got != 0 {
+		t.Fatalf("same-revision drifted job offers = %d, want 0", got)
+	}
+	b.holder.AdapterVersions["sage"] = "1.1.0"
+	delete(b.offered, id)
+	msgs, _ = runSync(t, b)
+	if got := countJobOffersFor(msgs, id); got != 1 {
+		t.Fatalf("newer-revision drifted job offers = %d, want 1", got)
+	}
+}
+
+func TestProviderOutcomeLatchIsIdempotentAndSurvivesBridgeRestart(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_latch_restart", handoffWork())
+	p := &protocol.ProviderOutcomePayload{
+		Outcome: "ui_changed", AdapterID: "sage", AdapterVersion: "1.0.0",
+	}
+	if err := b.outcome(ctx, id, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.outcome(ctx, id, p); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(latchEvents(t, jobs, id)); got != 1 {
+		t.Fatalf("duplicate outcome latch events = %d, want 1", got)
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, "handoff available again", job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	b2 := NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+	runSync(t, b2, helloWithAdapterVersions(t, "1.0.0", map[string]string{"sage": "1.0.0"}))
+	delete(b2.offered, id)
+	msgs, _ := runSync(t, b2)
+	if got := countJobOffersFor(msgs, id); got != 0 {
+		t.Fatalf("restart re-offered latched job %d times, want 0", got)
+	}
+}
+
+func TestProviderLatchDoesNotAffectUnrelatedJob(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	latchedID := park(t, jobs, "wr_latch_scoped", handoffWork())
+	otherID := park(t, jobs, "wr_latch_other", work.Work{DOI: "10.1002/other.43", Title: "Another Paper"})
+	if err := b.recordProviderLatch(ctx, latchedID, &protocol.ProviderOutcomePayload{
+		Outcome: "wrong_work", AdapterID: "sage", AdapterVersion: "1.0.0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := runSync(t, b, helloWithAdapterVersions(t, "1.0.0", map[string]string{"sage": "1.0.0"}))
+	if got := countJobOffersFor(msgs, latchedID); got != 0 {
+		t.Fatalf("latched job offers = %d, want 0", got)
+	}
+	if got := countJobOffersFor(msgs, otherID); got != 1 {
+		t.Fatalf("unrelated job offers = %d, want 1", got)
+	}
+}
+
 func manualProviderUpgradePark(t *testing.T, jobs *job.Store, requestID, extensionVersion string) string {
 	t.Helper()
 	ctx := context.Background()

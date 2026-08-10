@@ -7,7 +7,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 
-import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
+import { parseBrowserMessage, type BrowserMessage, type PageCapturePayload } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
 import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
 import { KeepaliveManager, type FreshSessionEvidence, type KeepaliveAPI } from "../src/keepalive";
@@ -22,6 +22,8 @@ import {
   INBOX_RUNTIME_MESSAGE_TYPES,
   needsVisibleWindow,
   normalizeManagedTabURL,
+  normalizeExpectedDOI,
+  readCitationDOI,
   isBotChallenge,
   isRedirectLoopPage,
   assessDrivenPage,
@@ -292,6 +294,8 @@ function makeHarness(
     windows?: boolean;
     workWindowEnabled?: boolean;
     firefox?: boolean;
+    firefoxVersion?: string;
+    captureConsent?: boolean;
     tabGroups?: boolean;
     handoffSurface?: "in-window" | "work-window" | "tab-group";
   },
@@ -374,8 +378,8 @@ function makeHarness(
     },
     downloads,
     // No registered adapters and no granted host: these behavioural tests stay
-    // entirely in assisted mode, so the classifier never fires. Adapter mapping
-    // is covered in adapters.test.ts.
+    // out of the adapter action path. Adapter mapping is covered in
+    // adapters.test.ts.
     adapterSpecs: [],
     scripting: { executeScript: async () => [] },
     permissions: { contains: async () => false },
@@ -384,6 +388,17 @@ function makeHarness(
       setTermsConsent: async () => {},
       getHandoffSurface: async () =>
         opts?.handoffSurface ?? (opts?.workWindowEnabled === false ? "in-window" : "work-window"),
+    },
+    ...(opts?.firefox === true
+      ? {
+          browserInfo: async () => ({
+            name: "Firefox",
+            version: opts.firefoxVersion ?? "128.0",
+          }),
+        }
+      : {}),
+    captureConsent: {
+      get: async () => opts?.captureConsent === true,
     },
     ...(windows !== undefined ? { windows } : {}),
     ...(tabGroups !== undefined ? { tabGroups } : {}),
@@ -411,7 +426,7 @@ function makeHarness(
   };
 }
 
-function jobOffer(jobID: string, openurl = OPENURL): unknown {
+function jobOffer(jobID: string, openurl = OPENURL, accessMode: "assisted" | "delegated" = "delegated"): unknown {
   return {
     protocol: "papio-browser/1",
     type: "job_offer",
@@ -421,7 +436,7 @@ function jobOffer(jobID: string, openurl = OPENURL): unknown {
     payload: {
       openurl,
       provider_hosts: [PROVIDER_HOST],
-      access_mode: "assisted",
+      access_mode: accessMode,
       expires_at: EXPIRES,
     },
   };
@@ -7702,4 +7717,220 @@ test("runtime message registry stays equal to the handler type chain", () => {
   );
   expect(handlerTypes).toContain("papio.pageBulk.grabStatus");
   expect(new Set<string>(INBOX_RUNTIME_MESSAGE_TYPES)).toEqual(handlerTypes);
+});
+
+async function pageCapturePayload(): Promise<PageCapturePayload> {
+  const encoded = await encodePageCapture(
+    sanitizeFixture("<html><body>provider failure</body></html>", {
+      provider: "example",
+      scenario: "observed",
+      originNoQuery: "https://provider.example/failure",
+      capturedISO: "2026-01-01T00:00:00.000Z",
+    }),
+    { host: "provider.example", scenario: "observed" },
+  );
+  if (!encoded.ok) throw new Error(encoded.error);
+  return encoded.payload;
+}
+
+test("Firefox 128 suppresses page_capture transmission until consent", async () => {
+  const h = makeHarness(undefined, { firefox: true, captureConsent: false });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+  expect(await h.bridge.sendPageCapture(await pageCapturePayload())).toBe(false);
+  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(0);
+});
+
+test("Firefox 128 transmits page_capture after stored consent", async () => {
+  const h = makeHarness(undefined, { firefox: true, captureConsent: true });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+  expect(await h.bridge.sendPageCapture(await pageCapturePayload())).toBe(true);
+  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(1);
+});
+
+test("Chrome keeps page_capture transmission always on", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+  expect(await h.bridge.sendPageCapture(await pageCapturePayload())).toBe(true);
+  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(1);
+});
+test("assisted offers block every papio-initiated download path", async () => {
+  for (const method of ["click", "url", "meta", "href"] as const) {
+    const h = makeHarness();
+    const adapter: AdapterSpec = {
+      id: `assisted-${method}`,
+      version: "1.0.0",
+      hosts: [PROVIDER_HOST],
+      classify: [{ kind: "article", any: ["article"] }],
+      download:
+        method === "click"
+          ? { selector: "button.download", requireKind: "article", method }
+          : method === "url"
+            ? {
+                selector: "a.download",
+                requireKind: "article",
+                method,
+                idPattern: "stable/([^/]+)",
+                urlTemplate: "https://download.example/{1}.pdf",
+              }
+            : { selector: "a.download", requireKind: "article", method, ...(method === "meta" ? { metaName: "citation_pdf_url" } : {}) },
+    };
+    h.deps.adapterSpecs.push(adapter);
+    h.deps.permissions.contains = async () => true;
+    h.deps.scripting.executeScript = async (injection) => {
+      if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+      if (injection.func === interpret) {
+        return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+      }
+      return [{ result: method === "click" ? true : `https://${PROVIDER_HOST}/download/paper.pdf` }];
+    };
+    await h.bridge.start();
+    await h.port.inbound(jobOffer(`job_assisted_${method}`, OPENURL, "assisted"));
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
+    expect(h.downloads.started).toHaveLength(0);
+    expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
+  }
+});
+
+test("assisted direct-file offers park for a human handoff instead of initiating a download", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    jobOffer("job_assisted_direct", `https://${PROVIDER_HOST}/content/pdf/paper.pdf`, "assisted"),
+  );
+  expect(h.downloads.started).toHaveLength(0);
+  expect(h.tabs.created).toHaveLength(0);
+  expect(h.backend.store.activeJobs[0]?.access_mode).toBe("assisted");
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(-1);
+});
+
+test("delegated article offers retain automatic download behavior", async () => {
+  const h = makeHarness();
+  const adapter: AdapterSpec = {
+    id: "delegated-url",
+    version: "1.0.0",
+    hosts: [PROVIDER_HOST],
+    classify: [{ kind: "article", any: ["article"] }],
+    download: {
+      selector: "a.download",
+      requireKind: "article",
+      method: "url",
+      idPattern: "stable/([^/]+)",
+      urlTemplate: "https://download.example/{1}.pdf",
+    },
+  };
+  h.deps.adapterSpecs.push(adapter);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === interpret) {
+      return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+    }
+    return [{ result: "https://download.example/paper.pdf" }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_delegated_url", OPENURL, "delegated"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
+  expect(h.downloads.started).toHaveLength(1);
+});
+
+test("assisted jobs still adopt a human-initiated download", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_assisted_human", OPENURL, "assisted"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.downloads.onCreated.emit({
+    id: 81,
+    tabId: tabID,
+    url: `https://${PROVIDER_HOST}/download/paper.pdf`,
+    state: "in_progress",
+  });
+  h.downloads.items.set(81, {
+    id: 81,
+    tabId: tabID,
+    filename: "/Users/x/Downloads/paper.pdf",
+    fileSize: 91,
+    mime: "application/pdf",
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 81, state: { current: "complete" } });
+  expect(h.frames().some((frame) => frame.type === "download_complete" && frame.job_id === "job_assisted_human")).toBe(true);
+});
+
+test("expected DOI mismatch reports wrong_work before any automatic download", async () => {
+  const h = makeHarness();
+  const adapter: AdapterSpec = {
+    id: "doi-mismatch",
+    version: "2.0.0",
+    hosts: [PROVIDER_HOST],
+    classify: [{ kind: "article", any: ["article"] }],
+    download: { selector: "a.download", requireKind: "article", method: "href" },
+  };
+  h.deps.adapterSpecs.push(adapter);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === interpret) {
+      return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+    }
+    if (injection.func === readCitationDOI) return [{ result: "DOI: 10.1000/other" }];
+    return [{ result: "https://download.example/paper.pdf" }];
+  };
+  const offer = jobOffer("job_doi_mismatch", OPENURL, "delegated") as { payload: Record<string, unknown> };
+  offer.payload["expected"] = { doi: "https://doi.org/10.1000/expected" };
+  await h.bridge.start();
+  await h.port.inbound(offer);
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
+  const outcome = h.frames().find(
+    (frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "wrong_work",
+  );
+  expect(outcome?.payload).toMatchObject({
+    outcome: "wrong_work",
+    adapter_id: adapter.id,
+    adapter_version: adapter.version,
+  });
+  expect(h.downloads.started).toHaveLength(0);
+});
+
+test("matching or absent citation DOI leaves delegated downloads unchanged", async () => {
+  for (const pageDOI of ["DOI: 10.1000//ABC", null]) {
+    const h = makeHarness();
+    const adapter: AdapterSpec = {
+      id: "doi-match",
+      version: "1.0.0",
+      hosts: [PROVIDER_HOST],
+      classify: [{ kind: "article", any: ["article"] }],
+      download: { selector: "a.download", requireKind: "article", method: "href" },
+    };
+    h.deps.adapterSpecs.push(adapter);
+    h.deps.permissions.contains = async () => true;
+    h.deps.scripting.executeScript = async (injection) => {
+      if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+      if (injection.func === interpret) {
+        return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+      }
+      if (injection.func === readCitationDOI) return [{ result: pageDOI }];
+      return [{ result: "https://download.example/paper.pdf" }];
+    };
+    const offer = jobOffer(`job_doi_${pageDOI === null ? "absent" : "match"}`, OPENURL, "delegated") as {
+      payload: Record<string, unknown>;
+    };
+    offer.payload["expected"] = { doi: "https://doi.org/10.1000//abc" };
+    await h.bridge.start();
+    await h.port.inbound(offer);
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
+    expect(h.downloads.started).toHaveLength(1);
+  }
+});
+
+test("DOI normalization strips presentation prefixes but preserves repeated slashes", () => {
+  expect(normalizeExpectedDOI(" DOI: https://doi.org/10.1000//ABC ")).toBe("10.1000//abc");
+  expect(normalizeExpectedDOI("https://doi.org/10.1000//ABC")).toBe("10.1000//abc");
+  expect(normalizeExpectedDOI("10.1000/abc")).not.toBe(normalizeExpectedDOI("10.1000//abc"));
 });

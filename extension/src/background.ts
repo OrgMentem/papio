@@ -58,11 +58,12 @@ import {
   emptyStore,
   findByJob,
   findByTab,
+  PAGE_CAPTURE_CONSENT_KEY,
   patchJob,
   removeJob,
   startPendingDelivery,
-  updatePendingDelivery,
   upsertJob,
+  updatePendingDelivery,
   type ActiveJob,
   type PendingDelivery,
   type StateBackend,
@@ -686,6 +687,14 @@ export interface BridgeDeps {
   /** The observation path needs durable quota state but must not depend on a
    * browser global, so tests can prove the capture frame reaches the bridge. */
   captureStorage?: ObserveChromeApi["storage"];
+  /** Firefox-only runtime identity. Its absence is Chrome (or another
+   * Chromium-compatible browser), which keeps existing always-on capture
+   * behaviour unchanged. */
+  browserInfo?: () => Promise<{ name?: string; version?: string }>;
+  /** Durable pre-Firefox-140 consent for page-capture transmission. */
+  captureConsent?: {
+    get(): Promise<boolean>;
+  };
   /** chrome.permissions seam. Adapter execution is gated on an explicit
    * optional-host-permission grant for the provider origin. */
   permissions: {
@@ -768,6 +777,7 @@ interface StalledAuthHandoff {
   providerHosts: string[];
   expected?: { title?: string; doi?: string };
   requiresAuth?: boolean;
+  accessMode?: ActiveJob["access_mode"];
 }
 interface QueuedHandoffDrive {
   jobID: string;
@@ -959,6 +969,27 @@ function parseExpected(raw: unknown): { title?: string; doi?: string } | undefin
     ...(doi !== undefined ? { doi } : {}),
   };
 }
+/** Normalize DOI identity for the E1 expected-work check. Prefixes are
+ * presentation, not identity; slash runs are significant and are preserved. */
+export function normalizeExpectedDOI(value: string): string {
+  let normalized = value.trim().toLowerCase();
+  for (let pass = 0; pass < 2; pass += 1) {
+    if (normalized.startsWith("doi:")) normalized = normalized.slice(4).trimStart();
+    if (normalized.startsWith("https://doi.org/")) normalized = normalized.slice("https://doi.org/".length);
+  }
+  return normalized;
+}
+
+/** Read only the citation DOI explicitly exposed by the classified landing
+ * page. This is injected as a self-contained probe, so it never sees or
+ * returns page text beyond the DOI metadata value. */
+export function readCitationDOI(): string | null {
+  const element = document.querySelector('meta[name="citation_doi"]');
+  if (element === null) return null;
+  const value = element.getAttribute("content")?.trim() ?? "";
+  return value.length === 0 ? null : value;
+}
+
 
 /** Compare only the stable, non-secret part of a provider download URL.
  * Chrome may normalize a signed query before onDeterminingFilename fires. */
@@ -1261,6 +1292,13 @@ export class Bridge {
    * or framed. This lets onDeterminingFilename steer the exact adapter-started
    * download even when stale provider tabs make host correlation ambiguous. */
   private readonly pendingDownloadURLs = new Map<string, string>();
+  /** Firefox < 140 requires an explicit durable choice before any
+   * page_capture frame may leave the extension. Chrome and newer Firefox
+   * remain always-on. */
+  private captureTransmissionAllowed = true;
+  private captureConsentRequired = false;
+  private captureTransmissionPolicyReady: Promise<void> = Promise.resolve();
+  private captureConsentNoteLogged = false;
   private readonly pendingGrabDownloadURLs = new Map<string, { grabID: string; tabID: number; steeringPath: string }>();
   private readonly pdfGrabCorrelations = new Map<string, PdfGrabCorrelation>();
   private seq = 0;
@@ -1420,8 +1458,13 @@ export class Bridge {
     string,
     Promise<BrokerReply<{ opened: true }>>
   >();
-  /** Jobs already reported human_auth_required this worker lifetime, so a capped
-   * job refreshes the daemon's human action at most once per spin-up. */
+  constructor(private readonly deps: BridgeDeps) {
+    // A Firefox-only runtime probe is asynchronous; fail closed until its
+    // version and durable consent have been resolved. Chrome has no probe and
+    // therefore retains the existing always-on default above.
+    if (deps.browserInfo !== undefined) this.captureTransmissionAllowed = false;
+  }
+  /** A job refreshes the daemon's human action at most once per spin-up. */
   private readonly authStalledReported = new Set<string>();
   /** Serializes work-window creation so concurrent offers cannot race two
    * dedicated windows into existence. Worker-local only. */
@@ -1454,7 +1497,6 @@ export class Bridge {
    * another's for SESSION_EVIDENCE_THROTTLE_MS. */
   private readonly sessionEvidenceSentAt = new Map<string, number>();
 
-  constructor(private readonly deps: BridgeDeps) {}
   trackedJobCount(): number {
     return this.store.activeJobs.length;
   }
@@ -1704,6 +1746,7 @@ export class Bridge {
             providerHosts: [...current.provider_hosts],
             ...(current.expected !== undefined ? { expected: current.expected } : {}),
             ...(current.requires_auth !== undefined ? { requiresAuth: current.requires_auth } : {}),
+            ...(current.access_mode !== undefined ? { accessMode: current.access_mode } : {}),
           }
         : undefined);
     if (saved === undefined || !this.authStalledReported.has(jobID)) {
@@ -1720,6 +1763,7 @@ export class Bridge {
           expires_at: now,
           status: "accepted",
           provider_hosts: [...saved.providerHosts],
+          ...(saved.accessMode !== undefined ? { access_mode: saved.accessMode } : {}),
           ...(saved.requiresAuth !== undefined ? { requires_auth: saved.requiresAuth } : {}),
         },
         saved.url,
@@ -1752,6 +1796,7 @@ export class Bridge {
         offered_at: openedAt,
         expires_at: openedAt,
         status: "accepted",
+        ...(saved.accessMode !== undefined ? { access_mode: saved.accessMode } : {}),
         provider_hosts: [...saved.providerHosts],
         ...(saved.requiresAuth !== undefined ? { requires_auth: saved.requiresAuth } : {}),
       },
@@ -2930,6 +2975,7 @@ export class Bridge {
       const signInBlockersBeforePermissions = this.signInBlockerCount();
       let ungrantedResolverOrigins = 0;
       if (status === "connected" && signInBlockersBeforePermissions === 0 && blockedProviderHosts.length === 0) {
+
         for (const origin of this.store.resolverOrigins ?? []) {
           try {
             if (!(await this.deps.permissions.contains({ origins: [`${origin}/*`] }))) {
@@ -2961,12 +3007,55 @@ export class Bridge {
       // Browser action APIs are advisory; do not make a healthy bridge fail.
     }
   }
+  private async resolveCaptureTransmissionPolicy(): Promise<void> {
+    const browserInfo = this.deps.browserInfo;
+    // Firefox-only API absence is the Chrome path; preserve today's
+    // always-on capture behaviour there.
+    if (browserInfo === undefined) {
+      this.captureConsentRequired = false;
+      this.captureTransmissionAllowed = true;
+      return;
+    }
+    let info: { name?: string; version?: string };
+    try {
+      info = await browserInfo();
+    } catch {
+      // The Firefox-only API is present but unavailable; fail closed rather
+      // than transmit before a pre-140 consent decision can be read.
+      this.captureConsentRequired = true;
+      this.captureTransmissionAllowed = false;
+      return;
+    }
+    if (info.name?.toLowerCase() !== "firefox") {
+      this.captureConsentRequired = false;
+      this.captureTransmissionAllowed = true;
+      return;
+    }
+    const major = Number.parseInt(info.version?.split(".")[0] ?? "", 10);
+    if (!Number.isFinite(major)) {
+      this.captureConsentRequired = true;
+      this.captureTransmissionAllowed = false;
+      return;
+    }
+    if (major >= 140) {
+      this.captureConsentRequired = false;
+      this.captureTransmissionAllowed = true;
+      return;
+    }
+    this.captureConsentRequired = true;
+    try {
+      this.captureTransmissionAllowed = (await this.deps.captureConsent?.get()) === true;
+    } catch {
+      this.captureTransmissionAllowed = false;
+    }
+  }
 
 
   /** Bind browser listeners (once), open the native connection, send hello, and
    * hydrate persisted job/tab correlation. Safe to call on every SW spin-up.
    * top-level-registration expectation. */
   async start(): Promise<void> {
+    this.captureTransmissionPolicyReady = this.resolveCaptureTransmissionPolicy();
     this.bindListeners();
     this.ready = this.deps.backend.load().then(async (s) => {
       this.store = clearNegotiationState(s);
@@ -3006,6 +3095,7 @@ export class Bridge {
     // worker itself). Idempotent: re-creating the same alarm just resets it.
     this.deps.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
     await this.ready;
+    await this.captureTransmissionPolicyReady;
     await this.reconcilePdfGrabCorrelations();
     await this.restoreProviderDrainLeaseTimers();
     await this.restoreChallengeCooldownTimers();
@@ -3130,6 +3220,7 @@ export class Bridge {
             providerHosts: job.provider_hosts,
             ...(job.expected !== undefined ? { expected: job.expected } : {}),
             ...(job.requires_auth !== undefined ? { requiresAuth: job.requires_auth } : {}),
+            ...(job.access_mode !== undefined ? { accessMode: job.access_mode } : {}),
           });
         }
         await this.reportAuthStalled(job.job_id);
@@ -4894,6 +4985,7 @@ export class Bridge {
       providerHosts: [...handoff.providerHosts],
       ...(handoff.expected !== undefined ? { expected: handoff.expected } : {}),
       ...(handoff.requiresAuth !== undefined ? { requiresAuth: handoff.requiresAuth } : {}),
+      ...(handoff.accessMode !== undefined ? { accessMode: handoff.accessMode } : {}),
     });
   }
 
@@ -5784,9 +5876,24 @@ export class Bridge {
       }
     }
   }
-
-  public sendPageCapture(payload: PageCapturePayload, jobID?: string): boolean {
-    return this.pageCaptureAvailable() && this.send(MsgPageCapture, payload, jobID);
+  public async sendPageCapture(payload: PageCapturePayload, jobID?: string): Promise<boolean> {
+    await this.captureTransmissionPolicyReady;
+    if (!this.pageCaptureAvailable()) return false;
+    if (this.captureConsentRequired) {
+      try {
+        this.captureTransmissionAllowed = (await this.deps.captureConsent?.get()) === true;
+      } catch {
+        this.captureTransmissionAllowed = false;
+      }
+    }
+    if (!this.captureTransmissionAllowed) {
+      if (!this.captureConsentNoteLogged) {
+        this.captureConsentNoteLogged = true;
+        console.debug("papio: Firefox page-capture transmission is disabled until consent is enabled in settings");
+      }
+      return false;
+    }
+    return this.send(MsgPageCapture, payload, jobID);
   }
 
   private waitForPageCaptureLoad(tabID: number): Promise<boolean> {
@@ -5806,6 +5913,7 @@ export class Bridge {
   }
 
   private async onPageCaptureRequest(msg: BrowserMessage): Promise<void> {
+    await this.captureTransmissionPolicyReady;
     const request = msg.payload as unknown as PageCaptureRequestPayload;
     const reply = (outcome: PageCaptureRequestResultPayload["outcome"], detail?: string): void => {
       const payload: PageCaptureRequestResultPayload = {
@@ -5820,6 +5928,14 @@ export class Bridge {
       !(this.store.daemonFeatures ?? []).includes(PAGE_CAPTURE_REQUEST_FEATURE)
     ) {
       reply("not_permitted", "page capture is not available");
+      return;
+    }
+    if (!this.captureTransmissionAllowed) {
+      if (!this.captureConsentNoteLogged) {
+        this.captureConsentNoteLogged = true;
+        console.debug("papio: Firefox page-capture transmission is disabled until consent is enabled in settings");
+      }
+      reply("not_permitted", "page capture transmission requires consent in settings");
       return;
     }
     let requested: URL;
@@ -5944,7 +6060,7 @@ export class Bridge {
         reply("nav_failed", encoded.error);
         return;
       }
-      if (!this.sendPageCapture(encoded.payload)) {
+      if (!(await this.sendPageCapture(encoded.payload))) {
         reply("nav_failed", "could not send the sanitized page capture");
         return;
       }
@@ -6206,6 +6322,8 @@ export class Bridge {
     const providerParked = this.currentProviderDrainLease(providerKey)?.parkedReason === "challenge";
     const challengeCooldown = this.challengeCooldownActiveForHosts(providerHosts);
     const expected = parseExpected(p["expected"]);
+    const offeredAccessMode =
+      p["access_mode"] === "assisted" || p["access_mode"] === "delegated" ? p["access_mode"] : undefined;
     const requiresAuth = typeof p["requires_auth"] === "boolean" ? p["requires_auth"] : undefined;
     const loginEntityID = p["login_entity_id"];
     const previousLoginEntityID = this.loginEntityIDs.get(jobID);
@@ -6239,6 +6357,12 @@ export class Bridge {
     // without its durable offer URL cannot represent an in-flight download:
     // discard that stale record so this offer recreates the real browser work.
     let existing = findByJob(this.store, jobID);
+    if (existing !== undefined && offeredAccessMode !== undefined && existing.access_mode !== offeredAccessMode) {
+      await this.update((s) => patchJob(s, jobID, { access_mode: offeredAccessMode }));
+      existing = findByJob(this.store, jobID);
+    }
+    const effectiveAccessMode = offeredAccessMode ?? existing?.access_mode;
+
     const pendingDelivery = this.store.pendingDelivery;
     if (pendingDelivery?.job_id === jobID && pendingDelivery.status !== "failed") {
       const now = this.deps.now();
@@ -6257,6 +6381,7 @@ export class Bridge {
           provider_hosts: providerHosts,
           ...(expected !== undefined ? { expected } : {}),
           ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
+          ...(effectiveAccessMode !== undefined ? { access_mode: effectiveAccessMode } : {}),
         },
         openurl,
       );
@@ -6305,6 +6430,7 @@ export class Bridge {
         ...(claimKey !== undefined ? { institution_claim_key: claimKey } : {}),
         ...(expected !== undefined ? { expected } : {}),
         requires_auth: true,
+        ...(effectiveAccessMode !== undefined ? { access_mode: effectiveAccessMode } : {}),
       };
       if (expected === undefined) delete coldJob.expected;
       if (claimKey === undefined) delete coldJob.institution_claim_key;
@@ -6434,7 +6560,11 @@ export class Bridge {
           live &&
           !providerParked &&
           !challengeCooldown &&
-          !(isDirectFileOffer(openurl) && requiresAuth !== true)
+          !(
+            isDirectFileOffer(openurl) &&
+            requiresAuth !== true &&
+            effectiveAccessMode !== "assisted"
+          )
         ) {
           if (this.authAttemptsFor(jobID) >= MAX_AUTH_ATTEMPTS) {
             this.rememberStalledAuthHandoff(jobID, {
@@ -6442,6 +6572,7 @@ export class Bridge {
               providerHosts,
               ...(expected !== undefined ? { expected } : {}),
               ...(requiresAuth !== undefined ? { requiresAuth } : {}),
+              ...(effectiveAccessMode !== undefined ? { accessMode: effectiveAccessMode } : {}),
             });
             await this.reportAuthStalled(jobID);
             return;
@@ -6521,6 +6652,7 @@ export class Bridge {
       this.rememberStalledAuthHandoff(jobID, {
         url: openurl,
         providerHosts,
+        ...(effectiveAccessMode !== undefined ? { accessMode: effectiveAccessMode } : {}),
         ...(expected !== undefined ? { expected } : {}),
         ...(requiresAuth !== undefined ? { requiresAuth } : {}),
       });
@@ -6539,6 +6671,7 @@ export class Bridge {
       provider_hosts: providerHosts,
       ...(expected !== undefined ? { expected } : {}),
       ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
+      ...(effectiveAccessMode !== undefined ? { access_mode: effectiveAccessMode } : {}),
     });
     // A direct-file URL is not permission to download unattended. The
     // shape-matching above says only "this looks like a file"; whether a human
@@ -6548,8 +6681,17 @@ export class Bridge {
     // the offer URL for an institutional handoff is the operator's configured
     // OpenURL base, whose path papio does not constrain, so a pdf-shaped base
     // would otherwise route a sign-in-required offer straight to a download.
-    // Only an explicit true refuses; absent and false behave as before.
-    if (isDirectFileOffer(openurl) && requiresAuth !== true && !challengeCooldown) {
+    if (isDirectFileOffer(openurl) && effectiveAccessMode === "assisted") {
+      await this.upsertJobWithOffer(makeJob(-1), openurl);
+      this.send("job_accept", {}, jobID);
+      return;
+    }
+    if (
+      isDirectFileOffer(openurl) &&
+      requiresAuth !== true &&
+      effectiveAccessMode !== "assisted" &&
+      !challengeCooldown
+    ) {
       await this.upsertJobWithOffer(makeJob(-1), openurl);
       this.send("job_accept", {}, jobID);
       await this.startDirectOfferDownload(jobID, openurl);
@@ -6613,7 +6755,7 @@ export class Bridge {
    * Any initiation error falls back to the normal broker-tab handoff. */
   private async startDirectOfferDownload(jobID: string, url: string): Promise<void> {
     const job = findByJob(this.store, jobID);
-    if (!job || job.tab_id >= 0 || job.download_initiated === true) return;
+    if (!job || job.tab_id >= 0 || job.download_initiated === true || job.access_mode === "assisted") return;
     await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
     // Register the direct-offer classification before Chrome can emit
     // onCreated/onChanged for a small cached response.
@@ -7131,6 +7273,7 @@ export class Bridge {
         this.rememberStalledAuthHandoff(job.job_id, {
           url: openurl,
           providerHosts: job.provider_hosts,
+          ...(job.access_mode !== undefined ? { accessMode: job.access_mode } : {}),
           ...(job.expected !== undefined ? { expected: job.expected } : {}),
           ...(job.requires_auth !== undefined ? { requiresAuth: job.requires_auth } : {}),
         });
@@ -7303,6 +7446,7 @@ export class Bridge {
    * host permission or no electronic service stays assisted.
    */
   private async maybeRouteResolver(job: ActiveJob, currentURL: string): Promise<boolean> {
+    if (job.access_mode === "assisted") return false;
     const offered = this.offerURLs.get(job.job_id);
     let landingURL: URL;
     try {
@@ -8069,7 +8213,22 @@ export class Bridge {
     } else if (count === 0) {
       await this.update((s) => patchJob(s, job.job_id, { unknown_count: 1, last_unknown_ms: now }));
     }
+
     return captured;
+  }
+  private async citationDOIForTab(tabID: number): Promise<string | undefined> {
+    try {
+      const results = await this.deps.scripting.executeScript({
+        target: { tabId: tabID },
+        func: readCitationDOI,
+      });
+      const value = results[0]?.result;
+      return typeof value === "string" && value.trim() !== "" ? value : undefined;
+    } catch {
+      // A page that cannot expose metadata is unchanged: no new identity
+      // assertion is possible, so preserve the established assisted path.
+      return undefined;
+    }
   }
 
   /** Map a page verdict to a bridge action. See the safety contract: at most one
@@ -8100,10 +8259,26 @@ export class Bridge {
       // Any decisive verdict breaks the unknown streak.
       await this.update((s) => patchJob(s, jobID, { unknown_count: 0 }));
     }
+    if (verdict.kind === "article" && job.expected?.doi !== undefined && job.tab_id >= 0) {
+      const citationDOI = await this.citationDOIForTab(job.tab_id);
+      if (
+        citationDOI !== undefined &&
+        normalizeExpectedDOI(citationDOI) !== normalizeExpectedDOI(job.expected.doi)
+      ) {
+        if (this.send("provider_outcome", { outcome: "wrong_work", adapter_id: spec.id, adapter_version: av }, jobID)) {
+          await this.settleHandoffAfterOutcome(jobID);
+        }
+        return;
+      }
+    }
+
 
     switch (verdict.kind) {
       case "article": {
         const dl = spec.download;
+        // Assisted jobs may classify and capture, but no adapter-declared
+        // control or derived URL may cause a browser download.
+        if (job.access_mode === "assisted" && dl !== undefined) return;
         if (
           dl &&
           job.download_initiated !== true &&
@@ -8227,6 +8402,7 @@ export class Bridge {
         return;
       }
       case "login":
+        if (job.access_mode === "assisted") return;
         // A provider login wall. If the adapter has a federated-login route and
         // the offer carried the institution entityID, auto-select the institution
         // by navigating the handoff tab straight to the IdP (skipping the
@@ -8239,6 +8415,13 @@ export class Bridge {
         return;
       case "terms": {
         const consent = await this.deps.settings.getTermsConsent();
+        if (job.access_mode === "assisted") {
+          this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_id: spec.id, adapter_version: av }, jobID);
+          if (consent === undefined) {
+            await this.update((s) => patchJob(s, jobID, { needs_terms_consent: true }));
+          }
+          return;
+        }
         if (consent === "accept" && spec.termsAccept) {
           const accepted = await this.acceptTerms(job.job_id, spec.termsAccept);
           if (accepted) {
@@ -8375,7 +8558,7 @@ export class Bridge {
     } catch {
       return undefined;
     }
-    const initiated = this.store.activeJobs.filter((job) => {
+    const initiated = this.store.activeJobs.filter((job: ActiveJob) => {
       if (this.isFirefoxClickDownload(job) || job.download_initiated !== true || job.adapter_id === undefined) return false;
       const spec = this.deps.adapterSpecs.find((candidate) => candidate.id === job.adapter_id);
       return spec !== undefined && hostMatches(host, spec.hosts);
@@ -8383,7 +8566,7 @@ export class Bridge {
     if (initiated.length === 1) return initiated[0];
     if (initiated.length > 1) return undefined;
     const matches = this.store.activeJobs.filter(
-      (job) => !this.isFirefoxClickDownload(job) && this.matchesManualDownloadHost(job, host),
+      (job: ActiveJob) => !this.isFirefoxClickDownload(job) && this.matchesManualDownloadHost(job, host),
     );
     return matches.length === 1 ? matches[0] : undefined;
   }
@@ -9016,7 +9199,7 @@ export async function handleInboxRuntimeMessage(
       return failure("capture_failed",
       "The connected daemon does not support terms captures; upgrade the daemon to send this scenario",);
     }
-    return bridge.sendPageCapture(capturePayload)
+    return (await bridge.sendPageCapture(capturePayload))
       ? { captured: true }
       : failure("capture_failed", "Could not send page capture");
   }
@@ -9271,6 +9454,16 @@ function realDeps(): BridgeDeps {
       setTimeout(fn, ms);
     },
     runtimeSendMessage: (message) => chrome.runtime.sendMessage(message),
+    ...((chrome.runtime as typeof chrome.runtime & {
+      getBrowserInfo?: () => Promise<{ name?: string; version?: string }>;
+    }).getBrowserInfo === undefined
+      ? {}
+      : {
+          browserInfo: () =>
+            (chrome.runtime as typeof chrome.runtime & {
+              getBrowserInfo: () => Promise<{ name?: string; version?: string }>;
+            }).getBrowserInfo(),
+        }),
     backend: chromeBackend(chrome.storage),
     tabs: {
       create: (props) => chrome.tabs.create(props),
@@ -9346,6 +9539,12 @@ function realDeps(): BridgeDeps {
       local: {
         get: (key) => chrome.storage.local.get(key),
         set: (items) => chrome.storage.local.set(items),
+      },
+    },
+    captureConsent: {
+      get: async () => {
+        const got = await chrome.storage.local.get(PAGE_CAPTURE_CONSENT_KEY);
+        return got[PAGE_CAPTURE_CONSENT_KEY] === true;
       },
     },
     tabLedger: {

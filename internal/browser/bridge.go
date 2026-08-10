@@ -3356,6 +3356,9 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 	if err := b.jobs.RecordEvent(ctx, jobID, "browser.provider_outcome", detail); err != nil {
 		return err
 	}
+	if err := b.recordProviderLatch(ctx, jobID, p); err != nil {
+		return err
+	}
 	switch p.Outcome {
 	case "cancelled":
 		if err := b.resolveHandoff(ctx, jobID, "cancelled"); err != nil {
@@ -3470,6 +3473,100 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 	default:
 		return fmt.Errorf("unknown provider outcome %q", p.Outcome)
 	}
+}
+
+const providerLatchEventKind = "job.latch"
+
+// recordProviderLatch turns provider observations into durable, job-scoped
+// circuit-breaker evidence. The provider outcome frame deliberately has no
+// host field; when available, the preceding page-capture event supplies the
+// landed provider host without widening the strict wire contract.
+func (b *Bridge) recordProviderLatch(ctx context.Context, jobID string, p *protocol.ProviderOutcomePayload) error {
+	if b == nil || b.jobs == nil || p == nil {
+		return nil
+	}
+	kind := ""
+	switch p.Outcome {
+	case "wrong_work", "unexpected_effect", "validation_failed", "failed_validation":
+		kind = "no_positive_effects"
+	case "ui_changed", "unknown":
+		kind = "drift"
+	default:
+		return nil
+	}
+	events, err := b.jobs.Events(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	domain := strings.TrimSpace(p.AdapterID)
+	if domain == "" {
+		for i := len(events) - 1; i >= 0; i-- {
+			if events[i]["kind"] != "browser.page_capture" {
+				continue
+			}
+			captureDetail, _ := events[i]["detail"].(map[string]any)
+			domain = strings.TrimSpace(stringDetail(captureDetail, "adapter_id"))
+			if domain != "" {
+				break
+			}
+		}
+	}
+	if domain == "" {
+		// An observation without an adapter cannot identify a provider safety
+		// domain. Keep the ordinary provider outcome durable, but do not create
+		// a latch that would accidentally suspend unrelated browser routes.
+		return nil
+	}
+	host := providerOutcomeHost(events, domain, p.AdapterVersion)
+	for _, event := range events {
+		if event["kind"] != providerLatchEventKind {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if detail["kind"] != kind || stringDetail(detail, "safety_domain") != domain {
+			continue
+		}
+		if kind == "no_positive_effects" ||
+			(stringDetail(detail, "adapter_id") == p.AdapterID &&
+				stringDetail(detail, "adapter_version") == p.AdapterVersion &&
+				stringDetail(detail, "host") == host) {
+			return nil
+		}
+	}
+	detail := map[string]any{
+		"kind":          kind,
+		"safety_domain": domain,
+	}
+	if kind == "drift" {
+		detail["adapter_id"] = p.AdapterID
+		detail["adapter_version"] = p.AdapterVersion
+		detail["host"] = host
+	}
+	return b.jobs.RecordEvent(ctx, jobID, providerLatchEventKind, detail)
+}
+
+func providerOutcomeHost(events []map[string]any, adapterID, adapterVersion string) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "browser.page_capture" {
+			continue
+		}
+		detail, _ := events[i]["detail"].(map[string]any)
+		if id := stringDetail(detail, "adapter_id"); id != "" && id != adapterID {
+			continue
+		}
+		if adapterVersion != "" {
+			if version := stringDetail(detail, "adapter_version"); version != "" && version != adapterVersion {
+				continue
+			}
+		}
+		return strings.ToLower(strings.TrimSpace(stringDetail(detail, "host")))
+	}
+	return ""
+}
+
+func stringDetail(detail map[string]any, key string) string {
+	value, _ := detail[key].(string)
+	return value
 }
 
 // institutionalRouteRequeued reports whether this job already left an
@@ -4398,6 +4495,18 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			delete(b.reofferPending, id)
 			continue
 		}
+		if !b.focusPending[id] {
+			latched, latchErr := b.browserOfferLatched(ctx, row, action)
+			if latchErr != nil {
+				log.Printf("papio: reading browser safety latches for %s: %v", id, latchErr)
+				delete(b.reofferPending, id)
+				continue
+			}
+			if latched {
+				delete(b.reofferPending, id)
+				continue
+			}
+		}
 		if slots <= 0 {
 			held++
 			heldIDs[id] = true
@@ -4482,6 +4591,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 					}
 					continue
 				}
+
 				offer, offerErr := b.offer(*row, handoff[id], accessMode)
 				if offerErr != nil {
 					return nil, offerErr
@@ -4565,6 +4675,82 @@ func (b *Bridge) offerableAccessMode(row job.Row) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// browserOfferLatched projects durable job.latch events into the browser-only
+// offer gate. It intentionally does not participate in resolver/API candidate
+// selection, and an explicit focus request remains a human-authorized escape
+// hatch from the automatic gate.
+func (b *Bridge) browserOfferLatched(
+	ctx context.Context,
+	row job.Row,
+	action job.HumanAction,
+) (bool, error) {
+	events, err := b.jobs.Events(ctx, row.ID)
+	if err != nil {
+		return true, err
+	}
+	offerHosts := b.browserOfferHosts(row, action)
+	for _, event := range events {
+		if event["kind"] != providerLatchEventKind {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if stringDetail(detail, "safety_domain") == "" {
+			continue
+		}
+		switch stringDetail(detail, "kind") {
+		case "no_positive_effects":
+			return true, nil
+		case "drift":
+			adapterID := stringDetail(detail, "adapter_id")
+			adapterVersion := stringDetail(detail, "adapter_version")
+			if adapterID == "" || adapterVersion == "" {
+				return true, nil
+			}
+			liveVersion := ""
+			if b.holder != nil {
+				liveVersion = b.holder.AdapterVersions[adapterID]
+			}
+			if extensionVersionNewer(adapterVersion, liveVersion) {
+				continue
+			}
+			host := stringDetail(detail, "host")
+			if host == "" || browserOfferHostMatches(offerHosts, host) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (b *Bridge) browserOfferHosts(row job.Row, action job.HumanAction) []string {
+	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
+	offerURL := RouteURL(inst, row.Work)
+	if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
+		offerURL = oaURL
+	}
+	if retrievalURL, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
+		offerURL = retrievalURL
+	}
+	hosts := make([]string, 0, len(verifiedProviderHosts)+1)
+	if host := resolverHost(offerURL); host != "" {
+		hosts = append(hosts, host)
+	}
+	hosts = append(hosts, verifiedProviderHosts...)
+	return hosts
+}
+
+func browserOfferHostMatches(offerHosts []string, latchHost string) bool {
+	latchHost = strings.ToLower(strings.TrimSpace(latchHost))
+	for _, offerHost := range offerHosts {
+		offerHost = strings.ToLower(strings.TrimSpace(offerHost))
+		if offerHost == latchHost || strings.HasSuffix(offerHost, "."+latchHost) ||
+			strings.HasSuffix(latchHost, "."+offerHost) {
+			return true
+		}
+	}
+	return false
 }
 
 // offer builds a job_offer for one parked handoff job. OA browser handoffs
