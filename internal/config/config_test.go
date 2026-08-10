@@ -17,6 +17,9 @@ import (
 func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "config.toml")
 	cfg := Default()
+	if !cfg.Browser.DirectRoutesEnabled {
+		t.Fatal("direct routes disabled by default")
+	}
 	cfg.AccessMode = ModeConservative
 	cfg.Email = "researcher@example.test"
 	cfg.DataDir = filepath.Join(t.TempDir(), "data")
@@ -24,6 +27,7 @@ func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 	cfg.Zotio.Executable = filepath.Join(t.TempDir(), "zotio")
 	cfg.Zotio.AttachmentMode = "linked-file"
 	cfg.Hooks.OnReady = "true"
+	cfg.Browser.DirectRoutesEnabled = false
 	if err := Save(cfg, path); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +49,8 @@ func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 	if got.AccessMode != cfg.AccessMode || got.Email != cfg.Email ||
 		got.Sources[SourceOpenAlex].APIKey != "secret" ||
 		got.Zotio.Executable != cfg.Zotio.Executable ||
-		got.Zotio.AttachmentMode != "linked-file" || got.Hooks.OnReady != "true" || got.Path != path {
+		got.Zotio.AttachmentMode != "linked-file" || got.Hooks.OnReady != "true" ||
+		got.Browser.DirectRoutesEnabled != cfg.Browser.DirectRoutesEnabled || got.Path != path {
 		t.Fatalf("round trip = %+v", got)
 	}
 }

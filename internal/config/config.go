@@ -123,6 +123,10 @@ type Browser struct {
 	// FirefoxExtensionID is the Gecko add-on ID allowed to reach the native
 	// host. Empty disables the Firefox bridge.
 	FirefoxExtensionID string `toml:"firefox_extension_id,omitempty"`
+	// DirectRoutesEnabled permits the daemon's packaged provider-direct URL
+	// candidates to be offered once a compatible extension advertises support.
+	// It defaults on; setting it false is a daemon-side kill switch.
+	DirectRoutesEnabled bool `toml:"direct_routes_enabled"`
 	// OpenURLBase is the default institution's OpenURL resolver base (https).
 	OpenURLBase string `toml:"openurl_base_url,omitempty"`
 	// ShibbolethEntityID is the default institution's Shibboleth IdP entityID;
@@ -526,7 +530,7 @@ func Default() Config {
 		DataDir:  defaultDataDir(),
 		Fetch:    Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
 		PDF:      PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
-		Browser:  Browser{ActionExpirySeconds: 1800},
+		Browser:  Browser{DirectRoutesEnabled: true, ActionExpirySeconds: 1800},
 		Captures: Captures{Enabled: true, MaxPerHost: 10, MaxAgeDays: 14},
 		Actions:  Actions{StaleAfterSeconds: DefaultActionStaleAfterSeconds},
 		Zotio:    Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
