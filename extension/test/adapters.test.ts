@@ -14,6 +14,7 @@ import {
   type DownloadRule,
   type PageVerdict,
 } from "../src/adapters/types";
+import { planExecution, type Plan, type PlanResult } from "../src/plan";
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape, type TermsConsent } from "../src/state";
 import {
@@ -996,9 +997,10 @@ class FakeDownloads {
   }
 }
 
-// Fake chrome.scripting: interpret injections (3 args) return queued verdicts;
-// extractDownloadURL (1 arg) returns a signed URL; declared clicks (5 args)
-// record the exact light/shadow/follow-up selectors.
+// Fake chrome.scripting: planner injections execute the real self-contained
+// planner against a happy-dom document, with the old verdict overrides mapped
+// onto its returned Plan. Click and API helpers remain recorded exactly as
+// Chrome would invoke them.
 class FakeScripting {
   verdict: PageVerdict | undefined;
   readonly verdictQueue: PageVerdict[] = [];
@@ -1015,14 +1017,113 @@ class FakeScripting {
   readonly interpretTabs: number[] = [];
   constructedURL: string | null = "https://provider.example.edu/pdf/default.pdf";
   readonly constructedArgs: { tabId: number; selector: string; idPattern: unknown; urlTemplate: unknown; jsonField: unknown }[] = [];
+
+  private plannerResult(inj: { target: { tabId: number }; args?: unknown[] }): PlanResult {
+    const args = inj.args ?? [];
+    const spec = args[1] as AdapterSpec;
+    const expected = (args[2] ?? {}) as { title?: string; doi?: string; year?: number };
+    const policy = (args[3] ?? {}) as { access_mode?: "assisted" | "delegated" | "conservative"; terms_consent?: "accept" | "decline" };
+    const win = new Window({ url: "https://www.jstor.org/stable/4093878" });
+    const selector = spec.download?.selector;
+    const planningSpec =
+      spec.classify.length === 0 && selector !== undefined
+        ? { ...spec, classify: [{ kind: "article" as const, all: [selector] }] }
+        : spec;
+    if (selector !== undefined) {
+      const first = selector.split(",")[0]?.trim() ?? "div";
+      const tag = /^[a-z][a-z0-9-]*/i.exec(first)?.[0] ?? "div";
+      const element = win.document.createElement(tag);
+      const id = /#([A-Za-z0-9_-]+)/.exec(first)?.[1];
+      const className = /\.([A-Za-z0-9_-]+)/.exec(first)?.[1];
+      if (id !== undefined) element.id = id;
+      if (className !== undefined) element.className = className;
+      if (spec.download?.method === "meta") {
+        element.setAttribute("name", spec.download.metaName ?? "citation_pdf_url");
+        element.setAttribute("content", this.href);
+      } else if (tag.toLowerCase() === "a") {
+        element.setAttribute("href", spec.download?.method === "url" ? "https://www.jstor.org/stable/4093878" : this.href);
+      }
+      if (spec.download?.shadowSelector !== undefined) {
+        const host = element as unknown as {
+          attachShadow?: (init: { mode: "open" }) => { appendChild: (child: typeof element) => unknown };
+        };
+        const shadow = host.attachShadow?.({ mode: "open" });
+        if (shadow !== undefined) {
+          const shadowSelector = spec.download.shadowSelector;
+          const shadowTag = /^[a-z][a-z0-9-]*/i.exec(shadowSelector)?.[0] ?? "div";
+          const shadowElement = win.document.createElement(shadowTag);
+          const shadowID = /#([A-Za-z0-9_-]+)/.exec(shadowSelector)?.[1];
+          if (shadowID !== undefined) shadowElement.id = shadowID;
+          shadow.appendChild(shadowElement);
+        }
+      }
+      (tag.toLowerCase() === "meta" ? win.document.head : win.document.body).appendChild(element);
+    }
+    const actual = planExecution(win.document as unknown as Document, planningSpec, expected, policy);
+    const override = this.verdictQueue.shift() ?? this.verdict;
+    if (override === undefined) return actual;
+    const base: Plan = "assisted" in actual
+      ? {
+          adapter_id: spec.id,
+          adapter_version: spec.version,
+          verdict: override,
+          decisive_rule: override.kind === "unknown" ? null : `rule:${override.kind} matched`,
+          target_ref: null,
+          method: null,
+          url: null,
+          required_consequence: "none",
+          access_mode: policy.access_mode,
+          terms_consent: policy.terms_consent ?? null,
+        }
+      : actual;
+    const download = spec.download;
+    const article = override.kind === "article" && download !== undefined;
+    const target_ref = article
+      ? (base.target_ref ?? {
+          selector: download.selector,
+          shadow_selector: download.shadowSelector ?? null,
+          fingerprint: "synthetic",
+        })
+      : null;
+    const method = article ? download.method : null;
+    const url =
+      article && (download.method === "href" || download.method === "meta")
+        ? this.href
+        : article
+          ? base.url
+          : null;
+    return {
+      ...base,
+      adapter_id: override.adapter_id ?? spec.id,
+      adapter_version: override.adapter_version ?? spec.version,
+      verdict: override,
+      decisive_rule: override.kind === "unknown" ? null : `rule:${override.kind} matched`,
+      target_ref,
+      method,
+      url,
+      required_consequence: article ? "download" : "none",
+    };
+  }
   async executeScript(inj: {
     target: { tabId: number };
     func: (...args: never[]) => unknown;
     args?: unknown[];
   }): Promise<{ result?: unknown }[]> {
-    // The driven-page challenge assessment shares this injection path; it is
-    // not an adapter extraction and must not pollute the recorded calls.
     if (inj.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (inj.func === planExecution) {
+      const planned = this.plannerResult(inj);
+      if (
+        typeof planned === "object" &&
+        planned !== null &&
+        !("assisted" in planned) &&
+        planned.target_ref !== null &&
+        !this.extracted.some((entry) => entry.tabId === inj.target.tabId)
+      ) {
+        this.extracted.push({ tabId: inj.target.tabId, selector: planned.target_ref.selector });
+      }
+      this.interpretTabs.push(inj.target.tabId);
+      return [{ result: planned }];
+    }
     const args = inj.args ?? [];
     if (args.length === 1) {
       this.extracted.push({ tabId: inj.target.tabId, selector: String(args[0]) });
@@ -1047,14 +1148,11 @@ class FakeScripting {
       });
       return [{ result: true }];
     }
-    // resolveDownloadURL(selector, idPattern, urlTemplate, jsonField): uniquely
-    // 4-arg (interpret is 3, click is 5).
     if (args.length === 4) {
       this.constructedArgs.push({ tabId: inj.target.tabId, selector: String(args[0]), idPattern: args[1], urlTemplate: args[2], jsonField: args[3] });
       return [{ result: this.constructedURL }];
     }
-    this.interpretTabs.push(inj.target.tabId);
-    return [{ result: this.verdictQueue.shift() ?? this.verdict }];
+    return [{ result: undefined }];
   }
 }
 
@@ -1696,6 +1794,7 @@ test("declared shadow click reclassifies an in-page terms gate", async () => {
   const h = makeMapHarness([clickSpec]);
   h.scripting.verdictQueue.push(
     { kind: "article", adapter_id: "jstor", adapter_version: "0.1.0", evidence: [] },
+    { kind: "article", adapter_id: "jstor", adapter_version: "0.1.0", evidence: [] },
     { kind: "terms", adapter_id: "jstor", adapter_version: "0.1.0", evidence: [] },
   );
   await h.bridge.start();
@@ -1710,7 +1809,7 @@ test("declared shadow click reclassifies an in-page terms gate", async () => {
   const outcome = h.frames().find((f) => f.type === "provider_outcome");
   expect(outcome?.payload["outcome"]).toBe("terms_acceptance_required");
   expect(outcome?.payload["adapter_version"]).toBe("0.1.0");
-  expect(h.scripting.interpretTabs.length).toBe(2);
+  expect(h.scripting.interpretTabs.length).toBe(3);
   expect(h.downloads.started).toHaveLength(0);
 });
 test("declared provider modal follow-up stays inside the one click helper", async () => {

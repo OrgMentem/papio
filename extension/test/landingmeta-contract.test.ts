@@ -299,38 +299,59 @@ function normalizeSource(src: string): string {
   return out.replace(/\s+/g, " ").trim();
 }
 
-const EXTRACT_META_URL_SIGNATURE = "function extractMetaURL(metaName: string): string | null {";
+const RESOLVE_URL_SIGNATURE = "const resolveURL = (rule: DownloadRule, target: Element): string | null => {";
 
-// Verbatim copy of extractMetaURL's full source, signature through closing
-// brace, as it stood when this guard was written. Re-sync this literal (and
-// extractMetaURLMirror above it) whenever the real function legitimately
+// Verbatim copy of planExecution's resolveURL source, signature through
+// closing brace, as it stood when this guard was retargeted from
+// background.ts's removed extractMetaURL to the planner (the single source
+// of truth for meta/href URL safety). Re-sync this literal (and
+// extractMetaURLMirror above it) whenever the real code legitimately
 // changes — see the comment block above for the full re-sync procedure.
-const PINNED_EXTRACT_META_URL_SOURCE = `function extractMetaURL(metaName: string): string | null {
-  const el = document.querySelector(\`meta[name="\${metaName}"]\`);
-  if (!(el instanceof HTMLMetaElement)) return null;
-  const raw = el.getAttribute("content")?.trim() ?? "";
-  if (raw.length === 0) return null;
-  try {
-    const u = new URL(raw, location.href);
-    if (u.protocol !== "https:") return null;
-    if (u.username !== "" || u.password !== "") return null;
-    const page = new URL(location.href);
-    const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
-    return isSelf ? null : u.href;
-  } catch {
-    return null;
-  }
-}`;
+const PINNED_RESOLVE_URL_SOURCE = `const resolveURL = (rule: DownloadRule, target: Element): string | null => {
+    const raw = rule.method === "meta" ? target.getAttribute("content") : target.getAttribute("href");
+    if (rule.method === "href" || rule.method === "meta") {
+      const trimmed = raw?.trim() ?? "";
+      if (trimmed.length === 0) return null;
+      try {
+        const u = new URL(trimmed, pageHref);
+        if (u.protocol !== "https:" || u.username !== "" || u.password !== "") return null;
+        const page = new URL(pageHref);
+        const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
+        return isSelf ? null : u.href;
+      } catch {
+        return null;
+      }
+    }
+    if (rule.method !== "url" && rule.method !== "api") return null;
+    if (!rule.urlTemplate) return null;
+    let built = rule.urlTemplate;
+    if (rule.idPattern) {
+      let match: RegExpMatchArray | null;
+      try {
+        match = pageHref.match(new RegExp(rule.idPattern));
+      } catch {
+        return null;
+      }
+      if (!match) return null;
+      built = built.replace(/\\{(\\d+|id)\\}/g, (_whole: string, key: string) => match[key === "id" ? 1 : Number(key)] ?? "");
+    }
+    try {
+      const u = new URL(built, pageHref);
+      return u.protocol === "https:" ? u.href : null;
+    } catch {
+      return null;
+    }
+  }`;
 
-test("extractMetaURL in background.ts still carries the behavior this mirror models", () => {
-  const backgroundSrc = readFileSync(join(import.meta.dir, "..", "src", "background.ts"), "utf8");
-  const actual = extractFunctionSource(backgroundSrc, EXTRACT_META_URL_SIGNATURE);
+test("resolveURL in plan.ts still carries the behavior this mirror models", () => {
+  const planSrc = readFileSync(join(import.meta.dir, "..", "src", "plan.ts"), "utf8");
+  const actual = extractFunctionSource(planSrc, RESOLVE_URL_SIGNATURE);
   expect(
     normalizeSource(actual),
-    "extractMetaURL's body changed in src/background.ts. Update " +
-      "PINNED_EXTRACT_META_URL_SOURCE in this file to match the new body, " +
+    "resolveURL's body changed in src/plan.ts. Update " +
+      "PINNED_RESOLVE_URL_SOURCE in this file to match the new body, " +
       "hand-resync extractMetaURLMirror above to the same behavior, then " +
       "re-run this whole suite against internal/landingmeta/testdata/contract.json " +
       "before trusting either implementation again.",
-  ).toBe(normalizeSource(PINNED_EXTRACT_META_URL_SOURCE));
+  ).toBe(normalizeSource(PINNED_RESOLVE_URL_SOURCE));
 });

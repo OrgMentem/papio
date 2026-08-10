@@ -11,7 +11,8 @@ import { parseBrowserMessage, type BrowserMessage, type PageCapturePayload } fro
 import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
 import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
 import { KeepaliveManager, type FreshSessionEvidence, type KeepaliveAPI } from "../src/keepalive";
-import { interpret, type AdapterSpec, type PageVerdict } from "../src/adapters/types";
+import { type AdapterSpec, type PageVerdict } from "../src/adapters/types";
+import { planExecution, type Plan } from "../src/plan";
 import {
   Bridge,
   findManagedTab,
@@ -480,6 +481,75 @@ const PROVIDER_ADAPTER: AdapterSpec = {
   hosts: [PROVIDER_HOST],
   classify: [],
 };
+function plannerResult(
+  injection: Parameters<BridgeDeps["scripting"]["executeScript"]>[0],
+  verdict: Partial<PageVerdict> & { kind: PageVerdict["kind"] },
+): { result: Plan }[] {
+  const args = injection.args ?? [];
+  const spec = (args[1] as AdapterSpec | undefined) ?? PROVIDER_ADAPTER;
+  const download = spec.download;
+  const expected = (args[2] ?? {}) as { title?: string; doi?: string; year?: number };
+  const policy = (args[3] ?? {}) as { access_mode?: "assisted" | "delegated" | "conservative"; terms_consent?: "accept" | "decline" };
+  const win = new Window({ url: "https://www.jstor.org/stable/4093878" });
+  const selector = download?.selector;
+  if (selector !== undefined) {
+    const first = selector.split(",")[0]?.trim() ?? "div";
+    const tag = /^[a-z][a-z0-9-]*/i.exec(first)?.[0] ?? "div";
+    const element = win.document.createElement(tag);
+    const id = /#([A-Za-z0-9_-]+)/.exec(first)?.[1];
+    const className = /\.([A-Za-z0-9_-]+)/.exec(first)?.[1];
+    if (id !== undefined) element.id = id;
+    if (download?.method === "meta") {
+      element.setAttribute("name", download.metaName ?? "citation_pdf_url");
+      element.setAttribute("content", "https://download.example/paper.pdf");
+    } else if (tag.toLowerCase() === "a") {
+      element.setAttribute("href", "https://download.example/paper.pdf");
+    }
+    (tag.toLowerCase() === "meta" ? win.document.head : win.document.body).appendChild(element);
+  }
+  const actual = planExecution(win.document as unknown as Document, spec, expected, policy);
+  const fullVerdict: PageVerdict = {
+    kind: verdict.kind,
+    adapter_id: verdict.adapter_id ?? spec.id,
+    adapter_version: verdict.adapter_version ?? spec.version,
+    evidence: verdict.evidence ?? [],
+  };
+  const base: Plan = "assisted" in actual
+    ? {
+        adapter_id: spec.id,
+        adapter_version: spec.version,
+        verdict: fullVerdict,
+        decisive_rule: fullVerdict.kind === "unknown" ? null : `rule:${fullVerdict.kind} matched`,
+        target_ref: null,
+        method: null,
+        url: null,
+        required_consequence: "none",
+        access_mode: policy.access_mode,
+        terms_consent: policy.terms_consent ?? null,
+      }
+    : actual;
+  const article = fullVerdict.kind === "article" && spec.download !== undefined;
+  return [{
+    result: {
+      ...base,
+      adapter_id: fullVerdict.adapter_id,
+      adapter_version: fullVerdict.adapter_version,
+      verdict: fullVerdict,
+      decisive_rule: fullVerdict.kind === "unknown" ? null : `rule:${fullVerdict.kind} matched`,
+      target_ref: article
+        ? (base.target_ref ?? {
+            selector: spec.download!.selector,
+            shadow_selector: spec.download!.shadowSelector ?? null,
+            fingerprint: "synthetic",
+          })
+        : null,
+      method: article ? spec.download!.method : null,
+      url: article ? "https://download.example/paper.pdf" : null,
+      required_consequence: article ? "download" : "none",
+    },
+  }];
+}
+
 
 function sanitizedObservedChallenge(html: string): Document {
   const window = new Window({ url: "https://fixture.local/" });
@@ -498,7 +568,7 @@ function useUnknownProviderClassifier(h: Harness, challenge: () => boolean): voi
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === interpret) return [{ result: { kind: "unknown" } }];
+    if (injection.func === planExecution) return plannerResult(injection, { kind: "unknown" });
     if (injection.func === assessDrivenPage) return [{ result: { kind: challenge() ? "challenge" : "normal" } }];
     if (injection.func === isBotChallenge) return [{ result: challenge() }];
     return [];
@@ -514,93 +584,41 @@ async function classifyProviderUnknown(h: Harness, jobID: string): Promise<numbe
   await h.tabs.completeNavigation(tabID, url);
   return tabID;
 }
-
-/** extractMetaURL and extractDownloadURL are self-contained page functions:
- * background.ts injects them verbatim via chrome.scripting.executeScript, so
- * they read the page's global `document`/`location` rather than taking a
- * Document parameter, and are deliberately not exported — executeScript
- * serializes the injected function alone, not its module scope, so a shared
- * helper or a test import would either break at runtime or let a test-local
- * reimplementation silently drift from the function actually shipped (see
- * the comment above extractDownloadURL in background.ts). Driving one job
- * through the real "meta"/"href" download path captures the exact function
- * reference background.ts hands to executeScript for that method, so every
- * case below calls production code directly. */
-async function captureExtractor(method: "meta" | "href"): Promise<(...args: unknown[]) => unknown> {
-  const h = makeHarness();
+/** Exercise the planner's URL resolution directly. This mirror used to call
+ * an injected background helper that no longer exists; the planner is now the
+ * single source of truth for href/meta URL safety. */
+function plannerURL(method: "meta" | "href", pageURL: string, html: string, selector: string): string | null {
+  const window = new Window({ url: pageURL });
+  window.document.write(html);
   const adapter: AdapterSpec = {
-    id: `extractor-capture-${method}`,
+    id: `planner-url-${method}`,
     version: "1.0.0",
     hosts: [PROVIDER_HOST],
-    classify: [],
+    classify: [
+      {
+        kind: "article",
+        all: [method === "meta" ? `meta[name="${selector}"]` : selector],
+      },
+    ],
     download:
       method === "meta"
-        ? { selector: "a", requireKind: "article", method: "meta", metaName: "citation_pdf_url" }
-        : { selector: "a.pdf", requireKind: "article", method: "href" },
+        ? {
+            selector: `meta[name="${selector}"]`,
+            requireKind: "article",
+            method: "meta",
+            metaName: selector,
+          }
+        : { selector, requireKind: "article", method: "href" },
   };
-  h.deps.adapterSpecs.push(adapter);
-  h.deps.permissions.contains = async () => true;
-  let captured: ((...args: unknown[]) => unknown) | undefined;
-  h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === interpret) {
-      return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
-    }
-    // Whatever's left is the extractor under test for this method: capture
-    // the real reference without invoking it here — a null result lets the
-    // download flow finish cleanly without starting a chrome.downloads call.
-    captured = injection.func as (...args: unknown[]) => unknown;
-    return [{ result: null }];
-  };
-  await h.bridge.start();
-  await h.port.inbound(jobOffer(`job_capture_${method}`));
-  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  const url = `https://${PROVIDER_HOST}/stable/article`;
-  await h.tabs.completeNavigation(tabID, url);
-  if (captured === undefined) throw new Error(`extractor for method "${method}" was never invoked`);
-  return captured;
+  const result = planExecution(window.document as unknown as Document, adapter, {}, {});
+  return "assisted" in result ? null : result.url;
 }
 
-/** Run `fn` with `globalThis.document`/`globalThis.location` set to a
- * happy-dom page at `url` — the environment executeScript actually provides
- * the extractor inside the tracked tab — then restore whatever was there
- * before. Mirrors the document/localStorage/sessionStorage swap
- * keepalive.test.ts uses for collectResolverMarkers; `location` joins the
- * swap here because extractMetaURL/extractDownloadURL read `location.href`
- * for the self-URL guard, which collectResolverMarkers never needs, and
- * HTMLMetaElement/HTMLAnchorElement join it because both extractors guard
- * their querySelector result with `instanceof` against those GLOBAL
- * constructors — bun's test environment has no DOM globals at all, so
- * without this swap every element happy-dom hands back fails the
- * instanceof check against an undefined constructor. */
-function withPageGlobals<T>(url: string, html: string, fn: () => T): T {
-  const window = new Window({ url });
-  window.document.write(html);
-  const previous = {
-    document: globalThis.document,
-    location: globalThis.location,
-    HTMLMetaElement: globalThis.HTMLMetaElement,
-    HTMLAnchorElement: globalThis.HTMLAnchorElement,
-  };
-  Object.assign(globalThis, {
-    document: window.document,
-    location: window.location,
-    HTMLMetaElement: window.HTMLMetaElement,
-    HTMLAnchorElement: window.HTMLAnchorElement,
-  });
-  try {
-    return fn();
-  } finally {
-    Object.assign(globalThis, previous);
-  }
-}
-
-test("extractMetaURL rejects every self-reference escape but still resolves a distinct download URL", async () => {
-  const extractMetaURL = await captureExtractor("meta");
+test("planner meta URL resolution rejects every self-reference escape but still resolves a distinct download URL", () => {
   const PAGE = "https://p.example.edu/a";
   const metaTag = (content: string): string =>
     `<html><head><meta name="citation_pdf_url" content="${content}"></head><body></body></html>`;
-  const run = (html: string): unknown => withPageGlobals(PAGE, html, () => extractMetaURL("citation_pdf_url"));
+  const run = (html: string): string | null => plannerURL("meta", PAGE, html, "citation_pdf_url");
 
   expect(run("<html><head></head><body></body></html>")).toBeNull(); // no meta tag at all
   expect(run(metaTag(""))).toBeNull(); // empty content
@@ -622,11 +640,10 @@ test("extractMetaURL rejects every self-reference escape but still resolves a di
   expect(run(metaTag("https://p.example.edu/other.pdf"))).toBe("https://p.example.edu/other.pdf");
 });
 
-test("extractDownloadURL rejects every self-reference escape but still resolves a distinct download URL", async () => {
-  const extractDownloadURL = await captureExtractor("href");
+test("planner href URL resolution rejects every self-reference escape but still resolves a distinct download URL", () => {
   const PAGE = "https://p.example.edu/a";
   const anchor = (href: string): string => `<html><body><a class="pdf" href="${href}">Download</a></body></html>`;
-  const run = (html: string): unknown => withPageGlobals(PAGE, html, () => extractDownloadURL("a.pdf"));
+  const run = (html: string): string | null => plannerURL("href", PAGE, html, "a.pdf");
 
   expect(run("<html><body></body></html>")).toBeNull(); // no matching anchor at all
   expect(run(anchor(""))).toBeNull(); // empty href
@@ -1788,7 +1805,7 @@ test("a registry-only adapter host classifies and emits an observed capture", as
   const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
-    if (injection.func === interpret) return [{ result: { kind: "unknown" } }];
+    if (injection.func === planExecution) return plannerResult(injection, { kind: "unknown" });
     if (injection.func === capturePage) {
       return [{ result: { html: `<main class="article">new provider shape</main>`, origin: `https://${PROVIDER_HOST}`, path: "/stable/article" } }];
     }
@@ -1814,7 +1831,7 @@ test("a registry-only adapter host classifies and emits an observed capture", as
   const articleURL = `https://${PROVIDER_HOST}/stable/article`;
   await h.tabs.completeNavigation(tabID, articleURL);
 
-  expect(injections.some((i) => i.func === interpret && i.target.tabId === tabID)).toBe(true);
+  expect(injections.some((i) => i.func === planExecution && i.target.tabId === tabID)).toBe(true);
   const captures = h.frames().filter((frame) => frame.type === "page_capture");
   expect(captures).toHaveLength(1);
   expect(captures[0]?.job_id).toBe("job_0001a_registry_host");
@@ -1839,7 +1856,7 @@ test("all-sites browser access counts as effective provider access", async () =>
   };
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
-    if (injection.func === interpret) return [{ result: { kind: "unknown" } }];
+    if (injection.func === planExecution) return plannerResult(injection, { kind: "unknown" });
     if (injection.func === isBotChallenge) return [{ result: false }];
     return [];
   };
@@ -1851,7 +1868,7 @@ test("all-sites browser access counts as effective provider access", async () =>
   await h.tabs.completeNavigation(tabID, articleURL);
 
   expect(permissionQueries).toEqual([[`https://${PROVIDER_HOST}/*`]]);
-  expect(injections.some((injection) => injection.func === interpret)).toBe(true);
+  expect(injections.some((injection) => injection.func === planExecution)).toBe(true);
   expect(h.backend.store.blockedProviderHosts).toBeUndefined();
 });
 
@@ -1884,7 +1901,7 @@ test("missing provider access stays actionable and resumes the exact tab after g
 
   granted = true;
   await h.bridge.onPermissionsChanged();
-  expect(injections.some((injection) => injection.func === interpret)).toBe(true);
+  expect(injections.some((injection) => injection.func === planExecution)).toBe(true);
   expect(h.backend.store.blockedProviderHosts).toEqual([]);
   expect(h.backend.store.activeJobs[0]?.blocked_provider_host).toBeUndefined();
 });
@@ -1893,7 +1910,13 @@ test("a classify retry whose handoff tab closed settles instead of rejecting", a
   const h = makeHarness();
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
   h.deps.permissions.contains = async () => true;
-  h.deps.scripting.executeScript = async () => [{ result: { kind: "unknown" } }];
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === planExecution) {
+      return plannerResult(injection, { kind: "unknown" });
+    }
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    return [];
+  };
 
   await h.bridge.start();
   await h.port.inbound(helloAck());
@@ -2070,8 +2093,8 @@ test("challenge resume queues without a governor slot before classifying", async
   h.deps.settings.getTermsConsent = async () => "accept";
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === interpret) {
-      return [{ result: { kind: "article", adapter_id: spec.id, adapter_version: spec.version, evidence: [] } }];
+    if (injection.func === planExecution) {
+      return plannerResult(injection, { kind: "article", adapter_id: spec.id, adapter_version: spec.version, evidence: [] });
     }
     return [{ result: "https://download.example/paper.pdf" }];
   };
@@ -2345,8 +2368,8 @@ test("concurrent classifications after accepted terms initiate exactly one downl
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === interpret) {
-      return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+    if (injection.func === planExecution) {
+      return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
     }
     return [{ result: "https://download.example/paper.pdf" }];
   };
@@ -2715,7 +2738,8 @@ test("Firefox keeps click adapters assisted and ignores their manual job-tab dow
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
     if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    return [{ result: { kind: "article" } }];
+    if (injection.func === planExecution) return plannerResult(injection, { kind: "article" });
+    return [];
   };
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0004_firefox_click"));
@@ -2724,7 +2748,7 @@ test("Firefox keeps click adapters assisted and ignores their manual job-tab dow
   await h.tabs.completeNavigation(tabID, articleURL);
 
   expect(injections).toHaveLength(2);
-  expect(injections.filter((injection) => injection.func === interpret)).toHaveLength(1);
+  expect(injections.filter((injection) => injection.func === planExecution)).toHaveLength(1);
   expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
   await h.downloads.onCreated.emit({
     id: 41,
@@ -2795,8 +2819,8 @@ test("Firefox adapter API downloads remain filename-controlled and report normal
   h.deps.adapterSpecs.push(apiAdapter);
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) =>
-    injection.func === interpret
-      ? [{ result: { kind: "article" } }]
+    injection.func === planExecution
+      ? plannerResult(injection, { kind: "article" })
       : [{ result: `https://${PROVIDER_HOST}/download/article.pdf` }];
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0004_firefox_api"));
@@ -2844,7 +2868,7 @@ test("a cross-origin api download with a content-disposition rename steers into 
   h.deps.adapterSpecs.push(apiAdapter);
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) =>
-    injection.func === interpret ? [{ result: { kind: "article" } }] : [{ result: crossOriginPDF }];
+    injection.func === planExecution ? plannerResult(injection, { kind: "article" }) : [{ result: crossOriginPDF }];
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0004b_xorigin_api"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -7062,7 +7086,7 @@ function makeFedLoginHarness(seed?: StoreShape): Harness {
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === interpret) return [{ result: FED_LOGIN_VERDICT }];
+    if (injection.func === planExecution) return plannerResult(injection, FED_LOGIN_VERDICT);
     return [];
   };
   return h;
@@ -7707,7 +7731,7 @@ test("a service-worker restart with a dead claim owner requeues its waiters inst
   restarted.deps.permissions.contains = async () => true;
   restarted.deps.scripting.executeScript = async (injection) => {
     if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === interpret) return [{ result: FED_LOGIN_VERDICT }];
+    if (injection.func === planExecution) return plannerResult(injection, FED_LOGIN_VERDICT);
     return [];
   };
   restarted.tabs.seed({ id: tabB, url: FED_PROVIDER_LOGIN_URL });
@@ -7940,8 +7964,8 @@ test("assisted offers block every papio-initiated download path", async () => {
     h.deps.permissions.contains = async () => true;
     h.deps.scripting.executeScript = async (injection) => {
       if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-      if (injection.func === interpret) {
-        return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+      if (injection.func === planExecution) {
+        return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
       }
       return [{ result: method === "click" ? true : `https://${PROVIDER_HOST}/download/paper.pdf` }];
     };
@@ -7985,8 +8009,8 @@ test("delegated article offers retain automatic download behavior", async () => 
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === interpret) {
-      return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+    if (injection.func === planExecution) {
+      return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
     }
     return [{ result: "https://download.example/paper.pdf" }];
   };
@@ -8033,8 +8057,8 @@ test("expected DOI mismatch reports wrong_work before any automatic download", a
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === interpret) {
-      return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+    if (injection.func === planExecution) {
+      return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
     }
     if (injection.func === readCitationDOI) return [{ result: "DOI: 10.1000/other" }];
     return [{ result: "https://download.example/paper.pdf" }];
@@ -8070,8 +8094,8 @@ test("matching or absent citation DOI leaves delegated downloads unchanged", asy
     h.deps.permissions.contains = async () => true;
     h.deps.scripting.executeScript = async (injection) => {
       if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-      if (injection.func === interpret) {
-        return [{ result: { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] } }];
+      if (injection.func === planExecution) {
+        return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
       }
       if (injection.func === readCitationDOI) return [{ result: pageDOI }];
       return [{ result: "https://download.example/paper.pdf" }];

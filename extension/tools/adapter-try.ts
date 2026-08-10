@@ -24,7 +24,8 @@
 import { readFileSync } from "node:fs";
 
 import { captureOrigin, parseHTML } from "../test/harness";
-import { adapters, interpret, type AdapterContext, type AdapterSpec, type ClassifyRule, type DownloadRule } from "../src/adapters/types";
+import { adapters, type AdapterSpec, type ClassifyRule, type DownloadRule, type PageVerdict } from "../src/adapters/types";
+import { planExecution, type Plan } from "../src/plan";
 
 function usage(): never {
   console.error(
@@ -265,64 +266,10 @@ function printClassifyRules(doc: Document, spec: AdapterSpec): void {
   }
 }
 
-// ---- download resolution ----------------------------------------------------
-// "href" and "meta" are resolved locally: their extractors (extractDownloadURL,
-// extractMetaURL, both in ../src/background.ts) are private to background.ts,
-// unexported, so they are reimplemented here against the same contract. "url"/
-// "api" reuse the exported resolveDownloadURL — background.ts imports cleanly
-// in plain bun (its chrome.* wiring is gated behind `typeof chrome !==
-// "undefined"`), but the reuse is still wrapped in try/catch so a future
-// coupling to chrome.* degrades to a clear message instead of crashing this
-// tool. "click" is never resolvable offline: it requires a real user gesture
-// against a live page.
-//
-// resolveHrefLocally/resolveMetaLocally below MUST stay in lockstep with
-// extractDownloadURL/extractMetaURL's two guards: reject an empty/whitespace
-// href or content before resolving, and reject a resolved URL equal to the
-// page's own URL. `new URL("", base)` returns BASE, so without the first
-// guard `<a href="">`/`<meta content="">` "resolves" to the landing page
-// itself and this tool would print that as a confident match — the exact
-// live defect fixed in 7a8deb5 (pinned as the `empty_content` case in
-// internal/landingmeta/testdata/contract.json). A tool meant to debug that
-// failure must not itself hide it.
 
-function resolveHrefLocally(doc: Document, selector: string): string | null {
-  const el = doc.querySelector(selector);
-  if (el === null || el.tagName.toUpperCase() !== "A") return null;
-  const raw = el.getAttribute("href")?.trim() ?? "";
-  if (raw.length === 0) return null;
-  try {
-    const u = new URL(raw, doc.location?.href ?? "https://fixture.local/");
-    if (u.protocol !== "https:") return null;
-    const page = new URL(doc.location?.href ?? "https://fixture.local/");
-    u.hash = "";
-    page.hash = "";
-    return u.href === page.href ? null : u.href;
-  } catch {
-    return null;
-  }
-}
-
-function resolveMetaLocally(doc: Document, metaName: string): string | null {
-  const el = doc.querySelector(`meta[name="${metaName}"]`);
-  if (el === null || el.tagName.toUpperCase() !== "META") return null;
-  const raw = el.getAttribute("content")?.trim() ?? "";
-  if (raw.length === 0) return null;
-  try {
-    const u = new URL(raw, doc.location?.href ?? "https://fixture.local/");
-    if (u.protocol !== "https:") return null;
-    const page = new URL(doc.location?.href ?? "https://fixture.local/");
-    u.hash = "";
-    page.hash = "";
-    return u.href === page.href ? null : u.href;
-  } catch {
-    return null;
-  }
-}
-
-// resolveDownloadURL's signature is part of the SERIALIZATION CONTRACT on
-// interpret in adapters/types.ts (self-contained, chrome.scripting-injected),
-// so it is stable enough to name explicitly here without importing the value.
+// resolveDownloadURL is the live API-only resolver. The declarative href/meta
+// planning and URL construction above come from planExecution; this helper is
+// retained only for --allow-network's JSON-field fetch diagnostic.
 type ResolveDownloadURLFn = (
   selector: string,
   idPattern: string | null,
@@ -351,10 +298,8 @@ async function tryResolveViaBackground(
   }
 
   // resolveDownloadURL is written to be serialized verbatim into the live
-  // page (see the SERIALIZATION CONTRACT note on interpret in
-  // adapters/types.ts), so it reads the ambient `document`/`location`
-  // globals instead of taking a Document argument. Point those globals at
-  // the fixture window for the one call, then put back whatever was there.
+  // page, so it reads ambient document/location globals rather than taking a
+  // Document argument. Point those globals at the fixture window for this call.
   const g = globalThis as unknown as { document?: unknown; location?: unknown };
   const savedDoc = g.document;
   const savedLoc = g.location;
@@ -376,31 +321,34 @@ async function tryResolveViaBackground(
   }
 }
 
-async function printDownloadResolution(doc: Document, rule: DownloadRule, allowNetwork: boolean): Promise<void> {
+async function printDownloadResolution(
+  doc: Document,
+  rule: DownloadRule,
+  plan: Plan | undefined,
+  allowNetwork: boolean,
+): Promise<void> {
   console.log("\nDownload resolution (verdict is article; spec declares a download rule)");
   console.log(`  method:   ${rule.method}`);
   console.log(`  selector: ${rule.selector}`);
   console.log(`  resolves: ${doc.querySelector(rule.selector) !== null ? "yes" : "no"}`);
 
   switch (rule.method) {
-    case "href": {
-      const url = resolveHrefLocally(doc, rule.selector);
-      console.log(`  url:      ${url ?? "(none — selector missing, not an <a>, or href not https)"}`);
+
+    case "href":
+    case "meta":
+      if (rule.method === "meta") console.log(`  metaName: ${rule.metaName ?? "citation_pdf_url"}`);
+      console.log(`  url:      ${plan?.url ?? "(none — selector missing, target is not unique, or URL not https)"}`);
       break;
-    }
-    case "meta": {
-      const metaName = rule.metaName ?? "citation_pdf_url";
-      const url = resolveMetaLocally(doc, metaName);
-      console.log(`  metaName: ${metaName}`);
-      console.log(`  url:      ${url ?? "(none — meta tag missing or content not https)"}`);
-      break;
-    }
     case "url":
     case "api": {
       if (!allowNetwork) {
         console.log(
           `  url:      not resolved (method "${rule.method}" resolves against the live endpoint; re-run with --allow-network)`,
         );
+        break;
+      }
+      if (plan === undefined) {
+        console.log("  url:      not resolvable offline (planner stayed assisted)");
         break;
       }
       if (rule.method === "api") {
@@ -459,15 +407,22 @@ async function main(): Promise<void> {
   const origin = resolveCaptureOrigin(html);
   const doc = origin === undefined ? parseHTML(html) : parseHTML(html, origin);
 
-  const ctx: AdapterContext = {
-    expected: {
-      ...(args.title !== undefined ? { title: args.title } : {}),
-      ...(args.doi !== undefined ? { doi: args.doi } : {}),
-      ...(args.year !== undefined ? { year: args.year } : {}),
-    },
+  const expected = {
+    ...(args.title !== undefined ? { title: args.title } : {}),
+    ...(args.doi !== undefined ? { doi: args.doi } : {}),
+    ...(args.year !== undefined ? { year: args.year } : {}),
   };
 
-  const verdict = interpret(doc, spec, ctx);
+  const planned = planExecution(doc, spec, expected, {});
+  const plan = "assisted" in planned ? undefined : planned;
+  const verdict =
+    plan?.verdict ??
+    ({
+      kind: "unknown",
+      adapter_id: spec.id,
+      adapter_version: spec.version,
+      evidence: [`planner assisted: ${"assisted" in planned ? planned.assisted : "planner returned no plan"}`],
+    } satisfies PageVerdict);
 
   console.log(`=== adapter-try: ${spec.id}@${spec.version} vs ${args.htmlPath} ===\n`);
   console.log("Verdict");
@@ -480,7 +435,7 @@ async function main(): Promise<void> {
   printClassifyRules(doc, spec);
 
   if (verdict.kind === "article" && spec.download !== undefined) {
-    await printDownloadResolution(doc, spec.download, args.allowNetwork);
+    await printDownloadResolution(doc, spec.download, plan, args.allowNetwork);
   }
 
   console.log("");

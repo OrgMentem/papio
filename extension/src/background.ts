@@ -79,11 +79,10 @@ import {
 import { isPDFPage, pdfSourceURL, sanitizePageHost } from "./deliver";
 import {
   adapters,
-  interpret,
-  type AdapterContext,
   type AdapterSpec,
   type PageVerdict,
 } from "./adapters/types";
+import { planExecution, type Plan, type PlanResult } from "./plan";
 import { observeUnknown, type ObserveChromeApi } from "./observe";
 import {
   capturePage,
@@ -1033,75 +1032,6 @@ function isDirectFileOffer(raw: string): boolean {
   }
 }
 
-/** Self-contained provider-link extractor, injected verbatim into the tracked
- * page. It returns only an HTTPS href from the declared selector. The signed
- * URL remains in extension memory and is handed directly to
- * chrome.downloads.download; it never crosses native messaging or storage.
- *
- * Keep this function self-contained: executeScript serializes the injected
- * function alone, not its module-level dependencies, so the empty/self URL
- * guard below is deliberately duplicated in extractMetaURL rather than shared.
- *
- * The self-URL check compares origin + pathname + search rather than the raw
- * href string: WHATWG serializes a non-null empty query as a trailing "?", so
- * `content="?"` on https://p/a produced "https://p/a?" — one character away
- * from the page's own href and therefore NOT caught by a literal href ===
- * href comparison, while `URL#search` already normalizes both the "?" and
- * no-query forms to "". A URL carrying userinfo (`https://x@p/a`) survives
- * href serialization unchanged while still addressing the identical page, so
- * it is rejected outright rather than folded into the equality check. */
-function extractDownloadURL(selector: string): string | null {
-  const el = document.querySelector<HTMLAnchorElement>(selector);
-  if (!(el instanceof HTMLAnchorElement)) return null;
-  const raw = el.getAttribute("href")?.trim() ?? "";
-  if (raw.length === 0) return null;
-  try {
-    const u = new URL(raw, location.href);
-    if (u.protocol !== "https:") return null;
-    if (u.username !== "" || u.password !== "") return null;
-    const page = new URL(location.href);
-    const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
-    return isSelf ? null : u.href;
-  } catch {
-    return null;
-  }
-}
-
-/** Self-contained meta-tag PDF-URL extractor, injected verbatim into the tracked
- * page. Returns only an HTTPS URL from the named meta tag's content. The URL
- * stays in extension memory and is handed directly to chrome.downloads.download;
- * it never crosses native messaging or storage.
- *
- * An empty or self-resolving content attribute is rejected, because
- * `new URL("", base)` resolves to BASE — which is https and truthy, so
- * `<meta name="citation_pdf_url" content="">` used to yield the landing page's
- * own URL. The adapter `article` rule only checks that the tag EXISTS, so such
- * a page classified as an article and then handed its own landing HTML to
- * chrome.downloads.download as if it were the PDF; payload validation caught
- * it downstream, but the fetch was wasted and the failure was misattributed to
- * the provider. A query string still differentiates: a provider's
- * `?download=true` form of the same path is a real, distinct download URL.
- *
- * The self-URL check compares origin + pathname + search rather than the raw
- * href string, and rejects userinfo outright, for the same reason documented
- * in extractDownloadURL above — see that comment for the two escapes this
- * closes. */
-function extractMetaURL(metaName: string): string | null {
-  const el = document.querySelector(`meta[name="${metaName}"]`);
-  if (!(el instanceof HTMLMetaElement)) return null;
-  const raw = el.getAttribute("content")?.trim() ?? "";
-  if (raw.length === 0) return null;
-  try {
-    const u = new URL(raw, location.href);
-    if (u.protocol !== "https:") return null;
-    if (u.username !== "" || u.password !== "") return null;
-    const page = new URL(location.href);
-    const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
-    return isSelf ? null : u.href;
-  } catch {
-    return null;
-  }
-}
 
 /** Self-contained resolver for a provider's direct PDF endpoint, injected into
  * the tracked page. It fills {N}/{id} in urlTemplate from idPattern's capture
@@ -7660,10 +7590,10 @@ export class Bridge {
 
   /**
    * Classify the tracked tab's current provider page with the single injected
-   * `interpret` function, then act on the verdict. A registered provider is
-   * diagnosed before injection when the browser cannot effectively read it;
-   * all-sites access is effective access. Adapter execution never touches a tab
-   * we do not own for this job.
+   * `planExecution` function, then act on the verdict/plan. A registered
+   * provider is diagnosed before injection when the browser cannot effectively
+   * read it; all-sites access is effective access. Adapter execution never
+   * touches a tab we do not own for this job.
    */
   private async maybeClassify(
     jobID: string,
@@ -7771,23 +7701,35 @@ export class Bridge {
       if (!(await this.clearChallengeBlock(currentJob))) return undefined;
     }
 
-    const ctx: AdapterContext = { expected: { ...(currentJob.expected ?? {}) } };
-    let verdict: PageVerdict | undefined;
+    let plan: Plan | undefined;
     try {
       const results = await this.deps.scripting.executeScript({
-        target: { tabId: job.tab_id },
-        func: interpret,
-        // interpret(null, spec, ctx): doc arrives null, falls back to the page's
-        // document; spec + ctx are the JSON args.
-        args: [null, spec, ctx],
+        target: { tabId: currentJob.tab_id },
+        func: planExecution,
+        // planExecution(null, spec, expected, policy): doc arrives null and
+        // falls back to the page's document; all other inputs are JSON.
+        args: [
+          null,
+          spec,
+          { ...(currentJob.expected ?? {}) },
+          currentJob.access_mode === undefined ? {} : { access_mode: currentJob.access_mode },
+        ],
       });
-      const first = results[0];
-      verdict = first ? (first.result as PageVerdict | undefined) : undefined;
+      const first = results[0]?.result as PlanResult | undefined;
+      if (
+        first !== undefined &&
+        typeof first === "object" &&
+        first !== null &&
+        !("assisted" in first)
+      ) {
+        plan = first;
+      }
     } catch (e) {
-      console.error("papio: adapter classification failed; staying assisted", e);
+      console.error("papio: adapter planning failed; staying assisted", e);
       return;
     }
-    if (!verdict) return undefined;
+    if (plan === undefined) return undefined;
+    const verdict = plan.verdict;
     if (disposition === "evidence_only") return verdict;
     if (verdict.kind === "unknown") {
       let fallbackKind: ChallengeBlockKind | undefined;
@@ -7824,7 +7766,7 @@ export class Bridge {
         await this.releaseQueuedHandoffs();
       }
     }
-    await this.applyVerdict(jobID, spec, verdict, host);
+    await this.applyVerdict(jobID, spec, plan, host);
     // A decisive verdict ends the render race; `unknown` may just be an
     // un-upgraded page, so retry on a bounded schedule. A latched download-click
     // that opens a declared terms gate must ALSO keep retrying: providers like
@@ -8368,9 +8310,10 @@ export class Bridge {
     await this.removeJobWithOffer(jobID);
   }
 
-  private async applyVerdict(jobID: string, spec: AdapterSpec, verdict: PageVerdict, host: string): Promise<void> {
+  private async applyVerdict(jobID: string, spec: AdapterSpec, plan: Plan, host: string): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (!job) return;
+    const verdict = plan.verdict;
     const av = spec.version;
     const ownerEntry = Object.entries(this.store.federatedLoginOwners ?? {}).find(
       ([, owner]) => owner.jobID === jobID && owner.phase === "engaging",
@@ -8400,7 +8343,6 @@ export class Bridge {
       }
     }
 
-
     switch (verdict.kind) {
       case "article": {
         const dl = spec.download;
@@ -8409,6 +8351,8 @@ export class Bridge {
         if (job.access_mode === "assisted" && dl !== undefined) return;
         if (
           dl &&
+          plan.method === dl.method &&
+          plan.target_ref !== null &&
           job.download_initiated !== true &&
           !(dl.method === "click" && this.deps.downloads.onDeterminingFilename === undefined)
         ) {
@@ -8425,15 +8369,59 @@ export class Bridge {
               return;
             }
           }
+          // Re-run the planner immediately before the effect. A changed
+          // target, verdict, or URL loses authority and stays assisted.
+          let freshPlan: Plan | undefined;
+          try {
+            const results = await this.deps.scripting.executeScript({
+              target: { tabId: job.tab_id },
+              func: planExecution,
+              args: [
+                null,
+                spec,
+                { ...(job.expected ?? {}) },
+                job.access_mode === undefined ? {} : { access_mode: job.access_mode },
+              ],
+            });
+            const fresh = results[0]?.result as PlanResult | undefined;
+            if (
+              fresh !== undefined &&
+              typeof fresh === "object" &&
+              fresh !== null &&
+              !("assisted" in fresh)
+            ) {
+              freshPlan = fresh;
+            }
+          } catch (e) {
+            console.error("papio: execution plan revalidation failed; staying assisted", e);
+            return;
+          }
+          if (
+            freshPlan === undefined ||
+            freshPlan.verdict.kind !== plan.verdict.kind ||
+            freshPlan.decisive_rule !== plan.decisive_rule ||
+            freshPlan.method !== plan.method ||
+            freshPlan.url !== plan.url ||
+            JSON.stringify(freshPlan.target_ref) !== JSON.stringify(plan.target_ref)
+          ) {
+            return;
+          }
+          if ((dl.method === "click" || dl.method === "api") && freshPlan.target_ref === null) {
+            return;
+          }
+          const freshTarget = freshPlan.target_ref;
+          if (freshTarget === null) return;
+          // Do not latch or invoke page code without a concrete,
+          // revalidated target.
           // Consent is an await boundary shared by concurrent classifications.
           // Re-read the durable latch before this synchronous update claims the
           // job, so only one classifier can initiate the download.
           const latestJob = findByJob(this.store, jobID);
           if (latestJob === undefined || latestJob.download_initiated === true) return;
           // Latch BEFORE resolving/downloading (persisted) so no
-          // re-classification can ever initiate a second download for this
-          // job. Failure falls back to assisted mode; the user can still use
-          // the verified page control manually.
+          // re-classification can ever initiate a second download. Failure
+          // falls back to assisted mode; the user can still use the verified
+          // page control manually.
           await this.update((s) =>
             patchJob(s, jobID, { download_initiated: true, adapter_id: spec.id }),
           );
@@ -8443,8 +8431,8 @@ export class Bridge {
                 target: { tabId: job.tab_id },
                 func: clickDeclaredDownload,
                 args: [
-                  dl.selector,
-                  dl.shadowSelector ?? null,
+                  freshTarget.selector,
+                  freshTarget.shadow_selector,
                   dl.postClickWaitFor ?? null,
                   dl.postClickTimeoutMs ?? null,
                   dl.followupSelector ?? null,
@@ -8454,11 +8442,11 @@ export class Bridge {
               if (clicked && dl.postClickWaitFor !== undefined) {
                 await this.reclassifyCurrentProviderPage(jobID);
               }
-            } else if (dl.method === "url" || dl.method === "api") {
+            } else if (dl.method === "api") {
               const built = await this.deps.scripting.executeScript({
                 target: { tabId: job.tab_id },
                 func: resolveDownloadURL,
-                args: [dl.selector, dl.idPattern ?? null, dl.urlTemplate ?? null, dl.jsonField ?? null],
+                args: [freshTarget.selector, dl.idPattern ?? null, dl.urlTemplate ?? null, dl.jsonField ?? null],
               });
               const url = built[0]?.result;
               if (typeof url === "string" && url.startsWith("https://")) {
@@ -8475,13 +8463,8 @@ export class Bridge {
                   this.pendingDownloadURLs.delete(url);
                 }
               }
-            } else if (dl.method === "meta") {
-              const metas = await this.deps.scripting.executeScript({
-                target: { tabId: job.tab_id },
-                func: extractMetaURL,
-                args: [dl.metaName ?? "citation_pdf_url"],
-              });
-              const url = metas[0]?.result;
+            } else {
+              const url = freshPlan.url;
               if (typeof url === "string" && url.startsWith("https://")) {
                 this.pendingDownloadURLs.set(url, jobID);
                 try {
@@ -8491,33 +8474,12 @@ export class Bridge {
                     conflictAction: "uniquify",
                     saveAs: false,
                   });
-                  this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false, directOffer: false });
-                } finally {
-                  this.pendingDownloadURLs.delete(url);
-                }
-              }
-            } else {
-              const links = await this.deps.scripting.executeScript({
-                target: { tabId: job.tab_id },
-                func: extractDownloadURL,
-                args: [dl.selector],
-              });
-              const href = links[0]?.result;
-              if (typeof href === "string" && href.startsWith("https://")) {
-                this.pendingDownloadURLs.set(href, jobID);
-                try {
-                  const id = await this.deps.downloads.download({
-                    url: href,
-                    filename: `papio/${jobID}/paper.pdf`,
-                    conflictAction: "uniquify",
-                    saveAs: false,
-                  });
                   // Correlate by Chrome's returned ID, not URL/referrer
                   // heuristics. onChanged can now complete even if onCreated
                   // raced the Promise.
                   this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false, directOffer: false });
                 } finally {
-                  this.pendingDownloadURLs.delete(href);
+                  this.pendingDownloadURLs.delete(url);
                 }
               }
             }
