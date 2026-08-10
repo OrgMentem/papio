@@ -26,6 +26,21 @@ execution records kept during the initial build.
   automatic browser offers for that job and provider; ordinary page-drift
   outcomes latch only the exact adapter revision and host, so a repaired
   adapter is offered again while the broken one is not.
+- **`papio jobs failures` groups failures into incidents.** Terminal and
+  parked jobs are aggregated by a keyed failure-shape fingerprint (safety
+  domain, host family, outcome — hashed with a per-installation secret so no
+  raw host or identifier appears), so one provider redesign reads as one
+  incident instead of a page of repeats. Older daemons simply omit the
+  incident rows.
+- **Failure evidence is pinned while an incident is open.** The first
+  decisive and latest page captures of an open incident are exempt from the
+  per-host capture eviction until the job resolves, so a burst of newer
+  failures cannot destroy the evidence a repair needs.
+- **`papio adapter repair <capture>` scaffolds a fix.** From a stored or
+  local capture it produces a ready-to-review workspace under
+  `dev/scratch/repair/`: the sanitized fixture with its header, an
+  adapter-try analysis report, the adapter's next revision string, and the
+  exact apply steps — without touching extension source.
 
 ## [0.20.0] - 2026-08-10
 

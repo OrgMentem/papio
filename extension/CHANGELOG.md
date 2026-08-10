@@ -23,6 +23,14 @@ for the full pre-split extension history.
   built-in consent at install); on Firefox 128–139 sanitized failure captures
   are not transmitted to the local *papio* app until a one-time settings
   checkbox is enabled. Chrome behaviour is unchanged.
+- **Unrecognized provider pages get a generic, identity-proven attempt.**
+  When no adapter recognizes a page during a delegated handoff, the
+  extension now reads the page's citation metadata and — only when the
+  page's DOI exactly matches the requested work — tries at most two
+  strictly-sequential candidates (the declared `citation_pdf_url`, then a
+  unique article PDF link) before parking. Assisted jobs record the evidence
+  without downloading anything, ambiguous pages stay hands-off, and every
+  attempt is capped per drive even across extension restarts.
 
 ### Changed
 

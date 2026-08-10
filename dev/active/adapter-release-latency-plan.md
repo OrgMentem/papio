@@ -1152,6 +1152,14 @@ Do not mix translator code into a differently licensed *papio* runtime bundle
 without a separate licensing decision. Measure static and sandbox-observed
 yield separately before reconsidering any runtime compatibility layer.
 
+**Static yield measured 2026-08-10** (pinned corpus
+`fbee32689eca0d88105ac518c3b7f53bdbdd2508`, 749 translators): exactly **1**
+statically representable E1 candidate; 97% of translators depend on
+network/helper calls and every route-adjacent publisher translator computes
+`detectWeb`. The build-time static importer is therefore not worth building;
+the hermetic execution harness is the only remaining evidence path, and it
+must earn its way in from repair-time need, not speculatively.
+
 ## Operations and objectives
 
 Track locally:
