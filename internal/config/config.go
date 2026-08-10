@@ -963,12 +963,6 @@ func validateDocumentDelivery(prefix string, d *DocumentDelivery) error {
 			return fmt.Errorf("%srequest_classes entry %q is not modelled yet (only digital_journal_article)", prefix, class)
 		}
 	}
-	if d.MonthlyRequestCap < 0 {
-		return fmt.Errorf("%smonthly_request_cap must be >= 0", prefix)
-	}
-	if d.StatusPollMinutes < 0 {
-		return fmt.Errorf("%sstatus_poll_minutes must be >= 0 (0 uses the default)", prefix)
-	}
 	if d.APIKey != "" && kind != "illiad" {
 		// A key on a form-kind profile is dead config: openurl, libkey, and
 		// custom route to a form the browser opens and never call an API
