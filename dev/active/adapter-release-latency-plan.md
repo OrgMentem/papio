@@ -8,11 +8,15 @@ accepted.
 Build, in this order of leverage:
 
 1. **Daemon-side provider URL intelligence** — provider knowledge that is
-   URL-shaped (direct PDF endpoint templates, resolver quirks, account
-   parameters) lives in the daemon and is exercised through the extension's
-   existing packaged navigate/viewer/download primitives. The daemon updates
-   outside browser stores entirely, so these repairs deploy in **hours** with
-   zero store-policy exposure.
+   URL-shaped (direct PDF endpoint templates, resolver and route quirks)
+   lives in the daemon and is exercised through the extension's existing
+   packaged navigate/viewer/download primitives. The daemon half deploys
+   outside browser stores in **hours**; autonomous use requires the one
+   Phase-0-capable extension release that adds `provider_direct_get_v1` and
+   enforces `access_mode` — after that, route repairs are daemon-only. No new
+   extension-store submission is needed per repair; the pattern extends the
+   shipped daemon-supplies-URL seam (`openurl_handoff`), though its store
+   classification remains an inference until reviewed.
 2. **An automated adapter patch generator** (capture → candidate source change,
    fixtures, tests, revision bump, changelog, tag) feeding the existing
    dual-store release flow. Store review is "most extensions within a few
@@ -36,10 +40,11 @@ of each class remains unproven until exercised):
 | release class | remote control | positive repair path |
 |---|---|---|
 | operational suspension | durably disable an exact packaged revision or safety domain | immediate online-signed control update |
-| permanent safety revocation | monotonically revoke an exact packaged revision or domain | offline-root-signed control update |
+| permanent safety revocation (deferred with offline root) | monotonically revoke an exact packaged revision or domain | offline-root-signed control update |
 | packaged activation (deferred) | select an exact installed revision already permitted by its packaged rollout eligibility, safety domain, and effect contract | signed selection — built only when measured rollout risk justifies the registry, after a policy pilot |
-| URL-discovery repair | none until the repaired revision is packaged | generated source change → existing Chrome/AMO release flow → activation |
-| click, follow-up, login, terms, account navigation | none until packaged | generated source change → store review → same-contract canary or effect-contract-delta review |
+| daemon route-template repair | daemon-side; extension executes packaged primitives on offered URLs | daemon release/config update — no store involvement |
+| DOM discovery/locator repair | none until the repaired revision is packaged | generated source change → existing Chrome/AMO release flow |
+| click, follow-up, login, terms, account navigation | none until packaged | generated source change → store review → same-contract auto-release or effect-contract-delta review |
 | new host, method, endpoint family, permission, protocol, or engine logic | none | normal extension feature release |
 
 This preserves the user experience the catalog was meant to provide:
@@ -69,14 +74,17 @@ From the live dev database (552 jobs; single-operator, includes dev noise):
 | `unavailable: no_identifier` | 126 | largest failure class; pure daemon metadata-resolution work, untouched by any adapter mechanism |
 | user-cancelled/dismissed | 164 | mostly dev noise |
 | `awaiting_human` | 27 | parked on human action |
-| `browser.provider_outcome: ui_changed` | 119 of 139 (86%) | adapter drift/unrecognized pages dominate browser-side failures — the repair-latency target |
-| `wrong_work` / `no_entitlement` | 9 / 6 | identity validation and entitlement walls |
+| `browser.provider_outcome: ui_changed` | 83 unique jobs (119 events; 62 jobs saw it once) | adapter drift/unrecognized pages dominate browser-side failures — 83 unique jobs vs 5 `wrong_work` and 6 `no_entitlement` — the repair-latency target |
+| `wrong_work` / `no_entitlement` | 5 / 6 unique jobs | identity validation and entitlement walls |
 
-Two consequences. First, the highest-leverage browser-side fix is repair
-velocity for `ui_changed`, which daemon URL intelligence and the patch
-generator both attack. Second, the single biggest overall win —
-`no_identifier` — is out of this plan's scope and belongs to daemon metadata
-resolution work.
+Counted by unique job, not raw events, so repeated re-drives of one broken
+page do not inflate the case. Two consequences. First, the highest-leverage
+browser-side fix is repair velocity for `ui_changed`, which daemon URL
+intelligence and the patch generator both attack. Second, the single biggest
+overall win — `no_identifier`, 126 jobs — belongs to daemon metadata
+resolution: it is out of this plan's scope and is the explicit **next
+priority after Phase 1**, ahead of Phase 2 control and Phase 3 intake, for a
+single-installation deployment.
 
 ## Why the current loop does not scale
 
@@ -308,11 +316,13 @@ The architecture has seven boundaries:
    selectors, paths, methods, predicates, text, thresholds, or executable data.
 9. **Restrictive safety state is durable and fail-closed.** The daemon holds
    canonical verified control; the extension persists only
-   `{last_sequence, revoked_ids}` in dedicated `storage.local`. Revocations
-   union monotonically; MV3 restart, expiry, offline operation, pinning, or
-   rollback cannot resurrect a permanently revoked revision. If daemon state
-   disappears or rolls back below the extension's sequence, no positive effect
-   executes until current control is recovered.
+   `{last_sequence, last_verified_suspensions_digest}` in dedicated
+   `storage.local`. A suspension persists until a higher verified sequence
+   lifts it; MV3 restart, expiry, offline operation, or pinning cannot relax
+   accepted state. Permanent revocation arrives only with the deferred
+   offline root. If daemon state disappears or rolls back below the
+   extension's sequence, no positive effect executes until current control
+   is recovered.
 10. **Protocol traffic remains solicited, feature-gated, and non-fatal.** No
     new field widens a strict existing frame, and an inbound handler never
     awaits a request whose reply must traverse the same serialized chain.
@@ -342,29 +352,84 @@ Move URL-shaped provider knowledge daemon-side:
   tried by navigating the user's authenticated browser to a daemon-computed
   URL and adopting the resulting PDF viewer/download through existing packaged
   machinery;
-- resolver and proxy quirks (openurl parameters, `accountid` injection,
-  IdP entity routing) — already config, extended to versioned per-provider
-  route knowledge;
-- candidate ordering: daemon offers an ordered list of candidate URLs for one
-  work; the extension executes them as E1 navigations under the same identity,
-  access-mode, and validation gates as any other effect.
+- versioned per-provider route knowledge (`route_revision`), cited in every
+  observation so a bad template is diagnosable and revertible like any other
+  config. Institution-configured parameters (`accountid`, IdP entity routing,
+  openurl quirks) remain the separate institution-config path they already
+  are — not remotely maintained provider intelligence.
+
+### `provider_direct_get_v1`
+
+The daemon emits **one** candidate at a time, never an ordered list in one
+offer, so two candidates can never race one work:
+
+```json
+{
+  "strategy": "provider_direct_get",
+  "route_revision": "wiley-doi-pdfdirect/1",
+  "expected_identifier": "doi:…",
+  "url": "https://…",
+  "allowed_origin": "https://…",
+  "path_family": "/doi/pdfdirect/{doi}"
+}
+```
+
+The extension checks `delegated`, verifies GET/HTTPS/origin/path/no-userinfo,
+starts one navigation or download, reports the correlated terminal
+observation, and never persists the URL. The daemon decides whether another
+route is warranted after seeing the result.
+
+### Route-template contract (v1)
+
+```text
+method              GET only
+substitution        canonical public work identifiers only
+query               fixed public keys/values or the work identifier;
+                    no tokens, signatures, cookies, patron IDs
+destination         packaged provider family
+scheme              HTTPS; userinfo forbidden
+redirects           bounded; every hop revalidated
+effect              navigation/viewer/download only
+terms               no new or bypassed terms requirement
+cardinality         one candidate in flight per job
+```
+
+A route template may interpolate only canonical public work identifiers. It
+cannot carry signed/bearer values, patron identity, form data, consent
+assertions, non-GET methods, or an endpoint whose use bypasses a terms step
+not already covered by durable packaged consent policy. Any page-derived
+secret remains extension-memory-only and cannot originate in daemon route
+knowledge. Final PDF validation protects against wrong adoption; it does not
+make an unsafe navigation harmless, which is why the envelope above is
+enforced before navigation, not after.
 
 Rules:
 
 - the extension receives **URLs to navigate and observe**, never selectors,
   predicates, or action parameters — its packaged logic decides how a viewer
-  or download is adopted, so store policy is untouched;
-- every candidate URL is HTTPS, no userinfo, provider-family-scoped, and the
-  result still crosses PDF and work-identity validation;
+  or download is adopted. This requires no new extension-store submission per
+  repair and extends the shipped `openurl_handoff` seam; its store
+  classification remains an inference until reviewed;
+- every candidate still crosses PDF and work-identity validation; and
 - failures emit the same redacted observations and count against the same
-  safety domains as adapter effects; and
-- daemon route knowledge is versioned and cited in evidence so a bad template
-  is diagnosable and revertible like any other config.
+  safety domains as adapter effects.
 
-This workstream lands before, and independently of, every extension-side
-change below. When a provider redesign breaks DOM classification but keeps its
-PDF endpoint shape (common), the repair is a daemon config/release the same
-day, and the `ui_changed` class shrinks without waiting on a store.
+### Sequencing against Phase 0
+
+The daemon half may be implemented and tested at any time. Autonomous
+provider-direct candidates are emitted only after the connected extension
+advertises `provider_direct_get_v1` and demonstrably consumes the job's
+existing `access_mode`: under `assisted`, *papio* may open or expose the
+route but must not initiate its download; under `delegated`, it may execute
+one contract-authorized GET; `conservative` receives no provider offer. The
+strict dual parsers enforce this mechanically — an old extension cannot even
+decode the new offer — but the requirement is recorded so the same extension
+release that understands direct routes is the one that enforces access mode.
+
+Once that Phase-0-capable extension is in the stores, every later route
+repair is daemon-only: same-day deployment, no store involvement. When a
+provider redesign breaks DOM classification but keeps its PDF endpoint shape
+(common), the `ui_changed` class shrinks without waiting on a store.
 
 ## 1. Split execution from observation
 
@@ -534,13 +599,17 @@ Every packaged adapter/generic strategy names a `safety_domain_id`. Map failures
 before selecting fallback:
 
 - selector miss, ordinary `unknown`, or UI drift latches locally at
-  `(revision, route_family, page_shape)` — one selector miss must not suspend a
-  whole provider adapter — and permits only explicitly same-or-lower-risk
-  packaged generic strategies in that domain; global suspension requires signed
-  control or maintainer action;
+  `(job, revision, route_family, page_shape)` — one selector miss must not
+  suspend a whole provider adapter — and permits only explicitly
+  same-or-lower-risk packaged generic strategies in that domain; global
+  suspension requires signed control or maintainer action;
 - wrong-work, unexpected effect, work/PDF validation failure, or envelope
-  violation records a daemon-durable `(job, safety_domain, page_shape)`
-  `no_positive_effects` latch; it never falls through to generic automation.
+  violation records a daemon-durable `(job, safety_domain)`
+  `no_positive_effects` latch — deliberately WITHOUT a page-shape dimension,
+  so navigation, SPA mutation, strategy changes, extension restart, or
+  registry changes cannot restore positive automation for that job/domain. It
+  clears only on an explicit human retry decision or the job's terminal
+  outcome. It never falls through to generic automation.
 
 "Assisted" is not a job state; latched failures land in existing transitions:
 
@@ -613,7 +682,17 @@ Drive the existing `ext-v*` workflow rather than replacing it:
 - bounded candidates create a source PR with generated evidence;
 - configured repository policy may auto-merge/tag same-contract E0–E3 repairs
   after deterministic gates and required live evidence pass; store review
-  remains the external gate, not a maintainer queue;
+  remains the external gate, not a maintainer queue. For E2/E3 the
+  preconditions are explicit: unchanged effect contract, full corpus pass
+  including adversarial negatives, live consequence evidence from the
+  reporting installation, and a baseline that is already broken (the repair
+  competes with "parked for everyone", not with working behaviour), with the
+  circuit breaker and signed suspension as the post-release backstop. The
+  third review pass recommended maintainer review for all E2/E3 until staged
+  rollout exists; overruled for a solo-maintainer deployment — the review
+  queue is the harm this plan removes. Flip trigger: any wrong-work adoption
+  caused by an auto-released E2/E3 repair converts that class to
+  review-required until staged rollout ships;
 - a release bot prepares the patch version, changelog, tag, and existing
   dual-store submission;
 - an effect-contract delta or missing consequence evidence routes to maintainer
@@ -629,10 +708,14 @@ ask the end user to approve routine repair mechanics.
 ## 5. Signed adapter control plane
 
 First control version (Phase 2) is deliberately small: one online *papio*
-control-key signature, a monotonic sequence, and restrictive directives only
-(suspend/revoke exact packaged revision IDs and safety domains). Everything
-else in this section — multi-revision registry, staged activation, incident
-tests — is **deferred** until measured rollout risk justifies it.
+control key that can **suspend** exact packaged revision IDs and safety
+domains and **lift a suspension with a higher sequence** — nothing else. A
+compromised online key can deny automation temporarily; it cannot
+permanently brick packaged revisions across reinstall and recovery.
+Permanent revocation belongs entirely to the deferred offline root; do not
+persist a `revoked_ids` set until that design exists. Everything else in
+this section — multi-revision registry, staged activation, incident tests,
+offline root — is **deferred** until measured rollout risk justifies it.
 
 ### Packaged registry (deferred with activation)
 
@@ -683,8 +766,8 @@ The signed document may contain only:
 
 - schema version, monotonic sequence, issued/expiry timestamps, key ID, and
   minimum bundle/extension versions;
-- reversible suspensions;
-- permanent revocations;
+- reversible suspensions and higher-sequence lifts;
+- permanent revocations (deferred with the offline root);
 - exact packaged revision/strategy activation for stable or cohort audiences
   (deferred with the registry);
 - safety-domain `no_positive_effects` restrictions;
@@ -750,11 +833,13 @@ repeat the exchange before positive work.
 ### Durable state, expiry, and rollback
 
 The daemon persists canonical verified control. The extension persists only
-`{last_sequence, revoked_ids}` in dedicated `chrome.storage.local`, not the
-session backend. Revocations union monotonically and can never be lifted by
-runtime control. Suspensions and activation maps come only from the highest
-verified sequence; a higher online-signed sequence may lift a suspension. On
-missing, corrupt, or lower-sequence daemon state, the extension executes no
+`{last_sequence, last_verified_suspensions_digest}` in dedicated
+`chrome.storage.local`, not the session backend. Suspensions and activation
+maps come only from the highest verified sequence; a higher online-signed
+sequence may lift a suspension. Permanent revocation is deferred with the
+offline root and, once built, unions monotonically and can never be lifted by
+runtime control. On missing, corrupt, or lower-sequence daemon state, the
+extension executes no
 positive effect until current control is recovered.
 
 Expiry/stale network state has asymmetric semantics:
@@ -967,10 +1052,24 @@ HTTPS with no userinfo and an allowed origin/path, access-policy authorization,
 execution revalidation, and final PDF/work validation. The current unused
 `expected.doi` field must be enforced before E1 ships.
 
-The generic attempt has a durable `(job, page-shape, strategy,
-active_registry_version)` latch. Failure captures once and parks. E2 generic
-clicks remain a measured graduation: same effect contract, adversarial corpus,
-incident-scoped live evidence, and zero wrong-work evidence are required.
+Generic execution is disciplined, not one-shot-then-park: run every E0
+observation; rank all eligible E1 candidates deterministically; execute E1
+candidates **strictly sequentially** — the next may start only after the
+previous has a correlated terminal observation — up to a short deterministic
+bound (default two per page epoch). An ordinary failure (HTTP error, non-PDF
+payload) advances the chain or parks; an identity, validation, or
+unexpected-effect failure sets the `(job, safety_domain)`
+`no_positive_effects` latch and stops everything. The third review pass
+recommended exactly one E1 attempt per page epoch; overruled with the bound
+instead — stale declared metadata (a `citation_pdf_url` pointing at a viewer
+wrapper) is a dominant real failure shape, and parking on the first 404
+recreates the user-abandonment harm this plan exists to remove.
+
+Persist `(job, page_shape, safety_domain, generic_positive_attempts)` with
+the chosen strategies recorded as evidence, not as latch dimensions that
+would permit another attempt. E2 generic clicks remain a measured
+graduation: same effect contract, adversarial corpus, incident-scoped live
+evidence, and zero wrong-work evidence are required.
 Every attempt emits a redacted observation and uses the same safety-domain
 circuit breaker.
 
@@ -1007,7 +1106,7 @@ Track locally:
   install → activation intervals;
 - blocked-work integral per failure shape;
 - generic, packaged-adapter, and assisted completion rates;
-- safety-domain trips, suspensions, and permanent revocations;
+- safety-domain trips and suspensions;
 - repair recurrence by immutable revision/effect contract;
 - target ambiguity and execution-plan rejection;
 - wrong-work and effect-contract violations;
@@ -1026,7 +1125,7 @@ Objectives:
 - approved source automatically enters the existing dual-store flow;
 - if staged rollout is ever built, a packaged repair progresses incident test
   → cohort → stable without another extension release or prompt;
-- rollback needs no rebuild and cannot resurrect permanent revocation;
+- rollback needs no rebuild and cannot relax accepted restrictive state;
 - duplicate submissions converge on one private incident; and
 - stable operation tolerates zero known wrong-work adoptions.
 
@@ -1035,7 +1134,7 @@ Objectives:
 ### Phase 0 — close current authority gaps
 
 - Write the narrow ADR: ADR-0015 still governs positive runtime behaviour;
-  signed control may only suspend/revoke/select exact packaged IDs.
+  signed control may only suspend/lift exact packaged IDs and domains.
 - Implement memory-only `ExecutionPlan`, redacted `EffectObservation`, and
   fresh-plan execution revalidation through one injectable planning function
   shared with `adapter-try`.
@@ -1046,8 +1145,11 @@ Objectives:
   target uniqueness.
 - Define immutable revision, safety-domain, and effect-contract IDs.
 - Classify and declare all existing extension→daemon data (including
-  `page_capture`); implement Firefox 140+ `data_collection_permissions` and a
-  one-time custom consent — or disabled capture — on Firefox 128–139.
+  `page_capture`) — consent for transmission to the **local native
+  application**; implement Firefox 140+ `data_collection_permissions` and a
+  one-time custom consent — or disabled capture — on Firefox 128–139. Hosted
+  reporting consent is a separate Phase 3 decision; local consent never
+  silently authorizes it.
 - Any new browser message (e.g. `provider_effect_observation`) ships with the
   structured-failure handler contract from Invariant 10.
 
@@ -1058,20 +1160,29 @@ observed; the known primitives no longer underpin later automation.
 
 Run these in parallel after Phase 0:
 
-- ship daemon URL intelligence: per-provider candidate PDF URL templates and
-  route knowledge, offered as ordered E1 navigations through existing packaged
-  primitives — repairs deploy with the daemon, same day, no store surface;
-- run packaged generic E0/E1 on the first settled `unknown`, with
-  safety-domain/no-positive-effect gates and durable attempt latches;
-- record the daemon-durable `(job, safety_domain, page_shape)`
-  `no_positive_effects` latch, enforced entirely through existing job
-  transitions (no control protocol or registry dependency);
+- ship daemon URL intelligence: the daemon half (route templates,
+  `route_revision` config, candidate computation) deploys independently, same
+  day; autonomous `provider_direct_get_v1` candidates are emitted only to an
+  extension that advertises the feature and enforces `access_mode`, one
+  candidate in flight per job;
+- run packaged generic E0/E1 on the first settled `unknown`, with the bounded
+  sequential chain, safety-domain gates, and durable attempt latches;
+- record the daemon-durable `(job, safety_domain)` `no_positive_effects`
+  latch and the `(job, revision, route_family, page_shape)` drift latch,
+  enforced entirely through existing job transitions (no control protocol or
+  registry dependency);
 - add redacted observations, keyed fingerprints, and incident-pinned evidence;
 - build the adapter patch **scaffolder**: reviewed capture → CSS candidate,
   fixture, focused test, revision bump, changelog, and patch release through
   the production planner;
 - drive the existing `ext-v*` path from verified E0/E1 candidates; and
 - survey Zotero statically and in a hermetic network-denied repair harness.
+
+After Phase 1 lands, the next priority is `no_identifier` metadata
+resolution (126 jobs — the largest measured class), ahead of Phase 2 and
+Phase 3, for a single-installation deployment. Restrictive global control
+becomes urgent with multiple active installations or an observed unsafe
+packaged revision, not merely many UI misses.
 
 Do not wait for a locator AST, hosted service, or multi-revision registry.
 
@@ -1082,10 +1193,11 @@ without hand plumbing.
 ### Phase 2 — restrictive control
 
 - publish the minimal signed control schema: one online *papio* control key,
-  monotonic sequence, suspend/revoke of exact packaged revision IDs and safety
-  domains only;
-- persist canonical control in the daemon and `{last_sequence, revoked_ids}` in
-  extension `storage.local`;
+  monotonic sequence, suspension and higher-sequence lift of exact packaged
+  revision IDs and safety domains only;
+- persist canonical control in the daemon and
+  `{last_sequence, last_verified_suspensions_digest}` in extension
+  `storage.local`;
 - add the feature-gated per-session control exchange without widening `hello`;
 - withhold provider offers until each holder reports `applied`; and
 - add `RepairAdapterTransition` with exact event latch and transaction rollback.
@@ -1102,7 +1214,9 @@ but assisted.
 - ship popup/inbox reporting and local list/show/export/submit/delete;
 - add per-profile `never`/`ask`/`automatic` and
   `structural`/`rich_capture` authorization;
-- implement Firefox 140+ built-in and Firefox 128–139 custom consent;
+- implement hosted-transmission consent on top of the Phase 0 local-consent
+  machinery (Firefox 140+ built-in categories, 128–139 custom flow); hosted
+  `ask` creates one deduplicated inbox row, never a modal;
 - publish matching Chrome/Firefox/privacy/onboarding/config disclosures;
 - add structural report intake, private rich uploads, deduplication, receipts,
   complete deletion schedules, and status; and
@@ -1147,9 +1261,11 @@ shipping translator logic or remotely supplied behaviour.
    daemon may still offer but the new extension performs no positive effect,
    then recovers on the same session once control arrives; no provider offer is
    released before `applied`.
-3. **Control sequence semantics:** higher-sequence `suspended→active` lifts a
-   suspension; revocation is monotone; an expired incident test with a
-   suspended stable revision leaves the adapter disabled.
+3. **Control sequence semantics (Phase 2):** higher-sequence
+   `suspended→active` lifts a suspension; a lower or replayed sequence is
+   rejected; monotone-revocation tests move to the offline-root phase; an
+   expired incident test with a suspended stable revision leaves the adapter
+   disabled (Phase 4).
 4. **Atomic registry swap (with Phase 4):** unknown/duplicate/over-cap
    directives, and crashes both before and after the durable write, release no
    job and leave the previous active-registry version intact; a tab drive
@@ -1158,8 +1274,8 @@ shipping translator logic or remotely supplied behaviour.
    repeated event, failed transaction, and old no-ID events produce exactly the
    intended park transitions once; leased, adopting, and identity-review jobs
    remain untouched.
-6. **Safety-domain monotonicity:** selector drift may try one declared generic
-   fallback; wrong-work, validation, unexpected-effect, and envelope failures
+6. **Safety-domain monotonicity:** ordinary drift may run the bounded generic
+   chain; wrong-work, validation, unexpected-effect, and envelope failures
    never execute another positive effect — including after MV3 restart,
    duplicate outcomes, and tab reclassification.
 7. **Generic identity boundary:** title-token similarity produces E0 only; E1
@@ -1181,18 +1297,40 @@ shipping translator logic or remotely supplied behaviour.
     or assisted result for every fixture.
 12. **Fatality containment:** injected failure in every new bridge handler is
     followed by a successful unrelated RPC on the same native session.
+13. **Route access mode:** the same daemon candidate opens but does not
+    download under `assisted`, downloads once under `delegated`, and is never
+    offered under `conservative`.
+14. **Route secrecy:** signed-query, cookie, patron-ID, and authorization
+    sentinels never appear in daemon route templates, native frames,
+    extension storage, logs, captures, or events.
+15. **Route envelope:** reject non-GET, HTTP, userinfo, private/local
+    addresses, wrong provider family, wrong path family, cross-origin
+    credential propagation, and any endpoint bypassing a terms step not
+    covered by durable packaged consent policy.
+16. **Sequential candidates:** a second daemon candidate cannot be offered
+    until the first has a correlated terminal observation.
+17. **Strong latch:** wrong-work on page shape A prevents generic and adapter
+    effects after navigation to page shape B and after MV3 restart; the latch
+    clears only on explicit human retry or terminal outcome.
+18. **Generic bound:** all E0 strategies may observe; at most the bounded
+    number of E1 executions occur per page epoch, strictly sequentially, and
+    an identity/validation/unexpected-effect failure stops the chain.
+19. **Production composition:** the route and observation paths are exercised
+    through the real background dispatcher, native host, daemon bridge, and
+    planner — not just direct handler calls — because individually tested
+    handlers have repeatedly been unreachable or fatal in composition.
 
 ## Release-class verdicts
 
 | class | verdict | mechanism |
 |---|---|---|
-| daemon URL intelligence | **Go now** | daemon-side route/template knowledge through packaged navigation primitives; no store surface |
-| local job/page-shape suppression | **Go now** | daemon-durable latch through existing job transitions |
-| reversible suspension | **Go after control protocol** | online-signed restrictive control of packaged revision/domain, prominently disclosed |
+| daemon route-template repair | **Go now (daemon half); autonomous use gated on the Phase-0 extension** | route contract v1 through packaged navigation primitives; one candidate in flight |
+| local drift/safety latches | **Go now** | daemon-durable latches through existing job transitions |
+| reversible suspension | **Go after control protocol** | online-signed suspension + higher-sequence lift, prominently disclosed |
 | permanent revocation | **Deferred** | offline-root signing built with staged rollout |
 | generic E0/E1 | **Go after Phase 0** | packaged safety-domain strategy; exact identity for E1 |
 | same-contract E0/E1 repair | **Go automatic** | generated source, deterministic/live gates, store release |
-| same-contract E2/E3 repair | **Go automatic (store-released active)**; staged inactive rollout deferred | generated source, live evidence, store release |
+| same-contract E2/E3 repair | **Go automatic (store-released active)**; flip to review on any wrong-work adoption; staged inactive rollout deferred | generated source, live evidence, broken baseline, store release |
 | effect-contract delta E2/E3 | **Go with maintainer action review** | generated candidate, live evidence, store release |
 | E4 new capability | **Go through normal feature design** | extension source and store review |
 | automatic reporting | **Go after per-profile/tier consent** | structural by default; rich only when separately authorized |
