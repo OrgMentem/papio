@@ -82,7 +82,7 @@ import {
   type AdapterSpec,
   type PageVerdict,
 } from "./adapters/types";
-import { planExecution, type Plan, type PlanResult } from "./plan";
+import { planExecution, planGeneric, type GenericCandidate, type GenericPlan, type Plan, type PlanResult } from "./plan";
 import { observeUnknown, type ObserveChromeApi } from "./observe";
 import {
   capturePage,
@@ -769,6 +769,11 @@ export interface BridgeDeps {
   };
 }
 
+interface GenericDownloadAttempt {
+  candidates: GenericCandidate[];
+  index: number;
+}
+
 interface DownloadTrack {
   ids: Set<number>;
   ambiguous: boolean;
@@ -776,6 +781,15 @@ interface DownloadTrack {
   delivery?: boolean;
   route?: DeliveryRoute;
   sessionEvidence?: DeliverySessionEvidence;
+  generic?: GenericDownloadAttempt;
+}
+/** Generic state is intentionally carried on the persisted job object so the
+ * attempt bound survives an MV3 worker restart without widening the wire. */
+interface GenericJobState {
+  generic_evaluated?: boolean;
+  generic_positive_attempts?: number;
+  generic_attempted_strategies?: string[];
+  generic_evidence?: string[];
 }
 
 interface PdfGrabTrack {
@@ -1779,6 +1793,21 @@ export class Bridge {
     this.classifyRetries.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
     this.challengeBlockedOutcomeSent.delete(`${jobID}:challenge_blocked`);
+    // Generic E1 is bounded per drive, not per job lifetime. The following
+    // accepted-drive update persists this synchronous reset with the rest of
+    // the drive transition.
+    this.store = {
+      ...this.store,
+      activeJobs: this.store.activeJobs.map((entry) => {
+        if (entry.job_id !== jobID) return entry;
+        const next = { ...entry } as ActiveJob & Record<string, unknown>;
+        delete next["generic_evaluated"];
+        delete next["generic_positive_attempts"];
+        delete next["generic_attempted_strategies"];
+        delete next["generic_evidence"];
+        return next as ActiveJob;
+      }),
+    };
   }
 
   /** Chrome answers this origin query from effective access: an all-sites grant
@@ -7639,12 +7668,17 @@ export class Bridge {
       const currentJob = findByJob(this.store, job.job_id);
       if (currentJob === undefined) return;
       const captured = await this.recordUnknown(currentJob, host);
+      if (await this.runGenericOnSettledUnknown(currentJob)) return;
+      const latest = findByJob(this.store, job.job_id) ?? currentJob;
+      const genericState = latest as ActiveJob & GenericJobState;
       const outcomeKey = `${job.job_id}:ui_changed`;
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
+        const evidence = genericState.generic_evidence ?? [];
         const detail =
           "No source-controlled adapter matched this provider page." +
-          (captured ? " A sanitized diagnostic was saved locally for adapter development." : "");
+          (captured ? " A sanitized diagnostic was saved locally for adapter development." : "") +
+          (evidence.length === 0 ? "" : ` Generic evidence: ${evidence.join(", ")}.`);
         if (!this.send("provider_outcome", { outcome: "ui_changed", detail }, job.job_id)) {
           this.handoffOutcomeSent.delete(outcomeKey);
         } else {
@@ -8273,7 +8307,11 @@ export class Bridge {
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
         if (
-          !this.send("provider_outcome", { outcome: "ui_changed", adapter_id: adapter.id, adapter_version: adapter.version }, job.job_id)
+          !this.send(
+            "provider_outcome",
+            { outcome: "ui_changed", adapter_id: adapter.id, adapter_version: adapter.version },
+            job.job_id,
+          )
         ) {
           this.handoffOutcomeSent.delete(outcomeKey);
         } else {
@@ -8286,6 +8324,230 @@ export class Bridge {
 
     return captured;
   }
+  private async runGenericOnSettledUnknown(job: ActiveJob): Promise<boolean> {
+    if (
+      this.handoffDrives.has(job.job_id) === false ||
+      job.tab_id < 0 ||
+      job.status !== "accepted" ||
+      (job.access_mode !== "delegated" && job.access_mode !== "assisted")
+    ) {
+      return false;
+    }
+    const state = job as ActiveJob & GenericJobState;
+    if (state.generic_evaluated === true || (state.generic_positive_attempts ?? 0) >= 2) return false;
+    // Reserve the E0 observation before injection. This is the durable
+    // check-and-set that prevents a restarted worker from re-running it.
+    await this.update((s) => ({
+      ...s,
+      activeJobs: s.activeJobs.map((candidate) =>
+        candidate.job_id === job.job_id
+          ? ({ ...candidate, generic_evaluated: true } as ActiveJob)
+          : candidate,
+      ),
+    }));
+    let planned: GenericPlan | undefined;
+    try {
+      const results = await this.deps.scripting.executeScript({
+        target: { tabId: job.tab_id },
+        func: planGeneric,
+        args: [null, { ...(job.expected ?? {}) }, { access_mode: job.access_mode }],
+      });
+      const result = results[0]?.result as GenericPlan | undefined;
+      if (
+        result !== undefined &&
+        typeof result === "object" &&
+        result !== null &&
+        Array.isArray(result.evidence) &&
+        Array.isArray(result.candidates)
+      ) {
+        planned = result;
+      }
+    } catch (error) {
+      console.error("papio: generic planning failed; staying assisted", error);
+    }
+    if (planned === undefined) return false;
+    const evidence = planned.evidence.filter((item): item is string => typeof item === "string").slice(0, 20);
+    await this.update((s) => ({
+      ...s,
+      activeJobs: s.activeJobs.map((candidate) => {
+        if (candidate.job_id !== job.job_id) return candidate;
+        const prior = (candidate as ActiveJob & GenericJobState).generic_evidence ?? [];
+        return {
+          ...candidate,
+          generic_evidence: [...new Set([...prior, ...evidence])].slice(0, 20),
+        } as ActiveJob;
+      }),
+    }));
+    const candidates =
+      job.access_mode === "delegated"
+        ? planned.candidates.filter(
+            (candidate): candidate is GenericCandidate =>
+              candidate !== null &&
+              typeof candidate === "object" &&
+              (candidate.strategy_id === "generic-citation-pdf/1" ||
+                candidate.strategy_id === "generic-article-pdf-link/1") &&
+              candidate.strategy_version === "1" &&
+              typeof candidate.url === "string" &&
+              candidate.url.startsWith("https://"),
+          )
+        : [];
+    if (candidates.length === 0) return false;
+    await this.startGenericCandidate(job.job_id, candidates, 0);
+    return true;
+  }
+
+  private async startGenericCandidate(
+    jobID: string,
+    candidates: GenericCandidate[],
+    requestedIndex: number,
+  ): Promise<void> {
+    const current = findByJob(this.store, jobID);
+    if (
+      current === undefined ||
+      !this.handoffDrives.has(jobID) ||
+      current.tab_id < 0 ||
+      current.status !== "accepted" ||
+      current.access_mode !== "delegated"
+    ) {
+      return;
+    }
+    const state = current as ActiveJob & GenericJobState;
+    const attempted = state.generic_attempted_strategies ?? [];
+    const attempts = state.generic_positive_attempts ?? 0;
+    if (attempts >= 2) return;
+    let index = requestedIndex;
+    let candidate: GenericCandidate | undefined;
+    while (index < candidates.length) {
+      const next = candidates[index];
+      index += 1;
+      if (next !== undefined && !attempted.includes(next.strategy_id)) {
+        candidate = next;
+        break;
+      }
+    }
+    if (candidate === undefined) {
+      await this.emitGenericUnknown(jobID);
+      return;
+    }
+    // Execution revalidation is separate from discovery. A changed document
+    // loses authority rather than allowing a stale URL to be downloaded.
+    try {
+      const results = await this.deps.scripting.executeScript({
+        target: { tabId: current.tab_id },
+        func: planGeneric,
+        args: [null, { ...(current.expected ?? {}) }, { access_mode: "delegated" }],
+      });
+      const fresh = results[0]?.result as GenericPlan | undefined;
+      const freshCandidate = fresh?.candidates?.find(
+        (entry) =>
+          entry?.strategy_id === candidate!.strategy_id &&
+          entry.strategy_version === candidate!.strategy_version &&
+          entry.url === candidate!.url,
+      );
+      if (freshCandidate === undefined) {
+        await this.emitGenericWrongWork(jobID, candidate.strategy_id);
+        return;
+      }
+    } catch (error) {
+      console.error("papio: generic execution revalidation failed; staying assisted", error);
+      await this.emitGenericWrongWork(jobID, candidate.strategy_id);
+      return;
+    }
+    const latest = findByJob(this.store, jobID);
+    if (
+      latest === undefined ||
+      latest.download_initiated === true ||
+      this.downloads.has(jobID) ||
+      !this.handoffDrives.has(jobID)
+    ) {
+      return;
+    }
+    await this.update((s) => ({
+      ...s,
+      activeJobs: s.activeJobs.map((entry) => {
+        if (entry.job_id !== jobID) return entry;
+        const prior = entry as ActiveJob & GenericJobState;
+        return {
+          ...entry,
+          download_initiated: true,
+          adapter_id: candidate!.strategy_id,
+          generic_positive_attempts: (prior.generic_positive_attempts ?? 0) + 1,
+          generic_attempted_strategies: [...(prior.generic_attempted_strategies ?? []), candidate!.strategy_id],
+        } as ActiveJob;
+      }),
+    }));
+    this.pendingDownloadURLs.set(candidate.url, jobID);
+    try {
+      const downloadID = await this.deps.downloads.download({
+        url: candidate.url,
+        filename: `papio/${jobID}/paper.pdf`,
+        conflictAction: "uniquify",
+        saveAs: false,
+      });
+      this.downloads.set(jobID, {
+        ids: new Set([downloadID]),
+        ambiguous: false,
+        directOffer: false,
+        generic: { candidates, index },
+      });
+    } catch (error) {
+      console.error("papio: generic download initiation failed", error);
+      await this.update((s) => ({
+        ...s,
+        activeJobs: s.activeJobs.map((entry) => {
+          if (entry.job_id !== jobID) return entry;
+          const next = { ...entry, download_initiated: false } as ActiveJob & Record<string, unknown>;
+          delete next["adapter_id"];
+          return next as ActiveJob;
+        }),
+      }));
+      await this.startGenericCandidate(jobID, candidates, index);
+    } finally {
+      this.pendingDownloadURLs.delete(candidate.url);
+    }
+  }
+  private async emitGenericWrongWork(jobID: string, strategyID: string): Promise<void> {
+    if (
+      this.send(
+        "provider_outcome",
+        { outcome: "wrong_work", detail: `Generic strategy ${strategyID} failed identity revalidation.` },
+        jobID,
+      )
+    ) {
+      await this.settleHandoffAfterOutcome(jobID);
+    }
+  }
+
+  private async emitGenericUnknown(jobID: string): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    if (job === undefined) return;
+    const state = job as ActiveJob & GenericJobState;
+    const evidence = state.generic_evidence ?? [];
+    const detail =
+      "No source-controlled adapter matched this provider page." +
+      (evidence.length === 0 ? "" : ` Generic evidence: ${evidence.join(", ")}.`);
+    const outcomeKey = `${jobID}:ui_changed`;
+    if (!this.handoffOutcomeSent.has(outcomeKey) && this.send("provider_outcome", { outcome: "ui_changed", detail }, jobID)) {
+      this.handoffOutcomeSent.add(outcomeKey);
+      await this.settleHandoffAfterOutcome(jobID);
+    }
+  }
+
+  private async advanceGenericCandidate(jobID: string, track: GenericDownloadAttempt): Promise<void> {
+    this.downloads.delete(jobID);
+    await this.update((s) => ({
+      ...s,
+      activeJobs: s.activeJobs.map((entry) =>
+        entry.job_id === jobID ? ({ ...entry, download_initiated: false } as ActiveJob) : entry,
+      ),
+    }));
+    if (track.index >= track.candidates.length) {
+      await this.emitGenericUnknown(jobID);
+      return;
+    }
+    await this.startGenericCandidate(jobID, track.candidates, track.index);
+  }
+
   private async citationDOIForTab(tabID: number): Promise<string | undefined> {
     try {
       const results = await this.deps.scripting.executeScript({
@@ -8293,10 +8555,8 @@ export class Bridge {
         func: readCitationDOI,
       });
       const value = results[0]?.result;
-      return typeof value === "string" && value.trim() !== "" ? value : undefined;
+      return typeof value === "string" && value.length > 0 ? value : undefined;
     } catch {
-      // A page that cannot expose metadata is unchanged: no new identity
-      // assertion is possible, so preserve the established assisted path.
       return undefined;
     }
   }
@@ -8718,6 +8978,11 @@ export class Bridge {
       if (state === "interrupted") {
         for (const job of this.store.activeJobs) {
           const track = this.downloads.get(job.job_id);
+          if (track?.generic !== undefined && track.ids.has(delta.id)) {
+            await this.discardDownload(job.job_id, delta.id);
+            await this.advanceGenericCandidate(job.job_id, track.generic);
+            return;
+          }
           if (track?.delivery === true && track.ids.has(delta.id)) {
             await this.failDelivery(job.job_id, delta.id, "The PDF download was interrupted");
             return;
@@ -8745,6 +9010,11 @@ export class Bridge {
     const found = await this.deps.downloads.search({ id: delta.id });
     const item = found[0];
     const mime = item?.mime?.split(";", 1)[0]?.trim().toLowerCase();
+    if (track.generic !== undefined && mime !== "application/pdf") {
+      await this.discardDownload(owner.job_id, delta.id);
+      await this.advanceGenericCandidate(owner.job_id, track.generic);
+      return;
+    }
     if (track.delivery === true) {
       if (mime !== "application/pdf") {
         await this.failDelivery(owner.job_id, delta.id, "Downloaded file was not a PDF — job stays in your inbox");

@@ -3,7 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { adapters, interpret, type AdapterSpec } from "../src/adapters/types";
-import { planExecution } from "../src/plan";
+import { planExecution, planGeneric } from "../src/plan";
 import { captureOrigin, parseHTML } from "./harness";
 
 function fixtureHTML(provider: string, scenario: string): string {
@@ -97,6 +97,60 @@ test("planExecution keeps href and meta URL extraction equivalent to live downlo
   expect(planExecution(selfPage, hrefSpec, {}, {})).toEqual({
     assisted: "declared action URL is not a distinct HTTPS URL",
   });
+});
+
+test("planGeneric records E0 evidence but emits no E1 candidate for assisted access", () => {
+  const doc = parseHTML(
+    '<head><meta name="citation_doi" content="doi:10.1000/ABC"></head><body></body>',
+    "https://publisher.example/article",
+  );
+  const planned = planGeneric(doc, { doi: "10.1000/abc" }, { access_mode: "assisted" });
+  expect(planned.candidates).toEqual([]);
+  expect(planned.evidence).toContain("e0:citation-doi=exact");
+});
+
+test("planGeneric requires an exact normalized DOI before emitting candidates", () => {
+  const doc = parseHTML(
+    '<head><meta name="citation_doi" content="10.1000/right"></head><body><article><a href="/pdf/right.pdf">PDF</a></article></body>',
+    "https://publisher.example/article",
+  );
+  expect(planGeneric(doc, { doi: "10.1000/wrong" }, { access_mode: "delegated" }).candidates).toEqual([]);
+});
+
+test("planGeneric refuses two article PDF anchors instead of choosing the first", () => {
+  const doc = parseHTML(
+    '<head><meta name="citation_doi" content="10.1000/right"></head><body><article>' +
+      '<a href="/pdf/one.pdf">one</a><a href="/pdf/two.pdf">two</a></article></body>',
+    "https://publisher.example/article",
+  );
+  const planned = planGeneric(doc, { doi: "doi:10.1000/right" }, { access_mode: "delegated" });
+  expect(planned.candidates).toEqual([]);
+  expect(planned.evidence).toContain("e0:article-pdf-link=ambiguous");
+});
+
+test("planGeneric prioritizes one declared citation PDF before article links", () => {
+  const doc = parseHTML(
+    '<head><meta name="citation_doi" content="10.1000/right">' +
+      '<meta name="citation_pdf_url" content="/download/citation.pdf"></head>' +
+      '<body><article><a href="/pdf/anchor.pdf">anchor</a></article></body>',
+    "https://publisher.example/article",
+  );
+  const planned = planGeneric(doc, { doi: "10.1000/right" }, { access_mode: "delegated" });
+  expect(planned.candidates[0]).toEqual({
+    strategy_id: "generic-citation-pdf/1",
+    strategy_version: "1",
+    url: "https://publisher.example/download/citation.pdf",
+  });
+});
+
+test("planGeneric does nothing when the page exposes no metadata", () => {
+  const planned = planGeneric(
+    parseHTML("<html><body><article><a href='/pdf/paper.pdf'>PDF</a></article></body></html>", "https://publisher.example/article"),
+    { doi: "10.1000/right" },
+    { access_mode: "delegated" },
+  );
+  expect(planned.candidates).toEqual([]);
+  expect(planned.evidence).toContain("e0:citation-doi=missing");
 });
 
 test("planExecution body has no module-scope runtime dependencies", () => {

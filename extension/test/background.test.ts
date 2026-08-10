@@ -3,16 +3,16 @@
 // a fake native port. No real chrome, and no wall-clock timers: every fake
 // emitter awaits the handler promises it triggers, so the flow is deterministic.
 
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 
 import { parseBrowserMessage, type BrowserMessage, type PageCapturePayload } from "../src/protocol";
-import { emptyStore, type StateBackend, type StoreShape } from "../src/state";
+import { emptyStore, type ActiveJob, type StateBackend, type StoreShape } from "../src/state";
 import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
 import { KeepaliveManager, type FreshSessionEvidence, type KeepaliveAPI } from "../src/keepalive";
 import { type AdapterSpec, type PageVerdict } from "../src/adapters/types";
-import { planExecution, type Plan } from "../src/plan";
+import { planExecution, planGeneric, type GenericPlan, type Plan } from "../src/plan";
 import {
   Bridge,
   findManagedTab,
@@ -8116,4 +8116,148 @@ test("DOI normalization strips presentation prefixes but preserves repeated slas
   expect(normalizeExpectedDOI(" DOI: https://doi.org/10.1000//ABC ")).toBe("10.1000//abc");
   expect(normalizeExpectedDOI("https://doi.org/10.1000//ABC")).toBe("10.1000//abc");
   expect(normalizeExpectedDOI("10.1000/abc")).not.toBe(normalizeExpectedDOI("10.1000//abc"));
+});
+
+describe("generic settled-unknown acquisition", () => {
+  async function reachUnknown(
+    h: Harness,
+    jobID: string,
+    accessMode: "assisted" | "delegated",
+    planned: GenericPlan,
+    expectedDOI = "10.1000/generic",
+  ): Promise<void> {
+    h.deps.permissions.contains = async () => true;
+    h.deps.scripting.executeScript = async (injection) => {
+      if (injection.func === planGeneric) return [{ result: planned }];
+      return [];
+    };
+    await h.bridge.start();
+    const offer = jobOffer(jobID, OPENURL, accessMode) as { payload: Record<string, unknown> };
+    offer.payload["expected"] = { doi: expectedDOI };
+    await h.port.inbound(offer);
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    h.clock.now += 6_000;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+  }
+
+  test("assisted generic execution records E0 evidence without downloading", async () => {
+    const h = makeHarness();
+    await reachUnknown(
+      h,
+      "job_generic_assisted",
+      "assisted",
+      {
+        evidence: ["e0:citation-doi=exact"],
+        candidates: [
+          { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/a.pdf" },
+        ],
+      },
+    );
+    expect(h.downloads.started).toHaveLength(0);
+    const outcome = h
+      .frames()
+      .find((frame) => frame.type === "provider_outcome" && frame.payload.outcome === "ui_changed");
+    expect(outcome?.payload.detail).toContain("e0:citation-doi=exact");
+  });
+
+  test("a declared citation URL downloads once and records its strategy", async () => {
+    const h = makeHarness();
+    await reachUnknown(
+      h,
+      "job_generic_citation",
+      "delegated",
+      {
+        evidence: ["e0:citation-doi=exact", "e0:citation-pdf=unique"],
+        candidates: [
+          { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/citation.pdf" },
+        ],
+      },
+    );
+    expect(h.downloads.started.map((entry) => entry.url)).toEqual(["https://www.jstor.org/download/citation.pdf"]);
+    expect(h.backend.store.activeJobs[0]?.adapter_id).toBe("generic-citation-pdf/1");
+  });
+
+  test("an interrupted citation download advances exactly once to the article link", async () => {
+    const h = makeHarness();
+    await reachUnknown(
+      h,
+      "job_generic_ordinary_failure",
+      "delegated",
+      {
+        evidence: ["e0:citation-doi=exact"],
+        candidates: [
+          { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/missing.pdf" },
+          { strategy_id: "generic-article-pdf-link/1", strategy_version: "1", url: "https://www.jstor.org/pdf/article.pdf" },
+        ],
+      },
+    );
+    expect(h.downloads.started).toHaveLength(1);
+    await h.downloads.onChanged.emit({ id: 901, state: { current: "interrupted" } });
+    expect(h.downloads.started.map((entry) => entry.url)).toEqual([
+      "https://www.jstor.org/download/missing.pdf",
+      "https://www.jstor.org/pdf/article.pdf",
+    ]);
+    expect(h.downloads.started.filter((entry) => entry.url.endsWith("article.pdf"))).toHaveLength(1);
+  });
+
+  test("identity revalidation failure stops generic execution without a download", async () => {
+    const h = makeHarness();
+    let plans = 0;
+    h.deps.permissions.contains = async () => true;
+    h.deps.scripting.executeScript = async (injection) => {
+      if (injection.func === planGeneric) {
+        plans += 1;
+        return [
+          {
+            result:
+              plans === 1
+                ? {
+                    evidence: ["e0:citation-doi=exact"],
+                    candidates: [
+                      {
+                        strategy_id: "generic-citation-pdf/1",
+                        strategy_version: "1",
+                        url: "https://www.jstor.org/download/identity.pdf",
+                      },
+                    ],
+                  }
+                : { evidence: ["e0:citation-doi=mismatch"], candidates: [] },
+          },
+        ];
+      }
+      return [];
+    };
+    await h.bridge.start();
+    const offer = jobOffer("job_generic_identity", OPENURL, "delegated") as { payload: Record<string, unknown> };
+    offer.payload["expected"] = { doi: "10.1000/generic" };
+    await h.port.inbound(offer);
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    h.clock.now += 6_000;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    expect(h.downloads.started).toHaveLength(0);
+    expect(h.frames().some((frame) => frame.type === "provider_outcome" && frame.payload.outcome === "wrong_work")).toBe(true);
+  });
+
+  test("the generic attempt latch survives a worker restart", async () => {
+    const h = makeHarness();
+    await reachUnknown(
+      h,
+      "job_generic_restart",
+      "delegated",
+      {
+        evidence: ["e0:citation-doi=exact"],
+        candidates: [
+          { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/restart.pdf" },
+        ],
+      },
+    );
+    const before = h.downloads.started.length;
+    const persisted = JSON.parse(JSON.stringify(h.backend.store)) as StoreShape;
+    const reloaded = new Bridge(h.deps);
+    await reloaded.start();
+    expect(h.downloads.started).toHaveLength(before);
+    expect((persisted.activeJobs[0] as ActiveJob & { generic_evaluated?: boolean })?.generic_evaluated).toBe(true);
+  });
 });

@@ -1,9 +1,9 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 //
-// INJECTION CONSTRAINT: planExecution is serialized verbatim by
-// chrome.scripting.executeScript({func}). Its body must not reference imports,
-// module helpers, or closure state. Keep every helper nested below, and pass
-// every policy/configuration value as an argument.
+// INJECTION CONSTRAINT: planExecution and planGeneric are serialized verbatim
+// by chrome.scripting.executeScript({func}). Their bodies must not reference
+// imports, module helpers, or closure state. Keep every helper nested below,
+// and pass every policy/configuration value as an argument.
 
 import type { AdapterSpec, DownloadRule, PageVerdict } from "./adapters/types";
 
@@ -44,6 +44,214 @@ export interface AssistedPlan {
 }
 
 export type PlanResult = Plan | AssistedPlan;
+
+export interface GenericCandidate {
+  strategy_id: "generic-citation-pdf/1" | "generic-article-pdf-link/1";
+  strategy_version: "1";
+  url: string;
+}
+
+export interface GenericPlan {
+  /** E0 observations are static labels; page text and raw URLs stay local. */
+  evidence: string[];
+  candidates: GenericCandidate[];
+}
+
+export function planGeneric(
+  doc: Document,
+  expected: ExpectedWork,
+  policy: PlanPolicy,
+): GenericPlan;
+export function planGeneric(
+  doc: null,
+  expected: ExpectedWork,
+  policy: PlanPolicy,
+): Promise<GenericPlan>;
+export function planGeneric(
+  doc: Document | null,
+  expected: ExpectedWork,
+  policy: PlanPolicy,
+): GenericPlan | Promise<GenericPlan> {
+  // Keep this function self-contained: it is serialized into a provider tab.
+  const root: Document = doc ?? document;
+  const pageHref = root.location?.href ?? "https://fixture.local/";
+  const evidence: string[] = [];
+
+  const normalizeDOI = (raw: string): string => {
+    let value = raw.trim().toLowerCase();
+    value = value.replace(/^doi:\s*/, "");
+    value = value.replace(/^(?:https?:\/\/)?(?:dx\.)?doi\.org\//, "");
+    return value;
+  };
+  const registrableHost = (host: string): string => {
+    const labels = host.toLowerCase().split(".").filter(Boolean);
+    if (labels.length <= 2) return labels.join(".");
+    const suffix = labels.slice(-2).join(".");
+    const commonTwoLevel: Record<string, true> = {
+      "co.uk": true,
+      "org.uk": true,
+      "ac.uk": true,
+      "gov.uk": true,
+      "com.au": true,
+      "net.au": true,
+      "org.au": true,
+      "co.nz": true,
+      "com.br": true,
+      "co.jp": true,
+    };
+    return commonTwoLevel[suffix] === true && labels.length >= 3 ? labels.slice(-3).join(".") : suffix;
+  };
+  const safeURL = (raw: string): URL | null => {
+    try {
+      const parsed = new URL(raw.trim(), pageHref);
+      if (parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "") return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+  const page = safeURL(pageHref);
+  if (page === null) return { evidence, candidates: [] };
+  const sameAllowedHost = (candidate: URL, declaredOrigin: string | null): boolean => {
+    const pageHost = registrableHost(page.hostname);
+    if (registrableHost(candidate.hostname) === pageHost) return true;
+    if (declaredOrigin === null) return false;
+    try {
+      const declared = new URL(declaredOrigin);
+      return registrableHost(candidate.hostname) === registrableHost(declared.hostname);
+    } catch {
+      return false;
+    }
+  };
+  const valuesFor = (selector: string, attribute: string): string[] => {
+    let nodes: Element[];
+    try {
+      nodes = Array.from(root.querySelectorAll(selector));
+    } catch {
+      return [];
+    }
+    return nodes
+      .map((node) => node.getAttribute(attribute)?.trim() ?? "")
+      .filter((value) => value.length > 0);
+  };
+  const citationDOIs = valuesFor('meta[name="citation_doi"]', "content");
+  const citationTitles = valuesFor('meta[name="citation_title"]', "content");
+  const citationYears = valuesFor('meta[name="citation_year"]', "content");
+  evidence.push(citationTitles.length === 0 ? "e0:citation-title=missing" : "e0:citation-title=present");
+  evidence.push(citationYears.length === 0 ? "e0:citation-year=missing" : "e0:citation-year=present");
+  const jsonValues: { dois: string[]; urls: string[] } = { dois: [], urls: [] };
+  const visitJSON = (value: unknown, depth: number): void => {
+    if (depth > 6 || value === null || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 32)) visitJSON(item, depth + 1);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    for (const [key, item] of Object.entries(record)) {
+      if (typeof item === "string") {
+        if (key === "contentUrl" || key === "associatedMedia") jsonValues.urls.push(item);
+        if (key === "identifier" || key === "doi") jsonValues.dois.push(item);
+      } else {
+        visitJSON(item, depth + 1);
+      }
+    }
+  };
+  let jsonScripts: Element[] = [];
+  try {
+    jsonScripts = Array.from(root.querySelectorAll('script[type="application/ld+json"]'));
+  } catch {
+    jsonScripts = [];
+  }
+  for (const script of jsonScripts) {
+    try {
+      visitJSON(JSON.parse(script.textContent ?? ""), 0);
+    } catch {
+      evidence.push("e0:json-ld-invalid");
+    }
+  }
+  const alternatePDFURLs = valuesFor('link[rel~="alternate"][type="application/pdf"]', "href");
+  evidence.push(jsonValues.urls.length === 0 ? "e0:jsonld-content-url=missing" : "e0:jsonld-content-url=present");
+  evidence.push(alternatePDFURLs.length === 0 ? "e0:alternate-pdf=missing" : "e0:alternate-pdf=present");
+  const exposedDOI = [...citationDOIs, ...jsonValues.dois].find((value) => normalizeDOI(value).length > 0);
+  if (exposedDOI === undefined) {
+    evidence.push("e0:citation-doi=missing");
+    return { evidence, candidates: [] };
+  }
+  evidence.push("e0:citation-doi=present");
+  const expectedDOI = typeof expected.doi === "string" ? normalizeDOI(expected.doi) : "";
+  if (expectedDOI.length === 0 || normalizeDOI(exposedDOI) !== expectedDOI) {
+    evidence.push("e0:citation-doi=mismatch");
+    return { evidence, candidates: [] };
+  }
+  evidence.push("e0:citation-doi=exact");
+
+  const declaredURLs = [
+    ...valuesFor('meta[name="citation_pdf_url"]', "content"),
+    ...jsonValues.urls,
+    ...alternatePDFURLs,
+  ];
+  const citationPDFOrigins: string[] = [];
+  for (const raw of valuesFor('meta[name="citation_pdf_url"]', "content")) {
+    const parsed = safeURL(raw);
+    if (parsed !== null) citationPDFOrigins.push(parsed.origin);
+  }
+  const declaredOrigin = citationPDFOrigins[0] ?? null;
+  const declaredCandidates: string[] = [];
+  for (const raw of declaredURLs) {
+    const parsed = safeURL(raw);
+    if (parsed === null || !sameAllowedHost(parsed, declaredOrigin)) continue;
+    if (parsed.href === page.href) continue;
+    declaredCandidates.push(parsed.href);
+  }
+  if (declaredCandidates.length === 1) {
+    evidence.push("e0:citation-pdf=unique");
+  } else if (declaredCandidates.length > 1) {
+    evidence.push("e0:citation-pdf=ambiguous");
+  } else {
+    evidence.push("e0:citation-pdf=missing");
+  }
+  const candidates: GenericCandidate[] = [];
+  if (declaredCandidates.length === 1) {
+    candidates.push({
+      strategy_id: "generic-citation-pdf/1",
+      strategy_version: "1",
+      url: declaredCandidates[0]!,
+    });
+  }
+
+  const routeShape = (pathname: string): boolean => {
+    const path = pathname.toLowerCase();
+    return path.endsWith(".pdf") || /\/(?:pdf|download|full[-_]?text)(?:\/|$)/.test(path);
+  };
+  const articleAnchors: Element[] = [];
+  try {
+    for (const region of Array.from(root.querySelectorAll("article, [role='article'], main"))) {
+      for (const anchor of Array.from(region.querySelectorAll("a[href]"))) articleAnchors.push(anchor);
+    }
+  } catch {
+    // Invalid selectors are impossible here, but a hostile DOM must stay E0-only.
+  }
+  const articleURLs: string[] = [];
+  for (const anchor of articleAnchors) {
+    const parsed = safeURL(anchor.getAttribute("href") ?? "");
+    if (parsed === null || !routeShape(parsed.pathname) || !sameAllowedHost(parsed, declaredOrigin)) continue;
+    articleURLs.push(parsed.href);
+  }
+  if (articleURLs.length === 1) {
+    evidence.push("e0:article-pdf-link=unique");
+    candidates.push({
+      strategy_id: "generic-article-pdf-link/1",
+      strategy_version: "1",
+      url: articleURLs[0]!,
+    });
+  } else if (articleURLs.length > 1) {
+    evidence.push("e0:article-pdf-link=ambiguous");
+  } else {
+    evidence.push("e0:article-pdf-link=missing");
+  }
+  if (policy.access_mode !== "delegated") return { evidence, candidates: [] };
+  return { evidence, candidates };
+}
 
 export function planExecution(
   doc: Document,
