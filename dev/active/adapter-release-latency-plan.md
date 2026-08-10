@@ -1141,24 +1141,53 @@ Statically import only reviewable evidence:
 - attachment MIME/URL transforms that map to packaged E0/E1 candidates; and
 - explicit host/route hints for source repair.
 
-For behaviour static analysis cannot recover, run the pinned translator only in
-a hermetic build/repair harness over a captured fixture. Deny live network;
-record attempted requests, DOM reads, candidate outputs, and helper usage.
-Replay old and new pinned revisions differentially so an upstream update cannot
-silently alter generated *papio* behaviour.
+For behaviour static analysis cannot recover, execute the pinned translator —
+never in the browser, and never as browser authority. Two execution homes are
+ratified as **live options** (2026-08-10, operator decision):
 
-Observed output is evidence for a source PR, never browser runtime authority.
-Do not mix translator code into a differently licensed *papio* runtime bundle
-without a separate licensing decision. Measure static and sandbox-observed
-yield separately before reconsidering any runtime compatibility layer.
+1. **Repair-time hermetic harness.** Run the translator over a captured
+   fixture with the network denied; record attempted requests, DOM reads,
+   candidate outputs, and helper usage. Replay old and new pinned revisions
+   differentially so an upstream update cannot silently alter generated
+   *papio* behaviour. Output feeds the patch generator as evidence for a
+   source PR.
+2. **Daemon-hosted candidate source.** The daemon (not the store-reviewed
+   extension) runs a translator runtime as a separately-installed subprocess
+   — the zotio pattern — using Zotero's own open-source server-side stack.
+   Translators execute against the sanitized captures *papio* already stores
+   (no network) or, later, against public endpoints via daemon-controlled
+   HTTP. Their output is **metadata and candidate PDF URLs only**, which
+   enter the existing direct-offer envelope: delegated-only, identity-gated,
+   origin/path-checked, one in flight, and always behind final PDF and
+   work-identity validation. Translator code never gains browser authority
+   and never ships inside *papio*'s bundle; the corpus and runtime are
+   fetched separately at install time (licensing decision required before
+   shipping — the stack is not MIT).
+
+Gate for option 2: the **capture-replay yield experiment** — run matching
+translators against the stored capture/fixture corpus and count PDF
+candidates the generic engine and route table missed. It earns
+implementation only if that marginal yield is material.
+
+**Replay yield measured 2026-08-10** (same pinned corpus; 106 pages — 45
+live captures, 61 fixtures; network-denied translation-server harness,
+report in `dev/scratch/zotero-replay/`): `detectWeb` succeeded on 41% of
+regex-matched runs, `doWeb` completed without network on 46% of those,
+translators produced PDF candidates on exactly 2 pages — and both were
+already covered by the generic citation/anchor checks. **Marginal yield: 0
+pages.** The daemon-hosted runtime therefore does NOT clear its gate on
+current evidence and stays unimplemented. Standing revisit trigger: re-run
+the replay (cheap, offline) whenever the capture corpus gains a meaningfully
+different provider mix — the corpus today is biased toward providers *papio*
+already handles, which is exactly where translators are redundant.
 
 **Static yield measured 2026-08-10** (pinned corpus
 `fbee32689eca0d88105ac518c3b7f53bdbdd2508`, 749 translators): exactly **1**
 statically representable E1 candidate; 97% of translators depend on
 network/helper calls and every route-adjacent publisher translator computes
 `detectWeb`. The build-time static importer is therefore not worth building;
-the hermetic execution harness is the only remaining evidence path, and it
-must earn its way in from repair-time need, not speculatively.
+translator value, if any, is reachable only through execution — see the two
+live options above.
 
 ## Operations and objectives
 
@@ -1414,7 +1443,8 @@ shipping translator logic or remotely supplied behaviour.
 | automatic reporting | **Go after per-profile/tier consent** | structural by default; rich only when separately authorized |
 | packaged positive activation | **Policy pilot required** | dormant-revision pilot on both stores before any registry build |
 | positive runtime rule catalog | **Deferred, not categorical** | revisit per "Deferred alternatives" triggers |
-| runtime Zotero translator execution | **No planned implementation** | static/hermetic repair-time evidence only |
+| runtime Zotero translator execution (browser) | **No planned implementation** | translator code never runs in the extension |
+| daemon-hosted translator candidate source | **Live option, gated on measured marginal yield** | subprocess runtime over stored captures; candidates through the direct-offer envelope; licensing review before shipping |
 
 ## Stop conditions
 

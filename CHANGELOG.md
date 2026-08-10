@@ -41,6 +41,18 @@ execution records kept during the initial build.
   `dev/scratch/repair/`: the sanitized fixture with its header, an
   adapter-try analysis report, the adapter's next revision string, and the
   exact apply steps — without touching extension source.
+- **Title-only works get an OpenAlex rescue.** When a request has a title but
+  no usable identifier and Crossref finds nothing, the daemon now searches
+  OpenAlex with the same strict corroboration (exact normalized title,
+  matching year, agreeing authors) and adopts the work's OpenAlex ID — and
+  its DOI when one exists — unlocking the normal resolver pipeline. Runs
+  behind the existing `openalex` source policy and its contact-email
+  requirement.
+- **ISBN-only books park for you instead of dying.** A book request that has
+  an ISBN but no DOI no longer ends `unavailable: no_identifier` when an
+  institutional OpenURL resolver is configured: *papio* opens an assisted
+  handoff with a book-formatted OpenURL (`rft.isbn`, title, year, authors) so
+  you can fetch it through your library while *papio* tracks the outcome.
 
 ## [0.20.0] - 2026-08-10
 
