@@ -35,6 +35,14 @@ func TestEnrichCorroboratesCrossrefSearchResults(t *testing.T) {
 			body: `{"message":{"items":[{"DOI":"10.1234/example","title":["A Precise Study"],"author":[{"family":"Smith"}],"published-print":{"date-parts":[[2023]]}}]}}`,
 		},
 		{
+			name: "candidate year missing is rejected",
+			body: `{"message":{"items":[{"DOI":"10.1234/example","title":["A Precise Study"],"author":[{"family":"Smith"}]}]}}`,
+		},
+		{
+			name: "candidate author missing is rejected",
+			body: `{"message":{"items":[{"DOI":"10.1234/example","title":["A Precise Study"],"published-print":{"date-parts":[[2024]]}}]}}`,
+		},
+		{
 			name: "author mismatch is rejected",
 			body: `{"message":{"items":[{"DOI":"10.1234/example","title":["A Precise Study"],"author":[{"family":"Brown"}],"published-print":{"date-parts":[[2024]]}}]}}`,
 		},
@@ -67,6 +75,31 @@ func TestEnrichCorroboratesCrossrefSearchResults(t *testing.T) {
 				t.Errorf("enriched metadata = %+v", enriched)
 			}
 		})
+	}
+}
+func TestEnrichRejectsISBNAmbiguityAndMissingEditionEvidence(t *testing.T) {
+	const matching = `{"DOI":"10.1234/example","title":["A Precise Study"],"author":[{"family":"Smith"}],"published-print":{"date-parts":[[2024]]}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"message":{"items":[` + matching + `,{"DOI":"10.1234/other","title":["A Precise Study"],"author":[{"family":"Smith"}],"published-print":{"date-parts":[[2024]]}}]}}`))
+	}))
+	defer server.Close()
+
+	enriched, matched, err := NewWithOptions(Options{BaseURL: server.URL}).Enrich(context.Background(), work.Work{
+		Title: "A Precise Study", Year: 2024, Authors: []string{"Smith"},
+	})
+	if err != nil || matched || enriched.DOI != "" {
+		t.Fatalf("ambiguous enrichment = %+v, matched=%v, err=%v; ambiguity must be refused", enriched, matched, err)
+	}
+
+	for _, requested := range []work.Work{
+		{Title: "A Precise Study", Authors: []string{"Smith"}},
+		{Title: "A Precise Study", Year: 2024},
+		{Title: "A Precise Study", Year: 2024, Authors: []string{"Smith"}, ISBN: "9781576753484"},
+	} {
+		enriched, matched, err := NewWithOptions(Options{BaseURL: server.URL}).Enrich(context.Background(), requested)
+		if err != nil || matched || enriched.DOI != "" {
+			t.Fatalf("requested=%+v enrichment=%+v matched=%v err=%v; missing/ISBN evidence must be refused", requested, enriched, matched, err)
+		}
 	}
 }
 

@@ -1655,6 +1655,15 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 		case hasBase && base != "" && !institutionalExhausted:
 			detail := InstitutionalOpenURLHandoffDetail
 			if !row.Work.HasFetchableIdentifier() && row.Work.ISBN != "" {
+				// ISBN is an assisted-only rescue: persist the narrower
+				// ceiling before opening the action so a restarted bridge
+				// cannot advertise delegated automation for a catalogue/ebook
+				// handoff. NarrowPolicyAccessMode is monotone, and the row
+				// copy is updated for this pass's offer construction.
+				if err := s.Jobs.NarrowPolicyAccessMode(ctx, row.ID, config.ModeAssisted); err != nil {
+					return err
+				}
+				row.Policy.AccessMode = config.ModeAssisted
 				detail = InstitutionalBookOpenURLHandoffDetail
 			}
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", detail, job.Access(true, "paywall")); err != nil {
@@ -2716,8 +2725,9 @@ func (s *Service) DrainHooks(timeout time.Duration) bool {
 const InstitutionalOpenURLHandoffDetail = "institutional OpenURL handoff: sign in to your institution first, then run 'papio actions open' — a fresh link is generated on each open; if the provider reports a stale or expired session, re-run 'papio actions open'"
 
 // InstitutionalBookOpenURLHandoffDetail explains the deliberately human-
-// assisted ISBN route. The resolver may find a catalogue or ebook record, but
-// papio does not claim it can automatically fetch and validate a book PDF.
+// assisted ISBN route. Before this action is opened, the job policy is
+// durably narrowed to assisted; the detail itself remains the existing
+// HumanAction wire payload and is not used as an access-mode signal.
 const InstitutionalBookOpenURLHandoffDetail = "institutional OpenURL handoff: sign in to your institution first, then run 'papio actions open' — this ISBN route can locate a catalogue or ebook record, but papio cannot automatically fetch or validate a book PDF; if you obtain a file, papio can adopt it; if the provider reports a stale or expired session, re-run 'papio actions open'"
 
 // OABrowserHandoffDetail identifies a handoff that must open the public OA

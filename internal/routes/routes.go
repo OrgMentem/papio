@@ -129,11 +129,44 @@ func Validate() error {
 		if err != nil {
 			return fmt.Errorf("route %q does not compile: %w", route.routeRevision, err)
 		}
-		if err := validateCandidate(candidate, route, identifier); err != nil {
+		if err := ValidateCandidate(candidate); err != nil {
 			return fmt.Errorf("route %q violates its envelope: %w", route.routeRevision, err)
 		}
 	}
 	return nil
+}
+
+// ProviderHintNames returns every namespace accepted by CandidatesFor's
+// providerHint argument: the packaged provider family and its exact revision.
+// The returned slice is a copy so callers cannot mutate route-package state.
+func ProviderHintNames() []string {
+	names := make([]string, 0, len(routeTable)*2)
+	seen := make(map[string]struct{}, len(routeTable)*2)
+	for _, route := range routeTable {
+		for _, name := range []string{route.provider, route.routeRevision} {
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// IsProviderHint reports whether name is a packaged provider-family or exact
+// route-revision hint. Configuration uses this same namespace rather than
+// duplicating route-table knowledge.
+func IsProviderHint(name string) bool {
+	for _, route := range routeTable {
+		if name == route.provider || name == route.routeRevision {
+			return true
+		}
+	}
+	return false
 }
 
 // CandidatesFor returns DOI-based direct routes. providerHint may be empty,
@@ -243,37 +276,82 @@ func expand(route routeTemplate, identifier string) (Candidate, error) {
 		TermsPolicy:   termsPolicyNone,
 		Identifier:    route.identifier + ":" + identifier,
 	}
-	if err := validateCandidate(candidate, route, identifier); err != nil {
+	if err := ValidateCandidate(candidate); err != nil {
 		return Candidate{}, err
 	}
 	return candidate, nil
 }
 
-func validateCandidate(candidate Candidate, route routeTemplate, identifier string) error {
+// ValidateCandidate checks a compiled candidate against its declared route
+// envelope. It is the single emission-boundary validator for callers that
+// carry a Candidate outside this package; in particular, it computes the
+// escaped path with the same segment-preserving encoder used by the compiler.
+func ValidateCandidate(candidate Candidate) error {
+	var route *routeTemplate
+	for i := range routeTable {
+		if routeTable[i].routeRevision == candidate.RouteRevision {
+			route = &routeTable[i]
+			break
+		}
+	}
+	if route == nil {
+		return fmt.Errorf("unknown route revision %q", candidate.RouteRevision)
+	}
+	if candidate.AllowedOrigin != route.origin {
+		return fmt.Errorf("allowed origin does not match packaged route %q", candidate.RouteRevision)
+	}
+	if candidate.PathFamily != route.pathFamily {
+		return fmt.Errorf("path family does not match packaged route %q", candidate.RouteRevision)
+	}
+	if candidate.TermsPolicy != termsPolicyNone {
+		return fmt.Errorf("terms envelope mismatch")
+	}
+
+	kind, identifier, ok := strings.Cut(candidate.Identifier, ":")
+	if !ok || kind != route.identifier || identifier == "" || !safeIdentifier(identifier) {
+		return fmt.Errorf("candidate identifier is invalid for route %q", candidate.RouteRevision)
+	}
+	placeholder := "{" + route.identifier + "}"
+	if strings.Count(route.pathFamily, placeholder) != 1 ||
+		route.pathPrefix+placeholder+route.pathSuffix != route.pathFamily ||
+		strings.ContainsAny(strings.Replace(route.pathFamily, placeholder, "", 1), "{}?#\\") {
+		return fmt.Errorf("packaged path family is invalid for route %q", candidate.RouteRevision)
+	}
+
+	origin, err := url.Parse(route.origin)
+	if err != nil || origin.Scheme != "https" || origin.Host == "" ||
+		origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		return fmt.Errorf("packaged origin is invalid for route %q", candidate.RouteRevision)
+	}
 	u, err := url.Parse(candidate.URL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
 	}
-	origin, err := url.Parse(candidate.AllowedOrigin)
-	if err != nil {
-		return fmt.Errorf("invalid allowed origin: %w", err)
-	}
-	if u.Scheme != "https" || u.User != nil || u.Host != origin.Host || u.Hostname() != origin.Hostname() {
+	if u.Scheme != "https" || u.User != nil || u.Host == "" || u.Fragment != "" {
 		return fmt.Errorf("URL is outside HTTPS/origin envelope")
 	}
-	if candidate.TermsPolicy != termsPolicyNone || route.query != u.RawQuery {
-		return fmt.Errorf("terms or query envelope mismatch")
+
+	escapedIdentifier := escapePathIdentifier(identifier)
+	expectedPath := strings.Replace(route.pathFamily, placeholder, escapedIdentifier, 1)
+	expectedRawPath := route.pathPrefix + escapedIdentifier + route.pathSuffix
+	if expectedPath != expectedRawPath {
+		return fmt.Errorf("packaged route path family does not match its compiler")
 	}
-	placeholder := "{" + route.identifier + "}"
-	expectedPath := strings.Replace(route.pathFamily, placeholder, escapePathIdentifier(identifier), 1)
 	if u.EscapedPath() != expectedPath {
 		return fmt.Errorf("path %q is outside %q", u.EscapedPath(), route.pathFamily)
 	}
-	if route.query != "" && (strings.Count(u.Query().Get("download"), "true") != 1 || len(u.Query()) != 1) {
+	if u.RawQuery != route.query {
 		return fmt.Errorf("query is duplicated or unexpected")
 	}
-	if route.query == "" && len(u.Query()) != 0 {
-		return fmt.Errorf("query is duplicated or unexpected")
+	expectedURL := (&url.URL{
+		Scheme:   origin.Scheme,
+		Host:     origin.Host,
+		Path:     route.pathPrefix + identifier + route.pathSuffix,
+		RawPath:  expectedRawPath,
+		RawQuery: route.query,
+	}).String()
+	if candidate.URL != expectedURL {
+		return fmt.Errorf("URL is not the canonical encoding for route %q", candidate.RouteRevision)
 	}
 	return nil
 }

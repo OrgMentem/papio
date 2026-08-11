@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -807,51 +808,56 @@ func enumRequired(field, value string, allowed ...string) error {
 
 // Browser message types.
 const (
-	MsgHello                    = "hello"
-	MsgHelloAck                 = "hello_ack"
-	MsgPageAcquire              = "page_acquire"
-	MsgPageAcquireAck           = "page_acquire_ack"
-	MsgPageCapture              = "page_capture"
-	MsgPageCaptureRequest       = "page_capture_request"
-	MsgPageCaptureRequestResult = "page_capture_request_result"
-	MsgJobOffer                 = "job_offer"
-	MsgHandoffOutcome           = "handoff_outcome"
-	MsgJobAccept                = "job_accept"
-	MsgJobReject                = "job_reject"
-	MsgAuthPending              = "auth_pending"
-	MsgAuthReturned             = "auth_returned"
-	MsgSessionEvidence          = "session_evidence"
-	MsgDownloadStarted          = "download_started"
-	MsgDownloadComplete         = "download_complete"
-	MsgDeliveryContext          = "delivery_context"
-	MsgProviderOutcome          = "provider_outcome"
-	MsgCancel                   = "cancel"
-	MsgHandoffFocus             = "handoff_focus"
-	MsgAck                      = "ack"
-	MsgError                    = "error"
-	MsgTriageSnapshotRequest    = "triage_snapshot_request"
-	MsgTriageSnapshotResponse   = "triage_snapshot_response"
-	MsgTriageCountsRequest      = "triage_counts_request"
-	MsgTriageCountsResponse     = "triage_counts_response"
-	MsgTriageDecide             = "triage_decide"
-	MsgTriageDecideResult       = "triage_decide_result"
-	MsgHumanActionResolve       = "human_action_resolve"
-	MsgHumanActionResolveResult = "human_action_resolve_result"
-	MsgReviewPreviewRequest     = "review_preview_request"
-	MsgReviewPreviewResult      = "review_preview_result"
-	MsgStatsRequest             = "stats_request"
-	MsgStatsResponse            = "stats_response"
-	MsgActivityRequest          = "activity_request"
-	MsgActivityResponse         = "activity_response"
-	MsgPageBulkStatusRequest    = "page_bulk_status_request"
-	MsgPageBulkStatusResult     = "page_bulk_status_result"
-	MsgPageBulkSubmitRequest    = "page_bulk_submit_request"
-	MsgPageBulkSubmitResult     = "page_bulk_submit_result"
-	MsgDeliveryReconcileRequest = "delivery_reconcile_request"
-	MsgDeliveryReconcileResult  = "delivery_reconcile_result"
-	MsgHandoffLinkRequest       = "handoff_link_request"
-	MsgHandoffLinkResult        = "handoff_link_result"
-	// MsgPdfGrabRequest/MsgPdfGrabResult are ADR-0020's PDF-grab pair (feature
+	MsgHello                           = "hello"
+	MsgHelloAck                        = "hello_ack"
+	MsgPageAcquire                     = "page_acquire"
+	MsgPageAcquireAck                  = "page_acquire_ack"
+	MsgPageCapture                     = "page_capture"
+	MsgPageCaptureRequest              = "page_capture_request"
+	MsgPageCaptureRequestResult        = "page_capture_request_result"
+	MsgJobOffer                        = "job_offer"
+	MsgHandoffOutcome                  = "handoff_outcome"
+	MsgJobAccept                       = "job_accept"
+	MsgJobReject                       = "job_reject"
+	MsgAuthPending                     = "auth_pending"
+	MsgAuthReturned                    = "auth_returned"
+	MsgSessionEvidence                 = "session_evidence"
+	MsgDownloadStarted                 = "download_started"
+	MsgDownloadComplete                = "download_complete"
+	MsgDeliveryContext                 = "delivery_context"
+	MsgProviderOutcome                 = "provider_outcome"
+	MsgCancel                          = "cancel"
+	MsgHandoffFocus                    = "handoff_focus"
+	MsgAck                             = "ack"
+	MsgError                           = "error"
+	MsgTriageSnapshotRequest           = "triage_snapshot_request"
+	MsgTriageSnapshotResponse          = "triage_snapshot_response"
+	MsgTriageCountsRequest             = "triage_counts_request"
+	MsgTriageCountsResponse            = "triage_counts_response"
+	MsgTriageDecide                    = "triage_decide"
+	MsgTriageDecideResult              = "triage_decide_result"
+	MsgHumanActionResolve              = "human_action_resolve"
+	MsgHumanActionResolveResult        = "human_action_resolve_result"
+	MsgReviewPreviewRequest            = "review_preview_request"
+	MsgReviewPreviewResult             = "review_preview_result"
+	MsgStatsRequest                    = "stats_request"
+	MsgStatsResponse                   = "stats_response"
+	MsgActivityRequest                 = "activity_request"
+	MsgActivityResponse                = "activity_response"
+	MsgPageBulkStatusRequest           = "page_bulk_status_request"
+	MsgPageBulkStatusResult            = "page_bulk_status_result"
+	MsgPageBulkSubmitRequest           = "page_bulk_submit_request"
+	MsgPageBulkSubmitResult            = "page_bulk_submit_result"
+	MsgDeliveryReconcileRequest        = "delivery_reconcile_request"
+	MsgDeliveryReconcileResult         = "delivery_reconcile_result"
+	MsgHandoffLinkRequest              = "handoff_link_request"
+	MsgHandoffLinkResult               = "handoff_link_result"
+	MsgProviderDirectGetRequest        = "provider_direct_get_request"
+	MsgProviderDirectGetResult         = "provider_direct_get_result"
+	MsgProviderDriveEpochStartRequest  = "provider_drive_epoch_start_request"
+	MsgProviderDriveEpochStartResult   = "provider_drive_epoch_start_result"
+	MsgProviderDriveEpochResultRequest = "provider_drive_epoch_result_request"
+	MsgProviderDriveEpochResult        = "provider_drive_epoch_result"
 	// pdf_grab_v1). MsgPdfGrabResult is sent twice per grab: synchronously in
 	// reply to MsgPdfGrabRequest (request_id set, outcome "steering" with
 	// grab_id+steering_path, or a refusal outcome), and again later,
@@ -868,10 +874,11 @@ const (
 
 // jobScoped lists the types that must carry a job_id.
 var jobScoped = map[string]bool{
-	MsgJobOffer: true, MsgJobAccept: true, MsgJobReject: true, MsgHandoffOutcome: true,
-	MsgAuthPending: true, MsgAuthReturned: true,
 	MsgDownloadStarted: true, MsgDownloadComplete: true, MsgDeliveryContext: true,
-	MsgProviderOutcome: true, MsgCancel: true, MsgHandoffFocus: true,
+	MsgProviderOutcome: true, MsgProviderDirectGetRequest: true, MsgProviderDirectGetResult: true,
+	MsgProviderDriveEpochStartRequest: true, MsgProviderDriveEpochStartResult: true,
+	MsgProviderDriveEpochResultRequest: true, MsgProviderDriveEpochResult: true,
+	MsgCancel: true, MsgHandoffFocus: true,
 }
 
 // HelloPayload announces the extension and its adapter versions.
@@ -1047,10 +1054,14 @@ type JobOfferPayload struct {
 	OpenURL           string            `json:"openurl"`
 	ProviderHosts     []string          `json:"provider_hosts"`
 	Expected          *JobOfferExpected `json:"expected,omitempty"`
-	AccessMode        string            `json:"access_mode"`
+	AccessMode        string            `json:"access_mode,omitempty"`
 	LoginEntityID     string            `json:"login_entity_id,omitempty"`
 	ProquestAccountID string            `json:"proquest_account_id,omitempty"`
 	RequiresAuth      bool              `json:"requires_auth,omitempty"`
+	DriveAttemptID    string            `json:"drive_attempt_id,omitempty"`
+	DriveOrdinal      *int64            `json:"drive_ordinal,omitempty"`
+	DriveStrategy     string            `json:"drive_strategy,omitempty"`
+	DriveRevision     string            `json:"drive_revision,omitempty"`
 	ExpiresAt         string            `json:"expires_at"`
 }
 
@@ -1111,6 +1122,71 @@ type ProviderOutcomePayload struct {
 	Outcome        string `json:"outcome"`
 	AdapterID      string `json:"adapter_id,omitempty"`
 	AdapterVersion string `json:"adapter_version,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+}
+
+// ProviderDirectGetRequestPayload asks a feature-capable extension to fetch one
+// daemon-selected public provider route. The URL is constrained to the declared
+// origin/path envelope; it carries no credentials or opaque query parameters.
+type ProviderDirectGetRequestPayload struct {
+	DriveAttemptID     string `json:"drive_attempt_id"`
+	Ordinal            int64  `json:"ordinal"`
+	RouteRevision      string `json:"route_revision"`
+	ExpectedIdentifier string `json:"expected_identifier"`
+	URL                string `json:"url"`
+	AllowedOrigin      string `json:"allowed_origin"`
+	PathFamily         string `json:"path_family"`
+	TermsPolicy        string `json:"terms_policy"`
+}
+
+// ProviderDirectGetResultPayload is the extension's classified terminal
+// observation. FinalHost/FinalPath are sanitized landing metadata, never a URL
+// with query, fragment, userinfo, or secret-bearing components.
+type ProviderDirectGetResultPayload struct {
+	DriveAttemptID string `json:"drive_attempt_id"`
+	Ordinal        int64  `json:"ordinal"`
+	RouteRevision  string `json:"route_revision"`
+	Outcome        string `json:"outcome"`
+	FinalHost      string `json:"final_host,omitempty"`
+	FinalPath      string `json:"final_path,omitempty"`
+	LandingClass   string `json:"landing_class"`
+	Detail         string `json:"detail,omitempty"`
+}
+type ProviderDriveEpochStartRequestPayload struct {
+	RequestID      string `json:"request_id,omitempty"`
+	DriveAttemptID string `json:"drive_attempt_id"`
+	Ordinal        int64  `json:"ordinal"`
+	Strategy       string `json:"strategy"`
+	Revision       string `json:"revision"`
+}
+
+type ProviderDriveEpochStartResultPayload struct {
+	RequestID      string `json:"request_id,omitempty"`
+	DriveAttemptID string `json:"drive_attempt_id"`
+	Ordinal        int64  `json:"ordinal"`
+	Strategy       string `json:"strategy"`
+	Revision       string `json:"revision"`
+	Outcome        string `json:"outcome"`
+	Detail         string `json:"detail,omitempty"`
+}
+
+type ProviderDriveEpochResultRequestPayload struct {
+	RequestID      string `json:"request_id,omitempty"`
+	DriveAttemptID string `json:"drive_attempt_id"`
+	Ordinal        int64  `json:"ordinal"`
+	Strategy       string `json:"strategy"`
+	Revision       string `json:"revision"`
+	Outcome        string `json:"outcome"`
+	Detail         string `json:"detail,omitempty"`
+}
+
+type ProviderDriveEpochResultPayload struct {
+	RequestID      string `json:"request_id,omitempty"`
+	DriveAttemptID string `json:"drive_attempt_id"`
+	Ordinal        int64  `json:"ordinal"`
+	Strategy       string `json:"strategy"`
+	Revision       string `json:"revision"`
+	Outcome        string `json:"outcome"`
 	Detail         string `json:"detail,omitempty"`
 }
 
@@ -1804,8 +1880,8 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgJobOffer:
 		p := &JobOfferPayload{}
-		if err = browserRequireFields(payloadFields, "openurl", "provider_hosts", "access_mode", "expires_at"); err == nil {
-			err = browserRejectNullFields(payloadFields, "expected", "login_entity_id", "proquest_account_id", "requires_auth")
+		if err = browserRequireFields(payloadFields, "openurl", "provider_hosts", "expires_at"); err == nil {
+			err = browserRejectNullFields(payloadFields, "expected", "access_mode", "login_entity_id", "proquest_account_id", "requires_auth", "drive_attempt_id", "drive_ordinal", "drive_strategy", "drive_revision")
 		}
 		if raw, ok := payloadFields["expected"]; ok && err == nil {
 			var expectedFields map[string]json.RawMessage
@@ -1899,6 +1975,81 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		}
 		if err == nil {
 			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgProviderDirectGetRequest:
+		p := &ProviderDirectGetRequestPayload{}
+		if err = browserRequireFields(payloadFields, "drive_attempt_id", "ordinal", "route_revision", "expected_identifier", "url", "allowed_origin", "path_family", "terms_policy"); err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgProviderDirectGetResult:
+		p := &ProviderDirectGetResultPayload{}
+		if err = browserRequireFields(payloadFields, "drive_attempt_id", "ordinal", "route_revision", "outcome", "landing_class"); err == nil {
+			err = browserRejectNullFields(payloadFields, "final_host", "final_path", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgProviderDriveEpochStartRequest:
+		p := &ProviderDriveEpochStartRequestPayload{}
+		if err = browserRequireFields(payloadFields, "drive_attempt_id", "ordinal", "strategy", "revision"); err == nil {
+			err = browserRejectNullFields(payloadFields, "request_id")
+			if err == nil {
+				err = strictDecode(env.Payload, p)
+			}
+		}
+		if err == nil {
+			err = validateDriveEpochTuple(p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision, "provider_drive_epoch_start_request")
+		}
+		msg.Payload = p
+	case MsgProviderDriveEpochStartResult:
+		p := &ProviderDriveEpochStartResultPayload{}
+		if err = browserRequireFields(payloadFields, "drive_attempt_id", "ordinal", "strategy", "revision", "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "request_id", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = validateDriveEpochTuple(p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision, "provider_drive_epoch_start_result")
+		}
+		if err == nil {
+			err = enumRequired("provider_drive_epoch_start_result.outcome", p.Outcome, "started", "stale", "unsupported", "error")
+		}
+		msg.Payload = p
+	case MsgProviderDriveEpochResultRequest:
+		p := &ProviderDriveEpochResultRequestPayload{}
+		if err = browserRequireFields(payloadFields, "drive_attempt_id", "ordinal", "strategy", "revision", "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "request_id", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = validateDriveEpochTuple(p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision, "provider_drive_epoch_result_request")
+		}
+		msg.Payload = p
+	case MsgProviderDriveEpochResult:
+		p := &ProviderDriveEpochResultPayload{}
+		if err = browserRequireFields(payloadFields, "drive_attempt_id", "ordinal", "strategy", "revision", "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "request_id", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = validateDriveEpochTuple(p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision, "provider_drive_epoch_result")
+		}
+		if err == nil {
+			err = enumRequired("provider_drive_epoch_result.outcome", p.Outcome, "applied", "stale", "duplicate", "unsupported", "error")
 		}
 		msg.Payload = p
 	case MsgError:
@@ -2299,8 +2450,10 @@ func (p *JobOfferPayload) validate() error {
 			return fmt.Errorf("invalid provider host %q", h)
 		}
 	}
-	if err := enumRequired("access_mode", p.AccessMode, "assisted", "delegated"); err != nil {
-		return err
+	if p.AccessMode != "" {
+		if err := enumRequired("access_mode", p.AccessMode, "assisted", "delegated"); err != nil {
+			return err
+		}
 	}
 	if !rfc3339RE.MatchString(p.ExpiresAt) {
 		return fmt.Errorf("expires_at must be RFC3339")
@@ -2588,6 +2741,149 @@ func (p *ProviderOutcomePayload) validate() error {
 		return fmt.Errorf("detail exceeds 500 chars")
 	}
 	return nil
+}
+func (p *ProviderDirectGetRequestPayload) validate() error {
+	if err := validateCorrelationID("provider_direct_get_request.drive_attempt_id", p.DriveAttemptID); err != nil {
+		return err
+	}
+	if p.Ordinal < 0 || p.Ordinal > MaxBrowserInteger {
+		return fmt.Errorf("provider_direct_get_request.ordinal must be in range 0..%d", MaxBrowserInteger)
+	}
+	if p.RouteRevision == "" || browserTextLen(p.RouteRevision) > 128 || !strings.Contains(p.RouteRevision, "/") {
+		return fmt.Errorf("provider_direct_get_request.route_revision is invalid")
+	}
+	if p.ExpectedIdentifier == "" || browserTextLen(p.ExpectedIdentifier) > 256 || strings.ContainsAny(p.ExpectedIdentifier, "?#{}\\\x00\r\n@") || directGetIdentifierUnsafe(p.ExpectedIdentifier) {
+		return fmt.Errorf("provider_direct_get_request.expected_identifier is invalid")
+	}
+	if browserTextLen(p.PathFamily) == 0 || browserTextLen(p.PathFamily) > 512 || strings.ContainsAny(p.PathFamily, "?#\\\x00\r\n") {
+		return fmt.Errorf("provider_direct_get_request.path_family is invalid")
+	}
+	if browserTextLen(p.URL) == 0 || browserTextLen(p.URL) > 2048 || browserTextLen(p.AllowedOrigin) == 0 || browserTextLen(p.AllowedOrigin) > 300 {
+		return fmt.Errorf("provider_direct_get_request URL envelope exceeds bounds")
+	}
+	if err := validateDirectGetEnvelope(p.URL, p.AllowedOrigin, p.PathFamily, p.ExpectedIdentifier); err != nil {
+		return fmt.Errorf("provider_direct_get_request: %w", err)
+	}
+	if err := enumRequired("provider_direct_get_request.terms_policy", p.TermsPolicy, "none", "durable_consent"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *ProviderDirectGetResultPayload) validate() error {
+	if err := validateCorrelationID("provider_direct_get_result.drive_attempt_id", p.DriveAttemptID); err != nil {
+		return err
+	}
+	if p.Ordinal < 0 || p.Ordinal > MaxBrowserInteger {
+		return fmt.Errorf("provider_direct_get_result.ordinal must be in range 0..%d", MaxBrowserInteger)
+	}
+	if p.RouteRevision == "" || browserTextLen(p.RouteRevision) > 128 || !strings.Contains(p.RouteRevision, "/") {
+		return fmt.Errorf("provider_direct_get_result.route_revision is invalid")
+	}
+	if err := enumRequired("provider_direct_get_result.outcome", p.Outcome,
+		"success", "not_pdf", "foreign", "login", "terms", "challenge", "cancelled",
+		"timeout", "network", "rate_limited", "server_error", "unknown"); err != nil {
+		return err
+	}
+	if err := enumRequired("provider_direct_get_result.landing_class", p.LandingClass,
+		"pdf", "html", "login", "terms", "challenge", "foreign", "unknown"); err != nil {
+		return err
+	}
+	if p.FinalHost != "" && (!hostRE.MatchString(p.FinalHost) || strings.ToLower(p.FinalHost) != p.FinalHost) {
+		return fmt.Errorf("provider_direct_get_result.final_host must be a lowercase hostname")
+	}
+	if p.FinalPath != "" && (browserTextLen(p.FinalPath) > 1000 || !strings.HasPrefix(p.FinalPath, "/") || strings.ContainsAny(p.FinalPath, "?#\x00\r\n")) {
+		return fmt.Errorf("provider_direct_get_result.final_path must be a sanitized path")
+	}
+	if p.Outcome == "success" && (p.LandingClass != "pdf" || p.FinalHost == "" || p.FinalPath == "") {
+		return fmt.Errorf("provider_direct_get_result success requires pdf landing and final envelope")
+	}
+	if browserTextLen(p.Detail) > 500 {
+		return fmt.Errorf("provider_direct_get_result.detail exceeds 500 chars")
+	}
+	return nil
+}
+func validateDriveEpochTuple(attempt string, ordinal int64, strategy, revision, what string) error {
+	if err := validateCorrelationID(what+".drive_attempt_id", attempt); err != nil {
+		return err
+	}
+	if ordinal < 0 || ordinal > MaxBrowserInteger {
+		return fmt.Errorf("%s.ordinal out of range", what)
+	}
+	if strategy == "" || browserTextLen(strategy) > 128 || strings.ContainsAny(strategy, "\x00\r\n") {
+		return fmt.Errorf("%s.strategy invalid", what)
+	}
+	if revision == "" || browserTextLen(revision) > 128 || strings.ContainsAny(revision, "\x00\r\n") {
+		return fmt.Errorf("%s.revision invalid", what)
+	}
+	return nil
+}
+
+func validateDirectGetEnvelope(rawURL, rawOrigin, pathFamily, expectedIdentifier string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Host == "" || u.Fragment != "" {
+		return fmt.Errorf("url must be an https URL without userinfo or fragment")
+	}
+	origin, err := url.Parse(rawOrigin)
+	if err != nil || origin.Scheme != "https" || origin.User != nil || origin.Path != "" ||
+		origin.RawQuery != "" || origin.Fragment != "" || origin.Host == "" || u.Host != origin.Host {
+		return fmt.Errorf("url is outside allowed origin")
+	}
+	if u.RawQuery != "" && u.RawQuery != "download=true" {
+		return fmt.Errorf("url contains an unsupported query")
+	}
+	kind, identifier, ok := strings.Cut(expectedIdentifier, ":")
+	if !ok || kind == "" || identifier == "" || strings.ContainsAny(kind, "{}") {
+		return fmt.Errorf("expected_identifier is invalid")
+	}
+	placeholder := "{" + kind + "}"
+	if strings.Count(pathFamily, "{") != 1 || strings.Count(pathFamily, "}") != 1 || !strings.Contains(pathFamily, placeholder) {
+		return fmt.Errorf("path_family must contain exactly one placeholder matching expected_identifier")
+	}
+	prefix, suffix, found := strings.Cut(pathFamily, placeholder)
+	if !found || prefix == "" {
+		return fmt.Errorf("path_family does not match expected_identifier")
+	}
+	expectedPath := prefix + escapeDirectGetIdentifier(identifier) + suffix
+	if u.EscapedPath() != expectedPath {
+		return fmt.Errorf("url path does not match path_family")
+	}
+	return nil
+}
+func escapeDirectGetIdentifier(identifier string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for segmentIndex, segment := range strings.Split(identifier, "/") {
+		if segmentIndex > 0 {
+			b.WriteByte('/')
+		}
+		dotSegment := segment == "." || segment == ".."
+		for i := range len(segment) {
+			c := segment[i]
+			unreserved := !dotSegment &&
+				(c >= 'A' && c <= 'Z' ||
+					c >= 'a' && c <= 'z' ||
+					c >= '0' && c <= '9' ||
+					c == '-' || c == '.' || c == '_' || c == '~')
+			if unreserved {
+				b.WriteByte(c)
+			} else {
+				b.WriteByte('%')
+				b.WriteByte(hex[c>>4])
+				b.WriteByte(hex[c&0x0f])
+			}
+		}
+	}
+	return b.String()
+}
+
+func directGetIdentifierUnsafe(value string) bool {
+	for _, r := range value {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // validateDownload rejects download_id 0. Delivery provenance correlates on

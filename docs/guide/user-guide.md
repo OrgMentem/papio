@@ -434,6 +434,12 @@ papio jobs failures --since 30d
 Rows group by state, provider host, and terminal reason with a sample job id
 for `papio jobs get`.
 
+Incident rows show a keyed fingerprint plus bounded `safety_domain` and
+registrable `host_family` labels for local diagnosis. The fingerprint omits raw
+hosts and identifiers and is keyed per installation, so it resists stable
+cross-install correlation; those bounded labels are intentionally visible in
+local `jobs failures` and `jobs incidents` output.
+
 ## 8. Resolve identity reviews deliberately
 
 A PDF can be well-formed yet still land in `needs_review` when *papio* isn't sure

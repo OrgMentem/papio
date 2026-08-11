@@ -12,12 +12,14 @@ import (
 	"papio/internal/job"
 )
 
-func TestJobsFailuresOmitsIncidentsForOlderDaemon(t *testing.T) {
+func TestJobsFailuresUnknownIncidentsMethodKeepsStableEmptySurface(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
 		switch method {
 		case "jobs.failures":
-			*result.(*jobsFailuresResult) = jobsFailuresResult{Failures: []job.FailureGroup{{State: job.StateFailed, Provider: "example.edu", Reason: "timeout", Count: 1, Sample: "job_1"}}}
+			*result.(*jobsFailuresResult) = jobsFailuresResult{Failures: []job.FailureGroup{{
+				State: job.StateFailed, Provider: "example.edu", Reason: "timeout", Count: 1, Sample: "job_1",
+			}}}
 		case "jobs.incidents":
 			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
 		default:
@@ -29,8 +31,25 @@ func TestJobsFailuresOmitsIncidentsForOlderDaemon(t *testing.T) {
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("jobs failures: %v", err)
 	}
-	const want = `{"failures":[{"state":"failed","provider":"example.edu","reason":"timeout","count":1,"sample":"job_1"}],"truncated":false}
-`
+	const want = `{"failures":[{"state":"failed","provider":"example.edu","reason":"timeout","count":1,"sample":"job_1"}],"incidents":[],"truncated":false}` + "\n"
+	if out.String() != want {
+		t.Fatalf("output = %q, want %q", out.String(), want)
+	}
+}
+
+func TestJobsIncidentsUnknownMethodKeepsSeparateEmptySurface(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, _ any) error {
+		if method != "jobs.incidents" {
+			t.Fatalf("method = %q, want jobs.incidents", method)
+		}
+		return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+	})
+	root.SetArgs([]string{"--json", "jobs", "incidents"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("jobs incidents: %v", err)
+	}
+	const want = `{"incidents":[],"truncated":false}` + "\n"
 	if out.String() != want {
 		t.Fatalf("output = %q, want %q", out.String(), want)
 	}

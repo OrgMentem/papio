@@ -1,15 +1,14 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Cross-language contract test for citation_pdf_url extraction. The daemon's
-// internal/landingmeta.PDFURL and this extension's extractMetaURL
-// (src/background.ts) implement the same semantics independently — one
-// parsing untrusted network HTML in Go, one reading the live DOM of a page
-// the user is already on. internal/landingmeta/testdata/contract.json is the
-// one corpus that pins both: it lives in the Go tree deliberately so a change
-// on either side has to walk through the same fixtures, and this suite is
-// what makes that enforceable from the extension side. Every case in the
-// corpus is asserted by name below — a case silently skipped here is a case
-// the two implementations are free to drift apart on without either side
-// noticing.
+// internal/landingmeta.PDFURL and this extension's planExecution.resolveURL
+// implement the same URL-safety semantics independently — one parsing
+// untrusted network HTML in Go, one reading the live DOM of a page the user is
+// already on. internal/landingmeta/testdata/contract.json is the one corpus
+// that pins both: it lives in the Go tree deliberately so a change on either
+// side has to walk through the same fixtures, and this suite is what makes that
+// enforceable from the extension side. Every case in the corpus is asserted by
+// name below — a case silently skipped here is a case the two implementations
+// are free to drift apart on without either side noticing.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -50,57 +49,66 @@ function loadCase(c: ContractCase): Document {
 // not identical, so pinning our own minimal shape is safer than trusting lib
 // dom's shape to match happy-dom's exports byte for byte.
 interface DocumentRealm {
-  HTMLMetaElement: abstract new (...args: never[]) => Element;
   location: { href: string };
 }
 
 /**
- * Mirrors extractMetaURL in extension/src/background.ts (~line 860), body
- * for body:
- *
- *   function extractMetaURL(metaName: string): string | null {
- *     const el = document.querySelector(`meta[name="${metaName}"]`);
- *     if (!(el instanceof HTMLMetaElement)) return null;
- *     const raw = el.getAttribute("content")?.trim() ?? "";
- *     if (raw.length === 0) return null;
- *     try {
- *       const u = new URL(raw, location.href);
- *       if (u.protocol !== "https:") return null;
- *       if (u.username !== "" || u.password !== "") return null;
- *       const page = new URL(location.href);
- *       const isSelf = u.origin === page.origin &&
- *         u.pathname === page.pathname && u.search === page.search;
- *       return isSelf ? null : u.href;
- *     } catch { return null; }
- *   }
- *
- * That function cannot be imported here: it pulls chrome.* globals at module
- * load, and background.ts is owned by another change in flight this session.
- * This is a hand-copied mirror, not the real implementation — if
- * extractMetaURL's body ever changes, update this function in lockstep, or
- * this suite silently starts asserting a contract the extension no longer
- * honors. The drift-guard test below fails loudly if that happens instead.
- *
- * The only departure from the original: `HTMLMetaElement`/`location` are read
- * off the parsed document's own realm instead of the ambient globals a real
- * content script runs with. A live page has exactly one `HTMLMetaElement`
- * global to be `instanceof`; a happy-dom test document has none at the top
- * level, only its own window's — same identity check, same meaning, just
- * scoped to where the element actually lives.
+ * Mirrors planExecution's resolveURL (extension/src/plan.ts), using the
+ * citation meta element as the selected target for this corpus. The mirror
+ * keeps the rule's declared destination envelope explicit: same-origin URLs
+ * are allowed, while foreign origins need a matching origin + path prefix.
  */
-function extractMetaURLMirror(doc: Document): string | null {
+interface MirrorDownloadRule {
+  method: "href" | "meta" | "url" | "api";
+  allowedDestinations?: Array<{ origin: string; pathPrefix: string }>;
+  urlTemplate?: string;
+  idPattern?: string;
+}
+
+function extractMetaURLMirror(
+  doc: Document,
+  rule: MirrorDownloadRule = { method: "meta" },
+): string | null {
   const view = doc.defaultView as unknown as DocumentRealm | null;
-  const el = doc.querySelector('meta[name="citation_pdf_url"]');
-  if (view === null || !(el instanceof view.HTMLMetaElement)) return null;
-  const raw = el.getAttribute("content")?.trim() ?? "";
-  if (raw.length === 0) return null;
+  const target = doc.querySelector('meta[name="citation_pdf_url"]');
+  if (view === null || target === null) return null;
+  const pageHref = view.location.href;
+  const raw = rule.method === "meta" ? target.getAttribute("content") : target.getAttribute("href");
+  if (rule.method === "href" || rule.method === "meta") {
+    const trimmed = raw?.trim() ?? "";
+    if (trimmed.length === 0) return null;
+    try {
+      const u = new URL(trimmed, pageHref);
+      if (u.protocol !== "https:" || u.username !== "" || u.password !== "") return null;
+      const page = new URL(pageHref);
+      const allowed = u.origin === page.origin ||
+        (Array.isArray(rule.allowedDestinations) && rule.allowedDestinations.some((destination) => {
+          if (destination.origin !== u.origin || destination.pathPrefix.length === 0) return false;
+          return u.pathname.startsWith(destination.pathPrefix);
+        }));
+      if (!allowed) return null;
+      const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
+      return isSelf ? null : u.href;
+    } catch {
+      return null;
+    }
+  }
+  if (rule.method !== "url" && rule.method !== "api") return null;
+  if (!rule.urlTemplate) return null;
+  let built = rule.urlTemplate;
+  if (rule.idPattern) {
+    let match: RegExpMatchArray | null;
+    try {
+      match = pageHref.match(new RegExp(rule.idPattern));
+    } catch {
+      return null;
+    }
+    if (!match) return null;
+    built = built.replace(/\{(\d+|id)\}/g, (_whole: string, key: string) => match[key === "id" ? 1 : Number(key)] ?? "");
+  }
   try {
-    const u = new URL(raw, view.location.href);
-    if (u.protocol !== "https:") return null;
-    if (u.username !== "" || u.password !== "") return null;
-    const page = new URL(view.location.href);
-    const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
-    return isSelf ? null : u.href;
+    const u = new URL(built, pageHref);
+    return u.protocol === "https:" ? u.href : null;
   } catch {
     return null;
   }
@@ -146,10 +154,10 @@ for (const c of contract) {
 // Each must be an explicit, named, PASSING test: the divergence is real and
 // permanent, not a gap to close, so it has to stay visible rather than being
 // silently skipped or folded into the agreement loop above. empty_content
-// used to be a third one (the extension's `new URL("", location.href)`
-// resolved to the landing page itself and returned it as a bogus "PDF");
-// extractMetaURL now rejects a resolved URL that equals its own page, so
-// empty_content is back in the agreed set above and asserts null there.
+// used to be a third one (the extension's empty URL resolved to the landing
+// page itself and returned it as a bogus "PDF"); resolveURL now rejects a
+// resolved URL that equals its own page, so empty_content is back in the
+// agreed set above and asserts null there.
 
 test("duplicate_conflicting: extension takes the first match; daemon fails closed on ambiguity", () => {
   const c = getCase("duplicate_conflicting");
@@ -158,7 +166,7 @@ test("duplicate_conflicting: extension takes the first match; daemon fails close
   // returns ErrConflictingPDFURL rather than guessing.
   expect(wantURL(c)).toBeNull();
   // The extension's actual behavior: querySelector returns the first match in
-  // document order, so extractMetaURL silently prefers it. Safe there because
+  // document order, so the resolver silently prefers it. Safe there because
   // the page was already classified under the user's own session; not safe
   // for a daemon parsing unauthenticated network HTML, which is why Go fails
   // closed instead of copying this behavior.
@@ -183,26 +191,23 @@ test("malformed_content: extension resolves it as a relative path; daemon's pars
   expect(c.note.length).toBeGreaterThan(0);
 });
 
-// A hand-copied mirror can drift silently — background.ts changed under this
-// exact test twice already this session (the empty-content and self-URL
-// rejections above were both added mid-session). extractMetaURL can't be
-// imported (chrome.* globals at module load) or safely eval'd (it runs
-// against a real page's DOM). The guard used to be three `toContain`
-// substring checks; that missed any edit that didn't touch one of those
-// three exact lines (a dropped `.trim()`, a renamed meta tag, a loosened
-// `https:` check, or simple reordering all pass three-substring checks
-// unscathed while the hand-copied mirror above keeps testing stale
-// behavior). Instead, extract the function's real source text out of
-// background.ts by brace-balanced scanning (string/template-literal aware,
-// so a `${metaName}` interpolation or a `"//"`-bearing string never
-// mistakenly closes the scan early), normalize it (strip comments, collapse
-// whitespace) so formatting-only reflows don't false-positive, and diff the
-// WHOLE body against a pinned verbatim copy below. Any semantic change —
-// anywhere in the body — now fails this test. When it fails for a real,
-// intentional change to extractMetaURL: update PINNED_EXTRACT_META_URL_SOURCE
-// to match, re-sync extractMetaURLMirror above by hand, and re-run the full
-// corpus loop so the two implementations are re-verified against
-// contract.json before trusting them again.
+// A hand-copied mirror can drift silently — plan.ts changed under this exact
+// test during the planner hardening work. resolveURL cannot be imported
+// safely here because planExecution is serialized into a provider tab and
+// this test exercises it against happy-dom documents. The guard used to be
+// three `toContain` substring checks; that missed any edit that did not touch
+// those three exact lines (a dropped `.trim()`, a loosened `https:` check, a
+// missing allowed-destination authority check, or simple reordering all pass
+// three-substring checks unscathed while the hand-copied mirror keeps testing
+// stale behavior). Instead, extract the function's real source text out of
+// plan.ts by brace-balanced scanning (string/template-literal aware), normalize
+// it (strip comments, collapse whitespace) so formatting-only reflows do not
+// false-positive, and diff the WHOLE body against a pinned verbatim copy
+// below. Any semantic change — anywhere in the body — now fails this test.
+// When it fails for a real, intentional change to resolveURL: update
+// PINNED_RESOLVE_URL_SOURCE to match, re-sync extractMetaURLMirror above by
+// hand, and re-run the full corpus loop so the two implementations are
+// re-verified against contract.json before trusting them again.
 
 /**
  * Extracts a top-level function's exact source text — from its signature
@@ -302,11 +307,9 @@ function normalizeSource(src: string): string {
 const RESOLVE_URL_SIGNATURE = "const resolveURL = (rule: DownloadRule, target: Element): string | null => {";
 
 // Verbatim copy of planExecution's resolveURL source, signature through
-// closing brace, as it stood when this guard was retargeted from
-// background.ts's removed extractMetaURL to the planner (the single source
-// of truth for meta/href URL safety). Re-sync this literal (and
-// extractMetaURLMirror above it) whenever the real code legitimately
-// changes — see the comment block above for the full re-sync procedure.
+// closing brace. This is the single source of truth for meta/href URL safety;
+// re-sync this literal (and extractMetaURLMirror above) whenever the real code
+// legitimately changes — see the comment block above for the full procedure.
 const PINNED_RESOLVE_URL_SOURCE = `const resolveURL = (rule: DownloadRule, target: Element): string | null => {
     const raw = rule.method === "meta" ? target.getAttribute("content") : target.getAttribute("href");
     if (rule.method === "href" || rule.method === "meta") {
@@ -316,6 +319,12 @@ const PINNED_RESOLVE_URL_SOURCE = `const resolveURL = (rule: DownloadRule, targe
         const u = new URL(trimmed, pageHref);
         if (u.protocol !== "https:" || u.username !== "" || u.password !== "") return null;
         const page = new URL(pageHref);
+        const allowed = u.origin === page.origin ||
+          (Array.isArray(rule.allowedDestinations) && rule.allowedDestinations.some((destination) => {
+            if (destination.origin !== u.origin || destination.pathPrefix.length === 0) return false;
+            return u.pathname.startsWith(destination.pathPrefix);
+          }));
+        if (!allowed) return null;
         const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
         return isSelf ? null : u.href;
       } catch {

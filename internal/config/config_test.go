@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	"papio/internal/routes"
+
 	toml "github.com/pelletier/go-toml/v2"
 )
 
@@ -530,6 +532,55 @@ func TestBrowserResolverProfilesRejectInvalidNameAndURL(t *testing.T) {
 		})
 	}
 }
+
+func TestResolverProfilesCannotAliasHyphenatedRouteFamilies(t *testing.T) {
+	for _, routeFamily := range []string{
+		"wiley-doi-pdfdirect",
+		"sage-doi-pdf",
+		"sciencedirect-pii-pdfft",
+	} {
+		t.Run(routeFamily, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			data := []byte("access_mode = \"conservative\"\n[browser.resolvers." + routeFamily + "]\nopenurl_base_url = \"https://resolver.example.edu/openurl\"\n")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("hyphenated route family %q was accepted as an institution profile", routeFamily)
+			}
+		})
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte("access_mode = \"conservative\"\n[browser.resolvers.wileydoipdfdirect1]\nopenurl_base_url = \"https://resolver.example.edu/openurl\"\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("validated alphanumeric profile rejected: %v", err)
+	} else if _, ok := cfg.InstitutionFor("wileydoipdfdirect1"); !ok {
+		t.Fatal("validated alphanumeric institution profile is not selectable")
+	}
+}
+
+func TestResolverProfilesRejectEveryPackagedProviderHint(t *testing.T) {
+	for _, hint := range routes.ProviderHintNames() {
+		t.Run(hint, func(t *testing.T) {
+			cfg := Default()
+			cfg.AccessMode = ModeConservative
+			cfg.Browser.Resolvers = map[string]Institution{
+				hint: {OpenURLBase: "https://resolver.example.edu/openurl"},
+			}
+			err := cfg.validate()
+			if err == nil {
+				t.Fatalf("packaged provider hint %q was accepted as an institution profile", hint)
+			}
+			if !strings.Contains(err.Error(), "provider route hint") {
+				t.Fatalf("collision error for %q is not actionable: %v", hint, err)
+			}
+		})
+	}
+}
+
 func TestBrowserResolverRejectsReservedDefaultName(t *testing.T) {
 	// [browser.resolvers.default] is the exact config path that must be rejected:
 	// InstitutionFor short-circuits name == "default" to the top-level Browser

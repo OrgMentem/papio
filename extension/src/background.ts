@@ -54,10 +54,12 @@ import {
 } from "./page-scan";
 import {
   chromeBackend,
+  claimJobDownloadInitiated,
   clearPendingDelivery,
   emptyStore,
   findByJob,
   findByTab,
+  jobDownloadFilename,
   PAGE_CAPTURE_CONSENT_KEY,
   patchJob,
   removeJob,
@@ -68,9 +70,10 @@ import {
   type PendingDelivery,
   type StateBackend,
   type StoreShape,
+  TERMS_CONSENT_KEY,
   type TermsConsent,
   type ProviderDrainLease,
-  TERMS_CONSENT_KEY,
+  type ProviderDriveEpoch,
   WORK_WINDOW_KEY,
   HANDOFF_SURFACE_KEY,
   MANAGED_TAB_LEDGER_KEY,
@@ -119,10 +122,9 @@ export const MIN_DAEMON_VERSION = "0.18.0";
 
 const AUTH_EVIDENCE_TTL_MS = 30 * 60_000;
 const QUEUED_HANDOFF_RELEASE_MS = 45_000;
-/** At most two papio-created handoff tabs may be driving at once. The queue
- * below is intentionally worker-local: a service-worker restart may drop it,
- * and daemon re-offers recover any accepted job that was waiting for a tab. */
-const HANDOFF_DRIVE_LIMIT = 2;
+/** At most one papio-created handoff tab may drive an effect at once during
+ * stabilization. Descriptor/offer counts remain independent of this cap. */
+const HANDOFF_DRIVE_LIMIT = 1;
 const HANDOFF_DRIVE_TIMEOUT_MS = 3 * 60_000;
 /** Supplies the inbox's browser-local waiting overlay with an absolute display
  * hint. It does not demote waiting_for_session parks; those remain parked until
@@ -211,10 +213,12 @@ const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE = "triage_snapshot_schema_v3";
 const TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE = "triage_snapshot_schema_v4";
 const TRIAGE_COUNTS_SCHEMA_2_FEATURE = "triage_counts_schema_v2";
+const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const SESSION_EVIDENCE_FEATURE = "session_evidence_v1";
 const DELIVERY_CONTEXT_FEATURE = "delivery_context_v1";
+const PROVIDER_DIRECT_GET_FEATURE = "provider_direct_get_v1";
 const HANDOFF_LINK_FEATURE = "handoff_link_v1";
-const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
+const PROVIDER_DRIVE_EPOCH_FEATURE = "provider_drive_epoch_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 const STATS_FEATURE = "browser_stats_v1";
 const ACTIVITY_FEED_FEATURE = "activity_feed_v1";
@@ -247,8 +251,9 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "delivery_reconcile_result",
   "pdf_grab_result",
   "handoff_link_result",
+  "provider_drive_epoch_start_result",
+  "provider_drive_epoch_result",
 ]);
-// Fallback for a manifest without an action popup; both build targets ship
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
 const POPUP_PAGE_PATH = "dist/popup.html";
 /** Stable base title for papio's handoff group. A surfaced paper temporarily
@@ -346,10 +351,18 @@ export function computeBadge(state: BadgeState): BadgeResult {
     tooltip: triageCount === 0 ? "papio: no pending triage items" : "papio: connected",
   };
 }
+export interface SessionAuthDemand {
+  job_id: string;
+  origin: string;
+}
 export type BridgeSessionState = KeepaliveSnapshot & {
   releasedAuthJobs: number;
   /** Epoch ms of the most recent release; keys once-per-event popup notices. */
   releasedAuthJobsAt: number | null;
+  /** Browser-local demand binding; never sent over native messaging. */
+  authDemand?: SessionAuthDemand[];
+  /** True when this worker computed the complete browser-local demand set. */
+  authDemandComplete: true;
 };
 
 
@@ -592,6 +605,16 @@ export interface DownloadDeltaLike {
   id: number;
   state?: { current?: string | undefined } | undefined;
   filename?: { current?: string | undefined } | undefined;
+  error?: { current?: string | undefined } | undefined;
+}
+
+function isCleanNonBrowserMime(mime: string | undefined): boolean {
+  if (mime === undefined || mime === "" || mime === "application/pdf") return false;
+  return /^(?:image|audio|video)\//u.test(mime) ||
+    mime === "application/octet-stream" ||
+    mime === "application/zip" ||
+    mime === "application/x-7z-compressed" ||
+    mime === "application/gzip";
 }
 export interface PdfGrabCorrelation {
   scanID: string;
@@ -663,7 +686,7 @@ export interface BridgeDeps {
     query(props: { title?: string }): Promise<TabGroupInfo[]>;
   };
   downloads: {
-    search(query: { id: number }): Promise<DownloadItemLike[]>;
+    search(query: { id?: number; filename?: string; limit?: number }): Promise<DownloadItemLike[]>;
     /** Start a browser-managed download. The resolver-provided offer URL stays
      * local to the extension/browser and is never put in a native frame. */
     download(options: {
@@ -772,13 +795,24 @@ export interface BridgeDeps {
 interface GenericDownloadAttempt {
   candidates: GenericCandidate[];
   index: number;
+  epoch: ProviderDriveEpoch;
 }
 
 interface DownloadTrack {
   ids: Set<number>;
   ambiguous: boolean;
   directOffer: boolean;
+  /** True for a popup-initiated delivery download. This is deliberately
+   * worker-local: the durable pendingDelivery record carries the matching
+   * provenance and consent evidence across restarts. */
   delivery?: boolean;
+  directEpoch?: ProviderDriveEpoch;
+  /** Resolved URL is memory-only; this origin/path envelope survives restart
+   * through ActiveJob.direct_envelope instead. */
+  directURL?: string;
+  directAllowedOrigin?: string;
+  directPathFamily?: string;
+  directExpectedIdentifier?: string;
   route?: DeliveryRoute;
   sessionEvidence?: DeliverySessionEvidence;
   generic?: GenericDownloadAttempt;
@@ -789,7 +823,9 @@ interface GenericJobState {
   generic_evaluated?: boolean;
   generic_positive_attempts?: number;
   generic_attempted_strategies?: string[];
-  generic_evidence?: string[];
+  /** A non-applied epoch result parks this candidate until a fresh daemon
+   * epoch arrives; local retries must never mint candidate two. */
+  generic_terminal?: boolean;
 }
 
 interface PdfGrabTrack {
@@ -832,7 +868,7 @@ interface PendingNativeRequest {
   resolve(result: NativeRequestResult): void;
 }
 
-type ClassifyRetryKind = "unknown" | "federated_evidence";
+type ClassifyRetryKind = "unknown" | "effect" | "federated_evidence";
 interface ClassifyRetry {
   kind: ClassifyRetryKind;
   attempts: number;
@@ -996,26 +1032,18 @@ function parseExpected(raw: unknown): { title?: string; doi?: string } | undefin
     ...(doi !== undefined ? { doi } : {}),
   };
 }
-/** Normalize DOI identity for the E1 expected-work check. Prefixes are
- * presentation, not identity; slash runs are significant and are preserved. */
+/** Normalize DOI presentation without changing DOI identity. Scheme/host and
+ * the optional `doi:` label are case-insensitive; surrounding whitespace is
+ * presentation, while repeated slashes in the DOI suffix remain significant. */
 export function normalizeExpectedDOI(value: string): string {
   let normalized = value.trim().toLowerCase();
   for (let pass = 0; pass < 2; pass += 1) {
-    if (normalized.startsWith("doi:")) normalized = normalized.slice(4).trimStart();
-    if (normalized.startsWith("https://doi.org/")) normalized = normalized.slice("https://doi.org/".length);
+    normalized = normalized.replace(/^doi:\s*/i, "");
+    normalized = normalized.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "");
   }
   return normalized;
 }
 
-/** Read only the citation DOI explicitly exposed by the classified landing
- * page. This is injected as a self-contained probe, so it never sees or
- * returns page text beyond the DOI metadata value. */
-export function readCitationDOI(): string | null {
-  const element = document.querySelector('meta[name="citation_doi"]');
-  if (element === null) return null;
-  const value = element.getAttribute("content")?.trim() ?? "";
-  return value.length === 0 ? null : value;
-}
 
 
 /** Compare only the stable, non-secret part of a provider download URL.
@@ -1030,20 +1058,42 @@ function sameDownloadRoute(a: string, b: string): boolean {
   }
 }
 
-/** Recognize public direct-file routes without guessing from content. These
- * paths can be handed to chrome.downloads before a browser tab is needed. */
-function isDirectFileOffer(raw: string): boolean {
+function directEnvelopePath(pathname: string, family: string | undefined, expectedIdentifier: string | undefined): boolean {
+  if (family === undefined || expectedIdentifier === undefined || !pathname.startsWith("/")) return false;
+  const separator = expectedIdentifier.indexOf(":");
+  if (separator <= 0 || separator === expectedIdentifier.length - 1) return false;
+  const kind = expectedIdentifier.slice(0, separator);
+  const identifier = expectedIdentifier.slice(separator + 1);
+  if (kind.length === 0 || identifier.length === 0) return false;
+  const marker = `{${kind}}`;
+  const markerIndex = family.indexOf(marker);
+  if (markerIndex < 0 || family.indexOf(marker, markerIndex + marker.length) >= 0) return false;
+  const openBraces = family.split("{").length - 1;
+  const closeBraces = family.split("}").length - 1;
+  if (
+    openBraces !== 1 ||
+    closeBraces !== 1 ||
+    family.indexOf("{") !== markerIndex ||
+    family.indexOf("}") !== markerIndex + marker.length - 1 ||
+    /[?#\\\u0000\r\n]/u.test(family) ||
+    /(?:^|\/)\.{1,2}(?:\/|$)/u.test(family)
+  ) return false;
+  if (markerIndex === 0) return false;
+  let escaped: string;
   try {
-    const path = new URL(raw).pathname.toLowerCase();
-    return (
-      path.endsWith(".pdf") ||
-      path.includes("/content/pdf/") ||
-      path.includes("/doi/pdf/") ||
-      /(?:^|\/)pdf(?:\/|$)/.test(path)
-    );
+    escaped = identifier
+      .split("/")
+      .map((part) => {
+        if (part === "." || part === "..") return [...part].map(() => "%2E").join("");
+        return encodeURIComponent(part).replace(/[!'()*]/gu, (char) =>
+          `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+        );
+      })
+      .join("/");
   } catch {
     return false;
   }
+  return pathname === `${family.slice(0, markerIndex)}${escaped}${family.slice(markerIndex + marker.length)}`;
 }
 
 
@@ -1089,128 +1139,366 @@ export async function resolveDownloadURL(
   }
 }
 
-/** Self-contained click of a terms-and-conditions accept control, found by an
- * explicit fixture-backed selector or accessible text inside an open modal
- * (piercing shadow roots). Runs ONLY when the user has recorded informed
- * consent; the extension never guesses terms controls otherwise. Returns
- * whether a matching control was clicked. */
-export function clickTermsAccept(
-  modalSelector: string,
-  textAny: string[],
-  controlSelector: string | null = null,
-): boolean {
-  const modal = document.querySelector(modalSelector);
-  if (!modal) return false;
-  const click = (el: Element): boolean => {
-    const target = el as HTMLElement;
-    if (typeof target.click !== "function") return false;
-    const shadow = (target as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
-    const inner = shadow?.querySelector<HTMLElement>("#button-element");
-    (inner ?? target).click();
-    return true;
-  };
-  if (controlSelector !== null) {
-    const control = modal.matches(controlSelector) ? modal : modal.querySelector(controlSelector);
-    return control === null ? false : click(control);
-  }
 
-  const needles = textAny.map((t) => t.toLowerCase());
-  const walk = (root: ParentNode): boolean => {
-    for (const el of Array.from(root.querySelectorAll("*"))) {
-      // Click only a genuine control, never a wrapping container whose text
-      // merely includes the accept label: a modal footer <div> holds both
-      // "Cancel" and "Accept and download", and clicking it is a no-op. The
-      // real control is button-like (JSTOR's is an mfe-*-button with a shadow
-      // #button-element).
-      const tag = el.tagName.toLowerCase();
-      const submit = tag === "input" && el.getAttribute("type")?.toLowerCase() === "submit";
-      const actionable =
-        tag === "button" ||
-        tag === "a" ||
-        submit ||
-        el.getAttribute?.("role") === "button" ||
-        tag.endsWith("-button");
-      if (actionable) {
-        const value = submit ? (el.getAttribute("value") ?? "") : "";
-        const formContext =
-          submit && value.trim() === ""
-            ? ((el.closest("form") as HTMLElement | null)?.innerText ?? "")
-            : "";
-        const label =
-          ((el as HTMLElement).innerText ?? "") +
-          " " +
-          (el.getAttribute?.("aria-label") ?? "") +
-          " " +
-          value +
-          " " +
-          formContext;
-        if (needles.some((n) => label.toLowerCase().includes(n)) && click(el)) return true;
-      }
-      const sub = (el as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
-      if (sub && walk(sub)) return true;
+
+
+/** Final page-side executor for an already planned adapter effect. It is
+ * injected as one function so selector lookup, identity evidence, follow-up
+ * appearance, API resolution, and the page mutation share one authority
+ * boundary. The background still owns chrome.downloads.download. */
+export async function executePlannedPageEffect(
+  plan: Plan,
+  rule: {
+    method: "href" | "click" | "url" | "api" | "meta";
+    metaName?: string;
+    followupSelector?: string;
+    postClickTimeoutMs?: number;
+    allowedDestinations?: { origin: string; pathPrefix: string }[];
+  },
+): Promise<{ ok: boolean; url?: string }> {
+  // The injected function is the final authority boundary. Never infer a
+  // missing field from the adapter or from the current DOM.
+  if (
+    plan === null ||
+    typeof plan !== "object" ||
+    plan.expected_work === null ||
+    typeof plan.expected_work !== "object" ||
+    plan.effect_graph === null ||
+    typeof plan.effect_graph !== "object" ||
+    plan.revalidation === null ||
+    typeof plan.revalidation !== "object" ||
+    plan.revalidation.target_cardinality !== 1 ||
+    typeof plan.revalidation.max_selector_length !== "number" ||
+    typeof plan.revalidation.max_wait_ms !== "number"
+  ) return { ok: false };
+  const graph = plan.effect_graph;
+  const primary = graph.primary_target ?? graph.terms_target;
+  const expectedWork = plan.expected_work as typeof plan.expected_work & {
+    requested_doi?: unknown;
+    requested_title?: unknown;
+  };
+  if (primary === null || primary === undefined) return { ok: false };
+  if (typeof plan.route_origin !== "string" || plan.route_origin !== location.origin) return { ok: false };
+  const primarySelector = primary.selector;
+  if (
+    typeof primarySelector !== "string" ||
+    primarySelector.length === 0 ||
+    primarySelector.length > plan.revalidation.max_selector_length ||
+    typeof primary.fingerprint !== "string"
+  ) return { ok: false };
+  const primaryShadowSelector = primary.shadow_selector;
+  if (primaryShadowSelector !== null && typeof primaryShadowSelector !== "string") return { ok: false };
+  const normalize = (raw: string): string => {
+    let value = raw.trim().toLowerCase();
+    for (let pass = 0; pass < 2; pass += 1) {
+      value = value.replace(/^doi:\s*/i, "");
+      value = value.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "");
     }
-    return false;
+    return value;
   };
-  return walk(modal);
-}
-
-
-
-/** Self-contained declared click, optionally through one explicitly named
- * control in an open shadow root. It may then wait for one declared in-page
- * gate or click one declared provider download-modal control. No guessed
- * delay, selector, fallback, or terms/consent action. */
-async function clickDeclaredDownload(
-  selector: string,
-  shadowSelector: string | null,
-  waitForSelector: string | null,
-  timeoutMs: number | null,
-  followupSelector: string | null,
-): Promise<boolean> {
-  const host = document.querySelector(selector);
-  let target: Element | null = host;
-  if (shadowSelector !== null) {
-    if (!(host instanceof HTMLElement) || host.shadowRoot === null) return false;
-    target = host.shadowRoot.querySelector(shadowSelector);
-  }
-  if (!(target instanceof HTMLElement)) return false;
-  target.click();
-
-  const appearanceSelector = followupSelector ?? waitForSelector;
-  if (appearanceSelector === null) return true;
-  const findAppeared = (): Element | null => {
+  const fingerprint = (element: Element): string => {
+    const names = ["id", "class", "href", "name", "content", "type", "role", "aria-label", "data-doi", "data-qa"];
+    const values: string[] = [element.tagName.toLowerCase()];
+    for (const name of names) values.push(name + "=" + (element.getAttribute(name) ?? ""));
+    let cursor: Element | null = element;
+    while (cursor !== null && cursor.parentElement !== null) {
+      let index = 0;
+      for (const sibling of Array.from(cursor.parentElement.children)) {
+        if (sibling === cursor) break;
+        index += 1;
+      }
+      values.push(`p${index}`);
+      cursor = cursor.parentElement;
+    }
+    return values.join("|");
+  };
+  const matchesTarget = (target: Element, ref: { fingerprint: string | null; shadow_selector: string | null }): boolean => {
+    if (typeof ref.fingerprint !== "string") return false;
+    const [hostFingerprint, shadowFingerprint] = ref.fingerprint.split(">>");
+    if (fingerprint(target) !== hostFingerprint) return false;
+    if (ref.shadow_selector === null) return shadowFingerprint === undefined;
+    if (typeof ref.shadow_selector !== "string") return false;
+    const shadow = (target as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+    if (shadow === null || shadow === undefined) return false;
+    const inner = shadow.querySelector(ref.shadow_selector);
+    return inner !== null && shadowFingerprint !== undefined && fingerprint(inner) === shadowFingerprint;
+  };
+  const findExactlyOne = (selector: string): Element | null => {
     try {
-      return document.querySelector(appearanceSelector);
+      const found = Array.from(document.querySelectorAll(selector));
+      return found.length === 1 ? found[0] ?? null : null;
     } catch {
       return null;
     }
   };
-
-  let appeared = findAppeared();
-  if (appeared === null) {
-    const boundedMs = Math.max(0, Math.min(timeoutMs ?? 0, 5000));
-    appeared = await new Promise<Element | null>((resolve) => {
-      let observer: MutationObserver | null = null;
-      let timer: number | Timer | undefined;
-      const finish = (element: Element | null): void => {
-        observer?.disconnect();
-        clearTimeout(timer);
-        resolve(element);
+  const target = findExactlyOne(primarySelector);
+  if (target === null || !matchesTarget(target, primary)) return { ok: false };
+  if (rule.method === "meta" && (target.tagName.toUpperCase() !== "META" || target.getAttribute("name") !== (rule.metaName ?? "citation_pdf_url"))) {
+    return { ok: false };
+  }
+  if (!("requested_doi" in expectedWork) || !("requested_title" in expectedWork)) return { ok: false };
+  const requestedDOI = expectedWork.requested_doi;
+  const requestedTitle = expectedWork.requested_title;
+  if ((requestedDOI !== null && typeof requestedDOI !== "string") || (requestedTitle !== null && typeof requestedTitle !== "string")) {
+    return { ok: false };
+  }
+  const workBinding = (primary as typeof primary & {
+    work_binding?: unknown;
+  }).work_binding;
+  if (plan.verdict.kind === "article" && (requestedDOI !== null || requestedTitle !== null)) {
+    if (workBinding === null || typeof workBinding !== "object" || Array.isArray(workBinding)) return { ok: false };
+    const binding = workBinding as {
+      kind?: unknown;
+      selector?: unknown;
+      fingerprint?: unknown;
+      attribute?: unknown;
+      normalized?: unknown;
+      pattern?: unknown;
+    };
+    if (
+      (binding.kind !== "doi" && binding.kind !== "opaque") ||
+      typeof binding.selector !== "string" ||
+      binding.selector.length === 0 ||
+      typeof binding.fingerprint !== "string" ||
+      binding.fingerprint === ""
+    ) return { ok: false };
+    const bindingTarget = findExactlyOne(binding.selector);
+    if (bindingTarget === null || fingerprint(bindingTarget) !== binding.fingerprint) return { ok: false };
+    if (binding.kind === "opaque") {
+      if (binding.attribute !== null || binding.normalized !== null || binding.pattern !== null) return { ok: false };
+    } else {
+      if (
+        requestedDOI === null ||
+        typeof binding.attribute !== "string" ||
+        binding.attribute.length === 0 ||
+        typeof binding.normalized !== "string" ||
+        binding.normalized !== normalize(requestedDOI) ||
+        (binding.pattern !== null && typeof binding.pattern !== "string")
+      ) return { ok: false };
+      const raw = bindingTarget.getAttribute(binding.attribute)?.trim() ?? "";
+      if (raw === "") return { ok: false };
+      let extracted = raw;
+      if (binding.pattern !== null) {
+        let match: RegExpMatchArray | null;
+        try {
+          match = raw.match(new RegExp(binding.pattern));
+        } catch {
+          return { ok: false };
+        }
+        if (!match || typeof match[1] !== "string") return { ok: false };
+        extracted = match[1];
+      }
+      if (normalize(extracted) !== binding.normalized) return { ok: false };
+    }
+  } else if (plan.verdict.kind === "article" && workBinding !== null) {
+    return { ok: false };
+  }
+  const doiEvidence = expectedWork.doi as {
+    normalized?: unknown;
+    fingerprint?: unknown;
+    selector?: unknown;
+    attribute?: unknown;
+    pattern?: unknown;
+  } | null;
+  const titleEvidence = expectedWork.title as {
+    normalized?: unknown;
+    fingerprint?: unknown;
+    selector?: unknown;
+    attribute?: unknown;
+    pattern?: unknown;
+  } | null;
+  const validatesEvidence = (
+    entry: typeof doiEvidence | typeof titleEvidence,
+    requested: string,
+    kind: "doi" | "title",
+  ): boolean => {
+    if (
+      entry === null ||
+      typeof entry !== "object" ||
+      typeof entry.fingerprint !== "string" ||
+      entry.fingerprint === "" ||
+      typeof entry.selector !== "string" ||
+      entry.selector.length === 0 ||
+      typeof entry.attribute !== "string" ||
+      entry.attribute.length === 0 ||
+      (entry.pattern !== null && typeof entry.pattern !== "string")
+    ) return false;
+    const source = findExactlyOne(entry.selector);
+    if (source === null || fingerprint(source) !== entry.fingerprint) return false;
+    const raw = source.getAttribute(entry.attribute)?.trim() ?? "";
+    if (raw === "") return false;
+    let extracted = raw;
+    if (entry.pattern !== null) {
+      let match: RegExpMatchArray | null;
+      try {
+        match = raw.match(new RegExp(entry.pattern));
+      } catch {
+        return false;
+      }
+      if (!match || typeof match[1] !== "string") return false;
+      extracted = match[1];
+    }
+    if (kind === "doi") {
+      return typeof entry.normalized === "string" && entry.normalized === normalize(requested) && normalize(extracted) === entry.normalized;
+    }
+    return extracted.trim().toLowerCase().replace(/\s+/g, " ") === requested.trim().toLowerCase().replace(/\s+/g, " ");
+  };
+  const evidenceVerdict = plan.verdict.kind === "article" || plan.verdict.kind === "terms";
+  if (evidenceVerdict && requestedDOI !== null) {
+    if (!validatesEvidence(doiEvidence, requestedDOI, "doi")) return { ok: false };
+  } else if (evidenceVerdict && doiEvidence !== null) {
+    return { ok: false };
+  }
+  if (evidenceVerdict && requestedTitle !== null) {
+    if (!validatesEvidence(titleEvidence, requestedTitle, "title")) return { ok: false };
+  } else if (evidenceVerdict && titleEvidence !== null) {
+    return { ok: false };
+  }
+  if (rule.method === "click") {
+    const termsTarget = graph.primary_target === null && graph.terms_target !== null ? graph.terms_target : null;
+    if (termsTarget !== null) {
+      if (requestedDOI === null && requestedTitle === null) return { ok: false };
+      const planned = termsTarget as typeof termsTarget & {
+        text_any?: unknown;
+        control_selector?: unknown;
+        control_fingerprint?: unknown;
       };
-      observer = new MutationObserver(() => {
-        const element = findAppeared();
-        if (element !== null) finish(element);
-      });
-      observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
-      timer = setTimeout(() => finish(findAppeared()), boundedMs);
-    });
+      const needles = Array.isArray(planned.text_any)
+        ? planned.text_any.filter((value): value is string => typeof value === "string" && value.length > 0).map((value) => value.toLowerCase())
+        : [];
+      const controlSelector = planned.control_selector;
+      const controlFingerprint = planned.control_fingerprint;
+      if (
+        (typeof controlSelector !== "string" && needles.length === 0) ||
+        typeof controlFingerprint !== "string" ||
+        controlFingerprint === ""
+      ) return { ok: false };
+      let control: Element | null = null;
+      if (typeof controlSelector === "string") {
+        try {
+          const candidates = target.matches(controlSelector)
+            ? [target]
+            : Array.from(target.querySelectorAll(controlSelector));
+          if (candidates.length !== 1) return { ok: false };
+          control = candidates[0] ?? null;
+        } catch {
+          return { ok: false };
+        }
+      } else {
+        const candidates: Element[] = [];
+        const walk = (root: ParentNode): void => {
+          for (const element of Array.from(root.querySelectorAll("*"))) {
+            const tag = element.tagName.toLowerCase();
+            const actionable =
+              tag === "button" ||
+              tag === "a" ||
+              element.getAttribute("role") === "button" ||
+              tag.endsWith("-button") ||
+              (tag === "input" && element.getAttribute("type")?.toLowerCase() === "submit");
+            if (actionable) {
+              const label = `${(element as HTMLElement).innerText ?? ""} ${element.getAttribute("aria-label") ?? ""} ${element.getAttribute("value") ?? ""}`.toLowerCase();
+              if (needles.some((needle) => label.includes(needle))) candidates.push(element);
+            }
+            const shadow = (element as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+            if (shadow !== null && shadow !== undefined) walk(shadow);
+          }
+        };
+        walk(target);
+        if (candidates.length !== 1) return { ok: false };
+        control = candidates[0] ?? null;
+      }
+      if (
+        !(control instanceof HTMLElement) ||
+        typeof control.click !== "function" ||
+        fingerprint(control) !== controlFingerprint
+      ) return { ok: false };
+      control.click();
+      return { ok: true };
+    }
+    const followup = graph.followup_target;
+    if (followup === null && rule.followupSelector !== undefined) return { ok: false };
+    let followupSelector: string | null = null;
+    if (followup !== null) {
+      if (
+        typeof followup.selector !== "string" ||
+        followup.selector.length === 0 ||
+        followup.selector.length > plan.revalidation.max_selector_length ||
+        rule.followupSelector !== followup.selector
+      ) return { ok: false };
+      followupSelector = followup.selector;
+      if (followup.must_appear_after_effect === true && findExactlyOne(followupSelector) !== null) return { ok: false };
+    }
+    let clickTarget: Element | null = target;
+    if (primaryShadowSelector !== null) {
+      const shadow = (target as HTMLElement & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+      if (shadow === null || shadow === undefined) return { ok: false };
+      clickTarget = shadow.querySelector(primaryShadowSelector);
+    }
+    if (!(clickTarget instanceof HTMLElement) || typeof clickTarget.click !== "function") return { ok: false };
+    clickTarget.click();
+    if (followup !== null && followupSelector !== null) {
+      let appeared = findExactlyOne(followupSelector);
+      if (appeared === null) {
+        const timeout = Math.max(0, Math.min(rule.postClickTimeoutMs ?? plan.revalidation.max_wait_ms, plan.revalidation.max_wait_ms, 5000));
+        appeared = await new Promise<Element | null>((resolve) => {
+          let observer: MutationObserver | null = null;
+          const timer = setTimeout(() => { observer?.disconnect(); resolve(findExactlyOne(followupSelector!)); }, timeout);
+          observer = new MutationObserver(() => {
+            const candidate = findExactlyOne(followupSelector!);
+            if (candidate !== null) {
+              clearTimeout(timer);
+              observer?.disconnect();
+              resolve(candidate);
+            }
+          });
+          observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+        });
+      }
+      if (appeared === null || (followup.fingerprint !== null && fingerprint(appeared) !== followup.fingerprint)) return { ok: false };
+    }
+    return { ok: true };
   }
-
-  if (followupSelector !== null) {
-    if (!(appeared instanceof HTMLElement)) return false;
-    appeared.click();
+  if (rule.method === "api") {
+    const api = graph.api;
+    if (api === null || typeof api.endpoint !== "string" || api.endpoint !== plan.url || typeof api.result_field !== "string" || api.result_field === "") return { ok: false };
+    try {
+      const endpoint = new URL(api.endpoint);
+      const route = graph.route;
+      if (endpoint.protocol !== "https:" || route === null || route.origin !== endpoint.origin || route.pathname !== endpoint.pathname) return { ok: false };
+      const response = await fetch(endpoint.href, { credentials: "include" });
+      if (!response.ok) return { ok: false };
+      const data: unknown = await response.json();
+      if (data === null || typeof data !== "object" || Array.isArray(data)) return { ok: false };
+      const raw = (data as Record<string, unknown>)[api.result_field];
+      if (typeof raw !== "string") return { ok: false };
+      const resolved = new URL(raw, location.href);
+      if (resolved.protocol !== "https:" || resolved.origin !== api.result_origin) return { ok: false };
+      return { ok: true, url: resolved.href };
+    } catch {
+      return { ok: false };
+    }
   }
-  return true;
+  if (rule.method === "url") {
+    return plan.url !== null && plan.required_consequence === "download" ? { ok: true, url: plan.url } : { ok: false };
+  }
+  const raw = target.getAttribute(rule.method === "meta" ? "content" : "href") ?? "";
+  if (plan.url === null || plan.required_consequence !== "download") return { ok: false };
+  try {
+    const resolved = new URL(raw.trim(), location.href);
+    if (resolved.protocol !== "https:" || resolved.href !== plan.url) return { ok: false };
+    const page = new URL(location.href);
+    const allowed = resolved.origin === page.origin ||
+      (Array.isArray(rule.allowedDestinations) && rule.allowedDestinations.some((destination) =>
+        destination.origin === resolved.origin &&
+        typeof destination.pathPrefix === "string" &&
+        destination.pathPrefix.length > 0 &&
+        resolved.pathname.startsWith(destination.pathPrefix),
+      ));
+    if (!allowed) return { ok: false };
+  } catch {
+    return { ok: false };
+  }
+  return { ok: true, url: plan.url };
 }
 
 /** Bare `scheme://host` for a scanned tab's URL, or null when the page is
@@ -1269,6 +1557,8 @@ export class Bridge {
   private saveChain: Promise<void> = Promise.resolve();
   private listenersBound = false;
   private readonly downloads = new Map<string, DownloadTrack>();
+  /** Page-derived generic evidence stays worker-local and is not durable. */
+  private readonly genericEvidence = new Map<string, string[]>();
   private readonly grabDownloads = new Map<string, PdfGrabTrack>();
   /** Browser-driven fixture capture shares the two-slot handoff governor. */
   private pageCaptureDriving = false;
@@ -1321,6 +1611,10 @@ export class Bridge {
    * so retries of one drive do not spam the daemon. Cleared for a fresh drive
    * and on job removal. */
   private readonly handoffOutcomeSent = new Set<string>();
+  /** Generic epoch tuples already sent a terminal result this worker life.
+   * The daemon also deduplicates durably, but this guard closes the concurrent
+   * onChanged/startup-reconcile race before either request can be observed. */
+  private readonly genericEpochResultsSent = new Set<string>();
   /** Challenge/dead-end browser.error reports are once per active drive. */
   private readonly challengeBlockedOutcomeSent = new Set<string>();
   /** Worker-local wakeups complement durable cooldown expiry timestamps. */
@@ -1396,6 +1690,13 @@ export class Bridge {
   /** Ownership tokens never leave this worker. Durable lease metadata omits
    * them, so a restarted worker waits only for the persisted expiry. */
   private readonly providerDrainLeaseOwners = new Map<string, string>();
+  /** Browser-local governor for irreversible provider effects. It is separate
+   * from handoffDrives: a tab may be classified before it starts its effect,
+   * while tabless provider-direct work has no tab to register. */
+  private effectGovernorOwner: { jobID: string; token: string } | undefined;
+  /** Local owner job for the provider lease token; durable lease state omits
+   * this identity, so it is only used to reject same-worker sibling bypasses. */
+  private readonly providerDrainLeaseJobs = new Map<string, string>();
   /** Lease-expiry wakeups are best-effort; startup and the keepalive alarm
    * re-derive expiry from session state after MV3 discards these timers. */
   private readonly providerDrainLeaseTimers = new Map<string, object>();
@@ -1472,6 +1773,13 @@ export class Bridge {
       (job) => job.status === "queued" && job.requires_auth === true,
     ).length;
   }
+  /** Only the daemon's exact delegated mode authorizes unattended browser
+   * effects. Legacy/missing and assisted jobs remain parked until the operator
+   * explicitly opens them. */
+  private hasDelegatedAuthority(job: ActiveJob | undefined): boolean {
+    return job?.access_mode === "delegated";
+  }
+
   queuedAuthJobs(): number {
     return this.queuedAuthJobCount();
   }
@@ -1543,11 +1851,31 @@ export class Bridge {
     // and folding those in turned every provider that ever offered a job into
     // a phantom "institution" row in the popup session card.
     const candidates = [...(this.store.resolverOrigins ?? [])];
+
     for (const candidate of candidates) {
-      const origin = this.resolverOriginHint(candidate);
-      if (origin !== undefined) origins.add(origin);
+      // Configuration membership is authoritative and deliberately does not
+      // use resolverOriginHint: an institution's configured bare origin may
+      // contain auth-like labels (for example, sso.example.edu).
+      if (isBareHTTPSOrigin(candidate)) origins.add(candidate);
     }
     return [...origins];
+  }
+  /** Resolve only browser-local authentication demand to its configured
+   * institution. Unknown origins are omitted rather than guessed, so popup
+   * rows can never be coupled to a different resolver's job. */
+  sessionAuthDemand(): SessionAuthDemand[] {
+    return this.store.activeJobs
+      .filter(
+        (job) =>
+          job.requires_auth === true ||
+          job.status === "auth_pending" ||
+          job.waiting_for_session === true,
+      )
+      .map((job) => {
+        const origin = this.jobInstitutionOrigin(job);
+        return origin === undefined ? undefined : { job_id: job.job_id, origin };
+      })
+      .filter((demand): demand is SessionAuthDemand => demand !== undefined);
   }
 
   sessionOriginStates(): KeepaliveOriginSnapshot[] {
@@ -1605,6 +1933,8 @@ export class Bridge {
       stalledAuthJobs: this.stalledAuthJobIDs(),
       releasedAuthJobs: this.authUnblockedCount,
       releasedAuthJobsAt: this.authUnblockedAt,
+      authDemandComplete: true,
+      authDemand: this.sessionAuthDemand(),
     };
   }
 
@@ -1646,8 +1976,26 @@ export class Bridge {
       if (!isBareHTTPSOrigin(origin)) {
         return failure("resolver_unavailable", "No resolver configured yet — open a paper first");
       }
-      if (this.hasCurrentHello() && !this.knownResolverOrigins().includes(origin)) {
+      if (!this.hasCurrentHello()) {
+        return failure("resolver_unavailable", "The daemon has not confirmed configured institutions");
+      }
+      const known = this.knownResolverOrigins();
+      if (known.length > 0 && !known.includes(origin)) {
         return failure("resolver_unavailable", "This institution is not currently configured");
+      }
+      if (known.length === 0) {
+        const manager = this.keepaliveManager;
+        const snapshotOrigin = manager?.getSnapshot().resolverOrigin;
+        const snapshotOrigins =
+          manager !== undefined && typeof manager.getOriginSnapshots === "function"
+            ? manager.getOriginSnapshots().map((snapshot) => snapshot.origin)
+            : [];
+        const fallbackOrigins = new Set(
+          [snapshotOrigin, ...snapshotOrigins].filter((candidate): candidate is string => isBareHTTPSOrigin(candidate)),
+        );
+        if (!fallbackOrigins.has(origin)) {
+          return failure("resolver_unavailable", "This institution is not currently configured");
+        }
       }
       // Hand the tab to the keepalive manager exactly as the no-origin branch
       // below does. It owns the tab for the duration of the sign-in: its
@@ -1784,8 +2132,9 @@ export class Bridge {
     return [...new Set(this.store.blockedProviderHosts ?? [])];
   }
 
-  /** A new broker tab is a new provider attempt, so terminal classification
-   * observations from its predecessor must not suppress this drive. */
+  /** A new broker tab starts a new page-observation epoch. Durable generic E1
+   * state is keyed by the daemon-minted drive attempt and must survive
+   * automatic redrives, tab replacement, and MV3 worker restart. */
   private beginProviderDrive(jobID: string): void {
     this.federatedLoginOperatorNavigated.delete(jobID);
     this.federatedLoginRouteSettled.delete(jobID);
@@ -1793,21 +2142,6 @@ export class Bridge {
     this.classifyRetries.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
     this.challengeBlockedOutcomeSent.delete(`${jobID}:challenge_blocked`);
-    // Generic E1 is bounded per drive, not per job lifetime. The following
-    // accepted-drive update persists this synchronous reset with the rest of
-    // the drive transition.
-    this.store = {
-      ...this.store,
-      activeJobs: this.store.activeJobs.map((entry) => {
-        if (entry.job_id !== jobID) return entry;
-        const next = { ...entry } as ActiveJob & Record<string, unknown>;
-        delete next["generic_evaluated"];
-        delete next["generic_positive_attempts"];
-        delete next["generic_attempted_strategies"];
-        delete next["generic_evidence"];
-        return next as ActiveJob;
-      }),
-    };
   }
 
   /** Chrome answers this origin query from effective access: an all-sites grant
@@ -1963,6 +2297,13 @@ export class Bridge {
 
   private async openManagedTabUnlocked(options: OpenManagedTabOptions): Promise<number | undefined> {
     const job = options.jobId === undefined ? undefined : findByJob(this.store, options.jobId);
+    if (
+      options.jobId !== undefined &&
+      (options.purpose === "redrive" || options.purpose === "reoffer") &&
+      !this.hasDelegatedAuthority(job)
+    ) {
+      return undefined;
+    }
     const trackedTabID = job !== undefined && job.tab_id >= 0 ? job.tab_id : undefined;
     let ledgerOwnedTabID: number | undefined;
     const candidates: TabInfo[] = [];
@@ -2016,18 +2357,11 @@ export class Bridge {
         addCandidate(candidate);
       }
     }
-    if (this.deps.tabs.query !== undefined && options.jobId === undefined) {
-      try {
-        for (const candidate of await this.deps.tabs.query({})) addCandidate(candidate);
-      } catch {
-        // URL dedupe is best-effort when a browser rejects an all-tabs query.
-      }
-    }
     const reusable =
-      trackedTabID !== undefined || ledgerOwnedTabID !== undefined || options.jobId === undefined
-        ? findManagedTab(candidates, options.url, trackedTabID ?? ledgerOwnedTabID)
-        : candidates.length === 1
-          ? candidates[0]
+      options.jobId === undefined
+        ? findManagedTab(candidates, options.url)
+        : trackedTabID !== undefined || ledgerOwnedTabID !== undefined
+          ? findManagedTab(candidates, options.url, trackedTabID ?? ledgerOwnedTabID)
           : undefined;
     if (reusable?.id !== undefined) {
       const shouldNavigate =
@@ -2611,7 +2945,7 @@ export class Bridge {
   }
 
   private handoffGroupTitle(tabID: number): string {
-    const jobs = this.store.activeJobs.filter((job) => job.tab_id >= 0);
+    const jobs = this.store.activeJobs;
     if (jobs.length !== 1 || jobs[0]?.tab_id !== tabID) return HANDOFF_GROUP_TITLE;
     const title = jobs[0].expected?.title?.replace(/\s+/g, " ").trim();
     if (!title) return HANDOFF_GROUP_TITLE;
@@ -3071,7 +3405,100 @@ export class Bridge {
       this.captureTransmissionAllowed = false;
     }
   }
+  /** Re-read mutable consent at every capture boundary. Firefox options can
+   * change while this worker remains alive, so startup policy is not enough. */
+  private async refreshCaptureConsent(): Promise<void> {
+    if (!this.captureConsentRequired) return;
+    try {
+      this.captureTransmissionAllowed = (await this.deps.captureConsent?.get()) === true;
+    } catch {
+      this.captureTransmissionAllowed = false;
+    }
+  }
 
+
+  /** Search only the bounded, exact job-owned filename. Chrome may return an
+   * absolute path, so the comparison accepts a path prefix but never a
+   * filename from another job or a uniquified collision. `undefined` means
+   * the browser query itself failed; `null` is a completed reconciliation
+   * with no unambiguous matching item. */
+  private async restartDownloadByFilename(jobID: string): Promise<DownloadItemLike | null | undefined> {
+    let found: DownloadItemLike[];
+    try {
+      found = await this.deps.downloads.search({ filename: jobDownloadFilename(jobID), limit: 8 });
+    } catch {
+      return undefined;
+    }
+    const expected = jobDownloadFilename(jobID).replaceAll("\\", "/");
+    const matches = found.filter((item) => {
+      const filename = typeof item.filename === "string" ? item.filename.replaceAll("\\", "/") : "";
+      return filename === expected || filename.endsWith(`/${expected}`);
+    });
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  /** Rebuild direct-download tracking from the daemon tuple/envelope and
+   * Chrome's durable download record after an MV3 worker restart. */
+  private async reconcileDirectDownloads(): Promise<void> {
+    for (const job of this.store.activeJobs) {
+      const epoch = job.drive_epoch;
+      const envelope = job.direct_envelope;
+      if (
+        epoch?.strategy !== "direct" ||
+        envelope === undefined ||
+        typeof envelope.allowed_origin !== "string" ||
+        typeof envelope.path_family !== "string" ||
+        typeof envelope.expected_identifier !== "string"
+      ) continue;
+      let item: DownloadItemLike | undefined;
+      let downloadID: number;
+      if (epoch.in_flight_download_id === undefined) {
+        if (job.download_initiated !== true || job.direct_terminal === true) continue;
+        const reconciled = await this.restartDownloadByFilename(job.job_id);
+        if (reconciled === undefined) continue;
+        if (reconciled === null) {
+          this.send(
+            "provider_direct_get_result",
+            {
+              drive_attempt_id: epoch.drive_attempt_id,
+              ordinal: epoch.ordinal,
+              route_revision: epoch.route_revision ?? "",
+              outcome: "network",
+              landing_class: "unknown",
+            },
+            job.job_id,
+          );
+          await this.clearDirectDownloadState(job.job_id, epoch);
+          continue;
+        }
+        item = reconciled;
+        downloadID = reconciled.id;
+      } else {
+        downloadID = epoch.in_flight_download_id;
+        let found: DownloadItemLike[];
+        try {
+          found = await this.deps.downloads.search({ id: downloadID });
+        } catch {
+          continue;
+        }
+        item = found[0];
+        if (item === undefined) continue;
+      }
+      this.downloads.set(job.job_id, {
+        ids: new Set([downloadID]),
+        ambiguous: false,
+        directOffer: true,
+        directEpoch: epoch,
+        directAllowedOrigin: envelope.allowed_origin,
+        directPathFamily: envelope.path_family,
+        directExpectedIdentifier: envelope.expected_identifier,
+      });
+      const state = item?.state;
+      if (state === "complete" || state === "interrupted") {
+        await this.onDownloadChanged({ id: downloadID, state: { current: state } });
+      }
+    }
+  }
 
   /** Bind browser listeners (once), open the native connection, send hello, and
    * hydrate persisted job/tab correlation. Safe to call on every SW spin-up.
@@ -3120,7 +3547,8 @@ export class Bridge {
     await this.captureTransmissionPolicyReady;
     await this.reconcilePdfGrabCorrelations();
     await this.restoreProviderDrainLeaseTimers();
-    await this.restoreChallengeCooldownTimers();
+    await this.reconcileDirectDownloads();
+    await this.reconcileGenericDownloads();
     // Reconcile persisted papio groups before any new fold can race the
     // startup repair and multiply groups in the same browser window.
     await this.reconcileHandoffGroups();
@@ -3129,7 +3557,18 @@ export class Bridge {
     await this.reconcileFederatedLoginOwners();
     const governorQueuedAtRestart: string[] = [];
     for (const job of this.store.activeJobs) {
+      if (!this.hasDelegatedAuthority(job)) {
+        // Legacy and assisted jobs are durable records only. A worker restart
+        // must not turn an old offer into a new autonomous tab/download.
+        continue;
+      }
       if (job.status !== "accepted" && job.status !== "auth_pending" && job.status !== "awaiting_download") {
+        continue;
+      }
+      if (job.tab_id < 0 && job.status === "auth_pending" && job.parked_with_tab !== true) {
+        // A timeout-detached/auth-pending job has deliberately left the
+        // governor. Only a fresh operator drive may reclaim its slot; restart
+        // must not turn the durable auth state into an autonomous re-open.
         continue;
       }
       if (job.tab_id < 0) {
@@ -3141,19 +3580,9 @@ export class Bridge {
         // they never open, never complete and never time out, which is worst
         // exactly under the flood the governor exists for.
         //
-        // Deliveries and direct-file downloads also park at tab_id -1 and must
-        // NOT be handed a broker tab. The direct-file test has to mirror the
-        // offer path's gate exactly: isDirectFileOffer is shape-only, and an
-        // institutional handoff's offer URL is the operator's OpenURL base,
-        // whose path papio does not constrain — so a pdf-shaped base on a
-        // requires_auth offer is a real handoff that was never eligible for
-        // the direct-download shortcut. Excluding it on shape alone would
-        // strand exactly the jobs this restore exists to recover.
-        if (job.status !== "accepted") continue;
-        if (this.store.pendingDelivery?.job_id === job.job_id) continue;
-        const offerURL = this.offerURLs.get(job.job_id);
-        if (offerURL === undefined) continue;
-        if (isDirectFileOffer(offerURL) && job.requires_auth !== true) continue;
+        // A tabless accepted handoff is governor work. Direct routes never
+        // arrive as job offers; they use provider_direct_get_request.
+        if (this.offerURLs.get(job.job_id) === undefined) continue;
         governorQueuedAtRestart.push(job.job_id);
         continue;
       }
@@ -3169,7 +3598,10 @@ export class Bridge {
         // operator finishes authenticating in that same tab.
         continue;
       }
-      if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) continue;
+      if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
+        governorQueuedAtRestart.push(job.job_id);
+        continue;
+      }
       this.registerHandoffDrive(job.job_id, job.tab_id);
     }
     for (const jobID of governorQueuedAtRestart) {
@@ -3202,6 +3634,7 @@ export class Bridge {
    */
   private async reconcileTabs(): Promise<void> {
     for (const job of [...this.store.activeJobs]) {
+      if (!this.hasDelegatedAuthority(job)) continue;
       if (job.tab_id < 0) continue; // already queued / awaiting an open
       let alive = false;
       try {
@@ -3220,16 +3653,14 @@ export class Bridge {
           candidate.status === "accepted" &&
           candidate.tab_id < 0 &&
           this.store.pendingDelivery?.job_id !== candidate.job_id &&
-          this.offerURLs.get(candidate.job_id) !== undefined &&
-          (!isDirectFileOffer(this.offerURLs.get(candidate.job_id)!) || candidate.requires_auth === true || candidate.access_mode === "assisted"),
+          this.offerURLs.get(candidate.job_id) !== undefined,
       );
       if (
         !ownsFederatedLoginClaim &&
         !hasQueuedGovernorWork &&
         job.status !== "awaiting_download" &&
         this.store.pendingDelivery?.job_id !== job.job_id &&
-        offerURL !== undefined &&
-        (!isDirectFileOffer(offerURL) || job.requires_auth === true || job.access_mode === "assisted")
+        offerURL !== undefined
       ) {
         const recoveredTabID = await this.openManagedTab({
           url: offerURL,
@@ -3289,6 +3720,11 @@ export class Bridge {
           status: "queued",
           download_initiated: false,
           unknown_count: 0,
+          // A dead owner must not be re-opened autonomously: its exact claim
+          // has just been retired, and only that claim's waiters are eligible
+          // for the freed slot. Requiring fresh operator engagement prevents
+          // the dead owner from winning the FIFO ahead of those waiters.
+          ...(ownsFederatedLoginClaim ? { engagement_required: true } : {}),
           // A dead tab discovered only at restart (MV3 never fired
           // onRemoved while this worker slept) never went through
           // onTabRemoved's own waiting_for_session demotion — clear both
@@ -3389,7 +3825,7 @@ export class Bridge {
     try {
       const id = await this.deps.downloads.download({
         url,
-        filename: `papio/${jobID}/paper.pdf`,
+        filename: jobDownloadFilename(jobID),
         conflictAction: "uniquify",
         saveAs: false,
       });
@@ -3468,6 +3904,7 @@ export class Bridge {
         job = synthetic;
       }
     }
+    if (job === undefined) return failure("page_acquire", "The daemon did not return a job");
     const pending = this.store.pendingDelivery;
     if (pending !== undefined && pending.status !== "failed" && pending.job_id !== job.job_id) {
       return failure("delivery_busy", "Another PDF is already being sent to papio");
@@ -3894,6 +4331,7 @@ export class Bridge {
     type: BrowserMessageType,
     payload: Record<string, unknown>,
     expectedType: BrowserMessageType,
+    jobID?: string,
   ): Promise<NativeRequestResult> {
     const requestID = this.nextRequestID();
     return new Promise<NativeRequestResult>((resolve) => {
@@ -3904,7 +4342,7 @@ export class Bridge {
         this.pendingNativeRequests.delete(requestID);
         resolve({ kind: "timeout" });
       }, TRIAGE_REQUEST_TIMEOUT_MS);
-      if (!this.send(type, { ...payload, request_id: requestID })) {
+      if (!this.send(type, { ...payload, request_id: requestID }, jobID)) {
         this.pendingNativeRequests.delete(requestID);
         resolve({
           kind: "transport",
@@ -3922,6 +4360,7 @@ export class Bridge {
     expectedType: BrowserMessageType,
     feature: string,
     mutation: boolean,
+    jobID?: string,
   ): Promise<NativeRequestResult> {
     if (!CORRELATED_RESULT_TYPES.has(expectedType)) {
       throw new Error(`papio: correlated request expects unrouted reply type ${expectedType}`);
@@ -3942,7 +4381,7 @@ export class Bridge {
           message: "This daemon does not support the requested inbox feature",
         };
       }
-      const result = await this.sendCorrelated(type, payload, expectedType);
+      const result = await this.sendCorrelated(type, payload, expectedType, jobID);
       if (result.kind !== "transport" || mutation || attempt + 1 === attempts) return result;
       // Reads are safe to retry once after a confirmed transport failure;
       // mutations deliberately return their ambiguous status to the page.
@@ -4657,7 +5096,7 @@ export class Bridge {
   private async redrivePendingTermsGates(): Promise<void> {
     if ((await this.deps.settings.getTermsConsent()) !== "accept") return;
     const flagged = this.store.activeJobs
-      .filter((j) => j.needs_terms_consent === true && j.tab_id >= 0)
+      .filter((j) => j.needs_terms_consent === true && j.tab_id >= 0 && this.hasDelegatedAuthority(j))
       .map((j) => j.job_id);
     for (const jobID of flagged) {
       await this.update((s) => patchJob(s, jobID, { needs_terms_consent: false }));
@@ -4671,19 +5110,56 @@ export class Bridge {
 
   /** Inject the consented terms-accept click on the tracked tab. Gated by the
    * caller on recorded consent; returns whether a control was clicked. */
-  private async acceptTerms(
-    jobID: string,
-    rule: { modalSelector: string; control?: string; textAny: string[] },
-  ): Promise<boolean> {
+  private async acceptTerms(jobID: string, spec: AdapterSpec): Promise<boolean> {
     const job = findByJob(this.store, jobID);
-    if (!job || job.tab_id < 0) return false;
+    if (job === undefined || !this.hasDelegatedAuthority(job)) return false;
     try {
+      const planned = await this.deps.scripting.executeScript({
+        target: { tabId: job.tab_id },
+        func: planExecution,
+        args: [null, spec, { ...(job.expected ?? {}) }, { access_mode: job.access_mode }],
+      });
+      const plan = planned[0]?.result as PlanResult | undefined;
+      if (
+        plan === undefined ||
+        typeof plan !== "object" ||
+        plan === null ||
+        "assisted" in plan ||
+        plan.verdict.kind !== "terms" ||
+        plan.target_ref !== null ||
+        plan.method !== null ||
+        plan.effect_graph === null ||
+        typeof plan.effect_graph !== "object" ||
+        plan.effect_graph.primary_target !== null ||
+        plan.effect_graph.followup_target !== null ||
+        plan.effect_graph.terms_target === null ||
+        typeof plan.effect_graph.terms_target !== "object" ||
+        plan.expected_work === null ||
+        typeof plan.expected_work !== "object" ||
+        ((typeof plan.expected_work.requested_doi === "string" &&
+          plan.expected_work.requested_doi.trim() !== "" &&
+          (plan.expected_work.doi === null || typeof plan.expected_work.doi !== "object")) ||
+          (typeof plan.expected_work.requested_title === "string" &&
+            plan.expected_work.requested_title.trim() !== "" &&
+            (plan.expected_work.title === null || typeof plan.expected_work.title !== "object")))
+      ) return false;
+      const latest = findByJob(this.store, jobID);
+      if (!this.hasDelegatedAuthority(latest)) return false;
       const results = await this.deps.scripting.executeScript({
         target: { tabId: job.tab_id },
-        func: clickTermsAccept,
-        args: [rule.modalSelector, rule.textAny, rule.control ?? null],
+        func: executePlannedPageEffect,
+        args: [
+          plan,
+          {
+            method: "click",
+            followupSelector: undefined,
+            postClickTimeoutMs: 0,
+            shadowSelector: undefined,
+            metaName: undefined,
+          },
+        ],
       });
-      return results[0]?.result === true;
+      return (results[0]?.result as { ok?: boolean } | undefined)?.ok === true;
     } catch (e) {
       console.error("papio: terms accept click failed; staying assisted", e);
       return false;
@@ -4922,6 +5398,94 @@ export class Bridge {
     await save;
     if (signInBlockersChanged) await this.syncConnectionBadge();
   }
+  /** Reserve a job's download initiation at the state reducer boundary.
+   * Classification may have crossed several awaits before reaching this
+   * point; the synchronous transform is the per-job CAS that makes the
+   * already-authorized decision single-use without serializing other jobs. */
+  private async claimDownloadInitiated(jobID: string): Promise<boolean> {
+    let claimed = false;
+    await this.update((store) => {
+      const current = findByJob(store, jobID);
+      if (!this.hasDelegatedAuthority(current) || this.downloads.has(jobID)) return store;
+      const result = claimJobDownloadInitiated(store, jobID);
+      claimed = result.claimed;
+      return result.store;
+    });
+    return claimed;
+  }
+  /** Check the durable and worker-local authority needed by one generic
+   * candidate. When allowClaimed is true, this is the immediate pre-download
+   * re-read for the claim made by this invocation. */
+  private genericCandidateAuthorized(
+    store: StoreShape,
+    jobID: string,
+    epoch: ProviderDriveEpoch,
+    strategyID: string,
+    allowClaimed = false,
+  ): boolean {
+    const current = findByJob(store, jobID);
+    if (
+      current === undefined ||
+      !this.handoffDrives.has(jobID) ||
+      current.tab_id < 0 ||
+      current.status !== "accepted" ||
+      !this.hasDelegatedAuthority(current) ||
+      current.generic_terminal === true ||
+      this.downloads.has(jobID)
+    ) {
+      return false;
+    }
+    const currentEpoch = current.generic_drive_epoch;
+    if (
+      currentEpoch?.strategy !== "generic" ||
+      currentEpoch.drive_attempt_id !== epoch.drive_attempt_id ||
+      currentEpoch.ordinal !== epoch.ordinal ||
+      currentEpoch.revision !== epoch.revision
+    ) {
+      return false;
+    }
+    if (allowClaimed) {
+      return current.download_initiated === true && current.adapter_id === strategyID && currentEpoch.strategy_id === strategyID;
+    }
+    return (
+      current.download_initiated !== true &&
+      (current.generic_positive_attempts ?? 0) < 2 &&
+      !(current.generic_attempted_strategies ?? []).includes(strategyID)
+    );
+  }
+
+
+  /** Atomically claim a generic candidate after all async work. */
+  private async claimGenericCandidate(
+    jobID: string,
+    epoch: ProviderDriveEpoch,
+    candidate: GenericCandidate,
+  ): Promise<ProviderDriveEpoch | undefined> {
+    let claimedEpoch: ProviderDriveEpoch | undefined;
+    await this.update((store) => {
+      if (!this.genericCandidateAuthorized(store, jobID, epoch, candidate.strategy_id)) return store;
+      const result = claimJobDownloadInitiated(store, jobID);
+      if (!result.claimed) return store;
+      const next = result.store.activeJobs.map((entry) => {
+        if (entry.job_id !== jobID) return entry;
+        const current = entry as ActiveJob & GenericJobState;
+        const currentEpoch = current.generic_drive_epoch ?? epoch;
+        claimedEpoch = { ...currentEpoch, strategy_id: candidate.strategy_id };
+        return {
+          ...entry,
+          adapter_id: candidate.strategy_id,
+          generic_drive_epoch: claimedEpoch,
+          generic_positive_attempts: (current.generic_positive_attempts ?? 0) + 1,
+          generic_attempted_strategies: [...(current.generic_attempted_strategies ?? []), candidate.strategy_id],
+        } as ActiveJob;
+      });
+      return { ...result.store, activeJobs: next };
+    });
+    return claimedEpoch;
+  }
+
+
+
 
   private async upsertJobWithOffer(job: ActiveJob, offerURL: string): Promise<void> {
     this.offerURLs.set(job.job_id, offerURL);
@@ -4970,6 +5534,7 @@ export class Bridge {
     this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
     this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
+    this.genericEvidence.delete(jobID);
     this.challengeBlockedOutcomeSent.delete(`${jobID}:challenge_blocked`);
     this.authFailureSurfaced.delete(jobID);
     this.staleRecoveryEpochs.delete(jobID);
@@ -4988,7 +5553,13 @@ export class Bridge {
     });
     if (providerKey !== undefined) await this.releaseProviderDrainWhenUnused(providerKey);
     await this.dropStaleHandoffGroup();
-    if (!this.drainingHandoffDriveQueue) await this.drainHandoffDriveQueue();
+    if (!this.drainingHandoffDriveQueue) {
+      await this.drainHandoffDriveQueue();
+      // Removing/cancelling a settled owner is itself a release boundary.
+      // Re-run the evidence-scoped FIFO after its drive and claim are gone;
+      // otherwise queued work waits for an unrelated timer despite capacity.
+      if (!this.drainingQueuedHandoffs) await this.releaseQueuedHandoffs();
+    }
     if (tabID !== undefined && tabID >= 0) void this.closeOwnedTab(tabID, "job-removed");
   }
 
@@ -5260,6 +5831,21 @@ export class Bridge {
     await this.syncConnectionBadge();
     return resumed;
   }
+  /** Reserve the single browser-local effect slot. A caller must hold this
+   * through the observable initiation consequence (not merely planning). */
+  private claimEffectGovernor(jobID: string): string | undefined {
+    const current = this.effectGovernorOwner;
+    if (current !== undefined) return undefined;
+    const token = this.deps.randomUUID();
+    this.effectGovernorOwner = { jobID, token };
+    return token;
+  }
+
+  private releaseEffectGovernor(jobID: string, token: string): void {
+    const current = this.effectGovernorOwner;
+    if (current?.jobID === jobID && current.token === token) this.effectGovernorOwner = undefined;
+  }
+
 
 
 
@@ -5303,6 +5889,7 @@ export class Bridge {
     });
     for (const providerKey of expired) {
       this.providerDrainLeaseOwners.delete(providerKey);
+      this.providerDrainLeaseJobs.delete(providerKey);
       this.providerDrainLeaseTimers.delete(providerKey);
     }
     return expired;
@@ -5362,6 +5949,7 @@ export class Bridge {
     });
     if (!claimed) return undefined;
     this.providerDrainLeaseOwners.set(providerKey, owner);
+    this.providerDrainLeaseJobs.set(providerKey, job.job_id);
     this.scheduleProviderDrainLeaseExpiry(providerKey, expiresAt);
     return owner;
   }
@@ -5369,6 +5957,7 @@ export class Bridge {
   private async releaseProviderDrainLease(providerKey: string, owner: string): Promise<void> {
     if (this.providerDrainLeaseOwners.get(providerKey) !== owner) return;
     this.providerDrainLeaseOwners.delete(providerKey);
+    this.providerDrainLeaseJobs.delete(providerKey);
     this.providerDrainLeaseTimers.delete(providerKey);
     await this.update((store) => {
       const lease = store.providerDrainLeases?.[providerKey];
@@ -5386,6 +5975,7 @@ export class Bridge {
     const owner = this.deps.randomUUID();
     const expiresAt = this.deps.now() + PROVIDER_DRAIN_LEASE_MS;
     this.providerDrainLeaseOwners.set(providerKey, owner);
+    this.providerDrainLeaseJobs.set(providerKey, job.job_id);
     await this.update((store) => ({
       ...store,
       providerDrainLeases: {
@@ -5401,6 +5991,7 @@ export class Bridge {
   private async completeProviderDrainLease(providerKey: string): Promise<boolean> {
     if (this.currentProviderDrainLease(providerKey) === undefined) return false;
     this.providerDrainLeaseOwners.delete(providerKey);
+    this.providerDrainLeaseJobs.delete(providerKey);
     this.providerDrainLeaseTimers.delete(providerKey);
     await this.update((store) => {
       const providerDrainLeases = { ...(store.providerDrainLeases ?? {}) };
@@ -5415,8 +6006,8 @@ export class Bridge {
    * cleared challenge also calls this when its provider document returns. */
   private async clearProviderDrainPark(providerKey: string): Promise<boolean> {
     const lease = this.currentProviderDrainLease(providerKey);
-    if (lease?.parkedReason !== "challenge") return false;
     this.providerDrainLeaseOwners.delete(providerKey);
+    this.providerDrainLeaseJobs.delete(providerKey);
     this.providerDrainLeaseTimers.delete(providerKey);
     await this.update((store) => {
       const providerDrainLeases = { ...(store.providerDrainLeases ?? {}) };
@@ -5449,6 +6040,7 @@ export class Bridge {
   private async releaseProviderDrainWhenUnused(providerKey: string): Promise<void> {
     if (this.store.activeJobs.some((job) => this.providerKeyForJob(job) === providerKey)) return;
     this.providerDrainLeaseOwners.delete(providerKey);
+    this.providerDrainLeaseJobs.delete(providerKey);
     this.providerDrainLeaseTimers.delete(providerKey);
     await this.update((store) => {
       if (store.providerDrainLeases?.[providerKey] === undefined) return store;
@@ -5787,7 +6379,11 @@ export class Bridge {
   ): Promise<void> {
     if (fallbackJobID !== undefined) {
       const fallback = findByJob(this.store, fallbackJobID);
-      if (fallback?.engagement_required !== true) this.pendingForcedReleases.add(fallbackJobID);
+      // The operator's explicit inbox-open action may release assisted or
+      // otherwise engagement-gated work once; timers may not.
+      if (fallback !== undefined && (fallback.engagement_required !== true || forceProvider)) {
+        this.pendingForcedReleases.add(fallbackJobID);
+      }
     }
     if (forceProvider && fallbackJobID !== undefined) {
       const forced = findByJob(this.store, fallbackJobID);
@@ -5819,49 +6415,84 @@ export class Bridge {
       // One loop opens at most one unclassified handoff per provider. A lease
       // stays with that tab until it proves normal, becomes a challenge park,
       while (this.handoffDrives.size < HANDOFF_DRIVE_LIMIT) {
-        let selected = this.store.activeJobs.find(
-          (job) =>
-            matchesOrigin(job) &&
-            job.status === "queued" &&
-            job.engagement_required !== true &&
-            this.hasHandoffReleaseEvidence(jobOrigin(job), job.requires_auth) &&
-            !this.challengeCooldownActiveForHosts(job.provider_hosts) &&
-            !this.hasActiveProviderDrainLease(job),
-        );
+        let selected: ActiveJob | undefined;
         let forcedJobID: string | undefined;
-        if (selected === undefined) {
-          for (const jobID of this.pendingForcedReleases) {
-            const candidate = this.store.activeJobs.find(
-              (job) =>
-                matchesOrigin(job) &&
-                job.job_id === jobID &&
-                job.status === "queued" &&
-                job.engagement_required !== true,
-            );
-            if (candidate === undefined) {
-              this.pendingForcedReleases.delete(jobID);
+        let forcedTemporarilyBlocked = false;
+        for (const jobID of this.pendingForcedReleases) {
+          const forcedJob = findByJob(this.store, jobID);
+          if (forcedJob === undefined) {
+            // A removed job is terminal; retire its worker-local marker.
+            this.pendingForcedReleases.delete(jobID);
+            continue;
+          }
+          if (forcedJob.status !== "queued") {
+            if (forcedJob.status === "offered") {
+              // An offer can be transiently re-materialized during a daemon
+              // re-offer. Keep the exact request until it is queued again, but
+              // do not let an out-of-scope marker block this profile's work.
+              if (matchesOrigin(forcedJob)) forcedTemporarilyBlocked = true;
               continue;
             }
-            if (this.challengeCooldownActiveForHosts(candidate.provider_hosts)) continue;
-            if (this.hasActiveProviderDrainLease(candidate)) continue;
-            selected = candidate;
-            forcedJobID = jobID;
+            // accepted/auth_pending/awaiting_download means this exact job has
+            // already opened and no longer needs a queued-release marker.
             this.pendingForcedReleases.delete(jobID);
-            break;
+            continue;
           }
+          // A scoped evidence drain must not consume a forced request for a
+          // different resolver profile; leave it for its own unscoped drain.
+          if (!matchesOrigin(forcedJob)) continue;
+          const candidate = forcedJob;
+          if (candidate.engagement_required === true && !forceProvider) {
+            // Timer-driven forced release never admits engagement-gated work.
+            // The marker is permanently ineligible under this drain mode.
+            this.pendingForcedReleases.delete(jobID);
+            continue;
+          }
+          if (this.challengeCooldownActiveForHosts(candidate.provider_hosts)) {
+            forcedTemporarilyBlocked = true;
+            continue;
+          }
+          if (this.hasActiveProviderDrainLease(candidate)) {
+            forcedTemporarilyBlocked = true;
+            continue;
+          }
+          selected = candidate;
+          forcedJobID = jobID;
+          break;
+        }
+        // An explicit request has priority over opportunistic work. If its
+        // exact job is temporarily blocked, retain the marker and wait rather
+        // than substituting another queued job.
+        if (selected === undefined && !forcedTemporarilyBlocked) {
+          selected = this.store.activeJobs.find(
+            (job) =>
+              matchesOrigin(job) &&
+              job.status === "queued" &&
+              job.engagement_required !== true &&
+              this.hasHandoffReleaseEvidence(jobOrigin(job), job.requires_auth) &&
+              !this.challengeCooldownActiveForHosts(job.provider_hosts) &&
+              !this.hasActiveProviderDrainLease(job),
+          );
         }
         if (selected === undefined) return;
 
         const queued = selected;
         const providerKey = this.providerKeyForJob(queued);
         const owner = await this.claimProviderDrainLease(queued);
-        if (owner === undefined) continue;
+        if (owner === undefined) {
+          // A lease race is a temporary block for an exact forced request;
+          // retain it rather than falling through to opportunistic work.
+          if (forcedJobID !== undefined) return;
+          continue;
+        }
         let opened = false;
         try {
-          const forceSurface = forcedJobID === queued.job_id && queued.requires_auth === true;
+          const forceSurface =
+            forcedJobID === queued.job_id && (forceProvider || queued.requires_auth === true);
           this.queuedHandoffTimers.delete(queued.job_id);
           const url = this.offerURLs.get(queued.job_id);
           if (url === undefined) {
+            this.pendingForcedReleases.delete(queued.job_id);
             this.send("job_reject", {}, queued.job_id);
             await this.removeJobWithOffer(queued.job_id);
             continue;
@@ -5879,6 +6510,7 @@ export class Bridge {
             console.error("papio: queued handoff tab creation failed", e);
           }
           if (tabID === undefined) {
+            this.pendingForcedReleases.delete(queued.job_id);
             this.send("job_reject", {}, queued.job_id);
             await this.removeJobWithOffer(queued.job_id);
             continue;
@@ -5898,6 +6530,7 @@ export class Bridge {
             this.authUnblockedAt = this.deps.now();
           }
           opened = true;
+          this.pendingForcedReleases.delete(queued.job_id);
           if (forceSurface) await this.surfaceWorkTab(tabID);
         } finally {
           if (!opened) await this.releaseProviderDrainLease(providerKey, owner);
@@ -5913,7 +6546,7 @@ export class Bridge {
   private async reloadAuthenticationHandoffs(origin: string | undefined, includeInstitutional = true): Promise<void> {
     for (const job of this.store.activeJobs) {
       if (
-        job.tab_id < 0 ||
+        !this.hasDelegatedAuthority(job) ||
         job.status === "queued" ||
         (!includeInstitutional && job.requires_auth === true) ||
         (origin !== undefined && this.resolverOriginHint(this.offerURLs.get(job.job_id)) !== origin) ||
@@ -5934,13 +6567,7 @@ export class Bridge {
   public async sendPageCapture(payload: PageCapturePayload, jobID?: string): Promise<boolean> {
     await this.captureTransmissionPolicyReady;
     if (!this.pageCaptureAvailable()) return false;
-    if (this.captureConsentRequired) {
-      try {
-        this.captureTransmissionAllowed = (await this.deps.captureConsent?.get()) === true;
-      } catch {
-        this.captureTransmissionAllowed = false;
-      }
-    }
+    await this.refreshCaptureConsent();
     if (!this.captureTransmissionAllowed) {
       if (!this.captureConsentNoteLogged) {
         this.captureConsentNoteLogged = true;
@@ -5969,6 +6596,7 @@ export class Bridge {
 
   private async onPageCaptureRequest(msg: BrowserMessage): Promise<void> {
     await this.captureTransmissionPolicyReady;
+    await this.refreshCaptureConsent();
     const request = msg.payload as unknown as PageCaptureRequestPayload;
     const reply = (outcome: PageCaptureRequestResultPayload["outcome"], detail?: string): void => {
       const payload: PageCaptureRequestResultPayload = {
@@ -6231,13 +6859,210 @@ export class Bridge {
       outcome === "needs_identifier" ? "needs_identifier" :
       outcome === "abandoned" ? "abandoned" :
       "failed";
-    // Terminal pushes are deliberately at-most-once; a reopened workspace reads
-    // the fresh snapshot rather than replaying an old outcome.
     this.notifyPdfGrab(correlation.scanID, grabID, terminal, detail);
     this.grabDownloads.delete(grabID);
     this.pdfGrabCorrelations.delete(grabID);
     this.persistPdfGrabCorrelations();
   }
+  private async onProviderDirectGetRequest(msg: BrowserMessage): Promise<void> {
+    const jobID = msg.job_id;
+    if (jobID === undefined || !(this.store.daemonFeatures ?? []).includes(PROVIDER_DIRECT_GET_FEATURE)) return;
+    const p = msg.payload;
+    const attemptID = p["drive_attempt_id"];
+    const ordinal = p["ordinal"];
+    const revision = p["route_revision"];
+    const rawURL = p["url"];
+    const origin = p["allowed_origin"];
+    const pathFamily = p["path_family"];
+    const expectedIdentifier = p["expected_identifier"];
+    const termsPolicy = p["terms_policy"];
+    if (typeof attemptID !== "string" || typeof ordinal !== "number" || typeof revision !== "string" ||
+        typeof rawURL !== "string" || typeof origin !== "string" ||
+        typeof pathFamily !== "string" || typeof expectedIdentifier !== "string" ||
+        (termsPolicy !== "none" && termsPolicy !== "durable_consent")) return;
+    let target: URL;
+    let allowed: URL;
+    try {
+      target = new URL(rawURL);
+      allowed = new URL(origin);
+    } catch {
+      return;
+    }
+    const envelopeValid =
+      target.protocol === "https:" &&
+      allowed.protocol === "https:" &&
+      allowed.pathname === "/" &&
+      allowed.search === "" &&
+      allowed.hash === "" &&
+      target.hash === "" &&
+      (target.search === "" || target.search === "?download=true") &&
+      target.host === allowed.host &&
+      directEnvelopePath(target.pathname, pathFamily, expectedIdentifier);
+    if (!envelopeValid) {
+      this.send("provider_direct_get_result", {
+        drive_attempt_id: attemptID,
+        ordinal,
+        route_revision: revision,
+        outcome: "foreign",
+        landing_class: "foreign",
+        detail: "direct route envelope is malformed or outside the allowed path family",
+      }, jobID);
+      return;
+    }
+    if (termsPolicy === "durable_consent" && (await this.deps.settings.getTermsConsent()) !== "accept") {
+      this.send("provider_direct_get_result", {
+        drive_attempt_id: attemptID,
+        ordinal,
+        route_revision: revision,
+        outcome: "terms",
+        landing_class: "terms",
+        detail: "durable terms consent is required for this direct route",
+      }, jobID);
+      return;
+    }
+    const prior = findByJob(this.store, jobID);
+    if (prior !== undefined && !this.hasDelegatedAuthority(prior)) return;
+    const priorEpoch = prior?.drive_epoch;
+    const priorDirect = prior as (ActiveJob & { direct_terminal?: boolean }) | undefined;
+    if (
+      priorEpoch !== undefined &&
+      priorEpoch.drive_attempt_id === attemptID &&
+      priorEpoch.ordinal === ordinal &&
+      priorEpoch.route_revision === revision &&
+      (priorDirect?.direct_terminal === true || prior?.download_initiated === true || this.downloads.has(jobID))
+    ) return;
+    if (priorEpoch?.drive_attempt_id === attemptID && priorEpoch.in_flight_download_id !== undefined) {
+      const found = await this.deps.downloads.search({ id: priorEpoch.in_flight_download_id });
+      if (found.length !== 0) {
+        this.downloads.set(jobID, {
+          ids: new Set([priorEpoch.in_flight_download_id]),
+          ambiguous: false,
+          directOffer: true,
+          directEpoch: priorEpoch,
+          directURL: rawURL,
+          directAllowedOrigin: allowed.origin,
+          directPathFamily: pathFamily,
+          directExpectedIdentifier: expectedIdentifier,
+        });
+        return;
+      }
+    }
+    const now = this.deps.now();
+    const epoch: ProviderDriveEpoch =
+      priorEpoch?.drive_attempt_id === attemptID
+        ? priorEpoch
+        : {
+            drive_attempt_id: attemptID,
+            ordinal,
+            strategy: "direct",
+            route_revision: revision,
+            attempt_count: (priorEpoch?.attempt_count ?? 0) + 1,
+          };
+    const job: ActiveJob = prior ?? {
+      job_id: jobID,
+      tab_id: -1,
+      offered_at: now,
+      expires_at: now + 24 * 60 * 60_000,
+      status: "accepted",
+      provider_hosts: [allowed.hostname],
+      access_mode: "delegated",
+    };
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) {
+      this.send(
+        "provider_direct_get_result",
+        { drive_attempt_id: attemptID, ordinal, route_revision: revision, outcome: "network", landing_class: "unknown" },
+        jobID,
+      );
+      return;
+    }
+    const providerKey = this.providerKeyForJob(job);
+    const providerLeaseJob = this.providerDrainLeaseJobs.get(providerKey);
+    if (providerLeaseJob !== undefined && providerLeaseJob !== jobID) {
+      this.releaseEffectGovernor(jobID, effectToken);
+      this.send(
+        "provider_direct_get_result",
+        { drive_attempt_id: attemptID, ordinal, route_revision: revision, outcome: "network", landing_class: "unknown" },
+        jobID,
+      );
+      return;
+    }
+    let providerLeaseOwner = this.providerDrainLeaseOwners.get(providerKey);
+    try {
+      if (providerLeaseOwner === undefined && this.currentProviderDrainLease(providerKey) === undefined) {
+        providerLeaseOwner = await this.claimProviderDrainLease(job);
+      }
+    } catch {
+      this.releaseEffectGovernor(jobID, effectToken);
+      return;
+    }
+    if (providerLeaseOwner === undefined) {
+      this.releaseEffectGovernor(jobID, effectToken);
+      this.send(
+        "provider_direct_get_result",
+        { drive_attempt_id: attemptID, ordinal, route_revision: revision, outcome: "network", landing_class: "unknown" },
+        jobID,
+      );
+      return;
+    }
+    try {
+      await this.update((s) =>
+        upsertJob(s, {
+          ...job,
+          status: "accepted",
+          tab_id: -1,
+          download_initiated: true,
+          drive_epoch: epoch,
+          direct_envelope: {
+            allowed_origin: allowed.origin,
+            path_family: pathFamily,
+            expected_identifier: expectedIdentifier,
+          },
+          direct_terminal: false,
+        } as ActiveJob),
+      );
+      this.pendingDownloadURLs.set(rawURL, jobID);
+      try {
+        const downloadID = await this.deps.downloads.download({
+          url: rawURL,
+          filename: jobDownloadFilename(jobID),
+          conflictAction: "uniquify",
+          saveAs: false,
+        });
+        const current = findByJob(this.store, jobID)?.drive_epoch ?? epoch;
+        const inFlight = { ...current, in_flight_download_id: downloadID };
+        await this.update((s) => patchJob(s, jobID, { drive_epoch: inFlight }));
+        this.downloads.set(jobID, {
+          ids: new Set([downloadID]),
+          ambiguous: false,
+          directOffer: true,
+          directEpoch: inFlight,
+          directURL: rawURL,
+          directAllowedOrigin: allowed.origin,
+          directPathFamily: pathFamily,
+          directExpectedIdentifier: expectedIdentifier,
+        });
+      } catch {
+        // Keep the daemon tuple and envelope durable, but allow a retry of the
+        // same tuple after a browser-level initiation failure.
+        await this.update((s) => patchJob(s, jobID, { download_initiated: false }));
+        this.send(
+          "provider_direct_get_result",
+          { drive_attempt_id: attemptID, ordinal, route_revision: revision, outcome: "network", landing_class: "unknown" },
+          jobID,
+        );
+      } finally {
+        this.pendingDownloadURLs.delete(rawURL);
+      }
+    } finally {
+      try {
+        if (providerLeaseOwner !== undefined) await this.releaseProviderDrainLease(providerKey, providerLeaseOwner);
+      } finally {
+        this.releaseEffectGovernor(jobID, effectToken);
+      }
+    }
+  }
+
 
   private async onInbound(raw: unknown): Promise<void> {
     let msg: BrowserMessage;
@@ -6272,6 +7097,9 @@ export class Bridge {
         return;
       case "job_offer":
         await this.onJobOffer(msg);
+        return;
+      case "provider_direct_get_request":
+        await this.onProviderDirectGetRequest(msg);
         return;
       case "cancel":
         await this.onCancel(msg);
@@ -6377,9 +7205,17 @@ export class Bridge {
     const providerParked = this.currentProviderDrainLease(providerKey)?.parkedReason === "challenge";
     const challengeCooldown = this.challengeCooldownActiveForHosts(providerHosts);
     const expected = parseExpected(p["expected"]);
+    const requiresAuth = typeof p["requires_auth"] === "boolean" ? p["requires_auth"] : undefined;
     const offeredAccessMode =
       p["access_mode"] === "assisted" || p["access_mode"] === "delegated" ? p["access_mode"] : undefined;
-    const requiresAuth = typeof p["requires_auth"] === "boolean" ? p["requires_auth"] : undefined;
+    const driveAttemptID = typeof p["drive_attempt_id"] === "string" ? p["drive_attempt_id"] : undefined;
+    const driveOrdinal = typeof p["drive_ordinal"] === "number" ? p["drive_ordinal"] : undefined;
+    const driveStrategy = typeof p["drive_strategy"] === "string" ? p["drive_strategy"] : undefined;
+    const driveRevision = typeof p["drive_revision"] === "string" ? p["drive_revision"] : undefined;
+    const offeredEpoch: ProviderDriveEpoch | undefined =
+      driveAttemptID !== undefined && driveOrdinal !== undefined && driveStrategy === "generic" && driveRevision !== undefined
+        ? { drive_attempt_id: driveAttemptID, ordinal: driveOrdinal, strategy: "generic", revision: driveRevision, attempt_count: 0 }
+        : undefined;
     const loginEntityID = p["login_entity_id"];
     const previousLoginEntityID = this.loginEntityIDs.get(jobID);
     const loginEntityRestored =
@@ -6412,6 +7248,40 @@ export class Bridge {
     // without its durable offer URL cannot represent an in-flight download:
     // discard that stale record so this offer recreates the real browser work.
     let existing = findByJob(this.store, jobID);
+    if (offeredEpoch !== undefined && existing !== undefined) {
+      const priorAttemptID = existing.generic_drive_epoch?.drive_attempt_id;
+      await this.update((s) => ({
+        ...s,
+        activeJobs: s.activeJobs.map((entry) => {
+          if (entry.job_id !== jobID) return entry;
+          const state = entry as ActiveJob & GenericJobState;
+          const prior = state.generic_drive_epoch;
+          const sameEpoch =
+            prior?.drive_attempt_id === offeredEpoch.drive_attempt_id &&
+            prior.ordinal === offeredEpoch.ordinal;
+          const next = {
+            ...entry,
+            generic_drive_epoch: sameEpoch
+              ? {
+                  ...offeredEpoch,
+                  ...prior,
+                  ordinal: offeredEpoch.ordinal,
+                  revision: offeredEpoch.revision,
+                }
+              : offeredEpoch,
+          } as ActiveJob & Record<string, unknown>;
+          if (priorAttemptID !== offeredEpoch.drive_attempt_id || prior?.ordinal !== offeredEpoch.ordinal) {
+            this.genericEvidence.delete(jobID);
+            delete next["generic_evaluated"];
+            delete next["generic_positive_attempts"];
+            delete next["generic_attempted_strategies"];
+            delete next["generic_terminal"];
+          }
+          return next as ActiveJob;
+        }),
+      }));
+      existing = findByJob(this.store, jobID);
+    }
     if (existing !== undefined && offeredAccessMode !== undefined && existing.access_mode !== offeredAccessMode) {
       await this.update((s) => patchJob(s, jobID, { access_mode: offeredAccessMode }));
       existing = findByJob(this.store, jobID);
@@ -6434,12 +7304,38 @@ export class Bridge {
         {
           ...deliveryJob,
           provider_hosts: providerHosts,
+          ...(offeredEpoch !== undefined ? { generic_drive_epoch: offeredEpoch } : {}),
           ...(expected !== undefined ? { expected } : {}),
           ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
           ...(effectiveAccessMode !== undefined ? { access_mode: effectiveAccessMode } : {}),
         },
         openurl,
       );
+      this.send("job_accept", {}, jobID);
+      return;
+    }
+    const authorityMode = effectiveAccessMode;
+    if (authorityMode !== "delegated") {
+      const now = this.deps.now();
+      const expiresMs = Date.parse(expiresAt);
+      const parked: ActiveJob = {
+        ...(existing ?? {
+          job_id: jobID,
+          tab_id: -1,
+          offered_at: now,
+          expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
+          status: "queued",
+        }),
+        provider_hosts: providerHosts,
+        ...(offeredEpoch !== undefined ? { generic_drive_epoch: offeredEpoch } : {}),
+        ...(expected !== undefined ? { expected } : {}),
+        ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
+        ...(effectiveAccessMode !== undefined ? { access_mode: effectiveAccessMode } : {}),
+        engagement_required: true,
+      };
+      if (expected === undefined) delete parked.expected;
+      if (requiresAuth === undefined) delete parked.requires_auth;
+      await this.upsertJobWithOffer(parked, openurl);
       this.send("job_accept", {}, jobID);
       return;
     }
@@ -6489,9 +7385,10 @@ export class Bridge {
         engagement_required: true,
         fresh_handoff: true,
         ...(claimKey !== undefined ? { institution_claim_key: claimKey } : {}),
+        ...(offeredEpoch !== undefined ? { generic_drive_epoch: offeredEpoch } : {}),
         ...(expected !== undefined ? { expected } : {}),
         requires_auth: true,
-        ...(effectiveAccessMode !== undefined ? { access_mode: effectiveAccessMode } : {}),
+        access_mode: "delegated",
       };
       if (expected === undefined) delete coldJob.expected;
       if (claimKey === undefined) delete coldJob.institution_claim_key;
@@ -6562,10 +7459,7 @@ export class Bridge {
         } catch {
           live = false;
         }
-        if (
-          !live &&
-          (!isDirectFileOffer(openurl) || requiresAuth === true || effectiveAccessMode === "assisted")
-        ) {
+        if (!live) {
           const recoveredTabID = await this.openManagedTab({
             url: openurl,
             jobId: jobID,
@@ -6635,16 +7529,7 @@ export class Bridge {
           }
           return;
         }
-        if (
-          live &&
-          !providerParked &&
-          !challengeCooldown &&
-          !(
-            isDirectFileOffer(openurl) &&
-            requiresAuth !== true &&
-            effectiveAccessMode !== "assisted"
-          )
-        ) {
+        if (live && !providerParked && !challengeCooldown) {
           if (this.authAttemptsFor(jobID) >= MAX_AUTH_ATTEMPTS) {
             this.rememberStalledAuthHandoff(jobID, {
               url: openurl,
@@ -6748,34 +7633,11 @@ export class Bridge {
       expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
       status,
       provider_hosts: providerHosts,
+      ...(offeredEpoch !== undefined ? { generic_drive_epoch: offeredEpoch } : {}),
       ...(expected !== undefined ? { expected } : {}),
       ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
       ...(effectiveAccessMode !== undefined ? { access_mode: effectiveAccessMode } : {}),
     });
-    // A direct-file URL is not permission to download unattended. The
-    // shape-matching above says only "this looks like a file"; whether a human
-    // must sign in is a property of the ACTION, and the daemon has already
-    // decided it. Checking it here rather than refusing to emit file-shaped
-    // URLs daemon-side keeps isDirectFileOffer's heuristic in one component:
-    // the offer URL for an institutional handoff is the operator's configured
-    // OpenURL base, whose path papio does not constrain, so a pdf-shaped base
-    // would otherwise route a sign-in-required offer straight to a download.
-    if (isDirectFileOffer(openurl) && effectiveAccessMode === "assisted") {
-      await this.upsertJobWithOffer(makeJob(-1), openurl);
-      this.send("job_accept", {}, jobID);
-      return;
-    }
-    if (
-      isDirectFileOffer(openurl) &&
-      requiresAuth !== true &&
-      effectiveAccessMode !== "assisted" &&
-      !challengeCooldown
-    ) {
-      await this.upsertJobWithOffer(makeJob(-1), openurl);
-      this.send("job_accept", {}, jobID);
-      await this.startDirectOfferDownload(jobID, openurl);
-      return;
-    }
 
     const governorQueued =
       !providerParked &&
@@ -6830,42 +7692,7 @@ export class Bridge {
     this.send("job_accept", {}, jobID);
   }
 
-  /** Start the one download-first attempt for an unequivocal direct-file URL.
-   * Any initiation error falls back to the normal broker-tab handoff. */
-  private async startDirectOfferDownload(jobID: string, url: string): Promise<void> {
-    const job = findByJob(this.store, jobID);
-    if (!job || job.tab_id >= 0 || job.download_initiated === true || job.access_mode === "assisted") return;
-    await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
-    // Register the direct-offer classification before Chrome can emit
-    // onCreated/onChanged for a small cached response.
-    this.downloads.set(jobID, { ids: new Set<number>(), ambiguous: false, directOffer: true });
-    this.pendingDownloadURLs.set(url, jobID);
-    try {
-      const id = await this.deps.downloads.download({
-        url,
-        filename: `papio/${jobID}/paper.pdf`,
-        conflictAction: "uniquify",
-        saveAs: false,
-      });
-      const track = this.downloads.get(jobID) ?? { ids: new Set<number>(), ambiguous: false, directOffer: true };
-      track.ids.add(id);
-      track.directOffer = true;
-      if (track.ids.size > 1) track.ambiguous = true;
-      this.downloads.set(jobID, track);
-    } catch (e) {
-      console.error("papio: direct-file download initiation failed; opening handoff tab", e);
-      this.downloads.delete(jobID);
-      await this.fallbackToOfferTab(jobID);
-    } finally {
-      this.pendingDownloadURLs.delete(url);
-    }
-  }
 
-  /** Remove a non-PDF direct attempt and return to the established tab flow. */
-  private async discardDirectOffer(jobID: string, downloadID: number): Promise<void> {
-    await this.discardDownload(jobID, downloadID);
-    await this.fallbackToOfferTab(jobID);
-  }
 
   private async failDelivery(jobID: string, downloadID: number, reason: string): Promise<void> {
     await this.discardDownload(jobID, downloadID);
@@ -6894,67 +7721,24 @@ export class Bridge {
       // Clearing history is best-effort; opening the human-visible fallback is not.
     }
   }
-
-  /** Convert a failed download-first attempt into the normal handoff flow. */
-  private async fallbackToOfferTab(jobID: string): Promise<void> {
-    const job = findByJob(this.store, jobID);
-    const url = this.offerURLs.get(jobID);
-    if (!job || job.tab_id >= 0 || url === undefined) return;
-    const governorQueued =
-      this.hasHandoffReleaseEvidence(this.resolverOriginHint(url), job.requires_auth) &&
-      (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT || this.handoffDriveQueue.length > 0);
-    const queueHandoff =
-      governorQueued ||
-      (!this.hasHandoffReleaseEvidence(this.resolverOriginHint(url), job.requires_auth) &&
-        (job.requires_auth === true ||
-          this.handoffOpening ||
-          this.store.activeJobs.some((candidate) => candidate.tab_id >= 0 && candidate.status !== "queued")));
-    if (queueHandoff) {
-      await this.update((s) =>
-        patchJob(s, jobID, {
-          status: governorQueued ? "accepted" : "queued",
-          tab_id: -1,
+  private async clearDirectDownloadState(jobID: string, epoch: ProviderDriveEpoch): Promise<void> {
+    const { in_flight_download_id: _inFlightDownloadID, ...withoutDownload } = epoch;
+    await this.update((s) => ({
+      ...s,
+      activeJobs: s.activeJobs.map((entry) => {
+        if (entry.job_id !== jobID) return entry;
+        const { direct_envelope: _directEnvelope, ...withoutEnvelope } = entry;
+        return {
+          ...withoutEnvelope,
           download_initiated: false,
-        }),
-      );
-      if (governorQueued) {
-        this.enqueueHandoffDrive({ jobID, purpose: "handoff" });
-        await this.drainHandoffDriveQueue();
-      } else {
-        this.scheduleQueuedHandoffRelease(jobID);
-      }
-      return;
-    }
-
-    this.handoffOpening = true;
-    let tabID: number | undefined;
-    try {
-      tabID = await this.openManagedTab({
-        url,
-        jobId: jobID,
-        purpose: "handoff",
-      });
-    } catch (e) {
-      console.error("papio: tab creation failed after direct-file download", e);
-    } finally {
-      this.handoffOpening = false;
-    }
-    if (tabID === undefined) {
-      this.send("job_reject", {}, jobID);
-      await this.removeJobWithOffer(jobID);
-      return;
-    }
-    this.beginProviderDrive(jobID);
-    await this.update((s) =>
-      patchJob(s, jobID, {
-        tab_id: tabID,
-        status: "accepted",
-        download_initiated: false,
-        unknown_count: 0,
+          drive_epoch: withoutDownload,
+          direct_terminal: true,
+        };
       }),
-    );
-    this.registerHandoffDrive(jobID, tabID);
+    }));
   }
+
+
 
   private async onCancel(msg: BrowserMessage): Promise<void> {
     const jobID = msg.job_id;
@@ -7150,7 +7934,15 @@ export class Bridge {
     // the adapter registry is the authoritative host source for classification,
     // so a tracked handoff landing on any registered family is on-provider.
     const onProvider = hostMatches(host, job.provider_hosts) || adapter !== undefined;
-    if (onProvider) await this.clearFederatedLoginOwnerForTab(tabID, "auth");
+    if (onProvider) {
+      // A completed provider landing after papio's federated route is the
+      // concrete sign-in evidence for this drive. Preserve it for the auth
+      // return reducer before retiring the claim owner.
+      if (successfulLanding && this.federatedLoginRouted.has(job.job_id)) {
+        this.federatedLoginOperatorNavigated.add(job.job_id);
+      }
+      await this.clearFederatedLoginOwnerForTab(tabID, "auth");
+    }
     // Back on the provider means this tab left the IdP (successfully or not);
     // either way it can no longer be the live sibling any waiting job is
     // deferring to for this origin.
@@ -7277,13 +8069,25 @@ export class Bridge {
     const institutionalSession = await this.recordInstitutionalSession(job, url, now);
     if (!institutionalSession) await this.recordOpenAccessLanding(job);
     const completedFederatedSignIn =
-      this.federatedLoginOperatorNavigated.has(jobID) || currentFederatedClassification;
+      institutionalSession ||
+      this.federatedLoginOperatorNavigated.has(jobID) ||
+      currentFederatedClassification;
     if (
+      this.hasDelegatedAuthority(findByJob(this.store, jobID)) &&
       this.federatedLoginRouted.has(jobID) &&
       completedFederatedSignIn &&
       !this.federatedReDriven.has(jobID)
     ) {
       const openurl = this.offerURLs.get(jobID);
+      const currentJob = findByJob(this.store, jobID);
+      if (openurl !== undefined && currentJob?.tab_id === tabID && this.deps.tabs.update !== undefined) {
+        // The successful sign-in is still driving this exact tab. Reuse it
+        // for the resolver return instead of creating a second effectful tab.
+        this.federatedLoginOperatorNavigated.delete(jobID);
+        this.federatedReDriven.add(jobID);
+        await this.deps.tabs.update(tabID, { url: openurl });
+        return true;
+      }
       if (openurl !== undefined) {
         this.federatedLoginOperatorNavigated.delete(jobID);
         this.federatedReDriven.add(jobID);
@@ -7328,6 +8132,7 @@ export class Bridge {
    * fall through and spend a second entry in the same recovery budget.
    */
   private async redriveStaleHandoff(job: ActiveJob, recoveryEpoch: number): Promise<boolean> {
+    if (!this.hasDelegatedAuthority(job)) return false;
     if ((this.staleRecoveryEpochs.get(job.job_id) ?? 0) !== recoveryEpoch) return true;
     if (
       this.staleRecoveryAttemptedEpochs.get(job.job_id) === recoveryEpoch ||
@@ -7399,6 +8204,7 @@ export class Bridge {
    * recognized Chrome PDF viewer. */
   private async maybeDownloadPDFViewer(jobID: string, url: string, knownPDFViewer = false): Promise<void> {
     let job = findByJob(this.store, jobID);
+    if (!this.hasDelegatedAuthority(job)) return;
     if (!job || (job.status !== "accepted" && job.status !== "awaiting_download")) return;
     if (this.isFirefoxClickDownload(job)) return;
     if (job.download_initiated === true || this.downloads.has(jobID)) return;
@@ -7439,13 +8245,18 @@ export class Bridge {
     // download may have been correlated while this probe was in flight.
     job = findByJob(this.store, jobID);
     if (!job || job.download_initiated === true || this.downloads.has(jobID)) return;
-    await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
-
-    this.pendingDownloadURLs.set(downloadURL, jobID);
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) {
+      this.deps.setTimeout(() => void this.maybeDownloadPDFViewer(jobID, url, knownPDFViewer), CLASSIFY_RETRY_MS);
+      return;
+    }
     try {
+      await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
+
+      this.pendingDownloadURLs.set(downloadURL, jobID);
       const id = await this.deps.downloads.download({
         url: downloadURL,
-        filename: `papio/${jobID}/paper.pdf`,
+        filename: jobDownloadFilename(jobID),
         conflictAction: "uniquify",
         saveAs: false,
       });
@@ -7457,6 +8268,7 @@ export class Bridge {
       console.error("papio: PDF-viewer download initiation failed; staying assisted", e);
     } finally {
       this.pendingDownloadURLs.delete(downloadURL);
+      this.releaseEffectGovernor(jobID, effectToken);
     }
   }
 
@@ -7489,16 +8301,23 @@ export class Bridge {
       if (this.isFirefoxClickDownload(j)) return false;
       if (j.status !== "accepted" && j.status !== "awaiting_download") return false;
       const openerMatches =
+        this.hasDelegatedAuthority(j) &&
         openerTabId !== undefined &&
         (j.tab_id === openerTabId || openerLedgerEntry?.jobID === j.job_id);
-      const providerDriveActive = this.handoffDrives.has(j.job_id) || j.download_initiated === true;
-      // A CDN viewer can lose both openerTabId and provider-host ancestry.
-      // Keep the unique-job guard below; daemon-side PDF/work identity checks
-      // remain the final authority for this broader correlation.
-      return openerMatches || (openerTabId === undefined && providerDriveActive);
+      const packagedCDNMatch =
+        openerTabId === undefined && this.hasRecordedProviderCDNRelationship(j, host);
+      return openerMatches || packagedCDNMatch;
     });
     const job = candidates.length === 1 ? candidates[0] : candidates.find((j) => j.tab_id === openerTabId);
     if (!job) return;
+    // Viewer adoption starts a browser download, so it participates in the
+    // same single effect slot as every other download initiation. If another
+    // effect is in flight, retry classification rather than parking the slot.
+    const effectToken = this.claimEffectGovernor(job.job_id);
+    if (effectToken === undefined) {
+      this.deps.setTimeout(() => void this.maybeAdoptViewerTab(viewerTabId, url, openerTabId), CLASSIFY_RETRY_MS);
+      return;
+    }
     this.adoptedViewerTabs.set(job.job_id, viewerTabId);
 
     this.pendingDownloadURLs.set(url, job.job_id);
@@ -7520,6 +8339,7 @@ export class Bridge {
       console.error("papio: viewer-tab PDF adoption failed; staying assisted", e);
     } finally {
       this.pendingDownloadURLs.delete(url);
+      this.releaseEffectGovernor(job.job_id, effectToken);
     }
   }
 
@@ -7531,7 +8351,7 @@ export class Bridge {
    * host permission or no electronic service stays assisted.
    */
   private async maybeRouteResolver(job: ActiveJob, currentURL: string): Promise<boolean> {
-    if (job.access_mode === "assisted") return false;
+    if (!this.hasDelegatedAuthority(job)) return false;
     const offered = this.offerURLs.get(job.job_id);
     let landingURL: URL;
     try {
@@ -7605,6 +8425,18 @@ export class Bridge {
     return spec?.download?.method === "click";
   }
 
+  /** The only openerless viewer relationship shipped in the extension is the
+   * ScienceDirect provider -> science-direct-assets CDN redirect. It is valid
+   * only while this exact delegated job has an active drive marker. */
+  private hasRecordedProviderCDNRelationship(job: ActiveJob, host: string): boolean {
+    if (!this.hasDelegatedAuthority(job)) return false;
+    if (!host.toLowerCase().endsWith(".sciencedirectassets.com")) return false;
+    const providerKnown =
+      job.provider_hosts.some((candidate) => hostMatches(candidate, ["sciencedirect.com"])) ||
+      job.adapter_id === "sciencedirect";
+    return providerKnown && this.handoffDrives.has(job.job_id);
+  }
+
   /** A manual browser download may originate from an offer host or from a
    * source-controlled adapter host that was recorded on the tracked landing. */
   private matchesManualDownloadHost(job: ActiveJob, host: string): boolean {
@@ -7615,8 +8447,7 @@ export class Bridge {
   }
 
 
-  /**
-   * Classify the tracked tab's current provider page with the single injected
+  /** Classify the tracked provider page with the single injected plan executor.
    * `planExecution` function, then act on the verdict/plan. A registered
    * provider is diagnosed before injection when the browser cannot effectively
    * read it; all-sites access is effective access. Adapter execution never
@@ -7667,12 +8498,10 @@ export class Bridge {
       if (currentJob === undefined) return;
       const captured = await this.recordUnknown(currentJob, host);
       if (await this.runGenericOnSettledUnknown(currentJob)) return;
-      const latest = findByJob(this.store, job.job_id) ?? currentJob;
-      const genericState = latest as ActiveJob & GenericJobState;
       const outcomeKey = `${job.job_id}:ui_changed`;
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
-        const evidence = genericState.generic_evidence ?? [];
+        const evidence = this.genericEvidence.get(job.job_id) ?? [];
         const detail =
           "No source-controlled adapter matched this provider page." +
           (captured ? " A sanitized diagnostic was saved locally for adapter development." : "") +
@@ -7685,7 +8514,7 @@ export class Bridge {
       }
       return;
     }
-    if (disposition === "apply") await this.restoreWorkWindowForAdapter(spec);
+    if (disposition === "apply" && this.hasDelegatedAuthority(job)) await this.restoreWorkWindowForAdapter(spec);
     const access = await this.hasEffectiveProviderAccess(host);
     if (access !== true) {
       if (disposition === "apply" && access === false) {
@@ -7793,12 +8622,37 @@ export class Bridge {
       if (currentJob.challenge_blocked === true) await this.clearChallengeBlock(currentJob);
     }
     const providerKey = this.providerKeyForJob(currentJob);
-    if (await this.completeProviderDrainLease(providerKey)) {
+    let providerLeaseOwner = this.providerDrainLeaseOwners.get(providerKey);
+    const providerLeaseJob = this.providerDrainLeaseJobs.get(providerKey);
+    if (providerLeaseJob !== undefined && providerLeaseJob !== currentJob.job_id) {
+      this.scheduleClassifyRetry(jobID, "effect");
+      return;
+    }
+    if (providerLeaseOwner === undefined && this.currentProviderDrainLease(providerKey) === undefined) {
+      providerLeaseOwner = await this.claimProviderDrainLease(currentJob);
+    }
+    // A persisted lease without a local owner belongs to another live drive
+    // (possibly from a prior worker); do not let this tab bypass it. Keep the
+    // exact classification queued so releasing that drive can make progress
+    // instead of silently dropping this provider effect.
+    if (providerLeaseOwner === undefined && this.currentProviderDrainLease(providerKey) !== undefined) {
+      this.scheduleClassifyRetry(jobID, "effect");
+      return;
+    }
+    let releasedProviderLease = false;
+    try {
+      await this.applyVerdict(jobID, spec, plan, host);
+    } finally {
+      if (providerLeaseOwner !== undefined) {
+        await this.releaseProviderDrainLease(providerKey, providerLeaseOwner);
+        releasedProviderLease = true;
+      }
+    }
+    if (releasedProviderLease) {
       if (await this.acknowledgePendingProviderHandoffs(providerKey)) {
         await this.releaseQueuedHandoffs();
       }
     }
-    await this.applyVerdict(jobID, spec, plan, host);
     // A decisive verdict ends the render race; `unknown` may just be an
     // un-upgraded page, so retry on a bounded schedule. A latched download-click
     // that opens a declared terms gate must ALSO keep retrying: providers like
@@ -7812,7 +8666,10 @@ export class Bridge {
       (after?.status === "accepted" || after?.status === "awaiting_download") &&
       after?.download_initiated === true &&
       !this.downloads.has(jobID);
-    if (verdict.kind === "unknown" || (verdict.kind !== "terms" && awaitingTermsGate)) {
+    const genericInFlight =
+      after?.download_initiated === true &&
+      this.downloads.get(jobID)?.generic !== undefined;
+    if ((!genericInFlight && verdict.kind === "unknown") || (verdict.kind !== "terms" && awaitingTermsGate)) {
       this.scheduleClassifyRetry(jobID);
     } else {
       this.classifyRetries.delete(jobID);
@@ -7979,7 +8836,10 @@ export class Bridge {
    * on churn from a keepalive probe repeating every few seconds while a
    * repeated evidence does not navigate a tabless waiter; it becomes queued
    * and engagement-required until the operator clicks it again. */
-  private async resumeWaitingForSessionJobs(matches: (job: ActiveJob) => boolean): Promise<void> {
+  private async resumeWaitingForSessionJobs(
+    matches: (job: ActiveJob) => boolean,
+    autoDriveTabless = false,
+  ): Promise<void> {
     for (const job of this.store.activeJobs) {
       if (job.waiting_for_session !== true || !matches(job)) continue;
       if (
@@ -7989,15 +8849,27 @@ export class Bridge {
         continue;
       }
       if (job.tab_id < 0) {
-        await this.update((s) =>
-          patchJob(s, job.job_id, {
-            waiting_for_session: false,
-            waiting_for_session_key: undefined,
-            waiting_deadline: undefined,
-            status: "queued",
-            engagement_required: true,
-          }),
-        );
+        if (autoDriveTabless && job.engagement_required !== true) {
+          await this.update((s) =>
+            patchJob(s, job.job_id, {
+              waiting_for_session: false,
+              waiting_for_session_key: undefined,
+              waiting_deadline: undefined,
+              status: "queued",
+            }),
+          );
+          this.enqueueHandoffDrive({ jobID: job.job_id, purpose: "handoff", focusExisting: false });
+        } else {
+          await this.update((s) =>
+            patchJob(s, job.job_id, {
+              waiting_for_session: false,
+              waiting_for_session_key: undefined,
+              waiting_deadline: undefined,
+              status: "queued",
+              engagement_required: true,
+            }),
+          );
+        }
         continue;
       }
       this.enqueueHandoffDrive({
@@ -8026,7 +8898,7 @@ export class Bridge {
    * job's own data may already be gone (removed, restart-dead), so this
    * never depends on it: the waiters carry their own claim key. */
   private async resumeWaitingForSessionByClaim(claimKey: string): Promise<void> {
-    await this.resumeWaitingForSessionJobs((job) => job.waiting_for_session_key === claimKey);
+    await this.resumeWaitingForSessionJobs((job) => job.waiting_for_session_key === claimKey, true);
   }
 
   /** Consume only the browser lifecycle generated by our own federated route.
@@ -8072,6 +8944,7 @@ export class Bridge {
    * and resumes when that claim retires or fresh institution evidence lands.
    * Otherwise this job claims the key and becomes the live tab for siblings. */
   private async maybeRouteFederatedLogin(jobID: string, job: ActiveJob, spec: AdapterSpec): Promise<void> {
+    if (!this.hasDelegatedAuthority(job)) return;
     const template = spec.federatedLogin;
     const entityID = this.loginEntityIDs.get(jobID);
     if (template === undefined || entityID === undefined) return;
@@ -8124,9 +8997,6 @@ export class Bridge {
     } catch (e) {
       // Let a later classify retry route again if this navigation failed.
       this.federatedLoginRouted.delete(jobID);
-      this.federatedLoginRouteEvents.delete(jobID);
-      await this.clearFederatedLoginOwner(claimKey, jobID);
-      console.error("papio: federated login route failed", e);
     }
   }
 
@@ -8136,6 +9006,7 @@ export class Bridge {
    * configured param/account id or a `tabs.update` seam, if the current URL
    * already carries the param, or if already appended this drive (latched). */
   private async maybeAppendAccountId(jobID: string, job: ActiveJob, spec: AdapterSpec): Promise<boolean> {
+    if (!this.hasDelegatedAuthority(job)) return false;
     const param = spec.accountIdParam;
     const accountID = this.proquestAccountIDs.get(jobID);
     if (param === undefined || accountID === undefined) return false;
@@ -8270,7 +9141,12 @@ export class Bridge {
 
   /** Record a development capture for an unknown page. The caller decides
    * whether to remain assisted or report a terminal coverage gap. */
-  private async recordUnknown(job: ActiveJob, host: string, adapter?: AdapterSpec): Promise<boolean> {
+  private async recordUnknown(
+    job: ActiveJob,
+    host: string,
+    adapter?: AdapterSpec,
+    deferTerminal = false,
+  ): Promise<boolean> {
     let captured = false;
     const captureStorage = this.deps.captureStorage;
     if (captureStorage !== undefined && this.pageCaptureAvailable()) {
@@ -8298,7 +9174,7 @@ export class Bridge {
     const now = this.deps.now();
     const count = job.unknown_count ?? 0;
     const last = job.last_unknown_ms ?? 0;
-    if (count >= 1 && now - last >= 5000) {
+    if (count >= 1 && now - last >= 5000 && !deferTerminal) {
       // Retries wait for one document to render; they are not independent
       // provider failures, so one broker drive gets one terminal observation.
       const outcomeKey = `${job.job_id}:ui_changed`;
@@ -8322,6 +9198,97 @@ export class Bridge {
 
     return captured;
   }
+  private genericEpochKey(jobID: string, epoch: ProviderDriveEpoch): string {
+    return `${jobID}\u0000${epoch.drive_attempt_id}\u0000${epoch.ordinal}\u0000${epoch.strategy}\u0000${epoch.revision ?? ""}`;
+  }
+
+  /** Send one terminal observation for the exact daemon-minted tuple. */
+  private async sendGenericEpochResult(
+    jobID: string,
+    epoch: ProviderDriveEpoch,
+    outcome: string,
+    detail: string,
+  ): Promise<NativeRequestResult | undefined> {
+    const key = this.genericEpochKey(jobID, epoch);
+    if (this.genericEpochResultsSent.has(key)) return undefined;
+    this.genericEpochResultsSent.add(key);
+    const result = await this.requestNative(
+      "provider_drive_epoch_result_request",
+      {
+        drive_attempt_id: epoch.drive_attempt_id,
+        ordinal: epoch.ordinal,
+        strategy: "generic",
+        revision: epoch.revision ?? "",
+        outcome,
+        detail,
+      },
+      "provider_drive_epoch_result",
+      PROVIDER_DRIVE_EPOCH_FEATURE,
+      true,
+      jobID,
+    );
+    if (result.kind !== "response") this.genericEpochResultsSent.delete(key);
+    return result;
+  }
+
+  /** Rebuild only generic download correlation after an MV3 worker restart.
+   * Candidate URLs and their ordering are deliberately not recoverable: the
+   * daemon's tuple is the sole durable authority for a fresh epoch. */
+  private async reconcileGenericDownloads(): Promise<void> {
+    for (const job of this.store.activeJobs) {
+      const epoch = job.generic_drive_epoch;
+      if (epoch?.strategy !== "generic") continue;
+      if (job.generic_terminal === true) continue;
+      let item: DownloadItemLike | null | undefined;
+      let downloadID: number;
+      if (epoch.in_flight_download_id === undefined) {
+        if (job.download_initiated !== true) continue;
+        item = await this.restartDownloadByFilename(job.job_id);
+        if (item === undefined) continue;
+        if (item === null) {
+          await this.sendGenericEpochResult(
+            job.job_id,
+            epoch,
+            "cancelled",
+            "browser download no longer exists after worker restart",
+          );
+          await this.retainGenericCandidate(job.job_id, { candidates: [], index: 0, epoch });
+          continue;
+        }
+        downloadID = item.id;
+      } else {
+        downloadID = epoch.in_flight_download_id;
+        let found: DownloadItemLike[];
+        try {
+          found = await this.deps.downloads.search({ id: downloadID });
+        } catch {
+          continue;
+        }
+        item = found[0] ?? null;
+        if (item === null) {
+          await this.sendGenericEpochResult(
+            job.job_id,
+            epoch,
+            "cancelled",
+            "browser download no longer exists after worker restart",
+          );
+          await this.retainGenericCandidate(job.job_id, { candidates: [], index: 0, epoch });
+          continue;
+        }
+      }
+      this.downloads.set(job.job_id, {
+        ids: new Set([downloadID]),
+        ambiguous: false,
+        directOffer: false,
+        generic: { candidates: [], index: 0, epoch },
+      });
+      const state = item?.state;
+      if (state === "complete" || state === "interrupted") {
+        await this.onDownloadChanged({ id: downloadID, state: { current: state } });
+      }
+    }
+  }
+
   private async runGenericOnSettledUnknown(job: ActiveJob): Promise<boolean> {
     if (
       this.handoffDrives.has(job.job_id) === false ||
@@ -8365,17 +9332,8 @@ export class Bridge {
     }
     if (planned === undefined) return false;
     const evidence = planned.evidence.filter((item): item is string => typeof item === "string").slice(0, 20);
-    await this.update((s) => ({
-      ...s,
-      activeJobs: s.activeJobs.map((candidate) => {
-        if (candidate.job_id !== job.job_id) return candidate;
-        const prior = (candidate as ActiveJob & GenericJobState).generic_evidence ?? [];
-        return {
-          ...candidate,
-          generic_evidence: [...new Set([...prior, ...evidence])].slice(0, 20),
-        } as ActiveJob;
-      }),
-    }));
+    const priorEvidence = this.genericEvidence.get(job.job_id) ?? [];
+    this.genericEvidence.set(job.job_id, [...new Set([...priorEvidence, ...evidence])].slice(0, 20));
     const candidates =
       job.access_mode === "delegated"
         ? planned.candidates.filter(
@@ -8410,6 +9368,7 @@ export class Bridge {
       return;
     }
     const state = current as ActiveJob & GenericJobState;
+    if (state.generic_terminal === true) return;
     const attempted = state.generic_attempted_strategies ?? [];
     const attempts = state.generic_positive_attempts ?? 0;
     if (attempts >= 2) return;
@@ -8452,33 +9411,76 @@ export class Bridge {
       return;
     }
     const latest = findByJob(this.store, jobID);
-    if (
-      latest === undefined ||
-      latest.download_initiated === true ||
-      this.downloads.has(jobID) ||
-      !this.handoffDrives.has(jobID)
-    ) {
+    if (latest === undefined || !this.handoffDrives.has(jobID)) return;
+    const priorEpoch = (latest as ActiveJob & GenericJobState).generic_drive_epoch;
+    const epoch: ProviderDriveEpoch | undefined =
+      priorEpoch?.strategy_id === candidate.strategy_id && priorEpoch.strategy === "generic"
+        ? priorEpoch
+        : priorEpoch?.strategy === "generic" && priorEpoch.revision === candidate.strategy_version
+          ? { ...priorEpoch, strategy_id: candidate.strategy_id }
+          : undefined;
+    if (epoch === undefined) {
+      await this.emitGenericUnknown(jobID);
       return;
     }
-    await this.update((s) => ({
-      ...s,
-      activeJobs: s.activeJobs.map((entry) => {
-        if (entry.job_id !== jobID) return entry;
-        const prior = entry as ActiveJob & GenericJobState;
-        return {
-          ...entry,
-          download_initiated: true,
-          adapter_id: candidate!.strategy_id,
-          generic_positive_attempts: (prior.generic_positive_attempts ?? 0) + 1,
-          generic_attempted_strategies: [...(prior.generic_attempted_strategies ?? []), candidate!.strategy_id],
-        } as ActiveJob;
-      }),
-    }));
+    if (typeof epoch.revision !== "string" || epoch.revision.length === 0) {
+      if (!this.genericCandidateAuthorized(this.store, jobID, epoch, candidate.strategy_id)) return;
+      await this.retainGenericCandidate(jobID, { candidates, index, epoch });
+      return;
+    }
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) return;
+    const providerKey = this.providerKeyForJob(latest);
+    const providerLeaseJob = this.providerDrainLeaseJobs.get(providerKey);
+    if (providerLeaseJob !== undefined && providerLeaseJob !== jobID) {
+      this.releaseEffectGovernor(jobID, effectToken);
+      return;
+    }
+    let providerLeaseOwner = this.providerDrainLeaseOwners.get(providerKey);
+    try {
+      if (providerLeaseOwner === undefined && this.currentProviderDrainLease(providerKey) === undefined) {
+        providerLeaseOwner = await this.claimProviderDrainLease(latest);
+      }
+      if (providerLeaseOwner === undefined) {
+        this.releaseEffectGovernor(jobID, effectToken);
+        return;
+      }
+    } catch {
+      this.releaseEffectGovernor(jobID, effectToken);
+      return;
+    }
+    try {
+    const start = await this.requestNative(
+      "provider_drive_epoch_start_request",
+      { drive_attempt_id: epoch.drive_attempt_id, ordinal: epoch.ordinal, strategy: "generic", revision: epoch.revision },
+      "provider_drive_epoch_start_result",
+      PROVIDER_DRIVE_EPOCH_FEATURE,
+      true,
+      jobID,
+    );
+    if (
+      start.kind !== "response" ||
+      start.payload?.["outcome"] !== "started" ||
+      start.payload?.["drive_attempt_id"] !== epoch.drive_attempt_id ||
+      start.payload?.["ordinal"] !== epoch.ordinal ||
+      start.payload?.["strategy"] !== "generic" ||
+      start.payload?.["revision"] !== epoch.revision
+    ) {
+      if (this.genericCandidateAuthorized(this.store, jobID, epoch, candidate.strategy_id)) {
+        await this.retainGenericCandidate(jobID, { candidates, index, epoch });
+      }
+      return;
+    }
+    const claimedEpoch = await this.claimGenericCandidate(jobID, epoch, candidate);
+    if (claimedEpoch === undefined) return;
+    // The claim update persists asynchronously. Re-read synchronously after it
+    // settles so a concurrent offer downgrade cannot be followed by a download.
+    if (!this.genericCandidateAuthorized(this.store, jobID, claimedEpoch, candidate.strategy_id, true)) return;
     this.pendingDownloadURLs.set(candidate.url, jobID);
     try {
       const downloadID = await this.deps.downloads.download({
         url: candidate.url,
-        filename: `papio/${jobID}/paper.pdf`,
+        filename: jobDownloadFilename(jobID),
         conflictAction: "uniquify",
         saveAs: false,
       });
@@ -8486,41 +9488,59 @@ export class Bridge {
         ids: new Set([downloadID]),
         ambiguous: false,
         directOffer: false,
-        generic: { candidates, index },
+        generic: { candidates, index, epoch: claimedEpoch },
       });
+      await this.update((s) => ({
+        ...s,
+        activeJobs: s.activeJobs.map((entry) =>
+          entry.job_id === jobID
+            ? ({ ...entry, generic_drive_epoch: { ...claimedEpoch, in_flight_download_id: downloadID } } as ActiveJob)
+            : entry,
+        ),
+      }));
     } catch (error) {
-      console.error("papio: generic download initiation failed", error);
+      console.error("papio: generic download initiation failed; retaining candidate", error);
+      await this.sendGenericEpochResult(jobID, claimedEpoch, "unknown", "browser download initiation failed");
       await this.update((s) => ({
         ...s,
         activeJobs: s.activeJobs.map((entry) => {
           if (entry.job_id !== jobID) return entry;
-          const next = { ...entry, download_initiated: false } as ActiveJob & Record<string, unknown>;
-          delete next["adapter_id"];
-          return next as ActiveJob;
+          const { in_flight_download_id: _inFlightDownloadID, ...withoutDownload } = claimedEpoch;
+          return {
+            ...entry,
+            download_initiated: false,
+            generic_terminal: true,
+            generic_drive_epoch: withoutDownload,
+          } as ActiveJob;
         }),
       }));
-      await this.startGenericCandidate(jobID, candidates, index);
     } finally {
       this.pendingDownloadURLs.delete(candidate.url);
     }
+    } finally {
+      try {
+        if (providerLeaseOwner !== undefined) await this.releaseProviderDrainLease(providerKey, providerLeaseOwner);
+      } finally {
+        this.releaseEffectGovernor(jobID, effectToken);
+      }
+    }
   }
   private async emitGenericWrongWork(jobID: string, strategyID: string): Promise<void> {
-    if (
-      this.send(
-        "provider_outcome",
-        { outcome: "wrong_work", detail: `Generic strategy ${strategyID} failed identity revalidation.` },
-        jobID,
-      )
-    ) {
-      await this.settleHandoffAfterOutcome(jobID);
-    }
+    const job = findByJob(this.store, jobID);
+    const epoch = job?.generic_drive_epoch;
+    if (epoch?.strategy !== "generic" || typeof epoch.revision !== "string") return;
+    await this.sendGenericEpochResult(
+      jobID,
+      epoch,
+      "wrong_work",
+      `Generic strategy ${strategyID} failed identity revalidation.`,
+    );
   }
 
   private async emitGenericUnknown(jobID: string): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return;
-    const state = job as ActiveJob & GenericJobState;
-    const evidence = state.generic_evidence ?? [];
+    const evidence = this.genericEvidence.get(jobID) ?? [];
     const detail =
       "No source-controlled adapter matched this provider page." +
       (evidence.length === 0 ? "" : ` Generic evidence: ${evidence.join(", ")}.`);
@@ -8535,9 +9555,15 @@ export class Bridge {
     this.downloads.delete(jobID);
     await this.update((s) => ({
       ...s,
-      activeJobs: s.activeJobs.map((entry) =>
-        entry.job_id === jobID ? ({ ...entry, download_initiated: false } as ActiveJob) : entry,
-      ),
+      activeJobs: s.activeJobs.map((entry) => {
+        if (entry.job_id !== jobID) return entry;
+        const { strategy_id: _strategyID, ...withoutStrategy } = track.epoch;
+        return {
+          ...entry,
+          download_initiated: false,
+          generic_drive_epoch: { ...withoutStrategy, ordinal: track.epoch.ordinal + 1 },
+        } as ActiveJob;
+      }),
     }));
     if (track.index >= track.candidates.length) {
       await this.emitGenericUnknown(jobID);
@@ -8545,19 +9571,25 @@ export class Bridge {
     }
     await this.startGenericCandidate(jobID, track.candidates, track.index);
   }
-
-  private async citationDOIForTab(tabID: number): Promise<string | undefined> {
-    try {
-      const results = await this.deps.scripting.executeScript({
-        target: { tabId: tabID },
-        func: readCitationDOI,
-      });
-      const value = results[0]?.result;
-      return typeof value === "string" && value.length > 0 ? value : undefined;
-    } catch {
-      return undefined;
-    }
+  private async retainGenericCandidate(jobID: string, track: GenericDownloadAttempt): Promise<void> {
+    this.downloads.delete(jobID);
+    await this.update((s) => ({
+      ...s,
+      activeJobs: s.activeJobs.map((entry) => {
+        if (entry.job_id !== jobID) return entry;
+        const { in_flight_download_id: _inFlightDownloadID, ...withoutDownload } = track.epoch;
+        return {
+          ...entry,
+          download_initiated: false,
+          // The positive attempt and strategy remain durable. Only a fresh
+          // daemon epoch may clear them and authorize another candidate.
+          generic_terminal: true,
+          generic_drive_epoch: withoutDownload,
+        } as ActiveJob;
+      }),
+    }));
   }
+
 
   /** Map a page verdict to a bridge action. See the safety contract: at most one
    * download initiation per job, ever; unknown only escalates after two spaced
@@ -8583,27 +9615,15 @@ export class Bridge {
     ) {
       await this.clearFederatedLoginOwner(ownerEntry[0], jobID);
     }
-
     if (verdict.kind !== "unknown" && (job.unknown_count ?? 0) !== 0) {
       // Any decisive verdict breaks the unknown streak.
       await this.update((s) => patchJob(s, jobID, { unknown_count: 0 }));
-    }
-    if (verdict.kind === "article" && job.expected?.doi !== undefined && job.tab_id >= 0) {
-      const citationDOI = await this.citationDOIForTab(job.tab_id);
-      if (
-        citationDOI !== undefined &&
-        normalizeExpectedDOI(citationDOI) !== normalizeExpectedDOI(job.expected.doi)
-      ) {
-        if (this.send("provider_outcome", { outcome: "wrong_work", adapter_id: spec.id, adapter_version: av }, jobID)) {
-          await this.settleHandoffAfterOutcome(jobID);
-        }
-        return;
-      }
     }
 
     switch (verdict.kind) {
       case "article": {
         const dl = spec.download;
+        if (!this.hasDelegatedAuthority(job) && dl !== undefined) return;
         // Assisted jobs may classify and capture, but no adapter-declared
         // control or derived URL may cause a browser download.
         if (job.access_mode === "assisted" && dl !== undefined) return;
@@ -8660,125 +9680,148 @@ export class Bridge {
             freshPlan.decisive_rule !== plan.decisive_rule ||
             freshPlan.method !== plan.method ||
             freshPlan.url !== plan.url ||
-            JSON.stringify(freshPlan.target_ref) !== JSON.stringify(plan.target_ref)
+            JSON.stringify(freshPlan.target_ref) !== JSON.stringify(plan.target_ref) ||
+            JSON.stringify(freshPlan.expected_work) !== JSON.stringify(plan.expected_work) ||
+            JSON.stringify(freshPlan.effect_graph) !== JSON.stringify(plan.effect_graph) ||
+            freshPlan.route_origin !== plan.route_origin ||
+            freshPlan.access_mode !== plan.access_mode ||
+            JSON.stringify(freshPlan.revalidation) !== JSON.stringify(plan.revalidation)
           ) {
             return;
           }
           if ((dl.method === "click" || dl.method === "api") && freshPlan.target_ref === null) {
             return;
           }
+          const currentAuthority = findByJob(this.store, jobID);
+          if (!this.hasDelegatedAuthority(currentAuthority)) return;
           const freshTarget = freshPlan.target_ref;
           if (freshTarget === null) return;
-          // Do not latch or invoke page code without a concrete,
-          // revalidated target.
-          // Consent is an await boundary shared by concurrent classifications.
-          // Re-read the durable latch before this synchronous update claims the
-          // job, so only one classifier can initiate the download.
-          const latestJob = findByJob(this.store, jobID);
-          if (latestJob === undefined || latestJob.download_initiated === true) return;
-          // Latch BEFORE resolving/downloading (persisted) so no
-          // re-classification can ever initiate a second download. Failure
-          // falls back to assisted mode; the user can still use the verified
-          // page control manually.
-          await this.update((s) =>
-            patchJob(s, jobID, { download_initiated: true, adapter_id: spec.id }),
-          );
+          const effectToken = this.claimEffectGovernor(jobID);
+          if (effectToken === undefined) {
+            // Another page mutation or download owns the one-effect slot.
+            // Reclassify after it settles; silently returning loses this
+            // adapter/job correlation when providers share a host family.
+            this.scheduleClassifyRetry(jobID, "effect");
+            return;
+          }
+          // Do not latch or invoke page code without a concrete, validated
+          // target. Click effects must reserve first because the page mutation
+          // itself can open a download; URL effects reserve after their
+          // page-side URL has been validated.
+          let governorHeld = true;
+          let claimedDownload = false;
           try {
             if (dl.method === "click") {
-              const results = await this.deps.scripting.executeScript({
-                target: { tabId: job.tab_id },
-                func: clickDeclaredDownload,
-                args: [
-                  freshTarget.selector,
-                  freshTarget.shadow_selector,
-                  dl.postClickWaitFor ?? null,
-                  dl.postClickTimeoutMs ?? null,
-                  dl.followupSelector ?? null,
-                ],
-              });
-              const clicked = results[0]?.result === true;
-              if (clicked && dl.postClickWaitFor !== undefined) {
+              claimedDownload = await this.claimDownloadInitiated(jobID);
+              if (!claimedDownload) return;
+            }
+            const result = await this.deps.scripting.executeScript({
+              target: { tabId: job.tab_id },
+              func: executePlannedPageEffect,
+              args: [freshPlan, dl],
+            });
+            const effect = result[0]?.result as { ok?: boolean; url?: string } | undefined;
+            if (effect?.ok !== true) {
+              if (claimedDownload) {
+                await this.update((s) => patchJob(s, jobID, { download_initiated: false }));
+              }
+              return;
+            }
+            if (dl.method === "click") {
+              // The click itself is the observable initiation consequence.
+              // Release before a post-click reclassification so a late terms
+              // gate can acquire the same global slot independently.
+              this.releaseEffectGovernor(jobID, effectToken);
+              governorHeld = false;
+              if (dl.postClickWaitFor !== undefined || dl.followupSelector !== undefined) {
                 await this.reclassifyCurrentProviderPage(jobID);
               }
-            } else if (dl.method === "api") {
-              const built = await this.deps.scripting.executeScript({
-                target: { tabId: job.tab_id },
-                func: resolveDownloadURL,
-                args: [freshTarget.selector, dl.idPattern ?? null, dl.urlTemplate ?? null, dl.jsonField ?? null],
+              return;
+            }
+            const url = effect.url;
+            if (typeof url !== "string" || !url.startsWith("https://")) return;
+            claimedDownload = await this.claimDownloadInitiated(jobID);
+            if (!claimedDownload) return;
+            this.pendingDownloadURLs.set(url, jobID);
+            try {
+              const id = await this.deps.downloads.download({
+                url,
+                filename: jobDownloadFilename(jobID),
+                conflictAction: "uniquify",
+                saveAs: false,
               });
-              const url = built[0]?.result;
-              if (typeof url === "string" && url.startsWith("https://")) {
-                this.pendingDownloadURLs.set(url, jobID);
-                try {
-                  const id = await this.deps.downloads.download({
-                    url,
-                    filename: `papio/${jobID}/paper.pdf`,
-                    conflictAction: "uniquify",
-                    saveAs: false,
-                  });
-                  this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false, directOffer: false });
-                } finally {
-                  this.pendingDownloadURLs.delete(url);
-                }
-              }
-            } else {
-              const url = freshPlan.url;
-              if (typeof url === "string" && url.startsWith("https://")) {
-                this.pendingDownloadURLs.set(url, jobID);
-                try {
-                  const id = await this.deps.downloads.download({
-                    url,
-                    filename: `papio/${jobID}/paper.pdf`,
-                    conflictAction: "uniquify",
-                    saveAs: false,
-                  });
-                  // Correlate by Chrome's returned ID, not URL/referrer
-                  // heuristics. onChanged can now complete even if onCreated
-                  // raced the Promise.
-                  this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false, directOffer: false });
-                } finally {
-                  this.pendingDownloadURLs.delete(url);
-                }
-              }
+              this.downloads.set(jobID, { ids: new Set([id]), ambiguous: false, directOffer: false });
+            } finally {
+              this.pendingDownloadURLs.delete(url);
             }
           } catch (e) {
+            if (claimedDownload) {
+              await this.update((s) => patchJob(s, jobID, { download_initiated: false }));
+            }
             console.error("papio: adapter download initiation failed; staying assisted", e);
+          } finally {
+            if (governorHeld) this.releaseEffectGovernor(jobID, effectToken);
           }
-          // No synthesized frames: the real Chrome download flows through the
-          // onChanged listener, which emits download_started/complete.
         }
         return;
       }
-      case "login":
-        if (job.access_mode === "assisted") return;
-        // A provider login wall. If the adapter has a federated-login route and
-        // the offer carried the institution entityID, auto-select the institution
-        // by navigating the handoff tab straight to the IdP (skipping the
-        // provider's picker); the human still enters credentials there. Then stay
-        // auth_pending, emit nothing.
-        // Prefer the autonomous account-id unlock; fall back to federated login.
-        if (!(await this.maybeAppendAccountId(jobID, job, spec))) {
-          await this.maybeRouteFederatedLogin(jobID, job, spec);
+      case "login": {
+        if (!this.hasDelegatedAuthority(job)) return;
+        const effectToken = this.claimEffectGovernor(jobID);
+        if (effectToken === undefined) return;
+        try {
+          // A provider login wall. If the adapter has a federated-login route
+          // and the offer carried the institution entityID, auto-select the
+          // institution by navigating the handoff tab straight to the IdP
+          // (skipping the provider's picker); the human still enters
+          // credentials there. Then stay auth_pending, emit nothing.
+          // Prefer the autonomous account-id unlock; fall back to federated login.
+          if (!(await this.maybeAppendAccountId(jobID, job, spec))) {
+            await this.maybeRouteFederatedLogin(jobID, job, spec);
+          }
+        } finally {
+          this.releaseEffectGovernor(jobID, effectToken);
         }
         return;
+      }
       case "terms": {
+        // Consent is observational policy, so read it before claiming the
+        // effect governor. The value is then carried through the guarded
+        // acceptance closure and reused for the assisted fallback below.
         const consent = await this.deps.settings.getTermsConsent();
-        if (job.access_mode === "assisted") {
-          this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_id: spec.id, adapter_version: av }, jobID);
-          if (consent === undefined) {
-            await this.update((s) => patchJob(s, jobID, { needs_terms_consent: true }));
+        if (!this.hasDelegatedAuthority(job)) {
+          if (job.access_mode === "assisted") {
+            this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_id: spec.id, adapter_version: av }, jobID);
+            if (consent === undefined) {
+              await this.update((s) => patchJob(s, jobID, { needs_terms_consent: true }));
+            }
           }
           return;
         }
         if (consent === "accept" && spec.termsAccept) {
-          const accepted = await this.acceptTerms(job.job_id, spec.termsAccept);
-          if (accepted) {
-            // The accept click opens the provider PDF (often in a new viewer
-            // tab), which the download / viewer-adoption path captures and
-            // reports as download_started/complete. No extra frame: the
-            // frozen protocol has no terms-accepted outcome, and the download
-            // events are the audit trail.
+          const effectToken = this.claimEffectGovernor(jobID);
+          if (effectToken === undefined) {
+            this.scheduleClassifyRetry(jobID, "effect");
             return;
+          }
+          try {
+            const alreadyClaimed = job.download_initiated === true;
+            const claimedDownload = alreadyClaimed || (await this.claimDownloadInitiated(job.job_id));
+            if (!claimedDownload) return;
+            const accepted = await this.acceptTerms(job.job_id, spec);
+            if (accepted) {
+              // The accept click opens the provider PDF (often in a new viewer
+              // tab), which the download / viewer-adoption path captures and
+              // reports as download_started/complete. No extra frame: the
+              // frozen protocol has no terms-accepted outcome, and the
+              // download events are the audit trail.
+              return;
+            }
+            if (!alreadyClaimed && !this.downloads.has(job.job_id)) {
+              await this.update((s) => patchJob(s, jobID, { download_initiated: false }));
+            }
+          } finally {
+            this.releaseEffectGovernor(jobID, effectToken);
           }
         }
         this.send("provider_outcome", { outcome: "terms_acceptance_required", adapter_id: spec.id, adapter_version: av }, jobID);
@@ -8800,9 +9843,39 @@ export class Bridge {
           await this.settleHandoffAfterOutcome(jobID);
         }
         return;
-      case "unknown":
-        await this.recordUnknown(job, host, spec);
+      case "unknown": {
+        const now = this.deps.now();
+        const settled =
+          (job.unknown_count ?? 0) >= 1 &&
+          now - (job.last_unknown_ms ?? 0) >= 5000;
+        await this.recordUnknown(job, host, spec, settled);
+        if (!settled) return;
+        const current = findByJob(this.store, jobID);
+        if (current !== undefined && (await this.runGenericOnSettledUnknown(current))) return;
+        const evidence = this.genericEvidence.get(jobID) ?? [];
+        const detail = evidence.length === 0 ? undefined : `Generic evidence: ${evidence.join(", ")}.`;
+        const outcomeKey = `${jobID}:ui_changed`;
+        if (!this.handoffOutcomeSent.has(outcomeKey)) {
+          this.handoffOutcomeSent.add(outcomeKey);
+          if (
+            !this.send(
+              "provider_outcome",
+              {
+                outcome: "ui_changed",
+                adapter_id: spec.id,
+                adapter_version: av,
+                ...(detail === undefined ? {} : { detail }),
+              },
+              jobID,
+            )
+          ) {
+            this.handoffOutcomeSent.delete(outcomeKey);
+          } else {
+            await this.settleHandoffAfterOutcome(jobID);
+          }
+        }
         return;
+      }
       }
   }
 
@@ -8978,7 +10051,13 @@ export class Bridge {
           const track = this.downloads.get(job.job_id);
           if (track?.generic !== undefined && track.ids.has(delta.id)) {
             await this.discardDownload(job.job_id, delta.id);
-            await this.advanceGenericCandidate(job.job_id, track.generic);
+            await this.sendGenericEpochResult(
+              job.job_id,
+              track.generic.epoch,
+              "cancelled",
+              "browser download interrupted",
+            );
+            await this.retainGenericCandidate(job.job_id, track.generic);
             return;
           }
           if (track?.delivery === true && track.ids.has(delta.id)) {
@@ -8986,7 +10065,17 @@ export class Bridge {
             return;
           }
           if (track?.directOffer === true && track.ids.has(delta.id)) {
-            await this.discardDirectOffer(job.job_id, delta.id);
+            if (track.directEpoch !== undefined) {
+              this.send("provider_direct_get_result", {
+                drive_attempt_id: track.directEpoch.drive_attempt_id,
+                ordinal: track.directEpoch.ordinal,
+                route_revision: track.directEpoch.route_revision ?? "",
+                outcome: "cancelled",
+                landing_class: "unknown",
+              }, job.job_id);
+            }
+            await this.discardDownload(job.job_id, delta.id);
+            if (track.directEpoch !== undefined) await this.clearDirectDownloadState(job.job_id, track.directEpoch);
             return;
           }
         }
@@ -9010,7 +10099,44 @@ export class Bridge {
     const mime = item?.mime?.split(";", 1)[0]?.trim().toLowerCase();
     if (track.generic !== undefined && mime !== "application/pdf") {
       await this.discardDownload(owner.job_id, delta.id);
-      await this.advanceGenericCandidate(owner.job_id, track.generic);
+      const clean = isCleanNonBrowserMime(mime);
+      let outcome = clean ? "not_pdf" : "unknown";
+      let detail = clean ? "generic candidate did not produce a PDF" : "generic candidate returned an unexpected MIME";
+      try {
+        const finalURL = new URL(item?.finalUrl ?? item?.url ?? "");
+        const path = finalURL.pathname.toLowerCase();
+        if (mime === "text/html" || mime === "application/xhtml+xml") {
+          outcome = "html";
+          detail = "generic candidate returned HTML";
+        } else if (/(login|signin|sign-in|sso|saml)/u.test(path)) {
+          outcome = "login";
+          detail = "generic candidate reached a login page";
+        } else if (/(term|consent|license)/u.test(path)) {
+          outcome = "terms";
+          detail = "generic candidate reached a terms page";
+        } else if (/(challenge|captcha|verify)/u.test(path)) {
+          outcome = "challenge";
+          detail = "generic candidate reached a challenge page";
+        } else if (/(rate[-_]?limit|too[-_]?many)/u.test(path)) {
+          outcome = "rate_limited";
+          detail = "generic candidate was rate limited";
+        } else if (/5\d\d/u.test(path)) {
+          outcome = "server_error";
+          detail = "generic candidate reached a server error";
+        }
+      } catch {
+        // Keep the bounded MIME classification.
+      }
+      const observation = await this.sendGenericEpochResult(owner.job_id, track.generic.epoch, outcome, detail);
+      const acknowledged =
+        observation?.kind === "response" &&
+        observation.payload?.["drive_attempt_id"] === track.generic.epoch.drive_attempt_id &&
+        observation.payload?.["ordinal"] === track.generic.epoch.ordinal &&
+        observation.payload?.["strategy"] === "generic" &&
+        observation.payload?.["revision"] === track.generic.epoch.revision &&
+        observation.payload?.["outcome"] === "applied";
+      if (outcome === "not_pdf" && acknowledged) await this.advanceGenericCandidate(owner.job_id, track.generic);
+      else await this.retainGenericCandidate(owner.job_id, track.generic);
       return;
     }
     if (track.delivery === true) {
@@ -9020,7 +10146,48 @@ export class Bridge {
       }
     } else if (track.directOffer) {
       if (mime !== "application/pdf") {
-        await this.discardDirectOffer(owner.job_id, delta.id);
+        if (track.directEpoch !== undefined) {
+          const clean = isCleanNonBrowserMime(mime);
+          let outcome: "not_pdf" | "foreign" | "login" | "terms" | "challenge" | "unknown" = clean ? "not_pdf" : "unknown";
+          let landing: "html" | "foreign" | "login" | "terms" | "challenge" | "unknown" = mime === "text/html" || mime === "application/xhtml+xml" ? "html" : (clean ? "foreign" : "unknown");
+          let finalHost = "";
+          let finalPath = "";
+          try {
+            const finalURL = new URL(item?.finalUrl ?? item?.url ?? track.directURL ?? "");
+            finalHost = finalURL.hostname.toLowerCase();
+            finalPath = finalURL.pathname;
+            let expectedHost = "";
+            try {
+              expectedHost = new URL(track.directAllowedOrigin ?? "").hostname.toLowerCase();
+            } catch {
+              // Keep the bounded unknown classification.
+            }
+            const lowerPath = finalPath.toLowerCase();
+            if (expectedHost !== "" && finalHost !== expectedHost) {
+              outcome = "foreign";
+              landing = "foreign";
+            } else if (/(login|signin|sign-in|sso|saml)/u.test(lowerPath)) {
+              outcome = "login";
+              landing = "login";
+            } else if (/(term|consent|license)/u.test(lowerPath)) {
+              outcome = "terms";
+              landing = "terms";
+            }
+          } catch {
+            // Keep the bounded not_pdf/unknown observation.
+          }
+          this.send("provider_direct_get_result", {
+            drive_attempt_id: track.directEpoch.drive_attempt_id,
+            ordinal: track.directEpoch.ordinal,
+            route_revision: track.directEpoch.route_revision ?? "",
+            outcome,
+            landing_class: landing,
+            ...(finalHost !== "" ? { final_host: finalHost } : {}),
+            ...(finalPath !== "" ? { final_path: finalPath } : {}),
+          }, owner.job_id);
+        }
+        await this.discardDownload(owner.job_id, delta.id);
+        if (track.directEpoch !== undefined) await this.clearDirectDownloadState(owner.job_id, track.directEpoch);
         return;
       }
     } else if (mime === "text/html" || mime === "application/xhtml+xml") {
@@ -9037,12 +10204,79 @@ export class Bridge {
       );
       return;
     }
+    if (track.generic !== undefined) {
+      const result = await this.sendGenericEpochResult(
+        owner.job_id,
+        track.generic.epoch,
+        "success",
+        "PDF download completed",
+      );
+      const acknowledged =
+        result?.kind === "response" &&
+        result.payload?.["drive_attempt_id"] === track.generic.epoch.drive_attempt_id &&
+        result.payload?.["ordinal"] === track.generic.epoch.ordinal &&
+        result.payload?.["strategy"] === "generic" &&
+        result.payload?.["revision"] === track.generic.epoch.revision &&
+        result.payload?.["outcome"] === "applied";
+      if (!acknowledged) {
+        await this.retainGenericCandidate(owner.job_id, track.generic);
+        return;
+      }
+      await this.update((s) =>
+        patchJob(s, owner.job_id, {
+          download_initiated: false,
+          // Keep the opaque ID for diagnostics, but make the durable epoch
+          // terminal so a second worker life cannot emit the result again.
+          generic_terminal: true,
+        }),
+      );
+    }
     if (!item) return;
     const rawName = item.filename ?? delta.filename?.current ?? "";
     const filename = rawName.split(/[\\/]/).pop() ?? "";
     const size = item.fileSize ?? item.totalBytes ?? item.bytesReceived ?? 0;
     if (filename.length === 0 || size < 1) return; // cannot form a valid frame; leave to the user
 
+    if (track.directEpoch !== undefined) {
+      let finalHost = "";
+      let finalPath = "";
+      try {
+        const finalURL = new URL(item.finalUrl ?? item.url ?? track.directURL ?? "");
+        finalHost = finalURL.hostname.toLowerCase();
+        finalPath = finalURL.pathname;
+      } catch {
+        // Keep the correlated result unknown and never adopt.
+      }
+      let outcome: "success" | "foreign" | "unknown" = "unknown";
+      let landing: "pdf" | "foreign" | "unknown" = "unknown";
+      let expectedHost = "";
+      try {
+        expectedHost = new URL(track.directAllowedOrigin ?? "").hostname.toLowerCase();
+      } catch {
+        // Keep unknown.
+      }
+      if (finalHost !== "" && finalPath !== "") {
+        const envelopeOK = expectedHost !== "" && expectedHost === finalHost &&
+          directEnvelopePath(finalPath, track.directPathFamily, track.directExpectedIdentifier);
+        outcome = envelopeOK ? "success" : "foreign";
+        landing = envelopeOK ? "pdf" : "foreign";
+      }
+      this.send("provider_direct_get_result", {
+        drive_attempt_id: track.directEpoch.drive_attempt_id,
+        ordinal: track.directEpoch.ordinal,
+        route_revision: track.directEpoch.route_revision ?? "",
+        outcome,
+        landing_class: landing,
+        ...(finalHost !== "" ? { final_host: finalHost } : {}),
+        ...(finalPath !== "" ? { final_path: finalPath } : {}),
+      }, owner.job_id);
+      if (outcome !== "success") {
+        await this.discardDownload(owner.job_id, delta.id);
+        await this.clearDirectDownloadState(owner.job_id, track.directEpoch);
+        return;
+      }
+      await this.clearDirectDownloadState(owner.job_id, track.directEpoch);
+    }
     await this.update((s) => {
       const next = this.clearAuthAttempts(patchJob(s, owner.job_id, { status: "awaiting_download" }), owner.job_id);
       return track.delivery === true
@@ -9354,12 +10588,12 @@ function isDeliveryReconcileRuntimeRequest(
   const jobID = value["job_id"];
   const operation = value["operation"];
   const providerReference = value["provider_reference"];
-  if (typeof jobID !== "string" || jobID.length === 0 || jobID.length > 128) return false;
+  if (typeof jobID !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(jobID)) return false;
   if (operation !== "confirm_request_exists" && operation !== "confirm_request_absent") return false;
   if (operation === "confirm_request_exists") {
     return typeof providerReference === "string" && providerReference.length > 0 && providerReference.length <= 300;
   }
-  return providerReference === undefined;
+  return !("provider_reference" in value);
 }
 
 function isPageBulkGrabStatusRuntimeRequest(value: unknown): value is { grab_id: string } {

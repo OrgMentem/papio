@@ -52,6 +52,10 @@ for the full pre-split extension history.
 - **On-screen PDFs on publisher CDNs are grabbed again.** A PDF viewer tab
   landing on a host outside the provider's own domain (e.g. a ScienceDirect
   asset CDN) is now adopted when exactly one driven job matches it.
+- **Institution-session status stays attached to the right institution.**
+  Fresh sign-in evidence now unblocks and labels only jobs waiting on that
+  resolver; stale, malformed, unrelated, or future-dated session records no
+  longer make another institution look signed in.
 
 ## [0.12.0] - 2026-08-10
 

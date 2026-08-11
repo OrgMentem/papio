@@ -45,11 +45,12 @@ type commandKind int
 const (
 	// kindEnvelope commands emit a two-key internal/agentjson.Envelope page.
 	kindEnvelope commandKind = iota
-	// kindStructured commands emit a single structured JSON record — possibly
+	// kindStructured commands emit a structured JSON record — possibly
 	// containing arrays of its own, like `browser sessions`'s denied/takeover
-	// counts or `acquire --from-zotio`'s queued/skipped lists — that is not a
-	// list-shaped result and carries no `truncated` key. Legitimately exempt
-	// from the envelope contract; never force-converted.
+	// counts or `acquire --from-zotio`'s queued/skipped lists — that does not
+	// use the ordinary two-key envelope. Legitimately exempt from the envelope
+	// contract; never force-converted. A multi-collection page may retain a
+	// stable truncated field while remaining a structured record.
 	kindStructured
 	// kindNone commands have no distinct `--json` output: help-only command
 	// groups (configureCommandGroups in root.go gives every non-runnable
@@ -122,7 +123,8 @@ var commandClassification = map[string]commandClass{
 	"papio jobs repair-awaiting-human": {kind: kindStructured, rpcMethods: []string{"jobs.repair_awaiting_human"}},
 	"papio jobs cancel":                {kind: kindStructured, rpcMethods: []string{"jobs.cancel", "jobs.get"}},
 	"papio jobs retry":                 {kind: kindStructured, rpcMethods: []string{"jobs.retry"}},
-	"papio jobs failures":              {kind: kindEnvelope, rowKey: "failures", rpcMethods: []string{"jobs.failures", "jobs.incidents"}},
+	"papio jobs failures":              {kind: kindStructured, rpcMethods: []string{"jobs.failures", "jobs.incidents"}},
+	"papio jobs incidents":             {kind: kindEnvelope, rowKey: "incidents", rpcMethods: []string{"jobs.incidents"}},
 	"papio delivery":                   {kind: kindNone},
 	"papio delivery get":               {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"delivery.get"}},
 	"papio delivery submit":            {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"delivery.submit"}},

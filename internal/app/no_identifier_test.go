@@ -95,6 +95,9 @@ func TestISBNOnlyWorkUsesAssistedInstitutionalBookHandoff(t *testing.T) {
 	if got.State != job.StateAwaitingHuman {
 		t.Fatalf("isbn-only state = %q, want %q", got.State, job.StateAwaitingHuman)
 	}
+	if got.Policy.AccessMode != config.ModeAssisted {
+		t.Fatalf("isbn-only policy access mode = %q, want persisted assisted ceiling", got.Policy.AccessMode)
+	}
 	actions, err := jobs.ListHumanActions(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)

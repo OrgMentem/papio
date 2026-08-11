@@ -127,6 +127,40 @@ test("handoff_focus is an empty job-scoped frame listed by the shared schema", (
   expect(() => parseBrowserMessage({ ...frame, payload: { unexpected: true } })).toThrow(ProtocolError);
 });
 
+test("provider drive epoch frames require job scope and closed result outcomes", () => {
+  const base = {
+    drive_attempt_id: "epoch-attempt-001",
+    ordinal: 0,
+    strategy: "generic",
+    revision: "1",
+  };
+  const frame = (type: string, payload: Record<string, unknown>, jobID?: string) => ({
+    protocol: "papio-browser/1",
+    type,
+    msg_id: "epoch-msg-001",
+    seq: 1,
+    ...(jobID === undefined ? {} : { job_id: jobID }),
+    payload,
+  });
+  const valid = [
+    ["provider_drive_epoch_start_request", base],
+    ["provider_drive_epoch_start_result", { ...base, outcome: "started" }],
+    ["provider_drive_epoch_result_request", { ...base, outcome: "strategy_outcome" }],
+    ["provider_drive_epoch_result", { ...base, outcome: "applied" }],
+  ] as const;
+  for (const [type, payload] of valid) {
+    expect(parseBrowserMessage(frame(type, payload, "job-epoch-001")).job_id).toBe("job-epoch-001");
+    expect(() => parseBrowserMessage(frame(type, payload))).toThrow(ProtocolError);
+    expect(() => parseBrowserMessage(frame(type, payload, ""))).toThrow(ProtocolError);
+  }
+  expect(() =>
+    parseBrowserMessage(frame("provider_drive_epoch_start_result", { ...base, outcome: "applied" }, "job-epoch-001")),
+  ).toThrow(ProtocolError);
+  expect(() =>
+    parseBrowserMessage(frame("provider_drive_epoch_result", { ...base, outcome: "started" }, "job-epoch-001")),
+  ).toThrow(ProtocolError);
+});
+
 test("handoff link correlation and URL text stay wire-strict", () => {
   const frame = (type: "handoff_link_request" | "handoff_link_result", payload: Record<string, unknown>) => ({
     protocol: "papio-browser/1",

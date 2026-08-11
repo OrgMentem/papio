@@ -4,11 +4,15 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"papio/internal/captures"
 )
 
 type adapterRepairRunnerFunc func(context.Context, string, string, string) (string, error)
@@ -56,43 +60,105 @@ func TestNextAdapterRevision(t *testing.T) {
 	}
 }
 
-func TestScaffoldAdapterRepairWorkspaceLayoutDegradesWithoutExtension(t *testing.T) {
+func TestScaffoldAdapterRepairRejectsUnprovenancedPrivateHTML(t *testing.T) {
 	root := t.TempDir()
 	capturePath := filepath.Join(root, "capture.html")
-	if err := os.WriteFile(capturePath, []byte("<html><body>safe</body></html>"), 0o600); err != nil {
+	secret := "COOKIE_SENTINEL"
+	if err := os.WriteFile(capturePath, []byte("<html><body>"+secret+"</body></html>"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "observed.json"), []byte(`{"provider":"jstor","scenario":"observed","origin":"https://www.jstor.org/stable/abc","adapter_version":"0.3.0"}`), 0o600); err != nil {
+	_, err := scaffoldAdapterRepair(context.Background(), adapterRepairCapture{
+		Path: capturePath, Provider: "jstor", Scenario: "success",
+		Host: "www.jstor.org", Origin: "https://www.jstor.org/stable/abc",
+		SHA256:              "0000000000000000000000000000000000000000000000000000000000000000",
+		SanitizerProvenance: captures.SanitizerProvenance, SanitizerVersion: captures.SanitizerVersion,
+	}, adapterRepairDeps{RepoRoot: root})
+	if err == nil || (!strings.Contains(err.Error(), "canonical") && !strings.Contains(err.Error(), "SHA-256")) {
+		t.Fatalf("scaffold error = %v, want canonical provenance/hash rejection", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "dev", "scratch", "repair")); !os.IsNotExist(statErr) {
+		t.Fatalf("untrusted capture created a repair workspace: %v", statErr)
+	}
+}
+
+func TestScaffoldAdapterRepairCertifiesExactEmittedBytes(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "extension", "tools"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "extension", "tools", "adapter-try.ts"), []byte("// test seam\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "extension", "src", "adapters"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "extension", "src", "adapters", "types.ts"), []byte(`{ id: "jstor", version: "0.3.0" }`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := captures.New(root, captures.Retention{MaxPerHost: 2, MaxAge: 24 * time.Hour})
+	fixture := []byte("<!-- papio-fixture provider=\"jstor\" scenario=\"success\" origin=\"https://www.jstor.org/stable/abc\" captured=\"2026-08-10T00:00:00Z\" -->\n<html><body>safe</body></html>")
+	path, err := store.StoreSanitized(context.Background(), "www.jstor.org", "success", "jstor", "0.3.0", fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.List(context.Background())
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("capture rows = %#v, %v", rows, err)
+	}
+	if err := store.UpdateJob(context.Background(), "job-independent", path, path); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = store.List(context.Background())
+	if err != nil || !rows[0].IndependentEvidence {
+		t.Fatalf("independent evidence = %#v, %v", rows, err)
+	}
+
+	var runnerPath string
 	result, err := scaffoldAdapterRepair(context.Background(), adapterRepairCapture{
-		Path: capturePath, Provider: "jstor", Scenario: "observed", Host: "www.jstor.org",
-		Origin: "https://www.jstor.org/stable/abc", Captured: time.Date(2026, 8, 10, 1, 2, 3, 0, time.UTC), AdapterVersion: "0.3.0",
+		Path: path, Provider: rows[0].AdapterID, Scenario: rows[0].Scenario,
+		Host: rows[0].Host, Captured: rows[0].Timestamp, AdapterVersion: rows[0].AdapterVersion,
+		SHA256: rows[0].SHA256, SanitizerProvenance: rows[0].SanitizerProvenance,
+		SanitizerVersion: rows[0].SanitizerVersion, IndependentEvidence: rows[0].IndependentEvidence,
 	}, adapterRepairDeps{
 		RepoRoot: root,
 		Now:      func() time.Time { return time.Date(2026, 8, 10, 2, 3, 4, 0, time.UTC) },
-		Run: adapterRepairRunnerFunc(func(context.Context, string, string, string) (string, error) {
-			t.Fatal("bun runner must not run when extension workspace is absent")
-			return "", nil
+		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, p, _ string) (string, error) {
+			runnerPath = p
+			data, readErr := os.ReadFile(p)
+			if readErr != nil {
+				return "", readErr
+			}
+			sum := sha256.Sum256(data)
+			return "plan fixture sha256=" + hex.EncodeToString(sum[:]), nil
 		}),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"fixture.html", "report.md", "apply.md"} {
-		if _, err := os.Stat(filepath.Join(result.Workspace, name)); err != nil {
-			t.Fatalf("workspace missing %s: %v", name, err)
-		}
+	emitted, err := os.ReadFile(result.Fixture)
+	if err != nil {
+		t.Fatal(err)
 	}
-	fixture, _ := os.ReadFile(result.Fixture)
-	if !strings.HasPrefix(string(fixture), "<!-- papio-fixture provider=\"jstor\" scenario=\"observed\"") {
-		t.Fatalf("fixture header = %q", fixture)
+	if string(emitted) != string(fixture) {
+		t.Fatalf("emitted fixture differs from canonical capture")
+	}
+	runnerBytes, err := os.ReadFile(runnerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(runnerBytes) != string(emitted) {
+		t.Fatalf("adapter-try received bytes different from emitted fixture")
+	}
+	report, err := os.ReadFile(result.Report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(emitted)
+	if !strings.Contains(string(report), "Fixture SHA-256: `"+hex.EncodeToString(sum[:])+"`") ||
+		!strings.Contains(string(report), "plan fixture sha256="+hex.EncodeToString(sum[:])) {
+		t.Fatalf("report does not certify exact adapter-try bytes: %s", report)
 	}
 	if result.NextRevision != "0.3.1" {
 		t.Fatalf("next revision = %q, want 0.3.1", result.NextRevision)
-	}
-	report, _ := os.ReadFile(result.Report)
-	if !strings.Contains(string(report), "adapter-try analysis skipped") {
-		t.Fatalf("degraded report omitted skip reason: %s", report)
 	}
 }

@@ -35,6 +35,12 @@ export type BrowserMessageType =
   | "download_complete"
   | "delivery_context"
   | "provider_outcome"
+  | "provider_direct_get_request"
+  | "provider_direct_get_result"
+  | "provider_drive_epoch_start_request"
+  | "provider_drive_epoch_start_result"
+  | "provider_drive_epoch_result_request"
+  | "provider_drive_epoch_result"
   | "cancel"
   | "handoff_focus"
   | "ack"
@@ -132,7 +138,7 @@ export interface JobOfferPayload {
   openurl: string;
   provider_hosts: string[];
   expected?: JobOfferExpected;
-  access_mode: "assisted" | "delegated";
+  access_mode?: "assisted" | "delegated";
   expires_at: string;
   /** The institution's Shibboleth IdP entityID, when the daemon knows it.
    * Lets an adapter's federated-login route auto-select the institution on a
@@ -142,9 +148,11 @@ export interface JobOfferPayload {
    * ProQuest adapter unlock the openurl link-resolver by appending
    * ?accountid=<id>. Optional; digits when present. */
   proquest_account_id?: string;
-  /** True when the handoff needs an authenticated institutional session; false
-   * or absent means the URL is publicly reachable (open access). */
   requires_auth?: boolean;
+  drive_attempt_id?: string;
+  drive_ordinal?: number;
+  drive_strategy?: string;
+  drive_revision?: string;
 }
 
 /** Reports that a handoff tab terminated on an identity-provider failure
@@ -203,6 +211,51 @@ export interface ProviderOutcomePayload {
   outcome: ProviderOutcome;
   adapter_id?: string;
   adapter_version?: string;
+  detail?: string;
+}
+export interface ProviderDirectGetRequestPayload {
+  drive_attempt_id: string;
+  ordinal: number;
+  route_revision: string;
+  expected_identifier: string;
+  url: string;
+  allowed_origin: string;
+  path_family: string;
+  terms_policy: "none" | "durable_consent";
+}
+
+export type ProviderDirectGetOutcome =
+  | "success" | "not_pdf" | "foreign" | "login" | "terms" | "challenge"
+  | "cancelled" | "timeout" | "network" | "rate_limited" | "server_error" | "unknown";
+
+export interface ProviderDirectGetResultPayload {
+  drive_attempt_id: string;
+  ordinal: number;
+  route_revision: string;
+  outcome: ProviderDirectGetOutcome;
+  final_host?: string;
+  final_path?: string;
+  landing_class: "pdf" | "html" | "login" | "terms" | "challenge" | "foreign" | "unknown";
+  detail?: string;
+}
+export interface ProviderDriveEpochTuple {
+  request_id?: string;
+  drive_attempt_id: string;
+  ordinal: number;
+  strategy: string;
+  revision: string;
+}
+export interface ProviderDriveEpochStartRequestPayload extends ProviderDriveEpochTuple {}
+export interface ProviderDriveEpochStartResultPayload extends ProviderDriveEpochTuple {
+  outcome: "started" | "stale" | "unsupported" | "error";
+  detail?: string;
+}
+export interface ProviderDriveEpochResultRequestPayload extends ProviderDriveEpochTuple {
+  outcome: string;
+  detail?: string;
+}
+export interface ProviderDriveEpochResultPayload extends ProviderDriveEpochTuple {
+  outcome: "applied" | "stale" | "duplicate" | "unsupported" | "error";
   detail?: string;
 }
 
@@ -607,7 +660,7 @@ export class ProtocolError extends Error {
   override name = "ProtocolError";
 }
 
-const MSG_TYPES: Record<string, true> = {
+const MSG_TYPES: Record<BrowserMessageType, true> = {
   hello: true,
   hello_ack: true,
   page_acquire: true,
@@ -626,20 +679,18 @@ const MSG_TYPES: Record<string, true> = {
   download_complete: true,
   delivery_context: true,
   provider_outcome: true,
+  provider_direct_get_request: true,
+  provider_direct_get_result: true,
+  provider_drive_epoch_start_request: true,
+  provider_drive_epoch_start_result: true,
+  provider_drive_epoch_result_request: true,
+  provider_drive_epoch_result: true,
   cancel: true,
   handoff_focus: true,
   ack: true,
   error: true,
-  handoff_link_request: true,
-  handoff_link_result: true,
   triage_snapshot_request: true,
   triage_snapshot_response: true,
-  pdf_grab_request: true,
-  pdf_grab_result: true,
-  pdf_grab_status_request: true,
-  pdf_grab_status_result: true,
-  pdf_grab_abandon_request: true,
-  pdf_grab_abandon_result: true,
   triage_counts_request: true,
   triage_counts_response: true,
   triage_decide: true,
@@ -648,6 +699,8 @@ const MSG_TYPES: Record<string, true> = {
   human_action_resolve_result: true,
   delivery_reconcile_request: true,
   delivery_reconcile_result: true,
+  handoff_link_request: true,
+  handoff_link_result: true,
   review_preview_request: true,
   review_preview_result: true,
   stats_request: true,
@@ -658,6 +711,12 @@ const MSG_TYPES: Record<string, true> = {
   page_bulk_status_result: true,
   page_bulk_submit_request: true,
   page_bulk_submit_result: true,
+  pdf_grab_request: true,
+  pdf_grab_result: true,
+  pdf_grab_status_request: true,
+  pdf_grab_status_result: true,
+  pdf_grab_abandon_request: true,
+  pdf_grab_abandon_result: true,
 };
 
 const JOB_SCOPED: Record<string, true> = {
@@ -671,6 +730,12 @@ const JOB_SCOPED: Record<string, true> = {
   download_complete: true,
   delivery_context: true,
   provider_outcome: true,
+  provider_direct_get_request: true,
+  provider_direct_get_result: true,
+  provider_drive_epoch_start_request: true,
+  provider_drive_epoch_start_result: true,
+  provider_drive_epoch_result_request: true,
+  provider_drive_epoch_result: true,
   cancel: true,
   handoff_focus: true,
 };
@@ -710,6 +775,37 @@ const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=
 // Must stay byte-identical to the steering-path pattern
 // internal/protocol/protocol.go's pdf_grab_result validation enforces.
 const PDF_GRAB_STEERING_PATH_RE = /^papio\/grabs\/[A-Za-z0-9_-]{8,64}\/$/;
+function escapeDirectGetIdentifier(identifier: string): string {
+  const hex = "0123456789ABCDEF";
+  const encoder = new TextEncoder();
+  const encoded: string[] = [];
+  for (const segment of identifier.split("/")) {
+    let value = "";
+    const bytes = encoder.encode(segment);
+    const dotSegment = segment === "." || segment === "..";
+    for (const byte of bytes) {
+      const unreserved =
+        !dotSegment &&
+        ((byte >= 0x41 && byte <= 0x5a) ||
+          (byte >= 0x61 && byte <= 0x7a) ||
+          (byte >= 0x30 && byte <= 0x39) ||
+          byte === 0x2d ||
+          byte === 0x2e ||
+          byte === 0x5f ||
+          byte === 0x7e);
+      value += unreserved ? String.fromCharCode(byte) : `%${hex[byte >> 4]}${hex[byte & 0x0f]}`;
+    }
+    encoded.push(value);
+  }
+  return encoded.join("/");
+}
+function directGetIdentifierUnsafe(value: string): boolean {
+  for (const char of value) {
+    const code = char.codePointAt(0)!;
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+  }
+  return false;
+}
 
 function fail(msg: string): never {
   throw new ProtocolError(msg);
@@ -1056,7 +1152,7 @@ export function parseBrowserMessage(raw: unknown): BrowserMessage {
     fail(`protocol ${JSON.stringify(env["protocol"])}, want ${BROWSER_PROTOCOL_VERSION}`);
   }
   const type = str(env, "type", "message", 50);
-  if (MSG_TYPES[type] !== true) fail(`unknown type ${JSON.stringify(type)} (fail closed)`);
+  if (!Object.prototype.hasOwnProperty.call(MSG_TYPES, type)) fail(`unknown type ${JSON.stringify(type)} (fail closed)`);
   const msgID = str(env, "msg_id", "message", 64);
   if (!MSG_ID_RE.test(msgID)) fail(`invalid msg_id ${JSON.stringify(msgID)}`);
   const seq = int(env, "seq", "message", 0);
@@ -1232,11 +1328,15 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         openurl: "required",
         provider_hosts: "required",
         expected: "optional",
-        access_mode: "required",
+        access_mode: "optional",
         expires_at: "required",
         login_entity_id: "optional",
         proquest_account_id: "optional",
         requires_auth: "optional",
+        drive_attempt_id: "optional",
+        drive_ordinal: "optional",
+        drive_strategy: "optional",
+        drive_revision: "optional",
       });
       const openurl = str(p, "openurl", "job_offer", 4000);
       if (!openurl.startsWith("https://")) fail("job_offer.openurl must be https");
@@ -1247,8 +1347,10 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       for (const h of hosts) {
         if (typeof h !== "string" || !HOST_RE.test(h)) fail(`invalid provider host ${JSON.stringify(h)}`);
       }
-      const mode = str(p, "access_mode", "job_offer", 20);
-      if (mode !== "assisted" && mode !== "delegated") fail(`invalid access_mode ${JSON.stringify(mode)}; expected "assisted" or "delegated"`);
+      if ("access_mode" in p) {
+        const mode = str(p, "access_mode", "job_offer", 20);
+        if (mode !== "assisted" && mode !== "delegated") fail(`invalid access_mode ${JSON.stringify(mode)}; expected "assisted" or "delegated"`);
+      }
       const expires = str(p, "expires_at", "job_offer", 64);
       if (!isRFC3339(expires)) fail("job_offer.expires_at must be RFC3339");
       if ("expected" in p) {
@@ -1265,6 +1367,10 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         const acct = str(p, "proquest_account_id", "job_offer", 64);
         if (!/^[0-9]+$/.test(acct)) fail("job_offer.proquest_account_id must be digits");
       }
+      if ("drive_attempt_id" in p) correlationID(p, "drive_attempt_id", "job_offer");
+      if ("drive_ordinal" in p) int(p, "drive_ordinal", "job_offer", 0);
+      if ("drive_strategy" in p) str(p, "drive_strategy", "job_offer", 128);
+      if ("drive_revision" in p) str(p, "drive_revision", "job_offer", 128);
       if ("requires_auth" in p && typeof p["requires_auth"] !== "boolean") {
         fail("job_offer.requires_auth must be a boolean");
       }
@@ -1456,6 +1562,149 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if ("detail" in p) str(p, "detail", "provider_outcome", 500);
       break;
       }
+    case "provider_direct_get_request": {
+      requireFields<ProviderDirectGetRequestPayload>(p, "provider_direct_get_request", {
+        drive_attempt_id: "required", ordinal: "required", route_revision: "required",
+        expected_identifier: "required", url: "required", allowed_origin: "required", path_family: "required",
+        terms_policy: "required",
+      });
+      correlationID(p, "drive_attempt_id", "provider_direct_get_request");
+      int(p, "ordinal", "provider_direct_get_request", 0);
+      const revision = str(p, "route_revision", "provider_direct_get_request", 128);
+      if (!revision.includes("/")) fail("provider_direct_get_request.route_revision is invalid");
+      const expected = str(p, "expected_identifier", "provider_direct_get_request", 256);
+      const family = str(p, "path_family", "provider_direct_get_request", 512);
+      if (/[?#{}\\@\s\u0000\r\n]/u.test(expected) || /[?#\u0000\r\n\\]/u.test(family) || directGetIdentifierUnsafe(expected)) fail("provider_direct_get_request envelope text is invalid");
+      const termsPolicy = str(p, "terms_policy", "provider_direct_get_request", 32);
+      if (termsPolicy !== "none" && termsPolicy !== "durable_consent") {
+        fail("provider_direct_get_request.terms_policy is invalid");
+      }
+      try {
+        const target = new URL(str(p, "url", "provider_direct_get_request", 2048));
+        const origin = new URL(str(p, "allowed_origin", "provider_direct_get_request", 300));
+        if (target.protocol !== "https:" || origin.protocol !== "https:" || target.username || target.password ||
+            target.hash || origin.username || origin.password || origin.pathname !== "/" || origin.search || origin.hash ||
+            target.host !== origin.host || (target.search !== "" && target.search !== "?download=true")) {
+          fail("provider_direct_get_request URL is outside its declared envelope");
+        }
+        const split = expected.indexOf(":");
+        if (split < 1 || split === expected.length - 1) fail("provider_direct_get_request.expected_identifier is invalid");
+        const placeholder = `{${expected.slice(0, split)}}`;
+        const openCount = family.split("{").length - 1;
+        const closeCount = family.split("}").length - 1;
+        const marker = family.indexOf(placeholder);
+        const escapedIdentifier = escapeDirectGetIdentifier(expected.slice(split + 1));
+        if (
+          /[{}]/u.test(expected.slice(0, split)) ||
+          openCount !== 1 ||
+          closeCount !== 1 ||
+          marker < 1 ||
+          target.pathname !== `${family.slice(0, marker)}${escapedIdentifier}${family.slice(marker + placeholder.length)}`
+        ) {
+          fail("provider_direct_get_request URL path does not match exactly one path_family placeholder");
+        }
+      } catch {
+        fail("provider_direct_get_request URL is invalid");
+      }
+      break;
+    }
+    case "provider_drive_epoch_start_request": {
+      requireFields<ProviderDriveEpochStartRequestPayload>(p, type, {
+        request_id: "optional",
+        drive_attempt_id: "required",
+        ordinal: "required",
+        strategy: "required",
+        revision: "required",
+      });
+      correlationID(p, "drive_attempt_id", type);
+      int(p, "ordinal", type, 0);
+      const strategy = str(p, "strategy", type, 128);
+      const revision = str(p, "revision", type, 128);
+      if (/[\u0000\r\n]/u.test(strategy + revision)) fail(`${type} tuple text is invalid`);
+      break;
+    }
+    case "provider_drive_epoch_start_result": {
+      requireFields<ProviderDriveEpochStartResultPayload>(p, type, {
+        request_id: "optional",
+        drive_attempt_id: "required",
+        ordinal: "required",
+        strategy: "required",
+        revision: "required",
+        outcome: "required",
+        detail: "optional",
+      });
+      correlationID(p, "drive_attempt_id", type);
+      int(p, "ordinal", type, 0);
+      const strategy = str(p, "strategy", type, 128);
+      const revision = str(p, "revision", type, 128);
+      if (/[\u0000\r\n]/u.test(strategy + revision)) fail(`${type} tuple text is invalid`);
+      const outcome = str(p, "outcome", type, 64);
+      if (!["started", "stale", "unsupported", "error"].includes(outcome)) fail(`${type}.outcome is invalid`);
+      if ("detail" in p) str(p, "detail", type, 500);
+      break;
+    }
+    case "provider_drive_epoch_result_request": {
+      requireFields<ProviderDriveEpochResultRequestPayload>(p, type, {
+        request_id: "optional",
+        drive_attempt_id: "required",
+        ordinal: "required",
+        strategy: "required",
+        revision: "required",
+        outcome: "required",
+        detail: "optional",
+      });
+      correlationID(p, "drive_attempt_id", type);
+      int(p, "ordinal", type, 0);
+      const strategy = str(p, "strategy", type, 128);
+      const revision = str(p, "revision", type, 128);
+      if (/[\u0000\r\n]/u.test(strategy + revision)) fail(`${type} tuple text is invalid`);
+      str(p, "outcome", type, 64);
+      if ("detail" in p) str(p, "detail", type, 500);
+      break;
+    }
+    case "provider_drive_epoch_result": {
+      requireFields<ProviderDriveEpochResultPayload>(p, type, {
+        request_id: "optional",
+        drive_attempt_id: "required",
+        ordinal: "required",
+        strategy: "required",
+        revision: "required",
+        outcome: "required",
+        detail: "optional",
+      });
+      correlationID(p, "drive_attempt_id", type);
+      int(p, "ordinal", type, 0);
+      const strategy = str(p, "strategy", type, 128);
+      const revision = str(p, "revision", type, 128);
+      if (/[\u0000\r\n]/u.test(strategy + revision)) fail(`${type} tuple text is invalid`);
+      const outcome = str(p, "outcome", type, 64);
+      if (!["applied", "stale", "duplicate", "unsupported", "error"].includes(outcome)) fail(`${type}.outcome is invalid`);
+      if ("detail" in p) str(p, "detail", type, 500);
+      break;
+    }
+    case "provider_direct_get_result": {
+      requireFields<ProviderDirectGetResultPayload>(p, "provider_direct_get_result", {
+        drive_attempt_id: "required", ordinal: "required", route_revision: "required", outcome: "required",
+        final_host: "optional", final_path: "optional", landing_class: "required", detail: "optional",
+      });
+      correlationID(p, "drive_attempt_id", "provider_direct_get_result");
+      int(p, "ordinal", "provider_direct_get_result", 0);
+      const outcome = str(p, "outcome", "provider_direct_get_result", 50);
+      if (!(["success", "not_pdf", "foreign", "login", "terms", "challenge", "cancelled", "timeout", "network", "rate_limited", "server_error", "unknown"] as string[]).includes(outcome)) fail("provider_direct_get_result.outcome is invalid");
+      const landing = str(p, "landing_class", "provider_direct_get_result", 20);
+      if (!(["pdf", "html", "login", "terms", "challenge", "foreign", "unknown"] as string[]).includes(landing)) fail("provider_direct_get_result.landing_class is invalid");
+      if ("final_host" in p) {
+        const host = str(p, "final_host", "provider_direct_get_result", 253);
+        if (!HOST_RE.test(host) || host !== host.toLowerCase()) fail("provider_direct_get_result.final_host is invalid");
+      }
+      if ("final_path" in p) {
+        const path = str(p, "final_path", "provider_direct_get_result", 1000);
+        if (!path.startsWith("/") || /[?#\u0000\r\n]/u.test(path)) fail("provider_direct_get_result.final_path is invalid");
+      }
+      if (outcome === "success" && (landing !== "pdf" || !("final_host" in p) || !("final_path" in p))) fail("provider_direct_get_result success requires final envelope");
+      if ("detail" in p) str(p, "detail", "provider_direct_get_result", 500);
+      break;
+    }
     case "error": {
       requireFields<ErrorPayload>(p, "error", { code: "required", message: "required", request_id: "optional" });
       if (!ERROR_CODE_RE.test(str(p, "code", "error", 50))) fail("invalid error code");

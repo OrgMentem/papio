@@ -75,10 +75,10 @@ func NewWithOptions(opts Options) *Enricher {
 }
 
 // Enrich searches Crossref for a title-only work. It adopts only an exact
-// normalized title match, with compatible year and at least one corroborating
-// author family name when authors were supplied.
+// normalized title match with positive, equal publication year and author-family
+// evidence; ISBN work is never promoted by title rescue.
 func (e *Enricher) Enrich(ctx context.Context, requested work.Work) (work.Work, bool, error) {
-	if strings.TrimSpace(requested.DOI) != "" || strings.TrimSpace(requested.Title) == "" {
+	if strings.TrimSpace(requested.DOI) != "" || strings.TrimSpace(requested.ISBN) != "" || strings.TrimSpace(requested.Title) == "" {
 		return requested, false, nil
 	}
 	if e == nil || e.client == nil {
@@ -125,6 +125,7 @@ func (e *Enricher) Enrich(ctx context.Context, requested work.Work) (work.Work, 
 	if err := decodeBoundedJSON(resp.Body, e.maxBody, &payload); err != nil {
 		return requested, false, fmt.Errorf("enrich: invalid Crossref response: %w", err)
 	}
+	seen := make(map[string]record)
 	for _, candidate := range payload.Message.Items {
 		if !matches(candidate, requested) {
 			continue
@@ -133,11 +134,16 @@ func (e *Enricher) Enrich(ctx context.Context, requested work.Work) (work.Work, 
 		if err != nil {
 			continue
 		}
+		if _, exists := seen[doi]; !exists {
+			seen[doi] = candidate
+		}
+	}
+	if len(seen) != 1 {
+		return requested, false, nil
+	}
+	for doi, candidate := range seen {
 		enriched := requested
 		enriched.DOI = doi
-		if enriched.Year == 0 {
-			enriched.Year = candidate.year()
-		}
 		if enriched.Container == "" && len(candidate.ContainerTitle) > 0 {
 			enriched.Container = strings.TrimSpace(candidate.ContainerTitle[0])
 		}
@@ -322,11 +328,12 @@ func matches(candidate record, requested work.Work) bool {
 	if len(candidate.Title) == 0 || normalizeTitle(candidate.Title[0]) != normalizeTitle(requested.Title) {
 		return false
 	}
-	if candidateYear := candidate.year(); requested.Year != 0 && candidateYear != 0 && candidateYear != requested.Year {
+	candidateYear := candidate.year()
+	if requested.Year <= 0 || candidateYear <= 0 || candidateYear != requested.Year {
 		return false
 	}
 	if len(requested.Authors) == 0 {
-		return true
+		return false
 	}
 	for _, requestedAuthor := range requested.Authors {
 		family := authorFamily(requestedAuthor)

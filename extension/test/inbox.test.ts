@@ -977,7 +977,7 @@ test("access classification chooses one concise next action", async () => {
     .toContain("Download the PDF yourself - papio adopts it");
   expect(page.document.querySelector(".access-hint")).toBeNull();
 
-  for (const guidance of page.document.querySelectorAll<HTMLElement>(".item-guidance")) {
+  for (const guidance of Array.from(page.document.querySelectorAll<HTMLElement>(".item-guidance"))) {
     const copy = guidance.firstChild?.textContent ?? "";
     expect(copy.length).toBeLessThanOrEqual(60);
     expect(copy.trim().split(/\s+/).length).toBeLessThanOrEqual(8);

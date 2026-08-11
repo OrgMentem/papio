@@ -383,7 +383,7 @@ func TestJobsFailuresCommandOutputsGroups(t *testing.T) {
 				// struct is what let a stray `since,omitempty` key ride along
 				// unnoticed: a struct decode ignores keys it has no field for,
 				// so it cannot see the page shape a consumer actually receives.
-				const wantJSON = `{"failures":[{"state":"failed","provider":"api.example.test","reason":"timeout","count":2,"sample":"job_01"}],"truncated":false}` + "\n"
+				const wantJSON = `{"failures":[{"state":"failed","provider":"api.example.test","reason":"timeout","count":2,"sample":"job_01"}],"incidents":[],"truncated":false}` + "\n"
 				if got := out.String(); got != wantJSON {
 					t.Fatalf("JSON = %s, want %s", got, wantJSON)
 				}
@@ -402,6 +402,54 @@ func TestJobsFailuresCommandOutputsGroups(t *testing.T) {
 	}
 	if failures.Annotations["mcp:read-only"] != "true" {
 		t.Fatalf("failures annotations = %#v", failures.Annotations)
+	}
+}
+
+func TestJobsFailureHelpDescribesIncidentPrivacyContract(t *testing.T) {
+	command := newJobsCommand(&options{})
+	for _, name := range []string{"failures", "incidents"} {
+		subcommand, _, err := command.Find([]string{name})
+		if err != nil {
+			t.Fatalf("find %s command: %v", name, err)
+		}
+		for _, phrase := range []string{
+			"fingerprint",
+			"raw hosts and identifiers",
+			"keyed per installation",
+			"safety_domain",
+			"host_family",
+			"local output intentionally includes",
+		} {
+			if !strings.Contains(subcommand.Long, phrase) {
+				t.Fatalf("%s help = %q, missing %q", name, subcommand.Long, phrase)
+			}
+		}
+	}
+}
+
+func TestJobsFailuresKeepsMixedLegacyRowsAndNeverSubstitutesIncidents(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method == "jobs.incidents" {
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		}
+		if method != "jobs.failures" {
+			t.Fatalf("method = %q, want jobs.failures", method)
+		}
+		*result.(*jobsFailuresResult) = jobsFailuresResult{Failures: []job.FailureGroup{
+			{Count: 2, State: job.StateFailed, Provider: "api.example.test", Reason: "timeout", Sample: "job_01"},
+			{Count: 1, State: job.StateUnavailable, Provider: "example.edu", Reason: "login_required", Sample: "job_02"},
+		}}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "jobs", "failures"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"failures":[{"state":"failed","provider":"api.example.test","reason":"timeout","count":2,"sample":"job_01"},{"state":"unavailable","provider":"example.edu","reason":"login_required","count":1,"sample":"job_02"}],"incidents":[],"truncated":false}
+`
+	if out.String() != want {
+		t.Fatalf("output = %q, want %q", out.String(), want)
 	}
 }
 
@@ -434,11 +482,17 @@ func TestJobsFailuresDecodesTheDaemonsSinceField(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
 		t.Fatalf("decode JSON: %v (%q)", err, out.String())
 	}
-	if len(page) != 2 {
-		t.Fatalf("page = %v, want exactly the 2 envelope keys — since must be decoded but never re-emitted on the output side", page)
+	if len(page) != 3 {
+		t.Fatalf("page = %v, want exactly the 3 stable output keys — since must be decoded but never re-emitted on the output side", page)
 	}
 	if _, ok := page["since"]; ok {
 		t.Fatalf("page = %v, since leaked into the output envelope", page)
+	}
+	if _, ok := page["failures"]; !ok {
+		t.Fatalf("page = %v, failures collection missing", page)
+	}
+	if _, ok := page["incidents"]; !ok {
+		t.Fatalf("page = %v, incidents collection missing", page)
 	}
 }
 

@@ -72,6 +72,35 @@ export const MANAGED_TAB_LEDGER_KEY = "papio_managed_tabs_v1";
  * remains valid for state persisted by earlier extension versions. */
 export type DaemonConnectionStatus = "connected" | "disconnected" | "daemon_outdated" | "extension_outdated";
 
+/** Durable drive epoch for one daemon-selected provider candidate. The URL is
+ * intentionally absent: only the daemon's opaque attempt and public route
+ * revision survive a worker restart. */
+export interface ProviderDriveEpoch {
+  drive_attempt_id: string;
+  ordinal: number;
+  strategy: "direct" | "generic";
+  route_revision?: string;
+  revision?: string;
+  strategy_id?: string;
+  in_flight_download_id?: number;
+  attempt_count: number;
+}
+
+/** Deterministic browser filename used while a provider download is being
+ * created. It is the only restart-time correlation available before
+ * chrome.downloads.download returns its ID; no URL is persisted or searched. */
+export function jobDownloadFilename(jobID: string): string {
+  return `papio/${jobID}/paper.pdf`;
+}
+/** Minimal daemon-minted direct-route envelope retained for MV3 restart
+ * correlation. It deliberately excludes the resolved URL and query. */
+export interface DirectEnvelopeCorrelation {
+  allowed_origin: string;
+  path_family: string;
+  expected_identifier: string;
+}
+
+
 export interface ActiveJob {
   job_id: string;
   tab_id: number;
@@ -82,8 +111,10 @@ export interface ActiveJob {
    * navigations locally. Not sensitive — these are the resolver's declared
    * destinations, never an IdP address. */
   provider_hosts: string[];
-  /** Access policy retained from the offer for local authority checks. Legacy
-   * jobs without this field retain delegated behavior. */
+  /** Access policy retained from the offer for local authority checks.
+   * Only the exact `"delegated"` value authorizes autonomous effects.
+   * Legacy jobs without this field remain parked until explicit operator
+   * engagement. */
   access_mode?: "assisted" | "delegated";
   /** Epoch ms when the tab first left every provider host (auth started). */
   auth_started_ms?: number;
@@ -94,6 +125,23 @@ export interface ActiveJob {
   /** True when the resolver says this offer needs a warm institutional session.
    * Queued handoffs retain it so a fallback never mints a sign-in request early. */
   requires_auth?: boolean;
+  /** Durable direct tuple terminal marker; it carries no URL and suppresses
+   * duplicate/late requests for the same daemon-minted attempt. */
+  direct_terminal?: boolean;
+  /** Durable daemon-minted direct-route attempt correlation. Full URLs and
+   * page-derived evidence are never persisted. */
+  drive_epoch?: ProviderDriveEpoch;
+  /** Direct route envelope needed to classify the browser download after a
+   * worker restart. The tuple and download id remain in drive_epoch. */
+  direct_envelope?: DirectEnvelopeCorrelation;
+  /** Durable generic strategy tuple; candidate URLs remain worker-local. */
+  generic_drive_epoch?: ProviderDriveEpoch;
+  /** Generic epoch bookkeeping is opaque correlation only. Candidate URLs and
+   * page-derived evidence remain worker-local. */
+  generic_evaluated?: boolean;
+  generic_positive_attempts?: number;
+  generic_attempted_strategies?: string[];
+  generic_terminal?: boolean;
   /** Cold auth offers wait for explicit inbox/popup engagement before opening
    * a managed tab. */
   engagement_required?: boolean;
@@ -316,6 +364,22 @@ export function patchJob(
     activeJobs: store.activeJobs.map((j) => (j.job_id === jobID ? { ...j, ...patch } : j)),
   };
 }
+/** Atomically reserve the one download initiation allowed for a job.
+ * Callers apply this transform synchronously inside their state transaction;
+ * a competing classification therefore observes the monotone latch instead
+ * of racing on an older snapshot. */
+export function claimJobDownloadInitiated(
+  store: StoreShape,
+  jobID: string,
+): { store: StoreShape; claimed: boolean } {
+  const job = findByJob(store, jobID);
+  if (job === undefined || job.download_initiated === true) return { store, claimed: false };
+  return {
+    store: patchJob(store, jobID, { download_initiated: true }),
+    claimed: true,
+  };
+}
+
 
 export function startPendingDelivery(store: StoreShape, delivery: PendingDelivery): StoreShape {
   return { ...store, pendingDelivery: { ...delivery, status: delivery.status ?? "sending" } };

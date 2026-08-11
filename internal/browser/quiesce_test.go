@@ -105,8 +105,7 @@ func TestFreshLoginDoesNotResurrectAQuiescedSibling(t *testing.T) {
 	b.offered = map[string]bool{source: true}
 	b.cancelSent = map[string]bool{}
 	b.reofferPending = map[string]bool{}
-	b.reofferSourceJobID = ""
-	b.reofferProfile = ""
+	b.reofferSourceJobID = map[string]string{}
 	b.mu.Unlock()
 
 	mustSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "", map[string]any{

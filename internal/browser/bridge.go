@@ -80,8 +80,13 @@ const (
 	// pdfGrabV1Feature is ADR-0020's PDF-grab capability flag: it gates both
 	// the pdf_grab_request/pdf_grab_result message pair and, extension-side,
 	// whether the workspace even renders the grab row.
-	pdfGrabV1Feature     = "pdf_grab_v1"
-	handoffLinkV1Feature = "handoff_link_v1"
+	pdfGrabV1Feature            = "pdf_grab_v1"
+	handoffLinkV1Feature        = "handoff_link_v1"
+	providerDirectGetV1Feature  = "provider_direct_get_v1"
+	providerDriveEpochV1Feature = "provider_drive_epoch_v1"
+	// ProviderDirectGetMinExtensionVersion gates the additive frame away from
+	// released 0.13.x sessions whose strict parser cannot know this message.
+	ProviderDirectGetMinExtensionVersion = "0.14.0"
 	// pageBulkConsumer is the sole daemon-assigned consumer for every job
 	// created through page_bulk_submit_request (ADR-0019 Decision 6). The
 	// extension never supplies it.
@@ -218,12 +223,13 @@ type Bridge struct {
 	Version  string
 	Features []string
 
-	mu           sync.Mutex
-	seq          int64
-	holder       *browserSession
-	pending      map[string]*browserSession
-	deniedHellos int
-	takeovers    int
+	mu                   sync.Mutex
+	providerDriveEpochMu sync.Mutex
+	seq                  int64
+	holder               *browserSession
+	pending              map[string]*browserSession
+	deniedHellos         int
+	takeovers            int
 	// epoch increments whenever holder identity changes. Code that releases
 	// b.mu mid-flight (adoption windows inside poll) re-checks it afterwards:
 	// a concurrent claim/takeover must not let a resumed poll send offers to a
@@ -236,15 +242,16 @@ type Bridge struct {
 	// reofferPending prioritizes jobs released by the institutional-session
 	// sweep when poll turns them back into job_offer frames.
 	reofferPending map[string]bool
-	// reofferSourceJobID and reofferProfile keep an authenticated institutional
-	// session alive across ordinary sync ticks, even after its source settles.
-	reofferSourceJobID string
-	reofferProfile     string
-	// Session evidence is timing-only and throttled per holder.
-	lastSessionEvidenceAt time.Time
-	// One reoffer sweep per sync cycle; the handler that triggered it lets poll
-	// finish the same cycle without immediately running a second burst.
-	reofferRanThisSync bool
+	// reofferSourceJobID keeps an authenticated institutional session alive
+	// per configured resolver profile across ordinary sync ticks, even after
+	// its source settles.
+	reofferSourceJobID map[string]string
+	// Session evidence is timing-only and throttled per exact configured
+	// resolver profile.
+	lastSessionEvidenceAt map[string]time.Time
+	// Reoffer sweeps are accounted per profile within one sync cycle; a
+	// successful sweep for one profile must not suppress another profile.
+	reofferRanThisSync map[string]bool
 	// lastPacedHeld deduplicates the operator-visible pacing event while a
 	// backlog remains unchanged across the native host's two-second polls.
 	lastPacedHeld int
@@ -359,7 +366,7 @@ func (source parkedGrabItemSource) SnapshotItems(ctx context.Context, tx *sql.Tx
 
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature,
 	}
 	var grabs *grab.Service
 	if jobs != nil {
@@ -370,20 +377,23 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, holdings: holdings, zotio: zotioService, cfg: cfg,
-		grabs:            grabs,
-		Version:          version,
-		Features:         required,
-		offered:          map[string]bool{},
-		cancelSent:       map[string]bool{},
-		authReleased:     map[int64]bool{},
-		reofferPending:   map[string]bool{},
-		pendingDownloads: map[browserDownloadKey]pendingBrowserDownload{},
-		deliveryContexts: map[browserDownloadKey]pendingDeliveryContext{},
-		focusPending:     map[string]bool{},
-		pendingCaptures:  map[string]*pendingPageCapture{},
-		pending:          map[string]*browserSession{},
-		now:              time.Now,
-		readDir:          os.ReadDir,
+		grabs:                 grabs,
+		Version:               version,
+		Features:              required,
+		offered:               map[string]bool{},
+		cancelSent:            map[string]bool{},
+		authReleased:          map[int64]bool{},
+		reofferPending:        map[string]bool{},
+		reofferSourceJobID:    map[string]string{},
+		lastSessionEvidenceAt: map[string]time.Time{},
+		reofferRanThisSync:    map[string]bool{},
+		pendingDownloads:      map[browserDownloadKey]pendingBrowserDownload{},
+		deliveryContexts:      map[browserDownloadKey]pendingDeliveryContext{},
+		focusPending:          map[string]bool{},
+		pendingCaptures:       map[string]*pendingPageCapture{},
+		pending:               map[string]*browserSession{},
+		now:                   time.Now,
+		readDir:               os.ReadDir,
 	}
 }
 
@@ -545,9 +555,9 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	b.cancelSent = map[string]bool{}
 	b.authReleased = map[int64]bool{}
 	b.reofferPending = map[string]bool{}
-	b.reofferSourceJobID = ""
-	b.reofferProfile = ""
-	b.lastSessionEvidenceAt = time.Time{}
+	b.reofferSourceJobID = map[string]string{}
+	b.lastSessionEvidenceAt = map[string]time.Time{}
+	b.reofferRanThisSync = map[string]bool{}
 	b.lastPacedHeld = 0
 	b.takeovers++
 	log.Printf("papio: browser session %s (v%s) now holds the bridge: %s", shortSession(session.ID), session.ExtensionVersion, reason)
@@ -576,7 +586,7 @@ var ErrOutboundFrame = errors.New("outbound frame self-validation failed")
 // Every outbound frame is self-validated by the same decoder before it leaves.
 func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frames []json.RawMessage) ([]json.RawMessage, error) {
 	b.mu.Lock()
-	b.reofferRanThisSync = false
+	b.reofferRanThisSync = map[string]bool{}
 	defer b.mu.Unlock()
 	if sessionID == "" {
 		sessionID = legacySessionID
@@ -790,9 +800,7 @@ func (b *Bridge) release(sessionID string) {
 		log.Printf("papio: browser session %s (v%s) disconnected", shortSession(sessionID), b.holder.ExtensionVersion)
 		b.holder = nil
 		b.epoch++
-		b.reofferSourceJobID = ""
-		b.reofferProfile = ""
-		b.reofferPending = map[string]bool{}
+		b.reofferSourceJobID = map[string]string{}
 	}
 	if pending := b.pendingCaptures[sessionID]; pending != nil {
 		delete(b.pendingCaptures, sessionID)
@@ -868,6 +876,10 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgDeliveryReconcileRequest:
 		return b.deliveryReconcile(ctx, msg.Payload.(*protocol.DeliveryReconcilePayload))
+	case protocol.MsgProviderDriveEpochStartRequest:
+		return b.providerDriveEpochStart(ctx, msg.JobID, msg.Payload.(*protocol.ProviderDriveEpochStartRequestPayload))
+	case protocol.MsgProviderDriveEpochResultRequest:
+		return b.providerDriveEpochResult(ctx, msg.JobID, msg.Payload.(*protocol.ProviderDriveEpochResultRequestPayload))
 	case protocol.MsgHandoffLinkRequest:
 		return b.handoffLink(ctx, msg.Payload.(*protocol.HandoffLinkRequestPayload))
 
@@ -999,7 +1011,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		} else {
 			pendingDownload.CandidateID = candidateID
 			b.pendingDownloads[key] = pendingDownload
-			_, _ = b.directRouteFailure(ctx, msg.JobID, "success")
+			if err := b.recordAdoptionConclusiveLatch(ctx, msg.JobID); err != nil {
+				log.Printf("papio: recording adoption safety latch: %v", err)
+			}
 			if context != nil {
 				delete(b.deliveryContexts, key)
 				delete(b.pendingDownloads, key)
@@ -1010,6 +1024,12 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			return nil, err
 		}
 		return []json.RawMessage{ack}, nil
+
+	case protocol.MsgProviderDirectGetResult:
+		if err := b.providerDirectGetResult(ctx, msg.JobID, msg.Payload.(*protocol.ProviderDirectGetResultPayload)); err != nil {
+			log.Printf("papio: recording provider direct result: %v", err)
+		}
+		return nil, nil
 
 	case protocol.MsgProviderOutcome:
 		if err := b.outcome(ctx, msg.JobID, msg.Payload.(*protocol.ProviderOutcomePayload)); err != nil {
@@ -1032,13 +1052,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgError:
 		p := msg.Payload.(*protocol.ErrorPayload)
-		if p.Code == "download_not_pdf" {
-			if handled, err := b.directRouteFailure(ctx, msg.JobID, p.Code); err != nil {
-				log.Printf("papio: recording direct-route failure: %v", err)
-			} else if handled {
-				return nil, nil
-			}
-		}
+		// Legacy job-level error frames are intentionally uncorrelated. They
+		// cannot mutate a direct route; only provider_direct_get_result carries
+		// the daemon-minted route tuple.
 		// Only the normalized code is durable; the free-text message is
 		// extension-supplied and never persisted.
 		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.error",
@@ -1050,6 +1066,205 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	default:
 		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
 	}
+}
+func (b *Bridge) providerDriveEpochAuthorized(ctx context.Context, jobID, _ string) (bool, error) {
+	if b == nil || b.jobs == nil || strings.TrimSpace(jobID) == "" {
+		return false, nil
+	}
+	row, err := b.jobs.Get(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	if row.State != job.StateAwaitingHuman || job.Terminal(row.State) {
+		return false, nil
+	}
+	actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+	if err != nil {
+		return false, err
+	}
+	for _, action := range actions {
+		if action.JobID != jobID || action.Kind != handoffActionKind || action.Status != "open" {
+			continue
+		}
+		// The tuple is scoped to the job's currently open institutional
+		// handoff. The durable superseded event, rather than a host guess,
+		// distinguishes an explicit retry from this handoff's late frames.
+		return true, nil
+	}
+	return false, nil
+}
+
+func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *protocol.ProviderDriveEpochStartRequestPayload) ([]json.RawMessage, error) {
+	var requestID, driveAttemptID, strategy, revision string
+	var ordinal int64
+	outcome, detail := "stale", "drive epoch is not the current offered tuple"
+	if p == nil {
+		outcome, detail = "error", "malformed provider drive epoch tuple"
+	} else {
+		requestID, driveAttemptID, ordinal, strategy, revision = p.RequestID, p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision
+		if !validProviderDriveEpochTuple(driveAttemptID, ordinal, strategy, revision) {
+			outcome, detail = "error", "malformed provider drive epoch tuple"
+		} else {
+			b.providerDriveEpochMu.Lock()
+			events, err := b.jobs.Events(ctx, jobID)
+			if err != nil {
+				outcome, detail = "error", "provider drive epoch state is unavailable"
+			} else {
+				tuple := providerDriveEpochKey(driveAttemptID, ordinal, strategy, revision)
+				current, started, _, superseded, domain := providerDriveEpochState(events, tuple)
+				if current == tuple && domain != "" && !superseded {
+					authorized, authErr := b.providerDriveEpochAuthorized(ctx, jobID, domain)
+					if authErr != nil {
+						outcome, detail = "error", "provider drive epoch authorization is unavailable"
+					} else if !authorized {
+						outcome, detail = "stale", "drive epoch job is no longer awaiting this handoff"
+					} else {
+						outcome, detail = "started", ""
+						if !started {
+							if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.provider_drive_epoch_started", map[string]any{
+								"drive_attempt_id": driveAttemptID, "ordinal": ordinal, "strategy": strategy, "revision": revision, "safety_domain": domain,
+							}); err != nil {
+								outcome, detail = "error", "provider drive epoch start could not be recorded"
+							}
+						}
+					}
+				}
+			}
+			b.providerDriveEpochMu.Unlock()
+		}
+	}
+	frame, err := b.frame(protocol.MsgProviderDriveEpochStartResult, jobID, protocol.ProviderDriveEpochStartResultPayload{
+		RequestID: requestID, DriveAttemptID: driveAttemptID, Ordinal: ordinal, Strategy: strategy, Revision: revision, Outcome: outcome, Detail: detail,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) providerDriveEpochResult(ctx context.Context, jobID string, p *protocol.ProviderDriveEpochResultRequestPayload) ([]json.RawMessage, error) {
+	var requestID, driveAttemptID, strategy, revision string
+	var ordinal int64
+	outcome, detail := "stale", "drive epoch result does not match a started tuple"
+	if p == nil {
+		outcome, detail = "error", "malformed provider drive epoch tuple"
+	} else {
+		requestID, driveAttemptID, ordinal, strategy, revision = p.RequestID, p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision
+		if !validProviderDriveEpochTuple(driveAttemptID, ordinal, strategy, revision) || p.Outcome == "" {
+			outcome, detail = "error", "malformed provider drive epoch result"
+		} else {
+			b.providerDriveEpochMu.Lock()
+			events, err := b.jobs.Events(ctx, jobID)
+			if err != nil {
+				outcome, detail = "error", "provider drive epoch state is unavailable"
+			} else {
+				tuple := providerDriveEpochKey(driveAttemptID, ordinal, strategy, revision)
+				current, started, applied, superseded, domain := providerDriveEpochState(events, tuple)
+				if current != tuple || domain == "" || superseded || !started {
+					outcome, detail = "stale", "drive epoch result does not match a current authorized tuple"
+				} else {
+					authorized, authErr := b.providerDriveEpochAuthorized(ctx, jobID, domain)
+					if authErr != nil {
+						outcome, detail = "error", "provider drive epoch authorization is unavailable"
+					} else if !authorized {
+						outcome, detail = "stale", "drive epoch job is no longer awaiting this handoff"
+					} else {
+						switch {
+						case applied:
+							outcome, detail = "duplicate", ""
+						default:
+							resultDetail := map[string]any{
+								"drive_attempt_id": driveAttemptID, "ordinal": ordinal, "strategy": strategy, "revision": revision,
+								"outcome": p.Outcome, "safety_domain": domain,
+							}
+							if p.Detail != "" {
+								resultDetail["detail"] = truncate(p.Detail, 500)
+							}
+							if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.provider_drive_epoch_result", resultDetail); err != nil {
+								outcome, detail = "error", "provider drive epoch result could not be recorded"
+								break
+							}
+							if providerDriveStrongOutcome(p.Outcome) || providerDriveStrongDetail(p.Detail) {
+								if err := b.appendProviderNoPositiveLatch(ctx, jobID, domain); err != nil {
+									outcome, detail = "error", "provider drive safety latch could not be recorded"
+									break
+								}
+							}
+							if p.Outcome == "not_pdf" || p.Outcome == "cancelled" {
+								if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.provider_drive_epoch_offered", map[string]any{
+									"drive_attempt_id": driveAttemptID, "ordinal": ordinal + 1, "strategy": strategy, "revision": revision, "safety_domain": domain,
+								}); err != nil {
+									outcome, detail = "error", "provider drive epoch successor could not be recorded"
+									break
+								}
+							}
+							outcome, detail = "applied", ""
+						}
+					}
+				}
+			}
+			b.providerDriveEpochMu.Unlock()
+		}
+	}
+	frame, err := b.frame(protocol.MsgProviderDriveEpochResult, jobID, protocol.ProviderDriveEpochResultPayload{
+		RequestID: requestID, DriveAttemptID: driveAttemptID, Ordinal: ordinal, Strategy: strategy, Revision: revision, Outcome: outcome, Detail: detail,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func providerDriveEpochState(events []map[string]any, tuple string) (current string, started, applied, superseded bool, domain string) {
+	for _, event := range events {
+		d, _ := event["detail"].(map[string]any)
+		eventTuple := providerDriveEpochKey(stringDetail(d, "drive_attempt_id"), int64(intDetail(d, "ordinal")), stringDetail(d, "strategy"), stringDetail(d, "revision"))
+		switch event["kind"] {
+		case "browser.provider_drive_epoch_offered":
+			if validProviderDriveEpochTuple(stringDetail(d, "drive_attempt_id"), int64(intDetail(d, "ordinal")), stringDetail(d, "strategy"), stringDetail(d, "revision")) {
+				current = eventTuple
+				if eventTuple == tuple {
+					domain = strings.TrimSpace(stringDetail(d, "safety_domain"))
+				}
+			}
+		case "browser.provider_drive_epoch_superseded":
+			if eventTuple == tuple {
+				superseded = true
+			}
+		case "browser.provider_drive_epoch_started":
+			if eventTuple == tuple {
+				started = true
+			}
+		case "browser.provider_drive_epoch_result":
+			if eventTuple == tuple {
+				applied = true
+			}
+		}
+	}
+	return
+}
+
+func providerDriveStrongOutcome(outcome string) bool {
+	switch outcome {
+	case "wrong_work", "validation_failed", "failed_validation", "unexpected_effect", "envelope_invalid", "invalid_envelope":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerDriveStrongDetail(detail string) bool {
+	lower := strings.ToLower(detail)
+	return strings.Contains(lower, "validation") ||
+		strings.Contains(lower, "envelope") ||
+		strings.Contains(lower, "unexpected effect")
+}
+
+func providerDriveEpochKey(driveAttemptID string, ordinal int64, strategy, revision string) string {
+	return driveAttemptID + "\x00" + strconv.FormatInt(ordinal, 10) + "\x00" + strategy + "\x00" + revision
+}
+func validProviderDriveEpochTuple(driveAttemptID string, ordinal int64, strategy, revision string) bool {
+	return driveAttemptID != "" && ordinal >= 0 && strategy != "" && revision != ""
 }
 
 // handoffLink mints the same fresh route used by `papio actions open`.
@@ -1133,7 +1348,7 @@ func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, paylo
 		log.Printf("papio: ignoring page capture from %s: %v", payload.Host, err)
 		return
 	}
-	path, err := b.captureStore.Store(ctx, payload.Host, payload.Scenario, payload.AdapterID, payload.AdapterVersion, html)
+	path, err := b.captureStore.StoreSanitizedPinned(ctx, jobID, payload.Host, payload.Scenario, payload.AdapterID, payload.AdapterVersion, html)
 	if err != nil {
 		log.Printf("papio: storing page capture from %s: %v", payload.Host, err)
 		return
@@ -1238,15 +1453,14 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	holderChanged := b.holder == nil || b.holder.ID != session.ID
 	if holderChanged {
 		b.epoch++
-		b.lastSessionEvidenceAt = time.Time{}
+		b.lastSessionEvidenceAt = map[string]time.Time{}
 	}
 	b.holder = session
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
 	b.authReleased = map[int64]bool{}
 	b.reofferPending = map[string]bool{}
-	b.reofferSourceJobID = ""
-	b.reofferProfile = ""
+	b.reofferSourceJobID = map[string]string{}
 	b.lastPacedHeld = 0
 	if session.Outdated {
 		return b.extensionOutdatedError()
@@ -1301,27 +1515,13 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 		if err != nil {
 			return b.unavailable("triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", err)
 		}
-		payload, err := b.triageSnapshotPayload(ctx, request.RequestID, request.SchemaVersions[0], snapshot)
-		if err != nil {
-			return b.unavailable("triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", err)
-		}
+		payload := b.triageSnapshotPayload(ctx, request.RequestID, request.SchemaVersions[0], snapshot)
 		if b.frameFits(protocol.MsgTriageSnapshotResponse, payload) {
 			frame, err := b.frame(protocol.MsgTriageSnapshotResponse, "", payload)
-			if err == nil {
-				return []json.RawMessage{frame}, nil
+			if err != nil {
+				return nil, err
 			}
-			// Item-level validation happens while the payload is assembled
-			// above. Keep a final safety net here for non-item programming
-			// errors: emit a correlated, minimal response rather than
-			// returning a raw error that would tear down the native session.
-			log.Printf("papio: triage snapshot assembled frame failed self-validation: %v", err)
-			minimal := minimalTriageSnapshotPayload(payload)
-			frame, minimalErr := b.frame(protocol.MsgTriageSnapshotResponse, "", minimal)
-			if minimalErr == nil {
-				return []json.RawMessage{frame}, nil
-			}
-			return b.unavailable("triage_snapshot_invalid",
-				"the triage inbox is temporarily unavailable", "triage snapshot", minimalErr)
+			return []json.RawMessage{frame}, nil
 		}
 		if len(snapshot.Items) <= 1 {
 			return b.unavailable("triage_snapshot_too_large", "the triage inbox item is too large to display", "triage snapshot",
@@ -1334,10 +1534,11 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 // triageSnapshotPayload builds one schema's wire shape from a triage
 // snapshot. Schema 3 additionally populates attention/route_class/
 // auth_requirement (dev/post-build-followups.md item 7) and, for a
-// document_delivery human_action, looks up its live delivery_requests row —
-// the only reason this needs ctx and can fail; the v1/v2 emission path
-// below stays byte-identical to what it produced before triage-snapshot/3.
-func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, schema int64, snapshot triage.Snapshot) (protocol.TriageSnapshotResponsePayload, error) {
+// document_delivery human_action, looks up its live delivery_requests row.
+// Lookup failures are intentionally represented by an absent optional
+// delivery field; outbound frame-construction errors remain fatal to the
+// request.
+func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, schema int64, snapshot triage.Snapshot) protocol.TriageSnapshotResponsePayload {
 	items := make([]protocol.TriageSnapshotItem, 0, len(snapshot.Items))
 	counts := triageCountsPayload(snapshot.Counts)
 	omit := func(item protocol.TriageSnapshotItem, reason error) {
@@ -1441,7 +1642,7 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 		RequestID: requestID, Schema: schema, GeneratedAt: snapshot.GeneratedAt,
 		Counts: counts, Items: items, Cursor: snapshot.Cursor,
 		HasMore: snapshot.HasMore, UnsupportedItemsCount: int64(snapshot.UnsupportedItemsCount),
-	}, nil
+	}
 }
 
 // triageAuthRequirement is ADR-0016 Decision 4's tri-state carrier, derived
@@ -1529,15 +1730,6 @@ func validateTriageSnapshotPayload(payload protocol.TriageSnapshotResponsePayloa
 	return err
 }
 
-func minimalTriageSnapshotPayload(payload protocol.TriageSnapshotResponsePayload) protocol.TriageSnapshotResponsePayload {
-	payload.Counts = protocol.TriageCounts{}
-	payload.Items = []protocol.TriageSnapshotItem{}
-	payload.Cursor = ""
-	payload.HasMore = false
-	payload.UnsupportedItemsCount = 0
-	return payload
-}
-
 // triageHumanActionAttention implements the settled attention mapping from
 // dev/post-build-followups.md item 7: an unknown-auth openurl handoff (a
 // library-link route papio has not yet observed a session state for) and a
@@ -1573,7 +1765,8 @@ func (b *Bridge) triageDeliveryFor(ctx context.Context, jobID string) *protocol.
 	}
 	req, err := b.svc.Delivery.GetByJobID(ctx, jobID)
 	if err != nil {
-		log.Printf("papio: looking up delivery request for job %s: %v", jobID, err)
+		log.Printf("papio: delivery lookup unavailable (job_id=%s): %s",
+			truncate(jobID, 128), truncate(err.Error(), 256))
 		return nil
 	}
 	if req == nil {
@@ -3075,23 +3268,43 @@ func validExtensionVersion(value string) bool {
 // reuses the auth-return sibling reoffer path. Replays within the throttle
 // window are ignored before touching durable activity or job state.
 func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidencePayload) error {
-	now := b.now()
-	if !b.lastSessionEvidenceAt.IsZero() {
-		age := now.Sub(b.lastSessionEvidenceAt)
-		if age >= 0 && age < sessionEvidenceThrottle {
-			return nil
+	if b.lastSessionEvidenceAt == nil {
+		b.lastSessionEvidenceAt = map[string]time.Time{}
+	}
+	if b.reofferRanThisSync == nil {
+		b.reofferRanThisSync = map[string]bool{}
+	}
+	wantedProfile := resolverProfileKey("")
+	attributable := true
+	if strings.TrimSpace(p.OriginHint) != "" {
+		profile, ok := b.cfg.ResolverProfileForOrigin(p.OriginHint)
+		if !ok {
+			attributable = false
+		} else {
+			wantedProfile = resolverProfileKey(profile)
 		}
 	}
-	b.lastSessionEvidenceAt = now
+	now := b.now()
+	if attributable {
+		if last := b.lastSessionEvidenceAt[wantedProfile]; !last.IsZero() {
+			age := now.Sub(last)
+			if age >= 0 && age < sessionEvidenceThrottle {
+				return nil
+			}
+		}
+	}
 	if err := b.jobs.S.AppendEvent(ctx, "", "browser.session_evidence", nil); err != nil {
 		return err
 	}
-	if b.reofferRanThisSync {
+	if !attributable || b.reofferRanThisSync[wantedProfile] {
 		return nil
 	}
-	err := b.reofferInstitutionalSiblingsForEvidence(ctx, p.OriginHint)
-	b.reofferRanThisSync = true
-	return err
+	if err := b.reofferInstitutionalSiblingsForEvidence(ctx, p.OriginHint); err != nil {
+		return err
+	}
+	b.lastSessionEvidenceAt[wantedProfile] = now
+	b.reofferRanThisSync[wantedProfile] = true
+	return nil
 }
 
 // reofferInstitutionalSiblingsForEvidence chooses an open institutional
@@ -3099,21 +3312,6 @@ func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidenc
 // extension supplies an origin hint, both the source and every candidate must
 // belong to the matching configured resolver profile; an unknown hint fails
 // closed.
-//
-// An absent hint is NOT a wildcard. Evidence that cannot be attributed to an
-// institution may only release the default profile's queue: matching any
-// profile would let a second institution's sign-in reopen the first
-// institution's parked tabs, which is precisely the isolation this scoping
-// exists to guarantee. Single-institution setups leave Policy.Resolver empty,
-// which is the default profile, so their historical behavior is unchanged.
-//
-// A live pin may be retired only by attributable evidence for another
-// profile. An unhinted frame must never clear or repoint it: an older extension
-// or origin-less keepalive would otherwise replace a named-profile pin with a
-// default-profile handoff, and the next genuine auth_returned for the named
-// profile would hit the mismatched-pin branch and release nothing. That silently
-// starves the institution's queue for at least the 60-second evidence-throttle
-// window, or for the whole session if the extension never sends a hint.
 func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, originHint string) error {
 	hinted := strings.TrimSpace(originHint) != ""
 	wantedProfile := resolverProfileKey("")
@@ -3124,19 +3322,17 @@ func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, or
 		}
 		wantedProfile = resolverProfileKey(profile)
 	}
-	if b.reofferSourceJobID != "" && resolverProfileKey(b.reofferProfile) != wantedProfile {
-		if !hinted {
-			// An unattributable frame proves neither that the named pin is
-			// stale nor that the default queue is authenticated. Falling
-			// through would release the default queue while leaving the
-			// named institution unable to use its genuine auth return.
-			return nil
+	if !hinted {
+		for profile, sourceJobID := range b.reofferSourceJobID {
+			if profile != resolverProfileKey("") && sourceJobID != "" {
+				// An origin-less frame cannot retire a named-profile pin or
+				// prove that the default institution is the authenticated one.
+				return nil
+			}
 		}
-		b.reofferSourceJobID = ""
-		b.reofferProfile = ""
 	}
-	if b.reofferSourceJobID != "" {
-		return b.reofferInstitutionalSiblings(ctx, b.reofferSourceJobID)
+	if sourceJobID := b.reofferSourceJobID[wantedProfile]; sourceJobID != "" {
+		return b.reofferInstitutionalSiblings(ctx, sourceJobID)
 	}
 	handoffs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
 	if err != nil {
@@ -3144,9 +3340,6 @@ func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, or
 	}
 	var fallback string
 	for _, item := range handoffs {
-		// A quiesced handoff must not seed a re-offer sweep: riding someone
-		// else's fresh login is exactly how a week-old dead action keeps
-		// producing a tab per session. `papio actions open` still drives it.
 		if !item.Action.RequiresAuth ||
 			item.Action.Quiesced(b.now()) ||
 			resolverProfileKey(item.Row.Policy.Resolver) != wantedProfile {
@@ -3164,11 +3357,31 @@ func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, or
 	}
 	return b.reofferInstitutionalSiblings(ctx, fallback)
 }
+func (b *Bridge) reofferProfileForSource(ctx context.Context, sourceJobID string) (string, bool, error) {
+	for profile, pinned := range b.reofferSourceJobID {
+		if pinned == sourceJobID {
+			return profile, true, nil
+		}
+	}
+	handoffs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
+	if err != nil {
+		return "", false, err
+	}
+	for _, item := range handoffs {
+		if item.Row.ID == sourceJobID && item.Action.RequiresAuth {
+			return resolverProfileKey(item.Row.Policy.Resolver), true, nil
+		}
+	}
+	return "", false, nil
+}
 
 func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) error {
 	kind := "browser.auth_pending"
 	if msg.Type == protocol.MsgAuthReturned {
 		kind = "browser.auth_returned"
+	}
+	if b.reofferRanThisSync == nil {
+		b.reofferRanThisSync = map[string]bool{}
 	}
 
 	detail := map[string]any{}
@@ -3181,12 +3394,21 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	if msg.Type != protocol.MsgAuthReturned {
 		return nil
 	}
-	if b.reofferRanThisSync {
+	if b.reofferSourceJobID == nil {
+		b.reofferSourceJobID = map[string]string{}
+	}
+	profile, ok, err := b.reofferProfileForSource(ctx, msg.JobID)
+	if err != nil {
+		return err
+	}
+	if !ok || b.reofferRanThisSync[profile] {
 		return nil
 	}
-	err := b.reofferInstitutionalSiblings(ctx, msg.JobID)
-	b.reofferRanThisSync = true
-	return err
+	if err := b.reofferInstitutionalSiblings(ctx, msg.JobID); err != nil {
+		return err
+	}
+	b.reofferRanThisSync[profile] = true
+	return nil
 }
 
 // reofferInstitutionalSiblings lets poll reopen only the handoffs that a
@@ -3194,6 +3416,9 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID string) error {
 	if b.holder == nil || b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
 		return nil
+	}
+	if b.reofferSourceJobID == nil {
+		b.reofferSourceJobID = map[string]string{}
 	}
 
 	handoffJobs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
@@ -3213,24 +3438,39 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 			break
 		}
 	}
+	sourceProfile := ""
+	if source != nil {
+		sourceProfile = resolverProfileKey(source.Policy.Resolver)
+	}
+	profile := sourceProfile
+	if profile == "" {
+		for candidateProfile, pinned := range b.reofferSourceJobID {
+			if pinned == sourceJobID {
+				profile = candidateProfile
+				break
+			}
+		}
+	}
+	if profile == "" {
+		return nil
+	}
+	pinnedSource := b.reofferSourceJobID[profile]
 	if source == nil {
-		if b.reofferSourceJobID != sourceJobID {
+		if pinnedSource != sourceJobID {
 			return nil
 		}
 	} else {
-		if b.reofferSourceJobID != "" && b.reofferSourceJobID != sourceJobID {
+		if pinnedSource != "" && pinnedSource != sourceJobID {
 			return nil
 		}
-		if b.reofferSourceJobID == "" && sourceActionID != 0 {
-			b.reofferSourceJobID = sourceJobID
-			b.reofferProfile = resolverProfileKey(source.Policy.Resolver)
+		if pinnedSource == "" && sourceActionID != 0 {
+			b.reofferSourceJobID[profile] = sourceJobID
 		}
 		if sourceActionID != 0 {
 			b.authReleased[sourceActionID] = true
 		}
 	}
-	profile := b.reofferProfile
-	if b.reofferSourceJobID != sourceJobID || profile == "" {
+	if b.reofferSourceJobID[profile] != sourceJobID {
 		return nil
 	}
 
@@ -3297,7 +3537,15 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		if !b.offered[candidate.row.ID] && available <= 0 {
 			break
 		}
-		if b.offered[candidate.row.ID] {
+		wasOffered := b.offered[candidate.row.ID]
+		if !wasOffered && available <= 0 {
+			break
+		}
+		if err := b.jobs.RecordEvent(ctx, candidate.row.ID, "browser.handoff_reoffered",
+			map[string]any{"reason": "institutional_session_live"}); err != nil {
+			return err
+		}
+		if wasOffered {
 			delete(b.offered, candidate.row.ID)
 			delete(b.cancelSent, candidate.row.ID)
 		} else {
@@ -3305,10 +3553,6 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		}
 		b.reofferPending[candidate.row.ID] = true
 		b.authReleased[candidate.action.ID] = true
-		if err := b.jobs.RecordEvent(ctx, candidate.row.ID, "browser.handoff_reoffered",
-			map[string]any{"reason": "institutional_session_live"}); err != nil {
-			return err
-		}
 		released++
 	}
 	return nil
@@ -3352,8 +3596,52 @@ func resolverProfileKey(profile string) string {
 	return profile
 }
 
+func (b *Bridge) updateCaptureLease(ctx context.Context, jobID string) error {
+	if b.captureStore == nil || strings.TrimSpace(jobID) == "" {
+		return nil
+	}
+	events, err := b.jobs.Events(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	first, latest := "", ""
+	for _, event := range events {
+		if event["kind"] != "browser.page_capture" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if strings.TrimSpace(stringDetail(detail, "scenario")) == "observed" {
+			continue
+		}
+		path := strings.TrimSpace(stringDetail(detail, "path"))
+		if path == "" {
+			continue
+		}
+		if first == "" {
+			first = path
+		}
+		latest = path
+	}
+	if first == "" || latest == "" {
+		return nil
+	}
+	return b.captureStore.UpdateJob(ctx, jobID, first, latest)
+}
+
 // outcome maps a terminal provider observation onto a policy-legal transition.
-func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.ProviderOutcomePayload) error {
+func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.ProviderOutcomePayload) (err error) {
+	defer func() {
+		if b.captureStore == nil {
+			return
+		}
+		row, getErr := b.jobs.Get(ctx, jobID)
+		if getErr != nil || row.State == job.StateAwaitingHuman {
+			return
+		}
+		if releaseErr := b.captureStore.ReleaseJob(ctx, jobID); err == nil {
+			err = releaseErr
+		}
+	}()
 	sourceExtensionVersion := ""
 	if b.holder != nil {
 		sourceExtensionVersion = b.holder.ExtensionVersion
@@ -3368,6 +3656,9 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		detail["adapter_id"] = p.AdapterID
 	}
 	if err := b.jobs.RecordEvent(ctx, jobID, "browser.provider_outcome", detail); err != nil {
+		return err
+	}
+	if err := b.updateCaptureLease(ctx, jobID); err != nil {
 		return err
 	}
 	if err := b.recordProviderLatch(ctx, jobID, p); err != nil {
@@ -3491,6 +3782,40 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 
 const providerLatchEventKind = "job.latch"
 
+func routeSafetyDomain(routeRevision string) string {
+	routeRevision = strings.TrimSpace(routeRevision)
+	if routeRevision == "" {
+		return ""
+	}
+	family, _, ok := strings.Cut(routeRevision, "/")
+	if !ok || family == "" {
+		return ""
+	}
+	return "route:" + family
+}
+
+func hostSafetyDomain(prefix, target string) string {
+	parsed, err := url.Parse(target)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+		return ""
+	}
+	return prefix + ":" + strings.ToLower(parsed.Hostname())
+}
+
+func actionSafetyDomain(cfg config.Config, row job.Row, action job.HumanAction) string {
+	if target, ok := app.OABrowserHandoffURL(action.Detail); ok {
+		return hostSafetyDomain("oa", target)
+	}
+	if target, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
+		return hostSafetyDomain("delivery", target)
+	}
+	inst, ok := cfg.InstitutionFor(row.Policy.Resolver)
+	if !ok {
+		return ""
+	}
+	return hostSafetyDomain("institution", RouteURL(inst, row.Work))
+}
+
 // recordProviderLatch turns provider observations into durable, job-scoped
 // circuit-breaker evidence. The provider outcome frame deliberately has no
 // host field; when available, the preceding page-capture event supplies the
@@ -3512,26 +3837,49 @@ func (b *Bridge) recordProviderLatch(ctx context.Context, jobID string, p *proto
 	if err != nil {
 		return err
 	}
-	domain := strings.TrimSpace(p.AdapterID)
-	if domain == "" {
-		for i := len(events) - 1; i >= 0; i-- {
-			if events[i]["kind"] != "browser.page_capture" {
-				continue
+	domain := ""
+	for i := len(events) - 1; i >= 0; i-- {
+		detail, _ := events[i]["detail"].(map[string]any)
+		switch events[i]["kind"] {
+		case "browser.direct_route":
+			if stringDetail(detail, "phase") == "offered" || stringDetail(detail, "phase") == "result" {
+				domain = stringDetail(detail, "safety_domain")
+				if domain == "" {
+					domain = routeSafetyDomain(stringDetail(detail, "route_revision"))
+				}
 			}
-			captureDetail, _ := events[i]["detail"].(map[string]any)
-			domain = strings.TrimSpace(stringDetail(captureDetail, "adapter_id"))
-			if domain != "" {
-				break
-			}
+		case "browser.provider_drive_epoch_offered", "browser.provider_drive_epoch_started", "browser.provider_drive_epoch_result":
+			domain = stringDetail(detail, "safety_domain")
+		case "browser.handoff_offered":
+			domain = stringDetail(detail, "safety_domain")
+		}
+		if domain != "" {
+			break
 		}
 	}
 	if domain == "" {
-		// An observation without an adapter cannot identify a provider safety
+		row, rowErr := b.jobs.Get(ctx, jobID)
+		if rowErr != nil {
+			return rowErr
+		}
+		actions, actionErr := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+		if actionErr != nil {
+			return actionErr
+		}
+		for _, action := range actions {
+			if action.Kind == handoffActionKind {
+				domain = actionSafetyDomain(b.cfg, *row, action)
+				break
+			}
+		}
+		// An observation without an offered route cannot identify a safety
 		// domain. Keep the ordinary provider outcome durable, but do not create
 		// a latch that would accidentally suspend unrelated browser routes.
-		return nil
+		if domain == "" {
+			return nil
+		}
 	}
-	host := providerOutcomeHost(events, domain, p.AdapterVersion)
+	host := providerOutcomeHost(events, p.AdapterID, p.AdapterVersion)
 	for _, event := range events {
 		if event["kind"] != providerLatchEventKind {
 			continue
@@ -3559,6 +3907,54 @@ func (b *Bridge) recordProviderLatch(ctx context.Context, jobID string, p *proto
 	return b.jobs.RecordEvent(ctx, jobID, providerLatchEventKind, detail)
 }
 
+func (b *Bridge) appendProviderNoPositiveLatch(ctx context.Context, jobID, domain string) error {
+	if b == nil || b.jobs == nil || strings.TrimSpace(domain) == "" {
+		return nil
+	}
+	events, err := b.jobs.Events(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	for _, event := range events {
+		if event["kind"] != providerLatchEventKind {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if stringDetail(detail, "kind") == "no_positive_effects" &&
+			stringDetail(detail, "safety_domain") == domain {
+			return nil
+		}
+	}
+	return b.jobs.RecordEvent(ctx, jobID, providerLatchEventKind, map[string]any{
+		"kind": "no_positive_effects", "safety_domain": domain,
+	})
+}
+
+// recordAdoptionConclusiveLatch distinguishes a rejected adopted file from
+// environmental adoption deferral. The app parks an identity rejection with a
+// durable transition reason; only that conclusive reason trips the current
+// handoff domain, never an unreadable or still-renaming file.
+func (b *Bridge) recordAdoptionConclusiveLatch(ctx context.Context, jobID string) error {
+	events, err := b.jobs.Events(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	domain := ""
+	conclusive := false
+	for _, event := range events {
+		detail, _ := event["detail"].(map[string]any)
+		if event["kind"] == "browser.handoff_offered" {
+			domain = stringDetail(detail, "safety_domain")
+		}
+		if event["kind"] == "job.transition" && stringDetail(detail, "reason") == "wrong_work" {
+			conclusive = true
+		}
+	}
+	if !conclusive || domain == "" {
+		return nil
+	}
+	return b.appendProviderNoPositiveLatch(ctx, jobID, domain)
+}
 func providerOutcomeHost(events []map[string]any, adapterID, adapterVersion string) string {
 	for i := len(events) - 1; i >= 0; i-- {
 		if events[i]["kind"] != "browser.page_capture" {
@@ -3581,6 +3977,18 @@ func providerOutcomeHost(events []map[string]any, adapterID, adapterVersion stri
 func stringDetail(detail map[string]any, key string) string {
 	value, _ := detail[key].(string)
 	return value
+}
+func intDetail(detail map[string]any, key string) int {
+	switch value := detail[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return -1
+	}
 }
 
 // institutionalRouteRequeued reports whether this job already left an
@@ -3904,6 +4312,8 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 			if evErr := b.recordAdoptionDeferred(ctx, jobID, name, err); evErr != nil {
 				return evErr
 			}
+		} else if latchErr := b.recordAdoptionConclusiveLatch(ctx, jobID); latchErr != nil {
+			return latchErr
 		}
 	}
 	return nil
@@ -4350,11 +4760,15 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	// walking that queue on ordinary browser ticks once capacity is available;
 	// this is what drains a parked backlog without requiring another evidence
 	// frame.
-	if b.reofferSourceJobID != "" && !b.reofferRanThisSync {
-		if err := b.reofferInstitutionalSiblings(ctx, b.reofferSourceJobID); err != nil {
-			log.Printf("papio: browser reoffer poll unavailable: %v", err)
+	for profile, sourceJobID := range b.reofferSourceJobID {
+		if sourceJobID == "" || b.reofferRanThisSync[profile] {
+			continue
 		}
-		b.reofferRanThisSync = true
+		if err := b.reofferInstitutionalSiblings(ctx, sourceJobID); err != nil {
+			log.Printf("papio: browser reoffer poll unavailable: %v", err)
+			continue
+		}
+		b.reofferRanThisSync[profile] = true
 	}
 	awaiting, err := b.jobs.List(ctx, job.StateAwaitingHuman, 200)
 	if err != nil {
@@ -4365,6 +4779,25 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	if err != nil {
 		log.Printf("papio: browser handoff poll unavailable: %v", err)
 		return nil, nil
+	}
+	if b.captureStore != nil {
+		if pending, pendingErr := b.captureStore.PendingJobs(ctx); pendingErr == nil {
+			awaitingIDs := make(map[string]struct{}, len(awaiting))
+			for _, row := range awaiting {
+				awaitingIDs[row.ID] = struct{}{}
+			}
+			for _, jobID := range pending {
+				if _, ok := awaitingIDs[jobID]; ok {
+					continue
+				}
+				row, getErr := b.jobs.Get(ctx, jobID)
+				if getErr != nil || row.State != job.StateAwaitingHuman {
+					if releaseErr := b.captureStore.ReleaseJob(ctx, jobID); releaseErr != nil {
+						log.Printf("papio: capture retention release for %s: %v", jobID, releaseErr)
+					}
+				}
+			}
+		}
 	}
 	handoff := make(map[string]job.HumanAction, len(handoffJobs))
 	present := map[string]bool{}
@@ -4395,6 +4828,9 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 					log.Printf("papio: recording deferred browser adoption: %v", evErr)
 				}
 			} else {
+				if latchErr := b.recordAdoptionConclusiveLatch(ctx, row.ID); latchErr != nil {
+					log.Printf("papio: recording adoption safety latch: %v", latchErr)
+				}
 				delete(b.offered, row.ID)
 				delete(b.reofferPending, row.ID)
 				delete(handoff, row.ID)
@@ -4459,6 +4895,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	}
 	held := 0
 	heldIDs := make(map[string]bool)
+jobLoop:
 	for _, id := range candidateIDs {
 		if hasSettledDownload(b.pendingDownloads, id) || b.offered[id] {
 			continue
@@ -4509,15 +4946,23 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			delete(b.reofferPending, id)
 			continue
 		}
-		if !b.focusPending[id] {
-			latched, latchErr := b.browserOfferLatched(ctx, row, action)
-			if latchErr != nil {
-				log.Printf("papio: reading browser safety latches for %s: %v", id, latchErr)
-				delete(b.reofferPending, id)
+		latched, latchErr := b.browserOfferLatched(ctx, row, action)
+		if latchErr != nil {
+			log.Printf("papio: reading browser safety latches for %s: %v", id, latchErr)
+			delete(b.reofferPending, id)
+			continue
+		}
+		if latched {
+			delete(b.reofferPending, id)
+			continue
+		}
+		if b.providerDriveEpochAvailable() {
+			events, epochErr := b.jobs.Events(ctx, id)
+			if epochErr != nil {
+				log.Printf("papio: reading provider drive epoch history for %s: %v", id, epochErr)
 				continue
 			}
-			if latched {
-				delete(b.reofferPending, id)
+			if providerDriveEpochSuppressed(events, actionSafetyDomain(b.cfg, row, action)) {
 				continue
 			}
 		}
@@ -4542,31 +4987,63 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 				if eventErr != nil {
 					log.Printf("papio: reading direct-route history for %s: %v", id, eventErr)
 				} else {
-					ordinal, _ := directRouteProgress(events, candidates)
-					if ordinal < len(candidates) {
+					ordinal, inFlight := directRouteProgress(events, candidates)
+					if inFlight || directRouteSucceeded(events) {
+						continue
+					}
+					for ordinal < len(candidates) {
 						candidate := candidates[ordinal]
-						if validateDirectRouteEnvelope(candidate) {
-							offer, offerErr := b.offerAtURL(row, action, accessMode, candidate.URL)
-							if offerErr != nil {
-								return nil, offerErr
-							}
-							if err := b.jobs.S.AppendEvent(ctx, id, "browser.direct_route",
-								map[string]any{
-									"route_revision": candidate.RouteRevision,
-									"ordinal":        ordinal,
-									"phase":          "offered",
-								}); err != nil {
-								log.Printf("papio: recording direct-route offer for %s: %v", id, err)
-								continue
-							}
-							out = append(out, offer)
-							b.offered[id] = true
-							delete(b.reofferPending, id)
-							slots--
+						if !validateDirectRouteEnvelope(candidate) {
+							break
+						}
+						candidateDomain := routeSafetyDomain(candidate.RouteRevision)
+						latched, latchErr := b.browserOfferLatched(ctx, row, action,
+							candidateDomain, resolverHost(candidate.URL))
+						if latchErr != nil {
+							log.Printf("papio: reading direct-route safety latches for %s: %v", id, latchErr)
+							break
+						}
+						if latched {
+							ordinal++
 							continue
 						}
-						// A malformed table row is fail-closed and falls
-						// through to the ordinary institutional handoff.
+						if !b.providerDirectGetAvailable() {
+							break
+						}
+						attemptID := newMsgID()
+						frame, frameErr := b.frame(protocol.MsgProviderDirectGetRequest, id,
+							protocol.ProviderDirectGetRequestPayload{
+								DriveAttemptID:     attemptID,
+								Ordinal:            int64(ordinal),
+								RouteRevision:      candidate.RouteRevision,
+								ExpectedIdentifier: candidate.Identifier,
+								URL:                candidate.URL,
+								AllowedOrigin:      candidate.AllowedOrigin,
+								PathFamily:         candidate.PathFamily,
+								TermsPolicy:        candidate.TermsPolicy,
+							})
+						if frameErr != nil {
+							return nil, frameErr
+						}
+						if err := b.jobs.S.AppendEvent(ctx, id, "browser.direct_route",
+							map[string]any{
+								"route_revision":   candidate.RouteRevision,
+								"safety_domain":    candidateDomain,
+								"ordinal":          ordinal,
+								"drive_attempt_id": attemptID,
+								"phase":            "offered",
+							}); err != nil {
+							log.Printf("papio: recording direct-route offer for %s: %v", id, err)
+							// The route tuple is authorized only by this durable event.
+							// Exit this poll rather than spinning on the same ordinal
+							// while holding the bridge lock.
+							return out, nil
+						}
+						out = append(out, frame)
+						b.offered[id] = true
+						delete(b.reofferPending, id)
+						slots--
+						continue jobLoop
 					}
 				}
 			}
@@ -4576,7 +5053,10 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 			return nil, err
 		}
 		if err := b.jobs.S.AppendEvent(ctx, row.ID, "browser.handoff_offered",
-			map[string]any{"requires_auth": action.RequiresAuth}); err != nil {
+			map[string]any{
+				"requires_auth": action.RequiresAuth,
+				"safety_domain": actionSafetyDomain(b.cfg, row, action),
+			}); err != nil {
 			log.Printf("papio: recording browser.handoff_offered for %s: %v", row.ID, err)
 			continue
 		}
@@ -4642,6 +5122,25 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 				delete(b.focusPending, id)
 				continue
 			}
+			latched, latchErr := b.browserOfferLatched(ctx, *row, handoff[id])
+			if latchErr != nil {
+				log.Printf("papio: reading focused browser safety latch for %s: %v", id, latchErr)
+				continue
+			}
+			if latched {
+				delete(b.focusPending, id)
+				continue
+			}
+			if !b.offered[id] && b.providerDriveEpochAvailable() {
+				events, epochErr := b.jobs.Events(ctx, id)
+				if epochErr != nil {
+					log.Printf("papio: reading focused provider epoch for %s: %v", id, epochErr)
+					continue
+				}
+				if providerDriveEpochSuppressed(events, actionSafetyDomain(b.cfg, *row, handoff[id])) {
+					continue
+				}
+			}
 			if !b.offered[id] {
 				if slots <= 0 {
 					if !heldIDs[id] {
@@ -4650,13 +5149,15 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 					}
 					continue
 				}
-
-				offer, offerErr := b.offer(*row, handoff[id], accessMode)
+				offer, offerErr := b.offerAtURL(*row, handoff[id], accessMode, "", true)
 				if offerErr != nil {
 					return nil, offerErr
 				}
 				if err := b.jobs.S.AppendEvent(ctx, id, "browser.handoff_offered",
-					map[string]any{"requires_auth": handoff[id].RequiresAuth}); err != nil {
+					map[string]any{
+						"requires_auth": handoff[id].RequiresAuth,
+						"safety_domain": actionSafetyDomain(b.cfg, *row, handoff[id]),
+					}); err != nil {
 					log.Printf("papio: recording focused handoff offer for %s: %v", id, err)
 					continue
 				}
@@ -4680,6 +5181,7 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	if held == 0 {
 	} else if held != b.lastPacedHeld {
 		if err := b.jobs.S.AppendEvent(ctx, "", "browser.offers_paced", map[string]any{"held": held}); err != nil {
+
 			log.Printf("papio: recording offer pacing: %v", err)
 		} else {
 			b.lastPacedHeld = held
@@ -4716,21 +5218,37 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	}
 	return out, nil
 }
+func (b *Bridge) providerDirectGetAvailable() bool {
+	if b == nil || b.holder == nil || !slices.Contains(b.Features, providerDirectGetV1Feature) {
+		return false
+	}
+	return compareVersion(b.holder.ExtensionVersion, ProviderDirectGetMinExtensionVersion) >= 0
+}
+func (b *Bridge) providerDriveEpochAvailable() bool {
+	if b == nil || b.holder == nil || !slices.Contains(b.Features, providerDriveEpochV1Feature) {
+		return false
+	}
+	return compareVersion(b.holder.ExtensionVersion, ProviderDirectGetMinExtensionVersion) >= 0
+}
 
-// offerableAccessMode resolves the access mode to advertise for one handoff
-// offer, and reports whether the job may be offered at all.
-//
-// papio-browser/1 permits only assisted and delegated in a job_offer, because
-// conservative never opens an institutional handoff. A parked job that resolves
-// to conservative is therefore stale state: a row parked before the operator
-// tightened the daemon mode, or before per-request overrides were honoured.
-// Skipping it is the honest answer. Emitting it would fail the outbound
-// self-validation, and a non-nil error out of Sync tears down the entire
-// native-messaging session rather than dropping one offer.
+// offerableAccessMode resolves the access mode to advertise for one handoff.
 func (b *Bridge) offerableAccessMode(row job.Row) (string, bool) {
-	switch mode := b.cfg.EffectiveAccessMode(row.Policy.AccessMode); mode {
+	mode := b.cfg.EffectiveAccessMode(row.Policy.AccessMode)
+	// ISBN catalogue/ebook routes are deliberately human-assisted even when
+	// the global policy is delegated: papio cannot automatically fetch or
+	// validate a book PDF.
+	actions, err := b.jobs.ListOpenHumanActionsForJobs(context.Background(), []string{row.ID})
+	if err == nil {
+		for _, action := range actions {
+			if action.Kind == handoffActionKind &&
+				strings.HasPrefix(action.Detail, app.InstitutionalBookOpenURLHandoffDetail) {
+				mode = config.ModeAssisted
+				break
+			}
+		}
+	}
+	switch mode {
 	case config.ModeAssisted, config.ModeDelegated:
-
 		return mode, true
 	default:
 		return "", false
@@ -4863,71 +5381,68 @@ func directRouteOrdinal(detail map[string]any) (int, bool) {
 	}
 }
 
-// directRouteProgress projects the durable route events. An offered phase
-// without its result keeps the same ordinal in flight; only a terminal result
-// advances the next ordinal.
+// directRouteProgress projects durable direct-route tuples. An offered phase
+// without its matching result remains in flight, and all non-success
+// observations remain terminal for that tuple without advancing.
 func directRouteProgress(events []map[string]any, candidates []routes.Candidate) (next int, inFlight bool) {
+	attempt := ""
+	revision := ""
+	ordinal := -1
 	for _, event := range events {
 		if event["kind"] != "browser.direct_route" {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
-		ordinal, ok := directRouteOrdinal(detail)
-		if !ok || ordinal >= len(candidates) {
+		eventOrdinal, ok := directRouteOrdinal(detail)
+		if !ok || eventOrdinal < 0 || eventOrdinal >= len(candidates) {
 			continue
 		}
-		revision, _ := detail["route_revision"].(string)
-		if revision == "" || revision != candidates[ordinal].RouteRevision {
+		eventRevision := stringDetail(detail, "route_revision")
+		eventAttempt := stringDetail(detail, "drive_attempt_id")
+		if eventAttempt == "" || eventRevision == "" || eventRevision != candidates[eventOrdinal].RouteRevision {
 			continue
 		}
-		switch detail["phase"] {
+		switch stringDetail(detail, "phase") {
 		case "offered":
-			if ordinal == next {
-				inFlight = true
+			if eventOrdinal == next {
+				attempt, revision, ordinal, inFlight = eventAttempt, eventRevision, eventOrdinal, true
 			}
 		case "result":
-			if ordinal == next && inFlight {
+			if eventOrdinal != ordinal || eventAttempt != attempt || eventRevision != revision || !inFlight {
+				continue
+			}
+			switch stringDetail(detail, "outcome") {
+			case "success", "not_pdf":
 				next++
 				inFlight = false
+				attempt, revision, ordinal = "", "", -1
+			default:
+				// foreign/login/terms/challenge and every unknown result are
+				// terminal observations for this tuple but never advance.
+				inFlight = true
 			}
 		}
 	}
 	return next, inFlight
 }
+func directRouteSucceeded(events []map[string]any) bool {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "browser.direct_route" {
+			continue
+		}
+		detail, _ := events[i]["detail"].(map[string]any)
+		if stringDetail(detail, "phase") == "result" && stringDetail(detail, "outcome") == "success" {
+			return true
+		}
+	}
+	return false
+}
 
-// validateDirectRouteEnvelope repeats the route-table envelope checks at the
-// emission boundary. This is deliberately independent of route compilation:
-// a future table edit must not turn a bad row into an arbitrary navigation.
+// validateDirectRouteEnvelope checks the candidate at the emission boundary.
+// The canonical path/escaping rules live in internal/routes so this bridge
+// cannot drift into a second URL envelope implementation.
 func validateDirectRouteEnvelope(candidate routes.Candidate) bool {
-	u, err := url.Parse(candidate.URL)
-	if err != nil || u.Scheme != "https" || u.User != nil || u.Host == "" || u.Fragment != "" {
-		return false
-	}
-	origin, err := url.Parse(candidate.AllowedOrigin)
-	if err != nil || origin.Scheme != "https" || origin.User != nil || origin.Path != "" ||
-		origin.RawQuery != "" || origin.Fragment != "" || origin.Host == "" || u.Host != origin.Host {
-		return false
-	}
-	kind, identifier, ok := strings.Cut(candidate.Identifier, ":")
-	if !ok || kind == "" || identifier == "" {
-		return false
-	}
-	placeholder := "{" + kind + "}"
-	prefix, suffix, found := strings.Cut(candidate.PathFamily, placeholder)
-	if !found || prefix == "" {
-		return false
-	}
-	expectedPath := (&url.URL{Path: prefix + identifier + suffix}).EscapedPath()
-	if u.EscapedPath() != expectedPath {
-		return false
-	}
-	if candidate.TermsPolicy != "none" {
-		return false
-	}
-	if u.RawQuery != "" && u.RawQuery != "download=true" {
-		return false
-	}
-	return true
+	return routes.ValidateCandidate(candidate) == nil
 }
 
 func (b *Bridge) directRouteEligible(row job.Row, accessMode string) bool {
@@ -4940,24 +5455,46 @@ func (b *Bridge) directRouteEligible(row job.Row, accessMode string) bool {
 
 // browserOfferLatched projects durable job.latch events into the browser-only
 // offer gate. It intentionally does not participate in resolver/API candidate
-// selection, and an explicit focus request remains a human-authorized escape
-// hatch from the automatic gate.
+// selection. Focus is view-only: it cannot bypass this latch or mint a new
+// drive epoch; only an explicit retry may reset that authority.
 func (b *Bridge) browserOfferLatched(
 	ctx context.Context,
 	row job.Row,
 	action job.HumanAction,
+	override ...string,
 ) (bool, error) {
 	events, err := b.jobs.Events(ctx, row.ID)
 	if err != nil {
 		return true, err
 	}
-	offerHosts := b.browserOfferHosts(row, action)
+	domain := actionSafetyDomain(b.cfg, row, action)
+	offerHosts := b.browserOfferHosts(row, action, events)
+	landingHost := ""
+	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
+	offerURL := RouteURL(inst, row.Work)
+	if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
+		offerURL = oaURL
+	}
+	if retrievalURL, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
+		offerURL = retrievalURL
+	}
+	landingHost = strings.ToLower(strings.TrimSpace(resolverHost(offerURL)))
+	if len(override) > 0 && override[0] != "" {
+		domain = override[0]
+	}
+	if len(override) > 1 && override[1] != "" {
+		landingHost = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(override[1]), "."))
+		offerHosts = append(offerHosts, landingHost)
+	}
+	if domain == "" {
+		return false, nil
+	}
 	for _, event := range events {
 		if event["kind"] != providerLatchEventKind {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
-		if stringDetail(detail, "safety_domain") == "" {
+		if stringDetail(detail, "safety_domain") != domain {
 			continue
 		}
 		switch stringDetail(detail, "kind") {
@@ -4967,7 +5504,7 @@ func (b *Bridge) browserOfferLatched(
 			adapterID := stringDetail(detail, "adapter_id")
 			adapterVersion := stringDetail(detail, "adapter_version")
 			if adapterID == "" || adapterVersion == "" {
-				return true, nil
+				continue
 			}
 			liveVersion := ""
 			if b.holder != nil {
@@ -4976,8 +5513,15 @@ func (b *Bridge) browserOfferLatched(
 			if extensionVersionNewer(adapterVersion, liveVersion) {
 				continue
 			}
-			host := stringDetail(detail, "host")
-			if host == "" || browserOfferHostMatches(offerHosts, host) {
+			host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(stringDetail(detail, "host")), "."))
+			if host == "" {
+				// A drift observation may arrive without a page capture (for
+				// example after a bridge restart). The durable safety domain is
+				// still authoritative; missing host evidence must not turn a
+				// latched route into an automatic re-offer.
+				return true, nil
+			}
+			if (landingHost != "" && host == landingHost) || browserOfferHostMatches(offerHosts, host) {
 				return true, nil
 			}
 		}
@@ -4985,27 +5529,71 @@ func (b *Bridge) browserOfferLatched(
 	return false, nil
 }
 
-func (b *Bridge) browserOfferHosts(row job.Row, action job.HumanAction) []string {
+func (b *Bridge) browserOfferHosts(row job.Row, action job.HumanAction, events []map[string]any, directURL ...string) []string {
 	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
-	offerURL := RouteURL(inst, row.Work)
-	if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
-		offerURL = oaURL
+	offerURL := ""
+	if len(directURL) > 0 {
+		offerURL = strings.TrimSpace(directURL[0])
 	}
-	if retrievalURL, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
-		offerURL = retrievalURL
+	if offerURL == "" {
+		offerURL = RouteURL(inst, row.Work)
+		if target, ok := app.OABrowserHandoffURL(action.Detail); ok {
+			offerURL = target
+		}
+		if target, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
+			offerURL = target
+		}
 	}
-	hosts := make([]string, 0, len(verifiedProviderHosts)+1)
-	if host := resolverHost(offerURL); host != "" {
+	hosts := make([]string, 0, 4)
+	offerHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(resolverHost(offerURL))), ".")
+	offerHostIsProvider := browserOfferHostMatches(verifiedProviderHosts, offerHost)
+	appendHost := func(raw string) {
+		host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+		if host == "" || slices.Contains(hosts, host) {
+			return
+		}
 		hosts = append(hosts, host)
 	}
-	hosts = append(hosts, verifiedProviderHosts...)
+	appendHost(offerHost)
+	libKeyURL := LibKeyURL(inst, row.Work)
+	if libKeyURL != "" && offerURL == libKeyURL {
+		if host := resolverHost(inst.OpenURLBase); host != "" && host != libKeyHost {
+			appendHost(host)
+		}
+	}
+	// A resolver may redirect to a provider host that is not the resolver
+	// landing host. Only durable page-capture evidence that belongs to the
+	// declarative provider set is action-specific; do not attach the entire
+	// global provider list to every institution route.
+	for _, event := range events {
+		if event["kind"] != "browser.page_capture" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(stringDetail(detail, "host"))), ".")
+		if host == "" || !browserOfferHostMatches(verifiedProviderHosts, host) {
+			continue
+		}
+		// When the actual route is already a known provider, evidence from
+		// another provider cannot justify this offer. Resolver/institution
+		// routes remain open to their reviewed provider landing evidence.
+		if offerHostIsProvider && !browserOfferHostMatches([]string{offerHost}, host) {
+			continue
+		}
+		appendHost(host)
+	}
 	return hosts
 }
 
 func browserOfferHostMatches(offerHosts []string, latchHost string) bool {
-	latchHost = strings.ToLower(strings.TrimSpace(latchHost))
+	if latchHost == "" {
+		return false
+	}
 	for _, offerHost := range offerHosts {
-		offerHost = strings.ToLower(strings.TrimSpace(offerHost))
+		offerHost = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(offerHost)), ".")
+		if offerHost == "" {
+			continue
+		}
 		if offerHost == latchHost || strings.HasSuffix(offerHost, "."+latchHost) ||
 			strings.HasSuffix(latchHost, "."+offerHost) {
 			return true
@@ -5014,21 +5602,93 @@ func browserOfferHostMatches(offerHosts []string, latchHost string) bool {
 	return false
 }
 
-// offer builds a job_offer for one parked handoff job. OA browser handoffs
-// reuse the frozen OpenURL field with the candidate's public URL;
-// institutional handoffs take the profile's route — the LibKey.io link when
-// configured (ADR-0016), else the plain OpenURL resolver link. A LibKey
-// route opens on libkey.io and then forwards through the institution's
-// resolver, so the resolver host must stay on the offer's host list or the
-// extension goes blind exactly at the redirect. accessMode comes from
-// offerableAccessMode, so this never has to re-derive it.
-func (b *Bridge) offer(row job.Row, action job.HumanAction, accessMode string) (json.RawMessage, error) {
-	return b.offerAtURL(row, action, accessMode, "")
+// providerDriveEpochSuppressed reports whether a generic epoch is already
+// started or terminal. A merely offered tuple still needs its job_offer frame
+// after a daemon/extension hello; suppressing that frame would strand legacy
+// ordinary handoffs.
+func providerDriveEpochSuppressed(events []map[string]any, domain string) bool {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return true
+	}
+	current := ""
+	started, result, successor := false, false, false
+	for _, event := range events {
+		detail, _ := event["detail"].(map[string]any)
+		tuple := providerDriveEpochKey(
+			stringDetail(detail, "drive_attempt_id"),
+			int64(intDetail(detail, "ordinal")),
+			stringDetail(detail, "strategy"),
+			stringDetail(detail, "revision"),
+		)
+		switch event["kind"] {
+		case "browser.provider_drive_epoch_offered":
+			if stringDetail(detail, "safety_domain") != domain ||
+				!validProviderDriveEpochTuple(stringDetail(detail, "drive_attempt_id"), int64(intDetail(detail, "ordinal")), stringDetail(detail, "strategy"), stringDetail(detail, "revision")) {
+				continue
+			}
+			if result {
+				successor = true
+			}
+			current, started, result = tuple, false, false
+		case "browser.provider_drive_epoch_started":
+			if tuple == current {
+				started = true
+			}
+		case "browser.provider_drive_epoch_result":
+			if tuple == current {
+				result = true
+			}
+		}
+	}
+	return current != "" && (started || result || successor)
 }
 
-func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, directURL string) (json.RawMessage, error) {
+// latestProviderDriveEpoch derives the generic tuple from durable events.
+func (b *Bridge) latestProviderDriveEpoch(jobID string) (string, int64, bool) {
+	if b == nil || b.jobs == nil {
+		return "", 0, false
+	}
+	events, err := b.jobs.Events(context.Background(), jobID)
+	if err != nil {
+		return "", 0, false
+	}
+	attempt, ordinal := "", int64(0)
+	for _, event := range events {
+		d, _ := event["detail"].(map[string]any)
+		if event["kind"] == "browser.provider_drive_epoch_offered" {
+			attempt, ordinal = stringDetail(d, "drive_attempt_id"), int64(intDetail(d, "ordinal"))
+		}
+	}
+	return attempt, ordinal, attempt != ""
+}
+
+func (b *Bridge) latestHandoffSafetyDomain(jobID string) string {
+	if b == nil || b.jobs == nil {
+		return ""
+	}
+	events, err := b.jobs.Events(context.Background(), jobID)
+	if err != nil {
+		return ""
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "browser.handoff_offered" {
+			continue
+		}
+		detail, _ := events[i]["detail"].(map[string]any)
+		if domain := strings.TrimSpace(stringDetail(detail, "safety_domain")); domain != "" {
+			return domain
+		}
+	}
+	return ""
+}
+
+func (b *Bridge) offer(row job.Row, action job.HumanAction, accessMode string) (json.RawMessage, error) {
+	return b.offerAtURL(row, action, accessMode, "", false)
+}
+
+func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, directURL string, forceNewEpoch bool) (json.RawMessage, error) {
 	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
-	libKeyURL := LibKeyURL(inst, row.Work)
 	offerURL := directURL
 	if offerURL == "" {
 		offerURL = RouteURL(inst, row.Work)
@@ -5042,16 +5702,15 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 			offerURL = retrievalURL
 		}
 	}
-	hosts := []string{}
-	if h := resolverHost(offerURL); h != "" {
-		hosts = append(hosts, h)
-	}
-	if libKeyURL != "" && offerURL == libKeyURL {
-		if h := resolverHost(inst.OpenURLBase); h != "" && h != libKeyHost {
-			hosts = append(hosts, h)
+	var events []map[string]any
+	if b.jobs != nil && row.ID != "" {
+		var err error
+		events, err = b.jobs.Events(context.Background(), row.ID)
+		if err != nil {
+			return nil, fmt.Errorf("read browser offer evidence: %w", err)
 		}
 	}
-	hosts = append(hosts, verifiedProviderHosts...)
+	hosts := b.browserOfferHosts(row, action, events, offerURL)
 	expected := &protocol.JobOfferExpected{DOI: row.Work.DOI, Title: truncate(row.Work.Title, 500)}
 	if expected.DOI == "" && expected.Title == "" {
 		expected = nil
@@ -5064,6 +5723,40 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 		RequiresAuth:  action.RequiresAuth,
 		ExpiresAt:     b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339),
 	}
+	if b.providerDriveEpochAvailable() {
+		b.providerDriveEpochMu.Lock()
+		attempt, ordinal, ok := b.latestProviderDriveEpoch(row.ID)
+		domain := actionSafetyDomain(b.cfg, row, action)
+		if b.jobs != nil {
+			if durableDomain := b.latestHandoffSafetyDomain(row.ID); durableDomain != "" {
+				domain = durableDomain
+			}
+		}
+		if forceNewEpoch && ok && b.jobs != nil {
+			if err := b.jobs.S.AppendEvent(context.Background(), row.ID, "browser.provider_drive_epoch_superseded", map[string]any{
+				"drive_attempt_id": attempt, "ordinal": ordinal, "strategy": "generic", "revision": "1", "safety_domain": domain,
+			}); err != nil {
+				b.providerDriveEpochMu.Unlock()
+				return nil, fmt.Errorf("record provider drive epoch supersession: %w", err)
+			}
+		}
+		if forceNewEpoch || !ok {
+			attempt, ordinal = newMsgID(), 0
+			if b.jobs != nil {
+				if err := b.jobs.S.AppendEvent(context.Background(), row.ID, "browser.provider_drive_epoch_offered", map[string]any{
+					"drive_attempt_id": attempt, "ordinal": ordinal, "strategy": "generic", "revision": "1", "safety_domain": domain,
+				}); err != nil {
+					b.providerDriveEpochMu.Unlock()
+					return nil, fmt.Errorf("record provider drive epoch offer: %w", err)
+				}
+			}
+		}
+		payload.DriveAttemptID = attempt
+		payload.DriveOrdinal = &ordinal
+		payload.DriveStrategy = "generic"
+		payload.DriveRevision = "1"
+		b.providerDriveEpochMu.Unlock()
+	}
 
 	// Federated login-routing: hand this job's institution Shibboleth entityID
 	// and ProQuest account id to the extension so it can auto-select the
@@ -5073,40 +5766,104 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 	return b.frame(protocol.MsgJobOffer, row.ID, payload)
 }
 
-// directRouteFailure consumes the existing error frame used by the extension's
-// direct-file path. It is deliberately a durable event transition: the next
-// route is not eligible for emission until this result has landed.
-func (b *Bridge) directRouteFailure(ctx context.Context, jobID, outcome string) (bool, error) {
+// providerDirectGetResult applies one strict direct observation only when its
+// complete daemon-minted tuple still names the current in-flight route.
+func (b *Bridge) providerDirectGetResult(ctx context.Context, jobID string, p *protocol.ProviderDirectGetResultPayload) error {
+	if p == nil || !validDirectResultTuple(p) {
+		return nil
+	}
 	row, err := b.jobs.Get(ctx, jobID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
+			return nil
 		}
-		return false, err
+		return err
 	}
 	candidates, err := b.directRouteCandidates(ctx, *row)
 	if err != nil || len(candidates) == 0 {
-		return false, err
+		return err
 	}
 	events, err := b.jobs.Events(ctx, jobID)
 	if err != nil {
-		return false, err
+		return err
 	}
 	ordinal, inFlight := directRouteProgress(events, candidates)
-	if !inFlight || ordinal >= len(candidates) {
-		return false, nil
+	if !inFlight || p.Ordinal != int64(ordinal) || ordinal >= len(candidates) ||
+		p.RouteRevision != candidates[ordinal].RouteRevision {
+		return nil
+	}
+	tupleOffered := false
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "browser.direct_route" {
+			continue
+		}
+		detail, _ := events[i]["detail"].(map[string]any)
+		if intDetail(detail, "ordinal") != ordinal ||
+			stringDetail(detail, "route_revision") != p.RouteRevision ||
+			stringDetail(detail, "drive_attempt_id") != p.DriveAttemptID {
+			continue
+		}
+		switch stringDetail(detail, "phase") {
+		case "result":
+			return nil
+		case "offered":
+			tupleOffered = true
+		}
+		break
+	}
+	if !tupleOffered {
+		return nil
 	}
 	candidate := candidates[ordinal]
-	if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.direct_route", map[string]any{
-		"route_revision": candidate.RouteRevision,
-		"ordinal":        ordinal,
-		"phase":          "result",
-		"outcome":        outcome,
-	}); err != nil {
-		return false, err
+	outcome := p.Outcome
+	landing := p.LandingClass
+	finalHost := strings.ToLower(strings.TrimSpace(p.FinalHost))
+	finalPath := p.FinalPath
+	envelopeInvalid := false
+	if outcome == "success" {
+		expectedOrigin, originErr := url.Parse(candidate.AllowedOrigin)
+		expectedURL, urlErr := url.Parse(candidate.URL)
+		if originErr != nil || urlErr != nil || finalHost == "" ||
+			finalHost != strings.ToLower(expectedOrigin.Hostname()) ||
+			landing != "pdf" || finalPath == "" || strings.ContainsAny(finalPath, "?#") ||
+			finalPath != expectedURL.EscapedPath() {
+			outcome = "unknown"
+			landing = "unknown"
+			finalHost, finalPath = "", ""
+			envelopeInvalid = true
+		}
 	}
-	delete(b.offered, jobID)
-	return true, nil
+	detail := map[string]any{
+		"route_revision":   p.RouteRevision,
+		"ordinal":          p.Ordinal,
+		"drive_attempt_id": p.DriveAttemptID,
+		"safety_domain":    routeSafetyDomain(p.RouteRevision),
+		"phase":            "result",
+		"outcome":          outcome,
+		"landing_class":    landing,
+	}
+	if finalHost != "" {
+		detail["final_host"] = finalHost
+	}
+	if finalPath != "" {
+		detail["final_path"] = finalPath
+	}
+	if p.Detail != "" {
+		detail["detail"] = truncate(p.Detail, 500)
+	}
+	if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.direct_route", detail); err != nil {
+		return err
+	}
+	if envelopeInvalid {
+		if err := b.appendProviderNoPositiveLatch(ctx, jobID, routeSafetyDomain(p.RouteRevision)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validDirectResultTuple(p *protocol.ProviderDirectGetResultPayload) bool {
+	return p.DriveAttemptID != "" && p.Ordinal >= 0 && p.RouteRevision != ""
 }
 
 // handoffOutcome records an extension-reported IdP failure on a parked

@@ -243,6 +243,91 @@ func TestHandoffFocusPayloadRoundTripAndScope(t *testing.T) {
 	}
 }
 
+func TestProviderDriveEpochScopeAndOutcomes(t *testing.T) {
+	frame := func(typ string, jobID any, payload map[string]any) []byte {
+		t.Helper()
+		env := map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     typ,
+			"msg_id":   "epoch-msg-001",
+			"seq":      1,
+			"payload":  payload,
+		}
+		if jobID != nil {
+			env["job_id"] = jobID
+		}
+		data, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	base := map[string]any{
+		"drive_attempt_id": "epoch-attempt-001",
+		"ordinal":          0,
+		"strategy":         "generic",
+		"revision":         "1",
+	}
+	for _, tc := range []struct {
+		typ     string
+		outcome string
+	}{
+		{MsgProviderDriveEpochStartRequest, ""},
+		{MsgProviderDriveEpochStartResult, "started"},
+		{MsgProviderDriveEpochResultRequest, "strategy_outcome"},
+		{MsgProviderDriveEpochResult, "applied"},
+	} {
+		t.Run(tc.typ+"/valid", func(t *testing.T) {
+			payload := map[string]any{}
+			for key, value := range base {
+				payload[key] = value
+			}
+			if tc.outcome != "" {
+				payload["outcome"] = tc.outcome
+			}
+			if _, err := DecodeBrowserMessage(frame(tc.typ, "job-epoch-001", payload)); err != nil {
+				t.Fatalf("valid epoch frame rejected: %v", err)
+			}
+		})
+		for _, missing := range []struct {
+			name  string
+			jobID any
+		}{
+			{name: "missing", jobID: nil},
+			{name: "empty", jobID: ""},
+		} {
+			t.Run(tc.typ+"/job_id_"+missing.name, func(t *testing.T) {
+				payload := map[string]any{}
+				for key, value := range base {
+					payload[key] = value
+				}
+				if tc.outcome != "" {
+					payload["outcome"] = tc.outcome
+				}
+				if _, err := DecodeBrowserMessage(frame(tc.typ, missing.jobID, payload)); err == nil {
+					t.Fatalf("epoch frame with %s job_id was accepted", missing.name)
+				}
+			})
+		}
+	}
+	start := map[string]any{}
+	for key, value := range base {
+		start[key] = value
+	}
+	start["outcome"] = "applied"
+	if _, err := DecodeBrowserMessage(frame(MsgProviderDriveEpochStartResult, "job-epoch-001", start)); err == nil {
+		t.Fatal("start result accepted terminal outcome")
+	}
+	terminal := map[string]any{}
+	for key, value := range base {
+		terminal[key] = value
+	}
+	terminal["outcome"] = "started"
+	if _, err := DecodeBrowserMessage(frame(MsgProviderDriveEpochResult, "job-epoch-001", terminal)); err == nil {
+		t.Fatal("terminal result accepted start outcome")
+	}
+}
+
 func TestPageAcquirePayloadRoundTripAndValidation(t *testing.T) {
 	frame := func(typ string, payload any) []byte {
 		t.Helper()
@@ -1584,5 +1669,49 @@ func TestOriginHintRejectsUppercaseHost(t *testing.T) {
 	}
 	if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, "https://resolver.example.edu"))); err != nil {
 		t.Errorf("origin_hint %q rejected: %v", "https://resolver.example.edu", err)
+	}
+}
+
+func TestProviderDirectGetTupleValidation(t *testing.T) {
+	base := BrowserMessage{
+		Protocol: BrowserProtocolVersion,
+		Type:     MsgProviderDirectGetRequest,
+		MsgID:    "msg-direct-1",
+		JobID:    "job-direct-1",
+		Seq:      1,
+		Payload: ProviderDirectGetRequestPayload{
+			DriveAttemptID:     "attempt-0001",
+			Ordinal:            0,
+			RouteRevision:      "sage-doi-pdf/1",
+			ExpectedIdentifier: "doi:10.1234/example",
+			URL:                "https://journals.sagepub.com/doi/pdf/10.1234/example?download=true",
+			AllowedOrigin:      "https://journals.sagepub.com",
+			PathFamily:         "/doi/pdf/{doi}",
+			TermsPolicy:        "none",
+		},
+	}
+	wire, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(wire); err != nil {
+		t.Fatalf("valid direct request rejected: %v", err)
+	}
+	base.Payload = ProviderDirectGetRequestPayload{
+		DriveAttemptID:     "attempt-0001",
+		Ordinal:            0,
+		RouteRevision:      "sage-doi-pdf/1",
+		ExpectedIdentifier: "doi:10.1234/example",
+		URL:                "https://journals.sagepub.com/doi/pdf/10.1234/example?token=secret",
+		AllowedOrigin:      "https://journals.sagepub.com",
+		PathFamily:         "/doi/pdf/{doi}",
+		TermsPolicy:        "none",
+	}
+	wire, err = json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(wire); err == nil {
+		t.Fatal("secret-bearing direct URL accepted")
 	}
 }

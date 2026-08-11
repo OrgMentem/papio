@@ -402,12 +402,20 @@ export async function openHandoff(jobID: string): Promise<void> {
   throw new Error(message);
 }
 
+export interface SessionAuthDemand {
+  job_id: string;
+  origin: string;
+}
 export type PopupSessionState = KeepaliveSnapshot & {
   releasedAuthJobs: number;
   /** Epoch ms of the latest release event; the notice shows once per stamp. */
   releasedAuthJobsAt?: number | null;
   /** One independently probed state for every configured resolver origin. */
   origins?: KeepaliveOriginSnapshot[];
+  /** Browser-local bindings between authentication demand and resolver origin. */
+  authDemand?: SessionAuthDemand[];
+  /** Present on current workers; absent preserves older-worker fallback. */
+  authDemandComplete?: boolean;
 };
 
 export const SESSION_STATE_MESSAGE = "papio.session.state";
@@ -415,12 +423,30 @@ export const SESSION_PROBE_MESSAGE = "papio.session.probe";
 export const SESSION_SIGNIN_MESSAGE = "papio.session.signin";
 export const SESSION_RETRY_MESSAGE = "papio.session.retry";
 
+function isBareHTTPSOrigin(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 300) return false;
+  try {
+    const parsed = new URL(value);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.pathname === "/" &&
+      parsed.search === "" &&
+      parsed.hash === "" &&
+      parsed.host !== "" &&
+      `${parsed.protocol}//${parsed.host}` === value
+    );
+  } catch {
+    return false;
+  }
+}
+
 function isOriginSnapshot(value: unknown): value is KeepaliveOriginSnapshot {
   if (typeof value !== "object" || value === null) return false;
   const snapshot = value as Record<string, unknown>;
   return (
-    typeof snapshot["origin"] === "string" &&
-    /^https:\/\/[^/]+$/.test(snapshot["origin"]) &&
+    isBareHTTPSOrigin(snapshot["origin"]) &&
     typeof snapshot["authenticated"] === "boolean" &&
     (snapshot["verdict"] === "in" || snapshot["verdict"] === "out" || snapshot["verdict"] === "unknown") &&
     (snapshot["probeSource"] === "live_tab" ||
@@ -439,6 +465,23 @@ function isOriginSnapshot(value: unknown): value is KeepaliveOriginSnapshot {
     typeof snapshot["pausedForReauth"] === "boolean" &&
     (snapshot["lastProbeAt"] === null || typeof snapshot["lastProbeAt"] === "number")
   );
+}
+
+function isSessionAuthDemand(value: unknown): value is SessionAuthDemand {
+  if (typeof value !== "object" || value === null) return false;
+  const demand = value as Record<string, unknown>;
+  return (
+    Object.keys(demand).every((key) => key === "job_id" || key === "origin") &&
+    typeof demand["job_id"] === "string" &&
+    demand["job_id"].length > 0 &&
+    demand["job_id"].length <= 1024 &&
+    typeof demand["origin"] === "string" &&
+    isBareHTTPSOrigin(demand["origin"])
+  );
+}
+
+function isSessionAuthDemandList(value: unknown): value is SessionAuthDemand[] {
+  return Array.isArray(value) && value.every(isSessionAuthDemand);
 }
 
 function isSessionState(value: unknown): value is PopupSessionState {
@@ -467,17 +510,15 @@ function isSessionState(value: unknown): value is PopupSessionState {
     (state["lastVerdictAt"] === undefined ||
       state["lastVerdictAt"] === null ||
       typeof state["lastVerdictAt"] === "number") &&
-    (state["checking"] === undefined || typeof state["checking"] === "boolean") &&
-    (state["likelyAuthenticated"] === undefined || typeof state["likelyAuthenticated"] === "boolean") &&
+    (resolverOrigin === null || isBareHTTPSOrigin(resolverOrigin)) &&
     typeof state["pausedForReauth"] === "boolean" &&
     (state["lastProbeAt"] === null || typeof state["lastProbeAt"] === "number") &&
-    (resolverOrigin === null ||
-      (typeof resolverOrigin === "string" && /^https:\/\/[^/]+$/.test(resolverOrigin))) &&
     (state["lastAuthReturnedAt"] === null || typeof state["lastAuthReturnedAt"] === "number") &&
     typeof state["queuedAuthJobs"] === "number" &&
     Array.isArray(state["stalledAuthJobs"]) &&
     state["stalledAuthJobs"].every((jobID) => typeof jobID === "string") &&
     typeof state["releasedAuthJobs"] === "number" &&
+    (state["authDemandComplete"] === undefined || state["authDemandComplete"] === true) &&
     (state["releasedAuthJobsAt"] === undefined ||
       state["releasedAuthJobsAt"] === null ||
       typeof state["releasedAuthJobsAt"] === "number") &&
@@ -491,13 +532,37 @@ function isSessionState(value: unknown): value is PopupSessionState {
 function parseSessionReply(response: unknown): PopupSessionState | undefined {
   if (typeof response !== "object" || response === null) return undefined;
   const envelope = response as Record<string, unknown>;
-  const state = envelope["state"];
-  if (!isSessionState(state)) return undefined;
-  const origins = envelope["origins"];
-  if (origins === undefined) return state;
-  return Array.isArray(origins) && origins.every(isOriginSnapshot)
-    ? { ...state, origins }
-    : state;
+  const rawState = envelope["state"];
+  if (!isSessionState(rawState)) return undefined;
+  const state = rawState as PopupSessionState & { authDemand?: unknown };
+  const rawOrigins = envelope["origins"];
+  const envelopeOrigins =
+    Array.isArray(rawOrigins) && rawOrigins.every(isOriginSnapshot)
+      ? rawOrigins
+      : undefined;
+  const knownOrigins = new Set(
+    envelopeOrigins?.map((origin) => origin.origin) ??
+      (Array.isArray(state.origins)
+        ? state.origins.map((origin) => origin.origin)
+        : state.resolverOrigin === null || state.resolverOrigin === undefined
+          ? []
+          : [state.resolverOrigin]),
+  );
+  // Demand metadata is local decoration. A stale/older worker, a future
+  // worker's unknown origin, or malformed decoration falls back to the
+  // validated core state rather than affecting row association.
+  const validDemand =
+    state.authDemand === undefined ||
+    (isSessionAuthDemandList(state.authDemand) &&
+      state.authDemand.every((demand) => knownOrigins.has(demand.origin)));
+  const normalizedState = validDemand
+    ? state
+    : (() => {
+        const { authDemand: _ignored, ...withoutDemand } = state;
+        return withoutDemand as PopupSessionState;
+      })();
+  if (envelopeOrigins === undefined) return normalizedState;
+  return { ...normalizedState, origins: envelopeOrigins };
 }
 
 /** Pure snapshot read — never triggers a probe or content-script injection. */
@@ -780,6 +845,7 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   const stale =
     typeof lastVerdictAt !== "number" ||
     !Number.isFinite(lastVerdictAt) ||
+    Date.now() - lastVerdictAt < 0 ||
     Date.now() - lastVerdictAt > SESSION_STALE_MS;
   if (stale) {
     return {
@@ -819,8 +885,54 @@ export interface SessionRowState extends SessionCardState {
  * (sign in) or should doubt the verdict (stale evidence). */
 const SESSION_ROW_FRESH_MS = 10 * 60 * 1000;
 
-export function deriveSessionRows(state: PopupSessionState | undefined): SessionRowState[] {
-  if (state === undefined || !Array.isArray(state.origins)) return [];
+function isFreshSessionTimestamp(value: number | null | undefined, now = Date.now()): value is number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return false;
+  const age = now - value;
+  return age >= 0 && age <= SESSION_ROW_FRESH_MS;
+}
+
+
+export function deriveSessionRows(
+  state: PopupSessionState | undefined,
+  jobs: readonly ActiveJob[] = [],
+): SessionRowState[] {
+  if (
+    state === undefined ||
+    !Array.isArray(state.origins) ||
+    !state.origins.every(isOriginSnapshot)
+  ) {
+    return [];
+  }
+  const knownOrigins = new Set(state.origins.map((origin) => origin.origin));
+  const rawDemands = Array.isArray(state.authDemand) ? state.authDemand : [];
+  const demandCounts = new Map<string, number>();
+  for (const demand of rawDemands) {
+    if (typeof demand !== "object" || demand === null) continue;
+    const demandJobID = (demand as unknown as Record<string, unknown>)["job_id"];
+    if (typeof demandJobID !== "string") continue;
+    demandCounts.set(demandJobID, (demandCounts.get(demandJobID) ?? 0) + 1);
+  }
+  const validDemands = rawDemands.filter(
+    (demand) =>
+      isSessionAuthDemand(demand) &&
+      demandCounts.get(demand.job_id) === 1 &&
+      knownOrigins.has(demand.origin),
+  );
+  const demandOrigins = new Set(validDemands.map((demand) => demand.origin));
+  const demandJobIDs = new Set(validDemands.map((demand) => demand.job_id));
+  if (
+    jobs.some(
+      (job) =>
+        (job.requires_auth === true ||
+          job.status === "auth_pending" ||
+          job.waiting_for_session === true ||
+          job.engagement_required === true) &&
+        !demandJobIDs.has(job.job_id),
+    ) &&
+    demandOrigins.size === 0
+  ) {
+    return [];
+  }
   return state.origins
     .map((originState) => {
       const card = deriveSessionCardState({
@@ -831,11 +943,13 @@ export function deriveSessionRows(state: PopupSessionState | undefined): Session
       return { origin: originState.origin, ...card };
     })
     .filter((row) => {
+      // While work is actively waiting on one or more institutions, only
+      // those exact origin rows may share the card. This keeps an inactive
+      // origin's stale evidence from reading as the waiting job's blocker.
+      if (demandOrigins.size > 0 && !demandOrigins.has(row.origin)) return false;
       if (row.action !== "none") return true;
       const verifiedAt = state.origins?.find((o) => o.origin === row.origin)?.lastVerdictAt;
-      return (
-        typeof verifiedAt !== "number" || Date.now() - verifiedAt > SESSION_ROW_FRESH_MS
-      );
+      return demandOrigins.has(row.origin) || !isFreshSessionTimestamp(verifiedAt);
     });
 }
 
@@ -923,14 +1037,17 @@ function renderSessionRows(
   });
 }
 
-function scheduleSessionProbeRetry(state: PopupSessionState | undefined): void {
+function scheduleSessionProbeRetry(
+  state: PopupSessionState | undefined,
+  jobs: readonly ActiveJob[] = [],
+): void {
   clearTimeout(sessionProbeRetryTimer);
   sessionProbeRetryTimer = undefined;
   if (state?.checking !== true) return;
   sessionProbeRetryTimer = setTimeout(() => {
     sessionProbeRetryTimer = undefined;
     void requestSessionState().then((next) => {
-      if (next !== undefined) renderInstitutionSession(document, next);
+      if (next !== undefined) renderInstitutionSession(document, next, openInstitutionSignIn, jobs);
     });
   }, 2_000);
   (sessionProbeRetryTimer as unknown as { unref?: () => void }).unref?.();
@@ -941,6 +1058,7 @@ export function renderInstitutionSession(
   doc: Document,
   state: PopupSessionState | undefined,
   onSignIn: (origin?: string) => Promise<void> = openInstitutionSignIn,
+  jobs: readonly ActiveJob[] = [],
 ): void {
   const card = doc.getElementById("institution-session");
   const status = doc.getElementById("institution-session-status");
@@ -979,14 +1097,12 @@ export function renderInstitutionSession(
     state.origins === undefined || state.origins.length === 0
       ? (() => {
           const legacy = deriveSessionCardState(state);
-          const fresh =
-            typeof state.lastVerdictAt === "number" &&
-            Date.now() - state.lastVerdictAt <= SESSION_ROW_FRESH_MS;
+          const fresh = isFreshSessionTimestamp(state.lastVerdictAt);
           return legacy.action === "none" && fresh
             ? []
             : [{ origin: state.resolverOrigin ?? "", ...legacy }];
         })()
-      : deriveSessionRows(state);
+      : deriveSessionRows(state, jobs);
   const waitingVisible = waiting instanceof HTMLElement && waiting.hidden === false;
   const noticeVisible = Math.max(0, Math.trunc(state.releasedAuthJobs)) > 0;
   // Calm steady state — every session warm and fresh, nothing waiting, no
@@ -1094,6 +1210,7 @@ function renderWaitingOnSignIn(
   doc: Document,
   jobs: readonly ActiveJob[],
   onFocus: (jobID: string) => Promise<void>,
+  authDemand: readonly SessionAuthDemand[] = [],
 ): void {
   const card = doc.getElementById("institution-session");
   const waiting = doc.getElementById("institution-session-waiting");
@@ -1127,13 +1244,18 @@ function renderWaitingOnSignIn(
     if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
     if (rows instanceof HTMLElement) rows.hidden = true;
   }
-
   for (const job of jobs) {
     const row = doc.createElement("div");
     row.className = "action-row institution-session-waiting-row";
     const paper = doc.createElement("p");
     paper.className = "institution-session-waiting-title";
     paper.textContent = handoffPaperLabel(job);
+    const matchingDemands = authDemand.filter((entry) => entry.job_id === job.job_id);
+    const demand =
+      matchingDemands.length === 1 && isSessionAuthDemand(matchingDemands[0])
+        ? matchingDemands[0]
+        : undefined;
+    const demandHost = demand === undefined ? undefined : resolverHost(demand.origin);
     if (job.waiting_for_session === true) {
       // This paper is not waiting on the operator: it deferred to a sibling
       // paper's tab already at the institution's login page, and resumes on
@@ -1141,7 +1263,10 @@ function renderWaitingOnSignIn(
       // operator to a page they have no reason to act on.
       const status = doc.createElement("p");
       status.className = "institution-session-waiting-status";
-      status.textContent = "Waiting for the institution sign-in — another paper's tab is at the login page";
+      status.textContent =
+        demandHost === undefined
+          ? "Waiting for the institution sign-in — another paper's tab is at the login page"
+          : `Waiting for ${demandHost} sign-in — another paper's tab is at the login page`;
       row.append(paper, status);
       list.append(row);
       continue;
@@ -1194,6 +1319,7 @@ export function renderNeedsAttention(
   authStalledJobs: readonly string[] = [],
   onRetry: (jobID: string) => Promise<void> = retryAuthStalled,
   onGrantProvider: (host: string) => Promise<boolean> = grantProviderAccess,
+  authDemand: readonly SessionAuthDemand[] = [],
 ): void {
   const section = doc.getElementById("needs-you-section");
   const heading = doc.getElementById("needs-you-heading");
@@ -1212,7 +1338,7 @@ export function renderNeedsAttention(
       (job.status === "auth_pending" || job.engagement_required === true) &&
       job.challenge_blocked !== true,
   );
-  renderWaitingOnSignIn(doc, pending, onFocus);
+  renderWaitingOnSignIn(doc, pending, onFocus, authDemand);
   const challengeJobs = jobs.filter(
     (job) =>
       job.challenge_blocked === true &&
@@ -1354,6 +1480,7 @@ export function wireInboxLauncher(
     button.disabled = true;
     if (status) status.textContent = "Opening inbox…";
     void onOpen()
+
       .then(() => {
         // Chrome dismisses the popup when the new tab takes focus; Firefox
         // keeps it open, so close it explicitly once the inbox is open.
@@ -1892,6 +2019,49 @@ function normalizedPDFURL(value: string | undefined): string | undefined {
   }
 }
 
+export type PopupSessionWarmth = boolean | PopupSessionState | undefined;
+
+/** Resolve the warm-session override for one live job without borrowing
+ * freshness from another demanded institution. */
+export function sessionWarmForJob(
+  sessionOrLegacyWarmth: PopupSessionWarmth,
+  jobID: string,
+  requiresOriginBinding = false,
+): boolean {
+  if (typeof sessionOrLegacyWarmth === "boolean") return sessionOrLegacyWarmth;
+  const session = sessionOrLegacyWarmth;
+  const legacyWarmth =
+    (session?.origins ?? []).some(
+      (origin) => origin.verdict === "in" && isFreshSessionTimestamp(origin.lastVerdictAt),
+    ) || session?.authenticated === true;
+  const rawDemands = session?.authDemand;
+  const matchingDemands = Array.isArray(rawDemands)
+    ? rawDemands.filter((entry) => {
+        if (typeof entry !== "object" || entry === null) return false;
+        return (entry as unknown as Record<string, unknown>)["job_id"] === jobID;
+      })
+    : [];
+  if (matchingDemands.length === 0) {
+    if (requiresOriginBinding && session?.authDemandComplete === true) return false;
+    return legacyWarmth;
+  }
+  if (matchingDemands.length !== 1) return false;
+  const demand = matchingDemands[0];
+  if (!isSessionAuthDemand(demand)) return false;
+  const matchingOrigins = (session?.origins ?? []).filter(
+    (origin) => origin.origin === demand.origin,
+  );
+  if (matchingOrigins.length !== 1) return false;
+  const demandedOrigin = matchingOrigins[0];
+  if (demandedOrigin === undefined) return false;
+  return (
+    demandedOrigin.verdict === "in" &&
+    demandedOrigin.authenticated === true &&
+    demandedOrigin.checking === false &&
+    isFreshSessionTimestamp(demandedOrigin.lastVerdictAt)
+  );
+}
+
 export function renderPageContext(
   doc: Document,
   page: PageMetadata | undefined,
@@ -1899,7 +2069,7 @@ export function renderPageContext(
   pendingDelivery?: PendingDelivery,
   activityEntries: readonly ActivityEntryPayload[] = [],
   liveActions: PopupLiveActions = {},
-  sessionWarm = false,
+  sessionWarm: PopupSessionWarmth = false,
 ): void {
   const section = doc.getElementById("page-acquire");
   const status = doc.getElementById("page-acquire-status");
@@ -1940,7 +2110,13 @@ export function renderPageContext(
         delivery,
         liveActions,
         page?.tab_id,
-        sessionWarm,
+        sessionWarmForJob(
+          sessionWarm,
+          knownJob.job_id,
+          knownJob.requires_auth === true ||
+            knownJob.status === "auth_pending" ||
+            knownJob.waiting_for_session === true,
+        ),
       );
       section.hidden = false;
     } else {
@@ -1976,7 +2152,13 @@ export function renderPageContext(
     pendingDelivery,
     liveActions,
     page?.tab_id,
-    sessionWarm,
+    sessionWarmForJob(
+      sessionWarm,
+      inFlightJob.job_id,
+      inFlightJob.requires_auth === true ||
+        inFlightJob.status === "auth_pending" ||
+        inFlightJob.waiting_for_session === true,
+    ),
   );
   section.hidden = false;
 }
@@ -2059,13 +2241,6 @@ export async function refresh(): Promise<void> {
       })(),
     ]);
   if (freshActivity !== undefined) popupActivity = freshActivity;
-  const sessionWarm =
-    (session?.origins ?? []).some(
-      (o) =>
-        o.verdict === "in" &&
-        typeof o.lastVerdictAt === "number" &&
-        Date.now() - o.lastVerdictAt <= SESSION_ROW_FRESH_MS,
-    ) || session?.authenticated === true;
   renderPageContext(
     document,
     pageMetadata,
@@ -2073,10 +2248,10 @@ export async function refresh(): Promise<void> {
     delivery,
     popupActivity,
     {},
-    sessionWarm,
+    session,
   );
-  renderInstitutionSession(document, session);
-  scheduleSessionProbeRetry(session);
+  renderInstitutionSession(document, session, openInstitutionSignIn, store.activeJobs);
+  scheduleSessionProbeRetry(session, store.activeJobs);
   renderLeftoverTabs(document, orphanCount);
   renderNeedsAttention(
     document,
@@ -2091,6 +2266,7 @@ export async function refresh(): Promise<void> {
       if (granted) await refresh();
       return granted;
     },
+    session?.authDemand ?? [],
   );
   renderTermsConsent(document, store.activeJobs, consent, (value) => {
     void sendTermsConsent(value).then(() => refresh());

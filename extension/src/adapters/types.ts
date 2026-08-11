@@ -28,17 +28,88 @@ export interface ClassifyRule {
    * (compared lowercased). Static labels only — never page-derived text. */
   textAny?: string[];
 }
+/** Shared rule-readiness predicate used by synchronous classifier tests and by
+ * the injected planner's equivalent. A rule is complete only when every
+ * declared selector/text guard is satisfied; an empty rule never authorizes a
+ * verdict. */
+export function isClassifyRuleReady(doc: Document, rule: ClassifyRule): boolean {
+  const hasAll = Array.isArray(rule.all) && rule.all.length > 0;
+  const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
+  const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
+  if (!hasAll && !hasAny && !hasText) return false;
+  if (hasAll && (rule.all as string[]).some((selector) => {
+    try {
+      return doc.querySelector(selector) === null;
+    } catch {
+      return true;
+    }
+  })) return false;
+  if (hasAny && !(rule.any as string[]).some((selector) => {
+    try {
+      return doc.querySelector(selector) !== null;
+    } catch {
+      return false;
+    }
+  })) return false;
+  if (hasText) {
+    const bodyText = (doc.body?.innerText ?? "").toLowerCase();
+    if (!(rule.textAny as string[]).some((needle) => bodyText.includes(needle.toLowerCase()))) return false;
+  }
+  return true;
+}
+
+export interface WorkEvidenceContract {
+  /** Exact packaged page-side identity evidence for the requested work. */
+  kind: "doi" | "title";
+  selector: string;
+  attribute: string;
+  /** Optional extraction pattern; group 1 is the identity value. */
+  pattern?: string;
+}
+
+export interface DownloadDestinationContract {
+  /** Exact HTTPS origin authorized by the packaged adapter. */
+  origin: string;
+  /** Explicit path prefix authorized on that origin. */
+  pathPrefix: string;
+}
+
+export interface DownloadTargetContract {
+  /**
+   * The packaged adapter's declared relation between the selected effect and
+   * the requested work. `doi` reads an exact identifier from the selected
+   * element; `opaque` is reserved for provider controls whose identity is
+   * intentionally not URL-shaped, and means the selector itself is the
+   * provider's work-bound control.
+  */
+  kind: "doi" | "opaque";
+  /** Optional exact element carrying the target identity; defaults to the
+   * selected action element. */
+  selector?: string;
+  /** Attribute carrying the DOI when kind is `doi` (for example `data-doi`,
+   * `content`, or `href`). Omitted for opaque provider controls. */
+  attribute?: string;
+  /** Optional explicit extraction pattern for a DOI-bearing attribute. The
+   * first capture group is the DOI; no URL inference is performed otherwise. */
+  pattern?: string;
+}
 
 export interface DownloadRule {
   selector: string;
   requireKind: "article";
+  /** Explicitly binds the selected effect to the requested work. */
+  workTarget?: DownloadTargetContract;
   /** `href` extracts an HTTPS anchor and uses chrome.downloads.download.
    * `click` activates the explicitly selected element (or an explicitly
    * selected control in its open shadow root).
    * `url` constructs the direct PDF endpoint from the page URL (idPattern +
    * urlTemplate) and fetches it via chrome.downloads.download — no click, no
    * gesture. The privileged downloads API carries the session cookies, so an
-   * entitled endpoint (e.g. JSTOR /stable/pdf/<id>.pdf) is fetched autonomously. */
+   * entitled endpoint (e.g. JSTOR /stable/pdf/<id>.pdf) is fetched
+   * autonomously. */
+  /** Page-derived href/meta destinations require this packaged envelope when
+   * they leave the current page origin. */
+  allowedDestinations?: DownloadDestinationContract[];
   method: "href" | "click" | "url" | "api" | "meta";
   shadowSelector?: string;
   /** Wait for this fixture-backed in-page gate before reclassification. */
@@ -64,8 +135,8 @@ export interface DownloadRule {
   /** method "api": field in the urlTemplate JSON response holding the PDF URL. */
   jsonField?: string;
   /** method "meta": name of the page meta tag whose content is the entitled PDF
-   * URL (default "citation_pdf_url", the Highwire/Google-Scholar standard that
-   * Elsevier/ScienceDirect and others expose). The URL is fetched via the
+   * URL (default "citation_pdf_url", the Highwire/Google-Scholar standard
+   * that Elsevier/ScienceDirect and others expose). The URL is fetched via the
    * privileged downloads API — no click, no gesture — like the "url" method. */
   metaName?: string;
 }
@@ -76,6 +147,8 @@ export interface AdapterSpec {
   hosts: string[];
   /** Ordered rules; first match wins. */
   classify: ClassifyRule[];
+  /** Exact packaged page evidence used to bind expected DOI/title identity. */
+  workEvidence?: WorkEvidenceContract;
   /** On live SPA pages only, wait this long for a complete rule's declared
    * selectors to hydrate before classifying. Fixture Documents stay synchronous. */
   settleTimeoutMs?: number;
@@ -94,8 +167,8 @@ export interface AdapterSpec {
    * leaving credential entry to the human. Absent = surface the wall as-is. */
   federatedLogin?: string;
   /** Query param this provider's openurl handler needs to unlock institutional
-   * access (ProQuest: "accountid"). On a `login` verdict, if the offer carries a
-   * provider account id, papio appends `?<param>=<id>` to the current URL —
+   * access (ProQuest: "accountid"). On a `login` verdict, if the offer carries
+   * a provider account id, papio appends `?<param>=<id>` to the current URL —
    * fully autonomous, no sign-in. Tried before federatedLogin. */
   accountIdParam?: string;
 }
@@ -243,11 +316,17 @@ export function interpret(
     for (const rule of spec.classify) {
       const hasAll = Array.isArray(rule.all) && rule.all.length > 0;
       const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
-      if (!hasAll && !hasAny) continue;
+      const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
+      if (!hasAll && !hasAny && !hasText) continue;
       let allReady = true;
       if (hasAll) {
         for (const selector of rule.all as string[]) {
-          if (root.querySelector(selector) === null) {
+          try {
+            if (root.querySelector(selector) === null) {
+              allReady = false;
+              break;
+            }
+          } catch {
             allReady = false;
             break;
           }
@@ -257,13 +336,28 @@ export function interpret(
       if (hasAny) {
         anyReady = false;
         for (const selector of rule.any as string[]) {
-          if (root.querySelector(selector) !== null) {
-            anyReady = true;
+          try {
+            if (root.querySelector(selector) !== null) {
+              anyReady = true;
+              break;
+            }
+          } catch {
+            // Invalid alternatives cannot authorize a ready rule.
+          }
+        }
+      }
+      let textReady = true;
+      if (hasText) {
+        textReady = false;
+        const bodyText = (root.body?.innerText ?? "").toLowerCase();
+        for (const needle of rule.textAny as string[]) {
+          if (bodyText.includes(needle.toLowerCase())) {
+            textReady = true;
             break;
           }
         }
       }
-      if (allReady && anyReady) return true;
+      if (allReady && anyReady && textReady) return true;
     }
     return false;
   };
@@ -325,6 +419,8 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a[id^='downloadPDFLink_']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
+      allowedDestinations: [{ origin: "https://media.proquest.com", pathPrefix: "/media/" }],
       method: "href",
     },
     // On the login wall, route straight to the institution's Shibboleth login
@@ -359,6 +455,12 @@ export const adapters: AdapterSpec[] = [
     id: "jstor",
     version: "0.3.0",
     hosts: ["jstor.org"],
+    workEvidence: {
+      kind: "doi",
+      selector:
+        "mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']",
+      attribute: "data-doi",
+    },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -382,6 +484,8 @@ export const adapters: AdapterSpec[] = [
       selector:
         "mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
+      allowedDestinations: [{ origin: "https://www.jstor.org", pathPrefix: "/stable/pdf/" }],
       method: "url",
       idPattern: "^https://www\\.jstor\\.org/stable/(?:pdf/)?(\\d+)",
       urlTemplate: "https://www.jstor.org/stable/pdf/{id}.pdf?acceptTC=1",
@@ -403,6 +507,7 @@ export const adapters: AdapterSpec[] = [
     id: "informit",
     version: "0.1.0",
     hosts: ["search.informit.org"],
+    workEvidence: { kind: "doi", selector: "[data-doi]", attribute: "data-doi" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -424,6 +529,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a.pdf-button[href^='/doi/pdf/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "click",
     },
     termsAccept: {
@@ -455,6 +561,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a.anchor-tag-style[href*='/discovery/sourceRecord']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -489,6 +596,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a[data-testid='pdf-download-link'][href*='/service/content/pdf/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -498,6 +606,7 @@ export const adapters: AdapterSpec[] = [
     id: "ebsco",
     version: "0.2.0",
     hosts: ["research.ebsco.com"],
+    workEvidence: { kind: "title", selector: "meta[name='citation_title']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -526,6 +635,7 @@ export const adapters: AdapterSpec[] = [
       // gate is the viewer URL, whose opid/recordId build the aggregator call.
       selector: "meta[name='citation_title']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "api",
       idPattern: "/c/([^/]+)/viewer/pdf/([^/?#]+)",
       urlTemplate:
@@ -539,6 +649,7 @@ export const adapters: AdapterSpec[] = [
     id: "springer",
     version: "0.1.0",
     hosts: ["link.springer.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 3000,
     classify: [
       {
@@ -559,6 +670,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a[data-test='pdf-link'][href*='/content/pdf/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -577,6 +689,7 @@ export const adapters: AdapterSpec[] = [
     id: "acm",
     version: "0.2.0",
     hosts: ["dl.acm.org"],
+    workEvidence: { kind: "doi", selector: "meta[name='publication_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -587,6 +700,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a.btn--eReader[href*='/doi/epdf/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "url",
       idPattern: "/doi/(?:abs/|full/|epdf/|pdf/)?(10\\.[0-9]+/[^?#]+)",
       urlTemplate: "https://dl.acm.org/doi/pdf/{1}?download=true",
@@ -612,6 +726,7 @@ export const adapters: AdapterSpec[] = [
     id: "sciencedirect",
     version: "0.4.0",
     hosts: ["sciencedirect.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -629,6 +744,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdfft']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "click",
     },
   },
@@ -645,6 +761,7 @@ export const adapters: AdapterSpec[] = [
     id: "wiley",
     version: "0.2.0",
     hosts: ["onlinelibrary.wiley.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='publication_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -655,6 +772,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "meta[name='citation_pdf_url']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "url",
       viewerPathPattern: "/doi/epdf/",
       // Wiley article/abstract/viewer paths all carry the DOI after /doi/[seg/].
@@ -669,6 +787,7 @@ export const adapters: AdapterSpec[] = [
     id: "sage",
     version: "0.2.0",
     hosts: ["journals.sagepub.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='publication_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -679,6 +798,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "section.format--pdf_epub",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "url",
       idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
       urlTemplate: "https://journals.sagepub.com/doi/pdf/{1}?download=true",
@@ -694,6 +814,7 @@ export const adapters: AdapterSpec[] = [
     id: "psycnet",
     version: "0.1.0",
     hosts: ["psycnet.apa.org", "doi.apa.org"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -714,6 +835,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a#pdf[href*='/fulltext/'][href$='.pdf']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -727,6 +849,7 @@ export const adapters: AdapterSpec[] = [
     id: "annualreviews",
     version: "0.1.0",
     hosts: ["annualreviews.org"],
+    workEvidence: { kind: "title", selector: "meta[name='citation_title']", attribute: "content" },
     classify: [
       {
         kind: "article",
@@ -741,6 +864,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "form.ft-download-content__form--pdf a[aria-label='Download PDF']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "click",
     },
   },
@@ -765,6 +889,7 @@ export const adapters: AdapterSpec[] = [
     id: "tandfonline",
     version: "0.2.0",
     hosts: ["tandfonline.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='publication_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -783,6 +908,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: ".downloadPDFLink a.show-pdf[href*='/doi/pdf/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -811,6 +937,7 @@ export const adapters: AdapterSpec[] = [
     id: "emerald",
     version: "0.2.0",
     hosts: ["emerald.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -836,6 +963,7 @@ export const adapters: AdapterSpec[] = [
       selector:
         "a.article-pdfLink[data-doctype='contentPdf'][href*='/article-pdf/'], a.intent_pdf_link[href*='/insight/content/doi/'][href*='/full/pdf']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -848,6 +976,7 @@ export const adapters: AdapterSpec[] = [
     id: "cambridge",
     version: "0.1.0",
     hosts: ["cambridge.org"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -870,6 +999,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a[href*='/core/services/aop-cambridge-core/content/view/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -883,6 +1013,7 @@ export const adapters: AdapterSpec[] = [
     id: "thieme",
     version: "0.1.0",
     hosts: ["thieme-connect.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     classify: [
       {
         kind: "article",
@@ -896,6 +1027,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a#pdfLink[href*='/products/ejournals/pdf/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -910,6 +1042,7 @@ export const adapters: AdapterSpec[] = [
     id: "nature",
     version: "0.1.0",
     hosts: ["nature.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -931,6 +1064,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a[data-test='download-pdf'][data-article-pdf='true']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -944,6 +1078,7 @@ export const adapters: AdapterSpec[] = [
     id: "oup",
     version: "0.1.0",
     hosts: ["academic.oup.com"],
+    workEvidence: { kind: "title", selector: "meta[name='citation_title']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -965,6 +1100,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a.article-pdfLink[href*='/article-pdf/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -977,6 +1113,7 @@ export const adapters: AdapterSpec[] = [
     id: "mitpress",
     version: "0.1.0",
     hosts: ["direct.mit.edu"],
+    workEvidence: { kind: "title", selector: "meta[name='citation_title']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -998,6 +1135,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a.article-pdfLink[href*='/article-pdf/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -1011,6 +1149,7 @@ export const adapters: AdapterSpec[] = [
     id: "bmj",
     version: "0.1.0",
     hosts: ["bmj.com"],
+    workEvidence: { kind: "title", selector: "meta[name='citation_title']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -1026,6 +1165,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a.article-pdf-download[href$='.full.pdf']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -1038,6 +1178,7 @@ export const adapters: AdapterSpec[] = [
     id: "psychiatryonline",
     version: "0.1.0",
     hosts: ["psychiatryonline.org"],
+    workEvidence: { kind: "doi", selector: "meta[name='publication_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -1059,6 +1200,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a#downloadPdfUrl[data-doi]",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },
@@ -1072,7 +1214,7 @@ export const adapters: AdapterSpec[] = [
     id: "jamanetwork",
     version: "0.1.0",
     hosts: ["jamanetwork.com"],
-    settleTimeoutMs: 5000,
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     classify: [
       {
         kind: "article",
@@ -1088,6 +1230,7 @@ export const adapters: AdapterSpec[] = [
       selector:
         "a#pdf-link.pdfaccess[data-article-url$='.pdf'][data-ajax-url='/Content/CheckPdfAccess']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "click",
     },
   },
@@ -1100,7 +1243,7 @@ export const adapters: AdapterSpec[] = [
     id: "lww",
     version: "0.1.0",
     hosts: ["journals.lww.com"],
-    settleTimeoutMs: 5000,
+    workEvidence: { kind: "doi", selector: "meta[name='wkhealth_doi']", attribute: "content" },
     classify: [
       {
         kind: "article",
@@ -1114,6 +1257,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "meta[name='wkhealth_pdf_url']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "meta",
       metaName: "wkhealth_pdf_url",
     },
@@ -1128,6 +1272,7 @@ export const adapters: AdapterSpec[] = [
     id: "hal",
     version: "0.1.0",
     hosts: ["hal.science"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     classify: [
       {
         kind: "article",
@@ -1141,6 +1286,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "meta[name='citation_pdf_url']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "meta",
       metaName: "citation_pdf_url",
     },
@@ -1154,6 +1300,7 @@ export const adapters: AdapterSpec[] = [
     id: "mdpi",
     version: "0.1.0",
     hosts: ["mdpi.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     classify: [
       {
         kind: "article",
@@ -1168,6 +1315,8 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a.UD_ArticlePDF[href*='/pdf']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
+      allowedDestinations: [{ origin: "https://www.mdpi.com", pathPrefix: "/" }],
       method: "href",
     },
   },
@@ -1181,6 +1330,7 @@ export const adapters: AdapterSpec[] = [
     id: "hogrefe",
     version: "0.1.0",
     hosts: ["econtent.hogrefe.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='publication_doi']", attribute: "content" },
     classify: [
       {
         kind: "article",
@@ -1195,6 +1345,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a[href^='/doi/pdf/']",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "href",
     },
   },

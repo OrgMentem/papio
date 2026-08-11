@@ -4,6 +4,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,24 +30,31 @@ var (
 )
 
 type adapterRepairCapture struct {
-	Path           string
-	Provider       string
-	Scenario       string
-	Host           string
-	Origin         string
-	Captured       time.Time
-	AdapterVersion string
+	Path                string
+	Provider            string
+	Scenario            string
+	Host                string
+	Origin              string
+	Captured            time.Time
+	AdapterVersion      string
+	SHA256              string
+	SanitizerProvenance string
+	SanitizerVersion    string
+	IndependentEvidence bool
 }
-
 type adapterRepairMetadata struct {
-	Provider       string    `json:"provider,omitempty"`
-	AdapterID      string    `json:"adapter_id,omitempty"`
-	Scenario       string    `json:"scenario,omitempty"`
-	Host           string    `json:"host,omitempty"`
-	Origin         string    `json:"origin,omitempty"`
-	Captured       time.Time `json:"captured,omitempty"`
-	Timestamp      time.Time `json:"timestamp,omitempty"`
-	AdapterVersion string    `json:"adapter_version,omitempty"`
+	Provider            string    `json:"provider,omitempty"`
+	AdapterID           string    `json:"adapter_id,omitempty"`
+	Scenario            string    `json:"scenario,omitempty"`
+	Host                string    `json:"host,omitempty"`
+	Origin              string    `json:"origin,omitempty"`
+	Captured            time.Time `json:"captured,omitempty"`
+	Timestamp           time.Time `json:"timestamp,omitempty"`
+	AdapterVersion      string    `json:"adapter_version,omitempty"`
+	SHA256              string    `json:"sha256,omitempty"`
+	SanitizerProvenance string    `json:"sanitizer_provenance,omitempty"`
+	SanitizerVersion    string    `json:"sanitizer_version,omitempty"`
+	IndependentEvidence bool      `json:"independent_evidence,omitempty"`
 }
 
 type adapterRepairRunner interface {
@@ -66,12 +75,12 @@ type adapterRepairDeps struct {
 	Run      adapterRepairRunner
 	RepoRoot string
 }
-
 type adapterRepairResult struct {
-	Workspace    string `json:"workspace"`
-	Fixture      string `json:"fixture"`
-	Report       string `json:"report"`
-	NextRevision string `json:"next_revision"`
+	Workspace           string `json:"workspace"`
+	Fixture             string `json:"fixture"`
+	Report              string `json:"report"`
+	NextRevision        string `json:"next_revision"`
+	IndependentEvidence bool   `json:"independent_evidence"`
 }
 
 func newAdapterRepairCommand(opt *options) *cobra.Command {
@@ -104,21 +113,14 @@ func newAdapterRepairCommand(opt *options) *cobra.Command {
 			return err
 		},
 	}
-	command.Flags().StringVar(&provider, "provider", "", "provider adapter id (required when capture metadata is absent)")
-	command.Flags().StringVar(&scenario, "scenario", "", "fixture scenario (required when capture metadata is absent)")
+	command.Flags().StringVar(&provider, "provider", "", "provider adapter id (must match daemon capture metadata)")
+	command.Flags().StringVar(&scenario, "scenario", "", "fixture scenario (must match daemon capture metadata)")
 	return command
 }
 
 func resolveAdapterRepairCapture(ctx context.Context, opt *options, input, providerFlag, scenarioFlag string) (adapterRepairCapture, error) {
-	if info, err := os.Stat(input); err == nil {
-		if !info.Mode().IsRegular() {
-			return adapterRepairCapture{}, fmt.Errorf("capture path %q is not a regular file", input)
-		}
-		return loadAdapterRepairCapture(input, providerFlag, scenarioFlag)
-	} else if filepath.IsAbs(input) {
-		return adapterRepairCapture{}, fmt.Errorf("capture %q: %w", input, err)
-	}
-
+	// A path is only an identifier for a row returned by the daemon. Reading
+	// an arbitrary local file would let secrets bypass the daemon sanitizer.
 	var rows []captures.Capture
 	if err := opt.call(ctx, "adapter.captures.list", struct{}{}, &rows); err != nil {
 		return adapterRepairCapture{}, err
@@ -132,7 +134,7 @@ func resolveAdapterRepairCapture(ctx context.Context, opt *options, input, provi
 		}
 	}
 	if len(matches) == 0 {
-		return adapterRepairCapture{}, fmt.Errorf("no stored capture matches %q", input)
+		return adapterRepairCapture{}, fmt.Errorf("no daemon-stored capture matches %q; raw local HTML is not accepted", input)
 	}
 	if len(matches) > 1 {
 		return adapterRepairCapture{}, fmt.Errorf("capture prefix %q is ambiguous (%d matches)", input, len(matches))
@@ -141,78 +143,99 @@ func resolveAdapterRepairCapture(ctx context.Context, opt *options, input, provi
 	if row.Path == "" {
 		return adapterRepairCapture{}, errors.New("stored capture has no path")
 	}
+	if strings.TrimSpace(row.SHA256) == "" || !validSHA256(row.SHA256) {
+		return adapterRepairCapture{}, errors.New("stored capture has missing or invalid content SHA-256")
+	}
+	if row.SanitizerProvenance != captures.SanitizerProvenance || row.SanitizerVersion != captures.SanitizerVersion {
+		return adapterRepairCapture{}, errors.New("stored capture has missing or unsupported sanitizer provenance")
+	}
 	provider := strings.TrimSpace(providerFlag)
+	if provider != "" && provider != strings.TrimSpace(row.AdapterID) {
+		return adapterRepairCapture{}, errors.New("provider override conflicts with daemon capture metadata")
+	}
 	if provider == "" {
 		provider = strings.TrimSpace(row.AdapterID)
 	}
 	scenario := strings.TrimSpace(scenarioFlag)
+	if scenario != "" && scenario != strings.TrimSpace(row.Scenario) {
+		return adapterRepairCapture{}, errors.New("scenario override conflicts with daemon capture metadata")
+	}
 	if scenario == "" {
 		scenario = strings.TrimSpace(row.Scenario)
 	}
-	return finishAdapterRepairCapture(row.Path, adapterRepairCapture{
-		Path:           row.Path,
-		Provider:       provider,
-		Scenario:       scenario,
-		Host:           row.Host,
-		Captured:       row.Timestamp,
-		AdapterVersion: row.AdapterVersion,
-	})
+	capture := adapterRepairCapture{
+		Path: row.Path, Provider: provider, Scenario: scenario, Host: row.Host,
+		Captured: row.Timestamp, AdapterVersion: row.AdapterVersion, SHA256: row.SHA256,
+		SanitizerProvenance: row.SanitizerProvenance, SanitizerVersion: row.SanitizerVersion,
+		IndependentEvidence: row.IndependentEvidence,
+	}
+	if err := validateDaemonCaptureRow(capture); err != nil {
+		return adapterRepairCapture{}, err
+	}
+	return finishAdapterRepairCapture(row.Path, capture)
 }
 
-func loadAdapterRepairCapture(path, providerFlag, scenarioFlag string) (adapterRepairCapture, error) {
-	capture := adapterRepairCapture{Path: path}
-	if info, err := os.Stat(path); err == nil {
-		capture.Captured = info.ModTime().UTC()
+func validSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
 	}
-	capture.Host = filepath.Base(filepath.Dir(path))
-	for _, metadataPath := range []string{
-		strings.TrimSuffix(path, filepath.Ext(path)) + ".json",
-		path + ".observed.json",
-		filepath.Join(filepath.Dir(path), "observed.json"),
-	} {
-		data, err := os.ReadFile(metadataPath)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return adapterRepairCapture{}, fmt.Errorf("read capture metadata %q: %w", metadataPath, err)
-		}
-		var metadata adapterRepairMetadata
-		if err := json.Unmarshal(data, &metadata); err != nil {
-			return adapterRepairCapture{}, fmt.Errorf("decode capture metadata %q: %w", metadataPath, err)
-		}
-		if metadata.Provider != "" {
-			capture.Provider = metadata.Provider
-		}
-		if metadata.AdapterID != "" {
-			capture.Provider = metadata.AdapterID
-		}
-		if metadata.Scenario != "" {
-			capture.Scenario = metadata.Scenario
-		}
-		if metadata.Host != "" {
-			capture.Host = metadata.Host
-		}
-		if metadata.Origin != "" {
-			capture.Origin = metadata.Origin
-		}
-		if !metadata.Captured.IsZero() {
-			capture.Captured = metadata.Captured.UTC()
-		}
-		if !metadata.Timestamp.IsZero() {
-			capture.Captured = metadata.Timestamp.UTC()
-		}
-		if metadata.AdapterVersion != "" {
-			capture.AdapterVersion = metadata.AdapterVersion
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
 		}
 	}
-	if providerFlag != "" {
-		capture.Provider = providerFlag
+	return true
+}
+
+func validateDaemonCaptureRow(capture adapterRepairCapture) error {
+	info, err := os.Lstat(capture.Path)
+	if err != nil {
+		return fmt.Errorf("read daemon capture %q: %w", capture.Path, err)
 	}
-	if scenarioFlag != "" {
-		capture.Scenario = scenarioFlag
+	if !info.Mode().IsRegular() {
+		return errors.New("daemon capture path is no longer a regular canonical file")
 	}
-	return finishAdapterRepairCapture(path, capture)
+	data, err := os.ReadFile(capture.Path)
+	if err != nil {
+		return fmt.Errorf("read daemon capture %q: %w", capture.Path, err)
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != strings.ToLower(capture.SHA256) {
+		return errors.New("daemon capture content SHA-256 does not match its list row")
+	}
+	if !captures.IsSanitizedFixture(data) {
+		return errors.New("daemon capture is missing its canonical extension-sanitized fixture header")
+	}
+	first, _, _ := strings.Cut(string(data), "\n")
+	header := adapterFixtureHeaderRE.FindStringSubmatch(strings.TrimSuffix(first, "\r"))
+	if len(header) != 5 || header[1] != capture.Provider || header[2] != capture.Scenario {
+		return errors.New("daemon capture fixture header does not match its canonical list row")
+	}
+	metadataPath := strings.TrimSuffix(capture.Path, filepath.Ext(capture.Path)) + ".json"
+	metadataInfo, err := os.Lstat(metadataPath)
+	if err != nil {
+		return fmt.Errorf("read daemon capture metadata: %w", err)
+	}
+	if !metadataInfo.Mode().IsRegular() {
+		return errors.New("daemon capture metadata path is not a regular canonical file")
+	}
+	metadataBytes, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return fmt.Errorf("read daemon capture metadata: %w", err)
+	}
+	var metadata adapterRepairMetadata
+	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+		return fmt.Errorf("decode daemon capture metadata: %w", err)
+	}
+	if metadata.SHA256 != capture.SHA256 ||
+		metadata.SanitizerProvenance != capture.SanitizerProvenance ||
+		metadata.SanitizerVersion != capture.SanitizerVersion ||
+		metadata.AdapterID != capture.Provider ||
+		metadata.AdapterVersion != capture.AdapterVersion ||
+		metadata.IndependentEvidence != capture.IndependentEvidence {
+		return errors.New("daemon capture metadata does not match its canonical list row")
+	}
+	return nil
 }
 
 func finishAdapterRepairCapture(path string, capture adapterRepairCapture) (adapterRepairCapture, error) {
@@ -272,7 +295,27 @@ func findAdapterRepairRepoRoot() (string, error) {
 	}
 }
 
+func validateRepairCapture(capture adapterRepairCapture) error {
+	if capture.Provider == "" || !adapterRepairSegmentRE.MatchString(capture.Provider) {
+		return errors.New("repair capture has no canonical provider")
+	}
+	if capture.Scenario == "" || !adapterRepairSegmentRE.MatchString(capture.Scenario) {
+		return errors.New("repair capture has no canonical scenario")
+	}
+	if !validSHA256(capture.SHA256) {
+		return errors.New("repair capture has no valid canonical content SHA-256")
+	}
+	if capture.SanitizerProvenance != captures.SanitizerProvenance ||
+		capture.SanitizerVersion != captures.SanitizerVersion {
+		return errors.New("repair capture lacks canonical sanitizer provenance")
+	}
+	return validateDaemonCaptureRow(capture)
+}
 func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, deps adapterRepairDeps) (adapterRepairResult, error) {
+	if err := validateRepairCapture(capture); err != nil {
+		return adapterRepairResult{}, err
+	}
+
 	if deps.Now == nil {
 		deps.Now = time.Now
 	}
@@ -297,7 +340,11 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	if err != nil {
 		return adapterRepairResult{}, fmt.Errorf("read capture: %w", err)
 	}
-	fixture := rewrapAdapterFixture(string(raw), capture.Provider, capture.Scenario, capture.Origin, capture.Captured)
+	// The capture was already verified against its daemon hash, metadata, and
+	// canonical sanitizer provenance above. Emit those exact bytes; prepending
+	// or rewriting a header would make the certified plan differ from the
+	// fixture the maintainer is asked to commit.
+	fixture := string(raw)
 	fixturePath := filepath.Join(workspace, "fixture.html")
 	reportPath := filepath.Join(workspace, "report.md")
 	applyPath := filepath.Join(workspace, "apply.md")
@@ -323,21 +370,25 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 		sourceStatus = "extension workspace unavailable; using stored capture adapter version"
 	}
 	nextRevision := "unknown"
-	if next, nextErr := nextAdapterRevision(currentVersion); nextErr == nil {
-		nextRevision = next
+	evidenceStatus := "untrusted caller-labelled scenario; revision promotion is locked"
+	if capture.IndependentEvidence {
+		evidenceStatus = "independent daemon-correlated provider outcome"
+		if next, nextErr := nextAdapterRevision(currentVersion); nextErr == nil {
+			nextRevision = next
+		}
 	}
 
 	analysis := ""
 	if _, err := os.Stat(filepath.Join(deps.RepoRoot, "extension", "tools", "adapter-try.ts")); err != nil {
 		analysis = "adapter-try analysis skipped: extension/tools/adapter-try.ts is unavailable"
 	} else {
-		output, runErr := deps.Run.Run(ctx, deps.RepoRoot, capture.Path, capture.Provider)
+		output, runErr := deps.Run.Run(ctx, deps.RepoRoot, fixturePath, capture.Provider)
 		analysis = output
 		if runErr != nil {
 			analysis += fmt.Sprintf("\n(adapter-try analysis skipped or failed: %v)\n", runErr)
 		}
 	}
-	report := fmt.Sprintf("# Adapter repair analysis\n\nProvider: `%s`\nScenario: `%s`\nCurrent adapter version: `%s`\nNext adapter revision: `%s`\nVersion source: %s\n\n## adapter-try output\n\n%s", capture.Provider, capture.Scenario, currentVersion, nextRevision, sourceStatus, analysis)
+	report := fmt.Sprintf("# Adapter repair analysis\n\nProvider: `%s`\nScenario: `%s`\nEvidence: %s\nFixture SHA-256: `%s`\nCurrent adapter version: `%s`\nNext adapter revision: `%s`\nVersion source: %s\n\n## adapter-try output (against exact emitted fixture bytes)\n\n%s", capture.Provider, capture.Scenario, evidenceStatus, capture.SHA256, currentVersion, nextRevision, sourceStatus, analysis)
 	if err := os.WriteFile(reportPath, []byte(report), 0o600); err != nil {
 		return adapterRepairResult{}, fmt.Errorf("write report: %w", err)
 	}
@@ -345,11 +396,15 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	if versionLine > 0 {
 		typesInstruction = fmt.Sprintf("Edit extension/src/adapters/types.ts line %d (the `%s` adapter version line)", versionLine, capture.Provider)
 	}
-	apply := fmt.Sprintf("# Apply this reviewed scaffold\n\nThis workspace is proposal-only; papio did not modify extension source. Review `report.md` and the captured page before applying anything.\n\n1. Copy `fixture.html` to `extension/fixtures/%s/%s.html`.\n2. Add a focused case to `extension/test/adapters.test.ts`, following the existing fixture-backed adapter test pattern for `loadFixture` and the expected page verdict.\n3. %s: change the current adapter version `%s` to the exact next revision `%s`.\n4. Re-run the focused adapter test and review the resulting source diff before opening a PR.\n\nGenerated fixture path: `extension/fixtures/%s/%s.html`.\n", capture.Provider, capture.Scenario, typesInstruction, currentVersion, nextRevision, capture.Provider, capture.Scenario)
+	promotionInstruction := "Revision promotion is locked: this scenario is caller-labelled. Attach an independently observed daemon outcome before changing the adapter version."
+	if capture.IndependentEvidence {
+		promotionInstruction = fmt.Sprintf("%s: change the current adapter version `%s` to the exact next revision `%s`.", typesInstruction, currentVersion, nextRevision)
+	}
+	apply := fmt.Sprintf("# Apply this reviewed scaffold\n\nThis workspace is proposal-only; papio did not modify extension source. Review `report.md` and the captured page before applying anything.\n\n1. Copy `fixture.html` to `extension/fixtures/%s/%s.html`.\n2. Add a focused case to `extension/test/adapters.test.ts`, following the existing fixture-backed adapter test pattern for `loadFixture` and the expected page verdict.\n3. %s\n4. Re-run the focused adapter test and review the resulting source diff before opening a PR.\n\nGenerated fixture path: `extension/fixtures/%s/%s.html`.\n", capture.Provider, capture.Scenario, promotionInstruction, capture.Provider, capture.Scenario)
 	if err := os.WriteFile(applyPath, []byte(apply), 0o600); err != nil {
 		return adapterRepairResult{}, fmt.Errorf("write apply instructions: %w", err)
 	}
-	return adapterRepairResult{Workspace: workspace, Fixture: fixturePath, Report: reportPath, NextRevision: nextRevision}, nil
+	return adapterRepairResult{Workspace: workspace, Fixture: fixturePath, Report: reportPath, NextRevision: nextRevision, IndependentEvidence: capture.IndependentEvidence}, nil
 }
 func rewrapAdapterFixture(raw, provider, scenario, origin string, captured time.Time) string {
 	body := raw

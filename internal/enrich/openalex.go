@@ -62,11 +62,13 @@ func NewOpenAlexWithOptions(opts OpenAlexOptions) *OpenAlexEnricher {
 	}
 }
 
-// Enrich performs one bounded OpenAlex title search. A match is accepted only
-// when its normalized title, compatible publication year, and at least one
-// requested author family agree, matching Crossref's corroboration policy.
+// Enrich performs one bounded OpenAlex title search. A match requires exact
+// title, positive equal publication year, one-to-one full-author-list
+// corroboration, and an explicit usable open-access location. ISBN work is
+// never promoted because OpenAlex provides no edition-level ISBN data.
 func (e *OpenAlexEnricher) Enrich(ctx context.Context, requested work.Work) (work.Work, bool, error) {
-	if requested.HasFetchableIdentifier() || strings.TrimSpace(requested.Title) == "" {
+	if requested.HasFetchableIdentifier() || strings.TrimSpace(requested.ISBN) != "" ||
+		strings.TrimSpace(requested.Title) == "" || requested.Year <= 0 || len(requested.Authors) == 0 {
 		return requested, false, nil
 	}
 	if e == nil || e.client == nil {
@@ -116,6 +118,8 @@ func (e *OpenAlexEnricher) Enrich(ctx context.Context, requested work.Work) (wor
 	if err := decodeBoundedJSON(resp.Body, e.maxBody, &payload); err != nil {
 		return requested, false, fmt.Errorf("enrich: invalid OpenAlex response: %w", err)
 	}
+	seen := make(map[string]string)
+	ambiguous := false
 	for _, candidate := range payload.Results {
 		if !matchesOpenAlex(candidate, requested) {
 			continue
@@ -124,14 +128,24 @@ func (e *OpenAlexEnricher) Enrich(ctx context.Context, requested work.Work) (wor
 		if err != nil {
 			continue
 		}
+		doi := openAlexDOI(candidate)
+		if previous, exists := seen[openAlexID]; exists {
+			if previous != "" && doi != "" && previous != doi {
+				ambiguous = true
+			} else if previous == "" {
+				seen[openAlexID] = doi
+			}
+			continue
+		}
+		seen[openAlexID] = doi
+	}
+	if ambiguous || len(seen) != 1 {
+		return requested, false, nil
+	}
+	for openAlexID, doi := range seen {
 		enriched := requested
 		enriched.OpenAlex = openAlexID
-		if doi := openAlexDOI(candidate); doi != "" {
-			enriched.DOI = doi
-		}
-		if enriched.Year == 0 && candidate.PublicationYear > 0 {
-			enriched.Year = candidate.PublicationYear
-		}
+		enriched.DOI = doi
 		return enriched, true, nil
 	}
 	return requested, false, nil
@@ -149,6 +163,7 @@ func (e *OpenAlexEnricher) searchURL(requested work.Work) (*url.URL, error) {
 	query := endpoint.Query()
 	query.Set("filter", strings.Join(filters, ","))
 	query.Set("per-page", "5")
+	query.Set("select", "id,doi,ids,title,publication_year,authorships,open_access,locations")
 	if e.email != "" {
 		query.Set("mailto", e.email)
 	}
@@ -163,15 +178,6 @@ type openAlexSearchResponse struct {
 	Results []openAlexRecord `json:"results"`
 }
 
-type openAlexRecord struct {
-	ID              string               `json:"id"`
-	DOI             string               `json:"doi"`
-	IDs             openAlexIdentifiers  `json:"ids"`
-	Title           string               `json:"title"`
-	PublicationYear int                  `json:"publication_year"`
-	Authorships     []openAlexAuthorship `json:"authorships"`
-}
-
 type openAlexIdentifiers struct {
 	OpenAlex string `json:"openalex"`
 	DOI      string `json:"doi"`
@@ -183,28 +189,139 @@ type openAlexAuthorship struct {
 	} `json:"author"`
 }
 
+type openAlexOpenAccess struct {
+	IsOA bool `json:"is_oa"`
+}
+
+type openAlexLocation struct {
+	IsOA           bool   `json:"is_oa"`
+	LandingPageURL string `json:"landing_page_url"`
+	PDFURL         string `json:"pdf_url"`
+}
+
+type openAlexRecord struct {
+	ID              string               `json:"id"`
+	DOI             string               `json:"doi"`
+	IDs             openAlexIdentifiers  `json:"ids"`
+	Title           string               `json:"title"`
+	PublicationYear int                  `json:"publication_year"`
+	Authorships     []openAlexAuthorship `json:"authorships"`
+	OpenAccess      openAlexOpenAccess   `json:"open_access"`
+	Locations       []openAlexLocation   `json:"locations"`
+}
+
 func matchesOpenAlex(candidate openAlexRecord, requested work.Work) bool {
 	if normalizeTitle(candidate.Title) != normalizeTitle(requested.Title) {
 		return false
 	}
-	if candidate.PublicationYear != 0 && requested.Year != 0 && candidate.PublicationYear != requested.Year {
+	if requested.Year <= 0 || candidate.PublicationYear <= 0 || candidate.PublicationYear != requested.Year {
 		return false
 	}
-	if len(requested.Authors) == 0 {
-		return true
+	if !hasUsableOpenAlexLocation(candidate) {
+		return false
 	}
+	if len(requested.Authors) == 0 || len(candidate.Authorships) == 0 {
+		return false
+	}
+	if len(requested.Authors) != len(candidate.Authorships) {
+		return false
+	}
+	used := make([]bool, len(candidate.Authorships))
 	for _, requestedAuthor := range requested.Authors {
-		family := authorFamily(requestedAuthor)
-		if family == "" {
+		match := -1
+		for index, candidateAuthor := range candidate.Authorships {
+			if used[index] || !authorsCorroborate(requestedAuthor, candidateAuthor.Author.DisplayName) {
+				continue
+			}
+			if match != -1 {
+				// A requested name with multiple candidate matches is not a
+				// unique corroboration, even when a different ordering could
+				// produce a complete matching.
+				return false
+			}
+			match = index
+		}
+		if match == -1 {
+			return false
+		}
+		used[match] = true
+	}
+	return true
+}
+
+func hasUsableOpenAlexLocation(candidate openAlexRecord) bool {
+	if !candidate.OpenAccess.IsOA {
+		return false
+	}
+	for _, location := range candidate.Locations {
+		if !location.IsOA {
 			continue
 		}
-		for _, candidateAuthor := range candidate.Authorships {
-			if family == authorFamily(candidateAuthor.Author.DisplayName) {
+		for _, raw := range []string{location.PDFURL, location.LandingPageURL} {
+			locationURL, err := url.Parse(strings.TrimSpace(raw))
+			if err == nil && (locationURL.Scheme == "http" || locationURL.Scheme == "https") && locationURL.Host != "" {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// authorsCorroborate requires more than a shared family name. A family name
+// alone is not enough to identify a work: common surnames routinely appear on
+// unrelated works with the same title and year. OpenAlex supplies display
+// names, so compare the given-name evidence when it is available, accepting
+// the usual full-name/initial presentations in either direction.
+func authorsCorroborate(requested, candidate string) bool {
+	if authorFamily(requested) == "" || authorFamily(requested) != authorFamily(candidate) {
+		return false
+	}
+	requestedGiven := authorGivenNames(requested)
+	candidateGiven := authorGivenNames(candidate)
+	if len(requestedGiven) == 0 || len(candidateGiven) == 0 {
+		return false
+	}
+	return givenNamesCorroborate(requestedGiven, candidateGiven)
+}
+
+func authorGivenNames(value string) []string {
+	value = strings.TrimSpace(normalizeTitle(value))
+	if comma := strings.IndexRune(value, ','); comma >= 0 {
+		value = strings.TrimSpace(value[comma+1:])
+	} else {
+		parts := strings.Fields(value)
+		if len(parts) <= 1 {
+			return nil
+		}
+		// authorFamily treats a trailing initial as given-name evidence only
+		// when it follows the family in a comma-formatted citation. For the
+		// display-name form, the final token is the family name.
+		value = strings.Join(parts[:len(parts)-1], " ")
+	}
+	var given []string
+	for _, part := range strings.Fields(value) {
+		part = strings.Trim(part, ".,")
+		if part != "" {
+			given = append(given, part)
+		}
+	}
+	return given
+}
+
+func givenNamesCorroborate(requested, candidate []string) bool {
+	// The first given name is the stable cross-source signal. Compare either
+	// spelling or an initial so "D. L. Kirkpatrick" and "Donald L.
+	// Kirkpatrick" corroborate, while "Jane Smith" and "John Smith" do not.
+	firstRequested := strings.Trim(requested[0], ".")
+	firstCandidate := strings.Trim(candidate[0], ".")
+	if firstRequested == "" || firstCandidate == "" {
+		return false
+	}
+	if firstRequested == firstCandidate {
+		return true
+	}
+	return len(firstRequested) == 1 && strings.HasPrefix(firstCandidate, firstRequested) ||
+		len(firstCandidate) == 1 && strings.HasPrefix(firstRequested, firstCandidate)
 }
 
 func openAlexIdentifier(candidate openAlexRecord) (string, error) {

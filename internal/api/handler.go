@@ -1224,6 +1224,11 @@ func cancelJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 	if err := system.App.CancelJob(ctx, params.JobID, "cancelled by user"); err != nil {
 		return failure(err)
 	}
+	if system.Captures != nil {
+		if err := system.Captures.ReleaseJob(ctx, params.JobID); err != nil {
+			return failure(err)
+		}
+	}
 	return marshal(map[string]any{"job_id": params.JobID, "cancelled": true})
 }
 
@@ -1239,6 +1244,11 @@ func retryJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	}
 	if err := system.Jobs.Retry(ctx, params.JobID); err != nil {
 		return failure(err)
+	}
+	if system.Captures != nil {
+		if err := system.Captures.ReleaseJob(ctx, params.JobID); err != nil {
+			return failure(err)
+		}
 	}
 	return marshal(map[string]any{"job_id": params.JobID, "state": job.StateResolving})
 }

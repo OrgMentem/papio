@@ -20,7 +20,7 @@ import { emptyStore, type StateBackend, type StoreShape, type TermsConsent } fro
 import {
   Bridge,
   assessDrivenPage,
-  clickTermsAccept,
+  executePlannedPageEffect,
   resolveDownloadURL,
   type BridgeDeps,
   type DownloadDeltaLike,
@@ -32,6 +32,11 @@ import { ChromeTabsFake } from "./fake-tabs";
 import { Window } from "happy-dom";
 
 // A representative ProQuest-shaped spec. Rules are ordered; first match wins.
+const PROVIDER_WORK_EVIDENCE = {
+  kind: "title" as const,
+  selector: "meta[name='citation_title']",
+  attribute: "content",
+};
 const SPEC: AdapterSpec = {
   id: "proquest",
   version: "0.3.1",
@@ -43,7 +48,8 @@ const SPEC: AdapterSpec = {
     { kind: "wrong_work_check", all: ["[data-mismatch]"] },
     { kind: "article", all: ["a.download-pdf"] },
   ],
-  download: { selector: "a.download-pdf", requireKind: "article", method: "href" },
+  workEvidence: PROVIDER_WORK_EVIDENCE,
+  download: { selector: "a.download-pdf", requireKind: "article", method: "href", workTarget: { kind: "opaque" } },
 };
 
 const EXPECTED_TITLE = "Trust in Automation: Designing for Appropriate Reliance";
@@ -1004,7 +1010,16 @@ class FakeDownloads {
 class FakeScripting {
   verdict: PageVerdict | undefined;
   readonly verdictQueue: PageVerdict[] = [];
-  href = "https://media.proquest.com/media/signed?TOKEN=ephemeral";
+  private hrefOverride: string | undefined;
+  private plannerOrigin = "https://fixture.local";
+  /** Optional page URL for specs whose declared rule needs a particular path. */
+  documentURL: string | undefined;
+  get href(): string {
+    return this.hrefOverride ?? `${this.plannerOrigin}/media/signed?TOKEN=ephemeral`;
+  }
+  set href(value: string) {
+    this.hrefOverride = value;
+  }
   readonly extracted: { tabId: number; selector: string }[] = [];
   readonly clicked: {
     tabId: number;
@@ -1017,19 +1032,83 @@ class FakeScripting {
   readonly interpretTabs: number[] = [];
   constructedURL: string | null = "https://provider.example.edu/pdf/default.pdf";
   readonly constructedArgs: { tabId: number; selector: string; idPattern: unknown; urlTemplate: unknown; jsonField: unknown }[] = [];
+  private syntheticPageURL(spec: AdapterSpec): string {
+    const supplied = this.documentURL?.trim();
+    if (supplied !== undefined && supplied.length > 0) {
+      try {
+        const parsed = new URL(supplied);
+        if (parsed.protocol === "https:" && parsed.hostname !== "") return parsed.href;
+      } catch {
+        // Fall through to the deterministic host-derived fixture.
+      }
+    }
+    const declaredHost = spec.hosts[0]?.trim();
+    if (declaredHost !== undefined && declaredHost.length > 0) {
+      try {
+        const parsed = new URL(declaredHost.includes("://") ? declaredHost : `https://${declaredHost}`);
+        if (parsed.protocol === "https:" && parsed.hostname !== "") return `${parsed.origin}/fixture`;
+      } catch {
+        // The planner's invalid-page fallback remains deterministic.
+      }
+    }
+    return "https://fixture.local/fixture";
+  }
+
 
   private plannerResult(inj: { target: { tabId: number }; args?: unknown[] }): PlanResult {
     const args = inj.args ?? [];
     const spec = args[1] as AdapterSpec;
     const expected = (args[2] ?? {}) as { title?: string; doi?: string; year?: number };
     const policy = (args[3] ?? {}) as { access_mode?: "assisted" | "delegated" | "conservative"; terms_consent?: "accept" | "decline" };
-    const win = new Window({ url: "https://www.jstor.org/stable/4093878" });
-    const selector = spec.download?.selector;
+    const override = this.verdictQueue.shift() ?? this.verdict;
+    const pageURL = this.syntheticPageURL(spec);
+    this.plannerOrigin = new URL(pageURL).origin;
+    const win = new Window({ url: pageURL });
+    const terms = override?.kind === "terms" ? spec.termsAccept : undefined;
     const planningSpec =
-      spec.classify.length === 0 && selector !== undefined
-        ? { ...spec, classify: [{ kind: "article" as const, all: [selector] }] }
-        : spec;
-    if (selector !== undefined) {
+      terms !== undefined
+        ? { ...spec, classify: [{ kind: "terms" as const, all: [terms.modalSelector] }] }
+        : spec.classify.length === 0 && spec.download?.selector !== undefined
+          ? { ...spec, classify: [{ kind: "article" as const, all: [spec.download.selector] }] }
+          : spec;
+    if (terms !== undefined) {
+      const modalFirst = terms.modalSelector.split(/[.#\[]/u)[0]?.trim() ?? "div";
+      const modalTag = /^[a-z][a-z0-9-]*/iu.exec(modalFirst)?.[0] ?? "div";
+      const modal = win.document.createElement(modalTag);
+      const modalID = /#([A-Za-z0-9_-]+)/u.exec(terms.modalSelector)?.[1];
+      const modalClass = /\.([A-Za-z0-9_-]+)/u.exec(terms.modalSelector)?.[1];
+      if (modalID !== undefined) modal.id = modalID;
+      if (modalClass !== undefined) modal.className = modalClass;
+      if (/\[open\]/u.test(terms.modalSelector)) modal.setAttribute("open", "");
+      const controlSelector = terms.control ?? "button";
+      const controlFirst = controlSelector.split(/[.#\[]/u)[0]?.trim() ?? "button";
+      const controlTag = /^[a-z][a-z0-9-]*/iu.exec(controlFirst)?.[0] ?? "button";
+      const control = win.document.createElement(controlTag);
+      const controlID = /#([A-Za-z0-9_-]+)/u.exec(controlSelector)?.[1];
+      const controlClass = /\.([A-Za-z0-9_-]+)/u.exec(controlSelector)?.[1];
+      if (controlID !== undefined) control.id = controlID;
+      if (controlClass !== undefined) control.className = controlClass;
+      if (controlTag.toLowerCase() === "input") {
+        control.setAttribute("type", "submit");
+        control.setAttribute("value", terms.textAny[0] ?? "Accept");
+      } else {
+        control.textContent = terms.textAny[0] ?? "Accept";
+      }
+      modal.appendChild(control);
+      win.document.body.appendChild(modal);
+    }
+    if (spec.workEvidence !== undefined) {
+      const evidence = win.document.createElement("meta");
+      const name = /meta\[name=['"]([^'"]+)['"]\]/u.exec(spec.workEvidence.selector)?.[1];
+      if (name !== undefined) evidence.setAttribute("name", name);
+      const value = spec.workEvidence.kind === "doi"
+        ? expected.doi ?? ""
+        : expected.title ?? "";
+      evidence.setAttribute(spec.workEvidence.attribute, value);
+      win.document.head.appendChild(evidence);
+    }
+    const selector = spec.download?.selector;
+    if (selector !== undefined && terms === undefined) {
       const first = selector.split(",")[0]?.trim() ?? "div";
       const tag = /^[a-z][a-z0-9-]*/i.exec(first)?.[0] ?? "div";
       const element = win.document.createElement(tag);
@@ -1060,8 +1139,15 @@ class FakeScripting {
       (tag.toLowerCase() === "meta" ? win.document.head : win.document.body).appendChild(element);
     }
     const actual = planExecution(win.document as unknown as Document, planningSpec, expected, policy);
-    const override = this.verdictQueue.shift() ?? this.verdict;
     if (override === undefined) return actual;
+    // A requested identity with no declared page evidence must remain
+    // assisted. Do not turn the fake's verdict override into an authority
+    // binding that the real planner would have rejected.
+    if (
+      "assisted" in actual &&
+      (override.kind === "article" || override.kind === "terms") &&
+      (expected.title !== undefined || expected.doi !== undefined)
+    ) return actual;
     const base: Plan = "assisted" in actual
       ? {
           adapter_id: spec.id,
@@ -1074,6 +1160,36 @@ class FakeScripting {
           required_consequence: "none",
           access_mode: policy.access_mode,
           terms_consent: policy.terms_consent ?? null,
+          expected_work: {
+            requested_doi: expected.doi?.trim().toLowerCase() ?? null,
+            requested_title: expected.title?.trim().toLowerCase().replace(/\s+/g, " ") ?? null,
+            doi: null,
+            title: null,
+          },
+          effect_graph: {
+            primary_target: null,
+            followup_target: null,
+            terms_target:
+              override.kind === "terms" && spec.termsAccept !== undefined
+                ? {
+                    selector: spec.termsAccept.modalSelector,
+                    shadow_selector: null,
+                    fingerprint: "synthetic-modal",
+                    text_any: [...spec.termsAccept.textAny],
+                    control_selector: spec.termsAccept.control ?? null,
+                    control_fingerprint: "synthetic-control",
+                  }
+                : null,
+            api: null,
+            consequence: "none",
+            route: null,
+          },
+          route_origin: null,
+          revalidation: {
+            target_cardinality: 1,
+            max_selector_length: 512,
+            max_wait_ms: planningSpec.settleTimeoutMs ?? 0,
+          },
         }
       : actual;
     const download = spec.download;
@@ -1125,18 +1241,53 @@ class FakeScripting {
       return [{ result: planned }];
     }
     const args = inj.args ?? [];
+    if (inj.func === executePlannedPageEffect) {
+      const plan = (args[0] ?? {}) as Plan;
+      const rule = (args[1] ?? {}) as Partial<DownloadRule>;
+      const termsTarget = plan.effect_graph?.terms_target;
+      const target = plan.target_ref ?? plan.effect_graph?.primary_target ?? termsTarget;
+      if (rule.method === "click" && target !== null && target !== undefined) {
+        const followup = typeof rule.followupSelector === "string" ? rule.followupSelector : null;
+        this.rawClickArgs.push([
+          target.selector,
+          target.shadow_selector,
+          null,
+          rule.postClickTimeoutMs ?? null,
+          followup,
+        ]);
+        if (target === termsTarget) {
+          this.termsAccepts.push({
+            tabId: inj.target.tabId,
+            modalSelector: target.selector,
+            textAny: termsTarget?.text_any,
+            control: termsTarget?.control_selector,
+          });
+          return [{ result: { ok: true } }];
+        }
+        this.clicked.push({
+          tabId: inj.target.tabId,
+          selector: target.selector,
+          ...(typeof target.shadow_selector === "string" ? { shadowSelector: target.shadow_selector } : {}),
+          ...(followup !== null ? { followupSelector: followup } : {}),
+        });
+        return [{ result: { ok: true } }];
+      }
+      if (rule.method === "api") {
+        const api = plan.effect_graph?.api;
+        this.constructedArgs.push({
+          tabId: inj.target.tabId,
+          selector: target?.selector ?? "",
+          idPattern: null,
+          urlTemplate: api?.endpoint ?? null,
+          jsonField: api?.result_field ?? null,
+        });
+        return [{ result: { ok: this.constructedURL !== null, url: this.constructedURL ?? undefined } }];
+      }
+      return [{ result: { ok: plan.url !== null, url: plan.url ?? undefined } }];
+    }
     if (args.length === 1) {
       this.extracted.push({ tabId: inj.target.tabId, selector: String(args[0]) });
       return [{ result: this.href }];
-    }
-    if (inj.func === clickTermsAccept) {
-      this.termsAccepts.push({
-        tabId: inj.target.tabId,
-        modalSelector: String(args[0]),
-        textAny: args[1],
-        control: args[2],
-      });
-      return [{ result: true }];
     }
     if (args.length === 5) {
       this.rawClickArgs.push([...args]);
@@ -1250,7 +1401,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
 
 function offer(
   jobID: string,
-  expected?: { title?: string },
+  expected?: { title?: string; doi?: string },
   providerHosts: string[] = [PROVIDER],
   loginEntityID?: string,
   proquestAccountID?: string,
@@ -1342,8 +1493,6 @@ test("a provider PDF opened in a new viewer tab is adopted for the opener job", 
   await h.port.inbound(offer("job_viewer_0001"));
   const trackedTab = h.backend.store.activeJobs.find(j => j.job_id === 'job_viewer_0001')?.tab_id ?? -1;
   expect(trackedTab).toBeGreaterThanOrEqual(0);
-
-  // A new viewer tab opens on the provider .pdf, spawned by the tracked tab.
   const viewerTab = 999;
   const pdfUrl = `https://${PROVIDER}/doc/259290.pdf?refreqid=x`;
   h.tabs.seed({ id: viewerTab, url: pdfUrl, openerTabId: trackedTab });
@@ -1372,17 +1521,19 @@ const TERMS_SPEC: AdapterSpec = {
   id: "termsprov",
   version: "1.0.0",
   hosts: [PROVIDER],
-  classify: [],
+  classify: [{ kind: "terms", all: ["div.terms[open]"] }],
+  workEvidence: PROVIDER_WORK_EVIDENCE,
   termsAccept: { modalSelector: "div.terms[open]", textAny: ["accept and download"] },
 };
 const termsVerdict = { kind: "terms" as const, adapter_id: "termsprov", adapter_version: "1.0.0", evidence: [] };
+
 
 test("terms verdict auto-accepts only when the user has consented", async () => {
   const h = makeMapHarness([TERMS_SPEC]);
   h.settings.consent = "accept";
   h.scripting.verdict = termsVerdict;
   await h.bridge.start();
-  await h.port.inbound(offer("job_terms_0001"));
+  await h.port.inbound(offer("job_terms_0001", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_terms_0001");
 
   expect(h.scripting.termsAccepts.length).toBe(1);
@@ -1390,12 +1541,23 @@ test("terms verdict auto-accepts only when the user has consented", async () => 
   // Auto-accept emits no provider_outcome; the ensuing download is the record.
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
 });
+test("terms modal without declared work evidence stays assisted and never clicks", async () => {
+  const { workEvidence: _workEvidence, ...unbound } = TERMS_SPEC;
+  const h = makeMapHarness([unbound]);
+  h.settings.consent = "accept";
+  h.scripting.verdict = { ...termsVerdict, adapter_id: unbound.id };
+  await h.bridge.start();
+  await h.port.inbound(offer("job_terms_unbound_0001", { title: EXPECTED_TITLE }));
+  await landOnProvider(h, "job_terms_unbound_0001");
+  expect(h.scripting.termsAccepts).toHaveLength(0);
+});
 
 test("terms verdict stays a human step and flags consent when undecided", async () => {
+
   const h = makeMapHarness([TERMS_SPEC]);
   h.scripting.verdict = termsVerdict; // consent stays undefined
   await h.bridge.start();
-  await h.port.inbound(offer("job_terms_0002"));
+  await h.port.inbound(offer("job_terms_0002", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_terms_0002");
 
   expect(h.scripting.termsAccepts.length).toBe(0);
@@ -1407,7 +1569,7 @@ test("granting consent clears the prompt flag and re-attempts the pending terms 
   const h = makeMapHarness([TERMS_SPEC]);
   h.scripting.verdict = termsVerdict;
   await h.bridge.start();
-  await h.port.inbound(offer("job_terms_0003"));
+  await h.port.inbound(offer("job_terms_0003", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_terms_0003");
   expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(true);
 
@@ -1421,7 +1583,7 @@ test("declining consent records manual and never auto-accepts", async () => {
   const h = makeMapHarness([TERMS_SPEC]);
   h.scripting.verdict = termsVerdict;
   await h.bridge.start();
-  await h.port.inbound(offer("job_terms_0004"));
+  await h.port.inbound(offer("job_terms_0004", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_terms_0004");
   await h.bridge.requestTermsConsent("manual");
   expect(h.settings.consent).toBe("manual");
@@ -1435,7 +1597,7 @@ test("startup re-drives a pending terms gate when consent was granted while asle
   const h = makeMapHarness([TERMS_SPEC]);
   h.scripting.verdict = termsVerdict; // consent undefined -> flags the gate
   await h.bridge.start();
-  await h.port.inbound(offer("job_terms_wake_0001"));
+  await h.port.inbound(offer("job_terms_wake_0001", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_terms_wake_0001");
   expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(true);
   expect(h.scripting.termsAccepts.length).toBe(0);
@@ -1454,7 +1616,8 @@ const TERMS_DL_SPEC: AdapterSpec = {
   version: "1.0.0",
   hosts: [PROVIDER],
   classify: [],
-  download: { selector: "button.dl", requireKind: "article", method: "click" },
+  workEvidence: PROVIDER_WORK_EVIDENCE,
+  download: { selector: "button.dl", requireKind: "article", method: "click", workTarget: { kind: "opaque" } },
   termsAccept: { modalSelector: "div.terms[open]", textAny: ["accept and download"] },
 };
 
@@ -1467,11 +1630,12 @@ test("a latched download-click keeps re-classifying until a late terms modal is 
   h.settings.consent = "accept";
   const article = { kind: "article" as const, adapter_id: "termsdl", adapter_version: "1.0.0", evidence: [] };
   const terms = { kind: "terms" as const, adapter_id: "termsdl", adapter_version: "1.0.0", evidence: [] };
-  // 1st classify: article -> click (latches). 2nd (retry): still article (modal
-  // not upgraded). 3rd (retry): terms -> acceptTerms.
-  h.scripting.verdictQueue.push(article, article, terms);
+  // 1st classify: article -> click (latches). Its revalidation consumes the
+  // second article. The retry sees terms and acceptTerms revalidates terms once
+  // more immediately before clicking the declared accept control.
+  h.scripting.verdictQueue.push(article, article, terms, terms);
   await h.bridge.start();
-  await h.port.inbound(offer("job_termsdl_0001"));
+  await h.port.inbound(offer("job_termsdl_0001", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_termsdl_0001");
 
   expect(h.scripting.clicked.length).toBe(1); // download clicked once (latched)
@@ -1491,82 +1655,6 @@ test("a latched download-click keeps re-classifying until a late terms modal is 
   expect(h.scripting.clicked.length).toBe(1); // retry never re-clicked the download
 });
 
-test("clickTermsAccept clicks the real accept control, not a wrapping container", () => {
-  // JSTOR's terms footer is a <div> holding both "Cancel" and "Accept and
-  // download"; the accept control is an mfe-*-button with a shadow
-  // #button-element. The walk must click the button, never the container div
-  // (which is a no-op and left the modal open live).
-  const win = new Window();
-  const doc = win.document;
-  doc.body.innerHTML =
-    "<mfe-download-pharos-modal class='terms-and-conditions' open>" +
-    "<div class='cta'>" +
-    "<mfe-download-pharos-button id='cancel'>Cancel</mfe-download-pharos-button>" +
-    "<mfe-download-pharos-button id='accept'>Accept and download</mfe-download-pharos-button>" +
-    "</div></mfe-download-pharos-modal>";
-  const clicks: string[] = [];
-  doc.querySelector(".cta")?.addEventListener("click", () => clicks.push("div"));
-  for (const id of ["cancel", "accept"]) {
-    const btn = doc.getElementById(id) as unknown as {
-      attachShadow: (init: { mode: string }) => ShadowRoot;
-    };
-    const sr = btn.attachShadow({ mode: "open" });
-    sr.innerHTML = "<button id='button-element'></button>";
-    sr.querySelector("#button-element")?.addEventListener("click", () => clicks.push(id));
-  }
-  const prev = globalThis.document;
-  Object.assign(globalThis, { document: doc });
-  try {
-    const ok = clickTermsAccept("mfe-download-pharos-modal.terms-and-conditions[open]", ["accept and download"]);
-    expect(ok).toBe(true);
-    // The accept button's shadow #button-element is the click TARGET (old bug
-    // clicked the container div directly, so target was "div"). A composed
-    // click then bubbles to .cta, which is fine — Cancel is never clicked.
-    expect(clicks[0]).toBe("accept");
-    expect(clicks).not.toContain("cancel");
-  } finally {
-    Object.assign(globalThis, { document: prev });
-  }
-});
-
-test("clickTermsAccept clicks an empty-value submit input through its explicit selector", () => {
-  const win = new Window();
-  const doc = win.document;
-  doc.body.innerHTML =
-    "<form class='saml__consent__form'>" +
-    "<p>I have read and agree to the Terms and Conditions</p>" +
-    "<input class='saml__consent__yes' type='submit' value=''>" +
-    "</form>";
-  const control = doc.querySelector("input.saml__consent__yes");
-  let clicks = 0;
-  control?.addEventListener("click", (event) => {
-    event.preventDefault();
-    clicks++;
-  });
-  const prev = globalThis.document;
-  Object.assign(globalThis, { document: doc });
-  try {
-    expect(
-      clickTermsAccept(
-        "form.saml__consent__form",
-        ["i have read and agree to the terms and conditions"],
-        "input.saml__consent__yes",
-      ),
-    ).toBe(true);
-    expect(clicks).toBe(1);
-
-    // With no explicit selector, empty submit values use the enclosing form's
-    // consent text rather than becoming invisible to accessible-text matching.
-    expect(
-      clickTermsAccept("form.saml__consent__form", [
-        "i have read and agree to the terms and conditions",
-      ]),
-    ).toBe(true);
-    expect(clicks).toBe(2);
-  } finally {
-    Object.assign(globalThis, { document: prev });
-  }
-});
 
 test("startup reconciliation re-queues a job whose pre-download tab vanished", async () => {
   // A tab closed while the worker slept never fired onTabRemoved, so the job
@@ -1785,6 +1873,7 @@ test("declared shadow click reclassifies an in-page terms gate", async () => {
     download: {
       selector: "mfe-download",
       requireKind: "article",
+      workTarget: { kind: "opaque" },
       method: "click",
       shadowSelector: "#button-element",
       postClickWaitFor: ".terms[open]",
@@ -1822,6 +1911,7 @@ test("declared provider modal follow-up stays inside the one click helper", asyn
       selector: "[data-auto='download']",
       requireKind: "article",
       method: "click",
+      workTarget: { kind: "opaque" },
       followupSelector: "[data-auto='confirm-download']",
       postClickTimeoutMs: 3000,
     },
@@ -1862,14 +1952,14 @@ test("click downloads correlate by adapter when concurrent handoffs share provid
     version: "0.1.0",
     hosts: ["www.jstor.org"],
     classify: [{ kind: "article", all: [".download"] }],
-    download: { selector: ".download", requireKind: "article", method: "click" },
+    download: { selector: ".download", requireKind: "article", method: "click", workTarget: { kind: "opaque" } },
   };
   const ebsco: AdapterSpec = {
     id: "ebsco",
     version: "0.1.0",
     hosts: ["research.ebsco.com"],
     classify: [{ kind: "article", all: [".download"] }],
-    download: { selector: ".download", requireKind: "article", method: "click" },
+    download: { selector: ".download", requireKind: "article", method: "click", workTarget: { kind: "opaque" } },
   };
   const providerHosts = ["www.jstor.org", "research.ebsco.com"];
   const h = makeMapHarness([jstor, ebsco]);
@@ -1887,9 +1977,39 @@ test("click downloads correlate by adapter when concurrent handoffs share provid
     source: "live_tab",
   });
   await h.port.inbound(offer("job_jstor_concurrent_0001", undefined, providerHosts));
-  await landOnProvider(h, "job_jstor_concurrent_0001", "www.jstor.org");
+  const firstTab = await landOnProvider(h, "job_jstor_concurrent_0001", "www.jstor.org");
+
+  // The second same-provider handoff is accepted but remains queued behind
+  // the first drive. Its effect must not be attempted against the first tab.
   await h.port.inbound(offer("job_ebsco_concurrent_0001", undefined, providerHosts));
-  await landOnProvider(h, "job_ebsco_concurrent_0001", "research.ebsco.com");
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_ebsco_concurrent_0001")).toMatchObject({
+    tab_id: -1,
+    status: "accepted",
+  });
+  expect(h.tabs.list()).toHaveLength(1);
+
+  const firstItem: DownloadItemLike = {
+    id: 900,
+    url: "blob:https://www.jstor.org/download",
+    referrer: "https://www.jstor.org/c/record",
+    filename: "/Users/test/Downloads/JSTOR-FullText.pdf",
+    state: "in_progress",
+  };
+  let firstSuggested: { filename: string; conflictAction: "uniquify" } | undefined;
+  await h.downloads.onDeterminingFilename.emit(firstItem, (value) => {
+    firstSuggested = value;
+  });
+  expect(firstSuggested).toEqual({
+    filename: "papio/job_jstor_concurrent_0001/JSTOR-FullText.pdf",
+    conflictAction: "uniquify",
+  });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_jstor_concurrent_0001")?.adapter_id).toBe(
+    "jstor",
+  );
+
+  // Settle the first effect; only then may the queued handoff acquire a tab.
+  await h.bridge.requestCancel("job_jstor_concurrent_0001");
+  const secondTab = await landOnProvider(h, "job_ebsco_concurrent_0001", "research.ebsco.com");
 
   const item: DownloadItemLike = {
     id: 901,
@@ -1903,13 +2023,12 @@ test("click downloads correlate by adapter when concurrent handoffs share provid
     suggested = value;
   });
 
+  expect(secondTab).not.toBe(firstTab);
   expect(suggested).toEqual({
     filename: "papio/job_ebsco_concurrent_0001/EBSCO-FullText.pdf",
     conflictAction: "uniquify",
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_jstor_concurrent_0001")?.adapter_id).toBe(
-    "jstor",
-  );
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_jstor_concurrent_0001")).toBeUndefined();
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_ebsco_concurrent_0001")?.adapter_id).toBe(
     "ebsco",
   );
@@ -1990,7 +2109,7 @@ const FED_LOGIN_SPEC: AdapterSpec = {
   version: "1.0.0",
   hosts: [PROVIDER],
   classify: [{ kind: "login", all: ["#login-form"] }],
-  download: { selector: "a.download-pdf", requireKind: "article", method: "href" },
+  download: { selector: "a.download-pdf", requireKind: "article", method: "href", workTarget: { kind: "opaque" } },
   termsAccept: { modalSelector: "div.terms[open]", textAny: ["accept and download"] },
   federatedLogin: "https://sp.example/Shibboleth.sso/DS?entityID={entityID}&target=https://sp.example/home",
 };
@@ -2220,22 +2339,25 @@ const URL_SPEC: AdapterSpec = {
     selector: "button.dl",
     requireKind: "article",
     method: "url",
+    workTarget: { kind: "opaque" },
     idPattern: "/stable/([^?#]+)",
     urlTemplate: "https://provider.example.edu/pdf/{id}.pdf",
     requiresTermsConsent: true,
   },
 };
+const URL_SPEC_FIXTURE_URL = `https://${PROVIDER}/stable/4093878`;
 
 test("url-method adapter fetches the direct endpoint autonomously with terms consent", async () => {
   // JSTOR-class: the entitled PDF is at a constructible URL. With consent,
   // fetch it via the downloads API — no click, no gesture.
   const h = makeMapHarness([URL_SPEC]);
+  h.scripting.documentURL = URL_SPEC_FIXTURE_URL;
   h.settings.consent = "accept";
   h.scripting.constructedURL = "https://provider.example.edu/pdf/4093878.pdf";
   h.scripting.verdict = { kind: "article", adapter_id: "urlprov", adapter_version: "1.0.0", evidence: [] };
   await h.bridge.start();
   await h.port.inbound(offer("job_url_0001"));
-  await landOnProvider(h, "job_url_0001");
+  await landOnProvider(h, "job_url_0001", PROVIDER, URL_SPEC_FIXTURE_URL);
 
   expect(h.scripting.clicked.length).toBe(0); // no gesture click
   expect(h.downloads.started.length).toBe(1);
@@ -2245,11 +2367,12 @@ test("url-method adapter fetches the direct endpoint autonomously with terms con
 
 test("url-method adapter stays assisted (prompts, no fetch) without terms consent", async () => {
   const h = makeMapHarness([URL_SPEC]);
+  h.scripting.documentURL = URL_SPEC_FIXTURE_URL;
   // consent undefined -> gate stays human
   h.scripting.verdict = { kind: "article", adapter_id: "urlprov", adapter_version: "1.0.0", evidence: [] };
   await h.bridge.start();
   await h.port.inbound(offer("job_url_0002"));
-  await landOnProvider(h, "job_url_0002");
+  await landOnProvider(h, "job_url_0002", PROVIDER, URL_SPEC_FIXTURE_URL);
 
   expect(h.downloads.started.length).toBe(0); // no autonomous fetch
   expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(true);
@@ -2353,7 +2476,7 @@ test.skipIf(primoRecord === null)(
     const record = primoRecord as Document;
     const spec = adapters.find((a) => a.id === "primo") as AdapterSpec;
     const stripped = record.cloneNode(true) as Document;
-    for (const el of stripped.querySelectorAll("a.anchor-tag-style[href*='/discovery/sourceRecord']")) {
+    for (const el of Array.from(stripped.querySelectorAll("a.anchor-tag-style[href*='/discovery/sourceRecord']"))) {
       el.remove();
     }
     expect(interpret(stripped, spec, ctx()).kind).not.toBe("article");
@@ -2384,7 +2507,7 @@ test.skipIf(clinicalKeyArticle === null)(
     const article = clinicalKeyArticle as Document;
     const spec = adapters.find((a) => a.id === "clinicalkey") as AdapterSpec;
     const stripped = article.cloneNode(true) as Document;
-    for (const el of stripped.querySelectorAll("a[data-testid='pdf-download-link']")) el.remove();
+    for (const el of Array.from(stripped.querySelectorAll("a[data-testid='pdf-download-link']"))) el.remove();
     expect(interpret(stripped, spec, ctx()).kind).not.toBe("article");
   },
 );
@@ -2412,7 +2535,7 @@ test.skipIf(mdpiArticle === null)(
   () => {
     const article = (mdpiArticle as Document).cloneNode(true) as Document;
     const spec = adapters.find((a) => a.id === "mdpi") as AdapterSpec;
-    for (const anchor of article.querySelectorAll("a.UD_ArticlePDF")) anchor.remove();
+    for (const anchor of Array.from(article.querySelectorAll("a.UD_ArticlePDF"))) anchor.remove();
     expect(interpret(article, spec, ctx()).kind).toBe("unknown");
   },
 );
@@ -2439,7 +2562,7 @@ test.skipIf(hogrefeArticle === null)(
   () => {
     const article = (hogrefeArticle as Document).cloneNode(true) as Document;
     const spec = adapters.find((a) => a.id === "hogrefe") as AdapterSpec;
-    for (const anchor of article.querySelectorAll("a[href^='/doi/pdf/']")) anchor.remove();
+    for (const anchor of Array.from(article.querySelectorAll("a[href^='/doi/pdf/']"))) anchor.remove();
     expect(interpret(article, spec, ctx()).kind).toBe("unknown");
   },
 );

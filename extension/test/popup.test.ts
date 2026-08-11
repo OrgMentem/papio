@@ -14,6 +14,7 @@ import {
   openInstitutionSignIn,
   deriveSessionCardState,
   deriveSessionRows,
+  requestSessionState,
   readCurrentPageMetadata,
   refreshImpactSummary,
   refreshCaptureOptions,
@@ -22,8 +23,9 @@ import {
   grantProviderAccess,
   renderDaemonStatus,
   renderImpactSummary,
-  renderPageAcquire,
   renderPageContext,
+  renderPageAcquire,
+  sessionWarmForJob,
   renderResolverGrants,
   renderTermsConsent,
   wireCapture,
@@ -420,6 +422,181 @@ test("renders a live, honest status card for a local in-flight acquisition", () 
   expect(openedInbox).toBe(1);
   expect(openedTab).toBe(1);
 });
+test("scopes live auth-pending warmth to its demanded resolver origin", () => {
+  const now = Date.now();
+  const originA = "https://resolver-a.example.edu";
+  const originB = "https://resolver-b.example.edu";
+  const liveJob = job({
+    job_id: "job-b",
+    status: "auth_pending",
+    expected: { title: "Paper B", doi: "10.1000/paper-b" },
+  });
+  const originSnapshot = (origin: string, warm: boolean) => ({
+    origin,
+    authenticated: warm,
+    verdict: warm ? ("in" as const) : ("out" as const),
+    probeSource: warm ? ("live_tab" as const) : ("none" as const),
+    lastProbeOutcome: warm ? ("markers" as const) : ("no_markers" as const),
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: warm,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    dirtySince: null,
+  });
+  const session = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: true,
+    verdict: "in" as const,
+    probeSource: "live_tab" as const,
+    lastProbeOutcome: "markers" as const,
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: true,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    resolverOrigin: originA,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    authDemandComplete: true,
+    authDemand: [{ job_id: liveJob.job_id, origin: originB }],
+    origins: [originSnapshot(originA, true), originSnapshot(originB, false)],
+  };
+  const activity = [{
+    seq: 1,
+    at: new Date(now).toISOString(),
+    job_id: liveJob.job_id,
+    kind: "browser.auth_pending" as const,
+    text: "Waiting on you to sign in",
+  }];
+  const page = { url: "https://doi.org/10.1000/paper-b", doi: "10.1000/paper-b" };
+
+  expect(sessionWarmForJob(session, liveJob.job_id)).toBe(false);
+  const waitingDoc = popupDocument();
+  renderPageContext(waitingDoc, page, [liveJob], undefined, activity, {}, session);
+  expect(waitingDoc.getElementById("page-acquire-live-status")?.textContent).toContain(
+    "Waiting on you to sign in",
+  );
+  expect(waitingDoc.getElementById("page-acquire-live-status")?.textContent).not.toContain("Signed in");
+
+  const warmB = {
+    ...session,
+    origins: [originSnapshot(originA, false), originSnapshot(originB, true)],
+  };
+  expect(sessionWarmForJob(warmB, liveJob.job_id)).toBe(true);
+  const signedInDoc = popupDocument();
+  renderPageContext(signedInDoc, page, [liveJob], undefined, activity, {}, warmB);
+  expect(signedInDoc.getElementById("page-acquire-live-status")?.textContent).toContain("Signed in");
+
+  const { authDemand: _dropped, authDemandComplete: _oldWorker, ...legacySession } = session;
+  expect(sessionWarmForJob(legacySession, liveJob.job_id, true)).toBe(true);
+  expect(sessionWarmForJob({ ...legacySession, authDemandComplete: true }, liveJob.job_id, true)).toBe(false);
+});
+test("demanded warmth requires one exact fresh authenticated non-checking snapshot", () => {
+  const now = Date.now();
+  const origin = "https://resolver.example.edu";
+  const warmSnapshot = {
+    origin,
+    authenticated: true,
+    verdict: "in" as const,
+    probeSource: "live_tab" as const,
+    lastProbeOutcome: "markers" as const,
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: true,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    dirtySince: null,
+  };
+  const session = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: true,
+    verdict: "in" as const,
+    probeSource: "live_tab" as const,
+    lastProbeOutcome: "markers" as const,
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: true,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    resolverOrigin: origin,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    authDemandComplete: true,
+    authDemand: [{ job_id: "demanded-job", origin }],
+    origins: [warmSnapshot],
+  };
+
+  expect(sessionWarmForJob(session, "demanded-job")).toBe(true);
+  expect(sessionWarmForJob({ ...session, origins: [] }, "demanded-job")).toBe(false);
+  expect(
+    sessionWarmForJob(
+      { ...session, origins: [{ ...warmSnapshot, checking: true }] },
+      "demanded-job",
+    ),
+  ).toBe(false);
+  expect(
+    sessionWarmForJob(
+      { ...session, origins: [{ ...warmSnapshot, authenticated: false }] },
+      "demanded-job",
+    ),
+  ).toBe(false);
+  expect(
+    sessionWarmForJob(
+      {
+        ...session,
+        authDemand: [
+          { job_id: "demanded-job", origin },
+          { job_id: "demanded-job", origin },
+        ],
+      },
+      "demanded-job",
+    ),
+  ).toBe(false);
+  expect(
+    sessionWarmForJob(
+      {
+        ...session,
+        authDemand: [
+          { job_id: "demanded-job", origin },
+          { job_id: "demanded-job", origin: "https://other-resolver.example.edu" },
+        ],
+      },
+      "demanded-job",
+    ),
+  ).toBe(false);
+  expect(
+    sessionWarmForJob(
+      { ...session, origins: [{ ...warmSnapshot, lastVerdictAt: now - 10 * 60 * 1000 - 1 }] },
+      "demanded-job",
+    ),
+  ).toBe(false);
+  expect(
+    sessionWarmForJob(
+      { ...session, origins: [{ ...warmSnapshot, lastVerdictAt: now + 60_000 }] },
+      "demanded-job",
+    ),
+  ).toBe(false);
+  const futureSnapshot = { ...warmSnapshot, lastVerdictAt: now + 60_000 };
+  expect(
+    deriveSessionCardState({
+      ...session,
+      ...futureSnapshot,
+      resolverOrigin: origin,
+    }).action,
+  ).toBe("signin");
+  expect(
+    deriveSessionRows({ ...session, origins: [futureSnapshot] })[0]?.action,
+  ).toBe("signin");
+});
+
+
 
 test("merges auth-pending paper rows into the institution session card", async () => {
   const doc = popupDocument();
@@ -1405,6 +1582,209 @@ test("renders independent multi-origin session rows and targets each sign-in ori
   await Promise.resolve();
   expect(targets).toEqual([uwaOrigin]);
 });
+test("binds waiting demand to its warm origin instead of a stale secondary row", () => {
+  const now = Date.now();
+  const originA = "https://resolver.example.edu";
+  const originB = "https://stale.other.example";
+  const waitingJob = job({
+    job_id: "waiting-a",
+    status: "auth_pending",
+    waiting_for_session: true,
+    expected: { title: "Paper A" },
+  });
+  const state = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: true,
+    verdict: "in" as const,
+    probeSource: "live_tab" as const,
+    lastProbeOutcome: "markers" as const,
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    resolverOrigin: originA,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 1,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    authDemand: [{ job_id: waitingJob.job_id, origin: originA }],
+    origins: [
+      {
+        origin: originA,
+        authenticated: true,
+        verdict: "in" as const,
+        probeSource: "live_tab" as const,
+        lastProbeOutcome: "markers" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: now,
+        dirtySince: null,
+      },
+      {
+        origin: originB,
+        authenticated: true,
+        verdict: "in" as const,
+        probeSource: "keepalive_tab" as const,
+        lastProbeOutcome: "markers" as const,
+        lastVerdictAt: now - 34 * 60 * 60 * 1000,
+        checking: false,
+        likelyAuthenticated: true,
+        pausedForReauth: false,
+        lastProbeAt: now - 34 * 60 * 60 * 1000,
+        dirtySince: null,
+      },
+    ],
+  };
+  expect(deriveSessionRows(state)).toEqual([
+    expect.objectContaining({ origin: originA, label: "Session warm" }),
+  ]);
+  const doc = popupDocument();
+  renderInstitutionSession(doc, state);
+  renderNeedsAttention(
+    doc,
+    [waitingJob],
+    [],
+    async () => {},
+    async () => {},
+    [],
+    async () => {},
+    async () => true,
+    state.authDemand,
+  );
+  expect(doc.getElementById("institution-session-origin")?.textContent).toBe("resolver.example.edu");
+
+  expect(doc.querySelector(".institution-session-origin-row")).toBeNull();
+  expect(doc.getElementById("institution-session-waiting")?.textContent).toContain("resolver.example.edu");
+});
+test("hides unrelated session rows when a waiting job has no safe origin binding", () => {
+  const now = Date.now();
+  const originA = "https://resolver-a.example.edu";
+  const originB = "https://resolver-b.example.edu";
+  const state = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: false,
+    verdict: "out" as const,
+    probeSource: "none" as const,
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    resolverOrigin: originA,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    authDemand: [],
+    origins: [
+      {
+        origin: originA,
+        authenticated: false,
+        verdict: "out" as const,
+        probeSource: "none" as const,
+        lastProbeOutcome: "no_markers" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: now,
+        dirtySince: null,
+      },
+      {
+        origin: originB,
+        authenticated: false,
+        verdict: "out" as const,
+        probeSource: "none" as const,
+        lastProbeOutcome: "no_markers" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: now,
+        dirtySince: null,
+      },
+    ],
+  };
+  const waitingJob = job({ job_id: "unmapped-waiting", status: "auth_pending" });
+
+  expect(deriveSessionRows(state, [waitingJob])).toEqual([]);
+  expect(deriveSessionRows(state)).toHaveLength(2);
+});
+test("waiting demand for origin B cannot display origin A as its blocker", () => {
+  const now = Date.now();
+  const originA = "https://resolver.example.edu";
+  const originB = "https://other-resolver.example.edu";
+  const waitingJob = job({ job_id: "waiting-b", status: "auth_pending", waiting_for_session: true });
+  const state = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: false,
+    verdict: "out" as const,
+    probeSource: "none" as const,
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    resolverOrigin: originB,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 1,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    authDemand: [{ job_id: waitingJob.job_id, origin: originB }],
+    origins: [
+      {
+        origin: originA,
+        authenticated: false,
+        verdict: "out" as const,
+        probeSource: "none" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: now,
+        dirtySince: null,
+      },
+      {
+        origin: originB,
+        authenticated: false,
+        verdict: "out" as const,
+        probeSource: "none" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: now,
+        dirtySince: null,
+      },
+    ],
+  };
+  expect(deriveSessionRows(state).map((row) => row.origin)).toEqual([originB]);
+  const doc = popupDocument();
+  renderInstitutionSession(doc, state);
+  renderNeedsAttention(
+    doc,
+    [waitingJob],
+    [],
+    async () => {},
+    async () => {},
+    [],
+    async () => {},
+    async () => true,
+    state.authDemand,
+  );
+  expect(doc.getElementById("institution-session-waiting")?.textContent).toContain("other-resolver.example.edu");
+  expect(doc.querySelector(".institution-session-waiting-status")?.textContent).toBe(
+    "Waiting for other-resolver.example.edu sign-in — another paper's tab is at the login page",
+  );
+});
+
+
 
 test("a calm warm session renders no institution card at all", () => {
   const now = Date.now();
@@ -1796,5 +2176,65 @@ test("the 2-second checking retry reads a snapshot, never re-injecting a probe",
     expect(h.requests).toEqual([{ type: SESSION_STATE_MESSAGE }]);
   } finally {
     globalThis.setTimeout = originalSetTimeout;
+  }
+});
+test("malformed demand metadata falls back to the legacy session state", async () => {
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        sendMessage: async () =>
+          sessionReplyFixture({
+            authDemand: [{ job_id: "waiting-a", origin: "https://resolver.example.edu", extra: true }],
+          }),
+      },
+    },
+  });
+  const state = await requestSessionState();
+  expect(state).toBeDefined();
+  expect(state?.authDemand).toBeUndefined();
+  expect(state?.resolverOrigin).toBe("https://resolver.example.edu");
+});
+test("rejects malformed core and per-origin session origins", async () => {
+  const malformedOrigins = [
+    "https://resolver.example.edu/path",
+    "https://resolver.example.edu?query=1",
+    "https://resolver.example.edu#fragment",
+    "https://user:password@resolver.example.edu",
+  ];
+  for (const resolverOrigin of malformedOrigins) {
+    Object.assign(globalThis, {
+      chrome: {
+        runtime: {
+          sendMessage: async () => sessionReplyFixture({ resolverOrigin }),
+        },
+      },
+    });
+    await expect(requestSessionState()).resolves.toBeUndefined();
+  }
+
+  const validSnapshot = {
+    origin: "https://resolver.example.edu",
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    lastProbeOutcome: "markers",
+    lastVerdictAt: Date.now(),
+    checking: false,
+    likelyAuthenticated: true,
+    pausedForReauth: false,
+    lastProbeAt: Date.now(),
+  };
+  for (const origin of malformedOrigins) {
+    Object.assign(globalThis, {
+      chrome: {
+        runtime: {
+          sendMessage: async () =>
+            sessionReplyFixture({
+              origins: [{ ...validSnapshot, origin }],
+            }),
+        },
+      },
+    });
+    await expect(requestSessionState()).resolves.toBeUndefined();
   }
 });

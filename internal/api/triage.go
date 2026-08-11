@@ -205,6 +205,11 @@ func resolveActionCAS(ctx context.Context, raw json.RawMessage, system *bootstra
 		if err != nil {
 			return failure(err)
 		}
+		if system.Captures != nil {
+			if err := system.Captures.ReleaseJob(ctx, jobID); err != nil {
+				return failure(err)
+			}
+		}
 		if system.Preview != nil {
 			system.Preview.Revoke(params.ActionID)
 		}
@@ -221,6 +226,11 @@ func resolveActionCAS(ctx context.Context, raw json.RawMessage, system *bootstra
 			}{Outcome: string(job.ReviewConflict)})
 		}
 		return badParams(err)
+	}
+	if system.Captures != nil && (resolution.Outcome == job.ReviewApplied || resolution.Outcome == job.ReviewAlreadyApplied) {
+		if err := system.Captures.ReleaseJob(ctx, resolution.JobID); err != nil {
+			return failure(err)
+		}
 	}
 	if system.Preview != nil && (resolution.Outcome == job.ReviewApplied || resolution.Outcome == job.ReviewAlreadyApplied) {
 		system.Preview.Revoke(params.ActionID)

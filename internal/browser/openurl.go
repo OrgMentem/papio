@@ -28,17 +28,16 @@ func RouteURL(inst config.Institution, w work.Work) string {
 }
 
 // verifiedProviderHosts are the registrable domains of providers with
-// declarative adapters (or adapters in progress). They ride on every offer so
-// the extension can recognize a post-SSO landing on an entitled provider: the
-// resolver host alone goes blind the moment it routes the tab onward. Matching
-// is exact-or-dot-suffix on the extension side.
+// declarative adapters (or adapters in progress). They are an allowlist for
+// reviewed durable landing evidence selected by browserOfferHosts; ordinary
+// offers must not receive the complete registry.
 //
 // The browser protocol caps provider_hosts at 20 entries and extensions
-// before 0.4.1 fail-closed on longer lists, so this list must stay within the
-// cap and cannot simply grow with the adapter registry. Extensions from 0.4.1
-// also recognize any host in their own adapter registry (the registry is the
-// authoritative adapter-host source); this list only needs the families whose
-// entitled landings predate that behavior.
+// before 0.4.1 fail-closed on longer lists, so this list must stay within
+// the cap and cannot simply grow with the adapter registry. Extensions from
+// 0.4.1 also recognize any host in their own adapter registry (the registry is
+// the authoritative adapter-host source); this list only needs the families
+// whose entitled landings predate that behavior.
 var verifiedProviderHosts = []string{
 	"jstor.org",
 	"proquest.com",
@@ -56,9 +55,8 @@ var verifiedProviderHosts = []string{
 	"cell.com",
 }
 
-// resolverHost returns the hostname of the OpenURL base; it joins the verified
-// provider hosts on an offer (the resolver host is the tab papio opens; the
-// entitled provider host is where the resolver lands it).
+// resolverHost returns the hostname of a route URL. The bridge adds this
+// host first, then selectively adds any reviewed provider landing evidence.
 func resolverHost(base string) string {
 	u, err := url.Parse(base)
 	if err != nil {

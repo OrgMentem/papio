@@ -27,10 +27,11 @@ execution records kept during the initial build.
   outcomes latch only the exact adapter revision and host, so a repaired
   adapter is offered again while the broken one is not.
 - **`papio jobs failures` groups failures into incidents.** Terminal and
-  parked jobs are aggregated by a keyed failure-shape fingerprint (safety
-  domain, host family, outcome — hashed with a per-installation secret so no
-  raw host or identifier appears), so one provider redesign reads as one
-  incident instead of a page of repeats. Older daemons simply omit the
+  parked jobs are aggregated by a keyed failure-shape fingerprint. The
+  fingerprint excludes raw hosts and identifiers and uses a per-installation
+  secret, resisting stable cross-install correlation; local `jobs failures` and
+  `jobs incidents` output intentionally includes bounded `safety_domain` and
+  registrable `host_family` labels for diagnosis. Older daemons simply omit the
   incident rows.
 - **Failure evidence is pinned while an incident is open.** The first
   decisive and latest page captures of an open incident are exempt from the

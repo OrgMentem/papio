@@ -229,8 +229,8 @@ papio adapter repair <capture-id-or-path> [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--provider` | `string` |  | provider adapter id (required when capture metadata is absent) |
-| `--scenario` | `string` |  | fixture scenario (required when capture metadata is absent) |
+| `--provider` | `string` |  | provider adapter id (must match daemon capture metadata) |
+| `--scenario` | `string` |  | fixture scenario (must match daemon capture metadata) |
 
 ## `papio artifacts`
 
@@ -677,6 +677,10 @@ papio jobs diagnose <job-id>
 
 Group acquisition jobs that need attention
 
+Group acquisition jobs that need attention.
+
+Incident fingerprints omit raw hosts and identifiers and are keyed per installation; local output intentionally includes bounded safety_domain and registrable host_family labels for diagnosis.
+
 ```
 papio jobs failures [flags]
 ```
@@ -697,6 +701,23 @@ papio jobs get <job-id> [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--wait` | `bool` | `false` | wait for completion or human action |
+
+### `papio jobs incidents`
+
+Group decisive provider incidents
+
+Group decisive provider incidents by keyed failure shape.
+
+The fingerprint omits raw hosts and identifiers and is keyed per installation; local output intentionally includes bounded safety_domain and registrable host_family labels for diagnosis.
+
+```
+papio jobs incidents [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--limit` | `int` | `50` | maximum groups (1-200) |
+| `--since` | `string` |  | include incidents recorded since a duration or RFC3339 timestamp |
 
 ### `papio jobs list`
 

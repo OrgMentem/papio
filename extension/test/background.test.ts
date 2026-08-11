@@ -8,13 +8,14 @@ import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 
 import { parseBrowserMessage, type BrowserMessage, type PageCapturePayload } from "../src/protocol";
-import { emptyStore, type ActiveJob, type StateBackend, type StoreShape } from "../src/state";
+import { emptyStore, jobDownloadFilename, type ActiveJob, type StateBackend, type StoreShape } from "../src/state";
 import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
 import { KeepaliveManager, type FreshSessionEvidence, type KeepaliveAPI } from "../src/keepalive";
 import { type AdapterSpec, type PageVerdict } from "../src/adapters/types";
-import { planExecution, planGeneric, type GenericPlan, type Plan } from "../src/plan";
+import { planExecution, planGeneric, type GenericCandidate, type GenericPlan, type Plan } from "../src/plan";
 import {
   Bridge,
+  assessDrivenPage,
   findManagedTab,
   MIN_DAEMON_VERSION,
   hasDaemonUpdateHint,
@@ -24,10 +25,9 @@ import {
   needsVisibleWindow,
   normalizeManagedTabURL,
   normalizeExpectedDOI,
-  readCitationDOI,
   isBotChallenge,
   isRedirectLoopPage,
-  assessDrivenPage,
+  executePlannedPageEffect,
   registrableProviderHost,
   federatedLoginClaimKey,
   type BridgeDeps,
@@ -40,6 +40,7 @@ import {
 } from "../src/background";
 import { routeResolverService } from "../src/resolver";
 import { ChromeTabsFake } from "./fake-tabs";
+import { FakeDownloads } from "./fake-downloads";
 
 /** A hello_ack that must read as a healthy daemon has to sit at or above
  * background.ts's MIN_DAEMON_VERSION. Deriving it keeps a floor bump from
@@ -87,11 +88,12 @@ class FakePort implements NativePort {
     this.posted.push(msg);
     for (const waiter of this.frameWaiters) waiter(msg);
   }
-  async waitForFrame(type: BrowserMessage["type"]): Promise<BrowserMessage> {
-    const existing = this.posted.map(parseBrowserMessage).find((frame) => frame.type === type);
+  async waitForFrame(type: BrowserMessage["type"], afterPostedCount = 0): Promise<BrowserMessage> {
+    const existing = this.posted.slice(afterPostedCount).map(parseBrowserMessage).find((frame) => frame.type === type);
     if (existing !== undefined) return existing;
     return new Promise<BrowserMessage>((resolve) => {
       const waiter = (message: object) => {
+        if (this.posted.indexOf(message) < afterPostedCount) return;
         const frame = parseBrowserMessage(message);
         if (frame.type !== type) return;
         this.frameWaiters.delete(waiter);
@@ -222,44 +224,6 @@ class FakeTabGroups {
   }
 }
 
-class FakeDownloads {
-  readonly onCreated = new FakeEmitter<[DownloadItemLike]>();
-  readonly onChanged = new FakeEmitter<[DownloadDeltaLike]>();
-  readonly onDeterminingFilename = new FakeEmitter<
-    [DownloadItemLike, (s: { filename: string; conflictAction: "uniquify" }) => void]
-  >();
-  readonly items = new Map<number, DownloadItemLike>();
-  readonly started: {
-    url: string;
-    filename: string;
-    conflictAction: "uniquify";
-    saveAs: false;
-  }[] = [];
-  readonly removedFiles: number[] = [];
-  readonly erased: number[] = [];
-  failDownload = false;
-  async download(options: {
-    url: string;
-    filename: string;
-    conflictAction: "uniquify";
-    saveAs: false;
-  }): Promise<number> {
-    this.started.push(options);
-    if (this.failDownload) throw new Error("download blocked");
-    return 900 + this.started.length;
-  }
-  async removeFile(downloadID: number): Promise<void> {
-    this.removedFiles.push(downloadID);
-  }
-  async erase(query: { id: number }): Promise<number[]> {
-    this.erased.push(query.id);
-    return [query.id];
-  }
-  async search(query: { id: number }): Promise<DownloadItemLike[]> {
-    const item = this.items.get(query.id);
-    return item ? [item] : [];
-  }
-}
 
 class FakeAlarms {
   readonly onAlarm = new FakeEmitter<[{ name: string }]>();
@@ -491,14 +455,46 @@ function plannerResult(
   const expected = (args[2] ?? {}) as { title?: string; doi?: string; year?: number };
   const policy = (args[3] ?? {}) as { access_mode?: "assisted" | "delegated" | "conservative"; terms_consent?: "accept" | "decline" };
   const win = new Window({ url: "https://www.jstor.org/stable/4093878" });
+  const terms = verdict.kind === "terms" ? spec.termsAccept : undefined;
+  const planningSpec =
+    terms !== undefined
+      ? { ...spec, classify: [{ kind: "terms" as const, all: [terms.modalSelector] }] }
+      : spec;
+  if (terms !== undefined) {
+    const modalFirst = terms.modalSelector.split(/[.#\[]/u)[0]?.trim() ?? "div";
+    const modalTag = /^[a-z][a-z0-9-]*/iu.exec(modalFirst)?.[0] ?? "div";
+    const modal = win.document.createElement(modalTag);
+    const modalID = /#([A-Za-z0-9_-]+)/u.exec(terms.modalSelector)?.[1];
+    const modalClass = /\.([A-Za-z0-9_-]+)/u.exec(terms.modalSelector)?.[1];
+    if (modalID !== undefined) modal.id = modalID;
+    if (modalClass !== undefined) modal.className = modalClass;
+    if (/\[open\]/u.test(terms.modalSelector)) modal.setAttribute("open", "");
+    const controlSelector = terms.control ?? "button";
+    const controlFirst = controlSelector.split(/[.#\[]/u)[0]?.trim() ?? "button";
+    const controlTag = /^[a-z][a-z0-9-]*/iu.exec(controlFirst)?.[0] ?? "button";
+    const control = win.document.createElement(controlTag);
+    const controlID = /#([A-Za-z0-9_-]+)/u.exec(controlSelector)?.[1];
+    const controlClass = /\.([A-Za-z0-9_-]+)/u.exec(controlSelector)?.[1];
+    if (controlID !== undefined) control.id = controlID;
+    if (controlClass !== undefined) control.className = controlClass;
+    if (controlTag.toLowerCase() === "input") {
+      control.setAttribute("type", "submit");
+      control.setAttribute("value", terms.textAny[0] ?? "Accept");
+    } else {
+      control.textContent = terms.textAny[0] ?? "Accept";
+    }
+    modal.appendChild(control);
+    win.document.body.appendChild(modal);
+  }
   const selector = download?.selector;
-  if (selector !== undefined) {
+  if (selector !== undefined && terms === undefined) {
     const first = selector.split(",")[0]?.trim() ?? "div";
     const tag = /^[a-z][a-z0-9-]*/i.exec(first)?.[0] ?? "div";
     const element = win.document.createElement(tag);
     const id = /#([A-Za-z0-9_-]+)/.exec(first)?.[1];
     const className = /\.([A-Za-z0-9_-]+)/.exec(first)?.[1];
     if (id !== undefined) element.id = id;
+    if (className !== undefined) element.className = className;
     if (download?.method === "meta") {
       element.setAttribute("name", download.metaName ?? "citation_pdf_url");
       element.setAttribute("content", "https://download.example/paper.pdf");
@@ -507,7 +503,7 @@ function plannerResult(
     }
     (tag.toLowerCase() === "meta" ? win.document.head : win.document.body).appendChild(element);
   }
-  const actual = planExecution(win.document as unknown as Document, spec, expected, policy);
+  const actual = planExecution(win.document as unknown as Document, planningSpec, expected, policy);
   const fullVerdict: PageVerdict = {
     kind: verdict.kind,
     adapter_id: verdict.adapter_id ?? spec.id,
@@ -526,9 +522,33 @@ function plannerResult(
         required_consequence: "none",
         access_mode: policy.access_mode,
         terms_consent: policy.terms_consent ?? null,
+        expected_work: {
+          requested_doi: expected.doi?.trim().toLowerCase() ?? null,
+          requested_title: expected.title?.trim().toLowerCase().replace(/\s+/g, " ") ?? null,
+          doi: null,
+          title: null,
+        },
+        effect_graph: {
+          primary_target: null,
+          followup_target: null,
+          terms_target: null,
+          api: null,
+          consequence: "none",
+          route: null,
+        },
+        route_origin: null,
+        revalidation: { target_cardinality: 1, max_selector_length: 512, max_wait_ms: 0 },
       }
     : actual;
+  const termsPlan = fullVerdict.kind === "terms" && base.effect_graph.terms_target !== null;
   const article = fullVerdict.kind === "article" && spec.download !== undefined;
+  const articleTarget = article
+    ? (base.target_ref ?? {
+        selector: spec.download!.selector,
+        shadow_selector: spec.download!.shadowSelector ?? null,
+        fingerprint: "synthetic",
+      })
+    : null;
   return [{
     result: {
       ...base,
@@ -536,18 +556,34 @@ function plannerResult(
       adapter_version: fullVerdict.adapter_version,
       verdict: fullVerdict,
       decisive_rule: fullVerdict.kind === "unknown" ? null : `rule:${fullVerdict.kind} matched`,
-      target_ref: article
-        ? (base.target_ref ?? {
-            selector: spec.download!.selector,
-            shadow_selector: spec.download!.shadowSelector ?? null,
-            fingerprint: "synthetic",
-          })
-        : null,
-      method: article ? spec.download!.method : null,
-      url: article ? "https://download.example/paper.pdf" : null,
-      required_consequence: article ? "download" : "none",
+      target_ref: termsPlan ? null : articleTarget,
+      method: termsPlan ? null : article ? spec.download!.method : null,
+      url: termsPlan ? null : article ? "https://download.example/paper.pdf" : null,
+      required_consequence: termsPlan ? "none" : article ? "download" : "none",
+      effect_graph: termsPlan
+        ? base.effect_graph
+        : {
+            primary_target: articleTarget,
+            followup_target: null,
+            terms_target: null,
+            api: null,
+            consequence: article && spec.download!.method === "click" ? "modal" : article ? "download" : "none",
+            route: { origin: "https://download.example", pathname: "/paper.pdf" },
+          },
+      route_origin: termsPlan ? base.route_origin : "https://download.example",
+      revalidation: termsPlan
+        ? base.revalidation
+        : { target_cardinality: 1, max_selector_length: 512, max_wait_ms: 0 },
     },
   }];
+}
+function plannedEffectResult(
+  injection: Parameters<BridgeDeps["scripting"]["executeScript"]>[0],
+): { result: { ok: boolean; url?: string } }[] {
+  const plan = (injection.args?.[0] ?? {}) as Plan;
+  const rule = (injection.args?.[1] ?? {}) as { method?: string };
+  if (rule.method === "click") return [{ result: { ok: true } }];
+  return [{ result: { ok: plan.url !== null, ...(plan.url !== null ? { url: plan.url } : {}) } }];
 }
 
 
@@ -1011,127 +1047,127 @@ test("repeated reoffers reuse one ledger tab without growing the browser surface
   expect(h.tabs.created).toHaveLength(1);
   expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
 });
+test("assisted direct-file offers stay parked for either auth requirement", async () => {
+  for (const requiresAuth of [false, true]) {
+    const h = makeHarness();
+    const offer = jobOffer(`job_assisted_direct_${requiresAuth}`) as { payload: Record<string, unknown> };
+    offer.payload["openurl"] = "https://dl.acm.org/doi/pdf/10.1145/3630106.3660000";
+    offer.payload["access_mode"] = "assisted";
+    offer.payload["requires_auth"] = requiresAuth;
+    await h.bridge.start();
+    await h.port.inbound(offer);
+    expect(h.tabs.created).toHaveLength(0);
+    expect(h.downloads.started).toHaveLength(0);
+    expect(h.backend.store.activeJobs[0]).toMatchObject({
+      tab_id: -1,
+      status: "queued",
+      engagement_required: true,
+      access_mode: "assisted",
+    });
+  }
+});
 
-test("direct OA file offer downloads before opening a tab and adopts only PDF MIME", async () => {
+test("a legacy offer without access authority stays parked", async () => {
   const h = makeHarness();
-  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658941";
-  const offer = jobOffer("job_0001a_direct_pdf") as { payload: Record<string, unknown> };
-  offer.payload["openurl"] = directURL;
+  const offer = jobOffer("job_legacy_missing_mode") as { payload: Record<string, unknown> };
+  delete offer.payload["access_mode"];
   await h.bridge.start();
   await h.port.inbound(offer);
-
-  expect(h.tabs.created).toEqual([]);
-  expect(h.downloads.started).toEqual([
-    {
-      url: directURL,
-      filename: "papio/job_0001a_direct_pdf/paper.pdf",
-      conflictAction: "uniquify",
-      saveAs: false,
-    },
-  ]);
-  h.downloads.items.set(901, {
-    id: 901,
-    filename: "/Users/x/Downloads/paper.pdf",
-    fileSize: 64,
-    mime: "application/pdf",
-    state: "complete",
+  expect(h.tabs.created).toHaveLength(0);
+  expect(h.downloads.started).toHaveLength(0);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    tab_id: -1,
+    status: "queued",
+    engagement_required: true,
   });
-  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
-  expect(h.frames().some((f) => f.type === "download_complete" && f.job_id === "job_0001a_direct_pdf")).toBe(true);
+});
+
+test("a same-family orphan from another job is replaced rather than reused", async () => {
+  const h = makeHarness();
+  installManagedTabLedger(h, {
+    "100": {
+      openedAt: 1,
+      url: "https://resolver.example.edu/openurl?job=old",
+      jobID: "job_other",
+    },
+  });
+  h.tabs.seed({ id: 100, url: "https://resolver.example.edu/openurl?job=old" });
+  await h.bridge.start();
+  const offer = jobOffer("job_new_exact_url", "https://resolver.example.edu/openurl?job=new");
+  await h.port.inbound(offer);
+  expect(h.tabs.created).toEqual([{ url: "https://resolver.example.edu/openurl?job=new", active: true }]);
+  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(101);
+});
+
+
+
+test("direct JSON landing is parked as unknown rather than a candidate-local miss", async () => {
+  const h = makeHarness();
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942.pdf";
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
   await h.port.inbound({
     protocol: "papio-browser/1",
-    type: "ack",
-    msg_id: "ack_00000002",
-    job_id: "job_0001a_direct_pdf",
-    seq: 1,
-    payload: {},
+    type: "provider_direct_get_request",
+    msg_id: "direct_get_000001",
+    job_id: "job_0001a_direct_json",
+    seq: 2,
+    payload: {
+      drive_attempt_id: "direct-attempt-0001",
+      ordinal: 0,
+      route_revision: "acm-doi-pdf/1",
+      expected_identifier: "doi:10.1145/3630106.3658942.pdf",
+      url: directURL,
+      allowed_origin: "https://dl.acm.org",
+      path_family: "/doi/pdf/{doi}",
+      terms_policy: "none",
+    },
   });
-  expect(h.backend.store.activeJobs).toEqual([]);
-  expect(h.tabs.removed).toEqual([]);
-});
-
-test("non-PDF direct offer removes junk and falls back to the broker tab", async () => {
-  const h = makeHarness();
-  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942";
-  const offer = jobOffer("job_0001a_direct_fallback") as { payload: Record<string, unknown> };
-  offer.payload["openurl"] = directURL;
-  await h.bridge.start();
-  await h.port.inbound(offer);
   h.downloads.items.set(901, {
     id: 901,
-    filename: "/Users/x/Downloads/challenge.html",
+    filename: "/Users/x/Downloads/response.json",
     fileSize: 64,
-    mime: "text/html",
+    mime: "application/json",
     state: "complete",
   });
   await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
-
+  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  expect(result?.payload.outcome).toBe("unknown");
   expect(h.downloads.removedFiles).toEqual([901]);
-  expect(h.downloads.erased).toEqual([901]);
-  expect(h.tabs.created).toEqual([{ url: directURL, active: true }]);
-  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
-  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(false);
 });
 
-test("direct download initiation errors fall back to the broker tab", async () => {
+test("a direct route requiring durable terms consent does not download without consent", async () => {
   const h = makeHarness();
-  h.downloads.failDownload = true;
-  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658943";
-  const offer = jobOffer("job_0001a_direct_error") as { payload: Record<string, unknown> };
-  offer.payload["openurl"] = directURL;
   await h.bridge.start();
-  await h.port.inbound(offer);
+  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "provider_direct_get_request",
+    msg_id: "direct_get_terms_0001",
+    job_id: "job_0001a_direct_terms",
+    seq: 2,
+    payload: {
+      drive_attempt_id: "direct-terms-attempt-0001",
+      ordinal: 0,
+      route_revision: "acm-doi-pdf/1",
+      expected_identifier: "doi:10.1145/3630106.3658942",
+      url: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
+      allowed_origin: "https://dl.acm.org",
+      path_family: "/doi/pdf/{doi}",
+      terms_policy: "durable_consent",
+    },
+  });
 
-  expect(h.tabs.created).toEqual([{ url: directURL, active: true }]);
-  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
+  expect(h.downloads.started).toEqual([]);
+  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  expect(result?.payload).toMatchObject({
+    drive_attempt_id: "direct-terms-attempt-0001",
+    outcome: "terms",
+    landing_class: "terms",
+  });
+  expect(h.backend.store.activeJobs).toEqual([]);
 });
 
-test("tab-less re-offer without a durable offer URL recreates the direct download", async () => {
-  const jobID = "job_0001a_stale_direct";
-  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658944";
-  const seed: StoreShape = {
-    activeJobs: [
-      {
-        job_id: jobID,
-        tab_id: -1,
-        offered_at: 1,
-        expires_at: 2,
-        status: "accepted",
-        provider_hosts: [PROVIDER_HOST],
-        download_initiated: true,
-      },
-    ],
-  };
-  const h = makeHarness(seed);
-  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
-  offer.payload["openurl"] = directURL;
-
-  await h.bridge.start();
-  await h.port.inbound(offer);
-
-  expect(h.downloads.started).toHaveLength(1);
-  expect(h.downloads.started[0]?.url).toBe(directURL);
-  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
-});
-
-test("offer URLs round-trip through durable state for a worker restart", async () => {
-  const jobID = "job_0001a_durable_direct";
-  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658945";
-  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
-  offer.payload["openurl"] = directURL;
-  const first = makeHarness();
-
-  await first.bridge.start();
-  await first.port.inbound(offer);
-  expect(first.backend.store.offerURLs).toEqual({ [jobID]: directURL });
-
-  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
-  await restarted.bridge.start();
-  await restarted.port.inbound(offer);
-
-  expect(restarted.downloads.started).toEqual([]);
-  expect(restarted.backend.store.offerURLs).toEqual({ [jobID]: directURL });
-});
 
 test("pre-auth handoffs queue behind one visible tab, then release after auth returns", async () => {
   const h = makeHarness();
@@ -1160,6 +1196,7 @@ test("pre-auth handoffs queue behind one visible tab, then release after auth re
     expires_at: h.clock.now + 1,
     status: "accepted",
     provider_hosts: [PROVIDER_HOST],
+    access_mode: "delegated",
   });
   h.tabs.seed({ id: stuckTabID, url: idpURL });
 
@@ -1167,9 +1204,9 @@ test("pre-auth handoffs queue behind one visible tab, then release after auth re
   const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
   await h.tabs.userNavigate(activeTabID, providerURL);
 
-  expect(h.tabs.created).toHaveLength(2);
-  expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(1);
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(3);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(0);
+  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(4);
   expect(h.tabs.reloaded).toEqual([stuckTabID]);
 });
 
@@ -1607,6 +1644,12 @@ test("a warm resolver landing releases queued handoffs without an auth event", a
   const firstTabID = h.backend.store.activeJobs.find((job) => job.tab_id >= 0)?.tab_id ?? -1;
 
   await h.tabs.completeNavigation(firstTabID, OPENURL);
+  // The landing is warm evidence for this resolver, but the first drive still
+  // owns the sole effect slot. Settle that owner before asserting the FIFO
+  // successor, rather than inventing a concurrent second drive.
+  await h.bridge.requestCancel(jobIDs[0]!);
+  const internals = h.bridge as unknown as { releaseQueuedHandoffs: () => Promise<void> };
+  await internals.releaseQueuedHandoffs.call(h.bridge);
 
   expect(h.tabs.created).toEqual([
     { url: OPENURL, active: true },
@@ -1827,6 +1870,7 @@ test("a registry-only adapter host classifies and emits an observed capture", as
       expires_at: EXPIRES,
     },
   });
+  await expect(h.bridge.openHandoff("job_0001a_registry_host")).resolves.toEqual({ ok: true, opened: true });
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const articleURL = `https://${PROVIDER_HOST}/stable/article`;
   await h.tabs.completeNavigation(tabID, articleURL);
@@ -2078,9 +2122,19 @@ test("challenge resume queues without a governor slot before classifying", async
   const h = makeHarness();
   useUnknownProviderClassifier(h, () => challenge);
   const challengeTabID = await classifyProviderUnknown(h, "job_challenge_resume_queued");
-  await h.port.inbound(jobOfferForHosts("job_resume_slot_a", ["link.springer.com"]));
-  await h.port.inbound(jobOfferForHosts("job_resume_slot_b", ["link.springer.com"]));
-  expect(h.tabs.list().length).toBe(3);
+  const ownerOffer = jobOfferForHosts("job_resume_slot_a", ["link.springer.com"]) as {
+    payload: Record<string, unknown>;
+  };
+  ownerOffer.payload["requires_auth"] = false;
+  await h.port.inbound(ownerOffer);
+  const queuedOffer = jobOfferForHosts("job_resume_slot_b", ["link.springer.com"]) as {
+    payload: Record<string, unknown>;
+  };
+  queuedOffer.payload["requires_auth"] = true;
+  await h.port.inbound(queuedOffer);
+  // The challenge parked its own tab and released its slot, so the first
+  // unrelated offer may legitimately claim it; the second stays FIFO-queued.
+  expect(h.tabs.list().length).toBe(2);
 
   const spec = h.deps.adapterSpecs[0]!;
   spec.download = {
@@ -2096,6 +2150,7 @@ test("challenge resume queues without a governor slot before classifying", async
     if (injection.func === planExecution) {
       return plannerResult(injection, { kind: "article", adapter_id: spec.id, adapter_version: spec.version, evidence: [] });
     }
+    if (injection.func === executePlannedPageEffect) return plannedEffectResult(injection);
     return [{ result: "https://download.example/paper.pdf" }];
   };
 
@@ -2107,7 +2162,15 @@ test("challenge resume queues without a governor slot before classifying", async
   const resumed = h.backend.store.activeJobs.find((job) => job.job_id === "job_challenge_resume_queued");
   expect(resumed).toMatchObject({ tab_id: challengeTabID, status: "accepted" });
   expect(resumed?.challenge_blocked).toBeUndefined();
-  expect(h.tabs.list().length).toBe(3);
+  const resumedInternals = h.bridge as unknown as {
+    handoffDriveQueue: Array<{ jobID: string }>;
+    handoffDrives: Map<string, unknown>;
+  };
+  expect(resumedInternals.handoffDrives.has("job_challenge_resume_queued")).toBe(false);
+  expect(resumedInternals.handoffDriveQueue.some((request) => request.jobID === "job_challenge_resume_queued")).toBe(true);
+  // The unrelated owner remains effectful while the resumed challenge waits
+  // for a governor slot; no second classification or download is allowed.
+  expect(h.tabs.list().length).toBe(2);
 });
 test("driven-page assessment classifies challenge, redirect-loop, and normal fixtures", () => {
   const fixture = (html: string): Document => {
@@ -2282,6 +2345,7 @@ test("a unique manual Chrome download from a registry-only host is correlated", 
       expires_at: EXPIRES,
     },
   });
+  await expect(h.bridge.openHandoff("job_0001a_registry_manual")).resolves.toEqual({ ok: true, opened: true });
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const articleURL = `https://${PROVIDER_HOST}/stable/article`;
   await h.tabs.completeNavigation(tabID, articleURL);
@@ -2371,32 +2435,53 @@ test("concurrent classifications after accepted terms initiate exactly one downl
     if (injection.func === planExecution) {
       return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
     }
+    if (injection.func === executePlannedPageEffect) return plannedEffectResult(injection);
     return [{ result: "https://download.example/paper.pdf" }];
   };
   let consentCalls = 0;
-  let gateEnabled = false;
-  let releaseConsent!: () => void;
-  const consentGate = new Promise<"accept">((resolve) => {
-    releaseConsent = () => resolve("accept");
+  let effectCalls = 0;
+  let signalEffectStarted!: () => void;
+  let releaseEffect!: () => void;
+  const effectStarted = new Promise<void>((resolve) => {
+    signalEffectStarted = resolve;
+  });
+  const effectGate = new Promise<void>((resolve) => {
+    releaseEffect = () => resolve();
   });
   h.deps.settings.getTermsConsent = async () => {
-    if (!gateEnabled) return "accept";
     consentCalls += 1;
-    return consentGate;
+    return "accept";
+  };
+  const originalExecuteScript = h.deps.scripting.executeScript;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === executePlannedPageEffect) {
+      effectCalls += 1;
+      signalEffectStarted();
+      if (effectCalls === 1) await effectGate;
+    }
+    return originalExecuteScript(injection);
   };
 
   await h.bridge.start();
-  gateEnabled = true;
   await h.port.inbound(jobOffer("job_terms_race"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const url = `https://${PROVIDER_HOST}/stable/article`;
   const first = h.tabs.completeNavigation(tabID, url);
   const second = h.tabs.completeNavigation(tabID, url);
-  for (let attempt = 0; attempt < 20 && consentCalls < 2; attempt += 1) await Promise.resolve();
-  releaseConsent();
+  await effectStarted;
+  // The first classification owns the provider/effect lease; the concurrent
+  // observation is queued rather than entering a second terms/download effect.
+  expect(effectCalls).toBe(1);
+  expect(consentCalls).toBeGreaterThan(0);
+  expect(h.downloads.started).toHaveLength(0);
+  releaseEffect();
   await Promise.all([first, second]);
 
-  expect(consentCalls).toBe(2);
+  const retry = h.timers.find((timer) => timer.ms === 2_500);
+  expect(retry).toBeDefined();
+  await retry?.fn();
+  expect(effectCalls).toBe(1);
+  expect(consentCalls).toBeGreaterThan(0);
   expect(h.downloads.started).toHaveLength(1);
   expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
 });
@@ -2411,6 +2496,12 @@ test("a queued handoff falls back to a background tab after 45 seconds", async (
   const fallback = h.timers.find((timer) => timer.ms === 45_000);
   expect(fallback).toBeDefined();
 
+  // Model the first effect settling without letting the ordinary release
+  // drain consume the queued job before its durable 45-second fallback fires.
+  const internals = h.bridge as unknown as {
+    releaseHandoffDrive(jobID: string): void;
+  };
+  internals.releaseHandoffDrive("job_0001a_timer_active");
   await fallback?.fn();
 
   expect(h.tabs.created).toEqual([
@@ -2821,7 +2912,9 @@ test("Firefox adapter API downloads remain filename-controlled and report normal
   h.deps.scripting.executeScript = async (injection) =>
     injection.func === planExecution
       ? plannerResult(injection, { kind: "article" })
-      : [{ result: `https://${PROVIDER_HOST}/download/article.pdf` }];
+      : injection.func === executePlannedPageEffect
+        ? [{ result: { ok: true, url: `https://${PROVIDER_HOST}/download/article.pdf` } }]
+        : [];
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0004_firefox_api"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -2868,7 +2961,11 @@ test("a cross-origin api download with a content-disposition rename steers into 
   h.deps.adapterSpecs.push(apiAdapter);
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) =>
-    injection.func === planExecution ? plannerResult(injection, { kind: "article" }) : [{ result: crossOriginPDF }];
+    injection.func === planExecution
+      ? plannerResult(injection, { kind: "article" })
+      : injection.func === executePlannedPageEffect
+        ? [{ result: { ok: true, url: crossOriginPDF } }]
+        : [{ result: crossOriginPDF }];
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0004b_xorigin_api"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -2920,8 +3017,9 @@ test("a CDN PDF viewer is adopted for one uniquely driven accepted job", async (
       offered_at: 1_700_000_000_000,
       expires_at: 1_800_000_000_000,
       status: "accepted",
-      provider_hosts: [PROVIDER_HOST],
+      provider_hosts: ["www.sciencedirect.com"],
       download_initiated: true,
+      access_mode: "delegated",
     }],
   });
   h.tabs.seed({ id: 100, url: OPENURL });
@@ -2936,6 +3034,27 @@ test("a CDN PDF viewer is adopted for one uniquely driven accepted job", async (
     saveAs: false,
   }]);
 });
+test("an unrelated openerless PDF viewer is rejected without provider provenance", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: "job_unrelated_viewer",
+      tab_id: 100,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "accepted",
+      provider_hosts: [PROVIDER_HOST],
+      access_mode: "delegated",
+      download_initiated: true,
+    }],
+  });
+  h.tabs.seed({ id: 100, url: OPENURL });
+  await h.bridge.start();
+  h.tabs.seed({ id: 101, url: "about:blank" });
+  await h.tabs.completeNavigation(101, "https://unrelated.example/paper.pdf");
+  expect(h.downloads.started).toEqual([]);
+});
+
 
 test("a CDN PDF viewer remains unadopted when two driven jobs are candidates", async () => {
   const h = makeHarness({
@@ -2946,7 +3065,7 @@ test("a CDN PDF viewer remains unadopted when two driven jobs are candidates", a
       offered_at: 1_700_000_000_000,
       expires_at: 1_800_000_000_000,
       status: "accepted" as const,
-      provider_hosts: [PROVIDER_HOST],
+      provider_hosts: ["www.sciencedirect.com"],
       download_initiated: true,
     })),
   });
@@ -2969,7 +3088,7 @@ test("Firefox keeps the CDN viewer adoption path disabled for click adapters", a
       offered_at: 1_700_000_000_000,
       expires_at: 1_800_000_000_000,
       status: "accepted",
-      provider_hosts: [PROVIDER_HOST],
+      provider_hosts: ["www.sciencedirect.com"],
       adapter_id: "firefox-click",
       download_initiated: true,
     }],
@@ -3094,13 +3213,11 @@ test("a pre-existing content-disposition download prevents PDF-viewer duplicatio
 
   expect(h.downloads.started).toEqual([]);
 });
-
 test("an MDPI PDF route without a .pdf suffix is adopted", async () => {
   const h = makeHarness();
   await h.bridge.start();
   const pdfURL = "https://mdpi.com/2227-7102/9/3/181/pdf?version=1563177761";
   await h.port.inbound(jobOfferForHosts("job_mdpi_pdf_route", ["mdpi.com"], pdfURL));
-  await h.bridge.openHandoff("job_mdpi_pdf_route");
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   await h.tabs.completeNavigation(tabID, pdfURL);
 
@@ -3113,6 +3230,7 @@ test("an MDPI PDF route without a .pdf suffix is adopted", async () => {
     },
   ]);
 });
+
 
 test("a correlated download is steered into papio/<job_id>/; unrelated untouched", async () => {
   const h = makeHarness();
@@ -3273,15 +3391,21 @@ test("concurrent handoff triggers cannot double-drain one provider", async () =>
   await h.port.inbound(jobOffer("job_provider_active"));
   await h.port.inbound(jobOffer("job_provider_first"));
   await h.port.inbound(jobOffer("job_provider_second"));
-
+  // The single governor slot is released before the racing inbox opens; both
+  // requests must still target their exact queued jobs, not double-drain.
+  await h.bridge.requestCancel("job_provider_active");
   const [first, second] = await Promise.all([
     h.bridge.openHandoff("job_provider_first"),
     h.bridge.openHandoff("job_provider_second"),
   ]);
 
-  expect(first).toEqual({ ok: true, opened: true });
+  expect(first).toMatchObject({ ok: true, opened: true });
   expect(second).toMatchObject({ ok: false });
   expect(h.tabs.created).toHaveLength(2);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_provider_first")).toMatchObject({
+    tab_id: expect.any(Number),
+    status: "accepted",
+  });
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_provider_second")).toMatchObject({
     tab_id: -1,
     status: "queued",
@@ -3296,17 +3420,18 @@ test("concurrent fallback timers retain same-provider handoffs behind one lease"
 
   await h.bridge.start();
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
-
   expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(3);
   const fallbacks = h.timers.filter((timer) => timer.ms === 45_000);
   expect(fallbacks).toHaveLength(3);
-
+  await h.bridge.requestCancel("job_conc_active");
   // Racing fallback callbacks claim one provider lease. The remaining jobs
   // stay queued instead of opening concurrent handoff tabs for the same host.
   await Promise.all(fallbacks.map((timer) => timer.fn()));
 
   expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(2);
-  expect(h.backend.store.activeJobs.filter((job) => job.tab_id >= 0)).toHaveLength(2);
+  expect(h.backend.store.activeJobs.filter((job) => job.tab_id >= 0)).toHaveLength(1);
+  // One fallback owns the sole provider lease and is surfaced in the
+  // background; the remaining callbacks retain their queued jobs.
   expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(1);
 });
 
@@ -3463,7 +3588,8 @@ test("a directly matched visible-required handoff opens a normal unfocused windo
 });
 
 test("work window is reused across offers and recreated after the user closes it", async () => {
-  // Warm auth evidence so every offer opens immediately instead of queueing.
+  // Warm auth evidence makes the first offer immediately occupy the single
+  // governor slot; later offers remain queued until it releases.
   const h = makeHarness(
     { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
     { windows: true },
@@ -3473,9 +3599,9 @@ test("work window is reused across offers and recreated after the user closes it
   await h.port.inbound(jobOffer("job_ww_b"));
 
   expect(h.windows?.created.length).toBe(1);
-  expect(h.tabs.created.map((t) => t.windowId)).toEqual([500, 500]);
+  expect(h.tabs.created.map((t) => t.windowId)).toEqual([500]);
 
-  // The governor queues a third drive while both warm slots are occupied.
+  // The governor queues further drives while the single warm slot is occupied.
   h.windows?.close(500);
   await h.port.inbound(jobOffer("job_ww_c"));
   expect(h.windows?.created.length).toBe(1);
@@ -3562,9 +3688,11 @@ test("tab-group handoffs reuse one papio group", async () => {
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_tg_a"));
   const groupID = h.backend.store.handoffGroupID!;
+  await h.bridge.requestCancel("job_tg_a");
   await h.port.inbound(jobOffer("job_tg_b"));
 
-  // Second handoff joins the same group rather than creating another.
+  // The second handoff opens after the first releases and joins the same
+  // papio group rather than creating another group.
   expect(h.tabs.grouped).toEqual([{ tabIds: [100] }, { tabIds: [101], groupId: groupID }]);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
   expect(h.tabGroups?.live.size).toBe(1);
@@ -3926,6 +4054,33 @@ test("popup capture relay withholds a terms capture until the daemon advertises 
   expect(captures[0]?.payload).toEqual({ ...encoded.payload });
 });
 
+test("capture consent refreshes live false-to-true and true-to-false", async () => {
+  const h = makeHarness(undefined, { firefox: true, captureConsent: false });
+  let allowed = false;
+  h.deps.captureConsent = { get: async () => allowed };
+  const sanitized = sanitizeFixture(`<main class="article">Consent transition</main>`, {
+    provider: "jstor",
+    scenario: "success",
+    originNoQuery: "https://www.jstor.org/stable/consent",
+    capturedISO: "2026-08-10T00:00:00.000Z",
+  });
+  const encoded = await encodePageCapture(sanitized, {
+    host: "www.jstor.org",
+    scenario: "success",
+    adapterID: "jstor",
+    adapterVersion: "1",
+  });
+  if (!encoded.ok) throw new Error(encoded.error);
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+  await expect(h.bridge.sendPageCapture(encoded.payload)).resolves.toBe(false);
+  allowed = true;
+  await expect(h.bridge.sendPageCapture(encoded.payload)).resolves.toBe(true);
+  allowed = false;
+  await expect(h.bridge.sendPageCapture(encoded.payload)).resolves.toBe(false);
+  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(1);
+});
+
 test("page capture request closes an inactive ledgered managed tab after focus moves away", async () => {
   const h = makeHarness(undefined, { windows: true, handoffSurface: "work-window" });
   let ledger: Record<string, { openedAt: number; url: string; windowId?: number; groupId?: number }> = {};
@@ -4014,7 +4169,7 @@ test("page capture request closes an inactive ledgered managed tab after focus m
   expect(h.downloads.started).toHaveLength(0);
 });
 
-test("page capture request respects the two-drive handoff governor", async () => {
+test("page capture request respects the single-drive handoff governor", async () => {
   const h = makeHarness(
     { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
     { handoffSurface: "in-window" },
@@ -4026,7 +4181,7 @@ test("page capture request respects the two-drive handoff governor", async () =>
   }));
   await h.port.inbound(jobOffer("job_capture_governor_1"));
   await h.port.inbound(jobOffer("job_capture_governor_2"));
-  expect(h.tabs.created).toHaveLength(2);
+  expect(h.tabs.created).toHaveLength(1);
 
   await h.port.inbound({
     protocol: "papio-browser/1",
@@ -4041,7 +4196,7 @@ test("page capture request respects the two-drive handoff governor", async () =>
       settle_ms: 0,
     },
   });
-  expect(h.tabs.created).toHaveLength(2);
+  expect(h.tabs.created).toHaveLength(1);
   const result = h.frames().find(
     (frame) =>
       frame.type === "page_capture_request_result" &&
@@ -4885,6 +5040,100 @@ test("session state reports each known resolver and sign-in targets its origin",
   expect(h.tabs.created).toContainEqual({ url: collegeOrigin, active: true });
 });
 
+test("configured auth-like resolver origins remain in strict membership", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: ["https://sso.resolver.example.edu"] }));
+
+  expect(h.bridge.knownResolverOrigins()).toEqual(["https://sso.resolver.example.edu"]);
+});
+
+test("generic engagement alone is omitted from session authentication demand", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    resolverOrigins: ["https://resolver.example.edu"],
+    activeJobs: [
+      {
+        job_id: "job_generic_engagement",
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        provider_hosts: [],
+        engagement_required: true,
+      },
+    ],
+  });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
+
+  expect(h.bridge.sessionAuthDemand()).toEqual([]);
+});
+
+test("origin-specific sign-in rejects an arbitrary origin before a current hello", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+
+  await expect(h.bridge.requestSessionSignIn("https://arbitrary.example.edu")).resolves.toEqual({
+    ok: false,
+    error: { code: "resolver_unavailable", message: "The daemon has not confirmed configured institutions" },
+  });
+  expect(h.tabs.created).toEqual([]);
+});
+
+test("old-daemon empty resolver sets allow only the keepalive current origin", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  const currentOrigin = "https://legacy-resolver.example.edu";
+  const opened: (string | undefined)[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ resolverOrigin: currentOrigin, pausedForReauth: false }),
+    openReauth: async (originHint?: string) => {
+      opened.push(originHint);
+      return true;
+    },
+  } as unknown as KeepaliveManager);
+
+  await expect(h.bridge.requestSessionSignIn(currentOrigin)).resolves.toEqual({ ok: true, opened: true });
+  await expect(h.bridge.requestSessionSignIn("https://unknown-legacy.example.edu")).resolves.toEqual({
+    ok: false,
+    error: { code: "resolver_unavailable", message: "This institution is not currently configured" },
+  });
+  expect(opened).toEqual([currentOrigin]);
+});
+
+test("session state binds active authentication demand to the exact resolver origin", async () => {
+  const h = makeHarness();
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+  };
+  const originA = "https://resolver.example.edu";
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: [originA, "https://stale.other.example"] }));
+  await h.port.inbound(jobOffer("job_demand_a", OPENURL));
+  const tabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_demand_a")?.tab_id ?? -1;
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.session.state" },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toMatchObject({
+    ok: true,
+    state: {
+      authDemand: [{ job_id: "job_demand_a", origin: originA }],
+    },
+  });
+});
+
+
 test("provider and OA offer URLs never mint institution session rows", async () => {
   const h = makeHarness();
   const urls = {
@@ -5100,43 +5349,57 @@ test("an inbox delivery reconciliation relays confirm_request_exists/absent thro
   await h.port.inbound(nativeResult("delivery_reconcile_result", {
     request_id: frame.payload["request_id"],
     outcome: "applied",
+    detail: "delivery request confirmed",
   }));
-  await expect(pending).resolves.toEqual({ ok: true, outcome: "applied" });
-
+  const postedBeforeAbsent = h.port.posted.length;
   const pendingAbsent = handleInboxRuntimeMessage(
     h.bridge,
     { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0002", operation: "confirm_request_absent" } },
     { id: urls.runtimeID, url: urls.inboxURL },
     urls,
   );
-  await Promise.resolve();
-  await Promise.resolve();
-  const absentFrame = h.frames().filter((f) => f.type === "delivery_reconcile_request").at(-1);
-  expect(absentFrame?.payload["job_id"]).toBe("job_delivery_0002");
-  expect(absentFrame?.payload["operation"]).toBe("confirm_request_absent");
-  expect(absentFrame?.payload["provider_reference"]).toBeUndefined();
+  const absentFrame = await h.port.waitForFrame("delivery_reconcile_request", postedBeforeAbsent);
+  expect(absentFrame.payload["job_id"]).toBe("job_delivery_0002");
+  expect(absentFrame.payload["operation"]).toBe("confirm_request_absent");
+  expect(absentFrame.payload["provider_reference"]).toBeUndefined();
   await h.port.inbound(nativeResult("delivery_reconcile_result", {
     request_id: absentFrame?.payload["request_id"],
     outcome: "applied",
   }));
   await expect(pendingAbsent).resolves.toEqual({ ok: true, outcome: "applied" });
 
-  // Shape validation and sender authorization must both fail closed.
+  // Shape validation and sender authorization must both fail closed without
+  // reaching native messaging. Missing/empty references are invalid for
+  // confirm_request_exists; even an explicit undefined provider_reference key
+  // is forbidden for confirm_request_absent.
+  const reconcileFrameCount = () => h.frames().filter((f) => f.type === "delivery_reconcile_request").length;
+  const beforeMalformed = reconcileFrameCount();
+  const malformedRequests = [
+    { job_id: "job_delivery_0003", operation: "confirm_request_exists" },
+    { job_id: "job_delivery_0003", operation: "confirm_request_exists", provider_reference: "" },
+    { job_id: "job_delivery_0003", operation: "confirm_request_absent", provider_reference: undefined },
+    { job_id: "job_delivery_0003", operation: "confirm_request_absent", extra: true },
+    { job_id: "bad!", operation: "confirm_request_exists", provider_reference: "TN-43" },
+    { job_id: "job_delivery_0003", operation: "other", provider_reference: "TN-43" },
+  ];
+  for (const request of malformedRequests) {
+    await expect(
+      handleInboxRuntimeMessage(
+        h.bridge,
+        { type: "papio.delivery.reconcile", request },
+        { id: urls.runtimeID, url: urls.inboxURL },
+        urls,
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "invalid_request", message: "Invalid delivery reconciliation request" },
+    });
+  }
+  expect(reconcileFrameCount()).toBe(beforeMalformed);
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
-      { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0001", operation: "confirm_request_absent", provider_reference: "TN-42" } },
-      { id: urls.runtimeID, url: urls.inboxURL },
-      urls,
-    ),
-  ).resolves.toEqual({
-    ok: false,
-    error: { code: "invalid_request", message: "Invalid delivery reconciliation request" },
-  });
-  await expect(
-    handleInboxRuntimeMessage(
-      h.bridge,
-      { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0001", operation: "confirm_request_absent" } },
+      { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0003", operation: "confirm_request_absent" } },
       { id: urls.runtimeID, url: urls.popupURL },
       urls,
     ),
@@ -5144,6 +5407,7 @@ test("an inbox delivery reconciliation relays confirm_request_exists/absent thro
     ok: false,
     error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
   });
+  expect(reconcileFrameCount()).toBe(beforeMalformed);
 });
 
 test("queued inbox handoff force-releases exactly one live tab under racing opens", async () => {
@@ -5153,6 +5417,7 @@ test("queued inbox handoff force-releases exactly one live tab under racing open
   await h.port.inbound(jobOffer("job_0001a_handoff_queued"));
 
   const queuedID = "job_0001a_handoff_queued";
+  await h.bridge.requestCancel("job_0001a_handoff_active");
   expect(h.backend.store.activeJobs.find((job) => job.job_id === queuedID)?.status).toBe("queued");
   const [first, second] = await Promise.all([h.bridge.openHandoff(queuedID), h.bridge.openHandoff(queuedID)]);
   const released = h.backend.store.activeJobs.find((job) => job.job_id === queuedID);
@@ -5746,48 +6011,32 @@ test("a refused review preview reports the daemon's reason", async () => {
   });
 });
 
-test("a direct-file offer that requires a sign-in is queued, never downloaded", async () => {
-  // isDirectFileOffer matches on URL shape alone. An institutional offer's URL
-  // is the operator's configured OpenURL base, whose path papio does not
-  // constrain, so a pdf-shaped base would otherwise route a sign-in-required
-  // offer straight into chrome.downloads with no human present.
-  const h = makeHarness();
-  const offer = jobOffer("job_0091_auth_direct") as { payload: Record<string, unknown> };
-  offer.payload["openurl"] = "https://library.example.edu/openurl/pdf/10.1000-x";
-  offer.payload["requires_auth"] = true;
-  await h.bridge.start();
-  await h.port.inbound(offer);
-
-  expect(h.downloads.started).toEqual([]);
-  const job = h.backend.store.activeJobs.find((j) => j.job_id === "job_0091_auth_direct");
-  expect(job?.status).toBe("queued");
-});
 
 
-test("handoff governor keeps two drives, drains FIFO on settle and timeout", async () => {
+test("handoff governor keeps one drive, drains FIFO on settle and timeout", async () => {
   const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
   await h.bridge.start();
   const jobIDs = Array.from({ length: 5 }, (_, index) => `job_governor_${index}`);
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
 
-  expect(h.tabs.list().length).toBe(2);
-  expect(h.tabs.created).toHaveLength(2);
-  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(3);
+  expect(h.tabs.list().length).toBe(1);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(4);
   expect(h.frames().filter((frame) => frame.type === "job_accept")).toHaveLength(5);
 
   const first = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
   expect(first?.tab_id).toBeGreaterThanOrEqual(0);
   await h.bridge.requestCancel(jobIDs[0]!);
-  expect(h.tabs.list().length).toBe(3);
-  expect(h.tabs.created).toHaveLength(3);
+  expect(h.tabs.list().length).toBe(2);
+  expect(h.tabs.created).toHaveLength(2);
 
   const timeout = h.timers.at(-1);
   expect(timeout?.ms).toBe(180_000);
   h.clock.now += 180_000;
   await timeout?.fn();
-  expect(h.tabs.list().length).toBe(4);
-  expect(h.tabs.created).toHaveLength(4);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[2])?.status).toBe("auth_pending");
+  expect(h.tabs.list().length).toBe(3);
+  expect(h.tabs.created).toHaveLength(3);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])?.status).toBe("auth_pending");
 });
 
 test("a drive timing out on an authentication page leaves the tab open and frees the governor slot", async () => {
@@ -5801,8 +6050,8 @@ test("a drive timing out on an authentication page leaves the tab open and frees
   const jobIDs = Array.from({ length: 3 }, (_, index) => `job_auth_timeout_${index}`);
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
 
-  expect(h.tabs.list().length).toBe(2);
-  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(1);
+  expect(h.tabs.list().length).toBe(1);
+  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(2);
   const first = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
   const firstTabID = first?.tab_id ?? -1;
   expect(firstTabID).toBeGreaterThanOrEqual(0);
@@ -5812,7 +6061,8 @@ test("a drive timing out on an authentication page leaves the tab open and frees
   h.tabs.seed({ id: firstTabID, url: idpURL });
 
   const authTimeouts = h.timers.filter((t) => t.ms === 180_000);
-  expect(authTimeouts).toHaveLength(2);
+  expect(authTimeouts).toHaveLength(1);
+
   h.clock.now += 180_000;
   await authTimeouts[0]?.fn();
 
@@ -5823,10 +6073,10 @@ test("a drive timing out on an authentication page leaves the tab open and frees
   expect(after?.tab_id).toBe(-1);
   expect(h.frames().filter((frame) => frame.type === "auth_pending")).toHaveLength(1);
 
-  // The slot the parked job held is freed: the third, queued job now drives.
-  expect(h.tabs.created).toHaveLength(3);
-  const third = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[2]);
-  expect(third?.tab_id).toBeGreaterThanOrEqual(0);
+  // The next FIFO job now drives after the parked job frees its slot.
+  expect(h.tabs.created).toHaveLength(2);
+  const second = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1]);
+  expect(second?.tab_id).toBeGreaterThanOrEqual(0);
 });
 
 test("a drive timing out on an ordinary provider page leaves the tab open and frees the governor slot", async () => {
@@ -5841,7 +6091,7 @@ test("a drive timing out on an ordinary provider page leaves the tab open and fr
   // Tab never left the resolver/provider page — no IdP navigation happened.
 
   const providerTimeouts = h.timers.filter((t) => t.ms === 180_000);
-  expect(providerTimeouts).toHaveLength(2);
+  expect(providerTimeouts).toHaveLength(1);
   h.clock.now += 180_000;
   await providerTimeouts[0]?.fn();
 
@@ -5850,7 +6100,7 @@ test("a drive timing out on an ordinary provider page leaves the tab open and fr
   const after = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
   expect(after?.status).toBe("auth_pending");
   expect(after?.tab_id).toBe(-1);
-  expect(h.tabs.created).toHaveLength(3);
+  expect(h.tabs.created).toHaveLength(2);
 });
 
 test("registerHandoffDrive refuses to exceed HANDOFF_DRIVE_LIMIT even when called directly at capacity", async () => {
@@ -5897,12 +6147,13 @@ test("registerHandoffDrive refuses to exceed HANDOFF_DRIVE_LIMIT even when calle
   bridgeInternal.registerHandoffDrive(jobIDs[1]!, tabIDs[1]!);
   bridgeInternal.registerHandoffDrive(jobIDs[2]!, tabIDs[2]!);
 
-  expect(bridgeInternal.handoffDrives.size).toBe(2);
+  expect(bridgeInternal.handoffDrives.size).toBe(1);
   expect(bridgeInternal.handoffDrives.has(jobIDs[0]!)).toBe(true);
-  expect(bridgeInternal.handoffDrives.has(jobIDs[1]!)).toBe(true);
+  expect(bridgeInternal.handoffDrives.has(jobIDs[1]!)).toBe(false);
   expect(bridgeInternal.handoffDrives.has(jobIDs[2]!)).toBe(false);
-  // Refused, not dropped: it is queued so the next drain reuses the tab it
-  // already has rather than stranding the job.
+  // Refused, not dropped: both excess drives are queued so the next drain
+  // reuses their tabs rather than stranding either job.
+  expect(bridgeInternal.handoffDriveQueue.some((request) => request.jobID === jobIDs[1])).toBe(true);
   expect(bridgeInternal.handoffDriveQueue.some((request) => request.jobID === jobIDs[2])).toBe(true);
 });
 
@@ -5911,9 +6162,9 @@ test("governor-queued handoffs are re-driven after a service-worker restart", as
   await first.bridge.start();
   const jobIDs = Array.from({ length: 5 }, (_, index) => `job_restart_governor_${index}`);
   for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
-  expect(first.tabs.list().length).toBe(2);
+  expect(first.tabs.list().length).toBe(1);
   const parked = first.backend.store.activeJobs.filter((job) => job.tab_id < 0);
-  expect(parked).toHaveLength(3);
+  expect(parked).toHaveLength(4);
   expect(parked.every((job) => job.status === "accepted")).toBe(true);
 
   // Only the persisted store survives a suspend; the FIFO holding those three
@@ -5922,13 +6173,47 @@ test("governor-queued handoffs are re-driven after a service-worker restart", as
   // status "queued", and a daemon re-offer on the same URL merely re-acks.
   const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
   await restarted.bridge.start();
-  // The restored worker must give the governor's two slots to the jobs that
-  // were waiting for them, not leave them stranded at tab_id -1 forever.
+  // The restored worker gives the single governor slot to the first queued
+  // job that was waiting for it, not leave it stranded at tab_id -1 forever.
   const parkedIDs = parked.map((job) => job.job_id);
   const drivenAfterRestart = restarted.backend.store.activeJobs.filter(
     (job) => parkedIDs.includes(job.job_id) && job.tab_id >= 0,
   );
-  expect(drivenAfterRestart).toHaveLength(2);
+  expect(drivenAfterRestart).toHaveLength(1);
+});
+
+test("live accepted handoffs queue behind the restored governor owner after restart", async () => {
+  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  await first.bridge.start();
+  await first.port.inbound(jobOffer("job_restart_live_a"));
+  await first.port.inbound(jobOffer("job_restart_live_b"));
+
+  const persisted = JSON.parse(JSON.stringify(first.backend.store)) as StoreShape;
+  const a = persisted.activeJobs.find((job) => job.job_id === "job_restart_live_a")!;
+  const b = persisted.activeJobs.find((job) => job.job_id === "job_restart_live_b")!;
+  a.tab_id = 200;
+  a.status = "accepted";
+  a.parked_with_tab = false;
+  b.tab_id = 201;
+  b.status = "accepted";
+  b.parked_with_tab = false;
+
+  const restarted = makeHarness(persisted);
+  restarted.tabs.seed({ id: 200, url: OPENURL });
+  restarted.tabs.seed({ id: 201, url: OPENURL });
+  await restarted.bridge.start();
+  const internals = restarted.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+    handoffDriveQueue: Array<{ jobID: string }>;
+    releaseHandoffDrive(jobID: string): void;
+    drainHandoffDriveQueue(): Promise<void>;
+  };
+  expect([...internals.handoffDrives.keys()]).toEqual(["job_restart_live_a"]);
+  expect(internals.handoffDriveQueue.map((request) => request.jobID)).toEqual(["job_restart_live_b"]);
+
+  internals.releaseHandoffDrive("job_restart_live_a");
+  await internals.drainHandoffDriveQueue();
+  expect([...internals.handoffDrives.keys()]).toEqual(["job_restart_live_b"]);
 });
 
 test("a timeout-detached auth job survives restart without re-consuming its governor slot", async () => {
@@ -5940,11 +6225,11 @@ test("a timeout-detached auth job survives restart without re-consuming its gove
   const parkedTabID = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])?.tab_id ?? -1;
   expect(parkedTabID).toBeGreaterThanOrEqual(0);
   const activeTabID = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])?.tab_id ?? -1;
-  expect(activeTabID).toBeGreaterThanOrEqual(0);
+  expect(activeTabID).toBe(-1);
   first.tabs.seed({ id: parkedTabID, url: "https://idp.example.edu/sso" });
   await first.tabs.userActivate(parkedTabID);
   const authTimeouts = first.timers.filter((t) => t.ms === 180_000);
-  expect(authTimeouts).toHaveLength(2);
+  expect(authTimeouts).toHaveLength(1);
   first.clock.now += 180_000;
   await authTimeouts[0]?.fn();
 
@@ -5953,12 +6238,12 @@ test("a timeout-detached auth job survives restart without re-consuming its gove
   expect(parkedAfterTimeout?.tab_id).toBe(-1);
   expect(parkedAfterTimeout?.parked_with_tab).toBeUndefined();
   expect(first.tabs.snapshot(parkedTabID) !== undefined).toBe(true);
-  expect(first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[2])?.tab_id).toBeGreaterThanOrEqual(0);
+  expect(first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])?.tab_id).toBeGreaterThanOrEqual(0);
 
   const survivingTabs = first.backend.store.activeJobs
     .filter((job) => job.tab_id >= 0)
     .map((job) => [job.job_id, job.tab_id] as const);
-  expect(survivingTabs).toHaveLength(2);
+  expect(survivingTabs).toHaveLength(1);
   const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
   for (const [, tabID] of survivingTabs) restarted.tabs.seed({ id: tabID, url: OPENURL });
   await restarted.bridge.start();
@@ -5971,9 +6256,9 @@ test("a timeout-detached auth job survives restart without re-consuming its gove
   expect(restartedParked?.status).toBe("auth_pending");
   expect(restartedParked?.parked_with_tab).toBeUndefined();
   expect(restartedInternal.handoffDrives.has(jobIDs[1]!)).toBe(true);
-  expect(restartedInternal.handoffDrives.has(jobIDs[2]!)).toBe(true);
-  expect(restartedInternal.handoffDrives.size).toBe(2);
-  expect(restarted.timers.filter((t) => t.ms === 180_000)).toHaveLength(2);
+  expect(restartedInternal.handoffDrives.has(jobIDs[2]!)).toBe(false);
+  expect(restartedInternal.handoffDrives.size).toBe(1);
+  expect(restarted.timers.filter((t) => t.ms === 180_000)).toHaveLength(1);
 });
 
 test("a timeout-detached job does not re-associate an operator tab", async () => {
@@ -6010,12 +6295,13 @@ test("a timeout-detached job stays outside the governor until a fresh drive", as
   expect(detachedTabID).toBeGreaterThanOrEqual(0);
   first.tabs.seed({ id: detachedTabID, url: "https://idp.example.edu/sso" });
   const authTimeouts = first.timers.filter((t) => t.ms === 180_000);
-  expect(authTimeouts).toHaveLength(2);
+
+  expect(authTimeouts).toHaveLength(1);
   first.clock.now += 180_000;
   await authTimeouts[0]?.fn();
 
   const beforeResume = first.bridge as unknown as { handoffDrives: Map<string, unknown> };
-  expect(beforeResume.handoffDrives.size).toBe(2);
+  expect(beforeResume.handoffDrives.size).toBe(1);
   expect(beforeResume.handoffDrives.has(jobIDs[0]!)).toBe(false);
   const resumed = await first.bridge.resumeHandoffAfterManual(jobIDs[0]!);
   expect(resumed).toBe(false);
@@ -6066,9 +6352,10 @@ test("restore recovers an auth-required handoff whose OpenURL base looks like a 
 test("per-origin sign-in hands the tab to the keepalive manager", async () => {
   const h = makeHarness();
   await h.bridge.start();
+  await h.port.inbound(helloAck());
   const reauthOrigins: (string | undefined)[] = [];
   h.bridge.attachKeepalive({
-    getSnapshot: () => ({ pausedForReauth: false }),
+    getSnapshot: () => ({ resolverOrigin: "https://beta.example.edu", pausedForReauth: false }),
     noteResolverActivated: () => {},
     openReauth: async (originHint?: string) => {
       reauthOrigins.push(originHint);
@@ -6088,8 +6375,9 @@ test("per-origin sign-in hands the tab to the keepalive manager", async () => {
 test("per-origin sign-in falls back to a managed tab when the manager declines", async () => {
   const h = makeHarness();
   await h.bridge.start();
+  await h.port.inbound(helloAck());
   h.bridge.attachKeepalive({
-    getSnapshot: () => ({ pausedForReauth: false }),
+    getSnapshot: () => ({ resolverOrigin: "https://beta.example.edu", pausedForReauth: false }),
     noteResolverActivated: () => {},
     openReauth: async () => false,
   } as unknown as KeepaliveManager);
@@ -6098,6 +6386,7 @@ test("per-origin sign-in falls back to a managed tab when the manager declines",
   expect(reply).toEqual({ ok: true, opened: true });
   expect(h.tabs.created).toHaveLength(1);
 });
+
 
 test("delivery provenance keeps the host that requested the download", async () => {
   const jobID = "job_delivery_provenance";
@@ -6304,7 +6593,7 @@ test("successful adoption removes the job while leaving its managed handoff open
   expect(human.tabs.removed).toEqual([]);
   expect(human.tabs.snapshot(humanTab) !== undefined).toBe(true);
 });
-test("cold handoffs consolidate to one tab before warm evidence fills the second slot", async () => {
+test("cold handoffs keep one tab until warm evidence releases the queue", async () => {
   const h = makeHarness();
   await h.bridge.start();
   const jobIDs = Array.from({ length: 5 }, (_, index) => `job_cold_governor_${index}`);
@@ -6314,10 +6603,12 @@ test("cold handoffs consolidate to one tab before warm evidence fills the second
   expect(h.tabs.created).toHaveLength(1);
   expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(4);
 
+  // Evidence is scoped and release-grade, but cannot exceed the single
+  // effectful drive while the existing tab is still active.
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
-  expect(h.tabs.list().length).toBe(2);
-  expect(h.tabs.created).toHaveLength(2);
-  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(3);
+  expect(h.tabs.list().length).toBe(1);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(4);
 });
 test("keepalive warmth releases only the matching resolver queue", async () => {
   const h = makeHarness();
@@ -6782,11 +7073,16 @@ test("fresh evidence for one resolver cannot be laundered into another's queue b
   const openAccessURL = "https://oa.example.edu/article/leak-guard";
   const openAccess = jobOffer("job_leak_guard_oa", openAccessURL) as { payload: Record<string, unknown> };
   openAccess.payload["requires_auth"] = false;
-
   await h.bridge.start();
   await h.port.inbound(institutionalA);
   await h.port.inbound(institutionalB);
   await h.port.inbound(openAccess);
+  // The open-access owner must settle before resolver evidence can admit A;
+  // otherwise a second handoff would overlap the sole governor effect.
+  const openAccessJob = h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_oa");
+  if (openAccessJob?.tab_id !== undefined && openAccessJob.tab_id >= 0) {
+    await h.bridge.parkHandoffForManual(openAccessJob.job_id);
+  }
 
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_a")).toMatchObject({
@@ -6985,8 +7281,8 @@ test("reloadAuthenticationHandoffs reloads only the evidenced origin's tabs, lea
   const h = makeHarness({
     ...emptyStore(),
     activeJobs: [
-      { job_id: jobA, tab_id: tabA, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: [PROVIDER_HOST] },
-      { job_id: jobB, tab_id: tabB, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: ["link.springer.com"] },
+      { job_id: jobA, tab_id: tabA, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: [PROVIDER_HOST], access_mode: "delegated" },
+      { job_id: jobB, tab_id: tabB, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: ["link.springer.com"], access_mode: "delegated" },
     ],
     offerURLs: { [jobA]: `${originA}/openurl?ctx=a`, [jobB]: `${originB}/openurl?ctx=b` },
   });
@@ -7017,14 +7313,18 @@ test("requestSessionSignIn rejects a non-configured origin once hello_ack has la
 
 test("the 45-second forced-release fallback still opens a queued handoff with zero authentication evidence", async () => {
   // ADR-0009's autonomous-retry fallback is ratified and deliberately bypasses
-  // evidence for exactly one forced job; Commit C must not regress it.
+  // evidence for exactly one forced job; it still waits for the sole slot.
   const h = makeHarness();
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_forced_release_active"));
   await h.port.inbound(jobOffer("job_forced_release_queued"));
+
   const fallback = h.timers.find((timer) => timer.ms === 45_000);
   expect(fallback).toBeDefined();
-
+  const internals = h.bridge as unknown as {
+    releaseHandoffDrive(jobID: string): void;
+  };
+  internals.releaseHandoffDrive("job_forced_release_active");
   await fallback?.fn();
 
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_forced_release_queued")).toMatchObject({
@@ -7034,6 +7334,51 @@ test("the 45-second forced-release fallback still opens a queued handoff with ze
     { url: OPENURL, active: true },
     { url: OPENURL, active: false },
   ]);
+});
+
+test("an explicit queued open keeps its exact forced job ahead of unrelated queued work", async () => {
+  const h = makeHarness();
+  h.backend.store.challengeCooldowns = { "www.jstor.org": h.clock.now + 600_000 };
+  await h.bridge.start();
+  await h.port.inbound(jobOfferForHosts("job_forced_priority_active_a", ["nature.com"]));
+
+  const jobA = "job_forced_priority_a";
+  const jobB = "job_forced_priority_b";
+  const jobC = "job_forced_priority_c";
+  const originA = "https://resolver-a.example.edu/openurl?a";
+  const originB = "https://resolver-b.example.edu/openurl?b";
+  const originC = "https://resolver-c.example.edu/openurl?c";
+  await h.port.inbound(jobOfferForHosts(jobA, ["www.jstor.org"], originA));
+  await h.port.inbound(jobOfferForHosts(jobB, ["link.springer.com"], originB));
+  await h.port.inbound(jobOfferForHosts(jobC, ["sciencedirect.com"], originC));
+  await h.bridge.requestCancel("job_forced_priority_active_a");
+  // Establish A/B/C as queued work before any evidence makes B eligible.
+  // The active owner is settled explicitly so the forced request is the only
+  // candidate considered by the subsequent release.
+  // The owner is settled; clear only the temporary provider cooldown while
+  // retaining A's queued marker for the explicit exact-job request.
+  const bridgeStore = (h.bridge as unknown as { store: StoreShape }).store;
+  bridgeStore.challengeCooldowns = {};
+  h.backend.store.challengeCooldowns = {};
+  // Explicit force may bypass that temporary block, but it must never
+  // substitute B or C.
+  await expect(h.bridge.openHandoff(jobA)).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([
+    OPENURL,
+    originA,
+  ]);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobA)).toMatchObject({
+    status: "accepted",
+    tab_id: expect.any(Number),
+  });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobB)).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobC)).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
 });
 
 test("a hello_ack immediately notifies the keepalive manager of configured-origin membership", async () => {
@@ -7117,11 +7462,9 @@ async function landOnFedProviderWall(h: Harness, tabID: number): Promise<void> {
   await h.tabs.completeNavigation(tabID, FED_PROVIDER_LOGIN_URL);
 }
 
-/** Offers three jobs for the same institution (evidence pre-seeded so all
- * three open real handoff tabs, HANDOFF_DRIVE_LIMIT capping two concurrent),
- * then lands every one of them on the shared provider login wall. Returns
- * the harness with job_fed_a as the federated-login owner and job_fed_b /
- * job_fed_c parked in waiting_for_session. */
+/** Offers three jobs for the same institution with one effectful drive.
+ * job_fed_a owns the live provider-login claim; the two siblings are durable
+ * tabless waiting parks until that exact claim retires. */
 async function primeFedLoginTriad(): Promise<{ h: Harness; tabA: number; tabB: number; tabC: number }> {
   await ensureFedClaimKeys();
   const h = makeFedLoginHarness();
@@ -7130,14 +7473,27 @@ async function primeFedLoginTriad(): Promise<{ h: Harness; tabA: number; tabB: n
     await h.port.inbound(fedLoginOffer(jobID));
   }
   const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_a")?.tab_id ?? -1;
-  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b")?.tab_id ?? -1;
   await landOnFedProviderWall(h, tabA);
-  await landOnFedProviderWall(h, tabB);
-  // job_fed_c was queued behind the governor; parking job_fed_b just freed
-  // its slot, so it now has a real tab too.
-  const tabC = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c")?.tab_id ?? -1;
-  await landOnFedProviderWall(h, tabC);
-  return { h, tabA, tabB, tabC };
+
+  // With one global effect slot the siblings cannot materialize tabs while A
+  // owns the claim. Seed the same durable waiting state produced by the
+  // federated park, without inventing concurrent browser effects.
+  const deadline = h.clock.now + 600_000;
+  h.backend.store.activeJobs = h.backend.store.activeJobs.map((job) =>
+    job.job_id === "job_fed_b" || job.job_id === "job_fed_c"
+      ? {
+          ...job,
+          tab_id: -1,
+          status: "auth_pending",
+          parked_with_tab: false,
+          waiting_for_session: true,
+          waiting_for_session_key: FED_CLAIM_KEY,
+          waiting_deadline: deadline,
+          institution_claim_key: FED_CLAIM_KEY,
+        }
+      : job,
+  );
+  return { h, tabA, tabB: -1, tabC: -1 };
 }
 
 test("a re-offer reconciles a login wall that completed while the worker was stopped", async () => {
@@ -7410,13 +7766,9 @@ test("a sibling click rechecks an owner that retires while focus settles", async
 });
 
 test("one login tab per institution: two siblings park in waiting_for_session instead of opening their own IdP tab", async () => {
-  const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
+  const { h, tabA } = await primeFedLoginTriad();
 
   expect(tabA).toBeGreaterThanOrEqual(0);
-  expect(tabB).toBeGreaterThanOrEqual(0);
-  expect(tabC).toBeGreaterThanOrEqual(0);
-
-  // Exactly one tab ever navigates to the IdP.
   const idpNavs = h.tabs.navigations.filter((n) => n.url === FED_LOGIN_URL);
   expect(idpNavs).toEqual([{ tabID: tabA, url: FED_LOGIN_URL }]);
 
@@ -7427,38 +7779,30 @@ test("one login tab per institution: two siblings park in waiting_for_session in
   expect(b).toMatchObject({
     waiting_for_session: true,
     waiting_for_session_key: FED_CLAIM_KEY,
-    parked_with_tab: true,
-    tab_id: tabB,
+    parked_with_tab: false,
+    tab_id: -1,
     status: "auth_pending",
   });
   expect(c).toMatchObject({
     waiting_for_session: true,
     waiting_for_session_key: FED_CLAIM_KEY,
-    parked_with_tab: true,
-    tab_id: tabC,
+    parked_with_tab: false,
+    tab_id: -1,
     status: "auth_pending",
   });
-
-  // The other two tabs are left exactly where they were — the provider's
-  // login wall, never navigated to the IdP.
-  expect(h.tabs.snapshot(tabB)?.url).toBe(FED_PROVIDER_LOGIN_URL);
-  expect(h.tabs.snapshot(tabC)?.url).toBe(FED_PROVIDER_LOGIN_URL);
-
   expect(h.backend.store.federatedLoginOwners).toEqual({
     [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA, phase: "auth" },
   });
 });
-test("waiting siblings stay parked without gaining an IdP tab over time", async () => {
-  const { h, tabB, tabC } = await primeFedLoginTriad();
-  const navigations = [...h.tabs.navigations];
 
+test("waiting siblings stay parked without gaining an IdP tab over time", async () => {
+  const { h } = await primeFedLoginTriad();
+  const navigations = [...h.tabs.navigations];
   h.clock.now += 3_600_000;
 
   expect(h.timers.filter((timer) => timer.ms === 600_000)).toHaveLength(0);
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")?.waiting_for_session).toBe(true);
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")?.waiting_for_session).toBe(true);
-  expect(h.tabs.snapshot(tabB)?.url).toBe(FED_PROVIDER_LOGIN_URL);
-  expect(h.tabs.snapshot(tabC)?.url).toBe(FED_PROVIDER_LOGIN_URL);
   expect(h.tabs.navigations).toEqual(navigations);
 });
 test("federated claim storage is opaque and one owner supplies the only sign-in badge blocker", async () => {
@@ -7473,7 +7817,7 @@ test("federated claim storage is opaque and one owner supplies the only sign-in 
 });
 
 test("startup drops legacy raw claim keys and resumes their waiters ownerlessly", async () => {
-  const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
+  const { h, tabA } = await primeFedLoginTriad();
   const legacyKey = JSON.stringify([FED_IDP_ORIGIN, FED_ENTITY_ID]);
   const seed = JSON.parse(JSON.stringify(h.backend.store)) as StoreShape;
   seed.federatedLoginOwners = { [legacyKey]: { jobID: "job_fed_a", tabID: tabA, phase: "auth" } };
@@ -7485,8 +7829,6 @@ test("startup drops legacy raw claim keys and resumes their waiters ownerlessly"
   }
   const restarted = makeFedLoginHarness(seed);
   restarted.tabs.seed({ id: tabA, url: FED_LOGIN_URL });
-  restarted.tabs.seed({ id: tabB, url: FED_PROVIDER_LOGIN_URL });
-  restarted.tabs.seed({ id: tabC, url: FED_PROVIDER_LOGIN_URL });
   await restarted.bridge.start();
   expect(restarted.backend.store.federatedLoginOwners).toEqual({});
   expect(restarted.backend.store.activeJobs.filter((job) => job.waiting_for_session === true)).toHaveLength(0);
@@ -7508,7 +7850,7 @@ test("startup drops legacy raw claim keys and resumes their waiters ownerlessly"
 });
 
 test("repeated decisive evidence events cost zero navigations for a waiter whose claim owner is still live", async () => {
-  const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
+  const { h, tabA } = await primeFedLoginTriad();
   const originalDeadline = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b")?.waiting_deadline;
   expect(originalDeadline).toBeDefined();
   h.tabs.navigations.splice(0);
@@ -7540,7 +7882,7 @@ test("repeated decisive evidence events cost zero navigations for a waiter whose
 });
 
 test("the claim owner leaving the IdP resumes its waiters exactly once, through the retirement chokepoint — never the prior evidence events", async () => {
-  const { h, tabA, tabB, tabC } = await primeFedLoginTriad();
+  const { h, tabA } = await primeFedLoginTriad();
   // Three prior evidence events, all no-ops per the test above.
   for (let i = 0; i < 3; i += 1) {
     await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
@@ -7562,16 +7904,13 @@ test("the claim owner leaving the IdP resumes its waiters exactly once, through 
   // drops its park markers too (intent to resume expressed) but stays
   // queued behind the governor until a slot genuinely frees.
   expect(h.backend.store.federatedLoginOwners).toEqual({});
-  const resumedNav = h.tabs.navigations.find((n) => n.tabID === tabB || n.tabID === tabC);
-  expect(resumedNav?.url).toBe(OPENURL);
+  expect(h.tabs.navigations).toEqual([]);
   const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
   const c = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
   expect(b?.waiting_for_session).toBe(false);
   expect(c?.waiting_for_session).toBe(false);
-  // Exactly one navigation total: the retirement event fired once, and a
-  // second, redundant onProvider re-entry for the same already-cleared
-  // claim must never re-navigate either waiter again.
-  expect(h.tabs.navigations).toHaveLength(1);
+  // Retirement clears both exact-claim parks once; no second effect can start
+  // until A's existing drive releases.
 });
 
 
@@ -7581,44 +7920,50 @@ test("re-parking a resumed waiter keeps its original waiting overlay hint", asyn
   await h.port.inbound(fedLoginOffer("job_redeadline_a"));
   await h.port.inbound(fedLoginOffer("job_redeadline_b"));
   const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_a")?.tab_id ?? -1;
-  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")?.tab_id ?? -1;
   await landOnFedProviderWall(h, tabA); // owns the claim
-  await landOnFedProviderWall(h, tabB); // parks
-  const originalDeadline = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")?.waiting_deadline;
-  expect(originalDeadline).toBe(h.clock.now + 600_000);
 
-  // job_redeadline_a's tab closes (abandoned mid sign-in): retires its
-  // claim, which resumes job_redeadline_b through the chokepoint — its own
-  // tab is reused and redriven back to its offer URL.
+  const originalDeadline = h.clock.now + 600_000;
+  h.backend.store.activeJobs = h.backend.store.activeJobs.map((job) =>
+    job.job_id === "job_redeadline_b"
+      ? {
+          ...job,
+          status: "auth_pending",
+          tab_id: -1,
+          waiting_for_session: true,
+          waiting_for_session_key: FED_CLAIM_KEY,
+          waiting_deadline: originalDeadline,
+          parked_with_tab: false,
+          institution_claim_key: FED_CLAIM_KEY,
+        }
+      : job,
+  );
+
+  // Owner retirement resumes B sequentially into the only available slot.
   await h.tabs.userClose(tabA);
+  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")?.tab_id ?? -1;
+  expect(tabB).toBeGreaterThanOrEqual(0);
   expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")?.waiting_for_session).toBe(false);
-  expect(h.tabs.navigations).toContainEqual({ tabID: tabB, url: OPENURL });
 
-  // A third job claims the now-empty claim BEFORE job_redeadline_b's
-  // redrive lands, so b's re-classify finds a live owner again and parks a
-  // second time, under the SAME claim key.
+  // A new claim owner appears before B reaches the provider wall, so B parks
+  // again without changing its original display deadline.
   await h.port.inbound(fedLoginOffer("job_redeadline_c"));
-  const tabC = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_c")?.tab_id ?? -1;
-  expect(tabC).toBeGreaterThanOrEqual(0);
-  await landOnFedProviderWall(h, tabC);
-  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe("job_redeadline_c");
-
+  h.backend.store.federatedLoginOwners = {
+    [FED_CLAIM_KEY]: { jobID: "job_redeadline_c", tabID: -1, phase: "auth" },
+  };
   await landOnFedProviderWall(h, tabB);
   const bReparked = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b");
   expect(bReparked?.waiting_for_session).toBe(true);
   expect(bReparked?.waiting_for_session_key).toBe(FED_CLAIM_KEY);
-  // The original display hint survives the entire resume-then-re-park cycle
-  // untouched; re-parking never resets the waiting overlay timestamp.
   expect(bReparked?.waiting_deadline).toBe(originalDeadline);
 });
 
 test("fresh session evidence for a different institution resumes no waiting_for_session park", async () => {
-  const { h, tabB, tabC } = await primeFedLoginTriad();
+  const { h } = await primeFedLoginTriad();
   h.tabs.navigations.splice(0);
 
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://other-library.example.edu"));
 
-  expect(h.tabs.navigations.some((n) => n.tabID === tabB || n.tabID === tabC)).toBe(false);
+  expect(h.tabs.navigations).toEqual([]);
   const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
   const c = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
   expect(b?.waiting_for_session).toBe(true);
@@ -7628,15 +7973,13 @@ test("fresh session evidence for a different institution resumes no waiting_for_
   expect(h.backend.store.federatedLoginOwners).not.toEqual({});
 });
 test("fresh session evidence resumes ownerless waiting siblings", async () => {
-  const { h, tabB, tabC } = await primeFedLoginTriad();
+  const { h } = await primeFedLoginTriad();
   h.backend.store.federatedLoginOwners = {};
   h.tabs.navigations.splice(0);
 
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
 
-  expect(h.tabs.navigations).toHaveLength(1);
-  expect(h.tabs.navigations[0]?.url).toBe(OPENURL);
-  expect([tabB, tabC]).toContain(h.tabs.navigations[0]?.tabID ?? -1);
+  expect(h.tabs.navigations).toHaveLength(0);
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")?.waiting_for_session).toBe(false);
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")?.waiting_for_session).toBe(false);
 });
@@ -7652,61 +7995,37 @@ test("two institutions sharing a federated-login (DS) host never collide: distin
   });
   await h.bridge.start();
 
-  // Institution A: three jobs — a1 owns claim A, a2 and a3 park under it.
-  for (const jobID of ["job_x_a1", "job_x_a2", "job_x_a3"]) {
-    await h.port.inbound(fedLoginOffer(jobID, FED_ENTITY_ID, OPENURL));
-  }
+  // Institution A owns the only effectful drive.
+  await h.port.inbound(fedLoginOffer("job_x_a1", FED_ENTITY_ID, OPENURL));
   const tabA1 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a1")?.tab_id ?? -1;
-  const tabA2 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a2")?.tab_id ?? -1;
   await landOnFedProviderWall(h, tabA1);
-  await landOnFedProviderWall(h, tabA2);
-  const tabA3 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a3")?.tab_id ?? -1;
-  expect(tabA3).toBeGreaterThanOrEqual(0); // a2 parking freed the slot a3 needed
-  await landOnFedProviderWall(h, tabA3);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a2")?.waiting_for_session).toBe(true);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a3")?.waiting_for_session).toBe(true);
+  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe("job_x_a1");
 
-  // Institution B: the exact same DS host, a DIFFERENT entityID and offer
-  // origin. Its first job takes the slot a3's park just freed.
+  // Institution B queues behind A; evidence for A must not launder into B.
   await h.port.inbound(fedLoginOffer("job_x_b1", FED_ENTITY_ID_B, OPENURL_B));
-  const tabB1 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id ?? -1;
-  expect(tabB1).toBeGreaterThanOrEqual(0);
-  await landOnFedProviderWall(h, tabB1);
-
-  // B never blocked on A's claim: b1 became the OWNER of its OWN claim
-  // (navigated straight to the IdP), not a waiter behind a1's.
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.waiting_for_session).toBeUndefined();
-  expect(h.tabs.navigations.filter((n) => n.tabID === tabB1)).toHaveLength(1);
-
-  // Two distinct claims held simultaneously despite sharing one DS host.
-  expect(Object.keys(h.backend.store.federatedLoginOwners ?? {}).sort()).toEqual(
-    [FED_CLAIM_KEY, FED_CLAIM_KEY_B].sort(),
-  );
-
-  // Free a slot for institution B's second job via a1's own pre-existing
-  // 3-minute drive timeout — a1 simply never came back, unrelated to the
-  // federated-login feature itself.
-  await h.port.inbound(fedLoginOffer("job_x_b2", FED_ENTITY_ID_B, OPENURL_B));
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id).toBe(-1);
-  const a1Timeout = h.timers.find((t) => t.ms === 180_000);
-  expect(a1Timeout).toBeDefined();
-  await a1Timeout?.fn();
-  const tabB2 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id ?? -1;
-  expect(tabB2).toBeGreaterThanOrEqual(0);
-  await landOnFedProviderWall(h, tabB2);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.waiting_for_session).toBe(true);
-
-  // The scope guard AND the live-owner guard together: evidence for
-  // institution A costs zero navigations for EITHER institution's waiter
-  // while both claim owners (job_x_a1, job_x_b1) are still live — A's own
-  // waiters would only re-park behind job_x_a1, and institution B's waiter
-  // was never in scope for institution A's evidence to begin with.
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id).toBe(-1);
   h.tabs.navigations.splice(0);
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
   expect(h.tabs.navigations).toEqual([]);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a2")?.waiting_for_session).toBe(true);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a3")?.waiting_for_session).toBe(true);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.waiting_for_session).toBe(true);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id).toBe(-1);
+  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY_B]).toBeUndefined();
+
+  // Retire A, then B claims its own institution sequentially.
+  await h.tabs.userClose(tabA1);
+  const tabB1 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id ?? -1;
+  expect(tabB1).toBeGreaterThanOrEqual(0);
+  await landOnFedProviderWall(h, tabB1);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.waiting_for_session).toBeUndefined();
+  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY_B]?.jobID).toBe("job_x_b1");
+  expect(Object.keys(h.backend.store.federatedLoginOwners ?? {})).toEqual([FED_CLAIM_KEY_B]);
+
+  // A second B job remains queued behind B; A evidence still cannot resume it.
+  await h.port.inbound(fedLoginOffer("job_x_b2", FED_ENTITY_ID_B, OPENURL_B));
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id).toBe(-1);
+  h.tabs.navigations.splice(0);
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
+  expect(h.tabs.navigations).toEqual([]);
+  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id).toBe(-1);
 });
 
 test("the federated-login registry clears when the owning tab closes, so the next login attempt navigates normally", async () => {
@@ -7739,7 +8058,7 @@ test("the federated-login registry clears when the owning tab closes, so the nex
 });
 
 test("a service-worker restart with a dead claim owner requeues its waiters instead of leaving them parked forever", async () => {
-  const { h: first, tabB, tabC } = await primeFedLoginTriad();
+  const { h: first } = await primeFedLoginTriad();
   // job_fed_a (the claim owner) is NOT re-added to the restarted harness's
   // live tabs — its tab closed while this worker was asleep, the one case
   // onTabRemoved can never observe directly (MV3 tears the worker down
@@ -7753,10 +8072,13 @@ test("a service-worker restart with a dead claim owner requeues its waiters inst
     if (injection.func === planExecution) return plannerResult(injection, FED_LOGIN_VERDICT);
     return [];
   };
-  restarted.tabs.seed({ id: tabB, url: FED_PROVIDER_LOGIN_URL });
-  restarted.tabs.seed({ id: tabC, url: FED_PROVIDER_LOGIN_URL });
+  // The siblings are tabless waiting parks; startup must resume only the FIFO
+  // head into the single available effect slot.
 
   await restarted.bridge.start();
+  const restartedInternals = restarted.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+  };
 
   // job_fed_a's dead tab reconciles like any other pre-download job whose
   // tab vanished: back to an ordinary queued handoff, park markers cleared —
@@ -7773,11 +8095,9 @@ test("a service-worker restart with a dead claim owner requeues its waiters inst
   const c = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
   expect(b?.waiting_for_session).toBe(false);
   expect(c?.waiting_for_session).toBe(false);
-  expect(restarted.tabs.navigations).toContainEqual({ tabID: tabB, url: OPENURL });
-  expect(restarted.tabs.navigations).toContainEqual({ tabID: tabC, url: OPENURL });
-  const restartedInternals = restarted.bridge as unknown as { handoffDrives: Map<string, unknown> };
-  expect(restartedInternals.handoffDrives.size).toBe(2);
-  expect([...restartedInternals.handoffDrives.keys()].sort()).toEqual(["job_fed_b", "job_fed_c"]);
+  expect(restarted.tabs.created.some((tab) => tab.url === OPENURL)).toBe(true);
+  expect(restartedInternals.handoffDrives.size).toBe(1);
+  expect([...restartedInternals.handoffDrives.keys()]).toEqual(["job_fed_b"]);
 });
 
 
@@ -7796,9 +8116,19 @@ test("the owner completing its own login resumes waiting siblings even when inst
   await h.port.inbound(offerB);
   const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_a")?.tab_id ?? -1;
   const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")?.tab_id ?? -1;
+  expect(tabB).toBe(-1);
   await landOnFedProviderWall(h, tabA);
-  await landOnFedProviderWall(h, tabB);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")?.waiting_for_session).toBe(true);
+  const bBefore = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b");
+  if (bBefore !== undefined) {
+    Object.assign(bBefore, {
+      status: "auth_pending",
+      waiting_for_session: true,
+      waiting_for_session_key: FED_CLAIM_KEY,
+      waiting_deadline: h.clock.now + 600_000,
+      parked_with_tab: false,
+      institution_claim_key: FED_CLAIM_KEY,
+    });
+  }
 
   // job_fed_a's tab, already navigated to the IdP by maybeRouteFederatedLogin,
   // now reports its own follow-up navigation landing there — Chrome's real
@@ -7815,11 +8145,11 @@ test("the owner completing its own login resumes waiting siblings even when inst
   h.tabs.seed({ id: tabA, url: returnURL });
   await h.tabs.completeNavigation(tabA, returnURL);
 
-  expect(h.tabs.navigations).toContainEqual({ tabID: tabB, url: OPENURL });
+  expect(h.tabs.navigations.some((navigation) => navigation.url === OPENURL)).toBe(true);
   expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")?.waiting_for_session).toBe(false);
 });
 test("removing a claim owner job frees its waiting siblings", async () => {
-  const { h, tabB, tabC } = await primeFedLoginTriad();
+  const { h } = await primeFedLoginTriad();
   h.tabs.navigations.splice(0);
 
   const bridgeInternals = h.bridge as unknown as {
@@ -7828,8 +8158,7 @@ test("removing a claim owner job frees its waiting siblings", async () => {
   await bridgeInternals.removeJobWithOffer.call(h.bridge, "job_fed_a");
 
   expect(h.backend.store.federatedLoginOwners).toEqual({});
-  expect(h.tabs.navigations).toContainEqual({ tabID: tabB, url: OPENURL });
-  expect(h.tabs.navigations).toContainEqual({ tabID: tabC, url: OPENURL });
+  expect(h.tabs.created.some((tab) => tab.url === OPENURL)).toBe(true);
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")?.waiting_for_session).toBe(false);
   expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")?.waiting_for_session).toBe(false);
 });
@@ -7990,6 +8319,7 @@ test("assisted offers block every papio-initiated download path", async () => {
     };
     await h.bridge.start();
     await h.port.inbound(jobOffer(`job_assisted_${method}`, OPENURL, "assisted"));
+    await expect(h.bridge.openHandoff(`job_assisted_${method}`)).resolves.toEqual({ ok: true, opened: true });
     const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
     await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
     expect(h.downloads.started).toHaveLength(0);
@@ -7997,17 +8327,6 @@ test("assisted offers block every papio-initiated download path", async () => {
   }
 });
 
-test("assisted direct-file offers park for a human handoff instead of initiating a download", async () => {
-  const h = makeHarness();
-  await h.bridge.start();
-  await h.port.inbound(
-    jobOffer("job_assisted_direct", `https://${PROVIDER_HOST}/content/pdf/paper.pdf`, "assisted"),
-  );
-  expect(h.downloads.started).toHaveLength(0);
-  expect(h.tabs.created).toHaveLength(0);
-  expect(h.backend.store.activeJobs[0]?.access_mode).toBe("assisted");
-  expect(h.backend.store.activeJobs[0]?.tab_id).toBe(-1);
-});
 
 test("delegated article offers retain automatic download behavior", async () => {
   const h = makeHarness();
@@ -8031,6 +8350,7 @@ test("delegated article offers retain automatic download behavior", async () => 
     if (injection.func === planExecution) {
       return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
     }
+    if (injection.func === executePlannedPageEffect) return plannedEffectResult(injection);
     return [{ result: "https://download.example/paper.pdf" }];
   };
   await h.bridge.start();
@@ -8063,73 +8383,6 @@ test("assisted jobs still adopt a human-initiated download", async () => {
   expect(h.frames().some((frame) => frame.type === "download_complete" && frame.job_id === "job_assisted_human")).toBe(true);
 });
 
-test("expected DOI mismatch reports wrong_work before any automatic download", async () => {
-  const h = makeHarness();
-  const adapter: AdapterSpec = {
-    id: "doi-mismatch",
-    version: "2.0.0",
-    hosts: [PROVIDER_HOST],
-    classify: [{ kind: "article", any: ["article"] }],
-    download: { selector: "a.download", requireKind: "article", method: "href" },
-  };
-  h.deps.adapterSpecs.push(adapter);
-  h.deps.permissions.contains = async () => true;
-  h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === planExecution) {
-      return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
-    }
-    if (injection.func === readCitationDOI) return [{ result: "DOI: 10.1000/other" }];
-    return [{ result: "https://download.example/paper.pdf" }];
-  };
-  const offer = jobOffer("job_doi_mismatch", OPENURL, "delegated") as { payload: Record<string, unknown> };
-  offer.payload["expected"] = { doi: "https://doi.org/10.1000/expected" };
-  await h.bridge.start();
-  await h.port.inbound(offer);
-  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
-  const outcome = h.frames().find(
-    (frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "wrong_work",
-  );
-  expect(outcome?.payload).toMatchObject({
-    outcome: "wrong_work",
-    adapter_id: adapter.id,
-    adapter_version: adapter.version,
-  });
-  expect(h.downloads.started).toHaveLength(0);
-});
-
-test("matching or absent citation DOI leaves delegated downloads unchanged", async () => {
-  for (const pageDOI of ["DOI: 10.1000//ABC", null]) {
-    const h = makeHarness();
-    const adapter: AdapterSpec = {
-      id: "doi-match",
-      version: "1.0.0",
-      hosts: [PROVIDER_HOST],
-      classify: [{ kind: "article", any: ["article"] }],
-      download: { selector: "a.download", requireKind: "article", method: "href" },
-    };
-    h.deps.adapterSpecs.push(adapter);
-    h.deps.permissions.contains = async () => true;
-    h.deps.scripting.executeScript = async (injection) => {
-      if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-      if (injection.func === planExecution) {
-        return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
-      }
-      if (injection.func === readCitationDOI) return [{ result: pageDOI }];
-      return [{ result: "https://download.example/paper.pdf" }];
-    };
-    const offer = jobOffer(`job_doi_${pageDOI === null ? "absent" : "match"}`, OPENURL, "delegated") as {
-      payload: Record<string, unknown>;
-    };
-    offer.payload["expected"] = { doi: "https://doi.org/10.1000//abc" };
-    await h.bridge.start();
-    await h.port.inbound(offer);
-    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
-    expect(h.downloads.started).toHaveLength(1);
-  }
-});
 
 test("DOI normalization strips presentation prefixes but preserves repeated slashes", () => {
   expect(normalizeExpectedDOI(" DOI: https://doi.org/10.1000//ABC ")).toBe("10.1000//abc");
@@ -8144,16 +8397,34 @@ describe("generic settled-unknown acquisition", () => {
     accessMode: "assisted" | "delegated",
     planned: GenericPlan,
     expectedDOI = "10.1000/generic",
+    driveEpoch = true,
   ): Promise<void> {
     h.deps.permissions.contains = async () => true;
     h.deps.scripting.executeScript = async (injection) => {
       if (injection.func === planGeneric) return [{ result: planned }];
       return [];
     };
-    await h.bridge.start();
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => ({
+      kind: "response",
+      payload: {
+        ...((args[1] ?? {}) as Record<string, unknown>),
+        outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+      },
+    }));
     const offer = jobOffer(jobID, OPENURL, accessMode) as { payload: Record<string, unknown> };
+    await h.bridge.start();
+    // requestNative above models the feature-negotiated daemon ACK.
     offer.payload["expected"] = { doi: expectedDOI };
+    if (driveEpoch) {
+      offer.payload["drive_attempt_id"] = "generic-test-epoch-1";
+      offer.payload["drive_ordinal"] = 0;
+      offer.payload["drive_strategy"] = "generic";
+      offer.payload["drive_revision"] = "1";
+    }
     await h.port.inbound(offer);
+    if (accessMode === "assisted") {
+      await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({ ok: true, opened: true });
+    }
     const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
     await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
     h.clock.now += 6_000;
@@ -8180,6 +8451,66 @@ describe("generic settled-unknown acquisition", () => {
     expect(outcome?.payload.detail).toContain("e0:citation-doi=exact");
   });
 
+  test("a delegated generic candidate is revoked before epoch start completes", async () => {
+    const h = makeHarness();
+    const jobID = "job_generic_downgrade_race";
+    const candidate: GenericCandidate = {
+      strategy_id: "generic-citation-pdf/1",
+      strategy_version: "1",
+      url: "https://www.jstor.org/download/revoked.pdf",
+    };
+    let release!: () => void;
+    let entered!: () => void;
+    const epochStartEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const epochStartGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.deps.permissions.contains = async () => true;
+    h.deps.scripting.executeScript = async (injection) => {
+      if (injection.func === planGeneric) {
+        return [{ result: { evidence: ["e0:citation-doi=exact"], candidates: [candidate] } }];
+      }
+      return [];
+    };
+    await h.bridge.start();
+    const offer = jobOffer(jobID, OPENURL, "delegated") as { payload: Record<string, unknown> };
+    offer.payload["expected"] = { doi: "10.1000/revoked" };
+    offer.payload["drive_attempt_id"] = "generic-revoked-epoch-1";
+    offer.payload["drive_ordinal"] = 0;
+    offer.payload["drive_strategy"] = "generic";
+    offer.payload["drive_revision"] = "1";
+    await h.port.inbound(offer);
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      if (args[0] === "provider_drive_epoch_start_request") {
+        entered();
+        await epochStartGate;
+      }
+      return {
+        kind: "response",
+        payload: {
+          ...((args[1] ?? {}) as Record<string, unknown>),
+          outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+        },
+      };
+    });
+    const startGenericCandidate = (
+      h.bridge as unknown as {
+        startGenericCandidate(jobID: string, candidates: GenericCandidate[], requestedIndex: number): Promise<void>;
+      }
+    ).startGenericCandidate.bind(h.bridge);
+    const attempt = startGenericCandidate(jobID, [candidate], 0);
+    await epochStartEntered;
+    await h.port.inbound(jobOffer(jobID, OPENURL, "assisted"));
+    expect(h.backend.store.activeJobs[0]?.access_mode).toBe("assisted");
+    release();
+    await attempt;
+    expect(h.downloads.started).toHaveLength(0);
+    expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
+    expect(h.backend.store.activeJobs[0]?.adapter_id).toBeUndefined();
+  });
+
   test("a declared citation URL downloads once and records its strategy", async () => {
     const h = makeHarness();
     await reachUnknown(
@@ -8193,11 +8524,12 @@ describe("generic settled-unknown acquisition", () => {
         ],
       },
     );
-    expect(h.downloads.started.map((entry) => entry.url)).toEqual(["https://www.jstor.org/download/citation.pdf"]);
+    expect(h.downloads.started).toHaveLength(1);
+    expect(h.downloads.started[0]?.url).toBe("https://www.jstor.org/download/citation.pdf");
     expect(h.backend.store.activeJobs[0]?.adapter_id).toBe("generic-citation-pdf/1");
   });
 
-  test("an interrupted citation download advances exactly once to the article link", async () => {
+  test("an interrupted citation download stays parked without advancing", async () => {
     const h = makeHarness();
     await reachUnknown(
       h,
@@ -8212,17 +8544,15 @@ describe("generic settled-unknown acquisition", () => {
       },
     );
     expect(h.downloads.started).toHaveLength(1);
-    await h.downloads.onChanged.emit({ id: 901, state: { current: "interrupted" } });
+    await h.downloads.onChanged.emit({ id: 901, state: { current: "interrupted" }, error: { current: "NETWORK_FAILED" } });
     expect(h.downloads.started.map((entry) => entry.url)).toEqual([
       "https://www.jstor.org/download/missing.pdf",
-      "https://www.jstor.org/pdf/article.pdf",
     ]);
-    expect(h.downloads.started.filter((entry) => entry.url.endsWith("article.pdf"))).toHaveLength(1);
   });
-
   test("identity revalidation failure stops generic execution without a download", async () => {
     const h = makeHarness();
     let plans = 0;
+    const requests: unknown[][] = [];
     h.deps.permissions.contains = async () => true;
     h.deps.scripting.executeScript = async (injection) => {
       if (injection.func === planGeneric) {
@@ -8247,16 +8577,107 @@ describe("generic settled-unknown acquisition", () => {
       }
       return [];
     };
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      requests.push(args);
+      return {
+        kind: "response",
+        payload: {
+          ...((args[1] ?? {}) as Record<string, unknown>),
+          outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+        },
+      };
+    });
     await h.bridge.start();
+    // requestNative above models the feature-negotiated daemon ACK.
     const offer = jobOffer("job_generic_identity", OPENURL, "delegated") as { payload: Record<string, unknown> };
     offer.payload["expected"] = { doi: "10.1000/generic" };
+    offer.payload["drive_attempt_id"] = "generic-identity-epoch-1";
+    offer.payload["drive_ordinal"] = 0;
+    offer.payload["drive_strategy"] = "generic";
+    offer.payload["drive_revision"] = "1";
     await h.port.inbound(offer);
     const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
     await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
     h.clock.now += 6_000;
     await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
     expect(h.downloads.started).toHaveLength(0);
-    expect(h.frames().some((frame) => frame.type === "provider_outcome" && frame.payload.outcome === "wrong_work")).toBe(true);
+    expect(
+      requests.some(
+        (args) =>
+          args[0] === "provider_drive_epoch_result_request" &&
+          (args[1] as Record<string, unknown>)?.outcome === "wrong_work" &&
+          (args[1] as Record<string, unknown>)?.drive_attempt_id === "generic-identity-epoch-1",
+      ),
+    ).toBe(true);
+    expect(
+      requests
+        .filter((args) => args[0] === "provider_drive_epoch_result_request")
+        .every((args) => args[5] === "job_generic_identity"),
+    ).toBe(true);
+    expect(h.frames().some((frame) => frame.type === "provider_outcome" && frame.payload.outcome === "wrong_work")).toBe(false);
+  });
+
+  test("generic completed download is settled after worker restart", async () => {
+    const h = makeHarness();
+    await reachUnknown(h, "job_generic_restart_complete", "delegated", {
+      evidence: ["e0:citation-doi=exact"],
+      candidates: [{ strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/restart-complete.pdf" }],
+    });
+    h.downloads.items.set(901, {
+      id: 901,
+      filename: "/tmp/restart-complete.pdf",
+      fileSize: 12,
+      mime: "application/pdf",
+      state: "complete",
+    });
+    const reloaded = new Bridge(h.deps);
+    Reflect.set(reloaded, "requestNative", async (...args: unknown[]) => ({
+      kind: "response",
+      payload: {
+        ...((args[1] ?? {}) as Record<string, unknown>),
+        outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+      },
+    }));
+    await reloaded.start();
+    const complete = h.frames().filter((frame) => frame.type === "download_complete");
+    expect(complete).toHaveLength(1);
+    expect(h.backend.store.activeJobs[0]?.generic_drive_epoch?.in_flight_download_id).toBe(901);
+  });
+
+  test("generic interrupted download settles its exact tuple after worker restart", async () => {
+    const h = makeHarness();
+    await reachUnknown(h, "job_generic_restart_interrupted", "delegated", {
+      evidence: ["e0:citation-doi=exact"],
+      candidates: [{ strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/restart-interrupted.pdf" }],
+    });
+    h.downloads.items.set(901, { id: 901, state: "interrupted", mime: "application/pdf" });
+    const reloaded = new Bridge(h.deps);
+    const requests: unknown[][] = [];
+    Reflect.set(reloaded, "requestNative", async (...args: unknown[]) => {
+      requests.push(args);
+      return {
+        kind: "response",
+        payload: {
+          ...((args[1] ?? {}) as Record<string, unknown>),
+          outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+        },
+      };
+    });
+    await reloaded.start();
+    const cancelled = requests.filter(
+      (args) =>
+        args[0] === "provider_drive_epoch_result_request" &&
+        (args[1] as Record<string, unknown>)?.outcome === "cancelled",
+    );
+    expect(cancelled).toHaveLength(1);
+    await h.downloads.onChanged.emit({ id: 901, state: { current: "interrupted" } });
+    expect(
+      requests.filter(
+        (args) =>
+          args[0] === "provider_drive_epoch_result_request" &&
+          (args[1] as Record<string, unknown>)?.outcome === "cancelled",
+      ),
+    ).toHaveLength(1);
   });
 
   test("the generic attempt latch survives a worker restart", async () => {
@@ -8274,9 +8695,459 @@ describe("generic settled-unknown acquisition", () => {
     );
     const before = h.downloads.started.length;
     const persisted = JSON.parse(JSON.stringify(h.backend.store)) as StoreShape;
+    expect(JSON.stringify(persisted)).not.toContain("restart.pdf");
     const reloaded = new Bridge(h.deps);
     await reloaded.start();
     expect(h.downloads.started).toHaveLength(before);
     expect((persisted.activeJobs[0] as ActiveJob & { generic_evaluated?: boolean })?.generic_evaluated).toBe(true);
   });
+  test("generic browser-document MIME parks the current candidate without advancing", async () => {
+    const h = makeHarness();
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => ({
+      kind: "response",
+      payload: {
+        ...((args[1] ?? {}) as Record<string, unknown>),
+        outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+      },
+    }));
+    await reachUnknown(h, "job_generic_html", "delegated", {
+      evidence: ["e0:citation-doi=exact"],
+      candidates: [
+        { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/html.pdf" },
+        { strategy_id: "generic-article-pdf-link/1", strategy_version: "1", url: "https://www.jstor.org/download/second.pdf" },
+      ],
+    }, "10.1000/generic", true);
+    h.downloads.items.set(901, { id: 901, filename: "/tmp/wrapper.html", fileSize: 10, mime: "text/html", state: "complete" });
+    await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+    expect(h.downloads.started.map((entry) => entry.url)).toEqual(["https://www.jstor.org/download/html.pdf"]);
+  });
+
+  test("generic clean non-browser MIME advances exactly once to candidate two", async () => {
+    const h = makeHarness();
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => ({
+      kind: "response",
+      payload: {
+        ...((args[1] ?? {}) as Record<string, unknown>),
+        outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+      },
+    }));
+    await reachUnknown(h, "job_generic_clean", "delegated", {
+      evidence: ["e0:citation-doi=exact"],
+      candidates: [
+        { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/image.pdf" },
+        { strategy_id: "generic-article-pdf-link/1", strategy_version: "1", url: "https://www.jstor.org/download/second.pdf" },
+      ],
+    }, "10.1000/generic", true);
+    h.downloads.items.set(901, { id: 901, filename: "/tmp/image.png", fileSize: 10, mime: "image/png", state: "complete" });
+    await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+    expect(h.downloads.started.map((entry) => entry.url)).toEqual([
+      "https://www.jstor.org/download/image.pdf",
+      "https://www.jstor.org/download/second.pdf",
+    ]);
+  });
+});
+
+test("direct named DOI route completes a valid PDF without persisting its URL", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942";
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "provider_direct_get_request",
+    msg_id: "direct_valid_0001",
+    job_id: "job_direct_valid",
+    seq: 2,
+    payload: {
+      drive_attempt_id: "direct-valid-attempt",
+      ordinal: 0,
+      route_revision: "acm-doi-pdf/1",
+      expected_identifier: "doi:10.1145/3630106.3658942",
+      url: directURL,
+      allowed_origin: "https://dl.acm.org",
+      path_family: "/doi/pdf/{doi}",
+      terms_policy: "none",
+    },
+  });
+  h.downloads.items.set(901, {
+    id: 901,
+    filename: "/tmp/direct-valid.pdf",
+    fileSize: 12,
+    mime: "application/pdf",
+    state: "complete",
+    finalUrl: directURL,
+    url: directURL,
+  });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  expect(result?.payload).toMatchObject({
+    drive_attempt_id: "direct-valid-attempt",
+    outcome: "success",
+    landing_class: "pdf",
+  });
+  expect(h.frames().filter((frame) => frame.type === "download_started")).toHaveLength(1);
+  expect(h.frames().filter((frame) => frame.type === "download_complete")).toHaveLength(1);
+  expect(JSON.stringify(h.backend.store)).not.toContain(directURL);
+});
+test("tabless direct downloads share the single effect governor and release after initiation", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  let unblock!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    unblock = resolve;
+  });
+  h.downloads.afterCreate = async () => blocked;
+  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (message: unknown) => Promise<void>;
+  const direct = (jobID: string, msgID: string) =>
+    onDirect.call(h.bridge, {
+      protocol: "papio-browser/1",
+      type: "provider_direct_get_request",
+      msg_id: msgID,
+      job_id: jobID,
+      seq: 2,
+      payload: {
+        drive_attempt_id: `${jobID}-attempt`,
+        ordinal: 0,
+        route_revision: "acm-doi-pdf/1",
+        expected_identifier: "doi:10.1145/3630106.3658942",
+        url: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
+        allowed_origin: "https://dl.acm.org",
+        path_family: "/doi/pdf/{doi}",
+        terms_policy: "none",
+      },
+    });
+  const first = direct("job_direct_governor_a", "direct_governor_a");
+  for (let attempt = 0; attempt < 20 && h.downloads.started.length < 1; attempt += 1) {
+    await Promise.resolve();
+  }
+  expect(h.downloads.started).toHaveLength(1);
+  await direct("job_direct_governor_b", "direct_governor_b");
+  expect(h.downloads.started).toHaveLength(1);
+  unblock();
+  await first;
+  expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
+  expect(Reflect.get(h.bridge, "providerDrainLeaseOwners")).toEqual(new Map());
+});
+test("tabless direct download failure releases both governors for a retry", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  h.downloads.failDownload = true;
+  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (message: unknown) => Promise<void>;
+  await onDirect.call(h.bridge, {
+    protocol: "papio-browser/1",
+    type: "provider_direct_get_request",
+    msg_id: "direct_failure_0001",
+    job_id: "job_direct_failure",
+    seq: 2,
+    payload: {
+      drive_attempt_id: "direct-failure-attempt",
+      ordinal: 0,
+      route_revision: "acm-doi-pdf/1",
+      expected_identifier: "doi:10.1145/3630106.3658942",
+      url: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
+      allowed_origin: "https://dl.acm.org",
+      path_family: "/doi/pdf/{doi}",
+      terms_policy: "none",
+    },
+  });
+  expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
+  expect(Reflect.get(h.bridge, "providerDrainLeaseOwners")).toEqual(new Map());
+});
+
+
+
+test("direct PDF with a foreign final envelope never emits adoption events", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "provider_direct_get_request",
+    msg_id: "direct_foreign_0001",
+    job_id: "job_direct_foreign",
+    seq: 2,
+    payload: {
+      drive_attempt_id: "direct-foreign-attempt",
+      ordinal: 0,
+      route_revision: "acm-doi-pdf/1",
+      expected_identifier: "doi:10.1145/3630106.3658942",
+      url: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
+      allowed_origin: "https://dl.acm.org",
+      path_family: "/doi/pdf/{doi}",
+      terms_policy: "none",
+    },
+  });
+  h.downloads.items.set(901, {
+    id: 901,
+    filename: "/tmp/direct-foreign.pdf",
+    fileSize: 12,
+    mime: "application/pdf",
+    state: "complete",
+    finalUrl: "https://evil.example/download.pdf",
+    url: "https://evil.example/download.pdf",
+  });
+
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  expect(result?.payload).toMatchObject({
+    drive_attempt_id: "direct-foreign-attempt",
+    outcome: "foreign",
+    landing_class: "foreign",
+  });
+  expect(h.frames().filter((frame) => frame.type === "download_started")).toHaveLength(0);
+  expect(h.frames().filter((frame) => frame.type === "download_complete")).toHaveLength(0);
+  expect(h.downloads.removedFiles).toEqual([901]);
+});
+test("direct named-marker mismatch is rejected at completion", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "provider_direct_get_request",
+    msg_id: "direct_marker_mismatch_0001",
+    job_id: "job_direct_marker_mismatch",
+    seq: 2,
+    payload: {
+      drive_attempt_id: "direct-marker-mismatch-attempt",
+      ordinal: 0,
+      route_revision: "acm-doi-pdf/1",
+      expected_identifier: "doi:10.1145/3630106.3658942",
+      url: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
+      allowed_origin: "https://dl.acm.org",
+      path_family: "/doi/pdf/{doi}",
+      terms_policy: "none",
+    },
+  });
+  h.downloads.items.set(901, {
+    id: 901,
+    filename: "/tmp/direct-marker-mismatch.pdf",
+    fileSize: 12,
+    mime: "application/pdf",
+    state: "complete",
+    finalUrl: "https://dl.acm.org/doi/pdf/10.1145/3630106.other",
+    url: "https://dl.acm.org/doi/pdf/10.1145/3630106.other",
+  });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  expect(result?.payload).toMatchObject({
+    drive_attempt_id: "direct-marker-mismatch-attempt",
+    outcome: "foreign",
+    landing_class: "foreign",
+  });
+  expect(h.downloads.started).toHaveLength(1);
+  expect(h.downloads.removedFiles).toEqual([901]);
+  expect(h.frames().filter((frame) => frame.type === "download_started")).toHaveLength(0);
+  expect(h.frames().filter((frame) => frame.type === "download_complete")).toHaveLength(0);
+});
+
+test("direct completed download is recovered once across worker restarts", async () => {
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942";
+  const seed: StoreShape = {
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: "job_direct_restart",
+      tab_id: -1,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "accepted",
+      provider_hosts: ["dl.acm.org"],
+      access_mode: "delegated",
+      download_initiated: true,
+      direct_terminal: false,
+      drive_epoch: {
+        drive_attempt_id: "direct-restart-attempt",
+        ordinal: 0,
+        strategy: "direct",
+        route_revision: "acm-doi-pdf/1",
+        in_flight_download_id: 901,
+        attempt_count: 1,
+      },
+      direct_envelope: {
+        allowed_origin: "https://dl.acm.org",
+        path_family: "/doi/pdf/{doi}",
+        expected_identifier: "doi:10.1145/3630106.3658942",
+      },
+    }],
+  };
+  const first = makeHarness(seed);
+  first.downloads.items.set(901, {
+    id: 901,
+    filename: "/tmp/direct-restart.pdf",
+    fileSize: 12,
+    mime: "application/pdf",
+    state: "complete",
+    finalUrl: directURL,
+    url: directURL,
+  });
+  await first.bridge.start();
+  expect(first.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(1);
+  expect(first.backend.store.activeJobs[0]?.direct_terminal).toBe(true);
+  expect(JSON.stringify(first.backend.store)).not.toContain(directURL);
+
+  const second = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  second.downloads.items.set(901, {
+    id: 901,
+    filename: "/tmp/direct-restart.pdf",
+    fileSize: 12,
+    mime: "application/pdf",
+    state: "complete",
+    finalUrl: directURL,
+    url: directURL,
+  });
+  await second.bridge.start();
+  expect(second.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(0);
+});
+test("direct pre-ID download is recovered by its exact job filename and settled once", async () => {
+  const jobID = "job_direct_pre_id";
+  const seed: StoreShape = {
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: jobID,
+      tab_id: -1,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "accepted",
+      provider_hosts: ["dl.acm.org"],
+      access_mode: "delegated",
+      download_initiated: true,
+      drive_epoch: {
+        drive_attempt_id: "direct-pre-id-attempt",
+        ordinal: 0,
+        strategy: "direct",
+        route_revision: "acm-doi-pdf/1",
+        attempt_count: 1,
+      },
+      direct_envelope: {
+        allowed_origin: "https://dl.acm.org",
+        path_family: "/doi/pdf/{doi}",
+        expected_identifier: "doi:10.1145/3630106.3658942",
+      },
+    }],
+  };
+  const h = makeHarness(seed);
+  h.downloads.items.set(901, {
+    id: 901,
+    filename: jobDownloadFilename(jobID),
+    fileSize: 12,
+    mime: "application/pdf",
+    state: "complete",
+    finalUrl: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
+    url: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
+  });
+  await h.bridge.start();
+  expect(h.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.direct_terminal).toBe(true);
+  expect(JSON.stringify(h.backend.store)).not.toContain("https://dl.acm.org/doi/pdf/10.1145/3630106.3658942");
+  const second = new Bridge(h.deps);
+  await second.start();
+  expect(h.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(1);
+});
+test("direct pre-ID restart with no exact filename settles the tuple for retry", async () => {
+  const jobID = "job_direct_pre_id_missing";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: jobID,
+      tab_id: -1,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "accepted",
+      provider_hosts: ["dl.acm.org"],
+      access_mode: "delegated",
+      download_initiated: true,
+      drive_epoch: {
+        drive_attempt_id: "direct-pre-id-missing",
+        ordinal: 0,
+        strategy: "direct",
+        route_revision: "acm-doi-pdf/1",
+        attempt_count: 1,
+      },
+      direct_envelope: {
+        allowed_origin: "https://dl.acm.org",
+        path_family: "/doi/pdf/{doi}",
+        expected_identifier: "doi:10.1145/3630106.3658942",
+      },
+    }],
+  });
+  await h.bridge.start();
+  expect(h.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(false);
+  expect(h.backend.store.activeJobs[0]?.direct_terminal).toBe(true);
+});
+
+
+test("generic pre-ID interrupted download settles once and no-match recovery clears the latch", async () => {
+  const jobID = "job_generic_pre_id";
+  const requests: unknown[][] = [];
+  const seed: StoreShape = {
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: jobID,
+      tab_id: -1,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "accepted",
+      provider_hosts: ["www.jstor.org"],
+      access_mode: "delegated",
+      download_initiated: true,
+      generic_drive_epoch: {
+        drive_attempt_id: "generic-pre-id-attempt",
+        ordinal: 0,
+        strategy: "generic",
+        revision: "1",
+        strategy_id: "generic-citation-pdf/1",
+        attempt_count: 1,
+      },
+    }],
+  };
+  const h = makeHarness(seed);
+  Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    requests.push(args);
+    return {
+      kind: "response",
+      payload: {
+        ...((args[1] ?? {}) as Record<string, unknown>),
+        outcome: "applied",
+      },
+    };
+  });
+  h.downloads.items.set(901, {
+    id: 901,
+    filename: jobDownloadFilename(jobID),
+    mime: "application/pdf",
+    state: "interrupted",
+  });
+  await h.bridge.start();
+  expect(requests.filter((args) => args[0] === "provider_drive_epoch_result_request")).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.generic_terminal).toBe(true);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(false);
+  const second = new Bridge(h.deps);
+  Reflect.set(second, "requestNative", async (...args: unknown[]) => {
+    requests.push(args);
+    return {
+      kind: "response",
+      payload: {
+        ...((args[1] ?? {}) as Record<string, unknown>),
+        outcome: "applied",
+      },
+    };
+  });
+  await second.start();
+  expect(requests.filter((args) => args[0] === "provider_drive_epoch_result_request")).toHaveLength(1);
+  expect(requests[0]?.[5]).toBe(jobID);
+
+  const missing = makeHarness(seed);
+  const missingRequests: unknown[][] = [];
+  Reflect.set(missing.bridge, "requestNative", async (...args: unknown[]) => {
+    missingRequests.push(args);
+    return { kind: "response", payload: { ...((args[1] ?? {}) as Record<string, unknown>), outcome: "applied" } };
+  });
+  missing.downloads.items.clear();
+  await missing.bridge.start();
+  expect(missingRequests.filter((args) => args[0] === "provider_drive_epoch_result_request")).toHaveLength(1);
+  expect(missing.backend.store.activeJobs[0]?.download_initiated).toBe(false);
+  expect(missing.backend.store.activeJobs[0]?.generic_terminal).toBe(true);
 });

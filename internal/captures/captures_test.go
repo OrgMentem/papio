@@ -43,6 +43,49 @@ func TestStoreAndListRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreSanitizedRecordsHashAndProvenance(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 2, MaxAge: 24 * time.Hour})
+	html := []byte("<!-- papio-fixture provider=\"sage\" scenario=\"observed\" origin=\"https://sage.example/\" captured=\"2026-08-10T00:00:00Z\" -->\n<html>safe</html>")
+	path, err := store.StoreSanitized(ctx, "sage.example", "observed", "sage", "1.2.3", html)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Path != path {
+		t.Fatalf("rows = %#v", rows)
+	}
+	if rows[0].SHA256 == "" || rows[0].SanitizerProvenance != SanitizerProvenance || rows[0].SanitizerVersion != SanitizerVersion {
+		t.Fatalf("sanitized metadata = %#v", rows[0])
+	}
+	if _, err := store.StoreSanitized(ctx, "sage.example", "observed", "sage", "1.2.3", []byte("<html>raw</html>")); err == nil {
+		t.Fatal("raw HTML was accepted through trusted ingress")
+	}
+}
+func TestUpdateJobMarksOnlyDaemonCorrelatedEvidenceIndependent(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 2, MaxAge: 24 * time.Hour})
+	html := []byte("<!-- papio-fixture provider=\"sage\" scenario=\"success\" origin=\"https://sage.example/article\" captured=\"2026-08-10T00:00:00Z\" -->\n<html>safe</html>")
+	path, err := store.StoreSanitized(ctx, "sage.example", "success", "sage", "1.2.3", html)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].IndependentEvidence {
+		t.Fatalf("caller-labelled capture evidence = %#v, %v; want untrusted", rows, err)
+	}
+	if err := store.UpdateJob(ctx, "job-correlated", path, path); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = store.List(ctx)
+	if err != nil || len(rows) != 1 || !rows[0].IndependentEvidence {
+		t.Fatalf("correlated capture evidence = %#v, %v; want independent", rows, err)
+	}
+}
+
 func TestStorePrunesRetention(t *testing.T) {
 	t.Run("count", func(t *testing.T) {
 		ctx := context.Background()

@@ -31,9 +31,8 @@ import (
 // at all — deleting it does not remove the key from the wire, it just makes
 // every `--since`-bearing call fail with "unknown field \"since\"" before
 // either renderer runs. It is deliberately NOT re-emitted on the OUTPUT side:
-// the page shape is supplied by printPage, and a metadata key that appears
-// only on some invocations is exactly the shape drift the one-envelope
-// contract exists to remove.
+// the stable output shape is supplied by jobsFailuresPage, and metadata that
+// appears only on some invocations is deliberately excluded from that shape.
 type jobsFailuresResult struct {
 	Failures []job.FailureGroup `json:"failures"`
 	Since    string             `json:"since,omitempty"`
@@ -41,6 +40,17 @@ type jobsFailuresResult struct {
 
 type jobsIncidentsResult struct {
 	Incidents []incident.Group `json:"incidents"`
+}
+
+// jobsFailuresPage keeps the established ordinary failure rows under
+// "failures" and adds incidents under their own stable collection. Both
+// collections are present for every invocation, including incident-only and
+// old-daemon fallback responses, so consumers never have to infer the row
+// schema from current data.
+type jobsFailuresPage struct {
+	Failures  []job.FailureGroup `json:"failures"`
+	Incidents []incident.Group   `json:"incidents"`
+	Truncated bool               `json:"truncated"`
 }
 
 // listJobsPage and listActionsPage prefer the _v2 methods, whose `truncated` is
@@ -511,8 +521,12 @@ func newJobsCommand(opt *options) *cobra.Command {
 	var failuresSince string
 	var failuresLimit int
 	failures := &cobra.Command{
-		Use:         "failures",
-		Short:       "Group acquisition jobs that need attention",
+		Use:   "failures",
+		Short: "Group acquisition jobs that need attention",
+		Long: "Group acquisition jobs that need attention.\n\n" +
+			"Incident fingerprints omit raw hosts and identifiers and are keyed per " +
+			"installation; local output intentionally includes bounded safety_domain " +
+			"and registrable host_family labels for diagnosis.",
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -522,29 +536,34 @@ func newJobsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			var incidentsResult jobsIncidentsResult
-			if err := opt.call(cmd.Context(), "jobs.incidents", map[string]any{"since": failuresSince, "limit": effective}, &incidentsResult); err != nil && !isUnknownMethod(err) {
-				return err
+			if err := opt.call(cmd.Context(), "jobs.incidents", map[string]any{"since": failuresSince, "limit": effective}, &incidentsResult); err != nil {
+				if !isUnknownMethod(err) {
+					return err
+				}
+				// Older daemons have no incident read model. Keep the
+				// incidents collection empty rather than replacing or
+				// suppressing the ordinary failure collection.
+				incidentsResult.Incidents = []incident.Group{}
 			}
+			failureRows, failureTruncated := agentjson.Capped(result.Failures, effective)
+			incidentRows, incidentTruncated := agentjson.Capped(incidentsResult.Incidents, effective)
 			if opt.jsonOutput {
-				if len(incidentsResult.Incidents) > 0 {
-					rows, truncated := agentjson.Capped(incidentsResult.Incidents, effective)
-					return printPage(opt, "failures", rows, truncated)
-				}
-				rows, truncated := agentjson.Capped(result.Failures, effective)
-				return printPage(opt, "failures", rows, truncated)
+				return opt.printJSON(jobsFailuresPage{
+					Failures:  failureRows,
+					Incidents: incidentRows,
+					Truncated: failureTruncated || incidentTruncated,
+				})
 			}
-			if len(incidentsResult.Incidents) > 0 {
-				for _, group := range incidentsResult.Incidents {
-					if _, err := fmt.Fprintf(opt.out, "%s | %s | %s | %s | %d | %s | %s\n",
-						group.Fingerprint, group.SafetyDomain, group.HostFamily, group.Outcome,
-						group.Jobs, group.FirstSeen.Format(time.RFC3339Nano), group.LastSeen.Format(time.RFC3339Nano)); err != nil {
-						return err
-					}
+			for _, group := range failureRows {
+				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s (sample: %s)\n",
+					group.Count, group.State, group.Provider, group.Reason, group.Sample); err != nil {
+					return err
 				}
-				return nil
 			}
-			for _, group := range result.Failures {
-				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | %s (sample: %s)\n", group.Count, group.State, group.Provider, group.Reason, group.Sample); err != nil {
+			for _, group := range incidentRows {
+				if _, err := fmt.Fprintf(opt.out, "%s | %s | %s | %s | %d | %s | %s\n",
+					group.Fingerprint, group.SafetyDomain, group.HostFamily, group.Outcome,
+					group.Jobs, group.FirstSeen.Format(time.RFC3339Nano), group.LastSeen.Format(time.RFC3339Nano)); err != nil {
 					return err
 				}
 			}
@@ -553,10 +572,52 @@ func newJobsCommand(opt *options) *cobra.Command {
 	}
 	failures.Flags().StringVar(&failuresSince, "since", "", "include jobs updated since a duration or RFC3339 timestamp")
 	failures.Flags().IntVar(&failuresLimit, "limit", 50, "maximum groups (1-200)")
+	var incidentsSince string
+	var incidentsLimit int
+	incidents := &cobra.Command{
+		Use:   "incidents",
+		Short: "Group decisive provider incidents",
+		Long: "Group decisive provider incidents by keyed failure shape.\n\n" +
+			"The fingerprint omits raw hosts and identifiers and is keyed per " +
+			"installation; local output intentionally includes bounded safety_domain " +
+			"and registrable host_family labels for diagnosis.",
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		Args:        cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			effective := effectiveLimitFloored(incidentsLimit, job.FailuresLimitMax, job.FailuresLimitDefault)
+			var result jobsIncidentsResult
+			if err := opt.call(cmd.Context(), "jobs.incidents", map[string]any{"since": incidentsSince, "limit": effective}, &result); err != nil {
+				if isUnknownMethod(err) {
+					// Older daemons have no incident read model. Preserve the
+					// separate surface with an empty page rather than
+					// substituting legacy FailureGroup rows.
+					if opt.jsonOutput {
+						return printPage(opt, "incidents", []incident.Group{}, false)
+					}
+					return nil
+				}
+				return err
+			}
+			rows, truncated := agentjson.Capped(result.Incidents, effective)
+			if opt.jsonOutput {
+				return printPage(opt, "incidents", rows, truncated)
+			}
+			for _, group := range rows {
+				if _, err := fmt.Fprintf(opt.out, "%s | %s | %s | %s | %d | %s | %s\n",
+					group.Fingerprint, group.SafetyDomain, group.HostFamily, group.Outcome,
+					group.Jobs, group.FirstSeen.Format(time.RFC3339Nano), group.LastSeen.Format(time.RFC3339Nano)); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	incidents.Flags().StringVar(&incidentsSince, "since", "", "include incidents recorded since a duration or RFC3339 timestamp")
+	incidents.Flags().IntVar(&incidentsLimit, "limit", 50, "maximum groups (1-200)")
 
 	diagnose := newJobsDiagnoseCommand(opt)
 
-	command.AddCommand(list, get, show, diagnose, cancel, retry, failures, receiptCommand, repairAwaitingHuman, addComponent)
+	command.AddCommand(list, get, show, diagnose, cancel, retry, failures, incidents, receiptCommand, repairAwaitingHuman, addComponent)
 	return command
 }
 

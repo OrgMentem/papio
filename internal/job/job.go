@@ -765,6 +765,53 @@ func (js *Store) FillWorkMetadata(ctx context.Context, jobID string, discovered 
 	return js.Get(ctx, jobID)
 }
 
+// NarrowPolicyAccessMode durably lowers a job's automation ceiling. It is
+// monotone: an existing conservative or assisted policy is never widened, and
+// an unset policy may only be set to the requested ceiling. The update is
+// persisted before an action is opened so a restarted bridge cannot advertise
+// the former, wider mode.
+func (js *Store) NarrowPolicyAccessMode(ctx context.Context, jobID, ceiling string) error {
+	rank := map[string]int{"conservative": 0, "assisted": 1, "delegated": 2}
+	targetRank, ok := rank[ceiling]
+	if !ok {
+		return fmt.Errorf("invalid access mode ceiling %q", ceiling)
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var current string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(json_extract(policy_json, '$.access_mode'), '') FROM jobs WHERE id = ?`,
+		jobID).Scan(&current); err != nil {
+		return err
+	}
+	current = strings.TrimSpace(current)
+	if current != "" {
+		currentRank, known := rank[current]
+		if !known {
+			return fmt.Errorf("job %s has invalid access mode %q", jobID, current)
+		}
+		if currentRank <= targetRank {
+			return tx.Commit()
+		}
+	}
+	result, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET policy_json = json_set(policy_json, '$.access_mode', ?), updated_at = ? WHERE id = ?`,
+		ceiling, store.Now(), jobID)
+	if err != nil {
+		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil {
+		return err
+	} else if changed != 1 {
+		return ErrConflict
+	}
+	return tx.Commit()
+}
+
 // ReserveCost atomically charges one paid source attempt to a job. A nil limit
 // tracks spend without imposing a ceiling. Zero-cost calls are not recorded.
 func (js *Store) ReserveCost(ctx context.Context, jobID, source string, cost float64, limit *float64) error {

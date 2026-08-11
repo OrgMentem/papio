@@ -12,16 +12,30 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/publicsuffix"
 )
+
+var (
+	incidentKeyPublicationHook func(string) error
+	incidentKeyMu              sync.Mutex
+)
+
+func keyPublicationPoint(point string) error {
+	if incidentKeyPublicationHook == nil {
+		return nil
+	}
+	return incidentKeyPublicationHook(point)
+}
 
 const (
 	KeyName         = "incident.key"
@@ -61,8 +75,67 @@ func Fingerprint(key []byte, in FingerprintInput) string {
 	return hex.EncodeToString(mac.Sum(nil)[:FingerprintSize])
 }
 
+// readPublishedKey accepts only a complete regular key artifact. The boolean
+// reports whether the final path was present, including a malformed regular
+// artifact that the caller may safely replace.
+func readPublishedKey(path string) ([]byte, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, fmt.Errorf("checking incident key: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, true, errors.New("incident key must not be a symlink")
+	}
+	if !info.Mode().IsRegular() {
+		return nil, true, fmt.Errorf("incident key must be a regular file, got %s", info.Mode())
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, true, fmt.Errorf("opening incident key: %w", err)
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, true, fmt.Errorf("stating incident key: %w", err)
+	}
+	if !openedInfo.Mode().IsRegular() {
+		return nil, true, fmt.Errorf("incident key must be a regular file, got %s", openedInfo.Mode())
+	}
+	if !os.SameFile(info, openedInfo) {
+		// The path changed between validation and open. Never trust bytes
+		// obtained through that race; let the caller retry the path.
+		return nil, false, nil
+	}
+	key := make([]byte, KeySize)
+	if _, err := io.ReadFull(file, key); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, true, nil
+		}
+		return nil, true, fmt.Errorf("reading incident key: %w", err)
+	}
+	var extra [1]byte
+	if n, err := file.Read(extra[:]); n != 0 {
+		return nil, true, nil
+	} else if !errors.Is(err, io.EOF) {
+		return nil, true, fmt.Errorf("checking incident key length: %w", err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return nil, true, fmt.Errorf("restricting incident key: %w", err)
+	}
+	return key, true, nil
+}
+
 // LoadOrCreateKey loads the per-installation incident key, creating it once
-// with restrictive permissions when needed.
+// with restrictive permissions when needed. A key is never published until a
+// same-directory temporary file has been completely written, synced, closed,
+// and then linked into place with exclusive semantics.
 func LoadOrCreateKey(dataDir string) ([]byte, error) {
 	if strings.TrimSpace(dataDir) == "" {
 		return nil, errors.New("incident data directory is required")
@@ -70,46 +143,98 @@ func LoadOrCreateKey(dataDir string) ([]byte, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating incident data directory: %w", err)
 	}
+	incidentKeyMu.Lock()
+	defer incidentKeyMu.Unlock()
 	path := filepath.Join(dataDir, KeyName)
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("incident key must not be a symlink")
-	}
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-	if err == nil {
-		key := make([]byte, KeySize)
-		if _, err := rand.Read(key); err != nil {
-			_ = file.Close()
-			_ = os.Remove(path)
-			return nil, fmt.Errorf("generating incident key: %w", err)
+	for {
+		key, present, err := readPublishedKey(path)
+		if err != nil {
+			return nil, err
 		}
-		if _, err := file.Write(key); err != nil {
-			_ = file.Close()
-			_ = os.Remove(path)
-			return nil, fmt.Errorf("writing incident key: %w", err)
+		if present {
+			if key != nil {
+				return key, nil
+			}
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("removing invalid incident key: %w", err)
+			}
+			continue
 		}
-		if err := file.Chmod(0o600); err != nil {
-			_ = file.Close()
-			return nil, fmt.Errorf("restricting incident key: %w", err)
+		temp, err := os.CreateTemp(dataDir, "."+KeyName+".tmp-*")
+		if err != nil {
+			return nil, fmt.Errorf("creating incident key temporary file: %w", err)
 		}
-		if err := file.Close(); err != nil {
+		tempPath := temp.Name()
+		cleanup := func() {
+			_ = temp.Close()
+			_ = os.Remove(tempPath)
+		}
+		fail := func(message string, err error) ([]byte, error) {
+			cleanup()
+			return nil, fmt.Errorf("%s: %w", message, err)
+		}
+		if err := keyPublicationPoint("temp_created"); err != nil {
+			return fail("incident key publication interrupted", err)
+		}
+		newKey := make([]byte, KeySize)
+		if _, err := rand.Read(newKey); err != nil {
+			return fail("generating incident key", err)
+		}
+		n, err := temp.Write(newKey)
+		if err != nil {
+			return fail("writing incident key", err)
+		}
+		if n != len(newKey) {
+			return fail("writing incident key", io.ErrShortWrite)
+		}
+		if err := keyPublicationPoint("written"); err != nil {
+			return fail("incident key publication interrupted", err)
+		}
+		if err := temp.Chmod(0o600); err != nil {
+			return fail("restricting incident key", err)
+		}
+		if err := keyPublicationPoint("chmod"); err != nil {
+			return fail("incident key publication interrupted", err)
+		}
+		if err := temp.Sync(); err != nil {
+			return fail("syncing incident key", err)
+		}
+		if err := keyPublicationPoint("synced"); err != nil {
+			return fail("incident key publication interrupted", err)
+		}
+		if err := temp.Close(); err != nil {
+			_ = os.Remove(tempPath)
 			return nil, fmt.Errorf("closing incident key: %w", err)
 		}
-		return key, nil
+		if err := keyPublicationPoint("closed"); err != nil {
+			_ = os.Remove(tempPath)
+			return nil, fmt.Errorf("incident key publication interrupted: %w", err)
+		}
+		err = os.Link(tempPath, path)
+		if err == nil {
+			_ = os.Remove(tempPath)
+			if err := keyPublicationPoint("published"); err != nil {
+				return nil, fmt.Errorf("incident key publication interrupted: %w", err)
+			}
+			dir, openErr := os.Open(dataDir)
+			if openErr != nil {
+				return nil, fmt.Errorf("opening incident key directory: %w", openErr)
+			}
+			syncErr := dir.Sync()
+			closeErr := dir.Close()
+			if syncErr != nil {
+				return nil, fmt.Errorf("syncing incident key directory: %w", syncErr)
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("closing incident key directory: %w", closeErr)
+			}
+			return newKey, nil
+		}
+		_ = os.Remove(tempPath)
+		if !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("publishing incident key: %w", err)
+		}
 	}
-	if !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("creating incident key: %w", err)
-	}
-	key, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("reading incident key: %w", err)
-	}
-	if len(key) != KeySize {
-		return nil, fmt.Errorf("incident key has length %d, want %d", len(key), KeySize)
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return nil, fmt.Errorf("restricting incident key: %w", err)
-	}
-	return key, nil
 }
 
 // NormalizeHostFamily extracts a registrable domain and discards path/query
@@ -141,60 +266,21 @@ func NormalizeHostFamily(raw string) string {
 	return raw
 }
 
-// InputFromEvents derives a redacted fingerprint shape from the existing
-// durable event forms. It records detail key names, never detail values, as
-// marker classes; only the bounded outcome/latch vocabulary is retained.
+// InputFromEvents returns the first immutable provider-outcome shape. It is
+// retained as a compatibility helper, but deliberately does not project later
+// events into an earlier incident.
 func InputFromEvents(events []map[string]any) FingerprintInput {
-	var in FingerprintInput
-	markerSet := make(map[string]struct{})
-	for _, event := range events {
-		kind, _ := event["kind"].(string)
-		if kind != "browser.provider_outcome" && kind != "job.latch" && kind != "browser.page_capture" {
+	for index, event := range events {
+		if kind, _ := event["kind"].(string); kind != "browser.provider_outcome" {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
-		for key := range detail {
-			markerSet[key] = struct{}{}
+		if strings.TrimSpace(stringDetail(detail, "outcome")) == "" {
+			continue
 		}
-		if host, _ := detail["host"].(string); host != "" {
-			in.HostFamily = NormalizeHostFamily(host)
-		}
-		if domain, _ := detail["safety_domain"].(string); domain != "" {
-			in.SafetyDomain = strings.TrimSpace(domain)
-		}
-		if outcome, _ := detail["outcome"].(string); outcome != "" && kind == "browser.provider_outcome" {
-			in.OutcomeKind = strings.TrimSpace(outcome)
-		}
-		if in.OutcomeKind == "" {
-			if latch, _ := detail["kind"].(string); kind == "job.latch" && latch != "" {
-				in.OutcomeKind = "latch_" + strings.TrimSpace(latch)
-			}
-		}
-		if in.OutcomeKind == "" {
-			if scenario, _ := detail["scenario"].(string); kind == "browser.page_capture" && scenario != "" {
-				in.OutcomeKind = "capture_" + strings.TrimSpace(scenario)
-			}
-		}
-		if in.SafetyDomain == "" {
-			if adapter, _ := detail["adapter_id"].(string); adapter != "" {
-				in.SafetyDomain = strings.TrimSpace(adapter)
-			}
-		}
+		return decisiveInput(events, index)
 	}
-	for marker := range markerSet {
-		in.MarkerClasses = append(in.MarkerClasses, marker)
-	}
-	sort.Strings(in.MarkerClasses)
-	if in.HostFamily == "" {
-		in.HostFamily = "unknown"
-	}
-	if in.SafetyDomain == "" {
-		in.SafetyDomain = "unknown"
-	}
-	if in.OutcomeKind == "" {
-		in.OutcomeKind = "unknown"
-	}
-	return in
+	return unknownInput()
 }
 
 func unique(values []string) []string {
@@ -230,8 +316,142 @@ type Group struct {
 	LastSeen     time.Time `json:"last_seen"`
 }
 
-// Aggregate groups observations by keyed failure shape. Jobs with no decisive
-// observation are omitted rather than assigned a misleading generic incident.
+// decisiveObservation is an immutable shape/window extracted at the instant a
+// provider outcome was recorded. Nothing after that outcome can participate.
+type decisiveObservation struct {
+	input FingerprintInput
+	at    time.Time
+}
+
+func eventTime(event map[string]any) (time.Time, bool) {
+	raw, _ := event["at"].(string)
+	at, err := time.Parse(time.RFC3339Nano, raw)
+	return at, err == nil
+}
+
+func eventEpoch(event map[string]any) string {
+	for _, key := range []string{"drive_attempt_id", "epoch", "drive_epoch"} {
+		if value, ok := event[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	detail, _ := event["detail"].(map[string]any)
+	for _, key := range []string{"drive_attempt_id", "epoch", "drive_epoch"} {
+		if value, ok := detail[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func stringDetail(detail map[string]any, key string) string {
+	value, _ := detail[key].(string)
+	return value
+}
+
+func unknownInput() FingerprintInput {
+	return FingerprintInput{
+		SafetyDomain: "unknown",
+		HostFamily:   "unknown",
+		OutcomeKind:  "unknown",
+	}
+}
+
+func decisiveInput(events []map[string]any, index int) FingerprintInput {
+	detail, _ := events[index]["detail"].(map[string]any)
+	input := FingerprintInput{
+		OutcomeKind:  strings.TrimSpace(stringDetail(detail, "outcome")),
+		HostFamily:   NormalizeHostFamily(stringDetail(detail, "host")),
+		SafetyDomain: strings.ToLower(strings.TrimSpace(stringDetail(detail, "safety_domain"))),
+	}
+	if input.SafetyDomain == "" || input.SafetyDomain == "unknown" {
+		input.SafetyDomain = strings.ToLower(strings.TrimSpace(stringDetail(detail, "adapter_id")))
+	}
+	markers := make(map[string]struct{}, len(detail))
+	for key := range detail {
+		markers[key] = struct{}{}
+	}
+	epoch := eventEpoch(events[index])
+	adapterID := strings.TrimSpace(stringDetail(detail, "adapter_id"))
+	adapterVersion := strings.TrimSpace(stringDetail(detail, "adapter_version"))
+	// A capture belongs to this outcome only while walking backward inside
+	// the current drive epoch. The prior provider outcome is the durable
+	// boundary even for histories that predate explicit epoch fields.
+	for prior := index - 1; prior >= 0; prior-- {
+		previous := events[prior]
+		if kind, _ := previous["kind"].(string); kind == "browser.provider_outcome" {
+			break
+		}
+		if kind, _ := previous["kind"].(string); kind != "browser.page_capture" {
+			continue
+		}
+		captureEpoch := eventEpoch(previous)
+		if epoch != "" && captureEpoch != "" && captureEpoch != epoch {
+			continue
+		}
+		capture, _ := previous["detail"].(map[string]any)
+		captureID := strings.TrimSpace(stringDetail(capture, "adapter_id"))
+		captureVersion := strings.TrimSpace(stringDetail(capture, "adapter_version"))
+		if adapterID != "" && captureID != "" && captureID != adapterID {
+			continue
+		}
+		if adapterVersion != "" && captureVersion != "" && captureVersion != adapterVersion {
+			continue
+		}
+		if input.HostFamily == "unknown" || input.HostFamily == "" {
+			input.HostFamily = NormalizeHostFamily(stringDetail(capture, "host"))
+		}
+		if input.SafetyDomain == "" || input.SafetyDomain == "unknown" {
+			captureDomain := strings.TrimSpace(stringDetail(capture, "safety_domain"))
+			if captureDomain == "" {
+				captureDomain = captureID
+			}
+			input.SafetyDomain = strings.ToLower(captureDomain)
+		}
+		for key := range capture {
+			markers[key] = struct{}{}
+		}
+		// The nearest compatible capture is the complete context. Older
+		// captures are prior navigation state and must not rewrite it.
+		break
+	}
+	if input.HostFamily == "" {
+		input.HostFamily = "unknown"
+	}
+	if input.SafetyDomain == "" {
+		input.SafetyDomain = "unknown"
+	}
+	if input.OutcomeKind == "" {
+		input.OutcomeKind = "unknown"
+	}
+	for marker := range markers {
+		input.MarkerClasses = append(input.MarkerClasses, marker)
+	}
+	sort.Strings(input.MarkerClasses)
+	return input
+}
+
+func decisiveObservations(events []map[string]any) []decisiveObservation {
+	var out []decisiveObservation
+	for index, event := range events {
+		if kind, _ := event["kind"].(string); kind != "browser.provider_outcome" {
+			continue
+		}
+		at, ok := eventTime(event)
+		if !ok {
+			continue
+		}
+		input := decisiveInput(events, index)
+		if input.OutcomeKind == "unknown" {
+			continue
+		}
+		out = append(out, decisiveObservation{input: input, at: at})
+	}
+	return out
+}
+
+// Aggregate groups immutable decisive provider observations by keyed failure
+// shape. Capture-only history and non-decisive transitions are ignored.
 func Aggregate(key []byte, observations []JobObservation) []Group {
 	type aggregate struct {
 		Group
@@ -239,50 +459,30 @@ func Aggregate(key []byte, observations []JobObservation) []Group {
 	}
 	groups := make(map[string]*aggregate)
 	for _, observation := range observations {
-		input := InputFromEvents(observation.Events)
-		if input.OutcomeKind == "unknown" {
-			continue
-		}
-		var firstSeen, lastSeen time.Time
-		for _, event := range observation.Events {
-			at, _ := event["at"].(string)
-			timestamp, err := time.Parse(time.RFC3339Nano, at)
-			if err != nil {
-				continue
+		for _, decisive := range decisiveObservations(observation.Events) {
+			fingerprint := Fingerprint(key, decisive.input)
+			group := groups[fingerprint]
+			if group == nil {
+				group = &aggregate{Group: Group{
+					Fingerprint:  fingerprint,
+					SafetyDomain: decisive.input.SafetyDomain,
+					HostFamily:   decisive.input.HostFamily,
+					Outcome:      decisive.input.OutcomeKind,
+					FirstSeen:    decisive.at,
+					LastSeen:     decisive.at,
+				}, seen: make(map[string]struct{})}
+				groups[fingerprint] = group
 			}
-			if firstSeen.IsZero() {
-				firstSeen, lastSeen = timestamp, timestamp
-				continue
+			if _, ok := group.seen[observation.JobID]; !ok {
+				group.seen[observation.JobID] = struct{}{}
+				group.Jobs++
 			}
-			if timestamp.Before(firstSeen) {
-				firstSeen = timestamp
+			if decisive.at.Before(group.FirstSeen) {
+				group.FirstSeen = decisive.at
 			}
-			if timestamp.After(lastSeen) {
-				lastSeen = timestamp
+			if decisive.at.After(group.LastSeen) {
+				group.LastSeen = decisive.at
 			}
-		}
-		if firstSeen.IsZero() {
-			firstSeen, lastSeen = observation.UpdatedAt, observation.UpdatedAt
-		}
-		fingerprint := Fingerprint(key, input)
-		group := groups[fingerprint]
-		if group == nil {
-			group = &aggregate{Group: Group{
-				Fingerprint: fingerprint, SafetyDomain: input.SafetyDomain,
-				HostFamily: input.HostFamily, Outcome: input.OutcomeKind,
-				FirstSeen: firstSeen, LastSeen: lastSeen,
-			}, seen: make(map[string]struct{})}
-			groups[fingerprint] = group
-		}
-		if _, ok := group.seen[observation.JobID]; !ok {
-			group.seen[observation.JobID] = struct{}{}
-			group.Jobs++
-		}
-		if firstSeen.Before(group.FirstSeen) {
-			group.FirstSeen = firstSeen
-		}
-		if lastSeen.After(group.LastSeen) {
-			group.LastSeen = lastSeen
 		}
 	}
 	out := make([]Group, 0, len(groups))

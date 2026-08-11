@@ -6,12 +6,15 @@ package captures
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -19,11 +22,54 @@ import (
 )
 
 const (
-	capturesDir = "captures"
-	htmlExt     = ".html"
-	metadataExt = ".json"
-	pinExt      = ".pin.json"
+	capturesDir      = "captures"
+	htmlExt          = ".html"
+	metadataExt      = ".json"
+	pinExt           = ".pin.json"
+	pendingIndexName = ".pending.json"
+
+	// SanitizerProvenance and SanitizerVersion are the only provenance values
+	// accepted for adapter repair. They describe the extension sanitizer whose
+	// canonical fixture header is checked before bytes enter this store.
+	SanitizerProvenance = "papio.extension.sanitizer"
+	SanitizerVersion    = "1"
+
+	// Evidence labels are daemon-owned. A capture request may choose a scenario
+	// for display, but that label is not evidence that the page produced that
+	// outcome. UpdateJob marks captures only after a correlated provider
+	// outcome has been durably recorded.
+	EvidenceUntrusted   = "untrusted"
+	EvidenceIndependent = "independent"
 )
+
+var sanitizerFixtureHeader = regexp.MustCompile(`^<!-- papio-fixture provider="([^"]+)" scenario="([^"]+)" origin="([^"]+)" captured="([^"]+)" -->$`)
+
+// IsSanitizedFixture verifies the daemon-recognized provenance marker before
+// any bytes are persisted. The extension performs secret removal; the daemon
+// must nevertheless reject raw or hand-authored HTML that lacks its canonical
+// marker.
+func IsSanitizedFixture(html []byte) bool {
+	first, _, ok := strings.Cut(string(html), "\n")
+	if !ok {
+		return false
+	}
+	first = strings.TrimSuffix(first, "\r")
+	match := sanitizerFixtureHeader.FindStringSubmatch(first)
+	if len(match) != 5 || !validScenario(match[2]) {
+		return false
+	}
+	origin := strings.TrimSpace(match[3])
+	if strings.ContainsAny(origin, "?#") {
+		return false
+	}
+	if !strings.HasPrefix(origin, "https://") && !strings.HasPrefix(origin, "http://") {
+		return false
+	}
+	if _, err := time.Parse(time.RFC3339Nano, match[4]); err != nil {
+		return false
+	}
+	return true
+}
 
 // PinRole identifies why a capture is retained for an open incident.
 type PinRole string
@@ -33,8 +79,7 @@ const (
 	PinLatest        PinRole = "latest"
 )
 
-// Retention bounds diagnostics so a provider repeatedly changing its page
-// cannot silently fill the user's data volume.
+// Retention bounds diagnostic captures per provider host.
 type Retention struct {
 	MaxPerHost int
 	MaxAge     time.Duration
@@ -42,13 +87,19 @@ type Retention struct {
 
 // Capture preserves provider context that would otherwise be lost with HTML alone.
 type Capture struct {
-	Host           string    `json:"host"`
-	Scenario       string    `json:"scenario"`
-	AdapterID      string    `json:"adapter_id,omitempty"`
-	AdapterVersion string    `json:"adapter_version,omitempty"`
-	Timestamp      time.Time `json:"timestamp"`
-	Path           string    `json:"path"`
-	Size           int64     `json:"size"`
+	Host                string `json:"host"`
+	Scenario            string `json:"scenario"`
+	AdapterID           string `json:"adapter_id,omitempty"`
+	AdapterVersion      string `json:"adapter_version,omitempty"`
+	SHA256              string `json:"sha256,omitempty"`
+	SanitizerProvenance string `json:"sanitizer_provenance,omitempty"`
+	SanitizerVersion    string `json:"sanitizer_version,omitempty"`
+	// IndependentEvidence is false for a caller-labelled capture. It becomes
+	// true only when UpdateJob binds the capture to a durable provider outcome.
+	IndependentEvidence bool      `json:"independent_evidence,omitempty"`
+	Timestamp           time.Time `json:"timestamp"`
+	Path                string    `json:"path"`
+	Size                int64     `json:"size"`
 }
 
 // Store serializes persistence so concurrent diagnostics cannot evade retention.
@@ -69,8 +120,189 @@ func New(dataDir string, retention Retention) *Store {
 }
 
 // Store keeps diagnostic HTML usable while preventing one provider from retaining
-// an unbounded volume of stale pages.
+// an unbounded volume of stale pages. Bytes written through this generic method
+// deliberately carry no sanitizer provenance and cannot be used for adapter
+// repair.
 func (s *Store) Store(ctx context.Context, host, scenario, adapterID, adapterVersion string, html []byte) (string, error) {
+	return s.store(ctx, host, scenario, adapterID, adapterVersion, "", "", "", html)
+}
+
+// StoreSanitized is the sole trusted extension-ingress path. It accepts only
+// the extension's canonical fixture header and records fixed daemon-owned
+// sanitizer provenance beside the exact bytes.
+func (s *Store) StoreSanitized(ctx context.Context, host, scenario, adapterID, adapterVersion string, html []byte) (string, error) {
+	if !IsSanitizedFixture(html) {
+		return "", errors.New("refusing page capture without a canonical extension-sanitized fixture header")
+	}
+	return s.store(ctx, host, scenario, adapterID, adapterVersion, SanitizerProvenance, SanitizerVersion, "", html)
+}
+
+// StoreSanitizedPinned writes and pins a decisive capture before count pruning
+// under one store lock. The provisional key is opaque and durable, so a lost
+// provider outcome cannot evict the first/latest evidence.
+func (s *Store) StoreSanitizedPinned(ctx context.Context, jobID, host, scenario, adapterID, adapterVersion string, html []byte) (string, error) {
+	if !IsSanitizedFixture(html) {
+		return "", errors.New("refusing page capture without a canonical extension-sanitized fixture header")
+	}
+	return s.store(ctx, host, scenario, adapterID, adapterVersion, SanitizerProvenance, SanitizerVersion, strings.TrimSpace(jobID), html)
+}
+
+// ReleaseJob releases a pre-outcome capture lease. It is safe to call on
+// terminal resolution, explicit retry, or reopen even when no lease exists.
+func (s *Store) ReleaseJob(ctx context.Context, jobID string) error {
+	if strings.TrimSpace(jobID) == "" {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.releaseIncidentLocked(ctx, pendingFingerprint(jobID)); err != nil {
+		return err
+	}
+	return s.removePendingIndexLocked(jobID)
+}
+
+// PendingJobs enumerates durable provisional lease associations. The index is
+// local daemon state; callers still re-read each job before releasing it.
+func (s *Store) PendingJobs(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingJobsLocked()
+}
+
+func pendingFingerprint(jobID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(jobID)))
+	return "pending:" + hex.EncodeToString(sum[:])
+}
+func pendingIndexPath(root string) string {
+	return filepath.Join(root, pendingIndexName)
+}
+
+func (s *Store) pendingJobsLocked() ([]string, error) {
+	data, err := os.ReadFile(pendingIndexPath(s.root))
+	if errors.Is(err, fs.ErrNotExist) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var index map[string]string
+	if err := json.Unmarshal(data, &index); err != nil {
+		return nil, fmt.Errorf("decoding capture pending index: %w", err)
+	}
+	out := make([]string, 0, len(index))
+	for _, jobID := range index {
+		if strings.TrimSpace(jobID) != "" {
+			out = append(out, jobID)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (s *Store) writePendingIndexLocked(index map[string]string) error {
+	if len(index) == 0 {
+		if err := os.Remove(pendingIndexPath(s.root)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	data, err := json.Marshal(index)
+	if err != nil {
+		return err
+	}
+	return writeAtomically(s.root, pendingIndexPath(s.root), data)
+}
+
+func (s *Store) addPendingIndexLocked(jobID string) error {
+	data, err := os.ReadFile(pendingIndexPath(s.root))
+	index := map[string]string{}
+	if err == nil {
+		if err := json.Unmarshal(data, &index); err != nil {
+			return fmt.Errorf("decoding capture pending index: %w", err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	index[pendingFingerprint(jobID)] = strings.TrimSpace(jobID)
+	return s.writePendingIndexLocked(index)
+}
+
+func (s *Store) removePendingIndexLocked(jobID string) error {
+	data, err := os.ReadFile(pendingIndexPath(s.root))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var index map[string]string
+	if err := json.Unmarshal(data, &index); err != nil {
+		return fmt.Errorf("decoding capture pending index: %w", err)
+	}
+	delete(index, pendingFingerprint(jobID))
+	return s.writePendingIndexLocked(index)
+}
+func (s *Store) pinPendingLocked(ctx context.Context, path, jobID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	file, err := s.captureFile(path)
+	if err != nil {
+		return err
+	}
+	fingerprint := pendingFingerprint(jobID)
+	role := PinFirstDecisive
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		if err := s.writePinLocked(file, fingerprint, role); err != nil {
+			return err
+		}
+		return s.addPendingIndexLocked(jobID)
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return infoErr
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		files, scanErr := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
+		if scanErr != nil {
+			return scanErr
+		}
+		for _, candidate := range files {
+			pin, ok := readPin(candidate.Path)
+			if ok && pin.Fingerprint == fingerprint && pin.Role == PinFirstDecisive {
+				role = PinLatest
+				break
+			}
+		}
+		if role == PinLatest {
+			break
+		}
+	}
+	if role == PinLatest {
+		if err := s.removeIncidentRoleLocked(ctx, fingerprint, PinLatest, file.Path); err != nil {
+			return err
+		}
+	}
+	if err := s.writePinLocked(file, fingerprint, role); err != nil {
+		return err
+	}
+	return s.addPendingIndexLocked(jobID)
+}
+
+func (s *Store) store(ctx context.Context, host, scenario, adapterID, adapterVersion, sanitizerProvenance, sanitizerVersion, jobID string, html []byte) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -95,8 +327,14 @@ func (s *Store) Store(ctx context.Context, host, scenario, adapterID, adapterVer
 	if err != nil {
 		return "", err
 	}
-	metadata, err := json.Marshal(captureMetadata{AdapterID: adapterID, AdapterVersion: adapterVersion})
+	sum := sha256.Sum256(html)
+	metadata, err := json.Marshal(captureMetadata{
+		AdapterID: adapterID, AdapterVersion: adapterVersion,
+		SHA256: hex.EncodeToString(sum[:]), SanitizerProvenance: sanitizerProvenance,
+		SanitizerVersion: sanitizerVersion,
+	})
 	if err != nil {
+
 		return "", fmt.Errorf("encoding capture metadata: %w", err)
 	}
 	metadataPath := metadataPath(path)
@@ -107,10 +345,60 @@ func (s *Store) Store(ctx context.Context, host, scenario, adapterID, adapterVer
 		_ = os.Remove(metadataPath)
 		return "", err
 	}
+	if strings.TrimSpace(jobID) != "" && scenario != "observed" {
+		if err := s.pinPendingLocked(ctx, path, jobID); err != nil {
+			return path, err
+		}
+	}
 	if err := s.pruneHost(ctx, hostDir, safeHost(host)); err != nil {
 		return path, err
 	}
 	return path, nil
+}
+
+// UpdateJob records the first and latest decisive captures for an in-flight
+// job under its provisional opaque key. Repeated outcomes therefore demote the
+// previous latest atomically without losing the first capture. The correlated
+// outcome also upgrades the capture's evidence label; a caller-provided
+// scenario alone never does so.
+func (s *Store) UpdateJob(ctx context.Context, jobID, firstPath, latestPath string) error {
+	if strings.TrimSpace(jobID) == "" || firstPath == "" || latestPath == "" {
+		return nil
+	}
+	if err := s.PinIncident(ctx, pendingFingerprint(jobID), firstPath, latestPath); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, path := range []string{firstPath, latestPath} {
+		if err := s.markIndependentLocked(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// markIndependentLocked is called only after the daemon has recorded the
+// correlated provider outcome. It intentionally refuses a missing/corrupt
+// metadata sidecar rather than upgrading a hand-authored file.
+func (s *Store) markIndependentLocked(path string) error {
+	file, err := s.captureFile(path)
+	if err != nil {
+		return fmt.Errorf("locate capture for independent evidence: %w", err)
+	}
+	metadata, err := readMetadata(file.metadataPath)
+	if err != nil {
+		return err
+	}
+	if metadata.SHA256 == "" {
+		return errors.New("capture metadata has no content hash")
+	}
+	metadata.IndependentEvidence = true
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("encoding independent evidence metadata: %w", err)
+	}
+	return writeAtomically(filepath.Dir(file.metadataPath), file.metadataPath, encoded)
 }
 
 // List makes recent provider observations discoverable without filesystem spelunking.
@@ -184,15 +472,95 @@ func (s *Store) Pin(ctx context.Context, path, fingerprint string, role PinRole)
 }
 
 // PinIncident pins the first decisive and latest captures for one open
-// incident. A capture may serve both roles when the paths are equal.
+// incident. A capture may serve both roles when the paths are equal. The
+// replacement of a prior latest marker is performed while the store lock is
+// held, so retention cannot observe two latest captures for one incident.
 func (s *Store) PinIncident(ctx context.Context, fingerprint, firstPath, latestPath string) error {
-	if err := s.Pin(ctx, firstPath, fingerprint, PinFirstDecisive); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if filepath.Clean(latestPath) == filepath.Clean(firstPath) {
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" {
+		return errors.New("capture pin requires an incident fingerprint")
+	}
+	if firstPath == "" || latestPath == "" {
+		return errors.New("capture incident requires first and latest paths")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	first, err := s.captureFile(firstPath)
+	if err != nil {
+		return err
+	}
+	latest, err := s.captureFile(latestPath)
+	if err != nil {
+		return err
+	}
+	// Remove the old latest marker before publishing the new one. This is
+	// intentionally role-scoped: the first decisive capture is immutable.
+	if err := s.removeIncidentRoleLocked(ctx, fingerprint, PinLatest, latest.Path); err != nil {
+		return err
+	}
+	firstRole := PinFirstDecisive
+	if filepath.Clean(first.Path) == filepath.Clean(latest.Path) {
+		firstRole = PinFirstDecisive
+	}
+	if err := s.writePinLocked(first, fingerprint, firstRole); err != nil {
+		return err
+	}
+	if filepath.Clean(latest.Path) != filepath.Clean(first.Path) {
+		if err := s.writePinLocked(latest, fingerprint, PinLatest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) writePinLocked(file captureFile, fingerprint string, role PinRole) error {
+	data, err := json.Marshal(capturePin{Fingerprint: fingerprint, Role: role})
+	if err != nil {
+		return fmt.Errorf("encoding capture pin: %w", err)
+	}
+	return writeAtomically(filepath.Dir(file.Path), pinPath(file.Path), data)
+}
+
+func (s *Store) removeIncidentRoleLocked(ctx context.Context, fingerprint string, role PinRole, keepPath string) error {
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
-	return s.Pin(ctx, latestPath, fingerprint, PinLatest)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		files, err := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			if filepath.Clean(file.Path) == filepath.Clean(keepPath) {
+				continue
+			}
+			pin, ok := readPin(file.Path)
+			if ok && pin.Fingerprint == fingerprint && pin.Role == role {
+				if err := os.Remove(pinPath(file.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // ReleaseIncident removes all retention markers for an incident. The next
@@ -248,8 +616,12 @@ type captureFile struct {
 }
 
 type captureMetadata struct {
-	AdapterID      string `json:"adapter_id,omitempty"`
-	AdapterVersion string `json:"adapter_version,omitempty"`
+	AdapterID           string `json:"adapter_id,omitempty"`
+	AdapterVersion      string `json:"adapter_version,omitempty"`
+	SHA256              string `json:"sha256,omitempty"`
+	SanitizerProvenance string `json:"sanitizer_provenance,omitempty"`
+	SanitizerVersion    string `json:"sanitizer_version,omitempty"`
+	IndependentEvidence bool   `json:"independent_evidence,omitempty"`
 }
 
 type capturePin struct {
@@ -356,8 +728,17 @@ func (s *Store) list(ctx context.Context) ([]Capture, error) {
 			if err != nil {
 				return nil, err
 			}
+			data, err := os.ReadFile(file.Path)
+			if err != nil {
+				return nil, fmt.Errorf("reading capture %q: %w", file.Path, err)
+			}
+			sum := sha256.Sum256(data)
+			file.SHA256 = hex.EncodeToString(sum[:])
 			file.AdapterID = metadata.AdapterID
 			file.AdapterVersion = metadata.AdapterVersion
+			file.SanitizerProvenance = metadata.SanitizerProvenance
+			file.SanitizerVersion = metadata.SanitizerVersion
+			file.IndependentEvidence = metadata.IndependentEvidence
 			out = append(out, file.Capture)
 		}
 	}

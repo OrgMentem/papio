@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"papio/internal/bibparse"
+	"papio/internal/routes"
 
 	toml "github.com/pelletier/go-toml/v2"
 )
@@ -685,6 +686,9 @@ func (c *Config) validate() error {
 		// ResolverProfileForOrigin to misroute jobs.
 		if name == "default" {
 			return fmt.Errorf("browser.resolvers.default is a reserved name (use the top-level browser.openurl_base_url, browser.shibboleth_entity_id, and browser.proquest_account_id fields for the default institution)")
+		}
+		if routes.IsProviderHint(name) {
+			return fmt.Errorf("browser.resolvers.%s collides with packaged provider route hint %q; choose an institution name outside the provider-hint namespace", name, name)
 		}
 		if !resolverNameRE.MatchString(name) {
 			return fmt.Errorf("browser.resolvers.%s name must be lowercase alphanumeric", name)

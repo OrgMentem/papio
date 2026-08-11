@@ -57,6 +57,11 @@ func TestCandidatesForDOIEncodingMatrix(t *testing.T) {
 			if len(candidates) != tt.wantRoutes {
 				t.Fatalf("candidate count = %d, want %d", len(candidates), tt.wantRoutes)
 			}
+			for _, candidate := range candidates {
+				if err := ValidateCandidate(candidate); err != nil {
+					t.Fatalf("compiler emitted candidate rejected by validator: %+v: %v", candidate, err)
+				}
+			}
 			if candidates[0].Identifier != tt.wantID {
 				t.Fatalf("identifier = %q, want %q", candidates[0].Identifier, tt.wantID)
 			}
@@ -144,5 +149,95 @@ func TestCandidatesForIdentifiersEscapesPIIAndHonorsHint(t *testing.T) {
 	wantPath := "/science/article/pii/S123/%2E%2E/%C3%BCber/pdfft"
 	if u.EscapedPath() != wantPath {
 		t.Fatalf("escaped PII path = %q, want %q", u.EscapedPath(), wantPath)
+	}
+}
+
+func TestValidateCandidateRejectsMalformedPlaceholders(t *testing.T) {
+	candidates := CandidatesFor("10.48612/example", "")
+	if len(candidates) == 0 {
+		t.Fatal("expected a compiled candidate")
+	}
+	for _, tt := range []struct {
+		name       string
+		pathFamily string
+	}{
+		{name: "extra braces", pathFamily: "/doi/pdfdirect/{doi}{extra}"},
+		{name: "mismatched placeholder", pathFamily: "/doi/pdfdirect/{pii}"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := candidates[0]
+			candidate.PathFamily = tt.pathFamily
+			if err := ValidateCandidate(candidate); err == nil {
+				t.Fatalf("ValidateCandidate accepted malformed path family %q", tt.pathFamily)
+			}
+		})
+	}
+}
+
+func TestValidateCandidateRejectsAdversarialManualCandidates(t *testing.T) {
+	candidates := CandidatesFor("10.48612/../über+paper%edition", "wiley-doi-pdfdirect")
+	if len(candidates) != 1 {
+		t.Fatalf("candidate count = %d, want 1", len(candidates))
+	}
+	base := candidates[0]
+	for _, tt := range []struct {
+		name string
+		edit func(Candidate) Candidate
+	}{
+		{
+			name: "unknown revision",
+			edit: func(candidate Candidate) Candidate {
+				candidate.RouteRevision = "operator-url/1"
+				return candidate
+			},
+		},
+		{
+			name: "foreign origin",
+			edit: func(candidate Candidate) Candidate {
+				candidate.AllowedOrigin = "https://evil.example"
+				return candidate
+			},
+		},
+		{
+			name: "unescaped dot segment",
+			edit: func(candidate Candidate) Candidate {
+				candidate.URL = strings.Replace(candidate.URL, "%2E%2E", "..", 1)
+				return candidate
+			},
+		},
+		{
+			name: "lowercase percent encoding",
+			edit: func(candidate Candidate) Candidate {
+				candidate.URL = strings.Replace(candidate.URL, "%C3%BC", "%c3%bc", 1)
+				return candidate
+			},
+		},
+		{
+			name: "duplicated query",
+			edit: func(candidate Candidate) Candidate {
+				candidate.URL += "&download=true"
+				return candidate
+			},
+		},
+		{
+			name: "fragment",
+			edit: func(candidate Candidate) Candidate {
+				candidate.URL += "#download"
+				return candidate
+			},
+		},
+		{
+			name: "wrong identifier kind",
+			edit: func(candidate Candidate) Candidate {
+				candidate.Identifier = "pii:S1234567890123456"
+				return candidate
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ValidateCandidate(tt.edit(base)); err == nil {
+				t.Fatal("ValidateCandidate accepted a malformed manual candidate")
+			}
+		})
 	}
 }
