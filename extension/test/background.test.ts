@@ -328,6 +328,7 @@ function makeHarness(
     },
     randomUUID: () => crypto.randomUUID(),
     manifestVersion: "0.1.0",
+    runtimeGetURL: (path) => `chrome-extension://test/${path}`,
     now: () => clock.now,
     setTimeout: (fn, ms) => {
       timers.push({ fn, ms });
@@ -404,6 +405,59 @@ function jobOffer(jobID: string, openurl = OPENURL, accessMode: "assisted" | "de
       access_mode: accessMode,
       expires_at: EXPIRES,
     },
+  };
+}
+function candidateOffer(jobID: string, candidateID = "cand_0001"): unknown {
+  return {
+    protocol: "papio-browser/1",
+    type: "institutional_candidate_offer",
+    msg_id: "candidate_offer_000001",
+    job_id: jobID,
+    seq: 2,
+    payload: {
+      candidate_id: candidateID,
+      materialization_kind: "browser_tab",
+      expires_at: "2030-01-01T00:00:00Z",
+    },
+  };
+}
+function materializationActiveJob(jobID: string): ActiveJob {
+  return {
+    job_id: jobID,
+    tab_id: -1,
+    offered_at: 1_700_000_000_000,
+    expires_at: 1_900_000_000_000,
+    status: "accepted",
+    provider_hosts: [PROVIDER_HOST],
+    access_mode: "delegated",
+  };
+}
+
+function institutionalClaimResponse(jobID: string, candidateID: string, claimID = "claim_0001", bindingID = "bind_0001"): unknown {
+  return {
+    protocol: "papio-browser/1",
+    type: "institutional_claim_response",
+    msg_id: "claim_response_000001",
+    job_id: jobID,
+    seq: 3,
+    payload: {
+      outcome: "claimed",
+      candidate_id: candidateID,
+      claim_id: claimID,
+      binding_id: bindingID,
+      browser_holder_generation: 1,
+      lease_until: "2030-01-01T00:00:00Z",
+    },
+  };
+}
+function institutionalBindResponse(jobID: string, claimID = "claim_0001", bindingID = "bind_0001"): unknown {
+  return {
+    protocol: "papio-browser/1",
+    type: "institutional_bind_response",
+    msg_id: "bind_response_000001",
+    job_id: jobID,
+    seq: 4,
+    payload: { outcome: "bound", claim_id: claimID, binding_id: bindingID },
   };
 }
 function jobOfferForHosts(jobID: string, providerHosts: string[], openurl = OPENURL): unknown {
@@ -775,6 +829,7 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
   expect(first?.seq).toBe(0);
   expect(first?.msg_id).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
   expect(first?.payload["extension_version"]).toBe("0.1.0");
+  expect(first?.payload["features"]).toEqual(["institutional_materialization_v1"]);
 });
 
 test("startup clears a stale badge when persisted daemon health is connected", async () => {
@@ -9150,4 +9205,483 @@ test("generic pre-ID interrupted download settles once and no-match recovery cle
   expect(missingRequests.filter((args) => args[0] === "provider_drive_epoch_result_request")).toHaveLength(1);
   expect(missing.backend.store.activeJobs[0]?.download_initiated).toBe(false);
   expect(missing.backend.store.activeJobs[0]?.generic_terminal).toBe(true);
+});
+test("institutional candidate offer dispatches claim without awaiting the correlated response", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  const inbound = h.port.inbound(candidateOffer("job_mat_0001"));
+  await inbound;
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  expect(claim.job_id).toBe("job_mat_0001");
+  expect(claim.payload).toMatchObject({
+    candidate_id: "cand_0001",
+    materialization_kind: "browser_tab",
+  });
+  expect(typeof claim.payload.request_id).toBe("string");
+  expect(claim.payload.request_id).not.toBe("");
+  expect(JSON.stringify(h.backend.store)).not.toContain("https://");
+  expect(h.backend.store.materializations?.["job_mat_0001"]).toMatchObject({
+    candidate_id: "cand_0001",
+    phase: "claiming",
+    tab_id: -1,
+  });
+});
+test("institutional claim busy uses bounded retry instead of a dead failed phase", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(candidateOffer("job_mat_busy"));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_claim_response",
+    msg_id: "claim_response_busy",
+    job_id: "job_mat_busy",
+    seq: 3,
+    payload: { request_id: claim.payload["request_id"], outcome: "busy" },
+  });
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  expect(h.backend.store.materializations?.["job_mat_busy"]).toMatchObject({
+    phase: "offered",
+    retry_attempts: 1,
+  });
+  const internals = h.bridge as unknown as { materializationRetryTimers: Map<string, object> };
+  expect(internals.materializationRetryTimers.has("job_mat_busy")).toBe(true);
+});
+test("same candidate fresh expiry revives an expired pre-claim offer", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(candidateOffer("job_mat_reoffer"));
+  const firstClaim = await h.port.waitForFrame("institutional_claim_request");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_claim_response",
+    msg_id: "claim_response_reoffer_busy",
+    job_id: "job_mat_reoffer",
+    seq: 3,
+    payload: { request_id: firstClaim.payload["request_id"], outcome: "busy" },
+  });
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const internals = h.bridge as unknown as {
+    materializationRuns: Map<string, Promise<void>>;
+    materializationRetryTimers: Map<string, object>;
+  };
+  expect(internals.materializationRuns.has("job_mat_reoffer")).toBe(false);
+  const retryTimer = h.timers.find((timer) => timer.ms === 1_000);
+  expect(retryTimer).toBeDefined();
+  h.clock.now = Date.parse("2031-01-01T00:00:00Z");
+  const fresh = candidateOffer("job_mat_reoffer") as { msg_id: string; seq: number; payload: Record<string, unknown> };
+  fresh.msg_id = "candidate_offer_000002";
+  fresh.seq = 4;
+  fresh.payload["expires_at"] = "2032-01-01T00:00:00Z";
+  const afterFirstClaim = h.port.posted.length;
+  await h.port.inbound(fresh);
+  const secondClaim = await h.port.waitForFrame("institutional_claim_request", afterFirstClaim);
+  expect(secondClaim.payload["candidate_id"]).toBe("cand_0001");
+  expect(h.backend.store.materializations?.["job_mat_reoffer"]).toMatchObject({
+    phase: "claiming",
+    candidate_id: "cand_0001",
+    candidate_expires_at: "2032-01-01T00:00:00Z",
+  });
+});
+
+test("institutional bind error uses bounded retry instead of a dead failed phase", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  const internals = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+    runMaterialization: (jobID: string) => Promise<void>;
+    materializationRetryTimers: Map<string, object>;
+    cancelledMaterializationJobs: Set<string>;
+    pendingMaterializationRequests: unknown[];
+  };
+  await internals.update.call(h.bridge, (store) => ({
+    ...store,
+    activeJobs: [materializationActiveJob("job_mat_bind_error")],
+    materializations: {
+      job_mat_bind_error: {
+        job_id: "job_mat_bind_error",
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim_0001",
+        binding_id: "bind_0001",
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+        phase: "claimed",
+        tab_id: -1,
+      },
+    },
+  }));
+  const current = h.backend.store.materializations?.["job_mat_bind_error"];
+  expect(current).toMatchObject({ phase: "claimed", candidate_id: "cand_0001", binding_id: "bind_0001", tab_id: -1 });
+  expect(internals.cancelledMaterializationJobs.has("job_mat_bind_error")).toBe(false);
+  const bindPromise = h.port.waitForFrame("institutional_bind_request");
+  let runSettled = false;
+  const runPromise = internals.runMaterialization.call(h.bridge, "job_mat_bind_error").finally(() => {
+    runSettled = true;
+  });
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const after = h.backend.store.materializations?.["job_mat_bind_error"];
+  const frameTypes = h.frames().map((frame) => frame.type);
+  if (!frameTypes.includes("institutional_bind_request")) {
+    throw new Error(JSON.stringify({
+      correlation: after,
+      created: h.tabs.created.length,
+      queries: h.tabs.queryCount,
+      pending: internals.pendingMaterializationRequests.length,
+      runSettled,
+      cancelled: internals.cancelledMaterializationJobs.has("job_mat_bind_error"),
+      features: h.backend.store.daemonFeatures,
+    }));
+  }
+  const bind = await bindPromise;
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_bind_response",
+    msg_id: "bind_response_error",
+    job_id: "job_mat_bind_error",
+    seq: 4,
+    payload: { request_id: bind.payload["request_id"], outcome: "error" },
+  });
+  await runPromise;
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(h.backend.store.materializations?.["job_mat_bind_error"]).toMatchObject({
+    phase: "claimed",
+    retry_attempts: 1,
+  });
+  expect(internals.materializationRetryTimers.has("job_mat_bind_error")).toBe(true);
+});
+
+test("scaffold creation failure retries and converges to one replacement", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  const internals = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+    runMaterialization: (jobID: string) => Promise<void>;
+    materializationRetryTimers: Map<string, object>;
+    cancelledMaterializationJobs: Set<string>;
+  };
+  h.tabs.seed({ id: 999, url: OPENURL, active: false, windowId: 500 });
+  await internals.update.call(h.bridge, (store) => ({
+    ...store,
+    activeJobs: [{ ...materializationActiveJob("job_mat_scaffold_retry"), tab_id: 999 }],
+    workWindowID: 500,
+    materializations: {
+      job_mat_scaffold_retry: {
+        job_id: "job_mat_scaffold_retry",
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim_0001",
+        binding_id: "bind_0001",
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+        phase: "claimed",
+        tab_id: -1,
+      },
+    },
+  }));
+  const current = h.backend.store.materializations?.["job_mat_scaffold_retry"];
+  expect(current).toMatchObject({ phase: "claimed", candidate_id: "cand_0001", binding_id: "bind_0001", tab_id: -1 });
+  expect(Date.parse(current?.candidate_expires_at ?? "")).toBeGreaterThan(h.clock.now);
+  expect(internals.cancelledMaterializationJobs.has("job_mat_scaffold_retry")).toBe(false);
+  h.tabs.failCreate = true;
+  await internals.runMaterialization.call(h.bridge, "job_mat_scaffold_retry");
+  expect(internals.materializationRetryTimers.has("job_mat_scaffold_retry")).toBe(true);
+  const retryTimer = h.timers.slice().reverse().find((timer) => timer.ms === 1_000);
+  expect(retryTimer).toBeDefined();
+  h.tabs.failCreate = false;
+  const bindPromise = h.port.waitForFrame("institutional_bind_request");
+  await retryTimer!.fn();
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(h.frames().map((frame) => frame.type)).toContain("institutional_bind_request");
+  const bind = await bindPromise;
+  expect(bind.payload["tab_id"]).toBe(h.backend.store.materializations?.["job_mat_scaffold_retry"]?.tab_id);
+  expect(h.tabs.list().filter((tab) => tab.url?.includes("materialize.html#bind_0001") === true)).toHaveLength(1);
+});
+
+test("institutional claim stale clears local correlation for a later offer", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(candidateOffer("job_mat_stale"));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_claim_response",
+    msg_id: "claim_response_stale",
+    job_id: "job_mat_stale",
+    seq: 3,
+    payload: { request_id: claim.payload["request_id"], outcome: "stale" },
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const internals = h.bridge as unknown as { materializationRetryTimers: Map<string, object> };
+  expect(h.backend.store.materializations?.["job_mat_stale"]).toBeUndefined();
+  expect(internals.materializationRetryTimers.has("job_mat_stale")).toBe(false);
+});
+
+test("new institutional candidate supersedes old correlation and closes its scaffold", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  const internals = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+  };
+  h.tabs.seed({ id: 901, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  await internals.update.call(h.bridge, (store) => ({
+    ...store,
+    activeJobs: [materializationActiveJob("job_mat_supersede")],
+    offerURLs: { ...store.offerURLs, job_mat_supersede: OPENURL },
+    workWindowID: 500,
+    materializations: {
+      job_mat_supersede: {
+        job_id: "job_mat_supersede",
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim_0001",
+        binding_id: "bind_0001",
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+        phase: "bound",
+        tab_id: 901,
+      },
+    },
+  }));
+  await h.port.inbound(candidateOffer("job_mat_supersede", "cand_0002"));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  expect(claim.payload["candidate_id"]).toBe("cand_0002");
+  expect(h.backend.store.materializations?.["job_mat_supersede"]).toMatchObject({
+    candidate_id: "cand_0002",
+    phase: "claiming",
+    tab_id: -1,
+  });
+  expect(h.tabs.removed).toContain(901);
+});
+
+test("route update loss removes dead scaffold and next run rebinds a replacement", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  const originalUpdate = h.tabs.update.bind(h.tabs);
+  let failNextRoute = true;
+  h.tabs.update = async (tabID, properties) => {
+    if (properties.url !== undefined && failNextRoute) {
+      failNextRoute = false;
+      throw new Error("scaffold disappeared");
+    }
+    return originalUpdate(tabID, properties);
+  };
+  const internals = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+    runMaterialization: (jobID: string) => Promise<void>;
+    scheduleMaterialization: (jobID: string, immediate?: boolean) => void;
+    cancelledMaterializationJobs: Set<string>;
+    pendingMaterializationRequests: unknown[];
+  };
+  h.tabs.seed({ id: 903, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  await internals.update.call(h.bridge, (store) => ({
+    ...store,
+    activeJobs: [materializationActiveJob("job_mat_dead_tab")],
+    offerURLs: { ...store.offerURLs, job_mat_dead_tab: OPENURL },
+    workWindowID: 500,
+    materializations: {
+      job_mat_dead_tab: {
+        job_id: "job_mat_dead_tab",
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim_0001",
+        binding_id: "bind_0001",
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+        phase: "bound",
+        tab_id: 903,
+        route_issuance_ordinal: 7,
+      },
+    },
+  }));
+  const current = h.backend.store.materializations?.["job_mat_dead_tab"];
+  expect(current).toMatchObject({ phase: "bound", candidate_id: "cand_0001", binding_id: "bind_0001", tab_id: 903 });
+  expect(Date.parse(current?.candidate_expires_at ?? "")).toBeGreaterThan(h.clock.now);
+  expect(internals.cancelledMaterializationJobs.has("job_mat_dead_tab")).toBe(false);
+  let runSettled = false;
+  const firstRun = internals.runMaterialization.call(h.bridge, "job_mat_dead_tab").finally(() => {
+    runSettled = true;
+  });
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const after = h.backend.store.materializations?.["job_mat_dead_tab"];
+  const frameTypes = h.frames().map((frame) => frame.type);
+  if (!frameTypes.includes("institutional_route_request")) {
+    throw new Error(JSON.stringify({
+      correlation: after,
+      created: h.tabs.created.length,
+      queries: h.tabs.queryCount,
+      pending: internals.pendingMaterializationRequests.length,
+      runSettled,
+      cancelled: internals.cancelledMaterializationJobs.has("job_mat_dead_tab"),
+      features: h.backend.store.daemonFeatures,
+    }));
+  }
+  const firstRoute = h.frames().find((frame) => frame.type === "institutional_route_request");
+  if (firstRoute === undefined) throw new Error("institutional route request is missing");
+  expect(internals.pendingMaterializationRequests.length).toBe(1);
+  expect(typeof firstRoute.payload["request_id"]).toBe("string");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_route_response",
+    msg_id: "route_response_dead",
+    job_id: "job_mat_dead_tab",
+    seq: 4,
+    payload: {
+      request_id: firstRoute.payload["request_id"],
+      outcome: "issued",
+      claim_id: "claim_0001",
+      binding_id: "bind_0001",
+      route_issuance_ordinal: 8,
+      url: "https://resolver.example.edu/fresh/8",
+    },
+  });
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const afterRoute = h.backend.store.materializations?.["job_mat_dead_tab"];
+  if (afterRoute?.phase === "bound") {
+    throw new Error(JSON.stringify({
+      correlation: afterRoute,
+      pending: internals.pendingMaterializationRequests.length,
+      frames: h.frames().map((frame) => frame.type),
+      runSettled,
+    }));
+  }
+  await firstRun;
+  expect(h.backend.store.materializations?.["job_mat_dead_tab"]).toMatchObject({
+    phase: "claimed",
+    tab_id: -1,
+    claim_id: "claim_0001",
+    binding_id: "bind_0001",
+    route_issuance_ordinal: 8,
+  });
+
+  const postedBeforeReplacement = h.port.posted.length;
+  internals.scheduleMaterialization.call(h.bridge, "job_mat_dead_tab", true);
+  const bind = await h.port.waitForFrame("institutional_bind_request", postedBeforeReplacement);
+  expect(bind.payload["tab_id"]).not.toBe(903);
+  const replacementTabID = bind.payload["tab_id"];
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_bind_response",
+    msg_id: "bind_response_replacement",
+    job_id: "job_mat_dead_tab",
+    seq: 5,
+    payload: {
+      request_id: bind.payload["request_id"],
+      outcome: "bound",
+      claim_id: "claim_0001",
+      binding_id: "bind_0001",
+    },
+  });
+  const secondRoute = await h.port.waitForFrame("institutional_route_request", postedBeforeReplacement);
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_route_response",
+    msg_id: "route_response_replacement",
+    job_id: "job_mat_dead_tab",
+    seq: 6,
+    payload: {
+      request_id: secondRoute.payload["request_id"],
+      outcome: "issued",
+      claim_id: "claim_0001",
+      binding_id: "bind_0001",
+      route_issuance_ordinal: 9,
+      url: "https://resolver.example.edu/fresh/9",
+    },
+  });
+  const navigated = await h.port.waitForFrame("institutional_navigated_request", postedBeforeReplacement);
+  expect(navigated.payload["tab_id"]).toBe(replacementTabID);
+});
+
+test("cancelling materialization removes scaffold, retry timer, and correlation", async () => {
+  const h = makeHarness({
+    activeJobs: [materializationActiveJob("job_mat_cancel")],
+    offerURLs: { job_mat_cancel: OPENURL },
+    workWindowID: 500,
+    materializations: {
+      job_mat_cancel: {
+        job_id: "job_mat_cancel",
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        binding_id: "bind_0001",
+        phase: "bound",
+        tab_id: 902,
+      },
+    },
+  });
+  h.tabs.seed({ id: 902, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  await h.bridge.start();
+  const internals = h.bridge as unknown as {
+    materializationRetryTimers: Map<string, object>;
+    removeJobWithOffer: (jobID: string) => Promise<void>;
+  };
+  internals.materializationRetryTimers.set("job_mat_cancel", {});
+  await internals.removeJobWithOffer.call(h.bridge, "job_mat_cancel");
+  expect(h.backend.store.materializations?.["job_mat_cancel"]).toBeUndefined();
+  expect(h.tabs.removed).toContain(902);
+  expect(internals.materializationRetryTimers.has("job_mat_cancel")).toBe(false);
+});
+test("deferred route response from superseded candidate cannot navigate replacement", async () => {
+  const h = makeHarness({
+    activeJobs: [materializationActiveJob("job_mat_route_supersede")],
+    offerURLs: { job_mat_route_supersede: OPENURL },
+    workWindowID: 500,
+    materializations: {
+      job_mat_route_supersede: {
+        job_id: "job_mat_route_supersede",
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim_0001",
+        binding_id: "bind_0001",
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+        phase: "bound",
+        tab_id: 904,
+      },
+    },
+  });
+  h.tabs.seed({ id: 904, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  const internals = h.bridge as unknown as { runMaterialization: (jobID: string) => Promise<void> };
+  const oldRun = internals.runMaterialization.call(h.bridge, "job_mat_route_supersede");
+  const oldRoute = await h.port.waitForFrame("institutional_route_request");
+  await h.port.inbound(candidateOffer("job_mat_route_supersede", "cand_0002"));
+  const replacementClaim = await h.port.waitForFrame("institutional_claim_request");
+  expect(replacementClaim.payload["candidate_id"]).toBe("cand_0002");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_route_response",
+    msg_id: "route_response_old_after_supersede",
+    job_id: "job_mat_route_supersede",
+    seq: 4,
+    payload: {
+      request_id: oldRoute.payload["request_id"],
+      outcome: "issued",
+      claim_id: "claim_0001",
+      binding_id: "bind_0001",
+      route_issuance_ordinal: 1,
+      url: "https://resolver.example.edu/old-route",
+    },
+  });
+  await oldRun;
+  expect(h.tabs.navigations.some((entry) => entry.url.includes("old-route"))).toBe(false);
+  expect(h.backend.store.materializations?.["job_mat_route_supersede"]?.candidate_id).toBe("cand_0002");
 });

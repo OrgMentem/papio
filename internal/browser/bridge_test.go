@@ -2064,6 +2064,161 @@ func TestFocusHandoffsDropsClosedOrUnparkedJobs(t *testing.T) {
 	}
 }
 
+func materializationHello(t *testing.T) json.RawMessage {
+	t.Helper()
+	return inFrame(t, protocol.MsgHello, "", map[string]any{
+		"extension_version": "0.14.0",
+		"features":          []string{institutionalMaterializationFeature},
+	})
+}
+
+func TestInstitutionalCandidateOfferReoffersUntilClaim(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-reoffer", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	first, _ := runSync(t, b)
+	offer := firstOfType(first, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil {
+		t.Fatalf("first poll did not emit candidate offer: %v", first)
+	}
+	candidateID := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID
+	second, _ := runSync(t, b)
+	reoffer := firstOfType(second, protocol.MsgInstitutionalCandidateOffer)
+	if reoffer == nil || reoffer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID != candidateID {
+		t.Fatalf("lost candidate offer was not re-emitted: first=%v second=%v", first, second)
+	}
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, jobID,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "materialization-reoffer-claim", CandidateID: candidateID, MaterializationKind: "browser_tab",
+		}))
+	claimResult := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if claimResult == nil {
+		t.Fatalf("claim result missing: %v", claimed)
+	}
+	claimPayload := claimResult.Payload.(*protocol.InstitutionalClaimResponsePayload)
+	if claimPayload.Outcome != "claimed" {
+		t.Fatalf("claim result = %v, want claimed", claimed)
+	}
+	afterClaim, _ := runSync(t, b)
+	recovered := firstOfType(afterClaim, protocol.MsgInstitutionalCandidateOffer)
+	if recovered == nil || recovered.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID != candidateID {
+		t.Fatalf("claimed candidate was not re-offered for recovery: %v", afterClaim)
+	}
+	bound, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalBindRequest, jobID,
+		protocol.InstitutionalBindRequestPayload{
+			RequestID: "materialization-reoffer-bind", ClaimID: claimPayload.ClaimID,
+			BindingID: claimPayload.BindingID, TabID: 7,
+		}))
+	bindResult := firstOfType(bound, protocol.MsgInstitutionalBindResponse)
+	if bindResult == nil || bindResult.Payload.(*protocol.InstitutionalBindResponsePayload).Outcome != "bound" {
+		t.Fatalf("bind result = %v, want bound", bound)
+	}
+	if err := jobs.Cancel(ctx, jobID, job.TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, _ := runSync(t, b)
+	if firstOfType(cancelled, protocol.MsgCancel) == nil {
+		t.Fatalf("cancel after bind did not emit cancel: %v", cancelled)
+	}
+}
+
+func TestInstitutionalCandidateOfferCancellationIsDelivered(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-cancel", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	initial, _ := runSync(t, b)
+	if firstOfType(initial, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("initial candidate offer missing: %v", initial)
+	}
+	if err := jobs.Cancel(ctx, jobID, job.TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, _ := runSync(t, b)
+	if firstOfType(cancelled, protocol.MsgCancel) == nil {
+		t.Fatalf("materialization-only cancellation did not emit cancel: %v", cancelled)
+	}
+}
+
+func TestInstitutionalCandidateOfferRecoversAfterHolderRestart(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-restart-recovery", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	initial, _ := runSync(t, b)
+	offer := firstOfType(initial, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil {
+		t.Fatalf("initial candidate offer missing: %v", initial)
+	}
+	candidateID := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID
+
+	const replacementSession = "sess-replacement-000000000000000000000"
+	b.mu.Lock()
+	b.promote(&browserSession{
+		ID:               replacementSession,
+		ExtensionVersion: "0.14.0",
+		Features:         []string{institutionalMaterializationFeature},
+		LastSyncAt:       b.now(),
+	}, "test holder restart")
+	b.mu.Unlock()
+	recovered, _ := runSyncAs(t, b, replacementSession)
+	reoffer := firstOfType(recovered, protocol.MsgInstitutionalCandidateOffer)
+	if reoffer == nil || reoffer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID != candidateID {
+		t.Fatalf("restart did not recover candidate offer: %v", recovered)
+	}
+}
+
+func TestInstitutionalCandidateClaimOfferExpiryRetainsCancellationTracking(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-expiry-cancel", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	initial, _ := runSync(t, b)
+	offer := firstOfType(initial, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil {
+		t.Fatalf("initial candidate offer missing: %v", initial)
+	}
+	candidateID := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, jobID,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "materialization-expiry-claim", CandidateID: candidateID, MaterializationKind: "browser_tab",
+		}))
+	claimResult := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if claimResult == nil || claimResult.Payload.(*protocol.InstitutionalClaimResponsePayload).Outcome != "claimed" {
+		t.Fatalf("claim result = %v, want claimed", claimed)
+	}
+	future := b.now().Add(b.actionExpiry() + time.Second)
+	b.now = func() time.Time { return future }
+	expired, _ := runSync(t, b)
+	recovered := firstOfType(expired, protocol.MsgInstitutionalCandidateOffer)
+	if recovered == nil || recovered.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID != candidateID {
+		t.Fatalf("expired claim did not converge to a fresh candidate offer: %v", expired)
+	}
+	if !b.materializationTracked[jobID] {
+		t.Fatal("candidate cancellation tracking was cleared during claim expiry reconciliation")
+	}
+	if err := jobs.Cancel(ctx, jobID, job.TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, _ := runSync(t, b)
+	if firstOfType(cancelled, protocol.MsgCancel) == nil {
+		t.Fatalf("cancel after claimed offer expiry did not emit cancel: %v", cancelled)
+	}
+}
+
 func TestOABrowserHandoffOffersCandidateThenFallsBackToInstitution(t *testing.T) {
 	const oaURL = "https://oa.example.org/articles/blocked-paper.pdf"
 	b, jobs, cfg, _ := newBridge(t)
@@ -7501,6 +7656,255 @@ func TestProviderDriveWrongWorkStaleTupleCannotLatchNewDomain(t *testing.T) {
 		}
 	}
 }
+func TestInstitutionalRouteProfileFencePrecedesURLDerivation(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-route-profile-fence", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-a", AuthenticationClaimID: "auth-a",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	profile := profiles[0]
+	candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-route-profile-fence", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision:         candidate.JobAttemptRevision,
+		InstitutionProfileRevision: candidate.InstitutionProfileRevision,
+		RouteRevision:              candidate.RouteRevision, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-b", AuthenticationClaimID: "auth-b",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	frames, err := b.institutionalRoute(ctx, jobID, &protocol.InstitutionalRouteRequestPayload{
+		RequestID: "req_route_fence", ClaimID: claim.ID, BindingID: claim.BindingID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("route response frames=%d, want one", len(frames))
+	}
+	msg, err := protocol.DecodeBrowserMessage(frames[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := msg.Payload.(*protocol.InstitutionalRouteResponsePayload)
+	if !ok {
+		t.Fatalf("route payload=%T, want institutional response", msg.Payload)
+	}
+	if result.Outcome != "stale" || result.URL != "" || result.RouteIssuanceOrdinal != 0 {
+		t.Fatalf("drifted route response=%+v, want stale with no URL/ordinal", result)
+	}
+	got, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Phase != "bound" || got.RouteIssuanceOrdinal != 0 {
+		t.Fatalf("drifted claim=%+v, want bound ordinal 0", got)
+	}
+}
+func TestInstitutionalReconcileAcceptsTabZero(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-reconcile-tab-zero", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-a", AuthenticationClaimID: "auth-a",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	profile := profiles[0]
+	candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-reconcile-tab-zero", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	frames, err := b.institutionalReconcile(ctx, &protocol.InstitutionalReconcileRequestPayload{
+		RequestID: "req_reconcile_zero", Bindings: []protocol.InstitutionalReconcileBinding{{BindingID: claim.BindingID, TabID: 0}},
+	})
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("reconcile frames=%d err=%v", len(frames), err)
+	}
+	msg, err := protocol.DecodeBrowserMessage(frames[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := msg.Payload.(*protocol.InstitutionalReconcileResponsePayload)
+	if !ok || len(result.Claims) != 1 || result.Claims[0].TabID == nil || *result.Claims[0].TabID != 0 {
+		t.Fatalf("tab-zero reconcile result=%+v", msg.Payload)
+	}
+}
+
+func TestInstitutionalReconcileStoreErrorIsStructured(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	if err := jobs.S.DB().Close(); err != nil {
+		t.Fatal(err)
+	}
+	frames, err := b.institutionalReconcile(context.Background(), &protocol.InstitutionalReconcileRequestPayload{
+		RequestID: "req_reconcile_error",
+		Bindings:  []protocol.InstitutionalReconcileBinding{{BindingID: "binding_missing", TabID: 4}},
+	})
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("reconcile frames=%d err=%v, want structured response", len(frames), err)
+	}
+	msg, err := protocol.DecodeBrowserMessage(frames[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := msg.Payload.(*protocol.InstitutionalReconcileResponsePayload)
+	if result.Outcome != "error" || result.Detail == "" || len(result.Claims) != 0 {
+		t.Fatalf("reconcile store error result=%+v", result)
+	}
+}
+
+func TestMaterializationGenerationRetryOnSameSessionHello(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_holder_generation_once
+		BEFORE UPDATE OF holder_generation ON daemon_authority_key
+		WHEN OLD.holder_generation = 0
+		BEGIN SELECT RAISE(ABORT, 'injected generation failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, materializationHello(t))
+	if !b.materializationGenerationUnavailable {
+		t.Fatal("generation failure did not fail closed")
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_holder_generation_once`); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, materializationHello(t))
+	if b.materializationGenerationUnavailable || b.materializationAuthorityUncertain || b.epoch == 0 {
+		t.Fatalf("same-session generation retry did not recover: epoch=%d unavailable=%v uncertain=%v", b.epoch, b.materializationGenerationUnavailable, b.materializationAuthorityUncertain)
+	}
+}
+
+func TestMaterializationProfileFailureSurvivesClaimSweep(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_materialization_profile
+		BEFORE INSERT ON institution_profiles
+		BEGIN SELECT RAISE(ABORT, 'injected profile failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, materializationHello(t))
+	if !b.materializationProfileAuthorityUnavailable || !b.materializationAuthorityUncertain {
+		t.Fatalf("profile failure did not fail closed: profile=%v authority=%v", b.materializationProfileAuthorityUnavailable, b.materializationAuthorityUncertain)
+	}
+	runSync(t, b)
+	if !b.materializationProfileAuthorityUnavailable || !b.materializationAuthorityUncertain {
+		t.Fatal("claim sweep incorrectly cleared profile authority failure")
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_materialization_profile`); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, materializationHello(t))
+	if b.materializationProfileAuthorityUnavailable || b.materializationAuthorityUncertain {
+		t.Fatalf("profile retry did not recover: profile=%v authority=%v", b.materializationProfileAuthorityUnavailable, b.materializationAuthorityUncertain)
+	}
+}
+func TestInstitutionalRouteClosedActionDoesNotIssueOrdinal(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-route-closed-action", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-a", AuthenticationClaimID: "auth-a",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	profile := profiles[0]
+	candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-route-closed-action", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+	if err != nil || len(actions) != 1 {
+		t.Fatalf("open actions=%+v err=%v", actions, err)
+	}
+	if err := jobs.ResolveHumanAction(ctx, actions[0].ID, "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	frames, err := b.institutionalRoute(ctx, jobID, &protocol.InstitutionalRouteRequestPayload{
+		RequestID: "req_route_closed", ClaimID: claim.ID, BindingID: claim.BindingID,
+	})
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("route frames=%d err=%v", len(frames), err)
+	}
+	msg, err := protocol.DecodeBrowserMessage(frames[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := msg.Payload.(*protocol.InstitutionalRouteResponsePayload)
+	if result.Outcome != "not_eligible" || result.URL != "" || result.RouteIssuanceOrdinal != 0 {
+		t.Fatalf("closed action route=%+v, want no issuance", result)
+	}
+	got, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Phase != "bound" || got.RouteIssuanceOrdinal != 0 {
+		t.Fatalf("closed action claim=%+v, want bound ordinal 0", got)
+	}
+}
+
 func TestInstitutionalMaterializationHandlersAreDarkAndContinue(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	requests := []struct {
@@ -7508,13 +7912,13 @@ func TestInstitutionalMaterializationHandlersAreDarkAndContinue(t *testing.T) {
 		payload    any
 		response   string
 	}{
-		{protocol.MsgInstitutionalClaimRequest, "job_inst_001", protocol.InstitutionalClaimRequestPayload{CandidateID: "cand_001", MaterializationKind: "browser_tab"}, protocol.MsgInstitutionalClaimResponse},
-		{protocol.MsgInstitutionalBindRequest, "job_inst_001", protocol.InstitutionalBindRequestPayload{ClaimID: "claim_001", BindingID: "bind_001", TabID: 4}, protocol.MsgInstitutionalBindResponse},
-		{protocol.MsgInstitutionalRouteRequest, "job_inst_001", protocol.InstitutionalRouteRequestPayload{ClaimID: "claim_001", BindingID: "bind_001"}, protocol.MsgInstitutionalRouteResponse},
-		{protocol.MsgInstitutionalNavigatedRequest, "job_inst_001", protocol.InstitutionalNavigatedRequestPayload{ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, TabID: 4}, protocol.MsgInstitutionalNavigatedResponse},
-		{protocol.MsgInstitutionalReconcileRequest, "", protocol.InstitutionalReconcileRequestPayload{Bindings: []protocol.InstitutionalReconcileBinding{{BindingID: "bind_001", TabID: 4}}}, protocol.MsgInstitutionalReconcileResponse},
+		{protocol.MsgInstitutionalClaimRequest, "job_inst_001", protocol.InstitutionalClaimRequestPayload{RequestID: "req_inst_001", CandidateID: "cand_001", MaterializationKind: "browser_tab"}, protocol.MsgInstitutionalClaimResponse},
+		{protocol.MsgInstitutionalBindRequest, "job_inst_001", protocol.InstitutionalBindRequestPayload{RequestID: "req_inst_002", ClaimID: "claim_001", BindingID: "bind_001", TabID: 4}, protocol.MsgInstitutionalBindResponse},
+		{protocol.MsgInstitutionalRouteRequest, "job_inst_001", protocol.InstitutionalRouteRequestPayload{RequestID: "req_inst_003", ClaimID: "claim_001", BindingID: "bind_001"}, protocol.MsgInstitutionalRouteResponse},
+		{protocol.MsgInstitutionalNavigatedRequest, "job_inst_001", protocol.InstitutionalNavigatedRequestPayload{RequestID: "req_inst_004", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, TabID: 4}, protocol.MsgInstitutionalNavigatedResponse},
+		{protocol.MsgInstitutionalReconcileRequest, "", protocol.InstitutionalReconcileRequestPayload{RequestID: "req_inst_005", Bindings: []protocol.InstitutionalReconcileBinding{{BindingID: "bind_001", TabID: 4}}}, protocol.MsgInstitutionalReconcileResponse},
 	}
-	msgs, _ := runSync(t, b, hello())
+	msgs, _ := runSync(t, b, helloAs("0.13.0"))
 	if firstOfType(msgs, protocol.MsgHelloAck) == nil {
 		t.Fatal("hello_ack missing")
 	}
@@ -7552,5 +7956,29 @@ func TestInstitutionalMaterializationHandlersAreDarkAndContinue(t *testing.T) {
 	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgTriageCountsRequest, "", protocol.TriageCountsRequestPayload{RequestID: "request_inst_continue"}))
 	if firstOfType(msgs, protocol.MsgTriageCountsResponse) == nil {
 		t.Fatalf("later RPC did not continue after dark handlers: %v", msgs)
+	}
+}
+
+func TestInstitutionalMaterializationRequiresExplicitClientFeature(t *testing.T) {
+	request := inFrame(t, protocol.MsgInstitutionalClaimRequest, "job_inst_001",
+		protocol.InstitutionalClaimRequestPayload{RequestID: "req_feature_claim", CandidateID: "cand_001", MaterializationKind: "browser_tab"})
+
+	withoutFeature, _, _, _ := newBridge(t)
+	runSync(t, withoutFeature, helloAs("99.0.0"))
+	msgs, _ := runSync(t, withoutFeature, request)
+	disabled := firstOfType(msgs, protocol.MsgInstitutionalClaimResponse)
+	if disabled == nil || disabled.Payload.(*protocol.InstitutionalClaimResponsePayload).Outcome != "feature_disabled" {
+		t.Fatalf("version-only materialization response = %#v, want feature_disabled", disabled)
+	}
+
+	withFeature, _, _, _ := newBridge(t)
+	runSync(t, withFeature, inFrame(t, protocol.MsgHello, "", map[string]any{
+		"extension_version": "0.14.0",
+		"features":          []string{protocol.InstitutionalMaterializationFeature},
+	}))
+	msgs, _ = runSync(t, withFeature, request)
+	enabled := firstOfType(msgs, protocol.MsgInstitutionalClaimResponse)
+	if enabled == nil || enabled.Payload.(*protocol.InstitutionalClaimResponsePayload).Outcome != "stale" {
+		t.Fatalf("explicitly negotiated materialization response = %#v, want stale candidate", enabled)
 	}
 }

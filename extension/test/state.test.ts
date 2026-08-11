@@ -12,11 +12,13 @@ import {
   findByTab,
   migrateManagedState,
   patchJob,
+  reduceMaterialization,
   removeJob,
   startPendingDelivery,
   updatePendingDelivery,
   upsertJob,
   type ActiveJob,
+  type MaterializationCorrelation,
   type StoreShape,
 } from "../src/state";
 import { federatedLoginClaimKey } from "../src/background";
@@ -282,4 +284,100 @@ test("migration is deterministic and idempotent", () => {
   const second = migrateManagedState(first);
   expect(second).toEqual(first);
   expect(JSON.stringify(second)).not.toContain("https://secret.example");
+});
+test("materialization reducer keeps URL-free closed transitions and rejects stale callbacks", () => {
+  const correlation: MaterializationCorrelation = {
+    job_id: "job_mat_0001",
+    candidate_id: "cand_0001",
+    materialization_kind: "browser_tab",
+    candidate_expires_at: "2030-01-01T00:00:00Z",
+    phase: "offered",
+    tab_id: -1,
+  };
+  let store = reduceMaterialization(emptyStore(), correlation.job_id, { type: "offer", correlation });
+  store = reduceMaterialization(store, correlation.job_id, { type: "bound" });
+  expect(store.materializations?.[correlation.job_id]?.phase).toBe("offered");
+  store = reduceMaterialization(store, correlation.job_id, { type: "claiming" });
+  store = reduceMaterialization(store, correlation.job_id, {
+    type: "claimed",
+    claim_id: "claim_001",
+    binding_id: "bind_0001",
+    browser_holder_generation: 3,
+    lease_until: "2030-01-01T00:05:00Z",
+  });
+  store = reduceMaterialization(store, correlation.job_id, { type: "scaffolded", tab_id: 501 });
+  store = reduceMaterialization(store, correlation.job_id, { type: "bound" });
+  store = reduceMaterialization(store, correlation.job_id, { type: "route_issued", route_issuance_ordinal: 9 });
+  store = reduceMaterialization(store, correlation.job_id, { type: "route_issued", route_issuance_ordinal: 8 });
+  expect(store.materializations?.[correlation.job_id]?.route_issuance_ordinal).toBe(9);
+  const persisted = JSON.stringify(store);
+  expect(persisted).not.toContain("https://");
+});
+test("materialization reducer supersedes candidates and marks a lost scaffold without dropping binding", () => {
+  const first: MaterializationCorrelation = {
+    job_id: "job_mat_0002",
+    candidate_id: "cand_0001",
+    materialization_kind: "browser_tab",
+    candidate_expires_at: "2030-01-01T00:00:00Z",
+    claim_id: "claim_0001",
+    binding_id: "bind_0001",
+    browser_holder_generation: 1,
+    lease_until: "2030-01-01T00:05:00Z",
+    phase: "navigating",
+    tab_id: 501,
+  };
+  let store = reduceMaterialization(emptyStore(), first.job_id, { type: "offer", correlation: { ...first, phase: "offered", tab_id: -1 } });
+  store = reduceMaterialization(store, first.job_id, { type: "claiming" });
+  store = reduceMaterialization(store, first.job_id, {
+    type: "claimed",
+    claim_id: first.claim_id!,
+    binding_id: first.binding_id!,
+    browser_holder_generation: first.browser_holder_generation!,
+    lease_until: first.lease_until!,
+  });
+  store = reduceMaterialization(store, first.job_id, { type: "scaffolded", tab_id: first.tab_id });
+  store = reduceMaterialization(store, first.job_id, { type: "bound" });
+  store = reduceMaterialization(store, first.job_id, { type: "route_issued", route_issuance_ordinal: 4 });
+  store = reduceMaterialization(store, first.job_id, { type: "navigating" });
+  store = reduceMaterialization(store, first.job_id, { type: "scaffold_lost" });
+  expect(store.materializations?.[first.job_id]).toMatchObject({
+    candidate_id: first.candidate_id,
+    claim_id: first.claim_id,
+    route_issuance_ordinal: 4,
+    tab_id: -1,
+    phase: "claimed",
+  });
+  const second = { ...first, candidate_id: "cand_0002", phase: "offered" as const, tab_id: -1 };
+  store = reduceMaterialization(store, first.job_id, { type: "offer", correlation: second });
+  expect(store.materializations?.[first.job_id]).toEqual(second);
+});
+
+test("materialization migration preserves only opaque correlation fields", () => {
+  const migrated = migrateManagedState({
+    activeJobs: [migrationJob()],
+    materializations: {
+      job_migrate_0001: {
+        job_id: "job_migrate_0001",
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim_001",
+        binding_id: "bind_0001",
+        browser_holder_generation: 4,
+        lease_until: "2030-01-01T00:05:00Z",
+        phase: "bound",
+        tab_id: 502,
+        route_issuance_ordinal: 1,
+        fresh_route_url: "https://secret.example/one-use",
+      },
+    },
+  });
+  expect(migrated.materializations?.["job_migrate_0001"]).toMatchObject({
+    candidate_id: "cand_0001",
+    binding_id: "bind_0001",
+    tab_id: 502,
+    phase: "bound",
+  });
+  expect(JSON.stringify(migrated)).not.toContain("fresh_route_url");
+  expect(JSON.stringify(migrated)).not.toContain("https://secret.example");
 });

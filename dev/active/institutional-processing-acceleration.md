@@ -1,7 +1,7 @@
 # Institutional processing acceleration
 
-**Status:** Phase −1 complete; **Phase 0 complete; Phase 1 current,
-implemented-but-dark**  
+**Status:** Phase −1, Phase 0, Phase 1, and Phase 2 complete; **Phase 3
+current**  
 **Ownering model:** solo-maintainer-sized changes landed directly on `main`  
 **Scope:** daemon authority, browser materialization, institutional cutover, and
 staged enablement. Existing UI work remains a dependency for typed attention
@@ -19,11 +19,11 @@ creating candidates, opening tabs, bypassing a source gate, or changing
 concurrency. No provider tuple is broadly enabled. The readiness stream
 continues independently; no provider is given a `ready` claim here because no
 current live validated success plus adoption evidence is being asserted.
-Phase 1 is implemented-but-dark: durable projections, strict feature-negotiated
-message families, and the extension scrub migration exist, but their handlers
-are hard-disabled. Automatic candidate/materialization creation, tab creation,
-navigation, download, source-gate bypass, provider canary, and concurrency
-changes remain off.
+Phase 1's durable projections and strict protocol are now active only for
+holders that explicitly advertise `institutional_materialization_v1`. Phase 2
+adds recoverable, user-invoked candidate materialization; automatic claiming,
+automatic first-route behavior, source-gate bypass, provider canaries, and
+concurrency changes remain off.
  
 ### Coordinated Phase 0/Phase 1 implementation note
  
@@ -60,10 +60,33 @@ reconciliation are in place. Phase 1 is implemented-but-dark:
    Feature advertisement and bounded negotiation do not activate a handler or
    create a candidate.
  
-No Phase 2 materialization behavior, provider readiness, automatic first route,
-source-gate cutover, or concurrency increase is included. This coordinated
-change keeps the direct-to-main fallback paths and makes no compatibility
+That Phase 0/Phase 1 change included no Phase 2 materialization behavior,
+provider readiness, automatic first route, source-gate cutover, or concurrency
+increase. It kept the direct-to-main fallback paths and made no compatibility
 promise beyond bounded feature negotiation.
+
+### Coordinated Phase 2 implementation note
+
+Phase 2 closes the explicit daemon-to-extension handoff without enabling
+automatic candidate claiming. Migration `0027` adds the daemon authority key,
+candidate materialization kind, and the tab identity bound to each live claim.
+The daemon mints URL-free candidate offers and fences claim, bind, route,
+navigation acknowledgement, settlement, and replay by the current job attempt,
+institution profile revision, browser-holder generation, binding, and tab.
+
+The extension negotiates the feature explicitly in `hello`, persists only
+opaque IDs and ordinals, creates one inert `materialize.html#<binding>` scaffold,
+requests a fresh route, navigates that same tab, and acknowledges the result.
+Per-request opaque IDs prevent a late timed-out response from satisfying a
+newer retry. Bounded retries cover claim, bind, route, and navigation response
+loss; startup reconciliation is paginated, treats tab-scan uncertainty as
+uncertainty rather than absence, replaces a lost pre-route scaffold through an
+exact rebind, abandons stale-holder claims, and clears cancelled or orphaned
+local work. Raw institutional URLs remain transient and memory-only.
+
+The legacy URL-bearing `job_offer` path remains available to peers that do not
+advertise the feature. Phase 2 does not change source-gate admission, automatic
+route scheduling, the global effect permit, provider readiness, or concurrency.
  
 The hard enablement chain is:
 

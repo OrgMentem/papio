@@ -205,6 +205,49 @@ func TestHelloAckPayloadRoundTripAndBounds(t *testing.T) {
 	}
 }
 
+func TestHelloPayloadFeaturesStrictBoundsAndParity(t *testing.T) {
+	frame := func(payload any) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     MsgHello,
+			"msg_id":   "client-hello-1",
+			"seq":      0,
+			"payload":  payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	msg, err := DecodeBrowserMessage(frame(HelloPayload{
+		ExtensionVersion: "0.14.0",
+		Features:         []string{InstitutionalMaterializationFeature, "future_capability"},
+	}))
+	if err != nil {
+		t.Fatalf("hello with negotiated features rejected: %v", err)
+	}
+	if got := msg.Payload.(*HelloPayload).Features; !slices.Equal(got, []string{InstitutionalMaterializationFeature, "future_capability"}) {
+		t.Fatalf("decoded hello features = %#v", got)
+	}
+	features := make([]string, 33)
+	for i := range features {
+		features[i] = fmt.Sprintf("future_%d", i)
+	}
+	for name, payload := range map[string]any{
+		"unknown field":     map[string]any{"extension_version": "0.14.0", "unknown": true},
+		"duplicate feature": map[string]any{"extension_version": "0.14.0", "features": []string{"future_capability", "future_capability"}},
+		"invalid feature":   map[string]any{"extension_version": "0.14.0", "features": []string{"Future"}},
+		"over 32 features":  map[string]any{"extension_version": "0.14.0", "features": features},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeBrowserMessage(frame(payload)); err == nil {
+				t.Fatalf("hello payload accepted: %#v", payload)
+			}
+		})
+	}
+}
+
 func TestHandoffFocusPayloadRoundTripAndScope(t *testing.T) {
 	frame := func(jobID string, payload any) []byte {
 		t.Helper()
@@ -1721,12 +1764,12 @@ func TestInstitutionalMaterializationPayloadsRoundTripAndDisposition(t *testing.
 		name, typ, jobID string
 		payload          any
 	}{
-		{"claim", MsgInstitutionalClaimRequest, "job_inst_001", InstitutionalClaimRequestPayload{CandidateID: "cand_001", MaterializationKind: "browser_tab"}},
-		{"claim_response", MsgInstitutionalClaimResponse, "job_inst_001", InstitutionalClaimResponsePayload{Outcome: "claimed", CandidateID: "cand_001", ClaimID: "claim_001", BindingID: "bind_001", BrowserHolderGeneration: &generation, LeaseUntil: "2026-08-11T12:00:00Z"}},
-		{"bind", MsgInstitutionalBindRequest, "job_inst_001", InstitutionalBindRequestPayload{ClaimID: "claim_001", BindingID: "bind_001", TabID: 7}},
-		{"route", MsgInstitutionalRouteResponse, "job_inst_001", InstitutionalRouteResponsePayload{Outcome: "issued", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, URL: "https://resolver.example/route"}},
-		{"navigated", MsgInstitutionalNavigatedRequest, "job_inst_001", InstitutionalNavigatedRequestPayload{ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, TabID: 7}},
-		{"reconcile", MsgInstitutionalReconcileRequest, "", InstitutionalReconcileRequestPayload{Bindings: []InstitutionalReconcileBinding{{BindingID: "bind_001", TabID: 7}}}},
+		{"claim", MsgInstitutionalClaimRequest, "job_inst_001", InstitutionalClaimRequestPayload{RequestID: "req_inst_001", CandidateID: "cand_001", MaterializationKind: "browser_tab"}},
+		{"claim_response", MsgInstitutionalClaimResponse, "job_inst_001", InstitutionalClaimResponsePayload{RequestID: "req_inst_001", Outcome: "claimed", CandidateID: "cand_001", ClaimID: "claim_001", BindingID: "bind_001", BrowserHolderGeneration: &generation, LeaseUntil: "2026-08-11T12:00:00Z"}},
+		{"bind", MsgInstitutionalBindRequest, "job_inst_001", InstitutionalBindRequestPayload{RequestID: "req_inst_001", ClaimID: "claim_001", BindingID: "bind_001", TabID: 7}},
+		{"route", MsgInstitutionalRouteResponse, "job_inst_001", InstitutionalRouteResponsePayload{RequestID: "req_inst_001", Outcome: "issued", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, URL: "https://resolver.example/route"}},
+		{"navigated", MsgInstitutionalNavigatedRequest, "job_inst_001", InstitutionalNavigatedRequestPayload{RequestID: "req_inst_001", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, TabID: 7}},
+		{"reconcile", MsgInstitutionalReconcileRequest, "", InstitutionalReconcileRequestPayload{RequestID: "req_inst_001", Bindings: []InstitutionalReconcileBinding{{BindingID: "bind_001", TabID: 7}}}},
 	}
 	for _, tc := range frames {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1743,7 +1786,7 @@ func TestInstitutionalMaterializationPayloadsRoundTripAndDisposition(t *testing.
 			}
 		})
 	}
-	disabled := InstitutionalRouteResponsePayload{Outcome: "feature_disabled", Detail: "dark"}
+	disabled := InstitutionalRouteResponsePayload{RequestID: "req_inst_002", Outcome: "feature_disabled", Detail: "dark"}
 	raw, _ := json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalRouteResponse, "msg_id": "msg_inst_002", "seq": 2, "job_id": "job_inst_001", "payload": disabled})
 	if _, err := DecodeBrowserMessage(raw); err != nil {
 		t.Fatalf("disabled response: %v", err)
@@ -1872,6 +1915,89 @@ func TestInstitutionalMaterializationClosedOutcomesAndOpaqueIDs(t *testing.T) {
 					t.Fatalf("%s success with detail accepted", tc.name)
 				}
 			})
+		}
+	})
+}
+
+func TestInstitutionalCandidateOfferRoundTripScopeAndBounds(t *testing.T) {
+	frame := func(jobID string, payload map[string]any) []byte {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     MsgInstitutionalCandidateOffer,
+			"msg_id":   "candidate-offer-001",
+			"seq":      1,
+			"job_id":   jobID,
+			"payload":  payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	valid := map[string]any{
+		"candidate_id":         "candidate-001",
+		"materialization_kind": "browser_tab",
+		"expires_at":           "2026-08-11T12:00:00Z",
+	}
+	msg, err := DecodeBrowserMessage(frame("job-inst-001", valid))
+	if err != nil {
+		t.Fatalf("valid candidate offer rejected: %v", err)
+	}
+	payload, ok := msg.Payload.(*InstitutionalCandidateOfferPayload)
+	if !ok || payload.CandidateID != "candidate-001" || payload.MaterializationKind != "browser_tab" ||
+		payload.ExpiresAt != "2026-08-11T12:00:00Z" {
+		t.Fatalf("decoded payload = %#v", msg.Payload)
+	}
+	roundTrip, err := json.Marshal(map[string]any{
+		"protocol": BrowserProtocolVersion, "type": MsgInstitutionalCandidateOffer,
+		"msg_id": "candidate-offer-002", "seq": 2, "job_id": "job-inst-001", "payload": payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(roundTrip); err != nil {
+		t.Fatalf("round-trip rejected: %v", err)
+	}
+
+	t.Run("missing job scope", func(t *testing.T) {
+		if _, err := DecodeBrowserMessage(frame("", valid)); err == nil {
+			t.Fatal("candidate offer without job_id accepted")
+		}
+	})
+	t.Run("unknown URL field", func(t *testing.T) {
+		withURL := map[string]any{"candidate_id": "candidate-001", "materialization_kind": "browser_tab", "expires_at": valid["expires_at"], "url": "https://resolver.example"}
+		if _, err := DecodeBrowserMessage(frame("job-inst-001", withURL)); err == nil {
+			t.Fatal("candidate offer carrying URL accepted")
+		}
+	})
+	t.Run("invalid kind", func(t *testing.T) {
+		invalid := map[string]any{"candidate_id": "candidate-001", "materialization_kind": "direct_download", "expires_at": valid["expires_at"]}
+		if _, err := DecodeBrowserMessage(frame("job-inst-001", invalid)); err == nil {
+			t.Fatal("direct_download candidate offer accepted")
+		}
+	})
+	t.Run("invalid expiry", func(t *testing.T) {
+		invalid := map[string]any{"candidate_id": "candidate-001", "materialization_kind": "browser_tab", "expires_at": "not-a-time"}
+		if _, err := DecodeBrowserMessage(frame("job-inst-001", invalid)); err == nil {
+			t.Fatal("invalid expiry accepted")
+		}
+	})
+	t.Run("candidate ID bounds", func(t *testing.T) {
+		for _, candidateID := range []string{"short", strings.Repeat("x", 129)} {
+			invalid := map[string]any{"candidate_id": candidateID, "materialization_kind": "browser_tab", "expires_at": valid["expires_at"]}
+			if _, err := DecodeBrowserMessage(frame("job-inst-001", invalid)); err == nil {
+				t.Fatalf("candidate ID length %d accepted", len(candidateID))
+			}
+		}
+	})
+	t.Run("frame size cap", func(t *testing.T) {
+		oversized := frame("job-inst-001", map[string]any{
+			"candidate_id": "candidate-001", "materialization_kind": "browser_tab",
+			"expires_at": valid["expires_at"], "extra": strings.Repeat("x", MaxBrowserMessageBytes),
+		})
+		if _, err := DecodeBrowserMessage(oversized); err == nil {
+			t.Fatal("oversized candidate offer accepted")
 		}
 	})
 }

@@ -62,12 +62,15 @@ import {
   jobDownloadFilename,
   PAGE_CAPTURE_CONSENT_KEY,
   patchJob,
+  reduceMaterialization,
   removeJob,
   startPendingDelivery,
   upsertJob,
   updatePendingDelivery,
   type ActiveJob,
-  type PendingDelivery,
+  type MaterializationCorrelation,
+  type MaterializationEvent,
+  type MaterializationPhase,
   type StateBackend,
   type StoreShape,
   TERMS_CONSENT_KEY,
@@ -228,6 +231,24 @@ const PAGE_CAPTURE_TERMS_FEATURE = "page_capture_terms_v1";
 /** ADR-0019 Decision 7: page_bulk_status_request/page_bulk_submit_request. */
 const PAGE_BULK_ACQUIRE_FEATURE = "page_bulk_acquire_v1";
 const PDF_GRAB_FEATURE = "pdf_grab_v1";
+const INSTITUTIONAL_MATERIALIZATION_FEATURE = "institutional_materialization_v1";
+const MATERIALIZE_PAGE_PATH = "materialize.html";
+const MATERIALIZATION_ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/u;
+const MATERIALIZATION_RFC3339_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
+/** A lost claim/bind response is retried as the exact idempotent operation.
+ * The daemon owns the durable claim; this budget bounds browser-side wakes. */
+const MATERIALIZATION_RETRY_BASE_MS = 1_000;
+const MATERIALIZATION_RETRY_MAX_MS = 15_000;
+const MATERIALIZATION_RETRY_COOLDOWN_MS = 60_000;
+const MATERIALIZATION_MAX_RESPONSE_LOSS_RETRIES = 3;
+const MATERIALIZATION_RESPONSE_TYPES: Record<string, true> = {
+  institutional_claim_response: true,
+  institutional_bind_response: true,
+  institutional_route_response: true,
+  institutional_navigated_response: true,
+  institutional_reconcile_response: true,
+};
 const PDF_GRAB_CORRELATION_STORAGE_KEY = "papio_pdf_grab_correlations_v1";
 /** ADR-0019 Decision 2: kept separate from acquisition/adapter host grants. */
 const PAGE_BULK_ALLOWLIST_KEY = "papio_scanner_allowlist_v1";
@@ -639,6 +660,8 @@ export interface BridgeDeps {
   manifestVersion: string;
   randomUUID(): string;
   now(): number;
+  /** Runtime URL seam for the URL-free materialization scaffold. */
+  runtimeGetURL?: (path: string) => string;
   /** Injectable timers so tests control reconnect backoff and queue release. */
   setTimeout(fn: () => void | Promise<void>, ms: number): void;
   backend: StateBackend;
@@ -852,6 +875,16 @@ interface QueuedHandoffDrive {
 interface HandoffDrive {
   tabID: number;
   token: object;
+}
+
+interface PendingMaterializationRequest {
+  responseType: string;
+  requestID: string;
+  jobID?: string;
+  candidateID?: string;
+  claimID?: string;
+  bindingID?: string;
+  resolve(message: BrowserMessage | undefined): void;
 }
 
 type NativeRequestKind = "response" | "transport" | "timeout";
@@ -1740,6 +1773,18 @@ export class Bridge {
   /** One resolver per correlated native triage request. It is intentionally
    * worker-memory only; daemon state remains the authority after a restart. */
   private readonly pendingNativeRequests = new Map<string, PendingNativeRequest>();
+  /** One detached response-loss retry timer per materialization job. */
+  private readonly materializationRetryTimers = new Map<string, object>();
+  /** Materialization replies have no request_id by protocol design. Match
+   * them only to the current opaque job/claim/binding correlation. */
+  private readonly pendingMaterializationRequests: PendingMaterializationRequest[] = [];
+  /** One detached workflow per job; duplicate offers are idempotent. */
+  private readonly materializationRuns = new Map<string, Promise<void>>();
+  /** A fresh same-candidate offer arriving during a run requests one replay
+   * after that run releases the single-flight slot. */
+  private readonly materializationReruns = new Set<string>();
+  /** Jobs removed while a detached materialization run is between awaits. */
+  private readonly cancelledMaterializationJobs = new Set<string>();
   private portGeneration = 0;
   private helloAckGeneration = -1;
   private helloSentGeneration = -1;
@@ -2418,10 +2463,11 @@ export class Bridge {
    * a sibling open a duplicate institutional login. PDF content still stays. */
   private async closeOwnedTab(tabID: number, reason: string): Promise<void> {
     const entry = this.tabLedgerCache?.[String(tabID)];
+    const materializationCleanup = reason === "materialization-reconcile";
     const rollbackPrivate =
       reason === "fresh-materialization-rollback" && entry?.privateURL === true;
-    if (entry === undefined || findByTab(this.store, tabID) !== undefined) return;
-    if (reason === "adopted-viewer" || isPDFPage(entry.url)) return;
+    if (!materializationCleanup && (entry === undefined || findByTab(this.store, tabID) !== undefined)) return;
+    if (reason === "adopted-viewer" || (entry !== undefined && isPDFPage(entry.url))) return;
     let tab: TabInfo;
     try {
       tab = await this.deps.tabs.get(tabID);
@@ -2429,10 +2475,28 @@ export class Bridge {
       return;
     }
     if (reason === "adopted-viewer" || (tab.url !== undefined && isPDFPage(tab.url))) return;
+    if (materializationCleanup) {
+      const base = this.deps.runtimeGetURL?.(MATERIALIZE_PAGE_PATH);
+      if (base === undefined || tab.active === true || typeof tab.url !== "string") return;
+      try {
+        const expected = new URL(base);
+        const actual = new URL(tab.url);
+        const bindingID = actual.hash.startsWith("#") ? actual.hash.slice(1) : "";
+        if (
+          actual.origin !== expected.origin ||
+          actual.pathname !== expected.pathname ||
+          actual.search !== "" ||
+          !MATERIALIZATION_ID_PATTERN.test(bindingID)
+        ) return;
+      } catch {
+        return;
+      }
+    }
     const inWorkWindow = tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
     const inPapioGroup = tab.groupId !== undefined && tab.groupId === this.store.handoffGroupID;
     if (
       !rollbackPrivate &&
+      !materializationCleanup &&
       (tab.active === true || (!inWorkWindow && !inPapioGroup))
     ) return;
     await this.deps.tabs.remove(tabID).catch(() => undefined);
@@ -3555,6 +3619,16 @@ export class Bridge {
     await this.syncConnectionBadge();
     await this.reconcileTabs();
     await this.reconcileFederatedLoginOwners();
+    const activeMaterializationJobs = new Set(this.store.activeJobs.map((job) => job.job_id));
+    for (const [jobID, entry] of Object.entries(this.store.materializations ?? {})) {
+      if (activeMaterializationJobs.has(jobID)) continue;
+      if (entry.tab_id >= 0) await this.removeMaterializationTab(entry.tab_id);
+      await this.applyMaterialization(jobID, { type: "clear" });
+    }
+    await this.reconcileMaterializationTabs();
+    for (const [jobID, entry] of Object.entries(this.store.materializations ?? {})) {
+      if (entry.phase !== "navigated") this.scheduleMaterialization(jobID);
+    }
     const governorQueuedAtRestart: string[] = [];
     for (const job of this.store.activeJobs) {
       if (!this.hasDelegatedAuthority(job)) {
@@ -4390,6 +4464,845 @@ export class Bridge {
   }
   private supportsFreshHandoffLinks(): boolean {
     return (this.store.daemonFeatures ?? []).includes(HANDOFF_LINK_FEATURE);
+  }
+
+  private async applyMaterialization(jobID: string, event: MaterializationEvent): Promise<void> {
+    await this.update((store) => reduceMaterialization(store, jobID, event));
+  }
+  /** Cancel only browser-local work for a materialization job. The daemon's
+   * durable claim remains authoritative; resolving pending requests lets any
+   * detached run observe the supersession/removal instead of mutating a new
+   * correlation. */
+  private cancelMaterializationWorkflow(jobID: string): void {
+    this.cancelledMaterializationJobs.add(jobID);
+    this.materializationReruns.delete(jobID);
+    this.materializationRetryTimers.delete(jobID);
+    this.materializationRuns.delete(jobID);
+    const pending = this.pendingMaterializationRequests.filter((request) => request.jobID === jobID);
+    for (const request of pending) {
+      const index = this.pendingMaterializationRequests.indexOf(request);
+      if (index >= 0) this.pendingMaterializationRequests.splice(index, 1);
+      request.resolve(undefined);
+    }
+  }
+
+  private materializationCurrent(jobID: string, candidateID: string): boolean {
+    return !this.cancelledMaterializationJobs.has(jobID) &&
+      this.materializationCorrelation(jobID)?.candidate_id === candidateID;
+  }
+  private async clearMaterializationWorkflow(jobID: string): Promise<void> {
+    this.cancelMaterializationWorkflow(jobID);
+    await this.applyMaterialization(jobID, { type: "clear" });
+  }
+
+
+
+  private materializationCorrelation(jobID: string): MaterializationCorrelation | undefined {
+    return this.store.materializations?.[jobID];
+  }
+
+  private materializationURL(bindingID: string): string | undefined {
+    const base = this.deps.runtimeGetURL?.(MATERIALIZE_PAGE_PATH);
+    if (base === undefined) return undefined;
+    return `${base}#${bindingID}`;
+  }
+
+  private async scanMaterializationTabs(): Promise<{
+    byBinding: Map<string, TabInfo[]>;
+    reliable: boolean;
+  }> {
+    const byBinding = new Map<string, TabInfo[]>();
+    const base = this.deps.runtimeGetURL?.(MATERIALIZE_PAGE_PATH);
+    if (base === undefined || this.deps.tabs.query === undefined) return { byBinding, reliable: false };
+    let tabs: TabInfo[];
+    try {
+      tabs = await this.deps.tabs.query({ url: `${base}*` });
+    } catch {
+      return { byBinding, reliable: false };
+    }
+    let baseURL: URL;
+    try {
+      baseURL = new URL(base);
+    } catch {
+      return { byBinding, reliable: false };
+    }
+    for (const tab of tabs) {
+      if (tab.id === undefined || typeof tab.url !== "string") continue;
+      try {
+        const parsed = new URL(tab.url);
+        const fragment = parsed.hash.startsWith("#") ? parsed.hash.slice(1) : "";
+        if (
+          parsed.origin !== baseURL.origin ||
+          parsed.pathname !== baseURL.pathname ||
+          parsed.search !== "" ||
+          !MATERIALIZATION_ID_PATTERN.test(fragment)
+        ) continue;
+        const list = byBinding.get(fragment) ?? [];
+        list.push(tab);
+        byBinding.set(fragment, list);
+      } catch {
+        return { byBinding, reliable: false };
+      }
+    }
+    return { byBinding, reliable: true };
+  }
+
+  private async removeMaterializationTab(tabID: number): Promise<void> {
+    await this.closeOwnedTab(tabID, "materialization-reconcile");
+  }
+
+  private materializationResponseMatches(
+    pending: PendingMaterializationRequest,
+    msg: BrowserMessage,
+  ): boolean {
+    if (pending.responseType !== String(msg.type)) return false;
+    if (pending.jobID !== undefined && msg.job_id !== pending.jobID) return false;
+    const payload = msg.payload;
+    if (payload["request_id"] !== pending.requestID) return false;
+    if (pending.candidateID !== undefined && payload["candidate_id"] !== undefined &&
+        payload["candidate_id"] !== pending.candidateID) return false;
+    if (pending.claimID !== undefined && payload["claim_id"] !== undefined &&
+        payload["claim_id"] !== pending.claimID) return false;
+    if (pending.bindingID !== undefined && payload["binding_id"] !== undefined &&
+        payload["binding_id"] !== pending.bindingID) return false;
+    return true;
+  }
+
+  private resolveMaterializationResponse(msg: BrowserMessage): void {
+    for (let index = 0; index < this.pendingMaterializationRequests.length; index += 1) {
+      const pending = this.pendingMaterializationRequests[index];
+      if (pending === undefined || !this.materializationResponseMatches(pending, msg)) continue;
+      this.pendingMaterializationRequests.splice(index, 1);
+      pending.resolve(msg);
+      return;
+    }
+  }
+
+  private failPendingMaterializationRequests(): void {
+    const pending = this.pendingMaterializationRequests.splice(0);
+    for (const request of pending) request.resolve(undefined);
+  }
+
+  private requestMaterializationResponse(
+    requestType: string,
+    responseType: string,
+    payload: Record<string, unknown>,
+    jobID: string | undefined,
+    correlation: Pick<PendingMaterializationRequest, "candidateID" | "claimID" | "bindingID">,
+  ): Promise<BrowserMessage | undefined> {
+    const { promise, resolve } = Promise.withResolvers<BrowserMessage | undefined>();
+    const requestID = this.deps.randomUUID().replace(/-/g, "");
+    const pending: PendingMaterializationRequest = {
+      responseType,
+      requestID,
+      ...(jobID !== undefined ? { jobID } : {}),
+      ...correlation,
+      resolve,
+    };
+    this.pendingMaterializationRequests.push(pending);
+    if (!this.send(requestType as BrowserMessageType, { ...payload, request_id: requestID }, jobID)) {
+      const index = this.pendingMaterializationRequests.indexOf(pending);
+      if (index >= 0) this.pendingMaterializationRequests.splice(index, 1);
+      resolve(undefined);
+      return promise;
+    }
+    this.deps.setTimeout(() => {
+      const index = this.pendingMaterializationRequests.indexOf(pending);
+      if (index < 0) return;
+      this.pendingMaterializationRequests.splice(index, 1);
+      resolve(undefined);
+    }, TRIAGE_REQUEST_TIMEOUT_MS);
+    return promise;
+  }
+
+  private async materializationRPC(
+    requestType: string,
+    responseType: string,
+    payload: Record<string, unknown>,
+    jobID: string | undefined,
+    correlation: Pick<PendingMaterializationRequest, "candidateID" | "claimID" | "bindingID">,
+  ): Promise<BrowserMessage | undefined> {
+    if (!(this.store.daemonFeatures ?? []).includes(INSTITUTIONAL_MATERIALIZATION_FEATURE)) return undefined;
+    if (!(await this.ensureConnected())) return undefined;
+    return this.requestMaterializationResponse(requestType, responseType, payload, jobID, correlation);
+  }
+
+  private async materializeScaffold(
+    jobID: string,
+    correlation: MaterializationCorrelation,
+  ): Promise<{ tabID?: number; reliable: boolean }> {
+    if (this.cancelledMaterializationJobs.has(jobID)) return { reliable: false };
+    const bindingID = correlation.binding_id;
+    if (bindingID === undefined) return { reliable: true };
+    const scan = await this.scanMaterializationTabs();
+    if (this.cancelledMaterializationJobs.has(jobID)) return { reliable: false };
+    if (!scan.reliable) return { reliable: false };
+    const candidates = scan.byBinding.get(bindingID) ?? [];
+    let chosen: TabInfo | undefined;
+    if (correlation.tab_id >= 0) {
+      chosen = candidates.find((tab) => tab.id === correlation.tab_id);
+    }
+    chosen ??= candidates[0];
+    for (const candidate of candidates) {
+      if (candidate.id !== undefined && candidate.id !== chosen?.id) {
+        await this.removeMaterializationTab(candidate.id);
+      }
+    }
+    if (chosen?.id !== undefined) {
+      if (chosen.active === true) {
+        if (this.deps.tabs.update === undefined) return { reliable: false };
+        try {
+          await this.deps.tabs.update(chosen.id, { active: false });
+        } catch {
+          return { reliable: false };
+        }
+      }
+      if (correlation.tab_id !== chosen.id) {
+        await this.applyMaterialization(jobID, { type: "scaffolded", tab_id: chosen.id });
+      }
+      return { tabID: chosen.id, reliable: true };
+    }
+    const scaffoldURL = this.materializationURL(bindingID);
+    if (scaffoldURL === undefined) return { reliable: false };
+    try {
+      const created = await this.deps.tabs.create({ url: scaffoldURL, active: false });
+      if (created.id === undefined) return { reliable: false };
+      await this.applyMaterialization(jobID, { type: "scaffolded", tab_id: created.id });
+      return { tabID: created.id, reliable: true };
+    } catch {
+      return { reliable: false };
+    }
+  }
+
+  private materializationRetryExpiry(
+    correlation: MaterializationCorrelation,
+    phase: "claim" | "bind",
+  ): number | undefined {
+    const raw = phase === "claim" ? correlation.candidate_expires_at : correlation.lease_until;
+    if (typeof raw !== "string" || !MATERIALIZATION_RFC3339_PATTERN.test(raw)) return undefined;
+    const expiry = Date.parse(raw);
+    return Number.isFinite(expiry) && expiry > this.deps.now() ? expiry : undefined;
+  }
+
+  private async retryMaterializationAfterResponseLoss(
+    jobID: string,
+    phase: "claim" | "bind" | "route" | "navigated",
+  ): Promise<void> {
+    const correlation = this.materializationCorrelation(jobID);
+    if (correlation === undefined) return;
+    const expectedPhase: MaterializationPhase =
+      phase === "claim" ? "claiming" :
+      phase === "bind" ? correlation.phase :
+      phase === "route" ? "bound" : "navigating";
+    if (
+      (phase === "bind" && correlation.phase !== "claimed" && correlation.phase !== "bound") ||
+      correlation.phase !== expectedPhase ||
+      this.materializationRetryExpiry(correlation, phase === "claim" ? "claim" : "bind") === undefined
+    ) return;
+    const attempt = (correlation.retry_attempts ?? 0) + 1;
+    const exhausted = attempt > MATERIALIZATION_MAX_RESPONSE_LOSS_RETRIES;
+    const retryAfter = this.deps.now() + (
+      exhausted
+        ? MATERIALIZATION_RETRY_COOLDOWN_MS
+        : Math.min(
+            MATERIALIZATION_RETRY_MAX_MS,
+            MATERIALIZATION_RETRY_BASE_MS * 2 ** (attempt - 1),
+          )
+    );
+    const persistedAttempt = exhausted ? 0 : attempt;
+    const type =
+      phase === "claim" ? "retry_claim" :
+      phase === "bind" ? "retry_bind" :
+      phase === "route" ? "retry_route_response" : "retry_navigated";
+    await this.applyMaterialization(jobID, {
+      type,
+      attempt: persistedAttempt,
+      retry_after: retryAfter,
+    });
+    this.scheduleMaterializationRetry(jobID);
+  }
+
+  private scheduleMaterializationRetry(jobID: string, immediate = false): void {
+    if (this.materializationRetryTimers.has(jobID)) return;
+    const correlation = this.materializationCorrelation(jobID);
+    if (
+      correlation === undefined ||
+      correlation.phase === "navigated" ||
+      (correlation.retry_attempts ?? 0) >= MATERIALIZATION_MAX_RESPONSE_LOSS_RETRIES &&
+        correlation.retry_after === undefined
+    ) return;
+    const due = immediate ? this.deps.now() : (correlation.retry_after ?? this.deps.now());
+    const delay = Math.max(0, due - this.deps.now());
+    if (delay > 0) {
+      const marker = {};
+      this.materializationRetryTimers.set(jobID, marker);
+      this.deps.setTimeout(() => {
+        if (this.materializationRetryTimers.get(jobID) !== marker) return;
+        this.materializationRetryTimers.delete(jobID);
+        this.scheduleMaterialization(jobID, true);
+      }, delay);
+      return;
+    }
+    this.scheduleMaterialization(jobID, true);
+  }
+
+  private async runMaterialization(jobID: string): Promise<void> {
+    if (this.cancelledMaterializationJobs.has(jobID)) return;
+    let correlation = this.materializationCorrelation(jobID);
+    if (correlation === undefined || correlation.phase === "navigated") return;
+    if (!MATERIALIZATION_RFC3339_PATTERN.test(correlation.candidate_expires_at) ||
+        Date.parse(correlation.candidate_expires_at) <= this.deps.now()) {
+      await this.applyMaterialization(jobID, { type: "failed" });
+      return;
+    }
+    if (correlation.binding_id === undefined) {
+      const claimingCandidateID = correlation.candidate_id;
+      if (correlation.phase !== "offered" &&
+          correlation.phase !== "claiming" &&
+          correlation.phase !== "failed") return;
+      if (correlation.phase !== "claiming") {
+        await this.applyMaterialization(jobID, { type: "claiming" });
+        if (!this.materializationCurrent(jobID, claimingCandidateID)) return;
+      }
+      correlation = this.materializationCorrelation(jobID);
+      if (correlation === undefined || correlation.candidate_id !== claimingCandidateID) return;
+      const claimCandidateID = correlation.candidate_id;
+      const response = await this.materializationRPC(
+        "institutional_claim_request",
+        "institutional_claim_response",
+        { candidate_id: claimCandidateID, materialization_kind: "browser_tab" },
+        jobID,
+        { candidateID: claimCandidateID },
+      );
+      if (!this.materializationCurrent(jobID, claimCandidateID)) return;
+      if (response === undefined) {
+        await this.retryMaterializationAfterResponseLoss(jobID, "claim");
+        return;
+      }
+      const payload = response.payload;
+      const claimOutcome = payload?.["outcome"];
+      if (claimOutcome !== "claimed") {
+        if (claimOutcome === "stale" || claimOutcome === "not_eligible" || claimOutcome === "feature_disabled") {
+          await this.clearMaterializationWorkflow(jobID);
+        } else {
+          // busy/error are transient daemon conditions. Reuse the bounded
+          // response-loss backoff instead of entering a dead failed phase.
+          await this.retryMaterializationAfterResponseLoss(jobID, "claim");
+        }
+        return;
+      }
+      const claimID = payload?.["claim_id"];
+      const bindingID = payload?.["binding_id"];
+      const holderGeneration = payload?.["browser_holder_generation"];
+      const leaseUntil = payload?.["lease_until"];
+      if (
+        typeof claimID !== "string" ||
+        !MATERIALIZATION_ID_PATTERN.test(claimID) ||
+        typeof bindingID !== "string" ||
+        !MATERIALIZATION_ID_PATTERN.test(bindingID) ||
+        typeof holderGeneration !== "number" ||
+        !Number.isSafeInteger(holderGeneration) ||
+        holderGeneration < 1 ||
+        typeof leaseUntil !== "string" ||
+        !MATERIALIZATION_RFC3339_PATTERN.test(leaseUntil) ||
+        !Number.isFinite(Date.parse(leaseUntil))
+      ) {
+        await this.retryMaterializationAfterResponseLoss(jobID, "claim");
+        return;
+      }
+      await this.applyMaterialization(jobID, {
+        type: "claimed",
+        claim_id: claimID,
+        binding_id: bindingID,
+        browser_holder_generation: holderGeneration,
+        lease_until: leaseUntil,
+      });
+    }
+    correlation = this.materializationCorrelation(jobID);
+    if (correlation?.binding_id === undefined || correlation.claim_id === undefined) return;
+    if (correlation.phase === "failed") {
+      await this.applyMaterialization(
+        jobID,
+        correlation.tab_id >= 0 ? { type: "retry_route", tab_id: correlation.tab_id } : { type: "retry_route" },
+      );
+      correlation = this.materializationCorrelation(jobID);
+    }
+    if (correlation === undefined || correlation.binding_id === undefined || correlation.claim_id === undefined) return;
+    if (correlation.phase === "claimed" || (correlation.phase === "bound" && correlation.tab_id < 0)) {
+      const scaffold = await this.materializeScaffold(jobID, correlation);
+      if (!scaffold.reliable) {
+        await this.retryMaterializationAfterResponseLoss(jobID, "bind");
+        return;
+      }
+      const tabID = scaffold.tabID;
+      if (tabID === undefined) {
+        await this.retryMaterializationAfterResponseLoss(jobID, "bind");
+        return;
+      }
+      correlation = this.materializationCorrelation(jobID);
+      if (correlation === undefined || correlation.tab_id !== tabID || correlation.binding_id === undefined ||
+          correlation.claim_id === undefined) return;
+      const bindCandidateID = correlation.candidate_id;
+      const bindClaimID = correlation.claim_id;
+      const bindBindingID = correlation.binding_id;
+      const bindResponse = await this.materializationRPC(
+        "institutional_bind_request",
+        "institutional_bind_response",
+        { claim_id: bindClaimID, binding_id: bindBindingID, tab_id: tabID },
+        jobID,
+        { claimID: bindClaimID, bindingID: bindBindingID },
+      );
+      const currentAfterBind = this.materializationCorrelation(jobID);
+      if (!this.materializationCurrent(jobID, bindCandidateID) ||
+          currentAfterBind?.claim_id !== bindClaimID ||
+          currentAfterBind?.binding_id !== bindBindingID) return;
+      if (bindResponse === undefined) {
+        await this.retryMaterializationAfterResponseLoss(jobID, "bind");
+        return;
+      }
+      const bindOutcome = bindResponse.payload["outcome"];
+      if (bindOutcome !== "bound") {
+        if (bindOutcome === "stale" || bindOutcome === "not_eligible" || bindOutcome === "feature_disabled") {
+          await this.removeMaterializationTab(tabID);
+          await this.clearMaterializationWorkflow(jobID);
+        } else {
+          await this.retryMaterializationAfterResponseLoss(jobID, "bind");
+        }
+        return;
+      }
+      await this.applyMaterialization(jobID, { type: "bound" });
+    }
+    correlation = this.materializationCorrelation(jobID);
+    if (correlation === undefined || correlation.binding_id === undefined || correlation.claim_id === undefined) return;
+    if (correlation.phase === "route_issued") {
+      await this.applyMaterialization(jobID, { type: "retry_route", tab_id: correlation.tab_id });
+      correlation = this.materializationCorrelation(jobID);
+    }
+    if (correlation === undefined || correlation.binding_id === undefined || correlation.claim_id === undefined) return;
+    if (correlation.phase === "navigating") {
+      if (correlation.tab_id < 0 || correlation.route_issuance_ordinal === undefined) return;
+      const navigationCandidateID = correlation.candidate_id;
+      const navigationClaimID = correlation.claim_id;
+      const navigationBindingID = correlation.binding_id;
+      const navigationTabID = correlation.tab_id;
+      let providerNavigation = false;
+      try {
+        const tab = this.deps.tabs.get === undefined ? undefined : await this.deps.tabs.get(navigationTabID);
+        const tabURL = tab?.url;
+        const scaffoldBase = this.deps.runtimeGetURL?.(MATERIALIZE_PAGE_PATH);
+        providerNavigation = tab?.id === navigationTabID &&
+          typeof tabURL === "string" &&
+          /^https:\/\//u.test(tabURL) &&
+          (scaffoldBase === undefined || !tabURL.startsWith(`${scaffoldBase}#`));
+      } catch {
+        providerNavigation = false;
+      }
+      const currentAfterTabCheck = this.materializationCorrelation(jobID);
+      if (!providerNavigation) {
+        if (!this.materializationCurrent(jobID, navigationCandidateID) ||
+            currentAfterTabCheck?.claim_id !== navigationClaimID ||
+            currentAfterTabCheck?.binding_id !== navigationBindingID ||
+            currentAfterTabCheck?.tab_id !== navigationTabID) return;
+        await this.applyMaterialization(jobID, { type: "scaffold_lost" });
+        this.scheduleMaterialization(jobID, true);
+        return;
+      }
+      const recoveredNavigation = await this.materializationRPC(
+        "institutional_navigated_request",
+        "institutional_navigated_response",
+        {
+          claim_id: navigationClaimID,
+          binding_id: navigationBindingID,
+          route_issuance_ordinal: correlation.route_issuance_ordinal,
+          tab_id: navigationTabID,
+        },
+        jobID,
+        { claimID: navigationClaimID, bindingID: navigationBindingID },
+      );
+      const currentAfterNavigation = this.materializationCorrelation(jobID);
+      if (!this.materializationCurrent(jobID, navigationCandidateID) ||
+          currentAfterNavigation?.claim_id !== navigationClaimID ||
+          currentAfterNavigation?.binding_id !== navigationBindingID ||
+          currentAfterNavigation?.tab_id !== navigationTabID) return;
+      if (recoveredNavigation === undefined) {
+        await this.retryMaterializationAfterResponseLoss(jobID, "navigated");
+        return;
+      }
+      const outcome = recoveredNavigation.payload["outcome"];
+      if (outcome === "acknowledged") await this.applyMaterialization(jobID, { type: "navigated" });
+      else if (outcome === "stale" || outcome === "not_eligible" || outcome === "feature_disabled") {
+        await this.removeMaterializationTab(correlation.tab_id);
+        await this.clearMaterializationWorkflow(jobID);
+      } else {
+        await this.retryMaterializationAfterResponseLoss(jobID, "navigated");
+      }
+      return;
+    }
+    const routeCandidateID = correlation.candidate_id;
+    const routeClaimID = correlation.claim_id;
+    const routeBindingID = correlation.binding_id;
+    const routeResponse = await this.materializationRPC(
+      "institutional_route_request",
+      "institutional_route_response",
+      { claim_id: routeClaimID, binding_id: routeBindingID },
+      jobID,
+      { claimID: routeClaimID, bindingID: routeBindingID },
+    );
+    const currentAfterRoute = this.materializationCorrelation(jobID);
+    if (!this.materializationCurrent(jobID, routeCandidateID) ||
+        currentAfterRoute?.claim_id !== routeClaimID ||
+        currentAfterRoute?.binding_id !== routeBindingID) return;
+    if (routeResponse === undefined) {
+      await this.retryMaterializationAfterResponseLoss(jobID, "route");
+      return;
+    }
+    const routePayload = routeResponse.payload;
+    const routeOrdinal = routePayload["route_issuance_ordinal"];
+    const freshURL = routePayload["url"];
+    const replayingRoute = correlation.route_replay_ordinal === routeOrdinal;
+    if (
+      routePayload["outcome"] !== "issued" ||
+      typeof routeOrdinal !== "number" ||
+      !Number.isSafeInteger(routeOrdinal) ||
+      routeOrdinal < 1 ||
+      (correlation.route_issuance_ordinal !== undefined &&
+        (routeOrdinal < correlation.route_issuance_ordinal ||
+          (!replayingRoute && routeOrdinal <= correlation.route_issuance_ordinal))) ||
+      typeof freshURL !== "string" ||
+      !/^https:\/\//u.test(freshURL)
+    ) {
+      const routeOutcome = routePayload["outcome"];
+      if (routeOutcome === "stale" || routeOutcome === "not_eligible" || routeOutcome === "feature_disabled") {
+        await this.removeMaterializationTab(correlation.tab_id);
+        await this.clearMaterializationWorkflow(jobID);
+      } else {
+        await this.retryMaterializationAfterResponseLoss(jobID, "route");
+      }
+      return;
+    }
+    await this.applyMaterialization(jobID, { type: "route_issued", route_issuance_ordinal: routeOrdinal });
+    correlation = this.materializationCorrelation(jobID);
+    if (correlation === undefined || correlation.phase !== "route_issued" ||
+        correlation.candidate_id !== routeCandidateID ||
+        correlation.claim_id !== routeClaimID ||
+        correlation.binding_id !== routeBindingID ||
+        correlation.tab_id < 0) return;
+    const navigationCandidateID = correlation.candidate_id;
+    const navigationClaimID = correlation.claim_id;
+    const navigationBindingID = correlation.binding_id;
+    const navigationOrdinal = correlation.route_issuance_ordinal;
+    if (navigationOrdinal === undefined) return;
+    await this.applyMaterialization(jobID, { type: "navigating" });
+    const currentTabID = correlation.tab_id;
+    const beforeUpdate = this.materializationCorrelation(jobID);
+    if (!this.materializationCurrent(jobID, navigationCandidateID) ||
+        beforeUpdate?.claim_id !== navigationClaimID ||
+        beforeUpdate?.binding_id !== navigationBindingID ||
+        beforeUpdate?.route_issuance_ordinal !== navigationOrdinal ||
+        beforeUpdate?.tab_id !== currentTabID) return;
+    try {
+      if (this.deps.tabs.update === undefined) {
+        await this.removeMaterializationTab(currentTabID);
+        await this.applyMaterialization(jobID, { type: "scaffold_lost" });
+        return;
+      }
+      await this.deps.tabs.update(currentTabID, { url: freshURL });
+    } catch {
+      const currentAfterFailure = this.materializationCorrelation(jobID);
+      if (!this.materializationCurrent(jobID, navigationCandidateID) ||
+          currentAfterFailure?.claim_id !== navigationClaimID ||
+          currentAfterFailure?.binding_id !== navigationBindingID ||
+          currentAfterFailure?.route_issuance_ordinal !== navigationOrdinal ||
+          currentAfterFailure?.tab_id !== currentTabID) return;
+      // The scaffold can disappear between route issuance and navigation.
+      // Never replay against that tab: remove it, preserve the claim/binding
+      // and ordinal while marking the scaffold absent, then the post-run wake
+      // creates and binds a replacement before requesting another route.
+      await this.removeMaterializationTab(currentTabID);
+      await this.applyMaterialization(jobID, { type: "scaffold_lost" });
+      return;
+    }
+    correlation = this.materializationCorrelation(jobID);
+    if (!this.materializationCurrent(jobID, navigationCandidateID) ||
+        correlation?.phase !== "navigating" ||
+        correlation.claim_id !== navigationClaimID ||
+        correlation.binding_id !== navigationBindingID ||
+        correlation.route_issuance_ordinal !== navigationOrdinal ||
+        correlation.tab_id !== currentTabID) return;
+    const navigatedResponse = await this.materializationRPC(
+      "institutional_navigated_request",
+      "institutional_navigated_response",
+      {
+        claim_id: navigationClaimID,
+        binding_id: navigationBindingID,
+        route_issuance_ordinal: navigationOrdinal,
+        tab_id: currentTabID,
+      },
+      jobID,
+      { claimID: navigationClaimID, bindingID: navigationBindingID },
+    );
+    const currentAfterNavigated = this.materializationCorrelation(jobID);
+    if (!this.materializationCurrent(jobID, navigationCandidateID) ||
+        currentAfterNavigated?.claim_id !== navigationClaimID ||
+        currentAfterNavigated?.binding_id !== navigationBindingID ||
+        currentAfterNavigated?.route_issuance_ordinal !== navigationOrdinal ||
+        currentAfterNavigated?.tab_id !== currentTabID) return;
+    if (navigatedResponse === undefined) {
+      await this.retryMaterializationAfterResponseLoss(jobID, "navigated");
+    } else {
+      const navigatedOutcome = navigatedResponse.payload["outcome"];
+      if (navigatedOutcome === "acknowledged") {
+        await this.applyMaterialization(jobID, { type: "navigated" });
+      } else if (navigatedOutcome === "stale" || navigatedOutcome === "not_eligible" || navigatedOutcome === "feature_disabled") {
+        await this.removeMaterializationTab(currentTabID);
+        await this.clearMaterializationWorkflow(jobID);
+      } else {
+        await this.retryMaterializationAfterResponseLoss(jobID, "navigated");
+      }
+    }
+  }
+
+  private scheduleMaterialization(jobID: string, immediate = false): void {
+    if (this.materializationRuns.has(jobID)) {
+      this.materializationReruns.add(jobID);
+      return;
+    }
+    if (this.materializationRetryTimers.has(jobID)) return;
+    const correlation = this.materializationCorrelation(jobID);
+    if (
+      correlation === undefined ||
+      correlation.phase === "navigated" ||
+      ((correlation.retry_attempts ?? 0) >= MATERIALIZATION_MAX_RESPONSE_LOSS_RETRIES &&
+        correlation.retry_after === undefined)
+    ) return;
+    const due = immediate ? this.deps.now() : (correlation.retry_after ?? this.deps.now());
+    const delay = Math.max(0, due - this.deps.now());
+    if (delay > 0) {
+      const marker = {};
+      this.materializationRetryTimers.set(jobID, marker);
+      this.deps.setTimeout(() => {
+        if (this.materializationRetryTimers.get(jobID) !== marker) return;
+        this.materializationRetryTimers.delete(jobID);
+        this.scheduleMaterialization(jobID, true);
+      }, delay);
+      return;
+    }
+    const run = this.runMaterialization(jobID)
+      .catch((error) => console.error("papio: institutional materialization failed", error))
+      .finally(() => {
+        if (this.materializationRuns.get(jobID) !== run) return;
+        this.materializationRuns.delete(jobID);
+        const rerun = this.materializationReruns.delete(jobID);
+        if (rerun) {
+          this.scheduleMaterialization(jobID, true);
+          return;
+        }
+        const correlation = this.materializationCorrelation(jobID);
+        if (correlation?.phase === "claimed" && correlation.tab_id < 0) {
+          this.scheduleMaterialization(jobID, true);
+        }
+      });
+    this.materializationRuns.set(jobID, run);
+  }
+
+  private async reconcileMaterializationTabs(): Promise<void> {
+    if (!(this.store.daemonFeatures ?? []).includes(INSTITUTIONAL_MATERIALIZATION_FEATURE)) return;
+    const scan = await this.scanMaterializationTabs();
+    if (!scan.reliable) return;
+    const records = this.store.materializations ?? {};
+    const byBinding = scan.byBinding;
+    const bindings: {
+      binding_id: string;
+      tab_id: number;
+      job_id: string;
+      candidate_id: string;
+    }[] = [];
+    const retained = new Set<number>();
+    const seenBindings = new Set<string>();
+    const stillCurrent = (jobID: string, candidateID: string, bindingID: string): boolean => {
+      const current = this.materializationCorrelation(jobID);
+      return current?.candidate_id === candidateID && current.binding_id === bindingID;
+    };
+    for (const [jobID, correlation] of Object.entries(records)) {
+      const bindingID = correlation.binding_id;
+      if (bindingID === undefined) continue;
+      const candidateID = correlation.candidate_id;
+      if (seenBindings.has(bindingID)) {
+        if (stillCurrent(jobID, candidateID, bindingID)) {
+          await this.clearMaterializationWorkflow(jobID);
+        }
+        continue;
+      }
+      seenBindings.add(bindingID);
+      const candidates = byBinding.get(bindingID) ?? [];
+      const chosen = candidates.find((tab) => tab.id === correlation.tab_id) ?? candidates[0];
+      if (chosen?.id === undefined) {
+        if (correlation.tab_id >= 0) {
+          bindings.push({ binding_id: bindingID, tab_id: correlation.tab_id, job_id: jobID, candidate_id: candidateID });
+        }
+        continue;
+      }
+      for (const candidate of candidates) {
+        if (
+          candidate.id !== undefined &&
+          candidate.id !== chosen.id &&
+          stillCurrent(jobID, candidateID, bindingID)
+        ) {
+          await this.removeMaterializationTab(candidate.id);
+        }
+      }
+      retained.add(chosen.id);
+      if (correlation.tab_id !== chosen.id && stillCurrent(jobID, candidateID, bindingID)) {
+        await this.applyMaterialization(jobID, { type: "reconcile_tab", tab_id: chosen.id });
+      }
+      bindings.push({ binding_id: bindingID, tab_id: chosen.id, job_id: jobID, candidate_id: candidateID });
+    }
+    for (const [bindingID, tabs] of byBinding.entries()) {
+      const owner = Object.entries(records).find(([, entry]) => entry.binding_id === bindingID);
+      for (const tab of tabs) {
+        if (tab.id === undefined || retained.has(tab.id)) continue;
+        if (
+          owner !== undefined &&
+          !stillCurrent(owner[0], owner[1].candidate_id, bindingID)
+        ) continue;
+        await this.removeMaterializationTab(tab.id);
+      }
+    }
+    for (let offset = 0; offset < bindings.length; offset += 32) {
+      await this.reconcileMaterializationPage(bindings.slice(offset, offset + 32));
+    }
+  }
+
+  private async reconcileMaterializationPage(
+    submittedBindings: {
+      binding_id: string;
+      tab_id: number;
+      job_id: string;
+      candidate_id: string;
+    }[],
+  ): Promise<void> {
+    const response = await this.materializationRPC(
+      "institutional_reconcile_request",
+      "institutional_reconcile_response",
+      { bindings: submittedBindings.map(({ binding_id, tab_id }) => ({ binding_id, tab_id })) },
+      undefined,
+      {},
+    );
+    const payload = response?.payload;
+    if (payload === undefined || !Array.isArray(payload["claims"])) return;
+    const liveBindings = new Set<string>();
+    const currentFor = (snapshot: { job_id: string; candidate_id: string; binding_id: string }) => {
+      const entry = this.materializationCorrelation(snapshot.job_id);
+      return entry?.candidate_id === snapshot.candidate_id && entry.binding_id === snapshot.binding_id
+        ? entry
+        : undefined;
+    };
+    for (const rawClaim of payload["claims"]) {
+      if (typeof rawClaim !== "object" || rawClaim === null) continue;
+      const claim = rawClaim as Record<string, unknown>;
+      const bindingID = claim["binding_id"];
+      if (typeof bindingID !== "string") continue;
+      liveBindings.add(bindingID);
+      const snapshot = submittedBindings.find((binding) => binding.binding_id === bindingID);
+      if (snapshot === undefined) continue;
+      let entry = currentFor(snapshot);
+      if (entry === undefined) continue;
+      const tabID = claim["tab_id"];
+      if (typeof tabID === "number" && Number.isInteger(tabID) && tabID >= 0 && entry.tab_id !== tabID) {
+        if (currentFor(snapshot) === undefined) continue;
+        await this.applyMaterialization(snapshot.job_id, { type: "reconcile_tab", tab_id: tabID });
+      }
+      entry = currentFor(snapshot);
+      if (entry === undefined) continue;
+      if (claim["phase"] === "navigated" && entry.phase === "navigating") {
+        if (currentFor(snapshot) === undefined) continue;
+        await this.applyMaterialization(snapshot.job_id, { type: "navigated" });
+      }
+      entry = currentFor(snapshot);
+      if (entry === undefined) continue;
+      if (claim["phase"] === "settled" || claim["phase"] === "abandoned") {
+        if (entry.tab_id >= 0) {
+          if (currentFor(snapshot) === undefined) continue;
+          await this.removeMaterializationTab(entry.tab_id);
+        }
+        if (currentFor(snapshot) === undefined) continue;
+        await this.clearMaterializationWorkflow(snapshot.job_id);
+      }
+    }
+    for (const snapshot of submittedBindings) {
+      if (liveBindings.has(snapshot.binding_id)) continue;
+      const entry = currentFor(snapshot);
+      if (entry === undefined) continue;
+      if (payload["outcome"] !== "stale" && payload["outcome"] !== "reconciled") continue;
+      if (entry.tab_id >= 0) {
+        if (currentFor(snapshot) === undefined) continue;
+        await this.removeMaterializationTab(entry.tab_id);
+      }
+      if (currentFor(snapshot) === undefined) continue;
+      await this.clearMaterializationWorkflow(snapshot.job_id);
+    }
+  }
+  private onInstitutionalCandidateOffer(msg: BrowserMessage): void {
+    const jobID = msg.job_id;
+    const payload = msg.payload;
+    const candidateID = payload["candidate_id"];
+    const kind = payload["materialization_kind"];
+    const expiresAt = payload["expires_at"];
+    if (
+      jobID === undefined ||
+      !(this.store.daemonFeatures ?? []).includes(INSTITUTIONAL_MATERIALIZATION_FEATURE) ||
+      kind !== "browser_tab" ||
+      typeof candidateID !== "string" ||
+      !MATERIALIZATION_ID_PATTERN.test(candidateID) ||
+      typeof expiresAt !== "string" ||
+      !MATERIALIZATION_RFC3339_PATTERN.test(expiresAt) ||
+      !Number.isFinite(Date.parse(expiresAt)) ||
+      Date.parse(expiresAt) <= this.deps.now()
+    ) return;
+    const existing = this.materializationCorrelation(jobID);
+    const sameCandidateRefresh = existing?.candidate_id === candidateID &&
+      Date.parse(expiresAt) > Date.parse(existing.candidate_expires_at);
+    const offer = async () => {
+      this.cancelledMaterializationJobs.delete(jobID);
+      if (sameCandidateRefresh) this.materializationRetryTimers.delete(jobID);
+      await this.applyMaterialization(jobID, {
+        type: "offer",
+        correlation: {
+          job_id: jobID,
+          candidate_id: candidateID,
+          materialization_kind: "browser_tab",
+          candidate_expires_at: expiresAt,
+          phase: "offered",
+          tab_id: -1,
+        },
+      });
+      this.scheduleMaterialization(jobID, sameCandidateRefresh);
+    };
+    if (existing !== undefined && existing.candidate_id !== candidateID) {
+      // A daemon re-offer is authoritative. Stop all browser-local work from
+      // the old candidate before replacing its correlation, and close only
+      // the old papio-owned scaffold.
+      this.cancelMaterializationWorkflow(jobID);
+      const oldTabID = existing.tab_id;
+      void (async () => {
+        try {
+          if (oldTabID >= 0) await this.removeMaterializationTab(oldTabID);
+        } finally {
+          await offer();
+        }
+      })();
+      return;
+    }
+    if (sameCandidateRefresh) {
+      void offer();
+      return;
+    }
+    this.cancelledMaterializationJobs.delete(jobID);
+    if (existing === undefined) {
+      void offer();
+      return;
+    }
+    this.scheduleMaterialization(jobID);
   }
 
   private async requestFreshHandoffLink(jobID: string): Promise<{ ok: true; url: string } | BrokerFailure> {
@@ -5306,6 +6219,7 @@ export class Bridge {
         {
           extension_version: this.deps.manifestVersion,
           adapter_versions: adapterVersions,
+          features: [INSTITUTIONAL_MATERIALIZATION_FEATURE],
         },
         undefined,
         this.helloRequestID,
@@ -5320,6 +6234,7 @@ export class Bridge {
     // A stale port may report its close after recovery opened a replacement.
     if (this.port !== port) return;
     this.port = null;
+    this.failPendingMaterializationRequests();
     this.failPageAcquireWaiters("The daemon disconnected before acknowledging this page");
     this.settleHelloWaiters(false);
     this.failPendingNativeRequests(
@@ -5345,6 +6260,7 @@ export class Bridge {
     this.closingDeliberately = true;
     const port = this.port;
     this.port = null;
+    this.failPendingMaterializationRequests();
     this.failPageAcquireWaiters("The daemon disconnected before acknowledging this page");
     this.settleHelloWaiters(false);
     this.failPendingNativeRequests(
@@ -5359,7 +6275,6 @@ export class Bridge {
     }
   }
 
-  /** Replace a live native port whose daemon forgot this hello-session. */
   private reconnectForHello(): void {
     const port = this.port;
     if (!port) return;
@@ -5367,6 +6282,7 @@ export class Bridge {
     // schedule a second recovery after connect() has installed its replacement.
     this.closingDeliberately = true;
     this.port = null;
+    this.failPendingMaterializationRequests();
     this.failPageAcquireWaiters("The daemon restarted before acknowledging this page");
     this.settleHelloWaiters(false);
     this.failPendingNativeRequests(
@@ -5516,14 +6432,16 @@ export class Bridge {
 
   private async removeJobWithOffer(jobID: string): Promise<void> {
     const job = findByJob(this.store, jobID);
+    const materialization = this.materializationCorrelation(jobID);
     const tabID = job?.tab_id;
+    const materializationTabID = materialization?.tab_id;
     const providerKey = job === undefined ? undefined : this.providerKeyForJob(job);
+    this.cancelMaterializationWorkflow(jobID);
     this.releaseHandoffDrive(jobID);
     this.deliveryJobs.delete(jobID);
     this.resolverRoutes.delete(jobID);
     this.deliverySessionEvidence.delete(jobID);
     this.offerURLs.delete(jobID);
-    this.queuedHandoffTimers.delete(jobID);
     this.classifyRetries.delete(jobID);
     this.loginEntityIDs.delete(jobID);
     this.federatedLoginRouted.delete(jobID);
@@ -5546,10 +6464,14 @@ export class Bridge {
     this.proquestAccountIDs.delete(jobID);
     this.accountIdAppended.delete(jobID);
     await this.clearFederatedLoginOwnerForJob(jobID);
+    if (materializationTabID !== undefined && materializationTabID >= 0) {
+      await this.removeMaterializationTab(materializationTabID);
+    }
     await this.update((s) => {
       const offerURLs = { ...(s.offerURLs ?? {}) };
       delete offerURLs[jobID];
-      return { ...clearPendingDelivery(removeJob(s, jobID), jobID), offerURLs };
+      const withoutJob = clearPendingDelivery(removeJob(s, jobID), jobID);
+      return reduceMaterialization({ ...withoutJob, offerURLs }, jobID, { type: "clear" });
     });
     if (providerKey !== undefined) await this.releaseProviderDrainWhenUnused(providerKey);
     await this.dropStaleHandoffGroup();
@@ -7087,6 +8009,16 @@ export class Bridge {
       this.onUnsolicitedPdfGrab(msg);
       return;
     }
+    if (MATERIALIZATION_RESPONSE_TYPES[String(msg.type)] === true) {
+      this.resolveMaterializationResponse(msg);
+      return;
+    }
+    if (String(msg.type) === "institutional_candidate_offer") {
+      // Candidate offers are notifications. Do not await a claim workflow
+      // inside the inbound FIFO; a response must be free to arrive next.
+      void this.onInstitutionalCandidateOffer(msg);
+      return;
+    }
     if (CORRELATED_RESULT_TYPES.has(msg.type)) {
       this.resolveNativeResponse(msg);
       return;
@@ -7153,6 +8085,11 @@ export class Bridge {
             };
           });
         }
+        void this.reconcileMaterializationTabs().then(() => {
+          for (const [jobID, entry] of Object.entries(this.store.materializations ?? {})) {
+            if (entry.phase !== "navigated") this.scheduleMaterialization(jobID, true);
+          }
+        });
         this.settleHelloWaiters(true);
         return;
       }
@@ -11040,6 +11977,7 @@ function realDeps(): BridgeDeps {
       };
     },
     manifestVersion: chrome.runtime.getManifest().version,
+    runtimeGetURL: (path) => chrome.runtime.getURL(path),
     randomUUID: () => crypto.randomUUID(),
     now: () => Date.now(),
     setTimeout: (fn, ms) => {

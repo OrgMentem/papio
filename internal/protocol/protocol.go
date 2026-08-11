@@ -49,10 +49,10 @@ var (
 	// entitlementRefRE mirrors the consumer's closed vocabulary. The cleartext
 	// source form is preferred: hashing a public constant like "crossref_tdm"
 	// buys no secrecy and destroys legibility in an audit trail whose whole
-	// value is knowing which entitlement obtained the work. The digest form is
-	// accepted so an opaque reference stays expressible.
+	// point is to explain why a candidate was accepted.
 	entitlementRefRE = regexp.MustCompile(`^entitlement:(source:[a-z0-9_]{1,64}|sha256:[0-9a-f]{64})$`)
 	msgIDRE          = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
+	clientFeatureRE  = regexp.MustCompile(`^[a-z0-9_]+$`)
 	zoteroKeyRE      = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
 	doiRE            = regexp.MustCompile(`^10\.[0-9]{4,9}/\S{1,200}$`)
 	pmidRE           = regexp.MustCompile(`^[0-9]{1,10}$`)
@@ -861,6 +861,7 @@ const (
 	// institutional_materialization_v1 is the dark, strict Phase 1
 	// materialization protocol. Its handlers are feature-disabled until a
 	// later phase enables durable claims and browser effects.
+	MsgInstitutionalCandidateOffer    = "institutional_candidate_offer"
 	MsgInstitutionalClaimRequest      = "institutional_claim_request"
 	MsgInstitutionalClaimResponse     = "institutional_claim_response"
 	MsgInstitutionalBindRequest       = "institutional_bind_request"
@@ -890,11 +891,21 @@ const InstitutionalMaterializationFeature = "institutional_materialization_v1"
 // Institutional materialization payloads intentionally carry only opaque
 // identifiers and bounded ordinals. Job-scoped requests use the envelope's
 // job_id; reconcile is session-scoped and has no job_id.
+// InstitutionalCandidateOfferPayload is the daemon's URL-free, job-scoped
+// offer of one explicit browser-tab materialization candidate.
+type InstitutionalCandidateOfferPayload struct {
+	CandidateID         string `json:"candidate_id"`
+	MaterializationKind string `json:"materialization_kind"`
+	ExpiresAt           string `json:"expires_at"`
+}
+
 type InstitutionalClaimRequestPayload struct {
+	RequestID           string `json:"request_id"`
 	CandidateID         string `json:"candidate_id"`
 	MaterializationKind string `json:"materialization_kind"`
 }
 type InstitutionalClaimResponsePayload struct {
+	RequestID               string `json:"request_id"`
 	Outcome                 string `json:"outcome"`
 	CandidateID             string `json:"candidate_id,omitempty"`
 	ClaimID                 string `json:"claim_id,omitempty"`
@@ -904,21 +915,25 @@ type InstitutionalClaimResponsePayload struct {
 	Detail                  string `json:"detail,omitempty"`
 }
 type InstitutionalBindRequestPayload struct {
+	RequestID string `json:"request_id"`
 	ClaimID   string `json:"claim_id"`
 	BindingID string `json:"binding_id"`
 	TabID     int64  `json:"tab_id"`
 }
 type InstitutionalBindResponsePayload struct {
+	RequestID string `json:"request_id"`
 	Outcome   string `json:"outcome"`
 	ClaimID   string `json:"claim_id,omitempty"`
 	BindingID string `json:"binding_id,omitempty"`
 	Detail    string `json:"detail,omitempty"`
 }
 type InstitutionalRouteRequestPayload struct {
+	RequestID string `json:"request_id"`
 	ClaimID   string `json:"claim_id"`
 	BindingID string `json:"binding_id"`
 }
 type InstitutionalRouteResponsePayload struct {
+	RequestID            string `json:"request_id"`
 	Outcome              string `json:"outcome"`
 	ClaimID              string `json:"claim_id,omitempty"`
 	BindingID            string `json:"binding_id,omitempty"`
@@ -927,12 +942,14 @@ type InstitutionalRouteResponsePayload struct {
 	Detail               string `json:"detail,omitempty"`
 }
 type InstitutionalNavigatedRequestPayload struct {
+	RequestID            string `json:"request_id"`
 	ClaimID              string `json:"claim_id"`
 	BindingID            string `json:"binding_id"`
 	RouteIssuanceOrdinal int64  `json:"route_issuance_ordinal"`
 	TabID                int64  `json:"tab_id"`
 }
 type InstitutionalNavigatedResponsePayload struct {
+	RequestID string `json:"request_id"`
 	Outcome   string `json:"outcome"`
 	ClaimID   string `json:"claim_id,omitempty"`
 	BindingID string `json:"binding_id,omitempty"`
@@ -943,7 +960,8 @@ type InstitutionalReconcileBinding struct {
 	TabID     int64  `json:"tab_id"`
 }
 type InstitutionalReconcileRequestPayload struct {
-	Bindings []InstitutionalReconcileBinding `json:"bindings"`
+	RequestID string                          `json:"request_id"`
+	Bindings  []InstitutionalReconcileBinding `json:"bindings"`
 }
 type InstitutionalReconcileClaim struct {
 	ClaimID     string `json:"claim_id"`
@@ -953,9 +971,10 @@ type InstitutionalReconcileClaim struct {
 	TabID       *int64 `json:"tab_id,omitempty"`
 }
 type InstitutionalReconcileResponsePayload struct {
-	Outcome string                        `json:"outcome"`
-	Claims  []InstitutionalReconcileClaim `json:"claims,omitempty"`
-	Detail  string                        `json:"detail,omitempty"`
+	RequestID string                        `json:"request_id"`
+	Outcome   string                        `json:"outcome"`
+	Claims    []InstitutionalReconcileClaim `json:"claims,omitempty"`
+	Detail    string                        `json:"detail,omitempty"`
 }
 
 // jobScoped lists the types that must carry a job_id.
@@ -965,16 +984,20 @@ var jobScoped = map[string]bool{
 	MsgProviderDriveEpochStartRequest: true, MsgProviderDriveEpochStartResult: true,
 	MsgProviderDriveEpochResultRequest: true, MsgProviderDriveEpochResult: true,
 	MsgCancel: true, MsgHandoffFocus: true,
-	MsgInstitutionalClaimRequest: true, MsgInstitutionalClaimResponse: true,
+	MsgInstitutionalCandidateOffer: true,
+	MsgInstitutionalClaimRequest:   true, MsgInstitutionalClaimResponse: true,
 	MsgInstitutionalBindRequest: true, MsgInstitutionalBindResponse: true,
 	MsgInstitutionalRouteRequest: true, MsgInstitutionalRouteResponse: true,
 	MsgInstitutionalNavigatedRequest: true, MsgInstitutionalNavigatedResponse: true,
 }
 
-// HelloPayload announces the extension and its adapter versions.
+// HelloPayload announces the extension, its adapter versions, and the
+// capabilities it explicitly negotiates with the daemon. Features are
+// optional so old extensions retain the legacy URL-bearing offer path.
 type HelloPayload struct {
 	ExtensionVersion string            `json:"extension_version"`
 	AdapterVersions  map[string]string `json:"adapter_versions,omitempty"`
+	Features         []string          `json:"features,omitempty"`
 }
 
 // HelloAckPayload announces the daemon version and supported bridge features.
@@ -1828,7 +1851,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgHello:
 		p := &HelloPayload{}
 		if err = browserRequireFields(payloadFields, "extension_version"); err == nil {
-			err = browserRejectNullFields(payloadFields, "adapter_versions")
+			err = browserRejectNullFields(payloadFields, "adapter_versions", "features")
 		}
 		var adapterFields map[string]json.RawMessage
 		if raw, ok := payloadFields["adapter_versions"]; ok && err == nil {
@@ -1842,6 +1865,22 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 				err = fmt.Errorf("hello.extension_version required (max 50)")
 			} else if len(p.AdapterVersions) > 50 {
 				err = fmt.Errorf("hello.adapter_versions capped at 50")
+			} else if len(p.Features) > 32 {
+				err = fmt.Errorf("hello.features capped at 32")
+			}
+		}
+		if err == nil {
+			seen := make(map[string]struct{}, len(p.Features))
+			for _, feature := range p.Features {
+				if browserTextLen(feature) < 1 || browserTextLen(feature) > 64 || !clientFeatureRE.MatchString(feature) {
+					err = fmt.Errorf("hello.features entries must match [a-z0-9_]{1,64}")
+					break
+				}
+				if _, exists := seen[feature]; exists {
+					err = fmt.Errorf("hello.features contains duplicate %q", feature)
+					break
+				}
+				seen[feature] = struct{}{}
 			}
 		}
 		for key, raw := range adapterFields {
@@ -2145,16 +2184,23 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = enumRequired("provider_drive_epoch_result.outcome", p.Outcome, "applied", "stale", "duplicate", "unsupported", "error")
 		}
 		msg.Payload = p
+	case MsgInstitutionalCandidateOffer:
+		p := &InstitutionalCandidateOfferPayload{}
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_candidate_offer", []string{"candidate_id", "materialization_kind", "expires_at"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
 	case MsgInstitutionalClaimRequest:
 		p := &InstitutionalClaimRequestPayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_claim_request", []string{"candidate_id", "materialization_kind"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_claim_request", []string{"request_id", "candidate_id", "materialization_kind"}, p)
 		if err == nil {
 			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgInstitutionalClaimResponse:
 		p := &InstitutionalClaimResponsePayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_claim_response", []string{"outcome"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_claim_response", []string{"request_id", "outcome"}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -2162,9 +2208,6 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			fields := []string{"candidate_id", "claim_id", "binding_id", "browser_holder_generation", "lease_until"}
 			if p.Outcome == "claimed" {
 				err = institutionalRequirePresence(payloadFields, "institutional_claim_response", fields...)
-				if err == nil {
-					err = institutionalRejectPresence(payloadFields, "institutional_claim_response", "detail")
-				}
 			} else {
 				err = institutionalRejectPresence(payloadFields, "institutional_claim_response", fields...)
 			}
@@ -2172,14 +2215,14 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgInstitutionalBindRequest:
 		p := &InstitutionalBindRequestPayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_bind_request", []string{"claim_id", "binding_id", "tab_id"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_bind_request", []string{"request_id", "claim_id", "binding_id", "tab_id"}, p)
 		if err == nil {
 			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgInstitutionalBindResponse:
 		p := &InstitutionalBindResponsePayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_bind_response", []string{"outcome"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_bind_response", []string{"request_id", "outcome"}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -2187,9 +2230,6 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			fields := []string{"claim_id", "binding_id"}
 			if p.Outcome == "bound" {
 				err = institutionalRequirePresence(payloadFields, "institutional_bind_response", fields...)
-				if err == nil {
-					err = institutionalRejectPresence(payloadFields, "institutional_bind_response", "detail")
-				}
 			} else {
 				err = institutionalRejectPresence(payloadFields, "institutional_bind_response", fields...)
 			}
@@ -2197,14 +2237,14 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgInstitutionalRouteRequest:
 		p := &InstitutionalRouteRequestPayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_route_request", []string{"claim_id", "binding_id"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_route_request", []string{"request_id", "claim_id", "binding_id"}, p)
 		if err == nil {
 			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgInstitutionalRouteResponse:
 		p := &InstitutionalRouteResponsePayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_route_response", []string{"outcome"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_route_response", []string{"request_id", "outcome"}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -2212,9 +2252,6 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			fields := []string{"claim_id", "binding_id", "route_issuance_ordinal", "url"}
 			if p.Outcome == "issued" {
 				err = institutionalRequirePresence(payloadFields, "institutional_route_response", fields...)
-				if err == nil {
-					err = institutionalRejectPresence(payloadFields, "institutional_route_response", "detail")
-				}
 			} else {
 				err = institutionalRejectPresence(payloadFields, "institutional_route_response", fields...)
 			}
@@ -2222,14 +2259,14 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgInstitutionalNavigatedRequest:
 		p := &InstitutionalNavigatedRequestPayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_navigated_request", []string{"claim_id", "binding_id", "route_issuance_ordinal", "tab_id"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_navigated_request", []string{"request_id", "claim_id", "binding_id", "route_issuance_ordinal", "tab_id"}, p)
 		if err == nil {
 			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgInstitutionalNavigatedResponse:
 		p := &InstitutionalNavigatedResponsePayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_navigated_response", []string{"outcome"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_navigated_response", []string{"request_id", "outcome"}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -2237,9 +2274,6 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			fields := []string{"claim_id", "binding_id"}
 			if p.Outcome == "acknowledged" {
 				err = institutionalRequirePresence(payloadFields, "institutional_navigated_response", fields...)
-				if err == nil {
-					err = institutionalRejectPresence(payloadFields, "institutional_navigated_response", "detail")
-				}
 			} else {
 				err = institutionalRejectPresence(payloadFields, "institutional_navigated_response", fields...)
 			}
@@ -2247,23 +2281,19 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgInstitutionalReconcileRequest:
 		p := &InstitutionalReconcileRequestPayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_reconcile_request", []string{"bindings"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_reconcile_request", []string{"request_id", "bindings"}, p)
 		if err == nil {
 			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgInstitutionalReconcileResponse:
 		p := &InstitutionalReconcileResponsePayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_reconcile_response", []string{"outcome"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_reconcile_response", []string{"request_id", "outcome"}, p)
 		if err == nil {
 			err = p.validate()
 		}
-		if err == nil {
-			if p.Outcome == "reconciled" {
-				err = institutionalRejectPresence(payloadFields, "institutional_reconcile_response", "detail")
-			} else {
-				err = institutionalRejectPresence(payloadFields, "institutional_reconcile_response", "claims")
-			}
+		if err == nil && p.Outcome != "reconciled" {
+			err = institutionalRejectPresence(payloadFields, "institutional_reconcile_response", "claims")
 		}
 		msg.Payload = p
 	case MsgError:
@@ -3171,6 +3201,12 @@ func institutionalID(what, value string) error {
 	}
 	return nil
 }
+func institutionalRequestID(what, value string) error {
+	if !requestIDRE.MatchString(value) {
+		return fmt.Errorf("%s must be a bounded request_id (8..128 chars)", what)
+	}
+	return nil
+}
 
 func institutionalOutcome(what, value string, allowed ...string) error {
 	return enumRequired(what, value, allowed...)
@@ -3189,14 +3225,29 @@ func institutionalTabID(what string, value int64) error {
 	}
 	return nil
 }
+func (p *InstitutionalCandidateOfferPayload) validate() error {
+	if err := institutionalID("institutional_candidate_offer.candidate_id", p.CandidateID); err != nil {
+		return err
+	}
+	if err := enumRequired("institutional_candidate_offer.materialization_kind", p.MaterializationKind, "browser_tab"); err != nil {
+		return err
+	}
+	return validateTriageTime("institutional_candidate_offer.expires_at", p.ExpiresAt)
+}
 
 func (p *InstitutionalClaimRequestPayload) validate() error {
+	if err := institutionalRequestID("institutional_claim_request.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if err := institutionalID("institutional_claim_request.candidate_id", p.CandidateID); err != nil {
 		return err
 	}
 	return enumRequired("institutional_claim_request.materialization_kind", p.MaterializationKind, "browser_tab", "direct_download")
 }
 func (p *InstitutionalClaimResponsePayload) validate() error {
+	if err := institutionalRequestID("institutional_claim_response.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if err := institutionalOutcome("institutional_claim_response.outcome", p.Outcome,
 		"feature_disabled", "claimed", "stale", "not_eligible", "busy", "error"); err != nil {
 		return err
@@ -3228,6 +3279,9 @@ func (p *InstitutionalClaimResponsePayload) validate() error {
 	return nil
 }
 func (p *InstitutionalBindRequestPayload) validate() error {
+	if err := institutionalRequestID("institutional_bind_request.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if err := institutionalID("institutional_bind_request.claim_id", p.ClaimID); err != nil {
 		return err
 	}
@@ -3237,6 +3291,9 @@ func (p *InstitutionalBindRequestPayload) validate() error {
 	return institutionalTabID("institutional_bind_request.tab_id", p.TabID)
 }
 func (p *InstitutionalBindResponsePayload) validate() error {
+	if err := institutionalRequestID("institutional_bind_response.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if err := institutionalOutcome("institutional_bind_response.outcome", p.Outcome,
 		"feature_disabled", "bound", "stale", "not_eligible", "error"); err != nil {
 		return err
@@ -3259,12 +3316,18 @@ func (p *InstitutionalBindResponsePayload) validate() error {
 	return nil
 }
 func (p *InstitutionalRouteRequestPayload) validate() error {
+	if err := institutionalRequestID("institutional_route_request.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if err := institutionalID("institutional_route_request.claim_id", p.ClaimID); err != nil {
 		return err
 	}
 	return institutionalID("institutional_route_request.binding_id", p.BindingID)
 }
 func (p *InstitutionalRouteResponsePayload) validate() error {
+	if err := institutionalRequestID("institutional_route_response.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if err := institutionalOutcome("institutional_route_response.outcome", p.Outcome,
 		"feature_disabled", "issued", "stale", "not_eligible", "busy", "error"); err != nil {
 		return err
@@ -3296,6 +3359,9 @@ func (p *InstitutionalRouteResponsePayload) validate() error {
 	return nil
 }
 func (p *InstitutionalNavigatedRequestPayload) validate() error {
+	if err := institutionalRequestID("institutional_navigated_request.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if err := institutionalID("institutional_navigated_request.claim_id", p.ClaimID); err != nil {
 		return err
 	}
@@ -3308,6 +3374,9 @@ func (p *InstitutionalNavigatedRequestPayload) validate() error {
 	return institutionalTabID("institutional_navigated_request.tab_id", p.TabID)
 }
 func (p *InstitutionalNavigatedResponsePayload) validate() error {
+	if err := institutionalRequestID("institutional_navigated_response.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if err := institutionalOutcome("institutional_navigated_response.outcome", p.Outcome,
 		"feature_disabled", "acknowledged", "stale", "not_eligible", "error"); err != nil {
 		return err
@@ -3330,6 +3399,9 @@ func (p *InstitutionalNavigatedResponsePayload) validate() error {
 	return nil
 }
 func (p *InstitutionalReconcileRequestPayload) validate() error {
+	if err := institutionalRequestID("institutional_reconcile_request.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if len(p.Bindings) > 32 {
 		return fmt.Errorf("institutional_reconcile_request.bindings capped at 32")
 	}
@@ -3349,6 +3421,9 @@ func (p *InstitutionalReconcileRequestPayload) validate() error {
 	return nil
 }
 func (p *InstitutionalReconcileResponsePayload) validate() error {
+	if err := institutionalRequestID("institutional_reconcile_response.request_id", p.RequestID); err != nil {
+		return err
+	}
 	if err := institutionalOutcome("institutional_reconcile_response.outcome", p.Outcome,
 		"feature_disabled", "reconciled", "error"); err != nil {
 		return err

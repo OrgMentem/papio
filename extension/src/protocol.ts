@@ -73,6 +73,7 @@ export type BrowserMessageType =
   | "pdf_grab_status_result"
   | "pdf_grab_abandon_request"
   | "pdf_grab_abandon_result"
+  | "institutional_candidate_offer"
   | "institutional_claim_request"
   | "institutional_claim_response"
   | "institutional_bind_request"
@@ -87,6 +88,7 @@ export type BrowserMessageType =
 export interface HelloPayload {
   extension_version: string;
   adapter_versions?: Record<string, string>;
+  features?: string[];
 }
 
 export interface HelloAckPayload {
@@ -631,12 +633,19 @@ export interface PdfGrabStatusResultPayload {
   job_id?: string;
 }
 
+export interface InstitutionalCandidateOfferPayload {
+  candidate_id: string;
+  materialization_kind: "browser_tab";
+  expires_at: string;
+}
+
 export interface InstitutionalClaimRequestPayload {
+  request_id: string;
   candidate_id: string;
   materialization_kind: "browser_tab" | "direct_download";
 }
-
 export interface InstitutionalClaimResponsePayload {
+  request_id: string;
   outcome: InstitutionalMaterializationOutcome;
   detail?: string;
   candidate_id?: string;
@@ -645,43 +654,43 @@ export interface InstitutionalClaimResponsePayload {
   browser_holder_generation?: number;
   lease_until?: string;
 }
-
 export interface InstitutionalBindRequestPayload {
+  request_id: string;
   claim_id: string;
   binding_id: string;
   tab_id: number;
 }
-
 export interface InstitutionalBindResponsePayload {
+  request_id: string;
   outcome: InstitutionalMaterializationOutcome;
   detail?: string;
   claim_id?: string;
   binding_id?: string;
 }
-
 export interface InstitutionalRouteRequestPayload {
+  request_id: string;
   claim_id: string;
   binding_id: string;
 }
-
 export interface InstitutionalRouteResponsePayload {
   outcome: InstitutionalMaterializationOutcome;
+  request_id: string;
   detail?: string;
   claim_id?: string;
   binding_id?: string;
   route_issuance_ordinal?: number;
   url?: string;
 }
-
 export interface InstitutionalNavigatedRequestPayload {
   claim_id: string;
+  request_id: string;
   binding_id: string;
   route_issuance_ordinal: number;
   tab_id: number;
 }
-
 export interface InstitutionalNavigatedResponsePayload {
   outcome: InstitutionalMaterializationOutcome;
+  request_id: string;
   detail?: string;
   claim_id?: string;
   binding_id?: string;
@@ -699,13 +708,13 @@ export interface InstitutionalClaimStatus {
   phase: "claimed" | "bound" | "route_issued" | "navigated" | "settled" | "abandoned";
   tab_id?: number;
 }
-
 export interface InstitutionalReconcileRequestPayload {
   bindings: InstitutionalBindingPair[];
+  request_id: string;
 }
-
 export interface InstitutionalReconcileResponsePayload {
   outcome: InstitutionalMaterializationOutcome;
+  request_id: string;
   detail?: string;
   claims?: InstitutionalClaimStatus[];
 }
@@ -818,6 +827,7 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   pdf_grab_status_result: true,
   pdf_grab_abandon_request: true,
   pdf_grab_abandon_result: true,
+  institutional_candidate_offer: true,
   institutional_claim_request: true,
   institutional_claim_response: true,
   institutional_bind_request: true,
@@ -849,6 +859,7 @@ const JOB_SCOPED: Record<string, true> = {
   provider_drive_epoch_result: true,
   cancel: true,
   handoff_focus: true,
+  institutional_candidate_offer: true,
   institutional_claim_request: true,
   institutional_claim_response: true,
   institutional_bind_request: true,
@@ -871,6 +882,7 @@ const OUTCOMES: Record<string, true> = {
 };
 
 const MSG_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const CLIENT_FEATURE_RE = /^[a-z0-9_]+$/;
 const JOB_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 // ZOTERO_KEY_RE must stay byte-identical to zoteroKeyRE in
 // internal/protocol/protocol.go.
@@ -1347,7 +1359,11 @@ export function parseBrowserMessageBytes(text: string): BrowserMessage {
 function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): void {
   switch (type) {
     case "hello": {
-      requireFields<HelloPayload>(p, "hello", { extension_version: "required", adapter_versions: "optional" });
+      requireFields<HelloPayload>(p, "hello", {
+        extension_version: "required",
+        adapter_versions: "optional",
+        features: "optional",
+      });
       const v = str(p, "extension_version", "hello", 50);
       if (v.length === 0) fail("hello.extension_version required");
       if ("adapter_versions" in p) {
@@ -1359,6 +1375,19 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
           if (typeof value !== "string" || Array.from(value).length > 50) {
             fail(`hello.adapter_versions.${k} must be a short string`);
           }
+        }
+      }
+      if ("features" in p) {
+        const rawFeatures = p["features"];
+        if (!Array.isArray(rawFeatures)) fail("hello.features must be an array");
+        if (rawFeatures.length > 32) fail("hello.features capped at 32");
+        const seen = new Set<string>();
+        for (const rawFeature of rawFeatures) {
+          if (typeof rawFeature !== "string" || Array.from(rawFeature).length < 1 || Array.from(rawFeature).length > 64 || !CLIENT_FEATURE_RE.test(rawFeature)) {
+            fail("hello.features entries must match [a-z0-9_]{1,64}");
+          }
+          if (seen.has(rawFeature)) fail(`hello.features contains duplicate ${JSON.stringify(rawFeature)}`);
+          seen.add(rawFeature);
         }
       }
       break;
@@ -2408,18 +2437,32 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       }
       break;
     }
+    case "institutional_candidate_offer": {
+      requireFields<InstitutionalCandidateOfferPayload>(p, type, {
+        candidate_id: "required",
+        materialization_kind: "required",
+        expires_at: "required",
+      });
+      institutionalID(p, "candidate_id", type);
+      if (str(p, "materialization_kind", type, 32) !== "browser_tab") fail(`${type}.materialization_kind is invalid`);
+      triageTime(p, "expires_at", type);
+      break;
+    }
     case "institutional_claim_request": {
       requireFields<InstitutionalClaimRequestPayload>(p, type, {
+        request_id: "required",
         candidate_id: "required",
         materialization_kind: "required",
       });
       institutionalID(p, "candidate_id", type);
+      institutionalID(p, "request_id", type);
       const kind = str(p, "materialization_kind", type, 32);
       if (kind !== "browser_tab" && kind !== "direct_download") fail(`${type}.materialization_kind is invalid`);
       break;
     }
     case "institutional_claim_response": {
       requireFields<InstitutionalClaimResponsePayload>(p, type, {
+        request_id: "required",
         outcome: "required",
         detail: "optional",
         candidate_id: "optional",
@@ -2429,6 +2472,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         lease_until: "optional",
       });
       const outcome = institutionalOutcome(p, type);
+      institutionalID(p, "request_id", type);
       institutionalOutcomeOneOf(outcome, type, ["feature_disabled", "claimed", "stale", "not_eligible", "busy", "error"]);
       if (outcome === "claimed") {
         for (const key of ["candidate_id", "claim_id", "binding_id"]) institutionalID(p, key, type);
@@ -2444,15 +2488,17 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "institutional_bind_request": {
-      requireFields<InstitutionalBindRequestPayload>(p, type, { claim_id: "required", binding_id: "required", tab_id: "required" });
+      requireFields<InstitutionalBindRequestPayload>(p, type, { request_id: "required", claim_id: "required", binding_id: "required", tab_id: "required" });
       institutionalID(p, "claim_id", type);
+      institutionalID(p, "request_id", type);
       institutionalID(p, "binding_id", type);
       institutionalTabID(p, "tab_id", type);
       break;
     }
     case "institutional_bind_response": {
-      requireFields<InstitutionalBindResponsePayload>(p, type, { outcome: "required", detail: "optional", claim_id: "optional", binding_id: "optional" });
+      requireFields<InstitutionalBindResponsePayload>(p, type, { request_id: "required", outcome: "required", detail: "optional", claim_id: "optional", binding_id: "optional" });
       const outcome = institutionalOutcome(p, type);
+      institutionalID(p, "request_id", type);
       institutionalOutcomeOneOf(outcome, type, ["feature_disabled", "bound", "stale", "not_eligible", "error"]);
       if (outcome === "bound") {
         institutionalID(p, "claim_id", type);
@@ -2465,13 +2511,15 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "institutional_route_request": {
-      requireFields<InstitutionalRouteRequestPayload>(p, type, { claim_id: "required", binding_id: "required" });
+      requireFields<InstitutionalRouteRequestPayload>(p, type, { request_id: "required", claim_id: "required", binding_id: "required" });
       institutionalID(p, "claim_id", type);
+      institutionalID(p, "request_id", type);
       institutionalID(p, "binding_id", type);
       break;
     }
     case "institutional_route_response": {
       requireFields<InstitutionalRouteResponsePayload>(p, type, {
+        request_id: "required",
         outcome: "required",
         detail: "optional",
         claim_id: "optional",
@@ -2481,6 +2529,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       });
       const outcome = institutionalOutcome(p, type);
       institutionalOutcomeOneOf(outcome, type, ["feature_disabled", "issued", "stale", "not_eligible", "busy", "error"]);
+      institutionalID(p, "request_id", type);
       if (outcome === "issued") {
         institutionalID(p, "claim_id", type);
         institutionalID(p, "binding_id", type);
@@ -2497,6 +2546,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
     }
     case "institutional_navigated_request": {
       requireFields<InstitutionalNavigatedRequestPayload>(p, type, {
+        request_id: "required",
         claim_id: "required",
         binding_id: "required",
         route_issuance_ordinal: "required",
@@ -2506,11 +2556,13 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       institutionalID(p, "binding_id", type);
       int(p, "route_issuance_ordinal", type, 0);
       institutionalTabID(p, "tab_id", type);
+      institutionalID(p, "request_id", type);
       break;
     }
     case "institutional_navigated_response": {
-      requireFields<InstitutionalNavigatedResponsePayload>(p, type, { outcome: "required", detail: "optional", claim_id: "optional", binding_id: "optional" });
+      requireFields<InstitutionalNavigatedResponsePayload>(p, type, { request_id: "required", outcome: "required", detail: "optional", claim_id: "optional", binding_id: "optional" });
       const outcome = institutionalOutcome(p, type);
+      institutionalID(p, "request_id", type);
       institutionalOutcomeOneOf(outcome, type, ["feature_disabled", "acknowledged", "stale", "not_eligible", "error"]);
       if (outcome === "acknowledged") {
         institutionalID(p, "claim_id", type);
@@ -2523,8 +2575,9 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "institutional_reconcile_request": {
-      requireFields<InstitutionalReconcileRequestPayload>(p, type, { bindings: "required" });
+      requireFields<InstitutionalReconcileRequestPayload>(p, type, { request_id: "required", bindings: "required" });
       const bindings = p["bindings"];
+      institutionalID(p, "request_id", type);
       if (!Array.isArray(bindings) || bindings.length > 32) fail(`${type}.bindings must have at most 32 entries`);
       const seen = new Set<string>();
       for (const rawBinding of bindings) {
@@ -2538,8 +2591,9 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       break;
     }
     case "institutional_reconcile_response": {
-      requireFields<InstitutionalReconcileResponsePayload>(p, type, { outcome: "required", detail: "optional", claims: "optional" });
+      requireFields<InstitutionalReconcileResponsePayload>(p, type, { request_id: "required", outcome: "required", detail: "optional", claims: "optional" });
       const outcome = institutionalOutcome(p, type);
+      institutionalID(p, "request_id", type);
       institutionalOutcomeOneOf(outcome, type, ["feature_disabled", "reconciled", "error"]);
       if (outcome === "reconciled") {
         if ("detail" in p) fail(`${type}.reconciled must not carry detail`);

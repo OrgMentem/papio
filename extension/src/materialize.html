@@ -1,0 +1,27 @@
+<!doctype html>
+<!-- Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>papio — materialization</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font: 16px/1.5 system-ui, sans-serif;
+      }
+
+      body {
+        margin: 2rem;
+      }
+
+      #materialize-status {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <output id="materialize-status" role="status" data-state="invalid">Invalid materialization binding</output>
+    <script src="./materialize.js" type="module"></script>
+  </body>
+</html>

@@ -470,6 +470,33 @@ test("hello_ack accepts optional daemon details and rejects invalid members", ()
   }
 });
 
+test("hello features are optional but strict, unique, and bounded", () => {
+  const frame = (payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type: "hello",
+    msg_id: "client-hello-1",
+    seq: 0,
+    payload,
+  });
+  expect(parseBrowserMessage(frame({
+    extension_version: "0.14.0",
+    features: ["institutional_materialization_v1", "future_capability"],
+  })).payload["features"]).toEqual(["institutional_materialization_v1", "future_capability"]);
+  expect(parseBrowserMessage(frame({ extension_version: "0.14.0" })).payload).toEqual({
+    extension_version: "0.14.0",
+  });
+  expect(() => parseBrowserMessage(frame({ extension_version: "0.14.0", unknown: true }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(frame({
+    extension_version: "0.14.0",
+    features: ["future_capability", "future_capability"],
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(frame({ extension_version: "0.14.0", features: ["Future"] }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(frame({
+    extension_version: "0.14.0",
+    features: Array.from({ length: 33 }, (_, i) => `future_${i}`),
+  }))).toThrow(ProtocolError);
+});
+
 test("page_acquire messages parse strictly", () => {
   const frame = (type: "page_acquire" | "page_acquire_ack", payload: Record<string, unknown>) => ({
     protocol: "papio-browser/1",
@@ -793,7 +820,7 @@ test("institutional materialization families are strict, bounded, and job-scoped
     msg_id: "msg-inst-001",
     seq: 1,
     ...(job === "" ? {} : { job_id: job }),
-    payload,
+    payload: { request_id: "request-inst-001", ...payload },
   });
   const ids = { candidate_id: "candidate-001", claim_id: "claim-001", binding_id: "binding-001" };
   const valid: Array<readonly [InstitutionalMessageType, Record<string, unknown>, string]> = [
@@ -862,4 +889,43 @@ test("institutional materialization families are strict, bounded, and job-scoped
   expect(() => parseBrowserMessage(envelope(
     "institutional_bind_request", { claim_id: ids.claim_id, binding_id: ids.binding_id, tab_id: -1 }, "job-inst-001",
   ))).toThrow(ProtocolError);
+  const missingRequestID = envelope("institutional_claim_request", {
+    candidate_id: ids.candidate_id,
+    materialization_kind: "browser_tab",
+  });
+  delete (missingRequestID.payload as Record<string, unknown>).request_id;
+  expect(() => parseBrowserMessage(missingRequestID)).toThrow(ProtocolError);
+});
+
+test("institutional_candidate_offer is URL-free, browser-tab-only, job-scoped, and bounded", () => {
+  const envelope = (payload: Record<string, unknown>, job?: string) => ({
+    protocol: "papio-browser/1",
+    type: "institutional_candidate_offer",
+    msg_id: "candidate-offer-001",
+    seq: 1,
+    ...(job === undefined ? { job_id: "job-inst-001" } : job === "" ? {} : { job_id: job }),
+    payload,
+  });
+  const valid = {
+    candidate_id: "candidate-001",
+    materialization_kind: "browser_tab",
+    expires_at: "2026-08-11T12:00:00Z",
+  };
+  expect(parseBrowserMessage(envelope(valid)).payload).toEqual(valid);
+  expect(parseBrowserMessage(envelope(valid, "job-inst-001")).type).toBe("institutional_candidate_offer");
+
+  for (const payload of [
+    { ...valid, url: "https://resolver.example.edu/open" },
+    { ...valid, materialization_kind: "direct_download" },
+    { ...valid, candidate_id: "short" },
+    { ...valid, candidate_id: "x".repeat(129) },
+    { ...valid, expires_at: "not-a-time" },
+  ]) {
+    expect(() => parseBrowserMessage(envelope(payload))).toThrow(ProtocolError);
+  }
+  expect(() => parseBrowserMessage(envelope(valid, ""))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(envelope({ ...valid, extra: true }))).toThrow(ProtocolError);
+
+  const oversized = JSON.stringify(envelope({ ...valid, extra: "x".repeat(MAX_BROWSER_MESSAGE_BYTES) }));
+  expect(() => parseBrowserMessageBytes(oversized)).toThrow(/exceeds cap/);
 });

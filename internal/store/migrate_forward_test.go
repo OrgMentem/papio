@@ -55,8 +55,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 26 {
-		t.Fatalf("user_version = %d, %v; want 26", version, err)
+	if err != nil || version != 27 {
+		t.Fatalf("user_version = %d, %v; want 27", version, err)
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
 
@@ -122,8 +122,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 26 {
-		t.Fatalf("user_version = %d, %v; want 26", version, err)
+	if err != nil || version != 27 {
+		t.Fatalf("user_version = %d, %v; want 27", version, err)
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
 
@@ -223,6 +223,7 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 	const tables = `
 		SELECT name FROM sqlite_master
 		WHERE type = 'table' AND name IN (
+			'daemon_authority_key',
 			'institution_profiles',
 			'browser_candidates',
 			'materialization_claims',
@@ -248,6 +249,7 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 		t.Fatalf("iterate institutional materialization tables: %v", err)
 	}
 	for _, name := range []string{
+		"daemon_authority_key",
 		"institution_profiles",
 		"browser_candidates",
 		"materialization_claims",

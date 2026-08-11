@@ -22,6 +22,90 @@ var (
 	ErrMaterializationBusy     = errors.New("materialization claim busy")
 )
 
+// InstitutionAuthorityKey returns the singleton daemon-private HMAC key,
+// creating it transactionally on first use. The key is returned only to
+// daemon code that derives opaque authority identities; it is never serialized
+// into protocol, event, diagnostic, or configuration data.
+func (js *Store) InstitutionAuthorityKey(ctx context.Context) ([]byte, error) {
+	var generated [32]byte
+	if _, err := rand.Read(generated[:]); err != nil {
+		return nil, err
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// INSERT OR IGNORE is deliberately the first statement: concurrent
+	// processes cannot hold a stale read snapshot while upgrading to a writer.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO daemon_authority_key(singleton, hmac_key, created_at)
+		VALUES (1, ?, ?)`, generated[:], store.Now()); err != nil {
+		return nil, err
+	}
+	var key []byte
+	if err := tx.QueryRowContext(ctx,
+		`SELECT hmac_key FROM daemon_authority_key WHERE singleton=1`,
+	).Scan(&key); err != nil {
+		return nil, err
+	}
+	if len(key) != 32 {
+		return nil, errors.New("invalid daemon authority key length")
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), key...), nil
+}
+
+// NextMaterializationHolderGeneration allocates the next daemon holder
+// generation transactionally. The durable counter prevents a daemon restart
+// from reusing a live claim's generation.
+func (js *Store) NextMaterializationHolderGeneration(ctx context.Context) (int64, error) {
+	const maxGeneration int64 = 1<<53 - 1
+	var generated [32]byte
+	if _, err := rand.Read(generated[:]); err != nil {
+		return 0, err
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO daemon_authority_key(singleton, hmac_key, created_at)
+		VALUES (1, ?, ?)`, generated[:], store.Now()); err != nil {
+		return 0, err
+	}
+	update, err := tx.ExecContext(ctx, `
+		UPDATE daemon_authority_key SET holder_generation = holder_generation + 1
+		WHERE singleton=1 AND holder_generation < ?`, maxGeneration)
+	if err != nil {
+		return 0, err
+	}
+	changed, err := update.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if changed != 1 {
+		return 0, errors.New("daemon holder generation exhausted")
+	}
+	var generation int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT holder_generation FROM daemon_authority_key WHERE singleton=1`,
+	).Scan(&generation); err != nil {
+		return 0, err
+	}
+	if generation < 1 || generation > maxGeneration {
+		return 0, errors.New("daemon holder generation exhausted")
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return generation, nil
+}
+
 // InstitutionProfileSpec is the daemon-computed authority for one configured
 // institution. AuthenticationClaimID is opaque and is supplied by the daemon's
 // identity reconciler; it is never derived from a provider/entity identifier.
@@ -177,6 +261,27 @@ func (js *Store) GetInstitutionProfile(ctx context.Context, id string) (*Institu
 	return &p, nil
 }
 
+// InstitutionProfileByConfiguredName returns the current active profile with
+// the exact configured name. Tombstoned profiles are intentionally invisible
+// to operational callers.
+func (js *Store) InstitutionProfileByConfiguredName(ctx context.Context, configuredName string) (*InstitutionProfile, error) {
+	var p InstitutionProfile
+	err := js.S.DB().QueryRowContext(ctx, `
+		SELECT id, configured_name, revision, authority_digest,
+		       authentication_claim_id, COALESCE(tombstoned_at,''), created_at, updated_at
+		  FROM institution_profiles
+		 WHERE configured_name=? AND tombstoned_at IS NULL`, configuredName).Scan(
+		&p.ID, &p.ConfiguredName, &p.Revision, &p.AuthorityDigest,
+		&p.AuthenticationClaimID, &p.TombstonedAt, &p.CreatedAt, &p.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
 // ListInstitutionProfiles returns active profiles unless includeTombstoned is
 // true. Results are deterministic by configured name then opaque ID.
 func (js *Store) ListInstitutionProfiles(ctx context.Context, includeTombstoned bool) ([]InstitutionProfile, error) {
@@ -313,6 +418,76 @@ func (js *Store) GetBrowserCandidate(ctx context.Context, id string) (*BrowserCa
 	return c, err
 }
 
+// EligibleBrowserCandidateForJob returns the oldest current eligible
+// institutional candidate for the specified job attempt.
+func (js *Store) EligibleBrowserCandidateForJob(ctx context.Context, jobID string, attemptRevision int64) (*BrowserCandidate, error) {
+	if strings.TrimSpace(jobID) == "" || attemptRevision < 1 {
+		return nil, nil
+	}
+	c, err := scanBrowserCandidate(js.S.DB().QueryRowContext(ctx, `SELECT browser_candidates.id, browser_candidates.job_id,
+		browser_candidates.job_attempt_revision, browser_candidates.institution_profile_id,
+		browser_candidates.institution_profile_revision, browser_candidates.route_revision,
+		browser_candidates.route_class, browser_candidates.identifier_strategy,
+		browser_candidates.pre_route_safety_key, browser_candidates.safety_domain_id,
+		browser_candidates.adapter_revision, browser_candidates.effect_contract_id,
+		browser_candidates.status, browser_candidates.created_at, browser_candidates.updated_at
+		FROM browser_candidates
+		JOIN institution_profiles p ON p.id=browser_candidates.institution_profile_id
+		WHERE browser_candidates.job_id=? AND browser_candidates.job_attempt_revision=?
+		  AND browser_candidates.status='eligible'
+		  AND p.tombstoned_at IS NULL
+		  AND p.revision=browser_candidates.institution_profile_revision
+		ORDER BY browser_candidates.created_at, browser_candidates.id LIMIT 1`,
+		jobID, attemptRevision))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return c, err
+}
+
+// CurrentBrowserCandidateForJob returns the oldest nonterminal current
+// candidate, including one already claimed by an in-flight materialization.
+func (js *Store) CurrentBrowserCandidateForJob(ctx context.Context, jobID string, attemptRevision int64) (*BrowserCandidate, error) {
+	if strings.TrimSpace(jobID) == "" || attemptRevision < 1 {
+		return nil, nil
+	}
+	c, err := scanBrowserCandidate(js.S.DB().QueryRowContext(ctx, `SELECT browser_candidates.id, browser_candidates.job_id,
+		browser_candidates.job_attempt_revision, browser_candidates.institution_profile_id,
+		browser_candidates.institution_profile_revision, browser_candidates.route_revision,
+		browser_candidates.route_class, browser_candidates.identifier_strategy,
+		browser_candidates.pre_route_safety_key, browser_candidates.safety_domain_id,
+		browser_candidates.adapter_revision, browser_candidates.effect_contract_id,
+		browser_candidates.status, browser_candidates.created_at, browser_candidates.updated_at
+		FROM browser_candidates
+		JOIN institution_profiles p ON p.id=browser_candidates.institution_profile_id
+		WHERE browser_candidates.job_id=? AND browser_candidates.job_attempt_revision=?
+		  AND browser_candidates.status IN ('eligible','claimed','materializing')
+		  AND p.tombstoned_at IS NULL
+		  AND p.revision=browser_candidates.institution_profile_revision
+		ORDER BY browser_candidates.created_at, browser_candidates.id LIMIT 1`,
+		jobID, attemptRevision))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return c, err
+}
+
+// MaterializationAttemptRevision returns the explicit retry decision epoch
+// for a job. A retry_requested event starts the next materialization attempt;
+// ordinary transitions do not.
+func (js *Store) MaterializationAttemptRevision(ctx context.Context, jobID string) (int64, error) {
+	if strings.TrimSpace(jobID) == "" {
+		return 0, nil
+	}
+	var retries int64
+	if err := js.S.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events WHERE job_id=? AND kind='job.retry_requested'`,
+		jobID).Scan(&retries); err != nil {
+		return 0, err
+	}
+	return retries + 1, nil
+}
+
 // SetBrowserCandidateStatus performs a status CAS; immutable authority columns
 // are never included in this update.
 func (js *Store) SetBrowserCandidateStatus(ctx context.Context, id, expectedStatus, nextStatus string) error {
@@ -339,6 +514,7 @@ type MaterializationClaim struct {
 	BrowserHolderGeneration int64
 	MaterializationKind     string
 	BindingID               string
+	TabID                   int64
 	Phase                   string
 	RouteIssuanceOrdinal    int64
 	EffectOrdinal           int64
@@ -361,14 +537,14 @@ type MaterializationClaimInput struct {
 func claimScan(s interface{ Scan(...any) error }) (*MaterializationClaim, error) {
 	var c MaterializationClaim
 	if err := s.Scan(&c.ID, &c.CandidateID, &c.BrowserHolderGeneration, &c.MaterializationKind,
-		&c.BindingID, &c.Phase, &c.RouteIssuanceOrdinal, &c.EffectOrdinal, &c.LeaseUntil, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		&c.BindingID, &c.TabID, &c.Phase, &c.RouteIssuanceOrdinal, &c.EffectOrdinal, &c.LeaseUntil, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
 const claimSelect = `SELECT id, candidate_id, browser_holder_generation, materialization_kind,
-	COALESCE(binding_id,''), phase, route_issuance_ordinal, effect_ordinal,
+	COALESCE(binding_id,''), tab_id, phase, route_issuance_ordinal, effect_ordinal,
 	COALESCE(lease_until,''), created_at, updated_at FROM materialization_claims`
 
 func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationClaimInput) (*MaterializationClaim, error) {
@@ -407,7 +583,11 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 		FROM browser_candidates c
 		JOIN institution_profiles p ON p.id=c.institution_profile_id
 		WHERE c.id=? AND p.tombstoned_at IS NULL
-		  AND p.revision=c.institution_profile_revision`, in.CandidateID).
+		  AND p.revision=c.institution_profile_revision
+		  AND c.job_attempt_revision = 1 + (
+			SELECT COUNT(*) FROM events e
+			 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+		  )`, in.CandidateID).
 		Scan(&jobRev, &profileRev, &routeRev, &candidateStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrMaterializationStale
@@ -461,9 +641,9 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 		return nil, ErrMaterializationConflict
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO materialization_claims
-		(id, candidate_id, browser_holder_generation, materialization_kind, binding_id, phase,
+		(id, candidate_id, browser_holder_generation, materialization_kind, binding_id, tab_id, phase,
 		 route_issuance_ordinal, effect_ordinal, lease_until, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 'claimed', 0, 0, ?, ?, ?)`, claimID, in.CandidateID,
+		VALUES (?, ?, ?, ?, ?, 0, 'claimed', 0, 0, ?, ?, ?)`, claimID, in.CandidateID,
 		in.BrowserHolderGeneration, in.MaterializationKind, bindingID, in.LeaseUntil.UTC().Format(time.RFC3339Nano), now, now); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return nil, ErrMaterializationBusy
@@ -487,16 +667,29 @@ func (js *Store) GetMaterializationClaim(ctx context.Context, id string) (*Mater
 	return c, err
 }
 
+// MaterializationClaimByBindingID resolves the daemon claim owning a physical
+// scaffold binding. Binding IDs are unique across claim history.
+func (js *Store) MaterializationClaimByBindingID(ctx context.Context, bindingID string) (*MaterializationClaim, error) {
+	if strings.TrimSpace(bindingID) == "" {
+		return nil, nil
+	}
+	c, err := claimScan(js.S.DB().QueryRowContext(ctx, claimSelect+` WHERE binding_id=?`, bindingID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return c, err
+}
+
 // BindMaterialization acknowledges the physical resource for a claim. Binding
-// IDs are minted at claim creation and this operation only acknowledges that
-// exact binding under the holder/profile fence.
-func (js *Store) BindMaterialization(ctx context.Context, claimID, bindingID string, holderGeneration, profileRevision int64) error {
-	if claimID == "" || bindingID == "" {
-		return errors.New("materialization binding requires claim and binding ID")
+// IDs are minted at claim creation. A live claim may replace its tab while
+// bound or route_issued; navigated and settled tab fences are immutable.
+func (js *Store) BindMaterialization(ctx context.Context, claimID, bindingID string, holderGeneration, profileRevision, tabID int64) error {
+	if claimID == "" || bindingID == "" || tabID < 0 {
+		return errors.New("materialization binding requires claim, binding ID, and nonnegative tab ID")
 	}
 	now := store.Now()
 	res, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims
-		SET phase='bound', updated_at=?
+		SET phase='bound', tab_id=?, updated_at=?
 		WHERE id=? AND binding_id=? AND browser_holder_generation=? AND phase='claimed'
 		  AND (lease_until IS NULL OR lease_until > ?)
 		  AND EXISTS (
@@ -506,8 +699,12 @@ func (js *Store) BindMaterialization(ctx context.Context, claimID, bindingID str
 			  AND c.institution_profile_revision=?
 			  AND p.tombstoned_at IS NULL
 			  AND p.revision=c.institution_profile_revision
+			  AND c.job_attempt_revision = 1 + (
+				SELECT COUNT(*) FROM events e
+				 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+			  )
 		  )`,
-		now, claimID, bindingID, holderGeneration, now, profileRevision)
+		tabID, now, claimID, bindingID, holderGeneration, now, profileRevision)
 	if err != nil {
 		return err
 	}
@@ -518,16 +715,47 @@ func (js *Store) BindMaterialization(ctx context.Context, claimID, bindingID str
 	if n == 1 {
 		return nil
 	}
+
+	// A live scaffold can disappear before navigation. Allow the same
+	// holder/profile to rebind a bound or route-issued claim to its replacement
+	// tab without changing its route phase or issuance ordinal.
+	res, err = js.S.DB().ExecContext(ctx, `UPDATE materialization_claims
+		SET tab_id=?, updated_at=?
+		WHERE id=? AND binding_id=? AND browser_holder_generation=? AND phase IN ('bound','route_issued')
+		  AND tab_id<>?
+		  AND (lease_until IS NULL OR lease_until > ?)
+		  AND EXISTS (
+			SELECT 1 FROM browser_candidates c
+			JOIN institution_profiles p ON p.id=c.institution_profile_id
+			WHERE c.id=materialization_claims.candidate_id
+			  AND c.institution_profile_revision=?
+			  AND p.tombstoned_at IS NULL
+			  AND p.revision=c.institution_profile_revision
+			  AND c.job_attempt_revision = 1 + (
+				SELECT COUNT(*) FROM events e
+				 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+			  )
+		  )`,
+		tabID, now, claimID, bindingID, holderGeneration, tabID, now, profileRevision)
+	if err != nil {
+		return err
+	}
+	if n, err = res.RowsAffected(); err != nil {
+		return err
+	} else if n == 1 {
+		return nil
+	}
+
 	var present int
 	err = js.S.DB().QueryRowContext(ctx, `SELECT 1
 		FROM materialization_claims m
 		JOIN browser_candidates c ON c.id=m.candidate_id
 		JOIN institution_profiles p ON p.id=c.institution_profile_id
-		WHERE m.id=? AND m.binding_id=? AND m.browser_holder_generation=? AND m.phase='bound'
-		  AND c.institution_profile_revision=? AND p.tombstoned_at IS NULL
+		WHERE m.id=? AND m.binding_id=? AND m.browser_holder_generation=? AND m.phase IN ('bound','route_issued')
+		  AND m.tab_id=? AND c.institution_profile_revision=? AND p.tombstoned_at IS NULL
 		  AND p.revision=c.institution_profile_revision
 		  AND (m.lease_until IS NULL OR m.lease_until > ?)`,
-		claimID, bindingID, holderGeneration, profileRevision, now).Scan(&present)
+		claimID, bindingID, holderGeneration, tabID, profileRevision, now).Scan(&present)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrMaterializationStale
 	}
@@ -537,9 +765,13 @@ func (js *Store) BindMaterialization(ctx context.Context, claimID, bindingID str
 	return nil
 }
 
-// IssueMaterializationRoute advances the route issuance ordinal without
-// persisting route bytes. expectedOrdinal is the last ordinal observed by the
-// caller; the returned value is the newly issued ordinal.
+// IssueMaterializationRoute advances the route issuance ordinal for a newly
+// bound claim and replays the existing ordinal for an already issued or
+// navigated claim. In both cases the candidate's snapshotted institution
+// profile revision must still be the active revision of the same profile.
+// Routes are intentionally not represented; only their issuance ordinal is
+// durable. expectedOrdinal is the last ordinal observed by the caller; the
+// returned value is the newly issued or replayed ordinal.
 func (js *Store) IssueMaterializationRoute(ctx context.Context, claimID, bindingID string, holderGeneration, expectedOrdinal int64) (int64, error) {
 	now := store.Now()
 	tx, err := js.S.DB().BeginTx(ctx, nil)
@@ -547,10 +779,11 @@ func (js *Store) IssueMaterializationRoute(ctx context.Context, claimID, binding
 		return 0, err
 	}
 	defer tx.Rollback()
+
 	res, err := tx.ExecContext(ctx, `UPDATE materialization_claims
 		SET phase='route_issued', route_issuance_ordinal=route_issuance_ordinal+1, updated_at=?
 		WHERE id=? AND binding_id=? AND browser_holder_generation=?
-		  AND phase IN ('bound','route_issued') AND route_issuance_ordinal=?
+		  AND phase='bound' AND route_issuance_ordinal=?
 		  AND (lease_until IS NULL OR lease_until > ?)
 		  AND EXISTS (
 			SELECT 1 FROM browser_candidates c
@@ -558,6 +791,10 @@ func (js *Store) IssueMaterializationRoute(ctx context.Context, claimID, binding
 			WHERE c.id=materialization_claims.candidate_id
 			  AND p.tombstoned_at IS NULL
 			  AND p.revision=c.institution_profile_revision
+			  AND c.job_attempt_revision = 1 + (
+				SELECT COUNT(*) FROM events e
+				 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+			  )
 		  )`, now, claimID, bindingID, holderGeneration, expectedOrdinal, now)
 	if err != nil {
 		return 0, err
@@ -566,11 +803,40 @@ func (js *Store) IssueMaterializationRoute(ctx context.Context, claimID, binding
 	if err != nil {
 		return 0, err
 	}
-	if n != 1 {
+	if n == 1 {
+		var ordinal int64
+		if err := tx.QueryRowContext(ctx, `SELECT route_issuance_ordinal FROM materialization_claims WHERE id=?`, claimID).Scan(&ordinal); err != nil {
+			return 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		return ordinal, nil
+	}
+
+	// A response may have been lost after route issuance committed. Replay is
+	// permitted only for the exact current ordinal and the same active profile
+	// revision; a drift or tombstone therefore cannot leak the old route.
+	var ordinal int64
+	err = tx.QueryRowContext(ctx, `SELECT m.route_issuance_ordinal
+		FROM materialization_claims m
+		JOIN browser_candidates c ON c.id=m.candidate_id
+		JOIN institution_profiles p ON p.id=c.institution_profile_id
+		WHERE m.id=? AND m.binding_id=? AND m.browser_holder_generation=?
+		  AND m.phase IN ('route_issued','navigated')
+		  AND m.route_issuance_ordinal=?
+		  AND (m.lease_until IS NULL OR m.lease_until > ?)
+		  AND p.tombstoned_at IS NULL
+		  AND p.revision=c.institution_profile_revision
+		  AND c.job_attempt_revision = 1 + (
+			SELECT COUNT(*) FROM events e
+			 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+		  )`, claimID, bindingID,
+		holderGeneration, expectedOrdinal, now).Scan(&ordinal)
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, ErrMaterializationStale
 	}
-	var ordinal int64
-	if err := tx.QueryRowContext(ctx, `SELECT route_issuance_ordinal FROM materialization_claims WHERE id=?`, claimID).Scan(&ordinal); err != nil {
+	if err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -579,18 +845,25 @@ func (js *Store) IssueMaterializationRoute(ctx context.Context, claimID, binding
 	return ordinal, nil
 }
 
-func (js *Store) AcknowledgeMaterializationNavigation(ctx context.Context, claimID, bindingID string, holderGeneration, routeOrdinal int64) error {
+func (js *Store) AcknowledgeMaterializationNavigation(ctx context.Context, claimID, bindingID string, holderGeneration, routeOrdinal, tabID int64) error {
+	if tabID < 0 {
+		return ErrMaterializationStale
+	}
 	now := store.Now()
 	res, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims SET phase='navigated', updated_at=?
 		WHERE id=? AND binding_id=? AND browser_holder_generation=? AND route_issuance_ordinal=?
-		  AND phase IN ('route_issued','navigated') AND (lease_until IS NULL OR lease_until > ?)
+		  AND tab_id=? AND phase IN ('route_issued','navigated') AND (lease_until IS NULL OR lease_until > ?)
 		  AND EXISTS (
 			SELECT 1 FROM browser_candidates c
 			JOIN institution_profiles p ON p.id=c.institution_profile_id
 			WHERE c.id=materialization_claims.candidate_id
 			  AND p.tombstoned_at IS NULL
 			  AND p.revision=c.institution_profile_revision
-		  )`, now, claimID, bindingID, holderGeneration, routeOrdinal, now)
+			  AND c.job_attempt_revision = 1 + (
+				SELECT COUNT(*) FROM events e
+				 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+			  )
+		  )`, now, claimID, bindingID, holderGeneration, routeOrdinal, tabID, now)
 	if err != nil {
 		return err
 	}
@@ -625,7 +898,11 @@ func (js *Store) SettleMaterialization(ctx context.Context, claimID, bindingID s
 		  AND (m.phase='settled' OR m.lease_until IS NULL OR m.lease_until > ?)
 		  AND c.institution_profile_revision=?
 		  AND p.tombstoned_at IS NULL
-		  AND p.revision=c.institution_profile_revision`, claimID, bindingID, holderGeneration, now, profileRevision).
+		  AND p.revision=c.institution_profile_revision
+		  AND c.job_attempt_revision = 1 + (
+			SELECT COUNT(*) FROM events e
+			 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+		  )`, claimID, bindingID, holderGeneration, now, profileRevision).
 		Scan(&candidateID, &jobID, &jobAttemptRevision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrMaterializationStale
@@ -691,6 +968,10 @@ func (js *Store) RenewMaterializationClaim(ctx context.Context, claimID string, 
 			WHERE c.id=materialization_claims.candidate_id
 			  AND p.tombstoned_at IS NULL
 			  AND p.revision=c.institution_profile_revision
+			  AND c.job_attempt_revision = 1 + (
+				SELECT COUNT(*) FROM events e
+				 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+			  )
 		  )`, leaseUntil.UTC().Format(time.RFC3339Nano),
 		store.Now(), claimID, holderGeneration, store.Now())
 	if err != nil {
@@ -726,6 +1007,10 @@ func (js *Store) AdvanceMaterializationEffect(ctx context.Context, claimID, bind
 			WHERE c.id=materialization_claims.candidate_id
 			  AND p.tombstoned_at IS NULL
 			  AND p.revision=c.institution_profile_revision
+			  AND c.job_attempt_revision = 1 + (
+				SELECT COUNT(*) FROM events e
+				 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+			  )
 		  )`,
 		now, claimID, bindingID, holderGeneration, expectedOrdinal, now)
 	if err != nil {
@@ -766,7 +1051,7 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 	for rows.Next() {
 		var c MaterializationClaim
 		if err := rows.Scan(&c.ID, &c.CandidateID, &c.BrowserHolderGeneration, &c.MaterializationKind,
-			&c.BindingID, &c.Phase, &c.RouteIssuanceOrdinal, &c.EffectOrdinal, &c.LeaseUntil, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.BindingID, &c.TabID, &c.Phase, &c.RouteIssuanceOrdinal, &c.EffectOrdinal, &c.LeaseUntil, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -791,6 +1076,53 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 		return nil, err
 	}
 	return expired, nil
+}
+
+// AbandonStaleMaterializations transactionally fences every live claim issued
+// by an older browser holder generation. Claims from the current generation
+// remain untouched. Candidates are made eligible again only when no other live
+// claim still owns them; terminal candidate states are never rewritten.
+func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGeneration int64) (int64, error) {
+	now := store.Now()
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `UPDATE materialization_claims
+		SET phase='abandoned', updated_at=?
+		WHERE browser_holder_generation<>?
+		  AND phase IN ('claimed','bound','route_issued','navigated')
+		  AND (lease_until IS NULL OR lease_until > ?)`,
+		now, currentGeneration, now)
+	if err != nil {
+		return 0, err
+	}
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates
+		SET status='eligible', updated_at=?
+		WHERE status IN ('claimed','materializing')
+		  AND NOT EXISTS (
+			SELECT 1 FROM materialization_claims
+			WHERE candidate_id=browser_candidates.id
+			  AND phase IN ('claimed','bound','route_issued','navigated')
+			  AND (lease_until IS NULL OR lease_until > ?)
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM artifact_winners
+			WHERE candidate_id=browser_candidates.id
+			  AND job_attempt_revision=browser_candidates.job_attempt_revision
+		  )`, now, now); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func opaqueMaterializationID(prefix string) (string, error) {

@@ -248,6 +248,312 @@ export interface ProviderDrainLease {
   parkedReason?: "challenge";
 }
 
+/** URL-free browser-tab materialization correlation. All identifiers are
+ * daemon-minted opaque values; route URL material never crosses this boundary. */
+export type MaterializationPhase =
+  | "offered"
+  | "claiming"
+  | "claimed"
+  | "bound"
+  | "route_issued"
+  | "navigating"
+  | "navigated"
+  | "failed";
+
+export interface MaterializationCorrelation {
+  job_id: string;
+  candidate_id: string;
+  materialization_kind: "browser_tab";
+  candidate_expires_at: string;
+  claim_id?: string;
+  binding_id?: string;
+  browser_holder_generation?: number;
+  lease_until?: string;
+  phase: MaterializationPhase;
+  tab_id: number;
+  route_issuance_ordinal?: number;
+  /** Explicit crash/reconnect replay marker for an already-issued route. */
+  route_replay_ordinal?: number;
+  /** Number of lost claim/bind responses in this bounded offer attempt. */
+  retry_attempts?: number;
+  /** Browser-local wake deadline for the next detached response-loss retry. */
+  retry_after?: number;
+}
+ 
+export type MaterializationEvent =
+  | { type: "offer"; correlation: MaterializationCorrelation }
+  | { type: "claiming" }
+  | {
+      type: "claimed";
+      claim_id: string;
+      binding_id: string;
+      browser_holder_generation: number;
+      lease_until: string;
+    }
+  | { type: "scaffolded"; tab_id: number }
+  | { type: "reconcile_tab"; tab_id: number }
+  | { type: "scaffold_lost" }
+  | { type: "bound" }
+  | { type: "route_issued"; route_issuance_ordinal: number }
+  | { type: "navigating" }
+  | { type: "navigated" }
+  | { type: "retry_route"; tab_id?: number }
+  | { type: "retry_claim"; attempt: number; retry_after?: number }
+  | { type: "retry_bind"; attempt: number; retry_after?: number }
+  | { type: "retry_route_response"; attempt: number; retry_after?: number }
+  | { type: "retry_navigated"; attempt: number; retry_after?: number }
+  | { type: "failed" }
+  | { type: "clear" };
+ 
+const MATERIALIZATION_ID = /^[A-Za-z0-9_-]{8,128}$/u;
+
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
+
+function validMaterializationID(value: unknown): value is string {
+  return typeof value === "string" && MATERIALIZATION_ID.test(value);
+}
+
+function validRFC3339(value: unknown): value is string {
+  return typeof value === "string" && RFC3339.test(value) && Number.isFinite(Date.parse(value));
+}
+
+function validMaterializationCorrelation(value: unknown): value is MaterializationCorrelation {
+  if (!isRecord(value) ||
+      typeof value.job_id !== "string" ||
+      !validMaterializationID(value.candidate_id) ||
+      value.materialization_kind !== "browser_tab" ||
+      !validRFC3339(value.candidate_expires_at) ||
+      !MATERIALIZATION_PHASES.includes(value.phase as MaterializationPhase) ||
+      !isFiniteNumber(value.tab_id) ||
+      !Number.isSafeInteger(value.tab_id) ||
+      value.tab_id < -1) return false;
+  if (value.claim_id !== undefined && !validMaterializationID(value.claim_id)) return false;
+  if (value.binding_id !== undefined && !validMaterializationID(value.binding_id)) return false;
+  if (
+    value.browser_holder_generation !== undefined &&
+    (!isFiniteNumber(value.browser_holder_generation) ||
+      !Number.isSafeInteger(value.browser_holder_generation) ||
+      value.browser_holder_generation < 1)
+  ) return false;
+  if (value.lease_until !== undefined && !validRFC3339(value.lease_until)) return false;
+  if (value.route_issuance_ordinal !== undefined &&
+      (!isFiniteNumber(value.route_issuance_ordinal) ||
+        !Number.isSafeInteger(value.route_issuance_ordinal) ||
+        value.route_issuance_ordinal < 1)) return false;
+  if (value.route_replay_ordinal !== undefined &&
+      (!isFiniteNumber(value.route_replay_ordinal) ||
+        !Number.isSafeInteger(value.route_replay_ordinal) ||
+        value.route_replay_ordinal < 1)) return false;
+  if (value.retry_attempts !== undefined &&
+      (!isFiniteNumber(value.retry_attempts) ||
+        !Number.isSafeInteger(value.retry_attempts) ||
+        value.retry_attempts < 0)) return false;
+  if (value.retry_after !== undefined &&
+      (!isFiniteNumber(value.retry_after) || value.retry_after < 0)) return false;
+  return true;
+}
+
+const MATERIALIZATION_PHASES: readonly MaterializationPhase[] = [
+  "offered",
+  "claiming",
+  "claimed",
+  "bound",
+  "route_issued",
+  "navigating",
+  "navigated",
+  "failed",
+];
+
+const MATERIALIZATION_TRANSITIONS: Readonly<Record<MaterializationEvent["type"], readonly MaterializationPhase[]>> = {
+  offer: [],
+  claiming: ["offered", "failed"],
+  claimed: ["claiming"],
+  scaffolded: ["claimed"],
+  reconcile_tab: ["offered", "claiming", "claimed", "bound", "route_issued", "navigating", "navigated", "failed"],
+  scaffold_lost: ["route_issued", "navigating"],
+  bound: ["claimed"],
+  route_issued: ["bound"],
+  navigating: ["route_issued"],
+  navigated: ["navigating"],
+  retry_route: ["route_issued", "navigating", "failed"],
+  retry_claim: ["offered", "claiming", "failed"],
+  retry_bind: ["claimed", "bound"],
+  retry_route_response: ["bound"],
+  retry_navigated: ["navigating"],
+  failed: ["offered", "claiming", "claimed", "bound", "route_issued", "navigating"],
+  clear: MATERIALIZATION_PHASES,
+};
+
+/** Focused reducer for one URL-free materialization correlation. Invalid or
+ * out-of-order events are no-ops, making duplicate and stale callbacks safe. */
+export function reduceMaterialization(store: StoreShape, jobID: string, event: MaterializationEvent): StoreShape {
+  const current = store.materializations?.[jobID];
+  if (event.type === "offer") {
+    const incoming = event.correlation;
+    if (incoming.job_id !== jobID || !validMaterializationCorrelation(incoming)) return store;
+    if (current !== undefined) {
+      if (current.candidate_id === incoming.candidate_id) {
+        const currentExpiry = Date.parse(current.candidate_expires_at);
+        const incomingExpiry = Date.parse(incoming.candidate_expires_at);
+        if (!Number.isFinite(incomingExpiry) || incomingExpiry <= currentExpiry) return store;
+        const refreshed: MaterializationCorrelation = {
+          ...current,
+          candidate_expires_at: incoming.candidate_expires_at,
+        };
+        // A pre-claim re-offer is a fresh daemon lease and may claim again,
+        // even when the prior attempt was still marked claiming.
+        if (
+          current.binding_id === undefined &&
+          (current.phase === "failed" || current.phase === "claiming")
+        ) {
+          refreshed.phase = "offered";
+          refreshed.tab_id = -1;
+          delete refreshed.retry_attempts;
+          delete refreshed.retry_after;
+        }
+        return {
+          ...store,
+          materializations: { ...(store.materializations ?? {}), [jobID]: refreshed },
+        };
+      }
+      return {
+        ...store,
+        materializations: { ...(store.materializations ?? {}), [jobID]: { ...incoming } },
+      };
+    }
+    return {
+      ...store,
+      materializations: { ...(store.materializations ?? {}), [jobID]: { ...incoming } },
+    };
+  }
+  if (current === undefined || !MATERIALIZATION_TRANSITIONS[event.type].includes(current.phase)) return store;
+  if (event.type === "clear") {
+    const materializations = { ...(store.materializations ?? {}) };
+    delete materializations[jobID];
+    return Object.keys(materializations).length === 0
+      ? (() => {
+          const next = { ...store };
+          delete next.materializations;
+          return next;
+        })()
+      : { ...store, materializations };
+  }
+  let next: MaterializationCorrelation = { ...current };
+  switch (event.type) {
+    case "claiming":
+      next.phase = "claiming";
+      break;
+    case "claimed":
+      if (
+        !validMaterializationID(event.claim_id) ||
+        !validMaterializationID(event.binding_id) ||
+        !Number.isInteger(event.browser_holder_generation) ||
+        event.browser_holder_generation < 1 ||
+        !validRFC3339(event.lease_until)
+      ) return store;
+      next = {
+        ...next,
+        claim_id: event.claim_id,
+        binding_id: event.binding_id,
+        browser_holder_generation: event.browser_holder_generation,
+        lease_until: event.lease_until,
+        phase: "claimed",
+      };
+      delete next.retry_after;
+      delete next.retry_attempts;
+      break;
+    case "scaffolded":
+      if (!Number.isInteger(event.tab_id) || event.tab_id < 0) return store;
+      next.tab_id = event.tab_id;
+      break;
+    case "reconcile_tab":
+      if (!Number.isInteger(event.tab_id) || event.tab_id < 0) return store;
+      next.tab_id = event.tab_id;
+      break;
+    case "scaffold_lost":
+      next.tab_id = -1;
+      next.phase = "claimed";
+      delete next.route_replay_ordinal;
+      break;
+    case "bound":
+      next.phase = "bound";
+      delete next.retry_after;
+      delete next.retry_attempts;
+      break;
+    case "route_issued": {
+      if (!Number.isInteger(event.route_issuance_ordinal) || event.route_issuance_ordinal < 1) return store;
+      const replaying = next.route_replay_ordinal === event.route_issuance_ordinal;
+      if (
+        next.route_issuance_ordinal !== undefined &&
+        (event.route_issuance_ordinal < next.route_issuance_ordinal ||
+          (event.route_issuance_ordinal === next.route_issuance_ordinal && !replaying))
+      ) return store;
+      next.route_issuance_ordinal = event.route_issuance_ordinal;
+      delete next.route_replay_ordinal;
+      next.phase = "route_issued";
+      break;
+    }
+    case "navigating":
+      next.phase = "navigating";
+      break;
+    case "navigated":
+      next.phase = "navigated";
+      break;
+    case "retry_route":
+      if (event.tab_id !== undefined) {
+        if (!Number.isInteger(event.tab_id) || event.tab_id < 0) return store;
+        next.tab_id = event.tab_id;
+      }
+      if ((current.phase === "route_issued" || current.phase === "navigating") &&
+          next.route_issuance_ordinal !== undefined) {
+        next.route_replay_ordinal = next.route_issuance_ordinal;
+      }
+      next.phase = next.binding_id === undefined ? "failed" : next.tab_id < 0 ? "claimed" : "bound";
+      break;
+    case "retry_claim":
+      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0) return store;
+      next.phase = "offered";
+      next.tab_id = -1;
+      delete next.claim_id;
+      delete next.binding_id;
+      delete next.browser_holder_generation;
+      delete next.lease_until;
+      delete next.route_issuance_ordinal;
+      delete next.route_replay_ordinal;
+      next.retry_attempts = event.attempt;
+      if (event.retry_after === undefined) delete next.retry_after;
+      else next.retry_after = event.retry_after;
+      break;
+    case "retry_bind":
+      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0) return store;
+      if (current.phase === "claimed") next.phase = "claimed";
+      next.retry_attempts = event.attempt;
+      if (event.retry_after === undefined) delete next.retry_after;
+      else next.retry_after = event.retry_after;
+      break;
+    case "retry_route_response":
+      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0) return store;
+      next.phase = "bound";
+      next.retry_attempts = event.attempt;
+      if (event.retry_after === undefined) delete next.retry_after;
+      else next.retry_after = event.retry_after;
+      break;
+    case "retry_navigated":
+      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0) return store;
+      next.phase = "navigating";
+      next.retry_attempts = event.attempt;
+      if (event.retry_after === undefined) delete next.retry_after;
+      else next.retry_after = event.retry_after;
+      break;
+    case "failed":
+      next.phase = "failed";
+      break;
+    default:
+      return store;
+  }
+  return { ...store, materializations: { ...(store.materializations ?? {}), [jobID]: next } };
+}
+
 
 export interface StoreShape {
   activeJobs: ActiveJob[];
@@ -279,6 +585,9 @@ export interface StoreShape {
   blockedProviderHosts?: string[];
   /** Provider-host security-check cooldowns. */
   challengeCooldowns?: Record<string, number>;
+  /** URL-free daemon claim/binding ledger for explicit browser-tab
+   * materialization. Response URLs are intentionally absent. */
+  materializations?: Record<string, MaterializationCorrelation>;
   /** Legacy browser claim map; never promoted by managed-state migration. */
   federatedLoginOwners?: Record<string, FederatedLoginOwner>;
 }
@@ -371,8 +680,9 @@ export function clearPendingDelivery(store: StoreShape, jobID?: string): StoreSh
 }
 
 /** Version of the durable managed-state shape. The storage key predates this
- * field, so version 1 means the unversioned `papio_state_v1` blob. */
-export const MANAGED_STATE_VERSION = 2;
+ * field, so version 1 means the unversioned `papio_state_v1` blob. Version 3
+ * adds the URL-free explicit materialization correlation ledger. */
+export const MANAGED_STATE_VERSION = 3;
 const STORAGE_KEY = "papio_state_v1";
 type UnknownRecord = Record<string, unknown>;
 
@@ -652,6 +962,38 @@ function migratedCooldownMap(value: unknown): Record<string, number> | undefined
   return Object.keys(out).length === 0 ? undefined : out;
 }
 
+function migratedMaterializations(value: unknown): Record<string, MaterializationCorrelation> | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: Record<string, MaterializationCorrelation> = {};
+  for (const [jobID, candidate] of Object.entries(value)) {
+    if (!validMaterializationCorrelation(candidate) || candidate.job_id !== jobID) continue;
+    const correlation: MaterializationCorrelation = {
+      job_id: candidate.job_id,
+      candidate_id: candidate.candidate_id,
+      materialization_kind: "browser_tab",
+      candidate_expires_at: candidate.candidate_expires_at,
+      phase: candidate.phase,
+      tab_id: candidate.tab_id,
+    };
+    if (candidate.claim_id !== undefined) correlation.claim_id = candidate.claim_id;
+    if (candidate.binding_id !== undefined) correlation.binding_id = candidate.binding_id;
+    if (candidate.browser_holder_generation !== undefined) {
+      correlation.browser_holder_generation = candidate.browser_holder_generation;
+    }
+    if (candidate.lease_until !== undefined) correlation.lease_until = candidate.lease_until;
+    if (candidate.route_issuance_ordinal !== undefined) {
+      correlation.route_issuance_ordinal = candidate.route_issuance_ordinal;
+    }
+    if (candidate.route_replay_ordinal !== undefined) {
+      correlation.route_replay_ordinal = candidate.route_replay_ordinal;
+    }
+    if (candidate.retry_attempts !== undefined) correlation.retry_attempts = candidate.retry_attempts;
+    if (candidate.retry_after !== undefined) correlation.retry_after = candidate.retry_after;
+    out[jobID] = correlation;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
 function migratedString(value: unknown): string | null | undefined {
   if (value === null) return null;
   return typeof value === "string" && !isURLLike(value) ? value : undefined;
@@ -717,6 +1059,8 @@ function migratedState(raw: UnknownRecord): StoreShape {
       .map(safeOrigin)
       .filter((origin): origin is string => origin !== undefined);
   }
+  const materializations = migratedMaterializations(raw.materializations);
+  if (materializations !== undefined) output.materializations = materializations;
   const blockedProviderHosts = migratedHosts(raw.blockedProviderHosts);
   if (blockedProviderHosts !== undefined) output.blockedProviderHosts = blockedProviderHosts;
   const challengeCooldowns = migratedCooldownMap(raw.challengeCooldowns);
@@ -733,7 +1077,7 @@ function migratedState(raw: UnknownRecord): StoreShape {
 export function migrateManagedState(raw: unknown): StoreShape {
   if (!isRecord(raw) || !Array.isArray(raw.activeJobs)) return emptyStore();
   const version = raw.version;
-  if (version !== undefined && version !== 1 && version !== MANAGED_STATE_VERSION) return emptyStore();
+  if (version !== undefined && version !== 1 && version !== 2 && version !== MANAGED_STATE_VERSION) return emptyStore();
   return migratedState(raw);
 }
 
