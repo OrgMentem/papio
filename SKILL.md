@@ -225,6 +225,34 @@ papio zotio apply <plan-id> --confirm-sha256 <digest-from-the-plan>
 When acquisitions fail unexpectedly: `papio doctor --json` first, then
 `papio jobs failures --since 7d --json` to see where they cluster.
 
+### Restore / debug a stalled acquisition
+
+Use this bounded path when an existing job is not progressing:
+
+```bash
+# 1. Check daemon, connector, extension, and adoption-root health.
+papio doctor --json
+
+# 2. Ask the daemon for the current blocker and permitted next operation.
+papio jobs diagnose <job-id> --json
+
+# 3. Read the durable evidence behind that diagnosis.
+papio jobs get <job-id> --json
+papio adapter diagnose <job-id> --json
+papio adapter captures
+
+# 4. If the diagnosis says the action is openable, hand one job to the
+#    user's ordinary browser. Never open the whole action queue.
+papio actions open --job <job-id> --dry-run
+papio actions open --job <job-id>
+
+# 5. Observe adoption and validation; do not blindly retry a rejected file.
+papio jobs get <job-id> --json
+```
+
+`jobs diagnose` is read-only. It does not repair state, retry jobs, or resolve
+human actions; it tells the agent which explicit operation is safe to offer.
+
 ## Recipes
 
 ### Fetch the PDFs for an exported reference list
