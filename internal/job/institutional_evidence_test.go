@@ -363,3 +363,63 @@ func TestArtifactWinnerRejectsRevisedProfileClaim(t *testing.T) {
 		t.Fatalf("revised profile created winner: ok=%v err=%v", ok, err)
 	}
 }
+
+func TestAuthenticationEntryLeaseSignedOutDominatesLaterWarm(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	seedInstitutionProfile(t, js, "profile-lease-precedence")
+	if _, err := js.S.DB().ExecContext(ctx, `
+		UPDATE institution_profiles SET authentication_claim_id='claim-precedence'
+		WHERE id='profile-lease-precedence'`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	authReturned := ProfileEvidenceObservation{
+		ObservationID: "precedence-auth-return", BrowserHolderGeneration: 17,
+		InstitutionProfileID: "profile-lease-precedence", InstitutionProfileRevision: 1,
+		Verdict: ProfileEvidenceAuthReturned, Source: ProfileEvidenceAuthReturn,
+		ProducerObservedAt: now.Format(time.RFC3339Nano),
+	}
+	if err := js.RecordProfileEvidence(ctx, authReturned); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-precedence", LeaseID: "lease-owner-a", OwnerID: "job-a",
+		BrowserHolderGeneration: 17, LeaseUntil: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentEvidence, ok, err := js.CurrentProfileEvidence(ctx, "profile-lease-precedence", 1, 17)
+	if err != nil || !ok {
+		t.Fatalf("current auth-return evidence = %+v, ok=%v err=%v", currentEvidence, ok, err)
+	}
+	if err := js.ConvertAuthenticationEntryLeaseToHuman(ctx, "claim-precedence", lease.LeaseID, "job-a", 17, currentEvidence); err != nil {
+		t.Fatal(err)
+	}
+	for _, observation := range []ProfileEvidenceObservation{
+		{
+			ObservationID: "precedence-signed-out", BrowserHolderGeneration: 17,
+			InstitutionProfileID: "profile-lease-precedence", InstitutionProfileRevision: 1,
+			Verdict: ProfileEvidenceSignedOut, Source: ProfileEvidenceProviderOutcome,
+			ProducerObservedAt: now.Add(time.Second).Format(time.RFC3339Nano),
+		},
+		{
+			ObservationID: "precedence-warm-late", BrowserHolderGeneration: 17,
+			InstitutionProfileID: "profile-lease-precedence", InstitutionProfileRevision: 1,
+			Verdict: ProfileEvidenceWarmVerified, Source: ProfileEvidenceProbe,
+			ProducerObservedAt: now.Add(2 * time.Second).Format(time.RFC3339Nano),
+		},
+	} {
+		if err := js.RecordProfileEvidence(ctx, observation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replacement, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-precedence", LeaseID: "lease-owner-b", OwnerID: "job-b",
+		BrowserHolderGeneration: 17, LeaseUntil: now.Add(time.Minute),
+	})
+	if err != nil || replacement.OwnerID != "job-b" || replacement.State != AuthenticationEntryLeaseReserved {
+		t.Fatalf("replacement lease = %+v, err=%v", replacement, err)
+	}
+}
