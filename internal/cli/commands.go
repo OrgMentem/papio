@@ -554,7 +554,9 @@ func newJobsCommand(opt *options) *cobra.Command {
 	failures.Flags().StringVar(&failuresSince, "since", "", "include jobs updated since a duration or RFC3339 timestamp")
 	failures.Flags().IntVar(&failuresLimit, "limit", 50, "maximum groups (1-200)")
 
-	command.AddCommand(list, get, show, cancel, retry, failures, receiptCommand, repairAwaitingHuman, addComponent)
+	diagnose := newJobsDiagnoseCommand(opt)
+
+	command.AddCommand(list, get, show, diagnose, cancel, retry, failures, receiptCommand, repairAwaitingHuman, addComponent)
 	return command
 }
 

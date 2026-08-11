@@ -322,6 +322,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"jobs.get_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return getJobV3(ctx, raw, system)
 		},
+		"jobs.diagnose_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return diagnoseJob(ctx, raw, system)
+		},
 		"jobs.cancel": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return cancelJob(ctx, raw, system)
 		},

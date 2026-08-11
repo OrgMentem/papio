@@ -665,6 +665,14 @@ Cancel a nonterminal job
 papio jobs cancel <job-id>
 ```
 
+### `papio jobs diagnose`
+
+Explain why one job needs attention and what can happen next
+
+```
+papio jobs diagnose <job-id>
+```
+
 ### `papio jobs failures`
 
 Group acquisition jobs that need attention

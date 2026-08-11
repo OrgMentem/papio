@@ -41,6 +41,11 @@ execution records kept during the initial build.
   `dev/scratch/repair/`: the sanitized fixture with its header, an
   adapter-try analysis report, the adapter's next revision string, and the
   exact apply steps — without touching extension source.
+- **`papio jobs diagnose` explains parked work.** The read-only, daemon-owned
+  diagnosis classifies provider adapter gaps, page drift, rejected adopted
+  files, wrong-work outcomes, landing pages, and human-authentication steps,
+  then reports the exact next action and whether the selected job can be
+  opened or retried. It does not drain the human-action queue.
 - **Title-only works get an OpenAlex rescue.** When a request has a title but
   no usable identifier and Crossref finds nothing, the daemon now searches
   OpenAlex with the same strict corroboration (exact normalized title,

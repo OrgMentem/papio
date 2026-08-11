@@ -77,6 +77,11 @@ When acquisitions fail unexpectedly, run `papio doctor --json` first, then
 `papio jobs failures --since 7d --json` to see where failures cluster before
 opening individual jobs.
 
+For a parked job, use `papio jobs diagnose <job-id> --json` before opening its
+action. The diagnosis is read-only and reports the reason, next step, and
+whether `actions open --job` or `jobs retry` is applicable. It never authorizes
+opening the whole human-action queue.
+
 ## Safety semantics
 
 ### A human gate is an outcome, not an error

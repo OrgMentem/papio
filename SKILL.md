@@ -143,6 +143,10 @@ One line each; run `papio <command> --help` for the full flag set.
   `--max-cost`, `--access-mode`, `--resolver`, `--request-id` (idempotency key), `--force`.
 - **`jobs list --state <state>` / `jobs get <id> [--wait]` / `jobs retry <id>` / `jobs cancel <id>`**
   — The job surface. `jobs receipt <id>` is the outcome plus component index.
+- **`jobs diagnose <id>`** — Read-only daemon explanation of the current state,
+  including provider adapter missing/drift, rejected adopted files, wrong-work,
+  landing-page, and human-authentication reasons. It reports whether one
+  selected action can be opened or the job can be retried; it never drains the queue.
 - **`status`** — Dashboard grouped into working, awaiting-human, needs-review, ready,
   imported, failed/unavailable. `--follow` refreshes every 2s (interactive only — do not
   use it from an agent).
