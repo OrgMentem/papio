@@ -1715,3 +1715,163 @@ func TestProviderDirectGetTupleValidation(t *testing.T) {
 		t.Fatal("secret-bearing direct URL accepted")
 	}
 }
+func TestInstitutionalMaterializationPayloadsRoundTripAndDisposition(t *testing.T) {
+	generation := int64(0)
+	frames := []struct {
+		name, typ, jobID string
+		payload          any
+	}{
+		{"claim", MsgInstitutionalClaimRequest, "job_inst_001", InstitutionalClaimRequestPayload{CandidateID: "cand_001", MaterializationKind: "browser_tab"}},
+		{"claim_response", MsgInstitutionalClaimResponse, "job_inst_001", InstitutionalClaimResponsePayload{Outcome: "claimed", CandidateID: "cand_001", ClaimID: "claim_001", BindingID: "bind_001", BrowserHolderGeneration: &generation, LeaseUntil: "2026-08-11T12:00:00Z"}},
+		{"bind", MsgInstitutionalBindRequest, "job_inst_001", InstitutionalBindRequestPayload{ClaimID: "claim_001", BindingID: "bind_001", TabID: 7}},
+		{"route", MsgInstitutionalRouteResponse, "job_inst_001", InstitutionalRouteResponsePayload{Outcome: "issued", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, URL: "https://resolver.example/route"}},
+		{"navigated", MsgInstitutionalNavigatedRequest, "job_inst_001", InstitutionalNavigatedRequestPayload{ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, TabID: 7}},
+		{"reconcile", MsgInstitutionalReconcileRequest, "", InstitutionalReconcileRequestPayload{Bindings: []InstitutionalReconcileBinding{{BindingID: "bind_001", TabID: 7}}}},
+	}
+	for _, tc := range frames {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]any{"protocol": BrowserProtocolVersion, "type": tc.typ, "msg_id": "msg_inst_001", "seq": 1, "payload": tc.payload}
+			if tc.jobID != "" {
+				env["job_id"] = tc.jobID
+			}
+			raw, err := json.Marshal(env)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeBrowserMessage(raw); err != nil {
+				t.Fatalf("round trip: %v", err)
+			}
+		})
+	}
+	disabled := InstitutionalRouteResponsePayload{Outcome: "feature_disabled", Detail: "dark"}
+	raw, _ := json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalRouteResponse, "msg_id": "msg_inst_002", "seq": 2, "job_id": "job_inst_001", "payload": disabled})
+	if _, err := DecodeBrowserMessage(raw); err != nil {
+		t.Fatalf("disabled response: %v", err)
+	}
+	for _, bad := range []map[string]any{
+		{"outcome": "issued", "claim_id": "claim_001", "binding_id": "bind_001"},
+		{"outcome": "feature_disabled", "url": "https://resolver.example/route"},
+	} {
+		raw, _ := json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalRouteResponse, "msg_id": "msg_inst_003", "seq": 3, "job_id": "job_inst_001", "payload": bad})
+		if _, err := DecodeBrowserMessage(raw); err == nil {
+			t.Fatalf("invalid route response accepted: %#v", bad)
+		}
+	}
+}
+
+func TestInstitutionalMaterializationBoundsAndScope(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalClaimRequest, "msg_id": "msg_inst_004", "seq": 4, "payload": map[string]any{"candidate_id": "cand_001", "materialization_kind": "browser_tab"}})
+	if _, err := DecodeBrowserMessage(raw); err == nil {
+		t.Fatal("job-scoped institutional request without job_id accepted")
+	}
+	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalReconcileRequest, "msg_id": "msg_inst_005", "seq": 5, "payload": map[string]any{"bindings": make([]any, 33)}})
+	if _, err := DecodeBrowserMessage(raw); err == nil {
+		t.Fatal("oversized reconcile bindings accepted")
+	}
+	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalBindRequest, "msg_id": "msg_inst_006", "seq": 6, "job_id": "job_inst_001", "payload": map[string]any{"claim_id": "claim_001", "binding_id": "bind_001", "tab_id": MaxBrowserInteger + 1}})
+	if _, err := DecodeBrowserMessage(raw); err == nil {
+		t.Fatal("oversized tab id accepted")
+	}
+	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalBindRequest, "msg_id": "msg_inst_008", "seq": 8, "job_id": "job_inst_001", "payload": map[string]any{"claim_id": "claim_001", "binding_id": "bind_001", "tab_id": -1}})
+	if _, err := DecodeBrowserMessage(raw); err == nil {
+		t.Fatal("negative tab id accepted")
+	}
+	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalNavigatedRequest, "msg_id": "msg_inst_009", "seq": 9, "job_id": "job_inst_001", "payload": map[string]any{"claim_id": "claim_001", "binding_id": "bind_001", "route_issuance_ordinal": 1, "tab_id": -1}})
+	if _, err := DecodeBrowserMessage(raw); err == nil {
+		t.Fatal("negative navigated tab id accepted")
+	}
+	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalReconcileRequest, "msg_id": "msg_inst_010", "seq": 10, "payload": map[string]any{"bindings": []any{map[string]any{"binding_id": "bind_001", "tab_id": -1}}}})
+	if _, err := DecodeBrowserMessage(raw); err == nil {
+		t.Fatal("negative reconcile tab id accepted")
+	}
+	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalReconcileRequest, "msg_id": "msg_inst_007", "seq": 7, "job_id": "job_inst_001", "payload": map[string]any{"bindings": []any{}}})
+	if _, err := DecodeBrowserMessage(raw); err == nil {
+		t.Fatal("session-scoped reconcile with job_id accepted")
+	}
+}
+
+func TestInstitutionalMaterializationClosedOutcomesAndOpaqueIDs(t *testing.T) {
+	frame := func(typ, jobID string, payload map[string]any) []byte {
+		t.Helper()
+		env := map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     typ,
+			"msg_id":   "msg_inst_011",
+			"seq":      11,
+			"payload":  payload,
+		}
+		if jobID != "" {
+			env["job_id"] = jobID
+		}
+		raw, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	t.Run("cross-family outcomes are rejected", func(t *testing.T) {
+		cases := []struct {
+			name, typ, jobID, outcome string
+		}{
+			{"claim rejects issued", MsgInstitutionalClaimResponse, "job_inst_001", "issued"},
+			{"bind rejects claimed", MsgInstitutionalBindResponse, "job_inst_001", "claimed"},
+			{"route rejects acknowledged", MsgInstitutionalRouteResponse, "job_inst_001", "acknowledged"},
+			{"navigated rejects bound", MsgInstitutionalNavigatedResponse, "job_inst_001", "bound"},
+			{"reconcile rejects busy", MsgInstitutionalReconcileResponse, "", "busy"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if _, err := DecodeBrowserMessage(frame(tc.typ, tc.jobID, map[string]any{"outcome": tc.outcome})); err == nil {
+					t.Fatalf("accepted outcome %q for %s", tc.outcome, tc.typ)
+				}
+			})
+		}
+	})
+
+	t.Run("opaque IDs require at least eight characters", func(t *testing.T) {
+		if _, err := DecodeBrowserMessage(frame(MsgInstitutionalClaimRequest, "job_inst_001", map[string]any{
+			"candidate_id": "short", "materialization_kind": "browser_tab",
+		})); err == nil {
+			t.Fatal("short candidate_id accepted")
+		}
+		if _, err := DecodeBrowserMessage(frame(MsgInstitutionalBindRequest, "job_inst_001", map[string]any{
+			"claim_id": "short", "binding_id": "binding_01", "tab_id": 1,
+		})); err == nil {
+			t.Fatal("short claim_id accepted")
+		}
+	})
+
+	t.Run("success outcomes forbid detail", func(t *testing.T) {
+		successes := []struct {
+			name, typ, jobID string
+			payload          map[string]any
+		}{
+			{"claim", MsgInstitutionalClaimResponse, "job_inst_001", map[string]any{
+				"outcome": "claimed", "candidate_id": "cand_001", "claim_id": "claim_001",
+				"binding_id": "bind_001", "browser_holder_generation": 0,
+				"lease_until": "2026-08-11T12:00:00Z", "detail": "forbidden",
+			}},
+			{"bind", MsgInstitutionalBindResponse, "job_inst_001", map[string]any{
+				"outcome": "bound", "claim_id": "claim_001", "binding_id": "bind_001", "detail": "forbidden",
+			}},
+			{"route", MsgInstitutionalRouteResponse, "job_inst_001", map[string]any{
+				"outcome": "issued", "claim_id": "claim_001", "binding_id": "bind_001",
+				"route_issuance_ordinal": 1, "url": "https://resolver.example/route", "detail": "forbidden",
+			}},
+			{"navigated", MsgInstitutionalNavigatedResponse, "job_inst_001", map[string]any{
+				"outcome": "acknowledged", "claim_id": "claim_001", "binding_id": "bind_001", "detail": "forbidden",
+			}},
+			{"reconcile", MsgInstitutionalReconcileResponse, "", map[string]any{
+				"outcome": "reconciled", "detail": "forbidden",
+			}},
+		}
+		for _, tc := range successes {
+			t.Run(tc.name, func(t *testing.T) {
+				if _, err := DecodeBrowserMessage(frame(tc.typ, tc.jobID, tc.payload)); err == nil {
+					t.Fatalf("%s success with detail accepted", tc.name)
+				}
+			})
+		}
+	})
+}

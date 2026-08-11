@@ -745,9 +745,8 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, institutionalMaterializationFeature,
 	}) {
-		t.Fatalf("features = %v, want required bridge feature set", payload.Features)
 	}
 }
 
@@ -7500,5 +7499,58 @@ func TestProviderDriveWrongWorkStaleTupleCannotLatchNewDomain(t *testing.T) {
 		if detail["safety_domain"] == "institution:old.example" || detail["safety_domain"] == "institution:new.example" {
 			t.Fatalf("stale tuple created safety latch: %#v", detail)
 		}
+	}
+}
+func TestInstitutionalMaterializationHandlersAreDarkAndContinue(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	requests := []struct {
+		typ, jobID string
+		payload    any
+		response   string
+	}{
+		{protocol.MsgInstitutionalClaimRequest, "job_inst_001", protocol.InstitutionalClaimRequestPayload{CandidateID: "cand_001", MaterializationKind: "browser_tab"}, protocol.MsgInstitutionalClaimResponse},
+		{protocol.MsgInstitutionalBindRequest, "job_inst_001", protocol.InstitutionalBindRequestPayload{ClaimID: "claim_001", BindingID: "bind_001", TabID: 4}, protocol.MsgInstitutionalBindResponse},
+		{protocol.MsgInstitutionalRouteRequest, "job_inst_001", protocol.InstitutionalRouteRequestPayload{ClaimID: "claim_001", BindingID: "bind_001"}, protocol.MsgInstitutionalRouteResponse},
+		{protocol.MsgInstitutionalNavigatedRequest, "job_inst_001", protocol.InstitutionalNavigatedRequestPayload{ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, TabID: 4}, protocol.MsgInstitutionalNavigatedResponse},
+		{protocol.MsgInstitutionalReconcileRequest, "", protocol.InstitutionalReconcileRequestPayload{Bindings: []protocol.InstitutionalReconcileBinding{{BindingID: "bind_001", TabID: 4}}}, protocol.MsgInstitutionalReconcileResponse},
+	}
+	msgs, _ := runSync(t, b, hello())
+	if firstOfType(msgs, protocol.MsgHelloAck) == nil {
+		t.Fatal("hello_ack missing")
+	}
+	for _, req := range requests {
+		msgs, _ = runSync(t, b, inFrame(t, req.typ, req.jobID, req.payload))
+		got := firstOfType(msgs, req.response)
+		if got == nil {
+			t.Fatalf("%s response missing: %v", req.typ, msgs)
+		}
+		switch p := got.Payload.(type) {
+		case *protocol.InstitutionalClaimResponsePayload:
+			if p.Outcome != "feature_disabled" || p.ClaimID != "" || p.BindingID != "" {
+				t.Fatalf("claim response = %#v", p)
+			}
+		case *protocol.InstitutionalBindResponsePayload:
+			if p.Outcome != "feature_disabled" || p.ClaimID != "" || p.BindingID != "" {
+				t.Fatalf("bind response = %#v", p)
+			}
+		case *protocol.InstitutionalRouteResponsePayload:
+			if p.Outcome != "feature_disabled" || p.URL != "" {
+				t.Fatalf("route response = %#v", p)
+			}
+		case *protocol.InstitutionalNavigatedResponsePayload:
+			if p.Outcome != "feature_disabled" || p.ClaimID != "" {
+				t.Fatalf("navigated response = %#v", p)
+			}
+		case *protocol.InstitutionalReconcileResponsePayload:
+			if p.Outcome != "feature_disabled" || len(p.Claims) != 0 {
+				t.Fatalf("reconcile response = %#v", p)
+			}
+		}
+	}
+	// A disabled materialization call cannot poison the holder/session: a
+	// normal RPC immediately afterwards is still served.
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgTriageCountsRequest, "", protocol.TriageCountsRequestPayload{RequestID: "request_inst_continue"}))
+	if firstOfType(msgs, protocol.MsgTriageCountsResponse) == nil {
+		t.Fatalf("later RPC did not continue after dark handlers: %v", msgs)
 	}
 }

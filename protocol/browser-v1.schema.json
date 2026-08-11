@@ -65,7 +65,17 @@
         "pdf_grab_status_request",
         "pdf_grab_status_result",
         "pdf_grab_abandon_request",
-        "pdf_grab_abandon_result"
+        "pdf_grab_abandon_result",
+        "institutional_claim_request",
+        "institutional_claim_response",
+        "institutional_bind_request",
+        "institutional_bind_response",
+        "institutional_route_request",
+        "institutional_route_response",
+        "institutional_navigated_request",
+        "institutional_navigated_response",
+        "institutional_reconcile_request",
+        "institutional_reconcile_response"
       ]
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
@@ -557,8 +567,12 @@
   },
   "allOf": [
     {
-      "if": { "properties": { "type": { "enum": ["job_offer", "handoff_outcome", "job_accept", "job_reject", "auth_pending", "auth_returned", "download_started", "download_complete", "delivery_context", "provider_outcome", "provider_direct_get_request", "provider_direct_get_result", "provider_drive_epoch_start_request", "provider_drive_epoch_start_result", "provider_drive_epoch_result_request", "provider_drive_epoch_result", "cancel", "handoff_focus"] } } },
+      "if": { "properties": { "type": { "enum": ["job_offer", "handoff_outcome", "job_accept", "job_reject", "auth_pending", "auth_returned", "download_started", "download_complete", "delivery_context", "provider_outcome", "provider_direct_get_request", "provider_direct_get_result", "provider_drive_epoch_start_request", "provider_drive_epoch_start_result", "provider_drive_epoch_result_request", "provider_drive_epoch_result", "cancel", "handoff_focus", "institutional_claim_request", "institutional_claim_response", "institutional_bind_request", "institutional_bind_response", "institutional_route_request", "institutional_route_response", "institutional_navigated_request", "institutional_navigated_response"] } } },
       "then": { "required": ["job_id"] }
+    },
+    {
+      "if": { "properties": { "type": { "enum": ["institutional_reconcile_request", "institutional_reconcile_response"] } } },
+      "then": { "not": { "required": ["job_id"] } }
     },
     {
       "if": { "properties": { "type": { "enum": ["ack", "job_accept", "job_reject", "cancel", "handoff_focus"] } } },
@@ -1595,6 +1609,235 @@
     {
       "if": { "properties": { "type": { "const": "pdf_grab_result" }, "payload": { "properties": { "outcome": { "enum": ["job_created", "already_owned", "needs_identifier", "failed_validation"] } } } } },
       "then": { "properties": { "payload": { "required": ["grab_id"], "allOf": [{ "not": { "required": ["request_id"] } }, { "not": { "required": ["steering_path"] } }] } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_claim_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["candidate_id", "materialization_kind"],
+            "properties": {
+              "candidate_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "materialization_kind": { "enum": ["browser_tab", "direct_download"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_claim_response" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "enum": ["feature_disabled", "claimed", "stale", "not_eligible", "busy", "error"] },
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" },
+              "candidate_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "browser_holder_generation": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "lease_until": { "type": "string", "format": "date-time", "maxLength": 64 }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "outcome": { "const": "claimed" } }, "required": ["outcome"] },
+                "then": { "required": ["candidate_id", "claim_id", "binding_id", "browser_holder_generation", "lease_until"], "not": { "required": ["detail"] } }
+              },
+              {
+                "if": { "properties": { "outcome": { "enum": ["feature_disabled", "stale", "not_eligible", "busy", "error"] } }, "required": ["outcome"] },
+                "then": { "not": { "anyOf": [{ "required": ["candidate_id"] }, { "required": ["claim_id"] }, { "required": ["binding_id"] }, { "required": ["browser_holder_generation"] }, { "required": ["lease_until"] }] } }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_bind_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["claim_id", "binding_id", "tab_id"],
+            "properties": {
+              "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "tab_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_bind_response" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "enum": ["feature_disabled", "bound", "stale", "not_eligible", "error"] },
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" },
+              "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" }
+            },
+            "allOf": [
+              { "if": { "properties": { "outcome": { "const": "bound" } }, "required": ["outcome"] }, "then": { "required": ["claim_id", "binding_id"], "not": { "required": ["detail"] } } },
+              { "if": { "properties": { "outcome": { "enum": ["feature_disabled", "stale", "not_eligible", "error"] } }, "required": ["outcome"] }, "then": { "not": { "anyOf": [{ "required": ["claim_id"] }, { "required": ["binding_id"] }] } } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_route_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["claim_id", "binding_id"],
+            "properties": {
+              "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_route_response" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "enum": ["feature_disabled", "issued", "stale", "not_eligible", "busy", "error"] },
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" },
+              "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "route_issuance_ordinal": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "url": { "type": "string", "format": "uri", "pattern": "^https://", "maxLength": 4000 }
+            },
+            "allOf": [
+              { "if": { "properties": { "outcome": { "const": "issued" } }, "required": ["outcome"] }, "then": { "required": ["claim_id", "binding_id", "route_issuance_ordinal", "url"], "not": { "required": ["detail"] } } },
+              { "if": { "properties": { "outcome": { "enum": ["feature_disabled", "stale", "not_eligible", "busy", "error"] } }, "required": ["outcome"] }, "then": { "not": { "anyOf": [{ "required": ["claim_id"] }, { "required": ["binding_id"] }, { "required": ["route_issuance_ordinal"] }, { "required": ["url"] }] } } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_navigated_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["claim_id", "binding_id", "route_issuance_ordinal", "tab_id"],
+            "properties": {
+              "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "route_issuance_ordinal": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "tab_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_navigated_response" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "enum": ["feature_disabled", "acknowledged", "stale", "not_eligible", "error"] },
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" },
+              "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+              "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" }
+            },
+            "allOf": [
+              { "if": { "properties": { "outcome": { "const": "acknowledged" } }, "required": ["outcome"] }, "then": { "required": ["claim_id", "binding_id"], "not": { "required": ["detail"] } } },
+              { "if": { "properties": { "outcome": { "enum": ["feature_disabled", "stale", "not_eligible", "error"] } }, "required": ["outcome"] }, "then": { "not": { "anyOf": [{ "required": ["claim_id"] }, { "required": ["binding_id"] }] } } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_reconcile_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["bindings"],
+            "properties": {
+              "bindings": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["binding_id", "tab_id"],
+                  "properties": {
+                    "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+                    "tab_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "institutional_reconcile_response" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "enum": ["feature_disabled", "reconciled", "error"] },
+              "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" },
+              "claims": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["claim_id", "binding_id", "candidate_id", "phase"],
+                  "properties": {
+                    "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+                    "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+                    "candidate_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+                    "phase": { "enum": ["claimed", "bound", "route_issued", "navigated", "settled", "abandoned"] },
+                    "tab_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+                  }
+                }
+              }
+            },
+            "allOf": [
+              { "if": { "properties": { "outcome": { "const": "reconciled" } }, "required": ["outcome"] }, "then": { "not": { "required": ["detail"] } } },
+              { "if": { "properties": { "outcome": { "enum": ["feature_disabled", "error"] } }, "required": ["outcome"] }, "then": { "not": { "required": ["claims"] } } }
+            ]
+          }
+        }
+      }
     }
   ]
 }

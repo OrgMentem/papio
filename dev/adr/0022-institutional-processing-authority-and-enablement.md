@@ -1,10 +1,10 @@
 # ADR-0022: Institutional processing authority and staged enablement
 
-Status: **Accepted** (2026-08-11). Phase 0 is the current implementation phase. This
-ADR ratifies the authority, identity, fencing, cutover, and enablement rules for
-institutional processing. It supersedes the conflicting execution clauses in
-older active plans while retaining the browser-safety invariants in ADR-0003,
-ADR-0013, ADR-0018, and ADR-0021.
+Status: **Accepted** (2026-08-11). Phase 0 is complete; Phase 1 is current
+and implemented-but-dark. This ADR ratifies the authority, identity, fencing,
+cutover, and enablement rules for institutional processing. It supersedes the
+conflicting execution clauses in older active plans while retaining the
+browser-safety invariants in ADR-0003, ADR-0013, ADR-0018, and ADR-0021.
 
 ## Context
 
@@ -261,12 +261,18 @@ The staged order is normative:
   effect concurrency one, exact evidence handling, safe tab closure, faithful
   browser fakes, and obsolete remainder cleanup. Automatic first-route and
   source-gate bypass stayed disabled.
-- **Phase 0 — current:** land this authority contract, transactional cutover
+- **Phase 0 — complete:** land this authority contract, transactional cutover
   classification, diagnosis v2, stable vocabulary, privacy inventory, and
   active-plan reconciliation. Observation only; no acquisition decision changes.
-- **Phase 1:** add dark, additive durable state, migrations, strict messages,
-  profile revisions, holder generations, claims, evidence projections,
-  suppressions, winner CAS, and typed gates. No automatic materialization.
+- **Phase 1 — current, implemented-but-dark:** migration `0026` (with
+  `user_version` `26`) adds seven URL-free daemon projections:
+  `institution_profiles`, `browser_candidates`, `materialization_claims`,
+  `profile_evidence`, `human_gate_observations`, `route_suppressions`, and
+  insert-only `artifact_winners`. Add the strict, feature-negotiated
+  `institutional_materialization_v1` request/response families for claim,
+  bind, route, navigated, and reconcile. Scrub legacy extension state rather
+  than promote ambiguous authority. Every new handler returns structured
+  `feature_disabled` without mutation. Automatic materialization remains off.
 - **Phase 2:** migrate explicit Open/focus/redrive/retry/restart recovery to the
   self-identifying scaffold and two-party binding. Automatic claims remain off.
 - **Phase 3:** unify tab and direct effects under one permit at concurrency one;
@@ -279,8 +285,7 @@ The staged order is normative:
   tuples from a current live entitled run through validated ready and successful
   adoption or attachment. Only then may automatic signed-out/unknown first
   routing be canaried after ordinary OA exhaustion. Source-gate bypass remains
-  off. No provider is declared ready by this ADR; ScienceDirect, specifically,
-  has no ready claim here.
+  off. No provider is declared ready by this ADR.
 - **Phase 6:** canary source-gate cutover only for qualified tuples. Classify
   OA sources, determine route readiness, policy and identifier eligibility,
   and commit one decision with the institutional candidate or retained OA
@@ -291,6 +296,40 @@ The staged order is normative:
   human-surface, parked-tab, fairness, and artifact limits.
 - **Phase 8:** expand exact route templates, adapters, integrations, delivery,
   workflows, and destinations per-route; do not weaken earlier gates.
+
+## Phase 1 implementation note: dark and direct-to-main
+
+The coordinated Phase 1 implementation is complete but dark. Migration `0026`
+creates exactly seven daemon-owned projections: institution profiles, URL-free
+browser candidates, materialization claims, profile-evidence observations,
+current human-gate observations, route suppressions, and insert-only artifact
+winners. IDs are opaque daemon-minted values; profile and claim authority
+columns are revisioned and immutable for a candidate claim. The migration
+advances SQLite `user_version` to `26`.
+
+The strict `institutional_materialization_v1` surface lands together in the
+Go validator, TypeScript types/parser, and JSON Schema. It consists of paired
+`institutional_claim_request`/`institutional_claim_response`,
+`institutional_bind_request`/`institutional_bind_response`,
+`institutional_route_request`/`institutional_route_response`,
+`institutional_navigated_request`/`institutional_navigated_response`, and
+`institutional_reconcile_request`/`institutional_reconcile_response` families.
+Every request except reconcile is job-scoped. IDs are bounded opaque strings;
+tab IDs and ordinals are bounded safe nonnegative integers. URLs are absent from
+requests and all durable or diagnostic state; only a successful route response
+may contain a transient URL. Responses use only `feature_disabled`, `claimed`,
+`bound`, `issued`, `acknowledged`, `reconciled`, `stale`, `not_eligible`, `busy`,
+or `error`, with disposition-gated fields and strict unknown-field rejection.
+
+The extension performs an explicit versioned managed-state scrub migration:
+legacy URLs, hashes, global terms authority, and ambiguous browser queues are
+discarded rather than promoted, while safe current non-URL job, download, and
+lease state is preserved. All new handlers are hard-disabled and return
+structured `feature_disabled` without mutation. Automatic candidate creation,
+materialization, tab creation, navigation, downloads, source-gate bypass,
+provider canaries, and concurrency changes remain off. This note claims no
+Phase 2 behavior or provider readiness.
+
 
 Rollback disables new claims/effects, suppresses the affected profile/route,
 or returns the permit count to one. It never closes operator-owned content tabs
@@ -306,9 +345,11 @@ routing and tri-state auth), ADR-0017 (configured delivery gates), ADR-0018
 (fresh session evidence only), and ADR-0021 (packaged positive behaviour and
 restrictive-only control).
 
-New protocol work is feature-negotiated and solicited. Old extensions receive
-no unknown new request or frame and retain the current explicit handoff fallback.
-Migrations scrub legacy fresh routes, global terms authority, deterministic
-claim hashes, and unmaterialized browser queues without promoting ambiguous
-history into new authority. Every implementation slice remains small enough for
-one maintainer to review and land directly on main.
+New protocol work is strict, feature-negotiated, and solicited. Compatibility is
+bounded to feature negotiation; correctness does not carry a broad old/new
+shim burden. Existing messages remain unchanged, and no unknown institutional
+frame is sent to a peer that did not negotiate the feature. Migrations scrub
+legacy fresh routes, global terms authority, deterministic claim hashes, and
+unmaterialized browser queues without promoting ambiguous history into new
+authority. Every implementation slice remains small enough for one maintainer
+to review and land directly on `main`.

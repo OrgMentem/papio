@@ -1,6 +1,7 @@
 # Institutional processing acceleration
 
-**Status:** Phase −1 complete; **Phase 0 current** (observation-only)  
+**Status:** Phase −1 complete; **Phase 0 complete; Phase 1 current,
+implemented-but-dark**  
 **Ownering model:** solo-maintainer-sized changes landed directly on `main`  
 **Scope:** daemon authority, browser materialization, institutional cutover, and
 staged enablement. Existing UI work remains a dependency for typed attention
@@ -13,12 +14,57 @@ bypass disabled. The global browser-effect permit is one. Existing explicit
 handoff and direct/generic paths remain the fallback behind their current
 feature, access-mode, holder, and safety gates.
 
-Phase 0 records decisions; it does not create candidates, open tabs, bypass a
-source gate, or change concurrency. No provider tuple is broadly enabled. The
-readiness stream continues independently; ScienceDirect has no `ready` claim in
-this plan because no current live validated success plus adoption evidence is
-being asserted.
-
+Phase 0 is complete for this coordinated change: it records decisions without
+creating candidates, opening tabs, bypassing a source gate, or changing
+concurrency. No provider tuple is broadly enabled. The readiness stream
+continues independently; no provider is given a `ready` claim here because no
+current live validated success plus adoption evidence is being asserted.
+Phase 1 is implemented-but-dark: durable projections, strict feature-negotiated
+message families, and the extension scrub migration exist, but their handlers
+are hard-disabled. Automatic candidate/materialization creation, tab creation,
+navigation, download, source-gate bypass, provider canary, and concurrency
+changes remain off.
+ 
+### Coordinated Phase 0/Phase 1 implementation note
+ 
+This is a direct-to-main implementation boundary, not a claim that a later
+phase has shipped. Phase 0 is complete: transactional cutover classification,
+diagnosis v2, stable vocabulary, privacy inventory, and active-plan
+reconciliation are in place. Phase 1 is implemented-but-dark:
+ 
+1. Migration `0026` adds the seven daemon-owned dark projections and advances
+   `user_version` to `26`: `institution_profiles`, URL-free
+   `browser_candidates`, `materialization_claims`, `profile_evidence`,
+   `human_gate_observations`, `route_suppressions`, and insert-only
+   `artifact_winners`. Profile IDs, authentication-claim IDs, candidate IDs,
+   claim IDs, binding IDs, and safety-domain IDs are opaque and daemon-minted.
+   Authority columns and revisions are immutable for a candidate claim.
+2. The strict, feature-negotiated `institutional_materialization_v1` contract
+   lands together in the Go validator, TypeScript types/parser, and JSON
+   Schema. It adds paired `institutional_claim_request`/`institutional_claim_response`,
+   `institutional_bind_request`/`institutional_bind_response`,
+   `institutional_route_request`/`institutional_route_response`,
+   `institutional_navigated_request`/`institutional_navigated_response`, and
+   `institutional_reconcile_request`/`institutional_reconcile_response`
+   families. Requests are bounded and URL-free; only a successful route
+   response may carry a transient URL. Responses use the closed outcome
+   vocabulary (`feature_disabled`, `claimed`, `bound`, `issued`, `acknowledged`,
+   `reconciled`, `stale`, `not_eligible`, `busy`, `error`) and
+   disposition-gated fields; unknown fields are rejected. Reconcile is the only
+   non-job-scoped request.
+3. The extension's explicit versioned managed-state migration scrubs legacy
+   URLs, hashes, and global terms authority, while preserving only safe current
+   non-URL job, download, and lease state. Ambiguous browser queues are not
+   promoted into daemon authority.
+4. Every new handler returns structured `feature_disabled` without mutation.
+   Feature advertisement and bounded negotiation do not activate a handler or
+   create a candidate.
+ 
+No Phase 2 materialization behavior, provider readiness, automatic first route,
+source-gate cutover, or concurrency increase is included. This coordinated
+change keeps the direct-to-main fallback paths and makes no compatibility
+promise beyond bounded feature negotiation.
+ 
 The hard enablement chain is:
 
 ```text
@@ -37,9 +83,9 @@ The chain is strict. Provider repair, cohort preparation, and fixture work may
 run in parallel with Phases 0–4, but no phase may consume evidence from a later
 phase or silently enable its behavior.
 
-## Immediate first three changes
+## Initial three direct-to-main changes — complete
 
-These are the first three direct-to-main changes. Each has one primary owner,
+These were the first three direct-to-main changes. Each has one primary owner,
 one bounded review surface, and a narrow rollback.
 
 ### Change 0.1 — Ratify the authority and identity contract
@@ -47,10 +93,9 @@ one bounded review surface, and a narrow rollback.
 **Targets:** ADR-0022, this plan, and the curated architecture summary.  
 **Purpose:** freeze the daemon/extension split, the three business identities,
 holder generation, attempt/revision rules, typed gates, cooldown scopes,
-suppression/winner rules, privacy inventory, and the −1–8 sequence before new
-state or protocol is built.  
-**Non-goals:** no runtime behavior change, no new protocol frame, no provider
-qualification, and no source-gate bypass.
+suppression/winner rules, privacy inventory, and the −1–8 sequence.  
+**Non-goals:** no runtime behavior change, no new provider qualification, and
+no source-gate bypass.
 
 **Exit:** the three documents agree on terminology and all later changes can
 cite one authority model without reopening it.
@@ -128,10 +173,10 @@ extension memory, the active tab, and ordinary browser history. Durable state,
 events, diagnostics, logs, captures, and errors retain only opaque claim data,
 route class, revisions, and bounded result codes.
 
-## Phase 0 contract and observability
+## Phase 0 contract and observability — complete
 
-Phase 0 is an observation-only cutover. At the current decision point, the
-processing epoch classifies one blocker from this closed vocabulary:
+Phase 0 was an observation-only cutover. At the decision point, the processing
+epoch classifies one blocker from this closed vocabulary:
 
 ```text
 none
@@ -145,7 +190,7 @@ identifier_gate
 
 `none` is written when no blocker exists; omission is not a second meaning.
 `canary_ready_route_exists` is a separate boolean. It is conservatively false
-now and becomes meaningful only once Phase 5 adds exact qualified-route state.
+until Phase 5 adds exact qualified-route state.
 
 The decision payload is committed atomically with the decisive transition and
 is never a separate appended event. It contains no provider route, bearer,
@@ -173,31 +218,45 @@ The baseline is fixed and stays enabled while later phases land:
 Automatic first-route behavior, source-gate bypass, and concurrency four remain
 off. Phase −1 completion is not evidence that any provider is ready.
 
-## Phase 1 — additive durable state and strict protocol (dark)
+## Phase 1 — additive durable state and strict protocol (implemented-but-dark)
 
-Add only state that cannot be safely reconstructed from replay:
+Migration `0026` adds seven daemon-owned projections that cannot be safely
+reconstructed from replay:
+1. `institution_profiles`, including opaque profile and authentication-claim
+   IDs plus authority revisions;
+2. URL-free `browser_candidates` with immutable authority columns;
+3. `materialization_claims` with opaque binding IDs and holder generations;
+4. `profile_evidence` observations with a current exact-profile projection;
+5. `human_gate_observations` as the current typed gate projection;
+6. `route_suppressions` at the exact profile/route/safety/adapter/strategy
+   scope; and
+7. insert-only `artifact_winners` CAS state.
 
-- institution profile IDs/revisions and authentication claims;
-- browser candidates with no URL;
-- materialization claims and opaque binding IDs;
-- profile evidence observations/current projections;
-- typed human-gate observations;
-- route suppressions and artifact-winner CAS state; and
-- holder generations, permits, revisions, and migration markers.
+`user_version` is `26`. The extension's explicit versioned managed-state
+migration scrubs old URLs, hashes, global terms authority, and ambiguous
+unmaterialized browser queues; it preserves only safe current non-URL job,
+download, and lease state. No fresh route is migrated or durably stored.
 
-Use new feature-gated, solicited message families. Do not widen strict job
-offers, handoff links, session evidence, provider outcomes, or ratified v1
-results. Old extension/new daemon and new extension/old daemon pairs retain the
-current explicit fallback with no unknown frame. Prove worst-case request and
-aggregate response sizes with explicit headroom before activation.
+The strict, feature-negotiated `institutional_materialization_v1` protocol
+contains paired `institutional_claim_request`/`institutional_claim_response`,
+`institutional_bind_request`/`institutional_bind_response`,
+`institutional_route_request`/`institutional_route_response`,
+`institutional_navigated_request`/`institutional_navigated_response`, and
+`institutional_reconcile_request`/`institutional_reconcile_response` families.
+All requests except reconcile are job-scoped. IDs are opaque bounded strings;
+tab IDs and ordinals are bounded safe integers. URLs are forbidden except in a
+successful transient route response and are never stored or logged.
 
-Scrub rather than promote ambiguous state: old fresh URLs, URL-bearing tab
-rows, global terms consent, old deterministic claim hashes, old job-wide
-suppression, and unmaterialized browser queues do not become new authority.
-Old warm evidence is not migrated into a new profile revision.
+Responses use only the closed outcomes `feature_disabled`, `claimed`, `bound`,
+`issued`, `acknowledged`, `reconciled`, `stale`, `not_eligible`, `busy`, and
+`error`. Fields are disposition-gated and unknown fields are rejected. Every
+Phase 1 handler is hard-disabled: it returns structured `feature_disabled` and
+performs no mutation. Feature negotiation is the only compatibility burden;
+there are no broad shims or widened existing messages.
 
-**Gate:** migrations, rollback/startup behavior, mixed-version behavior, and
-IPC-size proof pass. All capabilities remain dark.
+Automatic candidate claiming, materialization, tab creation, navigation,
+downloads, source-gate bypass, provider canaries, and concurrency changes
+remain disabled. Phase 2 behavior is not implemented by this note.
 
 ## Phase 2 — recoverable explicit materialization
 

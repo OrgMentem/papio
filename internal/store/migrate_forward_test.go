@@ -55,9 +55,11 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 25 {
-		t.Fatalf("user_version = %d, %v; want 25", version, err)
+	if err != nil || version != 26 {
+		t.Fatalf("user_version = %d, %v; want 26", version, err)
 	}
+	assertInstitutionalMaterializationSchema(t, ctx, migrated)
+
 	var status string
 	if err := migrated.DB().QueryRowContext(ctx,
 		`SELECT status FROM zotio_tag_state WHERE item_key = 'LEGACY13'`,
@@ -120,9 +122,10 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 25 {
-		t.Fatalf("user_version = %d, %v; want 25", version, err)
+	if err != nil || version != 26 {
+		t.Fatalf("user_version = %d, %v; want 26", version, err)
 	}
+	assertInstitutionalMaterializationSchema(t, ctx, migrated)
 
 	var jobs, actions, exports int
 	if err := migrated.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs").Scan(&jobs); err != nil {
@@ -213,5 +216,97 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}, worker, nil)
 	if !report.OK {
 		t.Fatalf("doctor after roll-forward is unhealthy: %+v", report)
+	}
+}
+func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context, db *store.Store) {
+	t.Helper()
+	const tables = `
+		SELECT name FROM sqlite_master
+		WHERE type = 'table' AND name IN (
+			'institution_profiles',
+			'browser_candidates',
+			'materialization_claims',
+			'profile_evidence',
+			'human_gate_observations',
+			'route_suppressions',
+			'artifact_winners'
+		)`
+	rows, err := db.DB().QueryContext(ctx, tables)
+	if err != nil {
+		t.Fatalf("list institutional materialization tables: %v", err)
+	}
+	defer rows.Close()
+	foundTables := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan institutional materialization table: %v", err)
+		}
+		foundTables[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate institutional materialization tables: %v", err)
+	}
+	for _, name := range []string{
+		"institution_profiles",
+		"browser_candidates",
+		"materialization_claims",
+		"profile_evidence",
+		"human_gate_observations",
+		"route_suppressions",
+		"artifact_winners",
+	} {
+		if !foundTables[name] {
+			t.Errorf("migration did not create table %q", name)
+		}
+	}
+
+	const indexes = `
+		SELECT name FROM sqlite_master
+		WHERE type = 'index' AND name IN (
+			'institution_profiles_active_name',
+			'browser_candidates_by_job',
+			'browser_candidates_by_profile',
+			'materialization_claims_by_candidate',
+			'materialization_claims_live_candidate',
+			'profile_evidence_by_profile',
+			'profile_evidence_producer_observation',
+			'human_gate_observations_by_status',
+			'route_suppressions_by_job',
+			'route_suppressions_active_exact',
+			'artifact_winners_by_candidate'
+		)`
+	rows, err = db.DB().QueryContext(ctx, indexes)
+	if err != nil {
+		t.Fatalf("list institutional materialization indexes: %v", err)
+	}
+	defer rows.Close()
+	foundIndexes := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan institutional materialization index: %v", err)
+		}
+		foundIndexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate institutional materialization indexes: %v", err)
+	}
+	for _, name := range []string{
+		"institution_profiles_active_name",
+		"browser_candidates_by_job",
+		"browser_candidates_by_profile",
+		"materialization_claims_by_candidate",
+		"materialization_claims_live_candidate",
+		"profile_evidence_by_profile",
+		"profile_evidence_producer_observation",
+		"human_gate_observations_by_status",
+		"route_suppressions_by_job",
+		"route_suppressions_active_exact",
+		"artifact_winners_by_candidate",
+	} {
+		if !foundIndexes[name] {
+			t.Errorf("migration did not create index %q", name)
+		}
 	}
 }

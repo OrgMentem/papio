@@ -12,6 +12,7 @@ import {
   parseBrowserMessage,
   parseBrowserMessageBytes,
 } from "../src/protocol";
+import type { BrowserMessageType } from "../src/protocol";
 
 const corpusRoot = join(import.meta.dir, "..", "..", "testdata", "protocol");
 
@@ -781,4 +782,84 @@ test("page_bulk_submit_result rejects negative counts and a malformed batch_id",
   expect(() => parseBrowserMessage(frame({ ...base, submitted: -1, batch_id: "batch_bulk_00001" }))).toThrow(ProtocolError);
   expect(() => parseBrowserMessage(frame({ ...base, batch_id: "short" }))).toThrow(ProtocolError);
   expect(() => parseBrowserMessage(frame(base))).toThrow(ProtocolError);
+});
+
+ 
+test("institutional materialization families are strict, bounded, and job-scoped", () => {
+  type InstitutionalMessageType = Extract<BrowserMessageType, `institutional_${string}`>;
+  const envelope = (type: InstitutionalMessageType, payload: Record<string, unknown>, job = "job-inst-001") => ({
+    protocol: "papio-browser/1",
+    type,
+    msg_id: "msg-inst-001",
+    seq: 1,
+    ...(job === "" ? {} : { job_id: job }),
+    payload,
+  });
+  const ids = { candidate_id: "candidate-001", claim_id: "claim-001", binding_id: "binding-001" };
+  const valid: Array<readonly [InstitutionalMessageType, Record<string, unknown>, string]> = [
+    ["institutional_claim_request", { candidate_id: ids.candidate_id, materialization_kind: "browser_tab" }, "job-inst-001"],
+    ["institutional_claim_response", {
+      outcome: "claimed", ...ids, browser_holder_generation: 1, lease_until: "2026-08-11T12:00:00Z",
+    }, "job-inst-001"],
+    ["institutional_bind_request", { claim_id: ids.claim_id, binding_id: ids.binding_id, tab_id: 7 }, "job-inst-001"],
+    ["institutional_bind_response", { outcome: "bound", claim_id: ids.claim_id, binding_id: ids.binding_id }, "job-inst-001"],
+    ["institutional_route_request", { claim_id: ids.claim_id, binding_id: ids.binding_id }, "job-inst-001"],
+    ["institutional_route_response", {
+      outcome: "issued", claim_id: ids.claim_id, binding_id: ids.binding_id, route_issuance_ordinal: 0,
+      url: "https://resolver.example.edu/open",
+    }, "job-inst-001"],
+    ["institutional_navigated_request", {
+      claim_id: ids.claim_id, binding_id: ids.binding_id, route_issuance_ordinal: 0, tab_id: 7,
+    }, "job-inst-001"],
+    ["institutional_navigated_response", { outcome: "acknowledged", claim_id: ids.claim_id, binding_id: ids.binding_id }, "job-inst-001"],
+    ["institutional_reconcile_request", {
+      bindings: [{ binding_id: ids.binding_id, tab_id: 7 }],
+    }, ""],
+    ["institutional_reconcile_response", {
+      outcome: "reconciled",
+      claims: [{ claim_id: ids.claim_id, binding_id: ids.binding_id, candidate_id: ids.candidate_id, phase: "bound", tab_id: 7 }],
+    }, ""],
+  ];
+  for (const [type, payload, job] of valid) {
+    expect(parseBrowserMessage(envelope(type, payload, job)).type).toBe(type);
+  }
+
+  const disabled = [
+    ["institutional_claim_response", { outcome: "feature_disabled", detail: "dark" }],
+    ["institutional_bind_response", { outcome: "feature_disabled", detail: "dark" }],
+    ["institutional_route_response", { outcome: "feature_disabled", detail: "dark" }],
+    ["institutional_navigated_response", { outcome: "feature_disabled", detail: "dark" }],
+    ["institutional_reconcile_response", { outcome: "feature_disabled", detail: "dark" }],
+  ] as const;
+  for (const [type, payload] of disabled) {
+    const job = type.startsWith("institutional_reconcile") ? "" : "job-inst-001";
+    expect(parseBrowserMessage(envelope(type, payload, job)).type).toBe(type);
+  }
+
+  expect(() => parseBrowserMessage(envelope(
+    "institutional_claim_request", { candidate_id: ids.candidate_id, materialization_kind: "browser_tab" }, "",
+  ))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(envelope(
+    "institutional_reconcile_request", { bindings: [{ binding_id: ids.binding_id, tab_id: 1 }], extra: true }, "",
+  ))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(envelope(
+    "institutional_route_response", { outcome: "stale", detail: "late", url: "https://resolver.example.edu/x" }, "",
+  ))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(envelope(
+    "institutional_route_response", { outcome: "issued", claim_id: ids.claim_id, binding_id: ids.binding_id, route_issuance_ordinal: 0 }, "",
+  ))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(envelope(
+    "institutional_bind_request", { claim_id: ids.claim_id, binding_id: ids.binding_id, tab_id: Number.MAX_SAFE_INTEGER + 1 }, "job-inst-001",
+  ))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(envelope(
+    "institutional_reconcile_request", {
+      bindings: Array.from({ length: 33 }, (_, i) => ({ binding_id: `binding-${String(i).padStart(3, "0")}`, tab_id: i })),
+    }, "",
+  ))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(envelope(
+    "institutional_claim_request", { candidate_id: "x".repeat(129), materialization_kind: "browser_tab" }, "job-inst-001",
+  ))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(envelope(
+    "institutional_bind_request", { claim_id: ids.claim_id, binding_id: ids.binding_id, tab_id: -1 }, "job-inst-001",
+  ))).toThrow(ProtocolError);
 });

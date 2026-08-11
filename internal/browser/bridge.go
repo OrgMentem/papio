@@ -80,10 +80,11 @@ const (
 	// pdfGrabV1Feature is ADR-0020's PDF-grab capability flag: it gates both
 	// the pdf_grab_request/pdf_grab_result message pair and, extension-side,
 	// whether the workspace even renders the grab row.
-	pdfGrabV1Feature            = "pdf_grab_v1"
-	handoffLinkV1Feature        = "handoff_link_v1"
-	providerDirectGetV1Feature  = "provider_direct_get_v1"
-	providerDriveEpochV1Feature = "provider_drive_epoch_v1"
+	pdfGrabV1Feature                    = "pdf_grab_v1"
+	handoffLinkV1Feature                = "handoff_link_v1"
+	providerDirectGetV1Feature          = "provider_direct_get_v1"
+	providerDriveEpochV1Feature         = "provider_drive_epoch_v1"
+	institutionalMaterializationFeature = protocol.InstitutionalMaterializationFeature
 	// ProviderDirectGetMinExtensionVersion gates the additive frame away from
 	// released 0.13.x sessions whose strict parser cannot know this message.
 	ProviderDirectGetMinExtensionVersion = "0.14.0"
@@ -366,7 +367,7 @@ func (source parkedGrabItemSource) SnapshotItems(ctx context.Context, tx *sql.Tx
 
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, institutionalMaterializationFeature,
 	}
 	var grabs *grab.Service
 	if jobs != nil {
@@ -831,10 +832,53 @@ func (b *Bridge) helloAck() (json.RawMessage, error) {
 	})
 }
 
+func institutionalMaterializationMessage(msgType string) bool {
+	switch msgType {
+	case protocol.MsgInstitutionalClaimRequest, protocol.MsgInstitutionalBindRequest,
+		protocol.MsgInstitutionalRouteRequest, protocol.MsgInstitutionalNavigatedRequest,
+		protocol.MsgInstitutionalReconcileRequest:
+		return true
+	}
+	return false
+}
+
+// institutionalMaterializationDisabled is deliberately side-effect free in
+// Phase 1: capability advertisement is the only change, and every request is
+// answered with its paired structured refusal.
+func (b *Bridge) institutionalMaterializationDisabled(msg *protocol.BrowserMessage) ([]json.RawMessage, error) {
+	detail := "institutional materialization is disabled"
+	var responseType string
+	var payload any
+	switch msg.Type {
+	case protocol.MsgInstitutionalClaimRequest:
+		responseType, payload = protocol.MsgInstitutionalClaimResponse, protocol.InstitutionalClaimResponsePayload{Outcome: "feature_disabled", Detail: detail}
+	case protocol.MsgInstitutionalBindRequest:
+		responseType, payload = protocol.MsgInstitutionalBindResponse, protocol.InstitutionalBindResponsePayload{Outcome: "feature_disabled", Detail: detail}
+	case protocol.MsgInstitutionalRouteRequest:
+		responseType, payload = protocol.MsgInstitutionalRouteResponse, protocol.InstitutionalRouteResponsePayload{Outcome: "feature_disabled", Detail: detail}
+	case protocol.MsgInstitutionalNavigatedRequest:
+		responseType, payload = protocol.MsgInstitutionalNavigatedResponse, protocol.InstitutionalNavigatedResponsePayload{Outcome: "feature_disabled", Detail: detail}
+	case protocol.MsgInstitutionalReconcileRequest:
+		responseType, payload = protocol.MsgInstitutionalReconcileResponse, protocol.InstitutionalReconcileResponsePayload{Outcome: "feature_disabled", Detail: detail}
+	default:
+		// The caller filters through institutionalMaterializationMessage first.
+		// Never turn an unreachable dispatch mismatch into a session-fatal error.
+		return nil, nil
+	}
+	frame, err := b.frame(responseType, msg.JobID, payload)
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
 // handle dispatches one decoded inbound frame from sessionID.
 func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.BrowserMessage) ([]json.RawMessage, error) {
 	if msg.Type == protocol.MsgHello {
 		return b.handleHello(sessionID, msg.Payload.(*protocol.HelloPayload))
+	}
+	if institutionalMaterializationMessage(msg.Type) {
+		return b.institutionalMaterializationDisabled(msg)
 	}
 	session := b.sessionByID(sessionID)
 	if session == nil {

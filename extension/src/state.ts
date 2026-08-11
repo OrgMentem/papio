@@ -5,21 +5,21 @@
 // is pure over an injected StateBackend so it is unit-testable without chrome.
 //
 // Privacy invariant: no identity-provider URL, host, title, query, or fragment
-// is persisted. Legacy daemons still require resolver offer URLs for restart
-// recovery; handoff_link_v1 jobs retain only an opaque institution claim key.
+// is persisted. Legacy URL-bearing state is migrated to the URL-free managed
+// shape below; handoff URLs remain worker-local compatibility data only.
 
 import type { DeliverySessionEvidence } from "./protocol";
 import type { FederatedClaimPhase } from "./federated-claim";
 
 export type JobStatus = "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
 
-/** Browser-managed delivery of an active PDF tab. The URL is intentionally
- * retained only in this narrow record so a suspended worker can finish the
- * exact download; it must never be copied into another persisted field. */
+/** Browser-managed delivery correlation. The source URL is worker-local and
+ * intentionally omitted by the managed-state migration/serializer. */
 export type PendingDeliveryStatus = "sending" | "downloaded" | "failed";
 export interface PendingDelivery {
   job_id: string;
-  url: string;
+  /** Present only while this worker is alive; never written to managed state. */
+  url?: string;
   initiated_at: number;
   status?: PendingDeliveryStatus;
   error?: string;
@@ -28,13 +28,7 @@ export interface PendingDelivery {
    * host cannot be re-read from the tab once the bytes land. */
   page_host?: string;
   /** Session evidence available at the moment the delivery was requested,
-   * frozen alongside page_host. keepaliveAuthenticated/authReturnedThisWorker/
-   * lastAuthReturnedAt are live global state, not scoped to this tab or
-   * download — the multi-second download window leaves time for an
-   * institutional probe or sign-in to complete elsewhere in the browser, and
-   * reading evidence again at completion would credit this delivery with
-   * that unrelated session instead of the one that actually existed when the
-   * page produced the bytes. */
+   * frozen alongside page_host. */
   session_evidence?: DeliverySessionEvidence;
 }
 
@@ -258,62 +252,34 @@ export interface ProviderDrainLease {
 export interface StoreShape {
   activeJobs: ActiveJob[];
   /** The one operator-initiated PDF delivery currently awaiting daemon
-   * adoption. The URL is retained only here and is cleared after ack. */
+   * adoption. URL is worker-local and is not durable. */
   pendingDelivery?: PendingDelivery;
-  /** Resolver-provided offer URL by active job. This is needed to recreate a
-   * broker handoff after a service-worker restart. */
+  /** Resolver-provided offer URLs remain worker-local compatibility data and
+   * are always dropped by managed persistence. */
   offerURLs?: Record<string, string>;
-  /** Most recent local proof that an institutional login returned to a provider.
-   * It is bounded by the bridge before use and lets queued jobs drain after an
-   * MV3 restart while the session is still warm. */
+  /** Most recent auth return, retained as a display hint. */
   lastAuthReturnedAt?: number;
-  /** Epoch ms of the most recent release-grade observation or warm institutional
-   * landing, per configured resolver origin. This — not the global
-   * lastAuthReturnedAt — is the authorization input for releasing that origin's
-   * queued handoffs, and it must survive a service-worker restart: an MV3 worker
-   * dies constantly, and losing authority on every restart would park the
-   * operator's accepted work behind a probe that may have no inspectable tab.
-   * lastAuthReturnedAt stays for display only. */
+  /** Release-grade evidence by configured resolver origin. */
   authEvidenceByOrigin?: Record<string, number>;
-  /** Per-job count of authentication drives that never reached a download,
-   * within this browser session. Accumulates across worker restarts and parks
-   * (cleared on browser close with the rest of session state); reset once a
-   * download proves the session works. Bounds re-driving a job whose warm SSO
-   * session cannot complete human authentication. */
+  /** Per-job authentication attempt counts. */
   authAttempts?: Record<string, number>;
-  /** Per-provider drain leases. These contain only a canonical provider-host
-   * key, expiry, and optional park reason — never a resolver or identity URL. */
+  /** Per-provider drain leases keyed by canonical provider host. */
   providerDrainLeases?: Record<string, ProviderDrainLease>;
-  /** Id of papio's dedicated background work window, when work-window mode
-   * has created one this browser session. Window ids are session-scoped, never
-   * sensitive. Verified live (and recreated) before every reuse. */
+  /** Session-scoped work window and tab-group ids. */
   workWindowID?: number;
-  /** Id of papio's collapsed "papio" tab group in the user's window, when
-   * tab-group mode has created one this browser session. Group ids are
-   * session-scoped, never sensitive. Verified live (and recreated) before reuse. */
   handoffGroupID?: number;
-  /** Native-daemon connection and capability data, refreshed by hello_ack.
-   * Version is null when an older daemon does not report one. */
+  /** Native-daemon connection and capability data from hello_ack. */
   connectionStatus?: DaemonConnectionStatus;
   daemonVersion?: string | null;
-  /** True when this build shipped with a newer daemon than the one connected. */
   daemonUpdateHint?: boolean;
   daemonFeatures?: string[];
-  /** https origins of the daemon's configured OpenURL resolvers, from hello_ack.
-   * The popup and options page request a host permission for each so papio can
-   * steer that resolver's menu. Not sensitive: these are the user's own library
-   * discovery hosts, the same origins already carried in every job offer. */
+  /** Configured resolver origins, normalized to origins during migration. */
   resolverOrigins?: string[];
-  /** Exact provider hosts currently blocking a tracked handoff because the
-   * browser lacks effective access. Kept after a job finishes so the popup and
-   * badge describe the standing condition until access changes. */
+  /** Provider hosts currently blocked by browser access. */
   blockedProviderHosts?: string[];
-  /** Provider registrable-host cooldowns after a security check or redirect
-   * loop. Values are epoch milliseconds; no URL or IdP data is retained. */
+  /** Provider-host security-check cooldowns. */
   challengeCooldowns?: Record<string, number>;
-  /** One live login-tab claim per federated-login tuple, keyed by an opaque
-   * SHA-256 digest so the persisted map contains neither raw origin nor
-   * entityID. See FederatedLoginOwner's doc comment for the full lifecycle. */
+  /** Legacy browser claim map; never promoted by managed-state migration. */
   federatedLoginOwners?: Record<string, FederatedLoginOwner>;
 }
 
@@ -404,7 +370,377 @@ export function clearPendingDelivery(store: StoreShape, jobID?: string): StoreSh
   return next;
 }
 
+/** Version of the durable managed-state shape. The storage key predates this
+ * field, so version 1 means the unversioned `papio_state_v1` blob. */
+export const MANAGED_STATE_VERSION = 2;
 const STORAGE_KEY = "papio_state_v1";
+type UnknownRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+function safeHost(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const host = value.trim().toLowerCase();
+  if (host.length === 0 || host.length > 253) return undefined;
+  const labels = host.split(".");
+  if (labels.some((label) =>
+    label.length === 0 ||
+    label.length > 63 ||
+    !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
+  )) return undefined;
+  return host;
+}
+
+function isURLLike(value: string): boolean {
+  const trimmed = value.trim();
+  return /^(?:https?|ftp|chrome|moz-extension|file|papio):/i.test(trimmed) ||
+    /^(?:[a-z][a-z\d+.-]*:)?\/\//i.test(trimmed);
+}
+
+function safeOrigin(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  try {
+    const parsed = new URL(value);
+    if ((parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+        parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "") return undefined;
+    return parsed.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function forbiddenPersistedKey(key: string): boolean {
+  const normalized = key.replace(/[-_]/g, "").toLowerCase();
+  const globalTermsAuthority = normalized !== "needstermsconsent" &&
+    normalized.includes("terms") &&
+    (normalized.includes("consent") || normalized.includes("accept") || normalized.includes("authority"));
+  return normalized.includes("url") ||
+    globalTermsAuthority ||
+    normalized.includes("claim") ||
+    normalized.includes("authkey") ||
+    normalized.includes("authhash") ||
+    normalized.includes("authdigest") ||
+    normalized.includes("institutionhash");
+}
+
+/** Copy legacy data while dropping URL-bearing and authority-bearing leaves.
+ * This is deliberately recursive: old worker versions added fields over time,
+ * and an unknown nested URL must never become durable merely because its parent
+ * was known. */
+function scrubValue(value: unknown, key = ""): unknown {
+  if (forbiddenPersistedKey(key)) return undefined;
+  if (typeof value === "string") return isURLLike(value) ? undefined : value;
+  if (Array.isArray(value)) {
+    return value.map((item) => scrubValue(item)).filter((item) => item !== undefined);
+  }
+  if (!isRecord(value)) return value;
+  const out: UnknownRecord = {};
+  for (const [childKey, childValue] of Object.entries(value)) {
+    const scrubbed = scrubValue(childValue, childKey);
+    if (scrubbed !== undefined) out[childKey] = scrubbed;
+  }
+  return out;
+}
+
+function scrubRecord(value: unknown): UnknownRecord | undefined {
+  const scrubbed = scrubValue(value);
+  return isRecord(scrubbed) ? scrubbed : undefined;
+}
+const JOB_STATUSES: readonly JobStatus[] = ["offered", "queued", "accepted", "auth_pending", "awaiting_download"];
+const DELIVERY_STATUSES: readonly PendingDeliveryStatus[] = ["sending", "downloaded", "failed"];
+
+function validActiveJob(value: unknown): value is ActiveJob {
+  if (!isRecord(value) ||
+      typeof value.job_id !== "string" ||
+      typeof value.tab_id !== "number" ||
+      !Number.isInteger(value.tab_id) ||
+      !isFiniteNumber(value.offered_at) ||
+      !isFiniteNumber(value.expires_at) ||
+      typeof value.status !== "string" ||
+      !JOB_STATUSES.includes(value.status as JobStatus) ||
+      !Array.isArray(value.provider_hosts)) return false;
+  const providerHosts: unknown[] = value.provider_hosts;
+  return providerHosts.every((host) => safeHost(host) !== undefined);
+}
+function migratedDriveEpoch(value: unknown): ProviderDriveEpoch | undefined {
+  if (!isRecord(value) || typeof value.drive_attempt_id !== "string" || isURLLike(value.drive_attempt_id)) {
+    return undefined;
+  }
+  const ordinal = value.ordinal;
+  const strategy = value.strategy;
+  const attemptCount = value.attempt_count;
+  if (!isFiniteNumber(ordinal) || !Number.isInteger(ordinal) ||
+      (strategy !== "direct" && strategy !== "generic") ||
+      !isFiniteNumber(attemptCount) || !Number.isInteger(attemptCount)) return undefined;
+  const epoch: ProviderDriveEpoch = {
+    drive_attempt_id: value.drive_attempt_id,
+    ordinal,
+    strategy,
+    attempt_count: attemptCount,
+  };
+  if (typeof value.route_revision === "string" && !isURLLike(value.route_revision)) {
+    epoch.route_revision = value.route_revision;
+  }
+  if (typeof value.revision === "string" && !isURLLike(value.revision)) epoch.revision = value.revision;
+  if (typeof value.strategy_id === "string" && !isURLLike(value.strategy_id)) epoch.strategy_id = value.strategy_id;
+  const inFlightDownloadID = value.in_flight_download_id;
+  if (isFiniteNumber(inFlightDownloadID) && Number.isInteger(inFlightDownloadID)) {
+    epoch.in_flight_download_id = inFlightDownloadID;
+  }
+  return epoch;
+}
+function migratedJob(value: ActiveJob, droppedClaimOwnerJobIDs: ReadonlySet<string>): ActiveJob {
+  const scrubbed = scrubRecord(value) ?? {};
+  const migrated: ActiveJob = {
+    ...scrubbed,
+    job_id: value.job_id,
+    tab_id: value.tab_id,
+    offered_at: value.offered_at,
+    expires_at: value.expires_at,
+    status: value.status,
+    provider_hosts: value.provider_hosts.map(safeHost).filter((host): host is string => host !== undefined),
+  };
+  const raw = value as unknown as UnknownRecord;
+  const droppedWaitAuthority =
+    droppedClaimOwnerJobIDs.has(value.job_id) ||
+    raw.waiting_for_session === true ||
+    raw.waiting_for_session_key !== undefined ||
+    raw.institution_claim_key !== undefined;
+  delete migrated.institution_claim_key;
+  delete migrated.waiting_for_session_key;
+  delete migrated.direct_envelope;
+  if (isFiniteNumber(value.auth_started_ms)) migrated.auth_started_ms = value.auth_started_ms;
+  const expectedRaw = value.expected;
+  if (isRecord(expectedRaw)) {
+    const expected: NonNullable<ActiveJob["expected"]> = {};
+    if (typeof expectedRaw.title === "string" && !isURLLike(expectedRaw.title)) expected.title = expectedRaw.title;
+    if (typeof expectedRaw.doi === "string" && !isURLLike(expectedRaw.doi)) expected.doi = expectedRaw.doi;
+    if (Object.keys(expected).length > 0) migrated.expected = expected;
+  }
+  if (typeof value.requires_auth === "boolean") migrated.requires_auth = value.requires_auth;
+  if (typeof value.direct_terminal === "boolean") migrated.direct_terminal = value.direct_terminal;
+  const driveEpoch = migratedDriveEpoch(value.drive_epoch);
+  if (driveEpoch !== undefined) migrated.drive_epoch = driveEpoch;
+  const envelopeRaw = value.direct_envelope;
+  if (isRecord(envelopeRaw)) {
+    const allowedOrigin = safeOrigin(envelopeRaw.allowed_origin);
+    const pathFamily = envelopeRaw.path_family;
+    const expectedIdentifier = envelopeRaw.expected_identifier;
+    if (allowedOrigin !== undefined &&
+        typeof pathFamily === "string" && !isURLLike(pathFamily) &&
+        typeof expectedIdentifier === "string" && !isURLLike(expectedIdentifier)) {
+      migrated.direct_envelope = {
+        allowed_origin: allowedOrigin,
+        path_family: pathFamily,
+        expected_identifier: expectedIdentifier,
+      };
+    }
+  }
+  const genericAttemptedStrategies = value.generic_attempted_strategies;
+  if (Array.isArray(genericAttemptedStrategies)) {
+    const strategies: unknown[] = genericAttemptedStrategies;
+    migrated.generic_attempted_strategies = strategies
+      .filter((strategy): strategy is string => typeof strategy === "string" && !isURLLike(strategy));
+  }
+  if (isFiniteNumber(value.generic_positive_attempts)) migrated.generic_positive_attempts = value.generic_positive_attempts;
+  if (typeof value.generic_terminal === "boolean") migrated.generic_terminal = value.generic_terminal;
+  if (typeof value.engagement_required === "boolean") migrated.engagement_required = value.engagement_required;
+  if (typeof value.fresh_handoff === "boolean") migrated.fresh_handoff = value.fresh_handoff;
+  if (typeof value.download_initiated === "boolean") migrated.download_initiated = value.download_initiated;
+  const unknownCount = value.unknown_count;
+  if (isFiniteNumber(unknownCount) && Number.isInteger(unknownCount)) migrated.unknown_count = unknownCount;
+  if (isFiniteNumber(value.last_unknown_ms)) migrated.last_unknown_ms = value.last_unknown_ms;
+  if (typeof value.needs_terms_consent === "boolean") migrated.needs_terms_consent = value.needs_terms_consent;
+  const blockedProviderHost = safeHost(value.blocked_provider_host);
+  if (blockedProviderHost !== undefined) migrated.blocked_provider_host = blockedProviderHost;
+  if (typeof value.challenge_blocked === "boolean") migrated.challenge_blocked = value.challenge_blocked;
+  const challengeHost = safeHost(value.challenge_host);
+  if (challengeHost !== undefined) migrated.challenge_host = challengeHost;
+  if (value.challenge_kind === "cloudflare" || value.challenge_kind === "redirect_loop") {
+    migrated.challenge_kind = value.challenge_kind;
+  }
+  if (isFiniteNumber(value.challenge_blocked_at)) migrated.challenge_blocked_at = value.challenge_blocked_at;
+  if (typeof value.handoffAckPending === "boolean") migrated.handoffAckPending = value.handoffAckPending;
+  if (droppedWaitAuthority) {
+    // The old claim owner/key is deliberately not retained. Clear every
+    // marker that depended on it so startup reconciliation sees a normal
+    // schedulable job, while preserving its safe tab/job correlation above.
+    const migratedRecord = migrated as unknown as UnknownRecord;
+    for (const key of [
+      "waiting_for_session",
+      "waiting_since",
+      "waiting_deadline",
+      "waiting_reason",
+      "waitingReason",
+      "parked_with_tab",
+      "parked_at",
+      "parked_reason",
+    ]) {
+      delete migratedRecord[key];
+    }
+  } else {
+    if (typeof value.parked_with_tab === "boolean") migrated.parked_with_tab = value.parked_with_tab;
+    if (typeof value.waiting_for_session === "boolean") migrated.waiting_for_session = value.waiting_for_session;
+    if (isFiniteNumber(value.waiting_deadline)) migrated.waiting_deadline = value.waiting_deadline;
+  }
+  return migrated;
+}
+
+function migratedPendingDelivery(value: unknown): PendingDelivery | undefined {
+  if (!isRecord(value) || typeof value.job_id !== "string" || !isFiniteNumber(value.initiated_at)) return undefined;
+  const migrated: PendingDelivery = {
+    job_id: value.job_id,
+    initiated_at: value.initiated_at,
+  };
+  if (typeof value.status === "string" && DELIVERY_STATUSES.includes(value.status as PendingDeliveryStatus)) {
+    migrated.status = value.status as PendingDeliveryStatus;
+  }
+  const pageHost = safeHost(value.page_host);
+  if (pageHost !== undefined) migrated.page_host = pageHost;
+  if (typeof value.error === "string" && !isURLLike(value.error)) migrated.error = value.error;
+  if (value.session_evidence === "fresh_auth" || value.session_evidence === "warm" || value.session_evidence === "none") {
+    migrated.session_evidence = value.session_evidence;
+  }
+  return migrated;
+}
+
+
+function migratedOriginMap(value: unknown): Record<string, number> | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: Record<string, number> = {};
+  for (const [origin, timestamp] of Object.entries(value)) {
+    const normalized = safeOrigin(origin);
+    if (normalized !== undefined && isFiniteNumber(timestamp)) out[normalized] = timestamp;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
+function migratedNumberMap(value: unknown): Record<string, number> | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: Record<string, number> = {};
+  for (const [key, numberValue] of Object.entries(value)) {
+    if (isFiniteNumber(numberValue)) out[key] = numberValue;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
+function migratedLeaseMap(value: unknown): Record<string, ProviderDrainLease> | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: Record<string, ProviderDrainLease> = {};
+  for (const [key, candidate] of Object.entries(value)) {
+    const providerKey = safeHost(key);
+    if (!providerKey || !isRecord(candidate) || !isFiniteNumber(candidate.expiresAt)) continue;
+    const lease: ProviderDrainLease = { providerKey, expiresAt: candidate.expiresAt };
+    if (candidate.parkedReason === "challenge") lease.parkedReason = "challenge";
+    out[providerKey] = lease;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
+function migratedCooldownMap(value: unknown): Record<string, number> | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: Record<string, number> = {};
+  for (const [key, numberValue] of Object.entries(value)) {
+    const host = safeHost(key);
+    if (host !== undefined && isFiniteNumber(numberValue)) out[host] = numberValue;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
+function migratedString(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  return typeof value === "string" && !isURLLike(value) ? value : undefined;
+}
+
+function migratedHosts(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const hostValues: unknown[] = value;
+  const hosts = hostValues.map(safeHost).filter((host): host is string => host !== undefined);
+  return hosts.length === 0 ? undefined : [...new Set(hosts)];
+}
+function migratedState(raw: UnknownRecord): StoreShape {
+  if (!Array.isArray(raw.activeJobs)) return emptyStore();
+  const jobs: unknown[] = raw.activeJobs;
+  // A malformed job is not allowed to silently become an empty active job.
+  const validJobs = jobs.filter(validActiveJob);
+  if (validJobs.length !== jobs.length) return emptyStore();
+  const droppedClaimOwnerJobIDs = new Set<string>();
+  if (isRecord(raw.federatedLoginOwners)) {
+    for (const owner of Object.values(raw.federatedLoginOwners)) {
+      if (isRecord(owner) && typeof owner.jobID === "string") {
+        droppedClaimOwnerJobIDs.add(owner.jobID);
+      }
+    }
+  }
+  const output: StoreShape = {
+    ...emptyStore(),
+    activeJobs: validJobs.map((job) => migratedJob(job, droppedClaimOwnerJobIDs)),
+  };
+
+  const pending = migratedPendingDelivery(raw.pendingDelivery);
+  if (pending !== undefined) output.pendingDelivery = pending;
+  const lastAuthReturnedAt = raw.lastAuthReturnedAt;
+  if (isFiniteNumber(lastAuthReturnedAt)) output.lastAuthReturnedAt = lastAuthReturnedAt;
+  const authEvidenceByOrigin = migratedOriginMap(raw.authEvidenceByOrigin);
+  if (authEvidenceByOrigin !== undefined) output.authEvidenceByOrigin = authEvidenceByOrigin;
+  const authAttempts = migratedNumberMap(raw.authAttempts);
+  if (authAttempts !== undefined) output.authAttempts = authAttempts;
+  const providerDrainLeases = migratedLeaseMap(raw.providerDrainLeases);
+  if (providerDrainLeases !== undefined) output.providerDrainLeases = providerDrainLeases;
+  const workWindowID = raw.workWindowID;
+  if (isFiniteNumber(workWindowID) && Number.isInteger(workWindowID)) output.workWindowID = workWindowID;
+  const handoffGroupID = raw.handoffGroupID;
+  if (isFiniteNumber(handoffGroupID) && Number.isInteger(handoffGroupID)) output.handoffGroupID = handoffGroupID;
+  if (raw.connectionStatus === "connected" || raw.connectionStatus === "disconnected" ||
+      raw.connectionStatus === "daemon_outdated" || raw.connectionStatus === "extension_outdated") {
+    output.connectionStatus = raw.connectionStatus;
+  }
+  const daemonVersion = migratedString(raw.daemonVersion);
+  if (daemonVersion !== undefined) output.daemonVersion = daemonVersion;
+  if (typeof raw.daemonUpdateHint === "boolean") output.daemonUpdateHint = raw.daemonUpdateHint;
+  const daemonFeatures = raw.daemonFeatures;
+  if (Array.isArray(daemonFeatures)) {
+    const featureValues: unknown[] = daemonFeatures;
+    output.daemonFeatures = featureValues.filter(
+      (feature): feature is string => typeof feature === "string" && !isURLLike(feature),
+    );
+  }
+  const resolverOrigins = raw.resolverOrigins;
+  if (Array.isArray(resolverOrigins)) {
+    const originValues: unknown[] = resolverOrigins;
+    output.resolverOrigins = originValues
+      .map(safeOrigin)
+      .filter((origin): origin is string => origin !== undefined);
+  }
+  const blockedProviderHosts = migratedHosts(raw.blockedProviderHosts);
+  if (blockedProviderHosts !== undefined) output.blockedProviderHosts = blockedProviderHosts;
+  const challengeCooldowns = migratedCooldownMap(raw.challengeCooldowns);
+  if (challengeCooldowns !== undefined) output.challengeCooldowns = challengeCooldowns;
+  // Legacy federatedLoginOwners and all per-job claim keys are deterministic
+  // browser hashes, not daemon-issued opaque authority IDs. Do not promote.
+  delete output.federatedLoginOwners;
+  delete output.offerURLs;
+  return output;
+}
+
+/** Migrate a raw managed-state value without side effects. Unknown/future and
+ * malformed versions fail closed to an empty managed state. */
+export function migrateManagedState(raw: unknown): StoreShape {
+  if (!isRecord(raw) || !Array.isArray(raw.activeJobs)) return emptyStore();
+  const version = raw.version;
+  if (version !== undefined && version !== 1 && version !== MANAGED_STATE_VERSION) return emptyStore();
+  return migratedState(raw);
+}
+
+function serializeManagedState(store: StoreShape): UnknownRecord {
+  const migrated = migratedState({ ...store, activeJobs: store.activeJobs });
+  return { version: MANAGED_STATE_VERSION, ...migrated };
+}
 
 /** chrome.storage-backed StateBackend. Prefers session storage (cleared when
  * the browser restarts) and falls back to local when session is unavailable. */
@@ -413,15 +749,19 @@ export function chromeBackend(storage: typeof chrome.storage): StateBackend {
   return {
     async load(): Promise<StoreShape> {
       const got: Record<string, unknown> = await area.get(STORAGE_KEY);
-      const raw: unknown = got[STORAGE_KEY];
-      if (raw !== null && typeof raw === "object" && "activeJobs" in raw && Array.isArray(raw.activeJobs)) {
-        // Our own persisted blob, already narrowed to carry an activeJobs array.
-        return raw as StoreShape;
+      const migrated = migrateManagedState(got[STORAGE_KEY]);
+      // Persist the cutover immediately, so a legacy URL-bearing blob is not
+      // left behind until some later unrelated state update.
+      try {
+        await area.set({ [STORAGE_KEY]: serializeManagedState(migrated) });
+      } catch {
+        // Storage can be temporarily unavailable; keep the sanitized in-memory
+        // result and retry on the next normal save.
       }
-      return emptyStore();
+      return migrated;
     },
     async save(store: StoreShape): Promise<void> {
-      await area.set({ [STORAGE_KEY]: store });
+      await area.set({ [STORAGE_KEY]: serializeManagedState(store) });
     },
   };
 }
