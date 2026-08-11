@@ -1,22 +1,67 @@
 # Adapter lifecycle at scale — capture, repair, release, contribute
 
-Status: **Proposed**. ADR-0015 remains authoritative until the Phase 0 ADR is
-accepted.
+Status: **Active implementation plan; subordinate to ADR-0021**. ADR-0021
+(`Accepted`, 2026-08-10) is the authority for packaged behaviour,
+daemon-first URL repair, and restrictive-only control. ADR-0015 remains the
+positive-runtime companion only where ADR-0021 does not supersede it. This
+document records implementation order, evidence, and acceptance gates; it is
+not a second authority decision and no Phase-0 ADR is pending.
 
-## Decision (2026-08-10, operator-ratified)
+The sections below preserve the useful pre-ADR design history. Assertions
+labelled **implemented Phase-0 authority** describe the code that exists now;
+later phase sections remain targets and must not be read as shipped behaviour.
+
+### Implemented Phase-0 authority (2026-08-10)
+
+- The daemon mints and durably records direct and generic provider-drive
+  tuples: `drive_attempt_id + ordinal + strategy + revision`. The extension
+  persists only the opaque tuple/bookkeeping needed across an MV3 restart;
+  direct route URLs and generic candidate URLs are not persisted as authority.
+  Daemon restart reconstructs tuple state from the durable event history; an
+  extension restart reconstructs only bounded browser-download correlation.
+- Direct provider routes travel as daemon-minted
+  `provider_direct_get_request` tuples. They are not inferred from
+  `job_offer` URLs, hosts, or URL heuristics. The daemon accepts results only
+  when the complete tuple is the currently offered, started tuple.
+- `plan.ts`'s complete `Plan` is the sole page-side authority for a positive
+  adapter effect. It carries `expected_work`, `effect_graph`, `route_origin`,
+  and `revalidation` alongside the target and consequence. A packaged
+  `DownloadRule.workTarget` is evaluated into the selected target's explicit
+  `work_binding`; the background revalidates that complete plan in the live
+  document before executing it.
+- Generic candidates are page-derived and must have the page's exact HTTPS
+  origin; a registrable-domain or sibling-subdomain match is not authority.
+  Generic restart safety is correlation-first, not URL replay: candidate URLs
+  and ordering are worker-local, and a restart cannot authorize an arbitrary
+  stored URL. A fresh candidate requires fresh planning/revalidation and a
+  current daemon epoch; stale, duplicate, or unstarted tuples remain assisted.
+- ISBN catalogue/ebook handoffs are forced to `assisted`, even when the
+  daemon-wide access mode is `delegated`, because the bridge cannot
+  automatically validate a book PDF.
+- OpenAlex title lookup is strict corroboration: exact normalized title,
+  positive requested-year equality when a year is supplied, and one-to-one
+  author-list equality by family plus given-name initial. Identifier lookup
+  uses a canonical unique DOI/OpenAlex ID (a URL alone is insufficient), and
+  the selected location must be explicitly open access.
+- Repair-fixture sanitization and independent observational provenance remain
+  future generator/intake obligations; Phase 0 local capture is not a hosted
+  repair pipeline. Hosted incident retention and deletion are future work.
+  Local capture pinning already implements role-scoped first/latest retention
+  and release; hosted intake lifecycle remains future.
+
+## Decision (2026-08-10, operator-ratified; subordinate to ADR-0021)
 
 Build, in this order of leverage:
 
 1. **Daemon-side provider URL intelligence** — provider knowledge that is
    URL-shaped (direct PDF endpoint templates, resolver and route quirks)
-   lives in the daemon and is exercised through the extension's existing
-   packaged navigate/viewer/download primitives. The daemon half deploys
-   outside browser stores in **hours**; autonomous use requires the one
-   Phase-0-capable extension release that adds `provider_direct_get_v1` and
-   enforces `access_mode` — after that, route repairs are daemon-only. No new
-   extension-store submission is needed per repair; the pattern extends the
-   shipped daemon-supplies-URL seam (`openurl_handoff`), though its store
-   classification remains an inference until reviewed.
+   lives in the daemon. Direct provider routes are emitted only as
+   daemon-minted `provider_direct_get_request` tuples; `job_offer` is not a
+   direct-route authority and no URL heuristic may synthesize one. The
+   extension release gates the feature and `access_mode`; after that,
+   daemon route repairs deploy outside browser stores in **hours**. Generic
+   page candidates remain page-side, but their positive attempts are admitted
+   only by the daemon-minted provider-drive epoch.
 2. **An automated adapter patch generator** (capture → candidate source change,
    fixtures, tests, revision bump, changelog, tag) feeding the existing
    dual-store release flow. Store review is "most extensions within a few
@@ -86,13 +131,14 @@ resolution: it is out of this plan's scope and is the explicit **next
 priority after Phase 1**, ahead of Phase 2 control and Phase 3 intake, for a
 single-installation deployment.
 
-## Why the current loop does not scale
+## Why the pre-Phase-0 loop did not scale (historical baseline)
 
-The shipped loop is:
+The following loop is retained to explain the repair-latency objective; it is
+not a statement that the new planner/epoch authority is absent:
 
 ```text
 provider changes
-  → sanitized local capture
+  → local capture (sanitized/provenanced only before future intake)
   → maintainer diagnoses the drift
   → TypeScript adapter + fixture edit
   → extension version/tag
@@ -249,16 +295,16 @@ triggers, not a baked-in assumption:
    (automated unlisted signing) and documented dev-mode unpacked Chrome for
    power users. Cheap; adopt opportunistically when a user asks.
 
-## Target architecture
+## Target architecture (forward-looking beyond the implemented Phase-0 slice)
 
 ```mermaid
 flowchart LR
     P[Provider page] --> A[Packaged adapter or generic strategy]
     A --> S[Safety-domain gate]
-    S --> X[In-memory ExecutionPlan]
+    S --> X[Complete page-side Plan]
     X --> B[Browser action executor]
     B --> V[PDF and work-identity validation]
-    X --> O[Redacted EffectObservation]
+    X --> O[Redacted EffectObservation - future]
     V -->|unknown / ui_changed / rejected| C[Local capture + observation]
     C --> D[Fingerprint + deduplicate]
     D --> R[Deterministic repair generator]
@@ -273,22 +319,30 @@ flowchart LR
 
 The architecture has seven boundaries:
 
-1. **Execution planning** — one self-contained injected function returns the
-   exact memory-only action or assisted mode. Full URLs and target handles never
-   enter persisted evidence.
-2. **Observation** — a separate redacted `EffectObservation` records enough
-   action semantics to reproduce and classify a failure without becoming a
-   reusable action.
+1. **Execution planning — implemented Phase 0.** `planExecution` returns the
+   complete page-side `Plan` or an assisted result. The plan binds
+   `expected_work`, its `effect_graph`, `route_origin`, and bounded
+   `revalidation` limits. A packaged `DownloadRule.workTarget` is not merely
+   a source hint: it must produce the selected target's explicit
+   `work_binding` (or the planner returns assisted). Full URLs and live
+   targets
+   remain memory-only. `executePlannedPageEffect` is not allowed to infer a
+   missing authority field from the adapter or current DOM.
+2. **Observation — future.** A separate redacted `EffectObservation` may
+   record enough action semantics to reproduce and classify a failure without
+   becoming a reusable action. It is not a shipped Phase-0 authority object.
 3. **Safety domains** — adapters and generic strategies share explicit packaged
    domains; a failure determines which fallbacks remain eligible.
 4. **Source representation** — current store-bundled CSS rules remain initially;
    a locator AST is introduced only from measured need.
-5. **Adapter patch generator** — deterministic generation, corpus replay,
+5. **Adapter patch generator** — future deterministic generation, corpus replay,
    effect-contract classification, and release preparation.
-6. **Control plane** — signed state may suspend or (later) select exact installed
-   revisions and packaged strategies; never selectors or actions.
-7. **Contribution and coverage inputs** — minimized reports and upstream
-   translator evidence create source candidates, never runtime authority.
+6. **Control plane** — ADR-0021 permits signed state to suspend exact
+   packaged IDs/domains; positive selection remains deferred and control never
+   names selectors or actions.
+7. **Contribution and coverage inputs** — future minimized reports and
+   upstream translator evidence create source candidates, never runtime
+   authority.
 
 ## Invariants
 
@@ -300,8 +354,9 @@ The architecture has seven boundaries:
    `no_positive_effects`; generic fallback is ineligible. Selector miss or
    ordinary UI drift may fall through only to an explicitly same-or-lower-risk
    packaged generic domain.
-3. **Classification is authority.** Tests and reviews consider the guard,
-   selected target, exact effect contract, and observed result together.
+3. **Plan is page-side authority.** Tests and reviews consider the complete
+   planner result — expected work, effect graph, route origin, revalidation
+   limits, target, exact effect contract, and observed result — together.
 4. **One planner owns action invariants.** Offline tools invoke the same
    self-contained planning function as live page injection. A third
    reimplementation is a bug.
@@ -341,32 +396,37 @@ The architecture has seven boundaries:
 ## 0. Daemon URL intelligence — the fastest repair path
 
 The daemon updates outside browser stores (brew, `make dev-deploy`), so any
-provider knowledge expressible as **URLs and routing** repairs in hours with no
-policy surface. Half of current successes already complete without a browser;
-`job_offer` already carries daemon-chosen URLs (`openurl_handoff`), so this is
-an extension of an existing seam, not a new trust boundary.
+provider knowledge expressible as **URLs and routing** can repair in hours.
+Half of current successes already complete without a browser. The authority
+boundary is nevertheless explicit: `job_offer` carries the ordinary handoff
+context, while direct provider routes are daemon-minted
+`provider_direct_get_request` frames. No direct route is inferred from a
+`job_offer` URL, host, or URL heuristic.
 
 Move URL-shaped provider knowledge daemon-side:
 
 - direct PDF endpoint templates per provider family (e.g. Wiley
   `/doi/pdfdirect/<doi>?download=true`, SAGE `/doi/pdf/<doi>?download=true`),
-  tried by navigating the user's authenticated browser to a daemon-computed
-  URL and adopting the resulting PDF viewer/download through existing packaged
-  machinery;
+  emitted as one tuple-correlated request and adopted through existing
+  packaged machinery;
 - versioned per-provider route knowledge (`route_revision`), cited in every
-  observation so a bad template is diagnosable and revertible like any other
-  config. Institution-configured parameters (`accountid`, IdP entity routing,
-  openurl quirks) remain the separate institution-config path they already
-  are — not remotely maintained provider intelligence.
+  durable direct-route event so a bad template is diagnosable and revertible
+  like any other config. Institution-configured parameters (`accountid`, IdP
+  entity routing, openurl quirks) remain the separate institution-config path
+  they already are — not remotely maintained provider intelligence.
 
 ### `provider_direct_get_v1`
 
 The daemon emits **one** candidate at a time, never an ordered list in one
-offer, so two candidates can never race one work:
+offer, so two candidates cannot race one work. The request carries the
+daemon-minted tuple fields (`drive_attempt_id`, `ordinal`, and
+`route_revision`) in addition to the route envelope:
 
 ```json
 {
   "strategy": "provider_direct_get",
+  "drive_attempt_id": "daemon-minted opaque id",
+  "ordinal": 0,
   "route_revision": "wiley-doi-pdfdirect/1",
   "expected_identifier": "doi:…",
   "url": "https://…",
@@ -376,9 +436,17 @@ offer, so two candidates can never race one work:
 ```
 
 The extension checks `delegated`, verifies GET/HTTPS/origin/path/no-userinfo,
-starts one navigation or download, reports the correlated terminal
-observation, and never persists the URL. The daemon decides whether another
+starts one browser-managed download, and reports the tuple-correlated terminal
+observation; it never persists the URL. The daemon decides whether another
 route is warranted after seeing the result.
+
+Generic positive attempts use the same daemon-owned epoch shape:
+`drive_attempt_id + ordinal + strategy=generic + revision`. The daemon
+durably records offered/started/result/superseded tuples and accepts a result
+only for the currently authorized, started tuple. The extension may persist
+the opaque tuple and bounded attempt bookkeeping, but not the candidate URL;
+MV3 restart therefore cannot replay an arbitrary URL or mint candidate two
+locally.
 
 ### Route-template contract (v1)
 
@@ -418,39 +486,38 @@ autonomous candidates — `human_required` (and anything unknown) is not.
 Template expansion is a closed compiler, not string templating: one canonical
 public identifier substitutes into named slots, with tests covering percent
 encoding, embedded/repeated slashes, dot segments, Unicode, fragments, and
-query duplication. The terminal observation binds
-`job_id + drive_attempt_id + ordinal + route_revision`, so a late
-candidate-one result cannot release a later candidate or affect a retried
-handoff.
+query duplication. Every direct and generic terminal observation is accepted
+only against the daemon-durable tuple
+`job_id + drive_attempt_id + ordinal + strategy + revision` (direct routes use
+`route_revision` as `revision`). A late candidate-one result therefore cannot
+release a later candidate or affect a retried handoff.
 
 Rules:
 
-- the extension receives **URLs to navigate and observe**, never selectors,
-  predicates, or action parameters — its packaged logic decides how a viewer
-  or download is adopted. This requires no new extension-store submission per
-  repair and extends the shipped `openurl_handoff` seam; its store
-  classification remains an inference until reviewed;
-- every candidate still crosses PDF and work-identity validation; and
-- failures emit the same redacted observations and count against the same
-  safety domains as adapter effects.
+- direct-route requests carry a daemon-minted tuple and the route URL is
+  consumed only by the feature-capable packaged executor; later route repairs
+  need no new store submission, but the first `provider_direct_get_v1`
+  extension release is required;
+- every candidate still crosses PDF and work-identity validation; future
+  redacted observations, when shipped, must use the same safety domains as
+  adapter effects.
 
 ### Sequencing against Phase 0
 
-The daemon half may be implemented and tested at any time. Autonomous
-provider-direct candidates are emitted only after the connected extension
-advertises `provider_direct_get_v1` and demonstrably consumes the job's
-existing `access_mode`: under `assisted`, *papio* records an openable action
-and performs **no automatic navigation** — a GET to a direct-PDF endpoint can
-immediately produce `Content-Disposition: attachment`, so "open but don't
-download" is not an implementable distinction; an explicit operator action
-may navigate, after which ordinary download adoption applies. Under
-`delegated`, *papio* may autonomously execute one contract-authorized GET;
-`conservative` receives no provider offer. Enforcement is feature gating,
-not parser rejection: the daemon never emits a direct-route offer unless the
-session advertised `provider_direct_get_v1` — emitting it anyway is itself a
-defect that can tear down the strict native-messaging session. The same
-extension release that understands direct routes is the one that enforces
-access mode.
+Autonomous provider-direct candidates are emitted only after the connected
+extension advertises `provider_direct_get_v1` and the daemon has an eligible
+`delegated` job. Under `assisted`, the ordinary handoff records an openable
+action and performs no automatic navigation; under `conservative`, no provider
+offer is emitted. Enforcement is feature gating, not parser rejection: the
+daemon never emits a direct-route offer unless the session advertises
+`provider_direct_get_v1` — emitting it anyway is itself a defect that can tear
+down the strict native-messaging session. The same extension release that
+understands direct routes is the one that enforces access mode.
+
+The bridge also forces ISBN catalogue/ebook institutional handoffs to
+`assisted` in `offerableAccessMode`, regardless of the configured delegated
+mode. That is an implemented safety boundary, not a future route-template
+exception.
 
 Once that Phase-0-capable extension is in the stores, every later route
 repair is daemon-only: same-day deployment, no store involvement. When a
@@ -459,41 +526,40 @@ provider redesign breaks DOM classification but keeps its PDF endpoint shape
 
 ## 1. Split execution from observation
 
-The current model separates DOM classification from later action execution,
-duplicates URL extraction between `background.ts` and `adapter-try`, and parses
-`job_offer.access_mode` without consuming it in runtime action decisions. Close
-those gaps before automated repairs or generic acquisition.
+**Superseded pre-Phase-0 diagnosis:** the former model separated
+classification from later execution, duplicated URL extraction, and parsed
+`job_offer.access_mode` without consuming it. The implemented replacement is
+the single complete `Plan` below, injected by `background.ts` and checked
+again at execution.
 
-### Memory-only `ExecutionPlan`
+### Memory-only `Plan` (implemented Phase 0)
 
-Create one self-contained injected planner:
+`planExecution(page, packagedRevision, expectedWork, accessPolicy)` returns a
+complete `Plan` or an assisted result:
 
-```text
-planExecution(page, packagedRevision, expectedWork, accessPolicy)
-  → ExecutionPlan | assisted
-```
-
-An `ExecutionPlan` remains in memory and contains everything the executor must
+The `Plan` remains in memory and contains everything the executor must
 revalidate:
 
 - adapter/generic strategy and immutable revision IDs;
 - `safety_domain_id` and `effect_contract_id`;
 - current page origin and route family;
 - access mode and any already-recorded consent/configuration relied on;
-- expected-work evidence and rule;
+- complete `expected_work` evidence (requested DOI/title plus page evidence
+  fingerprints);
 - decisive guard and exact-one target;
-- a target fingerprint/handle meaningful only to the current document;
+- the `effect_graph` (primary/follow-up/terms targets, API result binding,
+  consequence, and route);
+- `route_origin` and the bounded `revalidation` limits; and
 - exact action class and full resolved URL, including query values when the
-  request needs them;
-- expected navigation, new-tab, modal, API, or download consequence; and
-- limits needed for execution revalidation.
-
+  request needs them.
 The full URL, query values, live target, and credentials never enter an event,
-capture, report, control document, or log. The executor immediately reruns the
-planner against the live document and proceeds on a fresh equivalent plan
-(Invariant 5); an authority-relevant difference fails assisted. Browser APIs
-such as `chrome.downloads`, tab creation, and downloads remain in the
-background executor rather than the pure planner.
+capture, report, control document, or log. Before any adapter effect,
+`background.ts` reruns the planner against the live document and requires the
+fresh plan's verdict, rule, target, expected work, effect graph, route origin,
+access mode, and revalidation limits to match; any authority-relevant
+difference stays assisted. Browser APIs such as `chrome.downloads`, tab
+creation, and downloads remain in the background executor rather than the
+pure planner.
 
 ### One injectable implementation
 
@@ -529,23 +595,27 @@ consequence, follow-up/consent policy, safety domain, and access-mode floor.
 | E3 chained/consent/auth | follow-up click, terms, login, account navigation, form interaction | automatic source release only with recorded access/consent and live evidence; a contract delta requires review |
 | E4 new capability | host authority, endpoint family, action method, permission, protocol, engine logic | normal feature design/release |
 
-For the initial generic engine, exact DOI/PMID/arXiv or an equivalent
-scheme-specific identifier is required before E1. The current title check
-(`3` tokens, `60%`) is E0 discovery evidence only; the current
-`expected.doi` field is not yet enforced and cannot authorize a download.
+For the implemented generic engine, an exact expected DOI corroborated by
+page evidence is required before E1; the current `ExpectedWork` contract does
+not claim generic PMID/arXiv support. Title similarity remains E0 discovery
+evidence only. Adapter E1 plans bind requested DOI/title to page evidence
+fingerprints in `expected_work`; a missing, ambiguous, or mismatched binding
+returns assisted rather than authorizing a download.
 
 ## 2. Source repair representation — do not block on a new DSL
+This section is a forward-looking repair-generator design, not a claim that
+the generator, locator AST, or generated fixtures ship in Phase 0. The current
+authority is the packaged adapter plus the complete `Plan`.
 
 The current CSS-based adapter schema is source-controlled, store-reviewed, and
 already exercises the production `interpret` function. A custom locator AST is
-not a prerequisite for the adapter patch generator and does not by itself make a
-selected action safe.
+not a prerequisite for the adapter patch generator and does not by itself make
+a selected action safe.
 
 Start by making the current representation mechanically safe:
 
-- action selectors resolve exactly one element;
-- resolved targets pass `ExecutionPlan` rather than gaining authority from selector
-  syntax;
+- resolved targets pass the complete `Plan` rather than gaining authority from
+  selector syntax;
 - selector complexity, text, candidate, and wait budgets are bounded;
 - text matching never authorizes an action target by itself;
 - URL facts normalize before comparison;
@@ -564,14 +634,15 @@ source/build-time representation, define packaged structural regions, disallow
 arbitrary regex escape hatches, and migrate incrementally. Do not hold the
 capture-to-source fast path behind a tree-wide adapter rewrite.
 
-## 3. Redacted execution observations
+## 3. Redacted execution observations (future intake design)
 
 Sanitized HTML is useful but loses facts that determine browser consequences.
-The persisted/uploadable record is not the `ExecutionPlan`. Construct a
-strictly smaller `EffectObservation` from allowlisted facts after planning and
-execution.
+The persisted/uploadable record is not the `Plan`. A future
+`EffectObservation` would be a strictly smaller record constructed from
+allowlisted facts after planning and execution. Phase 0 does not claim that
+new observation frame or repair-fixture pipeline is shipped.
 
-It may contain:
+A future observation may contain:
 
 - packaged revision/strategy, safety-domain, and effect-contract IDs;
 - normalized route family with identifiers removed;
@@ -591,33 +662,52 @@ values, raw IdP routes, titles/authors/DOIs, DOM text, CSS selectors, and target
 handles. A pattern hash uses a key local to the installation or incident; a
 public hash of a low-entropy class/id string is not anonymization.
 
-The existing `provider_outcome` and `page_capture` frames are strict contracts.
-Carry observations in a new `provider_effect_observation` message sent only
-after the daemon advertises its feature. Do not widen either existing payload:
-an old daemon would reject the unknown fields and tear down the browser session.
+The existing `provider_outcome` and `page_capture` frames are strict
+contracts. A future `provider_effect_observation` message may be sent only
+after the daemon advertises its feature; it must not widen either existing
+payload.
 
-### Incident fingerprint
+### Incident fingerprint (current grouping; future upload deduplication)
 
-Compute:
+The current incident package computes a keyed failure-shape fingerprint from
+the bounded `safety_domain`, registrable `host_family`, outcome, and sorted
+decisive marker classes. Raw hosts, URLs, and work identifiers do not enter the
+fingerprint. The local operator aggregate intentionally exposes those bounded
+failure-shape labels (`safety_domain` and `host_family`) alongside the outcome
+and evidence window; that output is not raw host/identifier disclosure.
+Adapter and extension revisions are evidence facets, not the primary identity,
+so one provider redesign can group across releases without publishing article
+identity or low-entropy page strings.
 
-- a local content digest for exact deduplication; and
-- a keyed failure-shape fingerprint from safety domain, normalized route family,
-  intended effect contract, decisive marker classes, cardinality, and outcome.
-
-Adapter and extension revisions are facets, not primary fingerprint inputs, so
-one provider redesign deduplicates across *papio* releases without publishing
-article identity or low-entropy page strings.
+A future intake may add a local content digest for exact report deduplication;
+that is not a Phase-0 transmission or retention claim.
 
 ### Old evidence and retention
 
-Captures/events predating observations or adapter-id/version fields remain
-`dom_only` evidence. They may seed a source candidate, but never auto-promote
-an action consequence, activation transition, or rollback. Do not backfill
-guessed labels/identifiers.
+The incident package currently treats the first provider outcome as the
+immutable decisive boundary for its compatibility helper. For each decisive
+outcome, it walks backward only to the nearest compatible `page_capture`
+within the same `drive_attempt_id` (when epochs are present), matching
+adapter identity/version and stopping at the previous provider outcome.
+Older or mismatched captures cannot rewrite that outcome, and labels or
+identifiers are never guessed.
 
-An open incident pins its first decisive and latest capture against normal
-per-host eviction, or stores their minimized report bundle separately.
-Resolving/deleting the incident releases that retention.
+Its aggregate exposes `first_seen` and `last_seen` from decisive outcome
+timestamps across jobs. Those timestamps are an evidence window, not proof
+that raw captures are retained. The local capture store does implement raw
+capture pinning: provisional captures are retained as first/latest evidence
+by role before ordinary age/count pruning, and `PinIncident` replaces only the
+latest marker while preserving the first marker. `ReleaseIncident` and
+`ReleaseJob` remove the markers; the next `Sweep` applies normal eviction.
+`pins_test.go` covers burst survival, latest replacement, provisional
+pre-outcome retention, and release followed by sweep. This local lifecycle is
+implemented Phase-0 behavior; hosted retention and deletion remain future
+intake work.
+
+Future incident intake must carry the immutable first boundary and latest
+compatible evidence into its consented/minimized bundle without allowing later
+evidence to rewrite the first boundary, and must define hosted retention and
+deletion. Those hosted guarantees are not current Phase-0 claims.
 
 ### Safety-domain circuit breaker
 
@@ -654,7 +744,20 @@ restart, or a repeated provider outcome cannot spin it. This local automation
 needs no telemetry or hosted service. Signed global suspension arrives in
 Phase 2.
 
-## 4. Adapter patch generator
+## 4. Adapter patch generator (future; local repair scaffold shipped in Phase 0)
+
+Phase 0 ships a local `papio adapter repair <capture-id-or-path>` scaffold. It
+accepts only daemon-listed, daemon-sanitized capture input, verifies the
+capture's hash and sanitizer metadata, and creates a bounded local
+`dev/scratch/repair/<provider>-<timestamp>` workspace containing the exact
+fixture bytes, a report, and review/apply instructions (plus local
+`adapter-try` analysis when available). The workspace is proposal-only:
+review is required before any source or fixture change, and the command does
+not provide hosted intake, automatic generator/catalog publication, store
+submission, or trust/promotion without review. Those hosted, generator, and
+release-automation capabilities remain future work.
+
+The future expanded generator contract uses this same local command surface:
 
 Add:
 
@@ -950,12 +1053,16 @@ they exist only for this staged rollout.
 
 *papio* does not claim a global failure-rate signal without reporting telemetry.
 
-## 6. User contribution intake
+## 6. User contribution intake (future; not shipped in Phase 0)
+
+This section is the planned local/hosted reporting surface. Its consent,
+sanitization, retention, fixture-provenance, and deletion statements are
+requirements for a later intake implementation, not current behavior.
 
 ### Product surface
 
-Add **Report provider failure** to the inbox and **Report this provider page** to
-the extension popup for a tracked or active tab, plus:
+The planned surface adds **Report provider failure** to the inbox and **Report
+this provider page** to the extension popup for a tracked or active tab, plus:
 
 ```text
 papio adapter reports list
@@ -1064,11 +1171,10 @@ confirmation.
 
 ## 7. Generic acquisition
 
-Implement packaged generic strategies immediately after the execution,
-identity, safety-domain, and access-policy gates — in parallel with the
-adapter patch generator and after daemon URL candidates are exhausted for the
-job. They are the policy-compliant path to near-instant positive recovery
-without remotely supplied logic.
+The packaged generic E0/E1 path is implemented behind the execution,
+identity, safety-domain, and access-policy gates. Its current positive
+strategies are the two named in `planGeneric`; the remaining strategy ideas
+below are future coverage, not shipped claims.
 
 Run generic once on the first settled `unknown` during the handoff. Do not wait
 for a terminal `ui_changed` transition. After a packaged revision is locally
@@ -1077,55 +1183,66 @@ latched, generic is eligible only for selector/UI drift and only when its
 unexpected-effect, and envelope failures set `no_positive_effects` and follow
 the existing transitions named in the circuit-breaker section.
 
-Package small, named strategies:
+Current strategies:
 
 - exact citation metadata/canonical identity (E0), and one declared PDF —
-  a single `citation_pdf_url`, JSON-LD `encoding`/`contentUrl`, or
+  `citation_pdf_url`, JSON-LD `contentUrl`, or
   `link rel=alternate type=application/pdf` — bound to the page's exact
   expected identifier (E1);
-- unique article-scoped PDF anchor/embed inside the identified article region
-  (E1);
-- conservative same-origin viewer/download route (E1);
-- tracked browser PDF viewer tab correlated to the job;
-- exact browser download ID; and
-- Zotero-derived candidates that have already become reviewed source.
+- unique article-scoped PDF anchor inside `article`, `[role='article']`, or
+  `main`, with a conservative PDF/download path shape (E1).
 
-Control may activate/suspend these exact packaged strategy IDs; it cannot supply
-their predicates.
+Future strategy ideas (not Phase-0 claims) include tracked browser viewer
+tabs, exact browser download IDs, and Zotero-derived candidates after they
+become reviewed source. Control may eventually suspend exact packaged strategy
+IDs; it cannot supply their predicates.
 
-E0 discovery may use the current title/year heuristic. E1 download requires an
-exact expected DOI/PMID/arXiv/equivalent identifier match, exactly one target,
-HTTPS with no userinfo and an allowed origin/path, access-policy authorization,
-execution revalidation, and final PDF/work validation. The current unused
-`expected.doi` field must be enforced before E1 ships.
 
-Generic execution is disciplined, not one-shot-then-park: run every E0
-observation; rank all eligible E1 candidates deterministically; execute E1
-candidates **strictly sequentially** — the next may start only after the
-previous has a correlated terminal observation — up to
-`max_positive_attempts = 2` per **drive attempt**. The daemon mints a durable
-`drive_attempt_id` when the handoff begins; navigation, SPA replacement,
-redirects, tab replacement, and MV3 worker restart all retain it, so the
-bound cannot reset into an unbounded chain. Only an explicit human retry
-mints a new attempt. Advance to candidate two only on a deterministic
-ordinary failure: 404/410, a clean non-PDF payload, a final URL outside the
-expected article/PDF shape without a safety effect, or terminal navigation
-failure. Login, MFA, CAPTCHA, terms, timeouts, 429, and 5xx wait, defer, or
-park the current candidate — they never advance the chain. Late or duplicate
-terminal observations CAS against `(drive_attempt_id, ordinal)`. An identity,
+E0 discovery may use title/year metadata as evidence. Current `planGeneric`
+E1 candidates require an exact expected DOI corroborated by page citation
+metadata or JSON-LD, exactly one candidate per strategy, HTTPS with no
+userinfo, and the page's **exact origin** (not a sibling subdomain or merely
+the same registrable domain). They also require delegated access, execution
+revalidation, and final PDF/work validation. The planner enforces the
+available expected DOI binding before authorizing a generic download; it does
+not claim PMID/arXiv generic support that `ExpectedWork` does not carry.
+
+Generic execution is disciplined, not one-shot-then-park: it records E0
+evidence, ranks the two eligible E1 strategies deterministically, and executes
+E1 candidates **strictly sequentially** — the next may start only after the
+previous has a correlated terminal observation — with at most two positive
+candidate attempts per daemon-minted `drive_attempt_id`. The daemon persists
+the full tuple (`drive_attempt_id + ordinal + strategy + revision`) and
+reconstructs its state from job events; navigation, SPA replacement, redirects,
+tab replacement, and MV3 worker restart cannot mint a new tuple locally.
+Candidate URLs and ordering remain worker-local and are never replayed from
+persisted state.
+
+On MV3 restart, `reconcileGenericDownloads` searches only the persisted
+in-flight download ID and restores its opaque tuple correlation. It does not
+restore candidate URLs or ordering; a missing download is reported cancelled
+and parked. Candidate two therefore requires a daemon-offered successor tuple
+plus fresh planning/revalidation, never restart-local URL replay or tuple
+minting. Within the live sequential chain, advance to candidate two only when a
+clean non-PDF result is acknowledged `applied` for the current tuple. HTML,
+login, MFA, CAPTCHA, terms, rate-limit, server-error, unknown, cancelled, and
+unacknowledged results retain/park the current candidate. Only an explicit
+human retry mints a new drive attempt. Late or duplicate terminal observations
+are applied only when the daemon accepts the matching
+`(drive_attempt_id, ordinal, strategy, revision)` tuple. An identity,
 validation, or unexpected-effect failure sets the `(job, safety_domain)`
-`no_positive_effects` latch and stops everything. Measure
-`second_candidate_recovery_rate`; keep the bound at two unless real
-recoveries justify more. (The third review pass wanted exactly one attempt;
-the fourth accepted two with this durable epoch.)
+`no_positive_effects` latch and stops everything.
 
-Persist `(job, page_shape, safety_domain, generic_positive_attempts)` with
-the chosen strategies recorded as evidence, not as latch dimensions that
-would permit another attempt. E2 generic clicks remain a measured
-graduation: same effect contract, adversarial corpus, incident-scoped live
-evidence, and zero wrong-work evidence are required.
-Every attempt emits a redacted observation and uses the same safety-domain
-circuit breaker.
+Persisted extension job state carries only `generic_evaluated`, bounded
+attempt/strategy/evidence bookkeeping, `generic_terminal`, the in-flight
+download ID when present, and the opaque `generic_drive_epoch` tuple. The
+daemon event history is the authority for offered/started/result/superseded
+status; the extension's local fields do not authorize a new candidate on their
+own.
+
+E2 generic clicks remain a future graduation requiring the same effect
+contract, adversarial corpus, incident-scoped live evidence, and zero
+wrong-work evidence.
 
 ## 8. Zotero evidence importer
 
@@ -1154,9 +1271,10 @@ ratified as **live options** (2026-08-10, operator decision):
 2. **Daemon-hosted candidate source.** The daemon (not the store-reviewed
    extension) runs a translator runtime as a separately-installed subprocess
    — the zotio pattern — using Zotero's own open-source server-side stack.
-   Translators execute against the sanitized captures *papio* already stores
-   (no network) or, later, against public endpoints via daemon-controlled
-   HTTP. Their output is **metadata and candidate PDF URLs only**, which
+  Translators execute against locally held captures/fixtures only after the
+  future sanitizer and independent-provenance boundary (no network) or, later,
+  against public endpoints via daemon-controlled HTTP.
+  Their output is **metadata and candidate PDF URLs only**, which
    enter the existing direct-offer envelope: delegated-only, identity-gated,
    origin/path-checked, one in flight, and always behind final PDF and
    work-identity validation. Translator code never gains browser authority
@@ -1222,55 +1340,68 @@ Objectives:
 
 ## Implementation order
 
-### Phase 0 — close current authority gaps
+### Phase 0 — implemented authority slice and remaining obligations
 
-- Write the narrow ADR: ADR-0015 still governs positive runtime behaviour;
-  signed control may only suspend/lift exact packaged IDs and domains.
-- Implement memory-only `ExecutionPlan`, redacted `EffectObservation`, and
-  fresh-plan execution revalidation through one injectable planning function
-  shared with `adapter-try`.
-- Consume the existing `job_offer.access_mode` before any positive effect.
-- Enforce exact DOI/PMID/arXiv/equivalent identity for E1, including the
-  currently unenforced `expected.doi`.
-- Fix live URL origin/path validation, follow-up containment/causality, and
-  target uniqueness.
-- Define immutable revision, safety-domain, and effect-contract IDs.
-- Classify and declare all existing extension→daemon data (including
-  `page_capture`) — consent for transmission to the **local native
-  application**; implement Firefox 140+ `data_collection_permissions` and a
-  one-time custom consent — or disabled capture — on Firefox 128–139. Hosted
-  reporting consent is a separate Phase 3 decision; local consent never
-  silently authorizes it. Urgency raised 2026-08-10: extension 0.12.0 is
-  live on AMO with automatic failure capture riding native messaging and no
-  built-in consent — this is now remediation of shipped behaviour, not
-  preparation.
-- Any new browser message (e.g. `provider_effect_observation`) ships with the
-  structured-failure handler contract from Invariant 10.
+ADR-0021 is accepted; this plan no longer schedules a Phase-0 ADR. The
+following authority work is implemented in the listed code:
 
-**Exit:** current actions are planned, policy-gated, revalidated, and safely
-observed; the known primitives no longer underpin later automation.
+- `plan.ts` supplies the complete page-side `Plan` with
+  `expected_work`, `effect_graph`, `route_origin`, and `revalidation`;
+  `DownloadRule.workTarget` is enforced into the selected target's explicit
+  `work_binding`; `background.ts` injects it and executes only after
+  live-document revalidation.
+- `job_offer.access_mode` is consumed before positive effects. Direct routes
+  are feature-gated daemon `provider_direct_get_request` tuples, never
+  `job_offer` URL heuristics. ISBN catalogue/ebook handoffs are forced
+  assisted by the bridge.
+- Direct and generic attempts use daemon-minted durable
+  `drive_attempt_id + ordinal + strategy + revision` epochs. The bridge
+  records tuple lifecycle events and rejects stale/unstarted/duplicate
+  results; extension storage carries only opaque tuple and bounded
+  bookkeeping. Daemon restart rebuilds tuple state from job events.
+- Generic E0/E1 is bounded and sequential. `planGeneric` accepts candidates
+  only from the page's exact HTTPS origin. Candidate URLs/order remain
+  worker-local; on MV3 restart only the persisted in-flight download ID and
+  opaque epoch are reconciled, never a URL or candidate-two continuation.
+  Candidate two requires the daemon's successor epoch plus fresh
+  planning/revalidation; restart cannot replay a URL or mint a tuple.
+- OpenAlex title matching is strict: exact normalized title, positive equal
+  year when requested, and exact one-to-one author family/given-initial
+  matching; identifier paths use canonical unique IDs and an explicitly
+  open-access location. Weak or URL-only corroboration is not authority.
+- DOI/title evidence, target uniqueness, exact-origin/path checks, access
+  policy, and final PDF/work validation remain authority gates. The current
+  generic strategies are only those implemented by `planGeneric`.
+
+Remaining Phase-0 obligations are explicitly not shipped claims: classify and
+declare existing extension→daemon transmissions (including `page_capture`) and
+complete the required Firefox 140+ / 128–139 consent treatment; add the
+redacted `provider_effect_observation` contract only when its feature-gated
+structured-failure path is implemented; and keep repair-fixture
+sanitization/provenance and hosted incident retention in their later phases.
+
+**Exit for this authority slice:** current adapter and generic effects are
+planned, policy-gated, revalidated, and tuple-correlated; stale URLs and
+stale plans cannot independently authorize positive work.
 
 ### Phase 1 — shortest path from failure to success
 
-Run these in parallel after Phase 0:
+The authority prerequisites above are complete. Remaining Phase-1 work is
+coverage and automation, not a second authority model:
 
-- ship daemon URL intelligence: the daemon half (route templates,
-  `route_revision` config, candidate computation) deploys independently, same
-  day; autonomous `provider_direct_get_v1` candidates are emitted only to an
-  extension that advertises the feature and enforces `access_mode`, one
-  candidate in flight per job;
-- run packaged generic E0/E1 on the first settled `unknown`, with the bounded
-  sequential chain, safety-domain gates, and durable attempt latches;
-- record the daemon-durable `(job, safety_domain)` `no_positive_effects`
-  latch and the `(job, revision, route_family, page_shape)` drift latch,
-  enforced entirely through existing job transitions (no control protocol or
-  registry dependency);
-- add redacted observations, keyed fingerprints, and incident-pinned evidence;
-- build the adapter patch **scaffolder**: reviewed capture → CSS candidate,
-  fixture, focused test, revision bump, changelog, and patch release through
-  the production planner;
-- drive the existing `ext-v*` path from verified E0/E1 candidates; and
-- survey Zotero statically and in a hermetic network-denied repair harness.
+- extend daemon route templates and `route_revision` coverage; every
+  autonomous `provider_direct_get_v1` candidate remains feature-gated,
+  delegated-only, one tuple in flight per job;
+- measure and broaden the packaged generic E0/E1 strategy set without
+  weakening the bounded sequential chain, safety-domain gates, or daemon epoch
+  correlation;
+- add the future redacted observations, keyed fingerprints, and incident
+  evidence intake described above;
+- build the adapter patch **scaffolder**: independently evidenced capture →
+  sanitized/provenanced fixture and CSS candidate, focused test, revision bump,
+  changelog, and patch release through the production planner; and
+- drive the existing `ext-v*` path from verified E0/E1 candidates and survey
+  Zotero in a hermetic network-denied repair harness.
 
 After Phase 1 lands, the next priority is `no_identifier` metadata
 resolution (126 jobs — the largest measured class), ahead of Phase 2 and
@@ -1348,9 +1479,13 @@ shipping translator logic or remotely supplied behaviour.
 
 ## Acceptance tests
 
-1. **Execution/observation separation:** seeded secret, URL, selector, and
-   identifier sentinels never surface in events, captures, logs, reports, or
-   control across success, failure, crash, and logging sinks.
+1. **Execution/observation separation:** seeded secrets, selectors,
+   identifiers, and page-derived URL sentinels never surface in events,
+   captures, logs, reports, control, or extension storage across success,
+   failure, crash, and logging sinks. A daemon route URL may appear only in
+   its solicited `provider_direct_get_request` frame and extension memory;
+   credentials, signed queries, and page-derived URLs never become authority
+   state.
 2. **Control gate and skew:** a fresh install (sequence 0, bundle minimum 0)
    runs packaged defaults with no control fetch; once any restrictive state
    is accepted, missing/rolled-back control means no positive effects until
@@ -1372,9 +1507,10 @@ shipping translator logic or remotely supplied behaviour.
    chain; wrong-work, validation, unexpected-effect, and envelope failures
    never execute another positive effect — including after MV3 restart,
    duplicate outcomes, and tab reclassification.
-7. **Generic identity boundary:** title-token similarity produces E0 only; E1
-   refuses mismatched/missing DOI/PMID/arXiv-equivalents, requires article
-   binding, and a final identity mismatch sets `no_positive_effects`.
+7. **Generic identity boundary:** title-token similarity produces E0 only; the
+   current generic E1 refuses a missing/mismatched expected DOI or page DOI
+   corroboration, requires article binding, and a final identity mismatch sets
+   `no_positive_effects`.
 8. **Consent/profile isolation:** automated tests cover profile persistence and
    isolation across reconnect and holder switch with zero prompts; manual
    checklists cover Firefox 140+ built-in and 128–139 custom consent
@@ -1408,17 +1544,19 @@ shipping translator logic or remotely supplied behaviour.
     classified by MIME/disposition, not URL shape.
 16. **Sequential candidates:** a second daemon candidate cannot be offered
     until the first has a correlated terminal observation bound to
-    `job_id + drive_attempt_id + ordinal + route_revision` — including
+    `job_id + drive_attempt_id + ordinal + strategy + revision` — including
     across worker restart, daemon restart, duplicate results, late results,
-    and CAS-lost races.
+    and CAS-lost races. Direct routes use `route_revision` as `revision`.
 17. **Strong latch:** wrong-work on page shape A prevents generic and adapter
     effects after navigation to page shape B and after MV3 restart; the latch
     clears only on explicit human retry or terminal outcome.
 18. **Generic bound:** all E0 strategies may observe; at most two E1
-    executions occur per `drive_attempt_id` — asserted across navigation,
-    redirects, tab replacement, worker restart, daemon restart, duplicate
-    results, late results, and CAS-lost races — strictly sequentially, and
-    an identity/validation/unexpected-effect failure stops the chain.
+    executions occur per daemon-minted `drive_attempt_id` — asserted across
+    navigation, redirects, tab replacement, worker restart, daemon restart,
+    duplicate results, late results, and CAS-lost races — strictly
+    sequentially, and an identity/validation/unexpected-effect failure stops
+    the chain. A restart never authorizes URL replay without a current daemon
+    epoch.
 19. **Production composition:** the route and observation paths are exercised
     through the real background dispatcher, native host, daemon bridge, and
     planner — not just direct handler calls — because individually tested
@@ -1431,11 +1569,11 @@ shipping translator logic or remotely supplied behaviour.
 
 | class | verdict | mechanism |
 |---|---|---|
-| daemon route-template repair | **Go now (daemon half); autonomous use gated on the Phase-0 extension** | route contract v1 through packaged navigation primitives; one candidate in flight |
+| daemon route-template repair | **Go now; autonomous use is feature/access/epoch gated** | daemon-minted direct tuple through packaged navigation/download primitives; one candidate in flight |
 | local drift/safety latches | **Go now** | daemon-durable latches through existing job transitions |
 | reversible suspension | **Go after control protocol** | online-signed suspension + higher-sequence lift, prominently disclosed |
 | permanent revocation | **Deferred** | offline-root signing built with staged rollout |
-| generic E0/E1 | **Go after Phase 0** | packaged safety-domain strategy; exact identity for E1 |
+| generic E0/E1 authority | **Implemented bounded slice; broaden after Phase 0** | packaged `planGeneric` strategies, exact identity, fresh revalidation, daemon epoch correlation |
 | same-contract E0/E1 repair | **Go automatic** | generated source, deterministic/live gates, store release |
 | same-contract E2/E3 repair (authority-bearing action rule unchanged) | **Go automatic (store-released active)**; flip to review on wrong-work adoption OR any unexpected authenticated effect OR unintended terms/form/account/purchase mutation; staged inactive rollout deferred | generated source, live evidence, broken baseline, store release |
 | effect-contract delta E2/E3 | **Go with maintainer action review** | generated candidate, live evidence, store release |

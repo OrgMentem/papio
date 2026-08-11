@@ -10,17 +10,6 @@ repeated: the T&F and PsycNet adapters, per-institution resolver profiles,
 zotio stored retro-attachment, and nine of the ten durability gaps from the
 2026-07-16 adoption/import review. Only what follows is genuinely open.
 
-## Code
-
-- **Adoption poll hard-caps at 200 jobs with no pagination** (durability review
-  gap #6, the one still standing). `poll()` in `internal/browser/bridge.go`
-  calls `b.jobs.List(ctx, job.StateAwaitingHuman, 200)` with a fixed cap and no
-  cursor, so a settled download older than the 200 most recent `awaiting_human`
-  jobs is never scanned for adoption. Deferred at the time as "not biting now —
-  queue drained". Needs cursor pagination, or an adoption-root directory scan
-  independent of the job list, before the parked backlog can realistically pass
-  200.
-
 ## Live verification (needs a real session, not code)
 
 These cannot be closed by automation: a warm human browser passes provider
@@ -44,12 +33,3 @@ constraint that makes the extension QA matrix manual.
   confirm the resolver lands on EBSCO's PDF viewer rather than the record page
   — the `api` download method cannot use the record page's `idPattern`.
 
-## Packaging
-
-- **Packed extension-ID re-pin.** `extension/manifest.json` still has no `key`,
-  so the extension runs under its unpacked development ID. Pinning means adding
-  the preserved manifest key, setting `browser.extension_id`, re-running
-  `papio native-host install`, and reloading. Parked deliberately: swapping IDs
-  while live `awaiting_human` handoffs reference the unpacked ID would orphan
-  them, and the Web Store submission that needs the packed build is gated on
-  credentials that do not exist yet.
