@@ -3095,6 +3095,25 @@ test("a pre-existing content-disposition download prevents PDF-viewer duplicatio
   expect(h.downloads.started).toEqual([]);
 });
 
+test("an MDPI PDF route without a .pdf suffix is adopted", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  const pdfURL = "https://mdpi.com/2227-7102/9/3/181/pdf?version=1563177761";
+  await h.port.inbound(jobOfferForHosts("job_mdpi_pdf_route", ["mdpi.com"], pdfURL));
+  await h.bridge.openHandoff("job_mdpi_pdf_route");
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.completeNavigation(tabID, pdfURL);
+
+  expect(h.downloads.started).toEqual([
+    {
+      url: pdfURL,
+      filename: "papio/job_mdpi_pdf_route/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+});
+
 test("a correlated download is steered into papio/<job_id>/; unrelated untouched", async () => {
   const h = makeHarness();
   await h.bridge.start();

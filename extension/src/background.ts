@@ -7191,17 +7191,9 @@ export class Bridge {
       // A direct PDF can legitimately land on a CDN outside the offer's
       // provider-host list. Its URL alone is sufficient to preserve the
       // browser download flow without treating that redirect as an IdP hop.
-      if (change.status === "complete") {
-        let directPDF = false;
-        try {
-          directPDF = new URL(url).pathname.toLowerCase().endsWith(".pdf");
-        } catch {
-          directPDF = false;
-        }
-        if (directPDF) {
-          await this.maybeDownloadPDFViewer(job.job_id, url);
-          return;
-        }
+      if (change.status === "complete" && this.isPDFNavigationURL(url)) {
+        await this.maybeDownloadPDFViewer(job.job_id, url);
+        return;
       }
       // A stable non-authentication landing outside the capped offer list is
       // still the resolver's provider result. Give it the same bounded
@@ -7385,6 +7377,20 @@ export class Bridge {
     }
   }
 
+  /** Provider PDF endpoints are not required to end in `.pdf`: MDPI serves
+   * `/.../pdf`, and similar publisher routes use `/download` or
+   * `/full-text`. Keep this bounded to explicit PDF-ish path segments so a
+   * tracked handoff navigation can be adopted without treating arbitrary
+   * provider pages as files. */
+  private isPDFNavigationURL(url: string): boolean {
+    try {
+      const pathname = new URL(url).pathname.toLowerCase();
+      return pathname.endsWith(".pdf") || /\/(?:pdf|download|full[-_]?text)(?:\/|$)/u.test(pathname);
+    } catch {
+      return false;
+    }
+  }
+
   /** Download a tracked PDF-viewer navigation through Chrome's download API.
    * The persisted latch and in-memory correlation jointly ensure that a
    * content-disposition download or repeated completion event cannot start a
@@ -7426,13 +7432,7 @@ export class Bridge {
         // Invalid or non-provider URLs stay on the normal viewer path.
       }
     }
-    if (!viewer) {
-      try {
-        viewer = new URL(url).pathname.toLowerCase().endsWith(".pdf");
-      } catch {
-        viewer = false;
-      }
-    }
+    if (!viewer) viewer = this.isPDFNavigationURL(url);
     if (!viewer) return;
 
     // Re-read after the permission/probe awaits: a content-disposition
@@ -7471,12 +7471,10 @@ export class Bridge {
    */
   private async maybeAdoptViewerTab(viewerTabId: number, url: string | undefined, openerTabId: number | undefined): Promise<void> {
     if (url === undefined) return;
-    let isPDF = false;
+    const isPDF = this.isPDFNavigationURL(url);
     let host: string;
     try {
-      const u = new URL(url);
-      host = u.hostname;
-      isPDF = u.pathname.toLowerCase().endsWith(".pdf");
+      host = new URL(url).hostname;
     } catch {
       return;
     }
