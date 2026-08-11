@@ -894,9 +894,19 @@ const InstitutionalMaterializationFeature = "institutional_materialization_v1"
 // InstitutionalCandidateOfferPayload is the daemon's URL-free, job-scoped
 // offer of one explicit browser-tab materialization candidate.
 type InstitutionalCandidateOfferPayload struct {
-	CandidateID         string `json:"candidate_id"`
-	MaterializationKind string `json:"materialization_kind"`
-	ExpiresAt           string `json:"expires_at"`
+	CandidateID         string            `json:"candidate_id"`
+	MaterializationKind string            `json:"materialization_kind"`
+	ExpiresAt           string            `json:"expires_at"`
+	ProviderHosts       []string          `json:"provider_hosts"`
+	Expected            *JobOfferExpected `json:"expected,omitempty"`
+	AccessMode          string            `json:"access_mode,omitempty"`
+	LoginEntityID       string            `json:"login_entity_id,omitempty"`
+	ProquestAccountID   string            `json:"proquest_account_id,omitempty"`
+	RequiresAuth        bool              `json:"requires_auth,omitempty"`
+	DriveAttemptID      string            `json:"drive_attempt_id,omitempty"`
+	DriveOrdinal        *int64            `json:"drive_ordinal,omitempty"`
+	DriveStrategy       string            `json:"drive_strategy,omitempty"`
+	DriveRevision       string            `json:"drive_revision,omitempty"`
 }
 
 type InstitutionalClaimRequestPayload struct {
@@ -2186,7 +2196,9 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgInstitutionalCandidateOffer:
 		p := &InstitutionalCandidateOfferPayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_candidate_offer", []string{"candidate_id", "materialization_kind", "expires_at"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_candidate_offer", []string{
+			"candidate_id", "materialization_kind", "expires_at", "provider_hosts",
+		}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -2668,49 +2680,63 @@ func (p *PageAcquireAckPayload) validate() error {
 	}
 	return nil
 }
+func validateJobContext(providerHosts []string, expected *JobOfferExpected, accessMode, loginEntityID, proquestAccountID string, driveAttemptID string, driveOrdinal *int64, driveStrategy, driveRevision, expiresAt, what string) error {
+	if loginEntityID != "" && (browserTextLen(loginEntityID) > 4000 || !strings.HasPrefix(loginEntityID, "https://")) {
+		return fmt.Errorf("%s.login_entity_id must be a bounded https URL", what)
+	}
+	if proquestAccountID != "" {
+		if len(proquestAccountID) > 64 {
+			return fmt.Errorf("%s.proquest_account_id must be digits", what)
+		}
+		for _, r := range proquestAccountID {
+			if r < '0' || r > '9' {
+				return fmt.Errorf("%s.proquest_account_id must be digits", what)
+			}
+		}
+	}
+	if len(providerHosts) < 1 || len(providerHosts) > 20 {
+		return fmt.Errorf("%s.provider_hosts must have 1..20 entries", what)
+	}
+	for _, h := range providerHosts {
+		if !hostRE.MatchString(h) {
+			return fmt.Errorf("%s.provider_hosts contains invalid host %q", what, h)
+		}
+	}
+	if accessMode != "" {
+		if err := enumRequired(what+".access_mode", accessMode, "assisted", "delegated"); err != nil {
+			return err
+		}
+	}
+	if !rfc3339RE.MatchString(expiresAt) {
+		return fmt.Errorf("%s.expires_at must be RFC3339", what)
+	}
+	if _, err := time.Parse(time.RFC3339, expiresAt); err != nil {
+		return fmt.Errorf("%s.expires_at: %w", what, err)
+	}
+	if expected != nil && (browserTextLen(expected.DOI) > 300 || browserTextLen(expected.Title) > 500) {
+		return fmt.Errorf("%s.expected hints exceed bounds", what)
+	}
+	if driveAttemptID != "" {
+		if err := validateCorrelationID(what+".drive_attempt_id", driveAttemptID); err != nil {
+			return err
+		}
+	}
+	if driveOrdinal != nil && (*driveOrdinal < 0 || *driveOrdinal > MaxBrowserInteger) {
+		return fmt.Errorf("%s.drive_ordinal out of range", what)
+	}
+	for name, value := range map[string]string{"drive_strategy": driveStrategy, "drive_revision": driveRevision} {
+		if value != "" && (browserTextLen(value) > 128 || strings.ContainsAny(value, "\x00\r\n")) {
+			return fmt.Errorf("%s.%s is invalid", what, name)
+		}
+	}
+	return nil
+}
 
 func (p *JobOfferPayload) validate() error {
 	if p.OpenURL == "" || browserTextLen(p.OpenURL) > 4000 || !strings.HasPrefix(p.OpenURL, "https://") {
 		return fmt.Errorf("openurl must be a bounded https URL")
 	}
-	if p.LoginEntityID != "" && (browserTextLen(p.LoginEntityID) > 4000 || !strings.HasPrefix(p.LoginEntityID, "https://")) {
-		return fmt.Errorf("login_entity_id must be a bounded https URL")
-	}
-	if p.ProquestAccountID != "" {
-		if len(p.ProquestAccountID) > 64 {
-			return fmt.Errorf("proquest_account_id must be digits")
-		}
-		for _, r := range p.ProquestAccountID {
-			if r < '0' || r > '9' {
-				return fmt.Errorf("proquest_account_id must be digits")
-			}
-		}
-	}
-	if len(p.ProviderHosts) < 1 || len(p.ProviderHosts) > 20 {
-		return fmt.Errorf("provider_hosts must have 1..20 entries")
-	}
-	for _, h := range p.ProviderHosts {
-		if !hostRE.MatchString(h) {
-			return fmt.Errorf("invalid provider host %q", h)
-		}
-	}
-	if p.AccessMode != "" {
-		if err := enumRequired("access_mode", p.AccessMode, "assisted", "delegated"); err != nil {
-			return err
-		}
-	}
-	if !rfc3339RE.MatchString(p.ExpiresAt) {
-		return fmt.Errorf("expires_at must be RFC3339")
-	}
-	if _, err := time.Parse(time.RFC3339, p.ExpiresAt); err != nil {
-		return fmt.Errorf("expires_at: %w", err)
-	}
-	if p.Expected != nil {
-		if browserTextLen(p.Expected.DOI) > 300 || browserTextLen(p.Expected.Title) > 500 {
-			return fmt.Errorf("expected hints exceed bounds")
-		}
-	}
-	return nil
+	return validateJobContext(p.ProviderHosts, p.Expected, p.AccessMode, p.LoginEntityID, p.ProquestAccountID, p.DriveAttemptID, p.DriveOrdinal, p.DriveStrategy, p.DriveRevision, p.ExpiresAt, "job_offer")
 }
 
 func (p *HandoffOutcomePayload) validate() error {
@@ -3232,7 +3258,19 @@ func (p *InstitutionalCandidateOfferPayload) validate() error {
 	if err := enumRequired("institutional_candidate_offer.materialization_kind", p.MaterializationKind, "browser_tab"); err != nil {
 		return err
 	}
-	return validateTriageTime("institutional_candidate_offer.expires_at", p.ExpiresAt)
+	return validateJobContext(
+		p.ProviderHosts,
+		p.Expected,
+		p.AccessMode,
+		p.LoginEntityID,
+		p.ProquestAccountID,
+		p.DriveAttemptID,
+		p.DriveOrdinal,
+		p.DriveStrategy,
+		p.DriveRevision,
+		p.ExpiresAt,
+		"institutional_candidate_offer",
+	)
 }
 
 func (p *InstitutionalClaimRequestPayload) validate() error {

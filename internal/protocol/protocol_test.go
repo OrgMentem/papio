@@ -1939,6 +1939,16 @@ func TestInstitutionalCandidateOfferRoundTripScopeAndBounds(t *testing.T) {
 		"candidate_id":         "candidate-001",
 		"materialization_kind": "browser_tab",
 		"expires_at":           "2026-08-11T12:00:00Z",
+		"provider_hosts":       []string{"resolver.example"},
+		"expected":             map[string]any{"doi": "10.1234/example", "title": "Example work"},
+		"access_mode":          "delegated",
+		"login_entity_id":      "https://idp.example/entity",
+		"proquest_account_id":  "12345",
+		"requires_auth":        true,
+		"drive_attempt_id":     "attempt-001",
+		"drive_ordinal":        int64(0),
+		"drive_strategy":       "generic",
+		"drive_revision":       "rev-1",
 	}
 	msg, err := DecodeBrowserMessage(frame("job-inst-001", valid))
 	if err != nil {

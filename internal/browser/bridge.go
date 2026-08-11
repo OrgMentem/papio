@@ -299,7 +299,21 @@ type Bridge struct {
 	// Focus requests survive a holder change so the replacement holder can
 	// receive its offer before it is asked to surface the handoff.
 	focusPending map[string]bool
-	// Capture directives ride the holder's ordinary poll. One request per
+	// materializationScheduleCursor is daemon-side keyset state. It is only
+	// advanced after a scheduler query completes while this holder is still
+	// current; DB scheduling itself never runs under b.mu.
+	materializationScheduleCursor     job.CandidateScheduleCursor
+	scheduleCursorPending             job.CandidateScheduleCursor
+	materializationScheduleInFlight   bool
+	materializationScheduleVersion    uint64
+	scheduleHasMorePending            bool
+	scheduleEligibleCandidates        func(context.Context, int, job.CandidateScheduleCursor) (job.CandidateSchedulePage, error)
+	materializationScheduleBlocked    bool
+	materializationScheduleProcessed  bool
+	prepareMaterializationCandidateFn func(context.Context, job.Row) (*job.BrowserCandidate, error)
+	listAwaitingHuman                 func(context.Context, int) ([]job.Row, error)
+	listOpenHandoffs                  func(context.Context, int) ([]job.OpenHandoffJob, bool, error)
+	openHandoffForJobFn               func(context.Context, string) (*job.HumanAction, error)
 	// session keeps the unchanged page_capture content frame unambiguous.
 	pendingCaptures map[string]*pendingPageCapture
 	now             func() time.Time
@@ -460,7 +474,7 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 		compareVersion(b.holder.ExtensionVersion, HandoffFocusMinExtensionVersion) < 0 {
 		return 0, false, nil
 	}
-
+	holderID := b.holder.ID
 	actions, err := b.jobs.ListHumanActions(ctx, true)
 	if err != nil {
 		return 0, true, err
@@ -492,7 +506,19 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 			continue
 		}
 		if b.institutionalMaterializationAvailable() {
+			epoch := b.epoch
+			b.mu.Unlock()
 			candidate, candidateErr := b.prepareMaterializationCandidate(ctx, *row)
+			b.mu.Lock()
+			if b.epoch != epoch || b.holder == nil || b.holder.ID != holderID {
+				if b.holder != nil && b.holder.ID != legacySessionID && b.institutionalMaterializationAvailable() {
+					b.focusPending[row.ID] = true
+					b.materializationTracked[row.ID] = false
+					queued++
+					continue
+				}
+				return queued, false, nil
+			}
 			if candidateErr != nil {
 				return queued, true, candidateErr
 			}
@@ -617,8 +643,15 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	b.materializationOffered = map[string]materializationOffer{}
 	b.materializationTracked = map[string]bool{}
 	b.reofferRanThisSync = map[string]bool{}
-	b.materializationRecoveryPending = true
 
+	b.materializationScheduleCursor = job.CandidateScheduleCursor{}
+	b.scheduleCursorPending = job.CandidateScheduleCursor{}
+	b.scheduleHasMorePending = false
+	b.materializationScheduleBlocked = false
+	b.materializationScheduleProcessed = false
+	b.materializationScheduleInFlight = false
+	b.materializationScheduleVersion++
+	b.materializationRecoveryPending = true
 	b.takeovers++
 	log.Printf("papio: browser session %s (v%s) now holds the bridge: %s", shortSession(session.ID), session.ExtensionVersion, reason)
 }
@@ -675,6 +708,7 @@ func (b *Bridge) recoverMaterializationFocus(ctx context.Context) error {
 		}
 		b.focusPending[row.ID] = true
 		b.materializationTracked[row.ID] = true
+		b.materializationOffered[row.ID] = materializationOffer{CandidateID: candidate.ID}
 	}
 	return nil
 }
@@ -784,6 +818,48 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		b.reconcileMaterializationGeneration(ctx)
 	}
 	b.repairAdapterUpgradeParks(ctx)
+	// Candidate selection is durable scheduler work, not session arbitration.
+	// Release b.mu while the indexed query runs so a stalled database cannot
+	// prevent a live replacement holder from taking over. Revalidate both
+	// holder identity and generation before using any returned descriptors.
+	var scheduled []job.BrowserCandidateDescriptor
+	schedulingUnavailable := false
+	scheduleRan := false
+	scheduleEpoch := b.epoch
+	scheduleVersion := b.materializationScheduleVersion
+	if b.jobs != nil && b.institutionalMaterializationAvailable() && !b.materializationScheduleInFlight {
+		cursor := b.materializationScheduleCursor
+		b.materializationScheduleInFlight = true
+		b.materializationScheduleVersion++
+		scheduleVersion = b.materializationScheduleVersion
+		scheduleRan = true
+		schedule := b.scheduleEligibleCandidates
+		if schedule == nil {
+			schedule = func(sctx context.Context, slimit int, scursor job.CandidateScheduleCursor) (job.CandidateSchedulePage, error) {
+				return b.jobs.ScheduleEligibleBrowserCandidates(sctx, slimit, scursor)
+			}
+		}
+		b.mu.Unlock()
+		page, scheduleErr := schedule(ctx, maxOutstandingOffers, cursor)
+		b.mu.Lock()
+		if b.materializationScheduleVersion != scheduleVersion {
+			return out, nil
+		}
+		b.materializationScheduleInFlight = false
+		if b.epoch != scheduleEpoch || b.holder == nil || b.holder.ID != sessionID {
+			return out, nil
+		}
+		if scheduleErr != nil {
+			schedulingUnavailable = true
+			log.Printf("papio: materialization scheduler unavailable: %v", scheduleErr)
+		} else {
+			scheduled = page.Candidates
+			b.scheduleCursorPending = page.Cursor
+			b.scheduleHasMorePending = page.HasMore
+		}
+	}
+	b.materializationScheduleBlocked = false
+	b.materializationScheduleProcessed = false
 	offeredBefore := maps.Clone(b.offered)
 	materializationOfferedBefore := maps.Clone(b.materializationOffered)
 	materializationTrackedBefore := maps.Clone(b.materializationTracked)
@@ -793,7 +869,7 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 			deliveredBefore[id] = pending.delivered
 		}
 	}
-	polled, err := b.poll(ctx)
+	polled, err := b.poll(ctx, scheduled, schedulingUnavailable)
 	if err != nil {
 		// poll may stage offers/cancels or mark a pending capture delivered
 		// before a later frame-construction failure. The API classifies routine
@@ -808,6 +884,14 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 			}
 		}
 		return nil, err
+	}
+	if scheduleRan && !schedulingUnavailable && !b.materializationScheduleBlocked &&
+		b.materializationScheduleProcessed && b.materializationScheduleVersion == scheduleVersion &&
+		b.epoch == scheduleEpoch && b.holder != nil && b.holder.ID == sessionID {
+		b.materializationScheduleCursor = b.scheduleCursorPending
+		if !b.scheduleHasMorePending {
+			b.materializationScheduleCursor = job.CandidateScheduleCursor{}
+		}
 	}
 	return append(out, polled...), nil
 }
@@ -994,23 +1078,6 @@ func materializationRevision(key []byte, values ...string) int64 {
 	return n
 }
 
-func materializationIdentifierStrategy(w work.Work) string {
-	switch {
-	case w.DOI != "":
-		return "doi"
-	case w.PMID != "":
-		return "pmid"
-	case w.ArXiv != "":
-		return "arxiv"
-	case w.ISBN != "":
-		return "isbn"
-	case w.OpenAlex != "":
-		return "openalex"
-	default:
-		return "title"
-	}
-}
-
 func (b *Bridge) reconcileMaterializationProfiles(ctx context.Context, key []byte) error {
 	specs := make([]job.InstitutionProfileSpec, 0, len(b.cfg.ResolverNames()))
 	for _, name := range b.cfg.ResolverNames() {
@@ -1019,12 +1086,16 @@ func (b *Bridge) reconcileMaterializationProfiles(ctx context.Context, key []byt
 			continue
 		}
 		name = resolverProfileKey(name)
+		authIdentity := inst.ShibbolethEntityID
+		if authIdentity == "" {
+			authIdentity = name
+		}
 		specs = append(specs, job.InstitutionProfileSpec{
 			ConfiguredName: name,
 			AuthorityDigest: materializationMAC(key, "profile_authority", name,
 				inst.OpenURLBase, inst.ShibbolethEntityID, inst.ProquestAccountID,
 				inst.LibKeyMode, strconv.FormatInt(inst.LibKeyLibraryID, 10)),
-			AuthenticationClaimID: materializationMAC(key, "authentication_claim", name, inst.ShibbolethEntityID),
+			AuthenticationClaimID: materializationMAC(key, "authentication_claim", authIdentity),
 		})
 	}
 	_, err := b.jobs.ReconcileInstitutionProfiles(ctx, specs)
@@ -1032,6 +1103,9 @@ func (b *Bridge) reconcileMaterializationProfiles(ctx context.Context, key []byt
 }
 
 func (b *Bridge) openHandoffForJob(ctx context.Context, jobID string) (*job.HumanAction, error) {
+	if b.openHandoffForJobFn != nil {
+		return b.openHandoffForJobFn(ctx, jobID)
+	}
 	actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
 	if err != nil {
 		return nil, err
@@ -1045,6 +1119,9 @@ func (b *Bridge) openHandoffForJob(ctx context.Context, jobID string) (*job.Huma
 }
 
 func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Row) (*job.BrowserCandidate, error) {
+	if b.prepareMaterializationCandidateFn != nil {
+		return b.prepareMaterializationCandidateFn(ctx, row)
+	}
 	if b.jobs == nil || row.ID == "" {
 		return nil, job.ErrMaterializationStale
 	}
@@ -1072,25 +1149,37 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 	} else if existing != nil {
 		return existing, nil
 	}
-	strategy := materializationIdentifierStrategy(row.Work)
+	strategy := "title"
+	switch {
+	case row.Work.DOI != "":
+		strategy = "doi"
+	case row.Work.PMID != "":
+		strategy = "pmid"
+	case row.Work.ArXiv != "":
+		strategy = "arxiv"
+	case row.Work.ISBN != "":
+		strategy = "isbn"
+	case row.Work.OpenAlex != "":
+		strategy = "openalex"
+	}
 	routeRevision := materializationRevision(key, profile.ID, strategy, row.ID, strconv.FormatInt(attempt, 10), row.Work.DOI, row.Work.PMID, row.Work.ArXiv, row.Work.ISBN, row.Work.OpenAlex)
 	input := job.BrowserCandidateInput{
+		ID:    materializationMAC(key, "browser_candidate", profile.ID, strconv.FormatInt(profile.Revision, 10), profile.AuthorityDigest, strconv.FormatInt(routeRevision, 10), strategy, row.ID, strconv.FormatInt(attempt, 10)),
 		JobID: row.ID, JobAttemptRevision: attempt,
 		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: routeRevision, RouteClass: "institutional", IdentifierStrategy: strategy,
 		PreRouteSafetyKey: materializationMAC(key, "pre_route_safety", profile.ID, row.ID, strconv.FormatInt(attempt, 10)),
 		SafetyDomainID:    materializationMAC(key, "safety_domain", profile.ID, row.ID),
 		AdapterRevision:   "packaged:institutional_materialization/1",
-		EffectContractID:  "browser_tab:institutional_materialization/1",
-		Status:            "eligible",
+		EffectContractID:  "browser_tab:institutional_materialization/1", Status: "eligible",
 	}
-	candidate, err := b.jobs.CreateBrowserCandidate(ctx, input)
-	if err != nil {
+	candidate, createErr := b.jobs.CreateBrowserCandidate(ctx, input)
+	if createErr != nil {
 		if existing, getErr := b.jobs.CurrentBrowserCandidateForJob(ctx, row.ID, attempt); getErr == nil && existing != nil {
 			return existing, nil
 		}
 	}
-	return candidate, err
+	return candidate, createErr
 }
 
 // currentMaterializationEligibility is the shared fence for every
@@ -2157,6 +2246,13 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	}
 	if holderChanged {
 		b.lastSessionEvidenceAt = map[string]time.Time{}
+		b.materializationScheduleCursor = job.CandidateScheduleCursor{}
+		b.scheduleCursorPending = job.CandidateScheduleCursor{}
+		b.scheduleHasMorePending = false
+		b.materializationScheduleBlocked = false
+		b.materializationScheduleProcessed = false
+		b.materializationScheduleInFlight = false
+		b.materializationScheduleVersion++
 	}
 	b.materializationRecoveryPending = true
 	b.holder = session
@@ -5470,15 +5566,17 @@ func (b *Bridge) RunSweeper(ctx context.Context, interval time.Duration) error {
 				return nil
 			}
 		}
+
 	}
 }
 
 // poll offers outstanding handoff jobs (once per hello-session), announces
 // daemon-side cancels, and drains focus requests for the current holder.
-func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
+func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescriptor, schedulingUnavailable bool) ([]json.RawMessage, error) {
 	if b.jobs != nil {
 		if _, err := b.jobs.ReconcileMaterializationClaims(ctx, b.now()); err != nil {
 			b.materializationClaimReconcileUnavailable = true
+			b.materializationScheduleBlocked = true
 			log.Printf("papio: reconciling expired materialization claims: %v", err)
 			return nil, nil
 		}
@@ -5486,6 +5584,8 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	}
 	if b.materializationRecoveryPending {
 		if err := b.recoverMaterializationFocus(ctx); err != nil {
+			b.materializationScheduleBlocked = true
+			b.materializationScheduleProcessed = false
 			log.Printf("papio: recovering durable materialization focus: %v", err)
 		} else {
 			b.materializationRecoveryPending = false
@@ -5505,16 +5605,30 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 		}
 		b.reofferRanThisSync[profile] = true
 	}
-	awaiting, err := b.jobs.List(ctx, job.StateAwaitingHuman, 200)
+	var awaiting []job.Row
+	var err error
+	if b.listAwaitingHuman != nil {
+		awaiting, err = b.listAwaitingHuman(ctx, 200)
+	} else {
+		awaiting, err = b.jobs.List(ctx, job.StateAwaitingHuman, 200)
+	}
 	if err != nil {
+		b.materializationScheduleBlocked = true
 		log.Printf("papio: browser offer poll unavailable: %v", err)
 		return nil, nil
 	}
-	handoffJobs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
+	var handoffJobs []job.OpenHandoffJob
+	if b.listOpenHandoffs != nil {
+		handoffJobs, _, err = b.listOpenHandoffs(ctx, handoffPageLimit)
+	} else {
+		handoffJobs, _, err = b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
+	}
 	if err != nil {
+		b.materializationScheduleBlocked = true
 		log.Printf("papio: browser handoff poll unavailable: %v", err)
 		return nil, nil
 	}
+	b.materializationScheduleProcessed = true
 	if b.captureStore != nil {
 		if pending, pendingErr := b.captureStore.PendingJobs(ctx); pendingErr == nil {
 			awaitingIDs := make(map[string]struct{}, len(awaiting))
@@ -5547,7 +5661,6 @@ func (b *Bridge) poll(ctx context.Context) ([]json.RawMessage, error) {
 	var out []json.RawMessage
 	for i := range awaiting {
 		row := awaiting[i]
-		present[row.ID] = true
 		// Directory-scan adoption: a file the user (or a steered Chrome
 		// download) placed in the job's adoption directory is the strongest
 		// job-scoped gesture available. Exactly one settled regular file
@@ -5636,6 +5749,13 @@ jobLoop:
 			continue
 		}
 		row := rows[id]
+		if b.materializationTracked[id] && !b.focusPending[id] && b.institutionalMaterializationAvailable() {
+			// A capable holder must never fall back to the URL-bearing legacy
+			// offer after an explicit candidate has been observed. Claim expiry
+			// only makes the durable candidate eligible again; a fresh explicit
+			// focus/redrive is still required to surface it.
+			continue
+		}
 		if b.focusPending[id] && b.institutionalMaterializationAvailable() {
 			continue
 		}
@@ -5827,7 +5947,8 @@ jobLoop:
 			log.Printf("papio: checking cancelled browser job %s: %v", id, err)
 			continue
 		}
-		trackedMaterialization := b.materializationTracked[id]
+		trackedMaterialization := b.materializationTracked[id] ||
+			b.materializationOffered[id].CandidateID != ""
 		actionPresent := present[id]
 		if trackedMaterialization && row.State == job.StateAwaitingHuman && !actionPresent {
 			// present is only the bounded poll page; a tracked job may be
@@ -5873,17 +5994,60 @@ jobLoop:
 	if b.epoch != epoch {
 		return out, nil
 	}
+	scheduledByJob := make(map[string]job.BrowserCandidateDescriptor, len(scheduled))
+	scheduledRawByJob := make(map[string]job.BrowserCandidateDescriptor, len(scheduled))
+	scheduledDomainOwner := make(map[string]string, len(scheduled))
+	for _, descriptor := range scheduled {
+		if descriptor.JobID == "" {
+			continue
+		}
+		scheduledRawByJob[descriptor.JobID] = descriptor
+		domain := descriptor.SafetyDomainID
+		if domain == "" {
+			domain = descriptor.InstitutionProfileID + "\x00" + descriptor.PreRouteSafetyKey
+		}
+		if b.focusPending[descriptor.JobID] {
+			if _, exists := scheduledDomainOwner[domain]; !exists {
+				scheduledDomainOwner[domain] = descriptor.JobID
+				scheduledByJob[descriptor.JobID] = descriptor
+			}
+		}
+	}
 	if b.holder != nil && b.holder.ID != legacySessionID && compareVersion(b.holder.ExtensionVersion, HandoffFocusMinExtensionVersion) >= 0 {
 		ids := make([]string, 0, len(b.focusPending))
-		for id := range b.focusPending {
-			ids = append(ids, id)
+		ordered := make(map[string]bool, len(b.focusPending))
+		for _, descriptor := range scheduled {
+			_, hasHandoff := handoff[descriptor.JobID]
+			if descriptor.JobID != "" && b.focusPending[descriptor.JobID] && hasHandoff {
+				ids = append(ids, descriptor.JobID)
+				ordered[descriptor.JobID] = true
+			}
 		}
-		sort.Strings(ids)
+		var rest []string
+		for id := range b.focusPending {
+			if !ordered[id] {
+				rest = append(rest, id)
+			}
+		}
+		sort.Strings(rest)
+		ids = append(ids, rest...)
 		focused := 0
 		for _, id := range ids {
 			if _, ok := handoff[id]; !ok {
-				delete(b.focusPending, id)
-				continue
+				action, actionErr := b.openHandoffForJob(ctx, id)
+				switch {
+				case errors.Is(actionErr, sql.ErrNoRows):
+					delete(b.focusPending, id)
+					continue
+				case actionErr != nil:
+					log.Printf("papio: checking focused browser action %s: %v", id, actionErr)
+					continue
+				case action == nil:
+					delete(b.focusPending, id)
+					continue
+				default:
+					handoff[id] = *action
+				}
 			}
 			row, getErr := b.jobs.Get(ctx, id)
 			switch {
@@ -5916,63 +6080,152 @@ jobLoop:
 				continue
 			}
 			if b.focusPending[id] && b.institutionalMaterializationAvailable() {
-				candidate, candidateErr := b.prepareMaterializationCandidate(ctx, *row)
-				if candidateErr != nil || candidate == nil {
+				candidate, candidateOK := scheduledByJob[id]
+				if !candidateOK {
+					if _, domainBlocked := scheduledRawByJob[id]; domainBlocked {
+						continue
+					}
+					attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, id)
+					if attemptErr != nil {
+						log.Printf("papio: reading focused materialization attempt for %s: %v", id, attemptErr)
+						continue
+					}
+					durable, candidateErr := b.jobs.CurrentBrowserCandidateForJob(ctx, id, attempt)
 					if candidateErr != nil {
-						log.Printf("papio: preparing institutional candidate for %s: %v", id, candidateErr)
+						log.Printf("papio: reading focused materialization candidate for %s: %v", id, candidateErr)
+						continue
 					}
-					if candidate == nil || errors.Is(candidateErr, job.ErrMaterializationStale) {
+					if durable == nil {
 						b.clearMaterializationTracking(id)
+						delete(b.focusPending, id)
+						continue
 					}
-					continue
+					switch durable.Status {
+					case "claimed", "materializing":
+						candidate = job.BrowserCandidateDescriptor{
+							CandidateID: durable.ID, JobID: durable.JobID,
+							JobAttemptRevision:         durable.JobAttemptRevision,
+							InstitutionProfileID:       durable.InstitutionProfileID,
+							InstitutionProfileRevision: durable.InstitutionProfileRevision,
+							RouteRevision:              durable.RouteRevision, RouteClass: durable.RouteClass,
+							IdentifierStrategy: durable.IdentifierStrategy,
+							PreRouteSafetyKey:  durable.PreRouteSafetyKey,
+							SafetyDomainID:     durable.SafetyDomainID,
+							AdapterRevision:    durable.AdapterRevision,
+							EffectContractID:   durable.EffectContractID,
+							Status:             durable.Status, CreatedAt: durable.CreatedAt,
+						}
+						candidateOK = candidate.CandidateID != ""
+					case "eligible":
+						trackedOffer, tracked := b.materializationOffered[id]
+						if !tracked || trackedOffer.CandidateID != durable.ID {
+							continue
+						}
+						candidate = job.BrowserCandidateDescriptor{
+							CandidateID: durable.ID, JobID: durable.JobID,
+							JobAttemptRevision:         durable.JobAttemptRevision,
+							InstitutionProfileID:       durable.InstitutionProfileID,
+							InstitutionProfileRevision: durable.InstitutionProfileRevision,
+							RouteRevision:              durable.RouteRevision, RouteClass: durable.RouteClass,
+							IdentifierStrategy: durable.IdentifierStrategy,
+							PreRouteSafetyKey:  durable.PreRouteSafetyKey,
+							SafetyDomainID:     durable.SafetyDomainID,
+							AdapterRevision:    durable.AdapterRevision,
+							EffectContractID:   durable.EffectContractID,
+							Status:             durable.Status, CreatedAt: durable.CreatedAt,
+						}
+						candidateOK = true
+					default:
+						b.clearMaterializationTracking(id)
+						delete(b.focusPending, id)
+						continue
+					}
 				}
-				if candidate.Status != "eligible" && candidate.Status != "claimed" && candidate.Status != "materializing" {
-					// Succeeded, abandoned, or another terminal candidate
-					// state cannot be safely replayed.
-					b.clearMaterializationTracking(id)
-					continue
-				}
-				now := b.now()
-				offerState, tracked := b.materializationOffered[id]
-				newCandidate := !tracked
-				if tracked && offerState.CandidateID != candidate.ID {
-					// A new attempt/candidate supersedes the old local
-					// correlation; only the current candidate may be offered.
-					delete(b.materializationOffered, id)
-					tracked = false
-					newCandidate = true
-				}
-				if newCandidate {
-					// A prior cancellation belongs to the superseded
-					// scaffold and must not suppress this candidate's cancel.
-					delete(b.cancelSent, id)
-				}
-				if tracked && !offerState.ExpiresAt.IsZero() && !offerState.ExpiresAt.After(now) {
-					delete(b.materializationOffered, id)
-					if candidate.Status != "claimed" && candidate.Status != "materializing" {
+				if candidateOK {
+					attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, id)
+					if attemptErr != nil {
+						continue
+					}
+					current, currentErr := b.jobs.CurrentBrowserCandidateForJob(ctx, id, attempt)
+					if currentErr != nil {
+						continue
+					}
+					if current == nil {
+						b.clearMaterializationTracking(id)
+						delete(b.focusPending, id)
+						continue
+					}
+					if current.ID != candidate.CandidateID ||
+						current.JobAttemptRevision != candidate.JobAttemptRevision ||
+						current.InstitutionProfileID != candidate.InstitutionProfileID ||
+						current.InstitutionProfileRevision != candidate.InstitutionProfileRevision ||
+						current.RouteRevision != candidate.RouteRevision ||
+						current.PreRouteSafetyKey != candidate.PreRouteSafetyKey ||
+						current.SafetyDomainID != candidate.SafetyDomainID ||
+						current.AdapterRevision != candidate.AdapterRevision ||
+						current.EffectContractID != candidate.EffectContractID ||
+						(candidate.Status == "eligible" && current.Status != "eligible") ||
+						(candidate.Status != "eligible" && current.Status != "claimed" && current.Status != "materializing") {
+						continue
+					}
+					now := b.now()
+					offerState, tracked := b.materializationOffered[id]
+					newCandidate := !tracked
+					if tracked && offerState.CandidateID != candidate.CandidateID {
+						delete(b.materializationOffered, id)
+						tracked = false
+						newCandidate = true
+					}
+					if newCandidate {
+						delete(b.cancelSent, id)
+					}
+					if tracked && !offerState.ExpiresAt.IsZero() && !offerState.ExpiresAt.After(now) {
+						delete(b.materializationOffered, id)
 						delete(b.materializationTracked, id)
+						tracked = false
+						newCandidate = true
+						delete(b.cancelSent, id)
 					}
-					tracked = false
-					newCandidate = true
-					delete(b.cancelSent, id)
+					expiresAt := now.Add(b.actionExpiry())
+					if tracked && !offerState.ExpiresAt.IsZero() {
+						expiresAt = offerState.ExpiresAt
+					}
+					events, eventsErr := b.jobs.Events(ctx, id)
+					if eventsErr != nil {
+						log.Printf("papio: reading candidate offer context for %s: %v", id, eventsErr)
+						continue
+					}
+					hosts := b.browserOfferHosts(*row, handoff[id], events)
+					if len(hosts) == 0 {
+						continue
+					}
+					expected := &protocol.JobOfferExpected{DOI: row.Work.DOI, Title: truncate(row.Work.Title, 500)}
+					if expected.DOI == "" && expected.Title == "" {
+						expected = nil
+					}
+					inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
+					offerPayload := protocol.InstitutionalCandidateOfferPayload{
+						CandidateID: candidate.CandidateID, MaterializationKind: "browser_tab",
+						ExpiresAt:     expiresAt.UTC().Format(time.RFC3339),
+						ProviderHosts: hosts, Expected: expected, AccessMode: accessMode,
+						LoginEntityID: inst.ShibbolethEntityID, ProquestAccountID: inst.ProquestAccountID,
+						RequiresAuth: handoff[id].RequiresAuth,
+					}
+					if attemptID, ordinal, ok := b.latestProviderDriveEpoch(id); ok {
+						offerPayload.DriveAttemptID = attemptID
+						offerPayload.DriveOrdinal = &ordinal
+						offerPayload.DriveStrategy = "generic"
+						offerPayload.DriveRevision = "1"
+					}
+					offerFrame, frameErr := b.frame(protocol.MsgInstitutionalCandidateOffer, id, offerPayload)
+					if frameErr != nil {
+						return nil, frameErr
+					}
+					b.materializationOffered[id] = materializationOffer{CandidateID: candidate.CandidateID, ExpiresAt: expiresAt}
+					out = append(out, offerFrame)
+					b.materializationTracked[id] = true
+					continue
 				}
-				expiresAt := now.Add(b.actionExpiry())
-				if tracked {
-					expiresAt = offerState.ExpiresAt
-				}
-				offerFrame, frameErr := b.frame(protocol.MsgInstitutionalCandidateOffer, id,
-					protocol.InstitutionalCandidateOfferPayload{
-						CandidateID: candidate.ID, MaterializationKind: "browser_tab",
-						ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
-					})
-				if frameErr != nil {
-					return nil, frameErr
-				}
-				b.materializationOffered[id] = materializationOffer{CandidateID: candidate.ID, ExpiresAt: expiresAt}
-				out = append(out, offerFrame)
-				b.materializationTracked[id] = true
-				// Keep focusPending until the claim/status fence observes
-				// acknowledgement; a lost frame is retried on the next poll.
 				continue
 			}
 			if !b.offered[id] && b.providerDriveEpochAvailable() {

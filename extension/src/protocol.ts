@@ -637,6 +637,16 @@ export interface InstitutionalCandidateOfferPayload {
   candidate_id: string;
   materialization_kind: "browser_tab";
   expires_at: string;
+  provider_hosts: string[];
+  expected?: JobOfferExpected;
+  access_mode?: "assisted" | "delegated";
+  login_entity_id?: string;
+  proquest_account_id?: string;
+  requires_auth?: boolean;
+  drive_attempt_id?: string;
+  drive_ordinal?: number;
+  drive_strategy?: string;
+  drive_revision?: string;
 }
 
 export interface InstitutionalClaimRequestPayload {
@@ -2442,10 +2452,47 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         candidate_id: "required",
         materialization_kind: "required",
         expires_at: "required",
+        provider_hosts: "required",
+        expected: "optional",
+        access_mode: "optional",
+        login_entity_id: "optional",
+        proquest_account_id: "optional",
+        requires_auth: "optional",
+        drive_attempt_id: "optional",
+        drive_ordinal: "optional",
+        drive_strategy: "optional",
+        drive_revision: "optional",
       });
       institutionalID(p, "candidate_id", type);
       if (str(p, "materialization_kind", type, 32) !== "browser_tab") fail(`${type}.materialization_kind is invalid`);
       triageTime(p, "expires_at", type);
+      const hosts = p["provider_hosts"];
+      if (!Array.isArray(hosts) || hosts.length < 1 || hosts.length > 20) fail(`${type}.provider_hosts must have 1..20 entries`);
+      for (const host of hosts) {
+        if (typeof host !== "string" || !HOST_RE.test(host)) fail(`${type}.provider_hosts contains an invalid host`);
+      }
+      if ("expected" in p) {
+        const expected = asRecord(p["expected"], `${type}.expected`);
+        requireFields<JobOfferExpected>(expected, `${type}.expected`, { doi: "optional", title: "optional" });
+        if ("doi" in expected) str(expected, "doi", `${type}.expected`, 300);
+        if ("title" in expected) str(expected, "title", `${type}.expected`, 500);
+      }
+      if ("access_mode" in p) {
+        const mode = str(p, "access_mode", type, 20);
+        if (mode !== "assisted" && mode !== "delegated") fail(`${type}.access_mode is invalid`);
+      }
+      if ("login_entity_id" in p) {
+        const entity = str(p, "login_entity_id", type, 4000);
+        if (!entity.startsWith("https://")) fail(`${type}.login_entity_id must be https`);
+      }
+      if ("proquest_account_id" in p && !/^[0-9]+$/.test(str(p, "proquest_account_id", type, 64))) {
+        fail(`${type}.proquest_account_id must be digits`);
+      }
+      if ("requires_auth" in p && typeof p["requires_auth"] !== "boolean") fail(`${type}.requires_auth must be a boolean`);
+      if ("drive_attempt_id" in p) correlationID(p, "drive_attempt_id", type);
+      if ("drive_ordinal" in p) int(p, "drive_ordinal", type, 0);
+      if ("drive_strategy" in p) str(p, "drive_strategy", type, 128);
+      if ("drive_revision" in p) str(p, "drive_revision", type, 128);
       break;
     }
     case "institutional_claim_request": {

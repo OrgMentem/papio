@@ -55,8 +55,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 27 {
-		t.Fatalf("user_version = %d, %v; want 27", version, err)
+	if err != nil || version != 28 {
+		t.Fatalf("user_version = %d, %v; want 28", version, err)
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
 
@@ -122,8 +122,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 27 {
-		t.Fatalf("user_version = %d, %v; want 27", version, err)
+	if err != nil || version != 28 {
+		t.Fatalf("user_version = %d, %v; want 28", version, err)
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
 
@@ -269,6 +269,7 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 			'institution_profiles_active_name',
 			'browser_candidates_by_job',
 			'browser_candidates_by_profile',
+			'browser_candidates_schedule_keyset',
 			'materialization_claims_by_candidate',
 			'materialization_claims_live_candidate',
 			'profile_evidence_by_profile',
@@ -298,6 +299,7 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 		"institution_profiles_active_name",
 		"browser_candidates_by_job",
 		"browser_candidates_by_profile",
+		"browser_candidates_schedule_keyset",
 		"materialization_claims_by_candidate",
 		"materialization_claims_live_candidate",
 		"profile_evidence_by_profile",

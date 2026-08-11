@@ -294,7 +294,8 @@ test("materialization reducer keeps URL-free closed transitions and rejects stal
     phase: "offered",
     tab_id: -1,
   };
-  let store = reduceMaterialization(emptyStore(), correlation.job_id, { type: "offer", correlation });
+  let store = upsertJob(emptyStore(), job({ job_id: correlation.job_id, tab_id: -1, provider_hosts: ["www.jstor.org"] }));
+  store = reduceMaterialization(store, correlation.job_id, { type: "offer", correlation });
   store = reduceMaterialization(store, correlation.job_id, { type: "bound" });
   expect(store.materializations?.[correlation.job_id]?.phase).toBe("offered");
   store = reduceMaterialization(store, correlation.job_id, { type: "claiming" });
@@ -306,12 +307,16 @@ test("materialization reducer keeps URL-free closed transitions and rejects stal
     lease_until: "2030-01-01T00:05:00Z",
   });
   store = reduceMaterialization(store, correlation.job_id, { type: "scaffolded", tab_id: 501 });
+  expect(findByTab(store, 501)?.job_id).toBe(correlation.job_id);
   store = reduceMaterialization(store, correlation.job_id, { type: "bound" });
   store = reduceMaterialization(store, correlation.job_id, { type: "route_issued", route_issuance_ordinal: 9 });
   store = reduceMaterialization(store, correlation.job_id, { type: "route_issued", route_issuance_ordinal: 8 });
   expect(store.materializations?.[correlation.job_id]?.route_issuance_ordinal).toBe(9);
   const persisted = JSON.stringify(store);
   expect(persisted).not.toContain("https://");
+  store = reduceMaterialization(store, correlation.job_id, { type: "clear" });
+  expect(store.materializations).toBeUndefined();
+  expect(store.activeJobs.find((active) => active.job_id === correlation.job_id)?.tab_id).toBe(-1);
 });
 test("materialization reducer supersedes candidates and marks a lost scaffold without dropping binding", () => {
   const first: MaterializationCorrelation = {

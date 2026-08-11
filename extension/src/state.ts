@@ -430,13 +430,15 @@ export function reduceMaterialization(store: StoreShape, jobID: string, event: M
   if (event.type === "clear") {
     const materializations = { ...(store.materializations ?? {}) };
     delete materializations[jobID];
-    return Object.keys(materializations).length === 0
-      ? (() => {
-          const next = { ...store };
-          delete next.materializations;
-          return next;
-        })()
-      : { ...store, materializations };
+    const activeJobs = store.activeJobs.map((job) =>
+      job.job_id === jobID && job.tab_id === current.tab_id ? { ...job, tab_id: -1 } : job,
+    );
+    if (Object.keys(materializations).length === 0) {
+      const next = { ...store, activeJobs };
+      delete next.materializations;
+      return next;
+    }
+    return { ...store, activeJobs, materializations };
   }
   let next: MaterializationCorrelation = { ...current };
   switch (event.type) {
@@ -551,7 +553,19 @@ export function reduceMaterialization(store: StoreShape, jobID: string, event: M
     default:
       return store;
   }
-  return { ...store, materializations: { ...(store.materializations ?? {}), [jobID]: next } };
+  const tabSync =
+    event.type === "scaffolded" ||
+    event.type === "reconcile_tab" ||
+    event.type === "scaffold_lost" ||
+    event.type === "retry_route" ||
+    event.type === "retry_claim";
+  if (!tabSync) return { ...store, materializations: { ...(store.materializations ?? {}), [jobID]: next } };
+  const tabID = next.tab_id;
+  return {
+    ...store,
+    materializations: { ...(store.materializations ?? {}), [jobID]: next },
+    activeJobs: store.activeJobs.map((job) => job.job_id === jobID ? { ...job, tab_id: tabID } : job),
+  };
 }
 
 

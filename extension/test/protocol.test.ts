@@ -910,6 +910,16 @@ test("institutional_candidate_offer is URL-free, browser-tab-only, job-scoped, a
     candidate_id: "candidate-001",
     materialization_kind: "browser_tab",
     expires_at: "2026-08-11T12:00:00Z",
+    provider_hosts: ["resolver.example.edu"],
+    expected: { doi: "10.1234/example", title: "Example work" },
+    access_mode: "delegated",
+    login_entity_id: "https://idp.example/entity",
+    proquest_account_id: "12345",
+    requires_auth: true,
+    drive_attempt_id: "attempt-001",
+    drive_ordinal: 0,
+    drive_strategy: "generic",
+    drive_revision: "rev-1",
   };
   expect(parseBrowserMessage(envelope(valid)).payload).toEqual(valid);
   expect(parseBrowserMessage(envelope(valid, "job-inst-001")).type).toBe("institutional_candidate_offer");

@@ -1629,11 +1629,33 @@
           "payload": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["candidate_id", "materialization_kind", "expires_at"],
+            "required": ["candidate_id", "materialization_kind", "expires_at", "provider_hosts"],
             "properties": {
               "candidate_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
               "materialization_kind": { "const": "browser_tab" },
-              "expires_at": { "type": "string", "format": "date-time", "maxLength": 64 }
+              "expires_at": { "type": "string", "format": "date-time", "maxLength": 64 },
+              "provider_hosts": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": { "type": "string", "pattern": "^[a-z0-9.-]{3,253}$" }
+              },
+              "expected": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "doi": { "type": "string", "maxLength": 300 },
+                  "title": { "type": "string", "maxLength": 500 }
+                }
+              },
+              "access_mode": { "enum": ["assisted", "delegated"] },
+              "login_entity_id": { "type": "string", "format": "uri", "maxLength": 4000, "pattern": "^https://" },
+              "proquest_account_id": { "type": "string", "maxLength": 64, "pattern": "^[0-9]+$" },
+              "requires_auth": { "type": "boolean" },
+              "drive_attempt_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+              "drive_ordinal": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "drive_strategy": { "type": "string", "maxLength": 128, "pattern": "^[^\u0000\r\n]+$" },
+              "drive_revision": { "type": "string", "maxLength": 128, "pattern": "^[^\u0000\r\n]+$" }
             }
           }
         }

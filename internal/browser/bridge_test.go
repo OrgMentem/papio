@@ -16,8 +16,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -233,6 +235,21 @@ func countType(msgs []*protocol.BrowserMessage, typ string) int {
 	}
 	return n
 }
+func countRawType(t *testing.T, frames []json.RawMessage, typ string) int {
+	t.Helper()
+	count := 0
+	for _, frame := range frames {
+		msg, err := protocol.DecodeBrowserMessage(frame)
+		if err != nil {
+			t.Fatalf("outbound frame failed protocol decode: %v", err)
+		}
+		if msg.Type == typ {
+			count++
+		}
+	}
+	return count
+}
+
 func pageCaptureFixture(html []byte) []byte {
 	return []byte(fmt.Sprintf("<!-- papio-fixture provider=\"sage\" scenario=\"observed\" origin=\"https://sagepub.com/\" captured=\"2026-08-10T00:00:00Z\" -->\n%s", html))
 }
@@ -2072,11 +2089,47 @@ func materializationHello(t *testing.T) json.RawMessage {
 	})
 }
 
+func explicitMaterializationCandidate(t *testing.T, jobs *job.Store, jobID, domain string) string {
+	t.Helper()
+	ctx := context.Background()
+	profiles, err := jobs.ListInstitutionProfiles(ctx, false)
+	if err != nil || len(profiles) == 0 {
+		t.Fatalf("list institution profiles: %v (%d)", err, len(profiles))
+	}
+	attempt, err := jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		t.Fatalf("materialization attempt: %v", err)
+	}
+	candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		JobID: jobID, JobAttemptRevision: attempt,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "pre-route-" + domain, SafetyDomainID: domain,
+		AdapterRevision: "test-adapter", EffectContractID: "test-effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatalf("create explicit browser candidate: %v", err)
+	}
+	return candidate.ID
+}
+func schedulerDescriptor(t *testing.T, jobs *job.Store, candidateID, status string) job.BrowserCandidateDescriptor {
+	t.Helper()
+	var descriptor job.BrowserCandidateDescriptor
+	if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT id, job_id, job_attempt_revision, institution_profile_id, institution_profile_revision, route_revision, route_class, identifier_strategy, pre_route_safety_key, safety_domain_id, adapter_revision, effect_contract_id, status, created_at FROM browser_candidates WHERE id=?`, candidateID).Scan(
+		&descriptor.CandidateID, &descriptor.JobID, &descriptor.JobAttemptRevision, &descriptor.InstitutionProfileID, &descriptor.InstitutionProfileRevision, &descriptor.RouteRevision, &descriptor.RouteClass, &descriptor.IdentifierStrategy, &descriptor.PreRouteSafetyKey, &descriptor.SafetyDomainID, &descriptor.AdapterRevision, &descriptor.EffectContractID, &descriptor.Status, &descriptor.CreatedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	descriptor.Status = status
+	return descriptor
+}
+
 func TestInstitutionalCandidateOfferReoffersUntilClaim(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
 	jobID := parkInstitutional(t, jobs, "materialization-reoffer", handoffWork(), "")
 	runSync(t, b, materializationHello(t))
+	explicitMaterializationCandidate(t, jobs, jobID, "domain-reoffer")
 	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
 		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
 	}
@@ -2086,6 +2139,20 @@ func TestInstitutionalCandidateOfferReoffersUntilClaim(t *testing.T) {
 		t.Fatalf("first poll did not emit candidate offer: %v", first)
 	}
 	candidateID := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID
+	offerPayload := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload)
+	if len(offerPayload.ProviderHosts) == 0 || offerPayload.AccessMode == "" {
+		t.Fatalf("candidate offer omitted job context: %#v", offerPayload)
+	}
+	if offerPayload.Expected == nil || offerPayload.Expected.DOI == "" {
+		t.Fatalf("candidate offer omitted expected work identity: %#v", offerPayload)
+	}
+	rawOffer, err := json.Marshal(offerPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(rawOffer, []byte(`"openurl"`)) || bytes.Contains(rawOffer, []byte(`"url"`)) {
+		t.Fatalf("candidate offer carried URL field: %s", rawOffer)
+	}
 	second, _ := runSync(t, b)
 	reoffer := firstOfType(second, protocol.MsgInstitutionalCandidateOffer)
 	if reoffer == nil || reoffer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID != candidateID {
@@ -2131,6 +2198,7 @@ func TestInstitutionalCandidateOfferCancellationIsDelivered(t *testing.T) {
 	ctx := context.Background()
 	jobID := parkInstitutional(t, jobs, "materialization-cancel", handoffWork(), "")
 	runSync(t, b, materializationHello(t))
+	explicitMaterializationCandidate(t, jobs, jobID, "domain-cancel")
 	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
 		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
 	}
@@ -2152,6 +2220,7 @@ func TestInstitutionalCandidateOfferRecoversAfterHolderRestart(t *testing.T) {
 	ctx := context.Background()
 	jobID := parkInstitutional(t, jobs, "materialization-restart-recovery", handoffWork(), "")
 	runSync(t, b, materializationHello(t))
+	explicitMaterializationCandidate(t, jobs, jobID, "domain-restart")
 	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
 		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
 	}
@@ -2183,6 +2252,7 @@ func TestInstitutionalCandidateClaimOfferExpiryRetainsCancellationTracking(t *te
 	ctx := context.Background()
 	jobID := parkInstitutional(t, jobs, "materialization-expiry-cancel", handoffWork(), "")
 	runSync(t, b, materializationHello(t))
+	explicitMaterializationCandidate(t, jobs, jobID, "domain-expiry")
 	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
 		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
 	}
@@ -7980,5 +8050,592 @@ func TestInstitutionalMaterializationRequiresExplicitClientFeature(t *testing.T)
 	enabled := firstOfType(msgs, protocol.MsgInstitutionalClaimResponse)
 	if enabled == nil || enabled.Payload.(*protocol.InstitutionalClaimResponsePayload).Outcome != "stale" {
 		t.Fatalf("explicitly negotiated materialization response = %#v, want stale candidate", enabled)
+	}
+}
+func TestOrdinaryPollDoesNotCreateCandidate(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-no-auto-create", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	runSync(t, b)
+	var count int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM browser_candidates WHERE job_id=?`, jobID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("ordinary poll created %d candidate rows without explicit focus", count)
+	}
+}
+
+func TestExplicitFocusCreatesAndOffersCandidate(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-focus-create", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	var count int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM browser_candidates WHERE job_id=?`, jobID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("explicit focus created %d candidate rows, want one", count)
+	}
+	msgs, _ := runSync(t, b)
+	if firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("explicit focus did not emit candidate offer: %v", msgs)
+	}
+}
+
+func TestMaterializationSchedulerKeepsOneSafetyDomainScaffold(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	first := parkInstitutional(t, jobs, "materialization-domain-first", handoffWork(), "")
+	second := parkInstitutional(t, jobs, "materialization-domain-second", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	explicitMaterializationCandidate(t, jobs, first, "same-domain")
+	explicitMaterializationCandidate(t, jobs, second, "same-domain")
+	if queued, live, err := b.FocusHandoffs(ctx, []string{first, second}); err != nil || !live || queued != 2 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want two live requests", queued, live, err)
+	}
+	msgs, _ := runSync(t, b)
+	if got := countType(msgs, protocol.MsgInstitutionalCandidateOffer); got != 1 {
+		t.Fatalf("same safety domain emitted %d candidate offers, want one: %v", got, msgs)
+	}
+}
+
+func TestMaterializationSchedulerErrorRetainsFocusUntilRecovery(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-scheduler-retry", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	b.materializationScheduleCursor = job.CandidateScheduleCursor{LastGroup: "prior"}
+	beforeCursor := b.materializationScheduleCursor
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "retry-domain")
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	var failed atomic.Bool
+	b.scheduleEligibleCandidates = func(context.Context, int, job.CandidateScheduleCursor) (job.CandidateSchedulePage, error) {
+		if failed.CompareAndSwap(false, true) {
+			return job.CandidateSchedulePage{}, errors.New("temporary scheduler outage")
+		}
+		return job.CandidateSchedulePage{
+			Candidates: []job.BrowserCandidateDescriptor{schedulerDescriptor(t, jobs, candidateID, "eligible")},
+		}, nil
+	}
+	first, _ := runSync(t, b)
+	if firstOfType(first, protocol.MsgInstitutionalCandidateOffer) != nil {
+		t.Fatalf("scheduler error emitted a candidate offer: %v", first)
+	}
+	if !reflect.DeepEqual(b.materializationScheduleCursor, beforeCursor) {
+		t.Fatalf("scheduler error advanced cursor: got=%#v want=%#v", b.materializationScheduleCursor, beforeCursor)
+	}
+	if !b.focusPending[jobID] || b.materializationTracked[jobID] {
+		t.Fatalf("scheduler error lost explicit focus/tracking: focus=%v tracked=%v", b.focusPending[jobID], b.materializationTracked[jobID])
+	}
+	recovered, _ := runSync(t, b)
+	if firstOfType(recovered, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("scheduler recovery did not emit candidate offer: %v", recovered)
+	}
+}
+
+func TestMaterializationSchedulerStallDoesNotBlockHolderTakeover(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-scheduler-stall", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	explicitMaterializationCandidate(t, jobs, jobID, "stall-domain")
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	b.scheduleEligibleCandidates = func(context.Context, int, job.CandidateScheduleCursor) (job.CandidateSchedulePage, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return job.CandidateSchedulePage{}, nil
+	}
+	oldSession := testSessionID
+	go func() {
+		_, _ = b.Sync(ctx, oldSession, false, nil)
+	}()
+	<-started
+	b.mu.Lock()
+	if b.holder != nil {
+		b.holder.LastSyncAt = b.now().Add(-sessionStaleAfter - time.Second)
+	}
+	b.mu.Unlock()
+	const replacement = "sess-scheduler-replacement-000000000000000000"
+	replacementMsgs, _ := runSyncAs(t, b, replacement, hello())
+	if firstOfType(replacementMsgs, protocol.MsgHelloAck) == nil {
+		t.Fatalf("replacement did not become holder while scheduler stalled: %v", replacementMsgs)
+	}
+	b.mu.Lock()
+	holder := b.holder
+	b.mu.Unlock()
+	if holder == nil || holder.ID != replacement {
+		t.Fatalf("holder = %#v, want replacement while first scheduler call is blocked", holder)
+	}
+	close(release)
+}
+func TestMaterializationCursorRetainedAcrossClaimReconcileFailure(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-cursor-reconcile-failure", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	initial, _ := runSync(t, b)
+	offer := firstOfType(initial, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil {
+		t.Fatalf("initial candidate offer missing: %v", initial)
+	}
+	candidateID := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, jobID,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "cursor-reconcile-claim", CandidateID: candidateID, MaterializationKind: "browser_tab",
+		}))
+	claimResult := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if claimResult == nil || claimResult.Payload.(*protocol.InstitutionalClaimResponsePayload).Outcome != "claimed" {
+		t.Fatalf("claim result = %v", claimed)
+	}
+	b.now = func() time.Time { return time.Now().UTC().Add(2 * b.actionExpiry()) }
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_materialization_reconcile_once
+		BEFORE UPDATE OF phase ON materialization_claims
+		BEGIN SELECT RAISE(ABORT, 'injected reconcile failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	cursorBefore := b.materializationScheduleCursor
+	runSync(t, b)
+	if b.materializationScheduleCursor.LastGroup != cursorBefore.LastGroup ||
+		len(b.materializationScheduleCursor.Offsets) != len(cursorBefore.Offsets) {
+		t.Fatalf("scheduler cursor advanced across reconcile failure: before=%+v after=%+v", cursorBefore, b.materializationScheduleCursor)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_materialization_reconcile_once`); err != nil {
+		t.Fatal(err)
+	}
+	recovered, _ := runSync(t, b)
+	if firstOfType(recovered, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("reconcile recovery did not re-offer candidate: %v", recovered)
+	}
+}
+
+func TestResolvedAwaitingMaterializationActionCancelsTrackedScaffold(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-resolved-action-cancel", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	initial, _ := runSync(t, b)
+	if firstOfType(initial, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("candidate offer missing: %v", initial)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+	if err != nil || len(actions) == 0 {
+		t.Fatalf("open handoff action = %v, %v", actions, err)
+	}
+	if err := jobs.ResolveHumanAction(ctx, actions[0].ID, "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, _ := runSync(t, b)
+	if firstOfType(cancelled, protocol.MsgCancel) == nil {
+		t.Fatalf("resolved awaiting action did not cancel scaffold: %v", cancelled)
+	}
+	if b.materializationTracked[jobID] {
+		t.Fatal("resolved awaiting action left materialization tracking open")
+	}
+}
+func TestMaterializationTakeoverResetsScheduleCursorForRecovery(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-takeover-cursor", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	initial, _ := runSync(t, b)
+	if firstOfType(initial, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("initial candidate offer missing: %v", initial)
+	}
+	b.mu.Lock()
+	b.holder.LastSyncAt = b.now().Add(-sessionStaleAfter - time.Second)
+	b.mu.Unlock()
+	const replacement = "sess-takeover-cursor-000000000000000000000000"
+	recovered, _ := runSyncAs(t, b, replacement, materializationHello(t))
+	if firstOfType(recovered, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("takeover did not re-offer candidate after cursor reset: %v", recovered)
+	}
+}
+func TestMaterializationListErrorRetainsCursorUntilRecovery(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-list-error-cursor", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	initial, _ := runSync(t, b)
+	if firstOfType(initial, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("initial candidate offer missing: %v", initial)
+	}
+	cursorBefore := b.materializationScheduleCursor
+	var failed atomic.Bool
+	b.listAwaitingHuman = func(context.Context, int) ([]job.Row, error) {
+		if failed.CompareAndSwap(false, true) {
+			return nil, errors.New("temporary list failure")
+		}
+		return jobs.List(ctx, job.StateAwaitingHuman, 200)
+	}
+	runSync(t, b)
+	if b.materializationScheduleCursor.LastGroup != cursorBefore.LastGroup ||
+		len(b.materializationScheduleCursor.Offsets) != len(cursorBefore.Offsets) {
+		t.Fatalf("cursor advanced across list failure: before=%+v after=%+v", cursorBefore, b.materializationScheduleCursor)
+	}
+	b.listAwaitingHuman = nil
+	recovered, _ := runSync(t, b)
+	if firstOfType(recovered, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("list recovery did not re-offer candidate: %v", recovered)
+	}
+}
+
+func TestMaterializationNoDescriptorNeverFallsBackToLegacyOffer(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-no-descriptor", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	b.scheduleEligibleCandidates = func(context.Context, int, job.CandidateScheduleCursor) (job.CandidateSchedulePage, error) {
+		return job.CandidateSchedulePage{}, nil
+	}
+	msgs, _ := runSync(t, b)
+	if countJobOffersFor(msgs, jobID) != 0 {
+		t.Fatalf("materialization-capable no-descriptor focus fell back to legacy job_offer: %v", msgs)
+	}
+	if !b.focusPending[jobID] {
+		t.Fatal("no-descriptor focus intent was cleared")
+	}
+}
+func TestMaterializationRestartRecoversLiveClaimWithoutSecondTab(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-live-claim-restart", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	initial, _ := runSync(t, b)
+	offer := firstOfType(initial, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil {
+		t.Fatalf("candidate offer missing: %v", initial)
+	}
+	candidateID := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, jobID,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "live-claim-restart", CandidateID: candidateID, MaterializationKind: "browser_tab",
+		}))
+	claim := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if claim == nil || claim.Payload.(*protocol.InstitutionalClaimResponsePayload).Outcome != "claimed" {
+		t.Fatalf("claim result = %v", claimed)
+	}
+	const replacement = "sess-live-claim-replacement-00000000000000000"
+	b.mu.Lock()
+	b.promote(&browserSession{ID: replacement, ExtensionVersion: "0.14.0", Features: []string{institutionalMaterializationFeature}, LastSyncAt: b.now()}, "live claim restart")
+	b.mu.Unlock()
+	recovered, _ := runSyncAs(t, b, replacement)
+	reoffer := firstOfType(recovered, protocol.MsgInstitutionalCandidateOffer)
+	if reoffer == nil || reoffer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID != candidateID {
+		t.Fatalf("live claim recovery offer = %v, want candidate %s", recovered, candidateID)
+	}
+	recoveredPayload := reoffer.Payload.(*protocol.InstitutionalCandidateOfferPayload)
+	if recoveredPayload.ExpiresAt == "" {
+		t.Fatal("live claim recovery offer omitted expiry")
+	}
+	expiresAt, err := time.Parse(time.RFC3339, recoveredPayload.ExpiresAt)
+	if err != nil || !expiresAt.After(b.now()) {
+		t.Fatalf("live claim recovery expiry = %q, parsed=%v now=%v", recoveredPayload.ExpiresAt, err, b.now())
+	}
+	if countJobOffersFor(recovered, jobID) != 0 {
+		t.Fatalf("live claim recovery emitted legacy/second-tab job offer: %v", recovered)
+	}
+}
+func TestMaterializationSameLandedDomainDifferentPreRouteOffersOnce(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	first := parkInstitutional(t, jobs, "materialization-domain-global-first", handoffWork(), "")
+	second := parkInstitutional(t, jobs, "materialization-domain-global-second", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	explicitMaterializationCandidate(t, jobs, first, "landed-global")
+	secondCandidate := explicitMaterializationCandidate(t, jobs, second, "landed-global")
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE browser_candidates SET pre_route_safety_key=? WHERE id=?`, "different-pre-route", secondCandidate); err != nil {
+		t.Fatal(err)
+	}
+	if queued, live, err := b.FocusHandoffs(ctx, []string{first, second}); err != nil || !live || queued != 2 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	msgs, _ := runSync(t, b)
+	if got := countType(msgs, protocol.MsgInstitutionalCandidateOffer); got != 1 {
+		t.Fatalf("same landed domain with different pre-route emitted %d offers, want one: %v", got, msgs)
+	}
+}
+func TestMaterializationActionLookupTransientErrorRetainsScaffold(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-action-lookup-retry", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	initial, _ := runSync(t, b)
+	if firstOfType(initial, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("candidate offer missing: %v", initial)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+	if err != nil || len(actions) == 0 {
+		t.Fatalf("open action = %v, %v", actions, err)
+	}
+	b.listOpenHandoffs = func(context.Context, int) ([]job.OpenHandoffJob, bool, error) {
+		return nil, false, nil
+	}
+	var failed atomic.Bool
+	b.openHandoffForJobFn = func(context.Context, string) (*job.HumanAction, error) {
+		if failed.CompareAndSwap(false, true) {
+			return nil, errors.New("temporary action lookup failure")
+		}
+		return nil, sql.ErrNoRows
+	}
+	first, _ := runSync(t, b)
+	if firstOfType(first, protocol.MsgCancel) != nil || !b.materializationTracked[jobID] {
+		t.Fatalf("transient action lookup cancelled/lost scaffold: msgs=%v tracked=%v", first, b.materializationTracked[jobID])
+	}
+	b.openHandoffForJobFn = nil
+	if err := jobs.ResolveHumanAction(ctx, actions[0].ID, "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	resolved, _ := runSync(t, b)
+	if firstOfType(resolved, protocol.MsgCancel) == nil || b.materializationTracked[jobID] {
+		t.Fatalf("resolved action did not cancel scaffold: msgs=%v tracked=%v", resolved, b.materializationTracked[jobID])
+	}
+}
+func TestConcurrentFocusHandoffsCreateOneCandidate(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-concurrent-focus", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	for range 2 {
+		go func() {
+			defer wg.Done()
+			_, live, err := b.FocusHandoffs(ctx, []string{jobID})
+			if err == nil && !live {
+				err = errors.New("focus session unexpectedly offline")
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM browser_candidates WHERE job_id=?`, jobID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("concurrent focus created %d candidates, want one", count)
+	}
+}
+
+func TestFocusedCandidateOutsideBoundedHandoffPageUsesExactActionLookup(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-focus-outside-page", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	explicitMaterializationCandidate(t, jobs, jobID, "outside-page-domain")
+	b.listOpenHandoffs = func(context.Context, int) ([]job.OpenHandoffJob, bool, error) {
+		return nil, true, nil
+	}
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	msgs, _ := runSync(t, b)
+	if firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("focused candidate outside handoff page did not offer: %v", msgs)
+	}
+}
+
+func TestTerminalMaterializationCandidateClearsFocusWithoutOffer(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-terminal-focus", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "terminal-domain")
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	if err := jobs.SetBrowserCandidateStatus(ctx, candidateID, "eligible", "succeeded"); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := runSync(t, b)
+	if firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer) != nil || b.focusPending[jobID] {
+		t.Fatalf("terminal candidate retained focus or emitted offer: msgs=%v focus=%v", msgs, b.focusPending[jobID])
+	}
+}
+func TestOverlappingSyncsSingleFlightScheduler(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-overlap-sync", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "overlap-domain")
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v", queued, live, err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	b.scheduleEligibleCandidates = func(context.Context, int, job.CandidateScheduleCursor) (job.CandidateSchedulePage, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return job.CandidateSchedulePage{
+			Candidates: []job.BrowserCandidateDescriptor{schedulerDescriptor(t, jobs, candidateID, "eligible")},
+			Cursor:     job.CandidateScheduleCursor{LastGroup: "overlap-domain"},
+			HasMore:    true,
+		}, nil
+	}
+	first := make(chan []json.RawMessage, 1)
+	go func() {
+		msgs, _ := b.Sync(ctx, testSessionID, false, nil)
+		first <- msgs
+	}()
+	<-started
+	second, err := b.Sync(ctx, testSessionID, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countRawType(t, second, protocol.MsgInstitutionalCandidateOffer) != 0 {
+		t.Fatalf("overlapping sync emitted offer before scheduler completion: %v", second)
+	}
+	close(release)
+	firstMsgs := <-first
+	if calls.Load() != 1 {
+		t.Fatalf("scheduler calls = %d, want one", calls.Load())
+	}
+	if countRawType(t, firstMsgs, protocol.MsgInstitutionalCandidateOffer) != 1 {
+		t.Fatalf("completed scheduler emitted %d offers: %v", countRawType(t, firstMsgs, protocol.MsgInstitutionalCandidateOffer), firstMsgs)
+	}
+	if b.materializationScheduleCursor.LastGroup != "overlap-domain" {
+		t.Fatalf("cursor = %#v, want completed page cursor", b.materializationScheduleCursor)
+	}
+}
+func TestMaterializationProfileRevisionBumpCreatesFreshCandidate(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-profile-revision", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if _, _, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil {
+		t.Fatal(err)
+	}
+	var firstID string
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT id FROM browser_candidates WHERE job_id=?`, jobID).Scan(&firstID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE institution_profiles SET revision=revision+1, authority_digest=? WHERE tombstoned_at IS NULL`, "authority-revision-2"); err != nil {
+		t.Fatal(err)
+	}
+	delete(b.focusPending, jobID)
+	if _, _, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM browser_candidates WHERE job_id=?`, jobID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("profile revision bump created %d candidates, want two", count)
+	}
+	var secondID string
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT id FROM browser_candidates WHERE job_id=? AND id<>?`, jobID, firstID).Scan(&secondID); err != nil {
+		t.Fatal(err)
+	}
+	if secondID == firstID {
+		t.Fatal("profile revision reused candidate identity")
+	}
+}
+
+func TestSchedulerAuthorityDriftSuppressesStaleOffer(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-authority-drift", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "authority-drift")
+	if _, _, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil {
+		t.Fatal(err)
+	}
+	b.scheduleEligibleCandidates = func(context.Context, int, job.CandidateScheduleCursor) (job.CandidateSchedulePage, error) {
+		if err := jobs.SetBrowserCandidateStatus(ctx, candidateID, "eligible", "succeeded"); err != nil {
+			t.Fatal(err)
+		}
+		descriptor := schedulerDescriptor(t, jobs, candidateID, "eligible")
+		return job.CandidateSchedulePage{Candidates: []job.BrowserCandidateDescriptor{descriptor}}, nil
+	}
+	msgs, _ := runSync(t, b)
+	if firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer) != nil {
+		t.Fatalf("stale scheduler descriptor emitted candidate offer: %v", msgs)
+	}
+}
+func TestFocusPreparationTakeoverReplacementOffersWithoutRetry(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "materialization-focus-takeover", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	started, release := make(chan struct{}), make(chan struct{})
+	var prepOnce atomic.Bool
+	var prepFn func(context.Context, job.Row) (*job.BrowserCandidate, error)
+	prepFn = func(pctx context.Context, row job.Row) (*job.BrowserCandidate, error) {
+		if prepOnce.CompareAndSwap(false, true) {
+			close(started)
+			<-release
+		}
+		b.prepareMaterializationCandidateFn = nil
+		candidate, err := b.prepareMaterializationCandidate(pctx, row)
+		b.prepareMaterializationCandidateFn = prepFn
+		return candidate, err
+	}
+	b.prepareMaterializationCandidateFn = prepFn
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := b.FocusHandoffs(ctx, []string{jobID})
+		result <- err
+	}()
+	<-started
+	const replacement = "sess-focus-takeover-replacement-000000000000000"
+	b.mu.Lock()
+	b.promote(&browserSession{
+		ID: replacement, ExtensionVersion: "0.14.0",
+		Features: []string{institutionalMaterializationFeature}, LastSyncAt: b.now(),
+	}, "focus preparation takeover")
+	b.mu.Unlock()
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := runSyncAs(t, b, replacement)
+	if firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("replacement did not offer prepared candidate without retry: %v", msgs)
 	}
 }

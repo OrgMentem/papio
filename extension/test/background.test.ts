@@ -418,6 +418,16 @@ function candidateOffer(jobID: string, candidateID = "cand_0001"): unknown {
       candidate_id: candidateID,
       materialization_kind: "browser_tab",
       expires_at: "2030-01-01T00:00:00Z",
+      provider_hosts: [PROVIDER_HOST],
+      expected: { doi: "10.1234/example", title: "Example work" },
+      access_mode: "delegated",
+      login_entity_id: "https://idp.example/entity",
+      proquest_account_id: "12345",
+      requires_auth: true,
+      drive_attempt_id: "attempt-001",
+      drive_ordinal: 0,
+      drive_strategy: "generic",
+      drive_revision: "rev-1",
     },
   };
 }
@@ -8881,8 +8891,58 @@ test("tabless direct downloads share the single effect governor and release afte
   expect(h.downloads.started).toHaveLength(1);
   unblock();
   await first;
+  for (
+    let attempt = 0;
+    attempt < 200 &&
+      (h.downloads.started.length < 2 || Reflect.get(h.bridge, "effectGovernorOwner") !== undefined);
+    attempt += 1
+  ) {
+    await Promise.resolve();
+  }
+  expect(h.downloads.started).toHaveLength(2);
   expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
   expect(Reflect.get(h.bridge, "providerDrainLeaseOwners")).toEqual(new Map());
+});
+test("provider tab navigation waits behind an unlike direct effect and resumes after its consequence", async () => {
+  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  let unblock!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    unblock = resolve;
+  });
+  h.downloads.afterCreate = async () => blocked;
+  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (message: unknown) => Promise<void>;
+  const first = onDirect.call(h.bridge, {
+    protocol: "papio-browser/1",
+    type: "provider_direct_get_request",
+    msg_id: "cross_kind_direct",
+    job_id: "job_cross_kind_direct",
+    seq: 2,
+    payload: {
+      drive_attempt_id: "cross-kind-attempt",
+      ordinal: 0,
+      route_revision: "acm-doi-pdf/1",
+      expected_identifier: "doi:10.1145/3630106.3658942",
+      url: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
+      allowed_origin: "https://dl.acm.org",
+      path_family: "/doi/pdf/{doi}",
+      terms_policy: "none",
+    },
+  });
+  for (let attempt = 0; attempt < 20 && h.downloads.started.length < 1; attempt += 1) {
+    await Promise.resolve();
+  }
+  expect(h.downloads.started).toHaveLength(1);
+  await h.port.inbound(jobOffer("job_cross_kind_tab"));
+  expect(h.tabs.created).toHaveLength(0);
+  unblock();
+  await first;
+  for (let attempt = 0; attempt < 20 && h.tabs.created.length < 1; attempt += 1) {
+    await Promise.resolve();
+  }
+  expect(h.tabs.created).toHaveLength(1);
+  expect(Reflect.get(h.bridge, "effectGovernorOwner")).toMatchObject({ jobID: "job_cross_kind_tab" });
 });
 test("tabless direct download failure releases both governors for a retry", async () => {
   const h = makeHarness();
@@ -9226,6 +9286,107 @@ test("institutional candidate offer dispatches claim without awaiting the correl
     phase: "claiming",
     tab_id: -1,
   });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_mat_0001")).toMatchObject({
+    job_id: "job_mat_0001",
+    tab_id: -1,
+    status: "accepted",
+    provider_hosts: [PROVIDER_HOST],
+    expected: { doi: "10.1234/example", title: "Example work" },
+    requires_auth: true,
+    access_mode: "delegated",
+    generic_drive_epoch: { drive_attempt_id: "attempt-001", ordinal: 0, strategy: "generic", revision: "rev-1" },
+  });
+});
+
+test("candidate materialization waits behind the global browser effect permit", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  const internals = h.bridge as unknown as {
+    claimEffectGovernor: (jobID: string) => string | undefined;
+    releaseEffectGovernor: (jobID: string, token: string, wake?: boolean) => void;
+  };
+  const token = internals.claimEffectGovernor.call(h.bridge, "blocking-effect");
+  expect(token).toBeDefined();
+  await h.port.inbound(candidateOffer("job_mat_effect_wait"));
+  await Promise.resolve();
+  expect(h.frames().some((frame) => frame.type === "institutional_claim_request")).toBe(false);
+
+  internals.releaseEffectGovernor.call(h.bridge, "blocking-effect", token!, true);
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  expect(claim.job_id).toBe("job_mat_effect_wait");
+});
+
+test("persisted materialization waits for capability negotiation and clears on daemon downgrade", async () => {
+  const h = makeHarness({
+    activeJobs: [materializationActiveJob("job_mat_downgrade")],
+    workWindowID: 500,
+    materializations: {
+      job_mat_downgrade: {
+        job_id: "job_mat_downgrade",
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        binding_id: "bind_0001",
+        phase: "bound",
+        tab_id: 902,
+      },
+    },
+  });
+  h.tabs.seed({ id: 902, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  await h.bridge.start();
+  expect(h.tabs.removed).not.toContain(902);
+  expect(h.frames().some((frame) => frame.type.startsWith("institutional_"))).toBe(false);
+
+  await h.port.inbound(helloAck());
+  expect(h.tabs.removed).toContain(902);
+  expect(h.backend.store.materializations).toBeUndefined();
+});
+
+test("candidate-only materialization binds ActiveJob tab before provider navigation", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(candidateOffer("job_mat_candidate_only"));
+  await h.port.waitForFrame("institutional_claim_request");
+  const internals = h.bridge as unknown as {
+    cancelMaterializationWorkflow: (jobID: string) => void;
+    applyMaterialization: (jobID: string, event: unknown) => Promise<void>;
+    onTabUpdated: (tabID: number, change: Record<string, string>, tab: TabInfo) => Promise<void>;
+  };
+  internals.cancelMaterializationWorkflow("job_mat_candidate_only");
+  await internals.applyMaterialization("job_mat_candidate_only", {
+    type: "claimed",
+    claim_id: "claim_0001",
+    binding_id: "bind_0001",
+    browser_holder_generation: 1,
+    lease_until: "2030-01-01T00:00:00Z",
+  });
+  await internals.applyMaterialization("job_mat_candidate_only", { type: "scaffolded", tab_id: 777 });
+  await internals.applyMaterialization("job_mat_candidate_only", { type: "bound" });
+  await internals.applyMaterialization("job_mat_candidate_only", { type: "route_issued", route_issuance_ordinal: 1 });
+  await internals.applyMaterialization("job_mat_candidate_only", { type: "navigating" });
+  await internals.applyMaterialization("job_mat_candidate_only", { type: "navigated" });
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_mat_candidate_only")).toMatchObject({
+    tab_id: 777,
+    provider_hosts: [PROVIDER_HOST],
+  });
+  h.tabs.seed({ id: 777, url: "https://www.jstor.org/stable/example", active: false, windowId: 500 });
+  let classified: [string, string] | undefined;
+  Reflect.set(h.bridge, "assessTrackedDrivenPage", async () => false);
+  Reflect.set(h.bridge, "maybeDownloadPDFViewer", async () => {});
+  Reflect.set(h.bridge, "maybeClassify", async (jobID: string, host: string) => {
+    classified = [jobID, host];
+    return undefined;
+  });
+  await internals.onTabUpdated(
+    777,
+    { url: "https://www.jstor.org/stable/example", status: "complete" },
+    { id: 777, url: "https://www.jstor.org/stable/example", active: false, windowId: 500 },
+  );
+  expect(classified).toEqual(["job_mat_candidate_only", "www.jstor.org"]);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_mat_candidate_only")?.tab_id).toBe(777);
+  expect(JSON.stringify(h.backend.store)).not.toContain("https://resolver.example.edu");
 });
 test("institutional claim busy uses bounded retry instead of a dead failed phase", async () => {
   const h = makeHarness();

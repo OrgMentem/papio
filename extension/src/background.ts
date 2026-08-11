@@ -1571,6 +1571,20 @@ export class Bridge {
    * or framed. This lets onDeterminingFilename steer the exact adapter-started
    * download even when stale provider tabs make host correlation ambiguous. */
   private readonly pendingDownloadURLs = new Map<string, string>();
+  /** Exact provider-direct requests awaiting the single effect permit. */
+  private readonly pendingDirectGets = new Map<string, BrowserMessage>();
+  /** Explicit sign-in intents retained while another effect owns the permit. */
+  private readonly pendingSessionSignIns = new Map<string, string | undefined>();
+  private readonly pendingPdfGrabRequests = new Map<string, {
+    tab_id: number;
+    url?: string | undefined;
+    title?: string | undefined;
+    workspace_tab_id?: number | undefined;
+    scan_id?: string | undefined;
+  }>();
+  private readonly pendingMaterializationEffects = new Set<string>();
+  private readonly pendingAuthReloads = new Map<string, { jobID: string; tabID: number }>();
+  private readonly pendingFreshHandoffs = new Map<string, ActiveJob>();
   /** Firefox < 140 requires an explicit durable choice before any
    * page_capture frame may leave the extension. Chrome and newer Firefox
    * remain always-on. */
@@ -1665,6 +1679,8 @@ export class Bridge {
    * races title and completion callbacks for that same generation. */
   private readonly staleRecoverySurfacedEpochs = new Map<string, number>();
   private readonly staleRecoveryInFlightEpochs = new Map<string, number>();
+  /** Bounded stale redrive retries are cancelled with their job. */
+  private readonly staleRecoveryRetryTimers = new Map<string, object>();
   /** Document epoch already given its one late OpenAthens body probe. Retaining
    * the epoch after the timer fires prevents repeated title events from polling. */
   private readonly openAthensErrorRecheckEpochs = new Map<string, number>();
@@ -1727,12 +1743,19 @@ export class Bridge {
    * from handoffDrives: a tab may be classified before it starts its effect,
    * while tabless provider-direct work has no tab to register. */
   private effectGovernorOwner: { jobID: string; token: string } | undefined;
+  /** Release wakeups defer while a provider tab effect still needs to publish
+   * its managed-tab/drive consequence. */
+  private effectGovernorWakePending = false;
   /** Local owner job for the provider lease token; durable lease state omits
    * this identity, so it is only used to reject same-worker sibling bypasses. */
   private readonly providerDrainLeaseJobs = new Map<string, string>();
   /** Lease-expiry wakeups are best-effort; startup and the keepalive alarm
    * re-derive expiry from session state after MV3 discards these timers. */
   private readonly providerDrainLeaseTimers = new Map<string, object>();
+  /** Deferred resolver redrives retain only the in-memory job correlation and
+   * re-read the one-use offer URL when the permit becomes available. */
+  private readonly resolverRedriveRetryTimers = new Map<string, object>();
+  private readonly resolverRouteRetryTimers = new Map<string, object>();
   /** A bounded retry budget tracks only ordinary provider render races. */
   private readonly classifyRetries = new Map<string, ClassifyRetry>();
   /** Effective provider access is stable between permission changes, so retries
@@ -2017,6 +2040,13 @@ export class Bridge {
 
   async requestSessionSignIn(origin?: string): Promise<BrokerReply<{ opened: true }>> {
     await this.ready;
+    const effectJobID = `session-signin:${origin ?? "latest"}`;
+    const effectToken = this.claimEffectGovernor(effectJobID);
+    if (effectToken === undefined) {
+      this.pendingSessionSignIns.set(effectJobID, origin);
+      return failure("effect_busy", "Sign-in will open when the current browser effect finishes");
+    }
+    try {
     if (origin !== undefined) {
       if (!isBareHTTPSOrigin(origin)) {
         return failure("resolver_unavailable", "No resolver configured yet — open a paper first");
@@ -2084,6 +2114,10 @@ export class Bridge {
     return tabID === undefined
       ? failure("session_open_failed", "Could not open the institution sign-in")
       : { ok: true, opened: true };
+    } finally {
+      this.releaseEffectGovernor(effectJobID, effectToken, false);
+      this.wakeEffectGovernor();
+    }
   }
 
   async retryAuthStalled(jobID: string): Promise<BrokerReply<{ opened: true }>> {
@@ -2102,6 +2136,29 @@ export class Bridge {
         : undefined);
     if (saved === undefined || !this.authStalledReported.has(jobID)) {
       return failure("handoff_unavailable", "This authentication stall is no longer available");
+    }
+    if (
+      this.effectGovernorOwner !== undefined &&
+      !this.handoffDrives.has(jobID) &&
+      this.handoffDrives.size < HANDOFF_DRIVE_LIMIT
+    ) {
+      const now = this.deps.now();
+      await this.upsertJobWithOffer(
+        {
+          job_id: jobID,
+          tab_id: current?.tab_id ?? -1,
+          offered_at: now,
+          expires_at: now,
+          status: "accepted",
+          provider_hosts: [...saved.providerHosts],
+          ...(saved.accessMode !== undefined ? { access_mode: saved.accessMode } : {}),
+          ...(saved.requiresAuth !== undefined ? { requires_auth: saved.requiresAuth } : {}),
+        },
+        saved.url,
+      );
+      this.enqueueHandoffDrive({ jobID, purpose: "redrive", focusExisting: false });
+      await this.drainHandoffDriveQueue();
+      return { ok: true, opened: true };
     }
     await this.update((s) => this.clearAuthAttempts(s, jobID));
     if (!this.handoffDrives.has(jobID) && this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
@@ -2126,6 +2183,12 @@ export class Bridge {
       await this.drainHandoffDriveQueue();
       return { ok: true, opened: true };
     }
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) {
+      this.enqueueHandoffDrive({ jobID, purpose: "redrive", focusExisting: false });
+      await this.drainHandoffDriveQueue();
+      return { ok: true, opened: true };
+    }
     let tabID: number | undefined;
     try {
       tabID = await this.openManagedTab({
@@ -2137,28 +2200,37 @@ export class Bridge {
       tabID = undefined;
     }
     if (tabID === undefined) {
+      this.releaseEffectGovernor(jobID, effectToken, false);
+      this.wakeEffectGovernor();
       return failure("handoff_open_failed", "Could not reopen the institutional handoff");
     }
     const openedAt = this.deps.now();
-    await this.upsertJobWithOffer(
-      {
-        job_id: jobID,
-        tab_id: tabID,
-        offered_at: openedAt,
-        expires_at: openedAt,
-        status: "accepted",
-        ...(saved.accessMode !== undefined ? { access_mode: saved.accessMode } : {}),
-        provider_hosts: [...saved.providerHosts],
-        ...(saved.requiresAuth !== undefined ? { requires_auth: saved.requiresAuth } : {}),
-      },
-      saved.url,
-    );
-    this.registerHandoffDrive(jobID, tabID);
-    this.stalledAuthHandoffs.delete(jobID);
-    this.send("job_accept", {}, jobID);
+    try {
+      await this.upsertJobWithOffer(
+        {
+          job_id: jobID,
+          tab_id: tabID,
+          offered_at: openedAt,
+          expires_at: openedAt,
+          status: "accepted",
+          ...(saved.accessMode !== undefined ? { access_mode: saved.accessMode } : {}),
+          provider_hosts: [...saved.providerHosts],
+          ...(saved.requiresAuth !== undefined ? { requires_auth: saved.requiresAuth } : {}),
+        },
+        saved.url,
+      );
+      this.registerHandoffDrive(jobID, tabID);
+      this.stalledAuthHandoffs.delete(jobID);
+      this.send("job_accept", {}, jobID);
+    } catch (error) {
+      this.releaseEffectGovernor(jobID, effectToken, false);
+      this.wakeEffectGovernor();
+      throw error;
+    }
+    this.releaseEffectGovernor(jobID, effectToken, false);
+    this.wakeEffectGovernor();
     return { ok: true, opened: true };
   }
-
   /** A cold preflight has no tab yet; excluding it would hide the only sign-in
    * signal when keepalive is disabled. Waiters are not additional blockers:
    * one owner is the actionable institution sign-in for the whole batch. */
@@ -3216,30 +3288,63 @@ export class Bridge {
         }
       }
       const url = this.offerURLs.get(request.jobID);
-      if (tabID !== undefined && request.purpose === "redrive" && url !== undefined && this.deps.tabs.update !== undefined) {
-        try {
-          await this.deps.tabs.update(tabID, { url });
-        } catch {
-          tabID = undefined;
+      const mustNavigate = url !== undefined && (tabID === undefined || request.purpose === "redrive");
+      const focusOnly = tabID !== undefined && request.focusExisting === true && !mustNavigate;
+      // Opening a provider handoff or re-driving its existing tab is itself an
+      // effect. Keep it under the same global permit as page mutations and
+      // downloads; the handoff-drive lease remains separate and covers the
+      // live tab after this bounded browser consequence.
+      let effectToken: string | undefined;
+      if (mustNavigate || focusOnly) {
+        effectToken = this.claimEffectGovernor(request.jobID);
+        if (effectToken === undefined) {
+          // Preserve FIFO and retry when the current effect releases. Do not
+          // reject an explicit offer merely because an unlike effect won the
+          // slot first.
+          this.handoffDriveQueue.unshift(request);
+          this.queuedDriveJobIDs.add(request.jobID);
+          return;
         }
       }
-      if (tabID === undefined && url === undefined) {
-        this.send("job_reject", {}, request.jobID);
-        await this.removeJobWithOffer(request.jobID);
+      try {
+        if (focusOnly && tabID !== undefined) {
+          try {
+            await this.focusManagedTab(tabID);
+          } catch {
+            // The existing managed tab remains available in its papio surface.
+          }
+        }
+        if (tabID !== undefined && request.purpose === "redrive" && url !== undefined && this.deps.tabs.update !== undefined) {
+          try {
+            await this.deps.tabs.update(tabID, { url });
+          } catch {
+            tabID = undefined;
+          }
+        }
+        if (tabID === undefined && url === undefined) {
+          this.send("job_reject", {}, request.jobID);
+          await this.removeJobWithOffer(request.jobID);
+          continue;
+        }
+        if (tabID === undefined && url !== undefined) {
+          try {
+            tabID = await this.openManagedTab({
+              url,
+              jobId: request.jobID,
+              purpose: request.purpose,
+              ...(request.surfaceFallback !== undefined ? { surfaceFallback: request.surfaceFallback } : {}),
+              ...(request.focusExisting !== undefined ? { focusExisting: request.focusExisting } : {}),
+            });
+          } catch (error) {
+            console.error("papio: queued handoff tab creation failed", error);
+          }
+        }
+      } finally {
+        if (effectToken !== undefined) this.releaseEffectGovernor(request.jobID, effectToken, false);
+      }
+      if (focusOnly) {
+        this.wakeEffectGovernor();
         continue;
-      }
-      if (tabID === undefined && url !== undefined) {
-        try {
-          tabID = await this.openManagedTab({
-            url,
-            jobId: request.jobID,
-            purpose: request.purpose,
-            ...(request.surfaceFallback !== undefined ? { surfaceFallback: request.surfaceFallback } : {}),
-            ...(request.focusExisting !== undefined ? { focusExisting: request.focusExisting } : {}),
-          });
-        } catch (error) {
-          console.error("papio: queued handoff tab creation failed", error);
-        }
       }
       if (tabID === undefined) {
         this.send("job_reject", {}, request.jobID);
@@ -3257,6 +3362,7 @@ export class Bridge {
       );
       this.registerHandoffDrive(request.jobID, tabID);
       if (request.surfaceFallback === true) await this.surfaceWorkTab(tabID);
+      this.wakeEffectGovernor();
     }
   }
 
@@ -3267,6 +3373,7 @@ export class Bridge {
         await this.drainHandoffDriveQueueUnlocked();
       } finally {
         this.drainingHandoffDriveQueue = false;
+        this.wakeEffectGovernor();
       }
     });
     this.handoffDriveDrainChain = queued.catch(() => undefined);
@@ -3625,10 +3732,6 @@ export class Bridge {
       if (entry.tab_id >= 0) await this.removeMaterializationTab(entry.tab_id);
       await this.applyMaterialization(jobID, { type: "clear" });
     }
-    await this.reconcileMaterializationTabs();
-    for (const [jobID, entry] of Object.entries(this.store.materializations ?? {})) {
-      if (entry.phase !== "navigated") this.scheduleMaterialization(jobID);
-    }
     const governorQueuedAtRestart: string[] = [];
     for (const job of this.store.activeJobs) {
       if (!this.hasDelegatedAuthority(job)) {
@@ -3736,16 +3839,30 @@ export class Bridge {
         this.store.pendingDelivery?.job_id !== job.job_id &&
         offerURL !== undefined
       ) {
-        const recoveredTabID = await this.openManagedTab({
-          url: offerURL,
-          jobId: job.job_id,
-          purpose: "reoffer",
-          focusExisting: false,
-        });
+        const effectToken = this.claimEffectGovernor(job.job_id);
+        if (effectToken === undefined) {
+          this.enqueueHandoffDrive({ jobID: job.job_id, purpose: "reoffer", focusExisting: false });
+          continue;
+        }
+        let recoveredTabID: number | undefined;
+        try {
+          recoveredTabID = await this.openManagedTab({
+            url: offerURL,
+            jobId: job.job_id,
+            purpose: "reoffer",
+            focusExisting: false,
+          });
+          if (recoveredTabID !== undefined) {
+            const recoveredID = recoveredTabID;
+            this.beginProviderDrive(job.job_id);
+            await this.update((s) => patchJob(s, job.job_id, { tab_id: recoveredID }));
+            this.registerHandoffDrive(job.job_id, recoveredID);
+          }
+        } finally {
+          this.releaseEffectGovernor(job.job_id, effectToken, false);
+          this.wakeEffectGovernor();
+        }
         if (recoveredTabID !== undefined) {
-          this.beginProviderDrive(job.job_id);
-          await this.update((s) => patchJob(s, job.job_id, { tab_id: recoveredTabID }));
-          this.registerHandoffDrive(job.job_id, recoveredTabID);
           continue;
         }
       }
@@ -3892,8 +4009,17 @@ export class Bridge {
   private async startDeliveryDownload(jobID: string, url: string): Promise<boolean> {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return false;
+    const ownedJobID = jobID;
+    const effectToken = this.claimEffectGovernor(ownedJobID);
+    if (effectToken === undefined) return false;
+    try {
+      await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
+    } catch {
+      this.releaseEffectGovernor(jobID, effectToken, false);
+      this.wakeEffectGovernor();
+      return false;
+    }
     this.deliveryJobs.add(jobID);
-    await this.update((s) => patchJob(s, jobID, { download_initiated: true }));
     this.downloads.set(jobID, { ids: new Set<number>(), ambiguous: false, directOffer: false, delivery: true });
     this.pendingDownloadURLs.set(url, jobID);
     try {
@@ -3923,6 +4049,8 @@ export class Bridge {
       return false;
     } finally {
       this.pendingDownloadURLs.delete(url);
+      this.releaseEffectGovernor(jobID, effectToken, false);
+      this.wakeEffectGovernor();
     }
   }
 
@@ -4045,16 +4173,24 @@ export class Bridge {
   /** Focus an existing inbox tab before creating one. This is browser-local UI
    * state only; no tab id is retained because a worker can disappear at will. */
   async openInbox(inboxURL: string): Promise<void> {
-    const existing = (await this.deps.tabs.query?.({ url: inboxURL })) ?? [];
-    const tab = existing.find((candidate) => candidate.id !== undefined);
-    if (tab?.id !== undefined) {
-      await this.deps.tabs.update?.(tab.id, { active: true });
-      if (tab.windowId !== undefined && this.deps.windows !== undefined) {
-        await this.deps.windows.update(tab.windowId, { focused: true });
+    const effectJobID = `inbox:${inboxURL}`;
+    const effectToken = this.claimEffectGovernor(effectJobID);
+    if (effectToken === undefined) return;
+    try {
+      const existing = (await this.deps.tabs.query?.({ url: inboxURL })) ?? [];
+      const tab = existing.find((candidate) => candidate.id !== undefined);
+      if (tab?.id !== undefined) {
+        await this.deps.tabs.update?.(tab.id, { active: true });
+        if (tab.windowId !== undefined && this.deps.windows !== undefined) {
+          await this.deps.windows.update(tab.windowId, { focused: true });
+        }
+        return;
       }
-      return;
+      await this.deps.tabs.create({ url: inboxURL, active: true });
+    } finally {
+      this.releaseEffectGovernor(effectJobID, effectToken, false);
+      this.wakeEffectGovernor();
     }
-    await this.deps.tabs.create({ url: inboxURL, active: true });
   }
   /** Surface the browser-owned handoff already offered for an inbox row. This
    * boundary accepts only a job id: provider/resolver URLs remain local to the
@@ -4176,6 +4312,11 @@ export class Bridge {
       });
     };
 
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) {
+      this.pendingFreshHandoffs.set(jobID, job);
+      return failure("effect_busy", "Handoff will open when the current browser effect finishes");
+    }
     let returnedTabID: number | undefined;
     try {
       returnedTabID = await this.openManagedTab({
@@ -4198,6 +4339,8 @@ export class Bridge {
     if (tabID === undefined || boundOwner?.jobID !== jobID || boundOwner.tabID !== tabID) {
       if (tabID !== undefined) await this.closeOwnedTab(tabID, "fresh-materialization-rollback");
       await this.clearFederatedLoginOwner(claimKey, jobID);
+      this.releaseEffectGovernor(jobID, effectToken, false);
+      this.wakeEffectGovernor();
       return failure("tab_creation_failed", "The handoff tab could not be created");
     }
     if (returnedTabID === undefined) {
@@ -4211,7 +4354,25 @@ export class Bridge {
     } catch {
       // The managed tab remains available in its papio surface.
     }
+    this.releaseEffectGovernor(jobID, effectToken, false);
+    this.wakeEffectGovernor();
     return { ok: true, opened: true };
+  }
+
+  private async focusExistingHandoff(jobID: string, tabID: number): Promise<boolean> {
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) {
+      this.enqueueHandoffDrive({ jobID, purpose: "inbox-open", focusExisting: true });
+      await this.drainHandoffDriveQueue();
+      return false;
+    }
+    try {
+      await this.focusManagedTab(tabID);
+      return true;
+    } finally {
+      this.releaseEffectGovernor(jobID, effectToken, false);
+      this.wakeEffectGovernor();
+    }
   }
 
 
@@ -4223,8 +4384,9 @@ export class Bridge {
       job = findByJob(this.store, jobID);
     }
     if (job !== undefined && job.tab_id >= 0) {
-      await this.focusManagedTab(job.tab_id);
-      return { ok: true, opened: true };
+      return (await this.focusExistingHandoff(jobID, job.tab_id))
+        ? { ok: true, opened: true }
+        : failure("handoff_queued", "The handoff is waiting for the active browser effect");
     }
     const engagementRequired =
       job?.requires_auth === true && job.engagement_required === true;
@@ -4247,8 +4409,9 @@ export class Bridge {
       return failure("handoff_unavailable", "The requested handoff is not available");
     }
     if (job.tab_id >= 0) {
-      await this.focusManagedTab(job.tab_id);
-      return { ok: true, opened: true };
+      return (await this.focusExistingHandoff(jobID, job.tab_id))
+        ? { ok: true, opened: true }
+        : failure("handoff_queued", "The handoff is waiting for the active browser effect");
     }
     if (job.requires_auth === true && job.engagement_required === true) {
       return this.openFreshHandoff(jobID, job);
@@ -4266,22 +4429,30 @@ export class Bridge {
       if (job === undefined || !this.offerURLs.has(jobID) || job.tab_id < 0) {
         return failure("handoff_open_failed", "The offered handoff could not be opened");
       }
-      await this.focusManagedTab(job.tab_id);
-      return { ok: true, opened: true };
+      return (await this.focusExistingHandoff(jobID, job.tab_id))
+        ? { ok: true, opened: true }
+        : failure("handoff_queued", "The handoff is waiting for the active browser effect");
     }
     if (job.tab_id < 0) {
       this.enqueueHandoffDrive({ jobID, purpose: "inbox-open" });
       await this.drainHandoffDriveQueue();
       job = findByJob(this.store, jobID);
       if (job !== undefined && job.tab_id >= 0) {
-        await this.focusManagedTab(job.tab_id);
-        return { ok: true, opened: true };
+        return (await this.focusExistingHandoff(jobID, job.tab_id))
+          ? { ok: true, opened: true }
+          : failure("handoff_queued", "The handoff is waiting for the active browser effect");
       }
       return failure("handoff_queued", "The handoff is waiting for an available browser slot");
     }
     const openurl = this.offerURLs.get(jobID);
     if (openurl === undefined) {
       return failure("handoff_open_failed", "The offered handoff could not be opened");
+    }
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) {
+      this.enqueueHandoffDrive({ jobID, purpose: "inbox-open" });
+      await this.drainHandoffDriveQueue();
+      return failure("handoff_queued", "The handoff is waiting for an available browser slot");
     }
     let tabID: number | undefined;
     try {
@@ -4292,6 +4463,9 @@ export class Bridge {
       });
     } catch {
       tabID = undefined;
+    } finally {
+      this.releaseEffectGovernor(jobID, effectToken, false);
+      this.wakeEffectGovernor();
     }
     return tabID === undefined
       ? failure("handoff_open_failed", "The offered handoff tab could not be focused")
@@ -4316,11 +4490,22 @@ export class Bridge {
         // A missing tab is handled by the focus/open fallback below.
       }
       if (needsFreshResolver) {
-        const reopened = await this.openManagedTab({
-          url: openurl,
-          jobId: jobID,
-          purpose: "redrive",
-        });
+        const effectToken = this.claimEffectGovernor(jobID);
+        if (effectToken === undefined) {
+          await this.openHandoff(jobID);
+          return;
+        }
+        let reopened: number | undefined;
+        try {
+          reopened = await this.openManagedTab({
+            url: openurl,
+            jobId: jobID,
+            purpose: "redrive",
+          });
+        } finally {
+          this.releaseEffectGovernor(jobID, effectToken, false);
+          this.wakeEffectGovernor();
+        }
         if (reopened !== undefined) {
           if (!this.handoffDrives.has(jobID) && this.handoffDrives.size < HANDOFF_DRIVE_LIMIT) {
             this.registerHandoffDrive(jobID, reopened);
@@ -4475,7 +4660,9 @@ export class Bridge {
    * correlation. */
   private cancelMaterializationWorkflow(jobID: string): void {
     this.cancelledMaterializationJobs.add(jobID);
+    this.releaseHandoffDrive(jobID);
     this.materializationReruns.delete(jobID);
+    this.pendingMaterializationEffects.delete(jobID);
     this.materializationRetryTimers.delete(jobID);
     this.materializationRuns.delete(jobID);
     const pending = this.pendingMaterializationRequests.filter((request) => request.jobID === jobID);
@@ -5000,8 +5187,16 @@ export class Bridge {
         beforeUpdate?.binding_id !== navigationBindingID ||
         beforeUpdate?.route_issuance_ordinal !== navigationOrdinal ||
         beforeUpdate?.tab_id !== currentTabID) return;
+    const activeDrive = findByJob(this.store, jobID);
+    if (activeDrive?.tab_id === currentTabID && activeDrive.generic_drive_epoch !== undefined) {
+      // Register before navigation: a fast provider page can complete while
+      // the correlated navigated acknowledgement is still in flight.
+      this.beginProviderDrive(jobID);
+      this.registerHandoffDrive(jobID, currentTabID);
+    }
     try {
       if (this.deps.tabs.update === undefined) {
+        this.releaseHandoffDrive(jobID);
         await this.removeMaterializationTab(currentTabID);
         await this.applyMaterialization(jobID, { type: "scaffold_lost" });
         return;
@@ -5019,6 +5214,7 @@ export class Bridge {
       // and ordinal while marking the scaffold absent, then the post-run wake
       // creates and binds a replacement before requesting another route.
       await this.removeMaterializationTab(currentTabID);
+      this.releaseHandoffDrive(jobID);
       await this.applyMaterialization(jobID, { type: "scaffold_lost" });
       return;
     }
@@ -5053,6 +5249,8 @@ export class Bridge {
       const navigatedOutcome = navigatedResponse.payload["outcome"];
       if (navigatedOutcome === "acknowledged") {
         await this.applyMaterialization(jobID, { type: "navigated" });
+        // The drive lease was registered before navigation so fast onUpdated
+        // callbacks cannot outrun generic classification authority.
       } else if (navigatedOutcome === "stale" || navigatedOutcome === "not_eligible" || navigatedOutcome === "feature_disabled") {
         await this.removeMaterializationTab(currentTabID);
         await this.clearMaterializationWorkflow(jobID);
@@ -5087,9 +5285,17 @@ export class Bridge {
       }, delay);
       return;
     }
+    const effectJobID = `materialization:${jobID}`;
+    const effectToken = this.claimEffectGovernor(effectJobID);
+    if (effectToken === undefined) {
+      this.pendingMaterializationEffects.add(jobID);
+      return;
+    }
     const run = this.runMaterialization(jobID)
       .catch((error) => console.error("papio: institutional materialization failed", error))
       .finally(() => {
+        this.releaseEffectGovernor(effectJobID, effectToken, false);
+        this.wakeEffectGovernor();
         if (this.materializationRuns.get(jobID) !== run) return;
         this.materializationRuns.delete(jobID);
         const rerun = this.materializationReruns.delete(jobID);
@@ -5242,12 +5448,13 @@ export class Bridge {
       await this.clearMaterializationWorkflow(snapshot.job_id);
     }
   }
-  private onInstitutionalCandidateOffer(msg: BrowserMessage): void {
+  private async onInstitutionalCandidateOffer(msg: BrowserMessage): Promise<void> {
     const jobID = msg.job_id;
     const payload = msg.payload;
     const candidateID = payload["candidate_id"];
     const kind = payload["materialization_kind"];
     const expiresAt = payload["expires_at"];
+    const hostsRaw = payload["provider_hosts"];
     if (
       jobID === undefined ||
       !(this.store.daemonFeatures ?? []).includes(INSTITUTIONAL_MATERIALIZATION_FEATURE) ||
@@ -5257,8 +5464,55 @@ export class Bridge {
       typeof expiresAt !== "string" ||
       !MATERIALIZATION_RFC3339_PATTERN.test(expiresAt) ||
       !Number.isFinite(Date.parse(expiresAt)) ||
-      Date.parse(expiresAt) <= this.deps.now()
+      Date.parse(expiresAt) <= this.deps.now() ||
+      !Array.isArray(hostsRaw) ||
+      hostsRaw.length < 1 ||
+      hostsRaw.some((host) => typeof host !== "string")
     ) return;
+    const providerHosts = hostsRaw.filter((host): host is string => typeof host === "string");
+    const expected = parseExpected(payload["expected"]);
+    const accessMode = payload["access_mode"] === "assisted" || payload["access_mode"] === "delegated"
+      ? payload["access_mode"]
+      : undefined;
+    const requiresAuth = typeof payload["requires_auth"] === "boolean" ? payload["requires_auth"] : undefined;
+    const loginEntityID = typeof payload["login_entity_id"] === "string" ? payload["login_entity_id"] : undefined;
+    const proquestAccountID = typeof payload["proquest_account_id"] === "string" ? payload["proquest_account_id"] : undefined;
+    const driveAttemptID = typeof payload["drive_attempt_id"] === "string" ? payload["drive_attempt_id"] : undefined;
+    const driveOrdinal = typeof payload["drive_ordinal"] === "number" ? payload["drive_ordinal"] : undefined;
+    const driveStrategy = typeof payload["drive_strategy"] === "string" ? payload["drive_strategy"] : undefined;
+    const driveRevision = typeof payload["drive_revision"] === "string" ? payload["drive_revision"] : undefined;
+    const offeredEpoch: ProviderDriveEpoch | undefined =
+      driveAttemptID !== undefined && driveOrdinal !== undefined && driveStrategy === "generic" && driveRevision !== undefined
+        ? { drive_attempt_id: driveAttemptID, ordinal: driveOrdinal, strategy: "generic", revision: driveRevision, attempt_count: 0 }
+        : undefined;
+    const existingJob = findByJob(this.store, jobID);
+    const now = this.deps.now();
+    const expiresMs = Date.parse(expiresAt);
+    const candidateJob: ActiveJob = {
+      ...(existingJob ?? {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: now,
+        expires_at: expiresMs,
+        status: accessMode === "assisted" ? "queued" : "accepted",
+        provider_hosts: providerHosts,
+      }),
+      // Candidate offers are URL-free and have no scaffold tab yet. Binding
+      // later changes only tab_id; this record is the classifier's authority.
+      tab_id: -1,
+      offered_at: existingJob?.offered_at ?? now,
+      expires_at: expiresMs,
+      provider_hosts: providerHosts,
+      ...(accessMode !== undefined ? { access_mode: accessMode } : {}),
+      ...(expected !== undefined ? { expected } : {}),
+      ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
+      ...(offeredEpoch !== undefined ? { generic_drive_epoch: offeredEpoch } : {}),
+    };
+    if (expected === undefined) delete candidateJob.expected;
+    if (requiresAuth === undefined) delete candidateJob.requires_auth;
+    await this.upsertJobWithoutOffer(candidateJob);
+    if (loginEntityID !== undefined && loginEntityID.length > 0) this.loginEntityIDs.set(jobID, loginEntityID);
+    if (proquestAccountID !== undefined && proquestAccountID.length > 0) this.proquestAccountIDs.set(jobID, proquestAccountID);
     const existing = this.materializationCorrelation(jobID);
     const sameCandidateRefresh = existing?.candidate_id === candidateID &&
       Date.parse(expiresAt) > Date.parse(existing.candidate_expires_at);
@@ -5717,52 +5971,61 @@ export class Bridge {
     } catch {
       return failure("invalid_request", "The PDF tab URL is invalid");
     }
-    const result = await this.requestNative(
-      "pdf_grab_request",
-      { host, ...(request.title !== undefined ? { title: request.title } : {}) },
-      "pdf_grab_result",
-      PDF_GRAB_FEATURE,
-      true,
-    );
-    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return failure(result.code, result.message ?? "The PDF grab is unavailable");
-    const outcome = result.payload["outcome"];
-    const grabID = result.payload["grab_id"];
-    const steeringPath = result.payload["steering_path"];
-    if (outcome === "existing" && typeof grabID === "string") {
-      const status = await this.requestPdfGrabStatus(grabID);
-      if (status.ok) this.notifyPdfGrab(request.scan_id ?? "", grabID, status.state, status.detail);
-      return { ok: true, grab_id: grabID };
+    const effectJobID = `pdf-grab:${request.tab_id}:${request.scan_id ?? ""}`;
+    const effectToken = this.claimEffectGovernor(effectJobID);
+    if (effectToken === undefined) {
+      this.pendingPdfGrabRequests.set(effectJobID, request);
+      return failure("effect_busy", "PDF grab will start when the current browser effect finishes");
     }
-    if (outcome !== "steering" || typeof grabID !== "string" || typeof steeringPath !== "string") {
-      return failure("grab_failed", typeof result.payload["detail"] === "string" ? result.payload["detail"] : "The daemon could not start this PDF grab");
-    }
-    const workspaceTabID = request.workspace_tab_id ?? request.tab_id;
-    const scanID = request.scan_id ?? "";
-    this.grabDownloads.set(grabID, { ids: new Set<number>(), tabID: workspaceTabID, scanID, url: requestURL, steeringPath });
-    this.pendingGrabDownloadURLs.set(requestURL, { grabID, tabID: workspaceTabID, steeringPath });
     try {
-      const id = await this.deps.downloads.download({ url: requestURL, conflictAction: "uniquify", saveAs: false });
-      const track = this.grabDownloads.get(grabID);
-      if (track !== undefined) track.ids.add(id);
-      this.pdfGrabCorrelations.set(grabID, {
-        scanID,
-        tabID: workspaceTabID,
-        state: "grabbed",
-        downloadID: id,
-        steeringPath,
-      });
-      this.persistPdfGrabCorrelations();
-      this.notifyPdfGrab(scanID, grabID, "grabbed");
-      return { ok: true, grab_id: grabID };
-    } catch {
-      this.grabDownloads.delete(grabID);
-      this.pdfGrabCorrelations.delete(grabID);
-      this.persistPdfGrabCorrelations();
-      this.pendingGrabDownloadURLs.delete(requestURL);
-      return failure("grab_failed", "Could not start the browser download");
+      const result = await this.requestNative(
+        "pdf_grab_request",
+        { host, ...(request.title !== undefined ? { title: request.title } : {}) },
+        "pdf_grab_result",
+        PDF_GRAB_FEATURE,
+        true,
+      );
+      if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+      if (result.code !== undefined) return failure(result.code, result.message ?? "The PDF grab is unavailable");
+      const outcome = result.payload["outcome"];
+      const grabID = result.payload["grab_id"];
+      const steeringPath = result.payload["steering_path"];
+      if (outcome === "existing" && typeof grabID === "string") {
+        const status = await this.requestPdfGrabStatus(grabID);
+        if (status.ok) this.notifyPdfGrab(request.scan_id ?? "", grabID, status.state, status.detail);
+        return { ok: true, grab_id: grabID };
+      }
+      if (outcome !== "steering" || typeof grabID !== "string" || typeof steeringPath !== "string") {
+        return failure("grab_failed", typeof result.payload["detail"] === "string" ? result.payload["detail"] : "The daemon could not start this PDF grab");
+      }
+      const workspaceTabID = request.workspace_tab_id ?? request.tab_id;
+      const scanID = request.scan_id ?? "";
+      this.grabDownloads.set(grabID, { ids: new Set<number>(), tabID: workspaceTabID, scanID, url: requestURL, steeringPath });
+      this.pendingGrabDownloadURLs.set(requestURL, { grabID, tabID: workspaceTabID, steeringPath });
+      try {
+        const id = await this.deps.downloads.download({ url: requestURL, conflictAction: "uniquify", saveAs: false });
+        const track = this.grabDownloads.get(grabID);
+        if (track !== undefined) track.ids.add(id);
+        this.pdfGrabCorrelations.set(grabID, {
+          scanID,
+          tabID: workspaceTabID,
+          state: "grabbed",
+          downloadID: id,
+          steeringPath,
+        });
+        this.persistPdfGrabCorrelations();
+        this.notifyPdfGrab(scanID, grabID, "grabbed");
+        return { ok: true, grab_id: grabID };
+      } catch {
+        this.pdfGrabCorrelations.delete(grabID);
+        this.persistPdfGrabCorrelations();
+        return failure("grab_failed", "Could not start the browser download");
+      } finally {
+        this.pendingGrabDownloadURLs.delete(requestURL);
+      }
     } finally {
-      this.pendingGrabDownloadURLs.delete(requestURL);
+      this.releaseEffectGovernor(effectJobID, effectToken, false);
+      this.wakeEffectGovernor();
     }
   }
 
@@ -6436,7 +6699,9 @@ export class Bridge {
     const tabID = job?.tab_id;
     const materializationTabID = materialization?.tab_id;
     const providerKey = job === undefined ? undefined : this.providerKeyForJob(job);
+    this.pendingAuthReloads.delete(jobID);
     this.cancelMaterializationWorkflow(jobID);
+    this.pendingFreshHandoffs.delete(jobID);
     this.releaseHandoffDrive(jobID);
     this.deliveryJobs.delete(jobID);
     this.resolverRoutes.delete(jobID);
@@ -6459,6 +6724,10 @@ export class Bridge {
     this.staleRecoveryAttemptedEpochs.delete(jobID);
     this.staleRecoverySurfacedEpochs.delete(jobID);
     this.staleRecoveryInFlightEpochs.delete(jobID);
+    this.staleRecoveryRetryTimers.delete(jobID);
+    for (const [key, request] of this.pendingDirectGets) {
+      if (request.job_id === jobID || key.startsWith(`${jobID}:`)) this.pendingDirectGets.delete(key);
+    }
     this.openAthensErrorRecheckEpochs.delete(jobID);
     this.resolverNoEntitlementSent.delete(jobID);
     this.proquestAccountIDs.delete(jobID);
@@ -6753,6 +7022,14 @@ export class Bridge {
     await this.syncConnectionBadge();
     return resumed;
   }
+  private async drainPendingPdfGrabRequests(): Promise<void> {
+    if (this.effectGovernorOwner !== undefined) return;
+    const next = this.pendingPdfGrabRequests.entries().next();
+    if (next.done) return;
+    const [key, request] = next.value;
+    this.pendingPdfGrabRequests.delete(key);
+    await this.requestPdfGrab(request as Parameters<typeof this.requestPdfGrab>[0]);
+  }
   /** Reserve the single browser-local effect slot. A caller must hold this
    * through the observable initiation consequence (not merely planning). */
   private claimEffectGovernor(jobID: string): string | undefined {
@@ -6763,9 +7040,94 @@ export class Bridge {
     return token;
   }
 
-  private releaseEffectGovernor(jobID: string, token: string): void {
+  private wakeEffectGovernor(): void {
+    if (!this.effectGovernorWakePending) return;
+    if (this.drainingHandoffDriveQueue || this.drainingQueuedHandoffs) return;
+    this.effectGovernorWakePending = false;
+    void this.drainPendingFreshHandoffs();
+    void this.drainPendingAuthReloads();
+    void this.drainPendingSessionSignIns();
+    void this.drainHandoffDriveQueue();
+    void this.releaseQueuedHandoffs();
+    void this.drainPendingMaterializations();
+    void this.drainPendingDirectGets();
+    void this.drainPendingPdfGrabRequests();
+  }
+  private drainPendingMaterializations(): void {
+    if (this.effectGovernorOwner !== undefined) return;
+    const next = this.pendingMaterializationEffects.values().next();
+    if (next.done) return;
+    this.pendingMaterializationEffects.delete(next.value);
+    this.scheduleMaterialization(next.value, true);
+  }
+  private async drainPendingAuthReloads(): Promise<void> {
+    if (this.effectGovernorOwner !== undefined) return;
+    const next = this.pendingAuthReloads.entries().next();
+    if (next.done) return;
+    const [jobID, pending] = next.value;
+    this.pendingAuthReloads.delete(jobID);
+    const current = findByJob(this.store, jobID);
+    if (current?.tab_id !== pending.tabID || !this.hasDelegatedAuthority(current)) return;
+    const token = this.claimEffectGovernor(`auth-reload:${jobID}`);
+    if (token === undefined) {
+      this.pendingAuthReloads.set(jobID, pending);
+      return;
+    }
+    try {
+      const tab = await this.deps.tabs.get(pending.tabID);
+      if (typeof tab.url === "string" && isAuthenticationURL(tab.url)) await this.deps.tabs.reload(pending.tabID);
+    } finally {
+      this.releaseEffectGovernor(`auth-reload:${jobID}`, token, false);
+      this.wakeEffectGovernor();
+    }
+  }
+  private async drainPendingFreshHandoffs(): Promise<void> {
+    if (this.effectGovernorOwner !== undefined) return;
+    const next = this.pendingFreshHandoffs.entries().next();
+    if (next.done) return;
+    const [jobID, queuedJob] = next.value;
+    this.pendingFreshHandoffs.delete(jobID);
+    const current = findByJob(this.store, jobID);
+    if (current === undefined || current.engagement_required !== true) return;
+    await this.openFreshHandoff(jobID, current);
+  }
+  private async drainPendingSessionSignIns(): Promise<void> {
+    if (this.effectGovernorOwner !== undefined) return;
+    const next = this.pendingSessionSignIns.entries().next();
+    if (next.done) return;
+    const [key, origin] = next.value;
+    this.pendingSessionSignIns.delete(key);
+    await this.requestSessionSignIn(origin);
+  }
+  private async drainPendingDirectGets(): Promise<void> {
+    if (this.effectGovernorOwner !== undefined) return;
+    const next = this.pendingDirectGets.entries().next();
+    if (next.done) return;
+    const [key, request] = next.value;
+    this.pendingDirectGets.delete(key);
+    const jobID = request.job_id;
+    const payload = request.payload;
+    const current = jobID === undefined ? undefined : findByJob(this.store, jobID);
+    const epoch = current?.drive_epoch;
+    if (
+      current === undefined ||
+      !this.hasDelegatedAuthority(current) ||
+      epoch === undefined ||
+      epoch.drive_attempt_id !== payload["drive_attempt_id"] ||
+      epoch.ordinal !== payload["ordinal"] ||
+      epoch.route_revision !== payload["route_revision"]
+    ) {
+      return;
+    }
+    await this.onProviderDirectGetRequest(request);
+  }
+
+  private releaseEffectGovernor(jobID: string, token: string, wake = true): void {
     const current = this.effectGovernorOwner;
-    if (current?.jobID === jobID && current.token === token) this.effectGovernorOwner = undefined;
+    if (current?.jobID !== jobID || current.token !== token) return;
+    this.effectGovernorOwner = undefined;
+    this.effectGovernorWakePending = true;
+    if (wake) this.wakeEffectGovernor();
   }
 
 
@@ -7331,11 +7693,13 @@ export class Bridge {
       return;
     }
     this.drainingQueuedHandoffs = true;
+    let effectBlocked = false;
     try {
       await this.expireProviderDrainLeases();
       await this.expireChallengeCooldowns();
       // One loop opens at most one unclassified handoff per provider. A lease
       // stays with that tab until it proves normal, becomes a challenge park,
+      // or expires.
       while (this.handoffDrives.size < HANDOFF_DRIVE_LIMIT) {
         let selected: ActiveJob | undefined;
         let forcedJobID: string | undefined;
@@ -7420,6 +7784,15 @@ export class Bridge {
             continue;
           }
           if (!(await this.acknowledgePendingProviderHandoffs(providerKey))) return;
+          const effectToken = this.claimEffectGovernor(queued.job_id);
+          if (effectToken === undefined) {
+            // Keep the queued offer and release only this provider's drain
+            // lease. The global effect owner will wake the drain when its
+            // bounded browser consequence settles.
+            effectBlocked = true;
+            await this.releaseProviderDrainLease(providerKey, owner);
+            return;
+          }
           let tabID: number | undefined;
           try {
             tabID = await this.openManagedTab({
@@ -7430,6 +7803,8 @@ export class Bridge {
             });
           } catch (e) {
             console.error("papio: queued handoff tab creation failed", e);
+          } finally {
+            this.releaseEffectGovernor(queued.job_id, effectToken, false);
           }
           if (tabID === undefined) {
             this.pendingForcedReleases.delete(queued.job_id);
@@ -7454,6 +7829,7 @@ export class Bridge {
           opened = true;
           this.pendingForcedReleases.delete(queued.job_id);
           if (forceSurface) await this.surfaceWorkTab(tabID);
+          this.wakeEffectGovernor();
         } finally {
           if (!opened) await this.releaseProviderDrainLease(providerKey, owner);
         }
@@ -7462,9 +7838,14 @@ export class Bridge {
       this.drainingQueuedHandoffs = false;
       for (const resolve of this.queuedHandoffDrainWaiters) resolve();
       this.queuedHandoffDrainWaiters.clear();
+      this.wakeEffectGovernor();
+      // The effect owner can settle during the awaits above. Re-run after the
+      // drain latch clears so a queued offer cannot be stranded by that
+      // narrow release race.
+      if (effectBlocked && this.effectGovernorOwner === undefined) void this.releaseQueuedHandoffs();
     }
-  }
 
+  }
   private async reloadAuthenticationHandoffs(origin: string | undefined, includeInstitutional = true): Promise<void> {
     for (const job of this.store.activeJobs) {
       if (
@@ -7478,8 +7859,20 @@ export class Bridge {
       }
       try {
         const tab = await this.deps.tabs.get(job.tab_id);
-        if (typeof tab.url === "string" && isAuthenticationURL(tab.url)) {
-          await this.deps.tabs.reload(job.tab_id);
+        if (typeof tab.url !== "string" || !isAuthenticationURL(tab.url)) continue;
+        const effectToken = this.claimEffectGovernor(`auth-reload:${job.job_id}`);
+        if (effectToken === undefined) {
+          this.pendingAuthReloads.set(job.job_id, { jobID: job.job_id, tabID: job.tab_id });
+          continue;
+        }
+        try {
+          const current = findByJob(this.store, job.job_id);
+          if (current?.tab_id === job.tab_id && this.hasDelegatedAuthority(current)) {
+            await this.deps.tabs.reload(job.tab_id);
+          }
+        } finally {
+          this.releaseEffectGovernor(`auth-reload:${job.job_id}`, effectToken, false);
+          this.wakeEffectGovernor();
         }
       } catch {
         // A closed handoff is handled by the normal tab-removal path.
@@ -7880,22 +8273,23 @@ export class Bridge {
             route_revision: revision,
             attempt_count: (priorEpoch?.attempt_count ?? 0) + 1,
           };
-    const job: ActiveJob = prior ?? {
-      job_id: jobID,
-      tab_id: -1,
-      offered_at: now,
-      expires_at: now + 24 * 60 * 60_000,
-      status: "accepted",
-      provider_hosts: [allowed.hostname],
-      access_mode: "delegated",
+    const job: ActiveJob = {
+      ...(prior ?? {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: now,
+        expires_at: now + 24 * 60 * 60_000,
+        status: "accepted",
+        provider_hosts: [allowed.hostname],
+        access_mode: "delegated",
+      }),
+      drive_epoch: epoch,
     };
     const effectToken = this.claimEffectGovernor(jobID);
     if (effectToken === undefined) {
-      this.send(
-        "provider_direct_get_result",
-        { drive_attempt_id: attemptID, ordinal, route_revision: revision, outcome: "network", landing_class: "unknown" },
-        jobID,
-      );
+      if (prior === undefined) await this.update((s) => upsertJob(s, job));
+      const requestKey = `${jobID}:${attemptID}:${ordinal}:${revision}`;
+      this.pendingDirectGets.set(requestKey, msg);
       return;
     }
     const providerKey = this.providerKeyForJob(job);
@@ -8066,6 +8460,22 @@ export class Bridge {
         await this.syncConnectionBadge(connectionStatus);
         this.helloAckGeneration = this.portGeneration;
         this.keepaliveManager?.notifyConfiguredOriginsChanged();
+        if (features.includes(INSTITUTIONAL_MATERIALIZATION_FEATURE)) {
+          // Inbound frames are serialized. Reconciliation sends correlated
+          // requests whose replies must traverse this same queue, so it must
+          // never be awaited from the hello_ack handler.
+          void (async () => {
+            await this.reconcileMaterializationTabs();
+            for (const [jobID, entry] of Object.entries(this.store.materializations ?? {})) {
+              if (entry.phase !== "navigated") this.scheduleMaterialization(jobID);
+            }
+          })();
+        } else {
+          for (const [jobID, entry] of Object.entries(this.store.materializations ?? {})) {
+            if (entry.tab_id >= 0) await this.removeMaterializationTab(entry.tab_id);
+            await this.applyMaterialization(jobID, { type: "clear" });
+          }
+        }
         if (features.includes(HANDOFF_LINK_FEATURE)) {
           const authJobIDs = this.store.activeJobs
             .filter((job) => job.requires_auth === true)
@@ -8503,12 +8913,31 @@ export class Bridge {
             }
             return;
           }
-          const tabID = await this.openManagedTab({
-            url: openurl,
-            jobId: jobID,
-            purpose: "reoffer",
-          });
+          const effectToken = this.claimEffectGovernor(jobID);
+          if (effectToken === undefined) {
+            await this.upsertJobWithOffer(
+              { ...existing, status: "accepted", offered_at: this.deps.now(), provider_hosts: providerHosts, parked_with_tab: false },
+              openurl,
+            );
+            this.enqueueHandoffDrive({ jobID, purpose: "reoffer", focusExisting: false });
+            this.send("job_accept", {}, jobID);
+            await this.drainHandoffDriveQueue();
+            return;
+          }
+          let tabID: number | undefined;
+          try {
+            tabID = await this.openManagedTab({
+              url: openurl,
+              jobId: jobID,
+              purpose: "reoffer",
+            });
+          } catch (error) {
+            console.error("papio: re-offer tab creation failed", error);
+          } finally {
+            this.releaseEffectGovernor(jobID, effectToken, false);
+          }
           if (tabID === undefined) {
+            this.wakeEffectGovernor();
             this.send("job_reject", {}, jobID);
             return;
           }
@@ -8538,6 +8967,7 @@ export class Bridge {
           } else {
             this.send("job_accept", {}, jobID);
           }
+          this.wakeEffectGovernor();
           return;
         }
         await this.removeJobWithOffer(jobID);
@@ -8606,6 +9036,18 @@ export class Bridge {
       return;
     }
 
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) {
+      // This explicit offer is eligible, but an unlike effect currently owns
+      // the browser permit. Keep the URL only in the existing offer ledger and
+      // let the normal handoff queue materialize it after release.
+      const queued = makeJob(-1, "accepted");
+      await this.upsertJobWithOffer(queued, openurl);
+      this.enqueueHandoffDrive({ jobID, purpose: "handoff" });
+      this.send("job_accept", {}, jobID);
+      await this.drainHandoffDriveQueue();
+      return;
+    }
     this.handoffOpening = true;
     let tabID: number | undefined;
     try {
@@ -8618,8 +9060,10 @@ export class Bridge {
       console.error("papio: tab creation failed; rejecting job", e);
     } finally {
       this.handoffOpening = false;
+      this.releaseEffectGovernor(jobID, effectToken, false);
     }
     if (tabID === undefined) {
+      this.wakeEffectGovernor();
       this.send("job_reject", {}, jobID);
       return;
     }
@@ -8627,10 +9071,8 @@ export class Bridge {
     await this.upsertJobWithOffer(makeJob(tabID), openurl);
     this.registerHandoffDrive(jobID, tabID);
     this.send("job_accept", {}, jobID);
+    this.wakeEffectGovernor();
   }
-
-
-
   private async failDelivery(jobID: string, downloadID: number, reason: string): Promise<void> {
     await this.discardDownload(jobID, downloadID);
     this.deliveryJobs.delete(jobID);
@@ -8984,6 +9426,57 @@ export class Bridge {
       await this.maybeClassify(job.job_id, host);
     }
   }
+  private scheduleResolverRedriveRetry(jobID: string, tabID: number): void {
+    if (this.resolverRedriveRetryTimers.has(jobID)) return;
+    const marker = {};
+    this.resolverRedriveRetryTimers.set(jobID, marker);
+    this.deps.setTimeout(async () => {
+      if (this.resolverRedriveRetryTimers.get(jobID) !== marker) return;
+      this.resolverRedriveRetryTimers.delete(jobID);
+      const job = findByJob(this.store, jobID);
+      const openurl = this.offerURLs.get(jobID);
+      if (job === undefined || job.status !== "awaiting_download") return;
+      if (openurl === undefined) {
+        try {
+          const tab = await this.deps.tabs.get(tabID);
+          const currentURL = tab.url === undefined ? undefined : new URL(tab.url);
+          if (currentURL !== undefined) await this.maybeClassify(jobID, currentURL.hostname);
+        } catch {
+          // A vanished tab is handled by the normal removal path.
+        }
+        return;
+      }
+      const effectToken = this.claimEffectGovernor(jobID);
+      if (effectToken === undefined) {
+        this.scheduleResolverRedriveRetry(jobID, tabID);
+        return;
+      }
+      try {
+        const current = findByJob(this.store, jobID);
+        if (current?.tab_id === tabID && this.deps.tabs.update !== undefined) {
+          await this.deps.tabs.update(tabID, { url: openurl });
+        } else {
+          const opened = await this.openManagedTab({
+            url: openurl,
+            jobId: jobID,
+            purpose: "redrive",
+            focusExisting: false,
+          });
+          if (opened === undefined) {
+            this.scheduleResolverRedriveRetry(jobID, tabID);
+            return;
+          }
+        }
+        this.federatedLoginOperatorNavigated.delete(jobID);
+        this.federatedReDriven.add(jobID);
+      } catch {
+        this.scheduleResolverRedriveRetry(jobID, tabID);
+      } finally {
+        this.releaseEffectGovernor(jobID, effectToken);
+      }
+    }, CLASSIFY_RETRY_MS);
+  }
+
   private async finalizeAuthReturn(
     jobID: string,
     tabID: number,
@@ -9009,34 +9502,55 @@ export class Bridge {
       institutionalSession ||
       this.federatedLoginOperatorNavigated.has(jobID) ||
       currentFederatedClassification;
+    const openurl = this.offerURLs.get(jobID);
     if (
+      openurl !== undefined &&
       this.hasDelegatedAuthority(findByJob(this.store, jobID)) &&
       this.federatedLoginRouted.has(jobID) &&
       completedFederatedSignIn &&
       !this.federatedReDriven.has(jobID)
     ) {
-      const openurl = this.offerURLs.get(jobID);
       const currentJob = findByJob(this.store, jobID);
-      if (openurl !== undefined && currentJob?.tab_id === tabID && this.deps.tabs.update !== undefined) {
-        // The successful sign-in is still driving this exact tab. Reuse it
-        // for the resolver return instead of creating a second effectful tab.
-        this.federatedLoginOperatorNavigated.delete(jobID);
-        this.federatedReDriven.add(jobID);
-        await this.deps.tabs.update(tabID, { url: openurl });
-        return true;
+      const effectToken = this.claimEffectGovernor(jobID);
+      if (effectToken === undefined) {
+        // Session evidence is durable; retry this exact resolver redrive
+        // against the still-held one-use offer URL, not generic UI classify.
+        this.scheduleResolverRedriveRetry(jobID, tabID);
+        return false;
       }
-      if (openurl !== undefined) {
-        this.federatedLoginOperatorNavigated.delete(jobID);
-        this.federatedReDriven.add(jobID);
-        await this.openManagedTab({
-          url: openurl,
-          jobId: jobID,
-          purpose: "redrive",
-          focusExisting: false,
-        });
-        return true;
+      try {
+        if (openurl !== undefined && currentJob?.tab_id === tabID && this.deps.tabs.update !== undefined) {
+          // The successful sign-in is still driving this exact tab. Reuse it
+          // for the resolver return instead of creating a second effectful tab.
+          await this.deps.tabs.update(tabID, { url: openurl });
+          this.federatedLoginOperatorNavigated.delete(jobID);
+          this.federatedReDriven.add(jobID);
+          return true;
+        }
+        if (openurl !== undefined) {
+          const opened = await this.openManagedTab({
+            url: openurl,
+            jobId: jobID,
+            purpose: "redrive",
+            focusExisting: false,
+          });
+          if (opened === undefined) {
+            this.scheduleResolverRedriveRetry(jobID, tabID);
+            return false;
+          }
+          this.federatedLoginOperatorNavigated.delete(jobID);
+          this.federatedReDriven.add(jobID);
+          return true;
+        }
+      } catch {
+        this.scheduleResolverRedriveRetry(jobID, tabID);
+        return false;
+      } finally {
+        this.releaseEffectGovernor(jobID, effectToken);
       }
+      return false;
     }
+
     await this.maybeClassify(jobID, host);
     return true;
   }
@@ -9050,6 +9564,27 @@ export class Bridge {
     this.staleRecoveryAttemptedEpochs.delete(jobID);
     this.staleRecoverySurfacedEpochs.delete(jobID);
     this.staleRecoveryInFlightEpochs.delete(jobID);
+    this.staleRecoveryRetryTimers.delete(jobID);
+  }
+  private scheduleStaleRecoveryRetry(job: ActiveJob, recoveryEpoch: number): void {
+    if (this.staleRecoveryRetryTimers.has(job.job_id)) return;
+    const marker = {};
+    this.staleRecoveryRetryTimers.set(job.job_id, marker);
+    this.deps.setTimeout(() => {
+      if (this.staleRecoveryRetryTimers.get(job.job_id) !== marker) return;
+      this.staleRecoveryRetryTimers.delete(job.job_id);
+      const current = findByJob(this.store, job.job_id);
+      if (
+        current === undefined ||
+        this.offerURLs.get(job.job_id) === undefined ||
+        (this.staleRecoveryEpochs.get(job.job_id) ?? 0) !== recoveryEpoch ||
+        !this.hasDelegatedAuthority(current)
+      ) {
+        return;
+      }
+      this.staleRecoveryAttemptedEpochs.delete(job.job_id);
+      void this.redriveStaleHandoff(current, recoveryEpoch);
+    }, CLASSIFY_RETRY_MS);
   }
 
   /**
@@ -9099,19 +9634,39 @@ export class Bridge {
         await this.drainHandoffDriveQueue();
         return true;
       }
-      const tabID = await this.openManagedTab({
-        url: openurl,
-        jobId: job.job_id,
-        purpose: "redrive",
-        focusExisting: false,
-      });
-      if (tabID !== undefined && !this.handoffDrives.has(job.job_id)) {
+      const effectToken = this.claimEffectGovernor(job.job_id);
+      if (effectToken === undefined) {
+        // Keep this exact recovery epoch pending; queue insertion would be a
+        // no-op while the same job already owns the managed drive.
+        this.scheduleStaleRecoveryRetry(job, recoveryEpoch);
+        return true;
+      }
+      let tabID: number | undefined;
+      try {
+        tabID = await this.openManagedTab({
+          url: openurl,
+          jobId: job.job_id,
+          purpose: "redrive",
+          focusExisting: false,
+        });
+      } finally {
+        this.releaseEffectGovernor(job.job_id, effectToken, false);
+      }
+      if (tabID === undefined) {
+        this.scheduleStaleRecoveryRetry(job, recoveryEpoch);
+        this.wakeEffectGovernor();
+        return true;
+      }
+      if (!this.handoffDrives.has(job.job_id)) {
         this.registerHandoffDrive(job.job_id, tabID);
       }
-      return tabID !== undefined;
+      this.wakeEffectGovernor();
+      return true;
     } catch {
-      // Tab vanished mid-recovery; the normal removal path re-queues.
-      return false;
+      // Preserve the same document's recovery intent across a transient tab
+      // creation/update failure; the retry callback clears the attempted latch.
+      this.scheduleStaleRecoveryRetry(job, recoveryEpoch);
+      return true;
     } finally {
       if (this.staleRecoveryInFlightEpochs.get(job.job_id) === recoveryEpoch) {
         this.staleRecoveryInFlightEpochs.delete(job.job_id);
@@ -9287,6 +9842,35 @@ export class Bridge {
    * function separately accepts only same-origin Alma service links. Missing
    * host permission or no electronic service stays assisted.
    */
+  private scheduleResolverRouteRetry(jobID: string, currentURL: string): void {
+    if (this.resolverRouteRetryTimers.has(jobID)) return;
+    const marker = {};
+    this.resolverRouteRetryTimers.set(jobID, marker);
+    this.deps.setTimeout(async () => {
+      if (this.resolverRouteRetryTimers.get(jobID) !== marker) return;
+      this.resolverRouteRetryTimers.delete(jobID);
+      const job = findByJob(this.store, jobID);
+      if (
+        job === undefined ||
+        job.tab_id < 0 ||
+        (job.status !== "accepted" && job.status !== "awaiting_download")
+      ) return;
+      try {
+        const tab = await this.deps.tabs.get(job.tab_id);
+        if (tab.url !== currentURL) {
+          if (typeof tab.url === "string") {
+            const current = new URL(tab.url);
+            await this.maybeClassify(jobID, current.hostname);
+          }
+          return;
+        }
+      } catch {
+        return;
+      }
+      await this.maybeRouteResolver(job, currentURL);
+    }, CLASSIFY_RETRY_MS);
+  }
+
   private async maybeRouteResolver(job: ActiveJob, currentURL: string): Promise<boolean> {
     if (!this.hasDelegatedAuthority(job)) return false;
     const offered = this.offerURLs.get(job.job_id);
@@ -9323,6 +9907,11 @@ export class Bridge {
     }
     if (!granted) return false;
 
+    const effectToken = this.claimEffectGovernor(job.job_id);
+    if (effectToken === undefined) {
+      this.scheduleResolverRouteRetry(job.job_id, currentURL);
+      return true;
+    }
     try {
       const results = await this.deps.scripting.executeScript({
         target: { tabId: job.tab_id },
@@ -9347,11 +9936,12 @@ export class Bridge {
         return true;
       }
       // `no_service` is inconclusive: retain the existing assisted behavior.
-      return false;
     } catch (e) {
-      console.error("papio: resolver routing failed; staying assisted", e);
-      return false;
+      console.error("papio: resolver route execution failed", e);
+    } finally {
+      this.releaseEffectGovernor(job.job_id, effectToken);
     }
+    return false;
   }
   /** Firefox cannot steer a native click download into papio/<job>, so a click
    * adapter must remain human-assisted there. Direct API downloads carry their
