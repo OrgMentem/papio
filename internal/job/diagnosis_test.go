@@ -3,6 +3,8 @@
 package job
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 
 	"papio/internal/work"
@@ -67,5 +69,97 @@ func TestDiagnoseRetryWait(t *testing.T) {
 	}
 	if diagnosis.Action != nil {
 		t.Fatalf("action = %+v, want nil", diagnosis.Action)
+	}
+}
+
+func TestDiagnoseV1ShapeRemainsUnchangedWhileV2AddsNestedCutover(t *testing.T) {
+	row := diagnosisRow(StateAwaitingHuman)
+	v1 := Diagnose(row, nil, nil)
+	v2 := DiagnoseV2(row, nil, []map[string]any{{
+		"kind": "job.transition",
+		"detail": map[string]any{
+			InstitutionCutoverBlockerKey: string(InstitutionCutoverBlockerPolicyGate),
+			CanaryReadyRouteExistsKey:    true,
+		},
+	}})
+	v1JSON, err := json.Marshal(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1Fields := map[string]any{}
+	if err := json.Unmarshal(v1JSON, &v1Fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v1Fields["institution_cutover"]; ok {
+		t.Fatal("v1 diagnosis unexpectedly contains institution_cutover")
+	}
+	v2JSON, err := json.Marshal(v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Fields := map[string]any{}
+	if err := json.Unmarshal(v2JSON, &v2Fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(v2Fields, "institution_cutover")
+	if !reflect.DeepEqual(v2Fields, v1Fields) {
+		t.Fatalf("v2 base fields changed v1: v2=%v v1=%v", v2Fields, v1Fields)
+	}
+	if v2.InstitutionCutover == nil || v2.InstitutionCutover.Blocker != InstitutionCutoverBlockerPolicyGate ||
+		!v2.InstitutionCutover.CanaryReadyRouteExists {
+		t.Fatalf("v2 cutover = %+v", v2.InstitutionCutover)
+	}
+}
+
+func TestDiagnoseV2IgnoresMalformedNewestCutoverDetail(t *testing.T) {
+	events := []map[string]any{
+		{"kind": "job.transition", "detail": map[string]any{
+			InstitutionCutoverBlockerKey: string(InstitutionCutoverBlockerPolicyGate),
+			CanaryReadyRouteExistsKey:    true,
+		}},
+		{"kind": "job.transition", "detail": map[string]any{
+			InstitutionCutoverBlockerKey: "not-a-blocker",
+			CanaryReadyRouteExistsKey:    false,
+		}},
+	}
+	diagnosis := DiagnoseV2(diagnosisRow(StateAwaitingHuman), nil, events)
+	if diagnosis.InstitutionCutover != nil {
+		t.Fatalf("cutover = %+v, want nil for malformed newest transition", diagnosis.InstitutionCutover)
+	}
+}
+
+func TestDiagnoseV2NewestTransitionWithoutCutoverClearsPrior(t *testing.T) {
+	events := []map[string]any{
+		{"kind": "job.transition", "detail": map[string]any{
+			InstitutionCutoverBlockerKey: string(InstitutionCutoverBlockerPolicyGate),
+			CanaryReadyRouteExistsKey:    true,
+		}},
+		{"kind": "job.transition", "detail": map[string]any{"reason": "complete"}},
+	}
+	diagnosis := DiagnoseV2(diagnosisRow(StateReady), nil, events)
+	if diagnosis.InstitutionCutover != nil {
+		t.Fatalf("cutover = %+v, want nil when newest transition has no decision", diagnosis.InstitutionCutover)
+	}
+}
+
+func TestDiagnoseV2LatestValidTransactionalDecisionWins(t *testing.T) {
+	events := []map[string]any{
+		{"kind": "job.transition", "detail": map[string]any{
+			InstitutionCutoverBlockerKey: string(InstitutionCutoverBlockerSourceGateOnly),
+			CanaryReadyRouteExistsKey:    false,
+		}},
+		{"kind": "diagnostic.noise", "detail": map[string]any{
+			InstitutionCutoverBlockerKey: string(InstitutionCutoverBlockerPolicyGate),
+			CanaryReadyRouteExistsKey:    true,
+		}},
+		{"kind": "job.transition", "detail": map[string]any{
+			InstitutionCutoverBlockerKey: string(InstitutionCutoverBlockerIdentifierGate),
+			CanaryReadyRouteExistsKey:    true,
+		}},
+	}
+	diagnosis := DiagnoseV2(diagnosisRow(StateAwaitingHuman), nil, events)
+	if diagnosis.InstitutionCutover == nil || diagnosis.InstitutionCutover.Blocker != InstitutionCutoverBlockerIdentifierGate ||
+		!diagnosis.InstitutionCutover.CanaryReadyRouteExists {
+		t.Fatalf("cutover = %+v, want identifier_gate/true", diagnosis.InstitutionCutover)
 	}
 }

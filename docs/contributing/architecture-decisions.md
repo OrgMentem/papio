@@ -229,3 +229,38 @@ ADR-0010 also makes the daemon-wide `access_mode` a ceiling: a per-request `acce
 **Decision:** ADR-0021 keeps every guard, selector, and action class packaged in the store-reviewed extension. Repair speed comes from three mechanisms instead of a remote rule catalog: URL-shaped provider knowledge lives in the daemon and reaches the browser as candidate navigations through existing packaged primitives, deploying in hours without any store surface; an adapter patch generator turns a reviewed failure capture into a complete source change, fixtures, tests, and store submission; and a signed control document — restrictive only — can suspend or revoke exact packaged revisions immediately, holding nothing that could name a host, selector, or action. Remote activation of packaged-but-inactive revisions is deferred behind an explicit store policy pilot, and the rejected-for-now alternatives are recorded with revisit triggers rather than discarded.
 
 **Why:** A signature authenticates who published logic; it does not make logic inert, and a store rejection would risk the only distribution channel. Restrictive-only control can only reduce what *papio* does with a person's session, so it carries none of the authority risk ADR-0015 refused — while daemon-side URL repair attacks the measured dominant failure class at update speeds no store review constrains.
+
+## Institutional processing authority and staged enablement
+
+**Context:** Institutional processing combines durable daemon decisions with
+browser-local tabs, navigation, session evidence, permissions, and downloads.
+The daemon must remain the authority for unmaterialized work without pretending
+that SQLite can atomically revoke a browser effect already delivered to Chrome.
+Strict old IPC clients also require additive diagnosis and feature-gated
+protocol evolution.
+
+**Decision:** ADR-0022 makes the daemon authoritative for jobs, policy,
+institution profiles and revisions, candidate order, claims, permits,
+cooldowns, suppressions, cutover decisions, and artifact winners. The
+extension is authoritative only for physical browser resources and
+browser-local facts. Claim-to-resource binding is acknowledged by both sides
+and fenced by an opaque daemon holder generation. The three business identities
+remain distinct: authentication claim, institution profile, and provider safety
+domain; holder generation is an execution fence, not another identity. Fresh
+external routes are transient and never durable.
+
+Institutional cutover is observed before it is enabled. One closed blocker and
+one canary-readiness flag are written transactionally with the decisive
+transition, while diagnosis v2 adds detail without changing diagnosis v1.
+Automatic first-route behavior requires exact provider/profile/route readiness;
+source-gate bypass requires its own canary; and effect concurrency four waits
+for broad-at-one evidence. Phase −1 is complete and Phase 0 is current.
+
+**Why:** This preserves ADR-0003's holder boundary, ADR-0013's browser-local
+facts, ADR-0016's daemon-side institutional routing, ADR-0018's fresh-evidence
+entitlement rule, and ADR-0021's packaged positive behavior. It also keeps
+ADR-0006's compatibility gate, ADR-0009's frozen result shapes, ADR-0012's
+observed-provider-limit rule, and ADR-0017's configured delivery gates intact.
+Direct-to-main implementation stays in small, solo-maintainer-sized changes;
+the staged gates make measurement and rollback possible without adding
+speculative confirmation prompts.

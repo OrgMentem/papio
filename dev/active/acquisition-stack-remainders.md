@@ -16,11 +16,7 @@ These cannot be closed by automation: a warm human browser passes provider
 anti-bot checks that no CDP or WebDriver session can, which is the same
 constraint that makes the extension QA matrix manual.
 
-- **ScienceDirect entitled download.** The `sciencedirect` adapter's
-  `no_entitlement` rule is backed by a real institutional capture (2026-08-06),
-  but its entitled-article rule is structural only — `fixtures/sciencedirect/success.html`
-  carries a fabricated DOI/PII, not a capture. Confirm the `citation_pdf_url`
-  meta fetch reaches a real PDF through the privileged downloads API.
+- **ScienceDirect entitled download (Unverified).** The live primary access-bar path, viewer adoption, and provider outcome are now repaired/observed, but no retained validated artifact reached `ready`; the exact route is therefore not canary-qualified or **Verified working**. Page capture or provider outcome alone is insufficient to promote it. The `no_entitlement` rule remains live-verified from a real institutional capture (2026-08-06), while the entitled-article rule remains fixture-backed only — `fixtures/sciencedirect/success.html` carries a fabricated DOI/PII, not a capture. Confirm the `citation_pdf_url` meta fetch reaches a real PDF through the privileged downloads API.
 - **Springer supervised acceptance.** The `springer` adapter is still 0.1.0 with
   all six fixture states but no live-verification note, unlike wiley/proquest/
   jstor/acm. One supervised run against an entitled chapter would prove the

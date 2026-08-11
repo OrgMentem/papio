@@ -117,7 +117,7 @@ var commandClassification = map[string]commandClass{
 	"papio jobs list":                  {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.list_v3", "jobs.list_v2", "jobs.list"}},
 	"papio jobs get":                   {kind: kindStructured, rpcMethods: []string{"jobs.get_v3", "jobs.get_v2", "jobs.get"}},
 	"papio jobs show":                  {kind: kindStructured, rpcMethods: []string{"jobs.get_v3", "jobs.get_v2", "jobs.get"}},
-	"papio jobs diagnose":              {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"jobs.diagnose_v1"}},
+	"papio jobs diagnose":              {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"jobs.diagnose_v2", "jobs.diagnose_v1"}},
 	"papio jobs receipt":               {kind: kindStructured, rpcMethods: []string{"jobs.receipt"}},
 	"papio jobs add-component":         {kind: kindEnvelope, rowKey: "components", args: []string{"job_01", "/tmp/papio-conformance-supplement.pdf", "--role", "supplement"}, rpcMethods: []string{"jobs.add_component"}},
 	"papio jobs repair-awaiting-human": {kind: kindStructured, rpcMethods: []string{"jobs.repair_awaiting_human"}},

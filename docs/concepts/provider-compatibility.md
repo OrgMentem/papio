@@ -27,9 +27,11 @@ download. **Verified route** — the page structure and file endpoint are
 confirmed against a real entitled or public session, without an independent
 confirmation that the endpoint itself returns file bytes. **Human-assisted** —
 a publisher terms step keeps the download manual unless auto-accept consent is
-recorded. **Unverified** — registered and fixture-backed, but not yet driven
-against a live entitled session. **No route** — the adapter recognizes a
-terminal provider state but has no download control to invoke.
+recorded. **Unverified** — registered and fixture-backed, but no retained
+validated artifact has established an end-to-end download; live page captures,
+viewer adoption, or provider outcomes alone do not promote it. **No route** —
+the adapter recognizes a terminal provider state but has no download control to
+invoke.
 
 | Provider | Route observed | Adapter | Status | Last verified | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -57,7 +59,7 @@ terminal provider state but has no download control to invoke.
 | ProQuest | OpenURL handler; requires the `accountid` parameter | `proquest` | Verified working | 2026-07-18 | Appending `accountid` unlocks the institutional route before the provider's federated-login fallback. |
 | Psychiatry Online | Silverchair `data-article-access='full'` state plus a rendered `#downloadPdfUrl` anchor, read directly | `psychiatryonline` | Verified route | 2026-07-20 | Denied pages may still render `downloadPdfUrl`, so the full-access marker is checked first. |
 | SAGE Journals | Rendered `section.format--pdf_epub` panel gates a derived `/doi/pdf/<doi>?download=true` endpoint | `sage` | Verified route | 2026-07-27 | SAGE stopped rendering the earlier `a#downloadPdfUrl` anchor in July 2026; the adapter was rewritten to key on the semantic PDF/EPUB panel instead of a viewer-only eReader href. |
-| ScienceDirect | `citation_pdf_url` meta (the Highwire/Google-Scholar standard) fetched directly, gated on recorded terms consent | `sciencedirect` | Unverified | Not live-verified | Structural only: ScienceDirect sits behind Cloudflare, which bot-challenges automated capture, so the `article` rule has not been confirmed against a live entitled session. Only the `no_entitlement` rule is live-verified (2026-08-06, from a real institutional handoff). |
+| ScienceDirect | `citation_pdf_url` meta (the Highwire/Google-Scholar standard) fetched directly, gated on recorded terms consent | `sciencedirect` | Unverified | Not live-verified | Live observations now include the primary access-bar path, viewer adoption, and provider outcome, but no retained validated artifact reached `ready`; page capture or provider outcome alone is insufficient to call the exact route canary-qualified or **Verified working**. The `no_entitlement` rule remains live-verified (2026-08-06, from a real institutional handoff). |
 | SpringerLink | Rendered `a[data-test='pdf-link']` anchor to `/content/pdf/`, read directly | `springer` | Verified route | 2026-07-14 | Verified live against both entitled and no-entitlement article states. |
 | Taylor & Francis Online | Rendered `.downloadPDFLink a.show-pdf` anchor to `/doi/pdf/`, gated on an Open Access or full-access badge | `tandfonline` | Verified route | 2026-08-06 | Journal platform only — distinct from `taylorfrancis.com` books, whose `citation_pdf_url` can be a preview only. `no_entitlement` runs first since Access Denial pages carry no download control at all. |
 | Thieme E-Journals | Rendered `#pdfLink` anchor, read directly, gated on the platform's full-text page state | `thieme` | Verified route | 2026-07-20 | Verified against public full-text pages; the abstract-only route stays unknown/assisted since `citation_pdf_url` and `#pdfLink` also appear there. |

@@ -18,7 +18,19 @@ import (
 // existing IPC decoders reject widened responses.
 type JobDiagnosis = job.Diagnosis
 
+// JobDiagnosisV2 adds the observation-only institutional cutover projection.
+// The v1 alias above remains unchanged for strict older clients.
+type JobDiagnosisV2 = job.DiagnosisV2
+
 func diagnoseJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	return diagnoseJobWithProjection(ctx, raw, system, false)
+}
+
+func diagnoseJobV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	return diagnoseJobWithProjection(ctx, raw, system, true)
+}
+
+func diagnoseJobWithProjection(ctx context.Context, raw json.RawMessage, system *bootstrap.System, v2 bool) ([]byte, *ipc.RPCError) {
 	var params struct {
 		JobID string `json:"job_id"`
 	}
@@ -43,6 +55,9 @@ func diagnoseJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 	actions := make([]job.HumanAction, 0, len(attributed))
 	for _, item := range attributed {
 		actions = append(actions, item.Action)
+	}
+	if v2 {
+		return marshal(job.DiagnoseV2(row, actions, events))
 	}
 	return marshal(job.Diagnose(row, actions, events))
 }

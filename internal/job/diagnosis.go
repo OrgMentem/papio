@@ -59,6 +59,31 @@ type Diagnosis struct {
 	Action          *ActionDiagnosis `json:"action,omitempty"`
 }
 
+// DiagnosisV2 is the additive diagnosis projection. Diagnosis remains the
+// exact v1 result model; the optional institution_cutover field is only
+// present when a valid transactional cutover decision was recorded.
+type DiagnosisV2 struct {
+	Diagnosis
+	InstitutionCutover *InstitutionCutoverDecision `json:"institution_cutover,omitempty"`
+}
+
+// DiagnoseV2 projects the same row, actions, and events as Diagnose, adding
+// only the latest valid transactional cutover decision.
+func DiagnoseV2(row *Row, actions []HumanAction, events []map[string]any) DiagnosisV2 {
+	return DiagnosisV2{
+		Diagnosis:          Diagnose(row, actions, events),
+		InstitutionCutover: latestInstitutionCutoverDecision(events),
+	}
+}
+
+func latestInstitutionCutoverDecision(events []map[string]any) *InstitutionCutoverDecision {
+	decision, ok := LatestInstitutionCutoverDecision(events)
+	if !ok {
+		return nil
+	}
+	return &decision
+}
+
 // Diagnose folds the current job row, its actions, and its append-only events
 // into one operator explanation. Events are oldest first, as returned by
 // Store.Events. The classifier prefers the latest provider outcome because it

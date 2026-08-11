@@ -1435,7 +1435,13 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			return err
 		}
 		return s.park(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,
-			map[string]any{"reason": "landing_page_only"})
+			job.WithCutoverDecision(
+				map[string]any{"reason": "landing_page_only"},
+				job.InstitutionCutoverDecision{
+					Blocker:                job.InstitutionCutoverBlockerLiveSourceRemaining,
+					CanaryReadyRouteExists: false,
+				},
+			))
 	}
 	if !plan.IsZero() {
 		return s.parkForRetry(ctx, row, job.StateFetching, plan,
@@ -1487,7 +1493,36 @@ func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, p
 		at = now.Add(s.RetryDelay)
 	}
 	detail["retry_kind"] = kind
+	decision := retryCutoverDecision(plan)
+	if kind == retryKindExhaustedGate {
+		// This park is deliberately forced to the gate: the retry budget is
+		// spent, and only the one source that never got a request justifies
+		// this final wait. Do not let stale/mixed temporary observations from
+		// the pass relabel that forced gate decision.
+		decision = job.InstitutionCutoverDecision{
+			Blocker:                job.InstitutionCutoverBlockerSourceGateOnly,
+			CanaryReadyRouteExists: false,
+		}
+	}
+	detail = job.WithCutoverDecision(detail, decision)
 	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, detail, job.WithRetryAt(at))
+}
+
+// retryCutoverDecision classifies only facts observed in the current resolver
+// and fetch pass. A mixed temporary failure plus source gate is still a
+// transient retry: source_gate_only is reserved for the strict case where no
+// callable source made a request.
+func retryCutoverDecision(plan retryPlan) job.InstitutionCutoverDecision {
+	blocker := job.InstitutionCutoverBlockerNone
+	if !plan.Temporary().IsZero() || plan.RetryableCandidates > 0 || plan.TemporaryResolvers > 0 {
+		blocker = job.InstitutionCutoverBlockerTransientRetryRemaining
+	} else if plan.ClosedSourceGates > 0 || !plan.Gate.IsZero() {
+		blocker = job.InstitutionCutoverBlockerSourceGateOnly
+	}
+	return job.InstitutionCutoverDecision{
+		Blocker:                blocker,
+		CanaryReadyRouteExists: false,
+	}
 }
 
 // alreadyWaitedPastExhaustion reports whether this job has already spent its
@@ -1630,6 +1665,10 @@ func (s *Service) handoffGate(ctx context.Context, w work.Work, resolverName str
 // is never copied into job events or protocol metadata.
 func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, reason string, terminal job.TerminalReason, oaBrowserURL string) error {
 	mode := s.Config.EffectiveAccessMode(row.Policy.AccessMode)
+	decision := job.InstitutionCutoverDecision{
+		Blocker:                job.InstitutionCutoverBlockerNone,
+		CanaryReadyRouteExists: false,
+	}
 	switch mode {
 	case config.ModeAssisted, config.ModeDelegated:
 		if oaBrowserURL != "" {
@@ -1637,7 +1676,13 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				return err
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
-				map[string]any{"reason": "open_access_browser_handoff"})
+				job.WithCutoverDecision(
+					map[string]any{"reason": "open_access_browser_handoff"},
+					job.InstitutionCutoverDecision{
+						Blocker:                job.InstitutionCutoverBlockerLiveSourceRemaining,
+						CanaryReadyRouteExists: false,
+					},
+				))
 		}
 		institutionalExhausted := s.institutionalRouteExhausted(ctx, row.ID)
 		base, hasBase := s.Config.OpenURLBaseFor(row.Policy.Resolver)
@@ -1652,6 +1697,11 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 		// round trip and park forever.
 		case !routeable:
 			reason, terminal = gateReason, gateTerminal
+			if gateReason == "no_identifier" || gateReason == "doi_not_registered" {
+				decision.Blocker = job.InstitutionCutoverBlockerIdentifierGate
+			} else {
+				decision.Blocker = job.InstitutionCutoverBlockerNoLegalRoute
+			}
 		case hasBase && base != "" && !institutionalExhausted:
 			detail := InstitutionalOpenURLHandoffDetail
 			if !row.Work.HasFetchableIdentifier() && row.Work.ISBN != "" {
@@ -1670,7 +1720,10 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				return err
 			}
 			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
-				map[string]any{"reason": "institutional_handoff"})
+				job.WithCutoverDecision(
+					map[string]any{"reason": "institutional_handoff"},
+					decision,
+				))
 		default:
 			// institutionalExhausted, or no institutional OpenURL route was
 			// ever configured for this profile: the plain-OpenURL handoff has
@@ -1688,7 +1741,13 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 			if institutionalExhausted {
 				terminal = job.TerminalReasonNoEntitlement
 			}
-			result, err := s.deliveryRoute(ctx, row, from)
+			_, _, configured := s.deliveryConfigured(row)
+			if configured {
+				decision.Blocker = job.InstitutionCutoverBlockerNone
+			} else {
+				decision.Blocker = job.InstitutionCutoverBlockerNoLegalRoute
+			}
+			result, err := s.deliveryRoute(withCutoverDecision(ctx, decision), row, from)
 			if err != nil {
 				return err
 			}
@@ -1700,7 +1759,9 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 		// Same gate: an OpenURL built from a bare title or an unregistered DOI
 		// is not worth surfacing.
 		routeable, gateReason, gateTerminal := s.handoffGate(ctx, row.Work, row.Policy.Resolver)
-		if base, ok := s.Config.OpenURLBaseFor(row.Policy.Resolver); ok && base != "" && routeable {
+		base, hasBase := s.Config.OpenURLBaseFor(row.Policy.Resolver)
+		if hasBase && base != "" && routeable {
+			decision.Blocker = job.InstitutionCutoverBlockerPolicyGate
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_available",
 				"no direct candidates; institutional OpenURL available but not opened in conservative mode",
 				// An advisory, not a sign-in prompt: it exists precisely to say
@@ -1709,17 +1770,9 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				return err
 			}
 		}
-		// ADR-0017 Decision 3B condition 1: "under conservative the route is
-		// discovered and recorded, never opened or submitted." Unlike the
-		// delegated/assisted path, this never runs Branch/EvaluateGate, and
-		// deliberately records an EVENT rather than a job.ActionKindDocumentDelivery
-		// human action: that kind is reserved for the delegated/assisted
-		// path's actionable prefill/reconciliation offers, and — unlike
-		// openurl_available — has no exemption from the terminal
-		// transition's open-action cleanup a few lines down, which would
-		// silently cancel it the instant it opened. An event survives that
-		// cleanup untouched and is exactly "recorded": visible in the job's
-		// history without masquerading as something actionable.
+		// ADR-0017 Decision 3B condition 1: conservative mode discovers a
+		// configured delivery route but never opens or submits it. Preserve
+		// that observation independently of the cutover blocker payload.
 		if _, dd, ok := s.deliveryConfigured(row); ok && routeable {
 			if err := s.Jobs.RecordEvent(ctx, row.ID, "delivery.route_discovered", map[string]any{
 				"provider": dd.Kind,
@@ -1728,12 +1781,31 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				return err
 			}
 		}
+		// A syntactically handoff-capable work is not itself a legal route:
+		// without an OpenURL destination, and without a configured delivery
+		// service, conservative mode has nothing institutional to discover or
+		// hold back. Keep the identifier gate above distinct, but classify this
+		// exhausted boundary as no_legal_route rather than the initial none.
 		if !routeable {
 			reason, terminal = gateReason, gateTerminal
+			if gateReason == "no_identifier" || gateReason == "doi_not_registered" {
+				decision.Blocker = job.InstitutionCutoverBlockerIdentifierGate
+			} else {
+				decision.Blocker = job.InstitutionCutoverBlockerNoLegalRoute
+			}
+		} else if hasBase && base != "" {
+			decision.Blocker = job.InstitutionCutoverBlockerPolicyGate
+		} else if _, _, configured := s.deliveryConfigured(row); configured {
+			decision.Blocker = job.InstitutionCutoverBlockerPolicyGate
+		} else {
+			decision.Blocker = job.InstitutionCutoverBlockerNoLegalRoute
 		}
 	}
 	return s.Jobs.Transition(ctx, row.ID, from, job.StateUnavailable,
-		map[string]any{"reason": reason}, job.WithTerminalReason(terminal))
+		job.WithCutoverDecision(
+			map[string]any{"reason": reason},
+			decision,
+		), job.WithTerminalReason(terminal))
 }
 
 // DeliveryRouteResult reports what one document-delivery route evaluation
@@ -1750,6 +1822,28 @@ type DeliveryRouteResult struct {
 	Branch     delivery.BranchDecision
 	Decision   delivery.Decision
 	Request    *delivery.Request
+}
+type cutoverDecisionContextKey struct{}
+
+func withCutoverDecision(ctx context.Context, decision job.InstitutionCutoverDecision) context.Context {
+	return context.WithValue(ctx, cutoverDecisionContextKey{}, decision)
+}
+func deliveryRetryCutoverDetail(ctx context.Context, detail map[string]any) map[string]any {
+	decision, ok := ctx.Value(cutoverDecisionContextKey{}).(job.InstitutionCutoverDecision)
+	if !ok {
+		return detail
+	}
+	decision.Blocker = job.InstitutionCutoverBlockerTransientRetryRemaining
+	decision.CanaryReadyRouteExists = false
+	return job.WithCutoverDecision(detail, decision)
+}
+
+func deliveryCutoverDetail(ctx context.Context, detail map[string]any) map[string]any {
+	decision, ok := ctx.Value(cutoverDecisionContextKey{}).(job.InstitutionCutoverDecision)
+	if !ok {
+		return detail
+	}
+	return job.WithCutoverDecision(detail, decision)
 }
 
 // SubmitDelivery runs the same Decision 3B/4 idempotency-branch-then-gate
@@ -2089,10 +2183,10 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 		if class != illiad.FailurePreSend {
 			return created, s.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, created)
 		}
-		return created, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+		return created, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, deliveryRetryCutoverDetail(ctx, map[string]any{
 			"reason":              "resolver_temporarily_unavailable",
 			"delivery_request_id": created.ID,
-		}, job.WithRetryAt(s.Now().Add(s.RetryDelay)))
+		}), job.WithRetryAt(s.Now().Add(s.RetryDelay)))
 	}
 	providerRef := strconv.Itoa(txn.TransactionNumber)
 	nextCheck := delivery.NextCheck(s.Now(), 0, profile.StatusPollMinutes)
@@ -2124,11 +2218,11 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 	// Plain job.Store.Transition, not s.park: a delivery poll is not a human
 	// action, exactly like parkForRetry's ordinary retry_wait never notifies
 	// through s.park either.
-	return submitted, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+	return submitted, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, deliveryCutoverDetail(ctx, map[string]any{
 		"reason":              string(job.RetryReasonDocumentDeliveryPending),
 		"delivery_request_id": created.ID,
 		"provider_reference":  durableProviderRef,
-	}, job.WithRetryAt(nextCheck))
+	}), job.WithRetryAt(nextCheck))
 }
 
 // reconcileAmbiguousSubmission is the only application call site for the
@@ -2176,11 +2270,11 @@ func (s *Service) reconcileAmbiguousSubmission(ctx context.Context, row *job.Row
 			return fmt.Errorf("delivery: adopted request %d disappeared", req.ID)
 		}
 		next := delivery.NextCheck(s.Now(), 0, profile.StatusPollMinutes)
-		return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+		return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, deliveryCutoverDetail(ctx, map[string]any{
 			"reason":              string(job.RetryReasonDocumentDeliveryPending),
 			"delivery_request_id": req.ID,
 			"provider_reference":  adopted.ProviderReference,
-		}, job.WithRetryAt(next))
+		}), job.WithRetryAt(next))
 	case delivery.ReconciliationNotFoundYet:
 		attempt := reconciliationAttemptCount(ctx, s.Jobs, row.ID, req.ID) + 1
 		if err := s.Jobs.RecordEvent(ctx, row.ID, "delivery.reconciliation_attempt", map[string]any{
@@ -2194,11 +2288,11 @@ func (s *Service) reconcileAmbiguousSubmission(ctx context.Context, row *job.Row
 			return s.openDeliveryReconciliationAction(ctx, row, from, req)
 		}
 		delay := offeredRecoveryInitialBackoff << (attempt - 1)
-		return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+		return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, deliveryRetryCutoverDetail(ctx, map[string]any{
 			"reason":                 string(job.RetryReasonDocumentDeliveryPending),
 			"delivery_request_id":    req.ID,
 			"reconciliation_attempt": attempt,
-		}, job.WithRetryAt(s.Now().Add(delay)))
+		}), job.WithRetryAt(s.Now().Add(delay)))
 	default:
 		if result.Reason == delivery.ReconciliationReasonCommitConflict && result.ProviderReference != "" {
 			current, getErr := s.Delivery.Get(ctx, req.ID)
@@ -2280,7 +2374,7 @@ func (s *Service) openProviderSubmissionConflict(ctx context.Context, jobID stri
 		return nil
 	case job.StateQueued, job.StateResolving, job.StateFetching, job.StateValidating, job.StateRetryWait, job.StateNeedsReview:
 		return s.park(ctx, jobID, current.State, job.StateAwaitingHuman,
-			map[string]any{"reason": "document_delivery_submission_conflict"})
+			deliveryCutoverDetail(ctx, map[string]any{"reason": "document_delivery_submission_conflict"}))
 	default:
 		return nil
 	}
@@ -2315,7 +2409,7 @@ func (s *Service) parkDeliveryPrefill(ctx context.Context, row *job.Row, from st
 		DeliveryPrefillActionDetail(dd.BaseURL), job.Access(false, "")); err != nil {
 		return err
 	}
-	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_prefill"})
+	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, deliveryCutoverDetail(ctx, map[string]any{"reason": "document_delivery_prefill"}))
 }
 
 // joinDeliveryPoll is Decision 3B's `join_poll` branch: this job attaches to
@@ -2350,10 +2444,10 @@ func (s *Service) joinDeliveryPoll(ctx context.Context, row *job.Row, from strin
 	if next.IsZero() {
 		next = deliveryJoinPollAt(s.Now(), existing)
 	}
-	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, map[string]any{
+	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, deliveryCutoverDetail(ctx, map[string]any{
 		"reason":              string(job.RetryReasonDocumentDeliveryPending),
 		"delivery_request_id": existing.ID,
-	}, job.WithRetryAt(next))
+	}), job.WithRetryAt(next))
 }
 
 // deliveryJoinPollAt reuses an already-scheduled next_check_at when it is
@@ -2378,7 +2472,7 @@ func (s *Service) openDeliveryReconciliationAction(ctx context.Context, row *job
 		DeliveryReconciliationActionDetail(existing), job.Access(false, "")); err != nil {
 		return err
 	}
-	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"})
+	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, deliveryCutoverDetail(ctx, map[string]any{"reason": "document_delivery_reconciliation"}))
 }
 
 // routeFulfilledDelivery is the 2026-08-07 ADR-0017 amendment's sole
@@ -2446,7 +2540,7 @@ func (s *Service) routeFulfilledDelivery(ctx context.Context, row *job.Row, from
 		DocumentDeliveryRetrievalHandoffDetail+"\n"+retrievalURL, job.Access(false, "")); err != nil {
 		return err
 	}
-	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_retrieval"})
+	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, deliveryCutoverDetail(ctx, map[string]any{"reason": "document_delivery_retrieval"}))
 }
 
 // DocumentDeliveryRetrievalHandoffDetail identifies an openurl_handoff
