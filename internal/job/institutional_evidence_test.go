@@ -5,9 +5,12 @@ package job
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"papio/internal/store"
 )
 
 func seedInstitutionProfile(t *testing.T, js *Store, id string) {
@@ -57,11 +60,13 @@ func TestProfileEvidenceLostResponseAndFences(t *testing.T) {
 	js := testStore(t)
 	seedInstitutionProfile(t, js, "profile-evidence")
 	ctx := context.Background()
+	received := time.Now().UTC().Add(-time.Minute)
 	decisive := ProfileEvidenceObservation{
 		ObservationID: "obs-decisive", BrowserHolderGeneration: 7,
 		InstitutionProfileID: "profile-evidence", InstitutionProfileRevision: 1,
 		Verdict: ProfileEvidenceWarmVerified, Source: ProfileEvidenceProbe,
-		ProducerObservedAt: "2026-01-01T00:00:01Z", DaemonReceivedAt: "2026-01-01T00:00:02Z",
+		ProducerObservedAt: received.Add(-time.Second).Format(time.RFC3339Nano),
+		DaemonReceivedAt:   received.Format(time.RFC3339Nano),
 	}
 	if err := js.RecordProfileEvidence(ctx, decisive); err != nil {
 		t.Fatal(err)
@@ -73,7 +78,8 @@ func TestProfileEvidenceLostResponseAndFences(t *testing.T) {
 		ObservationID: "obs-unknown", BrowserHolderGeneration: 7,
 		InstitutionProfileID: "profile-evidence", InstitutionProfileRevision: 1,
 		Verdict: ProfileEvidenceUnknown, Source: ProfileEvidenceProviderOutcome,
-		ProducerObservedAt: "2026-01-01T00:00:03Z", DaemonReceivedAt: "2026-01-01T00:00:04Z",
+		ProducerObservedAt: received.Add(time.Second).Format(time.RFC3339Nano),
+		DaemonReceivedAt:   received.Add(2 * time.Second).Format(time.RFC3339Nano),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -86,6 +92,139 @@ func TestProfileEvidenceLostResponseAndFences(t *testing.T) {
 	}
 	if _, ok, err := js.CurrentProfileEvidence(ctx, "profile-evidence", 2, 7); err != nil || ok {
 		t.Fatalf("stale profile revision became eligible: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestProfileEvidenceReceiptTTLAndSignedOutRevokesWarm(t *testing.T) {
+	js := testStore(t)
+	seedInstitutionProfile(t, js, "profile-ttl")
+	ctx := context.Background()
+	now := time.Now().UTC()
+	record := func(id string, verdict ProfileEvidenceVerdict, received time.Time) {
+		t.Helper()
+		if err := js.RecordProfileEvidence(ctx, ProfileEvidenceObservation{
+			ObservationID: id, BrowserHolderGeneration: 3,
+			InstitutionProfileID: "profile-ttl", InstitutionProfileRevision: 1,
+			Verdict: verdict, Source: ProfileEvidenceProbe,
+			ProducerObservedAt: received.Add(-time.Hour).Format(time.RFC3339Nano),
+			DaemonReceivedAt:   received.Format(time.RFC3339Nano),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.S.DB().ExecContext(ctx, `
+			UPDATE profile_evidence SET daemon_received_at=?, expires_at=? WHERE observation_id=?`,
+			received.Format(time.RFC3339Nano), received.Add(ProfileEvidenceTTL).Format(time.RFC3339Nano), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record("warm-old", ProfileEvidenceWarmVerified, now.Add(-ProfileEvidenceTTL-time.Minute))
+	if _, ok, err := js.CurrentProfileEvidence(ctx, "profile-ttl", 1, 3); err != nil || ok {
+		t.Fatalf("producer-old evidence remained current: ok=%v err=%v", ok, err)
+	}
+	record("warm-current", ProfileEvidenceWarmVerified, now.Add(-time.Minute))
+	record("signed-out", ProfileEvidenceSignedOut, now)
+	record("warm-delayed", ProfileEvidenceWarmVerified, now.Add(time.Second))
+	got, ok, err := js.CurrentProfileEvidence(ctx, "profile-ttl", 1, 3)
+	if err != nil || !ok || got.Verdict != ProfileEvidenceSignedOut {
+		t.Fatalf("signed-out did not revoke warm: %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
+func TestProfileEvidenceIndependentProfilesSameSync(t *testing.T) {
+	js := testStore(t)
+	seedInstitutionProfile(t, js, "profile-sync-a")
+	seedInstitutionProfile(t, js, "profile-sync-b")
+	ctx := context.Background()
+	received := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, profile := range []string{"profile-sync-a", "profile-sync-b"} {
+		if err := js.RecordProfileEvidence(ctx, ProfileEvidenceObservation{
+			ObservationID: profile + "-observation", BrowserHolderGeneration: 8,
+			InstitutionProfileID: profile, InstitutionProfileRevision: 1,
+			Verdict: ProfileEvidenceWarmVerified, Source: ProfileEvidenceProbe,
+			ProducerObservedAt: received, DaemonReceivedAt: received,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, profile := range []string{"profile-sync-a", "profile-sync-b"} {
+		if got, ok, err := js.CurrentProfileEvidence(ctx, profile, 1, 8); err != nil || !ok || got.InstitutionProfileID != profile {
+			t.Fatalf("profile %s evidence = %+v ok=%v err=%v", profile, got, ok, err)
+		}
+	}
+}
+
+func TestAuthenticationEntryLeaseReserveExpiryConversionAndRestart(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	seedInstitutionProfile(t, js, "profile-lease")
+	if _, err := js.S.DB().ExecContext(ctx, `UPDATE institution_profiles SET authentication_claim_id='claim-shared' WHERE id='profile-lease'`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	evidence := ProfileEvidenceObservation{
+		ObservationID: "lease-evidence", BrowserHolderGeneration: 12,
+		InstitutionProfileID: "profile-lease", InstitutionProfileRevision: 1,
+		Verdict: ProfileEvidenceAuthReturned, Source: ProfileEvidenceAuthReturn,
+		ProducerObservedAt: now.Add(-time.Second).Format(time.RFC3339Nano),
+		DaemonReceivedAt:   now.Format(time.RFC3339Nano),
+	}
+	if err := js.RecordProfileEvidence(ctx, evidence); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-shared", LeaseID: "lease-1", OwnerID: "job-a",
+		BrowserHolderGeneration: 12, LeaseUntil: now.Add(time.Minute),
+	})
+	if err != nil || lease.State != AuthenticationEntryLeaseReserved {
+		t.Fatalf("reserve = %+v err=%v", lease, err)
+	}
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-shared", LeaseID: "lease-2", OwnerID: "job-b",
+		BrowserHolderGeneration: 12, LeaseUntil: now.Add(time.Minute),
+	}); !errors.Is(err, ErrAuthenticationEntryLeaseBusy) {
+		t.Fatalf("second owner reserve err=%v, want busy", err)
+	}
+	if err := js.ConvertAuthenticationEntryLeaseToHuman(ctx, "claim-shared", "lease-1", "job-a", 12, evidence); err != nil {
+		t.Fatalf("convert to human: %v", err)
+	}
+	current, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-shared")
+	if err != nil || !ok || current.State != AuthenticationEntryLeaseHuman || current.HumanOwnerID != "job-a" {
+		t.Fatalf("human lease = %+v ok=%v err=%v", current, ok, err)
+	}
+	if err := js.ExpireAuthenticationEntryLease(ctx, "claim-shared", 11, "lease-1"); !errors.Is(err, ErrAuthenticationEntryLeaseStale) {
+		t.Fatalf("stale expiry err=%v", err)
+	}
+	dataDir := filepath.Dir(js.S.Path())
+	if err := js.S.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	persisted, ok, err := (&Store{S: restarted}).GetAuthenticationEntryLease(ctx, "claim-shared")
+	if err != nil || !ok || persisted.State != AuthenticationEntryLeaseHuman {
+		t.Fatalf("restarted lease = %+v ok=%v err=%v", persisted, ok, err)
+	}
+}
+
+func TestAuthenticationEntryLeaseExpiryAllowsNewOwner(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	past := time.Now().UTC().Add(-time.Minute)
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-expire", LeaseID: "lease-old", OwnerID: "old",
+		BrowserHolderGeneration: 4, LeaseUntil: past,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-expire", LeaseID: "lease-new", OwnerID: "new",
+		BrowserHolderGeneration: 5, LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil || lease.OwnerID != "new" || lease.State != AuthenticationEntryLeaseReserved {
+		t.Fatalf("expired lease replacement = %+v err=%v", lease, err)
 	}
 }
 

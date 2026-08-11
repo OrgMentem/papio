@@ -55,8 +55,9 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 28 {
-		t.Fatalf("user_version = %d, %v; want 28", version, err)
+	if err != nil || version != 29 {
+		t.Fatalf("user_version = %d, %v; want 29", version, err)
+
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
 
@@ -122,8 +123,9 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 28 {
-		t.Fatalf("user_version = %d, %v; want 28", version, err)
+	if err != nil || version != 29 {
+		t.Fatalf("user_version = %d, %v; want 29", version, err)
+
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
 
@@ -230,8 +232,10 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 			'profile_evidence',
 			'human_gate_observations',
 			'route_suppressions',
-			'artifact_winners'
+			'artifact_winners',
+			'authentication_entry_leases'
 		)`
+
 	rows, err := db.DB().QueryContext(ctx, tables)
 	if err != nil {
 		t.Fatalf("list institutional materialization tables: %v", err)
@@ -257,6 +261,7 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 		"human_gate_observations",
 		"route_suppressions",
 		"artifact_winners",
+		"authentication_entry_leases",
 	} {
 		if !foundTables[name] {
 			t.Errorf("migration did not create table %q", name)
@@ -277,8 +282,10 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 			'human_gate_observations_by_status',
 			'route_suppressions_by_job',
 			'route_suppressions_active_exact',
-			'artifact_winners_by_candidate'
+			'artifact_winners_by_candidate',
+			'authentication_entry_leases_by_expiry'
 		)`
+
 	rows, err = db.DB().QueryContext(ctx, indexes)
 	if err != nil {
 		t.Fatalf("list institutional materialization indexes: %v", err)
@@ -308,6 +315,7 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 		"route_suppressions_by_job",
 		"route_suppressions_active_exact",
 		"artifact_winners_by_candidate",
+		"authentication_entry_leases_by_expiry",
 	} {
 		if !foundIndexes[name] {
 			t.Errorf("migration did not create index %q", name)

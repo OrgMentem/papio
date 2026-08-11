@@ -4156,10 +4156,10 @@ func TestProviderOutcomeLatchIsIdempotentAndSurvivesBridgeRestart(t *testing.T) 
 	p := &protocol.ProviderOutcomePayload{
 		Outcome: "ui_changed", AdapterID: "sage", AdapterVersion: "1.0.0",
 	}
-	if err := b.outcome(ctx, id, p); err != nil {
+	if err := b.outcome(ctx, id, "outcome-replay", p); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.outcome(ctx, id, p); err != nil {
+	if err := b.outcome(ctx, id, "outcome-replay", p); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(latchEvents(t, jobs, id)); got != 1 {
@@ -8637,5 +8637,241 @@ func TestFocusPreparationTakeoverReplacementOffersWithoutRetry(t *testing.T) {
 	msgs, _ := runSyncAs(t, b, replacement)
 	if firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer) == nil {
 		t.Fatalf("replacement did not offer prepared candidate without retry: %v", msgs)
+	}
+}
+
+func TestBridgePersistsTwoProfileObservationsInOneSync(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+		"beta":  {OpenURLBase: "https://beta.example.edu/openurl"},
+	}
+	b.cfg = cfg
+	received := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	b.now = func() time.Time { return received }
+	daemonStart := time.Now().UTC().Add(-time.Second)
+	runSync(t, b, hello())
+	runSync(t, b,
+		inFrame(t, protocol.MsgSessionEvidence, "", map[string]any{
+			"evidence": "warm_verified", "origin_hint": "https://alpha.example.edu",
+			"at": "2026-08-12T09:59:00Z",
+		}),
+		inFrame(t, protocol.MsgSessionEvidence, "", map[string]any{
+			"evidence": "warm_verified", "origin_hint": "https://beta.example.edu",
+			"at": "2026-08-12T09:59:01Z",
+		}),
+	)
+	var count int
+	if err := jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM profile_evidence`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("profile evidence rows = %d, want 2", count)
+	}
+	var alphaReceipt, betaReceipt string
+	if err := jobs.S.DB().QueryRow(`
+		SELECT MIN(daemon_received_at), MAX(daemon_received_at)
+		FROM profile_evidence`).Scan(&alphaReceipt, &betaReceipt); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{alphaReceipt, betaReceipt} {
+		got, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil || got.Before(daemonStart) || got.After(time.Now().UTC().Add(time.Second)) {
+			t.Fatalf("daemon receipt %q is not daemon-owned current time: %v", value, err)
+		}
+	}
+}
+
+func TestBridgeProviderOutcomeProjectsTypedGatesAndSignedOutEvidence(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+	}
+	b.cfg = cfg
+	b.now = func() time.Time { return time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC) }
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "bridge-gate-provider", handoffWork(), "alpha")
+	if err := b.outcome(context.Background(), jobID, "provider-gate", &protocol.ProviderOutcomePayload{Outcome: "human_auth_required"}); err != nil {
+		t.Fatal(err)
+	}
+	attention, err := jobs.CurrentHumanAttention(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attention.Count != 1 || len(attention.Gates) != 1 || attention.Gates[0].GateType != job.HumanGateLogin {
+		t.Fatalf("human attention = %+v, want one login gate", attention)
+	}
+	var verdict string
+	if err := jobs.S.DB().QueryRow(`SELECT verdict FROM profile_evidence LIMIT 1`).Scan(&verdict); err != nil {
+		t.Fatal(err)
+	}
+	if verdict != string(job.ProfileEvidenceSignedOut) {
+		t.Fatalf("provider evidence verdict = %q, want signed_out", verdict)
+	}
+}
+
+func TestBridgeEvidenceLostResponseIsIdempotent(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+	}
+	b.cfg = cfg
+	b.now = func() time.Time { return time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC) }
+	runSync(t, b, hello())
+	frame := &protocol.SessionEvidencePayload{
+		Evidence: "warm_verified", OriginHint: "https://alpha.example.edu",
+		At: "2026-08-12T09:59:00Z",
+	}
+	if err := b.sessionEvidence(context.Background(), frame, "lost-response-msg"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.sessionEvidence(context.Background(), frame, "lost-response-msg"); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM profile_evidence`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("idempotent evidence rows = %d, want 1", count)
+	}
+}
+
+func TestBridgeEvidenceIsFencedToHolderGenerationAcrossTakeover(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+	}
+	b.cfg = cfg
+	now := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	b.now = func() time.Time { return now }
+	runSyncAs(t, b, "holder-a", hello())
+	runSyncAs(t, b, "holder-a", inFrame(t, protocol.MsgSessionEvidence, "", map[string]any{
+		"evidence": "warm_verified", "origin_hint": "https://alpha.example.edu",
+		"at": "2026-08-12T09:59:00Z",
+	}))
+	var firstGeneration int64
+	if err := jobs.S.DB().QueryRow(`SELECT browser_holder_generation FROM profile_evidence LIMIT 1`).Scan(&firstGeneration); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(sessionStaleAfter + time.Second)
+	runSyncAs(t, b, "holder-b", hello())
+	if b.epoch == uint64(firstGeneration) {
+		t.Fatalf("holder takeover did not advance generation: %d", firstGeneration)
+	}
+	current, found, err := jobs.CurrentProfileEvidence(context.Background(), mustProfileID(t, jobs, "alpha"), 1, int64(b.epoch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found || current.ObservationID != "" {
+		t.Fatalf("stale holder evidence crossed generation: %+v found=%v", current, found)
+	}
+}
+
+func mustProfileID(t *testing.T, jobs *job.Store, name string) string {
+	t.Helper()
+	profile, err := jobs.InstitutionProfileByConfiguredName(context.Background(), name)
+	if err != nil || profile == nil {
+		t.Fatalf("profile %q = %+v, %v", name, profile, err)
+	}
+	return profile.ID
+}
+
+func TestBridgeRestartRetainsEvidenceAndTypedAttention(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+	}
+	b.cfg = cfg
+	b.now = func() time.Time { return time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC) }
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "bridge-restart-evidence", handoffWork(), "alpha")
+	if err := b.outcome(context.Background(), jobID, "restart-gate", &protocol.ProviderOutcomePayload{Outcome: "human_auth_required"}); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+	attention, err := jobs.CurrentHumanAttention(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attention.Count != 1 || len(attention.Gates) != 1 {
+		t.Fatalf("attention after bridge restart = %+v, want one durable gate", attention)
+	}
+	var evidenceCount int
+	if err := jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM profile_evidence`).Scan(&evidenceCount); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceCount != 1 {
+		t.Fatalf("evidence after bridge restart = %d, want 1", evidenceCount)
+	}
+	if restarted == nil {
+		t.Fatal("bridge restart returned nil bridge")
+	}
+	runSync(t, restarted, hello())
+	if err := restarted.recordAuth(context.Background(), &protocol.BrowserMessage{
+		Type: protocol.MsgAuthReturned, MsgID: "restart-auth-return", JobID: jobID,
+		Payload: &protocol.AuthPayload{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	attention, err = jobs.CurrentHumanAttention(context.Background())
+	if err != nil || attention.Count != 0 {
+		t.Fatalf("attention after restarted auth return = %+v, err=%v", attention, err)
+	}
+}
+
+func TestBridgeWarmEvidenceIsExactProfileDespiteSharedAuthClaim(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl", ShibbolethEntityID: "shared-entity"},
+		"beta":  {OpenURLBase: "https://beta.example.edu/openurl", ShibbolethEntityID: "shared-entity"},
+	}
+	b.cfg = cfg
+	b.now = func() time.Time { return time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC) }
+	runSync(t, b, hello())
+	runSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "", map[string]any{
+		"evidence": "warm_verified", "origin_hint": "https://alpha.example.edu",
+		"at": "2026-08-12T09:59:00Z",
+	}))
+	alpha := mustProfile(t, jobs, "alpha")
+	beta := mustProfile(t, jobs, "beta")
+	if alpha.AuthenticationClaimID != beta.AuthenticationClaimID {
+		t.Fatalf("test setup claims differ: %q vs %q", alpha.AuthenticationClaimID, beta.AuthenticationClaimID)
+	}
+	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), alpha.ID, alpha.Revision, int64(b.epoch)); err != nil || !ok {
+		t.Fatalf("alpha warm evidence missing: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), beta.ID, beta.Revision, int64(b.epoch)); err != nil || ok {
+		t.Fatalf("beta inherited alpha warm evidence: ok=%v err=%v", ok, err)
+	}
+}
+
+func mustProfile(t *testing.T, jobs *job.Store, name string) *job.InstitutionProfile {
+	t.Helper()
+	profile, err := jobs.InstitutionProfileByConfiguredName(context.Background(), name)
+	if err != nil || profile == nil {
+		t.Fatalf("profile %q = %+v, %v", name, profile, err)
+	}
+	return profile
+}
+
+func TestBridgeNoAutomaticFirstRouteWithoutExplicitFocus(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+	}
+	b.cfg = cfg
+	runSync(t, b, hello())
+	_ = parkInstitutional(t, jobs, "bridge-no-auto-first-route", handoffWork(), "alpha")
+	runSync(t, b)
+	var candidates, claims int
+	if err := jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM browser_candidates`).Scan(&candidates); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM materialization_claims`).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if candidates != 0 || claims != 0 {
+		t.Fatalf("automatic first route created candidates=%d claims=%d without focus", candidates, claims)
 	}
 }

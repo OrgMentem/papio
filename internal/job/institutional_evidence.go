@@ -5,9 +5,12 @@ package job
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 
 	"papio/internal/store"
 )
@@ -77,6 +80,19 @@ type ProfileEvidenceObservation struct {
 	ExpiresAt                  string                 `json:"expires_at,omitempty"`
 }
 
+const ProfileEvidenceTTL = 30 * time.Minute
+
+func parseEvidenceTime(value, field string) (time.Time, error) {
+	if strings.TrimSpace(value) == "" {
+		return time.Time{}, fmt.Errorf("profile evidence %s is required", field)
+	}
+	t, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("profile evidence %s: %w", field, err)
+	}
+	return t.UTC(), nil
+}
+
 func (o ProfileEvidenceObservation) validate() error {
 	if strings.TrimSpace(o.ObservationID) == "" || len(o.ObservationID) > 128 {
 		return errors.New("profile evidence requires a bounded observation id")
@@ -98,7 +114,8 @@ func (o ProfileEvidenceObservation) validate() error {
 
 // RecordProfileEvidence durably records one observation. Lost responses are
 // safe: the observation id is the idempotency key and a duplicate leaves the
-// already committed row unchanged.
+// already committed row unchanged. Validity is computed from daemon receipt,
+// never from producer time or a caller-provided expiry.
 func (js *Store) RecordProfileEvidence(ctx context.Context, observation ProfileEvidenceObservation) error {
 	if err := observation.validate(); err != nil {
 		return err
@@ -106,26 +123,57 @@ func (js *Store) RecordProfileEvidence(ctx context.Context, observation ProfileE
 	if observation.ProducerObservedAt == "" {
 		observation.ProducerObservedAt = store.Now()
 	}
-	if observation.DaemonReceivedAt == "" {
-		observation.DaemonReceivedAt = store.Now()
+	// Receipt authority belongs to this daemon process. Caller timestamps are
+	// producer metadata only and cannot extend evidence validity.
+	received := time.Now().UTC()
+	produced, err := parseEvidenceTime(observation.ProducerObservedAt, "producer_observed_at")
+	if err != nil {
+		return err
 	}
+	observation.DaemonReceivedAt = received.Format(time.RFC3339Nano)
+	observation.ProducerObservedAt = produced.Format(time.RFC3339Nano)
+	observation.ExpiresAt = received.Add(ProfileEvidenceTTL).Format(time.RFC3339Nano)
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	_, err = tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO profile_evidence
 		 (observation_id, browser_holder_generation, institution_profile_id,
 		  institution_profile_revision, verdict, source, producer_observed_at,
 		  daemon_received_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		observation.ObservationID, observation.BrowserHolderGeneration,
 		observation.InstitutionProfileID, observation.InstitutionProfileRevision,
 		string(observation.Verdict), string(observation.Source), observation.ProducerObservedAt,
 		observation.DaemonReceivedAt, observation.ExpiresAt)
 	if err != nil {
 		return err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if inserted == 0 {
+		var existing ProfileEvidenceObservation
+		if err := tx.QueryRowContext(ctx, `
+			SELECT observation_id, browser_holder_generation, institution_profile_id,
+			       institution_profile_revision, verdict, source, producer_observed_at,
+			       daemon_received_at, expires_at
+			FROM profile_evidence WHERE observation_id=?`, observation.ObservationID).
+			Scan(&existing.ObservationID, &existing.BrowserHolderGeneration,
+				&existing.InstitutionProfileID, &existing.InstitutionProfileRevision,
+				&existing.Verdict, &existing.Source, &existing.ProducerObservedAt,
+				&existing.DaemonReceivedAt, &existing.ExpiresAt); err != nil {
+			return err
+		}
+		if existing.BrowserHolderGeneration != observation.BrowserHolderGeneration ||
+			existing.InstitutionProfileID != observation.InstitutionProfileID ||
+			existing.InstitutionProfileRevision != observation.InstitutionProfileRevision ||
+			existing.Verdict != observation.Verdict || existing.Source != observation.Source {
+			return ErrConflict
+		}
 	}
 	return tx.Commit()
 }
@@ -144,26 +192,26 @@ func (js *Store) CurrentProfileEvidence(ctx context.Context, profileID string, p
 			&o.InstitutionProfileRevision, &o.Verdict, &o.Source, &o.ProducerObservedAt,
 			&o.DaemonReceivedAt, &o.ExpiresAt)
 	}
-	args := []any{profileID, profileRevision, holderGeneration, store.Now()}
+	cutoff := time.Now().UTC().Add(-ProfileEvidenceTTL).Format(time.RFC3339Nano)
+	args := []any{profileID, profileRevision, holderGeneration, cutoff}
 	err := scan(js.S.DB().QueryRowContext(ctx, `
 		SELECT observation_id, browser_holder_generation, institution_profile_id,
 		       institution_profile_revision, verdict, source, producer_observed_at,
-		       daemon_received_at, COALESCE(expires_at, '')
+		       daemon_received_at, expires_at
 		FROM profile_evidence
 		WHERE institution_profile_id = ? AND institution_profile_revision = ?
-		  AND browser_holder_generation = ?
-		  AND (expires_at IS NULL OR expires_at = '' OR expires_at > ?)
+		  AND browser_holder_generation = ? AND daemon_received_at > ?
 		  AND verdict NOT IN ('unknown', 'inconclusive')
-		ORDER BY daemon_received_at DESC, observation_id DESC LIMIT 1`, args...))
+		ORDER BY CASE WHEN verdict IN ('auth_returned','signed_out') THEN 1 ELSE 0 END DESC,
+		         daemon_received_at DESC, observation_id DESC LIMIT 1`, args...))
 	if errors.Is(err, sql.ErrNoRows) {
 		err = scan(js.S.DB().QueryRowContext(ctx, `
 			SELECT observation_id, browser_holder_generation, institution_profile_id,
 			       institution_profile_revision, verdict, source, producer_observed_at,
-			       daemon_received_at, COALESCE(expires_at, '')
+			       daemon_received_at, expires_at
 			FROM profile_evidence
 			WHERE institution_profile_id = ? AND institution_profile_revision = ?
-			  AND browser_holder_generation = ?
-			  AND (expires_at IS NULL OR expires_at = '' OR expires_at > ?)
+			  AND browser_holder_generation = ? AND daemon_received_at > ?
 			ORDER BY daemon_received_at DESC, observation_id DESC LIMIT 1`, args...))
 	}
 	if errors.Is(err, sql.ErrNoRows) {
@@ -238,32 +286,183 @@ func validHumanGateScopeClass(s string) bool {
 }
 
 // HumanGateObservation is the current typed attention projection for a scope.
+// DependentJobIDs and ClaimMemberJobIDs are sets: callers may report the same
+// sibling repeatedly and the current projection remains idempotent. They are
+// persisted inside detail_json so this Phase 1 schema remains URL-free.
 type HumanGateObservation struct {
-	ID                   string          `json:"id"`
-	GateType             HumanGateType   `json:"gate_type"`
-	ScopeClass           string          `json:"scope_class"`
-	ScopeKey             string          `json:"scope_key"`
-	InstitutionProfileID string          `json:"institution_profile_id,omitempty"`
-	BindingID            string          `json:"binding_id,omitempty"`
-	ObservationRevision  int64           `json:"observation_revision"`
-	Status               HumanGateStatus `json:"status"`
-	DetailJSON           string          `json:"detail_json"`
-	CreatedAt            string          `json:"created_at"`
-	UpdatedAt            string          `json:"updated_at"`
+	ID                    string          `json:"id"`
+	GateType              HumanGateType   `json:"gate_type"`
+	ScopeClass            string          `json:"scope_class"`
+	ScopeKey              string          `json:"scope_key"`
+	InstitutionProfileID  string          `json:"institution_profile_id,omitempty"`
+	BindingID             string          `json:"binding_id,omitempty"`
+	AuthenticationClaimID string          `json:"authentication_claim_id,omitempty"`
+	DependentJobIDs       []string        `json:"dependent_job_ids,omitempty"`
+	ClaimMemberJobIDs     []string        `json:"claim_member_job_ids,omitempty"`
+	ObservationRevision   int64           `json:"observation_revision"`
+	Status                HumanGateStatus `json:"status"`
+	DetailJSON            string          `json:"detail_json"`
+	CreatedAt             string          `json:"created_at"`
+	UpdatedAt             string          `json:"updated_at"`
+}
+
+type humanGatePersistedDetail struct {
+	DetailJSON            string   `json:"detail_json"`
+	AuthenticationClaimID string   `json:"authentication_claim_id,omitempty"`
+	DependentJobIDs       []string `json:"dependent_job_ids,omitempty"`
+	ClaimMemberJobIDs     []string `json:"claim_member_job_ids,omitempty"`
+}
+
+func normalizeHumanGateIDs(ids []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || len(id) > 128 {
+			return nil, errors.New("human gate dependent job ids must be bounded and non-empty")
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (o HumanGateObservation) persistedDetail() (string, error) {
+	if o.DetailJSON == "" {
+		o.DetailJSON = "{}"
+	}
+	jobs, err := normalizeHumanGateIDs(o.DependentJobIDs)
+	if err != nil {
+		return "", err
+	}
+	claimJobs, err := normalizeHumanGateIDs(o.ClaimMemberJobIDs)
+	if err != nil {
+		return "", err
+	}
+	if o.AuthenticationClaimID != "" && len(o.AuthenticationClaimID) > 256 {
+		return "", errors.New("human gate authentication claim id is too long")
+	}
+	if len(jobs) == 0 && len(claimJobs) == 0 && o.AuthenticationClaimID == "" {
+		return o.DetailJSON, nil
+	}
+	raw, err := json.Marshal(humanGatePersistedDetail{
+		DetailJSON: o.DetailJSON, AuthenticationClaimID: o.AuthenticationClaimID,
+		DependentJobIDs: jobs, ClaimMemberJobIDs: claimJobs,
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func decodeHumanGateDetail(raw string, o *HumanGateObservation) error {
+	var detail humanGatePersistedDetail
+	if err := json.Unmarshal([]byte(raw), &detail); err != nil || detail.DetailJSON == "" {
+		o.DetailJSON = raw
+		return nil
+	}
+	o.DetailJSON = detail.DetailJSON
+	o.AuthenticationClaimID = detail.AuthenticationClaimID
+	o.DependentJobIDs = append([]string(nil), detail.DependentJobIDs...)
+	o.ClaimMemberJobIDs = append([]string(nil), detail.ClaimMemberJobIDs...)
+	return nil
 }
 
 func (o HumanGateObservation) validate() error {
 	if o.ID == "" || len(o.ID) > 128 || o.ScopeClass == "" || len(o.ScopeClass) > 128 || o.ScopeKey == "" || len(o.ScopeKey) > 256 {
 		return errors.New("human gate requires bounded id and scope")
 	}
+	normalizedDetail := strings.ReplaceAll(o.DetailJSON, `\/`, "/")
+	lowerDetail := strings.ToLower(normalizedDetail)
+	if strings.Contains(o.ScopeKey, "://") || strings.Contains(normalizedDetail, "://") ||
+		strings.Contains(lowerDetail, `"password"`) || strings.Contains(lowerDetail, `"credential"`) ||
+		strings.Contains(lowerDetail, `"cookie"`) || strings.Contains(lowerDetail, `"token"`) {
+		return errors.New("human gate observations cannot persist URLs or credentials")
+	}
 	if !validHumanGateScopeClass(o.ScopeClass) || !o.GateType.valid() || !o.Status.valid() || o.ObservationRevision < 1 {
 		return errors.New("invalid human gate scope, type, status, or revision")
+	}
+	switch o.GateType {
+	case HumanGateBrowserHostPermission:
+		if o.ScopeClass != string(HumanGateScopeBrowserHost) {
+			return errors.New("browser-host permission gate requires browser_host scope")
+		}
+	case HumanGateDownloadsFolderPermission:
+		if o.ScopeClass != string(HumanGateScopePlatform) {
+			return errors.New("downloads-folder permission gate requires platform scope")
+		}
+	}
+	if _, err := normalizeHumanGateIDs(o.DependentJobIDs); err != nil {
+		return err
+	}
+	if _, err := normalizeHumanGateIDs(o.ClaimMemberJobIDs); err != nil {
+		return err
+	}
+	if o.AuthenticationClaimID != "" && len(o.AuthenticationClaimID) > 256 {
+		return errors.New("human gate authentication claim id is too long")
 	}
 	return nil
 }
 
+func deriveHumanGateJobIDs(ctx context.Context, tx *sql.Tx, observation HumanGateObservation) ([]string, error) {
+	var query string
+	var arg string
+	switch HumanGateScopeClass(observation.ScopeClass) {
+	case HumanGateScopeAuthenticationClaim:
+		query = `SELECT DISTINCT bc.job_id
+			FROM browser_candidates bc
+			JOIN institution_profiles p ON p.id = bc.institution_profile_id
+			JOIN jobs j ON j.id = bc.job_id
+			WHERE p.authentication_claim_id = ? AND p.tombstoned_at IS NULL
+			  AND p.revision = bc.institution_profile_revision
+			  AND bc.job_attempt_revision = (SELECT MAX(current_bc.job_attempt_revision) FROM browser_candidates current_bc WHERE current_bc.job_id=bc.job_id)
+			  AND j.state NOT IN ('ready','imported','unavailable','failed','cancelled')
+			  AND bc.status IN ('eligible','claimed','materializing')`
+		arg = observation.AuthenticationClaimID
+	case HumanGateScopeInstitutionProfile:
+		query = `SELECT DISTINCT bc.job_id
+			FROM browser_candidates bc
+			JOIN institution_profiles p ON p.id = bc.institution_profile_id
+			JOIN jobs j ON j.id = bc.job_id
+			WHERE bc.institution_profile_id = ? AND p.tombstoned_at IS NULL
+			  AND p.revision = bc.institution_profile_revision
+			  AND bc.job_attempt_revision = (SELECT MAX(current_bc.job_attempt_revision) FROM browser_candidates current_bc WHERE current_bc.job_id=bc.job_id)
+			  AND j.state NOT IN ('ready','imported','unavailable','failed','cancelled')
+			  AND bc.status IN ('eligible','claimed','materializing')`
+		arg = observation.InstitutionProfileID
+	case HumanGateScopeBinding:
+		query = `SELECT DISTINCT bc.job_id
+			FROM materialization_claims mc
+			JOIN browser_candidates bc ON bc.id = mc.candidate_id
+			WHERE mc.binding_id = ?`
+		arg = observation.ScopeKey
+	default:
+		return nil, nil
+	}
+	rows, err := tx.QueryContext(ctx, query, arg)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // UpsertHumanGateObservation atomically advances one current scope projection.
-// A stale revision and a lost-response duplicate are both no-ops.
+// A stale revision and a lost-response duplicate are both no-ops. Newer
+// observations union dependent siblings and claim members with the current row,
+// so one live surface survives reports arriving from many jobs.
 func (js *Store) UpsertHumanGateObservation(ctx context.Context, observation HumanGateObservation) error {
 	if err := observation.validate(); err != nil {
 		return err
@@ -280,6 +479,60 @@ func (js *Store) UpsertHumanGateObservation(ctx context.Context, observation Hum
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	derived, err := deriveHumanGateJobIDs(ctx, tx, observation)
+	if err != nil {
+		return err
+	}
+	observation.DependentJobIDs = append(observation.DependentJobIDs, derived...)
+	if observation.ScopeClass == string(HumanGateScopeAuthenticationClaim) {
+		observation.ClaimMemberJobIDs = append(observation.ClaimMemberJobIDs, derived...)
+	}
+	var idGateType, idScopeClass, idScopeKey, idStatus string
+	var idRevision int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT gate_type, scope_class, scope_key, status, observation_revision
+		FROM human_gate_observations WHERE id = ?`, observation.ID).
+		Scan(&idGateType, &idScopeClass, &idScopeKey, &idStatus, &idRevision)
+	if err == nil {
+		if idGateType != string(observation.GateType) || idScopeClass != observation.ScopeClass ||
+			idScopeKey != observation.ScopeKey || idStatus != string(observation.Status) ||
+			idRevision != observation.ObservationRevision {
+			return ErrConflict
+		}
+		return tx.Commit()
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	var currentRevision int64
+	var currentDetail string
+	var currentCreatedAt string
+	err = tx.QueryRowContext(ctx, `
+		SELECT observation_revision, detail_json, created_at
+		FROM human_gate_observations
+		WHERE gate_type = ? AND scope_class = ? AND scope_key = ?`,
+		string(observation.GateType), observation.ScopeClass, observation.ScopeKey).
+		Scan(&currentRevision, &currentDetail, &currentCreatedAt)
+	if err == nil {
+		if observation.ObservationRevision <= currentRevision {
+			return tx.Commit()
+		}
+		var current HumanGateObservation
+		_ = decodeHumanGateDetail(currentDetail, &current)
+		observation.DependentJobIDs = append(observation.DependentJobIDs, current.DependentJobIDs...)
+		observation.ClaimMemberJobIDs = append(observation.ClaimMemberJobIDs, current.ClaimMemberJobIDs...)
+		if observation.AuthenticationClaimID == "" {
+			observation.AuthenticationClaimID = current.AuthenticationClaimID
+		}
+		observation.CreatedAt = currentCreatedAt
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	persisted, err := observation.persistedDetail()
+	if err != nil {
+		return err
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO human_gate_observations
 		 (id, gate_type, scope_class, scope_key, institution_profile_id, binding_id,
@@ -294,18 +547,15 @@ func (js *Store) UpsertHumanGateObservation(ctx context.Context, observation Hum
 		WHERE excluded.observation_revision > human_gate_observations.observation_revision`,
 		observation.ID, string(observation.GateType), observation.ScopeClass, observation.ScopeKey,
 		observation.InstitutionProfileID, observation.BindingID, observation.ObservationRevision,
-		string(observation.Status), observation.DetailJSON, observation.CreatedAt, observation.UpdatedAt)
+		string(observation.Status), persisted, observation.CreatedAt, observation.UpdatedAt)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// CurrentHumanGateObservations returns the current projection for one exact
-// gate scope. Scope class and key are explicit to avoid an unscoped attention
-// read being mistaken for an authorization decision.
 func (js *Store) CurrentHumanGateObservations(ctx context.Context, scopeClass, scopeKey string) ([]HumanGateObservation, error) {
-	if scopeClass == "" || scopeKey == "" {
+	if !validHumanGateScopeClass(scopeClass) || scopeKey == "" {
 		return nil, errors.New("gate scope class and key must be supplied")
 	}
 	q := `SELECT id, gate_type, scope_class, scope_key, COALESCE(institution_profile_id,''), COALESCE(binding_id,''), observation_revision, status, detail_json, created_at, updated_at FROM human_gate_observations WHERE scope_class = ? AND scope_key = ? ORDER BY gate_type`
@@ -317,7 +567,11 @@ func (js *Store) CurrentHumanGateObservations(ctx context.Context, scopeClass, s
 	var out []HumanGateObservation
 	for rows.Next() {
 		var o HumanGateObservation
-		if err := rows.Scan(&o.ID, &o.GateType, &o.ScopeClass, &o.ScopeKey, &o.InstitutionProfileID, &o.BindingID, &o.ObservationRevision, &o.Status, &o.DetailJSON, &o.CreatedAt, &o.UpdatedAt); err != nil {
+		var detail string
+		if err := rows.Scan(&o.ID, &o.GateType, &o.ScopeClass, &o.ScopeKey, &o.InstitutionProfileID, &o.BindingID, &o.ObservationRevision, &o.Status, &detail, &o.CreatedAt, &o.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if err := decodeHumanGateDetail(detail, &o); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -557,4 +811,333 @@ func (js *Store) ArtifactWinner(ctx context.Context, jobID string, jobAttemptRev
 		return ArtifactWinner{}, false, err
 	}
 	return w, true, nil
+}
+
+// AuthenticationEntryLeaseState describes durable ownership of one
+// authentication claim. A human lease is intentionally distinct from a
+// profile's evidence: sharing a claim never shares profile warm facts.
+type AuthenticationEntryLeaseState string
+
+const (
+	AuthenticationEntryLeaseReserved AuthenticationEntryLeaseState = "reserved"
+	AuthenticationEntryLeaseHuman    AuthenticationEntryLeaseState = "human"
+	AuthenticationEntryLeaseExpired  AuthenticationEntryLeaseState = "expired"
+)
+
+var (
+	ErrAuthenticationEntryLeaseBusy   = errors.New("authentication entry lease busy")
+	ErrAuthenticationEntryLeaseStale  = errors.New("authentication entry lease stale")
+	ErrAuthenticationEntryLeaseDenied = errors.New("authentication entry lease evidence required")
+)
+
+type AuthenticationEntryLeaseInput struct {
+	AuthenticationClaimID   string
+	LeaseID                 string
+	OwnerID                 string
+	BrowserHolderGeneration int64
+	LeaseUntil              time.Time
+}
+
+type AuthenticationEntryLease struct {
+	AuthenticationClaimID   string                        `json:"authentication_claim_id"`
+	LeaseID                 string                        `json:"lease_id"`
+	OwnerID                 string                        `json:"owner_id"`
+	BrowserHolderGeneration int64                         `json:"browser_holder_generation"`
+	State                   AuthenticationEntryLeaseState `json:"state"`
+	LeaseUntil              string                        `json:"lease_until,omitempty"`
+	HumanOwnerID            string                        `json:"human_owner_id,omitempty"`
+	EvidenceObservationID   string                        `json:"evidence_observation_id,omitempty"`
+	CreatedAt               string                        `json:"created_at"`
+	UpdatedAt               string                        `json:"updated_at"`
+}
+
+func (in AuthenticationEntryLeaseInput) validate() error {
+	if strings.TrimSpace(in.AuthenticationClaimID) == "" || len(in.AuthenticationClaimID) > 256 ||
+		strings.TrimSpace(in.LeaseID) == "" || len(in.LeaseID) > 128 ||
+		strings.TrimSpace(in.OwnerID) == "" || len(in.OwnerID) > 256 ||
+		in.BrowserHolderGeneration < 0 || in.LeaseUntil.IsZero() {
+		return errors.New("invalid authentication entry lease input")
+	}
+	return nil
+}
+
+func (l AuthenticationEntryLease) valid() bool {
+	return l.AuthenticationClaimID != "" && l.LeaseID != "" && l.OwnerID != "" &&
+		l.BrowserHolderGeneration >= 0 &&
+		(l.State == AuthenticationEntryLeaseReserved || l.State == AuthenticationEntryLeaseHuman ||
+			l.State == AuthenticationEntryLeaseExpired)
+}
+
+func scanAuthenticationEntryLease(row *sql.Row) (AuthenticationEntryLease, error) {
+	var l AuthenticationEntryLease
+	err := row.Scan(&l.AuthenticationClaimID, &l.LeaseID, &l.OwnerID,
+		&l.BrowserHolderGeneration, &l.State, &l.LeaseUntil, &l.HumanOwnerID,
+		&l.EvidenceObservationID, &l.CreatedAt, &l.UpdatedAt)
+	return l, err
+}
+
+// ReserveAuthenticationEntryLease claims one authentication entry for an
+// owner. A replay of the same reservation is idempotent; a different live
+// reservation receives Busy. A new observed authentication-entry attempt
+// supersedes prior human ownership, while expired reservations are replaced
+// atomically, including after a daemon restart.
+func (js *Store) ReserveAuthenticationEntryLease(ctx context.Context, in AuthenticationEntryLeaseInput) (*AuthenticationEntryLease, error) {
+	if err := in.validate(); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	nowText := now.Format(time.RFC3339Nano)
+	untilText := in.LeaseUntil.UTC().Format(time.RFC3339Nano)
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var current AuthenticationEntryLease
+	err = tx.QueryRowContext(ctx, `
+		SELECT authentication_claim_id, lease_id, owner_id, browser_holder_generation,
+		       state, COALESCE(lease_until,''), COALESCE(human_owner_id,''),
+		       COALESCE(evidence_observation_id,''), created_at, updated_at
+		FROM authentication_entry_leases WHERE authentication_claim_id = ?`,
+		in.AuthenticationClaimID).Scan(&current.AuthenticationClaimID, &current.LeaseID,
+		&current.OwnerID, &current.BrowserHolderGeneration, &current.State, &current.LeaseUntil,
+		&current.HumanOwnerID, &current.EvidenceObservationID, &current.CreatedAt, &current.UpdatedAt)
+	if err == nil {
+		var ownerState string
+		ownerErr := tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id=?`, current.OwnerID).Scan(&ownerState)
+		if ownerErr != nil && !errors.Is(ownerErr, sql.ErrNoRows) {
+			return nil, ownerErr
+		}
+		ownerTerminal := ownerErr == nil && Terminal(ownerState)
+		humanRevoked := current.State == AuthenticationEntryLeaseHuman &&
+			(current.BrowserHolderGeneration != in.BrowserHolderGeneration || ownerTerminal)
+		if current.State == AuthenticationEntryLeaseHuman && !humanRevoked {
+			var verdict ProfileEvidenceVerdict
+			evidenceErr := tx.QueryRowContext(ctx, `
+				SELECT pe.verdict
+				FROM profile_evidence pe
+				JOIN institution_profiles p ON p.id=pe.institution_profile_id
+				  AND p.revision=pe.institution_profile_revision
+				WHERE p.authentication_claim_id=? AND p.tombstoned_at IS NULL
+				  AND pe.browser_holder_generation=? AND pe.daemon_received_at>?
+				  AND pe.verdict NOT IN ('unknown','inconclusive')
+				ORDER BY CASE WHEN pe.verdict IN ('auth_returned','signed_out') THEN 1 ELSE 0 END DESC,
+				         pe.daemon_received_at DESC, pe.observation_id DESC LIMIT 1`,
+				in.AuthenticationClaimID, in.BrowserHolderGeneration,
+				now.Add(-ProfileEvidenceTTL).Format(time.RFC3339Nano),
+			).Scan(&verdict)
+			switch {
+			case errors.Is(evidenceErr, sql.ErrNoRows):
+				humanRevoked = true
+			case evidenceErr != nil:
+				return nil, evidenceErr
+			default:
+				humanRevoked = verdict == ProfileEvidenceSignedOut
+			}
+		}
+		expired := current.State == AuthenticationEntryLeaseExpired || humanRevoked ||
+			(current.State == AuthenticationEntryLeaseReserved &&
+				(ownerTerminal || current.LeaseUntil != "" && current.LeaseUntil <= nowText))
+		if !expired {
+			if current.State == AuthenticationEntryLeaseReserved &&
+				current.LeaseID == in.LeaseID && current.OwnerID == in.OwnerID &&
+				current.BrowserHolderGeneration == in.BrowserHolderGeneration {
+				if _, err := tx.ExecContext(ctx, `UPDATE authentication_entry_leases SET lease_until=?, updated_at=? WHERE authentication_claim_id=?`, untilText, nowText, in.AuthenticationClaimID); err != nil {
+					return nil, err
+				}
+				current.LeaseUntil, current.UpdatedAt = untilText, nowText
+				if err := tx.Commit(); err != nil {
+					return nil, err
+				}
+				return &current, nil
+			}
+			return nil, ErrAuthenticationEntryLeaseBusy
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE authentication_entry_leases
+			   SET lease_id=?, owner_id=?, browser_holder_generation=?, state='reserved',
+			       lease_until=?, human_owner_id=NULL, evidence_observation_id=NULL,
+			       updated_at=?
+			 WHERE authentication_claim_id=?`,
+			in.LeaseID, in.OwnerID, in.BrowserHolderGeneration, untilText, nowText,
+			in.AuthenticationClaimID); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO authentication_entry_leases
+			  (authentication_claim_id, lease_id, owner_id, browser_holder_generation,
+			   state, lease_until, created_at, updated_at)
+			VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?)`,
+			in.AuthenticationClaimID, in.LeaseID, in.OwnerID, in.BrowserHolderGeneration,
+			untilText, nowText, nowText); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT authentication_claim_id, lease_id, owner_id, browser_holder_generation,
+		       state, COALESCE(lease_until,''), COALESCE(human_owner_id,''),
+		       COALESCE(evidence_observation_id,''), created_at, updated_at
+		FROM authentication_entry_leases WHERE authentication_claim_id=?`,
+		in.AuthenticationClaimID).Scan(&current.AuthenticationClaimID, &current.LeaseID,
+		&current.OwnerID, &current.BrowserHolderGeneration, &current.State, &current.LeaseUntil,
+		&current.HumanOwnerID, &current.EvidenceObservationID, &current.CreatedAt, &current.UpdatedAt); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &current, nil
+}
+
+// GetAuthenticationEntryLease reads the durable current lease and marks an
+// expired reservation before returning it. Human ownership is not erased by
+// an expired reservation and requires an explicit stale/fence transition.
+func (js *Store) GetAuthenticationEntryLease(ctx context.Context, authenticationClaimID string) (*AuthenticationEntryLease, bool, error) {
+	if strings.TrimSpace(authenticationClaimID) == "" {
+		return nil, false, errors.New("authentication claim is required")
+	}
+	var l AuthenticationEntryLease
+	err := js.S.DB().QueryRowContext(ctx, `
+		SELECT authentication_claim_id, lease_id, owner_id, browser_holder_generation,
+		       state, COALESCE(lease_until,''), COALESCE(human_owner_id,''),
+		       COALESCE(evidence_observation_id,''), created_at, updated_at
+		FROM authentication_entry_leases WHERE authentication_claim_id=?`,
+		authenticationClaimID).Scan(&l.AuthenticationClaimID, &l.LeaseID, &l.OwnerID,
+		&l.BrowserHolderGeneration, &l.State, &l.LeaseUntil, &l.HumanOwnerID,
+		&l.EvidenceObservationID, &l.CreatedAt, &l.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if l.State == AuthenticationEntryLeaseReserved && l.LeaseUntil != "" && l.LeaseUntil <= store.Now() {
+		if err := js.ExpireAuthenticationEntryLease(ctx, l.AuthenticationClaimID, l.BrowserHolderGeneration, l.LeaseID); err != nil && !errors.Is(err, ErrAuthenticationEntryLeaseStale) {
+			return nil, false, err
+		}
+		// The fenced expiry may have raced a replacement reservation. Re-read
+		// authority instead of returning a locally fabricated expired state.
+		return js.GetAuthenticationEntryLease(ctx, authenticationClaimID)
+	}
+	return &l, true, nil
+}
+
+// ExpireAuthenticationEntryLease releases a reserved lease only when its
+// holder and lease id still match. A human owner is never silently replaced
+// by an expiry callback.
+func (js *Store) ExpireAuthenticationEntryLease(ctx context.Context, authenticationClaimID string, holderGeneration int64, leaseID string) error {
+	if authenticationClaimID == "" || leaseID == "" || holderGeneration < 0 {
+		return errors.New("authentication entry lease expiry requires exact fence")
+	}
+	res, err := js.S.DB().ExecContext(ctx, `
+		UPDATE authentication_entry_leases
+		   SET state='expired', lease_until=NULL, updated_at=?
+		 WHERE authentication_claim_id=? AND lease_id=? AND browser_holder_generation=?
+		   AND state='reserved'`,
+		store.Now(), authenticationClaimID, leaseID, holderGeneration)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrAuthenticationEntryLeaseStale
+	}
+	return nil
+}
+
+// ConvertAuthenticationEntryLeaseToHuman promotes a reserved authentication
+// lease only after the exact current auth-return observation is durably
+// present and decisive. Signed-out, unknown, and inconclusive observations
+// cannot create a human owner.
+func (js *Store) ConvertAuthenticationEntryLeaseToHuman(ctx context.Context, authenticationClaimID, leaseID, ownerID string, holderGeneration int64, evidence ProfileEvidenceObservation) error {
+	if authenticationClaimID == "" || leaseID == "" || ownerID == "" || holderGeneration < 0 ||
+		evidence.ObservationID == "" || evidence.Verdict != ProfileEvidenceAuthReturned ||
+		evidence.Source != ProfileEvidenceAuthReturn {
+		return errors.New("authentication entry lease conversion requires exact auth-return evidence")
+	}
+	now := store.Now()
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var observed ProfileEvidenceObservation
+	err = tx.QueryRowContext(ctx, `
+		SELECT observation_id, browser_holder_generation, institution_profile_id,
+		       institution_profile_revision, verdict, source, producer_observed_at,
+		       daemon_received_at, expires_at
+		FROM profile_evidence WHERE observation_id=?`,
+		evidence.ObservationID).Scan(&observed.ObservationID, &observed.BrowserHolderGeneration,
+		&observed.InstitutionProfileID, &observed.InstitutionProfileRevision, &observed.Verdict,
+		&observed.Source, &observed.ProducerObservedAt, &observed.DaemonReceivedAt, &observed.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAuthenticationEntryLeaseDenied
+	}
+	if err != nil {
+		return err
+	}
+	if observed.BrowserHolderGeneration != holderGeneration ||
+		observed.Verdict != evidence.Verdict ||
+		observed.Source != evidence.Source ||
+		observed.Verdict != ProfileEvidenceAuthReturned ||
+		observed.Source != ProfileEvidenceAuthReturn ||
+		observed.DaemonReceivedAt <= time.Now().UTC().Add(-ProfileEvidenceTTL).Format(time.RFC3339Nano) {
+		return ErrAuthenticationEntryLeaseDenied
+	}
+	var profileMatchesClaim int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM institution_profiles
+		WHERE id=? AND revision=? AND authentication_claim_id=?
+		  AND (tombstoned_at IS NULL OR tombstoned_at='')`,
+		observed.InstitutionProfileID, observed.InstitutionProfileRevision, authenticationClaimID,
+	).Scan(&profileMatchesClaim); err != nil {
+		return err
+	}
+	if profileMatchesClaim != 1 {
+		return ErrAuthenticationEntryLeaseDenied
+	}
+	var currentObservationID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT observation_id FROM profile_evidence
+		WHERE institution_profile_id=? AND institution_profile_revision=?
+		  AND browser_holder_generation=? AND daemon_received_at>?
+		  AND verdict NOT IN ('unknown','inconclusive')
+		ORDER BY daemon_received_at DESC, observation_id DESC LIMIT 1`,
+		observed.InstitutionProfileID, observed.InstitutionProfileRevision, holderGeneration,
+		time.Now().UTC().Add(-ProfileEvidenceTTL).Format(time.RFC3339Nano),
+	).Scan(&currentObservationID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrAuthenticationEntryLeaseDenied
+		}
+		return err
+	}
+	if currentObservationID != observed.ObservationID {
+		return ErrAuthenticationEntryLeaseDenied
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE authentication_entry_leases
+		   SET state='human', human_owner_id=?, evidence_observation_id=?,
+		       lease_until=NULL, updated_at=?
+		 WHERE authentication_claim_id=? AND lease_id=? AND owner_id=?
+		   AND browser_holder_generation=? AND state='reserved'
+		   AND (lease_until IS NULL OR lease_until > ?)`,
+		ownerID, observed.ObservationID, now, authenticationClaimID, leaseID, ownerID,
+		holderGeneration, now)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrAuthenticationEntryLeaseStale
+	}
+	return tx.Commit()
 }

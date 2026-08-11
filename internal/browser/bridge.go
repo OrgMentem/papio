@@ -1750,7 +1750,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return nil, nil
 
 	case protocol.MsgSessionEvidence:
-		if err := b.sessionEvidence(ctx, msg.Payload.(*protocol.SessionEvidencePayload)); err != nil {
+		if err := b.sessionEvidence(ctx, msg.Payload.(*protocol.SessionEvidencePayload), msg.MsgID); err != nil {
 			log.Printf("papio: recording browser session evidence: %v", err)
 		}
 		return nil, nil
@@ -1764,6 +1764,14 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.download_started",
 			map[string]any{"download_id": p.DownloadID, "filename": p.Filename}); err != nil {
 			log.Printf("papio: recording browser.download_started: %v", err)
+		}
+		if row, err := b.jobs.Get(ctx, msg.JobID); err == nil {
+			if err := b.resolveProfileGatesForJob(ctx,
+				evidenceObservationID("download_started", msg.JobID, strconv.FormatInt(p.DownloadID, 10)),
+				row.Policy.Resolver, msg.JobID, job.HumanGateLogin, job.HumanGateMFA,
+				job.HumanGateCaptchaOrSecurity, job.HumanGateTermsRequired); err != nil {
+				log.Printf("papio: resolving browser gates after download start: %v", err)
+			}
 		}
 		return nil, nil
 
@@ -1812,7 +1820,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return nil, nil
 
 	case protocol.MsgProviderOutcome:
-		if err := b.outcome(ctx, msg.JobID, msg.Payload.(*protocol.ProviderOutcomePayload)); err != nil {
+		if err := b.outcome(ctx, msg.JobID, msg.MsgID, msg.Payload.(*protocol.ProviderOutcomePayload)); err != nil {
 			log.Printf("papio: recording browser provider outcome: %v", err)
 		}
 		return nil, nil
@@ -4077,13 +4085,94 @@ func validExtensionVersion(value string) bool {
 	return true
 }
 
+const profileEvidenceTTL = 30 * time.Minute
+
+// recordProfileEvidence resolves a configured resolver to the daemon-owned
+// opaque profile identity before persisting a browser observation. The
+// observation is fenced to the current browser holder generation and the
+// exact profile revision; receipt time, not producer time, controls expiry.
+func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resolverName string, verdict job.ProfileEvidenceVerdict, source job.ProfileEvidenceSource, producerObservedAt string) error {
+	if b.jobs == nil {
+		return nil
+	}
+	if b.materializationGenerationUnavailable {
+		return errors.New("browser holder generation is unavailable")
+	}
+	profile, err := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverProfileKey(resolverName))
+	if err != nil || profile == nil || profile.TombstonedAt != "" {
+		return err
+	}
+	received := b.now().UTC()
+	if strings.TrimSpace(producerObservedAt) == "" {
+		producerObservedAt = received.Format(time.RFC3339Nano)
+	}
+	idParts := []string{
+		profile.ID, strconv.FormatInt(profile.Revision, 10),
+		strconv.FormatUint(b.epoch, 10), string(verdict), string(source),
+	}
+	if strings.TrimSpace(observationID) == "" {
+		idParts = append(idParts, producerObservedAt)
+	} else {
+		idParts = append(idParts, observationID)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(idParts, "\x00")))
+	observationID = hex.EncodeToString(sum[:])
+	return b.jobs.RecordProfileEvidence(ctx, job.ProfileEvidenceObservation{
+		ObservationID: observationID, BrowserHolderGeneration: int64(b.epoch),
+		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+		Verdict: verdict, Source: source, ProducerObservedAt: producerObservedAt,
+		DaemonReceivedAt: received.Format(time.RFC3339Nano),
+		ExpiresAt:        received.Add(profileEvidenceTTL).Format(time.RFC3339Nano),
+	})
+}
+
+func evidenceVerdict(value string) job.ProfileEvidenceVerdict {
+
+	switch strings.TrimSpace(value) {
+	case "warm_verified", "warm", "fresh_auth":
+		return job.ProfileEvidenceWarmVerified
+	case "auth_returned":
+		return job.ProfileEvidenceAuthReturned
+	case "signed_out", "signed-out", "logged_out":
+		return job.ProfileEvidenceSignedOut
+	case "unknown":
+		return job.ProfileEvidenceUnknown
+	default:
+		return job.ProfileEvidenceInconclusive
+	}
+}
+func (b *Bridge) reserveAuthenticationEntry(ctx context.Context, resolverName, jobID string) error {
+	profile, err := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverProfileKey(resolverName))
+	if err != nil || profile == nil || profile.TombstonedAt != "" || profile.AuthenticationClaimID == "" {
+		return err
+	}
+	leaseID := evidenceObservationID("authentication_entry", profile.AuthenticationClaimID,
+		jobID, strconv.FormatUint(b.epoch, 10))
+	_, err = b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+		AuthenticationClaimID:   profile.AuthenticationClaimID,
+		LeaseID:                 leaseID,
+		OwnerID:                 jobID,
+		BrowserHolderGeneration: int64(b.epoch),
+		LeaseUntil:              b.now().UTC().Add(profileEvidenceTTL),
+	})
+	if errors.Is(err, job.ErrAuthenticationEntryLeaseBusy) {
+		return nil
+	}
+	return err
+}
+
+func evidenceObservationID(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
 // recordAuth appends a timing-only auth event. The AuthPayload structurally
 // cannot carry a URL, host, title, query, or fragment, so an identity-provider
 // address cannot enter the event stream through this path.
-// sessionEvidence records one timing-only institutional-session signal and
-// reuses the auth-return sibling reoffer path. Replays within the throttle
-// window are ignored before touching durable activity or job state.
-func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidencePayload) error {
+// sessionEvidence records the first attributable profile observation within
+// each throttle window, then applies activity/reoffer side effects. Distinct
+// profiles remain independently attributable within one sync.
+func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidencePayload, msgIDs ...string) error {
 	if b.lastSessionEvidenceAt == nil {
 		b.lastSessionEvidenceAt = map[string]time.Time{}
 	}
@@ -4109,6 +4198,17 @@ func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidenc
 			}
 		}
 	}
+	if attributable {
+		msgID := ""
+		if len(msgIDs) > 0 {
+			msgID = msgIDs[0]
+		}
+		obsID := evidenceObservationID("session_evidence", msgID, wantedProfile, p.Evidence, p.At)
+		if err := b.recordProfileEvidence(ctx, obsID, wantedProfile, evidenceVerdict(p.Evidence), job.ProfileEvidenceProbe, p.At); err != nil {
+			return err
+		}
+		b.lastSessionEvidenceAt[wantedProfile] = now
+	}
 	if err := b.jobs.S.AppendEvent(ctx, "", "browser.session_evidence", nil); err != nil {
 		return err
 	}
@@ -4118,7 +4218,6 @@ func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidenc
 	if err := b.reofferInstitutionalSiblingsForEvidence(ctx, p.OriginHint); err != nil {
 		return err
 	}
-	b.lastSessionEvidenceAt[wantedProfile] = now
 	b.reofferRanThisSync[wantedProfile] = true
 	return nil
 }
@@ -4191,7 +4290,80 @@ func (b *Bridge) reofferProfileForSource(ctx context.Context, sourceJobID string
 	return "", false, nil
 }
 
+func (b *Bridge) upsertProfileGate(ctx context.Context, observationKey, resolverName, jobID string, gateType job.HumanGateType, status job.HumanGateStatus, detail string) error {
+	if b.jobs == nil {
+		return nil
+	}
+	profile, err := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverProfileKey(resolverName))
+	if err != nil || profile == nil || profile.TombstonedAt != "" {
+		return err
+	}
+	scopeClass := string(job.HumanGateScopeInstitutionProfile)
+	profileFence := strconv.FormatInt(profile.Revision, 10)
+	scopeKey := profile.ID + "\x00" + profileFence
+	claimID := ""
+	if gateType == job.HumanGateLogin || gateType == job.HumanGateMFA || gateType == job.HumanGateCaptchaOrSecurity {
+		claimID = profile.AuthenticationClaimID
+		if claimID != "" {
+			scopeClass = string(job.HumanGateScopeAuthenticationClaim)
+			// Authentication ownership and its one attention surface are
+			// shared by claim across profile revisions.
+			scopeKey = claimID
+		}
+	}
+	current, err := b.jobs.CurrentHumanGateObservations(ctx, scopeClass, scopeKey)
+	if err != nil {
+		return err
+	}
+	if status == job.HumanGateResolved {
+		for _, currentGate := range current {
+			if currentGate.GateType != gateType || currentGate.Status != job.HumanGateOpen ||
+				!slices.Contains(currentGate.DependentJobIDs, jobID) {
+				continue
+			}
+			currentGate.Status = job.HumanGateResolved
+			if err := b.jobs.ResolveHumanGateObservation(ctx, currentGate); err != nil && !errors.Is(err, job.ErrConflict) {
+				return err
+			}
+			return nil
+		}
+		return nil
+	}
+	id := evidenceObservationID("human_gate", observationKey, string(gateType), scopeClass, scopeKey)
+	for _, row := range current {
+		if row.GateType == gateType && row.ID == id {
+			return nil
+		}
+	}
+	var revision int64 = 1
+	for _, row := range current {
+		if row.GateType == gateType && row.ObservationRevision >= revision {
+			revision = row.ObservationRevision + 1
+		}
+	}
+	if detail == "" {
+		detail = "{}"
+	}
+	return b.jobs.UpsertHumanGateObservation(ctx, job.HumanGateObservation{
+		ID: id, GateType: gateType, ScopeClass: scopeClass, ScopeKey: scopeKey,
+		InstitutionProfileID: profile.ID, AuthenticationClaimID: claimID,
+		DependentJobIDs: []string{jobID}, ClaimMemberJobIDs: []string{jobID},
+		ObservationRevision: revision, Status: status, DetailJSON: detail,
+		CreatedAt: b.now().UTC().Format(time.RFC3339Nano), UpdatedAt: b.now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+func (b *Bridge) resolveProfileGatesForJob(ctx context.Context, observationKey, resolverName, jobID string, gateTypes ...job.HumanGateType) error {
+	for _, gateType := range gateTypes {
+		if err := b.upsertProfileGate(ctx, observationKey, resolverName, jobID,
+			gateType, job.HumanGateResolved, `{"source":"browser_progress"}`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) error {
+
 	kind := "browser.auth_pending"
 	if msg.Type == protocol.MsgAuthReturned {
 		kind = "browser.auth_returned"
@@ -4201,11 +4373,56 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	}
 
 	detail := map[string]any{}
+	elapsed := ""
 	if p := msg.Payload.(*protocol.AuthPayload); p.ElapsedMS != nil {
 		detail["elapsed_ms"] = *p.ElapsedMS
+		elapsed = strconv.FormatInt(*p.ElapsedMS, 10)
 	}
 	if err := b.jobs.S.AppendEvent(ctx, msg.JobID, kind, detail); err != nil {
 		return err
+	}
+	row, err := b.jobs.Get(ctx, msg.JobID)
+	if err != nil {
+		return err
+	}
+	if job.Terminal(row.State) {
+		return nil
+	}
+	resolverName := resolverProfileKey(row.Policy.Resolver)
+	if msg.Type == protocol.MsgAuthReturned {
+		if err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateResolved, `{"source":"auth_returned"}`); err != nil {
+			return err
+		}
+		if profile, profileErr := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverName); profileErr == nil && profile != nil && profile.AuthenticationClaimID != "" {
+			if lease, found, leaseErr := b.jobs.GetAuthenticationEntryLease(ctx, profile.AuthenticationClaimID); leaseErr == nil && found &&
+				lease.State == job.AuthenticationEntryLeaseReserved && lease.OwnerID == msg.JobID &&
+				lease.BrowserHolderGeneration == int64(b.epoch) {
+				if evidence, evidenceFound, evidenceErr := b.jobs.CurrentProfileEvidence(ctx, profile.ID, profile.Revision, int64(b.epoch)); evidenceErr == nil && evidenceFound {
+					if convertErr := b.jobs.ConvertAuthenticationEntryLeaseToHuman(ctx, profile.AuthenticationClaimID, lease.LeaseID, msg.JobID, int64(b.epoch), evidence); convertErr != nil &&
+						!errors.Is(convertErr, job.ErrAuthenticationEntryLeaseDenied) && !errors.Is(convertErr, job.ErrAuthenticationEntryLeaseStale) {
+						return convertErr
+					}
+				}
+			}
+		}
+		if err := b.resolveProfileGatesForJob(ctx,
+			evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID,
+			job.HumanGateMFA, job.HumanGateCaptchaOrSecurity); err != nil {
+			return err
+		}
+	} else {
+		if err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateOpen, `{"source":"auth_pending"}`); err != nil {
+			return err
+		}
+		if err := b.reserveAuthenticationEntry(ctx, resolverName, msg.JobID); err != nil {
+			return err
+		}
 	}
 	if msg.Type != protocol.MsgAuthReturned {
 		return nil
@@ -4355,7 +4572,6 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		}
 		wasOffered := b.offered[candidate.row.ID]
 		if !wasOffered && available <= 0 {
-			break
 		}
 		if err := b.jobs.RecordEvent(ctx, candidate.row.ID, "browser.handoff_reoffered",
 			map[string]any{"reason": "institutional_session_live"}); err != nil {
@@ -4445,7 +4661,7 @@ func (b *Bridge) updateCaptureLease(ctx context.Context, jobID string) error {
 }
 
 // outcome maps a terminal provider observation onto a policy-legal transition.
-func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.ProviderOutcomePayload) (err error) {
+func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.ProviderOutcomePayload) (err error) {
 	defer func() {
 		if b.captureStore == nil {
 			return
@@ -4473,6 +4689,73 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 	}
 	if err := b.jobs.RecordEvent(ctx, jobID, "browser.provider_outcome", detail); err != nil {
 		return err
+	}
+	rowForEvidence, rowErr := b.jobs.Get(ctx, jobID)
+	if rowErr != nil {
+		return rowErr
+	}
+	if job.Terminal(rowForEvidence.State) {
+		return nil
+	}
+	if (p.Outcome == "human_auth_required" || p.Outcome == "terms_acceptance_required") &&
+		!rowForEvidence.Work.HasFetchableIdentifier() {
+		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
+			return err
+		}
+		return b.leaveHandoff(ctx, jobID, job.StateUnavailable, string(job.TerminalReasonNoIdentifier))
+	}
+	verdict := job.ProfileEvidenceInconclusive
+	if p.Outcome == "human_auth_required" {
+		verdict = job.ProfileEvidenceSignedOut
+	}
+	outcomeObservationKey := evidenceObservationID("provider_outcome", msgID, jobID, p.Outcome, p.AdapterID, p.AdapterVersion)
+	progressObservationKey := evidenceObservationID("provider_progress", msgID, jobID, p.Outcome)
+	if err := b.recordProfileEvidence(ctx,
+		outcomeObservationKey,
+		rowForEvidence.Policy.Resolver, verdict, job.ProfileEvidenceProviderOutcome,
+		b.now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	switch p.Outcome {
+	case "human_auth_required":
+		// The explicit login gate remains current.
+	case "terms_acceptance_required":
+		if err := b.resolveProfileGatesForJob(ctx, progressObservationKey,
+			rowForEvidence.Policy.Resolver, jobID, job.HumanGateLogin, job.HumanGateMFA, job.HumanGateCaptchaOrSecurity); err != nil {
+			return err
+		}
+	default:
+		if err := b.resolveProfileGatesForJob(ctx, progressObservationKey,
+			rowForEvidence.Policy.Resolver, jobID, job.HumanGateLogin, job.HumanGateMFA,
+			job.HumanGateCaptchaOrSecurity, job.HumanGateTermsRequired); err != nil {
+			return err
+		}
+	}
+	switch p.Outcome {
+	case "human_auth_required":
+		if err := b.upsertProfileGate(ctx, outcomeObservationKey,
+			rowForEvidence.Policy.Resolver, jobID, job.HumanGateLogin, job.HumanGateOpen, `{"source":"provider_outcome"}`); err != nil {
+			return err
+		}
+		if err := b.reserveAuthenticationEntry(ctx, rowForEvidence.Policy.Resolver, jobID); err != nil {
+			return err
+		}
+	case "terms_acceptance_required":
+		if err := b.upsertProfileGate(ctx, outcomeObservationKey,
+			rowForEvidence.Policy.Resolver, jobID, job.HumanGateTermsRequired, job.HumanGateOpen, `{"source":"provider_outcome"}`); err != nil {
+			return err
+		}
+	case "ui_changed":
+		lower := strings.ToLower(p.Detail)
+		if strings.Contains(lower, "captcha") || strings.Contains(lower, "security") {
+			if err := b.upsertProfileGate(ctx, outcomeObservationKey,
+				rowForEvidence.Policy.Resolver, jobID, job.HumanGateCaptchaOrSecurity, job.HumanGateOpen, `{"source":"provider_outcome"}`); err != nil {
+				return err
+			}
+			if err := b.reserveAuthenticationEntry(ctx, rowForEvidence.Policy.Resolver, jobID); err != nil {
+				return err
+			}
+		}
 	}
 	if err := b.updateCaptureLease(ctx, jobID); err != nil {
 		return err
@@ -4522,13 +4805,12 @@ func (b *Bridge) outcome(ctx context.Context, jobID string, p *protocol.Provider
 		return b.leaveHandoff(ctx, jobID, job.StateUnavailable, p.Outcome)
 
 	case "wrong_work", "ui_changed":
+		requiresAuth := true
 		actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
 		if err != nil {
 			return err
 		}
 		// A missing handoff must not promise access: the user may still need to
-		// sign in, and a false open-access claim sends them to a paywall.
-		requiresAuth := true
 		for _, action := range actions {
 			if action.Kind == handoffActionKind {
 				requiresAuth = action.RequiresAuth
