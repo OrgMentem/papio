@@ -1696,6 +1696,15 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			return b.institutionalRoute(ctx, msg.JobID, msg.Payload.(*protocol.InstitutionalRouteRequestPayload))
 		case protocol.MsgInstitutionalNavigatedRequest:
 			return b.institutionalNavigated(ctx, msg.JobID, msg.Payload.(*protocol.InstitutionalNavigatedRequestPayload))
+		case protocol.MsgInstitutionalReconcileRequest:
+			// Omitting this case did not make reconcile unsupported: the frame
+			// is protocol-defined, validated, gated as an institutional
+			// materialization message above, and answered when the feature is
+			// disabled. Falling out of this switch dropped it into the generic
+			// unknown-frame default, which is classified ErrInvalidFrame and is
+			// therefore transport-fatal — so the extension's post-restart
+			// binding re-sync tore down the very session it was repairing.
+			return b.institutionalReconcile(ctx, msg.Payload.(*protocol.InstitutionalReconcileRequestPayload))
 		}
 	}
 	if b.holder == nil || b.holder.ID != sessionID {

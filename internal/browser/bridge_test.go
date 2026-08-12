@@ -8130,6 +8130,40 @@ func TestInstitutionalMaterializationHandlersAreDarkAndContinue(t *testing.T) {
 	}
 }
 
+// Reconcile is only exercised above with the feature disabled, which is served
+// by a different branch. With materialization enabled the frame fell out of the
+// dispatch switch into the generic unknown-frame default; that default is
+// classified ErrInvalidFrame, which is transport-fatal, so the extension's
+// post-restart binding re-sync disconnected the session it was repairing.
+func TestInstitutionalReconcileIsDispatchedWhenMaterializationIsEnabled(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
+	// runSync fails the test if Sync returns an error, which is the assertion
+	// that matters here: the frame must never be a transport-fatal error.
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalReconcileRequest, "",
+		protocol.InstitutionalReconcileRequestPayload{
+			RequestID: "req_reconcile_enabled",
+			Bindings:  []protocol.InstitutionalReconcileBinding{{BindingID: "bind_001", TabID: 4}},
+		}))
+	got := firstOfType(msgs, protocol.MsgInstitutionalReconcileResponse)
+	if got == nil {
+		t.Fatalf("reconcile response missing: %v", msgs)
+	}
+	p, ok := got.Payload.(*protocol.InstitutionalReconcileResponsePayload)
+	if !ok || p.RequestID != "req_reconcile_enabled" {
+		t.Fatalf("reconcile response = %#v", got.Payload)
+	}
+	if p.Outcome == "feature_disabled" {
+		t.Fatalf("reconcile answered from the disabled branch while the feature is enabled: %#v", p)
+	}
+	// The session must still serve ordinary work afterwards.
+	after, _ := runSync(t, b, inFrame(t, protocol.MsgTriageCountsRequest, "",
+		protocol.TriageCountsRequestPayload{RequestID: "req_after_reconcile"}))
+	if firstOfType(after, protocol.MsgTriageCountsResponse) == nil {
+		t.Fatalf("session did not survive reconcile: %v", after)
+	}
+}
+
 func TestInstitutionalMaterializationRequiresExplicitClientFeature(t *testing.T) {
 	request := inFrame(t, protocol.MsgInstitutionalClaimRequest, "job_inst_001",
 		protocol.InstitutionalClaimRequestPayload{RequestID: "req_feature_claim", CandidateID: "cand_001", MaterializationKind: "browser_tab"})
