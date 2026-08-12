@@ -48,9 +48,18 @@ func (e *ErrExceeded) Error() string {
 // does not burn a resolver out of the chain.
 const MaxInlineWait = 5 * time.Second
 
-// ErrDeferred means the source is gated by a durable next_allowed_at further
-// out than MaxInlineWait. The caller must skip the source and park its work
-// until Until rather than wait.
+// ErrDeferred means the source could not be called now. The caller must skip
+// the source and park its work rather than wait.
+//
+// Two very different facts share this type, and Advisory separates them.
+// A durable deferral is a real gate persisted in next_allowed_at — a server
+// Retry-After, routinely a daily quota reset up to 24 hours out — and Until
+// is authoritative: nothing this process does will open that source sooner.
+// An advisory deferral is this process's own token bucket refusing a request
+// it did not make; Until is at most MaxInlineWait away, is never persisted,
+// and any other caller may take the token first. Scheduling work against an
+// advisory Until wakes a job seconds later to re-run every source and learn
+// nothing, so a caller that parks durable work MUST NOT treat the two alike.
 type ErrDeferred struct {
 	Source string
 	// Identity is the account the deferred call was made under. A durable
@@ -58,6 +67,9 @@ type ErrDeferred struct {
 	// source-wide and merely reports who it turned away.
 	Identity string
 	Until    time.Time
+	// Advisory marks a process-local token-bucket backoff rather than a
+	// durable source gate.
+	Advisory bool
 }
 
 func (e *ErrDeferred) Error() string {
@@ -221,8 +233,9 @@ func (m *Manager) takeToken(ctx context.Context, source, identity string, rate f
 			// Same verdict as a durable gate from the caller's side: this source
 			// cannot serve you now, release the worker and park. Deliberately
 			// never persisted through Defer — a token is process-local and
-			// advisory, and another caller may take it first.
-			return &ErrDeferred{Source: source, Identity: identity, Until: next.UTC()}
+			// advisory, and another caller may take it first — and reported as
+			// Advisory so the scheduler does not schedule a durable wake on it.
+			return &ErrDeferred{Source: source, Identity: identity, Until: next.UTC(), Advisory: true}
 		}
 		if err := sleepContext(ctx, wait); err != nil {
 			return err

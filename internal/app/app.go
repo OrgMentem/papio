@@ -514,8 +514,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 				// lifts, instead of holding this worker's claim until then.
 				var deferred *budget.ErrDeferred
 				if errors.As(err, &deferred) {
-					plan.Gate = earlierTime(plan.Gate, deferred.Until)
-					plan.ClosedSourceGates++
+					plan.recordDeferral(deferred)
 					continue
 				}
 				return nil, plan, err
@@ -837,8 +836,7 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
 				var deferred *budget.ErrDeferred
 				if errors.As(err, &deferred) {
-					plan.Gate = earlierTime(plan.Gate, deferred.Until)
-					plan.ClosedSourceGates++
+					plan.recordDeferral(deferred)
 				}
 				continue
 			}
@@ -904,8 +902,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
 			var deferred *budget.ErrDeferred
 			if errors.As(err, &deferred) {
-				plan.Gate = earlierTime(plan.Gate, deferred.Until)
-				plan.ClosedSourceGates++
+				plan.recordDeferral(deferred)
 			}
 			return nil, plan
 		}
@@ -953,8 +950,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 				if err := s.Budgets.Acquire(ctx, rname, entry.Policy, entry.EstimatedCost); err != nil {
 					var deferred *budget.ErrDeferred
 					if errors.As(err, &deferred) {
-						plan.Gate = earlierTime(plan.Gate, deferred.Until)
-						plan.ClosedSourceGates++
+						plan.recordDeferral(deferred)
 					}
 					if valid == 0 {
 						outcome, detail = "budget_blocked", safeType(err)
@@ -1326,8 +1322,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 					if err := s.Jobs.MarkCandidate(ctx, stored.ID, "retryable"); err != nil {
 						return err
 					}
-					plan.Gate = earlierTime(plan.Gate, deferred.Until)
-					plan.ClosedSourceGates++
+					plan.recordDeferral(deferred)
 					continue
 				}
 				return err
@@ -1482,10 +1477,12 @@ func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, p
 		// park again — a spin at the temporary interval until the gate opens.
 		at, kind = plan.Gate, retryKindExhaustedGate
 	}
-	if !at.After(now) {
-		// The gate elapsed while the rest of the pass ran. Persisting a past
+	if at.IsZero() || !at.After(now) {
+		// Either the gate elapsed while the rest of the pass ran, or nothing
+		// but this process's own throttle refused a source. Persisting a past
 		// time makes the scheduler re-claim instantly and spend another
-		// attempt on a wait that already happened.
+		// attempt on a wait that already happened; persisting the throttle's
+		// own sub-second time does the same thing at token-bucket speed.
 		at = now.Add(s.RetryDelay)
 	}
 	detail["retry_kind"] = kind
@@ -1510,10 +1507,16 @@ func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, p
 // callable source made a request.
 func retryCutoverDecision(plan retryPlan) job.InstitutionCutoverDecision {
 	blocker := job.InstitutionCutoverBlockerNone
-	if !plan.Temporary().IsZero() || plan.RetryableCandidates > 0 || plan.TemporaryResolvers > 0 {
+	switch {
+	case !plan.Temporary().IsZero() || plan.RetryableCandidates > 0 || plan.TemporaryResolvers > 0:
 		blocker = job.InstitutionCutoverBlockerTransientRetryRemaining
-	} else if plan.ClosedSourceGates > 0 || !plan.Gate.IsZero() {
+	case plan.ClosedSourceGates > 0 || !plan.Gate.IsZero():
 		blocker = job.InstitutionCutoverBlockerSourceGateOnly
+	case plan.AdvisoryOnly():
+		// This process throttled itself. No source refused papio and no
+		// institutional route was ruled out, so the honest classification is
+		// an ordinary transient retry, not a closed source gate.
+		blocker = job.InstitutionCutoverBlockerTransientRetryRemaining
 	}
 	return job.InstitutionCutoverDecision{
 		Blocker:                blocker,
@@ -3001,11 +3004,20 @@ const (
 type retryPlan struct {
 	CandidateTemporary time.Time // a candidate fetch failed retryably
 	ResolverTemporary  time.Time // a resolver/sibling source failed retryably
-	Gate               time.Time // a source gate was closed; no request was made
+	Gate               time.Time // a durable source gate was closed; no request was made
+	// Advisory is this process's own token bucket turning a request away.
+	// It is deliberately NOT a wake time: it is at most budget.MaxInlineWait
+	// out, so scheduling on it wakes the job seconds later to re-run every
+	// source and learn nothing. Under cohort load one rate-limited source
+	// produced a two-event-per-cycle spin at ~5s — 10,437 durable transitions
+	// in 97 minutes — while the source that actually blocked those jobs sat
+	// behind a real 24-hour quota gate the whole time.
+	Advisory time.Time
 
 	RetryableCandidates int // candidate fetches that failed retryably this pass
 	TemporaryResolvers  int // resolver/sibling calls that failed retryably this pass
-	ClosedSourceGates   int // source gates closed before any request this pass
+	ClosedSourceGates   int // durable source gates closed before any request this pass
+	AdvisoryBackoffs    int // token-bucket refusals before any request this pass
 }
 
 // Temporary is the earliest retryable-request observation, candidate or
@@ -3021,23 +3033,60 @@ func (p *retryPlan) merge(other retryPlan) {
 	p.CandidateTemporary = earlierTime(p.CandidateTemporary, other.CandidateTemporary)
 	p.ResolverTemporary = earlierTime(p.ResolverTemporary, other.ResolverTemporary)
 	p.Gate = earlierTime(p.Gate, other.Gate)
+	p.Advisory = earlierTime(p.Advisory, other.Advisory)
 	p.RetryableCandidates += other.RetryableCandidates
 	p.TemporaryResolvers += other.TemporaryResolvers
 	p.ClosedSourceGates += other.ClosedSourceGates
+	p.AdvisoryBackoffs += other.AdvisoryBackoffs
 }
 
-// At is when the job should wake: the earliest opportunity of either kind,
-// because a source that frees up sooner deserves its attempt sooner.
+// recordDeferral folds one refused source into the plan, keeping a durable
+// gate (a real next_allowed_at this process cannot shorten) apart from this
+// process's own token-bucket backoff.
+func (p *retryPlan) recordDeferral(deferred *budget.ErrDeferred) {
+	if deferred == nil {
+		return
+	}
+	if deferred.Advisory {
+		p.Advisory = earlierTime(p.Advisory, deferred.Until)
+		p.AdvisoryBackoffs++
+		return
+	}
+	p.Gate = earlierTime(p.Gate, deferred.Until)
+	p.ClosedSourceGates++
+}
+
+// At is when the job should wake: the earliest real opportunity, because a
+// source that frees up sooner deserves its attempt sooner. An advisory
+// token-bucket backoff is never that opportunity — it says only that this
+// process throttled itself, so it cannot outrank a durable gate or a real
+// retryable failure, and on its own it yields the caller's ordinary retry
+// cadence rather than a sub-second wake.
 func (p retryPlan) At() time.Time { return earlierTime(p.Temporary(), p.Gate) }
 
-func (p retryPlan) IsZero() bool { return p.At().IsZero() }
+// AdvisoryOnly reports a pass that made no request and observed nothing but
+// this process's own throttle. There is no honest wake time to schedule, so
+// the caller supplies its ordinary retry cadence.
+func (p retryPlan) AdvisoryOnly() bool {
+	return p.At().IsZero() && (!p.Advisory.IsZero() || p.AdvisoryBackoffs > 0)
+}
 
-// Kind is source_gate only when no request was actually attempted this pass.
+func (p retryPlan) IsZero() bool { return p.At().IsZero() && !p.AdvisoryOnly() }
+
+// Kind is source_gate only when a durable gate held a source back and no
+// request was attempted. A source_gate park is exempt from the retry budget
+// (retryBudgetExhausted), which is correct for a real gate — no attempt was
+// spent — and unsafe for this process's own throttle: an advisory-only pass
+// would be both unbounded and uncharged, which is exactly how one rate-limited
+// source spun 82 jobs past a thousand transitions each.
 func (p retryPlan) Kind() string {
-	if p.Temporary().IsZero() {
-		return retryKindSourceGate
+	if !p.Temporary().IsZero() {
+		return retryKindTemporary
 	}
-	return retryKindTemporary
+	if p.Gate.IsZero() && p.ClosedSourceGates == 0 {
+		return retryKindTemporary
+	}
+	return retryKindSourceGate
 }
 
 // GatePending reports a source gate that has not yet elapsed. At the retry

@@ -2232,6 +2232,88 @@ func TestRetryPlanReportsWhatItObserved(t *testing.T) {
 			t.Fatalf("Temporary() = %v, want %v", got, want)
 		}
 	})
+
+	// Verified in production 2026-08-12: openaire's process-local token bucket
+	// refused a request every few seconds while openalex sat behind a real
+	// 24-hour quota gate. Both surfaced as budget.ErrDeferred, the plan kept
+	// only the earliest, and every job woke on the token bucket, re-ran every
+	// source, learned nothing and re-parked — 10,437 durable transitions in 97
+	// minutes across 82 jobs, uncharged because a source_gate park spends no
+	// attempt. The durable gate is the only honest wake time here.
+	t.Run("advisory_throttle_never_outranks_a_durable_gate", func(t *testing.T) {
+		base := time.Date(2026, 8, 12, 1, 37, 0, 0, time.UTC)
+		plan := retryPlan{}
+		plan.recordDeferral(&budget.ErrDeferred{
+			Source: "openalex", Until: base.Add(23 * time.Hour),
+		})
+		plan.recordDeferral(&budget.ErrDeferred{
+			Source: "openaire", Until: base.Add(5 * time.Second), Advisory: true,
+		})
+		if got, want := plan.At(), base.Add(23*time.Hour); !got.Equal(want) {
+			t.Fatalf("At() = %v, want the durable gate %v", got, want)
+		}
+		if plan.ClosedSourceGates != 1 || plan.AdvisoryBackoffs != 1 {
+			t.Fatalf("counters = %d gates / %d advisory, want 1/1",
+				plan.ClosedSourceGates, plan.AdvisoryBackoffs)
+		}
+		if plan.AdvisoryOnly() {
+			t.Fatal("a pass holding a durable gate is not advisory-only")
+		}
+		if plan.Kind() != retryKindSourceGate {
+			t.Fatalf("Kind() = %q, want %q", plan.Kind(), retryKindSourceGate)
+		}
+	})
+
+	// With no durable gate the throttle is the only observation, and it is not
+	// a wake time: sub-second parks are the spin itself. The job must fall back
+	// to the ordinary retry cadence and must stay chargeable, or an unbounded
+	// uncharged loop survives the split.
+	t.Run("advisory_only_pass_uses_retry_cadence_and_stays_charged", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		ctx := context.Background()
+		now := time.Date(2026, 8, 12, 1, 37, 0, 0, time.UTC)
+		svc.Now = func() time.Time { return now }
+		svc.RetryDelay = 30 * time.Second
+		id, err := svc.Submit(ctx, doiRequest("wr_advisory_only"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,
+			map[string]any{"reason": "scheduler_dispatch"}); err != nil {
+			t.Fatal(err)
+		}
+		row, err := jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan := retryPlan{}
+		plan.recordDeferral(&budget.ErrDeferred{
+			Source: "openaire", Until: now.Add(3 * time.Second), Advisory: true,
+		})
+		if !plan.AdvisoryOnly() || plan.IsZero() {
+			t.Fatalf("advisory-only plan = %+v, want advisory-only and non-zero", plan)
+		}
+		if plan.Kind() != retryKindTemporary {
+			t.Fatalf("Kind() = %q, want %q so the retry budget still bounds it",
+				plan.Kind(), retryKindTemporary)
+		}
+		if err := svc.parkForRetry(ctx, row, job.StateResolving, plan,
+			map[string]any{"reason": "resolver_temporarily_unavailable"},
+			job.TerminalReasonTemporarySourceFailuresDidNotClear, ""); err != nil {
+			t.Fatal(err)
+		}
+		got, err := jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		retryAt, err := time.Parse(time.RFC3339Nano, got.RetryAt)
+		if err != nil {
+			t.Fatalf("parsing retry_at %q: %v", got.RetryAt, err)
+		}
+		if wake := retryAt.Sub(now); wake < svc.RetryDelay {
+			t.Fatalf("retry_at is %v out, want at least the %v retry cadence", wake, svc.RetryDelay)
+		}
+	})
 }
 
 // onceTemporaryResolver stands in for the "unrelated temporary source/gate"
