@@ -353,3 +353,82 @@ legacy fresh routes, global terms authority, deterministic claim hashes, and
 unmaterialized browser queues without promoting ambiguous history into new
 authority. Every implementation slice remains small enough for one maintainer
 to review and land directly on `main`.
+
+## Amendment 2026-08-12: adversarial review dispositions
+
+An external adversarial review of the shipped Phase 0–4 code, followed by two
+internal reviewers of the resulting fixes, produced the decisions below. They
+are recorded here because each one is a boundary a later change could
+plausibly "simplify" back.
+
+**The artifact winner is per job ATTEMPT, not per job.** `artifact_winners`
+was keyed by `job_id` alone while every column, index and caller treated it as
+per attempt. Migration 0033 re-keys it. A winner is committed only AFTER
+validation, so rejected bytes cannot permanently win an attempt and lock out the
+correct file that arrives next. Every browser-delivered file — correlated,
+swept, or grab-adopted — goes through one institutional-aware ingest.
+
+**A CAS failure after validation is not an adoption failure.** The bytes are
+already attached; only the record of who won failed. Returning an error there
+reports a landed file as deferred, skips settlement and skips the conclusive
+latch.
+
+**An observation is stored against the revision it was produced under.** The
+correlated lookup must consult candidate HISTORY, not the "current candidate"
+query, which hides a candidate whose profile revision was superseded and so
+silently promotes stale evidence into the live revision. A rejected observation
+must abort the gate and lease mutations that would otherwise act on it.
+
+**Human gates are keyed to the occurrence.** Exact replay stays idempotent, but
+two genuinely distinct occurrences must not collapse — `auth_pending` without
+`elapsed_ms` did, so a second sign-out silently failed to reopen a resolved
+gate. The gate id carries the frame's `msg_id`; the evidence id deliberately
+does not, because `profile_evidence` is append-only and would otherwise grow
+with browsing activity rather than with distinct facts.
+
+**A process-local throttle is not a source refusing papio.** It is never a wake
+time, and it is never charged against the retry budget — but the exemption is
+narrow: only a pass where no source was reached at all. A pass that called
+sources and came back empty stays chargeable, or the job re-parks forever
+without a verdict.
+
+**Authorization is at most once, and refusal is not a stop.** A replayed drive
+epoch answers `duplicate` rather than re-authorizing. Because the extension
+retires such an epoch without ever sending a result, the release is at the next
+offer, which supersedes a stalled epoch and mints a successor; superseding at
+the refusal instead would discard a result that is merely late.
+
+**The safety domain is a provider fence, shared across jobs.** Deriving it from
+the job id gave every job a private domain, so the scheduler's sibling anti-join
+— the only cross-job serialization that exists — could never match. Scheduler
+grouping deliberately keys on the same value: the anti-join only counts claims
+at `bound` and beyond, so grouping is what stops many candidates sitting
+`claimed` at once. One bound scaffold per institution is the intended shape, and
+it matches the extension's own effect governor. Route suppressions keep a
+permanently failing candidate from holding the head of that queue.
+
+**Suppressions and claim renewal have producers.** Both were complete,
+consumed, and never written. A route that proved `no_entitlement`, or answered
+with a challenge, is fenced by its exact tuple so rediscovery cannot re-select
+it. Authentication traffic renews the materialization lease, because a login,
+MFA prompt or CAPTCHA is human-paced and routinely outlives the action expiry.
+
+### Knowingly deferred
+
+- **A daemon-durable leased effect permit.** The concrete replay and cross-job
+  holes are closed, but there is still no single leased permit held through
+  result reconciliation. `AdvanceMaterializationEffect` stays dark until there
+  is; wiring the ordinal without the permit would be decoration.
+- **A produced-under fence for uncorrelated session evidence.** It carries no
+  correlation, so nothing proves which revision produced it. Mitigated by
+  refusing uncorrelated evidence briefly after an authority change; the real fix
+  is a daemon-minted profile fence echoed by the extension, which is a
+  coordinated Go/TypeScript/schema change.
+- **Opaque provider domains in durable events.** `final_host`/`final_path`
+  survive because route-family correlation reads them, and they are retained
+  only when they matched the origin and path papio itself proposed. Free text
+  from an adapter is redacted at all three sinks.
+- **An unfenceable late adoption.** When a lease expires mid-login the store
+  refuses a winner by design. The bytes are adopted rather than stranded, the
+  candidate is retired so it cannot be re-driven, and `browser.artifact_unfenced`
+  records that the attempt ended without one.
