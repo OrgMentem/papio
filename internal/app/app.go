@@ -1608,13 +1608,15 @@ func (s *Service) park(ctx context.Context, jobID, from, to string, detail map[s
 const maxRetryAttempts = 8
 
 // retryBudgetExhausted reports whether a job has already spent its bounded
-// attempts. It counts durable transition events into retry_wait so the bound
-// survives daemon restarts, but skips parks recorded as retryKindSourceGate:
-// waiting for a closed source gate consumed no attempt because no request was
-// made. Events written before that discriminator existed carry no retry_kind
-// and are counted, which preserves the original bound for existing jobs. A
-// read error never escalates: best-effort maintenance prefers another retry to
-// falsely giving up on a job.
+// attempts. It counts durable transition events into retry_wait but skips
+// parks that made no request at all — retryKindSourceGate (a durable gate
+// held the source back) and retryKindAdvisory (this process's own token
+// bucket did). Charging either would settle a job "temporary source failures
+// did not clear" about sources papio never called. Events written before
+// those discriminators existed carry no retry_kind and are counted, which
+// preserves the original bound for existing jobs. A read error never
+// escalates: best-effort maintenance prefers another retry to falsely giving
+// up on a job.
 func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
 	events, err := s.Jobs.Events(ctx, jobID)
 	if err != nil {
@@ -1629,7 +1631,8 @@ func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
 		if to, _ := detail["to"].(string); to != job.StateRetryWait {
 			continue
 		}
-		if kind, _ := detail["retry_kind"].(string); kind == retryKindSourceGate {
+		switch kind, _ := detail["retry_kind"].(string); kind {
+		case retryKindSourceGate, retryKindAdvisory:
 			continue
 		}
 		n++
@@ -2982,6 +2985,15 @@ func autoImportErrorInfo(err error) (class, hint string, httpStatus int) {
 const (
 	retryKindTemporary  = "temporary"
 	retryKindSourceGate = "source_gate"
+	// retryKindAdvisory marks a pass that made no request because this
+	// process's own token bucket turned every callable source away. Like a
+	// closed source gate it consumes no attempt — charging it would settle a
+	// job "temporary source failures did not clear" about sources papio never
+	// called — but it stays distinct so the two are legible apart in the log.
+	// Liveness comes from the RetryDelay floor in parkForRetry, not from the
+	// retry budget: a self-inflicted throttle has always refilled by the next
+	// ordinary retry, so the following pass makes real requests.
+	retryKindAdvisory = "advisory"
 	// retryKindExhaustedGate marks the single wait a job is allowed after its
 	// retry budget is spent, so a second one can be refused. Not counted by
 	// retryBudgetExhausted: the budget is already spent by definition here.
@@ -3073,25 +3085,28 @@ func (p retryPlan) AdvisoryOnly() bool {
 
 func (p retryPlan) IsZero() bool { return p.At().IsZero() && !p.AdvisoryOnly() }
 
-// Kind is source_gate only when a durable gate held a source back and no
-// request was attempted. A source_gate park is exempt from the retry budget
-// (retryBudgetExhausted), which is correct for a real gate — no attempt was
-// spent — and unsafe for this process's own throttle: an advisory-only pass
-// would be both unbounded and uncharged, which is exactly how one rate-limited
-// source spun 82 jobs past a thousand transitions each.
+// Kind names why the pass ended with no verdict. source_gate means a durable
+// gate held a source back; advisory means only this process's own throttle
+// did. Both made no request, so neither is charged against the retry budget;
+// they stay distinct so the durable log says which one it was.
 func (p retryPlan) Kind() string {
 	if !p.Temporary().IsZero() {
 		return retryKindTemporary
 	}
-	if p.Gate.IsZero() && p.ClosedSourceGates == 0 {
-		return retryKindTemporary
+	if !p.Gate.IsZero() || p.ClosedSourceGates > 0 {
+		return retryKindSourceGate
 	}
-	return retryKindSourceGate
+	if p.AdvisoryOnly() {
+		return retryKindAdvisory
+	}
+	return retryKindTemporary
 }
 
-// GatePending reports a source gate that has not yet elapsed. At the retry
-// exhaustion boundary this outranks a terminal verdict: the bounded attempts
-// are spent, but the gated source still deserves the one call it never got.
+// GatePending reports a durable source gate that has not yet elapsed. At the
+// retry exhaustion boundary this outranks a terminal verdict: the bounded
+// attempts are spent, but the gated source still deserves the one call it
+// never got. An advisory throttle is deliberately excluded — it is this
+// process's own backoff, not a source withholding access.
 func (p retryPlan) GatePending(now time.Time) bool {
 	return !p.Gate.IsZero() && p.Gate.After(now)
 }

@@ -2264,11 +2264,13 @@ func TestRetryPlanReportsWhatItObserved(t *testing.T) {
 		}
 	})
 
-	// With no durable gate the throttle is the only observation, and it is not
-	// a wake time: sub-second parks are the spin itself. The job must fall back
-	// to the ordinary retry cadence and must stay chargeable, or an unbounded
-	// uncharged loop survives the split.
-	t.Run("advisory_only_pass_uses_retry_cadence_and_stays_charged", func(t *testing.T) {
+	// With no durable gate the throttle is the only observation. It is not a
+	// wake time — sub-second parks are the spin itself — so the job falls back
+	// to the ordinary retry cadence. It is also not an attempt: no request was
+	// made, so charging it would let papio's own throttle settle a job
+	// "temporary source failures did not clear" about sources it never called.
+	// Liveness comes from the cadence floor, not from the budget.
+	t.Run("advisory_only_pass_uses_retry_cadence_and_is_not_charged", func(t *testing.T) {
 		svc, jobs := newTestService(t)
 		ctx := context.Background()
 		now := time.Date(2026, 8, 12, 1, 37, 0, 0, time.UTC)
@@ -2293,9 +2295,8 @@ func TestRetryPlanReportsWhatItObserved(t *testing.T) {
 		if !plan.AdvisoryOnly() || plan.IsZero() {
 			t.Fatalf("advisory-only plan = %+v, want advisory-only and non-zero", plan)
 		}
-		if plan.Kind() != retryKindTemporary {
-			t.Fatalf("Kind() = %q, want %q so the retry budget still bounds it",
-				plan.Kind(), retryKindTemporary)
+		if plan.Kind() != retryKindAdvisory {
+			t.Fatalf("Kind() = %q, want %q", plan.Kind(), retryKindAdvisory)
 		}
 		if err := svc.parkForRetry(ctx, row, job.StateResolving, plan,
 			map[string]any{"reason": "resolver_temporarily_unavailable"},
@@ -2312,6 +2313,34 @@ func TestRetryPlanReportsWhatItObserved(t *testing.T) {
 		}
 		if wake := retryAt.Sub(now); wake < svc.RetryDelay {
 			t.Fatalf("retry_at is %v out, want at least the %v retry cadence", wake, svc.RetryDelay)
+		}
+		// The defect this guards: charging advisory parks let eight of them —
+		// four minutes at a 30s cadence — exhaust the budget and settle the job
+		// as though its sources had failed.
+		for range maxRetryAttempts + 2 {
+			cur, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cur.State != job.StateRetryWait {
+				t.Fatalf("job left the retry cycle in %s; a self-inflicted throttle is not a verdict", cur.State)
+			}
+			if err := jobs.Transition(ctx, id, job.StateRetryWait, job.StateResolving,
+				map[string]any{"reason": "scheduler_dispatch"}); err != nil {
+				t.Fatal(err)
+			}
+			again, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := svc.parkForRetry(ctx, again, job.StateResolving, plan,
+				map[string]any{"reason": "resolver_temporarily_unavailable"},
+				job.TerminalReasonTemporarySourceFailuresDidNotClear, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if svc.retryBudgetExhausted(ctx, id) {
+			t.Fatal("advisory parks exhausted the retry budget; no request was ever made")
 		}
 	})
 }
