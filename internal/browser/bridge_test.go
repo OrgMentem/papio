@@ -5332,6 +5332,69 @@ func TestBufferedFrameDoesNotPromoteIntoTheNewRevision(t *testing.T) {
 	}
 }
 
+// A second sign-out for the same job must raise the login gate again after a
+// login resolved it. auth_pending frames carry elapsed_ms only sometimes, so
+// when it is absent every occurrence for a job hashed to the same observation
+// id; upsertProfileGate treats an id match as an exact replay and returns
+// early regardless of status, so the reopen was silently dropped and every
+// sibling on that claim stayed parked with nothing to click.
+func TestRepeatedAuthPendingWithoutElapsedReopensTheLoginGate(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+	}
+	b.cfg = cfg
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "wr_gate_reopen_msgid", handoffWork(), "alpha")
+	openLoginGates := func() int {
+		t.Helper()
+		attention, err := jobs.CurrentHumanAttention(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, gate := range attention.Gates {
+			if gate.GateType == job.HumanGateLogin {
+				n++
+			}
+		}
+		return n
+	}
+	authFrame := func(msgID string, typ string) *protocol.BrowserMessage {
+		return &protocol.BrowserMessage{
+			Type: typ, MsgID: msgID, JobID: jobID,
+			Payload: &protocol.AuthPayload{}, // no elapsed_ms, as in the field
+		}
+	}
+	if err := b.recordAuth(ctx, authFrame("pending-1", protocol.MsgAuthPending)); err != nil {
+		t.Fatal(err)
+	}
+	if got := openLoginGates(); got != 1 {
+		t.Fatalf("first sign-out opened %d login gates, want 1", got)
+	}
+	if err := b.recordAuth(ctx, authFrame("returned-1", protocol.MsgAuthReturned)); err != nil {
+		t.Fatal(err)
+	}
+	if got := openLoginGates(); got != 0 {
+		t.Fatalf("login left %d gates open, want 0", got)
+	}
+	// Same job, same absent elapsed_ms, genuinely new occurrence.
+	if err := b.recordAuth(ctx, authFrame("pending-2", protocol.MsgAuthPending)); err != nil {
+		t.Fatal(err)
+	}
+	if got := openLoginGates(); got != 1 {
+		t.Fatalf("second sign-out reopened %d login gates, want 1", got)
+	}
+	// Exact replay of that same frame stays idempotent.
+	if err := b.recordAuth(ctx, authFrame("pending-2", protocol.MsgAuthPending)); err != nil {
+		t.Fatal(err)
+	}
+	if got := openLoginGates(); got != 1 {
+		t.Fatalf("replaying one frame produced %d gates, want 1", got)
+	}
+}
+
 // RunSweeper must survive a transient store error: a dead adoption loop would
 // silently strand every subsequently downloaded PDF, and the daemon supervisor
 // does not watch this goroutine. Closing the DB forces every sweep to error;

@@ -4926,6 +4926,15 @@ func (b *Bridge) upsertProfileGate(ctx context.Context, observationKey, resolver
 		}
 		return nil
 	}
+	// The observation key must identify the OCCURRENCE, not just the job.
+	// This early return is what makes exact replay idempotent, and it fires on
+	// the id alone regardless of the row's status — so any two genuinely
+	// distinct occurrences that hash alike collapse into one, and the second
+	// silently fails to reopen a resolved gate. That happened: auth_pending
+	// frames without elapsed_ms all keyed on (kind, job) alone, so after a
+	// login resolved the gate, the next sign-out for that job was discarded
+	// and every sibling stayed parked with no attention surface. Callers now
+	// mix the per-frame msg_id in; keep it that way.
 	id := evidenceObservationID("human_gate", observationKey, string(gateType), scopeClass, scopeKey)
 	for _, row := range current {
 		if row.GateType == gateType && row.ID == id {
@@ -4989,7 +4998,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	}
 	resolverName := resolverProfileKey(row.Policy.Resolver)
 	if msg.Type == protocol.MsgAuthReturned {
-		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.MsgID, msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}
@@ -5000,7 +5009,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 			// promotion the evidence fence exists to prevent.
 			return nil
 		}
-		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateResolved, `{"source":"auth_returned"}`); err != nil {
+		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_returned", msg.MsgID, msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateResolved, `{"source":"auth_returned"}`); err != nil {
 			return err
 		}
 		if profile, profileErr := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverName); profileErr == nil && profile != nil && profile.AuthenticationClaimID != "" {
@@ -5016,19 +5025,19 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 			}
 		}
 		if err := b.resolveProfileGatesForJob(ctx,
-			evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID,
+			evidenceObservationID("auth_returned", msg.MsgID, msg.JobID, elapsed), resolverName, msg.JobID,
 			job.HumanGateMFA, job.HumanGateCaptchaOrSecurity); err != nil {
 			return err
 		}
 	} else {
-		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.MsgID, msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}
 		if !accepted {
 			return nil
 		}
-		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateOpen, `{"source":"auth_pending"}`); err != nil {
+		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_pending", msg.MsgID, msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateOpen, `{"source":"auth_pending"}`); err != nil {
 			return err
 		}
 		if err := b.reserveAuthenticationEntry(ctx, resolverName, msg.JobID); err != nil {
