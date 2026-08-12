@@ -717,6 +717,34 @@ func (js *Store) LiveMaterializationClaimForJob(ctx context.Context, jobID strin
 	return claim, candidate, nil
 }
 
+// CandidateForAttempt returns this job attempt's browser candidate regardless
+// of whether a claim is live now, or nil when the attempt was never
+// institutional. Delivery uses it for two things: to decide that an attempt
+// owes an artifact winner at all, and to attribute that winner when the claim
+// that produced the bytes has already expired or been abandoned. Treating a
+// missing live claim as "legacy, no fence required" let late institutional
+// bytes attach with nothing having won them.
+//
+// The most recently created candidate wins attribution when an attempt has
+// several: later candidates supersede earlier ones within one attempt.
+func (js *Store) CandidateForAttempt(ctx context.Context, jobID string, jobAttemptRevision int64) (*BrowserCandidate, error) {
+	if strings.TrimSpace(jobID) == "" || jobAttemptRevision < 1 {
+		return nil, nil
+	}
+	var id string
+	err := js.S.DB().QueryRowContext(ctx, `SELECT id FROM browser_candidates
+		WHERE job_id = ? AND job_attempt_revision = ?
+		ORDER BY created_at DESC, id DESC LIMIT 1`,
+		jobID, jobAttemptRevision).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return js.GetBrowserCandidate(ctx, id)
+}
+
 // BindMaterialization acknowledges the physical resource for a claim. Binding
 // IDs are minted at claim creation. A live claim may replace its tab while
 // bound or route_issued; navigated and settled tab fences are immutable.
@@ -1102,11 +1130,18 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 	if _, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=? WHERE phase IN ('claimed','bound','route_issued','navigated') AND lease_until IS NOT NULL AND lease_until <= ?`, stamp, stamp); err != nil {
 		return nil, err
 	}
+	// A candidate whose attempt already produced an artifact must not become
+	// eligible again just because its lease expired: re-issuing the route would
+	// drive a second irreversible provider effect for work that already landed.
+	// AbandonStaleMaterializations carries the same anti-join; expiry omitted it.
 	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates SET status='eligible', updated_at=?
 		WHERE status IN ('claimed','materializing')
 		  AND NOT EXISTS (SELECT 1 FROM materialization_claims WHERE candidate_id=browser_candidates.id
 		    AND phase IN ('claimed','bound','route_issued','navigated')
-		    AND (lease_until IS NULL OR lease_until > ?))`, stamp, stamp); err != nil {
+		    AND (lease_until IS NULL OR lease_until > ?))
+		  AND NOT EXISTS (SELECT 1 FROM artifact_winners
+		    WHERE candidate_id=browser_candidates.id
+		      AND job_attempt_revision=browser_candidates.job_attempt_revision)`, stamp, stamp); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

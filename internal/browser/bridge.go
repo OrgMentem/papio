@@ -4379,74 +4379,142 @@ func fileDigest(path string) (string, error) {
 	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
-// reserveArtifactWinner binds arriving bytes to the browser effect that was
-// authorized to produce them. The winner is decided before anything is
-// attached, so a late or replaced holder cannot overwrite the artifact this
-// attempt already delivered — including after the winning claim settled, when
-// no live claim remains to consult. A job that never had an institutional
-// claim keeps the legacy delivery path untouched.
-func (b *Bridge) reserveArtifactWinner(ctx context.Context, jobID, filename string) (*job.MaterializationClaim, *job.BrowserCandidate, error) {
+// artifactFence carries the winner decision for one delivery across
+// validation. digest is the exact bytes weighed; claim/candidate are nil when
+// the attempt has no institutional history and the legacy path applies.
+type artifactFence struct {
+	attempt   int64
+	digest    string
+	claim     *job.MaterializationClaim
+	candidate *job.BrowserCandidate
+	governed  bool // the attempt is institutional; winning is mandatory
+	replay    bool // this exact artifact already won; do not CAS again
+}
+
+// weighArtifact decides whether these bytes may be adopted, WITHOUT committing
+// the winner. Committing before validation was a real defect: rejected bytes
+// (an HTML interstitial, a wrong-work PDF) permanently won the attempt, and the
+// correct file that landed afterwards hashed differently and was refused as
+// superseded. The winner must describe bytes that passed validation, so the CAS
+// moved to commitArtifact and only the refusal decision happens here.
+//
+// "Institutional" is any attempt with materialization history, not merely a
+// currently live claim: a claim that expired or was abandoned before the file
+// landed must not silently fall back to unfenced legacy adoption.
+func (b *Bridge) weighArtifact(ctx context.Context, jobID, filename string) (*artifactFence, error) {
 	if b.jobs == nil || b.materializationGenerationUnavailable {
-		return nil, nil, nil
+		return &artifactFence{}, nil
 	}
 	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	decided, hasWinner, err := b.jobs.ArtifactWinner(ctx, jobID, attempt)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	claim, candidate, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, int64(b.epoch))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if !hasWinner && (claim == nil || candidate == nil) {
-		return nil, nil, nil
+	governed := hasWinner || claim != nil
+	if candidate == nil {
+		// No live claim: fall back to the attempt's candidate history, which
+		// both decides that the attempt is institutional and attributes the
+		// winner when the claim that produced the bytes has already expired.
+		historic, histErr := b.jobs.CandidateForAttempt(ctx, jobID, attempt)
+		if histErr != nil {
+			return nil, histErr
+		}
+		if historic != nil {
+			candidate = historic
+			governed = true
+		}
+	}
+	if !governed {
+		return &artifactFence{attempt: attempt}, nil
 	}
 	full, err := b.adoptionPath(jobID, filename)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	digest, err := fileDigest(full)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	superseded := func() error {
-		if eventErr := b.jobs.RecordEvent(ctx, jobID, "browser.artifact_superseded", nil); eventErr != nil {
-			log.Printf("papio: recording superseded artifact: %v", eventErr)
-		}
-		return errArtifactSuperseded
+	fence := &artifactFence{
+		attempt: attempt, digest: digest,
+		claim: claim, candidate: candidate, governed: true,
 	}
 	if hasWinner {
 		// Replaying the artifact this attempt already committed is idempotent;
 		// different bytes are a late producer and must not be attached.
 		if decided.SHA256 != digest {
-			return nil, nil, superseded()
+			if eventErr := b.jobs.RecordEvent(ctx, jobID, "browser.artifact_superseded", nil); eventErr != nil {
+				log.Printf("papio: recording superseded artifact: %v", eventErr)
+			}
+			return nil, errArtifactSuperseded
 		}
-		return claim, candidate, nil
+		fence.replay = true
 	}
-	_, won, err := b.jobs.ClaimArtifactWinner(ctx, job.ArtifactWinner{
-		JobID: jobID, JobAttemptRevision: attempt, CandidateID: candidate.ID,
-		BrowserHolderGeneration: int64(b.epoch), SHA256: digest,
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	if !won {
-		return nil, nil, superseded()
-	}
-	return claim, candidate, nil
+	return fence, nil
 }
 
-// adoptOutsideSessionLock runs validation without blocking unrelated browser
-// syncs. The adoption service leases the durable job state before validation,
-// so releasing the in-memory session lock cannot admit a competing adoption.
-// The caller must hold b.mu; it is held again before this method returns.
-func (b *Bridge) adoptOutsideSessionLock(ctx context.Context, jobID, filename string, provenance ...*app.BrowserDeliveryContext) (int64, error) {
-	b.mu.Unlock()
-	defer b.mu.Lock()
-	claim, candidate, err := b.reserveArtifactWinner(ctx, jobID, filename)
+// commitArtifact records the winner for bytes that have just passed validation
+// and settles the claim that produced them. Adoption leases the durable job
+// state, so only one delivery per job validates at a time and this CAS cannot
+// race a sibling into attaching two artifacts.
+func (b *Bridge) commitArtifact(ctx context.Context, jobID string, fence *artifactFence) error {
+	if fence == nil || !fence.governed || fence.replay {
+		return nil
+	}
+	if fence.candidate != nil {
+		_, won, err := b.jobs.ClaimArtifactWinner(ctx, job.ArtifactWinner{
+			JobID: jobID, JobAttemptRevision: fence.attempt, CandidateID: fence.candidate.ID,
+			BrowserHolderGeneration: int64(b.epoch), SHA256: fence.digest,
+		})
+		switch {
+		case errors.Is(err, job.ErrMaterializationStale):
+			// The claim that produced these bytes is gone, and the store
+			// deliberately refuses a winner to a holder that can no longer
+			// prove it owns the effect. The bytes validated, so they are still
+			// adopted rather than stranded — long human logins routinely
+			// outlive a lease while RenewMaterializationClaim stays dark — but
+			// the attempt ends with no durable winner, so record that plainly
+			// instead of letting it look fenced.
+			if eventErr := b.jobs.RecordEvent(ctx, jobID, "browser.artifact_unfenced",
+				map[string]any{"job_attempt_revision": fence.attempt}); eventErr != nil {
+				log.Printf("papio: recording unfenced adoption: %v", eventErr)
+			}
+		case err != nil:
+			return err
+		case !won:
+			// A sibling validated first. The bytes are already attached, so
+			// this is recorded rather than reversed.
+			if eventErr := b.jobs.RecordEvent(ctx, jobID, "browser.artifact_superseded", nil); eventErr != nil {
+				log.Printf("papio: recording superseded artifact: %v", eventErr)
+			}
+		}
+	}
+	if fence.claim == nil || fence.candidate == nil {
+		return nil
+	}
+	if err := b.jobs.SettleMaterialization(ctx, fence.claim.ID, fence.claim.BindingID,
+		int64(b.epoch), fence.candidate.InstitutionProfileRevision); err != nil &&
+		!errors.Is(err, job.ErrMaterializationStale) &&
+		!errors.Is(err, job.ErrMaterializationConflict) {
+		log.Printf("papio: settling materialization after adoption: %v", err)
+	}
+	return nil
+}
+
+// ingestAdoptedFile is the single institutional-aware entry point for every
+// browser-delivered file, correlated or swept. SweepAdoptions used to call
+// b.adopt directly, so a file that landed during daemon downtime or after a
+// lost download_complete was adopted with no winner at all — the timer path is
+// precisely the one that runs when correlation was missed.
+func (b *Bridge) ingestAdoptedFile(ctx context.Context, jobID, filename string, provenance ...*app.BrowserDeliveryContext) (int64, error) {
+	fence, err := b.weighArtifact(ctx, jobID, filename)
 	if err != nil {
 		return 0, err
 	}
@@ -4456,16 +4524,23 @@ func (b *Bridge) adoptOutsideSessionLock(ctx context.Context, jobID, filename st
 	} else {
 		candidateID, err = b.adopt(ctx, jobID, filename)
 	}
-	if err != nil || claim == nil {
+	if err != nil {
 		return candidateID, err
 	}
-	if settleErr := b.jobs.SettleMaterialization(ctx, claim.ID, claim.BindingID,
-		int64(b.epoch), candidate.InstitutionProfileRevision); settleErr != nil &&
-		!errors.Is(settleErr, job.ErrMaterializationStale) &&
-		!errors.Is(settleErr, job.ErrMaterializationConflict) {
-		log.Printf("papio: settling materialization after adoption: %v", settleErr)
+	if commitErr := b.commitArtifact(ctx, jobID, fence); commitErr != nil {
+		return candidateID, commitErr
 	}
 	return candidateID, nil
+}
+
+// adoptOutsideSessionLock runs validation without blocking unrelated browser
+// syncs. The adoption service leases the durable job state before validation,
+// so releasing the in-memory session lock cannot admit a competing adoption.
+// The caller must hold b.mu; it is held again before this method returns.
+func (b *Bridge) adoptOutsideSessionLock(ctx context.Context, jobID, filename string, provenance ...*app.BrowserDeliveryContext) (int64, error) {
+	b.mu.Unlock()
+	defer b.mu.Lock()
+	return b.ingestAdoptedFile(ctx, jobID, filename, provenance...)
 }
 
 // helloRequired tells a still-connected extension that the daemon lost its
@@ -5901,7 +5976,16 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string) error {
 		if !ok {
 			continue
 		}
-		if _, err := b.adopt(ctx, jobID, name); err != nil {
+		if _, err := b.ingestAdoptedFile(ctx, jobID, name); err != nil {
+			if errors.Is(err, errArtifactSuperseded) {
+				// Another delivery already won this attempt. Re-scanning would
+				// refuse the same bytes every tick, so the job is latched out
+				// of the sweep rather than deferred.
+				if latchErr := b.recordAdoptionConclusiveLatch(ctx, jobID); latchErr != nil {
+					return latchErr
+				}
+				continue
+			}
 			if evErr := b.recordAdoptionDeferred(ctx, jobID, name, err); evErr != nil {
 				return evErr
 			}

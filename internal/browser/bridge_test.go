@@ -5127,6 +5127,160 @@ func TestSweepAdoptionsAdoptsWithoutHello(t *testing.T) {
 	}
 }
 
+// The sweep is the path that runs precisely when correlation was missed — a
+// file that landed during daemon downtime, or after a lost download_complete —
+// so it is the last place that may adopt institutional bytes unfenced. It used
+// to call b.adopt directly, winning nothing.
+func TestSweepAdoptionRequiresWinningTheAttempt(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "wr_sweep_fenced", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-sweep", AuthenticationClaimID: "auth-sweep",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	if _, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-sweep", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimSweep, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: "candidate-sweep", BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = claimSweep
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), jobID, "paper.pdf"))
+
+	if err := b.SweepAdoptions(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	row, _ := jobs.Get(ctx, jobID)
+	if row.State != job.StateReady || row.ArtifactSHA256 == "" {
+		t.Fatalf("sweeper did not adopt: %+v", row)
+	}
+	// The attempt has materialization history, so the swept bytes owed a winner
+	// even though no claim was ever live.
+	winner, ok, err := jobs.ArtifactWinner(ctx, jobID, 1)
+	if err != nil || !ok {
+		t.Fatalf("swept institutional bytes adopted with no artifact winner: ok=%v err=%v", ok, err)
+	}
+	if winner.SHA256 != row.ArtifactSHA256 {
+		t.Fatalf("winner %q does not describe the adopted artifact %q", winner.SHA256, row.ArtifactSHA256)
+	}
+}
+
+// The winner must describe bytes that PASSED validation. Committing the CAS
+// first meant a rejected file (an HTML interstitial, a wrong-work PDF)
+// permanently won the attempt, and the correct PDF that landed afterwards
+// hashed differently and was refused as superseded, so the job could never
+// complete. The ordering is pinned at the weigh/commit seam rather than by
+// feeding a bad file through adoption, because the adoption service in this
+// harness accepts any bytes; the defect is the ordering itself.
+func TestWinnerIsNotCommittedBeforeValidation(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "wr_order", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-order", AuthenticationClaimID: "auth-order",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	if _, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-order", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: "candidate-order", BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), jobID, "paper.pdf"))
+
+	fence, err := b.weighArtifact(ctx, jobID, "paper.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fence.governed || fence.digest == "" {
+		t.Fatalf("institutional attempt not governed: %+v", fence)
+	}
+	// Nothing may be won until the bytes have been through adoption.
+	if _, ok, err := jobs.ArtifactWinner(ctx, jobID, 1); err != nil || ok {
+		t.Fatalf("winner committed before validation: ok=%v err=%v", ok, err)
+	}
+	if err := b.commitArtifact(ctx, jobID, fence); err != nil {
+		t.Fatal(err)
+	}
+	winner, ok, err := jobs.ArtifactWinner(ctx, jobID, 1)
+	if err != nil || !ok || winner.SHA256 != fence.digest {
+		t.Fatalf("winner does not describe the validated bytes: %+v ok=%v err=%v", winner, ok, err)
+	}
+}
+
+// Ordering defence for ingestAdoptedFile itself: when adoption refuses the
+// bytes, the attempt must still be winnable by a later valid delivery. A
+// cancelled job is the cheapest adoption refusal available here.
+func TestFailedAdoptionLeavesTheAttemptWinnable(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "wr_failed_adopt", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-failed", AuthenticationClaimID: "auth-failed",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	if _, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-failed", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: "candidate-failed", BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), jobID, "paper.pdf"))
+	if err := jobs.Cancel(ctx, jobID, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ingestAdoptedFile(ctx, jobID, "paper.pdf"); err == nil {
+		t.Fatal("adoption of a cancelled job unexpectedly succeeded; pick another refusal")
+	}
+	if _, ok, err := jobs.ArtifactWinner(ctx, jobID, 1); err != nil || ok {
+		t.Fatalf("bytes that failed adoption won the attempt: ok=%v err=%v", ok, err)
+	}
+}
+
 // RunSweeper must survive a transient store error: a dead adoption loop would
 // silently strand every subsequently downloaded PDF, and the daemon supervisor
 // does not watch this goroutine. Closing the DB forces every sweep to error;
