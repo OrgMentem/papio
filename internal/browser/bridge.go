@@ -4722,27 +4722,31 @@ const uncorrelatedEvidenceQuarantine = 2 * time.Minute
 // Callers that mutate gates or authentication leases MUST check the accepted
 // result: acting on a rejected observation reintroduces the same promotion one
 // layer up.
-func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resolverName, jobID string, verdict job.ProfileEvidenceVerdict, source job.ProfileEvidenceSource, producerObservedAt string) (bool, error) {
+// The returned storedID is the durable profile_evidence key, which differs
+// from the caller's observationID because it is hashed with the profile,
+// revision and holder. Anything that references the evidence row by foreign
+// key must use this value, not the input.
+func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resolverName, jobID string, verdict job.ProfileEvidenceVerdict, source job.ProfileEvidenceSource, producerObservedAt string) (accepted bool, storedID string, err error) {
 	if b.jobs == nil {
-		return false, nil
+		return false, "", nil
 	}
 	if b.materializationGenerationUnavailable {
-		return false, errors.New("browser holder generation is unavailable")
+		return false, "", errors.New("browser holder generation is unavailable")
 	}
-	profile, err := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverProfileKey(resolverName))
-	if err != nil || profile == nil || profile.TombstonedAt != "" {
-		return false, err
+	profile, profileErr := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverProfileKey(resolverName))
+	if profileErr != nil || profile == nil || profile.TombstonedAt != "" {
+		return false, "", profileErr
 	}
 	observedRevision := profile.Revision
 	correlated := strings.TrimSpace(jobID) != ""
 	if correlated {
 		attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
 		if attemptErr != nil {
-			return false, attemptErr
+			return false, "", attemptErr
 		}
 		candidate, candidateErr := b.jobs.CandidateForAttempt(ctx, jobID, attempt)
 		if candidateErr != nil {
-			return false, candidateErr
+			return false, "", candidateErr
 		}
 		if candidate != nil {
 			observedRevision = candidate.InstitutionProfileRevision
@@ -4755,7 +4759,7 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 		// reconciled fresh.
 		if changed, parseErr := time.Parse(time.RFC3339Nano, profile.UpdatedAt); parseErr == nil &&
 			b.now().UTC().Sub(changed.UTC()) < uncorrelatedEvidenceQuarantine {
-			return false, nil
+			return false, "", nil
 		}
 	}
 	received := b.now().UTC()
@@ -4773,24 +4777,24 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	}
 	sum := sha256.Sum256([]byte(strings.Join(idParts, "\x00")))
 	observationID = hex.EncodeToString(sum[:])
-	err = b.jobs.RecordProfileEvidence(ctx, job.ProfileEvidenceObservation{
+	recordErr := b.jobs.RecordProfileEvidence(ctx, job.ProfileEvidenceObservation{
 		ObservationID: observationID, BrowserHolderGeneration: int64(b.epoch),
 		InstitutionProfileID: profile.ID, InstitutionProfileRevision: observedRevision,
 		Verdict: verdict, Source: source, ProducerObservedAt: producerObservedAt,
 		DaemonReceivedAt: received.Format(time.RFC3339Nano),
 		ExpiresAt:        received.Add(profileEvidenceTTL).Format(time.RFC3339Nano),
 	})
-	if errors.Is(err, job.ErrProfileEvidenceStale) {
+	if errors.Is(recordErr, job.ErrProfileEvidenceStale) {
 		// The observation describes a superseded profile identity. Discarding
 		// it is the fence, not a transport failure — but the caller must not
 		// then act on it, so this is reported as not accepted rather than as
 		// success.
-		return false, nil
+		return false, "", nil
 	}
-	if err != nil {
-		return false, err
+	if recordErr != nil {
+		return false, "", recordErr
 	}
-	return true, nil
+	return true, observationID, nil
 }
 
 func evidenceVerdict(value string) job.ProfileEvidenceVerdict {
@@ -4871,7 +4875,7 @@ func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidenc
 			msgID = msgIDs[0]
 		}
 		obsID := evidenceObservationID("session_evidence", msgID, wantedProfile, p.Evidence, p.At)
-		accepted, err := b.recordProfileEvidence(ctx, obsID, wantedProfile, "", evidenceVerdict(p.Evidence), job.ProfileEvidenceProbe, p.At)
+		accepted, _, err := b.recordProfileEvidence(ctx, obsID, wantedProfile, "", evidenceVerdict(p.Evidence), job.ProfileEvidenceProbe, p.At)
 		if err != nil {
 			return err
 		}
@@ -5046,6 +5050,35 @@ func (b *Bridge) resolveProfileGatesForJob(ctx context.Context, observationKey, 
 	}
 	return nil
 }
+
+// renewMaterializationLease extends the live claim for a job the human is
+// demonstrably still working. RenewMaterializationClaim had no production
+// caller, so a login, MFA prompt or CAPTCHA that outlived the action expiry
+// let reconciliation abandon the claim underneath the user: the eventual
+// callback arrived stale, the candidate went back to eligible, and the bytes
+// that finally landed could not be fenced because the store refuses a winner
+// to a holder that can no longer prove it owns the effect.
+//
+// Authentication traffic is the precise signal — it is exactly the slow,
+// human-paced interaction that outruns the lease.
+func (b *Bridge) renewMaterializationLease(ctx context.Context, jobID string) {
+	if b.jobs == nil || strings.TrimSpace(jobID) == "" || b.materializationGenerationUnavailable {
+		return
+	}
+	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		return
+	}
+	claim, _, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, int64(b.epoch))
+	if err != nil || claim == nil {
+		return
+	}
+	renewErr := b.jobs.RenewMaterializationClaim(ctx, claim.ID, int64(b.epoch), b.now().Add(b.actionExpiry()))
+	if renewErr != nil && !errors.Is(renewErr, job.ErrMaterializationStale) {
+		log.Printf("papio: renewing materialization lease for %s: %v", jobID, renewErr)
+	}
+}
+
 func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) error {
 
 	kind := "browser.auth_pending"
@@ -5072,6 +5105,9 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	if job.Terminal(row.State) {
 		return nil
 	}
+	// Authentication traffic proves the human is still on this job, so the
+	// materialization lease must not expire underneath them.
+	b.renewMaterializationLease(ctx, msg.JobID)
 	resolverName := resolverProfileKey(row.Policy.Resolver)
 	if msg.Type == protocol.MsgAuthReturned {
 		// The GATE id must identify the occurrence, so it carries msg_id. The
@@ -5079,7 +5115,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 		// and auth_pending arrives with an empty payload and can toggle several
 		// times per tab, so keying it per frame grows the table with browsing
 		// activity instead of with distinct facts.
-		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		accepted, _, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}
@@ -5111,7 +5147,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 			return err
 		}
 	} else {
-		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		accepted, _, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}
@@ -5379,6 +5415,43 @@ func redactProviderDetail(detail string) string {
 	return cleaned
 }
 
+// suppressCurrentRoute records a durable, exactly-keyed suppression for the
+// route this job attempt is currently using, so the scheduler's suppression
+// anti-join stops re-selecting the identical tuple. The producer side of
+// route_suppressions had no caller at all, which left that anti-join with no
+// rows to consume: a route that proved it had no entitlement, or that answered
+// with a challenge, was re-offered on the next pass exactly as before.
+//
+// The key is the candidate's own tuple, so a rediscovery pass that mints a new
+// route revision is unaffected — only the route that actually failed is fenced.
+// A job with no institutional candidate is not institutional and is skipped.
+func (b *Bridge) suppressCurrentRoute(ctx context.Context, jobID string, reason job.RouteSuppressionReason, observationID string) error {
+	if b.jobs == nil {
+		return nil
+	}
+	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	candidate, err := b.jobs.CandidateForAttempt(ctx, jobID, attempt)
+	if err != nil || candidate == nil {
+		return err
+	}
+	return b.jobs.AddRouteSuppression(ctx, job.RouteSuppression{
+		RouteSuppressionKey: job.RouteSuppressionKey{
+			JobID: jobID, JobAttemptRevision: candidate.JobAttemptRevision,
+			InstitutionProfileID:       candidate.InstitutionProfileID,
+			InstitutionProfileRevision: candidate.InstitutionProfileRevision,
+			RouteRevision:              candidate.RouteRevision,
+			SafetyDomainID:             candidate.SafetyDomainID,
+			AdapterRevision:            candidate.AdapterRevision,
+			IdentifierStrategy:         candidate.IdentifierStrategy,
+		},
+		EvidenceObservationID: observationID,
+		Reason:                reason,
+	})
+}
+
 // outcome maps a terminal provider observation onto a policy-legal transition.
 func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.ProviderOutcomePayload) (err error) {
 	defer func() {
@@ -5429,7 +5502,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 	}
 	outcomeObservationKey := evidenceObservationID("provider_outcome", msgID, jobID, p.Outcome, p.AdapterID, p.AdapterVersion)
 	progressObservationKey := evidenceObservationID("provider_progress", msgID, jobID, p.Outcome)
-	evidenceAccepted, err := b.recordProfileEvidence(ctx,
+	evidenceAccepted, storedEvidenceID, err := b.recordProfileEvidence(ctx,
 		outcomeObservationKey,
 		rowForEvidence.Policy.Resolver, jobID, verdict, job.ProfileEvidenceProviderOutcome,
 		b.now().UTC().Format(time.RFC3339Nano))
@@ -5480,6 +5553,13 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 				if err := b.reserveAuthenticationEntry(ctx, rowForEvidence.Policy.Resolver, jobID); err != nil {
 					return err
 				}
+				// A challenge is a property of this route, not of the work, so
+				// fence the tuple as well as opening the human gate. Without a
+				// suppression the scheduler re-selects the identical route the
+				// moment the gate resolves.
+				if err := b.suppressCurrentRoute(ctx, jobID, job.RouteSuppressionProviderChallenge, storedEvidenceID); err != nil {
+					log.Printf("papio: suppressing challenged route for %s: %v", jobID, err)
+				}
 			}
 		}
 	}
@@ -5498,6 +5578,11 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		return b.jobs.Cancel(ctx, jobID, job.TerminalReasonBrowserCancelled)
 
 	case "no_entitlement", "document_delivery_available":
+		// This exact route proved it cannot serve this work. Fence it before
+		// any requeue so a rediscovery pass cannot re-select the same tuple.
+		if err := b.suppressCurrentRoute(ctx, jobID, job.RouteSuppressionNoEntitlement, storedEvidenceID); err != nil {
+			log.Printf("papio: suppressing route after %s for %s: %v", p.Outcome, jobID, err)
+		}
 		requeued, err := b.institutionalRouteRequeued(ctx, jobID)
 		if err != nil {
 			return err

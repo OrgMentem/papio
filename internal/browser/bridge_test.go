@@ -5319,7 +5319,7 @@ func TestBufferedFrameDoesNotPromoteIntoTheNewRevision(t *testing.T) {
 	}
 
 	// A frame produced under revision 1 now arrives.
-	accepted, err := b.recordProfileEvidence(ctx, "buffered-obs", "default", jobID,
+	accepted, _, err := b.recordProfileEvidence(ctx, "buffered-obs", "default", jobID,
 		job.ProfileEvidenceWarmVerified, job.ProfileEvidenceProbe,
 		b.now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
@@ -5768,6 +5768,105 @@ func TestDriveEpochResultDetailIsRedacted(t *testing.T) {
 		if strings.Contains(text, "https://") || strings.Contains(text, "provider.example.com") || strings.Contains(text, "token=") {
 			t.Fatalf("drive epoch result retained provider identity or a token: %q", text)
 		}
+	}
+}
+
+// route_suppressions had a complete store implementation, a scheduler
+// anti-join that consumes it, and no producer anywhere — so a route that proved
+// it had no entitlement was re-selected on the very next pass.
+func TestNoEntitlementSuppressesTheRouteItProved(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "wr_suppress", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-sup", AuthenticationClaimID: "auth-sup",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-suppress", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 3, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain-sup",
+		AdapterRevision: "adapter-7", EffectContractID: "effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := job.RouteSuppressionKey{
+		JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: candidate.RouteRevision, SafetyDomainID: candidate.SafetyDomainID,
+		AdapterRevision: candidate.AdapterRevision, IdentifierStrategy: candidate.IdentifierStrategy,
+	}
+	if active, err := jobs.ActiveRouteSuppressions(ctx, key); err != nil || len(active) != 0 {
+		t.Fatalf("expected no suppression before the outcome: %+v %v", active, err)
+	}
+	if err := b.outcome(ctx, jobID, "msg-no-ent", &protocol.ProviderOutcomePayload{
+		Outcome: "no_entitlement", Detail: "not licensed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	active, err := jobs.ActiveRouteSuppressions(ctx, key)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("no_entitlement did not suppress the route it disproved: %+v %v", active, err)
+	}
+	if active[0].Reason != job.RouteSuppressionNoEntitlement {
+		t.Fatalf("suppression reason = %q", active[0].Reason)
+	}
+}
+
+// A login or CAPTCHA is human-paced and routinely outlives the action expiry.
+// RenewMaterializationClaim had no caller, so reconciliation abandoned the
+// claim underneath the user and the bytes that finally landed could not be
+// fenced.
+func TestAuthTrafficRenewsTheMaterializationLease(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	jobID := parkInstitutional(t, jobs, "wr_renew", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-renew", AuthenticationClaimID: "auth-renew",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	if _, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-renew", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: "candidate-renew", BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(30 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.recordAuth(ctx, &protocol.BrowserMessage{
+		Type: protocol.MsgAuthPending, MsgID: "renew-pending-1", JobID: jobID,
+		Payload: &protocol.AuthPayload{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.LeaseUntil <= before.LeaseUntil {
+		t.Fatalf("auth traffic did not extend the lease: %q -> %q", before.LeaseUntil, after.LeaseUntil)
 	}
 }
 
