@@ -4621,37 +4621,65 @@ func validExtensionVersion(value string) bool {
 
 const profileEvidenceTTL = 30 * time.Minute
 
-// recordProfileEvidence persists one institutional-session observation. The
-// observation is fenced to the current browser holder generation and to the
-// exact profile revision it was produced under; receipt time, not producer
-// time, controls expiry. For a job-correlated observation the produced-under
-// revision is the revision snapshotted on that job's browser candidate when
-// the route was offered, never the revision that happens to be live when the
-// frame is ingested: a frame buffered across a profile edit describes the
-// superseded identity and is discarded instead of promoting the new revision.
-func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resolverName, jobID string, verdict job.ProfileEvidenceVerdict, source job.ProfileEvidenceSource, producerObservedAt string) error {
+// uncorrelatedEvidenceQuarantine is how long after a profile revision changes
+// an uncorrelated observation is refused. A frame with no job correlation
+// carries no proof of which revision produced it, so immediately after an
+// authority edit there is no way to tell a fresh observation of the new
+// identity from a buffered one describing the old. Refusing briefly is the
+// fail-closed reading; correlated frames are unaffected because they carry
+// their candidate's revision.
+const uncorrelatedEvidenceQuarantine = 2 * time.Minute
+
+// recordProfileEvidence persists one institutional-session observation and
+// reports whether it was accepted. The observation is fenced to the current
+// browser holder generation and to the exact profile revision it was produced
+// under; receipt time, not producer time, controls expiry.
+//
+// For a job-correlated observation the produced-under revision is the revision
+// snapshotted on that job's browser candidate, looked up through the attempt's
+// candidate HISTORY. Using the "current candidate" query here was a silent
+// hole: that query hides a candidate whose profile revision is no longer
+// current, so a frame buffered across a profile edit found nothing, fell back
+// to the revision live at receipt, and was stored as though the new identity
+// had been observed. The whole point of the fence is that it must not be.
+//
+// Callers that mutate gates or authentication leases MUST check the accepted
+// result: acting on a rejected observation reintroduces the same promotion one
+// layer up.
+func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resolverName, jobID string, verdict job.ProfileEvidenceVerdict, source job.ProfileEvidenceSource, producerObservedAt string) (bool, error) {
 	if b.jobs == nil {
-		return nil
+		return false, nil
 	}
 	if b.materializationGenerationUnavailable {
-		return errors.New("browser holder generation is unavailable")
+		return false, errors.New("browser holder generation is unavailable")
 	}
 	profile, err := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverProfileKey(resolverName))
 	if err != nil || profile == nil || profile.TombstonedAt != "" {
-		return err
+		return false, err
 	}
 	observedRevision := profile.Revision
-	if strings.TrimSpace(jobID) != "" {
+	correlated := strings.TrimSpace(jobID) != ""
+	if correlated {
 		attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
 		if attemptErr != nil {
-			return attemptErr
+			return false, attemptErr
 		}
-		candidate, candidateErr := b.jobs.CurrentBrowserCandidateForJob(ctx, jobID, attempt)
+		candidate, candidateErr := b.jobs.CandidateForAttempt(ctx, jobID, attempt)
 		if candidateErr != nil {
-			return candidateErr
+			return false, candidateErr
 		}
 		if candidate != nil {
 			observedRevision = candidate.InstitutionProfileRevision
+		}
+	} else if profile.Revision > 1 {
+		// Only an authority CHANGE is ambiguous. A profile at its first
+		// revision has no superseded identity for a buffered frame to be
+		// describing, and quarantining that case would refuse warm evidence
+		// for the whole window after every daemon start, when profiles are
+		// reconciled fresh.
+		if changed, parseErr := time.Parse(time.RFC3339Nano, profile.UpdatedAt); parseErr == nil &&
+			b.now().UTC().Sub(changed.UTC()) < uncorrelatedEvidenceQuarantine {
+			return false, nil
 		}
 	}
 	received := b.now().UTC()
@@ -4678,10 +4706,15 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	})
 	if errors.Is(err, job.ErrProfileEvidenceStale) {
 		// The observation describes a superseded profile identity. Discarding
-		// it is the fence, not a transport failure.
-		return nil
+		// it is the fence, not a transport failure — but the caller must not
+		// then act on it, so this is reported as not accepted rather than as
+		// success.
+		return false, nil
 	}
-	return err
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func evidenceVerdict(value string) job.ProfileEvidenceVerdict {
@@ -4762,8 +4795,14 @@ func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidenc
 			msgID = msgIDs[0]
 		}
 		obsID := evidenceObservationID("session_evidence", msgID, wantedProfile, p.Evidence, p.At)
-		if err := b.recordProfileEvidence(ctx, obsID, wantedProfile, "", evidenceVerdict(p.Evidence), job.ProfileEvidenceProbe, p.At); err != nil {
+		accepted, err := b.recordProfileEvidence(ctx, obsID, wantedProfile, "", evidenceVerdict(p.Evidence), job.ProfileEvidenceProbe, p.At)
+		if err != nil {
 			return err
+		}
+		if !accepted {
+			// Uncorrelated and unprovable against the current revision. It is
+			// not recorded, so it must not release parked work either.
+			return nil
 		}
 		b.lastSessionEvidenceAt[wantedProfile] = now
 	}
@@ -4950,8 +4989,16 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	}
 	resolverName := resolverProfileKey(row.Policy.Resolver)
 	if msg.Type == protocol.MsgAuthReturned {
-		if err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano)); err != nil {
+		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
 			return err
+		}
+		if !accepted {
+			// The observation describes a superseded profile identity. Resolving
+			// the login gate or promoting the authentication lease on it would
+			// assert that the CURRENT identity is authenticated, which is the
+			// promotion the evidence fence exists to prevent.
+			return nil
 		}
 		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateResolved, `{"source":"auth_returned"}`); err != nil {
 			return err
@@ -4974,8 +5021,12 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 			return err
 		}
 	} else {
-		if err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano)); err != nil {
+		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
 			return err
+		}
+		if !accepted {
+			return nil
 		}
 		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateOpen, `{"source":"auth_pending"}`); err != nil {
 			return err
@@ -5270,50 +5321,57 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 	}
 	outcomeObservationKey := evidenceObservationID("provider_outcome", msgID, jobID, p.Outcome, p.AdapterID, p.AdapterVersion)
 	progressObservationKey := evidenceObservationID("provider_progress", msgID, jobID, p.Outcome)
-	if err := b.recordProfileEvidence(ctx,
+	evidenceAccepted, err := b.recordProfileEvidence(ctx,
 		outcomeObservationKey,
 		rowForEvidence.Policy.Resolver, jobID, verdict, job.ProfileEvidenceProviderOutcome,
-		b.now().UTC().Format(time.RFC3339Nano)); err != nil {
+		b.now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
 		return err
 	}
-	switch p.Outcome {
-	case "human_auth_required":
-		// The explicit login gate remains current.
-	case "terms_acceptance_required":
-		if err := b.resolveProfileGatesForJob(ctx, progressObservationKey,
-			rowForEvidence.Policy.Resolver, jobID, job.HumanGateLogin, job.HumanGateMFA, job.HumanGateCaptchaOrSecurity); err != nil {
-			return err
+	// A rejected observation describes a superseded identity, so it must not
+	// move gates or the authentication lease on the current one. The job's own
+	// routing below still runs: refusing to route would strand the job over an
+	// authority question that says nothing about whether the work can proceed.
+	if evidenceAccepted {
+		switch p.Outcome {
+		case "human_auth_required":
+			// The explicit login gate remains current.
+		case "terms_acceptance_required":
+			if err := b.resolveProfileGatesForJob(ctx, progressObservationKey,
+				rowForEvidence.Policy.Resolver, jobID, job.HumanGateLogin, job.HumanGateMFA, job.HumanGateCaptchaOrSecurity); err != nil {
+				return err
+			}
+		default:
+			if err := b.resolveProfileGatesForJob(ctx, progressObservationKey,
+				rowForEvidence.Policy.Resolver, jobID, job.HumanGateLogin, job.HumanGateMFA,
+				job.HumanGateCaptchaOrSecurity, job.HumanGateTermsRequired); err != nil {
+				return err
+			}
 		}
-	default:
-		if err := b.resolveProfileGatesForJob(ctx, progressObservationKey,
-			rowForEvidence.Policy.Resolver, jobID, job.HumanGateLogin, job.HumanGateMFA,
-			job.HumanGateCaptchaOrSecurity, job.HumanGateTermsRequired); err != nil {
-			return err
-		}
-	}
-	switch p.Outcome {
-	case "human_auth_required":
-		if err := b.upsertProfileGate(ctx, outcomeObservationKey,
-			rowForEvidence.Policy.Resolver, jobID, job.HumanGateLogin, job.HumanGateOpen, `{"source":"provider_outcome"}`); err != nil {
-			return err
-		}
-		if err := b.reserveAuthenticationEntry(ctx, rowForEvidence.Policy.Resolver, jobID); err != nil {
-			return err
-		}
-	case "terms_acceptance_required":
-		if err := b.upsertProfileGate(ctx, outcomeObservationKey,
-			rowForEvidence.Policy.Resolver, jobID, job.HumanGateTermsRequired, job.HumanGateOpen, `{"source":"provider_outcome"}`); err != nil {
-			return err
-		}
-	case "ui_changed":
-		lower := strings.ToLower(p.Detail)
-		if strings.Contains(lower, "captcha") || strings.Contains(lower, "security") {
+		switch p.Outcome {
+		case "human_auth_required":
 			if err := b.upsertProfileGate(ctx, outcomeObservationKey,
-				rowForEvidence.Policy.Resolver, jobID, job.HumanGateCaptchaOrSecurity, job.HumanGateOpen, `{"source":"provider_outcome"}`); err != nil {
+				rowForEvidence.Policy.Resolver, jobID, job.HumanGateLogin, job.HumanGateOpen, `{"source":"provider_outcome"}`); err != nil {
 				return err
 			}
 			if err := b.reserveAuthenticationEntry(ctx, rowForEvidence.Policy.Resolver, jobID); err != nil {
 				return err
+			}
+		case "terms_acceptance_required":
+			if err := b.upsertProfileGate(ctx, outcomeObservationKey,
+				rowForEvidence.Policy.Resolver, jobID, job.HumanGateTermsRequired, job.HumanGateOpen, `{"source":"provider_outcome"}`); err != nil {
+				return err
+			}
+		case "ui_changed":
+			lower := strings.ToLower(p.Detail)
+			if strings.Contains(lower, "captcha") || strings.Contains(lower, "security") {
+				if err := b.upsertProfileGate(ctx, outcomeObservationKey,
+					rowForEvidence.Policy.Resolver, jobID, job.HumanGateCaptchaOrSecurity, job.HumanGateOpen, `{"source":"provider_outcome"}`); err != nil {
+					return err
+				}
+				if err := b.reserveAuthenticationEntry(ctx, rowForEvidence.Policy.Resolver, jobID); err != nil {
+					return err
+				}
 			}
 		}
 	}

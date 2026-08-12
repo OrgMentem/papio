@@ -5281,6 +5281,57 @@ func TestFailedAdoptionLeavesTheAttemptWinnable(t *testing.T) {
 	}
 }
 
+// The bridge must supply the revision the observation was PRODUCED under, not
+// the one live when it arrives. This used to fall through: the correlated
+// lookup asked for the job's *current* candidate, a query that deliberately
+// hides candidates whose profile revision is superseded, so a frame buffered
+// across an authority edit found nothing and was stamped with the new
+// revision — the store then accepted it, because that revision really is live.
+func TestBufferedFrameDoesNotPromoteIntoTheNewRevision(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "wr_stale_rev", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-v1", AuthenticationClaimID: "auth-rev",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	profile := profiles[0]
+	// The route was offered under revision 1, so the candidate records it.
+	if _, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-stale-rev", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The operator changes authority-relevant configuration: revision 2.
+	bumped, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-v2", AuthenticationClaimID: "auth-rev",
+	}})
+	if err != nil || len(bumped) != 1 || bumped[0].Revision != profile.Revision+1 {
+		t.Fatalf("expected a revision bump, got %+v %v", bumped, err)
+	}
+
+	// A frame produced under revision 1 now arrives.
+	accepted, err := b.recordProfileEvidence(ctx, "buffered-obs", "default", jobID,
+		job.ProfileEvidenceWarmVerified, job.ProfileEvidenceProbe,
+		b.now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted {
+		t.Fatal("a frame produced under the superseded revision was accepted")
+	}
+	if _, ok, err := jobs.CurrentProfileEvidence(ctx, profile.ID, bumped[0].Revision, int64(b.epoch)); err != nil || ok {
+		t.Fatalf("stale observation became current evidence for the new revision: ok=%v err=%v", ok, err)
+	}
+}
+
 // RunSweeper must survive a transient store error: a dead adoption loop would
 // silently strand every subsequently downloaded PDF, and the daemon supervisor
 // does not watch this goroutine. Closing the DB forces every sweep to error;
