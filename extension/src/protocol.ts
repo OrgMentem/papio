@@ -267,7 +267,7 @@ export interface ProviderDriveEpochTuple {
 }
 export interface ProviderDriveEpochStartRequestPayload extends ProviderDriveEpochTuple {}
 export interface ProviderDriveEpochStartResultPayload extends ProviderDriveEpochTuple {
-  outcome: "started" | "stale" | "unsupported" | "error";
+  outcome: "started" | "duplicate" | "stale" | "unsupported" | "error";
   detail?: string;
 }
 export interface ProviderDriveEpochResultRequestPayload extends ProviderDriveEpochTuple {
@@ -2168,7 +2168,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       const revision = str(p, "revision", type, 128);
       if (/[\u0000\r\n]/u.test(strategy + revision)) fail(`${type} tuple text is invalid`);
       const outcome = str(p, "outcome", type, 64);
-      if (!["started", "stale", "unsupported", "error"].includes(outcome)) fail(`${type}.outcome is invalid`);
+      if (!["started", "duplicate", "stale", "unsupported", "error"].includes(outcome)) fail(`${type}.outcome is invalid`);
       if ("detail" in p) str(p, "detail", type, 500);
       break;
     }

@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -1249,9 +1250,18 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: routeRevision, RouteClass: "institutional", IdentifierStrategy: strategy,
 		PreRouteSafetyKey: materializationMAC(key, "pre_route_safety", profile.ID, row.ID, strconv.FormatInt(attempt, 10)),
-		SafetyDomainID:    materializationMAC(key, "safety_domain", profile.ID, row.ID),
-		AdapterRevision:   "packaged:institutional_materialization/1",
-		EffectContractID:  "browser_tab:institutional_materialization/1", Status: "eligible",
+		// The safety domain is a PROVIDER fence, so it must be shared by every
+		// job that will reach the same provider; the scheduler's sibling
+		// anti-join is the only thing serializing irreversible effects across
+		// jobs, and it compares this value. Mixing row.ID in gave every job a
+		// private domain, so that anti-join could never match a sibling and
+		// cross-job serialization silently did nothing. Pre-route, the honest
+		// shared axis is the institution profile: all of its traffic leaves
+		// through the same resolver and proxy. A landed provider domain, once
+		// there is one, is the stronger key and belongs here instead.
+		SafetyDomainID:   materializationMAC(key, "safety_domain", profile.ID),
+		AdapterRevision:  "packaged:institutional_materialization/1",
+		EffectContractID: "browser_tab:institutional_materialization/1", Status: "eligible",
 	}
 	candidate, createErr := b.jobs.CreateBrowserCandidate(ctx, input)
 	if createErr != nil {
@@ -1654,7 +1664,16 @@ func (b *Bridge) institutionalReconcile(ctx context.Context, p *protocol.Institu
 			if !eligibleNow {
 				continue
 			}
-			tabID := binding.TabID
+			// The reported tab must be the one the claim is durably bound to.
+			// Echoing the extension's number back would let a reconcile assert
+			// any tab as this materialization's tab, which is the one fact the
+			// daemon is supposed to be the authority on. A mismatch is an
+			// ordinary desync, not an error: the claim is simply not confirmed,
+			// so the extension rebuilds rather than adopting a wrong tab.
+			if claim.TabID != binding.TabID {
+				continue
+			}
+			tabID := claim.TabID
 			result.Claims = append(result.Claims, protocol.InstitutionalReconcileClaim{
 				ClaimID: claim.ID, BindingID: claim.BindingID, CandidateID: claim.CandidateID,
 				Phase: claim.Phase, TabID: &tabID,
@@ -2011,14 +2030,21 @@ func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *p
 						outcome, detail = "error", "provider drive epoch authorization is unavailable"
 					} else if !authorized {
 						outcome, detail = "stale", "drive epoch job is no longer awaiting this handoff"
+					} else if started {
+						// The durable start event already exists, so this tuple
+						// was authorized once. Returning "started" again would
+						// re-authorize an irreversible provider effect after a
+						// worker death that lost only the result, which is the
+						// one thing an at-most-once permit must not do. The
+						// extension proceeds solely on "started" and fails
+						// closed on anything else.
+						outcome, detail = "duplicate", "drive epoch was already authorized"
 					} else {
 						outcome, detail = "started", ""
-						if !started {
-							if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.provider_drive_epoch_started", map[string]any{
-								"drive_attempt_id": driveAttemptID, "ordinal": ordinal, "strategy": strategy, "revision": revision, "safety_domain": domain,
-							}); err != nil {
-								outcome, detail = "error", "provider drive epoch start could not be recorded"
-							}
+						if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.provider_drive_epoch_started", map[string]any{
+							"drive_attempt_id": driveAttemptID, "ordinal": ordinal, "strategy": strategy, "revision": revision, "safety_domain": domain,
+						}); err != nil {
+							outcome, detail = "error", "provider drive epoch start could not be recorded"
 						}
 					}
 				}
@@ -5280,6 +5306,24 @@ func (b *Bridge) updateCaptureLease(ctx context.Context, jobID string) error {
 	return b.captureStore.UpdateJob(ctx, jobID, first, latest)
 }
 
+// providerDetailRedaction removes URL-shaped and credential-shaped substrings
+// from extension-supplied free text before it reaches durable storage.
+var providerDetailRedaction = regexp.MustCompile(
+	`(?i)([a-z][a-z0-9+.-]*://\S+|[?&][^\s=]{1,64}=[^\s&]+|\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/\S*)?|\b[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{8,}\b|\b[A-Fa-f0-9]{32,}\b)`)
+
+// redactProviderDetail keeps a provider's free text diagnosable without making
+// the durable event a place where a URL, query token, or credential can land.
+// The text is adapter-authored and travels through the extension, so it is
+// untrusted input: truncation alone does not sanitise it. Closed outcome codes
+// carry the meaning; this string is only ever a human hint.
+func redactProviderDetail(detail string) string {
+	cleaned := providerDetailRedaction.ReplaceAllString(strings.TrimSpace(detail), "[redacted]")
+	if len(cleaned) > 200 {
+		cleaned = cleaned[:200]
+	}
+	return cleaned
+}
+
 // outcome maps a terminal provider observation onto a policy-legal transition.
 func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.ProviderOutcomePayload) (err error) {
 	defer func() {
@@ -5301,7 +5345,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 	detail := map[string]any{
 		"outcome":           p.Outcome,
 		"adapter_version":   p.AdapterVersion,
-		"detail":            p.Detail,
+		"detail":            redactProviderDetail(p.Detail),
 		"extension_version": sourceExtensionVersion,
 	}
 	if p.AdapterID != "" {
@@ -6814,7 +6858,7 @@ jobLoop:
 				if eventErr != nil {
 					log.Printf("papio: reading direct-route history for %s: %v", id, eventErr)
 				} else {
-					ordinal, inFlight := directRouteProgress(events, candidates)
+					ordinal, inFlight := directRouteProgress(events, candidates, b.now())
 					if inFlight || directRouteSucceeded(events) {
 						continue
 					}
@@ -7447,10 +7491,29 @@ func directRouteOrdinal(detail map[string]any) (int, bool) {
 	}
 }
 
+// stringValue reads an event column that the store returns as an untyped map
+// value.
+func stringValue(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+// directRouteOfferLease bounds how long an offered tuple may sit unanswered
+// before it may be offered again. The durable "offered" event is committed
+// before the frame is appended to the sync response, so a crash, a native-host
+// disconnect, or a failed delivery in that window leaves an offer no client
+// ever saw. Without a lease that tuple is in flight forever: the job is
+// skipped by every later poll, nobody can produce the missing result, and it
+// parks with no attention surface. Re-offering is safe rather than a second
+// effect because it replays the IDENTICAL tuple, and a drive epoch that really
+// did start answers a replayed start with "duplicate".
+const directRouteOfferLease = 10 * time.Minute
+
 // directRouteProgress projects durable direct-route tuples. An offered phase
-// without its matching result remains in flight, and all non-success
-// observations remain terminal for that tuple without advancing.
-func directRouteProgress(events []map[string]any, candidates []routes.Candidate) (next int, inFlight bool) {
+// without its matching result remains in flight until its lease expires, and
+// all non-success observations remain terminal for that tuple without
+// advancing.
+func directRouteProgress(events []map[string]any, candidates []routes.Candidate, now time.Time) (next int, inFlight bool) {
 	attempt := ""
 	revision := ""
 	ordinal := -1
@@ -7471,7 +7534,9 @@ func directRouteProgress(events []map[string]any, candidates []routes.Candidate)
 		switch stringDetail(detail, "phase") {
 		case "offered":
 			if eventOrdinal == next {
-				attempt, revision, ordinal, inFlight = eventAttempt, eventRevision, eventOrdinal, true
+				issued, parseErr := time.Parse(time.RFC3339Nano, stringValue(event["at"]))
+				expired := parseErr == nil && now.UTC().Sub(issued.UTC()) >= directRouteOfferLease
+				attempt, revision, ordinal, inFlight = eventAttempt, eventRevision, eventOrdinal, !expired
 			}
 		case "result":
 			if eventOrdinal != ordinal || eventAttempt != attempt || eventRevision != revision || !inFlight {
@@ -7853,7 +7918,7 @@ func (b *Bridge) providerDirectGetResult(ctx context.Context, jobID string, p *p
 	if err != nil {
 		return err
 	}
-	ordinal, inFlight := directRouteProgress(events, candidates)
+	ordinal, inFlight := directRouteProgress(events, candidates, b.now())
 	if !inFlight || p.Ordinal != int64(ordinal) || ordinal >= len(candidates) ||
 		p.RouteRevision != candidates[ordinal].RouteRevision {
 		return nil
@@ -7914,8 +7979,13 @@ func (b *Bridge) providerDirectGetResult(ctx context.Context, jobID string, p *p
 	if finalPath != "" {
 		detail["final_path"] = finalPath
 	}
-	if p.Detail != "" {
-		detail["detail"] = truncate(p.Detail, 500)
+	if redacted := redactProviderDetail(p.Detail); redacted != "" {
+		// Truncation is not sanitisation: a 500-character cap still admits a
+		// full URL or a query token. final_host/final_path above are safe by a
+		// different mechanism — they are only retained when they matched the
+		// candidate origin and path papio itself proposed, so they cannot
+		// carry provider-chosen material.
+		detail["detail"] = redacted
 	}
 	if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.direct_route", detail); err != nil {
 		return err

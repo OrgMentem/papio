@@ -1173,7 +1173,7 @@
           "ordinal": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
           "strategy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\u0000\r\n]+$" },
           "revision": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\u0000\r\n]+$" },
-          "outcome": { "enum": ["started", "stale", "unsupported", "error"] },
+          "outcome": { "enum": ["started", "duplicate", "stale", "unsupported", "error"] },
           "detail": { "type": "string", "maxLength": 500 }
         }
       } } }

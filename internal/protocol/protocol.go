@@ -2458,7 +2458,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = validateDriveEpochTuple(p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision, "provider_drive_epoch_start_result")
 		}
 		if err == nil {
-			err = enumRequired("provider_drive_epoch_start_result.outcome", p.Outcome, "started", "stale", "unsupported", "error")
+			err = enumRequired("provider_drive_epoch_start_result.outcome", p.Outcome, "started", "duplicate", "stale", "unsupported", "error")
 		}
 		msg.Payload = p
 	case MsgProviderDriveEpochResultRequest:

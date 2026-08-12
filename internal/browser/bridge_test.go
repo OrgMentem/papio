@@ -40,6 +40,7 @@ import (
 	"papio/internal/pulse"
 	"papio/internal/resolver"
 	"papio/internal/retraction"
+	"papio/internal/routes"
 	"papio/internal/store"
 	"papio/internal/triage"
 	"papio/internal/watch"
@@ -5395,6 +5396,189 @@ func TestRepeatedAuthPendingWithoutElapsedReopensTheLoginGate(t *testing.T) {
 	}
 }
 
+// Free text authored by an adapter and relayed by the extension is untrusted
+// input. Truncation is not sanitisation: a 500-character cap still admits a
+// whole URL, a query token or a credential, and durable events are exactly
+// where those must never land.
+func TestProviderFreeTextIsRedactedBeforeItIsDurable(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		in    string
+		clean string
+	}{
+		{"url", "failed at https://provider.example.com/doi/pdf?token=abc123", "https://"},
+		{"bare host", "redirected to sso.provider.example.com/login", "provider.example.com"},
+		{"query token", "gave up ?session=9f8e7d6c5b4a", "?session="},
+		{"long hex", "cookie 0123456789abcdef0123456789abcdef", "0123456789abcdef0123456789abcdef"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := redactProviderDetail(test.in)
+			if strings.Contains(got, test.clean) {
+				t.Fatalf("redaction left %q in %q", test.clean, got)
+			}
+			if !strings.Contains(got, "[redacted]") {
+				t.Fatalf("nothing was redacted from %q -> %q", test.in, got)
+			}
+		})
+	}
+	if got := redactProviderDetail("captcha challenge shown"); got != "captcha challenge shown" {
+		t.Fatalf("ordinary diagnostic text was mangled: %q", got)
+	}
+}
+
+// An offered direct-route tuple whose frame never reached any client must not
+// pin the job in flight forever. The durable offered event is committed before
+// the frame is appended to the sync response, so a crash in that window leaves
+// an offer nobody saw; without a lease the job is skipped by every later poll
+// and parks with no attention surface and no way for anyone to resolve it.
+func TestUnacknowledgedDirectRouteOfferExpiresInsteadOfStranding(t *testing.T) {
+	candidates := []routes.Candidate{{RouteRevision: "rev-1"}}
+	issued := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	events := []map[string]any{{
+		"kind": "browser.direct_route",
+		"at":   issued.Format(time.RFC3339Nano),
+		"detail": map[string]any{
+			"route_revision": "rev-1", "ordinal": float64(0),
+			"drive_attempt_id": "attempt-1", "phase": "offered",
+		},
+	}}
+	if _, inFlight := directRouteProgress(events, candidates, issued.Add(time.Minute)); !inFlight {
+		t.Fatal("a fresh offer must still count as in flight")
+	}
+	_, inFlight := directRouteProgress(events, candidates, issued.Add(directRouteOfferLease+time.Second))
+	if inFlight {
+		t.Fatal("an offer nobody acknowledged pinned the job in flight past its lease")
+	}
+}
+
+// Reconcile must not let the extension assert which tab a claim is bound to.
+// The daemon is the authority on that binding; echoing the reported number
+// back would confirm any tab as this materialization's tab.
+func TestReconcileRefusesATabThatIsNotTheClaimsOwn(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	jobID := parkInstitutional(t, jobs, "wr_reconcile_tab", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-tab", AuthenticationClaimID: "auth-tab",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	if _, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-tab", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: "candidate-tab", BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const boundTab = 41
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profiles[0].Revision, boundTab); err != nil {
+		t.Fatal(err)
+	}
+	reconcile := func(tab int64) *protocol.InstitutionalReconcileResponsePayload {
+		t.Helper()
+		frames, err := b.institutionalReconcile(ctx, &protocol.InstitutionalReconcileRequestPayload{
+			RequestID: "req_reconcile_tab_fence",
+			Bindings:  []protocol.InstitutionalReconcileBinding{{BindingID: claim.BindingID, TabID: tab}},
+		})
+		if err != nil || len(frames) != 1 {
+			t.Fatalf("reconcile: frames=%d err=%v", len(frames), err)
+		}
+		msg, decodeErr := protocol.DecodeBrowserMessage(frames[0])
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		return msg.Payload.(*protocol.InstitutionalReconcileResponsePayload)
+	}
+	if got := reconcile(boundTab); len(got.Claims) != 1 || got.Claims[0].TabID == nil || *got.Claims[0].TabID != boundTab {
+		t.Fatalf("the claim's own tab was not confirmed: %+v", got)
+	}
+	if got := reconcile(boundTab + 1); len(got.Claims) != 0 {
+		t.Fatalf("a tab the claim is not bound to was confirmed: %+v", got.Claims)
+	}
+}
+
+// The safety domain is the ONLY thing serializing irreversible effects across
+// jobs: the scheduler excludes a candidate when a sibling sharing this value
+// has a parked claim. Mixing the job id in gave every job a private domain, so
+// that anti-join matched nothing and the fence silently did not exist.
+func TestSafetyDomainIsSharedAcrossJobsOnOneProfile(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	first := parkInstitutional(t, jobs, "wr_domain_a", handoffWork(), "")
+	second := parkInstitutional(t, jobs, "wr_domain_b", handoffWork(), "")
+	rowA, err := jobs.Get(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowB, err := jobs.Get(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candA, err := b.prepareMaterializationCandidate(ctx, *rowA)
+	if err != nil || candA == nil {
+		t.Fatalf("candidate a: %+v %v", candA, err)
+	}
+	candB, err := b.prepareMaterializationCandidate(ctx, *rowB)
+	if err != nil || candB == nil {
+		t.Fatalf("candidate b: %+v %v", candB, err)
+	}
+	if candA.SafetyDomainID != candB.SafetyDomainID {
+		t.Fatalf("two jobs on one profile got private safety domains (%q vs %q); the cross-job fence cannot match",
+			candA.SafetyDomainID, candB.SafetyDomainID)
+	}
+	if candA.PreRouteSafetyKey == candB.PreRouteSafetyKey {
+		t.Fatal("pre-route safety keys must stay per job")
+	}
+}
+
+// End-to-end: the redaction must be applied where the event is written, not
+// merely available as a helper.
+func TestPersistedProviderOutcomeDetailIsRedacted(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "wr_redact_event", handoffWork(), "")
+	if err := b.outcome(ctx, jobID, "msg-redact", &protocol.ProviderOutcomePayload{
+		Outcome: "ui_changed",
+		Detail:  "stuck at https://provider.example.com/doi/pdf?token=secret123",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event["kind"] != "browser.provider_outcome" {
+			continue
+		}
+		found = true
+		detail, _ := event["detail"].(map[string]any)
+		text, _ := detail["detail"].(string)
+		if strings.Contains(text, "https://") || strings.Contains(text, "provider.example.com") || strings.Contains(text, "secret123") {
+			t.Fatalf("durable event retained provider identity or a token: %q", text)
+		}
+	}
+	if !found {
+		t.Fatal("no provider outcome event was recorded")
+	}
+}
+
 // RunSweeper must survive a transient store error: a dead adoption loop would
 // silently strand every subsequently downloaded PDF, and the daemon supervisor
 // does not watch this goroutine. Closing the DB forces every sweep to error;
@@ -7588,6 +7772,16 @@ func TestProviderDriveEpochTupleLifecycle(t *testing.T) {
 	again, err := b.providerDriveEpochStart(ctx, id, start)
 	if err != nil || len(again) != 1 {
 		t.Fatalf("duplicate start: frames=%d err=%v", len(again), err)
+	}
+	// Replaying the exact tuple after a worker death must NOT re-authorize the
+	// irreversible effect. This previously returned "started" a second time and
+	// only skipped rewriting the event, and the test asserted frame count only.
+	repeat, decodeErr := protocol.DecodeBrowserMessage(again[0])
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if got := repeat.Payload.(*protocol.ProviderDriveEpochStartResultPayload).Outcome; got != "duplicate" {
+		t.Fatalf("replayed drive epoch start outcome = %q, want duplicate", got)
 	}
 	stale := *start
 	stale.Ordinal = 1
