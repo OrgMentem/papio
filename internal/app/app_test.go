@@ -2276,6 +2276,27 @@ func TestRetryPlanReportsWhatItObserved(t *testing.T) {
 	// made, so charging it would let papio's own throttle settle a job
 	// "temporary source failures did not clear" about sources it never called.
 	// Liveness comes from the cadence floor, not from the budget.
+	// The exemption must be narrow. A pass where sources WERE reached and simply
+	// had nothing is a real answer: it stays chargeable, so the retry budget can
+	// still bound it and the job can eventually settle. Exempting it turned an
+	// answered-but-empty pass into an uncharged 30-second re-park forever.
+	t.Run("a_pass_that_reached_sources_is_still_charged", func(t *testing.T) {
+		now := time.Date(2026, 8, 12, 1, 37, 0, 0, time.UTC)
+		plan := retryPlan{SourcesCalled: 2}
+		plan.recordDeferral(&budget.ErrDeferred{
+			Source: "openaire", Until: now.Add(3 * time.Second), Advisory: true,
+		})
+		if plan.AdvisoryOnly() {
+			t.Fatal("a pass that called sources is not advisory-only")
+		}
+		if plan.Kind() != retryKindTemporary {
+			t.Fatalf("Kind() = %q, want %q so the retry budget bounds it", plan.Kind(), retryKindTemporary)
+		}
+		if plan.IsZero() {
+			t.Fatal("a throttled source papio never asked must not settle the job")
+		}
+	})
+
 	t.Run("advisory_only_pass_uses_retry_cadence_and_is_not_charged", func(t *testing.T) {
 		svc, jobs := newTestService(t)
 		ctx := context.Background()

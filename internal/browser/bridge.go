@@ -2055,6 +2055,13 @@ func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *p
 						// one thing an at-most-once permit must not do. The
 						// extension proceeds solely on "started" and fails
 						// closed on anything else.
+						// Refusing is correct, but it must not also be permanent:
+						// the extension retires the epoch without ever sending a
+						// result, so this tuple answers "duplicate" forever. The
+						// release is at the OFFER, which supersedes a stalled
+						// epoch and mints a successor — superseding here instead
+						// would discard a result that is merely late, since the
+						// result path rejects a superseded tuple.
 						outcome, detail = "duplicate", "drive epoch was already authorized"
 					} else {
 						outcome, detail = "started", ""
@@ -2114,7 +2121,7 @@ func (b *Bridge) providerDriveEpochResult(ctx context.Context, jobID string, p *
 								"outcome": p.Outcome, "safety_domain": domain,
 							}
 							if p.Detail != "" {
-								resultDetail["detail"] = truncate(p.Detail, 500)
+								resultDetail["detail"] = redactProviderDetail(p.Detail)
 							}
 							if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.provider_drive_epoch_result", resultDetail); err != nil {
 								outcome, detail = "error", "provider drive epoch result could not be recorded"
@@ -5067,7 +5074,12 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	}
 	resolverName := resolverProfileKey(row.Policy.Resolver)
 	if msg.Type == protocol.MsgAuthReturned {
-		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.MsgID, msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		// The GATE id must identify the occurrence, so it carries msg_id. The
+		// EVIDENCE id must not: profile_evidence is append-only with no pruning,
+		// and auth_pending arrives with an empty payload and can toggle several
+		// times per tab, so keying it per frame grows the table with browsing
+		// activity instead of with distinct facts.
+		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}
@@ -5099,7 +5111,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 			return err
 		}
 	} else {
-		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.MsgID, msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		accepted, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}
@@ -7844,6 +7856,44 @@ func providerDriveEpochSuppressed(events []map[string]any, domain string) bool {
 	return current != "" && (started || result || successor)
 }
 
+// providerDriveEpochLease bounds how long a started generic drive epoch may go
+// without a result before the next offer may supersede it. The extension
+// retires an epoch it cannot restart without ever sending a result — an MV3
+// worker death between the start ack and downloads.download() is enough — and
+// every later start for that tuple is correctly refused as a duplicate. Without
+// this the refusal is permanent and the job's automated drive simply stops,
+// reachable only by an operator `papio actions open`.
+const providerDriveEpochLease = 10 * time.Minute
+
+// driveEpochStalled reports a started tuple with no result whose lease has run
+// out, so the next offer should mint a successor instead of replaying it.
+func (b *Bridge) driveEpochStalled(jobID, attempt string, ordinal int64) bool {
+	if b == nil || b.jobs == nil || attempt == "" {
+		return false
+	}
+	events, err := b.jobs.Events(context.Background(), jobID)
+	if err != nil {
+		return false
+	}
+	tuple := providerDriveEpochKey(attempt, ordinal, "generic", "1")
+	current, started, applied, superseded, _ := providerDriveEpochState(events, tuple)
+	if current != tuple || superseded || !started || applied {
+		return false
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "browser.provider_drive_epoch_started" {
+			continue
+		}
+		d, _ := events[i]["detail"].(map[string]any)
+		if stringDetail(d, "drive_attempt_id") != attempt {
+			continue
+		}
+		at, parseErr := time.Parse(time.RFC3339Nano, stringValue(events[i]["at"]))
+		return parseErr == nil && b.now().UTC().Sub(at.UTC()) >= providerDriveEpochLease
+	}
+	return false
+}
+
 // latestProviderDriveEpoch derives the generic tuple from durable events.
 func (b *Bridge) latestProviderDriveEpoch(jobID string) (string, int64, bool) {
 	if b == nil || b.jobs == nil {
@@ -7931,6 +7981,9 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 			if durableDomain := b.latestHandoffSafetyDomain(row.ID); durableDomain != "" {
 				domain = durableDomain
 			}
+		}
+		if !forceNewEpoch && ok && b.driveEpochStalled(row.ID, attempt, ordinal) {
+			forceNewEpoch = true
 		}
 		if forceNewEpoch && ok && b.jobs != nil {
 			if err := b.jobs.S.AppendEvent(context.Background(), row.ID, "browser.provider_drive_epoch_superseded", map[string]any{

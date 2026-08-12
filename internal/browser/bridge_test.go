@@ -5675,6 +5675,102 @@ func TestDirectRouteLeaseDoesNotResurrectAnsweredTuples(t *testing.T) {
 	}
 }
 
+// "duplicate" is the right refusal but must not be a permanent stop. The
+// extension retires an epoch it cannot restart WITHOUT sending a result, so the
+// tuple would answer duplicate forever; the release is that the next offer
+// supersedes a stalled epoch and mints a successor.
+func TestStalledDriveEpochIsSupersededByTheNextOffer(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	// The started event's timestamp comes from the store's real clock, so the
+	// bridge clock has to advance relative to real time, not to a fixed past.
+	runSync(t, b, helloAs("0.14.0"))
+	id := park(t, jobs, "wr_epoch_stall", handoffWork())
+	attempt := "epoch-stalled-0001"
+	domain := map[string]any{
+		"drive_attempt_id": attempt, "ordinal": int64(0), "strategy": "generic",
+		"revision": "1", "safety_domain": "institution:example.edu",
+	}
+	if err := jobs.RecordEvent(ctx, id, "browser.provider_drive_epoch_offered", domain); err != nil {
+		t.Fatal(err)
+	}
+	start := &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}
+	if _, err := b.providerDriveEpochStart(ctx, id, start); err != nil {
+		t.Fatal(err)
+	}
+	// A fresh stall is not yet supersedable.
+	if b.driveEpochStalled(id, attempt, 0) {
+		t.Fatal("a just-started epoch must not be superseded")
+	}
+	b.now = func() time.Time { return time.Now().UTC().Add(providerDriveEpochLease + time.Minute) }
+	if !b.driveEpochStalled(id, attempt, 0) {
+		t.Fatal("a started epoch with no result stayed unreleasable past its lease")
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.offer(*row, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff"}, config.ModeDelegated); err != nil {
+		t.Fatal(err)
+	}
+	next, _, ok := b.latestProviderDriveEpoch(id)
+	if !ok || next == attempt {
+		t.Fatalf("offer did not mint a successor epoch: %q ok=%v", next, ok)
+	}
+	// The stalled tuple can never start again.
+	frames, err := b.providerDriveEpochStart(ctx, id, start)
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("start after supersession: frames=%d err=%v", len(frames), err)
+	}
+	msg, decodeErr := protocol.DecodeBrowserMessage(frames[0])
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if got := msg.Payload.(*protocol.ProviderDriveEpochStartResultPayload).Outcome; got == "started" {
+		t.Fatal("a superseded tuple was re-authorized")
+	}
+}
+
+// The drive-epoch result path is the third sink for the same adapter-authored
+// free text and was left on truncate() while the other two were redacted.
+func TestDriveEpochResultDetailIsRedacted(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_epoch_redact", handoffWork())
+	attempt := "epoch-redact-0001"
+	if err := jobs.RecordEvent(ctx, id, "browser.provider_drive_epoch_offered", map[string]any{
+		"drive_attempt_id": attempt, "ordinal": int64(0), "strategy": "generic",
+		"revision": "1", "safety_domain": "institution:example.edu",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.providerDriveEpochStart(ctx, id, &protocol.ProviderDriveEpochStartRequestPayload{
+		DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.providerDriveEpochResult(ctx, id, &protocol.ProviderDriveEpochResultRequestPayload{
+		DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
+		Outcome: "not_pdf", Detail: "landed on https://provider.example.com/login?token=abc123",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] != "browser.provider_drive_epoch_result" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		text, _ := detail["detail"].(string)
+		if strings.Contains(text, "https://") || strings.Contains(text, "provider.example.com") || strings.Contains(text, "token=") {
+			t.Fatalf("drive epoch result retained provider identity or a token: %q", text)
+		}
+	}
+}
+
 // RunSweeper must survive a transient store error: a dead adoption loop would
 // silently strand every subsequently downloaded PDF, and the daemon supervisor
 // does not watch this goroutine. Closing the DB forces every sweep to error;

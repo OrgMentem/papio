@@ -520,6 +520,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 				return nil, plan, err
 			}
 		}
+		plan.SourcesCalled++
 		cands, err := entry.Adapter.Resolve(ctx, row.Work)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -841,6 +842,7 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver
 				continue
 			}
 		}
+		plan.SourcesCalled++
 		cands, err := sibling.ResolveSiblings(ctx, row.Work)
 		if err != nil {
 			// A rate-limited sibling lookup is not a verdict. Recording it as
@@ -907,6 +909,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 			return nil, plan
 		}
 	}
+	plan.SourcesCalled++
 	sibs, err := relations.VersionSiblings(ctx, row.Work.DOI)
 	if err != nil {
 		if delay, temporary := resolver.Temporary(err); temporary {
@@ -958,6 +961,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 					break
 				}
 			}
+			plan.SourcesCalled++
 			cands, err := entry.Adapter.Resolve(ctx, work.Work{DOI: sib})
 			if err != nil {
 				if ctx.Err() != nil {
@@ -3031,6 +3035,11 @@ type retryPlan struct {
 	TemporaryResolvers  int // resolver/sibling calls that failed retryably this pass
 	ClosedSourceGates   int // durable source gates closed before any request this pass
 	AdvisoryBackoffs    int // token-bucket refusals before any request this pass
+	// SourcesCalled counts sources this pass actually reached. A pass that
+	// called something and came back empty is a real answer and must stay
+	// chargeable; only a pass where this process's own throttle turned away
+	// every callable source made no request at all.
+	SourcesCalled int
 }
 
 // Temporary is the earliest retryable-request observation, candidate or
@@ -3051,6 +3060,7 @@ func (p *retryPlan) merge(other retryPlan) {
 	p.TemporaryResolvers += other.TemporaryResolvers
 	p.ClosedSourceGates += other.ClosedSourceGates
 	p.AdvisoryBackoffs += other.AdvisoryBackoffs
+	p.SourcesCalled += other.SourcesCalled
 }
 
 // recordDeferral folds one refused source into the plan, keeping a durable
@@ -3081,10 +3091,13 @@ func (p retryPlan) At() time.Time { return earlierTime(p.Temporary(), p.Gate) }
 // this process's own throttle. There is no honest wake time to schedule, so
 // the caller supplies its ordinary retry cadence.
 func (p retryPlan) AdvisoryOnly() bool {
-	return p.At().IsZero() && (!p.Advisory.IsZero() || p.AdvisoryBackoffs > 0)
+	return p.At().IsZero() && p.AdvisoryBackoffs > 0 && p.SourcesCalled == 0
 }
 
-func (p retryPlan) IsZero() bool { return p.At().IsZero() && !p.AdvisoryOnly() }
+// IsZero means the pass observed nothing at all and the job can be settled.
+// Any throttle refusal keeps it non-zero — a source papio never asked cannot
+// justify a terminal verdict — but only an advisory-ONLY pass is uncharged.
+func (p retryPlan) IsZero() bool { return p.At().IsZero() && p.AdvisoryBackoffs == 0 }
 
 // Kind names why the pass ended with no verdict. source_gate means a durable
 // gate held a source back; advisory means only this process's own throttle
