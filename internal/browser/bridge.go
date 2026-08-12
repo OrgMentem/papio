@@ -1667,17 +1667,34 @@ func (b *Bridge) institutionalReconcile(ctx context.Context, p *protocol.Institu
 			// The reported tab must be the one the claim is durably bound to.
 			// Echoing the extension's number back would let a reconcile assert
 			// any tab as this materialization's tab, which is the one fact the
-			// daemon is supposed to be the authority on. A mismatch is an
-			// ordinary desync, not an error: the claim is simply not confirmed,
-			// so the extension rebuilds rather than adopting a wrong tab.
-			if claim.TabID != binding.TabID {
-				continue
+			// daemon is supposed to be the authority on.
+			//
+			// A claim is inserted with tab_id 0 in phase "claimed" and only
+			// gains a real tab when BindMaterialization lands, while the
+			// extension opens the scaffold tab BEFORE it sends the bind. So
+			// "claimed with a live tab the daemon has not recorded" is the
+			// normal transient state, and it is exactly what reconcile exists
+			// to recover after a worker death. Rejecting it would omit the
+			// claim, and the extension treats an omitted binding as dead: it
+			// closes the tab and clears the workflow while the durable claim
+			// stays live to its lease, blocking the candidate. Confirm such a
+			// claim without asserting a tab, and enforce the match only once
+			// the daemon actually has one.
+			// Phase, not the tab value, says whether a tab is bound: tab 0 is
+			// a legitimate bound tab here, so it cannot double as "unbound".
+			var tabID *int64
+			if claim.Phase != "claimed" {
+				if claim.TabID != binding.TabID {
+					continue
+				}
+				bound := claim.TabID
+				tabID = &bound
 			}
-			tabID := claim.TabID
 			result.Claims = append(result.Claims, protocol.InstitutionalReconcileClaim{
 				ClaimID: claim.ID, BindingID: claim.BindingID, CandidateID: claim.CandidateID,
-				Phase: claim.Phase, TabID: &tabID,
+				Phase: claim.Phase, TabID: tabID,
 			})
+
 		}
 	}
 	frame, err := b.frame(protocol.MsgInstitutionalReconcileResponse, "", result)
@@ -4491,10 +4508,16 @@ func (b *Bridge) weighArtifact(ctx context.Context, jobID, filename string) (*ar
 // state, so only one delivery per job validates at a time and this CAS cannot
 // race a sibling into attaching two artifacts.
 func (b *Bridge) commitArtifact(ctx context.Context, jobID string, fence *artifactFence) error {
-	if fence == nil || !fence.governed || fence.replay {
+	if fence == nil || !fence.governed {
 		return nil
 	}
-	if fence.candidate != nil {
+	// A replay must not re-run the CAS, but it must still try the settle: the
+	// first commit routinely records the winner and then fails the settle,
+	// because the sweep path is exactly the case where the navigate
+	// acknowledgement was missed and SettleMaterialization only accepts a claim
+	// already at navigated/settled. Skipping it entirely left the claim live to
+	// its lease, holding the candidate's effect slot for nothing.
+	if fence.candidate != nil && !fence.replay {
 		_, won, err := b.jobs.ClaimArtifactWinner(ctx, job.ArtifactWinner{
 			JobID: jobID, JobAttemptRevision: fence.attempt, CandidateID: fence.candidate.ID,
 			BrowserHolderGeneration: int64(b.epoch), SHA256: fence.digest,
@@ -4505,15 +4528,35 @@ func (b *Bridge) commitArtifact(ctx context.Context, jobID string, fence *artifa
 			// deliberately refuses a winner to a holder that can no longer
 			// prove it owns the effect. The bytes validated, so they are still
 			// adopted rather than stranded — long human logins routinely
-			// outlive a lease while RenewMaterializationClaim stays dark — but
-			// the attempt ends with no durable winner, so record that plainly
-			// instead of letting it look fenced.
+			// outlive a lease while RenewMaterializationClaim stays dark.
+			//
+			// Without a winner row the reconciliation anti-join cannot see that
+			// this attempt already produced an artifact, so it would flip the
+			// candidate back to eligible and re-issue the route: the exact
+			// second effect that anti-join exists to prevent, in the one
+			// scenario it was written for. Retire the candidate directly, which
+			// is the same fence expressed on the row the scheduler reads.
+			if statusErr := b.jobs.SetBrowserCandidateStatus(ctx, fence.candidate.ID,
+				fence.candidate.Status, "succeeded"); statusErr != nil {
+				log.Printf("papio: retiring candidate after unfenced adoption: %v", statusErr)
+			}
 			if eventErr := b.jobs.RecordEvent(ctx, jobID, "browser.artifact_unfenced",
 				map[string]any{"job_attempt_revision": fence.attempt}); eventErr != nil {
 				log.Printf("papio: recording unfenced adoption: %v", eventErr)
 			}
 		case err != nil:
-			return err
+			// The bytes are already validated and attached; the only thing that
+			// failed is recording who won. Returning the error here would tell
+			// the caller the adoption failed, so download_complete would file a
+			// browser.adoption_deferred for a file that actually landed, leave
+			// the pending download uncleared, skip the conclusive latch and
+			// skip settlement. Record it and continue, exactly as the losing
+			// branch below does.
+			log.Printf("papio: recording artifact winner for %s: %v", jobID, err)
+			if eventErr := b.jobs.RecordEvent(ctx, jobID, "browser.artifact_unfenced",
+				map[string]any{"job_attempt_revision": fence.attempt}); eventErr != nil {
+				log.Printf("papio: recording unfenced adoption: %v", eventErr)
+			}
 		case !won:
 			// A sibling validated first. The bytes are already attached, so
 			// this is recorded rather than reversed.
@@ -6351,7 +6394,7 @@ func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantin
 	if err := b.grabs.MarkJobCreated(ctx, g.ID, result.JobID, "job_created"); err != nil {
 		return err
 	}
-	if _, err := b.adopt(ctx, result.JobID, filename); err != nil {
+	if _, err := b.ingestAdoptedFile(ctx, result.JobID, filename); err != nil {
 		if evErr := b.recordAdoptionDeferred(ctx, result.JobID, filename, err); evErr != nil {
 			return evErr
 		}
@@ -6505,7 +6548,10 @@ func (b *Bridge) IdentifyGrab(ctx context.Context, grabID, kind, raw string) Gra
 		return result
 	}
 	_ = os.Remove(filepath.Dir(g.QuarantinePath))
-	if _, err := b.adopt(ctx, created.JobID, filename); err != nil {
+	// A grab can join an already-live job, including one holding a live
+	// institutional claim with a route already issued, so these bytes owe the
+	// same winner decision as any other browser-delivered file.
+	if _, err := b.ingestAdoptedFile(ctx, created.JobID, filename); err != nil {
 		_ = b.recordAdoptionDeferred(ctx, created.JobID, filename, err)
 	}
 	if err := b.grabs.MarkIdentified(ctx, grabID); err != nil {
@@ -6858,7 +6904,7 @@ jobLoop:
 				if eventErr != nil {
 					log.Printf("papio: reading direct-route history for %s: %v", id, eventErr)
 				} else {
-					ordinal, inFlight := directRouteProgress(events, candidates, b.now())
+					ordinal, inFlight, pendingAttempt := directRouteProgress(events, candidates, b.now())
 					if inFlight || directRouteSucceeded(events) {
 						continue
 					}
@@ -6881,7 +6927,16 @@ jobLoop:
 						if !b.providerDirectGetAvailable() {
 							break
 						}
-						attemptID := newMsgID()
+						// Replay the unanswered offer's own attempt id. Minting a
+						// fresh one makes the re-offer a DIFFERENT tuple, which
+						// defeats every at-most-once guard keyed on it: the
+						// extension's prior-epoch check and the daemon's own result
+						// match both compare drive_attempt_id, so a download that
+						// really did start would be issued a second time.
+						attemptID := pendingAttempt
+						if attemptID == "" {
+							attemptID = newMsgID()
+						}
 						frame, frameErr := b.frame(protocol.MsgProviderDirectGetRequest, id,
 							protocol.ProviderDirectGetRequestPayload{
 								DriveAttemptID:     attemptID,
@@ -7498,25 +7553,33 @@ func stringValue(v any) string {
 	return s
 }
 
-// directRouteOfferLease bounds how long an offered tuple may sit unanswered
+// directRouteOfferLease bounds how long an offered tuple may sit UNANSWERED
 // before it may be offered again. The durable "offered" event is committed
 // before the frame is appended to the sync response, so a crash, a native-host
 // disconnect, or a failed delivery in that window leaves an offer no client
 // ever saw. Without a lease that tuple is in flight forever: the job is
 // skipped by every later poll, nobody can produce the missing result, and it
-// parks with no attention surface. Re-offering is safe rather than a second
-// effect because it replays the IDENTICAL tuple, and a drive epoch that really
-// did start answers a replayed start with "duplicate".
+// parks with no attention surface.
+//
+// The lease must never touch a tuple that HAS a result. Applying it to the
+// in-flight latch itself also un-terminated answered tuples: a login/terms
+// result stopped being terminal ten minutes later and the identical candidate
+// was re-driven, and a not_pdf result stopped advancing the ordinal. Expiry is
+// therefore evaluated only for an offer whose result never arrived.
 const directRouteOfferLease = 10 * time.Minute
 
 // directRouteProgress projects durable direct-route tuples. An offered phase
-// without its matching result remains in flight until its lease expires, and
-// all non-success observations remain terminal for that tuple without
-// advancing.
-func directRouteProgress(events []map[string]any, candidates []routes.Candidate, now time.Time) (next int, inFlight bool) {
+// whose result never arrived stops blocking once its lease expires; every
+// non-success result stays terminal for that tuple without advancing.
+// pendingAttempt is the drive attempt id of an unanswered offer at the
+// returned ordinal, so a re-offer can replay the identical tuple instead of
+// minting a second one the extension cannot recognise as a duplicate.
+func directRouteProgress(events []map[string]any, candidates []routes.Candidate, now time.Time) (next int, inFlight bool, pendingAttempt string) {
 	attempt := ""
 	revision := ""
 	ordinal := -1
+	answered := false
+	issuedAt := time.Time{}
 	for _, event := range events {
 		if event["kind"] != "browser.direct_route" {
 			continue
@@ -7534,14 +7597,14 @@ func directRouteProgress(events []map[string]any, candidates []routes.Candidate,
 		switch stringDetail(detail, "phase") {
 		case "offered":
 			if eventOrdinal == next {
-				issued, parseErr := time.Parse(time.RFC3339Nano, stringValue(event["at"]))
-				expired := parseErr == nil && now.UTC().Sub(issued.UTC()) >= directRouteOfferLease
-				attempt, revision, ordinal, inFlight = eventAttempt, eventRevision, eventOrdinal, !expired
+				attempt, revision, ordinal, inFlight, answered = eventAttempt, eventRevision, eventOrdinal, true, false
+				issuedAt, _ = time.Parse(time.RFC3339Nano, stringValue(event["at"]))
 			}
 		case "result":
 			if eventOrdinal != ordinal || eventAttempt != attempt || eventRevision != revision || !inFlight {
 				continue
 			}
+			answered = true
 			switch stringDetail(detail, "outcome") {
 			case "success", "not_pdf":
 				next++
@@ -7554,7 +7617,13 @@ func directRouteProgress(events []map[string]any, candidates []routes.Candidate,
 			}
 		}
 	}
-	return next, inFlight
+	if inFlight && !answered {
+		if !issuedAt.IsZero() && now.UTC().Sub(issuedAt.UTC()) >= directRouteOfferLease {
+			return next, false, attempt
+		}
+		return next, true, attempt
+	}
+	return next, inFlight, ""
 }
 func directRouteSucceeded(events []map[string]any) bool {
 	for i := len(events) - 1; i >= 0; i-- {
@@ -7918,7 +7987,7 @@ func (b *Bridge) providerDirectGetResult(ctx context.Context, jobID string, p *p
 	if err != nil {
 		return err
 	}
-	ordinal, inFlight := directRouteProgress(events, candidates, b.now())
+	ordinal, inFlight, _ := directRouteProgress(events, candidates, b.now())
 	if !inFlight || p.Ordinal != int64(ordinal) || ordinal >= len(candidates) ||
 		p.RouteRevision != candidates[ordinal].RouteRevision {
 		return nil

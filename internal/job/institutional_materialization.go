@@ -604,7 +604,20 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 	if _, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=? WHERE candidate_id=? AND phase IN ('claimed','bound','route_issued','navigated') AND lease_until IS NOT NULL AND lease_until <= ?`, now, in.CandidateID, now); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates SET status='eligible', updated_at=? WHERE id=? AND status='claimed' AND NOT EXISTS (SELECT 1 FROM materialization_claims WHERE candidate_id=? AND phase IN ('claimed','bound','route_issued','navigated') AND (lease_until IS NULL OR lease_until > ?))`, now, in.CandidateID, in.CandidateID, now); err != nil {
+	// The same artifact_winners anti-join the two sweeps carry. Without it a
+	// winner-bearing candidate that reconciliation deliberately left parked in
+	// 'claimed' is flipped back to 'eligible' by the very next claim request,
+	// and a fresh claim — and therefore a fresh route issuance — mints the
+	// second irreversible provider effect the anti-join exists to prevent.
+	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates SET status='eligible', updated_at=?
+		WHERE id=? AND status='claimed'
+		  AND NOT EXISTS (SELECT 1 FROM materialization_claims WHERE candidate_id=?
+		    AND phase IN ('claimed','bound','route_issued','navigated')
+		    AND (lease_until IS NULL OR lease_until > ?))
+		  AND NOT EXISTS (SELECT 1 FROM artifact_winners
+		    WHERE candidate_id=browser_candidates.id
+		      AND job_attempt_revision=browser_candidates.job_attempt_revision)`,
+		now, in.CandidateID, in.CandidateID, now); err != nil {
 		return nil, err
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT status FROM browser_candidates WHERE id=?`, in.CandidateID).Scan(&candidateStatus); err != nil {
@@ -731,10 +744,21 @@ func (js *Store) CandidateForAttempt(ctx context.Context, jobID string, jobAttem
 	if strings.TrimSpace(jobID) == "" || jobAttemptRevision < 1 {
 		return nil, nil
 	}
+	// Attribute to the candidate that actually drove, not the newest one. An
+	// authority edit mid-handoff mints a second candidate for the same attempt
+	// while the original's tab is still open, so recency alone would credit the
+	// bytes to a candidate that never issued a route — and leave the real
+	// producer outside the artifact_winners anti-join. Rank by how far each
+	// candidate's claim got first, and fall back to recency only for candidates
+	// that never claimed.
 	var id string
-	err := js.S.DB().QueryRowContext(ctx, `SELECT id FROM browser_candidates
-		WHERE job_id = ? AND job_attempt_revision = ?
-		ORDER BY created_at DESC, id DESC LIMIT 1`,
+	err := js.S.DB().QueryRowContext(ctx, `SELECT c.id FROM browser_candidates c
+		LEFT JOIN materialization_claims m ON m.candidate_id = c.id
+		WHERE c.job_id = ? AND c.job_attempt_revision = ?
+		ORDER BY CASE m.phase
+			WHEN 'settled' THEN 5 WHEN 'navigated' THEN 4 WHEN 'route_issued' THEN 3
+			WHEN 'bound' THEN 2 WHEN 'claimed' THEN 1 ELSE 0 END DESC,
+			c.created_at DESC, c.id DESC LIMIT 1`,
 		jobID, jobAttemptRevision).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

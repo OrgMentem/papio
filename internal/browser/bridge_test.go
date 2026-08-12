@@ -5442,12 +5442,15 @@ func TestUnacknowledgedDirectRouteOfferExpiresInsteadOfStranding(t *testing.T) {
 			"drive_attempt_id": "attempt-1", "phase": "offered",
 		},
 	}}
-	if _, inFlight := directRouteProgress(events, candidates, issued.Add(time.Minute)); !inFlight {
+	if _, inFlight, _ := directRouteProgress(events, candidates, issued.Add(time.Minute)); !inFlight {
 		t.Fatal("a fresh offer must still count as in flight")
 	}
-	_, inFlight := directRouteProgress(events, candidates, issued.Add(directRouteOfferLease+time.Second))
+	_, inFlight, replayAttempt := directRouteProgress(events, candidates, issued.Add(directRouteOfferLease+time.Second))
 	if inFlight {
 		t.Fatal("an offer nobody acknowledged pinned the job in flight past its lease")
+	}
+	if replayAttempt != "attempt-1" {
+		t.Fatalf("re-offer would mint a new tuple (%q); the identical attempt id must be replayed so the extension can recognise the duplicate", replayAttempt)
 	}
 }
 
@@ -5507,6 +5510,62 @@ func TestReconcileRefusesATabThatIsNotTheClaimsOwn(t *testing.T) {
 	}
 	if got := reconcile(boundTab + 1); len(got.Claims) != 0 {
 		t.Fatalf("a tab the claim is not bound to was confirmed: %+v", got.Claims)
+	}
+}
+
+// A claim is inserted with tab_id 0 in phase "claimed" and only gains a real
+// tab when the bind lands, while the extension opens its scaffold tab BEFORE
+// sending the bind. Reconcile after a worker death must still confirm such a
+// claim: the extension treats an omitted binding as dead and closes the tab and
+// clears the workflow, while the durable claim stays live to its lease and
+// keeps the candidate blocked.
+func TestReconcileConfirmsAClaimedButUnboundClaim(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	jobID := parkInstitutional(t, jobs, "wr_reconcile_unbound", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-unbound", AuthenticationClaimID: "auth-unbound",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	if _, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-unbound", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Claimed, never bound: tab_id is still 0.
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: "candidate-unbound", BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := b.institutionalReconcile(ctx, &protocol.InstitutionalReconcileRequestPayload{
+		RequestID: "req_reconcile_unbound_tab",
+		Bindings:  []protocol.InstitutionalReconcileBinding{{BindingID: claim.BindingID, TabID: 77}},
+	})
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("reconcile: frames=%d err=%v", len(frames), err)
+	}
+	msg, decodeErr := protocol.DecodeBrowserMessage(frames[0])
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	got := msg.Payload.(*protocol.InstitutionalReconcileResponsePayload)
+	if len(got.Claims) != 1 {
+		t.Fatalf("an unbound claim was dropped; the extension would close its live tab: %+v", got.Claims)
+	}
+	if got.Claims[0].TabID != nil {
+		t.Fatalf("the daemon asserted a tab it never bound: %v", *got.Claims[0].TabID)
 	}
 }
 
@@ -5576,6 +5635,43 @@ func TestPersistedProviderOutcomeDetailIsRedacted(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no provider outcome event was recorded")
+	}
+}
+
+// The offer lease must never touch a tuple that was answered. Applying it to
+// the in-flight latch itself un-terminated answered tuples: ten minutes after
+// a login/terms result the identical candidate became re-drivable, and a
+// not_pdf result stopped advancing the ordinal.
+func TestDirectRouteLeaseDoesNotResurrectAnsweredTuples(t *testing.T) {
+	candidates := []routes.Candidate{{RouteRevision: "rev-1"}, {RouteRevision: "rev-2"}}
+	issued := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	longAfter := issued.Add(directRouteOfferLease + time.Hour)
+	offer := map[string]any{
+		"kind": "browser.direct_route", "at": issued.Format(time.RFC3339Nano),
+		"detail": map[string]any{
+			"route_revision": "rev-1", "ordinal": float64(0),
+			"drive_attempt_id": "attempt-1", "phase": "offered",
+		},
+	}
+	result := func(outcome string) map[string]any {
+		return map[string]any{
+			"kind": "browser.direct_route", "at": issued.Add(time.Second).Format(time.RFC3339Nano),
+			"detail": map[string]any{
+				"route_revision": "rev-1", "ordinal": float64(0),
+				"drive_attempt_id": "attempt-1", "phase": "result", "outcome": outcome,
+			},
+		}
+	}
+	// A terminal non-advancing result stays terminal forever.
+	next, inFlight, pending := directRouteProgress([]map[string]any{offer, result("login")}, candidates, longAfter)
+	if next != 0 || !inFlight || pending != "" {
+		t.Fatalf("answered login tuple = (next=%d inFlight=%v pending=%q); want it to stay terminal at ordinal 0",
+			next, inFlight, pending)
+	}
+	// An advancing result keeps its advance.
+	next, inFlight, _ = directRouteProgress([]map[string]any{offer, result("not_pdf")}, candidates, longAfter)
+	if next != 1 || inFlight {
+		t.Fatalf("answered not_pdf tuple = (next=%d inFlight=%v); want ordinal 1 and not in flight", next, inFlight)
 	}
 }
 
