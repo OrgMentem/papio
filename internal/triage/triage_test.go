@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -680,23 +681,27 @@ func TestFamilyProjectionRunIdentityContiguityAndKey(t *testing.T) {
 		t.Fatalf("changing first member did not change key: %q", run.RunKey)
 	}
 
+	// Amended plan §11 rule 5: the same family variant separated by an
+	// intervening row is one block, because the daemon now orders action rows
+	// by family rather than by raw insertion order.
 	splitService, _, splitJobs := triageTestService(t)
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		createProjectionAction(t, splitJobs, fmt.Sprintf("split-a-%02d", i), "manual_download", "download it", job.Access(false, "landing_page"))
 	}
-	createProjectionAction(t, splitJobs, "split-exception", "verify_identity", "inspect", job.Access(false, ""))
-	for i := 0; i < 19; i++ {
+	exception := createProjectionAction(t, splitJobs, "split-exception", "verify_identity", "inspect", job.Access(false, ""))
+	for i := range 19 {
 		createProjectionAction(t, splitJobs, fmt.Sprintf("split-b-%02d", i), "manual_download", "download it", job.Access(false, "landing_page"))
 	}
 	split, err := splitService.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(split.Counts.FamilyRuns) != 3 {
-		t.Fatalf("split runs = %+v, want 3 runs", split.Counts.FamilyRuns)
+	if len(split.Counts.FamilyRuns) != 2 {
+		t.Fatalf("split runs = %+v, want one run per family", split.Counts.FamilyRuns)
 	}
-	if split.Counts.FamilyRuns[0].Count != 20 || split.Counts.FamilyRuns[1].Count != 1 || split.Counts.FamilyRuns[2].Count != 19 {
-		t.Fatalf("split run counts = %+v", split.Counts.FamilyRuns)
+	if split.Counts.FamilyRuns[0].GuidanceVariant != "manual_download" || split.Counts.FamilyRuns[0].Count != 39 ||
+		split.Counts.FamilyRuns[1].GuidanceVariant != "verify_identity" || split.Counts.FamilyRuns[1].Count != 1 {
+		t.Fatalf("split run counts = %+v, want manual_download 39 then verify_identity 1", split.Counts.FamilyRuns)
 	}
 	for i := 1; i < len(split.Counts.FamilyRuns); i++ {
 		prev, current := split.Counts.FamilyRuns[i-1], split.Counts.FamilyRuns[i]
@@ -713,12 +718,15 @@ func TestFamilyProjectionRunIdentityContiguityAndKey(t *testing.T) {
 			t.Fatalf("row %s missing family quartet", item.ID)
 		}
 		seenKeys[item.Family.RunKey] = true
-		if i > 0 && item.Family.RunKey == split.Items[i-1].Family.RunKey {
-			continue
+		if item.HumanAction.JobID == exception && i != len(split.Items)-1 {
+			t.Fatalf("intervening exception at index %d, want it after the whole manual-download block", i)
 		}
 	}
-	if len(seenKeys) != 3 {
-		t.Fatalf("participating run keys = %v, want 3 distinct keys", seenKeys)
+	if len(seenKeys) != 2 {
+		t.Fatalf("participating run keys = %v, want 2 distinct keys", seenKeys)
+	}
+	if split.Counts.FamilyRuns[0].FirstRank != split.Items[0].Rank {
+		t.Fatalf("first run rank = %d, want the oldest action's rank %d", split.Counts.FamilyRuns[0].FirstRank, split.Items[0].Rank)
 	}
 }
 func TestFamilyGuidanceAndOperationVariantsUseDurableFacts(t *testing.T) {
@@ -812,9 +820,10 @@ func TestFamilyGuidanceAndOperationVariantsUseDurableFacts(t *testing.T) {
 
 func TestUnmappedFamilyStatesStayStandaloneAndInvalidateBreakdown(t *testing.T) {
 	service, _, jobs := triageTestService(t)
-	createProjectionAction(t, jobs, "mapped-before-unknown", "manual_download", "normal", job.Access(false, "landing_page"))
+	firstDownload := createProjectionAction(t, jobs, "mapped-before-unknown", "manual_download", "normal", job.Access(false, "landing_page"))
 	unknown := createProjectionAction(t, jobs, "unmapped-action", "new_route_not_mapped", "normal", job.Access(false, "landing_page"))
-	createProjectionAction(t, jobs, "mapped-after-unknown", "manual_download", "normal", job.Access(false, "landing_page"))
+	identity := createProjectionAction(t, jobs, "mapped-identity", "verify_identity", "inspect", job.Access(false, ""))
+	secondDownload := createProjectionAction(t, jobs, "mapped-after-unknown", "manual_download", "normal", job.Access(false, "landing_page"))
 	snapshot, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
 	if err != nil {
 		t.Fatal(err)
@@ -830,6 +839,14 @@ func TestUnmappedFamilyStatesStayStandaloneAndInvalidateBreakdown(t *testing.T) 
 	}
 	if snapshot.Counts.FamilyBreakdownComplete == nil || *snapshot.Counts.FamilyBreakdownComplete || snapshot.Counts.FamilyRuns != nil {
 		t.Fatalf("unmapped breakdown = complete %v runs %+v, want false and absent", snapshot.Counts.FamilyBreakdownComplete, snapshot.Counts.FamilyRuns)
+	}
+	// The unmapped row joins no family: it is ordered by its own position, so
+	// it lands after the manual-download block it interrupted and before the
+	// later verify_identity family.
+	want := []string{firstDownload, secondDownload, unknown, identity}
+	got := actionJobOrder(snapshot)
+	if !slices.Equal(got, want) {
+		t.Fatalf("emitted order = %v, want %v", got, want)
 	}
 }
 
@@ -878,6 +895,9 @@ func TestTurnsIncludePdfGrabsAndRespectBounds(t *testing.T) {
 		t.Fatalf("over-limit required turns = complete %v entries nil? %v", tooMany.RequiredTurnsComplete, tooMany.RequiredTurns == nil)
 	}
 
+	// Alternating kinds used to produce one run per row. Family ordering
+	// collapses them into one block per family; the 128-run wire bound is
+	// still enforced against the run count itself, exercised below.
 	manyRunsService, _, manyRunsJobs := triageTestService(t)
 	for i := range 129 {
 		kind := "manual_download"
@@ -890,8 +910,31 @@ func TestTurnsIncludePdfGrabsAndRespectBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manyRuns.FamilyBreakdownComplete == nil || *manyRuns.FamilyBreakdownComplete || manyRuns.FamilyRuns != nil {
-		t.Fatalf("over-limit family runs = complete %v runs %+v", manyRuns.FamilyBreakdownComplete, manyRuns.FamilyRuns)
+	if manyRuns.FamilyBreakdownComplete == nil || !*manyRuns.FamilyBreakdownComplete || len(manyRuns.FamilyRuns) != 2 {
+		t.Fatalf("alternating kinds = complete %v runs %+v, want one run per family", manyRuns.FamilyBreakdownComplete, manyRuns.FamilyRuns)
+	}
+	if manyRuns.FamilyRuns[0].Count != 65 || manyRuns.FamilyRuns[1].Count != 64 {
+		t.Fatalf("alternating run counts = %+v, want 65 then 64", manyRuns.FamilyRuns)
+	}
+}
+
+// TestFamilyRunCountStillTripsTheWireBound keeps the 128-run contract bound
+// defended. Family ordering makes 129 blocks unreachable from the closed
+// variant vocabulary, so the run counter is exercised directly.
+func TestFamilyRunCountStillTripsTheWireBound(t *testing.T) {
+	items := make([]Item, 129)
+	rows := make([]familyRow, 129)
+	for i := range items {
+		items[i] = Item{Kind: KindHumanAction, ID: fmt.Sprintf("action:%d", i+1), Rank: humanActionRankBase + i}
+		assignment := &FamilyAssignment{
+			NextActor: "researcher", GuidanceVariant: fmt.Sprintf("variant-%03d", i),
+			OperationVariant: "open_and_dismiss", RouteClass: "manual_download", ActionKind: "manual_download",
+		}
+		rows[i] = familyRow{assignment: assignment, tuple: familyTupleOf(KindHumanAction, assignment)}
+	}
+	var counts Counts
+	if runs := buildFamilyRuns(items, rows, &counts); runs != 129 {
+		t.Fatalf("run count = %d, want 129 so the projection's 128 bound fails closed", runs)
 	}
 }
 func TestTypedGateAggregationAndNoGateFallback(t *testing.T) {
@@ -958,5 +1001,139 @@ func TestTypedGateAggregationAndNoGateFallback(t *testing.T) {
 		if noGateByJob[id].NextActor == "reference" {
 			t.Fatalf("advisory inference produced reference actor for %s", id)
 		}
+	}
+}
+
+// actionJobOrder returns the emitted human-action rows as their job IDs, in
+// snapshot order, so a test can assert exactly which block each row lands in.
+func actionJobOrder(snapshot Snapshot) []string {
+	out := make([]string, 0, len(snapshot.Items))
+	for _, item := range snapshot.Items {
+		if item.HumanAction != nil {
+			out = append(out, item.HumanAction.JobID)
+		}
+	}
+	return out
+}
+
+// TestActionRowsRenderOneBlockPerFamily seeds the interleaving observed on a
+// real library: ten insertion-order runs across four families. The daemon now
+// orders action rows by family, families by earliest member, so the same rows
+// project as one block per family.
+func TestActionRowsRenderOneBlockPerFamily(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	download := job.Access(false, "landing_page")
+	handoff := job.Access(true, "paywall")
+	plain := job.Access(false, "")
+	seeded := 0
+	seed := func(kind string, access job.AccessClassification, count int) []string {
+		ids := make([]string, 0, count)
+		for range count {
+			ids = append(ids, createProjectionAction(t, jobs, fmt.Sprintf("live-%02d", seeded), kind, "detail", access))
+			seeded++
+		}
+		return ids
+	}
+	downloads := seed("manual_download", download, 8)
+	handoffs := seed("openurl_handoff", handoff, 1)
+	deliveries := seed("document_delivery", plain, 4)
+	downloads = append(downloads, seed("manual_download", download, 2)...)
+	deliveries = append(deliveries, seed("document_delivery", plain, 2)...)
+	downloads = append(downloads, seed("manual_download", download, 1)...)
+	available := seed("openurl_available", download, 1)
+	downloads = append(downloads, seed("manual_download", download, 16)...)
+	identity := seed("verify_identity", plain, 1)
+	handoffs = append(handoffs, seed("openurl_handoff", handoff, 1)...)
+
+	snapshot, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Counts.FamilyBreakdownComplete == nil || !*snapshot.Counts.FamilyBreakdownComplete {
+		t.Fatalf("family breakdown complete = %v", snapshot.Counts.FamilyBreakdownComplete)
+	}
+	type run struct {
+		guidance string
+		count    int
+	}
+	want := []run{
+		{"manual_download", 27},
+		{"institution_sign_in", 2},
+		{"document_delivery", 6},
+		{"open_page", 1},
+		{"verify_identity", 1},
+	}
+	got := make([]run, 0, len(snapshot.Counts.FamilyRuns))
+	for _, entry := range snapshot.Counts.FamilyRuns {
+		got = append(got, run{entry.GuidanceVariant, entry.Count})
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("family runs = %+v, want one block per family in earliest-member order %+v", got, want)
+	}
+	for i, entry := range snapshot.Counts.FamilyRuns {
+		if i > 0 {
+			previous := snapshot.Counts.FamilyRuns[i-1]
+			if previous.FirstRank > entry.FirstRank || (previous.FirstRank == entry.FirstRank && previous.RunKey >= entry.RunKey) {
+				t.Fatalf("family runs not ordered by (first_rank, run_key): %+v", snapshot.Counts.FamilyRuns)
+			}
+		}
+		if entry.RunKey == "" {
+			t.Fatalf("run %+v has no key", entry)
+		}
+	}
+
+	// Insertion order survives inside every family, and the oldest action
+	// overall still opens the first block.
+	wantOrder := slices.Concat(downloads, handoffs, deliveries, available, identity)
+	if order := actionJobOrder(snapshot); !slices.Equal(order, wantOrder) {
+		t.Fatalf("emitted order = %v, want %v", order, wantOrder)
+	}
+	if snapshot.Items[0].HumanAction.JobID != downloads[0] {
+		t.Fatalf("first row = %s, want the oldest action %s", snapshot.Items[0].HumanAction.JobID, downloads[0])
+	}
+	if snapshot.Counts.FamilyRuns[0].FirstRank != snapshot.Items[0].Rank {
+		t.Fatalf("first run rank = %d, want %d", snapshot.Counts.FamilyRuns[0].FirstRank, snapshot.Items[0].Rank)
+	}
+	for i := range snapshot.Items {
+		if snapshot.Items[i].Rank != humanActionRankBase+i {
+			t.Fatalf("rank[%d] = %d, want %d", i, snapshot.Items[i].Rank, humanActionRankBase+i)
+		}
+	}
+
+	// Ordering only: the same 37 rows keep the same turn counts.
+	if snapshot.Counts.TurnsRequired == nil || *snapshot.Counts.TurnsRequired != 37 ||
+		snapshot.Counts.TurnsWorking == nil || *snapshot.Counts.TurnsWorking != 0 {
+		t.Fatalf("turn counts = required %v working %v, want 37 and 0", snapshot.Counts.TurnsRequired, snapshot.Counts.TurnsWorking)
+	}
+	if snapshot.Counts.RequiredTurnsComplete == nil || !*snapshot.Counts.RequiredTurnsComplete || len(snapshot.Counts.RequiredTurns) != 37 {
+		t.Fatalf("required turns = complete %v entries %d", snapshot.Counts.RequiredTurnsComplete, len(snapshot.Counts.RequiredTurns))
+	}
+}
+
+// TestFamilyOrderingKeepsGuidanceVariantsApart proves family identity is the
+// full variant tuple, not the action kind: two manual-download rows with
+// different guidance stay in different blocks.
+func TestFamilyOrderingKeepsGuidanceVariantsApart(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	plainFirst := createProjectionAction(t, jobs, "variant-plain-first", "manual_download", "download it", job.Access(false, "landing_page"))
+	diagnosed := createProjectionAction(t, jobs, "variant-diagnosed", "manual_download", "download it", job.Access(false, "landing_page"))
+	if err := jobs.RecordEvent(context.Background(), diagnosed, "browser.provider_outcome", map[string]any{"diagnosis": job.DiagnosisReasonProviderAdapterMissing}); err != nil {
+		t.Fatal(err)
+	}
+	plainSecond := createProjectionAction(t, jobs, "variant-plain-second", "manual_download", "download it", job.Access(false, "landing_page"))
+	snapshot, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Counts.FamilyRuns) != 2 {
+		t.Fatalf("runs = %+v, want the two guidance variants kept apart", snapshot.Counts.FamilyRuns)
+	}
+	if snapshot.Counts.FamilyRuns[0].GuidanceVariant != "manual_download" || snapshot.Counts.FamilyRuns[0].Count != 2 ||
+		snapshot.Counts.FamilyRuns[1].GuidanceVariant != "manual_download_adapter_missing" || snapshot.Counts.FamilyRuns[1].Count != 1 {
+		t.Fatalf("runs = %+v, want manual_download 2 then manual_download_adapter_missing 1", snapshot.Counts.FamilyRuns)
+	}
+	want := []string{plainFirst, plainSecond, diagnosed}
+	if order := actionJobOrder(snapshot); !slices.Equal(order, want) {
+		t.Fatalf("emitted order = %v, want %v", order, want)
 	}
 }

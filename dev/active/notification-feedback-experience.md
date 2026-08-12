@@ -905,9 +905,13 @@ Presentation rules:
    `run_key`, byte-identical locally rendered guidance for their declared
    variant, and the declared compatible operation variant.
 2. A run is contiguous in full daemon rank order, not merely in the current
-   page. It may cross a page boundary. Repeated occurrences of the same variant
-   tuple after an intervening row have different run keys and headings.
-3. Preserve daemon rank exactly. Attention is not a global sort key.
+   page. It may cross a page boundary. Because the daemon groups action rows by
+   family (see the ordering amendment below), one variant tuple is one run and
+   one heading; a client that is nevertheless served two runs of the same tuple
+   still renders two headings.
+3. Preserve daemon rank exactly. Attention is not a global sort key. The client
+   never reorders, groups, or promotes rows to assemble a family; it renders the
+   family-grouped rank the daemon already supplies.
 4. Any missing, unknown, or internally inconsistent variant remains standalone
    with its own instruction. The client never guesses a family from prose,
    `action_kind`, Activity text, or a detail-string regex.
@@ -918,6 +922,29 @@ Presentation rules:
 6. Do not add `Open all` or destructive family controls. Opening 39 tabs and
    treating a six-second undo as protection for a 39-job cancellation are both
    unacceptable.
+
+**Ordering amendment (2026-08-12).** These rules originally required the client
+to render a second block rather than move members together, so a family variant
+recurring after an intervening row stayed fragmented. That protected a daemon
+ranking that does not exist: open human actions are selected `ORDER BY a.id
+ASC` — pure insertion order, with no priority, severity, rank, or attention
+term. Fragmenting a family therefore preserved no signal while defeating the
+feature's purpose; on the author's own library, 37 open actions produced ten
+blocks and repeated the same manual-download instruction across four of them.
+The daemon now orders action rows by family: families by their earliest member,
+insertion order within a family, ranks assigned afterwards. Runs stay
+maximal-contiguous, `family_runs` collapses to one entry per family,
+`first_rank` stays coherent with the emitted order, and no client change is
+required. The only genuine signal survives at both levels — the oldest action
+still opens the first block, and the oldest member still leads its family.
+Family identity is the full variant tuple, so `manual_download` and
+`manual_download_adapter_missing` remain separate families. Rows with no mapped
+variant join no family (rule 4) and stay standalone at their own position.
+Accepted tradeoff: a new action joins its family block rather than appending at
+the bottom, so an item can appear mid-list; blocks themselves do not jump,
+because they are keyed on their earliest member. This applies to `human_action`
+rows only — PDF grabs, watch hits, and retractions keep their own rank bases and
+never interleave with actions.
 
 The initial closed guidance vocabulary covers manual download, missing adapter,
 institution sign-in, page open, PDF identity review, document-delivery

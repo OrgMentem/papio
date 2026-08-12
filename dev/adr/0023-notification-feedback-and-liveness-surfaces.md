@@ -314,6 +314,40 @@ nonterminal work and must not contribute to `waiting_required` or break the
 five-bucket sum. This is a scope distinction, not an arithmetic discrepancy
 to reconcile.
 
+## Addendum (2026-08-12): action rows are ordered by family
+
+The accepted family contract assumed the daemon's action order carried a
+ranking worth protecting, and therefore required a family variant recurring
+after an intervening row to render as a second block rather than move its
+members together. Reading the shipped query settles it: open human actions are
+selected `ORDER BY a.id ASC` in `internal/triage`, which is insertion order
+with no priority, severity, rank, or attention term. Fragmenting a family
+preserved no signal and defeated the feature — 37 open actions on the author's
+library rendered as ten blocks, repeating one manual-download instruction four
+times to save 27 repetitions the feature exists to remove.
+
+The daemon therefore orders action rows by family: families by their earliest
+member, insertion order within a family, ranks assigned after grouping. Family
+identity remains the full variant tuple from the counts-v3 contract, so
+`manual_download` and `manual_download_adapter_missing` stay separate families,
+and a row with no mapped variant joins none — it stays standalone at its own
+position and still makes the breakdown incomplete. Runs remain
+maximal-contiguous, so `family_runs` now holds exactly one entry per family,
+`first_rank` stays coherent with the emitted rank, and turn counts are
+untouched: this is ordering, not counting. Only `human_action` rows are
+affected; PDF grabs, watch hits, and retractions keep their own rank bases.
+
+Decision 7's boundary is unchanged and is the reason this is safe: attention is
+still not a sort key, and the client still preserves daemon rank exactly — the
+daemon simply supplies a family-grouped rank instead of a fragmented one, so no
+client reorders, groups, or promotes rows.
+
+Accepted tradeoff: a new action joins its family block rather than appending at
+the bottom, so an item can appear mid-list rather than last. Blocks themselves
+do not jump, because each is keyed on its earliest member. The 128-run wire
+bound stays enforced against the run count even though grouping makes it
+unreachable from the closed variant vocabulary.
+
 ## Consequences
 
 Positive:

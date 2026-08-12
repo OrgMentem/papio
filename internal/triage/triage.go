@@ -794,17 +794,11 @@ func (s *Service) projectFamilies(ctx context.Context, items []Item, counts *Cou
 			requiredTurnsProjectionComplete = false
 		}
 	}
-	type tuple struct {
-		kind, route, action, actor, guidance, operation string
-	}
-	var previous tuple
-	// runIndex points at the open run inside counts.FamilyRuns, so a member
-	// increments the stored run rather than a detached copy of it.
-	runIndex := -1
-	runCount := 0
+	rows := make([]familyRow, len(items))
 	for i := range items {
 		item := &items[i]
 		var assignment *FamilyAssignment
+		var turn *RequiredTurn
 		switch item.Kind {
 		case KindHumanAction:
 			if item.HumanAction == nil {
@@ -826,8 +820,6 @@ func (s *Service) projectFamilies(ctx context.Context, items []Item, counts *Cou
 					// actionable; do not silently report zero turns.
 					breakdownComplete = false
 					requiredTurnsProjectionComplete = false
-					runIndex = -1
-					previous = tuple{}
 					continue
 				}
 				if owner != action.JobID {
@@ -857,7 +849,7 @@ func (s *Service) projectFamilies(ctx context.Context, items []Item, counts *Cou
 			}
 			assignment = &FamilyAssignment{NextActor: actor, GuidanceVariant: guidance, OperationVariant: operation, RouteClass: route, ActionKind: action.ActionKind, GateClaimID: gateID, DependentJobs: dependent}
 			if attention == "required" {
-				counts.RequiredTurns = append(counts.RequiredTurns, RequiredTurn{ItemID: item.ID, ItemKind: KindHumanAction, RouteClass: route, GateClaimID: gateID, JobID: action.JobID, ActionID: int(action.ActionID), DependentJobs: dependent})
+				turn = &RequiredTurn{ItemID: item.ID, ItemKind: KindHumanAction, RouteClass: route, GateClaimID: gateID, JobID: action.JobID, ActionID: int(action.ActionID), DependentJobs: dependent}
 			}
 		case KindPdfGrab:
 			if item.PdfGrab == nil {
@@ -867,37 +859,23 @@ func (s *Service) projectFamilies(ctx context.Context, items []Item, counts *Cou
 			}
 			assignment = &FamilyAssignment{NextActor: "researcher", GuidanceVariant: "pdf_identifier", OperationVariant: "provide_identifier_or_dismiss", RouteClass: "pdf_identifier_needed", ActionKind: "pdf_identifier_needed"}
 			required++
-			counts.RequiredTurns = append(counts.RequiredTurns, RequiredTurn{ItemID: item.ID, ItemKind: KindPdfGrab, RouteClass: "pdf_identifier_needed", GrabID: item.PdfGrab.GrabID})
+			turn = &RequiredTurn{ItemID: item.ID, ItemKind: KindPdfGrab, RouteClass: "pdf_identifier_needed", GrabID: item.PdfGrab.GrabID}
 		}
 		if assignment == nil {
-			runIndex = -1
-			previous = tuple{}
 			continue
 		}
-		t := tuple{item.Kind, assignment.RouteClass, assignment.ActionKind, assignment.NextActor, assignment.GuidanceVariant, assignment.OperationVariant}
-		if runIndex < 0 || t != previous {
-			keyInput := []any{5, item.ID, item.Kind, assignment.RouteClass, assignment.ActionKind, assignment.NextActor, assignment.GuidanceVariant, assignment.OperationVariant}
-			raw, _ := json.Marshal(keyInput)
-			sum := sha256.Sum256(raw)
-			counts.FamilyRuns = append(counts.FamilyRuns, FamilyRun{
-				RunKey: "fr1_" + hex.EncodeToString(sum[:])[:32], FirstRank: item.Rank,
-				RouteClass: assignment.RouteClass, ActionKind: assignment.ActionKind,
-				NextActor: assignment.NextActor, GuidanceVariant: assignment.GuidanceVariant,
-				OperationVariant: assignment.OperationVariant, Count: 1,
-			})
-			runIndex, previous, runCount = len(counts.FamilyRuns)-1, t, runCount+1
-		} else {
-			counts.FamilyRuns[runIndex].Count++
-		}
-		assignment.RunKey = counts.FamilyRuns[runIndex].RunKey
-		item.Family = assignment
+		rows[i] = familyRow{assignment: assignment, tuple: familyTupleOf(item.Kind, assignment), turn: turn}
 	}
+	orderHumanActionsByFamily(items, rows)
+	runCount := buildFamilyRuns(items, rows, counts)
 	if required > 1024 || !requiredTurnsProjectionComplete || len(counts.RequiredTurns) != required {
 		counts.RequiredTurnsComplete = new(false)
 		counts.RequiredTurns = nil
 	} else {
 		counts.RequiredTurnsComplete = new(true)
 	}
+	// The wire bound survives the family ordering: grouping shrinks the run
+	// count, but the projection must still refuse to overflow the contract.
 	if runCount > 128 {
 		breakdownComplete = false
 	}
@@ -907,6 +885,115 @@ func (s *Service) projectFamilies(ctx context.Context, items []Item, counts *Cou
 	counts.TurnsRequired, counts.TurnsWorking = &required, &working
 	counts.FamilyBreakdownComplete = &breakdownComplete
 	return nil
+}
+
+// familyTuple is the full family identity from plan §14. Two rows belong to
+// the same task family only when every component matches, so
+// `manual_download` and `manual_download_adapter_missing` stay separate.
+type familyTuple struct {
+	kind, route, action, actor, guidance, operation string
+}
+
+// familyRow is one item's projected family membership. It is computed before
+// the rows are reordered so ordering, ranking, and run building all see the
+// same assignment.
+type familyRow struct {
+	assignment *FamilyAssignment
+	tuple      familyTuple
+	turn       *RequiredTurn
+}
+
+func familyTupleOf(kind string, assignment *FamilyAssignment) familyTuple {
+	return familyTuple{kind, assignment.RouteClass, assignment.ActionKind, assignment.NextActor, assignment.GuidanceVariant, assignment.OperationVariant}
+}
+
+// orderHumanActionsByFamily makes every task family one contiguous block:
+// families are ordered by their earliest member and members keep their
+// insertion order inside a family. The underlying action order is pure
+// insertion order with no priority, severity, or attention term, so grouping
+// preserves the only real signal at both levels while letting the inbox hoist
+// one instruction per family instead of repeating it per fragment.
+//
+// A row with no mapped variant cannot join a family (plan §11 rule 4): it is
+// keyed by its own position, so it sorts among the families by its own id and
+// never merges with anything. Ranks are reassigned afterwards so `Rank` and
+// `first_rank` describe the emitted order. Other kinds own separate rank bases
+// and never interleave with actions, so they are left untouched.
+func orderHumanActionsByFamily(items []Item, rows []familyRow) {
+	positions := make([]int, 0, len(items))
+	for i := range items {
+		if items[i].Kind == KindHumanAction {
+			positions = append(positions, i)
+		}
+	}
+	if len(positions) == 0 {
+		return
+	}
+	group := make([]int, len(positions))
+	firstOf := make(map[familyTuple]int, len(positions))
+	for n, position := range positions {
+		if rows[position].assignment == nil {
+			group[n] = position
+			continue
+		}
+		first, grouped := firstOf[rows[position].tuple]
+		if !grouped {
+			first = position
+			firstOf[rows[position].tuple] = position
+		}
+		group[n] = first
+	}
+	order := make([]int, len(positions))
+	for n := range order {
+		order[n] = n
+	}
+	sort.SliceStable(order, func(left, right int) bool { return group[order[left]] < group[order[right]] })
+	orderedItems := make([]Item, len(positions))
+	orderedRows := make([]familyRow, len(positions))
+	for n, source := range order {
+		orderedItems[n], orderedRows[n] = items[positions[source]], rows[positions[source]]
+	}
+	for n, position := range positions {
+		items[position], rows[position] = orderedItems[n], orderedRows[n]
+		items[position].Rank = humanActionRankBase + n
+	}
+}
+
+// buildFamilyRuns records one run per maximal contiguous family in the emitted
+// order and appends required turns in that same order. Because action rows are
+// grouped before ranking, every family yields exactly one run.
+func buildFamilyRuns(items []Item, rows []familyRow, counts *Counts) int {
+	var previous familyTuple
+	// runIndex points at the open run inside counts.FamilyRuns, so a member
+	// increments the stored run rather than a detached copy of it.
+	runIndex, runCount := -1, 0
+	for i := range items {
+		row := rows[i]
+		if row.assignment == nil {
+			runIndex, previous = -1, familyTuple{}
+			continue
+		}
+		if row.turn != nil {
+			counts.RequiredTurns = append(counts.RequiredTurns, *row.turn)
+		}
+		if runIndex < 0 || row.tuple != previous {
+			keyInput := []any{5, items[i].ID, items[i].Kind, row.assignment.RouteClass, row.assignment.ActionKind, row.assignment.NextActor, row.assignment.GuidanceVariant, row.assignment.OperationVariant}
+			raw, _ := json.Marshal(keyInput)
+			sum := sha256.Sum256(raw)
+			counts.FamilyRuns = append(counts.FamilyRuns, FamilyRun{
+				RunKey: "fr1_" + hex.EncodeToString(sum[:])[:32], FirstRank: items[i].Rank,
+				RouteClass: row.assignment.RouteClass, ActionKind: row.assignment.ActionKind,
+				NextActor: row.assignment.NextActor, GuidanceVariant: row.assignment.GuidanceVariant,
+				OperationVariant: row.assignment.OperationVariant, Count: 1,
+			})
+			runIndex, previous, runCount = len(counts.FamilyRuns)-1, row.tuple, runCount+1
+		} else {
+			counts.FamilyRuns[runIndex].Count++
+		}
+		row.assignment.RunKey = counts.FamilyRuns[runIndex].RunKey
+		items[i].Family = row.assignment
+	}
+	return runCount
 }
 
 func contains(values []string, value string) bool {
