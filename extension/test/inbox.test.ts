@@ -501,6 +501,65 @@ test("hoists one byte-identical family instruction above its ranked rows", async
   }
 });
 
+// Reproduces the live defect: a two-row family followed by two singleton
+// families. A singleton hoists no heading, so keying card edges on sibling type
+// swept the headingless rows into the family's card, where a heading reading
+// "2 papers" sat above four rows of three different kinds.
+test("a singleton family starts its own card instead of joining the block above", async () => {
+  const family = [1, 2].map((rank) => {
+    const item = manualAction(`action:pair-${rank}`, rank, `Paired paper ${rank}`);
+    item.run_key = "run_pair";
+    item.next_actor = "researcher";
+    item.guidance_variant = "manual_download";
+    item.operation_variant = "dismiss_only";
+    return item;
+  });
+  const loners = [3, 4].map((rank) => {
+    const item = manualAction(`action:lone-${rank}`, rank, `Lone paper ${rank}`);
+    item.run_key = `run_lone_${rank}`;
+    item.next_actor = "researcher";
+    item.guidance_variant = "manual_download";
+    item.operation_variant = rank === 3 ? "dismiss_only" : "open_and_dismiss";
+    return item;
+  });
+  const run = (key: string, operation: string, count: number, firstRank: number) => ({
+    run_key: key,
+    first_rank: firstRank,
+    route_class: "manual_download",
+    action_kind: "manual_download",
+    next_actor: "researcher",
+    guidance_variant: "manual_download",
+    operation_variant: operation,
+    count,
+  });
+  const fixture = snapshot([...family, ...loners], {
+    schema: 5,
+    counts: counts({
+      pending_total: 4,
+      actions: 4,
+      watch_hits: 0,
+      retractions: 0,
+      turns_required: 4,
+      turns_working: 0,
+      family_breakdown_complete: true,
+      family_runs: [
+        run("run_pair", "dismiss_only", 2, 1),
+        run("run_lone_3", "dismiss_only", 1, 3),
+        run("run_lone_4", "open_and_dismiss", 1, 4),
+      ],
+    }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  const rows = Array.from(page.document.querySelectorAll<HTMLElement>("[data-triage-item-id]"));
+  expect(rows).toHaveLength(4);
+  // The pair shares one card; each singleton is its own.
+  expect(rows.map((row) => row.dataset.cardStart ?? "")).toEqual(["true", "", "true", "true"]);
+  expect(rows.map((row) => row.dataset.cardEnd ?? "")).toEqual(["", "true", "true", "true"]);
+  // Exactly one heading, and it must not sit above the singletons.
+  expect(page.document.querySelectorAll(".family-heading")).toHaveLength(1);
+});
+
 test("keyboard o sends an OA browser handoff through the broker", async () => {
   const item = handoffAction("action:open-access", 1, false);
   const fixture = snapshot([item], {

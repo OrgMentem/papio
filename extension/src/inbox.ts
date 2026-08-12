@@ -1436,9 +1436,18 @@ function renderGroup(kind: TriageSnapshotItem["kind"], heading: string | null, i
   const section = element("section");
   section.className = `triage-group triage-group-${kind}`;
   if (heading !== null) section.append(element("h2", `${heading} (${items.length})`));
+  // A card is one family block. A singleton family hoists no heading (that needs
+  // two adjacent rows), so keying card edges on "the sibling is not a row" put a
+  // headingless row inside the preceding family's card, where it visually
+  // inherited that family's heading and count — a card headed "2 papers" held
+  // four rows of three different kinds. Card edges therefore follow family
+  // identity, and a row with no family is its own card.
+  const families = items.map((item) => familyForItem(item, items));
+  const cardKeys = families.map((family, index) => family?.descriptionID ?? `standalone:${items[index]!.id}`);
+
   let previousRun: string | undefined;
-  for (const item of items) {
-    const family = familyForItem(item, items);
+  for (const [index, item] of items.entries()) {
+    const family = families[index]!;
     if (family !== null && family.descriptionID !== previousRun) {
       const familyHeading = element("h2", `${family.heading} · ${family.total} paper${family.total === 1 ? "" : "s"}`);
       familyHeading.className = "family-heading";
@@ -1456,19 +1465,10 @@ function renderGroup(kind: TriageSnapshotItem["kind"], heading: string | null, i
     } else if (family === null) {
       previousRun = undefined;
     }
-    section.append(renderItem(item, family));
-  }
-
-  // A card starts and ends where a family heading interrupts the stack, not at
-  // the first and last row of the section. `:first-of-type`/`:last-of-type` are
-  // tag-scoped, so with headings interleaved they matched only the section's
-  // first and last <article>, leaving every interior card boundary square.
-  for (const row of Array.from(section.children)) {
-    if (!row.classList.contains("triage-item")) continue;
-    const startsCard = row.previousElementSibling?.classList.contains("triage-item") !== true;
-    const endsCard = row.nextElementSibling?.classList.contains("triage-item") !== true;
-    if (startsCard) (row as HTMLElement).dataset.cardStart = "true";
-    if (endsCard) (row as HTMLElement).dataset.cardEnd = "true";
+    const row = renderItem(item, family);
+    if (cardKeys[index] !== cardKeys[index - 1]) row.dataset.cardStart = "true";
+    if (cardKeys[index] !== cardKeys[index + 1]) row.dataset.cardEnd = "true";
+    section.append(row);
   }
   return section;
 }
