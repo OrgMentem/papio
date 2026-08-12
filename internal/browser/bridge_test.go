@@ -37,6 +37,7 @@ import (
 	"papio/internal/pdf"
 	"papio/internal/preview"
 	"papio/internal/protocol"
+	"papio/internal/pulse"
 	"papio/internal/resolver"
 	"papio/internal/retraction"
 	"papio/internal/store"
@@ -763,7 +764,9 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	}
 	if !slices.Equal(payload.Features, []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, institutionalMaterializationFeature,
+		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature,
 	}) {
+		t.Fatalf("features = %v", payload.Features)
 	}
 }
 
@@ -9023,5 +9026,607 @@ func TestBridgeNoAutomaticFirstRouteWithoutExplicitFocus(t *testing.T) {
 	}
 	if candidates != 0 || claims != 0 {
 		t.Fatalf("automatic first route created candidates=%d claims=%d without focus", candidates, claims)
+	}
+}
+
+// TestNegotiatedReadArbitration pins the session boundary for every newly
+// negotiated read/hint frame. Reads are safe for a pending current peer, but
+// an extension below the protocol floor is refused before it can see an
+// unknown frame. Handoff-driving traffic remains holder-only.
+func TestNegotiatedReadArbitration(t *testing.T) {
+	type request struct {
+		name string
+		raw  func(*testing.T) json.RawMessage
+	}
+	requests := []request{
+		{"presence", func(t *testing.T) json.RawMessage {
+			return inFrame(t, protocol.MsgSurfacePresence, "", protocol.SurfacePresencePayload{
+				RequestID: "presence-arb-1", InstanceID: "instance-arb-1", Surface: "popup",
+				Focused: true, At: "2026-08-12T10:00:00Z",
+			})
+		}},
+		{"pulse", func(t *testing.T) json.RawMessage {
+			return inFrame(t, protocol.MsgWorkPulseRequest, "", protocol.WorkPulseRequestPayload{
+				RequestID: "pulse-arb-1", SchemaVersions: []int64{1},
+			})
+		}},
+		{"activity", func(t *testing.T) json.RawMessage {
+			return inFrame(t, protocol.MsgActivityPageRequest, "", protocol.ActivityPageRequestPayload{
+				RequestID: "activity-arb-1", Limit: 1,
+			})
+		}},
+		{"cohort-v2", func(t *testing.T) json.RawMessage {
+			return inFrame(t, protocol.MsgPageBulkSubmitV2Request, "", protocol.PageBulkSubmitV2RequestPayload{
+				RequestID: "cohort-arb-1", ScanID: "scan-arb-1", CohortID: "cohort-arb-1",
+				Source:      protocol.PageBulkSubmitSource{Kind: "browser_page", Origin: "https://reader.example.edu", Detector: "detector/1"},
+				CohortTotal: 1, ChunkIndex: 0, FinalChunk: true, CanonicalKeys: []string{"doi:10.1000/arb.1"},
+			})
+		}},
+	}
+	for _, tc := range requests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("holder", func(t *testing.T) {
+				b, _, _, _ := newBridge(t)
+				runSyncAs(t, b, sessA, helloAs("1.2.3"))
+				msgs, _ := runSyncAs(t, b, sessA, tc.raw(t))
+				if errMsg := firstOfType(msgs, protocol.MsgError); errMsg != nil &&
+					errMsg.Payload.(*protocol.ErrorPayload).Code == "session_busy" {
+					t.Fatalf("holder was refused: %v", msgs)
+				}
+			})
+			t.Run("non-holder", func(t *testing.T) {
+				b, _, _, _ := newBridge(t)
+				runSyncAs(t, b, sessA, helloAs("1.2.3"))
+				runSyncAs(t, b, sessB, helloAs("1.2.3"))
+				msgs, _ := runSyncAs(t, b, sessB, tc.raw(t))
+				if errMsg := firstOfType(msgs, protocol.MsgError); errMsg != nil &&
+					errMsg.Payload.(*protocol.ErrorPayload).Code == "session_busy" {
+					t.Fatalf("current non-holder read was refused: %v", msgs)
+				}
+			})
+			t.Run("outdated-holder", func(t *testing.T) {
+				b, _, _, _ := newBridge(t)
+				runSyncAs(t, b, sessA, helloAs("0.0.1"))
+				msgs, _ := runSyncAs(t, b, sessA, tc.raw(t))
+				errMsg := firstOfType(msgs, protocol.MsgError)
+				if errMsg == nil || errMsg.Payload.(*protocol.ErrorPayload).Code != "extension_outdated" {
+					t.Fatalf("outdated holder response = %v, want extension_outdated", msgs)
+				}
+			})
+			t.Run("outdated-non-holder", func(t *testing.T) {
+				b, _, _, _ := newBridge(t)
+				runSyncAs(t, b, sessA, helloAs("1.2.3"))
+				runSyncAs(t, b, sessB, helloAs("0.0.1"))
+				// The outdated gate is holder-only; pending reads remain admitted.
+				msgs, _ := runSyncAs(t, b, sessB, tc.raw(t))
+				if errMsg := firstOfType(msgs, protocol.MsgError); errMsg != nil &&
+					errMsg.Payload.(*protocol.ErrorPayload).Code == "session_busy" {
+					t.Fatalf("outdated non-holder read was refused: %v", msgs)
+				}
+			})
+		})
+	}
+
+	// A non-holder cannot drive handoff state even though it can read.
+	b, jobs, _, _ := newBridge(t)
+	jobID := park(t, jobs, "arbitration-handoff", handoffWork())
+	runSyncAs(t, b, sessA, helloAs("1.2.3"))
+	runSyncAs(t, b, sessB, helloAs("1.2.3"))
+	msgs, _ := runSyncAs(t, b, sessB, inFrame(t, protocol.MsgJobAccept, jobID, map[string]any{}))
+	errMsg := firstOfType(msgs, protocol.MsgError)
+	// v2 page-bulk keeps the v1 admission class; neither read-only submission
+	// path may be turned into a holder-only handoff by accident.
+	b, _, _, _ = newBridge(t)
+	runSyncAs(t, b, sessA, helloAs("1.2.3"))
+	runSyncAs(t, b, sessB, helloAs("1.2.3"))
+	v1 := inFrame(t, protocol.MsgPageBulkSubmitRequest, "", protocol.PageBulkSubmitRequestPayload{
+		RequestID: "bulk-v1-admission", ScanID: "scan-v1-admission",
+		Source:        protocol.PageBulkSubmitSource{Kind: "browser_page", Origin: "https://reader.example.edu", Detector: "detector/1"},
+		CanonicalKeys: []string{"doi:10.1000/v1-admission"},
+	})
+	v2 := requests[3].raw(t)
+	for name, frame := range map[string]json.RawMessage{"v1": v1, "v2": v2} {
+		msgs, _ := runSyncAs(t, b, sessB, frame)
+		if errMsg := firstOfType(msgs, protocol.MsgError); errMsg != nil &&
+			errMsg.Payload.(*protocol.ErrorPayload).Code == "session_busy" {
+			t.Fatalf("%s page-bulk request was holder-gated: %v", name, msgs)
+		}
+	}
+
+	if errMsg == nil || errMsg.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+		t.Fatalf("non-holder handoff response = %v, want session_busy", msgs)
+	}
+}
+
+func TestSurfacePresenceLeaseContract(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	advance := settableClock(b)
+	runSync(t, b, hello())
+	send := func(id string, focused bool, at string) *protocol.SurfacePresenceAckPayload {
+		t.Helper()
+		msgs, _ := runSync(t, b, inFrame(t, protocol.MsgSurfacePresence, "", protocol.SurfacePresencePayload{
+			RequestID: "presence-" + id, InstanceID: id, Surface: "popup", Focused: focused, At: at,
+		}))
+		ack := firstOfType(msgs, protocol.MsgSurfacePresenceAck)
+		if ack == nil {
+			t.Fatalf("presence ack missing: %v", msgs)
+		}
+		return ack.Payload.(*protocol.SurfacePresenceAckPayload)
+	}
+	if !send("instance-one-0001", true, "2026-08-12T10:00:00Z").Accepted || !b.AnyFocused(b.now()) {
+		t.Fatal("focused presence was not acknowledged and reflected")
+	}
+	advance(surfacePresenceTTL - time.Second)
+	if !b.AnyFocused(b.now()) {
+		t.Fatal("lease unexpectedly expired before 120 seconds")
+	}
+	advance(2 * time.Second)
+	if b.AnyFocused(b.now()) {
+		t.Fatal("lease used client at timestamp instead of daemon receipt time")
+	}
+	send("instance-one-0001", true, "2099-01-01T00:00:00Z")
+	send("instance-one-0001", false, "2099-01-01T00:00:00Z")
+	if b.AnyFocused(b.now()) {
+		t.Fatal("focused:false did not release the instance lease")
+	}
+	send("instance-one-0001", true, "2026-08-12T10:02:00Z")
+	send("instance-two-0002", true, "2026-08-12T10:02:00Z")
+	send("instance-one-0001", false, "2026-08-12T10:02:00Z")
+	if !b.AnyFocused(b.now()) {
+		t.Fatal("one focused instance was incorrectly cleared by another release")
+	}
+	send("instance-two-0002", false, "2026-08-12T10:02:00Z")
+	if b.AnyFocused(b.now()) {
+		t.Fatal("all focused instances were released, but AnyFocused stayed true")
+	}
+
+	bounded, _, _, _ := newBridge(t)
+	runSync(t, bounded, hello())
+	for i := range maxPresenceLeases + 20 {
+		id := fmt.Sprintf("bounded-%03d", i)
+		msgs, _ := runSync(t, bounded, inFrame(t, protocol.MsgSurfacePresence, "", protocol.SurfacePresencePayload{
+			RequestID: "presence-" + id, InstanceID: id, Surface: "popup", Focused: false, At: "2026-08-12T10:02:00Z",
+		}))
+		if firstOfType(msgs, protocol.MsgSurfacePresenceAck) == nil {
+			t.Fatalf("bounded presence ack missing: %v", msgs)
+		}
+	}
+	bounded.mu.Lock()
+	leaseCount, orderCount := len(bounded.presence), len(bounded.presenceOrder)
+	bounded.mu.Unlock()
+	if leaseCount > maxPresenceLeases || orderCount > maxPresenceLeases || orderCount != leaseCount {
+		t.Fatalf("presence lease bookkeeping = map:%d order:%d, want both <= %d and equal", leaseCount, orderCount, maxPresenceLeases)
+	}
+
+	churn, _, _, _ := newBridge(t)
+	churnAdvance := settableClock(churn)
+	runSync(t, churn, hello())
+	for i := range maxPresenceLeases * 3 {
+		id := fmt.Sprintf("churn-%03d", i)
+		msgs, _ := runSync(t, churn, inFrame(t, protocol.MsgSurfacePresence, "", protocol.SurfacePresencePayload{
+			RequestID: "presence-" + id, InstanceID: id, Surface: "popup", Focused: false, At: "2026-08-12T10:02:00Z",
+		}))
+		if firstOfType(msgs, protocol.MsgSurfacePresenceAck) == nil {
+			t.Fatalf("churn presence ack missing: %v", msgs)
+		}
+		churnAdvance(surfacePresenceTTL + time.Second)
+	}
+	churn.mu.Lock()
+	churnMap, churnOrder := len(churn.presence), len(churn.presenceOrder)
+	churn.mu.Unlock()
+	if churnMap > maxPresenceLeases || churnOrder > maxPresenceLeases || churnMap != churnOrder {
+		t.Fatalf("expired presence churn grew bookkeeping = map:%d order:%d, cap %d", churnMap, churnOrder, maxPresenceLeases)
+	}
+	if churnMap != 1 {
+		t.Fatalf("expected only latest lease after expiry churn, got %d", churnMap)
+	}
+}
+
+func TestSurfacePresenceRejectsPrivateFields(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+	raw := inFrame(t, protocol.MsgSurfacePresence, "", map[string]any{
+		"request_id": "presence-private-1", "instance_id": "private-instance-1",
+		"surface": "popup", "focused": true, "at": "2026-08-12T10:00:00Z",
+		"url": "https://private.example/article", "title": "Private title", "tab_id": 7,
+		"host": "private.example", "identifier": "doi:10.1000/private", "content": "secret",
+	})
+	if _, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{raw}); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("presence with private fields error = %v, want ErrInvalidFrame", err)
+	}
+}
+
+func TestWorkPulseHandlerValidatesAndDegradesStructurally(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	b.SetPulseService(&pulse.Service{Jobs: jobs, Now: b.now})
+	runSync(t, b, hello())
+	msgs, raw := runSync(t, b, inFrame(t, protocol.MsgWorkPulseRequest, "", protocol.WorkPulseRequestPayload{
+		RequestID: "pulse-healthy-1", SchemaVersions: []int64{1},
+	}))
+	response := firstOfType(msgs, protocol.MsgWorkPulseResponse)
+	if response == nil || len(raw) == 0 {
+		t.Fatalf("healthy pulse response = %v", msgs)
+	}
+	if got := response.Payload.(*protocol.WorkPulseResponsePayload); got.RequestID != "pulse-healthy-1" || got.Schema != 1 {
+		t.Fatalf("healthy pulse payload = %+v", response.Payload)
+	}
+	b.SetPulseService(nil)
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgWorkPulseRequest, "", protocol.WorkPulseRequestPayload{
+		RequestID: "pulse-failed-1", SchemaVersions: []int64{1},
+	}))
+	errMsg := firstOfType(msgs, protocol.MsgError)
+	if errMsg == nil {
+		types := make([]string, len(msgs))
+		for i, msg := range msgs {
+			types[i] = msg.Type
+		}
+		t.Fatalf("pulse failure response types=%v, want structured pulse_unavailable", types)
+	}
+	errPayload := errMsg.Payload.(*protocol.ErrorPayload)
+	if errPayload.Code != "pulse_unavailable" || errPayload.RequestID != "pulse-failed-1" {
+		t.Fatalf("pulse failure payload = %+v, want correlated pulse-failed-1", errPayload)
+	}
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgActivityRequest, "", protocol.ActivityRequestPayload{
+		RequestID: "pulse-following-old-activity", Limit: 1,
+	}))
+	if firstOfType(msgs, protocol.MsgActivityResponse) == nil {
+		t.Fatalf("session did not survive pulse failure: %v", msgs)
+	}
+}
+func TestActivityPageContractAndLegacyActivity(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, hello())
+	base := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	for i := range 60 {
+		appendEventAt(t, jobs, "", "test.activity", map[string]any{"n": i}, base.Add(time.Duration(i)*time.Second))
+	}
+	if _, err := jobs.S.DB().Exec(`DELETE FROM events WHERE seq <= 5`); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgActivityPageRequest, "", protocol.ActivityPageRequestPayload{
+		RequestID: "activity-page-1", Limit: 50,
+	}))
+	page := firstOfType(msgs, protocol.MsgActivityPageResponse)
+	if page == nil {
+		t.Fatalf("activity page missing: %v", msgs)
+	}
+	p := page.Payload.(*protocol.ActivityPageResponsePayload)
+	before := p.Cursor
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgActivityPageRequest, "", protocol.ActivityPageRequestPayload{
+		RequestID: "activity-page-2", Limit: 50, BeforeSeq: before,
+	}))
+	next := firstOfType(msgs, protocol.MsgActivityPageResponse).Payload.(*protocol.ActivityPageResponsePayload)
+	if len(next.Entries) != 5 || next.HasMore || next.Cursor != "" || next.Entries[0].Seq >= p.Entries[len(p.Entries)-1].Seq {
+		t.Fatalf("second activity page = %+v", next)
+	}
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgActivityPageRequest, "", protocol.ActivityPageRequestPayload{
+		RequestID: "activity-count", Limit: 1, SeenThroughSeq: "10",
+	}))
+	counted := firstOfType(msgs, protocol.MsgActivityPageResponse).Payload.(*protocol.ActivityPageResponsePayload)
+	if counted.NewCountSince == nil || *counted.NewCountSince != 50 || counted.Gap != nil {
+		t.Fatalf("new_count_since = %+v gap=%v, want 50 and no gap", counted.NewCountSince, counted.Gap)
+	}
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgActivityPageRequest, "", protocol.ActivityPageRequestPayload{
+		RequestID: "activity-gap", Limit: 1, SeenThroughSeq: "1",
+	}))
+	gap := firstOfType(msgs, protocol.MsgActivityPageResponse).Payload.(*protocol.ActivityPageResponsePayload)
+	if gap.Gap == nil || !*gap.Gap || gap.NewCountSince != nil {
+		t.Fatalf("retained-history gap = %+v", gap)
+	}
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgActivityRequest, "", protocol.ActivityRequestPayload{
+		RequestID: "legacy-activity", Limit: 1,
+	}))
+	if firstOfType(msgs, protocol.MsgActivityResponse) == nil {
+		t.Fatalf("legacy activity response missing: %v", msgs)
+	}
+}
+func TestActivityPageReadFailureIsUnavailable(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, hello())
+	if _, err := jobs.S.DB().Exec(`DROP TABLE events`); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgActivityPageRequest, "", protocol.ActivityPageRequestPayload{
+		RequestID: "activity-failed-1", Limit: 10, SeenThroughSeq: "1",
+	}))
+	errMsg := firstOfType(msgs, protocol.MsgError)
+	if errMsg == nil {
+		t.Fatalf("activity read failure = %v, want structured unavailable", msgs)
+	}
+	errPayload := errMsg.Payload.(*protocol.ErrorPayload)
+	if errPayload.Code != "activity_page_unavailable" || errPayload.RequestID != "activity-failed-1" {
+		t.Fatalf("activity read failure payload = %+v, want correlated unavailable", errPayload)
+	}
+	if firstOfType(msgs, protocol.MsgActivityPageResponse) != nil {
+		t.Fatalf("activity read failure fabricated a page: %v", msgs)
+	}
+}
+
+func TestPageBulkSubmitV2PersistsReplayAndConflict(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, hello())
+	req := protocol.PageBulkSubmitV2RequestPayload{
+		RequestID: "cohort-submit-1", ScanID: "scan-submit-1", CohortID: "cohort-submit-1",
+		Source:      protocol.PageBulkSubmitSource{Kind: "browser_page", Origin: "https://reader.example.edu", Detector: "detector/1"},
+		CohortTotal: 1, ChunkIndex: 0, FinalChunk: true, CanonicalKeys: []string{"doi:10.1000/cohort.1"},
+	}
+	frame := inFrame(t, protocol.MsgPageBulkSubmitV2Request, "", req)
+	msgs, _ := runSync(t, b, frame)
+	result := firstOfType(msgs, protocol.MsgPageBulkSubmitV2Result)
+	if result == nil {
+		t.Fatalf("cohort result missing: %v", msgs)
+	}
+	first := *result.Payload.(*protocol.PageBulkSubmitV2ResultPayload)
+	if first.Submitted != 1 || first.PersistedMembers != 1 || first.Membership != "complete" || first.CohortTotal == nil || *first.CohortTotal != 1 {
+		t.Fatalf("first cohort result = %+v", first)
+	}
+	var jobsBefore, membersBefore int
+	if err := jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&jobsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM acquisition_batch_members`).Scan(&membersBefore); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ = runSync(t, b, frame)
+	replay := firstOfType(msgs, protocol.MsgPageBulkSubmitV2Result)
+	if replay == nil || !reflect.DeepEqual(first, *replay.Payload.(*protocol.PageBulkSubmitV2ResultPayload)) {
+		t.Fatalf("replay = %v, want identical cached result %+v", msgs, first)
+	}
+	var jobsAfter, membersAfter int
+	_ = jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&jobsAfter)
+
+	req.CanonicalKeys = []string{"doi:10.1000/conflict.1"}
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgPageBulkSubmitV2Request, "", req))
+	errMsg := firstOfType(msgs, protocol.MsgError)
+	if errMsg == nil {
+		t.Fatalf("conflicting replay = %v, want page_bulk_cohort_conflict", msgs)
+	}
+	errPayload := errMsg.Payload.(*protocol.ErrorPayload)
+	if errPayload.Code != "page_bulk_cohort_conflict" || errPayload.RequestID != req.RequestID {
+		t.Fatalf("conflicting replay error = %+v, want correlated request id %q", errPayload, req.RequestID)
+	}
+	_ = jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&jobsAfter)
+	_ = jobs.S.DB().QueryRow(`SELECT COUNT(*) FROM acquisition_batch_members`).Scan(&membersAfter)
+	if jobsAfter != jobsBefore || membersAfter != membersBefore {
+		t.Fatalf("conflict mutated domain: jobs %d/%d members %d/%d", jobsAfter, jobsBefore, membersAfter, membersBefore)
+	}
+}
+func mappedFamilyJob(t *testing.T, jobs *job.Store, reqID string) string {
+	t.Helper()
+	id := park(t, jobs, reqID, handoffWork())
+	if _, err := jobs.S.DB().Exec(
+		`UPDATE human_actions SET kind = 'manual_download', detail = 'download manually', requires_auth = 0, blocked_by = 'landing_page' WHERE job_id = ?`,
+		id,
+	); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestCountsV3AndSnapshotV5FamilyAgreement(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	mappedFamilyJob(t, jobs, "family-agreement")
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgTriageCountsRequest, "", protocol.TriageCountsRequestPayload{
+		RequestID: "family-counts-3", SchemaVersions: []int64{3},
+	}))
+	countsMsg := firstOfType(msgs, protocol.MsgTriageCountsResponse)
+	if countsMsg == nil {
+		t.Fatalf("counts v3 missing: %v", msgs)
+	}
+	counts := countsMsg.Payload.(*protocol.TriageCountsResponsePayload).Counts
+	if counts.TurnsRequired == nil || counts.TurnsWorking == nil || counts.FamilyBreakdownComplete == nil || !*counts.FamilyBreakdownComplete {
+		t.Fatalf("counts v3 family projection incomplete: %+v", counts)
+	}
+	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "", protocol.TriageSnapshotRequestPayload{
+		RequestID: "family-snapshot-5", SchemaVersions: []int64{5}, Limit: 50,
+	}))
+	snapshotMsg := firstOfType(msgs, protocol.MsgTriageSnapshotResponse)
+	if snapshotMsg == nil {
+		t.Fatalf("snapshot v5 missing: %v", msgs)
+	}
+	snapshot := snapshotMsg.Payload.(*protocol.TriageSnapshotResponsePayload)
+	byRun := map[string]int{}
+	for _, item := range snapshot.Items {
+		if item.RunKey == "" {
+			t.Fatalf("snapshot item lacks run_key: %+v", item)
+		}
+		byRun[item.RunKey]++
+	}
+	countedRuns := map[string]int{}
+	for _, run := range counts.FamilyRuns {
+		countedRuns[run.RunKey] = int(run.Count)
+	}
+	if !reflect.DeepEqual(byRun, countedRuns) {
+		t.Fatalf("counts/snapshot family runs disagree: rows=%v runs=%v", byRun, countedRuns)
+	}
+	total := int64(0)
+	for _, run := range counts.FamilyRuns {
+		total += run.Count
+	}
+	if total != *counts.TurnsRequired+*counts.TurnsWorking {
+		t.Fatalf("family run total=%d, want turns_required+turns_working=%d", total, *counts.TurnsRequired+*counts.TurnsWorking)
+	}
+}
+
+func TestTriageNegotiatedSchemaFieldsAreProducerGated(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	mappedFamilyJob(t, jobs, "schema-gating")
+	runSync(t, b, hello())
+	requestCounts := func(schema int64) (protocol.TriageCounts, json.RawMessage) {
+		msgs, raw := runSync(t, b, inFrame(t, protocol.MsgTriageCountsRequest, "", protocol.TriageCountsRequestPayload{
+			RequestID: fmt.Sprintf("schema-counts-%d", schema), SchemaVersions: []int64{schema},
+		}))
+		msg := firstOfType(msgs, protocol.MsgTriageCountsResponse)
+		if msg == nil {
+			t.Fatalf("counts schema %d missing: %v", schema, msgs)
+		}
+		for _, frame := range raw {
+			var env struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Counts map[string]json.RawMessage `json:"counts"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal(frame, &env) == nil && env.Type == protocol.MsgTriageCountsResponse {
+				data, _ := json.Marshal(env.Payload.Counts)
+				return msg.Payload.(*protocol.TriageCountsResponsePayload).Counts, data
+			}
+		}
+		t.Fatalf("counts schema %d raw frame missing", schema)
+		return protocol.TriageCounts{}, nil
+	}
+	v1, v1Raw := requestCounts(1)
+	v2, v2Raw := requestCounts(2)
+	v3, v3Raw := requestCounts(3)
+	for name, raw := range map[string]json.RawMessage{"v1": v1Raw, "v2": v2Raw, "v3": v3Raw} {
+		for _, field := range []string{"turns_required", "turns_working", "family_breakdown_complete", "family_runs", "required_turns_complete", "required_turns"} {
+			var payload map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &payload); err != nil {
+				t.Fatal(err)
+			}
+			_, present := payload[field]
+			if name != "v3" && present {
+				t.Fatalf("%s carried v3 field %q", name, field)
+			}
+			if name == "v3" && !present {
+				t.Fatalf("v3 omitted negotiated field %q", field)
+			}
+		}
+	}
+	if v1.ActionsRequiresAuth != nil || v2.ActionsRequiresAuth == nil || v3.ActionsRequiresAuth != nil {
+		t.Fatalf("actions_requires_auth schema gating = v1:%v v2:%v v3:%v", v1.ActionsRequiresAuth, v2.ActionsRequiresAuth, v3.ActionsRequiresAuth)
+	}
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "", protocol.TriageSnapshotRequestPayload{
+		RequestID: "schema-snapshot-4", SchemaVersions: []int64{4}, Limit: 50,
+	}))
+	v4 := firstOfType(msgs, protocol.MsgTriageSnapshotResponse)
+	msgs, raw := runSync(t, b, inFrame(t, protocol.MsgTriageSnapshotRequest, "", protocol.TriageSnapshotRequestPayload{
+		RequestID: "schema-snapshot-5", SchemaVersions: []int64{5}, Limit: 50,
+	}))
+	v5 := firstOfType(msgs, protocol.MsgTriageSnapshotResponse)
+	if v4 == nil || v5 == nil {
+		t.Fatalf("snapshot schema responses = v4:%v v5:%v", v4, v5)
+	}
+	for _, item := range v4.Payload.(*protocol.TriageSnapshotResponsePayload).Items {
+		if item.RunKey != "" || item.NextActor != "" || item.GuidanceVariant != "" || item.OperationVariant != "" {
+			t.Fatalf("schema 4 carried schema-5 quartet: %+v", item)
+		}
+	}
+	seenQuartet := false
+	for _, item := range v5.Payload.(*protocol.TriageSnapshotResponsePayload).Items {
+		if item.RunKey != "" && item.NextActor != "" && item.GuidanceVariant != "" && item.OperationVariant != "" {
+			seenQuartet = true
+		}
+	}
+	if !seenQuartet {
+		t.Fatalf("schema 5 carried no row quartet: %v", raw)
+	}
+}
+
+func TestNewSolicitedResponsesFitResultCap(t *testing.T) {
+	b := &Bridge{}
+	stalls := make([]protocol.WorkPulseStallEpisode, 16)
+	gates := make([]protocol.WorkPulseGate, 16)
+	for i := range stalls {
+		stalls[i] = protocol.WorkPulseStallEpisode{
+			EpisodeKey: fmt.Sprintf("episode-%02d", i), CauseKind: "execution_lease_overdue",
+			PublicLabel: strings.Repeat("s", 64), Since: "2026-08-12T00:00:00Z", Count: 1,
+		}
+		gates[i] = protocol.WorkPulseGate{Kind: "source_budget", Source: fmt.Sprintf("source-%02d", i), Until: "2026-08-12T23:59:59Z", Count: 1}
+	}
+	pulseFrame, err := b.frame(protocol.MsgWorkPulseResponse, "", protocol.WorkPulseResponsePayload{
+		RequestID: "pulse-cap", Schema: 1, GeneratedAt: "2026-08-12T00:00:00Z",
+		StallEpisodes: stalls, Gates: gates, StallEpisodesTruncated: new(bool), GatesTruncated: new(bool),
+		EffectCapacity:       &protocol.WorkPulseCapacity{Busy: 1, Limit: 1, Waiting: 100},
+		HumanSurfaceCapacity: &protocol.WorkPulseHumanSurfaceCapacity{Busy: 1, Limit: 1, WaitingClaims: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]protocol.ActivityEntryPayload, 50)
+	for i := range entries {
+		// 160 runes is the real worst case: the daemon clamps every Activity
+		// text to that bound (store.clampActivityText) and the wire enforces it,
+		// so a longer fixture would test a frame no producer can emit.
+		entries[i] = protocol.ActivityEntryPayload{Seq: int64(i + 1), At: "2026-08-12T00:00:00Z", Kind: "test", Text: strings.Repeat("a", 160)}
+	}
+	newCount := int64(1_000_000)
+	activityFrame, err := b.frame(protocol.MsgActivityPageResponse, "", protocol.ActivityPageResponsePayload{
+		RequestID: "activity-cap", GeneratedAt: "2026-08-12T00:00:00Z", Entries: entries, HasMore: true, Cursor: "1", LatestSeq: 50,
+		NewCountSince: &newCount,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The true worst case is a full breakdown: 128 family runs plus the 1024-turn
+	// ceiling, with the counts algebra satisfied (runs sum to required+working).
+	runs := make([]protocol.TriageFamilyRun, 128)
+	for i := range runs {
+		runs[i] = protocol.TriageFamilyRun{RunKey: fmt.Sprintf("fr1_%028x", i), FirstRank: int64(i),
+			RouteClass: "manual_download", ActionKind: "manual_download", NextActor: "researcher",
+			GuidanceVariant: "manual_download", OperationVariant: "dismiss_only", Count: 8}
+	}
+	turns := make([]protocol.TriageRequiredTurn, 1024)
+	for i := range turns {
+		actionID := int64(i + 1)
+		turns[i] = protocol.TriageRequiredTurn{
+			ItemID: fmt.Sprintf("action:%d", i+1), ItemKind: "human_action", ActionID: &actionID,
+			JobID: fmt.Sprintf("job_%026d", i+1), RouteClass: "manual_download",
+		}
+	}
+	required, working := int64(1024), int64(0)
+	complete := true
+	countsFrame, err := b.frame(protocol.MsgTriageCountsResponse, "", protocol.TriageCountsResponsePayload{
+		RequestID: "counts-cap", Counts: protocol.TriageCounts{
+			PendingTotal: 0, TurnsRequired: &required, TurnsWorking: &working,
+			FamilyBreakdownComplete: &complete, FamilyRuns: runs,
+			RequiredTurnsComplete: &complete, RequiredTurns: turns,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, frame := range map[string]json.RawMessage{"pulse": pulseFrame, "activity": activityFrame, "counts": countsFrame} {
+		if len(frame) > ipc.MaxResultBytes {
+			t.Fatalf("%s frame=%d exceeds ipc.MaxResultBytes=%d", name, len(frame), ipc.MaxResultBytes)
+		}
+	}
+
+	maxSolicited := max(len(pulseFrame), len(activityFrame), len(countsFrame))
+	batched := (maxOutstandingOffers + maxFocusFramesPerPoll) * len(pulseFrame)
+	if maxSolicited+batched > ipc.MaxResultBytes {
+		t.Fatalf("new solicited response plus bounded batches=%d exceeds ipc.MaxResultBytes=%d", maxSolicited+batched, ipc.MaxResultBytes)
+	}
+}
+func TestOldPeerReceivesNoNewUnsolicitedFrames(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	msgs, _ := runSyncAs(t, b, sessA, helloAs("0.13.0"))
+	for _, msg := range msgs {
+		switch msg.Type {
+		case protocol.MsgSurfacePresenceAck, protocol.MsgWorkPulseResponse, protocol.MsgActivityPageResponse,
+			protocol.MsgPageBulkSubmitV2Result:
+			t.Fatalf("old peer received unsolicited new frame %q: %v", msg.Type, msgs)
+		}
+	}
+	msgs, _ = runSyncAs(t, b, sessA, inFrame(t, protocol.MsgTriageCountsRequest, "", protocol.TriageCountsRequestPayload{
+		RequestID: "old-peer-counts", SchemaVersions: []int64{1},
+	}))
+	counts := firstOfType(msgs, protocol.MsgTriageCountsResponse)
+	if counts == nil {
+		t.Fatalf("old peer counts response missing: %v", msgs)
+	}
+	raw, _ := json.Marshal(counts.Payload.(*protocol.TriageCountsResponsePayload).Counts)
+	for _, field := range []string{"turns_required", "family_runs", "required_turns"} {
+		if bytes.Contains(raw, []byte(`"`+field+`"`)) {
+			t.Fatalf("old peer legacy counts carried %q: %s", field, raw)
+		}
+	}
+	msgs, _ = runSyncAs(t, b, sessA, inFrame(t, protocol.MsgTriageSnapshotRequest, "", protocol.TriageSnapshotRequestPayload{
+		RequestID: "old-peer-snapshot", SchemaVersions: []int64{4}, Limit: 1,
+	}))
+	snapshot := firstOfType(msgs, protocol.MsgTriageSnapshotResponse)
+	if snapshot == nil || snapshot.Payload.(*protocol.TriageSnapshotResponsePayload).Schema != 4 {
+		t.Fatalf("old peer schema fallback = %v", msgs)
 	}
 }

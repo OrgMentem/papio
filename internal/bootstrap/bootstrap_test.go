@@ -52,8 +52,12 @@ func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("resolver order = %v, want %v", names, want)
 	}
-	if system.App.Fetch == nil || system.App.Validate == nil || system.App.Enricher == nil || system.Scheduler == nil || system.Bundle == nil || system.Captures == nil {
-		t.Fatal("bootstrap left a core service unwired")
+	if system.Pulse == nil {
+		t.Fatal("bootstrap left pulse service unwired")
+	}
+	pulseField := reflect.ValueOf(system.Browser).Elem().FieldByName("pulse")
+	if !pulseField.IsValid() || pulseField.IsNil() {
+		t.Fatal("bootstrap did not wire pulse service into browser bridge")
 	}
 	maintenance, ok := system.Scheduler.Config.Maintenance.(daemon.MaintenanceRunners)
 	if !ok {

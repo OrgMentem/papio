@@ -64,6 +64,8 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
     Event: window.Event,
     HTMLElement: window.HTMLElement,
     HTMLButtonElement: window.HTMLButtonElement,
+    HTMLInputElement: window.HTMLInputElement,
+    HTMLSelectElement: window.HTMLSelectElement,
     HTMLUListElement: window.HTMLUListElement,
     chrome: {
       permissions: {
@@ -246,4 +248,27 @@ test("persists the Firefox page-capture consent checkbox", async () => {
   const restored = await optionsDocument({ pageCaptureConsent: true });
   const restoredCheckbox = restored.document.getElementById("page-capture-consent") as HTMLInputElement;
   expect(restoredCheckbox.checked).toBe(true);
+});
+
+test("persists feedback and interruption settings", async () => {
+  const page = await optionsDocument();
+  const toolbar = page.document.getElementById("toolbar-count-mode") as HTMLSelectElement;
+  const catchUp = page.document.getElementById("catch-up-enabled") as HTMLInputElement;
+  const success = page.document.getElementById("success-ack-mode") as HTMLSelectElement;
+
+  expect(toolbar.value).toBe("required");
+  expect(catchUp.checked).toBe(true);
+  expect(success.value).toBe("all");
+
+  toolbar.value = "all";
+  toolbar.dispatchEvent(new Event("change"));
+  catchUp.checked = false;
+  catchUp.dispatchEvent(new Event("change"));
+  success.value = "errors";
+  success.dispatchEvent(new Event("change"));
+  await settle();
+
+  expect(page.storageValues["papio_toolbar_count_mode_v1"]).toBe("all");
+  expect(page.storageValues["papio_catch_up_enabled_v1"]).toBe(false);
+  expect(page.storageValues["papio_success_ack_mode_v1"]).toBe("errors");
 });

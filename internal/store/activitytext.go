@@ -114,6 +114,21 @@ func ActivityText(kind string, detail map[string]any) string {
 			return clampActivityText(fmt.Sprintf("On-ready hook ran (%s)", status))
 		}
 		return "On-ready hook ran"
+	case "notify.attempted":
+		if count, ok := activityDetailInt64(detail, "count"); ok && count > 1 {
+			return clampActivityText(fmt.Sprintf("Notification attempted for %d items", count))
+		}
+		return "Notification attempted"
+	case "notify.held":
+		if reason := strings.ReplaceAll(activityDetailString(detail, "reason"), "_", " "); reason != "" {
+			return clampActivityText(fmt.Sprintf("Notification held (%s)", reason))
+		}
+		return "Notification held"
+	case "notify.digest":
+		if count, ok := activityDetailInt64(detail, "count"); ok && count > 1 {
+			return clampActivityText(fmt.Sprintf("Notification digest queued for %d items", count))
+		}
+		return "Notification digest queued"
 	default:
 		return clampActivityText(kind)
 	}

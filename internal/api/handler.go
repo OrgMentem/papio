@@ -274,8 +274,20 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"triage.counts": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return triageCounts(ctx, raw, system)
 		},
+		"work.pulse_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return workPulse(ctx, raw, system)
+		},
 		"stats.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return triageStats(ctx, raw, system)
+		},
+		"notify.show_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return notifyShow(ctx, raw, system)
+		},
+		"notify.preview_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return notifyPreview(ctx, raw, system)
+		},
+		"notify.test_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return notifyTest(ctx, raw, system)
 		},
 		"stats.page_bulk": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return pageBulkStats(ctx, raw, system)

@@ -76,7 +76,15 @@
         "institutional_navigated_request",
         "institutional_navigated_response",
         "institutional_reconcile_request",
-        "institutional_reconcile_response"
+        "institutional_reconcile_response",
+        "surface_presence",
+        "surface_presence_ack",
+        "work_pulse_request",
+        "work_pulse_response",
+        "activity_page_request",
+        "activity_page_response",
+        "page_bulk_submit_v2_request",
+        "page_bulk_submit_v2_result"
       ]
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
@@ -114,6 +122,108 @@
         "failure_groups_7d": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
     },
+    "counts_v3": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pending_total", "watch_hits", "actions", "retractions", "jobs_working", "jobs_needs_review", "failure_groups_7d"],
+      "properties": {
+        "pending_total": {"type":"integer","minimum":0,"maximum":9007199254740991},
+        "watch_hits": {"type":"integer","minimum":0,"maximum":9007199254740991},
+        "actions": {"type":"integer","minimum":0,"maximum":9007199254740991},
+        "actions_requires_auth": {"type":"integer","minimum":0,"maximum":9007199254740991},
+        "retractions": {"type":"integer","minimum":0,"maximum":9007199254740991},
+        "jobs_working": {"type":"integer","minimum":0,"maximum":9007199254740991},
+        "jobs_needs_review": {"type":"integer","minimum":0,"maximum":9007199254740991},
+        "failure_groups_7d": {"type":"integer","minimum":0,"maximum":9007199254740991},
+        "turns_required": {"type":"integer","minimum":0,"maximum":1000000},
+        "turns_working": {"type":"integer","minimum":0,"maximum":1000000},
+        "family_breakdown_complete": {"type":"boolean"},
+        "family_runs": {"type":"array","maxItems":128,"items":{"$ref":"#/$defs/family_run"}},
+        "required_turns_complete": {"type":"boolean"},
+        "required_turns": {"type":"array","maxItems":1024,"items":{"$ref":"#/$defs/required_turn"}}
+      },
+      "allOf":[
+        {"anyOf":[
+          {"required":["turns_required"]},
+          {"required":["turns_working"]},
+          {"required":["family_breakdown_complete"]},
+          {"required":["family_runs"]},
+          {"required":["required_turns_complete"]},
+          {"required":["required_turns"]}
+        ]}
+      ]
+    },
+    "family_run": {
+      "type":"object",
+      "additionalProperties":false,
+      "required":["run_key","first_rank","route_class","action_kind","next_actor","guidance_variant","operation_variant","count"],
+      "properties":{
+        "run_key":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+        "first_rank":{"type":"integer","minimum":0,"maximum":9007199254740991},
+        "route_class":{"enum":["openurl_handoff","manual_download","verify_identity","openurl_available","human_auth_required","terms_acceptance_required","document_delivery","downloads_access_required","pdf_identifier_needed"]},
+        "action_kind":{"type":"string","minLength":1,"maxLength":100,"pattern":"^[^\u0000]+$"},
+        "next_actor":{"enum":["papio","researcher","reference"]},
+        "guidance_variant":{"enum":["manual_download","manual_download_adapter_missing","institution_sign_in","open_page","verify_identity","document_delivery","downloads_access","terms_acceptance","security_challenge","pdf_identifier","papio_continuing"]},
+        "operation_variant":{"enum":["none","dismiss_only","open_and_dismiss","accept_reject","accept_reject_open","delivery_reconcile","provide_identifier_or_dismiss"]},
+        "count":{"type":"integer","minimum":1,"maximum":1000000}
+      }
+    },
+    "required_turn": {
+      "type":"object","additionalProperties":false,
+      "required":["item_id","item_kind","route_class","dependent_jobs"],
+      "properties":{
+        "item_id":{"type":"string","minLength":1,"maxLength":1024,"pattern":"^[^\u0000]+$"},
+        "item_kind":{"enum":["human_action","pdf_grab"]},
+        "action_id":{"type":"integer","minimum":1,"maximum":9007199254740991},
+        "job_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{8,128}$"},
+        "grab_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+        "route_class":{"enum":["openurl_handoff","manual_download","verify_identity","openurl_available","human_auth_required","terms_acceptance_required","document_delivery","downloads_access_required","pdf_identifier_needed"]},
+        "gate_claim_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+        "dependent_jobs":{"type":"integer","minimum":0,"maximum":1000000}
+      },
+      "allOf":[
+        {
+          "if":{"properties":{"item_kind":{"const":"human_action"}},"required":["item_kind"]},
+          "then":{"required":["action_id","job_id"],"not":{"required":["grab_id"]}}
+        },
+        {
+          "if":{"properties":{"item_kind":{"const":"pdf_grab"}},"required":["item_kind"]},
+          "then":{"required":["grab_id"],"properties":{"dependent_jobs":{"const":0}},"not":{"anyOf":[{"required":["action_id"]},{"required":["job_id"]},{"required":["gate_claim_id"]}]}}
+        }
+      ]
+    },
+    "pulse_capacity": {
+      "type":"object","additionalProperties":false,"required":["busy","limit"],
+      "properties":{"busy":{"type":"integer","minimum":0,"maximum":1000000},"limit":{"type":"integer","minimum":0,"maximum":1000000},"waiting":{"type":"integer","minimum":0,"maximum":1000000}}
+    },
+    "pulse_human_capacity": {
+      "type":"object","additionalProperties":false,"required":["busy","limit","waiting_claims"],
+      "properties":{"busy":{"type":"integer","minimum":0,"maximum":1000000},"limit":{"type":"integer","minimum":0,"maximum":1000000},"waiting_claims":{"type":"integer","minimum":0,"maximum":1000000}}
+    },
+    "pulse_episode": {
+      "type":"object","additionalProperties":false,"required":["episode_key","cause_kind","public_label","since","count"],
+      "properties":{
+        "episode_key":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+        "cause_kind":{"enum":["execution_lease_overdue","browser_session_unavailable","source_state_unclassified","delivery_poll_overdue","cohort_projection_failed"]},
+        "public_label":{"type":"string","minLength":1,"maxLength":64,"description":"UTF-8 byte bound is enforced by executable validators; maxLength is a schema approximation."},
+        "since":{"type":"string","format":"date-time","maxLength":64},
+        "count":{"type":"integer","minimum":1,"maximum":1000000}
+      }
+    },
+    "pulse_next_action": {
+      "type":"object","additionalProperties":false,"required":["at","kind"],
+      "properties":{"at":{"type":"string","format":"date-time","maxLength":64},"kind":{"enum":["retry","delivery_poll","source_gate"]},"source":{"type":"string","maxLength":64,"description":"UTF-8 byte bound is enforced by executable validators; maxLength is a schema approximation."},"count":{"type":"integer","minimum":0,"maximum":1000000}}
+    },
+    "pulse_gate": {
+      "type":"object","additionalProperties":false,"required":["kind","source","until","count"],
+      "properties":{"kind":{"const":"source_budget"},"source":{"type":"string","minLength":1,"maxLength":64,"description":"UTF-8 byte bound is enforced by executable validators; maxLength is a schema approximation."},"until":{"type":"string","format":"date-time","maxLength":64},"count":{"type":"integer","minimum":0,"maximum":1000000}}
+    },
+    "pulse_batch": {
+      "type":"object","additionalProperties":false,"required":["batch_id","started_at","membership"],
+      "properties":{
+        "batch_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"label":{"type":"string","maxLength":256,"description":"UTF-8 byte bound is enforced by executable validators; maxLength is a schema approximation."},"started_at":{"type":"string","format":"date-time","maxLength":64},"settled_at":{"type":"string","format":"date-time","maxLength":64},
+        "total":{"type":"integer","minimum":0,"maximum":1000000},"settled":{"type":"integer","minimum":0,"maximum":1000000},"nonterminal_total":{"type":"integer","minimum":0,"maximum":1000000},"in_flight":{"type":"integer","minimum":0,"maximum":1000000},"scheduled":{"type":"integer","minimum":0,"maximum":1000000},"continuing":{"type":"integer","minimum":0,"maximum":1000000},"waiting_required":{"type":"integer","minimum":0,"maximum":1000000},"stalled":{"type":"integer","minimum":0,"maximum":1000000},"unavailable":{"type":"integer","minimum":0,"maximum":1000000}
+      }
+    },
     "stats_access": {
       "type": "object",
       "additionalProperties": false,
@@ -126,8 +236,7 @@
       }
     },
     "stats_bucket": {
-      "type": "object",
-      "additionalProperties": false,
+      "type":"object","additionalProperties":false,
       "required": ["period_start", "acquired"],
       "properties": {
         "period_start": { "type": "string", "format": "date-time" },
@@ -143,7 +252,7 @@
         "at": { "type": "string", "format": "date-time" },
         "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
         "kind": { "type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[^\u0000]*$" },
-        "text": { "type": "string", "maxLength": 160, "pattern": "^[^\u0000]*$" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[^\u0000]*$" },
         "title": { "type": "string", "maxLength": 500, "pattern": "^[^\u0000]*$" }
       }
     },
@@ -561,8 +670,8 @@
       "required": ["kind", "origin", "detector"],
       "properties": {
         "kind": { "const": "browser_page" },
-        "origin": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9.-]{3,253}(:[0-9]{1,5})?$" },
-        "detector": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\u0000]+$" }
+        "origin": { "type": "string", "maxLength": 300, "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::[0-9]{1,5})?$" },
+        "detector": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$" }
       }
     }
   },
@@ -1115,7 +1224,8 @@
               "schema_versions": {
                 "oneOf": [
                   { "const": [4, 3] },
-                  { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": [1, 2, 3, 4] } }
+                  { "const": [5, 4] },
+                  { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": [1, 2, 3, 4, 5] } }
                 ]
               },
               "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
@@ -1135,7 +1245,7 @@
             "required": ["request_id", "schema", "generated_at", "counts", "items", "has_more", "unsupported_items_count"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "schema": { "enum": [1, 2, 3, 4] },
+              "schema": { "enum": [1, 2, 3, 4, 5] },
               "generated_at": { "type": "string", "format": "date-time" },
               "counts": { "$ref": "#/$defs/counts" },
               "items": { "type": "array", "maxItems": 100 },
@@ -1174,7 +1284,7 @@
             "required": ["request_id"],
             "properties": {
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
-              "schema_versions": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": [1, 2] } }
+              "schema_versions": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "enum": [1, 2, 3] } }
             }
           }
         }
@@ -1193,7 +1303,8 @@
               "counts": {
                 "oneOf": [
                   { "$ref": "#/$defs/counts" },
-                  { "$ref": "#/$defs/counts_v2" }
+                  { "$ref": "#/$defs/counts_v2" },
+                  { "$ref": "#/$defs/counts_v3" }
                 ]
               }
             }
@@ -1875,22 +1986,13 @@
               "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
               "outcome": { "enum": ["feature_disabled", "reconciled", "error"] },
               "detail": { "type": "string", "maxLength": 1000, "pattern": "^[^\u0000]*$" },
-              "claims": {
-                "type": "array",
-                "maxItems": 32,
-                "items": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["claim_id", "binding_id", "candidate_id", "phase"],
-                  "properties": {
-                    "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
-                    "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
-                    "candidate_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
-                    "phase": { "enum": ["claimed", "bound", "route_issued", "navigated", "settled", "abandoned"] },
-                    "tab_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
-                  }
-                }
-              }
+              "claims": { "type": "array", "maxItems": 32, "items": { "type": "object", "additionalProperties": false, "required": ["claim_id", "binding_id", "candidate_id", "phase"], "properties": {
+                "claim_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+                "binding_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+                "candidate_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,128}$" },
+                "phase": { "enum": ["claimed", "bound", "route_issued", "navigated", "settled", "abandoned"] },
+                "tab_id": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+              } } }
             },
             "allOf": [
               { "if": { "properties": { "outcome": { "const": "reconciled" } }, "required": ["outcome"] }, "then": { "not": { "required": ["detail"] } } },
@@ -1899,6 +2001,130 @@
           }
         }
       }
+    },
+    {
+      "if": { "properties": { "type": { "const": "surface_presence" } } },
+      "then": { "properties": { "payload": { "type": "object", "additionalProperties": false, "required": ["request_id","instance_id","surface","focused","at"], "properties": {
+        "request_id": { "type":"string", "pattern":"^[A-Za-z0-9_-]{8,64}$" },
+        "instance_id": { "type":"string", "pattern":"^[A-Za-z0-9_-]{8,64}$" },
+        "surface": { "enum":["popup","inbox"] }, "focused": { "type":"boolean" }, "at": { "type":"string","format":"date-time","maxLength":64 }
+      } } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "surface_presence_ack" } } },
+      "then": { "properties": { "payload": { "type":"object", "additionalProperties":false, "required":["request_id","accepted"], "properties": {
+        "request_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{8,64}$"},"accepted":{"type":"boolean"}
+      } } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "work_pulse_request" } } },
+      "then": { "properties": { "payload": { "type":"object","additionalProperties":false,"required":["request_id","schema_versions"],"properties":{
+        "request_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{8,64}$"},"schema_versions":{"const":[1]}
+      } } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "activity_page_request" } } },
+      "then": { "properties": { "payload": { "type":"object","additionalProperties":false,"required":["request_id"],"properties":{
+        "request_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{8,64}$"},"limit":{"type":"integer","minimum":1,"maximum":50},
+        "before_seq":{"type":"string","pattern":"^[0-9]+$"},"seen_through_seq":{"type":"string","pattern":"^[0-9]+$"}
+      } } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "activity_page_response" } } },
+      "then": { "properties": { "payload": {
+        "type":"object","additionalProperties":false,"required":["request_id","generated_at","entries","has_more","latest_seq"],
+        "properties":{
+          "request_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{8,64}$"},"generated_at":{"type":"string","format":"date-time","maxLength":64},
+          "entries":{"type":"array","maxItems":50,"items":{"$ref":"#/$defs/activity_entry"}},"has_more":{"type":"boolean"},
+          "cursor":{"type":"string","pattern":"^[0-9]+$"},"latest_seq":{"type":"integer","minimum":0,"maximum":9007199254740991},
+          "new_count_since":{"type":"integer","minimum":0,"maximum":9007199254740991},"gap":{"type":"boolean"}
+        },
+        "allOf":[
+          {"anyOf":[
+            {"required":["new_count_since"],"not":{"required":["gap"]}},
+            {"required":["gap"],"properties":{"gap":{"const":true}},"not":{"required":["new_count_since"]}}
+          ]}
+        ]
+      } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "page_bulk_submit_v2_request" } } },
+      "then": { "properties": { "payload": { "type":"object","additionalProperties":false,"required":["request_id","scan_id","cohort_id","source","cohort_total","chunk_index","final_chunk","canonical_keys"],"properties":{
+        "request_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{8,64}$"},"scan_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"cohort_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+        "source":{"$ref":"#/$defs/page_bulk_source"},"cohort_total":{"type":"integer","minimum":1,"maximum":200},"chunk_index":{"type":"integer","minimum":0,"maximum":3},"final_chunk":{"type":"boolean"},
+        "canonical_keys":{"type":"array","minItems":1,"maxItems":50,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":300}}
+      } } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "page_bulk_submit_v2_result" } } },
+      "then": { "properties": { "payload": {
+        "type":"object","additionalProperties":false,
+        "required":["request_id","scan_id","cohort_id","chunk_index","final_chunk","batch_id","membership","persisted_members","submitted","joined","already_owned","invalid"],
+        "properties":{
+          "request_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{8,64}$"},"scan_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"cohort_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"chunk_index":{"type":"integer","minimum":0,"maximum":3},"final_chunk":{"type":"boolean"},"batch_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"membership":{"enum":["open","complete","partial"]},"cohort_total":{"type":"integer","minimum":1,"maximum":200},
+          "persisted_members":{"type":"integer","minimum":0,"maximum":1000000},"submitted":{"type":"integer","minimum":0,"maximum":1000000},"joined":{"type":"integer","minimum":0,"maximum":1000000},"already_owned":{"type":"integer","minimum":0,"maximum":1000000},"invalid":{"type":"integer","minimum":0,"maximum":1000000}
+        },
+        "allOf":[
+          {"if":{"properties":{"final_chunk":{"const":true}},"required":["final_chunk"]},"then":{"required":["cohort_total"]}},
+          {"anyOf":[{"properties":{"submitted":{"minimum":1}}},{"properties":{"joined":{"minimum":1}}},{"properties":{"already_owned":{"minimum":1}}},{"properties":{"invalid":{"minimum":1}}}]}
+        ]
+      } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "work_pulse_response" } } },
+      "then": { "properties": { "payload": { "type":"object","additionalProperties":false,"required":["request_id","schema","generated_at"],"properties":{
+        "request_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{8,64}$"},"schema":{"const":1},"generated_at":{"type":"string","format":"date-time","maxLength":64},
+        "nonterminal_total":{"type":"integer","minimum":0,"maximum":1000000},"projection_complete":{"type":"boolean"},
+        "in_flight":{"type":"integer","minimum":0,"maximum":1000000},"scheduled":{"type":"integer","minimum":0,"maximum":1000000},"waiting_required":{"type":"integer","minimum":0,"maximum":1000000},"continuing":{"type":"integer","minimum":0,"maximum":1000000},"stalled":{"type":"integer","minimum":0,"maximum":1000000},
+        "last_forward_at":{"type":"string","format":"date-time","maxLength":64},"last_finished_at":{"type":"string","format":"date-time","maxLength":64},
+        "effect_capacity":{"type":"object","additionalProperties":false,"required":["busy","limit"],"properties":{
+          "busy":{"type":"integer","minimum":0,"maximum":1000000},"limit":{"type":"integer","minimum":0,"maximum":1000000},"waiting":{"type":"integer","minimum":0,"maximum":1000000}
+        }},
+        "human_surface_capacity":{"type":"object","additionalProperties":false,"required":["busy","limit","waiting_claims"],"properties":{
+          "busy":{"type":"integer","minimum":0,"maximum":1000000},"limit":{"type":"integer","minimum":0,"maximum":1000000},"waiting_claims":{"type":"integer","minimum":0,"maximum":1000000}
+        }},
+        "stall_episodes":{"type":"array","maxItems":16,"uniqueItems":true,"items":{"type":"object","additionalProperties":false,"required":["episode_key","cause_kind","public_label","since","count"],"properties":{
+          "episode_key":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+          "cause_kind":{"enum":["execution_lease_overdue","browser_session_unavailable","source_state_unclassified","delivery_poll_overdue","cohort_projection_failed"]},
+          "public_label":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[^\u0000-\u001f\u007f]+$"},
+          "since":{"type":"string","format":"date-time","maxLength":64},
+          "count":{"type":"integer","minimum":1,"maximum":1000000}
+        }}},
+        "stall_episodes_truncated":{"type":"boolean"},
+        "next_action":{"type":"object","additionalProperties":false,"required":["at","kind"],"properties":{
+          "at":{"type":"string","format":"date-time","maxLength":64},
+          "kind":{"enum":["retry","delivery_poll","source_gate"]},
+          "source":{"type":"string","maxLength":64,"pattern":"^[^\u0000-\u001f\u007f]+$"},
+          "count":{"type":"integer","minimum":0,"maximum":1000000}
+        }},
+        "gates":{"type":"array","maxItems":16,"uniqueItems":true,"items":{"type":"object","additionalProperties":false,"required":["kind","source","until","count"],"properties":{
+          "kind":{"const":"source_budget"},
+          "source":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[^\u0000-\u001f\u007f]+$"},
+          "until":{"type":"string","format":"date-time","maxLength":64},
+          "count":{"type":"integer","minimum":0,"maximum":1000000}
+        }}},
+        "gates_truncated":{"type":"boolean"},
+        "latest_batch":{"type":"object","additionalProperties":false,"required":["batch_id","started_at","membership"],"properties":{
+          "batch_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+          "label":{"type":"string","maxLength":256,"pattern":"^[^\u0000-\u001f\u007f]+$"},
+          "started_at":{"type":"string","format":"date-time","maxLength":64},
+          "settled_at":{"type":"string","format":"date-time","maxLength":64},
+          "membership":{"enum":["open","complete","partial"]},
+          "projection_complete":{"type":"boolean"},
+          "total":{"type":"integer","minimum":0,"maximum":1000000},
+          "settled":{"type":"integer","minimum":0,"maximum":1000000},
+          "nonterminal_total":{"type":"integer","minimum":0,"maximum":1000000},
+          "in_flight":{"type":"integer","minimum":0,"maximum":1000000},
+          "scheduled":{"type":"integer","minimum":0,"maximum":1000000},
+          "continuing":{"type":"integer","minimum":0,"maximum":1000000},
+          "waiting_required":{"type":"integer","minimum":0,"maximum":1000000},
+          "stalled":{"type":"integer","minimum":0,"maximum":1000000},
+          "unavailable":{"type":"integer","minimum":0,"maximum":1000000}
+        },
+        "allOf":[
+          {"if":{"properties":{"membership":{"const":"partial"}},"required":["membership"]},"then":{"not":{"required":["total"]}}}
+        ]
+      } } } } }
     }
   ]
 }

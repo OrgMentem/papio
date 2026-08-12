@@ -44,8 +44,10 @@ const MaxBrowserMessageBytes = 256 << 10
 const MaxBrowserInteger int64 = 1<<53 - 1
 
 var (
-	requestIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
-	adapterIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	requestIDRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
+	wireIDRE     = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	instanceIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
+	adapterIDRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 	// entitlementRefRE mirrors the consumer's closed vocabulary. The cleartext
 	// source form is preferred: hashing a public constant like "crossref_tdm"
 	// buys no secrecy and destroys legibility in an audit trail whose whole
@@ -157,6 +159,10 @@ func browserRejectNoncanonicalFields(fields map[string]json.RawMessage, keys ...
 
 func browserTextLen(value string) int {
 	return utf8.RuneCountInString(value)
+}
+
+func browserTextByteLen(value string) int {
+	return len([]byte(value))
 }
 
 func browserHasNUL(value string) bool {
@@ -878,12 +884,20 @@ const (
 	// unsolicited, once the grab sweeper finishes identifying the captured
 	// file (request_id empty, outcome one of the terminal identification
 	// outcomes). See PdfGrabResultPayload.
-	MsgPdfGrabRequest        = "pdf_grab_request"
-	MsgPdfGrabResult         = "pdf_grab_result"
-	MsgPdfGrabStatusRequest  = "pdf_grab_status_request"
-	MsgPdfGrabStatusResult   = "pdf_grab_status_result"
-	MsgPdfGrabAbandonRequest = "pdf_grab_abandon_request"
-	MsgPdfGrabAbandonResult  = "pdf_grab_abandon_result"
+	MsgPdfGrabRequest          = "pdf_grab_request"
+	MsgPdfGrabResult           = "pdf_grab_result"
+	MsgPdfGrabStatusRequest    = "pdf_grab_status_request"
+	MsgPdfGrabStatusResult     = "pdf_grab_status_result"
+	MsgPdfGrabAbandonRequest   = "pdf_grab_abandon_request"
+	MsgPdfGrabAbandonResult    = "pdf_grab_abandon_result"
+	MsgSurfacePresence         = "surface_presence"
+	MsgSurfacePresenceAck      = "surface_presence_ack"
+	MsgWorkPulseRequest        = "work_pulse_request"
+	MsgWorkPulseResponse       = "work_pulse_response"
+	MsgActivityPageRequest     = "activity_page_request"
+	MsgActivityPageResponse    = "activity_page_response"
+	MsgPageBulkSubmitV2Request = "page_bulk_submit_v2_request"
+	MsgPageBulkSubmitV2Result  = "page_bulk_submit_v2_result"
 )
 
 const InstitutionalMaterializationFeature = "institutional_materialization_v1"
@@ -1340,14 +1354,41 @@ type TriageSnapshotRequestPayload struct {
 // ActionsRequiresAuth field is populated only for the negotiated counts
 // response schema v2; snapshots and legacy counts responses omit it.
 type TriageCounts struct {
-	PendingTotal        int64  `json:"pending_total"`
-	WatchHits           int64  `json:"watch_hits"`
-	Actions             int64  `json:"actions"`
-	ActionsRequiresAuth *int64 `json:"actions_requires_auth,omitempty"`
-	Retractions         int64  `json:"retractions"`
-	JobsWorking         int64  `json:"jobs_working"`
-	JobsNeedsReview     int64  `json:"jobs_needs_review"`
-	FailureGroups7d     int64  `json:"failure_groups_7d"`
+	PendingTotal            int64                `json:"pending_total"`
+	TurnsRequired           *int64               `json:"turns_required,omitempty"`
+	TurnsWorking            *int64               `json:"turns_working,omitempty"`
+	FamilyBreakdownComplete *bool                `json:"family_breakdown_complete,omitempty"`
+	FamilyRuns              []TriageFamilyRun    `json:"family_runs,omitempty"`
+	RequiredTurnsComplete   *bool                `json:"required_turns_complete,omitempty"`
+	RequiredTurns           []TriageRequiredTurn `json:"required_turns,omitempty"`
+	WatchHits               int64                `json:"watch_hits"`
+	Actions                 int64                `json:"actions"`
+	ActionsRequiresAuth     *int64               `json:"actions_requires_auth,omitempty"`
+	Retractions             int64                `json:"retractions"`
+	JobsWorking             int64                `json:"jobs_working"`
+	JobsNeedsReview         int64                `json:"jobs_needs_review"`
+	FailureGroups7d         int64                `json:"failure_groups_7d"`
+}
+type TriageFamilyRun struct {
+	RunKey           string `json:"run_key"`
+	FirstRank        int64  `json:"first_rank"`
+	RouteClass       string `json:"route_class"`
+	ActionKind       string `json:"action_kind"`
+	NextActor        string `json:"next_actor"`
+	GuidanceVariant  string `json:"guidance_variant"`
+	OperationVariant string `json:"operation_variant"`
+	Count            int64  `json:"count"`
+}
+
+type TriageRequiredTurn struct {
+	ItemID        string `json:"item_id"`
+	ItemKind      string `json:"item_kind"`
+	ActionID      *int64 `json:"action_id,omitempty"`
+	JobID         string `json:"job_id,omitempty"`
+	GrabID        string `json:"grab_id,omitempty"`
+	RouteClass    string `json:"route_class"`
+	GateClaimID   string `json:"gate_claim_id,omitempty"`
+	DependentJobs int64  `json:"dependent_jobs"`
 }
 
 // TriageFact is bounded display text attached to an inbox item.
@@ -1412,7 +1453,10 @@ type TriageSnapshotItem struct {
 	RequiresAuth *bool  `json:"requires_auth,omitempty"`
 	BlockedBy    string `json:"blocked_by,omitempty"`
 	// RouteClass is triage-snapshot/3's closed routing classifier for a
-	// human_action item: required on schema 3, forbidden below. It
+	RunKey           string `json:"run_key,omitempty"`
+	NextActor        string `json:"next_actor,omitempty"`
+	GuidanceVariant  string `json:"guidance_variant,omitempty"`
+	OperationVariant string `json:"operation_variant,omitempty"`
 	// formalizes the existing action-kind vocabulary (plus document_delivery)
 	// into a fixed enum decoupled from action_kind's open one, so a v3
 	// extension can safely branch on it even after a future daemon ships an
@@ -1475,6 +1519,25 @@ func (d TriageDelivery) validate() error {
 // triageRouteClasses is triage-snapshot/3's closed route_class vocabulary —
 // see TriageSnapshotItem.RouteClass's doc comment for why it is closed
 // independently of action_kind.
+func TriageRouteClassesV5() []string {
+	return append(slices.Clone(triageRouteClasses), "pdf_identifier_needed")
+}
+
+var triageNextActors = []string{"papio", "researcher", "reference"}
+var triageGuidanceVariants = []string{
+	"manual_download", "manual_download_adapter_missing", "institution_sign_in",
+	"open_page", "verify_identity", "document_delivery", "downloads_access",
+	"terms_acceptance", "security_challenge", "pdf_identifier", "papio_continuing",
+}
+var triageOperationVariants = []string{
+	"none", "dismiss_only", "open_and_dismiss", "accept_reject",
+	"accept_reject_open", "delivery_reconcile", "provide_identifier_or_dismiss",
+}
+
+func TriageNextActors() []string        { return slices.Clone(triageNextActors) }
+func TriageGuidanceVariants() []string  { return slices.Clone(triageGuidanceVariants) }
+func TriageOperationVariants() []string { return slices.Clone(triageOperationVariants) }
+
 var triageRouteClasses = []string{
 	"openurl_handoff", "manual_download", "verify_identity", "openurl_available",
 	"human_auth_required", "terms_acceptance_required", "document_delivery",
@@ -1682,8 +1745,28 @@ func (entry *ActivityEntryPayload) UnmarshalJSON(data []byte) error {
 	if err := strictDecode(data, &decoded); err != nil {
 		return err
 	}
-	if _, present := fields["job_id"]; present && decoded.JobID == "" {
-		return fmt.Errorf("activity_response.entry.job_id must be non-empty")
+	if _, present := fields["job_id"]; present {
+		if decoded.JobID == "" || !requestIDRE.MatchString(decoded.JobID) {
+			return fmt.Errorf("activity_response.entry.job_id invalid")
+		}
+	}
+	if err := validateTriageTime("activity_response.entry.at", decoded.At); err != nil {
+		return err
+	}
+	if err := validateTriageText("activity_response.entry.kind", decoded.Kind, 100); err != nil || decoded.Kind == "" {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("activity_response.entry.kind required")
+	}
+	if err := validateTriageText("activity_response.entry.text", decoded.Text, 160); err != nil || decoded.Text == "" {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("activity_response.entry.text required")
+	}
+	if err := validateTriageText("activity_response.entry.title", decoded.Title, 500); err != nil {
+		return err
 	}
 	*entry = ActivityEntryPayload(decoded)
 	return nil
@@ -1791,6 +1874,145 @@ type PageBulkSubmitResultPayload struct {
 	AlreadyOwned int64  `json:"already_owned"`
 	Invalid      int64  `json:"invalid"`
 	BatchID      string `json:"batch_id"`
+}
+
+// SurfacePresencePayload is a privacy-minimal focused-surface lease.
+type SurfacePresencePayload struct {
+	RequestID  string `json:"request_id"`
+	InstanceID string `json:"instance_id"`
+	Surface    string `json:"surface"`
+	Focused    bool   `json:"focused"`
+	At         string `json:"at"`
+}
+
+type SurfacePresenceAckPayload struct {
+	RequestID string `json:"request_id"`
+	Accepted  bool   `json:"accepted"`
+}
+
+type WorkPulseRequestPayload struct {
+	RequestID      string  `json:"request_id"`
+	SchemaVersions []int64 `json:"schema_versions"`
+}
+
+type WorkPulseCapacity struct {
+	Busy    int64 `json:"busy"`
+	Limit   int64 `json:"limit"`
+	Waiting int64 `json:"waiting,omitempty"`
+}
+
+type WorkPulseHumanSurfaceCapacity struct {
+	Busy          int64 `json:"busy"`
+	Limit         int64 `json:"limit"`
+	WaitingClaims int64 `json:"waiting_claims"`
+}
+
+type WorkPulseStallEpisode struct {
+	EpisodeKey  string `json:"episode_key"`
+	CauseKind   string `json:"cause_kind"`
+	PublicLabel string `json:"public_label"`
+	Since       string `json:"since"`
+	Count       int64  `json:"count"`
+}
+
+type WorkPulseNextAction struct {
+	At     string `json:"at"`
+	Kind   string `json:"kind"`
+	Source string `json:"source,omitempty"`
+	Count  *int64 `json:"count,omitempty"`
+}
+
+type WorkPulseGate struct {
+	Kind   string `json:"kind"`
+	Source string `json:"source"`
+	Until  string `json:"until"`
+	Count  int64  `json:"count"`
+}
+
+type WorkPulseLatestBatch struct {
+	BatchID            string `json:"batch_id"`
+	Label              string `json:"label,omitempty"`
+	StartedAt          string `json:"started_at"`
+	SettledAt          string `json:"settled_at,omitempty"`
+	Membership         string `json:"membership"`
+	ProjectionComplete *bool  `json:"projection_complete,omitempty"`
+	Total              *int64 `json:"total,omitempty"`
+	Settled            *int64 `json:"settled,omitempty"`
+	NonterminalTotal   *int64 `json:"nonterminal_total,omitempty"`
+	InFlight           *int64 `json:"in_flight,omitempty"`
+	Scheduled          *int64 `json:"scheduled,omitempty"`
+	Continuing         *int64 `json:"continuing,omitempty"`
+	WaitingRequired    *int64 `json:"waiting_required,omitempty"`
+	Stalled            *int64 `json:"stalled,omitempty"`
+	Unavailable        *int64 `json:"unavailable,omitempty"`
+}
+
+type WorkPulseResponsePayload struct {
+	RequestID              string                         `json:"request_id"`
+	Schema                 int64                          `json:"schema"`
+	GeneratedAt            string                         `json:"generated_at"`
+	NonterminalTotal       *int64                         `json:"nonterminal_total,omitempty"`
+	ProjectionComplete     *bool                          `json:"projection_complete,omitempty"`
+	InFlight               *int64                         `json:"in_flight,omitempty"`
+	Scheduled              *int64                         `json:"scheduled,omitempty"`
+	WaitingRequired        *int64                         `json:"waiting_required,omitempty"`
+	Continuing             *int64                         `json:"continuing,omitempty"`
+	Stalled                *int64                         `json:"stalled,omitempty"`
+	EffectCapacity         *WorkPulseCapacity             `json:"effect_capacity,omitempty"`
+	HumanSurfaceCapacity   *WorkPulseHumanSurfaceCapacity `json:"human_surface_capacity,omitempty"`
+	LastForwardAt          string                         `json:"last_forward_at,omitempty"`
+	StallEpisodes          []WorkPulseStallEpisode        `json:"stall_episodes,omitempty"`
+	StallEpisodesTruncated *bool                          `json:"stall_episodes_truncated,omitempty"`
+	LastFinishedAt         string                         `json:"last_finished_at,omitempty"`
+	NextAction             *WorkPulseNextAction           `json:"next_action,omitempty"`
+	Gates                  []WorkPulseGate                `json:"gates,omitempty"`
+	GatesTruncated         *bool                          `json:"gates_truncated,omitempty"`
+	LatestBatch            *WorkPulseLatestBatch          `json:"latest_batch,omitempty"`
+}
+
+type ActivityPageRequestPayload struct {
+	RequestID      string `json:"request_id"`
+	Limit          int64  `json:"limit,omitempty"`
+	BeforeSeq      string `json:"before_seq,omitempty"`
+	SeenThroughSeq string `json:"seen_through_seq,omitempty"`
+}
+
+type ActivityPageResponsePayload struct {
+	RequestID     string                 `json:"request_id"`
+	GeneratedAt   string                 `json:"generated_at"`
+	Entries       []ActivityEntryPayload `json:"entries"`
+	HasMore       bool                   `json:"has_more"`
+	Cursor        string                 `json:"cursor,omitempty"`
+	LatestSeq     int64                  `json:"latest_seq"`
+	NewCountSince *int64                 `json:"new_count_since,omitempty"`
+	Gap           *bool                  `json:"gap,omitempty"`
+}
+
+type PageBulkSubmitV2RequestPayload struct {
+	RequestID     string               `json:"request_id"`
+	ScanID        string               `json:"scan_id"`
+	CohortID      string               `json:"cohort_id"`
+	Source        PageBulkSubmitSource `json:"source"`
+	CohortTotal   int64                `json:"cohort_total"`
+	ChunkIndex    int64                `json:"chunk_index"`
+	FinalChunk    bool                 `json:"final_chunk"`
+	CanonicalKeys []string             `json:"canonical_keys"`
+}
+
+type PageBulkSubmitV2ResultPayload struct {
+	RequestID        string `json:"request_id"`
+	ScanID           string `json:"scan_id"`
+	CohortID         string `json:"cohort_id"`
+	ChunkIndex       int64  `json:"chunk_index"`
+	FinalChunk       bool   `json:"final_chunk"`
+	BatchID          string `json:"batch_id"`
+	Membership       string `json:"membership"`
+	CohortTotal      *int64 `json:"cohort_total,omitempty"`
+	PersistedMembers int64  `json:"persisted_members"`
+	Submitted        int64  `json:"submitted"`
+	Joined           int64  `json:"joined"`
+	AlreadyOwned     int64  `json:"already_owned"`
+	Invalid          int64  `json:"invalid"`
 }
 
 // BrowserMessage is one decoded native-messaging envelope. Payload holds the
@@ -1903,6 +2125,70 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			} else if err = strictDecode(raw, &value); err == nil && browserTextLen(value) > 50 {
 				err = fmt.Errorf("hello.adapter_versions.%s exceeds 50 chars", key)
 			}
+		}
+		msg.Payload = p
+	case MsgSurfacePresence:
+		p := &SurfacePresencePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "surface_presence",
+			[]string{"request_id", "instance_id", "surface", "focused", "at"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgSurfacePresenceAck:
+		p := &SurfacePresenceAckPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "surface_presence_ack",
+			[]string{"request_id", "accepted"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgWorkPulseRequest:
+		p := &WorkPulseRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "work_pulse_request",
+			[]string{"request_id", "schema_versions"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgWorkPulseResponse:
+		p := &WorkPulseResponsePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "work_pulse_response",
+			[]string{"request_id", "schema", "generated_at"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgActivityPageRequest:
+		p := &ActivityPageRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "activity_page_request",
+			[]string{"request_id"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgActivityPageResponse:
+		p := &ActivityPageResponsePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "activity_page_response",
+			[]string{"request_id", "generated_at", "entries", "has_more", "latest_seq"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPageBulkSubmitV2Request:
+		p := &PageBulkSubmitV2RequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "page_bulk_submit_v2_request",
+			[]string{"request_id", "scan_id", "cohort_id", "source", "cohort_total", "chunk_index", "final_chunk", "canonical_keys"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPageBulkSubmitV2Result:
+		p := &PageBulkSubmitV2ResultPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "page_bulk_submit_v2_result",
+			[]string{"request_id", "scan_id", "cohort_id", "chunk_index", "final_chunk", "batch_id", "membership", "persisted_members", "submitted", "joined", "already_owned", "invalid"}, p)
+		if err == nil {
+			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgHelloAck:
@@ -2628,6 +2914,438 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	return msg, nil
 }
 
+func validateWireID(what, value string) error {
+	if !wireIDRE.MatchString(value) {
+		return fmt.Errorf("%s must be 1..64 ASCII identifier", what)
+	}
+	return nil
+}
+func validateCount(what string, value int64, min int64) error {
+	if value < min || value > 1_000_000 {
+		return fmt.Errorf("%s must be in range %d..1000000", what, min)
+	}
+	return nil
+}
+func validatePulseTime(what, value string, required bool) error {
+	if value == "" && !required {
+		return nil
+	}
+	if value == "" || utf8.RuneCountInString(value) > 64 || !rfc3339RE.MatchString(value) {
+		return fmt.Errorf("%s must be RFC3339 and at most 64 bytes", what)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
+		return fmt.Errorf("%s must be RFC3339", what)
+	}
+	return nil
+}
+func (p *SurfacePresencePayload) validate() error {
+	if err := validateCorrelationID("surface_presence.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if !instanceIDRE.MatchString(p.InstanceID) {
+		return fmt.Errorf("surface_presence.instance_id invalid")
+	}
+	if err := enumRequired("surface_presence.surface", p.Surface, "popup", "inbox"); err != nil {
+		return err
+	}
+	return validatePulseTime("surface_presence.at", p.At, true)
+}
+func (p *SurfacePresenceAckPayload) validate() error {
+	return validateCorrelationID("surface_presence_ack.request_id", p.RequestID)
+}
+func (p *WorkPulseRequestPayload) validate() error {
+	if err := validateCorrelationID("work_pulse_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if len(p.SchemaVersions) != 1 || p.SchemaVersions[0] != 1 {
+		return fmt.Errorf("work_pulse_request.schema_versions must be [1]")
+	}
+	return nil
+}
+func (p *WorkPulseCapacity) validate(what string) error {
+	if err := validateCount(what+".busy", p.Busy, 0); err != nil {
+		return err
+	}
+	if err := validateCount(what+".limit", p.Limit, 0); err != nil {
+		return err
+	}
+	if err := validateCount(what+".waiting", p.Waiting, 0); err != nil {
+		return err
+	}
+	if p.Busy > p.Limit {
+		return fmt.Errorf("%s.busy cannot exceed limit", what)
+	}
+	return nil
+}
+func (p *WorkPulseHumanSurfaceCapacity) validate(what string) error {
+	if err := validateCount(what+".busy", p.Busy, 0); err != nil {
+		return err
+	}
+	if err := validateCount(what+".limit", p.Limit, 0); err != nil {
+		return err
+	}
+	if err := validateCount(what+".waiting_claims", p.WaitingClaims, 0); err != nil {
+		return err
+	}
+	if p.Busy > p.Limit {
+		return fmt.Errorf("%s.busy cannot exceed limit", what)
+	}
+	return nil
+}
+func (p *WorkPulseResponsePayload) validate() error {
+	if err := validateCorrelationID("work_pulse_response.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if p.Schema != 1 {
+		return fmt.Errorf("work_pulse_response.schema must be 1")
+	}
+	if err := validatePulseTime("work_pulse_response.generated_at", p.GeneratedAt, true); err != nil {
+		return err
+	}
+	buckets := []*int64{p.InFlight, p.Continuing, p.Scheduled, p.WaitingRequired, p.Stalled}
+	for i, value := range []*int64{p.NonterminalTotal, p.InFlight, p.Continuing, p.Scheduled, p.WaitingRequired, p.Stalled} {
+		if value != nil {
+			if err := validateCount(fmt.Sprintf("work_pulse_response.bucket_%d", i), *value, 0); err != nil {
+				return err
+			}
+		}
+	}
+	if p.ProjectionComplete != nil && *p.ProjectionComplete {
+		if p.NonterminalTotal == nil {
+			return fmt.Errorf("work_pulse_response.nonterminal_total required for complete projection")
+		}
+		sum := int64(0)
+		for _, value := range buckets {
+			if value == nil {
+				return fmt.Errorf("work_pulse_response buckets required for complete projection")
+			}
+			sum += *value
+		}
+		if sum != *p.NonterminalTotal {
+			return fmt.Errorf("work_pulse_response bucket sum must equal nonterminal_total")
+		}
+	}
+	if p.NonterminalTotal != nil {
+		for _, value := range buckets {
+			if value != nil && *value > *p.NonterminalTotal {
+				return fmt.Errorf("work_pulse_response bucket exceeds nonterminal_total")
+			}
+		}
+	}
+	if p.EffectCapacity != nil {
+		if err := p.EffectCapacity.validate("work_pulse_response.effect_capacity"); err != nil {
+			return err
+		}
+	}
+	if p.HumanSurfaceCapacity != nil {
+		if err := p.HumanSurfaceCapacity.validate("work_pulse_response.human_surface_capacity"); err != nil {
+			return err
+		}
+	}
+	if err := validatePulseTime("work_pulse_response.last_forward_at", p.LastForwardAt, false); err != nil {
+		return err
+	}
+	if err := validatePulseTime("work_pulse_response.last_finished_at", p.LastFinishedAt, false); err != nil {
+		return err
+	}
+	if len(p.StallEpisodes) > 16 {
+		return fmt.Errorf("work_pulse_response.stall_episodes capped at 16")
+	}
+	seenEpisodes := map[string]bool{}
+	var prior WorkPulseStallEpisode
+	for i, episode := range p.StallEpisodes {
+		if err := validateWireID("work_pulse_response.stall_episodes.episode_key", episode.EpisodeKey); err != nil || seenEpisodes[episode.EpisodeKey] {
+			return fmt.Errorf("invalid or duplicate stall episode key")
+		}
+		seenEpisodes[episode.EpisodeKey] = true
+		if err := enumRequired("work_pulse_response.stall_episodes.cause_kind", episode.CauseKind, "execution_lease_overdue", "browser_session_unavailable", "source_state_unclassified", "delivery_poll_overdue", "cohort_projection_failed"); err != nil {
+			return err
+		}
+		if browserTextByteLen(episode.PublicLabel) < 1 || browserTextByteLen(episode.PublicLabel) > 64 || strings.IndexFunc(episode.PublicLabel, unicode.IsControl) >= 0 {
+			return fmt.Errorf("stall episode public_label invalid")
+		}
+		if err := validatePulseTime("work_pulse_response.stall_episodes.since", episode.Since, true); err != nil {
+			return err
+		}
+		if err := validateCount("work_pulse_response.stall_episodes.count", episode.Count, 1); err != nil {
+			return err
+		}
+		if i > 0 {
+			prev, _ := time.Parse(time.RFC3339Nano, prior.Since)
+			curr, _ := time.Parse(time.RFC3339Nano, episode.Since)
+			if curr.Before(prev) || (curr.Equal(prev) && episode.EpisodeKey < prior.EpisodeKey) {
+				return fmt.Errorf("stall episodes must be ordered")
+			}
+		}
+		prior = episode
+	}
+	if p.StallEpisodesTruncated != nil && *p.StallEpisodesTruncated == false && p.Stalled != nil {
+		sum := int64(0)
+		for _, episode := range p.StallEpisodes {
+			sum += episode.Count
+		}
+		if sum != *p.Stalled {
+			return fmt.Errorf("stall episode counts must equal stalled")
+		}
+	}
+	if p.StallEpisodesTruncated != nil && *p.StallEpisodesTruncated && p.Stalled != nil {
+		sum := int64(0)
+		for _, episode := range p.StallEpisodes {
+			sum += episode.Count
+		}
+		if sum > *p.Stalled {
+			return fmt.Errorf("stall episode counts exceed stalled")
+		}
+	}
+	if p.Stalled != nil && *p.Stalled > 0 && len(p.StallEpisodes) == 0 {
+		return fmt.Errorf("stalled requires a stall episode")
+	}
+	if p.NextAction != nil {
+		if err := validatePulseTime("work_pulse_response.next_action.at", p.NextAction.At, true); err != nil {
+			return err
+		}
+		if err := enumRequired("work_pulse_response.next_action.kind", p.NextAction.Kind, "retry", "delivery_poll", "source_gate"); err != nil {
+			return err
+		}
+		if p.NextAction.Source != "" && (browserTextByteLen(p.NextAction.Source) > 64 || strings.IndexFunc(p.NextAction.Source, unicode.IsControl) >= 0) {
+			return fmt.Errorf("next_action.source invalid")
+		}
+		if p.NextAction.Count != nil {
+			if err := validateCount("work_pulse_response.next_action.count", *p.NextAction.Count, 0); err != nil {
+				return err
+			}
+		}
+	}
+	if len(p.Gates) > 16 {
+		return fmt.Errorf("work_pulse_response.gates capped at 16")
+	}
+	seenGates := map[string]bool{}
+	for _, gate := range p.Gates {
+		if err := enumRequired("work_pulse_response.gates.kind", gate.Kind, "source_budget"); err != nil {
+			return err
+		}
+		if browserTextByteLen(gate.Source) < 1 || browserTextByteLen(gate.Source) > 64 || strings.IndexFunc(gate.Source, unicode.IsControl) >= 0 {
+			return fmt.Errorf("gate source invalid")
+		}
+		key := gate.Kind + "\x00" + gate.Source
+		if seenGates[key] {
+			return fmt.Errorf("duplicate gate")
+		}
+		seenGates[key] = true
+		if err := validatePulseTime("work_pulse_response.gates.until", gate.Until, true); err != nil {
+			return err
+		}
+		if err := validateCount("work_pulse_response.gates.count", gate.Count, 0); err != nil {
+			return err
+		}
+	}
+	if encoded, err := json.Marshal(p); err != nil {
+		return err
+	} else if len(encoded) > 32*1024 {
+		return fmt.Errorf("work_pulse_response exceeds 32 KiB")
+	}
+	if p.LatestBatch != nil {
+		if err := p.LatestBatch.validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (b *WorkPulseLatestBatch) validate() error {
+	if err := validateWireID("latest_batch.batch_id", b.BatchID); err != nil {
+		return err
+	}
+	if browserTextByteLen(b.Label) > 256 || strings.IndexFunc(b.Label, unicode.IsControl) >= 0 {
+		return fmt.Errorf("latest_batch.label invalid")
+	}
+	if err := validatePulseTime("latest_batch.started_at", b.StartedAt, true); err != nil {
+		return err
+	}
+	if err := validatePulseTime("latest_batch.settled_at", b.SettledAt, false); err != nil {
+		return err
+	}
+	if err := enumRequired("latest_batch.membership", b.Membership, "open", "complete", "partial"); err != nil {
+		return err
+	}
+	for name, value := range map[string]*int64{"total": b.Total, "settled": b.Settled, "nonterminal_total": b.NonterminalTotal, "in_flight": b.InFlight, "scheduled": b.Scheduled, "continuing": b.Continuing, "waiting_required": b.WaitingRequired, "stalled": b.Stalled, "unavailable": b.Unavailable} {
+		if value != nil {
+			if err := validateCount("latest_batch."+name, *value, 0); err != nil {
+				return err
+			}
+		}
+	}
+	if b.Unavailable != nil && b.Settled != nil && *b.Unavailable > *b.Settled {
+		return fmt.Errorf("latest_batch.unavailable exceeds settled")
+	}
+	if b.Total != nil {
+		for _, value := range []*int64{b.Settled, b.NonterminalTotal, b.InFlight, b.Continuing, b.Scheduled, b.WaitingRequired, b.Stalled} {
+			if value != nil && *value > *b.Total {
+				return fmt.Errorf("latest batch bucket exceeds total")
+			}
+		}
+	}
+	if b.Membership == "partial" && b.Total != nil {
+		return fmt.Errorf("partial latest batch must omit total")
+	}
+	if b.Membership == "complete" && b.ProjectionComplete != nil && *b.ProjectionComplete {
+		if b.Total == nil || b.Settled == nil || b.NonterminalTotal == nil {
+			return fmt.Errorf("complete latest batch requires totals")
+		}
+		if *b.Settled+*b.NonterminalTotal != *b.Total {
+			return fmt.Errorf("latest batch total equation invalid")
+		}
+		sum := int64(0)
+		for _, value := range []*int64{b.InFlight, b.Continuing, b.Scheduled, b.WaitingRequired, b.Stalled} {
+			if value == nil {
+				return fmt.Errorf("latest batch buckets required")
+			}
+			sum += *value
+		}
+		if sum != *b.NonterminalTotal {
+			return fmt.Errorf("latest batch bucket equation invalid")
+		}
+	}
+	return nil
+}
+func (p *ActivityPageRequestPayload) validate() error {
+	if err := validateCorrelationID("activity_page_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if p.Limit != 0 && (p.Limit < 1 || p.Limit > 50) {
+		return fmt.Errorf("activity_page_request.limit must be 1..50")
+	}
+	if p.BeforeSeq != "" && !regexp.MustCompile(`^[0-9]+$`).MatchString(p.BeforeSeq) {
+		return fmt.Errorf("activity_page_request.before_seq invalid")
+	}
+	if p.SeenThroughSeq != "" && !regexp.MustCompile(`^[0-9]+$`).MatchString(p.SeenThroughSeq) {
+		return fmt.Errorf("activity_page_request.seen_through_seq invalid")
+	}
+	return nil
+}
+func (p *ActivityPageResponsePayload) validate() error {
+	if err := validateCorrelationID("activity_page_response.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validatePulseTime("activity_page_response.generated_at", p.GeneratedAt, true); err != nil {
+		return err
+	}
+	if len(p.Entries) > 50 {
+		return fmt.Errorf("activity_page_response.entries capped at 50")
+	}
+	if p.LatestSeq < 0 || p.LatestSeq > MaxBrowserInteger {
+		return fmt.Errorf("activity_page_response.latest_seq invalid")
+	}
+	if p.HasMore && p.Cursor == "" {
+		return fmt.Errorf("activity_page_response.cursor required when has_more")
+	}
+	if !p.HasMore && p.Cursor != "" {
+		return fmt.Errorf("activity_page_response.cursor forbidden when not has_more")
+	}
+	if p.Cursor != "" && !regexp.MustCompile(`^[0-9]+$`).MatchString(p.Cursor) {
+		return fmt.Errorf("activity_page_response.cursor invalid")
+	}
+	if p.NewCountSince == nil && (p.Gap == nil || !*p.Gap) {
+		return fmt.Errorf("activity_page_response requires new_count_since or gap")
+	}
+	if p.NewCountSince != nil && (*p.NewCountSince < 0 || *p.NewCountSince > MaxBrowserInteger) {
+		return fmt.Errorf("activity_page_response.new_count_since invalid")
+	}
+	if p.Gap != nil && *p.Gap && p.NewCountSince != nil {
+		return fmt.Errorf("activity_page_response.gap cannot include new_count_since")
+	}
+	for _, e := range p.Entries {
+		if e.Seq < 0 || e.Seq > MaxBrowserInteger || e.At == "" || e.Kind == "" || e.Text == "" {
+			return fmt.Errorf("activity_page_response entry invalid")
+		}
+	}
+	return nil
+}
+func validateCanonicalKeys(what string, keys []string, max int) error {
+	if len(keys) < 1 || len(keys) > max {
+		return fmt.Errorf("%s must contain 1..%d keys", what, max)
+	}
+	seen := map[string]bool{}
+	for _, key := range keys {
+		if browserHasNUL(key) || browserTextLen(key) == 0 || browserTextLen(key) > 300 || seen[key] {
+			return fmt.Errorf("%s contains invalid or duplicate key", what)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+func (p *PageBulkSubmitV2RequestPayload) validate() error {
+	if err := validateCorrelationID("page_bulk_submit_v2_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateWireID("page_bulk_submit_v2_request.scan_id", p.ScanID); err != nil {
+		return err
+	}
+	if err := validateWireID("page_bulk_submit_v2_request.cohort_id", p.CohortID); err != nil {
+		return err
+	}
+	if p.CohortTotal < 1 || p.CohortTotal > 200 || p.ChunkIndex < 0 || p.ChunkIndex > 3 {
+		return fmt.Errorf("page_bulk_submit_v2_request cohort bounds invalid")
+	}
+	expectedChunks := (p.CohortTotal + 49) / 50
+	if p.ChunkIndex >= expectedChunks || p.FinalChunk != (p.ChunkIndex == expectedChunks-1) {
+		return fmt.Errorf("page_bulk_submit_v2_request chunk sequencing invalid")
+	}
+	if err := validateCanonicalKeys("page_bulk_submit_v2_request.canonical_keys", p.CanonicalKeys, 50); err != nil {
+		return err
+	}
+	if p.ChunkIndex < expectedChunks-1 && len(p.CanonicalKeys) != 50 {
+		return fmt.Errorf("non-final chunk must contain 50 keys")
+	}
+	if p.ChunkIndex == expectedChunks-1 && len(p.CanonicalKeys) != int(p.CohortTotal)-int(p.ChunkIndex)*50 {
+		return fmt.Errorf("final chunk key count invalid")
+	}
+	return p.Source.validate()
+}
+func (p *PageBulkSubmitV2ResultPayload) validate() error {
+	if err := validateCorrelationID("page_bulk_submit_v2_result.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateWireID("page_bulk_submit_v2_result.scan_id", p.ScanID); err != nil {
+		return err
+	}
+	if err := validateWireID("page_bulk_submit_v2_result.cohort_id", p.CohortID); err != nil {
+		return err
+	}
+	if err := validateWireID("page_bulk_submit_v2_result.batch_id", p.BatchID); err != nil {
+		return err
+	}
+	if p.ChunkIndex < 0 || p.ChunkIndex > 3 {
+		return fmt.Errorf("page_bulk_submit_v2_result.chunk_index invalid")
+	}
+	if err := enumRequired("page_bulk_submit_v2_result.membership", p.Membership, "open", "complete", "partial"); err != nil {
+		return err
+	}
+	for name, value := range map[string]int64{"persisted_members": p.PersistedMembers, "submitted": p.Submitted, "joined": p.Joined, "already_owned": p.AlreadyOwned, "invalid": p.Invalid} {
+		if err := validateCount("page_bulk_submit_v2_result."+name, value, 0); err != nil {
+			return err
+		}
+	}
+	if p.CohortTotal != nil && (*p.CohortTotal < 1 || *p.CohortTotal > 200) {
+		return fmt.Errorf("result cohort_total invalid")
+	}
+	chunkSum := p.Submitted + p.Joined + p.AlreadyOwned + p.Invalid
+	if p.FinalChunk {
+		if p.CohortTotal == nil {
+			return fmt.Errorf("final result requires cohort_total")
+		}
+		expected := *p.CohortTotal - int64(p.ChunkIndex)*50
+		if expected < 1 || expected > 50 || chunkSum != expected {
+			return fmt.Errorf("final result counts must equal final chunk size")
+		}
+	} else if chunkSum != 50 {
+		return fmt.Errorf("non-final result counts must equal 50")
+	}
+	if p.CohortTotal != nil && *p.CohortTotal-int64(p.ChunkIndex)*50 < 1 {
+		return fmt.Errorf("result cohort_total and chunk_index invalid")
+	}
+	return nil
+}
+
 func (p *PageAcquirePayload) validate() error {
 	if browserTextLen(p.URL) == 0 || browserTextLen(p.URL) > 4000 {
 		return fmt.Errorf("page_acquire.url required (max 4000)")
@@ -3237,14 +3955,12 @@ func institutionalRequestID(what, value string) error {
 func institutionalOutcome(what, value string, allowed ...string) error {
 	return enumRequired(what, value, allowed...)
 }
-
 func institutionalOrdinal(what string, value int64) error {
 	if value < 0 || value > MaxBrowserInteger {
 		return fmt.Errorf("%s must be in range 0..%d", what, MaxBrowserInteger)
 	}
 	return nil
 }
-
 func institutionalTabID(what string, value int64) error {
 	if value < 0 || value > MaxBrowserInteger {
 		return fmt.Errorf("%s must be in range 0..%d", what, MaxBrowserInteger)
@@ -3603,8 +4319,8 @@ func (p *TriageCountsRequestPayload) validate() error {
 	if len(p.SchemaVersions) == 0 {
 		return nil
 	}
-	if len(p.SchemaVersions) != 1 || (p.SchemaVersions[0] != 1 && p.SchemaVersions[0] != 2) {
-		return fmt.Errorf("triage_counts_request.schema_versions must be [1] or [2]")
+	if len(p.SchemaVersions) != 1 || (p.SchemaVersions[0] != 1 && p.SchemaVersions[0] != 2 && p.SchemaVersions[0] != 3) {
+		return fmt.Errorf("triage_counts_request.schema_versions must be [1], [2], or [3]")
 	}
 	return nil
 }
@@ -3614,10 +4330,10 @@ func (p *TriageSnapshotRequestPayload) validate() error {
 		return err
 	}
 	validSingle := len(p.SchemaVersions) == 1 &&
-		(p.SchemaVersions[0] == 1 || p.SchemaVersions[0] == 2 || p.SchemaVersions[0] == 3 || p.SchemaVersions[0] == 4)
-	validFallback := len(p.SchemaVersions) == 2 && p.SchemaVersions[0] == 4 && p.SchemaVersions[1] == 3
+		(p.SchemaVersions[0] == 1 || p.SchemaVersions[0] == 2 || p.SchemaVersions[0] == 3 || p.SchemaVersions[0] == 4 || p.SchemaVersions[0] == 5)
+	validFallback := len(p.SchemaVersions) == 2 && ((p.SchemaVersions[0] == 4 && p.SchemaVersions[1] == 3) || (p.SchemaVersions[0] == 5 && p.SchemaVersions[1] == 4))
 	if !validSingle && !validFallback {
-		return fmt.Errorf("triage_snapshot_request.schema_versions must be [1], [2], [3], [4], or [4,3]")
+		return fmt.Errorf("triage_snapshot_request.schema_versions invalid")
 	}
 	if p.Limit != 0 && (p.Limit < 1 || p.Limit > 100) {
 		return fmt.Errorf("triage_snapshot_request.limit must be between 1 and 100")
@@ -3654,6 +4370,90 @@ func (counts TriageCounts) validate(additionalPending ...int) error {
 	} else if counts.PendingTotal != expected {
 		return fmt.Errorf("triage pending_total must equal visible items plus pdf grabs")
 	}
+	if err := counts.validateV3(); err != nil {
+		return err
+	}
+	return nil
+}
+func (counts TriageCounts) validateV3() error {
+	for name, value := range map[string]*int64{"turns_required": counts.TurnsRequired, "turns_working": counts.TurnsWorking} {
+		if value != nil && (*value < 0 || *value > 1_000_000) {
+			return fmt.Errorf("counts.%s out of range", name)
+		}
+	}
+	if len(counts.FamilyRuns) > 128 {
+		return fmt.Errorf("counts.family_runs capped at 128")
+	}
+	seenRuns := map[string]bool{}
+	prevRank := int64(-1)
+	prevKey := ""
+	familyTotal := int64(0)
+	for _, run := range counts.FamilyRuns {
+		if err := validateWireID("counts.family_runs.run_key", run.RunKey); err != nil || seenRuns[run.RunKey] {
+			return fmt.Errorf("invalid or duplicate family run key")
+		}
+		if run.FirstRank < 0 || run.FirstRank > MaxBrowserInteger || run.Count < 1 || run.Count > 1_000_000 {
+			return fmt.Errorf("invalid family run bounds")
+		}
+		if run.FirstRank < prevRank || (run.FirstRank == prevRank && run.RunKey < prevKey) {
+			return fmt.Errorf("family runs must be ordered")
+		}
+		if !containsString(TriageRouteClassesV5(), run.RouteClass) || !containsString(triageNextActors, run.NextActor) || !containsString(triageGuidanceVariants, run.GuidanceVariant) || !containsString(triageOperationVariants, run.OperationVariant) {
+			return fmt.Errorf("invalid family run vocabulary")
+		}
+		seenRuns[run.RunKey] = true
+		prevRank, prevKey = run.FirstRank, run.RunKey
+		familyTotal += run.Count
+	}
+	if counts.FamilyBreakdownComplete != nil && *counts.FamilyBreakdownComplete {
+		if counts.TurnsRequired == nil || counts.TurnsWorking == nil {
+			return fmt.Errorf("complete family breakdown requires turns counts")
+		}
+		if counts.FamilyRuns == nil {
+			return fmt.Errorf("complete family breakdown requires family_runs")
+		}
+		if familyTotal != *counts.TurnsRequired+*counts.TurnsWorking {
+			return fmt.Errorf("family run totals mismatch")
+		}
+	}
+	if len(counts.RequiredTurns) > 1024 {
+		return fmt.Errorf("counts.required_turns capped at 1024")
+	}
+	seenTurns := map[string]bool{}
+	for _, turn := range counts.RequiredTurns {
+		if turn.ItemID == "" || seenTurns[turn.ItemID] {
+			return fmt.Errorf("invalid or duplicate required turn item_id")
+		}
+		if err := validateTriageText("counts.required_turns.item_id", turn.ItemID, 1024); err != nil {
+			return err
+		}
+		seenTurns[turn.ItemID] = true
+		if !containsString(TriageRouteClassesV5(), turn.RouteClass) || turn.DependentJobs < 0 || turn.DependentJobs > 1_000_000 {
+			return fmt.Errorf("invalid required turn")
+		}
+		switch turn.ItemKind {
+		case "human_action":
+			if turn.ActionID == nil || *turn.ActionID < 1 || turn.JobID == "" || turn.GrabID != "" {
+				return fmt.Errorf("human_action required turn fields invalid")
+			}
+			if !requestIDRE.MatchString(turn.JobID) {
+				return fmt.Errorf("human_action required turn job_id invalid")
+			}
+		case "pdf_grab":
+			if turn.GrabID == "" || !wireIDRE.MatchString(turn.GrabID) ||
+				turn.ActionID != nil || turn.JobID != "" || turn.GateClaimID != "" ||
+				turn.DependentJobs != 0 || turn.RouteClass != "pdf_identifier_needed" {
+				return fmt.Errorf("pdf_grab required turn fields invalid")
+			}
+		default:
+			return fmt.Errorf("invalid required turn item_kind")
+		}
+	}
+	if counts.RequiredTurnsComplete != nil && *counts.RequiredTurnsComplete {
+		if counts.TurnsRequired == nil || counts.RequiredTurns == nil || int64(len(counts.RequiredTurns)) != *counts.TurnsRequired {
+			return fmt.Errorf("complete required turns must equal turns_required")
+		}
+	}
 	return nil
 }
 
@@ -3678,18 +4478,22 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 		Watches     []TriageWatch `json:"watches"`
 		FirstSeenAt string        `json:"first_seen_at"`
 
-		ActionID        int64           `json:"action_id"`
-		JobID           string          `json:"job_id"`
-		ActionKind      string          `json:"action_kind"`
-		JobState        string          `json:"job_state"`
-		Revision        int64           `json:"revision"`
-		SHA256          string          `json:"sha256"`
-		SizeBytes       int64           `json:"size_bytes"`
-		RequiresAuth    *bool           `json:"requires_auth"`
-		BlockedBy       string          `json:"blocked_by"`
-		RouteClass      string          `json:"route_class"`
-		AuthRequirement string          `json:"auth_requirement"`
-		Delivery        *TriageDelivery `json:"delivery"`
+		ActionID         int64           `json:"action_id"`
+		JobID            string          `json:"job_id"`
+		ActionKind       string          `json:"action_kind"`
+		JobState         string          `json:"job_state"`
+		Revision         int64           `json:"revision"`
+		SHA256           string          `json:"sha256"`
+		SizeBytes        int64           `json:"size_bytes"`
+		RequiresAuth     *bool           `json:"requires_auth"`
+		BlockedBy        string          `json:"blocked_by"`
+		RouteClass       string          `json:"route_class"`
+		AuthRequirement  string          `json:"auth_requirement"`
+		Delivery         *TriageDelivery `json:"delivery"`
+		RunKey           string          `json:"run_key"`
+		NextActor        string          `json:"next_actor"`
+		GuidanceVariant  string          `json:"guidance_variant"`
+		OperationVariant string          `json:"operation_variant"`
 
 		DOI       string `json:"doi"`
 		Nature    string `json:"nature"`
@@ -3707,7 +4511,8 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 	allowed = append(allowed, "attention")
 	switch wire.Kind {
 	case "pdf_grab":
-		allowed = []string{"kind", "label", "grab", "route_class", "blocked_by", "attention", "ops"}
+		allowed = []string{"kind", "label", "grab", "route_class", "blocked_by", "attention", "ops",
+			"run_key", "next_actor", "guidance_variant", "operation_variant"}
 		if err := browserRequireFields(fields, "kind", "label", "grab", "route_class", "blocked_by", "attention", "ops"); err != nil {
 			return err
 		}
@@ -3724,7 +4529,8 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 		}
 	case "human_action":
 		allowed = append(allowed, "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes",
-			"requires_auth", "blocked_by", "route_class", "auth_requirement", "delivery")
+			"requires_auth", "blocked_by", "route_class", "auth_requirement", "delivery",
+			"run_key", "next_actor", "guidance_variant", "operation_variant")
 		if err := browserRequireFields(fields, append(core, "action_id", "job_id", "action_kind", "job_state", "revision", "sha256", "size_bytes")...); err != nil {
 			return err
 		}
@@ -3771,6 +4577,7 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 		Revision: wire.Revision, SHA256: wire.SHA256, SizeBytes: wire.SizeBytes,
 		RequiresAuth: wire.RequiresAuth, BlockedBy: wire.BlockedBy,
 		RouteClass: wire.RouteClass, AuthRequirement: wire.AuthRequirement, Delivery: wire.Delivery,
+		RunKey: wire.RunKey, NextActor: wire.NextActor, GuidanceVariant: wire.GuidanceVariant, OperationVariant: wire.OperationVariant,
 		DOI: wire.DOI, Nature: wire.Nature, NoticedAt: wire.NoticedAt, NoticeDOI: wire.NoticeDOI,
 		Label: wire.Label, Grab: wire.Grab,
 	}
@@ -3778,11 +4585,16 @@ func (item *TriageSnapshotItem) UnmarshalJSON(data []byte) error {
 }
 func (item TriageSnapshotItem) MarshalJSON() ([]byte, error) {
 	if item.Kind == "pdf_grab" {
-		return json.Marshal(map[string]any{
+		wire := map[string]any{
 			"kind": item.Kind, "label": item.Label, "grab": item.Grab,
 			"route_class": item.RouteClass, "blocked_by": item.BlockedBy,
 			"attention": item.Attention, "ops": item.Ops,
-		})
+		}
+		if item.RunKey != "" || item.NextActor != "" || item.GuidanceVariant != "" || item.OperationVariant != "" {
+			wire["run_key"], wire["next_actor"], wire["guidance_variant"], wire["operation_variant"] =
+				item.RunKey, item.NextActor, item.GuidanceVariant, item.OperationVariant
+		}
+		return json.Marshal(wire)
 	}
 	core := map[string]any{
 		"kind": item.Kind, "id": item.ID, "rank": item.Rank, "title": item.Title,
@@ -3814,6 +4626,10 @@ func (item TriageSnapshotItem) MarshalJSON() ([]byte, error) {
 		if item.Delivery != nil {
 			core["delivery"] = item.Delivery
 		}
+		if item.RunKey != "" || item.NextActor != "" || item.GuidanceVariant != "" || item.OperationVariant != "" {
+			core["run_key"], core["next_actor"], core["guidance_variant"], core["operation_variant"] =
+				item.RunKey, item.NextActor, item.GuidanceVariant, item.OperationVariant
+		}
 	case "retraction":
 		core["doi"], core["nature"], core["noticed_at"] = item.DOI, item.Nature, item.NoticedAt
 		if item.NoticeDOI != "" {
@@ -3826,6 +4642,24 @@ func (item TriageSnapshotItem) MarshalJSON() ([]byte, error) {
 func (item TriageSnapshotItem) validate() error {
 	if err := enumRequired("triage item kind", item.Kind, "watch_hit", "human_action", "retraction", "pdf_grab"); err != nil {
 		return err
+	}
+	quartet := []string{item.RunKey, item.NextActor, item.GuidanceVariant, item.OperationVariant}
+	presentQuartet := 0
+	for _, value := range quartet {
+		if value != "" {
+			presentQuartet++
+		}
+	}
+	if presentQuartet != 0 {
+		if (item.Kind != "human_action" && item.Kind != "pdf_grab") || presentQuartet != 4 {
+			return fmt.Errorf("triage row family quartet must be complete and action-like-only")
+		}
+		if err := validateWireID("triage item.run_key", item.RunKey); err != nil {
+			return err
+		}
+		if !containsString(triageNextActors, item.NextActor) || !containsString(triageGuidanceVariants, item.GuidanceVariant) || !containsString(triageOperationVariants, item.OperationVariant) {
+			return fmt.Errorf("triage item family variant invalid")
+		}
 	}
 	if item.Kind == "pdf_grab" {
 		if item.Label == "" || item.Grab == nil || item.Grab.GrabID == "" || item.Grab.State == "" {
@@ -4012,8 +4846,8 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 	if err := validateCorrelationID("triage_snapshot_response.request_id", p.RequestID); err != nil {
 		return err
 	}
-	if p.Schema != 1 && p.Schema != 2 && p.Schema != 3 && p.Schema != 4 {
-		return fmt.Errorf("triage_snapshot_response.schema must be 1, 2, 3, or 4")
+	if p.Schema < 1 || p.Schema > 5 {
+		return fmt.Errorf("triage_snapshot_response.schema must be 1..5")
 	}
 	grabCount := 0
 	for _, item := range p.Items {
@@ -4022,8 +4856,13 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 		}
 	}
 	floorFlag := 0
-	if p.Schema == 4 {
+	if p.Schema == 4 || p.Schema == 5 {
 		floorFlag = 1
+	}
+	if p.Schema < 3 {
+		if p.Counts.TurnsRequired != nil || p.Counts.TurnsWorking != nil || p.Counts.FamilyBreakdownComplete != nil || len(p.Counts.FamilyRuns) > 0 || p.Counts.RequiredTurnsComplete != nil || len(p.Counts.RequiredTurns) > 0 {
+			return fmt.Errorf("triage_snapshot_response schema below 3 cannot include v3 counts fields")
+		}
 	}
 	if err := p.Counts.validate(grabCount, floorFlag); err != nil {
 		return err
@@ -4037,6 +4876,17 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 	for _, item := range p.Items {
 		if err := item.validate(); err != nil {
 			return err
+		}
+		quartetPresent := item.RunKey != "" || item.NextActor != "" || item.GuidanceVariant != "" || item.OperationVariant != ""
+		quartetComplete := item.RunKey != "" && item.NextActor != "" && item.GuidanceVariant != "" && item.OperationVariant != ""
+		if p.Schema < 5 && quartetPresent {
+			return fmt.Errorf("triage snapshot schema below 5 forbids family quartet")
+		}
+		if p.Schema >= 5 && quartetPresent != quartetComplete {
+			return fmt.Errorf("triage snapshot schema 5 family quartet must be complete or absent")
+		}
+		if p.Schema >= 5 && (item.Kind == "watch_hit" || item.Kind == "retraction") && quartetPresent {
+			return fmt.Errorf("triage snapshot schema 5 forbids family quartet on %s", item.Kind)
 		}
 		v3Fields := item.RouteClass != "" || item.AuthRequirement != "" || item.Delivery != nil
 		switch p.Schema {
@@ -4068,20 +4918,20 @@ func (p *TriageSnapshotResponsePayload) validate() error {
 			} else if v3Fields {
 				return fmt.Errorf("triage_snapshot_response.schema 3 route_class/auth_requirement/delivery are human_action only")
 			}
-		case 4:
+		case 4, 5:
 			if item.Attention == "" {
-				return fmt.Errorf("triage_snapshot_response.schema 4 requires attention on every item")
+				return fmt.Errorf("triage_snapshot_response schema %d requires attention on every item", p.Schema)
 			}
 			if item.Kind == "pdf_grab" {
 				if item.RouteClass != "pdf_identifier_needed" || item.BlockedBy != "identifier_missing" {
-					return fmt.Errorf("triage_snapshot_response.schema 4 pdf_grab fields are invalid")
+					return fmt.Errorf("triage_snapshot_response pdf_grab fields are invalid")
 				}
 			} else if item.Kind == "human_action" {
 				if item.RouteClass == "" || item.AuthRequirement == "" {
-					return fmt.Errorf("triage_snapshot_response.schema 4 human_action items require route_class and auth_requirement")
+					return fmt.Errorf("triage_snapshot_response human_action items require route_class and auth_requirement")
 				}
 			} else if v3Fields {
-				return fmt.Errorf("triage_snapshot_response.schema 4 route_class/auth_requirement/delivery are human_action only")
+				return fmt.Errorf("triage_snapshot_response route_class/auth_requirement/delivery are human_action only")
 			}
 		}
 	}
@@ -4536,7 +5386,13 @@ func (s *PageBulkSubmitSource) validate() error {
 	if s.Detector == "" {
 		return fmt.Errorf("page_bulk_submit_request.source.detector is required")
 	}
-	return validateTriageText("page_bulk_submit_request.source.detector", s.Detector, 128)
+	if err := validateTriageText("page_bulk_submit_request.source.detector", s.Detector, 128); err != nil {
+		return err
+	}
+	if strings.IndexFunc(s.Detector, unicode.IsControl) >= 0 {
+		return fmt.Errorf("page_bulk_submit_request.source.detector contains control character")
+	}
+	return nil
 }
 
 func (p *PageBulkSubmitResultPayload) validate() error {

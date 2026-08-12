@@ -6,13 +6,22 @@
 
 import {
   chromeBackend,
+  CATCH_UP_ENABLED_KEY,
   PAGE_CAPTURE_CONSENT_KEY,
+  SUCCESS_ACK_MODE_KEY,
+  TOOLBAR_COUNT_MODE_KEY,
   WORK_WINDOW_KEY,
   HANDOFF_SURFACE_KEY,
   type StoreShape,
 } from "./state";
 import { renderPapio } from "./dom";
 import { adapters, type AdapterSpec } from "./adapters/types";
+export {
+  CATCH_UP_ENABLED_KEY,
+  SUCCESS_ACK_MODE_KEY,
+  TOOLBAR_COUNT_MODE_KEY,
+} from "./state";
+export type { SuccessAckMode, ToolbarCountMode } from "./state";
 import { clampKeepaliveInterval } from "./keepalive";
 
 export interface Source {
@@ -239,6 +248,40 @@ export function wirePageCaptureConsent(): void {
       .then(renderPageCaptureConsent, () => {
         input.disabled = false;
       });
+  });
+}
+
+async function renderFeedbackSettings(): Promise<void> {
+  const toolbar = document.getElementById("toolbar-count-mode");
+  const catchUp = document.getElementById("catch-up-enabled");
+  const success = document.getElementById("success-ack-mode");
+  if (!(toolbar instanceof HTMLSelectElement) || !(catchUp instanceof HTMLInputElement) || !(success instanceof HTMLSelectElement)) return;
+  try {
+    const values = await chrome.storage.local.get([TOOLBAR_COUNT_MODE_KEY, CATCH_UP_ENABLED_KEY, SUCCESS_ACK_MODE_KEY]);
+    const mode = values[TOOLBAR_COUNT_MODE_KEY];
+    toolbar.value = mode === "all" || mode === "off" ? mode : "required";
+    catchUp.checked = values[CATCH_UP_ENABLED_KEY] !== false;
+    const ack = values[SUCCESS_ACK_MODE_KEY];
+    success.value = ack === "errors" || ack === "off" ? ack : "all";
+  } catch {
+    toolbar.value = "required";
+    catchUp.checked = true;
+    success.value = "all";
+  }
+}
+
+function wireFeedbackSettings(): void {
+  const toolbar = document.getElementById("toolbar-count-mode");
+  const catchUp = document.getElementById("catch-up-enabled");
+  const success = document.getElementById("success-ack-mode");
+  toolbar?.addEventListener("change", () => {
+    const value = toolbar instanceof HTMLSelectElement && (toolbar.value === "all" || toolbar.value === "off") ? toolbar.value : "required";
+    void chrome.storage.local.set({ [TOOLBAR_COUNT_MODE_KEY]: value });
+  });
+  catchUp?.addEventListener("change", () => void chrome.storage.local.set({ [CATCH_UP_ENABLED_KEY]: catchUp instanceof HTMLInputElement && catchUp.checked }));
+  success?.addEventListener("change", () => {
+    const value = success instanceof HTMLSelectElement && (success.value === "errors" || success.value === "off") ? success.value : "all";
+    void chrome.storage.local.set({ [SUCCESS_ACK_MODE_KEY]: value });
   });
 }
 
@@ -480,6 +523,8 @@ wireTermsConsent();
 void renderTermsConsent();
 wirePageCaptureConsent();
 void renderPageCaptureConsent();
+wireFeedbackSettings();
+void renderFeedbackSettings();
 wireHandoffSurface();
 void renderHandoffSurface();
 void renderDaemonFooter();

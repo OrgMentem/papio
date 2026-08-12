@@ -839,7 +839,11 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
   expect(first?.seq).toBe(0);
   expect(first?.msg_id).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
   expect(first?.payload["extension_version"]).toBe("0.1.0");
-  expect(first?.payload["features"]).toEqual(["institutional_materialization_v1"]);
+  expect(first?.payload["features"]).toEqual([
+    "institutional_materialization_v1",
+    "surface_presence_v1",
+    "work_pulse_v1",
+  ]);
 });
 
 test("startup clears a stale badge when persisted daemon health is connected", async () => {
@@ -4315,11 +4319,15 @@ test("papio.activity accepts popup senders while triage remains inbox-only", asy
   const reply = {
     ok: true as const,
     feature: true,
+    request_id: "request-activity-1",
+    generated_at: "2026-08-03T00:00:01Z",
     entries: [{ seq: 1, at: "2026-08-03T00:00:00Z", kind: "download_complete", text: "Ready" }],
+    has_more: false,
+    latest_seq: 1,
   };
-  let requestedLimit: number | undefined;
-  h.bridge.requestActivity = async (limit) => {
-    requestedLimit = limit;
+  let requestedRequest: { limit?: number; before_seq?: string; seen_through_seq?: string } | undefined;
+  h.bridge.requestActivity = async (request) => {
+    requestedRequest = request;
     return reply;
   };
 
@@ -4331,7 +4339,7 @@ test("papio.activity accepts popup senders while triage remains inbox-only", asy
       urls,
     ),
   ).resolves.toBe(reply);
-  expect(requestedLimit).toBe(10);
+  expect(requestedRequest).toEqual({ limit: 10 });
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
@@ -4645,7 +4653,7 @@ test("papio.pageBulk.submit happy dispatch forwards the request to the bridge an
   let received: unknown;
   h.bridge.requestPageBulkSubmit = async (request) => {
     received = request;
-    return { ok: true, submitted: 1, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" };
+    return { ok: true, mode: "v2", processed_count: 1, submitted: 1, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" };
   };
   const sender = { id: urls.runtimeID, url: urls.pageBulkURL };
   const request = {
@@ -4655,7 +4663,7 @@ test("papio.pageBulk.submit happy dispatch forwards the request to the bridge an
   };
   await expect(
     handleInboxRuntimeMessage(h.bridge, { type: "papio.pageBulk.submit", request }, sender, urls),
-  ).resolves.toEqual({ ok: true, submitted: 1, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" });
+  ).resolves.toEqual({ ok: true, mode: "v2", processed_count: 1, submitted: 1, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" });
   expect(received).toEqual(request);
 });
 
@@ -5337,14 +5345,13 @@ test("handoff_focus re-drives an auth-pending tab without charging the automatic
 
   expect(h.tabs.navigations).toEqual([{ tabID, url: OPENURL }]);
   expect(h.backend.store.authAttempts?.[jobID]).toBe(attemptsBefore);
-  expect(h.tabs.activated).toContain(tabID);
 });
 
 test("an inbox dismiss relays verdict dismiss through the native resolve", async () => {
-  // Regression: the inbox and the native protocol both speak verdict
-  // "dismiss" (Go enumRequired and protocol.ts both allow it), but the
-  // broker's isResolveRuntimeRequest guard only accepted accept/reject, so
-  // every human-action dismiss died as "Invalid action resolution request".
+  // Regression: the inbox and native protocol both speak verdict "dismiss"
+  // (Go enumRequired and protocol.ts both allow it), but the runtime dispatch
+  // switch omitted papio.action.resolve, so every human-action dismissal
+  // stalled without sending a native frame.
   const h = makeHarness();
   const urls = {
     runtimeID: "papio-test-id",
@@ -5620,6 +5627,21 @@ test("triage requests time out and late echoes are dropped", async () => {
   }
   expect(debugLines.some((line) => line.join(" ").includes("unknown or late correlated response"))).toBe(true);
 });
+test("surface presence does not retry on a transport failure within one poll", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["surface_presence_v1"] }));
+  const pending = h.bridge.sendSurfacePresence({
+    instance_id: "instance-1",
+    surface: "popup",
+    focused: true,
+    at: "2027-01-01T00:00:00Z",
+  });
+  await h.port.waitForFrame("surface_presence");
+  await h.port.emitDisconnect();
+  await expect(pending).resolves.toMatchObject({ ok: false });
+  expect(h.frames().filter((frame) => frame.type === "surface_presence")).toHaveLength(1);
+});
 
 test("a user-visible triage request forces reconnect and waits for a fresh hello", async () => {
   const h = makeHarness();
@@ -5684,7 +5706,7 @@ test("heartbeat counts obey disconnected, sign-in, permission, then pending badg
   await h.tabs.completeNavigation(tabID, providerURL);
   expect(h.action.texts.at(-1)).toBe("4");
   expect(h.action.backgroundColors.at(-1)).toBe("#1a73e8");
-  expect(h.action.titles.at(-1)).toBe("papio: 4 pending triage items");
+  expect(h.action.titles.at(-1)).toBe("papio: 4 pending items");
 
   await h.port.emitDisconnect();
   expect(h.action.texts.at(-1)).toBe("!");

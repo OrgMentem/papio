@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -65,9 +66,6 @@ type BudgetAcquirer interface {
 	Acquire(context.Context, string, config.Source, float64) error
 }
 
-// Options configures a Sentinel. DataDir, Store, and Budgets are production
-// dependencies; the remaining fields make the bounded network operation
-// deterministic in tests.
 type Options struct {
 	Store            *store.Store
 	Budgets          BudgetAcquirer
@@ -76,7 +74,7 @@ type Options struct {
 	DataDir          string
 	BaseURL          string
 	MaxResponseBytes int64
-	Notifier         notify.Sender
+	Notifier         notify.Sink
 	Now              func() time.Time
 }
 
@@ -90,7 +88,7 @@ type Sentinel struct {
 	dataDir  string
 	baseURL  string
 	maxBody  int64
-	notifier notify.Sender
+	notifier notify.Sink
 	now      func() time.Time
 
 	mu      sync.Mutex
@@ -207,15 +205,8 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	if err := s.writeCache(cache{Version: cacheVersion, CheckedAt: now, Notices: notices}); err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("retraction: write cache: %w", err)
-	}
-	if err := s.pruneAcks(ctx, notices); err != nil {
-		s.mu.Unlock()
-		return err
-	}
 	seenNotices := make(map[string]bool, len(previous))
+	newFindings := make([]Finding, 0)
 	for _, finding := range previous {
 		seenNotices[noticeKey(finding)] = true
 	}
@@ -225,13 +216,45 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 			continue
 		}
 		seenNotices[key] = true
-		notify.Emit(ctx, s.notifier, notify.Event{
-			Kind:    "library.retraction",
-			Message: noticeMessage(finding),
-			Count:   1,
-		})
+		newFindings = append(newFindings, finding)
+	}
+	scanID := cached.ScanID
+	if scanID == "" || !ok || !fresh {
+		scanID = fmt.Sprintf("scan:%d", now.UnixNano())
+	}
+	if err := s.writeCache(cache{Version: cacheVersion, CheckedAt: now, ScanID: scanID, Notices: notices}); err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("retraction: write cache: %w", err)
+	}
+	if err := s.pruneAcks(ctx, notices); err != nil {
+		s.mu.Unlock()
+		return err
 	}
 	s.mu.Unlock()
+	if len(newFindings) > 0 && s.notifier != nil {
+		message := noticeMessage(newFindings[0])
+		if len(newFindings) > 1 {
+			message = fmt.Sprintf("%d library notices found in retraction scan", len(newFindings))
+		}
+		details := make([]map[string]any, 0, len(newFindings))
+		for _, finding := range newFindings {
+			details = append(details, map[string]any{
+				"doi": finding.DOI, "nature": finding.Nature,
+				"noticed_at": finding.NoticedAt.UTC().Format(time.RFC3339Nano),
+				"notice_doi": finding.NoticeDOI,
+			})
+		}
+		event := notify.Event{Kind: "library.retraction", Message: message, Count: len(newFindings), Detail: map[string]any{"findings": details, "scan_id": scanID}}
+		intent := notify.Intent{
+			EventKind: "library.retraction", Category: notify.CategoryIntegrityNotice,
+			AggregateKey: scanID, Phase: notify.PhaseScan, WindowStart: now,
+			ScanID: scanID, HappenedAt: now, Message: message, Detail: event,
+		}
+		if err := s.notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
+			// Notification failures must not alter the committed scan/cache.
+			log.Printf("papio: routing retraction notification: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -572,6 +595,7 @@ func noticeMessage(f Finding) string {
 type cache struct {
 	Version   int                `json:"version"`
 	CheckedAt time.Time          `json:"checked_at"`
+	ScanID    string             `json:"scan_id,omitempty"`
 	Notices   map[string]Finding `json:"notices"`
 }
 

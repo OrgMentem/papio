@@ -20,6 +20,7 @@ import (
 	"papio/internal/delivery"
 	"papio/internal/discovery"
 	"papio/internal/job"
+	"papio/internal/notify"
 	"papio/internal/ownership"
 	"papio/internal/pdf"
 	"papio/internal/store"
@@ -74,6 +75,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	} else {
 		add("fetch_policy", Pass, "HTTPS-only production policy", "")
 	}
+	checkNotifications(ctx, cfg, db, add)
 
 	if err := checkDataDir(cfg.DataDir); err != nil {
 		add("data_dir", Fail, "data directory is not private and writable", err.Error())
@@ -193,6 +195,43 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		}
 	}
 	return out
+}
+
+// checkNotifications reports the local notification capability and effective
+// routing state without exposing webhook credentials.
+func checkNotifications(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string)) {
+	available, capability := notify.PlatformCapability()
+	policy, policyErr := notify.ResolvePolicy(cfg.Notify)
+	held := "unavailable"
+	if db != nil {
+		n, err := db.Notifications().HeldCount(ctx)
+		if err == nil {
+			held = fmt.Sprintf("%d", n)
+		}
+	}
+	webhook := "not configured"
+	if strings.TrimSpace(cfg.Notify.WebhookURL) != "" {
+		webhook = "configured"
+	}
+	if policyErr != nil {
+		add("notifications", Fail,
+			fmt.Sprintf("%s; effective preset unavailable; held digests %s; webhook %s", capability, held, webhook),
+			"fix [notify] preset and category overrides in the configuration")
+		return
+	}
+	status := Pass
+	remediation := ""
+	if !available {
+		status = Warn
+		remediation = "desktop notifications are unavailable on this platform; use papio inbox or Activity"
+	}
+	if !cfg.Notify.Enabled && available {
+		status = Warn
+		remediation = "set notify.enabled = true to enable local desktop notifications"
+	}
+	add("notifications", status,
+		fmt.Sprintf("%s; effective preset %s; held digests %s; webhook %s", capability, policy.Preset, held, webhook),
+		remediation)
 }
 
 // uncollectedGracePeriod is how long an acquired full text may sit before it

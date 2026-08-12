@@ -28,3 +28,40 @@ test("computeBadge follows the documented operator-signal precedence", () => {
     expect(computeBadge({ ...base, ...patch }), label).toMatchObject(expected);
   }
 });
+
+test("computeBadge uses required turns only for a complete counts v3 projection", () => {
+  const legacy = computeBadge({ ...base, triageCount: 4 });
+  expect(legacy).toMatchObject({ text: "4", color: "#1a73e8", tooltip: "papio: 4 pending items" });
+
+  const completeV3 = computeBadge({
+    ...base,
+    triageCount: 9,
+    countsSchemaV3: true,
+    requiredTurnCount: 2,
+    requiredTurnsComplete: true,
+  });
+  expect(completeV3).toMatchObject({ text: "2", color: "#1a73e8" });
+
+  const incompleteV3 = computeBadge({
+    ...base,
+    triageCount: 9,
+    countsSchemaV3: true,
+    requiredTurnCount: undefined,
+    requiredTurnsComplete: false,
+  });
+  expect(incompleteV3).toMatchObject({
+    text: "",
+    color: "#1a73e8",
+    tooltip: "Many decisions waiting — open inbox",
+  });
+});
+test("toolbar count modes select the configured numeric tier without masking blockers", () => {
+  expect(computeBadge({ ...base, toolbarCountMode: "all", triageCount: 4, requiredTurnCount: 1, countsSchemaV3: true, requiredTurnsComplete: true }))
+    .toMatchObject({ text: "4", tooltip: "papio: 4 pending items" });
+  expect(computeBadge({ ...base, toolbarCountMode: "off", triageCount: 4, requiredTurnCount: 1, countsSchemaV3: true, requiredTurnsComplete: true }))
+    .toMatchObject({ text: "" });
+  expect(computeBadge({ ...base, toolbarCountMode: "off", connectionStatus: "disconnected", triageCount: 4 }))
+    .toMatchObject({ text: "!" });
+  expect(computeBadge({ ...base, toolbarCountMode: "off", reauthNeeded: true, triageCount: 4 }))
+    .toMatchObject({ text: "!" });
+});

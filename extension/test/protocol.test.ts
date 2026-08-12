@@ -7,8 +7,14 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  GUIDANCE_VARIANTS,
   MAX_BROWSER_MESSAGE_BYTES,
+  NEXT_ACTORS,
+  OPERATION_VARIANTS,
   ProtocolError,
+  isBareLowercaseHTTPSOrigin,
+  isCanonicalKey,
+  isDetectorText,
   parseBrowserMessage,
   parseBrowserMessageBytes,
 } from "../src/protocol";
@@ -938,4 +944,426 @@ test("institutional_candidate_offer is URL-free, browser-tab-only, job-scoped, a
 
   const oversized = JSON.stringify(envelope({ ...valid, extra: "x".repeat(MAX_BROWSER_MESSAGE_BYTES) }));
   expect(() => parseBrowserMessageBytes(oversized)).toThrow(/exceeds cap/);
+});
+const protocolFrame = (type: BrowserMessageType, payload: Record<string, unknown>) => ({
+  protocol: "papio-browser/1",
+  type,
+  msg_id: "new-frame-msg-001",
+  seq: 1,
+  payload,
+});
+
+const pulseEpisode = (key = "episode-001", since = "2026-01-01T00:00:00Z", count = 1) => ({
+  episode_key: key,
+  cause_kind: "execution_lease_overdue",
+  public_label: "Execution lease overdue",
+  since,
+  count,
+});
+
+const pulsePayload = (): Record<string, unknown> => ({
+  request_id: "request-pulse-001",
+  schema: 1,
+  generated_at: "2026-01-01T00:00:00Z",
+  nonterminal_total: 10,
+  projection_complete: true,
+  in_flight: 2,
+  continuing: 4,
+  scheduled: 1,
+  waiting_required: 2,
+  stalled: 1,
+  effect_capacity: { busy: 1, limit: 2, waiting: 1 },
+  human_surface_capacity: { busy: 1, limit: 2, waiting_claims: 2 },
+  last_forward_at: "2026-01-01T00:00:01Z",
+  stall_episodes: [pulseEpisode()],
+  stall_episodes_truncated: false,
+  last_finished_at: "2025-12-31T23:59:59Z",
+  next_action: { at: "2026-01-01T00:01:00Z", kind: "retry", source: "OpenAlex", count: 2 },
+  gates: [{ kind: "source_budget", source: "OpenAlex", until: "2026-01-01T01:00:00Z", count: 2 }],
+  latest_batch: {
+    batch_id: "batch-001",
+    label: "January browser submission",
+    started_at: "2026-01-01T00:00:00Z",
+    settled_at: "2026-01-01T00:02:00Z",
+    membership: "complete",
+    projection_complete: true,
+    total: 8,
+    settled: 3,
+    nonterminal_total: 5,
+    in_flight: 1,
+    continuing: 1,
+    scheduled: 1,
+    waiting_required: 1,
+    stalled: 1,
+    unavailable: 1,
+  },
+});
+
+const countsV3 = (): Record<string, unknown> => ({
+  pending_total: 1,
+  watch_hits: 0,
+  actions: 1,
+  retractions: 0,
+  jobs_working: 0,
+  jobs_needs_review: 0,
+  failure_groups_7d: 0,
+  turns_required: 1,
+  turns_working: 0,
+  family_breakdown_complete: true,
+  family_runs: [{
+    run_key: "run-001",
+    first_rank: 0,
+    route_class: "manual_download",
+    action_kind: "manual_download",
+    next_actor: "researcher",
+    guidance_variant: "manual_download",
+    operation_variant: "open_and_dismiss",
+    count: 1,
+  }],
+  required_turns_complete: true,
+  required_turns: [{
+    item_id: "action-001",
+    item_kind: "human_action",
+    action_id: 1,
+    job_id: "job-0001",
+    route_class: "manual_download",
+    gate_claim_id: "gate-001",
+    dependent_jobs: 2,
+  }],
+});
+
+const activityEntry = (seq: number): Record<string, unknown> => ({
+  seq,
+  at: "2026-01-01T00:00:00Z",
+  job_id: "job-activity-001",
+  kind: "watch.alert",
+  text: "new",
+  title: "Watch hit",
+});
+
+const bulkSource = {
+  kind: "browser_page",
+  origin: "https://scholar.example.edu:8443",
+  detector: "generic-identifiers/1",
+};
+
+test("new protocol frames parse with all optional fields and round-trip", () => {
+  const frames: Array<[BrowserMessageType, Record<string, unknown>]> = [
+    ["surface_presence", {
+      request_id: "request-presence-001", instance_id: "instance-001", surface: "popup", focused: true,
+      at: "2026-01-01T00:00:00Z",
+    }],
+    ["surface_presence_ack", { request_id: "request-presence-001", accepted: true }],
+    ["work_pulse_request", { request_id: "request-pulse-001", schema_versions: [1] }],
+    ["work_pulse_response", pulsePayload()],
+    ["activity_page_request", {
+      request_id: "request-activity-page-001", limit: 50, before_seq: "41", seen_through_seq: "40",
+    }],
+    ["activity_page_response", {
+      request_id: "request-activity-page-001", generated_at: "2026-01-01T00:00:00Z",
+      entries: [activityEntry(42)], has_more: true, cursor: "43", latest_seq: 43, new_count_since: 1, gap: false,
+    }],
+    ["page_bulk_submit_v2_request", {
+      request_id: "request-bulk-v2-001", scan_id: "scan-001", cohort_id: "cohort-001",
+      source: bulkSource, cohort_total: 1, chunk_index: 0, final_chunk: true, canonical_keys: ["work-key-1"],
+    }],
+    ["page_bulk_submit_v2_result", {
+      request_id: "request-bulk-v2-001", scan_id: "scan-001", cohort_id: "cohort-001", chunk_index: 0,
+      final_chunk: true, batch_id: "batch-001", membership: "complete", cohort_total: 1,
+      persisted_members: 1, submitted: 1, joined: 0, already_owned: 0, invalid: 0,
+    }],
+  ];
+  for (const [type, payload] of frames) {
+    const frame = protocolFrame(type, payload);
+    const parsed = parseBrowserMessage(frame);
+    expect(parsed.type).toBe(type);
+    expect(parsed.payload).toEqual(payload);
+    expect(JSON.parse(JSON.stringify(parsed.payload))).toEqual(payload);
+  }
+});
+
+test("new protocol frames reject unknown and null fields", () => {
+  const payloads: Array<[BrowserMessageType, Record<string, unknown>]> = [
+    ["surface_presence", { request_id: "request-001", instance_id: "instance-001", surface: "popup", focused: true, at: "2026-01-01T00:00:00Z" }],
+    ["surface_presence_ack", { request_id: "request-001", accepted: true }],
+    ["work_pulse_request", { request_id: "request-001", schema_versions: [1] }],
+    ["work_pulse_response", pulsePayload()],
+    ["activity_page_request", { request_id: "request-001" }],
+    ["activity_page_response", { request_id: "request-001", generated_at: "2026-01-01T00:00:00Z", entries: [], has_more: false, latest_seq: 0 }],
+    ["page_bulk_submit_v2_request", {
+      request_id: "request-001", scan_id: "scan-001", cohort_id: "cohort-001", source: bulkSource,
+      cohort_total: 1, chunk_index: 0, final_chunk: true, canonical_keys: ["key"],
+    }],
+    ["page_bulk_submit_v2_result", {
+      request_id: "request-001", scan_id: "scan-001", cohort_id: "cohort-001", chunk_index: 0,
+      final_chunk: true, batch_id: "batch-001", membership: "complete", persisted_members: 1,
+      submitted: 1, joined: 0, already_owned: 0, invalid: 0,
+    }],
+  ];
+  for (const [type, payload] of payloads) {
+    expect(() => parseBrowserMessage(protocolFrame(type, { ...payload, unexpected: true }))).toThrow(ProtocolError);
+    const key = Object.keys(payload)[0]!;
+    expect(() => parseBrowserMessage(protocolFrame(type, { ...payload, [key]: null }))).toThrow(ProtocolError);
+  }
+});
+
+test("new protocol closed vocabularies reject unknown values", () => {
+  expect(() => parseBrowserMessage(protocolFrame("surface_presence", {
+    request_id: "request-001", instance_id: "instance-001", surface: "tab", focused: true, at: "2026-01-01T00:00:00Z",
+  }))).toThrow(ProtocolError);
+  for (const [field, value] of [
+    ["cause_kind", "other"],
+    ["next_action.kind", "other"],
+    ["gates[].kind", "other"],
+    ["latest_batch.membership", "other"],
+  ] as const) {
+    const payload = pulsePayload();
+    if (field === "cause_kind") (payload.stall_episodes as Array<Record<string, unknown>>)[0]!["cause_kind"] = value;
+    if (field === "next_action.kind") (payload.next_action as Record<string, unknown>)["kind"] = value;
+    if (field === "gates[].kind") (payload.gates as Array<Record<string, unknown>>)[0]!["kind"] = value;
+    if (field === "latest_batch.membership") (payload.latest_batch as Record<string, unknown>)["membership"] = value;
+    expect(() => parseBrowserMessage(protocolFrame("work_pulse_response", payload))).toThrow(ProtocolError);
+  }
+  expect(() => parseBrowserMessage(protocolFrame("page_bulk_submit_v2_result", {
+    request_id: "request-001", scan_id: "scan-001", cohort_id: "cohort-001", chunk_index: 0, final_chunk: true,
+    batch_id: "batch-001", membership: "other", persisted_members: 1, submitted: 1, joined: 0, already_owned: 0, invalid: 0,
+  }))).toThrow(ProtocolError);
+});
+
+test("new protocol IDs, timestamps, strings, and public labels are bounded", () => {
+  expect(() => parseBrowserMessage(protocolFrame("surface_presence", {
+    request_id: "bad id", instance_id: "instance-001", surface: "popup", focused: true, at: "2026-01-01T00:00:00Z",
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("surface_presence", {
+    request_id: "request-001", instance_id: "instance-001", surface: "popup", focused: true, at: "not-time",
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("work_pulse_response", {
+    ...pulsePayload(), request_id: "x".repeat(65),
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("work_pulse_response", {
+    ...pulsePayload(), stall_episodes: [{ ...pulseEpisode(), public_label: "x".repeat(65) }],
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("work_pulse_response", {
+    ...pulsePayload(), stall_episodes: [{ ...pulseEpisode(), public_label: "bad\nlabel" }],
+  }))).toThrow(ProtocolError);
+});
+
+test("work pulse bounds, algebra, capacities, episodes, and gates match the wire contract", () => {
+  const withPulse = (mutate: (payload: Record<string, unknown>) => void) => {
+    const payload = pulsePayload();
+    mutate(payload);
+    expect(() => parseBrowserMessage(protocolFrame("work_pulse_response", payload))).toThrow(ProtocolError);
+  };
+  withPulse((p) => { p.nonterminal_total = 11; });
+  withPulse((p) => { (p.effect_capacity as Record<string, unknown>).busy = 3; });
+  withPulse((p) => { p.stalled = 1; p.stall_episodes = []; });
+  withPulse((p) => { p.stall_episodes = [pulseEpisode("a", "2026-01-01T00:00:00Z", 2)]; });
+  const validTruncated = pulsePayload();
+  validTruncated.stall_episodes_truncated = true;
+  validTruncated.stall_episodes = [pulseEpisode("a", "2026-01-01T00:00:00Z", 1)];
+  validTruncated.stalled = 2;
+  validTruncated.nonterminal_total = 11;
+  expect(parseBrowserMessage(protocolFrame("work_pulse_response", validTruncated)).payload).toBeDefined();
+  withPulse((p) => { p.stall_episodes_truncated = true; p.stall_episodes = [pulseEpisode("a", "2026-01-01T00:00:00Z", 2)]; });
+  withPulse((p) => { p.stall_episodes = Array.from({ length: 17 }, (_, i) => pulseEpisode(`episode-${String(i).padStart(3, "0")}`, `2026-01-01T00:${String(i).padStart(2, "0")}:00Z`)); });
+  withPulse((p) => { p.stall_episodes = [pulseEpisode("duplicate"), pulseEpisode("duplicate", "2026-01-01T00:01:00Z")]; });
+  withPulse((p) => { p.stall_episodes = [pulseEpisode("z", "2026-01-01T00:01:00Z"), pulseEpisode("a", "2026-01-01T00:00:00Z")]; });
+  withPulse((p) => { p.gates = Array.from({ length: 17 }, (_, i) => ({ kind: "source_budget", source: `source-${i}`, until: "2026-01-01T01:00:00Z", count: 1 })); });
+  withPulse((p) => { p.gates = [{ kind: "source_budget", source: "OpenAlex", until: "2026-01-01T01:00:00Z", count: 1 }, { kind: "source_budget", source: "OpenAlex", until: "2026-01-01T02:00:00Z", count: 1 }]; });
+  withPulse((p) => { p.stalled = 1_000_001; });
+  withPulse((p) => { (p.stall_episodes as Array<Record<string, unknown>>)[0]!["count"] = 0; });
+  withPulse((p) => { p.next_action = { at: "2026-01-01T00:01:00Z", kind: "other" }; });
+});
+
+test("activity page bounds, entries, cursor algebra, and gap semantics match the wire contract", () => {
+  const base = {
+    request_id: "request-activity-page-001", generated_at: "2026-01-01T00:00:00Z",
+    entries: [activityEntry(1)], has_more: false, latest_seq: 1,
+  };
+  expect(() => parseBrowserMessage(protocolFrame("activity_page_response", {
+    ...base, entries: Array.from({ length: 51 }, (_, i) => activityEntry(i + 1)),
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("activity_page_response", {
+    ...base, entries: [{ ...activityEntry(1), seq: -1 }],
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("activity_page_response", {
+    ...base, entries: [{ ...activityEntry(1), at: "not-time" }],
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("activity_page_response", {
+    ...base, entries: [{ ...activityEntry(1), kind: "" }],
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("activity_page_response", {
+    ...base, entries: [{ ...activityEntry(1), text: "" }],
+  }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("activity_page_response", { ...base, has_more: true }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("activity_page_response", { ...base, has_more: false, cursor: "2" }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("activity_page_response", { ...base, gap: true, new_count_since: 1 }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("activity_page_request", { request_id: "request-001", limit: 51 }))).toThrow(ProtocolError);
+});
+
+test("page bulk v2 enforces cohort, chunk, canonical-key, and result-count bounds", () => {
+  const request = (changes: Record<string, unknown> = {}) => parseBrowserMessage(protocolFrame("page_bulk_submit_v2_request", {
+    request_id: "request-bulk-001", scan_id: "scan-001", cohort_id: "cohort-001", source: bulkSource,
+    cohort_total: 1, chunk_index: 0, final_chunk: true, canonical_keys: ["key"], ...changes,
+  }));
+  expect(() => request({ cohort_total: 0 })).toThrow(ProtocolError);
+  expect(() => request({ cohort_total: 201 })).toThrow(ProtocolError);
+  expect(() => request({ cohort_total: 51, chunk_index: 4, final_chunk: true, canonical_keys: ["key"] })).toThrow(ProtocolError);
+  expect(() => request({ cohort_total: 51, chunk_index: 0, final_chunk: false, canonical_keys: Array.from({ length: 51 }, (_, i) => `key-${i}`) })).toThrow(ProtocolError);
+  expect(() => request({ cohort_total: 2, canonical_keys: ["duplicate", "duplicate"] })).toThrow(ProtocolError);
+  const result = {
+    request_id: "request-bulk-001", scan_id: "scan-001", cohort_id: "cohort-001", chunk_index: 0, final_chunk: true,
+    batch_id: "batch-001", membership: "complete", cohort_total: 1, persisted_members: 1,
+    submitted: 1, joined: 0, already_owned: 0, invalid: 0,
+  };
+  expect(() => parseBrowserMessage(protocolFrame("page_bulk_submit_v2_result", { ...result, chunk_index: 4 }))).toThrow(ProtocolError);
+  expect(() => parseBrowserMessage(protocolFrame("page_bulk_submit_v2_result", { ...result, submitted: 1_000_001 }))).toThrow(ProtocolError);
+});
+
+test("page bulk v2 accepts cumulative persisted members across two chunks", () => {
+  const base = {
+    request_id: "request-bulk-001", scan_id: "scan-001", cohort_id: "cohort-001",
+    batch_id: "batch-001", membership: "open", cohort_total: 100, persisted_members: 0,
+    submitted: 50, joined: 0, already_owned: 0, invalid: 0,
+  };
+  expect(parseBrowserMessage(protocolFrame("page_bulk_submit_v2_result", { ...base, chunk_index: 0, final_chunk: false })).payload).toBeDefined();
+  expect(parseBrowserMessage(protocolFrame("page_bulk_submit_v2_result", {
+    ...base, chunk_index: 1, final_chunk: true, persisted_members: 50,
+  })).payload).toBeDefined();
+  for (const changes of [
+    { chunk_index: 0, final_chunk: false, submitted: 0 },
+    { chunk_index: 1, final_chunk: true, persisted_members: 50, submitted: 49 },
+  ]) {
+    expect(() => parseBrowserMessage(protocolFrame("page_bulk_submit_v2_result", { ...base, ...changes }))).toThrow(ProtocolError);
+  }
+});
+
+test("counts schema negotiation accepts only the locked versions", () => {
+  for (const versions of [[1], [2], [3]]) {
+    expect(parseBrowserMessage(protocolFrame("triage_counts_request", { request_id: "request-001", schema_versions: versions })).payload).toEqual({
+      request_id: "request-001", schema_versions: versions,
+    });
+  }
+  for (const schema_versions of [[4], [3, 2]]) {
+    expect(() => parseBrowserMessage(protocolFrame("triage_counts_request", { request_id: "request-001", schema_versions }))).toThrow(ProtocolError);
+  }
+  for (const schema_versions of [[1], [2], [3], [4], [5], [4, 3], [5, 4]]) {
+    expect(parseBrowserMessage(protocolFrame("triage_snapshot_request", { request_id: "request-001", schema_versions })).payload).toEqual({
+      request_id: "request-001", schema_versions,
+    });
+  }
+  for (const schema_versions of [[6], [5, 3], [3, 4]]) {
+    expect(() => parseBrowserMessage(protocolFrame("triage_snapshot_request", { request_id: "request-001", schema_versions }))).toThrow(ProtocolError);
+  }
+});
+
+test("counts v3 fields, family runs, and required-turn item kinds are strict", () => {
+  const valid = (counts: Record<string, unknown>) => parseBrowserMessage(protocolFrame("triage_counts_response", {
+    request_id: "request-001", counts,
+  }));
+  expect(valid(countsV3()).payload).toBeDefined();
+  expect(() => valid({ ...countsV3(), turns_required: 1_000_001 })).toThrow(ProtocolError);
+  expect(() => valid({ ...countsV3(), family_runs: Array.from({ length: 129 }, (_, i) => ({ ...countsV3().family_runs instanceof Array ? (countsV3().family_runs as Array<Record<string, unknown>>)[0] : {}, run_key: `run-${i}` })) })).toThrow(ProtocolError);
+  expect(() => valid({ ...countsV3(), required_turns: Array.from({ length: 1_025 }, (_, i) => ({ ...(countsV3().required_turns as Array<Record<string, unknown>>)[0], item_id: `item-${i}` })) })).toThrow(ProtocolError);
+  for (const field of ["next_actor", "guidance_variant", "operation_variant"] as const) {
+    const counts = countsV3();
+    (counts.family_runs as Array<Record<string, unknown>>)[0]![field] = "unknown";
+    expect(() => valid(counts)).toThrow(ProtocolError);
+  }
+  const wrongItemKind = countsV3();
+  (wrongItemKind.required_turns as Array<Record<string, unknown>>)[0]!.item_kind = "other";
+  expect(() => valid(wrongItemKind)).toThrow(ProtocolError);
+  const pdf = countsV3();
+  pdf.required_turns = [{ item_id: "grab-001", item_kind: "pdf_grab", grab_id: "grab-001", route_class: "pdf_identifier_needed", dependent_jobs: 0 }];
+  pdf.turns_required = 1;
+  expect(valid(pdf).payload).toBeDefined();
+  const invalidPDF = { ...pdf, required_turns: [{ item_id: "grab-001", item_kind: "pdf_grab", grab_id: "grab-001", action_id: 1, route_class: "pdf_identifier_needed", dependent_jobs: 0 }] };
+  expect(() => valid(invalidPDF)).toThrow(ProtocolError);
+  const invalidHuman = { ...countsV3(), required_turns: [{ item_id: "action-001", item_kind: "human_action", route_class: "manual_download", dependent_jobs: 0 }] };
+  expect(() => valid(invalidHuman)).toThrow(ProtocolError);
+  const belowV3 = { ...countsV3() };
+  delete belowV3.turns_required;
+  delete belowV3.turns_working;
+  delete belowV3.family_breakdown_complete;
+  delete belowV3.family_runs;
+  delete belowV3.required_turns_complete;
+  delete belowV3.required_turns;
+  expect(valid(belowV3).payload).toBeDefined();
+  const belowV3Frame = protocolFrame("triage_snapshot_response", {
+    request_id: "request-001", schema: 2, generated_at: "2026-01-01T00:00:00Z",
+    counts: countsV3(), items: [], has_more: false, unsupported_items_count: 0,
+  });
+  expect(() => parseBrowserMessage(belowV3Frame)).toThrow(ProtocolError);
+});
+
+test("triage snapshot schema v5 quartet is all-or-none and kind-gated", () => {
+  const item: Record<string, unknown> = {
+    kind: "human_action", id: "action-001", rank: 0, title: "Download", facts: [], links: [],
+    ops: ["open", "dismiss"], attention: "required", action_id: 1, job_id: "job-0001",
+    action_kind: "manual_download", job_state: "awaiting_human", revision: 1, sha256: "", size_bytes: 0,
+    route_class: "manual_download", auth_requirement: "false",
+    run_key: "run-001", next_actor: "researcher", guidance_variant: "manual_download", operation_variant: "open_and_dismiss",
+  };
+  const response = (schema: number, itemOverride: Record<string, unknown> = {}) => protocolFrame("triage_snapshot_response", {
+    request_id: "request-001", schema, generated_at: "2026-01-01T00:00:00Z",
+    counts: { pending_total: 1, watch_hits: 0, actions: 1, retractions: 0, jobs_working: 0, jobs_needs_review: 0, failure_groups_7d: 0 },
+    items: [{ ...item, ...itemOverride }], has_more: false, unsupported_items_count: 0,
+  });
+  expect(parseBrowserMessage(response(5)).payload).toBeDefined();
+  for (const field of ["run_key", "next_actor", "guidance_variant", "operation_variant"]) {
+    const partial = { ...item };
+    delete partial[field];
+    const frame = response(5);
+    (frame.payload as Record<string, unknown>)["items"] = [partial];
+    expect(() => parseBrowserMessage(frame)).toThrow(ProtocolError);
+  }
+  expect(() => parseBrowserMessage(response(4))).toThrow(ProtocolError);
+  const watch = { kind: "watch_hit", id: "watch-001", rank: 0, title: "Watch", facts: [], links: [], ops: [], attention: "advisory",
+    work: { doi: "10.1/x", title: "Watch", authors: "A", year: 2026, is_oa: true }, abstract: "x", watches: [{ id: 1, label: "w" }], first_seen_at: "2026-01-01T00:00:00Z",
+    run_key: "run-001", next_actor: "reference", guidance_variant: "manual_download", operation_variant: "none" };
+  expect(() => parseBrowserMessage(response(5, watch))).toThrow(ProtocolError);
+  const pdfItem: Record<string, unknown> = {
+    kind: "pdf_grab", label: "Provide PDF identifier", grab: { grab_id: "grab-001", state: "awaiting_file" },
+    route_class: "pdf_identifier_needed", blocked_by: "identifier_missing", attention: "required",
+    ops: ["provide_identifier", "dismiss"], run_key: "run-001", next_actor: "researcher",
+    guidance_variant: "pdf_identifier", operation_variant: "provide_identifier_or_dismiss",
+  };
+  const pdfFrame = protocolFrame("triage_snapshot_response", {
+    request_id: "request-001", schema: 5, generated_at: "2026-01-01T00:00:00Z",
+    counts: { pending_total: 1, watch_hits: 0, actions: 0, retractions: 0, jobs_working: 0, jobs_needs_review: 0, failure_groups_7d: 0 },
+    items: [pdfItem], has_more: false, unsupported_items_count: 0,
+  });
+  expect(parseBrowserMessage(pdfFrame).payload).toBeDefined();
+  const partialPDF = { ...pdfItem };
+  delete partialPDF["operation_variant"];
+  (pdfFrame.payload as Record<string, unknown>)["items"] = [partialPDF];
+  expect(() => parseBrowserMessage(pdfFrame)).toThrow(ProtocolError);
+  const belowV5 = response(4);
+  (belowV5.payload as Record<string, unknown>)["items"] = [{ ...item }];
+  expect(() => parseBrowserMessage(belowV5)).toThrow(ProtocolError);
+});
+
+test("shared protocol validators and triage vocabularies are locked", () => {
+  expect(isBareLowercaseHTTPSOrigin("https://example.edu")).toBe(true);
+  expect(isBareLowercaseHTTPSOrigin("https://example.edu:8443")).toBe(true);
+  for (const origin of ["https://EXAMPLE.edu", "https://example.edu/path", "https://example.edu?x=1", "https://example.edu#x", "https://user@example.edu", "http://example.edu", `https://${"a".repeat(301)}`]) {
+    expect(isBareLowercaseHTTPSOrigin(origin)).toBe(false);
+  }
+  expect(isCanonicalKey("")).toBe(false);
+  expect(isCanonicalKey("key\0with-nul")).toBe(false);
+  expect(isCanonicalKey("x".repeat(301))).toBe(false);
+  expect(isCanonicalKey("x".repeat(300))).toBe(true);
+  expect(isDetectorText("")).toBe(false);
+  expect(isDetectorText("x".repeat(129))).toBe(false);
+  expect(isDetectorText("x".repeat(128))).toBe(true);
+  expect(NEXT_ACTORS).toEqual(["papio", "researcher", "reference"]);
+  expect(GUIDANCE_VARIANTS).toEqual([
+    "manual_download", "manual_download_adapter_missing", "institution_sign_in", "open_page",
+    "verify_identity", "document_delivery", "downloads_access", "terms_acceptance",
+    "security_challenge", "pdf_identifier", "papio_continuing",
+  ]);
+  expect(OPERATION_VARIANTS).toEqual([
+    "none", "dismiss_only", "open_and_dismiss", "accept_reject", "accept_reject_open",
+    "delivery_reconcile", "provide_identifier_or_dismiss",
+  ]);
 });

@@ -11,6 +11,23 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Notification routing and liveness are durable and bounded.** The daemon now
+  uses one typed notification router and durable notification ledger, with
+  migrations `0030` and `0031` (store schema version 31), independent
+  human-desktop and automation-webhook policies, and the `quiet`,
+  `milestones`, and `verbose` presets. `papio notify show|preview|test` exposes
+  the effective policy and an explicit local test; `papio pulse` and the
+  feature-gated `work.pulse_v1` read model expose the honest Moving, Scheduled,
+  Waiting, Stalled, Idle, and Unknown vocabulary. The browser bridge now
+  negotiates the four new request frames `surface_presence`,
+  `work_pulse_request`, `activity_page_request`, and
+  `page_bulk_submit_v2_request` plus their responses, each feature-gated
+  without widening older frames. Counts schema v3 and triage snapshot schema v5
+  carry daemon-owned required-turn and family-run projections. Browser and CLI
+  submissions persist durable acquisition cohorts and chunk membership rather
+  than deriving progress from telemetry. `papio doctor` reports desktop
+  notification capability explicitly; unsupported platforms and OS
+  notification outcomes are never presented as delivered.
 
 - **Direct provider PDF routes.** For delegated jobs whose provider is already
   known from resolver policy or prior browser evidence, the daemon now

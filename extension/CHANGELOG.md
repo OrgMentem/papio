@@ -17,6 +17,17 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Added
+- **The extension surfaces honest, recoverable progress.** The inbox now uses
+  action-first information architecture with one local feedback strip, and
+  hoists repeated guidance only from daemon-authored family run keys. The
+  toolbar badge counts effective required turns by default, with
+  **Decisions waiting**, **Everything pending**, and **No number** options.
+  Activity is pageable with a browser-local read watermark, while the popup
+  shows the negotiated pulse vocabulary and current-page lens. Focused popup
+  and inbox presence is sent through the privacy-minimal
+  `surface_presence_v1` hint. Page-bulk acquisition accepts 1–200 canonical
+  keys as durable cohorts, chunks them under the wire bound, and replays
+  unresolved chunks safely across worker suspension and browser restart.
 
 - **Firefox asks once before page captures leave the browser.** The Firefox
   build now declares website-content data collection (Firefox 140+ shows the

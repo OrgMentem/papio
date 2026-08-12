@@ -18,6 +18,9 @@ type Event struct {
 	WatchLabel string `json:"watch_label,omitempty"`
 	// Count is the event's primary quantity: works queued or reported.
 	Count int `json:"count,omitempty"`
+	// Detail carries producer-owned structured fields (for example all findings
+	// in one retraction scan) without changing the event kind or core fields.
+	Detail map[string]any `json:"detail,omitempty"`
 }
 
 // EventSender is optionally implemented by senders that can deliver the

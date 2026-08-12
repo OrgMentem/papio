@@ -83,7 +83,15 @@ export type BrowserMessageType =
   | "institutional_navigated_request"
   | "institutional_navigated_response"
   | "institutional_reconcile_request"
-  | "institutional_reconcile_response";
+  | "institutional_reconcile_response"
+  | "surface_presence"
+  | "surface_presence_ack"
+  | "work_pulse_request"
+  | "work_pulse_response"
+  | "activity_page_request"
+  | "activity_page_response"
+  | "page_bulk_submit_v2_request"
+  | "page_bulk_submit_v2_result";
 
 export interface HelloPayload {
   extension_version: string;
@@ -287,18 +295,94 @@ export interface TriageCounts {
   jobs_working: number;
   jobs_needs_review: number;
   failure_groups_7d: number;
+  turns_required?: number;
+  turns_working?: number;
+  family_breakdown_complete?: boolean;
+  family_runs?: TriageFamilyRun[];
+  required_turns_complete?: boolean;
+  required_turns?: TriageRequiredTurn[];
+}
+export interface TriageFamilyRun {
+  run_key: string;
+  first_rank: number;
+  route_class: string;
+  action_kind: string;
+  next_actor: string;
+  guidance_variant: string;
+  operation_variant: string;
+  count: number;
+}
+export interface TriageRequiredTurn {
+  item_id: string;
+  item_kind: "human_action" | "pdf_grab";
+  action_id?: number;
+  job_id?: string;
+  grab_id?: string;
+  route_class: string;
+  gate_claim_id?: string;
+  dependent_jobs: number;
+}
+export type TriageNextActor = "papio" | "researcher" | "reference";
+export const NEXT_ACTORS = ["papio", "researcher", "reference"] as const;
+export const GUIDANCE_VARIANTS = [
+  "manual_download", "manual_download_adapter_missing", "institution_sign_in",
+  "open_page", "verify_identity", "document_delivery", "downloads_access",
+  "terms_acceptance", "security_challenge", "pdf_identifier", "papio_continuing",
+] as const;
+export const OPERATION_VARIANTS = [
+  "none", "dismiss_only", "open_and_dismiss", "accept_reject",
+  "accept_reject_open", "delivery_reconcile", "provide_identifier_or_dismiss",
+] as const;
+
+export interface SurfacePresencePayload {
+  request_id: string; instance_id: string; surface: "popup" | "inbox"; focused: boolean; at: string;
+}
+export interface SurfacePresenceAckPayload { request_id: string; accepted: boolean; }
+export interface WorkPulseRequestPayload { request_id: string; schema_versions: [1]; }
+export interface WorkPulseCapacity { busy: number; limit: number; waiting?: number; }
+export interface WorkPulseHumanSurfaceCapacity { busy: number; limit: number; waiting_claims: number; }
+export interface WorkPulseStallEpisode { episode_key: string; cause_kind: string; public_label: string; since: string; count: number; }
+export interface WorkPulseNextAction { at: string; kind: "retry" | "delivery_poll" | "source_gate"; source?: string; count?: number; }
+export interface WorkPulseGate { kind: "source_budget"; source: string; until: string; count: number; }
+export interface WorkPulseLatestBatch {
+  batch_id: string; label?: string; started_at: string; settled_at?: string;
+  membership: "open" | "complete" | "partial"; projection_complete?: boolean;
+  total?: number; settled?: number; nonterminal_total?: number; in_flight?: number;
+  scheduled?: number; continuing?: number; waiting_required?: number; stalled?: number; unavailable?: number;
+}
+export interface WorkPulseResponsePayload {
+  request_id: string; schema: 1; generated_at: string; nonterminal_total?: number;
+  projection_complete?: boolean; in_flight?: number; scheduled?: number; waiting_required?: number;
+  continuing?: number; stalled?: number; effect_capacity?: WorkPulseCapacity;
+  human_surface_capacity?: WorkPulseHumanSurfaceCapacity; last_forward_at?: string;
+  stall_episodes?: WorkPulseStallEpisode[]; stall_episodes_truncated?: boolean; last_finished_at?: string;
+  next_action?: WorkPulseNextAction; gates?: WorkPulseGate[]; gates_truncated?: boolean; latest_batch?: WorkPulseLatestBatch;
+}
+export interface ActivityPageRequestPayload { request_id: string; limit?: number; before_seq?: string; seen_through_seq?: string; }
+export interface ActivityPageResponsePayload {
+  request_id: string; generated_at: string; entries: ActivityEntryPayload[]; has_more: boolean;
+  cursor?: string; latest_seq: number; new_count_since?: number; gap?: boolean;
+}
+export interface PageBulkSubmitV2RequestPayload {
+  request_id: string; scan_id: string; cohort_id: string; source: PageBulkSubmitSource;
+  cohort_total: number; chunk_index: number; final_chunk: boolean; canonical_keys: string[];
+}
+export interface PageBulkSubmitV2ResultPayload {
+  request_id: string; scan_id: string; cohort_id: string; chunk_index: number; final_chunk: boolean;
+  batch_id: string; membership: "open" | "complete" | "partial"; cohort_total?: number;
+  persisted_members: number; submitted: number; joined: number; already_owned: number; invalid: number;
 }
 
 export interface TriageSnapshotRequestPayload {
   request_id: string;
-  schema_versions: [1] | [2] | [3] | [4] | [4, 3];
+  schema_versions: [1] | [2] | [3] | [4] | [5] | [4, 3] | [5, 4];
   limit?: number;
   cursor?: string;
 }
 
 export interface TriageSnapshotResponsePayload {
   request_id: string;
-  schema: 1 | 2 | 3 | 4;
+  schema: 1 | 2 | 3 | 4 | 5;
   generated_at: string;
   counts: TriageCounts;
   items: TriageSnapshotItem[];
@@ -370,8 +454,11 @@ export interface TriageSnapshotItem {
    * requires_auth stays the narrow execution gate; only this may drive
    * presentation copy. */
   auth_requirement?: "true" | "false" | "unknown";
-  /** Present only on a document_delivery human_action item (schema 3). */
   delivery?: TriageDelivery;
+  run_key?: string;
+  next_actor?: TriageNextActor;
+  guidance_variant?: typeof GUIDANCE_VARIANTS[number];
+  operation_variant?: typeof OPERATION_VARIANTS[number];
   doi?: string;
   label?: string;
   grab?: {
@@ -393,10 +480,9 @@ export interface TriageDelivery {
   provider_reference?: string;
   state: "offered" | "submitted" | "pending" | "fulfilled" | "declined" | "cancelled" | "unknown_outcome";
 }
-
 export interface TriageCountsRequestPayload {
   request_id: string;
-  schema_versions?: [1] | [2];
+  schema_versions?: [1] | [2] | [3];
 }
 
 export interface TriageCountsResponsePayload {
@@ -848,6 +934,14 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   institutional_navigated_response: true,
   institutional_reconcile_request: true,
   institutional_reconcile_response: true,
+  surface_presence: true,
+  surface_presence_ack: true,
+  work_pulse_request: true,
+  work_pulse_response: true,
+  activity_page_request: true,
+  activity_page_response: true,
+  page_bulk_submit_v2_request: true,
+  page_bulk_submit_v2_result: true,
 };
 
 const JOB_SCOPED: Record<string, true> = {
@@ -892,11 +986,11 @@ const OUTCOMES: Record<string, true> = {
 };
 
 const MSG_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const WIRE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const CLIENT_FEATURE_RE = /^[a-z0-9_]+$/;
 const JOB_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
-// ZOTERO_KEY_RE must stay byte-identical to zoteroKeyRE in
-// internal/protocol/protocol.go.
 const ZOTERO_KEY_RE = /^[A-Za-z0-9]{1,32}$/;
+const utf8ByteLength = (value: string): number => new TextEncoder().encode(value).byteLength;
 const HOST_RE = /^[a-z0-9.-]{3,253}$/;
 // ORIGIN_HOST_RE is the resolver-origin host grammar used ONLY by
 // session_evidence.origin_hint (see the validation block below for why it
@@ -910,6 +1004,22 @@ const HOST_RE = /^[a-z0-9.-]{3,253}$/;
 const ORIGIN_HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
 const ERROR_CODE_RE = /^[a-z0-9_]{2,50}$/;
 const FILENAME_RE = /^[^/\\]{1,255}$/u;
+export function isBareLowercaseHTTPSOrigin(value: string): boolean {
+  if (typeof value !== "string" || new TextEncoder().encode(value).byteLength > 300 || !value.startsWith("https://")) return false;
+  const rest = value.slice("https://".length);
+  const match = /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*)((?::[0-9]{1,5})?)$/.exec(rest);
+  return match !== null && !rest.includes("/") && !rest.includes("?") && !rest.includes("#") && !rest.includes("@");
+}
+// Canonical keys are opaque daemon-provided identifiers. This predicate only
+// enforces bounded, NUL-free text; URL/privacy provenance comes from that
+// validated upstream response, not from this local shape check.
+export function isCanonicalKey(value: string): boolean {
+  return typeof value === "string" && value.length > 0 && !value.includes("\0") && Array.from(value).length <= 300;
+}
+export function isDetectorText(value: string): boolean {
+  return typeof value === "string" && Array.from(value).length >= 1 && Array.from(value).length <= 128 &&
+    !Array.from(value).some((char) => /\p{Cc}/u.test(char));
+}
 const RFC3339_RE =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/;
 const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -1063,35 +1173,98 @@ function triageURL(value: string, what: string, scheme: "http:" | "https:"): URL
   }
 }
 
-function triageCounts(raw: unknown, what: string, allowAuth = false, additionalPending = 0, allowPartial = false): void {
+function triageCounts(raw: unknown, what: string, allowAuth = false, additionalPending = 0, allowPartial = false, allowV3 = false): void {
   const counts = asRecord(raw, what);
-  const fields = [
-    "pending_total",
-    "watch_hits",
-    "actions",
-    "retractions",
-    "jobs_working",
-    "jobs_needs_review",
-    "failure_groups_7d",
-  ];
+  const fields = ["pending_total", "watch_hits", "actions", "retractions", "jobs_working", "jobs_needs_review", "failure_groups_7d"];
   requireFields<TriageCounts>(counts, what, {
-    pending_total: "required",
-    watch_hits: "required",
-    actions: "required",
-    actions_requires_auth: allowAuth ? "optional" : "forbidden",
-    retractions: "required",
-    jobs_working: "required",
-    jobs_needs_review: "required",
-    failure_groups_7d: "required",
+    pending_total: "required", watch_hits: "required", actions: "required",
+    actions_requires_auth: allowAuth ? "optional" : "forbidden", retractions: "required",
+    jobs_working: "required", jobs_needs_review: "required", failure_groups_7d: "required",
+    turns_required: allowV3 ? "optional" : "forbidden", turns_working: allowV3 ? "optional" : "forbidden",
+    family_breakdown_complete: allowV3 ? "optional" : "forbidden", family_runs: allowV3 ? "optional" : "forbidden",
+    required_turns_complete: allowV3 ? "optional" : "forbidden", required_turns: allowV3 ? "optional" : "forbidden",
   });
   const pending = int(counts, "pending_total", what, 0);
   const visible = int(counts, "watch_hits", what, 0) + int(counts, "actions", what, 0) + int(counts, "retractions", what, 0);
   const expected = visible + additionalPending;
-  if (allowPartial ? pending < expected : pending !== expected) {
-    fail(`${what}.pending_total must ${allowPartial ? "be at least" : "equal"} visible items plus pdf grabs`);
-  }
+  if (allowPartial ? pending < expected : pending !== expected) fail(`${what}.pending_total must ${allowPartial ? "be at least" : "equal"} visible items plus pdf grabs`);
   for (const key of fields.slice(4)) int(counts, key, what, 0);
   if (allowAuth && "actions_requires_auth" in counts) int(counts, "actions_requires_auth", what, 0);
+  for (const key of ["turns_required", "turns_working"] as const) {
+    if (key in counts) {
+      const value = int(counts, key, what, 0);
+      if (value > 1_000_000) fail(`${what}.${key} exceeds 1000000`);
+    }
+  }
+  if ("family_breakdown_complete" in counts && typeof counts["family_breakdown_complete"] !== "boolean") {
+    fail(`${what}.family_breakdown_complete must be boolean`);
+  }
+  if ("required_turns_complete" in counts && typeof counts["required_turns_complete"] !== "boolean") {
+    fail(`${what}.required_turns_complete must be boolean`);
+  }
+  if ("family_runs" in counts) {
+    const runs = counts["family_runs"];
+    if (!Array.isArray(runs) || runs.length > 128) fail(`${what}.family_runs invalid`);
+    const seen = new Set<string>();
+    let previousRank = -1;
+    let previousKey = "";
+    let total = 0;
+    for (const rawRun of runs as unknown[]) {
+      const run = asRecord(rawRun, `${what}.family_runs`);
+      requireFields<TriageFamilyRun>(run, `${what}.family_runs`, {
+        run_key: "required", first_rank: "required", route_class: "required", action_kind: "required",
+        next_actor: "required", guidance_variant: "required", operation_variant: "required", count: "required",
+      });
+      const runKey = triageText(run, "run_key", `${what}.family_runs`, 64);
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(runKey) || seen.has(runKey)) fail(`${what}.family_runs run_key invalid/duplicate`);
+      seen.add(runKey);
+      const firstRank = int(run, "first_rank", `${what}.family_runs`, 0);
+      const count = int(run, "count", `${what}.family_runs`, 1);
+      if (count > 1_000_000) fail(`${what}.family_runs count exceeds 1000000`);
+      if (firstRank < previousRank || (firstRank === previousRank && runKey < previousKey)) fail(`${what}.family_runs must be ordered`);
+      previousRank = firstRank;
+      previousKey = runKey;
+      if (!(TRIAGE_ROUTE_CLASSES_V5 as readonly string[]).includes(triageText(run, "route_class", `${what}.family_runs`, 100))) fail(`${what}.family_runs route_class invalid`);
+      if (!(NEXT_ACTORS as readonly string[]).includes(triageText(run, "next_actor", `${what}.family_runs`, 20))) fail(`${what}.family_runs next_actor invalid`);
+      if (!(GUIDANCE_VARIANTS as readonly string[]).includes(triageText(run, "guidance_variant", `${what}.family_runs`, 100))) fail(`${what}.family_runs guidance_variant invalid`);
+      if (!(OPERATION_VARIANTS as readonly string[]).includes(triageText(run, "operation_variant", `${what}.family_runs`, 100))) fail(`${what}.family_runs operation_variant invalid`);
+      triageText(run, "action_kind", `${what}.family_runs`, 100);
+      total += count;
+    }
+    if (counts["family_breakdown_complete"] === true && "turns_required" in counts && "turns_working" in counts && total !== (counts["turns_required"] as number) + (counts["turns_working"] as number)) {
+      fail(`${what}.family_runs totals mismatch`);
+    }
+  }
+  if ("required_turns" in counts) {
+    const turns = counts["required_turns"];
+    if (!Array.isArray(turns) || turns.length > 1024) fail(`${what}.required_turns invalid`);
+    const seen = new Set<string>();
+    for (const rawTurn of turns as unknown[]) {
+      const turn = asRecord(rawTurn, `${what}.required_turns`);
+      requireFields<TriageRequiredTurn>(turn, `${what}.required_turns`, {
+        item_id: "required", item_kind: "required", action_id: "optional", job_id: "optional",
+        grab_id: "optional", route_class: "required", gate_claim_id: "optional", dependent_jobs: "required",
+      });
+      // item_id IS the snapshot row id ("action:7", "pdf_grab:<id>"), so it
+      // follows the snapshot's bounded-text rule, not the stricter
+      // ASCII-identifier rule used for daemon-minted opaque ids.
+      const itemID = triageText(turn, "item_id", `${what}.required_turns`, 1024);
+      if (itemID === "" || seen.has(itemID)) fail(`${what}.required_turns item_id invalid/duplicate`);
+      seen.add(itemID);
+      const itemKind = triageText(turn, "item_kind", `${what}.required_turns`, 20);
+      if (!(itemKind === "human_action" || itemKind === "pdf_grab")) fail(`${what}.required_turns item_kind invalid`);
+      const dependent = int(turn, "dependent_jobs", `${what}.required_turns`, 0);
+      if (itemKind === "human_action") {
+        if (!("action_id" in turn) || "grab_id" in turn || !("job_id" in turn)) fail(`${what}.required_turns human_action fields invalid`);
+        int(turn, "action_id", `${what}.required_turns`, 1);
+        if (!JOB_ID_RE.test(triageText(turn, "job_id", `${what}.required_turns`, 128))) fail(`${what}.required_turns job_id invalid`);
+      } else {
+        if ("action_id" in turn || "job_id" in turn || "gate_claim_id" in turn || !("grab_id" in turn) || dependent !== 0) fail(`${what}.required_turns pdf_grab fields invalid`);
+        if (!WIRE_ID_RE.test(triageText(turn, "grab_id", `${what}.required_turns`, 64))) fail(`${what}.required_turns grab_id invalid`);
+      }
+      if ("gate_claim_id" in turn && !WIRE_ID_RE.test(triageText(turn, "gate_claim_id", `${what}.required_turns`, 64))) fail(`${what}.required_turns gate_claim_id invalid`);
+    }
+  }
 }
 const ROUTE_CLASSES = [
   "openurl_handoff",
@@ -1103,19 +1276,32 @@ const ROUTE_CLASSES = [
   "document_delivery",
   "downloads_access_required",
 ];
+export const TRIAGE_ROUTE_CLASSES_V5 = [...ROUTE_CLASSES, "pdf_identifier_needed"] as const;
 
 // blockedByV2 is schema 2's exact closed set, shipped and locked: a
 // schema-2 frame must never carry a value outside it. blockedByV3 is
 // schema 3's strict superset; identifier_missing is reserved for v4 grabs.
 const BLOCKED_BY_V2 = ["anti_bot", "paywall", "landing_page"];
 const BLOCKED_BY_V3 = [...BLOCKED_BY_V2, "login", "terms", "delivery_outcome", "identity_review", "unknown"];
-
-function triageItem(raw: unknown, schema: 1 | 2 | 3 | 4): void {
+function triageItem(raw: unknown, schema: 1 | 2 | 3 | 4 | 5): void {
   const item = asRecord(raw, "triage item");
   const kind = triageText(item, "kind", "triage item", 50);
+  const quartet = ["run_key", "next_actor", "guidance_variant", "operation_variant"];
+  const presentQuartet = quartet.filter((key) => key in item).length;
+  if (schema < 5 && presentQuartet > 0) fail("triage row family quartet requires triage-snapshot/5");
+  if (presentQuartet > 0 && (kind === "watch_hit" || kind === "retraction")) fail("triage row family quartet is not valid for this item kind");
+  if (presentQuartet !== 0 && presentQuartet !== 4) fail("triage row family quartet must be complete");
+  if (presentQuartet === 4) {
+    const runKey = triageText(item, "run_key", "triage item", 64);
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(runKey)) fail("triage item.run_key is invalid");
+    if (!(NEXT_ACTORS as readonly string[]).includes(triageText(item, "next_actor", "triage item", 20))) fail("triage item.next_actor is invalid");
+    if (!(GUIDANCE_VARIANTS as readonly string[]).includes(triageText(item, "guidance_variant", "triage item", 100))) fail("triage item.guidance_variant is invalid");
+    if (!(OPERATION_VARIANTS as readonly string[]).includes(triageText(item, "operation_variant", "triage item", 100))) fail("triage item.operation_variant is invalid");
+  }
   if (kind === "pdf_grab") {
-    if (schema !== 4) fail("pdf_grab items require triage-snapshot/4");
-    requireKeys(item, "triage item pdf_grab", ["kind", "label", "grab", "route_class", "blocked_by", "attention", "ops"]);
+    if (schema !== 4 && schema !== 5) fail("pdf_grab items require triage-snapshot/4 or /5");
+    const pdfOptional = schema >= 5 ? quartet : [];
+    requireKeys(item, "triage item pdf_grab", ["kind", "label", "grab", "route_class", "blocked_by", "attention", "ops"], pdfOptional);
     triageText(item, "label", "triage item pdf_grab", 500);
     const grab = asRecord(item["grab"], "triage item pdf_grab.grab");
     requireKeys(grab, "triage item pdf_grab.grab", ["grab_id", "state"]);
@@ -1148,15 +1334,15 @@ function triageItem(raw: unknown, schema: 1 | 2 | 3 | 4): void {
     default:
       fail(`unsupported triage item kind ${JSON.stringify(kind)}`);
   }
-  // attention is required on every schema-3 item and forbidden below;
   // route_class/auth_requirement are required on schema-3 human_action
   // items and forbidden below (triage-snapshot/3). Putting them in the
   // required list for schema 3 and leaving them out entirely otherwise
-  // makes requireKeys enforce both directions: present-and-required, or
-  // absent-because-unknown-field.
   if (schema >= 3) {
     extra = [...extra, "attention"];
     if (kind === "human_action") extra = [...extra, "route_class", "auth_requirement"];
+  }
+  if (schema >= 5 && kind === "human_action") {
+    extra = [...extra, "run_key", "next_actor", "guidance_variant", "operation_variant"];
   }
   const optional =
     kind === "human_action" && schema >= 2
@@ -1368,6 +1554,154 @@ export function parseBrowserMessageBytes(text: string): BrowserMessage {
 
 function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): void {
   switch (type) {
+    case "surface_presence": {
+      requireFields<SurfacePresencePayload>(p, type, { request_id: "required", instance_id: "required", surface: "required", focused: "required", at: "required" });
+      correlationID(p, "request_id", type);
+      const instance = str(p, "instance_id", type, 64);
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(instance)) fail(`${type}.instance_id invalid`);
+      const surface = str(p, "surface", type, 10);
+      if (surface !== "popup" && surface !== "inbox") fail(`${type}.surface invalid`);
+      if (typeof p["focused"] !== "boolean") fail(`${type}.focused must be boolean`);
+      triageTime(p, "at", type);
+      break;
+    }
+    case "surface_presence_ack": {
+      requireFields<SurfacePresenceAckPayload>(p, type, { request_id: "required", accepted: "required" });
+      correlationID(p, "request_id", type);
+      if (typeof p["accepted"] !== "boolean") fail(`${type}.accepted must be boolean`);
+      break;
+    }
+    case "work_pulse_request": {
+      requireFields<WorkPulseRequestPayload>(p, type, { request_id: "required", schema_versions: "required" });
+      correlationID(p, "request_id", type);
+      const versions = p["schema_versions"];
+      if (!Array.isArray(versions) || versions.length !== 1 || versions[0] !== 1) fail(`${type}.schema_versions must be [1]`);
+      break;
+    }
+    case "work_pulse_response": {
+      requireFields<WorkPulseResponsePayload>(p, type, {
+        request_id: "required", schema: "required", generated_at: "required", nonterminal_total: "optional",
+        projection_complete: "optional", in_flight: "optional", scheduled: "optional", waiting_required: "optional",
+        continuing: "optional", stalled: "optional", effect_capacity: "optional", human_surface_capacity: "optional",
+        last_forward_at: "optional", stall_episodes: "optional", stall_episodes_truncated: "optional",
+        last_finished_at: "optional", next_action: "optional", gates: "optional", gates_truncated: "optional", latest_batch: "optional",
+      });
+      correlationID(p, "request_id", type);
+      if (p["schema"] !== 1) fail(`${type}.schema must be 1`);
+      triageTime(p, "generated_at", type);
+      const pulseCount = (key: string): number | undefined => {
+        if (!(key in p)) return undefined;
+        const value = int(p, key, type, 0);
+        if (value > 1_000_000) fail(`${type}.${key} exceeds 1000000`);
+        return value;
+      };
+      const pulseInt = (obj: Record<string, unknown>, key: string, what: string, min: number) => {
+        const value = int(obj, key, what, min);
+        if (value > 1_000_000) fail(`${what}.${key} exceeds 1000000`);
+        return value;
+      };
+      const counts = ["nonterminal_total", "in_flight", "scheduled", "waiting_required", "continuing", "stalled"].map(pulseCount);
+      if (p["projection_complete"] === true) {
+        if (counts[0] === undefined || counts.slice(1).some((v) => v === undefined)) fail(`${type} complete projection requires all buckets`);
+        if (counts.slice(1).reduce<number>((a, b) => a + (b ?? 0), 0) !== counts[0]) fail(`${type} bucket sum mismatch`);
+      } else if ("projection_complete" in p && typeof p["projection_complete"] !== "boolean") fail(`${type}.projection_complete must be boolean`);
+      if ("effect_capacity" in p) {
+        const cap = asRecord(p["effect_capacity"], `${type}.effect_capacity`);
+        requireFields<WorkPulseCapacity>(cap, `${type}.effect_capacity`, { busy: "required", limit: "required", waiting: "optional" });
+        const busy = pulseInt(cap, "busy", `${type}.effect_capacity`, 0), limit = pulseInt(cap, "limit", `${type}.effect_capacity`, 0);
+        if ("waiting" in cap) pulseInt(cap, "waiting", `${type}.effect_capacity`, 0);
+        if (busy > limit) fail(`${type}.effect_capacity.busy exceeds limit`);
+      }
+      if ("human_surface_capacity" in p) {
+        const cap = asRecord(p["human_surface_capacity"], `${type}.human_surface_capacity`);
+        requireFields<WorkPulseHumanSurfaceCapacity>(cap, `${type}.human_surface_capacity`, { busy: "required", limit: "required", waiting_claims: "required" });
+        const busy = pulseInt(cap, "busy", `${type}.human_surface_capacity`, 0), limit = pulseInt(cap, "limit", `${type}.human_surface_capacity`, 0);
+        pulseInt(cap, "waiting_claims", `${type}.human_surface_capacity`, 0);
+        if (busy > limit) fail(`${type}.human_surface_capacity.busy exceeds limit`);
+      }
+      for (const key of ["last_forward_at", "last_finished_at"]) if (key in p) triageTime(p, key, type);
+      if (counts[0] !== undefined) {
+        for (const value of counts.slice(1)) if (value !== undefined && value > counts[0]!) fail(`${type} bucket exceeds nonterminal_total`);
+      }
+      let stallEpisodesLength = 0;
+      if ("stall_episodes" in p) {
+        const episodes = p["stall_episodes"];
+        if (!Array.isArray(episodes) || episodes.length > 16) fail(`${type}.stall_episodes must have at most 16 entries`);
+        const seen = new Set<string>(); let previousTime = Number.NEGATIVE_INFINITY; let previousKey = "";
+        let sum = 0;
+        for (const raw of episodes as unknown[]) {
+          const episode = asRecord(raw, `${type}.stall_episodes`);
+          requireFields<WorkPulseStallEpisode>(episode, `${type}.stall_episodes`, { episode_key: "required", cause_kind: "required", public_label: "required", since: "required", count: "required" });
+          const key = str(episode, "episode_key", type, 64);
+          if (!/^[A-Za-z0-9_-]{1,64}$/.test(key) || seen.has(key)) fail(`${type}.stall_episodes duplicate/invalid key`);
+          seen.add(key);
+          const since = triageTime(episode, "since", type); const sinceTime = Date.parse(since);
+          if (sinceTime < previousTime || (sinceTime === previousTime && key < previousKey)) fail(`${type}.stall_episodes must be ordered`);
+          previousTime = sinceTime; previousKey = key;
+          const cause = str(episode, "cause_kind", type, 64);
+          if (!["execution_lease_overdue", "browser_session_unavailable", "source_state_unclassified", "delivery_poll_overdue", "cohort_projection_failed"].includes(cause)) fail(`${type}.stall_episodes cause invalid`);
+          const label = str(episode, "public_label", type, 64); if (utf8ByteLength(label) < 1 || utf8ByteLength(label) > 64 || Array.from(label).some((c) => /\p{Cc}/u.test(c))) fail(`${type}.stall_episodes label invalid`);
+          const count = pulseInt(episode, "count", type, 1); sum += count;
+        }
+        stallEpisodesLength = episodes.length;
+        if ("stall_episodes_truncated" in p && typeof p["stall_episodes_truncated"] !== "boolean") fail(`${type}.stall_episodes_truncated must be boolean`);
+        if (counts[5] !== undefined && p["stall_episodes_truncated"] === false && sum !== counts[5]) fail(`${type}.stall episode sum mismatch`);
+        if (counts[5] !== undefined && p["stall_episodes_truncated"] === true && sum > counts[5]) fail(`${type}.stall episode sum exceeds stalled`);
+      }
+      if (counts[5] !== undefined && counts[5]! > 0 && stallEpisodesLength === 0) fail(`${type}.stalled requires an episode`);
+      if ("next_action" in p) {
+        const action = asRecord(p["next_action"], `${type}.next_action`);
+        requireFields<WorkPulseNextAction>(action, `${type}.next_action`, { at: "required", kind: "required", source: "optional", count: "optional" });
+        triageTime(action, "at", type); if (!["retry", "delivery_poll", "source_gate"].includes(str(action, "kind", type, 20))) fail(`${type}.next_action.kind invalid`);
+        if ("source" in action && (utf8ByteLength(str(action, "source", type, 64)) === 0 || utf8ByteLength(str(action, "source", type, 64)) > 64 || /\p{Cc}/u.test(str(action, "source", type, 64)))) fail(`${type}.next_action.source invalid`);
+        if ("count" in action) pulseInt(action, "count", type, 0);
+      }
+      if ("gates" in p) {
+        const gates = p["gates"]; if (!Array.isArray(gates) || gates.length > 16) fail(`${type}.gates must have at most 16 entries`);
+        const seen = new Set<string>();
+        for (const raw of gates as unknown[]) {
+          const gate = asRecord(raw, `${type}.gates`); requireFields<WorkPulseGate>(gate, `${type}.gates`, { kind: "required", source: "required", until: "required", count: "required" });
+          if (str(gate, "kind", type, 30) !== "source_budget") fail(`${type}.gates.kind invalid`);
+          const source = str(gate, "source", type, 64); if (utf8ByteLength(source) === 0 || utf8ByteLength(source) > 64 || /\p{Cc}/u.test(source) || seen.has(`source_budget\0${source}`)) fail(`${type}.gates source invalid/duplicate`); seen.add(`source_budget\0${source}`);
+          triageTime(gate, "until", type); pulseInt(gate, "count", type, 0);
+        }
+      }
+      if ("latest_batch" in p) {
+        const batch = asRecord(p["latest_batch"], `${type}.latest_batch`);
+        requireFields<WorkPulseLatestBatch>(batch, `${type}.latest_batch`, {
+          batch_id: "required", label: "optional", started_at: "required", settled_at: "optional", membership: "required", projection_complete: "optional",
+          total: "optional", settled: "optional", nonterminal_total: "optional", in_flight: "optional", scheduled: "optional", continuing: "optional",
+          waiting_required: "optional", stalled: "optional", unavailable: "optional",
+        });
+        const batchID = str(batch, "batch_id", type, 64);
+        if (!WIRE_ID_RE.test(batchID)) fail(`${type}.latest_batch.batch_id invalid`);
+        triageTime(batch, "started_at", type); if ("settled_at" in batch) triageTime(batch, "settled_at", type);
+        if ("label" in batch) {
+          const label = str(batch, "label", type, 256);
+          if (utf8ByteLength(label) > 256 || /\p{Cc}/u.test(label)) fail(`${type}.latest_batch.label invalid`);
+        }
+        if ("projection_complete" in batch && typeof batch["projection_complete"] !== "boolean") fail(`${type}.latest_batch.projection_complete must be boolean`);
+        const membership = str(batch, "membership", type, 20);
+        if (!["open", "complete", "partial"].includes(membership)) fail(`${type}.latest_batch.membership invalid`);
+        if (membership === "partial" && "total" in batch) fail(`${type}.latest_batch partial membership cannot include total`);
+        const batchCounts = ["total", "settled", "nonterminal_total", "in_flight", "scheduled", "continuing", "waiting_required", "stalled", "unavailable"];
+        for (const key of batchCounts) if (key in batch) pulseInt(batch, key, type, 0);
+        if ("unavailable" in batch && "settled" in batch && (batch["unavailable"] as number) > (batch["settled"] as number)) fail(`${type}.latest_batch.unavailable exceeds settled`);
+        if ("total" in batch) {
+          for (const key of ["settled", "nonterminal_total", "in_flight", "scheduled", "continuing", "waiting_required", "stalled"]) {
+            if (key in batch && (batch[key] as number) > (batch["total"] as number)) fail(`${type}.latest_batch.${key} exceeds total`);
+          }
+        }
+        if (membership === "complete" && batch["projection_complete"] === true) {
+          if (!["total", "settled", "nonterminal_total", "in_flight", "scheduled", "continuing", "waiting_required", "stalled"].every((key) => key in batch)) fail(`${type}.latest_batch complete projection incomplete`);
+          if ((batch["settled"] as number) + (batch["nonterminal_total"] as number) !== batch["total"]) fail(`${type}.latest_batch total mismatch`);
+          const sum = ["in_flight", "continuing", "scheduled", "waiting_required", "stalled"].reduce((n, key) => n + (batch[key] as number), 0);
+          if (sum !== batch["nonterminal_total"]) fail(`${type}.latest_batch bucket mismatch`);
+        }
+      }
+      if (utf8ByteLength(JSON.stringify(p)) > 32 * 1024) fail(`${type} exceeds 32 KiB`);
+      break;
+    }
     case "hello": {
       requireFields<HelloPayload>(p, "hello", {
         extension_version: "required",
@@ -1754,7 +2088,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if ("adapter_version" in p) str(p, "adapter_version", "provider_outcome", 50);
       if ("detail" in p) str(p, "detail", "provider_outcome", 500);
       break;
-      }
+    }
     case "provider_direct_get_request": {
       requireFields<ProviderDirectGetRequestPayload>(p, "provider_direct_get_request", {
         drive_attempt_id: "required", ordinal: "required", route_revision: "required",
@@ -1947,11 +2281,11 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       if (
         !Array.isArray(versions) ||
         !(
-          (versions.length === 1 && (versions[0] === 1 || versions[0] === 2 || versions[0] === 3 || versions[0] === 4)) ||
-          (versions.length === 2 && versions[0] === 4 && versions[1] === 3)
+          (versions.length === 1 && (versions[0] === 1 || versions[0] === 2 || versions[0] === 3 || versions[0] === 4 || versions[0] === 5)) ||
+          (versions.length === 2 && ((versions[0] === 4 && versions[1] === 3) || (versions[0] === 5 && versions[1] === 4)))
         )
       ) {
-        fail("triage_snapshot_request.schema_versions must be [1], [2], [3], [4], or [4,3]");
+        fail("triage_snapshot_request.schema_versions invalid");
       }
       if ("limit" in p) int(p, "limit", "triage_snapshot_request", 1);
       if ("limit" in p && (p["limit"] as number) > 100) fail("triage_snapshot_request.limit must be <= 100");
@@ -1970,13 +2304,13 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         unsupported_items_count: "required",
       });
       correlationID(p, "request_id", "triage_snapshot_response");
-      if (p["schema"] !== 1 && p["schema"] !== 2 && p["schema"] !== 3 && p["schema"] !== 4) fail("triage_snapshot_response.schema must be 1, 2, 3, or 4");
-      const schema = p["schema"] as 1 | 2 | 3 | 4;
+      if (p["schema"] !== 1 && p["schema"] !== 2 && p["schema"] !== 3 && p["schema"] !== 4 && p["schema"] !== 5) fail("triage_snapshot_response.schema invalid");
+      const schema = p["schema"] as 1 | 2 | 3 | 4 | 5;
       const items = p["items"];
       if (!Array.isArray(items) || items.length > 100) fail("triage_snapshot_response.items must have at most 100 entries");
-      const pdfGrabCount = schema === 4 ? items.filter((item) => typeof item === "object" && item !== null && (item as Record<string, unknown>)["kind"] === "pdf_grab").length : 0;
-      const allowFloor = schema === 4;
-      triageCounts(p["counts"], "triage_snapshot_response.counts", false, pdfGrabCount, allowFloor);
+      const pdfGrabCount = schema === 4 || schema === 5 ? items.filter((item) => typeof item === "object" && item !== null && (item as Record<string, unknown>)["kind"] === "pdf_grab").length : 0;
+      const allowFloor = schema === 4 || schema === 5;
+      triageCounts(p["counts"], "triage_snapshot_response.counts", false, pdfGrabCount, allowFloor, schema >= 3);
       for (const item of items) triageItem(item, schema);
       if (typeof p["has_more"] !== "boolean") fail("triage_snapshot_response.has_more must be boolean");
       int(p, "unsupported_items_count", "triage_snapshot_response", 0);
@@ -1993,8 +2327,8 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       correlationID(p, "request_id", "triage_counts_request");
       if ("schema_versions" in p) {
         const versions = p["schema_versions"];
-        if (!Array.isArray(versions) || versions.length !== 1 || (versions[0] !== 1 && versions[0] !== 2)) {
-          fail("triage_counts_request.schema_versions must be [1] or [2]");
+        if (!Array.isArray(versions) || versions.length !== 1 || (versions[0] !== 1 && versions[0] !== 2 && versions[0] !== 3)) {
+          fail("triage_counts_request.schema_versions must be [1], [2], or [3]");
         }
       }
       break;
@@ -2002,7 +2336,7 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
     case "triage_counts_response": {
       requireFields<TriageCountsResponsePayload>(p, "triage_counts_response", { request_id: "required", counts: "required" });
       correlationID(p, "request_id", "triage_counts_response");
-      triageCounts(p["counts"], "triage_counts_response.counts", true);
+      triageCounts(p["counts"], "triage_counts_response.counts", true, 0, false, true);
       break;
     }
     case "triage_decide": {
@@ -2178,6 +2512,41 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       }
       break;
     }
+    case "activity_page_request": {
+      requireFields<ActivityPageRequestPayload>(p, type, { request_id: "required", limit: "optional", before_seq: "optional", seen_through_seq: "optional" });
+      correlationID(p, "request_id", type);
+      if ("limit" in p) { const limit = int(p, "limit", type, 1); if (limit > 50) fail(`${type}.limit must be 1..50`); }
+      for (const key of ["before_seq", "seen_through_seq"]) if (key in p && !/^[0-9]+$/.test(str(p, key, type, 64))) fail(`${type}.${key} invalid`);
+      break;
+    }
+    case "activity_page_response": {
+      requireFields<ActivityPageResponsePayload>(p, type, { request_id: "required", generated_at: "required", entries: "required", has_more: "required", cursor: "optional", latest_seq: "required", new_count_since: "optional", gap: "optional" });
+      correlationID(p, "request_id", type);
+      triageTime(p, "generated_at", type);
+      if (typeof p["has_more"] !== "boolean") fail(`${type}.has_more must be boolean`);
+      const entries = p["entries"]; if (!Array.isArray(entries) || entries.length > 50) fail(`${type}.entries must have at most 50 entries`);
+      for (const rawEntry of entries as unknown[]) {
+        const entry = asRecord(rawEntry, `${type}.entry`);
+        requireFields<ActivityEntryPayload>(entry, `${type}.entry`, {
+          seq: "required", at: "required", job_id: "optional", kind: "required", text: "required", title: "optional",
+        });
+        int(entry, "seq", `${type}.entry`, 0);
+        triageTime(entry, "at", `${type}.entry`);
+        if ("job_id" in entry && !JOB_ID_RE.test(str(entry, "job_id", `${type}.entry`, 128))) fail(`${type}.entry.job_id is invalid`);
+        if (triageText(entry, "kind", `${type}.entry`, 100) === "") fail(`${type}.entry.kind is required`);
+        if (triageText(entry, "text", `${type}.entry`, 160) === "") fail(`${type}.entry.text is required`);
+        if ("title" in entry) triageText(entry, "title", `${type}.entry`, 500);
+      }
+      int(p, "latest_seq", type, 0);
+      if ("cursor" in p && !/^[0-9]+$/.test(str(p, "cursor", type, 64))) fail(`${type}.cursor invalid`);
+      if (p["has_more"] && !("cursor" in p)) fail(`${type}.cursor required when has_more`);
+      if (!p["has_more"] && "cursor" in p) fail(`${type}.cursor forbidden when not has_more`);
+      if (!("new_count_since" in p) && p["gap"] !== true) fail(`${type} requires new_count_since or gap`);
+      if ("new_count_since" in p) int(p, "new_count_since", type, 0);
+      if ("gap" in p && typeof p["gap"] !== "boolean") fail(`${type}.gap must be boolean`);
+      if (p["gap"] === true && "new_count_since" in p) fail(`${type}.gap cannot include new_count_since`);
+      break;
+    }
     case "activity_request": {
       requireFields<ActivityRequestPayload>(p, "activity_request", { request_id: "required", limit: "optional" });
       correlationID(p, "request_id", "activity_request");
@@ -2305,7 +2674,6 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
             fail("page_bulk_status_result.items.canonical_key is required");
           }
         }
-        if (typeof item["ownership_complete"] !== "boolean") fail("page_bulk_status_result.items.ownership_complete must be a boolean");
         if ("job_id" in item) {
           if (status !== "queued") fail("page_bulk_status_result.items.job_id is only valid for queued");
           if (!JOB_ID_RE.test(str(item, "job_id", "page_bulk_status_result.items", 128))) {
@@ -2320,6 +2688,49 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
         }
       }
       if (typeof p["truncated"] !== "boolean") fail("page_bulk_status_result.truncated must be a boolean");
+      break;
+    }
+    case "page_bulk_submit_v2_request": {
+      requireFields<PageBulkSubmitV2RequestPayload>(p, type, { request_id: "required", scan_id: "required", cohort_id: "required", source: "required", cohort_total: "required", chunk_index: "required", final_chunk: "required", canonical_keys: "required" });
+      correlationID(p, "request_id", type);
+      for (const key of ["scan_id", "cohort_id"]) {
+        const id = str(p, key, type, 64);
+        if (!WIRE_ID_RE.test(id)) fail(`${type}.${key} invalid`);
+      }
+      const total = int(p, "cohort_total", type, 1); if (total > 200) fail(`${type}.cohort_total invalid`);
+      const chunk = int(p, "chunk_index", type, 0); if (chunk > 3) fail(`${type}.chunk_index invalid`);
+      if (typeof p["final_chunk"] !== "boolean") fail(`${type}.final_chunk must be boolean`);
+      const expected = Math.ceil(total / 50); if (chunk >= expected || p["final_chunk"] !== (chunk === expected - 1)) fail(`${type} chunk sequencing invalid`);
+      const keys = p["canonical_keys"]; if (!Array.isArray(keys) || keys.length < 1 || keys.length > 50) fail(`${type}.canonical_keys invalid`);
+      const seen = new Set<string>(); for (const raw of keys) { if (typeof raw !== "string" || !isCanonicalKey(raw) || seen.has(raw)) fail(`${type}.canonical_keys invalid/duplicate`); seen.add(raw); }
+      if (chunk < expected - 1 && keys.length !== 50) fail(`${type} non-final chunk must contain 50 keys`);
+      if (chunk === expected - 1 && keys.length !== total - chunk * 50) fail(`${type} final chunk size invalid`);
+      const source = asRecord(p["source"], `${type}.source`);
+      requireFields<PageBulkSubmitSource>(source, `${type}.source`, { kind: "required", origin: "required", detector: "required" });
+      if (str(source, "kind", type, 20) !== "browser_page" || !isBareLowercaseHTTPSOrigin(str(source, "origin", type, 300)) || !isDetectorText(str(source, "detector", type, 128))) fail(`${type}.source invalid`);
+      break;
+    }
+    case "page_bulk_submit_v2_result": {
+      requireFields<PageBulkSubmitV2ResultPayload>(p, type, { request_id: "required", scan_id: "required", cohort_id: "required", chunk_index: "required", final_chunk: "required", batch_id: "required", membership: "required", cohort_total: "optional", persisted_members: "required", submitted: "required", joined: "required", already_owned: "required", invalid: "required" });
+      correlationID(p, "request_id", type);
+      for (const key of ["scan_id", "cohort_id", "batch_id"]) {
+        const id = str(p, key, type, 64);
+        if (!WIRE_ID_RE.test(id)) fail(`${type}.${key} invalid`);
+      }
+      const chunk = int(p, "chunk_index", type, 0); if (chunk > 3) fail(`${type}.chunk_index invalid`);
+      if (typeof p["final_chunk"] !== "boolean") fail(`${type}.final_chunk must be boolean`);
+      if (!["open", "complete", "partial"].includes(str(p, "membership", type, 20))) fail(`${type}.membership invalid`);
+      let cohortTotal: number | undefined;
+      if ("cohort_total" in p) { cohortTotal = int(p, "cohort_total", type, 1); if (cohortTotal > 200) fail(`${type}.cohort_total invalid`); }
+      const chunkSum = ["submitted", "joined", "already_owned", "invalid"].reduce((sum, name) => sum + int(p, name, type, 0), 0);
+      if (p["final_chunk"] === true) {
+        if (cohortTotal === undefined) fail(`${type} final result requires cohort_total`);
+        const expected = cohortTotal! - chunk * 50;
+        if (expected < 1 || expected > 50 || chunkSum !== expected) fail(`${type} final result counts must equal final chunk size`);
+      } else if (chunkSum !== 50) {
+        fail(`${type} non-final result counts must equal 50`);
+      }
+      if (cohortTotal !== undefined && cohortTotal - chunk * 50 < 1) fail(`${type} cohort_total and chunk_index invalid`);
       break;
     }
     case "page_bulk_submit_request": {
@@ -2337,10 +2748,9 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       }
       const seenKeys = new Set<string>();
       for (const rawKey of keys) {
-        if (typeof rawKey !== "string" || rawKey.length === 0 || Array.from(rawKey).length > 300) {
+        if (typeof rawKey !== "string" || !isCanonicalKey(rawKey)) {
           fail("page_bulk_submit_request.canonical_keys entries must be non-empty bounded strings");
         }
-        rejectNUL(rawKey, "page_bulk_submit_request.canonical_keys");
         if (seenKeys.has(rawKey)) fail(`page_bulk_submit_request.canonical_keys contains a duplicate ${JSON.stringify(rawKey)}`);
         seenKeys.add(rawKey);
       }
@@ -2357,17 +2767,8 @@ function validatePayload(type: BrowserMessageType, p: Record<string, unknown>): 
       // title (ADR-0019 Decision 6), the same round-trip shape
       // hello_ack.resolver_origins already validates above.
       const origin = str(source, "origin", "page_bulk_submit_request.source", 300);
-      let originOK = origin.startsWith("https://");
-      if (originOK) {
-        try {
-          const parsed = new URL(origin);
-          originOK = parsed.protocol === "https:" && parsed.host !== "" && `${parsed.protocol}//${parsed.host}` === origin;
-        } catch {
-          originOK = false;
-        }
-      }
-      if (!originOK) fail("page_bulk_submit_request.source.origin must be a bare https scheme://host origin");
-      if (triageText(source, "detector", "page_bulk_submit_request.source", 128) === "") {
+      if (!isBareLowercaseHTTPSOrigin(origin)) fail("page_bulk_submit_request.source.origin must be a bare https scheme://host origin");
+      if (!isDetectorText(str(source, "detector", "page_bulk_submit_request.source", 128))) {
         fail("page_bulk_submit_request.source.detector is required");
       }
       break;

@@ -6,8 +6,10 @@ import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 import type { TriageCounts, TriageSnapshotItem } from "../src/protocol";
 
+// happy-dom's SVG namespace constructor is used by the details disclosure
+// renderer; keep the test DOM whitelist explicit as the page gains controls.
 interface FixtureSnapshot {
-  schema: 1 | 2 | 3 | 4;
+  schema: 1 | 2 | 3 | 4 | 5;
   generated_at: string;
   counts: TriageCounts;
   items: TriageSnapshotItem[];
@@ -398,8 +400,9 @@ test("waiting sibling overlay is browser-local, suppresses primary focus, and la
     const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:waiting']");
     expect(row?.dataset.attention).toBe("working");
     expect(row?.querySelector(".item-guidance")?.textContent).toBe(
-      "Waiting for the institution sign-in already open in another tab",
+      "papio is continuing — waiting for the institution sign-in already open in another tab",
     );
+    expect(row?.querySelector("[data-operation='open']")).toBeNull();
     vi.advanceTimersByTime(50);
     page.document.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
     await settle();
@@ -409,6 +412,42 @@ test("waiting sibling overlay is browser-local, suppresses primary focus, and la
   } finally {
     vi.useRealTimers();
   }
+});
+test("hoists one byte-identical family instruction above its ranked rows", async () => {
+  const items = [1, 2, 3].map((rank) => {
+    const item = manualAction(`action:family-${rank}`, rank, `Family paper ${rank}`);
+    item.run_key = "run_family_manual";
+    item.next_actor = "researcher";
+    item.guidance_variant = "manual_download";
+    item.operation_variant = "dismiss_only";
+    return item;
+  });
+  const fixture = snapshot(items, {
+    schema: 5,
+    counts: counts({
+      pending_total: 3,
+      actions: 3,
+      watch_hits: 0,
+      retractions: 0,
+      turns_required: 3,
+      turns_working: 0,
+      family_breakdown_complete: true,
+      family_runs: [{
+        run_key: "run_family_manual",
+        first_rank: 1,
+        route_class: "manual_download",
+        action_kind: "manual_download",
+        next_actor: "researcher",
+        guidance_variant: "manual_download",
+        operation_variant: "dismiss_only",
+        count: 3,
+      }],
+    }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  expect(page.document.querySelectorAll(".family-heading")).toHaveLength(1);
+  expect(page.document.querySelectorAll(".family-guidance")).toHaveLength(1);
+  expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(3);
 });
 
 test("keyboard o sends an OA browser handoff through the broker", async () => {
@@ -656,14 +695,14 @@ test("a dismissal removes the row at once, holds the daemon call, and undo puts 
   expect(page.document.getElementById("confirm-dialog")?.hidden).toBe(true);
   expect(page.document.querySelector("[data-triage-item-id='action:manual']")).toBeNull();
   expect(page.document.getElementById("undo-bar")?.hidden).toBe(false);
-  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("0 pending");
+  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("0 open");
   expect(page.requests.filter((request) => request.type === "papio.action.resolve")).toHaveLength(0);
 
   page.document.getElementById("undo-dismiss")?.dispatchEvent(new Event("click", { bubbles: true }));
   await settle();
   expect(page.document.querySelector("[data-triage-item-id='action:manual']")).not.toBeNull();
   expect(page.document.getElementById("undo-bar")?.hidden).toBe(true);
-  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("1 pending");
+  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("1 open");
   expect(page.requests.filter((request) => request.type === "papio.action.resolve")).toHaveLength(0);
 });
 
@@ -692,7 +731,7 @@ test("a committed human_action dismissal calls papio.action.resolve, not triage.
     expected_revision: 1,
   });
   expect(page.document.querySelector("[data-triage-item-id='action:manual']")).toBeNull();
-  expect(page.document.getElementById("undo-bar")?.hidden).toBe(true);
+  expect(page.document.getElementById("undo-bar")?.hidden).toBe(false);
 });
 
 test("the undo bar names a cancelled acquisition only when the job is parked on the action", async () => {
@@ -820,7 +859,7 @@ test("the filter narrows visible items, keeps counts intact, and reports a disti
   filterInput.dispatchEvent(new Event("input", { bubbles: true }));
   await settle();
   expect(Array.from(page.document.querySelectorAll("[data-triage-item-id]"), (row) => row.getAttribute("data-triage-item-id"))).toEqual(["hit:one"]);
-  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("2 pending");
+  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("2 open");
 
 
   filterInput.value = "no such paper exists";
@@ -1363,14 +1402,7 @@ test("renders a document_delivery item's delivery detail, attention styling, and
   });
   expect(page.document.querySelector("[data-triage-item-id='action:delivery-required']")).toBeNull();
 
-  const workingAbsentButton = workingRow?.querySelector<HTMLButtonElement>("[data-operation='confirm_request_absent']");
-  workingAbsentButton?.click();
-  await settle();
-  expect(page.requests.find((request) => request.request["job_id"] === "job-delivery-22")?.request).toEqual({
-    job_id: "job-delivery-22",
-    operation: "confirm_request_absent",
-  });
-  expect(page.document.querySelector("[data-triage-item-id='action:delivery-working']")).toBeNull();
+  expect(workingRow?.querySelector<HTMLButtonElement>("[data-operation='confirm_request_absent']")).toBeNull();
 });
 
 test("renders an offered delivery as a request created but not submitted", async () => {

@@ -6,14 +6,17 @@ package triage
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -100,15 +103,17 @@ type WatchHit struct {
 // HumanAction carries fields needed to display and safely resolve a human
 // action. Quarantine paths and candidate IDs never leave the daemon.
 type HumanAction struct {
-	ActionID     int64  `json:"action_id"`
-	JobID        string `json:"job_id"`
-	ActionKind   string `json:"action_kind"`
-	JobState     string `json:"job_state"`
-	Revision     int64  `json:"revision"`
-	SHA256       string `json:"sha256"`
-	SizeBytes    int64  `json:"size_bytes"`
-	RequiresAuth *bool  `json:"requires_auth,omitempty"`
-	BlockedBy    string `json:"blocked_by,omitempty"`
+	ActionID        int64  `json:"action_id"`
+	JobID           string `json:"job_id"`
+	ActionKind      string `json:"action_kind"`
+	JobState        string `json:"job_state"`
+	Revision        int64  `json:"revision"`
+	SHA256          string `json:"sha256"`
+	SizeBytes       int64  `json:"size_bytes"`
+	RequiresAuth    *bool  `json:"requires_auth,omitempty"`
+	BlockedBy       string `json:"blocked_by,omitempty"`
+	DiagnosisReason string `json:"-"`
+	DeliveryState   string `json:"-"`
 }
 
 // Retraction carries the retraction-specific portion of an Item.
@@ -131,10 +136,11 @@ type Item struct {
 	Links []Link   `json:"links"`
 	Ops   []string `json:"ops"`
 
-	WatchHit    *WatchHit    `json:"-"`
-	HumanAction *HumanAction `json:"-"`
-	Retraction  *Retraction  `json:"-"`
-	PdfGrab     *PdfGrab     `json:"-"`
+	WatchHit    *WatchHit         `json:"-"`
+	HumanAction *HumanAction      `json:"-"`
+	Retraction  *Retraction       `json:"-"`
+	PdfGrab     *PdfGrab          `json:"-"`
+	Family      *FamilyAssignment `json:"-"`
 }
 
 // MarshalJSON emits exactly one supported kind-specific object.
@@ -255,16 +261,43 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type FamilyAssignment struct {
+	RunKey           string
+	NextActor        string
+	GuidanceVariant  string
+	OperationVariant string
+	RouteClass       string
+	ActionKind       string
+	DependentJobs    int
+	GateClaimID      string
+}
+
+type FamilyRun struct {
+	RunKey, RouteClass, ActionKind, NextActor, GuidanceVariant, OperationVariant string
+	FirstRank, Count                                                             int
+}
+
+type RequiredTurn struct {
+	ItemID, ItemKind, RouteClass, GateClaimID, JobID, GrabID string
+	ActionID, DependentJobs                                  int
+}
+
 // Counts is complete even when Snapshot.Items is paginated.
 type Counts struct {
-	PendingTotal        int `json:"pending_total"`
-	WatchHits           int `json:"watch_hits"`
-	Actions             int `json:"actions"`
-	ActionsRequiresAuth int `json:"actions_requires_auth"`
-	Retractions         int `json:"retractions"`
-	JobsWorking         int `json:"jobs_working"`
-	JobsNeedsReview     int `json:"jobs_needs_review"`
-	FailureGroups7d     int `json:"failure_groups_7d"`
+	PendingTotal            int `json:"pending_total"`
+	TurnsRequired           *int
+	TurnsWorking            *int
+	FamilyBreakdownComplete *bool
+	FamilyRuns              []FamilyRun
+	RequiredTurnsComplete   *bool
+	RequiredTurns           []RequiredTurn
+	WatchHits               int `json:"watch_hits"`
+	Actions                 int `json:"actions"`
+	ActionsRequiresAuth     int `json:"actions_requires_auth"`
+	Retractions             int `json:"retractions"`
+	JobsWorking             int `json:"jobs_working"`
+	JobsNeedsReview         int `json:"jobs_needs_review"`
+	FailureGroups7d         int `json:"failure_groups_7d"`
 }
 
 // SnapshotRequest controls a bounded view into a complete snapshot ordering.
@@ -686,6 +719,9 @@ func (s *Service) collect(ctx context.Context, schema ...int) ([]Item, Counts, i
 	if err := tx.Commit(); err != nil {
 		return nil, Counts{}, 0, "", fmt.Errorf("committing triage snapshot: %w", err)
 	}
+	if err := s.projectFamilies(ctx, items, &counts); err != nil {
+		return nil, Counts{}, 0, "", err
+	}
 	return items, counts, unsupported, s.now().UTC().Format(time.RFC3339Nano), nil
 }
 
@@ -710,6 +746,252 @@ func snapshotCounts(ctx context.Context, tx *sql.Tx, watchHits, actions int, job
 	}
 	counts.FailureGroups7d = failureGroups
 	return counts, nil
+}
+func (s *Service) projectFamilies(ctx context.Context, items []Item, counts *Counts) error {
+	if counts == nil {
+		return errors.New("nil triage counts")
+	}
+	required, working := 0, 0
+	breakdownComplete := true
+	requiredTurnsProjectionComplete := true
+	var gates []job.HumanGateObservation
+	if s.Jobs != nil {
+		projection, err := s.Jobs.CurrentHumanAttention(ctx)
+		if err != nil {
+			// Human-gate authority is required to claim an exact required-turn
+			// projection. Keep ordinary row counts, but fail closed for the
+			// required-turn list and family totals.
+			breakdownComplete = false
+			requiredTurnsProjectionComplete = false
+		} else {
+			gates = projection.Gates
+		}
+	} else {
+		breakdownComplete = false
+		requiredTurnsProjectionComplete = false
+	}
+	gateByJob := make(map[string]job.HumanGateObservation)
+	for _, gate := range gates {
+		for _, id := range append(append([]string(nil), gate.DependentJobIDs...), gate.ClaimMemberJobIDs...) {
+			if _, exists := gateByJob[id]; !exists {
+				gateByJob[id] = gate
+			}
+		}
+	}
+	ownerByGate := make(map[string]string)
+	for _, gate := range gates {
+		// The producer identifies one owner by keeping it out of the
+		// dependent sibling set. If no such member exists, the authority is
+		// unresolvable and the required-turn projection fails closed.
+		for _, member := range gate.ClaimMemberJobIDs {
+			if !contains(gate.DependentJobIDs, member) {
+				ownerByGate[gate.ID] = member
+				break
+			}
+		}
+		if _, exists := ownerByGate[gate.ID]; !exists {
+			breakdownComplete = false
+			requiredTurnsProjectionComplete = false
+		}
+	}
+	type tuple struct {
+		kind, route, action, actor, guidance, operation string
+	}
+	var previous tuple
+	// runIndex points at the open run inside counts.FamilyRuns, so a member
+	// increments the stored run rather than a detached copy of it.
+	runIndex := -1
+	runCount := 0
+	for i := range items {
+		item := &items[i]
+		var assignment *FamilyAssignment
+		switch item.Kind {
+		case KindHumanAction:
+			if item.HumanAction == nil {
+				breakdownComplete = false
+				continue
+			}
+			action := item.HumanAction
+			attention, mapped := EffectiveAttention(action.ActionKind, action.RequiresAuth, action.DeliveryState)
+			if !mapped {
+				attention = "required"
+			}
+			gateID, dependent := "", 0
+			if gate, ok := gateByJob[action.JobID]; ok {
+				gateID = gate.ID
+				dependent = len(gate.DependentJobIDs)
+				owner, resolvable := ownerByGate[gate.ID]
+				if !resolvable {
+					// A typed claim without an owner is not safely
+					// actionable; do not silently report zero turns.
+					breakdownComplete = false
+					requiredTurnsProjectionComplete = false
+					runIndex = -1
+					previous = tuple{}
+					continue
+				}
+				if owner != action.JobID {
+					attention = "working"
+				}
+			}
+			route := action.ActionKind
+			operation := familyOperation(action.ActionKind, attention, item.Ops)
+			actor := "researcher"
+			if attention == "working" {
+				actor = "papio"
+			}
+			if attention == "required" {
+				required++
+			} else {
+				working++
+			}
+			guidance := familyGuidance(action.ActionKind, action.RequiresAuth, action.DiagnosisReason, attention, gateByJob[action.JobID])
+			if route == "" || guidance == "" || operation == "" || !contains(protocol.TriageRouteClassesV5(), route) ||
+				!contains(protocol.TriageNextActors(), actor) || !contains(protocol.TriageGuidanceVariants(), guidance) ||
+				!contains(protocol.TriageOperationVariants(), operation) {
+				// Keep the exact attention count, but make family and
+				// required-turn detail unavailable rather than dropping this row.
+				breakdownComplete = false
+				requiredTurnsProjectionComplete = false
+				continue
+			}
+			assignment = &FamilyAssignment{NextActor: actor, GuidanceVariant: guidance, OperationVariant: operation, RouteClass: route, ActionKind: action.ActionKind, GateClaimID: gateID, DependentJobs: dependent}
+			if attention == "required" {
+				counts.RequiredTurns = append(counts.RequiredTurns, RequiredTurn{ItemID: item.ID, ItemKind: KindHumanAction, RouteClass: route, GateClaimID: gateID, JobID: action.JobID, ActionID: int(action.ActionID), DependentJobs: dependent})
+			}
+		case KindPdfGrab:
+			if item.PdfGrab == nil {
+				breakdownComplete = false
+				requiredTurnsProjectionComplete = false
+				continue
+			}
+			assignment = &FamilyAssignment{NextActor: "researcher", GuidanceVariant: "pdf_identifier", OperationVariant: "provide_identifier_or_dismiss", RouteClass: "pdf_identifier_needed", ActionKind: "pdf_identifier_needed"}
+			required++
+			counts.RequiredTurns = append(counts.RequiredTurns, RequiredTurn{ItemID: item.ID, ItemKind: KindPdfGrab, RouteClass: "pdf_identifier_needed", GrabID: item.PdfGrab.GrabID})
+		}
+		if assignment == nil {
+			runIndex = -1
+			previous = tuple{}
+			continue
+		}
+		t := tuple{item.Kind, assignment.RouteClass, assignment.ActionKind, assignment.NextActor, assignment.GuidanceVariant, assignment.OperationVariant}
+		if runIndex < 0 || t != previous {
+			keyInput := []any{5, item.ID, item.Kind, assignment.RouteClass, assignment.ActionKind, assignment.NextActor, assignment.GuidanceVariant, assignment.OperationVariant}
+			raw, _ := json.Marshal(keyInput)
+			sum := sha256.Sum256(raw)
+			counts.FamilyRuns = append(counts.FamilyRuns, FamilyRun{
+				RunKey: "fr1_" + hex.EncodeToString(sum[:])[:32], FirstRank: item.Rank,
+				RouteClass: assignment.RouteClass, ActionKind: assignment.ActionKind,
+				NextActor: assignment.NextActor, GuidanceVariant: assignment.GuidanceVariant,
+				OperationVariant: assignment.OperationVariant, Count: 1,
+			})
+			runIndex, previous, runCount = len(counts.FamilyRuns)-1, t, runCount+1
+		} else {
+			counts.FamilyRuns[runIndex].Count++
+		}
+		assignment.RunKey = counts.FamilyRuns[runIndex].RunKey
+		item.Family = assignment
+	}
+	if required > 1024 || !requiredTurnsProjectionComplete || len(counts.RequiredTurns) != required {
+		counts.RequiredTurnsComplete = new(false)
+		counts.RequiredTurns = nil
+	} else {
+		counts.RequiredTurnsComplete = new(true)
+	}
+	if runCount > 128 {
+		breakdownComplete = false
+	}
+	if !breakdownComplete {
+		counts.FamilyRuns = nil
+	}
+	counts.TurnsRequired, counts.TurnsWorking = &required, &working
+	counts.FamilyBreakdownComplete = &breakdownComplete
+	return nil
+}
+
+func contains(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func familyGuidance(kind string, auth *bool, diagnosisReason, attention string, gate job.HumanGateObservation) string {
+	if attention == "working" {
+		return "papio_continuing"
+	}
+	switch {
+	case diagnosisReason == job.DiagnosisReasonProviderAdapterMissing && kind == "manual_download":
+		return "manual_download_adapter_missing"
+	case gate.ID != "":
+		if gate.GateType == job.HumanGateCaptchaOrSecurity {
+			return "security_challenge"
+		}
+		return "institution_sign_in"
+	case kind == "manual_download":
+		return "manual_download"
+	case kind == "human_auth_required":
+		return "institution_sign_in"
+	case kind == "openurl_handoff":
+		if auth == nil {
+			// Unknown authentication is not an authoritative actor mapping.
+			return ""
+		}
+		if *auth {
+			return "institution_sign_in"
+		}
+		return "open_page"
+	case kind == "openurl_available":
+		return "open_page"
+	case kind == "verify_identity":
+		return "verify_identity"
+	case kind == "document_delivery":
+		return "document_delivery"
+	case kind == "downloads_access_required":
+		return "downloads_access"
+	case kind == "terms_acceptance_required":
+		return "terms_acceptance"
+	default:
+		return ""
+	}
+}
+
+// EffectiveAttention applies the shared durable action-attention mapping used
+// by triage counts, pulse, and browser presentation. The bool reports whether
+// the mapping is authoritative; unknown authentication is deliberately
+// unmapped rather than guessed as autonomous work.
+func EffectiveAttention(kind string, requiresAuth *bool, deliveryState string) (attention string, mapped bool) {
+	if kind == job.ActionKindDocumentDelivery {
+		if deliveryState == "fulfilled" {
+			return "working", true
+		}
+		return "required", true
+	}
+	if kind == "openurl_handoff" && requiresAuth == nil {
+		return "", false
+	}
+	return "required", true
+}
+func familyOperation(kind, attention string, ops []string) string {
+	if attention == "working" {
+		return "none"
+	}
+	switch kind {
+	case "verify_identity":
+		if contains(ops, "open") {
+			return "accept_reject_open"
+		}
+		return "accept_reject"
+	case "document_delivery":
+		return "delivery_reconcile"
+	default:
+		if len(ops) > 1 {
+			return "open_and_dismiss"
+		}
+		return "dismiss_only"
+	}
 }
 
 type digestRow struct {
@@ -886,7 +1168,10 @@ func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT a.id, a.job_id, a.kind, j.state, COALESCE(a.detail, ''),
 			a.revision, a.quarantine_sha256, a.requires_auth, a.blocked_by, j.work_request_id,
-			COALESCE(w.title, ''), COALESCE(w.authors_json, '[]'), COALESCE(w.year, 0)
+			COALESCE(w.title, ''), COALESCE(w.authors_json, '[]'), COALESCE(w.year, 0),
+			COALESCE((SELECT json_extract(e.detail_json, '$.diagnosis')
+				FROM events e WHERE e.job_id = j.id AND e.kind = 'browser.provider_outcome'
+				ORDER BY e.seq DESC LIMIT 1), '')
 		FROM human_actions a
 		JOIN jobs j ON j.id = a.job_id
 		JOIN work_requests w ON w.id = j.work_request_id
@@ -904,15 +1189,17 @@ func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 		workRequestID      string
 		title, authorsJSON string
 		year               int
+		diagnosisReason    string
 	}
 	loaded := make([]row, 0)
 	workRequestIDs := make([]string, 0)
 	for rows.Next() {
 		var r row
 		if err := rows.Scan(&r.action.ActionID, &r.action.JobID, &r.action.ActionKind, &r.action.JobState, &r.detail,
-			&r.action.Revision, &r.action.SHA256, &r.requiresAuth, &r.blockedBy, &r.workRequestID, &r.title, &r.authorsJSON, &r.year); err != nil {
+			&r.action.Revision, &r.action.SHA256, &r.requiresAuth, &r.blockedBy, &r.workRequestID, &r.title, &r.authorsJSON, &r.year, &r.diagnosisReason); err != nil {
 			return nil, err
 		}
+		r.action.DiagnosisReason = r.diagnosisReason
 		if r.action.ActionID <= 0 || r.action.JobID == "" || r.action.ActionKind == "" || r.action.Revision <= 0 {
 			return nil, errors.New("invalid open human action")
 		}
@@ -924,6 +1211,14 @@ func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	// Delivery state is an optional enrichment. Older stores may predate the
+	// delivery table; absence must not make the whole triage snapshot fail.
+	for i := range loaded {
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM delivery_requests WHERE job_id=? ORDER BY updated_at DESC LIMIT 1`, loaded[i].action.JobID).Scan(&state); err == nil {
+			loaded[i].action.DeliveryState = state
+		}
 	}
 	identifiers, err := identifiersByWorkRequest(ctx, tx, workRequestIDs)
 	if err != nil {
@@ -1073,9 +1368,19 @@ func normalizeOps(ops []string) []string {
 	}
 	return out
 }
-
 func assignRanks(items []Item, base int) {
-	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	sort.Slice(items, func(i, j int) bool {
+		left, right := items[i].ID, items[j].ID
+		const prefix = "action:"
+		if strings.HasPrefix(left, prefix) && strings.HasPrefix(right, prefix) {
+			li, le := strconv.ParseInt(strings.TrimPrefix(left, prefix), 10, 64)
+			ri, re := strconv.ParseInt(strings.TrimPrefix(right, prefix), 10, 64)
+			if le == nil && re == nil && li != ri {
+				return li < ri
+			}
+		}
+		return left < right
+	})
 	for index := range items {
 		items[index].Rank = base + index
 	}

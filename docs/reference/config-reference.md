@@ -241,11 +241,69 @@ state. See the [filing guide](../guide/hooks.md).
 
 ## `[notify]`
 
+The notification router has two independent legs: local desktop interruptions
+for a human, and webhook delivery for automation. Desktop delivery is
+best-effort and currently available only through the macOS sender; an
+unsupported platform is reported by `papio doctor` and does not consume the
+desktop rate budget. Webhooks are not subject to quiet hours, focused-surface
+suppression, or the desktop rate ceiling.
+
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `true` | Enables best-effort local desktop notifications from the daemon. The daemon coalesces park and applied-import notices in a 60-second window. |
-| `webhook_url` | string URL | empty | When set, every notification is also delivered as a JSON POST (`{source, event, message, watch_id, watch_label, count, sent_at}`; plain notices carry only `source`, `message`, `sent_at`). Independent of `enabled`, which governs only the desktop channel. Must be an absolute http(s) URL. Delivery is best-effort and never fails the triggering work. |
+| `enabled` | boolean | `true` | Enables best-effort local desktop notifications from the daemon. This affects only the desktop leg; it does not disable webhooks. |
+| `preset` | string | `milestones` | Base desktop/webhook routing policy. Accepted values are `quiet`, `milestones`, and `verbose`; per-category overrides below layer on top. |
+| `max_per_hour` | integer | `6` | Maximum desktop notification reservations in a rolling hour. `0` means unlimited. Must be in `0..10000`. This ceiling never applies to webhooks. |
+| `quiet_hours` | string | empty (disabled) | Optional local civil-time interval in `HH:MM-HH:MM` form. The start and end must differ; spring-forward and fall-back transitions are handled as one local interval. |
+| `quiet_mode` | string | `hold` | Behavior for desktop notices during `quiet_hours`: `hold` keeps them pending until the window ends; `drop` records them as dropped. Accepted values are `hold` and `drop`. |
+| `digest_every_minutes` | integer minutes | `240` | Interval for pending-decision digests. `0` uses the four-hour default. Must be in `0..10080`. |
+| `completion_quiet_minutes` | integer minutes | `10` | Quiet period before a batch completion checkpoint may be surfaced. Must be in `0..1440`. |
+| `completion_max_hold_minutes` | integer minutes | `120` | Maximum hold for a batch completion checkpoint. Must be in `0..10080`; when nonzero, it must be at least `completion_quiet_minutes`. |
+| `stall_after_minutes` | integer minutes | `30` | Minimum named episode age before a system-degraded/stall notice. Must be in `0..10080`. A scheduled retry or delivery poll is not a stall. |
+| `categories` | table of tables | empty | Per-category overrides. Keys must be one of the seven names listed below; an unknown category is rejected. |
+| `webhook_url` | string URL | empty | When set, notification intents are delivered as JSON POSTs to this automation endpoint. It is independent of `enabled` and desktop policy; must be an absolute `http(s)` URL. |
 | `webhook_secret` | string | empty | Sent as `Authorization: Bearer <secret>` on webhook posts. Requires `webhook_url`. |
+
+The `milestones` preset is the default: it sends immediate coalesced
+standalone outcomes and newly opened decisions, a four-hour pending-decision
+digest, a bounded batch checkpoint/final summary, discovery as catch-up or
+digest material, capped integrity notices, and one system-degraded notice per
+episode. Work that is continuing or scheduled does not produce a desktop
+interruption. The preset treatment is:
+
+| Category | `quiet` | `milestones` (default) | `verbose` |
+| --- | --- | --- | --- |
+| `request_outcome` | Immediate failures; digest successes | Immediate, coalesced | Immediate |
+| `decision_opened` | Digest | Immediate, coalesced over 5 minutes | Immediate, coalesced over 60 seconds |
+| `decision_pending` | Off | Digest, at most every 4 hours | Immediate, once per pass |
+| `completion_batch` | Off | One checkpoint when useful plus one meaningful final delta | One checkpoint when useful plus one meaningful final delta |
+| `discovery_new` | Off | Catch-up or desktop digest | Immediate, coalesced |
+| `integrity_notice` | Immediate, capped | Immediate, capped | Immediate, capped |
+| `system_degraded` | Immediate, state-deduped | Immediate, state-deduped | Immediate, state-deduped |
+
+### `[notify.categories.<name>]`
+
+Use one table for each category whose routing should differ from the preset:
+
+```toml
+[notify.categories.decision_opened]
+desktop = "immediate"   # off | digest | immediate
+webhook = "immediate"   # off | digest | immediate
+window_seconds = 300
+```
+
+The valid category names are `request_outcome`, `decision_opened`,
+`decision_pending`, `completion_batch`, `discovery_new`, `integrity_notice`,
+and `system_degraded`. `desktop` and `webhook` each accept `off`, `digest`, or
+`immediate`; an empty value inherits the preset. `window_seconds` defaults to
+the preset's window when `0` (or when omitted) and otherwise must be in
+`0..86400`. Webhook mode is independent automation routing: it remains
+immediate by default and ignores desktop quiet hours, focus suppression, and
+rate limits. A category may override its webhook mode without changing its
+desktop mode.
+
+This section is strict-mode configuration. Deploy the binary that understands
+these fields together with the configuration change; an older daemon rejects
+unknown `[notify]` fields.
 
 ## `[updates]`
 

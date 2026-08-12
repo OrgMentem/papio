@@ -521,6 +521,44 @@
         <ul id="sources" class="rows"></ul>
       </div>
     </section>
+    <section>
+      <h2>Feedback and interruptions</h2>
+      <p class="lede">Choose how papio reflects progress and local action results. These settings never hide decisions, errors, or durable row results.</p>
+      <div class="card">
+        <div class="row">
+          <div>
+            <div class="source-label">Toolbar count</div>
+            <div class="hint">Decisions waiting counts daemon-owned turns; older daemons use pending items.</div>
+          </div>
+          <select id="toolbar-count-mode" aria-label="Toolbar count">
+            <option value="required">Decisions waiting</option>
+            <option value="all">Everything pending</option>
+            <option value="off">No number</option>
+          </select>
+        </div>
+        <label class="row" for="catch-up-enabled">
+          <span><span class="source-label">Catch-up line when a papio surface opens</span><span class="hint">Show a bounded summary of what happened while you were away.</span></span>
+          <input id="catch-up-enabled" type="checkbox" checked />
+        </label>
+        <div class="row">
+          <div>
+            <div class="source-label">Transient success acknowledgements</div>
+            <div class="hint">Errors, pending state, persistent row results, and announcements are never hidden.</div>
+          </div>
+          <select id="success-ack-mode" aria-label="Transient success acknowledgements">
+            <option value="all">All requests</option>
+            <option value="errors">Errors only</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <div class="row">
+          <div>
+            <div class="source-label">Daemon notifications</div>
+            <div class="hint">Read-only routing summary: run <code>papio notify show</code>. Configure daemon routing in <code>~/.config/papio/config.toml</code>.</div>
+          </div>
+        </div>
+      </div>
+    </section>
 
     <footer>
       <details class="diagnostics">

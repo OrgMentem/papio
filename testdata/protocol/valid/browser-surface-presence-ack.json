@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"surface_presence_ack","msg_id":"presence-ack-0001","seq":12,"payload":{"request_id":"request-0101","accepted":true}}

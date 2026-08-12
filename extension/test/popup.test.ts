@@ -22,9 +22,12 @@ import {
   renderNeedsAttention,
   grantProviderAccess,
   renderDaemonStatus,
-  renderImpactSummary,
   renderPageContext,
   renderPageAcquire,
+  renderImpactSummary,
+  derivePulseDisplay,
+  renderWorkPulse,
+  type PopupPulseCache,
   sessionWarmForJob,
   renderResolverGrants,
   renderTermsConsent,
@@ -39,6 +42,7 @@ import {
   SESSION_STATE_MESSAGE,
 } from "../src/popup";
 import type { ActiveJob } from "../src/state";
+import type { WorkPulseResponsePayload } from "../src/protocol";
 import { SESSION_STALE_MS } from "../src/keepalive";
 import { PROVIDERS, SCENARIOS } from "../src/capture";
 
@@ -66,6 +70,94 @@ function job(overrides: Partial<ActiveJob> = {}): ActiveJob {
     ...overrides,
   };
 }
+
+function pulseCache(overrides: Partial<WorkPulseResponsePayload> = {}): PopupPulseCache {
+  return {
+    pulse: {
+      request_id: "pulse-1",
+      schema: 1,
+      generated_at: new Date().toISOString(),
+      projection_complete: true,
+      nonterminal_total: 0,
+      in_flight: 0,
+      continuing: 0,
+      scheduled: 0,
+      waiting_required: 0,
+      stalled: 0,
+      ...overrides,
+    },
+    receivedAt: Date.now(),
+    workerEpoch: "worker-1",
+  };
+}
+
+test("derives every typed pulse state without inventing progress", () => {
+  expect(derivePulseDisplay(pulseCache({ in_flight: 2, nonterminal_total: 2 })).primary).toBe("Moving");
+  expect(derivePulseDisplay(pulseCache({ waiting_required: 2, nonterminal_total: 2 })).primary).toBe("Waiting on you");
+  expect(derivePulseDisplay(pulseCache({
+    stalled: 1,
+    nonterminal_total: 1,
+    stall_episodes: [{
+      episode_key: "episode-1",
+      cause_kind: "delivery_poll_overdue",
+      public_label: "Delivery poll overdue",
+      since: new Date(Date.now() - 60_000).toISOString(),
+      count: 1,
+    }],
+  })).primary).toBe("Stalled");
+  expect(derivePulseDisplay(pulseCache({ scheduled: 1, nonterminal_total: 1 })).primary).toBe("Scheduled");
+  expect(derivePulseDisplay(pulseCache({ last_finished_at: new Date(Date.now() - 7_200_000).toISOString() })).primaryText).toContain("last finished");
+  expect(derivePulseDisplay(undefined).primary).toBe("Unknown");
+});
+
+test("does not classify an incomplete pulse from absent buckets", () => {
+  const partial: PopupPulseCache = {
+    pulse: {
+      request_id: "pulse-partial",
+      schema: 1,
+      generated_at: new Date().toISOString(),
+      projection_complete: false,
+      scheduled: 1,
+      nonterminal_total: 1,
+    },
+    receivedAt: Date.now(),
+    workerEpoch: "worker-1",
+  };
+  expect(derivePulseDisplay(partial).primary).toBe("Unknown");
+});
+
+test("pulse freshness uses local receipt time and never invents ETA or percentage", () => {
+  const cache = pulseCache({ in_flight: 3, nonterminal_total: 3, next_action: {
+    at: new Date(Date.now() + 60_000).toISOString(),
+    kind: "retry",
+    source: "OpenAlex",
+    count: 3,
+  } });
+  const display = derivePulseDisplay({ ...cache, receivedAt: Date.now() - 16_000 }, "connected");
+  expect(display.primary).toBe("Unknown");
+  expect(display.primaryText).toContain("Status as of");
+  expect(display.primaryText).not.toMatch(/%|ETA|queue position/i);
+});
+
+test("renders active batch companion facts and disconnected copy", () => {
+  const doc = popupDocument();
+  renderWorkPulse(doc, pulseCache({
+    in_flight: 1,
+    nonterminal_total: 2,
+    latest_batch: {
+      batch_id: "batch-1",
+      started_at: new Date().toISOString(),
+      membership: "complete",
+      total: 2,
+      settled: 0,
+      nonterminal_total: 2,
+    },
+  }));
+  expect(doc.getElementById("popup-pulse-primary")?.textContent).toContain("Moving");
+  expect(doc.getElementById("popup-pulse-batch")?.textContent).toContain("2 papers");
+  renderWorkPulse(doc, undefined, "disconnected");
+  expect(doc.getElementById("popup-pulse-primary")?.textContent).toBe("Can't tell — daemon disconnected");
+});
 
 test("places the acquire icon before inbox and keeps idle feedback hidden", () => {
   const doc = popupDocument();

@@ -22,6 +22,7 @@ import (
 	"papio/internal/fetch"
 	"papio/internal/hook"
 	"papio/internal/job"
+	"papio/internal/notify"
 	"papio/internal/pdf"
 	"papio/internal/protocol"
 	"papio/internal/resolver"
@@ -1397,8 +1398,8 @@ func TestProcessReadyAutoImportsOnce(t *testing.T) {
 	if importer.calls != 1 {
 		t.Fatalf("auto-import calls = %d, want 1", importer.calls)
 	}
-	if notifier.imported != 1 {
-		t.Fatalf("import notifications = %d, want 1", notifier.imported)
+	if notifier.imported != 0 {
+		t.Fatalf("per-paper import notifications = %d, want none", notifier.imported)
 	}
 }
 func TestAutoImportCancellationDoesNotRecordFailure(t *testing.T) {
@@ -1595,13 +1596,19 @@ func TestSubmitResolverProfileAndUnknownValidation(t *testing.T) {
 type fakeNotificationSink struct {
 	human, imported int
 	reminders       []string
+	intents         []notify.Intent
 }
 
-func (f *fakeNotificationSink) HumanAction(context.Context) { f.human++ }
-func (f *fakeNotificationSink) HumanActionReminder(_ context.Context, message string) {
-	f.reminders = append(f.reminders, message)
+func (f *fakeNotificationSink) Route(_ context.Context, intent notify.Intent) error {
+	f.intents = append(f.intents, intent)
+	switch intent.Category {
+	case notify.CategoryDecisionOpened:
+		f.human++
+	case notify.CategoryDecisionPending:
+		f.reminders = append(f.reminders, intent.Message)
+	}
+	return nil
 }
-func (f *fakeNotificationSink) Imported(context.Context) { f.imported++ }
 
 func TestParkNotifiesAfterSuccessfulTransition(t *testing.T) {
 	svc, jobs := newTestService(t)

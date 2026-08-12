@@ -22,6 +22,9 @@ import {
   MsgPageCaptureRequestResult,
   parseBrowserMessage,
   durablePdfGrabState,
+  isBareLowercaseHTTPSOrigin,
+  isCanonicalKey,
+  isDetectorText,
   type ActivityEntryPayload,
   type BrowserMessage,
   type BrowserMessageType,
@@ -35,6 +38,8 @@ import {
   type PageCapturePayload,
   type PageCaptureRequestPayload,
   type PageCaptureRequestResultPayload,
+  type SurfacePresencePayload,
+  type WorkPulseResponsePayload,
 } from "./protocol";
 import {
   bindFederatedClaim,
@@ -53,6 +58,13 @@ import {
   type ScanResult,
 } from "./page-scan";
 import {
+  chunkKeysFor,
+  pageBulkPayloadDigest,
+  PageBulkCohortRecovery,
+  type PageBulkRecoveryCohort,
+  type PageBulkRecoverySource,
+} from "./page-bulk-recovery";
+import {
   chromeBackend,
   claimJobDownloadInitiated,
   clearPendingDelivery,
@@ -65,8 +77,8 @@ import {
   reduceMaterialization,
   removeJob,
   startPendingDelivery,
-  upsertJob,
   updatePendingDelivery,
+  upsertJob,
   type ActiveJob,
   type MaterializationCorrelation,
   type MaterializationEvent,
@@ -79,8 +91,10 @@ import {
   type ProviderDriveEpoch,
   WORK_WINDOW_KEY,
   HANDOFF_SURFACE_KEY,
-  MANAGED_TAB_LEDGER_KEY,
   type HandoffSurface,
+  MANAGED_TAB_LEDGER_KEY,
+  TOOLBAR_COUNT_MODE_KEY,
+  type ToolbarCountMode,
 } from "./state";
 import { isPDFPage, pdfSourceURL, sanitizePageHost } from "./deliver";
 import {
@@ -215,8 +229,12 @@ const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
 const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE = "triage_snapshot_schema_v3";
 const TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE = "triage_snapshot_schema_v4";
+const TRIAGE_SNAPSHOT_SCHEMA_5_FEATURE = "triage_snapshot_schema_v5";
 const TRIAGE_COUNTS_SCHEMA_2_FEATURE = "triage_counts_schema_v2";
+const TRIAGE_COUNTS_SCHEMA_3_FEATURE = "triage_counts_schema_v3";
 const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
+const SURFACE_PRESENCE_FEATURE = "surface_presence_v1";
+const WORK_PULSE_FEATURE = "work_pulse_v1";
 const SESSION_EVIDENCE_FEATURE = "session_evidence_v1";
 const DELIVERY_CONTEXT_FEATURE = "delivery_context_v1";
 const PROVIDER_DIRECT_GET_FEATURE = "provider_direct_get_v1";
@@ -225,11 +243,13 @@ const PROVIDER_DRIVE_EPOCH_FEATURE = "provider_drive_epoch_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 const STATS_FEATURE = "browser_stats_v1";
 const ACTIVITY_FEED_FEATURE = "activity_feed_v1";
+const ACTIVITY_PAGE_FEATURE = "activity_page_v1";
 const PAGE_CAPTURE_FEATURE = "page_capture_v1";
 const PAGE_CAPTURE_REQUEST_FEATURE = "page_capture_request_v1";
 const PAGE_CAPTURE_TERMS_FEATURE = "page_capture_terms_v1";
 /** ADR-0019 Decision 7: page_bulk_status_request/page_bulk_submit_request. */
 const PAGE_BULK_ACQUIRE_FEATURE = "page_bulk_acquire_v1";
+const PAGE_BULK_COHORT_V2_FEATURE = "page_bulk_cohort_v2";
 const PDF_GRAB_FEATURE = "pdf_grab_v1";
 const INSTITUTIONAL_MATERIALIZATION_FEATURE = "institutional_materialization_v1";
 const MATERIALIZE_PAGE_PATH = "materialize.html";
@@ -267,10 +287,14 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "review_preview_result",
   "stats_response",
   "activity_response",
+  "activity_page_response",
   "pdf_grab_status_result",
   "pdf_grab_abandon_result",
   "delivery_reconcile_result",
   "pdf_grab_result",
+  "surface_presence_ack",
+  "work_pulse_response",
+  "page_bulk_submit_v2_result",
   "handoff_link_result",
   "provider_drive_epoch_start_result",
   "provider_drive_epoch_result",
@@ -287,16 +311,27 @@ const HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH = 72;
 function isHandoffGroupTitle(title: string | undefined): boolean {
   return title === HANDOFF_GROUP_TITLE || title?.startsWith(`${HANDOFF_GROUP_TITLE} — `) === true;
 }
+export type { ToolbarCountMode };
 
 export interface BadgeState {
-  connectionStatus: StoreShape["connectionStatus"];
+  connectionStatus: StoreShape["connectionStatus"] | undefined;
   reauthNeeded: boolean;
   authBlockers: number;
   /** Number of active jobs left on a provider security check/dead-end page. */
-  challengeBlocked?: number;
+  challengeBlocked?: number | undefined;
   blockedHosts: number | readonly string[];
   ungrantedResolvers: number;
+  /** Legacy pending inventory, used only when v3 is unavailable or mode=all. */
   triageCount: number | undefined;
+  /** Exact daemon-owned actionable turns from counts schema v3. */
+  requiredTurnCount?: number | undefined;
+  /** True only when the daemon supplied a complete required-turn projection. */
+  requiredTurnsComplete?: boolean | undefined;
+  /** Counts schema v3 was negotiated for this reading. */
+  countsSchemaV3?: boolean | undefined;
+  watchHits?: number | undefined;
+  retractions?: number | undefined;
+  toolbarCountMode?: ToolbarCountMode | undefined;
 }
 
 export interface BadgeResult {
@@ -305,11 +340,9 @@ export interface BadgeResult {
   tooltip: string;
 }
 
-/** Compute the one toolbar badge used by every background subsystem.
- * Precedence is documented and intentional: disconnected daemon (gray) >
- * reauthentication (orange) > sign-in blockers (orange) > challenge-blocked
- * jobs (orange) > blocked providers (orange) > resolver grants (blue) >
- * triage (blue) > blank. */
+/** Compute the toolbar badge. Browser-local blockers always outrank counts.
+ * Schema v3 turns are used only when negotiated and complete; old daemons
+ * honestly fall back to pending inventory. */
 export function computeBadge(state: BadgeState): BadgeResult {
   const blockedHostCount =
     typeof state.blockedHosts === "number"
@@ -319,10 +352,20 @@ export function computeBadge(state: BadgeState): BadgeResult {
     typeof state.challengeBlocked === "number" ? Math.max(0, Math.trunc(state.challengeBlocked)) : 0;
   const authBlockerCount = Math.max(0, Math.trunc(state.authBlockers));
   const resolverCount = Math.max(0, Math.trunc(state.ungrantedResolvers));
-  const triageCount =
+  const pendingCount =
     typeof state.triageCount === "number" && Number.isFinite(state.triageCount)
       ? Math.max(0, Math.trunc(state.triageCount))
       : undefined;
+  const requiredCount =
+    typeof state.requiredTurnCount === "number" && Number.isFinite(state.requiredTurnCount)
+      ? Math.max(0, Math.trunc(state.requiredTurnCount))
+      : undefined;
+  const mode = state.toolbarCountMode ?? "required";
+  const v3Complete = state.countsSchemaV3 === true && state.requiredTurnsComplete === true && requiredCount !== undefined;
+  const watchHits = Math.max(0, Math.trunc(state.watchHits ?? 0));
+  const retractions = Math.max(0, Math.trunc(state.retractions ?? 0));
+  const breakdown = (need: number): string =>
+    `papio: ${need} need you · ${watchHits} watch hit${watchHits === 1 ? "" : "s"} · ${retractions} retraction notice${retractions === 1 ? "" : "s"}`;
   if (state.connectionStatus !== "connected") {
     return { text: "!", color: "#777777", tooltip: "papio: daemon disconnected" };
   }
@@ -344,8 +387,7 @@ export function computeBadge(state: BadgeState): BadgeResult {
     };
   }
   if (blockedHostCount > 0) {
-    const host =
-      typeof state.blockedHosts === "number" ? undefined : state.blockedHosts[0];
+    const host = typeof state.blockedHosts === "number" ? undefined : state.blockedHosts[0];
     const tooltip =
       blockedHostCount === 1 && typeof host === "string"
         ? `papio: ${host} needs browser access`
@@ -359,18 +401,34 @@ export function computeBadge(state: BadgeState): BadgeResult {
       tooltip: `papio: ${resolverCount} library resolver permission${resolverCount === 1 ? "" : "s"} need attention`,
     };
   }
-  if (triageCount !== undefined && triageCount > 0) {
+  if (mode === "off") return { text: "", color: "#1a73e8", tooltip: "papio: connected" };
+  if (mode === "all") {
+    if (pendingCount !== undefined && pendingCount > 0) {
+      return { text: String(pendingCount), color: "#1a73e8", tooltip: `papio: ${pendingCount} pending item${pendingCount === 1 ? "" : "s"}` };
+    }
+    return { text: "", color: "#1a73e8", tooltip: pendingCount === 0 ? "papio: no pending items" : "papio: pending items unavailable" };
+  }
+  if (state.countsSchemaV3 !== true) {
+    if (pendingCount !== undefined && pendingCount > 0) {
+      return {
+        text: String(pendingCount),
+        color: "#1a73e8",
+        tooltip: `papio: ${pendingCount} pending item${pendingCount === 1 ? "" : "s"}`,
+      };
+    }
     return {
-      text: String(triageCount),
+      text: "",
       color: "#1a73e8",
-      tooltip: `papio: ${triageCount} pending triage item${triageCount === 1 ? "" : "s"}`,
+      tooltip: "papio: connected",
     };
   }
-  return {
-    text: "",
-    color: "#1a73e8",
-    tooltip: triageCount === 0 ? "papio: no pending triage items" : "papio: connected",
-  };
+  if (!v3Complete) {
+    return { text: "", color: "#1a73e8", tooltip: "Many decisions waiting — open inbox" };
+  }
+  if (requiredCount > 0) {
+    return { text: String(requiredCount), color: "#1a73e8", tooltip: breakdown(requiredCount) };
+  }
+  return { text: "", color: "#1a73e8", tooltip: breakdown(0) };
 }
 export interface SessionAuthDemand {
   job_id: string;
@@ -621,7 +679,6 @@ export interface DownloadItemLike {
    * chrome.downloads.DownloadItem, in which case we fall back to referrer. */
   tabId?: number | undefined;
 }
-
 export interface DownloadDeltaLike {
   id: number;
   state?: { current?: string | undefined } | undefined;
@@ -663,6 +720,8 @@ export interface BridgeDeps {
   /** Runtime URL seam for the URL-free materialization scaffold. */
   runtimeGetURL?: (path: string) => string;
   /** Injectable timers so tests control reconnect backoff and queue release. */
+  /** Dedicated local cohort recovery seam; never uses the managed state backend. */
+  pageBulkRecovery?: PageBulkCohortRecovery;
   setTimeout(fn: () => void | Promise<void>, ms: number): void;
   backend: StateBackend;
   tabs: {
@@ -742,6 +801,10 @@ export interface BridgeDeps {
       func: (...args: never[]) => unknown;
       args?: unknown[];
     }): Promise<{ result?: unknown }[]>;
+  };
+  /** Browser-local toolbar count mode. */
+  toolbarCount?: {
+    get(): Promise<ToolbarCountMode>;
   };
   /** The observation path needs durable quota state but must not depend on a
    * browser global, so tests can prove the capture frame reaches the bridge. */
@@ -955,6 +1018,8 @@ export const INBOX_RUNTIME_MESSAGE_TYPES = [
   "papio.page_capture",
   "papio.openInbox",
   "papio.stats",
+  "papio.work.pulse",
+  "papio.surface.presence",
   "papio.handoff.open",
   "papio.delivery.start",
   "papio.delivery.state",
@@ -993,6 +1058,16 @@ interface BrokerSuccess<T extends Record<string, unknown>> {
 }
 
 type BrokerReply<T extends Record<string, unknown>> = BrokerFailure | (BrokerSuccess<T> & T);
+type ActivityPageBrokerPayload = {
+  feature: boolean;
+  entries: ActivityEntryPayload[];
+  generated_at?: string;
+  has_more?: boolean;
+  cursor?: string;
+  latest_seq?: number;
+  new_count_since?: number;
+  gap?: boolean;
+};
 
 interface DeliveryStartPayload {
   tab_id: number;
@@ -1764,16 +1839,17 @@ export class Bridge {
   /** Broker-tab ids whose auth attempt is already counted, so the SSO redirect
    * dance within one drive increments the budget only once. Worker-local. */
   private readonly authCountedTabs = new Set<number>();
-  /** Serializes the complete managed-tab reuse/create decision, so concurrent
-   * inbox clicks or re-offers cannot both observe an empty candidate set. */
+  private readonly pageBulkRecovery: PageBulkCohortRecovery;
   private managedTabChain: Promise<unknown> = Promise.resolve();
   /** Coalesce concurrent inbox clicks for one job so one request owns the
-   * managed-tab focus/open choreography and all callers receive its result. */
+   * open/focus choreography and all callers receive its result. */
   private readonly openHandoffRequests = new Map<
     string,
     Promise<BrokerReply<{ opened: true }>>
   >();
   constructor(private readonly deps: BridgeDeps) {
+    this.workerEpoch = deps.randomUUID().replace(/-/g, "");
+    this.pageBulkRecovery = deps.pageBulkRecovery ?? new PageBulkCohortRecovery();
     // A Firefox-only runtime probe is asynchronous; fail closed until its
     // version and durable consent have been resolved. Chrome has no probe and
     // therefore retains the existing always-on default above.
@@ -1784,20 +1860,32 @@ export class Bridge {
   /** Serializes work-window creation so concurrent offers cannot race two
    * dedicated windows into existence. Worker-local only. */
   private workTabChain: Promise<unknown> = Promise.resolve();
-  /** The broker-tab chain does not cover keepalive placement, so group adoption
-   * needs its own gate to prevent two first folds from both creating a group. */
   private handoffGroupChain: Promise<void> = Promise.resolve();
-  /** A persisted id can name only one window; retain the other live groups for
-   * this worker so window-local handoffs do not overwrite each other. */
   private readonly handoffGroupIDsByWindow = new Map<number, number>();
-  /** Native port messages may await storage, tabs, or downloads. Preserve wire
+  /** Native port messages may await storage, tabs, or downloads. Preserve
    * receipt order across those awaits so state transitions never interleave. */
+  /** Best-effort display cache only, refreshed from daemon counts or snapshots. */
+  private triagePendingCount: number | undefined;
+  private triageRequiredTurnCount: number | undefined;
+  private triageRequiredTurnsComplete = false;
+  private triageCountsSchemaV3 = false;
+  private triageWatchHits = 0;
+  private triageRetractions = 0;
+  private toolbarCountMode: ToolbarCountMode = "required";
+  private lastBadgePaint: BadgeResult | undefined;
   private inboundChain: Promise<void> = Promise.resolve();
   /** One resolver per correlated native triage request. It is intentionally
    * worker-memory only; daemon state remains the authority after a restart. */
   private readonly pendingNativeRequests = new Map<string, PendingNativeRequest>();
   /** One detached response-loss retry timer per materialization job. */
   private readonly materializationRetryTimers = new Map<string, object>();
+  /** Typed pulse cache is worker-local; receipt time is browser time and never
+   * replaced with daemon generated_at. A fresh worker starts with no trusted
+   * reading, so callers render Unknown until the next validated response. */
+  private pulseCache:
+    | { pulse: WorkPulseResponsePayload; receivedAt: number; workerEpoch: string }
+    | undefined;
+  private readonly workerEpoch: string;
   /** Materialization replies have no request_id by protocol design. Match
    * them only to the current opaque job/claim/binding correlation. */
   private readonly pendingMaterializationRequests: PendingMaterializationRequest[] = [];
@@ -1815,7 +1903,6 @@ export class Bridge {
   private readonly helloWaiters = new Set<(acknowledged: boolean) => void>();
   private requestIDSequence = 0;
   /** Best-effort display cache only, refreshed from daemon counts or snapshots. */
-  private triagePendingCount: number | undefined;
   /** Durable institutional demand from the most recent negotiated counts poll. */
   private triageActionsRequiresAuth: number | undefined;
   private triageActionsRequiresAuthAt: number | undefined;
@@ -3516,6 +3603,14 @@ export class Bridge {
       // contains() is asynchronous; never paint a connected result after the
       // port has dropped while permission checks were in flight.
       if (status === "connected" && this.store.connectionStatus !== "connected") return;
+      if (this.deps.toolbarCount !== undefined) {
+        try {
+          const mode = await this.deps.toolbarCount.get();
+          if (mode === "required" || mode === "all" || mode === "off") this.toolbarCountMode = mode;
+        } catch {
+          // Default required mode remains safe when storage is unavailable.
+        }
+      }
       const badge = computeBadge({
         connectionStatus: status,
         reauthNeeded: this.keepaliveReauthNeeded,
@@ -3524,7 +3619,19 @@ export class Bridge {
         blockedHosts: blockedProviderHosts,
         ungrantedResolvers: ungrantedResolverOrigins,
         triageCount: this.triagePendingCount,
+        requiredTurnCount: this.triageRequiredTurnCount,
+        requiredTurnsComplete: this.triageRequiredTurnsComplete,
+        countsSchemaV3: this.triageCountsSchemaV3,
+        watchHits: this.triageWatchHits,
+        retractions: this.triageRetractions,
+        toolbarCountMode: this.toolbarCountMode,
       });
+      if (
+        this.lastBadgePaint?.text === badge.text &&
+        this.lastBadgePaint.color === badge.color &&
+        this.lastBadgePaint.tooltip === badge.tooltip
+      ) return;
+      this.lastBadgePaint = badge;
       await Promise.all([
         this.deps.action.setBadgeText({ text: badge.text }),
         this.deps.action.setBadgeBackgroundColor({ color: badge.color }),
@@ -4591,8 +4698,18 @@ export class Bridge {
     payload: Record<string, unknown>,
     expectedType: BrowserMessageType,
     jobID?: string,
+    suppliedRequestID?: string,
   ): Promise<NativeRequestResult> {
-    const requestID = this.nextRequestID();
+    const requestID = suppliedRequestID ?? this.nextRequestID();
+    if (typeof requestID !== "string" || requestID.length === 0 || requestID.length > 64 || /[\u0000-\u001f\u007f]/u.test(requestID)) {
+      return Promise.resolve({ kind: "transport", code: "invalid_request_id", message: "The supplied request id is invalid" });
+    }
+    if (typeof payload["request_id"] === "string" && payload["request_id"] !== requestID) {
+      return Promise.resolve({ kind: "transport", code: "request_id_mismatch", message: "The supplied request id does not match the payload" });
+    }
+    if (this.pendingNativeRequests.has(requestID)) {
+      return Promise.resolve({ kind: "transport", code: "duplicate_request_id", message: "A request with this id is already pending" });
+    }
     return new Promise<NativeRequestResult>((resolve) => {
       const pending: PendingNativeRequest = { expectedType, resolve };
       this.pendingNativeRequests.set(requestID, pending);
@@ -4612,7 +4729,6 @@ export class Bridge {
       }
     });
   }
-
   private async requestNative(
     type: BrowserMessageType,
     payload: Record<string, unknown>,
@@ -4620,11 +4736,13 @@ export class Bridge {
     feature: string,
     mutation: boolean,
     jobID?: string,
+    suppliedRequestID?: string,
+    retryTransport = !mutation,
   ): Promise<NativeRequestResult> {
     if (!CORRELATED_RESULT_TYPES.has(expectedType)) {
       throw new Error(`papio: correlated request expects unrouted reply type ${expectedType}`);
     }
-    const attempts = mutation ? 1 : 2;
+    const attempts = retryTransport ? (mutation ? 1 : 2) : 1;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       if (!(await this.ensureConnected())) {
         return {
@@ -4640,13 +4758,14 @@ export class Bridge {
           message: "This daemon does not support the requested inbox feature",
         };
       }
-      const result = await this.sendCorrelated(type, payload, expectedType, jobID);
-      if (result.kind !== "transport" || mutation || attempt + 1 === attempts) return result;
+      const result = await this.sendCorrelated(type, payload, expectedType, jobID, suppliedRequestID);
+      if (result.kind !== "transport" || !retryTransport || attempt + 1 === attempts) return result;
       // Reads are safe to retry once after a confirmed transport failure;
       // mutations deliberately return their ambiguous status to the page.
     }
     return { kind: "transport", code: "connection_lost", message: "The daemon is unavailable" };
   }
+
   private supportsFreshHandoffLinks(): boolean {
     return (this.store.daemonFeatures ?? []).includes(HANDOFF_LINK_FEATURE);
   }
@@ -5581,18 +5700,21 @@ export class Bridge {
     const mapped = typeof outcome === "string" ? details[outcome] : undefined;
     return failure(mapped?.code ?? "daemon_error", mapped?.message ?? "The daemon rejected the handoff link");
   }
+
   async requestTriageSnapshot(
-    request: { schema_versions: [1] | [2] | [3] | [4] | [4, 3]; limit?: number; cursor?: string },
+    request: { schema_versions: [1] | [2] | [3] | [4] | [5] | [4, 3] | [5, 4]; limit?: number; cursor?: string },
   ): Promise<BrokerReply<{ snapshot: Record<string, unknown> }>> {
     const features = this.store.daemonFeatures ?? [];
-    const schemaVersions: [1] | [2] | [3] | [4] | [4, 3] =
-      features.includes(TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE)
-        ? [4, 3]
-        : features.includes(TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE)
-          ? [3]
-          : features.includes(TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE)
-            ? [2]
-            : request.schema_versions;
+    const schemaVersions: [1] | [2] | [3] | [4] | [5] | [4, 3] | [5, 4] =
+      features.includes(TRIAGE_SNAPSHOT_SCHEMA_5_FEATURE)
+        ? [5, 4]
+        : features.includes(TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE)
+          ? [4, 3]
+          : features.includes(TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE)
+            ? [3]
+            : features.includes(TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE)
+              ? [2]
+              : request.schema_versions;
     const result = await this.requestNative(
       "triage_snapshot_request",
       { ...request, schema_versions: schemaVersions },
@@ -5605,17 +5727,28 @@ export class Bridge {
     const { request_id: _requestID, ...snapshot } = result.payload;
     const counts = snapshot["counts"];
     if (typeof counts === "object" && counts !== null && typeof (counts as Record<string, unknown>)["pending_total"] === "number") {
-      this.triagePendingCount = (counts as Record<string, number>)["pending_total"];
+      this.updateTriageCounts(counts as Record<string, unknown>, features.includes(TRIAGE_COUNTS_SCHEMA_3_FEATURE));
       await this.syncConnectionBadge();
     }
     return { ok: true, snapshot };
   }
 
+  private updateTriageCounts(record: Record<string, unknown>, schemaV3: boolean): void {
+    this.triagePendingCount = typeof record["pending_total"] === "number" ? record["pending_total"] : undefined;
+    this.triageCountsSchemaV3 = schemaV3;
+    this.triageRequiredTurnCount = typeof record["turns_required"] === "number" ? record["turns_required"] : undefined;
+    this.triageRequiredTurnsComplete = record["required_turns_complete"] === true;
+    this.triageWatchHits = typeof record["watch_hits"] === "number" ? record["watch_hits"] : 0;
+    this.triageRetractions = typeof record["retractions"] === "number" ? record["retractions"] : 0;
+  }
+
   async requestTriageCounts(): Promise<BrokerReply<{ counts: Record<string, unknown>; generated_at: string }>> {
     const features = this.store.daemonFeatures ?? [];
-    const payload = features.includes(TRIAGE_COUNTS_SCHEMA_2_FEATURE)
-      ? { schema_versions: [2] }
-      : {};
+    const payload = features.includes(TRIAGE_COUNTS_SCHEMA_3_FEATURE)
+      ? { schema_versions: [3] }
+      : features.includes(TRIAGE_COUNTS_SCHEMA_2_FEATURE)
+        ? { schema_versions: [2] }
+        : {};
     const result = await this.requestNative(
       "triage_counts_request",
       payload,
@@ -5628,11 +5761,8 @@ export class Bridge {
     const counts = result.payload["counts"];
     if (typeof counts !== "object" || counts === null) return failure("invalid_response", "The daemon returned invalid counts");
     const record = counts as Record<string, unknown>;
-    const pending = record["pending_total"];
-    if (typeof pending === "number") {
-      this.triagePendingCount = pending;
-      await this.syncConnectionBadge();
-    }
+    this.updateTriageCounts(record, features.includes(TRIAGE_COUNTS_SCHEMA_3_FEATURE));
+    await this.syncConnectionBadge();
     const actionsRequiresAuth = record["actions_requires_auth"];
     if (typeof actionsRequiresAuth === "number") {
       this.triageActionsRequiresAuth = actionsRequiresAuth;
@@ -5642,13 +5772,8 @@ export class Bridge {
       this.triageActionsRequiresAuthAt = undefined;
     }
     await this.keepaliveManager?.sync();
-    return {
-      ok: true,
-      counts: record,
-      generated_at: new Date(this.deps.now()).toISOString(),
-    };
+    return { ok: true, counts: record, generated_at: new Date(this.deps.now()).toISOString() };
   }
-
   async requestStats(): Promise<BrokerReply<{ stats: Record<string, unknown> }>> {
     const result = await this.requestNative(
       "stats_request",
@@ -5662,27 +5787,88 @@ export class Bridge {
     const { request_id: _requestID, ...stats } = result.payload;
     return { ok: true, stats };
   }
-  async requestActivity(limit?: number): Promise<BrokerReply<{ feature: boolean; entries: ActivityEntryPayload[] }>> {
-    // Do not even open/reconnect the native path for a daemon that has already
-    // advertised that it cannot serve the feed. The inbox treats this as a
-    // normal, feature-gated empty result rather than an error.
-    if (!(this.store.daemonFeatures ?? []).includes(ACTIVITY_FEED_FEATURE)) {
-      return { ok: true, feature: false, entries: [] };
+  async requestWorkPulse(): Promise<
+    BrokerReply<{
+      available: boolean;
+      pulse?: WorkPulseResponsePayload;
+      received_at?: number;
+      worker_epoch: string;
+    }>
+  > {
+    if (!(this.store.daemonFeatures ?? []).includes(WORK_PULSE_FEATURE)) {
+      return { ok: true, available: false, worker_epoch: this.workerEpoch };
     }
     const result = await this.requestNative(
+      "work_pulse_request",
+      { schema_versions: [1] },
+      "work_pulse_response",
+      WORK_PULSE_FEATURE,
+      false,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code === "feature_unavailable") return { ok: true, available: false, worker_epoch: this.workerEpoch };
+    if (result.code !== undefined) return failure(result.code, result.message ?? "The pulse is unavailable");
+    const pulse = result.payload as unknown as WorkPulseResponsePayload;
+    if (pulse.schema !== 1 || typeof pulse.generated_at !== "string") {
+      return failure("invalid_response", "The daemon returned an invalid work pulse");
+    }
+    const receivedAt = this.deps.now();
+    this.pulseCache = { pulse, receivedAt, workerEpoch: this.workerEpoch };
+    return { ok: true, available: true, pulse, received_at: receivedAt, worker_epoch: this.workerEpoch };
+  }
+
+  async sendSurfacePresence(
+    payload: Omit<SurfacePresencePayload, "request_id">,
+  ): Promise<BrokerReply<{ accepted: boolean }>> {
+    if (!(this.store.daemonFeatures ?? []).includes(SURFACE_PRESENCE_FEATURE)) {
+      return { ok: true, accepted: false };
+    }
+    const result = await this.requestNative(
+      "surface_presence",
+      payload,
+      "surface_presence_ack",
+      SURFACE_PRESENCE_FEATURE,
+      false,
+      undefined,
+      undefined,
+      false,
+    );
+    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined) return failure(result.code, result.message ?? "Presence was not accepted");
+    return { ok: true, accepted: result.payload["accepted"] === true };
+  }
+  async requestActivity(request: { limit?: number; before_seq?: string; seen_through_seq?: string } = {}): Promise<BrokerReply<ActivityPageBrokerPayload>> {
+    const features = this.store.daemonFeatures ?? [];
+    if (features.includes(ACTIVITY_PAGE_FEATURE)) {
+      const result = await this.requestNative(
+        "activity_page_request",
+        request,
+        "activity_page_response",
+        ACTIVITY_PAGE_FEATURE,
+        false,
+      );
+      if (result.kind !== "response") return this.nativeFailure(result);
+      if (result.code === "feature_unavailable") return { ok: true, feature: false, entries: [] };
+      if (result.code !== undefined || result.payload === undefined) return failure(result.code ?? "unavailable", result.message ?? "The request is unavailable");
+      const { request_id: _requestID, ...payload } = result.payload;
+      const entries = payload["entries"];
+      if (!Array.isArray(entries)) return failure("invalid_response", "The daemon returned invalid activity entries");
+      return { ok: true, feature: true, ...payload, entries };
+    }
+    if (!features.includes(ACTIVITY_FEED_FEATURE)) return { ok: true, feature: false, entries: [] };
+    const result = await this.requestNative(
       "activity_request",
-      limit === undefined ? {} : { limit },
+      request.limit === undefined ? {} : { limit: request.limit },
       "activity_response",
       ACTIVITY_FEED_FEATURE,
       false,
     );
     if (result.kind !== "response") return this.nativeFailure(result);
     if (result.code === "feature_unavailable") return { ok: true, feature: false, entries: [] };
-    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
-    if (result.payload === undefined) return this.nativeFailure(result);
+    if (result.code !== undefined || result.payload === undefined) return failure(result.code ?? "unavailable", result.message ?? "The request is unavailable");
     const entries = result.payload["entries"];
     if (!Array.isArray(entries)) return failure("invalid_response", "The daemon returned invalid activity entries");
-    return { ok: true, feature: true, entries: entries as ActivityEntryPayload[] };
+    return { ok: true, feature: true, entries, has_more: false, latest_seq: entries.reduce((max, entry) => Math.max(max, entry.seq), 0) };
   }
 
   // -------------------------------------------------------------------------
@@ -6104,38 +6290,224 @@ export class Bridge {
     return { ok: true, items: items as PageBulkStatusItem[], truncated };
   }
 
-  /** A submit is a mutation: it creates a batch, so — like requestTriageDecision
-   * — it gets exactly one attempt, never the read path's transport retry. */
+  /** Submit a complete ordered manifest. Background owns v2 chunking and
+   * recovery; old daemons receive only the first 50 keys through v1. */
   async requestPageBulkSubmit(
     request: { scan_id: string; canonical_keys: string[]; source: PageBulkSubmitSource },
   ): Promise<
-    BrokerReply<{ submitted: number; joined: number; already_owned: number; invalid: number; batch_id: string }>
+    BrokerReply<{
+      mode: "v1" | "v2";
+      processed_count: number;
+      submitted: number;
+      joined: number;
+      already_owned: number;
+      invalid: number;
+      batch_id: string;
+    }>
   > {
-    const result = await this.requestNative(
-      "page_bulk_submit_request",
-      request,
-      "page_bulk_submit_result",
-      PAGE_BULK_ACQUIRE_FEATURE,
-      true,
-    );
-    if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
-    if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
-    const payload = result.payload;
-    const submitted = payload["submitted"];
-    const joined = payload["joined"];
-    const alreadyOwned = payload["already_owned"];
-    const invalid = payload["invalid"];
-    const batchID = payload["batch_id"];
-    if (
-      typeof submitted !== "number" ||
-      typeof joined !== "number" ||
-      typeof alreadyOwned !== "number" ||
-      typeof invalid !== "number" ||
-      typeof batchID !== "string"
-    ) {
-      return failure("invalid_response", "The daemon returned an invalid page-bulk submit result");
+    const v2Available =
+      this.store.connectionStatus === "connected" &&
+      (this.store.daemonFeatures ?? []).includes(PAGE_BULK_COHORT_V2_FEATURE);
+    if (!v2Available) {
+      const keys = request.canonical_keys.slice(0, 50);
+      const result = await this.requestNative(
+        "page_bulk_submit_request",
+        { ...request, canonical_keys: keys },
+        "page_bulk_submit_result",
+        PAGE_BULK_ACQUIRE_FEATURE,
+        true,
+      );
+      if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+      if (result.code !== undefined) return failure(result.code, result.message ?? "The request is unavailable");
+      const payload = result.payload;
+      const submitted = payload["submitted"];
+      const joined = payload["joined"];
+      const alreadyOwned = payload["already_owned"];
+      const invalid = payload["invalid"];
+      const batchID = payload["batch_id"];
+      if (
+        typeof submitted !== "number" || typeof joined !== "number" ||
+        typeof alreadyOwned !== "number" || typeof invalid !== "number" || typeof batchID !== "string"
+      ) return failure("invalid_response", "The daemon returned an invalid page-bulk submit result");
+      return {
+        ok: true, mode: "v1", processed_count: keys.length, submitted, joined,
+        already_owned: alreadyOwned, invalid, batch_id: batchID,
+      };
     }
-    return { ok: true, submitted, joined, already_owned: alreadyOwned, invalid, batch_id: batchID };
+
+    const source: PageBulkRecoverySource = {
+      kind: "browser_page",
+      origin: request.source.origin,
+      detector: request.source.detector,
+    };
+    const cohortID = this.nextRequestID();
+    const total = request.canonical_keys.length;
+    const totalChunks = Math.ceil(total / 50);
+    const firstIndex = 0;
+    const firstKeys = request.canonical_keys.slice(0, 50);
+    const firstFinal = totalChunks === 1;
+    const firstRequestID = this.nextRequestID();
+    const firstDigest = await pageBulkPayloadDigest({
+      scan_id: request.scan_id, cohort_id: cohortID, source, cohort_total: total,
+      chunk_index: firstIndex, final_chunk: firstFinal, canonical_keys: firstKeys,
+    });
+    const first: PageBulkRecoveryCohort = {
+      cohort_id: cohortID,
+      scan_id: request.scan_id,
+      source,
+      cohort_total: total,
+      canonical_keys: [...request.canonical_keys],
+      next_chunk: 0,
+      unresolved: { request_id: firstRequestID, chunk_index: firstIndex, payload_digest: firstDigest },
+      updated_at: new Date(this.deps.now()).toISOString(),
+    };
+    try {
+      await this.pageBulkRecovery.put(first);
+    } catch {
+      return failure("recovery_storage", "Could not persist page-bulk recovery state");
+    }
+
+    let submitted = 0;
+    let joined = 0;
+    let alreadyOwned = 0;
+    let invalid = 0;
+    let batchID = "";
+    for (let index = 0; index < totalChunks; index += 1) {
+      const loaded = await this.pageBulkRecovery.load();
+      const cohort = loaded.cohorts[cohortID];
+      if (cohort === undefined) {
+        // A completed final chunk removes the entry; there is no next send.
+        break;
+      }
+      const keys = chunkKeysFor(cohort, index);
+      const finalChunk = index === totalChunks - 1;
+      let unresolved = cohort.unresolved;
+      if (cohort.next_chunk !== index) {
+        if (cohort.next_chunk > index) continue;
+        return failure("recovery_state", "Page-bulk recovery state is out of sequence");
+      }
+      if (unresolved === undefined || unresolved.chunk_index !== index) {
+        const requestID = this.nextRequestID();
+        const digest = await pageBulkPayloadDigest({
+          scan_id: cohort.scan_id, cohort_id: cohort.cohort_id, source: cohort.source,
+          cohort_total: cohort.cohort_total, chunk_index: index, final_chunk: finalChunk, canonical_keys: keys,
+        });
+        unresolved = { request_id: requestID, chunk_index: index, payload_digest: digest };
+        try {
+          await this.pageBulkRecovery.put({
+            ...cohort, unresolved, updated_at: new Date(this.deps.now()).toISOString(),
+          });
+        } catch {
+          return failure("recovery_storage", "Could not persist page-bulk recovery state");
+        }
+      }
+      const result = await this.requestNative(
+        "page_bulk_submit_v2_request",
+        {
+          scan_id: cohort.scan_id,
+          cohort_id: cohort.cohort_id,
+          source: cohort.source,
+          cohort_total: cohort.cohort_total,
+          chunk_index: index,
+          final_chunk: finalChunk,
+          canonical_keys: keys,
+        },
+        "page_bulk_submit_v2_result",
+        PAGE_BULK_COHORT_V2_FEATURE,
+        true,
+        undefined,
+        unresolved.request_id,
+      );
+      if (result.kind !== "response" || result.payload === undefined) return this.nativeFailure(result);
+      if (result.code !== undefined) return failure(result.code, result.message ?? "The daemon rejected the page-bulk cohort");
+      const payload = result.payload;
+      if (
+        payload["request_id"] !== unresolved.request_id ||
+        payload["scan_id"] !== cohort.scan_id ||
+        payload["cohort_id"] !== cohort.cohort_id ||
+        payload["chunk_index"] !== index ||
+        payload["final_chunk"] !== finalChunk ||
+        typeof payload["batch_id"] !== "string"
+      ) return failure("invalid_response", "The daemon returned an invalid page-bulk cohort result");
+      const chunkSubmitted = payload["submitted"];
+      const chunkJoined = payload["joined"];
+      const chunkOwned = payload["already_owned"];
+      const chunkInvalid = payload["invalid"];
+      if (typeof chunkSubmitted !== "number" || typeof chunkJoined !== "number" || typeof chunkOwned !== "number" || typeof chunkInvalid !== "number") {
+        return failure("invalid_response", "The daemon returned an invalid page-bulk cohort result");
+      }
+      submitted += chunkSubmitted;
+      joined += chunkJoined;
+      alreadyOwned += chunkOwned;
+      invalid += chunkInvalid;
+      batchID = payload["batch_id"];
+      let applied = false;
+      try {
+        await this.pageBulkRecovery.update(cohortID, (current) => {
+          if (current.next_chunk !== index || current.unresolved?.request_id !== unresolved?.request_id) return current;
+          applied = true;
+          if (finalChunk) return undefined;
+          const { unresolved: _discard, ...withoutUnresolved } = current;
+          return { ...withoutUnresolved, next_chunk: index + 1, updated_at: new Date(this.deps.now()).toISOString() };
+        });
+      } catch {
+        return failure("recovery_storage", "Could not commit page-bulk recovery result");
+      }
+      if (!applied) continue;
+    }
+    return {
+      ok: true, mode: "v2", processed_count: total, submitted, joined,
+      already_owned: alreadyOwned, invalid, batch_id: batchID,
+    };
+  }
+  private async resumePageBulkCohort(cohortID: string): Promise<void> {
+    while (true) {
+      const loaded = await this.pageBulkRecovery.load();
+      const cohort = loaded.cohorts[cohortID];
+      if (cohort === undefined || cohort.unresolved === undefined) return;
+      if (!(this.store.daemonFeatures ?? []).includes(PAGE_BULK_COHORT_V2_FEATURE)) return;
+      const index = cohort.unresolved.chunk_index;
+      const keys = chunkKeysFor(cohort, index);
+      const finalChunk = index === Math.ceil(cohort.cohort_total / 50) - 1;
+      const result = await this.requestNative(
+        "page_bulk_submit_v2_request",
+        {
+          scan_id: cohort.scan_id, cohort_id: cohort.cohort_id, source: cohort.source,
+          cohort_total: cohort.cohort_total, chunk_index: index, final_chunk: finalChunk, canonical_keys: keys,
+        },
+        "page_bulk_submit_v2_result",
+        PAGE_BULK_COHORT_V2_FEATURE,
+        true,
+        undefined,
+        cohort.unresolved.request_id,
+      );
+      if (result.kind !== "response" || result.payload === undefined || result.code !== undefined) return;
+      const payload = result.payload;
+      if (
+        payload["request_id"] !== cohort.unresolved.request_id ||
+        payload["scan_id"] !== cohort.scan_id || payload["cohort_id"] !== cohort.cohort_id ||
+        payload["chunk_index"] !== index || payload["final_chunk"] !== finalChunk
+      ) return;
+      let applied = false;
+      try {
+        await this.pageBulkRecovery.update(cohortID, (current) => {
+          if (current.next_chunk !== index || current.unresolved?.request_id !== cohort.unresolved?.request_id) return current;
+          applied = true;
+          if (finalChunk) return undefined;
+          const { unresolved: _discard, ...withoutUnresolved } = current;
+          return { ...withoutUnresolved, next_chunk: index + 1, updated_at: new Date(this.deps.now()).toISOString() };
+        });
+      } catch {
+        return;
+      }
+      if (!applied) return;
+    }
+  }
+
+  private async resumePageBulkCohorts(): Promise<void> {
+    if (!(this.store.daemonFeatures ?? []).includes(PAGE_BULK_COHORT_V2_FEATURE)) return;
+    const loaded = await this.pageBulkRecovery.load();
+    for (const cohortID of Object.keys(loaded.cohorts)) void this.resumePageBulkCohort(cohortID);
   }
 
   /** Membership read/write for the scanner-scoped allowlist (Decision 2).
@@ -6442,6 +6814,9 @@ export class Bridge {
     if (this.hasCurrentHello() && (this.store.daemonFeatures ?? []).includes(TRIAGE_SNAPSHOT_FEATURE)) {
       await this.requestTriageCounts();
     }
+    if (this.hasCurrentHello() && (this.store.daemonFeatures ?? []).includes(WORK_PULSE_FEATURE)) {
+      await this.requestWorkPulse();
+    }
   }
 
   /** Consecutive unplanned disconnects; resets on a healthy inbound frame. */
@@ -6482,7 +6857,11 @@ export class Bridge {
         {
           extension_version: this.deps.manifestVersion,
           adapter_versions: adapterVersions,
-          features: [INSTITUTIONAL_MATERIALIZATION_FEATURE],
+          features: [
+            INSTITUTIONAL_MATERIALIZATION_FEATURE,
+            SURFACE_PRESENCE_FEATURE,
+            WORK_PULSE_FEATURE,
+          ],
         },
         undefined,
         this.helloRequestID,
@@ -8501,6 +8880,9 @@ export class Bridge {
           }
         });
         this.settleHelloWaiters(true);
+        // Resume only after this serialized handler yields; a correlated
+        // result must be able to traverse the inbound FIFO.
+        this.deps.setTimeout(() => { void this.resumePageBulkCohorts(); }, 0);
         return;
       }
       case "page_acquire_ack": {
@@ -11967,13 +12349,28 @@ type InboxRuntimeReply =
   | BrokerReply<{ opened: true }>
   | BrokerReply<{ waiting_jobs: Array<{ job_id: string; deadline?: number }> }>
   | BrokerReply<{ stats: Record<string, unknown> }>
+  | BrokerReply<{
+      available: boolean;
+      pulse?: WorkPulseResponsePayload;
+      received_at?: number;
+      worker_epoch: string;
+    }>
+  | BrokerReply<{ accepted: boolean }>
   | BrokerReply<{ feature: boolean; entries: ActivityEntryPayload[] }>
   | BrokerReply<{ state: BridgeSessionState; origins: KeepaliveOriginSnapshot[] }>
   | BrokerReply<{ scan_id: string }>
   | BrokerReply<{ snapshot: PageBulkSnapshot }>
   | BrokerReply<{ items: PageBulkStatusItem[]; truncated: boolean }>
   | BrokerReply<{ grab_id: string; state: string; outcome?: string; detail?: string; job_id?: string }>
-  | BrokerReply<{ submitted: number; joined: number; already_owned: number; invalid: number; batch_id: string }>
+  | BrokerReply<{
+      mode: "v1" | "v2";
+      processed_count: number;
+      submitted: number;
+      joined: number;
+      already_owned: number;
+      invalid: number;
+      batch_id: string;
+    }>
   | BrokerReply<{ allowed: boolean }>
   | DeliveryReply;
 
@@ -12042,27 +12439,45 @@ function isStatsSender(sender: InboxRuntimeSender, urls: InboxRuntimeURLs): bool
 
 function isSnapshotRuntimeRequest(
   value: unknown,
-): value is { schema_versions: [1] | [2] | [3] | [4] | [4, 3]; limit?: number; cursor?: string } {
+): value is { schema_versions: [1] | [2] | [3] | [4] | [5] | [4, 3] | [5, 4]; limit?: number; cursor?: string } {
   if (!isObjectRecord(value) || !hasOnlyKeys(value, ["schema_versions", "limit", "cursor"])) return false;
   const versions = value["schema_versions"];
   const validVersions =
     Array.isArray(versions) &&
-    ((versions.length === 1 && (versions[0] === 1 || versions[0] === 2 || versions[0] === 3 || versions[0] === 4)) ||
-      (versions.length === 2 && versions[0] === 4 && versions[1] === 3));
+    ((versions.length === 1 && (versions[0] === 1 || versions[0] === 2 || versions[0] === 3 || versions[0] === 4 || versions[0] === 5)) ||
+      (versions.length === 2 && versions[0] === 4 && versions[1] === 3) ||
+      (versions.length === 2 && versions[0] === 5 && versions[1] === 4));
   return (
     validVersions &&
     (value["limit"] === undefined || (isPositiveSafeInteger(value["limit"]) && value["limit"] <= 100)) &&
     (value["cursor"] === undefined || (typeof value["cursor"] === "string" && value["cursor"].length <= 256))
   );
 }
-
 function isCountsRuntimeRequest(value: unknown): value is Record<string, never> {
   return isObjectRecord(value) && Object.keys(value).length === 0;
 }
 
-function isActivityRuntimeRequest(value: unknown): value is { limit?: number } {
-  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["limit"])) return false;
+function isActivityRuntimeRequest(value: unknown): value is { limit?: number; before_seq?: string; seen_through_seq?: string } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["limit", "before_seq", "seen_through_seq"])) return false;
+  for (const key of ["before_seq", "seen_through_seq"]) {
+    if (value[key] !== undefined && (typeof value[key] !== "string" || !/^[0-9]{1,64}$/u.test(value[key] as string))) return false;
+  }
   return value["limit"] === undefined || (isPositiveSafeInteger(value["limit"]) && value["limit"] <= 50);
+}
+
+function isSurfacePresenceRuntimeRequest(
+  value: unknown,
+): value is Omit<SurfacePresencePayload, "request_id"> {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["instance_id", "surface", "focused", "at"])) return false;
+  return (
+    typeof value["instance_id"] === "string" &&
+    /^[A-Za-z0-9_-]{8,64}$/u.test(value["instance_id"]) &&
+    (value["surface"] === "popup" || value["surface"] === "inbox") &&
+    typeof value["focused"] === "boolean" &&
+    typeof value["at"] === "string" &&
+    value["at"].length <= 64 &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(value["at"])
+  );
 }
 
 function isDecisionRuntimeRequest(
@@ -12196,15 +12611,13 @@ function isPageBulkStatusRuntimeRequest(
 }
 
 function isPageBulkSubmitSource(value: unknown): value is PageBulkSubmitSource {
-  return (
-    isObjectRecord(value) &&
-    hasOnlyKeys(value, ["kind", "origin", "detector"]) &&
-    value["kind"] === "browser_page" &&
-    isBareHTTPSOrigin(value["origin"]) &&
-    typeof value["detector"] === "string" &&
-    value["detector"].length > 0 &&
-    value["detector"].length <= 128
-  );
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["kind", "origin", "detector"])) return false;
+  const kind = value["kind"];
+  const origin = value["origin"];
+  const detector = value["detector"];
+  return kind === "browser_page" &&
+    typeof origin === "string" && isBareLowercaseHTTPSOrigin(origin) &&
+    typeof detector === "string" && isDetectorText(detector);
 }
 
 function isPageBulkSubmitRuntimeRequest(
@@ -12214,8 +12627,12 @@ function isPageBulkSubmitRuntimeRequest(
   const scanID = value["scan_id"];
   const keys = value["canonical_keys"];
   if (typeof scanID !== "string" || scanID.length === 0 || scanID.length > 128) return false;
-  if (!Array.isArray(keys) || keys.length < 1 || keys.length > 50) return false;
-  if (!keys.every((key) => typeof key === "string" && key.length > 0 && key.length <= 300)) return false;
+  if (!Array.isArray(keys) || keys.length < 1 || keys.length > 200) return false;
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (typeof key !== "string" || !isCanonicalKey(key) || seen.has(key)) return false;
+    seen.add(key);
+  }
   return isPageBulkSubmitSource(value["source"]);
 }
 
@@ -12331,6 +12748,18 @@ export async function handleInboxRuntimeMessage(
     } catch {
       return failure("open_failed", "Could not open the inbox");
     }
+  }
+  if (type === "papio.work.pulse") {
+    if (!isInboxOrPopupSender(sender, urls)) return failure("unauthorized", "This sender cannot access the work pulse");
+    if (!hasOnlyKeys(message, ["type"])) return failure("invalid_request", "Invalid work pulse request");
+    return bridge.requestWorkPulse();
+  }
+  if (type === "papio.surface.presence") {
+    if (!isInboxOrPopupSender(sender, urls)) return failure("unauthorized", "This sender cannot report surface presence");
+    if (!hasOnlyKeys(message, ["type", "payload"]) || !isSurfacePresenceRuntimeRequest(message["payload"])) {
+      return failure("invalid_request", "Invalid surface presence");
+    }
+    return bridge.sendSurfacePresence(message["payload"]);
   }
   if (type === "papio.stats") {
     if (!isStatsSender(sender, urls)) return failure("unauthorized", "This sender cannot access papio stats");
@@ -12513,7 +12942,7 @@ export async function handleInboxRuntimeMessage(
   switch (type) {
     case "papio.activity":
       return isActivityRuntimeRequest(request)
-        ? bridge.requestActivity(request.limit)
+        ? bridge.requestActivity(request)
         : failure("invalid_request", "Invalid activity request");
     case "papio.triage.snapshot":
       return isSnapshotRuntimeRequest(request)
@@ -12722,6 +13151,17 @@ function realDeps(): BridgeDeps {
           return got[WORK_WINDOW_KEY] === false ? "in-window" : "work-window";
         } catch {
           return "work-window";
+        }
+      },
+    },
+    toolbarCount: {
+      async get(): Promise<ToolbarCountMode> {
+        try {
+          const values = await chrome.storage.local.get(TOOLBAR_COUNT_MODE_KEY);
+          const value = values[TOOLBAR_COUNT_MODE_KEY];
+          return value === "all" || value === "off" ? value : "required";
+        } catch {
+          return "required";
         }
       },
     },

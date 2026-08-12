@@ -4,9 +4,12 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"papio/internal/job"
+	"papio/internal/notify"
 )
 
 const (
@@ -70,6 +73,13 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 	loadedEvents := make(map[string]bool)
 	waiting := [actionReminderClassCount]actionReminderBatch{}
 	due := [actionReminderClassCount]bool{}
+	window := 4 * time.Hour
+	if policy, policyErr := notify.ResolvePolicy(s.Config.Notify); policyErr == nil {
+		if configured := policy.For(notify.CategoryDecisionPending).Window; configured > 0 {
+			window = configured
+		}
+	}
+	var digestWindow time.Time
 	var firstErr error
 	record := func(err error) {
 		if err != nil && firstErr == nil {
@@ -100,12 +110,6 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 		if age < base {
 			continue
 		}
-		// An action open past the quiesce window stops being re-notified. The
-		// backoff caps the interval, never the count, so without this a handoff
-		// nobody can complete nags once a day until the heat death of the
-		// queue. It stays open and `papio actions open` still drives it; papio
-		// just stops raising it unprompted, and `papio doctor` reports how many
-		// have gone quiet.
 		if action.Quiesced(now) {
 			continue
 		}
@@ -116,40 +120,67 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 		}
 		state, found := latestActionReminder(events, action.ID)
 		if found && state.RemindedAt.After(now) {
-			// A wall-clock rollback must not turn an already delivered reminder
-			// into a deadline that can remain in the future forever.
 			state.RemindedAt = now.Add(-actionReminderBackoff(base, state.Count))
 		}
-		if found && now.Before(state.RemindedAt.Add(actionReminderBackoff(base, state.Count))) {
+		dueAt := createdAt.Add(base)
+		if found {
+			dueAt = state.RemindedAt.Add(actionReminderBackoff(base, state.Count))
+		}
+		if found && now.Before(dueAt) {
 			continue
 		}
 		count := state.Count + 1
+		windowStart := dueAt.UTC().Truncate(window)
+		if digestWindow.IsZero() || windowStart.Before(digestWindow) {
+			digestWindow = windowStart
+		}
 		if err := s.Jobs.RecordEvent(ctx, action.JobID, actionReminderEvent, map[string]any{
-			"action_id":   action.ID,
-			"count":       count,
-			"age_seconds": int64(age / time.Second),
-			"reminded_at": now.UTC().Format(time.RFC3339Nano),
+			"action_id": action.ID, "count": count,
+			"age_seconds":  int64(age / time.Second),
+			"reminded_at":  now.UTC().Format(time.RFC3339Nano),
+			"window_start": windowStart.Format(time.RFC3339Nano),
 		}); err != nil {
 			record(err)
 			continue
 		}
-		batch := reminderBatchIndex(action)
-		waiting[batch].add(action.JobID, age)
-		due[batch] = true
+		class := reminderBatchIndex(action)
+		waiting[class].add(action.JobID, age)
+		due[class] = true
 	}
 
-	for _, class := range []actionReminderClass{
-		institutionalReminder,
-		openHandoffReminder,
-		manualDownloadAfterLoginReminder,
-		manualDownloadReminder,
-		loginReminder,
-		reviewReminder,
-	} {
-		if !due[class] {
-			continue
+	total := 0
+	for class := actionReminderClass(0); class < actionReminderClassCount; class++ {
+		if due[class] {
+			total += len(waiting[class].jobs)
 		}
-		s.Notifier.HumanActionReminder(context.WithoutCancel(ctx), waiting[class].message(class))
+	}
+	if total > 0 {
+		message := digestReminderMessage(waiting, due)
+		eventDetail := map[string]any{"classes": map[string]int{}, "oldest_age_seconds": int64(0)}
+		var oldest time.Duration
+		for class := actionReminderClass(0); class < actionReminderClassCount; class++ {
+			if !due[class] {
+				continue
+			}
+			eventDetail["classes"].(map[string]int)[reminderClassName(class)] = len(waiting[class].jobs)
+			if waiting[class].oldestAge > oldest {
+				oldest = waiting[class].oldestAge
+			}
+		}
+		eventDetail["oldest_age_seconds"] = int64(oldest / time.Second)
+		event := notify.Event{Kind: actionReminderEvent, Message: message, Count: total, Detail: eventDetail}
+		if digestWindow.IsZero() {
+			digestWindow = now.UTC().Truncate(window)
+		}
+		intent := notify.Intent{
+			EventKind: actionReminderEvent, Category: notify.CategoryDecisionPending,
+			AggregateKey: "actions:pending", Phase: notify.PhaseReminder,
+			WindowStart: digestWindow, HappenedAt: now.UTC(),
+			Message: message, Detail: event,
+		}
+		if err := s.Notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
+			log.Printf("papio: routing action reminder: %v", err)
+		}
 	}
 	return firstErr
 }
@@ -309,6 +340,48 @@ func (b actionReminderBatch) message(class actionReminderClass) string {
 		return fmt.Sprintf("%d %s %s been waiting %s %s", count, paper, verb, actionReminderAge(b.oldestAge), recovery)
 	}
 	return fmt.Sprintf("%d %s %s been waiting %s %s — run: %s", count, paper, verb, actionReminderAge(b.oldestAge), recovery, command)
+}
+func digestReminderMessage(waiting [actionReminderClassCount]actionReminderBatch, due [actionReminderClassCount]bool) string {
+	classes := make([]string, 0, actionReminderClassCount)
+	total := 0
+	var oldest time.Duration
+	var only actionReminderClass
+	classCount := 0
+	for class := actionReminderClass(0); class < actionReminderClassCount; class++ {
+		if !due[class] {
+			continue
+		}
+		count := len(waiting[class].jobs)
+		total += count
+		if waiting[class].oldestAge > oldest {
+			oldest = waiting[class].oldestAge
+		}
+		only = class
+		classCount++
+		classes = append(classes, fmt.Sprintf("%s: %d", reminderClassName(class), count))
+	}
+	if classCount == 1 {
+		return waiting[only].message(only)
+	}
+	return fmt.Sprintf("%d papers need your attention — %s; oldest waiting %s — run: papio actions list",
+		total, strings.Join(classes, ", "), actionReminderAge(oldest))
+}
+
+func reminderClassName(class actionReminderClass) string {
+	switch class {
+	case institutionalReminder:
+		return "institution sign-in"
+	case openHandoffReminder:
+		return "open handoff"
+	case manualDownloadAfterLoginReminder:
+		return "download after sign-in"
+	case manualDownloadReminder:
+		return "manual download"
+	case loginReminder:
+		return "sign-in"
+	default:
+		return "review"
+	}
 }
 
 func manualDownloadReminderRecovery(count int, requiresInstitutionalLogin bool) string {

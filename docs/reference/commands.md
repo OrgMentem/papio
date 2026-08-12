@@ -824,6 +824,50 @@ papio native-host uninstall [flags]
 | `--firefox-manifest-dir` | `string` |  | override the Firefox native-messaging manifest directory |
 | `--manifest-dir` | `string` |  | override the Chrome native-messaging manifest directory |
 
+## `papio notify`
+
+Inspect and test notification routing
+
+```
+papio notify
+```
+
+### `papio notify preview`
+
+Preview notification copy without sending
+
+```
+papio notify preview <category> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--count` | `int` | `1` | number of events represented in the preview |
+
+### `papio notify show`
+
+Show effective notification routing
+
+```
+papio notify show
+```
+
+### `papio notify test`
+
+Send one local notification test
+
+```
+papio notify test <category>
+```
+
+## `papio pulse`
+
+Show the daemon's current work pulse
+
+```
+papio pulse
+```
+
 ## `papio search`
 
 Search configured discovery backends for scholarly works

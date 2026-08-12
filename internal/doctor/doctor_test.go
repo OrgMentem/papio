@@ -67,7 +67,7 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	}
 	var dbPass bool
 	for _, c := range report.Checks {
-		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 29") {
+		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 31") {
 			dbPass = true
 		}
 	}
@@ -1313,4 +1313,32 @@ func TestRunDocumentDeliveryPollHealth(t *testing.T) {
 			t.Fatalf("remediation = %q, want it to also name 'papio jobs retry <job-id>' — resume alone does not force an immediate poll", health.Remediation)
 		}
 	})
+}
+func TestRunIncludesNotificationCapabilityWithoutWebhookSecret(t *testing.T) {
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	cfg.Notify.WebhookURL = "https://hooks.example.test/papio"
+	cfg.Notify.WebhookSecret = "NOTIFICATION_WEBHOOK_SECRET"
+	report := Run(context.Background(), cfg, nil, pdf.Capability{}, executable(t), nil)
+	var found bool
+	for _, check := range report.Checks {
+		if check.Name != "notifications" {
+			continue
+		}
+		found = true
+		if !strings.Contains(check.Detail, "effective preset") || !strings.Contains(check.Detail, "webhook configured") {
+			t.Fatalf("notification check detail = %q", check.Detail)
+		}
+		if strings.Contains(check.Detail, cfg.Notify.WebhookSecret) || strings.Contains(check.Remediation, cfg.Notify.WebhookSecret) {
+			t.Fatalf("notification check leaked webhook secret: %+v", check)
+		}
+	}
+	if !found {
+		t.Fatalf("notification check missing: %+v", report.Checks)
+	}
+	encoded, _ := json.Marshal(report)
+	if strings.Contains(string(encoded), cfg.Notify.WebhookSecret) {
+		t.Fatalf("doctor report leaked webhook secret")
+	}
 }

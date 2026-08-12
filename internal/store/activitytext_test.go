@@ -30,7 +30,9 @@ func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
 		{"zotio.auto_import", map[string]any{"status": "applied"}, "Imported into Zotero"},
 		{"zotio.collection_filing", nil, "Filed into Zotero collection"},
 		{"zotio.enrich", nil, "Zotero metadata enriched"},
-		{"hook.on_ready", map[string]any{"status": "ok"}, "On-ready hook ran (ok)"},
+		{"notify.attempted", map[string]any{"count": int64(2)}, "Notification attempted for 2 items"},
+		{"notify.held", map[string]any{"reason": "quiet_hours"}, "Notification held (quiet hours)"},
+		{"notify.digest", nil, "Notification digest queued"},
 		// Unknown kinds fall through verbatim rather than erroring.
 		{"future.kind", nil, "future.kind"},
 	} {

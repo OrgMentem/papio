@@ -7,12 +7,14 @@ package bootstrap
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"papio/internal/app"
 	"papio/internal/artifact"
+	"papio/internal/batch"
 	"papio/internal/browser"
 	"papio/internal/budget"
 	"papio/internal/bundle"
@@ -33,6 +35,7 @@ import (
 	"papio/internal/ownershipsnapshot"
 	"papio/internal/pdf"
 	"papio/internal/preview"
+	"papio/internal/pulse"
 	"papio/internal/resolver"
 	"papio/internal/resolvers/arxiv"
 	coreresolver "papio/internal/resolvers/core"
@@ -65,6 +68,8 @@ type System struct {
 	Captures      *captures.Store
 	Budgets       *budget.Manager
 	App           *app.Service
+	Notify        *notify.Router
+	Pulse         *pulse.Service
 	Scheduler     *daemon.Scheduler
 	Bundle        *bundle.Exporter
 	Browser       *browser.Bridge
@@ -211,20 +216,73 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	// Not a second HTTP client: landingmeta only ever reads a page the app
 	// layer already decided to fetch (an OA candidate's own Landing URL), so
 	// it shares metadataClient's SSRF guard, redirect cap and body bound
-	// rather than reimplementing them.
 	service.LandingReader = landingmeta.NewReader(metadataClient, metadataPolicy.MaxBytes)
-	var senders []notify.Sender
+	policy, err := notify.ResolvePolicy(cfg.Notify)
+	if err != nil {
+		return nil, err
+	}
+	var desktop notify.Sender
 	if cfg.Notify.Enabled {
-		senders = append(senders, notify.NewMacOS())
+		if available, _ := notify.PlatformCapability(); available {
+			desktop = notify.NewMacOS()
+		}
 	}
+	var webhook notify.Sender
 	if cfg.Notify.WebhookURL != "" {
-		senders = append(senders, notify.NewWebhook(cfg.Notify.WebhookURL, cfg.Notify.WebhookSecret))
+		webhook = notify.NewWebhook(cfg.Notify.WebhookURL, cfg.Notify.WebhookSecret)
 	}
-	var watchNotifier notify.Sender
-	if len(senders) > 0 {
-		watchNotifier = notify.Fanout(senders...)
-		service.Notifier = notify.NewCoalescer(watchNotifier)
+	revalidate := func(ctx context.Context, row notify.Record) (bool, error) {
+		dbh := db.DB()
+		aggregate := row.Intent.AggregateKey
+		if strings.HasPrefix(aggregate, "gate:") {
+			var count int
+			err := dbh.QueryRowContext(ctx, `SELECT COUNT(*) FROM human_actions WHERE status='open' AND blocked_by=?`, strings.TrimPrefix(aggregate, "gate:")).Scan(&count)
+			if err != nil {
+				// An unreadable aggregate is not evidence of resolution. Fail
+				// toward sending a possibly stale notice rather than dropping a
+				// real user turn.
+				return true, nil
+			}
+			return count > 0, nil
+		}
+		if strings.HasPrefix(aggregate, "action:") {
+			var status string
+			err := dbh.QueryRowContext(ctx, `SELECT status FROM human_actions WHERE id=?`, strings.TrimPrefix(aggregate, "action:")).Scan(&status)
+			if err != nil {
+				return true, nil
+			}
+			return status == "open", nil
+		}
+		if strings.HasPrefix(aggregate, "decision:") || strings.HasPrefix(aggregate, "actions:") {
+			var count int
+			err := dbh.QueryRowContext(ctx, `SELECT COUNT(*) FROM human_actions WHERE status='open'`).Scan(&count)
+			if err != nil {
+				// See above: lookup failure must not silently suppress work.
+				return true, nil
+			}
+			return count > 0, nil
+		}
+		if row.Intent.BatchID != "" || strings.HasPrefix(aggregate, "cohort:") {
+			key := row.Intent.BatchID
+			if key == "" {
+				key = strings.TrimPrefix(aggregate, "cohort:")
+			}
+			var closed sql.NullString
+			err := dbh.QueryRowContext(ctx, `SELECT closed_at FROM acquisition_batches WHERE id=? OR cohort_id=? LIMIT 1`, key, key).Scan(&closed)
+			if err != nil {
+				// Missing/unreadable cohort metadata is conservatively treated as
+				// still unsettled, preserving a potentially real milestone.
+				return true, nil
+			}
+			return !closed.Valid || closed.String == "", nil
+		}
+		return true, nil
 	}
+	router := notify.NewRouter(notify.RouterOptions{
+		Ledger: notify.NewStoreLedger(db), Desktop: desktop, Webhook: webhook,
+		Policy: policy, Activity: db, Revalidate: revalidate,
+	})
+	service.Notifier = router
 	service.Resolvers = entries
 	if cfg.SourcePolicy(config.SourceCrossrefMetadata).Enabled {
 		crossrefEnricher := enrich.NewWithOptions(enrich.Options{
@@ -317,28 +375,28 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		}
 		holdings = ownership.NewRegistry(providers...)
 	}
+	watches := watch.NewStore(db)
 	service.ReadyHook = &hook.Runner{
 		Command: cfg.Hooks.OnReady,
 		Timeout: time.Duration(cfg.Hooks.TimeoutSeconds) * time.Second,
 	}
-	watches := watch.NewStore(db)
 	watchRunner := &watch.Runner{
 		Store: watches, Discovery: discoveryClient, Lookup: zotioService, Submitter: service,
-		Backfill: zotioService, Notifier: watchNotifier, DataDir: cfg.DataDir,
+		Backfill: zotioService, Notifier: router, DataDir: cfg.DataDir,
 		Holdings: holdings,
 	}
 	var retractions *retraction.Sentinel
 	if policy := cfg.SourcePolicy(config.SourceRetractionWatch); policy.Enabled {
 		retractions = retraction.New(retraction.Options{
 			Store: db, Budgets: budgets, Policy: policy, Client: metadataClient,
-			DataDir: cfg.DataDir, BaseURL: policy.BaseURLForDev, Notifier: watchNotifier,
+			DataDir: cfg.DataDir, BaseURL: policy.BaseURLForDev, Notifier: router,
 		})
 	}
 	triageService := triage.New(db, watches, jobs)
 	if retractions != nil {
 		triageService.RegisterSource(retractions)
 	}
-	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), retractions}
+	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), retractions, router}
 	if reconciler := zotioService.TagReconciler(); reconciler != nil {
 		maintenance = append(maintenance, reconciler)
 	}
@@ -360,12 +418,18 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	}
 
 	previewServer := preview.New(jobs)
+	bridge := browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, captureStore, holdings, browserZotio, cfg, version)
+	router.SetPresence(bridge.PresenceProvider())
 
+	pulseService := &pulse.Service{
+		Jobs: jobs, Cohorts: batch.New(db), EffectLimit: 1, Now: time.Now,
+	}
+	bridge.SetPulseService(pulseService)
 	system := &System{
 		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Captures: captureStore, Budgets: budgets,
-		App: service, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
+		App: service, Notify: router, Pulse: pulseService, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
-		Browser:       browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, captureStore, holdings, browserZotio, cfg, version),
+		Browser:       bridge,
 		Preview:       previewServer,
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,

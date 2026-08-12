@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"page_bulk_submit_v2_result","msg_id":"bulk-v2-res-0001","seq":18,"payload":{"request_id":"request-0105","scan_id":"scan-0001","cohort_id":"cohort-0001","chunk_index":0,"final_chunk":true,"batch_id":"batch-0001","membership":"complete","cohort_total":2,"persisted_members":2,"submitted":1,"joined":1,"already_owned":0,"invalid":0}}

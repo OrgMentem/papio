@@ -13,6 +13,7 @@ import (
 
 	"papio/internal/batch"
 	"papio/internal/discovery"
+	"papio/internal/notify"
 	"papio/internal/protocol"
 	"papio/internal/store"
 	"papio/internal/work"
@@ -394,10 +395,15 @@ func (f *fakeSubmitter) SubmitWithAutoImport(_ context.Context, request protocol
 	return jobID, nil
 }
 
-type fakeNotifier struct{ messages []string }
+type fakeNotifier struct {
+	messages []string
+	intents  []notify.Intent
+}
 
-func (f *fakeNotifier) Send(_ context.Context, message string) {
-	f.messages = append(f.messages, message)
+func (f *fakeNotifier) Route(_ context.Context, intent notify.Intent) error {
+	f.intents = append(f.intents, intent)
+	f.messages = append(f.messages, intent.Message)
+	return nil
 }
 
 type fakeBackfillQueue struct {

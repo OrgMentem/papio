@@ -48,6 +48,11 @@ type recordingNotifier struct {
 	events []notify.Event
 }
 
+func (n *recordingNotifier) Route(_ context.Context, intent notify.Intent) error {
+	n.events = append(n.events, intent.Detail)
+	return nil
+}
+
 func (n *recordingNotifier) Send(_ context.Context, _ string) {}
 
 func (n *recordingNotifier) SendEvent(_ context.Context, event notify.Event) {

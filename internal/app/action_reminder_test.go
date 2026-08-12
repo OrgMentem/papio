@@ -258,18 +258,9 @@ func TestActionReminderMessageGroupsActionKinds(t *testing.T) {
 	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	wantAuth := "2 papers have been waiting 8h for your institution sign-in — run: papio actions open"
-	wantOpen := "1 paper has been waiting 8h for you to open it — run: papio actions open"
-	wantReview := "3 papers have been waiting 8h for your review — run: papio actions list"
-	if len(sink.reminders) != 3 {
-		t.Fatalf("reminders = %q, want auth, open-handoff, and review notices", sink.reminders)
-	}
-	seen := make(map[string]bool, len(sink.reminders))
-	for _, message := range sink.reminders {
-		seen[message] = true
-	}
-	if !seen[wantAuth] || !seen[wantOpen] || !seen[wantReview] {
-		t.Fatalf("reminders = %q, want %q, %q, and %q", sink.reminders, wantAuth, wantOpen, wantReview)
+	want := "6 papers need your attention — institution sign-in: 2, open handoff: 1, review: 3; oldest waiting 8h — run: papio actions list"
+	if len(sink.reminders) != 1 || sink.reminders[0] != want {
+		t.Fatalf("reminders = %q, want one bounded digest %q", sink.reminders, want)
 	}
 }
 

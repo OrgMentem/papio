@@ -5,11 +5,23 @@ package notify
 import (
 	"context"
 	"os/exec"
-	"strconv"
+	"runtime"
 	"strings"
-	"sync"
 	"time"
 )
+
+// PlatformCapability reports whether this build can invoke papio's local
+// desktop notification channel. Delivery remains best effort: macOS provides
+// no acknowledgement that Notification Center displayed the message.
+func PlatformCapability() (available bool, detail string) {
+	if runtime.GOOS != "darwin" {
+		return false, "desktop notifications are unavailable on " + runtime.GOOS + " (papio uses macOS osascript)"
+	}
+	if _, err := exec.LookPath("osascript"); err != nil {
+		return false, "desktop notifications are unavailable: macOS osascript is not installed"
+	}
+	return true, "desktop notifications available via macOS osascript (best effort; no delivery acknowledgement)"
+}
 
 const notificationTimeout = 5 * time.Second
 
@@ -56,140 +68,4 @@ func escapeAppleString(value string) string {
 	value = strings.ReplaceAll(value, `"`, `\"`)
 	value = strings.ReplaceAll(value, "\r", `\r`)
 	return strings.ReplaceAll(value, "\n", `\n`)
-}
-
-// Coalescer limits each notification class to one delivery per interval. The
-// first event is delivered immediately; events accumulated until the next
-// window are summarized when that window closes.
-type Coalescer struct {
-	Sender   Sender
-	Now      func() time.Time
-	Interval time.Duration
-
-	mu        sync.Mutex
-	pending   map[string]int
-	last      map[string]time.Time
-	scheduled map[string]uint64
-	sequence  map[string]uint64
-	after     func(time.Duration, func())
-}
-
-// NewCoalescer constructs a coalescer with the production sixty-second window.
-func NewCoalescer(sender Sender) *Coalescer {
-	return &Coalescer{
-		Sender: sender, Now: time.Now, Interval: time.Minute,
-		pending: make(map[string]int), last: make(map[string]time.Time),
-		scheduled: make(map[string]uint64), sequence: make(map[string]uint64),
-		after: func(duration time.Duration, callback func()) {
-			time.AfterFunc(duration, callback)
-		},
-	}
-}
-
-// HumanAction records a job that needs human attention.
-func (c *Coalescer) HumanAction(ctx context.Context) {
-	c.notify(ctx, "human_action", func(count int) string {
-		base := plural(count, "paper needs your attention", "papers need your attention")
-		return base + "; run papio status to see why"
-	})
-}
-
-// HumanActionReminder delivers an already-formed action reminder directly so
-// its age and recovery guidance survive the count-based coalescing path.
-func (c *Coalescer) HumanActionReminder(ctx context.Context, message string) {
-	if c == nil || c.Sender == nil {
-		return
-	}
-	c.Sender.Send(ctx, message)
-}
-
-// Imported records a job whose automatic Zotio import was applied.
-func (c *Coalescer) Imported(ctx context.Context) {
-	c.notify(ctx, "imported", func(count int) string {
-		return plural(count, "paper imported", "papers imported")
-	})
-}
-
-func (c *Coalescer) notify(ctx context.Context, kind string, message func(int) string) {
-	if c == nil || c.Sender == nil {
-		return
-	}
-	now := c.now()
-	interval := c.Interval
-	if interval <= 0 {
-		interval = time.Minute
-	}
-
-	c.mu.Lock()
-	if c.pending == nil {
-		c.pending = make(map[string]int)
-	}
-	if c.last == nil {
-		c.last = make(map[string]time.Time)
-	}
-	if c.scheduled == nil {
-		c.scheduled = make(map[string]uint64)
-	}
-	if c.sequence == nil {
-		c.sequence = make(map[string]uint64)
-	}
-	c.pending[kind]++
-	last := c.last[kind]
-	if !last.IsZero() && now.Sub(last) < interval {
-		if _, found := c.scheduled[kind]; !found {
-			c.sequence[kind]++
-			sequence := c.sequence[kind]
-			c.scheduled[kind] = sequence
-			after := c.after
-			if after == nil {
-				after = func(duration time.Duration, callback func()) {
-					time.AfterFunc(duration, callback)
-				}
-			}
-			// The timer outlives the request that scheduled it; detach
-			// cancellation but keep values so the delayed flush still sends.
-			flushCtx := context.WithoutCancel(ctx)
-			after(interval-now.Sub(last), func() {
-				c.flush(flushCtx, kind, message, sequence)
-			})
-		}
-		c.mu.Unlock()
-		return
-	}
-	count := c.pending[kind]
-	c.pending[kind] = 0
-	c.last[kind] = now
-	delete(c.scheduled, kind)
-	c.mu.Unlock()
-
-	c.Sender.Send(ctx, message(count))
-}
-
-func (c *Coalescer) flush(ctx context.Context, kind string, message func(int) string, sequence uint64) {
-	c.mu.Lock()
-	if c.scheduled[kind] != sequence || c.pending[kind] == 0 {
-		c.mu.Unlock()
-		return
-	}
-	delete(c.scheduled, kind)
-	count := c.pending[kind]
-	c.pending[kind] = 0
-	c.last[kind] = c.now()
-	c.mu.Unlock()
-
-	c.Sender.Send(ctx, message(count))
-}
-
-func (c *Coalescer) now() time.Time {
-	if c.Now != nil {
-		return c.Now()
-	}
-	return time.Now()
-}
-
-func plural(count int, singular, plural string) string {
-	if count == 1 {
-		return "1 " + singular
-	}
-	return strconv.Itoa(count) + " " + plural
 }

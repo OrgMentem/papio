@@ -264,3 +264,56 @@ observed-provider-limit rule, and ADR-0017's configured delivery gates intact.
 Direct-to-main implementation stays in small, solo-maintainer-sized changes;
 the staged gates make measurement and rollback possible without adding
 speculative confirmation prompts.
+ 
+## Notification, feedback, and liveness surfaces
+
+**Context:** *papio* had distinct popup, badge, desktop-notification, inbox,
+and Activity surfaces but no explicit responsibility split between them.
+Inventory counts also conflated active work, scheduled waits, and human turns,
+while per-item notifications made large runs noisy. The browser and daemon
+must continue to evolve through strict, feature-negotiated, additive contracts.
+
+**Decision:** ADR-0023 keeps the five surfaces distinct: inline feedback
+acknowledges a local action, the popup is a current-page lens with a compact
+pulse, the badge is ambient blocker/turn state, desktop notification policy is
+daemon-owned and best effort, and the inbox plus Activity are the durable
+bounded read model. `attention` remains turn-taking (`working`, `required`, or
+`advisory`), never severity; notification category and persistence are separate
+axes. A single typed router uses the closed categories and phase mapping,
+durable `(category, event_kind, aggregate_key, phase, window_start)` identity,
+and independent desktop/webhook policy. Desktop policy records platform
+attempts and dispositions, not delivery claims, and applies aggregate
+revalidation, capability, quiet-hours, focused-presence, rolling-rate
+reservation, then one sender attempt in that order.
+
+The solicited `work_pulse_v1` read model reports mutually exclusive
+`in_flight`, `continuing`, `scheduled`, `waiting_required`, and `stalled`
+buckets. Typed stall episodes are the only authority for Stalled; incomplete
+measurements remain unknown. ADR-0005's rejection of live push remains in
+force. The ADR-0001 badge amendment counts exact effective required turns by
+default, with browser-local **Decisions waiting**, **Everything pending**, and
+**No number** choices. Activity adds a bounded page/cursor and watermark:
+rendering the newest page in a visible Activity tab acknowledges durable entries
+through its `latest_seq`, while gaps suppress exact new-entry counts. The
+privacy-minimal `surface_presence_v1` hint carries only an opaque instance,
+surface, focus, and timestamp; no URL, title, tab ID, host, identifier, or page
+content crosses the boundary, and daemon receipt time controls lease expiry.
+
+Browser and CLI submissions use durable cohorts. The strict v2 batch protocol
+uses caller-owned request IDs for replay, daemon idempotency by cohort and
+chunk, and distinguishes per-chunk outcome counts from cumulative membership
+accounting. Partial coverage never invents a denominator.
+
+ADR-0023 owns routing and presentation only. ADR-0022 owns institutional
+orchestration, claims, permits, typed gates, holder generations, and budgets;
+neither creates parallel authority. Pulse/effect-capacity projection consumes
+the Phase 3 governor, and exact typed-gate/badge aggregation consumes Phase 4
+projections rather than approximating Phase 2 materialization state.
+
+**Why:** One durable policy makes milestone notifications bounded and
+recoverable without making the OS channel the source of truth. Typed pulse and
+turn projections let each surface say only what the daemon knows, while
+feature-gated pull reads preserve old-peer compatibility and ADR-0005's tested
+operational boundary. Durable cohort identity makes mixed browser/CLI batches
+honest across retries and restarts, and the institutional boundary prevents
+presentation code from becoming a second scheduler or owner.

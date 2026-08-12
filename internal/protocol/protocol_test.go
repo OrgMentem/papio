@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -2010,4 +2011,659 @@ func TestInstitutionalCandidateOfferRoundTripScopeAndBounds(t *testing.T) {
 			t.Fatal("oversized candidate offer accepted")
 		}
 	})
+}
+func protocolTestFrame(t *testing.T, typ string, payload any) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]any{
+		"protocol": BrowserProtocolVersion,
+		"type":     typ,
+		"msg_id":   "msg-new-wire-0001",
+		"seq":      1,
+		"payload":  payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func protocolPayloadMap(t *testing.T, payload any) map[string]any {
+	t.Helper()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func protocolFrameMap(t *testing.T, typ string, payload map[string]any) []byte {
+	t.Helper()
+	return protocolTestFrame(t, typ, payload)
+}
+
+func expectProtocolReject(t *testing.T, typ string, payload any) {
+	t.Helper()
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, typ, payload)); err == nil {
+		t.Fatalf("%s payload was accepted: %#v", typ, payload)
+	}
+}
+
+func int64Ptr(v int64) *int64 { return &v }
+func boolPtr(v bool) *bool    { return &v }
+
+func fullWorkPulsePayload() *WorkPulseResponsePayload {
+	return &WorkPulseResponsePayload{
+		RequestID:          "request-0001",
+		Schema:             1,
+		GeneratedAt:        "2026-01-01T00:00:00Z",
+		NonterminalTotal:   int64Ptr(10),
+		ProjectionComplete: boolPtr(true),
+		InFlight:           int64Ptr(2),
+		Scheduled:          int64Ptr(2),
+		WaitingRequired:    int64Ptr(2),
+		Continuing:         int64Ptr(2),
+		Stalled:            int64Ptr(2),
+		EffectCapacity:     &WorkPulseCapacity{Busy: 1, Limit: 2, Waiting: 3},
+		HumanSurfaceCapacity: &WorkPulseHumanSurfaceCapacity{
+			Busy: 1, Limit: 2, WaitingClaims: 3,
+		},
+		LastForwardAt:          "2026-01-01T00:00:00Z",
+		LastFinishedAt:         "2025-12-31T23:00:00Z",
+		StallEpisodes:          []WorkPulseStallEpisode{{EpisodeKey: "episode-0001", CauseKind: "execution_lease_overdue", PublicLabel: "Lease overdue", Since: "2026-01-01T00:00:00Z", Count: 2}},
+		StallEpisodesTruncated: boolPtr(false),
+		NextAction:             &WorkPulseNextAction{At: "2026-01-01T01:00:00Z", Kind: "retry", Source: "openalex", Count: int64Ptr(2)},
+		Gates:                  []WorkPulseGate{{Kind: "source_budget", Source: "openalex", Until: "2026-01-01T02:00:00Z", Count: 2}},
+		GatesTruncated:         boolPtr(false),
+		LatestBatch: &WorkPulseLatestBatch{
+			BatchID: "batch-0001", Label: "January batch", StartedAt: "2026-01-01T00:00:00Z",
+			SettledAt: "2026-01-01T03:00:00Z", Membership: "complete", ProjectionComplete: boolPtr(true),
+			Total: int64Ptr(15), Settled: int64Ptr(5), NonterminalTotal: int64Ptr(10),
+			InFlight: int64Ptr(2), Scheduled: int64Ptr(2), Continuing: int64Ptr(2),
+			WaitingRequired: int64Ptr(2), Stalled: int64Ptr(2), Unavailable: int64Ptr(1),
+		},
+	}
+}
+
+func fullActivityPageResponse() *ActivityPageResponsePayload {
+	return &ActivityPageResponsePayload{
+		RequestID: "request-0001", GeneratedAt: "2026-01-01T00:00:00Z",
+		Entries: []ActivityEntryPayload{{Seq: 1, At: "2026-01-01T00:00:00Z", JobID: "job-000001", Kind: "watch.alert", Text: "new work", Title: "A title"}},
+		HasMore: true, Cursor: "2", LatestSeq: 2, NewCountSince: int64Ptr(1),
+	}
+}
+
+func fullV2SubmitRequest() *PageBulkSubmitV2RequestPayload {
+	return &PageBulkSubmitV2RequestPayload{
+		RequestID: "request-0001", ScanID: "scan-0001", CohortID: "cohort-0001",
+		Source:      PageBulkSubmitSource{Kind: "browser_page", Origin: "https://scholar.example.edu", Detector: "generic-identifiers/1"},
+		CohortTotal: 1, ChunkIndex: 0, FinalChunk: true, CanonicalKeys: []string{"work-key-1"},
+	}
+}
+
+func fullV2SubmitResult() *PageBulkSubmitV2ResultPayload {
+	return &PageBulkSubmitV2ResultPayload{
+		RequestID: "request-0001", ScanID: "scan-0001", CohortID: "cohort-0001",
+		ChunkIndex: 0, FinalChunk: true, BatchID: "batch-0001", Membership: "complete",
+		CohortTotal: int64Ptr(1), PersistedMembers: 1, Submitted: 1, Joined: 0, AlreadyOwned: 0, Invalid: 0,
+	}
+}
+
+func fullCountsV3() *TriageCounts {
+	return &TriageCounts{
+		PendingTotal: 1, TurnsRequired: int64Ptr(1), TurnsWorking: int64Ptr(0),
+		FamilyBreakdownComplete: boolPtr(true),
+		FamilyRuns:              []TriageFamilyRun{{RunKey: "run-0001", FirstRank: 0, RouteClass: "manual_download", ActionKind: "manual_download", NextActor: "researcher", GuidanceVariant: "manual_download", OperationVariant: "dismiss_only", Count: 1}},
+		RequiredTurnsComplete:   boolPtr(true),
+		RequiredTurns:           []TriageRequiredTurn{{ItemID: "item-0001", ItemKind: "human_action", ActionID: int64Ptr(1), JobID: "job-000001", RouteClass: "manual_download", DependentJobs: 0}},
+		WatchHits:               0, Actions: 1, ActionsRequiresAuth: int64Ptr(0), Retractions: 0, JobsWorking: 0, JobsNeedsReview: 0, FailureGroups7d: 0,
+	}
+}
+
+func fullSnapshotV5() *TriageSnapshotResponsePayload {
+	counts := *fullCountsV3()
+	counts.ActionsRequiresAuth = nil
+	return &TriageSnapshotResponsePayload{
+		RequestID: "request-0001", Schema: 5, GeneratedAt: "2026-01-01T00:00:00Z",
+		Counts: counts,
+		Items: []TriageSnapshotItem{{
+			Kind: "human_action", ID: "item-0001", Rank: 0, Title: "Download",
+			Facts: []TriageFact{}, Links: []TriageLink{}, Ops: []string{"dismiss"}, Attention: "required",
+			ActionID: 1, JobID: "job-000001", ActionKind: "manual_download", JobState: "waiting", Revision: 1,
+			RequiresAuth: boolPtr(false), BlockedBy: "login", RouteClass: "manual_download", AuthRequirement: "false",
+			RunKey: "run-0001", NextActor: "researcher", GuidanceVariant: "manual_download", OperationVariant: "dismiss_only",
+		}},
+		HasMore: false, UnsupportedItemsCount: 0,
+	}
+}
+
+func TestNewBrowserFramesRoundTripAllFields(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  string
+		in   any
+	}{
+		{"surface_presence", MsgSurfacePresence, &SurfacePresencePayload{RequestID: "request-0001", InstanceID: "instance-0001", Surface: "popup", Focused: true, At: "2026-01-01T00:00:00Z"}},
+		{"surface_presence_ack", MsgSurfacePresenceAck, &SurfacePresenceAckPayload{RequestID: "request-0001", Accepted: true}},
+		{"work_pulse_request", MsgWorkPulseRequest, &WorkPulseRequestPayload{RequestID: "request-0001", SchemaVersions: []int64{1}}},
+		{"work_pulse_response", MsgWorkPulseResponse, fullWorkPulsePayload()},
+		{"activity_page_request", MsgActivityPageRequest, &ActivityPageRequestPayload{RequestID: "request-0001", Limit: 50, BeforeSeq: "42", SeenThroughSeq: "41"}},
+		{"activity_page_response", MsgActivityPageResponse, fullActivityPageResponse()},
+		{"page_bulk_submit_v2_request", MsgPageBulkSubmitV2Request, fullV2SubmitRequest()},
+		{"page_bulk_submit_v2_result", MsgPageBulkSubmitV2Result, fullV2SubmitResult()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, err := DecodeBrowserMessage(protocolTestFrame(t, tc.typ, tc.in))
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !reflect.DeepEqual(msg.Payload, tc.in) {
+				t.Fatalf("payload round-trip = %#v, want %#v", msg.Payload, tc.in)
+			}
+		})
+	}
+}
+
+func TestNewBrowserFramesRejectUnknownAndNullFields(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  string
+		base any
+		key  string
+	}{
+		{"presence", MsgSurfacePresence, &SurfacePresencePayload{RequestID: "request-0001", InstanceID: "instance-0001", Surface: "popup", Focused: true, At: "2026-01-01T00:00:00Z"}, "surface"},
+		{"presence_ack", MsgSurfacePresenceAck, &SurfacePresenceAckPayload{RequestID: "request-0001", Accepted: true}, "accepted"},
+		{"pulse_request", MsgWorkPulseRequest, &WorkPulseRequestPayload{RequestID: "request-0001", SchemaVersions: []int64{1}}, "schema_versions"},
+		{"pulse_response", MsgWorkPulseResponse, fullWorkPulsePayload(), "schema"},
+		{"activity_request", MsgActivityPageRequest, &ActivityPageRequestPayload{RequestID: "request-0001"}, "request_id"},
+		{"activity_response", MsgActivityPageResponse, fullActivityPageResponse(), "generated_at"},
+		{"bulk_request", MsgPageBulkSubmitV2Request, fullV2SubmitRequest(), "cohort_id"},
+		{"bulk_result", MsgPageBulkSubmitV2Result, fullV2SubmitResult(), "membership"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			unknown := protocolPayloadMap(t, tc.base)
+			unknown["unexpected"] = true
+			expectProtocolReject(t, tc.typ, unknown)
+			nullField := protocolPayloadMap(t, tc.base)
+			nullField[tc.key] = nil
+			expectProtocolReject(t, tc.typ, nullField)
+		})
+	}
+}
+
+func TestNewBrowserFramesClosedEnumsAndIdentifiers(t *testing.T) {
+	invalid := []struct {
+		name string
+		typ  string
+		p    map[string]any
+	}{
+		{name: "surface", typ: MsgSurfacePresence, p: map[string]any{
+			"request_id": "request-0001", "instance_id": "instance-0001", "surface": "sidebar", "focused": true, "at": "2026-01-01T00:00:00Z",
+		}},
+		{name: "cause_kind", typ: MsgWorkPulseResponse, p: map[string]any{
+			"request_id": "request-0001", "schema": 1, "generated_at": "2026-01-01T00:00:00Z",
+			"stall_episodes": []any{map[string]any{"episode_key": "episode-0001", "cause_kind": "unknown", "public_label": "bad", "since": "2026-01-01T00:00:00Z", "count": 1}}, "stalled": 1,
+		}},
+		{name: "next_action_kind", typ: MsgWorkPulseResponse, p: map[string]any{
+			"request_id": "request-0001", "schema": 1, "generated_at": "2026-01-01T00:00:00Z",
+			"next_action": map[string]any{"at": "2026-01-01T00:00:00Z", "kind": "eta"},
+		}},
+		{name: "gate_kind", typ: MsgWorkPulseResponse, p: map[string]any{
+			"request_id": "request-0001", "schema": 1, "generated_at": "2026-01-01T00:00:00Z",
+			"gates": []any{map[string]any{"kind": "quota", "source": "openalex", "until": "2026-01-01T00:00:00Z", "count": 1}},
+		}},
+		{name: "membership", typ: MsgWorkPulseResponse, p: map[string]any{
+			"request_id": "request-0001", "schema": 1, "generated_at": "2026-01-01T00:00:00Z",
+			"latest_batch": map[string]any{"batch_id": "batch-0001", "started_at": "2026-01-01T00:00:00Z", "membership": "sealed"},
+		}},
+		{name: "bulk_membership", typ: MsgPageBulkSubmitV2Result, p: map[string]any{
+			"request_id": "request-0001", "scan_id": "scan-0001", "cohort_id": "cohort-0001", "chunk_index": 0, "final_chunk": true,
+			"batch_id": "batch-0001", "membership": "sealed", "persisted_members": 0, "submitted": 0, "joined": 0, "already_owned": 0, "invalid": 0,
+		}},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) { expectProtocolReject(t, tc.typ, tc.p) })
+	}
+	pulse := protocolPayloadMap(t, fullWorkPulsePayload())
+	pulse["next_action"].(map[string]any)["kind"] = "eta"
+	expectProtocolReject(t, MsgWorkPulseResponse, pulse)
+	snapshot := protocolPayloadMap(t, fullSnapshotV5())
+	item := snapshot["items"].([]any)[0].(map[string]any)
+	item["next_actor"] = "daemon"
+	expectProtocolReject(t, MsgTriageSnapshotResponse, snapshot)
+	// Mutate through a fresh map because the previous item is intentionally detached.
+	snapshot = protocolPayloadMap(t, fullSnapshotV5())
+	snapshot["items"].([]any)[0].(map[string]any)["guidance_variant"] = "guess"
+	expectProtocolReject(t, MsgTriageSnapshotResponse, snapshot)
+	snapshot = protocolPayloadMap(t, fullSnapshotV5())
+	snapshot["items"].([]any)[0].(map[string]any)["operation_variant"] = "guess"
+	expectProtocolReject(t, MsgTriageSnapshotResponse, snapshot)
+	counts := protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+	counts["counts"].(map[string]any)["required_turns"].([]any)[0].(map[string]any)["item_kind"] = "watch_hit"
+	expectProtocolReject(t, MsgTriageCountsResponse, counts)
+}
+func TestPageBulkSubmitV2ChunkOutcomeSums(t *testing.T) {
+	first := protocolPayloadMap(t, fullV2SubmitResult())
+	first["final_chunk"], first["chunk_index"], first["cohort_total"] = false, 0, int64(100)
+	first["persisted_members"], first["submitted"], first["joined"], first["already_owned"], first["invalid"] = int64(0), int64(50), int64(0), int64(0), int64(0)
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgPageBulkSubmitV2Result, first)); err != nil {
+		t.Fatalf("first chunk rejected: %v", err)
+	}
+	second := protocolPayloadMap(t, fullV2SubmitResult())
+	second["final_chunk"], second["chunk_index"], second["cohort_total"] = true, 1, int64(100)
+	second["persisted_members"], second["submitted"], second["joined"], second["already_owned"], second["invalid"] = int64(50), int64(50), int64(0), int64(0), int64(0)
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgPageBulkSubmitV2Result, second)); err != nil {
+		t.Fatalf("second chunk rejected: %v", err)
+	}
+	for _, payload := range []map[string]any{first, second} {
+		payload["submitted"], payload["joined"], payload["already_owned"], payload["invalid"] = int64(0), int64(0), int64(0), int64(0)
+		expectProtocolReject(t, MsgPageBulkSubmitV2Result, payload)
+	}
+}
+
+func TestNewBrowserFramesRejectMalformedIDsTimesAndLabels(t *testing.T) {
+	presence := protocolPayloadMap(t, &SurfacePresencePayload{RequestID: "request-0001", InstanceID: "instance-0001", Surface: "popup", Focused: true, At: "2026-01-01T00:00:00Z"})
+	presence["request_id"] = "bad"
+	expectProtocolReject(t, MsgSurfacePresence, presence)
+	presence = protocolPayloadMap(t, &SurfacePresencePayload{RequestID: "request-0001", InstanceID: "instance-0001", Surface: "popup", Focused: true, At: "2026-01-01T00:00:00Z"})
+	presence["instance_id"] = "bad"
+	expectProtocolReject(t, MsgSurfacePresence, presence)
+	presence["instance_id"] = strings.Repeat("i", 65)
+	expectProtocolReject(t, MsgSurfacePresence, presence)
+	presence = protocolPayloadMap(t, &SurfacePresencePayload{RequestID: "request-0001", InstanceID: "instance-0001", Surface: "popup", Focused: true, At: "not-a-time"})
+	expectProtocolReject(t, MsgSurfacePresence, presence)
+	pulse := protocolPayloadMap(t, fullWorkPulsePayload())
+	pulse["generated_at"] = strings.Repeat("x", 65)
+	expectProtocolReject(t, MsgWorkPulseResponse, pulse)
+	pulse = protocolPayloadMap(t, fullWorkPulsePayload())
+	pulse["latest_batch"].(map[string]any)["label"] = strings.Repeat("x", 257)
+	expectProtocolReject(t, MsgWorkPulseResponse, pulse)
+	pulse = protocolPayloadMap(t, fullWorkPulsePayload())
+	pulse["latest_batch"].(map[string]any)["batch_id"] = strings.Repeat("b", 65)
+	expectProtocolReject(t, MsgWorkPulseResponse, pulse)
+	pulse = protocolPayloadMap(t, fullWorkPulsePayload())
+	pulse["stall_episodes"].([]any)[0].(map[string]any)["episode_key"] = strings.Repeat("e", 65)
+	expectProtocolReject(t, MsgWorkPulseResponse, pulse)
+	pulse = protocolPayloadMap(t, fullWorkPulsePayload())
+	pulse["stall_episodes"].([]any)[0].(map[string]any)["public_label"] = "bad\nlabel"
+	expectProtocolReject(t, MsgWorkPulseResponse, pulse)
+}
+
+func TestWorkPulseBoundsAndAlgebra(t *testing.T) {
+	t.Run("episode and gate bounds", func(t *testing.T) {
+		p := fullWorkPulsePayload()
+		p.StallEpisodes = make([]WorkPulseStallEpisode, 17)
+		for i := range p.StallEpisodes {
+			p.StallEpisodes[i] = WorkPulseStallEpisode{EpisodeKey: fmt.Sprintf("episode-%04d", i), CauseKind: "execution_lease_overdue", PublicLabel: "stall", Since: "2026-01-01T00:00:00Z", Count: 1}
+		}
+		p.Stalled, p.NonterminalTotal = int64Ptr(17), int64Ptr(25)
+		p.StallEpisodes = []WorkPulseStallEpisode{
+			{EpisodeKey: "episode-0001", CauseKind: "execution_lease_overdue", PublicLabel: "stall", Since: "2026-01-01T00:00:00Z", Count: 1},
+			{EpisodeKey: "episode-0002", CauseKind: "execution_lease_overdue", PublicLabel: "stall", Since: "2026-01-01T00:00:00Z", Count: 1},
+		}
+		p.Stalled, p.NonterminalTotal = int64Ptr(2), int64Ptr(10)
+		p.InFlight, p.Scheduled, p.WaitingRequired, p.Continuing = int64Ptr(2), int64Ptr(2), int64Ptr(2), int64Ptr(2)
+		p.StallEpisodesTruncated = boolPtr(false)
+		if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgWorkPulseResponse, p)); err != nil {
+			t.Fatalf("two ordered episodes rejected: %v", err)
+		}
+		p.StallEpisodes = make([]WorkPulseStallEpisode, 17)
+		for i := range p.StallEpisodes {
+			p.StallEpisodes[i] = WorkPulseStallEpisode{EpisodeKey: fmt.Sprintf("episode-%04d", i), CauseKind: "execution_lease_overdue", PublicLabel: "stall", Since: "2026-01-01T00:00:00Z", Count: 1}
+		}
+		p.Stalled, p.NonterminalTotal = int64Ptr(17), int64Ptr(25)
+		p.StallEpisodesTruncated = boolPtr(true)
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p.StallEpisodes = p.StallEpisodes[:16]
+		if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgWorkPulseResponse, p)); err != nil {
+			t.Fatalf("16 episodes rejected: %v", err)
+		}
+		p.Gates = make([]WorkPulseGate, 16)
+		for i := range p.Gates {
+			p.Gates[i] = WorkPulseGate{Kind: "source_budget", Source: fmt.Sprintf("source-%04d", i), Until: "2026-01-01T00:00:00Z", Count: 1}
+		}
+		if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgWorkPulseResponse, p)); err != nil {
+			t.Fatalf("16 gates rejected: %v", err)
+		}
+		p.Gates = append(p.Gates, WorkPulseGate{Kind: "source_budget", Source: "source-0016", Until: "2026-01-01T00:00:00Z", Count: 1})
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+	})
+	t.Run("episode uniqueness and order", func(t *testing.T) {
+		p := fullWorkPulsePayload()
+		p.StallEpisodes = []WorkPulseStallEpisode{
+			{EpisodeKey: "episode-0001", CauseKind: "execution_lease_overdue", PublicLabel: "stall", Since: "2026-01-01T00:00:00Z", Count: 1},
+			{EpisodeKey: "episode-0001", CauseKind: "execution_lease_overdue", PublicLabel: "stall", Since: "2026-01-01T00:00:00Z", Count: 1},
+		}
+		p.Stalled, p.NonterminalTotal, p.InFlight, p.Scheduled, p.WaitingRequired, p.Continuing = int64Ptr(2), int64Ptr(10), int64Ptr(2), int64Ptr(2), int64Ptr(2), int64Ptr(2)
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p.StallEpisodes[1].EpisodeKey, p.StallEpisodes[1].Since = "episode-0002", "2025-01-01T00:00:00Z"
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+	})
+	t.Run("count and uniqueness bounds", func(t *testing.T) {
+		p := protocolPayloadMap(t, fullWorkPulsePayload())
+		p["nonterminal_total"] = 1000001
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		p["stall_episodes"].([]any)[0].(map[string]any)["count"] = 0
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		p["gates"] = []any{p["gates"].([]any)[0], p["gates"].([]any)[0]}
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+	})
+	t.Run("projection algebra", func(t *testing.T) {
+		p := protocolPayloadMap(t, fullWorkPulsePayload())
+		p["continuing"] = 3
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		delete(p, "scheduled")
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		p["continuing"] = 2
+		if _, err := DecodeBrowserMessage(protocolFrameMap(t, MsgWorkPulseResponse, p)); err != nil {
+			t.Fatalf("exact bucket sum rejected: %v", err)
+		}
+	})
+	t.Run("capacity and stall equations", func(t *testing.T) {
+		p := protocolPayloadMap(t, fullWorkPulsePayload())
+		p["effect_capacity"].(map[string]any)["busy"] = 3
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		p["human_surface_capacity"].(map[string]any)["busy"] = 3
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		p["stalled"] = 1
+		delete(p, "stall_episodes")
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		p["stall_episodes"].([]any)[0].(map[string]any)["count"] = 1
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		p["stall_episodes_truncated"] = true
+		p["stall_episodes"].([]any)[0].(map[string]any)["count"] = 3
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+	})
+	t.Run("latest batch equations", func(t *testing.T) {
+		p := protocolPayloadMap(t, fullWorkPulsePayload())
+		p["latest_batch"].(map[string]any)["settled"] = 4
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		p["latest_batch"].(map[string]any)["settled"] = 5
+		if _, err := DecodeBrowserMessage(protocolFrameMap(t, MsgWorkPulseResponse, p)); err != nil {
+			t.Fatalf("exact latest batch identity rejected: %v", err)
+		}
+		p = protocolPayloadMap(t, fullWorkPulsePayload())
+		p["latest_batch"].(map[string]any)["unavailable"] = 6
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+	})
+}
+
+func TestWorkPulseMaximumLegalSize(t *testing.T) {
+	p := fullWorkPulsePayload()
+	p.StallEpisodes = make([]WorkPulseStallEpisode, 16)
+	for i := range p.StallEpisodes {
+		p.StallEpisodes[i] = WorkPulseStallEpisode{
+			EpisodeKey: fmt.Sprintf("%064d", i), CauseKind: "execution_lease_overdue",
+			PublicLabel: strings.Repeat("L", 64), Since: "2026-01-01T00:00:00Z", Count: 1,
+		}
+	}
+	p.Stalled, p.NonterminalTotal = int64Ptr(16), int64Ptr(20)
+	p.InFlight, p.Scheduled, p.WaitingRequired, p.Continuing = int64Ptr(1), int64Ptr(1), int64Ptr(1), int64Ptr(1)
+	p.Gates = make([]WorkPulseGate, 16)
+	for i := range p.Gates {
+		p.Gates[i] = WorkPulseGate{Kind: "source_budget", Source: fmt.Sprintf("%064d", i), Until: "2026-01-01T00:00:00Z", Count: 1000000}
+	}
+	p.LatestBatch.Label = strings.Repeat("B", 256)
+	p.LatestBatch.Total, p.LatestBatch.Settled, p.LatestBatch.NonterminalTotal = int64Ptr(25), int64Ptr(5), int64Ptr(20)
+	p.LatestBatch.InFlight, p.LatestBatch.Scheduled, p.LatestBatch.WaitingRequired, p.LatestBatch.Continuing, p.LatestBatch.Stalled = int64Ptr(1), int64Ptr(1), int64Ptr(1), int64Ptr(1), int64Ptr(16)
+	data := protocolTestFrame(t, MsgWorkPulseResponse, p)
+	if len(data) >= 32<<10 || len(data) >= MaxBrowserMessageBytes {
+		t.Fatalf("maximum legal pulse frame size = %d, want < 32 KiB and < MaxBrowserMessageBytes", len(data))
+	}
+	if _, err := DecodeBrowserMessage(data); err != nil {
+		t.Fatalf("maximum legal pulse rejected: %v", err)
+	}
+}
+
+func TestActivityAndBulkV2Bounds(t *testing.T) {
+	t.Run("activity page 51 entries", func(t *testing.T) {
+		p := fullActivityPageResponse()
+		p.HasMore, p.Cursor = false, ""
+		p.Entries = make([]ActivityEntryPayload, 51)
+		for i := range p.Entries {
+			p.Entries[i] = ActivityEntryPayload{Seq: int64(i), At: "2026-01-01T00:00:00Z", Kind: "event", Text: "text"}
+		}
+		expectProtocolReject(t, MsgActivityPageResponse, p)
+	})
+	t.Run("cohort bounds", func(t *testing.T) {
+		for _, total := range []int64{0, 201} {
+			p := fullV2SubmitRequest()
+			p.CohortTotal = total
+			expectProtocolReject(t, MsgPageBulkSubmitV2Request, p)
+		}
+		p := fullV2SubmitRequest()
+		p.ChunkIndex, p.CohortTotal, p.CanonicalKeys, p.FinalChunk = 4, 200, []string{"work-key-1"}, false
+		expectProtocolReject(t, MsgPageBulkSubmitV2Request, p)
+		p = fullV2SubmitRequest()
+		p.CohortTotal, p.CanonicalKeys = 51, make([]string, 51)
+		for i := range p.CanonicalKeys {
+			p.CanonicalKeys[i] = fmt.Sprintf("work-key-%d", i)
+		}
+		p.ChunkIndex, p.FinalChunk = 0, false
+		expectProtocolReject(t, MsgPageBulkSubmitV2Request, p)
+		p = fullV2SubmitRequest()
+		p.CohortTotal, p.CanonicalKeys = 2, []string{"work-key-1", "work-key-1"}
+		expectProtocolReject(t, MsgPageBulkSubmitV2Request, p)
+	})
+}
+
+func TestTriageSchemaNegotiationAndV3Bounds(t *testing.T) {
+	for _, versions := range [][]int64{{1}, {2}, {3}} {
+		p := &TriageCountsRequestPayload{RequestID: "request-0001", SchemaVersions: versions}
+		if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgTriageCountsRequest, p)); err != nil {
+			t.Fatalf("counts versions %v rejected: %v", versions, err)
+		}
+	}
+	for _, versions := range [][]int64{{4}, {3, 2}} {
+		expectProtocolReject(t, MsgTriageCountsRequest, &TriageCountsRequestPayload{RequestID: "request-0001", SchemaVersions: versions})
+	}
+	for _, versions := range [][]int64{{1}, {2}, {3}, {4}, {5}, {4, 3}, {5, 4}} {
+		p := &TriageSnapshotRequestPayload{RequestID: "request-0001", SchemaVersions: versions}
+		if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgTriageSnapshotRequest, p)); err != nil {
+			t.Fatalf("snapshot versions %v rejected: %v", versions, err)
+		}
+	}
+	for _, versions := range [][]int64{{6}, {5, 3}, {3, 4}} {
+		expectProtocolReject(t, MsgTriageSnapshotRequest, &TriageSnapshotRequestPayload{RequestID: "request-0001", SchemaVersions: versions})
+	}
+	counts := protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+	if _, err := DecodeBrowserMessage(protocolFrameMap(t, MsgTriageCountsResponse, counts)); err != nil {
+		t.Fatalf("v3 counts rejected: %v", err)
+	}
+	// Counts responses intentionally carry no schema discriminator. The
+	// requesting peer gates v1/v2/v3 fields by the schema it requested; the
+	// bridge population tests pin that negotiation. Here we pin strict
+	// validation of every v3 field when present.
+	t.Run("required turn field gating", func(t *testing.T) {
+		for name, mutate := range map[string]func(map[string]any){
+			"human missing action": func(m map[string]any) { delete(m, "action_id") },
+			"human missing job":    func(m map[string]any) { delete(m, "job_id") },
+			"human grab":           func(m map[string]any) { m["grab_id"] = "grab-0001" },
+			"pdf missing grab": func(m map[string]any) {
+				m["item_kind"] = "pdf_grab"
+				m["route_class"] = "pdf_identifier_needed"
+				delete(m, "action_id")
+				delete(m, "job_id")
+			},
+			"pdf action": func(m map[string]any) {
+				m["item_kind"] = "pdf_grab"
+				m["route_class"] = "pdf_identifier_needed"
+				delete(m, "action_id")
+				delete(m, "job_id")
+				m["grab_id"] = "grab-0001"
+				m["action_id"] = int64(1)
+			},
+			"pdf job": func(m map[string]any) {
+				m["item_kind"] = "pdf_grab"
+				m["route_class"] = "pdf_identifier_needed"
+				delete(m, "action_id")
+				m["grab_id"] = "grab-0001"
+			},
+			"pdf gate": func(m map[string]any) {
+				m["item_kind"] = "pdf_grab"
+				m["route_class"] = "pdf_identifier_needed"
+				delete(m, "action_id")
+				delete(m, "job_id")
+				m["grab_id"] = "grab-0001"
+				m["gate_claim_id"] = "claim-0001"
+			},
+			"pdf dependent": func(m map[string]any) {
+				m["item_kind"] = "pdf_grab"
+				m["route_class"] = "pdf_identifier_needed"
+				delete(m, "action_id")
+				delete(m, "job_id")
+				m["grab_id"] = "grab-0001"
+				m["dependent_jobs"] = 1
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				m := protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+				turn := m["counts"].(map[string]any)["required_turns"].([]any)[0].(map[string]any)
+				mutate(turn)
+				expectProtocolReject(t, MsgTriageCountsResponse, m)
+			})
+		}
+	})
+	t.Run("family bounds and uniqueness", func(t *testing.T) {
+		m := protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+		runs := make([]any, 129)
+		for i := range runs {
+			runs[i] = map[string]any{"run_key": fmt.Sprintf("run-%04d", i), "first_rank": i, "route_class": "manual_download", "action_kind": "manual_download", "next_actor": "researcher", "guidance_variant": "manual_download", "operation_variant": "dismiss_only", "count": 1}
+		}
+		m["counts"].(map[string]any)["turns_required"] = 129
+		m["counts"].(map[string]any)["family_runs"] = runs
+		expectProtocolReject(t, MsgTriageCountsResponse, m)
+		m = protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+		cm := m["counts"].(map[string]any)
+		cm["turns_required"] = 2
+		cm["family_runs"] = append(cm["family_runs"].([]any), map[string]any{
+			"run_key": "run-0002", "first_rank": 1, "route_class": "manual_download", "action_kind": "manual_download",
+			"next_actor": "researcher", "guidance_variant": "manual_download", "operation_variant": "dismiss_only", "count": 1,
+		})
+		cm["family_runs"].([]any)[0].(map[string]any)["run_key"] = "run-0002"
+		expectProtocolReject(t, MsgTriageCountsResponse, m)
+		m = protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+		cm = m["counts"].(map[string]any)
+		cm["turns_required"] = 2
+		cm["family_runs"] = append(cm["family_runs"].([]any), map[string]any{
+			"run_key": "run-0000", "first_rank": 0, "route_class": "manual_download", "action_kind": "manual_download",
+			"next_actor": "researcher", "guidance_variant": "manual_download", "operation_variant": "dismiss_only", "count": 1,
+		})
+		expectProtocolReject(t, MsgTriageCountsResponse, m)
+	})
+	t.Run("required turn cap and duplicate item", func(t *testing.T) {
+		m := protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+		turns := make([]any, 1025)
+		for i := range turns {
+			turns[i] = map[string]any{"item_id": fmt.Sprintf("item-%04d", i), "item_kind": "human_action", "action_id": i + 1, "job_id": "job-000001", "route_class": "manual_download", "dependent_jobs": 0}
+		}
+		m["counts"].(map[string]any)["required_turns"] = turns
+		expectProtocolReject(t, MsgTriageCountsResponse, m)
+		m = protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+		required := m["counts"].(map[string]any)["required_turns"].([]any)
+		required = append(required, map[string]any{"item_id": "item-0001", "item_kind": "human_action", "action_id": 2, "job_id": "job-000001", "route_class": "manual_download", "dependent_jobs": 0})
+		m["counts"].(map[string]any)["required_turns"] = required
+		expectProtocolReject(t, MsgTriageCountsResponse, m)
+	})
+}
+
+func TestTriageSnapshotV5QuartetContract(t *testing.T) {
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgTriageSnapshotResponse, fullSnapshotV5())); err != nil {
+		t.Fatalf("full human-action quartet rejected: %v", err)
+	}
+	for _, kind := range []string{"watch_hit", "retraction"} {
+		t.Run(kind+" quartet forbidden", func(t *testing.T) {
+			p := fullSnapshotV5()
+			p.Items[0] = TriageSnapshotItem{Kind: kind, ID: "item-0001", Rank: 0, Title: "item", Ops: nil, Attention: "advisory"}
+			if kind == "watch_hit" {
+				p.Items[0].Work = &TriageWork{DOI: "10.1000/example", Title: "title", Authors: "author", Year: 2020}
+				p.Items[0].Watches = []TriageWatch{{ID: 1, Label: "watch"}}
+				p.Items[0].Abstract = "abstract"
+				p.Items[0].FirstSeenAt = "2026-01-01T00:00:00Z"
+			} else {
+				p.Items[0].DOI, p.Items[0].Nature, p.Items[0].NoticedAt = "10.1000/example", "retraction", "2026-01-01T00:00:00Z"
+			}
+			p.Items[0].RunKey, p.Items[0].NextActor, p.Items[0].GuidanceVariant, p.Items[0].OperationVariant = "run-0001", "reference", "manual_download", "none"
+			expectProtocolReject(t, MsgTriageSnapshotResponse, p)
+		})
+	}
+	t.Run("partial and below schema five", func(t *testing.T) {
+		for n := 1; n <= 3; n++ {
+			p := protocolPayloadMap(t, fullSnapshotV5())
+			item := p["items"].([]any)[0].(map[string]any)
+			for _, field := range []string{"next_actor", "guidance_variant", "operation_variant"}[:n] {
+				delete(item, field)
+			}
+			expectProtocolReject(t, MsgTriageSnapshotResponse, p)
+		}
+		p := fullSnapshotV5()
+		p.Schema = 4
+		expectProtocolReject(t, MsgTriageSnapshotResponse, p)
+	})
+	t.Run("pdf grab quartet accepted only in v5", func(t *testing.T) {
+		p := fullSnapshotV5()
+		p.Items[0] = TriageSnapshotItem{Kind: "pdf_grab", Label: "PDF", Grab: &TriageGrab{GrabID: "grab-0001", State: "awaiting_file"}, RouteClass: "pdf_identifier_needed", BlockedBy: "identifier_missing", Attention: "required", Ops: []string{"provide_identifier", "dismiss"}, RunKey: "run-0001", NextActor: "researcher", GuidanceVariant: "pdf_identifier", OperationVariant: "provide_identifier_or_dismiss"}
+		p.Counts.PendingTotal, p.Counts.Actions = 1, 0
+		p.Counts.TurnsRequired, p.Counts.TurnsWorking = int64Ptr(0), int64Ptr(0)
+		p.Counts.FamilyBreakdownComplete = boolPtr(false)
+		p.Counts.FamilyRuns = nil
+		p.Counts.RequiredTurnsComplete = boolPtr(false)
+		p.Counts.RequiredTurns = nil
+		if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgTriageSnapshotResponse, p)); err != nil {
+			t.Fatalf("pdf grab v5 quartet rejected: %v", err)
+		}
+		p.Schema = 4
+		expectProtocolReject(t, MsgTriageSnapshotResponse, p)
+	})
+}
+
+func TestTriageSnapshotQuartetForbiddenForWatchAndRetractionAcrossSchemas(t *testing.T) {
+	for _, kind := range []string{"watch_hit", "retraction"} {
+		for schema := int64(1); schema <= 5; schema++ {
+			t.Run(fmt.Sprintf("%s_schema_%d", kind, schema), func(t *testing.T) {
+				p := protocolPayloadMap(t, fullSnapshotV5())
+				p["schema"] = schema
+				counts := p["counts"].(map[string]any)
+				counts["pending_total"], counts["actions"], counts["watch_hits"], counts["retractions"] = 1, 0, 0, 0
+				if kind == "watch_hit" {
+					counts["watch_hits"] = 1
+				} else {
+					counts["retractions"] = 1
+				}
+				item := map[string]any{
+					"kind": kind, "id": "item-0001", "rank": 0, "title": "item",
+					"facts": []any{}, "links": []any{}, "ops": []any{},
+					"run_key": "run-0001", "next_actor": "reference",
+					"guidance_variant": "manual_download", "operation_variant": "none",
+				}
+				if schema >= 3 {
+					item["attention"] = "advisory"
+				}
+				if kind == "watch_hit" {
+					item["work"] = map[string]any{"doi": "10.1000/example", "title": "title", "authors": "author", "year": 2020, "is_oa": true}
+					item["abstract"] = "abstract"
+					item["watches"] = []any{map[string]any{"id": 1, "label": "watch"}}
+					item["first_seen_at"] = "2026-01-01T00:00:00Z"
+				} else {
+					item["doi"], item["nature"], item["noticed_at"] = "10.1000/example", "retraction", "2026-01-01T00:00:00Z"
+				}
+				p["items"] = []any{item}
+				expectProtocolReject(t, MsgTriageSnapshotResponse, p)
+			})
+		}
+	}
 }

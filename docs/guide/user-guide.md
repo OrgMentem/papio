@@ -215,6 +215,108 @@ solicited pull, not a live push stream. It refreshes while the inbox tab is
 open, and older daemons that do not advertise the activity-feed feature show a
 clear unavailable message rather than stale or guessed entries.
 
+### Use each papio surface for one job
+
+The extension and daemon deliberately keep five surfaces distinct:
+
+| Surface | What it answers |
+| --- | --- |
+| Inline result / toast strip | Did the action I just took land? |
+| Popup | What is happening now for this page and this browser? |
+| Badge and tooltip | Is *papio* disconnected, blocked, or waiting for me? |
+| Desktop notification | Did something worth interrupting me for happen while I was elsewhere? |
+| Inbox and Activity | What needs a decision, what is continuing, and what happened? |
+
+The popup is a current-page lens with a compact global pulse, not a second
+inbox. The badge is ambient and lossy, not a progress bar. The inbox is the
+durable decision surface, and Activity is its recoverable history. A feedback
+strip acknowledges a local action; it never becomes a work queue.
+
+### Choose notification interruptions
+
+Desktop notification routing is daemon-owned. The default `milestones` preset
+interrupts for useful milestones rather than every event: newly opened
+decisions are coalesced, pending decisions become a digest no more often than
+every four hours, batch completion gets at most a useful checkpoint and a
+meaningful final summary, discoveries stay in catch-up/digest views, integrity
+notices are capped per scan, and a named degraded episode notifies once.
+Continuing work and scheduled retries stay quiet. The `quiet` preset is less
+interruptive, while `verbose` surfaces more category events. Use
+[`[notify]` in the configuration reference](../reference/config-reference.md#notify)
+for the preset table and per-category overrides.
+
+Webhooks are a separate automation channel. They are not delayed by human
+quiet hours or the desktop rate limit, and each category can override its
+webhook mode independently of desktop routing. Webhook delivery and desktop
+delivery are both best-effort; the durable inbox and Activity records remain
+the recovery path.
+
+### Read the pulse for a batch
+
+For a one-shot daemon reading, run:
+
+```sh
+papio pulse
+papio pulse --json
+```
+
+The popup and inbox request the same typed pulse on their existing refresh
+cadence. Depending on the authoritative projection, its vocabulary is:
+
+- **Moving** — work is in flight or eligible to continue automatically.
+- **Waiting on you** — no work is moving and an effective researcher turn is
+  open.
+- **Stalled** — work has a named, durable degradation episode rather than an
+  ordinary scheduled wait.
+- **Scheduled** — only future retries, delivery polls, or source gates remain.
+- **Idle** — a complete projection reports no nonterminal work.
+- **Unknown** — the daemon is disconnected, the reading is stale or
+  contradictory, or the projection is incomplete for the requested conclusion.
+
+When a batch is partial or a measurement is unavailable, *papio* says so
+instead of turning missing data into zero. It shows no progress percentage,
+success ETA, or queue position. A next action time is a scheduled retry or
+check, not a promise that the work will succeed then.
+
+### Choose the toolbar count
+
+In **Options → Feedback and interruptions**, choose one of:
+
+- **Decisions waiting** (the default): show the exact daemon-owned count of
+  effective required turns;
+- **Everything pending**: show the broader legacy pending inventory; or
+- **No number**: keep the badge's disconnected and blocker states without a
+  numeric count.
+
+The `!` disconnected/blocker indicator always takes precedence. Watch hits,
+retractions, dependent sibling papers, and continuing work do not inflate the
+default required-turn number. When an older daemon cannot provide the required
+turn projection, the extension labels the fallback honestly as pending items.
+
+### Recover Activity after being away
+
+Activity remains a solicited pull, not a live push stream. The inbox requests
+pages of at most 50 entries and can use **Show more** to walk older entries.
+The extension stores an `activity_seen_through_seq` read watermark in browser
+profile storage. It advances that watermark only after a visible Activity
+render succeeds; background polling does not mark entries read.
+
+When the daemon can calculate the difference, the inbox shows `Activity (N
+new)` and a **Since you were last here** divider. If retained history has a
+gap, it says that newer Activity is available without inventing an exact
+count. Activity remains ordered and recoverable while repeated polling stays
+quiet for screen readers.
+
+### Desktop capability and acknowledgement
+
+Desktop notifications are daemon-owned and best-effort. The supported sender
+is macOS-only today; other platforms report the capability as unavailable
+instead of pretending that a notification was shown. The operating system
+does not provide *papio* with a delivery or visibility acknowledgement, so
+the Activity audit language says **attempted**, never **delivered**. A desktop
+notification is never the only record of an outcome: use the inbox, Activity,
+or the corresponding CLI command to recover it.
+
 When an inbox row says **manual download**, open the provider's PDF in the
 ordinary browser and use the popup's **Send PDF to papio** action. The activity
 panel then makes the download and adoption steps visible while validation runs.

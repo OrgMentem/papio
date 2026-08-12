@@ -1,5 +1,7 @@
 // Copyright 2026 OrgMentem. Licensed under MIT.
 
+import { derivePulseDisplay, requestWorkPulse, type PopupPulseCache } from "./popup";
+import { getSuccessAckMode, type SuccessAckMode } from "./state";
 import type { ActivityEntryPayload, TriageCounts, TriageDelivery, TriageSnapshotItem, TriageSnapshotResponsePayload } from "./protocol";
 
 type Snapshot = Omit<TriageSnapshotResponsePayload, "request_id">;
@@ -34,6 +36,7 @@ function persistCitationStyle(style: CitationStyle): void {
 interface PageElements {
   connection: HTMLElement;
   counts: HTMLElement;
+  pulse: HTMLElement;
   filterInput: HTMLInputElement;
   refresh: HTMLButtonElement;
   reconnect: HTMLButtonElement;
@@ -46,6 +49,7 @@ interface PageElements {
   watchTab: HTMLButtonElement;
   activityTab: HTMLButtonElement;
   activityList: HTMLElement;
+  activityNew: HTMLElement;
   activityShowMore: HTMLButtonElement;
   operationStatus: HTMLElement;
   generatedAt: HTMLTimeElement;
@@ -59,12 +63,16 @@ interface PageElements {
   undoMessage: HTMLElement;
   undoButton: HTMLButtonElement;
 }
+let elements: PageElements | null = null;
 
 interface Confirmation {
   itemID: string;
   verdict: Verdict;
   returnFocus: HTMLElement | null;
 }
+
+type FeedbackNotice = { text: string; deadline: number };
+
 
 // One dismissal waiting out its undo window. The item is kept whole so an undo
 // can put the exact row back without a round trip.
@@ -76,6 +84,8 @@ interface PendingDismissal {
 interface PageState {
   snapshot: Snapshot | null;
   counts: TriageCounts | null;
+  pulse: PopupPulseCache | undefined;
+  successAckMode: SuccessAckMode;
   generatedAt: string | null;
   connected: boolean;
   connectionMessage: string;
@@ -86,6 +96,9 @@ interface PageState {
   confirmation: Confirmation | null;
   dismissals: PendingDismissal[];
   undoDeadline: number | null;
+  dismissalCommitInFlight: boolean;
+  feedbackNotice: FeedbackNotice | null;
+  feedbackQueue: string[];
   focusSelectionAfterRender: boolean;
   loading: boolean;
   filterQuery: string;
@@ -95,6 +108,13 @@ interface PageState {
   activityKnown: boolean;
   activityEntries: ActivityEntry[];
   activityExpanded: boolean;
+  activityNewCount: number;
+  activityCursor: string | undefined;
+  activityLatestSeq: number;
+  activitySeenThroughSeq: number | null;
+  activityGap: boolean;
+  activityLimited: boolean;
+  activityHasMore: boolean;
   waitingJobs: Map<string, number>;
 }
 
@@ -105,6 +125,8 @@ type FocusTarget =
 const state: PageState = {
   snapshot: null,
   counts: null,
+  pulse: undefined,
+  successAckMode: "all",
   generatedAt: null,
   connected: false,
   connectionMessage: "Connecting to daemon…",
@@ -115,6 +137,9 @@ const state: PageState = {
   confirmation: null,
   dismissals: [],
   undoDeadline: null,
+  dismissalCommitInFlight: false,
+  feedbackNotice: null,
+  feedbackQueue: [],
   focusSelectionAfterRender: false,
   loading: false,
   filterQuery: "",
@@ -123,11 +148,16 @@ const state: PageState = {
   activityFeature: false,
   activityKnown: false,
   activityEntries: [],
-  waitingJobs: new Map(),
   activityExpanded: false,
+  activityNewCount: 0,
+  activityCursor: undefined,
+  activityLatestSeq: 0,
+  activitySeenThroughSeq: null,
+  activityGap: false,
+  activityLimited: false,
+  activityHasMore: false,
+  waitingJobs: new Map(),
 };
-
-let elements: PageElements | null = null;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -167,11 +197,42 @@ function scheduleWaitingOverlayExpiry(): void {
   }, Math.max(0, next - Date.now()));
 }
 
+const ACTIVITY_SEEN_THROUGH_KEY = "activity_seen_through_seq";
+
+async function loadActivityWatermark(): Promise<number> {
+  try {
+    if (typeof chrome !== "undefined" && chrome.storage?.local) {
+      const got = await chrome.storage.local.get(ACTIVITY_SEEN_THROUGH_KEY);
+      const value = got[ACTIVITY_SEEN_THROUGH_KEY];
+      if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+      if (typeof value === "string" && /^[0-9]+$/u.test(value)) return Number(value);
+    }
+  } catch {
+    // Browser storage may be unavailable in private/test contexts.
+  }
+  return 0;
+}
+
+async function persistActivityWatermark(value: number): Promise<void> {
+  try {
+    if (typeof chrome !== "undefined" && chrome.storage?.local) {
+      await chrome.storage.local.set({ [ACTIVITY_SEEN_THROUGH_KEY]: value });
+    }
+  } catch {
+    // Read state is best effort; retain the in-memory watermark.
+  }
+}
 async function runtimeMessage(type: string, request: Record<string, unknown>): Promise<unknown> {
   if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) {
     throw new Error("The extension runtime is unavailable.");
   }
   return chrome.runtime.sendMessage({ type, request });
+}
+
+async function loadSuccessAckMode(): Promise<void> {
+  if (typeof chrome === "undefined" || chrome.storage?.local === undefined) return;
+  state.successAckMode = await getSuccessAckMode(chrome.storage.local);
+  render();
 }
 
 // A disconnect is usually the daemon's own port healing (extension reload,
@@ -301,6 +362,9 @@ function firstSafeLink(item: TriageSnapshotItem): string | null {
 function openNewTab(url: string): void {
   window.open(url, "_blank", "noopener,noreferrer");
 }
+function announce(text: string): void {
+  if (elements !== null) elements.operationStatus.textContent = text;
+}
 
 function previewToken(item: TriageSnapshotItem): string | null {
   if (item.kind !== "human_action" || item.action_kind !== "verify_identity") return null;
@@ -366,6 +430,9 @@ function operationLabel(operation: TriageOperation): string {
       return "Provide identifier";
   }
 }
+function itemGuidanceID(item: TriageSnapshotItem): string {
+  return `item-guidance-${item.id.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+}
 
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): HTMLElementTagNameMap[K] {
@@ -378,9 +445,32 @@ function operationMessage(itemID: string, text: string, tone: "info" | "error" |
   state.itemMessages.set(itemID, { text, tone });
   if (elements !== null) elements.operationStatus.textContent = text;
 }
-
-function announce(message: string): void {
-  if (elements !== null) elements.operationStatus.textContent = message;
+function activityResponse(value: unknown): {
+  feature: boolean;
+  entries: ActivityEntry[];
+  hasMore: boolean;
+  cursor?: string | undefined;
+  latestSeq: number;
+  newCountSince?: number | undefined;
+  gap: boolean;
+  paged: boolean;
+} | null {
+  if (!isRecord(value) || value["ok"] !== true || typeof value["feature"] !== "boolean") return null;
+  if (value["feature"] === false) return { feature: false, entries: [], hasMore: false, latestSeq: 0, gap: false, paged: false };
+  const rawEntries = value["entries"];
+  if (!Array.isArray(rawEntries)) return null;
+  const latestSeq: number = typeof value["latest_seq"] === "number" && Number.isSafeInteger(value["latest_seq"])
+    ? value["latest_seq"] : rawEntries.reduce<number>((max, entry) => isActivityEntry(entry) ? Math.max(max, entry.seq) : max, 0);
+  return {
+    feature: true,
+    entries: rawEntries.filter(isActivityEntry),
+    hasMore: value["has_more"] === true,
+    cursor: typeof value["cursor"] === "string" ? value["cursor"] : undefined,
+    latestSeq,
+    newCountSince: typeof value["new_count_since"] === "number" ? value["new_count_since"] : undefined,
+    gap: value["gap"] === true,
+    paged: "latest_seq" in value,
+  };
 }
 
 function rowForItem(itemID: string): HTMLElement | null {
@@ -393,7 +483,6 @@ function rowForItem(itemID: string): HTMLElement | null {
   }
   return null;
 }
-
 function itemsForTab(tab: InboxTab): TriageSnapshotItem[] {
   if (tab === "activity") return [];
   const items = orderedItems();
@@ -414,13 +503,6 @@ function isActivityEntry(value: unknown): value is ActivityEntry {
   );
 }
 
-function activityResponse(value: unknown): { feature: boolean; entries: ActivityEntry[] } | null {
-  if (!isRecord(value) || value["ok"] !== true || typeof value["feature"] !== "boolean") return null;
-  if (value["feature"] === false) return { feature: false, entries: [] };
-  const rawEntries = value["entries"];
-  if (!Array.isArray(rawEntries)) return null;
-  return { feature: true, entries: rawEntries.filter(isActivityEntry) };
-}
 
 function relativeActivityTime(at: string): string {
   const timestamp = Date.parse(at);
@@ -619,6 +701,8 @@ function renderActivityGroup(group: ActivityGroup, rows: ActivityRow[]): HTMLEle
 function renderActivity(): void {
   if (elements === null) return;
   elements.activityList.replaceChildren();
+  elements.activityNew.replaceChildren();
+  elements.activityNew.hidden = true;
   elements.activityShowMore.hidden = true;
   if (!state.activityKnown) {
     elements.activityList.append(element("p", "Checking activity availability…"));
@@ -628,6 +712,24 @@ function renderActivity(): void {
     elements.activityList.append(element("p", "Activity is unavailable with this daemon. Upgrade papio to see recent activity."));
     return;
   }
+  if (!state.activityLimited && !state.activityGap && state.activityNewCount > 0) {
+    const count = Math.min(50, state.activityNewCount);
+    const suffix = count === 1 ? "entry" : "entries";
+    const affordance = element("button", `${count} new Activity ${suffix} — show recent activity`);
+    affordance.type = "button";
+    affordance.setAttribute("aria-label", `${count} new Activity ${suffix}`);
+    affordance.addEventListener("click", () => {
+      state.activityNewCount = 0;
+      announce(`${count} new Activity ${suffix} available.`);
+      render();
+    });
+    elements.activityNew.append(affordance);
+    elements.activityNew.hidden = false;
+  } else if (state.activityGap) {
+    elements.activityNew.append(element("p", "Newer Activity is available; exact unread count is unavailable."));
+    elements.activityNew.hidden = false;
+  }
+  if (state.activityLimited) elements.activityList.append(element("p", "Activity history is limited to the latest 50 entries with this daemon"));
   const groups = activityGroups();
   if (groups.length === 0) {
     elements.activityList.append(element("p", "No recent activity."));
@@ -646,9 +748,20 @@ function renderActivity(): void {
     shownRows += rows.length;
   }
   const totalRows = groups.reduce((total, group) => total + group.rows.length, 0);
-  elements.activityShowMore.hidden = state.activityExpanded || (shownGroups >= groups.length && shownRows >= totalRows);
+  const needsLocalExpansion = !state.activityExpanded && (groups.length > 5 || totalRows > 15);
+  elements.activityShowMore.hidden = !(state.activityHasMore || needsLocalExpansion);
+  if (
+    state.activeTab === "activity" &&
+    state.activityEntries.length > 0 &&
+    (typeof document === "undefined" || document.visibilityState === "visible") &&
+    !state.activityGap &&
+    state.activitySeenThroughSeq !== null &&
+    state.activityLatestSeq > state.activitySeenThroughSeq
+  ) {
+    state.activitySeenThroughSeq = state.activityLatestSeq;
+    void persistActivityWatermark(state.activitySeenThroughSeq);
+  }
 }
-
 function renderTabs(): void {
   if (elements === null) return;
   const tabs = [elements.actionsTab, elements.watchTab, elements.activityTab];
@@ -662,7 +775,11 @@ function renderTabs(): void {
   const watchCount = state.counts === null ? itemsForTab("watch").length : state.counts.watch_hits;
   elements.actionsTab.textContent = `Actions (${actionCount})`;
   elements.watchTab.textContent = `Watch hits (${watchCount})`;
-  elements.activityTab.textContent = state.activityKnown && !state.activityFeature ? "Activity (unavailable)" : "Activity";
+  elements.activityTab.textContent = state.activityKnown && !state.activityFeature
+    ? "Activity (unavailable)"
+    : (!state.activityLimited && !state.activityGap && state.activityNewCount > 0
+      ? `Activity (${Math.min(50, state.activityNewCount)} new)`
+      : "Activity");
   elements.activityTab.hidden = false;
   for (const tab of tabs) {
     const selected = tab.dataset.tab === state.activeTab;
@@ -839,9 +956,12 @@ function renderCitation(item: TriageSnapshotItem, placeholderURL: string | null)
 
 function previewButton(item: TriageSnapshotItem): HTMLButtonElement | null {
   if (item.kind !== "human_action" || item.action_kind !== "verify_identity") return null;
+  const title = displayTitle(item).text;
   const button = element("button", "View PDF");
   button.type = "button";
   button.dataset.operation = "preview";
+  button.dataset.label = "View PDF";
+  button.setAttribute("aria-label", `View PDF for ${title}`);
   button.disabled = state.pending.has(item.id) || !state.connected;
   button.addEventListener("click", () => {
     void requestPreview(item);
@@ -853,9 +973,13 @@ function operationButton(item: TriageSnapshotItem, operation: TriageOperation): 
   // Retry is reserved for a newer inbox contract. Do not expose a dead,
   // permanently disabled placeholder when the daemon includes it.
   if (operation === "retry") return null;
-  const button = element("button", operationLabel(operation));
+  const label = operationLabel(operation);
+  const title = displayTitle(item).text;
+  const button = element("button", label);
   button.type = "button";
   button.dataset.operation = operation;
+  button.dataset.label = label;
+  button.setAttribute("aria-label", `${label} ${title}`);
 
   const needsPreview = operation === "accept" && item.action_kind === "verify_identity";
   const handoff = item.kind === "human_action" && item.action_kind === "openurl_handoff";
@@ -992,13 +1116,9 @@ function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): st
   if (blockedByChallenge) return "Solve the security check in its tab";
   switch (item.action_kind) {
     case "manual_download":
-      return missingAdapter(item)
-        ? "No adapter yet - download this PDF manually"
-        : "Download the PDF yourself - papio adopts it";
+      return missingAdapter(item) ? "No adapter yet - download this PDF manually" : "Download the PDF yourself - papio adopts it";
     case "openurl_handoff":
-      return item.requires_auth === true
-        ? "Sign in to your institution"
-        : "Open the page";
+      return item.requires_auth === true ? "Sign in to your institution" : "Open the page";
     case "verify_identity":
       return "Review the PDF, then accept or reject";
     case "document_delivery":
@@ -1008,6 +1128,67 @@ function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): st
     default:
       return null;
   }
+}
+function locallyRenderedGuidance(item: TriageSnapshotItem): string | null {
+  if (waitingSibling(item)) return "papio is continuing — waiting for the institution sign-in already open in another tab";
+  const blocked = challengeBlocked(item);
+  if (blocked) return renderInstruction(item, true, item.attention === "working")?.textContent ?? null;
+  const family = familyCopy(item);
+  if (family !== null) return family.instruction;
+  const guidance = guidanceText(item, false);
+  if (guidance === null || guidance.trim() === "") return null;
+  return item.attention === "working" ? `papio is continuing — ${guidance.charAt(0).toLowerCase()}${guidance.slice(1)}` : guidance;
+}
+
+interface FamilyRender {
+  heading: string;
+  instruction: string;
+  descriptionID: string;
+  total: number;
+  shown: number;
+}
+
+function familyCopy(item: TriageSnapshotItem): { heading: string; instruction: string } | null {
+  switch (item.guidance_variant) {
+    case "manual_download": return { heading: "Manual downloads", instruction: "Open each source and save the PDF — papio adopts it." };
+    case "manual_download_adapter_missing": return { heading: "Manual downloads (adapter unavailable)", instruction: "Download each PDF manually — papio adopts it." };
+    case "institution_sign_in": return { heading: "Institution sign-in", instruction: "Sign in to your institution once — papio continues the waiting papers." };
+    case "open_page": return { heading: "Pages to open", instruction: "Open each source page so papio can continue." };
+    case "verify_identity": return { heading: "PDF identity review", instruction: "Review each PDF, then accept or reject it." };
+    case "document_delivery": return { heading: "Document delivery", instruction: "Confirm what the library has on file for each request." };
+    case "downloads_access": return { heading: "Downloads access", instruction: "Grant Downloads access so papio can adopt the pending files." };
+    case "terms_acceptance": return { heading: "Publisher terms", instruction: "Review and accept the publisher terms for each source." };
+    case "security_challenge": return { heading: "Security checks", instruction: "Solve each security check in its tab." };
+    case "pdf_identifier": return { heading: "PDF identifiers", instruction: "Provide an identifier for each captured PDF." };
+    case "papio_continuing": return { heading: "papio continuing", instruction: "papio is continuing automatically — no decision is needed." };
+    default: return null;
+  }
+}
+
+function familyForItem(item: TriageSnapshotItem, items: readonly TriageSnapshotItem[]): FamilyRender | null {
+  if (state.snapshot?.schema !== 5 || item.run_key === undefined || item.next_actor === undefined ||
+      item.guidance_variant === undefined || item.operation_variant === undefined) return null;
+  const copy = familyCopy(item);
+  const run = state.counts?.family_runs?.find((candidate) =>
+    candidate.run_key === item.run_key &&
+    candidate.guidance_variant === item.guidance_variant &&
+    candidate.operation_variant === item.operation_variant &&
+    candidate.next_actor === item.next_actor);
+  if (copy === null || state.counts?.family_breakdown_complete !== true || run === undefined || run.count < 2) return null;
+  const runItems = items.filter((candidate) => candidate.run_key === item.run_key);
+  if (runItems.length < 2) return null;
+  const first = items.findIndex((candidate) => candidate.run_key === item.run_key);
+  const last = items.length - 1 - [...items].reverse().findIndex((candidate) => candidate.run_key === item.run_key);
+  if (first < 0 || last < first || items.slice(first, last + 1).some((candidate) => candidate.run_key !== item.run_key)) return null;
+  const guidance = locallyRenderedGuidance(item);
+  if (guidance === null || runItems.some((candidate) =>
+    candidate.next_actor !== item.next_actor ||
+    candidate.guidance_variant !== item.guidance_variant ||
+    candidate.operation_variant !== item.operation_variant ||
+    locallyRenderedGuidance(candidate) !== guidance
+  )) return null;
+  const descriptionID = `family-guidance-${item.run_key.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+  return { ...copy, descriptionID, total: run.count, shown: runItems.length };
 }
 
 function mechanismText(item: TriageSnapshotItem, blockedByChallenge: boolean): string | null {
@@ -1033,13 +1214,21 @@ function mechanismText(item: TriageSnapshotItem, blockedByChallenge: boolean): s
   }
 }
 
-/** Render only the next action. Empty guidance takes no row space; daemon
- * detail and mechanism explanations are kept in the disclosure. */
-function renderInstruction(item: TriageSnapshotItem, blockedByChallenge: boolean): HTMLElement | null {
+/** Render the next action. Working rows explicitly name papio as the actor
+ * and never present their imperative guidance as a decision. */
+function renderInstruction(
+  item: TriageSnapshotItem,
+  blockedByChallenge: boolean,
+  working = false,
+): HTMLElement | null {
   const guidance = guidanceText(item, blockedByChallenge);
   if (guidance === null || guidance.trim() === "") return null;
-  const instruction = element("p", guidance);
+  const text = working
+    ? `papio is continuing — ${guidance.charAt(0).toLowerCase()}${guidance.slice(1)}`
+    : guidance;
+  const instruction = element("p", text);
   instruction.className = "item-instruction item-guidance";
+  instruction.id = itemGuidanceID(item);
   if (blockedByChallenge) instruction.classList.add("challenge-annotation");
   return instruction;
 }
@@ -1052,7 +1241,6 @@ function liveStatusChip(item: TriageSnapshotItem): HTMLElement | null {
   if (status === null) return null;
   const chip = element("span", status);
   chip.className = "activity-live-status";
-  chip.setAttribute("role", "status");
   chip.dataset.jobId = jobID;
   return chip;
 }
@@ -1134,14 +1322,15 @@ function renderDebug(
   return { toggle, list };
 }
 
-function renderItem(item: TriageSnapshotItem): HTMLElement {
+function renderItem(item: TriageSnapshotItem, family: FamilyRender | null = null): HTMLElement {
   const card = element("article");
   card.className = "triage-item";
   card.dataset.triageItemId = item.id;
   const waiting = waitingSibling(item);
-  card.dataset.attention = waiting ? "working" : (item.attention ?? "");
-  if (!waiting && item.attention === undefined) delete card.dataset.attention;
-  card.tabIndex = item.id === state.selectedID ? 0 : -1;
+  const working = waiting || item.attention === "working";
+  card.dataset.attention = working ? "working" : (item.attention ?? "");
+  card.dataset.working = working ? "true" : "false";
+  if (!working && item.attention === undefined) delete card.dataset.attention;
   const title = displayTitle(item);
   const citation = renderCitation(item, title.placeholder ? title.text : null);
   card.setAttribute("aria-label", title.text);
@@ -1167,12 +1356,17 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   const debug = renderDebug(item, blockedByChallenge);
   body.append(headingText);
   if (citation !== null) body.append(citation);
-
-  const instruction = waiting ? element("p", "Waiting for the institution sign-in already open in another tab") : renderInstruction(item, blockedByChallenge);
-  if (instruction !== null) {
-    if (waiting) instruction.className = "item-instruction item-guidance";
-    body.append(instruction);
-  }
+  const instruction: HTMLElement | null = family === null
+    ? waiting
+      ? (() => {
+        const waitingInstruction = element("p", "papio is continuing — waiting for the institution sign-in already open in another tab");
+        waitingInstruction.className = "item-instruction item-guidance";
+        waitingInstruction.id = itemGuidanceID(item);
+        return waitingInstruction;
+      })()
+      : renderInstruction(item, blockedByChallenge, working)
+    : null;
+  if (instruction !== null) body.append(instruction);
   const liveStatus = liveStatusChip(item);
   if (liveStatus !== null) body.append(liveStatus);
   const delivery = renderDeliveryDetail(item);
@@ -1216,27 +1410,64 @@ function renderItem(item: TriageSnapshotItem): HTMLElement {
   const controls = element("div");
   controls.className = "item-controls";
   controls.setAttribute("aria-label", `Actions for ${title.text}`);
-  const preview = waiting ? null : previewButton(item);
+  const preview = working ? null : previewButton(item);
   if (preview !== null) controls.append(preview);
   for (const operation of item.ops) {
-    if (waiting && operation !== "dismiss") continue;
+    // A working row may expose only non-decision context (open/history).
+    // Never present a mutation as if the researcher owns the next turn.
+    if ((working && isMutation(operation)) || (waiting && operation === "open")) continue;
     const button = operationButton(item, operation);
     if (button !== null) controls.append(button);
+  }
+  if (controls.childElementCount > 0) {
+    const describedBy = family?.descriptionID ?? instruction?.id;
+    if (describedBy !== undefined) {
+      for (const control of Array.from(controls.querySelectorAll<HTMLButtonElement>("button"))) {
+        control.setAttribute("aria-describedby", describedBy);
+      }
+    }
   }
   if (controls.childElementCount > 0) card.append(controls);
 
   return card;
 }
-
 function renderGroup(kind: TriageSnapshotItem["kind"], heading: string | null, items: TriageSnapshotItem[]): HTMLElement | null {
   if (items.length === 0) return null;
   const section = element("section");
   section.className = `triage-group triage-group-${kind}`;
   if (heading !== null) section.append(element("h2", `${heading} (${items.length})`));
-  for (const item of items) section.append(renderItem(item));
+  let previousRun: string | undefined;
+  for (const item of items) {
+    const family = familyForItem(item, items);
+    if (family !== null && family.descriptionID !== previousRun) {
+      const familyHeading = element("h2", `${family.heading} · ${family.total} paper${family.total === 1 ? "" : "s"}`);
+      familyHeading.className = "family-heading";
+      familyHeading.id = `${family.descriptionID}-heading`;
+      if (state.filterQuery.trim() !== "" && family.shown !== family.total) {
+        familyHeading.append(element("span", ` (${family.shown} of ${family.total} shown)`));
+      }
+      section.append(familyHeading);
+      const familyInstruction = element("p", family.instruction);
+      familyInstruction.className = "item-instruction item-guidance family-guidance";
+      familyInstruction.id = family.descriptionID;
+      familyInstruction.setAttribute("aria-labelledby", familyHeading.id);
+      section.append(familyInstruction);
+      previousRun = family.descriptionID;
+    } else if (family === null) {
+      previousRun = undefined;
+    }
+    section.append(renderItem(item, family));
+  }
   return section;
 }
 
+function renderPulse(): void {
+  if (elements === null) return;
+  const display = derivePulseDisplay(state.pulse, state.connected ? "connected" : "disconnected", Date.now(), 45_000);
+  elements.pulse.textContent = display.primaryText;
+  elements.pulse.dataset.state = display.primary.toLowerCase().replaceAll(" ", "-");
+  elements.pulse.title = [display.buckets, display.next, display.capacity, display.batch].filter((part) => part !== "").join(" · ");
+}
 function renderCounts(): void {
   if (elements === null) return;
   const counts = state.counts ?? state.snapshot?.counts;
@@ -1244,13 +1475,13 @@ function renderCounts(): void {
     elements.counts.textContent = "Counts unavailable";
     return;
   }
-  const plural = (count: number, singular: string): string =>
-    `${count} ${count === 1 ? singular : `${singular}s`}`;
-  const parts = [`${counts.pending_total} pending`];
-  if (counts.retractions > 0) parts.push(plural(counts.retractions, "retraction"));
-  if (counts.actions > 0) parts.push(plural(counts.actions, "human action"));
-  if (counts.watch_hits > 0) parts.push(plural(counts.watch_hits, "watch hit"));
-  elements.counts.textContent = parts.join(" · ");
+  const required = counts.turns_required;
+  const needText = typeof required === "number" ? `${required} need you` : `${counts.pending_total} open`;
+  const reference = counts.watch_hits + counts.retractions;
+  const parts = [`${counts.pending_total} open`, needText];
+  if (reference > 0) parts.push(`${reference} for reference`);
+  if (counts.jobs_working > 0) parts.push(`papio is working on ${counts.jobs_working}`);
+  elements.counts.textContent = [...new Set(parts)].join(" · ");
 }
 
 function renderDialog(): void {
@@ -1290,6 +1521,7 @@ function render(): void {
   elements.refresh.disabled = state.loading;
   elements.reconnect.disabled = state.loading;
   renderCounts();
+  renderPulse();
   renderTabs();
   renderActivity();
 
@@ -1316,8 +1548,18 @@ function render(): void {
     elements.list.append(element("p", "No snapshot is available yet. Reconnect to retrieve the inbox."));
   } else if (state.snapshot.items.length === 0) {
     elements.list.append(element("p", "Your inbox is clear."));
-  } else if (actionItems.length === 0) {
+  } else if (actionItems.length === 0 && state.filterQuery.trim() !== "") {
     elements.list.append(element("p", `No items match "${state.filterQuery.trim()}".`));
+  } else if (actionItems.length === 0) {
+    const working = state.counts?.jobs_working ?? 0;
+    elements.list.append(
+      element(
+        "p",
+        working > 0
+          ? `No decisions waiting. papio is working through ${working} papers — see Activity.`
+          : "No decisions waiting.",
+      ),
+    );
   }
   if (state.snapshot === null) {
     elements.watchList.append(element("p", "No snapshot is available yet. Reconnect to retrieve the inbox."));
@@ -1435,14 +1677,43 @@ async function readWaitingSessionJobs(): Promise<Map<string, number>> {
   }
 }
 
-async function refreshActivity(): Promise<void> {
-  const result = await runtimeMessage("papio.activity", { limit: 50 })
+async function refreshActivity(loadMore = false): Promise<void> {
+  if (!loadMore && state.activitySeenThroughSeq === null) {
+    state.activitySeenThroughSeq = await loadActivityWatermark();
+  }
+  const request: Record<string, unknown> = { limit: 50 };
+  if (loadMore) {
+    if (state.activityCursor === undefined) return;
+    request["before_seq"] = state.activityCursor;
+  } else if (state.activitySeenThroughSeq !== null && state.activitySeenThroughSeq > 0) {
+    request["seen_through_seq"] = String(state.activitySeenThroughSeq);
+  }
+  const result = await runtimeMessage("papio.activity", request)
     .then(activityResponse)
     .catch(() => null);
   if (result === null) return;
   state.activityKnown = true;
   state.activityFeature = result.feature;
-  state.activityEntries = result.entries;
+  state.activityLimited = result.feature && !result.paged;
+  if (!result.feature) {
+    state.activityEntries = [];
+    state.activityHasMore = false;
+    state.activityCursor = undefined;
+    return;
+  }
+  const entries = loadMore
+    ? [...state.activityEntries, ...result.entries.filter((entry) => !state.activityEntries.some((existing) => existing.seq === entry.seq))]
+    : result.entries;
+  state.activityEntries = entries.sort((left, right) => right.seq - left.seq);
+  state.activityHasMore = result.hasMore;
+  state.activityCursor = result.cursor;
+  state.activityLatestSeq = Math.max(state.activityLatestSeq, result.latestSeq);
+  state.activityGap = result.gap;
+  if (result.paged && result.newCountSince !== undefined && !result.gap && !loadMore) {
+    state.activityNewCount = Math.min(1_000_000, result.newCountSince);
+  } else if (result.paged && result.gap) {
+    state.activityNewCount = 0;
+  }
 }
 
 async function refreshInbox(append = false): Promise<void> {
@@ -1460,9 +1731,11 @@ async function refreshInbox(append = false): Promise<void> {
     : runtimeMessage("papio.triage.counts", {})
       .then((response) => responseValue<TriageCounts>(response, "counts"))
       .catch((error: unknown) => ({ ok: false as const, message: error instanceof Error ? error.message : "The daemon is unavailable." }));
+  const pulsePromise = append ? Promise.resolve(undefined) : requestWorkPulse();
   const waitingPromise = readWaitingSessionJobs();
-  const [snapshotResult, countsResult, waitingResult] = await Promise.all([snapshotPromise, countsPromise, waitingPromise]);
+  const [snapshotResult, countsResult, pulseResult, waitingResult] = await Promise.all([snapshotPromise, countsPromise, pulsePromise, waitingPromise]);
   state.loading = false;
+  if (!append) state.pulse = pulseResult;
 
   if (snapshotResult.ok) {
     const snapshot = {
@@ -1513,6 +1786,7 @@ function autoLoadWatchHits(): void {
 // snapshot still contains those rows, and resurrecting a row the user just
 // dismissed would be worse than losing the undo window early.
 function requestRefresh(): void {
+  if (state.dismissalCommitInFlight) return;
   void commitDismissals().then(() => refreshInbox());
 }
 // Inbox freshness. The poll is visibility-gated and only refetches the full
@@ -1532,7 +1806,7 @@ let boundDocument: Document | undefined;
 
 function countsSignature(counts: TriageCounts | null): string {
   if (counts === null) return "";
-  return [
+  return JSON.stringify([
     counts.pending_total,
     counts.watch_hits,
     counts.actions,
@@ -1540,22 +1814,58 @@ function countsSignature(counts: TriageCounts | null): string {
     counts.jobs_working,
     counts.jobs_needs_review,
     counts.failure_groups_7d,
-  ].join(":");
+    counts.turns_required,
+    counts.turns_working,
+    counts.family_breakdown_complete,
+    counts.family_runs,
+    counts.required_turns_complete,
+    counts.required_turns,
+  ]);
+}
+
+const INBOX_PRESENCE_INSTANCE_ID = (() => {
+  const source = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+  return source.replace(/-/g, "").slice(0, 64).padEnd(8, "0");
+})();
+
+function sendInboxPresence(focused: boolean): void {
+  if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) return;
+  void Promise.resolve(chrome.runtime.sendMessage({
+    type: "papio.surface.presence",
+    payload: {
+      instance_id: INBOX_PRESENCE_INSTANCE_ID,
+      surface: "inbox",
+      focused,
+      at: new Date().toISOString(),
+    },
+  })).catch(() => undefined);
 }
 
 function autoRefreshAllowed(): boolean {
   if (boundDocument !== undefined && globalThis.document !== boundDocument) return false;
   if (!state.connected || state.loading) return false;
-  if (state.confirmation !== null || state.pending.size > 0 || state.dismissals.length > 0) return false;
+  if (
+    state.confirmation !== null ||
+    state.pending.size > 0 ||
+    state.dismissals.length > 0 ||
+    state.dismissalCommitInFlight
+  ) return false;
   return typeof document === "undefined" || document.visibilityState === "visible";
 }
 
 async function pollCounts(): Promise<void> {
+  if (typeof document === "undefined" || document.visibilityState === "visible") sendInboxPresence(true);
   if (!autoRefreshAllowed()) return;
   const before = countsSignature(state.counts);
-  const result = await runtimeMessage("papio.triage.counts", {})
-    .then((response) => responseValue<TriageCounts>(response, "counts"))
-    .catch(() => ({ ok: false as const, message: "" }));
+  const [result, pulse] = await Promise.all([
+    runtimeMessage("papio.triage.counts", {})
+      .then((response) => responseValue<TriageCounts>(response, "counts"))
+      .catch(() => ({ ok: false as const, message: "" })),
+    requestWorkPulse(),
+  ]);
+  state.pulse = pulse;
   // A failed counts poll means the port is healing; the background worker and
   // refreshInbox's own reconnect already own that recovery, so stay quiet.
   if (!result.ok) return;
@@ -1582,8 +1892,20 @@ function scheduleCountsPoll(): void {
 }
 
 function refreshOnReturn(): void {
-  if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
-  if (state.loading) return;
+  if (typeof document !== "undefined") {
+    if (document.visibilityState !== "visible") {
+      sendInboxPresence(false);
+      return;
+    }
+    sendInboxPresence(true);
+  }
+  if (
+    state.loading ||
+    state.confirmation !== null ||
+    state.pending.size > 0 ||
+    state.dismissals.length > 0 ||
+    state.dismissalCommitInFlight
+  ) return;
   void refreshInbox();
 }
 
@@ -1625,6 +1947,7 @@ async function finishMutation(item: TriageSnapshotItem, response: unknown): Prom
     case "already_applied":
       announce(result.outcome === "applied" ? "Change applied." : "Change was already applied.");
       removeItem(item.id);
+      if (state.successAckMode === "all") showFeedback(result.outcome === "applied" ? "Change applied." : "Change was already applied.");
       render();
       return;
     case "conflict":
@@ -1679,8 +2002,10 @@ async function requestDeliveryReconcile(
 // job, and Retry refuses a cancelled job), so the modal bought no recovery at
 // all — only a second click on every single row.
 const UNDO_WINDOW_MS = 6000;
+const ACKNOWLEDGEMENT_WINDOW_MS = 4000;
 const UNDO_TICK_MS = 250;
 let undoTimer: number | Timer | undefined;
+let feedbackTimer: number | Timer | undefined;
 
 // Mirrors dismissalCancelsParkedJob in internal/job/job.go: a dismiss cancels
 // work only when the job is parked on THIS action. Everything else — advisory
@@ -1689,7 +2014,6 @@ let undoTimer: number | Timer | undefined;
 // the consequence is known client-side without a protocol change. A human
 // action whose job_state is missing counts as destructive.
 //
-// downloads_access_required is awaiting_human too, but deliberately absent
 // from that case's list: the pending download is fine, only the Downloads
 // folder grant is missing, so dismissing it must never cancel the job.
 const DISMISS_DISPOSITION: Record<string, "cancels_parked_job" | "never_cancels"> = {
@@ -1736,14 +2060,42 @@ function undoSummary(): string {
 
 function renderUndoBar(): void {
   if (elements === null) return;
-  if (state.dismissals.length === 0) {
-    elements.undoBar.hidden = true;
+  if (state.dismissals.length > 0) {
+    const remaining = Math.max(0, Math.ceil(((state.undoDeadline ?? 0) - Date.now()) / 1000));
+    elements.undoMessage.textContent = undoSummary();
+    elements.undoButton.textContent = `Undo (${remaining})`;
+    elements.undoButton.hidden = false;
+    elements.undoBar.hidden = false;
     return;
   }
-  const remaining = Math.max(0, Math.ceil(((state.undoDeadline ?? 0) - Date.now()) / 1000));
-  elements.undoMessage.textContent = undoSummary();
-  elements.undoButton.textContent = `Undo (${remaining})`;
-  elements.undoBar.hidden = false;
+  if (state.feedbackNotice !== null) {
+    elements.undoMessage.textContent = state.feedbackNotice.text;
+    elements.undoButton.hidden = true;
+    elements.undoBar.hidden = false;
+    return;
+  }
+  elements.undoBar.hidden = true;
+  elements.undoButton.hidden = false;
+}
+
+function showFeedback(text: string): void {
+  if (state.dismissals.length > 0 || state.dismissalCommitInFlight || state.feedbackNotice !== null) {
+    if (!state.feedbackQueue.includes(text)) state.feedbackQueue.push(text);
+    if (state.feedbackQueue.length > 3) {
+      state.feedbackQueue = [`${state.feedbackQueue.length} actions completed.`];
+    }
+    renderUndoBar();
+    return;
+  }
+  state.feedbackNotice = { text, deadline: Date.now() + ACKNOWLEDGEMENT_WINDOW_MS };
+  clearTimeout(feedbackTimer);
+  feedbackTimer = setTimeout(() => {
+    state.feedbackNotice = null;
+    const next = state.feedbackQueue.shift();
+    if (next !== undefined) showFeedback(next);
+    render();
+  }, ACKNOWLEDGEMENT_WINDOW_MS);
+  renderUndoBar();
 }
 
 function scheduleUndoTick(): void {
@@ -1807,16 +2159,28 @@ function undoDismissals(): void {
 async function commitDismissals(): Promise<void> {
   const entries = takeDismissals();
   if (entries.length === 0) return;
+  state.dismissalCommitInFlight = true;
+  render();
   let applied = 0;
   let conflicted = false;
-  for (const entry of entries) {
-    const outcome = await sendDismissal(entry.item);
-    if (outcome === "applied") applied += 1;
-    if (outcome === "conflict") conflicted = true;
+  try {
+    for (const entry of entries) {
+      const outcome = await sendDismissal(entry.item);
+      if (outcome === "applied") applied += 1;
+      if (outcome === "conflict") conflicted = true;
+    }
+    if (applied === entries.length) {
+      const message = applied === 1 ? "Dismissal applied." : `${applied} dismissals applied.`;
+      announce(message);
+      showFeedback(message);
+    }
+    if (conflicted) await refreshInbox();
+  } finally {
+    state.dismissalCommitInFlight = false;
+    const next = state.feedbackQueue.shift();
+    if (next !== undefined && state.feedbackNotice === null) showFeedback(next);
+    render();
   }
-  if (applied === entries.length) announce(applied === 1 ? "Dismissal applied." : `${applied} dismissals applied.`);
-  render();
-  if (conflicted) await refreshInbox();
 }
 
 // A failed dismissal puts its row back rather than vanishing silently: the
@@ -2184,6 +2548,7 @@ function trapDialogFocus(event: KeyboardEvent): void {
 function bootstrap(): void {
   const connection = document.getElementById("connection-status");
   const counts = document.getElementById("inbox-counts");
+  const pulse = document.getElementById("inbox-pulse");
   const filterInput = document.getElementById("item-filter");
   const refresh = document.getElementById("refresh-inbox");
   const reconnect = document.getElementById("reconnect-daemon");
@@ -2196,6 +2561,7 @@ function bootstrap(): void {
   const watchTab = document.getElementById("watch-tab");
   const activityTab = document.getElementById("activity-tab");
   const activityList = document.getElementById("activity-list");
+  const activityNew = document.getElementById("activity-new");
   const activityShowMore = document.getElementById("activity-show-more");
   const operationStatus = document.getElementById("operation-status");
   const generatedAt = document.getElementById("generated-at");
@@ -2210,6 +2576,7 @@ function bootstrap(): void {
   const undoButton = document.getElementById("undo-dismiss");
   if (
     !(connection instanceof HTMLElement) ||
+    !(pulse instanceof HTMLElement) ||
     !(counts instanceof HTMLElement) ||
     !(filterInput instanceof HTMLInputElement) ||
     !(refresh instanceof HTMLButtonElement) ||
@@ -2223,6 +2590,7 @@ function bootstrap(): void {
     !(watchTab instanceof HTMLButtonElement) ||
     !(activityTab instanceof HTMLButtonElement) ||
     !(activityList instanceof HTMLElement) ||
+    !(activityNew instanceof HTMLElement) ||
     !(activityShowMore instanceof HTMLButtonElement) ||
     !(operationStatus instanceof HTMLElement) ||
     !(generatedAt instanceof HTMLTimeElement) ||
@@ -2242,6 +2610,7 @@ function bootstrap(): void {
     connection,
     counts,
     filterInput,
+    pulse,
     refresh,
     reconnect,
     list,
@@ -2253,6 +2622,7 @@ function bootstrap(): void {
     watchTab,
     activityTab,
     activityList,
+    activityNew,
     activityShowMore,
     operationStatus,
     generatedAt,
@@ -2269,12 +2639,16 @@ function bootstrap(): void {
   refresh.addEventListener("click", requestRefresh);
   reconnect.addEventListener("click", requestRefresh);
   for (const tab of [actionsTab, watchTab, activityTab]) {
+    if (!(tab instanceof HTMLButtonElement)) continue;
     tab.addEventListener("click", () => selectTab(tab.dataset.tab as InboxTab, false));
     tab.addEventListener("keydown", handleTabKeydown);
   }
   activityShowMore.addEventListener("click", () => {
-    state.activityExpanded = true;
-    render();
+    if (state.activityHasMore) void refreshActivity(true).then(render);
+    else {
+      state.activityExpanded = true;
+      render();
+    }
   });
   citationStyle.value = state.citationStyle;
   citationStyle.addEventListener("change", () => {
@@ -2290,6 +2664,7 @@ function bootstrap(): void {
     render();
   });
   loadMore.addEventListener("click", () => {
+    if (state.dismissalCommitInFlight) return;
     void commitDismissals().then(() => refreshInbox(true));
   });
   undoButton.addEventListener("click", undoDismissals);
@@ -2302,8 +2677,11 @@ function bootstrap(): void {
   document.addEventListener("visibilitychange", refreshOnReturn);
   window.addEventListener("focus", refreshOnReturn);
   window.addEventListener("pagehide", flushDismissals);
+  window.addEventListener("pagehide", () => sendInboxPresence(false));
   document.addEventListener("visibilitychange", flushDismissalsWhenHidden);
   boundDocument = document;
+  void loadSuccessAckMode();
+  sendInboxPresence(true);
   render();
   void refreshInbox();
   scheduleCountsPoll();

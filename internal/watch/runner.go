@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -48,10 +49,7 @@ type BackfillQueue interface {
 	QueueMissingPDF(context.Context, zotio.QueueOptions) (*zotio.QueueResult, error)
 }
 
-// Notifier sends an optional best-effort local notification.
-type Notifier interface {
-	Send(context.Context, string)
-}
+// Notifier is the daemon's shared typed notification router.
 
 // RunResult is the outcome of one forced or scheduled watch execution.
 type RunResult struct {
@@ -77,7 +75,7 @@ type Runner struct {
 	Holdings  HoldingsLookup
 	Submitter Submitter
 	Backfill  BackfillQueue
-	Notifier  Notifier
+	Notifier  notify.Sink
 	DataDir   string
 	Now       func() time.Time
 
@@ -254,23 +252,56 @@ func (r *Runner) RunDue(ctx context.Context) error {
 }
 
 func (r *Runner) runWatch(ctx context.Context, watch Watch) (*RunResult, error) {
-	result, err := r.execute(ctx, watch)
+	runStart := r.now().UTC()
+	result, err := r.executeAt(ctx, watch, runStart)
 	if err == nil {
 		return result, nil
 	}
-	failure, recordErr := r.Store.RecordFailure(ctx, watch.ID, r.now(), err)
+	failure, recordErr := r.Store.RecordFailure(ctx, watch.ID, runStart, err)
 	if recordErr != nil {
 		return result, fmt.Errorf("%w (recording watch failure: %w)", err, recordErr)
 	}
 	result.ConsecutiveFailures = failure.ConsecutiveFailures
 	result.Disabled = failure.Disabled
 	if failure.Disabled && r.Notifier != nil {
-		r.Notifier.Send(ctx, fmt.Sprintf("watch %s disabled after %d consecutive failures", watch.Label, failure.ConsecutiveFailures))
+		message := fmt.Sprintf("watch %s disabled after %d consecutive failures", watch.Label, failure.ConsecutiveFailures)
+		r.route(ctx, notify.Intent{
+			EventKind: "watch.disabled", Category: notify.CategorySystemDegraded,
+			AggregateKey: fmt.Sprintf("watch:%d:failure", watch.ID), Phase: notify.PhaseEpisode,
+			WindowStart: runStart, HappenedAt: runStart, Message: message,
+			Detail: notify.Event{Kind: "watch.disabled", Message: message, WatchID: watch.ID, WatchLabel: watch.Label, Count: failure.ConsecutiveFailures},
+		})
 	}
 	return result, err
 }
 
 func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
+	return r.executeAt(ctx, watch, r.now().UTC())
+}
+
+func (r *Runner) route(ctx context.Context, intent notify.Intent) {
+	if r == nil || r.Notifier == nil {
+		return
+	}
+	if err := r.Notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
+		log.Printf("papio: routing watch notification: %v", err)
+	}
+}
+
+func (r *Runner) executeAt(ctx context.Context, watch Watch, runStart time.Time) (*RunResult, error) {
+	result, err := r.executeBody(ctx, watch, runStart)
+	return result, err
+}
+func (r *Runner) watchIntent(watch Watch, runStart time.Time, event notify.Event, category notify.Category) notify.Intent {
+	return notify.Intent{
+		EventKind: event.Kind, Category: category,
+		AggregateKey: fmt.Sprintf("watch:%d:%s", watch.ID, runStart.UTC().Format(time.RFC3339Nano)),
+		Phase:        notify.PhaseDigest, WindowStart: runStart.UTC(),
+		HappenedAt: runStart.UTC(), Message: event.Message, Detail: event,
+		ScanID: fmt.Sprintf("watch:%d:%s", watch.ID, runStart.UTC().Format(time.RFC3339Nano)),
+	}
+}
+func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Time) (*RunResult, error) {
 	result := &RunResult{WatchID: watch.ID}
 	if watch.Kind == KindBackfill {
 		if r.Backfill == nil {
@@ -287,17 +318,15 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 			return result, errors.New("queueing missing PDFs returned no result")
 		}
 		result.Queued = len(queued.Queued)
-		if r.Notifier != nil && result.Queued > 0 {
-			notify.Emit(ctx, r.Notifier, notify.Event{
-				Kind:       "watch.backfill",
-				Message:    fmt.Sprintf("watch %s: %d missing PDFs queued", watch.Label, result.Queued),
-				WatchID:    watch.ID,
-				WatchLabel: watch.Label,
-				Count:      result.Queued,
-			})
-		}
-		if err := r.Store.MarkRun(ctx, watch.ID, r.now()); err != nil {
+		if err := r.Store.MarkRun(ctx, watch.ID, runStart); err != nil {
 			return result, err
+		}
+		if result.Queued > 0 {
+			r.route(ctx, r.watchIntent(watch, runStart, notify.Event{
+				Kind:    "watch.backfill",
+				Message: fmt.Sprintf("watch %s: %d missing PDFs queued", watch.Label, result.Queued),
+				WatchID: watch.ID, WatchLabel: watch.Label, Count: result.Queued,
+			}, notify.CategoryDiscoveryNew))
 		}
 		return result, nil
 	}
@@ -323,7 +352,7 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	}
 	requests := requestsForDiscoveredWithWork(works)
 	if len(requests) == 0 {
-		return result, r.Store.MarkRun(ctx, watch.ID, r.now())
+		return result, r.Store.MarkRun(ctx, watch.ID, runStart)
 	}
 	var queued []discoveredRequest
 	if watch.Mode == ModeAcquire && r.holdingsEnabled() {
@@ -363,29 +392,27 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 		}
 	}
 	if len(queued) == 0 {
-		return result, r.Store.MarkRun(ctx, watch.ID, r.now())
+		return result, r.Store.MarkRun(ctx, watch.ID, runStart)
 	}
 	if watch.Mode == ModeAlert {
 		entries, err := digestEntriesForDiscovered(queued)
 		if err != nil {
 			return result, err
 		}
-		reported, err := r.Store.RecordDigest(ctx, watch.ID, r.now(), entries)
+		reported, err := r.Store.RecordDigest(ctx, watch.ID, runStart, entries)
 		if err != nil {
 			return result, err
 		}
 		result.Reported = reported
-		if r.Notifier != nil && reported > 0 {
-			notify.Emit(ctx, r.Notifier, notify.Event{
-				Kind:       "watch.alert",
-				Message:    fmt.Sprintf("watch %s: %d new works found — papio watch digest %d", watch.Label, reported, watch.ID),
-				WatchID:    watch.ID,
-				WatchLabel: watch.Label,
-				Count:      reported,
-			})
-		}
-		if err := r.Store.MarkRun(ctx, watch.ID, r.now()); err != nil {
+		if err := r.Store.MarkRun(ctx, watch.ID, runStart); err != nil {
 			return result, err
+		}
+		if reported > 0 {
+			r.route(ctx, r.watchIntent(watch, runStart, notify.Event{
+				Kind:    "watch.alert",
+				Message: fmt.Sprintf("watch %s: %d new works found — papio watch digest %d", watch.Label, reported, watch.ID),
+				WatchID: watch.ID, WatchLabel: watch.Label, Count: reported,
+			}, notify.CategoryDiscoveryNew))
 		}
 		return result, nil
 	}
@@ -394,7 +421,7 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	for i, request := range queued {
 		queuedWorks[i] = request.Work
 	}
-	manifest := batch.NewManifest(queuedWorks, "watch: "+watch.Label, watch.Collection, r.now())
+	manifest := batch.NewManifest(queuedWorks, "watch: "+watch.Label, watch.Collection, runStart)
 	result.ManifestID = manifest.ID
 	for i := range manifest.Works {
 		requestID := batch.RequestID(fmt.Sprintf("watch-%d", watch.ID), manifest.Works[i].Work)
@@ -420,20 +447,19 @@ func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
 	if result.Failed == len(manifest.Works) {
 		return result, fmt.Errorf("all %d watch submissions failed", result.Failed)
 	}
-	if r.Notifier != nil && result.Queued > 0 {
-		notify.Emit(ctx, r.Notifier, notify.Event{
-			Kind:       "watch.acquire",
-			Message:    fmt.Sprintf("watch %s: %d new papers queued", watch.Label, result.Queued),
-			WatchID:    watch.ID,
-			WatchLabel: watch.Label,
-			Count:      result.Queued,
-		})
-	}
 	if result.Failed > 0 {
-		return result, r.Store.MarkDegradedRun(ctx, watch.ID, r.now(), result.Failed, len(manifest.Works))
-	}
-	if err := r.Store.MarkRun(ctx, watch.ID, r.now()); err != nil {
+		if err := r.Store.MarkDegradedRun(ctx, watch.ID, runStart, result.Failed, len(manifest.Works)); err != nil {
+			return result, err
+		}
+	} else if err := r.Store.MarkRun(ctx, watch.ID, runStart); err != nil {
 		return result, err
+	}
+	if result.Queued > 0 {
+		r.route(ctx, r.watchIntent(watch, runStart, notify.Event{
+			Kind:    "watch.acquire",
+			Message: fmt.Sprintf("watch %s: %d new papers queued", watch.Label, result.Queued),
+			WatchID: watch.ID, WatchLabel: watch.Label, Count: result.Queued,
+		}, notify.CategoryDiscoveryNew))
 	}
 	return result, nil
 }

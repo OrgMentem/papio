@@ -1,6 +1,6 @@
 # Privacy policy
 
-_Last updated: 2026-08-06_
+_Last updated: 2026-08-12_
 
 *papio* runs on your computer. It has no hosted service, user account, telemetry, or
 analytics. This policy covers the *papio* application (daemon and CLI) and the
@@ -70,9 +70,9 @@ for the full field list.
 
 - **No OrgMentem data collection.** The extension has no backend and does not send data to OrgMentem. It communicates with the local native-messaging host `com.orgmentem.papio`.
 - **No browser credentials.** You enter institutional credentials and complete MFA or CAPTCHA in your browser. The extension does not read, store, or transmit your usernames, passwords, cookies, or session tokens.
-- **No background scraping.** Bulk selection runs only after you click it. It acts only on the papers you select, with a maximum of 50 per batch. It does not crawl, harvest, or auto-submit pages.
-- **Local page detection.** “Select papers on this page” runs in the current tab after you request it. Only the detected identifiers are sent to the local application. The submitted batch records the page's scheme and host, not its path, query string, title, or surrounding text. No scholarly service is contacted until you submit the selected papers.
-- **Rendered-count hint is a single number.** The selection workspace's scan can report `rendered_record_count_hint` alongside the detected identifiers: one aggregate integer counting recognized result records on the page, never a title, URL, query string, or document id, and never sent at all when the page's shape isn't recognized.
+- **No background scraping.** Bulk selection runs only after you click it. It acts only on the papers you select, with a maximum of 200 canonical keys per durable cohort, submitted in bounded chunks. It does not crawl, harvest, or auto-submit pages.
+- **Focused-surface presence is minimal and local.** The feature-gated `surface_presence_v1` hint carries only an opaque per-instance id, the focused surface type (`popup` or `inbox`), a boolean focused value, and a timestamp. It goes to the local daemon only. It contains no URL, title, tab id, host, identifier, or page content.
+- **Page-bulk recovery is origin-bounded.** The browser-local restart-safe cohort record stores only a bare lowercase HTTPS origin, a bounded detector identifier, and canonical keys (plus the recovery bookkeeping needed to replay chunks). It stores no path, query, fragment, page title, or bearer value.
 - **Ownership marks come from a local check, not the network.** A page-bulk row's `owned_with_pdf` / `owned_missing_pdf` / `ownership_unknown` marks can come from your Zotero library through zotio, which the local application invokes as a local subprocess in local-only mode: the lookup answers from zotio's existing on-disk library mirror, and no network request is made for this check — in particular, papio never triggers a Zotero-account sync from a workspace scan. The mirror refreshes only through your own zotio activity (for example, when a paper is filed after acquisition), so a stale or failed check reports `ownership_unknown` honestly rather than a false "not owned."
 - **Normal browser session.** The extension uses browser extension APIs and native messaging. It does not use WebDriver, CDP, or other browser-automation frameworks.
 
@@ -82,10 +82,21 @@ for the full field list.
 state in browser storage. This data stays in the browser so the extension can
 survive service-worker suspension and reconnect to the local application.
 
+The dedicated `page_bulk_cohort_recovery_v1` browser-local record is limited to
+restart-safe replay data: a bare lowercase HTTPS origin, a detector identifier,
+and the ordered canonical keys, together with opaque cohort/chunk bookkeeping
+and timestamps. It never stores a path, query, fragment, page title, or bearer
+value.
+
 **Application storage.** The local application stores papers, metadata, and job
 records in its data directory. Validated PDFs live in `artifacts/`. Downloaded
 candidates awaiting validation live in `quarantine/`. Papers go only to your own
-Zotero library if you enable that integration.
+Zotero library if you enable that integration. Notification routing also keeps
+the `notification_intents` ledger in `papio.db`; its payloads are durable and
+may retain identifiers such as a retraction finding's DOI indefinitely. For a
+single-finding integrity notice, the DOI may also appear in the macOS
+Notification Center notification text, subject to your operating system's
+notification and lock-screen settings.
 
 **Diagnostic captures.** Diagnostic captures are sanitized HTML from pages you
 choose to capture. They are stored in `<data_dir>/captures/<host>/` and may still
@@ -94,15 +105,12 @@ for 14 days and up to 10 per host by default; both limits are configurable in
 `[captures]`. Run `papio adapter captures purge` to remove every capture, or
 `papio adapter captures purge --host <host>` to remove captures for one host.
 
-The extension no longer writes `~/Downloads/papio-fixtures/`. An existing directory
-there is safe to delete.
-
 **Bug reports.** The data directory may also contain `papio.db` (request history,
-titles, and identifiers), `native-host.log` (browser-session diagnostics,
-including URLs), `adoptions/` (browser-downloaded files awaiting adoption), and the
-`update-cache*.json` and `retraction-cache.json` files. *papio* does not upload
-these files. Review and minimize them before sharing a bug report; they describe
-what you have been reading.
+titles, identifiers, and notification-intent payloads), `native-host.log`
+(browser-session diagnostics, including URLs), `adoptions/` (browser-downloaded
+files awaiting adoption), and the `update-cache*.json` and `retraction-cache.json`
+files. *papio* does not upload these files. Review and minimize them before
+sharing a bug report; they describe what you have been reading.
 
 **Adapter evidence.** Reaching a provider with no adapter can create a sanitized
 diagnostic capture, but *papio* never uploads it, opens a public issue, or sends

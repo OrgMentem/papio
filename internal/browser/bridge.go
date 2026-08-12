@@ -37,15 +37,18 @@ import (
 	"time"
 
 	"papio/internal/app"
+	"papio/internal/batch"
 	"papio/internal/captures"
 	"papio/internal/config"
 	"papio/internal/delivery"
 	"papio/internal/grab"
 	"papio/internal/job"
+	"papio/internal/notify"
 	"papio/internal/ownership"
 	"papio/internal/pdf"
 	"papio/internal/preview"
 	"papio/internal/protocol"
+	"papio/internal/pulse"
 	"papio/internal/routes"
 	"papio/internal/store"
 	"papio/internal/triage"
@@ -76,9 +79,17 @@ const (
 	sessionEvidenceFeature         = "session_evidence_v1"
 	deliveryContextFeature         = "delivery_context_v1"
 	pageCaptureTermsFeature        = "page_capture_terms_v1"
-	pageBulkAcquireFeature         = "page_bulk_acquire_v1"
 	triageSnapshotSchema3Feature   = "triage_snapshot_schema_v3"
 	triageSnapshotSchema4Feature   = "triage_snapshot_schema_v4"
+	pageBulkAcquireFeature         = "page_bulk_acquire_v1"
+	// New negotiated read/presentation capabilities. Keep this order frozen
+	// with the hello_ack feature assertion.
+	surfacePresenceFeature       = "surface_presence_v1"
+	workPulseFeature             = "work_pulse_v1"
+	activityPageV2Feature        = "activity_page_v2"
+	pageBulkCohortV2Feature      = "page_bulk_cohort_v2"
+	triageCountsSchema3Feature   = "triage_counts_schema_v3"
+	triageSnapshotSchema5Feature = "triage_snapshot_schema_v5"
 	// pdfGrabV1Feature is ADR-0020's PDF-grab capability flag: it gates both
 	// the pdf_grab_request/pdf_grab_result message pair and, extension-side,
 	// whether the workspace even renders the grab row.
@@ -209,8 +220,6 @@ type holdingsProvider interface {
 // memory: each native-host process carries a session_id, exactly one session
 // holds the offer/handoff flow, and later hellos from other browsers wait as
 // pending instead of silently stealing the session. A fresh hello from the
-// holder still resets the offered/cancelled bookkeeping, which is exactly the
-// recovery an MV3 service-worker restart needs.
 type Bridge struct {
 	jobs     *job.Store
 	svc      *app.Service
@@ -225,6 +234,8 @@ type Bridge struct {
 	preview      *preview.Server
 	captureStore *captures.Store
 	cfg          config.Config
+	pulse        *pulse.Service
+	cohorts      *batch.Cohorts
 	// grabs owns pdf_grabs (ADR-0020); constructed internally in NewBridge
 	// from jobs.S rather than threaded through the constructor signature —
 	// it shares the same *store.Store every other job.Store-backed accessor
@@ -337,14 +348,74 @@ type Bridge struct {
 	// adoptable" without spawning another goroutine — at most one hung call
 	// is ever outstanding per bridge. The goroutine that tripped it clears
 	// the flag, and logs the recovery, the moment it finally returns.
+	// presence carries only focused surface leases; it is bounded and
+	// holder-independent because pending sessions may report their own focus.
+	presence              map[string]presenceLease
+	presenceOrder         []string
 	adoptionScanSuspended bool
-	// adoptionScanGate is a capacity-1 semaphore held for the FULL lifetime
-	// of one underlying root/dir listing — a hung syscall keeps it held past
-	// the deadline — so concurrent callers (per-job poll scans vs the two
-	// sweeper passes) can never stack a second hung goroutine or double-fire
-	// the suspend/resume transition logs. Lazily initialised under
-	// adoptionScanMu.
+	// adoptionScanGate is a capacity-1 semaphore held for the full lifetime
+	// of one underlying root/dir listing.
 	adoptionScanGate chan struct{}
+}
+
+type presenceLease struct {
+	surface  string
+	focused  bool
+	received time.Time
+	clientAt time.Time
+}
+
+// PresenceProvider returns the daemon-owned focused-surface hint used by the
+// notification router. It carries no browser metadata beyond the lease type.
+func (b *Bridge) PresenceProvider() notify.PresenceProvider { return b }
+
+// AnyFocused reports whether any focused popup/inbox lease was received within
+// the bounded TTL. Receipt time, not the client timestamp, controls expiry.
+func (b *Bridge) AnyFocused(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.anyFocusedLocked(now)
+}
+
+func (b *Bridge) anyFocusedLocked(now time.Time) bool {
+	expired := false
+	focused := false
+	for id, lease := range b.presence {
+		if now.Sub(lease.received) >= surfacePresenceTTL {
+			delete(b.presence, id)
+			expired = true
+			continue
+		}
+		if lease.focused {
+			focused = true
+		}
+	}
+	if expired {
+		b.compactPresenceOrderLocked()
+	}
+	return focused
+}
+
+// compactPresenceOrderLocked keeps the FIFO eviction index in one-to-one
+// correspondence with the live lease map. The bounded map is tiny, so doing
+// this after expiry is preferable to allowing stale ids to accumulate.
+func (b *Bridge) compactPresenceOrderLocked() {
+	if len(b.presenceOrder) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(b.presenceOrder))
+	compact := b.presenceOrder[:0]
+	for _, id := range b.presenceOrder {
+		if _, live := b.presence[id]; !live {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		compact = append(compact, id)
+	}
+	b.presenceOrder = compact
 }
 
 // browserSession is one native-host connection that said hello.
@@ -376,6 +447,10 @@ const legacySessionID = "legacy"
 // (nativehost.pollInterval); 5x that absorbs scheduling hiccups without
 // making crash recovery feel slow.
 const sessionStaleAfter = 10 * time.Second
+const (
+	surfacePresenceTTL = 120 * time.Second
+	maxPresenceLeases  = 256
+)
 
 // pendingExpireAfter prunes pending sessions whose native host stopped
 // syncing without a goodbye (browser killed) so `papio browser sessions`
@@ -414,20 +489,24 @@ func (source parkedGrabItemSource) SnapshotItems(ctx context.Context, tx *sql.Tx
 	}
 	return items, rows.Err()
 }
-
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, institutionalMaterializationFeature,
+		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature,
 	}
 	var grabs *grab.Service
+	var cohorts *batch.Cohorts
 	if jobs != nil {
 		grabs = grab.New(jobs.S, nil)
+		if jobs.S != nil {
+			cohorts = batch.New(jobs.S)
+		}
 		if triageService != nil {
 			triageService.RegisterSource(parkedGrabItemSource{store: jobs.S})
 		}
 	}
 	return &Bridge{
-		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, holdings: holdings, zotio: zotioService, cfg: cfg,
+		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, holdings: holdings, zotio: zotioService, cfg: cfg, cohorts: cohorts,
 		grabs:                  grabs,
 		Version:                version,
 		Features:               required,
@@ -444,6 +523,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		focusPending:           map[string]bool{},
 		pendingCaptures:        map[string]*pendingPageCapture{},
 		materializationOffered: map[string]materializationOffer{},
+		presence:               map[string]presenceLease{},
 		materializationTracked: map[string]bool{},
 		now:                    time.Now,
 		readDir:                os.ReadDir,
@@ -1616,14 +1696,14 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			return b.institutionalRoute(ctx, msg.JobID, msg.Payload.(*protocol.InstitutionalRouteRequestPayload))
 		case protocol.MsgInstitutionalNavigatedRequest:
 			return b.institutionalNavigated(ctx, msg.JobID, msg.Payload.(*protocol.InstitutionalNavigatedRequestPayload))
-		case protocol.MsgInstitutionalReconcileRequest:
-			return b.institutionalReconcile(ctx, msg.Payload.(*protocol.InstitutionalReconcileRequestPayload))
 		}
 	}
 	if b.holder == nil || b.holder.ID != sessionID {
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
-			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest, protocol.MsgPdfGrabRequest, protocol.MsgPdfGrabStatusRequest, protocol.MsgPdfGrabAbandonRequest:
+			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest, protocol.MsgPageBulkSubmitV2Request,
+			protocol.MsgPdfGrabRequest, protocol.MsgPdfGrabStatusRequest, protocol.MsgPdfGrabAbandonRequest,
+			protocol.MsgSurfacePresence, protocol.MsgWorkPulseRequest, protocol.MsgActivityPageRequest:
 			// regardless of version. "Acquire this page" and the inbox must
 			// not depend on who holds the handoff flow.
 		default:
@@ -1639,6 +1719,12 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	}
 
 	switch msg.Type {
+	case protocol.MsgSurfacePresence:
+		return b.surfacePresence(ctx, msg.Payload.(*protocol.SurfacePresencePayload))
+	case protocol.MsgWorkPulseRequest:
+		return b.workPulse(ctx, msg.Payload.(*protocol.WorkPulseRequestPayload))
+	case protocol.MsgActivityPageRequest:
+		return b.activityPage(ctx, msg.Payload.(*protocol.ActivityPageRequestPayload))
 	case protocol.MsgPageAcquire:
 		return b.pageAcquire(ctx, msg.Payload.(*protocol.PageAcquirePayload))
 
@@ -1676,6 +1762,8 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgPageBulkSubmitRequest:
 		return b.pageBulkSubmit(ctx, msg.Payload.(*protocol.PageBulkSubmitRequestPayload))
+	case protocol.MsgPageBulkSubmitV2Request:
+		return b.pageBulkSubmitV2(ctx, msg.Payload.(*protocol.PageBulkSubmitV2RequestPayload))
 
 	case protocol.MsgPdfGrabRequest:
 		return b.pdfGrab(ctx, msg.Payload.(*protocol.PdfGrabRequestPayload))
@@ -2335,7 +2423,7 @@ func (b *Bridge) sessionBusy(jobID string) ([]json.RawMessage, error) {
 // remains valid for exactly the returned item count.
 func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSnapshotRequestPayload) ([]json.RawMessage, error) {
 	if b.triage == nil {
-		return b.unavailable("triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", nil)
+		return b.unavailable(request.RequestID, "triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", nil)
 	}
 	limit := request.Limit
 	if limit == 0 {
@@ -2344,7 +2432,7 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 	for {
 		snapshot, err := b.triage.Snapshot(ctx, triage.SnapshotRequest{Limit: int(limit), Cursor: request.Cursor, Schema: int(request.SchemaVersions[0])})
 		if err != nil {
-			return b.unavailable("triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", err)
+			return b.unavailable(request.RequestID, "triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", err)
 		}
 		payload := b.triageSnapshotPayload(ctx, request.RequestID, request.SchemaVersions[0], snapshot)
 		if b.frameFits(protocol.MsgTriageSnapshotResponse, payload) {
@@ -2355,7 +2443,7 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 			return []json.RawMessage{frame}, nil
 		}
 		if len(snapshot.Items) <= 1 {
-			return b.unavailable("triage_snapshot_too_large", "the triage inbox item is too large to display", "triage snapshot",
+			return b.unavailable(request.RequestID, "triage_snapshot_too_large", "the triage inbox item is too large to display", "triage snapshot",
 				fmt.Errorf("triage snapshot item exceeds browser frame cap %d", protocol.MaxBrowserMessageBytes))
 		}
 		limit = int64(len(snapshot.Items) - 1)
@@ -2372,6 +2460,11 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, schema int64, snapshot triage.Snapshot) protocol.TriageSnapshotResponsePayload {
 	items := make([]protocol.TriageSnapshotItem, 0, len(snapshot.Items))
 	counts := triageCountsPayload(snapshot.Counts)
+	if schema < 5 {
+		counts.TurnsRequired, counts.TurnsWorking = nil, nil
+		counts.FamilyBreakdownComplete, counts.RequiredTurnsComplete = nil, nil
+		counts.FamilyRuns, counts.RequiredTurns = nil, nil
+	}
 	omit := func(item protocol.TriageSnapshotItem, reason error) {
 		log.Printf("papio: omitting triage snapshot item %s: %v",
 			triageSnapshotItemIdentity(item), reason)
@@ -2417,6 +2510,10 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 				omit(payload, fmt.Errorf("human_action.route_class %q is not representable in schema 3", action.ActionKind))
 				continue
 			}
+			if action != nil && schema >= 5 && !slices.Contains(protocol.TriageRouteClassesV5(), action.ActionKind) {
+				omit(payload, fmt.Errorf("human_action.route_class %q is not representable in schema 5", action.ActionKind))
+				continue
+			}
 			if action != nil {
 				payload.ActionID, payload.JobID = action.ActionID, action.JobID
 				payload.ActionKind, payload.JobState = action.ActionKind, action.JobState
@@ -2437,6 +2534,10 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 						payload.Ops = []string{"open_request_history", "confirm_request_exists", "confirm_request_absent"}
 					}
 					payload.Attention = triageHumanActionAttention(action, payload.Delivery)
+					if schema >= 5 && item.Family != nil {
+						payload.RunKey, payload.NextActor = item.Family.RunKey, item.Family.NextActor
+						payload.GuidanceVariant, payload.OperationVariant = item.Family.GuidanceVariant, item.Family.OperationVariant
+					}
 				}
 			}
 		case triage.KindRetraction:
@@ -2453,7 +2554,6 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 			}
 		case triage.KindPdfGrab:
 			if schema < 4 || item.PdfGrab == nil {
-				continue
 			}
 			payload.Kind = triage.KindPdfGrab
 			payload.Label = item.Title
@@ -2462,6 +2562,10 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 			payload.BlockedBy = "identifier_missing"
 			payload.Attention = "required"
 			payload.Ops = []string{"provide_identifier", "dismiss"}
+			if schema >= 5 && item.Family != nil {
+				payload.RunKey, payload.NextActor = item.Family.RunKey, item.Family.NextActor
+				payload.GuidanceVariant, payload.OperationVariant = item.Family.GuidanceVariant, item.Family.OperationVariant
+			}
 		}
 		if reason := triageSnapshotItemValidationError(schema, payload); reason != nil {
 			omit(payload, reason)
@@ -2609,11 +2713,48 @@ func (b *Bridge) triageDeliveryFor(ctx context.Context, jobID string) *protocol.
 }
 
 func triageFacts(facts []triage.Fact) []protocol.TriageFact {
+
 	result := make([]protocol.TriageFact, 0, len(facts))
 	for _, fact := range facts {
 		result = append(result, protocol.TriageFact{Label: fact.Label, Text: fact.Text})
 	}
 	return result
+}
+func (b *Bridge) surfacePresence(_ context.Context, request *protocol.SurfacePresencePayload) ([]json.RawMessage, error) {
+	now := b.now()
+	clientAt, err := time.Parse(time.RFC3339, request.At)
+	if err != nil {
+		clientAt = time.Time{}
+	}
+	if b.presence == nil {
+		b.presence = make(map[string]presenceLease)
+	}
+	b.anyFocusedLocked(now)
+	b.compactPresenceOrderLocked()
+	if _, exists := b.presence[request.InstanceID]; !exists {
+		for len(b.presence) >= maxPresenceLeases {
+			if len(b.presenceOrder) == 0 {
+				for id := range b.presence {
+					delete(b.presence, id)
+					break
+				}
+				break
+			}
+			delete(b.presence, b.presenceOrder[0])
+			b.presenceOrder = b.presenceOrder[1:]
+		}
+		b.presenceOrder = append(b.presenceOrder, request.InstanceID)
+	}
+	b.presence[request.InstanceID] = presenceLease{
+		surface: request.Surface, focused: request.Focused, received: now, clientAt: clientAt,
+	}
+	frame, err := b.frame(protocol.MsgSurfacePresenceAck, "", protocol.SurfacePresenceAckPayload{
+		RequestID: request.RequestID, Accepted: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
 }
 
 func triageLinks(links []triage.Link) []protocol.TriageLink {
@@ -2625,11 +2766,39 @@ func triageLinks(links []triage.Link) []protocol.TriageLink {
 }
 
 func triageCountsPayload(counts triage.Counts) protocol.TriageCounts {
-	return protocol.TriageCounts{
+	payload := protocol.TriageCounts{
 		PendingTotal: int64(counts.PendingTotal), WatchHits: int64(counts.WatchHits), Actions: int64(counts.Actions),
 		Retractions: int64(counts.Retractions), JobsWorking: int64(counts.JobsWorking),
 		JobsNeedsReview: int64(counts.JobsNeedsReview), FailureGroups7d: int64(counts.FailureGroups7d),
 	}
+	if counts.TurnsRequired != nil {
+		payload.TurnsRequired = new(int64(*counts.TurnsRequired))
+	}
+	if counts.TurnsWorking != nil {
+		payload.TurnsWorking = new(int64(*counts.TurnsWorking))
+	}
+	if counts.FamilyBreakdownComplete != nil {
+		payload.FamilyBreakdownComplete = new(*counts.FamilyBreakdownComplete)
+	}
+	if counts.RequiredTurnsComplete != nil {
+		payload.RequiredTurnsComplete = new(*counts.RequiredTurnsComplete)
+	}
+	for _, run := range counts.FamilyRuns {
+		payload.FamilyRuns = append(payload.FamilyRuns, protocol.TriageFamilyRun{
+			RunKey: run.RunKey, FirstRank: int64(run.FirstRank), RouteClass: run.RouteClass, ActionKind: run.ActionKind,
+			NextActor: run.NextActor, GuidanceVariant: run.GuidanceVariant, OperationVariant: run.OperationVariant, Count: int64(run.Count),
+		})
+	}
+	for _, turn := range counts.RequiredTurns {
+		wire := protocol.TriageRequiredTurn{ItemID: turn.ItemID, ItemKind: turn.ItemKind, RouteClass: turn.RouteClass, GateClaimID: turn.GateClaimID, DependentJobs: int64(turn.DependentJobs)}
+		if turn.ActionID > 0 {
+			wire.ActionID, wire.JobID = new(int64(turn.ActionID)), turn.JobID
+		} else {
+			wire.GrabID = turn.GrabID
+		}
+		payload.RequiredTurns = append(payload.RequiredTurns, wire)
+	}
+	return payload
 }
 
 func triageCountsPayloadV2(counts triage.Counts) protocol.TriageCounts {
@@ -2638,10 +2807,9 @@ func triageCountsPayloadV2(counts triage.Counts) protocol.TriageCounts {
 	payload.ActionsRequiresAuth = &auth
 	return payload
 }
-
 func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCountsRequestPayload) ([]json.RawMessage, error) {
 	if b.triage == nil {
-		return b.triageUnavailable(nil)
+		return b.triageUnavailable(request.RequestID, nil)
 	}
 	schema := 0
 	if len(request.SchemaVersions) == 1 {
@@ -2649,11 +2817,16 @@ func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCount
 	}
 	counts, err := b.triage.Counts(ctx, schema)
 	if err != nil {
-		return b.triageUnavailable(err)
+		return b.triageUnavailable(request.RequestID, err)
 	}
 	payload := triageCountsPayload(counts)
-	if len(request.SchemaVersions) == 1 && request.SchemaVersions[0] == 2 {
+	if schema == 2 {
 		payload = triageCountsPayloadV2(counts)
+	}
+	if schema != 3 {
+		payload.TurnsRequired, payload.TurnsWorking = nil, nil
+		payload.FamilyBreakdownComplete, payload.RequiredTurnsComplete = nil, nil
+		payload.FamilyRuns, payload.RequiredTurns = nil, nil
 	}
 	frame, err := b.frame(protocol.MsgTriageCountsResponse, "", protocol.TriageCountsResponsePayload{
 		RequestID: request.RequestID, Counts: payload,
@@ -2673,21 +2846,23 @@ func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCount
 // sessionBusy/helloRequired/extensionOutdatedError instead. The cause is
 // logged rather than sent: the extension gets a stable code it can render as
 // "temporarily unavailable", the operator keeps the diagnosis.
-func (b *Bridge) unavailable(code, message, surface string, cause error) ([]json.RawMessage, error) {
+func (b *Bridge) unavailable(requestID, code, message, surface string, cause error) ([]json.RawMessage, error) {
 	if cause != nil {
 		log.Printf("papio: %s unavailable: %v", surface, cause)
 	} else {
 		log.Printf("papio: %s unavailable: no triage service configured", surface)
 	}
-	frame, err := b.frame(protocol.MsgError, "", protocol.ErrorPayload{Code: code, Message: message})
+	frame, err := b.frame(protocol.MsgError, "", protocol.ErrorPayload{
+		Code: code, Message: message, RequestID: requestID,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return []json.RawMessage{frame}, nil
 }
 
-func (b *Bridge) triageUnavailable(cause error) ([]json.RawMessage, error) {
-	return b.unavailable("triage_unavailable", "the triage inbox is temporarily unavailable", "triage counts", cause)
+func (b *Bridge) triageUnavailable(requestID string, cause error) ([]json.RawMessage, error) {
+	return b.unavailable(requestID, "triage_unavailable", "the triage inbox is temporarily unavailable", "triage counts", cause)
 }
 
 func statsPayload(requestID string, generatedAt string, stats triage.Stats) protocol.StatsResponsePayload {
@@ -2711,11 +2886,11 @@ func statsPayload(requestID string, generatedAt string, stats triage.Stats) prot
 
 func (b *Bridge) stats(ctx context.Context, request *protocol.StatsRequestPayload) ([]json.RawMessage, error) {
 	if b.triage == nil {
-		return b.statsUnavailable(nil)
+		return b.statsUnavailable(request.RequestID, nil)
 	}
 	stats, err := b.triage.Stats(ctx)
 	if err != nil {
-		return b.statsUnavailable(err)
+		return b.statsUnavailable(request.RequestID, err)
 	}
 	frame, err := b.frame(protocol.MsgStatsResponse, "",
 		statsPayload(request.RequestID, b.now().UTC().Format(time.RFC3339), stats))
@@ -2724,14 +2899,13 @@ func (b *Bridge) stats(ctx context.Context, request *protocol.StatsRequestPayloa
 	}
 	return []json.RawMessage{frame}, nil
 }
-
-func (b *Bridge) statsUnavailable(cause error) ([]json.RawMessage, error) {
-	return b.unavailable("stats_unavailable", "acquisition stats are temporarily unavailable", "acquisition stats", cause)
+func (b *Bridge) statsUnavailable(requestID string, cause error) ([]json.RawMessage, error) {
+	return b.unavailable(requestID, "stats_unavailable", "acquisition stats are temporarily unavailable", "acquisition stats", cause)
 }
 
 // activity returns a bounded, display-only read model. A store read failure
 // is routine from the browser's point of view, so it is logged and represented
-// as an empty page rather than tearing down the native-messaging session.
+// as a structured unavailable error rather than tearing down the session.
 func (b *Bridge) activity(ctx context.Context, request *protocol.ActivityRequestPayload) ([]json.RawMessage, error) {
 	limit := request.Limit
 	if limit < 1 {
@@ -2740,37 +2914,124 @@ func (b *Bridge) activity(ctx context.Context, request *protocol.ActivityRequest
 	if limit > 50 {
 		limit = 50
 	}
+	if b.jobs == nil || b.jobs.S == nil {
+		return b.unavailable(request.RequestID, "activity_unavailable", "activity history is temporarily unavailable", "activity feed", nil)
+	}
+	recent, err := b.jobs.S.RecentEvents(int(limit), 0)
+	if err != nil {
+		return b.unavailable(request.RequestID, "activity_unavailable", "activity history is temporarily unavailable", "activity feed", err)
+	}
 	entries := make([]protocol.ActivityEntryPayload, 0, limit)
-	if b.jobs != nil && b.jobs.S != nil {
-		recent, err := b.jobs.S.RecentEvents(int(limit), 0)
-		if err != nil {
-			log.Printf("papio: activity feed unavailable: %v", err)
-		} else {
-			for _, event := range recent {
-				entry := protocol.ActivityEntryPayload{
-					Seq:  event.Seq,
-					At:   event.At.UTC().Format(time.RFC3339),
-					Kind: activityKind(event.Kind),
-					Text: store.ActivityText(event.Kind, event.Detail),
-				}
-				if event.JobID != "" {
-					entry.JobID = event.JobID
-				}
-				if event.JobTitle != "" {
-					entry.Title = activityTitle(event.JobTitle)
-				}
-				entries = append(entries, entry)
-				if len(entries) == 50 {
-					break
-				}
-			}
+	for _, event := range recent {
+		entry := protocol.ActivityEntryPayload{
+			Seq: event.Seq, At: event.At.UTC().Format(time.RFC3339),
+			Kind: activityKind(event.Kind), Text: store.ActivityText(event.Kind, event.Detail),
+		}
+		if event.JobID != "" {
+			entry.JobID = event.JobID
+		}
+		if event.JobTitle != "" {
+			entry.Title = activityTitle(event.JobTitle)
+		}
+		entries = append(entries, entry)
+		if len(entries) == 50 {
+			break
 		}
 	}
 	frame, err := b.frame(protocol.MsgActivityResponse, "", protocol.ActivityResponsePayload{
-		RequestID:   request.RequestID,
-		GeneratedAt: b.now().UTC().Format(time.RFC3339),
-		Entries:     entries,
+		RequestID: request.RequestID, GeneratedAt: b.now().UTC().Format(time.RFC3339), Entries: entries,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+// SetPulseService wires the daemon's authoritative pulse read model after
+// construction, preserving the existing NewBridge call signature.
+func (b *Bridge) SetPulseService(service *pulse.Service) { b.pulse = service }
+
+func (b *Bridge) workPulse(ctx context.Context, request *protocol.WorkPulseRequestPayload) ([]json.RawMessage, error) {
+	if b.pulse == nil {
+		return b.unavailable(request.RequestID, "pulse_unavailable", "live progress is temporarily unavailable", "work pulse", nil)
+	}
+	snapshot, err := b.pulse.Read(ctx)
+	if err != nil {
+		return b.unavailable(request.RequestID, "pulse_unavailable", "live progress is temporarily unavailable", "work pulse", err)
+	}
+	snapshot.RequestID = request.RequestID
+	frame, err := b.frame(protocol.MsgWorkPulseResponse, "", snapshot)
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) activityPage(ctx context.Context, request *protocol.ActivityPageRequestPayload) ([]json.RawMessage, error) {
+	limit := int(request.Limit)
+	if limit <= 0 || limit > 50 {
+		limit = 50
+	}
+	before := int64(0)
+	if request.BeforeSeq != "" {
+		if parsed, err := strconv.ParseInt(request.BeforeSeq, 10, 64); err == nil && parsed > 0 {
+			before = parsed
+		}
+	}
+	entries := make([]protocol.ActivityEntryPayload, 0, limit)
+	var hasMore, gap bool
+	var latest, earliest, newCount int64
+	if b.jobs == nil || b.jobs.S == nil {
+		return b.unavailable(request.RequestID, "activity_page_unavailable", "activity history is temporarily unavailable", "activity page", nil)
+	}
+	if err := b.jobs.S.DB().QueryRowContext(ctx, "SELECT COALESCE(MAX(seq),0), COALESCE(MIN(seq),0) FROM events").Scan(&latest, &earliest); err != nil {
+		return b.unavailable(request.RequestID, "activity_page_unavailable", "activity history is temporarily unavailable", "activity page", err)
+	}
+	if request.SeenThroughSeq != "" {
+		if seen, err := strconv.ParseInt(request.SeenThroughSeq, 10, 64); err == nil && seen > 0 {
+			if earliest > 0 && seen < earliest-1 {
+				gap = true
+			} else if err := b.jobs.S.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE seq > ?", seen).Scan(&newCount); err != nil {
+				return b.unavailable(request.RequestID, "activity_page_unavailable", "activity history is temporarily unavailable", "activity page", err)
+			}
+		}
+	}
+	recent, truncated, err := b.jobs.S.RecentEventsPage(limit, before, "")
+	if err != nil {
+		return b.unavailable(request.RequestID, "activity_page_unavailable", "activity history is temporarily unavailable", "activity page", err)
+	}
+	hasMore = truncated
+	for _, event := range recent {
+		entry := protocol.ActivityEntryPayload{
+			Seq: event.Seq, At: event.At.UTC().Format(time.RFC3339),
+			Kind: activityKind(event.Kind), Text: store.ActivityText(event.Kind, event.Detail),
+		}
+		if event.JobID != "" {
+			entry.JobID = event.JobID
+		}
+		if event.JobTitle != "" {
+			entry.Title = activityTitle(event.JobTitle)
+		}
+		entries = append(entries, entry)
+	}
+	payload := protocol.ActivityPageResponsePayload{
+		RequestID: request.RequestID, GeneratedAt: b.now().UTC().Format(time.RFC3339),
+		Entries: entries, HasMore: hasMore, LatestSeq: latest,
+	}
+	if len(entries) > 0 && hasMore {
+		payload.Cursor = strconv.FormatInt(entries[len(entries)-1].Seq, 10)
+	}
+	zero := int64(0)
+	payload.NewCountSince = &zero
+	if request.SeenThroughSeq != "" {
+		if gap {
+			payload.NewCountSince = nil
+			payload.Gap = &gap
+		} else {
+			payload.NewCountSince = &newCount
+		}
+	}
+	frame, err := b.frame(protocol.MsgActivityPageResponse, "", payload)
 	if err != nil {
 		return nil, err
 	}
@@ -3330,7 +3591,7 @@ func (b *Bridge) pageBulkStatus(ctx context.Context, request *protocol.PageBulkS
 				truncated = true
 				continue
 			}
-			return b.unavailable("page_bulk_status_unavailable",
+			return b.unavailable(request.RequestID, "page_bulk_status_unavailable",
 				"page status is temporarily unavailable", "page bulk status", nil)
 		}
 		items = items[:len(items)-1]
@@ -3671,50 +3932,74 @@ func (b *Bridge) canonicalJobStatus(ctx context.Context, kind, value string) (li
 // Every valid key rechecks holdings immediately before submission. Only a
 // fresh artifact-present claim suppresses the ordinary app submission; the
 // result is counted as already_owned (ADR-0008 invariant 2).
-func (b *Bridge) pageBulkSubmit(ctx context.Context, request *protocol.PageBulkSubmitRequestPayload) ([]json.RawMessage, error) {
-	var submitted, joined, alreadyOwned, invalid int64
-	for _, key := range request.CanonicalKeys {
+func (b *Bridge) submitPageBulkMembers(ctx context.Context, keys []string) ([]batch.MemberOutcome, error) {
+	outcomes := make([]batch.MemberOutcome, 0, len(keys))
+	for _, key := range keys {
+		outcome := batch.MemberOutcome{CanonicalKey: key}
 		wr, ok := pageBulkWorkRequest(key)
 		if !ok {
-			invalid++
+			outcome.Outcome = "invalid"
+			outcomes = append(outcomes, outcome)
 			continue
 		}
-		// papio's own ready bundle suppresses first: it is the freshest
-		// artifact-present claim and exists under every configuration,
-		// including zotio setups where the holdings registry is empty.
 		if kind, value, ok := pageBulkIdentifierOf(wr); ok {
 			if _, readyJobID, _, statusErr := b.canonicalJobStatus(ctx, kind, value); statusErr == nil && readyJobID != "" {
-				alreadyOwned++
+				outcome.Outcome = "already_owned"
+				outcomes = append(outcomes, outcome)
 				continue
 			}
 		}
 		query := ownership.QueryFor(wr.Identifiers.DOI, wr.Identifiers.ArXiv, wr.Identifiers.PMID, wr.DesiredVersion, ownership.EntityUnknown)
 		decision, _ := b.pageBulkOwnership(ctx, query)
 		if decision.Suppress {
-			alreadyOwned++
+			outcome.Outcome = "already_owned"
+			outcomes = append(outcomes, outcome)
+			continue
+		}
+		if b.svc == nil {
+			outcome.Outcome = "invalid"
+			outcomes = append(outcomes, outcome)
 			continue
 		}
 		result, err := b.svc.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, wr, app.SubmitOptions{Consumer: pageBulkConsumer})
 		if err != nil {
-			// A routine per-key submission failure (a resolver override
-			// naming an unconfigured profile, a since-broken invariant on
-			// the request) never fails the whole batch: it counts as one
-			// invalid key among however many others succeeded.
-			invalid++
+			outcome.Outcome = "invalid"
+			outcomes = append(outcomes, outcome)
 			continue
 		}
+		outcome.JobID = result.JobID
 		if result.Existing {
-			joined++
+			outcome.Outcome = "joined"
 		} else {
+			outcome.Outcome = "submitted"
+		}
+		outcomes = append(outcomes, outcome)
+	}
+	return outcomes, nil
+}
+
+func memberCounts(outcomes []batch.MemberOutcome) (submitted, joined, owned, invalid int64) {
+	for _, outcome := range outcomes {
+		switch outcome.Outcome {
+		case "submitted":
 			submitted++
+		case "joined":
+			joined++
+		case "already_owned":
+			owned++
+		default:
+			invalid++
 		}
 	}
+	return
+}
+
+func (b *Bridge) pageBulkSubmit(ctx context.Context, request *protocol.PageBulkSubmitRequestPayload) ([]json.RawMessage, error) {
+	outcomes, _ := b.submitPageBulkMembers(ctx, request.CanonicalKeys)
+	submitted, joined, alreadyOwned, invalid := memberCounts(outcomes)
 	batchID := newMsgID()
 	at := b.now().UTC()
 	if err := b.recordPageBulkRun(ctx, request.Source, len(request.CanonicalKeys), submitted, invalid, batchID, at); err != nil {
-		// The measurement row is local-only funnel telemetry (ADR-0019
-		// Decision 10), not part of the acquisition contract: losing it must
-		// never turn an otherwise-successful submission into a bridge error.
 		log.Printf("papio: recording page-bulk run: %v", err)
 	}
 	frame, err := b.frame(protocol.MsgPageBulkSubmitResult, "", protocol.PageBulkSubmitResultPayload{
@@ -3722,6 +4007,42 @@ func (b *Bridge) pageBulkSubmit(ctx context.Context, request *protocol.PageBulkS
 		Submitted: submitted, Joined: joined, AlreadyOwned: alreadyOwned, Invalid: invalid,
 		BatchID: batchID,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+func (b *Bridge) pageBulkSubmitV2(ctx context.Context, request *protocol.PageBulkSubmitV2RequestPayload) ([]json.RawMessage, error) {
+	if b.cohorts == nil {
+		return b.unavailable(request.RequestID, "page_bulk_cohort_unavailable", "page-bulk cohorts are temporarily unavailable", "page bulk cohort", nil)
+	}
+	result, err := b.cohorts.SubmitChunk(ctx, batch.ChunkRequest{
+		RequestID: request.RequestID, CohortID: request.CohortID,
+		Source:      batch.Source{Kind: request.Source.Kind, Label: request.Source.Origin, Detector: request.Source.Detector, ScanID: request.ScanID},
+		CohortTotal: int(request.CohortTotal), ChunkIndex: int(request.ChunkIndex),
+		FinalChunk: request.FinalChunk, CanonicalKeys: request.CanonicalKeys,
+	}, func(submitCtx context.Context, keys []string) ([]batch.MemberOutcome, error) {
+		return b.submitPageBulkMembers(submitCtx, keys)
+	})
+	if err != nil {
+		if conflict, ok := err.(*batch.ConflictError); ok {
+			return b.unavailable(request.RequestID, "page_bulk_cohort_conflict", conflict.Error(), "page bulk cohort", err)
+		}
+		return b.unavailable(request.RequestID, "page_bulk_cohort_unavailable", "page-bulk cohort submission is temporarily unavailable", "page bulk cohort", err)
+	}
+	payload := protocol.PageBulkSubmitV2ResultPayload{
+		RequestID: request.RequestID, ScanID: request.ScanID, CohortID: request.CohortID,
+		ChunkIndex: request.ChunkIndex, FinalChunk: request.FinalChunk, BatchID: result.BatchID,
+		Membership: result.Membership, PersistedMembers: int64(result.PersistedMembers),
+		Submitted: int64(result.Submitted), Joined: int64(result.Joined),
+		AlreadyOwned: int64(result.AlreadyOwned), Invalid: int64(result.Invalid),
+	}
+	if result.CohortTotal != nil {
+		v := int64(*result.CohortTotal)
+		payload.CohortTotal = &v
+	}
+	frame, err := b.frame(protocol.MsgPageBulkSubmitV2Result, "", payload)
 	if err != nil {
 		return nil, err
 	}
@@ -4465,7 +4786,7 @@ func (b *Bridge) upsertProfileGate(ctx context.Context, observationKey, resolver
 	if status == job.HumanGateResolved {
 		for _, currentGate := range current {
 			if currentGate.GateType != gateType || currentGate.Status != job.HumanGateOpen ||
-				!slices.Contains(currentGate.DependentJobIDs, jobID) {
+				(!slices.Contains(currentGate.DependentJobIDs, jobID) && !slices.Contains(currentGate.ClaimMemberJobIDs, jobID)) {
 				continue
 			}
 			currentGate.Status = job.HumanGateResolved
@@ -4494,7 +4815,9 @@ func (b *Bridge) upsertProfileGate(ctx context.Context, observationKey, resolver
 	return b.jobs.UpsertHumanGateObservation(ctx, job.HumanGateObservation{
 		ID: id, GateType: gateType, ScopeClass: scopeClass, ScopeKey: scopeKey,
 		InstitutionProfileID: profile.ID, AuthenticationClaimID: claimID,
-		DependentJobIDs: []string{jobID}, ClaimMemberJobIDs: []string{jobID},
+		// ClaimMemberJobIDs identifies the full claim and its deterministic
+		// owner; dependent siblings are derived by the gate authority.
+		ClaimMemberJobIDs:   []string{jobID},
 		ObservationRevision: revision, Status: status, DetailJSON: detail,
 		CreatedAt: b.now().UTC().Format(time.RFC3339Nano), UpdatedAt: b.now().UTC().Format(time.RFC3339Nano),
 	})

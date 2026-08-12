@@ -26,7 +26,7 @@ type WorkspaceSnapshot = PageBulkSnapshot & {
   pdfGrabAvailable?: boolean;
 };
 
-const SUBMIT_CAP = 50;
+const MAX_MANIFEST = 200;
 
 const KIND_LABEL: Record<DetectedPaper["identifier"]["kind"], string> = {
   doi: "DOI",
@@ -77,6 +77,8 @@ interface RowState {
 }
 
 interface SubmitResult {
+  mode: "v1" | "v2";
+  processedCount: number;
   submitted: number;
   joined: number;
   alreadyOwned: number;
@@ -264,10 +266,24 @@ function isStatusReply(value: unknown): value is { ok: true; items: PageBulkStat
 
 function isSubmitReply(
   value: unknown,
-): value is { ok: true; submitted: number; joined: number; already_owned: number; invalid: number; batch_id: string } {
+): value is {
+  ok: true;
+  mode: "v1" | "v2";
+  processed_count: number;
+  submitted: number;
+  joined: number;
+  already_owned: number;
+  invalid: number;
+  batch_id: string;
+} {
+  if (!isRecord(value) || value["ok"] !== true) return false;
+  const mode = value["mode"];
+  const processed = value["processed_count"];
   return (
-    isRecord(value) &&
-    value["ok"] === true &&
+    (mode === "v1" || mode === "v2") &&
+    typeof processed === "number" &&
+    Number.isSafeInteger(processed) &&
+    processed >= 0 && processed <= MAX_MANIFEST &&
     typeof value["submitted"] === "number" &&
     typeof value["joined"] === "number" &&
     typeof value["already_owned"] === "number" &&
@@ -589,28 +605,16 @@ function updatePrimaryButton(): void {
   const eligible = eligibleRows();
   const selected = selectedRows();
   if (selected.length === 0) {
-    // Nothing checked: acquire-all mode. Past the cap, the button itself
-    // says what will actually happen — "50 selected" with zero checkboxes
-    // checked read as a bug in the first live session.
-    const capped = Math.min(eligible.length, SUBMIT_CAP);
     elements.primaryButton.textContent = !state.statusLoaded
       ? "Acquire papers — checking availability…"
-      : eligible.length > SUBMIT_CAP
-        ? `Acquire ${capped} of ${eligible.length} eligible`
-        : `Acquire all ${eligible.length} eligible`;
+      : `Acquire all ${eligible.length} eligible`;
     elements.primaryButton.disabled = state.submitting || !state.statusLoaded || eligible.length === 0;
-    elements.submitStatus.textContent =
-      state.statusLoaded && eligible.length > SUBMIT_CAP
-        ? `papio batches are limited to ${SUBMIT_CAP} — the remaining ${eligible.length - SUBMIT_CAP} stay listed for the next batch`
-        : "";
+    elements.submitStatus.textContent = "";
     return;
   }
   elements.primaryButton.textContent = `Acquire ${selected.length} selected`;
   elements.primaryButton.disabled = state.submitting || !state.statusLoaded;
-  elements.submitStatus.textContent =
-    selected.length > SUBMIT_CAP
-      ? `${SUBMIT_CAP} of ${selected.length} selected will be submitted · papio batches are limited to ${SUBMIT_CAP}`
-      : "";
+  elements.submitStatus.textContent = "";
 }
 
 function renderActionBar(): void {
@@ -633,7 +637,6 @@ function renderResult(): void {
     elements.resultSummary.replaceChildren();
     return;
   }
-  elements.resultSummary.hidden = false;
   const parts = [
     `${result.submitted} submitted`,
     `${result.joined} joined`,
@@ -641,10 +644,14 @@ function renderResult(): void {
     `${result.invalid} invalid`,
   ];
   const summary = element("p", parts.join(" · "));
+  if (result.mode === "v1") {
+    summary.appendChild(element("span", " · Progress covers this 50-item submission"));
+  }
   const link = element("a", "Open inbox");
   link.href = typeof chrome !== "undefined" ? chrome.runtime.getURL(inboxPagePath()) : "inbox.html";
   link.target = "_blank";
   link.rel = "noopener noreferrer";
+  elements.resultSummary.hidden = false;
   elements.resultSummary.replaceChildren(summary, link);
 }
 
@@ -914,11 +921,10 @@ async function handleSubmit(): Promise<void> {
   if (elements === null || state.snapshot === null || state.submitting) return;
   const selected = selectedRows();
   const targetRows = selected.length === 0 ? eligibleRows() : selected;
-  // Decision 5: submission caps at 50; excess rows are not auto-chained —
-  // they simply keep their current selected/unselected state for the next
-  // submit click ("remainder retained").
-  const batch = targetRows.slice(0, SUBMIT_CAP);
-  const canonicalKeys = batch.map((row) => row.canonicalKey).filter((key): key is string => key !== null);
+  const canonicalKeys = targetRows
+    .map((row) => row.canonicalKey)
+    .filter((key): key is string => key !== null)
+    .slice(0, MAX_MANIFEST);
   if (canonicalKeys.length === 0) return;
   state.submitting = true;
   render();
@@ -941,11 +947,14 @@ async function handleSubmit(): Promise<void> {
     render();
     return;
   }
-  for (const row of batch) {
+  const processedCount = Math.min(response.processed_count, canonicalKeys.length);
+  for (const row of targetRows.slice(0, processedCount)) {
     row.submitted = true;
     row.selected = false;
   }
   state.result = {
+    mode: response.mode,
+    processedCount,
     submitted: response.submitted,
     joined: response.joined,
     alreadyOwned: response.already_owned,

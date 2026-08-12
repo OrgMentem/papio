@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"surface_presence","msg_id":"presence-0001","seq":11,"payload":{"request_id":"request-0101","instance_id":"inst-A1b2C3d4","surface":"inbox","focused":true,"at":"2026-08-12T10:15:00Z"}}

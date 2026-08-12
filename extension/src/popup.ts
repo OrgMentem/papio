@@ -16,8 +16,15 @@ import {
   type Provider,
   type Scenario,
 } from "./capture";
-import { chromeBackend, type ActiveJob, type PendingDelivery, type StoreShape, TERMS_CONSENT_KEY } from "./state";
-import type { ActivityEntryPayload } from "./protocol";
+import {
+  chromeBackend,
+  CATCH_UP_ENABLED_KEY,
+  type ActiveJob,
+  type PendingDelivery,
+  type StoreShape,
+  TERMS_CONSENT_KEY,
+} from "./state";
+import type { ActivityEntryPayload, WorkPulseResponsePayload } from "./protocol";
 import { classifyPage, isPDFPage, pdfSourceURL, sniffDOI, type PageKind } from "./deliver";
 import {
   SESSION_STALE_MS,
@@ -1310,6 +1317,7 @@ function renderWaitingOnSignIn(
 
 /** Render durable browser actions that need a user gesture: institutional
  * sign-in, provider permission grants, and security checks. */
+const popupBlockerOperations = new Map<string, boolean>();
 export function renderNeedsAttention(
   doc: Document,
   jobs: ActiveJob[],
@@ -1352,6 +1360,16 @@ export function renderNeedsAttention(
   const stalled = [
     ...new Set(authStalledJobs.filter((jobID) => typeof jobID === "string" && jobID.length > 0)),
   ];
+  const visibleChallenges = challengeJobs.slice(0, 1);
+  const visibleStalled = stalled.slice(0, 1);
+  const visibleBlocked = blocked.slice(
+    0,
+    Math.max(0, 3 - visibleChallenges.length - visibleStalled.length),
+  );
+  const overflowCount =
+    challengeJobs.length - visibleChallenges.length +
+    blocked.length - visibleBlocked.length +
+    stalled.length - visibleStalled.length;
   section.hidden = challengeJobs.length === 0 && blocked.length === 0 && stalled.length === 0;
   list.replaceChildren();
   if (section.hidden) return;
@@ -1369,9 +1387,10 @@ export function renderNeedsAttention(
     heading.textContent = "Allow provider access";
     message.textContent = "Grant the blocked source here, or manage all sources in Options.";
   }
+  if (overflowCount > 0) message.textContent += ` · ${overflowCount} more in inbox`;
   message.hidden = message.textContent === "";
+  for (const job of visibleChallenges) {
 
-  for (const job of challengeJobs) {
     const row = doc.createElement("div");
     row.className = "needs-you-item";
     const copy = doc.createElement("div");
@@ -1384,18 +1403,25 @@ export function renderNeedsAttention(
     reason.textContent = "Complete it in the open tab; papio will resume without retrying the provider.";
     copy.append(provider, reason);
     const button = doc.createElement("button");
+    const operationKey = `challenge:${job.job_id}`;
+    const pendingOperation = popupBlockerOperations.get(operationKey) === true;
     button.className = "ghost";
     button.type = "button";
-    button.textContent = "Go-to-tab";
+    button.textContent = pendingOperation ? "Opening…" : "Go-to-tab";
+    button.disabled = pendingOperation;
     button.addEventListener("click", () => {
+      if (popupBlockerOperations.get(operationKey) === true) return;
+      popupBlockerOperations.set(operationKey, true);
       button.disabled = true;
       button.textContent = "Opening…";
       void onFocus(job.job_id).then(
         () => {
+          popupBlockerOperations.delete(operationKey);
           button.disabled = false;
           button.textContent = "Go-to-tab";
         },
         () => {
+          popupBlockerOperations.delete(operationKey);
           button.disabled = false;
           button.textContent = "Try again";
         },
@@ -1406,7 +1432,7 @@ export function renderNeedsAttention(
   }
 
 
-  for (const jobID of stalled) {
+  for (const jobID of visibleStalled) {
     const row = doc.createElement("div");
     row.className = "needs-you-item";
     const copy = doc.createElement("div");
@@ -1417,19 +1443,27 @@ export function renderNeedsAttention(
     paper.textContent = knownJob === undefined ? jobID : handoffPaperLabel(knownJob);
     const reason = doc.createElement("p");
     reason.textContent = "Sign-in didn't stick - sign in, then retry";
+    copy.append(paper, reason);
     const button = doc.createElement("button");
+    const operationKey = `retry:${jobID}`;
+    const pendingOperation = popupBlockerOperations.get(operationKey) === true;
     button.className = "ghost";
     button.type = "button";
-    button.textContent = "Retry now";
+    button.textContent = pendingOperation ? "Retrying…" : "Retry now";
+    button.disabled = pendingOperation;
     button.addEventListener("click", () => {
+      if (popupBlockerOperations.get(operationKey) === true) return;
+      popupBlockerOperations.set(operationKey, true);
       button.disabled = true;
       button.textContent = "Retrying…";
       void onRetry(jobID).then(
         () => {
+          popupBlockerOperations.delete(operationKey);
           button.disabled = false;
           button.textContent = "Retry now";
         },
         () => {
+          popupBlockerOperations.delete(operationKey);
           button.disabled = false;
           button.textContent = "Try again";
         },
@@ -1439,25 +1473,32 @@ export function renderNeedsAttention(
     list.append(row);
   }
 
-  for (const host of blocked) {
+  for (const host of visibleBlocked) {
     const row = doc.createElement("div");
     row.className = "needs-you-item";
     const provider = doc.createElement("p");
     provider.className = "needs-you-paper";
     provider.textContent = host;
     const button = doc.createElement("button");
+    const operationKey = `provider:${host}`;
+    const pendingOperation = popupBlockerOperations.get(operationKey) === true;
     button.className = "ghost";
     button.type = "button";
-    button.textContent = "Allow";
+    button.textContent = pendingOperation ? "Allowing…" : "Allow";
+    button.disabled = pendingOperation;
     button.addEventListener("click", () => {
+      if (popupBlockerOperations.get(operationKey) === true) return;
+      popupBlockerOperations.set(operationKey, true);
       button.disabled = true;
       button.textContent = "Allowing…";
       void onGrantProvider(host).then(
         (granted) => {
+          popupBlockerOperations.delete(operationKey);
           button.disabled = false;
           button.textContent = granted ? "Allowed" : "Try again";
         },
         () => {
+          popupBlockerOperations.delete(operationKey);
           button.disabled = false;
           button.textContent = "Try again";
         },
@@ -1465,6 +1506,14 @@ export function renderNeedsAttention(
     });
     row.append(provider, button);
     list.append(row);
+  }
+  if (overflowCount > 0) {
+    const more = doc.createElement("button");
+    more.type = "button";
+    more.className = "ghost needs-you-more";
+    more.textContent = `${overflowCount} more in inbox`;
+    more.addEventListener("click", () => void openInbox());
+    list.append(more);
   }
 }
 
@@ -1580,6 +1629,192 @@ function deliveryStatusText(delivery: PendingDelivery | undefined): string {
   return "";
 }
 
+export interface PopupPulseCache {
+  pulse: WorkPulseResponsePayload;
+  receivedAt: number;
+  workerEpoch: string;
+}
+
+export interface PulseDisplay {
+  primary: "Moving" | "Waiting on you" | "Stalled" | "Scheduled" | "Idle" | "Unknown";
+  primaryText: string;
+  buckets: string;
+  next: string;
+  capacity: string;
+  batch: string;
+  asOf?: string;
+}
+
+let popupPulseCache: PopupPulseCache | undefined;
+let popupPulseWorkerEpoch: string | undefined;
+
+function isPulseRuntimeReply(value: unknown): value is {
+  ok: true;
+  available: boolean;
+  pulse?: WorkPulseResponsePayload;
+  received_at?: number;
+  worker_epoch: string;
+} {
+  if (typeof value !== "object" || value === null) return false;
+  const reply = value as Record<string, unknown>;
+  if (reply.ok !== true || typeof reply.available !== "boolean" || typeof reply.worker_epoch !== "string") return false;
+  if (!reply.available) return true;
+  const pulse = reply.pulse;
+  return (
+    typeof pulse === "object" &&
+    pulse !== null &&
+    (pulse as WorkPulseResponsePayload).schema === 1 &&
+    typeof (pulse as WorkPulseResponsePayload).generated_at === "string" &&
+    typeof reply.received_at === "number" &&
+    Number.isFinite(reply.received_at)
+  );
+}
+
+export async function requestWorkPulse(): Promise<PopupPulseCache | undefined> {
+  try {
+    const reply = await chrome.runtime.sendMessage({ type: "papio.work.pulse" });
+    if (!isPulseRuntimeReply(reply)) return undefined;
+    if (popupPulseWorkerEpoch !== undefined && popupPulseWorkerEpoch !== reply.worker_epoch) popupPulseCache = undefined;
+    popupPulseWorkerEpoch = reply.worker_epoch;
+    if (!reply.available || reply.pulse === undefined) {
+      popupPulseCache = undefined;
+      return undefined;
+    }
+    popupPulseCache = {
+      pulse: reply.pulse,
+      receivedAt: Date.now(),
+      workerEpoch: reply.worker_epoch,
+    };
+    return popupPulseCache;
+  } catch {
+    return undefined;
+  }
+}
+
+function pulseCount(pulse: WorkPulseResponsePayload, field: keyof WorkPulseResponsePayload): number | undefined {
+  const value = pulse[field];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+export function derivePulseDisplay(
+  cache: PopupPulseCache | undefined,
+  connectionStatus: StoreShape["connectionStatus"] = "connected",
+  now = Date.now(),
+  maxAgeMs = 15_000,
+): PulseDisplay {
+  if (connectionStatus !== "connected") {
+    return { primary: "Unknown", primaryText: "Can't tell — daemon disconnected", buckets: "", next: "", capacity: "", batch: "" };
+  }
+  if (cache === undefined || cache.workerEpoch === "" || now - cache.receivedAt < 0 || now - cache.receivedAt > maxAgeMs) {
+    const generated = cache === undefined ? undefined : Date.parse(cache.pulse.generated_at);
+    return {
+      primary: "Unknown",
+      primaryText: generated !== undefined && Number.isFinite(generated) && generated > 0
+        ? `Status as of ${new Date(generated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+        : "Can't tell — live progress is unavailable",
+      buckets: "",
+      next: "",
+      capacity: "",
+      batch: "",
+    };
+  }
+  const pulse = cache.pulse;
+  const inFlight = pulseCount(pulse, "in_flight");
+  const continuing = pulseCount(pulse, "continuing");
+  const scheduled = pulseCount(pulse, "scheduled");
+  const waiting = pulseCount(pulse, "waiting_required");
+  const stalled = pulseCount(pulse, "stalled");
+  const moving = inFlight !== undefined && continuing !== undefined ? inFlight + continuing : undefined;
+  const movingPositive = (inFlight ?? 0) > 0 || (continuing ?? 0) > 0;
+  const projectionComplete =
+    pulse.projection_complete === true &&
+    inFlight !== undefined &&
+    continuing !== undefined &&
+    scheduled !== undefined &&
+    waiting !== undefined &&
+    stalled !== undefined;
+  const complete = projectionComplete && pulse.nonterminal_total === 0;
+  const hasStallEpisode = Array.isArray(pulse.stall_episodes) && pulse.stall_episodes.length > 0;
+  let primary: PulseDisplay["primary"] = "Unknown";
+  if (movingPositive) primary = "Moving";
+  else if (projectionComplete && waiting > 0) primary = "Waiting on you";
+  else if (projectionComplete && stalled > 0 && hasStallEpisode) primary = "Stalled";
+  else if (projectionComplete && scheduled > 0) primary = "Scheduled";
+  else if (complete) primary = "Idle";
+
+  const bucketParts: string[] = [];
+  const primaryText =
+    primary === "Moving"
+      ? moving === undefined
+        ? "Moving"
+        : `Moving · ${moving} ${moving === 1 ? "paper" : "papers"}`
+      : primary === "Waiting on you"
+        ? `Waiting on you · ${waiting} ${waiting === 1 ? "decision" : "decisions"}`
+        : primary === "Stalled"
+          ? `Stalled · ${stalled} ${stalled === 1 ? "paper" : "papers"}`
+          : primary === "Scheduled"
+            ? `Scheduled · ${scheduled} ${scheduled === 1 ? "paper" : "papers"}`
+            : primary === "Idle"
+              ? "Idle"
+              : "Can't tell — live progress is unavailable";
+  if (continuing !== undefined) bucketParts.push(`${continuing} continuing`);
+  if (scheduled !== undefined) bucketParts.push(`${scheduled} scheduled`);
+  if (waiting !== undefined) bucketParts.push(`${waiting} need you`);
+  if (stalled !== undefined) bucketParts.push(`${stalled} stalled`);
+  let next = "";
+  if (pulse.next_action !== undefined) {
+    const actionName = pulse.next_action.kind === "retry" ? "retrying" : pulse.next_action.kind === "delivery_poll" ? "checking delivery" : "opening a source gate";
+    const at = new Date(Date.parse(pulse.next_action.at)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const count = pulse.next_action.count === undefined ? "" : ` ${pulse.next_action.count}`;
+    const source = pulse.next_action.source === undefined ? "" : ` ${pulse.next_action.source}`;
+    next = `Next: ${actionName}${count}${source} at ${at}`;
+  }
+  let capacity = "";
+  if (pulse.effect_capacity !== undefined) {
+    const cap = pulse.effect_capacity;
+    capacity = `Acquisition effects ${cap.busy}/${cap.limit} busy`;
+    if (cap.waiting !== undefined && cap.waiting > 0) capacity += ` · ${cap.waiting} waiting their turn`;
+  }
+  let batch = "";
+  const latest = pulse.latest_batch;
+  if (latest?.membership === "partial") batch = "Recent browser submissions";
+  else if (latest?.membership === "complete" && latest.total !== undefined && latest.settled !== undefined) {
+    const active = latest.nonterminal_total === undefined ? "" : ` · ${latest.nonterminal_total} remaining`;
+    batch = `${latest.total} papers · ${latest.settled} settled${active}`;
+  }
+  if (primary === "Idle" && pulse.last_finished_at !== undefined) {
+    const finished = Date.parse(pulse.last_finished_at);
+    if (Number.isFinite(finished)) {
+      const age = relativeAgeParts(finished, now).display;
+      if (age !== "just now") return { primary, primaryText: `${primaryText} · last finished ${age.replace(" ago", "")}`, buckets: bucketParts.join(" · "), next, capacity, batch };
+    }
+  }
+  return { primary, primaryText, buckets: bucketParts.join(" · "), next, capacity, batch };
+}
+
+export function renderWorkPulse(
+  doc: Document,
+  cache: PopupPulseCache | undefined,
+  connectionStatus: StoreShape["connectionStatus"] = "connected",
+  now = Date.now(),
+): void {
+  const section = doc.getElementById("popup-pulse");
+  const primary = doc.getElementById("popup-pulse-primary");
+  const buckets = doc.getElementById("popup-pulse-buckets");
+  const next = doc.getElementById("popup-pulse-next");
+  const capacity = doc.getElementById("popup-pulse-capacity");
+  const batch = doc.getElementById("popup-pulse-batch");
+  if (!(section instanceof HTMLElement) || !(primary instanceof HTMLElement) || !(buckets instanceof HTMLElement) ||
+      !(next instanceof HTMLElement) || !(capacity instanceof HTMLElement) || !(batch instanceof HTMLElement)) return;
+  const display = derivePulseDisplay(cache, connectionStatus, now);
+  primary.textContent = display.primaryText;
+  buckets.textContent = display.buckets;
+  next.textContent = display.next;
+  capacity.textContent = display.capacity;
+  batch.textContent = display.batch;
+  for (const node of [buckets, next, capacity, batch]) node.hidden = node.textContent === "";
+  section.hidden = display.primary === "Unknown" && display.primaryText === "Can't tell — live progress is unavailable";
+}
 const POPUP_REFRESH_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 10 * 60_000;
 
@@ -1617,6 +1852,50 @@ async function readPopupActivity(): Promise<ActivityEntryPayload[] | undefined> 
   } catch {
     return undefined;
   }
+}
+const POPUP_ACTIVITY_WATERMARK_KEY = "papio_popup_activity_seen_through_seq_v1";
+let popupCatchupInitialized = false;
+async function renderPopupCatchup(doc: Document, entries: readonly ActivityEntryPayload[]): Promise<void> {
+  const section = doc.getElementById("popup-catchup");
+  const text = doc.getElementById("popup-catchup-text");
+  const open = doc.getElementById("popup-catchup-open");
+  if (!(section instanceof HTMLElement) || !(text instanceof HTMLElement) || !(open instanceof HTMLButtonElement)) return;
+  if (popupCatchupInitialized) return;
+  let enabled = true;
+  try {
+    const setting = await chrome.storage.local.get(CATCH_UP_ENABLED_KEY);
+    enabled = setting[CATCH_UP_ENABLED_KEY] !== false;
+  } catch {
+    // An unavailable preference must not hide durable catch-up information.
+  }
+  popupCatchupInitialized = true;
+  if (!enabled) {
+    section.hidden = true;
+    return;
+  }
+  let seen = 0;
+  try {
+    const stored = await chrome.storage.local.get(POPUP_ACTIVITY_WATERMARK_KEY);
+    const storedValue = stored[POPUP_ACTIVITY_WATERMARK_KEY];
+    if (typeof storedValue === "number") seen = storedValue;
+  } catch {
+    return;
+  }
+  const unseen = entries.filter((entry) => entry.seq > seen);
+  const maxSeq = entries.reduce((max, entry) => Math.max(max, entry.seq), seen);
+  if (maxSeq > seen) void chrome.storage.local.set({ [POPUP_ACTIVITY_WATERMARK_KEY]: maxSeq });
+  if (unseen.length === 0) return;
+  const acquired = unseen.filter((entry) => /acquired|ready|imported/i.test(entry.kind)).length;
+  const required = unseen.filter((entry) => /human|action|auth|attention/i.test(entry.kind)).length;
+  const watch = unseen.filter((entry) => /watch/i.test(entry.kind)).length;
+  const parts: string[] = [];
+  if (acquired > 0) parts.push(`${acquired} acquired`);
+  if (required > 0) parts.push(`${required} need you`);
+  if (watch > 0) parts.push(`${watch} watch hits`);
+  if (parts.length === 0) parts.push(`${Math.min(unseen.length, 50)} updates`);
+  text.textContent = `While you were away: ${parts.join(" · ")}`;
+  section.hidden = false;
+  open.onclick = () => void openInbox();
 }
 
 function relativeAgeParts(timestamp: number, now = Date.now()): { display: string; compact: string; stale: boolean } {
@@ -2035,33 +2314,22 @@ export function sessionWarmForJob(
       (origin) => origin.verdict === "in" && isFreshSessionTimestamp(origin.lastVerdictAt),
     ) || session?.authenticated === true;
   const rawDemands = session?.authDemand;
-  const matchingDemands = Array.isArray(rawDemands)
-    ? rawDemands.filter((entry) => {
-        if (typeof entry !== "object" || entry === null) return false;
-        return (entry as unknown as Record<string, unknown>)["job_id"] === jobID;
-      })
-    : [];
-  if (matchingDemands.length === 0) {
-    if (requiresOriginBinding && session?.authDemandComplete === true) return false;
-    return legacyWarmth;
-  }
-  if (matchingDemands.length !== 1) return false;
-  const demand = matchingDemands[0];
-  if (!isSessionAuthDemand(demand)) return false;
-  const matchingOrigins = (session?.origins ?? []).filter(
-    (origin) => origin.origin === demand.origin,
+  if (rawDemands === undefined) return session?.authDemandComplete === true ? false : legacyWarmth;
+  if (!Array.isArray(rawDemands)) return false;
+  const matchingDemands = rawDemands.filter(
+    (entry): entry is SessionAuthDemand => isSessionAuthDemand(entry) && entry.job_id === jobID,
   );
-  if (matchingOrigins.length !== 1) return false;
-  const demandedOrigin = matchingOrigins[0];
-  if (demandedOrigin === undefined) return false;
-  return (
+  if (matchingDemands.length !== 1) return false;
+  const demanded = matchingDemands[0];
+  if (demanded === undefined) return false;
+  const demandedOrigin = (session?.origins ?? []).find((origin) => origin.origin === demanded.origin);
+  return demandedOrigin !== undefined &&
     demandedOrigin.verdict === "in" &&
     demandedOrigin.authenticated === true &&
     demandedOrigin.checking === false &&
-    isFreshSessionTimestamp(demandedOrigin.lastVerdictAt)
-  );
-}
+    isFreshSessionTimestamp(demandedOrigin.lastVerdictAt);
 
+}
 export function renderPageContext(
   doc: Document,
   page: PageMetadata | undefined,
@@ -2170,6 +2438,27 @@ let popupRefreshTimer: ReturnType<typeof setInterval> | undefined;
  * back to a snapshot-only read instead of repeating that injection. */
 let sessionProbedThisPopup = false;
 
+let popupPresenceFeatures: readonly string[] | undefined;
+const POPUP_SURFACE_FEATURE = "surface_presence_v1";
+const POPUP_PRESENCE_INSTANCE_ID = (() => {
+  const source = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+  return source.replace(/-/g, "").slice(0, 64).padEnd(8, "0");
+})();
+
+export function sendPopupPresence(features: readonly string[] | undefined, focused: boolean): void {
+  if (!(features ?? []).includes(POPUP_SURFACE_FEATURE)) return;
+  void chrome.runtime.sendMessage({
+    type: "papio.surface.presence",
+    payload: {
+      instance_id: POPUP_PRESENCE_INSTANCE_ID,
+      surface: "popup",
+      focused,
+      at: new Date().toISOString(),
+    },
+  }).catch(() => undefined);
+}
 function startPopupRefresh(): void {
   if (popupRefreshTimer !== undefined) return;
   popupRefreshTimer = setInterval(() => {
@@ -2203,10 +2492,31 @@ function readSessionForRefresh(): Promise<PopupSessionState | undefined> {
   return requestSessionProbe();
 }
 
+function popupFocusKey(doc: Document): string | undefined {
+  const active = doc.activeElement;
+  return active instanceof HTMLElement && active.id.length > 0 ? active.id : undefined;
+}
+
+function restorePopupFocus(doc: Document, key: string | undefined): void {
+  if (key === undefined) return;
+  const control = doc.getElementById(key);
+  if (control instanceof HTMLElement && !control.hidden && !(control instanceof HTMLButtonElement && control.disabled)) {
+    control.focus();
+    return;
+  }
+  const fallback = doc.getElementById("popup-pulse-primary") ?? doc.getElementById("daemon-status-message");
+  if (fallback instanceof HTMLElement) {
+    fallback.tabIndex = -1;
+    fallback.focus();
+  }
+}
 export async function refresh(): Promise<void> {
+  const focusKey = popupFocusKey(document);
   // Wave 1: store-derived sections paint immediately (one storage read),
   // before the user can aim at anything.
   const store = await chromeBackend(chrome.storage).load();
+  popupPresenceFeatures = store.daemonFeatures;
+  void sendPopupPresence(store.daemonFeatures, true);
   renderDaemonStatus(document, store);
   renderPageAcquire(document);
   refreshCaptureOptions(document, store.daemonFeatures);
@@ -2214,9 +2524,10 @@ export async function refresh(): Promise<void> {
   // synchronous pass. Sections revealing one by one over the next seconds
   // shift later cards mid-aim — a live mis-click hit "Focus" where
   // "Close them" had been a moment earlier.
-  const [freshActivity, delivery, pageMetadata, session, orphanCount, consent, ungranted] =
+  const [freshActivity, _pulse, delivery, pageMetadata, session, orphanCount, consent, ungranted] =
     await Promise.all([
       readPopupActivity(),
+      requestWorkPulse(),
       readDeliveryFeedback(store.pendingDelivery),
       readCurrentPageMetadata().catch(() => undefined),
       readSessionForRefresh(),
@@ -2240,7 +2551,11 @@ export async function refresh(): Promise<void> {
         return pending;
       })(),
     ]);
-  if (freshActivity !== undefined) popupActivity = freshActivity;
+  renderWorkPulse(document, popupPulseCache, store.connectionStatus);
+  if (freshActivity !== undefined) {
+    popupActivity = freshActivity;
+    await renderPopupCatchup(document, freshActivity);
+  }
   renderPageContext(
     document,
     pageMetadata,
@@ -2274,6 +2589,7 @@ export async function refresh(): Promise<void> {
   renderResolverGrants(document, ungranted, (toGrant) => {
     void chrome.permissions.request({ origins: toGrant.map((origin) => `${origin}/*`) }).then(() => refresh());
   });
+  restorePopupFocus(document, focusKey);
 }
 
 /** Pull the daemon-upgrade (or other) refusal reason out of a `runtimeFailure`
@@ -2473,6 +2789,15 @@ if (
   wirePageBulkScanLauncher();
   wireHistoryLauncher();
   wirePrimaryShortcut();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      void refresh();
+      sendPopupPresence(popupPresenceFeatures, true);
+    } else {
+      sendPopupPresence(popupPresenceFeatures, false);
+    }
+  });
+  window.addEventListener("pagehide", () => sendPopupPresence(popupPresenceFeatures, false));
   // The initial refresh must not float: a popup opened before storage is
   // reachable (or a test importing this module) would otherwise surface an
   // unhandled rejection. Later refreshes re-render; this one is best-effort.

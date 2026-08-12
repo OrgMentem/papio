@@ -83,6 +83,16 @@ var removedSourceNames = map[string]bool{
 // same order as the const block above.
 const validSourceNamesList = "arxiv, europepmc, unpaywall, openalex, core, crossref_tdm, crossref_metadata, retraction_watch, semanticscholar, openaire"
 
+var validNotifyCategoryNames = map[string]bool{
+	"request_outcome":  true,
+	"decision_opened":  true,
+	"decision_pending": true,
+	"completion_batch": true,
+	"discovery_new":    true,
+	"integrity_notice": true,
+	"system_degraded":  true,
+}
+
 // Source is one resolver's policy knobs.
 type Source struct {
 	Enabled       bool    `toml:"enabled"`
@@ -327,11 +337,27 @@ type Captures struct {
 	MaxAgeDays int `toml:"max_age_days"`
 }
 
-// Notify configures best-effort notifications from the daemon: local desktop
-// notifications and an optional remote webhook. Both are fire-and-forget; a
-// delivery failure never fails the work that triggered it.
+// NotifyCategory overrides one category's independent desktop and webhook
+// routing. Map keys are validated against the closed notification vocabulary.
+type NotifyCategory struct {
+	Desktop       string `toml:"desktop"`
+	Webhook       string `toml:"webhook"`
+	WindowSeconds int    `toml:"window_seconds"`
+}
+
+// Notify configures daemon-owned notification routing. Desktop delivery is
+// best effort; webhook delivery is an independent automation channel.
 type Notify struct {
-	Enabled bool `toml:"enabled"`
+	Enabled                  bool                      `toml:"enabled"`
+	Preset                   string                    `toml:"preset"`
+	MaxPerHour               int                       `toml:"max_per_hour"`
+	QuietHours               string                    `toml:"quiet_hours"`
+	QuietMode                string                    `toml:"quiet_mode"`
+	DigestEveryMinutes       int                       `toml:"digest_every_minutes"`
+	CompletionQuietMinutes   int                       `toml:"completion_quiet_minutes"`
+	CompletionMaxHoldMinutes int                       `toml:"completion_max_hold_minutes"`
+	StallAfterMinutes        int                       `toml:"stall_after_minutes"`
+	Categories               map[string]NotifyCategory `toml:"categories,omitempty"`
 	// WebhookURL, when set, receives every notification as a JSON POST in
 	// addition to (not instead of) the local desktop channel.
 	WebhookURL string `toml:"webhook_url"`
@@ -535,8 +561,13 @@ func Default() Config {
 		Captures: Captures{Enabled: true, MaxPerHost: 10, MaxAgeDays: 14},
 		Actions:  Actions{StaleAfterSeconds: DefaultActionStaleAfterSeconds},
 		Zotio:    Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
-		Notify:   Notify{Enabled: true},
-		Hooks:    Hooks{TimeoutSeconds: 120},
+		Notify: Notify{
+			Enabled: true, Preset: "milestones", MaxPerHour: 6,
+			QuietMode: "hold", DigestEveryMinutes: 240,
+			CompletionQuietMinutes: 10, CompletionMaxHoldMinutes: 120,
+			StallAfterMinutes: 30,
+		},
+		Hooks: Hooks{TimeoutSeconds: 120},
 		Sources: map[string]Source{
 			SourceArXiv:            {Enabled: true, RatePerSec: 1, Burst: 1},
 			SourceEuropePMC:        {Enabled: true, RatePerSec: 2, Burst: 2},
@@ -776,6 +807,9 @@ func (c *Config) validate() error {
 			return fmt.Errorf("sources.%s.max_cost_usd must not be negative (0 means unmetered)", name)
 		}
 	}
+	if err := validateNotify(c.Notify); err != nil {
+		return err
+	}
 	if c.Notify.WebhookURL != "" {
 		u, err := url.Parse(c.Notify.WebhookURL)
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
@@ -802,6 +836,87 @@ func (c *Config) validate() error {
 		seenDiscovery[name] = true
 	}
 	return nil
+
+}
+func validateNotify(n Notify) error {
+	switch n.Preset {
+	case "", "quiet", "milestones", "verbose":
+	default:
+		return fmt.Errorf("notify.preset must be quiet, milestones, or verbose")
+	}
+	if n.MaxPerHour < 0 || n.MaxPerHour > 10000 {
+		return fmt.Errorf("notify.max_per_hour must be in 0..10000")
+	}
+	switch n.QuietMode {
+	case "", "hold", "drop":
+	default:
+		return fmt.Errorf("notify.quiet_mode must be hold or drop")
+	}
+	if n.DigestEveryMinutes < 0 || n.DigestEveryMinutes > 10080 {
+		return fmt.Errorf("notify.digest_every_minutes must be in 0..10080")
+	}
+	if n.CompletionQuietMinutes < 0 || n.CompletionQuietMinutes > 1440 {
+		return fmt.Errorf("notify.completion_quiet_minutes must be in 0..1440")
+	}
+	if n.CompletionMaxHoldMinutes < 0 || n.CompletionMaxHoldMinutes > 10080 {
+		return fmt.Errorf("notify.completion_max_hold_minutes must be in 0..10080")
+	}
+	if n.StallAfterMinutes < 0 || n.StallAfterMinutes > 10080 {
+		return fmt.Errorf("notify.stall_after_minutes must be in 0..10080")
+	}
+	if n.QuietHours != "" {
+		if _, _, err := parseQuietHours(n.QuietHours); err != nil {
+			return fmt.Errorf("notify.quiet_hours %w", err)
+		}
+	}
+	for name, category := range n.Categories {
+		if !validNotifyCategoryNames[name] {
+			return fmt.Errorf("notify.categories.%s is not a recognized category", name)
+		}
+		if !validNotifyMode(category.Desktop) {
+			return fmt.Errorf("notify.categories.%s.desktop must be off, digest, or immediate", name)
+		}
+		if !validNotifyMode(category.Webhook) {
+			return fmt.Errorf("notify.categories.%s.webhook must be off, digest, or immediate", name)
+		}
+		if category.WindowSeconds < 0 || category.WindowSeconds > 86400 {
+			return fmt.Errorf("notify.categories.%s.window_seconds must be in 0..86400", name)
+		}
+	}
+	if n.CompletionMaxHoldMinutes > 0 && n.CompletionQuietMinutes > n.CompletionMaxHoldMinutes {
+		return fmt.Errorf("notify.completion_quiet_minutes cannot exceed completion_max_hold_minutes")
+	}
+	return nil
+}
+
+func validNotifyMode(value string) bool {
+	return value == "" || value == "off" || value == "digest" || value == "immediate"
+}
+
+func parseQuietHours(value string) (time.Duration, time.Duration, error) {
+	if len(value) != 11 || value[5] != '-' || value[2] != ':' || value[8] != ':' {
+		return 0, 0, fmt.Errorf("must use HH:MM-HH:MM")
+	}
+	parse := func(text string) (time.Duration, error) {
+		hour, err1 := strconv.Atoi(text[:2])
+		minute, err2 := strconv.Atoi(text[3:5])
+		if err1 != nil || err2 != nil || hour > 23 || minute > 59 {
+			return 0, fmt.Errorf("must use valid local times")
+		}
+		return time.Duration(hour)*time.Hour + time.Duration(minute)*time.Minute, nil
+	}
+	start, err := parse(value[:5])
+	if err != nil {
+		return 0, 0, err
+	}
+	end, err := parse(value[6:])
+	if err != nil {
+		return 0, 0, err
+	}
+	if start == end {
+		return 0, 0, fmt.Errorf("start and end must differ")
+	}
+	return start, end, nil
 }
 
 // validateLibrary is fail-closed on every field. A misconfigured holdings source

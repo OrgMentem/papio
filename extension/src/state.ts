@@ -40,6 +40,29 @@ export const TERMS_CONSENT_KEY = "papio_terms_consent_v1";
 /** Durable one-time consent for transmitting sanitized failure page captures
  * from Firefox < 140 to the local papio daemon. Absent/false means off. */
 export const PAGE_CAPTURE_CONSENT_KEY = "papio_page_capture_consent_v1";
+/** Browser-local feedback settings shared by the options page, popup, inbox,
+ * and service-worker broker. These dedicated keys intentionally stay outside
+ * papio_state_v1 and the managed StoreShape. */
+export type ToolbarCountMode = "required" | "all" | "off";
+export type SuccessAckMode = "all" | "errors" | "off";
+export const TOOLBAR_COUNT_MODE_KEY = "papio_toolbar_count_mode_v1";
+export const CATCH_UP_ENABLED_KEY = "papio_catch_up_enabled_v1";
+export const SUCCESS_ACK_MODE_KEY = "papio_success_ack_mode_v1";
+
+/** Read the success-acknowledgement preference without ever treating malformed
+ * storage as an enabled mode. The options UI and inbox both use `all` as the
+ * first-install default. */
+export async function getSuccessAckMode(
+  storage: Pick<chrome.storage.StorageArea, "get"> = chrome.storage.local,
+): Promise<SuccessAckMode> {
+  try {
+    const values = await storage.get(SUCCESS_ACK_MODE_KEY);
+    const value = values[SUCCESS_ACK_MODE_KEY];
+    return value === "errors" || value === "off" ? value : "all";
+  } catch {
+    return "all";
+  }
+}
 
 
 /** Durable user choice for the dedicated background work window. `false`

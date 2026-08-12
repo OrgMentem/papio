@@ -459,22 +459,31 @@ test("checking a row morphs the primary button to Acquire N selected, and unchec
   expect(primary.textContent).toBe("Acquire all 2 eligible");
 });
 
-test("50-cap: selecting more than 50 shows the cap note without hiding the true selected count", async () => {
+test("selecting more than 50 keeps the complete manifest and has no client-side cap", async () => {
   const items = Array.from({ length: 60 }, (_, i) => paper({ localId: `id-${i}`, identifier: { kind: "doi", value: `10.1/${i}` } }));
   const snap = snapshot({ items });
-  const statusItems = items.map((item) => eligibleStatus(item.localId));
-  const page = await pageBulkDocument("scan-1", standardReply(snap, statusItems));
+  const statusItems = items.map((item) => eligibleStatus(item.localId, `work:${item.localId}`));
+  const submitted: RuntimeRequest[] = [];
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.submit") {
+      submitted.push(message);
+      return { ok: true, mode: "v2", processed_count: 60, submitted: 60, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_v2" };
+    }
+    return standardReply(snap, statusItems)(message);
+  });
 
   for (const item of items) {
     const box = checkbox(page.document, item.localId)!;
     box.checked = true;
     box.dispatchEvent(new Event("change", { bubbles: true }));
   }
-  const primary = page.document.getElementById("primary-btn") as HTMLButtonElement;
-  expect(primary.textContent).toBe("Acquire 60 selected");
-  expect(page.document.getElementById("submit-status")?.textContent).toBe(
-    "50 of 60 selected will be submitted \u00b7 papio batches are limited to 50",
-  );
+  (page.document.getElementById("primary-btn") as HTMLButtonElement).click();
+  await settle();
+
+  expect(submitted).toHaveLength(1);
+  expect(submitted[0]?.request["canonical_keys"]).toEqual(items.map((item) => `work:${item.localId}`));
+  expect(page.document.getElementById("result-summary")?.textContent).not.toContain("Progress covers");
+  for (const item of items) expect(row(page.document, item.localId)?.dataset["status"]).toBe("submitted");
 });
 
 // --- submit payload, results, remainder retained ----------------------------
@@ -485,14 +494,12 @@ test("submitting Acquire all sends every eligible canonical key plus the source 
   const page = await pageBulkDocument("scan-1", (message) => {
     if (message.type === "papio.pageBulk.submit") {
       submitted.push(message);
-      return { ok: true, submitted: 2, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" };
+      return { ok: true, mode: "v2", processed_count: 2, submitted: 2, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" };
     }
     return standardReply(snap, [eligibleStatus("id-1", "work:a"), eligibleStatus("id-2", "work:b")])(message);
   });
-
   (page.document.getElementById("primary-btn") as HTMLButtonElement).click();
   await settle();
-
   expect(submitted).toHaveLength(1);
   expect(submitted[0]?.request).toEqual({
     scan_id: "scan-1",
@@ -521,7 +528,7 @@ test("submitting a manual selection sends only the checked canonical keys", asyn
   expect(submitted[0]?.request["canonical_keys"]).toEqual(["work:a"]);
 });
 
-test("submit caps the batch at 50 and retains the remainder for the next submit", async () => {
+test("v1 fallback marks only the processed prefix and names the limited submission", async () => {
   const items = Array.from({ length: 55 }, (_, i) => paper({ localId: `id-${i}`, identifier: { kind: "doi", value: `10.1/${i}` } }));
   const snap = snapshot({ items });
   const statusItems = items.map((item) => eligibleStatus(item.localId, `work:${item.localId}`));
@@ -529,18 +536,16 @@ test("submit caps the batch at 50 and retains the remainder for the next submit"
   const page = await pageBulkDocument("scan-1", (message) => {
     if (message.type === "papio.pageBulk.submit") {
       submitted.push(message);
-      return { ok: true, submitted: 50, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_3" };
+      return { ok: true, mode: "v1", processed_count: 50, submitted: 50, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_v1" };
     }
     return standardReply(snap, statusItems)(message);
   });
-
   (page.document.getElementById("primary-btn") as HTMLButtonElement).click();
   await settle();
-
   const keys = submitted[0]?.request["canonical_keys"] as string[];
-  expect(keys).toHaveLength(50);
-  expect(keys).toEqual(items.slice(0, 50).map((item) => `work:${item.localId}`));
-  // The remainder (the last 5) stay eligible, unsubmitted, and checkable.
+  expect(keys).toHaveLength(55);
+  expect(keys).toEqual(items.map((item) => `work:${item.localId}`));
+  expect(page.document.getElementById("result-summary")?.textContent).toContain("Progress covers this 50-item submission");
   for (const item of items.slice(50)) {
     expect(row(page.document, item.localId)?.dataset["status"]).not.toBe("submitted");
     expect(checkbox(page.document, item.localId)?.disabled).toBe(false);
@@ -555,7 +560,7 @@ test("the result panel renders submitted/joined/already-owned/invalid counts and
   const snap = snapshot();
   const page = await pageBulkDocument("scan-1", (message) => {
     if (message.type === "papio.pageBulk.submit") {
-      return { ok: true, submitted: 3, joined: 2, already_owned: 1, invalid: 1, batch_id: "batch_9" };
+      return { ok: true, mode: "v2", processed_count: 1, submitted: 3, joined: 2, already_owned: 1, invalid: 1, batch_id: "batch_9" };
     }
     return standardReply(snap, [eligibleStatus("id-1", "work:a")])(message);
   });

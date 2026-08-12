@@ -4,8 +4,11 @@ package triage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -572,5 +575,388 @@ func TestStatsFallsBackToUpdatedAtWhenReadyEventIsMissing(t *testing.T) {
 	}
 	if got, want := stats.Series[6], (StatsBucket{PeriodStart: time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC), Acquired: 1}); !got.PeriodStart.Equal(want.PeriodStart) || got.Acquired != want.Acquired {
 		t.Fatalf("series[6] = %+v, want %+v (falls back to updated_at)", got, want)
+	}
+}
+func createProjectionAction(t *testing.T, jobs *job.Store, requestID, kind, detail string, access job.AccessClassification) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, requestID, work.Work{DOI: "10.1000/" + requestID, Title: requestID}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := job.StateAwaitingHuman
+	if kind == "verify_identity" {
+		state = job.StateNeedsReview
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET state = ? WHERE id = ?`, state, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, kind, detail, access); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func createGate(t *testing.T, jobs *job.Store, id, scope, owner string, dependent []string) {
+	t.Helper()
+	members := append([]string{owner}, dependent...)
+	if err := jobs.UpsertHumanGateObservation(context.Background(), job.HumanGateObservation{
+		ID: id, GateType: job.HumanGateLogin,
+		ScopeClass: string(job.HumanGateScopeAuthenticationClaim), ScopeKey: scope,
+		ObservationRevision: 1, Status: job.HumanGateOpen, DetailJSON: `{}`,
+		DependentJobIDs: dependent, ClaimMemberJobIDs: members,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func familyByJob(snapshot Snapshot) map[string]*FamilyAssignment {
+	out := make(map[string]*FamilyAssignment)
+	for _, item := range snapshot.Items {
+		if item.HumanAction != nil {
+			out[item.HumanAction.JobID] = item.Family
+		}
+	}
+	return out
+}
+
+func TestFamilyProjectionRunIdentityContiguityAndKey(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	for i := 0; i < 39; i++ {
+		createProjectionAction(t, jobs, fmt.Sprintf("family-39-%02d", i), "manual_download", "download it", job.Access(false, "landing_page"))
+	}
+	first, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 5, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Items) != 5 || !first.HasMore {
+		t.Fatalf("first page = items %d, has_more %v", len(first.Items), first.HasMore)
+	}
+	if first.Counts.FamilyBreakdownComplete == nil || !*first.Counts.FamilyBreakdownComplete || len(first.Counts.FamilyRuns) != 1 {
+		t.Fatalf("family breakdown = complete %v runs %d", first.Counts.FamilyBreakdownComplete, len(first.Counts.FamilyRuns))
+	}
+	run := first.Counts.FamilyRuns[0]
+	if run.Count != 39 || run.FirstRank != first.Items[0].Rank || run.RunKey == "" {
+		t.Fatalf("run = %+v, first item = %+v", run, first.Items[0])
+	}
+	wantInput := []any{5, first.Items[0].ID, KindHumanAction, run.RouteClass, run.ActionKind, run.NextActor, run.GuidanceVariant, run.OperationVariant}
+	raw, err := json.Marshal(wantInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	wantKey := "fr1_" + hex.EncodeToString(sum[:])[:32]
+	if run.RunKey != wantKey {
+		t.Fatalf("run key = %q, want independently derived %q", run.RunKey, wantKey)
+	}
+	for _, item := range first.Items {
+		if item.Family == nil || item.Family.RunKey != run.RunKey ||
+			item.Family.NextActor != run.NextActor ||
+			item.Family.GuidanceVariant != run.GuidanceVariant ||
+			item.Family.OperationVariant != run.OperationVariant {
+			t.Fatalf("row %s family = %+v, want quartet from run %+v", item.ID, item.Family, run)
+		}
+	}
+	again, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 5, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Counts.FamilyRuns[0].RunKey != run.RunKey {
+		t.Fatalf("unchanged projection changed key: %q then %q", run.RunKey, again.Counts.FamilyRuns[0].RunKey)
+	}
+
+	changedService, _, changedJobs := triageTestService(t)
+	seed := createProjectionAction(t, changedJobs, "changed-seed", "manual_download", "closed", job.Access(false, "landing_page"))
+	if _, err := changedJobs.S.DB().ExecContext(context.Background(), `UPDATE human_actions SET status = 'resolved' WHERE job_id = ?`, seed); err != nil {
+		t.Fatal(err)
+	}
+	createProjectionAction(t, changedJobs, "changed-first", "manual_download", "download it", job.Access(false, "landing_page"))
+	createProjectionAction(t, changedJobs, "changed-second", "manual_download", "download it", job.Access(false, "landing_page"))
+	changed, err := changedService.Snapshot(context.Background(), SnapshotRequest{Limit: 5, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Counts.FamilyRuns[0].RunKey == run.RunKey {
+		t.Fatalf("changing first member did not change key: %q", run.RunKey)
+	}
+
+	splitService, _, splitJobs := triageTestService(t)
+	for i := 0; i < 20; i++ {
+		createProjectionAction(t, splitJobs, fmt.Sprintf("split-a-%02d", i), "manual_download", "download it", job.Access(false, "landing_page"))
+	}
+	createProjectionAction(t, splitJobs, "split-exception", "verify_identity", "inspect", job.Access(false, ""))
+	for i := 0; i < 19; i++ {
+		createProjectionAction(t, splitJobs, fmt.Sprintf("split-b-%02d", i), "manual_download", "download it", job.Access(false, "landing_page"))
+	}
+	split, err := splitService.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(split.Counts.FamilyRuns) != 3 {
+		t.Fatalf("split runs = %+v, want 3 runs", split.Counts.FamilyRuns)
+	}
+	if split.Counts.FamilyRuns[0].Count != 20 || split.Counts.FamilyRuns[1].Count != 1 || split.Counts.FamilyRuns[2].Count != 19 {
+		t.Fatalf("split run counts = %+v", split.Counts.FamilyRuns)
+	}
+	for i := 1; i < len(split.Counts.FamilyRuns); i++ {
+		prev, current := split.Counts.FamilyRuns[i-1], split.Counts.FamilyRuns[i]
+		if prev.FirstRank > current.FirstRank || (prev.FirstRank == current.FirstRank && prev.RunKey >= current.RunKey) {
+			t.Fatalf("family runs not ordered by (first_rank, run_key): %+v", split.Counts.FamilyRuns)
+		}
+	}
+	seenKeys := map[string]bool{}
+	for i, item := range split.Items {
+		if item.Rank != humanActionRankBase+i {
+			t.Fatalf("rank[%d] = %d, want %d", i, item.Rank, humanActionRankBase+i)
+		}
+		if item.Family == nil {
+			t.Fatalf("row %s missing family quartet", item.ID)
+		}
+		seenKeys[item.Family.RunKey] = true
+		if i > 0 && item.Family.RunKey == split.Items[i-1].Family.RunKey {
+			continue
+		}
+	}
+	if len(seenKeys) != 3 {
+		t.Fatalf("participating run keys = %v, want 3 distinct keys", seenKeys)
+	}
+}
+func TestFamilyGuidanceAndOperationVariantsUseDurableFacts(t *testing.T) {
+	type want struct {
+		kind, guidance, operation string
+		access                    job.AccessClassification
+	}
+	cases := []want{
+		{kind: "manual_download", guidance: "manual_download", operation: "open_and_dismiss", access: job.Access(false, "landing_page")},
+		{kind: "openurl_handoff", guidance: "institution_sign_in", operation: "open_and_dismiss", access: job.Access(true, "paywall")},
+		{kind: "openurl_handoff", guidance: "open_page", operation: "open_and_dismiss", access: job.Access(false, "landing_page")},
+		{kind: "verify_identity", guidance: "verify_identity", operation: "accept_reject_open", access: job.Access(false, "")},
+		{kind: "document_delivery", guidance: "document_delivery", operation: "delivery_reconcile", access: job.Access(false, "")},
+		{kind: "downloads_access_required", guidance: "downloads_access", operation: "open_and_dismiss", access: job.Access(false, "landing_page")},
+		{kind: "terms_acceptance_required", guidance: "terms_acceptance", operation: "open_and_dismiss", access: job.Access(false, "landing_page")},
+		{kind: "openurl_available", guidance: "open_page", operation: "open_and_dismiss", access: job.Access(false, "landing_page")},
+	}
+	service, _, jobs := triageTestService(t)
+	for i, tc := range cases {
+		createProjectionAction(t, jobs, fmt.Sprintf("mapping-%02d", i), tc.kind, "no adapter appears only in this detail", tc.access)
+	}
+	snapshot, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, tc := range cases {
+		var got *FamilyAssignment
+		for j := range snapshot.Items {
+			item := &snapshot.Items[j]
+			if item.HumanAction == nil || item.HumanAction.ActionKind != tc.kind || item.Family == nil {
+				continue
+			}
+			if tc.kind == "openurl_handoff" {
+				auth := item.HumanAction.RequiresAuth != nil && *item.HumanAction.RequiresAuth
+				if auth != (i == 1) {
+					continue
+				}
+			}
+			got = item.Family
+			break
+		}
+		if got == nil {
+			t.Fatalf("case %d kind %q missing family assignment; items = %+v", i, tc.kind, snapshot.Items)
+		}
+		if got.GuidanceVariant != tc.guidance || got.OperationVariant != tc.operation {
+			t.Errorf("%s case %d family = guidance %q operation %q, want %q/%q", tc.kind, i, got.GuidanceVariant, got.OperationVariant, tc.guidance, tc.operation)
+		}
+		if got.NextActor != "researcher" {
+			t.Errorf("%s case %d next actor = %q, want researcher", tc.kind, i, got.NextActor)
+		}
+	}
+	diagnosisService, _, diagnosisJobs := triageTestService(t)
+	diagnosisJob := createProjectionAction(t, diagnosisJobs, "mapping-diagnosis", "manual_download", "please download the PDF", job.Access(false, "landing_page"))
+	if err := diagnosisJobs.RecordEvent(context.Background(), diagnosisJob, "browser.provider_outcome", map[string]any{"diagnosis": job.DiagnosisReasonProviderAdapterMissing}); err != nil {
+		t.Fatal(err)
+	}
+	diagnosed, err := diagnosisService.Snapshot(context.Background(), SnapshotRequest{Limit: 10, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnosed.Items) != 1 || diagnosed.Items[0].Family == nil || diagnosed.Items[0].Family.GuidanceVariant != "manual_download_adapter_missing" {
+		t.Fatalf("durable adapter diagnosis projection = %+v", diagnosed.Items)
+	}
+
+	for _, item := range snapshot.Items {
+		if item.HumanAction != nil && item.HumanAction.ActionKind == "manual_download" && item.Family.GuidanceVariant == "manual_download_adapter_missing" {
+			t.Fatal("manual-download detail text was incorrectly treated as a durable adapter diagnosis")
+		}
+	}
+
+	workingService, _, workingJobs := triageTestService(t)
+	workingHandoff := createProjectionAction(t, workingJobs, "working-handoff", "openurl_handoff", "handoff", job.Access(false, ""))
+	owner := createProjectionAction(t, workingJobs, "working-owner", "openurl_handoff", "handoff", job.Access(true, "paywall"))
+	sibling := createProjectionAction(t, workingJobs, "working-sibling", "document_delivery", "fulfilled delivery continuation", job.Access(false, ""))
+	createGate(t, workingJobs, "working-gate", "working-claim", owner, []string{sibling})
+	working, err := workingService.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byJob := familyByJob(working)
+	if byJob[workingHandoff] != nil {
+		t.Fatalf("unknown-auth handoff assignment = %+v, want standalone", byJob[workingHandoff])
+	}
+	if byJob[owner] == nil || byJob[sibling] == nil {
+		t.Fatalf("working assignments = %+v", byJob)
+	}
+	if byJob[sibling].GuidanceVariant != "papio_continuing" || byJob[sibling].OperationVariant != "none" || byJob[sibling].NextActor != "papio" {
+		t.Fatalf("fulfilled-delivery continuation = %+v", byJob[sibling])
+	}
+}
+
+func TestUnmappedFamilyStatesStayStandaloneAndInvalidateBreakdown(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	createProjectionAction(t, jobs, "mapped-before-unknown", "manual_download", "normal", job.Access(false, "landing_page"))
+	unknown := createProjectionAction(t, jobs, "unmapped-action", "new_route_not_mapped", "normal", job.Access(false, "landing_page"))
+	createProjectionAction(t, jobs, "mapped-after-unknown", "manual_download", "normal", job.Access(false, "landing_page"))
+	snapshot, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unknownItem *Item
+	for i := range snapshot.Items {
+		if snapshot.Items[i].HumanAction != nil && snapshot.Items[i].HumanAction.JobID == unknown {
+			unknownItem = &snapshot.Items[i]
+		}
+	}
+	if unknownItem == nil || unknownItem.Family != nil {
+		t.Fatalf("unmapped item family = %+v, want nil", unknownItem)
+	}
+	if snapshot.Counts.FamilyBreakdownComplete == nil || *snapshot.Counts.FamilyBreakdownComplete || snapshot.Counts.FamilyRuns != nil {
+		t.Fatalf("unmapped breakdown = complete %v runs %+v, want false and absent", snapshot.Counts.FamilyBreakdownComplete, snapshot.Counts.FamilyRuns)
+	}
+}
+
+func TestTurnsIncludePdfGrabsAndRespectBounds(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	createProjectionAction(t, jobs, "turn-pdf-action", "manual_download", "normal", job.Access(false, "landing_page"))
+	service.RegisterSource(staticSource{items: []Item{{
+		Kind: KindPdfGrab, ID: PdfGrabIDPrefix + "turn-grab", Title: "PDF",
+		Ops:     []string{"provide_identifier", "dismiss"},
+		PdfGrab: &PdfGrab{GrabID: "turn-grab", State: "parked_no_identifier"},
+	}}})
+	snapshot, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Counts.TurnsRequired == nil || *snapshot.Counts.TurnsRequired != 2 || snapshot.Counts.TurnsWorking == nil || *snapshot.Counts.TurnsWorking != 0 {
+		t.Fatalf("turn counts = required %v working %v", snapshot.Counts.TurnsRequired, snapshot.Counts.TurnsWorking)
+	}
+	if snapshot.Counts.RequiredTurnsComplete == nil || !*snapshot.Counts.RequiredTurnsComplete || len(snapshot.Counts.RequiredTurns) != 2 {
+		t.Fatalf("required turns = complete %v entries %d", snapshot.Counts.RequiredTurnsComplete, len(snapshot.Counts.RequiredTurns))
+	}
+	for _, turn := range snapshot.Counts.RequiredTurns {
+		switch turn.ItemKind {
+		case KindPdfGrab:
+			if turn.GrabID == "" || turn.ActionID != 0 || turn.JobID != "" || turn.GateClaimID != "" || turn.DependentJobs != 0 {
+				t.Fatalf("pdf turn fields = %+v", turn)
+			}
+		case KindHumanAction:
+			if turn.ActionID == 0 || turn.JobID == "" || turn.GrabID != "" {
+				t.Fatalf("action turn fields = %+v", turn)
+			}
+		default:
+			t.Fatalf("unknown required turn kind = %+v", turn)
+		}
+	}
+
+	tooManyService, _, tooManyJobs := triageTestService(t)
+	for i := range 1025 {
+		createProjectionAction(t, tooManyJobs, fmt.Sprintf("turn-limit-%04d", i), "manual_download", "normal", job.Access(false, "landing_page"))
+	}
+	tooMany, err := tooManyService.Counts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tooMany.RequiredTurnsComplete == nil || *tooMany.RequiredTurnsComplete || tooMany.RequiredTurns != nil {
+		t.Fatalf("over-limit required turns = complete %v entries nil? %v", tooMany.RequiredTurnsComplete, tooMany.RequiredTurns == nil)
+	}
+
+	manyRunsService, _, manyRunsJobs := triageTestService(t)
+	for i := range 129 {
+		kind := "manual_download"
+		if i%2 == 1 {
+			kind = "verify_identity"
+		}
+		createProjectionAction(t, manyRunsJobs, fmt.Sprintf("run-limit-%04d", i), kind, "normal", job.Access(false, "landing_page"))
+	}
+	manyRuns, err := manyRunsService.Counts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manyRuns.FamilyBreakdownComplete == nil || *manyRuns.FamilyBreakdownComplete || manyRuns.FamilyRuns != nil {
+		t.Fatalf("over-limit family runs = complete %v runs %+v", manyRuns.FamilyBreakdownComplete, manyRuns.FamilyRuns)
+	}
+}
+func TestTypedGateAggregationAndNoGateFallback(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	owner := createProjectionAction(t, jobs, "gate-owner", "openurl_handoff", "sign in", job.Access(true, "paywall"))
+	siblingOne := createProjectionAction(t, jobs, "gate-sibling-one", "manual_download", "download", job.Access(false, "landing_page"))
+	siblingTwo := createProjectionAction(t, jobs, "gate-sibling-two", "document_delivery", "continue", job.Access(false, ""))
+	siblingThree := createProjectionAction(t, jobs, "gate-sibling-three", "terms_acceptance_required", "accept", job.Access(false, "landing_page"))
+	createGate(t, jobs, "gate-one", "claim-one", owner, []string{siblingOne, siblingTwo, siblingThree})
+	snapshot, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byJob := familyByJob(snapshot)
+	if snapshot.Counts.TurnsRequired == nil || *snapshot.Counts.TurnsRequired != 1 ||
+		snapshot.Counts.TurnsWorking == nil || *snapshot.Counts.TurnsWorking != 3 {
+		t.Fatalf("one gate turn counts = required %v working %v", snapshot.Counts.TurnsRequired, snapshot.Counts.TurnsWorking)
+	}
+	if len(snapshot.Counts.RequiredTurns) != 1 || snapshot.Counts.RequiredTurns[0].GateClaimID != "gate-one" || snapshot.Counts.RequiredTurns[0].DependentJobs != 3 {
+		t.Fatalf("one gate required turn = %+v", snapshot.Counts.RequiredTurns)
+	}
+	if byJob[owner] == nil || byJob[owner].GateClaimID != "gate-one" || byJob[owner].DependentJobs != 3 || byJob[owner].NextActor != "researcher" {
+		t.Fatalf("gate owner assignment = %+v", byJob[owner])
+	}
+	for _, id := range []string{siblingOne, siblingTwo, siblingThree} {
+		if byJob[id] == nil || byJob[id].NextActor != "papio" || byJob[id].GuidanceVariant != "papio_continuing" || byJob[id].OperationVariant != "none" {
+			t.Fatalf("gate sibling %s assignment = %+v", id, byJob[id])
+		}
+	}
+
+	twoService, _, twoJobs := triageTestService(t)
+	first := createProjectionAction(t, twoJobs, "two-gates-first", "openurl_handoff", "sign in", job.Access(true, "paywall"))
+	second := createProjectionAction(t, twoJobs, "two-gates-second", "openurl_handoff", "sign in", job.Access(true, "paywall"))
+	createGate(t, twoJobs, "gate-a", "claim-a", first, nil)
+	createGate(t, twoJobs, "gate-b", "claim-b", second, nil)
+	two, err := twoService.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if two.Counts.TurnsRequired == nil || *two.Counts.TurnsRequired != 2 || len(two.Counts.RequiredTurns) != 2 {
+		t.Fatalf("two independent gate counts = %+v required %+v", two.Counts.TurnsRequired, two.Counts.RequiredTurns)
+	}
+	byTwo := familyByJob(two)
+	if byTwo[first].GateClaimID == byTwo[second].GateClaimID || byTwo[first].GateClaimID == "" || byTwo[second].GateClaimID == "" {
+		t.Fatalf("independent gate claims collapsed: first %+v second %+v", byTwo[first], byTwo[second])
+	}
+
+	noGateService, _, noGateJobs := triageTestService(t)
+	noGateOne := createProjectionAction(t, noGateJobs, "no-gate-one", "manual_download", "download", job.Access(false, "landing_page"))
+	noGateTwo := createProjectionAction(t, noGateJobs, "no-gate-two", "verify_identity", "inspect", job.Access(false, ""))
+	noGateAdvisory := createProjectionAction(t, noGateJobs, "no-gate-advisory", "openurl_available", "advisory", job.Access(false, "landing_page"))
+	noGate, err := noGateService.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noGate.Counts.TurnsRequired == nil || *noGate.Counts.TurnsRequired != 3 || noGate.Counts.TurnsWorking == nil || *noGate.Counts.TurnsWorking != 0 {
+		t.Fatalf("no-gate counts = required %v working %v", noGate.Counts.TurnsRequired, noGate.Counts.TurnsWorking)
+	}
+	noGateByJob := familyByJob(noGate)
+	for _, id := range []string{noGateOne, noGateTwo, noGateAdvisory} {
+		if noGateByJob[id] == nil || noGateByJob[id].GateClaimID != "" || noGateByJob[id].NextActor != "researcher" {
+			t.Fatalf("no-gate assignment = %+v", noGateByJob[id])
+		}
+		if noGateByJob[id].NextActor == "reference" {
+			t.Fatalf("advisory inference produced reference actor for %s", id)
+		}
 	}
 }

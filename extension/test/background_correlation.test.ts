@@ -16,7 +16,7 @@ type PrivateBridge = {
 test("requestNative rejects a reply type that inbound routing cannot settle", async () => {
   // Execute the runtime guard instead of scanning source syntax: a variable or
   // helper wrapper that evaded a regex must still fail before it can time out.
-  const bridge = new Bridge({} as BridgeDeps);
+  const bridge = new Bridge({ randomUUID: () => "worker-epoch-test" } as BridgeDeps);
   const expectedType: BrowserMessageType = "hello_ack";
   const requestNative = (bridge as unknown as PrivateBridge).requestNative.bind(bridge);
 

@@ -3,11 +3,19 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
 )
+
+// RecordSystemEvent appends a jobless event to the durable activity stream.
+// System events deliberately use the same redacted detail contract as regular
+// job events while keeping job_id NULL so they cannot be mistaken for work.
+func (s *Store) RecordSystemEvent(ctx context.Context, kind string, detail map[string]any) error {
+	return s.AppendEvent(ctx, "", kind, detail)
+}
 
 // ActivityEntry is one durable event joined with the current job read model.
 //

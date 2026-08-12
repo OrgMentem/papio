@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"papio/internal/hook"
 	"papio/internal/illiad"
 	"papio/internal/job"
+	"papio/internal/notify"
 	"papio/internal/pdf"
 	"papio/internal/protocol"
 	"papio/internal/redact"
@@ -93,13 +95,7 @@ type classifiedAutoImportError interface {
 	ErrorHTTPStatus() int
 }
 
-// NotificationSink receives best-effort daemon UX notifications after durable
-// job state transitions.
-type NotificationSink interface {
-	HumanAction(context.Context)
-	HumanActionReminder(context.Context, string)
-	Imported(context.Context)
-}
+// Notification delivery is best effort and never changes domain state.
 
 // ResolverEntry binds an adapter to its policy and estimated metadata-call cost.
 type ResolverEntry struct {
@@ -123,7 +119,7 @@ type Service struct {
 	Fetch             FetchFunc
 	Validate          ValidateFunc
 	AutoImporter      AutoImporter
-	Notifier          NotificationSink
+	Notifier          notify.Sink
 	// Delivery is ADR-0017's document-delivery/ILL service (Decisions 1,
 	// 3A-3C, 4). Nil disables the feature entirely: exhaustedCandidates
 	// falls back to its pre-ADR-0017 OpenURL/no_entitlement behavior
@@ -1548,15 +1544,62 @@ func (s *Service) park(ctx context.Context, jobID, from, to string, detail map[s
 	if err := s.Jobs.Transition(ctx, jobID, from, to, detail, opts...); err != nil {
 		return err
 	}
-	if s.Notifier != nil {
-		s.Notifier.HumanAction(context.WithoutCancel(ctx))
+	if s.Notifier == nil || (to != job.StateAwaitingHuman && to != job.StateNeedsReview) {
+		return nil
+	}
+	// The transition and action row are durable before routing. A routing
+	// failure is deliberately swallowed so acquisition remains authoritative.
+	actions, err := s.Jobs.ListOpenHumanActionsForJobs(context.WithoutCancel(ctx), []string{jobID})
+	if err != nil {
+		log.Printf("papio: notification action lookup for job %s: %v", jobID, err)
+		return nil
+	}
+	action := job.HumanAction{JobID: jobID}
+	if len(actions) > 0 {
+		action = actions[len(actions)-1]
+	}
+	happened := s.Now().UTC()
+	if created, parseErr := time.Parse(time.RFC3339Nano, action.CreatedAt); parseErr == nil {
+		happened = created.UTC()
+	}
+	window := 5 * time.Minute
+	if policy, policyErr := notify.ResolvePolicy(s.Config.Notify); policyErr == nil {
+		if configured := policy.For(notify.CategoryDecisionOpened).Window; configured > 0 {
+			window = configured
+		}
+	}
+	windowStart := happened.Truncate(window)
+	aggregate := fmt.Sprintf("decision:%s", windowStart.Format(time.RFC3339Nano))
+	if action.BlockedBy != "" {
+		// One typed gate/claim is one effective turn, regardless of dependent
+		// siblings. Its durable identity remains stable across the coalescing
+		// window so it cannot create duplicate notices.
+		aggregate = "gate:" + action.BlockedBy
+	}
+	event := notify.Event{
+		Message: "papio has work waiting for you — open the papio inbox",
+		Count:   1,
+	}
+	if err := s.Jobs.RecordEvent(context.WithoutCancel(ctx), jobID, "notification.intent", map[string]any{
+		"event_kind": "action.opened", "category": string(notify.CategoryDecisionOpened),
+		"phase": string(notify.PhaseOpened), "aggregate_key": aggregate,
+		"window_start": windowStart.Format(time.RFC3339Nano),
+	}); err != nil {
+		log.Printf("papio: recording action notification for job %s: %v", jobID, err)
+		return nil
+	}
+	intent := notify.Intent{
+		EventKind: "action.opened", Category: notify.CategoryDecisionOpened,
+		AggregateKey: aggregate, Phase: notify.PhaseOpened,
+		WindowStart: windowStart, JobID: jobID,
+		HappenedAt: happened, Message: event.Message, Detail: event,
+	}
+	if err := s.Notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
+		log.Printf("papio: routing action notification for job %s: %v", jobID, err)
 	}
 	return nil
 }
 
-// maxRetryAttempts bounds how many times a job may cycle through retry_wait for
-// temporary resolver/fetch failures. A permanently "temporary" source would
-// otherwise retry forever; past the cap the job escalates to the ordinary
 // exhaustion boundary (institutional handoff, or unavailable) instead of
 // re-scheduling another attempt.
 const maxRetryAttempts = 8
@@ -1801,11 +1844,15 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 			decision.Blocker = job.InstitutionCutoverBlockerNoLegalRoute
 		}
 	}
-	return s.Jobs.Transition(ctx, row.ID, from, job.StateUnavailable,
+	err := s.Jobs.Transition(ctx, row.ID, from, job.StateUnavailable,
 		job.WithCutoverDecision(
 			map[string]any{"reason": reason},
 			decision,
 		), job.WithTerminalReason(terminal))
+	if err == nil {
+		s.recordStandaloneOutcome(ctx, row)
+	}
+	return err
 }
 
 // DeliveryRouteResult reports what one document-delivery route evaluation
@@ -2700,9 +2747,45 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		acceptDetail, job.WithCandidate(stored.ID), job.WithArtifact(result.SHA256)); err != nil {
 		return false, false, err
 	}
+	s.recordStandaloneOutcome(ctx, row)
 	s.autoImportReady(ctx, row)
 	s.runReadyHook(ctx, row, result.SHA256)
 	return true, false, nil
+}
+
+// recordStandaloneOutcome emits a terminal request milestone only when durable
+// cohort attribution proves the job is not a member of a browser/CLI batch.
+func (s *Service) recordStandaloneOutcome(ctx context.Context, row *job.Row) {
+	if s.Notifier == nil || row == nil {
+		return
+	}
+	if current, err := s.Jobs.Get(ctx, row.ID); err == nil {
+		row = current
+	}
+	var members int
+	if err := s.Jobs.S.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM acquisition_batch_members WHERE job_id=?`, row.ID).Scan(&members); err != nil || members != 0 {
+		return
+	}
+	happened := s.Now().UTC()
+	event := notify.Event{Kind: "request.outcome", Count: 1}
+	switch row.State {
+	case job.StateReady:
+		event.Message = "Request ready — open the papio inbox"
+	case job.StateFailed, job.StateUnavailable, job.StateCancelled:
+		event.Message = "Request failed — open the papio inbox"
+	default:
+		return
+	}
+	intent := notify.Intent{
+		EventKind: "request.outcome", Category: notify.CategoryRequestOutcome,
+		AggregateKey: "job:" + row.ID, Phase: notify.PhaseTerminal,
+		WindowStart: happened, HappenedAt: happened, JobID: row.ID,
+		Message: event.Message, Detail: event,
+	}
+	if err := s.Notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
+		log.Printf("papio: routing request outcome for job %s: %v", row.ID, err)
+	}
 }
 
 func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
@@ -2739,9 +2822,6 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 	}
 	detail["status"] = status
 	_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
-	if status == "applied" && s.Notifier != nil {
-		s.Notifier.Imported(eventCtx)
-	}
 }
 
 // runReadyHook fires the user's on_ready hook exactly once per ready
