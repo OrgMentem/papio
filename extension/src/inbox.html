@@ -579,13 +579,18 @@
       /* Attention is expressed by the row's instruction and controls. It is
          turn-taking metadata, not a severity or visual decoration axis. */
 
-      .triage-group > .triage-item:first-of-type {
+      /* Card corners follow the family blocks the daemon emits, not tag position.
+         `:first-of-type`/`:last-of-type` are scoped to element type, so once
+         family headings interleave with rows they matched only the section's
+         first and last <article> and every interior boundary rendered square. */
+
+      .triage-group > .triage-item[data-card-start="true"] {
         border-top: 1px solid var(--color-border);
         border-top-left-radius: var(--radius-card);
         border-top-right-radius: var(--radius-card);
       }
 
-      .triage-group > .triage-item:last-of-type {
+      .triage-group > .triage-item[data-card-end="true"] {
         border-bottom: 1px solid var(--color-border);
         border-bottom-left-radius: var(--radius-card);
         border-bottom-right-radius: var(--radius-card);

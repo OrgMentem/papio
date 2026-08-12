@@ -485,6 +485,20 @@ test("hoists one byte-identical family instruction above its ranked rows", async
   expect(page.document.querySelectorAll(".family-heading")).toHaveLength(1);
   expect(page.document.querySelectorAll(".family-guidance")).toHaveLength(1);
   expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(3);
+
+  // Card corners must follow the family block, not tag position. Before this was
+  // fixed the CSS keyed on `:first-of-type`/`:last-of-type`, which are scoped to
+  // element type, so with headings interleaved only the section's first and last
+  // <article> were marked and every interior boundary rendered square.
+  const rows = Array.from(page.document.querySelectorAll<HTMLElement>("[data-triage-item-id]"));
+  expect(rows.map((row) => row.dataset.cardStart ?? "")).toEqual(["true", "", ""]);
+  expect(rows.map((row) => row.dataset.cardEnd ?? "")).toEqual(["", "", "true"]);
+  for (const row of rows) {
+    const startsCard = row.previousElementSibling?.classList.contains("triage-item") !== true;
+    const endsCard = row.nextElementSibling?.classList.contains("triage-item") !== true;
+    expect(row.dataset.cardStart === "true").toBe(startsCard);
+    expect(row.dataset.cardEnd === "true").toBe(endsCard);
+  }
 });
 
 test("keyboard o sends an OA browser handoff through the broker", async () => {

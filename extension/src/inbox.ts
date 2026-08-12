@@ -1458,8 +1458,21 @@ function renderGroup(kind: TriageSnapshotItem["kind"], heading: string | null, i
     }
     section.append(renderItem(item, family));
   }
+
+  // A card starts and ends where a family heading interrupts the stack, not at
+  // the first and last row of the section. `:first-of-type`/`:last-of-type` are
+  // tag-scoped, so with headings interleaved they matched only the section's
+  // first and last <article>, leaving every interior card boundary square.
+  for (const row of Array.from(section.children)) {
+    if (!row.classList.contains("triage-item")) continue;
+    const startsCard = row.previousElementSibling?.classList.contains("triage-item") !== true;
+    const endsCard = row.nextElementSibling?.classList.contains("triage-item") !== true;
+    if (startsCard) (row as HTMLElement).dataset.cardStart = "true";
+    if (endsCard) (row as HTMLElement).dataset.cardEnd = "true";
+  }
   return section;
 }
+
 
 function renderPulse(): void {
   if (elements === null) return;
