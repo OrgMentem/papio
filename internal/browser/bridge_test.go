@@ -7793,6 +7793,104 @@ func TestInstitutionalRouteProfileFencePrecedesURLDerivation(t *testing.T) {
 		t.Fatalf("drifted claim=%+v, want bound ordinal 0", got)
 	}
 }
+
+// Delivered bytes are bound to the browser effect authorized to produce them.
+// The first adoption wins the attempt and settles its claim; a late producer
+// delivering different bytes for the same attempt is refused rather than
+// overwriting the artifact that already landed.
+func TestDeliveredArtifactIsFencedToTheWinningMaterialization(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "materialization-artifact-winner", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-winner", AuthenticationClaimID: "auth-winner",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	profile := profiles[0]
+	candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-artifact-winner", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety", SafetyDomainID: "domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 3); err != nil {
+		t.Fatal(err)
+	}
+	ordinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, int64(b.epoch), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.AcknowledgeMaterializationNavigation(ctx, claim.ID, claim.BindingID, int64(b.epoch), ordinal, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(cfg.EffectiveAdoptionRoot(), jobID, "paper.pdf")
+	writeFixturePDF(t, path)
+	runSync(t, b, inFrame(t, protocol.MsgDownloadComplete, jobID,
+		map[string]any{"download_id": 1, "filename": "paper.pdf", "size_bytes": 533}))
+
+	winner, ok, err := jobs.ArtifactWinner(ctx, jobID, 1)
+	if err != nil || !ok {
+		t.Fatalf("artifact winner after adoption ok=%v err=%v", ok, err)
+	}
+	if winner.CandidateID != candidate.ID || winner.BrowserHolderGeneration != int64(b.epoch) {
+		t.Fatalf("winner = %+v, want the navigated candidate and holder", winner)
+	}
+	settled, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settled.Phase != "settled" {
+		t.Fatalf("claim phase = %q, want settled", settled.Phase)
+	}
+
+	// A late producer delivers different bytes for the same attempt.
+	late := append([]byte("%PDF-1.4\nlate producer\n"), make([]byte, 512)...)
+	late = append(late, []byte("\n%%EOF")...)
+	if err := os.WriteFile(path, late, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, inFrame(t, protocol.MsgDownloadComplete, jobID,
+		map[string]any{"download_id": 2, "filename": "paper.pdf", "size_bytes": 534}))
+	after, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	superseded := 0
+	for _, event := range after {
+		if event["kind"] == "browser.artifact_superseded" {
+			superseded++
+		}
+	}
+	if superseded != 1 {
+		t.Fatalf("superseded events = %d (before=%d after=%d), want exactly one refusal",
+			superseded, len(before), len(after))
+	}
+	replaced, ok, err := jobs.ArtifactWinner(ctx, jobID, 1)
+	if err != nil || !ok || replaced.SHA256 != winner.SHA256 {
+		t.Fatalf("winner after late delivery = %+v ok=%v err=%v, want the original artifact", replaced, ok, err)
+	}
+}
 func TestInstitutionalReconcileAcceptsTabZero(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
@@ -8707,6 +8805,58 @@ func TestBridgeProviderOutcomeProjectsTypedGatesAndSignedOutEvidence(t *testing.
 	}
 	if verdict != string(job.ProfileEvidenceSignedOut) {
 		t.Fatalf("provider evidence verdict = %q, want signed_out", verdict)
+	}
+}
+
+// A successful login closes the gate for that episode only. When the session
+// later expires, the next decisive signed-out observation must raise a live
+// attention surface again; a resolved gate that could never reopen would park
+// every sibling with no way for anyone to authenticate.
+func TestBridgeResolvedLoginGateReopensOnNextAuthenticationCycle(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, cfg, _ := newBridge(t)
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+	}
+	b.cfg = cfg
+	b.now = func() time.Time { return time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC) }
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "bridge-gate-reopen", handoffWork(), "alpha")
+	liveLoginGates := func() int {
+		t.Helper()
+		attention, err := jobs.CurrentHumanAttention(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		open := 0
+		for _, gate := range attention.Gates {
+			if gate.GateType == job.HumanGateLogin {
+				open++
+			}
+		}
+		return open
+	}
+	if err := b.outcome(ctx, jobID, "cycle-one", &protocol.ProviderOutcomePayload{Outcome: "human_auth_required"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := liveLoginGates(); got != 1 {
+		t.Fatalf("login gates after first signed-out = %d, want 1", got)
+	}
+	elapsed := int64(1200)
+	if err := b.recordAuth(ctx, &protocol.BrowserMessage{
+		Type: protocol.MsgAuthReturned, MsgID: "auth-cycle-one", JobID: jobID,
+		Payload: &protocol.AuthPayload{ElapsedMS: &elapsed},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := liveLoginGates(); got != 0 {
+		t.Fatalf("login gates after authentication = %d, want 0", got)
+	}
+	if err := b.outcome(ctx, jobID, "cycle-two", &protocol.ProviderOutcomePayload{Outcome: "human_auth_required"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := liveLoginGates(); got != 1 {
+		t.Fatalf("login gates after session expiry = %d, want 1", got)
 	}
 }
 

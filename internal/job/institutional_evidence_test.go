@@ -423,3 +423,39 @@ func TestAuthenticationEntryLeaseSignedOutDominatesLaterWarm(t *testing.T) {
 		t.Fatalf("replacement lease = %+v, err=%v", replacement, err)
 	}
 }
+
+func TestProfileEvidenceRejectsSupersededRevisionAndTombstone(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	seedInstitutionProfile(t, js, "profile-revision-fence")
+	observation := func(id string, revision int64) ProfileEvidenceObservation {
+		return ProfileEvidenceObservation{
+			ObservationID: id, BrowserHolderGeneration: 4,
+			InstitutionProfileID: "profile-revision-fence", InstitutionProfileRevision: revision,
+			Verdict: ProfileEvidenceWarmVerified, Source: ProfileEvidenceProbe,
+			ProducerObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		}
+	}
+	if err := js.RecordProfileEvidence(ctx, observation("live-revision", 1)); err != nil {
+		t.Fatalf("live revision evidence: %v", err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE institution_profiles SET revision=2 WHERE id='profile-revision-fence'`); err != nil {
+		t.Fatal(err)
+	}
+	// A frame produced under revision 1 and delivered after the edit must not
+	// become revision-1 evidence again, and must never be promoted to 2.
+	if err := js.RecordProfileEvidence(ctx, observation("delayed-old-revision", 1)); !errors.Is(err, ErrProfileEvidenceStale) {
+		t.Fatalf("superseded revision evidence = %v, want stale", err)
+	}
+	if err := js.RecordProfileEvidence(ctx, observation("current-revision", 2)); err != nil {
+		t.Fatalf("current revision evidence: %v", err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE institution_profiles SET tombstoned_at='2026-01-02T00:00:00Z' WHERE id='profile-revision-fence'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.RecordProfileEvidence(ctx, observation("after-tombstone", 2)); !errors.Is(err, ErrProfileEvidenceStale) {
+		t.Fatalf("tombstoned profile evidence = %v, want stale", err)
+	}
+}

@@ -1790,13 +1790,20 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			context = browserDeliveryContext(&pending.Payload)
 		}
 		candidateID, err := b.adoptOutsideSessionLock(ctx, msg.JobID, p.Filename, context)
-		if err != nil {
+		switch {
+		case errors.Is(err, errArtifactSuperseded):
+			// Another materialization already won this attempt. Retrying would
+			// re-deliver bytes that must never be attached, so the pending
+			// download is dropped instead of deferred.
+			delete(b.pendingDownloads, key)
+			delete(b.deliveryContexts, key)
+		case err != nil:
 			// Environmental failure (file not there yet, Chrome rename race,
 			// user saved elsewhere) must not sever the bridge.
 			if evErr := b.recordAdoptionDeferred(ctx, msg.JobID, p.Filename, err); evErr != nil {
 				log.Printf("papio: recording deferred browser adoption: %v", evErr)
 			}
-		} else {
+		default:
 			pendingDownload.CandidateID = candidateID
 			b.pendingDownloads[key] = pendingDownload
 			if err := b.recordAdoptionConclusiveLatch(ctx, msg.JobID); err != nil {
@@ -3996,6 +4003,106 @@ func pageHostURL(host string) string {
 	return "https://" + host
 }
 
+// errArtifactSuperseded reports bytes that lost the insert-only artifact-winner
+// decision for the job attempt. The delivery is not a transport failure and not
+// a deferrable environmental failure: another materialization already produced
+// the artifact for this attempt, so these bytes must never be attached.
+var errArtifactSuperseded = errors.New("artifact winner already decided for this job attempt")
+
+// adoptionPath resolves the reported download strictly under the job's adoption
+// directory. The filename has already passed protocol validation (no path
+// separators); this adds IsLocal and a symlink-resolved prefix guard before
+// app-side confinement.
+func (b *Bridge) adoptionPath(jobID, filename string) (string, error) {
+	if !filepath.IsLocal(filename) {
+		return "", fmt.Errorf("adoption filename %q is not a local name", filename)
+	}
+	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("adoption root unavailable: %w", err)
+	}
+	full := filepath.Join(realRoot, filename)
+	rel, err := filepath.Rel(realRoot, full)
+	if err != nil || rel != filename || strings.Contains(rel, "..") {
+		return "", fmt.Errorf("adoption path escapes %s", realRoot)
+	}
+	return full, nil
+}
+
+func fileDigest(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+// reserveArtifactWinner binds arriving bytes to the browser effect that was
+// authorized to produce them. The winner is decided before anything is
+// attached, so a late or replaced holder cannot overwrite the artifact this
+// attempt already delivered — including after the winning claim settled, when
+// no live claim remains to consult. A job that never had an institutional
+// claim keeps the legacy delivery path untouched.
+func (b *Bridge) reserveArtifactWinner(ctx context.Context, jobID, filename string) (*job.MaterializationClaim, *job.BrowserCandidate, error) {
+	if b.jobs == nil || b.materializationGenerationUnavailable {
+		return nil, nil, nil
+	}
+	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		return nil, nil, err
+	}
+	decided, hasWinner, err := b.jobs.ArtifactWinner(ctx, jobID, attempt)
+	if err != nil {
+		return nil, nil, err
+	}
+	claim, candidate, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, int64(b.epoch))
+	if err != nil {
+		return nil, nil, err
+	}
+	if !hasWinner && (claim == nil || candidate == nil) {
+		return nil, nil, nil
+	}
+	full, err := b.adoptionPath(jobID, filename)
+	if err != nil {
+		return nil, nil, err
+	}
+	digest, err := fileDigest(full)
+	if err != nil {
+		return nil, nil, err
+	}
+	superseded := func() error {
+		if eventErr := b.jobs.RecordEvent(ctx, jobID, "browser.artifact_superseded", nil); eventErr != nil {
+			log.Printf("papio: recording superseded artifact: %v", eventErr)
+		}
+		return errArtifactSuperseded
+	}
+	if hasWinner {
+		// Replaying the artifact this attempt already committed is idempotent;
+		// different bytes are a late producer and must not be attached.
+		if decided.SHA256 != digest {
+			return nil, nil, superseded()
+		}
+		return claim, candidate, nil
+	}
+	_, won, err := b.jobs.ClaimArtifactWinner(ctx, job.ArtifactWinner{
+		JobID: jobID, JobAttemptRevision: attempt, CandidateID: candidate.ID,
+		BrowserHolderGeneration: int64(b.epoch), SHA256: digest,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if !won {
+		return nil, nil, superseded()
+	}
+	return claim, candidate, nil
+}
+
 // adoptOutsideSessionLock runs validation without blocking unrelated browser
 // syncs. The adoption service leases the durable job state before validation,
 // so releasing the in-memory session lock cannot admit a competing adoption.
@@ -4003,10 +4110,26 @@ func pageHostURL(host string) string {
 func (b *Bridge) adoptOutsideSessionLock(ctx context.Context, jobID, filename string, provenance ...*app.BrowserDeliveryContext) (int64, error) {
 	b.mu.Unlock()
 	defer b.mu.Lock()
-	if len(provenance) > 0 && provenance[0] != nil {
-		return b.adoptWithContext(ctx, jobID, filename, provenance[0])
+	claim, candidate, err := b.reserveArtifactWinner(ctx, jobID, filename)
+	if err != nil {
+		return 0, err
 	}
-	return b.adopt(ctx, jobID, filename)
+	var candidateID int64
+	if len(provenance) > 0 && provenance[0] != nil {
+		candidateID, err = b.adoptWithContext(ctx, jobID, filename, provenance[0])
+	} else {
+		candidateID, err = b.adopt(ctx, jobID, filename)
+	}
+	if err != nil || claim == nil {
+		return candidateID, err
+	}
+	if settleErr := b.jobs.SettleMaterialization(ctx, claim.ID, claim.BindingID,
+		int64(b.epoch), candidate.InstitutionProfileRevision); settleErr != nil &&
+		!errors.Is(settleErr, job.ErrMaterializationStale) &&
+		!errors.Is(settleErr, job.ErrMaterializationConflict) {
+		log.Printf("papio: settling materialization after adoption: %v", settleErr)
+	}
+	return candidateID, nil
 }
 
 // helloRequired tells a still-connected extension that the daemon lost its
@@ -4087,11 +4210,15 @@ func validExtensionVersion(value string) bool {
 
 const profileEvidenceTTL = 30 * time.Minute
 
-// recordProfileEvidence resolves a configured resolver to the daemon-owned
-// opaque profile identity before persisting a browser observation. The
-// observation is fenced to the current browser holder generation and the
-// exact profile revision; receipt time, not producer time, controls expiry.
-func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resolverName string, verdict job.ProfileEvidenceVerdict, source job.ProfileEvidenceSource, producerObservedAt string) error {
+// recordProfileEvidence persists one institutional-session observation. The
+// observation is fenced to the current browser holder generation and to the
+// exact profile revision it was produced under; receipt time, not producer
+// time, controls expiry. For a job-correlated observation the produced-under
+// revision is the revision snapshotted on that job's browser candidate when
+// the route was offered, never the revision that happens to be live when the
+// frame is ingested: a frame buffered across a profile edit describes the
+// superseded identity and is discarded instead of promoting the new revision.
+func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resolverName, jobID string, verdict job.ProfileEvidenceVerdict, source job.ProfileEvidenceSource, producerObservedAt string) error {
 	if b.jobs == nil {
 		return nil
 	}
@@ -4102,12 +4229,26 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	if err != nil || profile == nil || profile.TombstonedAt != "" {
 		return err
 	}
+	observedRevision := profile.Revision
+	if strings.TrimSpace(jobID) != "" {
+		attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
+		if attemptErr != nil {
+			return attemptErr
+		}
+		candidate, candidateErr := b.jobs.CurrentBrowserCandidateForJob(ctx, jobID, attempt)
+		if candidateErr != nil {
+			return candidateErr
+		}
+		if candidate != nil {
+			observedRevision = candidate.InstitutionProfileRevision
+		}
+	}
 	received := b.now().UTC()
 	if strings.TrimSpace(producerObservedAt) == "" {
 		producerObservedAt = received.Format(time.RFC3339Nano)
 	}
 	idParts := []string{
-		profile.ID, strconv.FormatInt(profile.Revision, 10),
+		profile.ID, strconv.FormatInt(observedRevision, 10),
 		strconv.FormatUint(b.epoch, 10), string(verdict), string(source),
 	}
 	if strings.TrimSpace(observationID) == "" {
@@ -4117,13 +4258,19 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	}
 	sum := sha256.Sum256([]byte(strings.Join(idParts, "\x00")))
 	observationID = hex.EncodeToString(sum[:])
-	return b.jobs.RecordProfileEvidence(ctx, job.ProfileEvidenceObservation{
+	err = b.jobs.RecordProfileEvidence(ctx, job.ProfileEvidenceObservation{
 		ObservationID: observationID, BrowserHolderGeneration: int64(b.epoch),
-		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+		InstitutionProfileID: profile.ID, InstitutionProfileRevision: observedRevision,
 		Verdict: verdict, Source: source, ProducerObservedAt: producerObservedAt,
 		DaemonReceivedAt: received.Format(time.RFC3339Nano),
 		ExpiresAt:        received.Add(profileEvidenceTTL).Format(time.RFC3339Nano),
 	})
+	if errors.Is(err, job.ErrProfileEvidenceStale) {
+		// The observation describes a superseded profile identity. Discarding
+		// it is the fence, not a transport failure.
+		return nil
+	}
+	return err
 }
 
 func evidenceVerdict(value string) job.ProfileEvidenceVerdict {
@@ -4204,7 +4351,7 @@ func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidenc
 			msgID = msgIDs[0]
 		}
 		obsID := evidenceObservationID("session_evidence", msgID, wantedProfile, p.Evidence, p.At)
-		if err := b.recordProfileEvidence(ctx, obsID, wantedProfile, evidenceVerdict(p.Evidence), job.ProfileEvidenceProbe, p.At); err != nil {
+		if err := b.recordProfileEvidence(ctx, obsID, wantedProfile, "", evidenceVerdict(p.Evidence), job.ProfileEvidenceProbe, p.At); err != nil {
 			return err
 		}
 		b.lastSessionEvidenceAt[wantedProfile] = now
@@ -4390,7 +4537,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	}
 	resolverName := resolverProfileKey(row.Policy.Resolver)
 	if msg.Type == protocol.MsgAuthReturned {
-		if err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateResolved, `{"source":"auth_returned"}`); err != nil {
@@ -4414,7 +4561,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 			return err
 		}
 	} else {
-		if err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 		if err := b.upsertProfileGate(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.HumanGateLogin, job.HumanGateOpen, `{"source":"auth_pending"}`); err != nil {
@@ -4712,7 +4859,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 	progressObservationKey := evidenceObservationID("provider_progress", msgID, jobID, p.Outcome)
 	if err := b.recordProfileEvidence(ctx,
 		outcomeObservationKey,
-		rowForEvidence.Policy.Resolver, verdict, job.ProfileEvidenceProviderOutcome,
+		rowForEvidence.Policy.Resolver, jobID, verdict, job.ProfileEvidenceProviderOutcome,
 		b.now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
@@ -5138,39 +5285,19 @@ func (b *Bridge) leaveHandoff(ctx context.Context, jobID, to, reason string) err
 }
 
 // adopt resolves the reported download strictly under the job's adoption
-// directory and hands it to the app for validation. The filename has already
-// passed protocol validation (no path separators); this adds IsLocal and a
-// symlink-resolved prefix guard before app-side confinement.
+// directory and hands it to the app for validation.
 func (b *Bridge) adopt(ctx context.Context, jobID, filename string) (int64, error) {
-	if !filepath.IsLocal(filename) {
-		return 0, fmt.Errorf("adoption filename %q is not a local name", filename)
-	}
-	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
-	realRoot, err := filepath.EvalSymlinks(root)
+	full, err := b.adoptionPath(jobID, filename)
 	if err != nil {
-		return 0, fmt.Errorf("adoption root unavailable: %w", err)
-	}
-	full := filepath.Join(realRoot, filename)
-	rel, err := filepath.Rel(realRoot, full)
-	if err != nil || rel != filename || strings.Contains(rel, "..") {
-		return 0, fmt.Errorf("adoption path escapes %s", realRoot)
+		return 0, err
 	}
 	return b.svc.AdoptDownloadCandidate(ctx, jobID, full)
 }
 
 func (b *Bridge) adoptWithContext(ctx context.Context, jobID, filename string, provenance *app.BrowserDeliveryContext) (int64, error) {
-	if !filepath.IsLocal(filename) {
-		return 0, fmt.Errorf("adoption filename %q is not a local name", filename)
-	}
-	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
-	realRoot, err := filepath.EvalSymlinks(root)
+	full, err := b.adoptionPath(jobID, filename)
 	if err != nil {
-		return 0, fmt.Errorf("adoption root unavailable: %w", err)
-	}
-	full := filepath.Join(realRoot, filename)
-	rel, err := filepath.Rel(realRoot, full)
-	if err != nil || rel != filename || strings.Contains(rel, "..") {
-		return 0, fmt.Errorf("adoption path escapes %s", realRoot)
+		return 0, err
 	}
 	return b.svc.AdoptDownloadWithContextCandidate(ctx, jobID, full, provenance)
 }

@@ -115,7 +115,11 @@ func (o ProfileEvidenceObservation) validate() error {
 // RecordProfileEvidence durably records one observation. Lost responses are
 // safe: the observation id is the idempotency key and a duplicate leaves the
 // already committed row unchanged. Validity is computed from daemon receipt,
-// never from producer time or a caller-provided expiry.
+// never from producer time or a caller-provided expiry. The observed profile
+// revision is an authority fence, not a historical annotation: an observation
+// whose revision is no longer the live revision of a non-tombstoned profile
+// was produced under a superseded identity and is rejected as stale rather
+// than promoted into the current revision.
 func (js *Store) RecordProfileEvidence(ctx context.Context, observation ProfileEvidenceObservation) error {
 	if err := observation.validate(); err != nil {
 		return err
@@ -138,6 +142,15 @@ func (js *Store) RecordProfileEvidence(ctx context.Context, observation ProfileE
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var liveProfile int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM institution_profiles
+		WHERE id = ? AND revision = ? AND (tombstoned_at IS NULL OR tombstoned_at = '')`,
+		observation.InstitutionProfileID, observation.InstitutionProfileRevision).Scan(&liveProfile); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrProfileEvidenceStale
+		}
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO profile_evidence
 		 (observation_id, browser_holder_generation, institution_profile_id,
@@ -828,6 +841,10 @@ var (
 	ErrAuthenticationEntryLeaseBusy   = errors.New("authentication entry lease busy")
 	ErrAuthenticationEntryLeaseStale  = errors.New("authentication entry lease stale")
 	ErrAuthenticationEntryLeaseDenied = errors.New("authentication entry lease evidence required")
+	// ErrProfileEvidenceStale reports an observation whose institution profile
+	// revision is no longer live. The observation is discarded rather than
+	// rebound to the current revision.
+	ErrProfileEvidenceStale = errors.New("profile evidence revision is stale")
 )
 
 type AuthenticationEntryLeaseInput struct {

@@ -680,6 +680,43 @@ func (js *Store) MaterializationClaimByBindingID(ctx context.Context, bindingID 
 	return c, err
 }
 
+// LiveMaterializationClaimForJob resolves the claim currently materializing
+// the job's exact attempt, fenced to the holder generation that owns it and
+// to a profile revision that is still live. Delivery callbacks use it to bind
+// arriving bytes to the browser effect that was actually authorized; a job
+// with no institutional claim returns nil and keeps the legacy delivery path.
+func (js *Store) LiveMaterializationClaimForJob(ctx context.Context, jobID string, jobAttemptRevision, holderGeneration int64) (*MaterializationClaim, *BrowserCandidate, error) {
+	if strings.TrimSpace(jobID) == "" || jobAttemptRevision < 1 || holderGeneration < 0 {
+		return nil, nil, nil
+	}
+	var claimID string
+	err := js.S.DB().QueryRowContext(ctx, `SELECT m.id
+		FROM materialization_claims m
+		JOIN browser_candidates c ON c.id = m.candidate_id
+		JOIN institution_profiles p ON p.id = c.institution_profile_id
+		WHERE c.job_id = ? AND c.job_attempt_revision = ?
+		  AND m.browser_holder_generation = ?
+		  AND m.phase IN ('claimed','bound','route_issued','navigated')
+		  AND p.tombstoned_at IS NULL
+		  AND p.revision = c.institution_profile_revision
+		ORDER BY m.id LIMIT 1`, jobID, jobAttemptRevision, holderGeneration).Scan(&claimID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	claim, err := js.GetMaterializationClaim(ctx, claimID)
+	if err != nil || claim == nil {
+		return nil, nil, err
+	}
+	candidate, err := js.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		return nil, nil, err
+	}
+	return claim, candidate, nil
+}
+
 // BindMaterialization acknowledges the physical resource for a claim. Binding
 // IDs are minted at claim creation. A live claim may replace its tab while
 // bound or route_issued; navigated and settled tab fences are immutable.
