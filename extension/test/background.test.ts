@@ -4307,7 +4307,11 @@ test("inbox runtime messages validate the exact extension sender", async () => {
       },
     });
 });
-test("papio.activity accepts popup senders while triage remains inbox-only", async () => {
+// The popup may read AGGREGATES it renders itself (Activity for catch-up, counts
+// for the pulse header's decision count). The triage SNAPSHOT carries citations
+// and identifiers, and every mutation owns a decision, so both stay inbox-only:
+// the popup closes on focus loss and must not own a result it cannot show.
+test("papio.activity and counts accept popup senders while snapshot and mutations stay inbox-only", async () => {
   const h = makeHarness();
   const urls = {
     runtimeID: "papio-test-id",
@@ -4340,6 +4344,8 @@ test("papio.activity accepts popup senders while triage remains inbox-only", asy
     ),
   ).resolves.toBe(reply);
   expect(requestedRequest).toEqual({ limit: 10 });
+  const stubbed = { ok: true as const, counts: { pending_total: 1 }, generated_at: "2026-08-03T00:00:01Z" };
+  h.bridge.requestTriageCounts = async () => stubbed;
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
@@ -4347,7 +4353,13 @@ test("papio.activity accepts popup senders while triage remains inbox-only", asy
       { id: urls.runtimeID, url: urls.popupURL },
       urls,
     ),
-  ).resolves.toMatchObject({ ok: false, error: { code: "unauthorized" } });
+  ).resolves.toBe(stubbed);
+
+  for (const type of ["papio.triage.snapshot", "papio.triage.decide", "papio.action.resolve", "papio.delivery.reconcile"]) {
+    await expect(
+      handleInboxRuntimeMessage(h.bridge, { type, request: {} }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+    ).resolves.toMatchObject({ ok: false, error: { code: "unauthorized" } });
+  }
 });
 
 test("papio.stats from any papio page routes to the bridge stats request", async () => {

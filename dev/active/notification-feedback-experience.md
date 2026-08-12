@@ -442,7 +442,7 @@ Keep the popup bounded. Top-to-bottom:
 The pulse answers three questions without becoming a dashboard:
 
 ```text
-Working on 24 papers · 2 need you · updated 3s ago
+Working on 24 papers · 2 decisions waiting · updated 3s ago
 Next: retrying 8 OpenAlex papers at 14:32
 Acquisition effects 1/1 busy · 6 waiting their turn
 ```
@@ -464,7 +464,7 @@ synthesize a percentage, ETA, or exact queue position.
 The catch-up line is one bounded summary, not a ticker:
 
 ```text
-While you were away: 12 acquired · 4 need you · 7 watch hits   Open inbox
+While you were away: 12 acquired · 4 decisions waiting · 7 watch hits   Open inbox
 ```
 
 The popup never lists daemon-side human actions as a second work queue. It shows
@@ -572,11 +572,20 @@ Rules:
   positive `in_flight + continuing` count establishes Moving. A materialization
   phase, extension correlation, Activity sentence, or elapsed-time heuristic
   never creates `waiting_required` or `stalled`.
-- `waiting_required` counts effective open explicit turns, including jobless PDF
-  grabs, plus the daemon's current typed human-gate projection
-  (`CurrentHumanAttention`), with one turn per gate/claim and dependent siblings
-  excluded from the count. Failure to read either authority makes the
-  projection incomplete rather than zero.
+- `waiting_required` is scoped to nonterminal work: it counts the effective
+  researcher-owned turns that block items in the nonterminal projection,
+  including jobless PDF grabs, plus the daemon's current typed human-gate
+  projection (`CurrentHumanAttention`), with one turn per gate/claim and
+  dependent siblings excluded. It is **not** the number of decisions the
+  researcher owes. Counts schema v3 `turns_required` is the turn authority and
+  the only number any surface may present as `decisions waiting` or `need you`.
+  The two values legitimately differ when an open action outlives its job (for
+  example, an `openurl_available` action on a terminal `unavailable` job): that
+  action remains an actionable inbox turn, but it is not nonterminal work and
+  must not enter `waiting_required` or break the five-bucket partition. This is
+  a scope distinction, not an arithmetic discrepancy to reconcile.
+  Failure to read either authority makes the projection incomplete rather than
+  zero.
 - `stall_episodes` is the only authority for `Stalled` and
   `system_degraded` pulse copy. An episode key remains stable until recovery
   rearms it. Without a valid episode affecting stalled work, the UI never
@@ -925,10 +934,10 @@ Use researcher language:
 44 open · 39 need you · 5 for reference · papio is working on 7
 ```
 
-`need you` requires an exact effective-required count. `for reference` contains
-watch/advisory inventory and does not imply a task. When Actions is empty while
-work continues: `No decisions waiting. *papio* is working through 7 papers — see
-Activity.`
+`need you` requires the exact effective-required `turns_required` count. `for
+reference` contains watch/advisory inventory and does not imply a task. When
+Actions is empty while work continues: `No decisions waiting. *papio* is
+working through 7 papers — see Activity.`
 
 ### 12. Make Activity quiet, pageable, and recoverable
 
@@ -979,10 +988,14 @@ Keep the existing precedence:
 3. actionable-turn count;
 4. blank.
 
-Change the numeric tier from `pending_total` to the exact number of daemon-owned
-`required` turns. Watch hits, retractions, dependent sibling papers, and
-`working` rows remain available in the tooltip/inbox but do not inflate the
-number.
+Change the numeric tier from `pending_total` to `turns_required`, the exact
+daemon-owned count of effective `required` turns. `turns_required` is the sole
+turn authority: every surface that says `decisions waiting` or `need you` must
+use it. Watch hits, retractions, dependent sibling papers, and `working` rows
+remain available in the tooltip/inbox but do not inflate the number. This may
+legitimately differ from the pulse's nonterminal `waiting_required` bucket
+when an open action outlives a terminal job; the badge never substitutes that
+bucket for the turn count.
 
 Institutional sign-in/challenge ownership comes from the institutional
 processing contract: one current typed gate/claim produces one action, carries
@@ -1028,6 +1041,14 @@ their effective attention. A `human_action` required-turn entry requires
 `dependent_jobs=0`. `item_id` is the exact snapshot row ID. A typed gate claim
 appears once regardless of its dependent paper count; two profiles/claims remain
 two turns.
+
+`turns_required` is the only counts-v3 authority for researcher-owned
+decisions. It is intentionally distinct from the pulse's `waiting_required`,
+which is a nonterminal-work bucket used only in the five-way partition and
+therefore excludes an open action whose parent job is already terminal. A
+terminal-job action remains in the inbox and in `turns_required`; clients must
+not reconcile these values by changing either scope or by presenting
+`waiting_required` as a decisions count.
 
 When `required_turns_complete=true`, the list has exactly `turns_required`
 unique entries. Background, popup, and inbox consume that daemon count and use

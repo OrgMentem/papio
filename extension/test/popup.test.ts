@@ -26,6 +26,7 @@ import {
   renderPageAcquire,
   renderImpactSummary,
   derivePulseDisplay,
+  renderPopupCatchup,
   renderWorkPulse,
   type PopupPulseCache,
   sessionWarmForJob,
@@ -110,6 +111,74 @@ test("derives every typed pulse state without inventing progress", () => {
   expect(derivePulseDisplay(undefined).primary).toBe("Unknown");
 });
 
+test("uses counts-v3 turns for decisions while labelling pulse buckets as nonterminal", () => {
+  const cache = pulseCache({ waiting_required: 34, nonterminal_total: 116 });
+  const counts = { pending_total: 35, turns_required: 35 };
+  const display = derivePulseDisplay(cache, "connected", Date.now(), 15_000, counts);
+  expect(display.primaryText).toBe("Waiting on you · 35 decisions");
+  expect(display.primaryText).not.toContain("34");
+  expect(display.buckets).toContain("Nonterminal breakdown");
+  // The bucket must NOT borrow "need you"; that phrase belongs to turns_required,
+  // which the inbox renders and which legitimately differs from this bucket.
+  expect(display.buckets).toContain("34 awaiting your turn");
+  expect(display.buckets).not.toContain("need you");
+  expect(display.buckets).toContain("0 in flight");
+  expect(display.buckets).toContain("0 continuing");
+  expect(display.buckets).toContain("0 scheduled");
+  expect(display.buckets).toContain("0 stalled");
+  const doc = popupDocument();
+  renderWorkPulse(doc, cache, "connected", Date.now(), counts);
+  expect(doc.getElementById("popup-pulse-primary")?.textContent).toBe("Waiting on you · 35 decisions");
+  expect(doc.getElementById("popup-pulse-buckets")?.textContent).toContain("Nonterminal breakdown");
+});
+
+test("uses an honest pending-items label when counts-v3 is unavailable", () => {
+  const display = derivePulseDisplay(
+    pulseCache({ waiting_required: 2, nonterminal_total: 2 }),
+    "connected",
+    Date.now(),
+    15_000,
+    { pending_total: 3 },
+  );
+  expect(display.primaryText).toBe("Waiting on you · 3 pending items");
+  expect(display.primaryText).not.toContain("decisions");
+});
+
+
+test("catch-up says newer Activity without an exact number across a retention gap", async () => {
+  const popup = await import(`../src/popup.ts?catchup-gap=${Date.now()}`);
+  const doc = popupDocument();
+  const storage = {
+    get: async () => ({ papio_popup_activity_seen_through_seq_v1: 100 }),
+    set: async () => undefined,
+  };
+  Object.assign(globalThis, { chrome: { storage: { local: storage } } });
+  await popup.renderPopupCatchup(doc, {
+    entries: [{ seq: 58861, at: new Date().toISOString(), kind: "system", text: "retained" }],
+    gap: true,
+    paged: true,
+  });
+  const text = doc.getElementById("popup-catchup-text")?.textContent ?? "";
+  expect(text).toContain("newer Activity is available");
+  expect(text).not.toMatch(/\d/);
+});
+
+test("catch-up uses daemon new_count_since rather than the page size", async () => {
+  const popup = await import(`../src/popup.ts?catchup-count=${Date.now()}`);
+  const doc = popupDocument();
+  const storage = {
+    get: async () => ({ papio_popup_activity_seen_through_seq_v1: 100 }),
+    set: async () => undefined,
+  };
+  Object.assign(globalThis, { chrome: { storage: { local: storage } } });
+  await popup.renderPopupCatchup(doc, {
+    entries: [{ seq: 101, at: new Date().toISOString(), kind: "system", text: "retained" }],
+    newCountSince: 12,
+    gap: false,
+    paged: true,
+  });
+  expect(doc.getElementById("popup-catchup-text")?.textContent).toBe("While you were away: 12 updates");
+});
 test("does not classify an incomplete pulse from absent buckets", () => {
   const partial: PopupPulseCache = {
     pulse: {

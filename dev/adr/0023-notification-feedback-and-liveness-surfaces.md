@@ -297,6 +297,23 @@ Staged rollout continues to gate automatic routing; this ADR adds no parallel
 claiming, first-route selection, source-gate bypass, provider-readiness claim,
 or concurrency increase.
 
+## Addendum (2026-08-12): nonterminal waiting is not the decision count
+
+Live UI validation exposed a scope distinction needed to read Decision 6
+alongside the counts-v3 badge contract. `waiting_required` is a bucket in the
+complete nonterminal projection: it counts only nonterminal work blocked on the
+researcher, so it excludes an open action whose parent job has already reached
+a terminal state. `turns_required` is the exact daemon-owned count of
+researcher-owned actionable turns and is the sole authority for any surface
+that says `decisions waiting` or `need you`.
+
+The values may therefore legitimately differ. For example, an
+`openurl_available` action can remain open on an `unavailable` job; it remains
+an actionable inbox row and contributes to `turns_required`, but it is not
+nonterminal work and must not contribute to `waiting_required` or break the
+five-bucket sum. This is a scope distinction, not an arithmetic discrepancy
+to reconcile.
+
 ## Consequences
 
 Positive:

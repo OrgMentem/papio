@@ -24,7 +24,7 @@ import {
   type StoreShape,
   TERMS_CONSENT_KEY,
 } from "./state";
-import type { ActivityEntryPayload, WorkPulseResponsePayload } from "./protocol";
+import type { ActivityEntryPayload, TriageCounts, WorkPulseResponsePayload } from "./protocol";
 import { classifyPage, isPDFPage, pdfSourceURL, sniffDOI, type PageKind } from "./deliver";
 import {
   SESSION_STALE_MS,
@@ -1691,6 +1691,29 @@ export async function requestWorkPulse(): Promise<PopupPulseCache | undefined> {
   }
 }
 
+/** Counts-v3 is the authority for effective researcher turns. The popup
+ * fetches it separately from pulse, whose waiting_required bucket partitions
+ * nonterminal work and may legitimately exclude terminal-job turns. */
+export async function requestTriageCounts(): Promise<TriageCounts | undefined> {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "papio.triage.counts", request: {} });
+    if (typeof response !== "object" || response === null) return undefined;
+    const value = response as Record<string, unknown>;
+    const counts = value["counts"];
+    if (value["ok"] !== true || typeof counts !== "object" || counts === null) return undefined;
+    const parsed = counts as Partial<TriageCounts>;
+    if (
+      typeof parsed.pending_total !== "number" ||
+      typeof parsed.watch_hits !== "number" ||
+      typeof parsed.actions !== "number" ||
+      typeof parsed.retractions !== "number"
+    ) return undefined;
+    return parsed as TriageCounts;
+  } catch {
+    return undefined;
+  }
+}
+
 function pulseCount(pulse: WorkPulseResponsePayload, field: keyof WorkPulseResponsePayload): number | undefined {
   const value = pulse[field];
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
@@ -1701,6 +1724,7 @@ export function derivePulseDisplay(
   connectionStatus: StoreShape["connectionStatus"] = "connected",
   now = Date.now(),
   maxAgeMs = 15_000,
+  counts?: Pick<TriageCounts, "pending_total" | "turns_required">,
 ): PulseDisplay {
   if (connectionStatus !== "connected") {
     return { primary: "Unknown", primaryText: "Can't tell — daemon disconnected", buckets: "", next: "", capacity: "", batch: "" };
@@ -1749,7 +1773,16 @@ export function derivePulseDisplay(
         ? "Moving"
         : `Moving · ${moving} ${moving === 1 ? "paper" : "papers"}`
       : primary === "Waiting on you"
-        ? `Waiting on you · ${waiting} ${waiting === 1 ? "decision" : "decisions"}`
+        ? counts?.turns_required !== undefined
+          // Pulse owns the Waiting on you classification; counts-v3 owns the
+          // effective decision-turn total because terminal-job turns can
+          // legitimately differ from pulse.waiting_required.
+          ? `Waiting on you · ${counts.turns_required} decisions`
+          : counts === undefined
+            ? "Waiting on you"
+            // Older daemons expose pending inventory, not effective turns;
+            // label that fallback as pending items rather than decisions.
+            : `Waiting on you · ${counts.pending_total} pending items`
         : primary === "Stalled"
           ? `Stalled · ${stalled} ${stalled === 1 ? "paper" : "papers"}`
           : primary === "Scheduled"
@@ -1757,10 +1790,17 @@ export function derivePulseDisplay(
             : primary === "Idle"
               ? "Idle"
               : "Can't tell — live progress is unavailable";
+  // Companion rule: every present pulse bucket is shown, including zero;
+  // omission would make an absent measurement indistinguishable from zero.
+  if (inFlight !== undefined) bucketParts.push(`${inFlight} in flight`);
   if (continuing !== undefined) bucketParts.push(`${continuing} continuing`);
   if (scheduled !== undefined) bucketParts.push(`${scheduled} scheduled`);
-  if (waiting !== undefined) bucketParts.push(`${waiting} need you`);
+  // "need you" is reserved for the turn authority (counts-v3 turns_required),
+  // which the inbox renders. This is the nonterminal bucket and can legitimately
+  // differ from it, so it must not borrow the same words. See ADR-0023's addendum.
+  if (waiting !== undefined) bucketParts.push(`${waiting} awaiting your turn`);
   if (stalled !== undefined) bucketParts.push(`${stalled} stalled`);
+  if (bucketParts.length > 0) bucketParts.unshift("Nonterminal breakdown");
   let next = "";
   if (pulse.next_action !== undefined) {
     const actionName = pulse.next_action.kind === "retry" ? "retrying" : pulse.next_action.kind === "delivery_poll" ? "checking delivery" : "opening a source gate";
@@ -1797,6 +1837,7 @@ export function renderWorkPulse(
   cache: PopupPulseCache | undefined,
   connectionStatus: StoreShape["connectionStatus"] = "connected",
   now = Date.now(),
+  counts?: Pick<TriageCounts, "pending_total" | "turns_required">,
 ): void {
   const section = doc.getElementById("popup-pulse");
   const primary = doc.getElementById("popup-pulse-primary");
@@ -1806,7 +1847,7 @@ export function renderWorkPulse(
   const batch = doc.getElementById("popup-pulse-batch");
   if (!(section instanceof HTMLElement) || !(primary instanceof HTMLElement) || !(buckets instanceof HTMLElement) ||
       !(next instanceof HTMLElement) || !(capacity instanceof HTMLElement) || !(batch instanceof HTMLElement)) return;
-  const display = derivePulseDisplay(cache, connectionStatus, now);
+  const display = derivePulseDisplay(cache, connectionStatus, now, 15_000, counts);
   primary.textContent = display.primaryText;
   buckets.textContent = display.buckets;
   next.textContent = display.next;
@@ -1834,19 +1875,50 @@ function isPopupActivityEntry(value: unknown): value is ActivityEntryPayload {
   );
 }
 
-function popupActivityEntries(value: unknown): ActivityEntryPayload[] | undefined {
+interface PopupActivityResult {
+  entries: ActivityEntryPayload[];
+  newCountSince?: number;
+  gap: boolean;
+  paged: boolean;
+}
+
+function popupActivityEntries(value: unknown): PopupActivityResult | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const response = value as Record<string, unknown>;
   if (response.ok !== true || typeof response.feature !== "boolean") return undefined;
-  if (response.feature === false) return [];
-  return Array.isArray(response.entries) ? response.entries.filter(isPopupActivityEntry) : undefined;
+  if (response.feature === false) return { entries: [], gap: false, paged: false };
+  if (!Array.isArray(response.entries)) return undefined;
+  const newCountSince =
+    typeof response.new_count_since === "number" &&
+    Number.isSafeInteger(response.new_count_since) &&
+    response.new_count_since >= 0
+      ? response.new_count_since
+      : undefined;
+  const gap = response.gap === true;
+  return {
+    entries: response.entries.filter(isPopupActivityEntry),
+    ...(newCountSince === undefined ? {} : { newCountSince }),
+    gap,
+    paged: "latest_seq" in response && (newCountSince !== undefined || gap),
+  };
 }
 
-async function readPopupActivity(): Promise<ActivityEntryPayload[] | undefined> {
+async function readPopupActivity(): Promise<PopupActivityResult | undefined> {
+  let seenThroughSeq: number | undefined;
+  try {
+    const stored = await chrome.storage.local.get(POPUP_ACTIVITY_WATERMARK_KEY);
+    const value = stored[POPUP_ACTIVITY_WATERMARK_KEY];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) seenThroughSeq = value;
+  } catch {
+    // The activity request remains useful without a read watermark.
+  }
   try {
     const response = await chrome.runtime.sendMessage({
       type: "papio.activity",
-      request: { limit: 50 },
+      request: {
+        limit: 50,
+        ...(seenThroughSeq === undefined ? {} : { seen_through_seq: String(seenThroughSeq) }),
+      },
     });
     return popupActivityEntries(response);
   } catch {
@@ -1855,7 +1927,7 @@ async function readPopupActivity(): Promise<ActivityEntryPayload[] | undefined> 
 }
 const POPUP_ACTIVITY_WATERMARK_KEY = "papio_popup_activity_seen_through_seq_v1";
 let popupCatchupInitialized = false;
-async function renderPopupCatchup(doc: Document, entries: readonly ActivityEntryPayload[]): Promise<void> {
+export async function renderPopupCatchup(doc: Document, result: PopupActivityResult): Promise<void> {
   const section = doc.getElementById("popup-catchup");
   const text = doc.getElementById("popup-catchup-text");
   const open = doc.getElementById("popup-catchup-open");
@@ -1877,23 +1949,28 @@ async function renderPopupCatchup(doc: Document, entries: readonly ActivityEntry
   try {
     const stored = await chrome.storage.local.get(POPUP_ACTIVITY_WATERMARK_KEY);
     const storedValue = stored[POPUP_ACTIVITY_WATERMARK_KEY];
-    if (typeof storedValue === "number") seen = storedValue;
+    if (typeof storedValue === "number" && Number.isSafeInteger(storedValue) && storedValue >= 0) seen = storedValue;
   } catch {
     return;
   }
-  const unseen = entries.filter((entry) => entry.seq > seen);
-  const maxSeq = entries.reduce((max, entry) => Math.max(max, entry.seq), seen);
+  const unseen = result.entries.filter((entry) => entry.seq > seen);
+  const maxSeq = result.entries.reduce((max, entry) => Math.max(max, entry.seq), seen);
   if (maxSeq > seen) void chrome.storage.local.set({ [POPUP_ACTIVITY_WATERMARK_KEY]: maxSeq });
   if (unseen.length === 0) return;
-  const acquired = unseen.filter((entry) => /acquired|ready|imported/i.test(entry.kind)).length;
-  const required = unseen.filter((entry) => /human|action|auth|attention/i.test(entry.kind)).length;
-  const watch = unseen.filter((entry) => /watch/i.test(entry.kind)).length;
-  const parts: string[] = [];
-  if (acquired > 0) parts.push(`${acquired} acquired`);
-  if (required > 0) parts.push(`${required} need you`);
-  if (watch > 0) parts.push(`${watch} watch hits`);
-  if (parts.length === 0) parts.push(`${Math.min(unseen.length, 50)} updates`);
-  text.textContent = `While you were away: ${parts.join(" · ")}`;
+  if (result.gap) {
+    // A gap means the daemon cannot provide an exact count; page-local rows
+    // must not be presented as a complete catch-up tally.
+    text.textContent = "While you were away: newer Activity is available";
+  } else if (result.paged && result.newCountSince !== undefined && result.newCountSince > 0) {
+    // new_count_since is the durable Activity authority, not the fetched
+    // page size. Per-kind counts are intentionally omitted because they are
+    // only a view of this bounded page.
+    text.textContent = `While you were away: ${result.newCountSince} updates`;
+  } else {
+    // Older/partial responses have no authoritative catch-up count.
+    section.hidden = true;
+    return;
+  }
   section.hidden = false;
   open.onclick = () => void openInbox();
 }
@@ -2524,10 +2601,11 @@ export async function refresh(): Promise<void> {
   // synchronous pass. Sections revealing one by one over the next seconds
   // shift later cards mid-aim — a live mis-click hit "Focus" where
   // "Close them" had been a moment earlier.
-  const [freshActivity, _pulse, delivery, pageMetadata, session, orphanCount, consent, ungranted] =
+  const [freshActivity, _pulse, freshCounts, delivery, pageMetadata, session, orphanCount, consent, ungranted] =
     await Promise.all([
       readPopupActivity(),
       requestWorkPulse(),
+      requestTriageCounts(),
       readDeliveryFeedback(store.pendingDelivery),
       readCurrentPageMetadata().catch(() => undefined),
       readSessionForRefresh(),
@@ -2551,9 +2629,12 @@ export async function refresh(): Promise<void> {
         return pending;
       })(),
     ]);
-  renderWorkPulse(document, popupPulseCache, store.connectionStatus);
+  // Pulse owns the liveness classification; counts-v3 owns any decision
+  // number shown in the popup header. They intentionally differ for a
+  // terminal-job turn that remains actionable in the inbox.
+  renderWorkPulse(document, popupPulseCache, store.connectionStatus, Date.now(), freshCounts);
   if (freshActivity !== undefined) {
-    popupActivity = freshActivity;
+    popupActivity = freshActivity.entries;
     await renderPopupCatchup(document, freshActivity);
   }
   renderPageContext(
@@ -2797,7 +2878,12 @@ if (
       sendPopupPresence(popupPresenceFeatures, false);
     }
   });
-  window.addEventListener("pagehide", () => sendPopupPresence(popupPresenceFeatures, false));
+  // `pagehide` is the only best-effort release signal for a popup that is torn
+  // down without a visibilitychange. Guard `window`: this module is imported in
+  // a DOM-less test context, where an unguarded reference throws at import time.
+  if (typeof window !== "undefined") {
+    window.addEventListener("pagehide", () => sendPopupPresence(popupPresenceFeatures, false));
+  }
   // The initial refresh must not float: a popup opened before storage is
   // reachable (or a test importing this module) would otherwise surface an
   // unhandled rejection. Later refreshes re-render; this one is best-effort.

@@ -9,6 +9,8 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/store"
+	"papio/internal/triage"
+	"papio/internal/watch"
 	"papio/internal/work"
 )
 
@@ -118,6 +120,58 @@ func TestReadTypedGateCountsOneTurnForOwnerAndSiblings(t *testing.T) {
 	}
 	if snap.WaitingRequired == nil || *snap.WaitingRequired != 1 || snap.NonterminalTotal == nil || *snap.NonterminalTotal != 1 {
 		t.Fatalf("typed gate buckets = waiting %v total %v", snap.WaitingRequired, snap.NonterminalTotal)
+	}
+}
+
+// TestTerminalJobActionKeepsTurnAndPulseScopesDistinct pins the live case that
+// motivated this contract: an open openurl_available action survived its job's
+// terminal unavailable outcome ("no legal candidates"). The inbox still owns
+// one actionable turn, while the pulse must partition only nonterminal work.
+func TestTerminalJobActionKeepsTurnAndPulseScopesDistinct(t *testing.T) {
+	ctx := context.Background()
+	js := pulseJobs(t)
+	id, err := js.CreateRequest(ctx, "wr_pulse_terminal_action", pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, job.StateResolving, job.StateUnavailable, nil,
+		job.WithTerminalReason(job.TerminalReasonNoLegalCandidates)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.OpenHumanAction(ctx, id, "openurl_available", "open the source page", job.Access(false, "landing_page")); err != nil {
+		t.Fatal(err)
+	}
+
+	triageCounts, err := triage.New(js.S, watch.NewStore(js.S), js).Counts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if triageCounts.TurnsRequired == nil || *triageCounts.TurnsRequired != 1 {
+		t.Fatalf("turns_required = %v, want 1 for the open terminal-job action", triageCounts.TurnsRequired)
+	}
+
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	snap, err := (&Service{Jobs: js, Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.ProjectionComplete == nil || !*snap.ProjectionComplete {
+		t.Fatalf("projection_complete = %v, want complete terminal-only projection", snap.ProjectionComplete)
+	}
+	if snap.WaitingRequired == nil || *snap.WaitingRequired != 0 {
+		t.Fatalf("waiting_required = %v, want 0 because the action's job is terminal", snap.WaitingRequired)
+	}
+	if snap.NonterminalTotal == nil || *snap.NonterminalTotal != 0 {
+		t.Fatalf("nonterminal_total = %v, want 0", snap.NonterminalTotal)
+	}
+	if snap.InFlight == nil || snap.Scheduled == nil || snap.Continuing == nil || snap.Stalled == nil {
+		t.Fatalf("complete projection omitted a bucket: %+v", snap)
+	}
+	if got := *snap.InFlight + *snap.Scheduled + *snap.Continuing + *snap.WaitingRequired + *snap.Stalled; got != *snap.NonterminalTotal {
+		t.Fatalf("pulse buckets sum to %d, want nonterminal_total %d", got, *snap.NonterminalTotal)
 	}
 }
 

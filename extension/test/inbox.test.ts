@@ -278,6 +278,43 @@ function flush(window: Window): void {
   window.dispatchEvent(new window.Event("pagehide"));
 }
 
+test("uses pulse liveness instead of jobs_working for the inbox counts line", async () => {
+  const fixture = snapshot([], {
+    counts: counts({ pending_total: 116, actions: 0, jobs_working: 116, watch_hits: 0, retractions: 0 }),
+  });
+  const pulse = (inFlight: number, continuing: number) => ({
+    ok: true,
+    available: true,
+    worker_epoch: "worker-live",
+    received_at: Date.now(),
+    pulse: {
+      request_id: "pulse-live",
+      schema: 1,
+      generated_at: new Date().toISOString(),
+      projection_complete: true,
+      nonterminal_total: 116,
+      in_flight: inFlight,
+      continuing,
+      scheduled: 82,
+      waiting_required: 34,
+      stalled: 0,
+    },
+  });
+  const idlePage = await inboxDocument((message) => {
+    if (message.type === "papio.work.pulse") return pulse(0, 0);
+    return snapshotReply(fixture, message);
+  });
+  const idleCounts = idlePage.document.getElementById("inbox-counts")?.textContent ?? "";
+  expect(idleCounts).not.toMatch(/working on|working through/);
+
+  const movingPage = await inboxDocument((message) => {
+    if (message.type === "papio.work.pulse") return pulse(2, 5);
+    return snapshotReply(fixture, message);
+  });
+  expect(movingPage.document.getElementById("inbox-counts")?.textContent).toContain("papio is working on 7");
+  expect(movingPage.document.getElementById("inbox-counts")?.textContent).not.toContain("working on 116");
+});
+
 test("renders rank-ordered bands, label:text facts, and only safe HTTPS links", async () => {
   const unsafe = watchHit("hit:unsafe", 3, "Watch hit", [
     { rel: "doi", url: "javascript:alert(1)" },

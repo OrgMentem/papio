@@ -294,6 +294,12 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "pdf_grab_result",
   "surface_presence_ack",
   "work_pulse_response",
+  // Registered 2026-08-12: the page-bulk bridge (ADR-0019 phase B) landed after
+  // this guard and never added its own reply types, so every availability check
+  // and v1 submit threw before sending a frame. page_bulk_runs recorded six
+  // opens and zero submissions as a result.
+  "page_bulk_status_result",
+  "page_bulk_submit_result",
   "page_bulk_submit_v2_result",
   "handoff_link_result",
   "provider_drive_epoch_start_result",
@@ -1000,7 +1006,18 @@ function runtimeRejectionReply(reason: unknown): {
   ) {
     return { ok: false, error: "connection_lost", message: CONNECTION_LOST_RUNTIME_COPY };
   }
-  return { ok: false, error: "internal", message: INTERNAL_RUNTIME_COPY };
+  // A daemon-coded failure already carries actionable remediation (session_busy
+  // names `papio browser use`; not_permitted names the missing host grant).
+  // Collapsing it into "could not complete that request" discards the only text
+  // that tells the researcher what to do, so keep the daemon's own message.
+  let supplied: string | undefined;
+  if (code !== undefined && isObjectRecord(reason)) {
+    const nested = reason["error"];
+    const direct = typeof reason["message"] === "string" ? reason["message"] : "";
+    const inner = isObjectRecord(nested) && typeof nested["message"] === "string" ? nested["message"] : "";
+    supplied = direct !== "" ? direct : inner !== "" ? inner : undefined;
+  }
+  return { ok: false, error: "internal", message: supplied ?? INTERNAL_RUNTIME_COPY };
 }
 
 /** Attach both fulfillment and rejection paths before returning true to Chrome. */
@@ -12930,8 +12947,15 @@ export async function handleInboxRuntimeMessage(
   ) {
     return undefined;
   }
-  const senderAuthorized =
-    type === "papio.activity" ? isInboxOrPopupSender(sender, urls) : isInboxSender(sender, urls);
+  // The popup may perform aggregate READS it renders directly: Activity for the
+  // catch-up line, and counts for the pulse header's decision count, which must
+  // come from turns_required. Every mutating type stays inbox-only, because the
+  // popup closes on focus loss and must not own a decision whose result it
+  // cannot show.
+  const popupReadableTypes: readonly string[] = ["papio.activity", "papio.triage.counts"];
+  const senderAuthorized = popupReadableTypes.includes(type)
+    ? isInboxOrPopupSender(sender, urls)
+    : isInboxSender(sender, urls);
   if (!senderAuthorized) {
     return failure("unauthorized", "This sender cannot access the inbox broker");
   }

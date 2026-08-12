@@ -1468,6 +1468,22 @@ function renderPulse(): void {
   elements.pulse.dataset.state = display.primary.toLowerCase().replaceAll(" ", "-");
   elements.pulse.title = [display.buckets, display.next, display.capacity, display.batch].filter((part) => part !== "").join(" · ");
 }
+function genuinelyMovingCount(): number | undefined {
+  if (!state.connected || state.pulse === undefined) return undefined;
+  const display = derivePulseDisplay(state.pulse, "connected", Date.now(), 45_000);
+  if (display.primary === "Unknown") return undefined;
+  const { in_flight: inFlight, continuing } = state.pulse.pulse;
+  if (
+    typeof inFlight !== "number" ||
+    !Number.isSafeInteger(inFlight) ||
+    inFlight < 0 ||
+    typeof continuing !== "number" ||
+    !Number.isSafeInteger(continuing) ||
+    continuing < 0
+  ) return undefined;
+  return inFlight + continuing;
+}
+
 function renderCounts(): void {
   if (elements === null) return;
   const counts = state.counts ?? state.snapshot?.counts;
@@ -1475,12 +1491,17 @@ function renderCounts(): void {
     elements.counts.textContent = "Counts unavailable";
     return;
   }
+  // Counts-v3 turns_required is the authority for decisions owed by the
+  // researcher; it must not be replaced with pulse.waiting_required.
   const required = counts.turns_required;
   const needText = typeof required === "number" ? `${required} need you` : `${counts.pending_total} open`;
   const reference = counts.watch_hits + counts.retractions;
   const parts = [`${counts.pending_total} open`, needText];
   if (reference > 0) parts.push(`${reference} for reference`);
-  if (counts.jobs_working > 0) parts.push(`papio is working on ${counts.jobs_working}`);
+  // Pulse in_flight + continuing is the only honest liveness authority;
+  // jobs_working also includes queued, awaiting-human, and retry-wait work.
+  const moving = genuinelyMovingCount();
+  if (moving !== undefined && moving > 0) parts.push(`papio is working on ${moving}`);
   elements.counts.textContent = [...new Set(parts)].join(" · ");
 }
 
@@ -1551,12 +1572,14 @@ function render(): void {
   } else if (actionItems.length === 0 && state.filterQuery.trim() !== "") {
     elements.list.append(element("p", `No items match "${state.filterQuery.trim()}".`));
   } else if (actionItems.length === 0) {
-    const working = state.counts?.jobs_working ?? 0;
+    // The pulse projection, not counts.jobs_working, decides whether an
+    // honest liveness sentence is warranted in the empty Actions view.
+    const moving = genuinelyMovingCount();
     elements.list.append(
       element(
         "p",
-        working > 0
-          ? `No decisions waiting. papio is working through ${working} papers — see Activity.`
+        moving !== undefined && moving > 0
+          ? `No decisions waiting. papio is working through ${moving} papers — see Activity.`
           : "No decisions waiting.",
       ),
     );
