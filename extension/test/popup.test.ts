@@ -1063,10 +1063,27 @@ test("renderImpactSummary fills the impact card with real values", () => {
   renderImpactSummary(doc, { acquired_total: 42, failed_total: 14 });
 
   expect(doc.getElementById("impact-summary")?.hidden).toBe(false);
-  // 42 acquired x 5 min ~= 3.5 h; 42 of 56 finished jobs succeeded.
+  // Both figures are measured: 42 acquired jobs, 42 of 56 finished jobs succeeded.
   expect(doc.getElementById("impact-acquired")?.textContent).toBe("42");
-  expect(doc.getElementById("impact-time-saved")?.textContent).toBe("3.5 h");
   expect(doc.getElementById("impact-success-rate")?.textContent).toBe("75%");
+});
+
+test("the impact footer publishes only measured figures — never an invented time saved", () => {
+  const doc = popupDocument();
+  renderImpactSummary(doc, { acquired_total: 42, failed_total: 14 });
+
+  // papio measures counts, not clocks: no estimated-time-saved figure may return
+  // to this footer under any wording.
+  expect(doc.getElementById("impact-time-saved")).toBeNull();
+  const section = doc.getElementById("impact-summary") as HTMLElement;
+  expect(section.textContent).not.toMatch(/saved|hours?\b|\bh\b|minutes/i);
+  const labels = Array.from(section.querySelectorAll(".impact-metric dt")).map((el) => el.textContent);
+  expect(labels).toEqual(["Papers acquired", "Success rate"]);
+  // One fewer figure must not leave an empty cell or a dangling separator.
+  expect(section.querySelectorAll(".impact-metric")).toHaveLength(labels.length);
+  for (const value of Array.from(section.querySelectorAll(".impact-metric dd"))) {
+    expect(value.textContent?.trim()).not.toBe("");
+  }
 });
 
 test("keeps the impact title and history link in one header row", () => {

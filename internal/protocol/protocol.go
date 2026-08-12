@@ -1699,9 +1699,10 @@ type StatsBucket struct {
 	Acquired    int64  `json:"acquired"`
 }
 
-// StatsResponsePayload reports lifetime acquisition value metrics plus a bounded
-// weekly time series. All counts are non-negative; the extension derives
-// success rate, handoff rate, and estimated time saved from these facts.
+// StatsResponsePayload reports lifetime acquisition counts plus a bounded
+// weekly time series. All counts are non-negative; the extension derives only
+// ratios of these measured counts — success rate and handoff rate — and never
+// an estimated duration or other unmeasured quantity.
 type StatsResponsePayload struct {
 	RequestID        string        `json:"request_id"`
 	GeneratedAt      string        `json:"generated_at"`

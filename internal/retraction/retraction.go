@@ -232,10 +232,7 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 	if len(newFindings) > 0 && s.notifier != nil {
-		message := noticeMessage(newFindings[0])
-		if len(newFindings) > 1 {
-			message = fmt.Sprintf("%d library notices found in retraction scan", len(newFindings))
-		}
+		message := integrityNoticeMessage(newFindings)
 		details := make([]map[string]any, 0, len(newFindings))
 		for _, finding := range newFindings {
 			details = append(details, map[string]any{
@@ -585,11 +582,23 @@ func validFinding(f Finding) bool {
 	}
 }
 
+// integrityNoticeMessage names what one retraction scan found. A single
+// finding keeps its DOI-specific identity; a whole scan reuses the shared
+// integrity vocabulary in internal/notify rather than maintaining a second
+// plural template. Either way the copy names the inbox, where the durable
+// notices are recoverable.
+func integrityNoticeMessage(findings []Finding) string {
+	if len(findings) != 1 {
+		return notify.ComposeMessage(notify.CategoryIntegrityNotice, len(findings), notify.Event{}, "")
+	}
+	return noticeMessage(findings[0])
+}
+
 func noticeMessage(f Finding) string {
 	if f.NoticeDOI != "" {
-		return fmt.Sprintf("Library %s notice for DOI %s (notice DOI %s)", f.Nature, f.DOI, f.NoticeDOI)
+		return fmt.Sprintf("Library %s notice for DOI %s (notice DOI %s) — open the papio inbox", f.Nature, f.DOI, f.NoticeDOI)
 	}
-	return fmt.Sprintf("Library %s notice for DOI %s", f.Nature, f.DOI)
+	return fmt.Sprintf("Library %s notice for DOI %s — open the papio inbox", f.Nature, f.DOI)
 }
 
 type cache struct {

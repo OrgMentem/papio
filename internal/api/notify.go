@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -111,6 +112,11 @@ func notifyPreview(ctx context.Context, raw json.RawMessage, system *bootstrap.S
 	}
 	message, err := system.Notify.Preview(category, params.Count)
 	if err != nil {
+		// A count this category can never produce is the caller's mistake, not
+		// a daemon failure: report it as such instead of "operation failed".
+		if errors.Is(err, notify.ErrPreviewCountUnrepresentable) {
+			return nil, &ipc.RPCError{Code: "invalid_argument", Message: err.Error()}
+		}
 		return failure(err)
 	}
 	count := params.Count

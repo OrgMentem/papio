@@ -1,20 +1,15 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // History: a full-tab read-only page showing what papio has delivered — papers
-// acquired, estimated time saved, success rate, access routes, and how often a
-// human handoff was needed. All data arrives through one papio.stats runtime
-// request to the background broker; the page never talks to the native host.
-// Refresh happens on page open and whenever the tab becomes visible again.
+// acquired, success rate, access routes, and how often a human handoff was
+// needed. Every figure is a measured count or a ratio of measured counts; the
+// page never estimates time saved or any other unmeasured quantity. All data
+// arrives through one papio.stats runtime request to the background broker; the
+// page never talks to the native host. Refresh happens on page open and
+// whenever the tab becomes visible again.
 
 import type { StatsAccess, StatsBucket } from "./protocol";
 import { renderPapio } from "./dom";
-import {
-  EST_MINUTES_SAVED_PER_PAPER,
-  formatHoursSaved,
-  formatShare,
-  parseStatsReply,
-  type AcquisitionStats,
-  type StatsReply,
-} from "./stats";
+import { formatShare, parseStatsReply, type AcquisitionStats, type StatsReply } from "./stats";
 
 interface PageElements {
   connection: HTMLElement;
@@ -23,8 +18,6 @@ interface PageElements {
   main: HTMLElement;
   unavailable: HTMLElement;
   acquired: HTMLElement;
-  timeSaved: HTMLElement;
-  timeNote: HTMLElement;
   successRate: HTMLElement;
   successDetail: HTMLElement;
   chart: HTMLElement;
@@ -195,8 +188,6 @@ function render(): void {
 
   const finished = stats.acquired_total + stats.failed_total;
   elements.acquired.textContent = String(stats.acquired_total);
-  elements.timeSaved.textContent = formatHoursSaved(stats.acquired_total * EST_MINUTES_SAVED_PER_PAPER);
-  elements.timeNote.textContent = `Assumes ~${EST_MINUTES_SAVED_PER_PAPER} minutes of manual chasing per paper.`;
   elements.successRate.textContent = formatShare(stats.acquired_total, finished);
   elements.successDetail.textContent =
     finished === 0 ? "No finished acquisitions yet." : `${stats.acquired_total} acquired · ${stats.failed_total} failed`;
@@ -263,8 +254,6 @@ function bootstrap(): void {
   const main = document.getElementById("stats-main");
   const unavailable = document.getElementById("stats-unavailable");
   const acquired = document.getElementById("stat-acquired");
-  const timeSaved = document.getElementById("stat-time-saved");
-  const timeNote = document.getElementById("stat-time-note");
   const successRate = document.getElementById("stat-success-rate");
   const successDetail = document.getElementById("stat-success-detail");
   const chart = document.getElementById("weekly-chart");
@@ -283,8 +272,6 @@ function bootstrap(): void {
     !(main instanceof HTMLElement) ||
     !(unavailable instanceof HTMLElement) ||
     !(acquired instanceof HTMLElement) ||
-    !(timeSaved instanceof HTMLElement) ||
-    !(timeNote instanceof HTMLElement) ||
     !(successRate instanceof HTMLElement) ||
     !(successDetail instanceof HTMLElement) ||
     !(chart instanceof HTMLElement) ||
@@ -306,8 +293,6 @@ function bootstrap(): void {
     main,
     unavailable,
     acquired,
-    timeSaved,
-    timeNote,
     successRate,
     successDetail,
     chart,

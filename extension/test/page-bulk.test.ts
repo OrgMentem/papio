@@ -806,6 +806,94 @@ test("a Chrome receiving-end rejection uses papio connection copy instead of raw
   }
 });
 
+/** `thrownErrorMessage` used to compute a transport condition and then return
+ * the connection copy on both branches, so every page-side throw claimed the
+ * daemon connection had dropped. That fabricated cause misattributed a real
+ * page-bulk failure (an unregistered correlated reply type) for several
+ * debugging rounds. Freshness rule 12: a failure degrades explicitly, and an
+ * invented cause is as dishonest as an invented zero. */
+test("a non-transport status throw names the real failure and neither blames nor retries the connection", async () => {
+  vi.useFakeTimers();
+  try {
+    const snap = snapshot();
+    let statusAttempts = 0;
+    const page = await pageBulkDocument("scan-1", (message) => {
+      if (message.type === "papio.pageBulk.load") return { ok: true, snapshot: snap };
+      if (message.type === "papio.pageBulk.status") {
+        statusAttempts += 1;
+        if (statusAttempts === 1) throw new Error("Unregistered reply type page_bulk_status_v2");
+        return { ok: true, items: [eligibleStatus("id-1")], truncated: false };
+      }
+      return { ok: true, allowed: false };
+    });
+
+    const shown = page.document.getElementById("status-error-message")?.textContent;
+    expect(shown).toBe("papio could not complete that request: Unregistered reply type page_bulk_status_v2");
+    expect(shown).not.toBe("papio lost its connection to the daemon and is retrying…");
+    expect(page.document.getElementById("status-error")?.hidden).toBe(false);
+
+    // Nothing transport-shaped failed, so nothing reschedules itself.
+    vi.advanceTimersByTime(500);
+    await settle();
+    expect(statusAttempts).toBe(1);
+
+    // The explicit Retry control still works for this class of failure.
+    (page.document.getElementById("status-retry-btn") as HTMLButtonElement).click();
+    await settle();
+    expect(statusAttempts).toBe(2);
+    expect(page.document.getElementById("status-error")?.hidden).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a daemon-unavailable throw from background keeps the connection copy and still schedules the retry", async () => {
+  vi.useFakeTimers();
+  try {
+    const snap = snapshot();
+    let statusAttempts = 0;
+    const page = await pageBulkDocument("scan-1", (message) => {
+      if (message.type === "papio.pageBulk.load") return { ok: true, snapshot: snap };
+      if (message.type === "papio.pageBulk.status") {
+        statusAttempts += 1;
+        if (statusAttempts === 1) throw new Error("the daemon is unavailable");
+        return { ok: true, items: [eligibleStatus("id-1")], truncated: false };
+      }
+      return { ok: true, allowed: false };
+    });
+
+    expect(page.document.getElementById("status-error-message")?.textContent).toBe(
+      "papio lost its connection to the daemon and is retrying…",
+    );
+    vi.advanceTimersByTime(500);
+    await settle();
+    expect(statusAttempts).toBe(2);
+    expect(page.document.getElementById("status-error")?.hidden).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("an over-long thrown message is whitespace-collapsed and bounded, never a raw multi-line dump", async () => {
+  const snap = snapshot();
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.load") return { ok: true, snapshot: snap };
+    if (message.type === "papio.pageBulk.status") {
+      throw new Error(`runtime blew up\n   ${"x".repeat(400)} trailing-detail-that-must-not-render`);
+    }
+    return { ok: true, allowed: false };
+  });
+
+  const prefix = "papio could not complete that request: ";
+  const shown = page.document.getElementById("status-error-message")?.textContent ?? "";
+  expect(shown.startsWith(`${prefix}runtime blew up x`)).toBe(true);
+  expect(shown).not.toContain("\n");
+  expect(shown).not.toContain("trailing-detail-that-must-not-render");
+  // Same bound as inbox.ts's boundedHandoffFailure: 237 characters plus an ellipsis.
+  expect(shown.length).toBe(prefix.length + 238);
+  expect(shown.endsWith("…")).toBe(true);
+});
+
 test("a status lookup failure shows the retry banner; Retry re-sends the request", async () => {
   const snap = snapshot();
   let statusAttempts = 0;

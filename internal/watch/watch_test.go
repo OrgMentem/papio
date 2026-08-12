@@ -514,6 +514,57 @@ func TestRunnerDeduplicatesCapsManifestsAndNotifies(t *testing.T) {
 	}
 }
 
+// TestRunnerNotifiesOneQueuedPaperInTheSingular is the behavioural guard for
+// notification grammar: a watch that queues exactly one paper must not report
+// "1 new papers queued".
+func TestRunnerNotifiesOneQueuedPaperInTheSingular(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watch := createWatch(t, watches, testWatchInput("retrieval"))
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	discoveryFake := &fakeDiscovery{works: []discovery.DiscoveredWork{discovered("10.1000/only-one", "W2001")}}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}}
+	notifier := &fakeNotifier{}
+	runner := &Runner{
+		Store: watches, Discovery: discoveryFake, Lookup: lookup, Submitter: &fakeSubmitter{},
+		Notifier: notifier, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	result, err := runner.Run(ctx, watch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Queued != 1 {
+		t.Fatalf("run result = %+v, want one queued paper", result)
+	}
+	if len(notifier.messages) != 1 || notifier.messages[0] != "watch retrieval: 1 new paper queued" {
+		t.Fatalf("notifications = %+v, want the singular form", notifier.messages)
+	}
+}
+
+// TestWatchNoticeCountsAgreeWithTheirNouns pins every counted fragment the
+// watch notices compose, so none of them can regress to a plural at one.
+func TestWatchNoticeCountsAgreeWithTheirNouns(t *testing.T) {
+	cases := []struct {
+		count            int
+		singular, plural string
+		want             string
+	}{
+		{count: 1, singular: "new paper", plural: "new papers", want: "1 new paper"},
+		{count: 2, singular: "new paper", plural: "new papers", want: "2 new papers"},
+		{count: 1, singular: "missing PDF", plural: "missing PDFs", want: "1 missing PDF"},
+		{count: 2, singular: "missing PDF", plural: "missing PDFs", want: "2 missing PDFs"},
+		{count: 1, singular: "new work", plural: "new works", want: "1 new work"},
+		{count: 39, singular: "new work", plural: "new works", want: "39 new works"},
+		{count: 1, singular: "consecutive failure", plural: "consecutive failures", want: "1 consecutive failure"},
+		{count: 5, singular: "consecutive failure", plural: "consecutive failures", want: "5 consecutive failures"},
+	}
+	for _, tc := range cases {
+		if got := countedNoun(tc.count, tc.singular, tc.plural); got != tc.want {
+			t.Fatalf("countedNoun(%d, %q, %q) = %q, want %q", tc.count, tc.singular, tc.plural, got, tc.want)
+		}
+	}
+}
+
 func TestRunnerBackfillQueuesAndMarksRun(t *testing.T) {
 	ctx := context.Background()
 	watches := testStore(t)

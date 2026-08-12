@@ -79,10 +79,8 @@ test("renders every impact metric from a daemon stats reply", async () => {
   expect(document.getElementById("stats-unavailable")?.hidden).toBe(true);
   expect(document.getElementById("reconnect-daemon")?.hidden).toBe(true);
 
-  // 42 acquired × 5 min ≈ 3.5 h; 42 of 56 finished jobs succeeded.
+  // 42 of 56 finished jobs succeeded — a ratio of measured counts.
   expect(document.getElementById("stat-acquired")?.textContent).toBe("42");
-  expect(document.getElementById("stat-time-saved")?.textContent).toBe("3.5 h");
-  expect(document.getElementById("stat-time-note")?.textContent).toContain("5 minutes");
   expect(document.getElementById("stat-success-rate")?.textContent).toBe("75%");
   expect(document.getElementById("stat-success-detail")?.textContent).toBe("42 acquired · 14 failed");
 
@@ -160,13 +158,30 @@ test("keeps the weekly chart stable on an all-zero series", async () => {
 
   // Zero totals degrade to em dashes, never NaN.
   expect(document.getElementById("stat-acquired")?.textContent).toBe("0");
-  expect(document.getElementById("stat-time-saved")?.textContent).toBe("0 h");
   expect(document.getElementById("stat-success-rate")?.textContent).toBe("—");
   expect(document.getElementById("stat-success-detail")?.textContent).toBe("No finished acquisitions yet.");
   expect(document.getElementById("stat-handoff-rate")?.textContent).toBe("—");
   expect(document.getElementById("stat-handoff-detail")?.textContent).toBe("No acquired papers yet.");
   const counts = Array.from(document.querySelectorAll("#access-list .access-count")).map((el) => el.textContent);
   expect(counts).toEqual(["0 · —", "0 · —", "0 · —", "0 · —"]);
+});
+
+test("the headline publishes only measured figures — never an invented time saved", async () => {
+  const { document } = await historyDocument(() => ({ ok: true, stats: stats() }));
+
+  // papio measures counts, not clocks: no estimated-time-saved figure or its
+  // assumption note may return to this headline under any wording.
+  expect(document.getElementById("stat-time-saved")).toBeNull();
+  expect(document.getElementById("stat-time-note")).toBeNull();
+  const headline = document.querySelector(".headline") as HTMLElement;
+  expect(headline.textContent).not.toMatch(/saved|minutes of manual chasing|\bh\b/i);
+  const labels = Array.from(headline.querySelectorAll(".stat-label")).map((el) => el.textContent);
+  expect(labels).toEqual(["Papers acquired", "Success rate"]);
+  // One fewer cell must not leave an empty column in the shared headline surface.
+  expect(headline.querySelectorAll(":scope > div")).toHaveLength(labels.length);
+  for (const value of Array.from(headline.querySelectorAll(".stat-value"))) {
+    expect(value.textContent?.trim()).not.toBe("");
+  }
 });
 
 // This page has no poll and no change subscription: it refetches on open and

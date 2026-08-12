@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -40,7 +41,7 @@ func TestNotifyMethodsReturnPurposeBuiltResults(t *testing.T) {
 		t.Fatalf("show = %+v", show)
 	}
 
-	previewRaw, rpcErr := notifyPreview(context.Background(), []byte(`{"category":"request_outcome","count":2}`), system)
+	previewRaw, rpcErr := notifyPreview(context.Background(), []byte(`{"category":"request_outcome","count":1}`), system)
 	if rpcErr != nil {
 		t.Fatal(rpcErr)
 	}
@@ -48,11 +49,17 @@ func TestNotifyMethodsReturnPurposeBuiltResults(t *testing.T) {
 	if err := json.Unmarshal(previewRaw, &preview); err != nil {
 		t.Fatal(err)
 	}
-	if preview.Category != "request_outcome" || preview.Count != 2 || preview.Message == "" {
+	if preview.Category != "request_outcome" || preview.Count != 1 || preview.Message == "" {
 		t.Fatalf("preview = %+v", preview)
 	}
 	for _, category := range notify.Categories() {
-		raw, rpcErr := notifyPreview(context.Background(), []byte(`{"category":"`+string(category)+`","count":3}`), system)
+		// Categories that stand for exactly one event reject an aggregate
+		// count instead of rendering copy the daemon can never send.
+		count := 3
+		if notify.CategoryRepresentsOneEvent(category) {
+			count = 1
+		}
+		raw, rpcErr := notifyPreview(context.Background(), []byte(`{"category":"`+string(category)+`","count":`+strconv.Itoa(count)+`}`), system)
 		if rpcErr != nil {
 			t.Fatalf("preview %s: %v", category, rpcErr)
 		}
@@ -60,8 +67,18 @@ func TestNotifyMethodsReturnPurposeBuiltResults(t *testing.T) {
 		if err := json.Unmarshal(raw, &row); err != nil {
 			t.Fatal(err)
 		}
-		if row.Category != string(category) || row.Count != 3 || row.Message == "" {
+		if row.Category != string(category) || row.Count != count || row.Message == "" {
 			t.Fatalf("preview %s = %+v", category, row)
+		}
+		if count > 1 {
+			continue
+		}
+		_, rpcErr = notifyPreview(context.Background(), []byte(`{"category":"`+string(category)+`","count":27}`), system)
+		if rpcErr == nil || rpcErr.Code != "invalid_argument" {
+			t.Fatalf("preview %s count 27 = %+v, want invalid_argument", category, rpcErr)
+		}
+		if !strings.Contains(rpcErr.Message, "count of 27") {
+			t.Fatalf("preview %s rejection = %q, want the impossible count explained", category, rpcErr.Message)
 		}
 	}
 

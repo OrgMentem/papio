@@ -118,9 +118,9 @@ telemetry. Review and minimize a capture before sharing it yourself. Sanitized H
 can still contain article text, account labels, or other page content.
 
 **Acquisition history and impact figures.** The extension's figures — papers
-acquired, estimated time saved, success rate, weekly acquisition trend,
-access-route breakdown, and human-handoff rate — are calculated locally from job
-records. They are displayed only to you and are never transmitted anywhere.
+acquired, success rate, weekly acquisition trend, access-route breakdown, and
+human-handoff rate — are calculated locally from job records. They are displayed
+only to you and are never transmitted anywhere.
 
 ## Permissions
 

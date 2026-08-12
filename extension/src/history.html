@@ -256,14 +256,14 @@
         padding-block: var(--space-8);
       }
 
-      /* One shared surface, three divided cells — the headline reads as a
+      /* One shared surface, two divided cells — the headline reads as a
          single statement, not a grid of identical cards. */
       .headline {
         background: var(--color-surface);
         border: 1px solid var(--color-border);
         border-radius: var(--radius-card);
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
 
       .headline > div {
@@ -488,7 +488,7 @@
         <span class="brand-name"><em>papio</em> <span class="page-name">history</span></span>
       </h1>
       <p id="connection-status" role="status" aria-live="polite">Connecting to daemon…</p>
-      <p id="history-lede">The papers <em>papio</em> fetched for you, and the chasing it spared you.</p>
+      <p id="history-lede">The papers <em>papio</em> fetched for you, and how it reached them.</p>
       <div class="toolbar" aria-label="History controls">
         <button id="refresh-history" type="button">Refresh</button>
         <button id="reconnect-daemon" type="button" hidden>Reconnect</button>
@@ -500,11 +500,6 @@
           <p class="stat-value" id="stat-acquired">0</p>
           <p class="stat-label">Papers acquired</p>
           <p class="stat-note">Delivered ready to read or imported into your library.</p>
-        </div>
-        <div>
-          <p class="stat-value" id="stat-time-saved">0 h</p>
-          <p class="stat-label">Estimated time saved</p>
-          <p class="stat-note" id="stat-time-note"></p>
         </div>
         <div>
           <p class="stat-value" id="stat-success-rate">—</p>

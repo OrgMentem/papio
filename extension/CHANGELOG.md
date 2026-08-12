@@ -54,6 +54,11 @@ for the full pre-split extension history.
   provider page exposes a DOI in its citation metadata and it does not match
   the job's DOI, the automatic download is refused and the mismatch is
   reported as the wrong work instead of silently filing the wrong PDF.
+- **The impact summary no longer estimates time saved.** The popup footer and
+  the history page dropped the "Est. time saved" figure and its five-minutes-
+  per-paper assumption. *papio* counts what it did — papers acquired and the
+  share of finished acquisitions that succeeded — and no longer multiplies a
+  count by an invented per-paper duration.
 
 ### Fixed
 

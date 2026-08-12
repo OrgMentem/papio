@@ -136,11 +136,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const CONNECTION_LOST_COPY = "papio lost its connection to the daemon and is retrying…";
+const RUNTIME_FAILURE_COPY = "papio could not complete that request. Please try again.";
+
+/** Chrome and Firefox reject a runtime message with these texts when the
+ * receiving end (the background worker) is gone, and background rejects with
+ * its own daemon-disconnected text. Any other rejection is a different
+ * failure and must not be reported as a lost connection. */
+const CONNECTION_LOST_PATTERN = /message channel closed|message port closed|receiving end does not exist|daemon.*(?:disconnect|unavailable)/i;
 
 function errorFromResponse(value: unknown): string {
   if (isRecord(value) && value["error"] === "connection_lost") return CONNECTION_LOST_COPY;
   if (isRecord(value) && value["error"] === "internal") {
-    return typeof value["message"] === "string" ? value["message"] : "papio could not complete that request. Please try again.";
+    return typeof value["message"] === "string" ? value["message"] : RUNTIME_FAILURE_COPY;
   }
   if (isRecord(value) && isRecord(value["error"]) && typeof value["error"]["message"] === "string") {
     return value["error"]["code"] === "connection_lost" ? CONNECTION_LOST_COPY : value["error"]["message"];
@@ -155,18 +162,23 @@ function errorCode(value: unknown): string | undefined {
   return undefined;
 }
 
-function thrownErrorMessage(error: unknown): string {
-  if (
-    error instanceof Error &&
-    /message channel closed|message port closed|receiving end does not exist|daemon.*(?:disconnect|unavailable)/i.test(error.message)
-  ) {
-    return CONNECTION_LOST_COPY;
-  }
-  return CONNECTION_LOST_COPY;
+function isConnectionLost(value: unknown): boolean {
+  return errorCode(value) === "connection_lost" || (value instanceof Error && CONNECTION_LOST_PATTERN.test(value.message));
 }
 
-function isConnectionLost(value: unknown): boolean {
-  return errorCode(value) === "connection_lost" || (value instanceof Error && /message channel closed|message port closed|receiving end does not exist|daemon.*(?:disconnect|unavailable)/i.test(value.message));
+/** A thrown failure is a connection loss only when `isConnectionLost` says so —
+ * the same predicate that gates retry scheduling, so copy and retry can never
+ * disagree. Everything else says what actually failed rather than fabricating a
+ * transport cause the page cannot observe. Untrusted thrown text is bounded
+ * exactly the way `boundedHandoffFailure` bounds runtime error copy in
+ * inbox.ts: whitespace collapsed, capped at 240 characters. A thrown non-Error
+ * (or an empty message) carries no trustworthy detail at all. */
+function thrownErrorMessage(error: unknown): string {
+  if (isConnectionLost(error)) return CONNECTION_LOST_COPY;
+  if (!(error instanceof Error) || typeof error.message !== "string") return RUNTIME_FAILURE_COPY;
+  const message = error.message.replace(/\s+/g, " ").trim();
+  if (message === "") return RUNTIME_FAILURE_COPY;
+  return `papio could not complete that request: ${message.length <= 240 ? message : `${message.slice(0, 237)}…`}`;
 }
 
 

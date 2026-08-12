@@ -1,18 +1,14 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Shared acquisition-stats presentation logic for the popup summary and the
-// history page: one estimate constant, one reply parser, and one formatting
-// vocabulary, so both surfaces always tell the same story.
+// history page: one reply parser and one formatting vocabulary, so both
+// surfaces always tell the same story. Every figure here is a measured count
+// or a ratio of measured counts; the daemon reports facts only, so nothing is
+// estimated, extrapolated, or projected into a time or currency figure.
 
 import type { StatsAccess, StatsBucket, StatsResponsePayload } from "./protocol";
 
 /** The stats reply as the background broker relays it (request_id stripped). */
 export type AcquisitionStats = Omit<StatsResponsePayload, "request_id">;
-
-/** Manually chasing one paywalled paper — resolver hops, login walls, and
- * downloading and filing the PDF — takes roughly 5 minutes. The "time saved"
- * headline multiplies this rough estimate per acquired paper; the daemon
- * reports counts only and never a time figure. */
-export const EST_MINUTES_SAVED_PER_PAPER = 5;
 
 export type StatsReply =
   | { ok: true; stats: AcquisitionStats }
@@ -72,13 +68,6 @@ export function parseStatsReply(value: unknown): StatsReply {
         ? error["message"]
         : "The daemon did not return a usable response.",
   };
-}
-
-/** "14 h" for 840 minutes; small figures keep one decimal ("0.7 h"). */
-export function formatHoursSaved(minutes: number): string {
-  const hours = minutes / 60;
-  const rounded = hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10;
-  return `${rounded} h`;
 }
 
 /** "75%" — or an em dash when the denominator is zero. */

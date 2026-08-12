@@ -264,7 +264,7 @@ func (r *Runner) runWatch(ctx context.Context, watch Watch) (*RunResult, error) 
 	result.ConsecutiveFailures = failure.ConsecutiveFailures
 	result.Disabled = failure.Disabled
 	if failure.Disabled && r.Notifier != nil {
-		message := fmt.Sprintf("watch %s disabled after %d consecutive failures", watch.Label, failure.ConsecutiveFailures)
+		message := fmt.Sprintf("watch %s disabled after %s", watch.Label, countedNoun(failure.ConsecutiveFailures, "consecutive failure", "consecutive failures"))
 		r.route(ctx, notify.Intent{
 			EventKind: "watch.disabled", Category: notify.CategorySystemDegraded,
 			AggregateKey: fmt.Sprintf("watch:%d:failure", watch.ID), Phase: notify.PhaseEpisode,
@@ -286,6 +286,16 @@ func (r *Runner) route(ctx context.Context, intent notify.Intent) {
 	if err := r.Notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
 		log.Printf("papio: routing watch notification: %v", err)
 	}
+}
+
+// countedNoun renders an exact quantity with a noun that agrees with it. Watch
+// notices carry real counts, and a single discovery must not read as
+// unfinished plural copy.
+func countedNoun(count int, singular, plural string) string {
+	if count == 1 {
+		return "1 " + singular
+	}
+	return fmt.Sprintf("%d %s", count, plural)
 }
 
 func (r *Runner) executeAt(ctx context.Context, watch Watch, runStart time.Time) (*RunResult, error) {
@@ -324,7 +334,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		if result.Queued > 0 {
 			r.route(ctx, r.watchIntent(watch, runStart, notify.Event{
 				Kind:    "watch.backfill",
-				Message: fmt.Sprintf("watch %s: %d missing PDFs queued", watch.Label, result.Queued),
+				Message: fmt.Sprintf("watch %s: %s queued", watch.Label, countedNoun(result.Queued, "missing PDF", "missing PDFs")),
 				WatchID: watch.ID, WatchLabel: watch.Label, Count: result.Queued,
 			}, notify.CategoryDiscoveryNew))
 		}
@@ -410,7 +420,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		if reported > 0 {
 			r.route(ctx, r.watchIntent(watch, runStart, notify.Event{
 				Kind:    "watch.alert",
-				Message: fmt.Sprintf("watch %s: %d new works found — papio watch digest %d", watch.Label, reported, watch.ID),
+				Message: fmt.Sprintf("watch %s: %s found — papio watch digest %d", watch.Label, countedNoun(reported, "new work", "new works"), watch.ID),
 				WatchID: watch.ID, WatchLabel: watch.Label, Count: reported,
 			}, notify.CategoryDiscoveryNew))
 		}
@@ -457,7 +467,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	if result.Queued > 0 {
 		r.route(ctx, r.watchIntent(watch, runStart, notify.Event{
 			Kind:    "watch.acquire",
-			Message: fmt.Sprintf("watch %s: %d new papers queued", watch.Label, result.Queued),
+			Message: fmt.Sprintf("watch %s: %s queued", watch.Label, countedNoun(result.Queued, "new paper", "new papers")),
 			WatchID: watch.ID, WatchLabel: watch.Label, Count: result.Queued,
 		}, notify.CategoryDiscoveryNew))
 	}

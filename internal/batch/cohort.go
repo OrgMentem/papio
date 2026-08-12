@@ -182,6 +182,76 @@ type storedChunk struct {
 	CanonicalKeys []string `json:"canonical_keys"`
 }
 
+// persistedChunkResult is the durable encoding of
+// acquisition_batch_chunks.result_json. That column is the chunk idempotency
+// cache: a replay after a lost acknowledgement must return the identical
+// stored result without re-submitting, so its shape is a persistence contract
+// and not an accident of Go field names. The names are the page-bulk v2 wire
+// names, which keeps a stored row readable by inspection and makes renaming a
+// ChunkResult field a compile-time concern rather than a silent on-disk change.
+type persistedChunkResult struct {
+	BatchID          string `json:"batch_id"`
+	Membership       string `json:"membership"`
+	CohortTotal      *int   `json:"cohort_total"`
+	PersistedMembers int    `json:"persisted_members"`
+	Submitted        int    `json:"submitted"`
+	Joined           int    `json:"joined"`
+	AlreadyOwned     int    `json:"already_owned"`
+	Invalid          int    `json:"invalid"`
+}
+
+// legacyChunkResult decodes rows written before persistedChunkResult existed,
+// when the cache was marshalled straight from ChunkResult and therefore used
+// Go field names. The 199-paper browser cohort submitted on 2026-08-12 left
+// its chunk rows in that shape while its jobs were still executing; without
+// this path their replay would report a corrupt cache and re-submit live work.
+// encoding/json matches field names case-insensitively but not
+// separator-insensitively, so "PersistedMembers" never reaches a
+// `persisted_members` tag: the two shapes genuinely need two decoders. This
+// type is read-only; nothing writes it.
+type legacyChunkResult struct {
+	BatchID          string `json:"BatchID"`
+	Membership       string `json:"Membership"`
+	CohortTotal      *int   `json:"CohortTotal"`
+	PersistedMembers int    `json:"PersistedMembers"`
+	Submitted        int    `json:"Submitted"`
+	Joined           int    `json:"Joined"`
+	AlreadyOwned     int    `json:"AlreadyOwned"`
+	Invalid          int    `json:"Invalid"`
+}
+
+func encodeChunkResult(r ChunkResult) ([]byte, error) {
+	return json.Marshal(persistedChunkResult{
+		BatchID: r.BatchID, Membership: r.Membership, CohortTotal: r.CohortTotal,
+		PersistedMembers: r.PersistedMembers, Submitted: r.Submitted, Joined: r.Joined,
+		AlreadyOwned: r.AlreadyOwned, Invalid: r.Invalid,
+	})
+}
+
+// decodeChunkResult reads either persisted shape. A row carries exactly one of
+// them, and both always name their batch, so a batch id that survives decoding
+// identifies which shape was stored; neither decoder matching means the cached
+// result cannot be trusted to answer a replay.
+func decodeChunkResult(raw []byte) (ChunkResult, error) {
+	var current persistedChunkResult
+	if err := json.Unmarshal(raw, &current); err == nil && current.BatchID != "" {
+		return ChunkResult{
+			BatchID: current.BatchID, Membership: current.Membership, CohortTotal: current.CohortTotal,
+			PersistedMembers: current.PersistedMembers, Submitted: current.Submitted, Joined: current.Joined,
+			AlreadyOwned: current.AlreadyOwned, Invalid: current.Invalid,
+		}, nil
+	}
+	var legacy legacyChunkResult
+	if err := json.Unmarshal(raw, &legacy); err != nil || legacy.BatchID == "" {
+		return ChunkResult{}, errors.New("stored cohort result is corrupt")
+	}
+	return ChunkResult{
+		BatchID: legacy.BatchID, Membership: legacy.Membership, CohortTotal: legacy.CohortTotal,
+		PersistedMembers: legacy.PersistedMembers, Submitted: legacy.Submitted, Joined: legacy.Joined,
+		AlreadyOwned: legacy.AlreadyOwned, Invalid: legacy.Invalid,
+	}, nil
+}
+
 func (c *Cohorts) SubmitChunk(ctx context.Context, req ChunkRequest, submit func(context.Context, []string) ([]MemberOutcome, error)) (ChunkResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -240,9 +310,9 @@ func (c *Cohorts) SubmitChunk(ctx context.Context, req ChunkRequest, submit func
 		if storedRequest != req.RequestID || storedFinal != boolInt(req.FinalChunk) || json.Unmarshal([]byte(chunkJSON), &stored) != nil || !sameStrings(stored.CanonicalKeys, req.CanonicalKeys) {
 			return ChunkResult{}, conflictf("chunk manifest identity differs")
 		}
-		var out ChunkResult
-		if json.Unmarshal([]byte(resultJSON), &out) != nil {
-			return ChunkResult{}, errors.New("stored cohort result is corrupt")
+		out, err := decodeChunkResult([]byte(resultJSON))
+		if err != nil {
+			return ChunkResult{}, err
 		}
 		return out, nil
 	}
@@ -295,7 +365,10 @@ func (c *Cohorts) SubmitChunk(ctx context.Context, req ChunkRequest, submit func
 		n := req.CohortTotal
 		res.CohortTotal = &n
 	}
-	resultBytes, _ := json.Marshal(res)
+	resultBytes, err := encodeChunkResult(res)
+	if err != nil {
+		return ChunkResult{}, err
+	}
 	keysBytes, _ := json.Marshal(storedChunk{CanonicalKeys: req.CanonicalKeys})
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -560,7 +633,10 @@ func (c *Cohorts) RecordCLIBatch(ctx context.Context, label string, outcomes []M
 	now := timestamp(c.Now())
 	expected := len(keys)
 	result := ChunkResult{BatchID: batchID, Membership: "complete", CohortTotal: &expected, PersistedMembers: expected, Submitted: counts["submitted"], Joined: counts["joined"], AlreadyOwned: counts["already_owned"], Invalid: counts["invalid"]}
-	resultJSON, _ := json.Marshal(result)
+	resultJSON, err := encodeChunkResult(result)
+	if err != nil {
+		return ChunkResult{}, err
+	}
 	keysJSON, _ := json.Marshal(storedChunk{CanonicalKeys: keys})
 	tx, err := c.S.DB().BeginTx(ctx, nil)
 	if err != nil {

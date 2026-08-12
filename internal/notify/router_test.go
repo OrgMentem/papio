@@ -4,6 +4,8 @@ package notify
 
 import (
 	"context"
+	"errors"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -274,13 +276,163 @@ func TestQuietReleaseHandlesDSTGapAndOverlap(t *testing.T) {
 func TestPreviewUsesSharedCategoryCopy(t *testing.T) {
 	router := NewRouter(RouterOptions{})
 	for _, category := range Categories() {
-		got, err := router.Preview(category, 3)
+		count := 3
+		if CategoryRepresentsOneEvent(category) {
+			count = 1
+		}
+		got, err := router.Preview(category, count)
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := ComposeMessage(category, 3, Event{}, "")
+		want := ComposeMessage(category, count, Event{}, "")
 		if got != want {
 			t.Fatalf("preview %s = %q, want shared producer copy %q", category, got, want)
+		}
+	}
+}
+
+// TestNotifyCategoryCopyAtRealisticCounts pins the exact public copy of every
+// notification category at the counts papio actually produces: one event, a
+// small aggregate, and a large browser cohort's worth of turns. It is the
+// regression guard for the whole notification vocabulary, so every expectation
+// is a literal string rather than a pattern, and the two categories that stand
+// for exactly one event are asserted to reject an impossible count instead of
+// rendering copy nobody will ever receive.
+func TestNotifyCategoryCopyAtRealisticCounts(t *testing.T) {
+	cases := []struct {
+		category Category
+		count    int
+		want     string
+		rejected bool
+	}{
+		{category: CategoryRequestOutcome, count: 1, want: "Request finished — open the papio inbox"},
+		{category: CategoryRequestOutcome, count: 2, rejected: true},
+		{category: CategoryRequestOutcome, count: 39, rejected: true},
+
+		{category: CategoryDecisionOpened, count: 1, want: "1 paper needs you — open the papio inbox"},
+		{category: CategoryDecisionOpened, count: 2, want: "2 papers need you — open the papio inbox"},
+		{category: CategoryDecisionOpened, count: 39, want: "39 papers need you — open the papio inbox"},
+
+		{category: CategoryDecisionPending, count: 1, want: "1 paper needs your attention — run: papio actions list"},
+		{category: CategoryDecisionPending, count: 2, want: "2 papers need your attention — run: papio actions list"},
+		{category: CategoryDecisionPending, count: 39, want: "39 papers need your attention — run: papio actions list"},
+
+		{category: CategoryCompletionBatch, count: 1, want: "Batch update · 1 paper — open the papio inbox"},
+		{category: CategoryCompletionBatch, count: 2, want: "Batch update · 2 papers — open the papio inbox"},
+		{category: CategoryCompletionBatch, count: 39, want: "Batch update · 39 papers — open the papio inbox"},
+
+		{category: CategoryDiscoveryNew, count: 1, want: "1 new watch hit — open the papio inbox"},
+		{category: CategoryDiscoveryNew, count: 2, want: "2 new watch hits — open the papio inbox"},
+		{category: CategoryDiscoveryNew, count: 39, want: "39 new watch hits — open the papio inbox"},
+
+		{category: CategoryIntegrityNotice, count: 1, want: "1 library integrity notice — open the papio inbox"},
+		{category: CategoryIntegrityNotice, count: 2, want: "2 library integrity notices — open the papio inbox"},
+		{category: CategoryIntegrityNotice, count: 39, want: "39 library integrity notices — open the papio inbox"},
+
+		{category: CategorySystemDegraded, count: 1, want: "papio cannot make progress — run: papio doctor"},
+		{category: CategorySystemDegraded, count: 2, rejected: true},
+		{category: CategorySystemDegraded, count: 39, rejected: true},
+	}
+	if len(cases) != 3*len(Categories()) {
+		t.Fatalf("copy table covers %d cases, want every category at counts 1, 2, and 39", len(cases))
+	}
+	router := NewRouter(RouterOptions{})
+	for _, tc := range cases {
+		got, err := router.Preview(tc.category, tc.count)
+		if tc.rejected {
+			if !errors.Is(err, ErrPreviewCountUnrepresentable) {
+				t.Fatalf("preview %s count %d = (%q, %v), want an unrepresentable-count error", tc.category, tc.count, got, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("preview %s count %d: %v", tc.category, tc.count, err)
+		}
+		if got != tc.want {
+			t.Fatalf("preview %s count %d = %q, want %q", tc.category, tc.count, got, tc.want)
+		}
+		if shared := ComposeMessage(tc.category, tc.count, Event{}, ""); shared != tc.want {
+			t.Fatalf("producer copy %s count %d = %q, want the previewed %q", tc.category, tc.count, shared, tc.want)
+		}
+	}
+}
+
+// TestNotifyComposedCopyStaysHonestAtEveryCount sweeps the counts between the pinned
+// table entries so a future edit cannot reintroduce a placeholder plural or
+// drop the recoverable surface at some count nobody thought to pin.
+func TestNotifyComposedCopyStaysHonestAtEveryCount(t *testing.T) {
+	pluralNouns := regexp.MustCompile(`\b(papers|hits|notices)\b`)
+	singularNouns := regexp.MustCompile(`\b(paper|hit|notice)\b`)
+	for _, category := range Categories() {
+		for count := 1; count <= 40; count++ {
+			got := ComposeMessage(category, count, Event{}, "")
+			for _, banned := range []string{"(s)", "%!", "delivered", "estimated", "ETA"} {
+				if strings.Contains(got, banned) {
+					t.Fatalf("%s count %d = %q, must not contain %q", category, count, got, banned)
+				}
+			}
+			if !strings.Contains(got, "open the papio inbox") && !strings.Contains(got, "run: papio ") {
+				t.Fatalf("%s count %d = %q, must name a recoverable papio surface or command", category, count, got)
+			}
+			// A category that carries a count must agree with it; one that
+			// stands for a single event carries no counted noun at all.
+			if CategoryRepresentsOneEvent(category) {
+				continue
+			}
+			if count == 1 && pluralNouns.MatchString(got) {
+				t.Fatalf("%s count 1 = %q, wants singular nouns", category, got)
+			}
+			if count > 1 && singularNouns.MatchString(got) {
+				t.Fatalf("%s count %d = %q, wants plural nouns", category, count, got)
+			}
+		}
+	}
+}
+
+// TestPreviewClampsAbsentCountAndExplainsImpossibleOnes keeps the operator
+// surface teachable: an omitted count previews one event, and an impossible one
+// says which category can aggregate instead.
+func TestPreviewClampsAbsentCountAndExplainsImpossibleOnes(t *testing.T) {
+	router := NewRouter(RouterOptions{})
+	for _, count := range []int{0, -5} {
+		got, err := router.Preview(CategoryRequestOutcome, count)
+		if err != nil {
+			t.Fatalf("preview count %d: %v", count, err)
+		}
+		if got != "Request finished — open the papio inbox" {
+			t.Fatalf("preview count %d = %q, want the one-request copy", count, got)
+		}
+	}
+	_, err := router.Preview(CategoryRequestOutcome, 27)
+	if err == nil {
+		t.Fatal("preview request_outcome count 27 = nil error, want a rejection")
+	}
+	for _, fragment := range []string{"request_outcome", "exactly one standalone request", "count of 27", "preview it with count 1", "completion_batch"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("rejection %q must explain %q", err, fragment)
+		}
+	}
+	if _, err := router.Preview(Category("made_up"), 1); err == nil {
+		t.Fatal("preview of an unknown category must fail")
+	}
+}
+
+// TestNotifyTestSendsOneSharedCopyPerCategory proves the explicit operator test uses the
+// same composition as preview and the producers rather than its own template.
+func TestNotifyTestSendsOneSharedCopyPerCategory(t *testing.T) {
+	for _, category := range Categories() {
+		sender := &routerSender{}
+		router := NewRouter(RouterOptions{Desktop: sender})
+		message, err := router.Test(context.Background(), category)
+		if err != nil {
+			t.Fatalf("test %s: %v", category, err)
+		}
+		want := ComposeMessage(category, 1, Event{}, "")
+		if message != want {
+			t.Fatalf("test %s returned %q, want shared copy %q", category, message, want)
+		}
+		if len(sender.messages) != 1 || sender.messages[0] != want {
+			t.Fatalf("test %s sent %#v, want exactly one %q", category, sender.messages, want)
 		}
 	}
 }

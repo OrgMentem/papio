@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -383,6 +384,18 @@ func (r *Router) audit(ctx context.Context, kind string, row Record, reason stri
 	}
 	_ = r.activity.RecordSystemEvent(ctx, kind, map[string]any{"category": row.Intent.Category, "event_kind": row.Intent.EventKind, "aggregate_key": row.Intent.AggregateKey, "phase": row.Intent.Phase, "count": row.Count, "reason": reason})
 }
+
+// ErrPreviewCountUnrepresentable reports a preview count a category can never
+// produce. Operator surfaces map it to an invalid-argument response so the
+// count is corrected rather than silently rendered as different copy.
+var ErrPreviewCountUnrepresentable = errors.New("notification count is not representable for this category")
+
+// Preview renders the exact copy one notification in this category would carry
+// for count durable events, without sending anything.
+//
+// A category that always stands for exactly one event rejects count > 1: no
+// such notification can exist, so rendering its one-event copy for a count of
+// 27 would teach an operator a vocabulary papio never emits.
 func (r *Router) Preview(category Category, count int) (string, error) {
 	if !isKnownCategory(category) {
 		return "", fmt.Errorf("unknown notification category %q", category)
@@ -390,7 +403,25 @@ func (r *Router) Preview(category Category, count int) (string, error) {
 	if count < 1 {
 		count = 1
 	}
+	if count > 1 && CategoryRepresentsOneEvent(category) {
+		return "", fmt.Errorf("%w: %s stands for exactly one %s, so a count of %d can never occur; preview it with count 1%s",
+			ErrPreviewCountUnrepresentable, category, singleEventNoun(category), count, aggregateAlternative(category))
+	}
 	return stripTerminalControls(ComposeMessage(category, count, Event{}, "")), nil
+}
+
+func singleEventNoun(category Category) string {
+	if category == CategoryRequestOutcome {
+		return "standalone request"
+	}
+	return "state episode"
+}
+
+func aggregateAlternative(category Category) string {
+	if category == CategoryRequestOutcome {
+		return ", or preview completion_batch for cohort totals"
+	}
+	return ""
 }
 
 // Test sends one explicit local notification without creating a durable

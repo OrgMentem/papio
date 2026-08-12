@@ -5,7 +5,6 @@ package notify
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 )
@@ -136,9 +135,33 @@ func validateIntent(intent Intent) error {
 	return nil
 }
 
+// CategoryRepresentsOneEvent reports whether one notification in this category
+// can only ever stand for a single durable event, so an aggregate count is not
+// merely unusual but impossible.
+//
+// request_outcome is the terminal result of one explicitly submitted standalone
+// request, and cohort members are summarized by completion_batch instead; its
+// aggregate key is one job. system_degraded is one nameable state episode; its
+// aggregate key is one episode. Both coalesce only with their own replays, so
+// their copy carries no number at all.
+func CategoryRepresentsOneEvent(category Category) bool {
+	switch category {
+	case CategoryRequestOutcome, CategorySystemDegraded:
+		return true
+	default:
+		return false
+	}
+}
+
 // ComposeMessage is the shared public-copy boundary for notification
 // producers and operator preview/test commands. The router also applies it
 // after coalescing so aggregate counts cannot leave stale singular copy.
+//
+// count is the number of durable domain facts the notification stands for —
+// papers, watch hits, or library notices. Every form is composed for its exact
+// count; this package never renders a "(s)" placeholder, and categories that
+// always stand for one event ignore count entirely so a replayed intent
+// coalescing into the same ledger row cannot inflate it.
 func ComposeMessage(category Category, count int, detail Event, fallback string) string {
 	if count < 1 {
 		count = 1
@@ -147,70 +170,92 @@ func ComposeMessage(category Category, count int, detail Event, fallback string)
 		return detail.Message
 	}
 	switch category {
+	case CategoryRequestOutcome:
+		// "Finished" reports that the request reached a terminal state without
+		// claiming the paper is accessible; the inbox holds the real outcome.
+		return "Request finished — open the papio inbox"
 	case CategoryDecisionOpened:
 		if count == 1 {
 			return "1 paper needs you — open the papio inbox"
 		}
 		return fmt.Sprintf("%d papers need you — open the papio inbox", count)
-	case CategoryRequestOutcome:
-		if detail.Message != "" {
-			return detail.Message
-		}
-		return fmt.Sprintf("%d request outcome(s) — open the papio inbox", count)
 	case CategoryDecisionPending:
-		if detail.Message != "" {
-			return detail.Message
-		}
 		return DecisionPendingMessage(count, 0, nil)
 	case CategoryCompletionBatch:
-		if detail.Message != "" {
-			return detail.Message
+		// A cohort notice never calls an active cohort complete; producers add
+		// the acquired/needs-you breakdown when they have one.
+		if count == 1 {
+			return "Batch update · 1 paper — open the papio inbox"
 		}
-		return fmt.Sprintf("%d papers in the batch reached a checkpoint — open the papio inbox", count)
+		return fmt.Sprintf("Batch update · %d papers — open the papio inbox", count)
 	case CategoryDiscoveryNew:
-		if detail.Message != "" {
-			return detail.Message
+		if count == 1 {
+			return "1 new watch hit — open the papio inbox"
 		}
-		return fmt.Sprintf("%d new works discovered — open the papio inbox", count)
+		return fmt.Sprintf("%d new watch hits — open the papio inbox", count)
 	case CategoryIntegrityNotice:
-		if detail.Message != "" {
-			return detail.Message
+		if count == 1 {
+			return "1 library integrity notice — open the papio inbox"
 		}
-		return fmt.Sprintf("%d integrity notices — open the papio inbox", count)
+		return fmt.Sprintf("%d library integrity notices — open the papio inbox", count)
 	case CategorySystemDegraded:
-		if detail.Message != "" {
-			return detail.Message
-		}
-		return fmt.Sprintf("%d system conditions need attention — open the papio inbox", count)
+		// One notification is one state episode. Producers name the condition;
+		// doctor is the recoverable surface when they cannot.
+		return "papio cannot make progress — run: papio doctor"
 	}
 	return fallback
 }
 
-// DecisionPendingMessage composes the reminder copy shared by action-reminder
-// producers and notify preview/test. Classes are optional for callers that
-// only have an aggregate count; producer detail remains additive.
-func DecisionPendingMessage(total int, oldestSeconds int64, classes map[string]int) string {
+// ReminderClass is one recovery class in a pending-decision digest. Callers
+// pass classes in their own priority order and the digest preserves it.
+type ReminderClass struct {
+	Name  string
+	Count int
+}
+
+// DecisionPendingMessage composes the reminder digest copy shared by the
+// action-reminder producer and notify preview/test. Classes are optional for
+// callers that only have an aggregate count, and an unknown oldest age
+// (oldestSeconds <= 0) omits the age clause instead of inventing one.
+func DecisionPendingMessage(total int, oldestSeconds int64, classes []ReminderClass) string {
 	if total < 1 {
 		total = 1
 	}
-	age := "now"
+	subject := fmt.Sprintf("%d papers need your attention", total)
+	if total == 1 {
+		subject = "1 paper needs your attention"
+	}
+	clauses := make([]string, 0, 2)
+	if len(classes) > 0 {
+		names := make([]string, 0, len(classes))
+		for _, class := range classes {
+			names = append(names, fmt.Sprintf("%s: %d", class.Name, class.Count))
+		}
+		clauses = append(clauses, strings.Join(names, ", "))
+	}
+	if oldestSeconds > 0 {
+		clauses = append(clauses, "oldest waiting "+reminderAge(oldestSeconds))
+	}
+	if len(clauses) == 0 {
+		return subject + " — run: papio actions list"
+	}
+	return subject + " — " + strings.Join(clauses, "; ") + " — run: papio actions list"
+}
+
+// reminderAge renders a coarse waiting age using the same rounding the
+// action-reminder producer has always used. It is called only for a known
+// positive age.
+func reminderAge(seconds int64) string {
 	switch {
-	case oldestSeconds >= 36*3600:
-		age = fmt.Sprintf("%dd", (oldestSeconds+18*3600)/(36*3600))
-	case oldestSeconds >= 90*60:
-		age = fmt.Sprintf("%dh", (oldestSeconds+1800)/(3600))
-	case oldestSeconds >= 90:
-		age = fmt.Sprintf("%dm", (oldestSeconds+30)/60)
-	case oldestSeconds > 0:
-		age = fmt.Sprintf("%ds", oldestSeconds)
+	case seconds >= 24*3600:
+		return fmt.Sprintf("%dd", seconds/(24*3600))
+	case seconds >= 3600:
+		return fmt.Sprintf("%dh", seconds/3600)
+	default:
+		minutes := seconds / 60
+		if minutes < 1 {
+			minutes = 1
+		}
+		return fmt.Sprintf("%dm", minutes)
 	}
-	if len(classes) == 0 {
-		return fmt.Sprintf("%d papers need your attention — oldest waiting %s — run: papio actions list", total, age)
-	}
-	names := make([]string, 0, len(classes))
-	for name, count := range classes {
-		names = append(names, fmt.Sprintf("%s: %d", name, count))
-	}
-	sort.Strings(names)
-	return fmt.Sprintf("%d papers need your attention — %s; oldest waiting %s — run: papio actions list", total, strings.Join(names, ", "), age)
 }

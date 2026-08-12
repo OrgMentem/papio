@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"papio/internal/job"
@@ -341,8 +340,13 @@ func (b actionReminderBatch) message(class actionReminderClass) string {
 	}
 	return fmt.Sprintf("%d %s %s been waiting %s %s — run: %s", count, paper, verb, actionReminderAge(b.oldestAge), recovery, command)
 }
+
+// digestReminderMessage composes one bounded digest across every due recovery
+// class. A single due class keeps its class-specific instruction; the
+// multi-class form is the shared notify vocabulary, so preview, test, and this
+// producer cannot drift apart.
 func digestReminderMessage(waiting [actionReminderClassCount]actionReminderBatch, due [actionReminderClassCount]bool) string {
-	classes := make([]string, 0, actionReminderClassCount)
+	classes := make([]notify.ReminderClass, 0, actionReminderClassCount)
 	total := 0
 	var oldest time.Duration
 	var only actionReminderClass
@@ -358,13 +362,12 @@ func digestReminderMessage(waiting [actionReminderClassCount]actionReminderBatch
 		}
 		only = class
 		classCount++
-		classes = append(classes, fmt.Sprintf("%s: %d", reminderClassName(class), count))
+		classes = append(classes, notify.ReminderClass{Name: reminderClassName(class), Count: count})
 	}
 	if classCount == 1 {
 		return waiting[only].message(only)
 	}
-	return fmt.Sprintf("%d papers need your attention — %s; oldest waiting %s — run: papio actions list",
-		total, strings.Join(classes, ", "), actionReminderAge(oldest))
+	return notify.DecisionPendingMessage(total, int64(oldest/time.Second), classes)
 }
 
 func reminderClassName(class actionReminderClass) string {

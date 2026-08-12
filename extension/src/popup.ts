@@ -32,13 +32,7 @@ import {
   type KeepaliveSnapshot,
 } from "./keepalive";
 import { renderPapio } from "./dom";
-import {
-  EST_MINUTES_SAVED_PER_PAPER,
-  formatHoursSaved,
-  formatShare,
-  parseStatsReply,
-  type AcquisitionStats,
-} from "./stats";
+import { formatShare, parseStatsReply, type AcquisitionStats } from "./stats";
 
 
 declare const __PAPIO_DEV_CAPTURE__: boolean;
@@ -1559,7 +1553,8 @@ function historyPagePath(): string {
 /**
  * Fill the "Your papio impact" summary, or hide the whole section when stats
  * are unavailable (daemon offline or too old) — the popup stays a launcher,
- * never an error surface.
+ * never an error surface. Both figures are measured: a count of acquired jobs
+ * and its share of finished ones. papio never estimates time saved.
  */
 export function renderImpactSummary(
   doc: Document,
@@ -1567,15 +1562,13 @@ export function renderImpactSummary(
 ): void {
   const section = doc.getElementById("impact-summary");
   const acquired = doc.getElementById("impact-acquired");
-  const timeSaved = doc.getElementById("impact-time-saved");
   const successRate = doc.getElementById("impact-success-rate");
-  if (!section || !acquired || !timeSaved || !successRate) return;
+  if (!section || !acquired || !successRate) return;
   if (stats === null) {
     section.hidden = true;
     return;
   }
   acquired.textContent = String(stats.acquired_total);
-  timeSaved.textContent = formatHoursSaved(stats.acquired_total * EST_MINUTES_SAVED_PER_PAPER);
   successRate.textContent = formatShare(stats.acquired_total, stats.acquired_total + stats.failed_total);
   section.hidden = false;
 }

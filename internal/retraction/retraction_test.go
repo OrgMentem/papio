@@ -332,6 +332,32 @@ func TestSweepCommitsPartialResultsAndRetainsFailedDOI(t *testing.T) {
 	}
 }
 
+// TestIntegrityNoticeCopyNamesARecoverableSurface pins the two forms of scan
+// copy: one finding keeps its DOI identity, a whole scan reuses the shared
+// integrity vocabulary, and neither leaves the reader without a papio surface
+// on which the durable notices can be found.
+func TestIntegrityNoticeCopyNamesARecoverableSurface(t *testing.T) {
+	retracted := Finding{DOI: "10.1234/one", Nature: NatureRetraction, NoticeDOI: "10.2000/one"}
+	corrected := Finding{DOI: "10.1234/two", Nature: NatureCorrection}
+	cases := []struct {
+		name     string
+		findings []Finding
+		want     string
+	}{
+		{name: "one finding with a notice DOI", findings: []Finding{retracted},
+			want: "Library retraction notice for DOI 10.1234/one (notice DOI 10.2000/one) — open the papio inbox"},
+		{name: "one finding without a notice DOI", findings: []Finding{corrected},
+			want: "Library correction notice for DOI 10.1234/two — open the papio inbox"},
+		{name: "whole scan", findings: []Finding{retracted, corrected},
+			want: "2 library integrity notices — open the papio inbox"},
+	}
+	for _, tc := range cases {
+		if got := integrityNoticeMessage(tc.findings); got != tc.want {
+			t.Fatalf("%s = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestSweepAllLookupFailuresLeaveCacheUntouched(t *testing.T) {
 	ctx := context.Background()
 	jobs := testStore(t)

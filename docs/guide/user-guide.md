@@ -567,11 +567,10 @@ wrong-work, encrypted, or active-content rejection.
 ## See your acquisition history and impact
 
 The extension popup shows a compact **Your papio impact** summary — papers
-acquired, an estimated time saved, and your success rate — with a **View
-history** link that opens a full-tab history page. The time-saved figure is
-a rough estimate (about 5 minutes of manual chasing per acquired paper) that
-the extension itself computes; *papio* does not measure how long anything
-actually took you.
+acquired and your success rate — with a **View history** link that opens a
+full-tab history page. Both figures are counted from your own job records:
+*papio* reports what it did and does not estimate time saved, hours of
+searching avoided, or any other figure it cannot measure.
 
 The history page adds a 12-week chart of weekly acquisitions, your success
 rate (acquired vs. failed), a breakdown by access route (open access /
