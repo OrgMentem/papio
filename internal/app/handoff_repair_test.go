@@ -185,6 +185,12 @@ func TestHandoffRepairerHealsStrandedNeedsReview(t *testing.T) {
 		if len(actions) != 1 || actions[0].Kind != "manual_download" || !actions[0].RequiresAuth {
 			t.Fatalf("open actions = %+v, want one auth-requiring manual_download", actions)
 		}
+		// No provider-specific fault was observed here, so the repair records
+		// the plain manual-download reason rather than leaving the column NULL
+		// and making the family breakdown incomplete.
+		if got := actionDiagnosis(t, jobs, actions[0].ID); got != job.DiagnosisReasonInstitutionalHandoff {
+			t.Fatalf("diagnosis = %q, want %q", got, job.DiagnosisReasonInstitutionalHandoff)
+		}
 	})
 
 	t.Run("replacement inherits the resolved handoff's sign-in requirement", func(t *testing.T) {

@@ -57,7 +57,10 @@ func newBridgeWithHoldings(t *testing.T, holdings holdingsProvider) (*Bridge, *j
 	return newBridgeWithHoldingsAndZotio(t, holdings, nil)
 }
 
-func newBridgeWithHoldingsAndZotio(t *testing.T, holdings holdingsProvider, zotioService *zotio.Service) (*Bridge, *job.Store, config.Config, string) {
+// tweak, when supplied, adjusts the pinned config before the service and
+// bridge are built — the seam a test needs when it must exercise an adoption
+// root layout other than the default pinned one.
+func newBridgeWithHoldingsAndZotio(t *testing.T, holdings holdingsProvider, zotioService *zotio.Service, tweak ...func(*config.Config)) (*Bridge, *job.Store, config.Config, string) {
 	t.Helper()
 	ctx := context.Background()
 	data := t.TempDir()
@@ -77,9 +80,15 @@ func newBridgeWithHoldingsAndZotio(t *testing.T, holdings holdingsProvider, zoti
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeDelegated
 	cfg.DataDir = data
+	// Adoption is a filesystem contract: pin the root to this test's data
+	// dir so nothing here ever reaches the real <downloads>/papio default.
+	cfg.Browser.AdoptionRoot = filepath.Join(data, "adoptions")
 	cfg.Browser.ExtensionID = strings.Repeat("a", 32)
 	cfg.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
 	cfg.Browser.ActionExpirySeconds = 1800
+	for _, fn := range tweak {
+		fn(&cfg)
+	}
 	jobs := &job.Store{S: db}
 	watches := watch.NewStore(db)
 	triageService := triage.New(db, watches, jobs)
@@ -3793,10 +3802,13 @@ func TestScanAdoptionResumesAfterHungReadDirReturnsAndAdoptsSettledFile(t *testi
 
 func TestProviderOutcomeMappings(t *testing.T) {
 	type expect struct {
+		outcome      string // wire outcome; defaults to the case name
+		adapterID    string // adapter_id on the frame; "" means none was sent
 		state        string
 		actionStatus string // status the openurl_handoff action should end in
 		extraAction  string // additional open action kind expected
 		extraDetail  string // detail expected on the additional open action
+		diagnosis    string // durable human_actions.diagnosis expected
 		terminal     string
 	}
 	cases := map[string]expect{
@@ -3806,17 +3818,33 @@ func TestProviderOutcomeMappings(t *testing.T) {
 		"wrong_work": {
 			state: job.StateAwaitingHuman, actionStatus: "resolved", extraAction: "manual_download",
 			extraDetail: "papio reached a different work; find and download the requested PDF yourself",
+			diagnosis:   job.DiagnosisReasonWrongWork,
+		},
+		// The two ui_changed reasons are told apart by adapter_id alone. An
+		// adapter that reported the page means it stopped matching (drift);
+		// no adapter means none ever claimed the page. The prose that used to
+		// make this call is deliberately absent from both frames.
+		"ui_changed_adapter_drift": {
+			outcome: "ui_changed", adapterID: "sciencedirect",
+			state: job.StateAwaitingHuman, actionStatus: "resolved", extraAction: "manual_download",
+			extraDetail: "papio could not drive the provider page; download the PDF yourself and papio will adopt it",
+			diagnosis:   job.DiagnosisReasonProviderAdapterDrift,
 		},
 		"ui_changed": {
 			state: job.StateAwaitingHuman, actionStatus: "resolved", extraAction: "manual_download",
-			extraDetail: "papio could not drive the provider page; download the PDF yourself and papio will adopt it",
+			extraDetail: "papio has no adapter for this provider yet; download the PDF yourself for now",
+			diagnosis:   job.DiagnosisReasonProviderAdapterMissing,
 		},
 		"rate_limited":              {state: job.StateRetryWait, actionStatus: "resolved"},
 		"human_auth_required":       {state: job.StateAwaitingHuman, actionStatus: "open", extraAction: "human_auth_required"},
 		"terms_acceptance_required": {state: job.StateAwaitingHuman, actionStatus: "open", extraAction: "terms_acceptance_required"},
 	}
-	for outcome, want := range cases {
-		t.Run(outcome, func(t *testing.T) {
+	for name, want := range cases {
+		outcome := want.outcome
+		if outcome == "" {
+			outcome = name
+		}
+		t.Run(name, func(t *testing.T) {
 			classifications := []struct {
 				name         string
 				requiresAuth bool
@@ -3834,7 +3862,7 @@ func TestProviderOutcomeMappings(t *testing.T) {
 				t.Run(classification.name, func(t *testing.T) {
 					b, jobs, _, _ := newBridge(t)
 					ctx := context.Background()
-					id := park(t, jobs, "wr_"+outcome, handoffWork())
+					id := park(t, jobs, "wr_"+name, handoffWork())
 					if want.extraAction == "manual_download" {
 						if _, err := jobs.S.DB().ExecContext(ctx,
 							`UPDATE human_actions SET requires_auth = ? WHERE job_id = ? AND kind = ?`,
@@ -3848,7 +3876,11 @@ func TestProviderOutcomeMappings(t *testing.T) {
 						}
 					}
 					runSync(t, b, hello())
-					runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": outcome}))
+					frame := map[string]any{"outcome": outcome}
+					if want.adapterID != "" {
+						frame["adapter_id"] = want.adapterID
+					}
+					runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, frame))
 
 					row, err := jobs.Get(ctx, id)
 					if err != nil {
@@ -3889,6 +3921,16 @@ func TestProviderOutcomeMappings(t *testing.T) {
 					}
 					if want.extraAction == "manual_download" && extraOpen[0].RequiresAuth != classification.requiresAuth {
 						t.Fatalf("manual_download requires_auth = %t, want %t", extraOpen[0].RequiresAuth, classification.requiresAuth)
+					}
+					if want.diagnosis != "" {
+						var diagnosis string
+						if err := jobs.S.DB().QueryRowContext(ctx,
+							`SELECT COALESCE(diagnosis, '') FROM human_actions WHERE id = ?`, extraOpen[0].ID).Scan(&diagnosis); err != nil {
+							t.Fatal(err)
+						}
+						if diagnosis != want.diagnosis {
+							t.Fatalf("durable diagnosis = %q, want %q", diagnosis, want.diagnosis)
+						}
 					}
 				})
 			}

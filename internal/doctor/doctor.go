@@ -83,6 +83,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		add("data_dir", Pass, "private writable data directory", "")
 	}
 	checkAdoptionRoot(cfg, add)
+	checkLegacyAdoptionRoot(cfg, add)
 	if cfg.Path != "" {
 		if info, err := os.Stat(cfg.Path); err == nil {
 			if info.Mode().Perm()&0o077 != 0 {
@@ -344,28 +345,94 @@ func checkDataDir(path string) error {
 // exercise the timeout/EPERM paths without a real TCC-protected filesystem.
 var adoptionRootReadDir func(string) ([]os.DirEntry, error)
 
-// checkAdoptionRoot reports the health of the browser adoption root
-// (download_adoption_root, default <data_dir>/adoptions). macOS's TCC layer
-// can make ReadDir on a folder under a protected location (a
-// download_adoption_root left under ~/Downloads is the case that bit
-// production) block in-kernel forever, waiting on a consent decision only an
+// checkAdoptionRoot reports whether the browser adoption root
+// (download_adoption_root, default <user downloads dir>/papio) is both
+// REACHABLE and healthy, in that order.
+//
+// Reachability first, because it is the failure that produces no symptom at
+// all. A browser can only steer a download to a path relative to its own
+// download directory whose first segment is "papio"
+// (config.AdoptionDirName), so a root that is not such a directory adopts
+// nothing, forever, silently — which is exactly what the historical
+// <data_dir>/adoptions default did. A readable directory nobody can write to
+// is not a passing adoption root, so this reports Fail, not Warn, and names
+// the effective path.
+//
+// Health second: macOS's TCC layer can make ReadDir on a folder under a
+// protected location (Downloads is one, which is precisely where a correct
+// root lives) block in-kernel forever, waiting on a consent decision only an
 // interactive process can supply — the same wall Bridge.scanAdoptionDir
 // latches against. The probe is bounded the same way (browser.BoundedReadDir)
 // so doctor itself can never hang on it. ENOENT stays healthy: the root
-// simply has not been created yet, exactly today's pre-first-download state.
+// simply has not been created yet, which is the pre-first-download state
+// `papio init` normally resolves.
 func checkAdoptionRoot(cfg config.Config, add func(string, string, string, string)) {
 	root := cfg.EffectiveAdoptionRoot()
+	if !config.BrowserSteerableAdoptionRoot(root) {
+		add("adoption_root", Fail,
+			fmt.Sprintf("%s cannot receive browser downloads: steering can only write to a %q directory inside the browser's own download folder, so nothing is ever adopted", root, config.AdoptionDirName),
+			fmt.Sprintf("clear download_adoption_root to use the default %s, or set it to <your browser download folder>/%s", config.DefaultAdoptionRoot(), config.AdoptionDirName))
+		return
+	}
 	_, err := browser.BoundedReadDir(root, adoptionRootReadDir, nil)
 	switch {
-	case err == nil, errors.Is(err, os.ErrNotExist):
-		add("adoption_root", Pass, fmt.Sprintf("%s is readable", root), "")
 	case errors.Is(err, browser.ErrAdoptionScanTimeout), errors.Is(err, os.ErrPermission):
 		add("adoption_root", Fail,
 			fmt.Sprintf("%s did not respond to a directory listing (macOS privacy consent?)", root),
 			fmt.Sprintf("grant the papio binary access to %s in System Settings \u2192 Privacy & Security \u2192 Files and Folders (or Full Disk Access) \u2014 every dev rebuild resets that consent \u2014 or move download_adoption_root to a different folder", root))
-	default:
+	case err != nil && !errors.Is(err, os.ErrNotExist):
 		add("adoption_root", Fail, fmt.Sprintf("%s: %v", root, err), "check the adoption root's permissions and try again")
+	case filepath.Dir(filepath.Clean(root)) != config.UserDownloadsDir():
+		add("adoption_root", Warn,
+			fmt.Sprintf("%s is readable, but it is not inside this account's download folder (%s)", root, config.UserDownloadsDir()),
+			fmt.Sprintf("adoption only works if the browser's download folder is %s; otherwise clear download_adoption_root to use %s", filepath.Dir(filepath.Clean(root)), config.DefaultAdoptionRoot()))
+	default:
+		add("adoption_root", Pass, fmt.Sprintf("%s is readable and reachable by browser steering", root), "")
 	}
+}
+
+// checkLegacyAdoptionRoot names the upgrade situation the adoption-root
+// default change creates: an install that predates it may still hold
+// downloads under <data_dir>/adoptions. papio keeps that directory in its
+// read path — settled files there are still adopted — but it never writes to
+// it, and it only collects a landing directory there once the job's bytes are
+// provably in the artifact store. So the folder can retain husks papio will
+// not delete on the operator's behalf, and this check is how they learn it is
+// theirs to remove. It counts landing directories rather than raw entries: a
+// stray .DS_Store must not produce a permanent warning about files that are
+// not there.
+func checkLegacyAdoptionRoot(cfg config.Config, add func(string, string, string, string)) {
+	legacy := cfg.LegacyAdoptionRoot()
+	if legacy == "" {
+		return
+	}
+	entries, err := browser.BoundedReadDir(legacy, adoptionRootReadDir, nil)
+	if err != nil {
+		return // absent or unreadable: nothing actionable to say here
+	}
+	landing := 0
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			landing++
+		}
+	}
+	if landing == 0 {
+		return
+	}
+	add("adoption_root_legacy", Warn,
+		fmt.Sprintf("%s still holds %d job director%s from the superseded adoption root; papio still adopts settled files from it but never writes to it",
+			legacy, landing, plural(landing, "y", "ies")),
+		fmt.Sprintf("no action is required \u2014 new downloads land in %s. Once nothing there is still wanted, delete %s yourself; papio will not remove a download it cannot prove is already in the artifact store",
+			cfg.EffectiveAdoptionRoot(), legacy))
+}
+
+// plural picks a suffix without dragging a formatting dependency into a
+// single doctor line.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // checkResolverBases warns when an OpenURL base points at a raw Alma uresolver

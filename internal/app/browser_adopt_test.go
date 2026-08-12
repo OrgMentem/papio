@@ -458,10 +458,30 @@ func TestAdoptDownloadValidationFailurePreservesHandoffAccess(t *testing.T) {
 			if !action.RequiresAuth || action.BlockedBy != "paywall" {
 				t.Fatalf("replacement access = requires_auth %t, blocked_by %q, want true/paywall", action.RequiresAuth, action.BlockedBy)
 			}
+			// The row must say WHY it exists, durably. Without it the inbox
+			// tells the researcher to "download the PDF" when the real ask is
+			// to replace the one papio already rejected.
+			if got := actionDiagnosis(t, jobs, action.ID); got != job.DiagnosisReasonAdoptedPDFInvalid {
+				t.Fatalf("diagnosis = %q, want %q", got, job.DiagnosisReasonAdoptedPDFInvalid)
+			}
 			return
 		}
 	}
 	t.Fatal("missing replacement manual_download action")
+}
+
+// actionDiagnosis reads the durable human_actions.diagnosis column. It is read
+// directly rather than through job.HumanAction because the column has exactly
+// one consumer — the triage family projection — and a struct field with no
+// production reader would be dead weight on every action query.
+func actionDiagnosis(t *testing.T, jobs *job.Store, actionID int64) string {
+	t.Helper()
+	var diagnosis string
+	if err := jobs.S.DB().QueryRowContext(context.Background(),
+		`SELECT COALESCE(diagnosis, '') FROM human_actions WHERE id = ?`, actionID).Scan(&diagnosis); err != nil {
+		t.Fatal(err)
+	}
+	return diagnosis
 }
 
 func TestAcceptedAdoptionReviewReusesExactContentOverride(t *testing.T) {
@@ -607,6 +627,18 @@ func TestAdoptDownloadRejectedUnquarantinableGoesNeedsReview(t *testing.T) {
 	// The file remains where the user can act on it.
 	if _, statErr := os.Stat(pdfPath); statErr != nil {
 		t.Fatalf("rejected file not preserved: %v", statErr)
+	}
+	// The other rejected-file producer carries the same durable reason: which
+	// branch quarantining took does not change what the researcher must do.
+	open, err := jobs.ListOpenHumanActionsForJobs(context.Background(), []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].Kind != "manual_download" {
+		t.Fatalf("open actions = %+v, want one manual_download", open)
+	}
+	if got := actionDiagnosis(t, jobs, open[0].ID); got != job.DiagnosisReasonAdoptedPDFInvalid {
+		t.Fatalf("diagnosis = %q, want %q", got, job.DiagnosisReasonAdoptedPDFInvalid)
 	}
 }
 

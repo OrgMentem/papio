@@ -37,6 +37,7 @@ async function settle(): Promise<void> {
 
 async function inboxDocument(
   reply: (message: RuntimeRequest) => unknown | Promise<unknown>,
+  options: { downloadSteering?: boolean } = {},
 ): Promise<{ document: Document; window: Window; requests: RuntimeRequest[]; opened: string[] }> {
   const window = new Window();
   window.document.write(readFileSync(new URL("../src/inbox.html", import.meta.url), "utf8"));
@@ -64,6 +65,12 @@ async function inboxDocument(
           return reply(message);
         },
       },
+      // Chrome exposes chrome.downloads.onDeterminingFilename; Firefox has no
+      // equivalent. The page reads that capability, never the user agent, so
+      // the two platform routes are exercised by presence alone.
+      downloads: options.downloadSteering === true
+        ? { onDeterminingFilename: { addListener: () => undefined } }
+        : {},
     },
   });
   importSerial += 1;
@@ -558,6 +565,212 @@ test("a singleton family starts its own card instead of joining the block above"
   expect(rows.map((row) => row.dataset.cardEnd ?? "")).toEqual(["", "true", "true", "true"]);
   // Exactly one heading, and it must not sit above the singletons.
   expect(page.document.querySelectorAll(".family-heading")).toHaveLength(1);
+});
+
+type GuidanceVariant = NonNullable<TriageSnapshotItem["guidance_variant"]>;
+
+// One manual-download family of `details.length` rows. A null detail means the
+// daemon shipped no reason prose for that row.
+function manualFamilyFixture(variant: GuidanceVariant, details: ReadonlyArray<string | null>): FixtureSnapshot {
+  const runKey = `run_${variant}`;
+  const items = details.map((detail, index) => {
+    const item = manualAction(`action:${variant}-${index + 1}`, index + 1, `Paper ${index + 1}`);
+    item.run_key = runKey;
+    item.next_actor = "researcher";
+    item.guidance_variant = variant;
+    item.operation_variant = "dismiss_only";
+    if (detail !== null) item.facts = [...item.facts, { label: "Detail", text: detail }];
+    return item;
+  });
+  return snapshot(items, {
+    schema: 5,
+    counts: counts({
+      pending_total: items.length,
+      actions: items.length,
+      watch_hits: 0,
+      retractions: 0,
+      turns_required: items.length,
+      turns_working: 0,
+      family_breakdown_complete: true,
+      family_runs: [{
+        run_key: runKey,
+        first_rank: 1,
+        route_class: "manual_download",
+        action_kind: "manual_download",
+        next_actor: "researcher",
+        guidance_variant: variant,
+        operation_variant: "dismiss_only",
+        count: items.length,
+      }],
+    }),
+  });
+}
+
+// Five genuinely different situations mint a manual download. Collapsing them
+// into one family told six researchers to re-download the exact file papio had
+// already rejected, so each one owns its heading and its imperative.
+const MANUAL_FAMILY_COPY: ReadonlyArray<[GuidanceVariant, string, string]> = [
+  ["manual_download", "Manual downloads · 2 papers", "Download each PDF — papio takes it from there."],
+  [
+    "manual_download_adapter_missing",
+    "Manual downloads · no adapter yet · 2 papers",
+    "papio has no adapter for these providers yet. Download each PDF — papio takes it from there.",
+  ],
+  [
+    "manual_download_page_undriveable",
+    "Manual downloads · page changed · 2 papers",
+    "papio could not drive these provider pages. Download each PDF — papio takes it from there.",
+  ],
+  [
+    "manual_download_rejected_file",
+    "Replace rejected files · 2 papers",
+    "The file papio adopted was not the paper. Download a different PDF for each.",
+  ],
+  [
+    "manual_download_wrong_work",
+    "Wrong paper reached · 2 papers",
+    "papio landed on a different work. Find and download the requested PDF.",
+  ],
+];
+
+test("each manual-download variant renders its own heading and instruction", async () => {
+  const rendered: string[] = [];
+  for (const [variant, heading, instruction] of MANUAL_FAMILY_COPY) {
+    const page = await inboxDocument((message) => snapshotReply(manualFamilyFixture(variant, [null, null]), message));
+    expect(page.document.querySelector(".family-heading")?.textContent).toBe(heading);
+    expect(page.document.querySelector(".family-guidance")?.textContent).toBe(instruction);
+    rendered.push(`${heading}|${instruction}`);
+  }
+  // No two situations may read alike.
+  expect(new Set(rendered).size).toBe(MANUAL_FAMILY_COPY.length);
+});
+
+test("a family block prints its instruction exactly once however many rows it holds", async () => {
+  const fixture = manualFamilyFixture("manual_download", Array.from({ length: 12 }, () => null));
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const list = page.document.getElementById("item-list");
+
+  expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(12);
+  expect((list?.textContent ?? "").split("Download each PDF — papio takes it from there.")).toHaveLength(2);
+  // The hoisted paragraph is the only guidance line in the block; no row
+  // repeats it as its own instruction.
+  expect(page.document.querySelectorAll(".item-guidance")).toHaveLength(1);
+});
+
+test("a rejected file cannot be mistaken for an ordinary manual download", async () => {
+  const plain = await inboxDocument((message) =>
+    snapshotReply(manualFamilyFixture("manual_download", [null, null]), message));
+  const rejected = await inboxDocument((message) =>
+    snapshotReply(manualFamilyFixture("manual_download_rejected_file", [null, null]), message));
+
+  const plainBadge = plain.document.querySelector<HTMLElement>(".item-status");
+  const rejectedBadge = rejected.document.querySelector<HTMLElement>(".item-status");
+  expect(plainBadge?.textContent).toBe("↓");
+  expect(rejectedBadge?.textContent).toBe("↺");
+  expect(rejectedBadge?.dataset.status).toBe("manual_download_rejected_file");
+  expect(rejectedBadge?.getAttribute("aria-label")).toBe("Rejected file — download a different PDF");
+
+  // The trap this closes: sending the researcher back for the same file papio
+  // already refused.
+  const copy = rejected.document.querySelector(".family-guidance")?.textContent ?? "";
+  expect(copy).toContain("Download a different PDF");
+  expect(copy).not.toContain("papio takes it from there");
+});
+
+test("a lone rejected-file row keeps its own imperative without a family", async () => {
+  const page = await inboxDocument((message) =>
+    snapshotReply(manualFamilyFixture("manual_download_rejected_file", [null]), message));
+
+  expect(page.document.querySelectorAll(".family-heading")).toHaveLength(0);
+  expect(page.document.querySelector(".item-guidance")?.firstChild?.textContent).toBe(
+    "The file papio adopted was not the paper. Download a different PDF.",
+  );
+});
+
+test("a row whose reason differs from its family's shows one bounded reason line", async () => {
+  const fixture = manualFamilyFixture("manual_download_page_undriveable", [
+    "the publisher page changed shape; download the requested PDF yourself and papio will adopt it",
+    "the download control never responded; download the requested PDF yourself and papio will adopt it",
+  ]);
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  const reasons = Array.from(page.document.querySelectorAll(".item-reason")).map((node) => node.textContent);
+  expect(reasons).toEqual(["the publisher page changed shape", "the download control never responded"]);
+  // A reason is the part the heading cannot carry — never a second copy of the
+  // hoisted instruction, and never the whole prose blob.
+  for (const reason of reasons) {
+    expect(reason).not.toContain("papio takes it from there");
+    expect(reason).not.toContain("download the requested PDF yourself");
+  }
+  // The full prose stays recoverable behind the row's disclosure.
+  const debug = page.document.querySelector<HTMLDListElement>(".item-debug");
+  expect(debug?.hidden).toBe(true);
+  expect(debug?.textContent).toContain("download the requested PDF yourself and papio will adopt it");
+
+  // Rule 13: the row's controls name the hoisted instruction, the platform
+  // route, and this row's own reason.
+  const row = page.document.querySelector("[data-triage-item-id='action:manual_download_page_undriveable-1']");
+  const described = row?.querySelector("button[data-operation]")?.getAttribute("aria-describedby") ?? "";
+  const familyID = page.document.querySelector(".family-guidance")?.id ?? "";
+  const reasonID = page.document.querySelector(".item-reason")?.id ?? "";
+  expect(familyID).not.toBe("");
+  expect(reasonID).not.toBe("");
+  expect(described.split(" ")).toContain(familyID);
+  expect(described.split(" ")).toContain(reasonID);
+});
+
+test("a family whose rows share one reason prints no per-row reason line", async () => {
+  const shared = "no source-controlled adapter matched this provider";
+  const fixture = manualFamilyFixture("manual_download_adapter_missing", [shared, shared, shared]);
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(3);
+  expect(page.document.querySelectorAll(".item-reason")).toHaveLength(0);
+  expect(page.document.querySelectorAll(".family-guidance")).toHaveLength(1);
+});
+
+test("an over-long or multi-line row reason is bounded to one line", async () => {
+  const long = `${"unbounded provider prose ".repeat(40)}tail`;
+  const fixture = manualFamilyFixture("manual_download_page_undriveable", [
+    long,
+    "a\n\n  short   second\treason",
+  ]);
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const reasons = Array.from(page.document.querySelectorAll(".item-reason")).map((node) => node.textContent ?? "");
+
+  expect(long.length).toBeGreaterThan(400);
+  expect(reasons[0]?.length).toBeLessThanOrEqual(120);
+  expect(reasons[0]?.endsWith("…")).toBe(true);
+  // Whitespace is collapsed exactly as every other untrusted string is.
+  expect(reasons[1]).toBe("a short second reason");
+});
+
+test("the manual-download route is honest on each platform and names no path", async () => {
+  const withoutSteering = await inboxDocument((message) =>
+    snapshotReply(manualFamilyFixture("manual_download", [null, null]), message));
+  const route = withoutSteering.document.querySelector(".family-mechanism")?.textContent ?? "";
+  expect(route).toBe(
+    "This browser cannot pass a saved download to papio. Open the PDF and use Send PDF in the papio toolbar popup instead.",
+  );
+  // One block, one route line — not one per row.
+  expect(withoutSteering.document.querySelectorAll(".family-mechanism")).toHaveLength(1);
+
+  const withSteering = await inboxDocument(
+    (message) => snapshotReply(manualFamilyFixture("manual_download", [null, null]), message),
+    { downloadSteering: true },
+  );
+  expect(withSteering.document.querySelector(".family-mechanism")).toBeNull();
+  const mechanism = withSteering.document.querySelector(".item-mechanism")?.textContent ?? "";
+  expect(mechanism).toContain("papio picks the download up from your browser's downloads");
+
+  // No surface may promise a folder: the adoption root is a daemon setting the
+  // browser cannot see, and a job id is never shown to the researcher.
+  for (const page of [withoutSteering, withSteering]) {
+    const text = page.document.body.textContent ?? "";
+    expect(text).not.toContain("Downloads/papio");
+    expect(text).not.toContain("<job>");
+    expect(text).not.toMatch(/papio\/[a-z<]/);
+  }
 });
 
 test("keyboard o sends an OA browser handoff through the broker", async () => {
@@ -1058,9 +1271,12 @@ test("expandable details carry mechanism copy and backend identifiers", async ()
   expect(row?.querySelector(".item-mechanism")?.textContent).toContain(
     "a resolver returned a landing page but no verified direct PDF",
   );
+  // The mechanism copy names the route, never a folder: the daemon's adoption
+  // root is invisible to the browser and the researcher never learns a job id.
   expect(row?.querySelector(".item-mechanism")?.textContent).toContain(
-    "papio adopts PDFs saved to Downloads/papio/<job>",
+    "Send PDF in the papio toolbar popup",
   );
+  expect(row?.querySelector(".item-mechanism")?.textContent).not.toContain("Downloads/papio");
   debugToggle?.click();
   expect(debugToggle?.getAttribute("aria-expanded")).toBe("true");
   expect(debug?.hidden).toBe(false);
@@ -1170,7 +1386,8 @@ test("keeps daemon detail and mechanism copy out of the always-visible row", asy
   const details = row?.querySelector<HTMLDListElement>(".item-debug");
   expect(details?.hidden).toBe(true);
   expect(details?.textContent).toContain("Download the requested PDF and papio will adopt it.");
-  expect(details?.textContent).toContain("Downloads/papio/<job>");
+  expect(details?.textContent).toContain("Send PDF in the papio toolbar popup");
+  expect(details?.textContent).not.toContain("Downloads/papio");
 });
 
 test("an author suffix duplicated in the title is stripped for display", async () => {

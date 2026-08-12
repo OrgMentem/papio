@@ -170,7 +170,7 @@ function isConnectionLost(value: unknown): boolean {
  * the same predicate that gates retry scheduling, so copy and retry can never
  * disagree. Everything else says what actually failed rather than fabricating a
  * transport cause the page cannot observe. Untrusted thrown text is bounded
- * exactly the way `boundedHandoffFailure` bounds runtime error copy in
+ * exactly the way `boundedProse` bounds runtime error copy in
  * inbox.ts: whitespace collapsed, capped at 240 characters. A thrown non-Error
  * (or an empty message) carries no trustworthy detail at all. */
 function thrownErrorMessage(error: unknown): string {

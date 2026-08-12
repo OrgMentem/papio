@@ -67,7 +67,7 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	}
 	var dbPass bool
 	for _, c := range report.Checks {
-		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 31") {
+		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 32") {
 			dbPass = true
 		}
 	}
@@ -116,27 +116,6 @@ func TestCheckAdoptionRootTimesOutAndFailsWithGrantRemediation(t *testing.T) {
 		!strings.Contains(c.Remediation, "Full Disk Access") ||
 		!strings.Contains(c.Remediation, "download_adoption_root") {
 		t.Fatalf("remediation = %q, want the TCC grant steps naming download_adoption_root", c.Remediation)
-	}
-}
-
-// TestCheckAdoptionRootMissingDirIsHealthy asserts ENOENT stays Pass: the
-// root simply has not been created yet (today's pre-first-download state),
-// not a permissions or hang failure.
-func TestCheckAdoptionRootMissingDirIsHealthy(t *testing.T) {
-	cfg := config.Default()
-	cfg.DataDir = t.TempDir() // adoptions/ under this root does not exist yet
-
-	var checks []Check
-	add := func(name, status, detail, remediation string) {
-		checks = append(checks, Check{Name: name, Status: status, Detail: detail, Remediation: remediation})
-	}
-	checkAdoptionRoot(cfg, add)
-	if len(checks) != 1 {
-		t.Fatalf("checks = %#v, want exactly one", checks)
-	}
-	c := checks[0]
-	if c.Name != "adoption_root" || c.Status != Pass {
-		t.Fatalf("check = %#v, want a Pass adoption_root check for a not-yet-created root", c)
 	}
 }
 

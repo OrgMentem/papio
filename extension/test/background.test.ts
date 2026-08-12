@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 
 import { parseBrowserMessage, type BrowserMessage, type PageCapturePayload } from "../src/protocol";
-import { emptyStore, jobDownloadFilename, type ActiveJob, type StateBackend, type StoreShape } from "../src/state";
+import { emptyStore, jobDownloadFilename, migrateManagedState, type ActiveJob, type StateBackend, type StoreShape } from "../src/state";
 import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
 import { KeepaliveManager, type FreshSessionEvidence, type KeepaliveAPI } from "../src/keepalive";
 import { type AdapterSpec, type PageVerdict } from "../src/adapters/types";
@@ -829,6 +829,57 @@ function snapshotResult(requestID: string, pending = 0, schema: 1 | 2 = 1): unkn
     has_more: false,
     unsupported_items_count: 0,
   });
+}
+
+/** One open `manual_download` row exactly as triage-snapshot/1 emits it. */
+function manualDownloadItem(jobID: string, actionID = 1): Record<string, unknown> {
+  return {
+    kind: "human_action",
+    id: `action:${actionID}`,
+    rank: actionID,
+    title: "Example work",
+    facts: [],
+    links: [],
+    ops: ["open", "dismiss"],
+    action_id: actionID,
+    job_id: jobID,
+    action_kind: "manual_download",
+    job_state: "awaiting_human",
+    revision: 1,
+    sha256: "",
+    size_bytes: 0,
+  };
+}
+
+/** Issue one triage snapshot request and settle it with exactly this page. */
+async function settleSnapshot(
+  h: Harness,
+  items: Record<string, unknown>[],
+  opts?: { hasMore?: boolean; unsupported?: number; cursor?: string },
+): Promise<void> {
+  const before = h.frames().filter((frame) => frame.type === "triage_snapshot_request").length;
+  const pending = h.bridge.requestTriageSnapshot({
+    schema_versions: [1],
+    ...(opts?.cursor === undefined ? {} : { cursor: opts.cursor }),
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const request = h.frames().filter((frame) => frame.type === "triage_snapshot_request")[before];
+  expect(request).toBeDefined();
+  const hasMore = opts?.hasMore === true;
+  await h.port.inbound(
+    nativeResult("triage_snapshot_response", {
+      request_id: request!.payload["request_id"],
+      schema: 1,
+      generated_at: "2027-01-01T00:00:00Z",
+      counts: { ...triageCounts(0), pending_total: items.length, actions: items.length },
+      items,
+      ...(hasMore ? { cursor: "next-page" } : {}),
+      has_more: hasMore,
+      unsupported_items_count: opts?.unsupported ?? 0,
+    }),
+  );
+  await expect(pending).resolves.toMatchObject({ ok: true });
 }
 
 test("hello is the first outgoing frame with a valid msg_id and seq 0", async () => {
@@ -1896,7 +1947,18 @@ test("an unregistered provider captures evidence and exits with a missing-adapte
       "No source-controlled adapter matched this provider page. " +
       "A sanitized diagnostic was saved locally for adapter development.",
   });
-  expect(h.backend.store.activeJobs).toHaveLength(0);
+  // The daemon opens a manual_download action from exactly this outcome, so the
+  // job survives as an inert correlation window rather than being deleted: it
+  // detaches from its tab, holds no drive authority, and keeps only the hosts
+  // correlate() needs to claim the researcher's own download.
+  expect(h.backend.store.activeJobs).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    job_id: "job_missing_adapter",
+    tab_id: -1,
+    status: "awaiting_download",
+  });
+  expect(h.backend.store.activeJobs[0]?.access_mode).toBeUndefined();
+  expect(h.backend.store.offerURLs?.["job_missing_adapter"]).toBeUndefined();
 });
 
 test("a registry-only adapter host classifies and emits an observed capture", async () => {
@@ -2307,6 +2369,225 @@ test("unknown retries report ui_changed once per drive and again for a re-offere
   expect(
     h.frames().filter((frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "ui_changed"),
   ).toHaveLength(2);
+});
+
+/** Drive one handoff all the way to the `ui_changed` provider outcome — the
+ * outcome from which the daemon opens a `manual_download` human action. Two
+ * spaced unknown observations are what escalates; the retry timers are how the
+ * fake clock reaches the second one. */
+async function driveToManualDownloadOutcome(h: Harness, jobID: string): Promise<number> {
+  const tabID = await classifyProviderUnknown(h, jobID);
+  for (let retry = 0; retry < 2; retry += 1) {
+    const timer = h.timers.at(-1);
+    expect(timer).toBeDefined();
+    h.clock.now += 2_500;
+    await timer!.fn();
+  }
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "ui_changed"),
+  ).toHaveLength(1);
+  return tabID;
+}
+
+/** The researcher's own click download: it comes from a tab papio never
+ * opened, so only the referrer host can correlate it. */
+function clickDownload(id: number, filename = "1234567.pdf"): DownloadItemLike {
+  return {
+    id,
+    tabId: 4242,
+    referrer: `https://${PROVIDER_HOST}/stable/challenge`,
+    url: `https://${PROVIDER_HOST}/stable/${filename}`,
+    filename,
+    state: "in_progress",
+  };
+}
+
+async function suggestFilenameFor(h: Harness, item: DownloadItemLike): Promise<string[]> {
+  const suggestions: string[] = [];
+  await h.downloads.onDeterminingFilename.emit(item, (s) => suggestions.push(s.filename));
+  return suggestions;
+}
+
+test("a ui_changed outcome retains a steering window for the researcher's own download", async () => {
+  // The daemon mints manual_download from this exact outcome. Deleting the job
+  // here used to switch Chrome steering off at the moment the action asking the
+  // researcher to download was created, so their file landed outside
+  // papio/<job_id>/ and was never adopted.
+  const jobID = "job_manual_window_steer";
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => false);
+  await driveToManualDownloadOutcome(h, jobID);
+
+  const retained = h.backend.store.activeJobs;
+  expect(retained).toHaveLength(1);
+  expect(retained[0]).toMatchObject({ job_id: jobID, tab_id: -1, status: "awaiting_download" });
+  expect(retained[0]?.provider_hosts).toContain(PROVIDER_HOST);
+  expect(retained[0]?.adapter_id).toBe("provider");
+  // No delegated authority and no retained offer URL: nothing autonomous can
+  // pick this record up and drive it again.
+  expect(retained[0]?.access_mode).toBeUndefined();
+  expect(h.backend.store.offerURLs?.[jobID]).toBeUndefined();
+
+  expect(await suggestFilenameFor(h, clickDownload(950))).toEqual([`papio/${jobID}/1234567.pdf`]);
+
+  h.downloads.items.set(950, {
+    id: 950,
+    filename: `/Users/x/Downloads/papio/${jobID}/1234567.pdf`,
+    fileSize: 1_500_000,
+    mime: "application/pdf",
+    state: "complete",
+  });
+  await h.downloads.onCreated.emit(clickDownload(950));
+  await h.downloads.onChanged.emit({ id: 950, state: { current: "complete" } });
+  const complete = h.frames().find((frame) => frame.type === "download_complete" && frame.job_id === jobID);
+  expect(complete?.payload["filename"]).toBe("1234567.pdf");
+});
+
+test("a retained steering window frees the governor slot and disarms its drive timeout", async () => {
+  const jobID = "job_manual_window_governor";
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => false);
+  await driveToManualDownloadOutcome(h, jobID);
+  const internals = h.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+    handoffDriveTimeouts: Map<string, unknown>;
+    handoffDriveQueue: Array<{ jobID: string }>;
+  };
+  // The daemon's "busy" refusal semantics assume the extension never holds a
+  // drive slot for a job it is not driving. A parked window drives nothing.
+  expect(internals.handoffDrives.has(jobID)).toBe(false);
+  expect(internals.handoffDrives.size).toBe(0);
+  expect(internals.handoffDriveQueue).toHaveLength(0);
+  expect(internals.handoffDriveTimeouts.has(jobID)).toBe(false);
+
+  // 180_000 is HANDOFF_DRIVE_TIMEOUT_MS. The timer object still exists — the
+  // fake clock cannot unschedule — so firing it must be inert: a parked window
+  // has no drive to stall, and an auth_pending frame here would tell the
+  // daemon the researcher is mid sign-in on work already handed back to them.
+  const framesBefore = h.frames().length;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(driveTimeout).toBeDefined();
+  h.clock.now += 180_000;
+  await driveTimeout!.fn();
+  expect(h.frames().slice(framesBefore)).toHaveLength(0);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({ job_id: jobID, tab_id: -1, status: "awaiting_download" });
+
+  // The freed slot is real capacity, not bookkeeping: the next offer drives
+  // immediately instead of queueing behind the parked window.
+  await h.port.inbound(jobOffer("job_manual_window_next", "https://resolver.example.edu/openurl?ctx=next"));
+  expect(internals.handoffDrives.has("job_manual_window_next")).toBe(true);
+  expect(internals.handoffDriveQueue).toHaveLength(0);
+  expect(h.tabs.created).toHaveLength(2);
+});
+
+test("two retained windows on one provider host refuse to claim a download", async () => {
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => false);
+  await driveToManualDownloadOutcome(h, "job_manual_window_one");
+
+  const secondURL = "https://resolver.example.edu/openurl?ctx=second";
+  await h.port.inbound(jobOffer("job_manual_window_two", secondURL));
+  const secondTabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_manual_window_two")?.tab_id ?? -1;
+  expect(secondTabID).toBeGreaterThanOrEqual(0);
+  const articleURL = `https://${PROVIDER_HOST}/stable/challenge`;
+  h.tabs.seed({ id: secondTabID, url: articleURL });
+  await h.tabs.completeNavigation(secondTabID, articleURL);
+  for (let retry = 0; retry < 2; retry += 1) {
+    const timer = h.timers.at(-1);
+    expect(timer).toBeDefined();
+    h.clock.now += 2_500;
+    await timer!.fn();
+  }
+
+  expect(h.backend.store.activeJobs.map((job) => job.job_id).sort()).toEqual([
+    "job_manual_window_one",
+    "job_manual_window_two",
+  ]);
+  // Retaining more jobs raises ambiguity, and a wrong guess files the
+  // researcher's PDF under someone else's paper. No suggestion at all.
+  expect(await suggestFilenameFor(h, clickDownload(951))).toEqual([]);
+  await h.downloads.onCreated.emit(clickDownload(951));
+  for (const job of h.backend.store.activeJobs) expect(job.download_initiated).toBeUndefined();
+});
+
+test("a worker restart rehydrates the retained window from the daemon's snapshot", async () => {
+  const jobID = "job_manual_window_restart";
+  const first = makeHarness();
+  useUnknownProviderClassifier(first, () => false);
+  await driveToManualDownloadOutcome(first, jobID);
+
+  // The MV3 worker dies; only what survives the real managed-state migration
+  // comes back. Worker-memory bookkeeping does not.
+  const restarted = makeHarness(migrateManagedState(JSON.parse(JSON.stringify(first.backend.store))));
+  useUnknownProviderClassifier(restarted, () => false);
+  await restarted.bridge.start();
+  expect(restarted.backend.store.activeJobs.map((job) => job.job_id)).toEqual([jobID]);
+  // The startup drive scan must not resurrect it: no tab, no governor slot.
+  expect(restarted.tabs.created).toHaveLength(0);
+  const internals = restarted.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  expect(internals.handoffDrives.size).toBe(0);
+
+  await restarted.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_snapshot_v1"] }));
+  await settleSnapshot(restarted, [manualDownloadItem(jobID)]);
+
+  expect(restarted.backend.store.activeJobs.map((job) => job.job_id)).toEqual([jobID]);
+  expect(await suggestFilenameFor(restarted, clickDownload(952))).toEqual([`papio/${jobID}/1234567.pdf`]);
+});
+
+test("a complete snapshot without the action retires the retained window", async () => {
+  const jobID = "job_manual_window_retire";
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => false);
+  await driveToManualDownloadOutcome(h, jobID);
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_snapshot_v1"] }));
+
+  // A partial page describes a subset of the open actions and is never
+  // authority to retire anything.
+  await settleSnapshot(h, [], { hasMore: true });
+  expect(h.backend.store.activeJobs.map((job) => job.job_id)).toEqual([jobID]);
+  await settleSnapshot(h, [], { unsupported: 1 });
+  expect(h.backend.store.activeJobs.map((job) => job.job_id)).toEqual([jobID]);
+
+  // A complete page that no longer reports the action is the daemon saying the
+  // window is closed — adopted, dismissed, or otherwise resolved.
+  await settleSnapshot(h, []);
+  expect(h.backend.store.activeJobs).toHaveLength(0);
+  expect(await suggestFilenameFor(h, clickDownload(953))).toEqual([]);
+});
+
+test("Firefox refuses to claim a retained window's download at all", async () => {
+  // Firefox has no downloads.onDeterminingFilename, so a native download can
+  // never be relocated into papio/<job_id>/. Acknowledging one would tell the
+  // daemon to adopt a file it will never find, so correlate() refuses before
+  // any host or adapter reasoning — and isFirefoxClickDownload keeps excluding
+  // click adapters behind it. Retaining the job must not reach past either.
+  for (const clickAdapter of [true, false]) {
+    const jobID = `job_manual_window_firefox_${clickAdapter ? "click" : "plain"}`;
+    const h = makeHarness(undefined, { firefox: true });
+    h.deps.adapterSpecs.push(
+      clickAdapter
+        ? { ...PROVIDER_ADAPTER, download: { selector: "a#pdf", requireKind: "article", method: "click" } }
+        : PROVIDER_ADAPTER,
+    );
+    h.deps.permissions.contains = async () => true;
+    h.deps.scripting.executeScript = async (injection) =>
+      injection.func === planExecution ? plannerResult(injection, { kind: "unknown" }) : [];
+    await driveToManualDownloadOutcome(h, jobID);
+
+    expect(h.backend.store.activeJobs[0]).toMatchObject({ job_id: jobID, tab_id: -1, status: "awaiting_download" });
+    expect(h.deps.downloads.onDeterminingFilename).toBeUndefined();
+    h.downloads.items.set(954, {
+      id: 954,
+      filename: "/Users/x/Downloads/1234567.pdf",
+      fileSize: 1_500_000,
+      mime: "application/pdf",
+      state: "complete",
+    });
+    await h.downloads.onCreated.emit(clickDownload(954));
+    await h.downloads.onChanged.emit({ id: 954, state: { current: "complete" } });
+    expect(h.backend.store.activeJobs[0]?.download_initiated).toBeUndefined();
+    expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(false);
+  }
 });
 
 test("a challenge parks only its provider and leaves another provider draining", async () => {

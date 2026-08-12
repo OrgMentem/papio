@@ -325,7 +325,9 @@ export interface TriageRequiredTurn {
 export type TriageNextActor = "papio" | "researcher" | "reference";
 export const NEXT_ACTORS = ["papio", "researcher", "reference"] as const;
 export const GUIDANCE_VARIANTS = [
-  "manual_download", "manual_download_adapter_missing", "institution_sign_in",
+  "manual_download", "manual_download_adapter_missing",
+  "manual_download_page_undriveable", "manual_download_rejected_file",
+  "manual_download_wrong_work", "institution_sign_in",
   "open_page", "verify_identity", "document_delivery", "downloads_access",
   "terms_acceptance", "security_challenge", "pdf_identifier", "papio_continuing",
 ] as const;

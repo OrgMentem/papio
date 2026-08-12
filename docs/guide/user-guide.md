@@ -404,14 +404,22 @@ If a handoff or a provider page has reached a PDF, open the popup and choose
 **Send PDF to papio**. The popup recognizes a direct PDF URL and the built-in
 Chrome or Firefox PDF viewer, then queues the DOI or associates the current tab
 with its existing job. The extension starts a browser-managed download named
-`papio/<job-id>/paper.pdf`. With a browser download directory configured for
-the *papio* adoption root, that commonly appears as
-`Downloads/papio/<job-id>/`; *papio* adopts the file from that job-scoped
-location and runs the same validation used for a directly fetched PDF. Keep
-the browser directory aligned with the daemon's `download_adoption_root`;
-otherwise a file in an unrelated Downloads folder is not adoptable. The popup
-reports **Sending PDF to papio** and then **papio adopted (validating)**; the
-inbox and `papio activity` show the later outcome.
+`papio/<job-id>/paper.pdf`. That name is *relative*: Chrome's download
+steering can only place a file inside the browser's own download directory,
+so the file lands at `<your browser download folder>/papio/<job-id>/`. The
+daemon's adoption root is the matching `papio` folder — by default
+`<your download folder>/papio`, which `papio init` creates for you — and it
+adopts the file from that job-scoped location, running the same validation
+used for a directly fetched PDF. The popup reports **Sending PDF to papio**
+and then **papio adopted (validating)**; the inbox and `papio activity` show
+the later outcome.
+
+You only need `download_adoption_root` if your browser downloads somewhere
+other than this account's download folder; set it to that folder's `papio`
+subdirectory. `papio doctor` fails the `adoption_root` check, and names the
+path it resolved, whenever the configured root is not a `papio` directory a
+browser could steer into — the failure mode is otherwise completely silent,
+because nothing errors, files simply never get adopted.
 
 The download path is deliberate: do not rename a file into another job's
 directory. If validation rejects the PDF, the job remains actionable so you can

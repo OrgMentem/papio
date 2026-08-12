@@ -41,6 +41,9 @@ func testSystem(t *testing.T) *bootstrap.System {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
 	cfg.DataDir = t.TempDir()
+	// Adoption is a filesystem contract: pin the root to this test's data
+	// dir so nothing here ever reaches the real <downloads>/papio default.
+	cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")
 	system, err := bootstrap.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -674,6 +677,9 @@ func TestRouterActionsOpenQueuesCompatibleHandoff(t *testing.T) {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeDelegated
 	cfg.DataDir = t.TempDir()
+	// Adoption is a filesystem contract: pin the root to this test's data
+	// dir so nothing here ever reaches the real <downloads>/papio default.
+	cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")
 	system, err := bootstrap.New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)

@@ -4342,22 +4342,28 @@ var errArtifactSuperseded = errors.New("artifact winner already decided for this
 // adoptionPath resolves the reported download strictly under the job's adoption
 // directory. The filename has already passed protocol validation (no path
 // separators); this adds IsLocal and a symlink-resolved prefix guard before
-// app-side confinement.
+// app-side confinement. It walks cfg.AdoptionRoots so a file that landed in
+// the superseded <data_dir>/adoptions root before the default moved under the
+// browser's download directory is still adoptable.
 func (b *Bridge) adoptionPath(jobID, filename string) (string, error) {
 	if !filepath.IsLocal(filename) {
 		return "", fmt.Errorf("adoption filename %q is not a local name", filename)
 	}
-	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
-	realRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", fmt.Errorf("adoption root unavailable: %w", err)
+	var rootErr error
+	for _, base := range b.cfg.AdoptionRoots() {
+		realRoot, err := filepath.EvalSymlinks(filepath.Join(base, jobID))
+		if err != nil {
+			rootErr = err
+			continue
+		}
+		full := filepath.Join(realRoot, filename)
+		rel, err := filepath.Rel(realRoot, full)
+		if err != nil || rel != filename || strings.Contains(rel, "..") {
+			return "", fmt.Errorf("adoption path escapes %s", realRoot)
+		}
+		return full, nil
 	}
-	full := filepath.Join(realRoot, filename)
-	rel, err := filepath.Rel(realRoot, full)
-	if err != nil || rel != filename || strings.Contains(rel, "..") {
-		return "", fmt.Errorf("adoption path escapes %s", realRoot)
-	}
-	return full, nil
+	return "", fmt.Errorf("adoption root unavailable: %w", rootErr)
 }
 
 func fileDigest(path string) (string, error) {
@@ -5299,11 +5305,21 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
 			return err
 		}
-		detail := "papio reached a different work; find and download the requested PDF yourself"
+		// Three genuinely different reasons reach this one action kind, and
+		// which one it is decides the inbox task family. Take the answer from
+		// structure, never prose: the extension emits ui_changed WITH an
+		// adapter_id when a known adapter stopped matching its page (drift),
+		// and WITHOUT one when no adapter claimed the page at all. Reading the
+		// English sentence instead is how all 27 live manual downloads came to
+		// share one instruction.
+		detail, diagnosis := "papio reached a different work; find and download the requested PDF yourself", job.DiagnosisReasonWrongWork
 		if p.Outcome == "ui_changed" {
-			detail = "papio could not drive the provider page; download the PDF yourself and papio will adopt it"
-			if strings.HasPrefix(p.Detail, "No source-controlled adapter matched this provider page.") {
-				detail = "papio has no adapter for this provider yet; download the PDF yourself for now"
+			if p.AdapterID != "" {
+				detail, diagnosis = "papio could not drive the provider page; download the PDF yourself and papio will adopt it", job.DiagnosisReasonProviderAdapterDrift
+			} else {
+				detail, diagnosis = "papio has no adapter for this provider yet; download the PDF yourself for now", job.DiagnosisReasonProviderAdapterMissing
+				// Copy only: whether a capture was kept decorates the
+				// sentence and never selects the diagnosis above.
 				if strings.Contains(p.Detail, "A sanitized diagnostic was saved locally") {
 					detail += "; a sanitized page diagnostic is saved locally; run 'papio adapter captures' to inspect it"
 				}
@@ -5312,7 +5328,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		// The page, rather than the original paywall, now blocks papio; whether
 		// that page needs a sign-in remains the resolved handoff's classification.
 		_, err = b.jobs.OpenHumanAction(ctx, jobID, "manual_download", detail,
-			job.Access(requiresAuth, "landing_page"))
+			job.Access(requiresAuth, "landing_page"), job.WithHumanActionDiagnosis(diagnosis))
 		return err
 
 	case "rate_limited":
@@ -5732,7 +5748,7 @@ func (b *Bridge) readAdoptionDir(dir string) ([]os.DirEntry, error) {
 		b.adoptionScanMu.Lock()
 		b.adoptionScanSuspended = true
 		b.adoptionScanMu.Unlock()
-		log.Printf("papio: adoption scans suspended: %s not responding (macOS privacy consent?)", b.cfg.EffectiveAdoptionRoot())
+		log.Printf("papio: adoption scans suspended: %s not responding (macOS privacy consent?)", dir)
 	}
 	return entries, err
 }
@@ -5789,9 +5805,16 @@ func (b *Bridge) recordAdoptionDeferred(ctx context.Context, jobID, filename str
 // placeholder target (Firefox creates the final name empty while streaming
 // into name.part), never a settled download, so it defers the scan too. More
 // than one visible file is ambiguous and adopts nothing. The returned name
-// feeds adopt(), which re-applies full confinement checks.
+// feeds adopt(), which re-applies full confinement checks. Roots are tried in
+// cfg.AdoptionRoots order, so the effective root wins and the drain-only
+// legacy root is only consulted when it holds the job's directory.
 func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool) {
-	return b.settledFileIn(filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID))
+	for _, root := range b.cfg.AdoptionRoots() {
+		if name, ok := b.settledFileIn(filepath.Join(root, jobID)); ok {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // settledFileIn is scanAdoptionDir's directory-scan rule, factored out so
@@ -5835,8 +5858,21 @@ func (b *Bridge) settledFileIn(dir string) (string, bool) {
 // rather than the newest-N job list, so a settled download is never missed
 // behind a large handoff backlog. It never emits frames or opens offers. Safe
 // to call on a timer.
+//
+// It walks every root in cfg.AdoptionRoots, not just the effective one, so an
+// install that was adopting into the superseded <data_dir>/adoptions root
+// before the default moved under the browser's download directory keeps
+// draining. A per-root error is fatal to the tick the same way it always was.
 func (b *Bridge) SweepAdoptions(ctx context.Context) error {
-	root := b.cfg.EffectiveAdoptionRoot()
+	for _, root := range b.cfg.AdoptionRoots() {
+		if err := b.sweepAdoptionsIn(ctx, root); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string) error {
 	entries, err := b.readAdoptionDir(root)
 	if errors.Is(err, ErrAdoptionScanTimeout) {
 		return nil // root not responding (TCC); latch already logged, skip this tick
@@ -5890,8 +5926,38 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 // an unknown job directory here would try (and, since it is never empty
 // while a grab is live, harmlessly fail to) rmdir a live grab every tick.
 // Best-effort, idempotent, and safe on a timer.
+//
+// It runs over every root in cfg.AdoptionRoots, but the drain-only legacy
+// root gets a deliberately narrower rule: only a job whose bytes are provably
+// in the artifact store (ready or imported) has its directory collected
+// there. That root predates the current default and was never swept while it
+// was unreachable, so it can hold a file a human downloaded by hand for a job
+// that then failed — and an upgrade is the worst possible moment to delete
+// the only copy of something on the strength of a state transition made
+// before this directory was in scope. Those husks stay, and doctor's
+// adoption_root_legacy check tells the operator the folder is theirs to
+// remove.
 func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
-	root := b.cfg.EffectiveAdoptionRoot()
+	effective := b.cfg.EffectiveAdoptionRoot()
+	for _, root := range b.cfg.AdoptionRoots() {
+		collectible := job.Terminal
+		if root != effective {
+			collectible = artifactSafelyStored
+		}
+		if err := b.sweepTerminalAdoptionsIn(ctx, root, collectible); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// artifactSafelyStored reports whether a job's landing bytes are provably
+// redundant: the content-addressed artifact store already holds them.
+func artifactSafelyStored(state string) bool {
+	return state == job.StateReady || state == job.StateImported
+}
+
+func (b *Bridge) sweepTerminalAdoptionsIn(ctx context.Context, root string, collectible func(string) bool) error {
 	entries, err := b.readAdoptionDir(root)
 	if errors.Is(err, ErrAdoptionScanTimeout) {
 		return nil // root not responding (TCC); latch already logged, skip this tick
@@ -5919,7 +5985,7 @@ func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
 			_ = os.Remove(filepath.Join(root, e.Name()))
 			continue
 		}
-		if !job.Terminal(row.State) {
+		if !collectible(row.State) {
 			continue
 		}
 		_ = os.RemoveAll(filepath.Join(root, e.Name()))
@@ -5933,12 +5999,28 @@ func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
 // readAdoptionDir's bounded, latch-aware reader with
 // SweepAdoptions/SweepTerminalAdoptions, so a TCC consent wall on the
 // adoption root defers grab sweeping exactly the way it defers ordinary
-// adoption — a latch-hung root skips this tick entirely, same as those.
+// adoption — a latch-hung root skips this tick entirely, same as those. Like
+// those sweeps it walks every root in cfg.AdoptionRoots so a grab whose
+// landing directory was minted under the superseded <data_dir>/adoptions root
+// still settles; the stale backstop runs once, after every root.
 func (b *Bridge) SweepGrabs(ctx context.Context) error {
 	if b.grabs == nil {
 		return nil
 	}
-	root := filepath.Join(b.cfg.EffectiveAdoptionRoot(), grabsDirName)
+	for _, base := range b.cfg.AdoptionRoots() {
+		if err := b.sweepGrabsIn(ctx, filepath.Join(base, grabsDirName)); err != nil {
+			return err
+		}
+	}
+	// Run the stale backstop only after scanning/processing landing files so
+	// daemon downtime cannot abandon bytes that arrived while it was offline.
+	if err := b.grabs.AbandonStaleAwaiting(ctx, time.Now().Add(-staleAwaitingGrabBudget)); err != nil {
+		log.Printf("papio: stale PDF grab sweep failed: %v", err)
+	}
+	return nil
+}
+
+func (b *Bridge) sweepGrabsIn(ctx context.Context, root string) error {
 	entries, err := b.readAdoptionDir(root)
 	if errors.Is(err, ErrAdoptionScanTimeout) {
 		return nil // root not responding (TCC); latch already logged, skip this tick
@@ -5980,11 +6062,6 @@ func (b *Bridge) SweepGrabs(ctx context.Context) error {
 		if err := b.processSettledGrab(ctx, g, filepath.Join(root, id), name); err != nil {
 			log.Printf("papio: pdf grab %s processing failed: %v", id, err)
 		}
-	}
-	// Run the stale backstop only after scanning/processing landing files so
-	// daemon downtime cannot abandon bytes that arrived while it was offline.
-	if err := b.grabs.AbandonStaleAwaiting(ctx, time.Now().Add(-staleAwaitingGrabBudget)); err != nil {
-		log.Printf("papio: stale PDF grab sweep failed: %v", err)
 	}
 	return nil
 }

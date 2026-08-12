@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"papio/internal/bootstrap"
@@ -22,6 +23,9 @@ func deliveryTestSystem(t *testing.T) *bootstrap.System {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeDelegated
 	cfg.DataDir = t.TempDir()
+	// Adoption is a filesystem contract: pin the root to this test's data
+	// dir so nothing here ever reaches the real <downloads>/papio default.
+	cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")
 	cfg.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
 	cfg.Browser.DocumentDelivery = &config.DocumentDelivery{
 		Kind:              "openurl",

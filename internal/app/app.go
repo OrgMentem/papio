@@ -1422,7 +1422,8 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	if manual && oaBrowserURL == "" {
 		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "manual_download",
 			"a resolver returned a landing page but no verified direct PDF",
-			job.Access(manualRequiresAuth, "landing_page")); err != nil {
+			job.Access(manualRequiresAuth, "landing_page"),
+			job.WithHumanActionDiagnosis(job.DiagnosisReasonLandingPageOnly)); err != nil {
 			return err
 		}
 		return s.park(ctx, row.ID, job.StateFetching, job.StateAwaitingHuman,

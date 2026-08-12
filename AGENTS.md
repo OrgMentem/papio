@@ -152,14 +152,24 @@ There is also a link check, because `zensical build` prints a broken link as an
 - **macOS TCC can hang the daemon's `open(2)` on `~/Downloads/papio` — and every
   `make dev-deploy` re-arms it.** `download_adoption_root` lives under `~/Downloads`
   (it must: Chrome's `onDeterminingFilename` can only steer downloads to relative
-  paths inside the browser's download root), and Downloads is TCC-protected. A
+  paths inside the browser's download root), and Downloads is TCC-protected. That
+  is now the *default* — `EffectiveAdoptionRoot()` resolves to
+  `<user downloads dir>/papio` (`internal/config/downloads.go`), and `papio init`
+  creates it so the consent prompt is paid once, interactively, rather than by a
+  background daemon that cannot answer it. `<data_dir>/adoptions` is the
+  superseded default and survives only as a drain-only entry in
+  `Config.AdoptionRoots()`: sweeps still adopt from it and collect its terminal
+  job dirs, nothing is ever written there. A
   daemon launched from a context without the Files-and-Folders grant doesn't get a
   clean `EPERM` — the syscall blocks in-kernel on tccd (the process ignores SIGTERM
   mid-open; `kill -9` only). Consent is per-binary-signature, so every dev rebuild
   resets it. This used to wedge EVERY daemon RPC (adoption scans ran under the
   bridge mutex — three goroutine dumps in one night's `daemon.log` before diagnosis);
   scans are now bounded+latched so the daemon stays responsive and `papio doctor`
-  names the adoption root's health with the grant remediation. If doctor shows the
+  names the adoption root's health with the grant remediation. Doctor also **fails**
+  `adoption_root` outright when the effective root is not a `papio` directory a
+  browser could steer into — the pre-fix default was exactly that, and it adopted
+  nothing with no error at all. If doctor shows the
   adoption-root check failing after a deploy: System Settings → Privacy & Security →
   grant the papio binary folder access (or start the daemon from a terminal that has
   it). Diagnose live hangs with `kill -QUIT <pid>` — the dump lands in

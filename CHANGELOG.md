@@ -77,6 +77,30 @@ execution records kept during the initial build.
   handoff with a book-formatted OpenURL (`rft.isbn`, title, year, authors) so
   you can fetch it through your library while *papio* tracks the outcome.
 
+### Fixed
+- **Browser downloads are adopted on a fresh install.** `download_adoption_root`
+  now defaults to the `papio` directory inside your browser's download folder
+  (`~/Downloads/papio` on macOS, the XDG `XDG_DOWNLOAD_DIR` folder on
+  Linux/BSD, the `Downloads` known folder on Windows) instead of
+  `<data_dir>/adoptions`. The old default was unreachable: Chrome's
+  `onDeterminingFilename` can only steer a download to a path *relative* to
+  the browser's own download directory, and every steering target *papio*
+  mints is `papio/<job-id>/…`, so a default install adopted nothing — no
+  manual downloads, no adapter-driven downloads, no PDF grabs — silently and
+  with no error anywhere. An explicit `download_adoption_root` still wins
+  unchanged. Existing files are not orphaned: `<data_dir>/adoptions` stays in
+  the adoption search path as a drain-only location, so settled files there
+  are still adopted and their landing directories are still collected once
+  their jobs finish, while nothing new is ever written to it. `papio init`
+  creates the effective root so the macOS Files-and-Folders consent prompt is
+  paid once, interactively, at setup rather than blocking a background
+  daemon's `open(2)` in-kernel; a creation failure is reported with its
+  remediation instead of a tick. `papio doctor`'s `adoption_root` check now
+  **fails** — naming the path it resolved and the fix — when the effective
+  root is not a `papio` directory a browser could steer into, and a new
+  `adoption_root_legacy` check names any files still sitting in the old
+  location.
+
 ## [0.20.0] - 2026-08-10
 
 ### Added

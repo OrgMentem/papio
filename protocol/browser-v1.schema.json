@@ -162,7 +162,7 @@
         "route_class":{"enum":["openurl_handoff","manual_download","verify_identity","openurl_available","human_auth_required","terms_acceptance_required","document_delivery","downloads_access_required","pdf_identifier_needed"]},
         "action_kind":{"type":"string","minLength":1,"maxLength":100,"pattern":"^[^\u0000]+$"},
         "next_actor":{"enum":["papio","researcher","reference"]},
-        "guidance_variant":{"enum":["manual_download","manual_download_adapter_missing","institution_sign_in","open_page","verify_identity","document_delivery","downloads_access","terms_acceptance","security_challenge","pdf_identifier","papio_continuing"]},
+        "guidance_variant":{"enum":["manual_download","manual_download_adapter_missing","manual_download_page_undriveable","manual_download_rejected_file","manual_download_wrong_work","institution_sign_in","open_page","verify_identity","document_delivery","downloads_access","terms_acceptance","security_challenge","pdf_identifier","papio_continuing"]},
         "operation_variant":{"enum":["none","dismiss_only","open_and_dismiss","accept_reject","accept_reject_open","delivery_reconcile","provide_identifier_or_dismiss"]},
         "count":{"type":"integer","minimum":1,"maximum":1000000}
       }

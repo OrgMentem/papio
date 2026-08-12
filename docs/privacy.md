@@ -107,10 +107,13 @@ for 14 days and up to 10 per host by default; both limits are configurable in
 
 **Bug reports.** The data directory may also contain `papio.db` (request history,
 titles, identifiers, and notification-intent payloads), `native-host.log`
-(browser-session diagnostics, including URLs), `adoptions/` (browser-downloaded
-files awaiting adoption), and the `update-cache*.json` and `retraction-cache.json`
-files. *papio* does not upload these files. Review and minimize them before
-sharing a bug report; they describe what you have been reading.
+(browser-session diagnostics, including URLs), a legacy `adoptions/` directory
+on installs that predate the browser-download adoption root, and the
+`update-cache*.json` and `retraction-cache.json` files. Browser-downloaded
+files awaiting adoption now live in the adoption root itself
+(`<your download folder>/papio` by default). *papio* does not upload any of
+these. Review and minimize them before sharing a bug report; they describe
+what you have been reading.
 
 **Adapter evidence.** Reaching a provider with no adapter can create a sanitized
 diagnostic capture, but *papio* never uploads it, opens a public issue, or sends

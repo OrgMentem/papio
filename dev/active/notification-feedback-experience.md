@@ -890,8 +890,16 @@ Repeated homogeneous work receives a shared family heading and instruction:
 
 ```text
 Manual downloads · 39 papers
-Open each source and save the PDF — papio adopts it.
+Download each PDF — papio takes it from there.
 ```
+
+A manual download is not one situation. The five closed variants below carry
+their own heading and instruction, because the required action genuinely
+differs — a rejected file needs a *different* PDF, not the same one again — and
+because a single shared instruction made twenty-seven rows look like one
+problem. No surface names a download folder: papio takes the download from the
+browser where steering exists, and where it does not the honest route is the
+popup's Send PDF.
 
 Family identity is daemon-authored, not reconstructed from rendered copy or the
 currently loaded page. Negotiated triage snapshot schema 5 carries an all-or-none

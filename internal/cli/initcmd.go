@@ -197,6 +197,8 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	}
 	initLine(opt.out, true, "Data", "created "+cfg.DataDir+" and applied migrations")
 
+	writeAdoptionRootLine(opt.out, cfg)
+
 	if err := deps.CheckZotio(cmd.Context(), cfg.Zotio.Executable); err != nil {
 		initLine(opt.out, false, "zotio", fmt.Sprintf("%v; Zotero features are disabled (the on_ready hook still files PDFs)", err))
 	} else {
@@ -239,6 +241,51 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	writeInitDoctorSummary(opt.out, report)
 	fmt.Fprintln(opt.out, "\nNext: "+initNextAction(input, report))
 	return nil
+}
+
+// writeAdoptionRootLine creates the browser adoption root and says plainly
+// what happened.
+//
+// Creating it during setup rather than lazily in the daemon is deliberate and
+// macOS-specific. The default root lives inside the user's Downloads folder,
+// which is TCC-protected, and a background daemon that is the first process
+// to open it does not receive a clean EPERM: its open(2) blocks in-kernel
+// waiting on a consent decision it can never answer, and the process then
+// ignores SIGTERM. `papio init` is interactive and user-launched, so it is
+// the one context that can pay that prompt, once. On Linux and Windows there
+// is no TCC and this is an ordinary MkdirAll.
+//
+// A failure here never aborts setup — everything else is still worth doing —
+// but it is never dressed up as success either. Adoption cannot work until
+// the directory exists and is reachable by browser steering, and the line
+// says exactly that plus the fix.
+func writeAdoptionRootLine(out io.Writer, cfg config.Config) {
+	root := cfg.EffectiveAdoptionRoot()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		initLine(out, false, "Downloads", fmt.Sprintf(
+			"could not create %s: %v. Browser downloads cannot be adopted until it exists%s",
+			root, err, adoptionRootGrantHint()))
+		return
+	}
+	if !config.BrowserSteerableAdoptionRoot(root) {
+		initLine(out, false, "Downloads", fmt.Sprintf(
+			"created %s, but the browser can only steer downloads into a %q directory inside its own download folder, so nothing will be adopted. "+
+				"Clear download_adoption_root to use %s, or point it at <your browser download folder>/%s",
+			root, config.AdoptionDirName, config.DefaultAdoptionRoot(), config.AdoptionDirName))
+		return
+	}
+	initLine(out, true, "Downloads", root+" is ready for browser downloads")
+}
+
+// adoptionRootGrantHint names the macOS consent step that is the usual cause
+// of a failed adoption-root creation, and stays silent where TCC does not
+// exist.
+func adoptionRootGrantHint() string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+	return ". On macOS this is usually the Files and Folders privacy prompt: " +
+		"grant this terminal (and the papio binary) access in System Settings \u2192 Privacy & Security"
 }
 
 // initExtensionHealthy reports whether doctor saw a connected, current

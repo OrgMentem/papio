@@ -1358,7 +1358,9 @@ test("shared protocol validators and triage vocabularies are locked", () => {
   expect(isDetectorText("x".repeat(128))).toBe(true);
   expect(NEXT_ACTORS).toEqual(["papio", "researcher", "reference"]);
   expect(GUIDANCE_VARIANTS).toEqual([
-    "manual_download", "manual_download_adapter_missing", "institution_sign_in", "open_page",
+    "manual_download", "manual_download_adapter_missing",
+    "manual_download_page_undriveable", "manual_download_rejected_file",
+    "manual_download_wrong_work", "institution_sign_in", "open_page",
     "verify_identity", "document_delivery", "downloads_access", "terms_acceptance",
     "security_challenge", "pdf_identifier", "papio_continuing",
   ]);

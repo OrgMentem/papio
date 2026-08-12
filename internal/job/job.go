@@ -1209,15 +1209,15 @@ func (js *Store) RepairParkWithAction(ctx context.Context, jobID, from, to strin
 	case err == nil:
 		if options.binding == nil {
 			_, err = tx.ExecContext(ctx,
-				`UPDATE human_actions SET detail = ?, requires_auth = ?, blocked_by = ?, revision = revision + 1 WHERE id = ?`,
-				nullable(actionDetail), options.requiresAuth, options.blockedBy, actionID)
+				`UPDATE human_actions SET detail = ?, requires_auth = ?, blocked_by = ?, diagnosis = ?, revision = revision + 1 WHERE id = ?`,
+				nullable(actionDetail), options.requiresAuth, options.blockedBy, nullable(options.diagnosis), actionID)
 		} else {
 			_, err = tx.ExecContext(ctx, `
 				UPDATE human_actions
-				SET detail = ?, requires_auth = ?, blocked_by = ?, candidate_id = ?, quarantine_path = ?, quarantine_sha256 = ?,
+				SET detail = ?, requires_auth = ?, blocked_by = ?, diagnosis = ?, candidate_id = ?, quarantine_path = ?, quarantine_sha256 = ?,
 					revision = revision + 1
 				WHERE id = ?`,
-				nullable(actionDetail), options.requiresAuth, options.blockedBy, options.binding.CandidateID, options.binding.QuarantinePath,
+				nullable(actionDetail), options.requiresAuth, options.blockedBy, nullable(options.diagnosis), options.binding.CandidateID, options.binding.QuarantinePath,
 				options.binding.QuarantineSHA256, actionID)
 		}
 	case errors.Is(err, sql.ErrNoRows):
@@ -1228,9 +1228,9 @@ func (js *Store) RepairParkWithAction(ctx context.Context, jobID, from, to strin
 		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO human_actions
-				(job_id, kind, status, detail, requires_auth, blocked_by, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
-			VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, 1, ?)`,
-			jobID, actionKind, nullable(actionDetail), options.requiresAuth, options.blockedBy, candidateID, path, sha, now)
+				(job_id, kind, status, detail, requires_auth, blocked_by, diagnosis, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
+			VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+			jobID, actionKind, nullable(actionDetail), options.requiresAuth, options.blockedBy, nullable(options.diagnosis), candidateID, path, sha, now)
 	default:
 		return err
 	}
@@ -2372,6 +2372,7 @@ type openHumanActionOptions struct {
 	requiresAuth               bool
 	blockedBy                  string
 	inheritResolvedHandoffAuth bool
+	diagnosis                  string
 }
 
 // OpenHumanActionOption configures one human action.
@@ -2393,6 +2394,24 @@ func WithHumanActionBinding(binding HumanActionBinding) OpenHumanActionOption {
 		binding.QuarantinePath = strings.TrimSpace(binding.QuarantinePath)
 		binding.QuarantineSHA256 = strings.ToLower(strings.TrimSpace(binding.QuarantineSHA256))
 		options.binding = &binding
+		return nil
+	}
+}
+
+// WithHumanActionDiagnosis persists why this action exists, as a closed
+// job.DiagnosisReason. It is the durable discriminator the triage projection
+// reads: without it every manual download collapses into one task family and
+// "the file you gave me was rejected" renders as "download the PDF".
+//
+// The reason is structured on purpose. It is never derived from the action's
+// prose detail, and an unknown value fails closed here rather than reaching
+// the wire as a guess.
+func WithHumanActionDiagnosis(reason string) OpenHumanActionOption {
+	return func(options *openHumanActionOptions) error {
+		if !ValidDiagnosisReason(reason) {
+			return fmt.Errorf("invalid human action diagnosis %q", reason)
+		}
+		options.diagnosis = reason
 		return nil
 	}
 }
@@ -2481,17 +2500,21 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 		 ORDER BY id ASC LIMIT 1`, jobID, kind).Scan(&actionID)
 	switch {
 	case err == nil:
+		// diagnosis rides with detail on every refresh. The two describe the
+		// same reason at different resolutions, so letting a re-park rewrite
+		// one and keep the other would leave the row's structured family and
+		// its prose disagreeing.
 		if options.binding == nil {
 			_, err = tx.ExecContext(ctx,
-				`UPDATE human_actions SET detail = ?, requires_auth = ?, blocked_by = ?, revision = revision + 1 WHERE id = ?`,
-				nullable(detail), options.requiresAuth, options.blockedBy, actionID)
+				`UPDATE human_actions SET detail = ?, requires_auth = ?, blocked_by = ?, diagnosis = ?, revision = revision + 1 WHERE id = ?`,
+				nullable(detail), options.requiresAuth, options.blockedBy, nullable(options.diagnosis), actionID)
 		} else {
 			_, err = tx.ExecContext(ctx, `
 				UPDATE human_actions
-				SET detail = ?, requires_auth = ?, blocked_by = ?, candidate_id = ?, quarantine_path = ?, quarantine_sha256 = ?,
+				SET detail = ?, requires_auth = ?, blocked_by = ?, diagnosis = ?, candidate_id = ?, quarantine_path = ?, quarantine_sha256 = ?,
 					revision = revision + 1
 				WHERE id = ?`,
-				nullable(detail), options.requiresAuth, options.blockedBy, options.binding.CandidateID, options.binding.QuarantinePath,
+				nullable(detail), options.requiresAuth, options.blockedBy, nullable(options.diagnosis), options.binding.CandidateID, options.binding.QuarantinePath,
 				options.binding.QuarantineSHA256, actionID)
 		}
 		if err != nil {
@@ -2505,9 +2528,9 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 		}
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO human_actions
-				(job_id, kind, status, detail, requires_auth, blocked_by, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
-			VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, 1, ?)`,
-			jobID, kind, nullable(detail), options.requiresAuth, options.blockedBy, candidateID, path, sha, store.Now())
+				(job_id, kind, status, detail, requires_auth, blocked_by, diagnosis, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
+			VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+			jobID, kind, nullable(detail), options.requiresAuth, options.blockedBy, nullable(options.diagnosis), candidateID, path, sha, store.Now())
 		if err != nil {
 			return 0, err
 		}

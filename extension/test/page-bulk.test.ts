@@ -889,7 +889,7 @@ test("an over-long thrown message is whitespace-collapsed and bounded, never a r
   expect(shown.startsWith(`${prefix}runtime blew up x`)).toBe(true);
   expect(shown).not.toContain("\n");
   expect(shown).not.toContain("trailing-detail-that-must-not-render");
-  // Same bound as inbox.ts's boundedHandoffFailure: 237 characters plus an ellipsis.
+  // Same bound as inbox.ts's boundedProse: 237 characters plus an ellipsis.
   expect(shown.length).toBe(prefix.length + 238);
   expect(shown.endsWith("…")).toBe(true);
 });

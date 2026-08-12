@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -51,6 +52,9 @@ func newDeliveryTestService(t *testing.T) (*Service, *job.Store, *delivery.Servi
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeDelegated
 	cfg.DataDir = data
+	// Adoption is a filesystem contract: pin the root to this test's data
+	// dir so nothing here ever reaches the real <downloads>/papio default.
+	cfg.Browser.AdoptionRoot = filepath.Join(data, "adoptions")
 	cfg.Sources["fixture"] = config.Source{Enabled: true}
 	svc := New(cfg, &job.Store{S: db}, artifacts, nil)
 	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {

@@ -81,6 +81,7 @@ func overlayConfig(dataDir string, current bool) config.Config {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeDelegated
 	cfg.DataDir = dataDir
+	cfg.Browser.AdoptionRoot = filepath.Join(dataDir, "adoptions")
 	cfg.Email = "bench@example.org"
 	// A fixed, never-dialed default institution: exhaustedCandidates only
 	// ever uses this to open a human_actions row and stamp its detail text,

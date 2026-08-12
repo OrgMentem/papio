@@ -287,6 +287,78 @@ func TestBrowserMessageVocabularyIsTriMaintained(t *testing.T) {
 	}
 }
 
+// TestGuidanceVariantVocabularyIsTriMaintained is the same trap one level down.
+// guidance_variant is a closed enum declared in protocol.go, protocol.ts and
+// browser-v1.schema.json; landing a new member in two of the three leaves the
+// daemon emitting a value the extension or the published schema rejects, and
+// the row silently drops out of its task family. Order is part of the contract
+// here — the TS lock test compares the array literally — so compare as-is.
+func TestGuidanceVariantVocabularyIsTriMaintained(t *testing.T) {
+	goVariants := TriageGuidanceVariants()
+	if len(goVariants) < 11 {
+		t.Fatalf("parsed %d guidance variants, want the full vocabulary", len(goVariants))
+	}
+	for _, other := range []struct {
+		name     string
+		variants []string
+	}{
+		{"extension/src/protocol.ts GUIDANCE_VARIANTS", tsGuidanceVariants(t)},
+		{"protocol/browser-v1.schema.json family_runs.guidance_variant.enum", schemaGuidanceVariants(t)},
+	} {
+		if slices.Equal(goVariants, other.variants) {
+			continue
+		}
+		t.Errorf("guidance variant drift between internal/protocol and %s:\n  go: %q\n  %s: %q",
+			other.name, goVariants, other.name, other.variants)
+	}
+}
+
+var tsGuidanceRE = regexp.MustCompile(`(?s)export const GUIDANCE_VARIANTS\s*=\s*\[(.*?)\]`)
+
+func tsGuidanceVariants(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(repoPath(t, "extension", "src", "protocol.ts"))
+	if err != nil {
+		t.Fatalf("read protocol.ts: %v", err)
+	}
+	match := tsGuidanceRE.FindSubmatch(raw)
+	if match == nil {
+		t.Fatal("extension/src/protocol.ts declares no GUIDANCE_VARIANTS array")
+	}
+	var out []string
+	for _, m := range regexp.MustCompile(`"([a-z0-9_]+)"`).FindAllSubmatch(match[1], -1) {
+		out = append(out, string(m[1]))
+	}
+	return out
+}
+
+func schemaGuidanceVariants(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(repoPath(t, "protocol", "browser-v1.schema.json"))
+	if err != nil {
+		t.Fatalf("read browser schema: %v", err)
+	}
+	var doc struct {
+		Defs map[string]struct {
+			Properties struct {
+				GuidanceVariant *struct {
+					Enum []string `json:"enum"`
+				} `json:"guidance_variant"`
+			} `json:"properties"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse browser schema: %v", err)
+	}
+	for _, def := range doc.Defs {
+		if def.Properties.GuidanceVariant != nil {
+			return slices.Clone(def.Properties.GuidanceVariant.Enum)
+		}
+	}
+	t.Fatal("browser schema declares no guidance_variant enum")
+	return nil
+}
+
 func describeDiff(have, want []string) string {
 	var only []string
 	for _, v := range have {

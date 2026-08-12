@@ -24,6 +24,33 @@ const (
 	DiagnosisReasonUnknown                = "unknown"
 )
 
+// diagnosisReasons is the closed vocabulary above, as a set. It gates what may
+// be persisted in human_actions.diagnosis, so a producer cannot invent a
+// reason the triage projection would then have to guess at.
+// TestDiagnosisReasonVocabularyIsExhaustive parses the const block above and
+// fails when a declared reason is missing here — do not hand-maintain it into
+// a list that silently covers less.
+var diagnosisReasons = map[string]bool{
+	DiagnosisReasonProviderAdapterMissing: true,
+	DiagnosisReasonProviderAdapterDrift:   true,
+	DiagnosisReasonAdoptedPDFInvalid:      true,
+	DiagnosisReasonWrongWork:              true,
+	DiagnosisReasonLandingPageOnly:        true,
+	DiagnosisReasonInstitutionalHandoff:   true,
+	DiagnosisReasonHumanAuthRequired:      true,
+	DiagnosisReasonTermsRequired:          true,
+	DiagnosisReasonIdentityReview:         true,
+	DiagnosisReasonRetryWait:              true,
+	DiagnosisReasonInProgress:             true,
+	DiagnosisReasonComplete:               true,
+	DiagnosisReasonFailed:                 true,
+	DiagnosisReasonUnavailable:            true,
+	DiagnosisReasonUnknown:                true,
+}
+
+// ValidDiagnosisReason reports whether reason is in the closed vocabulary.
+func ValidDiagnosisReason(reason string) bool { return diagnosisReasons[reason] }
+
 // ActionDiagnosis is the daemon's explanation of one current human action.
 // Capabilities describe explicit CLI operations only; they are not an
 // instruction to perform them automatically.

@@ -751,6 +751,23 @@
         color: var(--color-primary);
       }
 
+      /* A rejected file and a wrong work are manual downloads with a different
+         meaning; colour is never their only carrier — the glyph, accessible
+         name, and family instruction all say which one it is. */
+      .item-status[data-status="manual_download_adapter_missing"],
+      .item-status[data-status="manual_download_page_undriveable"] {
+        background: var(--color-primary-surface);
+        border-color: var(--color-primary-border);
+        color: var(--color-primary);
+      }
+
+      .item-status[data-status="manual_download_rejected_file"],
+      .item-status[data-status="manual_download_wrong_work"] {
+        background: var(--color-warning-surface);
+        border-color: var(--color-warning-border);
+        color: var(--color-warning);
+      }
+
       .item-status[data-status="openurl_handoff"] {
         background: var(--color-ok-surface);
         border-color: var(--color-ok-border);
@@ -802,7 +819,23 @@
         margin: var(--space-2) 0 var(--space-3);
       }
 
+      /* Printed only where papio cannot take the download itself, so it sits
+         with the hoisted instruction rather than repeating on every row. */
+      .family-mechanism {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+        margin: calc(-1 * var(--space-2)) 0 var(--space-3);
+      }
+
       .item-guidance {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+      }
+
+      /* One line, and only where this row's reason differs from its family's.
+         It sits under the hoisted instruction, quieter than the title and
+         never wider than the card. */
+      .item-reason {
         color: var(--color-muted);
         font-size: var(--font-size-small);
       }
@@ -1193,6 +1226,8 @@
     <footer>
       <p id="status-legend">
         <span class="item-status" data-status="manual_download" aria-hidden="true">↓</span><span>manual download</span>
+        <span class="item-status" data-status="manual_download_rejected_file" aria-hidden="true">↺</span><span>rejected file</span>
+        <span class="item-status" data-status="manual_download_wrong_work" aria-hidden="true">≠</span><span>wrong paper</span>
         <span class="item-status" data-status="openurl_handoff" aria-hidden="true">↗</span><span>browser handoff</span>
         <span class="item-status" data-status="verify_identity" aria-hidden="true">?</span><span>verify identity</span>
         <span class="item-status" data-status="document_delivery" aria-hidden="true">⇄</span><span>document delivery</span>

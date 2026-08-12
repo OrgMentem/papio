@@ -385,13 +385,16 @@ function handoffJobID(item: TriageSnapshotItem): string | null {
   return /^[A-Za-z0-9_-]{8,128}$/.test(item.job_id) ? item.job_id : null;
 }
 
-function boundedHandoffFailure(value: unknown): string {
-  const message = errorFromResponse(value).replace(/\s+/g, " ").trim();
-  return message.length <= 240 ? message : `${message.slice(0, 237)}…`;
+/** One-line bound for text papio did not author: collapse whitespace, cap the
+ * length, and mark a truncation with an ellipsis. Every surface that prints
+ * untrusted daemon or runtime prose goes through this. */
+function boundedProse(text: string, limit: number): string {
+  const message = text.replace(/\s+/g, " ").trim();
+  return message.length <= limit ? message : `${message.slice(0, limit - 3)}…`;
 }
 
 function handoffFailure(item: TriageSnapshotItem, value: unknown, tone: "error" | "offline" = "error"): void {
-  operationMessage(item.id, boundedHandoffFailure(value), tone);
+  operationMessage(item.id, boundedProse(errorFromResponse(value), 240), tone);
   render();
 }
 
@@ -1079,6 +1082,11 @@ const DELIVERY_STATE_LABELS: Record<TriageDelivery["state"], string> = {
 // the raw kind as the label instead of breaking the row.
 function statusMeta(item: TriageSnapshotItem): { key: string; glyph: string; label: string } {
   const key = item.kind === "human_action" && typeof item.action_kind === "string" ? item.action_kind : item.kind;
+  // A rejected file and a wrong work are not "one more PDF to download"; they
+  // get their own glyph and accessible name so a scanning eye cannot read them
+  // as an ordinary manual download.
+  const manual = manualDownloadCopy(item);
+  if (manual !== null) return { key: item.guidance_variant ?? key, glyph: manual.glyph, label: manual.statusLabel };
   const meta = STATUS_META[key];
   if (meta !== undefined) return { key, glyph: meta.glyph, label: meta.label };
   return { key: "unknown", glyph: "•", label: key.replaceAll("_", " ") };
@@ -1107,6 +1115,67 @@ function missingAdapter(item: TriageSnapshotItem): boolean {
   return item.action_kind === "manual_download" && /\bno adapter for this provider\b/i.test(actionDetail(item));
 }
 
+interface ManualDownloadCopy {
+  /** Hoisted family heading; the block appends its exact paper count. */
+  heading: string;
+  /** Hoisted family instruction, printed once per block. */
+  instruction: string;
+  /** The same imperative for a row that hoists no heading. */
+  row: string;
+  glyph: string;
+  statusLabel: string;
+}
+
+// Five genuinely different situations mint a manual download, and the closed
+// guidance variant is the only trustworthy discriminator — never the detail
+// prose. A rejected file in particular must not read as "download this PDF",
+// which is exactly the file papio already refused.
+const MANUAL_DOWNLOAD_COPY: Partial<Record<NonNullable<TriageSnapshotItem["guidance_variant"]>, ManualDownloadCopy>> = {
+  manual_download: {
+    heading: "Manual downloads",
+    instruction: "Download each PDF — papio takes it from there.",
+    row: "Download the PDF — papio takes it from there.",
+    glyph: "↓",
+    statusLabel: "Manual download needed",
+  },
+  manual_download_adapter_missing: {
+    heading: "Manual downloads · no adapter yet",
+    instruction: "papio has no adapter for these providers yet. Download each PDF — papio takes it from there.",
+    row: "papio has no adapter for this provider yet. Download the PDF — papio takes it from there.",
+    glyph: "↓",
+    statusLabel: "Manual download needed — no adapter for this provider yet",
+  },
+  manual_download_page_undriveable: {
+    heading: "Manual downloads · page changed",
+    instruction: "papio could not drive these provider pages. Download each PDF — papio takes it from there.",
+    row: "papio could not drive this provider page. Download the PDF — papio takes it from there.",
+    glyph: "↓",
+    statusLabel: "Manual download needed — papio could not drive the page",
+  },
+  manual_download_rejected_file: {
+    heading: "Replace rejected files",
+    instruction: "The file papio adopted was not the paper. Download a different PDF for each.",
+    row: "The file papio adopted was not the paper. Download a different PDF.",
+    glyph: "↺",
+    statusLabel: "Rejected file — download a different PDF",
+  },
+  manual_download_wrong_work: {
+    heading: "Wrong paper reached",
+    instruction: "papio landed on a different work. Find and download the requested PDF.",
+    row: "papio landed on a different work. Find and download the requested PDF.",
+    glyph: "≠",
+    statusLabel: "Wrong paper reached — find the requested PDF",
+  },
+};
+
+function manualDownloadCopy(item: TriageSnapshotItem): ManualDownloadCopy | null {
+  if (item.kind !== "human_action" || item.action_kind !== "manual_download") return null;
+  const variant = item.guidance_variant;
+  // An unmapped variant stays standalone with its legacy copy rather than
+  // being guessed into a family.
+  return variant === undefined ? null : MANUAL_DOWNLOAD_COPY[variant] ?? null;
+}
+
 function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): string | null {
   if (item.kind === "pdf_grab") {
     const grabID = item.grab?.grab_id ?? item.id.replace(/^pdf_grab:/, "");
@@ -1115,8 +1184,14 @@ function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): st
   if (item.kind !== "human_action") return null;
   if (blockedByChallenge) return "Solve the security check in its tab";
   switch (item.action_kind) {
-    case "manual_download":
+    case "manual_download": {
+      const manual = manualDownloadCopy(item);
+      if (manual !== null) return manual.row;
+      // A daemon older than the closed manual-download variants ships no
+      // structured discriminator at all; its detail prose is the only signal
+      // there is. Never consulted once a variant is present.
       return missingAdapter(item) ? "No adapter yet - download this PDF manually" : "Download the PDF yourself - papio adopts it";
+    }
     case "openurl_handoff":
       return item.requires_auth === true ? "Sign in to your institution" : "Open the page";
     case "verify_identity":
@@ -1146,12 +1221,20 @@ interface FamilyRender {
   descriptionID: string;
   total: number;
   shown: number;
+  /** The loaded rows of this run do not share one reason, so each carries its
+   * own summary line. When they do share it, printing it per row would be the
+   * exact repetition hoisting exists to remove. */
+  varyingReasons: boolean;
+  /** The honest download route on this browser, printed once per block where
+   * the hoisted instruction alone would over-promise. Null where papio can
+   * take the download itself. */
+  platformRoute: string | null;
 }
 
 function familyCopy(item: TriageSnapshotItem): { heading: string; instruction: string } | null {
+  const manual = manualDownloadCopy(item);
+  if (manual !== null) return { heading: manual.heading, instruction: manual.instruction };
   switch (item.guidance_variant) {
-    case "manual_download": return { heading: "Manual downloads", instruction: "Open each source and save the PDF — papio adopts it." };
-    case "manual_download_adapter_missing": return { heading: "Manual downloads (adapter unavailable)", instruction: "Download each PDF manually — papio adopts it." };
     case "institution_sign_in": return { heading: "Institution sign-in", instruction: "Sign in to your institution once — papio continues the waiting papers." };
     case "open_page": return { heading: "Pages to open", instruction: "Open each source page so papio can continue." };
     case "verify_identity": return { heading: "PDF identity review", instruction: "Review each PDF, then accept or reject it." };
@@ -1188,8 +1271,48 @@ function familyForItem(item: TriageSnapshotItem, items: readonly TriageSnapshotI
     locallyRenderedGuidance(candidate) !== guidance
   )) return null;
   const descriptionID = `family-guidance-${item.run_key.replace(/[^A-Za-z0-9_-]/g, "_")}`;
-  return { ...copy, descriptionID, total: run.count, shown: runItems.length };
+  const ownReason = reasonSummary(item, copy.instruction);
+  const varyingReasons = runItems.some((candidate) => reasonSummary(candidate, copy.instruction) !== ownReason);
+  const platformRoute = manualDownloadCopy(item) !== null && !downloadSteeringAvailable() ? NO_STEERING_ROUTE : null;
+  return { ...copy, descriptionID, total: run.count, shown: runItems.length, varyingReasons, platformRoute };
 }
+
+/** The row's own durable reason, reduced to the leading clause the family
+ * heading cannot carry. Daemon detail prose habitually appends the very
+ * instruction that is already hoisted ("…; download the requested PDF
+ * yourself"), so only the reason itself survives, bounded like every other
+ * string papio did not author. Returns null when it would merely restate the
+ * instruction. */
+function reasonSummary(item: TriageSnapshotItem, instruction: string): string | null {
+  const detail = boundedProse(actionDetail(item), 400);
+  if (detail === "") return null;
+  const lead = detail.split(/[;.]\s+/u)[0] ?? detail;
+  const reason = boundedProse(lead.replace(/[.;,]+$/u, ""), 120);
+  if (reason === "") return null;
+  const compact = reason.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const said = instruction.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  return compact === "" || said.includes(compact) || compact.includes(said) ? null : reason;
+}
+
+/** Chrome exposes chrome.downloads.onDeterminingFilename and can therefore
+ * take a download papio is expecting; Firefox has no equivalent, so steering
+ * is a platform fact rather than a setting. Probed exactly as page-bulk.ts
+ * probes it, never by sniffing the user agent. */
+function downloadSteeringAvailable(): boolean {
+  const downloads: unknown = typeof chrome === "undefined" ? undefined : chrome.downloads;
+  if (typeof downloads !== "object" || downloads === null || !("onDeterminingFilename" in downloads)) return false;
+  return downloads.onDeterminingFilename !== undefined;
+}
+
+// Neither sentence names a folder: papio's adoption root is a daemon setting
+// the browser cannot see, and the researcher has no way to learn a job id.
+// Send PDF passes its own filename and needs no steering at all, so it is the
+// route that is true on every browser.
+const NO_STEERING_ROUTE =
+  "This browser cannot pass a saved download to papio. Open the PDF and use Send PDF in the papio toolbar popup instead.";
+const STEERED_ROUTE =
+  "papio picks the download up from your browser's downloads. When it cannot tell which paper a file belongs to, " +
+  "open the PDF and use Send PDF in the papio toolbar popup.";
 
 function mechanismText(item: TriageSnapshotItem, blockedByChallenge: boolean): string | null {
   if (item.kind !== "human_action") return null;
@@ -1197,10 +1320,17 @@ function mechanismText(item: TriageSnapshotItem, blockedByChallenge: boolean): s
     return "papio resumes automatically after you solve the security check.";
   }
   switch (item.action_kind) {
-    case "manual_download":
-      return missingAdapter(item)
-        ? "A sanitized page diagnostic is saved locally; run papio adapter captures to find it. papio adopts PDFs saved to Downloads/papio/<job>."
-        : "papio adopts PDFs saved to Downloads/papio/<job>. The toolbar button can also send an open PDF.";
+    case "manual_download": {
+      // Steering claims the researcher's own click only when exactly one
+      // retained job matches the download's host, so this promises nothing.
+      const adoption = downloadSteeringAvailable() ? STEERED_ROUTE : NO_STEERING_ROUTE;
+      const adapterMissing = manualDownloadCopy(item) === null
+        ? missingAdapter(item)
+        : item.guidance_variant === "manual_download_adapter_missing";
+      return adapterMissing
+        ? `A sanitized page diagnostic is saved locally; run papio adapter captures to find it. ${adoption}`
+        : adoption;
+    }
     case "openurl_handoff":
       return "A fresh link is generated each time you open this action. papio continues automatically after the handoff.";
     case "verify_identity":
@@ -1367,6 +1497,18 @@ function renderItem(item: TriageSnapshotItem, family: FamilyRender | null = null
       : renderInstruction(item, blockedByChallenge, working)
     : null;
   if (instruction !== null) body.append(instruction);
+  // The hoisted instruction says what to do for the whole block; a row prints
+  // its own reason only where that reason differs from its siblings', so the
+  // block never degenerates back into one repeated sentence per row.
+  const reasonText = family !== null && family.varyingReasons && !working && !blockedByChallenge
+    ? reasonSummary(item, family.instruction)
+    : null;
+  const reason = reasonText === null ? null : element("p", reasonText);
+  if (reason !== null) {
+    reason.className = "item-instruction item-reason";
+    reason.id = `item-reason-${item.id.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+    body.append(reason);
+  }
   const liveStatus = liveStatusChip(item);
   if (liveStatus !== null) body.append(liveStatus);
   const delivery = renderDeliveryDetail(item);
@@ -1390,6 +1532,8 @@ function renderItem(item: TriageSnapshotItem, family: FamilyRender | null = null
 
   if (instruction !== null) {
     instruction.append(debug.toggle);
+  } else if (reason !== null) {
+    reason.append(debug.toggle);
   } else if (citation !== null) {
     // Non-action items have no instruction line; keep the disclosure at the
     // end of their metadata rather than creating a standalone controls row.
@@ -1420,8 +1564,13 @@ function renderItem(item: TriageSnapshotItem, family: FamilyRender | null = null
     if (button !== null) controls.append(button);
   }
   if (controls.childElementCount > 0) {
-    const describedBy = family?.descriptionID ?? instruction?.id;
-    if (describedBy !== undefined) {
+    // Rule 13: the hoisted instruction, the block's platform route, and the
+    // row's own reason are all part of what each control does, so each control
+    // names every one of them that exists.
+    const routeID = family?.platformRoute === null || family === null ? undefined : `${family.descriptionID}-route`;
+    const describedBy = [family?.descriptionID ?? instruction?.id, routeID, reason?.id]
+      .filter((id): id is string => id !== undefined).join(" ");
+    if (describedBy !== "") {
       for (const control of Array.from(controls.querySelectorAll<HTMLButtonElement>("button"))) {
         control.setAttribute("aria-describedby", describedBy);
       }
@@ -1461,6 +1610,14 @@ function renderGroup(kind: TriageSnapshotItem["kind"], heading: string | null, i
       familyInstruction.id = family.descriptionID;
       familyInstruction.setAttribute("aria-labelledby", familyHeading.id);
       section.append(familyInstruction);
+      if (family.platformRoute !== null) {
+        // Once per block, never per row: the hoisted imperative is the same on
+        // every browser, but how the file reaches papio is not.
+        const route = element("p", family.platformRoute);
+        route.className = "item-instruction family-mechanism";
+        route.id = `${family.descriptionID}-route`;
+        section.append(route);
+      }
       previousRun = family.descriptionID;
     } else if (family === null) {
       previousRun = undefined;

@@ -166,9 +166,13 @@ type Browser struct {
 	// strict-mode daemons reject this unknown field, so config writers should
 	// only emit it when talking to a daemon that supports resolver profiles.
 	DefaultResolver string `toml:"default_resolver,omitempty"`
-	// AdoptionRoot is the directory Chrome downloads into for adoption;
-	// the daemon rejects reported paths outside <root>/<job_id>/.
-	// Default: <data_dir>/adoptions.
+	// AdoptionRoot is the directory the browser downloads into for adoption;
+	// the daemon rejects reported paths outside <root>/<job_id>/. Default:
+	// <user downloads dir>/papio — it must be a "papio" directory inside the
+	// browser's own download directory, because that is the only place
+	// Chrome's onDeterminingFilename can steer a download to (see
+	// AdoptionDirName). Setting it elsewhere disables adoption entirely, and
+	// papio doctor fails on exactly that.
 	AdoptionRoot string `toml:"download_adoption_root,omitempty"`
 	// ActionExpirySeconds sets browser-offer expiry and the first human-action
 	// reminder threshold. Subsequent reminders back off independently per action.
@@ -1106,12 +1110,47 @@ func validateDocumentDelivery(prefix string, d *DocumentDelivery) error {
 	return nil
 }
 
-// EffectiveAdoptionRoot returns the configured adoption root or its default.
+// EffectiveAdoptionRoot returns the directory papio steers browser downloads
+// into and creates per-job landing directories under: download_adoption_root
+// when set, otherwise DefaultAdoptionRoot (<user downloads dir>/papio).
+//
+// The default is derived from the browser's download directory rather than
+// the data directory because browser steering has no other reachable target
+// (see config.AdoptionDirName). The historical <data_dir>/adoptions default
+// was addressable only by the daemon, so a default install adopted nothing;
+// LegacyAdoptionRoot keeps it in the read path so that is fixed without
+// stranding anything already sitting there.
 func (c *Config) EffectiveAdoptionRoot() string {
 	if c.Browser.AdoptionRoot != "" {
 		return c.Browser.AdoptionRoot
 	}
-	return filepath.Join(c.DataDir, "adoptions")
+	return DefaultAdoptionRoot()
+}
+
+// LegacyAdoptionRoot returns the superseded <data_dir>/adoptions root, or ""
+// when there is no distinct one to consider. It is a drain-only location:
+// papio still adopts settled files and collects terminal job directories
+// there, and never creates new landing directories in it.
+func (c *Config) LegacyAdoptionRoot() string {
+	if c.DataDir == "" {
+		return ""
+	}
+	legacy := filepath.Join(c.DataDir, legacyAdoptionDirName)
+	if legacy == c.EffectiveAdoptionRoot() {
+		return ""
+	}
+	return legacy
+}
+
+// AdoptionRoots is the ordered adoption search path: the effective root
+// first, then the legacy root when it is distinct. Every reader (sweeps,
+// per-job scans, path confinement) walks this list; every writer uses
+// EffectiveAdoptionRoot alone.
+func (c *Config) AdoptionRoots() []string {
+	if legacy := c.LegacyAdoptionRoot(); legacy != "" {
+		return []string{c.EffectiveAdoptionRoot(), legacy}
+	}
+	return []string{c.EffectiveAdoptionRoot()}
 }
 
 // RequireAccessMode returns the mode or ErrAccessModeUnset.

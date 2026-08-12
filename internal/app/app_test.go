@@ -90,6 +90,9 @@ func newTestService(t *testing.T) (*Service, *job.Store) {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
 	cfg.DataDir = data
+	// Adoption is a filesystem contract: pin the root to this test's data
+	// dir so nothing here ever reaches the real <downloads>/papio default.
+	cfg.Browser.AdoptionRoot = filepath.Join(data, "adoptions")
 	cfg.Sources["fixture"] = config.Source{Enabled: true}
 	svc := New(cfg, &job.Store{S: db}, artifacts, nil)
 	return svc, svc.Jobs
@@ -865,6 +868,9 @@ func TestPaywalledLandingRequiresManualDownload(t *testing.T) {
 	actions, _ := jobs.ListHumanActions(context.Background(), true)
 	if len(actions) != 1 || actions[0].JobID != id || actions[0].Kind != "manual_download" {
 		t.Fatalf("actions = %+v", actions)
+	}
+	if got := actionDiagnosis(t, jobs, actions[0].ID); got != job.DiagnosisReasonLandingPageOnly {
+		t.Fatalf("diagnosis = %q, want %q", got, job.DiagnosisReasonLandingPageOnly)
 	}
 }
 

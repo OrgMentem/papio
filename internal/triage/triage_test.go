@@ -578,7 +578,7 @@ func TestStatsFallsBackToUpdatedAtWhenReadyEventIsMissing(t *testing.T) {
 		t.Fatalf("series[6] = %+v, want %+v (falls back to updated_at)", got, want)
 	}
 }
-func createProjectionAction(t *testing.T, jobs *job.Store, requestID, kind, detail string, access job.AccessClassification) string {
+func createProjectionAction(t *testing.T, jobs *job.Store, requestID, kind, detail string, access job.AccessClassification, opts ...job.OpenHumanActionOption) string {
 	t.Helper()
 	ctx := context.Background()
 	id, err := jobs.CreateRequest(ctx, requestID, work.Work{DOI: "10.1000/" + requestID, Title: requestID}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", Resolver: "fixture", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
@@ -592,7 +592,7 @@ func createProjectionAction(t *testing.T, jobs *job.Store, requestID, kind, deta
 	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET state = ? WHERE id = ?`, state, id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.OpenHumanAction(ctx, id, kind, detail, access); err != nil {
+	if _, err := jobs.OpenHumanAction(ctx, id, kind, detail, access, opts...); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -778,23 +778,79 @@ func TestFamilyGuidanceAndOperationVariantsUseDurableFacts(t *testing.T) {
 			t.Errorf("%s case %d next actor = %q, want researcher", tc.kind, i, got.NextActor)
 		}
 	}
-	diagnosisService, _, diagnosisJobs := triageTestService(t)
-	diagnosisJob := createProjectionAction(t, diagnosisJobs, "mapping-diagnosis", "manual_download", "please download the PDF", job.Access(false, "landing_page"))
-	if err := diagnosisJobs.RecordEvent(context.Background(), diagnosisJob, "browser.provider_outcome", map[string]any{"diagnosis": job.DiagnosisReasonProviderAdapterMissing}); err != nil {
-		t.Fatal(err)
+	// The five live manual-download reasons. Before the durable column all of
+	// them rendered as one "manual_download" family, so a rejected file and a
+	// missing adapter carried the same instruction.
+	for _, tc := range []struct{ diagnosis, guidance string }{
+		{job.DiagnosisReasonProviderAdapterDrift, "manual_download_page_undriveable"},
+		{job.DiagnosisReasonAdoptedPDFInvalid, "manual_download_rejected_file"},
+		{job.DiagnosisReasonWrongWork, "manual_download_wrong_work"},
+		{job.DiagnosisReasonProviderAdapterMissing, "manual_download_adapter_missing"},
+		{job.DiagnosisReasonLandingPageOnly, "manual_download"},
+	} {
+		reasonService, _, reasonJobs := triageTestService(t)
+		createProjectionAction(t, reasonJobs, "reason-"+tc.diagnosis, "manual_download",
+			// Prose that would sniff as a different reason entirely: only the
+			// structured diagnosis may decide the family.
+			"No source-controlled adapter matched this provider page.",
+			job.Access(false, "landing_page"), job.WithHumanActionDiagnosis(tc.diagnosis))
+		projected, err := reasonService.Snapshot(context.Background(), SnapshotRequest{Limit: 10, Schema: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(projected.Items) != 1 || projected.Items[0].Family == nil ||
+			projected.Items[0].Family.GuidanceVariant != tc.guidance {
+			t.Fatalf("%s projected = %+v, want guidance %q", tc.diagnosis, projected.Items, tc.guidance)
+		}
+		if projected.Counts.FamilyBreakdownComplete == nil || !*projected.Counts.FamilyBreakdownComplete {
+			t.Fatalf("%s left the family breakdown incomplete", tc.diagnosis)
+		}
+		// The per-item prose reason stays on the wire for the row-level line.
+		var detail string
+		for _, fact := range projected.Items[0].Facts {
+			if fact.Label == "Detail" {
+				detail = fact.Text
+			}
+		}
+		if detail != "No source-controlled adapter matched this provider page." {
+			t.Fatalf("%s Detail fact = %q, want the durable prose preserved", tc.diagnosis, detail)
+		}
 	}
-	diagnosed, err := diagnosisService.Snapshot(context.Background(), SnapshotRequest{Limit: 10, Schema: 5})
+
+	// A row with no diagnosis at all — every action that predates the column —
+	// still renders as a plain manual download rather than crashing or
+	// dropping out of the breakdown.
+	legacyService, _, legacyJobs := triageTestService(t)
+	createProjectionAction(t, legacyJobs, "reason-legacy-null", "manual_download",
+		"the adopted download failed validation; please supply a different file", job.Access(false, "landing_page"))
+	legacy, err := legacyService.Snapshot(context.Background(), SnapshotRequest{Limit: 10, Schema: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(diagnosed.Items) != 1 || diagnosed.Items[0].Family == nil || diagnosed.Items[0].Family.GuidanceVariant != "manual_download_adapter_missing" {
-		t.Fatalf("durable adapter diagnosis projection = %+v", diagnosed.Items)
+	if len(legacy.Items) != 1 || legacy.Items[0].Family == nil || legacy.Items[0].Family.GuidanceVariant != "manual_download" {
+		t.Fatalf("NULL-diagnosis projection = %+v, want a plain manual_download family", legacy.Items)
+	}
+	if legacy.Counts.FamilyBreakdownComplete == nil || !*legacy.Counts.FamilyBreakdownComplete {
+		t.Fatal("a NULL diagnosis must not make the family breakdown incomplete")
 	}
 
-	for _, item := range snapshot.Items {
-		if item.HumanAction != nil && item.HumanAction.ActionKind == "manual_download" && item.Family.GuidanceVariant == "manual_download_adapter_missing" {
-			t.Fatal("manual-download detail text was incorrectly treated as a durable adapter diagnosis")
-		}
+	// An unmapped diagnosis is never guessed: the row stays standalone and the
+	// breakdown says so.
+	unknownService, _, unknownJobs := triageTestService(t)
+	createProjectionAction(t, unknownJobs, "reason-unmapped", "manual_download", "download it",
+		job.Access(false, "landing_page"), job.WithHumanActionDiagnosis(job.DiagnosisReasonRetryWait))
+	unknown, err := unknownService.Snapshot(context.Background(), SnapshotRequest{Limit: 10, Schema: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unknown.Items) != 1 || unknown.Items[0].Family != nil {
+		t.Fatalf("unmapped diagnosis projection = %+v, want a standalone row with no family", unknown.Items)
+	}
+	if unknown.Counts.FamilyBreakdownComplete == nil || *unknown.Counts.FamilyBreakdownComplete {
+		t.Fatal("an unmapped diagnosis must make the family breakdown incomplete")
+	}
+	if unknown.Counts.FamilyRuns != nil {
+		t.Fatalf("incomplete breakdown still published runs: %+v", unknown.Counts.FamilyRuns)
 	}
 
 	workingService, _, workingJobs := triageTestService(t)
@@ -1116,10 +1172,8 @@ func TestActionRowsRenderOneBlockPerFamily(t *testing.T) {
 func TestFamilyOrderingKeepsGuidanceVariantsApart(t *testing.T) {
 	service, _, jobs := triageTestService(t)
 	plainFirst := createProjectionAction(t, jobs, "variant-plain-first", "manual_download", "download it", job.Access(false, "landing_page"))
-	diagnosed := createProjectionAction(t, jobs, "variant-diagnosed", "manual_download", "download it", job.Access(false, "landing_page"))
-	if err := jobs.RecordEvent(context.Background(), diagnosed, "browser.provider_outcome", map[string]any{"diagnosis": job.DiagnosisReasonProviderAdapterMissing}); err != nil {
-		t.Fatal(err)
-	}
+	diagnosed := createProjectionAction(t, jobs, "variant-diagnosed", "manual_download", "download it", job.Access(false, "landing_page"),
+		job.WithHumanActionDiagnosis(job.DiagnosisReasonProviderAdapterMissing))
 	plainSecond := createProjectionAction(t, jobs, "variant-plain-second", "manual_download", "download it", job.Access(false, "landing_page"))
 	snapshot, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 5})
 	if err != nil {

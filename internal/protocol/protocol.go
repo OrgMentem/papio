@@ -1524,8 +1524,15 @@ func TriageRouteClassesV5() []string {
 }
 
 var triageNextActors = []string{"papio", "researcher", "reference"}
+
+// triageGuidanceVariants is closed. The four manual_download members are one
+// per durable job.DiagnosisReason a manual download can carry, because those
+// reasons ask the researcher for genuinely different things — supply the file
+// papio could not fetch, versus replace a file papio already rejected.
 var triageGuidanceVariants = []string{
-	"manual_download", "manual_download_adapter_missing", "institution_sign_in",
+	"manual_download", "manual_download_adapter_missing",
+	"manual_download_page_undriveable", "manual_download_rejected_file",
+	"manual_download_wrong_work", "institution_sign_in",
 	"open_page", "verify_identity", "document_delivery", "downloads_access",
 	"terms_acceptance", "security_challenge", "pdf_identifier", "papio_continuing",
 }

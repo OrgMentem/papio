@@ -160,7 +160,7 @@ commits any pending dismissals.
 | `openurl_base_url` | Default institution's HTTPS OpenURL resolver base. |
 | `shibboleth_entity_id` | Optional default IdP entity ID for skipping a provider's WAYF selector. |
 | `proquest_account_id` | Optional default ProQuest account ID for the `accountid` append. |
-| `download_adoption_root` | Root containing the per-job adopted downloads; when empty, *papio* uses `<data_dir>/adoptions`. |
+| `download_adoption_root` | Root containing the per-job adopted downloads; when empty, *papio* uses `<your download folder>/papio`. It must be a `papio` directory inside the browser's own download directory — steering cannot reach anywhere else. |
 | `action_expiry_seconds` | Maximum open time for one browser handoff. |
 
 `[browser.resolvers.<name>]` profiles replace the default institution for a
@@ -197,9 +197,12 @@ The link to the browser carries metadata only, within *papio*'s fixed message-si
 PDF bytes, cookies, credentials, page contents, screenshots, and secret- or
 signed-URL values never cross that link. For a selected download, the extension reports metadata such as
 the download item and final filename; the file itself lands under
-`<download_adoption_root>/<job_id>/` for adoption and validation. See
+`<download_adoption_root>/<job_id>/` for adoption and validation. Because
+Chrome's `onDeterminingFilename` can only rewrite a download to a path
+relative to the browser's download directory, that root is by construction
+`<your download folder>/papio` — which is also the effective default. See
 [Configuration reference](../reference/config-reference.md) for
-`download_adoption_root` and the effective default.
+`download_adoption_root`.
 
 ## Institution-specific routing
 

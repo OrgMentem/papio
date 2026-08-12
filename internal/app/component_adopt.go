@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"papio/internal/artifact"
 	"papio/internal/job"
 )
 
@@ -85,7 +84,7 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 	// "the file must be inside the adoption root" would send them to inspect a path
 	// that is fine while hiding a broken data directory. Unexpected errors stay
 	// unclassified so the RPC layer reports them as internal.
-	realRoot, err := filepath.EvalSymlinks(filepath.Join(s.Config.EffectiveAdoptionRoot(), jobID))
+	roots, err := s.resolveAdoptionRoots(jobID)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("%w: job %s has no adoption root to attach a %s from", ErrComponentPrecondition, jobID, role)
@@ -103,7 +102,7 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 	}
 	resolved := filepath.Join(realDir, filepath.Base(path))
 	// This one IS the policy check: escape, or a non-regular final component.
-	if err := artifact.ConfineRegularFile(realRoot, resolved); err != nil {
+	if err := confineToAdoptionRoots(roots, resolved); err != nil {
 		return fmt.Errorf("%w: %w", ErrComponentPath, err)
 	}
 

@@ -5747,6 +5747,7 @@ export class Bridge {
       this.updateTriageCounts(counts as Record<string, unknown>, features.includes(TRIAGE_COUNTS_SCHEMA_3_FEATURE));
       await this.syncConnectionBadge();
     }
+    await this.reconcileManualDownloadWindows(snapshot, request.cursor !== undefined);
     return { ok: true, snapshot };
   }
 
@@ -10329,7 +10330,7 @@ export class Bridge {
           // this institutional attempt.
           if (this.send("provider_outcome", { outcome: "no_entitlement" }, job.job_id)) {
             this.resolverNoEntitlementSent.add(job.job_id);
-            await this.settleHandoffAfterOutcome(job.job_id);
+            await this.settleHandoffAfterOutcome(job.job_id, "no_entitlement");
           }
         }
         return true;
@@ -10435,7 +10436,7 @@ export class Bridge {
         if (!this.send("provider_outcome", { outcome: "ui_changed", detail }, job.job_id)) {
           this.handoffOutcomeSent.delete(outcomeKey);
         } else {
-          await this.settleHandoffAfterOutcome(job.job_id);
+          await this.settleHandoffAfterOutcome(job.job_id, "ui_changed");
         }
       }
       return;
@@ -11115,7 +11116,7 @@ export class Bridge {
         ) {
           this.handoffOutcomeSent.delete(outcomeKey);
         } else {
-          await this.settleHandoffAfterOutcome(job.job_id);
+          await this.settleHandoffAfterOutcome(job.job_id, "ui_changed");
         }
       }
     } else if (count === 0) {
@@ -11473,7 +11474,7 @@ export class Bridge {
     const outcomeKey = `${jobID}:ui_changed`;
     if (!this.handoffOutcomeSent.has(outcomeKey) && this.send("provider_outcome", { outcome: "ui_changed", detail }, jobID)) {
       this.handoffOutcomeSent.add(outcomeKey);
-      await this.settleHandoffAfterOutcome(jobID);
+      await this.settleHandoffAfterOutcome(jobID, "ui_changed");
     }
   }
 
@@ -11517,13 +11518,146 @@ export class Bridge {
   }
 
 
-  /** Map a page verdict to a bridge action. See the safety contract: at most one
-   * download initiation per job, ever; unknown only escalates after two spaced
-   * observations; every other unknown keeps assisted behaviour. */
-  private async settleHandoffAfterOutcome(jobID: string): Promise<void> {
+  /** Settle the handoff this provider outcome ended, and decide whether the
+   * job's browser-side record dies with it.
+   *
+   * `ui_changed` and `wrong_work` are exactly the two outcomes for which the
+   * daemon opens a `manual_download` human action instead of terminating the
+   * job (bridge.go's provider_outcome handler). Removing the job here — all
+   * this used to do — deleted the only record `correlate` can match, so the
+   * researcher's own click download could never be steered into
+   * `papio/<job_id>/` and the daemon's adoption sweep never saw the file.
+   * The steering window switched itself off at precisely the moment the
+   * action asking the researcher to download was created.
+   *
+   * `no_entitlement` opens no action — the daemon requeues or parks the job
+   * as unavailable — so it keeps the plain removal. */
+  private async settleHandoffAfterOutcome(
+    jobID: string,
+    outcome: "ui_changed" | "wrong_work" | "no_entitlement",
+  ): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return;
+    if (outcome === "no_entitlement") {
+      await this.removeJobWithOffer(jobID);
+      return;
+    }
+    await this.retainForManualDownload(jobID);
+  }
+
+  /** Tear the drive down exactly as `removeJobWithOffer` does — governor slot,
+   * drive timeout, provider drain lease, materialization workflow, federated
+   * login claim, offer URL, managed tab — then re-insert a deliberately inert
+   * correlation-only record so the researcher's own download can still be
+   * claimed.
+   *
+   * Tab policy: the provider tab is still closed. `correlate`'s tab branch
+   * cannot serve this case anyway — the researcher downloads from whatever
+   * tab they open from the inbox row, not from the page papio just proved it
+   * cannot drive — and the host branch needs only `provider_hosts`. Holding
+   * one provider tab open per open action (27 of them on the maintainer's
+   * live install) to serve a correlation none of those tabs carries is not a
+   * trade worth making, and papio does not get to occupy the researcher's
+   * browser on the strength of work it just failed at.
+   *
+   * The retained record deliberately carries no `access_mode`, so
+   * `hasDelegatedAuthority` is false and every autonomous path skips it by
+   * construction: the startup drive scan, `reconcileTabs`, viewer adoption,
+   * resolver routing and stale redrive all gate on it. It has no tab and no
+   * offer URL, so nothing can reopen one — the startup scan's tabless branch
+   * requires a retained offer URL to enqueue governor work. What survives is
+   * exactly `provider_hosts` plus `adapter_id`: the input to
+   * `matchesManualDownloadHost`, and the input to `isFirefoxClickDownload`'s
+   * refusal, which must keep working or Firefox would acknowledge a file it
+   * cannot relocate.
+   *
+   * `awaiting_download` is the honest status for it — papio is waiting for a
+   * PDF for this job and nothing else — and it is already the status the
+   * download-completion path writes, so a claimed download needs no second
+   * transition.
+   *
+   * Retirement is the daemon's call, never a timer: adoption retires it
+   * through the ordinary `ack` -> `closeAfterAdoption` path, and
+   * `reconcileManualDownloadWindows` drops it as soon as a complete triage
+   * snapshot stops reporting the action open. */
+  private async retainForManualDownload(jobID: string): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    if (job === undefined) return;
+    const retained: ActiveJob = {
+      job_id: job.job_id,
+      tab_id: -1,
+      offered_at: job.offered_at,
+      expires_at: job.expires_at,
+      status: "awaiting_download",
+      provider_hosts: [...job.provider_hosts],
+      ...(job.adapter_id === undefined ? {} : { adapter_id: job.adapter_id }),
+      ...(job.expected === undefined ? {} : { expected: { ...job.expected } }),
+    };
     await this.removeJobWithOffer(jobID);
+    await this.upsertJobWithoutOffer(retained);
+  }
+
+  /** A record left behind by `retainForManualDownload`, recognised by shape
+   * rather than by a worker-memory set: the set would be empty after an MV3
+   * teardown while the record itself is persisted, which is the one moment
+   * reconciliation has to be able to retire a stale window.
+   *
+   * The conjunction is exact. A live handoff has a tab or a retained offer
+   * URL; a delivery has its `pendingDelivery`/`deliveryJobs` entry; a job with
+   * a download in flight is in `downloads`; anything papio may still drive
+   * itself carries `access_mode`. */
+  private isManualDownloadWindow(job: ActiveJob): boolean {
+    return (
+      job.tab_id < 0 &&
+      job.status === "awaiting_download" &&
+      job.access_mode === undefined &&
+      this.offerURLs.get(job.job_id) === undefined &&
+      !this.downloads.has(job.job_id) &&
+      !this.deliveryJobs.has(job.job_id) &&
+      this.store.pendingDelivery?.job_id !== job.job_id
+    );
+  }
+
+  /** Re-derive which manual-download correlation windows are still live from
+   * the daemon's own view of what is still open.
+   *
+   * This is also the restart path. The window record itself is persisted, so
+   * an MV3 teardown does not lose it and the startup drive scan leaves it
+   * alone; what a restart does lose is any right to believe it. The first
+   * complete snapshot after the worker comes back either reconfirms the
+   * action — the window keeps steering — or reports it closed, in which case
+   * the record is dropped rather than left to claim an unrelated download
+   * from the same provider months later.
+   *
+   * Only a complete first page is authority. A cursored page, a page with
+   * `has_more`, one the daemon could not fully render at the negotiated
+   * schema, or one carrying an item this cannot read describes a subset of
+   * the open actions, and retiring against a subset would drop live windows.
+   * Identification is structural — schema-3+ `route_class` first, the older
+   * `action_kind` field otherwise — never the action's prose detail. */
+  private async reconcileManualDownloadWindows(
+    snapshot: Record<string, unknown>,
+    paged: boolean,
+  ): Promise<void> {
+    if (paged || snapshot["has_more"] !== false) return;
+    if (snapshot["unsupported_items_count"] !== 0) return;
+    const items = snapshot["items"];
+    if (!Array.isArray(items)) return;
+    const open = new Set<string>();
+    for (const entry of items) {
+      if (typeof entry !== "object" || entry === null) return;
+      const item = entry as Record<string, unknown>;
+      if (item["kind"] !== "human_action") continue;
+      const jobID = item["job_id"];
+      if (typeof jobID !== "string" || jobID.length === 0) continue;
+      const routeClass = item["route_class"];
+      const kind = typeof routeClass === "string" ? routeClass : item["action_kind"];
+      if (kind === "manual_download") open.add(jobID);
+    }
+    const stale = this.store.activeJobs
+      .filter((job) => this.isManualDownloadWindow(job) && !open.has(job.job_id))
+      .map((job) => job.job_id);
+    for (const jobID of stale) await this.removeJobWithOffer(jobID);
   }
 
   private async applyVerdict(jobID: string, spec: AdapterSpec, plan: Plan, host: string): Promise<void> {
@@ -11760,13 +11894,13 @@ export class Bridge {
       }
       case "no_entitlement":
         if (this.send("provider_outcome", { outcome: "no_entitlement", adapter_id: spec.id, adapter_version: av }, jobID)) {
-          await this.settleHandoffAfterOutcome(jobID);
+          await this.settleHandoffAfterOutcome(jobID, "no_entitlement");
         }
         return;
       case "wrong_work":
       case "wrong_work_check":
         if (this.send("provider_outcome", { outcome: "wrong_work", adapter_id: spec.id, adapter_version: av }, jobID)) {
-          await this.settleHandoffAfterOutcome(jobID);
+          await this.settleHandoffAfterOutcome(jobID, "wrong_work");
         }
         return;
       case "unknown": {
@@ -11797,7 +11931,7 @@ export class Bridge {
           ) {
             this.handoffOutcomeSent.delete(outcomeKey);
           } else {
-            await this.settleHandoffAfterOutcome(jobID);
+            await this.settleHandoffAfterOutcome(jobID, "ui_changed");
           }
         }
         return;

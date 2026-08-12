@@ -1005,20 +1005,49 @@ func contains(values []string, value string) bool {
 	return false
 }
 
+// manualDownloadGuidance maps a manual download's durable diagnosis onto its
+// task family. Five genuinely different reasons open this one action kind and
+// they need five different instructions — telling someone to "download the
+// PDF" when the real problem is that the file they already supplied was
+// rejected sends them round the same loop.
+//
+// A NULL diagnosis (a row predating the column, or a producer with no
+// structured reason) is the plain manual download, which is what it has always
+// rendered as. An unrecognised one returns "" so the row stays standalone and
+// makes the breakdown incomplete; it is never guessed from the prose detail.
+func manualDownloadGuidance(diagnosisReason string) string {
+	switch diagnosisReason {
+	case job.DiagnosisReasonProviderAdapterMissing:
+		return "manual_download_adapter_missing"
+	case job.DiagnosisReasonProviderAdapterDrift:
+		return "manual_download_page_undriveable"
+	case job.DiagnosisReasonAdoptedPDFInvalid:
+		return "manual_download_rejected_file"
+	case job.DiagnosisReasonWrongWork:
+		return "manual_download_wrong_work"
+	case "", job.DiagnosisReasonLandingPageOnly, job.DiagnosisReasonInstitutionalHandoff:
+		return "manual_download"
+	default:
+		return ""
+	}
+}
+
 func familyGuidance(kind string, auth *bool, diagnosisReason, attention string, gate job.HumanGateObservation) string {
 	if attention == "working" {
 		return "papio_continuing"
 	}
 	switch {
-	case diagnosisReason == job.DiagnosisReasonProviderAdapterMissing && kind == "manual_download":
-		return "manual_download_adapter_missing"
+	case kind == "manual_download":
+		// Ahead of the gate branch, as the adapter-missing case already was:
+		// an open profile gate does not change what this row asks for. papio
+		// will not continue on its own once the gate clears — the researcher
+		// still has to supply the file — so sign-in copy would be a lie.
+		return manualDownloadGuidance(diagnosisReason)
 	case gate.ID != "":
 		if gate.GateType == job.HumanGateCaptchaOrSecurity {
 			return "security_challenge"
 		}
 		return "institution_sign_in"
-	case kind == "manual_download":
-		return "manual_download"
 	case kind == "human_auth_required":
 		return "institution_sign_in"
 	case kind == "openurl_handoff":
@@ -1252,13 +1281,15 @@ func watchFacts(work Work) []Fact {
 // only verify_identity additionally offers accept (gated on a valid
 // quarantine binding) and reject (never gated — reject needs no SHA match).
 func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
+	// diagnosis is a durable column on the action, not an event join. The
+	// join it replaced read `$.diagnosis` out of browser.provider_outcome,
+	// a key no producer ever wrote and that two of the five manual-download
+	// producers had no event for at all.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT a.id, a.job_id, a.kind, j.state, COALESCE(a.detail, ''),
 			a.revision, a.quarantine_sha256, a.requires_auth, a.blocked_by, j.work_request_id,
 			COALESCE(w.title, ''), COALESCE(w.authors_json, '[]'), COALESCE(w.year, 0),
-			COALESCE((SELECT json_extract(e.detail_json, '$.diagnosis')
-				FROM events e WHERE e.job_id = j.id AND e.kind = 'browser.provider_outcome'
-				ORDER BY e.seq DESC LIMIT 1), '')
+			COALESCE(a.diagnosis, '')
 		FROM human_actions a
 		JOIN jobs j ON j.id = a.job_id
 		JOIN work_requests w ON w.id = j.work_request_id

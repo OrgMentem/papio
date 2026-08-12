@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -56,6 +57,52 @@ func (s *Service) parkForBrowserAdoption(ctx context.Context, jobID string) erro
 		}
 	}
 	return fmt.Errorf("job %s changed while preparing browser adoption", jobID)
+}
+
+// resolveAdoptionRoots returns the symlink-resolved landing directories for
+// jobID across config.AdoptionRoots — the effective root first, then the
+// drain-only legacy <data_dir>/adoptions root when it is distinct. Both are
+// returned when both exist, because the caller confines against all of them:
+// a file that landed in the legacy root before the default moved under the
+// browser's download directory must still be adoptable, and its job may well
+// have an (empty) directory under the effective root too.
+//
+// When no root holds a directory for the job it returns the last resolution
+// error unwrapped enough for callers to test it with errors.Is(fs.ErrNotExist).
+func (s *Service) resolveAdoptionRoots(jobID string) ([]string, error) {
+	bases := s.Config.AdoptionRoots()
+	roots := make([]string, 0, len(bases))
+	var last error
+	for _, base := range bases {
+		real, err := filepath.EvalSymlinks(filepath.Join(base, jobID))
+		if err != nil {
+			last = err
+			continue
+		}
+		roots = append(roots, real)
+	}
+	if len(roots) == 0 {
+		if last == nil {
+			last = fs.ErrNotExist
+		}
+		return nil, last
+	}
+	return roots, nil
+}
+
+// confineToAdoptionRoots accepts resolved when it is a regular file inside any
+// of roots, and otherwise returns the last confinement failure so the caller
+// can report a real reason rather than a generic refusal.
+func confineToAdoptionRoots(roots []string, resolved string) error {
+	var last error
+	for _, root := range roots {
+		err := artifact.ConfineRegularFile(root, resolved)
+		if err == nil {
+			return nil
+		}
+		last = err
+	}
+	return last
 }
 
 // AdoptDownload ingests a browser-supplied download for a job parked in
@@ -106,7 +153,7 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	// Ancestor symlinks are resolved (so /var -> /private/var and mounts work),
 	// but the final component is checked with Lstat so a symlinked file is
 	// rejected rather than followed.
-	realRoot, err := filepath.EvalSymlinks(filepath.Join(s.Config.EffectiveAdoptionRoot(), jobID))
+	roots, err := s.resolveAdoptionRoots(jobID)
 	if err != nil {
 		return fmt.Errorf("adoption root unavailable: %w", err)
 	}
@@ -115,7 +162,7 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		return fmt.Errorf("adoption path rejected: %w", err)
 	}
 	resolved := filepath.Join(realDir, filepath.Base(path))
-	if err := artifact.ConfineRegularFile(realRoot, resolved); err != nil {
+	if err := confineToAdoptionRoots(roots, resolved); err != nil {
 		return fmt.Errorf("adoption path rejected: %w", err)
 	}
 	path = resolved
@@ -241,14 +288,16 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		// adoption sweep never scans it — with an action telling the user to
 		// remove or replace the file so the loop cannot spin.
 		if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
-			"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory", replacementAccess); err != nil {
+			"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory",
+			replacementAccess, job.WithHumanActionDiagnosis(job.DiagnosisReasonAdoptedPDFInvalid)); err != nil {
 			return err
 		}
 		return s.park(ctx, jobID, job.StateFetching, job.StateNeedsReview,
 			map[string]any{"reason": "adopted_download_rejected_unquarantined"})
 	}
 	if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
-		"the adopted download failed validation; please supply a different file", replacementAccess); err != nil {
+		"the adopted download failed validation; please supply a different file",
+		replacementAccess, job.WithHumanActionDiagnosis(job.DiagnosisReasonAdoptedPDFInvalid)); err != nil {
 		return err
 	}
 	return s.park(ctx, jobID, job.StateFetching, job.StateAwaitingHuman,
