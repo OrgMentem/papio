@@ -40,6 +40,8 @@
     "https://www.tandfonline.com/*",
     "https://journals.sagepub.com/*",
     "https://psycnet.apa.org/*",
+    "https://www.cell.com/*",
+    "https://*.cell.com/*",
     "https://*/*"
   ],
   "options_page": "dist/options.html",

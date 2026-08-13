@@ -29,6 +29,20 @@ test("classifyPage recognizes PDF paths, viewers, DOI URLs, and text fallback", 
   expect(classifyPage("https://example.com/news")).toEqual({ kind: "none" });
 });
 
+test("Cell's exact PII route is a direct PDF surface without a .pdf suffix", () => {
+  const url = "https://www.cell.com/action/showPdf?pii=S240584401730308X";
+  expect(isPDFURL(url)).toBe(true);
+  expect(isPDFPage(url)).toBe(true);
+  expect(classifyPage(url)).toEqual({ kind: "pdf" });
+  expect(isPDFURL("http://www.cell.com/action/showPdf?pii=S240584401730308X")).toBe(false);
+  expect(isPDFURL("https://heliyon.cell.com/action/showPdf?pii=S240584401730308X")).toBe(false);
+  expect(isPDFURL("https://www.cell.com/action/showPdf?pii=S240584401730308X&extra=1")).toBe(false);
+  expect(isPDFURL("https://www.cell.com/action/showPdf?pii=S240584401730308X#frag")).toBe(false);
+  expect(isPDFURL("https://www.cell.com/action/showPdf")).toBe(false);
+  expect(isPDFURL("https://cell.com/action/showPdf?pii=S240584401730308X")).toBe(false);
+  expect(isPDFURL("https://attacker.example/action/showPdf?pii=S240584401730308X")).toBe(false);
+});
+
 test("extractMetaDOI honors metadata priority and accepts DOI-bearing PDF URLs", () => {
   expect(
     extractMetaDOI([

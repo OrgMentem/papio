@@ -15,7 +15,7 @@ export type JobStatus = "offered" | "queued" | "accepted" | "auth_pending" | "aw
 
 /** Browser-managed delivery correlation. The source URL is worker-local and
  * intentionally omitted by the managed-state migration/serializer. */
-export type PendingDeliveryStatus = "sending" | "downloaded" | "failed";
+export type PendingDeliveryStatus = "sending" | "waiting_manual" | "downloaded" | "failed" | "adopted";
 export interface PendingDelivery {
   job_id: string;
   /** Present only while this worker is alive; never written to managed state. */
@@ -175,6 +175,11 @@ export interface ActiveJob {
    * correlated without persisting a page URL, referrer, or live host. */
   download_initiated?: boolean;
   adapter_id?: string;
+  /** Explicit operator intent from opening a manual-download inbox row. At
+   * most one active job may carry this marker. It binds the popup's next
+   * Send PDF action to an existing job even when the PDF has no embedded DOI
+   * and opens in a different tab from the provider page. */
+  manual_delivery_target?: boolean;
   /** Consecutive `unknown` classification streak, and the epoch-ms of the
    * streak's first observation, for the 2×(≥5s apart) ui_changed debounce. */
   unknown_count?: number;
@@ -654,8 +659,13 @@ export function findByTab(store: StoreShape, tabID: number): ActiveJob | undefin
   return store.activeJobs.find((j) => j.tab_id === tabID);
 }
 
-/** Insert or replace a job (matched by job_id), returning a new store. */
+/** Insert or replace a job by `job_id`. An operator-selected manual delivery
+ * window is pinned until its action closes or delivery removes it: later
+ * daemon offers describe available automation, but cannot revoke the user's
+ * explicit choice while they navigate, download, and reopen a PDF. */
 export function upsertJob(store: StoreShape, job: ActiveJob): StoreShape {
+  const current = findByJob(store, job.job_id);
+  if (current?.manual_delivery_target === true) return store;
   const activeJobs = store.activeJobs.filter((j) => j.job_id !== job.job_id);
   activeJobs.push(job);
   return { ...store, activeJobs };
@@ -718,8 +728,9 @@ export function clearPendingDelivery(store: StoreShape, jobID?: string): StoreSh
 
 /** Version of the durable managed-state shape. The storage key predates this
  * field, so version 1 means the unversioned `papio_state_v1` blob. Version 3
- * adds the URL-free explicit materialization correlation ledger. */
-export const MANAGED_STATE_VERSION = 3;
+ * added the URL-free explicit materialization correlation ledger; version 4
+ * adds the URL-free operator-selected manual-delivery target. */
+export const MANAGED_STATE_VERSION = 4;
 const STORAGE_KEY = "papio_state_v1";
 type UnknownRecord = Record<string, unknown>;
 
@@ -799,7 +810,7 @@ function scrubRecord(value: unknown): UnknownRecord | undefined {
   return isRecord(scrubbed) ? scrubbed : undefined;
 }
 const JOB_STATUSES: readonly JobStatus[] = ["offered", "queued", "accepted", "auth_pending", "awaiting_download"];
-const DELIVERY_STATUSES: readonly PendingDeliveryStatus[] = ["sending", "downloaded", "failed"];
+const DELIVERY_STATUSES: readonly PendingDeliveryStatus[] = ["sending", "waiting_manual", "downloaded", "failed", "adopted"];
 
 function validActiveJob(value: unknown): value is ActiveJob {
   if (!isRecord(value) ||
@@ -861,6 +872,7 @@ function migratedJob(value: ActiveJob, droppedClaimOwnerJobIDs: ReadonlySet<stri
   delete migrated.institution_claim_key;
   delete migrated.waiting_for_session_key;
   delete migrated.direct_envelope;
+  delete migrated.manual_delivery_target;
   if (isFiniteNumber(value.auth_started_ms)) migrated.auth_started_ms = value.auth_started_ms;
   const expectedRaw = value.expected;
   if (isRecord(expectedRaw)) {
@@ -899,6 +911,9 @@ function migratedJob(value: ActiveJob, droppedClaimOwnerJobIDs: ReadonlySet<stri
   if (typeof value.engagement_required === "boolean") migrated.engagement_required = value.engagement_required;
   if (typeof value.fresh_handoff === "boolean") migrated.fresh_handoff = value.fresh_handoff;
   if (typeof value.download_initiated === "boolean") migrated.download_initiated = value.download_initiated;
+  if (value.manual_delivery_target === true && value.status === "awaiting_download") {
+    migrated.manual_delivery_target = true;
+  }
   const unknownCount = value.unknown_count;
   if (isFiniteNumber(unknownCount) && Number.isInteger(unknownCount)) migrated.unknown_count = unknownCount;
   if (isFiniteNumber(value.last_unknown_ms)) migrated.last_unknown_ms = value.last_unknown_ms;
@@ -1056,9 +1071,17 @@ function migratedState(raw: UnknownRecord): StoreShape {
       }
     }
   }
+  let activeJobs = validJobs.map((job) => migratedJob(job, droppedClaimOwnerJobIDs));
+  if (activeJobs.filter((job) => job.manual_delivery_target === true).length > 1) {
+    activeJobs = activeJobs.map((job) => {
+      if (job.manual_delivery_target !== true) return job;
+      const { manual_delivery_target: _target, ...unselected } = job;
+      return unselected as ActiveJob;
+    });
+  }
   const output: StoreShape = {
     ...emptyStore(),
-    activeJobs: validJobs.map((job) => migratedJob(job, droppedClaimOwnerJobIDs)),
+    activeJobs,
   };
 
   const pending = migratedPendingDelivery(raw.pendingDelivery);
@@ -1114,7 +1137,7 @@ function migratedState(raw: UnknownRecord): StoreShape {
 export function migrateManagedState(raw: unknown): StoreShape {
   if (!isRecord(raw) || !Array.isArray(raw.activeJobs)) return emptyStore();
   const version = raw.version;
-  if (version !== undefined && version !== 1 && version !== 2 && version !== MANAGED_STATE_VERSION) return emptyStore();
+  if (version !== undefined && version !== 1 && version !== 2 && version !== 3 && version !== MANAGED_STATE_VERSION) return emptyStore();
   return migratedState(raw);
 }
 

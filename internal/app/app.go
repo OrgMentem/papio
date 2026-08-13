@@ -2680,18 +2680,24 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	s.recordValidation(ctx, row.ID, stored.ID, result.SHA256,
 		validationVerdict(report, active, needsIdentityReview), report)
 	switch {
+	case report.Structural.Encrypted || active:
+		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "encrypted_or_active_content")
+		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
+		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "unsafe_pdf", "PDF is encrypted or contains active/embedded content", job.Access(false, ""),
+			job.WithHumanActionBinding(job.HumanActionBinding{
+				CandidateID: stored.ID, QuarantinePath: result.TempPath, QuarantineSHA256: result.SHA256,
+			}),
+		); err != nil {
+			return false, false, err
+		}
+		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
+			map[string]any{"reason": "encrypted_or_active_content"})
 	case !report.Payload.OK || !report.Structural.Valid:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "payload_or_structure_rejected")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "invalid")
 		_ = os.Remove(result.TempPath)
 		return false, false, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateFetching,
 			map[string]any{"reason": "invalid_pdf"})
-	case report.Structural.Encrypted || active:
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "encrypted_or_active_content")
-		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
-		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "unsafe_pdf", "PDF is encrypted or contains active/embedded content", job.Access(false, ""))
-		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
-			map[string]any{"reason": "encrypted_or_active_content"})
 	case needsIdentityReview && !stored.ReviewOverride:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "semantic_or_identity_review")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")

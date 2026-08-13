@@ -641,6 +641,85 @@ func TestAdoptDownloadRejectedUnquarantinableGoesNeedsReview(t *testing.T) {
 		t.Fatalf("diagnosis = %q, want %q", got, job.DiagnosisReasonAdoptedPDFInvalid)
 	}
 }
+func TestAdoptDownloadHoldsEmbeddedPDFForReview(t *testing.T) {
+	// SAGE/T&F publisher PDFs with embedded supplementary files returned
+	// Valid=false + HasEmbeddedFiles=true from the structural worker. The
+	// generic invalid_pdf branch was checked first, so AdoptDownload re-parked
+	// awaiting_human with a manual_download "please supply a different file"
+	// and moved the file to rejected/. The unsafe_pdf/needs_review branch
+	// was dead for those flags. The fix evaluates encrypted/active before
+	// payload/structure validity, so the file stays for review.
+	svc, jobs := newTestService(t)
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: false, HasEmbeddedFiles: true, Reason: "PDF contains embedded files", Pages: 2},
+			Text:       pdf.TextReport{Chars: 2000},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+		}, nil
+	}
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_embedded_held")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	origPath := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(origPath, pdfBytes("publisher embedded publisher.pdf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, origPath); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateNeedsReview {
+		t.Fatalf("adopted embedded PDF left job in %s, want needs_review", row.State)
+	}
+	// File must NOT have been moved to rejected/ — it stays for the operator.
+	if _, err := os.Stat(origPath); err != nil {
+		t.Fatalf("original file should remain at %s, stat err: %v", origPath, err)
+	}
+	rejectedPath := filepath.Join(svc.Config.EffectiveAdoptionRoot(), "rejected", id, filepath.Base(origPath))
+	if _, err := os.Stat(rejectedPath); !os.IsNotExist(err) {
+		t.Fatalf("rejected file should not exist at %s, err=%v", rejectedPath, err)
+	}
+	// One open unsafe_pdf with a quarantine binding, no manual_download replacement.
+	actions, err := jobs.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unsafe, manual *job.HumanAction
+	for i := range actions {
+		if actions[i].JobID != id {
+			continue
+		}
+		switch actions[i].Kind {
+		case "unsafe_pdf":
+			if actions[i].Status == "open" {
+				unsafe = &actions[i]
+			}
+		case "manual_download":
+			if actions[i].Status == "open" {
+				manual = &actions[i]
+			}
+		}
+	}
+	if unsafe == nil {
+		t.Fatalf("want open unsafe_pdf action, got actions %+v", actions)
+	}
+	if unsafe.CandidateID == 0 || unsafe.QuarantinePath == "" || unsafe.QuarantineSHA256 == "" {
+		t.Fatalf("unsafe_pdf binding incomplete: %+v", unsafe)
+	}
+	if _, err := os.Stat(unsafe.QuarantinePath); err != nil {
+		t.Fatalf("quarantined file missing at %s: %v", unsafe.QuarantinePath, err)
+	}
+	if manual != nil {
+		t.Fatalf("must not open manual_download alongside unsafe_pdf, got %+v", manual)
+	}
+}
 
 // A browser-adopted download's version must always be `unknown`: adoption sees
 // bytes arrive from a human's browser and never learns which version that human

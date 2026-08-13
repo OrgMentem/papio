@@ -111,13 +111,13 @@ func TestValidationVerdictMirrorsCandidateBranches(t *testing.T) {
 			want: validationPayloadRejected,
 		},
 		{
-			name: "structure wins over encryption",
+			name: "unsafe wins over structure",
 			report: pdf.ValidationReport{
 				Payload:    pdf.PayloadReport{OK: true},
 				Structural: pdf.StructuralReport{Valid: false, Encrypted: true},
 				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
 			},
-			want: validationStructRejected,
+			want: validationUnsafe,
 		},
 		{
 			name: "unsafe wins over identity review",

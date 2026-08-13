@@ -33,6 +33,7 @@ import {
 } from "./keepalive";
 import { renderPapio } from "./dom";
 import { formatShare, parseStatsReply, type AcquisitionStats } from "./stats";
+import { providerViewerPDFURL } from "./adapters/types";
 
 
 declare const __PAPIO_DEV_CAPTURE__: boolean;
@@ -283,18 +284,19 @@ export async function readCurrentPageMetadata(): Promise<PageMetadata> {
     // PDF viewers and privileged pages reject scripting; their tab URL is
     // enough to classify the page and start a browser-managed download.
   }
-  const url = tabURL || metadata?.url;
-  if (url === undefined || url.length === 0) throw new Error("Could not read the current page");
-  const inferredDOI = metadata?.doi ?? sniffDOI(url);
-  const classification = tabPDF
+  const pageURL = tabURL || metadata?.url;
+  if (pageURL === undefined || pageURL.length === 0) throw new Error("Could not read the current page");
+  const viewerPDFURL = providerViewerPDFURL(pageURL);
+  const inferredDOI = metadata?.doi ?? sniffDOI(pageURL);
+  const classification = tabPDF || viewerPDFURL !== undefined
     ? { kind: "pdf" as const, ...(inferredDOI ? { doi: inferredDOI } : {}) }
-    : classifyPage(url, {
+    : classifyPage(pageURL, {
         ...(inferredDOI ? { doi: inferredDOI } : {}),
         ...(contentType ? { contentType } : {}),
       });
   const pageDOI = inferredDOI ?? classification.doi;
   return {
-    url,
+    url: viewerPDFURL ?? pageURL,
     ...(pageDOI ? { doi: pageDOI } : {}),
     ...(metadata?.title || tab.title ? { title: metadata?.title || tab.title! } : {}),
     kind: classification.kind,
@@ -843,12 +845,27 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   // sets one, so lastVerdictAt is always a number below — an AGED verdict,
   // never an unresolved probe, is what lands in this block.
   const lastVerdictAt = state.lastVerdictAt;
-  const stale =
-    typeof lastVerdictAt !== "number" ||
-    !Number.isFinite(lastVerdictAt) ||
-    Date.now() - lastVerdictAt < 0 ||
-    Date.now() - lastVerdictAt > SESSION_STALE_MS;
+  const verdictAge =
+    typeof lastVerdictAt === "number" && Number.isFinite(lastVerdictAt)
+      ? Date.now() - lastVerdictAt
+      : undefined;
+  const aged = verdictAge !== undefined && verdictAge > SESSION_STALE_MS;
+  const stale = verdictAge === undefined || verdictAge < 0 || aged;
   if (stale) {
+    if (aged && verdict === "in" && state.authenticated) {
+      return {
+        label: "Last verified signed in — rechecking",
+        detail,
+        action: "none",
+      };
+    }
+    if (aged && verdict === "out" && !state.authenticated) {
+      return {
+        label: "Last verified signed out — rechecking",
+        detail,
+        action: "signin",
+      };
+    }
     return {
       label: "Session state unknown — recheck",
       detail,
@@ -957,6 +974,27 @@ export function deriveSessionRows(
 let sessionNoticeFadeTimer: ReturnType<typeof setTimeout> | undefined;
 let sessionNoticeHideTimer: ReturnType<typeof setTimeout> | undefined;
 let sessionProbeRetryTimer: ReturnType<typeof setTimeout> | undefined;
+/** One targeted re-probe per stale decisive verdict. A popup refresh still
+ * reads snapshots every five seconds; this key prevents that cadence from
+ * repeatedly injecting the resolver probe when an inconclusive check leaves
+ * the earlier verdict timestamp unchanged. */
+let staleSessionProbeKey: string | undefined;
+
+function staleDecisiveSessionKey(state: PopupSessionState | undefined): string | undefined {
+  if (
+    state === undefined ||
+    state.checking === true ||
+    state.pausedForReauth ||
+    (state.verdict !== "in" && state.verdict !== "out") ||
+    typeof state.lastVerdictAt !== "number" ||
+    !Number.isFinite(state.lastVerdictAt)
+  ) {
+    return undefined;
+  }
+  const age = Date.now() - state.lastVerdictAt;
+  if (age >= 0 && age <= SESSION_STALE_MS) return undefined;
+  return `${state.resolverOrigin ?? ""}\u0000${state.verdict}\u0000${state.lastVerdictAt}`;
+}
 /** The release-event stamp the notice last animated for. A cumulative count
  * re-delivered by every session poll must not resurrect a faded notice. */
 let sessionNoticeShownKey: string | undefined;
@@ -1044,10 +1082,14 @@ function scheduleSessionProbeRetry(
 ): void {
   clearTimeout(sessionProbeRetryTimer);
   sessionProbeRetryTimer = undefined;
-  if (state?.checking !== true) return;
+  const staleKey = staleDecisiveSessionKey(state);
+  const checking = state?.checking === true;
+  if (!checking && (staleKey === undefined || staleKey === staleSessionProbeKey)) return;
+  if (staleKey !== undefined) staleSessionProbeKey = staleKey;
   sessionProbeRetryTimer = setTimeout(() => {
     sessionProbeRetryTimer = undefined;
-    void requestSessionState().then((next) => {
+    const read = checking ? requestSessionState() : requestSessionProbe();
+    void read.then((next) => {
       if (next !== undefined) renderInstitutionSession(document, next, openInstitutionSignIn, jobs);
     });
   }, 2_000);
@@ -1615,9 +1657,10 @@ function pageAcquireStatus(response: PageAcquireResponse): string {
   return "The daemon did not acknowledge this page.";
 }
 
-function deliveryStatusText(delivery: PendingDelivery | undefined): string {
+export function deliveryStatusText(delivery: PendingDelivery | undefined): string {
   if (delivery?.status === "failed") return delivery.error || "Could not deliver this PDF";
-  if (delivery?.status === "downloaded") return "papio adopted v (validating)";
+  if (delivery?.status === "waiting_manual") return delivery.error || "Use the PDF viewer Download button";
+  if (delivery?.status === "adopted" || delivery?.status === "downloaded") return "papio adopted PDF (validating)";
   if (delivery?.status === "sending") return "Sending PDF to papio…";
   return "";
 }
@@ -2186,8 +2229,10 @@ export async function acquireCurrentPage(): Promise<PageAcquireResponse> {
   return result as PageAcquireResponse;
 }
 
-/** Ask the broker to deliver the current PDF without opening another tab. */
-export async function sendCurrentPDF(): Promise<PageAcquireResponse> {
+/** Ask the broker to deliver the current PDF without opening another tab.
+ * The broker joins by tab, then DOI, then an Open pin that owns this tab.
+ * `targetJobID` is only a hint for that last case. */
+export async function sendCurrentPDF(targetJobID?: string): Promise<PageAcquireResponse> {
   const page = await readCurrentPageMetadata();
   if (page.kind !== "pdf" && !isPDFPage(page.url)) {
     return { error: "No PDF detected on this page" };
@@ -2198,6 +2243,7 @@ export async function sendCurrentPDF(): Promise<PageAcquireResponse> {
     request: {
       tab_id: page.tab_id,
       url: pdfSourceURL(page.url),
+      ...(targetJobID ? { job_id: targetJobID } : {}),
       ...(page.doi ? { doi: page.doi } : {}),
       ...(page.title ? { title: page.title } : {}),
     },
@@ -2209,7 +2255,7 @@ export async function sendCurrentPDF(): Promise<PageAcquireResponse> {
 }
 
 type DeliveryFeedback = PendingDelivery & {
-  status: "sending" | "downloaded" | "failed";
+  status: "sending" | "waiting_manual" | "downloaded" | "failed" | "adopted";
 };
 
 async function readDeliveryFeedback(fallback: PendingDelivery | undefined): Promise<PendingDelivery | undefined> {
@@ -2220,8 +2266,10 @@ async function readDeliveryFeedback(fallback: PendingDelivery | undefined): Prom
       reply !== null &&
       typeof (reply as Record<string, unknown>)["job_id"] === "string" &&
       ((reply as Record<string, unknown>)["state"] === "sending" ||
+        (reply as Record<string, unknown>)["state"] === "waiting_manual" ||
         (reply as Record<string, unknown>)["state"] === "downloaded" ||
-        (reply as Record<string, unknown>)["state"] === "failed")
+        (reply as Record<string, unknown>)["state"] === "failed" ||
+        (reply as Record<string, unknown>)["state"] === "adopted")
     ) {
       const state = (reply as Record<string, unknown>)["state"] as DeliveryFeedback["status"];
       const jobID = (reply as Record<string, unknown>)["job_id"] as string;
@@ -2309,17 +2357,39 @@ export function renderPageAcquire(
               : "PDF sent to papio"
             : "Send this PDF to papio";
           setAcquireButton(button, label, deliveryPending);
-          showAcquireFeedback(
-            section,
-            status,
-            state === "sending"
-              ? response.duplicate === true
-                ? "Sending PDF for the existing job"
-                : "Sending PDF to papio…"
-              : state === "downloaded"
-                ? "papio adopted v (validating)"
-                : responseErrorMessage(response) || response.message || "PDF delivery did not start.",
-          );
+          {
+            const errorText = responseErrorMessage(response);
+            const messageText = typeof response.message === "string" ? response.message : "";
+            const hasIdentify = /identify|file/i.test(errorText) || /identify|file/i.test(messageText);
+            const isNoDOI = /no[_ -]?doi/i.test(errorText) || /no[_ -]?doi/i.test(messageText);
+            // When manual target is selected the broker would not return no_doi; suppress stale copy.
+            let manualTargetSelected = false;
+            try {
+              const maybeJobs = (globalThis as unknown as { __papioLastJobs?: unknown }).__papioLastJobs;
+              if (Array.isArray(maybeJobs)) {
+                manualTargetSelected = selectedManualDeliveryTarget(maybeJobs as ActiveJob[]) !== undefined;
+              }
+            } catch {}
+            if (hasIdentify && messageText) {
+              showAcquireFeedback(section, status, messageText);
+            } else if (hasIdentify && errorText) {
+              showAcquireFeedback(section, status, errorText);
+            } else if (isNoDOI && manualTargetSelected) {
+              showAcquireFeedback(section, status, "Sending PDF to papio…");
+            } else {
+              showAcquireFeedback(
+                section,
+                status,
+                state === "sending"
+                  ? response.duplicate === true
+                    ? "Sending PDF for the existing job"
+                    : "Sending PDF to papio…"
+                  : state === "downloaded"
+                    ? "papio adopted v (validating)"
+                    : errorText || messageText || "PDF delivery did not start.",
+              );
+            }
+          }
           return;
         }
         queued = typeof response.job_id === "string" && response.job_id.length > 0;
@@ -2400,6 +2470,32 @@ export function sessionWarmForJob(
     isFreshSessionTimestamp(demandedOrigin.lastVerdictAt);
 
 }
+export function selectedManualDeliveryTarget(jobs: readonly ActiveJob[]): ActiveJob | undefined {
+  const targets = jobs.filter((job) => job.manual_delivery_target === true && job.status === "awaiting_download");
+  return targets.length === 1 ? targets[0] : undefined;
+}
+
+/** Tab, then unique expected DOI, then the Open pin only when it owns this tab. */
+export function pageDeliveryJob(
+  jobs: readonly ActiveJob[],
+  page: { tab_id?: number | undefined; doi?: string | undefined },
+): ActiveJob | undefined {
+  if (page.tab_id !== undefined) {
+    const byTab = jobs.find((job) => job.tab_id === page.tab_id);
+    if (byTab !== undefined) return byTab;
+  }
+  if (page.doi !== undefined && page.doi.trim() !== "") {
+    const normalized = page.doi.trim().toLowerCase().replace(/^doi:\s*/, "");
+    const byDOI = jobs.filter(
+      (job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === normalized,
+    );
+    if (byDOI.length === 1) return byDOI[0];
+  }
+  const pin = selectedManualDeliveryTarget(jobs);
+  if (pin !== undefined && page.tab_id !== undefined && pin.tab_id === page.tab_id) return pin;
+  return undefined;
+}
+
 export function renderPageContext(
   doc: Document,
   page: PageMetadata | undefined,
@@ -2425,11 +2521,7 @@ export function renderPageContext(
   status.textContent = "";
   const kind = page?.kind ?? (page ? classifyPage(page.url, page.doi ? { doi: page.doi } : {}).kind : "none");
   if (kind === "pdf") {
-    const knownJob =
-      (page?.tab_id === undefined ? undefined : jobs.find((job) => job.tab_id === page.tab_id)) ??
-      (page?.doi === undefined
-        ? undefined
-        : jobs.find((job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === page.doi?.trim().toLowerCase().replace(/^doi:\s*/, "")));
+    const knownJob = pageDeliveryJob(jobs, { tab_id: page?.tab_id, doi: page?.doi });
     const currentPDFURL = normalizedPDFURL(page?.url);
     const pendingPDFURL = normalizedPDFURL(pendingDelivery?.url);
     const deliveryMatchesJob = pendingDelivery?.job_id === knownJob?.job_id;
@@ -2503,9 +2595,9 @@ export function renderPageContext(
 
 let popupActivity: ActivityEntryPayload[] = [];
 let popupRefreshTimer: ReturnType<typeof setInterval> | undefined;
-/** The popup probes at most once per open — a probe injects a content
- * script into the user's library tab, so every later refresh tick must fall
- * back to a snapshot-only read instead of repeating that injection. */
+/** The popup probes once on open. Later refreshes are snapshot-only except
+ * for one targeted re-probe when a decisive verdict crosses its freshness
+ * boundary; scheduleSessionProbeRetry deduplicates that by verdict timestamp. */
 let sessionProbedThisPopup = false;
 
 let popupPresenceFeatures: readonly string[] | undefined;
@@ -2554,8 +2646,8 @@ export function wirePrimaryShortcut(doc: Document = document): void {
 }
 
 
-/** The popup's one probe-on-open, then snapshot-only reads for every later
- * refresh tick — see `sessionProbedThisPopup`. */
+/** The popup's probe-on-open, then snapshot-only refresh reads. A stale
+ * decisive verdict may separately trigger one deduplicated re-probe. */
 function readSessionForRefresh(): Promise<PopupSessionState | undefined> {
   if (sessionProbedThisPopup) return requestSessionState();
   sessionProbedThisPopup = true;
@@ -2588,7 +2680,12 @@ export async function refresh(): Promise<void> {
   popupPresenceFeatures = store.daemonFeatures;
   void sendPopupPresence(store.daemonFeatures, true);
   renderDaemonStatus(document, store);
-  renderPageAcquire(document);
+  (globalThis as unknown as { __papioLastJobs?: ActiveJob[] }).__papioLastJobs = store.activeJobs;
+  renderPageAcquire(
+    document,
+    acquireCurrentPage,
+    () => sendCurrentPDF(),
+  );
   refreshCaptureOptions(document, store.daemonFeatures);
   // Wave 2: every slow input is gathered in parallel and painted in ONE
   // synchronous pass. Sections revealing one by one over the next seconds
@@ -2856,7 +2953,15 @@ if (
   typeof chrome.storage?.local?.get === "function" &&
   (chrome.storage.session === undefined || typeof chrome.storage.session.get === "function")
 ) {
-  renderPageAcquire(document);
+  renderPageAcquire(
+    document,
+    acquireCurrentPage,
+    async () => {
+      const store = await chromeBackend(chrome.storage).load().catch(() => ({ activeJobs: [] as ActiveJob[] }));
+      (globalThis as unknown as { __papioLastJobs?: ActiveJob[] }).__papioLastJobs = store.activeJobs ?? [];
+      return sendCurrentPDF();
+    },
+  );
   wireDevTools();
   wireSettings();
   wireInboxLauncher();

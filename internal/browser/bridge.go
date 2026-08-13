@@ -6434,7 +6434,12 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 		// about the PDF itself.
 		return err
 	}
-	if !report.Payload.OK || !report.Structural.Valid {
+	active := report.Structural.Encrypted || report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
+	// Encrypted/JS/embedded publisher PDFs are held for review after a job
+	// exists (validateCandidate parks unsafe_pdf). Deleting them here as
+	// invalid_pdf made Send PDF's grab fallback unusable for the SAGE/T&F
+	// files that motivated that park.
+	if !active && (!report.Payload.OK || !report.Structural.Valid) {
 		_ = os.Remove(temp)
 		_ = os.RemoveAll(dir)
 		return b.grabs.MarkFailedValidation(ctx, g.ID, "the captured file is not a valid PDF")
@@ -6448,15 +6453,76 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 
 		return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
 	}
-	return b.createGrabJob(ctx, g, dois[0], temp, dir, name)
+	var mismatch error
+	for _, doi := range dois {
+		err := b.createGrabJob(ctx, g, doi, temp, dir, name, report.Text.Excerpt)
+		if errors.Is(err, errGrabIdentityMismatch) {
+			mismatch = err
+			continue
+		}
+		return err
+	}
+	if mismatch != nil {
+		return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
+	}
+	return nil
+}
+
+// errGrabIdentityMismatch means this front-matter DOI names a ready bundle
+// that MatchIdentity says is a different work. The caller tries the next DOI
+// rather than claiming already_owned or creating a duplicate job.
+var errGrabIdentityMismatch = errors.New("grab front-matter DOI does not match the ready work")
+
+func uniqueAdoptionDest(dir, filename string) string {
+	if filename == "" || !filepath.IsLocal(filename) || filename == "." || filename == string(filepath.Separator) {
+		filename = "grab.pdf"
+	}
+	dest := filepath.Join(dir, filename)
+	if _, err := os.Stat(dest); err != nil {
+		return dest
+	}
+	ext := filepath.Ext(filename)
+	stem := strings.TrimSuffix(filename, ext)
+	for n := 2; n < 1000; n++ {
+		candidate := filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, n, ext))
+		if _, err := os.Stat(candidate); err != nil {
+			return candidate
+		}
+	}
+	return filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, time.Now().UnixNano(), ext))
 }
 
 // createGrabJob implements ADR-0020 Decision 4's "identifier found" branch.
 // Ledger dedupe (ADR-0010) applies naturally through the same
-// CreateRequestForWork every other submission path uses: an already-live job
-// for this DOI is joined, never duplicated, and reports "already_owned"
-// instead of creating a second job.
-func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantinePath, landingDir, filename string) error {
+// CreateRequestForWork every other submission path uses, but ready is terminal
+// and therefore invisible to that dedupe. Mirror IdentifyGrab: a ready bundle
+// is already_owned and discards the captured bytes, while a live (non-terminal)
+// job reuses those bytes via its own adoption directory (job_created).
+func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantinePath, landingDir, filename, excerpt string) error {
+	if _, readyJobID, _, err := b.canonicalJobStatus(ctx, "doi", doi); err != nil {
+		return err
+	} else if readyJobID != "" {
+		row, err := b.jobs.Get(ctx, readyJobID)
+		if err != nil {
+			return err
+		}
+		switch pdf.MatchIdentity(excerpt, row.Work).Result {
+		case pdf.IdentityPass:
+			// Keep the only copy until the grab row is durably terminal.
+			if err := b.grabs.MarkJobCreated(ctx, g.ID, readyJobID, "already_owned"); err != nil {
+				return err
+			}
+			_ = os.Remove(quarantinePath)
+			_ = os.RemoveAll(landingDir)
+			return nil
+		case pdf.IdentityReview:
+			// An erratum/comment can print the ready paper's DOI. Do not
+			// claim already_owned or discard the capture.
+			return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
+		default:
+			return errGrabIdentityMismatch
+		}
+	}
 	mode, err := b.cfg.RequireAccessMode()
 	if err != nil {
 		return err
@@ -6467,32 +6533,27 @@ func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantin
 	if err != nil {
 		return err
 	}
-	_ = os.Remove(quarantinePath) // superseded either way — see the two branches below
-	if result.Existing {
-		_ = os.RemoveAll(landingDir)
-		return b.grabs.MarkJobCreated(ctx, g.ID, result.JobID, "already_owned")
-	}
-	// No candidate-injection seam exists for a local file (InsertCandidates
-	// predates a job and has no "local file" source), so this places the
-	// captured bytes in the job's OWN adoption directory — the same landing
-	// spot a real steered chrome.downloads.download would use — and lets the
-	// existing, already-tested adopt() claim it: structural + identity
-	// validation against the DOI's registrar metadata, exactly as any other
-	// acquisition receives (ADR-0020 Decision 4).
 	jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), result.JobID)
 	if err := os.MkdirAll(jobDir, 0o700); err != nil {
 		return err
 	}
-	dest := filepath.Join(jobDir, filename)
-	if err := os.Rename(filepath.Join(landingDir, filename), dest); err != nil {
+	src := filepath.Join(landingDir, filename)
+	if _, err := os.Stat(src); err != nil {
+		src = quarantinePath
+	}
+	dest := uniqueAdoptionDest(jobDir, filename)
+	if err := b.copyGrabFile(src, dest); err != nil {
 		return err
 	}
-	_ = os.Remove(landingDir) // rmdir semantics: only removes now that it's empty
+	boundName := filepath.Base(dest)
 	if err := b.grabs.MarkJobCreated(ctx, g.ID, result.JobID, "job_created"); err != nil {
+		_ = os.Remove(dest)
 		return err
 	}
-	if _, err := b.ingestAdoptedFile(ctx, result.JobID, filename); err != nil {
-		if evErr := b.recordAdoptionDeferred(ctx, result.JobID, filename, err); evErr != nil {
+	_ = os.Remove(quarantinePath)
+	_ = os.RemoveAll(landingDir)
+	if _, err := b.ingestAdoptedFile(ctx, result.JobID, boundName); err != nil {
+		if evErr := b.recordAdoptionDeferred(ctx, result.JobID, boundName, err); evErr != nil {
 			return evErr
 		}
 	}
@@ -6510,16 +6571,7 @@ type GrabIdentifyResult struct {
 	Detail  string `json:"detail,omitempty"`
 }
 
-func (b *Bridge) moveGrabFile(src, dst string) error {
-	rename := b.renameFile
-	if rename == nil {
-		rename = os.Rename
-	}
-	if err := rename(src, dst); err == nil {
-		return nil
-	} else if !errors.Is(err, syscall.EXDEV) {
-		return err
-	}
+func (b *Bridge) copyGrabFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -6546,6 +6598,22 @@ func (b *Bridge) moveGrabFile(src, dst string) error {
 	if closeInErr != nil {
 		_ = os.Remove(dst)
 		return closeInErr
+	}
+	return nil
+}
+
+func (b *Bridge) moveGrabFile(src, dst string) error {
+	rename := b.renameFile
+	if rename == nil {
+		rename = os.Rename
+	}
+	if err := rename(src, dst); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	if err := b.copyGrabFile(src, dst); err != nil {
+		return err
 	}
 	return os.Remove(src)
 }

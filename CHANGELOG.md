@@ -38,6 +38,8 @@ execution records kept during the initial build.
   and automatic fallback to the normal path when candidates are exhausted.
   Requires extension 0.13.0; `[browser] direct_routes_enabled` (default
   `true`) turns the behaviour off.
+- **Cell Press PII PDF route.** The compiled route table now includes `cell-pii-showpdf/1`: `https://www.cell.com/action/showPdf?pii={pii}`. The compiler accepts the identifier slot in the query (`pii={pii}`) as well as in the path, still exactly one named slot, still no freeform interpolation.
+
 - **Drift and safety latches.** A browser outcome that proves the wrong work,
   a failed validation, or an unexpected effect now durably stops further
   automatic browser offers for that job and provider; ordinary page-drift
@@ -78,29 +80,9 @@ execution records kept during the initial build.
   you can fetch it through your library while *papio* tracks the outcome.
 
 ### Fixed
+- **Publisher PDFs with embedded files are held for review instead of rejected.** Encrypted PDFs and those carrying active content (JavaScript or embedded files) now correctly park in `needs_review` with the quarantined file held for `unsafe_pdf` review. Accepting that review is refused (the original bytes are never promoted). Rejecting it returns the job to `awaiting_human` with a new `manual_download` so a different file can be supplied. Previously SAGE and Taylor & Francis publisher PDFs that bundle supplementary files hit the generic `invalid_pdf` path — the daemon asked the operator to supply a different file and moved the original to `rejected/`, while the `unsafe_pdf` review path was dead for those structural flags.
+- **A grabbed PDF that matches a live job is adopted into that job.** When front-matter identification finds a DOI that already has an in-progress job, the captured file is moved into that job's adoption directory under a unique name instead of being discarded as `already_owned`. A ready artifact still reports `already_owned` only after `MatchIdentity` passes, and the bytes are dropped only after that outcome is durable. Embedded/JS/encrypted captures are no longer deleted as `failed_validation` before that join can run.
 - **Browser downloads are adopted on a fresh install.** `download_adoption_root`
-  now defaults to the `papio` directory inside your browser's download folder
-  (`~/Downloads/papio` on macOS, the XDG `XDG_DOWNLOAD_DIR` folder on
-  Linux/BSD, the `Downloads` known folder on Windows) instead of
-  `<data_dir>/adoptions`. The old default was unreachable: Chrome's
-  `onDeterminingFilename` can only steer a download to a path *relative* to
-  the browser's own download directory, and every steering target *papio*
-  mints is `papio/<job-id>/…`, so a default install adopted nothing — no
-  manual downloads, no adapter-driven downloads, no PDF grabs — silently and
-  with no error anywhere. An explicit `download_adoption_root` still wins
-  unchanged. Existing files are not orphaned: `<data_dir>/adoptions` stays in
-  the adoption search path as a drain-only location, so settled files there
-  are still adopted and their landing directories are still collected once
-  their jobs finish, while nothing new is ever written to it. `papio init`
-  creates the effective root so the macOS Files-and-Folders consent prompt is
-  paid once, interactively, at setup rather than blocking a background
-  daemon's `open(2)` in-kernel; a creation failure is reported with its
-  remediation instead of a tick. `papio doctor`'s `adoption_root` check now
-  **fails** — naming the path it resolved and the fix — when the effective
-  root is not a `papio` directory a browser could steer into, and a new
-  `adoption_root_legacy` check names any files still sitting in the old
-  location.
-
 ## [0.20.0] - 2026-08-10
 
 ### Added

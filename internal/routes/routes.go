@@ -73,6 +73,15 @@ var routeTable = []routeTemplate{
 		pathPrefix:    "/science/article/pii/",
 		pathSuffix:    "/pdfft",
 	},
+	{
+		routeRevision: "cell-pii-showpdf/1",
+		provider:      "cell-pii-showpdf",
+		identifier:    identifierPII,
+		origin:        "https://www.cell.com",
+		pathFamily:    "/action/showPdf",
+		pathPrefix:    "/action/showPdf",
+		query:         "pii={pii}",
+	},
 }
 
 // Validate checks every compiled-in route's declared URL envelope. It is
@@ -106,16 +115,29 @@ func Validate() error {
 		if err != nil || origin.Scheme != "https" || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
 			return fmt.Errorf("route %q has invalid allowed origin %q", route.routeRevision, route.origin)
 		}
-		if route.query != "" && route.query != "download=true" {
-			return fmt.Errorf("route %q has an unsupported query", route.routeRevision)
-		}
 		placeholder := "{" + route.identifier + "}"
-		pathWithoutSlot := strings.Replace(route.pathFamily, placeholder, "", 1)
-		if strings.Count(route.pathFamily, placeholder) != 1 || strings.ContainsAny(pathWithoutSlot, "{}") {
+		pathCount := strings.Count(route.pathFamily, placeholder)
+		queryCount := strings.Count(route.query, placeholder)
+		if pathCount+queryCount != 1 {
 			return fmt.Errorf("route %q must contain exactly one named identifier slot", route.routeRevision)
 		}
-		if route.pathPrefix+placeholder+route.pathSuffix != route.pathFamily {
-			return fmt.Errorf("route %q path family does not match its compiler", route.routeRevision)
+		if strings.ContainsAny(strings.Replace(route.pathFamily, placeholder, "", 1)+strings.Replace(route.query, placeholder, "", 1), "{}") {
+			return fmt.Errorf("route %q must contain exactly one named identifier slot", route.routeRevision)
+		}
+		if queryCount == 1 {
+			if route.identifier != identifierPII || route.query != "pii={pii}" {
+				return fmt.Errorf("route %q has an unsupported query", route.routeRevision)
+			}
+			if route.pathFamily != route.pathPrefix+route.pathSuffix {
+				return fmt.Errorf("route %q path family does not match its compiler", route.routeRevision)
+			}
+		} else {
+			if route.query != "" && route.query != "download=true" {
+				return fmt.Errorf("route %q has an unsupported query", route.routeRevision)
+			}
+			if route.pathPrefix+placeholder+route.pathSuffix != route.pathFamily {
+				return fmt.Errorf("route %q path family does not match its compiler", route.routeRevision)
+			}
 		}
 		if !strings.HasPrefix(route.pathPrefix, "/") || strings.Contains(route.pathPrefix, "?") || strings.Contains(route.pathSuffix, "?") {
 			return fmt.Errorf("route %q has an invalid path family", route.routeRevision)
@@ -258,6 +280,31 @@ func expand(route routeTemplate, identifier string) (Candidate, error) {
 	if !safeIdentifier(identifier) {
 		return Candidate{}, fmt.Errorf("identifier contains a forbidden character")
 	}
+	placeholder := "{" + route.identifier + "}"
+	if strings.Contains(route.query, placeholder) {
+		if route.identifier != identifierPII || route.query != "pii={pii}" {
+			return Candidate{}, fmt.Errorf("unsupported query slot %q", route.query)
+		}
+		if strings.Count(route.query, placeholder) != 1 {
+			return Candidate{}, fmt.Errorf("unsupported query slot %q", route.query)
+		}
+		escapedQuery := url.QueryEscape(identifier)
+		expandedQuery := strings.Replace(route.query, placeholder, escapedQuery, 1)
+		path := route.pathFamily
+		u := url.URL{Scheme: "https", Host: strings.TrimPrefix(route.origin, "https://"), Path: path, RawQuery: expandedQuery}
+		candidate := Candidate{
+			RouteRevision: route.routeRevision,
+			URL:           u.String(),
+			AllowedOrigin: route.origin,
+			PathFamily:    route.pathFamily,
+			TermsPolicy:   termsPolicyNone,
+			Identifier:    route.identifier + ":" + identifier,
+		}
+		if err := ValidateCandidate(candidate); err != nil {
+			return Candidate{}, err
+		}
+		return candidate, nil
+	}
 	var escaped string
 	switch route.identifier {
 	case identifierDOI, identifierPII:
@@ -312,10 +359,25 @@ func ValidateCandidate(candidate Candidate) error {
 		return fmt.Errorf("candidate identifier is invalid for route %q", candidate.RouteRevision)
 	}
 	placeholder := "{" + route.identifier + "}"
-	if strings.Count(route.pathFamily, placeholder) != 1 ||
-		route.pathPrefix+placeholder+route.pathSuffix != route.pathFamily ||
-		strings.ContainsAny(strings.Replace(route.pathFamily, placeholder, "", 1), "{}?#\\") {
+	pathCount := strings.Count(route.pathFamily, placeholder)
+	queryCount := strings.Count(route.query, placeholder)
+	if pathCount+queryCount != 1 {
 		return fmt.Errorf("packaged path family is invalid for route %q", candidate.RouteRevision)
+	}
+	if strings.ContainsAny(strings.Replace(route.pathFamily, placeholder, "", 1)+strings.Replace(route.query, placeholder, "", 1), "{}?#\\") {
+		return fmt.Errorf("packaged path family is invalid for route %q", candidate.RouteRevision)
+	}
+	if queryCount == 1 {
+		if route.identifier != identifierPII || route.query != "pii={pii}" {
+			return fmt.Errorf("packaged path family is invalid for route %q", candidate.RouteRevision)
+		}
+		if route.pathFamily != route.pathPrefix+route.pathSuffix {
+			return fmt.Errorf("packaged path family is invalid for route %q", candidate.RouteRevision)
+		}
+	} else {
+		if strings.Count(route.pathFamily, placeholder) != 1 || route.pathPrefix+placeholder+route.pathSuffix != route.pathFamily {
+			return fmt.Errorf("packaged path family is invalid for route %q", candidate.RouteRevision)
+		}
 	}
 
 	origin, err := url.Parse(route.origin)
@@ -329,6 +391,26 @@ func ValidateCandidate(candidate Candidate) error {
 	}
 	if u.Scheme != "https" || u.User != nil || u.Host == "" || u.Fragment != "" {
 		return fmt.Errorf("URL is outside HTTPS/origin envelope")
+	}
+
+	if queryCount == 1 {
+		expectedQuery := strings.Replace(route.query, placeholder, url.QueryEscape(identifier), 1)
+		if u.EscapedPath() != route.pathFamily {
+			return fmt.Errorf("path %q is outside %q", u.EscapedPath(), route.pathFamily)
+		}
+		if u.RawQuery != expectedQuery {
+			return fmt.Errorf("query is duplicated or unexpected")
+		}
+		expectedURL := (&url.URL{
+			Scheme:   origin.Scheme,
+			Host:     origin.Host,
+			Path:     route.pathFamily,
+			RawQuery: expectedQuery,
+		}).String()
+		if candidate.URL != expectedURL {
+			return fmt.Errorf("URL is not the canonical encoding for route %q", candidate.RouteRevision)
+		}
+		return nil
 	}
 
 	escapedIdentifier := escapePathIdentifier(identifier)

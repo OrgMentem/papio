@@ -1116,8 +1116,8 @@ func (js *Store) RepairParkWithAction(ctx context.Context, jobID, from, to strin
 			return err
 		}
 	}
-	if options.binding != nil && actionKind != "verify_identity" {
-		return errors.New("human action binding is only valid for verify_identity")
+	if options.binding != nil && actionKind != "verify_identity" && actionKind != "unsafe_pdf" {
+		return errors.New("human action binding is only valid for verify_identity or unsafe_pdf")
 	}
 	expected := make(map[int64]struct{}, len(actionIDs))
 	for _, actionID := range actionIDs {
@@ -2483,8 +2483,8 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 			return 0, err
 		}
 	}
-	if options.binding != nil && kind != "verify_identity" {
-		return 0, errors.New("human action binding is only valid for verify_identity")
+	if options.binding != nil && kind != "verify_identity" && kind != "unsafe_pdf" {
+		return 0, errors.New("human action binding is only valid for verify_identity or unsafe_pdf")
 	}
 
 	tx, err := js.S.DB().BeginTx(ctx, nil)
@@ -2652,7 +2652,10 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 	if err != nil {
 		return ReviewResolution{}, normalizeReviewBusy(err)
 	}
-	if action.Kind != "verify_identity" {
+	if action.Kind != "verify_identity" && action.Kind != "unsafe_pdf" {
+		return ReviewResolution{}, &ErrHumanActionKind{ActionID: input.ActionID, Kind: action.Kind}
+	}
+	if action.Kind == "unsafe_pdf" && input.Verdict == "accept" {
 		return ReviewResolution{}, &ErrHumanActionKind{ActionID: input.ActionID, Kind: action.Kind}
 	}
 	if action.Status != "open" {
@@ -2714,7 +2717,10 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 
 	to, reason := StateCancelled, "review_rejected"
 	terminalReason := TerminalReasonReviewRejected
-	if input.Verdict == "accept" {
+	if action.Kind == "unsafe_pdf" && input.Verdict == "reject" {
+		to, reason = StateAwaitingHuman, "unsafe_pdf_rejected_manual_download"
+		terminalReason = TerminalReason("")
+	} else if input.Verdict == "accept" {
 		candidateID := action.CandidateID
 		if candidateID == 0 {
 			var candidate sql.NullInt64
@@ -2768,6 +2774,15 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 	} else if changed != 1 {
 		return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID}, nil
 	}
+	if action.Kind == "unsafe_pdf" && input.Verdict == "reject" {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO human_actions
+				(job_id, kind, status, detail, requires_auth, blocked_by, diagnosis, revision, created_at)
+			VALUES (?, 'manual_download', 'open', ?, 0, '', '', 1, ?)`,
+			action.JobID, "the held PDF was rejected; supply a different file", now); err != nil {
+			return ReviewResolution{}, normalizeReviewBusy(err)
+		}
+	}
 	if Terminal(to) {
 		if err := closeTerminalHumanActions(ctx, tx, action.JobID, to, now); err != nil {
 			return ReviewResolution{}, normalizeReviewBusy(err)
@@ -2808,7 +2823,7 @@ func normalizeReviewBusy(err error) error {
 // on revision). It cancels the job only when that job is currently parked on
 // the dismissed action: awaiting_human for openurl_handoff, manual_download,
 // openurl_available, or document_delivery; or needs_review for
-// verify_identity. A stale action from another state is closed without
+// verify_identity or unsafe_pdf. A stale action from another state is closed without
 // disturbing the job's live work. downloads_access_required is deliberately
 // excluded from the awaiting_human list even though that action also parks a
 // job there: the pending download itself is fine, only the folder grant is
@@ -2871,7 +2886,7 @@ func dismissalCancelsParkedJob(actionKind, state string) bool {
 		// absent here — see DismissHumanAction's doc comment.
 		return actionKind == "openurl_handoff" || actionKind == "manual_download" || actionKind == "openurl_available" || actionKind == ActionKindDocumentDelivery
 	case StateNeedsReview:
-		return actionKind == "verify_identity"
+		return actionKind == "verify_identity" || actionKind == "unsafe_pdf"
 	default:
 		return false
 	}

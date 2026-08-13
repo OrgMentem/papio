@@ -94,6 +94,15 @@ export interface DownloadTargetContract {
   pattern?: string;
 }
 
+export interface ProviderViewerRoute {
+  /** Exact leading pathname identifying the provider's journal viewer. */
+  pathPrefix: string;
+  /** Optional viewer-specific extraction/build pair. Omit both to reuse the
+   * download rule's idPattern and urlTemplate. */
+  idPattern?: string;
+  urlTemplate?: string;
+}
+
 export interface DownloadRule {
   selector: string;
   requireKind: "article";
@@ -119,9 +128,8 @@ export interface DownloadRule {
   followupSelector?: string;
   /** Shared bounded wait for post-click gate/follow-up insertion. */
   postClickTimeoutMs?: number;
-  /** Optional provider viewer route that should be converted to the declared
-   * direct endpoint before Chrome's built-in viewer can hide the PDF URL. */
-  viewerPathPattern?: string;
+  /** Unambiguous packaged provider viewers and their direct-PDF mapping. */
+  viewerRoutes?: ProviderViewerRoute[];
   /** method "url"/"api": regex matched against the page URL; capture groups fill
    * {1},{2},… (and {id} = {1}) in urlTemplate. */
   idPattern?: string;
@@ -774,7 +782,7 @@ export const adapters: AdapterSpec[] = [
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "url",
-      viewerPathPattern: "/doi/epdf/",
+      viewerRoutes: [{ pathPrefix: "/doi/epdf/" }],
       // Wiley article/abstract/viewer paths all carry the DOI after /doi/[seg/].
       idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
       urlTemplate: "https://onlinelibrary.wiley.com/doi/pdfdirect/{1}?download=true",
@@ -800,6 +808,10 @@ export const adapters: AdapterSpec[] = [
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "url",
+      viewerRoutes: [
+        { pathPrefix: "/doi/epdf/" },
+        { pathPrefix: "/doi/epub/" },
+      ],
       idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
       urlTemplate: "https://journals.sagepub.com/doi/pdf/{1}?download=true",
     },
@@ -910,6 +922,11 @@ export const adapters: AdapterSpec[] = [
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "href",
+      viewerRoutes: [{
+        pathPrefix: "/doi/epdf/",
+        idPattern: "/doi/epdf/(10\\.[^?#]+)",
+        urlTemplate: "https://www.tandfonline.com/doi/pdf/{1}?download=true",
+      }],
     },
   },
   {
@@ -1369,3 +1386,47 @@ export const adapters: AdapterSpec[] = [
     ],
   },
 ];
+
+/** Resolve a packaged provider viewer route to its declared direct PDF
+ * endpoint. Only HTTPS pages on a registered host, an explicit viewer prefix,
+ * and a successful source-controlled extraction/build pair may qualify. */
+export function providerViewerPDFURL(
+  value: string,
+  specs: readonly AdapterSpec[] = adapters,
+): string | undefined {
+  let page: URL;
+  try {
+    page = new URL(value);
+  } catch {
+    return undefined;
+  }
+  if (page.protocol !== "https:") return undefined;
+  const spec = specs.find((candidate) =>
+    candidate.hosts.some((host) => page.hostname === host || page.hostname.endsWith(`.${host}`))
+  );
+  const rule = spec?.download;
+  const route = rule?.viewerRoutes?.find((candidate) => page.pathname.startsWith(candidate.pathPrefix));
+  const idPattern = route?.idPattern ?? rule?.idPattern;
+  const urlTemplate = route?.urlTemplate ?? rule?.urlTemplate;
+  if (route === undefined || typeof idPattern !== "string" || typeof urlTemplate !== "string") {
+    return undefined;
+  }
+
+  let match: RegExpMatchArray | null;
+  try {
+    match = value.match(new RegExp(idPattern));
+  } catch {
+    return undefined;
+  }
+  if (match === null) return undefined;
+  const built = urlTemplate.replace(
+    /\{(\d+|id)\}/g,
+    (_, key: string) => match?.[key === "id" ? 1 : Number(key)] ?? "",
+  );
+  try {
+    const target = new URL(built);
+    return target.protocol === "https:" ? target.href : undefined;
+  } catch {
+    return undefined;
+  }
+}

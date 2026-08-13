@@ -125,9 +125,12 @@ func confineToAdoptionRoots(roots []string, resolved string) error {
 //
 // The job is briefly leased for the duration so neither the scheduler nor
 // RecoverStale can claim or rewind it while it sits in validating. Outcomes:
-// ready on acceptance, needs_review when validation parks it, and back to
-// awaiting_human (with a fresh manual_download action) when the file is
-// rejected so the human can supply a different one.
+// ready on acceptance, needs_review when validation parks it (including
+// unsafe_pdf — encrypted or active/embedded PDFs held for review with their
+// quarantine file — which does NOT open a manual_download replacement and does
+// NOT move the file to rejected/), and back to awaiting_human (with a fresh
+// manual_download action) when the file is rejected so the human can supply a
+// different one.
 func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	if s.Validate == nil {
 		return fmt.Errorf("acquisition service is missing its validation dependency")

@@ -898,22 +898,36 @@ test("a successful handoff retry clears the prior inline failure", async () => {
   expect(attempts).toBe(2);
 });
 
-test("ordinary manual and watch links still open directly", async () => {
+test("manual Open selects its existing job through the broker while watch links stay direct", async () => {
   const manual = manualAction("action:manual-open", 1, "Manual link");
+  manual.job_id = "job_manual_open_0001";
   manual.links = [{ rel: "landing", url: "https://example.test/manual" }];
   manual.ops = ["open"];
   const hit = watchHit("hit:open", 2, "Watch link", [{ rel: "doi", url: "https://doi.org/10.1234/watch" }]);
   const fixture = snapshot([manual, hit], {
     counts: counts({ pending_total: 2, actions: 1, watch_hits: 1, retractions: 0 }),
   });
-  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.manual.open") return { ok: true, opened: true };
+    return snapshotReply(fixture, message);
+  });
 
   page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:manual-open'] [data-operation='open']")?.click();
+  await settle();
+  expect(page.requests.filter((request) => request.type === "papio.manual.open")).toEqual([{
+    type: "papio.manual.open",
+    request: {
+      job_id: "job_manual_open_0001",
+      url: "https://example.test/manual",
+      title: "Manual link",
+    },
+  }]);
+  expect(page.document.getElementById("operation-status")?.textContent)
+    .toBe("Manual-download page opened. Send PDF will use this job.");
+
   page.document.querySelector<HTMLElement>("[data-triage-item-id='hit:open']")?.focus();
   key(page.document, "o");
-
-  expect(page.opened).toEqual(["https://example.test/manual", "https://doi.org/10.1234/watch"]);
-  expect(page.requests.filter((request) => request.type === "papio.handoff.open")).toHaveLength(0);
+  expect(page.opened).toEqual(["https://doi.org/10.1234/watch"]);
 });
 
 test("a conflict leaves an inline refresh result and re-requests the snapshot", async () => {
@@ -941,6 +955,41 @@ test("returning to the tab re-requests the snapshot so the inbox stays fresh", a
   page.document.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
   await settle();
   expect(page.requests.filter((request) => request.type === "papio.triage.snapshot")).toHaveLength(2);
+});
+test("an automatic snapshot refresh preserves expanded item details", async () => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const polls: Array<() => void> = [];
+  globalThis.setTimeout = ((callback: () => void, delay?: number) => {
+    if (delay === 15_000) {
+      polls.push(callback);
+      return 0;
+    }
+    return originalSetTimeout(callback, delay);
+  }) as typeof globalThis.setTimeout;
+  try {
+    let fixture = snapshot([manualAction("action:expanded", 1, "Expanded details")], {
+      counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+    });
+    const page = await inboxDocument((message) => snapshotReply(fixture, message));
+    const toggle = page.document.querySelector<HTMLButtonElement>(
+      "[data-triage-item-id='action:expanded'] .item-debug-toggle",
+    );
+    toggle?.click();
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+    expect(polls).toHaveLength(1);
+
+    fixture = snapshot([manualAction("action:expanded", 1, "Expanded details")], {
+      counts: counts({ pending_total: 2, actions: 1, watch_hits: 0, retractions: 0 }),
+    });
+    polls.shift()?.();
+    await settle();
+
+    const refreshedRow = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:expanded']");
+    expect(refreshedRow?.querySelector(".item-debug-toggle")?.getAttribute("aria-expanded")).toBe("true");
+    expect(refreshedRow?.querySelector<HTMLDListElement>(".item-debug")?.hidden).toBe(false);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
 });
 
 

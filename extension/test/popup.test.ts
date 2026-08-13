@@ -7,6 +7,7 @@ import { Window } from "happy-dom";
 
 import {
   acquireCurrentPage,
+  sendCurrentPDF,
   collectPageMetadata,
   OPEN_HANDOFF_MESSAGE,
   OPEN_INBOX_MESSAGE,
@@ -29,6 +30,9 @@ import {
   renderPopupCatchup,
   renderWorkPulse,
   type PopupPulseCache,
+  selectedManualDeliveryTarget,
+  pageDeliveryJob,
+  deliveryStatusText,
   sessionWarmForJob,
   renderResolverGrants,
   renderTermsConsent,
@@ -71,6 +75,20 @@ function job(overrides: Partial<ActiveJob> = {}): ActiveJob {
     ...overrides,
   };
 }
+
+test("delivery feedback distinguishes viewer action from adopted success", () => {
+  expect(deliveryStatusText({
+    job_id: "job-viewer",
+    initiated_at: 1,
+    status: "waiting_manual",
+    error: "Use the PDF viewer Download button — papio will adopt that authorized file",
+  })).toMatch(/viewer Download button/i);
+  expect(deliveryStatusText({
+    job_id: "job-adopted",
+    initiated_at: 2,
+    status: "adopted",
+  })).toBe("papio adopted PDF (validating)");
+});
 
 function pulseCache(overrides: Partial<WorkPulseResponsePayload> = {}): PopupPulseCache {
   return {
@@ -518,6 +536,80 @@ test("shows the PDF acquire icon with the PDF tooltip", () => {
   button.click();
 });
 
+test("Send PDF does not attach an Open pin job_id for a DOI-less unmatched tab", async () => {
+  popupDocument();
+  const sent: unknown[] = [];
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: {
+        query: async () => [{
+          id: 77,
+          url: "https://provider.example.edu/download/article.pdf",
+          contentType: "application/pdf",
+        }],
+      },
+      scripting: { executeScript: async () => { throw new Error("PDF viewer blocks scripting"); } },
+      runtime: {
+        sendMessage: async (message: unknown) => {
+          sent.push(message);
+          return { ok: true, state: "sending", message: "papio will identify this PDF from the file" };
+        },
+      },
+    },
+  });
+
+  await expect(sendCurrentPDF()).resolves.toMatchObject({
+    ok: true,
+    state: "sending",
+  });
+  expect(sent).toEqual([{
+    type: "papio.delivery.start",
+    request: {
+      tab_id: 77,
+      url: "https://provider.example.edu/download/article.pdf",
+    },
+  }]);
+});
+
+test("pageDeliveryJob prefers tab then DOI then pin-on-this-tab", () => {
+  const pin = job({
+    job_id: "job_pin",
+    tab_id: 11,
+    status: "awaiting_download",
+    manual_delivery_target: true,
+    expected: { doi: "10.1/pin" },
+  });
+  const other = job({
+    job_id: "job_other",
+    tab_id: 22,
+    status: "awaiting_download",
+    expected: { doi: "10.1/other" },
+  });
+  expect(pageDeliveryJob([pin, other], { tab_id: 22 })).toBe(other);
+  expect(pageDeliveryJob([pin, other], { doi: "10.1/other" })).toBe(other);
+  expect(pageDeliveryJob([pin], { tab_id: 11 })).toBe(pin);
+  expect(pageDeliveryJob([pin], { tab_id: 99 })).toBeUndefined();
+});
+
+test("manual delivery target selection is unique and fail-closed", () => {
+  const first = job({
+    job_id: "job_manual_target_one",
+    tab_id: -1,
+    status: "awaiting_download",
+    manual_delivery_target: true,
+  });
+  const second = job({
+    job_id: "job_manual_target_two",
+    tab_id: -1,
+    status: "awaiting_download",
+    manual_delivery_target: true,
+  });
+  expect(selectedManualDeliveryTarget([first])).toBe(first);
+  expect(selectedManualDeliveryTarget([first, second])).toBeUndefined();
+  expect(selectedManualDeliveryTarget([{ ...first, access_mode: "delegated" } as unknown as ActiveJob])).toBeDefined();
+  expect(selectedManualDeliveryTarget([{ ...first, tab_id: 42 } as unknown as ActiveJob])).toBeDefined();
+  expect(selectedManualDeliveryTarget([{ ...first, status: "accepted" as const } as unknown as ActiveJob])).toBeUndefined();
+});
 test("does not send a DOI-less scraped page to the daemon", async () => {
   popupDocument();
   let messages = 0;
@@ -1343,6 +1435,74 @@ test("readCurrentPageMetadata keeps JSTOR detection when page scripting is unava
   });
 });
 
+test("SAGE's epub journal viewer becomes a direct Send PDF surface", async () => {
+  const viewerURL = "https://journals.sagepub.com/doi/epub/10.1177/14757257231222647";
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: {
+        query: async () => [{ id: 17, url: viewerURL, title: "Against All Odds" }],
+      },
+      scripting: {
+        executeScript: async () => [{
+          result: {
+            url: viewerURL,
+            doi: "10.1177/14757257231222647",
+            title: "Against All Odds",
+          },
+        }],
+      },
+    },
+  });
+  await expect(readCurrentPageMetadata()).resolves.toEqual({
+    url: "https://journals.sagepub.com/doi/pdf/10.1177/14757257231222647?download=true",
+    doi: "10.1177/14757257231222647",
+    title: "Against All Odds",
+    kind: "pdf",
+    tab_id: 17,
+  });
+});
+
+test("Taylor and Francis's epdf viewer becomes a direct Send PDF surface", async () => {
+  const viewerURL = "https://www.tandfonline.com/doi/epdf/10.1080/10705511.2018.1431046?needAccess=true";
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: { query: async () => [{ id: 18, url: viewerURL, title: "Drawing Conclusions" }] },
+      scripting: {
+        executeScript: async () => [{
+          result: {
+            url: viewerURL,
+            doi: "10.1080/10705511.2018.1431046",
+            title: "Drawing Conclusions",
+          },
+        }],
+      },
+    },
+  });
+  await expect(readCurrentPageMetadata()).resolves.toEqual({
+    url: "https://www.tandfonline.com/doi/pdf/10.1080/10705511.2018.1431046?download=true",
+    doi: "10.1080/10705511.2018.1431046",
+    title: "Drawing Conclusions",
+    kind: "pdf",
+    tab_id: 18,
+  });
+});
+
+test("Cell's PII PDF response becomes Send PDF even when scripting is unavailable", async () => {
+  const viewerURL = "https://www.cell.com/action/showPdf?pii=S2405-8440%2817%2930127-5";
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: { query: async () => [{ id: 19, url: viewerURL, title: "Latent profile analysis" }] },
+      scripting: { executeScript: async () => { throw new Error("PDF viewer blocks scripting"); } },
+    },
+  });
+  await expect(readCurrentPageMetadata()).resolves.toEqual({
+    url: viewerURL,
+    title: "Latent profile analysis",
+    kind: "pdf",
+    tab_id: 19,
+  });
+});
+
 test("institution session uses the shared card/button styles and explains missing resolver", () => {
   const doc = popupDocument();
   renderInstitutionSession(doc, {
@@ -1596,10 +1756,9 @@ test("an origin that never landed a decisive verdict resolves to its honest prob
   expect(noMarkersForever.label).toBe("Signed-in state unclear on this page");
   expect(noMarkersForever.label).not.toBe("Checking session…");
 
-  // A decisive verdict that has since aged past SESSION_STALE_MS is a different
-  // case — it WAS resolved, it just isn't fresh enough to trust display-wise — and
-  // must land on its own honest "needs a recheck" label rather than reusing the
-  // in-flight spinner copy, which claims a check is actively running when none is.
+  // A decisive verdict that has aged past SESSION_STALE_MS remains evidence:
+  // the popup says what it last verified while scheduling one bounded recheck,
+  // rather than falsely presenting the durable `in` verdict as unknown.
   const agedWarm = deriveSessionCardState({
     ...base,
     authenticated: true,
@@ -1608,8 +1767,9 @@ test("an origin that never landed a decisive verdict resolves to its honest prob
     lastProbeOutcome: "markers",
     lastVerdictAt: now - (SESSION_STALE_MS + 1),
   });
-  expect(agedWarm.label).toBe("Session state unknown — recheck");
-  expect(agedWarm.label).not.toBe("Checking session…");
+  expect(agedWarm.label).toBe("Last verified signed in — rechecking");
+  expect(agedWarm.action).toBe("none");
+  expect(agedWarm.label).not.toContain("unknown");
 });
 
 test("session status lines omit degenerate probe detail and retain real evidence", () => {
@@ -2356,6 +2516,48 @@ test("the 2-second checking retry reads a snapshot, never re-injecting a probe",
     globalThis.setTimeout = originalSetTimeout;
   }
 });
+
+test("a stale decisive session schedules one re-probe without discarding its verdict", async () => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const retries: Array<() => void> = [];
+  globalThis.setTimeout = ((callback: () => void, delay?: number) => {
+    if (delay === 2_000) {
+      retries.push(callback);
+      return 0;
+    }
+    return originalSetTimeout(callback, delay);
+  }) as typeof globalThis.setTimeout;
+  try {
+    const lastVerdictAt = Date.now() - (SESSION_STALE_MS + 1);
+    const h = await popupRefreshHarness(() =>
+      sessionReplyFixture({
+        authenticated: true,
+        verdict: "in",
+        probeSource: "live_tab",
+        lastProbeOutcome: "markers",
+        lastProbeAt: lastVerdictAt,
+        lastVerdictAt,
+      }),
+    );
+    await h.refresh();
+    expect(sessionMessageTypes(h.requests)).toEqual([SESSION_PROBE_MESSAGE]);
+    expect(retries).toHaveLength(1);
+
+    h.requests.length = 0;
+    retries[0]?.();
+    await flushMicrotasks();
+    expect(h.requests).toEqual([{ type: SESSION_PROBE_MESSAGE }]);
+
+    await h.refresh();
+    expect(sessionMessageTypes(h.requests)).toEqual([
+      SESSION_PROBE_MESSAGE,
+      SESSION_STATE_MESSAGE,
+    ]);
+    expect(retries).toHaveLength(1);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
 test("malformed demand metadata falls back to the legacy session state", async () => {
   Object.assign(globalThis, {
     chrome: {
@@ -2415,4 +2617,45 @@ test("rejects malformed core and per-origin session origins", async () => {
     });
     await expect(requestSessionState()).resolves.toBeUndefined();
   }
+});
+
+test("popup with a known job or manual target in PDF context does not show no-DOI copy", async () => {
+  const doc = popupDocument();
+  const fakeSend = async () => ({
+    ok: true as const,
+    state: "sending" as const,
+    message: "papio will identify this PDF from the file",
+  });
+  renderPageAcquire(doc, async () => ({ ok: true, state: "sending", job_id: "unused" }), fakeSend);
+  const manual = job({
+    job_id: "job_manual_1",
+    tab_id: -1,
+    status: "awaiting_download",
+    manual_delivery_target: true,
+  });
+  expect(selectedManualDeliveryTarget([manual])).toBeDefined();
+  renderPageContext(
+    doc,
+    { url: "https://provider.example.edu/download/paper.pdf", kind: "pdf", tab_id: 42 },
+    [manual],
+  );
+  expect(doc.documentElement.innerHTML).not.toContain("This PDF has no DOI to queue");
+
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  expect(button.disabled).toBe(false);
+  button.click();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const txt = doc.getElementById("page-acquire-status")?.textContent ?? "";
+  expect(txt).toMatch(/identify/i);
+  expect(txt).not.toMatch(/This PDF has no DOI to queue/);
+});
+
+test("knownJob PDF context never contains This PDF has no DOI to queue", () => {
+  const mod = require("../src/popup") as typeof import("../src/popup");
+  // Direct string search in built popup module text
+  const fs = require("node:fs") as typeof import("node:fs");
+  const popupSrc = fs.readFileSync(new URL("../src/popup.ts", import.meta.url), "utf8");
+  expect(popupSrc).not.toContain("This PDF has no DOI to queue");
 });

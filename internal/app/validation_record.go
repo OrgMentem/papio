@@ -31,12 +31,12 @@ const (
 // the job actually took.
 func validationVerdict(report pdf.ValidationReport, activeContent, needsIdentityReview bool) string {
 	switch {
+	case report.Structural.Encrypted || activeContent:
+		return validationUnsafe
 	case !report.Payload.OK:
 		return validationPayloadRejected
 	case !report.Structural.Valid:
 		return validationStructRejected
-	case report.Structural.Encrypted || activeContent:
-		return validationUnsafe
 	case needsIdentityReview:
 		return validationIdentityReview
 	case report.Identity.Result != pdf.IdentityPass:

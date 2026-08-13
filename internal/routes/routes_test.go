@@ -118,8 +118,8 @@ func TestCandidatesForIdentifiersRequiresPIIForScienceDirect(t *testing.T) {
 		"doi": "10.48612/example",
 		"pii": "S1234567890123456",
 	}, "")
-	if len(withPII) != 3 {
-		t.Fatalf("with PII got %d candidates, want 3", len(withPII))
+	if len(withPII) != 4 {
+		t.Fatalf("with PII got %d candidates, want 4", len(withPII))
 	}
 	got := withPII[2]
 	if got.RouteRevision != "sciencedirect-pii-pdfft/1" || got.Identifier != "pii:S1234567890123456" {
@@ -149,6 +149,85 @@ func TestCandidatesForIdentifiersEscapesPIIAndHonorsHint(t *testing.T) {
 	wantPath := "/science/article/pii/S123/%2E%2E/%C3%BCber/pdfft"
 	if u.EscapedPath() != wantPath {
 		t.Fatalf("escaped PII path = %q, want %q", u.EscapedPath(), wantPath)
+	}
+}
+
+func TestCandidatesForIdentifiersCellPII(t *testing.T) {
+	pii := "S240584401730308X"
+	got := CandidatesForIdentifiers(map[string]string{"pii": pii}, "")
+	var cell *Candidate
+	for i := range got {
+		if got[i].RouteRevision == "cell-pii-showpdf/1" {
+			cell = &got[i]
+			break
+		}
+	}
+	if cell == nil {
+		t.Fatalf("cell candidate missing in %+v", got)
+	}
+	wantURL := "https://www.cell.com/action/showPdf?pii=" + pii
+	if cell.URL != wantURL {
+		t.Fatalf("cell URL = %q, want %q", cell.URL, wantURL)
+	}
+	if err := ValidateCandidate(*cell); err != nil {
+		t.Fatalf("cell candidate failed ValidateCandidate: %v", err)
+	}
+	u, err := url.Parse(cell.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.EscapedPath() != "/action/showPdf" {
+		t.Fatalf("cell path = %q, want %q", u.EscapedPath(), "/action/showPdf")
+	}
+	if u.RawQuery != "pii="+pii {
+		t.Fatalf("cell query = %q, want %q", u.RawQuery, "pii="+pii)
+	}
+	if cell.AllowedOrigin != "https://www.cell.com" || cell.PathFamily != "/action/showPdf" || cell.Identifier != "pii:"+pii {
+		t.Fatalf("cell candidate fields = %+v", *cell)
+	}
+	// DOI-only CandidatesFor must not emit the cell route.
+	for _, c := range CandidatesFor("10.1234/example", "") {
+		if c.RouteRevision == "cell-pii-showpdf/1" {
+			t.Fatalf("DOI-only CandidatesFor emitted cell route: %+v", c)
+		}
+	}
+	if got := CandidatesForIdentifiers(map[string]string{"doi": "10.1234/example"}, ""); len(got) != 2 {
+		t.Fatalf("DOI-only CandidatesForIdentifiers got %d, want 2 (wiley+sage)", len(got))
+	}
+	for _, c := range CandidatesForIdentifiers(map[string]string{"doi": "10.1234/example"}, "") {
+		if c.RouteRevision == "cell-pii-showpdf/1" {
+			t.Fatalf("DOI-only CandidatesForIdentifiers emitted cell route: %+v", c)
+		}
+	}
+	// Malformed PII must not emit the cell route.
+	for _, bad := range []string{"S123 #bad", "S123?bad", "S123\\bad", "S123@bad", "S123 bad", "S123#bad"} {
+		if got := CandidatesForIdentifiers(map[string]string{"pii": bad}, ""); len(got) != 0 {
+			// wiley/sage require DOI, so zero is expected; any cell emission is failure
+			for _, c := range got {
+				if c.RouteRevision == "cell-pii-showpdf/1" {
+					t.Fatalf("malformed PII %q emitted cell route", bad)
+				}
+			}
+		}
+		if got := CandidatesForIdentifiers(map[string]string{"pii": bad}, "cell-pii-showpdf"); len(got) != 0 {
+			t.Fatalf("malformed PII %q with hint emitted %d candidates, want 0", bad, len(got))
+		}
+	}
+	// Existing routes unchanged: wiley and sage still emit with DOI, sciencedirect still requires PII.
+	doiCandidates := CandidatesFor("10.48612/example", "")
+	if len(doiCandidates) != 2 {
+		t.Fatalf("DOI candidates = %d, want 2", len(doiCandidates))
+	}
+	wantRevisions := map[string]bool{"wiley-doi-pdfdirect/1": true, "sage-doi-pdf/1": true}
+	for _, c := range doiCandidates {
+		if !wantRevisions[c.RouteRevision] {
+			t.Fatalf("unexpected DOI revision %q", c.RouteRevision)
+		}
+	}
+	// Cell hint isolates the route.
+	hinted := CandidatesForIdentifiers(map[string]string{"pii": pii}, "cell-pii-showpdf/1")
+	if len(hinted) != 1 || hinted[0].RouteRevision != "cell-pii-showpdf/1" {
+		t.Fatalf("cell hint = %+v", hinted)
 	}
 }
 

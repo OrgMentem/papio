@@ -90,6 +90,7 @@ interface PageState {
   connected: boolean;
   connectionMessage: string;
   selectedID: string | null;
+  expandedItemIDs: Set<string>;
   pending: Set<string>;
   previewed: Set<string>;
   itemMessages: Map<string, { text: string; tone: "info" | "error" | "offline" }>;
@@ -131,6 +132,7 @@ const state: PageState = {
   connected: false,
   connectionMessage: "Connecting to daemon…",
   selectedID: null,
+  expandedItemIDs: new Set(),
   pending: new Set(),
   previewed: new Set(),
   itemMessages: new Map(),
@@ -384,6 +386,11 @@ function handoffJobID(item: TriageSnapshotItem): string | null {
   if (item.kind !== "human_action" || item.action_kind !== "openurl_handoff" || typeof item.job_id !== "string") return null;
   return /^[A-Za-z0-9_-]{8,128}$/.test(item.job_id) ? item.job_id : null;
 }
+function manualDownloadJobID(item: TriageSnapshotItem): string | null {
+  if (item.kind !== "human_action" || item.action_kind !== "manual_download" || typeof item.job_id !== "string") return null;
+  return /^[A-Za-z0-9_-]{8,128}$/.test(item.job_id) ? item.job_id : null;
+}
+
 
 /** One-line bound for text papio did not author: collapse whitespace, cap the
  * length, and mark a truncation with an ellipsis. Every surface that prints
@@ -393,7 +400,7 @@ function boundedProse(text: string, limit: number): string {
   return message.length <= limit ? message : `${message.slice(0, limit - 3)}…`;
 }
 
-function handoffFailure(item: TriageSnapshotItem, value: unknown, tone: "error" | "offline" = "error"): void {
+function openFailure(item: TriageSnapshotItem, value: unknown, tone: "error" | "offline" = "error"): void {
   operationMessage(item.id, boundedProse(errorFromResponse(value), 240), tone);
   render();
 }
@@ -592,6 +599,7 @@ function captureFocusTarget(): FocusTarget | null {
   }
   return null;
 }
+
 
 function restoreFocusTarget(target: FocusTarget | null): void {
   if (target === null || elements === null) return;
@@ -976,6 +984,7 @@ function operationButton(item: TriageSnapshotItem, operation: TriageOperation): 
   // Retry is reserved for a newer inbox contract. Do not expose a dead,
   // permanently disabled placeholder when the daemon includes it.
   if (operation === "retry") return null;
+  if (operation === "accept" && item.action_kind === "unsafe_pdf") return null;
   const label = operationLabel(operation);
   const title = displayTitle(item).text;
   const button = element("button", label);
@@ -1060,6 +1069,7 @@ const STATUS_META: Record<string, { glyph: string; label: string }> = {
   manual_download: { glyph: "↓", label: "Manual download needed" },
   openurl_handoff: { glyph: "↗", label: "Browser handoff ready" },
   verify_identity: { glyph: "?", label: "Identity verification needed" },
+  unsafe_pdf: { glyph: "⚠", label: "Held PDF needs review" },
   document_delivery: { glyph: "⇄", label: "Document delivery reconciliation" },
   downloads_access_required: { glyph: "⚠", label: "Downloads folder access needed" },
   watch_hit: { glyph: "✶", label: "New watch hit" },
@@ -1196,6 +1206,8 @@ function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): st
       return item.requires_auth === true ? "Sign in to your institution" : "Open the page";
     case "verify_identity":
       return "Review the PDF, then accept or reject";
+    case "unsafe_pdf":
+      return "File is held because it is encrypted or has active/embedded content; Reject returns to manual download; Dismiss cancels";
     case "document_delivery":
       return "Confirm what the library has on file";
     case "downloads_access_required":
@@ -1401,7 +1413,8 @@ function renderDebug(
 ): { toggle: HTMLButtonElement; list: HTMLDListElement } {
   const list = element("dl");
   list.className = "item-debug";
-  list.hidden = true;
+  const expanded = state.expandedItemIDs.has(item.id);
+  list.hidden = !expanded;
   list.id = `backend-details-${item.id}`;
 
   const details = [factText(item, "Detail"), mechanismText(item, blockedByChallenge)]
@@ -1442,12 +1455,14 @@ function renderDebug(
   toggle.type = "button";
   toggle.dataset.label = "More details";
   toggle.setAttribute("aria-controls", list.id);
-  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-expanded", String(expanded));
   toggle.setAttribute("aria-label", "More details");
   toggle.addEventListener("click", () => {
     const expanded = toggle.getAttribute("aria-expanded") === "true";
     toggle.setAttribute("aria-expanded", String(!expanded));
     list.hidden = expanded;
+    if (expanded) state.expandedItemIDs.delete(item.id);
+    else state.expandedItemIDs.add(item.id);
   });
   return { toggle, list };
 }
@@ -1691,7 +1706,11 @@ function renderDialog(): void {
   if (confirmation.verdict === "accept" && item.action_kind === "verify_identity") {
     elements.dialogMessage.textContent = `Accept this PDF as ${item.title}? It leaves quarantine.`;
   } else if (confirmation.verdict === "reject") {
-    elements.dialogMessage.textContent = `Reject ${item.title}? It cancels the job.`;
+    if (item.action_kind === "unsafe_pdf") {
+      elements.dialogMessage.textContent = `Reject ${item.title}? A manual download will be requested.`;
+    } else {
+      elements.dialogMessage.textContent = `Reject ${item.title}? It cancels the job.`;
+    }
   } else {
     elements.dialogMessage.textContent = `Accept ${item.title}?`;
   }
@@ -2214,6 +2233,7 @@ const DISMISS_DISPOSITION: Record<string, "cancels_parked_job" | "never_cancels"
   "manual_download": "cancels_parked_job",
   "openurl_available": "cancels_parked_job",
   "verify_identity": "cancels_parked_job",
+  "unsafe_pdf": "cancels_parked_job",
   "document_delivery": "cancels_parked_job",
   "downloads_access_required": "never_cancels",
 };
@@ -2226,7 +2246,7 @@ function dismissCancelsJob(item: TriageSnapshotItem): boolean {
       return disposition === "cancels_parked_job" &&
         (item.action_kind === "openurl_handoff" || item.action_kind === "manual_download" || item.action_kind === "openurl_available" || item.action_kind === "document_delivery");
     case "needs_review":
-      return disposition === "cancels_parked_job" && item.action_kind === "verify_identity";
+      return disposition === "cancels_parked_job" && (item.action_kind === "verify_identity" || item.action_kind === "unsafe_pdf");
     case undefined:
       return true;
     default:
@@ -2555,7 +2575,7 @@ async function requestPreview(item: TriageSnapshotItem): Promise<void> {
 async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
   const jobID = handoffJobID(item);
   if (jobID === null) {
-    handoffFailure(item, { error: { message: "This browser handoff is missing its job identifier." } });
+    openFailure(item, { error: { message: "This browser handoff is missing its job identifier." } });
     return;
   }
   // Unlike daemon mutations, the broker open is local to the extension: the
@@ -2570,7 +2590,7 @@ async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
     const response = await runtimeMessage("papio.handoff.open", { job_id: jobID });
     state.pending.delete(item.id);
     if (!isRecord(response) || response["ok"] !== true || response["opened"] !== true) {
-      handoffFailure(item, response);
+      openFailure(item, response);
       return;
     }
     operationMessage(item.id, "Browser handoff opened.", "info");
@@ -2579,9 +2599,52 @@ async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
     state.pending.delete(item.id);
     const message = error instanceof Error ? error.message : "The daemon is unavailable.";
     setConnection(false, message);
-    handoffFailure(item, { error: { message } }, "offline");
+    openFailure(item, { error: { message } }, "offline");
   }
 }
+
+/** Open the manual row through the broker rather than window.open. Besides
+ * opening the same safe daemon-provided link, this records the researcher's
+ * explicit job choice so a later Send PDF can bind DOI-less bytes to the
+ * existing action even when the PDF opens in another tab or from local disk. */
+async function requestManualDownloadOpen(item: TriageSnapshotItem): Promise<void> {
+  const jobID = manualDownloadJobID(item);
+  const url = firstSafeLink(item);
+  if (jobID === null || url === null) {
+    openFailure(item, {
+      error: {
+        message:
+          jobID === null
+            ? "This manual download is missing its job identifier."
+            : "This manual download has no safe link to open.",
+      },
+    });
+    return;
+  }
+  if (state.pending.has(item.id)) return;
+  state.pending.add(item.id);
+  render();
+  try {
+    const response = await runtimeMessage("papio.manual.open", {
+      job_id: jobID,
+      url,
+      title: item.title,
+    });
+    state.pending.delete(item.id);
+    if (!isRecord(response) || response["ok"] !== true || response["opened"] !== true) {
+      openFailure(item, response);
+      return;
+    }
+    operationMessage(item.id, "Manual-download page opened. Send PDF will use this job.", "info");
+    render();
+  } catch (error) {
+    state.pending.delete(item.id);
+    const message = error instanceof Error ? error.message : "The browser broker is unavailable.";
+    setConnection(false, message);
+    openFailure(item, { error: { message } }, "offline");
+  }
+}
+
 
 function activateOperation(item: TriageSnapshotItem, operation: TriageOperation): void {
   if (waitingSibling(item) && operation !== "dismiss") return;
@@ -2603,6 +2666,10 @@ function activateOperation(item: TriageSnapshotItem, operation: TriageOperation)
     case "open": {
       if (item.kind === "human_action" && item.action_kind === "openurl_handoff") {
         void requestHandoffOpen(item);
+        return;
+      }
+      if (item.kind === "human_action" && item.action_kind === "manual_download") {
+        void requestManualDownloadOpen(item);
         return;
       }
       const url = firstSafeLink(item);

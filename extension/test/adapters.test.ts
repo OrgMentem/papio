@@ -9,6 +9,7 @@ import { expect, test } from "bun:test";
 import {
   adapters,
   interpret,
+  providerViewerPDFURL,
   type AdapterContext,
   type AdapterSpec,
   type DownloadRule,
@@ -467,6 +468,27 @@ test.skipIf(sageArticle === null)(
   },
 );
 
+
+test("packaged journal viewers resolve only their declared direct PDF endpoints", () => {
+  expect(
+    providerViewerPDFURL("https://journals.sagepub.com/doi/epdf/10.1177/0146167207301014"),
+  ).toBe("https://journals.sagepub.com/doi/pdf/10.1177/0146167207301014?download=true");
+  expect(
+    providerViewerPDFURL("https://journals.sagepub.com/doi/epub/10.1177/14757257231222647"),
+  ).toBe("https://journals.sagepub.com/doi/pdf/10.1177/14757257231222647?download=true");
+  expect(
+    providerViewerPDFURL("https://www.tandfonline.com/doi/epdf/10.1080/10705511.2018.1431046?needAccess=true"),
+  ).toBe("https://www.tandfonline.com/doi/pdf/10.1080/10705511.2018.1431046?download=true");
+  expect(
+    providerViewerPDFURL("https://onlinelibrary.wiley.com/doi/epdf/10.1111/jcpp.13440"),
+  ).toBe("https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/jcpp.13440?download=true");
+  expect(
+    providerViewerPDFURL("https://journals.sagepub.com/doi/full/10.1177/0146167207301014"),
+  ).toBeUndefined();
+  expect(
+    providerViewerPDFURL("https://attacker.example/doi/epdf/10.1177/0146167207301014"),
+  ).toBeUndefined();
+});
 test("sage stays unknown when its PDF/EPUB marker is absent", () => {
   const spec = adapters.find((a) => a.id === "sage") as AdapterSpec;
   const page = parseHTML(

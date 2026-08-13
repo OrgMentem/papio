@@ -1285,6 +1285,195 @@ func TestReviewOverrideDoesNotBypassRejectOrUnsafePDF(t *testing.T) {
 		})
 	}
 }
+func TestValidateCandidateHoldsEmbeddedAndEncryptedPDFsForReview(t *testing.T) {
+	// Embedded/active/encrypted PDFs must park needs_review with an unsafe_pdf
+	// action holding the quarantine file — not return to fetching with a
+	// manual_download "please supply a different file" ask. SAGE/T&F publisher
+	// PDFs legitimately bundle supplementary files while returning Valid=false
+	// (plus HasEmbeddedFiles=true), so the encrypted/active branch must precede
+	// the generic invalid check.
+	cases := []struct {
+		name   string
+		report pdf.ValidationReport
+	}{
+		{
+			name: "embedded_files_with_invalid_structure",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: false, HasEmbeddedFiles: true, Reason: "PDF contains embedded files"},
+				Text:       pdf.TextReport{Chars: 2000},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+			},
+		},
+		{
+			name: "embedded_files_with_valid_structure",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: true, HasEmbeddedFiles: true},
+				Text:       pdf.TextReport{Chars: 2000},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+			},
+		},
+		{
+			name: "javascript_with_invalid_structure",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: false, HasJavaScript: true, Reason: "PDF contains JavaScript"},
+				Text:       pdf.TextReport{Chars: 2000},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+			},
+		},
+		{
+			name: "encrypted_with_invalid_structure",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: false, Encrypted: true, Reason: "encrypted PDF"},
+				Text:       pdf.TextReport{Chars: 2000},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+				return tc.report, nil
+			}
+			id, err := jobs.CreateRequest(context.Background(), "wr_hold_"+tc.name, work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+				AccessMode: config.ModeConservative, DesiredVersion: "any",
+			}, nil, job.PrincipalUnknown)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := jobs.InsertCandidates(context.Background(), id, []job.Candidate{{
+				JobID: id, Source: "fixture", URLRedacted: "https://example.test/" + tc.name + ".pdf", URLKey: tc.name,
+				Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			candidate, _ := jobs.NextPendingCandidate(context.Background(), id)
+			for _, edge := range [][2]string{
+				{job.StateQueued, job.StateResolving},
+				{job.StateResolving, job.StateFetching},
+				{job.StateFetching, job.StateValidating},
+			} {
+				if err := jobs.Transition(context.Background(), id, edge[0], edge[1], nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			row, _ := jobs.Get(context.Background(), id)
+			temp := t.TempDir() + "/candidate.pdf"
+			if err := os.WriteFile(temp, pdfBytes(tc.name), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sha := strings.Repeat("b", 64)
+			accepted, parked, err := svc.validateCandidate(context.Background(), row, candidate, fetch.Result{
+				TempPath: temp, SHA256: sha, SniffedMIME: "application/pdf",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if accepted || !parked {
+				t.Fatalf("embedded/active/encrypted must park unsafe_pdf: accepted=%t parked=%t", accepted, parked)
+			}
+			got, _ := jobs.Get(context.Background(), id)
+			if got.State != job.StateNeedsReview {
+				t.Fatalf("state = %s, want needs_review", got.State)
+			}
+			actions, err := jobs.ListHumanActions(context.Background(), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var unsafe *job.HumanAction
+			for i := range actions {
+				if actions[i].JobID == id && actions[i].Kind == "unsafe_pdf" {
+					unsafe = &actions[i]
+					break
+				}
+			}
+			if unsafe == nil || unsafe.Status != "open" {
+				t.Fatalf("unsafe_pdf action = %+v, want open", unsafe)
+			}
+			if unsafe.CandidateID != candidate.ID || unsafe.QuarantineSHA256 != sha || unsafe.QuarantinePath != temp {
+				t.Fatalf("unsafe_pdf binding = %+v, want candidate %d sha %s path %s", unsafe, candidate.ID, sha, temp)
+			}
+			if _, err := os.Stat(temp); err != nil {
+				t.Fatalf("quarantined file missing at %s: %v", temp, err)
+			}
+			// Must not also have opened a manual_download replacement ask.
+			for i := range actions {
+				if actions[i].JobID == id && actions[i].Kind == "manual_download" && actions[i].Status == "open" {
+					t.Fatalf("unexpected manual_download action alongside unsafe_pdf: %+v", &actions[i])
+				}
+			}
+		})
+	}
+}
+
+func TestValidateCandidateTrulyInvalidPayloadStillFetchesAgain(t *testing.T) {
+	// A genuinely invalid payload with no embedded/JS/encrypted signal must still
+	// return to fetching (and remove the temp file) rather than parking.
+	svc, jobs := newTestService(t)
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: false, Reason: "too small"},
+			Structural: pdf.StructuralReport{Valid: false},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+		}, nil
+	}
+	id, err := jobs.CreateRequest(context.Background(), "wr_invalid_payload", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.InsertCandidates(context.Background(), id, []job.Candidate{{
+		JobID: id, Source: "fixture", URLRedacted: "https://example.test/invalid_payload.pdf", URLKey: "invalid_payload",
+		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, _ := jobs.NextPendingCandidate(context.Background(), id)
+	for _, edge := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateValidating},
+	} {
+		if err := jobs.Transition(context.Background(), id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, _ := jobs.Get(context.Background(), id)
+	temp := t.TempDir() + "/candidate.pdf"
+	if err := os.WriteFile(temp, pdfBytes("invalid payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	accepted, parked, err := svc.validateCandidate(context.Background(), row, candidate, fetch.Result{
+		TempPath: temp, SHA256: strings.Repeat("c", 64), SniffedMIME: "application/pdf",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted || parked {
+		t.Fatalf("invalid payload must not accept or park: accepted=%t parked=%t", accepted, parked)
+	}
+	got, _ := jobs.Get(context.Background(), id)
+	if got.State != job.StateFetching {
+		t.Fatalf("state = %s, want fetching", got.State)
+	}
+	if _, err := os.Stat(temp); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temp file should have been removed at %s: stat err=%v", temp, err)
+	}
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range actions {
+		if a.JobID == id && a.Status == "open" {
+			t.Fatalf("invalid payload should not open a human action, got %+v", &a)
+		}
+	}
+}
 
 func readyPipeline(svc *Service) {
 	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: []resolver.Candidate{{

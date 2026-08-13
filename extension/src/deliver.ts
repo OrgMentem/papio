@@ -141,11 +141,28 @@ export function extractPageDOI(probe: PageDOIProbe): string | undefined {
   return typeof probe.href === "string" ? deriveStablePageDOI(probe.href) : undefined;
 }
 
-/** A URL whose path is a PDF, without treating a query or fragment as part
- * of the extension. */
+/** A direct PDF response whose route does not use a `.pdf` suffix. Keep these
+ * exact and host-bound; HTML viewers that need endpoint conversion belong in
+ * their declarative adapter's viewerRoutes contract instead. */
+function isKnownDirectPDFRoute(url: URL): boolean {
+  if (url.protocol !== "https:") return false;
+  if (url.hostname.toLowerCase() !== "www.cell.com") return false;
+  if (url.pathname.toLowerCase() !== "/action/showpdf") return false;
+  if (url.hash !== "") return false;
+  const params = [...url.searchParams];
+  if (params.length !== 1) return false;
+  const only = params[0];
+  if (only === undefined || only[0] !== "pii") return false;
+  const pii = only[1];
+  return /^[A-Za-z0-9()_-]{5,128}$/.test(pii);
+}
+
+/** A URL whose path is a PDF, or an exact host-bound direct-PDF route,
+ * without treating a query or fragment as a filename extension. */
 export function isPDFURL(value: string): boolean {
   try {
-    return new URL(value).pathname.toLowerCase().endsWith(".pdf");
+    const url = new URL(value);
+    return url.pathname.toLowerCase().endsWith(".pdf") || isKnownDirectPDFRoute(url);
   } catch {
     return false;
   }

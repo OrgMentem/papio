@@ -101,6 +101,7 @@ import {
   adapters,
   type AdapterSpec,
   type PageVerdict,
+  providerViewerPDFURL,
 } from "./adapters/types";
 import { planExecution, planGeneric, type GenericCandidate, type GenericPlan, type Plan, type PlanResult } from "./plan";
 import { observeUnknown, type ObserveChromeApi } from "./observe";
@@ -1038,6 +1039,7 @@ export const INBOX_RUNTIME_MESSAGE_TYPES = [
   "papio.work.pulse",
   "papio.surface.presence",
   "papio.handoff.open",
+  "papio.manual.open",
   "papio.delivery.start",
   "papio.delivery.state",
   "papio.session.state",
@@ -1085,15 +1087,22 @@ type ActivityPageBrokerPayload = {
   new_count_since?: number;
   gap?: boolean;
 };
+interface ManualOpenPayload {
+  job_id: string;
+  url: string;
+  title?: string;
+}
+
 
 interface DeliveryStartPayload {
   tab_id: number;
   url: string;
+  job_id?: string;
   doi?: string;
   title?: string;
 }
 
-type DeliveryState = "sending" | "downloaded" | "failed" | "adopted" | "idle";
+type DeliveryState = "sending" | "waiting_manual" | "downloaded" | "failed" | "adopted" | "idle";
 
 type DeliveryReply = BrokerReply<{
   state: DeliveryState;
@@ -1104,6 +1113,17 @@ type DeliveryReply = BrokerReply<{
 
 function hostMatches(host: string, providerHosts: string[]): boolean {
   return providerHosts.some((h) => host === h || host.endsWith("." + h));
+}
+
+/** Parse a released semver (with an optional leading v) without retaining its
+ * prerelease identifier: callers only need to distinguish release from pre-release. */
+function requiresNativeViewerDownload(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && parsed.hostname === "pdf.sciencedirectassets.com";
+  } catch {
+    return false;
+  }
 }
 
 /** Parse a released semver (with an optional leading v) without retaining its
@@ -4125,9 +4145,30 @@ export class Bridge {
   private deliveryJobForDOI(doi: string | undefined): ActiveJob | undefined {
     if (doi === undefined || doi.trim() === "") return undefined;
     const normalized = doi.trim().toLowerCase().replace(/^doi:\s*/, "");
-    return this.store.activeJobs.find(
+    const matches = this.store.activeJobs.filter(
       (job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === normalized,
     );
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+  private deliveryJobForOpener(tab: TabInfo): ActiveJob | undefined {
+    if (tab.openerTabId === undefined) return undefined;
+    const opener = findByTab(this.store, tab.openerTabId);
+    if (opener === undefined) return undefined;
+    if (opener.status !== "accepted" && opener.status !== "awaiting_download") return undefined;
+    return opener;
+  }
+  private uniqueManualDeliveryTarget(): ActiveJob | undefined {
+    const targets = this.store.activeJobs.filter(
+      (job) => job.manual_delivery_target === true && job.status === "awaiting_download",
+    );
+    return targets.length === 1 ? targets[0] : undefined;
+  }
+  /** Resolve the one operator-selected manual-download target. The marker is
+   * useful only on an inert, URL-free awaiting-download record; any broader
+   * shape could let stale autonomous authority borrow a later popup click. */
+  private manualDeliveryTarget(jobID: string): ActiveJob | undefined {
+    const pin = this.uniqueManualDeliveryTarget();
+    return pin?.job_id === jobID ? pin : undefined;
   }
 
   private async startDeliveryDownload(jobID: string, url: string): Promise<boolean> {
@@ -4190,53 +4231,122 @@ export class Bridge {
       return failure("tab_unavailable", "The current PDF tab is no longer available");
     }
     const tabURL = typeof tab.url === "string" ? tab.url : payload.url;
-    const url = pdfSourceURL(payload.url || tabURL);
-    if (!isPDFPage(tabURL) && !isPDFPage(url)) {
+    const viewerPDFURL = providerViewerPDFURL(tabURL, this.deps.adapterSpecs);
+    const url = viewerPDFURL ?? pdfSourceURL(payload.url || tabURL);
+    if (viewerPDFURL === undefined && !isPDFPage(tabURL) && !isPDFPage(url)) {
       return failure("not_pdf", "No PDF detected on this page");
     }
     const doi = payload.doi;
-    let job = findByTab(this.store, payload.tab_id) ?? this.deliveryJobForDOI(doi);
+    let job: ActiveJob | undefined =
+      findByTab(this.store, payload.tab_id) ??
+      this.deliveryJobForOpener(tab) ??
+      this.deliveryJobForDOI(doi);
+    if (job === undefined) {
+      const pin = this.uniqueManualDeliveryTarget();
+      if (pin !== undefined && pin.tab_id === payload.tab_id) {
+        job = pin;
+      } else if (payload.job_id !== undefined) {
+        const hinted = this.manualDeliveryTarget(payload.job_id);
+        const doiHint =
+          doi !== undefined &&
+          doi.trim() !== "" &&
+          hinted?.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") ===
+            doi.trim().toLowerCase().replace(/^doi:\s*/, "");
+        if (hinted !== undefined && (hinted.tab_id === payload.tab_id || doiHint)) {
+          job = hinted;
+        }
+      }
+    }
     let duplicate = false;
     if (job === undefined) {
       if (doi === undefined || doi.trim() === "") {
-        return failure("no_doi", "This PDF has no DOI to queue");
-      }
-      const ack = await this.requestPageAcquire({
-        url,
-        doi,
-        ...(payload.title ? { title: payload.title } : {}),
-        source: "popup",
-      });
-      if (ack.error !== undefined) return failure("page_acquire", ack.error);
-      if (ack.job_id === undefined) return failure("page_acquire", "The daemon did not return a job");
-      duplicate = ack.duplicate === true;
-      await this.inboundChain;
-      job = findByJob(this.store, ack.job_id);
-      if (job === undefined && duplicate) {
-        return failure("duplicate_not_live", "That paper is already queued, but its job is not live in this browser");
+        if (this.pdfGrabAvailable()) {
+          const grab = await this.requestPdfGrab({ tab_id: payload.tab_id, url, title: payload.title });
+          if (grab.ok) return { ok: true, state: "sending", message: "papio will identify this PDF from the file" };
+          return grab as unknown as DeliveryReply;
+        } else {
+          return failure("no_doi", "This PDF has no page DOI; Chrome download steering is required to identify it from the file");
+        }
       }
       if (job === undefined) {
-        const now = this.deps.now();
-        const synthetic: ActiveJob = {
-          job_id: ack.job_id,
-          tab_id: payload.tab_id,
-          offered_at: now,
-          expires_at: now + 24 * 60 * 60_000,
-          status: "accepted",
-          provider_hosts: [],
-          ...(payload.title || doi ? { expected: { ...(payload.title ? { title: payload.title } : {}), ...(doi ? { doi } : {}) } } : {}),
-        };
-        await this.update((s) => upsertJob(s, synthetic));
-        job = synthetic;
+        const ack = await this.requestPageAcquire({
+          url,
+          ...(doi !== undefined && doi.trim() !== "" ? { doi } : {}),
+          ...(payload.title ? { title: payload.title } : {}),
+          source: "popup",
+        });
+        if (ack.error !== undefined) return failure("page_acquire", ack.error);
+        if (ack.job_id === undefined) return failure("page_acquire", "The daemon did not return a job");
+        duplicate = ack.duplicate === true;
+        await this.inboundChain;
+        job = findByJob(this.store, ack.job_id);
+        if (job === undefined && duplicate) {
+          return failure("duplicate_not_live", "That paper is already queued, but its job is not live in this browser");
+        }
+        if (job === undefined) {
+          const now = this.deps.now();
+          const synthetic: ActiveJob = {
+            job_id: ack.job_id,
+            tab_id: payload.tab_id,
+            offered_at: now,
+            expires_at: now + 24 * 60 * 60_000,
+            status: "accepted",
+            provider_hosts: [],
+            ...(payload.title || doi ? { expected: { ...(payload.title ? { title: payload.title } : {}), ...(doi ? { doi } : {}) } } : {}),
+          };
+          await this.update((s) => upsertJob(s, synthetic));
+          job = synthetic;
+        }
       }
     }
-    if (job === undefined) return failure("page_acquire", "The daemon did not return a job");
     const pending = this.store.pendingDelivery;
     if (pending !== undefined && pending.status !== "failed" && pending.job_id !== job.job_id) {
       return failure("delivery_busy", "Another PDF is already being sent to papio");
     }
     if (pending?.job_id === job.job_id && pending.status !== "failed") {
       return { ok: true, state: pending.status ?? "sending", job_id: job.job_id, ...(duplicate ? { duplicate: true } : {}) };
+    }
+    if (requiresNativeViewerDownload(url)) {
+      const message = "Use the PDF viewer Download button — papio will adopt that authorized file";
+      const deliveryPageHostAtStart = sanitizePageHost(tabURL);
+      const sessionEvidenceAtStart = this.currentSessionEvidence(job);
+      await this.update((s) => {
+        const activeJobs = s.activeJobs.map((candidate) => {
+            if (candidate.job_id === job.job_id) {
+              return {
+                ...candidate,
+                tab_id: payload.tab_id,
+                status: "awaiting_download" as const,
+                manual_delivery_target: true,
+                download_initiated: false,
+              };
+            }
+            if (candidate.manual_delivery_target !== true) return candidate;
+            const { manual_delivery_target: _target, ...unselected } = candidate;
+            return { ...unselected, tab_id: -1 } as ActiveJob;
+          });
+        return startPendingDelivery(
+          { ...s, activeJobs },
+          {
+            job_id: job.job_id,
+            url,
+            initiated_at: this.deps.now(),
+            status: "waiting_manual",
+            error: message,
+            ...(deliveryPageHostAtStart !== undefined ? { page_host: deliveryPageHostAtStart } : {}),
+            session_evidence: sessionEvidenceAtStart,
+          },
+        );
+      });
+      this.deliveryJobs.add(job.job_id);
+      this.lastDeliveryState = undefined;
+      return {
+        ok: true,
+        state: "waiting_manual",
+        job_id: job.job_id,
+        message,
+        ...(duplicate ? { duplicate: true } : {}),
+      };
     }
     // Freeze the requesting page's host alongside the URL. The tab stays
     // interactive for the whole download, so this is the only moment the
@@ -4300,6 +4410,7 @@ export class Bridge {
     const effectJobID = `inbox:${inboxURL}`;
     const effectToken = this.claimEffectGovernor(effectJobID);
     if (effectToken === undefined) return;
+
     try {
       const existing = (await this.deps.tabs.query?.({ url: inboxURL })) ?? [];
       const tab = existing.find((candidate) => candidate.id !== undefined);
@@ -4315,6 +4426,70 @@ export class Bridge {
       this.releaseEffectGovernor(effectJobID, effectToken, false);
       this.wakeEffectGovernor();
     }
+  }
+  /** Open a manual-download row and bind the popup's next explicit Send PDF
+   * action to that existing job. The provider tab itself stays unowned: the
+   * PDF may open in another tab or from local disk, and retaining its tab id
+   * would make a close look like job cancellation. The only durable authority
+   * added here is the URL-free, unique manual_delivery_target marker. */
+  async openManualDownload(payload: ManualOpenPayload): Promise<BrokerReply<{ opened: true }>> {
+    await this.ready;
+    const existing = findByJob(this.store, payload.job_id);
+    if (existing !== undefined && !this.isManualDownloadWindow(existing)) {
+      return failure("manual_target_busy", "This job already has browser work in progress");
+    }
+    const effectToken = this.claimEffectGovernor(payload.job_id);
+    if (effectToken === undefined) {
+      return failure("manual_open_busy", "Another browser action for this job is still finishing");
+    }
+    let opened: TabInfo | undefined;
+    let updated = false;
+    try {
+      opened = await this.deps.tabs.create({ url: payload.url, active: true });
+      const now = this.deps.now();
+      const expected = {
+        ...(existing?.expected ?? {}),
+        ...(payload.title === undefined ? {} : { title: payload.title }),
+      };
+      const sourceHost = sanitizePageHost(payload.url);
+      const target: ActiveJob = {
+        job_id: payload.job_id,
+        tab_id: typeof opened?.id === "number" ? opened.id : -1,
+        offered_at: existing?.offered_at ?? now,
+        expires_at: existing?.expires_at ?? now,
+        status: "awaiting_download",
+        provider_hosts: [...new Set([
+          ...(existing?.provider_hosts ?? []),
+          ...(sourceHost === undefined ? [] : [sourceHost]),
+        ])],
+        ...(existing?.adapter_id === undefined ? {} : { adapter_id: existing.adapter_id, access_mode: "delegated" as const }),
+        ...(Object.keys(expected).length === 0 ? {} : { expected }),
+        manual_delivery_target: true,
+      };
+      await this.update((store) => {
+        const activeJobs = store.activeJobs
+          .filter((job) => job.job_id !== payload.job_id)
+          .map((job) => {
+            if (job.manual_delivery_target !== true) return job;
+            // Demoting an explicit Open target must revoke its tab authority
+            // too. Keeping the old tab id lets a later native download on that
+            // tab outrank the newly selected job in correlate().
+            const { manual_delivery_target: _target, ...unselected } = job;
+            return { ...unselected, tab_id: -1 } as ActiveJob;
+          });
+        return { ...store, activeJobs: [...activeJobs, target] };
+      });
+      updated = true;
+    } catch {
+      return failure("tab_unavailable", "The manual-download page could not be opened");
+    } finally {
+      this.releaseEffectGovernor(payload.job_id, effectToken, false);
+      this.wakeEffectGovernor();
+    }
+    if (opened?.id === undefined || !updated) {
+      return failure("tab_unavailable", "The manual-download page could not be opened");
+    }
+    return { ok: true, opened: true };
   }
   /** Surface the browser-owned handoff already offered for an inbox row. This
    * boundary accepts only a job id: provider/resolver URLs remain local to the
@@ -7064,9 +7239,23 @@ export class Bridge {
 
 
   private async upsertJobWithOffer(job: ActiveJob, offerURL: string): Promise<void> {
-    this.offerURLs.set(job.job_id, offerURL);
-    if (job.requires_auth === true) this.keepaliveManager?.learnResolver(offerURL);
+    let manualTargetPinned = false;
     await this.update((s) => {
+      const current = findByJob(s, job.job_id);
+      if (current?.manual_delivery_target === true) {
+        manualTargetPinned = true;
+        const mergedHosts = [...new Set([...(current.provider_hosts ?? []), ...(job.provider_hosts ?? [])])];
+        const mergedExpected = { ...(current.expected ?? {}), ...(job.expected ?? {}) };
+        const patched = patchJob(s, job.job_id, {
+          provider_hosts: mergedHosts,
+          ...(Object.keys(mergedExpected).length > 0 ? { expected: mergedExpected } : {}),
+          ...(job.adapter_id !== undefined ? { adapter_id: job.adapter_id, access_mode: "delegated" as const } : {}),
+        });
+        return {
+          ...patched,
+          offerURLs: { ...(s.offerURLs ?? {}), [job.job_id]: offerURL },
+        };
+      }
       const withJob = upsertJob(s, job);
       if (this.supportsFreshHandoffLinks() && job.requires_auth === true) {
         const offerURLs = { ...(s.offerURLs ?? {}) };
@@ -7078,6 +7267,9 @@ export class Bridge {
         offerURLs: { ...(s.offerURLs ?? {}), [job.job_id]: offerURL },
       };
     });
+    this.offerURLs.set(job.job_id, offerURL);
+    if (manualTargetPinned) return;
+    if (job.requires_auth === true) this.keepaliveManager?.learnResolver(offerURL);
   }
   /** Persist a tabless job without retaining the resolver URL. */
   private async upsertJobWithoutOffer(job: ActiveJob): Promise<void> {
@@ -8995,6 +9187,32 @@ export class Bridge {
     // without its durable offer URL cannot represent an in-flight download:
     // discard that stale record so this offer recreates the real browser work.
     let existing = findByJob(this.store, jobID);
+    // Opening a manual-download inbox row is explicit operator intent. Re-offers
+    // may arrive throughout a long login/download/reopen path; acknowledge
+    // them, but never replace or reactivate the pinned manual target.
+    if (existing?.manual_delivery_target === true) {
+      const adapterID = typeof p["adapter_id"] === "string" && p["adapter_id"].length > 0 ? p["adapter_id"] : existing.adapter_id;
+      await this.update((s) => {
+        const current = findByJob(s, jobID);
+        if (current?.manual_delivery_target !== true) return s;
+        const mergedHosts = [...new Set([...(current.provider_hosts ?? []), ...providerHosts])];
+        const mergedExpected = { ...(current.expected ?? {}), ...(expected ?? {}) };
+        return patchJob(s, jobID, {
+          provider_hosts: mergedHosts,
+          ...(Object.keys(mergedExpected).length > 0 ? { expected: mergedExpected } : {}),
+          ...(adapterID !== undefined ? { adapter_id: adapterID, access_mode: "delegated" as const } : {}),
+          ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
+          ...(offeredAccessMode !== undefined && adapterID === undefined ? { access_mode: offeredAccessMode } : {}),
+        });
+      });
+      this.offerURLs.set(jobID, openurl);
+      await this.update((s) => ({
+        ...s,
+        offerURLs: { ...(s.offerURLs ?? {}), [jobID]: openurl },
+      }));
+      this.send("job_accept", {}, jobID);
+      return;
+    }
     if (offeredEpoch !== undefined && existing !== undefined) {
       const priorAttemptID = existing.generic_drive_epoch?.drive_attempt_id;
       await this.update((s) => ({
@@ -10092,8 +10310,8 @@ export class Bridge {
    * The persisted latch and in-memory correlation jointly ensure that a
    * content-disposition download or repeated completion event cannot start a
    * second download for the same job. Page classification stays exclusively in
-   * the declarative adapter path; this method accepts only a PDF URL or the
-   * recognized Chrome PDF viewer. */
+   * the declarative adapter path; this method accepts only a recognized direct
+   * PDF route, browser PDF viewer, or packaged provider viewer route. */
   private async maybeDownloadPDFViewer(jobID: string, url: string, knownPDFViewer = false): Promise<void> {
     let job = findByJob(this.store, jobID);
     if (!this.hasDelegatedAuthority(job)) return;
@@ -10104,33 +10322,13 @@ export class Bridge {
     let downloadURL = url;
     let viewer = knownPDFViewer;
     if (!viewer) {
-      try {
-        const current = new URL(url);
-        const spec = this.deps.adapterSpecs.find((candidate) => {
-          if (!hostMatches(current.hostname, candidate.hosts)) return false;
-          const rule = candidate.download;
-          return (
-            rule?.method === "url" &&
-            typeof rule.viewerPathPattern === "string" &&
-            current.pathname.includes(rule.viewerPathPattern)
-          );
-        });
-        const rule = spec?.download;
-        if (rule?.idPattern !== undefined && rule.urlTemplate !== undefined) {
-          const match = url.match(new RegExp(rule.idPattern));
-          if (match !== null) {
-            downloadURL = rule.urlTemplate.replace(
-              /\{(\d+|id)\}/g,
-              (_, key: string) => match[key === "id" ? 1 : Number(key)] ?? "",
-            );
-            viewer = true;
-          }
-        }
-      } catch {
-        // Invalid or non-provider URLs stay on the normal viewer path.
+      const providerPDFURL = providerViewerPDFURL(url, this.deps.adapterSpecs);
+      if (providerPDFURL !== undefined) {
+        downloadURL = providerPDFURL;
+        viewer = true;
       }
     }
-    if (!viewer) viewer = this.isPDFNavigationURL(url);
+    if (!viewer) viewer = isPDFPage(url) || this.isPDFNavigationURL(url);
     if (!viewer) return;
 
     // Re-read after the permission/probe awaits: a content-disposition
@@ -12002,6 +12200,11 @@ export class Bridge {
       await this.drainHandoffDriveQueue();
       return;
     }
+    if (job.manual_delivery_target === true) {
+      await this.update((s) => patchJob(s, job.job_id, { tab_id: -1 }));
+      await this.drainHandoffDriveQueue();
+      return;
+    }
     // Once the user is past authentication (awaiting_download), a closed tab is
     // NOT a cancel: a download may be in flight or already saved into the job's
     // adoption directory, where the daemon's poll-scan adopts it. Park it, as
@@ -12026,7 +12229,16 @@ export class Bridge {
       const byTab = findByTab(this.store, item.tabId);
       if (byTab) {
         if (this.isFirefoxClickDownload(byTab)) return undefined;
-        return byTab;
+        // Compatibility guard for persisted records created before Open
+        // demotion cleared tab_id. An unselected awaiting-download record
+        // has no authority to claim another PDF merely because its old tab
+        // id survived; current Open targets and initiated adapter downloads
+        // remain authoritative.
+        const staleManualTab =
+          byTab.status === "awaiting_download" &&
+          byTab.manual_delivery_target !== true &&
+          byTab.download_initiated !== true;
+        if (!staleManualTab) return byTab;
       }
       // extension did not create; host matching below requires an advertised
       // provider host or the job's persisted registry adapter.
@@ -12809,13 +13021,38 @@ function isHandoffOpenRuntimeRequest(value: unknown): value is { job_id: string 
     value["job_id"].length <= 1024
   );
 }
+function isManualJobID(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{8,128}$/u.test(value);
+}
+
+function isSafeExternalHTTPSURL(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4000) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" && parsed.username === "" && parsed.password === "";
+  } catch {
+    return false;
+  }
+}
+
+function isManualOpenRuntimeRequest(value: unknown): value is ManualOpenPayload {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["job_id", "url", "title"])) return false;
+  const title = value["title"];
+  return (
+    isManualJobID(value["job_id"]) &&
+    isSafeExternalHTTPSURL(value["url"]) &&
+    (title === undefined ||
+      (typeof title === "string" && title.trim().length > 0 && title.length <= 2048 && !title.includes("\u0000")))
+  );
+}
+
 
 function isSessionRetryRuntimeRequest(value: unknown): value is { job_id: string } {
   return isHandoffOpenRuntimeRequest(value);
 }
 
 function isDeliveryStartRuntimeRequest(value: unknown): value is DeliveryStartPayload {
-  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["tab_id", "url", "doi", "title"])) return false;
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["tab_id", "url", "job_id", "doi", "title"])) return false;
   return (
     typeof value["tab_id"] === "number" &&
     Number.isSafeInteger(value["tab_id"]) &&
@@ -12823,6 +13060,7 @@ function isDeliveryStartRuntimeRequest(value: unknown): value is DeliveryStartPa
     typeof value["url"] === "string" &&
     value["url"].length > 0 &&
     value["url"].length <= 4000 &&
+    (value["job_id"] === undefined || isManualJobID(value["job_id"])) &&
     (value["doi"] === undefined || typeof value["doi"] === "string") &&
     (value["title"] === undefined || typeof value["title"] === "string")
   );
@@ -12929,6 +13167,15 @@ export async function handleInboxRuntimeMessage(
     return isHandoffOpenRuntimeRequest(message["request"])
       ? bridge.openHandoff(message["request"].job_id)
       : failure("invalid_request", "Invalid handoff open request");
+  }
+  if (type === "papio.manual.open") {
+    if (!isInboxSender(sender, urls)) {
+      return failure("unauthorized", "This sender cannot select a manual-download target");
+    }
+    if (!hasOnlyKeys(message, ["type", "request"]) || !isManualOpenRuntimeRequest(message["request"])) {
+      return failure("invalid_request", "Invalid manual-download open request");
+    }
+    return bridge.openManualDownload(message["request"]);
   }
   if (type === "papio.delivery.start") {
     if (!isInboxOrPopupSender(sender, urls)) {

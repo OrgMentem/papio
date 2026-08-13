@@ -1278,8 +1278,9 @@ func watchFacts(work Work) []Fact {
 // inbox shows a paper's title/authors/DOI instead of only the daemon's
 // internal job id — matching watch_hit's Work/watchFacts treatment. Any kind
 // is dismissible (Store.Cancel is idempotent on an already-terminal job);
-// only verify_identity additionally offers accept (gated on a valid
-// quarantine binding) and reject (never gated — reject needs no SHA match).
+// verify_identity and unsafe_pdf offer reject (unsafe_pdf never offers accept),
+// and only verify_identity additionally offers accept (gated on a valid
+// quarantine binding).
 func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 	// diagnosis is a durable column on the action, not an event join. The
 	// join it replaced read `$.diagnosis` out of browser.provider_outcome,
@@ -1371,6 +1372,11 @@ func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 			if validSHA256(r.action.SHA256) {
 				ops = []string{"accept", "reject"}
 			}
+			if len(links) > 0 {
+				ops = append(ops, "open")
+			}
+		} else if r.action.ActionKind == "unsafe_pdf" && r.action.JobState == job.StateNeedsReview {
+			ops = []string{"reject", "dismiss"}
 			if len(links) > 0 {
 				ops = append(ops, "open")
 			}

@@ -43,6 +43,20 @@ test("upsert inserts then replaces by job_id, never duplicating", () => {
   expect(findByJob(store, "job_00000001")?.status).toBe("auth_pending");
 });
 
+test("a daemon upsert cannot revoke an operator-selected manual delivery target", () => {
+  const selected = job({
+    tab_id: -1,
+    status: "awaiting_download",
+    provider_hosts: [],
+    manual_delivery_target: true,
+  });
+  const store = upsertJob(
+    { ...emptyStore(), activeJobs: [selected] },
+    job({ tab_id: 222, status: "accepted", access_mode: "delegated" }),
+  );
+  expect(store.activeJobs).toEqual([selected]);
+});
+
 test("find by tab and by job resolve the same record", () => {
   const store = upsertJob(emptyStore(), job());
   expect(findByTab(store, 100)?.job_id).toBe("job_00000001");
@@ -138,6 +152,50 @@ test("migration accepts a clean current state and writes an explicit version on 
   });
   expect(JSON.stringify(fixture.data.papio_state_v1)).not.toContain("https://secret.example");
   expect(fixture.data.papio_state_v1).toMatchObject({ version: MANAGED_STATE_VERSION });
+});
+
+test("version 3 upgrades and the unique manual-delivery target survives restart", () => {
+  const legacy = migrateManagedState({ version: 3, activeJobs: [migrationJob()] });
+  expect(legacy.activeJobs[0]?.job_id).toBe("job_migrate_0001");
+
+  const selected = migrationJob({
+    job_id: "job_manual_selected",
+    tab_id: -1,
+    status: "awaiting_download",
+    manual_delivery_target: true,
+  });
+  expect(migrateManagedState({
+    version: MANAGED_STATE_VERSION,
+    activeJobs: [selected],
+  }).activeJobs[0]?.manual_delivery_target).toBe(true);
+  expect(migrateManagedState({
+    version: MANAGED_STATE_VERSION,
+    activeJobs: [migrationJob({
+      job_id: "job_manual_open_tab",
+      tab_id: 88,
+      status: "awaiting_download",
+      access_mode: "delegated",
+      manual_delivery_target: true,
+    })],
+  }).activeJobs[0]?.manual_delivery_target).toBe(true);
+
+  const ambiguous = migrateManagedState({
+    version: MANAGED_STATE_VERSION,
+    activeJobs: [
+      selected,
+      migrationJob({
+        job_id: "job_manual_other",
+        tab_id: -1,
+        status: "awaiting_download",
+        manual_delivery_target: true,
+      }),
+    ],
+  });
+  expect(ambiguous.activeJobs.every((job) => job.manual_delivery_target !== true)).toBe(true);
+  expect(migrateManagedState({
+    version: MANAGED_STATE_VERSION,
+    activeJobs: [migrationJob({ manual_delivery_target: true })],
+  }).activeJobs[0]?.manual_delivery_target).toBeUndefined();
 });
 
 test("migration scrubs every legacy URL, claim hash, and global terms authority", () => {

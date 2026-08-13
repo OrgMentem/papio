@@ -7444,8 +7444,9 @@ func TestSweepGrabsCreatesJobFromDOI(t *testing.T) {
 }
 
 // TestSweepGrabsCreatesJobFromDOIReportsAlreadyOwned pins the ledger-dedupe
-// half of Decision 4: an already-live job for the same DOI is joined, never
-// duplicated, and the grab reports already_owned.
+// half of Decision 4: an already-live (awaiting_human) job for the same DOI
+// is joined and its bytes are adopted, never duplicated, and the grab reports
+// job_created.
 func TestSweepGrabsCreatesJobFromDOIReportsAlreadyOwned(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
 	b.svc.Validate = grabDOIValidate("10.1234/grab.owned")
@@ -7466,8 +7467,8 @@ func TestSweepGrabsCreatesJobFromDOIReportsAlreadyOwned(t *testing.T) {
 	if err != nil || got == nil {
 		t.Fatalf("grab lookup: %v", err)
 	}
-	if got.Outcome != "already_owned" || got.JobID != existingID {
-		t.Fatalf("grab = %+v, want already_owned pointing at the existing job %s", got, existingID)
+	if got.State != grab.StateJobCreated || got.Outcome != "job_created" || got.JobID != existingID {
+		t.Fatalf("grab = %+v, want job_created pointing at the existing live job %s", got, existingID)
 	}
 	var jobCount int
 	if err := jobs.S.DB().QueryRowContext(ctx,
@@ -7477,6 +7478,65 @@ func TestSweepGrabsCreatesJobFromDOIReportsAlreadyOwned(t *testing.T) {
 	}
 	if jobCount != 1 {
 		t.Fatalf("jobs for this DOI = %d, want exactly 1 (no duplicate)", jobCount)
+	}
+	row, err := jobs.Get(ctx, existingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateReady || row.ArtifactSHA256 == "" {
+		t.Fatalf("existing live job not adopted in the same pass: %+v", row)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("grab landing dir survived claim: err=%v", err)
+	}
+	// Ingest succeeded (job is ready) is sufficient — the adoption directory
+	// file is promoted into the artifact store and may or may not remain as a
+	// transient copy depending on timing, so do not assert its absence.
+}
+
+// TestSweepGrabsReadyJobIsAlreadyOwned pins the ready/terminal dedupe half:
+// an already-ready bundle for the same DOI reports already_owned and discards
+// the captured bytes.
+func TestSweepGrabsReadyJobIsAlreadyOwned(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	b.svc.Validate = grabDOIValidate("10.1234/grab.ready")
+	ctx := context.Background()
+	readyID := bulkReadyJob(t, jobs, "wr_grab_ready", "10.1234/grab.ready")
+
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Ready Already")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil {
+		t.Fatalf("grab lookup: %v", err)
+	}
+	if got.Outcome != "already_owned" || got.JobID != readyID {
+		t.Fatalf("grab = %+v, want already_owned pointing at the existing ready job %s", got, readyID)
+	}
+	if got.State != grab.StateJobCreated {
+		t.Fatalf("grab state = %s, want %s", got.State, grab.StateJobCreated)
+	}
+	var jobCount int
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs j JOIN identifiers i ON i.work_request_id = j.work_request_id WHERE i.kind='doi' AND i.value=?`,
+		"10.1234/grab.ready").Scan(&jobCount); err != nil {
+		t.Fatal(err)
+	}
+	if jobCount != 1 {
+		t.Fatalf("jobs for this DOI = %d, want exactly 1 (no duplicate)", jobCount)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("grab landing dir survived already_owned: err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.EffectiveAdoptionRoot(), readyID, "main.pdf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ready job must not have adopted file: err=%v", err)
 	}
 }
 
@@ -7577,6 +7637,112 @@ func TestSweepGrabsFailsValidationForNonPDF(t *testing.T) {
 		t.Fatalf("grab = %+v, want failed_validation/failed_validation", got)
 	}
 }
+
+func TestSweepGrabsEmbeddedPDFStillJoinsLiveJob(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: false, Pages: 1, HasEmbeddedFiles: true, Reason: "embedded files"},
+			Text:       pdf.TextReport{Chars: 40, Excerpt: "DOI: 10.1234/grab.embedded\nA Paper Worth Grabbing\n"},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
+		}, nil
+	}
+	ctx := context.Background()
+	existingID := park(t, jobs, "wr_grab_embedded", work.Work{DOI: "10.1234/grab.embedded", Title: "A Paper Worth Grabbing"})
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Embedded Publisher PDF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil {
+		t.Fatalf("grab lookup: %v", err)
+	}
+	if got.State == grab.StateFailedValidation {
+		t.Fatalf("embedded PDF marked failed_validation: %+v", got)
+	}
+	if got.Outcome != "job_created" || got.JobID != existingID {
+		t.Fatalf("grab = %+v, want job_created pointing at live job %s", got, existingID)
+	}
+}
+
+func TestSweepGrabsReadyJobIdentityReviewKeepsBytes(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text:       pdf.TextReport{Chars: 80, Excerpt: "Erratum:\nDOI: 10.1234/grab.ready\nA Paper Worth Grabbing\n"},
+		}, nil
+	}
+	ctx := context.Background()
+	readyID := bulkReadyJob(t, jobs, "wr_grab_ready_review", "10.1234/grab.ready")
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Erratum About Ready Paper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil {
+		t.Fatalf("grab lookup: %v", err)
+	}
+	if got.Outcome == "already_owned" {
+		t.Fatalf("erratum grab claimed already_owned of %s: %+v", readyID, got)
+	}
+	if got.State != grab.StateParkedNoIdentifier {
+		t.Fatalf("grab = %+v, want parked_no_identifier so the capture is kept", got)
+	}
+	if _, err := os.Stat(got.QuarantinePath); err != nil {
+		t.Fatalf("quarantine discarded on identity review: %v", err)
+	}
+}
+
+func TestSweepGrabsDoesNotOverwritePendingAdoptionFile(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	b.svc.Validate = grabDOIValidate("10.1234/grab.unique")
+	ctx := context.Background()
+	existingID := park(t, jobs, "wr_grab_unique", work.Work{DOI: "10.1234/grab.unique", Title: "A Paper Worth Grabbing"})
+	prior := filepath.Join(cfg.EffectiveAdoptionRoot(), existingID, "main.pdf")
+	writeFixturePDF(t, prior)
+	priorInfo, err := os.Stat(prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "A Paper Worth Grabbing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	after, err := os.Stat(prior)
+	if err != nil {
+		t.Fatalf("pending main.pdf was removed: %v", err)
+	}
+	if after.ModTime() != priorInfo.ModTime() || after.Size() != priorInfo.Size() {
+		t.Fatalf("pending main.pdf was overwritten")
+	}
+	got, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || got == nil || got.JobID != existingID {
+		t.Fatalf("grab = %+v, err=%v", got, err)
+	}
+}
+
+// TestSweepGrabsSkipsTickOnHungRoot mirrors
+// TestSweepsSkipTickOnHungAdoptionRoot for the grabs/ subtree: a TCC-hung
+// root must never wedge the grab sweeper, and the shared latch must not
+// stack a second hung goroutine underneath it.
 
 // TestSweepGrabsSkipsTickOnHungRoot mirrors
 // TestSweepsSkipTickOnHungAdoptionRoot for the grabs/ subtree: a TCC-hung

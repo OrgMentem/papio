@@ -65,14 +65,33 @@ for the full pre-split extension history.
 - **Repeated handoffs no longer stack duplicate tabs.** After a service-worker
   restart the extension recovers the job's existing broker tab from its
   durable ledger instead of opening another copy for every re-offer.
+- **Manual PDF delivery stays attached to the row you opened.** Opening a
+  manual-download item now pins that existing job through later daemon
+  re-offers, long login flows, and MV3 restarts. Re-offers merge adapter and
+  host fields onto that pin instead of replacing it. **Send PDF** joins by the
+  current tab, then a unique page DOI, and only then the Open pin when it owns
+  this tab — a DOI-less PDF in another tab is identified from the file rather
+  than bound to whichever row was opened last. **Send PDF** works directly on
+  recognized SAGE, Taylor & Francis, and Cell journal PDF viewers. Selecting
+  another Open row now also revokes the old row's tab authority, so a native
+  download cannot be adopted into that stale job and rejected as the wrong
+  paper. On Chrome, a provider-started download from the selected landing host
+  is steered into that job automatically instead of landing loose in Downloads.
+  ScienceDirect asset viewers are deliberately not re-fetched — that endpoint
+  can return `init.html` outside the viewer navigation. **Send PDF** now arms
+  the current viewer for the job and asks for the viewer's own Download button;
+  the popup keeps showing that instruction, then **papio adopted PDF
+  (validating)** after the daemon acknowledges adoption. Viewer tabs remain
+  open intentionally so papio never closes user-visible reading context.
 - **On-screen PDFs on publisher CDNs are grabbed again.** A PDF viewer tab
   landing on a host outside the provider's own domain (e.g. a ScienceDirect
   asset CDN) is now adopted when exactly one driven job matches it.
+- **Send PDF without a page DOI identifies the file.** On Chrome, a DOI-less
+  PDF now uses download steering to identify the file itself instead of
+  claiming the job has no DOI. Opening a manual-download row with an adapter
+  resumes driving that tab, and closing that tab keeps the pinned job awaiting
+  download.
 - **Institution-session status stays attached to the right institution.**
-  Fresh sign-in evidence now unblocks and labels only jobs waiting on that
-  resolver; stale, malformed, unrelated, or future-dated session records no
-  longer make another institution look signed in.
-
 ## [0.12.0] - 2026-08-10
 
 ### Added
@@ -198,16 +217,15 @@ for the full pre-split extension history.
 
 ### Fixed
 
-- **The Institution session card no longer gets stuck on "Checking
-  session…".** Staleness gating previously ran before an inconclusive
-  probe outcome (`no_tab`, `no_markers`, and the rest) was resolved to its
-  own honest label, so an origin whose probe never lands a decisive in/out
-  verdict — the steady state whenever no library tab is open — rendered
-  "Checking session…" forever. An `unknown` verdict now resolves to its
-  honest copy first; only a decided ("in"/"out") verdict that has since
-  aged past freshness falls through to a new **Session state unknown —
-  recheck** state, so a decided-but-recently-completed probe is never
-  misread as stale.
+- **The Institution session card no longer invents "unknown" two minutes
+  after a verified sign-in.** Inconclusive probe outcomes (`no_tab`,
+  `no_markers`, and the rest) still resolve to their own honest labels, but
+  an aged decisive verdict now retains what papio actually verified:
+  **Last verified signed in — rechecking** or **Last verified signed out —
+  rechecking**. The popup schedules one bounded probe for that verdict
+  timestamp and deduplicates it, rather than converting durable signed-in
+  evidence to unknown or injecting another probe on every five-second
+  refresh.
 
 - **A dropped daemon connection no longer leaves the browser talking to
   itself.** Every asynchronous message handler now always answers. When the
