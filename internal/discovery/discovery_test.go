@@ -403,3 +403,37 @@ func TestInvertAbstractSkipsOversizedIndexes(t *testing.T) {
 		t.Fatalf("oversized abstract = %q", got)
 	}
 }
+
+// OpenAlex requires a contact email by API policy: the polite pool uses it to
+// identify the caller. Refusing to make an unidentified request is deliberate
+// fail-closed configuration, not a style preference — without an email we would
+// draw on the anonymous per-IP quota instead.
+func TestSearchRequiresConfiguredClientAndContactEmail(t *testing.T) {
+	tests := []struct {
+		name    string
+		client  *Client
+		wantErr string
+	}{
+		{
+			name:    "no HTTP client",
+			client:  &Client{email: "researcher@example.org"},
+			wantErr: "discovery: HTTP client is not configured",
+		},
+		{
+			name:    "no contact email",
+			client:  NewWithOptions(Options{Client: http.DefaultClient}),
+			wantErr: "discovery: contact email is required for the OpenAlex polite pool",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tt.client.Search(context.Background(), SearchParams{Query: "test"})
+			if err == nil {
+				t.Fatal("Search succeeded without required configuration")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}

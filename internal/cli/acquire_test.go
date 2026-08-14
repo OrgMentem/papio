@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -173,6 +175,28 @@ func TestBatchAcceptsResolverFlag(t *testing.T) {
 	}
 	if err := validateBatchFlags(command, nil, false, false); err != nil {
 		t.Fatalf("--batch rejected --resolver: %v", err)
+	}
+}
+
+func TestAcquireBatchMalformedJSONArrayFailsClosed(t *testing.T) {
+	batchFile := filepath.Join(t.TempDir(), "works.jsonl")
+	if err := os.WriteFile(batchFile, []byte(`[{"doi": "10.1000/x"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{},
+		func(_ context.Context, method string, _ any, _ any) error {
+			t.Fatalf("malformed batch reached the daemon (%q)", method)
+			return nil
+		})
+	root.SetArgs([]string{"acquire", "--batch", batchFile})
+	err := root.ExecuteContext(context.Background())
+	if err == nil {
+		t.Fatal("acquire --batch with malformed JSON array succeeded; want parse error")
+	}
+	combined := err.Error() + errOut.String()
+	if !strings.Contains(combined, "decoding JSON array") {
+		t.Fatalf("error = %v stderr = %q, want decoding JSON array context", err, errOut.String())
 	}
 }
 

@@ -244,6 +244,28 @@ func TestOpenAlexEnrichRejectsISBNAndAmbiguousMatches(t *testing.T) {
 	}
 }
 
+func TestOpenAlexEnrichRejectsConflictingDOIsForOneWork(t *testing.T) {
+	// One OpenAlex work reported with two conflicting DOIs is ambiguous evidence
+	// and must never be promoted. That is a different refusal path from two
+	// distinct candidate works (len(seen) != 1).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"results":[
+			{"id":"https://openalex.org/W12345","ids":{"openalex":"https://openalex.org/W12345"},"doi":"10.1000/one","title":"A title","publication_year":2024,"authorships":[{"author":{"display_name":"Jane Smith"}}],"open_access":{"is_oa":true},"locations":[{"is_oa":true,"landing_page_url":"https://example.org/one"}]},
+			{"id":"https://openalex.org/W12345","ids":{"openalex":"https://openalex.org/W12345"},"doi":"10.1000/two","title":"A title","publication_year":2024,"authorships":[{"author":{"display_name":"Jane Smith"}}],"open_access":{"is_oa":true},"locations":[{"is_oa":true,"landing_page_url":"https://example.org/two"}]}
+		]}`))
+	}))
+	defer server.Close()
+
+	enriched, matched, err := NewOpenAlexWithOptions(OpenAlexOptions{
+		BaseURL: server.URL, ContactEmail: "reader@example.org",
+	}).Enrich(context.Background(), work.Work{
+		Title: "A title", Year: 2024, Authors: []string{"Jane Smith"},
+	})
+	if err != nil || matched || enriched.OpenAlex != "" || enriched.DOI != "" {
+		t.Fatalf("conflicting-DOI enrichment = %+v, matched=%v, err=%v; same work with conflicting DOIs must be refused", enriched, matched, err)
+	}
+}
+
 func TestOpenAlexEnrichRequiresEditionEvidence(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"results":[{"id":"https://openalex.org/W12345","title":"A title","publication_year":2024,"authorships":[{"author":{"display_name":"Jane Smith"}}],"open_access":{"is_oa":true},"locations":[{"is_oa":true,"landing_page_url":"https://example.org/paper"}]}]}`))

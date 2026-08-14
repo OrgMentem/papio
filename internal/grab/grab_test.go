@@ -734,3 +734,100 @@ func TestLegacyPDFGrabTransitionsSettleExactBlocker(t *testing.T) {
 		})
 	}
 }
+
+func TestByJobID(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	svc := New(s, nil)
+	now := store.Now()
+	const jobID = "job_00000000000000000000000099"
+
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO work_requests(id,created_at) VALUES(?,?)`, "request-by-job-id", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO jobs(id,work_request_id,state,policy_json,created_at,updated_at) VALUES(?,?,?,?,?,?)`,
+		jobID, "request-by-job-id", "awaiting_human", `{}`, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	g, err := svc.Allocate(ctx, "pdf.example.org", "ByJobID paper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.MarkJobCreated(ctx, g.ID, jobID, "job_created"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.ByJobID(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ByJobID hit: %v", err)
+	}
+	if got == nil {
+		t.Fatal("ByJobID hit: got nil grab")
+	}
+	if got.ID != g.ID {
+		t.Fatalf("ByJobID id = %q, want %q", got.ID, g.ID)
+	}
+	if got.JobID != jobID {
+		t.Fatalf("ByJobID job_id = %q, want %q", got.JobID, jobID)
+	}
+	if got.State != StateJobCreated {
+		t.Fatalf("ByJobID state = %q, want %q", got.State, StateJobCreated)
+	}
+
+	miss, err := svc.ByJobID(ctx, "job_00000000000000000000000000")
+	if err != nil {
+		t.Fatalf("ByJobID miss: %v", err)
+	}
+	if miss != nil {
+		t.Fatalf("ByJobID miss: got %+v, want (nil, nil)", miss)
+	}
+
+	empty, err := svc.ByJobID(ctx, "")
+	if err != nil {
+		t.Fatalf("ByJobID empty job id: %v", err)
+	}
+	if empty != nil {
+		t.Fatalf("ByJobID empty job id: got %+v, want (nil, nil)", empty)
+	}
+
+	// ByJobID orders by created_at DESC and returns one row; pin the newest match.
+	const dupJobID = "job_00000000000000000000000098"
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO work_requests(id,created_at) VALUES(?,?)`, "request-dup-job-id", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO jobs(id,work_request_id,state,policy_json,created_at,updated_at) VALUES(?,?,?,?,?,?)`,
+		dupJobID, "request-dup-job-id", "awaiting_human", `{}`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	older := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano)
+	newer := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339Nano)
+	const olderGrabID = "grab_by_job_id_older01"
+	const newerGrabID = "grab_by_job_id_newer01"
+	if _, err := s.DB().ExecContext(ctx, `
+		INSERT INTO pdf_grabs(id, url_host, title, state, job_id, outcome, created_at, updated_at)
+		VALUES (?, 'pdf.example.org', 'older', 'job_created', ?, 'job_created', ?, ?)`,
+		olderGrabID, dupJobID, older, older); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `
+		INSERT INTO pdf_grabs(id, url_host, title, state, job_id, outcome, created_at, updated_at)
+		VALUES (?, 'pdf.example.org', 'newer', 'job_created', ?, 'job_created', ?, ?)`,
+		newerGrabID, dupJobID, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := svc.ByJobID(ctx, dupJobID)
+	if err != nil {
+		t.Fatalf("ByJobID duplicate job_id: %v", err)
+	}
+	if latest == nil {
+		t.Fatal("ByJobID duplicate job_id: got nil grab")
+	}
+	if latest.ID != newerGrabID {
+		t.Fatalf("ByJobID duplicate job_id id = %q, want newest %q", latest.ID, newerGrabID)
+	}
+}

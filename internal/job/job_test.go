@@ -99,6 +99,11 @@ func TestTerminalTransitionRecordsReasonAndClearsLease(t *testing.T) {
 	if row.TerminalReason != string(TerminalReasonCandidatesExhausted) {
 		t.Fatalf("terminal reason = %q", row.TerminalReason)
 	}
+	// ClaimNext excludes terminal states regardless of lease state, so lease
+	// clearing must be asserted directly on the row.
+	if row.LeaseOwner != "" || row.LeaseExpiresAt != "" {
+		t.Fatalf("terminal transition left lease behind: owner=%q expires=%q", row.LeaseOwner, row.LeaseExpiresAt)
+	}
 	// Terminal jobs are not claimable.
 	claimed, err := js.ClaimNext(ctx, "owner2", time.Minute)
 	if err != nil || claimed != nil {
@@ -207,6 +212,15 @@ func TestRecoveredResolvingJobIsImmediatelyClaimable(t *testing.T) {
 	}
 	if recovered, err := js.RecoverStale(ctx); err != nil || len(recovered) != 1 {
 		t.Fatalf("recover = %v, %v", recovered, err)
+	}
+	row, _ := js.Get(ctx, id)
+	if row.State != StateResolving {
+		t.Fatalf("state after recovery = %s, want resolving", row.State)
+	}
+	// ClaimNext would also match an expired lease, so assert the durable
+	// unowned boundary RecoverStale promises.
+	if row.LeaseOwner != "" || row.LeaseExpiresAt != "" {
+		t.Fatalf("recover left lease behind: owner=%q expires=%q", row.LeaseOwner, row.LeaseExpiresAt)
 	}
 	claimed, err := js.ClaimNext(ctx, "replacement-daemon", time.Minute)
 	if err != nil {
@@ -824,6 +838,90 @@ func TestRepairParkWithActionLeavesLateLeaseUntouched(t *testing.T) {
 		t.Fatalf("late lease let repair change actions: %+v", actions)
 	}
 }
+
+func TestRepairParkWithActionRejectsBindingForNonIdentityAction(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, err := js.CreateRequest(ctx, "wr_repair_binding_kind", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, StateNeedsReview, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	err = js.RepairParkWithAction(ctx, id, StateNeedsReview, StateAwaitingHuman, nil,
+		"manual_download", "download the requested PDF yourself",
+		map[string]any{"reason": "repair"},
+		Access(false, "landing_page"),
+		WithHumanActionBinding(HumanActionBinding{
+			CandidateID:      1,
+			QuarantinePath:   "/tmp/paper.pdf",
+			QuarantineSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		}))
+	want := "human action binding is only valid for verify_identity or unsafe_pdf"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("binding guard opened actions despite error: %+v", actions)
+	}
+}
+
+// A binding option that rejects its own arguments must abort the repair
+// before any state change: the option loop's error return is the only guard
+// standing between a malformed binding and a human action bound to a
+// quarantine file papio cannot verify.
+func TestRepairParkWithActionRejectsMalformedBinding(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, err := js.CreateRequest(ctx, "wr_repair_binding_malformed", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, StateNeedsReview, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	err = js.RepairParkWithAction(ctx, id, StateNeedsReview, StateAwaitingHuman, nil,
+		"verify_identity", "confirm this is the requested paper",
+		map[string]any{"reason": "repair"},
+		Access(false, "landing_page"),
+		WithHumanActionBinding(HumanActionBinding{
+			CandidateID:      1,
+			QuarantinePath:   "   ",
+			QuarantineSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		}))
+	want := "human action binding requires a quarantine path"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != StateNeedsReview {
+		t.Fatalf("state = %s, want needs_review (a rejected option must not park the job)", row.State)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("malformed binding opened actions despite error: %+v", actions)
+	}
+}
+
 func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int64, int64) {
 	t.Helper()
 	ctx := context.Background()

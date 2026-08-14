@@ -3047,3 +3047,63 @@ func TestLandingExpansionSurvivesRetryableDerivedFetchFailure(t *testing.T) {
 		t.Fatalf("actions = %+v, want none (the job must acquire cleanly)", actions)
 	}
 }
+
+// Programmer-error guard: a partially wired Service must fail before any state
+// change when fetch or validation dependencies are missing.
+func TestProcessRejectsMissingFetchOrValidateDependencies(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+
+	id, err := svc.Submit(ctx, doiRequest("wr_nil_fetch_validate"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil || row == nil || row.ID != id {
+		t.Fatalf("claim = %+v, %v", row, err)
+	}
+	before, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const wantErr = "acquisition service is missing fetch/validation dependencies"
+	fetches := 0
+	for _, tc := range []struct {
+		name string
+		wire func(*Service)
+	}{
+		{
+			name: "nil Fetch",
+			wire: func(s *Service) {
+				s.Fetch = nil
+				s.Validate = passValidation()
+			},
+		},
+		{
+			name: "nil Validate",
+			wire: func(s *Service) {
+				s.Fetch = fakeDownload(&fetches)
+				s.Validate = nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.wire(svc)
+			err := svc.Process(ctx, row)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if err.Error() != wantErr {
+				t.Fatalf("error = %q, want %q", err, wantErr)
+			}
+			after, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.State != before.State || after.UpdatedAt != before.UpdatedAt {
+				t.Fatalf("job mutated: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}

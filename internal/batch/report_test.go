@@ -5,6 +5,7 @@ package batch
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,6 +82,103 @@ func TestManifestWriteAndLoadPreservesBatchShape(t *testing.T) {
 	if err != nil || latest.ID != manifest.ID {
 		t.Fatalf("latest = %+v, %v", latest, err)
 	}
+}
+
+func TestWriteFailsEncodingBatchManifest(t *testing.T) {
+	requests := []protocol.WorkRequest{
+		{SchemaVersion: protocol.WorkRequestSchemaVersion, Identifiers: &protocol.Identifiers{DOI: "10.1000/one"}},
+	}
+	manifest := NewManifest(requests, "", "", time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC))
+	nan := math.NaN()
+	manifest.Works[0].Work.MaxCostUSD = &nan
+
+	err := Write(t.TempDir(), manifest)
+	if err == nil {
+		t.Fatal("Write() = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "encoding batch manifest:") {
+		t.Fatalf("Write() error = %q, want encoding batch manifest context", err)
+	}
+}
+
+func TestWriteFailsOnUnwritableManifestDestination(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission bits")
+	}
+	requests := []protocol.WorkRequest{
+		{SchemaVersion: protocol.WorkRequestSchemaVersion, Identifiers: &protocol.Identifiers{DOI: "10.1000/one"}},
+	}
+	when := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+
+	t.Run("creating batch manifest directory", func(t *testing.T) {
+		manifest := NewManifest(requests, "", "", when)
+		dataDir := t.TempDir()
+		if err := os.Chmod(dataDir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dataDir, 0o700) })
+
+		err := Write(dataDir, manifest)
+		if err == nil {
+			t.Fatal("Write() = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "creating batch manifest directory:") {
+			t.Fatalf("Write() error = %q, want creating batch manifest directory context", err)
+		}
+	})
+
+	t.Run("creating batch manifest", func(t *testing.T) {
+		manifest := NewManifest(requests, "", "", when)
+		dataDir := t.TempDir()
+		batchesDir := directory(dataDir)
+		if err := os.MkdirAll(batchesDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(batchesDir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(batchesDir, 0o700) })
+
+		err := Write(dataDir, manifest)
+		if err == nil {
+			t.Fatal("Write() = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "creating batch manifest:") {
+			t.Fatalf("Write() error = %q, want creating batch manifest context", err)
+		}
+	})
+
+	t.Run("publishing batch manifest", func(t *testing.T) {
+		manifest := NewManifest(requests, "", "", when)
+		dataDir := t.TempDir()
+		batchesDir := directory(dataDir)
+		if err := os.MkdirAll(batchesDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		dest := path(dataDir, manifest.ID)
+		if err := os.Mkdir(dest, 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		err := Write(dataDir, manifest)
+		if err == nil {
+			t.Fatal("Write() = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "publishing batch manifest:") {
+			t.Fatalf("Write() error = %q, want publishing batch manifest context", err)
+		}
+		info, err := os.Stat(dest)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("destination %s = %v, want existing directory unchanged", dest, err)
+		}
+		matches, err := filepath.Glob(filepath.Join(batchesDir, ".manifest-*.tmp"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("leftover temporary manifest files: %v", matches)
+		}
+	})
 }
 
 func TestLoadReadsLegacyManifestIDAndFindsLatest(t *testing.T) {
