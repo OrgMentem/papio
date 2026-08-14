@@ -8,7 +8,7 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records kept during the initial build.
 
-## [Unreleased]
+## [0.21.0] - 2026-08-14
 
 ### Added
 - **Browser effects remain at-most-once across extension restarts.** Store
