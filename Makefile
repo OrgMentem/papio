@@ -59,6 +59,13 @@ hooks:
 # Usage: make dev-deploy            (installs to ~/.local/bin/papio)
 #        make dev-deploy DEV_BIN=/custom/path/papio
 DEV_BIN ?= $(HOME)/.local/bin/papio
+# A stable signing identity makes macOS TCC grants survive dev rebuilds. Keep
+# the workstation-specific identity outside the repository:
+#   DEV_CODESIGN_IDENTITY := My Local Code Signing
+DEV_CODESIGN_CONFIG ?= $(HOME)/.config/papio/dev.mk
+-include $(DEV_CODESIGN_CONFIG)
+DEV_CODESIGN_IDENTITY ?=
+DEV_CODESIGN_IDENTIFIER ?= com.orgmentem.papio.dev
 # Stamp the NEXT patch as a prerelease (v0.18.0 -> 0.18.1-dev.<sha>), never the
 # released tag itself. `0.18.0-dev.<sha>` is semver-LOWER than `0.18.0`, and the
 # extension's MIN_DAEMON_VERSION floor (extension/src/background.ts) compares
@@ -87,6 +94,10 @@ dev-deploy:
 	cd extension && bun run build
 	@mkdir -p $(dir $(DEV_BIN))
 	go build -ldflags "-X papio/internal/api.Version=$(DEV_VERSION)" -o $(DEV_BIN).new ./cmd/papio
+	@if [ -n "$(DEV_CODESIGN_IDENTITY)" ]; then \
+		codesign --force --sign "$(DEV_CODESIGN_IDENTITY)" \
+			--identifier "$(DEV_CODESIGN_IDENTIFIER)" "$(DEV_BIN).new"; \
+	fi
 	@# macOS SIGKILLs an overwritten signed-binary inode; rm then mv for a fresh one.
 	rm -f $(DEV_BIN)
 	mv $(DEV_BIN).new $(DEV_BIN)
@@ -95,8 +106,9 @@ dev-deploy:
 	$(DEV_BIN) native-host install
 	@# Drop any running host so the browser respawns it from the new binary.
 	-pkill -f papio-native-host
-	@# Autostarts the new daemon, runs migrations, and verifies the whole chain.
-	-$(DEV_BIN) doctor
+	@# A normal read autostarts the new daemon and runs migrations; doctor itself never autostarts.
+	@$(DEV_BIN) jobs list --json >/dev/null
+	$(DEV_BIN) doctor
 	@echo "dev-deploy: $(DEV_VERSION) -> $(DEV_BIN) (host symlink repointed)"
 	@echo "dev-deploy: reload the extension now — Chrome: chrome://extensions -> Reload;" \
 	      "Firefox: about:debugging -> This Firefox -> Reload"
