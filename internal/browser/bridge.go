@@ -449,6 +449,13 @@ type browserSession struct {
 	// a session promoted by claim or stale-takeover was denied its ack at
 	// hello time and must still receive one before offers mean anything.
 	needsAck bool
+	// demotedNotice makes the next Sync from a claim-demoted holder deliver
+	// one session_busy frame. `papio browser use` moves the bridge without
+	// the old holder's extension ever hearing about it, so that browser kept
+	// reporting a live connection while receiving no offers. A hello-time
+	// takeover needs no flag: it drops the previous holder outright, whose
+	// next poll is answered with expected_hello.
+	demotedNotice bool
 }
 
 // legacySessionID stands in for native hosts older than the session_id field.
@@ -706,6 +713,7 @@ func (b *Bridge) Claim(sessionID string) (string, error) {
 // explicit claim can be reversed with another claim.
 func (b *Bridge) promote(session *browserSession, reason string) {
 	if b.holder != nil && b.holder.ID != session.ID {
+		b.holder.demotedNotice = true
 		b.pending[b.holder.ID] = b.holder
 		if capture := b.pendingCaptures[b.holder.ID]; capture != nil {
 			delete(b.pendingCaptures, b.holder.ID)
@@ -880,6 +888,17 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 			}
 			out = append(out, ack)
 		}
+	}
+	// A claim moved the bridge out from under this session. Tell it once, with
+	// the same frame a denied hello gets, so its UI can stop claiming a live
+	// papio connection and name the browser that now holds one.
+	if demoted, ok := b.pending[sessionID]; ok && demoted.demotedNotice {
+		demoted.demotedNotice = false
+		busy, err := b.sessionBusy("")
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, busy...)
 	}
 	for _, raw := range frames {
 		var msg *protocol.BrowserMessage

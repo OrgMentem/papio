@@ -1034,6 +1034,20 @@ function extensionOutdatedError(): unknown {
   };
 }
 
+function sessionBusyError(): unknown {
+  return {
+    protocol: "papio-browser/1",
+    type: "error",
+    msg_id: "error_00000003",
+    seq: 1,
+    payload: {
+      code: "session_busy",
+      message:
+        "another browser holds the papio session (v0.14.0); run 'papio browser sessions' then 'papio browser use' to switch",
+    },
+  };
+}
+
 function triageCounts(pending = 0): Record<string, number> {
   return {
     pending_total: pending,
@@ -1367,6 +1381,44 @@ test("extension-outdated daemon error is persisted and badged", async () => {
   expect(h.backend.store.connectionStatus).toBe("extension_outdated");
   expect(h.action.texts.at(-1)).toBe("!");
   expect(h.action.backgroundColors.at(-1)).toBe("#777777");
+});
+
+test("a hello refused by the holder browser is not reported as an unreachable daemon", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(sessionBusyError());
+
+  expect(h.backend.store.connectionStatus).toBe("session_elsewhere");
+  expect(h.action.titles.at(-1)).toBe(
+    "papio: another browser holds the papio session",
+  );
+  // The harness never fires a queued timer, so this resolves only because a
+  // refusal is treated as a settled answer. Waiting out the hello timeout made
+  // every popup read five seconds late in a browser that was merely pending.
+  const stats = await h.bridge.requestStats();
+  expect(stats).toMatchObject({ ok: false, error: { code: "session_busy" } });
+  // The port stays open and polling: a later `papio browser use` seats this
+  // session with a hello_ack on the same connection.
+  expect(h.ports.length).toBe(1);
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON }));
+  expect(h.backend.store.connectionStatus).toBe("connected");
+});
+
+test("a demoted browser keeps every capability it negotiated", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, features: ["page_acquire"] }),
+  );
+  expect(h.bridge.pageAcquireAvailable()).toBe(true);
+
+  // `papio browser use` moved the session elsewhere and the daemon says so on
+  // the next poll. Holdership gates offers and handoffs, never the features
+  // this port negotiated: the daemon still accepts page acquisition from any
+  // session it acknowledged, so the button must not go dark.
+  await h.port.inbound(sessionBusyError());
+  expect(h.backend.store.connectionStatus).toBe("session_elsewhere");
+  expect(h.bridge.pageAcquireAvailable()).toBe(true);
 });
 
 test("job_offer opens exactly one tab and replies job_accept", async () => {

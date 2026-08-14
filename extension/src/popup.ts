@@ -83,6 +83,13 @@ export function renderDaemonStatus(
     case "extension_outdated":
       line = "this extension is older than your papio daemon supports — update it from your browser's extension store";
       break;
+    case "session_elsewhere":
+      // The daemon answered; it is just pointed at a different browser. Only
+      // the operator can decide which browser should hold it, so name the
+      // one command that moves it here.
+      line = "another browser is holding your papio session — this one gets no papers until you switch it";
+      action = "run: papio browser use --latest";
+      break;
     case "disconnected":
       line = "papio daemon isn't reachable";
       action = "run: papio daemon status";
@@ -2334,7 +2341,13 @@ export function derivePulseDisplay(
   counts?: Pick<TriageCounts, "pending_total" | "turns_required">,
 ): PulseDisplay {
   if (connectionStatus !== "connected") {
-    return { primary: "Unknown", primaryText: "Can't tell — daemon disconnected", buckets: "", companion: "", next: "", capacity: "", batch: "" };
+    return {
+      primary: "Unknown",
+      primaryText: connectionStatus === "session_elsewhere"
+        ? "Can't tell — another browser holds the papio session"
+        : "Can't tell — daemon disconnected",
+      buckets: "", companion: "", next: "", capacity: "", batch: "",
+    };
   }
   if (cache === undefined || cache.workerEpoch === "" || now - cache.receivedAt < 0 || now - cache.receivedAt > maxAgeMs) {
     const generated = cache === undefined ? undefined : Date.parse(cache.pulse.generated_at);

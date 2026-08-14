@@ -87,9 +87,12 @@ export const HANDOFF_SURFACE_KEY = "papio_handoff_surface_v1";
 export const MANAGED_TAB_LEDGER_KEY = "papio_managed_tabs_v1";
 
 /** Native-daemon compatibility as last reported by the bridge. `undefined`
- * remains valid for state persisted by earlier extension versions. */
+ * remains valid for state persisted by earlier extension versions.
+ * `session_elsewhere` is not a connectivity failure: the daemon is reachable
+ * and another browser holds its offer/handoff flow, so this browser is
+ * negotiated for nothing until `papio browser use` moves it here. */
 export type DaemonConnectionStatus =
-  "connected" | "disconnected" | "daemon_outdated" | "extension_outdated";
+  "connected" | "disconnected" | "session_elsewhere" | "daemon_outdated" | "extension_outdated";
 
 /** Durable drive epoch for one daemon-selected provider candidate. The URL is
  * intentionally absent: only the daemon's opaque attempt and public route
@@ -1505,6 +1508,7 @@ function migratedState(raw: UnknownRecord): StoreShape {
   if (
     raw.connectionStatus === "connected" ||
     raw.connectionStatus === "disconnected" ||
+    raw.connectionStatus === "session_elsewhere" ||
     raw.connectionStatus === "daemon_outdated" ||
     raw.connectionStatus === "extension_outdated"
   ) {

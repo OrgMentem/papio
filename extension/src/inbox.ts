@@ -101,6 +101,9 @@ interface PageState {
   generatedAt: string | null;
   connected: boolean;
   connectionMessage: string;
+  /** The daemon answered and refused: another browser holds its session. No
+   * amount of reconnecting fixes that, so the banner must not promise it. */
+  connectionSessionElsewhere: boolean;
   selectedID: string | null;
   expandedItemIDs: Set<string>;
   pending: Set<string>;
@@ -145,6 +148,7 @@ const state: PageState = {
   generatedAt: null,
   connected: false,
   connectionMessage: "Connecting to daemon…",
+  connectionSessionElsewhere: false,
   selectedID: null,
   expandedItemIDs: new Set(),
   pending: new Set(),
@@ -188,11 +192,15 @@ function errorFromResponse(value: unknown): string {
   return "The daemon did not return a usable response.";
 }
 
-function responseValue<T>(value: unknown, key: string): { ok: true; value: T } | { ok: false; message: string } {
+function responseValue<T>(value: unknown, key: string): { ok: true; value: T } | { ok: false; message: string; code?: string } {
   if (isRecord(value) && value["ok"] === true && key in value) {
     return { ok: true, value: value[key] as T };
   }
-  return { ok: false, message: errorFromResponse(value) };
+  const code =
+    isRecord(value) && isRecord(value["error"]) && typeof value["error"]["code"] === "string"
+      ? value["error"]["code"]
+      : undefined;
+  return { ok: false, message: errorFromResponse(value), ...(code === undefined ? {} : { code }) };
 }
 function waitingSibling(item: TriageSnapshotItem): boolean {
   return typeof item.job_id === "string" && state.waitingJobs.has(item.job_id);
@@ -292,10 +300,11 @@ function clearOfflineItemMessages(): void {
   }
 }
 
-function setConnection(connected: boolean, message: string): void {
+function setConnection(connected: boolean, message: string, code?: string): void {
   const wasConnected = state.connected;
   state.connected = connected;
   state.connectionMessage = message;
+  state.connectionSessionElsewhere = !connected && code === "session_busy";
   if (connected) {
     cancelAutoReconnect();
     if (!wasConnected) clearOfflineItemMessages();
@@ -1815,8 +1824,13 @@ function renderDialog(): void {
 function render(): void {
   if (elements === null) return;
   const isDisconnected = !state.connected;
+  // A refused session is not lost connectivity: the daemon answered. Promising
+  // an automatic recovery and pointing at `papio status` sent the researcher
+  // looking for a broken daemon that was working the whole time.
   elements.connection.textContent = isDisconnected
-    ? `Disconnected: ${state.connectionMessage} Reconnecting automatically — run papio status if this persists.`
+    ? state.connectionSessionElsewhere
+      ? `Not this browser: ${state.connectionMessage} The inbox reconnects by itself once it does.`
+      : `Disconnected: ${state.connectionMessage} Reconnecting automatically — run papio status if this persists.`
     : state.connectionMessage;
   elements.connection.dataset.state = isDisconnected ? "disconnected" : "connected";
   const showConnection = isDisconnected || /^connecting/i.test(state.connectionMessage);
@@ -2031,7 +2045,7 @@ async function refreshInbox(append = false): Promise<void> {
   if (cursor !== undefined) snapshotRequest["cursor"] = cursor;
   const snapshotPromise = runtimeMessage("papio.triage.snapshot", snapshotRequest)
     .then((response) => responseValue<Snapshot>(response, "snapshot"))
-    .catch((error: unknown) => ({ ok: false as const, message: error instanceof Error ? error.message : "The daemon is unavailable." }));
+    .catch((error: unknown) => ({ ok: false as const, code: "connection_lost", message: error instanceof Error ? error.message : "The daemon is unavailable." }));
   const countsPromise = append
     ? Promise.resolve({ ok: false as const, message: "Counts were not refreshed." })
     : runtimeMessage("papio.triage.counts", {})
@@ -2055,7 +2069,7 @@ async function refreshInbox(append = false): Promise<void> {
     state.generatedAt = snapshot.generated_at;
     setConnection(true, "Connected to daemon.");
   } else {
-    setConnection(false, snapshotResult.message);
+    setConnection(false, snapshotResult.message, snapshotResult.code);
   }
   if (countsResult.ok) state.counts = countsResult.value;
   if (waitingResult !== null) {

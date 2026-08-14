@@ -158,10 +158,15 @@ func TestClaimSwitchesHolderAndReoffersHandoffs(t *testing.T) {
 	if firstOfType(msgs, protocol.MsgHelloAck) == nil || firstOfType(msgs, protocol.MsgJobOffer) == nil {
 		t.Fatalf("claimed session must receive hello_ack + re-offer, got %+v", msgs)
 	}
-	// The demoted holder stays pending and receives nothing.
+	// The demoted holder is told once — silence let its extension keep
+	// reporting a live papio connection it no longer had — then goes quiet.
 	msgs, _ = runSyncAs(t, b, sessA)
-	if len(msgs) != 0 {
-		t.Fatalf("demoted holder poll = %+v, want empty", msgs)
+	busy := firstOfType(msgs, protocol.MsgError)
+	if len(msgs) != 1 || busy == nil || busy.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+		t.Fatalf("demoted holder poll = %+v, want one session_busy", msgs)
+	}
+	if msgs, _ = runSyncAs(t, b, sessA); len(msgs) != 0 {
+		t.Fatalf("second demoted holder poll = %+v, want empty", msgs)
 	}
 	sessions, _, _ := b.Sessions()
 	if len(sessions) != 2 || sessions[0].ID != sessB || !sessions[0].Holder {

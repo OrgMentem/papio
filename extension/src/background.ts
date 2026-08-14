@@ -431,6 +431,15 @@ export function computeBadge(state: BadgeState): BadgeResult {
   const retractions = Math.max(0, Math.trunc(state.retractions ?? 0));
   const breakdown = (need: number): string =>
     `papio: ${need} need you · ${watchHits} watch hit${watchHits === 1 ? "" : "s"} · ${retractions} retraction notice${retractions === 1 ? "" : "s"}`;
+  if (state.connectionStatus === "session_elsewhere") {
+    // Reachable daemon, wrong browser: the remedy is switching the session,
+    // not diagnosing the daemon.
+    return {
+      text: "!",
+      color: "#777777",
+      tooltip: "papio: another browser holds the papio session",
+    };
+  }
   if (state.connectionStatus !== "connected") {
     return {
       text: "!",
@@ -2324,6 +2333,11 @@ export class Bridge {
   private portGeneration = 0;
   private helloAckGeneration = -1;
   private helloSentGeneration = -1;
+  /** Port generation whose hello the daemon answered with session_busy. That
+   * hello never gets an ack, so without this every foreground request would
+   * burn the full hello wait before failing — the popup's own status paint
+   * arrived five seconds late in a browser that was merely not the holder. */
+  private helloDeniedGeneration = -1;
   private helloRequestID: string | undefined;
   private readonly helloWaiters = new Set<(acknowledged: boolean) => void>();
   private requestIDSequence = 0;
@@ -4808,17 +4822,29 @@ export class Bridge {
     await this.removeJobWithOffer(jobID);
   }
 
+  /** True while this port's hello_ack still describes the daemon, whether or
+   * not this browser holds the offer/handoff flow. Holdership gates offers and
+   * handoffs in the daemon, never the capabilities it acknowledged: a browser
+   * demoted by `papio browser use` keeps every feature it negotiated, and a
+   * browser refused at hello has no features to satisfy the callers below. */
+  private daemonNegotiated(): boolean {
+    return (
+      this.store.connectionStatus === "connected" ||
+      this.store.connectionStatus === "session_elsewhere"
+    );
+  }
+
   /** True only after this port's hello_ack has advertised page acquisition. */
   pageAcquireAvailable(): boolean {
     return (
-      this.store.connectionStatus === "connected" &&
+      this.daemonNegotiated() &&
       (this.store.daemonFeatures ?? []).includes("page_acquire")
     );
   }
 
   pageCaptureAvailable(): boolean {
     return (
-      this.store.connectionStatus === "connected" &&
+      this.daemonNegotiated() &&
       (this.store.daemonFeatures ?? []).includes(PAGE_CAPTURE_FEATURE)
     );
   }
@@ -4832,7 +4858,7 @@ export class Bridge {
    * boundary that actually sends the frame refuses it too. */
   termsCaptureAvailable(): boolean {
     return (
-      this.store.connectionStatus === "connected" &&
+      this.daemonNegotiated() &&
       (this.store.daemonFeatures ?? []).includes(PAGE_CAPTURE_TERMS_FEATURE)
     );
   }
@@ -5776,6 +5802,15 @@ export class Bridge {
     await this.ready;
     if (this.hasCurrentHello()) return true;
     this.reconnectAttempts = 0;
+    // A denied hello is a settled answer, not a slow one: waiting for an ack
+    // the daemon will never send, and reconnecting to ask again, only churns
+    // native-host sessions into the daemon's pending list.
+    if (
+      this.port !== null &&
+      this.helloDeniedGeneration === this.portGeneration
+    ) {
+      return false;
+    }
     // A freshly opened port already has a current hello in flight; coalesce
     // foreground callers on that acknowledgement rather than churning ports.
     if (
@@ -5883,11 +5918,21 @@ export class Bridge {
     const attempts = retryTransport ? (mutation ? 1 : 2) : 1;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       if (!(await this.ensureConnected())) {
-        return {
-          kind: "transport",
-          code: "connection_timeout",
-          message: "Could not establish a current daemon session",
-        };
+        // Two different failures reached the researcher as one sentence about
+        // an unavailable daemon. A refused session has a remedy the generic
+        // copy hides, and the inbox prints this text verbatim.
+        return this.helloDeniedGeneration === this.portGeneration
+          ? {
+              kind: "transport",
+              code: "session_busy",
+              message:
+                "Another browser holds the papio session; run 'papio browser use --latest' to move it here",
+            }
+          : {
+              kind: "transport",
+              code: "connection_timeout",
+              message: "Could not establish a current daemon session",
+            };
       }
       if (!(this.store.daemonFeatures ?? []).includes(feature)) {
         return {
@@ -7795,7 +7840,7 @@ export class Bridge {
   }
   pdfGrabAvailable(): boolean {
     return (
-      this.store.connectionStatus === "connected" &&
+      this.daemonNegotiated() &&
       this.deps.downloads.onDeterminingFilename !== undefined &&
       (this.store.daemonFeatures ?? []).includes(PDF_GRAB_FEATURE) &&
       (this.store.daemonFeatures ?? []).includes(EFFECT_PERMIT_FEATURE)
@@ -8171,7 +8216,7 @@ export class Bridge {
     }>
   > {
     const v2Available =
-      this.store.connectionStatus === "connected" &&
+      this.daemonNegotiated() &&
       (this.store.daemonFeatures ?? []).includes(PAGE_BULK_COHORT_V2_FEATURE);
     if (!v2Available) {
       const keys = request.canonical_keys.slice(0, 50);
@@ -9060,6 +9105,7 @@ export class Bridge {
     this.port = port;
     this.portGeneration += 1;
     this.helloAckGeneration = -1;
+    this.helloDeniedGeneration = -1;
     this.helloSentGeneration = -1;
     this.helloRequestID = undefined;
     this.triagePendingCount = undefined;
@@ -11634,6 +11680,9 @@ export class Bridge {
         }));
         await this.syncConnectionBadge(connectionStatus);
         this.helloAckGeneration = this.portGeneration;
+        // A claim can seat this session after it was refused; the ack arrives
+        // on the same port, so the refusal must stop shortcutting requests.
+        this.helloDeniedGeneration = -1;
         this.keepaliveManager?.notifyConfiguredOriginsChanged();
         if (features.includes(INSTITUTIONAL_MATERIALIZATION_FEATURE)) {
           // Inbound frames are serialized. Reconciliation sends correlated
@@ -11732,6 +11781,26 @@ export class Bridge {
             connectionStatus: "extension_outdated",
           }));
           await this.syncConnectionBadge("extension_outdated");
+        }
+        // The daemon is reachable and healthy; another browser holds its
+        // offer/handoff flow. Reporting that as "daemon isn't reachable" sent
+        // the researcher to `papio daemon status`, which answers "ok".
+        if (msg.payload.code === "session_busy") {
+          if (
+            this.helloSentGeneration === this.portGeneration &&
+            this.helloAckGeneration !== this.portGeneration
+          ) {
+            // This refusal IS the answer to our hello. Release every waiter
+            // now; the port stays open and keeps polling, so a later
+            // `papio browser use` still arrives as an ack on this session.
+            this.helloDeniedGeneration = this.portGeneration;
+            this.settleHelloWaiters(false);
+          }
+          await this.update((s) => ({
+            ...s,
+            connectionStatus: "session_elsewhere",
+          }));
+          await this.syncConnectionBadge("session_elsewhere");
         }
         return;
       default:
@@ -15992,7 +16061,7 @@ export class Bridge {
       owner.job_id,
     );
     if (
-      this.store.connectionStatus === "connected" &&
+      this.daemonNegotiated() &&
       (this.store.daemonFeatures ?? []).includes(DELIVERY_CONTEXT_FEATURE)
     ) {
       this.send(

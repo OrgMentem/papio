@@ -464,6 +464,19 @@ test("migration preserves safe identity, download, lease, daemon, origin, and UI
   expect(migrated.handoffGroupID).toBe(88);
 });
 
+test("migration keeps a refused session status and still drops an unknown one", () => {
+  // Survives a worker restart: the popup band would otherwise reopen claiming
+  // the daemon is unreachable in a browser that is merely not the holder.
+  expect(
+    migrateManagedState({ activeJobs: [], connectionStatus: "session_elsewhere" })
+      .connectionStatus,
+  ).toBe("session_elsewhere");
+  expect(
+    migrateManagedState({ activeJobs: [], connectionStatus: "holder" })
+      .connectionStatus,
+  ).toBe("disconnected");
+});
+
 test("malformed and unknown future versions fail closed without browser-side effects", () => {
   expect(migrateManagedState(null)).toEqual(emptyStore());
   expect(

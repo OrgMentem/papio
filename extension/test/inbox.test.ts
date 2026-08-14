@@ -1224,6 +1224,40 @@ test("a structured broker rejection renders inline and never fakes a disconnect"
   expect(page.document.getElementById("connection-status")?.textContent).toContain("Disconnected");
 });
 
+test("a session held by another browser is not reported as a lost connection", async () => {
+  // The snapshot read is holder-independent in the daemon, but this browser is
+  // negotiated for nothing until it is claimed. Calling that "Disconnected …
+  // Reconnecting automatically — run papio status" sent the researcher hunting
+  // a daemon that was answering the whole time.
+  const fixture = snapshot([manualAction("action:busy", 1, "Manual action")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  let refuse = false;
+  const page = await inboxDocument((message) => {
+    if (refuse && message.type === "papio.triage.snapshot") {
+      return {
+        ok: false,
+        error: {
+          code: "session_busy",
+          message: "Another browser holds the papio session; run 'papio browser use --latest' to move it here",
+        },
+      };
+    }
+    return snapshotReply(fixture, message);
+  });
+
+  refuse = true;
+  page.document.getElementById("refresh-inbox")?.click();
+  await settle();
+
+  const banner = page.document.getElementById("connection-status");
+  expect(banner?.hidden).toBe(false);
+  expect(banner?.textContent).toBe(
+    "Not this browser: Another browser holds the papio session; run 'papio browser use --latest' to move it here The inbox reconnects by itself once it does.",
+  );
+  expect(banner?.textContent).not.toContain("papio status");
+});
+
 test("the filter narrows visible items, keeps counts intact, and reports a distinct empty state", async () => {
   const fixture = snapshot([
     watchHit("hit:one", 1, "Attention and memory"),

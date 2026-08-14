@@ -519,6 +519,25 @@ test("renders actionable daemon problems without routine version diagnostics", (
   expect(doc.getElementById("daemon-footer")).toBeNull();
 });
 
+test("a session held by another browser is not reported as an unreachable daemon", () => {
+  const doc = popupDocument();
+  renderDaemonStatus(doc, { connectionStatus: "session_elsewhere", daemonVersion: "0.21.0" });
+  const card = doc.getElementById("daemon-status");
+  expect(card?.hidden).toBe(false);
+  // `papio daemon status` answers "ok" here, so it must not be the advice.
+  expect(doc.getElementById("daemon-status-message")?.textContent).toBe(
+    "another browser is holding your papio session — this one gets no papers until you switch it",
+  );
+  expect(doc.getElementById("daemon-status-hint")?.textContent).toBe("run: papio browser use --latest");
+
+  // The pulse band stays the daemon band's story, and says which one it is.
+  renderWorkPulse(doc, undefined, "session_elsewhere", Date.now());
+  expect(doc.getElementById("popup-pulse")?.hidden).toBe(true);
+  expect(derivePulseDisplay(undefined, "session_elsewhere").primaryText).toBe(
+    "Can't tell — another browser holds the papio session",
+  );
+});
+
 test("shows the DOI acquire icon with its tooltip even without a negotiated daemon", async () => {
   const doc = popupDocument();
   let calls = 0;

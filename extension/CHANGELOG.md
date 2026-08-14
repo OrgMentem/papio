@@ -14,6 +14,24 @@ History before 0.3.1 was recorded in the root `CHANGELOG.md` (the extension
 and daemon shared a version stream through 0.3.0); see its `[0.3.0]` section
 for the full pre-split extension history.
 
+## [Unreleased]
+
+### Fixed
+- **A browser that is not the session holder no longer claims the daemon is
+  unreachable.** With the extension enabled in two browsers, the one waiting
+  its turn showed *papio daemon isn't reachable — run: papio daemon status*,
+  which answers *ok*, and its inbox promised an automatic reconnect that could
+  never happen. A `session_busy` refusal is now its own state: the popup names
+  the situation and the single command that moves the session
+  (`papio browser use --latest`), the toolbar tooltip says another browser
+  holds the session, the inbox says which browser has it, and the options
+  footer reports the daemon as reachable. The refusal is also treated as a
+  settled answer rather than a slow one, so popup and inbox reads in a waiting
+  browser fail immediately instead of after the five-second hello wait.
+  A browser demoted by `papio browser use` reports the same state as soon as
+  the daemon tells it, and keeps every capability it negotiated — holdership
+  gates offers and handoffs, not page acquisition or inbox reads.
+
 ## [0.14.0] - 2026-08-14
 
 ### Added

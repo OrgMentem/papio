@@ -172,8 +172,11 @@ failure page for you and the job stays parked.
 ## Two browsers fight over *papio*
 
 With the extension enabled in more than one browser or profile, only one
-browser holds the offer/handoff flow; the others wait as pending and their
-popups may look idle. Symptoms: handoff tabs open in the "wrong" browser, or
+browser holds the offer/handoff flow. A browser that is not the holder says so
+in its popup — *another browser is holding your papio session* — and its
+toolbar icon shows a grey `!`. That is not a daemon problem: `papio daemon
+status` answers *ok*, and the remedy is switching the session, not restarting
+anything. Other symptoms: handoff tabs open in the "wrong" browser, or
 `doctor` reports "N other browser(s) waiting".
 
 ```sh
@@ -184,8 +187,11 @@ papio browser use <session-id>  # or pick one explicitly
 
 Quitting the holding browser releases the session immediately; a crashed
 holder yields within about ten seconds. If you never want a browser to hold
-the session, disable the *papio* extension there. Page acquisition and the inbox
-keep working from every connected browser either way.
+the session, disable the *papio* extension there. Until a waiting browser is
+given the session, its popup and inbox only report which browser has it: the
+daemon negotiates page acquisition and the inbox with the browser it
+acknowledged, and it acknowledges one at a time. Both surfaces resume by
+themselves in the browser you claim.
 
 ## Read `doctor` output
 

@@ -419,6 +419,14 @@ async function renderDaemonFooter(): Promise<void> {
     case "extension_outdated":
       renderPapio(footer, `${prefix}daemon connected (extension outdated)`);
       return;
+    case "session_elsewhere":
+      renderPapio(
+        footer,
+        typeof daemon.daemonVersion === "string" && daemon.daemonVersion.length > 0
+          ? `${prefix}daemon v${daemon.daemonVersion} (another browser holds the papio session)`
+          : `${prefix}daemon reachable (another browser holds the papio session)`,
+      );
+      return;
     case "disconnected":
       renderPapio(footer, `${prefix}daemon not connected`);
       return;

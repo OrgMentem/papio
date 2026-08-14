@@ -16,6 +16,13 @@ execution records kept during the initial build.
   recognizes the lease-releasing state as success, while a wrong owner on
   active work still fails closed.
 
+- **A browser demoted by `papio browser use` is told once.** Claiming the
+  session moved the offer/handoff flow without the previous holder's extension
+  ever hearing about it, so that browser kept reporting a live *papio*
+  connection while receiving no work. Its next poll now carries the same
+  `session_busy` frame a refused hello gets, which the extension renders as
+  the browser that holds the session instead of a healthy connection.
+
 ## [0.21.0] - 2026-08-14
 
 ### Added

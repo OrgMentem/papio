@@ -394,6 +394,22 @@ There is also a link check, because `zensical build` prints a broken link as an
   the daemon log), and offers/captures route **only** to the holder, so a harness can
   silently steal the user's session. `papio browser use <id-prefix>` pins a chosen session
   (the demoted one stays pending and keeps polling); `papio browser sessions` lists them.
+- **A refused hello is never acked, so a pending browser is negotiated for nothing —
+  and `session_busy` is the extension's ONLY holdership signal.** `handleHello` answers a
+  denied hello with one `session_busy` error frame and no `hello_ack`, so that session has
+  no `daemonFeatures`: every feature-gated surface in it (pulse, inbox, page acquire,
+  captures) is refused **locally** by the extension even though `bridge.go`'s non-holder
+  whitelist would serve the reads. Do not read that as a daemon bug, and do not "fix" it by
+  acking a pending session without a role field — an ack is what makes the extension start
+  holder work (materialization, effect retries, offers) the daemon will then refuse.
+  The extension maps that frame to its `session_elsewhere` display state (never
+  `disconnected`: `papio daemon status` answers *ok*, which is the dead end this replaced)
+  and treats it as a settled answer, so requests fail fast instead of burning the 5s hello
+  wait. A **claim-demoted** holder keeps its features and only loses offers/handoffs, so
+  `daemonNegotiated()` — not `connectionStatus === "connected"` — gates capabilities; it
+  learns it was demoted from the one-shot `demotedNotice` frame `Sync` sends after
+  `promote()`, because a hello-time takeover drops the old holder (next poll →
+  `expected_hello`) while a claim leaves it polling happily in the dark.
 - **Read a refused capture precisely.** `busy` = the holder's handoff drive slots are
   occupied by real work; `not_permitted` = the provider host grant is missing;
   `nav_failed: browser session disconnected …` = the transport teardown above, not a

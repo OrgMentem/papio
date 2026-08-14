@@ -16,6 +16,7 @@ const base: BadgeState = {
 test("computeBadge follows the documented operator-signal precedence", () => {
   const cases: Array<[string, Partial<BadgeState>, { text: string; color: string }]> = [
     ["disconnected", { connectionStatus: "disconnected", reauthNeeded: true, authBlockers: 2 }, { text: "!", color: "#777777" }],
+    ["session elsewhere", { connectionStatus: "session_elsewhere", reauthNeeded: true, authBlockers: 2 }, { text: "!", color: "#777777" }],
     ["reauth", { reauthNeeded: true, authBlockers: 2, blockedHosts: ["provider.example.edu"], triageCount: 4 }, { text: "!", color: "#b06000" }],
     ["sign-in blockers", { authBlockers: 2, blockedHosts: ["provider.example.edu"], triageCount: 4 }, { text: "2", color: "#b06000" }],
     ["blocked hosts", { blockedHosts: ["provider.example.edu"], ungrantedResolvers: 2, triageCount: 4 }, { text: "1", color: "#b06000" }],
@@ -27,6 +28,17 @@ test("computeBadge follows the documented operator-signal precedence", () => {
   for (const [label, patch, expected] of cases) {
     expect(computeBadge({ ...base, ...patch }), label).toMatchObject(expected);
   }
+});
+
+test("computeBadge separates a refused session from an unreachable daemon", () => {
+  // Same grey "!" shape, different story: the tooltip is the only place the
+  // researcher learns the daemon is fine and the session is in another browser.
+  expect(computeBadge({ ...base, connectionStatus: "session_elsewhere" }).tooltip).toBe(
+    "papio: another browser holds the papio session",
+  );
+  expect(computeBadge({ ...base, connectionStatus: "disconnected" }).tooltip).toBe(
+    "papio: daemon disconnected",
+  );
 });
 
 test("computeBadge uses required turns only for a complete counts v3 projection", () => {

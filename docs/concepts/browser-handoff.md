@@ -120,8 +120,10 @@ others wait, visibly, instead of silently taking over:
   ten seconds.
 - `papio doctor` and `papio status` report when other browsers are waiting.
 
-Clicking **Acquire this page** and using the inbox work from any connected
-browser regardless of which one holds the handoff flow.
+A browser that is not the holder says so in its popup and points at
+`papio browser use`; the daemon negotiates **Acquire this page** and the inbox
+with the browser whose session it acknowledged, so both return in whichever
+browser you hand the session to.
 
 ## The inbox stays current
 
