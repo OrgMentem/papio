@@ -81,6 +81,10 @@ for the full pre-split extension history.
   row while other origins remain usable.
   The catch-up setting's label and explanation now stack instead of running
   together on one line.
+- **Manual-download actions use an unambiguous label.** The inbox now says
+  **Open link** instead of **Open source**, avoiding both open-source and
+  open-access readings while keeping **Open tab** reserved for focusing an
+  existing *papio* handoff tab.
 - **Repeated handoffs no longer stack duplicate tabs.** After a service-worker
   restart the extension recovers the job's existing broker tab from its
   durable ledger instead of opening another copy for every re-offer.

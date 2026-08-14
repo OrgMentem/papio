@@ -1000,10 +1000,11 @@ function previewButton(item: TriageSnapshotItem): HTMLButtonElement | null {
   return button;
 }
 
-
 function operationOpenLabel(item: TriageSnapshotItem): string {
   if (item.kind === "watch_hit") return "Open result";
-  if (item.kind === "human_action" && item.action_kind === "manual_download") return "Open source";
+  // Manual download opens the item's first safe link; "Open tab" is reserved
+  // for focusing an existing papio handoff tab.
+  if (item.kind === "human_action" && item.action_kind === "manual_download") return "Open link";
   if (item.kind === "human_action" && item.action_kind === "openurl_handoff") {
     return item.requires_auth === true ? "Sign in" : "Open page";
   }

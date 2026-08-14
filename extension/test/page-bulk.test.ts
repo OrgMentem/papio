@@ -27,6 +27,33 @@ async function settle(): Promise<void> {
   for (let iteration = 0; iteration < 16; iteration += 1) await Promise.resolve();
 }
 
+/** Orphan the previous fixture's module instance before this one takes over.
+ *
+ * page-bulk starts un-awaited chains (loadStatus, loadAllowlist) whose
+ * continuations can outlive the previous test's final settle(). Because the
+ * module reads `chrome` off the global at call time, such a continuation would
+ * otherwise reach the NEXT fixture's stub and push a stray entry into its
+ * request log, failing an unrelated test. Swapping in a quarantine stub and
+ * draining microtasks lets those stragglers finish somewhere harmless. Replies
+ * are deliberately NOT awaited here: several fixtures hold one pending on
+ * purpose to observe in-flight UI state. */
+async function orphanPreviousFixture(): Promise<void> {
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        sendMessage: async () => ({ ok: false, error: { code: "orphaned", message: "fixture retired" } }),
+        onMessage: { addListener: () => {} },
+        getManifest: () => ({ action: { default_popup: "dist/ui/popup.html" } }),
+        getURL: (path: string) => `chrome-extension://test-id/${path}`,
+      },
+      storage: { session: {}, local: {}, onChanged: { addListener: () => {} } },
+      tabs: { update: async () => ({ id: 0, windowId: 0 }) },
+      windows: { get: async () => ({ id: 0, state: "normal" }), update: async () => ({ id: 0 }) },
+    },
+  });
+  await settle();
+}
+
 interface ChromeTestOptions {
   tabsUpdateFails?: boolean;
 }
@@ -43,6 +70,7 @@ async function pageBulkDocument(
   emitRuntimeMessage: (message: unknown) => Promise<void>;
   emitStorageChange: (changes: Record<string, StorageChangeLike>, areaName?: string) => Promise<void>;
 }> {
+  await orphanPreviousFixture();
   const search = scanId !== null ? `?scan=${encodeURIComponent(scanId)}` : "";
   const window = new Window({ url: `https://ext.test/page-bulk.html${search}` });
   window.document.write(readFileSync(new URL("../src/page-bulk.html", import.meta.url), "utf8"));

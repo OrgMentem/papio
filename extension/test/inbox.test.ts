@@ -1861,10 +1861,15 @@ test("uses contextual Open labels for manual, auth handoff, and watch hits", asy
     counts: counts({ pending_total: 4, actions: 3, watch_hits: 1, retractions: 0 }),
   });
   const page = await inboxDocument((message) => snapshotReply(fixture, message));
-  expect(page.document.querySelector("[data-triage-item-id='action:manual'] [data-operation='open']")?.textContent).toBe("Open source");
-  expect(page.document.querySelector("[data-triage-item-id='action:auth'] [data-operation='open']")?.textContent).toBe("Sign in");
-  expect(page.document.querySelector("[data-triage-item-id='action:plain'] [data-operation='open']")?.textContent).toBe("Open page");
-  expect(page.document.querySelector("[data-triage-item-id='hit:one'] [data-operation='open']")?.textContent).toBe("Open result");
+  // "Open source" is barred: it reads as open-source/open-access rather than
+  // "open this paper's link". Each label must also stay distinct per kind.
+  const label = (id: string): string | undefined =>
+    page.document.querySelector(`[data-triage-item-id='${id}'] [data-operation='open']`)?.textContent ?? undefined;
+  expect(label("action:manual")).toBe("Open link");
+  expect(label("action:auth")).toBe("Sign in");
+  expect(label("action:plain")).toBe("Open page");
+  expect(label("hit:one")).toBe("Open result");
+  expect(page.document.body.textContent).not.toMatch(/open source/i);
 });
 
 test("exposes row-focus status tooltips and a 32px debug control", async () => {
