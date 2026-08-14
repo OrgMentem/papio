@@ -360,71 +360,69 @@ func TestSaveValidatesProquestAccountID(t *testing.T) {
 	}
 }
 
-func TestZotioAutoImportDefaultsOffAndLoadsTrue(t *testing.T) {
-	if Default().Zotio.AutoImport {
-		t.Fatal("default zotio.auto_import = true, want false")
+// TestBooleanConfigDefaultsAndToggles collapses four boolean default/toggle
+// checks that share an identical shape: assert the default of one boolean
+// config field, write a TOML snippet that toggles it, load the file, and
+// assert it flipped. Each default is a deliberate product decision —
+//
+//	zotio.auto_import off (import requires explicit opt-in),
+//	zotio.auto_enrich on (enrichment is expected by default),
+//	notify.enabled on (users expect notifications unless disabled),
+//	updates.check off (update checks are opt-in) —
+//
+// and the toggle leg proves strict TOML decoding actually reaches the field.
+// Because decoding is strict (unknown fields are rejected), each TOML snippet
+// must contain only the real table/field name — copied verbatim from the
+// original per-field tests.
+func TestBooleanConfigDefaultsAndToggles(t *testing.T) {
+	tests := []struct {
+		name        string
+		get         func(Config) bool
+		wantDefault bool
+		toml        string
+	}{
+		{
+			name:        "zotio.auto_import defaults off and loads true",
+			get:         func(c Config) bool { return c.Zotio.AutoImport },
+			wantDefault: false,
+			toml:        "access_mode='conservative'\n[zotio]\nauto_import=true\n",
+		},
+		{
+			name:        "zotio.auto_enrich defaults on and loads false",
+			get:         func(c Config) bool { return c.Zotio.AutoEnrich },
+			wantDefault: true,
+			toml:        "access_mode='conservative'\n[zotio]\nauto_enrich=false\n",
+		},
+		{
+			name:        "notify.enabled defaults on and loads false",
+			get:         func(c Config) bool { return c.Notify.Enabled },
+			wantDefault: true,
+			toml:        "access_mode='conservative'\n[notify]\nenabled=false\n",
+		},
+		{
+			name:        "updates.check defaults off and loads true",
+			get:         func(c Config) bool { return c.Updates.Check },
+			wantDefault: false,
+			toml:        "access_mode='conservative'\n[updates]\ncheck=true\n",
+		},
 	}
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[zotio]\nauto_import=true\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cfg.Zotio.AutoImport {
-		t.Fatal("loaded zotio.auto_import = false, want true")
-	}
-}
-
-func TestZotioAutoEnrichDefaultsOnAndLoadsFalse(t *testing.T) {
-	if !Default().Zotio.AutoEnrich {
-		t.Fatal("default zotio.auto_enrich = false, want true")
-	}
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[zotio]\nauto_enrich=false\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Zotio.AutoEnrich {
-		t.Fatal("loaded zotio.auto_enrich = true, want false")
-	}
-}
-
-func TestNotifyDefaultsOnAndLoadsFalse(t *testing.T) {
-	if !Default().Notify.Enabled {
-		t.Fatal("default notify.enabled = false, want true")
-	}
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[notify]\nenabled=false\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Notify.Enabled {
-		t.Fatal("loaded notify.enabled = true, want false")
-	}
-}
-
-func TestUpdatesCheckDefaultsOffAndLoadsTrue(t *testing.T) {
-	if Default().Updates.Check {
-		t.Fatal("default updates.check = true, want false")
-	}
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[updates]\ncheck=true\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cfg.Updates.Check {
-		t.Fatal("loaded updates.check = false, want true")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.get(Default()); got != test.wantDefault {
+				t.Fatalf("default %s = %v, want %v", test.name, got, test.wantDefault)
+			}
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(test.toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := test.get(cfg); got == test.wantDefault {
+				t.Fatalf("loaded %s = %v, want %v", test.name, got, !test.wantDefault)
+			}
+		})
 	}
 }
 

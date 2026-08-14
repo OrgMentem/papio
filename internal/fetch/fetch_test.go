@@ -430,41 +430,43 @@ func TestOnlyLoopbackHTTPIsAllowedByLocalDevelopmentOption(t *testing.T) {
 	}
 }
 
-func TestCredentialsAreStrippedWhenOnlyPortChanges(t *testing.T) {
-	var second *http.Request
-	d := testDownloader(t, publicResolver(nil), roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Port() == "" {
-			return response(http.StatusFound, "", map[string]string{"Location": "https://papers.example:8443/file"}), nil
-		}
-		second = req.Clone(req.Context())
-		return response(http.StatusOK, "%PDF-1.7", nil), nil
-	}))
-	req, _ := http.NewRequest(http.MethodGet, "https://papers.example/file", nil)
-	req.Header.Set("Authorization", "Bearer secret")
-	if _, err := d.DownloadRequest(context.Background(), req, filepath.Join(t.TempDir(), "x")); err != nil {
-		t.Fatal(err)
+// TestRedirectCredentialsFollowEffectivePort verifies that an Authorization
+// header survives a redirect if and only if the effective port is unchanged.
+// Same host is not enough because a different port is a different origin for
+// credential purposes, and :443 spelled explicitly is the same effective port
+// as an omitted port on https (so credentials must be preserved for 443 but
+// stripped when the port changes, e.g. to 8443).
+func TestRedirectCredentialsFollowEffectivePort(t *testing.T) {
+	tests := []struct {
+		name           string
+		redirectPort   string
+		wantAuthHeader string
+	}{
+		{name: "stripped when port changes to 8443", redirectPort: "8443", wantAuthHeader: ""},
+		{name: "preserved when redirect spells default port 443", redirectPort: "443", wantAuthHeader: "Bearer secret"},
 	}
-	if second == nil || second.Header.Get("Authorization") != "" {
-		t.Fatal("authorization survived a cross-port redirect")
-	}
-}
-
-func TestCredentialsSurviveDefaultPortRedirect(t *testing.T) {
-	var second *http.Request
-	d := testDownloader(t, publicResolver(nil), roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Port() == "" {
-			return response(http.StatusFound, "", map[string]string{"Location": "https://papers.example:443/file"}), nil
-		}
-		second = req.Clone(req.Context())
-		return response(http.StatusOK, "%PDF-1.7", nil), nil
-	}))
-	req, _ := http.NewRequest(http.MethodGet, "https://papers.example/file", nil)
-	req.Header.Set("Authorization", "Bearer secret")
-	if _, err := d.DownloadRequest(context.Background(), req, filepath.Join(t.TempDir(), "x")); err != nil {
-		t.Fatal(err)
-	}
-	if second == nil || second.Header.Get("Authorization") != "Bearer secret" {
-		t.Fatal("authorization was stripped on a same-origin default-port redirect")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var second *http.Request
+			d := testDownloader(t, publicResolver(nil), roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Port() == "" {
+					return response(http.StatusFound, "", map[string]string{"Location": "https://papers.example:" + test.redirectPort + "/file"}), nil
+				}
+				second = req.Clone(req.Context())
+				return response(http.StatusOK, "%PDF-1.7", nil), nil
+			}))
+			req, _ := http.NewRequest(http.MethodGet, "https://papers.example/file", nil)
+			req.Header.Set("Authorization", "Bearer secret")
+			if _, err := d.DownloadRequest(context.Background(), req, filepath.Join(t.TempDir(), "x")); err != nil {
+				t.Fatal(err)
+			}
+			if second == nil {
+				t.Fatal("no second request captured")
+			}
+			if got := second.Header.Get("Authorization"); got != test.wantAuthHeader {
+				t.Fatalf("Authorization = %q, want %q (redirectPort=%s)", got, test.wantAuthHeader, test.redirectPort)
+			}
+		})
 	}
 }
 

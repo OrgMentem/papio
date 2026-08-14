@@ -182,25 +182,30 @@ func doiWork(requestID, doi string) protocol.WorkRequest {
 	}
 }
 
-func TestSubmitDefaultsCollectionToLabelWhenUnset(t *testing.T) {
-	caller := &collectionBatchCaller{}
-	work := doiWork("batch-collection-default", "10.1000/collection")
-	if _, err := Submit(context.Background(), caller, t.TempDir(), []protocol.WorkRequest{work}, SubmitOptions{Label: "evidence synthesis"}); err != nil {
-		t.Fatal(err)
+// An unset collection falls back to the batch's label so imported papers are
+// filed under the search that produced them instead of landing loose in the
+// library root; an explicit collection always wins.
+func TestSubmitCollectionFallsBackToLabel(t *testing.T) {
+	tests := []struct {
+		name       string
+		label      string
+		collection string
+		want       string
+	}{
+		{name: "collection unset falls back to label", label: "evidence synthesis", collection: "", want: "evidence synthesis"},
+		{name: "explicit collection wins over label", label: "evidence synthesis", collection: "Reading", want: "Reading"},
 	}
-	if len(caller.collections) != 1 || caller.collections[0] != "evidence synthesis" {
-		t.Fatalf("submitted collections = %q, want [evidence synthesis]", caller.collections)
-	}
-}
-
-func TestSubmitKeepsExplicitCollectionOverLabel(t *testing.T) {
-	caller := &collectionBatchCaller{}
-	work := doiWork("batch-collection-explicit", "10.1000/explicit")
-	if _, err := Submit(context.Background(), caller, t.TempDir(), []protocol.WorkRequest{work}, SubmitOptions{Label: "evidence synthesis", Collection: "Reading"}); err != nil {
-		t.Fatal(err)
-	}
-	if len(caller.collections) != 1 || caller.collections[0] != "Reading" {
-		t.Fatalf("submitted collections = %q, want [Reading]", caller.collections)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			caller := &collectionBatchCaller{}
+			work := doiWork("batch-collection", "10.1000/collection")
+			if _, err := Submit(context.Background(), caller, t.TempDir(), []protocol.WorkRequest{work}, SubmitOptions{Label: test.label, Collection: test.collection}); err != nil {
+				t.Fatal(err)
+			}
+			if len(caller.collections) != 1 || caller.collections[0] != test.want {
+				t.Fatalf("submitted collections = %q, want [%s]", caller.collections, test.want)
+			}
+		})
 	}
 }
 

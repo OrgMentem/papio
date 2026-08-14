@@ -1688,133 +1688,104 @@ func TestOfferedDeliveryRecoveryCapsTransportFailures(t *testing.T) {
 	}
 }
 
-func TestOfferedDeliveryRecoveryProfileMismatchGetsDurableDisposition(t *testing.T) {
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://example.edu/request")
-	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
+// TestOfferedDeliveryRecoveryDurableDispositions verifies that a stale or
+// mismatched gate disposition discovered during recovery must surface a human
+// action and leave the request Offered — never silently re-offer or settle it.
+func TestOfferedDeliveryRecoveryDurableDispositions(t *testing.T) {
+	tests := []struct {
+		name string
+		seed func(t *testing.T, svc *Service, jobs *job.Store, deliverySvc *delivery.Service) (string, *delivery.Request)
+	}{
+		{
+			name: "changed_gate_profile_digest",
+			seed: func(t *testing.T, svc *Service, jobs *job.Store, deliverySvc *delivery.Service) (string, *delivery.Request) {
+				t.Helper()
+				ctx := context.Background()
+				if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+					t.Fatal(err)
+				}
+				id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_profile_mismatch", "10.1000/offered-recovery-profile-mismatch"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := seedOfferedRecovery(t, jobs, deliverySvc, id, "changed-profile", "illiad", profile.Digest())
+				return id, req
+			},
+		},
+		{
+			name: "nil_document_delivery_config",
+			seed: func(t *testing.T, svc *Service, jobs *job.Store, deliverySvc *delivery.Service) (string, *delivery.Request) {
+				t.Helper()
+				ctx := context.Background()
+				id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_missing_config", "10.1000/offered-recovery-missing-config"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				invalidProfile := delivery.CompileGateProfile(config.Institution{}, "default")
+				req := seedOfferedRecovery(t, jobs, deliverySvc, id, "default", "illiad", invalidProfile.Digest())
+				svc.Config.Browser.DocumentDelivery = nil
+				return id, req
+			},
+		},
+		{
+			name: "changed_provider_kind",
+			seed: func(t *testing.T, svc *Service, jobs *job.Store, deliverySvc *delivery.Service) (string, *delivery.Request) {
+				t.Helper()
+				ctx := context.Background()
+				id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_provider_change", "10.1000/offered-recovery-provider-change"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				svc.Config.Browser.DocumentDelivery = &config.DocumentDelivery{
+					Kind: "openurl", BaseURL: "https://example.edu/request", SubmitPolicy: "prefill_only",
+				}
+				changedProfile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := seedOfferedRecovery(t, jobs, deliverySvc, id, "default", "illiad", changedProfile.Digest())
+				return id, req
+			},
+		},
 	}
-	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_profile_mismatch", "10.1000/offered-recovery-profile-mismatch"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := seedOfferedRecovery(t, jobs, deliverySvc, id, "changed-profile", "illiad", profile.Digest())
-	for range 2 {
-		if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	gotJob, err := jobs.Get(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotJob.State != job.StateAwaitingHuman {
-		t.Fatalf("profile-mismatch job state = %q, want awaiting_human", gotJob.State)
-	}
-	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
-		t.Fatalf("profile-mismatch actions = %+v, want one document_delivery action", actions)
-	}
-	got, err := deliverySvc.Get(ctx, req.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != delivery.StateOffered {
-		t.Fatalf("profile-mismatch request = %+v, want offered with durable disposition", got)
-	}
-}
-
-func TestOfferedDeliveryRecoveryMissingConfigGetsDurableDisposition(t *testing.T) {
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://example.edu/request")
-	ctx := context.Background()
-	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_missing_config", "10.1000/offered-recovery-missing-config"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalidProfile := delivery.CompileGateProfile(config.Institution{}, "default")
-	req := seedOfferedRecovery(t, jobs, deliverySvc, id, "default", "illiad", invalidProfile.Digest())
-	svc.Config.Browser.DocumentDelivery = nil
-	for range 2 {
-		if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	gotJob, err := jobs.Get(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotJob.State != job.StateAwaitingHuman {
-		t.Fatalf("missing-config job state = %q, want awaiting_human", gotJob.State)
-	}
-	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
-		t.Fatalf("missing-config actions = %+v, want one document_delivery action", actions)
-	}
-	got, err := deliverySvc.Get(ctx, req.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != delivery.StateOffered {
-		t.Fatalf("missing-config request = %+v, want offered with durable disposition", got)
-	}
-}
-
-func TestOfferedDeliveryRecoveryProviderKindChangeGetsDurableDisposition(t *testing.T) {
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://example.edu/request")
-	ctx := context.Background()
-	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_provider_change", "10.1000/offered-recovery-provider-change"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc.Config.Browser.DocumentDelivery = &config.DocumentDelivery{
-		Kind: "openurl", BaseURL: "https://example.edu/request", SubmitPolicy: "prefill_only",
-	}
-	changedProfile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := seedOfferedRecovery(t, jobs, deliverySvc, id, "default", "illiad", changedProfile.Digest())
-	for range 2 {
-		if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	gotJob, err := jobs.Get(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotJob.State != job.StateAwaitingHuman {
-		t.Fatalf("provider-change job state = %q, want awaiting_human", gotJob.State)
-	}
-	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
-		t.Fatalf("provider-change actions = %+v, want one document_delivery action", actions)
-	}
-	got, err := deliverySvc.Get(ctx, req.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != delivery.StateOffered {
-		t.Fatalf("provider-change request = %+v, want offered with durable disposition", got)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			svc, jobs, deliverySvc := newDeliveryTestService(t)
+			svc.Delivery = deliverySvc
+			svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://example.edu/request")
+			ctx := context.Background()
+			id, req := test.seed(t, svc, jobs, deliverySvc)
+			for range 2 {
+				if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gotJob, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotJob.State != job.StateAwaitingHuman {
+				t.Fatalf("%s: job state = %q, want awaiting_human", test.name, gotJob.State)
+			}
+			actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+				t.Fatalf("%s: actions = %+v, want one document_delivery action", test.name, actions)
+			}
+			got, err := deliverySvc.Get(ctx, req.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != delivery.StateOffered {
+				t.Fatalf("%s: request = %+v, want offered with durable disposition", test.name, got)
+			}
+		})
 	}
 }
 

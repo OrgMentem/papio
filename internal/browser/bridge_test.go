@@ -1264,40 +1264,73 @@ func breakTriage(t *testing.T, b *Bridge) {
 	}
 }
 
-// A raw Go error from triageCounts would propagate through Sync into the
-// native host's fatal error path (internal/nativehost/host.go), tearing down
-// the whole native-messaging session over a routine, recoverable failure.
-func TestTriageCountsUnconfiguredReportsErrorFrameNotFatal(t *testing.T) {
-	b, _, _, _ := newBridge(t)
-	b.triage = nil
-	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageCountsRequest, "",
-		protocol.TriageCountsRequestPayload{RequestID: "request-count-002"}))
-	errFrame := firstOfType(msgs, protocol.MsgError)
-	if errFrame == nil {
-		t.Fatalf("no error frame for unconfigured triage service: %v", msgs)
+// A raw Go error from triageCounts or stats would propagate through Sync into
+// the native host's fatal error path (internal/nativehost/host.go), tearing
+// down the whole native-messaging session over a routine, recoverable failure.
+// The bridge must answer with a protocol error frame instead, so the
+// extension keeps polling.
+func TestReadModelFailureReportsErrorFrameNotFatal(t *testing.T) {
+	tests := []struct {
+		name          string
+		setup         func(t *testing.T, b *Bridge)
+		requestType   string
+		payload       any
+		forbiddenType string
+		requestLabel  string
+		failureLabel  string
+	}{
+		{
+			name:          "triage_counts_unconfigured",
+			setup:         func(t *testing.T, b *Bridge) { b.triage = nil },
+			requestType:   protocol.MsgTriageCountsRequest,
+			payload:       protocol.TriageCountsRequestPayload{RequestID: "request-count-002"},
+			forbiddenType: protocol.MsgTriageCountsResponse,
+			requestLabel:  "an unconfigured triage_counts_request",
+			failureLabel:  "unconfigured triage service",
+		},
+		{
+			name:          "triage_counts_failing_query",
+			setup:         breakTriage,
+			requestType:   protocol.MsgTriageCountsRequest,
+			payload:       protocol.TriageCountsRequestPayload{RequestID: "request-count-003"},
+			forbiddenType: protocol.MsgTriageCountsResponse,
+			requestLabel:  "a failing triage_counts_request",
+			failureLabel:  "a failing triage counts query",
+		},
+		{
+			name:          "stats_unconfigured",
+			setup:         func(t *testing.T, b *Bridge) { b.triage = nil },
+			requestType:   protocol.MsgStatsRequest,
+			payload:       protocol.StatsRequestPayload{RequestID: "request-stats-002"},
+			forbiddenType: protocol.MsgStatsResponse,
+			requestLabel:  "an unconfigured stats_request",
+			failureLabel:  "unconfigured stats service",
+		},
+		{
+			name:          "stats_failing_query",
+			setup:         breakTriage,
+			requestType:   protocol.MsgStatsRequest,
+			payload:       protocol.StatsRequestPayload{RequestID: "request-stats-003"},
+			forbiddenType: protocol.MsgStatsResponse,
+			requestLabel:  "a failing stats_request",
+			failureLabel:  "a failing stats query",
+		},
 	}
-	if countType(msgs, protocol.MsgTriageCountsResponse) != 0 {
-		t.Fatalf("triage_counts_response emitted despite unconfigured triage service: %v", msgs)
-	}
-	if poll, _ := runSync(t, b); firstOfType(poll, protocol.MsgError) != nil {
-		t.Fatalf("session did not survive an unconfigured triage_counts_request: %v", poll)
-	}
-}
-
-func TestTriageCountsQueryFailureReportsErrorFrameNotFatal(t *testing.T) {
-	b, _, _, _ := newBridge(t)
-	breakTriage(t, b)
-	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageCountsRequest, "",
-		protocol.TriageCountsRequestPayload{RequestID: "request-count-003"}))
-	errFrame := firstOfType(msgs, protocol.MsgError)
-	if errFrame == nil {
-		t.Fatalf("no error frame for a failing triage counts query: %v", msgs)
-	}
-	if countType(msgs, protocol.MsgTriageCountsResponse) != 0 {
-		t.Fatalf("triage_counts_response emitted despite a failing query: %v", msgs)
-	}
-	if poll, _ := runSync(t, b); firstOfType(poll, protocol.MsgError) != nil {
-		t.Fatalf("session did not survive a failing triage_counts_request: %v", poll)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			b, _, _, _ := newBridge(t)
+			test.setup(t, b)
+			msgs, _ := runSync(t, b, hello(), inFrame(t, test.requestType, "", test.payload))
+			if firstOfType(msgs, protocol.MsgError) == nil {
+				t.Fatalf("no error frame for %s: %v", test.failureLabel, msgs)
+			}
+			if countType(msgs, test.forbiddenType) != 0 {
+				t.Fatalf("%s emitted despite %s: %v", test.forbiddenType, test.failureLabel, msgs)
+			}
+			if poll, _ := runSync(t, b); firstOfType(poll, protocol.MsgError) != nil {
+				t.Fatalf("session did not survive %s: %v", test.requestLabel, poll)
+			}
+		})
 	}
 }
 
@@ -1400,43 +1433,6 @@ func TestStatsResponseReflectsAcquisitionAggregates(t *testing.T) {
 	}
 	if total != 1 {
 		t.Fatalf("series total = %d, want 1", total)
-	}
-}
-
-// A raw Go error from stats would propagate through Sync into the native
-// host's fatal error path (internal/nativehost/host.go), tearing down the
-// whole native-messaging session over a routine, recoverable failure.
-func TestStatsUnconfiguredReportsErrorFrameNotFatal(t *testing.T) {
-	b, _, _, _ := newBridge(t)
-	b.triage = nil
-	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgStatsRequest, "",
-		protocol.StatsRequestPayload{RequestID: "request-stats-002"}))
-	errFrame := firstOfType(msgs, protocol.MsgError)
-	if errFrame == nil {
-		t.Fatalf("no error frame for unconfigured triage service: %v", msgs)
-	}
-	if countType(msgs, protocol.MsgStatsResponse) != 0 {
-		t.Fatalf("stats_response emitted despite unconfigured triage service: %v", msgs)
-	}
-	if poll, _ := runSync(t, b); firstOfType(poll, protocol.MsgError) != nil {
-		t.Fatalf("session did not survive an unconfigured stats_request: %v", poll)
-	}
-}
-
-func TestStatsQueryFailureReportsErrorFrameNotFatal(t *testing.T) {
-	b, _, _, _ := newBridge(t)
-	breakTriage(t, b)
-	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgStatsRequest, "",
-		protocol.StatsRequestPayload{RequestID: "request-stats-003"}))
-	errFrame := firstOfType(msgs, protocol.MsgError)
-	if errFrame == nil {
-		t.Fatalf("no error frame for a failing stats query: %v", msgs)
-	}
-	if countType(msgs, protocol.MsgStatsResponse) != 0 {
-		t.Fatalf("stats_response emitted despite a failing query: %v", msgs)
-	}
-	if poll, _ := runSync(t, b); firstOfType(poll, protocol.MsgError) != nil {
-		t.Fatalf("session did not survive a failing stats_request: %v", poll)
 	}
 }
 
@@ -1741,53 +1737,51 @@ func TestPageAcquireSubmitsNormalizedDOI(t *testing.T) {
 	}
 }
 
-func TestPageAcquireInvalidDOIReturnsErrorWithoutSubmit(t *testing.T) {
-	b, jobs, _, _ := newBridge(t)
-	runSync(t, b, hello())
+func TestPageAcquireRejectedInputReturnsErrorWithoutSubmit(t *testing.T) {
+	tests := []struct {
+		name          string
+		payload       protocol.PageAcquirePayload
+		wantErrSubstr string
+	}{
+		{
+			name: "invalid_doi",
+			payload: protocol.PageAcquirePayload{
+				URL: "https://publisher.example.edu/article/42",
+				DOI: "not-a-doi",
+			},
+			wantErrSubstr: "invalid page DOI",
+		},
+		{
+			name: "missing_doi",
+			payload: protocol.PageAcquirePayload{
+				URL:   "https://publisher.example.edu/article/42",
+				Title: "A DOI-less page",
+			},
+			wantErrSubstr: "page has no DOI",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			runSync(t, b, hello())
 
-	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageAcquire, "", protocol.PageAcquirePayload{
-		URL: "https://publisher.example.edu/article/42",
-		DOI: "not-a-doi",
-	}))
-	ack := firstOfType(msgs, protocol.MsgPageAcquireAck)
-	if ack == nil {
-		t.Fatalf("no page_acquire_ack in %v", msgs)
-	}
-	payload := ack.Payload.(*protocol.PageAcquireAckPayload)
-	if payload.Error == "" || payload.JobID != "" || payload.Duplicate {
-		t.Fatalf("page_acquire_ack = %#v", payload)
-	}
-	var count int
-	if err := jobs.S.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM jobs").Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 0 {
-		t.Fatalf("jobs after invalid page acquire = %d, want 0", count)
-	}
-}
-
-func TestPageAcquireWithoutDOIReturnsErrorWithoutSubmit(t *testing.T) {
-	b, jobs, _, _ := newBridge(t)
-	runSync(t, b, hello())
-
-	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageAcquire, "", protocol.PageAcquirePayload{
-		URL:   "https://publisher.example.edu/article/42",
-		Title: "A DOI-less page",
-	}))
-	ack := firstOfType(msgs, protocol.MsgPageAcquireAck)
-	if ack == nil {
-		t.Fatalf("no page_acquire_ack in %v", msgs)
-	}
-	payload := ack.Payload.(*protocol.PageAcquireAckPayload)
-	if payload.Error != "page has no DOI" || payload.JobID != "" || payload.Duplicate {
-		t.Fatalf("page_acquire_ack = %#v", payload)
-	}
-	var count int
-	if err := jobs.S.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM jobs").Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 0 {
-		t.Fatalf("jobs after DOI-less page acquire = %d, want 0", count)
+			msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageAcquire, "", test.payload))
+			ack := firstOfType(msgs, protocol.MsgPageAcquireAck)
+			if ack == nil {
+				t.Fatalf("no page_acquire_ack in %v", msgs)
+			}
+			payload := ack.Payload.(*protocol.PageAcquireAckPayload)
+			if payload.Error == "" || !strings.Contains(payload.Error, test.wantErrSubstr) || payload.JobID != "" || payload.Duplicate {
+				t.Fatalf("page_acquire_ack = %#v", payload)
+			}
+			var count int
+			if err := jobs.S.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM jobs").Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("jobs after rejected page acquire = %d, want 0", count)
+			}
+		})
 	}
 }
 
@@ -3320,12 +3314,19 @@ func TestDownloadCompleteForLiveJobAdoptsAndAcks(t *testing.T) {
 	}
 }
 
-func TestDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
-	b, jobs, cfg, _ := newBridge(t)
-	id := park(t, jobs, "wr_unblocked_sync", handoffWork())
-	runSync(t, b, hello())
-	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
-
+// assertDownloadValidationDoesNotBlockSessionSync runs one adoption path while
+// validation is blocked and proves a concurrent nil-frame poll still completes.
+func assertDownloadValidationDoesNotBlockSessionSync(
+	t *testing.T,
+	b *Bridge,
+	adoptionNeverValidated string,
+	pollDuringValidation string,
+	syncBlockedOnValidation string,
+	adoptionFailed string,
+	adoptionDidNotFinish string,
+	runAdoption func() error,
+) {
+	t.Helper()
 	validationStarted := make(chan struct{})
 	releaseValidation := make(chan struct{})
 	validationReleased := false
@@ -3345,17 +3346,14 @@ func TestDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
 		}, nil
 	}
 
-	frame := inFrame(t, protocol.MsgDownloadComplete, id,
-		map[string]any{"download_id": 7, "filename": "paper.pdf", "size_bytes": 533})
 	adoptionDone := make(chan error, 1)
 	go func() {
-		_, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{frame})
-		adoptionDone <- err
+		adoptionDone <- runAdoption()
 	}()
 	select {
 	case <-validationStarted:
 	case <-time.After(time.Second):
-		t.Fatal("download adoption never reached validation")
+		t.Fatal(adoptionNeverValidated)
 	}
 
 	pollDone := make(chan error, 1)
@@ -3366,10 +3364,10 @@ func TestDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
 	select {
 	case err := <-pollDone:
 		if err != nil {
-			t.Fatalf("poll during validation: %v", err)
+			t.Fatalf("%s: %v", pollDuringValidation, err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("session sync blocked on download validation")
+		t.Fatal(syncBlockedOnValidation)
 	}
 
 	close(releaseValidation)
@@ -3377,11 +3375,32 @@ func TestDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
 	select {
 	case err := <-adoptionDone:
 		if err != nil {
-			t.Fatalf("download adoption: %v", err)
+			t.Fatalf("%s: %v", adoptionFailed, err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("download adoption did not finish")
+		t.Fatal(adoptionDidNotFinish)
 	}
+}
+
+func TestDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	id := park(t, jobs, "wr_unblocked_sync", handoffWork())
+	runSync(t, b, hello())
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+
+	frame := inFrame(t, protocol.MsgDownloadComplete, id,
+		map[string]any{"download_id": 7, "filename": "paper.pdf", "size_bytes": 533})
+	assertDownloadValidationDoesNotBlockSessionSync(t, b,
+		"download adoption never reached validation",
+		"poll during validation",
+		"session sync blocked on download validation",
+		"download adoption",
+		"download adoption did not finish",
+		func() error {
+			_, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{frame})
+			return err
+		},
+	)
 }
 
 func TestPollDiscoveredDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
@@ -3390,60 +3409,17 @@ func TestPollDiscoveredDownloadValidationDoesNotBlockSessionSync(t *testing.T) {
 	runSync(t, b, hello())
 	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
 
-	validationStarted := make(chan struct{})
-	releaseValidation := make(chan struct{})
-	validationReleased := false
-	t.Cleanup(func() {
-		if !validationReleased {
-			close(releaseValidation)
-		}
-	})
-	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
-		close(validationStarted)
-		<-releaseValidation
-		return pdf.ValidationReport{
-			Payload:    pdf.PayloadReport{OK: true},
-			Structural: pdf.StructuralReport{Valid: true, Pages: 3},
-			Text:       pdf.TextReport{Chars: 4000},
-			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
-		}, nil
-	}
-
-	adoptionDone := make(chan error, 1)
-	go func() {
-		_, err := b.Sync(context.Background(), testSessionID, false, nil)
-		adoptionDone <- err
-	}()
-	select {
-	case <-validationStarted:
-	case <-time.After(time.Second):
-		t.Fatal("poll-time adoption never reached validation")
-	}
-
-	pollDone := make(chan error, 1)
-	go func() {
-		_, err := b.Sync(context.Background(), testSessionID, false, nil)
-		pollDone <- err
-	}()
-	select {
-	case err := <-pollDone:
-		if err != nil {
-			t.Fatalf("poll during poll-time validation: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("session sync blocked on poll-time download validation")
-	}
-
-	close(releaseValidation)
-	validationReleased = true
-	select {
-	case err := <-adoptionDone:
-		if err != nil {
-			t.Fatalf("poll-time adoption: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("poll-time adoption did not finish")
-	}
+	assertDownloadValidationDoesNotBlockSessionSync(t, b,
+		"poll-time adoption never reached validation",
+		"poll during poll-time validation",
+		"session sync blocked on poll-time download validation",
+		"poll-time adoption",
+		"poll-time adoption did not finish",
+		func() error {
+			_, err := b.Sync(context.Background(), testSessionID, false, nil)
+			return err
+		},
+	)
 }
 
 func TestDownloadForUnrelatedJobDoesNotAdoptAnotherJobsFile(t *testing.T) {

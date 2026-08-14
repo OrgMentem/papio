@@ -30,6 +30,26 @@ import {
 } from "../src/keepalive";
 import { ChromeTabsFake } from "./fake-tabs";
 
+const withResolverDom = <T,>(html: string, run: () => T, url = "https://resolver.example.edu/discovery/search"): T => {
+  const window = new Window({ url });
+  window.document.write(html);
+  const previous = {
+    document: globalThis.document,
+    localStorage: globalThis.localStorage,
+    sessionStorage: globalThis.sessionStorage,
+  };
+  Object.assign(globalThis, {
+    document: window.document,
+    localStorage: window.localStorage,
+    sessionStorage: window.sessionStorage,
+  });
+  try {
+    return run();
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+};
+
 const RESOLVER_OPENURL = "https://resolver.example.edu/openurl?genre=article";
 
 // KeepaliveManager has no clock seam of its own — it reads the real
@@ -1194,57 +1214,30 @@ test("a URL is routing, not an affordance: neither direction is decided by a lin
 });
 
 test("marker collection scans sign-out affordances inside closed and hidden menus", () => {
-  const window = new Window({ url: "https://resolver.example.edu/account" });
   // A closed account menu is where a real sign-out affordance lives, and it is
   // legitimate evidence of a session. What makes it evidence is the label the
   // operator would read on opening the menu — not the /logout target, which a
   // signed-out page can carry just as easily.
-  window.document.write(
-    "<html><body><details><div hidden><span><a href='/logout'>Sign out</a></span></div></details></body></html>",
-  );
-  const previous = {
-    document: globalThis.document,
-    localStorage: globalThis.localStorage,
-    sessionStorage: globalThis.sessionStorage,
-  };
-  Object.assign(globalThis, {
-    document: window.document,
-    localStorage: window.localStorage,
-    sessionStorage: window.sessionStorage,
-  });
-  try {
-    expect(classifyResolverMarkers(collectResolverMarkers())).toBe("in");
-  } finally {
-    Object.assign(globalThis, previous);
-  }
+  expect(
+    withResolverDom(
+      "<html><body><details><div hidden><span><a href='/logout'>Sign out</a></span></div></details></body></html>",
+      () => classifyResolverMarkers(collectResolverMarkers()),
+    ),
+  ).toBe("in");
 });
 
 test("Primo-shaped account page with a non-guest session JWT is signed in without sign-out UI", () => {
-  const window = new Window({ url: "https://example.primo.exlibrisgroup.com/nde/account/overview" });
-  window.document.write(
+  const token = syntheticJWT({ preferred_username: "jane", userGroup: "STUDENT" });
+  const markers = withResolverDom(
     "<html><body><main><h1>Jane Doe</h1><details><summary>Account</summary><div hidden>Profile</div></details></main></body></html>",
+    () => {
+      sessionStorage.setItem("primo-session", token);
+      return collectResolverMarkers();
+    },
+    "https://example.primo.exlibrisgroup.com/nde/account/overview",
   );
-  window.sessionStorage.setItem(
-    "primo-session",
-    syntheticJWT({ preferred_username: "jane", userGroup: "STUDENT" }),
-  );
-  const previous = {
-    document: globalThis.document,
-    localStorage: globalThis.localStorage,
-    sessionStorage: globalThis.sessionStorage,
-  };
-  Object.assign(globalThis, {
-    document: window.document,
-    localStorage: window.localStorage,
-    sessionStorage: window.sessionStorage,
-  });
-  try {
-    const markers = collectResolverMarkers();
-    expect(classifyResolverMarkers(markers)).toBe("in");
-    expect(markers.some((marker) => marker.storageIdentity === "in")).toBe(true);
-  } finally {
-    Object.assign(globalThis, previous);
-  }
+  expect(classifyResolverMarkers(markers)).toBe("in");
+  expect(markers.some((marker) => marker.storageIdentity === "in")).toBe(true);
 });
 
 test("probe outcome separates markers, no markers, and injection failure", async () => {
@@ -1321,50 +1314,27 @@ test("JWT identity requires an unexpired exp claim", () => {
 });
 
 test("injected marker collection rejects an expired JWT identity", () => {
-  const window = new Window({ url: "https://resolver.example.edu/account" });
-  window.sessionStorage.setItem(
-    "primo-session",
-    syntheticJWT({ preferred_username: "jane", exp: Math.floor(Date.now() / 1_000) - 1 }),
+  const token = syntheticJWT({ preferred_username: "jane", exp: Math.floor(Date.now() / 1_000) - 1 });
+  const markers = withResolverDom(
+    "<html><body></body></html>",
+    () => {
+      sessionStorage.setItem("primo-session", token);
+      return collectResolverMarkers();
+    },
+    "https://resolver.example.edu/account",
   );
-  const previous = {
-    document: globalThis.document,
-    localStorage: globalThis.localStorage,
-    sessionStorage: globalThis.sessionStorage,
-  };
-  Object.assign(globalThis, {
-    document: window.document,
-    localStorage: window.localStorage,
-    sessionStorage: window.sessionStorage,
-  });
-  try {
-    const markers = collectResolverMarkers();
-    expect(classifyResolverMarkers(markers)).toBe("unknown");
-    expect(markers.some((marker) => marker.storageIdentity === "in")).toBe(false);
-  } finally {
-    Object.assign(globalThis, previous);
-  }
+  expect(classifyResolverMarkers(markers)).toBe("unknown");
+  expect(markers.some((marker) => marker.storageIdentity === "in")).toBe(false);
 });
 
 test("marker collection ignores logout text in scripts, styles, templates, and ancestors", () => {
-  const window = new Window({ url: "https://resolver.example.edu/account" });
-  window.document.write(
-    "<html><head><style>.logout { content: 'logout'; }</style></head><body><script>const label = 'logout';</script><template>logout</template><main>logout</main></body></html>",
-  );
-  const previous = {
-    document: globalThis.document,
-    localStorage: globalThis.localStorage,
-    sessionStorage: globalThis.sessionStorage,
-  };
-  Object.assign(globalThis, {
-    document: window.document,
-    localStorage: window.localStorage,
-    sessionStorage: window.sessionStorage,
-  });
-  try {
-    expect(classifyResolverMarkers(collectResolverMarkers())).toBe("unknown");
-  } finally {
-    Object.assign(globalThis, previous);
-  }
+  expect(
+    withResolverDom(
+      "<html><head><style>.logout { content: 'logout'; }</style></head><body><script>const label = 'logout';</script><template>logout</template><main>logout</main></body></html>",
+      () => classifyResolverMarkers(collectResolverMarkers()),
+      "https://resolver.example.edu/account",
+    ),
+  ).toBe("unknown");
 });
 
 test("popup check probes a live tab for a second known resolver origin", async () => {
@@ -2818,26 +2788,6 @@ test("whitespace formatting cannot defeat or trip the affordance length bound", 
 });
 
 test("the injected collector caps element count, per-marker text, and deeply nested control text", () => {
-  const withResolverDom = <T,>(html: string, run: () => T): T => {
-    const window = new Window({ url: "https://resolver.example.edu/discovery/search" });
-    window.document.write(html);
-    const previous = {
-      document: globalThis.document,
-      localStorage: globalThis.localStorage,
-      sessionStorage: globalThis.sessionStorage,
-    };
-    Object.assign(globalThis, {
-      document: window.document,
-      localStorage: window.localStorage,
-      sessionStorage: window.sessionStorage,
-    });
-    try {
-      return run();
-    } finally {
-      Object.assign(globalThis, previous);
-    }
-  };
-
   // More matching controls than the element cap: the whole array is
   // structured-cloned back to the service worker, so the cap must bound the
   // RETURNED count, not merely how much is read.
@@ -2883,6 +2833,7 @@ test("the injected collector caps element count, per-marker text, and deeply nes
     expect(totalChars).toBeLessThanOrEqual(depth * MAX_MARKER_TEXT_LENGTH * 2);
   }
 });
+
 
 test("the receiver rejects an oversized marker array as a failed scan, preserving the prior verdict", async () => {
   const h = makeHarness();
@@ -3007,25 +2958,15 @@ test("collectResolverMarkers' injected storage-identity closure agrees with clas
     const specResult = classifyResolverJWTIdentity([token]);
     expect(specResult, `${name}: classifyResolverJWTIdentity`).toBe(expected);
 
-    const window = new Window({ url: "https://resolver.example.edu/account" });
-    window.sessionStorage.setItem("token", token);
-    const previous = {
-      document: globalThis.document,
-      localStorage: globalThis.localStorage,
-      sessionStorage: globalThis.sessionStorage,
-    };
-    Object.assign(globalThis, {
-      document: window.document,
-      localStorage: window.localStorage,
-      sessionStorage: window.sessionStorage,
-    });
-    let collectorResult: "in" | "unknown";
-    try {
-      const markers = collectResolverMarkers();
-      collectorResult = markers.some((marker) => marker.storageIdentity === "in") ? "in" : "unknown";
-    } finally {
-      Object.assign(globalThis, previous);
-    }
+    const collectorResult = withResolverDom(
+      "<html><body></body></html>",
+      () => {
+        sessionStorage.setItem("token", token);
+        const markers = collectResolverMarkers();
+        return markers.some((marker) => marker.storageIdentity === "in") ? ("in" as const) : ("unknown" as const);
+      },
+      "https://resolver.example.edu/account",
+    );
     expect(collectorResult, `${name}: collectResolverMarkers`).toBe(expected);
   }
 });

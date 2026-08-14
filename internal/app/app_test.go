@@ -952,18 +952,27 @@ func TestCrashRecoveryRefetchesMidflightWithoutDuplicateDurableRecords(t *testin
 		})
 	}
 }
-func TestValidationPersistsArtifactMetadataBeforePromotion(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	svc, jobs := newTestService(t)
-	id, err := jobs.CreateRequest(ctx, "wr_artifact_metadata_first", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+
+// seedValidatingCandidate drives a fresh job through the three-edge walk
+// queued→resolving→fetching→validating and stages a quarantined candidate file.
+// The three edges are queued→resolving, resolving→fetching, fetching→validating.
+// Validation is the starting point because these tests call validateCandidate
+// directly — that function requires the job already be in StateValidating, where
+// artifact-metadata persistence is attempted before promotion. The helper returns
+// the validating row, the pending candidate, the PDF body, the quarantine
+// temp path, and the SHA-256 hex so callers can focus on the Validate stub
+// and the post-validation assertions.
+func seedValidatingCandidate(t *testing.T, svc *Service, jobs *job.Store, wrName, urlKey, seed string) (*job.Row, *job.Candidate, []byte, string, string) {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, wrName, work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
 		AccessMode: config.ModeConservative, DesiredVersion: "any",
 	}, nil, job.PrincipalUnknown)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
-		JobID: id, Source: "fixture", URLRedacted: "https://example.test/paper.pdf", URLKey: "paper",
+		JobID: id, Source: "fixture", URLRedacted: "https://example.test/" + urlKey + ".pdf", URLKey: urlKey,
 		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
 	}}); err != nil {
 		t.Fatal(err)
@@ -989,19 +998,27 @@ func TestValidationPersistsArtifactMetadataBeforePromotion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := pdfBytes("promotion-order")
+	body := pdfBytes(seed)
 	tempPath := filepath.Join(qdir, "candidate.tmp")
 	if err := os.WriteFile(tempPath, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(body)
 	sha := hex.EncodeToString(sum[:])
+	return row, candidate, body, tempPath, sha
+}
+
+func TestValidationPersistsArtifactMetadataBeforePromotion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc, jobs := newTestService(t)
+	row, candidate, body, tempPath, sha := seedValidatingCandidate(t, svc, jobs, "wr_artifact_metadata_first", "paper", "promotion-order")
 	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
 		cancel()
 		return passValidation()(context.Background(), "", "", work.Work{})
 	}
 
-	_, _, err = svc.validateCandidate(ctx, row, candidate, fetch.Result{
+	_, _, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
 		TempPath: tempPath, SHA256: sha, SizeBytes: int64(len(body)), SniffedMIME: "application/pdf",
 	})
 	if !errors.Is(err, context.Canceled) {
@@ -1023,46 +1040,7 @@ func TestValidationPersistsArtifactMetadataBeforePromotion(t *testing.T) {
 func TestValidationRemovesMetadataWhenPromotionFails(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)
-	id, err := jobs.CreateRequest(ctx, "wr_promotion_rollback", work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
-		AccessMode: config.ModeConservative, DesiredVersion: "any",
-	}, nil, job.PrincipalUnknown)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
-		JobID: id, Source: "fixture", URLRedacted: "https://example.test/paper.pdf", URLKey: "promotion-rollback",
-		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	candidate, err := jobs.NextPendingCandidate(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, edge := range [][2]string{
-		{job.StateQueued, job.StateResolving},
-		{job.StateResolving, job.StateFetching},
-		{job.StateFetching, job.StateValidating},
-	} {
-		if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-	row, err := jobs.Get(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	qdir, err := svc.Artifacts.QuarantineDir(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := pdfBytes("promotion-rollback")
-	tempPath := filepath.Join(qdir, "candidate.tmp")
-	if err := os.WriteFile(tempPath, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(body)
-	sha := hex.EncodeToString(sum[:])
+	row, candidate, body, tempPath, sha := seedValidatingCandidate(t, svc, jobs, "wr_promotion_rollback", "promotion-rollback", "promotion-rollback")
 	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
 		if err := os.Remove(tempPath); err != nil {
 			t.Fatal(err)

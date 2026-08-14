@@ -281,52 +281,44 @@ func TestCheckNonOKStatusSoftFailsToCachedInfo(t *testing.T) {
 	}
 }
 
-func TestCheckColdCacheReturnsNilOnTransportError(t *testing.T) {
+// An update check is advisory, so with no prior cached answer every failure mode
+// must degrade silently to "no information" rather than surfacing an error or a
+// fabricated version. Every case reaches the same single assertion; only the way
+// the release read fails differs.
+func TestCheckColdCacheDegradesToNil(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return nil, errors.New("connection refused")
-	})}
-	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: "https://example.test/releases", Client: client, Now: func() time.Time { return now }})
-	if info := checker.Check(context.Background()); info != nil {
-		t.Fatalf("info = %#v, want nil with no prior cache", info)
+	tests := []struct {
+		name      string
+		handler   http.HandlerFunc                            // served by a test server, or
+		transport func(*http.Request) (*http.Response, error) // used instead when non-nil
+	}{
+		{name: "transport error", transport: func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("connection refused")
+		}},
+		{name: "not modified", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotModified)
+		}},
+		{name: "non-OK status", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}},
+		{name: "malformed body", handler: func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"tag_name":`))
+		}},
 	}
-}
-
-func TestCheckColdCacheReturnsNilOnNotModified(t *testing.T) {
-	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNotModified)
-	}))
-	defer server.Close()
-
-	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
-	if info := checker.Check(context.Background()); info != nil {
-		t.Fatalf("info = %#v, want nil with no prior cache", info)
-	}
-}
-
-func TestCheckColdCacheReturnsNilOnNonOKStatus(t *testing.T) {
-	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
-	if info := checker.Check(context.Background()); info != nil {
-		t.Fatalf("info = %#v, want nil with no prior cache", info)
-	}
-}
-
-func TestCheckColdCacheReturnsNilOnMalformedResponse(t *testing.T) {
-	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"tag_name":`))
-	}))
-	defer server.Close()
-
-	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
-	if info := checker.Check(context.Background()); info != nil {
-		t.Fatalf("info = %#v, want nil with no prior cache", info)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options := Options{DataDir: t.TempDir(), Now: func() time.Time { return now }}
+			if test.transport != nil {
+				options.ReleasesURL = "https://example.test/releases"
+				options.Client = &http.Client{Transport: roundTripFunc(test.transport)}
+			} else {
+				server := httptest.NewServer(test.handler)
+				t.Cleanup(server.Close)
+				options.ReleasesURL, options.Client = server.URL, server.Client()
+			}
+			if info := NewWithOptions(options).Check(context.Background()); info != nil {
+				t.Fatalf("info = %#v, want nil with no prior cache", info)
+			}
+		})
 	}
 }
