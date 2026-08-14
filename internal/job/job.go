@@ -170,6 +170,10 @@ func Terminal(state string) bool {
 	return false
 }
 
+func releasesLease(state string) bool {
+	return Terminal(state) || state == StateRetryWait || state == StateAwaitingHuman || state == StateNeedsReview
+}
+
 // allowed maps from-state -> to-states. Recovery rewinds (fetching/validating
 // -> resolving) are legal because candidates re-rank deterministically and the
 // artifact store is content-addressed (no duplicates on re-fetch).
@@ -923,7 +927,7 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 	now := store.Now()
 	// A parked or terminal job is owned by nobody: release the lease so the
 	// scheduler can re-claim it when it becomes runnable again.
-	releaseLease := Terminal(to) || to == StateRetryWait || to == StateAwaitingHuman || to == StateNeedsReview
+	releaseLease := releasesLease(to)
 
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -1347,10 +1351,21 @@ func (js *Store) Heartbeat(ctx context.Context, jobID, owner string, lease time.
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("%w: lease on %s not held by %s", ErrConflict, jobID, owner)
+	if n, _ := res.RowsAffected(); n == 1 {
+		return nil
 	}
-	return nil
+	// A processor's final transition releases its lease. A heartbeat already
+	// in flight may observe that committed state before processLease cancels its
+	// ticker; treating that completion race as lost ownership makes clean
+	// scheduler shutdown fail nondeterministically.
+	var state string
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, jobID).Scan(&state); err != nil {
+		return err
+	}
+	if releasesLease(state) {
+		return nil
+	}
+	return fmt.Errorf("%w: lease on %s not held by %s", ErrConflict, jobID, owner)
 }
 
 // Release drops a lease without changing state (job becomes claimable).

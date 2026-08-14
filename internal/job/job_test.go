@@ -106,6 +106,30 @@ func TestTerminalTransitionRecordsReasonAndClearsLease(t *testing.T) {
 	}
 }
 
+func TestHeartbeatToleratesCompletedLeaseReleaseOnly(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_heartbeat_completion", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ClaimNext(ctx, "owner1", time.Minute); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := js.Heartbeat(ctx, id, "owner2", time.Minute); !errors.Is(err, ErrConflict) {
+		t.Fatalf("active job heartbeat by wrong owner = %v, want ErrConflict", err)
+	}
+	if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+		t.Fatalf("to resolving: %v", err)
+	}
+	if err := js.Transition(ctx, id, StateResolving, StateReady, nil); err != nil {
+		t.Fatalf("to ready: %v", err)
+	}
+	if err := js.Heartbeat(ctx, id, "owner1", time.Minute); err != nil {
+		t.Fatalf("heartbeat racing completed transition: %v", err)
+	}
+}
+
 func TestClaimNextHonorsLeasesAndRetryAt(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

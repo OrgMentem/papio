@@ -8,6 +8,14 @@ so older sections below include extension entries. The initial release entry
 is synthesized from the complete `papio` and `zotio` Git histories and the
 execution records kept during the initial build.
 
+## [Unreleased]
+
+### Fixed
+- **Clean scheduler completion no longer races its final heartbeat.** A
+  heartbeat already in flight when a worker parks or completes its job now
+  recognizes the lease-releasing state as success, while a wrong owner on
+  active work still fails closed.
+
 ## [0.21.0] - 2026-08-14
 
 ### Added
