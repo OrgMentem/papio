@@ -76,8 +76,11 @@ for the full pre-split extension history.
   rather than clipping in the narrow popup.
 - **Scanner consent and revocation stay accurate under concurrency.** The
   consent prompt now states that detected identifiers go to the local *papio*
-  app, matching ownership checks, and revoking one allowed origin disables only
-  that row while other origins remain usable.
+  app, while short citation labels stay in the browser, matching the actual
+  ownership-check wire payload. Revoking one allowed origin disables only that
+  row while other origins remain usable.
+  The catch-up setting's label and explanation now stack instead of running
+  together on one line.
 - **Repeated handoffs no longer stack duplicate tabs.** After a service-worker
   restart the extension recovers the job's existing broker tab from its
   durable ledger instead of opening another copy for every re-offer.

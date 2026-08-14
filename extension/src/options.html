@@ -199,18 +199,25 @@
         border-top: 1px solid var(--color-border);
       }
 
+      /* Block regardless of the element used. Most rows build these from divs,
+         but the catch-up row wraps them in spans so the whole row can be one
+         <label>; as inline spans they ran together, rendering
+         "…surface opensShow a bounded summary…". */
       .source-label {
+        display: block;
         font-weight: 600;
       }
 
       .source-host {
         color: var(--color-muted);
+        display: block;
         font-size: var(--font-size-small);
         overflow-wrap: anywhere;
       }
 
       .hint {
         color: var(--color-muted);
+        display: block;
         font-size: var(--font-size-small);
       }
 
