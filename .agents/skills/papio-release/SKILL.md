@@ -101,9 +101,12 @@ names out of subjects for release-bound commits.
 2. Tag papio. The tag-triggered release workflow runs GoReleaser, publishes the
    binaries, updates Homebrew, and opens the WinGet PR from
    `papio-{{ .Version }}`.
-3. Release the extension last. Store review can lag days. The extension must
-   tolerate old daemons; `hello_ack` feature flags exist for that purpose.
-   Never gate a daemon release on store approval.
+3. Release the extension last, and only after the QA gate passes —
+   `.agents/skills/papio-release/extension-qa.md`, against a deployed daemon on
+   a frozen commit. An `ext-v*` tag push submits to **both** stores, so the gate
+   is the last point where a defect is still cheap. Store review can lag days.
+   The extension must tolerate old daemons; `hello_ack` feature flags exist for
+   that purpose. Never gate a daemon release on store approval.
 4. Build the direct-distribution bundle locally with
    `scripts/release.sh <version>` after the required tagged inputs exist.
 
@@ -194,53 +197,20 @@ migration plan before merging; do not tag first and design compatibility later.
 Automated e2e against the extension is architecturally prohibited: driving it
 means attaching to the user's own browser via CDP or WebDriver, and both
 `navigator.webdriver` and CDP attachment get fingerprinted by provider
-anti-bot — the same detection this project exists to avoid tripping. So this
+anti-bot — the same detection this project exists to avoid tripping. So a
 manual matrix is the extension's permanent release gate, not a stopgap to
-eventually automate away. Run it before every store submission (Release order
-step 3), on Chrome (stable) and the built `firefox/` (loaded via
-`about:debugging`), against a deployed daemon.
+eventually automate away.
 
-### Skew matrix (must pass all four)
-
-- [ ] new extension + new daemon: normal operation, full feature set works
-- [ ] new extension + old daemon (missing recent features): extension renders
-      the compat/feature-unavailable state instead of erroring; core
-      acquisition still works; daemon log shows no unknown-message-type errors
-- [ ] old extension + new daemon: extension's prior behavior is unchanged;
-      daemon never emits a frame type the old extension doesn't understand
-- [ ] fresh install, no daemon running: popup and any extension pages render
-      daemon-down states cleanly
-
-### Lifecycle and connection handling
-
-- [ ] Chrome: let the service worker go idle (30s+), then act — the first
-      request reconnects and succeeds, no stuck spinner
-- [ ] Firefox: let the background event page unload, then reopen an extension
-      page — it re-establishes state
-- [ ] daemon restart while a papio extension page is open: reconnect banner
-      appears and recovers the page
-- [ ] a mutation attempted during disconnect fails cleanly and is not
-      replayed on reconnect; a refresh shows canonical state
-- [ ] singleton-tab pages focus the existing tab instead of duplicating; a
-      duplicate opened via direct URL doesn't corrupt shared state
-- [ ] badge precedence resolves correctly when multiple states are
-      simultaneously true (e.g. disconnected outranks a pending count);
-      tooltip names the active state
-- [ ] a notification click opens/focuses the relevant tab
-
-### Security spot-checks
-
-- [ ] a message from a non-privileged sender (content script, options page)
-      invoking a privileged message type is rejected
-- [ ] hostile or markup-bearing text sourced from the provider or the daemon
-      renders inert as plain text everywhere it's shown (lists, dialogs,
-      notifications) — never interpreted as HTML
-
-### Update lifecycle
-
-- [ ] with a papio extension page open, trigger an update (unpacked reload,
-      or a store update): the update banner appears, and the reload flow
-      lands on the new version
+**Read `.agents/skills/papio-release/extension-qa.md` and run it before every
+store submission (Release order step 3).** That file owns the matrix itself —
+skew, lifecycle, security, update lifecycle, transport proof — plus the
+execution rules an agent needs to produce trustworthy evidence: the
+locked-display and stale-native-addon preflights, the artifact-freeze protocol
+(a pass is meaningless if a sibling edit lands mid-run, or if the loaded
+service worker predates the bundles), the `dist/`-prefixed page URLs, the rule
+that every `papio` command except `daemon status`/`stop` autostarts the daemon
+and so destroys any daemon-down observation, and the PASS/FAIL/NOT-RUN
+discipline that keeps "we didn't test it" from being recorded as a pass.
 
 ## Extension store submission
 
