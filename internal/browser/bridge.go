@@ -358,7 +358,7 @@ type Bridge struct {
 	// prevent.
 	adoptionScanMu sync.Mutex
 	// adoptionScanSuspended latches true the instant one adoption-directory
-	// ReadDir call misses adoptionScanDeadline. A hung syscall can block
+	// ReadDir call misses AdoptionScanDeadline. A hung syscall can block
 	// forever, so every scan while this is true short-circuits to "nothing
 	// adoptable" without spawning another goroutine — at most one hung call
 	// is ever outstanding per bridge. The goroutine that tripped it clears
@@ -6710,22 +6710,27 @@ func (b *Bridge) adoptWithContext(ctx context.Context, jobID, filename string, p
 	return b.svc.AdoptDownloadWithContextCandidate(ctx, jobID, full, provenance)
 }
 
-// adoptionScanDeadline bounds one adoption-directory ReadDir syscall. A
+// AdoptionScanDeadline bounds one adoption-directory ReadDir syscall. A
 // TCC-protected root (for example a download_adoption_root under
 // ~/Downloads on macOS) can make open(2) block in-kernel indefinitely: tccd
 // is waiting on a consent decision only an interactive process can supply,
 // and papio is a background daemon. 2s is far past any real filesystem
 // latency but short enough that one hung scan costs at most one poll tick.
-const adoptionScanDeadline = 2 * time.Second
+//
+// It is a var, not a const, solely so the tests that prove the hung-syscall
+// behaviour can compress it: they block a ReadDir seam forever, so at the
+// production value each one costs a real 2s of wall clock. Production never
+// assigns it.
+var AdoptionScanDeadline = 2 * time.Second
 
 // ErrAdoptionScanTimeout marks a ReadDir call that did not return within
-// adoptionScanDeadline — the signature of the TCC consent wall described on
+// AdoptionScanDeadline — the signature of the TCC consent wall described on
 // scanAdoptionDir. Never wrapped, so callers compare it with errors.Is.
 var ErrAdoptionScanTimeout = errors.New("adoption directory scan timed out")
 
 // BoundedReadDir runs readDir(dir) — os.ReadDir when readDir is nil — on its
 // own goroutine and returns ErrAdoptionScanTimeout if it has not completed
-// within adoptionScanDeadline. Go cannot cancel a syscall already blocked
+// within AdoptionScanDeadline. Go cannot cancel a syscall already blocked
 // in-kernel, so on timeout the goroutine is left running; when afterTimeout
 // is non-nil, a second goroutine (which only waits on a channel, never on
 // the syscall itself) reports its eventual real result to afterTimeout
@@ -6749,7 +6754,7 @@ func BoundedReadDir(dir string, readDir func(string) ([]os.DirEntry, error), aft
 	select {
 	case r := <-done:
 		return r.entries, r.err
-	case <-time.After(adoptionScanDeadline):
+	case <-time.After(AdoptionScanDeadline):
 		if afterTimeout != nil {
 			go func() {
 				r := <-done
@@ -6761,7 +6766,7 @@ func BoundedReadDir(dir string, readDir func(string) ([]os.DirEntry, error), aft
 }
 
 // readAdoptionDir bounds one adoption-directory listing against
-// adoptionScanDeadline and, on a timeout, latches adoption scanning off for
+// AdoptionScanDeadline and, on a timeout, latches adoption scanning off for
 // the whole bridge — not just this job — until the hung call eventually
 // returns. A short-circuited or timed-out call reports the same shape of
 // error a missing directory does, which every caller here already treats as
@@ -6786,7 +6791,7 @@ func (b *Bridge) readAdoptionDir(dir string) ([]os.DirEntry, error) {
 	// the same fail-closed timeout without touching the latch.
 	select {
 	case gate <- struct{}{}:
-	case <-time.After(adoptionScanDeadline):
+	case <-time.After(AdoptionScanDeadline):
 		return nil, ErrAdoptionScanTimeout
 	}
 
@@ -6815,7 +6820,7 @@ func (b *Bridge) readAdoptionDir(dir string) ([]os.DirEntry, error) {
 
 // adoptionLatchUnhealthy reports whether the adoption-scan latch
 // (adoptionScanSuspended) is currently tripped: a prior ReadDir under the
-// adoption root missed adoptionScanDeadline and has not yet returned. It is
+// adoption root missed AdoptionScanDeadline and has not yet returned. It is
 // the daemon-side signature of the macOS TCC consent wall AGENTS.md
 // documents, and recordAdoptionDeferred uses it to decide whether a failed
 // adoption is plausibly that wall (worth a human grant prompt) rather than

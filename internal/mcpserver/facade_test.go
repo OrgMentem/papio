@@ -27,6 +27,13 @@ func newFacadeClient(t *testing.T) *client.Client {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
 	cfg.DataDir = t.TempDir()
+	// config.Default() names the zotio executable, so `papio status` — which
+	// reads the library-completeness line through zotio.missing_count — shells
+	// out to whatever zotio is installed and queries the developer's own
+	// Zotero library. That made this routing test cost 4.6s and depend on
+	// machine state; the facade contract under test has nothing to do with the
+	// optional integration, so leave it unconfigured.
+	cfg.Zotio.Executable = ""
 	system, err := bootstrap.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/delivery"
 	"papio/internal/discovery"
@@ -205,11 +206,18 @@ func TestRunNamesLegacyEffectBlockerAndExactRecovery(t *testing.T) {
 // supply. The probe must still return, bounded, and report a Fail naming
 // the real remediation instead of hanging the whole doctor run.
 func TestCheckAdoptionRootTimesOutAndFailsWithGrantRemediation(t *testing.T) {
+	// The probe can only be proven by blocking its ReadDir seam forever, so
+	// the test always pays the full bound; compress it rather than sleeping
+	// the production 2s. Nothing here depends on the value, only on the
+	// probe returning before the assertion deadline below.
+	previousDeadline := browser.AdoptionScanDeadline
+	browser.AdoptionScanDeadline = 100 * time.Millisecond
 	original := adoptionRootReadDir
 	block := make(chan struct{})
 	t.Cleanup(func() {
 		close(block)
 		adoptionRootReadDir = original
+		browser.AdoptionScanDeadline = previousDeadline
 	})
 	adoptionRootReadDir = func(string) ([]os.DirEntry, error) {
 		<-block

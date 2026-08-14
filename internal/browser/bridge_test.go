@@ -48,6 +48,20 @@ import (
 	"papio/internal/zotio"
 )
 
+// compressAdoptionScanDeadline shrinks the hung-ReadDir bound for one test.
+// The tests that prove the latch behaviour block a ReadDir seam forever, so
+// they always pay the full deadline; at the production 2s that is four
+// seconds of pure sleeping in this package alone, which is the slowest in the
+// tree. 100ms is still orders of magnitude above any real listing latency, so
+// nothing else about the tests changes. No test in this package calls
+// t.Parallel, so a package-level knob is safe.
+func compressAdoptionScanDeadline(t *testing.T) {
+	t.Helper()
+	previous := AdoptionScanDeadline
+	AdoptionScanDeadline = 100 * time.Millisecond
+	t.Cleanup(func() { AdoptionScanDeadline = previous })
+}
+
 func newBridge(t *testing.T) (*Bridge, *job.Store, config.Config, string) {
 	t.Helper()
 	return newBridgeWithHoldings(t, nil)
@@ -3668,12 +3682,13 @@ func TestPollScanAdoptsSingleSettledFileAndDefersAmbiguity(t *testing.T) {
 // TestPollSuspendsAdoptionScanningOnHungReadDirAndStaysResponsive reproduces
 // the incident this latch fixes: a ReadDir behind a TCC-protected adoption
 // root can block in-kernel forever. Every Sync/poll call must still return
-// bounded by adoptionScanDeadline, ordinary handoff offers must keep
+// bounded by AdoptionScanDeadline, ordinary handoff offers must keep
 // flowing, and — because Go can never cancel the blocked syscall — at most
 // one goroutine may ever be stuck in it, no matter how many polls arrive
 // while it is latched.
 func TestPollSuspendsAdoptionScanningOnHungReadDirAndStaysResponsive(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
+	compressAdoptionScanDeadline(t)
 	ctx := context.Background()
 
 	var calls int32
@@ -3798,6 +3813,7 @@ func TestScanAdoptionDirEPERMIsNotAdoptableWithoutLatching(t *testing.T) {
 // clears the latch, and the next poll performs a fresh scan that adopts it.
 func TestScanAdoptionResumesAfterHungReadDirReturnsAndAdoptsSettledFile(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
+	compressAdoptionScanDeadline(t)
 	ctx := context.Background()
 
 	var calls int32
@@ -7337,6 +7353,7 @@ func TestPageBulkStatusWithoutHintRecordsNullDenominator(t *testing.T) {
 // and landing-directory cleanup silently stopped until a daemon restart.
 func TestSweepsSkipTickOnHungAdoptionRoot(t *testing.T) {
 	b, _, _, _ := newBridge(t)
+	compressAdoptionScanDeadline(t)
 	ctx := context.Background()
 
 	var calls int32
@@ -7936,6 +7953,7 @@ func TestSweepGrabsDoesNotOverwritePendingAdoptionFile(t *testing.T) {
 // stack a second hung goroutine underneath it.
 func TestSweepGrabsSkipsTickOnHungRoot(t *testing.T) {
 	b, _, _, _ := newBridge(t)
+	compressAdoptionScanDeadline(t)
 	ctx := context.Background()
 
 	var calls int32

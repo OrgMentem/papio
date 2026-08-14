@@ -16,9 +16,15 @@ import (
 	"time"
 )
 
+// shortTempDir returns a temp directory short enough that a unix socket path
+// inside it fits sun_path (104 bytes on macOS, 108 on Linux). t.TempDir is
+// unusable here: it embeds the test's name, so a descriptively-named test in
+// this file overruns the limit and the server fails to bind. os.MkdirTemp("")
+// honors TMPDIR, which keeps the path short without hardcoding /tmp — a path
+// sandboxed environments refuse outright.
 func shortTempDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "papio-ipc-")
+	dir, err := os.MkdirTemp("", "papio-ipc-")
 	if err != nil {
 		t.Fatal(err)
 	}
