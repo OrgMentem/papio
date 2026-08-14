@@ -682,6 +682,125 @@ func TestPoll404DuplicateTokenSettlesUnknownForHumanReconciliation(t *testing.T)
 	}
 }
 
+// TestPoll404AfterSuccessWithNoPatronRefSpendsOneRecheckThenSettlesUnknownOutcome pins
+// the untested early return in reconcileViaUserRequests where PatronRef (or
+// ReferenceField) is empty. With no patron_ref configured there is nothing to
+// reconcile against, so papio does not silently keep polling forever — it spends
+// the one delayed recheck and settles unknown_outcome. papio doctor is where
+// the missing patron_ref is surfaced (doctor.go warns on it).
+// Note: the recorded reason still reads "404_after_reconciliation" even though
+// no reconciliation ran; that is the current wire vocabulary and is pinned here
+// deliberately rather than being a bug to fix silently.
+func TestPoll404AfterSuccessWithNoPatronRefSpendsOneRecheckThenSettlesUnknownOutcome(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	ctx := context.Background()
+	req := newLiveRequest(t, svc, "404-no-patron-ref", *clock)
+	if _, err := svc.store.DB().ExecContext(ctx,
+		`UPDATE delivery_requests SET last_successful_poll_at = ? WHERE id = ?`, clock.Format(time.RFC3339Nano), req.ID); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var userRequestsHit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/Transaction/UserRequests/") || strings.HasPrefix(r.URL.Path, "/Users/ExternalUserId/") {
+			userRequestsHit = true
+			t.Errorf("UserRequests listing was called despite empty PatronRef — reconcileViaUserRequests should have early-returned without any listing call (path %q)", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	client := illiad.New(srv.Client(), srv.URL, "key")
+
+	deps := PollDeps{Client: client, PatronRef: "", ReferenceField: "ItemInfo4", StatusPollMinutes: 60}
+
+	// First 404-after-success: must NOT settle, must record the reconciling
+	// class, and must schedule the fixed recheck (not exponential backoff).
+	firstNow := *clock
+	result, err := svc.Poll(ctx, req, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Settled {
+		t.Fatalf("first 404-after-success with empty PatronRef must not settle — it should spend the delayed recheck: %+v", result)
+	}
+	if userRequestsHit {
+		t.Fatalf("UserRequests listing was called on first 404 despite empty PatronRef")
+	}
+	got, err := svc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State == StateUnknownOutcome {
+		t.Fatalf("state = %q, want still live (not unknown_outcome) after first 404", got.State)
+	}
+	if got.LastPollErrorClass != PollErrorClassNotFoundReconciling {
+		t.Fatalf("last_poll_error_class = %q, want %q", got.LastPollErrorClass, PollErrorClassNotFoundReconciling)
+	}
+	if got.NextCheckAt == "" {
+		t.Fatalf("next_check_at is empty after first 404, want fixed recheck delay %s", notFoundReconciliationRecheckDelay)
+	}
+	nextAt, err := time.Parse(time.RFC3339Nano, got.NextCheckAt)
+	if err != nil {
+		t.Fatalf("parse next_check_at %q: %v", got.NextCheckAt, err)
+	}
+	expectedNext := firstNow.Add(notFoundReconciliationRecheckDelay)
+	if !nextAt.Equal(expectedNext) {
+		t.Fatalf("next_check_at = %s, want %s (fixed notFoundReconciliationRecheckDelay, not exponential backoff)", nextAt, expectedNext)
+	}
+	// Also verify Poll's returned NextCheckAt matches the persisted one.
+	if !result.NextCheckAt.Equal(expectedNext) {
+		t.Fatalf("PollResult NextCheckAt = %s, want %s", result.NextCheckAt, expectedNext)
+	}
+	// Keep the mutated req in sync for the second Poll (CAS predicate uses State/NextCheckAt).
+	req = got
+
+	// Advance to the delayed recheck: still 404, so this must be the call that settles unknown_outcome.
+	*clock = clock.Add(notFoundReconciliationRecheckDelay + time.Second)
+
+	result, err = svc.Poll(ctx, req, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Settled || result.State != StateUnknownOutcome {
+		t.Fatalf("result = %+v, want settled unknown_outcome after the delayed recheck", result)
+	}
+	if userRequestsHit {
+		t.Fatalf("UserRequests listing was called on second 404 despite empty PatronRef — second 404 settles without reconciliation")
+	}
+	final, err := svc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.State != StateUnknownOutcome {
+		t.Fatalf("state = %q, want %q after second 404", final.State, StateUnknownOutcome)
+	}
+	if final.NextCheckAt != "" {
+		t.Fatalf("next_check_at = %q, want empty (polling stopped) after settling unknown_outcome", final.NextCheckAt)
+	}
+	var detailJSON string
+	if err := svc.store.DB().QueryRowContext(ctx,
+		`SELECT detail_json FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT 1`,
+		req.JobID, eventKindPollSettled).Scan(&detailJSON); err != nil {
+		t.Fatalf("query poll_settled event: %v", err)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal([]byte(detailJSON), &detail); err != nil {
+		t.Fatalf("unmarshal event detail %q: %v", detailJSON, err)
+	}
+	if detail["reason"] != "404_after_reconciliation" {
+		t.Fatalf("event reason = %v, want %q (pinned wire vocabulary even when no reconciliation ran)", detail["reason"], "404_after_reconciliation")
+	}
+	if detail["state"] != string(StateUnknownOutcome) {
+		t.Fatalf("event state = %v, want %q", detail["state"], string(StateUnknownOutcome))
+	}
+}
+
 // --- Backoff growth is bounded -------------------------------------------
 
 func TestBackoffWithJitterGrowsAndIsBounded(t *testing.T) {

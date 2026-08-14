@@ -335,6 +335,19 @@ func TestClaimApplyReclaimsExpiredReservation(t *testing.T) {
 	}
 }
 
+// A cancelled apply is recorded as a durable failure and its plan invalidated,
+// even though the killed `zotio apply` child may have reached Zotero's API
+// before the context died. That reads like the hazard Apply's reservation
+// comment warns about, and it is not: the reservation protects against a
+// CONCURRENT worker whose write is still in flight, which papio cannot observe.
+// A cancellation is different — this process owns the reservation and knows the
+// child is dead — and the retry cannot duplicate anything, because a new plan is
+// re-derived from the live library through `zotio import resolve`, which
+// classifies an already-written work as duplicate (manifest_duplicate) or as an
+// attach candidate (manifest_attach) instead of creating it again. Leaving the
+// reservation in_progress instead would strand the job behind applyClaimLease
+// with no worker coming back for it, so do not "fix" this into a retryable
+// conflict without first removing that re-derivation.
 func TestCancelledApplyFinalizesClaimAndReplans(t *testing.T) {
 	var cancel context.CancelFunc
 	cli := &planCLI{
