@@ -1224,6 +1224,32 @@ test("a structured broker rejection renders inline and never fakes a disconnect"
   expect(page.document.getElementById("connection-status")?.textContent).toContain("Disconnected");
 });
 
+test("the inbox paints no connection verdict before the daemon answers", async () => {
+  // The reported flash: `connected: false` is the initial value, not a verdict,
+  // and the first paint read it as one — a red "Disconnected … run papio
+  // status" on every open, before anything had been asked.
+  vi.useFakeTimers();
+  try {
+    const unanswered = Promise.withResolvers<unknown>();
+    const page = await inboxDocument((message) =>
+      message.type === "papio.triage.snapshot" ? unanswered.promise : snapshotReply(snapshot([]), message),
+    );
+    const banner = page.document.getElementById("connection-status");
+    expect(banner?.hidden).toBe(true);
+    expect(banner?.dataset.state).toBeUndefined();
+    expect(page.document.getElementById("reconnect-daemon")?.hidden).toBe(true);
+
+    // A daemon that really is slow must not leave the page silent forever — but
+    // it still must not be called disconnected before it has been given a turn.
+    vi.advanceTimersByTime(1_000);
+    expect(banner?.hidden).toBe(false);
+    expect(banner?.textContent).toBe("Connecting to daemon…");
+    expect(banner?.dataset.state).toBeUndefined();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("a session held by another browser is not reported as a lost connection", async () => {
   // The snapshot read is holder-independent in the daemon, but this browser is
   // negotiated for nothing until it is claimed. Calling that "Disconnected …

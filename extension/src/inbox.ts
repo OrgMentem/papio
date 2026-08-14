@@ -104,6 +104,12 @@ interface PageState {
   /** The daemon answered and refused: another browser holds its session. No
    * amount of reconnecting fixes that, so the banner must not promise it. */
   connectionSessionElsewhere: boolean;
+  /** False until the first probe settles. `connected` alone cannot express
+   * "not asked yet", and its false default rendered as lost connectivity. */
+  connectionKnown: boolean;
+  /** True once the grace period has elapsed with connectivity still unknown, so
+   * a genuinely slow daemon says "Connecting…" instead of leaving a blank page. */
+  connectingVisible: boolean;
   selectedID: string | null;
   expandedItemIDs: Set<string>;
   pending: Set<string>;
@@ -149,6 +155,8 @@ const state: PageState = {
   connected: false,
   connectionMessage: "Connecting to daemon…",
   connectionSessionElsewhere: false,
+  connectionKnown: false,
+  connectingVisible: false,
   selectedID: null,
   expandedItemIDs: new Set(),
   pending: new Set(),
@@ -270,6 +278,23 @@ let reconnectScheduled = false;
 let reconnectAttempts = 0;
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
 
+// Opening the inbox asks the daemon a question; until it answers, connectivity
+// is unknown. Saying "Connecting…" straight away is a flash on every open,
+// because the answer normally beats the eye — but staying blank forever hides a
+// daemon that is genuinely slow. So: silence, then the neutral line.
+const CONNECTING_GRACE_MS = 750;
+let connectionGrace: number | Timer | undefined;
+
+function startConnectionGrace(): void {
+  if (connectionGrace !== undefined || state.connectionKnown) return;
+  connectionGrace = setTimeout(() => {
+    connectionGrace = undefined;
+    if (state.connectionKnown) return;
+    state.connectingVisible = true;
+    render();
+  }, CONNECTING_GRACE_MS);
+}
+
 function cancelAutoReconnect(): void {
   reconnectToken += 1;
   reconnectScheduled = false;
@@ -303,6 +328,14 @@ function clearOfflineItemMessages(): void {
 function setConnection(connected: boolean, message: string, code?: string): void {
   const wasConnected = state.connected;
   state.connected = connected;
+  // Until the first probe settles, connectivity is unknown rather than lost:
+  // rendering the initial "not connected" default flashed a red "Disconnected"
+  // banner on every open, before anything had been asked of the daemon.
+  state.connectionKnown = true;
+  if (connectionGrace !== undefined) {
+    clearTimeout(connectionGrace);
+    connectionGrace = undefined;
+  }
   state.connectionMessage = message;
   state.connectionSessionElsewhere = !connected && code === "session_busy";
   if (connected) {
@@ -1823,19 +1856,28 @@ function renderDialog(): void {
 
 function render(): void {
   if (elements === null) return;
-  const isDisconnected = !state.connected;
-  // A refused session is not lost connectivity: the daemon answered. Promising
-  // an automatic recovery and pointing at `papio status` sent the researcher
-  // looking for a broken daemon that was working the whole time.
-  elements.connection.textContent = isDisconnected
-    ? state.connectionSessionElsewhere
-      ? `Not this browser: ${state.connectionMessage} The inbox reconnects by itself once it does.`
-      : `Disconnected: ${state.connectionMessage} Reconnecting automatically — run papio status if this persists.`
-    : state.connectionMessage;
-  elements.connection.dataset.state = isDisconnected ? "disconnected" : "connected";
-  const showConnection = isDisconnected || /^connecting/i.test(state.connectionMessage);
-  elements.connection.hidden = !showConnection;
-  elements.reconnect.hidden = !isDisconnected;
+  if (!state.connectionKnown) {
+    // Nothing has answered yet. The old code read `connected: false` as a
+    // verdict, so every open flashed a red "Disconnected" before the first
+    // snapshot returned.
+    elements.connection.textContent = "Connecting to daemon…";
+    delete elements.connection.dataset.state;
+    elements.connection.hidden = !state.connectingVisible;
+    elements.reconnect.hidden = true;
+  } else {
+    const isDisconnected = !state.connected;
+    // A refused session is not lost connectivity: the daemon answered. Promising
+    // an automatic recovery and pointing at `papio status` sent the researcher
+    // looking for a broken daemon that was working the whole time.
+    elements.connection.textContent = isDisconnected
+      ? state.connectionSessionElsewhere
+        ? `Not this browser: ${state.connectionMessage} The inbox reconnects by itself once it does.`
+        : `Disconnected: ${state.connectionMessage} Reconnecting automatically — run papio status if this persists.`
+      : state.connectionMessage;
+    elements.connection.dataset.state = isDisconnected ? "disconnected" : "connected";
+    elements.connection.hidden = !isDisconnected;
+    elements.reconnect.hidden = !isDisconnected;
+  }
   elements.refresh.disabled = state.loading;
   elements.reconnect.disabled = state.loading;
   renderCounts();
@@ -3120,6 +3162,7 @@ function bootstrap(): void {
   void loadSuccessAckMode();
   sendInboxPresence(true);
   render();
+  startConnectionGrace();
   void refreshInbox();
   scheduleCountsPoll();
 }

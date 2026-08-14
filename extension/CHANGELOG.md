@@ -36,6 +36,13 @@ for the full pre-split extension history.
   line in their markup, painted before the first read returned, so every popup
   opened with a flash of it. Both now start empty and hidden, and only the
   renderer reveals them.
+- **Opening the inbox no longer flashes "Disconnected".** Connectivity started
+  as `false`, which is "not asked yet" rather than a verdict, and the first
+  paint reported it as lost connectivity — complete with an automatic-reconnect
+  promise and a `papio status` suggestion — before anything had been asked of
+  the daemon. Connectivity is now a third state until the first read settles:
+  the banner stays silent, and a daemon that really is slow gets a neutral
+  *Connecting to daemon…* after a short grace instead of an accusation.
 - **Plain words for an unknown or scheduled status.** *Can't tell* never said
   whether papio had looked and found nothing or had not looked yet; every
   unknown state now names its cause (*Progress unknown — the papio daemon
