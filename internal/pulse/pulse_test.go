@@ -48,6 +48,9 @@ func TestReadFutureRetryIsScheduledNotStalled(t *testing.T) {
 		t.Fatal(err)
 	}
 	snap, err := (&Service{Jobs: js, Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if snap.ProjectionComplete == nil || !*snap.ProjectionComplete {
 		t.Fatalf("projection_complete = %v", snap.ProjectionComplete)
 	}

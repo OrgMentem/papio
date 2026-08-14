@@ -1035,21 +1035,6 @@ func (in AuthenticationEntryLeaseInput) validate() error {
 	return nil
 }
 
-func (l AuthenticationEntryLease) valid() bool {
-	return l.AuthenticationClaimID != "" && l.LeaseID != "" && l.OwnerID != "" &&
-		l.BrowserHolderGeneration >= 0 &&
-		(l.State == AuthenticationEntryLeaseReserved || l.State == AuthenticationEntryLeaseHuman ||
-			l.State == AuthenticationEntryLeaseExpired)
-}
-
-func scanAuthenticationEntryLease(row *sql.Row) (AuthenticationEntryLease, error) {
-	var l AuthenticationEntryLease
-	err := row.Scan(&l.AuthenticationClaimID, &l.LeaseID, &l.OwnerID,
-		&l.BrowserHolderGeneration, &l.State, &l.LeaseUntil, &l.HumanOwnerID,
-		&l.EvidenceObservationID, &l.CreatedAt, &l.UpdatedAt)
-	return l, err
-}
-
 // ReserveAuthenticationEntryLease claims one authentication entry for an
 // owner. A replay of the same reservation is idempotent; a different live
 // reservation receives Busy. A new observed authentication-entry attempt

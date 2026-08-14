@@ -94,6 +94,8 @@ func xdgDownloadDir() string {
 		}
 		configHome = filepath.Join(home, ".config")
 	}
+	// #nosec G703 -- XDG_CONFIG_HOME is the user's explicit local config root;
+	// reading its standard user-dirs file is the purpose of this lookup.
 	content, err := os.ReadFile(filepath.Join(configHome, "user-dirs.dirs"))
 	if err != nil {
 		return ""

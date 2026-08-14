@@ -4,8 +4,9 @@ package cli
 
 import (
 	"fmt"
-	"github.com/spf13/cobra"
 	"strconv"
+
+	"github.com/spf13/cobra"
 
 	"papio/internal/api"
 	"papio/internal/notify"

@@ -348,6 +348,8 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	fixturePath := filepath.Join(workspace, "fixture.html")
 	reportPath := filepath.Join(workspace, "report.md")
 	applyPath := filepath.Join(workspace, "apply.md")
+	// #nosec G703 -- workspace is under the repo scratch root and both variable
+	// path segments passed adapterRepairSegmentRE before this write.
 	if err := os.WriteFile(fixturePath, []byte(fixture), 0o600); err != nil {
 		return adapterRepairResult{}, fmt.Errorf("write fixture: %w", err)
 	}
@@ -389,6 +391,7 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 		}
 	}
 	report := fmt.Sprintf("# Adapter repair analysis\n\nProvider: `%s`\nScenario: `%s`\nEvidence: %s\nFixture SHA-256: `%s`\nCurrent adapter version: `%s`\nNext adapter revision: `%s`\nVersion source: %s\n\n## adapter-try output (against exact emitted fixture bytes)\n\n%s", capture.Provider, capture.Scenario, evidenceStatus, capture.SHA256, currentVersion, nextRevision, sourceStatus, analysis)
+	// #nosec G703 -- reportPath shares the validated, repo-owned workspace above.
 	if err := os.WriteFile(reportPath, []byte(report), 0o600); err != nil {
 		return adapterRepairResult{}, fmt.Errorf("write report: %w", err)
 	}

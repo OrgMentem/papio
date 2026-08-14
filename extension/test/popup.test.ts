@@ -3497,7 +3497,7 @@ test("a slower earlier refresh cannot paint over a newer one", async () => {
       ...(globalThis as unknown as { chrome: Record<string, unknown> }).chrome,
       storage: {
         local: {
-          get: async () => ({ papio_state_v1: { connectionStatus: "connected" } }),
+          get: async () => ({ papio_state_v1: { activeJobs: [], connectionStatus: "connected" } }),
           set: async () => {},
         },
       },

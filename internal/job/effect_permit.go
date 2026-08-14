@@ -244,8 +244,7 @@ type EffectPermitObservation struct {
 func (k EffectKind) valid() bool {
 	return k == GenericDrive || k == DirectGet || k == PDFGrab || k == Terms || k == Institutional
 }
-func (s EffectPermitStatus) valid() bool { return s == Held || s == UnknownCompletion || s == Settled }
-func nonempty(v string) bool             { return strings.TrimSpace(v) != "" && len(v) <= 256 }
+func nonempty(v string) bool { return strings.TrimSpace(v) != "" && len(v) <= 256 }
 
 func (i EffectPermitIdentity) validate() error {
 	if !i.Kind.valid() {
@@ -331,10 +330,10 @@ func (js *Store) ArtifactProducerForArtifact(ctx context.Context, jobID, filenam
 		}
 		var producer ArtifactProducerIdentity
 		if err := json.Unmarshal(detail.Producer, &producer); err != nil {
-			return nil, fmt.Errorf("%w: matching download observation has malformed producer: %v", ErrArtifactProducerAmbiguous, err)
+			return nil, fmt.Errorf("%w: matching download observation has malformed producer: %w", ErrArtifactProducerAmbiguous, err)
 		}
 		if err := producer.validate(jobID); err != nil {
-			return nil, fmt.Errorf("%w: matching download observation has incomplete producer: %v", ErrArtifactProducerAmbiguous, err)
+			return nil, fmt.Errorf("%w: matching download observation has incomplete producer: %w", ErrArtifactProducerAmbiguous, err)
 		}
 		if found != nil && !artifactProducerEqual(*found, producer) {
 			return nil, ErrArtifactProducerAmbiguous
@@ -487,16 +486,6 @@ func exactLegacyBlockerAdmission(status string) (EffectPermitAcquireOutcome, err
 	}
 }
 
-func currentJobAttemptTx(ctx context.Context, tx *sql.Tx, jobID string) (int64, error) {
-	var attempt int64
-	err := tx.QueryRowContext(ctx,
-		`SELECT 1 + (SELECT COUNT(*) FROM events WHERE job_id=? AND kind='job.retry_requested')
-		   FROM jobs
-		  WHERE id=?`,
-		jobID, jobID).Scan(&attempt)
-	return attempt, err
-}
-
 func authorizedJobAttemptTx(ctx context.Context, tx *sql.Tx, jobID string) (int64, error) {
 	var attempt int64
 	err := tx.QueryRowContext(ctx,
@@ -514,15 +503,6 @@ func authorizedJobAttemptTx(ctx context.Context, tx *sql.Tx, jobID string) (int6
 	return attempt, err
 }
 
-func jobStateCurrent(state string) bool {
-	switch state {
-	case StateReady, StateImported, StateUnavailable, StateFailed, StateCancelled:
-		return false
-	default:
-		return true
-	}
-}
-
 func (js *Store) AcquireEffectPermit(ctx context.Context, in EffectPermitAcquireInput) (*EffectPermit, EffectPermitAcquireOutcome, error) {
 	if err := in.validate(); err != nil {
 		return nil, EffectPermitStaleOutcome, err
@@ -532,7 +512,7 @@ func (js *Store) AcquireEffectPermit(ctx context.Context, in EffectPermitAcquire
 		return nil, EffectPermitStaleOutcome, err
 	}
 
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	where, args := identityWhere(in.Identity)
 	existing, err := scanPermit(tx.QueryRowContext(ctx, permitSelect+` WHERE `+where, args...))
 	if err == nil {
@@ -881,7 +861,7 @@ func (js *Store) SettleEffectPermit(ctx context.Context, in EffectPermitSettleIn
 	if err != nil {
 		return nil, EffectPermitSettleStale, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	where, args := identityWhere(in.Identity)
 	p, err := scanPermit(tx.QueryRowContext(ctx, permitSelect+` WHERE `+where, args...))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1172,7 +1152,7 @@ func (js *Store) ReconcileEffectPermit(ctx context.Context, obs EffectPermitObse
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	p, err := scanPermit(tx.QueryRowContext(ctx, permitSelect+` WHERE id=?`, obs.PermitID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrEffectPermitStale
@@ -1216,7 +1196,7 @@ func (js *Store) ResolveUnknownEffectPermit(ctx context.Context, id, reason stri
 	if e != nil {
 		return e
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var job sql.NullString
 	var status string
 	e = tx.QueryRowContext(ctx, `SELECT job_id,status FROM effect_permits WHERE id=?`, id).Scan(&job, &status)
@@ -1289,7 +1269,7 @@ func (js *Store) AcquireInstitutionalEffectPermit(ctx context.Context, in Instit
 	if e != nil {
 		return nil, EffectPermitStaleOutcome, e
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var existingID string
 	e = tx.QueryRowContext(ctx, `SELECT id FROM effect_permits WHERE effect_kind='institutional' AND institutional_request_id=?`, in.InstitutionalRequestID).Scan(&existingID)
 	if e == nil {

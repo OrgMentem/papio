@@ -4,13 +4,10 @@ package notify
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -475,15 +472,4 @@ func samePublicOutcome(a, b Event) bool {
 		return data
 	}
 	return string(clean(a)) == string(clean(b))
-}
-
-func stableDigest(event Event) string {
-	data, _ := json.Marshal(event)
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-func sortedCategories() []Category {
-	categories := append([]Category(nil), Categories()...)
-	sort.Slice(categories, func(i, j int) bool { return categories[i] < categories[j] })
-	return categories
 }

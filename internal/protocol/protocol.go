@@ -2223,7 +2223,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		return nil, fmt.Errorf("browser message: type %q requires a valid job_id", env.Type)
 	}
 	if env.Type == MsgEffectPermitReconcileRequest {
-		effectKind, _ := payloadFields["effect_kind"]
+		effectKind := payloadFields["effect_kind"]
 		var kind string
 		_ = json.Unmarshal(effectKind, &kind)
 		if kind == "pdf_grab" {
@@ -3401,7 +3401,7 @@ func (p *WorkPulseResponsePayload) validate() error {
 		}
 		prior = episode
 	}
-	if p.StallEpisodesTruncated != nil && *p.StallEpisodesTruncated == false && p.Stalled != nil {
+	if p.StallEpisodesTruncated != nil && !*p.StallEpisodesTruncated && p.Stalled != nil {
 		sum := int64(0)
 		for _, episode := range p.StallEpisodes {
 			sum += episode.Count

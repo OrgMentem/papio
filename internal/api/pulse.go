@@ -10,7 +10,6 @@ import (
 	"papio/internal/bootstrap"
 	"papio/internal/ipc"
 	"papio/internal/protocol"
-	"papio/internal/pulse"
 )
 
 // PulseResult is the purpose-built work.pulse_v1 result. It is intentionally a
@@ -35,11 +34,4 @@ func workPulse(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 	}
 	snapshot.RequestID = params.RequestID
 	return marshal(PulseResult(snapshot))
-}
-
-// pulseSnapshotResult makes the service-to-wire conversion explicit for tests
-// and future API evolution; currently PulseResult has the same frozen fields.
-func pulseSnapshotResult(requestID string, snapshot pulse.Snapshot) PulseResult {
-	snapshot.RequestID = requestID
-	return PulseResult(snapshot)
 }

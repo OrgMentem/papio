@@ -265,7 +265,7 @@ type Bridge struct {
 	// b.mu mid-flight (adoption windows inside poll) re-checks it afterwards:
 	// a concurrent claim/takeover must not let a resumed poll send offers to a
 	// demoted session or pollute the new holder's bookkeeping.
-	epoch      uint64
+	epoch      int64
 	offered    map[string]bool // handoff jobs offered to the current holder
 	cancelSent map[string]bool // jobs a daemon-side cancel was already announced for
 	// A replayed auth return must not make the same holder open duplicate tabs.
@@ -723,7 +723,7 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 			b.materializationGenerationUnavailable = true
 			log.Printf("papio: materialization holder generation unavailable: %v", err)
 		} else {
-			b.epoch = uint64(generation)
+			b.epoch = generation
 			b.materializationAuthorityUncertain = false
 			b.materializationGenerationUnavailable = false
 		}
@@ -762,7 +762,7 @@ func (b *Bridge) reconcileMaterializationGeneration(ctx context.Context) {
 	if b.jobs == nil || b.materializationGenerationUnavailable || b.materializationProfileAuthorityUnavailable {
 		return
 	}
-	count, err := b.jobs.AbandonStaleMaterializations(ctx, int64(b.epoch))
+	count, err := b.jobs.AbandonStaleMaterializations(ctx, b.epoch)
 	if err != nil {
 		b.materializationAuthorityUncertain = true
 		log.Printf("papio: abandoning stale materialization claims failed: %v", err)
@@ -1452,7 +1452,7 @@ func (b *Bridge) institutionalClaim(ctx context.Context, jobID string, p *protoc
 	}
 	leaseUntil := b.now().Add(b.actionExpiry())
 	claim, err := b.jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision:         candidate.JobAttemptRevision,
 		InstitutionProfileRevision: candidate.InstitutionProfileRevision,
 		RouteRevision:              candidate.RouteRevision, MaterializationKind: p.MaterializationKind,
@@ -1500,7 +1500,7 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 	}
 	if candidate == nil || candidate.JobID != jobID || p.TabID < 0 ||
 		!liveMaterializationClaim(claim, b.now()) ||
-		claim.BrowserHolderGeneration != int64(b.epoch) || claim.MaterializationKind != "browser_tab" {
+		claim.BrowserHolderGeneration != b.epoch || claim.MaterializationKind != "browser_tab" {
 		result.Outcome, result.Detail = "stale", "claim is fenced to another holder"
 		return b.frameInstitutionalBind(jobID, result)
 	}
@@ -1513,7 +1513,7 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 		result.Outcome, result.Detail = "not_eligible", "the handoff is no longer open"
 		return b.frameInstitutionalBind(jobID, result)
 	}
-	err = b.jobs.BindMaterialization(ctx, claim.ID, p.BindingID, int64(b.epoch), candidate.InstitutionProfileRevision, p.TabID)
+	err = b.jobs.BindMaterialization(ctx, claim.ID, p.BindingID, b.epoch, candidate.InstitutionProfileRevision, p.TabID)
 	if err != nil {
 		result.Outcome = "stale"
 		if !errors.Is(err, job.ErrMaterializationStale) && !errors.Is(err, job.ErrMaterializationConflict) {
@@ -1551,7 +1551,7 @@ func (b *Bridge) institutionalRoute(ctx context.Context, jobID string, p *protoc
 		}
 		return b.frameInstitutionalRoute(jobID, result)
 	}
-	if claim.BindingID != p.BindingID || claim.BrowserHolderGeneration != int64(b.epoch) ||
+	if claim.BindingID != p.BindingID || claim.BrowserHolderGeneration != b.epoch ||
 		claim.MaterializationKind != "browser_tab" ||
 		(claim.Phase != "bound" && claim.Phase != "route_issued" && claim.Phase != "navigated") {
 		result.Outcome, result.Detail = "stale", "claim is fenced to another holder"
@@ -1609,7 +1609,7 @@ func (b *Bridge) institutionalRoute(ctx context.Context, jobID string, p *protoc
 		SafetyDomainID:          candidate.SafetyDomainID,
 		InstitutionalRequestID:  p.InstitutionalRequestID,
 		JobAttemptRevision:      candidate.JobAttemptRevision,
-		BrowserHolderGeneration: int64(b.epoch),
+		BrowserHolderGeneration: b.epoch,
 		ExpectedEffectOrdinal:   p.ExpectedEffectOrdinal,
 		LeaseUntil:              leaseUntil,
 		Authorization: job.EffectPermitEvent{Kind: "browser.institutional_effect_authorized", Detail: map[string]any{
@@ -1727,7 +1727,7 @@ func (b *Bridge) institutionalNavigatedForSession(ctx context.Context, jobID str
 		}
 		return b.frameInstitutionalNavigated(jobID, result)
 	}
-	currentHolderGeneration := int64(b.epoch)
+	currentHolderGeneration := b.epoch
 	if !currentHolder {
 		// A negotiated non-holder may settle its exact historical navigation,
 		// but it can never pass the current-holder projection fence.
@@ -1802,7 +1802,7 @@ func (b *Bridge) institutionalReconcile(ctx context.Context, p *protocol.Institu
 				continue
 			}
 			if !liveMaterializationClaim(claim, b.now()) ||
-				claim.BrowserHolderGeneration != int64(b.epoch) || claim.MaterializationKind != "browser_tab" {
+				claim.BrowserHolderGeneration != b.epoch || claim.MaterializationKind != "browser_tab" {
 				continue
 			}
 			candidate, err := b.jobs.GetBrowserCandidate(ctx, claim.CandidateID)
@@ -2310,7 +2310,7 @@ func (b *Bridge) providerDriveEpochAuthorized(ctx context.Context, jobID, safety
 func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *protocol.ProviderDriveEpochStartRequestPayload) ([]json.RawMessage, error) {
 	var requestID, driveAttemptID, strategy, revision string
 	var ordinal int64
-	outcome, detail := "stale", "drive epoch is not the current offered tuple"
+	var outcome, detail string
 	if p == nil {
 		outcome, detail = "error", "malformed provider drive epoch tuple"
 	} else {
@@ -2350,7 +2350,7 @@ func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *p
 									DriveAttemptID: driveAttemptID, Ordinal: ordinal,
 									Strategy: strategy, Revision: revision,
 								},
-								JobAttemptRevision: attempt, BrowserHolderGeneration: int64(b.epoch),
+								JobAttemptRevision: attempt, BrowserHolderGeneration: b.epoch,
 								SafetyDomainID: domain, LeaseUntil: b.now().UTC().Add(b.actionExpiry()),
 								Authorization: job.EffectPermitEvent{Kind: "browser.provider_drive_epoch_started", Detail: map[string]any{
 									"drive_attempt_id": driveAttemptID, "ordinal": ordinal,
@@ -2359,7 +2359,7 @@ func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *p
 							})
 							exactReplay := permit != nil && permit.Status == job.EffectPermitHeld &&
 								permit.JobAttemptRevision == attempt &&
-								permit.BrowserHolderGeneration == int64(b.epoch) &&
+								permit.BrowserHolderGeneration == b.epoch &&
 								permit.SafetyDomainID == domain
 							switch {
 							case acquireErr != nil && errors.Is(acquireErr, job.ErrEffectPermitBusy):
@@ -2403,7 +2403,7 @@ func (b *Bridge) providerDriveEpochResult(ctx context.Context, jobID string, p *
 func (b *Bridge) providerDriveEpochResultForSession(ctx context.Context, jobID string, p *protocol.ProviderDriveEpochResultRequestPayload, currentHolder bool) ([]json.RawMessage, error) {
 	var requestID, driveAttemptID, strategy, revision string
 	var ordinal int64
-	outcome, detail := "stale", "drive epoch result does not match a started tuple"
+	var outcome, detail string
 	if p == nil {
 		outcome, detail = "error", "malformed provider drive epoch tuple"
 	} else {
@@ -2463,7 +2463,7 @@ func (b *Bridge) providerDriveEpochResultForSession(ctx context.Context, jobID s
 					if currentHolder {
 						currentAttempt, attemptErr = b.jobs.MaterializationAttemptRevision(ctx, jobID)
 					}
-					current := currentHolder && attemptErr == nil && permit.JobAttemptRevision == currentAttempt && permit.BrowserHolderGeneration == int64(b.epoch)
+					current := currentHolder && attemptErr == nil && permit.JobAttemptRevision == currentAttempt && permit.BrowserHolderGeneration == b.epoch
 					if attemptErr != nil {
 						outcome, detail = "error", "provider drive attempt state is unavailable"
 					} else {
@@ -2479,7 +2479,7 @@ func (b *Bridge) providerDriveEpochResultForSession(ctx context.Context, jobID s
 								"strategy": strategy, "revision": revision, "safety_domain": permit.SafetyDomainID,
 							}})
 						}
-						settleGeneration := int64(b.epoch)
+						settleGeneration := b.epoch
 						if !currentHolder {
 							settleGeneration = -1
 						}
@@ -2573,19 +2573,6 @@ func providerDriveEpochResultDetail(events []map[string]any, tuple string) (map[
 	return nil, false
 }
 
-func effectPermitOverrideRecorded(events []map[string]any, permitID string) bool {
-	for _, event := range events {
-		if event["kind"] != "effect_permit.override" {
-			continue
-		}
-		detail, _ := event["detail"].(map[string]any)
-		if stringDetail(detail, "permit_id") == permitID {
-			return true
-		}
-	}
-	return false
-}
-
 // providerDriveSafetyDomain derives the current provider safety domain only
 // from durable provider-drive offer history. Client-supplied terms metadata is
 // never a safety-domain authority.
@@ -2611,7 +2598,7 @@ func (b *Bridge) providerDriveSafetyDomain(ctx context.Context, jobID string) (s
 
 func (b *Bridge) termsEffectStart(ctx context.Context, jobID string, p *protocol.TermsEffectStartRequestPayload) ([]json.RawMessage, error) {
 	requestID := ""
-	outcome, detail := "stale", "terms effect is not authorized"
+	var outcome, detail string
 	var permitID, occurrenceID string
 	if p != nil {
 		requestID = p.RequestID
@@ -2648,7 +2635,7 @@ func (b *Bridge) termsEffectStart(ctx context.Context, jobID string, p *protocol
 					}
 					permit, acquireOutcome, acquireErr := b.jobs.AcquireEffectPermit(ctx, job.EffectPermitAcquireInput{
 						Identity: identity, JobAttemptRevision: attempt,
-						BrowserHolderGeneration: int64(b.epoch), SafetyDomainID: domain,
+						BrowserHolderGeneration: b.epoch, SafetyDomainID: domain,
 						LeaseUntil: b.now().UTC().Add(b.actionExpiry()),
 						Authorization: job.EffectPermitEvent{Kind: "browser.terms_effect_authorized", Detail: map[string]any{
 							"terms_occurrence_id": occurrenceID,
@@ -2668,7 +2655,7 @@ func (b *Bridge) termsEffectStart(ctx context.Context, jobID string, p *protocol
 					case acquireOutcome == job.EffectPermitDuplicate &&
 						permit.Status == job.EffectPermitHeld &&
 						permit.JobAttemptRevision == attempt &&
-						permit.BrowserHolderGeneration == int64(b.epoch) &&
+						permit.BrowserHolderGeneration == b.epoch &&
 						permit.SafetyDomainID == domain:
 						// The start response may have been lost before the
 						// extension persisted the tuple. Re-issue the same
@@ -2703,7 +2690,7 @@ func (b *Bridge) termsEffectStart(ctx context.Context, jobID string, p *protocol
 func (b *Bridge) termsEffectResult(ctx context.Context, jobID string, p *protocol.TermsEffectResultRequestPayload) ([]json.RawMessage, error) {
 	requestID := ""
 	permitID, occurrenceID := "", ""
-	outcome, detail := "stale", "terms effect result does not match a permit"
+	var outcome, detail string
 	if p != nil {
 		requestID, permitID, occurrenceID = p.RequestID, p.PermitID, p.TermsOccurrenceID
 	}
@@ -2965,7 +2952,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 			b.materializationGenerationUnavailable = true
 			log.Printf("papio: materialization holder generation unavailable: %v", genErr)
 		} else {
-			b.epoch = uint64(generation)
+			b.epoch = generation
 			b.materializationGenerationUnavailable = false
 		}
 	}
@@ -3176,6 +3163,7 @@ func (b *Bridge) triageSnapshotPayload(ctx context.Context, requestID string, sc
 			}
 		case triage.KindPdfGrab:
 			if schema < 4 || item.PdfGrab == nil {
+				continue
 			}
 			payload.Kind = triage.KindPdfGrab
 			payload.Label = item.Title
@@ -4654,7 +4642,8 @@ func (b *Bridge) pageBulkSubmitV2(ctx context.Context, request *protocol.PageBul
 		return b.submitPageBulkMembers(submitCtx, keys)
 	})
 	if err != nil {
-		if conflict, ok := err.(*batch.ConflictError); ok {
+		conflict := &batch.ConflictError{}
+		if errors.As(err, &conflict) {
 			return b.unavailable(request.RequestID, "page_bulk_cohort_conflict", conflict.Error(), "page bulk cohort", err)
 		}
 		return b.unavailable(request.RequestID, "page_bulk_cohort_unavailable", "page-bulk cohort submission is temporarily unavailable", "page bulk cohort", err)
@@ -4799,7 +4788,7 @@ func (b *Bridge) pdfGrab(ctx context.Context, sessionID string, request *protoco
 		preparedDir = dir
 		return nil
 	}
-	g, err := b.grabs.AllocateEffect(ctx, normalizedHost, title, int64(b.epoch), safetyDomain, b.now().Add(b.actionExpiry()), prepare, request.RequestID)
+	g, err := b.grabs.AllocateEffect(ctx, normalizedHost, title, b.epoch, safetyDomain, b.now().Add(b.actionExpiry()), prepare, request.RequestID)
 	if err != nil {
 		if preparedDir != "" {
 			_ = os.RemoveAll(preparedDir)
@@ -4892,7 +4881,7 @@ func (b *Bridge) pdfGrabAbandonSession(ctx context.Context, sessionID string, re
 		return []json.RawMessage{frame}, nil
 	}
 	return b.pdfGrabAbandonWith(ctx, request, request.RequestID, func() error {
-		return b.grabs.MarkAbandonedForRequest(ctx, request.GrabID, request.RequestID, int64(b.epoch), "The PDF grab download was interrupted")
+		return b.grabs.MarkAbandonedForRequest(ctx, request.GrabID, request.RequestID, b.epoch, "The PDF grab download was interrupted")
 	})
 }
 func (b *Bridge) pdfGrabAbandonWith(ctx context.Context, request *protocol.PdfGrabAbandonRequestPayload, expectedRequestID string, abandon func() error) ([]json.RawMessage, error) {
@@ -5106,7 +5095,7 @@ func (b *Bridge) weighArtifact(ctx context.Context, jobID, filename string) (*ar
 	if err != nil {
 		return nil, err
 	}
-	claim, candidate, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, int64(b.epoch))
+	claim, candidate, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.epoch)
 	if err != nil {
 		return nil, err
 	}
@@ -5246,7 +5235,7 @@ func (b *Bridge) commitArtifact(
 	if fence.candidate != nil {
 		_, won, settled, err := b.jobs.CommitArtifactWinnerAndProducer(ctx, job.ArtifactWinner{
 			JobID: jobID, JobAttemptRevision: fence.attempt, CandidateID: fence.candidate.ID,
-			BrowserHolderGeneration: int64(b.epoch), SHA256: fence.digest,
+			BrowserHolderGeneration: b.epoch, SHA256: fence.digest,
 		}, producer)
 		switch {
 		case errors.Is(err, job.ErrMaterializationStale):
@@ -5496,7 +5485,7 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	}
 	idParts := []string{
 		profile.ID, strconv.FormatInt(observedRevision, 10),
-		strconv.FormatUint(b.epoch, 10), string(verdict), string(source),
+		strconv.FormatInt(b.epoch, 10), string(verdict), string(source),
 	}
 	if strings.TrimSpace(observationID) == "" {
 		idParts = append(idParts, producerObservedAt)
@@ -5506,7 +5495,7 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	sum := sha256.Sum256([]byte(strings.Join(idParts, "\x00")))
 	observationID = hex.EncodeToString(sum[:])
 	recordErr := b.jobs.RecordProfileEvidence(ctx, job.ProfileEvidenceObservation{
-		ObservationID: observationID, BrowserHolderGeneration: int64(b.epoch),
+		ObservationID: observationID, BrowserHolderGeneration: b.epoch,
 		InstitutionProfileID: profile.ID, InstitutionProfileRevision: observedRevision,
 		Verdict: verdict, Source: source, ProducerObservedAt: producerObservedAt,
 		DaemonReceivedAt: received.Format(time.RFC3339Nano),
@@ -5546,12 +5535,12 @@ func (b *Bridge) reserveAuthenticationEntry(ctx context.Context, resolverName, j
 		return err
 	}
 	leaseID := evidenceObservationID("authentication_entry", profile.AuthenticationClaimID,
-		jobID, strconv.FormatUint(b.epoch, 10))
+		jobID, strconv.FormatInt(b.epoch, 10))
 	_, err = b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
 		AuthenticationClaimID:   profile.AuthenticationClaimID,
 		LeaseID:                 leaseID,
 		OwnerID:                 jobID,
-		BrowserHolderGeneration: int64(b.epoch),
+		BrowserHolderGeneration: b.epoch,
 		LeaseUntil:              b.now().UTC().Add(profileEvidenceTTL),
 	})
 	if errors.Is(err, job.ErrAuthenticationEntryLeaseBusy) {
@@ -6036,8 +6025,6 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 			break
 		}
 		wasOffered := b.offered[candidate.row.ID]
-		if !wasOffered && available <= 0 {
-		}
 		if err := b.jobs.RecordEvent(ctx, candidate.row.ID, "browser.handoff_reoffered",
 			map[string]any{"reason": "institutional_session_live"}); err != nil {
 			return err
@@ -7858,7 +7845,7 @@ jobLoop:
 							permit.BrowserHolderGeneration == int64(b.epoch) &&
 							permit.SafetyDomainID == candidateDomain
 						if permitErr != nil || (permitOutcome != job.EffectPermitAcquired &&
-							!(permitOutcome == job.EffectPermitDuplicate && exactReplay)) {
+							(permitOutcome != job.EffectPermitDuplicate || !exactReplay)) {
 							if !errors.Is(permitErr, job.ErrEffectPermitBusy) &&
 								permitOutcome != job.EffectPermitBusyOutcome {
 								delete(b.directRouteAttempts, attemptKey)
@@ -8166,7 +8153,6 @@ jobLoop:
 						delete(b.materializationOffered, id)
 						delete(b.materializationTracked, id)
 						tracked = false
-						newCandidate = true
 						delete(b.cancelSent, id)
 					}
 					expiresAt := now.Add(b.actionExpiry())
@@ -8523,12 +8509,6 @@ func directRouteOrdinal(detail map[string]any) (int, bool) {
 	}
 }
 
-// stringValue reads an event column that the store returns as an untyped map
-// value.
-func stringValue(v any) string {
-	s, _ := v.(string)
-	return s
-}
 func directRouteAttemptKey(jobID string, ordinal int, revision string) string {
 	return jobID + "\x00" + strconv.Itoa(ordinal) + "\x00" + revision
 }

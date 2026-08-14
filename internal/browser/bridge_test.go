@@ -5209,7 +5209,7 @@ func TestSweepAdoptionRequiresWinningTheAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimSweep, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-sweep", BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: "candidate-sweep", BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -5266,7 +5266,7 @@ func TestWinnerIsNotCommittedBeforeValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-order", BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: "candidate-order", BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -5319,7 +5319,7 @@ func TestFailedAdoptionLeavesTheAttemptWinnable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-failed", BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: "candidate-failed", BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -5384,7 +5384,7 @@ func TestBufferedFrameDoesNotPromoteIntoTheNewRevision(t *testing.T) {
 	if accepted {
 		t.Fatal("a frame produced under the superseded revision was accepted")
 	}
-	if _, ok, err := jobs.CurrentProfileEvidence(ctx, profile.ID, bumped[0].Revision, int64(b.epoch)); err != nil || ok {
+	if _, ok, err := jobs.CurrentProfileEvidence(ctx, profile.ID, bumped[0].Revision, b.epoch); err != nil || ok {
 		t.Fatalf("stale observation became current evidence for the new revision: ok=%v err=%v", ok, err)
 	}
 }
@@ -5534,7 +5534,7 @@ func TestReconcileRefusesATabThatIsNotTheClaimsOwn(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-tab", BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: "candidate-tab", BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -5543,7 +5543,7 @@ func TestReconcileRefusesATabThatIsNotTheClaimsOwn(t *testing.T) {
 		t.Fatal(err)
 	}
 	const boundTab = 41
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profiles[0].Revision, boundTab); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profiles[0].Revision, boundTab); err != nil {
 		t.Fatal(err)
 	}
 	reconcile := func(tab int64) *protocol.InstitutionalReconcileResponsePayload {
@@ -5597,7 +5597,7 @@ func TestReconcileConfirmsAClaimedButUnboundClaim(t *testing.T) {
 	}
 	// Claimed, never bound: tab_id is still 0.
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-unbound", BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: "candidate-unbound", BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -5904,7 +5904,7 @@ func TestAuthTrafficRenewsTheMaterializationLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-renew", BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: "candidate-renew", BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(30 * time.Second),
@@ -7433,7 +7433,7 @@ func TestPdfGrabAllocatesSteeringPath(t *testing.T) {
 		Scan(&jobID, &attempt, &holder, &domain, &kind, &status, &grabID); err != nil {
 		t.Fatalf("pdf grab permit lookup: %v", err)
 	}
-	if jobID.Valid || attempt != 0 || holder != int64(b.epoch) ||
+	if jobID.Valid || attempt != 0 || holder != b.epoch ||
 		domain != "pdf_grab:pdf.example.org" || kind != "pdf_grab" ||
 		status != "held" || grabID != p.GrabID {
 		t.Fatalf("pdf grab permit = job_id=%v attempt=%d holder=%d domain=%q kind=%q status=%q grab_id=%q",
@@ -8340,7 +8340,7 @@ func TestDirectRouteUsesTupleProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if permit.JobAttemptRevision != attempt || permit.BrowserHolderGeneration != int64(b.epoch) {
+	if permit.JobAttemptRevision != attempt || permit.BrowserHolderGeneration != b.epoch {
 		t.Fatalf("direct permit fences = attempt %d/holder %d, want %d/%d", permit.JobAttemptRevision, permit.BrowserHolderGeneration, attempt, b.epoch)
 	}
 	result := inFrame(t, protocol.MsgProviderDirectGetResult, id, protocol.ProviderDirectGetResultPayload{
@@ -8785,16 +8785,11 @@ func TestProviderDriveEpochLateFramesCannotMutateClosedOrSupersededJob(t *testin
 
 type providerEpochLifecycleBoundary struct {
 	eventSeqs []int64
-	state     string
 }
 
 func snapshotProviderEpochLifecycleBoundary(t *testing.T, jobs *job.Store, id string) providerEpochLifecycleBoundary {
 	t.Helper()
 	events, err := jobs.Events(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	row, err := jobs.Get(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -8806,37 +8801,7 @@ func snapshotProviderEpochLifecycleBoundary(t *testing.T, jobs *job.Store, id st
 		}
 		seqs[i] = seq
 	}
-	return providerEpochLifecycleBoundary{eventSeqs: seqs, state: row.State}
-}
-
-func assertNoProviderEpochMutationSince(t *testing.T, jobs *job.Store, id string, boundary providerEpochLifecycleBoundary) {
-	t.Helper()
-	events, err := jobs.Events(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(events) < len(boundary.eventSeqs) {
-		t.Fatalf("event sequence shrank after late provider frame: before=%d after=%d", len(boundary.eventSeqs), len(events))
-	}
-	for i, wantSeq := range boundary.eventSeqs {
-		seq, ok := events[i]["seq"].(int64)
-		if !ok || seq != wantSeq {
-			t.Fatalf("event sequence changed before late-frame boundary at index %d: got=%#v want=%d", i, events[i]["seq"], wantSeq)
-		}
-	}
-	row, err := jobs.Get(context.Background(), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if row.State != boundary.state {
-		t.Fatalf("job state changed after late provider frame: got=%q want=%q", row.State, boundary.state)
-	}
-	for _, event := range events[len(boundary.eventSeqs):] {
-		switch event["kind"] {
-		case "browser.provider_drive_epoch_started", "browser.provider_drive_epoch_result", providerLatchEventKind:
-			t.Fatalf("late provider frame mutated job: %#v", event)
-		}
-	}
+	return providerEpochLifecycleBoundary{eventSeqs: seqs}
 }
 
 func assertNoProviderEpochMutation(t *testing.T, jobs *job.Store, id string) {
@@ -9126,7 +9091,7 @@ func TestInstitutionalRouteProfileFencePrecedesURLDerivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision:         candidate.JobAttemptRevision,
 		InstitutionProfileRevision: candidate.InstitutionProfileRevision,
 		RouteRevision:              candidate.RouteRevision, MaterializationKind: "browser_tab",
@@ -9135,7 +9100,7 @@ func TestInstitutionalRouteProfileFencePrecedesURLDerivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 0); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
@@ -9199,7 +9164,7 @@ func TestDeliveredArtifactIsFencedToTheWinningMaterialization(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -9207,14 +9172,14 @@ func TestDeliveredArtifactIsFencedToTheWinningMaterialization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 3); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 3); err != nil {
 		t.Fatal(err)
 	}
-	ordinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, int64(b.epoch), 0)
+	ordinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, b.epoch, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.AcknowledgeMaterializationNavigation(ctx, claim.ID, claim.BindingID, int64(b.epoch), ordinal, 3); err != nil {
+	if err := jobs.AcknowledgeMaterializationNavigation(ctx, claim.ID, claim.BindingID, b.epoch, ordinal, 3); err != nil {
 		t.Fatal(err)
 	}
 
@@ -9227,7 +9192,7 @@ func TestDeliveredArtifactIsFencedToTheWinningMaterialization(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("artifact winner after adoption ok=%v err=%v", ok, err)
 	}
-	if winner.CandidateID != candidate.ID || winner.BrowserHolderGeneration != int64(b.epoch) {
+	if winner.CandidateID != candidate.ID || winner.BrowserHolderGeneration != b.epoch {
 		t.Fatalf("winner = %+v, want the navigated candidate and holder", winner)
 	}
 	settled, err := jobs.GetMaterializationClaim(ctx, claim.ID)
@@ -9307,7 +9272,7 @@ func TestLateArtifactStaleClaimRecordsWinnerAndSettlesExactProducer(t *testing.T
 					if err != nil {
 						t.Fatal(err)
 					}
-					holder := int64(b.epoch)
+					holder := b.epoch
 					claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
 						CandidateID: candidate.ID, BrowserHolderGeneration: holder,
 						JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
@@ -9463,7 +9428,7 @@ func TestLateArtifactMissingProducerLeavesExactPermitHeld(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	holder := int64(b.epoch)
+	holder := b.epoch
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
 		CandidateID: candidate.ID, BrowserHolderGeneration: holder,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
@@ -9551,7 +9516,7 @@ func TestInstitutionalReconcileAcceptsTabZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -9559,7 +9524,7 @@ func TestInstitutionalReconcileAcceptsTabZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 0); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 0); err != nil {
 		t.Fatal(err)
 	}
 	frames, err := b.institutionalReconcile(ctx, &protocol.InstitutionalReconcileRequestPayload{
@@ -9670,7 +9635,7 @@ func TestInstitutionalRouteClosedActionDoesNotIssueOrdinal(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -9678,7 +9643,7 @@ func TestInstitutionalRouteClosedActionDoesNotIssueOrdinal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 0); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 0); err != nil {
 		t.Fatal(err)
 	}
 	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
@@ -10578,10 +10543,10 @@ func TestBridgeEvidenceIsFencedToHolderGenerationAcrossTakeover(t *testing.T) {
 	}
 	now = now.Add(sessionStaleAfter + time.Second)
 	runSyncAs(t, b, "holder-b", hello())
-	if b.epoch == uint64(firstGeneration) {
+	if b.epoch == firstGeneration {
 		t.Fatalf("holder takeover did not advance generation: %d", firstGeneration)
 	}
-	current, found, err := jobs.CurrentProfileEvidence(context.Background(), mustProfileID(t, jobs, "alpha"), 1, int64(b.epoch))
+	current, found, err := jobs.CurrentProfileEvidence(context.Background(), mustProfileID(t, jobs, "alpha"), 1, b.epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -10660,10 +10625,10 @@ func TestBridgeWarmEvidenceIsExactProfileDespiteSharedAuthClaim(t *testing.T) {
 	if alpha.AuthenticationClaimID != beta.AuthenticationClaimID {
 		t.Fatalf("test setup claims differ: %q vs %q", alpha.AuthenticationClaimID, beta.AuthenticationClaimID)
 	}
-	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), alpha.ID, alpha.Revision, int64(b.epoch)); err != nil || !ok {
+	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), alpha.ID, alpha.Revision, b.epoch); err != nil || !ok {
 		t.Fatalf("alpha warm evidence missing: ok=%v err=%v", ok, err)
 	}
-	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), beta.ID, beta.Revision, int64(b.epoch)); err != nil || ok {
+	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), beta.ID, beta.Revision, b.epoch); err != nil || ok {
 		t.Fatalf("beta inherited alpha warm evidence: ok=%v err=%v", ok, err)
 	}
 }
@@ -11928,7 +11893,9 @@ func TestEffectPermitReconcileDispatchedRemainsHeld(t *testing.T) {
 		{"outcome": "recorded", "dispatched": false, "download_present": true, "acknowledged": false, "tab_present": false},
 		{"outcome": "recorded", "dispatched": false, "download_present": false, "acknowledged": true, "tab_present": false},
 	} {
-		jobs.S.DB().ExecContext(context.Background(), `UPDATE effect_permits SET status='held' WHERE id=?`, permit.ID)
+		if _, err := jobs.S.DB().ExecContext(context.Background(), `UPDATE effect_permits SET status='held' WHERE id=?`, permit.ID); err != nil {
+			t.Fatal(err)
+		}
 		request := nextEffectPermitReconcileRequest(t, b)
 		obs["request_id"] = request.RequestID
 		obs["permit_id"] = permit.ID
@@ -12360,7 +12327,7 @@ func TestLegacyInstitutionalNavigatedSettlesExactBlockerOnlyAndReopensAdmission(
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -12368,10 +12335,10 @@ func TestLegacyInstitutionalNavigatedSettlesExactBlockerOnlyAndReopensAdmission(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 7); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 7); err != nil {
 		t.Fatal(err)
 	}
-	effectOrdinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, int64(b.epoch), 0)
+	effectOrdinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, b.epoch, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -12449,7 +12416,7 @@ func TestLegacyInstitutionalNavigatedSettlesExactBlockerOnlyAndReopensAdmission(
 		t.Fatal(err)
 	}
 	freshClaim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: freshCandidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: freshCandidate.ID, BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 2, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -12457,7 +12424,7 @@ func TestLegacyInstitutionalNavigatedSettlesExactBlockerOnlyAndReopensAdmission(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, freshClaim.ID, freshClaim.BindingID, int64(b.epoch), profile.Revision, 8); err != nil {
+	if err := jobs.BindMaterialization(ctx, freshClaim.ID, freshClaim.BindingID, b.epoch, profile.Revision, 8); err != nil {
 		t.Fatal(err)
 	}
 	freshFrames, err := b.institutionalRoute(ctx, jobID, &protocol.InstitutionalRouteRequestPayload{
@@ -12498,7 +12465,7 @@ func TestLegacyInstitutionalNavigatedWireUsesPrePermitNegotiation(t *testing.T) 
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -12506,10 +12473,10 @@ func TestLegacyInstitutionalNavigatedWireUsesPrePermitNegotiation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profiles[0].Revision, 7); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profiles[0].Revision, 7); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, int64(b.epoch), 0); err != nil {
+	if _, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, b.epoch, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := jobs.ImportLegacyStartedEpochs(ctx); err != nil {

@@ -275,10 +275,6 @@ func (r *Runner) runWatch(ctx context.Context, watch Watch) (*RunResult, error) 
 	return result, err
 }
 
-func (r *Runner) execute(ctx context.Context, watch Watch) (*RunResult, error) {
-	return r.executeAt(ctx, watch, r.now().UTC())
-}
-
 func (r *Runner) route(ctx context.Context, intent notify.Intent) {
 	if r == nil || r.Notifier == nil {
 		return

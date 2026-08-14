@@ -601,9 +601,10 @@ func TestMaterializationMutationsRejectProfileDrift(t *testing.T) {
 				t.Fatal(err)
 			}
 			wantPhase := "claimed"
-			if tc.name == "route" {
+			switch tc.name {
+			case "route":
 				wantPhase = "bound"
-			} else if tc.name == "navigation" || tc.name == "settle" {
+			case "navigation", "settle":
 				wantPhase = "route_issued"
 				if tc.name == "settle" {
 					wantPhase = "navigated"

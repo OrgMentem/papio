@@ -221,11 +221,7 @@ type legacyChunkResult struct {
 }
 
 func encodeChunkResult(r ChunkResult) ([]byte, error) {
-	return json.Marshal(persistedChunkResult{
-		BatchID: r.BatchID, Membership: r.Membership, CohortTotal: r.CohortTotal,
-		PersistedMembers: r.PersistedMembers, Submitted: r.Submitted, Joined: r.Joined,
-		AlreadyOwned: r.AlreadyOwned, Invalid: r.Invalid,
-	})
+	return json.Marshal(persistedChunkResult(r))
 }
 
 // decodeChunkResult reads either persisted shape. A row carries exactly one of
@@ -235,21 +231,13 @@ func encodeChunkResult(r ChunkResult) ([]byte, error) {
 func decodeChunkResult(raw []byte) (ChunkResult, error) {
 	var current persistedChunkResult
 	if err := json.Unmarshal(raw, &current); err == nil && current.BatchID != "" {
-		return ChunkResult{
-			BatchID: current.BatchID, Membership: current.Membership, CohortTotal: current.CohortTotal,
-			PersistedMembers: current.PersistedMembers, Submitted: current.Submitted, Joined: current.Joined,
-			AlreadyOwned: current.AlreadyOwned, Invalid: current.Invalid,
-		}, nil
+		return ChunkResult(current), nil
 	}
 	var legacy legacyChunkResult
 	if err := json.Unmarshal(raw, &legacy); err != nil || legacy.BatchID == "" {
 		return ChunkResult{}, errors.New("stored cohort result is corrupt")
 	}
-	return ChunkResult{
-		BatchID: legacy.BatchID, Membership: legacy.Membership, CohortTotal: legacy.CohortTotal,
-		PersistedMembers: legacy.PersistedMembers, Submitted: legacy.Submitted, Joined: legacy.Joined,
-		AlreadyOwned: legacy.AlreadyOwned, Invalid: legacy.Invalid,
-	}, nil
+	return ChunkResult(legacy), nil
 }
 
 func (c *Cohorts) SubmitChunk(ctx context.Context, req ChunkRequest, submit func(context.Context, []string) ([]MemberOutcome, error)) (ChunkResult, error) {

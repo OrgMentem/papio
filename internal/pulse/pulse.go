@@ -256,7 +256,7 @@ func (s *Service) Read(ctx context.Context) (result Snapshot, retErr error) {
 		}
 		if d, ok := delivery[row.ID]; ok {
 			if d.at.After(now) {
-				next = earlierNext(next, nextFact{at: d.at, kind: d.kind, source: d.source, count: d.count})
+				next = earlierNext(next, nextFact(d))
 			} else if !row.LeaseActive(now) && !futureRetry(row, now) && openActions[row.ID] == 0 {
 				// A due poll with no worker is only stalled if a durable episode
 				// names it. No such episode means an incomplete projection.

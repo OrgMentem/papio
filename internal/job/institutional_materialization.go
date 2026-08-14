@@ -35,7 +35,7 @@ func (js *Store) InstitutionAuthorityKey(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// INSERT OR IGNORE is deliberately the first statement: concurrent
 	// processes cannot hold a stale read snapshot while upgrading to a writer.
@@ -72,7 +72,7 @@ func (js *Store) NextMaterializationHolderGeneration(ctx context.Context) (int64
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO daemon_authority_key(singleton, hmac_key, created_at)
 		VALUES (1, ?, ?)`, generated[:], store.Now()); err != nil {
@@ -148,7 +148,7 @@ func (js *Store) ReconcileInstitutionProfiles(ctx context.Context, specs []Insti
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	now := store.Now()
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, configured_name, revision, authority_digest,
@@ -364,7 +364,7 @@ func (js *Store) CreateBrowserCandidate(ctx context.Context, in BrowserCandidate
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var active int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM institution_profiles WHERE id=? AND tombstoned_at IS NULL AND revision=?`, in.InstitutionProfileID, in.InstitutionProfileRevision).Scan(&active); err != nil {
 		return nil, err
@@ -571,7 +571,7 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// The candidate's profile is an authority fence, not merely a historical
 	// foreign key. A tombstoned profile or a revision drift invalidates the
@@ -878,7 +878,7 @@ func (js *Store) IssueMaterializationRoute(ctx context.Context, claimID, binding
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	res, err := tx.ExecContext(ctx, `UPDATE materialization_claims
 		SET phase='route_issued', route_issuance_ordinal=route_issuance_ordinal+1, updated_at=?
@@ -986,7 +986,7 @@ func (js *Store) SettleMaterialization(ctx context.Context, claimID, bindingID s
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var candidateID, jobID string
 	var jobAttemptRevision int64
 	err = tx.QueryRowContext(ctx, `SELECT c.id, c.job_id, c.job_attempt_revision
@@ -1096,7 +1096,7 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.QueryContext(ctx, claimSelect+` WHERE phase IN ('claimed','bound','route_issued','navigated')
 		AND lease_until IS NOT NULL AND lease_until <= ?
 		AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id)
@@ -1153,7 +1153,7 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	res, err := tx.ExecContext(ctx, `UPDATE materialization_claims
 		SET phase='abandoned', updated_at=?

@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -403,7 +404,7 @@ func (l *NotificationLedger) LatestCheckpoint(ctx context.Context, aggregateKey 
 		FROM notification_intents WHERE aggregate_key=? AND category='completion_batch' AND phase='checkpoint'
 		ORDER BY id DESC LIMIT 1`, aggregateKey)
 	r, err := scanNotification(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return NotificationRecord{}, false, nil
 	}
 	return r, err == nil, err

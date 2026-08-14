@@ -90,7 +90,8 @@ func TestSubmitChunkReplayAndConflictBeforeSubmit(t *testing.T) {
 	if conflictErr == nil {
 		t.Fatal("conflicting replay accepted")
 	}
-	if _, ok := conflictErr.(*ConflictError); !ok {
+	conflictError := &ConflictError{}
+	if !errors.As(conflictErr, &conflictError) {
 		t.Fatalf("error = %T, want ConflictError", conflictErr)
 	}
 	if calls != 1 {
