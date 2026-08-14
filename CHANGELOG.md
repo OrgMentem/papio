@@ -23,6 +23,11 @@ execution records kept during the initial build.
   `session_busy` frame a refused hello gets, which the extension renders as
   the browser that holds the session instead of a healthy connection.
 
+- **The work pulse's next action counts every paper sharing its deadline.** A
+  backoff cohort is scheduled on one common instant, and only the first row's
+  count was reported — so a browser popup said *retrying 1* directly beneath
+  *51 scheduled*, reading as though papio had forgotten the other fifty.
+
 ## [0.21.0] - 2026-08-14
 
 ### Added

@@ -31,6 +31,23 @@ for the full pre-split extension history.
   A browser demoted by `papio browser use` reports the same state as soon as
   the daemon tells it, and keeps every capability it negotiated — holdership
   gates offers and handoffs, not page acquisition or inbox reads.
+- **The popup no longer flashes a status nobody had measured.** Both the popup
+  and the inbox shipped a default *Can't tell — live progress is unavailable*
+  line in their markup, painted before the first read returned, so every popup
+  opened with a flash of it. Both now start empty and hidden, and only the
+  renderer reveals them.
+- **Plain words for an unknown or scheduled status.** *Can't tell* never said
+  whether papio had looked and found nothing or had not looked yet; every
+  unknown state now names its cause (*Progress unknown — the papio daemon
+  isn't answering*). A scheduled instant names the day whenever it is not
+  today, so a retry thirteen hours out reads *tomorrow at 08:00* instead of a
+  bare *at 08:00* that looked imminent. The next action counts papers, and
+  *Acquisition effects 0/1 busy* — an internal mechanism, reporting a
+  configured limit as though it were news — is gone: the line appears only
+  when something is actually held or queued behind the limit.
+- **A fresh line no longer says "just now".** The institution-session card and
+  live job status spent their remaining width restating that nothing had aged
+  yet; the age appears once there is one.
 
 ## [0.14.0] - 2026-08-14
 

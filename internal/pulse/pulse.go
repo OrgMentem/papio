@@ -518,6 +518,12 @@ func earlierNext(current *nextFact, candidate nextFact) *nextFact {
 		v := candidate
 		return &v
 	}
+	// One instant, one line, one count. Keeping the first fact's count reported
+	// "retrying 1" beside "51 scheduled" whenever a whole backoff cohort shared
+	// a deadline, which reads as papio having forgotten the other fifty.
+	if candidate.at.Equal(current.at) && candidate.kind == current.kind && candidate.source == current.source {
+		current.count += candidate.count
+	}
 	return current
 }
 

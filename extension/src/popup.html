@@ -900,8 +900,11 @@
       <div id="daemon-status-hint" class="daemon-status-hint"></div>
     </div>
     <div id="open-inbox-status" class="capture-status"></div>
-    <section id="popup-pulse" class="popup-pulse" aria-labelledby="popup-pulse-primary">
-      <div id="popup-pulse-primary" class="popup-pulse-primary" role="status" aria-live="polite">Can't tell — live progress is unavailable</div>
+    <!-- Hidden and empty until renderWorkPulse has real state: a default line
+         here is painted before the first read returns, so every popup opened
+         with a flash of a status nobody had measured yet. -->
+    <section id="popup-pulse" class="popup-pulse" aria-labelledby="popup-pulse-primary" hidden>
+      <div id="popup-pulse-primary" class="popup-pulse-primary" role="status" aria-live="polite"></div>
       <div id="popup-pulse-next" class="popup-pulse-detail" hidden></div>
       <div id="popup-pulse-capacity" class="popup-pulse-detail" hidden></div>
       <div id="popup-pulse-batch" class="popup-pulse-detail" hidden></div>

@@ -1183,7 +1183,8 @@
         <span class="brand-name"><em>papio</em> <span class="page-name">inbox</span></span>
       </h1>
       <p id="connection-status" role="status" aria-live="polite">Connecting to daemon…</p>
-      <p id="inbox-pulse" role="status" aria-live="polite">Can't tell — live progress is unavailable</p>
+      <!-- Empty and hidden until renderPulse has measured state; see popup.html. -->
+      <p id="inbox-pulse" role="status" aria-live="polite" hidden></p>
       <p id="inbox-counts">Counts unavailable</p>
       <div class="toolbar" aria-label="Inbox controls">
         <input id="item-filter" type="search" placeholder="Filter by title, DOI, or detail…" aria-label="Filter inbox items" />

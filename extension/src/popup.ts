@@ -1258,12 +1258,13 @@ export async function retryAuthStalled(jobID: string): Promise<void> {
 }
 
 /** Short relative age: freshness at a glance beats a wall-clock time the
- * reader must subtract from "now" themselves. */
+ * reader must subtract from "now" themselves. Empty while fresh — a card that
+ * says "just now" is spending a line to report that nothing has aged. */
 function formatAgo(timestamp: number | null): string {
-  if (timestamp === null || !Number.isFinite(timestamp)) return "just now";
+  if (timestamp === null || !Number.isFinite(timestamp)) return "";
   const elapsed = Math.max(0, Date.now() - timestamp);
   const minutes = Math.floor(elapsed / 60_000);
-  if (minutes < 1) return "just now";
+  if (minutes < 1) return "";
   if (minutes < 60) return `${minutes}m ago`;
   return `${Math.floor(minutes / 60)}h ago`;
 }
@@ -1290,7 +1291,8 @@ function sessionEvidenceDetail(state: PopupSessionState): string {
   if (typeof rawTimestamp !== "number" || !Number.isFinite(rawTimestamp)) {
     return source;
   }
-  return `${source} · ${formatAgo(rawTimestamp)}`;
+  const age = formatAgo(rawTimestamp);
+  return age === "" ? source : `${source} · ${age}`;
 }
 
 export interface SessionCardState {
@@ -2333,6 +2335,36 @@ function pulseCount(pulse: WorkPulseResponsePayload, field: keyof WorkPulseRespo
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
+/** The one Unknown state with no reason to give: nothing has been measured yet.
+ * "Can't tell" left the researcher guessing whether papio had checked and found
+ * nothing or had not checked at all, so every other Unknown names its cause. */
+const PULSE_UNMEASURED = "Progress unknown — papio hasn't reported yet";
+
+/** True when the pulse has nothing worth a line, which is not the same as
+ * having measured that nothing is happening (that is Idle). */
+export function pulseIsUnmeasured(display: PulseDisplay): boolean {
+  return display.primary === "Unknown" && display.primaryText === PULSE_UNMEASURED;
+}
+
+/** A scheduled instant with the day named whenever it is not today. A bare
+ * "at 08:00" for a retry thirteen hours out reads as imminent, and the reader
+ * has no way to tell it apart from one eight minutes away. */
+export function formatPulseWhen(at: number, now: number): string {
+  if (!Number.isFinite(at)) return "later";
+  if (at <= now) return "any moment";
+  const clock = new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const midnight = (t: number): number => {
+    const d = new Date(t);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  };
+  const days = Math.round((midnight(at) - midnight(now)) / 86_400_000);
+  if (days <= 0) return `at ${clock}`;
+  if (days === 1) return `tomorrow at ${clock}`;
+  if (days < 7) return `${new Date(at).toLocaleDateString([], { weekday: "short" })} at ${clock}`;
+  return `${new Date(at).toLocaleDateString([], { month: "short", day: "numeric" })} at ${clock}`;
+}
+
 export function derivePulseDisplay(
   cache: PopupPulseCache | undefined,
   connectionStatus: StoreShape["connectionStatus"] = "connected",
@@ -2344,8 +2376,8 @@ export function derivePulseDisplay(
     return {
       primary: "Unknown",
       primaryText: connectionStatus === "session_elsewhere"
-        ? "Can't tell — another browser holds the papio session"
-        : "Can't tell — daemon disconnected",
+        ? "Progress unknown — another browser holds the papio session"
+        : "Progress unknown — the papio daemon isn't answering",
       buckets: "", companion: "", next: "", capacity: "", batch: "",
     };
   }
@@ -2355,7 +2387,7 @@ export function derivePulseDisplay(
       primary: "Unknown",
       primaryText: generated !== undefined && Number.isFinite(generated) && generated > 0
         ? `Status as of ${new Date(generated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-        : "Can't tell — live progress is unavailable",
+        : PULSE_UNMEASURED,
       buckets: "",
       companion: "",
       next: "",
@@ -2410,7 +2442,7 @@ export function derivePulseDisplay(
             ? `Scheduled · ${scheduled} ${scheduled === 1 ? "paper" : "papers"}`
             : primary === "Idle"
               ? "Idle"
-              : "Can't tell — live progress is unavailable";
+              : PULSE_UNMEASURED;
   // Companion rule: every present pulse bucket is shown, including zero;
   // omission would make an absent measurement indistinguishable from zero.
   if (inFlight !== undefined) bucketParts.push(`${inFlight} in flight`);
@@ -2424,17 +2456,28 @@ export function derivePulseDisplay(
   if (bucketParts.length > 0) bucketParts.unshift("Nonterminal breakdown");
   let next = "";
   if (pulse.next_action !== undefined) {
-    const actionName = pulse.next_action.kind === "retry" ? "retrying" : pulse.next_action.kind === "delivery_poll" ? "checking delivery" : "opening a source gate";
-    const at = new Date(Date.parse(pulse.next_action.at)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const count = pulse.next_action.count === undefined ? "" : ` ${pulse.next_action.count}`;
-    const source = pulse.next_action.source === undefined ? "" : ` ${pulse.next_action.source}`;
-    next = `Next: ${actionName}${count}${source} at ${at}`;
+    const papers = pulse.next_action.count === undefined
+      ? ""
+      : ` ${pulse.next_action.count} paper${pulse.next_action.count === 1 ? "" : "s"}`;
+    const when = formatPulseWhen(Date.parse(pulse.next_action.at), now);
+    next = pulse.next_action.kind === "retry"
+      ? `Next: retrying${papers} ${when}`
+      : pulse.next_action.kind === "delivery_poll"
+        ? `Next: checking delivery${papers} ${when}`
+        : `Next: opening the ${pulse.next_action.source ?? "source"} gate${papers} ${when}`;
   }
   let capacity = "";
   if (pulse.effect_capacity !== undefined) {
     const cap = pulse.effect_capacity;
-    capacity = `Acquisition effects ${cap.busy}/${cap.limit} busy`;
-    if (cap.waiting !== undefined && cap.waiting > 0) capacity += ` · ${cap.waiting} waiting their turn`;
+    const queued = cap.waiting ?? 0;
+    // Silent when nothing is held and nothing is queued: "0/1 busy" reported a
+    // configured limit as though it were news, on the one line the researcher
+    // has for why papio is not doing more.
+    if (queued > 0) {
+      capacity = `${queued} waiting their turn — papio works on ${cap.limit} at a time`;
+    } else if (cap.busy > 0) {
+      capacity = `${cap.busy} of ${cap.limit} in the browser now`;
+    }
   }
   let batch = "";
   const latest = pulse.latest_batch;
@@ -2517,10 +2560,9 @@ export function renderWorkPulse(
     .filter((part) => part !== "")
     .join(" · ");
   section.dataset.state = display.primary;
-  // Disconnected is the daemon band's story, not the pulse's.
-  section.hidden =
-    connectionStatus !== "connected" ||
-    (display.primary === "Unknown" && display.primaryText === "Can't tell — live progress is unavailable");
+  // Disconnected is the daemon band's story, not the pulse's, and an unmeasured
+  // pulse says nothing worth a line.
+  section.hidden = connectionStatus !== "connected" || pulseIsUnmeasured(display);
 }
 const POPUP_REFRESH_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 10 * 60_000;
@@ -2734,7 +2776,9 @@ function liveStatusText(
   const stalled = activityAge?.stale === true;
   const stallAge = activityAge?.compact ?? age.compact;
   return {
-    text: `${stalled ? `No progress for ${stallAge} · ` : ""}${text} · ${age.display}`,
+    // A fresh line needs no age: "just now" is what every line says the moment
+    // it is written, so it carries no information the reader can act on.
+    text: `${stalled ? `No progress for ${stallAge} · ` : ""}${text}${age.display === "just now" ? "" : ` · ${age.display}`}`,
     timestamp,
     stale: stalled,
   };

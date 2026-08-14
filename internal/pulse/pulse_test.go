@@ -64,6 +64,40 @@ func TestReadFutureRetryIsScheduledNotStalled(t *testing.T) {
 		t.Fatalf("label = %q, want Scheduled", got)
 	}
 }
+
+func TestNextActionCountsEveryJobSharingTheDeadline(t *testing.T) {
+	// A backoff cohort is scheduled on one common deadline, so reporting the
+	// first row's count told the researcher "retrying 1" beside "3 scheduled".
+	ctx := context.Background()
+	js := pulseJobs(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	shared := now.Add(time.Hour)
+	for i, at := range []time.Time{shared, shared, shared, shared.Add(time.Minute)} {
+		id, err := js.CreateRequest(ctx, "wr_pulse_cohort_"+string(rune('a'+i)), pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := js.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := js.Transition(ctx, id, job.StateResolving, job.StateRetryWait, nil, job.WithRetryAt(at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snap, err := (&Service{Jobs: js, Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.NextAction == nil || snap.NextAction.Count == nil {
+		t.Fatalf("next_action = %+v, want a counted action", snap.NextAction)
+	}
+	if *snap.NextAction.Count != 3 {
+		t.Fatalf("next_action.count = %d, want 3 (the later retry is a different instant)", *snap.NextAction.Count)
+	}
+	if snap.NextAction.At != shared.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("next_action.at = %q, want %q", snap.NextAction.At, shared.UTC().Format(time.RFC3339Nano))
+	}
+}
 func TestReadSourceGatedQueuedJobIsScheduled(t *testing.T) {
 	ctx := context.Background()
 	js := pulseJobs(t)

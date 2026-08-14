@@ -1,6 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT.
 
-import { derivePulseDisplay, requestWorkPulse, type PopupPulseCache } from "./popup";
+import { derivePulseDisplay, pulseIsUnmeasured, requestWorkPulse, type PopupPulseCache } from "./popup";
 import { getSuccessAckMode, type SuccessAckMode } from "./state";
 import type { ActivityEntryPayload, TriageCounts, TriageDelivery, TriageSnapshotItem, TriageSnapshotResponsePayload } from "./protocol";
 
@@ -1759,11 +1759,11 @@ function renderPulse(): void {
   }
 
   if (display.primary === "Unknown") {
-    if (display.primaryText.startsWith("Status as of")) {
-      elements.pulse.textContent = display.primaryText;
-      return;
-    }
-    elements.pulse.textContent = "Live progress unavailable";
+    // Say which of the two it is: papio has not reported yet, or it reported at
+    // a time worth naming. "Can't tell" conflated them.
+    elements.pulse.textContent = pulseIsUnmeasured(display)
+      ? "papio hasn't reported progress yet"
+      : display.primaryText;
     return;
   }
 

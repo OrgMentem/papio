@@ -27,6 +27,7 @@ import {
   renderPageAcquire,
   renderImpactSummary,
   derivePulseDisplay,
+  formatPulseWhen,
   renderPopupCatchup,
   renderWorkPulse,
   type PopupPulseCache,
@@ -244,6 +245,57 @@ test("pulse freshness uses local receipt time and never invents ETA or percentag
   expect(display.primaryText).not.toMatch(/%|ETA|queue position/i);
 });
 
+test("a scheduled instant names the day whenever it is not today", () => {
+  const now = new Date(2026, 7, 14, 18, 20).getTime();
+  // The reported bug: a retry thirteen hours out rendered as a bare "at 08:00"
+  // and read as imminent.
+  expect(formatPulseWhen(new Date(2026, 7, 15, 8, 0).getTime(), now)).toMatch(/^tomorrow at /);
+  expect(formatPulseWhen(new Date(2026, 7, 14, 18, 28).getTime(), now)).toMatch(/^at /);
+  expect(formatPulseWhen(new Date(2026, 7, 17, 8, 0).getTime(), now)).toMatch(/^\w{3} at /);
+  expect(formatPulseWhen(new Date(2026, 8, 3, 8, 0).getTime(), now)).toMatch(/at /);
+  expect(formatPulseWhen(new Date(2026, 8, 3, 8, 0).getTime(), now)).not.toMatch(/tomorrow/);
+  // An instant that passed while the popup was open is not a future promise.
+  expect(formatPulseWhen(now - 1_000, now)).toBe("any moment");
+});
+
+test("the next action counts papers and the capacity line stays silent when idle", () => {
+  const now = new Date(2026, 7, 14, 18, 20).getTime();
+  const display = derivePulseDisplay(
+    { ...pulseCache({
+      waiting_required: 95,
+      scheduled: 51,
+      nonterminal_total: 146,
+      next_action: { at: new Date(2026, 7, 15, 8, 0).toISOString(), kind: "retry", count: 51 },
+      effect_capacity: { busy: 0, limit: 1 },
+    }), receivedAt: now },
+    "connected",
+    now,
+  );
+  // Clock formatting follows the reader's locale; the day qualifier is ours.
+  expect(display.next).toMatch(/^Next: retrying 51 papers tomorrow at \d{1,2}:00/);
+  // "Acquisition effects 0/1 busy" named an internal mechanism and reported a
+  // configured limit as news; nothing is held and nothing is queued.
+  expect(display.capacity).toBe("");
+
+  const constrained = derivePulseDisplay(
+    { ...pulseCache({
+      in_flight: 1,
+      nonterminal_total: 4,
+      effect_capacity: { busy: 1, limit: 1, waiting: 3 },
+    }), receivedAt: now },
+    "connected",
+    now,
+  );
+  expect(constrained.capacity).toBe("3 waiting their turn — papio works on 1 at a time");
+});
+
+test("the popup paints no pulse line before it has state", () => {
+  // Shipped markup, not a fixture: a default line here flashed on every open.
+  const doc = popupDocument();
+  expect(doc.getElementById("popup-pulse")?.hidden).toBe(true);
+  expect(doc.getElementById("popup-pulse-primary")?.textContent).toBe("");
+});
+
 test("renders active batch companion facts and disconnected copy", () => {
   const doc = popupDocument();
   renderWorkPulse(doc, pulseCache({
@@ -261,7 +313,7 @@ test("renders active batch companion facts and disconnected copy", () => {
   expect(doc.getElementById("popup-pulse-primary")?.textContent).toContain("Moving");
   expect(doc.getElementById("popup-pulse-batch")?.textContent).toContain("2 papers");
   renderWorkPulse(doc, undefined, "disconnected");
-  expect(doc.getElementById("popup-pulse-primary")?.textContent).toBe("Can't tell — daemon disconnected");
+  expect(doc.getElementById("popup-pulse-primary")?.textContent).toBe("Progress unknown — the papio daemon isn't answering");
 });
 
 test("puts every current-page action in one rail, in the accepted hierarchy", () => {
@@ -534,7 +586,7 @@ test("a session held by another browser is not reported as an unreachable daemon
   renderWorkPulse(doc, undefined, "session_elsewhere", Date.now());
   expect(doc.getElementById("popup-pulse")?.hidden).toBe(true);
   expect(derivePulseDisplay(undefined, "session_elsewhere").primaryText).toBe(
-    "Can't tell — another browser holds the papio session",
+    "Progress unknown — another browser holds the papio session",
   );
 });
 
@@ -1799,7 +1851,18 @@ test("session card matrix propagates probe outcomes without hijacking a decided 
     lastVerdictAt: now,
   });
   expect(warm.label).toContain("Session warm");
-  expect(warm.detail).toMatch(/via your library tab · (just now|\d+m ago|\d+h ago)$/);
+  // A fresh verdict prints no age: "just now" is true of every line the moment
+  // it renders, so it spent a line saying nothing.
+  expect(warm.detail).toBe("via your library tab");
+  const aged = deriveSessionCardState({
+    ...base,
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    lastProbeOutcome: "markers",
+    lastVerdictAt: now - 20 * 60_000,
+  });
+  expect(aged.detail).toBe("via your library tab · 20m ago");
   // A warm session offers no sign-in action — the button is hidden, not dead.
   expect(warm.action).toBe("none");
 
@@ -1949,7 +2012,9 @@ test("session status lines omit degenerate probe detail and retain real evidence
     "#institution-session-rows .institution-session-status",
   );
   expect(statuses[0]?.textContent).toBe("Session unknown — open your library page to verify");
-  expect(statuses[1]?.textContent).toMatch(/^Signed out or expired · via your library tab · /);
+  // The retained evidence is which tab saw it; a fresh verdict adds no age,
+  // because "just now" is true of every line at the moment it renders.
+  expect(statuses[1]?.textContent).toBe("Signed out or expired · via your library tab");
 });
 
 test("renders independent multi-origin session rows and targets each sign-in origin", async () => {
@@ -2001,7 +2066,6 @@ test("renders independent multi-origin session rows and targets each sign-in ori
       },
     ],
   };
-  // The warm-and-fresh steady state is filtered; only actionable rows render.
   expect(deriveSessionRows(state)).toEqual([
     expect.objectContaining({ origin: defaultOrigin, action: "signin" }),
     expect.objectContaining({ origin: uwaOrigin, label: "Signed out or expired", action: "signin" }),
