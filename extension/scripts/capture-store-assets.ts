@@ -124,11 +124,29 @@ const popupPage = {
 const makePopupMock = (state: Record<string, unknown>) => `(() => {
   const store = ${JSON.stringify(state)};
   const page = ${JSON.stringify(popupPage)};
+  const tab = { id: 1, url: page.url, title: page.title };
   globalThis.chrome = {
-    runtime: { getManifest: () => ({ version: ${JSON.stringify(VERSION)}, update_url: "https://clients2.google.com/service/update2/crx" }), sendMessage: async () => ({}), openOptionsPage: () => {} },
+    runtime: {
+      getManifest: () => ({ version: ${JSON.stringify(VERSION)}, update_url: "https://clients2.google.com/service/update2/crx" }),
+      sendMessage: async (message) => {
+        // Deterministic scanner-consent state: the capture must show the rail's
+        // resting shape, never open a selection workspace mid-screenshot.
+        if (message && message.type === "papio.pageBulk.allowlist.get") {
+          return { ok: true, allowed: true };
+        }
+        if (message && message.type === "papio.pageBulk.scan") {
+          return { ok: true, scan_id: "scan-capture" };
+        }
+        return {};
+      },
+      openOptionsPage: () => {},
+    },
     storage: { local: { get: async (k) => (k === "papio_state_v1" ? { papio_state_v1: store } : {}), set: async () => {} } },
     permissions: { contains: async () => true, request: async () => true },
-    tabs: { query: async () => [{ id: 1 }], create: async () => {} },
+    // readCurrentPageMetadata re-reads the active tab after the probe and
+    // requires the same id and byte-identical URL, so this must answer with a
+    // stable tab rather than a bare { id }.
+    tabs: { query: async () => [tab], create: async () => {} },
     scripting: { executeScript: async () => [{ result: page }] },
   };
 })();`;
@@ -298,12 +316,19 @@ async function newPage(browser: Browser, width: number, height: number, mock?: s
 async function capturePopup(browser: Browser, base: string, name: string, mock: string) {
   const page = await newPage(browser, 1280, 800, mock);
   await page.goto(`${base}/popup.html`, { waitUntil: "load" });
-  // Wait until the async refresh() has painted its state (acquire section or the
-  // daemon-status warning card, depending on the variant).
+  // Wait until the async refresh() has painted its state: the current-page rail
+  // has revealed at least one enabled action, or the daemon-status warning card
+  // is up (the attention variant, where the rail may legitimately stay empty).
   await page.waitForFunction(() => {
-    const acq = document.getElementById("page-acquire-btn") as HTMLButtonElement | null;
+    const rail = document.getElementById("current-page-actions");
+    const ready =
+      rail !== null &&
+      !rail.hidden &&
+      Array.from(rail.querySelectorAll("button")).some(
+        (button) => !(button as HTMLButtonElement).hidden && !(button as HTMLButtonElement).disabled,
+      );
     const card = document.getElementById("daemon-status");
-    return (acq !== null && !acq.disabled) || (card !== null && !card.hidden);
+    return ready || (card !== null && !card.hidden);
   }, { timeout: 10000 });
   await page.addStyleTag({
     content:

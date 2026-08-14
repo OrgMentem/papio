@@ -327,9 +327,14 @@
         gap: var(--space-2);
       }
 
+      /* Grow to share the row, but never below the label's own width: equal
+         flex growth used to divide the 356px content box evenly and clip
+         "Select papers on this page" while the short Acquire button sat in
+         unused space. When both labels cannot fit, the row wraps instead of
+         truncating either one. */
       .current-page-controls > button {
-        flex: 1 1 10rem;
-        min-width: 0;
+        flex: 1 1 auto;
+        min-width: max-content;
       }
 
       .current-page-controls > button[hidden] {
@@ -367,7 +372,8 @@
       }
 
       .page-consent-controls > button {
-        flex: 1 1 8rem;
+        flex: 1 1 auto;
+        min-width: max-content;
       }
 
       .page-acquire-live {
@@ -663,7 +669,8 @@
       }
 
       .resolver-grant-controls > button {
-        flex: 1 1 9rem;
+        flex: 1 1 auto;
+        min-width: max-content;
       }
 
 
@@ -688,7 +695,8 @@
       }
 
       .terms-consent-controls button {
-        flex: 1 1 9rem;
+        flex: 1 1 auto;
+        min-width: max-content;
         padding-inline: var(--space-2);
       }
 

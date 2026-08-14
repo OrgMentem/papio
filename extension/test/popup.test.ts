@@ -2521,7 +2521,12 @@ function sessionReplyFixture(overrides: Record<string, unknown> = {}): { state: 
 
 async function popupRefreshHarness(
   reply: (message: Record<string, unknown>) => unknown = () => sessionReplyFixture(),
-): Promise<{ document: Document; refresh: () => Promise<void>; requests: Record<string, unknown>[] }> {
+): Promise<{
+  document: Document;
+  refresh: () => Promise<void>;
+  startPopupRefresh: () => void;
+  requests: Record<string, unknown>[];
+}> {
   const window = new Window();
   window.document.write(readFileSync(new URL("../src/popup.html", import.meta.url), "utf8"));
   Object.assign(globalThis, {
@@ -2538,6 +2543,7 @@ async function popupRefreshHarness(
   popupRefreshImportSerial += 1;
   const popup = (await import(`../src/popup.ts?popup-refresh-test=${popupRefreshImportSerial}`)) as {
     refresh: () => Promise<void>;
+    startPopupRefresh: () => void;
   };
   const requests: Record<string, unknown>[] = [];
   Object.assign(globalThis, {
@@ -2552,7 +2558,12 @@ async function popupRefreshHarness(
       tabs: { query: async () => [] },
     },
   });
-  return { document: window.document as unknown as Document, refresh: popup.refresh, requests };
+  return {
+    document: window.document as unknown as Document,
+    refresh: popup.refresh,
+    startPopupRefresh: popup.startPopupRefresh,
+    requests,
+  };
 }
 
 function sessionMessageTypes(requests: Record<string, unknown>[]): unknown[] {
@@ -2989,7 +3000,12 @@ test("the first scan of an unapproved site asks once, focuses Allow, and perform
   const prompt = doc.getElementById("page-bulk-consent") as HTMLElement;
   expect(prompt.hidden).toBe(false);
   expect(doc.getElementById("page-bulk-consent-message")?.textContent).toBe(
-    "Allow papio to scan pages on scholar.example.edu for paper identifiers? Detection stays in this tab; only papers you select are sent to the papio app.",
+    "Scan scholar.example.edu for papers? Identifiers found go to your local papio app.",
+  );
+  // It must not claim that only selected papers are sent: opening the workspace
+  // sends every detected identifier to the local daemon for ownership marking.
+  expect(doc.getElementById("page-bulk-consent-message")?.textContent).not.toMatch(
+    /only papers you select/i,
   );
   // Focus lands on the affirmative choice, and nothing was stored yet.
   expect(doc.activeElement?.id).toBe("page-bulk-consent-allow");
@@ -3287,9 +3303,25 @@ test("a blocker's pending state survives a rerender instead of reverting", async
 // ADR-0023's sixth surface: the transient host-page acknowledgement.
 // ---------------------------------------------------------------------------
 
-function ackPage(): { window: Window; document: Document } {
+/** A host page for the injected acknowledgement.
+ *
+ * `setTimeout` is captured rather than scheduled: the chip's real dwell is three
+ * seconds, and leaving live timers behind in bun's shared process is a source of
+ * cross-file nondeterminism. Capturing them also makes the dwell and the removal
+ * directly assertable instead of waited on. */
+function ackPage(): {
+  window: Window;
+  document: Document;
+  timers: { fn: () => void; ms: number }[];
+  runTimers: () => void;
+} {
   const window = new Window();
   window.document.write("<!doctype html><html><body><p>An article</p></body></html>");
+  const timers: { fn: () => void; ms: number }[] = [];
+  (window as unknown as { setTimeout: unknown }).setTimeout = (fn: () => void, ms: number) => {
+    timers.push({ fn, ms });
+    return timers.length;
+  };
   Object.assign(globalThis, {
     document: window.document,
     window,
@@ -3299,7 +3331,11 @@ function ackPage(): { window: Window; document: Document } {
     },
     HTMLElement: window.HTMLElement,
   });
-  return { window, document: window.document as unknown as Document };
+  const runTimers = (): void => {
+    // Drain in insertion order; the exit timer is queued by the dwell timer.
+    for (let index = 0; index < timers.length; index += 1) timers[index]!.fn();
+  };
+  return { window, document: window.document as unknown as Document, timers, runTimers };
 }
 
 test("the host-page acknowledgement mounts one open shadow host with closed copy only", () => {
@@ -3523,4 +3559,64 @@ test("a slower earlier refresh cannot paint over a newer one", async () => {
     "Waiting on you · 2 decisions",
   );
   expect(h.document.getElementById("popup-pulse-primary")?.textContent).not.toContain("99");
+});
+
+test("the periodic tick skips while a refresh is still running instead of starving it", async () => {
+  const held = Promise.withResolvers<unknown>();
+  let countsCalls = 0;
+  const h = await popupRefreshHarness((message) => {
+    if (message["type"] === "papio.triage.counts") {
+      countsCalls += 1;
+      // Stands in for a daemon-unreachable read waiting out its hello timeout:
+      // slower than the five-second interval.
+      return countsCalls === 1 ? held.promise : { ok: false };
+    }
+    return sessionReplyFixture();
+  });
+
+  const originalSetInterval = globalThis.setInterval;
+  let tick: (() => void) | undefined;
+  globalThis.setInterval = ((callback: () => void) => {
+    tick = callback;
+    return 0;
+  }) as typeof globalThis.setInterval;
+  try {
+    h.startPopupRefresh();
+    expect(tick).toBeDefined();
+    tick?.();
+    await flushMicrotasks();
+    expect(countsCalls).toBe(1);
+
+    // Two more ticks land while the first wave is still in flight. Each one used
+    // to bump the generation and cancel the wave before it could paint, so the
+    // popup never painted again; they must be skipped instead.
+    tick?.();
+    tick?.();
+    await flushMicrotasks();
+    expect(countsCalls).toBe(1);
+
+    held.resolve({ ok: false });
+    await flushMicrotasks();
+    // Once the wave has settled, the next tick is free to run.
+    tick?.();
+    await flushMicrotasks();
+    expect(countsCalls).toBe(2);
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+  }
+});
+
+test("the acknowledgement dwells three seconds and then removes itself entirely", () => {
+  const page = ackPage();
+  renderInPageAcknowledgement("queued");
+  expect(page.document.getElementById("papio-extension-action-ack-v1")).not.toBeNull();
+  // One dwell timer, at exactly the ratified three seconds.
+  expect(page.timers.map((timer) => timer.ms)).toEqual([3000]);
+
+  page.runTimers();
+  // The dwell queued the exit, and the host is gone once that runs.
+  expect(page.timers.map((timer) => timer.ms)).toEqual([3000, 140]);
+  expect(page.document.getElementById("papio-extension-action-ack-v1")).toBeNull();
+  // Nothing of the chip survives in the page.
+  expect(page.document.body.querySelectorAll("*")).toHaveLength(1);
 });

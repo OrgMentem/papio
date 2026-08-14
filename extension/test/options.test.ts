@@ -32,6 +32,8 @@ interface OptionsPageOptions {
   pageCaptureConsent?: boolean;
   scannerAllowlistOrigins?: readonly string[];
   allowlistSetFails?: Record<string, boolean>;
+  /** Hold an `allowlist.set` open so a genuinely pending row can be observed. */
+  allowlistSetGate?: (origin: string) => Promise<void>;
 }
 
 async function settle(): Promise<void> {
@@ -106,6 +108,8 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
             return { ok: true, origins: [...scannerAllowlistOrigins].sort() };
           }
           if (message.type === "papio.pageBulk.allowlist.set") {
+            const gate = options.allowlistSetGate;
+            if (gate !== undefined) await gate(message.request?.origin as string);
             const origin = message.request?.origin as string;
             const allowed = message.request?.allowed as boolean;
             if (options.allowlistSetFails?.[origin]) {
@@ -360,18 +364,35 @@ test("failed scanner allowlist.set keeps the row and shows local feedback", asyn
   expect(message.textContent).toContain("could not revoke");
 });
 
-test("pending scanner revoke disables only its own control", async () => {
+test("a pending scanner revoke disables its own control and leaves the others usable", async () => {
   const first = "https://first.example";
   const second = "https://second.example";
-  const page = await optionsDocument({ scannerAllowlistOrigins: [first, second] });
+  const held = Promise.withResolvers<void>();
+  const page = await optionsDocument({
+    scannerAllowlistOrigins: [first, second],
+    allowlistSetGate: async (origin) => {
+      if (origin === first) await held.promise;
+    },
+  });
   const firstButton = scannerRow(page.document, first)?.querySelector("button") as HTMLButtonElement;
   const secondButton = scannerRow(page.document, second)?.querySelector("button") as HTMLButtonElement;
   firstButton.click();
+  await settle();
+  // The first row is genuinely in flight and says so.
   expect(firstButton.disabled).toBe(true);
+  expect(scannerRow(page.document, first)).toBeDefined();
   expect(secondButton.disabled).toBe(false);
+
+  // The second row must actually work, not merely look enabled: a control that
+  // silently ignores a click is worse than a disabled one.
+  secondButton.click();
+  await settle();
+  expect(scannerRow(page.document, second)).toBeUndefined();
+  expect(scannerRow(page.document, first)).toBeDefined();
+
+  held.resolve();
   await settle();
   expect(scannerRow(page.document, first)).toBeUndefined();
-  expect(secondButton.disabled).toBe(false);
 });
 
 test("scanner allowlist management never reads scanner storage directly", async () => {

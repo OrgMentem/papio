@@ -715,11 +715,16 @@ export async function allowScannerOrigin(origin: string): Promise<boolean> {
   return record["ok"] === true && record["allowed"] === true;
 }
 
-/** Exact consent copy. It names the host, says where detection happens, and says
- * what leaves the browser — no more, because a consent prompt that overstates
- * its own scope is worse than none. */
+/** Exact consent copy: the site, the action, and what leaves the browser.
+ *
+ * Deliberately does NOT promise that only *selected* papers are sent. Opening
+ * the selection workspace sends every detected identifier to the local daemon so
+ * it can mark what is already owned (`refreshStatus` in page-bulk.ts); only the
+ * canonical keys of chosen rows are then acquired. A consent prompt that
+ * overstates its own narrowness is worse than none, and the full disclosure
+ * lives in Options and docs/privacy.md rather than in a 380px popup. */
 export function scannerConsentPrompt(host: string): string {
-  return `Allow papio to scan pages on ${host} for paper identifiers? Detection stays in this tab; only papers you select are sent to the papio app.`;
+  return `Scan ${host} for papers? Identifiers found go to your local papio app.`;
 }
 
 interface ScannerConsentElements {
@@ -3424,12 +3429,27 @@ export function sendPopupPresence(features: readonly string[] | undefined, focus
     },
   }).catch(() => undefined);
 }
-function startPopupRefresh(): void {
+/** Coalesce the periodic tick rather than preempting an in-flight refresh.
+ *
+ * The generation fence makes an older wave abandon its writes, which is right
+ * for an action-triggered refresh but fatal for a timer: when a slow read (a
+ * daemon-unreachable `triage_counts` waits out its hello timeout) outlasts the
+ * five-second interval, every tick cancels the wave before it can paint and the
+ * popup starves permanently. Skipping a tick while one is already running keeps
+ * the fence's ordering guarantee and still lets the surface paint. */
+export function startPopupRefresh(): void {
   if (popupRefreshTimer !== undefined) return;
+  let running = false;
   popupRefreshTimer = setInterval(() => {
-    void refresh().catch((error: unknown) => {
-      console.debug("papio: popup refresh failed", error);
-    });
+    if (running) return;
+    running = true;
+    void refresh()
+      .catch((error: unknown) => {
+        console.debug("papio: popup refresh failed", error);
+      })
+      .finally(() => {
+        running = false;
+      });
   }, POPUP_REFRESH_INTERVAL_MS);
 }
 

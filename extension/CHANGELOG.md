@@ -70,6 +70,14 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Popup refreshes no longer starve on a slow daemon read.** The periodic tick
+  now waits for an in-flight refresh instead of repeatedly superseding it, so
+  disconnected and slow-start states eventually render. Action labels wrap
+  rather than clipping in the narrow popup.
+- **Scanner consent and revocation stay accurate under concurrency.** The
+  consent prompt now states that detected identifiers go to the local *papio*
+  app, matching ownership checks, and revoking one allowed origin disables only
+  that row while other origins remain usable.
 - **Repeated handoffs no longer stack duplicate tabs.** After a service-worker
   restart the extension recovers the job's existing broker tab from its
   durable ledger instead of opening another copy for every re-offer.

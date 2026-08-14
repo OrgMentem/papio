@@ -474,7 +474,10 @@ type ScannerAllowlistSetReply =
   | { ok: true; allowed: boolean }
   | { ok: false; error: { code: string; message: string } };
 
-let scannerAllowlistPendingOrigin: string | null = null;
+/** Origins with a revocation in flight. Per-origin, not a single slot: one
+ * pending row must not make the other rows' controls silently inert while they
+ * still look enabled. */
+const scannerAllowlistPending = new Set<string>();
 
 function setScannerAllowlistNotice(message: string | null): void {
   const notice = document.getElementById("scanner-allowlist-message");
@@ -572,15 +575,17 @@ async function renderScannerAllowlist(options?: { keepNotice?: boolean }): Promi
     revoke.className = "btn";
     revoke.textContent = "Stop allowing";
     revoke.setAttribute("aria-label", `Stop allowing page scanning on ${origin}`);
-    revoke.disabled = scannerAllowlistPendingOrigin === origin;
+    revoke.disabled = scannerAllowlistPending.has(origin);
 
     revoke.addEventListener("click", () => {
-      if (scannerAllowlistPendingOrigin !== null) return;
-      scannerAllowlistPendingOrigin = origin;
+      if (scannerAllowlistPending.has(origin)) return;
+      scannerAllowlistPending.add(origin);
       setScannerAllowlistNotice(null);
       revoke.disabled = true;
       void sendScannerAllowlistSet(origin, false).then((setReply) => {
-        scannerAllowlistPendingOrigin = null;
+        scannerAllowlistPending.delete(origin);
+        // The row leaves only on a validated {allowed:false}: an unacknowledged
+        // write must never look like revoked consent.
         if (setReply.ok && setReply.allowed === false) {
           void renderScannerAllowlist();
           return;
