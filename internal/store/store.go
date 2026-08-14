@@ -35,6 +35,13 @@ type Store struct {
 // verifies integrity. The connection pool is capped at one connection so all
 // writes serialize in-process.
 func Open(ctx context.Context, dir string) (*Store, error) {
+	return open(ctx, dir, 0)
+}
+
+// open is the startup path with an optional migration ceiling. A non-zero
+// ceiling models an older guard-capable binary while the current migration
+// files are present in this source tree.
+func open(ctx context.Context, dir string, migrationCeiling int) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating data dir: %w", err)
 	}
@@ -46,7 +53,7 @@ func Open(ctx context.Context, dir string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db, path: path}
-	if err := s.migrate(ctx); err != nil {
+	if err := s.migrate(ctx, migrationCeiling); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -85,7 +92,7 @@ func (s *Store) IntegrityCheck(ctx context.Context) error {
 
 // migrate applies numbered migrations above the current user_version, each in
 // its own transaction, then bumps user_version inside that transaction.
-func (s *Store) migrate(ctx context.Context) error {
+func (s *Store) migrate(ctx context.Context, migrationCeiling int) error {
 	entries, err := fs.ReadDir(migrationFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("reading embedded migrations: %w", err)
@@ -97,15 +104,36 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	sort.Strings(names)
+	if len(names) == 0 {
+		return fmt.Errorf("no embedded migrations")
+	}
+	latestName := names[len(names)-1]
+	latest, err := strconv.Atoi(strings.SplitN(latestName, "_", 2)[0])
+	if err != nil {
+		return fmt.Errorf("migration %s: expected NNNN_name.sql", latestName)
+	}
+	if migrationCeiling > 0 && migrationCeiling < latest {
+		latest = migrationCeiling
+	}
 
 	var current int
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&current); err != nil {
 		return fmt.Errorf("reading user_version: %w", err)
 	}
+	if current > latest {
+		return fmt.Errorf(
+			"database schema version %d is newer than this binary supports (%d); refusing to open",
+			current,
+			latest,
+		)
+	}
 	for _, name := range names {
 		num, err := strconv.Atoi(strings.SplitN(name, "_", 2)[0])
 		if err != nil {
 			return fmt.Errorf("migration %s: expected NNNN_name.sql", name)
+		}
+		if num > latest {
+			continue
 		}
 		if num <= current {
 			continue

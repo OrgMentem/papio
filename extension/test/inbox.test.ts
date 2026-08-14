@@ -285,9 +285,9 @@ function flush(window: Window): void {
   window.dispatchEvent(new window.Event("pagehide"));
 }
 
-test("uses pulse liveness instead of jobs_working for the inbox counts line", async () => {
+test("keeps inventory on the counts line and liveness on the pulse line", async () => {
   const fixture = snapshot([], {
-    counts: counts({ pending_total: 116, actions: 0, jobs_working: 116, watch_hits: 0, retractions: 0 }),
+    counts: counts({ pending_total: 116, turns_required: 34, actions: 0, jobs_working: 116, watch_hits: 0, retractions: 0 }),
   });
   const pulse = (inFlight: number, continuing: number) => ({
     ok: true,
@@ -312,14 +312,18 @@ test("uses pulse liveness instead of jobs_working for the inbox counts line", as
     return snapshotReply(fixture, message);
   });
   const idleCounts = idlePage.document.getElementById("inbox-counts")?.textContent ?? "";
+  expect(idleCounts).toContain("116 open");
+  expect(idleCounts).toContain("34 need you");
   expect(idleCounts).not.toMatch(/working on|working through/);
+  expect(idlePage.document.getElementById("inbox-pulse")?.hidden).toBe(true);
 
   const movingPage = await inboxDocument((message) => {
     if (message.type === "papio.work.pulse") return pulse(2, 5);
     return snapshotReply(fixture, message);
   });
-  expect(movingPage.document.getElementById("inbox-counts")?.textContent).toContain("papio is working on 7");
-  expect(movingPage.document.getElementById("inbox-counts")?.textContent).not.toContain("working on 116");
+  expect(movingPage.document.getElementById("inbox-counts")?.textContent).not.toContain("working on");
+  expect(movingPage.document.getElementById("inbox-pulse")?.textContent).toContain("papio is working on 7");
+  expect(movingPage.document.getElementById("inbox-pulse")?.textContent).not.toContain("116");
 });
 
 test("renders rank-ordered bands, label:text facts, and only safe HTTPS links", async () => {
@@ -1031,7 +1035,7 @@ test("a rejected preview (business error) stays connected and does not disconnec
   await settle();
   expect(page.document.querySelector(".item-result")?.textContent).toBe("review action 17 is unavailable");
   expect(page.document.querySelector(".item-result")?.getAttribute("data-tone")).toBe("error");
-  expect(page.document.getElementById("connection-status")?.textContent).not.toContain("Disconnected");
+  expect(page.document.getElementById("connection-status")?.hidden).toBe(true);
   expect(page.document.getElementById("reconnect-daemon")?.hidden).toBe(true);
   expect(page.opened).toEqual([]);
 });
@@ -1067,7 +1071,7 @@ test("a dismissal removes the row at once, holds the daemon call, and undo puts 
   expect(page.document.getElementById("confirm-dialog")?.hidden).toBe(true);
   expect(page.document.querySelector("[data-triage-item-id='action:manual']")).toBeNull();
   expect(page.document.getElementById("undo-bar")?.hidden).toBe(false);
-  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("0 open");
+  expect(page.document.getElementById("inbox-counts")?.textContent).toBe("No open items");
   expect(page.requests.filter((request) => request.type === "papio.action.resolve")).toHaveLength(0);
 
   page.document.getElementById("undo-dismiss")?.dispatchEvent(new Event("click", { bubbles: true }));
@@ -1208,7 +1212,8 @@ test("a structured broker rejection renders inline and never fakes a disconnect"
   expect(row?.textContent).toBe("Invalid action resolution request");
   expect(row?.dataset.tone).toBe("error");
   expect(page.document.querySelector("[data-triage-item-id='action:manual']")).not.toBeNull();
-  expect(page.document.getElementById("connection-status")?.textContent).toContain("Connected");
+  expect(page.document.getElementById("connection-status")?.hidden).toBe(true);
+  expect(page.document.getElementById("reconnect-daemon")?.hidden).toBe(true);
 
   // A thrown runtime call is a real transport failure and does disconnect.
   throwNow = true;
@@ -1794,3 +1799,198 @@ test("renders an offered delivery as a request created but not submitted", async
     ?.nextElementSibling?.textContent;
   expect(status).toBe("request created but not submitted");
 });
+
+test("hides waiting-on-you pulse while counts own the turn and deduplicates connection bands", async () => {
+  const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
+    counts: counts({ pending_total: 1, turns_required: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const pulse = {
+    ok: true,
+    available: true,
+    worker_epoch: "worker-live",
+    received_at: Date.now(),
+    pulse: {
+      request_id: "pulse-wait",
+      schema: 1,
+      generated_at: new Date().toISOString(),
+      projection_complete: true,
+      nonterminal_total: 1,
+      in_flight: 0,
+      continuing: 0,
+      scheduled: 0,
+      waiting_required: 1,
+      stalled: 0,
+    },
+  };
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.work.pulse") return pulse;
+    return snapshotReply(fixture, message);
+  });
+  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("1 need you");
+  expect(page.document.getElementById("inbox-pulse")?.hidden).toBe(true);
+  expect(page.document.getElementById("connection-status")?.hidden).toBe(true);
+});
+
+test("styles status meaning with data-tone independent of attention", async () => {
+  const rejected = manualAction("action:rejected", 1, "Rejected file");
+  rejected.guidance_variant = "manual_download_rejected_file";
+  rejected.attention = "required";
+  const working = manualAction("action:working", 2, "Working download");
+  working.attention = "working";
+  const fixture = snapshot([rejected, working], {
+    schema: 3,
+    counts: counts({ pending_total: 2, actions: 2, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const rejectedBadge = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:rejected'] .item-status");
+  const workingBadge = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:working'] .item-status");
+  expect(rejectedBadge?.dataset.tone).toBe("degraded");
+  expect(workingBadge?.dataset.tone).toBe("continuing");
+  expect(rejectedBadge?.dataset.attention).toBeUndefined();
+});
+
+test("uses contextual Open labels for manual, auth handoff, and watch hits", async () => {
+  const manual = manualAction("action:manual", 1, "Manual");
+  manual.ops = ["open", "dismiss"];
+  manual.links = [{ rel: "landing", url: "https://example.test/manual" }];
+  const authHandoff = handoffAction("action:auth", 2, true);
+  const plainHandoff = handoffAction("action:plain", 3, false);
+  const hit = watchHit("hit:one", 4, "Hit");
+  hit.ops = ["acquire", "open", "dismiss"];
+  const fixture = snapshot([manual, authHandoff, plainHandoff, hit], {
+    counts: counts({ pending_total: 4, actions: 3, watch_hits: 1, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  expect(page.document.querySelector("[data-triage-item-id='action:manual'] [data-operation='open']")?.textContent).toBe("Open source");
+  expect(page.document.querySelector("[data-triage-item-id='action:auth'] [data-operation='open']")?.textContent).toBe("Sign in");
+  expect(page.document.querySelector("[data-triage-item-id='action:plain'] [data-operation='open']")?.textContent).toBe("Open page");
+  expect(page.document.querySelector("[data-triage-item-id='hit:one'] [data-operation='open']")?.textContent).toBe("Open result");
+});
+
+test("exposes row-focus status tooltips and a 32px debug control", async () => {
+  const fixture = snapshot([manualAction("action:manual", 1, "Manual action")]);
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  // The static legend is gone, so every one of a glyph's meanings must be
+  // reachable from the row itself.
+  expect(page.document.querySelector("#status-legend")).toBeNull();
+  const toggle = page.document.querySelector(".item-debug-toggle") as unknown as HTMLElement | null;
+  expect(toggle).not.toBeNull();
+  const styles = page.window.getComputedStyle(toggle as never);
+  expect(Number.parseFloat(styles.minHeight)).toBe(32);
+  expect(Number.parseFloat(styles.minWidth)).toBe(32);
+  const status = page.document.querySelector("[data-triage-item-id='action:manual'] .item-status");
+  // Non-colour carriers: the glyph has an accessible name, and its visible
+  // label rides data-label for the hover/focus tooltip rather than colour.
+  expect(status?.getAttribute("role")).toBe("img");
+  expect((status?.getAttribute("aria-label") ?? "").length).toBeGreaterThan(0);
+  expect((status?.getAttribute("data-label") ?? "").length).toBeGreaterThan(0);
+  // Roving keyboard focus reveals the same label the pointer does, without
+  // adding a second tab stop per row. The rule is CSS-only, so the stylesheet
+  // declaring it beside the hover selector is the observable contract here.
+  const css = Array.from(page.document.querySelectorAll("style"))
+    .map((node) => node.textContent ?? "")
+    .join("\n");
+  expect(css).toContain(".triage-item:focus-visible > .item-status::after");
+});
+
+test("announces persistent row errors once across rerenders", async () => {
+  const fixture = snapshot([manualAction("action:manual", 1, "Manual action")]);
+  let fail = true;
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.action.resolve" && fail) {
+      return { ok: false, error: { code: "invalid_request", message: "Still invalid" } };
+    }
+    return snapshotReply(fixture, message);
+  });
+  page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
+  await settle();
+  flush(page.window);
+  await settle();
+  const announcer = page.document.getElementById("operation-status");
+  expect(announcer?.textContent).toBe("Still invalid");
+  expect(page.document.querySelector(".item-result")?.getAttribute("role")).toBeNull();
+  page.document.getElementById("refresh-inbox")?.dispatchEvent(new Event("click", { bubbles: true }));
+  await settle();
+  expect(announcer?.textContent).toBe("Still invalid");
+});
+
+test("feedback strip kinds, undo priority, and success lifecycle", async () => {
+  const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.settings.successAck") return { ok: true, mode: "all" };
+    if (message.type === "papio.action.resolve") return { ok: true, outcome: "applied" };
+    return snapshotReply(fixture, message);
+  });
+  page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
+  await settle();
+  const bar = page.document.getElementById("undo-bar");
+  expect(bar?.dataset.kind).toBe("undo");
+  expect(page.document.getElementById("undo-dismiss")?.textContent).toBe("Undo");
+  expect(page.document.getElementById("undo-dismiss")?.textContent).not.toMatch(/\(\d+\)/);
+  flush(page.window);
+  await settle();
+  expect(bar?.dataset.kind).toBe("success");
+  expect(page.document.getElementById("undo-dismiss")?.hidden).toBe(true);
+});
+
+test("aggregates more than three queued success notices", async () => {
+  vi.useFakeTimers();
+  try {
+    const fixture = snapshot([
+      watchHit("hit:1", 1, "One"),
+      watchHit("hit:2", 2, "Two"),
+      watchHit("hit:3", 3, "Three"),
+      watchHit("hit:4", 4, "Four"),
+      watchHit("hit:5", 5, "Five"),
+    ], { counts: counts({ pending_total: 5, watch_hits: 5, actions: 0, retractions: 0 }) });
+    const page = await inboxDocument((message) => {
+      if (message.type === "papio.settings.successAck") return { ok: true, mode: "all" };
+      if (message.type === "papio.triage.decide") return { ok: true, outcome: "applied" };
+      return snapshotReply(fixture, message);
+    });
+    for (const id of ["hit:1", "hit:2", "hit:3", "hit:4", "hit:5"]) {
+      page.document.querySelector<HTMLButtonElement>(`[data-triage-item-id='${id}'] [data-operation='acquire']`)?.click();
+      for (let i = 0; i < 4; i += 1) await settle();
+    }
+    const bar = page.document.getElementById("undo-bar");
+    vi.advanceTimersByTime(20_000);
+    for (let i = 0; i < 12; i += 1) await settle();
+    expect(page.document.getElementById("undo-message")?.textContent).toContain("4 actions completed.");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("undo deadline transfer blocks keyboard undo at the boundary", async () => {
+  vi.useFakeTimers();
+  try {
+    const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
+      counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+    });
+    const page = await inboxDocument((message) => {
+      if (message.type === "papio.action.resolve") return { ok: true, outcome: "applied" };
+      return snapshotReply(fixture, message);
+    });
+    page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
+    await settle();
+    vi.advanceTimersByTime(5999);
+    key(page.document, "u");
+    await settle();
+    expect(page.document.querySelector("[data-triage-item-id='action:manual']")).not.toBeNull();
+    expect(page.requests.filter((request) => request.type === "papio.action.resolve")).toHaveLength(0);
+
+    page.document.querySelector<HTMLButtonElement>("[data-operation='dismiss']")?.click();
+    await settle();
+    vi.advanceTimersByTime(6000);
+    await settle();
+    key(page.document, "u");
+    await settle();
+    expect(page.document.querySelector("[data-triage-item-id='action:manual']")).toBeNull();
+    expect(page.requests.filter((request) => request.type === "papio.action.resolve")).toHaveLength(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+

@@ -160,6 +160,9 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		}
 	}()
 	jobs := &job.Store{S: db}
+	if err := jobs.ImportLegacyStartedEpochs(ctx); err != nil {
+		return nil, fmt.Errorf("importing legacy browser effects: %w", err)
+	}
 	artifacts, err := artifact.New(cfg.DataDir)
 	if err != nil {
 		return nil, err

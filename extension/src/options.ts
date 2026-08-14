@@ -455,8 +455,156 @@ function coveredByAllSitesGrant(origin: string, allSitesGranted: boolean): boole
 function setProviderPermissionNotice(message: string | null): void {
   const notice = document.getElementById("provider-permission-message");
   if (!(notice instanceof HTMLElement)) return;
-  notice.hidden = message === null;
-  notice.textContent = message ?? "";
+  if (message === null) {
+    notice.hidden = true;
+    notice.textContent = "";
+    notice.removeAttribute("data-tone");
+    return;
+  }
+  notice.hidden = false;
+  notice.textContent = message;
+  notice.setAttribute("data-tone", "degraded");
+}
+
+type ScannerAllowlistListReply =
+  | { ok: true; origins: string[] }
+  | { ok: false; error: { code: string; message: string } };
+
+type ScannerAllowlistSetReply =
+  | { ok: true; allowed: boolean }
+  | { ok: false; error: { code: string; message: string } };
+
+let scannerAllowlistPendingOrigin: string | null = null;
+
+function setScannerAllowlistNotice(message: string | null): void {
+  const notice = document.getElementById("scanner-allowlist-message");
+  if (!(notice instanceof HTMLElement)) return;
+  if (message === null) {
+    notice.hidden = true;
+    notice.textContent = "";
+    notice.removeAttribute("data-tone");
+    return;
+  }
+  notice.hidden = false;
+  notice.textContent = message;
+  notice.setAttribute("data-tone", "degraded");
+}
+
+async function sendScannerAllowlistList(): Promise<ScannerAllowlistListReply> {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "papio.pageBulk.allowlist.list",
+      request: {},
+    });
+    if (typeof response === "object" && response !== null && "ok" in response) {
+      return response as ScannerAllowlistListReply;
+    }
+  } catch {
+    // transport failure
+  }
+  return {
+    ok: false,
+    error: {
+      code: "unavailable",
+      message: "papio could not load allowed page-scanning sites",
+    },
+  };
+}
+
+async function sendScannerAllowlistSet(
+  origin: string,
+  allowed: boolean,
+): Promise<ScannerAllowlistSetReply> {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "papio.pageBulk.allowlist.set",
+      request: { origin, allowed },
+    });
+    if (typeof response === "object" && response !== null && "ok" in response) {
+      return response as ScannerAllowlistSetReply;
+    }
+  } catch {
+    // transport failure
+  }
+  return {
+    ok: false,
+    error: {
+      code: "unavailable",
+      message: "papio could not update page scanning for this site",
+    },
+  };
+}
+
+async function renderScannerAllowlist(options?: { keepNotice?: boolean }): Promise<void> {
+  const list = document.getElementById("scanner-allowlist");
+  const empty = document.getElementById("scanner-allowlist-empty");
+  if (!(list instanceof HTMLUListElement) || !(empty instanceof HTMLElement)) return;
+
+  const reply = await sendScannerAllowlistList();
+  if (!reply.ok) {
+    list.hidden = true;
+    list.replaceChildren();
+    empty.hidden = true;
+    setScannerAllowlistNotice(reply.error.message);
+    return;
+  }
+
+  if (!options?.keepNotice) {
+    setScannerAllowlistNotice(null);
+  }
+  const origins = reply.origins;
+  list.replaceChildren();
+
+  for (const origin of origins) {
+    const item = document.createElement("li");
+
+    const meta = document.createElement("div");
+    const label = document.createElement("div");
+    label.className = "source-label";
+    label.textContent = origin.replace(/^https:\/\//, "");
+    const host = document.createElement("div");
+    host.className = "source-host";
+    host.textContent = origin;
+    meta.append(label, host);
+
+    const revoke = document.createElement("button");
+    revoke.type = "button";
+    revoke.className = "btn";
+    revoke.textContent = "Stop allowing";
+    revoke.setAttribute("aria-label", `Stop allowing page scanning on ${origin}`);
+    revoke.disabled = scannerAllowlistPendingOrigin === origin;
+
+    revoke.addEventListener("click", () => {
+      if (scannerAllowlistPendingOrigin !== null) return;
+      scannerAllowlistPendingOrigin = origin;
+      setScannerAllowlistNotice(null);
+      revoke.disabled = true;
+      void sendScannerAllowlistSet(origin, false).then((setReply) => {
+        scannerAllowlistPendingOrigin = null;
+        if (setReply.ok && setReply.allowed === false) {
+          void renderScannerAllowlist();
+          return;
+        }
+        const message = setReply.ok
+          ? "papio could not revoke page scanning for this site"
+          : setReply.error.message;
+        setScannerAllowlistNotice(message);
+        void renderScannerAllowlist({ keepNotice: true });
+      });
+    });
+
+    item.append(meta, revoke);
+    list.append(item);
+  }
+
+  if (origins.length === 0) {
+    list.hidden = true;
+    empty.hidden = false;
+    empty.textContent = "No sites are allowed for page scanning.";
+  } else {
+    list.hidden = false;
+    empty.hidden = true;
+  }
 }
 
 // Render the user's configured resolver origins (from the daemon, via hello_ack)
@@ -530,3 +678,4 @@ void renderHandoffSurface();
 void renderDaemonFooter();
 wireKeepalive();
 void renderKeepalive();
+void renderScannerAllowlist();

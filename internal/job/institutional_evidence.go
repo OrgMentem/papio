@@ -806,6 +806,163 @@ func (js *Store) ClaimArtifactWinner(ctx context.Context, winner ArtifactWinner)
 		existing.SHA256 == winner.SHA256, nil
 }
 
+// CommitArtifactWinnerAndProducer atomically commits or reuses the per-attempt
+// artifact winner and settles only the exact effect producer. A correlated
+// artifact may establish its historical winner after the materialization claim
+// expires or is replaced; current claim projection remains separately fenced.
+// Passing a nil producer preserves ordinary uncorrelated winner behavior and
+// still requires a live claim.
+func (js *Store) CommitArtifactWinnerAndProducer(
+	ctx context.Context,
+	winner ArtifactWinner,
+	producer *ArtifactProducerIdentity,
+) (ArtifactWinner, bool, bool, error) {
+	if err := winner.validate(); err != nil {
+		return ArtifactWinner{}, false, false, err
+	}
+	if producer != nil {
+		if err := producer.validate(winner.JobID); err != nil {
+			return ArtifactWinner{}, false, false, err
+		}
+	}
+	if winner.CreatedAt == "" {
+		winner.CreatedAt = store.Now()
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return ArtifactWinner{}, false, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if producer != nil {
+		// Artifact producer identity is historical. A file can arrive after the
+		// bridge and materialization claim move to a replacement holder, so the
+		// current caller generation is only provisional. Prefer the exact
+		// producer's durable generation for both a new winner and winner replay.
+		permitWhere, permitArgs := identityWhere(producer.effectIdentity(winner.JobID))
+		var producerHolder int64
+		holderErr := tx.QueryRowContext(ctx,
+			`SELECT browser_holder_generation FROM effect_permits WHERE `+permitWhere,
+			permitArgs...).Scan(&producerHolder)
+		if errors.Is(holderErr, sql.ErrNoRows) {
+			legacyWhere, legacyArgs := legacyBlockerIdentityWhere(producer.legacyIdentity(winner.JobID))
+			var reconstructedHolder sql.NullInt64
+			holderErr = tx.QueryRowContext(ctx,
+				`SELECT reconstructed_holder FROM legacy_effect_blockers WHERE `+legacyWhere,
+				legacyArgs...).Scan(&reconstructedHolder)
+			if holderErr == nil && reconstructedHolder.Valid {
+				producerHolder = reconstructedHolder.Int64
+			} else if holderErr == nil {
+				producerHolder = winner.BrowserHolderGeneration
+			}
+		}
+		if holderErr != nil && !errors.Is(holderErr, sql.ErrNoRows) {
+			return ArtifactWinner{}, false, false, holderErr
+		}
+		if holderErr == nil {
+			winner.BrowserHolderGeneration = producerHolder
+		}
+	}
+
+	var existing ArtifactWinner
+	err = tx.QueryRowContext(ctx, `SELECT job_id, job_attempt_revision, candidate_id,
+		browser_holder_generation, sha256, created_at
+		FROM artifact_winners WHERE job_id=? AND job_attempt_revision=?`,
+		winner.JobID, winner.JobAttemptRevision).Scan(
+		&existing.JobID, &existing.JobAttemptRevision, &existing.CandidateID,
+		&existing.BrowserHolderGeneration, &existing.SHA256, &existing.CreatedAt)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		var claimMatch int
+		if producer != nil {
+			// Exact producer correlation proves that validated bytes came from
+			// this historical materialization. The current claim row may have
+			// replaced its holder generation, so preserve candidate/job/attempt
+			// linkage here and verify the producing generation from the durable
+			// permit or reconstructed legacy blocker below.
+			err = tx.QueryRowContext(ctx, `
+				SELECT 1
+				  FROM materialization_claims m
+				  JOIN browser_candidates c ON c.id=m.candidate_id
+				 WHERE m.candidate_id=? AND c.job_id=?
+				   AND c.job_attempt_revision=?
+				 LIMIT 1`,
+				winner.CandidateID, winner.JobID, winner.JobAttemptRevision).Scan(&claimMatch)
+		} else {
+			now := store.Now()
+			err = tx.QueryRowContext(ctx, `
+				SELECT 1
+				  FROM materialization_claims m
+				  JOIN browser_candidates c ON c.id=m.candidate_id
+				  JOIN institution_profiles p ON p.id=c.institution_profile_id
+				 WHERE p.tombstoned_at IS NULL
+				   AND p.revision=c.institution_profile_revision
+				   AND m.candidate_id=? AND c.job_id=?
+				   AND c.job_attempt_revision=? AND m.browser_holder_generation=?
+				   AND m.phase IN ('claimed','bound','route_issued','navigated')
+				   AND (m.lease_until IS NULL OR m.lease_until>?)
+				 LIMIT 1`,
+				winner.CandidateID, winner.JobID, winner.JobAttemptRevision,
+				winner.BrowserHolderGeneration, now).Scan(&claimMatch)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return ArtifactWinner{}, false, false, ErrMaterializationStale
+		}
+		if err != nil {
+			return ArtifactWinner{}, false, false, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO artifact_winners
+			(job_id,job_attempt_revision,candidate_id,browser_holder_generation,sha256,created_at)
+			VALUES(?,?,?,?,?,?)`, winner.JobID, winner.JobAttemptRevision,
+			winner.CandidateID, winner.BrowserHolderGeneration, winner.SHA256,
+			winner.CreatedAt); err != nil {
+			return ArtifactWinner{}, false, false, err
+		}
+		existing = winner
+	case err != nil:
+		return ArtifactWinner{}, false, false, err
+	}
+	won := existing.CandidateID == winner.CandidateID &&
+		existing.JobAttemptRevision == winner.JobAttemptRevision &&
+		existing.BrowserHolderGeneration == winner.BrowserHolderGeneration &&
+		existing.SHA256 == winner.SHA256
+	settled := false
+	if producer != nil {
+		settled, err = settleArtifactProducerTx(ctx, tx, winner.JobID, *producer)
+		if err != nil {
+			return ArtifactWinner{}, false, false, err
+		}
+		if !settled {
+			// A correlated artifact must release one exact durable producer.
+			// Committing a winner without that release would leave occupancy
+			// stranded, so roll back both sides of this transaction.
+			return ArtifactWinner{}, false, false, ErrEffectPermitStale
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ArtifactWinner{}, false, false, err
+	}
+	return existing, won, settled, nil
+}
+
+// SettleArtifactProducer settles an exact producer when no materialization
+// candidate exists. This never creates an artifact winner and never guesses
+// from job identity alone.
+func (js *Store) SettleArtifactProducer(ctx context.Context, jobID string, producer ArtifactProducerIdentity) (bool, error) {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	settled, err := settleArtifactProducerTx(ctx, tx, jobID, producer)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return settled, nil
+}
+
 // ArtifactWinner returns the committed winner for one exact job attempt.
 func (js *Store) ArtifactWinner(ctx context.Context, jobID string, jobAttemptRevision int64) (ArtifactWinner, bool, error) {
 	if jobID == "" || jobAttemptRevision < 1 {

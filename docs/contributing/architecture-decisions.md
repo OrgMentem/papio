@@ -270,14 +270,24 @@ speculative confirmation prompts.
 **Context:** *papio* had distinct popup, badge, desktop-notification, inbox,
 and Activity surfaces but no explicit responsibility split between them.
 Inventory counts also conflated active work, scheduled waits, and human turns,
-while per-item notifications made large runs noisy. The browser and daemon
-must continue to evolve through strict, feature-negotiated, additive contracts.
+while per-item notifications made large runs noisy. The popup also closes on
+click, so a deliberate action could lose its only visible receipt before the
+researcher read it. The browser and daemon must continue to evolve through
+strict, feature-negotiated, additive contracts.
 
-**Decision:** ADR-0023 keeps the five surfaces distinct: inline feedback
+**Decision:** ADR-0023 keeps the six surfaces distinct: inline feedback
 acknowledges a local action, the popup is a current-page lens with a compact
-pulse, the badge is ambient blocker/turn state, desktop notification policy is
-daemon-owned and best effort, and the inbox plus Activity are the durable
-bounded read model. `attention` remains turn-taking (`working`, `required`, or
+pulse, a three-second host-page acknowledgement confirms that a popup action
+entered *papio* on the exact page the researcher is still looking at, the badge
+is ambient blocker/turn state, desktop notification policy is daemon-owned and
+best effort, and the inbox plus Activity are the durable
+bounded read model. The host-page acknowledgement is noninteractive and
+success-only: it carries one closed short label, no identifier, title, URL,
+provider, job ID, progress, or error, obeys the existing transient-feedback
+preference, and never replaces inline feedback or durable job state. It is a
+page-local projection inside a tab already granted for the action, so the daemon
+remains the sole desktop-notification owner and browser notification channels
+stay rejected. `attention` remains turn-taking (`working`, `required`, or
 `advisory`), never severity; notification category and persistence are separate
 axes. A single typed router uses the closed categories and phase mapping,
 durable `(category, event_kind, aggregate_key, phase, window_start)` identity,

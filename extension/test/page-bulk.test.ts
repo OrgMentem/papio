@@ -950,6 +950,127 @@ test("the allowlist checkbox reflects background state and persists a change", a
 
   const setRequest = page.requests.find((r) => r.type === "papio.pageBulk.allowlist.set");
   expect(setRequest?.request).toEqual({ origin: "https://scholar.example.edu", allowed: false });
+  expect(box.checked).toBe(false);
+});
+
+test("the allowlist checkbox is disabled while its set request is pending", async () => {
+  const snap = snapshot();
+  let resolveSet: (value: unknown) => void = () => undefined;
+  const setPending = new Promise<unknown>((resolve) => {
+    resolveSet = resolve;
+  });
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.allowlist.set") return setPending;
+    return standardReply(snap, [eligibleStatus("id-1")], true)(message);
+  });
+  const box = page.document.getElementById("allowlist-checkbox") as HTMLInputElement;
+  expect(box.checked).toBe(true);
+
+  box.checked = false;
+  box.dispatchEvent(new Event("change", { bubbles: true }));
+  await settle();
+
+  expect(box.disabled).toBe(true);
+  expect(box.checked).toBe(true);
+
+  resolveSet({ ok: true, allowed: false });
+  await settle();
+
+  expect(box.disabled).toBe(false);
+  expect(box.checked).toBe(false);
+});
+
+test("a failed allowlist set reverts the checkbox and shows a row-local error", async () => {
+  const snap = snapshot();
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.allowlist.set") {
+      return { ok: false, error: { code: "internal", message: "Could not save scanner consent" } };
+    }
+    return standardReply(snap, [eligibleStatus("id-1")], true)(message);
+  });
+  const box = page.document.getElementById("allowlist-checkbox") as HTMLInputElement;
+  const message = page.document.getElementById("allowlist-message");
+
+  box.checked = false;
+  box.dispatchEvent(new Event("change", { bubbles: true }));
+  await settle();
+
+  expect(box.checked).toBe(true);
+  expect(message?.hidden).toBe(false);
+  expect(message?.textContent).toBe("Could not save scanner consent");
+});
+
+test("a scanner_consent_required rescan keeps the snapshot and refuses without a second rescan until consent returns", async () => {
+  const snap = snapshot();
+  let rescanCalls = 0;
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.rescan") {
+      rescanCalls += 1;
+      if (rescanCalls === 1) {
+        return {
+          ok: false,
+          error: {
+            code: "scanner_consent_required",
+            message: "Allow scanning on this site before papio reads the page",
+          },
+        };
+      }
+      return { ok: true, snapshot: { ...snap, documentGeneration: 2, items: snap.items } };
+    }
+    if (message.type === "papio.pageBulk.allowlist.set") {
+      return { ok: true, allowed: message.request["allowed"] === true };
+    }
+    return standardReply(snap, [eligibleStatus("id-1")], false)(message);
+  });
+
+  expect(row(page.document, "id-1")).not.toBeNull();
+  const rescanButton = page.document.getElementById("rescan-btn") as HTMLButtonElement;
+  rescanButton.click();
+  await settle();
+
+  expect(rescanCalls).toBe(1);
+  expect(row(page.document, "id-1")).not.toBeNull();
+  expect(page.document.getElementById("status-error-message")?.textContent).toContain(
+    "Allow scanning on this site before papio reads the page",
+  );
+
+  const box = page.document.getElementById("allowlist-checkbox") as HTMLInputElement;
+  box.checked = true;
+  box.dispatchEvent(new Event("change", { bubbles: true }));
+  await settle();
+
+  rescanButton.click();
+  await settle();
+
+  expect(rescanCalls).toBe(2);
+  expect(page.document.getElementById("status-error")?.hidden).toBe(true);
+});
+
+test("a source_changed rescan shows its detail and hides Rescan without rebinding", async () => {
+  const snap = snapshot();
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.rescan") {
+      return {
+        ok: false,
+        error: {
+          code: "source_changed",
+          message: "The source tab moved to another site — start a new scan",
+        },
+      };
+    }
+    return standardReply(snap)(message);
+  });
+
+  const rescanButton = page.document.getElementById("rescan-btn") as HTMLButtonElement;
+  rescanButton.click();
+  await settle();
+
+  expect(row(page.document, "id-1")).not.toBeNull();
+  expect(rescanButton.hidden).toBe(true);
+  expect(page.document.getElementById("status-error-message")?.textContent).toBe(
+    "The source tab moved to another site — start a new scan",
+  );
+  expect(page.requests.filter((r) => r.type === "papio.pageBulk.load").length).toBe(1);
 });
 
 test("reopening a workspace pulls settled grab state and never renders Ready to grab", async () => {

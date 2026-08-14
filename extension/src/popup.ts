@@ -19,6 +19,8 @@ import {
 import {
   chromeBackend,
   CATCH_UP_ENABLED_KEY,
+  getSuccessAckMode,
+  type SuccessAckMode,
   type ActiveJob,
   type PendingDelivery,
   type StoreShape,
@@ -173,6 +175,159 @@ interface PageMetadata {
   tab_id?: number;
 }
 
+/** The page an action was bound to at the moment it was requested.
+ *
+ * `url` stays the acquisition/PDF-source URL — a provider viewer address is
+ * rewritten to the file it wraps — while `tab_url` stays the ACTUAL browser tab
+ * URL. Both are kept deliberately: the rewritten one is what papio acts on, and
+ * only the unrewritten one can be compared byte-for-byte against a later read
+ * of the active tab. Collapsing them would make the binding unverifiable. */
+export type PageActionBinding = PageMetadata & { tab_id: number; tab_url: string };
+
+/** One message for every "you asked about a page that is no longer in front of
+ * you" case, so a researcher never has to distinguish which of the three
+ * validation points noticed. */
+export const PAGE_CHANGED_MESSAGE = "The active page changed — try again";
+
+/** Identity of the page a result belongs to. A five-second refresh may render a
+ * different page than the one an in-flight action was bound to; keying results
+ * on this stops one page's outcome appearing under another. */
+export function popupPageKey(binding: PageActionBinding): string {
+  return `${binding.tab_id}\u0000${binding.tab_url}`;
+}
+
+/** Bindings live on the button, not in a module variable, so two rail buttons
+ * cannot share one mutable "current page" that a refresh has since replaced. */
+const pageActionBindings = new WeakMap<HTMLButtonElement, PageActionBinding>();
+
+export function bindPageAction(button: HTMLButtonElement, binding: PageActionBinding): void {
+  pageActionBindings.set(button, binding);
+}
+
+export function boundPageAction(button: HTMLButtonElement): PageActionBinding | undefined {
+  return pageActionBindings.get(button);
+}
+
+export type PopupFeedbackTone = "progress" | "success" | "degraded" | "error" | "info";
+
+export interface PopupOperationState {
+  generation: number;
+  ownerKey: string;
+  phase: "pending" | "result";
+  text: string;
+  tone: PopupFeedbackTone;
+}
+
+export interface PopupOperationResult {
+  ownerKey: string;
+  text: string;
+  tone: PopupFeedbackTone;
+}
+
+/** One registry per document for every locally initiated popup operation.
+ *
+ * The popup repaints from scratch every five seconds, so DOM-only pending flags
+ * and closure-local booleans lost their state on the next tick — a click's
+ * "Opening…" or its error would silently revert while the work was still in
+ * flight. Pending and result state therefore lives here and is re-rendered from
+ * the registry on every pass. `generation` fences a slow reply against a newer
+ * click on the same key; `ownerKey` fences it against the owner (page, job,
+ * host) having been replaced underneath it. */
+const popupOperationRegistries = new WeakMap<Document, Map<string, PopupOperationState>>();
+
+function popupOperations(doc: Document): Map<string, PopupOperationState> {
+  let registry = popupOperationRegistries.get(doc);
+  if (registry === undefined) {
+    registry = new Map();
+    popupOperationRegistries.set(doc, registry);
+  }
+  return registry;
+}
+
+export function beginPopupOperation(
+  doc: Document,
+  operationKey: string,
+  ownerKey: string,
+  text: string,
+): number {
+  const registry = popupOperations(doc);
+  const generation = (registry.get(operationKey)?.generation ?? 0) + 1;
+  registry.set(operationKey, { generation, ownerKey, phase: "pending", text, tone: "progress" });
+  return generation;
+}
+
+/** Commit a result only if this key is still on the same generation and owner.
+ * `null` removes the entry — used for a success whose whole point is that the
+ * popup is closing, where a lingering result would outlive its surface. */
+export function finishPopupOperation(
+  doc: Document,
+  operationKey: string,
+  generation: number,
+  state: PopupOperationResult | null,
+): boolean {
+  const registry = popupOperations(doc);
+  const current = registry.get(operationKey);
+  if (current === undefined || current.generation !== generation) return false;
+  if (state !== null && current.ownerKey !== state.ownerKey) return false;
+  if (state === null) {
+    registry.delete(operationKey);
+    return true;
+  }
+  registry.set(operationKey, {
+    ...current,
+    phase: "result",
+    text: state.text,
+    tone: state.tone,
+  });
+  return true;
+}
+
+export function popupOperation(doc: Document, operationKey: string): PopupOperationState | undefined {
+  return popupOperations(doc).get(operationKey);
+}
+
+export function clearPopupOperation(doc: Document, operationKey: string): void {
+  popupOperations(doc).delete(operationKey);
+}
+
+/** Drop entries whose owner no longer exists. An error must persist until the
+ * researcher retries it *or* its owner disappears — never merely because the
+ * next poll happened. */
+export function prunePopupOperations(doc: Document, ownerIsLive: (ownerKey: string) => boolean): void {
+  const registry = popupOperations(doc);
+  for (const [key, state] of [...registry]) {
+    if (!ownerIsLive(state.ownerKey)) registry.delete(key);
+  }
+}
+
+/** The last text written to the stable announcer per document. A rerender that
+ * reproduces identical text must not re-speak it. */
+const popupAnnouncements = new WeakMap<Document, string>();
+
+/** Announce one state transition through the single stable live region. Local
+ * result elements stay visible beside their controls and carry no live role, so
+ * this is the only place a screen reader hears about a local operation. */
+export function announcePopupOperation(doc: Document, text: string): void {
+  const announcer = doc.getElementById("popup-operation-status");
+  if (!(announcer instanceof HTMLElement)) return;
+  if (popupAnnouncements.get(doc) === text) return;
+  popupAnnouncements.set(doc, text);
+  announcer.textContent = text;
+}
+
+/** Paint one registry entry into its visible, non-live result element. */
+export function paintPopupResult(element: HTMLElement, state: PopupOperationState | undefined): void {
+  if (state === undefined || state.text === "") {
+    element.textContent = "";
+    element.hidden = true;
+    delete element.dataset.tone;
+    return;
+  }
+  element.textContent = state.text;
+  element.dataset.tone = state.tone;
+  element.hidden = false;
+}
+
 const NO_DOI_FOUND = "no DOI found on this page";
 
 /**
@@ -260,8 +415,152 @@ export function collectPageMetadata(): PageMetadata {
   };
 }
 
-/** Read the active page under the popup's transient activeTab grant. */
-export async function readCurrentPageMetadata(): Promise<PageMetadata> {
+/** The closed set of acknowledgements the host page may show. ADR-0023
+ * Decision 1: one short label for one accepted action, and nothing else — no
+ * identifier, title, URL, provider, job id, progress, or error. */
+export type InPageAcknowledgementKind = "queued" | "already_queued" | "pdf_started" | "pdf_received";
+
+/**
+ * Runs INSIDE the page via scripting.executeScript, so — like
+ * collectPageMetadata above — it must stay fully self-contained: no
+ * outer-scope reference, module import, or shared constant survives
+ * serialization, which is why the copy table and the tone literals are
+ * duplicated in the body rather than shared with the extension's tokens.
+ *
+ * ADR-0023 Decision 1's sixth surface. It exists because the popup closes on
+ * click, so its own inline result can vanish before the researcher reads it.
+ * The chip is noninteractive (`pointer-events: none`), installs no observer,
+ * listener, content script, or persistence, and removes itself after three
+ * seconds; navigation removes it naturally and an SPA keeps it for at most that
+ * lifetime. The host is `aria-hidden` because the popup's stable announcer has
+ * already reported the same action — a second announcement would be a duplicate,
+ * not an aid.
+ */
+export function renderInPageAcknowledgement(kind: InPageAcknowledgementKind): void {
+  const HOST_ID = "papio-extension-action-ack-v1";
+  const DWELL_MS = 3_000;
+  const ENTER_MS = 180;
+  const EXIT_MS = 140;
+  const COPY: Record<string, { label: string; glyph: string; tone: "success" | "info" | "continuing" }> = {
+    queued: { label: "Added to papio", glyph: "✓", tone: "success" },
+    already_queued: { label: "Already in papio", glyph: "•", tone: "info" },
+    pdf_started: { label: "papio is handling this PDF", glyph: "→", tone: "continuing" },
+    pdf_received: { label: "PDF received by papio", glyph: "✓", tone: "success" },
+  };
+  const copy = COPY[kind];
+  if (copy === undefined) return;
+  // Foreground / border / surface, mirroring the extension's own light and dark
+  // token values exactly. Literals, not variables: the page has no access to the
+  // extension's stylesheet.
+  const TONES: Record<string, { light: [string, string, string]; dark: [string, string, string] }> = {
+    success: { light: ["#245e45", "#78aa8f", "#edf7f1"], dark: ["#b3ddc2", "#568f6d", "#1d3329"] },
+    info: { light: ["#12549b", "#8db9eb", "#eaf3ff"], dark: ["#a8d0ff", "#4f85bc", "#183956"] },
+    continuing: { light: ["#426789", "#b8c5d1", "#eef3f6"], dark: ["#aecbe4", "#526579", "#263340"] },
+  };
+  const prior = document.getElementById(HOST_ID);
+  if (prior !== null) prior.remove();
+  const host = document.createElement("div");
+  host.id = HOST_ID;
+  host.setAttribute("aria-hidden", "true");
+  host.style.cssText = [
+    "position:fixed",
+    "right:16px",
+    "bottom:16px",
+    "z-index:2147483647",
+    "pointer-events:none",
+    "margin:0",
+    "padding:0",
+    "border:0",
+  ].join(";");
+  // Open, not closed: isolation is what a shadow root is for here, and an open
+  // root stays inspectable and testable without weakening that isolation.
+  const root = host.attachShadow({ mode: "open" });
+  const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const [ink, border, surface] = dark ? TONES[copy.tone]!.dark : TONES[copy.tone]!.light;
+  const chip = document.createElement("div");
+  chip.style.cssText = [
+    "align-items:center",
+    `background:${surface}`,
+    `border:1px solid ${border}`,
+    "border-radius:8px",
+    "box-shadow:0 8px 24px rgb(24 34 49 / 16%)",
+    `color:${ink}`,
+    "display:flex",
+    "font:600 13px/1.4 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+    "gap:12px",
+    "max-width:min(320px, calc(100vw - 32px))",
+    "padding:12px",
+    "opacity:0",
+    reduceMotion ? "transform:none" : "transform:translateY(8px)",
+    reduceMotion ? "transition:opacity 0.01ms linear" : `transition:opacity ${ENTER_MS}ms cubic-bezier(0.25, 1, 0.5, 1), transform ${ENTER_MS}ms cubic-bezier(0.25, 1, 0.5, 1)`,
+  ].join(";");
+  const glyph = document.createElement("span");
+  glyph.textContent = copy.glyph;
+  glyph.style.cssText = "flex:none;font-size:14px;line-height:1";
+  const label = document.createElement("span");
+  label.textContent = copy.label;
+  chip.append(glyph, label);
+  root.append(chip);
+  document.documentElement.append(host);
+  requestAnimationFrame(() => {
+    chip.style.opacity = "1";
+    chip.style.transform = "none";
+  });
+  window.setTimeout(() => {
+    chip.style.transition = reduceMotion
+      ? "opacity 0.01ms linear"
+      : `opacity ${EXIT_MS}ms cubic-bezier(0.5, 0, 0.75, 0), transform ${EXIT_MS}ms cubic-bezier(0.5, 0, 0.75, 0)`;
+    chip.style.opacity = "0";
+    if (!reduceMotion) chip.style.transform = "translateY(4px)";
+    // Under reduced motion the JS delay collapses with the CSS transition, so
+    // the host is never left invisible-but-present.
+    window.setTimeout(() => host.remove(), reduceMotion ? 0 : EXIT_MS);
+  }, DWELL_MS);
+}
+
+/** Project one accepted popup action into the page it was requested from.
+ *
+ * Success-only and preference-gated: `errors` and `off` suppress the chip while
+ * every mode keeps the popup's inline state and its accessible announcement.
+ * The binding is revalidated first so a chip cannot land on a page the
+ * researcher navigated to after clicking, and injection failure is swallowed
+ * because inline popup feedback is the authoritative receipt. */
+export async function acknowledgeInPage(
+  binding: PageActionBinding,
+  kind: InPageAcknowledgementKind,
+): Promise<void> {
+  // Fail closed on an unreadable preference: this is a success-only extra, so
+  // "we could not check whether you wanted it" means don't show it.
+  let mode: SuccessAckMode;
+  try {
+    mode = await getSuccessAckMode();
+  } catch {
+    return;
+  }
+  if (mode !== "all") return;
+  if (!(await validatePageActionBinding(binding))) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: binding.tab_id },
+      func: renderInPageAcknowledgement,
+      args: [kind],
+    });
+  } catch {
+    // A PDF viewer, a privileged page, or a withdrawn activeTab grant refuses
+    // injection. The popup's own result already told the researcher what
+    // happened, and papio asks for no broader permission to cover this.
+  }
+}
+
+/** Read the active page under the popup's transient activeTab grant, and return
+ * it as a binding rather than as loose page facts.
+ *
+ * Metadata and tab facts are two reads separated by an injection round trip. A
+ * navigation in between used to fuse one page's DOI onto another page's URL, so
+ * the active tab is re-read afterwards and both the tab id and the byte-exact
+ * tab URL must still match. */
+export async function readCurrentPageMetadata(): Promise<PageActionBinding> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tab?.id === undefined) throw new Error("No active tab");
   const tabURL = typeof tab.url === "string" ? tab.url : "";
@@ -284,6 +583,10 @@ export async function readCurrentPageMetadata(): Promise<PageMetadata> {
     // PDF viewers and privileged pages reject scripting; their tab URL is
     // enough to classify the page and start a browser-managed download.
   }
+  const [after] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (after?.id !== tab.id || (typeof after.url === "string" ? after.url : "") !== tabURL) {
+    throw new Error(PAGE_CHANGED_MESSAGE);
+  }
   const pageURL = tabURL || metadata?.url;
   if (pageURL === undefined || pageURL.length === 0) throw new Error("Could not read the current page");
   const viewerPDFURL = providerViewerPDFURL(pageURL);
@@ -301,7 +604,34 @@ export async function readCurrentPageMetadata(): Promise<PageMetadata> {
     ...(metadata?.title || tab.title ? { title: metadata?.title || tab.title! } : {}),
     kind: classification.kind,
     tab_id: tab.id,
+    tab_url: tabURL,
   };
+}
+
+/** The bare HTTPS origin scanner consent is granted for, or `null` when this
+ * binding could never be a legitimate scan target. Derived from the bound
+ * source URL so consent and the page actually read cannot diverge. */
+export function scannerOriginForBinding(binding: PageActionBinding): string | null {
+  try {
+    const parsed = new URL(binding.url);
+    const origin = `${parsed.protocol}//${parsed.host}`;
+    return isBareHTTPSOrigin(origin) ? origin : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Confirm the bound page is still the active one before acting on it. The tab
+ * id alone is not enough — the same tab navigating elsewhere is exactly the case
+ * this exists to catch — so the tab URL must match byte-for-byte. */
+export async function validatePageActionBinding(binding: PageActionBinding): Promise<boolean> {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.id === undefined || tab.id !== binding.tab_id) return false;
+    return (typeof tab.url === "string" ? tab.url : "") === binding.tab_url;
+  } catch {
+    return false;
+  }
 }
 
 export const OPEN_INBOX_MESSAGE = "papio.openInbox";
@@ -325,6 +655,7 @@ export async function openInbox(): Promise<void> {
 }
 
 export const PAGE_BULK_SCAN_MESSAGE = "papio.pageBulk.scan";
+export const PAGE_BULK_ALLOWLIST_SET_MESSAGE = "papio.pageBulk.allowlist.set";
 
 interface PageBulkScanResponse {
   ok?: boolean;
@@ -332,44 +663,245 @@ interface PageBulkScanResponse {
   error?: { code?: string; message?: string };
 }
 
-/** Run the one-shot page scan (ADR-0019 Decision 1): this click IS v1's scan
- * consent — no allowlist prompt, no confirmation dialog. Background injects
- * the detector into the active tab's top frame, stores the snapshot, and
- * opens the selection workspace; this only relays the tab id and surfaces a
- * failure message. */
-export async function startPageBulkScan(): Promise<{ ok: true } | { ok: false; error: string }> {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab?.id === undefined) return { ok: false, error: "No active tab to scan" };
+export interface PageBulkScanOutcome {
+  ok: boolean;
+  /** Structured failure code, so the caller can tell "you have not consented to
+   * this site yet" from every other refusal instead of matching on prose. */
+  code?: string;
+  error?: string;
+}
+
+/** Ask the background to scan the bound page.
+ *
+ * ADR-0019 Decision 2: this click *invokes* the scan but is not the consent —
+ * the background refuses a non-allowlisted origin before reading any DOM, and
+ * answers `scanner_consent_required` so the popup can ask once. The bound origin
+ * travels as `expected_origin` so consent granted for this page cannot be spent
+ * on whatever the tab navigates to next. */
+export async function startPageBulkScan(binding: PageActionBinding): Promise<PageBulkScanOutcome> {
+  if (!(await validatePageActionBinding(binding))) {
+    return { ok: false, code: "page_changed", error: PAGE_CHANGED_MESSAGE };
+  }
+  const origin = scannerOriginForBinding(binding);
+  if (origin === null) {
+    return {
+      ok: false,
+      code: "invalid_page",
+      error: "papio can only scan an ordinary secure (https) page",
+    };
+  }
   const response = (await chrome.runtime.sendMessage({
     type: PAGE_BULK_SCAN_MESSAGE,
-    request: { tab_id: tab.id },
+    request: { tab_id: binding.tab_id, expected_origin: origin },
   })) as PageBulkScanResponse;
   if (response.ok === true) return { ok: true };
-  return { ok: false, error: response.error?.message ?? "Could not scan this page" };
+  return {
+    ok: false,
+    ...(response.error?.code !== undefined ? { code: response.error.code } : {}),
+    error: response.error?.message ?? "Could not scan this page",
+  };
+}
+
+/** Persist scanner consent for exactly this bare origin. Returns true only on a
+ * validated `{ allowed: true }` reply: an unacknowledged write must never be
+ * treated as stored consent. */
+export async function allowScannerOrigin(origin: string): Promise<boolean> {
+  const reply: unknown = await chrome.runtime.sendMessage({
+    type: PAGE_BULK_ALLOWLIST_SET_MESSAGE,
+    request: { origin, allowed: true },
+  });
+  if (typeof reply !== "object" || reply === null) return false;
+  const record = reply as Record<string, unknown>;
+  return record["ok"] === true && record["allowed"] === true;
+}
+
+/** Exact consent copy. It names the host, says where detection happens, and says
+ * what leaves the browser — no more, because a consent prompt that overstates
+ * its own scope is worse than none. */
+export function scannerConsentPrompt(host: string): string {
+  return `Allow papio to scan pages on ${host} for paper identifiers? Detection stays in this tab; only papers you select are sent to the papio app.`;
+}
+
+interface ScannerConsentElements {
+  prompt: HTMLElement;
+  message: HTMLElement;
+  allow: HTMLButtonElement;
+  cancel: HTMLButtonElement;
+}
+
+function scannerConsentElements(doc: Document): ScannerConsentElements | undefined {
+  const prompt = doc.getElementById("page-bulk-consent");
+  const message = doc.getElementById("page-bulk-consent-message");
+  const allow = doc.getElementById("page-bulk-consent-allow");
+  const cancel = doc.getElementById("page-bulk-consent-cancel");
+  if (
+    !(prompt instanceof HTMLElement) ||
+    !(message instanceof HTMLElement) ||
+    !(allow instanceof HTMLButtonElement) ||
+    !(cancel instanceof HTMLButtonElement)
+  ) {
+    return undefined;
+  }
+  return { prompt, message, allow, cancel };
+}
+
+/** The page key the visible consent prompt belongs to. A navigation or a page
+ * change clears the prompt without writing anything. */
+let scannerConsentPageKey: string | undefined;
+
+export function clearScannerConsentPrompt(doc: Document): void {
+  scannerConsentPageKey = undefined;
+  const elements = scannerConsentElements(doc);
+  if (elements === undefined) return;
+  elements.prompt.hidden = true;
+  elements.message.textContent = "";
+  elements.allow.disabled = false;
 }
 
 export function wirePageBulkScanLauncher(
   doc: Document = document,
-  onScan: () => Promise<{ ok: true } | { ok: false; error: string }> = startPageBulkScan,
+  onScan: (binding: PageActionBinding) => Promise<PageBulkScanOutcome> = startPageBulkScan,
+  onAllow: (origin: string) => Promise<boolean> = allowScannerOrigin,
 ): void {
   const button = doc.getElementById("page-bulk-scan-btn");
   const status = doc.getElementById("page-bulk-scan-status");
+  const consent = scannerConsentElements(doc);
   if (!(button instanceof HTMLButtonElement) || button.dataset.wired) return;
   button.dataset.wired = "1";
-  button.addEventListener("click", () => {
+
+  const runScan = (binding: PageActionBinding): void => {
+    const pageKey = popupPageKey(binding);
+    const operationKey = `scan:${pageKey}`;
+    const generation = beginPopupOperation(doc, operationKey, pageKey, "Scanning this page…");
+    if (status instanceof HTMLElement) paintPopupResult(status, popupOperation(doc, operationKey));
+    announcePopupOperation(doc, "Scanning this page…");
     button.disabled = true;
-    if (status) status.textContent = "Scanning this page…";
-    void onScan().then((result) => {
-      button.disabled = false;
-      if (result.ok) {
-        // Chrome dismisses the popup when the new workspace tab takes focus;
-        // Firefox keeps it open, so close it explicitly once it's open.
-        window.close();
-        return;
-      }
-      if (status) status.textContent = result.error;
-    });
+    void onScan(binding).then(
+      (result) => {
+        button.disabled = false;
+        if (result.ok) {
+          // The workspace tab now owns this operation, and the popup is about to
+          // disappear with it, so no result outlives the surface.
+          finishPopupOperation(doc, operationKey, generation, null);
+          // Chrome dismisses the popup when the new workspace tab takes focus;
+          // Firefox keeps it open, so close it explicitly once it's open.
+          window.close();
+          return;
+        }
+        if (result.code === "scanner_consent_required" && consent !== undefined) {
+          // Not an error the researcher has to read as one: papio simply has no
+          // consent for this site yet. Clear the pending line and ask.
+          finishPopupOperation(doc, operationKey, generation, null);
+          if (status instanceof HTMLElement) paintPopupResult(status, undefined);
+          showScannerConsent(doc, binding, onAllow, runScan);
+          return;
+        }
+        const text = result.error ?? "Could not scan this page";
+        finishPopupOperation(doc, operationKey, generation, {
+          ownerKey: pageKey,
+          text,
+          tone: result.code === "page_changed" ? "degraded" : "error",
+        });
+        if (status instanceof HTMLElement) paintPopupResult(status, popupOperation(doc, operationKey));
+        announcePopupOperation(doc, text);
+      },
+      (error: unknown) => {
+        button.disabled = false;
+        const text = error instanceof Error ? error.message : "Could not scan this page";
+        finishPopupOperation(doc, operationKey, generation, {
+          ownerKey: pageKey,
+          text,
+          tone: "degraded",
+        });
+        if (status instanceof HTMLElement) paintPopupResult(status, popupOperation(doc, operationKey));
+        announcePopupOperation(doc, text);
+      },
+    );
+  };
+
+  button.addEventListener("click", () => {
+    // The binding is captured before any await, so the action can only ever
+    // touch the page the researcher was looking at when they clicked.
+    const binding = boundPageAction(button);
+    if (binding === undefined) return;
+    clearScannerConsentPrompt(doc);
+    runScan(binding);
   });
+
+  if (consent !== undefined) {
+    consent.cancel.addEventListener("click", () => {
+      clearScannerConsentPrompt(doc);
+      // Cancel does nothing but return the researcher to the action they
+      // declined, which is where their attention already is.
+      if (!button.hidden && !button.disabled) button.focus();
+    });
+  }
+}
+
+function showScannerConsent(
+  doc: Document,
+  binding: PageActionBinding,
+  onAllow: (origin: string) => Promise<boolean>,
+  onRetry: (binding: PageActionBinding) => void,
+): void {
+  const elements = scannerConsentElements(doc);
+  const origin = scannerOriginForBinding(binding);
+  const status = doc.getElementById("page-bulk-scan-status");
+  if (elements === undefined || origin === null) return;
+  const pageKey = popupPageKey(binding);
+  scannerConsentPageKey = pageKey;
+  elements.message.textContent = scannerConsentPrompt(new URL(origin).host);
+  elements.prompt.hidden = false;
+  elements.allow.disabled = false;
+  announcePopupOperation(doc, elements.message.textContent);
+  elements.allow.focus();
+  if (elements.allow.dataset.wiredOrigin === origin) return;
+  elements.allow.dataset.wiredOrigin = origin;
+  const allowHandler = (): void => {
+    // A stale prompt left behind by a page change must not grant anything.
+    if (scannerConsentPageKey !== pageKey) return;
+    elements.allow.disabled = true;
+    void onAllow(origin).then(
+      (allowed) => {
+        if (scannerConsentPageKey !== pageKey) return;
+        if (!allowed) {
+          elements.allow.disabled = false;
+          const text = "Could not save scanning permission for this site";
+          if (status instanceof HTMLElement) {
+            paintPopupResult(status, {
+              generation: 0,
+              ownerKey: pageKey,
+              phase: "result",
+              text,
+              tone: "error",
+            });
+          }
+          announcePopupOperation(doc, text);
+          return;
+        }
+        // Retry only after the write is acknowledged: scanning on the strength
+        // of an unconfirmed grant is the failure this prompt exists to prevent.
+        clearScannerConsentPrompt(doc);
+        onRetry(binding);
+      },
+      () => {
+        if (scannerConsentPageKey !== pageKey) return;
+        elements.allow.disabled = false;
+        const text = "Could not save scanning permission for this site";
+        if (status instanceof HTMLElement) {
+          paintPopupResult(status, {
+            generation: 0,
+            ownerKey: pageKey,
+            phase: "result",
+            text,
+            tone: "error",
+          });
+        }
+        announcePopupOperation(doc, text);
+      },
+    );
+  };
+  elements.allow.addEventListener("click", allowHandler);
 }
 
 export const OPEN_HANDOFF_MESSAGE = "papio.handoff.open";
@@ -1089,9 +1621,10 @@ function scheduleSessionProbeRetry(
   sessionProbeRetryTimer = setTimeout(() => {
     sessionProbeRetryTimer = undefined;
     const read = checking ? requestSessionState() : requestSessionProbe();
-    void read.then((next) => {
-      if (next !== undefined) renderInstitutionSession(document, next, openInstitutionSignIn, jobs);
-    });
+    // Repaint through refresh(), not directly: a direct renderInstitutionSession
+    // call here is outside the refresh generation fence, so a probe that settled
+    // after a newer refresh used to paint stale session state over it.
+    void read.then(() => refresh().catch(() => undefined));
   }, 2_000);
   (sessionProbeRetryTimer as unknown as { unref?: () => void }).unref?.();
 }
@@ -1351,9 +1884,93 @@ function renderWaitingOnSignIn(
   }
 }
 
-/** Render durable browser actions that need a user gesture: institutional
- * sign-in, provider permission grants, and security checks. */
-const popupBlockerOperations = new Map<string, boolean>();
+/** One row builder for every Needs-you blocker.
+ *
+ * All three blocker kinds had the same hand-rolled pending/label/error dance
+ * against a module-level boolean map, which lost its state on the next
+ * five-second repaint and could not show a persistent failure at all. They now
+ * share the document operation registry, so a click's pending state and its
+ * error survive rerenders and a slow reply cannot overwrite a newer one. */
+function appendBlockerRow(
+  doc: Document,
+  list: HTMLElement,
+  spec: {
+    operationKey: string;
+    ownerKey: string;
+    title: string;
+    reason?: string;
+    idleLabel: string;
+    pendingLabel: string;
+    run: () => Promise<{ text: string; tone: PopupFeedbackTone } | null>;
+  },
+): void {
+  const row = doc.createElement("div");
+  row.className = "needs-you-item";
+  const copy = doc.createElement("div");
+  copy.className = "needs-you-copy";
+  const title = doc.createElement("p");
+  title.className = "needs-you-paper";
+  title.textContent = spec.title;
+  copy.append(title);
+  if (spec.reason !== undefined) {
+    const reason = doc.createElement("p");
+    reason.className = "needs-you-reason";
+    reason.textContent = spec.reason;
+    copy.append(reason);
+  }
+  const result = doc.createElement("p");
+  result.className = "popup-result";
+  result.hidden = true;
+  const button = doc.createElement("button");
+  button.className = "ghost";
+  button.type = "button";
+
+  const paint = (): void => {
+    const state = popupOperation(doc, spec.operationKey);
+    const pending = state?.phase === "pending";
+    button.textContent = pending ? spec.pendingLabel : spec.idleLabel;
+    button.disabled = pending;
+    paintPopupResult(result, state?.phase === "result" ? state : undefined);
+  };
+
+  button.addEventListener("click", () => {
+    if (popupOperation(doc, spec.operationKey)?.phase === "pending") return;
+    const generation = beginPopupOperation(doc, spec.operationKey, spec.ownerKey, spec.pendingLabel);
+    paint();
+    announcePopupOperation(doc, spec.pendingLabel);
+    void spec.run().then(
+      (outcome) => {
+        if (!finishPopupOperation(doc, spec.operationKey, generation, outcome === null ? null : { ownerKey: spec.ownerKey, ...outcome })) {
+          return;
+        }
+        paint();
+        if (outcome !== null) announcePopupOperation(doc, outcome.text);
+      },
+      () => {
+        const text = "Didn't work — try again";
+        if (!finishPopupOperation(doc, spec.operationKey, generation, { ownerKey: spec.ownerKey, text, tone: "degraded" })) {
+          return;
+        }
+        paint();
+        announcePopupOperation(doc, text);
+      },
+    );
+  });
+
+  paint();
+  copy.append(result);
+  row.append(copy, button);
+  list.append(row);
+}
+
+/** Render durable browser actions that need a user gesture: a security check,
+ * provider permission grants, and one auth retry.
+ *
+ * Exactly three row classes, in that order, capped at three rows plus an
+ * overflow link. There is deliberately no Downloads row: no browser-local
+ * Downloads projection exists in `StoreShape`, and inferring one from daemon
+ * prose would put a control here that cannot act. Downloads actions stay in the
+ * durable inbox. */
 export function renderNeedsAttention(
   doc: Document,
   jobs: ActiveJob[],
@@ -1377,6 +1994,7 @@ export function renderNeedsAttention(
   ) {
     return;
   }
+  void onOpenOptions;
   const pending = jobs.filter(
     (job) =>
       (job.status === "auth_pending" || job.engagement_required === true) &&
@@ -1410,139 +2028,72 @@ export function renderNeedsAttention(
   list.replaceChildren();
   if (section.hidden) return;
 
+  // One heading, always. A heading that renamed itself per blocker kind read as
+  // a different section appearing rather than the same one gaining a row.
+  heading.textContent = "Needs you";
   if (challengeJobs.length > 0) {
-    heading.textContent = "Security check needs you";
-    message.textContent = "Solve it in the open tab — papio resumes automatically.";
+    message.textContent = "Solve the check in the open tab — papio resumes on its own.";
   } else if (stalled.length > 0 && blocked.length > 0) {
-    heading.textContent = "Needs your attention";
-    message.textContent = "Sign in again and allow provider access below.";
+    message.textContent = "Sign in again, and allow the blocked source below.";
   } else if (stalled.length > 0) {
-    heading.textContent = "Sign in, then retry";
     message.textContent = "Sign-in didn't stick — retry these papers.";
   } else {
-    heading.textContent = "Allow provider access";
-    message.textContent = "Grant the blocked source here, or manage all sources in Options.";
+    message.textContent = "Allow the blocked source here, or manage all sources in Settings.";
   }
   if (overflowCount > 0) message.textContent += ` · ${overflowCount} more in inbox`;
   message.hidden = message.textContent === "";
-  for (const job of visibleChallenges) {
 
-    const row = doc.createElement("div");
-    row.className = "needs-you-item";
-    const copy = doc.createElement("div");
-    copy.className = "needs-you-copy";
-    const provider = doc.createElement("p");
-    provider.className = "needs-you-paper";
-    provider.textContent = `Security check needs you - ${job.challenge_host!.trim().toLowerCase()}`;
-    const reason = doc.createElement("p");
-    reason.className = "needs-you-reason";
-    reason.textContent = "Complete it in the open tab; papio will resume without retrying the provider.";
-    copy.append(provider, reason);
-    const button = doc.createElement("button");
-    const operationKey = `challenge:${job.job_id}`;
-    const pendingOperation = popupBlockerOperations.get(operationKey) === true;
-    button.className = "ghost";
-    button.type = "button";
-    button.textContent = pendingOperation ? "Opening…" : "Go-to-tab";
-    button.disabled = pendingOperation;
-    button.addEventListener("click", () => {
-      if (popupBlockerOperations.get(operationKey) === true) return;
-      popupBlockerOperations.set(operationKey, true);
-      button.disabled = true;
-      button.textContent = "Opening…";
-      void onFocus(job.job_id).then(
-        () => {
-          popupBlockerOperations.delete(operationKey);
-          button.disabled = false;
-          button.textContent = "Go-to-tab";
-        },
-        () => {
-          popupBlockerOperations.delete(operationKey);
-          button.disabled = false;
-          button.textContent = "Try again";
-        },
-      );
+  for (const job of visibleChallenges) {
+    const host = job.challenge_host!.trim().toLowerCase();
+    appendBlockerRow(doc, list, {
+      operationKey: `challenge:${job.job_id}`,
+      ownerKey: job.job_id,
+      title: `Security check — ${host}`,
+      reason: "Complete it in the open tab; papio resumes without retrying the provider.",
+      idleLabel: "Open tab",
+      pendingLabel: "Opening…",
+      run: async () => {
+        await onFocus(job.job_id);
+        // The tab now has focus and this popup is gone with it, so a result here
+        // would have no surface to live on.
+        return null;
+      },
     });
-    row.append(copy, button);
-    list.append(row);
   }
 
-
   for (const jobID of visibleStalled) {
-    const row = doc.createElement("div");
-    row.className = "needs-you-item";
-    const copy = doc.createElement("div");
-    copy.className = "needs-you-copy";
-    const paper = doc.createElement("p");
-    paper.className = "needs-you-paper";
     const knownJob = jobs.find((job) => job.job_id === jobID);
-    paper.textContent = knownJob === undefined ? jobID : handoffPaperLabel(knownJob);
-    const reason = doc.createElement("p");
-    reason.textContent = "Sign-in didn't stick - sign in, then retry";
-    copy.append(paper, reason);
-    const button = doc.createElement("button");
-    const operationKey = `retry:${jobID}`;
-    const pendingOperation = popupBlockerOperations.get(operationKey) === true;
-    button.className = "ghost";
-    button.type = "button";
-    button.textContent = pendingOperation ? "Retrying…" : "Retry now";
-    button.disabled = pendingOperation;
-    button.addEventListener("click", () => {
-      if (popupBlockerOperations.get(operationKey) === true) return;
-      popupBlockerOperations.set(operationKey, true);
-      button.disabled = true;
-      button.textContent = "Retrying…";
-      void onRetry(jobID).then(
-        () => {
-          popupBlockerOperations.delete(operationKey);
-          button.disabled = false;
-          button.textContent = "Retry now";
-        },
-        () => {
-          popupBlockerOperations.delete(operationKey);
-          button.disabled = false;
-          button.textContent = "Try again";
-        },
-      );
+    appendBlockerRow(doc, list, {
+      operationKey: `auth-retry:${jobID}`,
+      ownerKey: jobID,
+      title: knownJob === undefined ? jobID : handoffPaperLabel(knownJob),
+      reason: "Sign-in didn't stick — sign in, then retry this paper.",
+      idleLabel: "Retry now",
+      pendingLabel: "Retrying…",
+      run: async () => {
+        await onRetry(jobID);
+        return { text: "Retry requested", tone: "progress" };
+      },
     });
-    row.append(copy, button);
-    list.append(row);
   }
 
   for (const host of visibleBlocked) {
-    const row = doc.createElement("div");
-    row.className = "needs-you-item";
-    const provider = doc.createElement("p");
-    provider.className = "needs-you-paper";
-    provider.textContent = host;
-    const button = doc.createElement("button");
-    const operationKey = `provider:${host}`;
-    const pendingOperation = popupBlockerOperations.get(operationKey) === true;
-    button.className = "ghost";
-    button.type = "button";
-    button.textContent = pendingOperation ? "Allowing…" : "Allow";
-    button.disabled = pendingOperation;
-    button.addEventListener("click", () => {
-      if (popupBlockerOperations.get(operationKey) === true) return;
-      popupBlockerOperations.set(operationKey, true);
-      button.disabled = true;
-      button.textContent = "Allowing…";
-      void onGrantProvider(host).then(
-        (granted) => {
-          popupBlockerOperations.delete(operationKey);
-          button.disabled = false;
-          button.textContent = granted ? "Allowed" : "Try again";
-        },
-        () => {
-          popupBlockerOperations.delete(operationKey);
-          button.disabled = false;
-          button.textContent = "Try again";
-        },
-      );
+    appendBlockerRow(doc, list, {
+      operationKey: `provider:${host}`,
+      ownerKey: host,
+      title: host,
+      reason: "papio needs your permission to reach this source.",
+      idleLabel: "Allow",
+      pendingLabel: "Allowing…",
+      run: async () => {
+        const granted = await onGrantProvider(host);
+        return granted
+          ? { text: "Allowed", tone: "success" }
+          : { text: "Not allowed — try again", tone: "degraded" };
+      },
     });
-    row.append(provider, button);
-    list.append(row);
   }
+
   if (overflowCount > 0) {
     const more = doc.createElement("button");
     more.type = "button";
@@ -1647,14 +2198,21 @@ function responseErrorMessage(response: PageAcquireResponse): string {
   return "";
 }
 
-function pageAcquireStatus(response: PageAcquireResponse): string {
+/** A job id is a durable identifier the inbox owns, not popup copy: it is
+ * unreadable at a glance and the popup cannot act on it. The researcher needs to
+ * know only whether their click landed. */
+function pageAcquireStatus(response: PageAcquireResponse): PopupResultCopy {
   const error = responseErrorMessage(response);
-  if (error) return error;
-  if (typeof response.message === "string" && response.message.length > 0) return response.message;
-  if (typeof response.job_id === "string" && response.job_id.length > 0) {
-    return response.duplicate === true ? `Already queued: ${response.job_id}` : `Queued: ${response.job_id}`;
+  if (error) return { text: error, tone: "error" };
+  if (typeof response.message === "string" && response.message.length > 0) {
+    return { text: response.message, tone: "info" };
   }
-  return "The daemon did not acknowledge this page.";
+  if (typeof response.job_id === "string" && response.job_id.length > 0) {
+    return response.duplicate === true
+      ? { text: "Already in papio", tone: "info" }
+      : { text: "Added to papio", tone: "success" };
+  }
+  return { text: "The daemon did not acknowledge this page.", tone: "error" };
 }
 
 export function deliveryStatusText(delivery: PendingDelivery | undefined): string {
@@ -1674,7 +2232,15 @@ export interface PopupPulseCache {
 export interface PulseDisplay {
   primary: "Moving" | "Waiting on you" | "Stalled" | "Scheduled" | "Idle" | "Unknown";
   primaryText: string;
+  /** The mechanical five-bucket string. Retained in full for the inbox and for
+   * the popup's accessible title detail — the popup no longer prints it, because
+   * five counts in a 380px lens is an inventory, not a status. */
   buckets: string;
+  /** Exact summary of simultaneous work the primary line does NOT already name,
+   * so "papio is working" does not hide four decisions waiting behind it. Zero
+   * and the primary's own class are omitted; an inexact measurement contributes
+   * nothing rather than a guess. */
+  companion: string;
   next: string;
   capacity: string;
   batch: string;
@@ -1763,7 +2329,7 @@ export function derivePulseDisplay(
   counts?: Pick<TriageCounts, "pending_total" | "turns_required">,
 ): PulseDisplay {
   if (connectionStatus !== "connected") {
-    return { primary: "Unknown", primaryText: "Can't tell — daemon disconnected", buckets: "", next: "", capacity: "", batch: "" };
+    return { primary: "Unknown", primaryText: "Can't tell — daemon disconnected", buckets: "", companion: "", next: "", capacity: "", batch: "" };
   }
   if (cache === undefined || cache.workerEpoch === "" || now - cache.receivedAt < 0 || now - cache.receivedAt > maxAgeMs) {
     const generated = cache === undefined ? undefined : Date.parse(cache.pulse.generated_at);
@@ -1773,6 +2339,7 @@ export function derivePulseDisplay(
         ? `Status as of ${new Date(generated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
         : "Can't tell — live progress is unavailable",
       buckets: "",
+      companion: "",
       next: "",
       capacity: "",
       batch: "",
@@ -1858,16 +2425,49 @@ export function derivePulseDisplay(
     const active = latest.nonterminal_total === undefined ? "" : ` · ${latest.nonterminal_total} remaining`;
     batch = `${latest.total} papers · ${latest.settled} settled${active}`;
   }
+  // Companion: the exact non-primary work happening at the same time. Only
+  // measurements the daemon actually supplied contribute, and the class already
+  // named by the primary line is skipped so nothing is said twice.
+  const companionParts: string[] = [];
+  if (
+    primary !== "Waiting on you" &&
+    counts?.turns_required !== undefined &&
+    counts.turns_required > 0
+  ) {
+    companionParts.push(`${counts.turns_required} decisions waiting`);
+  }
+  if (primary !== "Scheduled" && scheduled !== undefined && scheduled > 0) {
+    companionParts.push(`${scheduled} scheduled`);
+  }
+  if (primary !== "Stalled" && stalled !== undefined && stalled > 0) {
+    companionParts.push(`${stalled} stalled`);
+  }
+  const companion = companionParts.join(" · ");
   if (primary === "Idle" && pulse.last_finished_at !== undefined) {
     const finished = Date.parse(pulse.last_finished_at);
     if (Number.isFinite(finished)) {
       const age = relativeAgeParts(finished, now).display;
-      if (age !== "just now") return { primary, primaryText: `${primaryText} · last finished ${age.replace(" ago", "")}`, buckets: bucketParts.join(" · "), next, capacity, batch };
+      if (age !== "just now") {
+        return {
+          primary,
+          primaryText: `${primaryText} · last finished ${age.replace(" ago", "")}`,
+          buckets: bucketParts.join(" · "),
+          companion,
+          next,
+          capacity,
+          batch,
+        };
+      }
     }
   }
-  return { primary, primaryText, buckets: bucketParts.join(" · "), next, capacity, batch };
+  return { primary, primaryText, buckets: bucketParts.join(" · "), companion, next, capacity, batch };
 }
 
+/** Three lines at most: what is happening (plus whatever else is happening),
+ * the one authoritative next action, and either constrained capacity or the
+ * latest cohort. The five-bucket string stays available through `title` and
+ * through `derivePulseDisplay` for the inbox, but printing it here turned a
+ * status into an inventory the researcher had to add up. */
 export function renderWorkPulse(
   doc: Document,
   cache: PopupPulseCache | undefined,
@@ -1877,20 +2477,32 @@ export function renderWorkPulse(
 ): void {
   const section = doc.getElementById("popup-pulse");
   const primary = doc.getElementById("popup-pulse-primary");
-  const buckets = doc.getElementById("popup-pulse-buckets");
   const next = doc.getElementById("popup-pulse-next");
   const capacity = doc.getElementById("popup-pulse-capacity");
   const batch = doc.getElementById("popup-pulse-batch");
-  if (!(section instanceof HTMLElement) || !(primary instanceof HTMLElement) || !(buckets instanceof HTMLElement) ||
+  if (!(section instanceof HTMLElement) || !(primary instanceof HTMLElement) ||
       !(next instanceof HTMLElement) || !(capacity instanceof HTMLElement) || !(batch instanceof HTMLElement)) return;
   const display = derivePulseDisplay(cache, connectionStatus, now, 15_000, counts);
-  primary.textContent = display.primaryText;
-  buckets.textContent = display.buckets;
+  primary.textContent = display.companion === ""
+    ? display.primaryText
+    : `${display.primaryText} · ${display.companion}`;
   next.textContent = display.next;
-  capacity.textContent = display.capacity;
-  batch.textContent = display.batch;
-  for (const node of [buckets, next, capacity, batch]) node.hidden = node.textContent === "";
-  section.hidden = display.primary === "Unknown" && display.primaryText === "Can't tell — live progress is unavailable";
+  // Capacity only while it is actually constraining something; otherwise the
+  // third line is better spent on the latest cohort.
+  const constrained =
+    display.capacity !== "" && (display.primary === "Waiting on you" || display.primary === "Moving");
+  capacity.textContent = constrained ? display.capacity : "";
+  batch.textContent = constrained ? "" : display.batch;
+  for (const node of [next, capacity, batch]) node.hidden = node.textContent === "";
+  // Full validated measurements stay reachable without occupying a line.
+  section.title = [display.primaryText, display.buckets, display.capacity, display.batch]
+    .filter((part) => part !== "")
+    .join(" · ");
+  section.dataset.state = display.primary;
+  // Disconnected is the daemon band's story, not the pulse's.
+  section.hidden =
+    connectionStatus !== "connected" ||
+    (display.primary === "Unknown" && display.primaryText === "Can't tell — live progress is unavailable");
 }
 const POPUP_REFRESH_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 10 * 60_000;
@@ -2201,15 +2813,18 @@ function renderLiveAcquisition(
     (job.requires_auth === true || String(job.status) === "auth_pending" || handoffKind);
   tab.hidden = !hasLiveHandoffTab || onJobTab;
   if (hasLiveHandoffTab) {
-    wireLiveAction(tab, () => (actions.goToTab ?? openHandoff)(job.job_id), "Go to tab");
+    wireLiveAction(tab, () => (actions.goToTab ?? openHandoff)(job.job_id), "Open tab");
     tab.dataset.jobId = job.job_id;
   } else {
     tab.dataset.jobId = "";
   }
 }
 
-export async function acquireCurrentPage(): Promise<PageAcquireResponse> {
-  const page = await readCurrentPageMetadata();
+export async function acquireCurrentPage(binding: PageActionBinding): Promise<PageAcquireResponse> {
+  // Validate first and then use ONLY bound facts. Re-reading the page here would
+  // reintroduce exactly the race the binding exists to close.
+  if (!(await validatePageActionBinding(binding))) throw new Error(PAGE_CHANGED_MESSAGE);
+  const page = binding;
   if (typeof page.doi !== "string" || !page.doi) {
     return { error: NO_DOI_FOUND };
   }
@@ -2232,8 +2847,12 @@ export async function acquireCurrentPage(): Promise<PageAcquireResponse> {
 /** Ask the broker to deliver the current PDF without opening another tab.
  * The broker joins by tab, then DOI, then an Open pin that owns this tab.
  * `targetJobID` is only a hint for that last case. */
-export async function sendCurrentPDF(targetJobID?: string): Promise<PageAcquireResponse> {
-  const page = await readCurrentPageMetadata();
+export async function sendCurrentPDF(
+  binding: PageActionBinding,
+  targetJobID?: string,
+): Promise<PageAcquireResponse> {
+  if (!(await validatePageActionBinding(binding))) throw new Error(PAGE_CHANGED_MESSAGE);
+  const page = binding;
   if (page.kind !== "pdf" && !isPDFPage(page.url)) {
     return { error: "No PDF detected on this page" };
   }
@@ -2298,7 +2917,8 @@ function shortAcquireLabel(label: string): string {
   if (label.startsWith("Sending")) return "Sending…";
   if (label.startsWith("Send this PDF")) return "Send PDF";
   if (label.startsWith("PDF sent")) return "Sent";
-  if (label.startsWith("Already queued") || label.startsWith("Queued")) return "Queued";
+  if (label.startsWith("Added to papio")) return "Added";
+  if (label.startsWith("Already in papio")) return "Already in";
   return label.length > 12 ? `${label.slice(0, 11)}…` : label;
 }
 
@@ -2316,17 +2936,100 @@ function setAcquireButton(
   button.hidden = hidden;
 }
 
-function showAcquireFeedback(section: HTMLElement, status: HTMLElement, text: string): void {
-  status.textContent = text;
-  section.hidden = false;
+/** One visible, non-live result element per rail action. `section` collapses
+ * whenever it owns neither a result nor the live card, so an empty rail reserves
+ * no pixels. */
+function showAcquireFeedback(
+  doc: Document,
+  section: HTMLElement,
+  status: HTMLElement,
+  text: string,
+  tone: PopupFeedbackTone,
+): void {
+  paintPopupResult(status, text === "" ? undefined : { generation: 0, ownerKey: "", phase: "result", text, tone });
+  const live = doc.getElementById("page-acquire-live");
+  section.hidden = status.hidden && !(live instanceof HTMLElement && !live.hidden);
+}
+
+function paintPageAcquireResult(
+  doc: Document,
+  section: HTMLElement,
+  status: HTMLElement,
+  operationKey: string,
+): void {
+  paintPopupResult(status, popupOperation(doc, operationKey));
+  const live = doc.getElementById("page-acquire-live");
+  section.hidden = status.hidden && !(live instanceof HTMLElement && !live.hidden);
+}
+
+export function pageOperationKey(binding: PageActionBinding, mode: "doi" | "pdf"): string {
+  return `page:${popupPageKey(binding)}:${mode}`;
+}
+
+interface PopupResultCopy {
+  text: string;
+  tone: PopupFeedbackTone;
+}
+
+/** PDF-delivery result copy. Identification guidance is `info` because the next
+ * move is the researcher's, not a rejection; only a genuine refusal is `error`. */
+function pdfDeliveryCopy(response: PageAcquireResponse): PopupResultCopy {
+  const errorText = responseErrorMessage(response);
+  const messageText = typeof response.message === "string" ? response.message : "";
+  const hasIdentify = /identify|file/i.test(errorText) || /identify|file/i.test(messageText);
+  const isNoDOI = /no[_ -]?doi/i.test(errorText) || /no[_ -]?doi/i.test(messageText);
+  // With a manual target selected the broker would not answer no_doi, so that
+  // copy would be stale rather than informative.
+  let manualTargetSelected = false;
+  try {
+    const maybeJobs = (globalThis as unknown as { __papioLastJobs?: unknown }).__papioLastJobs;
+    if (Array.isArray(maybeJobs)) {
+      manualTargetSelected = selectedManualDeliveryTarget(maybeJobs as ActiveJob[]) !== undefined;
+    }
+  } catch {
+    // A missing job snapshot only costs this one copy refinement.
+  }
+  if (hasIdentify && messageText) return { text: messageText, tone: "info" };
+  if (hasIdentify && errorText) return { text: errorText, tone: "info" };
+  if (isNoDOI && manualTargetSelected) return { text: "Sending PDF to papio…", tone: "progress" };
+  if (response.state === "sending") {
+    return response.duplicate === true
+      ? { text: "Sending PDF for the existing job", tone: "progress" }
+      : { text: "Sending PDF to papio…", tone: "progress" };
+  }
+  if (response.state === "downloaded" || response.state === "adopted") {
+    return { text: "papio adopted PDF (validating)", tone: "success" };
+  }
+  return { text: errorText || messageText || "PDF delivery did not start.", tone: "error" };
+}
+
+/** Which host-page acknowledgement, if any, this validated response earns.
+ * `undefined` for every error, every pending daemon event, and every later job
+ * transition: the chip acknowledges acceptance of THIS click and nothing else. */
+function acknowledgementKindFor(
+  isPDF: boolean,
+  response: PageAcquireResponse,
+): InPageAcknowledgementKind | undefined {
+  if (responseErrorMessage(response) !== "") return undefined;
+  if (!isPDF) {
+    if (typeof response.job_id !== "string" || response.job_id.length === 0) return undefined;
+    return response.duplicate === true ? "already_queued" : "queued";
+  }
+  if (response.state === "sending" || response.state === "downloaded") return "pdf_started";
+  if (response.state === "adopted") return "pdf_received";
+  return undefined;
 }
 
 /** Render a page-aware acquisition launcher. It remains available while the
  * daemon is down so its established error path stays actionable. */
 export function renderPageAcquire(
   doc: Document,
-  onAcquire: () => Promise<PageAcquireResponse> = acquireCurrentPage,
-  onSendPDF: () => Promise<PageAcquireResponse> = sendCurrentPDF,
+  onAcquire: (binding: PageActionBinding) => Promise<PageAcquireResponse> = acquireCurrentPage,
+  onSendPDF: (binding: PageActionBinding) => Promise<PageAcquireResponse> = sendCurrentPDF,
+  onAcknowledge: (
+    binding: PageActionBinding,
+    kind: InPageAcknowledgementKind,
+  ) => Promise<void> = acknowledgeInPage,
 ): void {
   const section = doc.getElementById("page-acquire");
   const button = doc.getElementById("page-acquire-btn");
@@ -2340,90 +3043,72 @@ export function renderPageAcquire(
   }
   if (button.dataset.wired) return;
   button.dataset.wired = "1";
-  let queued = false;
-  let deliveryPending = false;
   button.addEventListener("click", () => {
+    // Captured before any await: this handler can only ever act on the page the
+    // researcher was looking at when they pressed the button, and its result can
+    // only ever be written under that page's key.
+    const binding = boundPageAction(button);
+    if (binding === undefined) return;
     const isPDF = button.dataset.mode === "pdf";
+    const pageKey = popupPageKey(binding);
+    const operationKey = pageOperationKey(binding, isPDF ? "pdf" : "doi");
+    const pendingText = isPDF ? "Sending PDF to papio…" : "Acquiring…";
+    const generation = beginPopupOperation(doc, operationKey, pageKey, pendingText);
     setAcquireButton(button, isPDF ? "Sending PDF to papio…" : "Acquiring this page…", true);
-    showAcquireFeedback(section, status, isPDF ? "Sending PDF to papio…" : "Acquiring…");
-    void (isPDF ? onSendPDF() : onAcquire()).then(
+    paintPageAcquireResult(doc, section, status, operationKey);
+    announcePopupOperation(doc, pendingText);
+    void (isPDF ? onSendPDF(binding) : onAcquire(binding)).then(
       (response) => {
+        const copy = isPDF ? pdfDeliveryCopy(response) : pageAcquireStatus(response);
+        if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, ...copy })) return;
         if (isPDF) {
-          const state = response.state;
-          deliveryPending = state === "sending" || state === "downloaded";
-          const label = deliveryPending
-            ? response.duplicate === true
-              ? "Sending PDF for the existing job"
-              : "PDF sent to papio"
-            : "Send this PDF to papio";
-          setAcquireButton(button, label, deliveryPending);
-          {
-            const errorText = responseErrorMessage(response);
-            const messageText = typeof response.message === "string" ? response.message : "";
-            const hasIdentify = /identify|file/i.test(errorText) || /identify|file/i.test(messageText);
-            const isNoDOI = /no[_ -]?doi/i.test(errorText) || /no[_ -]?doi/i.test(messageText);
-            // When manual target is selected the broker would not return no_doi; suppress stale copy.
-            let manualTargetSelected = false;
-            try {
-              const maybeJobs = (globalThis as unknown as { __papioLastJobs?: unknown }).__papioLastJobs;
-              if (Array.isArray(maybeJobs)) {
-                manualTargetSelected = selectedManualDeliveryTarget(maybeJobs as ActiveJob[]) !== undefined;
-              }
-            } catch {}
-            if (hasIdentify && messageText) {
-              showAcquireFeedback(section, status, messageText);
-            } else if (hasIdentify && errorText) {
-              showAcquireFeedback(section, status, errorText);
-            } else if (isNoDOI && manualTargetSelected) {
-              showAcquireFeedback(section, status, "Sending PDF to papio…");
-            } else {
-              showAcquireFeedback(
-                section,
-                status,
-                state === "sending"
-                  ? response.duplicate === true
-                    ? "Sending PDF for the existing job"
-                    : "Sending PDF to papio…"
-                  : state === "downloaded"
-                    ? "papio adopted v (validating)"
-                    : errorText || messageText || "PDF delivery did not start.",
-              );
-            }
-          }
-          return;
+          const deliveryPending = response.state === "sending" || response.state === "downloaded";
+          setAcquireButton(
+            button,
+            deliveryPending
+              ? response.duplicate === true
+                ? "Sending PDF for the existing job"
+                : "PDF sent to papio"
+              : "Send this PDF to papio",
+            deliveryPending,
+          );
+        } else {
+          const queued = typeof response.job_id === "string" && response.job_id.length > 0;
+          setAcquireButton(
+            button,
+            queued
+              ? response.duplicate === true
+                ? "Already in papio"
+                : "Added to papio"
+              : button.dataset.idleLabel ?? "Acquire this page",
+            queued,
+          );
         }
-        queued = typeof response.job_id === "string" && response.job_id.length > 0;
-        const label = queued
-          ? response.duplicate === true
-            ? "Already queued"
-            : "Queued"
-          : button.dataset.idleLabel ?? "Acquire this page";
-        setAcquireButton(button, label, queued);
-        showAcquireFeedback(section, status, pageAcquireStatus(response));
+        paintPageAcquireResult(doc, section, status, operationKey);
+        announcePopupOperation(doc, copy.text);
+        const kind = acknowledgementKindFor(isPDF, response);
+        if (kind !== undefined) void onAcknowledge(binding, kind);
       },
       (error: unknown) => {
-        queued = false;
-        deliveryPending = false;
+        // A thrown failure is transport, session, or permission — degraded, not a
+        // structured rejection of the request.
+        const text = error instanceof Error
+          ? error.message
+          : isPDF
+            ? "Could not send PDF to papio"
+            : "Could not acquire this page";
+        if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, text, tone: "degraded" })) {
+          return;
+        }
         setAcquireButton(
           button,
           isPDF ? "Send this PDF to papio" : button.dataset.idleLabel ?? "Acquire this page",
           false,
         );
-        showAcquireFeedback(
-          section,
-          status,
-          error instanceof Error
-            ? error.message
-            : isPDF
-              ? "Could not send PDF to papio"
-              : "Could not acquire this page",
-        );
+        paintPageAcquireResult(doc, section, status, operationKey);
+        announcePopupOperation(doc, text);
       },
-    ).finally(() => {
-      const disabled = isPDF ? deliveryPending : queued;
-      button.disabled = disabled;
-      button.setAttribute("aria-disabled", String(disabled));
-    });
+    );
   });
 }
 
@@ -2496,30 +3181,94 @@ export function pageDeliveryJob(
   return undefined;
 }
 
+/** Decide which page a bulk scan is even possible on. Any bound HTTPS source
+ * qualifies — including a PDF, whose tab address can itself carry an identifier
+ * (ADR-0020) — and malformed or non-HTTPS pages fail closed. Deliberately does
+ * NOT pre-scan for identifiers: detection is invoked, never ambient. */
+export function isBulkScannablePage(binding: PageActionBinding | undefined): boolean {
+  return binding !== undefined && scannerOriginForBinding(binding) !== null;
+}
+
+/** Mark exactly one visible, enabled rail button as the Enter target. With both
+ * actions present, Acquire/Send PDF wins because it is the specific one. */
+function markPrimaryRailAction(
+  acquire: HTMLButtonElement,
+  scan: HTMLButtonElement | undefined,
+): void {
+  const acquirePrimary = !acquire.hidden;
+  if (acquirePrimary) acquire.dataset.primaryAction = "true";
+  else delete acquire.dataset.primaryAction;
+  if (scan === undefined) return;
+  if (!acquirePrimary && !scan.hidden) scan.dataset.primaryAction = "true";
+  else delete scan.dataset.primaryAction;
+}
+
 export function renderPageContext(
   doc: Document,
-  page: PageMetadata | undefined,
+  page: PageActionBinding | undefined,
   jobs: ActiveJob[],
   pendingDelivery?: PendingDelivery,
   activityEntries: readonly ActivityEntryPayload[] = [],
   liveActions: PopupLiveActions = {},
   sessionWarm: PopupSessionWarmth = false,
 ): void {
+  const rail = doc.getElementById("current-page-actions");
   const section = doc.getElementById("page-acquire");
   const status = doc.getElementById("page-acquire-status");
   const button = doc.getElementById("page-acquire-btn");
+  const scanButton = doc.getElementById("page-bulk-scan-btn");
+  const scanStatus = doc.getElementById("page-bulk-scan-status");
   const liveCard = doc.getElementById("page-acquire-live");
   if (
+    !(rail instanceof HTMLElement) ||
     !(section instanceof HTMLElement) ||
     !(status instanceof HTMLElement) ||
     !(button instanceof HTMLButtonElement)
   ) {
     return;
   }
+  const scan = scanButton instanceof HTMLButtonElement ? scanButton : undefined;
   if (liveCard instanceof HTMLElement) liveCard.hidden = true;
   section.hidden = true;
-  status.textContent = "";
+  paintPopupResult(status, undefined);
+
+  // A page change clears any pending consent decision. It is never carried over:
+  // consent belongs to the origin the researcher was actually shown.
+  const pageKey = page === undefined ? undefined : popupPageKey(page);
+  if (scannerConsentPageKey !== undefined && scannerConsentPageKey !== pageKey) {
+    clearScannerConsentPrompt(doc);
+  }
+
+  // Bind both buttons to this exact page before anything can be clicked.
+  if (page !== undefined) {
+    bindPageAction(button, page);
+    if (scan !== undefined) bindPageAction(scan, page);
+  }
+
+  const scannable = isBulkScannablePage(page);
+  if (scan !== undefined) {
+    scan.hidden = !scannable;
+    // ADR-0019's exact visible label; the workspace is what "select" leads to.
+    scan.textContent = "Select papers on this page";
+  }
+  if (scanStatus instanceof HTMLElement) {
+    paintPopupResult(
+      scanStatus,
+      pageKey === undefined ? undefined : popupOperation(doc, `scan:${pageKey}`),
+    );
+  }
+
   const kind = page?.kind ?? (page ? classifyPage(page.url, page.doi ? { doi: page.doi } : {}).kind : "none");
+  const railOwnsSomething = (): boolean =>
+    !button.hidden ||
+    (scan !== undefined && !scan.hidden) ||
+    !section.hidden ||
+    (scanStatus instanceof HTMLElement && !scanStatus.hidden) ||
+    (() => {
+      const consent = doc.getElementById("page-bulk-consent");
+      return consent instanceof HTMLElement && !consent.hidden;
+    })();
+
   if (kind === "pdf") {
     const knownJob = pageDeliveryJob(jobs, { tab_id: page?.tab_id, doi: page?.doi });
     const currentPDFURL = normalizedPDFURL(page?.url);
@@ -2533,6 +3282,8 @@ export function renderPageContext(
     const disabled = delivery?.status === "sending" || delivery?.status === "downloaded";
     setAcquireButton(button, "Send this PDF to papio", disabled);
     if (knownJob !== undefined) {
+      // The live card keeps its richer copy and its own Open inbox / Open tab
+      // authority; the rail does not flatten an in-progress acquisition.
       renderLiveAcquisition(
         doc,
         knownJob,
@@ -2551,18 +3302,40 @@ export function renderPageContext(
       section.hidden = false;
     } else {
       const deliveryStatus = deliveryStatusText(delivery);
-      if (deliveryStatus !== "") showAcquireFeedback(section, status, deliveryStatus);
+      if (deliveryStatus !== "") {
+        showAcquireFeedback(
+          doc,
+          section,
+          status,
+          deliveryStatus,
+          delivery?.status === "failed"
+            ? "error"
+            : delivery?.status === "waiting_manual"
+              ? "info"
+              : delivery?.status === "adopted" || delivery?.status === "downloaded"
+                ? "success"
+                : "progress",
+        );
+      }
     }
-    return;
-  }
-  if (!page?.doi) {
-    button.dataset.mode = "doi";
-    button.dataset.idleLabel = "Acquire this page";
-    setAcquireButton(button, "Acquire this page", true, true);
+    restorePendingRailState(doc, button, page, "pdf", section, status);
+    markPrimaryRailAction(button, scan);
+    rail.hidden = !railOwnsSomething();
     return;
   }
 
   button.dataset.mode = "doi";
+  if (!page?.doi) {
+    // An ordinary HTTPS page with no DOI gets no disabled Acquire placeholder:
+    // a permanently dead control teaches nothing. Bulk selection stands alone.
+    button.dataset.idleLabel = "Acquire this page";
+    setAcquireButton(button, "Acquire this page", true, true);
+    restorePendingRailState(doc, button, page, "doi", section, status);
+    markPrimaryRailAction(button, scan);
+    rail.hidden = !railOwnsSomething();
+    return;
+  }
+
   const normalizedDOI = page.doi.trim().toLowerCase().replace(/^doi:\s*/, "");
   const idleLabel = `Acquire this page · ${normalizedDOI}`;
   button.dataset.idleLabel = idleLabel;
@@ -2571,6 +3344,9 @@ export function renderPageContext(
   );
   if (inFlightJob === undefined) {
     setAcquireButton(button, idleLabel, false);
+    restorePendingRailState(doc, button, page, "doi", section, status);
+    markPrimaryRailAction(button, scan);
+    rail.hidden = !railOwnsSomething();
     return;
   }
 
@@ -2591,6 +3367,33 @@ export function renderPageContext(
     ),
   );
   section.hidden = false;
+  restorePendingRailState(doc, button, page, "doi", section, status);
+  markPrimaryRailAction(button, scan);
+  rail.hidden = !railOwnsSomething();
+}
+
+/** Re-apply an in-flight or completed action's own state after a rerender.
+ *
+ * The popup repaints every five seconds from daemon/store facts, which do not
+ * yet know about a click made 200ms ago. Without this, a pending "Acquiring…"
+ * or a persistent error would be erased by the very next tick while the work
+ * was still running. */
+function restorePendingRailState(
+  doc: Document,
+  button: HTMLButtonElement,
+  page: PageActionBinding | undefined,
+  mode: "doi" | "pdf",
+  section: HTMLElement,
+  status: HTMLElement,
+): void {
+  if (page === undefined) return;
+  const operationKey = pageOperationKey(page, mode);
+  const state = popupOperation(doc, operationKey);
+  if (state === undefined) return;
+  if (state.phase === "pending") {
+    setAcquireButton(button, mode === "pdf" ? "Sending PDF to papio…" : "Acquiring this page…", true);
+  }
+  paintPageAcquireResult(doc, section, status, operationKey);
 }
 
 let popupActivity: ActivityEntryPayload[] = [];
@@ -2637,8 +3440,11 @@ export function wirePrimaryShortcut(doc: Document = document): void {
     if (event.key !== "Enter" || event.defaultPrevented) return;
     const target = event.target;
     if (target instanceof HTMLElement && target.closest("button, input, select, textarea, a")) return;
-    const primary = doc.getElementById("page-acquire-btn");
-    if (primary instanceof HTMLButtonElement && !primary.disabled) {
+    // Whichever rail action renderPageContext marked, not a hardcoded id: on an
+    // ordinary HTTPS page Acquire is hidden and bulk selection is the only thing
+    // Enter could sensibly mean.
+    const primary = doc.querySelector('#current-page-actions button[data-primary-action="true"]');
+    if (primary instanceof HTMLButtonElement && !primary.hidden && !primary.disabled) {
       event.preventDefault();
       primary.click();
     }
@@ -2672,20 +3478,27 @@ function restorePopupFocus(doc: Document, key: string | undefined): void {
     fallback.focus();
   }
 }
+/** Fences DOM writes against a slower, older refresh.
+ *
+ * Two refreshes overlap routinely — the five-second timer plus an
+ * action-triggered one — and their slow `Promise.all` waves can resolve in
+ * reverse order. Reads may proceed concurrently; painting may not, so a wave
+ * abandons its writes the moment a newer refresh has started. */
+let popupRefreshGeneration = 0;
+
 export async function refresh(): Promise<void> {
+  const generation = ++popupRefreshGeneration;
   const focusKey = popupFocusKey(document);
   // Wave 1: store-derived sections paint immediately (one storage read),
   // before the user can aim at anything.
   const store = await chromeBackend(chrome.storage).load();
+  if (generation !== popupRefreshGeneration) return;
   popupPresenceFeatures = store.daemonFeatures;
   void sendPopupPresence(store.daemonFeatures, true);
   renderDaemonStatus(document, store);
   (globalThis as unknown as { __papioLastJobs?: ActiveJob[] }).__papioLastJobs = store.activeJobs;
-  renderPageAcquire(
-    document,
-    acquireCurrentPage,
-    () => sendCurrentPDF(),
-  );
+  renderPageAcquire(document);
+  wirePageBulkScanLauncher(document);
   refreshCaptureOptions(document, store.daemonFeatures);
   // Wave 2: every slow input is gathered in parallel and painted in ONE
   // synchronous pass. Sections revealing one by one over the next seconds
@@ -2719,6 +3532,22 @@ export async function refresh(): Promise<void> {
         return pending;
       })(),
     ]);
+  if (generation !== popupRefreshGeneration) return;
+  // Drop operation state whose owner is gone. An error persists until the
+  // researcher retries it or its owner disappears — never merely because the
+  // next poll happened.
+  const liveOwners = new Set<string>([
+    ...store.activeJobs.map((job) => job.job_id),
+    ...(store.blockedProviderHosts ?? []),
+    ...(session?.stalledAuthJobs ?? []),
+    "open-inbox",
+    "leftover-tabs",
+    "terms",
+    ...(pageMetadata === undefined ? [] : [popupPageKey(pageMetadata)]),
+    ...(ungranted.length > 0 ? [[...ungranted].sort().join(",")] : []),
+    ...(session?.origins ?? []).map((snapshot: KeepaliveOriginSnapshot) => snapshot.origin),
+  ]);
+  prunePopupOperations(document, (ownerKey) => liveOwners.has(ownerKey));
   // Pulse owns the liveness classification; counts-v3 owns any decision
   // number shown in the popup header. They intentionally differ for a
   // terminal-job turn that remains actionable in the inbox.
@@ -2726,6 +3555,7 @@ export async function refresh(): Promise<void> {
   if (freshActivity !== undefined) {
     popupActivity = freshActivity.entries;
     await renderPopupCatchup(document, freshActivity);
+    if (generation !== popupRefreshGeneration) return;
   }
   renderPageContext(
     document,
@@ -2956,10 +3786,12 @@ if (
   renderPageAcquire(
     document,
     acquireCurrentPage,
-    async () => {
+    async (binding) => {
+      // The manual-delivery-target refinement in pdfDeliveryCopy reads this
+      // snapshot, so it must be current before the reply is interpreted.
       const store = await chromeBackend(chrome.storage).load().catch(() => ({ activeJobs: [] as ActiveJob[] }));
       (globalThis as unknown as { __papioLastJobs?: ActiveJob[] }).__papioLastJobs = store.activeJobs ?? [];
-      return sendCurrentPDF();
+      return sendCurrentPDF(binding);
     },
   );
   wireDevTools();

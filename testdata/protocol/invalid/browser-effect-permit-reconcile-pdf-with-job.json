@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"effect_permit_reconcile_request","msg_id":"msg_permit_pdf_002","job_id":"job_permit_pdf_001","seq":1,"payload":{"request_id":"request_pdf_002","permit_id":"permit_pdf_002","effect_kind":"pdf_grab","grab_id":"grab_pdf_002"}}

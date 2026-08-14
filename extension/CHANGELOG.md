@@ -17,6 +17,14 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Added
+- **Provider effects reconcile safely after a service-worker restart.** The
+  extension negotiates `effect_permit_v1`, persists only the daemon-issued
+  permit identity after authorization, and reports exact bounded observations
+  for generic/direct downloads, PDF grabs, configured terms acceptance, and
+  institutional navigation. Missing or ambiguous completion remains occupied
+  in the daemon instead of authorizing a second click or download; old daemons
+  return `unsupported` and no protected effect starts.
+
 - **The extension surfaces honest, recoverable progress.** The inbox now uses
   action-first information architecture with one local feedback strip, and
   hoists repeated guidance only from daemon-authored family run keys. The

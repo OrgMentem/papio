@@ -12,21 +12,55 @@
         --color-brand-ink: #2b2d42;
         --color-brand-accent: #d94f3d;
         --color-muted: #607080;
+        --color-context: #426789;
         --color-border: #dce3ea;
         --color-control-border: #b8c5d1;
         --color-page: #f4f7f9;
         --color-surface: #fdfefe;
         --color-surface-hover: #eef3f6;
         --color-primary: #12549b;
+        --color-primary-border: #8db9eb;
         --color-primary-surface: #eaf3ff;
+        --color-primary-hover: #dcecff;
         --color-primary-solid: #12549b;
+        --color-primary-solid-hover: #0d447f;
         --color-on-primary: #fdfefe;
+        --color-warning: #6d4316;
+        --color-warning-border: #a15c17;
+        --color-warning-surface: #fff7ed;
+        --color-ok: #245e45;
+        --color-ok-border: #78aa8f;
+        --color-ok-surface: #edf7f1;
+        --color-danger: #8f2f28;
+        --color-danger-border: #d94f3d;
+        --color-danger-surface: #fff0ed;
+        --color-neutral-badge: #eef3f6;
         --color-tooltip-bg: #182231;
         --color-tooltip-ink: #f4f7f9;
+        --font-size-label: 11px;
+        --font-size-small: 12px;
+        --font-size-body: 14px;
+        --font-size-title: 22px;
+        --space-1: 4px;
+        --space-2: 8px;
+        --space-3: 12px;
+        --space-4: 16px;
+        --space-6: 24px;
+        --space-8: 32px;
+        --space-12: 48px;
         --radius-control: 6px;
-        --radius-card: 10px;
+        --radius-card: 8px;
         --radius-pill: 999px;
-        --transition-fast: 140ms ease-out;
+        --control-height: 36px;
+        --brand-mark-size: 32px;
+        --focus-width: 2px;
+        --focus-offset: 2px;
+        --motion-hover: 120ms;
+        --motion-state: 160ms;
+        --motion-feedback-in: 180ms;
+        --motion-feedback-out: 140ms;
+        --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+        --ease-in-quart: cubic-bezier(0.5, 0, 0.75, 0);
         accent-color: var(--color-primary);
       }
 
@@ -36,15 +70,29 @@
           --color-brand-ink: #f0edf3;
           --color-brand-accent: #ef6a57;
           --color-muted: #a2b1be;
+          --color-context: #aecbe4;
           --color-border: #3e4f61;
           --color-control-border: #526579;
           --color-page: #141b23;
           --color-surface: #1c2631;
           --color-surface-hover: #263340;
           --color-primary: #a8d0ff;
+          --color-primary-border: #4f85bc;
           --color-primary-surface: #183956;
+          --color-primary-hover: #214967;
           --color-primary-solid: #75b5f5;
+          --color-primary-solid-hover: #91c5fb;
           --color-on-primary: #101a24;
+          --color-warning: #f1c183;
+          --color-warning-border: #b97833;
+          --color-warning-surface: #33291e;
+          --color-ok: #b3ddc2;
+          --color-ok-border: #568f6d;
+          --color-ok-surface: #1d3329;
+          --color-danger: #ffb2a8;
+          --color-danger-border: #ef6a57;
+          --color-danger-surface: #3a2223;
+          --color-neutral-badge: #263340;
           --color-tooltip-bg: #e5edf4;
           --color-tooltip-ink: #141b23;
         }
@@ -62,7 +110,7 @@
         background: var(--color-page);
         color: var(--color-ink);
         font:
-          14px/1.5 ui-sans-serif,
+          var(--font-size-body) / 1.5 ui-sans-serif,
           system-ui,
           -apple-system,
           BlinkMacSystemFont,
@@ -70,25 +118,26 @@
           sans-serif;
         margin: 0 auto;
         max-width: 640px;
-        padding: 32px 24px 48px;
+        overflow-x: hidden;
+        padding: var(--space-8) var(--space-6) var(--space-12);
       }
 
       .brand {
         align-items: center;
         display: flex;
-        gap: 12px;
-        margin: 0 0 24px;
+        gap: var(--space-3);
+        margin: 0 0 var(--space-6);
       }
 
       .brand svg {
         flex: 0 0 auto;
-        height: 32px;
-        width: 32px;
+        height: var(--brand-mark-size);
+        width: var(--brand-mark-size);
       }
 
       .brand-name {
         color: var(--color-brand-ink);
-        font-size: 22px;
+        font-size: var(--font-size-title);
         font-weight: 700;
         letter-spacing: 0.01em;
         line-height: 1.2;
@@ -98,7 +147,7 @@
         text-decoration-color: var(--color-brand-accent);
         text-decoration-line: underline;
         text-decoration-thickness: 2px;
-        text-underline-offset: 4px;
+        text-underline-offset: var(--space-1);
       }
 
       .page-name {
@@ -107,14 +156,14 @@
       }
 
       h2 {
-        font-size: 16px;
+        font-size: var(--font-size-body);
         font-weight: 650;
-        margin: 32px 0 4px;
+        margin: var(--space-8) 0 var(--space-1);
       }
 
       p.lede {
         color: var(--color-muted);
-        margin: 0 0 12px;
+        margin: 0 0 var(--space-3);
       }
 
       .card {
@@ -126,8 +175,9 @@
       .card-toolbar {
         border-bottom: 1px solid var(--color-border);
         display: flex;
-        gap: 8px;
-        padding: 10px 16px;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+        padding: var(--space-2) var(--space-4);
       }
 
       ul.rows {
@@ -140,9 +190,9 @@
       .row {
         align-items: center;
         display: flex;
-        gap: 16px;
+        gap: var(--space-4);
         justify-content: space-between;
-        padding: 12px 16px;
+        padding: var(--space-3) var(--space-4);
       }
 
       ul.rows li + li {
@@ -155,28 +205,55 @@
 
       .source-host {
         color: var(--color-muted);
-        font-size: 12px;
+        font-size: var(--font-size-small);
         overflow-wrap: anywhere;
       }
 
       .hint {
         color: var(--color-muted);
-        font-size: 12px;
+        font-size: var(--font-size-small);
       }
 
-      .permission-message {
-        border-bottom: 1px solid var(--color-border);
+      .inline-feedback-message {
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-control);
+        font-size: var(--font-size-small);
         margin: 0;
-        padding: 8px 16px;
+        overflow-wrap: anywhere;
+        padding: var(--space-2) var(--space-3);
+        transition:
+          background-color var(--motion-state) var(--ease-out-quart),
+          border-color var(--motion-state) var(--ease-out-quart),
+          color var(--motion-state) var(--ease-out-quart);
+        width: 100%;
+      }
+
+      .inline-feedback-message[hidden] {
+        display: none;
+      }
+
+      .inline-feedback-message[data-tone="degraded"] {
+        background: var(--color-warning-surface);
+        border-color: var(--color-warning-border);
+        color: var(--color-warning);
+      }
+
+      .card > .inline-feedback-message {
+        border-left: none;
+        border-right: none;
+        border-top: none;
+        border-radius: 0;
       }
 
       button {
         font: inherit;
       }
 
-      button:focus-visible {
-        outline: 2px solid var(--color-primary);
-        outline-offset: 2px;
+      button:focus-visible,
+      select:focus-visible,
+      input:focus-visible {
+        outline: var(--focus-width) solid var(--color-primary);
+        outline-offset: var(--focus-offset);
       }
 
       .btn {
@@ -185,11 +262,35 @@
         border-radius: var(--radius-control);
         color: var(--color-ink);
         cursor: pointer;
-        padding: 5px 12px;
+        font-size: var(--font-size-small);
+        min-height: var(--control-height);
+        padding: var(--space-1) var(--space-3);
+        transition:
+          background-color var(--motion-hover) var(--ease-out-quart),
+          border-color var(--motion-hover) var(--ease-out-quart),
+          color var(--motion-hover) var(--ease-out-quart);
       }
 
-      .btn:hover {
+      .btn:hover:not(:disabled) {
         background: var(--color-surface-hover);
+      }
+
+      .btn:disabled {
+        cursor: default;
+        opacity: 0.55;
+      }
+
+      #toolbar-count-mode,
+      #success-ack-mode {
+        background: var(--color-surface);
+        border: 1px solid var(--color-control-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
+        font: inherit;
+        font-size: var(--font-size-small);
+        min-height: var(--control-height);
+        min-width: 0;
+        padding: var(--space-1) var(--space-3);
       }
 
       /* Toggle switch: a button with role="switch"; aria-checked drives the visuals. */
@@ -202,7 +303,7 @@
         height: 24px;
         padding: 0;
         position: relative;
-        transition: background var(--transition-fast);
+        transition: background var(--motion-hover) var(--ease-out-quart);
         width: 40px;
       }
 
@@ -215,7 +316,7 @@
         left: 3px;
         position: absolute;
         top: 3px;
-        transition: transform var(--transition-fast);
+        transition: transform var(--motion-hover) var(--ease-out-quart);
         width: 18px;
       }
 
@@ -235,7 +336,7 @@
       .keepalive-interval {
         align-items: center;
         display: flex;
-        gap: 8px;
+        gap: var(--space-2);
       }
 
       .keepalive-interval input {
@@ -244,7 +345,7 @@
         border-radius: var(--radius-control);
         color: var(--color-ink);
         font: inherit;
-        padding: 5px 8px;
+        padding: var(--space-1) var(--space-2);
         width: 78px;
       }
 
@@ -260,8 +361,12 @@
         border: none;
         color: var(--color-muted);
         cursor: pointer;
-        padding: 6px 14px;
+        min-height: var(--control-height);
+        padding: var(--space-1) var(--space-3);
         position: relative;
+        transition:
+          background-color var(--motion-hover) var(--ease-out-quart),
+          color var(--motion-hover) var(--ease-out-quart);
       }
 
       .seg button + button {
@@ -291,14 +396,14 @@
       [data-tip]::after {
         background: var(--color-tooltip-bg);
         border-radius: var(--radius-control);
-        bottom: calc(100% + 8px);
+        bottom: calc(100% + var(--space-2));
         color: var(--color-tooltip-ink);
         content: attr(data-tip);
-        font-size: 12px;
+        font-size: var(--font-size-small);
         font-weight: 400;
         line-height: 1.4;
         opacity: 0;
-        padding: 6px 10px;
+        padding: var(--space-1) var(--space-2);
         pointer-events: none;
         position: absolute;
         right: 0;
@@ -316,19 +421,19 @@
 
       footer {
         border-top: 1px solid var(--color-border);
-        margin-top: 32px;
-        padding-top: 8px;
+        margin-top: var(--space-8);
+        padding-top: var(--space-2);
       }
 
       .diagnostics {
         color: var(--color-muted);
-        font-size: 12px;
+        font-size: var(--font-size-small);
       }
 
       .diagnostics summary {
         border-radius: var(--radius-control);
         cursor: pointer;
-        padding: 4px 0;
+        padding: var(--space-1) 0;
         width: max-content;
       }
 
@@ -337,7 +442,44 @@
       }
 
       #daemon-footer {
-        margin-top: 8px;
+        margin-top: var(--space-2);
+      }
+
+      @media (max-width: 36rem) {
+        body {
+          padding: var(--space-6) var(--space-4) var(--space-12);
+        }
+
+        ul.rows li,
+        .row {
+          align-items: stretch;
+          flex-direction: column;
+          gap: var(--space-2);
+        }
+
+        .row > select,
+        .row > input[type="checkbox"],
+        .row > button,
+        .row > .seg,
+        .row > label {
+          align-self: flex-start;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          transition-delay: 0ms !important;
+          animation-duration: 0.01ms !important;
+          animation-delay: 0ms !important;
+        }
+
+        .switch[aria-checked="true"]::before {
+          transform: translateX(16px);
+        }
       }
     </style>
   </head>
@@ -504,6 +646,27 @@
       </div>
     </section>
 
+    <section id="page-scanning-section">
+      <h2>Page scanning</h2>
+      <p class="lede">
+        Page scans are <strong>local</strong>, run only when you invoke them, read the <strong>top frame only</strong>,
+        and are <strong>separate from provider download access</strong> below. Granting a publisher permission does not
+        let <em>papio</em> scan that site until you allow scanning here or on first use.
+      </p>
+      <div class="card">
+        <p
+          id="scanner-allowlist-message"
+          class="inline-feedback-message hint"
+          role="status"
+          hidden
+        ></p>
+        <p id="scanner-allowlist-empty" class="hint row" hidden>
+          No sites are allowed for page scanning.
+        </p>
+        <ul id="scanner-allowlist" class="rows" hidden></ul>
+      </div>
+    </section>
+
     <section>
       <h2>Provider access</h2>
       <p class="lede">
@@ -517,7 +680,7 @@
           <button id="grant-all" class="btn" type="button">Grant all providers</button>
           <button id="revoke-all" class="btn" type="button">Revoke all provider access</button>
         </div>
-        <p id="provider-permission-message" class="permission-message hint" role="status" hidden></p>
+        <p id="provider-permission-message" class="inline-feedback-message hint" role="status" hidden></p>
         <ul id="sources" class="rows"></ul>
       </div>
     </section>

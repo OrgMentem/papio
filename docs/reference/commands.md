@@ -322,6 +322,28 @@ Inspect and switch connected browser sessions
 papio browser
 ```
 
+### `papio browser permit`
+
+Recover daemon-owned browser effect permits
+
+```
+papio browser permit
+```
+
+#### `papio browser permit resolve`
+
+Release one unknown-completion browser effect permit
+
+Release one exact unknown-completion effect permit after an operator has independently resolved whether its browser effect completed. This is break-glass recovery; it never releases a held permit.
+
+```
+papio browser permit resolve <permit-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--reason` | `string` |  | operator reason recorded in the durable audit event |
+
 ### `papio browser sessions`
 
 List browser sessions connected since daemon start

@@ -1,7 +1,8 @@
 # ADR-0022: Institutional processing authority and staged enablement
 
-Status: **Accepted** (2026-08-11). Phase 0 is complete; Phase 1 is current
-and implemented-but-dark. This ADR ratifies the authority, identity, fencing,
+Status: **Accepted** (2026-08-11). Phases 0 through 3 are complete; Phase 4 is
+current. Automatic first-route, source-gate bypass, and effect concurrency
+greater than one remain disabled. This ADR ratifies the authority, identity, fencing,
 cutover, and enablement rules for institutional processing. It supersedes the
 conflicting execution clauses in older active plans while retaining the
 browser-safety invariants in ADR-0003, ADR-0013, ADR-0018, and ADR-0021.
@@ -87,16 +88,19 @@ that can affect a job:
 - effect permits, route issuance ordinals, and result callbacks;
 - download/adoption correlations and artifact-winner decisions.
 
-A stale holder cannot mutate current daemon state, close a current claim, clear a
-newer lease, import or attach bytes, or win the artifact race. Automatic stale
-promotion waits while an unexpired materialization/effect permit is live. An
-explicit holder switch may increment the generation immediately, but a
-replacement effect waits for the old permit to expire or reconcile.
+A stale holder cannot mutate current-generation daemon state, displace a
+committed artifact winner, or acquire a new effect. It may report only the
+exact consequence of its historical permit; that result or correlated winner
+can settle the historical occupancy without authorizing a successor.
+Automatic stale promotion waits while an unexpired materialization claim is
+live. Effect-permit occupancy does not expire: a replacement effect waits for
+exact settlement or exact-ID operator resolution even after the diagnostic
+lease elapses.
 
 This is not a claim of distributed atomicity with Chrome. A demoted browser may
-complete a click or navigation in the narrow interval after it received a
-permit. Its callback and bytes are fenced and cannot win. Browser-local effects
-cannot be rolled back by SQLite or native messaging.
+complete a click or navigation after it received a permit. SQLite and native
+messaging cannot roll that browser-local effect back, which is why uncertainty
+continues occupying instead of authorizing a duplicate.
 
 ## Decision 4: attempts and revisions are explicit and monotonic
 
@@ -264,20 +268,22 @@ The staged order is normative:
 - **Phase 0 — complete:** land this authority contract, transactional cutover
   classification, diagnosis v2, stable vocabulary, privacy inventory, and
   active-plan reconciliation. Observation only; no acquisition decision changes.
-- **Phase 1 — current, implemented-but-dark:** migration `0026` (with
-  `user_version` `26`) adds seven URL-free daemon projections:
-  `institution_profiles`, `browser_candidates`, `materialization_claims`,
-  `profile_evidence`, `human_gate_observations`, `route_suppressions`, and
-  insert-only `artifact_winners`. Add the strict, feature-negotiated
-  `institutional_materialization_v1` request/response families for claim,
-  bind, route, navigated, and reconcile. Scrub legacy extension state rather
-  than promote ambiguous authority. Every new handler returns structured
-  `feature_disabled` without mutation. Automatic materialization remains off.
-- **Phase 2:** migrate explicit Open/focus/redrive/retry/restart recovery to the
-  self-identifying scaffold and two-party binding. Automatic claims remain off.
-- **Phase 3:** unify tab and direct effects under one permit at concurrency one;
-  add fair daemon scheduling, exact pre-route/landed lanes, and bounded parked
-  scaffolds.
+- **Phase 1 — complete:** migration `0026` (with `user_version` `26`) added
+  seven URL-free daemon projections: `institution_profiles`,
+  `browser_candidates`, `materialization_claims`, `profile_evidence`,
+  `human_gate_observations`, `route_suppressions`, and insert-only
+  `artifact_winners`. The strict, feature-negotiated
+  `institutional_materialization_v1` contract covers claim, bind, route,
+  navigated, and reconcile. Ambiguous extension authority was scrubbed rather
+  than promoted.
+- **Phase 2 — complete:** explicit Open/focus/redrive/retry/restart recovery
+  uses the self-identifying scaffold, two-party binding, and paginated
+  reconciliation. Automatic claims remain off.
+- **Phase 3 — complete:** migration `0034` (schema version `34`) adds one
+  daemon-durable effect permit globally and per provider safety domain.
+  Generic drive, direct get, PDF grab, terms, and institutional effects all
+  acquire before execution and reconcile exact completion after worker loss.
+  The fair scheduler remains at concurrency one.
 - **Phase 4:** add exact-profile evidence, authentication-entry leases, typed
   gate projection, terms/declaration authority, and one attention surface.
   Automatic first-route behavior remains disabled until readiness.
@@ -413,12 +419,11 @@ with a challenge, is fenced by its exact tuple so rediscovery cannot re-select
 it. Authentication traffic renews the materialization lease, because a login,
 MFA prompt or CAPTCHA is human-paced and routinely outlives the action expiry.
 
-### Knowingly deferred
+### Knowingly deferred at review time
 
-- **A daemon-durable leased effect permit.** The concrete replay and cross-job
-  holes are closed, but there is still no single leased permit held through
-  result reconciliation. `AdvanceMaterializationEffect` stays dark until there
-  is; wiring the ordinal without the permit would be decoration.
+- **A daemon-durable leased effect permit.** Closed by the 2026-08-13
+  amendment below. `AdvanceMaterializationEffect` remains dark; the permit
+  acquire is the authority.
 - **A produced-under fence for uncorrelated session evidence.** It carries no
   correlation, so nothing proves which revision produced it. Mitigated by
   refusing uncorrelated evidence briefly after an authority change; the real fix
@@ -428,7 +433,47 @@ MFA prompt or CAPTCHA is human-paced and routinely outlives the action expiry.
   survive because route-family correlation reads them, and they are retained
   only when they matched the origin and path papio itself proposed. Free text
   from an adapter is redacted at all three sinks.
-- **An unfenceable late adoption.** When a lease expires mid-login the store
-  refuses a winner by design. The bytes are adopted rather than stranded, the
-  candidate is retired so it cannot be re-driven, and `browser.artifact_unfenced`
-  records that the attempt ended without one.
+- **A late adoption after claim expiry.** A stale materialization claim cannot
+  win the artifact or mutate the current claim/candidate. The validated bytes
+  are still adopted. Exact durable filename-plus-SHA producer evidence settles
+  only its historical permit or legacy blocker; missing or ambiguous producer
+  evidence leaves occupancy unresolved rather than guessing.
+
+## Amendment 2026-08-13: Phase 3 effect authority
+
+The deferred daemon-durable permit is implemented. Migration `0034` adds
+`effect_permits` with one occupying global slot and one occupying row per
+provider safety domain; both `held` and `unknown_completion` occupy. Generic
+drive and direct get share one attempt identity namespace. PDF grab uses its
+exact grab correlation, terms uses a daemon-authorized job-scoped occurrence,
+and institutional navigation uses expected-ordinal CAS plus a stable request
+identity. Institutional acquire and route issuance are one transaction and
+the sole production writer of `materialization_claims.effect_ordinal`.
+
+Every reachable irreversible browser path acquires before execution. Exact
+results, correlated artifact winners, and kind-specific reconciliation settle
+the permit; silence, elapsed time, ordinary retry, cancellation, and claim
+expiry do not. Worker restart changes a held permit to
+`unknown_completion` unless the browser can prove its exact consequence.
+Unresolved occupancy blocks claim abandonment and further global or same-domain
+effects. Operators can resolve only an exact unknown permit through
+`papio browser permit resolve <permit-id> --reason <text>`; `papio pulse`
+and `papio doctor` expose the blocking permit identity.
+
+Pre-`0034` started epochs import as cleanup-only `legacy_effect_blockers`.
+Exact late results and uniquely correlated artifact winners settle those
+blockers without mutating a current job generation. Startup performs the
+import before browser work can acquire. Schema-33 binaries containing the
+future-version guard refuse schema 34; downgrade to earlier binaries requires
+restoring a pre-migration backup.
+
+The additive `effect_permit_v1` protocol is implemented in Go, TypeScript, and
+the published JSON Schema. A peer that does not advertise it receives
+`unsupported` and cannot start a protected effect. The extension's in-memory
+effect governor remains defense in depth, not authority.
+
+This closes the first knowingly deferred item above. The produced-under fence
+for uncorrelated session evidence and opaque provider-domain cleanup remain
+deferred. Claim renewal reduces late-adoption exposure; exact correlated late
+bytes can release only their historical occupancy, while unresolved effects
+remain blocking and cannot be re-driven.

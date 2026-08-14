@@ -77,14 +77,22 @@ test("removeJob drops exactly one record", () => {
   expect(store.activeJobs.length).toBe(0);
 });
 
-
 test("pending delivery reducers replace, patch, and clear only the matching job", () => {
-  const delivery = { job_id: "job_00000001", url: "https://papers.example/paper.pdf", initiated_at: 7 };
+  const delivery = {
+    job_id: "job_00000001",
+    url: "https://papers.example/paper.pdf",
+    initiated_at: 7,
+  };
   let store = startPendingDelivery(emptyStore(), delivery);
-  expect(store.pendingDelivery).toMatchObject({ ...delivery, status: "sending" });
+  expect(store.pendingDelivery).toMatchObject({
+    ...delivery,
+    status: "sending",
+  });
   store = updatePendingDelivery(store, "other-job", { status: "downloaded" });
   expect(store.pendingDelivery?.status).toBe("sending");
-  store = updatePendingDelivery(store, delivery.job_id, { status: "downloaded" });
+  store = updatePendingDelivery(store, delivery.job_id, {
+    status: "downloaded",
+  });
   expect(store.pendingDelivery?.status).toBe("downloaded");
   store = clearPendingDelivery(store, "other-job");
   expect(store.pendingDelivery).toBeDefined();
@@ -98,7 +106,9 @@ test("waiting-for-session persistence stores only the opaque claim digest", asyn
   const store = upsertJob(
     {
       ...emptyStore(),
-      federatedLoginOwners: { [digest]: { jobID: "job_00000001", tabID: 100, phase: "auth" } },
+      federatedLoginOwners: {
+        [digest]: { jobID: "job_00000001", tabID: 100, phase: "auth" },
+      },
     },
     job({ waiting_for_session: true, waiting_for_session_key: digest }),
   );
@@ -115,8 +125,10 @@ test("institution claim key is versioned and origin-independent", async () => {
   expect(first).toBe(second);
   expect(first).toMatch(/^v2:[0-9a-f]{64}$/);
 });
- 
-const migrationJob = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+
+const migrationJob = (
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
   job_id: "job_migrate_0001",
   tab_id: 407,
   offered_at: 100,
@@ -126,7 +138,10 @@ const migrationJob = (overrides: Record<string, unknown> = {}): Record<string, u
   ...overrides,
 });
 
-function storageWith(raw: unknown): { storage: typeof chrome.storage; data: Record<string, unknown> } {
+function storageWith(raw: unknown): {
+  storage: typeof chrome.storage;
+  data: Record<string, unknown>;
+} {
   const data: Record<string, unknown> = { papio_state_v1: raw };
   const area = {
     async get(): Promise<Record<string, unknown>> {
@@ -136,7 +151,10 @@ function storageWith(raw: unknown): { storage: typeof chrome.storage; data: Reco
       Object.assign(data, values);
     },
   };
-  return { storage: { session: area, local: area } as unknown as typeof chrome.storage, data };
+  return {
+    storage: { session: area, local: area } as unknown as typeof chrome.storage,
+    data,
+  };
 }
 
 test("migration accepts a clean current state and writes an explicit version on save", async () => {
@@ -144,18 +162,33 @@ test("migration accepts a clean current state and writes an explicit version on 
   const fixture = storageWith(raw);
   const backend = chromeBackend(fixture.storage);
   const loaded = await backend.load();
-  expect(loaded.activeJobs[0]).toMatchObject({ job_id: "job_migrate_0001", tab_id: 407, status: "accepted" });
+  expect(loaded.activeJobs[0]).toMatchObject({
+    job_id: "job_migrate_0001",
+    tab_id: 407,
+    status: "accepted",
+  });
   await backend.save({
     ...loaded,
-    pendingDelivery: { job_id: "job_migrate_0001", url: "https://secret.example/runtime.pdf", initiated_at: 1 },
-    offerURLs: { "job_migrate_0001": "https://secret.example/offer" },
+    pendingDelivery: {
+      job_id: "job_migrate_0001",
+      url: "https://secret.example/runtime.pdf",
+      initiated_at: 1,
+    },
+    offerURLs: { job_migrate_0001: "https://secret.example/offer" },
   });
-  expect(JSON.stringify(fixture.data.papio_state_v1)).not.toContain("https://secret.example");
-  expect(fixture.data.papio_state_v1).toMatchObject({ version: MANAGED_STATE_VERSION });
+  expect(JSON.stringify(fixture.data.papio_state_v1)).not.toContain(
+    "https://secret.example",
+  );
+  expect(fixture.data.papio_state_v1).toMatchObject({
+    version: MANAGED_STATE_VERSION,
+  });
 });
 
 test("version 3 upgrades and the unique manual-delivery target survives restart", () => {
-  const legacy = migrateManagedState({ version: 3, activeJobs: [migrationJob()] });
+  const legacy = migrateManagedState({
+    version: 3,
+    activeJobs: [migrationJob()],
+  });
   expect(legacy.activeJobs[0]?.job_id).toBe("job_migrate_0001");
 
   const selected = migrationJob({
@@ -164,20 +197,26 @@ test("version 3 upgrades and the unique manual-delivery target survives restart"
     status: "awaiting_download",
     manual_delivery_target: true,
   });
-  expect(migrateManagedState({
-    version: MANAGED_STATE_VERSION,
-    activeJobs: [selected],
-  }).activeJobs[0]?.manual_delivery_target).toBe(true);
-  expect(migrateManagedState({
-    version: MANAGED_STATE_VERSION,
-    activeJobs: [migrationJob({
-      job_id: "job_manual_open_tab",
-      tab_id: 88,
-      status: "awaiting_download",
-      access_mode: "delegated",
-      manual_delivery_target: true,
-    })],
-  }).activeJobs[0]?.manual_delivery_target).toBe(true);
+  expect(
+    migrateManagedState({
+      version: MANAGED_STATE_VERSION,
+      activeJobs: [selected],
+    }).activeJobs[0]?.manual_delivery_target,
+  ).toBe(true);
+  expect(
+    migrateManagedState({
+      version: MANAGED_STATE_VERSION,
+      activeJobs: [
+        migrationJob({
+          job_id: "job_manual_open_tab",
+          tab_id: 88,
+          status: "awaiting_download",
+          access_mode: "delegated",
+          manual_delivery_target: true,
+        }),
+      ],
+    }).activeJobs[0]?.manual_delivery_target,
+  ).toBe(true);
 
   const ambiguous = migrateManagedState({
     version: MANAGED_STATE_VERSION,
@@ -191,34 +230,86 @@ test("version 3 upgrades and the unique manual-delivery target survives restart"
       }),
     ],
   });
-  expect(ambiguous.activeJobs.every((job) => job.manual_delivery_target !== true)).toBe(true);
-  expect(migrateManagedState({
-    version: MANAGED_STATE_VERSION,
-    activeJobs: [migrationJob({ manual_delivery_target: true })],
-  }).activeJobs[0]?.manual_delivery_target).toBeUndefined();
+  expect(
+    ambiguous.activeJobs.every((job) => job.manual_delivery_target !== true),
+  ).toBe(true);
+  expect(
+    migrateManagedState({
+      version: MANAGED_STATE_VERSION,
+      activeJobs: [migrationJob({ manual_delivery_target: true })],
+    }).activeJobs[0]?.manual_delivery_target,
+  ).toBeUndefined();
 });
 
+test("materialization migration preserves only validated institutional effect identity", () => {
+  const valid = {
+    job_id: "job_migrate_0001",
+    candidate_id: "candidate_0001",
+    materialization_kind: "browser_tab",
+    candidate_expires_at: "2030-01-01T00:00:00Z",
+    claim_id: "claim_000001",
+    binding_id: "binding_0001",
+    browser_holder_generation: 1,
+    lease_until: "2030-01-01T00:05:00Z",
+    phase: "navigated",
+    tab_id: 407,
+    institutional_request_id: "request_000001",
+    expected_effect_ordinal: 6,
+    effect_ordinal: 7,
+  };
+  const migrated = migrateManagedState({
+    activeJobs: [migrationJob()],
+    materializations: { job_migrate_0001: valid },
+  });
+  expect(migrated.materializations?.["job_migrate_0001"]).toMatchObject({
+    institutional_request_id: "request_000001",
+    expected_effect_ordinal: 6,
+    effect_ordinal: 7,
+  });
+
+  for (const [field, value] of [
+    ["institutional_request_id", "https://secret.example/request"],
+    ["expected_effect_ordinal", -1],
+    ["effect_ordinal", 0],
+  ] as const) {
+    const malformed = migrateManagedState({
+      activeJobs: [migrationJob()],
+      materializations: {
+        job_migrate_0001: { ...valid, [field]: value },
+      },
+    });
+    expect(malformed.materializations).toBeUndefined();
+  }
+});
 test("migration scrubs every legacy URL, claim hash, and global terms authority", () => {
   const sentinel = "https://secret.example.edu/private?token=sentinel#fragment";
   const migrated = migrateManagedState({
-    activeJobs: [migrationJob({
-      institution_claim_key: "sha256:legacy-claim",
-      waiting_for_session_key: "v2:legacy-claim",
-      nested: { provider_url: sentinel, freshURL: sentinel },
-      direct_envelope: {
-        allowed_origin: "https://provider.example.edu",
-        path_family: "/download/{id}",
-        expected_identifier: "doi:10.1000/xyz",
-      },
-    })],
+    activeJobs: [
+      migrationJob({
+        institution_claim_key: "sha256:legacy-claim",
+        waiting_for_session_key: "v2:legacy-claim",
+        nested: { provider_url: sentinel, freshURL: sentinel },
+        direct_envelope: {
+          allowed_origin: "https://provider.example.edu",
+          path_family: "/download/{id}",
+          expected_identifier: "doi:10.1000/xyz",
+        },
+      }),
+    ],
     pendingDelivery: {
       job_id: "job_migrate_0001",
       url: sentinel,
       initiated_at: 101,
       nested: { url: sentinel, providerUrl: sentinel },
     },
-    offerURLs: { "job_migrate_0001": sentinel },
-    federatedLoginOwners: { "v2:legacy-claim": { jobID: "job_migrate_0001", tabID: 407, phase: "auth" } },
+    offerURLs: { job_migrate_0001: sentinel },
+    federatedLoginOwners: {
+      "v2:legacy-claim": {
+        jobID: "job_migrate_0001",
+        tabID: 407,
+        phase: "auth",
+      },
+    },
     termsConsent: "accept",
     global_terms_accept_authority: "legacy",
   });
@@ -231,7 +322,9 @@ test("migration scrubs every legacy URL, claim hash, and global terms authority"
   expect(migrated.pendingDelivery?.url).toBeUndefined();
   expect(migrated.activeJobs[0]?.institution_claim_key).toBeUndefined();
   expect(migrated.activeJobs[0]?.waiting_for_session_key).toBeUndefined();
-  expect(migrated.activeJobs[0]?.direct_envelope?.allowed_origin).toBe("https://provider.example.edu");
+  expect(migrated.activeJobs[0]?.direct_envelope?.allowed_origin).toBe(
+    "https://provider.example.edu",
+  );
 });
 test("legacy federated wait authority is scrubbed without stranding the job or its tab", () => {
   const migrated = migrateManagedState({
@@ -262,10 +355,16 @@ test("legacy federated wait authority is scrubbed without stranding the job or i
       }),
     ],
     federatedLoginOwners: {
-      "v2:legacy-owner": { jobID: "job_migrate_0001", tabID: 407, phase: "auth" },
+      "v2:legacy-owner": {
+        jobID: "job_migrate_0001",
+        tabID: 407,
+        phase: "auth",
+      },
     },
   });
-  const stranded = migrated.activeJobs.find((candidate) => candidate.job_id === "job_migrate_0001");
+  const stranded = migrated.activeJobs.find(
+    (candidate) => candidate.job_id === "job_migrate_0001",
+  );
   expect(stranded).toMatchObject({
     job_id: "job_migrate_0001",
     tab_id: 407,
@@ -280,9 +379,17 @@ test("legacy federated wait authority is scrubbed without stranding the job or i
   expect(strandedRecord?.waiting_reason).toBeUndefined();
   expect(strandedRecord?.parked_with_tab).toBeUndefined();
   expect(strandedRecord?.parked_at).toBeUndefined();
-  const ordinaryPark = migrated.activeJobs.find((candidate) => candidate.job_id === "job_migrate_0002");
-  expect(ordinaryPark).toMatchObject({ tab_id: 407, parked_with_tab: true, parked_at: 122 });
-  const orphan = migrated.activeJobs.find((candidate) => candidate.job_id === "job_migrate_0003");
+  const ordinaryPark = migrated.activeJobs.find(
+    (candidate) => candidate.job_id === "job_migrate_0002",
+  );
+  expect(ordinaryPark).toMatchObject({
+    tab_id: 407,
+    parked_with_tab: true,
+    parked_at: 122,
+  });
+  const orphan = migrated.activeJobs.find(
+    (candidate) => candidate.job_id === "job_migrate_0003",
+  );
   expect(orphan).toMatchObject({ tab_id: 407, status: "auth_pending" });
   const orphanRecord = orphan as Record<string, unknown> | undefined;
   expect(orphanRecord?.waiting_since).toBeUndefined();
@@ -295,15 +402,37 @@ test("legacy federated wait authority is scrubbed without stranding the job or i
 test("migration preserves safe identity, download, lease, daemon, origin, and UI state", () => {
   const migrated = migrateManagedState({
     version: 1,
-    activeJobs: [migrationJob({
-      status: "awaiting_download",
-      tab_id: 999,
-      needs_terms_consent: true,
-      drive_epoch: { drive_attempt_id: "attempt-1", ordinal: 2, strategy: "direct", attempt_count: 1 },
-      direct_envelope: { allowed_origin: "https://provider.example.edu", path_family: "/pdf/{id}", expected_identifier: "doi:10/x" },
-    })],
-    pendingDelivery: { job_id: "job_migrate_0001", initiated_at: 9, status: "downloaded", page_host: "provider.example.edu" },
-    providerDrainLeases: { "provider.example.edu": { providerKey: "provider.example.edu", expiresAt: 999, parkedReason: "challenge" } },
+    activeJobs: [
+      migrationJob({
+        status: "awaiting_download",
+        tab_id: 999,
+        needs_terms_consent: true,
+        drive_epoch: {
+          drive_attempt_id: "attempt-1",
+          ordinal: 2,
+          strategy: "direct",
+          attempt_count: 1,
+        },
+        direct_envelope: {
+          allowed_origin: "https://provider.example.edu",
+          path_family: "/pdf/{id}",
+          expected_identifier: "doi:10/x",
+        },
+      }),
+    ],
+    pendingDelivery: {
+      job_id: "job_migrate_0001",
+      initiated_at: 9,
+      status: "downloaded",
+      page_host: "provider.example.edu",
+    },
+    providerDrainLeases: {
+      "provider.example.edu": {
+        providerKey: "provider.example.edu",
+        expiresAt: 999,
+        parkedReason: "challenge",
+      },
+    },
     challengeCooldowns: { "provider.example.edu": 888 },
     daemonFeatures: ["institutional_materialization_v1"],
     resolverOrigins: ["https://resolver.example.edu"],
@@ -313,10 +442,20 @@ test("migration preserves safe identity, download, lease, daemon, origin, and UI
     workWindowID: 77,
     handoffGroupID: 88,
   });
-  expect(migrated.activeJobs[0]).toMatchObject({ job_id: "job_migrate_0001", tab_id: 999, status: "awaiting_download" });
+  expect(migrated.activeJobs[0]).toMatchObject({
+    job_id: "job_migrate_0001",
+    tab_id: 999,
+    status: "awaiting_download",
+  });
   expect(migrated.activeJobs[0]?.needs_terms_consent).toBe(true);
-  expect(migrated.pendingDelivery).toMatchObject({ job_id: "job_migrate_0001", initiated_at: 9, status: "downloaded" });
-  expect(migrated.providerDrainLeases?.["provider.example.edu"]?.expiresAt).toBe(999);
+  expect(migrated.pendingDelivery).toMatchObject({
+    job_id: "job_migrate_0001",
+    initiated_at: 9,
+    status: "downloaded",
+  });
+  expect(
+    migrated.providerDrainLeases?.["provider.example.edu"]?.expiresAt,
+  ).toBe(999);
   expect(migrated.challengeCooldowns?.["provider.example.edu"]).toBe(888);
   expect(migrated.daemonFeatures).toEqual(["institutional_materialization_v1"]);
   expect(migrated.resolverOrigins).toEqual(["https://resolver.example.edu"]);
@@ -327,16 +466,34 @@ test("migration preserves safe identity, download, lease, daemon, origin, and UI
 
 test("malformed and unknown future versions fail closed without browser-side effects", () => {
   expect(migrateManagedState(null)).toEqual(emptyStore());
-  expect(migrateManagedState({ version: MANAGED_STATE_VERSION + 1, activeJobs: [migrationJob()] })).toEqual(emptyStore());
-  expect(migrateManagedState({ version: "future", activeJobs: [migrationJob()] })).toEqual(emptyStore());
-  expect(migrateManagedState({ activeJobs: [{ job_id: "broken" }] })).toEqual(emptyStore());
+  expect(
+    migrateManagedState({
+      version: MANAGED_STATE_VERSION + 1,
+      activeJobs: [migrationJob()],
+    }),
+  ).toEqual(emptyStore());
+  expect(
+    migrateManagedState({ version: "future", activeJobs: [migrationJob()] }),
+  ).toEqual(emptyStore());
+  expect(migrateManagedState({ activeJobs: [{ job_id: "broken" }] })).toEqual(
+    emptyStore(),
+  );
 });
 
 test("migration is deterministic and idempotent", () => {
   const raw = {
-    activeJobs: [migrationJob({ nested: { provider_url: "https://secret.example/" } })],
-    pendingDelivery: { job_id: "job_migrate_0001", url: "https://secret.example/pdf", initiated_at: 1 },
-    resolverOrigins: ["https://resolver.example.edu/path", "https://resolver.example.edu"],
+    activeJobs: [
+      migrationJob({ nested: { provider_url: "https://secret.example/" } }),
+    ],
+    pendingDelivery: {
+      job_id: "job_migrate_0001",
+      url: "https://secret.example/pdf",
+      initiated_at: 1,
+    },
+    resolverOrigins: [
+      "https://resolver.example.edu/path",
+      "https://resolver.example.edu",
+    ],
   };
   const first = migrateManagedState(raw);
   const second = migrateManagedState(first);
@@ -352,11 +509,23 @@ test("materialization reducer keeps URL-free closed transitions and rejects stal
     phase: "offered",
     tab_id: -1,
   };
-  let store = upsertJob(emptyStore(), job({ job_id: correlation.job_id, tab_id: -1, provider_hosts: ["www.jstor.org"] }));
-  store = reduceMaterialization(store, correlation.job_id, { type: "offer", correlation });
+  let store = upsertJob(
+    emptyStore(),
+    job({
+      job_id: correlation.job_id,
+      tab_id: -1,
+      provider_hosts: ["www.jstor.org"],
+    }),
+  );
+  store = reduceMaterialization(store, correlation.job_id, {
+    type: "offer",
+    correlation,
+  });
   store = reduceMaterialization(store, correlation.job_id, { type: "bound" });
   expect(store.materializations?.[correlation.job_id]?.phase).toBe("offered");
-  store = reduceMaterialization(store, correlation.job_id, { type: "claiming" });
+  store = reduceMaterialization(store, correlation.job_id, {
+    type: "claiming",
+  });
   store = reduceMaterialization(store, correlation.job_id, {
     type: "claimed",
     claim_id: "claim_001",
@@ -364,17 +533,40 @@ test("materialization reducer keeps URL-free closed transitions and rejects stal
     browser_holder_generation: 3,
     lease_until: "2030-01-01T00:05:00Z",
   });
-  store = reduceMaterialization(store, correlation.job_id, { type: "scaffolded", tab_id: 501 });
+  store = reduceMaterialization(store, correlation.job_id, {
+    type: "scaffolded",
+    tab_id: 501,
+  });
   expect(findByTab(store, 501)?.job_id).toBe(correlation.job_id);
   store = reduceMaterialization(store, correlation.job_id, { type: "bound" });
-  store = reduceMaterialization(store, correlation.job_id, { type: "route_issued", route_issuance_ordinal: 9 });
-  store = reduceMaterialization(store, correlation.job_id, { type: "route_issued", route_issuance_ordinal: 8 });
-  expect(store.materializations?.[correlation.job_id]?.route_issuance_ordinal).toBe(9);
+  store = reduceMaterialization(store, correlation.job_id, {
+    type: "route_prepared",
+    expected_effect_ordinal: 0,
+    institutional_request_id: "inst_req_001",
+  });
+  store = reduceMaterialization(store, correlation.job_id, {
+    type: "route_issued",
+    route_issuance_ordinal: 9,
+    effect_ordinal: 1,
+    institutional_request_id: "inst_req_001",
+  });
+  store = reduceMaterialization(store, correlation.job_id, {
+    type: "route_issued",
+    route_issuance_ordinal: 8,
+    effect_ordinal: 1,
+    institutional_request_id: "inst_req_001",
+  });
+  expect(
+    store.materializations?.[correlation.job_id]?.route_issuance_ordinal,
+  ).toBe(9);
   const persisted = JSON.stringify(store);
   expect(persisted).not.toContain("https://");
   store = reduceMaterialization(store, correlation.job_id, { type: "clear" });
   expect(store.materializations).toBeUndefined();
-  expect(store.activeJobs.find((active) => active.job_id === correlation.job_id)?.tab_id).toBe(-1);
+  expect(
+    store.activeJobs.find((active) => active.job_id === correlation.job_id)
+      ?.tab_id,
+  ).toBe(-1);
 });
 test("materialization reducer supersedes candidates and marks a lost scaffold without dropping binding", () => {
   const first: MaterializationCorrelation = {
@@ -389,7 +581,10 @@ test("materialization reducer supersedes candidates and marks a lost scaffold wi
     phase: "navigating",
     tab_id: 501,
   };
-  let store = reduceMaterialization(emptyStore(), first.job_id, { type: "offer", correlation: { ...first, phase: "offered", tab_id: -1 } });
+  let store = reduceMaterialization(emptyStore(), first.job_id, {
+    type: "offer",
+    correlation: { ...first, phase: "offered", tab_id: -1 },
+  });
   store = reduceMaterialization(store, first.job_id, { type: "claiming" });
   store = reduceMaterialization(store, first.job_id, {
     type: "claimed",
@@ -398,9 +593,22 @@ test("materialization reducer supersedes candidates and marks a lost scaffold wi
     browser_holder_generation: first.browser_holder_generation!,
     lease_until: first.lease_until!,
   });
-  store = reduceMaterialization(store, first.job_id, { type: "scaffolded", tab_id: first.tab_id });
+  store = reduceMaterialization(store, first.job_id, {
+    type: "scaffolded",
+    tab_id: first.tab_id,
+  });
   store = reduceMaterialization(store, first.job_id, { type: "bound" });
-  store = reduceMaterialization(store, first.job_id, { type: "route_issued", route_issuance_ordinal: 4 });
+  store = reduceMaterialization(store, first.job_id, {
+    type: "route_prepared",
+    expected_effect_ordinal: 0,
+    institutional_request_id: "inst_req_002",
+  });
+  store = reduceMaterialization(store, first.job_id, {
+    type: "route_issued",
+    route_issuance_ordinal: 4,
+    effect_ordinal: 1,
+    institutional_request_id: "inst_req_002",
+  });
   store = reduceMaterialization(store, first.job_id, { type: "navigating" });
   store = reduceMaterialization(store, first.job_id, { type: "scaffold_lost" });
   expect(store.materializations?.[first.job_id]).toMatchObject({
@@ -410,8 +618,16 @@ test("materialization reducer supersedes candidates and marks a lost scaffold wi
     tab_id: -1,
     phase: "claimed",
   });
-  const second = { ...first, candidate_id: "cand_0002", phase: "offered" as const, tab_id: -1 };
-  store = reduceMaterialization(store, first.job_id, { type: "offer", correlation: second });
+  const second = {
+    ...first,
+    candidate_id: "cand_0002",
+    phase: "offered" as const,
+    tab_id: -1,
+  };
+  store = reduceMaterialization(store, first.job_id, {
+    type: "offer",
+    correlation: second,
+  });
   expect(store.materializations?.[first.job_id]).toEqual(second);
 });
 

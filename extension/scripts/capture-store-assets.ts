@@ -142,7 +142,16 @@ const optionsMock = `(() => {
   const store = ${JSON.stringify({ ...popupState })};
   const manifest = { version: ${JSON.stringify(VERSION)}, update_url: "https://clients2.google.com/service/update2/crx", host_permissions: ${JSON.stringify(HOST_PERMISSIONS)} };
   globalThis.chrome = {
-    runtime: { getManifest: () => manifest, sendMessage: async () => ({}), openOptionsPage: () => {} },
+    runtime: {
+      getManifest: () => manifest,
+      sendMessage: async (message) => {
+        if (message && message.type === "papio.pageBulk.allowlist.list") {
+          return { ok: true, origins: ["https://journals.example"] };
+        }
+        return {};
+      },
+      openOptionsPage: () => {},
+    },
     storage: { local: { get: async (k) => (k === "papio_state_v1" ? { papio_state_v1: store } : {}), set: async () => {} } },
     permissions: { contains: async () => true, request: async () => true, remove: async () => true },
   };

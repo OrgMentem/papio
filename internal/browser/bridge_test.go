@@ -220,12 +220,65 @@ func hello() json.RawMessage {
 	return json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-hello-1","seq":0,"payload":{"extension_version":"1.2.3"}}`)
 }
 
+func helloWithFeatures(t *testing.T, extensionVersion string, features ...string) json.RawMessage {
+	t.Helper()
+	payload := map[string]any{"extension_version": extensionVersion}
+	if len(features) != 0 {
+		payload["features"] = features
+	}
+	return inFrame(t, protocol.MsgHello, "", payload)
+}
+
 func helloWithAdapterVersions(t *testing.T, extensionVersion string, adapterVersions map[string]string) json.RawMessage {
 	t.Helper()
 	return inFrame(t, protocol.MsgHello, "", map[string]any{
 		"extension_version": extensionVersion,
 		"adapter_versions":  adapterVersions,
 	})
+}
+func effectPermitHolder(t *testing.T, b *Bridge) {
+	t.Helper()
+	b.holder = &browserSession{
+		ID: "permit-test-holder", ExtensionVersion: "0.14.0",
+		Features:   []string{providerDriveEpochV1Feature, effectPermitFeature},
+		LastSyncAt: b.now(),
+	}
+	b.epoch = 0
+}
+
+func effectPermitOffer(t *testing.T, jobs *job.Store, id, attempt, domain string) {
+	t.Helper()
+	if err := jobs.RecordEvent(context.Background(), id, "browser.provider_drive_epoch_offered", map[string]any{
+		"drive_attempt_id": attempt, "ordinal": int64(0), "strategy": "generic",
+		"revision": "1", "safety_domain": domain,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func permitOutcome(t *testing.T, frames []json.RawMessage) string {
+	t.Helper()
+	if len(frames) != 1 {
+		t.Fatalf("frames=%d, want one", len(frames))
+	}
+	msg, err := protocol.DecodeBrowserMessage(frames[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := msg.Payload.(*protocol.ProviderDriveEpochStartResultPayload); ok {
+		return p.Outcome
+	}
+	if p, ok := msg.Payload.(*protocol.ProviderDriveEpochResultPayload); ok {
+		return p.Outcome
+	}
+	if p, ok := msg.Payload.(*protocol.TermsEffectStartResultPayload); ok {
+		return p.Outcome
+	}
+	if p, ok := msg.Payload.(*protocol.TermsEffectResultPayload); ok {
+		return p.Outcome
+	}
+	t.Fatalf("unexpected permit payload %T", msg.Payload)
+	return ""
 }
 
 func firstOfType(msgs []*protocol.BrowserMessage, typ string) *protocol.BrowserMessage {
@@ -773,7 +826,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
 	if !slices.Equal(payload.Features, []string{
-		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, institutionalMaterializationFeature,
+		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, protocol.EffectPermitFeature, institutionalMaterializationFeature,
 		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature,
 	}) {
 		t.Fatalf("features = %v", payload.Features)
@@ -2098,7 +2151,7 @@ func materializationHello(t *testing.T) json.RawMessage {
 	t.Helper()
 	return inFrame(t, protocol.MsgHello, "", map[string]any{
 		"extension_version": "0.14.0",
-		"features":          []string{institutionalMaterializationFeature},
+		"features":          []string{institutionalMaterializationFeature, effectPermitFeature},
 	})
 }
 
@@ -2249,7 +2302,7 @@ func TestInstitutionalCandidateOfferRecoversAfterHolderRestart(t *testing.T) {
 	b.promote(&browserSession{
 		ID:               replacementSession,
 		ExtensionVersion: "0.14.0",
-		Features:         []string{institutionalMaterializationFeature},
+		Features:         []string{institutionalMaterializationFeature, effectPermitFeature},
 		LastSyncAt:       b.now(),
 	}, "test holder restart")
 	b.mu.Unlock()
@@ -4092,8 +4145,11 @@ func TestFocusDoesNotBypassBrowserLatchButExplicitRetryStartsFreshEpoch(t *testi
 		t.Fatal(err)
 	}
 
-	// Establish the compatible holder without offering the latched job.
+	// Establish the compatible holder with effect permit capability.
+	effectPermitHolder(t, b)
 	runSync(t, b, helloAs("0.14.0"))
+	// re-assert holder after hello which may reset holder state
+	effectPermitHolder(t, b)
 	initial, err := b.offer(*row, action, config.ModeDelegated)
 	if err != nil {
 		t.Fatal(err)
@@ -5230,7 +5286,7 @@ func TestWinnerIsNotCommittedBeforeValidation(t *testing.T) {
 	if _, ok, err := jobs.ArtifactWinner(ctx, jobID, 1); err != nil || ok {
 		t.Fatalf("winner committed before validation: ok=%v err=%v", ok, err)
 	}
-	if err := b.commitArtifact(ctx, jobID, fence); err != nil {
+	if err := b.commitArtifact(ctx, jobID, "paper.pdf", fence, nil); err != nil {
 		t.Fatal(err)
 	}
 	winner, ok, err := jobs.ArtifactWinner(ctx, jobID, 1)
@@ -5274,7 +5330,7 @@ func TestFailedAdoptionLeavesTheAttemptWinnable(t *testing.T) {
 	if err := jobs.Cancel(ctx, jobID, job.TerminalReasonCancelledByUser); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.ingestAdoptedFile(ctx, jobID, "paper.pdf"); err == nil {
+	if _, err := b.ingestAdoptedFile(ctx, jobID, "paper.pdf", nil, nil); err == nil {
 		t.Fatal("adoption of a cancelled job unexpectedly succeeded; pick another refusal")
 	}
 	if _, ok, err := jobs.ArtifactWinner(ctx, jobID, 1); err != nil || ok {
@@ -5426,12 +5482,12 @@ func TestProviderFreeTextIsRedactedBeforeItIsDurable(t *testing.T) {
 	}
 }
 
-// An offered direct-route tuple whose frame never reached any client must not
-// pin the job in flight forever. The durable offered event is committed before
-// the frame is appended to the sync response, so a crash in that window leaves
-// an offer nobody saw; without a lease the job is skipped by every later poll
-// and parks with no attention surface and no way for anyone to resolve it.
-func TestUnacknowledgedDirectRouteOfferExpiresInsteadOfStranding(t *testing.T) {
+// An offered direct-route tuple remains in flight until its exact permit is
+// settled. An elapsed offer lease is diagnostic only: it cannot authorize a
+// replay, because at-most-once permit semantics must not mint a second
+// attempt. Reconciliation or an explicit break-glass action resolves a lost
+// completion.
+func TestUnacknowledgedDirectRouteOfferRemainsInFlightWithoutReplay(t *testing.T) {
 	candidates := []routes.Candidate{{RouteRevision: "rev-1"}}
 	issued := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
 	events := []map[string]any{{
@@ -5445,12 +5501,12 @@ func TestUnacknowledgedDirectRouteOfferExpiresInsteadOfStranding(t *testing.T) {
 	if _, inFlight, _ := directRouteProgress(events, candidates, issued.Add(time.Minute)); !inFlight {
 		t.Fatal("a fresh offer must still count as in flight")
 	}
-	_, inFlight, replayAttempt := directRouteProgress(events, candidates, issued.Add(directRouteOfferLease+time.Second))
-	if inFlight {
-		t.Fatal("an offer nobody acknowledged pinned the job in flight past its lease")
+	_, inFlight, retainedAttempt := directRouteProgress(events, candidates, issued.Add(directRouteOfferLease+time.Second))
+	if !inFlight {
+		t.Fatal("an unacknowledged offer must remain in flight after its diagnostic lease")
 	}
-	if replayAttempt != "attempt-1" {
-		t.Fatalf("re-offer would mint a new tuple (%q); the identical attempt id must be replayed so the extension can recognise the duplicate", replayAttempt)
+	if retainedAttempt != "attempt-1" {
+		t.Fatalf("in-flight projection lost its diagnostic identity: %q", retainedAttempt)
 	}
 }
 
@@ -5675,59 +5731,64 @@ func TestDirectRouteLeaseDoesNotResurrectAnsweredTuples(t *testing.T) {
 	}
 }
 
-// "duplicate" is the right refusal but must not be a permanent stop. The
-// extension retires an epoch it cannot restart WITHOUT sending a result, so the
-// tuple would answer duplicate forever; the release is that the next offer
-// supersedes a stalled epoch and mints a successor.
+// A started effect remains occupying across lease expiry. Elapsed time does not
+// authorize a successor or release the lane.
 func TestStalledDriveEpochIsSupersededByTheNextOffer(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
 	ctx := context.Background()
-	// The started event's timestamp comes from the store's real clock, so the
-	// bridge clock has to advance relative to real time, not to a fixed past.
 	runSync(t, b, helloAs("0.14.0"))
+	effectPermitHolder(t, b)
 	id := park(t, jobs, "wr_epoch_stall", handoffWork())
 	attempt := "epoch-stalled-0001"
-	domain := map[string]any{
-		"drive_attempt_id": attempt, "ordinal": int64(0), "strategy": "generic",
-		"revision": "1", "safety_domain": "institution:example.edu",
-	}
-	if err := jobs.RecordEvent(ctx, id, "browser.provider_drive_epoch_offered", domain); err != nil {
-		t.Fatal(err)
-	}
+	domain := "institution:example.edu"
+	effectPermitOffer(t, jobs, id, attempt, domain)
 	start := &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}
-	if _, err := b.providerDriveEpochStart(ctx, id, start); err != nil {
-		t.Fatal(err)
+	if frames, err := b.providerDriveEpochStart(ctx, id, start); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v", err)
 	}
-	// A fresh stall is not yet supersedable.
+	// Lease expiry is not authorization.
 	if b.driveEpochStalled(id, attempt, 0) {
-		t.Fatal("a just-started epoch must not be superseded")
+		t.Fatal("a just-started epoch must not be reported as stalled")
 	}
 	b.now = func() time.Time { return time.Now().UTC().Add(providerDriveEpochLease + time.Minute) }
-	if !b.driveEpochStalled(id, attempt, 0) {
-		t.Fatal("a started epoch with no result stayed unreleasable past its lease")
+	if b.driveEpochStalled(id, attempt, 0) {
+		t.Fatal("elapsed time must not report a stalled effect")
 	}
 	row, err := jobs.Get(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.offer(*row, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff"}, config.ModeDelegated); err != nil {
+	// Poll/offer while occupying must not mint a successor or a new drive tuple.
+	msgs, _ := runSync(t, b)
+	for _, m := range msgs {
+		if m.JobID == id && m.Type == protocol.MsgJobOffer {
+			t.Fatalf("occupying permit was re-offered at poll: %v", msgs)
+		}
+	}
+	offer, err := b.offer(*row, job.HumanAction{Kind: handoffActionKind, Detail: "institutional handoff"}, config.ModeDelegated)
+	if err != nil {
 		t.Fatal(err)
 	}
-	next, _, ok := b.latestProviderDriveEpoch(id)
-	if !ok || next == attempt {
-		t.Fatalf("offer did not mint a successor epoch: %q ok=%v", next, ok)
+	msg, err := protocol.DecodeBrowserMessage(offer)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The stalled tuple can never start again.
+	if got := msg.Payload.(*protocol.JobOfferPayload).DriveAttemptID; got != "" {
+		t.Fatalf("occupying offer minted drive_attempt_id %q, want no tuple", got)
+	}
+	next, _, ok := b.latestProviderDriveEpoch(id)
+	if ok && next != attempt {
+		t.Fatalf("offer minted successor %q, want no supersession", next)
+	}
+	// Same tuple remains the exact held authorization replay, never a
+	// successor and never a new permit row.
 	frames, err := b.providerDriveEpochStart(ctx, id, start)
 	if err != nil || len(frames) != 1 {
-		t.Fatalf("start after supersession: frames=%d err=%v", len(frames), err)
+		t.Fatalf("start after lease: frames=%d err=%v", len(frames), err)
 	}
-	msg, decodeErr := protocol.DecodeBrowserMessage(frames[0])
-	if decodeErr != nil {
-		t.Fatal(decodeErr)
-	}
-	if got := msg.Payload.(*protocol.ProviderDriveEpochStartResultPayload).Outcome; got == "started" {
-		t.Fatal("a superseded tuple was re-authorized")
+	if got := permitOutcome(t, frames); got != "started" {
+		t.Fatalf("exact held re-start = %q, want started", got)
 	}
 }
 
@@ -7341,8 +7402,8 @@ func TestSweepTerminalAdoptionsRemovesEmptyUnknownDirs(t *testing.T) {
 // synchronous allocation reply: a grab id, a papio/grabs/<id>/ steering
 // path, and a landing directory actually created under the adoption root.
 func TestPdfGrabAllocatesSteeringPath(t *testing.T) {
-	b, _, cfg, _ := newBridge(t)
-	runSync(t, b, hello())
+	b, jobs, cfg, _ := newBridge(t)
+	runSync(t, b, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
 	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
 		"request_id": "grab-req-0001", "host": "pdf.example.org", "title": "A Paper",
 	}))
@@ -7361,6 +7422,95 @@ func TestPdfGrabAllocatesSteeringPath(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", p.GrabID)); err != nil {
 		t.Fatalf("landing directory not created: %v", err)
 	}
+	var jobID sql.NullString
+	var attempt int64
+	var holder int64
+	var domain, kind, status, grabID string
+	if err := jobs.S.DB().QueryRowContext(context.Background(), `
+		SELECT job_id, job_attempt_revision, browser_holder_generation, safety_domain_id,
+		       effect_kind, status, grab_id
+		FROM effect_permits WHERE effect_kind = 'pdf_grab' AND grab_id = ?`, p.GrabID).
+		Scan(&jobID, &attempt, &holder, &domain, &kind, &status, &grabID); err != nil {
+		t.Fatalf("pdf grab permit lookup: %v", err)
+	}
+	if jobID.Valid || attempt != 0 || holder != int64(b.epoch) ||
+		domain != "pdf_grab:pdf.example.org" || kind != "pdf_grab" ||
+		status != "held" || grabID != p.GrabID {
+		t.Fatalf("pdf grab permit = job_id=%v attempt=%d holder=%d domain=%q kind=%q status=%q grab_id=%q",
+			jobID, attempt, holder, domain, kind, status, grabID)
+	}
+	var authEvents int
+	if err := jobs.S.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM events WHERE job_id IS NULL AND kind = 'browser.pdf_grab_started'`).Scan(&authEvents); err != nil {
+		t.Fatalf("authorization event lookup: %v", err)
+	}
+	if authEvents != 1 {
+		t.Fatalf("pdf grab authorization events = %d, want one", authEvents)
+	}
+}
+func TestPdfGrabRequiresPermitAndRespectsOccupancy(t *testing.T) {
+	t.Run("unsupported", func(t *testing.T) {
+		b, jobs, cfg, _ := newBridge(t)
+		runSync(t, b, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature))
+		msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+			"request_id": "grab-req-no-permit", "host": "pdf.example.org", "title": "No permit",
+		}))
+		p := firstOfType(msgs, protocol.MsgPdfGrabResult).Payload.(*protocol.PdfGrabResultPayload)
+		if p.Outcome != "unavailable" || p.GrabID != "" || p.SteeringPath != "" {
+			t.Fatalf("unsupported payload = %+v, want unavailable without steering", p)
+		}
+		var grabs, permits int
+		if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pdf_grabs`).Scan(&grabs); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM effect_permits`).Scan(&permits); err != nil {
+			t.Fatal(err)
+		}
+		if grabs != 0 || permits != 0 {
+			t.Fatalf("unsupported allocation rows = grabs %d permits %d, want 0/0", grabs, permits)
+		}
+		if entries, err := os.ReadDir(filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs")); err == nil && len(entries) != 0 {
+			t.Fatalf("unsupported allocation created landing dirs: %d", len(entries))
+		}
+	})
+	t.Run("occupied lane and existing grab", func(t *testing.T) {
+		b, jobs, cfg, _ := newBridge(t)
+		runSync(t, b, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
+		first, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+			"request_id": "grab-req-occupied-1", "host": "pdf.example.org", "title": "First",
+		}))
+		firstPayload := firstOfType(first, protocol.MsgPdfGrabResult).Payload.(*protocol.PdfGrabResultPayload)
+		if firstPayload.Outcome != "steering" {
+			t.Fatalf("first payload = %+v, want steering", firstPayload)
+		}
+		occupied, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+			"request_id": "grab-req-occupied-2", "host": "other.example.org", "title": "Second",
+		}))
+		occupiedPayload := firstOfType(occupied, protocol.MsgPdfGrabResult).Payload.(*protocol.PdfGrabResultPayload)
+		if occupiedPayload.Outcome != "unavailable" || occupiedPayload.GrabID != "" || occupiedPayload.SteeringPath != "" {
+			t.Fatalf("occupied payload = %+v, want unavailable without steering", occupiedPayload)
+		}
+		existing, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+			"request_id": "grab-req-existing", "host": "pdf.example.org", "title": "First",
+		}))
+		existingPayload := firstOfType(existing, protocol.MsgPdfGrabResult).Payload.(*protocol.PdfGrabResultPayload)
+		if existingPayload.Outcome != "existing" || existingPayload.GrabID != firstPayload.GrabID || existingPayload.SteeringPath != "" {
+			t.Fatalf("existing payload = %+v, want existing without second steering", existingPayload)
+		}
+		var grabs, permits int
+		if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pdf_grabs`).Scan(&grabs); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM effect_permits`).Scan(&permits); err != nil {
+			t.Fatal(err)
+		}
+		if grabs != 1 || permits != 1 {
+			t.Fatalf("occupied/existing rows = grabs %d permits %d, want 1/1", grabs, permits)
+		}
+		if _, err := os.Stat(filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", firstPayload.GrabID)); err != nil {
+			t.Fatalf("first landing directory missing: %v", err)
+		}
+	})
 }
 
 // TestPdfGrabRefusesOnUnhealthyLatch pins ADR-0020's fail-closed refusal: a
@@ -7385,6 +7535,47 @@ func TestPdfGrabRefusesOnUnhealthyLatch(t *testing.T) {
 	if err == nil && len(entries) != 0 {
 		t.Fatalf("refusal must not allocate a grab: found %d landing dirs", len(entries))
 	}
+}
+func TestPdfGrabAdmissionIsCurrentHolderAndFeatureFenced(t *testing.T) {
+	t.Run("non-holder", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		const holder = "sess-pdf-holder-00000000000000000000001"
+		const pending = "sess-pdf-pending-00000000000000000000001"
+		runSyncAs(t, b, holder, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
+		runSyncAs(t, b, pending, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
+		msgs, _ := runSyncAs(t, b, pending, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+			"request_id": "pdf-non-holder-0001", "host": "pdf.example.org", "title": "Non-holder",
+		}))
+		result := firstOfType(msgs, protocol.MsgPdfGrabResult)
+		if result == nil || result.Payload.(*protocol.PdfGrabResultPayload).Outcome != "unavailable" {
+			t.Fatalf("non-holder result = %+v, want unavailable", msgs)
+		}
+		var n int
+		if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pdf_grabs`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("non-holder created %d grab rows", n)
+		}
+	})
+	t.Run("featureless holder", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, hello())
+		msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+			"request_id": "pdf-featureless-0001", "host": "pdf.example.org", "title": "Featureless",
+		}))
+		result := firstOfType(msgs, protocol.MsgPdfGrabResult)
+		if result == nil || result.Payload.(*protocol.PdfGrabResultPayload).Outcome != "unavailable" {
+			t.Fatalf("featureless result = %+v, want unavailable", msgs)
+		}
+		var n int
+		if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pdf_grabs`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("featureless holder created %d grab rows", n)
+		}
+	})
 }
 
 // grabDOIValidate returns a Validate stub whose Text.Excerpt prints doi in
@@ -7738,11 +7929,6 @@ func TestSweepGrabsDoesNotOverwritePendingAdoptionFile(t *testing.T) {
 		t.Fatalf("grab = %+v, err=%v", got, err)
 	}
 }
-
-// TestSweepGrabsSkipsTickOnHungRoot mirrors
-// TestSweepsSkipTickOnHungAdoptionRoot for the grabs/ subtree: a TCC-hung
-// root must never wedge the grab sweeper, and the shared latch must not
-// stack a second hung goroutine underneath it.
 
 // TestSweepGrabsSkipsTickOnHungRoot mirrors
 // TestSweepsSkipTickOnHungAdoptionRoot for the grabs/ subtree: a TCC-hung
@@ -8125,21 +8311,51 @@ func parkWithProviderEvidence(t *testing.T, jobs *job.Store, reqID string, w wor
 func TestDirectRouteUsesTupleProtocol(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := parkWithProviderEvidence(t, jobs, "wr_direct_tuple", handoffWork(), "onlinelibrary.wiley.com")
-	msgs, _ := runSync(t, b, helloAs("0.14.0"))
+	msgs, _ := runSync(t, b, helloWithFeatures(t, "0.14.0", providerDirectGetV1Feature, effectPermitFeature))
 	req := firstOfType(msgs, protocol.MsgProviderDirectGetRequest)
 	if req == nil {
 		t.Fatalf("missing provider direct request: %v", msgs)
+	}
+	if countType(msgs, protocol.MsgProviderDirectGetRequest) != 1 {
+		t.Fatalf("direct request count = %d, want one", countType(msgs, protocol.MsgProviderDirectGetRequest))
 	}
 	if firstOfType(msgs, protocol.MsgJobOffer) != nil {
 		t.Fatalf("direct URL leaked through job_offer: %v", msgs)
 	}
 	p := req.Payload.(*protocol.ProviderDirectGetRequestPayload)
+	permit, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{
+		JobID: id, Kind: job.EffectKindDirectGet, DriveAttemptID: p.DriveAttemptID,
+		Ordinal: p.Ordinal, Strategy: "direct_get", Revision: p.RouteRevision,
+	})
+	if err != nil || permit == nil {
+		t.Fatalf("direct permit = %+v, err=%v", permit, err)
+	}
+	if permit.Status != job.EffectPermitHeld {
+		t.Fatalf("direct permit status = %q, want held", permit.Status)
+	}
+	if permit.SafetyDomainID != routeSafetyDomain(p.RouteRevision) {
+		t.Fatalf("direct permit domain = %q, want %q", permit.SafetyDomainID, routeSafetyDomain(p.RouteRevision))
+	}
+	attempt, err := jobs.MaterializationAttemptRevision(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if permit.JobAttemptRevision != attempt || permit.BrowserHolderGeneration != int64(b.epoch) {
+		t.Fatalf("direct permit fences = attempt %d/holder %d, want %d/%d", permit.JobAttemptRevision, permit.BrowserHolderGeneration, attempt, b.epoch)
+	}
 	result := inFrame(t, protocol.MsgProviderDirectGetResult, id, protocol.ProviderDirectGetResultPayload{
 		DriveAttemptID: p.DriveAttemptID, Ordinal: p.Ordinal, RouteRevision: p.RouteRevision,
 		Outcome: "not_pdf", LandingClass: "html",
 	})
 	runSync(t, b, result)
 	runSync(t, b, result)
+	permit, err = jobs.GetEffectPermit(context.Background(), permit.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if permit.Status != job.EffectPermitSettled {
+		t.Fatalf("direct permit after result = %q, want settled", permit.Status)
+	}
 	events, err := jobs.Events(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
@@ -8165,12 +8381,15 @@ func TestDirectRouteUsesTupleProtocol(t *testing.T) {
 func TestDirectRouteRequiresProviderEvidence(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := park(t, jobs, "wr_direct_route_no_provider", handoffWork())
-	msgs, _ := runSync(t, b, helloAs(DirectRouteMinExtensionVersion))
+	msgs, _ := runSync(t, b, helloWithFeatures(t, DirectRouteMinExtensionVersion, providerDirectGetV1Feature, effectPermitFeature))
 	if countJobOffersFor(msgs, id) != 1 {
 		t.Fatalf("offer count = %d, want ordinary offer", countJobOffersFor(msgs, id))
 	}
 	if got := directRouteOfferURL(t, msgs); strings.Contains(got, "onlinelibrary.wiley.com") {
 		t.Fatalf("job without provider evidence received direct route %q", got)
+	}
+	if countType(msgs, protocol.MsgProviderDirectGetRequest) != 0 {
+		t.Fatalf("job without provider evidence received direct request: %v", msgs)
 	}
 }
 
@@ -8178,7 +8397,7 @@ func TestDirectRoutesRequireDelegationAndExtensionFloor(t *testing.T) {
 	t.Run("assisted job receives ordinary offer only", func(t *testing.T) {
 		b, jobs, _, _ := newBridge(t)
 		parkWithPolicyMode(t, jobs, "wr_direct_route_assisted", "10.1002/assisted", config.ModeAssisted)
-		msgs, _ := runSync(t, b, helloAs(DirectRouteMinExtensionVersion))
+		msgs, _ := runSync(t, b, helloWithFeatures(t, DirectRouteMinExtensionVersion, providerDirectGetV1Feature, effectPermitFeature))
 		if got := directRouteOfferURL(t, msgs); strings.Contains(got, "onlinelibrary.wiley.com") {
 			t.Fatalf("assisted job received direct route %q", got)
 		}
@@ -8204,7 +8423,7 @@ func TestLatchedJobsReceiveOrdinaryOfferButNoDirectRoute(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	msgs, _ := runSync(t, b, helloAs("0.14.0"))
+	msgs, _ := runSync(t, b, helloWithFeatures(t, "0.14.0", providerDirectGetV1Feature, effectPermitFeature))
 	if countJobOffersFor(msgs, id) != 1 {
 		t.Fatalf("latched job ordinary offers = %d, want 1", countJobOffersFor(msgs, id))
 	}
@@ -8212,8 +8431,163 @@ func TestLatchedJobsReceiveOrdinaryOfferButNoDirectRoute(t *testing.T) {
 		t.Fatalf("latched job received direct route request: %v", msgs)
 	}
 }
+func TestDirectRouteEffectPermitFeatureGate(t *testing.T) {
+	t.Run("featureless holder", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		id := parkWithProviderEvidence(t, jobs, "direct-featureless", handoffWork(), "onlinelibrary.wiley.com")
+		msgs, _ := runSync(t, b, helloAs("0.14.0"))
+		if countType(msgs, protocol.MsgProviderDirectGetRequest) != 0 {
+			t.Fatalf("featureless holder received direct request: %v", msgs)
+		}
+		if live, err := jobs.LiveEffectPermit(context.Background()); err != nil || live != nil {
+			t.Fatalf("featureless holder permit=%+v err=%v", live, err)
+		}
+		_ = id
+	})
+	t.Run("provider direct without permit", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		id := parkWithProviderEvidence(t, jobs, "direct-no-permit", handoffWork(), "onlinelibrary.wiley.com")
+		msgs, _ := runSync(t, b, helloWithFeatures(t, "0.14.0", providerDirectGetV1Feature))
+		if countType(msgs, protocol.MsgProviderDirectGetRequest) != 0 {
+			t.Fatalf("permit-unsupported holder received direct request: %v", msgs)
+		}
+		if live, err := jobs.LiveEffectPermit(context.Background()); err != nil || live != nil {
+			t.Fatalf("permit-unsupported holder permit=%+v err=%v", live, err)
+		}
+		_ = id
+	})
+}
+
+func TestDirectRouteOccupiedLaneDefersUntilSettlement(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	firstID := parkWithProviderEvidence(t, jobs, "direct-occupied-first", handoffWork(), "onlinelibrary.wiley.com")
+	secondID := parkWithProviderEvidence(t, jobs, "direct-occupied-second", handoffWork(), "onlinelibrary.wiley.com")
+	msgs, _ := runSync(t, b, helloWithFeatures(t, "0.14.0", providerDirectGetV1Feature, effectPermitFeature))
+	if countType(msgs, protocol.MsgProviderDirectGetRequest) != 1 {
+		t.Fatalf("initial direct request count = %d, want one", countType(msgs, protocol.MsgProviderDirectGetRequest))
+	}
+	firstReq := firstOfType(msgs, protocol.MsgProviderDirectGetRequest)
+	first := firstReq.Payload.(*protocol.ProviderDirectGetRequestPayload)
+	occupyingID := firstReq.JobID
+	deferredID := secondID
+	if occupyingID == secondID {
+		deferredID = firstID
+	} else if occupyingID != firstID {
+		t.Fatalf("first request targeted unexpected created job %q (created %q and %q)", occupyingID, firstID, secondID)
+	}
+	if deferredID == occupyingID {
+		t.Fatalf("created jobs did not leave a deferred job distinct from occupying request: %q", occupyingID)
+	}
+	firstPermit, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{
+		JobID: occupyingID, Kind: job.EffectKindDirectGet, DriveAttemptID: first.DriveAttemptID,
+		Ordinal: first.Ordinal, Strategy: "direct_get", Revision: first.RouteRevision,
+	})
+	if err != nil || firstPermit == nil {
+		t.Fatalf("first direct permit=%+v err=%v", firstPermit, err)
+	}
+	deferredEvents, err := jobs.Events(context.Background(), deferredID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range deferredEvents {
+		if event["kind"] == "browser.direct_route" {
+			t.Fatalf("occupied lane recorded a second direct-route event: %#v", event)
+		}
+	}
+	for _, msg := range msgs {
+		if msg.JobID == deferredID && msg.Type == protocol.MsgProviderDirectGetRequest {
+			t.Fatalf("occupied lane emitted second direct request: %v", msgs)
+		}
+	}
+	result := inFrame(t, protocol.MsgProviderDirectGetResult, occupyingID, protocol.ProviderDirectGetResultPayload{
+		DriveAttemptID: first.DriveAttemptID, Ordinal: first.Ordinal, RouteRevision: first.RouteRevision,
+		Outcome: "not_pdf", LandingClass: "html",
+	})
+	settlement, _ := runSync(t, b, result)
+	retry := settlement
+	if countType(retry, protocol.MsgProviderDirectGetRequest) == 0 {
+		delete(b.offered, deferredID)
+		b.reofferPending[deferredID] = true
+		retry, _ = runSync(t, b)
+	}
+	if countType(retry, protocol.MsgProviderDirectGetRequest) == 0 {
+		t.Fatalf("deferred direct route was not retried after settlement: %v", retry)
+	}
+	retriedMsg := firstOfType(retry, protocol.MsgProviderDirectGetRequest)
+	if retriedMsg.JobID != deferredID {
+		t.Fatalf("settled lane request targeted job %q, want deferred job %q", retriedMsg.JobID, deferredID)
+	}
+	retried := retriedMsg.Payload.(*protocol.ProviderDirectGetRequestPayload)
+	if retried.Ordinal != 0 || retried.RouteRevision == "" || retried.DriveAttemptID == "" {
+		t.Fatalf("retry direct tuple incomplete: %+v", retried)
+	}
+}
+
+func TestDirectRouteHistoricalResultSettlesCleanupOnly(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id := parkWithProviderEvidence(t, jobs, "direct-historical", handoffWork(), "onlinelibrary.wiley.com")
+	msgs, _ := runSync(t, b, helloWithFeatures(t, "0.14.0", providerDirectGetV1Feature, effectPermitFeature))
+	req := firstOfType(msgs, protocol.MsgProviderDirectGetRequest)
+	if req == nil {
+		t.Fatalf("missing direct request: %v", msgs)
+	}
+	p := req.Payload.(*protocol.ProviderDirectGetRequestPayload)
+	permit, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{
+		JobID: id, Kind: job.EffectKindDirectGet, DriveAttemptID: p.DriveAttemptID,
+		Ordinal: p.Ordinal, Strategy: "direct_get", Revision: p.RouteRevision,
+	})
+	if err != nil || permit == nil {
+		t.Fatalf("direct permit=%+v err=%v", permit, err)
+	}
+	if err := jobs.RecordEvent(context.Background(), id, "job.retry_requested", map[string]any{"reason": "historical direct result"}); err != nil {
+		t.Fatal(err)
+	}
+	b.epoch++
+	result := inFrame(t, protocol.MsgProviderDirectGetResult, id, protocol.ProviderDirectGetResultPayload{
+		DriveAttemptID: p.DriveAttemptID, Ordinal: p.Ordinal, RouteRevision: p.RouteRevision,
+		Outcome: "not_pdf", LandingClass: "html",
+	})
+	runSync(t, b, result)
+	got, err := jobs.GetEffectPermit(context.Background(), permit.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != job.EffectPermitSettled {
+		t.Fatalf("historical permit status=%q, want settled", got.Status)
+	}
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerResults, cleanupResults, visibleResults, latches, successors := 0, 0, 0, 0, 0
+	for _, event := range events {
+		switch event["kind"] {
+		case "browser.provider_direct_get_result":
+			providerResults++
+		case "browser.direct_route":
+			detail, _ := event["detail"].(map[string]any)
+			if detail["phase"] == "result" {
+				if cleanup, _ := detail["cleanup_only"].(bool); cleanup {
+					cleanupResults++
+				} else {
+					visibleResults++
+				}
+			}
+			if detail["phase"] == "offered" && intDetail(detail, "ordinal") == 1 {
+				successors++
+			}
+		case providerLatchEventKind:
+			latches++
+		}
+	}
+	if providerResults != 1 || cleanupResults != 1 || visibleResults != 0 || latches != 0 || successors != 0 {
+		t.Fatalf("historical cleanup events provider_result=%d cleanup_result=%d visible_result=%d latch=%d successor=%d",
+			providerResults, cleanupResults, visibleResults, latches, successors)
+	}
+}
 func TestProviderDriveEpochTupleLifecycle(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
 	id := park(t, jobs, "wr_provider_epoch", handoffWork())
 	ctx := context.Background()
 	attempt := "epoch-test-0001"
@@ -8230,15 +8604,15 @@ func TestProviderDriveEpochTupleLifecycle(t *testing.T) {
 	if err != nil || len(again) != 1 {
 		t.Fatalf("duplicate start: frames=%d err=%v", len(again), err)
 	}
-	// Replaying the exact tuple after a worker death must NOT re-authorize the
-	// irreversible effect. This previously returned "started" a second time and
-	// only skipped rewriting the event, and the test asserted frame count only.
+	// Replaying the exact held tuple after a worker death is the one
+	// authorizing start replay. Once the permit settles, later replay is
+	// non-authorizing.
 	repeat, decodeErr := protocol.DecodeBrowserMessage(again[0])
 	if decodeErr != nil {
 		t.Fatal(decodeErr)
 	}
-	if got := repeat.Payload.(*protocol.ProviderDriveEpochStartResultPayload).Outcome; got != "duplicate" {
-		t.Fatalf("replayed drive epoch start outcome = %q, want duplicate", got)
+	if got := repeat.Payload.(*protocol.ProviderDriveEpochStartResultPayload).Outcome; got != "started" {
+		t.Fatalf("replayed held drive epoch start outcome = %q, want started", got)
 	}
 	stale := *start
 	stale.Ordinal = 1
@@ -8275,6 +8649,7 @@ func TestProviderDriveEpochTupleLifecycle(t *testing.T) {
 func TestProviderDriveEpochLateFramesCannotMutateClosedOrSupersededJob(t *testing.T) {
 	t.Run("cancelled", func(t *testing.T) {
 		b, jobs, _, _ := newBridge(t)
+		effectPermitHolder(t, b)
 		ctx := context.Background()
 		id := park(t, jobs, "wr_provider_epoch_cancelled", handoffWork())
 		attempt := "epoch-cancelled-0001"
@@ -8304,6 +8679,7 @@ func TestProviderDriveEpochLateFramesCannotMutateClosedOrSupersededJob(t *testin
 
 	t.Run("terminal", func(t *testing.T) {
 		b, jobs, _, _ := newBridge(t)
+		effectPermitHolder(t, b)
 		ctx := context.Background()
 		id := park(t, jobs, "wr_provider_epoch_terminal", handoffWork())
 		attempt := "epoch-terminal-0001"
@@ -8334,6 +8710,7 @@ func TestProviderDriveEpochLateFramesCannotMutateClosedOrSupersededJob(t *testin
 
 	t.Run("explicit retry supersedes old epoch", func(t *testing.T) {
 		b, jobs, _, _ := newBridge(t)
+		effectPermitHolder(t, b)
 		ctx := context.Background()
 		id := park(t, jobs, "wr_provider_epoch_retry_late", handoffWork())
 		attempt := "epoch-retry-0001"
@@ -8348,30 +8725,61 @@ func TestProviderDriveEpochLateFramesCannotMutateClosedOrSupersededJob(t *testin
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if err := jobs.RecordEvent(ctx, id, "browser.provider_drive_epoch_superseded", map[string]any{
-			"drive_attempt_id": attempt, "ordinal": int64(0), "strategy": "generic", "revision": "1",
-			"safety_domain": "institution:example.edu",
+		// Settle the historical permit so its late result is cleanup-only.
+		if _, _, err := jobs.SettleEffectPermit(ctx, job.EffectPermitSettleInput{
+			Identity: job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"},
+			RequiredEvents: []job.EffectPermitEvent{{Kind: "browser.provider_drive_epoch_result", Detail: map[string]any{
+				"drive_attempt_id": attempt, "ordinal": int64(0), "strategy": "generic", "revision": "1", "outcome": "applied", "safety_domain": "institution:example.edu",
+			}}},
 		}); err != nil {
 			t.Fatal(err)
 		}
-		// Everything before this boundary is authorized history: the first
-		// start belongs to the pre-retry epoch, while superseded marks the
-		// lifecycle boundary after which this tuple is stale. Snapshot both
-		// the event sequence and mutable job state so the assertions below
-		// inspect only effects of the late frames.
 		boundary := snapshotProviderEpochLifecycleBoundary(t, jobs, id)
-		if _, err := b.providerDriveEpochStart(ctx, id, &protocol.ProviderDriveEpochStartRequestPayload{
-			DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
-		}); err != nil {
+		if err := jobs.RecordEvent(ctx, id, "job.retry_requested", map[string]any{"reason": "explicit_retry"}); err != nil {
 			t.Fatal(err)
 		}
-		assertNoProviderEpochMutationSince(t, jobs, id, boundary)
+		// Late frames after explicit retry: exact historical result is allowed as
+		// cleanup (records evidence) but must not latch, create a successor, or
+		// mutate current state beyond that.
 		if _, err := b.providerDriveEpochResult(ctx, id, &protocol.ProviderDriveEpochResultRequestPayload{
 			DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1", Outcome: "wrong_work",
 		}); err != nil {
 			t.Fatal(err)
 		}
-		assertNoProviderEpochMutationSince(t, jobs, id, boundary)
+		// Verify historical result recorded but no latch/successor/current mutation.
+		events, err := jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) < len(boundary.eventSeqs) {
+			t.Fatalf("events shrank")
+		}
+		for _, event := range events[len(boundary.eventSeqs):] {
+			if event["kind"] == providerLatchEventKind {
+				t.Fatalf("historical result created latch: %#v", event)
+			}
+			if event["kind"] == "browser.provider_drive_epoch_offered" {
+				detail, _ := event["detail"].(map[string]any)
+				if intDetail(detail, "ordinal") == 1 {
+					t.Fatalf("historical result minted successor: %#v", event)
+				}
+			}
+		}
+		// Start of stale tuple remains stale.
+		if _, err := b.providerDriveEpochStart(ctx, id, &protocol.ProviderDriveEpochStartRequestPayload{
+			DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		events2, err := jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events2[len(events):] {
+			if event["kind"] == "browser.provider_drive_epoch_started" {
+				t.Fatalf("stale start mutated: %#v", event)
+			}
+		}
 	})
 }
 
@@ -8450,6 +8858,7 @@ func TestOfferAtURLEpochAuthorizationFailureEmitsNoTuple(t *testing.T) {
 	ctx := context.Background()
 	id := park(t, jobs, "wr_epoch_append_failure", handoffWork())
 	runSync(t, b, helloAs("0.14.0"))
+	effectPermitHolder(t, b)
 	row, err := jobs.Get(ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -8538,6 +8947,7 @@ func TestProviderDriftLatchMatchesRedirectProviderButNotUnrelatedRoute(t *testin
 
 func TestProviderDriveEpochOfferReusesAcrossRestartStyleReoffer(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
 	id := park(t, jobs, "wr_provider_epoch_offer", handoffWork())
 	row, err := jobs.Get(context.Background(), id)
 
@@ -8559,6 +8969,7 @@ func TestProviderDriveEpochOfferReusesAcrossRestartStyleReoffer(t *testing.T) {
 		t.Fatal("open action missing")
 	}
 	runSync(t, b, helloAs("0.14.0"))
+	effectPermitHolder(t, b)
 	first, err := b.offer(*row, action, config.ModeDelegated)
 	if err != nil {
 		t.Fatal(err)
@@ -8587,6 +8998,7 @@ func TestProviderDriveEpochOfferReusesAcrossRestartStyleReoffer(t *testing.T) {
 }
 func TestProviderDriveWrongWorkLatchesOnlyCurrentDomain(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
 	id := park(t, jobs, "wr_provider_epoch_wrong_work", handoffWork())
 	ctx := context.Background()
 	offered := map[string]any{
@@ -8644,6 +9056,7 @@ func TestProviderDriveWrongWorkLatchesOnlyCurrentDomain(t *testing.T) {
 }
 func TestProviderDriveWrongWorkStaleTupleCannotLatchNewDomain(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
 	id := park(t, jobs, "wr_provider_epoch_stale_wrong_work", handoffWork())
 	ctx := context.Background()
 	if err := jobs.RecordEvent(ctx, id, "browser.provider_drive_epoch_offered", map[string]any{
@@ -8673,8 +9086,8 @@ func TestProviderDriveWrongWorkStaleTupleCannotLatchNewDomain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := msg.Payload.(*protocol.ProviderDriveEpochResultPayload).Outcome; got != "stale" {
-		t.Fatalf("stale wrong-work result = %q, want stale", got)
+	if got := msg.Payload.(*protocol.ProviderDriveEpochResultPayload).Outcome; got != "applied" {
+		t.Fatalf("stale wrong-work result = %q, want applied (cleanup of exact historical permit)", got)
 	}
 	events, err := jobs.Events(ctx, id)
 	if err != nil {
@@ -8685,13 +9098,14 @@ func TestProviderDriveWrongWorkStaleTupleCannotLatchNewDomain(t *testing.T) {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
-		if detail["safety_domain"] == "institution:old.example" || detail["safety_domain"] == "institution:new.example" {
-			t.Fatalf("stale tuple created safety latch: %#v", detail)
+		if detail["safety_domain"] == "institution:new.example" {
+			t.Fatalf("stale tuple latched new domain: %#v", detail)
 		}
 	}
 }
 func TestInstitutionalRouteProfileFencePrecedesURLDerivation(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
 	ctx := context.Background()
 	jobID := parkInstitutional(t, jobs, "materialization-route-profile-fence", handoffWork(), "")
 	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
@@ -8853,6 +9267,266 @@ func TestDeliveredArtifactIsFencedToTheWinningMaterialization(t *testing.T) {
 	replaced, ok, err := jobs.ArtifactWinner(ctx, jobID, 1)
 	if err != nil || !ok || replaced.SHA256 != winner.SHA256 {
 		t.Fatalf("winner after late delivery = %+v ok=%v err=%v, want the original artifact", replaced, ok, err)
+	}
+}
+
+// A structurally valid late adoption with exact producer correlation records
+// the per-attempt artifact winner and releases only that historical effect.
+// Expiry or claim replacement must not mutate current claim/job authority.
+// Exercise both because replacement is the daemon-restart shape seen in practice.
+func TestLateArtifactStaleClaimRecordsWinnerAndSettlesExactProducer(t *testing.T) {
+	tests := []struct {
+		name string
+		kind job.EffectKind
+	}{
+		{name: "generic", kind: job.GenericDrive},
+		{name: "direct", kind: job.DirectGet},
+		{name: "institutional", kind: job.Institutional},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, replaced := range []bool{false, true} {
+				t.Run(map[bool]string{false: "expired", true: "replaced"}[replaced], func(t *testing.T) {
+					b, jobs, _, _ := newBridge(t)
+					ctx := context.Background()
+					jobID := parkInstitutional(t, jobs, "late-artifact-"+tc.name, handoffWork(), "")
+					profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+						ConfiguredName: "late-artifact", AuthorityDigest: "late-artifact-authority",
+						AuthenticationClaimID: "late-artifact-auth",
+					}})
+					if err != nil || len(profiles) != 1 {
+						t.Fatalf("profile reconcile: %+v %v", profiles, err)
+					}
+					candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+						ID: "late-artifact-" + tc.name, JobID: jobID, JobAttemptRevision: 1,
+						InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+						RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+						PreRouteSafetyKey: "late-artifact-safety", SafetyDomainID: "late-artifact-domain",
+						AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					holder := int64(b.epoch)
+					claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+						CandidateID: candidate.ID, BrowserHolderGeneration: holder,
+						JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+						RouteRevision: 1, MaterializationKind: "browser_tab",
+						LeaseUntil: time.Now().UTC().Add(time.Minute),
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if tc.kind == job.Institutional {
+						if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, holder, profiles[0].Revision, 0); err != nil {
+							t.Fatal(err)
+						}
+					}
+					attempt := "late-artifact-" + tc.name
+					ordinal := int64(0)
+					strategy := "generic"
+					if tc.kind == job.DirectGet {
+						strategy = "direct_get"
+					}
+					producer := job.ArtifactProducerIdentity{
+						Kind: tc.kind, DriveAttemptID: attempt, Ordinal: &ordinal,
+						Strategy: strategy, Revision: "1",
+					}
+					identity := job.EffectPermitIdentity{
+						JobID: jobID, Kind: tc.kind, DriveAttemptID: attempt,
+						Ordinal: 0, Strategy: strategy, Revision: "1",
+					}
+					acquire := job.EffectPermitAcquireInput{
+						Identity: identity, JobAttemptRevision: 1, BrowserHolderGeneration: holder,
+						SafetyDomainID: "late-artifact-domain", LeaseUntil: time.Now().UTC().Add(time.Minute),
+						Authorization: job.EffectPermitEvent{Kind: "effect.authorized"},
+					}
+					if tc.kind == job.Institutional {
+						effectOrdinal := int64(1)
+						producer = job.ArtifactProducerIdentity{
+							Kind: tc.kind, ClaimID: claim.ID, BindingID: claim.BindingID,
+							EffectOrdinal: &effectOrdinal, InstitutionalRequestID: "late-artifact-request",
+						}
+						permit, outcome, acquireErr := jobs.AcquireInstitutionalEffectPermit(ctx, job.InstitutionalEffectPermitAcquireInput{
+							JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+							SafetyDomainID: "late-artifact-domain", InstitutionalRequestID: producer.InstitutionalRequestID,
+							JobAttemptRevision: 1, BrowserHolderGeneration: holder,
+							ExpectedEffectOrdinal: 0, LeaseUntil: time.Now().UTC().Add(time.Minute),
+							Authorization: job.EffectPermitEvent{Kind: "effect.authorized"},
+						})
+						if acquireErr != nil || outcome != job.EffectPermitAcquired || permit == nil {
+							t.Fatalf("institutional permit=%+v outcome=%v err=%v", permit, outcome, acquireErr)
+						}
+						identity = job.EffectPermitIdentity{
+							JobID: jobID, Kind: tc.kind, ClaimID: claim.ID, BindingID: claim.BindingID,
+							EffectOrdinal: 1, InstitutionalRequestID: producer.InstitutionalRequestID,
+						}
+					} else {
+						permit, outcome, acquireErr := jobs.AcquireEffectPermit(ctx, acquire)
+						if acquireErr != nil || outcome != job.EffectPermitAcquired || permit == nil {
+							t.Fatalf("permit=%+v outcome=%v err=%v", permit, outcome, acquireErr)
+						}
+					}
+
+					digest := strings.Repeat("a", 64)
+					if err := jobs.RecordEvent(ctx, jobID, "browser.download_complete", map[string]any{
+						"filename": "late.pdf", "sha256": digest, "producer": producer,
+					}); err != nil {
+						t.Fatal(err)
+					}
+					if replaced {
+						if _, err := jobs.S.DB().ExecContext(ctx,
+							`UPDATE materialization_claims SET browser_holder_generation=? WHERE id=?`,
+							holder+1, claim.ID); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						if _, err := jobs.S.DB().ExecContext(ctx,
+							`UPDATE materialization_claims SET lease_until=? WHERE id=?`,
+							time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), claim.ID); err != nil {
+							t.Fatal(err)
+						}
+					}
+					beforeClaim, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					beforeCandidate, err := jobs.GetBrowserCandidate(ctx, candidate.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					beforeEvents, err := jobs.Events(ctx, jobID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					fence := &artifactFence{
+						attempt: 1, digest: digest, candidate: candidate, claim: claim, governed: true,
+					}
+					if err := b.commitArtifact(ctx, jobID, "late.pdf", fence, nil); err != nil {
+						t.Fatal(err)
+					}
+					if err := b.commitArtifact(ctx, jobID, "late.pdf", fence, nil); err != nil {
+						t.Fatal(err)
+					}
+					winner, ok, err := jobs.ArtifactWinner(ctx, jobID, 1)
+					if err != nil || !ok || winner.CandidateID != candidate.ID || winner.SHA256 != digest {
+						t.Fatalf("late correlated winner=%+v ok=%v err=%v", winner, ok, err)
+					}
+					permit, err := jobs.GetEffectPermitByIdentity(ctx, identity)
+					if err != nil || permit == nil || permit.Status != job.EffectPermitSettled {
+						t.Fatalf("late exact producer permit=%+v err=%v", permit, err)
+					}
+					afterClaim, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+					if err != nil || !reflect.DeepEqual(afterClaim, beforeClaim) {
+						t.Fatalf("stale claim changed: before=%+v after=%+v err=%v", beforeClaim, afterClaim, err)
+					}
+					afterCandidate, err := jobs.GetBrowserCandidate(ctx, candidate.ID)
+					if err != nil || afterCandidate.Status != beforeCandidate.Status {
+						t.Fatalf("stale candidate changed: before=%+v after=%+v err=%v", beforeCandidate, afterCandidate, err)
+					}
+					afterEvents, err := jobs.Events(ctx, jobID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(afterEvents) != len(beforeEvents)+1 {
+						t.Fatalf("late cleanup events=%d before=%d, want one idempotent producer event", len(afterEvents), len(beforeEvents))
+					}
+					for _, event := range afterEvents[len(beforeEvents):] {
+						if event["kind"] == "browser.artifact_unfenced" {
+							t.Fatalf("stale adoption retained winner disposition as unfenced event: %#v", event)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLateArtifactMissingProducerLeavesExactPermitHeld(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "late-artifact-missing", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "late-artifact-missing", AuthorityDigest: "late-artifact-missing-authority",
+		AuthenticationClaimID: "late-artifact-missing-auth",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "late-artifact-missing-candidate", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "late-artifact-missing-safety", SafetyDomainID: "late-artifact-missing-domain",
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := int64(b.epoch)
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: candidate.ID, BrowserHolderGeneration: holder,
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := "late-artifact-missing-attempt"
+	identity := job.EffectPermitIdentity{
+		JobID: jobID, Kind: job.GenericDrive, DriveAttemptID: attempt,
+		Ordinal: 0, Strategy: "generic", Revision: "1",
+	}
+	permit, outcome, err := jobs.AcquireEffectPermit(ctx, job.EffectPermitAcquireInput{
+		Identity: identity, JobAttemptRevision: 1, BrowserHolderGeneration: holder,
+		SafetyDomainID: "late-artifact-missing-domain", LeaseUntil: time.Now().UTC().Add(time.Minute),
+		Authorization: job.EffectPermitEvent{Kind: "effect.authorized"},
+	})
+	if err != nil || outcome != job.EffectPermitAcquired || permit == nil {
+		t.Fatalf("permit=%+v outcome=%v err=%v", permit, outcome, err)
+	}
+	digest := strings.Repeat("b", 64)
+	if err := jobs.RecordEvent(ctx, jobID, "browser.download_complete", map[string]any{
+		"filename": "missing.pdf", "sha256": digest,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET lease_until=? WHERE id=?`,
+		time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	beforeClaim, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeEvents, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.commitArtifact(ctx, jobID, "missing.pdf", &artifactFence{
+		attempt: 1, digest: digest, candidate: candidate, claim: claim, governed: true,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := jobs.ArtifactWinner(ctx, jobID, 1); err != nil || ok {
+		t.Fatalf("missing producer created winner: ok=%v err=%v", ok, err)
+	}
+	got, err := jobs.GetEffectPermit(ctx, permit.ID)
+	if err != nil || got == nil || got.Status != job.EffectPermitHeld {
+		t.Fatalf("missing producer changed permit=%+v err=%v", got, err)
+	}
+	afterClaim, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil || !reflect.DeepEqual(beforeClaim, afterClaim) {
+		t.Fatalf("missing producer changed claim: before=%+v after=%+v err=%v", beforeClaim, afterClaim, err)
+	}
+	afterEvents, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterEvents) != len(beforeEvents) {
+		t.Fatalf("missing producer appended events: before=%d after=%d", len(beforeEvents), len(afterEvents))
 	}
 }
 func TestInstitutionalReconcileAcceptsTabZero(t *testing.T) {
@@ -9046,8 +9720,8 @@ func TestInstitutionalMaterializationHandlersAreDarkAndContinue(t *testing.T) {
 	}{
 		{protocol.MsgInstitutionalClaimRequest, "job_inst_001", protocol.InstitutionalClaimRequestPayload{RequestID: "req_inst_001", CandidateID: "cand_001", MaterializationKind: "browser_tab"}, protocol.MsgInstitutionalClaimResponse},
 		{protocol.MsgInstitutionalBindRequest, "job_inst_001", protocol.InstitutionalBindRequestPayload{RequestID: "req_inst_002", ClaimID: "claim_001", BindingID: "bind_001", TabID: 4}, protocol.MsgInstitutionalBindResponse},
-		{protocol.MsgInstitutionalRouteRequest, "job_inst_001", protocol.InstitutionalRouteRequestPayload{RequestID: "req_inst_003", ClaimID: "claim_001", BindingID: "bind_001"}, protocol.MsgInstitutionalRouteResponse},
-		{protocol.MsgInstitutionalNavigatedRequest, "job_inst_001", protocol.InstitutionalNavigatedRequestPayload{RequestID: "req_inst_004", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, TabID: 4}, protocol.MsgInstitutionalNavigatedResponse},
+		{protocol.MsgInstitutionalRouteRequest, "job_inst_001", protocol.InstitutionalRouteRequestPayload{RequestID: "req_inst_003", ClaimID: "claim_001", BindingID: "bind_001", ExpectedEffectOrdinal: 0, InstitutionalRequestID: "inst_req_003"}, protocol.MsgInstitutionalRouteResponse},
+		{protocol.MsgInstitutionalNavigatedRequest, "job_inst_001", protocol.InstitutionalNavigatedRequestPayload{RequestID: "req_inst_004", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, EffectOrdinal: 1, InstitutionalRequestID: "inst_req_003", TabID: 4}, protocol.MsgInstitutionalNavigatedResponse},
 		{protocol.MsgInstitutionalReconcileRequest, "", protocol.InstitutionalReconcileRequestPayload{RequestID: "req_inst_005", Bindings: []protocol.InstitutionalReconcileBinding{{BindingID: "bind_001", TabID: 4}}}, protocol.MsgInstitutionalReconcileResponse},
 	}
 	msgs, _ := runSync(t, b, helloAs("0.13.0"))
@@ -9140,7 +9814,7 @@ func TestInstitutionalMaterializationRequiresExplicitClientFeature(t *testing.T)
 	withFeature, _, _, _ := newBridge(t)
 	runSync(t, withFeature, inFrame(t, protocol.MsgHello, "", map[string]any{
 		"extension_version": "0.14.0",
-		"features":          []string{protocol.InstitutionalMaterializationFeature},
+		"features":          []string{protocol.InstitutionalMaterializationFeature, protocol.EffectPermitFeature},
 	}))
 	msgs, _ = runSync(t, withFeature, request)
 	enabled := firstOfType(msgs, protocol.MsgInstitutionalClaimResponse)
@@ -9445,7 +10119,7 @@ func TestMaterializationRestartRecoversLiveClaimWithoutSecondTab(t *testing.T) {
 	}
 	const replacement = "sess-live-claim-replacement-00000000000000000"
 	b.mu.Lock()
-	b.promote(&browserSession{ID: replacement, ExtensionVersion: "0.14.0", Features: []string{institutionalMaterializationFeature}, LastSyncAt: b.now()}, "live claim restart")
+	b.promote(&browserSession{ID: replacement, ExtensionVersion: "0.14.0", Features: []string{institutionalMaterializationFeature, effectPermitFeature}, LastSyncAt: b.now()}, "live claim restart")
 	b.mu.Unlock()
 	recovered, _ := runSyncAs(t, b, replacement)
 	reoffer := firstOfType(recovered, protocol.MsgInstitutionalCandidateOffer)
@@ -9723,7 +10397,7 @@ func TestFocusPreparationTakeoverReplacementOffersWithoutRetry(t *testing.T) {
 	b.mu.Lock()
 	b.promote(&browserSession{
 		ID: replacement, ExtensionVersion: "0.14.0",
-		Features: []string{institutionalMaterializationFeature}, LastSyncAt: b.now(),
+		Features: []string{institutionalMaterializationFeature, effectPermitFeature}, LastSyncAt: b.now(),
 	}, "focus preparation takeover")
 	b.mu.Unlock()
 	close(release)
@@ -10268,6 +10942,58 @@ func TestWorkPulseHandlerValidatesAndDegradesStructurally(t *testing.T) {
 		t.Fatalf("session did not survive pulse failure: %v", msgs)
 	}
 }
+
+func TestWorkPulseEffectPermitDetailsRequirePermitFeature(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		features  []string
+		wantNamed bool
+	}{
+		{name: "featureless peer", wantNamed: false},
+		{name: "permit peer", features: []string{effectPermitFeature}, wantNamed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			id := park(t, jobs, "wr_pulse_permit_"+strings.ReplaceAll(tc.name, " ", "_"), handoffWork())
+			attemptRevision, err := jobs.MaterializationAttemptRevision(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			permit, _, err := jobs.AcquireEffectPermit(context.Background(), job.EffectPermitAcquireInput{
+				Identity: job.EffectPermitIdentity{
+					JobID: id, Kind: job.EffectKindGenericDrive,
+					DriveAttemptID: "pulse-permit-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+				},
+				JobAttemptRevision: attemptRevision, BrowserHolderGeneration: 1,
+				SafetyDomainID: "pulse-permit-domain", LeaseUntil: b.now().Add(time.Minute),
+				Authorization: job.EffectPermitEvent{Kind: "browser.provider_drive_epoch_started", Detail: map[string]any{
+					"drive_attempt_id": "pulse-permit-attempt", "ordinal": int64(0), "strategy": "generic",
+					"revision": "1", "safety_domain": "pulse-permit-domain",
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			b.SetPulseService(&pulse.Service{Jobs: jobs, EffectLimit: 1, Now: b.now})
+			runSync(t, b, helloWithFeatures(t, "0.14.0", tc.features...))
+			msgs, _ := runSync(t, b, inFrame(t, protocol.MsgWorkPulseRequest, "", protocol.WorkPulseRequestPayload{
+				RequestID: "pulse-permit-details", SchemaVersions: []int64{1},
+			}))
+			response := firstOfType(msgs, protocol.MsgWorkPulseResponse)
+			if response == nil {
+				t.Fatalf("pulse response missing: %v", msgs)
+			}
+			got := response.Payload.(*protocol.WorkPulseResponsePayload).EffectPermits
+			if tc.wantNamed {
+				if len(got) != 1 || got[0].PermitID != permit.ID {
+					t.Fatalf("effect permits = %+v, want %s", got, permit.ID)
+				}
+			} else if len(got) != 0 {
+				t.Fatalf("featureless peer received additive effect permits: %+v", got)
+			}
+		})
+	}
+}
 func TestActivityPageContractAndLegacyActivity(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	runSync(t, b, hello())
@@ -10623,5 +11349,1218 @@ func TestOldPeerReceivesNoNewUnsolicitedFrames(t *testing.T) {
 	snapshot := firstOfType(msgs, protocol.MsgTriageSnapshotResponse)
 	if snapshot == nil || snapshot.Payload.(*protocol.TriageSnapshotResponsePayload).Schema != 4 {
 		t.Fatalf("old peer schema fallback = %v", msgs)
+	}
+}
+func TestProviderDriveEffectPermitFeaturelessPeerIsUnsupported(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id := park(t, jobs, "permit-featureless", handoffWork())
+	effectPermitOffer(t, jobs, id, "permit-featureless-attempt", "domain-featureless")
+	b.holder = &browserSession{ID: "featureless", ExtensionVersion: "0.14.0", LastSyncAt: b.now()}
+	frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{
+		DriveAttemptID: "permit-featureless-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := permitOutcome(t, frames); got != "unsupported" {
+		t.Fatalf("featureless start = %q, want unsupported", got)
+	}
+	live, err := jobs.LiveEffectPermit(context.Background())
+	if err != nil || live != nil {
+		t.Fatalf("featureless peer acquired permit=%+v err=%v", live, err)
+	}
+}
+
+func TestProviderDriveEffectPermitStartDuplicateAndAgeDoNotSupersede(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "permit-start-duplicate", handoffWork())
+	effectPermitOffer(t, jobs, id, "permit-start-attempt", "domain-start")
+	start := &protocol.ProviderDriveEpochStartRequestPayload{
+		DriveAttemptID: "permit-start-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+	}
+	if got, err := b.providerDriveEpochStart(context.Background(), id, start); err != nil || permitOutcome(t, got) != "started" {
+		t.Fatalf("first start err=%v frames=%v", err, got)
+	}
+	again, err := b.providerDriveEpochStart(context.Background(), id, start)
+	if err != nil || permitOutcome(t, again) != "started" {
+		t.Fatalf("exact held replay err=%v frames=%v", err, again)
+	}
+	if frames, err := b.providerDriveEpochResult(context.Background(), id, &protocol.ProviderDriveEpochResultRequestPayload{
+		DriveAttemptID: "permit-start-attempt", Ordinal: 0, Strategy: "generic", Revision: "1", Outcome: "not_pdf",
+	}); err != nil || permitOutcome(t, frames) != "applied" {
+		t.Fatalf("settle after replay err=%v frames=%v", err, frames)
+	}
+	closed, err := b.providerDriveEpochStart(context.Background(), id, start)
+	if err != nil || permitOutcome(t, closed) != "duplicate" {
+		t.Fatalf("settled replay err=%v frames=%v", err, closed)
+	}
+	advance := settableClock(b)
+	advance(11 * time.Minute)
+	if b.driveEpochStalled(id, "permit-start-attempt", 0) {
+		t.Fatal("elapsed time reported a stalled effect")
+	}
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := openHandoffAction(t, jobs, id)
+	offer, err := b.offerAtURL(*row, action, config.ModeDelegated, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := protocol.DecodeBrowserMessage(offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := msg.Payload.(*protocol.JobOfferPayload).DriveAttemptID; got != "permit-start-attempt" {
+		t.Fatalf("settled identity reoffer attempt=%q, want exact original tuple", got)
+	}
+}
+
+func TestProviderDriveEffectPermitBusyStaleThenSameIdentityReoffers(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	firstID := park(t, jobs, "permit-busy-first", handoffWork())
+	secondID := park(t, jobs, "permit-busy-second", handoffWork())
+	effectPermitOffer(t, jobs, firstID, "permit-busy-first-attempt", "domain-busy")
+	effectPermitOffer(t, jobs, secondID, "permit-busy-second-attempt", "domain-other")
+	start := &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: "permit-busy-first-attempt", Ordinal: 0, Strategy: "generic", Revision: "1"}
+	if frames, err := b.providerDriveEpochStart(context.Background(), firstID, start); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("first start err=%v frames=%v", err, frames)
+	}
+	busy, err := b.providerDriveEpochStart(context.Background(), secondID, &protocol.ProviderDriveEpochStartRequestPayload{
+		DriveAttemptID: "permit-busy-second-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+	})
+	if err != nil || permitOutcome(t, busy) != "stale" {
+		t.Fatalf("busy start err=%v frames=%v", err, busy)
+	}
+	if _, _, err := jobs.SettleEffectPermit(context.Background(), job.EffectPermitSettleInput{
+		Identity:       job.EffectPermitIdentity{JobID: firstID, Kind: job.EffectKindGenericDrive, DriveAttemptID: "permit-busy-first-attempt", Ordinal: 0, Strategy: "generic", Revision: "1"},
+		RequiredEvents: []job.EffectPermitEvent{{Kind: "browser.provider_drive_epoch_result", Detail: map[string]any{"drive_attempt_id": "permit-busy-first-attempt", "ordinal": int64(0), "strategy": "generic", "revision": "1", "outcome": "applied", "safety_domain": "domain-busy"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(context.Background(), secondID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer, err := b.offerAtURL(*row, openHandoffAction(t, jobs, secondID), config.ModeDelegated, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := protocol.DecodeBrowserMessage(offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := msg.Payload.(*protocol.JobOfferPayload).DriveAttemptID; got != "permit-busy-second-attempt" {
+		t.Fatalf("busy retry minted %q, want same identity", got)
+	}
+	if frames, err := b.providerDriveEpochStart(context.Background(), secondID, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: "permit-busy-second-attempt", Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("retry start err=%v frames=%v", err, frames)
+	}
+}
+
+func TestProviderDriveEffectPermitUnknownAndHistoricalResultsCleanupOnly(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "permit-unknown", handoffWork())
+	effectPermitOffer(t, jobs, id, "permit-unknown-attempt", "domain-unknown")
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: "permit-unknown-attempt", Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v frames=%v", err, frames)
+	}
+	p, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: "permit-unknown-attempt", Ordinal: 0, Strategy: "generic", Revision: "1"})
+	if err != nil || p == nil {
+		t.Fatalf("permit=%+v err=%v", p, err)
+	}
+	if _, err := jobs.ReconcileEffectPermit(context.Background(), job.EffectPermitObservation{PermitID: p.ID, BrowserHolderGeneration: 0}); err != nil {
+		t.Fatal(err)
+	}
+	// Unknown completion for current holder may still append its legitimate successor.
+	result, err := b.providerDriveEpochResult(context.Background(), id, &protocol.ProviderDriveEpochResultRequestPayload{DriveAttemptID: "permit-unknown-attempt", Ordinal: 0, Strategy: "generic", Revision: "1", Outcome: "not_pdf"})
+	if err != nil || permitOutcome(t, result) != "applied" {
+		t.Fatalf("unknown result err=%v frames=%v", err, result)
+	}
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := 0
+	for _, event := range events {
+		if event["kind"] == "browser.provider_drive_epoch_offered" {
+			detail, _ := event["detail"].(map[string]any)
+			if intDetail(detail, "ordinal") == 1 {
+				successor++
+			}
+		}
+	}
+	if successor != 1 {
+		t.Fatalf("unknown current result successor count=%d, want 1", successor)
+	}
+}
+func TestProviderDriveEffectPermitHistoricalResultIsCleanupOnly(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "permit-historical", handoffWork())
+	identity := job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: "permit-historical-attempt", Ordinal: 0, Strategy: "generic", Revision: "1"}
+	_, outcome, err := jobs.AcquireEffectPermit(context.Background(), job.EffectPermitAcquireInput{
+		Identity: identity, JobAttemptRevision: 1, BrowserHolderGeneration: 99,
+		SafetyDomainID: "domain-historical", LeaseUntil: time.Now().Add(time.Hour),
+		Authorization: job.EffectPermitEvent{Kind: "browser.provider_drive_epoch_started", Detail: map[string]any{
+			"drive_attempt_id": identity.DriveAttemptID, "ordinal": int64(0), "strategy": "generic", "revision": "1", "safety_domain": "domain-historical",
+		}},
+	})
+	if err != nil || outcome != job.EffectPermitAcquired {
+		t.Fatalf("historical acquire outcome=%v err=%v", outcome, err)
+	}
+	frames, err := b.providerDriveEpochResult(context.Background(), id, &protocol.ProviderDriveEpochResultRequestPayload{
+		DriveAttemptID: identity.DriveAttemptID, Ordinal: 0, Strategy: "generic", Revision: "1", Outcome: "not_pdf",
+	})
+	if err != nil || permitOutcome(t, frames) != "applied" {
+		t.Fatalf("historical result err=%v frames=%v", err, frames)
+	}
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == providerLatchEventKind {
+			t.Fatalf("historical result created latch: %#v", event)
+		}
+		if event["kind"] == "browser.provider_drive_epoch_offered" {
+			detail, _ := event["detail"].(map[string]any)
+			if intDetail(detail, "ordinal") == 1 {
+				t.Fatalf("historical result minted successor: %#v", event)
+			}
+		}
+	}
+}
+
+func TestProviderDriveEffectPermitDuplicateResultRepairsRequiredEvents(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "permit-repair", handoffWork())
+	effectPermitOffer(t, jobs, id, "permit-repair-attempt", "domain-repair")
+	start := &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: "permit-repair-attempt", Ordinal: 0, Strategy: "generic", Revision: "1"}
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, start); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v frames=%v", err, frames)
+	}
+	result := &protocol.ProviderDriveEpochResultRequestPayload{DriveAttemptID: "permit-repair-attempt", Ordinal: 0, Strategy: "generic", Revision: "1", Outcome: "not_pdf", Detail: "validation failed"}
+	if frames, err := b.providerDriveEpochResult(context.Background(), id, result); err != nil || permitOutcome(t, frames) != "applied" {
+		t.Fatalf("first result err=%v frames=%v", err, frames)
+	}
+	if _, err := jobs.S.DB().ExecContext(context.Background(), `DELETE FROM events WHERE job_id=? AND kind IN (?,?)`, id, providerLatchEventKind, "browser.provider_drive_epoch_offered"); err != nil {
+		t.Fatal(err)
+	}
+	if frames, err := b.providerDriveEpochResult(context.Background(), id, result); err != nil || permitOutcome(t, frames) != "duplicate" {
+		t.Fatalf("duplicate result err=%v frames=%v", err, frames)
+	}
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultCount, latchCount, successorCount := 0, 0, 0
+	for _, event := range events {
+		switch event["kind"] {
+		case "browser.provider_drive_epoch_result":
+			resultCount++
+		case providerLatchEventKind:
+			latchCount++
+		case "browser.provider_drive_epoch_offered":
+			detail, _ := event["detail"].(map[string]any)
+			if intDetail(detail, "ordinal") == 1 {
+				successorCount++
+			}
+		}
+	}
+	if resultCount != 1 || latchCount != 0 || successorCount != 0 {
+		t.Fatalf("historical duplicate repaired current-only events: result=%d latch=%d successor=%d", resultCount, latchCount, successorCount)
+	}
+}
+
+func TestProviderDriveEffectPermitConflictingDuplicateUsesDurableResult(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "permit-conflicting-duplicate", handoffWork())
+	effectPermitOffer(t, jobs, id, "permit-conflicting-attempt", "domain-conflicting")
+	start := &protocol.ProviderDriveEpochStartRequestPayload{
+		DriveAttemptID: "permit-conflicting-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+	}
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, start); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v frames=%v", err, frames)
+	}
+	first := &protocol.ProviderDriveEpochResultRequestPayload{
+		DriveAttemptID: "permit-conflicting-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+		Outcome: "success",
+	}
+	if frames, err := b.providerDriveEpochResult(context.Background(), id, first); err != nil || permitOutcome(t, frames) != "applied" {
+		t.Fatalf("first result err=%v frames=%v", err, frames)
+	}
+	conflicting := &protocol.ProviderDriveEpochResultRequestPayload{
+		DriveAttemptID: "permit-conflicting-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+		Outcome: "not_pdf", Detail: "validation failed",
+	}
+	if frames, err := b.providerDriveEpochResult(context.Background(), id, conflicting); err != nil || permitOutcome(t, frames) != "duplicate" {
+		t.Fatalf("conflicting result err=%v frames=%v", err, frames)
+	}
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultCount := 0
+	for _, event := range events {
+		switch event["kind"] {
+		case "browser.provider_drive_epoch_result":
+			resultCount++
+			detail, _ := event["detail"].(map[string]any)
+			if stringDetail(detail, "outcome") != "success" {
+				t.Fatalf("durable result changed: %#v", event)
+			}
+		case providerLatchEventKind:
+			t.Fatalf("conflicting duplicate minted a latch: %#v", event)
+		case "browser.provider_drive_epoch_offered":
+			detail, _ := event["detail"].(map[string]any)
+			if intDetail(detail, "ordinal") == 1 {
+				t.Fatalf("conflicting duplicate minted a successor: %#v", event)
+			}
+		}
+	}
+	if resultCount != 1 {
+		t.Fatalf("result events=%d, want immutable first result", resultCount)
+	}
+}
+
+func TestProviderDriveEffectPermitOverrideIgnoresLateResult(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "permit-override-late", handoffWork())
+	effectPermitOffer(t, jobs, id, "permit-override-attempt", "domain-override")
+	start := &protocol.ProviderDriveEpochStartRequestPayload{
+		DriveAttemptID: "permit-override-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+	}
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, start); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v frames=%v", err, frames)
+	}
+	identity := job.EffectPermitIdentity{
+		JobID: id, Kind: job.EffectKindGenericDrive,
+		DriveAttemptID: "permit-override-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+	}
+	permit, err := jobs.GetEffectPermitByIdentity(context.Background(), identity)
+	if err != nil || permit == nil {
+		t.Fatalf("permit=%+v err=%v", permit, err)
+	}
+	if _, err := jobs.ReconcileEffectPermit(context.Background(), job.EffectPermitObservation{
+		PermitID: permit.ID, BrowserHolderGeneration: 0,
+	}); err != nil {
+		t.Fatalf("reconcile unknown completion: %v", err)
+	}
+	if err := jobs.ResolveUnknownEffectPermit(context.Background(), permit.ID, "operator verified no browser effect remains"); err != nil {
+		t.Fatalf("resolve unknown completion: %v", err)
+	}
+	late := &protocol.ProviderDriveEpochResultRequestPayload{
+		DriveAttemptID: "permit-override-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+		Outcome: "not_pdf", Detail: "validation failed",
+	}
+	if frames, err := b.providerDriveEpochResult(context.Background(), id, late); err != nil || permitOutcome(t, frames) != "duplicate" {
+		t.Fatalf("late result err=%v frames=%v", err, frames)
+	}
+	if b.reofferPending[id] {
+		t.Fatal("operator-resolved permit scheduled an automatic reoffer")
+	}
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		switch event["kind"] {
+		case "browser.provider_drive_epoch_result", providerLatchEventKind:
+			t.Fatalf("operator-resolved permit applied late result state: %#v", event)
+		case "browser.provider_drive_epoch_offered":
+			detail, _ := event["detail"].(map[string]any)
+			if intDetail(detail, "ordinal") == 1 {
+				t.Fatalf("operator-resolved permit minted a successor: %#v", event)
+			}
+		}
+	}
+}
+
+func TestArtifactProducerSettlesExactDrivePermit(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "permit-artifact-winner", handoffWork())
+	attempt := "permit-artifact-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-artifact")
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v frames=%v", err, frames)
+	}
+	ordinal := int64(0)
+	settled, err := jobs.SettleArtifactProducer(context.Background(), id, job.ArtifactProducerIdentity{
+		Kind: job.GenericDrive, DriveAttemptID: attempt, Ordinal: &ordinal,
+		Strategy: "generic", Revision: "1",
+	})
+	if err != nil || !settled {
+		t.Fatalf("artifact producer settlement settled=%v err=%v", settled, err)
+	}
+	p, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{
+		JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt,
+		Ordinal: 0, Strategy: "generic", Revision: "1",
+	})
+	if err != nil || p == nil || p.Status != job.EffectPermitSettled {
+		t.Fatalf("artifact permit=%+v err=%v", p, err)
+	}
+}
+
+func TestUncorrelatedArtifactCannotSettleDriveSuccessor(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "permit-artifact-ambiguous", handoffWork())
+	attempt := "permit-artifact-ambiguous-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-artifact-ambiguous")
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{
+		DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
+	}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v frames=%v", err, frames)
+	}
+	p, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{
+		JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt,
+		Ordinal: 0, Strategy: "generic", Revision: "1",
+	})
+	if err != nil || p == nil || p.Status != job.EffectPermitHeld {
+		t.Fatalf("uncorrelated artifact changed permit=%+v err=%v", p, err)
+	}
+}
+func TestArtifactProducerRecoveryRequiresExactDurableObservation(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "permit-artifact-producer-recovery", handoffWork())
+	ordinal := int64(0)
+	supplied := &job.ArtifactProducerIdentity{
+		Kind: job.GenericDrive, DriveAttemptID: "producer-recovery-attempt",
+		Ordinal: &ordinal, Strategy: "generic", Revision: "1",
+	}
+	digest := strings.Repeat("a", 64)
+	if got := b.recoverArtifactProducer(ctx, id, "paper.pdf", digest, supplied); got != nil {
+		t.Fatalf("uncorrelated supplied producer recovered: %+v", got)
+	}
+	if err := jobs.RecordEvent(ctx, id, "browser.download_complete", map[string]any{
+		"filename": "paper.pdf", "sha256": digest, "producer": supplied,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mismatched := *supplied
+	mismatched.Strategy = "other"
+	if got := b.recoverArtifactProducer(ctx, id, "paper.pdf", digest, &mismatched); got != nil {
+		t.Fatalf("mismatched supplied producer recovered: %+v", got)
+	}
+	got := b.recoverArtifactProducer(ctx, id, "paper.pdf", digest, supplied)
+	if got == nil || got.DriveAttemptID != supplied.DriveAttemptID {
+		t.Fatalf("matching durable producer = %+v", got)
+	}
+}
+
+func TestUngovernedArtifactHashesAndSettlesExactProducer(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	ctx := context.Background()
+	id := park(t, jobs, "permit-artifact-ungoverned", handoffWork())
+	attempt := "permit-artifact-ungoverned-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-artifact-ungoverned")
+	if frames, err := b.providerDriveEpochStart(ctx, id, &protocol.ProviderDriveEpochStartRequestPayload{
+		DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
+	}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v frames=%v", err, frames)
+	}
+	filename := "paper.pdf"
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, filename))
+	digest, err := fileDigest(filepath.Join(cfg.EffectiveAdoptionRoot(), id, filename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinal := int64(0)
+	producer := &job.ArtifactProducerIdentity{
+		Kind: job.GenericDrive, DriveAttemptID: attempt, Ordinal: &ordinal,
+		Strategy: "generic", Revision: "1",
+	}
+	if err := jobs.RecordEvent(ctx, id, "browser.download_complete", map[string]any{
+		"filename": filename, "sha256": digest, "producer": producer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fence, err := b.weighArtifact(ctx, id, filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fence.governed || fence.digest != digest {
+		t.Fatalf("ungoverned fence = %+v, want digest %q", fence, digest)
+	}
+	if err := b.commitArtifact(ctx, id, filename, fence, producer); err != nil {
+		t.Fatal(err)
+	}
+	permit, err := jobs.GetEffectPermitByIdentity(ctx, job.EffectPermitIdentity{
+		JobID: id, Kind: job.GenericDrive, DriveAttemptID: attempt,
+		Ordinal: 0, Strategy: "generic", Revision: "1",
+	})
+	if err != nil || permit == nil || permit.Status != job.Settled {
+		t.Fatalf("ungoverned artifact permit=%+v err=%v", permit, err)
+	}
+}
+
+func TestEffectPermitReconcileOutboundExactIdentity(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "reconcile-outbound", handoffWork())
+	attempt := "reconcile-attempt-0001"
+	domain := "domain-reconcile"
+	effectPermitOffer(t, jobs, id, attempt, domain)
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v", err)
+	}
+	permit, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	if err != nil || permit == nil {
+		t.Fatal(err)
+	}
+	msgs, _ := runSyncAs(t, b, b.holder.ID)
+	req := firstOfType(msgs, protocol.MsgEffectPermitReconcileRequest)
+	if req == nil {
+		t.Fatalf("no reconcile request outbound: %v", msgs)
+	}
+	payload, ok := req.Payload.(*protocol.EffectPermitReconcileRequestPayload)
+	if !ok {
+		t.Fatalf("payload type %T", req.Payload)
+	}
+	if payload.PermitID != permit.ID || payload.EffectKind != string(job.EffectKindGenericDrive) || payload.DriveAttemptID != attempt || payload.Ordinal == nil || *payload.Ordinal != 0 || payload.Strategy != "generic" || payload.Revision != "1" {
+		t.Fatalf("reconcile request identity mismatch: %+v vs permit %+v", payload, permit)
+	}
+	// No sensitive fields.
+	raw, _ := json.Marshal(payload)
+	s := strings.ToLower(string(raw))
+	if strings.Contains(s, "https://") || strings.Contains(s, "provider") || strings.Contains(s, "/tmp") || strings.Contains(s, ".pdf") {
+		t.Fatalf("reconcile request leaked sensitive text: %s", s)
+	}
+	if payload.RequestID == "" {
+		t.Fatal("request_id empty")
+	}
+}
+
+func nextEffectPermitReconcileRequest(t *testing.T, b *Bridge) *protocol.EffectPermitReconcileRequestPayload {
+	t.Helper()
+	msgs, _ := runSyncAs(t, b, b.holder.ID)
+	req := firstOfType(msgs, protocol.MsgEffectPermitReconcileRequest)
+	if req == nil {
+		t.Fatalf("no reconcile request outbound: %v", msgs)
+	}
+	payload, ok := req.Payload.(*protocol.EffectPermitReconcileRequestPayload)
+	if !ok {
+		t.Fatalf("reconcile payload type %T", req.Payload)
+	}
+	return payload
+}
+
+func TestEffectPermitReconcileNoDispatchBecomesUnknown(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "reconcile-unknown", handoffWork())
+	attempt := "reconcile-unknown-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-unknown")
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatal(err)
+	}
+	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	request := nextEffectPermitReconcileRequest(t, b)
+	// no-dispatch observation -> unknown_completion
+	resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
+
+		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+	})
+	runSyncAs(t, b, b.holder.ID, resp)
+	got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
+	if got.Status != job.EffectPermitUnknownCompletion {
+		t.Fatalf("status=%q want unknown_completion", got.Status)
+	}
+}
+func TestEffectPermitReconcileReplacementHolderClassifiesHistoricalPermit(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "reconcile-replacement-holder", handoffWork())
+	attempt := "reconcile-replacement-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-replacement-holder")
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{
+		DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
+	}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start err=%v frames=%v", err, frames)
+	}
+	permit, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{
+		JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt,
+		Ordinal: 0, Strategy: "generic", Revision: "1",
+	})
+	if err != nil || permit == nil {
+		t.Fatalf("permit=%+v err=%v", permit, err)
+	}
+	request := nextEffectPermitReconcileRequest(t, b)
+	// A replacement holder answers the request after its generation changes.
+	// The bridge correlates the current request, while the store classifies
+	// the historical permit using its stored generation.
+	b.epoch = 77
+	resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
+		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+	})
+	runSyncAs(t, b, b.holder.ID, resp)
+	got, err := jobs.GetEffectPermit(context.Background(), permit.ID)
+	if err != nil || got == nil || got.Status != job.EffectPermitUnknownCompletion {
+		t.Fatalf("replacement reconcile permit=%+v err=%v, want unknown_completion", got, err)
+	}
+}
+
+func TestEffectPermitReconcileDispatchedRemainsHeld(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "reconcile-held-dispatched", handoffWork())
+	attempt := "reconcile-held-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-held")
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatal(err)
+	}
+	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	for _, obs := range []map[string]any{
+		{"outcome": "recorded", "dispatched": true, "download_present": false, "acknowledged": false, "tab_present": false},
+		{"outcome": "recorded", "dispatched": false, "download_present": true, "acknowledged": false, "tab_present": false},
+		{"outcome": "recorded", "dispatched": false, "download_present": false, "acknowledged": true, "tab_present": false},
+	} {
+		jobs.S.DB().ExecContext(context.Background(), `UPDATE effect_permits SET status='held' WHERE id=?`, permit.ID)
+		request := nextEffectPermitReconcileRequest(t, b)
+		obs["request_id"] = request.RequestID
+		obs["permit_id"] = permit.ID
+		resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, obs)
+		runSyncAs(t, b, b.holder.ID, resp)
+		got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
+		if got.Status != job.EffectPermitHeld {
+			t.Fatalf("held observation %v got status %q want held", obs, got.Status)
+		}
+	}
+}
+
+func TestEffectPermitReconcileNonTermsSettledProofDoesNotRelease(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "reconcile-settled", handoffWork())
+	attempt := "reconcile-settled-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-settled")
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatal(err)
+	}
+	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	request := nextEffectPermitReconcileRequest(t, b)
+	resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
+		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "settled",
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+	})
+	runSyncAs(t, b, b.holder.ID, resp)
+	got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
+	if got.Status != job.EffectPermitHeld {
+		t.Fatalf("status=%q want held", got.Status)
+	}
+}
+
+func TestEffectPermitReconcileStaleOrWrongIDNoMutation(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "reconcile-stale", handoffWork())
+	attempt := "reconcile-stale-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-stale")
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatal(err)
+	}
+	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	before, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
+	request := nextEffectPermitReconcileRequest(t, b)
+	// stale outcome must not mutate
+	stale := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
+		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "stale",
+		"dispatched": true, "download_present": true, "acknowledged": true, "tab_present": true,
+	})
+	runSyncAs(t, b, b.holder.ID, stale)
+	after, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
+	if after.Status != before.Status {
+		t.Fatalf("stale mutated %q -> %q", before.Status, after.Status)
+	}
+	// wrong permit id must not mutate even with an outstanding request.
+	request = nextEffectPermitReconcileRequest(t, b)
+	wrong := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
+		"request_id": request.RequestID, "permit_id": "permit-does-not-exist", "outcome": "settled",
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+	})
+	runSyncAs(t, b, b.holder.ID, wrong)
+	after2, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
+	if after2.Status != before.Status {
+		t.Fatalf("wrong id mutated %q -> %q", before.Status, after2.Status)
+	}
+	request = nextEffectPermitReconcileRequest(t, b)
+	otherID := park(t, jobs, "reconcile-other-job", handoffWork())
+	wrongJob := inFrame(t, protocol.MsgEffectPermitReconcileResponse, otherID, map[string]any{
+		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+	})
+	runSyncAs(t, b, b.holder.ID, wrongJob)
+	afterWrongJob, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
+	if afterWrongJob.Status != before.Status {
+		t.Fatalf("wrong job mutated %q -> %q", before.Status, afterWrongJob.Status)
+	}
+	// wrong holder generation must not mutate: request under the current
+	// generation, then fence it before the response arrives.
+	request = nextEffectPermitReconcileRequest(t, b)
+	b.epoch = 99
+	mismatchGen := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
+		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "settled",
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+	})
+	runSyncAs(t, b, b.holder.ID, mismatchGen)
+	after3, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
+	if after3.Status != before.Status {
+		t.Fatalf("wrong generation mutated %q -> %q", before.Status, after3.Status)
+	}
+}
+
+func TestLegacyProviderDriveResultSettlesCleanupBlocker(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	jobID := park(t, jobs, "legacy-result-cleanup", handoffWork())
+	if err := jobs.RecordEvent(context.Background(), jobID, "browser.provider_drive_epoch_started", map[string]any{
+		"drive_attempt_id": "legacy-result-attempt", "ordinal": int64(0),
+		"strategy": "generic", "revision": "1", "safety_domain": "domain-legacy-result",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.ImportLegacyStartedEpochs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	eventsBefore, err := jobs.Events(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := b.providerDriveEpochResult(context.Background(), jobID, &protocol.ProviderDriveEpochResultRequestPayload{
+		RequestID: "legacy-result-request", DriveAttemptID: "legacy-result-attempt",
+		Ordinal: 0, Strategy: "generic", Revision: "1",
+		Outcome: "not_pdf", Detail: "historical result",
+	})
+	if err != nil || permitOutcome(t, frames) != "applied" {
+		t.Fatalf("legacy result err=%v frames=%v", err, frames)
+	}
+	count, err := jobs.UnresolvedLegacyEffectBlockerCount(context.Background())
+	if err != nil || count != 0 {
+		t.Fatalf("unresolved blockers=%d err=%v, want zero", count, err)
+	}
+	events, err := jobs.Events(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events[len(eventsBefore):] {
+		t.Fatalf("cleanup-only legacy result mutated job history: %#v", event)
+	}
+}
+
+func TestTermsEffectPermitAuthorizesAndSettlesExactOccurrence(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	ctx := context.Background()
+	jobID := park(t, jobs, "terms-effect-permit", handoffWork())
+	effectPermitOffer(t, jobs, jobID, "terms-drive-attempt", "domain-terms")
+	request := &protocol.TermsEffectStartRequestPayload{
+		RequestID: "request-terms-start",
+		AdapterID: "jstor", AdapterVersion: "1.0.0",
+		AuthorityDigest: strings.Repeat("a", 64),
+	}
+	first, err := b.termsEffectStart(ctx, jobID, request)
+	if err != nil || permitOutcome(t, first) != "started" {
+		t.Fatalf("first terms start err=%v frames=%v", err, first)
+	}
+	firstFrame, err := protocol.DecodeBrowserMessage(first[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized := firstFrame.Payload.(*protocol.TermsEffectStartResultPayload)
+	if authorized.PermitID == "" || authorized.TermsOccurrenceID == "" {
+		t.Fatalf("terms authorization is incomplete: %+v", authorized)
+	}
+	replay, err := b.termsEffectStart(ctx, jobID, request)
+	if err != nil || permitOutcome(t, replay) != "started" {
+		t.Fatalf("terms start replay err=%v frames=%v", err, replay)
+	}
+	replayFrame, err := protocol.DecodeBrowserMessage(replay[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed := replayFrame.Payload.(*protocol.TermsEffectStartResultPayload)
+	if replayed.PermitID != authorized.PermitID || replayed.TermsOccurrenceID != authorized.TermsOccurrenceID {
+		t.Fatalf("lost-response replay authorization=%+v, want exact original tuple", replayed)
+	}
+	b.epoch++
+	fencedReplay, err := b.termsEffectStart(ctx, jobID, request)
+	if err != nil || permitOutcome(t, fencedReplay) != "stale" {
+		t.Fatalf("replacement-holder replay err=%v frames=%v", err, fencedReplay)
+	}
+	b.epoch--
+	identity := job.EffectPermitIdentity{
+		JobID: jobID, Kind: job.EffectKindTerms,
+		TermsOccurrenceID: authorized.TermsOccurrenceID,
+	}
+	permit, err := jobs.GetEffectPermitByIdentity(ctx, identity)
+	if err != nil || permit == nil || permit.ID != authorized.PermitID || permit.Status != job.EffectPermitHeld {
+		t.Fatalf("held terms permit=%+v err=%v", permit, err)
+	}
+	result := &protocol.TermsEffectResultRequestPayload{
+		RequestID: "request-terms-result", PermitID: authorized.PermitID,
+		TermsOccurrenceID: authorized.TermsOccurrenceID, Outcome: "accepted",
+	}
+	applied, err := b.termsEffectResult(ctx, jobID, result)
+	if err != nil || permitOutcome(t, applied) != "applied" {
+		t.Fatalf("terms result err=%v frames=%v", err, applied)
+	}
+	duplicate, err := b.termsEffectResult(ctx, jobID, result)
+	if err != nil || permitOutcome(t, duplicate) != "duplicate" {
+		t.Fatalf("terms result replay err=%v frames=%v", err, duplicate)
+	}
+	permit, err = jobs.GetEffectPermit(ctx, authorized.PermitID)
+	if err != nil || permit == nil || permit.Status != job.EffectPermitSettled {
+		t.Fatalf("settled terms permit=%+v err=%v", permit, err)
+	}
+	closedReplay, err := b.termsEffectStart(ctx, jobID, request)
+	if err != nil || permitOutcome(t, closedReplay) != "duplicate" {
+		t.Fatalf("settled terms start replay err=%v frames=%v", err, closedReplay)
+	}
+	closedFrame, err := protocol.DecodeBrowserMessage(closedReplay[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := closedFrame.Payload.(*protocol.TermsEffectStartResultPayload)
+	if closed.PermitID != "" || closed.TermsOccurrenceID != "" {
+		t.Fatalf("settled terms replay leaked authorization: %+v", closed)
+	}
+	events, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizedEvents, resultEvents := 0, 0
+	for _, event := range events {
+		switch event["kind"] {
+		case "browser.terms_effect_authorized":
+			authorizedEvents++
+		case "browser.terms_effect_result":
+			resultEvents++
+		}
+		raw, _ := json.Marshal(event)
+		if strings.Contains(strings.ToLower(string(raw)), "https://") {
+			t.Fatalf("terms permit event leaked a URL: %s", raw)
+		}
+	}
+	if authorizedEvents != 1 || resultEvents != 1 {
+		t.Fatalf("terms events authorized=%d result=%d, want one each", authorizedEvents, resultEvents)
+	}
+}
+
+func TestTermsEffectPermitRejectsClosedHandoff(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	ctx := context.Background()
+	jobID := park(t, jobs, "terms-effect-closed-handoff", handoffWork())
+	effectPermitOffer(t, jobs, jobID, "terms-closed-attempt", "domain-terms-closed")
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+	if err != nil || len(actions) != 1 {
+		t.Fatalf("open actions=%+v err=%v", actions, err)
+	}
+	if err := jobs.ResolveHumanAction(ctx, actions[0].ID, "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	frames, err := b.termsEffectStart(ctx, jobID, &protocol.TermsEffectStartRequestPayload{
+		RequestID: "request-terms-closed",
+		AdapterID: "jstor", AdapterVersion: "1.0.0",
+		AuthorityDigest: strings.Repeat("b", 64),
+	})
+	if err != nil || permitOutcome(t, frames) != "stale" {
+		t.Fatalf("closed handoff start err=%v frames=%v", err, frames)
+	}
+	if live, err := jobs.LiveEffectPermit(ctx); err != nil || live != nil {
+		t.Fatalf("closed handoff permit=%+v err=%v", live, err)
+	}
+}
+
+func TestHistoricalEffectResultNonHolderIsCleanupOnlyAndFeatureFenced(t *testing.T) {
+	t.Run("negotiated non-holder settles cleanup only", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		effectPermitHolder(t, b)
+		id := park(t, jobs, "permit-nonholder-cleanup", handoffWork())
+		attempt := "permit-nonholder-attempt"
+		effectPermitOffer(t, jobs, id, attempt, "domain-nonholder")
+		if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{
+			DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
+		}); err != nil || permitOutcome(t, frames) != "started" {
+			t.Fatalf("start err=%v frames=%v", err, frames)
+		}
+		permit, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{
+			JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt,
+			Ordinal: 0, Strategy: "generic", Revision: "1",
+		})
+		if err != nil || permit == nil {
+			t.Fatalf("permit=%+v err=%v", permit, err)
+		}
+		const pending = "permit-nonholder-session-00000000000000000001"
+		runSyncAs(t, b, pending, helloWithFeatures(t, "0.14.0", providerDriveEpochV1Feature, effectPermitFeature))
+		runSyncAs(t, b, pending, inFrame(t, protocol.MsgProviderDriveEpochResultRequest, id, map[string]any{
+			"drive_attempt_id": attempt, "ordinal": 0, "strategy": "generic", "revision": "1", "outcome": "not_pdf",
+		}))
+		got, err := jobs.GetEffectPermit(context.Background(), permit.ID)
+		if err != nil || got == nil || got.Status != job.EffectPermitSettled {
+			t.Fatalf("non-holder result permit=%+v err=%v, want settled", got, err)
+		}
+		events, err := jobs.Events(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event["kind"] == providerLatchEventKind {
+				t.Fatalf("non-holder result projected current event: %#v", event)
+			}
+			if event["kind"] == "browser.provider_drive_epoch_offered" {
+				detail, _ := event["detail"].(map[string]any)
+				if intDetail(detail, "ordinal") == 1 {
+					t.Fatalf("non-holder result minted successor: %#v", event)
+				}
+			}
+		}
+	})
+
+	t.Run("featureless non-holder cannot settle", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		effectPermitHolder(t, b)
+		id := park(t, jobs, "permit-nonholder-featureless", handoffWork())
+		attempt := "permit-nonholder-featureless-attempt"
+		effectPermitOffer(t, jobs, id, attempt, "domain-nonholder-featureless")
+		if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{
+			DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
+		}); err != nil || permitOutcome(t, frames) != "started" {
+			t.Fatalf("start err=%v frames=%v", err, frames)
+		}
+		permit, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{
+			JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0,
+			Strategy: "generic", Revision: "1",
+		})
+		if err != nil || permit == nil {
+			t.Fatalf("permit=%+v err=%v", permit, err)
+		}
+		const pending = "permit-featureless-session-0000000000000000001"
+		runSyncAs(t, b, pending, helloAs("0.14.0"))
+		msgs, _ := runSyncAs(t, b, pending, inFrame(t, protocol.MsgProviderDriveEpochResultRequest, id, map[string]any{
+			"drive_attempt_id": attempt, "ordinal": 0, "strategy": "generic", "revision": "1", "outcome": "not_pdf",
+		}))
+		errFrame := firstOfType(msgs, protocol.MsgError)
+		if errFrame == nil || errFrame.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+			t.Fatalf("featureless non-holder result=%v, want session_busy", msgs)
+		}
+		got, err := jobs.GetEffectPermit(context.Background(), permit.ID)
+		if err != nil || got == nil || got.Status != job.EffectPermitHeld {
+			t.Fatalf("featureless non-holder mutated permit=%+v err=%v", got, err)
+		}
+	})
+}
+
+func TestProviderDriveStartRejectsSafetyDomainMismatch(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "permit-domain-mismatch", handoffWork())
+	effectPermitOffer(t, jobs, id, "permit-domain-attempt", "domain-authorized")
+	ok, err := b.providerDriveEpochAuthorized(context.Background(), id, "domain-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("provider start authorization accepted a mismatched safety domain")
+	}
+}
+
+func TestLegacyDirectGetResultSettlesExactBlockerOnlyAndReopensAdmission(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkWithProviderEvidence(t, jobs, "legacy-direct-cleanup", handoffWork(), "onlinelibrary.wiley.com")
+	const attempt = "legacy-direct-attempt"
+	const revision = "legacy-direct/revision"
+	if err := jobs.RecordEvent(ctx, jobID, "browser.direct_route", map[string]any{
+		"phase": "offered", "drive_attempt_id": attempt, "ordinal": int64(0),
+		"route_revision": revision, "safety_domain": "route:legacy-direct",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.ImportLegacyStartedEpochs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := jobs.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || count != 1 {
+		t.Fatalf("imported direct blockers=%d err=%v, want one", count, err)
+	}
+	// Importing the blocker fences the first admission globally.
+	initial, _ := runSync(t, b, helloWithFeatures(t, "0.14.0", providerDirectGetV1Feature, effectPermitFeature))
+	if firstOfType(initial, protocol.MsgProviderDirectGetRequest) != nil {
+		t.Fatalf("legacy blocker did not fence initial direct admission: %v", initial)
+	}
+	before, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := &protocol.ProviderDirectGetResultPayload{
+		DriveAttemptID: attempt, Ordinal: 0, RouteRevision: "wrong/revision",
+		Outcome: "not_pdf", LandingClass: "html",
+	}
+	if err := b.providerDirectGetResult(ctx, jobID, wrong); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := jobs.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || count != 1 {
+		t.Fatalf("wrong direct tuple blockers=%d err=%v, want unresolved one", count, err)
+	}
+	exact := &protocol.ProviderDirectGetResultPayload{
+		DriveAttemptID: attempt, Ordinal: 0, RouteRevision: revision,
+		Outcome: "not_pdf", LandingClass: "html",
+	}
+	if err := b.providerDirectGetResult(ctx, jobID, exact); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := jobs.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || count != 0 {
+		t.Fatalf("exact direct tuple blockers=%d err=%v, want zero", count, err)
+	}
+	after, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("cleanup-only direct result appended job events: before=%d after=%d", len(before), len(after))
+	}
+	reopened, _ := runSync(t, b)
+	if firstOfType(reopened, protocol.MsgProviderDirectGetRequest) == nil {
+		t.Fatalf("fresh direct admission did not reopen after blocker settlement: %v", reopened)
+	}
+}
+
+func TestLegacyInstitutionalNavigatedSettlesExactBlockerOnlyAndReopensAdmission(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	jobID := parkInstitutional(t, jobs, "legacy-institutional-cleanup", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "legacy-institution-digest", AuthenticationClaimID: "legacy-institution-auth",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	profile := profiles[0]
+	candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "legacy-institution-candidate", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "legacy-institution-safety", SafetyDomainID: "institution:legacy",
+		AdapterRevision: "legacy-adapter", EffectContractID: "legacy-effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profile.Revision, 7); err != nil {
+		t.Fatal(err)
+	}
+	effectOrdinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, int64(b.epoch), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effectOrdinal < 1 {
+		t.Fatalf("issued effect ordinal=%d, want positive", effectOrdinal)
+	}
+	if err := jobs.ImportLegacyStartedEpochs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := jobs.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || count != 1 {
+		t.Fatalf("imported institutional blockers=%d err=%v, want one", count, err)
+	}
+	beforeEvents, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeClaim, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongFrames, err := b.institutionalNavigated(ctx, jobID, &protocol.InstitutionalNavigatedRequestPayload{
+		RequestID: "legacy-institution-wrong", ClaimID: claim.ID, BindingID: claim.BindingID,
+		RouteIssuanceOrdinal: 1, EffectOrdinal: effectOrdinal + 1,
+		InstitutionalRequestID: "legacy-institution-request", TabID: 7,
+	})
+	if err != nil || len(wrongFrames) != 1 {
+		t.Fatalf("wrong institutional navigation frames=%d err=%v", len(wrongFrames), err)
+	}
+	if count, err := jobs.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || count != 1 {
+		t.Fatalf("wrong institutional tuple blockers=%d err=%v, want unresolved one", count, err)
+	}
+	frames, err := b.institutionalNavigated(ctx, jobID, &protocol.InstitutionalNavigatedRequestPayload{
+		RequestID: "legacy-institution-exact", ClaimID: claim.ID, BindingID: claim.BindingID,
+		RouteIssuanceOrdinal: 1, EffectOrdinal: effectOrdinal,
+		InstitutionalRequestID: "legacy-institution-request", TabID: 7,
+	})
+	if err != nil || len(frames) != 1 {
+		t.Fatalf("exact institutional navigation frames=%d err=%v", len(frames), err)
+	}
+	response, err := protocol.DecodeBrowserMessage(frames[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	navigated := response.Payload.(*protocol.InstitutionalNavigatedResponsePayload)
+	if navigated.Outcome != "stale" || navigated.Detail != "navigation was settled as historical cleanup" {
+		t.Fatalf("legacy institutional response=%+v, want cleanup-only stale", navigated)
+	}
+	if count, err := jobs.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || count != 0 {
+		t.Fatalf("exact institutional tuple blockers=%d err=%v, want zero", count, err)
+	}
+	afterEvents, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterEvents) != len(beforeEvents) {
+		t.Fatalf("cleanup-only institutional result appended job events: before=%d after=%d", len(beforeEvents), len(afterEvents))
+	}
+	current, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(current, beforeClaim) {
+		t.Fatalf("legacy cleanup mutated current claim: before=%+v after=%+v", beforeClaim, current)
+	}
+
+	// A distinct fresh claim can acquire the now-free institutional effect lane.
+	freshCandidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "legacy-institution-fresh-candidate", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 2, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "legacy-institution-fresh-safety", SafetyDomainID: "institution:fresh",
+		AdapterRevision: "legacy-adapter", EffectContractID: "legacy-effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshClaim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: freshCandidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
+		RouteRevision: 2, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.BindMaterialization(ctx, freshClaim.ID, freshClaim.BindingID, int64(b.epoch), profile.Revision, 8); err != nil {
+		t.Fatal(err)
+	}
+	freshFrames, err := b.institutionalRoute(ctx, jobID, &protocol.InstitutionalRouteRequestPayload{
+		RequestID: "legacy-institution-fresh-route", ClaimID: freshClaim.ID, BindingID: freshClaim.BindingID,
+		InstitutionalRequestID: "legacy-institution-fresh-request",
+	})
+	if err != nil || len(freshFrames) != 1 {
+		t.Fatalf("fresh institutional route frames=%d err=%v", len(freshFrames), err)
+	}
+	freshMsg, err := protocol.DecodeBrowserMessage(freshFrames[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshRoute := freshMsg.Payload.(*protocol.InstitutionalRouteResponsePayload)
+	if freshRoute.Outcome != "issued" {
+		t.Fatalf("fresh institutional admission outcome=%q detail=%q", freshRoute.Outcome, freshRoute.Detail)
+	}
+}
+
+func TestLegacyInstitutionalNavigatedWireUsesPrePermitNegotiation(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "legacy-institution-wire", handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "legacy-wire-digest", AuthenticationClaimID: "legacy-wire-auth",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "legacy-wire-candidate", JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "legacy-wire-safety", SafetyDomainID: "institution:legacy-wire",
+		AdapterRevision: "legacy-wire-adapter", EffectContractID: "legacy-wire-effect", Status: "eligible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: candidate.ID, BrowserHolderGeneration: int64(b.epoch),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, int64(b.epoch), profiles[0].Revision, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, int64(b.epoch), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.ImportLegacyStartedEpochs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	legacyHello := inFrame(t, protocol.MsgHello, "", map[string]any{
+		"extension_version": "0.10.0",
+		"features":          []string{institutionalMaterializationFeature},
+	})
+	legacyNavigation := inFrame(t, protocol.MsgInstitutionalNavigatedRequest, jobID,
+		map[string]any{
+			"request_id":             "legacy-wire-request",
+			"claim_id":               claim.ID,
+			"binding_id":             claim.BindingID,
+			"route_issuance_ordinal": 1,
+			"tab_id":                 7,
+		})
+	messages, _ := runSyncAs(t, b, testSessionID, legacyHello, legacyNavigation)
+	var response *protocol.InstitutionalNavigatedResponsePayload
+	for _, msg := range messages {
+		if msg.Type == protocol.MsgInstitutionalNavigatedResponse {
+			response = msg.Payload.(*protocol.InstitutionalNavigatedResponsePayload)
+		}
+	}
+	if response == nil || response.Outcome != "stale" {
+		t.Fatalf("legacy navigation response=%+v, want cleanup-only stale", response)
+	}
+	if count, err := jobs.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || count != 0 {
+		t.Fatalf("legacy wire blocker count=%d err=%v, want zero", count, err)
+	}
+}
+
+func TestLegacyInstitutionalPeerRejectsCurrentPermitTuple(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	legacyHello := inFrame(t, protocol.MsgHello, "", map[string]any{
+		"extension_version": "0.10.0",
+		"features":          []string{institutionalMaterializationFeature},
+	})
+	runSyncAs(t, b, testSessionID, legacyHello)
+	currentNavigation := inFrame(t, protocol.MsgInstitutionalNavigatedRequest, "job-inst-current-shape",
+		map[string]any{
+			"request_id":               "legacy-current-shape-request",
+			"claim_id":                 "legacy-current-shape-claim",
+			"binding_id":               "legacy-current-shape-binding",
+			"route_issuance_ordinal":   1,
+			"effect_ordinal":           1,
+			"institutional_request_id": "legacy-current-effect-request",
+			"tab_id":                   7,
+		})
+	if _, err := b.Sync(context.Background(), testSessionID, false,
+		[]json.RawMessage{currentNavigation}); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("legacy peer current-shaped result err=%v, want invalid frame", err)
 	}
 }

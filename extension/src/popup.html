@@ -25,6 +25,13 @@
         --color-warning: #6d4316;
         --color-warning-border: #a15c17;
         --color-warning-surface: #fff7ed;
+        --color-ok: #245e45;
+        --color-ok-border: #78aa8f;
+        --color-ok-surface: #edf7f1;
+        --color-danger: #8f2f28;
+        --color-danger-border: #d94f3d;
+        --color-danger-surface: #fff0ed;
+        --color-neutral-badge: #eef3f6;
         --color-primary-solid: #12549b;
         --color-primary-solid-hover: #0d447f;
         --color-on-primary: #fdfefe;
@@ -43,14 +50,25 @@
         --radius-card: 8px;
         --radius-pill: 999px;
         --control-height: 36px;
-        --action-height: 44px;
+        /* Compact minimum block size for every popup control. The popup is a
+           380px lens, so its actions stay 32px; the old 44px --action-height
+           made one button dominate the surface it was meant to sit inside. */
+        --control-height-compact: 32px;
         --inbox-row-height: 80px;
         --brand-mark-size: 32px;
         --settings-mark-size: 18px;
         --popup-width: 380px;
         --focus-width: 2px;
         --focus-offset: 2px;
-        --transition-fast: 140ms ease-out;
+        /* Motion is scoped by role, not by taste: hover tints controls, state
+           moves locally initiated inline feedback, and feedback-in/out belongs
+           only to the transient acknowledgements. Nothing polled animates. */
+        --motion-hover: 120ms;
+        --motion-state: 160ms;
+        --motion-feedback-in: 180ms;
+        --motion-feedback-out: 140ms;
+        --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+        --ease-in-quart: cubic-bezier(0.5, 0, 0.75, 0);
         accent-color: var(--color-primary);
         color: var(--color-ink);
         font-family:
@@ -77,6 +95,13 @@
           --color-warning: #f1c183;
           --color-warning-border: #b97833;
           --color-warning-surface: #33291e;
+          --color-ok: #b3ddc2;
+          --color-ok-border: #568f6d;
+          --color-ok-surface: #1d3329;
+          --color-danger: #ffb2a8;
+          --color-danger-border: #ef6a57;
+          --color-danger-surface: #3a2223;
+          --color-neutral-badge: #263340;
           --color-primary-solid: #75b5f5;
           --color-primary-solid-hover: #91c5fb;
           --color-on-primary: #101a24;
@@ -167,13 +192,13 @@
         color: var(--color-ink);
         cursor: pointer;
         font-size: var(--font-size-small);
-        min-height: var(--control-height);
+        min-height: var(--control-height-compact);
         padding: var(--space-1) var(--space-3);
         white-space: nowrap;
         transition:
-          background-color var(--transition-fast),
-          border-color var(--transition-fast),
-          color var(--transition-fast);
+          background-color var(--motion-hover) var(--ease-out-quart),
+          border-color var(--motion-hover) var(--ease-out-quart),
+          color var(--motion-hover) var(--ease-out-quart);
       }
 
       button:hover:not(:disabled) {
@@ -202,7 +227,8 @@
         flex: none;
         justify-content: center;
         padding: 0;
-        width: var(--control-height);
+        min-height: var(--control-height-compact);
+        width: var(--control-height-compact);
       }
 
       .settings-btn:hover:not(:disabled) {
@@ -276,13 +302,72 @@
         padding: var(--space-3);
       }
 
-      .page-acquire-feedback {
+      /* One rail owns every current-page action, so Acquire/Send PDF and bulk
+         selection are read as siblings instead of one living in the brand
+         header and one in a card further down. */
+      .current-page-actions {
         background: var(--color-surface);
         border: 1px solid var(--color-border);
         border-radius: var(--radius-card);
         display: grid;
         gap: var(--space-2);
+        min-width: 0;
+        padding: var(--space-3);
+      }
+
+      /* Collapsed entirely when the rail owns nothing: an empty grid cell would
+         still contribute its gap and leave a visible sliver of card. */
+      .current-page-actions[hidden] {
+        display: none;
+      }
+
+      .current-page-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+      }
+
+      .current-page-controls > button {
+        flex: 1 1 10rem;
+        min-width: 0;
+      }
+
+      .current-page-controls > button[hidden] {
+        display: none;
+      }
+
+      .page-acquire-feedback {
+        display: grid;
+        gap: var(--space-2);
+        min-width: 0;
+      }
+
+      /* ADR-0019 Decision 2's consent decision, inline and local: it is a
+         researcher action, so it is primary-toned, and it never looks like an
+         error even though it blocks the scan. */
+      .page-consent {
+        border: 1px solid var(--color-primary-border);
+        border-radius: var(--radius-control);
+        background: var(--color-primary-surface);
+        display: grid;
+        gap: var(--space-2);
         padding: var(--space-2) var(--space-3);
+      }
+
+      .page-consent-message {
+        color: var(--color-primary);
+        font-size: var(--font-size-small);
+        overflow-wrap: anywhere;
+      }
+
+      .page-consent-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+      }
+
+      .page-consent-controls > button {
+        flex: 1 1 8rem;
       }
 
       .page-acquire-live {
@@ -320,6 +405,73 @@
 
       .page-acquire-live-controls button {
         flex: 1 1 8rem;
+      }
+
+      /* Every popup-local result has one geometry and one semantic border, so
+         a queue acceptance, a refusal, and a transport failure differ by
+         meaning rather than by shape. Hidden means zero height: no reserved
+         pixels while empty. */
+      .popup-result {
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-control);
+        color: var(--color-ink);
+        font-size: var(--font-size-small);
+        overflow-wrap: anywhere;
+        padding: var(--space-2) var(--space-3);
+        transition:
+          background-color var(--motion-state) var(--ease-out-quart),
+          border-color var(--motion-state) var(--ease-out-quart),
+          color var(--motion-state) var(--ease-out-quart);
+        width: 100%;
+      }
+
+      .popup-result:empty,
+      .popup-result[hidden] {
+        display: none;
+      }
+
+      .popup-result[data-tone="progress"] {
+        background: var(--color-neutral-badge);
+        border-color: var(--color-border);
+        color: var(--color-context);
+      }
+
+      .popup-result[data-tone="success"] {
+        background: var(--color-ok-surface);
+        border-color: var(--color-ok-border);
+        color: var(--color-ok);
+      }
+
+      .popup-result[data-tone="info"] {
+        background: var(--color-primary-surface);
+        border-color: var(--color-primary-border);
+        color: var(--color-primary);
+      }
+
+      .popup-result[data-tone="degraded"] {
+        background: var(--color-warning-surface);
+        border-color: var(--color-warning-border);
+        color: var(--color-warning);
+      }
+
+      .popup-result[data-tone="error"] {
+        background: var(--color-danger-surface);
+        border-color: var(--color-danger-border);
+        color: var(--color-danger);
+      }
+
+      /* The stable operation announcer carries no pixels; it exists so a state
+         transition is spoken exactly once without every local result element
+         becoming its own live region. */
+      .visually-hidden {
+        border: 0;
+        clip-path: inset(50%);
+        height: 1px;
+        overflow: hidden;
+        padding: 0;
+        position: absolute;
+        white-space: nowrap;
+        width: 1px;
       }
 
       .capture-status {
@@ -369,13 +521,6 @@
         gap: var(--space-1);
       }
 
-      .header-acquire {
-        font-size: var(--font-size-small);
-        font-weight: 700;
-        min-height: 0;
-        padding: var(--space-1) var(--space-2);
-        width: auto;
-      }
 
       .resolver-grant,
       .terms-consent,
@@ -508,42 +653,53 @@
       .terms-consent > p {
         font-size: var(--font-size-small);
       }
-      .resolver-grant > button.primary {
-        min-height: var(--action-height);
-        width: 100%;
+      /* No full-width 44px exception: a grant is one ordinary researcher
+         control, and wrapping at 320px keeps it from becoming the largest
+         object in a 380px lens. */
+      .resolver-grant-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+      }
+
+      .resolver-grant-controls > button {
+        flex: 1 1 9rem;
       }
 
 
+      /* Terms acceptance and the Needs-you blockers are decisions waiting on
+         the researcher, not warnings about papio's health, so they carry the
+         actionable palette. Amber stays for degradation, red for integrity. */
       .terms-consent {
-        background: var(--color-warning-surface);
-        border-color: var(--color-warning-border);
-        color: var(--color-warning);
+        background: var(--color-primary-surface);
+        border-color: var(--color-primary-border);
+        color: var(--color-primary);
       }
 
       .terms-consent h2 {
-        color: var(--color-warning);
+        color: var(--color-primary);
       }
 
       .terms-consent-controls {
-        display: grid;
+        display: flex;
+        flex-wrap: wrap;
         gap: var(--space-2);
-        grid-template-columns: repeat(2, minmax(0, 1fr));
         margin-top: var(--space-1);
       }
 
       .terms-consent-controls button {
-        min-height: var(--action-height);
+        flex: 1 1 9rem;
         padding-inline: var(--space-2);
       }
 
       .needs-you {
-        background: var(--color-warning-surface);
-        border-color: var(--color-warning-border);
-        color: var(--color-warning);
+        background: var(--color-primary-surface);
+        border-color: var(--color-primary-border);
+        color: var(--color-primary);
       }
 
       .needs-you h2 {
-        color: var(--color-warning);
+        color: var(--color-primary);
       }
 
       .needs-you > p {
@@ -557,7 +713,7 @@
 
       .needs-you-item {
         align-items: center;
-        border-top: 1px solid var(--color-warning-border);
+        border-top: 1px solid var(--color-primary-border);
         display: grid;
         gap: var(--space-2);
         grid-template-columns: minmax(0, 1fr) auto;
@@ -576,14 +732,14 @@
       }
 
       .needs-you-reason {
-        color: var(--color-warning);
+        color: var(--color-primary);
         font-size: var(--font-size-small);
         overflow-wrap: anywhere;
       }
 
       .needs-you-item > button {
-        border-color: var(--color-warning-border);
-        color: var(--color-warning);
+        border-color: var(--color-primary-border);
+        color: var(--color-primary);
         font-weight: 700;
       }
 
@@ -642,51 +798,33 @@
         justify-self: start;
       }
 
+      /* One measured line, not a metric grid. papio counts; it never estimates
+         time saved, an ETA, or acquisition progress. */
       .impact {
+        align-items: baseline;
         background: var(--color-surface);
         border: 1px solid var(--color-border);
         border-radius: var(--radius-card);
-        display: grid;
-        gap: var(--space-2);
-        padding: var(--space-3);
-      }
-
-      .impact-header {
-        align-items: baseline;
         display: flex;
+        flex-wrap: wrap;
         gap: var(--space-2);
         justify-content: space-between;
+        padding: var(--space-2) var(--space-3);
       }
 
-      .impact-header > h2 {
+      .impact-line {
         color: var(--color-muted);
-        font-size: var(--font-size-label);
-        font-weight: 700;
-        letter-spacing: 0.07em;
-        text-transform: uppercase;
-      }
-
-      .impact-metrics {
-        display: grid;
-        gap: var(--space-2);
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        margin: 0;
-      }
-
-      .impact-metric dt {
-        color: var(--color-muted);
-        font-size: var(--font-size-label);
-      }
-
-      .impact-metric dd {
-        color: var(--color-brand-ink);
-        font-size: var(--font-size-item-title);
+        font-size: var(--font-size-small);
         font-variant-numeric: tabular-nums;
-        font-weight: 700;
-        margin: 0;
+        min-width: 0;
+        overflow-wrap: anywhere;
       }
 
-      .impact-header > button {
+      .impact-line > strong {
+        color: var(--color-brand-ink);
+      }
+
+      #view-history-btn {
         background: transparent;
         border-color: transparent;
         color: var(--color-primary);
@@ -695,18 +833,28 @@
         padding: 0;
       }
 
-      .impact-header > button:hover:not(:disabled) {
+      #view-history-btn:hover:not(:disabled) {
         background: transparent;
         color: var(--color-primary-solid-hover);
         text-decoration: underline;
       }
-
 
       @media (prefers-reduced-motion: reduce) {
         *,
         *::before,
         *::after {
           transition-duration: 0.01ms !important;
+          transition-delay: 0ms !important;
+          animation-duration: 0.01ms !important;
+          animation-delay: 0ms !important;
+        }
+
+        /* Every translation is removed rather than merely shortened: a 0.01ms
+           transform still lands the element in its animated position for one
+           frame, which is exactly the motion this preference refuses. */
+        .institution-session-unblocked,
+        .popup-result {
+          transform: none !important;
         }
       }
     </style>
@@ -725,17 +873,6 @@
         <span class="brand-name"><em>papio</em></span>
       </div>
       <div class="header-actions">
-        <button
-          id="page-acquire-btn"
-          class="primary header-acquire"
-          type="button"
-          title="Acquire this page"
-          aria-label="Acquire this page"
-          aria-describedby="page-acquire-status"
-          aria-disabled="true"
-          disabled
-          hidden
-        >Acquire</button>
         <button id="open-inbox-btn" class="settings-btn" type="button" title="Open inbox" aria-label="Open inbox" aria-describedby="open-inbox-status">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/>
@@ -754,37 +891,68 @@
       <div id="daemon-status-message" class="daemon-status-message"></div>
       <div id="daemon-status-hint" class="daemon-status-hint"></div>
     </div>
-    <div id="open-inbox-status" class="capture-status" aria-live="polite"></div>
+    <div id="open-inbox-status" class="capture-status"></div>
     <section id="popup-pulse" class="popup-pulse" aria-labelledby="popup-pulse-primary">
       <div id="popup-pulse-primary" class="popup-pulse-primary" role="status" aria-live="polite">Can't tell — live progress is unavailable</div>
-      <div id="popup-pulse-buckets" class="popup-pulse-detail" hidden></div>
       <div id="popup-pulse-next" class="popup-pulse-detail" hidden></div>
       <div id="popup-pulse-capacity" class="popup-pulse-detail" hidden></div>
       <div id="popup-pulse-batch" class="popup-pulse-detail" hidden></div>
     </section>
     <main>
-      <section class="launcher" aria-label="Paper actions">
+      <!-- One stable announcer for locally initiated operations. Local result
+           elements below stay visible beside their controls but carry no live
+           role, so an ordinary five-second refresh cannot re-speak state the
+           researcher already heard. The daemon band and pulse keep their own
+           separate liveness. -->
+      <p id="popup-operation-status" class="visually-hidden" role="status" aria-live="polite"></p>
+
+      <!-- The current-page rail: the popup's reason to exist. Both actions are
+           siblings here so neither hides in the brand header, and the blocker
+           groups below it are capped so none of them can push it off screen. -->
+      <section id="current-page-actions" class="current-page-actions" aria-label="This page" hidden>
+        <div class="current-page-controls">
+          <button
+            id="page-acquire-btn"
+            class="primary"
+            type="button"
+            title="Acquire this page"
+            aria-label="Acquire this page"
+            aria-describedby="page-acquire-status"
+            aria-disabled="true"
+            disabled
+            hidden
+          >Acquire</button>
+          <button
+            id="page-bulk-scan-btn"
+            class="ghost"
+            type="button"
+            aria-describedby="page-bulk-scan-status"
+            hidden
+          >Select papers on this page</button>
+        </div>
+        <div id="page-bulk-consent" class="page-consent" hidden>
+          <p id="page-bulk-consent-message" class="page-consent-message"></p>
+          <div class="page-consent-controls">
+            <button id="page-bulk-consent-allow" class="primary" type="button" aria-describedby="page-bulk-consent-message">Allow and scan</button>
+            <button id="page-bulk-consent-cancel" type="button">Cancel</button>
+          </div>
+        </div>
+        <p id="page-bulk-scan-status" class="popup-result" hidden></p>
         <div id="page-acquire" class="page-acquire-feedback" hidden>
-          <div id="page-acquire-status" class="capture-status" role="status" aria-live="polite"></div>
-          <div id="page-acquire-live" class="page-acquire-live" role="status" aria-live="polite" hidden>
+          <div id="page-acquire-status" class="popup-result" hidden></div>
+          <div id="page-acquire-live" class="page-acquire-live" hidden>
             <p id="page-acquire-live-title" class="page-acquire-live-title" hidden></p>
             <p id="page-acquire-live-status" class="page-acquire-live-status"></p>
             <div class="page-acquire-live-controls">
               <button id="page-acquire-open-inbox" class="ghost" type="button">Open inbox item</button>
-              <button id="page-acquire-go-tab" class="ghost" type="button" hidden>Go to tab</button>
+              <button id="page-acquire-go-tab" class="ghost" type="button" hidden>Open tab</button>
             </div>
           </div>
         </div>
       </section>
 
-      <section class="launcher-action page-bulk-scan" aria-label="Bulk selection">
-        <div class="action-row page-bulk-scan-row">
-          <button id="page-bulk-scan-btn" class="ghost" type="button" aria-describedby="page-bulk-scan-status">Select papers on this page</button>
-        </div>
-        <p id="page-bulk-scan-status" class="capture-status" role="status" aria-live="polite"></p>
-      </section>
       <section id="needs-you-section" class="needs-you" hidden aria-labelledby="needs-you-heading">
-        <h2 id="needs-you-heading">Needs your attention</h2>
+        <h2 id="needs-you-heading">Needs you</h2>
         <p id="needs-you-message"></p>
         <div id="needs-you-list" class="needs-you-list"></div>
       </section>
@@ -795,7 +963,7 @@
           <span id="institution-session-origin" class="institution-session-origin"></span>
         </div>
         <div class="action-row institution-session-row">
-          <p id="institution-session-status" class="institution-session-status" role="status" aria-live="polite"></p>
+          <p id="institution-session-status" class="institution-session-status"></p>
           <button id="institution-session-signin" class="primary" type="button" aria-describedby="institution-session-status">Sign in</button>
         </div>
         <div id="institution-session-rows" class="institution-session-rows" hidden></div>
@@ -803,6 +971,9 @@
           <p id="institution-session-waiting-heading" class="institution-session-waiting-heading">Waiting on your sign-in</p>
           <div id="institution-session-waiting-list" class="institution-session-waiting-list"></div>
         </div>
+        <!-- Keeps its own live role: this announces a daemon-side release the
+             researcher did not initiate, so the local operation announcer is not
+             its owner. -->
         <div id="institution-session-unblocked" class="institution-session-unblocked" role="status" aria-live="polite" hidden></div>
       </section>
 
@@ -813,42 +984,29 @@
           <button id="leftover-tabs-cleanup" type="button">Close them</button>
         </div>
       </section>
+
       <section id="popup-catchup" class="popup-pulse" hidden aria-label="While you were away">
         <div id="popup-catchup-text" class="popup-pulse-detail"></div>
         <button id="popup-catchup-open" class="ghost" type="button">Open inbox</button>
       </section>
 
-
-      <section id="impact-summary" class="impact" hidden aria-label="Your papio impact">
-        <div id="impact-header" class="impact-header">
-          <h2>Your <em>papio</em> impact</h2>
-          <button id="view-history-btn" type="button">View history →</button>
-        </div>
-        <dl class="impact-metrics">
-          <div class="impact-metric">
-            <dt>Papers acquired</dt>
-            <dd id="impact-acquired">—</dd>
-          </div>
-          <div class="impact-metric">
-            <dt>Success rate</dt>
-            <dd id="impact-success-rate">—</dd>
-          </div>
-        </dl>
-      </section>
       <section id="resolver-grant" class="resolver-grant" hidden></section>
 
       <section id="terms-consent" class="terms-consent" hidden>
         <h2>Publisher terms &amp; conditions</h2>
         <p>
-          A publisher requires accepting its terms &amp; conditions before the
-          download. <em>papio</em> can accept these for you automatically on future
-          downloads — this means <em>papio</em> will agree to each publisher's terms on
-          your behalf. You can change this anytime in Options.
+          This publisher requires terms acceptance. Let <em>papio</em> accept future
+          publisher terms for you? You can change this in Settings.
         </p>
         <div class="terms-consent-controls">
           <button id="terms-consent-enable" class="primary" type="button">Auto-accept terms</button>
           <button id="terms-consent-decline" type="button">I'll accept manually</button>
         </div>
+      </section>
+
+      <section id="impact-summary" class="impact" hidden aria-label="Your papio impact">
+        <p class="impact-line"><strong id="impact-acquired">—</strong> acquired · <strong id="impact-success-rate">—</strong> success</p>
+        <button id="view-history-btn" type="button">View history</button>
       </section>
 
       <details class="capture" hidden>

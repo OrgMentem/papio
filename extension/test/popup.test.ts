@@ -41,7 +41,20 @@ import {
   wireHistoryLauncher,
   wireInboxLauncher,
   wirePrimaryShortcut,
+  wirePageBulkScanLauncher,
   wireSettings,
+  startPageBulkScan,
+  acknowledgeInPage,
+  renderInPageAcknowledgement,
+  announcePopupOperation,
+  beginPopupOperation,
+  finishPopupOperation,
+  popupOperation,
+  prunePopupOperations,
+  PAGE_BULK_SCAN_MESSAGE,
+  PAGE_CHANGED_MESSAGE,
+  type InPageAcknowledgementKind,
+  type PageActionBinding,
   renderLeftoverTabs,
   SESSION_PROBE_MESSAGE,
   SESSION_STATE_MESSAGE,
@@ -146,8 +159,13 @@ test("uses counts-v3 turns for decisions while labelling pulse buckets as nonter
   expect(display.buckets).toContain("0 stalled");
   const doc = popupDocument();
   renderWorkPulse(doc, cache, "connected", Date.now(), counts);
+  // The popup prints the primary line, not the five-bucket inventory. Waiting on
+  // you already owns the turn, so the companion adds nothing here.
   expect(doc.getElementById("popup-pulse-primary")?.textContent).toBe("Waiting on you · 35 decisions");
-  expect(doc.getElementById("popup-pulse-buckets")?.textContent).toContain("Nonterminal breakdown");
+  expect(doc.getElementById("popup-pulse-buckets")).toBeNull();
+  // Full validated measurements stay reachable without occupying a line.
+  expect(doc.getElementById("popup-pulse")?.getAttribute("title")).toContain("Nonterminal breakdown");
+  expect(doc.getElementById("popup-pulse")?.dataset.state).toBe("Waiting on you");
 });
 
 test("uses an honest pending-items label when counts-v3 is unavailable", () => {
@@ -246,30 +264,73 @@ test("renders active batch companion facts and disconnected copy", () => {
   expect(doc.getElementById("popup-pulse-primary")?.textContent).toBe("Can't tell — daemon disconnected");
 });
 
-test("places the acquire icon before inbox and keeps idle feedback hidden", () => {
+test("puts every current-page action in one rail, in the accepted hierarchy", () => {
   const doc = popupDocument();
-  const launcher = doc.querySelector(".launcher");
-  const headerActions = doc.querySelector(".header-actions");
 
   expect(doc.querySelector("h1")).toBeNull();
-  expect(launcher?.querySelectorAll(".launcher-action")).toHaveLength(0);
-  expect(launcher?.querySelector("h2")).toBeNull();
+  // Acquire is no longer a header utility: the header owns only inbox and
+  // settings, and both page actions are siblings in the rail.
+  const headerActions = doc.querySelector(".header-actions");
+  expect(Array.from(headerActions?.children ?? []).map((child) => child.id)).toEqual([
+    "open-inbox-btn",
+    "settings-btn",
+  ]);
+  expect(doc.getElementById("page-acquire-btn")?.closest("header")).toBeNull();
+  const rail = doc.getElementById("current-page-actions");
+  expect(doc.getElementById("page-acquire-btn")?.closest("#current-page-actions")).toBe(rail);
+  expect(doc.getElementById("page-bulk-scan-btn")?.closest("#current-page-actions")).toBe(rail);
+  expect(doc.getElementById("page-acquire-status")?.closest("#current-page-actions")).toBe(rail);
+  expect(doc.getElementById("page-bulk-scan-status")?.closest("#current-page-actions")).toBe(rail);
+  expect(doc.getElementById("page-acquire-live")?.closest("#current-page-actions")).toBe(rail);
+  // The standalone page-bulk card is gone.
+  expect(doc.querySelector(".page-bulk-scan")).toBeNull();
+
+  // Exact visible/DOM order of the popup's own sections.
+  const order = Array.from(doc.querySelectorAll("main > section, main > details")).map(
+    (node) => node.id || node.className,
+  );
+  expect(order).toEqual([
+    "current-page-actions",
+    "needs-you-section",
+    "institution-session",
+    "leftover-tabs",
+    "popup-catchup",
+    "resolver-grant",
+    "terms-consent",
+    "impact-summary",
+    "capture",
+  ]);
+  // The global pulse still precedes the rail, and the abnormal daemon band
+  // precedes both.
+  const beforeMain = Array.from(doc.body.children).map((node) => node.id || node.tagName.toLowerCase());
+  expect(beforeMain.indexOf("daemon-status")).toBeLessThan(beforeMain.indexOf("popup-pulse"));
+  expect(beforeMain.indexOf("popup-pulse")).toBeLessThan(beforeMain.indexOf("main"));
+
+  // Nothing in the rail reserves pixels while empty.
+  expect(rail?.hidden).toBe(true);
   expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
+  expect(doc.getElementById("page-acquire-btn")?.hidden).toBe(true);
+  expect(doc.getElementById("page-bulk-scan-btn")?.hidden).toBe(true);
+  expect(doc.getElementById("page-bulk-consent")?.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-doi")).toBeNull();
   expect(doc.getElementById("page-acquire-context")).toBeNull();
-  expect(headerActions?.children[0]?.id).toBe("page-acquire-btn");
-  expect(headerActions?.children[1]?.id).toBe("open-inbox-btn");
-  expect(doc.getElementById("page-acquire-btn")?.closest("header")).not.toBeNull();
+  expect(doc.getElementById("daemon-footer")).toBeNull();
   expect(doc.getElementById("page-acquire-btn")?.querySelector("svg")).toBeNull();
   expect(doc.getElementById("page-acquire-btn")?.textContent).toBe("Acquire");
   expect(doc.getElementById("page-acquire-btn")?.classList.contains("primary")).toBe(true);
-  expect(doc.getElementById("page-acquire-btn")?.hidden).toBe(true);
-  expect(doc.getElementById("daemon-footer")).toBeNull();
   expect(doc.getElementById("open-inbox-btn")?.getAttribute("aria-label")).toBe("Open inbox");
-  expect(doc.getElementById("needs-you-section")).not.toBeNull();
   expect(doc.getElementById("needs-you-section")?.hidden).toBe(true);
-  expect(doc.getElementById("terms-consent")).not.toBeNull();
-  expect(doc.getElementById("resolver-grant")).not.toBeNull();
+
+  // One stable announcer; local results carry no live role of their own.
+  const announcer = doc.getElementById("popup-operation-status");
+  expect(announcer?.getAttribute("role")).toBe("status");
+  expect(announcer?.getAttribute("aria-live")).toBe("polite");
+  for (const id of ["page-acquire-status", "page-bulk-scan-status", "page-acquire-live", "open-inbox-status"]) {
+    expect(doc.getElementById(id)?.getAttribute("aria-live")).toBeNull();
+  }
+  // The daemon band and pulse keep their separate liveness responsibility.
+  expect(doc.getElementById("daemon-status")?.getAttribute("aria-live")).toBe("polite");
+  expect(doc.getElementById("popup-pulse-primary")?.getAttribute("aria-live")).toBe("polite");
 });
 
 test("capture selects offer every registered provider and scenario", () => {
@@ -465,7 +526,7 @@ test("shows the DOI acquire icon with its tooltip even without a negotiated daem
     calls += 1;
     throw new Error("papio daemon isn't reachable");
   });
-  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example" }, []);
+  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example", tab_id: 1, tab_url: "https://doi.org/10.1000/example" }, []);
 
   const section = doc.getElementById("page-acquire");
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
@@ -488,7 +549,7 @@ test("shows the DOI acquire icon with its tooltip even without a negotiated daem
 test("keeps a successfully queued acquisition disabled", async () => {
   const doc = popupDocument();
   renderPageAcquire(doc, async () => ({ job_id: "job_page_acquire_001" }));
-  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example" }, []);
+  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example", tab_id: 1, tab_url: "https://doi.org/10.1000/example" }, []);
 
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
   button.click();
@@ -496,9 +557,13 @@ test("keeps a successfully queued acquisition disabled", async () => {
   await Promise.resolve();
 
   expect(button.disabled).toBe(true);
-  expect(button.title).toBe("Queued");
+  // No raw job id: the popup says whether the click landed, and the inbox owns
+  // the durable identifier.
+  expect(button.title).toBe("Added to papio");
   expect(button.getAttribute("aria-disabled")).toBe("true");
-  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Queued: job_page_acquire_001");
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Added to papio");
+  expect(doc.getElementById("page-acquire-status")?.dataset.tone).toBe("success");
+  expect(doc.getElementById("page-acquire-status")?.textContent).not.toContain("job_");
 });
 
 test("hides the header acquire action when the current page has no paper", () => {
@@ -524,7 +589,7 @@ test("shows the PDF acquire icon with the PDF tooltip", () => {
   renderPageAcquire(doc, async () => ({ error: "unused" }), async () => ({ state: "sending", job_id: "job_1234567890abcdef" }));
   renderPageContext(
     doc,
-    { url: "https://papers.example.edu/download/paper.pdf?download=1", kind: "pdf", tab_id: 17 },
+    { url: "https://papers.example.edu/download/paper.pdf?download=1", kind: "pdf", tab_id: 17, tab_url: "https://papers.example.edu/download/paper.pdf?download=1" },
     [job({ job_id: "job_1234567890abcdef", tab_id: 17 })],
   );
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
@@ -558,7 +623,14 @@ test("Send PDF does not attach an Open pin job_id for a DOI-less unmatched tab",
     },
   });
 
-  await expect(sendCurrentPDF()).resolves.toMatchObject({
+  await expect(
+    sendCurrentPDF({
+      url: "https://provider.example.edu/download/article.pdf",
+      kind: "pdf",
+      tab_id: 77,
+      tab_url: "https://provider.example.edu/download/article.pdf",
+    }),
+  ).resolves.toMatchObject({
     ok: true,
     state: "sending",
   });
@@ -615,7 +687,11 @@ test("does not send a DOI-less scraped page to the daemon", async () => {
   let messages = 0;
   Object.assign(globalThis, {
     chrome: {
-      tabs: { query: async () => [{ id: 1 }] },
+      tabs: {
+        // Binding validation re-reads the active tab, so the fake must answer
+        // with the same tab id and byte-identical URL the binding carries.
+        query: async () => [{ id: 1, url: "https://publisher.example.edu/article/42" }],
+      },
       scripting: {
         executeScript: async () => [{
           result: { url: "https://publisher.example.edu/article/42", title: "A DOI-less page" },
@@ -630,7 +706,14 @@ test("does not send a DOI-less scraped page to the daemon", async () => {
     },
   });
 
-  await expect(acquireCurrentPage()).resolves.toEqual({ error: "no DOI found on this page" });
+  await expect(
+    acquireCurrentPage({
+      url: "https://publisher.example.edu/article/42",
+      title: "A DOI-less page",
+      tab_id: 1,
+      tab_url: "https://publisher.example.edu/article/42",
+    }),
+  ).resolves.toEqual({ error: "no DOI found on this page" });
   expect(messages).toBe(0);
 });
 
@@ -641,7 +724,7 @@ test("renders a live, honest status card for a local in-flight acquisition", () 
   let openedTab = 0;
   renderPageContext(
     doc,
-    { url: "https://doi.org/10.1000/example", doi: "10.1000/example" },
+    { url: "https://doi.org/10.1000/example", doi: "10.1000/example", tab_id: 1, tab_url: "https://doi.org/10.1000/example" },
     [job({ expected: { title: "A paper in progress", doi: "doi:10.1000/example" }, status: "auth_pending" })],
     undefined,
     [{
@@ -725,7 +808,7 @@ test("scopes live auth-pending warmth to its demanded resolver origin", () => {
     kind: "browser.auth_pending" as const,
     text: "Waiting on you to sign in",
   }];
-  const page = { url: "https://doi.org/10.1000/paper-b", doi: "10.1000/paper-b" };
+  const page = { url: "https://doi.org/10.1000/paper-b", doi: "10.1000/paper-b", tab_id: 1, tab_url: "https://doi.org/10.1000/paper-b" };
 
   expect(sessionWarmForJob(session, liveJob.job_id)).toBe(false);
   const waitingDoc = popupDocument();
@@ -1049,12 +1132,13 @@ test("surfaces a blocked security check with a go-to-tab action", async () => {
   const section = doc.getElementById("needs-you-section");
   expect(section?.hidden).toBe(false);
   expect(doc.getElementById("institution-session-waiting")?.hidden).toBe(true);
-  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Security check needs you");
+  // One heading, always: a per-kind heading read as a different section.
+  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Needs you");
   expect(section?.querySelector(".needs-you-paper")?.textContent).toBe(
-    "Security check needs you - sciencedirect.com",
+    "Security check — sciencedirect.com",
   );
   const button = section?.querySelector("button") as HTMLButtonElement;
-  expect(button.textContent).toBe("Go-to-tab");
+  expect(button.textContent).toBe("Open tab");
   button.click();
   await Promise.resolve();
   await Promise.resolve();
@@ -1081,8 +1165,8 @@ test("surfaces each blocked provider host once with a one-click grant", async ()
 
   const section = doc.getElementById("needs-you-section");
   expect(section?.hidden).toBe(false);
-  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Allow provider access");
-  expect(doc.getElementById("needs-you-message")?.textContent).toContain("Grant the blocked source here");
+  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Needs you");
+  expect(doc.getElementById("needs-you-message")?.textContent).toContain("Allow the blocked source here");
   expect(Array.from(section?.querySelectorAll(".needs-you-paper") ?? []).map((item) => item.textContent)).toEqual([
     "journals.sagepub.com",
     "www.sciencedirect.com",
@@ -1093,7 +1177,14 @@ test("surfaces each blocked provider host once with a one-click grant", async ()
   await Promise.resolve();
   await Promise.resolve();
   expect(granted).toEqual(["journals.sagepub.com"]);
-  expect(buttons[0]?.textContent).toBe("Allowed");
+  // The button keeps naming its action; the outcome lives in the row's own
+  // persistent, non-live result so a rerender cannot erase it.
+  expect(buttons[0]?.textContent).toBe("Allow");
+  const result = section?.querySelectorAll(".popup-result")[0] as HTMLElement | undefined;
+  expect(result?.textContent).toBe("Allowed");
+  expect(result?.dataset.tone).toBe("success");
+  expect(result?.getAttribute("aria-live")).toBeNull();
+  expect(doc.getElementById("popup-operation-status")?.textContent).toBe("Allowed");
 });
 
 test("provider grant requests the exact normalized https origin and rejects paths", async () => {
@@ -1160,31 +1251,24 @@ test("renderImpactSummary fills the impact card with real values", () => {
   expect(doc.getElementById("impact-success-rate")?.textContent).toBe("75%");
 });
 
-test("the impact footer publishes only measured figures — never an invented time saved", () => {
+test("the impact footer is one measured line — never an invented time saved", () => {
   const doc = popupDocument();
   renderImpactSummary(doc, { acquired_total: 42, failed_total: 14 });
 
-  // papio measures counts, not clocks: no estimated-time-saved figure may return
-  // to this footer under any wording.
+  // papio measures counts, not clocks: no estimated-time-saved figure, ETA, or
+  // acquisition-progress percentage may return to this footer under any wording.
   expect(doc.getElementById("impact-time-saved")).toBeNull();
   const section = doc.getElementById("impact-summary") as HTMLElement;
-  expect(section.textContent).not.toMatch(/saved|hours?\b|\bh\b|minutes/i);
-  const labels = Array.from(section.querySelectorAll(".impact-metric dt")).map((el) => el.textContent);
-  expect(labels).toEqual(["Papers acquired", "Success rate"]);
-  // One fewer figure must not leave an empty cell or a dangling separator.
-  expect(section.querySelectorAll(".impact-metric")).toHaveLength(labels.length);
-  for (const value of Array.from(section.querySelectorAll(".impact-metric dd"))) {
-    expect(value.textContent?.trim()).not.toBe("");
-  }
-});
-
-test("keeps the impact title and history link in one header row", () => {
-  const doc = popupDocument();
-  const header = doc.getElementById("impact-header");
-  expect(header?.classList.contains("impact-header")).toBe(true);
-  expect(header?.querySelector("h2")?.textContent).toBe("Your papio impact");
-  expect(doc.getElementById("view-history-btn")?.parentElement).toBe(header);
-  expect(doc.getElementById("impact-summary")?.querySelector(":scope > #view-history-btn")).toBeNull();
+  expect(section.textContent).not.toMatch(/saved|hours?\b|\bh\b|minutes|remaining|eta/i);
+  // One line, one link. The heading and the two-cell metric grid are gone.
+  expect(section.querySelector("h2")).toBeNull();
+  expect(section.querySelectorAll(".impact-metric")).toHaveLength(0);
+  expect(doc.getElementById("impact-header")).toBeNull();
+  expect(section.querySelector(".impact-line")?.textContent?.replace(/\s+/g, " ").trim()).toBe(
+    "42 acquired · 75% success",
+  );
+  expect(doc.getElementById("view-history-btn")?.textContent).toBe("View history");
+  expect(doc.getElementById("view-history-btn")?.parentElement).toBe(section);
 });
 
 test("renderImpactSummary hides the impact card when stats are unavailable", () => {
@@ -1276,7 +1360,7 @@ test("Enter invokes the primary acquisition action", async () => {
     return { job_id: "job_page_acquire_001" };
   });
   wirePrimaryShortcut(doc);
-  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example" }, []);
+  renderPageContext(doc, { url: "https://doi.org/10.1000/example", doi: "10.1000/example", tab_id: 1, tab_url: "https://doi.org/10.1000/example" }, []);
 
   doc.dispatchEvent(new doc.defaultView!.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   await Promise.resolve();
@@ -1459,6 +1543,7 @@ test("SAGE's epub journal viewer becomes a direct Send PDF surface", async () =>
     title: "Against All Odds",
     kind: "pdf",
     tab_id: 17,
+    tab_url: viewerURL,
   });
 });
 
@@ -1484,6 +1569,7 @@ test("Taylor and Francis's epdf viewer becomes a direct Send PDF surface", async
     title: "Drawing Conclusions",
     kind: "pdf",
     tab_id: 18,
+    tab_url: viewerURL,
   });
 });
 
@@ -1500,6 +1586,7 @@ test("Cell's PII PDF response becomes Send PDF even when scripting is unavailabl
     title: "Latent profile analysis",
     kind: "pdf",
     tab_id: 19,
+    tab_url: viewerURL,
   });
 });
 
@@ -2511,7 +2598,11 @@ test("the 2-second checking retry reads a snapshot, never re-injecting a probe",
     h.requests.length = 0;
     retries[0]?.();
     await flushMicrotasks();
-    expect(h.requests).toEqual([{ type: SESSION_STATE_MESSAGE }]);
+    // The retry reads a snapshot; it must never re-inject the probe. Its repaint
+    // now goes through refresh() so it sits inside the generation fence, which is
+    // why other refresh reads appear here too.
+    expect(sessionMessageTypes(h.requests)).toContain(SESSION_STATE_MESSAGE);
+    expect(sessionMessageTypes(h.requests)).not.toContain(SESSION_PROBE_MESSAGE);
   } finally {
     globalThis.setTimeout = originalSetTimeout;
   }
@@ -2546,13 +2637,17 @@ test("a stale decisive session schedules one re-probe without discarding its ver
     h.requests.length = 0;
     retries[0]?.();
     await flushMicrotasks();
-    expect(h.requests).toEqual([{ type: SESSION_PROBE_MESSAGE }]);
+    // A stale decisive verdict earns exactly one re-probe.
+    expect(sessionMessageTypes(h.requests)[0]).toBe(SESSION_PROBE_MESSAGE);
+    expect(
+      sessionMessageTypes(h.requests).filter((type) => type === SESSION_PROBE_MESSAGE),
+    ).toHaveLength(1);
 
+    h.requests.length = 0;
     await h.refresh();
-    expect(sessionMessageTypes(h.requests)).toEqual([
-      SESSION_PROBE_MESSAGE,
-      SESSION_STATE_MESSAGE,
-    ]);
+    // Later refreshes are snapshot-only, and the stale verdict does not schedule
+    // a second retry.
+    expect(sessionMessageTypes(h.requests)).toEqual([SESSION_STATE_MESSAGE]);
     expect(retries).toHaveLength(1);
   } finally {
     globalThis.setTimeout = originalSetTimeout;
@@ -2636,7 +2731,7 @@ test("popup with a known job or manual target in PDF context does not show no-DO
   expect(selectedManualDeliveryTarget([manual])).toBeDefined();
   renderPageContext(
     doc,
-    { url: "https://provider.example.edu/download/paper.pdf", kind: "pdf", tab_id: 42 },
+    { url: "https://provider.example.edu/download/paper.pdf", kind: "pdf", tab_id: 42, tab_url: "https://provider.example.edu/download/paper.pdf" },
     [manual],
   );
   expect(doc.documentElement.innerHTML).not.toContain("This PDF has no DOI to queue");
@@ -2658,4 +2753,774 @@ test("knownJob PDF context never contains This PDF has no DOI to queue", () => {
   const fs = require("node:fs") as typeof import("node:fs");
   const popupSrc = fs.readFileSync(new URL("../src/popup.ts", import.meta.url), "utf8");
   expect(popupSrc).not.toContain("This PDF has no DOI to queue");
+});
+
+// ---------------------------------------------------------------------------
+// The current-page rail: bound, refresh-safe actions (ADR-0023 Decision 1's
+// popup responsibility) and ADR-0019 Decision 2's scanner consent.
+// ---------------------------------------------------------------------------
+
+/** A binding for a page the rail can act on. `tab_url` is the unrewritten tab
+ * address, which is what validation compares. */
+function binding(overrides: Partial<PageActionBinding> = {}): PageActionBinding {
+  const url = overrides.url ?? "https://scholar.example.edu/refs";
+  return {
+    url,
+    kind: "landing",
+    tab_id: 42,
+    tab_url: overrides.tab_url ?? url,
+    ...overrides,
+  } as PageActionBinding;
+}
+
+/** A chrome stub whose active tab matches `tab`, so binding validation passes
+ * unless a test deliberately moves it. */
+function tabChrome(
+  tab: { id?: number; url?: string; contentType?: string },
+  onMessage: (message: Record<string, unknown>) => unknown = () => ({ ok: true }),
+): { sent: Record<string, unknown>[]; injections: unknown[] } {
+  const sent: Record<string, unknown>[] = [];
+  const injections: unknown[] = [];
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: { query: async () => (tab.id === undefined ? [] : [tab]) },
+      scripting: {
+        executeScript: async (injection: unknown) => {
+          injections.push(injection);
+          return [{ result: undefined }];
+        },
+      },
+      storage: { local: { get: async () => ({}) } },
+      runtime: {
+        sendMessage: async (message: Record<string, unknown>) => {
+          sent.push(message);
+          return onMessage(message);
+        },
+      },
+    },
+  });
+  return { sent, injections };
+}
+
+test("a DOI landing page offers solid Acquire beside outlined bulk selection", () => {
+  const doc = popupDocument();
+  renderPageContext(doc, binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }), []);
+
+  const acquire = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const scan = doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement;
+  expect(acquire.hidden).toBe(false);
+  expect(acquire.classList.contains("primary")).toBe(true);
+  expect(scan.hidden).toBe(false);
+  expect(scan.classList.contains("ghost")).toBe(true);
+  // ADR-0019's exact visible label.
+  expect(scan.textContent).toBe("Select papers on this page");
+  expect(doc.getElementById("current-page-actions")?.hidden).toBe(false);
+  // With two actions, Enter means the specific one.
+  expect(acquire.dataset.primaryAction).toBe("true");
+  expect(scan.dataset.primaryAction).toBeUndefined();
+});
+
+test("a PDF page offers Send PDF beside bulk selection, preserving the PDF-grab entry", () => {
+  const doc = popupDocument();
+  renderPageContext(
+    doc,
+    binding({ url: "https://papers.example.edu/a.pdf", kind: "pdf", tab_url: "https://papers.example.edu/a.pdf" }),
+    [],
+  );
+  const acquire = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const scan = doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement;
+  expect(acquire.hidden).toBe(false);
+  expect(acquire.title).toBe("Send this PDF to papio");
+  expect(scan.hidden).toBe(false);
+  expect(acquire.dataset.primaryAction).toBe("true");
+});
+
+test("an ordinary HTTPS page without a DOI shows bulk selection alone — no disabled Acquire placeholder", () => {
+  const doc = popupDocument();
+  renderPageContext(doc, binding({ url: "https://library.example.edu/list" }), []);
+
+  const acquire = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const scan = doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement;
+  expect(acquire.hidden).toBe(true);
+  expect(scan.hidden).toBe(false);
+  expect(doc.getElementById("current-page-actions")?.hidden).toBe(false);
+  // Enter falls to the only visible action.
+  expect(scan.dataset.primaryAction).toBe("true");
+  expect(acquire.dataset.primaryAction).toBeUndefined();
+});
+
+test("a restricted or absent page hides both actions and collapses the rail", () => {
+  const doc = popupDocument();
+  for (const page of [
+    undefined,
+    binding({ url: "chrome://settings", tab_url: "chrome://settings" }),
+    binding({ url: "http://insecure.example.edu/x", tab_url: "http://insecure.example.edu/x" }),
+    binding({ url: "not a url", tab_url: "not a url" }),
+  ]) {
+    renderPageContext(doc, page, []);
+    expect((doc.getElementById("page-acquire-btn") as HTMLButtonElement).hidden).toBe(true);
+    expect((doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).hidden).toBe(true);
+    expect(doc.getElementById("current-page-actions")?.hidden).toBe(true);
+  }
+});
+
+test("Enter activates whichever rail action is marked primary", async () => {
+  const doc = popupDocument();
+  let acquired = 0;
+  let scanned = 0;
+  renderPageAcquire(doc, async () => {
+    acquired += 1;
+    return { job_id: "job_1" };
+  });
+  wirePageBulkScanLauncher(doc, async () => {
+    scanned += 1;
+    return { ok: true };
+  });
+  wirePrimaryShortcut(doc);
+  const press = (): void => {
+    doc.dispatchEvent(new doc.defaultView!.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  };
+
+  // Bulk-only page: Enter scans.
+  renderPageContext(doc, binding({ url: "https://library.example.edu/list" }), []);
+  press();
+  await flushMicrotasks();
+  expect(scanned).toBe(1);
+  expect(acquired).toBe(0);
+
+  // DOI page: Enter acquires, never the bulk action.
+  renderPageContext(doc, binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }), []);
+  press();
+  await flushMicrotasks();
+  expect(acquired).toBe(1);
+  expect(scanned).toBe(1);
+
+  // Restricted page: Enter does nothing at all.
+  renderPageContext(doc, undefined, []);
+  press();
+  await flushMicrotasks();
+  expect(acquired).toBe(1);
+  expect(scanned).toBe(1);
+});
+
+test("readCurrentPageMetadata refuses to fuse metadata from a page that changed under the probe", async () => {
+  let queries = 0;
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: {
+        query: async () => {
+          queries += 1;
+          // The probe round trip is where a navigation can land, so the second
+          // read intentionally reports a different address.
+          return queries === 1
+            ? [{ id: 5, url: "https://a.example.edu/one" }]
+            : [{ id: 5, url: "https://a.example.edu/two" }];
+        },
+      },
+      scripting: {
+        executeScript: async () => [{ result: { url: "https://a.example.edu/one", doi: "10.1000/one" } }],
+      },
+    },
+  });
+  await expect(readCurrentPageMetadata()).rejects.toThrow(PAGE_CHANGED_MESSAGE);
+  expect(queries).toBe(2);
+});
+
+test("a bound action makes no request once the tab or its URL has changed", async () => {
+  const moved = tabChrome({ id: 42, url: "https://elsewhere.example.edu/other" });
+  await expect(
+    acquireCurrentPage(binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x", tab_url: "https://doi.org/10.1000/x" })),
+  ).rejects.toThrow(PAGE_CHANGED_MESSAGE);
+  expect(moved.sent).toEqual([]);
+
+  const otherTab = tabChrome({ id: 99, url: "https://doi.org/10.1000/x" });
+  await expect(
+    sendCurrentPDF(binding({ url: "https://doi.org/10.1000/x.pdf", kind: "pdf", tab_url: "https://doi.org/10.1000/x.pdf" })),
+  ).rejects.toThrow(PAGE_CHANGED_MESSAGE);
+  expect(otherTab.sent).toEqual([]);
+
+  const navigated = tabChrome({ id: 42, url: "https://elsewhere.example.edu/other" });
+  await expect(
+    startPageBulkScan(binding({ url: "https://scholar.example.edu/refs" })),
+  ).resolves.toEqual({ ok: false, code: "page_changed", error: PAGE_CHANGED_MESSAGE });
+  expect(navigated.sent).toEqual([]);
+});
+
+test("a bound scan sends the bound tab and its bare origin as expected_origin", async () => {
+  const stub = tabChrome({ id: 42, url: "https://scholar.example.edu/refs" }, () => ({ ok: true, scan_id: "scan-1" }));
+  await expect(startPageBulkScan(binding())).resolves.toEqual({ ok: true });
+  expect(stub.sent).toEqual([{
+    type: PAGE_BULK_SCAN_MESSAGE,
+    request: { tab_id: 42, expected_origin: "https://scholar.example.edu" },
+  }]);
+});
+
+test("a non-HTTPS bound page is refused before any scan request leaves the popup", async () => {
+  const stub = tabChrome({ id: 42, url: "chrome://settings" });
+  const result = await startPageBulkScan(binding({ url: "chrome://settings", tab_url: "chrome://settings" }));
+  expect(result.ok).toBe(false);
+  expect(result.code).toBe("invalid_page");
+  expect(stub.sent).toEqual([]);
+});
+
+test("the first scan of an unapproved site asks once, focuses Allow, and performs no scan", async () => {
+  const doc = popupDocument();
+  const scans: PageActionBinding[] = [];
+  const allowed: string[] = [];
+  wirePageBulkScanLauncher(
+    doc,
+    async (bound) => {
+      scans.push(bound);
+      return {
+        ok: false,
+        code: "scanner_consent_required",
+        error: "Allow scanning on this site before papio reads the page",
+      };
+    },
+    async (origin) => {
+      allowed.push(origin);
+      return true;
+    },
+  );
+  renderPageContext(doc, binding(), []);
+  (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
+  await flushMicrotasks();
+
+  const prompt = doc.getElementById("page-bulk-consent") as HTMLElement;
+  expect(prompt.hidden).toBe(false);
+  expect(doc.getElementById("page-bulk-consent-message")?.textContent).toBe(
+    "Allow papio to scan pages on scholar.example.edu for paper identifiers? Detection stays in this tab; only papers you select are sent to the papio app.",
+  );
+  // Focus lands on the affirmative choice, and nothing was stored yet.
+  expect(doc.activeElement?.id).toBe("page-bulk-consent-allow");
+  expect(allowed).toEqual([]);
+  // The refusal is a question, not an error: no error result is left behind.
+  expect((doc.getElementById("page-bulk-scan-status") as HTMLElement).hidden).toBe(true);
+  expect(scans).toHaveLength(1);
+});
+
+test("Allow and scan stores the exact origin and retries only after the write is acknowledged", async () => {
+  const doc = popupDocument();
+  const order: string[] = [];
+  let refuse = true;
+  wirePageBulkScanLauncher(
+    doc,
+    async () => {
+      order.push("scan");
+      if (refuse) {
+        return { ok: false, code: "scanner_consent_required", error: "nope" };
+      }
+      return { ok: true };
+    },
+    async (origin) => {
+      order.push(`allow:${origin}`);
+      refuse = false;
+      return true;
+    },
+  );
+  renderPageContext(doc, binding(), []);
+  (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
+  await flushMicrotasks();
+  (doc.getElementById("page-bulk-consent-allow") as HTMLButtonElement).click();
+  await flushMicrotasks();
+
+  expect(order).toEqual(["scan", "allow:https://scholar.example.edu", "scan"]);
+  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(true);
+});
+
+test("a failed consent write leaves a persistent error and does not scan", async () => {
+  const doc = popupDocument();
+  let scans = 0;
+  wirePageBulkScanLauncher(
+    doc,
+    async () => {
+      scans += 1;
+      return { ok: false, code: "scanner_consent_required", error: "nope" };
+    },
+    async () => false,
+  );
+  renderPageContext(doc, binding(), []);
+  (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
+  await flushMicrotasks();
+  (doc.getElementById("page-bulk-consent-allow") as HTMLButtonElement).click();
+  await flushMicrotasks();
+
+  expect(scans).toBe(1);
+  const status = doc.getElementById("page-bulk-scan-status") as HTMLElement;
+  expect(status.hidden).toBe(false);
+  expect(status.textContent).toBe("Could not save scanning permission for this site");
+  expect(status.dataset.tone).toBe("error");
+  // The prompt stays available so the researcher can retry the write.
+  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(false);
+  expect((doc.getElementById("page-bulk-consent-allow") as HTMLButtonElement).disabled).toBe(false);
+});
+
+test("Cancel clears the consent prompt, writes nothing, and returns focus to the action", async () => {
+  const doc = popupDocument();
+  let allows = 0;
+  wirePageBulkScanLauncher(
+    doc,
+    async () => ({ ok: false, code: "scanner_consent_required", error: "nope" }),
+    async () => {
+      allows += 1;
+      return true;
+    },
+  );
+  renderPageContext(doc, binding(), []);
+  (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
+  await flushMicrotasks();
+  (doc.getElementById("page-bulk-consent-cancel") as HTMLButtonElement).click();
+  await flushMicrotasks();
+
+  expect(allows).toBe(0);
+  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(true);
+  expect(doc.activeElement?.id).toBe("page-bulk-scan-btn");
+});
+
+test("a page change clears a pending consent prompt without writing anything", async () => {
+  const doc = popupDocument();
+  let allows = 0;
+  wirePageBulkScanLauncher(
+    doc,
+    async () => ({ ok: false, code: "scanner_consent_required", error: "nope" }),
+    async () => {
+      allows += 1;
+      return true;
+    },
+  );
+  renderPageContext(doc, binding(), []);
+  (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
+  await flushMicrotasks();
+  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(false);
+
+  // The researcher navigated; the prompt belonged to the previous origin.
+  renderPageContext(doc, binding({ url: "https://other.example.edu/refs" }), []);
+  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(true);
+  expect(allows).toBe(0);
+});
+
+test("a rail result survives a rerender and is keyed to its own page", async () => {
+  const doc = popupDocument();
+  renderPageAcquire(doc, async () => ({ job_id: "job_1" }));
+  const first = binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" });
+  renderPageContext(doc, first, []);
+  (doc.getElementById("page-acquire-btn") as HTMLButtonElement).click();
+  await flushMicrotasks();
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Added to papio");
+
+  // A five-second refresh of the SAME page keeps the result.
+  renderPageContext(doc, first, []);
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Added to papio");
+
+  // Rendering a DIFFERENT page must not show the first page's outcome.
+  renderPageContext(doc, binding({ url: "https://doi.org/10.1000/y", doi: "10.1000/y" }), []);
+  expect((doc.getElementById("page-acquire-status") as HTMLElement).hidden).toBe(true);
+
+  // Returning to the first page recovers it: the result is owned by the page.
+  renderPageContext(doc, first, []);
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("Added to papio");
+});
+
+test("a stale generation cannot overwrite a newer operation's result", () => {
+  const doc = popupDocument();
+  const stale = beginPopupOperation(doc, "page:k:doi", "k", "Acquiring…");
+  const fresh = beginPopupOperation(doc, "page:k:doi", "k", "Acquiring…");
+  expect(fresh).toBeGreaterThan(stale);
+
+  expect(finishPopupOperation(doc, "page:k:doi", stale, { ownerKey: "k", text: "old", tone: "error" })).toBe(false);
+  expect(popupOperation(doc, "page:k:doi")?.phase).toBe("pending");
+  expect(finishPopupOperation(doc, "page:k:doi", fresh, { ownerKey: "k", text: "new", tone: "success" })).toBe(true);
+  expect(popupOperation(doc, "page:k:doi")?.text).toBe("new");
+
+  // A reply whose owner has been replaced underneath it is also refused.
+  const next = beginPopupOperation(doc, "page:k:doi", "k2", "Acquiring…");
+  expect(finishPopupOperation(doc, "page:k:doi", next, { ownerKey: "k", text: "wrong owner", tone: "success" })).toBe(false);
+});
+
+test("operation state is dropped only when its owner disappears", () => {
+  const doc = popupDocument();
+  beginPopupOperation(doc, "provider:a.example", "a.example", "Allowing…");
+  beginPopupOperation(doc, "provider:b.example", "b.example", "Allowing…");
+  prunePopupOperations(doc, (owner) => owner === "a.example");
+  expect(popupOperation(doc, "provider:a.example")).toBeDefined();
+  expect(popupOperation(doc, "provider:b.example")).toBeUndefined();
+});
+
+test("the stable announcer speaks a transition once, not on every rerender", () => {
+  const doc = popupDocument();
+  const announcer = doc.getElementById("popup-operation-status") as HTMLElement;
+  announcePopupOperation(doc, "Acquiring…");
+  expect(announcer.textContent).toBe("Acquiring…");
+  announcer.textContent = "";
+  // Identical text is not re-spoken: a rerender is not a transition.
+  announcePopupOperation(doc, "Acquiring…");
+  expect(announcer.textContent).toBe("");
+  announcePopupOperation(doc, "Added to papio");
+  expect(announcer.textContent).toBe("Added to papio");
+});
+
+test("the pulse companion names simultaneous work the primary line does not", () => {
+  const moving = derivePulseDisplay(
+    pulseCache({ in_flight: 2, scheduled: 3, stalled: 1, nonterminal_total: 6 }),
+    "connected",
+    Date.now(),
+    15_000,
+    { pending_total: 4, turns_required: 4 },
+  );
+  expect(moving.primary).toBe("Moving");
+  expect(moving.companion).toBe("4 decisions waiting · 3 scheduled · 1 stalled");
+
+  // Zero is omitted, and the primary's own class is never repeated.
+  const scheduled = derivePulseDisplay(
+    pulseCache({ scheduled: 2, nonterminal_total: 2 }),
+    "connected",
+    Date.now(),
+    15_000,
+    { pending_total: 0, turns_required: 0 },
+  );
+  expect(scheduled.primary).toBe("Scheduled");
+  expect(scheduled.companion).toBe("");
+
+  // An inexact measurement contributes nothing rather than a guess.
+  const noCounts = derivePulseDisplay(
+    pulseCache({ in_flight: 1, nonterminal_total: 1 }),
+    "connected",
+  );
+  expect(noCounts.companion).toBe("");
+});
+
+test("the popup pulse renders at most three lines and hides while disconnected", () => {
+  const doc = popupDocument();
+  renderWorkPulse(
+    doc,
+    pulseCache({
+      in_flight: 1,
+      nonterminal_total: 1,
+      next_action: { kind: "retry", at: new Date().toISOString() },
+      effect_capacity: { busy: 1, limit: 2 },
+      latest_batch: { membership: "complete", total: 2, settled: 2 },
+    } as Partial<WorkPulseResponsePayload>),
+    "connected",
+    Date.now(),
+    { pending_total: 2, turns_required: 2 },
+  );
+  const visible = [
+    doc.getElementById("popup-pulse-primary"),
+    doc.getElementById("popup-pulse-next"),
+    doc.getElementById("popup-pulse-capacity"),
+    doc.getElementById("popup-pulse-batch"),
+  ].filter((node): node is HTMLElement => node instanceof HTMLElement && !node.hidden);
+  expect(visible.length).toBeLessThanOrEqual(3);
+  expect(visible[0]?.textContent).toBe("Moving · 1 paper · 2 decisions waiting");
+  // Capacity is constraining, so the third line is capacity, not the batch.
+  expect(doc.getElementById("popup-pulse-capacity")?.hidden).toBe(false);
+  expect(doc.getElementById("popup-pulse-batch")?.hidden).toBe(true);
+
+  // Disconnected belongs to the daemon band alone.
+  renderWorkPulse(doc, undefined, "disconnected");
+  expect(doc.getElementById("popup-pulse")?.hidden).toBe(true);
+});
+
+test("Needs you keeps its three row classes in order and invents no Downloads row", () => {
+  const doc = popupDocument();
+  renderNeedsAttention(
+    doc,
+    [
+      job({ job_id: "job-challenge", challenge_blocked: true, challenge_host: "sciencedirect.com", tab_id: 3 }),
+      job({ job_id: "job-stalled", tab_id: 4 }),
+    ],
+    ["a.example.edu", "b.example.edu", "c.example.edu"],
+    async () => {},
+    async () => {},
+    ["job-stalled"],
+    async () => {},
+    async () => true,
+  );
+  const rows = Array.from(doc.querySelectorAll("#needs-you-list .needs-you-item"));
+  // One challenge, then one auth retry, then provider permissions, capped at 3.
+  expect(rows).toHaveLength(3);
+  expect(rows[0]?.querySelector(".needs-you-paper")?.textContent).toBe("Security check — sciencedirect.com");
+  expect(rows[1]?.querySelector("button")?.textContent).toBe("Retry now");
+  expect(rows[2]?.querySelector(".needs-you-paper")?.textContent).toBe("a.example.edu");
+  expect(doc.getElementById("needs-you-message")?.textContent).toContain("2 more in inbox");
+  // No Downloads projection exists in the store, so no Downloads row may appear.
+  expect(doc.getElementById("needs-you-section")?.textContent).not.toMatch(/download/i);
+});
+
+test("a blocker's pending state survives a rerender instead of reverting", async () => {
+  const doc = popupDocument();
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  const render = (): void => {
+    renderNeedsAttention(
+      doc,
+      [],
+      ["a.example.edu"],
+      async () => {},
+      async () => {},
+      [],
+      async () => {},
+      async () => promise,
+    );
+  };
+  render();
+  const button = doc.querySelector("#needs-you-list button") as HTMLButtonElement;
+  button.click();
+  await flushMicrotasks();
+  expect(button.textContent).toBe("Allowing…");
+
+  // The five-second repaint rebuilds the row; the in-flight grant must not look
+  // idle and clickable again while it is still running.
+  render();
+  const rebuilt = doc.querySelector("#needs-you-list button") as HTMLButtonElement;
+  expect(rebuilt.textContent).toBe("Allowing…");
+  expect(rebuilt.disabled).toBe(true);
+
+  resolve(true);
+  await flushMicrotasks();
+  render();
+  const settled = doc.querySelector("#needs-you-list button") as HTMLButtonElement;
+  expect(settled.disabled).toBe(false);
+  expect(doc.querySelector("#needs-you-list .popup-result")?.textContent).toBe("Allowed");
+});
+
+// ---------------------------------------------------------------------------
+// ADR-0023's sixth surface: the transient host-page acknowledgement.
+// ---------------------------------------------------------------------------
+
+function ackPage(): { window: Window; document: Document } {
+  const window = new Window();
+  window.document.write("<!doctype html><html><body><p>An article</p></body></html>");
+  Object.assign(globalThis, {
+    document: window.document,
+    window,
+    requestAnimationFrame: (cb: () => void) => {
+      cb();
+      return 0;
+    },
+    HTMLElement: window.HTMLElement,
+  });
+  return { window, document: window.document as unknown as Document };
+}
+
+test("the host-page acknowledgement mounts one open shadow host with closed copy only", () => {
+  const page = ackPage();
+  renderInPageAcknowledgement("queued");
+  const host = page.document.getElementById("papio-extension-action-ack-v1");
+  expect(host).not.toBeNull();
+  expect(host?.shadowRoot).not.toBeNull();
+  // Announced already by the popup; a second announcement would be a duplicate.
+  expect(host?.getAttribute("aria-hidden")).toBe("true");
+  expect(host?.shadowRoot?.textContent).toBe("✓Added to papio");
+  // Nothing identifying, and nothing interactive.
+  expect(host?.shadowRoot?.querySelectorAll("button, a, input")).toHaveLength(0);
+  expect((host as HTMLElement).style.pointerEvents).toBe("none");
+});
+
+test("each acknowledgement kind maps to exactly its own label and tone", () => {
+  const expected: Record<string, { text: string; ink: string }> = {
+    queued: { text: "✓Added to papio", ink: "#245e45" },
+    already_queued: { text: "•Already in papio", ink: "#12549b" },
+    pdf_started: { text: "→papio is handling this PDF", ink: "#426789" },
+    pdf_received: { text: "✓PDF received by papio", ink: "#245e45" },
+  };
+  for (const [kind, want] of Object.entries(expected)) {
+    const page = ackPage();
+    renderInPageAcknowledgement(kind as InPageAcknowledgementKind);
+    const host = page.document.getElementById("papio-extension-action-ack-v1");
+    expect(host?.shadowRoot?.textContent).toBe(want.text);
+    const chip = host?.shadowRoot?.firstElementChild as HTMLElement;
+    expect(chip.style.color).toBe(want.ink);
+    // PDF-started must never claim adoption.
+    if (kind === "pdf_started") expect(want.text).not.toMatch(/adopt|received|added/i);
+  }
+});
+
+test("a second acknowledgement replaces the first host rather than stacking", () => {
+  const page = ackPage();
+  renderInPageAcknowledgement("queued");
+  renderInPageAcknowledgement("already_queued");
+  expect(page.document.querySelectorAll("#papio-extension-action-ack-v1")).toHaveLength(1);
+  expect(
+    page.document.getElementById("papio-extension-action-ack-v1")?.shadowRoot?.textContent,
+  ).toBe("•Already in papio");
+});
+
+test("the acknowledgement installs no observer, listener, or persistence", () => {
+  const page = ackPage();
+  renderInPageAcknowledgement("queued");
+  // Nothing was written to the page beyond the one host element.
+  expect(page.document.body.querySelectorAll("*")).toHaveLength(1);
+  expect(page.document.documentElement.querySelectorAll("script, link")).toHaveLength(0);
+});
+
+test("acknowledgeInPage injects only under the all-requests preference", async () => {
+  for (const [mode, expectedInjections] of [["all", 1], ["errors", 0], ["off", 0]] as const) {
+    const stub = tabChrome({ id: 42, url: "https://scholar.example.edu/refs" });
+    Object.assign(globalThis, {
+      chrome: {
+        ...(globalThis as unknown as { chrome: Record<string, unknown> }).chrome,
+        storage: { local: { get: async () => ({ papio_success_ack_mode_v1: mode }) } },
+      },
+    });
+    await acknowledgeInPage(binding(), "queued");
+    expect(stub.injections).toHaveLength(expectedInjections);
+  }
+});
+
+test("acknowledgeInPage skips a page that changed after the click", async () => {
+  const stub = tabChrome({ id: 42, url: "https://elsewhere.example.edu/other" });
+  Object.assign(globalThis, {
+    chrome: {
+      ...(globalThis as unknown as { chrome: Record<string, unknown> }).chrome,
+      storage: { local: { get: async () => ({ papio_success_ack_mode_v1: "all" }) } },
+    },
+  });
+  await acknowledgeInPage(binding(), "queued");
+  expect(stub.injections).toHaveLength(0);
+});
+
+test("acknowledgeInPage swallows a refused injection and asks for nothing more", async () => {
+  Object.assign(globalThis, {
+    chrome: {
+      tabs: { query: async () => [{ id: 42, url: "https://scholar.example.edu/refs" }] },
+      storage: { local: { get: async () => ({ papio_success_ack_mode_v1: "all" }) } },
+      scripting: {
+        executeScript: async () => {
+          throw new Error("Cannot access a chrome:// URL");
+        },
+      },
+    },
+  });
+  await expect(acknowledgeInPage(binding(), "queued")).resolves.toBeUndefined();
+});
+
+test("acknowledgeInPage fails closed when the preference cannot be read at all", async () => {
+  const stub = tabChrome({ id: 42, url: "https://scholar.example.edu/refs" });
+  Object.assign(globalThis, {
+    chrome: {
+      ...(globalThis as unknown as { chrome: Record<string, unknown> }).chrome,
+      storage: undefined,
+    },
+  });
+  await acknowledgeInPage(binding(), "queued");
+  expect(stub.injections).toHaveLength(0);
+});
+
+test("only a validated success earns an acknowledgement, and never an error or a bulk scan", async () => {
+  const kinds: string[] = [];
+  const run = async (
+    mode: "doi" | "pdf",
+    response: Record<string, unknown>,
+  ): Promise<void> => {
+    const doc = popupDocument();
+    renderPageAcquire(
+      doc,
+      async () => response,
+      async () => response,
+      async (_bound, kind) => {
+        kinds.push(kind);
+      },
+    );
+    renderPageContext(
+      doc,
+      mode === "pdf"
+        ? binding({ url: "https://papers.example.edu/a.pdf", kind: "pdf", tab_url: "https://papers.example.edu/a.pdf" })
+        : binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }),
+      [],
+    );
+    (doc.getElementById("page-acquire-btn") as HTMLButtonElement).click();
+    await flushMicrotasks();
+  };
+
+  await run("doi", { job_id: "job_1" });
+  await run("doi", { job_id: "job_1", duplicate: true });
+  await run("pdf", { state: "sending" });
+  await run("pdf", { state: "downloaded" });
+  await run("pdf", { state: "adopted" });
+  expect(kinds).toEqual(["queued", "already_queued", "pdf_started", "pdf_started", "pdf_received"]);
+
+  // Errors, empty acknowledgements, and unrelated states earn nothing.
+  kinds.length = 0;
+  await run("doi", { error: "no DOI found on this page" });
+  await run("doi", {});
+  await run("pdf", { state: "failed" });
+  await run("pdf", { error: { code: "nope", message: "refused" } });
+  expect(kinds).toEqual([]);
+});
+
+test("a slower earlier refresh cannot paint over a newer one", async () => {
+  const slow = Promise.withResolvers<unknown>();
+  let countsCalls = 0;
+  const countsReply = (turns: number): unknown => ({
+    ok: true,
+    counts: {
+      pending_total: turns,
+      turns_required: turns,
+      watch_hits: 0,
+      actions: turns,
+      retractions: 0,
+    },
+  });
+  const h = await popupRefreshHarness((message) => {
+    if (message["type"] === "papio.triage.counts") {
+      countsCalls += 1;
+      // The FIRST refresh's slow input resolves last, which is exactly the
+      // reverse-order case the generation fence exists for.
+      return countsCalls === 1 ? slow.promise : countsReply(2);
+    }
+    if (message["type"] === "papio.work.pulse") {
+      return {
+        ok: true,
+        available: true,
+        received_at: Date.now(),
+        worker_epoch: "worker-1",
+        pulse: {
+          request_id: "pulse-1",
+          schema: 1,
+          generated_at: new Date().toISOString(),
+          projection_complete: true,
+          nonterminal_total: 1,
+          in_flight: 0,
+          continuing: 0,
+          scheduled: 0,
+          waiting_required: 1,
+          stalled: 0,
+        },
+      };
+    }
+    return sessionReplyFixture();
+  });
+  // A connected daemon: pulse is hidden entirely while disconnected, so the
+  // painted line would otherwise be the daemon band's story instead.
+  Object.assign(globalThis, {
+    chrome: {
+      ...(globalThis as unknown as { chrome: Record<string, unknown> }).chrome,
+      storage: {
+        local: {
+          get: async () => ({ papio_state_v1: { connectionStatus: "connected" } }),
+          set: async () => {},
+        },
+      },
+    },
+  });
+
+  const first = h.refresh();
+  // Let the older refresh get past its store read and actually issue its slow
+  // wave-2 requests, so this exercises reverse-order resolution rather than the
+  // trivial case where the older wave is fenced before it starts.
+  await flushMicrotasks();
+  expect(countsCalls).toBe(1);
+  const second = h.refresh();
+  await second;
+  expect(h.document.getElementById("popup-pulse-primary")?.textContent).toBe(
+    "Waiting on you · 2 decisions",
+  );
+
+  slow.resolve(countsReply(99));
+  await first;
+  // The older wave finished last and must have abandoned its writes.
+  expect(h.document.getElementById("popup-pulse-primary")?.textContent).toBe(
+    "Waiting on you · 2 decisions",
+  );
+  expect(h.document.getElementById("popup-pulse-primary")?.textContent).not.toContain("99");
 });

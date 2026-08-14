@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"effect_permit_reconcile_response","msg_id":"msg_permit_resp_001","seq":1,"payload":{"request_id":"request_resp_001","permit_id":"permit_resp_001","outcome":"recorded","dispatched":false,"download_present":false,"acknowledged":false,"tab_present":false,"detail":"provider returned /tmp/private.pdf"}}

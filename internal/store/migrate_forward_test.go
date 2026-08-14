@@ -8,15 +8,159 @@ import (
 	_ "embed"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"papio/internal/config"
 	"papio/internal/doctor"
+	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/store"
 
 	_ "modernc.org/sqlite"
 )
+
+func schema33Fixture(t *testing.T, seed string) string {
+	t.Helper()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "papio.db")
+	raw, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := filepath.Glob(filepath.Join("migrations", "*.sql"))
+	if err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		if strings.HasPrefix(filepath.Base(path), "0034_") {
+			continue
+		}
+		migration, err := os.ReadFile(path)
+		if err != nil {
+			_ = raw.Close()
+			t.Fatal(err)
+		}
+		if _, err := raw.ExecContext(ctx, string(migration)); err != nil {
+			_ = raw.Close()
+			t.Fatalf("apply %s: %v", path, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, "PRAGMA user_version = 33"); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, seed); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed schema-33 fixture: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return dataDir
+}
+
+func TestSchema33UpgradeImportsEveryLegacyEffectKind(t *testing.T) {
+	const seed = `
+		INSERT INTO work_requests(id, created_at, desired_version)
+		VALUES ('req-generic', '2026-08-13T00:00:00Z', 'any'),
+		       ('req-direct', '2026-08-13T00:00:00Z', 'any'),
+		       ('req-inst', '2026-08-13T00:00:00Z', 'any');
+		INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at)
+		VALUES ('job-generic', 'req-generic', 'resolving', '{}', '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z'),
+		       ('job-direct', 'req-direct', 'resolving', '{}', '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z'),
+		       ('job-inst', 'req-inst', 'resolving', '{}', '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z');
+		INSERT INTO events(job_id, at, kind, detail_json)
+		VALUES ('job-generic', '2026-08-13T00:00:00Z', 'browser.provider_drive_epoch_started',
+		        '{"drive_attempt_id":"legacy-generic","ordinal":0,"strategy":"generic","revision":"1","safety_domain":"domain:generic"}'),
+		       ('job-generic', '2026-08-13T00:00:01Z', 'browser.provider_drive_epoch_superseded',
+		        '{"drive_attempt_id":"legacy-generic","ordinal":0,"strategy":"generic","revision":"1"}'),
+		       ('job-direct', '2026-08-13T00:00:00Z', 'browser.direct_route',
+		        '{"phase":"offered","drive_attempt_id":"legacy-direct","ordinal":1,"route_revision":"route-1","safety_domain":"domain:direct"}');
+		INSERT INTO pdf_grabs(id, url_host, title, state, created_at, updated_at)
+		VALUES ('legacy-grab', 'example.test', 'legacy grab', 'awaiting_file', '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z');
+		INSERT INTO institution_profiles
+		  (id, configured_name, revision, authority_digest, authentication_claim_id, created_at, updated_at)
+		VALUES ('legacy-profile', 'legacy profile', 1, 'digest', 'auth-claim', '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z');
+		INSERT INTO browser_candidates
+		  (id, job_id, job_attempt_revision, institution_profile_id, institution_profile_revision,
+		   route_revision, route_class, identifier_strategy, pre_route_safety_key, safety_domain_id,
+		   adapter_revision, effect_contract_id, status, created_at, updated_at)
+		VALUES ('legacy-candidate', 'job-inst', 1, 'legacy-profile', 1, 1, 'institutional', 'doi',
+		        'pre-route', 'domain:institutional', 'adapter-1', 'effect-1', 'claimed',
+		        '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z');
+		INSERT INTO materialization_claims
+		  (id, candidate_id, browser_holder_generation, materialization_kind, binding_id,
+		   phase, route_issuance_ordinal, effect_ordinal, created_at, updated_at)
+		VALUES ('legacy-claim', 'legacy-candidate', 1, 'browser_tab', 'legacy-binding',
+		        'route_issued', 2, 3, '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z');
+	`
+	dir := schema33Fixture(t, seed)
+	ctx := context.Background()
+	db, err := store.Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	js := &job.Store{S: db}
+	if err := js.ImportLegacyStartedEpochs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var total int
+	if err := db.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM legacy_effect_blockers WHERE status='unresolved'`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 4 {
+		t.Fatalf("schema-33 upgrade imported %d blockers, want four kinds", total)
+	}
+	var generic, direct, grab, institutional int
+	if err := db.DB().QueryRowContext(ctx, `
+		SELECT
+		  COALESCE(SUM(effect_kind='generic_drive'),0),
+		  COALESCE(SUM(effect_kind='direct_get'),0),
+		  COALESCE(SUM(effect_kind='pdf_grab'),0),
+		  COALESCE(SUM(effect_kind='institutional'),0)
+		FROM legacy_effect_blockers WHERE status='unresolved'`).Scan(&generic, &direct, &grab, &institutional); err != nil {
+		t.Fatal(err)
+	}
+	if generic != 1 || direct != 1 || grab != 1 || institutional != 1 {
+		t.Fatalf("schema-33 imported kinds generic=%d direct=%d grab=%d institutional=%d", generic, direct, grab, institutional)
+	}
+}
+
+func TestSchema33UpgradeRejectsMalformedLegacyStart(t *testing.T) {
+	dir := schema33Fixture(t, `
+		INSERT INTO work_requests(id, created_at, desired_version)
+		VALUES ('req-malformed', '2026-08-13T00:00:00Z', 'any');
+		INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at)
+		VALUES ('job-malformed', 'req-malformed', 'resolving', '{}', '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z');
+		INSERT INTO events(job_id, at, kind, detail_json)
+		VALUES ('job-malformed', '2026-08-13T00:00:00Z', 'browser.provider_drive_epoch_started',
+		        '{"drive_attempt_id":"malformed","ordinal":0,"strategy":"generic","revision":"1"}');
+	`)
+	ctx := context.Background()
+	db, err := store.Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	err = (&job.Store{S: db}).ImportLegacyStartedEpochs(ctx)
+	if err == nil || !strings.Contains(err.Error(), "unclassifiable legacy provider drive effect") {
+		t.Fatalf("malformed schema-33 start error = %v, want precise refusal", err)
+	}
+	var count int
+	if err := db.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM legacy_effect_blockers`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("malformed import left %d blockers, want rollback", count)
+	}
+}
 
 //go:embed migrations/0001_init.sql
 var schemaV1 string
@@ -55,8 +199,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 33 {
-		t.Fatalf("user_version = %d, %v; want 33", version, err)
+	if err != nil || version != 34 {
+		t.Fatalf("user_version = %d, %v; want 34", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -123,8 +267,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 33 {
-		t.Fatalf("user_version = %d, %v; want 33", version, err)
+	if err != nil || version != 34 {
+		t.Fatalf("user_version = %d, %v; want 34", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -233,7 +377,9 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 			'human_gate_observations',
 			'route_suppressions',
 			'artifact_winners',
-			'authentication_entry_leases'
+			'authentication_entry_leases',
+			'effect_permits',
+			'legacy_effect_blockers'
 		)`
 
 	rows, err := db.DB().QueryContext(ctx, tables)
@@ -262,9 +408,54 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 		"route_suppressions",
 		"artifact_winners",
 		"authentication_entry_leases",
+		"effect_permits",
+		"legacy_effect_blockers",
 	} {
 		if !foundTables[name] {
 			t.Errorf("migration did not create table %q", name)
+		}
+	}
+	tableColumns := map[string][]string{
+		"effect_permits": {
+			"id", "job_id", "job_attempt_revision", "browser_holder_generation",
+			"safety_domain_id", "effect_kind", "slot_index", "drive_attempt_id",
+			"ordinal", "strategy", "revision", "claim_id", "binding_id",
+			"effect_ordinal", "grab_id", "terms_occurrence_id",
+			"institutional_request_id", "status", "lease_until", "created_at",
+			"updated_at",
+		},
+		"legacy_effect_blockers": {
+			"id", "effect_kind", "job_id", "safety_domain_id", "drive_attempt_id", "ordinal",
+			"strategy", "revision", "claim_id", "binding_id", "effect_ordinal", "grab_id",
+			"reconstructed_attempt", "reconstructed_holder", "cleanup_only", "status", "created_at", "updated_at",
+		},
+	}
+	for table, wantColumns := range tableColumns {
+		rows, err := db.DB().QueryContext(ctx, "PRAGMA table_info("+table+")")
+		if err != nil {
+			t.Fatalf("describe %s: %v", table, err)
+		}
+		foundColumns := map[string]bool{}
+		for rows.Next() {
+			var cid int
+			var name, columnType string
+			var notNull, primaryKey int
+			var defaultValue sql.NullString
+			if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+				_ = rows.Close()
+				t.Fatalf("scan %s columns: %v", table, err)
+			}
+			foundColumns[name] = true
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			t.Fatalf("iterate %s columns: %v", table, err)
+		}
+		_ = rows.Close()
+		for _, name := range wantColumns {
+			if !foundColumns[name] {
+				t.Errorf("migration did not create %s column %q", table, name)
+			}
 		}
 	}
 
@@ -283,7 +474,22 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 			'route_suppressions_by_job',
 			'route_suppressions_active_exact',
 			'artifact_winners_by_candidate',
-			'authentication_entry_leases_by_expiry'
+			'authentication_entry_leases_by_expiry',
+			'effect_permits_live_slot',
+			'effect_permits_live_domain',
+			'effect_permits_drive_identity',
+			'effect_permits_pdf_grab_identity',
+			'effect_permits_terms_identity',
+			'effect_permits_institutional_request',
+			'effect_permits_institutional_identity',
+			'legacy_effect_blockers_drive_identity',
+			'legacy_effect_blockers_pdf_grab_identity',
+			'legacy_effect_blockers_institutional_identity',
+			'effect_permits_by_job',
+			'effect_permits_by_safety_domain',
+			'effect_permits_unresolved_lookup',
+			'legacy_effect_blockers_by_job',
+			'legacy_effect_blockers_unresolved'
 		)`
 
 	rows, err = db.DB().QueryContext(ctx, indexes)
@@ -303,6 +509,21 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 		t.Fatalf("iterate institutional materialization indexes: %v", err)
 	}
 	for _, name := range []string{
+		"effect_permits_live_slot",
+		"effect_permits_live_domain",
+		"effect_permits_drive_identity",
+		"effect_permits_pdf_grab_identity",
+		"effect_permits_terms_identity",
+		"effect_permits_institutional_request",
+		"effect_permits_institutional_identity",
+		"legacy_effect_blockers_drive_identity",
+		"legacy_effect_blockers_pdf_grab_identity",
+		"legacy_effect_blockers_institutional_identity",
+		"effect_permits_by_job",
+		"effect_permits_by_safety_domain",
+		"effect_permits_unresolved_lookup",
+		"legacy_effect_blockers_by_job",
+		"legacy_effect_blockers_unresolved",
 		"institution_profiles_active_name",
 		"browser_candidates_by_job",
 		"browser_candidates_by_profile",

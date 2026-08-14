@@ -21,6 +21,7 @@ import (
 	"papio/internal/pdf"
 	"papio/internal/store"
 	"papio/internal/update"
+	"papio/internal/work"
 	"papio/internal/zotio"
 )
 
@@ -67,13 +68,135 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	}
 	var dbPass bool
 	for _, c := range report.Checks {
-		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 33") {
+		if c.Name == "database" && c.Status == Pass && strings.Contains(c.Detail, "schema version 34") {
 			dbPass = true
 		}
 	}
 	if !dbPass {
 		t.Fatalf("database migration check missing: %+v", report.Checks)
 	}
+}
+
+func TestRunNamesUnknownEffectPermitAndRecoveryCommand(t *testing.T) {
+	ctx := context.Background()
+	data := t.TempDir()
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	js := &job.Store{S: db}
+	jobID, err := js.CreateRequest(ctx, "wr_doctor_effect", work.Work{DOI: "10.1000/doctor-effect"}, "", "", job.Policy{
+		AccessMode: "conservative", DesiredVersion: "any", Resolver: "test", FetchMaxBytes: 1 << 20,
+	}, nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, jobID, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, jobID, job.StateResolving, job.StateAwaitingHuman, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.OpenHumanAction(ctx, jobID, "openurl_handoff", "doctor effect permit fixture", job.Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	permit, _, err := js.AcquireEffectPermit(ctx, job.EffectPermitAcquireInput{
+		Identity: job.EffectPermitIdentity{
+			JobID: jobID, Kind: job.EffectKindGenericDrive,
+			DriveAttemptID: "doctor-effect-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
+		},
+		JobAttemptRevision: 1, BrowserHolderGeneration: 1, SafetyDomainID: "doctor-domain",
+		LeaseUntil: time.Now().Add(time.Minute),
+		Authorization: job.EffectPermitEvent{Kind: "browser.provider_drive_epoch_started", Detail: map[string]any{
+			"drive_attempt_id": "doctor-effect-attempt", "ordinal": int64(0),
+			"strategy": "generic", "revision": "1", "safety_domain": "doctor-domain",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.DataDir = data
+	report := Run(ctx, cfg, db, pdf.Capability{}, executable(t), nil)
+	heldNamed := false
+	for _, check := range report.Checks {
+		if check.Name != "effect_permit" {
+			continue
+		}
+		heldNamed = true
+		if check.Status != Pass || !strings.Contains(check.Detail, permit.ID) || !strings.Contains(check.Detail, "held") {
+			t.Fatalf("fresh held effect permit check = %+v", check)
+		}
+	}
+	if !heldNamed {
+		t.Fatalf("fresh held effect permit check missing: %+v", report.Checks)
+	}
+	if _, err := js.ReconcileEffectPermit(ctx, job.EffectPermitObservation{
+		PermitID: permit.ID, BrowserHolderGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	report = Run(ctx, cfg, db, pdf.Capability{}, executable(t), nil)
+	for _, check := range report.Checks {
+		if check.Name != "effect_permit" {
+			continue
+		}
+		if check.Status != Warn || !strings.Contains(check.Detail, permit.ID) ||
+			!strings.Contains(check.Remediation, "papio browser permit resolve "+permit.ID) {
+			t.Fatalf("effect permit check = %+v", check)
+		}
+		return
+	}
+	t.Fatalf("effect_permit check missing: %+v", report.Checks)
+}
+
+func TestRunNamesLegacyEffectBlockerAndExactRecovery(t *testing.T) {
+	ctx := context.Background()
+	data := t.TempDir()
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	js := &job.Store{S: db}
+	jobID, err := js.CreateRequest(ctx, "wr_doctor_legacy", work.Work{DOI: "10.1000/doctor-legacy"}, "", "", job.Policy{
+		AccessMode: "conservative", DesiredVersion: "any", Resolver: "test", FetchMaxBytes: 1 << 20,
+	}, nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	since := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO legacy_effect_blockers
+		  (id, effect_kind, job_id, safety_domain_id, drive_attempt_id, ordinal,
+		   strategy, revision, reconstructed_attempt, reconstructed_holder,
+		   cleanup_only, status, created_at, updated_at)
+		VALUES (?, 'generic_drive', ?, 'doctor-secret-domain', 'doctor-legacy-drive', 0,
+		        'generic', 'r1', NULL, NULL, 1, 'unresolved', ?, ?)`,
+		"legacy-doctor-blocker", jobID, since, since); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.DataDir = data
+	report := Run(ctx, cfg, db, pdf.Capability{}, executable(t), nil)
+	for _, check := range report.Checks {
+		if check.Name != "legacy_effect_blockers" {
+			continue
+		}
+		if check.Status != Warn || !strings.Contains(check.Detail, "legacy-doctor-blocker") ||
+			!strings.Contains(check.Detail, "global effect admission is refused") ||
+			!strings.Contains(check.Detail, "exact browser result or correlated artifact winner") ||
+			!strings.Contains(check.Remediation, "legacy-doctor-blocker") ||
+			!strings.Contains(check.Remediation, "no cleanup-only break-glass command is supported") {
+			t.Fatalf("legacy blocker check = %+v", check)
+		}
+		if strings.Contains(check.Detail, "doctor-secret-domain") || strings.Contains(check.Remediation, "doctor-secret-domain") {
+			t.Fatalf("legacy blocker check leaked provider text: %+v", check)
+		}
+		return
+	}
+	t.Fatalf("legacy_effect_blockers check missing: %+v", report.Checks)
 }
 
 // TestCheckAdoptionRootTimesOutAndFailsWithGrantRemediation reproduces the

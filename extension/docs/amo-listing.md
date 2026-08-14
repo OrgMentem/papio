@@ -37,6 +37,7 @@ This extension is _papio_'s browser half: it runs the institutional OpenURL hand
 **What makes it different**
 
 - **No credentials stored, no bulk scraping.** _papio_ never keeps your institution logins, and it fetches only the papers you explicitly request — one at a time — never mass-downloading from publishers.
+- **Page scanning is separate, invoked, and revocable.** When you ask _papio_ to find papers on a page, it reads only the top frame of that one tab, and only after you have allowed that specific site for scanning. That permission is separate from the site access used for downloads, is listed per site in _papio_'s settings, and can be revoked there at any time. Detection runs inside the page; the identifiers found go only to the local _papio_ app, and only the papers you select are acquired.
 - **Your real session, not a bot.** Native messaging and extension APIs only — no WebDriver, no CDP, no stealth — so your browser never looks automated.
 - **Validated before trusted.** Every candidate PDF is checked for structure and identity; anything ambiguous parks for your review instead of importing the wrong paper.
 - **Built for AI agents.** _papio_ runs as an MCP server, so an assistant can drive the whole workflow.
@@ -55,7 +56,11 @@ The extension communicates only with a papio daemon running locally on the user'
 
 To perform a download, the extension reads the current provider page (in a tab the user's own session opened) solely to locate the download link for the one paper requested. It does not read, store, or transmit page contents, cookies, credentials, or browsing history. Institutional login is performed by the user; the extension does not handle credentials.
 
-Extension settings and short-lived job/tab correlation state are stored locally in Firefox storage.
+Page scanning is a separate, explicitly invoked feature. It runs only when the user clicks it, reads only the top frame of the current tab, and runs only if that page's origin is already in a scanning allowlist the user controls — a list separate from the site access used for downloads, shown per site in the extension's settings and revocable there. Detection is local page JavaScript. The identifiers it finds and the page's bare origin go only to the local papio daemon so it can mark which papers are already owned; the short display-only citation labels shown in the selection view never leave the browser. No page text, path, query, fragment, page title, or credential is transmitted.
+
+After a popup action succeeds, and only when the user has left transient acknowledgements set to show for all requests, the extension draws a small noninteractive confirmation in the page it acted on. It shows one of four fixed short phrases, contains no identifier, title, URL, or job reference, reads no page content, stores nothing, transmits nothing, and removes itself after three seconds.
+
+Extension settings and short-lived job/tab correlation state are stored locally in Firefox storage. The scanning allowlist is stored the same way and holds only the bare HTTPS origins the user allowed.
 ```
 
 For the AMO "data collection" declaration, select **No** — this add-on does not
@@ -74,7 +79,7 @@ that manifest key is honored from Firefox 140, `web-ext lint` emits a benign
 | `downloads` | Required | Performs the single, explicitly requested PDF download for each acquisition job. |
 | `tabs` / `activeTab` | Required | Opens and manages the one handoff tab for a job, and correlates the download with the job. |
 | `tabGroups` | Required | *(New in 0.7.0 — the first version requesting this permission.)* Firefox 139+ only capability: groups the handoff tab into a collapsed "papio" tab group in the user's own window, so a provider sign-in/download flow stays visually separate from their own tabs (mirrors the tab-group mode already shipped on Chrome in 0.6.0). Runtime-detected: on Firefox < 139 — including the 128.0 ESR line `strict_min_version` targets — the API is simply absent and handoffs silently fall back to the background work window instead. |
-| `scripting` | Required | Runs a small content routine on the provider page to locate the requested paper's download link (per-provider adapters). It reads only what is needed to find that one link. |
+| `scripting` | Required | Runs a small content routine on the current page to locate the requested paper's download link (per-provider adapters), to detect paper identifiers when the user explicitly starts a scan on a site they have allowed for scanning, and to draw a three-second noninteractive confirmation in the page after a successful popup action. It reads only what those tasks need. |
 | `storage` | Required | Stores extension settings and short-lived job/tab correlation state that must survive the MV3 event page being suspended. |
 | `alarms` | Required | Schedules reconnect backoff to the local daemon without keeping the event page awake continuously. |
 | `host_permissions`: `*.alma.exlibrisgroup.com`, `*.primo.exlibrisgroup.com` | Required host access | The library discovery/resolver surfaces *papio* must read to route a job to the right licensed source. |

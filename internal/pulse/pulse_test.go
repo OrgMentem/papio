@@ -4,6 +4,8 @@ package pulse
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,6 +193,136 @@ func TestReadEmptyCompleteProjectionIsIdle(t *testing.T) {
 	}
 	if got := PrimaryLabel(snap); got != "Idle" {
 		t.Fatalf("label = %q, want Idle", got)
+	}
+}
+
+func TestReadUnknownEffectPermitExposesExactOccupancy(t *testing.T) {
+	ctx := context.Background()
+	js := pulseJobs(t)
+	jobID, err := js.CreateRequest(ctx, "wr_pulse_effect", pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO effect_permits (
+			id, job_id, job_attempt_revision, browser_holder_generation,
+			safety_domain_id, effect_kind, slot_index, drive_attempt_id,
+			ordinal, strategy, revision, status, lease_until, created_at, updated_at
+		) VALUES (?, ?, 1, 1, 'domain', 'generic_drive', 0, 'drive-attempt', 0,
+			'generic', '1', 'unknown_completion', ?, ?, ?)`,
+		"permit_pulse_unknown", jobID, now.Add(-time.Minute).Format(time.RFC3339Nano),
+		now.Add(-time.Minute).Format(time.RFC3339Nano), now.Add(-time.Minute).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := (&Service{Jobs: js, EffectLimit: 1, Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.EffectCapacity == nil || snap.EffectCapacity.Busy != 1 || snap.EffectCapacity.Limit != 1 {
+		t.Fatalf("effect capacity = %+v, want busy 1 limit 1", snap.EffectCapacity)
+	}
+	if len(snap.EffectPermits) != 1 || snap.EffectPermits[0].PermitID != "permit_pulse_unknown" ||
+		snap.EffectPermits[0].Status != string(job.EffectPermitUnknownCompletion) {
+		t.Fatalf("effect permits = %+v, want exact unknown occupancy", snap.EffectPermits)
+	}
+	if snap.Stalled == nil || *snap.Stalled != 1 {
+		t.Fatalf("stalled = %v, want 1", snap.Stalled)
+	}
+	if len(snap.StallEpisodes) != 1 || snap.StallEpisodes[0].EpisodeKey != "permit_pulse_unknown" {
+		t.Fatalf("stall episodes = %+v, want exact permit id", snap.StallEpisodes)
+	}
+}
+
+func TestReadLegacyEffectBlockerRefusesAdmissionWithoutOccupyingCapacity(t *testing.T) {
+	ctx := context.Background()
+	js := pulseJobs(t)
+	jobID, err := js.CreateRequest(ctx, "wr_pulse_legacy", pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	since := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO legacy_effect_blockers
+		  (id, effect_kind, job_id, safety_domain_id, drive_attempt_id, ordinal,
+		   strategy, revision, reconstructed_attempt, reconstructed_holder,
+		   cleanup_only, status, created_at, updated_at)
+		VALUES (?, 'generic_drive', ?, 'must-not-leak', 'legacy-drive', 0,
+		        'generic', 'r1', NULL, NULL, 1, 'unresolved', ?, ?)`,
+		"legacy-pulse-blocker", jobID, since, since); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := (&Service{Jobs: js, EffectLimit: 1, Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.EffectCapacity == nil || snap.EffectCapacity.Busy != 0 || snap.EffectCapacity.Limit != 1 {
+		t.Fatalf("effect capacity = %+v, want busy 0 despite global refusal", snap.EffectCapacity)
+	}
+	if snap.EffectAdmissionBlocked == nil || !*snap.EffectAdmissionBlocked {
+		t.Fatalf("effect admission blocked = %v, want true", snap.EffectAdmissionBlocked)
+	}
+	if len(snap.LegacyEffectBlockers) != 1 {
+		t.Fatalf("legacy blockers = %+v, want one exact blocker", snap.LegacyEffectBlockers)
+	}
+	blocker := snap.LegacyEffectBlockers[0]
+	if blocker.BlockerID != "legacy-pulse-blocker" || blocker.JobID != jobID ||
+		blocker.DriveAttemptID != "legacy-drive" || blocker.Strategy != "generic" ||
+		blocker.Revision != "r1" || blocker.Recovery != "exact_result_or_correlated_winner" {
+		t.Fatalf("legacy blocker projection = %+v", blocker)
+	}
+	if blocker.Since != since {
+		t.Fatalf("legacy blocker since = %q, want %q", blocker.Since, since)
+	}
+	encoded, _ := json.Marshal(snap)
+	if strings.Contains(string(encoded), "must-not-leak") {
+		t.Fatalf("pulse leaked safety-domain/provider text: %s", encoded)
+	}
+}
+
+func TestReadFreshHeldEffectPermitNamesOccupancyWithoutCallingItStalled(t *testing.T) {
+	ctx := context.Background()
+	js := pulseJobs(t)
+	jobID, err := js.CreateRequest(ctx, "wr_pulse_effect_held", pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, jobID, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, jobID, job.StateResolving, job.StateAwaitingHuman, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.OpenHumanAction(ctx, jobID, "openurl_handoff", "pulse effect permit fixture", job.Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	permit, _, err := js.AcquireEffectPermit(ctx, job.EffectPermitAcquireInput{
+		Identity: job.EffectPermitIdentity{
+			JobID: jobID, Kind: job.EffectKindGenericDrive,
+			DriveAttemptID: "drive-held", Ordinal: 0, Strategy: "generic", Revision: "1",
+		},
+		JobAttemptRevision: 1, BrowserHolderGeneration: 1, SafetyDomainID: "domain-held",
+		LeaseUntil: now.Add(time.Minute),
+		Authorization: job.EffectPermitEvent{Kind: "browser.provider_drive_epoch_started", Detail: map[string]any{
+			"drive_attempt_id": "drive-held", "ordinal": int64(0), "strategy": "generic",
+			"revision": "1", "safety_domain": "domain-held",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := (&Service{Jobs: js, EffectLimit: 1, Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.EffectPermits) != 1 || snap.EffectPermits[0].PermitID != permit.ID ||
+		snap.EffectPermits[0].Status != string(job.EffectPermitHeld) {
+		t.Fatalf("effect permits = %+v, want exact held occupancy", snap.EffectPermits)
+	}
+	if len(snap.StallEpisodes) != 0 {
+		t.Fatalf("fresh held permit reported as stalled: %+v", snap.StallEpisodes)
 	}
 }
 

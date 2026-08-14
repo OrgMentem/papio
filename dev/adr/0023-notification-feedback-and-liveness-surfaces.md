@@ -23,14 +23,15 @@ reproduce.
 
 ## Decisions
 
-### 1. Give the five surfaces distinct responsibilities
+### 1. Give the six surfaces distinct responsibilities
 
-The product uses five surfaces, each with one job:
+The product uses six surfaces, each with one job:
 
 | Surface | Question it answers | Persistence | Scope |
 | --- | --- | --- | --- |
 | Inline result / feedback strip | Did the action I just took land? | Seconds, or until dismissed for errors | One focused *papio* surface |
 | Popup | What is happening now for this page and browser? | While open | Current page, direct browser unblockers, compact global pulse |
+| Host-page action acknowledgement | Did the popup action I just requested enter *papio*? | Three seconds | The exact bound active page |
 | Badge and tooltip | Is *papio* disconnected, blocked, or waiting for me? | Ambient, lossy | Highest-precedence blocker plus actionable-turn count |
 | Desktop notification | Did something worth interrupting me for happen while I was elsewhere? | OS-controlled, not reliable storage | Coalesced action, milestone, integrity, or degradation event |
 | Inbox and Activity | What needs a decision, what is continuing, and what happened? | Durable | Complete bounded or paginated read model |
@@ -38,6 +39,31 @@ The product uses five surfaces, each with one job:
 No surface substitutes for another. A feedback strip is not a work queue, the
 popup is not a miniature inbox, the badge is not a progress bar, and a desktop
 notification is never the sole record of a decision or outcome.
+
+The host-page action acknowledgement is a noninteractive, browser-local
+projection of popup action acceptance, and nothing more. It exists because the
+popup closes on click, so its own inline result can disappear before the
+researcher reads it, leaving a deliberate action with no visible receipt on the
+page the researcher is still looking at. It is bounded accordingly: it carries
+one closed short label for one accepted action, persists for three seconds, and
+is scoped to the exact bound active page whose tab ID and byte-identical tab URL
+were validated for that action.
+
+It never carries progress, errors, identifiers, titles, URLs, provider names,
+job IDs, daemon prose, or background events. It is emitted only for a validated
+successful response to an action the researcher just requested, never for a
+failure, a later job transition, or an event that arrived on its own. It obeys
+the existing `SuccessAckMode` preference and appears only under `all`. It is
+never a substitute for popup inline feedback or for durable Activity and job
+state, both of which remain authoritative; if injection is refused on a viewer
+or privileged page, the inline popup result stands alone and no broader
+permission or content script is requested.
+
+This surface does not change Decision 3: the daemon remains the sole owner of
+desktop notification policy, and the rejection of browser notification channels
+stands. A page-local acknowledgement inside the tab the researcher already
+granted for the action is not a notification channel, gains no new install-time
+permission, and creates no second sender to arbitrate.
 
 ### 2. Keep turn-taking, category, and persistence separate
 

@@ -56,9 +56,10 @@ type Service struct {
 }
 
 const (
-	maxCount       = int64(1_000_000)
-	maxGates       = 16
-	terminalStates = "('ready','imported','unavailable','failed','cancelled')"
+	maxCount         = int64(1_000_000)
+	maxGates         = 16
+	effectStallAfter = 10 * time.Minute
+	terminalStates   = "('ready','imported','unavailable','failed','cancelled')"
 )
 
 func nowFor(s *Service) time.Time {
@@ -142,6 +143,31 @@ func (s *Service) Read(ctx context.Context) (result Snapshot, retErr error) {
 	if err != nil {
 		return snap, err
 	}
+	effectPermits, stalledPermit, err := readEffectPermits(ctx, db, now)
+	if err != nil {
+		return snap, err
+	}
+	snap.EffectPermits = effectPermits
+	legacyBlockers, legacyTruncated, err := s.Jobs.ReadUnresolvedLegacyEffectBlockers(ctx, job.LegacyEffectBlockerReadLimit)
+	if err != nil {
+		return snap, err
+	}
+	if len(legacyBlockers) > 0 || legacyTruncated {
+		snap.EffectAdmissionBlocked = boolPtr(true)
+		snap.LegacyEffectBlockersTruncated = boolPtr(legacyTruncated)
+	}
+	for _, blocker := range legacyBlockers {
+		item := protocol.WorkPulseLegacyEffectBlocker{
+			BlockerID: blocker.ID, EffectKind: string(blocker.Kind), JobID: blocker.JobID,
+			DriveAttemptID: blocker.DriveAttemptID, Strategy: blocker.Strategy,
+			Revision: blocker.Revision, Since: stamp(blocker.Since), Recovery: string(blocker.Recovery),
+		}
+		if blocker.Ordinal != nil {
+			n := *blocker.Ordinal
+			item.Ordinal = &n
+		}
+		snap.LegacyEffectBlockers = append(snap.LegacyEffectBlockers, item)
+	}
 
 	openActions := make(map[string]int)
 	for _, action := range actions {
@@ -163,10 +189,11 @@ func (s *Service) Read(ctx context.Context) (result Snapshot, retErr error) {
 	for _, gate := range attention.Gates {
 		member := false
 		for _, id := range append(append([]string(nil), gate.DependentJobIDs...), gate.ClaimMemberJobIDs...) {
-			if id != "" {
-				gateJobs[id] = true
-				member = true
+			if id == "" || (stalledPermit != nil && id == stalledPermit.jobID) {
+				continue
 			}
+			gateJobs[id] = true
+			member = true
 		}
 		if member {
 			gateTurns++
@@ -186,7 +213,14 @@ func (s *Service) Read(ctx context.Context) (result Snapshot, retErr error) {
 		return snap, err
 	}
 
+	permitCounted := false
+	permitExtra := int64(0)
 	for _, row := range rows {
+		if stalledPermit != nil && row.ID == stalledPermit.jobID {
+			stalled++
+			permitCounted = true
+			continue
+		}
 		if gateJobs[row.ID] {
 			// Dependent siblings are represented by their one typed gate.
 			continue
@@ -230,6 +264,10 @@ func (s *Service) Read(ctx context.Context) (result Snapshot, retErr error) {
 			}
 		}
 	}
+	if stalledPermit != nil && !permitCounted {
+		stalled++
+		permitExtra = 1
+	}
 
 	// Jobless PDF grabs are explicit turns, not daemon jobs.
 	if grabWaiting > 0 {
@@ -244,7 +282,7 @@ func (s *Service) Read(ctx context.Context) (result Snapshot, retErr error) {
 	// classified. Keep independently observed positive moving counts so a
 	// caller can still truthfully render Moving during a partial projection.
 	if projectionComplete {
-		nonterminal := int64(len(rows)) - gateMemberCount + int64(grabWaiting) + gateTurns
+		nonterminal := int64(len(rows)) - gateMemberCount + int64(grabWaiting) + gateTurns + permitExtra
 		if nonterminal > maxCount || inFlight > maxCount || scheduled > maxCount || continuing > maxCount || waiting > maxCount || stalled > maxCount {
 			return Snapshot{Schema: 1, GeneratedAt: stamp(now)}, errors.New("pulse counts exceed wire bound")
 		}
@@ -294,6 +332,38 @@ func (s *Service) Read(ctx context.Context) (result Snapshot, retErr error) {
 		snap.Gates = []protocol.WorkPulseGate{}
 	}
 
+	if stalledPermit != nil {
+		label := "Browser effect result overdue"
+		if stalledPermit.status == string(job.EffectPermitUnknownCompletion) {
+			label = "Browser effect completion unknown"
+		}
+		snap.StallEpisodes = []protocol.WorkPulseStallEpisode{{
+			EpisodeKey: stalledPermit.id, CauseKind: "execution_lease_overdue",
+			PublicLabel: label, Since: stamp(stalledPermit.since), Count: 1,
+		}}
+		snap.StallEpisodesTruncated = boolPtr(false)
+	}
+
+	if s.EffectLimit > 0 {
+		var busy int64
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM effect_permits WHERE status IN ('held','unknown_completion')`).Scan(&busy); err != nil {
+			return snap, err
+		}
+		if busy > int64(s.EffectLimit) || int64(s.EffectLimit) > maxCount {
+			return snap, errors.New("invalid effect capacity")
+		}
+		snap.EffectCapacity = &protocol.WorkPulseCapacity{Busy: busy, Limit: int64(s.EffectLimit)}
+	}
+	if r, ok := s.BrowserSession.(effectCapacityReader); ok {
+		b, l, w, e := r.EffectCapacity(ctx)
+		if e != nil {
+			return snap, e
+		}
+		if b < 0 || l < 0 || w < 0 || b > l || int64(l) > maxCount || int64(b) > maxCount || int64(w) > maxCount {
+			return snap, errors.New("invalid effect capacity")
+		}
+		snap.EffectCapacity = &protocol.WorkPulseCapacity{Busy: int64(b), Limit: int64(l), Waiting: int64(w)}
+	}
 	if r, ok := s.BrowserSession.(humanSurfaceCapacityReader); ok {
 		b, l, w, e := r.HumanSurfaceCapacity(ctx)
 		if e != nil {
@@ -516,6 +586,7 @@ func readDeliverySchedules(ctx context.Context, db *sql.DB, now time.Time) (map[
 	out := make(map[string]deliveryFact)
 	for rows.Next() {
 		var id, raw, provider string
+
 		if err := rows.Scan(&id, &raw, &provider); err != nil {
 			return nil, err
 		}
@@ -528,6 +599,51 @@ func readDeliverySchedules(ctx context.Context, db *sql.DB, now time.Time) (map[
 		}
 	}
 	return out, rows.Err()
+}
+
+type stalledEffectPermit struct {
+	id     string
+	jobID  string
+	status string
+	since  time.Time
+}
+
+func readEffectPermits(ctx context.Context, db *sql.DB, now time.Time) ([]protocol.WorkPulseEffectPermit, *stalledEffectPermit, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, COALESCE(job_id,''), status, updated_at
+		FROM effect_permits
+		WHERE status IN ('held','unknown_completion')
+		ORDER BY CASE status WHEN 'unknown_completion' THEN 0 ELSE 1 END, updated_at, id
+		LIMIT 4`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var live []protocol.WorkPulseEffectPermit
+	var stalled *stalledEffectPermit
+	for rows.Next() {
+		var permit stalledEffectPermit
+		var since string
+		if err := rows.Scan(&permit.id, &permit.jobID, &permit.status, &since); err != nil {
+			return nil, nil, err
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, since)
+		if err != nil {
+			return nil, nil, err
+		}
+		permit.since = parsed
+		live = append(live, protocol.WorkPulseEffectPermit{
+			PermitID: permit.id, Status: permit.status, Since: stamp(parsed),
+		})
+		if stalled == nil && (permit.status == string(job.EffectPermitUnknownCompletion) || !parsed.After(now.Add(-effectStallAfter))) {
+			copy := permit
+			stalled = &copy
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return live, stalled, nil
 }
 
 type claimFact struct{ JobID, Phase string }

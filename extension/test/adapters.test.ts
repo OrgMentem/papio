@@ -936,8 +936,10 @@ class FakePort implements NativePort {
   readonly posted: object[] = [];
   readonly onMessage = new FakeEmitter<[unknown]>();
   readonly onDisconnect = new FakeEmitter<[]>();
+  autoReply?: (msg: object) => void;
   postMessage(msg: object): void {
     this.posted.push(msg);
+    this.autoReply?.(msg);
   }
   disconnect(): void {
     void this.onDisconnect.emit();
@@ -1366,6 +1368,65 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
+  const termsPermits = new Map<string, { permitID: string; occurrenceID: string; settled: boolean }>();
+  port.autoReply = (raw) => {
+    const frame = raw as { type?: string; job_id?: string; payload?: Record<string, unknown> };
+    const payload = frame.payload ?? {};
+    if (frame.type === "terms_effect_start_request" && typeof frame.job_id === "string") {
+      const key = `${frame.job_id}\u0000${String(payload["adapter_id"])}\u0000${String(payload["adapter_version"])}\u0000${String(payload["authority_digest"])}`;
+      let permit = termsPermits.get(key);
+      const outcome = permit === undefined || !permit.settled ? "started" : "duplicate";
+      if (permit === undefined) {
+        permit = {
+          permitID: `permit_${frame.job_id}`,
+          occurrenceID: `terms_${frame.job_id}`,
+          settled: false,
+        };
+        termsPermits.set(key, permit);
+      }
+      const responsePermit = permit;
+      queueMicrotask(() => {
+        void port.inbound({
+          protocol: "papio-browser/1",
+          type: "terms_effect_start_result",
+          msg_id: crypto.randomUUID().replaceAll("-", ""),
+          job_id: frame.job_id,
+          seq: 2,
+          payload: {
+            request_id: payload["request_id"],
+            outcome,
+            ...(outcome === "started"
+              ? { permit_id: responsePermit.permitID, terms_occurrence_id: responsePermit.occurrenceID }
+              : { detail: "already authorized" }),
+          },
+        });
+      });
+    }
+    if (frame.type === "terms_effect_result_request" && typeof frame.job_id === "string") {
+      const permit = [...termsPermits.values()].find((candidate) =>
+        candidate.permitID === payload["permit_id"] &&
+        candidate.occurrenceID === payload["terms_occurrence_id"],
+      );
+      const outcome = permit?.settled === true ? "duplicate" : permit === undefined ? "stale" : "applied";
+      if (permit !== undefined) permit.settled = true;
+      queueMicrotask(() => {
+        void port.inbound({
+          protocol: "papio-browser/1",
+          type: "terms_effect_result",
+          msg_id: crypto.randomUUID().replaceAll("-", ""),
+          job_id: frame.job_id,
+          seq: 3,
+          payload: {
+            request_id: payload["request_id"],
+            permit_id: payload["permit_id"],
+            terms_occurrence_id: payload["terms_occurrence_id"],
+            outcome,
+            ...(outcome === "stale" ? { detail: "unknown permit" } : {}),
+          },
+        });
+      });
+    }
+  };
   const settings = { consent: undefined as TermsConsent };
   const alarmListeners: ((a: { name: string }) => void)[] = [];
   const alarms = {
@@ -1444,6 +1505,16 @@ function offer(
       ...(proquestAccountID !== undefined ? { proquest_account_id: proquestAccountID } : {}),
     },
   };
+}
+
+async function enableTermsPermit(h: MapHarness): Promise<void> {
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "hello_ack",
+    msg_id: "hello_terms_permit",
+    seq: 1,
+    payload: { features: ["effect_permit_v1"] },
+  });
 }
 
 async function landOnProvider(
@@ -1555,6 +1626,7 @@ test("terms verdict auto-accepts only when the user has consented", async () => 
   h.settings.consent = "accept";
   h.scripting.verdict = termsVerdict;
   await h.bridge.start();
+  await enableTermsPermit(h);
   await h.port.inbound(offer("job_terms_0001", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_terms_0001");
 
@@ -1591,6 +1663,7 @@ test("granting consent clears the prompt flag and re-attempts the pending terms 
   const h = makeMapHarness([TERMS_SPEC]);
   h.scripting.verdict = termsVerdict;
   await h.bridge.start();
+  await enableTermsPermit(h);
   await h.port.inbound(offer("job_terms_0003", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_terms_0003");
   expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(true);
@@ -1619,6 +1692,7 @@ test("startup re-drives a pending terms gate when consent was granted while asle
   const h = makeMapHarness([TERMS_SPEC]);
   h.scripting.verdict = termsVerdict; // consent undefined -> flags the gate
   await h.bridge.start();
+  await enableTermsPermit(h);
   await h.port.inbound(offer("job_terms_wake_0001", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_terms_wake_0001");
   expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(true);
@@ -1627,7 +1701,9 @@ test("startup re-drives a pending terms gate when consent was granted while asle
   // Consent recorded directly (popup wrote it) while the one-shot re-drive
   // never ran for this job — it stays flagged with its tab still open.
   h.settings.consent = "accept";
-  await h.bridge.start(); // worker wakes
+  const waking = h.bridge.start(); // worker wakes
+  await enableTermsPermit(h);
+  await waking;
 
   expect(h.backend.store.activeJobs[0]?.needs_terms_consent).toBe(false);
   expect(h.scripting.termsAccepts.length).toBeGreaterThanOrEqual(1);
@@ -1657,6 +1733,7 @@ test("a latched download-click keeps re-classifying until a late terms modal is 
   // more immediately before clicking the declared accept control.
   h.scripting.verdictQueue.push(article, article, terms, terms);
   await h.bridge.start();
+  await enableTermsPermit(h);
   await h.port.inbound(offer("job_termsdl_0001", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_termsdl_0001");
 

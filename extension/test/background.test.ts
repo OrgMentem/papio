@@ -7,12 +7,47 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 
-import { parseBrowserMessage, type BrowserMessage, type PageCapturePayload } from "../src/protocol";
-import { emptyStore, findByJob, jobDownloadFilename, migrateManagedState, type ActiveJob, type StateBackend, type StoreShape } from "../src/state";
-import { capturePage, encodePageCapture, sanitizeFixture } from "../src/capture";
-import { KeepaliveManager, type FreshSessionEvidence, type KeepaliveAPI } from "../src/keepalive";
+import {
+  parseBrowserMessage,
+  parseBrowserMessageWithLegacyInstitutionalNavigation,
+  type BrowserMessage,
+  type PageCapturePayload,
+} from "../src/protocol";
+import {
+  emptyStore,
+  findByJob,
+  jobDownloadFilename,
+  migrateManagedState,
+  type ActiveJob,
+  type ProviderDriveEpoch,
+  type StateBackend,
+  type StoreShape,
+} from "../src/state";
+import {
+  capturePage,
+  encodePageCapture,
+  sanitizeFixture,
+} from "../src/capture";
+import {
+  KeepaliveManager,
+  type FreshSessionEvidence,
+  type KeepaliveAPI,
+} from "../src/keepalive";
 import { type AdapterSpec, type PageVerdict } from "../src/adapters/types";
-import { planExecution, planGeneric, type GenericCandidate, type GenericPlan, type Plan } from "../src/plan";
+import {
+  emptyPageBulkScanStore,
+  scanDocument,
+  withPageBulkSnapshot,
+  type PageBulkScanStore,
+  type PageBulkSnapshot,
+} from "../src/page-scan";
+import {
+  planExecution,
+  planGeneric,
+  type GenericCandidate,
+  type GenericPlan,
+  type Plan,
+} from "../src/plan";
 import {
   Bridge,
   assessDrivenPage,
@@ -34,6 +69,7 @@ import {
   type DownloadDeltaLike,
   type DownloadItemLike,
   type NativePort,
+  type PageBulkSnapshotView,
   type PdfGrabCorrelation,
   type TabChangeInfo,
   type TabInfo,
@@ -57,11 +93,18 @@ test("managed tab dedupe ignores URL fragments and prioritizes a tracked tab", (
     { id: 100, url: "https://sage.example/article?download=1#section-a" },
     { id: 101, url: "https://sage.example/other" },
   ];
-  expect(normalizeManagedTabURL("https://sage.example/article?download=1#section-a")).toBe(
-    "https://sage.example/article?download=1",
-  );
-  expect(findManagedTab(candidates, "https://sage.example/article?download=1#section-b")?.id).toBe(100);
-  expect(findManagedTab(candidates, "https://sage.example/new#fragment", 101)?.id).toBe(101);
+  expect(
+    normalizeManagedTabURL("https://sage.example/article?download=1#section-a"),
+  ).toBe("https://sage.example/article?download=1");
+  expect(
+    findManagedTab(
+      candidates,
+      "https://sage.example/article?download=1#section-b",
+    )?.id,
+  ).toBe(100);
+  expect(
+    findManagedTab(candidates, "https://sage.example/new#fragment", 101)?.id,
+  ).toBe(101);
 });
 
 const EXPIRES = "2027-01-01T00:00:00Z";
@@ -88,8 +131,14 @@ class FakePort implements NativePort {
     this.posted.push(msg);
     for (const waiter of this.frameWaiters) waiter(msg);
   }
-  async waitForFrame(type: BrowserMessage["type"], afterPostedCount = 0): Promise<BrowserMessage> {
-    const existing = this.posted.slice(afterPostedCount).map(parseBrowserMessage).find((frame) => frame.type === type);
+  async waitForFrame(
+    type: BrowserMessage["type"],
+    afterPostedCount = 0,
+  ): Promise<BrowserMessage> {
+    const existing = this.posted
+      .slice(afterPostedCount)
+      .map(parseBrowserMessage)
+      .find((frame) => frame.type === type);
     if (existing !== undefined) return existing;
     return new Promise<BrowserMessage>((resolve) => {
       const waiter = (message: object) => {
@@ -118,10 +167,15 @@ class FakePort implements NativePort {
 
 class FakeBackend implements StateBackend {
   store: StoreShape = emptyStore();
+  failNextSave = false;
   async load(): Promise<StoreShape> {
     return this.store;
   }
   async save(store: StoreShape): Promise<void> {
+    if (this.failNextSave) {
+      this.failNextSave = false;
+      throw new Error("storage unavailable");
+    }
     this.store = store;
   }
 }
@@ -141,12 +195,15 @@ class FakeAction {
   }
 }
 
-
 class FakeWindows {
   readonly created: { url: string; focused: boolean; state: string }[] = [];
   readonly updated: {
     windowID: number;
-    props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean };
+    props: {
+      focused?: boolean;
+      state?: "normal" | "minimized";
+      drawAttention?: boolean;
+    };
   }[] = [];
   readonly removed: number[] = [];
   readonly live = new Map<number, { id: number; state: string }>();
@@ -160,17 +217,30 @@ class FakeWindows {
     this.created.push(props);
     const id = this.nextId++;
     this.live.set(id, { id, state: props.state });
-    const tab = await this.tabs.create({ url: props.url, active: false, windowId: id });
+    const tab = await this.tabs.create({
+      url: props.url,
+      active: false,
+      windowId: id,
+    });
     return { id, state: props.state, tabs: [tab] };
   }
-  async get(windowID: number): Promise<{ id: number; state: string; tabs: TabInfo[] }> {
+  async get(
+    windowID: number,
+  ): Promise<{ id: number; state: string; tabs: TabInfo[] }> {
     const win = this.live.get(windowID);
     if (!win) throw new Error("no such window");
-    return { ...win, tabs: this.tabs.list().filter((tab) => tab.windowId === windowID) };
+    return {
+      ...win,
+      tabs: this.tabs.list().filter((tab) => tab.windowId === windowID),
+    };
   }
   async update(
     windowID: number,
-    props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean },
+    props: {
+      focused?: boolean;
+      state?: "normal" | "minimized";
+      drawAttention?: boolean;
+    },
   ): Promise<unknown> {
     this.updated.push({ windowID, props });
     const win = this.live.get(windowID);
@@ -180,7 +250,9 @@ class FakeWindows {
   /** Programmatic close: drops the window and any tabs still parked in it. */
   async remove(windowID: number): Promise<void> {
     this.removed.push(windowID);
-    for (const tab of this.tabs.list().filter((candidate) => candidate.windowId === windowID)) {
+    for (const tab of this.tabs
+      .list()
+      .filter((candidate) => candidate.windowId === windowID)) {
       if (tab.id !== undefined) await this.tabs.removeFromWindow(tab.id);
     }
     this.live.delete(windowID);
@@ -192,19 +264,33 @@ class FakeWindows {
 }
 
 class FakeTabGroups {
-  readonly updated: { groupID: number; props: { collapsed?: boolean; title?: string; color?: string } }[] =
-    [];
-  readonly live = new Map<number, { id: number; collapsed: boolean; title?: string; windowId?: number }>();
+  readonly updated: {
+    groupID: number;
+    props: { collapsed?: boolean; title?: string; color?: string };
+  }[] = [];
+  readonly live = new Map<
+    number,
+    { id: number; collapsed: boolean; title?: string; windowId?: number }
+  >();
   nextID = 700;
-  async get(groupID: number): Promise<{ id: number; collapsed: boolean; title?: string; windowId?: number }> {
+  async get(groupID: number): Promise<{
+    id: number;
+    collapsed: boolean;
+    title?: string;
+    windowId?: number;
+  }> {
     const group = this.live.get(groupID);
     if (!group) throw new Error("no such group");
     return group;
   }
   async query(props: {
     title?: string;
-  }): Promise<{ id: number; collapsed: boolean; title?: string; windowId?: number }[]> {
-    return [...this.live.values()].filter((g) => props.title === undefined || g.title === props.title);
+  }): Promise<
+    { id: number; collapsed: boolean; title?: string; windowId?: number }[]
+  > {
+    return [...this.live.values()].filter(
+      (g) => props.title === undefined || g.title === props.title,
+    );
   }
   async update(
     groupID: number,
@@ -223,7 +309,6 @@ class FakeTabGroups {
     this.live.delete(groupID);
   }
 }
-
 
 class FakeAlarms {
   readonly onAlarm = new FakeEmitter<[{ name: string }]>();
@@ -251,6 +336,8 @@ interface Harness {
   frames(): BrowserMessage[];
   alarms: FakeAlarms;
   postedStrings(): string[];
+  scannerAllowlist: { origins: string[] };
+  pageBulkScans: { current: PageBulkScanStore };
 }
 
 function makeHarness(
@@ -273,7 +360,8 @@ function makeHarness(
   const tabs = new ChromeTabsFake();
   tabs.nextId = 100;
   const downloads = new FakeDownloads();
-  if (opts?.firefox === true) Reflect.deleteProperty(downloads, "onDeterminingFilename");
+  if (opts?.firefox === true)
+    Reflect.deleteProperty(downloads, "onDeterminingFilename");
   const windows = opts?.windows === true ? new FakeWindows(tabs) : undefined;
   const tabGroups = opts?.tabGroups === true ? new FakeTabGroups() : undefined;
   if (tabGroups !== undefined) {
@@ -294,12 +382,15 @@ function makeHarness(
           ...(windowID === undefined ? {} : { windowId: windowID }),
         });
       }
-      tabs.grouped.push(groupId === undefined ? { tabIds } : { tabIds, groupId });
+      tabs.grouped.push(
+        groupId === undefined ? { tabIds } : { tabIds, groupId },
+      );
       const emptied = new Set<number>();
       for (const tabID of tabIds) {
         const tab = tabs.snapshot(tabID);
         if (tab === undefined) throw new Error("no such tab");
-        if (tab.groupId !== undefined && tab.groupId >= 0 && tab.groupId !== id) emptied.add(tab.groupId);
+        if (tab.groupId !== undefined && tab.groupId >= 0 && tab.groupId !== id)
+          emptied.add(tab.groupId);
         tabs.patch(tabID, { groupId: id });
       }
       for (const formerGroupID of emptied) {
@@ -318,7 +409,16 @@ function makeHarness(
   const runtimeSendMessage = async (message: object): Promise<void> => {
     runtimeMessages.push(message);
   };
-  const pdfGrabCorrelations: { current: Record<string, PdfGrabCorrelation> } = { current: {} };
+  const pdfGrabCorrelations: { current: Record<string, PdfGrabCorrelation> } = {
+    current: {},
+  };
+  // The scanner-consent record ADR-0019 Decision 2 gates DOM reads on. Real
+  // storage semantics (validated, deduplicated, sorted) live in realDeps; this
+  // is a bare cell so a test can seed or observe exactly what it means to.
+  const scannerAllowlist: { origins: string[] } = { origins: [] };
+  const pageBulkScans: { current: PageBulkScanStore } = {
+    current: emptyPageBulkScanStore(),
+  };
   const deps: BridgeDeps = {
     connectNative: () => {
       if (connects++ === 0) return port;
@@ -343,6 +443,18 @@ function makeHarness(
       },
     },
     downloads,
+    scannerAllowlist: {
+      get: async () => scannerAllowlist.origins,
+      set: async (origins) => {
+        scannerAllowlist.origins = origins;
+      },
+    },
+    pageBulkScans: {
+      get: async () => pageBulkScans.current,
+      set: async (store) => {
+        pageBulkScans.current = store;
+      },
+    },
     // No registered adapters and no granted host: these behavioural tests stay
     // out of the adapter action path. Adapter mapping is covered in
     // adapters.test.ts.
@@ -353,7 +465,8 @@ function makeHarness(
       getTermsConsent: async () => undefined,
       setTermsConsent: async () => {},
       getHandoffSurface: async () =>
-        opts?.handoffSurface ?? (opts?.workWindowEnabled === false ? "in-window" : "work-window"),
+        opts?.handoffSurface ??
+        (opts?.workWindowEnabled === false ? "in-window" : "work-window"),
     },
     ...(opts?.firefox === true
       ? {
@@ -388,11 +501,18 @@ function makeHarness(
     pdfGrabCorrelations,
     alarms,
     frames: () => ports.flatMap((p) => p.posted.map(parseBrowserMessage)),
-    postedStrings: () => ports.flatMap((p) => p.posted.map((f) => JSON.stringify(f))),
+    postedStrings: () =>
+      ports.flatMap((p) => p.posted.map((f) => JSON.stringify(f))),
+    scannerAllowlist,
+    pageBulkScans,
   };
 }
 
-function jobOffer(jobID: string, openurl = OPENURL, accessMode: "assisted" | "delegated" = "delegated"): unknown {
+function jobOffer(
+  jobID: string,
+  openurl = OPENURL,
+  accessMode: "assisted" | "delegated" = "delegated",
+): unknown {
   return {
     protocol: "papio-browser/1",
     type: "job_offer",
@@ -443,7 +563,12 @@ function materializationActiveJob(jobID: string): ActiveJob {
   };
 }
 
-function institutionalClaimResponse(jobID: string, candidateID: string, claimID = "claim_0001", bindingID = "bind_0001"): unknown {
+function institutionalClaimResponse(
+  jobID: string,
+  candidateID: string,
+  claimID = "claim_0001",
+  bindingID = "bind_0001",
+): unknown {
   return {
     protocol: "papio-browser/1",
     type: "institutional_claim_response",
@@ -460,7 +585,11 @@ function institutionalClaimResponse(jobID: string, candidateID: string, claimID 
     },
   };
 }
-function institutionalBindResponse(jobID: string, claimID = "claim_0001", bindingID = "bind_0001"): unknown {
+function institutionalBindResponse(
+  jobID: string,
+  claimID = "claim_0001",
+  bindingID = "bind_0001",
+): unknown {
   return {
     protocol: "papio-browser/1",
     type: "institutional_bind_response",
@@ -470,15 +599,26 @@ function institutionalBindResponse(jobID: string, claimID = "claim_0001", bindin
     payload: { outcome: "bound", claim_id: claimID, binding_id: bindingID },
   };
 }
-function jobOfferForHosts(jobID: string, providerHosts: string[], openurl = OPENURL): unknown {
-  const offer = jobOffer(jobID, openurl) as { payload: Record<string, unknown> };
+function jobOfferForHosts(
+  jobID: string,
+  providerHosts: string[],
+  openurl = OPENURL,
+): unknown {
+  const offer = jobOffer(jobID, openurl) as {
+    payload: Record<string, unknown>;
+  };
   offer.payload["provider_hosts"] = providerHosts;
   return offer;
 }
 function installManagedTabLedger(
   h: Harness,
   initial: Record<string, { openedAt: number; url: string; jobID?: string }>,
-): { current: () => Record<string, { openedAt: number; url: string; jobID?: string }> } {
+): {
+  current: () => Record<
+    string,
+    { openedAt: number; url: string; jobID?: string }
+  >;
+} {
   let ledger = { ...initial };
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
@@ -486,7 +626,11 @@ function installManagedTabLedger(
       ledger = Object.fromEntries(
         Object.entries(entries).map(([key, entry]) => [
           key,
-          { openedAt: entry.openedAt, url: entry.url, ...(entry.jobID === undefined ? {} : { jobID: entry.jobID }) },
+          {
+            openedAt: entry.openedAt,
+            url: entry.url,
+            ...(entry.jobID === undefined ? {} : { jobID: entry.jobID }),
+          },
         ]),
       );
     },
@@ -494,14 +638,16 @@ function installManagedTabLedger(
   return { current: () => ({ ...ledger }) };
 }
 
-
 /** Build release-grade FreshSessionEvidence for a Commit C bridge call. The
  * generation is opaque to Bridge (KeepaliveManager-internal bookkeeping), so
  * tests never need a meaningful value here. */
-function freshEvidence(h: Harness, origin: string, source: FreshSessionEvidence["source"] = "keepalive_tab"): FreshSessionEvidence {
+function freshEvidence(
+  h: Harness,
+  origin: string,
+  source: FreshSessionEvidence["source"] = "keepalive_tab",
+): FreshSessionEvidence {
   return { origin, observedAt: h.clock.now, generation: 1, source };
 }
-
 
 const PROVIDER_ADAPTER: AdapterSpec = {
   id: "provider",
@@ -516,13 +662,23 @@ function plannerResult(
   const args = injection.args ?? [];
   const spec = (args[1] as AdapterSpec | undefined) ?? PROVIDER_ADAPTER;
   const download = spec.download;
-  const expected = (args[2] ?? {}) as { title?: string; doi?: string; year?: number };
-  const policy = (args[3] ?? {}) as { access_mode?: "assisted" | "delegated" | "conservative"; terms_consent?: "accept" | "decline" };
+  const expected = (args[2] ?? {}) as {
+    title?: string;
+    doi?: string;
+    year?: number;
+  };
+  const policy = (args[3] ?? {}) as {
+    access_mode?: "assisted" | "delegated" | "conservative";
+    terms_consent?: "accept" | "decline";
+  };
   const win = new Window({ url: "https://www.jstor.org/stable/4093878" });
   const terms = verdict.kind === "terms" ? spec.termsAccept : undefined;
   const planningSpec =
     terms !== undefined
-      ? { ...spec, classify: [{ kind: "terms" as const, all: [terms.modalSelector] }] }
+      ? {
+          ...spec,
+          classify: [{ kind: "terms" as const, all: [terms.modalSelector] }],
+        }
       : spec;
   if (terms !== undefined) {
     const modalFirst = terms.modalSelector.split(/[.#\[]/u)[0]?.trim() ?? "div";
@@ -534,7 +690,8 @@ function plannerResult(
     if (modalClass !== undefined) modal.className = modalClass;
     if (/\[open\]/u.test(terms.modalSelector)) modal.setAttribute("open", "");
     const controlSelector = terms.control ?? "button";
-    const controlFirst = controlSelector.split(/[.#\[]/u)[0]?.trim() ?? "button";
+    const controlFirst =
+      controlSelector.split(/[.#\[]/u)[0]?.trim() ?? "button";
     const controlTag = /^[a-z][a-z0-9-]*/iu.exec(controlFirst)?.[0] ?? "button";
     const control = win.document.createElement(controlTag);
     const controlID = /#([A-Za-z0-9_-]+)/u.exec(controlSelector)?.[1];
@@ -565,46 +722,64 @@ function plannerResult(
     } else if (tag.toLowerCase() === "a") {
       element.setAttribute("href", "https://download.example/paper.pdf");
     }
-    (tag.toLowerCase() === "meta" ? win.document.head : win.document.body).appendChild(element);
+    (tag.toLowerCase() === "meta"
+      ? win.document.head
+      : win.document.body
+    ).appendChild(element);
   }
-  const actual = planExecution(win.document as unknown as Document, planningSpec, expected, policy);
+  const actual = planExecution(
+    win.document as unknown as Document,
+    planningSpec,
+    expected,
+    policy,
+  );
   const fullVerdict: PageVerdict = {
     kind: verdict.kind,
     adapter_id: verdict.adapter_id ?? spec.id,
     adapter_version: verdict.adapter_version ?? spec.version,
     evidence: verdict.evidence ?? [],
   };
-  const base: Plan = "assisted" in actual
-    ? {
-        adapter_id: spec.id,
-        adapter_version: spec.version,
-        verdict: fullVerdict,
-        decisive_rule: fullVerdict.kind === "unknown" ? null : `rule:${fullVerdict.kind} matched`,
-        target_ref: null,
-        method: null,
-        url: null,
-        required_consequence: "none",
-        access_mode: policy.access_mode,
-        terms_consent: policy.terms_consent ?? null,
-        expected_work: {
-          requested_doi: expected.doi?.trim().toLowerCase() ?? null,
-          requested_title: expected.title?.trim().toLowerCase().replace(/\s+/g, " ") ?? null,
-          doi: null,
-          title: null,
-        },
-        effect_graph: {
-          primary_target: null,
-          followup_target: null,
-          terms_target: null,
-          api: null,
-          consequence: "none",
-          route: null,
-        },
-        route_origin: null,
-        revalidation: { target_cardinality: 1, max_selector_length: 512, max_wait_ms: 0 },
-      }
-    : actual;
-  const termsPlan = fullVerdict.kind === "terms" && base.effect_graph.terms_target !== null;
+  const base: Plan =
+    "assisted" in actual
+      ? {
+          adapter_id: spec.id,
+          adapter_version: spec.version,
+          verdict: fullVerdict,
+          decisive_rule:
+            fullVerdict.kind === "unknown"
+              ? null
+              : `rule:${fullVerdict.kind} matched`,
+          target_ref: null,
+          method: null,
+          url: null,
+          required_consequence: "none",
+          access_mode: policy.access_mode,
+          terms_consent: policy.terms_consent ?? null,
+          expected_work: {
+            requested_doi: expected.doi?.trim().toLowerCase() ?? null,
+            requested_title:
+              expected.title?.trim().toLowerCase().replace(/\s+/g, " ") ?? null,
+            doi: null,
+            title: null,
+          },
+          effect_graph: {
+            primary_target: null,
+            followup_target: null,
+            terms_target: null,
+            api: null,
+            consequence: "none",
+            route: null,
+          },
+          route_origin: null,
+          revalidation: {
+            target_cardinality: 1,
+            max_selector_length: 512,
+            max_wait_ms: 0,
+          },
+        }
+      : actual;
+  const termsPlan =
+    fullVerdict.kind === "terms" && base.effect_graph.terms_target !== null;
   const article = fullVerdict.kind === "article" && spec.download !== undefined;
   const articleTarget = article
     ? (base.target_ref ?? {
@@ -613,33 +788,56 @@ function plannerResult(
         fingerprint: "synthetic",
       })
     : null;
-  return [{
-    result: {
-      ...base,
-      adapter_id: fullVerdict.adapter_id,
-      adapter_version: fullVerdict.adapter_version,
-      verdict: fullVerdict,
-      decisive_rule: fullVerdict.kind === "unknown" ? null : `rule:${fullVerdict.kind} matched`,
-      target_ref: termsPlan ? null : articleTarget,
-      method: termsPlan ? null : article ? spec.download!.method : null,
-      url: termsPlan ? null : article ? "https://download.example/paper.pdf" : null,
-      required_consequence: termsPlan ? "none" : article ? "download" : "none",
-      effect_graph: termsPlan
-        ? base.effect_graph
-        : {
-            primary_target: articleTarget,
-            followup_target: null,
-            terms_target: null,
-            api: null,
-            consequence: article && spec.download!.method === "click" ? "modal" : article ? "download" : "none",
-            route: { origin: "https://download.example", pathname: "/paper.pdf" },
-          },
-      route_origin: termsPlan ? base.route_origin : "https://download.example",
-      revalidation: termsPlan
-        ? base.revalidation
-        : { target_cardinality: 1, max_selector_length: 512, max_wait_ms: 0 },
+  return [
+    {
+      result: {
+        ...base,
+        adapter_id: fullVerdict.adapter_id,
+        adapter_version: fullVerdict.adapter_version,
+        verdict: fullVerdict,
+        decisive_rule:
+          fullVerdict.kind === "unknown"
+            ? null
+            : `rule:${fullVerdict.kind} matched`,
+        target_ref: termsPlan ? null : articleTarget,
+        method: termsPlan ? null : article ? spec.download!.method : null,
+        url: termsPlan
+          ? null
+          : article
+            ? "https://download.example/paper.pdf"
+            : null,
+        required_consequence: termsPlan
+          ? "none"
+          : article
+            ? "download"
+            : "none",
+        effect_graph: termsPlan
+          ? base.effect_graph
+          : {
+              primary_target: articleTarget,
+              followup_target: null,
+              terms_target: null,
+              api: null,
+              consequence:
+                article && spec.download!.method === "click"
+                  ? "modal"
+                  : article
+                    ? "download"
+                    : "none",
+              route: {
+                origin: "https://download.example",
+                pathname: "/paper.pdf",
+              },
+            },
+        route_origin: termsPlan
+          ? base.route_origin
+          : "https://download.example",
+        revalidation: termsPlan
+          ? base.revalidation
+          : { target_cardinality: 1, max_selector_length: 512, max_wait_ms: 0 },
+      },
     },
-  }];
+  ];
 }
 function plannedEffectResult(
   injection: Parameters<BridgeDeps["scripting"]["executeScript"]>[0],
@@ -647,9 +845,15 @@ function plannedEffectResult(
   const plan = (injection.args?.[0] ?? {}) as Plan;
   const rule = (injection.args?.[1] ?? {}) as { method?: string };
   if (rule.method === "click") return [{ result: { ok: true } }];
-  return [{ result: { ok: plan.url !== null, ...(plan.url !== null ? { url: plan.url } : {}) } }];
+  return [
+    {
+      result: {
+        ok: plan.url !== null,
+        ...(plan.url !== null ? { url: plan.url } : {}),
+      },
+    },
+  ];
 }
-
 
 function sanitizedObservedChallenge(html: string): Document {
   const window = new Window({ url: "https://fixture.local/" });
@@ -664,18 +868,26 @@ function sanitizedObservedChallenge(html: string): Document {
   return window.document as unknown as Document;
 }
 
-function useUnknownProviderClassifier(h: Harness, challenge: () => boolean): void {
+function useUnknownProviderClassifier(
+  h: Harness,
+  challenge: () => boolean,
+): void {
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === planExecution) return plannerResult(injection, { kind: "unknown" });
-    if (injection.func === assessDrivenPage) return [{ result: { kind: challenge() ? "challenge" : "normal" } }];
+    if (injection.func === planExecution)
+      return plannerResult(injection, { kind: "unknown" });
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: challenge() ? "challenge" : "normal" } }];
     if (injection.func === isBotChallenge) return [{ result: challenge() }];
     return [];
   };
 }
 
-async function classifyProviderUnknown(h: Harness, jobID: string): Promise<number> {
+async function classifyProviderUnknown(
+  h: Harness,
+  jobID: string,
+): Promise<number> {
   await h.bridge.start();
   await h.port.inbound(jobOffer(jobID));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -687,7 +899,12 @@ async function classifyProviderUnknown(h: Harness, jobID: string): Promise<numbe
 /** Exercise the planner's URL resolution directly. This mirror used to call
  * an injected background helper that no longer exists; the planner is now the
  * single source of truth for href/meta URL safety. */
-function plannerURL(method: "meta" | "href", pageURL: string, html: string, selector: string): string | null {
+function plannerURL(
+  method: "meta" | "href",
+  pageURL: string,
+  html: string,
+  selector: string,
+): string | null {
   const window = new Window({ url: pageURL });
   window.document.write(html);
   const adapter: AdapterSpec = {
@@ -710,7 +927,12 @@ function plannerURL(method: "meta" | "href", pageURL: string, html: string, sele
           }
         : { selector, requireKind: "article", method: "href" },
   };
-  const result = planExecution(window.document as unknown as Document, adapter, {}, {});
+  const result = planExecution(
+    window.document as unknown as Document,
+    adapter,
+    {},
+    {},
+  );
   return "assisted" in result ? null : result.url;
 }
 
@@ -718,7 +940,8 @@ test("planner meta URL resolution rejects every self-reference escape but still 
   const PAGE = "https://p.example.edu/a";
   const metaTag = (content: string): string =>
     `<html><head><meta name="citation_pdf_url" content="${content}"></head><body></body></html>`;
-  const run = (html: string): string | null => plannerURL("meta", PAGE, html, "citation_pdf_url");
+  const run = (html: string): string | null =>
+    plannerURL("meta", PAGE, html, "citation_pdf_url");
 
   expect(run("<html><head></head><body></body></html>")).toBeNull(); // no meta tag at all
   expect(run(metaTag(""))).toBeNull(); // empty content
@@ -736,14 +959,20 @@ test("planner meta URL resolution rejects every self-reference escape but still 
   expect(run(metaTag("data:text/html,hi"))).toBeNull();
   expect(run(metaTag("blob:https://p.example.edu/xyz"))).toBeNull();
   // Must still work: a real, distinct download URL on the same path.
-  expect(run(metaTag("?download=true"))).toBe("https://p.example.edu/a?download=true");
-  expect(run(metaTag("https://p.example.edu/other.pdf"))).toBe("https://p.example.edu/other.pdf");
+  expect(run(metaTag("?download=true"))).toBe(
+    "https://p.example.edu/a?download=true",
+  );
+  expect(run(metaTag("https://p.example.edu/other.pdf"))).toBe(
+    "https://p.example.edu/other.pdf",
+  );
 });
 
 test("planner href URL resolution rejects every self-reference escape but still resolves a distinct download URL", () => {
   const PAGE = "https://p.example.edu/a";
-  const anchor = (href: string): string => `<html><body><a class="pdf" href="${href}">Download</a></body></html>`;
-  const run = (html: string): string | null => plannerURL("href", PAGE, html, "a.pdf");
+  const anchor = (href: string): string =>
+    `<html><body><a class="pdf" href="${href}">Download</a></body></html>`;
+  const run = (html: string): string | null =>
+    plannerURL("href", PAGE, html, "a.pdf");
 
   expect(run("<html><body></body></html>")).toBeNull(); // no matching anchor at all
   expect(run(anchor(""))).toBeNull(); // empty href
@@ -755,8 +984,12 @@ test("planner href URL resolution rejects every self-reference escape but still 
   expect(run(anchor("javascript:alert(1)"))).toBeNull();
   expect(run(anchor("data:text/html,hi"))).toBeNull();
   expect(run(anchor("blob:https://p.example.edu/xyz"))).toBeNull();
-  expect(run(anchor("?download=true"))).toBe("https://p.example.edu/a?download=true");
-  expect(run(anchor("https://p.example.edu/other.pdf"))).toBe("https://p.example.edu/other.pdf");
+  expect(run(anchor("?download=true"))).toBe(
+    "https://p.example.edu/a?download=true",
+  );
+  expect(run(anchor("https://p.example.edu/other.pdf"))).toBe(
+    "https://p.example.edu/other.pdf",
+  );
 });
 
 function helloRequiredError(): unknown {
@@ -773,7 +1006,11 @@ function helloRequiredError(): unknown {
 }
 
 function helloAck(
-  payload: { daemon_version?: string; features?: string[]; resolver_origins?: string[] } = {},
+  payload: {
+    daemon_version?: string;
+    features?: string[];
+    resolver_origins?: string[];
+  } = {},
 ): unknown {
   return {
     protocol: "papio-browser/1",
@@ -819,7 +1056,11 @@ function nativeResult(type: string, payload: Record<string, unknown>): unknown {
   };
 }
 
-function snapshotResult(requestID: string, pending = 0, schema: 1 | 2 = 1): unknown {
+function snapshotResult(
+  requestID: string,
+  pending = 0,
+  schema: 1 | 2 = 1,
+): unknown {
   return nativeResult("triage_snapshot_response", {
     request_id: requestID,
     schema,
@@ -832,7 +1073,10 @@ function snapshotResult(requestID: string, pending = 0, schema: 1 | 2 = 1): unkn
 }
 
 /** One open `manual_download` row exactly as triage-snapshot/1 emits it. */
-function manualDownloadItem(jobID: string, actionID = 1): Record<string, unknown> {
+function manualDownloadItem(
+  jobID: string,
+  actionID = 1,
+): Record<string, unknown> {
   return {
     kind: "human_action",
     id: `action:${actionID}`,
@@ -857,14 +1101,18 @@ async function settleSnapshot(
   items: Record<string, unknown>[],
   opts?: { hasMore?: boolean; unsupported?: number; cursor?: string },
 ): Promise<void> {
-  const before = h.frames().filter((frame) => frame.type === "triage_snapshot_request").length;
+  const before = h
+    .frames()
+    .filter((frame) => frame.type === "triage_snapshot_request").length;
   const pending = h.bridge.requestTriageSnapshot({
     schema_versions: [1],
     ...(opts?.cursor === undefined ? {} : { cursor: opts.cursor }),
   });
   await Promise.resolve();
   await Promise.resolve();
-  const request = h.frames().filter((frame) => frame.type === "triage_snapshot_request")[before];
+  const request = h
+    .frames()
+    .filter((frame) => frame.type === "triage_snapshot_request")[before];
   expect(request).toBeDefined();
   const hasMore = opts?.hasMore === true;
   await h.port.inbound(
@@ -872,7 +1120,11 @@ async function settleSnapshot(
       request_id: request!.payload["request_id"],
       schema: 1,
       generated_at: "2027-01-01T00:00:00Z",
-      counts: { ...triageCounts(0), pending_total: items.length, actions: items.length },
+      counts: {
+        ...triageCounts(0),
+        pending_total: items.length,
+        actions: items.length,
+      },
       items,
       ...(hasMore ? { cursor: "next-page" } : {}),
       has_more: hasMore,
@@ -891,6 +1143,7 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
   expect(first?.msg_id).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
   expect(first?.payload["extension_version"]).toBe("0.1.0");
   expect(first?.payload["features"]).toEqual([
+    "effect_permit_v1",
     "institutional_materialization_v1",
     "surface_presence_v1",
     "work_pulse_v1",
@@ -907,7 +1160,12 @@ test("startup clears a stale badge when persisted daemon health is connected", a
 test("hello acknowledgment persists daemon version, features, and connected status", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["browser-v1", "direct-download"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["browser-v1", "direct-download"],
+    }),
+  );
 
   expect(h.backend.store).toMatchObject({
     connectionStatus: "connected",
@@ -935,23 +1193,28 @@ test("a restarted worker clears persisted page-acquire capability before hello_a
   });
   expect(h.bridge.pageAcquireAvailable()).toBe(false);
   let response: unknown;
-  void h.bridge.requestPageAcquire({
-    url: "https://publisher.example.edu/article/42",
-    doi: "10.1000/example.42",
-  }).then((value) => {
-    response = value;
+  void h.bridge
+    .requestPageAcquire({
+      url: "https://publisher.example.edu/article/42",
+      doi: "10.1000/example.42",
+    })
+    .then((value) => {
+      response = value;
+    });
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(response).toEqual({
+    error: "Page acquisition is not available from this daemon",
   });
-  await Promise.resolve();
-  await Promise.resolve();
-  expect(response).toEqual({ error: "Page acquisition is not available from this daemon" });
   expect(h.frames().map((frame) => frame.type)).toEqual(["hello"]);
 });
-
 
 test("relays page acquisition and routes its acknowledgement to the popup", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["page_acquire"] }));
+  await h.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, features: ["page_acquire"] }),
+  );
 
   const acknowledgement = h.bridge.requestPageAcquire({
     url: "https://publisher.example.edu/article/42",
@@ -975,22 +1238,29 @@ test("relays page acquisition and routes its acknowledgement to the popup", asyn
     seq: 2,
     payload: { job_id: "job_page_acquire_001", duplicate: true },
   });
-  expect(await acknowledgement).toEqual({ job_id: "job_page_acquire_001", duplicate: true });
+  expect(await acknowledgement).toEqual({
+    job_id: "job_page_acquire_001",
+    duplicate: true,
+  });
 });
 
 test("refuses a DOI-less page acquisition without sending a frame", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["page_acquire"] }));
+  await h.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, features: ["page_acquire"] }),
+  );
 
   let response: unknown;
-  void h.bridge.requestPageAcquire({
-    url: "https://publisher.example.edu/article/42",
-    title: "A DOI-less page",
-    source: "popup",
-  }).then((value) => {
-    response = value;
-  });
+  void h.bridge
+    .requestPageAcquire({
+      url: "https://publisher.example.edu/article/42",
+      title: "A DOI-less page",
+      source: "popup",
+    })
+    .then((value) => {
+      response = value;
+    });
   await Promise.resolve();
   await Promise.resolve();
   expect(response).toEqual({ error: "page has no DOI" });
@@ -1001,9 +1271,13 @@ test("hello_ack caches resolver origins and badges ungranted ones while connecte
   const h = makeHarness();
   h.deps.permissions.contains = async () => false;
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: ["https://onesearch.library.example.edu"] }));
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://onesearch.library.example.edu"] }),
+  );
 
-  expect(h.backend.store.resolverOrigins).toEqual(["https://onesearch.library.example.edu"]);
+  expect(h.backend.store.resolverOrigins).toEqual([
+    "https://onesearch.library.example.edu",
+  ]);
   expect(h.action.texts.at(-1)).toBe("1");
   expect(h.action.backgroundColors.at(-1)).toBe("#1a73e8");
 });
@@ -1011,9 +1285,12 @@ test("hello_ack caches resolver origins and badges ungranted ones while connecte
 test("a granted resolver origin leaves the connected badge clear", async () => {
   const h = makeHarness();
   h.deps.permissions.contains = async ({ origins }) =>
-    origins.length === 1 && origins[0] === "https://onesearch.library.example.edu/*";
+    origins.length === 1 &&
+    origins[0] === "https://onesearch.library.example.edu/*";
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: ["https://onesearch.library.example.edu"] }));
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://onesearch.library.example.edu"] }),
+  );
 
   expect(h.action.texts.at(-1)).toBe("");
 });
@@ -1112,7 +1389,9 @@ test("a re-offer after a simulated worker restart recovers the durable ledger ta
   const originalTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   expect(h.tabs.created).toHaveLength(1);
 
-  const internal = h.bridge as unknown as { update: (fn: (store: StoreShape) => StoreShape) => Promise<void> };
+  const internal = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+  };
   await internal.update((store) => ({
     ...store,
     activeJobs: store.activeJobs.map((job) =>
@@ -1130,14 +1409,16 @@ test("a stale tab id with no ledger match mints once and records the replacement
   const offerURL = "https://resolver.example.edu/openurl?ledger=miss";
   const h = makeHarness({
     ...emptyStore(),
-    activeJobs: [{
-      job_id: jobID,
-      tab_id: 999,
-      offered_at: 1_700_000_000_000,
-      expires_at: 1_800_000_000_000,
-      status: "accepted",
-      provider_hosts: [PROVIDER_HOST],
-    }],
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: 999,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
     offerURLs: { [jobID]: offerURL },
   });
   const ledger = installManagedTabLedger(h, {});
@@ -1150,7 +1431,9 @@ test("a stale tab id with no ledger match mints once and records the replacement
   await h.port.inbound(jobOffer(jobID, offerURL));
 
   expect(h.tabs.created).toHaveLength(1);
-  const replacement = h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id;
+  const replacement = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobID,
+  )?.tab_id;
   expect(replacement).toBe(100);
   expect(ledger.current()["100"]).toMatchObject({ url: offerURL, jobID });
 });
@@ -1170,8 +1453,11 @@ test("repeated reoffers reuse one ledger tab without growing the browser surface
 test("assisted direct-file offers stay parked for either auth requirement", async () => {
   for (const requiresAuth of [false, true]) {
     const h = makeHarness();
-    const offer = jobOffer(`job_assisted_direct_${requiresAuth}`) as { payload: Record<string, unknown> };
-    offer.payload["openurl"] = "https://dl.acm.org/doi/pdf/10.1145/3630106.3660000";
+    const offer = jobOffer(`job_assisted_direct_${requiresAuth}`) as {
+      payload: Record<string, unknown>;
+    };
+    offer.payload["openurl"] =
+      "https://dl.acm.org/doi/pdf/10.1145/3630106.3660000";
     offer.payload["access_mode"] = "assisted";
     offer.payload["requires_auth"] = requiresAuth;
     await h.bridge.start();
@@ -1189,7 +1475,9 @@ test("assisted direct-file offers stay parked for either auth requirement", asyn
 
 test("a legacy offer without access authority stays parked", async () => {
   const h = makeHarness();
-  const offer = jobOffer("job_legacy_missing_mode") as { payload: Record<string, unknown> };
+  const offer = jobOffer("job_legacy_missing_mode") as {
+    payload: Record<string, unknown>;
+  };
   delete offer.payload["access_mode"];
   await h.bridge.start();
   await h.port.inbound(offer);
@@ -1213,19 +1501,24 @@ test("a same-family orphan from another job is replaced rather than reused", asy
   });
   h.tabs.seed({ id: 100, url: "https://resolver.example.edu/openurl?job=old" });
   await h.bridge.start();
-  const offer = jobOffer("job_new_exact_url", "https://resolver.example.edu/openurl?job=new");
+  const offer = jobOffer(
+    "job_new_exact_url",
+    "https://resolver.example.edu/openurl?job=new",
+  );
   await h.port.inbound(offer);
-  expect(h.tabs.created).toEqual([{ url: "https://resolver.example.edu/openurl?job=new", active: true }]);
+  expect(h.tabs.created).toEqual([
+    { url: "https://resolver.example.edu/openurl?job=new", active: true },
+  ]);
   expect(h.backend.store.activeJobs[0]?.tab_id).toBe(101);
 });
-
-
 
 test("direct JSON landing is parked as unknown rather than a candidate-local miss", async () => {
   const h = makeHarness();
   const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942.pdf";
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"] }),
+  );
   await h.port.inbound({
     protocol: "papio-browser/1",
     type: "provider_direct_get_request",
@@ -1251,7 +1544,9 @@ test("direct JSON landing is parked as unknown rather than a candidate-local mis
     state: "complete",
   });
   await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
-  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  const result = h
+    .frames()
+    .find((frame) => frame.type === "provider_direct_get_result");
   expect(result?.payload.outcome).toBe("unknown");
   expect(h.downloads.removedFiles).toEqual([901]);
 });
@@ -1259,7 +1554,9 @@ test("direct JSON landing is parked as unknown rather than a candidate-local mis
 test("a direct route requiring durable terms consent does not download without consent", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"] }),
+  );
   await h.port.inbound({
     protocol: "papio-browser/1",
     type: "provider_direct_get_request",
@@ -1279,7 +1576,9 @@ test("a direct route requiring durable terms consent does not download without c
   });
 
   expect(h.downloads.started).toEqual([]);
-  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  const result = h
+    .frames()
+    .find((frame) => frame.type === "provider_direct_get_result");
   expect(result?.payload).toMatchObject({
     drive_attempt_id: "direct-terms-attempt-0001",
     outcome: "terms",
@@ -1288,23 +1587,69 @@ test("a direct route requiring durable terms consent does not download without c
   expect(h.backend.store.activeJobs).toEqual([]);
 });
 
+test("mixed-version direct request without effect permit never downloads and emits no result or state", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942";
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "provider_direct_get_request",
+    msg_id: "direct_mixed_version_0001",
+    job_id: "job_direct_mixed_version",
+    seq: 2,
+    payload: {
+      drive_attempt_id: "direct-mixed-version-attempt",
+      ordinal: 0,
+      route_revision: "acm-doi-pdf/1",
+      expected_identifier: "doi:10.1145/3630106.3658942",
+      url: directURL,
+      allowed_origin: "https://dl.acm.org",
+      path_family: "/doi/pdf/{doi}",
+      terms_policy: "none",
+    },
+  });
+  expect(h.downloads.started).toHaveLength(0);
+  expect(
+    h.frames().some((frame) => frame.type === "provider_direct_get_result"),
+  ).toBe(false);
+  expect(h.backend.store.activeJobs).toEqual([]);
+  expect(JSON.stringify(h.backend.store)).not.toContain(directURL);
+  expect(JSON.stringify(h.backend.store)).not.toContain(
+    "direct-mixed-version-attempt",
+  );
+  // No direct epoch or download state was persisted; the request was ignored before any
+  // irreversible browser work.
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_direct_mixed_version",
+    ),
+  ).toBeUndefined();
+});
 
 test("pre-auth handoffs queue behind one visible tab, then release after auth returns", async () => {
   const h = makeHarness();
-  const jobIDs = Array.from({ length: 5 }, (_, index) => `job_0001a_queue_${index}`);
+  const jobIDs = Array.from(
+    { length: 5 },
+    (_, index) => `job_0001a_queue_${index}`,
+  );
 
   await h.bridge.start();
   await Promise.all(jobIDs.map((jobID) => h.port.inbound(jobOffer(jobID))));
 
   expect(h.tabs.created.filter((tab) => tab.active)).toHaveLength(1);
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(4);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.status === "queued"),
+  ).toHaveLength(4);
 
   const activeJob = h.backend.store.activeJobs.find((job) => job.tab_id >= 0);
   expect(activeJob).toBeDefined();
   const activeTabID = activeJob?.tab_id ?? -1;
   const idpURL = "https://idp.example.edu/sso";
   await h.tabs.completeNavigation(activeTabID, idpURL);
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(4);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.status === "queued"),
+  ).toHaveLength(4);
 
   // A pre-existing broker handoff can still be parked at IdP when another tab
   // returns first; auth release must force that stale redirect through cookies.
@@ -1326,7 +1671,9 @@ test("pre-auth handoffs queue behind one visible tab, then release after auth re
 
   expect(h.tabs.created).toHaveLength(1);
   expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(0);
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(4);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.status === "queued"),
+  ).toHaveLength(4);
   expect(h.tabs.reloaded).toEqual([stuckTabID]);
 });
 
@@ -1334,7 +1681,9 @@ test("a cold requires-auth handoff is signalled while queued and opens after its
   // No KeepaliveManager reports an authenticated session in this harness: this
   // is the disabled-keepalive, no-evidence path that must still reach the user.
   const h = makeHarness();
-  const offer = jobOffer("job_0001a_requires_auth") as { payload: Record<string, unknown> };
+  const offer = jobOffer("job_0001a_requires_auth") as {
+    payload: Record<string, unknown>;
+  };
   offer.payload["requires_auth"] = true;
 
   await h.bridge.start();
@@ -1360,7 +1709,10 @@ test("a cold requires-auth handoff is signalled while queued and opens after its
 
   expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  expect(h.backend.store.activeJobs[0]).toMatchObject({ tab_id: tabID, status: "accepted" });
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    tab_id: tabID,
+    status: "accepted",
+  });
 
   const idpURL = "https://idp.example.edu/sso";
   await h.tabs.userNavigate(tabID, idpURL);
@@ -1376,7 +1728,13 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
   const h = makeHarness();
   let ledger: Record<
     string,
-    { openedAt: number; url: string; privateURL?: boolean; windowId?: number; groupId?: number }
+    {
+      openedAt: number;
+      url: string;
+      privateURL?: boolean;
+      windowId?: number;
+      groupId?: number;
+    }
   > = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
@@ -1393,7 +1751,9 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
   await h.port.inbound(offer);
 
   expect(h.tabs.created).toEqual([]);
-  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toEqual([]);
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toEqual([]);
   expect(h.backend.store.activeJobs[0]).toMatchObject({
     job_id: jobID,
     tab_id: -1,
@@ -1454,9 +1814,14 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
       phase: "engaging",
     },
   });
-  await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({ ok: true, opened: true });
+  await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({
+    ok: true,
+    opened: true,
+  });
   expect(h.tabs.created).toHaveLength(1);
-  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toHaveLength(1);
   const driveTimeout = h.timers.find((timer) => timer.ms === 3 * 60_000);
   expect(driveTimeout).toBeDefined();
 
@@ -1467,8 +1832,12 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
     parked_with_tab: true,
   });
   expect(h.tabs.removed).not.toContain(100);
-  const internals = h.bridge as unknown as { handoffDrives: Map<string, unknown> };
-  const driveTimerCount = h.timers.filter((timer) => timer.ms === 3 * 60_000).length;
+  const internals = h.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+  };
+  const driveTimerCount = h.timers.filter(
+    (timer) => timer.ms === 3 * 60_000,
+  ).length;
   expect(internals.handoffDrives.has(jobID)).toBe(false);
   await h.port.inbound(offer);
   expect(h.backend.store.activeJobs[0]).toMatchObject({
@@ -1477,10 +1846,17 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
     parked_with_tab: true,
   });
   expect(internals.handoffDrives.has(jobID)).toBe(false);
-  expect(h.timers.filter((timer) => timer.ms === 3 * 60_000)).toHaveLength(driveTimerCount);
-  await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({ ok: true, opened: true });
+  expect(h.timers.filter((timer) => timer.ms === 3 * 60_000)).toHaveLength(
+    driveTimerCount,
+  );
+  await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({
+    ok: true,
+    opened: true,
+  });
   expect(h.tabs.created).toHaveLength(1);
-  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toHaveLength(1);
 });
 
 test("handoff_link_v1 keeps a warm requires-auth offer on the eager path", async () => {
@@ -1505,7 +1881,9 @@ test("handoff_link_v1 keeps a warm requires-auth offer on the eager path", async
     requires_auth: true,
   });
   expect(h.backend.store.activeJobs[0]?.engagement_required).toBeUndefined();
-  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toEqual([]);
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toEqual([]);
 });
 
 test("a fresh tab that loses its binding to cancellation is closed", async () => {
@@ -1515,7 +1893,13 @@ test("a fresh tab that loses its binding to cancellation is closed", async () =>
   const h = makeHarness();
   let ledger: Record<
     string,
-    { openedAt: number; url: string; privateURL?: boolean; windowId?: number; groupId?: number }
+    {
+      openedAt: number;
+      url: string;
+      privateURL?: boolean;
+      windowId?: number;
+      groupId?: number;
+    }
   > = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
@@ -1564,7 +1948,6 @@ test("a fresh tab that loses its binding to cancellation is closed", async () =>
   expect(h.backend.store.federatedLoginOwners ?? {}).toEqual({});
 });
 
-
 test("hello migration marks restored tabless auth jobs as fresh handoffs", async () => {
   const jobID = "job_fresh_link_migrated";
   const seed: StoreShape = {
@@ -1611,7 +1994,9 @@ test("missing institution metadata is a structured engagement failure and never 
       message: "The handoff is missing institution identity metadata",
     },
   });
-  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toEqual([]);
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toEqual([]);
   expect(h.tabs.created).toEqual([]);
 });
 
@@ -1716,21 +2101,29 @@ test("open-access offers open immediately without institutional session evidence
     const offer = jobOffer(`job_0001a_open_access_${String(requiresAuth)}`) as {
       payload: Record<string, unknown>;
     };
-    if (requiresAuth !== undefined) offer.payload["requires_auth"] = requiresAuth;
+    if (requiresAuth !== undefined)
+      offer.payload["requires_auth"] = requiresAuth;
 
     await h.bridge.start();
     await h.port.inbound(offer);
 
     expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
-    expect(h.backend.store.activeJobs[0]).toMatchObject({ tab_id: 100, status: "accepted" });
+    expect(h.backend.store.activeJobs[0]).toMatchObject({
+      tab_id: 100,
+      status: "accepted",
+    });
   }
 });
 
 test("an OA completion cannot release a queued institutional handoff", async () => {
   const h = makeHarness();
-  const institutionalURL = "https://resolver.example.edu/openurl?ctx=institutional";
+  const institutionalURL =
+    "https://resolver.example.edu/openurl?ctx=institutional";
   const openAccessURL = "https://oa.example.edu/article/123";
-  const institutional = jobOffer("job_0001a_institutional", institutionalURL) as {
+  const institutional = jobOffer(
+    "job_0001a_institutional",
+    institutionalURL,
+  ) as {
     payload: Record<string, unknown>;
   };
   institutional.payload["requires_auth"] = true;
@@ -1742,13 +2135,20 @@ test("an OA completion cannot release a queued institutional handoff", async () 
   await h.bridge.start();
   await h.port.inbound(institutional);
   await h.port.inbound(openAccess);
-  const openAccessTabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_0001a_open_access")?.tab_id ?? -1;
+  const openAccessTabID =
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_0001a_open_access",
+    )?.tab_id ?? -1;
   const providerURL = `https://${PROVIDER_HOST}/stable/open-access`;
   await h.tabs.completeNavigation(openAccessTabID, providerURL);
 
   expect(h.tabs.created).toEqual([{ url: openAccessURL, active: true }]);
   expect(h.bridge.latestOpenURL()).toBe(institutionalURL);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_0001a_institutional")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_0001a_institutional",
+    ),
+  ).toMatchObject({
     tab_id: -1,
     status: "queued",
   });
@@ -1761,27 +2161,35 @@ test("a warm resolver landing releases queued handoffs without an auth event", a
 
   await h.bridge.start();
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
-  const firstTabID = h.backend.store.activeJobs.find((job) => job.tab_id >= 0)?.tab_id ?? -1;
+  const firstTabID =
+    h.backend.store.activeJobs.find((job) => job.tab_id >= 0)?.tab_id ?? -1;
 
   await h.tabs.completeNavigation(firstTabID, OPENURL);
   // The landing is warm evidence for this resolver, but the first drive still
   // owns the sole effect slot. Settle that owner before asserting the FIFO
   // successor, rather than inventing a concurrent second drive.
   await h.bridge.requestCancel(jobIDs[0]!);
-  const internals = h.bridge as unknown as { releaseQueuedHandoffs: () => Promise<void> };
+  const internals = h.bridge as unknown as {
+    releaseQueuedHandoffs: () => Promise<void>;
+  };
   await internals.releaseQueuedHandoffs.call(h.bridge);
 
   expect(h.tabs.created).toEqual([
     { url: OPENURL, active: true },
     { url: OPENURL, active: false },
   ]);
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(1);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.status === "queued"),
+  ).toHaveLength(1);
   expect(h.backend.store.lastAuthReturnedAt).toBeUndefined();
-  expect(h.frames().some((frame) => frame.type === "auth_returned")).toBe(false);
+  expect(h.frames().some((frame) => frame.type === "auth_returned")).toBe(
+    false,
+  );
 });
 test("a tracked resolver landing routes its electronic service only with origin permission", async () => {
   const h = makeHarness();
-  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] =
+    [];
   h.deps.permissions.contains = async ({ origins }) =>
     origins.length === 1 && origins[0] === "https://resolver.example.edu/*";
   h.deps.scripting.executeScript = async (injection) => {
@@ -1818,7 +2226,8 @@ test("a fresh resolver link routes after its one-use URL is retired", async () =
   const entityID = "https://idp.example.edu/entity";
   const freshURL = "https://resolver.example.edu/openurl?fresh=private";
   const h = makeHarness();
-  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] =
+    [];
   h.deps.permissions.contains = async ({ origins }) =>
     origins.length === 1 && origins[0] === "https://resolver.example.edu/*";
   h.deps.scripting.executeScript = async (injection) => {
@@ -1857,9 +2266,14 @@ test("a fresh resolver link routes after its one-use URL is retired", async () =
 
 test("a resolver no-entitlement route emits once and short-circuits provider classification", async () => {
   const h = makeHarness();
-  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] =
+    [];
   h.deps.permissions.contains = async () => true;
-  h.deps.adapterSpecs.push({ ...PROVIDER_ADAPTER, id: "resolver-provider", hosts: ["resolver.example.edu"] });
+  h.deps.adapterSpecs.push({
+    ...PROVIDER_ADAPTER,
+    id: "resolver-provider",
+    hosts: ["resolver.example.edu"],
+  });
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
     return [{ result: { kind: "no_entitlement" } }];
@@ -1871,26 +2285,36 @@ test("a resolver no-entitlement route emits once and short-circuits provider cla
   await h.tabs.completeNavigation(tabID, OPENURL);
   await h.tabs.completeNavigation(tabID, OPENURL);
 
-  const outcomes = h.frames().filter(
-    (frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "no_entitlement",
-  );
+  const outcomes = h
+    .frames()
+    .filter(
+      (frame) =>
+        frame.type === "provider_outcome" &&
+        frame.payload["outcome"] === "no_entitlement",
+    );
   expect(outcomes).toHaveLength(1);
   expect(outcomes[0]?.payload).toEqual({ outcome: "no_entitlement" });
   expect(injections).toHaveLength(1);
-  expect(injections.every((injection) => injection.func === routeResolverService)).toBe(true);
+  expect(
+    injections.every((injection) => injection.func === routeResolverService),
+  ).toBe(true);
 });
 
 test("a resolver no-service route stays assisted without an outcome", async () => {
   const h = makeHarness();
   h.deps.permissions.contains = async () => true;
-  h.deps.scripting.executeScript = async () => [{ result: { kind: "no_service" } }];
+  h.deps.scripting.executeScript = async () => [
+    { result: { kind: "no_service" } },
+  ];
 
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0001a_resolver_no_service"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   await h.tabs.completeNavigation(tabID, OPENURL);
 
-  expect(h.frames().some((frame) => frame.type === "provider_outcome")).toBe(false);
+  expect(h.frames().some((frame) => frame.type === "provider_outcome")).toBe(
+    false,
+  );
   expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
 });
 
@@ -1908,28 +2332,34 @@ test("an unregistered provider captures evidence and exits with a missing-adapte
   };
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func === capturePage) {
-      return [{
-        result: {
-          html: "<main class=\"article\">unsupported provider shape</main>",
-          origin: `https://${PROVIDER_HOST}`,
-          path: "/stable/article",
+      return [
+        {
+          result: {
+            html: '<main class="article">unsupported provider shape</main>',
+            origin: `https://${PROVIDER_HOST}`,
+            path: "/stable/article",
+          },
         },
-      }];
+      ];
     }
     return [];
   };
 
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
-  await h.port.inbound(jobOfferForHosts("job_missing_adapter", ["resolver.example.edu"]));
+  await h.port.inbound(
+    jobOfferForHosts("job_missing_adapter", ["resolver.example.edu"]),
+  );
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const articleURL = `https://${PROVIDER_HOST}/stable/article`;
   h.tabs.seed({ id: tabID, url: articleURL });
   let nextTimer = h.timers.length;
   await h.tabs.completeNavigation(tabID, articleURL);
-  
+
   for (let retry = 0; retry < 2; retry += 1) {
-    const relative = h.timers.slice(nextTimer).findIndex((timer) => timer.ms === 2_500);
+    const relative = h.timers
+      .slice(nextTimer)
+      .findIndex((timer) => timer.ms === 2_500);
     expect(relative).toBeGreaterThanOrEqual(0);
     nextTimer += relative;
     const timer = h.timers[nextTimer]!;
@@ -1938,8 +2368,12 @@ test("an unregistered provider captures evidence and exits with a missing-adapte
     await timer.fn();
   }
 
-  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(1);
-  const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
+  expect(
+    h.frames().filter((frame) => frame.type === "page_capture"),
+  ).toHaveLength(1);
+  const outcomes = h
+    .frames()
+    .filter((frame) => frame.type === "provider_outcome");
   expect(outcomes).toHaveLength(1);
   expect(outcomes[0]?.payload).toMatchObject({
     outcome: "ui_changed",
@@ -1976,12 +2410,22 @@ test("a registry-only adapter host classifies and emits an observed capture", as
       },
     },
   };
-  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] =
+    [];
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
-    if (injection.func === planExecution) return plannerResult(injection, { kind: "unknown" });
+    if (injection.func === planExecution)
+      return plannerResult(injection, { kind: "unknown" });
     if (injection.func === capturePage) {
-      return [{ result: { html: `<main class="article">new provider shape</main>`, origin: `https://${PROVIDER_HOST}`, path: "/stable/article" } }];
+      return [
+        {
+          result: {
+            html: `<main class="article">new provider shape</main>`,
+            origin: `https://${PROVIDER_HOST}`,
+            path: "/stable/article",
+          },
+        },
+      ];
     }
     return [{ result: false }];
   };
@@ -2001,12 +2445,18 @@ test("a registry-only adapter host classifies and emits an observed capture", as
       expires_at: EXPIRES,
     },
   });
-  await expect(h.bridge.openHandoff("job_0001a_registry_host")).resolves.toEqual({ ok: true, opened: true });
+  await expect(
+    h.bridge.openHandoff("job_0001a_registry_host"),
+  ).resolves.toEqual({ ok: true, opened: true });
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const articleURL = `https://${PROVIDER_HOST}/stable/article`;
   await h.tabs.completeNavigation(tabID, articleURL);
 
-  expect(injections.some((i) => i.func === planExecution && i.target.tabId === tabID)).toBe(true);
+  expect(
+    injections.some(
+      (i) => i.func === planExecution && i.target.tabId === tabID,
+    ),
+  ).toBe(true);
   const captures = h.frames().filter((frame) => frame.type === "page_capture");
   expect(captures).toHaveLength(1);
   expect(captures[0]?.job_id).toBe("job_0001a_registry_host");
@@ -2022,7 +2472,8 @@ test("all-sites browser access counts as effective provider access", async () =>
   const h = makeHarness();
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
   const permissionQueries: string[][] = [];
-  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] =
+    [];
   h.deps.permissions.contains = async ({ origins }) => {
     permissionQueries.push(origins);
     // Chrome answers true for this exact-origin query when the user granted
@@ -2031,7 +2482,8 @@ test("all-sites browser access counts as effective provider access", async () =>
   };
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
-    if (injection.func === planExecution) return plannerResult(injection, { kind: "unknown" });
+    if (injection.func === planExecution)
+      return plannerResult(injection, { kind: "unknown" });
     if (injection.func === isBotChallenge) return [{ result: false }];
     return [];
   };
@@ -2043,14 +2495,17 @@ test("all-sites browser access counts as effective provider access", async () =>
   await h.tabs.completeNavigation(tabID, articleURL);
 
   expect(permissionQueries).toEqual([[`https://${PROVIDER_HOST}/*`]]);
-  expect(injections.some((injection) => injection.func === planExecution)).toBe(true);
+  expect(injections.some((injection) => injection.func === planExecution)).toBe(
+    true,
+  );
   expect(h.backend.store.blockedProviderHosts).toBeUndefined();
 });
 
 test("missing provider access stays actionable and resumes the exact tab after grant", async () => {
   const h = makeHarness();
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
-  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] =
+    [];
   let granted = false;
   h.deps.permissions.contains = async () => granted;
   h.deps.scripting.executeScript = async (injection) => {
@@ -2066,9 +2521,13 @@ test("missing provider access stays actionable and resumes the exact tab after g
   h.tabs.seed({ id: tabID, url: articleURL });
   await h.tabs.completeNavigation(tabID, articleURL);
 
-  expect(h.frames().filter((frame) => frame.type === "provider_outcome")).toHaveLength(0);
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_outcome"),
+  ).toHaveLength(0);
   expect(h.backend.store.activeJobs).toHaveLength(1);
-  expect(h.backend.store.activeJobs[0]?.blocked_provider_host).toBe(PROVIDER_HOST);
+  expect(h.backend.store.activeJobs[0]?.blocked_provider_host).toBe(
+    PROVIDER_HOST,
+  );
   expect(injections).toEqual([]);
   expect(h.backend.store.blockedProviderHosts).toEqual([PROVIDER_HOST]);
   expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
@@ -2076,7 +2535,9 @@ test("missing provider access stays actionable and resumes the exact tab after g
 
   granted = true;
   await h.bridge.onPermissionsChanged();
-  expect(injections.some((injection) => injection.func === planExecution)).toBe(true);
+  expect(injections.some((injection) => injection.func === planExecution)).toBe(
+    true,
+  );
   expect(h.backend.store.blockedProviderHosts).toEqual([]);
   expect(h.backend.store.activeJobs[0]?.blocked_provider_host).toBeUndefined();
 });
@@ -2089,7 +2550,8 @@ test("a classify retry whose handoff tab closed settles instead of rejecting", a
     if (injection.func === planExecution) {
       return plannerResult(injection, { kind: "unknown" });
     }
-    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
     return [];
   };
 
@@ -2110,7 +2572,9 @@ test("a classify retry whose handoff tab closed settles instead of rejecting", a
   h.clock.now += 2_500;
   await h.timers[scheduled]?.fn();
 
-  expect(h.frames().filter((frame) => frame.type === "provider_outcome")).toHaveLength(0);
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_outcome"),
+  ).toHaveLength(0);
   expect(h.backend.store.activeJobs).toHaveLength(1);
 });
 
@@ -2133,9 +2597,13 @@ test("one blocked provider host stays a single indication across repeated update
   }
 
   expect(permissionChecks).toBe(1);
-  expect(h.frames().filter((frame) => frame.type === "provider_outcome")).toHaveLength(0);
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_outcome"),
+  ).toHaveLength(0);
   expect(h.backend.store.blockedProviderHosts).toEqual([PROVIDER_HOST]);
-  expect(h.action.titles.filter((title) => title.includes(PROVIDER_HOST))).toHaveLength(1);
+  expect(
+    h.action.titles.filter((title) => title.includes(PROVIDER_HOST)),
+  ).toHaveLength(1);
 });
 
 test("a stored provider blocker remains visible until effective access changes", async () => {
@@ -2187,7 +2655,10 @@ test("a Cloudflare challenge clears an earlier unknown streak and parks its prov
   let challenge = false;
   const h = makeHarness();
   useUnknownProviderClassifier(h, () => challenge);
-  const tabID = await classifyProviderUnknown(h, "job_challenge_clears_unknown");
+  const tabID = await classifyProviderUnknown(
+    h,
+    "job_challenge_clears_unknown",
+  );
 
   expect(h.backend.store.activeJobs[0]?.unknown_count).toBe(1);
   await h.port.inbound(helloAck());
@@ -2206,7 +2677,13 @@ test("a Cloudflare challenge clears an earlier unknown streak and parks its prov
   });
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
   expect(
-    h.frames().find((frame) => frame.type === "error" && frame.payload["code"] === "challenge_blocked"),
+    h
+      .frames()
+      .find(
+        (frame) =>
+          frame.type === "error" &&
+          frame.payload["code"] === "challenge_blocked",
+      ),
   ).toBeDefined();
   expect(h.action.texts.at(-1)).toBe("1");
   expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
@@ -2237,7 +2714,9 @@ test("a cleared Cloudflare challenge returns to the ordinary stale-adapter path"
     await timer!.fn();
   }
 
-  const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
+  const outcomes = h
+    .frames()
+    .filter((frame) => frame.type === "provider_outcome");
 
   expect(outcomes).toHaveLength(1);
   expect(outcomes[0]?.payload).toMatchObject({
@@ -2252,13 +2731,20 @@ test("challenge resume queues without a governor slot before classifying", async
   let challenge = true;
   const h = makeHarness();
   useUnknownProviderClassifier(h, () => challenge);
-  const challengeTabID = await classifyProviderUnknown(h, "job_challenge_resume_queued");
-  const ownerOffer = jobOfferForHosts("job_resume_slot_a", ["link.springer.com"]) as {
+  const challengeTabID = await classifyProviderUnknown(
+    h,
+    "job_challenge_resume_queued",
+  );
+  const ownerOffer = jobOfferForHosts("job_resume_slot_a", [
+    "link.springer.com",
+  ]) as {
     payload: Record<string, unknown>;
   };
   ownerOffer.payload["requires_auth"] = false;
   await h.port.inbound(ownerOffer);
-  const queuedOffer = jobOfferForHosts("job_resume_slot_b", ["link.springer.com"]) as {
+  const queuedOffer = jobOfferForHosts("job_resume_slot_b", [
+    "link.springer.com",
+  ]) as {
     payload: Record<string, unknown>;
   };
   queuedOffer.payload["requires_auth"] = true;
@@ -2277,11 +2763,18 @@ test("challenge resume queues without a governor slot before classifying", async
   };
   h.deps.settings.getTermsConsent = async () => "accept";
   h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
     if (injection.func === planExecution) {
-      return plannerResult(injection, { kind: "article", adapter_id: spec.id, adapter_version: spec.version, evidence: [] });
+      return plannerResult(injection, {
+        kind: "article",
+        adapter_id: spec.id,
+        adapter_version: spec.version,
+        evidence: [],
+      });
     }
-    if (injection.func === executePlannedPageEffect) return plannedEffectResult(injection);
+    if (injection.func === executePlannedPageEffect)
+      return plannedEffectResult(injection);
     return [{ result: "https://download.example/paper.pdf" }];
   };
 
@@ -2290,15 +2783,23 @@ test("challenge resume queues without a governor slot before classifying", async
   await h.tabs.completeNavigation(challengeTabID, url);
 
   expect(h.downloads.started).toHaveLength(0);
-  const resumed = h.backend.store.activeJobs.find((job) => job.job_id === "job_challenge_resume_queued");
+  const resumed = h.backend.store.activeJobs.find(
+    (job) => job.job_id === "job_challenge_resume_queued",
+  );
   expect(resumed).toMatchObject({ tab_id: challengeTabID, status: "accepted" });
   expect(resumed?.challenge_blocked).toBeUndefined();
   const resumedInternals = h.bridge as unknown as {
     handoffDriveQueue: Array<{ jobID: string }>;
     handoffDrives: Map<string, unknown>;
   };
-  expect(resumedInternals.handoffDrives.has("job_challenge_resume_queued")).toBe(false);
-  expect(resumedInternals.handoffDriveQueue.some((request) => request.jobID === "job_challenge_resume_queued")).toBe(true);
+  expect(
+    resumedInternals.handoffDrives.has("job_challenge_resume_queued"),
+  ).toBe(false);
+  expect(
+    resumedInternals.handoffDriveQueue.some(
+      (request) => request.jobID === "job_challenge_resume_queued",
+    ),
+  ).toBe(true);
   // The unrelated owner remains effectful while the resumed challenge waits
   // for a governor slot; no second classification or download is allowed.
   expect(h.tabs.list().length).toBe(2);
@@ -2311,9 +2812,9 @@ test("driven-page assessment classifies challenge, redirect-loop, and normal fix
   };
   const challengeFixtures = [
     "<html><head><title>Are you a robot?</title></head><body></body></html>",
-    "<form id=\"challenge-form\"></form>",
-    "<div class=\"cf-turnstile\"></div>",
-    "<div id=\"data-cf-chl-token\"></div>",
+    '<form id="challenge-form"></form>',
+    '<div class="cf-turnstile"></div>',
+    '<div id="data-cf-chl-token"></div>',
     "<main>Verify you are human to continue</main>",
   ];
   for (const html of challengeFixtures) {
@@ -2321,15 +2822,23 @@ test("driven-page assessment classifies challenge, redirect-loop, and normal fix
     expect(assessDrivenPage(doc).kind).toBe("challenge");
     expect(isBotChallenge(doc)).toBe(true);
   }
-  const loop = fixture("<html><head><title>OpenAthens</title></head><body>Too many redirects</body></html>");
+  const loop = fixture(
+    "<html><head><title>OpenAthens</title></head><body>Too many redirects</body></html>",
+  );
   expect(assessDrivenPage(loop).kind).toBe("redirect_loop");
   expect(isRedirectLoopPage(loop)).toBe(true);
-  const normal = fixture("<html><head><title>Article</title></head><body><main>Abstract</main></body></html>");
+  const normal = fixture(
+    "<html><head><title>Article</title></head><body><main>Abstract</main></body></html>",
+  );
   expect(assessDrivenPage(normal)).toEqual({ kind: "normal" });
   expect(isBotChallenge(normal)).toBe(false);
   expect(isRedirectLoopPage(normal)).toBe(false);
-  expect(registrableProviderHost("www.sciencedirect.com")).toBe("sciencedirect.com");
-  expect(registrableProviderHost("journals.example.co.uk")).toBe("example.co.uk");
+  expect(registrableProviderHost("www.sciencedirect.com")).toBe(
+    "sciencedirect.com",
+  );
+  expect(registrableProviderHost("journals.example.co.uk")).toBe(
+    "example.co.uk",
+  );
 });
 
 test("unknown retries report ui_changed once per drive and again for a re-offered tab", async () => {
@@ -2347,7 +2856,13 @@ test("unknown retries report ui_changed once per drive and again for a re-offere
     await timer!.fn();
   }
   expect(
-    h.frames().filter((frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "ui_changed"),
+    h
+      .frames()
+      .filter(
+        (frame) =>
+          frame.type === "provider_outcome" &&
+          frame.payload["outcome"] === "ui_changed",
+      ),
   ).toHaveLength(1);
 
   // A re-offer whose previous tab is gone creates a genuinely new provider
@@ -2367,7 +2882,13 @@ test("unknown retries report ui_changed once per drive and again for a re-offere
   }
 
   expect(
-    h.frames().filter((frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "ui_changed"),
+    h
+      .frames()
+      .filter(
+        (frame) =>
+          frame.type === "provider_outcome" &&
+          frame.payload["outcome"] === "ui_changed",
+      ),
   ).toHaveLength(2);
 });
 
@@ -2375,7 +2896,10 @@ test("unknown retries report ui_changed once per drive and again for a re-offere
  * outcome from which the daemon opens a `manual_download` human action. Two
  * spaced unknown observations are what escalates; the retry timers are how the
  * fake clock reaches the second one. */
-async function driveToManualDownloadOutcome(h: Harness, jobID: string): Promise<number> {
+async function driveToManualDownloadOutcome(
+  h: Harness,
+  jobID: string,
+): Promise<number> {
   const tabID = await classifyProviderUnknown(h, jobID);
   for (let retry = 0; retry < 2; retry += 1) {
     const timer = h.timers.at(-1);
@@ -2384,7 +2908,13 @@ async function driveToManualDownloadOutcome(h: Harness, jobID: string): Promise<
     await timer!.fn();
   }
   expect(
-    h.frames().filter((frame) => frame.type === "provider_outcome" && frame.payload["outcome"] === "ui_changed"),
+    h
+      .frames()
+      .filter(
+        (frame) =>
+          frame.type === "provider_outcome" &&
+          frame.payload["outcome"] === "ui_changed",
+      ),
   ).toHaveLength(1);
   return tabID;
 }
@@ -2402,9 +2932,14 @@ function clickDownload(id: number, filename = "1234567.pdf"): DownloadItemLike {
   };
 }
 
-async function suggestFilenameFor(h: Harness, item: DownloadItemLike): Promise<string[]> {
+async function suggestFilenameFor(
+  h: Harness,
+  item: DownloadItemLike,
+): Promise<string[]> {
   const suggestions: string[] = [];
-  await h.downloads.onDeterminingFilename.emit(item, (s) => suggestions.push(s.filename));
+  await h.downloads.onDeterminingFilename.emit(item, (s) =>
+    suggestions.push(s.filename),
+  );
   return suggestions;
 }
 
@@ -2420,7 +2955,11 @@ test("a ui_changed outcome retains a steering window for the researcher's own do
 
   const retained = h.backend.store.activeJobs;
   expect(retained).toHaveLength(1);
-  expect(retained[0]).toMatchObject({ job_id: jobID, tab_id: -1, status: "awaiting_download" });
+  expect(retained[0]).toMatchObject({
+    job_id: jobID,
+    tab_id: -1,
+    status: "awaiting_download",
+  });
   expect(retained[0]?.provider_hosts).toContain(PROVIDER_HOST);
   expect(retained[0]?.adapter_id).toBe("provider");
   // No delegated authority and no retained offer URL: nothing autonomous can
@@ -2428,7 +2967,9 @@ test("a ui_changed outcome retains a steering window for the researcher's own do
   expect(retained[0]?.access_mode).toBeUndefined();
   expect(h.backend.store.offerURLs?.[jobID]).toBeUndefined();
 
-  expect(await suggestFilenameFor(h, clickDownload(950))).toEqual([`papio/${jobID}/1234567.pdf`]);
+  expect(await suggestFilenameFor(h, clickDownload(950))).toEqual([
+    `papio/${jobID}/1234567.pdf`,
+  ]);
 
   h.downloads.items.set(950, {
     id: 950,
@@ -2439,7 +2980,11 @@ test("a ui_changed outcome retains a steering window for the researcher's own do
   });
   await h.downloads.onCreated.emit(clickDownload(950));
   await h.downloads.onChanged.emit({ id: 950, state: { current: "complete" } });
-  const complete = h.frames().find((frame) => frame.type === "download_complete" && frame.job_id === jobID);
+  const complete = h
+    .frames()
+    .find(
+      (frame) => frame.type === "download_complete" && frame.job_id === jobID,
+    );
   expect(complete?.payload["filename"]).toBe("1234567.pdf");
 });
 
@@ -2470,11 +3015,20 @@ test("a retained steering window frees the governor slot and disarms its drive t
   h.clock.now += 180_000;
   await driveTimeout!.fn();
   expect(h.frames().slice(framesBefore)).toHaveLength(0);
-  expect(h.backend.store.activeJobs[0]).toMatchObject({ job_id: jobID, tab_id: -1, status: "awaiting_download" });
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    job_id: jobID,
+    tab_id: -1,
+    status: "awaiting_download",
+  });
 
   // The freed slot is real capacity, not bookkeeping: the next offer drives
   // immediately instead of queueing behind the parked window.
-  await h.port.inbound(jobOffer("job_manual_window_next", "https://resolver.example.edu/openurl?ctx=next"));
+  await h.port.inbound(
+    jobOffer(
+      "job_manual_window_next",
+      "https://resolver.example.edu/openurl?ctx=next",
+    ),
+  );
   expect(internals.handoffDrives.has("job_manual_window_next")).toBe(true);
   expect(internals.handoffDriveQueue).toHaveLength(0);
   expect(h.tabs.created).toHaveLength(2);
@@ -2487,7 +3041,10 @@ test("two retained windows on one provider host refuse to claim a download", asy
 
   const secondURL = "https://resolver.example.edu/openurl?ctx=second";
   await h.port.inbound(jobOffer("job_manual_window_two", secondURL));
-  const secondTabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_manual_window_two")?.tab_id ?? -1;
+  const secondTabID =
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_manual_window_two",
+    )?.tab_id ?? -1;
   expect(secondTabID).toBeGreaterThanOrEqual(0);
   const articleURL = `https://${PROVIDER_HOST}/stable/challenge`;
   h.tabs.seed({ id: secondTabID, url: articleURL });
@@ -2507,7 +3064,8 @@ test("two retained windows on one provider host refuse to claim a download", asy
   // researcher's PDF under someone else's paper. No suggestion at all.
   expect(await suggestFilenameFor(h, clickDownload(951))).toEqual([]);
   await h.downloads.onCreated.emit(clickDownload(951));
-  for (const job of h.backend.store.activeJobs) expect(job.download_initiated).toBeUndefined();
+  for (const job of h.backend.store.activeJobs)
+    expect(job.download_initiated).toBeUndefined();
 });
 
 test("a worker restart rehydrates the retained window from the daemon's snapshot", async () => {
@@ -2518,20 +3076,35 @@ test("a worker restart rehydrates the retained window from the daemon's snapshot
 
   // The MV3 worker dies; only what survives the real managed-state migration
   // comes back. Worker-memory bookkeeping does not.
-  const restarted = makeHarness(migrateManagedState(JSON.parse(JSON.stringify(first.backend.store))));
+  const restarted = makeHarness(
+    migrateManagedState(JSON.parse(JSON.stringify(first.backend.store))),
+  );
   useUnknownProviderClassifier(restarted, () => false);
   await restarted.bridge.start();
-  expect(restarted.backend.store.activeJobs.map((job) => job.job_id)).toEqual([jobID]);
+  expect(restarted.backend.store.activeJobs.map((job) => job.job_id)).toEqual([
+    jobID,
+  ]);
   // The startup drive scan must not resurrect it: no tab, no governor slot.
   expect(restarted.tabs.created).toHaveLength(0);
-  const internals = restarted.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  const internals = restarted.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+  };
   expect(internals.handoffDrives.size).toBe(0);
 
-  await restarted.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_snapshot_v1"] }));
+  await restarted.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_v1"],
+    }),
+  );
   await settleSnapshot(restarted, [manualDownloadItem(jobID)]);
 
-  expect(restarted.backend.store.activeJobs.map((job) => job.job_id)).toEqual([jobID]);
-  expect(await suggestFilenameFor(restarted, clickDownload(952))).toEqual([`papio/${jobID}/1234567.pdf`]);
+  expect(restarted.backend.store.activeJobs.map((job) => job.job_id)).toEqual([
+    jobID,
+  ]);
+  expect(await suggestFilenameFor(restarted, clickDownload(952))).toEqual([
+    `papio/${jobID}/1234567.pdf`,
+  ]);
 });
 
 test("a complete snapshot without the action retires the retained window", async () => {
@@ -2539,7 +3112,12 @@ test("a complete snapshot without the action retires the retained window", async
   const h = makeHarness();
   useUnknownProviderClassifier(h, () => false);
   await driveToManualDownloadOutcome(h, jobID);
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_snapshot_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_v1"],
+    }),
+  );
 
   // A partial page describes a subset of the open actions and is never
   // authority to retire anything.
@@ -2566,15 +3144,28 @@ test("Firefox refuses to claim a retained window's download at all", async () =>
     const h = makeHarness(undefined, { firefox: true });
     h.deps.adapterSpecs.push(
       clickAdapter
-        ? { ...PROVIDER_ADAPTER, download: { selector: "a#pdf", requireKind: "article", method: "click" } }
+        ? {
+            ...PROVIDER_ADAPTER,
+            download: {
+              selector: "a#pdf",
+              requireKind: "article",
+              method: "click",
+            },
+          }
         : PROVIDER_ADAPTER,
     );
     h.deps.permissions.contains = async () => true;
     h.deps.scripting.executeScript = async (injection) =>
-      injection.func === planExecution ? plannerResult(injection, { kind: "unknown" }) : [];
+      injection.func === planExecution
+        ? plannerResult(injection, { kind: "unknown" })
+        : [];
     await driveToManualDownloadOutcome(h, jobID);
 
-    expect(h.backend.store.activeJobs[0]).toMatchObject({ job_id: jobID, tab_id: -1, status: "awaiting_download" });
+    expect(h.backend.store.activeJobs[0]).toMatchObject({
+      job_id: jobID,
+      tab_id: -1,
+      status: "awaiting_download",
+    });
     expect(h.deps.downloads.onDeterminingFilename).toBeUndefined();
     h.downloads.items.set(954, {
       id: 954,
@@ -2584,9 +3175,14 @@ test("Firefox refuses to claim a retained window's download at all", async () =>
       state: "complete",
     });
     await h.downloads.onCreated.emit(clickDownload(954));
-    await h.downloads.onChanged.emit({ id: 954, state: { current: "complete" } });
+    await h.downloads.onChanged.emit({
+      id: 954,
+      state: { current: "complete" },
+    });
     expect(h.backend.store.activeJobs[0]?.download_initiated).toBeUndefined();
-    expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(false);
+    expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(
+      false,
+    );
   }
 });
 
@@ -2601,24 +3197,44 @@ test("a challenge parks only its provider and leaves another provider draining",
   h.tabs.seed({ id: sourceTabID, url: challengeURL });
   await h.tabs.completeNavigation(sourceTabID, challengeURL);
 
-  const parked = jobOffer("job_challenge_parked") as { payload: Record<string, unknown> };
+  const parked = jobOffer("job_challenge_parked") as {
+    payload: Record<string, unknown>;
+  };
   parked.payload["requires_auth"] = true;
-  const other = jobOfferForHosts("job_challenge_other", [otherProvider]) as { payload: Record<string, unknown> };
+  const other = jobOfferForHosts("job_challenge_other", [otherProvider]) as {
+    payload: Record<string, unknown>;
+  };
   other.payload["requires_auth"] = true;
   await h.port.inbound(parked);
   await h.port.inbound(other);
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
 
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_challenge_parked")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_challenge_parked",
+    ),
+  ).toMatchObject({
     tab_id: -1,
     status: "queued",
     handoffAckPending: true,
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_challenge_other")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_challenge_other",
+    ),
+  ).toMatchObject({
     status: "accepted",
   });
   expect(
-    h.frames().filter((frame) => frame.type === "job_accept" && frame.job_id === "job_challenge_parked"),
+    h
+      .frames()
+      .filter(
+        (frame) =>
+          frame.type === "job_accept" &&
+          frame.job_id === "job_challenge_parked",
+      ),
   ).toHaveLength(0);
 });
 
@@ -2632,11 +3248,19 @@ test("an expired provider lease reclaims its queued handoff without a new offer"
   h.tabs.seed({ id: sourceTabID, url: challengeURL });
   await h.tabs.completeNavigation(sourceTabID, challengeURL);
 
-  const queued = jobOffer("job_lease_reclaim") as { payload: Record<string, unknown> };
+  const queued = jobOffer("job_lease_reclaim") as {
+    payload: Record<string, unknown>;
+  };
   queued.payload["requires_auth"] = true;
   await h.port.inbound(queued);
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_lease_reclaim")).toMatchObject({
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_lease_reclaim",
+    ),
+  ).toMatchObject({
     tab_id: -1,
     status: "queued",
     handoffAckPending: true,
@@ -2649,12 +3273,21 @@ test("an expired provider lease reclaims its queued handoff without a new offer"
 
   // A provider challenge now has a durable cooldown in addition to its short
   // drain lease; expiry of the lease alone must not immediately re-drive it.
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_lease_reclaim")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_lease_reclaim",
+    ),
+  ).toMatchObject({
     status: "queued",
     tab_id: -1,
   });
   expect(
-    h.frames().filter((frame) => frame.type === "job_accept" && frame.job_id === "job_lease_reclaim"),
+    h
+      .frames()
+      .filter(
+        (frame) =>
+          frame.type === "job_accept" && frame.job_id === "job_lease_reclaim",
+      ),
   ).toHaveLength(1);
   expect(h.backend.store.providerDrainLeases).toEqual({});
 
@@ -2663,11 +3296,20 @@ test("an expired provider lease reclaims its queued handoff without a new offer"
   h.clock.now += 540_000;
   await cooldownExpiry!.fn();
 
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_lease_reclaim")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_lease_reclaim",
+    ),
+  ).toMatchObject({
     status: "accepted",
   });
   expect(
-    h.frames().filter((frame) => frame.type === "job_accept" && frame.job_id === "job_lease_reclaim"),
+    h
+      .frames()
+      .filter(
+        (frame) =>
+          frame.type === "job_accept" && frame.job_id === "job_lease_reclaim",
+      ),
   ).toHaveLength(1);
   expect(h.backend.store.providerDrainLeases).toEqual({
     [PROVIDER_HOST]: {
@@ -2682,6 +3324,7 @@ test("a unique manual Chrome download from a registry-only host is correlated", 
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
   h.deps.permissions.contains = async () => true;
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["effect_permit_v1"] }));
   await h.port.inbound({
     protocol: "papio-browser/1",
     type: "job_offer",
@@ -2695,7 +3338,9 @@ test("a unique manual Chrome download from a registry-only host is correlated", 
       expires_at: EXPIRES,
     },
   });
-  await expect(h.bridge.openHandoff("job_0001a_registry_manual")).resolves.toEqual({ ok: true, opened: true });
+  await expect(
+    h.bridge.openHandoff("job_0001a_registry_manual"),
+  ).resolves.toEqual({ ok: true, opened: true });
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const articleURL = `https://${PROVIDER_HOST}/stable/article`;
   await h.tabs.completeNavigation(tabID, articleURL);
@@ -2713,8 +3358,19 @@ test("a unique manual Chrome download from a registry-only host is correlated", 
     state: "complete",
   });
   await h.downloads.onChanged.emit({ id: 31, state: { current: "complete" } });
-
-  expect(h.frames().some((frame) => frame.type === "download_complete" && frame.job_id === "job_0001a_registry_manual")).toBe(true);
+  const complete = h
+    .frames()
+    .find((frame) => frame.type === "download_complete");
+  expect(complete?.payload["producer"]).toBeUndefined();
+  expect(
+    h
+      .frames()
+      .some(
+        (frame) =>
+          frame.type === "download_complete" &&
+          frame.job_id === "job_0001a_registry_manual",
+      ),
+  ).toBe(true);
 });
 
 test("a manual registry-host download with two matching jobs remains unowned", async () => {
@@ -2759,8 +3415,12 @@ test("a manual registry-host download with two matching jobs remains unowned", a
   });
   await h.downloads.onChanged.emit({ id: 32, state: { current: "complete" } });
 
-  expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(false);
-  expect(h.backend.store.activeJobs.every((job) => job.download_initiated !== true)).toBe(true);
+  expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(
+    false,
+  );
+  expect(
+    h.backend.store.activeJobs.every((job) => job.download_initiated !== true),
+  ).toBe(true);
 });
 test("concurrent classifications after accepted terms initiate exactly one download", async () => {
   const h = makeHarness();
@@ -2781,11 +3441,18 @@ test("concurrent classifications after accepted terms initiate exactly one downl
   h.deps.adapterSpecs.push(adapter);
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
     if (injection.func === planExecution) {
-      return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
+      return plannerResult(injection, {
+        kind: "article",
+        adapter_id: adapter.id,
+        adapter_version: adapter.version,
+        evidence: [],
+      });
     }
-    if (injection.func === executePlannedPageEffect) return plannedEffectResult(injection);
+    if (injection.func === executePlannedPageEffect)
+      return plannedEffectResult(injection);
     return [{ result: "https://download.example/paper.pdf" }];
   };
   let consentCalls = 0;
@@ -2836,7 +3503,6 @@ test("concurrent classifications after accepted terms initiate exactly one downl
   expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
 });
 
-
 test("a queued handoff falls back to a background tab after 45 seconds", async () => {
   const h = makeHarness();
 
@@ -2858,7 +3524,11 @@ test("a queued handoff falls back to a background tab after 45 seconds", async (
     { url: OPENURL, active: true },
     { url: OPENURL, active: false },
   ]);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_0001a_timer_queued")?.status).toBe("accepted");
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_0001a_timer_queued",
+    )?.status,
+  ).toBe("accepted");
 });
 
 test("startup releases queued handoffs when a tracked tab is already on a non-IdP page", async () => {
@@ -2940,7 +3610,9 @@ test("keepalive authentication evidence releases a restored queued handoff", asy
 
   await h.bridge.start();
   expect(h.tabs.created).toEqual([]);
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
 
   expect(h.tabs.created).toEqual([{ url: queuedURL, active: false }]);
   expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
@@ -2950,9 +3622,13 @@ test("a changed re-offer reuses the live job tab for the institutional fallback"
   const h = makeHarness();
   const oaURL = "https://oa.example.org/blocked-paper";
   const institutionalURL = "https://resolver.example.edu/openurl?fallback=1";
-  const oaOffer = jobOffer("job_0001b_fallback") as { payload: Record<string, unknown> };
+  const oaOffer = jobOffer("job_0001b_fallback") as {
+    payload: Record<string, unknown>;
+  };
   oaOffer.payload["openurl"] = oaURL;
-  const institutionalOffer = jobOffer("job_0001b_fallback") as { payload: Record<string, unknown> };
+  const institutionalOffer = jobOffer("job_0001b_fallback") as {
+    payload: Record<string, unknown>;
+  };
   institutionalOffer.payload["openurl"] = institutionalURL;
 
   await h.bridge.start();
@@ -2963,7 +3639,13 @@ test("a changed re-offer reuses the live job tab for the institutional fallback"
   expect(h.tabs.navigations).toEqual([{ tabID: 100, url: institutionalURL }]);
   expect(h.tabs.removed).toEqual([]);
   expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
-  expect(h.frames().filter((f) => f.type === "job_accept" && f.job_id === "job_0001b_fallback")).toHaveLength(2);
+  expect(
+    h
+      .frames()
+      .filter(
+        (f) => f.type === "job_accept" && f.job_id === "job_0001b_fallback",
+      ),
+  ).toHaveLength(2);
 });
 
 test("job_reject is sent when tab creation fails", async () => {
@@ -3010,7 +3692,10 @@ test("session evidence sends the exact origin observed for that evidence", async
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: ["session_evidence_v1"] }));
 
-  const sent = h.bridge.emitSessionEvidence("warm_verified", "https://resolver.example.edu");
+  const sent = h.bridge.emitSessionEvidence(
+    "warm_verified",
+    "https://resolver.example.edu",
+  );
 
   expect(sent).toBe(true);
   const frame = h.frames().find((f) => f.type === "session_evidence");
@@ -3031,18 +3716,26 @@ test("session evidence with no observed origin omits origin_hint instead of gues
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: ["session_evidence_v1"] }));
   const decoyOfferURL = "https://decoy.example.edu/openurl?ctx=zzz";
-  const offer = jobOffer("job_evidence_decoy", decoyOfferURL) as { payload: Record<string, unknown> };
+  const offer = jobOffer("job_evidence_decoy", decoyOfferURL) as {
+    payload: Record<string, unknown>;
+  };
   offer.payload["requires_auth"] = true;
   await h.port.inbound(offer); // populates latestResolverOrigin()'s decoy candidate
   h.bridge.attachKeepalive({
-    getSnapshot: () => ({ resolverOrigin: "https://granted-host.example.edu", pausedForReauth: false }),
+    getSnapshot: () => ({
+      resolverOrigin: "https://granted-host.example.edu",
+      pausedForReauth: false,
+    }),
   } as unknown as KeepaliveManager); // decoy for the keepalive-snapshot fallback
 
   const sent = h.bridge.emitSessionEvidence("warm_verified", undefined);
 
   expect(sent).toBe(true);
   const frame = h.frames().find((f) => f.type === "session_evidence");
-  expect(frame?.payload).toEqual({ evidence: "warm_verified", at: new Date(h.clock.now).toISOString() });
+  expect(frame?.payload).toEqual({
+    evidence: "warm_verified",
+    at: new Date(h.clock.now).toISOString(),
+  });
 });
 
 test("an auth-flagged resolver hostname omits origin_hint on auth_returned rather than inventing a fallback", async () => {
@@ -3055,7 +3748,10 @@ test("an auth-flagged resolver hostname omits origin_hint on auth_returned rathe
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: ["session_evidence_v1"] }));
   h.bridge.attachKeepalive({
-    getSnapshot: () => ({ resolverOrigin: "https://granted-host.example.edu", pausedForReauth: false }),
+    getSnapshot: () => ({
+      resolverOrigin: "https://granted-host.example.edu",
+      pausedForReauth: false,
+    }),
     // Commit B's onTabUpdated now tells the manager about every navigation
     // synchronously (see the "notified before ready resolves" test below);
     // this stub only cares about the resolver-origin fallback, so the
@@ -3072,7 +3768,10 @@ test("an auth-flagged resolver hostname omits origin_hint on auth_returned rathe
   await h.tabs.userNavigate(tabID, `https://${PROVIDER_HOST}/stable/x`);
 
   const frame = h.frames().find((f) => f.type === "session_evidence");
-  expect(frame?.payload).toEqual({ evidence: "auth_returned", at: new Date(h.clock.now).toISOString() });
+  expect(frame?.payload).toEqual({
+    evidence: "auth_returned",
+    at: new Date(h.clock.now).toISOString(),
+  });
 });
 
 test("auth_returned origin_hint omits an unconfigured provider origin, even though it is a bare non-auth-flagged URL", async () => {
@@ -3087,10 +3786,16 @@ test("auth_returned origin_hint omits an unconfigured provider origin, even thou
   const h = makeHarness();
   await h.bridge.start();
   await h.port.inbound(
-    helloAck({ features: ["session_evidence_v1"], resolver_origins: ["https://resolver.example.edu"] }),
+    helloAck({
+      features: ["session_evidence_v1"],
+      resolver_origins: ["https://resolver.example.edu"],
+    }),
   );
   h.bridge.attachKeepalive({
-    getSnapshot: () => ({ resolverOrigin: "https://resolver.example.edu", pausedForReauth: false }),
+    getSnapshot: () => ({
+      resolverOrigin: "https://resolver.example.edu",
+      pausedForReauth: false,
+    }),
     noteResolverNavigation: () => {},
     noteResolverActivated: () => {},
   } as unknown as KeepaliveManager);
@@ -3103,7 +3808,10 @@ test("auth_returned origin_hint omits an unconfigured provider origin, even thou
   await h.tabs.userNavigate(tabID, `https://${PROVIDER_HOST}/stable/x`);
 
   const frame = h.frames().find((f) => f.type === "session_evidence");
-  expect(frame?.payload).toEqual({ evidence: "auth_returned", at: new Date(h.clock.now).toISOString() });
+  expect(frame?.payload).toEqual({
+    evidence: "auth_returned",
+    at: new Date(h.clock.now).toISOString(),
+  });
 });
 
 test("auth_returned origin_hint carries a configured resolver origin", async () => {
@@ -3113,10 +3821,16 @@ test("auth_returned origin_hint carries a configured resolver origin", async () 
   const h = makeHarness();
   await h.bridge.start();
   await h.port.inbound(
-    helloAck({ features: ["session_evidence_v1"], resolver_origins: ["https://resolver.example.edu"] }),
+    helloAck({
+      features: ["session_evidence_v1"],
+      resolver_origins: ["https://resolver.example.edu"],
+    }),
   );
   h.bridge.attachKeepalive({
-    getSnapshot: () => ({ resolverOrigin: "https://resolver.example.edu", pausedForReauth: false }),
+    getSnapshot: () => ({
+      resolverOrigin: "https://resolver.example.edu",
+      pausedForReauth: false,
+    }),
     noteResolverNavigation: () => {},
     noteResolverActivated: () => {},
   } as unknown as KeepaliveManager);
@@ -3144,12 +3858,22 @@ test("a job-tab download completes to a basename-only frame; unrelated tab ignor
 
   // Unrelated download on a different tab: must be ignored entirely.
   await h.downloads.onCreated.emit({ id: 2, tabId: 999, state: "in_progress" });
-  h.downloads.items.set(2, { id: 2, tabId: 999, filename: "/tmp/other.pdf", fileSize: 10, state: "complete" });
+  h.downloads.items.set(2, {
+    id: 2,
+    tabId: 999,
+    filename: "/tmp/other.pdf",
+    fileSize: 10,
+    state: "complete",
+  });
   await h.downloads.onChanged.emit({ id: 2, state: { current: "complete" } });
   expect(h.frames().some((f) => f.type === "download_complete")).toBe(false);
 
   // Matching download on the job tab.
-  await h.downloads.onCreated.emit({ id: 1, tabId: tabID, state: "in_progress" });
+  await h.downloads.onCreated.emit({
+    id: 1,
+    tabId: tabID,
+    state: "in_progress",
+  });
   h.downloads.items.set(1, {
     id: 1,
     tabId: tabID,
@@ -3171,15 +3895,22 @@ test("Firefox keeps click adapters assisted and ignores their manual job-tab dow
   const h = makeHarness(undefined, { firefox: true });
   const clickAdapter: AdapterSpec = {
     ...PROVIDER_ADAPTER,
-    download: { selector: "button.download", requireKind: "article", method: "click" },
+    download: {
+      selector: "button.download",
+      requireKind: "article",
+      method: "click",
+    },
   };
-  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] = [];
+  const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] =
+    [];
   h.deps.adapterSpecs.push(clickAdapter);
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
     injections.push(injection);
-    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === planExecution) return plannerResult(injection, { kind: "article" });
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution)
+      return plannerResult(injection, { kind: "article" });
     return [];
   };
   await h.bridge.start();
@@ -3189,7 +3920,9 @@ test("Firefox keeps click adapters assisted and ignores their manual job-tab dow
   await h.tabs.completeNavigation(tabID, articleURL);
 
   expect(injections).toHaveLength(2);
-  expect(injections.filter((injection) => injection.func === planExecution)).toHaveLength(1);
+  expect(
+    injections.filter((injection) => injection.func === planExecution),
+  ).toHaveLength(1);
   expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
   await h.downloads.onCreated.emit({
     id: 41,
@@ -3206,7 +3939,9 @@ test("Firefox keeps click adapters assisted and ignores their manual job-tab dow
   });
   await h.downloads.onChanged.emit({ id: 41, state: { current: "complete" } });
 
-  expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(false);
+  expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(
+    false,
+  );
   expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
 });
 
@@ -3215,7 +3950,11 @@ test("Firefox ignores manual downloads from non-click adapters without exact own
   const hrefAdapter: AdapterSpec = {
     ...PROVIDER_ADAPTER,
     id: "firefox-href",
-    download: { selector: "a.download", requireKind: "article", method: "href" },
+    download: {
+      selector: "a.download",
+      requireKind: "article",
+      method: "href",
+    },
   };
   h.deps.adapterSpecs.push(hrefAdapter);
   h.deps.permissions.contains = async () => true;
@@ -3241,7 +3980,9 @@ test("Firefox ignores manual downloads from non-click adapters without exact own
   });
   await h.downloads.onChanged.emit({ id: 42, state: { current: "complete" } });
 
-  expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(false);
+  expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(
+    false,
+  );
   expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
 });
 
@@ -3263,7 +4004,14 @@ test("Firefox adapter API downloads remain filename-controlled and report normal
     injection.func === planExecution
       ? plannerResult(injection, { kind: "article" })
       : injection.func === executePlannedPageEffect
-        ? [{ result: { ok: true, url: `https://${PROVIDER_HOST}/download/article.pdf` } }]
+        ? [
+            {
+              result: {
+                ok: true,
+                url: `https://${PROVIDER_HOST}/download/article.pdf`,
+              },
+            },
+          ]
         : [];
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0004_firefox_api"));
@@ -3288,7 +4036,15 @@ test("Firefox adapter API downloads remain filename-controlled and report normal
   });
   await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
 
-  expect(h.frames().some((frame) => frame.type === "download_complete" && frame.job_id === "job_0004_firefox_api")).toBe(true);
+  expect(
+    h
+      .frames()
+      .some(
+        (frame) =>
+          frame.type === "download_complete" &&
+          frame.job_id === "job_0004_firefox_api",
+      ),
+  ).toBe(true);
 });
 
 test("a cross-origin api download with a content-disposition rename steers into papio/<job>/ by ID", async () => {
@@ -3297,7 +4053,8 @@ test("a cross-origin api download with a content-disposition rename steers into 
   // carries no tabId, and the server renames the file (retrieve.pdf). Steering
   // must come from the creation-bound download ID, never tab/URL heuristics.
   const h = makeHarness();
-  const crossOriginPDF = "https://content.aggregator.example/cds/retrieve?db=a9h";
+  const crossOriginPDF =
+    "https://content.aggregator.example/cds/retrieve?db=a9h";
   const apiAdapter: AdapterSpec = {
     ...PROVIDER_ADAPTER,
     download: {
@@ -3333,14 +4090,26 @@ test("a cross-origin api download with a content-disposition rename steers into 
 
   // Chrome fires onCreated (still the requested URL), then onDeterminingFilename
   // with the server's content-disposition name and no tab correlation.
-  await h.downloads.onCreated.emit({ id: 901, url: crossOriginPDF, state: "in_progress" });
+  await h.downloads.onCreated.emit({
+    id: 901,
+    url: crossOriginPDF,
+    state: "in_progress",
+  });
   const suggestions: { filename: string; conflictAction: string }[] = [];
   await h.downloads.onDeterminingFilename.emit(
-    { id: 901, url: crossOriginPDF, filename: "retrieve.pdf", state: "in_progress" },
+    {
+      id: 901,
+      url: crossOriginPDF,
+      filename: "retrieve.pdf",
+      state: "in_progress",
+    },
     (s) => suggestions.push(s),
   );
   expect(suggestions).toEqual([
-    { filename: "papio/job_0004b_xorigin_api/retrieve.pdf", conflictAction: "uniquify" },
+    {
+      filename: "papio/job_0004b_xorigin_api/retrieve.pdf",
+      conflictAction: "uniquify",
+    },
   ]);
 
   h.downloads.items.set(901, {
@@ -3352,51 +4121,64 @@ test("a cross-origin api download with a content-disposition rename steers into 
   });
   await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
 
-  const complete = h.frames().find(
-    (frame) => frame.type === "download_complete" && frame.job_id === "job_0004b_xorigin_api",
-  );
+  const complete = h
+    .frames()
+    .find(
+      (frame) =>
+        frame.type === "download_complete" &&
+        frame.job_id === "job_0004b_xorigin_api",
+    );
   expect(complete?.payload["filename"]).toBe("retrieve.pdf");
 });
 
 test("a CDN PDF viewer is adopted for one uniquely driven accepted job", async () => {
   const h = makeHarness({
     ...emptyStore(),
-    activeJobs: [{
-      job_id: "job_cdn_single",
-      tab_id: 100,
-      offered_at: 1_700_000_000_000,
-      expires_at: 1_800_000_000_000,
-      status: "accepted",
-      provider_hosts: ["www.sciencedirect.com"],
-      download_initiated: true,
-      access_mode: "delegated",
-    }],
+    activeJobs: [
+      {
+        job_id: "job_cdn_single",
+        tab_id: 100,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "accepted",
+        provider_hosts: ["www.sciencedirect.com"],
+        download_initiated: true,
+        access_mode: "delegated",
+      },
+    ],
   });
   h.tabs.seed({ id: 100, url: OPENURL });
   await h.bridge.start();
   h.tabs.seed({ id: 101, url: "about:blank" });
-  await h.tabs.completeNavigation(101, "https://pdf.sciencedirectassets.com/77/paper.pdf");
+  await h.tabs.completeNavigation(
+    101,
+    "https://pdf.sciencedirectassets.com/77/paper.pdf",
+  );
 
-  expect(h.downloads.started).toEqual([{
-    url: "https://pdf.sciencedirectassets.com/77/paper.pdf",
-    filename: "papio/job_cdn_single/paper.pdf",
-    conflictAction: "uniquify",
-    saveAs: false,
-  }]);
+  expect(h.downloads.started).toEqual([
+    {
+      url: "https://pdf.sciencedirectassets.com/77/paper.pdf",
+      filename: "papio/job_cdn_single/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
 });
 test("an unrelated openerless PDF viewer is rejected without provider provenance", async () => {
   const h = makeHarness({
     ...emptyStore(),
-    activeJobs: [{
-      job_id: "job_unrelated_viewer",
-      tab_id: 100,
-      offered_at: 1_700_000_000_000,
-      expires_at: 1_800_000_000_000,
-      status: "accepted",
-      provider_hosts: [PROVIDER_HOST],
-      access_mode: "delegated",
-      download_initiated: true,
-    }],
+    activeJobs: [
+      {
+        job_id: "job_unrelated_viewer",
+        tab_id: 100,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+        access_mode: "delegated",
+        download_initiated: true,
+      },
+    ],
   });
   h.tabs.seed({ id: 100, url: OPENURL });
   await h.bridge.start();
@@ -3404,7 +4186,6 @@ test("an unrelated openerless PDF viewer is rejected without provider provenance
   await h.tabs.completeNavigation(101, "https://unrelated.example/paper.pdf");
   expect(h.downloads.started).toEqual([]);
 });
-
 
 test("a CDN PDF viewer remains unadopted when two driven jobs are candidates", async () => {
   const h = makeHarness({
@@ -3423,35 +4204,50 @@ test("a CDN PDF viewer remains unadopted when two driven jobs are candidates", a
   h.tabs.seed({ id: 101, url: OPENURL });
   await h.bridge.start();
   h.tabs.seed({ id: 102, url: "about:blank" });
-  await h.tabs.completeNavigation(102, "https://pdf.sciencedirectassets.com/77/paper.pdf");
+  await h.tabs.completeNavigation(
+    102,
+    "https://pdf.sciencedirectassets.com/77/paper.pdf",
+  );
 
   expect(h.downloads.started).toEqual([]);
 });
 
 test("Firefox keeps the CDN viewer adoption path disabled for click adapters", async () => {
   const jobID = "job_cdn_firefox";
-  const h = makeHarness({
-    ...emptyStore(),
-    activeJobs: [{
-      job_id: jobID,
-      tab_id: 100,
-      offered_at: 1_700_000_000_000,
-      expires_at: 1_800_000_000_000,
-      status: "accepted",
-      provider_hosts: ["www.sciencedirect.com"],
-      adapter_id: "firefox-click",
-      download_initiated: true,
-    }],
-  }, { firefox: true });
+  const h = makeHarness(
+    {
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: 100,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_800_000_000_000,
+          status: "accepted",
+          provider_hosts: ["www.sciencedirect.com"],
+          adapter_id: "firefox-click",
+          download_initiated: true,
+        },
+      ],
+    },
+    { firefox: true },
+  );
   h.deps.adapterSpecs.push({
     ...PROVIDER_ADAPTER,
     id: "firefox-click",
-    download: { selector: "button.download", requireKind: "article", method: "click" },
+    download: {
+      selector: "button.download",
+      requireKind: "article",
+      method: "click",
+    },
   });
   h.tabs.seed({ id: 100, url: OPENURL });
   await h.bridge.start();
   h.tabs.seed({ id: 101, url: "about:blank" });
-  await h.tabs.completeNavigation(101, "https://pdf.sciencedirectassets.com/77/paper.pdf");
+  await h.tabs.completeNavigation(
+    101,
+    "https://pdf.sciencedirectassets.com/77/paper.pdf",
+  );
 
   expect(h.downloads.started).toEqual([]);
 });
@@ -3474,7 +4270,11 @@ test("a PDF-viewer tab starts one download and leaves the adopted viewer open", 
     },
   ]);
 
-  await h.downloads.onCreated.emit({ id: 901, tabId: tabID, state: "in_progress" });
+  await h.downloads.onCreated.emit({
+    id: 901,
+    tabId: tabID,
+    state: "in_progress",
+  });
   h.downloads.items.set(901, {
     id: 901,
     tabId: tabID,
@@ -3493,7 +4293,14 @@ test("a PDF-viewer tab starts one download and leaves the adopted viewer open", 
     payload: {},
   });
 
-  expect(h.frames().some((f) => f.type === "download_complete" && f.job_id === "job_0010_pdf_viewer")).toBe(true);
+  expect(
+    h
+      .frames()
+      .some(
+        (f) =>
+          f.type === "download_complete" && f.job_id === "job_0010_pdf_viewer",
+      ),
+  ).toBe(true);
   expect(h.tabs.removed).toEqual([]);
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
 });
@@ -3501,12 +4308,15 @@ test("a PDF-viewer tab starts one download and leaves the adopted viewer open", 
 test("Chrome's built-in PDF viewer downloads the memory-only offered URL", async () => {
   const h = makeHarness();
   const offeredURL = "https://oa.example.org/opaque-download";
-  const offer = jobOffer("job_0010b_chrome_viewer") as { payload: Record<string, unknown> };
+  const offer = jobOffer("job_0010b_chrome_viewer") as {
+    payload: Record<string, unknown>;
+  };
   offer.payload["openurl"] = offeredURL;
   await h.bridge.start();
   await h.port.inbound(offer);
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  const chromeViewerURL = "chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html";
+  const chromeViewerURL =
+    "chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html";
 
   await h.tabs.completeNavigation(tabID, chromeViewerURL);
 
@@ -3533,12 +4343,20 @@ test("Wiley epdf viewer route downloads the declared direct endpoint", async () 
       method: "url",
       viewerRoutes: [{ pathPrefix: "/doi/epdf/" }],
       idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
-      urlTemplate: "https://onlinelibrary.wiley.com/doi/pdfdirect/{1}?download=true",
+      urlTemplate:
+        "https://onlinelibrary.wiley.com/doi/pdfdirect/{1}?download=true",
     },
   });
-  const viewerURL = "https://onlinelibrary.wiley.com/doi/epdf/10.1111/rego.12568";
+  const viewerURL =
+    "https://onlinelibrary.wiley.com/doi/epdf/10.1111/rego.12568";
   await h.bridge.start();
-  await h.port.inbound(jobOfferForHosts("job_wiley_epdf_viewer", ["onlinelibrary.wiley.com"], viewerURL));
+  await h.port.inbound(
+    jobOfferForHosts(
+      "job_wiley_epdf_viewer",
+      ["onlinelibrary.wiley.com"],
+      viewerURL,
+    ),
+  );
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   await h.tabs.completeNavigation(tabID, viewerURL);
   expect(h.downloads.started).toEqual([
@@ -3557,7 +4375,11 @@ test("a pre-existing content-disposition download prevents PDF-viewer duplicatio
   await h.port.inbound(jobOffer("job_0011_pdf_dedup"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
 
-  await h.downloads.onCreated.emit({ id: 77, tabId: tabID, state: "in_progress" });
+  await h.downloads.onCreated.emit({
+    id: 77,
+    tabId: tabID,
+    state: "in_progress",
+  });
   const pdfURL = `https://${PROVIDER_HOST}/download/paper.pdf`;
   await h.tabs.completeNavigation(tabID, pdfURL);
 
@@ -3567,7 +4389,9 @@ test("an MDPI PDF route without a .pdf suffix is adopted", async () => {
   const h = makeHarness();
   await h.bridge.start();
   const pdfURL = "https://mdpi.com/2227-7102/9/3/181/pdf?version=1563177761";
-  await h.port.inbound(jobOfferForHosts("job_mdpi_pdf_route", ["mdpi.com"], pdfURL));
+  await h.port.inbound(
+    jobOfferForHosts("job_mdpi_pdf_route", ["mdpi.com"], pdfURL),
+  );
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   await h.tabs.completeNavigation(tabID, pdfURL);
 
@@ -3581,7 +4405,6 @@ test("an MDPI PDF route without a .pdf suffix is adopted", async () => {
   ]);
 });
 
-
 test("a correlated download is steered into papio/<job_id>/; unrelated untouched", async () => {
   const h = makeHarness();
   await h.bridge.start();
@@ -3590,16 +4413,30 @@ test("a correlated download is steered into papio/<job_id>/; unrelated untouched
 
   const suggestions: { filename: string; conflictAction: string }[] = [];
   await h.downloads.onDeterminingFilename.emit(
-    { id: 5, tabId: tabID, filename: "Trust_in_Automation.pdf", state: "in_progress" },
+    {
+      id: 5,
+      tabId: tabID,
+      filename: "Trust_in_Automation.pdf",
+      state: "in_progress",
+    },
     (s) => suggestions.push(s),
   );
   expect(suggestions).toEqual([
-    { filename: "papio/job_0007_steer/Trust_in_Automation.pdf", conflictAction: "uniquify" },
+    {
+      filename: "papio/job_0007_steer/Trust_in_Automation.pdf",
+      conflictAction: "uniquify",
+    },
   ]);
 
   // Unrelated download (different tab, unknown host): never steered.
   await h.downloads.onDeterminingFilename.emit(
-    { id: 6, tabId: 999, url: "https://example.org/x.pdf", filename: "x.pdf", state: "in_progress" },
+    {
+      id: 6,
+      tabId: 999,
+      url: "https://example.org/x.pdf",
+      filename: "x.pdf",
+      state: "in_progress",
+    },
     (s) => suggestions.push(s),
   );
   expect(suggestions.length).toBe(1);
@@ -3629,12 +4466,17 @@ test("closing the tab before auth cancels; after auth (awaiting_download) does n
   expect(post.backend.store.activeJobs.length).toBe(0);
 });
 
-
 test("a malformed inbound frame fails closed by disconnecting", async () => {
   const h = makeHarness();
   await h.bridge.start();
   expect(h.port.disconnected).toBe(false);
-  await h.port.inbound({ protocol: "papio-browser/1", type: "not_a_type", msg_id: "x", seq: 0, payload: {} });
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "not_a_type",
+    msg_id: "x",
+    seq: 0,
+    payload: {},
+  });
   expect(h.port.disconnected).toBe(true);
 });
 
@@ -3692,7 +4534,12 @@ test("hello-required error reconnects once and does not duplicate a live tab", a
   // The fresh daemon re-offers the durable job; the tracked live tab is reused.
   await h.ports[1]?.inbound(jobOffer("job_0007_session"));
   expect(h.tabs.created.length).toBe(0);
-  expect(h.frames().filter((f) => f.type === "job_accept" && f.job_id === "job_0007_session").length).toBe(1);
+  expect(
+    h
+      .frames()
+      .filter((f) => f.type === "job_accept" && f.job_id === "job_0007_session")
+      .length,
+  ).toBe(1);
 });
 
 test("unplanned port death marks the badge unhealthy and reconnect clears it", async () => {
@@ -3717,7 +4564,13 @@ test("unplanned port death marks the badge unhealthy and reconnect clears it", a
   const bad = makeHarness();
   await bad.bridge.start();
   const timersBefore = bad.timers.length;
-  await bad.port.inbound({ protocol: "papio-browser/1", type: "not_a_type", msg_id: "x", seq: 0, payload: {} });
+  await bad.port.inbound({
+    protocol: "papio-browser/1",
+    type: "not_a_type",
+    msg_id: "x",
+    seq: 0,
+    payload: {},
+  });
   expect(bad.port.disconnected).toBe(true);
   expect(bad.timers.length).toBe(timersBefore);
 });
@@ -3730,7 +4583,9 @@ test("backoff exhaustion leaves the daemon-unavailable badge set", async () => {
     if (attempt < 8) await h.timers.at(-1)?.fn();
   }
 
-  expect(h.timers.filter((timer) => timer.ms !== 12_000 && timer.ms !== 90_000)).toHaveLength(8);
+  expect(
+    h.timers.filter((timer) => timer.ms !== 12_000 && timer.ms !== 90_000),
+  ).toHaveLength(8);
   expect(h.action.texts.at(-1)).toBe("!");
   expect(h.action.backgroundColors.at(-1)).toBe("#777777");
 });
@@ -3752,11 +4607,19 @@ test("concurrent handoff triggers cannot double-drain one provider", async () =>
   expect(first).toMatchObject({ ok: true, opened: true });
   expect(second).toMatchObject({ ok: false });
   expect(h.tabs.created).toHaveLength(2);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_provider_first")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_provider_first",
+    ),
+  ).toMatchObject({
     tab_id: expect.any(Number),
     status: "accepted",
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_provider_second")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_provider_second",
+    ),
+  ).toMatchObject({
     tab_id: -1,
     status: "queued",
   });
@@ -3770,7 +4633,9 @@ test("concurrent fallback timers retain same-provider handoffs behind one lease"
 
   await h.bridge.start();
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(3);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.status === "queued"),
+  ).toHaveLength(3);
   const fallbacks = h.timers.filter((timer) => timer.ms === 45_000);
   expect(fallbacks).toHaveLength(3);
   await h.bridge.requestCancel("job_conc_active");
@@ -3778,8 +4643,12 @@ test("concurrent fallback timers retain same-provider handoffs behind one lease"
   // stay queued instead of opening concurrent handoff tabs for the same host.
   await Promise.all(fallbacks.map((timer) => timer.fn()));
 
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(2);
-  expect(h.backend.store.activeJobs.filter((job) => job.tab_id >= 0)).toHaveLength(1);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.status === "queued"),
+  ).toHaveLength(2);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.tab_id >= 0),
+  ).toHaveLength(1);
   // One fallback owns the sole provider lease and is surfaced in the
   // background; the remaining callbacks retain their queued jobs.
   expect(h.tabs.created.filter((tab) => !tab.active)).toHaveLength(1);
@@ -3856,7 +4725,10 @@ test("overlapping state writes persist serially so no stale snapshot wins", asyn
   backend.maxInFlight = 0; // ignore any hydration write during start.
 
   // Two Chrome events land at once; each mutates state and persists a snapshot.
-  await Promise.all([port.inbound(jobOffer("job_write_a")), port.inbound(jobOffer("job_write_b"))]);
+  await Promise.all([
+    port.inbound(jobOffer("job_write_a")),
+    port.inbound(jobOffer("job_write_b")),
+  ]);
 
   // Serialized persistence keeps at most one save in flight at any moment.
   // Without the save chain both writes overlap and a reordered chrome.storage
@@ -3872,10 +4744,14 @@ test("work-window mode routes the first handoff into one minimized unfocused win
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_ww_first"));
 
-  expect(h.windows?.created).toEqual([{ url: OPENURL, focused: false, state: "minimized" }]);
+  expect(h.windows?.created).toEqual([
+    { url: OPENURL, focused: false, state: "minimized" },
+  ]);
   // The tab was created by windows.create inside the work window, never
   // focused, and the job tracks it like any broker tab.
-  expect(h.tabs.created).toEqual([{ url: OPENURL, active: false, windowId: 500 }]);
+  expect(h.tabs.created).toEqual([
+    { url: OPENURL, active: false, windowId: 500 },
+  ]);
   expect(h.backend.store.workWindowID).toBe(500);
   expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
   const accept = h.frames().find((f) => f.type === "job_accept");
@@ -3886,7 +4762,10 @@ test("requiresVisible is opt-in and fails closed for unmatched adapters", () => 
   const cases: { spec: AdapterSpec | undefined; wantsVisible: boolean }[] = [
     { spec: undefined, wantsVisible: false },
     { spec: PROVIDER_ADAPTER, wantsVisible: false },
-    { spec: { ...PROVIDER_ADAPTER, requiresVisible: true }, wantsVisible: true },
+    {
+      spec: { ...PROVIDER_ADAPTER, requiresVisible: true },
+      wantsVisible: true,
+    },
   ];
   for (const { spec, wantsVisible } of cases) {
     expect(needsVisibleWindow(spec)).toBe(wantsVisible);
@@ -3899,15 +4778,25 @@ test("work-window visibility follows the matched adapter requirement", async () 
     expectedState: string;
     expectedUpdates: {
       windowID: number;
-      props: { focused?: boolean; state?: "normal" | "minimized"; drawAttention?: boolean };
+      props: {
+        focused?: boolean;
+        state?: "normal" | "minimized";
+        drawAttention?: boolean;
+      };
     }[];
   }[] = [
     {
       adapterSpecs: [{ ...PROVIDER_ADAPTER, requiresVisible: true }],
       expectedState: "normal",
-      expectedUpdates: [{ windowID: 500, props: { focused: false, state: "normal" } }],
+      expectedUpdates: [
+        { windowID: 500, props: { focused: false, state: "normal" } },
+      ],
     },
-    { adapterSpecs: [PROVIDER_ADAPTER], expectedState: "minimized", expectedUpdates: [] },
+    {
+      adapterSpecs: [PROVIDER_ADAPTER],
+      expectedState: "minimized",
+      expectedUpdates: [],
+    },
     { adapterSpecs: [], expectedState: "minimized", expectedUpdates: [] },
   ];
   for (const [index, c] of cases.entries()) {
@@ -3933,7 +4822,9 @@ test("a directly matched visible-required handoff opens a normal unfocused windo
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_ww_visible_target", providerURL));
 
-  expect(h.windows?.created).toEqual([{ url: providerURL, focused: false, state: "normal" }]);
+  expect(h.windows?.created).toEqual([
+    { url: providerURL, focused: false, state: "normal" },
+  ]);
   expect(h.windows?.updated).toEqual([]);
 });
 
@@ -3941,7 +4832,12 @@ test("work window is reused across offers and recreated after the user closes it
   // Warm auth evidence makes the first offer immediately occupy the single
   // governor slot; later offers remain queued until it releases.
   const h = makeHarness(
-    { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
+    {
+      ...emptyStore(),
+      authEvidenceByOrigin: {
+        "https://resolver.example.edu": 1_700_000_000_000,
+      },
+    },
     { windows: true },
   );
   await h.bridge.start();
@@ -3955,7 +4851,9 @@ test("work window is reused across offers and recreated after the user closes it
   h.windows?.close(500);
   await h.port.inbound(jobOffer("job_ww_c"));
   expect(h.windows?.created.length).toBe(1);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_ww_c")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_ww_c"),
+  ).toMatchObject({
     status: "accepted",
     tab_id: -1,
   });
@@ -4001,7 +4899,10 @@ test("a keepalive-pinned tab keeps the work window alive when handoffs drain", a
 });
 
 test("tab-group mode opens the handoff in a collapsed papio group in the current window", async () => {
-  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_tg_first"));
 
@@ -4012,14 +4913,21 @@ test("tab-group mode opens the handoff in a collapsed papio group in the current
   expect(groupID).toBeDefined();
   expect(h.tabGroups?.live.get(groupID!)?.collapsed).toBe(true);
   expect(h.tabGroups?.updated).toEqual([
-    { groupID: groupID!, props: { title: "papio", collapsed: true, color: "orange" } },
+    {
+      groupID: groupID!,
+      props: { title: "papio", collapsed: true, color: "orange" },
+    },
   ]);
 });
 
 test("tab-group handoff works on Firefox 139+ (no onDeterminingFilename)", async () => {
   // Firefox has no downloads.onDeterminingFilename, but Firefox 139+ ships the
   // tabGroups API. Tab-group handoff is dep-driven, never gated on Chrome.
-  const h = makeHarness(undefined, { firefox: true, tabGroups: true, handoffSurface: "tab-group" });
+  const h = makeHarness(undefined, {
+    firefox: true,
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_tg_firefox"));
 
@@ -4032,7 +4940,12 @@ test("tab-group handoff works on Firefox 139+ (no onDeterminingFilename)", async
 
 test("tab-group handoffs reuse one papio group", async () => {
   const h = makeHarness(
-    { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
+    {
+      ...emptyStore(),
+      authEvidenceByOrigin: {
+        "https://resolver.example.edu": 1_700_000_000_000,
+      },
+    },
     { tabGroups: true, handoffSurface: "tab-group" },
   );
   await h.bridge.start();
@@ -4043,21 +4956,39 @@ test("tab-group handoffs reuse one papio group", async () => {
 
   // The second handoff opens after the first releases and joins the same
   // papio group rather than creating another group.
-  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }, { tabIds: [101], groupId: groupID }]);
+  expect(h.tabs.grouped).toEqual([
+    { tabIds: [100] },
+    { tabIds: [101], groupId: groupID },
+  ]);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
   expect(h.tabGroups?.live.size).toBe(1);
 });
 
 test("concurrent tab-group folds create exactly one papio group", async () => {
-  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
   await h.bridge.start();
-  const first = await h.tabs.create({ url: `${OPENURL}&keepalive=first`, active: false });
-  const second = await h.tabs.create({ url: `${OPENURL}&keepalive=second`, active: false });
+  const first = await h.tabs.create({
+    url: `${OPENURL}&keepalive=first`,
+    active: false,
+  });
+  const second = await h.tabs.create({
+    url: `${OPENURL}&keepalive=second`,
+    active: false,
+  });
 
-  await Promise.all([h.bridge.foldKeepaliveTab(first.id!), h.bridge.foldKeepaliveTab(second.id!)]);
+  await Promise.all([
+    h.bridge.foldKeepaliveTab(first.id!),
+    h.bridge.foldKeepaliveTab(second.id!),
+  ]);
 
   expect(h.tabGroups?.live.size).toBe(1);
-  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }, { tabIds: [101], groupId: 700 }]);
+  expect(h.tabs.grouped).toEqual([
+    { tabIds: [100] },
+    { tabIds: [101], groupId: 700 },
+  ]);
 });
 
 test("tab-group folds do not reuse a stored group from another window", async () => {
@@ -4065,9 +4996,18 @@ test("tab-group folds do not reuse a stored group from another window", async ()
     { ...emptyStore(), handoffGroupID: 700 },
     { tabGroups: true, handoffSurface: "tab-group" },
   );
-  const existing = await h.tabs.create({ url: `${OPENURL}&window=one`, active: false, windowId: 1 });
+  const existing = await h.tabs.create({
+    url: `${OPENURL}&window=one`,
+    active: false,
+    windowId: 1,
+  });
   h.tabs.patch(existing.id!, { groupId: 700 });
-  h.tabGroups?.live.set(700, { id: 700, collapsed: true, title: "papio", windowId: 1 });
+  h.tabGroups?.live.set(700, {
+    id: 700,
+    collapsed: true,
+    title: "papio",
+    windowId: 1,
+  });
   h.tabGroups!.nextID = 701;
   h.tabs.currentWindowID = 2;
 
@@ -4081,7 +5021,10 @@ test("tab-group folds do not reuse a stored group from another window", async ()
 });
 
 test("tab-group mode rediscovers a renamed papio group after session storage clears", async () => {
-  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_tg_reload_a"));
   const groupID = h.backend.store.handoffGroupID;
@@ -4101,14 +5044,25 @@ test("tab-group mode rediscovers a renamed papio group after session storage cle
 
   expect(h.tabGroups?.live.size).toBe(1);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
-  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }, { tabIds: [101], groupId: groupID! }]);
-  expect(h.tabGroups?.live.get(groupID!)?.title).toBe("papio — A paper still awaiting institutional access");
+  expect(h.tabs.grouped).toEqual([
+    { tabIds: [100] },
+    { tabIds: [101], groupId: groupID! },
+  ]);
+  expect(h.tabGroups?.live.get(groupID!)?.title).toBe(
+    "papio — A paper still awaiting institutional access",
+  );
 });
 
 test("startup consolidates three papio groups in one window", async () => {
-  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
   for (const groupID of [700, 701, 702]) {
-    const tab = await h.tabs.create({ url: `${OPENURL}&group=${groupID}`, active: false });
+    const tab = await h.tabs.create({
+      url: `${OPENURL}&group=${groupID}`,
+      active: false,
+    });
     h.tabs.patch(tab.id!, { groupId: groupID });
     h.tabGroups!.live.set(groupID, {
       id: groupID,
@@ -4121,16 +5075,24 @@ test("startup consolidates three papio groups in one window", async () => {
 
   await h.bridge.start();
 
-  expect(h.tabs.grouped).toEqual([{ tabIds: [101], groupId: 700 }, { tabIds: [102], groupId: 700 }]);
+  expect(h.tabs.grouped).toEqual([
+    { tabIds: [101], groupId: 700 },
+    { tabIds: [102], groupId: 700 },
+  ]);
   expect(h.tabs.list().map((tab) => tab.groupId)).toEqual([700, 700, 700]);
   expect(h.tabGroups?.live.size).toBe(1);
 });
 
 test("IdP auth expands the papio group and re-collapses when auth returns", async () => {
-  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
   await h.bridge.start();
   const offer = jobOffer("job_tg_auth") as { payload: Record<string, unknown> };
-  offer.payload["expected"] = { title: "A paper awaiting institutional access" };
+  offer.payload["expected"] = {
+    title: "A paper awaiting institutional access",
+  };
   await h.port.inbound(offer);
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const groupID = h.backend.store.handoffGroupID!;
@@ -4140,7 +5102,9 @@ test("IdP auth expands the papio group and re-collapses when auth returns", asyn
   expect(h.frames().some((f) => f.type === "auth_pending")).toBe(true);
   expect(h.tabs.activated).toEqual([tabID]);
   expect(h.tabGroups?.live.get(groupID)?.collapsed).toBe(false);
-  expect(h.tabGroups?.live.get(groupID)?.title).toBe("papio — A paper awaiting institutional access");
+  expect(h.tabGroups?.live.get(groupID)?.title).toBe(
+    "papio — A paper awaiting institutional access",
+  );
 
   // Auth returns to a provider host: the job advances and the group folds away.
   const providerURL = `https://${PROVIDER_HOST}/stable/123`;
@@ -4156,16 +5120,28 @@ test("IdP auth expands the papio group and re-collapses when auth returns", asyn
 
 test("tab-group surfaces use the generic title when multiple jobs share the group", async () => {
   const h = makeHarness(
-    { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
+    {
+      ...emptyStore(),
+      authEvidenceByOrigin: {
+        "https://resolver.example.edu": 1_700_000_000_000,
+      },
+    },
     { tabGroups: true, handoffSurface: "tab-group" },
   );
-  const first = jobOffer("job_tg_multiple_first") as { payload: Record<string, unknown> };
-  first.payload["expected"] = { title: "A paper that should not claim a shared group" };
+  const first = jobOffer("job_tg_multiple_first") as {
+    payload: Record<string, unknown>;
+  };
+  first.payload["expected"] = {
+    title: "A paper that should not claim a shared group",
+  };
 
   await h.bridge.start();
   await h.port.inbound(first);
   await h.port.inbound(jobOffer("job_tg_multiple_second"));
-  const firstTabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_tg_multiple_first")?.tab_id ?? -1;
+  const firstTabID =
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_tg_multiple_first",
+    )?.tab_id ?? -1;
   const groupID = h.backend.store.handoffGroupID!;
   const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
 
@@ -4175,7 +5151,10 @@ test("tab-group surfaces use the generic title when multiple jobs share the grou
 });
 
 test("an emptied papio group's id is dropped so the next handoff regroups", async () => {
-  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_tg_idle"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -4188,9 +5167,16 @@ test("an emptied papio group's id is dropped so the next handoff regroups", asyn
 });
 
 test("a live papio group keeps its generic collapsed title when the last handoff closes", async () => {
-  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
-  const offer = jobOffer("job_tg_keepalive") as { payload: Record<string, unknown> };
-  offer.payload["expected"] = { title: "Paper metadata must disappear on cancellation" };
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
+  const offer = jobOffer("job_tg_keepalive") as {
+    payload: Record<string, unknown>;
+  };
+  offer.payload["expected"] = {
+    title: "Paper metadata must disappear on cancellation",
+  };
   await h.bridge.start();
   await h.port.inbound(offer);
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -4211,7 +5197,10 @@ test("a live papio group keeps its generic collapsed title when the last handoff
   await collapse!.fn();
   expect(h.backend.store.activeJobs.length).toBe(0);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
-  expect(h.tabGroups?.live.get(groupID)).toMatchObject({ collapsed: true, title: "papio" });
+  expect(h.tabGroups?.live.get(groupID)).toMatchObject({
+    collapsed: true,
+    title: "papio",
+  });
 });
 
 test("IdP navigation surfaces the work-window tab: activate + restore + focus", async () => {
@@ -4226,7 +5215,10 @@ test("IdP navigation surfaces the work-window tab: activate + restore + focus", 
   expect(h.frames().some((f) => f.type === "auth_pending")).toBe(true);
   expect(h.tabs.activated).toEqual([tabID]);
   expect(h.windows?.updated).toEqual([
-    { windowID: 500, props: { focused: true, drawAttention: true, state: "normal" } },
+    {
+      windowID: 500,
+      props: { focused: true, drawAttention: true, state: "normal" },
+    },
   ]);
 });
 
@@ -4248,7 +5240,11 @@ test("an HTML adapter download is refused, discarded, and reported as download_n
 
   // The provider served its "get access" page where the PDF should be —
   // adopting it would only bounce off the daemon's %PDF validation.
-  await h.downloads.onCreated.emit({ id: 7, tabId: tabID, state: "in_progress" });
+  await h.downloads.onCreated.emit({
+    id: 7,
+    tabId: tabID,
+    state: "in_progress",
+  });
   h.downloads.items.set(7, {
     id: 7,
     tabId: tabID,
@@ -4267,7 +5263,11 @@ test("an HTML adapter download is refused, discarded, and reported as download_n
   expect(h.downloads.removedFiles).toContain(7);
 
   // A genuine PDF on the same job afterwards still adopts normally.
-  await h.downloads.onCreated.emit({ id: 8, tabId: tabID, state: "in_progress" });
+  await h.downloads.onCreated.emit({
+    id: 8,
+    tabId: tabID,
+    state: "in_progress",
+  });
   h.downloads.items.set(8, {
     id: 8,
     tabId: tabID,
@@ -4287,14 +5287,18 @@ test("popup capture relay emits page_capture only after the daemon advertises it
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
-  const sanitized = sanitizeFixture(`<main class="article">Known structure</main>`, {
-    provider: "jstor",
-    scenario: "success",
-    originNoQuery: "https://www.jstor.org/stable/123",
-    capturedISO: "2026-07-27T10:11:12.000Z",
-  });
+  const sanitized = sanitizeFixture(
+    `<main class="article">Known structure</main>`,
+    {
+      provider: "jstor",
+      scenario: "success",
+      originNoQuery: "https://www.jstor.org/stable/123",
+      capturedISO: "2026-07-27T10:11:12.000Z",
+    },
+  );
   const encoded = await encodePageCapture(sanitized, {
     host: "www.jstor.org",
     scenario: "success",
@@ -4312,7 +5316,10 @@ test("popup capture relay emits page_capture only after the daemon advertises it
     ),
   ).resolves.toEqual({
     ok: false,
-    error: { code: "unauthorized", message: "This sender cannot send page captures" },
+    error: {
+      code: "unauthorized",
+      message: "This sender cannot send page captures",
+    },
   });
   expect(h.frames().some((frame) => frame.type === "page_capture")).toBe(false);
   await expect(
@@ -4354,6 +5361,7 @@ test("popup capture relay withholds a terms capture until the daemon advertises 
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const sanitized = sanitizeFixture(`<main class="terms">Consent wall</main>`, {
@@ -4384,12 +5392,15 @@ test("popup capture relay withholds a terms capture until the daemon advertises 
     ok: false,
     error: {
       code: "capture_failed",
-      message: "The connected daemon does not support terms captures; upgrade the daemon to send this scenario",
+      message:
+        "The connected daemon does not support terms captures; upgrade the daemon to send this scenario",
     },
   });
   expect(h.frames().some((frame) => frame.type === "page_capture")).toBe(false);
 
-  await h.port.inbound(helloAck({ features: ["page_capture_v1", "page_capture_terms_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["page_capture_v1", "page_capture_terms_v1"] }),
+  );
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
@@ -4408,12 +5419,15 @@ test("capture consent refreshes live false-to-true and true-to-false", async () 
   const h = makeHarness(undefined, { firefox: true, captureConsent: false });
   let allowed = false;
   h.deps.captureConsent = { get: async () => allowed };
-  const sanitized = sanitizeFixture(`<main class="article">Consent transition</main>`, {
-    provider: "jstor",
-    scenario: "success",
-    originNoQuery: "https://www.jstor.org/stable/consent",
-    capturedISO: "2026-08-10T00:00:00.000Z",
-  });
+  const sanitized = sanitizeFixture(
+    `<main class="article">Consent transition</main>`,
+    {
+      provider: "jstor",
+      scenario: "success",
+      originNoQuery: "https://www.jstor.org/stable/consent",
+      capturedISO: "2026-08-10T00:00:00.000Z",
+    },
+  );
   const encoded = await encodePageCapture(sanitized, {
     host: "www.jstor.org",
     scenario: "success",
@@ -4428,12 +5442,20 @@ test("capture consent refreshes live false-to-true and true-to-false", async () 
   await expect(h.bridge.sendPageCapture(encoded.payload)).resolves.toBe(true);
   allowed = false;
   await expect(h.bridge.sendPageCapture(encoded.payload)).resolves.toBe(false);
-  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "page_capture"),
+  ).toHaveLength(1);
 });
 
 test("page capture request closes an inactive ledgered managed tab after focus moves away", async () => {
-  const h = makeHarness(undefined, { windows: true, handoffSurface: "work-window" });
-  let ledger: Record<string, { openedAt: number; url: string; windowId?: number; groupId?: number }> = {};
+  const h = makeHarness(undefined, {
+    windows: true,
+    handoffSurface: "work-window",
+  });
+  let ledger: Record<
+    string,
+    { openedAt: number; url: string; windowId?: number; groupId?: number }
+  > = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -4443,20 +5465,24 @@ test("page capture request closes an inactive ledgered managed tab after focus m
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func !== capturePage) return [];
-    return [{
-      result: {
-        html: `<html><body><main class="article">Captured structure</main></body></html>`,
-        origin: "https://www.jstor.org",
-        path: "/stable/123",
+    return [
+      {
+        result: {
+          html: `<html><body><main class="article">Captured structure</main></body></html>`,
+          origin: "https://www.jstor.org",
+          path: "/stable/123",
+        },
       },
-    }];
+    ];
   };
   h.deps.tabs.query = async () => h.tabs.list();
   expect(h.deps.tabs.query).toBeDefined();
   await h.bridge.start();
-  await h.port.inbound(helloAck({
-    features: ["page_capture_v1", "page_capture_request_v1"],
-  }));
+  await h.port.inbound(
+    helloAck({
+      features: ["page_capture_v1", "page_capture_request_v1"],
+    }),
+  );
   const pending = h.port.inbound({
     protocol: "papio-browser/1",
     type: "page_capture_request",
@@ -4469,14 +5495,26 @@ test("page capture request closes an inactive ledgered managed tab after focus m
       scenario: "success",
     },
   });
-  for (let attempt = 0; attempt < 20 && h.tabs.created.length === 0; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < 20 && h.tabs.created.length === 0;
+    attempt += 1
+  ) {
     await Promise.resolve();
   }
-  for (let attempt = 0; attempt < 100 && (h.windows?.updated.length ?? 0) === 0; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < 100 && (h.windows?.updated.length ?? 0) === 0;
+    attempt += 1
+  ) {
     await Promise.resolve();
   }
   expect(h.windows?.created).toEqual([
-    { url: "https://www.jstor.org/stable/123", focused: false, state: "minimized" },
+    {
+      url: "https://www.jstor.org/stable/123",
+      focused: false,
+      state: "minimized",
+    },
   ]);
   expect(h.tabs.created).toEqual([
     { url: "https://www.jstor.org/stable/123", active: false, windowId: 500 },
@@ -4487,17 +5525,34 @@ test("page capture request closes an inactive ledgered managed tab after focus m
   });
   const tabID = h.tabs.list()[0]?.id ?? -1;
   await h.tabs.userActivate(tabID);
-  for (let attempt = 0; attempt < 20 && ledger[String(tabID)] === undefined; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < 20 && ledger[String(tabID)] === undefined;
+    attempt += 1
+  ) {
     await Promise.resolve();
   }
   expect(ledger[String(tabID)]).toBeDefined();
-  h.tabs.seed({ id: 999, url: "https://operator.example.test/away", active: false, windowId: 500 });
+  h.tabs.seed({
+    id: 999,
+    url: "https://operator.example.test/away",
+    active: false,
+    windowId: 500,
+  });
   await h.tabs.userActivate(999); // the operator switches away before capture cleanup
-  for (let attempt = 0; attempt < 20 && !h.timers.some((timer) => timer.ms === 30_000); attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < 20 && !h.timers.some((timer) => timer.ms === 30_000);
+    attempt += 1
+  ) {
     await Promise.resolve();
   }
   await h.tabs.completeNavigation(tabID);
-  for (let attempt = 0; attempt < 20 && !h.timers.some((timer) => timer.ms === 3_000); attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < 20 && !h.timers.some((timer) => timer.ms === 3_000);
+    attempt += 1
+  ) {
     await Promise.resolve();
   }
   await h.timers.find((timer) => timer.ms === 3_000)?.fn();
@@ -4510,7 +5565,9 @@ test("page capture request closes an inactive ledgered managed tab after focus m
     adapter_id: "jstor",
     encoding: "gzip+base64",
   });
-  const result = h.frames().find((frame) => frame.type === "page_capture_request_result");
+  const result = h
+    .frames()
+    .find((frame) => frame.type === "page_capture_request_result");
   expect(result?.payload).toEqual({
     request_id: "capture-request-001",
     outcome: "captured",
@@ -4521,14 +5578,21 @@ test("page capture request closes an inactive ledgered managed tab after focus m
 
 test("page capture request respects the single-drive handoff governor", async () => {
   const h = makeHarness(
-    { ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } },
+    {
+      ...emptyStore(),
+      authEvidenceByOrigin: {
+        "https://resolver.example.edu": 1_700_000_000_000,
+      },
+    },
     { handoffSurface: "in-window" },
   );
   h.deps.permissions.contains = async () => true;
   await h.bridge.start();
-  await h.port.inbound(helloAck({
-    features: ["page_capture_v1", "page_capture_request_v1"],
-  }));
+  await h.port.inbound(
+    helloAck({
+      features: ["page_capture_v1", "page_capture_request_v1"],
+    }),
+  );
   await h.port.inbound(jobOffer("job_capture_governor_1"));
   await h.port.inbound(jobOffer("job_capture_governor_2"));
   expect(h.tabs.created).toHaveLength(1);
@@ -4547,11 +5611,13 @@ test("page capture request respects the single-drive handoff governor", async ()
     },
   });
   expect(h.tabs.created).toHaveLength(1);
-  const result = h.frames().find(
-    (frame) =>
-      frame.type === "page_capture_request_result" &&
-      frame.payload["request_id"] === "capture-request-busy",
-  );
+  const result = h
+    .frames()
+    .find(
+      (frame) =>
+        frame.type === "page_capture_request_result" &&
+        frame.payload["request_id"] === "capture-request-busy",
+    );
   expect(result?.payload["outcome"]).toBe("busy");
 });
 
@@ -4562,31 +5628,48 @@ test("inbox runtime messages validate the exact extension sender", async () => {
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const message = { type: "papio.triage.counts", request: {} };
 
   for (const sender of [
-    { id: "papio-test-id", url: "chrome-extension://papio-test-id/options.html" },
+    {
+      id: "papio-test-id",
+      url: "chrome-extension://papio-test-id/options.html",
+    },
     { id: "papio-test-id", url: "https://provider.example/article" },
     { id: "other-extension", url: urls.inboxURL },
   ]) {
-    await expect(handleInboxRuntimeMessage(h.bridge, message, sender, urls)).resolves.toEqual({
+    await expect(
+      handleInboxRuntimeMessage(h.bridge, message, sender, urls),
+    ).resolves.toEqual({
       ok: false,
-      error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
+      error: {
+        code: "unauthorized",
+        message: "This sender cannot access the inbox broker",
+      },
     });
   }
 
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: [] }));
-  await expect(handleInboxRuntimeMessage(h.bridge, message, { id: urls.runtimeID, url: urls.inboxURL }, urls)).resolves
-    .toEqual({
-      ok: false,
-      error: {
-        code: "feature_unavailable",
-        message: "This daemon does not support the requested inbox feature",
-      },
-    });
+  await h.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, features: [] }),
+  );
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      message,
+      { id: urls.runtimeID, url: urls.inboxURL },
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "feature_unavailable",
+      message: "This daemon does not support the requested inbox feature",
+    },
+  });
 });
 // The popup may read AGGREGATES it renders itself (Activity for catch-up, counts
 // for the pulse header's decision count). The triage SNAPSHOT carries citations
@@ -4599,6 +5682,7 @@ test("papio.activity and counts accept popup senders while snapshot and mutation
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const reply = {
@@ -4606,11 +5690,20 @@ test("papio.activity and counts accept popup senders while snapshot and mutation
     feature: true,
     request_id: "request-activity-1",
     generated_at: "2026-08-03T00:00:01Z",
-    entries: [{ seq: 1, at: "2026-08-03T00:00:00Z", kind: "download_complete", text: "Ready" }],
+    entries: [
+      {
+        seq: 1,
+        at: "2026-08-03T00:00:00Z",
+        kind: "download_complete",
+        text: "Ready",
+      },
+    ],
     has_more: false,
     latest_seq: 1,
   };
-  let requestedRequest: { limit?: number; before_seq?: string; seen_through_seq?: string } | undefined;
+  let requestedRequest:
+    | { limit?: number; before_seq?: string; seen_through_seq?: string }
+    | undefined;
   h.bridge.requestActivity = async (request) => {
     requestedRequest = request;
     return reply;
@@ -4625,7 +5718,11 @@ test("papio.activity and counts accept popup senders while snapshot and mutation
     ),
   ).resolves.toBe(reply);
   expect(requestedRequest).toEqual({ limit: 10 });
-  const stubbed = { ok: true as const, counts: { pending_total: 1 }, generated_at: "2026-08-03T00:00:01Z" };
+  const stubbed = {
+    ok: true as const,
+    counts: { pending_total: 1 },
+    generated_at: "2026-08-03T00:00:01Z",
+  };
   h.bridge.requestTriageCounts = async () => stubbed;
   await expect(
     handleInboxRuntimeMessage(
@@ -4636,9 +5733,19 @@ test("papio.activity and counts accept popup senders while snapshot and mutation
     ),
   ).resolves.toBe(stubbed);
 
-  for (const type of ["papio.triage.snapshot", "papio.triage.decide", "papio.action.resolve", "papio.delivery.reconcile"]) {
+  for (const type of [
+    "papio.triage.snapshot",
+    "papio.triage.decide",
+    "papio.action.resolve",
+    "papio.delivery.reconcile",
+  ]) {
     await expect(
-      handleInboxRuntimeMessage(h.bridge, { type, request: {} }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+      handleInboxRuntimeMessage(
+        h.bridge,
+        { type, request: {} },
+        { id: urls.runtimeID, url: urls.popupURL },
+        urls,
+      ),
     ).resolves.toMatchObject({ ok: false, error: { code: "unauthorized" } });
   }
 });
@@ -4650,6 +5757,7 @@ test("papio.stats from any papio page routes to the bridge stats request", async
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const statsReply: Awaited<ReturnType<Bridge["requestStats"]>> = {
@@ -4672,7 +5780,12 @@ test("papio.stats from any papio page routes to the bridge stats request", async
   // The popup summary, the history page, and the inbox all read stats.
   for (const url of [urls.popupURL, urls.historyURL, urls.inboxURL]) {
     await expect(
-      handleInboxRuntimeMessage(h.bridge, { type: "papio.stats", request: {} }, { id: urls.runtimeID, url }, urls),
+      handleInboxRuntimeMessage(
+        h.bridge,
+        { type: "papio.stats", request: {} },
+        { id: urls.runtimeID, url },
+        urls,
+      ),
     ).resolves.toBe(statsReply);
   }
   expect(statsCalls).toBe(3);
@@ -4685,24 +5798,39 @@ test("papio.stats rejects foreign senders and malformed requests without touchin
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   let statsCalls = 0;
   h.bridge.requestStats = async (): ReturnType<Bridge["requestStats"]> => {
     statsCalls += 1;
-    return { ok: false, error: { code: "unexpected", message: "the bridge must not be reached" } };
+    return {
+      ok: false,
+      error: { code: "unexpected", message: "the bridge must not be reached" },
+    };
   };
 
   for (const sender of [
-    { id: urls.runtimeID, url: "chrome-extension://papio-test-id/options.html" },
+    {
+      id: urls.runtimeID,
+      url: "chrome-extension://papio-test-id/options.html",
+    },
     { id: urls.runtimeID, url: "https://provider.example/article" },
     { id: "other-extension", url: urls.historyURL },
   ]) {
     await expect(
-      handleInboxRuntimeMessage(h.bridge, { type: "papio.stats", request: {} }, sender, urls),
+      handleInboxRuntimeMessage(
+        h.bridge,
+        { type: "papio.stats", request: {} },
+        sender,
+        urls,
+      ),
     ).resolves.toEqual({
       ok: false,
-      error: { code: "unauthorized", message: "This sender cannot access papio stats" },
+      error: {
+        code: "unauthorized",
+        message: "This sender cannot access papio stats",
+      },
     });
   }
 
@@ -4712,7 +5840,9 @@ test("papio.stats rejects foreign senders and malformed requests without touchin
     { type: "papio.stats" },
     { type: "papio.stats", request: {}, extra: 1 },
   ]) {
-    await expect(handleInboxRuntimeMessage(h.bridge, message, sender, urls)).resolves.toEqual({
+    await expect(
+      handleInboxRuntimeMessage(h.bridge, message, sender, urls),
+    ).resolves.toEqual({
       ok: false,
       error: { code: "invalid_request", message: "Invalid stats request" },
     });
@@ -4729,6 +5859,7 @@ const pageBulkTestURLs = {
   inboxURL: "chrome-extension://papio-test-id/inbox.html",
   popupURL: "chrome-extension://papio-test-id/popup.html",
   historyURL: "chrome-extension://papio-test-id/history.html",
+  optionsURL: "chrome-extension://papio-test-id/options.html",
   pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
 };
 
@@ -4737,9 +5868,10 @@ const pageBulkRequestFixtures: {
   request: Record<string, unknown>;
   unauthorizedMessage: string;
   invalidMessage: string;
-  /** isPopupSender-gated (papio.pageBulk.scan) vs isPageBulkSender-gated
-   * (every other pageBulk type). */
-  gate: "popup" | "pageBulk";
+  /** Which *papio* page(s) may send this type. `scan` is popup-only, most of
+   * the family is workspace-only, scanner-consent reads/writes accept the
+   * three consent surfaces, and the whole-list read is Options-only. */
+  gate: "popup" | "pageBulk" | "consent" | "options";
 }[] = [
   {
     type: "papio.pageBulk.load",
@@ -4750,7 +5882,7 @@ const pageBulkRequestFixtures: {
   },
   {
     type: "papio.pageBulk.scan",
-    request: { tab_id: 5 },
+    request: { tab_id: 5, expected_origin: "https://scholar.example.edu" },
     unauthorizedMessage: "This sender cannot start a page scan",
     invalidMessage: "Invalid page scan request",
     gate: "popup",
@@ -4764,7 +5896,12 @@ const pageBulkRequestFixtures: {
   },
   {
     type: "papio.pageBulk.status",
-    request: { scan_id: "scan-1", identifiers: [{ local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" }] },
+    request: {
+      scan_id: "scan-1",
+      identifiers: [
+        { local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" },
+      ],
+    },
     unauthorizedMessage: "This sender cannot look up page-bulk status",
     invalidMessage: "Invalid page-bulk status request",
     gate: "pageBulk",
@@ -4774,7 +5911,11 @@ const pageBulkRequestFixtures: {
     request: {
       scan_id: "scan-1",
       canonical_keys: ["work:1"],
-      source: { kind: "browser_page", origin: "https://scholar.example.edu", detector: "generic-identifiers/1" },
+      source: {
+        kind: "browser_page",
+        origin: "https://scholar.example.edu",
+        detector: "generic-identifiers/1",
+      },
     },
     unauthorizedMessage: "This sender cannot submit a page-bulk batch",
     invalidMessage: "Invalid page-bulk submit request",
@@ -4785,20 +5926,64 @@ const pageBulkRequestFixtures: {
     request: { origin: "https://scholar.example.edu" },
     unauthorizedMessage: "This sender cannot read the scanner allowlist",
     invalidMessage: "Invalid scanner allowlist request",
-    gate: "pageBulk",
+    gate: "consent",
   },
   {
     type: "papio.pageBulk.allowlist.set",
     request: { origin: "https://scholar.example.edu", allowed: true },
     unauthorizedMessage: "This sender cannot change the scanner allowlist",
     invalidMessage: "Invalid scanner allowlist request",
-    gate: "pageBulk",
+    gate: "consent",
+  },
+  {
+    type: "papio.pageBulk.allowlist.list",
+    request: {},
+    unauthorizedMessage: "This sender cannot list the scanner allowlist",
+    invalidMessage: "Invalid scanner allowlist request",
+    gate: "options",
   },
 ];
 
+/** The pages a gate accepts, and *papio*'s own pages it must still refuse. */
+function gatePageURLs(
+  gate: "popup" | "pageBulk" | "consent" | "options",
+  urls: typeof pageBulkTestURLs,
+): { authorized: string[]; refusedOwnPages: string[] } {
+  switch (gate) {
+    case "popup":
+      return {
+        authorized: [urls.popupURL],
+        refusedOwnPages: [urls.pageBulkURL, urls.optionsURL, urls.inboxURL],
+      };
+    case "pageBulk":
+      return {
+        authorized: [urls.pageBulkURL],
+        refusedOwnPages: [urls.popupURL, urls.optionsURL, urls.inboxURL],
+      };
+    case "consent":
+      return {
+        authorized: [urls.popupURL, urls.pageBulkURL, urls.optionsURL],
+        refusedOwnPages: [urls.inboxURL, urls.historyURL],
+      };
+    case "options":
+      return {
+        authorized: [urls.optionsURL],
+        refusedOwnPages: [
+          urls.popupURL,
+          urls.pageBulkURL,
+          urls.inboxURL,
+          urls.historyURL,
+        ],
+      };
+  }
+}
+
 function stubPageBulkBridge(h: Harness): { calls: number } {
   const counter = { calls: 0 };
-  const unreached = { ok: false as const, error: { code: "unexpected", message: "the bridge must not be reached" } };
+  const unreached = {
+    ok: false as const,
+    error: { code: "unexpected", message: "the bridge must not be reached" },
+  };
   h.bridge.getPageBulkSnapshot = async () => {
     counter.calls += 1;
     return unreached;
@@ -4823,6 +6008,10 @@ function stubPageBulkBridge(h: Harness): { calls: number } {
     counter.calls += 1;
     return unreached;
   };
+  h.bridge.pageBulkAllowlistList = async () => {
+    counter.calls += 1;
+    return unreached;
+  };
   h.bridge.setPageBulkAllowlist = async () => {
     counter.calls += 1;
     return unreached;
@@ -4835,17 +6024,26 @@ test("papio.pageBulk.* rejects a foreign extension id and a foreign origin acros
   const urls = pageBulkTestURLs;
   const counter = stubPageBulkBridge(h);
 
-  for (const { type, request, unauthorizedMessage, gate } of pageBulkRequestFixtures) {
-    const ownPageURL = gate === "popup" ? urls.popupURL : urls.pageBulkURL;
+  for (const {
+    type,
+    request,
+    unauthorizedMessage,
+    gate,
+  } of pageBulkRequestFixtures) {
+    const { authorized, refusedOwnPages } = gatePageURLs(gate, urls);
     for (const sender of [
-      // Foreign extension id — same URL shape, different id.
-      { id: "other-extension", url: ownPageURL },
-      // Correct id, but a URL that is not papio's own gated page (a content
-      // script running on an arbitrary page, or — for pageBulk-gated types —
-      // the popup, which is not the workspace page).
+      // Foreign extension id — an authorized URL shape, different id.
+      ...authorized.map((url) => ({ id: "other-extension", url })),
+      // Correct id, but a content script on an arbitrary page.
       { id: urls.runtimeID, url: "https://provider.example/article" },
+      // Correct id on one of papio's OWN pages that this gate still refuses —
+      // the scanner-consent split is only real if the inbox cannot write it and
+      // the popup cannot enumerate it.
+      ...refusedOwnPages.map((url) => ({ id: urls.runtimeID, url })),
     ]) {
-      await expect(handleInboxRuntimeMessage(h.bridge, { type, request }, sender, urls)).resolves.toEqual({
+      await expect(
+        handleInboxRuntimeMessage(h.bridge, { type, request }, sender, urls),
+      ).resolves.toEqual({
         ok: false,
         error: { code: "unauthorized", message: unauthorizedMessage },
       });
@@ -4854,18 +6052,352 @@ test("papio.pageBulk.* rejects a foreign extension id and a foreign origin acros
   expect(counter.calls).toBe(0);
 });
 
+test("papio.pageBulk.* accepts every authorized papio page for its gate", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  const counter = stubPageBulkBridge(h);
+
+  for (const { type, request, gate } of pageBulkRequestFixtures) {
+    for (const url of gatePageURLs(gate, urls).authorized) {
+      const before = counter.calls;
+      await handleInboxRuntimeMessage(
+        h.bridge,
+        { type, request },
+        { id: urls.runtimeID, url },
+        urls,
+      );
+      // Reaching the (stubbed) bridge is the observable proof the sender and
+      // request shape both passed; the stub's reply itself is meaningless.
+      expect(counter.calls).toBe(before + 1);
+    }
+  }
+});
+
 test("papio.pageBulk.* rejects a malformed request (extra key) via hasOnlyKeys without touching the bridge", async () => {
   const h = makeHarness();
   const urls = pageBulkTestURLs;
   const counter = stubPageBulkBridge(h);
 
-  for (const { type, request, invalidMessage, gate } of pageBulkRequestFixtures) {
-    const sender = { id: urls.runtimeID, url: gate === "popup" ? urls.popupURL : urls.pageBulkURL };
+  for (const {
+    type,
+    request,
+    invalidMessage,
+    gate,
+  } of pageBulkRequestFixtures) {
+    const sender = {
+      id: urls.runtimeID,
+      url: gatePageURLs(gate, urls).authorized[0],
+    };
     await expect(
-      handleInboxRuntimeMessage(h.bridge, { type, request: { ...request, unexpected: true } }, sender, urls),
-    ).resolves.toEqual({ ok: false, error: { code: "invalid_request", message: invalidMessage } });
+      handleInboxRuntimeMessage(
+        h.bridge,
+        { type, request: { ...request, unexpected: true } },
+        sender,
+        urls,
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "invalid_request", message: invalidMessage },
+    });
   }
   expect(counter.calls).toBe(0);
+});
+
+test("papio.pageBulk.scan requires a bare-HTTPS expected_origin", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  const counter = stubPageBulkBridge(h);
+  const sender = { id: urls.runtimeID, url: urls.popupURL };
+
+  for (const request of [
+    // Missing entirely — the pre-consent shape. It must not degrade to an
+    // unchecked scan of whatever the tab currently shows.
+    { tab_id: 5 },
+    { tab_id: 5, expected_origin: "" },
+    { tab_id: 5, expected_origin: "http://scholar.example.edu" },
+    { tab_id: 5, expected_origin: "https://scholar.example.edu/list" },
+    { tab_id: 5, expected_origin: "https://scholar.example.edu?q=1" },
+    { tab_id: 5, expected_origin: 42 },
+  ]) {
+    await expect(
+      handleInboxRuntimeMessage(
+        h.bridge,
+        { type: "papio.pageBulk.scan", request },
+        sender,
+        urls,
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "invalid_request", message: "Invalid page scan request" },
+    });
+  }
+  expect(counter.calls).toBe(0);
+});
+
+test("papio.pageBulk.scan forwards the bound tab and origin to the bridge", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  let received: unknown;
+  h.bridge.startPageBulkScan = async (
+    tabID: number,
+    expectedOrigin: string,
+    pageBulkBaseURL: string,
+  ) => {
+    received = { tabID, expectedOrigin, pageBulkBaseURL };
+    return { ok: true, scan_id: "scan-9" };
+  };
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      {
+        type: "papio.pageBulk.scan",
+        request: { tab_id: 7, expected_origin: "https://scholar.example.edu" },
+      },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
+  ).resolves.toEqual({ ok: true, scan_id: "scan-9" });
+  expect(received).toEqual({
+    tabID: 7,
+    expectedOrigin: "https://scholar.example.edu",
+    pageBulkBaseURL: urls.pageBulkURL,
+  });
+});
+
+// --- ADR-0019 Decision 2: the click invokes the scan, the allowlist consents
+// to it. Every test here asserts on injection COUNT, because the whole point is
+// that no DOM is read before consent exists — a refusal that happens after
+// executeScript would be a privacy failure that still returns the right code.
+
+/** Count only scans (scanDocument injections); adapter/planner injections from
+ * unrelated code paths must not be mistaken for a page read. */
+function countScanInjections(h: Harness): () => number {
+  let scans = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === scanDocument) scans += 1;
+    return [
+      { result: { papers: [], truncated: false, renderedRecordCountHint: null } },
+    ];
+  };
+  return () => scans;
+}
+
+test("a first scan of an unapproved origin is refused before the page is read", async () => {
+  const h = makeHarness();
+  const scans = countScanInjections(h);
+  h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
+
+  await expect(
+    h.bridge.runPageBulkScan(42, "https://scholar.example.edu"),
+  ).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "scanner_consent_required",
+      message: "Allow scanning on this site before papio reads the page",
+    },
+  });
+  expect(scans()).toBe(0);
+  expect(Object.keys(h.pageBulkScans.current.byId)).toEqual([]);
+});
+
+test("a scan of an allowlisted origin reads the page and persists a snapshot", async () => {
+  const h = makeHarness();
+  const scans = countScanInjections(h);
+  h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
+  h.scannerAllowlist.origins = ["https://scholar.example.edu"];
+
+  const result = await h.bridge.runPageBulkScan(42, "https://scholar.example.edu");
+  expect(result.ok).toBe(true);
+  expect(scans()).toBe(1);
+  if (!result.ok) throw new Error(result.error.message);
+  expect(result.snapshot.sourceOrigin).toBe("https://scholar.example.edu");
+  expect(result.snapshot.documentGeneration).toBe(1);
+});
+
+test("an allowlist grant for one origin never authorizes scanning a different origin", async () => {
+  const h = makeHarness();
+  const scans = countScanInjections(h);
+  h.tabs.seed({ id: 42, url: "https://other.example.edu/refs" });
+  h.scannerAllowlist.origins = ["https://scholar.example.edu"];
+
+  await expect(
+    h.bridge.runPageBulkScan(42, "https://other.example.edu"),
+  ).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "scanner_consent_required",
+      message: "Allow scanning on this site before papio reads the page",
+    },
+  });
+  expect(scans()).toBe(0);
+});
+
+test("a tab that navigated away from the bound origin is refused as page_changed, not scanned under the bound consent", async () => {
+  const h = makeHarness();
+  const scans = countScanInjections(h);
+  // Both origins are allowlisted, so the ONLY thing that can refuse this is the
+  // binding check: consent for site A must not read site B just because the
+  // researcher happens to have allowed B too — they clicked on A.
+  h.tabs.seed({ id: 42, url: "https://elsewhere.example.edu/article" });
+  h.scannerAllowlist.origins = [
+    "https://scholar.example.edu",
+    "https://elsewhere.example.edu",
+  ];
+
+  await expect(
+    h.bridge.runPageBulkScan(42, "https://scholar.example.edu"),
+  ).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "page_changed",
+      message: "The source page changed — try again",
+    },
+  });
+  expect(scans()).toBe(0);
+});
+
+test("scanner consent fails closed when there is no allowlist storage at all", async () => {
+  const h = makeHarness();
+  const scans = countScanInjections(h);
+  h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
+  delete h.deps.scannerAllowlist;
+
+  await expect(
+    h.bridge.runPageBulkScan(42, "https://scholar.example.edu"),
+  ).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "scanner_consent_required",
+      message: "Allow scanning on this site before papio reads the page",
+    },
+  });
+  expect(scans()).toBe(0);
+});
+
+function seedSnapshot(
+  h: Harness,
+  overrides?: Partial<PageBulkSnapshotView>,
+): PageBulkSnapshotView {
+  const snapshot: PageBulkSnapshotView = {
+    scanId: "scan-1",
+    sourceTabId: 42,
+    sourceOrigin: "https://scholar.example.edu",
+    sourceTitle: "References",
+    pdfGrabAvailable: false,
+    scannedAt: "2026-08-14T00:00:00.000Z",
+    documentGeneration: 1,
+    items: [],
+    truncated: false,
+    renderedRecordCountHint: null,
+    ...overrides,
+  };
+  h.pageBulkScans.current = withPageBulkSnapshot(
+    emptyPageBulkScanStore(),
+    snapshot,
+  );
+  return snapshot;
+}
+
+test("Rescan is refused before reading the page once scanning consent is revoked", async () => {
+  const h = makeHarness();
+  const scans = countScanInjections(h);
+  h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
+  seedSnapshot(h);
+  // Consent was granted when the workspace opened and revoked since. The open
+  // workspace must not keep reading the page on the strength of a stale grant.
+  h.scannerAllowlist.origins = [];
+
+  await expect(h.bridge.requestPageBulkRescan("scan-1")).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "scanner_consent_required",
+      message: "Allow scanning on this site before papio reads the page",
+    },
+  });
+  expect(scans()).toBe(0);
+});
+
+test("Rescan succeeds again once the origin is re-allowed, bumping the generation", async () => {
+  const h = makeHarness();
+  const scans = countScanInjections(h);
+  h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
+  seedSnapshot(h);
+  h.scannerAllowlist.origins = ["https://scholar.example.edu"];
+
+  const result = await h.bridge.requestPageBulkRescan("scan-1");
+  expect(result.ok).toBe(true);
+  expect(scans()).toBe(1);
+  if (!result.ok) throw new Error(result.error.message);
+  expect(result.snapshot.documentGeneration).toBe(2);
+  expect(result.snapshot.scanId).toBe("scan-1");
+});
+
+test("Rescan after the source tab moved to another site refuses instead of rebinding the snapshot", async () => {
+  const h = makeHarness();
+  const scans = countScanInjections(h);
+  h.tabs.seed({ id: 42, url: "https://elsewhere.example.edu/article" });
+  seedSnapshot(h);
+  h.scannerAllowlist.origins = [
+    "https://scholar.example.edu",
+    "https://elsewhere.example.edu",
+  ];
+
+  await expect(h.bridge.requestPageBulkRescan("scan-1")).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "source_changed",
+      message: "The source tab moved to another site — start a new scan",
+    },
+  });
+  expect(scans()).toBe(0);
+  // The stored snapshot still names the origin it was scanned from.
+  expect(h.pageBulkScans.current.byId["scan-1"]?.sourceOrigin).toBe(
+    "https://scholar.example.edu",
+  );
+});
+
+test("the scanner allowlist list read is validated, deduplicated, and sorted", async () => {
+  const h = makeHarness();
+  h.scannerAllowlist.origins = [
+    "https://zeta.example.edu",
+    "https://alpha.example.edu",
+    "https://zeta.example.edu",
+    "http://insecure.example.edu",
+    "https://alpha.example.edu/path",
+    "not a url",
+  ];
+
+  await expect(h.bridge.pageBulkAllowlistList()).resolves.toEqual({
+    ok: true,
+    origins: ["https://alpha.example.edu", "https://zeta.example.edu"],
+  });
+});
+
+test("the scanner allowlist list read is empty, not absent, with no storage", async () => {
+  const h = makeHarness();
+  delete h.deps.scannerAllowlist;
+  await expect(h.bridge.pageBulkAllowlistList()).resolves.toEqual({
+    ok: true,
+    origins: [],
+  });
+});
+
+test("allowing then revoking one origin leaves the others untouched", async () => {
+  const h = makeHarness();
+  h.scannerAllowlist.origins = ["https://kept.example.edu"];
+
+  await expect(
+    h.bridge.setPageBulkAllowlist("https://scholar.example.edu", true),
+  ).resolves.toEqual({ ok: true, allowed: true });
+  expect(h.scannerAllowlist.origins).toContain("https://scholar.example.edu");
+  await expect(
+    h.bridge.pageBulkAllowlistContains("https://scholar.example.edu"),
+  ).resolves.toEqual({ ok: true, allowed: true });
+
+  await expect(
+    h.bridge.setPageBulkAllowlist("https://scholar.example.edu", false),
+  ).resolves.toEqual({ ok: true, allowed: false });
+  expect(h.scannerAllowlist.origins).toEqual(["https://kept.example.edu"]);
 });
 
 test("isPageBulkSender strips the ?scan=<id> query when matching the workspace page", async () => {
@@ -4876,13 +6408,21 @@ test("isPageBulkSender strips the ?scan=<id> query when matching the workspace p
     items: [],
     truncated: false,
   });
-  const sender = { id: urls.runtimeID, url: `${urls.pageBulkURL}?scan=scan-42` };
+  const sender = {
+    id: urls.runtimeID,
+    url: `${urls.pageBulkURL}?scan=scan-42`,
+  };
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
       {
         type: "papio.pageBulk.status",
-        request: { scan_id: "scan-42", identifiers: [{ local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" }] },
+        request: {
+          scan_id: "scan-42",
+          identifiers: [
+            { local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" },
+          ],
+        },
       },
       sender,
       urls,
@@ -4911,7 +6451,12 @@ test("papio.pageBulk.load happy dispatch forwards scan_id to the bridge and retu
   };
   const sender = { id: urls.runtimeID, url: urls.pageBulkURL };
   await expect(
-    handleInboxRuntimeMessage(h.bridge, { type: "papio.pageBulk.load", request: { scan_id: "scan-1" } }, sender, urls),
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.pageBulk.load", request: { scan_id: "scan-1" } },
+      sender,
+      urls,
+    ),
   ).resolves.toEqual({ ok: true, snapshot });
   expect(loadedScanID).toBe("scan-1");
 });
@@ -4924,17 +6469,41 @@ test("papio.pageBulk.status happy dispatch forwards the request to the bridge an
     received = request;
     return {
       ok: true,
-      items: [{ local_id: "id-1", canonical_key: "work:1", status: "eligible", ownership_complete: true }],
+      items: [
+        {
+          local_id: "id-1",
+          canonical_key: "work:1",
+          status: "eligible",
+          ownership_complete: true,
+        },
+      ],
       truncated: false,
     };
   };
   const sender = { id: urls.runtimeID, url: urls.pageBulkURL };
-  const request = { scan_id: "scan-1", identifiers: [{ local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" }] };
+  const request = {
+    scan_id: "scan-1",
+    identifiers: [
+      { local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" },
+    ],
+  };
   await expect(
-    handleInboxRuntimeMessage(h.bridge, { type: "papio.pageBulk.status", request }, sender, urls),
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.pageBulk.status", request },
+      sender,
+      urls,
+    ),
   ).resolves.toEqual({
     ok: true,
-    items: [{ local_id: "id-1", canonical_key: "work:1", status: "eligible", ownership_complete: true }],
+    items: [
+      {
+        local_id: "id-1",
+        canonical_key: "work:1",
+        status: "eligible",
+        ownership_complete: true,
+      },
+    ],
     truncated: false,
   });
   expect(received).toEqual(request);
@@ -4946,17 +6515,44 @@ test("papio.pageBulk.submit happy dispatch forwards the request to the bridge an
   let received: unknown;
   h.bridge.requestPageBulkSubmit = async (request) => {
     received = request;
-    return { ok: true, mode: "v2", processed_count: 1, submitted: 1, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" };
+    return {
+      ok: true,
+      mode: "v2",
+      processed_count: 1,
+      submitted: 1,
+      joined: 0,
+      already_owned: 0,
+      invalid: 0,
+      batch_id: "batch_1",
+    };
   };
   const sender = { id: urls.runtimeID, url: urls.pageBulkURL };
   const request = {
     scan_id: "scan-1",
     canonical_keys: ["work:1"],
-    source: { kind: "browser_page", origin: "https://scholar.example.edu", detector: "generic-identifiers/1" },
+    source: {
+      kind: "browser_page",
+      origin: "https://scholar.example.edu",
+      detector: "generic-identifiers/1",
+    },
   };
   await expect(
-    handleInboxRuntimeMessage(h.bridge, { type: "papio.pageBulk.submit", request }, sender, urls),
-  ).resolves.toEqual({ ok: true, mode: "v2", processed_count: 1, submitted: 1, joined: 0, already_owned: 0, invalid: 0, batch_id: "batch_1" });
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.pageBulk.submit", request },
+      sender,
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: true,
+    mode: "v2",
+    processed_count: 1,
+    submitted: 1,
+    joined: 0,
+    already_owned: 0,
+    invalid: 0,
+    batch_id: "batch_1",
+  });
   expect(received).toEqual(request);
 });
 
@@ -4972,7 +6568,12 @@ test("papio.pageBulk.grabPdf routes a steering grab through the native port and 
   };
 
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
   const replyPromise: Promise<unknown> = handleInboxRuntimeMessage(
     h.bridge,
     { type: "papio.pageBulk.grabPdf", request },
@@ -4980,7 +6581,10 @@ test("papio.pageBulk.grabPdf routes a steering grab through the native port and 
     urls,
   );
   const requestFrame = await h.port.waitForFrame("pdf_grab_request");
-  expect(requestFrame.payload).toMatchObject({ host: new URL(request.url).hostname, title: request.title });
+  expect(requestFrame.payload).toMatchObject({
+    host: new URL(request.url).hostname,
+    title: request.title,
+  });
   const requestID = requestFrame.payload["request_id"];
   expect(typeof requestID).toBe("string");
   await h.port.inbound(
@@ -4991,7 +6595,10 @@ test("papio.pageBulk.grabPdf routes a steering grab through the native port and 
       steering_path: "papio/grabs/grabpath/",
     }),
   );
-  await expect(replyPromise).resolves.toEqual({ ok: true, grab_id: "grab-00000001" });
+  await expect(replyPromise).resolves.toEqual({
+    ok: true,
+    grab_id: "grab-00000001",
+  });
   expect(h.downloads.started[0]).toMatchObject({
     url: request.url,
     conflictAction: "uniquify",
@@ -5000,10 +6607,20 @@ test("papio.pageBulk.grabPdf routes a steering grab through the native port and 
 
   const suggestions: { filename: string; conflictAction: string }[] = [];
   await h.downloads.onDeterminingFilename.emit(
-    { id: 901, url: request.url, filename: "/tmp/received-paper.pdf", state: "in_progress" },
+    {
+      id: 901,
+      url: request.url,
+      filename: "/tmp/received-paper.pdf",
+      state: "in_progress",
+    },
     (suggestion) => suggestions.push(suggestion),
   );
-  expect(suggestions).toEqual([{ filename: "papio/grabs/grabpath/received-paper.pdf", conflictAction: "uniquify" }]);
+  expect(suggestions).toEqual([
+    {
+      filename: "papio/grabs/grabpath/received-paper.pdf",
+      conflictAction: "uniquify",
+    },
+  ]);
 
   await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
   expect(h.runtimeMessages).toContainEqual({
@@ -5012,6 +6629,100 @@ test("papio.pageBulk.grabPdf routes a steering grab through the native port and 
     grab_id: "grab-00000001",
     state: "identifying",
   });
+});
+test("papio.pageBulk.grabPdf fails closed before native request when effect permits are not negotiated", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }),
+  );
+  const before = h.frames().length;
+  await expect(
+    handleInboxRuntimeMessage(
+      h.bridge,
+      {
+        type: "papio.pageBulk.grabPdf",
+        request: {
+          tab_id: 42,
+          url: "https://resolver.example.edu/content/no-permit.pdf",
+          scan_id: "scan-no-permit",
+        },
+      },
+      { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } },
+      urls,
+    ),
+  ).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "feature_unavailable",
+      message:
+        "PDF grabbing needs Chrome download steering and a compatible daemon",
+    },
+  });
+  expect(
+    h
+      .frames()
+      .slice(before)
+      .filter((frame) => frame.type === "pdf_grab_request"),
+  ).toHaveLength(0);
+  expect(h.downloads.started).toHaveLength(0);
+  expect(h.pdfGrabCorrelations.current).toEqual({});
+});
+
+test("papio.pageBulk.grabPdf abandons the exact grab when download initiation fails", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  h.downloads.failDownload = true;
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const replyPromise = handleInboxRuntimeMessage(
+    h.bridge,
+    {
+      type: "papio.pageBulk.grabPdf",
+      request: {
+        tab_id: 42,
+        url: "https://resolver.example.edu/content/fails.pdf",
+        scan_id: "scan-grab-fails",
+      },
+    },
+    { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } },
+    urls,
+  );
+  const requestFrame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-fails-0001",
+      steering_path: "papio/grabs/grab-fails-0001/",
+    }),
+  );
+  const abandonFrame = await h.port.waitForFrame("pdf_grab_abandon_request");
+  expect(abandonFrame.payload).toMatchObject({ grab_id: "grab-fails-0001" });
+  expect(typeof abandonFrame.payload["request_id"]).toBe("string");
+  await h.port.inbound(
+    nativeResult("pdf_grab_abandon_result", {
+      request_id: abandonFrame.payload["request_id"] as string,
+      grab_id: "grab-fails-0001",
+      state: "abandoned",
+      outcome: "abandoned",
+    }),
+  );
+  await expect(replyPromise).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "grab_failed",
+      message: "Could not start the browser download",
+    },
+  });
+  expect(h.downloads.started).toHaveLength(1);
+  expect(h.pdfGrabCorrelations.current).toEqual({});
 });
 
 test("papio.pageBulk.grabPdf reconciles an interrupted download after a service-worker restart", async () => {
@@ -5025,7 +6736,12 @@ test("papio.pageBulk.grabPdf reconciles an interrupted download after a service-
   };
 
   await first.bridge.start();
-  await first.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  await first.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
   const replyPromise: Promise<unknown> = handleInboxRuntimeMessage(
     first.bridge,
     { type: "papio.pageBulk.grabPdf", request },
@@ -5033,7 +6749,9 @@ test("papio.pageBulk.grabPdf reconciles an interrupted download after a service-
     urls,
   );
   const requestFrame = await first.port.waitForFrame("pdf_grab_request");
-  expect(requestFrame.payload).toMatchObject({ host: new URL(request.url).hostname });
+  expect(requestFrame.payload).toMatchObject({
+    host: new URL(request.url).hostname,
+  });
   await first.port.inbound(
     nativeResult("pdf_grab_result", {
       request_id: requestFrame.payload["request_id"] as string,
@@ -5042,10 +6760,17 @@ test("papio.pageBulk.grabPdf reconciles an interrupted download after a service-
       steering_path: "papio/grabs/grabpath/",
     }),
   );
-  await expect(replyPromise).resolves.toEqual({ ok: true, grab_id: "grab-restart" });
-  const persisted = JSON.parse(JSON.stringify(first.pdfGrabCorrelations.current)) as Record<string, PdfGrabCorrelation>;
+  await expect(replyPromise).resolves.toEqual({
+    ok: true,
+    grab_id: "grab-restart",
+  });
+  const persisted = JSON.parse(
+    JSON.stringify(first.pdfGrabCorrelations.current),
+  ) as Record<string, PdfGrabCorrelation>;
 
-  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  const restarted = makeHarness(
+    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+  );
   restarted.pdfGrabCorrelations.current = persisted;
   restarted.downloads.items.set(901, {
     id: 901,
@@ -5060,15 +6785,27 @@ test("papio.pageBulk.grabPdf reconciles an interrupted download after a service-
     state: "abandoned",
     detail: "The PDF grab download was interrupted",
   });
-  expect(restarted.pdfGrabCorrelations.current["grab-restart"]).toMatchObject({ abandonPending: true });
+  expect(restarted.pdfGrabCorrelations.current["grab-restart"]).toMatchObject({
+    abandonPending: true,
+  });
 });
 
 test("papio.pageBulk.grabPdf clears a conflict acknowledgment with its settled state", async () => {
   const h = makeHarness();
   const urls = pageBulkTestURLs;
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
-  const request = { tab_id: 42, url: "https://resolver.example.edu/conflict.pdf", title: "Conflict", scan_id: "scan-grab-conflict" };
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const request = {
+    tab_id: 42,
+    url: "https://resolver.example.edu/conflict.pdf",
+    title: "Conflict",
+    scan_id: "scan-grab-conflict",
+  };
   const replyPromise = handleInboxRuntimeMessage(
     h.bridge,
     { type: "papio.pageBulk.grabPdf", request },
@@ -5076,22 +6813,32 @@ test("papio.pageBulk.grabPdf clears a conflict acknowledgment with its settled s
     urls,
   );
   const requestFrame = await h.port.waitForFrame("pdf_grab_request");
-  await h.port.inbound(nativeResult("pdf_grab_result", {
-    request_id: requestFrame.payload["request_id"] as string,
-    outcome: "steering",
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-conflict-0001",
+      steering_path: "papio/grabs/conflict/",
+    }),
+  );
+  await expect(replyPromise).resolves.toEqual({
+    ok: true,
     grab_id: "grab-conflict-0001",
-    steering_path: "papio/grabs/conflict/",
-  }));
-  await expect(replyPromise).resolves.toEqual({ ok: true, grab_id: "grab-conflict-0001" });
-  await h.downloads.onChanged.emit({ id: 901, state: { current: "interrupted" } });
+  });
+  await h.downloads.onChanged.emit({
+    id: 901,
+    state: { current: "interrupted" },
+  });
   const abandonFrame = await h.port.waitForFrame("pdf_grab_abandon_request");
-  await h.port.inbound(nativeResult("pdf_grab_abandon_result", {
-    request_id: abandonFrame.payload["request_id"] as string,
-    grab_id: "grab-conflict-0001",
-    state: "quarantined",
-    outcome: "conflict",
-    detail: "pdf grab is already settled",
-  }));
+  await h.port.inbound(
+    nativeResult("pdf_grab_abandon_result", {
+      request_id: abandonFrame.payload["request_id"] as string,
+      grab_id: "grab-conflict-0001",
+      state: "quarantined",
+      outcome: "conflict",
+      detail: "pdf grab is already settled",
+    }),
+  );
   expect(h.runtimeMessages).toContainEqual({
     type: "papio.pageBulk.grabState",
     scan_id: request.scan_id,
@@ -5113,7 +6860,12 @@ test("papio.pageBulk.grabPdf delivers an unsolicited terminal result after a ser
   };
 
   await first.bridge.start();
-  await first.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  await first.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
   const replyPromise: Promise<unknown> = handleInboxRuntimeMessage(
     first.bridge,
     { type: "papio.pageBulk.grabPdf", request },
@@ -5121,7 +6873,9 @@ test("papio.pageBulk.grabPdf delivers an unsolicited terminal result after a ser
     urls,
   );
   const requestFrame = await first.port.waitForFrame("pdf_grab_request");
-  expect(requestFrame.payload).toMatchObject({ host: new URL(request.url).hostname });
+  expect(requestFrame.payload).toMatchObject({
+    host: new URL(request.url).hostname,
+  });
   await first.port.inbound(
     nativeResult("pdf_grab_result", {
       request_id: requestFrame.payload["request_id"] as string,
@@ -5130,10 +6884,17 @@ test("papio.pageBulk.grabPdf delivers an unsolicited terminal result after a ser
       steering_path: "papio/grabs/grabpath/",
     }),
   );
-  await expect(replyPromise).resolves.toEqual({ ok: true, grab_id: "grab-terminal" });
-  const persisted = JSON.parse(JSON.stringify(first.pdfGrabCorrelations.current)) as Record<string, PdfGrabCorrelation>;
+  await expect(replyPromise).resolves.toEqual({
+    ok: true,
+    grab_id: "grab-terminal",
+  });
+  const persisted = JSON.parse(
+    JSON.stringify(first.pdfGrabCorrelations.current),
+  ) as Record<string, PdfGrabCorrelation>;
 
-  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  const restarted = makeHarness(
+    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+  );
   restarted.pdfGrabCorrelations.current = persisted;
   await restarted.bridge.start();
   await restarted.port.inbound(
@@ -5160,21 +6921,35 @@ test("open inbox runtime request focuses the singleton or creates it from the po
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   h.tabs.seed({ id: 88, url: urls.inboxURL, windowId: 600 });
   h.windows?.live.set(600, { id: 600, state: "minimized" });
 
   await expect(
-    handleInboxRuntimeMessage(h.bridge, { type: "papio.openInbox" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.openInbox" },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
   ).resolves.toEqual({ opened: true });
   expect(h.tabs.activated).toEqual([88]);
-  expect(h.windows?.updated).toContainEqual({ windowID: 600, props: { focused: true } });
+  expect(h.windows?.updated).toContainEqual({
+    windowID: 600,
+    props: { focused: true },
+  });
   expect(h.tabs.created).toEqual([]);
 
   h.tabs.clear();
   await expect(
-    handleInboxRuntimeMessage(h.bridge, { type: "papio.openInbox" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.openInbox" },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
   ).resolves.toEqual({ opened: true });
   expect(h.tabs.created).toEqual([{ url: urls.inboxURL, active: true }]);
 
@@ -5182,7 +6957,10 @@ test("open inbox runtime request focuses the singleton or creates it from the po
     handleInboxRuntimeMessage(
       h.bridge,
       { type: "papio.openInbox" },
-      { id: urls.runtimeID, url: "chrome-extension://papio-test-id/options.html" },
+      {
+        id: urls.runtimeID,
+        url: "chrome-extension://papio-test-id/options.html",
+      },
       urls,
     ),
   ).resolves.toMatchObject({ ok: false, error: { code: "unauthorized" } });
@@ -5195,6 +6973,7 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
@@ -5204,17 +6983,22 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
-      { type: "papio.handoff.open", request: { job_id: "job_0001a_inbox_open" } },
+      {
+        type: "papio.handoff.open",
+        request: { job_id: "job_0001a_inbox_open" },
+      },
       { id: urls.runtimeID, url: urls.inboxURL },
       urls,
     ),
   ).resolves.toEqual({ ok: true, opened: true });
   expect(h.tabs.activated).toEqual([tabID]);
   const liveTab = h.tabs.snapshot(tabID);
-  if (liveTab?.windowId === undefined) throw new Error("The offered tab has no live window");
+  if (liveTab?.windowId === undefined)
+    throw new Error("The offered tab has no live window");
   expect(
     h.windows?.updated.some(
-      (update) => update.windowID === liveTab.windowId && update.props.focused === true,
+      (update) =>
+        update.windowID === liveTab.windowId && update.props.focused === true,
     ),
   ).toBe(true);
 
@@ -5232,7 +7016,10 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
-      { type: "papio.handoff.open", request: { job_id: "job_0001a_inbox_open" } },
+      {
+        type: "papio.handoff.open",
+        request: { job_id: "job_0001a_inbox_open" },
+      },
       { id: urls.runtimeID, url: urls.popupURL },
       urls,
     ),
@@ -5240,29 +7027,51 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
   expect(h.tabs.activated).toEqual([tabID]);
 
   for (const message of [
-    { type: "papio.triage.decide", request: { item_id: "item_001", op: "acquire" } },
-    { type: "papio.action.resolve", request: { action_id: 1, verdict: "reject", expected_revision: 1 } },
+    {
+      type: "papio.triage.decide",
+      request: { item_id: "item_001", op: "acquire" },
+    },
+    {
+      type: "papio.action.resolve",
+      request: { action_id: 1, verdict: "reject", expected_revision: 1 },
+    },
     { type: "papio.preview", request: { action_id: 1 } },
   ]) {
     await expect(
-      handleInboxRuntimeMessage(h.bridge, message, { id: urls.runtimeID, url: urls.popupURL }, urls),
+      handleInboxRuntimeMessage(
+        h.bridge,
+        message,
+        { id: urls.runtimeID, url: urls.popupURL },
+        urls,
+      ),
     ).resolves.toEqual({
       ok: false,
-      error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
+      error: {
+        code: "unauthorized",
+        message: "This sender cannot access the inbox broker",
+      },
     });
   }
-
 
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
-      { type: "papio.handoff.open", request: { job_id: "job_0001a_inbox_open" } },
-      { id: urls.runtimeID, url: "chrome-extension://papio-test-id/options.html" },
+      {
+        type: "papio.handoff.open",
+        request: { job_id: "job_0001a_inbox_open" },
+      },
+      {
+        id: urls.runtimeID,
+        url: "chrome-extension://papio-test-id/options.html",
+      },
       urls,
     ),
   ).resolves.toEqual({
     ok: false,
-    error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
+    error: {
+      code: "unauthorized",
+      message: "This sender cannot access the inbox broker",
+    },
   });
 });
 test("concurrent inbox opens reuse one managed tab and focus it once", async () => {
@@ -5282,7 +7091,10 @@ test("concurrent inbox opens reuse one managed tab and focus it once", async () 
     offerURLs: { [jobID]: OPENURL },
   });
   await h.bridge.start();
-  const [first, second] = await Promise.all([h.bridge.openHandoff(jobID), h.bridge.openHandoff(jobID)]);
+  const [first, second] = await Promise.all([
+    h.bridge.openHandoff(jobID),
+    h.bridge.openHandoff(jobID),
+  ]);
 
   expect(first).toEqual({ ok: true, opened: true });
   expect(second).toEqual({ ok: true, opened: true });
@@ -5297,6 +7109,7 @@ test("session probe inspects a live resolver tab before claiming signed out, and
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
@@ -5306,7 +7119,9 @@ test("session probe inspects a live resolver tab before claiming signed out, and
         h.tabs.create({
           url: properties.url,
           active: properties.active,
-          ...(properties.windowId === undefined ? {} : { windowId: properties.windowId }),
+          ...(properties.windowId === undefined
+            ? {}
+            : { windowId: properties.windowId }),
         }),
       reload: (tabID) => h.tabs.reload(tabID),
       get: (tabID) => h.tabs.get(tabID),
@@ -5357,12 +7172,22 @@ test("session probe inspects a live resolver tab before claiming signed out, and
   // library tab. Only papio.session.probe may, and the popup sends that once
   // when it opens.
   await expect(
-    handleInboxRuntimeMessage(h.bridge, { type: "papio.session.state" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.session.state" },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
   ).resolves.toMatchObject({ ok: true });
   expect(injections).toBe(0);
 
   await expect(
-    handleInboxRuntimeMessage(h.bridge, { type: "papio.session.probe" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.session.probe" },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
   ).resolves.toMatchObject({
     ok: true,
     state: {
@@ -5380,14 +7205,24 @@ test("session state reports each known resolver and sign-in targets its origin",
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const collegeOrigin = "https://onesearch.library.example-college.edu";
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu", collegeOrigin] }));
+  await h.port.inbound(
+    helloAck({
+      resolver_origins: ["https://resolver.example.edu", collegeOrigin],
+    }),
+  );
 
   await expect(
-    handleInboxRuntimeMessage(h.bridge, { type: "papio.session.state" }, { id: urls.runtimeID, url: urls.popupURL }, urls),
+    handleInboxRuntimeMessage(
+      h.bridge,
+      { type: "papio.session.state" },
+      { id: urls.runtimeID, url: urls.popupURL },
+      urls,
+    ),
   ).resolves.toMatchObject({
     ok: true,
     origins: [
@@ -5409,9 +7244,13 @@ test("session state reports each known resolver and sign-in targets its origin",
 test("configured auth-like resolver origins remain in strict membership", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: ["https://sso.resolver.example.edu"] }));
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://sso.resolver.example.edu"] }),
+  );
 
-  expect(h.bridge.knownResolverOrigins()).toEqual(["https://sso.resolver.example.edu"]);
+  expect(h.bridge.knownResolverOrigins()).toEqual([
+    "https://sso.resolver.example.edu",
+  ]);
 });
 
 test("generic engagement alone is omitted from session authentication demand", async () => {
@@ -5431,7 +7270,9 @@ test("generic engagement alone is omitted from session authentication demand", a
     ],
   });
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://resolver.example.edu"] }),
+  );
 
   expect(h.bridge.sessionAuthDemand()).toEqual([]);
 });
@@ -5440,9 +7281,14 @@ test("origin-specific sign-in rejects an arbitrary origin before a current hello
   const h = makeHarness();
   await h.bridge.start();
 
-  await expect(h.bridge.requestSessionSignIn("https://arbitrary.example.edu")).resolves.toEqual({
+  await expect(
+    h.bridge.requestSessionSignIn("https://arbitrary.example.edu"),
+  ).resolves.toEqual({
     ok: false,
-    error: { code: "resolver_unavailable", message: "The daemon has not confirmed configured institutions" },
+    error: {
+      code: "resolver_unavailable",
+      message: "The daemon has not confirmed configured institutions",
+    },
   });
   expect(h.tabs.created).toEqual([]);
 });
@@ -5454,17 +7300,28 @@ test("old-daemon empty resolver sets allow only the keepalive current origin", a
   const currentOrigin = "https://legacy-resolver.example.edu";
   const opened: (string | undefined)[] = [];
   h.bridge.attachKeepalive({
-    getSnapshot: () => ({ resolverOrigin: currentOrigin, pausedForReauth: false }),
+    getSnapshot: () => ({
+      resolverOrigin: currentOrigin,
+      pausedForReauth: false,
+    }),
     openReauth: async (originHint?: string) => {
       opened.push(originHint);
       return true;
     },
   } as unknown as KeepaliveManager);
 
-  await expect(h.bridge.requestSessionSignIn(currentOrigin)).resolves.toEqual({ ok: true, opened: true });
-  await expect(h.bridge.requestSessionSignIn("https://unknown-legacy.example.edu")).resolves.toEqual({
+  await expect(h.bridge.requestSessionSignIn(currentOrigin)).resolves.toEqual({
+    ok: true,
+    opened: true,
+  });
+  await expect(
+    h.bridge.requestSessionSignIn("https://unknown-legacy.example.edu"),
+  ).resolves.toEqual({
     ok: false,
-    error: { code: "resolver_unavailable", message: "This institution is not currently configured" },
+    error: {
+      code: "resolver_unavailable",
+      message: "This institution is not currently configured",
+    },
   });
   expect(opened).toEqual([currentOrigin]);
 });
@@ -5476,13 +7333,18 @@ test("session state binds active authentication demand to the exact resolver ori
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const originA = "https://resolver.example.edu";
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: [originA, "https://stale.other.example"] }));
+  await h.port.inbound(
+    helloAck({ resolver_origins: [originA, "https://stale.other.example"] }),
+  );
   await h.port.inbound(jobOffer("job_demand_a", OPENURL));
-  const tabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_demand_a")?.tab_id ?? -1;
+  const tabID =
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_demand_a")
+      ?.tab_id ?? -1;
   await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
   await expect(
     handleInboxRuntimeMessage(
@@ -5499,7 +7361,6 @@ test("session state binds active authentication demand to the exact resolver ori
   });
 });
 
-
 test("provider and OA offer URLs never mint institution session rows", async () => {
   const h = makeHarness();
   const urls = {
@@ -5507,16 +7368,28 @@ test("provider and OA offer URLs never mint institution session rows", async () 
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://resolver.example.edu"] }),
+  );
   // Direct/OA offers land on provider hosts; each used to become a phantom
   // "institution" in the popup session card.
-  await h.port.inbound(jobOffer("job_provider_a", "https://www.sciencedirect.com/science/article/pii/1"));
-  await h.port.inbound(jobOffer("job_provider_b", "https://direct.mit.edu/reco/article/1"));
+  await h.port.inbound(
+    jobOffer(
+      "job_provider_a",
+      "https://www.sciencedirect.com/science/article/pii/1",
+    ),
+  );
+  await h.port.inbound(
+    jobOffer("job_provider_b", "https://direct.mit.edu/reco/article/1"),
+  );
 
-  expect(h.bridge.knownResolverOrigins()).toEqual(["https://resolver.example.edu"]);
+  expect(h.bridge.knownResolverOrigins()).toEqual([
+    "https://resolver.example.edu",
+  ]);
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
@@ -5537,6 +7410,7 @@ test("session sign-in reports why it cannot open without a resolver", async () =
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
@@ -5549,7 +7423,10 @@ test("session sign-in reports why it cannot open without a resolver", async () =
     ),
   ).resolves.toEqual({
     ok: false,
-    error: { code: "resolver_unavailable", message: "No resolver configured yet — open a paper first" },
+    error: {
+      code: "resolver_unavailable",
+      message: "No resolver configured yet — open a paper first",
+    },
   });
 });
 
@@ -5560,9 +7437,12 @@ test("session sign-in opens the resolver origin in a foreground tab as fallback"
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
-  const offer = jobOffer("job_session_signin") as { payload: Record<string, unknown> };
+  const offer = jobOffer("job_session_signin") as {
+    payload: Record<string, unknown>;
+  };
   offer.payload["requires_auth"] = true;
   await h.bridge.start();
   await h.port.inbound(helloAck());
@@ -5575,7 +7455,9 @@ test("session sign-in opens the resolver origin in a foreground tab as fallback"
       urls,
     ),
   ).resolves.toEqual({ ok: true, opened: true });
-  expect(h.tabs.created).toEqual([{ url: "https://resolver.example.edu", active: true }]);
+  expect(h.tabs.created).toEqual([
+    { url: "https://resolver.example.edu", active: true },
+  ]);
 });
 
 test("handoff_focus surfaces the tracked work-window tab without creating another", async () => {
@@ -5583,7 +7465,9 @@ test("handoff_focus surfaces the tracked work-window tab without creating anothe
   const jobID = "job_0001a_focus";
   await h.bridge.start();
   await h.port.inbound(jobOffer(jobID));
-  const tabID = h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id ?? -1;
+  const tabID =
+    h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id ??
+    -1;
   expect(tabID).toBeGreaterThanOrEqual(0);
   expect(h.tabs.created).toHaveLength(1);
 
@@ -5597,7 +7481,10 @@ test("handoff_focus surfaces the tracked work-window tab without creating anothe
   });
   for (
     let i = 0;
-    i < 10 && !h.windows?.updated.some((update) => update.windowID === 500 && update.props.focused === true);
+    i < 10 &&
+    !h.windows?.updated.some(
+      (update) => update.windowID === 500 && update.props.focused === true,
+    );
     i += 1
   ) {
     await Promise.resolve();
@@ -5606,7 +7493,9 @@ test("handoff_focus surfaces the tracked work-window tab without creating anothe
   expect(h.tabs.created).toHaveLength(1);
   expect(h.tabs.activated).toContain(tabID);
   expect(
-    h.windows?.updated.some((update) => update.windowID === 500 && update.props.focused === true),
+    h.windows?.updated.some(
+      (update) => update.windowID === 500 && update.props.focused === true,
+    ),
   ).toBe(true);
   expect(h.tabs.navigations).toEqual([]);
 });
@@ -5617,7 +7506,9 @@ test("handoff_focus re-drives an auth-pending tab without charging the automatic
   const idpURL = "https://idp.example.edu/sso";
   await h.bridge.start();
   await h.port.inbound(jobOffer(jobID));
-  const tabID = h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id ?? -1;
+  const tabID =
+    h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id ??
+    -1;
   const authTab = { id: tabID, url: idpURL, windowId: 500 };
   h.tabs.seed(authTab);
   await h.tabs.userNavigate(tabID, idpURL);
@@ -5651,14 +7542,23 @@ test("an inbox dismiss relays verdict dismiss through the native resolve", async
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_mutations_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_mutations_v1"],
+    }),
+  );
 
   const pending = handleInboxRuntimeMessage(
     h.bridge,
-    { type: "papio.action.resolve", request: { action_id: 142, verdict: "dismiss", expected_revision: 1 } },
+    {
+      type: "papio.action.resolve",
+      request: { action_id: 142, verdict: "dismiss", expected_revision: 1 },
+    },
     { id: urls.runtimeID, url: urls.inboxURL },
     urls,
   );
@@ -5668,23 +7568,31 @@ test("an inbox dismiss relays verdict dismiss through the native resolve", async
   expect(frame.payload["expected_revision"]).toBe(1);
   expect(frame.payload["expected_sha256"]).toBeUndefined();
 
-  await h.port.inbound(nativeResult("human_action_resolve_result", {
-    request_id: frame.payload["request_id"],
-    outcome: "applied",
-  }));
+  await h.port.inbound(
+    nativeResult("human_action_resolve_result", {
+      request_id: frame.payload["request_id"],
+      outcome: "applied",
+    }),
+  );
   await expect(pending).resolves.toEqual({ ok: true, outcome: "applied" });
 
   // A genuinely unknown verdict must still be rejected with the exact error.
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
-      { type: "papio.action.resolve", request: { action_id: 142, verdict: "cancel", expected_revision: 1 } },
+      {
+        type: "papio.action.resolve",
+        request: { action_id: 142, verdict: "cancel", expected_revision: 1 },
+      },
       { id: urls.runtimeID, url: urls.inboxURL },
       urls,
     ),
   ).resolves.toEqual({
     ok: false,
-    error: { code: "invalid_request", message: "Invalid action resolution request" },
+    error: {
+      code: "invalid_request",
+      message: "Invalid action resolution request",
+    },
   });
 });
 
@@ -5695,14 +7603,27 @@ test("an inbox delivery reconciliation relays confirm_request_exists/absent thro
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_snapshot_schema_v3"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_schema_v3"],
+    }),
+  );
 
   const pending = handleInboxRuntimeMessage(
     h.bridge,
-    { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0001", operation: "confirm_request_exists", provider_reference: "TN-42" } },
+    {
+      type: "papio.delivery.reconcile",
+      request: {
+        job_id: "job_delivery_0001",
+        operation: "confirm_request_exists",
+        provider_reference: "TN-42",
+      },
+    },
     { id: urls.runtimeID, url: urls.inboxURL },
     urls,
   );
@@ -5711,41 +7632,78 @@ test("an inbox delivery reconciliation relays confirm_request_exists/absent thro
   expect(frame.payload["operation"]).toBe("confirm_request_exists");
   expect(frame.payload["provider_reference"]).toBe("TN-42");
 
-  await h.port.inbound(nativeResult("delivery_reconcile_result", {
-    request_id: frame.payload["request_id"],
-    outcome: "applied",
-    detail: "delivery request confirmed",
-  }));
+  await h.port.inbound(
+    nativeResult("delivery_reconcile_result", {
+      request_id: frame.payload["request_id"],
+      outcome: "applied",
+      detail: "delivery request confirmed",
+    }),
+  );
   const postedBeforeAbsent = h.port.posted.length;
   const pendingAbsent = handleInboxRuntimeMessage(
     h.bridge,
-    { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0002", operation: "confirm_request_absent" } },
+    {
+      type: "papio.delivery.reconcile",
+      request: {
+        job_id: "job_delivery_0002",
+        operation: "confirm_request_absent",
+      },
+    },
     { id: urls.runtimeID, url: urls.inboxURL },
     urls,
   );
-  const absentFrame = await h.port.waitForFrame("delivery_reconcile_request", postedBeforeAbsent);
+  const absentFrame = await h.port.waitForFrame(
+    "delivery_reconcile_request",
+    postedBeforeAbsent,
+  );
   expect(absentFrame.payload["job_id"]).toBe("job_delivery_0002");
   expect(absentFrame.payload["operation"]).toBe("confirm_request_absent");
   expect(absentFrame.payload["provider_reference"]).toBeUndefined();
-  await h.port.inbound(nativeResult("delivery_reconcile_result", {
-    request_id: absentFrame?.payload["request_id"],
+  await h.port.inbound(
+    nativeResult("delivery_reconcile_result", {
+      request_id: absentFrame?.payload["request_id"],
+      outcome: "applied",
+    }),
+  );
+  await expect(pendingAbsent).resolves.toEqual({
+    ok: true,
     outcome: "applied",
-  }));
-  await expect(pendingAbsent).resolves.toEqual({ ok: true, outcome: "applied" });
+  });
 
   // Shape validation and sender authorization must both fail closed without
   // reaching native messaging. Missing/empty references are invalid for
   // confirm_request_exists; even an explicit undefined provider_reference key
   // is forbidden for confirm_request_absent.
-  const reconcileFrameCount = () => h.frames().filter((f) => f.type === "delivery_reconcile_request").length;
+  const reconcileFrameCount = () =>
+    h.frames().filter((f) => f.type === "delivery_reconcile_request").length;
   const beforeMalformed = reconcileFrameCount();
   const malformedRequests = [
     { job_id: "job_delivery_0003", operation: "confirm_request_exists" },
-    { job_id: "job_delivery_0003", operation: "confirm_request_exists", provider_reference: "" },
-    { job_id: "job_delivery_0003", operation: "confirm_request_absent", provider_reference: undefined },
-    { job_id: "job_delivery_0003", operation: "confirm_request_absent", extra: true },
-    { job_id: "bad!", operation: "confirm_request_exists", provider_reference: "TN-43" },
-    { job_id: "job_delivery_0003", operation: "other", provider_reference: "TN-43" },
+    {
+      job_id: "job_delivery_0003",
+      operation: "confirm_request_exists",
+      provider_reference: "",
+    },
+    {
+      job_id: "job_delivery_0003",
+      operation: "confirm_request_absent",
+      provider_reference: undefined,
+    },
+    {
+      job_id: "job_delivery_0003",
+      operation: "confirm_request_absent",
+      extra: true,
+    },
+    {
+      job_id: "bad!",
+      operation: "confirm_request_exists",
+      provider_reference: "TN-43",
+    },
+    {
+      job_id: "job_delivery_0003",
+      operation: "other",
+      provider_reference: "TN-43",
+    },
   ];
   for (const request of malformedRequests) {
     await expect(
@@ -5757,20 +7715,32 @@ test("an inbox delivery reconciliation relays confirm_request_exists/absent thro
       ),
     ).resolves.toEqual({
       ok: false,
-      error: { code: "invalid_request", message: "Invalid delivery reconciliation request" },
+      error: {
+        code: "invalid_request",
+        message: "Invalid delivery reconciliation request",
+      },
     });
   }
   expect(reconcileFrameCount()).toBe(beforeMalformed);
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
-      { type: "papio.delivery.reconcile", request: { job_id: "job_delivery_0003", operation: "confirm_request_absent" } },
+      {
+        type: "papio.delivery.reconcile",
+        request: {
+          job_id: "job_delivery_0003",
+          operation: "confirm_request_absent",
+        },
+      },
       { id: urls.runtimeID, url: urls.popupURL },
       urls,
     ),
   ).resolves.toEqual({
     ok: false,
-    error: { code: "unauthorized", message: "This sender cannot access the inbox broker" },
+    error: {
+      code: "unauthorized",
+      message: "This sender cannot access the inbox broker",
+    },
   });
   expect(reconcileFrameCount()).toBe(beforeMalformed);
 });
@@ -5783,9 +7753,16 @@ test("queued inbox handoff force-releases exactly one live tab under racing open
 
   const queuedID = "job_0001a_handoff_queued";
   await h.bridge.requestCancel("job_0001a_handoff_active");
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === queuedID)?.status).toBe("queued");
-  const [first, second] = await Promise.all([h.bridge.openHandoff(queuedID), h.bridge.openHandoff(queuedID)]);
-  const released = h.backend.store.activeJobs.find((job) => job.job_id === queuedID);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === queuedID)?.status,
+  ).toBe("queued");
+  const [first, second] = await Promise.all([
+    h.bridge.openHandoff(queuedID),
+    h.bridge.openHandoff(queuedID),
+  ]);
+  const released = h.backend.store.activeJobs.find(
+    (job) => job.job_id === queuedID,
+  );
   const releasedTabID = released?.tab_id ?? -1;
 
   expect(first).toEqual({ ok: true, opened: true });
@@ -5793,29 +7770,48 @@ test("queued inbox handoff force-releases exactly one live tab under racing open
   expect(releasedTabID).toBeGreaterThanOrEqual(100);
   expect(h.tabs.created).toHaveLength(2);
   expect(h.tabs.activated).toContain(releasedTabID);
-  expect(h.windows?.updated.some((update) => update.windowID === h.tabs.snapshot(releasedTabID)?.windowId)).toBe(true);
+  expect(
+    h.windows?.updated.some(
+      (update) => update.windowID === h.tabs.snapshot(releasedTabID)?.windowId,
+    ),
+  ).toBe(true);
 });
 
 test("an unknown inbox handoff makes one counts refresh before failing unavailable", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_snapshot_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_v1"],
+    }),
+  );
 
   const pending = h.bridge.openHandoff("job_0001a_not_offered");
   const refresh = await h.port.waitForFrame("triage_counts_request");
-  const refreshes = h.frames().filter((frame) => frame.type === "triage_counts_request");
+  const refreshes = h
+    .frames()
+    .filter((frame) => frame.type === "triage_counts_request");
   const requestID = refresh.payload["request_id"];
   expect(refreshes).toHaveLength(1);
   expect(typeof requestID).toBe("string");
   await h.port.inbound(
-    nativeResult("triage_counts_response", { request_id: requestID as string, counts: triageCounts() }),
+    nativeResult("triage_counts_response", {
+      request_id: requestID as string,
+      counts: triageCounts(),
+    }),
   );
 
   await expect(pending).resolves.toEqual({
     ok: false,
-    error: { code: "handoff_unavailable", message: "The requested handoff is not available" },
+    error: {
+      code: "handoff_unavailable",
+      message: "The requested handoff is not available",
+    },
   });
-  expect(h.frames().filter((frame) => frame.type === "triage_counts_request")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "triage_counts_request"),
+  ).toHaveLength(1);
 });
 
 test("triage native replies correlate by request_id even when they arrive out of order", async () => {
@@ -5824,7 +7820,11 @@ test("triage native replies correlate by request_id even when they arrive out of
   await h.port.inbound(
     helloAck({
       daemon_version: CURRENT_DAEMON,
-      features: ["triage_snapshot_v1", "triage_mutations_v1", "review_preview_v1"],
+      features: [
+        "triage_snapshot_v1",
+        "triage_mutations_v1",
+        "review_preview_v1",
+      ],
     }),
   );
 
@@ -5832,8 +7832,13 @@ test("triage native replies correlate by request_id even when they arrive out of
   const second = h.bridge.requestTriageSnapshot({ schema_versions: [1] });
   await Promise.resolve();
   await Promise.resolve();
-  const requests = h.frames().filter((frame) => frame.type === "triage_snapshot_request");
-  expect(requests.map((frame) => frame.payload["schema_versions"])).toEqual([[1], [1]]);
+  const requests = h
+    .frames()
+    .filter((frame) => frame.type === "triage_snapshot_request");
+  expect(requests.map((frame) => frame.payload["schema_versions"])).toEqual([
+    [1],
+    [1],
+  ]);
   const firstID = requests[0]?.payload["request_id"];
   const secondID = requests[1]?.payload["request_id"];
   expect(typeof firstID).toBe("string");
@@ -5841,8 +7846,14 @@ test("triage native replies correlate by request_id even when they arrive out of
 
   await h.port.inbound(snapshotResult(secondID as string, 2));
   await h.port.inbound(snapshotResult(firstID as string, 1));
-  await expect(first).resolves.toMatchObject({ ok: true, snapshot: { counts: { pending_total: 1 } } });
-  await expect(second).resolves.toMatchObject({ ok: true, snapshot: { counts: { pending_total: 2 } } });
+  await expect(first).resolves.toMatchObject({
+    ok: true,
+    snapshot: { counts: { pending_total: 1 } },
+  });
+  await expect(second).resolves.toMatchObject({
+    ok: true,
+    snapshot: { counts: { pending_total: 2 } },
+  });
 });
 
 test("triage snapshot uses schema 2 only after the daemon advertises it", async () => {
@@ -5858,7 +7869,9 @@ test("triage snapshot uses schema 2 only after the daemon advertises it", async 
   const pending = h.bridge.requestTriageSnapshot({ schema_versions: [1] });
   await Promise.resolve();
   await Promise.resolve();
-  const request = h.frames().find((frame) => frame.type === "triage_snapshot_request");
+  const request = h
+    .frames()
+    .find((frame) => frame.type === "triage_snapshot_request");
   expect(request?.payload["schema_versions"]).toEqual([2]);
   const requestID = request?.payload["request_id"];
   await h.port.inbound(snapshotResult(requestID as string, 1, 2));
@@ -5871,14 +7884,20 @@ test("triage counts negotiate independently of snapshot schema 4", async () => {
   await h.port.inbound(
     helloAck({
       daemon_version: CURRENT_DAEMON,
-      features: ["triage_snapshot_v1", "triage_snapshot_schema_v4", "triage_counts_schema_v2"],
+      features: [
+        "triage_snapshot_v1",
+        "triage_snapshot_schema_v4",
+        "triage_counts_schema_v2",
+      ],
     }),
   );
 
   const pending = h.bridge.requestTriageCounts();
   await Promise.resolve();
   await Promise.resolve();
-  const request = h.frames().find((frame) => frame.type === "triage_counts_request");
+  const request = h
+    .frames()
+    .find((frame) => frame.type === "triage_counts_request");
   expect(request?.payload["schema_versions"]).toEqual([2]);
   const requestID = request?.payload["request_id"];
   expect(typeof requestID).toBe("string");
@@ -5888,17 +7907,27 @@ test("triage counts negotiate independently of snapshot schema 4", async () => {
       counts: triageCounts(3),
     }),
   );
-  await expect(pending).resolves.toMatchObject({ ok: true, counts: { pending_total: 3 } });
+  await expect(pending).resolves.toMatchObject({
+    ok: true,
+    counts: { pending_total: 3 },
+  });
 });
 
 test("triage requests time out and late echoes are dropped", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_snapshot_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_v1"],
+    }),
+  );
   const pending = h.bridge.requestTriageCounts();
   await Promise.resolve();
   await Promise.resolve();
-  const request = h.frames().find((frame) => frame.type === "triage_counts_request");
+  const request = h
+    .frames()
+    .find((frame) => frame.type === "triage_counts_request");
   const requestID = request?.payload["request_id"];
   const timeout = h.timers.find((timer) => timer.ms === 15_000);
   expect(typeof requestID).toBe("string");
@@ -5911,19 +7940,34 @@ test("triage requests time out and late echoes are dropped", async () => {
   };
   try {
     await timeout?.fn();
-    await expect(pending).resolves.toMatchObject({ ok: false, error: { code: "timeout" } });
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      error: { code: "timeout" },
+    });
     await h.port.inbound(
-      nativeResult("triage_counts_response", { request_id: requestID as string, counts: triageCounts(3) }),
+      nativeResult("triage_counts_response", {
+        request_id: requestID as string,
+        counts: triageCounts(3),
+      }),
     );
   } finally {
     console.debug = originalDebug;
   }
-  expect(debugLines.some((line) => line.join(" ").includes("unknown or late correlated response"))).toBe(true);
+  expect(
+    debugLines.some((line) =>
+      line.join(" ").includes("unknown or late correlated response"),
+    ),
+  ).toBe(true);
 });
 test("surface presence does not retry on a transport failure within one poll", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["surface_presence_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["surface_presence_v1"],
+    }),
+  );
   const pending = h.bridge.sendSurfacePresence({
     instance_id: "instance-1",
     surface: "popup",
@@ -5933,7 +7977,9 @@ test("surface presence does not retry on a transport failure within one poll", a
   await h.port.waitForFrame("surface_presence");
   await h.port.emitDisconnect();
   await expect(pending).resolves.toMatchObject({ ok: false });
-  expect(h.frames().filter((frame) => frame.type === "surface_presence")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "surface_presence"),
+  ).toHaveLength(1);
 });
 
 test("a user-visible triage request forces reconnect and waits for a fresh hello", async () => {
@@ -5946,13 +7992,23 @@ test("a user-visible triage request forces reconnect and waits for a fresh hello
   expect(h.ports).toHaveLength(2);
   const reconnected = h.ports[1];
   expect(reconnected).toBeDefined();
-  await reconnected?.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["triage_snapshot_v1"] }));
+  await reconnected?.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_v1"],
+    }),
+  );
   await Promise.resolve();
-  const request = h.frames().find((frame) => frame.type === "triage_snapshot_request");
+  const request = h
+    .frames()
+    .find((frame) => frame.type === "triage_snapshot_request");
   const requestID = request?.payload["request_id"];
   expect(typeof requestID).toBe("string");
   await reconnected?.inbound(snapshotResult(requestID as string, 1));
-  await expect(pending).resolves.toMatchObject({ ok: true, snapshot: { counts: { pending_total: 1 } } });
+  await expect(pending).resolves.toMatchObject({
+    ok: true,
+    snapshot: { counts: { pending_total: 1 } },
+  });
 });
 
 test("heartbeat counts obey disconnected, sign-in, permission, then pending badge precedence", async () => {
@@ -5972,27 +8028,38 @@ test("heartbeat counts obey disconnected, sign-in, permission, then pending badg
   await h.tabs.userNavigate(tabID, idpURL);
   expect(h.action.texts.at(-1)).toBe("1");
   expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
-  expect(h.action.titles.at(-1)).toBe("papio: 1 paper waiting on your institution sign-in");
+  expect(h.action.titles.at(-1)).toBe(
+    "papio: 1 paper waiting on your institution sign-in",
+  );
 
   const refresh = h.alarms.onAlarm.emit({ name: "papio-keepalive" });
   await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
-  const request = h.frames().find((frame) => frame.type === "triage_counts_request");
+  const request = h
+    .frames()
+    .find((frame) => frame.type === "triage_counts_request");
   const requestID = request?.payload["request_id"];
   expect(typeof requestID).toBe("string");
   await h.port.inbound(
-    nativeResult("triage_counts_response", { request_id: requestID as string, counts: triageCounts(4) }),
+    nativeResult("triage_counts_response", {
+      request_id: requestID as string,
+      counts: triageCounts(4),
+    }),
   );
   await refresh;
   expect(h.action.texts.at(-1)).toBe("1");
-  expect(h.action.titles.at(-1)).toBe("papio: 1 paper waiting on your institution sign-in");
+  expect(h.action.titles.at(-1)).toBe(
+    "papio: 1 paper waiting on your institution sign-in",
+  );
 
   h.deps.permissions.contains = async () => false;
   await h.bridge.syncConnectionBadge();
   expect(h.action.texts.at(-1)).toBe("1");
-  expect(h.action.titles.at(-1)).toBe("papio: 1 paper waiting on your institution sign-in");
+  expect(h.action.titles.at(-1)).toBe(
+    "papio: 1 paper waiting on your institution sign-in",
+  );
 
   h.deps.permissions.contains = async () => true;
   const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
@@ -6043,14 +8110,21 @@ test("inbound native handlers finish in receipt order across asynchronous awaits
 // The the default institution Shibboleth dead end (idp.example.edu/idp/profile/SAML2/Redirect/SSO?execution=…)
 // is classifiable ONLY by its title: that exact URL also serves the working
 // login form. Chrome can deliver the title in a separate update after `complete`.
-const STALE_IDP_URL = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?execution=e1s2";
+const STALE_IDP_URL =
+  "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?execution=e1s2";
 const STALE_IDP_TITLE = "Example University Login Service - Stale Request";
-const OPENATHENS_ERROR_URL = "https://login.openathens.net/saml/2/sso/example.edu/redirect";
+const OPENATHENS_ERROR_URL =
+  "https://login.openathens.net/saml/2/sso/example.edu/redirect";
 const OPENATHENS_ERROR_TITLE = "Error | OpenAthens";
 
-function openAthensDocument(body: string, title = OPENATHENS_ERROR_TITLE): Document {
+function openAthensDocument(
+  body: string,
+  title = OPENATHENS_ERROR_TITLE,
+): Document {
   const window = new Window({ url: OPENATHENS_ERROR_URL });
-  window.document.write(`<html><head><title>${title}</title></head><body>${body}</body></html>`);
+  window.document.write(
+    `<html><head><title>${title}</title></head><body>${body}</body></html>`,
+  );
   return window.document as unknown as Document;
 }
 
@@ -6068,15 +8142,25 @@ const OPENATHENS_REDIRECT_BODY = `
 /** Offer a job into a work window and return its broker tab id. */
 async function offerIntoWorkWindow(h: Harness, jobID: string): Promise<number> {
   await h.port.inbound(jobOffer(jobID));
-  const tabID = h.backend.store.activeJobs.find((j) => j.job_id === jobID)?.tab_id ?? -1;
+  const tabID =
+    h.backend.store.activeJobs.find((j) => j.job_id === jobID)?.tab_id ?? -1;
   expect(tabID).toBeGreaterThanOrEqual(0);
   return tabID;
 }
 
 /** Land the broker tab on the dead Shibboleth page via a title-only update.
  * Later failures include their loading boundary so they are distinct documents. */
-async function emitStaleIdPTitle(h: Harness, tabID: number, newDocument = false): Promise<void> {
-  const tab = { id: tabID, url: STALE_IDP_URL, title: STALE_IDP_TITLE, windowId: 500 };
+async function emitStaleIdPTitle(
+  h: Harness,
+  tabID: number,
+  newDocument = false,
+): Promise<void> {
+  const tab = {
+    id: tabID,
+    url: STALE_IDP_URL,
+    title: STALE_IDP_TITLE,
+    windowId: 500,
+  };
   h.tabs.seed(tab);
   if (newDocument) {
     await h.tabs.userNavigate(tabID, STALE_IDP_URL);
@@ -6092,40 +8176,65 @@ test("OpenAthens redirect-loop error parks the job provider and retains its tab"
     "GA-AP-4021-06",
     "OA-AP-4031-05",
   ]) {
-    expect(assessDrivenPage(openAthensDocument(`<p>${marker}</p>`), true)).toEqual({
+    expect(
+      assessDrivenPage(openAthensDocument(`<p>${marker}</p>`), true),
+    ).toEqual({
       kind: "redirect_loop",
     });
   }
   expect(
-    assessDrivenPage(openAthensDocument("<p>GA-AP-4021-06</p>", "Sign in | OpenAthens"), true),
+    assessDrivenPage(
+      openAthensDocument("<p>GA-AP-4021-06</p>", "Sign in | OpenAthens"),
+      true,
+    ),
   ).toEqual({ kind: "normal" });
-  expect(assessDrivenPage(openAthensDocument("<p>GA-AP-4021-06</p>"), false)).toEqual({
+  expect(
+    assessDrivenPage(openAthensDocument("<p>GA-AP-4021-06</p>"), false),
+  ).toEqual({
     kind: "normal",
   });
   const document = openAthensDocument(OPENATHENS_REDIRECT_BODY);
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func !== assessDrivenPage) return [];
-    return [{ result: assessDrivenPage(document, injection.args?.[1] === true) }];
+    return [
+      { result: assessDrivenPage(document, injection.args?.[1] === true) },
+    ];
   };
   await h.bridge.start();
-  await h.port.inbound(jobOfferForHosts("job_openathens_loop", ["www.tandfonline.com"]));
+  await h.port.inbound(
+    jobOfferForHosts("job_openathens_loop", ["www.tandfonline.com"]),
+  );
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  const tab = { id: tabID, url: OPENATHENS_ERROR_URL, title: OPENATHENS_ERROR_TITLE, windowId: 1, active: true };
+  const tab = {
+    id: tabID,
+    url: OPENATHENS_ERROR_URL,
+    title: OPENATHENS_ERROR_TITLE,
+    windowId: 1,
+    active: true,
+  };
   h.tabs.seed(tab);
 
   await h.tabs.update(tabID, { title: OPENATHENS_ERROR_TITLE });
 
-  const relevantFrames = h.frames().filter(
-    (frame) =>
-      (frame.type === "handoff_outcome" && frame.payload["outcome"] === "auth_error") ||
-      (frame.type === "error" && frame.payload["code"] === "challenge_blocked"),
-  );
+  const relevantFrames = h
+    .frames()
+    .filter(
+      (frame) =>
+        (frame.type === "handoff_outcome" &&
+          frame.payload["outcome"] === "auth_error") ||
+        (frame.type === "error" &&
+          frame.payload["code"] === "challenge_blocked"),
+    );
   expect(
     relevantFrames.map((frame) =>
-      frame.type === "handoff_outcome" ? frame.payload["outcome"] : frame.payload["code"],
+      frame.type === "handoff_outcome"
+        ? frame.payload["outcome"]
+        : frame.payload["code"],
     ),
   ).toEqual(["auth_error", "challenge_blocked"]);
-  expect(relevantFrames.filter((frame) => frame.type === "error")).toHaveLength(1);
+  expect(relevantFrames.filter((frame) => frame.type === "error")).toHaveLength(
+    1,
+  );
   expect(h.backend.store.activeJobs[0]).toMatchObject({
     challenge_blocked: true,
     challenge_host: "tandfonline.com",
@@ -6134,8 +8243,12 @@ test("OpenAthens redirect-loop error parks the job provider and retains its tab"
   expect(h.backend.store.challengeCooldowns).toEqual({
     "tandfonline.com": h.clock.now + 600_000,
   });
-  expect(h.backend.store.providerDrainLeases?.["www.tandfonline.com"]?.parkedReason).toBe("challenge");
-  expect(h.backend.store.challengeCooldowns?.["login.openathens.net"]).toBeUndefined();
+  expect(
+    h.backend.store.providerDrainLeases?.["www.tandfonline.com"]?.parkedReason,
+  ).toBe("challenge");
+  expect(
+    h.backend.store.challengeCooldowns?.["login.openathens.net"],
+  ).toBeUndefined();
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
   expect(h.tabs.navigations).toEqual([]);
   expect(h.timers.filter((timer) => timer.ms === 1_500)).toHaveLength(1);
@@ -6148,16 +8261,34 @@ test("OpenAthens title-only error catches a late body in one bounded recheck", a
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func !== assessDrivenPage) return [];
     assessments += 1;
-    return [{ result: assessDrivenPage(document, injection.args?.[1] === true) }];
+    return [
+      { result: assessDrivenPage(document, injection.args?.[1] === true) },
+    ];
   };
   await h.bridge.start();
-  await h.port.inbound(jobOfferForHosts("job_openathens_late_body", ["www.tandfonline.com"]));
+  await h.port.inbound(
+    jobOfferForHosts("job_openathens_late_body", ["www.tandfonline.com"]),
+  );
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  const tab = { id: tabID, url: OPENATHENS_ERROR_URL, title: OPENATHENS_ERROR_TITLE, windowId: 1, active: true };
+  const tab = {
+    id: tabID,
+    url: OPENATHENS_ERROR_URL,
+    title: OPENATHENS_ERROR_TITLE,
+    windowId: 1,
+    active: true,
+  };
   h.tabs.seed(tab);
 
   await h.tabs.update(tabID, { title: OPENATHENS_ERROR_TITLE });
-  expect(h.frames().some((frame) => frame.type === "error" && frame.payload["code"] === "challenge_blocked")).toBe(false);
+  expect(
+    h
+      .frames()
+      .some(
+        (frame) =>
+          frame.type === "error" &&
+          frame.payload["code"] === "challenge_blocked",
+      ),
+  ).toBe(false);
   const rechecks = h.timers.filter((timer) => timer.ms === 1_500);
   expect(rechecks).toHaveLength(1);
 
@@ -6167,14 +8298,22 @@ test("OpenAthens title-only error catches a late body in one bounded recheck", a
 
   expect(assessments).toBe(2);
   expect(
-    h.frames().filter((frame) => frame.type === "error" && frame.payload["code"] === "challenge_blocked"),
+    h
+      .frames()
+      .filter(
+        (frame) =>
+          frame.type === "error" &&
+          frame.payload["code"] === "challenge_blocked",
+      ),
   ).toHaveLength(1);
   expect(h.backend.store.activeJobs[0]).toMatchObject({
     challenge_blocked: true,
     challenge_host: "tandfonline.com",
     challenge_kind: "redirect_loop",
   });
-  expect(h.backend.store.challengeCooldowns?.["tandfonline.com"]).toBe(h.clock.now + 600_000);
+  expect(h.backend.store.challengeCooldowns?.["tandfonline.com"]).toBe(
+    h.clock.now + 600_000,
+  );
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
   expect(h.tabs.navigations).toEqual([]);
 });
@@ -6182,28 +8321,50 @@ test("OpenAthens title-only error catches a late body in one bounded recheck", a
 test("a normal OpenAthens sign-in page remains untouched", async () => {
   const h = makeHarness();
   const title = "Sign in | OpenAthens";
-  const document = openAthensDocument("<main><h1>Sign in</h1><form></form></main>", title);
+  const document = openAthensDocument(
+    "<main><h1>Sign in</h1><form></form></main>",
+    title,
+  );
   h.deps.scripting.executeScript = async (injection) => {
     if (injection.func !== assessDrivenPage) return [];
-    return [{ result: assessDrivenPage(document, injection.args?.[1] === true) }];
+    return [
+      { result: assessDrivenPage(document, injection.args?.[1] === true) },
+    ];
   };
   await h.bridge.start();
-  await h.port.inbound(jobOfferForHosts("job_openathens_sign_in", ["www.tandfonline.com"]));
+  await h.port.inbound(
+    jobOfferForHosts("job_openathens_sign_in", ["www.tandfonline.com"]),
+  );
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  const tab = { id: tabID, url: OPENATHENS_ERROR_URL, title, windowId: 1, active: true };
+  const tab = {
+    id: tabID,
+    url: OPENATHENS_ERROR_URL,
+    title,
+    windowId: 1,
+    active: true,
+  };
   h.tabs.seed(tab);
 
   await h.tabs.update(tabID, { title });
 
-  expect(h.frames().some((frame) => frame.type === "handoff_outcome")).toBe(false);
-  expect(h.frames().some((frame) => frame.type === "error" && frame.payload["code"] === "challenge_blocked")).toBe(false);
+  expect(h.frames().some((frame) => frame.type === "handoff_outcome")).toBe(
+    false,
+  );
+  expect(
+    h
+      .frames()
+      .some(
+        (frame) =>
+          frame.type === "error" &&
+          frame.payload["code"] === "challenge_blocked",
+      ),
+  ).toBe(false);
   expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
   expect(h.backend.store.challengeCooldowns ?? {}).toEqual({});
   expect(h.timers.filter((timer) => timer.ms === 1_500)).toHaveLength(0);
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
   expect(h.tabs.navigations).toEqual([]);
 });
-
 
 test("a title-only stale IdP page is detected, raises the work window, and re-drives", async () => {
   // The failure this pins: the handoff sat minimized on a dead sign-in page for
@@ -6219,7 +8380,10 @@ test("a title-only stale IdP page is detected, raises the work window, and re-dr
 
   const outcome = h.frames().find((f) => f.type === "handoff_outcome");
   expect(outcome?.job_id).toBe("job_stale_surface");
-  expect(outcome?.payload).toMatchObject({ outcome: "stale_sso", final_host: "idp.example.edu" });
+  expect(outcome?.payload).toMatchObject({
+    outcome: "stale_sso",
+    final_host: "idp.example.edu",
+  });
   // Surfaced: tab activated and the minimized window restored and focused.
   expect(h.tabs.activated).toContain(tabID);
   expect(h.windows?.updated).toContainEqual({
@@ -6239,7 +8403,12 @@ test("recoverable IdP errors surface without navigating away from their forms", 
     const h = makeHarness(undefined, { windows: true });
     await h.bridge.start();
     const tabID = await offerIntoWorkWindow(h, `job_recoverable_${outcome}`);
-    const loginTab = { id: tabID, url: STALE_IDP_URL, title: "Institution sign-in", windowId: 500 };
+    const loginTab = {
+      id: tabID,
+      url: STALE_IDP_URL,
+      title: "Institution sign-in",
+      windowId: 500,
+    };
     h.tabs.seed(loginTab);
     await h.tabs.userNavigate(tabID, STALE_IDP_URL);
     expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
@@ -6249,7 +8418,9 @@ test("recoverable IdP errors surface without navigating away from their forms", 
     h.tabs.seed(errorTab);
     await h.tabs.update(tabID, { title });
 
-    expect(h.frames().find((frame) => frame.type === "handoff_outcome")?.payload).toMatchObject({ outcome });
+    expect(
+      h.frames().find((frame) => frame.type === "handoff_outcome")?.payload,
+    ).toMatchObject({ outcome });
     expect(h.tabs.navigations).toHaveLength(navigationsBeforeError);
     expect(h.tabs.snapshot(tabID)?.url).toBe(STALE_IDP_URL);
     expect(h.tabs.activated).toContain(tabID);
@@ -6264,7 +8435,12 @@ test("concurrent stale-page title and complete events spend one recovery attempt
   const h = makeHarness(undefined, { windows: true });
   await h.bridge.start();
   const tabID = await offerIntoWorkWindow(h, "job_stale_concurrent");
-  const tab = { id: tabID, url: STALE_IDP_URL, title: STALE_IDP_TITLE, windowId: 500 };
+  const tab = {
+    id: tabID,
+    url: STALE_IDP_URL,
+    title: STALE_IDP_TITLE,
+    windowId: 500,
+  };
   h.tabs.seed(tab);
 
   await Promise.all([
@@ -6319,7 +8495,6 @@ test("one dead IdP page reports once but a repeat page still re-raises nothing n
   ).toBe(1);
 });
 
-
 // The inbox "View PDF" control on a verify_identity action. The daemon issues a
 // loopback capability URL promptly (confirmed against a live daemon), but the
 // reply type was absent from onInbound's correlation routing, so the frame was
@@ -6335,7 +8510,9 @@ test("a review preview capability reaches the caller that asked for it", async (
   const pending = h.bridge.requestPreview({ action_id: 213 });
   await Promise.resolve();
   await Promise.resolve();
-  const request = h.frames().filter((frame) => frame.type === "review_preview_request");
+  const request = h
+    .frames()
+    .filter((frame) => frame.type === "review_preview_request");
   expect(request).toHaveLength(1);
 
   await h.port.inbound({
@@ -6347,7 +8524,8 @@ test("a review preview capability reaches the caller that asked for it", async (
       request_id: request[0]?.payload["request_id"],
       outcome: "ok",
       url: "http://127.0.0.1:50795/p/YD5r_87qRLi0Ut9XMwt8E4Cq-Bv7N4VvSoEyMsH7-Fs",
-      sha256: "434376057dbe6fc3e44d0fdb7268b56126e9b47ca9d6aa9e05cf2e738f72e81d",
+      sha256:
+        "434376057dbe6fc3e44d0fdb7268b56126e9b47ca9d6aa9e05cf2e738f72e81d",
       size_bytes: 2570670,
       expires_at: "2036-07-27T02:39:46.877077Z",
     },
@@ -6355,7 +8533,9 @@ test("a review preview capability reaches the caller that asked for it", async (
 
   await expect(pending).resolves.toMatchObject({
     ok: true,
-    preview: { url: "http://127.0.0.1:50795/p/YD5r_87qRLi0Ut9XMwt8E4Cq-Bv7N4VvSoEyMsH7-Fs" },
+    preview: {
+      url: "http://127.0.0.1:50795/p/YD5r_87qRLi0Ut9XMwt8E4Cq-Bv7N4VvSoEyMsH7-Fs",
+    },
   });
 });
 
@@ -6365,12 +8545,16 @@ test("a review preview capability reaches the caller that asked for it", async (
 test("a refused review preview reports the daemon's reason", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: "0.12.0", features: ["review_preview_v1"] }));
+  await h.port.inbound(
+    helloAck({ daemon_version: "0.12.0", features: ["review_preview_v1"] }),
+  );
 
   const pending = h.bridge.requestPreview({ action_id: 9999 });
   await Promise.resolve();
   await Promise.resolve();
-  const request = h.frames().filter((frame) => frame.type === "review_preview_request");
+  const request = h
+    .frames()
+    .filter((frame) => frame.type === "review_preview_request");
 
   await h.port.inbound({
     protocol: "papio-browser/1",
@@ -6391,20 +8575,30 @@ test("a refused review preview reports the daemon's reason", async () => {
   });
 });
 
-
-
 test("handoff governor keeps one drive, drains FIFO on settle and timeout", async () => {
-  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
   await h.bridge.start();
-  const jobIDs = Array.from({ length: 5 }, (_, index) => `job_governor_${index}`);
+  const jobIDs = Array.from(
+    { length: 5 },
+    (_, index) => `job_governor_${index}`,
+  );
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
 
   expect(h.tabs.list().length).toBe(1);
   expect(h.tabs.created).toHaveLength(1);
-  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(4);
-  expect(h.frames().filter((frame) => frame.type === "job_accept")).toHaveLength(5);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.tab_id < 0),
+  ).toHaveLength(4);
+  expect(
+    h.frames().filter((frame) => frame.type === "job_accept"),
+  ).toHaveLength(5);
 
-  const first = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const first = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   expect(first?.tab_id).toBeGreaterThanOrEqual(0);
   await h.bridge.requestCancel(jobIDs[0]!);
   expect(h.tabs.list().length).toBe(2);
@@ -6416,7 +8610,9 @@ test("handoff governor keeps one drive, drains FIFO on settle and timeout", asyn
   await timeout?.fn();
   expect(h.tabs.list().length).toBe(3);
   expect(h.tabs.created).toHaveLength(3);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])?.status).toBe("auth_pending");
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])?.status,
+  ).toBe("auth_pending");
 });
 
 test("a drive timing out on an authentication page leaves the tab open and frees the governor slot", async () => {
@@ -6425,14 +8621,24 @@ test("a drive timing out on an authentication page leaves the tab open and frees
   // IdP form, entered credentials, or an in-flight 2FA challenge — at the
   // 3-minute mark with no warning. parkHandoffForManual's own contract is to
   // leave that page for the operator; only the governor slot is freed.
-  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
   await h.bridge.start();
-  const jobIDs = Array.from({ length: 3 }, (_, index) => `job_auth_timeout_${index}`);
+  const jobIDs = Array.from(
+    { length: 3 },
+    (_, index) => `job_auth_timeout_${index}`,
+  );
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
 
   expect(h.tabs.list().length).toBe(1);
-  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(2);
-  const first = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.tab_id < 0),
+  ).toHaveLength(2);
+  const first = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   const firstTabID = first?.tab_id ?? -1;
   expect(firstTabID).toBeGreaterThanOrEqual(0);
 
@@ -6448,24 +8654,38 @@ test("a drive timing out on an authentication page leaves the tab open and frees
 
   expect(h.tabs.removed).not.toContain(firstTabID);
   expect(h.tabs.snapshot(firstTabID) !== undefined).toBe(true);
-  const after = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const after = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   expect(after?.status).toBe("auth_pending");
   expect(after?.tab_id).toBe(-1);
-  expect(h.frames().filter((frame) => frame.type === "auth_pending")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "auth_pending"),
+  ).toHaveLength(1);
 
   // The next FIFO job now drives after the parked job frees its slot.
   expect(h.tabs.created).toHaveLength(2);
-  const second = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1]);
+  const second = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[1],
+  );
   expect(second?.tab_id).toBeGreaterThanOrEqual(0);
 });
 
 test("a drive timing out on an ordinary provider page leaves the tab open and frees the governor slot", async () => {
-  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
   await h.bridge.start();
-  const jobIDs = Array.from({ length: 3 }, (_, index) => `job_provider_timeout_${index}`);
+  const jobIDs = Array.from(
+    { length: 3 },
+    (_, index) => `job_provider_timeout_${index}`,
+  );
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
 
-  const first = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const first = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   const firstTabID = first?.tab_id ?? -1;
   expect(firstTabID).toBeGreaterThanOrEqual(0);
   // Tab never left the resolver/provider page — no IdP navigation happened.
@@ -6477,7 +8697,9 @@ test("a drive timing out on an ordinary provider page leaves the tab open and fr
 
   expect(h.tabs.removed).not.toContain(firstTabID);
   expect(h.tabs.snapshot(firstTabID) !== undefined).toBe(true);
-  const after = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const after = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   expect(after?.status).toBe("auth_pending");
   expect(after?.tab_id).toBe(-1);
   expect(h.tabs.created).toHaveLength(2);
@@ -6533,14 +8755,28 @@ test("registerHandoffDrive refuses to exceed HANDOFF_DRIVE_LIMIT even when calle
   expect(bridgeInternal.handoffDrives.has(jobIDs[2]!)).toBe(false);
   // Refused, not dropped: both excess drives are queued so the next drain
   // reuses their tabs rather than stranding either job.
-  expect(bridgeInternal.handoffDriveQueue.some((request) => request.jobID === jobIDs[1])).toBe(true);
-  expect(bridgeInternal.handoffDriveQueue.some((request) => request.jobID === jobIDs[2])).toBe(true);
+  expect(
+    bridgeInternal.handoffDriveQueue.some(
+      (request) => request.jobID === jobIDs[1],
+    ),
+  ).toBe(true);
+  expect(
+    bridgeInternal.handoffDriveQueue.some(
+      (request) => request.jobID === jobIDs[2],
+    ),
+  ).toBe(true);
 });
 
 test("governor-queued handoffs are re-driven after a service-worker restart", async () => {
-  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  const first = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
   await first.bridge.start();
-  const jobIDs = Array.from({ length: 5 }, (_, index) => `job_restart_governor_${index}`);
+  const jobIDs = Array.from(
+    { length: 5 },
+    (_, index) => `job_restart_governor_${index}`,
+  );
   for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
   expect(first.tabs.list().length).toBe(1);
   const parked = first.backend.store.activeJobs.filter((job) => job.tab_id < 0);
@@ -6551,7 +8787,9 @@ test("governor-queued handoffs are re-driven after a service-worker restart", as
   // accepted-but-undriven jobs is worker memory. They used to strand forever:
   // the startup scan skipped tab_id < 0, the queued-release pass only handles
   // status "queued", and a daemon re-offer on the same URL merely re-acks.
-  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  const restarted = makeHarness(
+    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+  );
   await restarted.bridge.start();
   // The restored worker gives the single governor slot to the first queued
   // job that was waiting for it, not leave it stranded at tab_id -1 forever.
@@ -6563,14 +8801,23 @@ test("governor-queued handoffs are re-driven after a service-worker restart", as
 });
 
 test("live accepted handoffs queue behind the restored governor owner after restart", async () => {
-  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  const first = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
   await first.bridge.start();
   await first.port.inbound(jobOffer("job_restart_live_a"));
   await first.port.inbound(jobOffer("job_restart_live_b"));
 
-  const persisted = JSON.parse(JSON.stringify(first.backend.store)) as StoreShape;
-  const a = persisted.activeJobs.find((job) => job.job_id === "job_restart_live_a")!;
-  const b = persisted.activeJobs.find((job) => job.job_id === "job_restart_live_b")!;
+  const persisted = JSON.parse(
+    JSON.stringify(first.backend.store),
+  ) as StoreShape;
+  const a = persisted.activeJobs.find(
+    (job) => job.job_id === "job_restart_live_a",
+  )!;
+  const b = persisted.activeJobs.find(
+    (job) => job.job_id === "job_restart_live_b",
+  )!;
   a.tab_id = 200;
   a.status = "accepted";
   a.parked_with_tab = false;
@@ -6589,7 +8836,9 @@ test("live accepted handoffs queue behind the restored governor owner after rest
     drainHandoffDriveQueue(): Promise<void>;
   };
   expect([...internals.handoffDrives.keys()]).toEqual(["job_restart_live_a"]);
-  expect(internals.handoffDriveQueue.map((request) => request.jobID)).toEqual(["job_restart_live_b"]);
+  expect(internals.handoffDriveQueue.map((request) => request.jobID)).toEqual([
+    "job_restart_live_b",
+  ]);
 
   internals.releaseHandoffDrive("job_restart_live_a");
   await internals.drainHandoffDriveQueue();
@@ -6597,14 +8846,24 @@ test("live accepted handoffs queue behind the restored governor owner after rest
 });
 
 test("a timeout-detached auth job survives restart without re-consuming its governor slot", async () => {
-  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  const first = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
   await first.bridge.start();
-  const jobIDs = Array.from({ length: 3 }, (_, index) => `job_park_restart_${index}`);
+  const jobIDs = Array.from(
+    { length: 3 },
+    (_, index) => `job_park_restart_${index}`,
+  );
   for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
 
-  const parkedTabID = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])?.tab_id ?? -1;
+  const parkedTabID =
+    first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])
+      ?.tab_id ?? -1;
   expect(parkedTabID).toBeGreaterThanOrEqual(0);
-  const activeTabID = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])?.tab_id ?? -1;
+  const activeTabID =
+    first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])
+      ?.tab_id ?? -1;
   expect(activeTabID).toBe(-1);
   first.tabs.seed({ id: parkedTabID, url: "https://idp.example.edu/sso" });
   await first.tabs.userActivate(parkedTabID);
@@ -6613,24 +8872,34 @@ test("a timeout-detached auth job survives restart without re-consuming its gove
   first.clock.now += 180_000;
   await authTimeouts[0]?.fn();
 
-  const parkedAfterTimeout = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const parkedAfterTimeout = first.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   expect(parkedAfterTimeout?.status).toBe("auth_pending");
   expect(parkedAfterTimeout?.tab_id).toBe(-1);
   expect(parkedAfterTimeout?.parked_with_tab).toBeUndefined();
   expect(first.tabs.snapshot(parkedTabID) !== undefined).toBe(true);
-  expect(first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])?.tab_id).toBeGreaterThanOrEqual(0);
+  expect(
+    first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])
+      ?.tab_id,
+  ).toBeGreaterThanOrEqual(0);
 
   const survivingTabs = first.backend.store.activeJobs
     .filter((job) => job.tab_id >= 0)
     .map((job) => [job.job_id, job.tab_id] as const);
   expect(survivingTabs).toHaveLength(1);
-  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
-  for (const [, tabID] of survivingTabs) restarted.tabs.seed({ id: tabID, url: OPENURL });
+  const restarted = makeHarness(
+    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+  );
+  for (const [, tabID] of survivingTabs)
+    restarted.tabs.seed({ id: tabID, url: OPENURL });
   await restarted.bridge.start();
   const restartedInternal = restarted.bridge as unknown as {
     handoffDrives: Map<string, { tabID: number }>;
   };
-  const restartedParked = restarted.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const restartedParked = restarted.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   expect(restartedInternal.handoffDrives.has(jobIDs[0]!)).toBe(false);
   expect(restartedParked?.tab_id).toBe(-1);
   expect(restartedParked?.status).toBe("auth_pending");
@@ -6642,18 +8911,25 @@ test("a timeout-detached auth job survives restart without re-consuming its gove
 });
 
 test("a timeout-detached job does not re-associate an operator tab", async () => {
-  const h = makeHarness({ ...emptyStore(), lastAuthReturnedAt: 1_700_000_000_000 });
+  const h = makeHarness({
+    ...emptyStore(),
+    lastAuthReturnedAt: 1_700_000_000_000,
+  });
   await h.bridge.start();
   const jobIDs = ["job_park_clear_0", "job_park_clear_1"];
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
 
-  const detachedTabID = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])?.tab_id ?? -1;
+  const detachedTabID =
+    h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])
+      ?.tab_id ?? -1;
   expect(detachedTabID).toBeGreaterThanOrEqual(0);
   h.tabs.seed({ id: detachedTabID, url: "https://idp.example.edu/sso" });
   const timeout = h.timers.find((t) => t.ms === 180_000);
   h.clock.now += 180_000;
   await timeout?.fn();
-  const detached = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const detached = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   expect(detached?.status).toBe("auth_pending");
   expect(detached?.tab_id).toBe(-1);
   expect(detached?.parked_with_tab).toBeUndefined();
@@ -6661,17 +8937,27 @@ test("a timeout-detached job does not re-associate an operator tab", async () =>
 
   const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
   await h.tabs.userNavigate(detachedTabID, providerURL);
-  const unchanged = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const unchanged = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   expect(unchanged?.status).toBe("auth_pending");
   expect(unchanged?.tab_id).toBe(-1);
 });
 test("a timeout-detached job stays outside the governor until a fresh drive", async () => {
-  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  const first = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
   await first.bridge.start();
-  const jobIDs = Array.from({ length: 3 }, (_, index) => `job_resume_capacity_${index}`);
+  const jobIDs = Array.from(
+    { length: 3 },
+    (_, index) => `job_resume_capacity_${index}`,
+  );
   for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
 
-  const detachedTabID = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])?.tab_id ?? -1;
+  const detachedTabID =
+    first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])
+      ?.tab_id ?? -1;
   expect(detachedTabID).toBeGreaterThanOrEqual(0);
   first.tabs.seed({ id: detachedTabID, url: "https://idp.example.edu/sso" });
   const authTimeouts = first.timers.filter((t) => t.ms === 180_000);
@@ -6680,20 +8966,28 @@ test("a timeout-detached job stays outside the governor until a fresh drive", as
   first.clock.now += 180_000;
   await authTimeouts[0]?.fn();
 
-  const beforeResume = first.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  const beforeResume = first.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+  };
   expect(beforeResume.handoffDrives.size).toBe(1);
   expect(beforeResume.handoffDrives.has(jobIDs[0]!)).toBe(false);
   const resumed = await first.bridge.resumeHandoffAfterManual(jobIDs[0]!);
   expect(resumed).toBe(false);
-  const detached = first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0]);
+  const detached = first.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[0],
+  );
   expect(detached?.tab_id).toBe(-1);
   expect(detached?.status).toBe("auth_pending");
   expect(detached?.parked_with_tab).toBeUndefined();
   expect(first.tabs.snapshot(detachedTabID) !== undefined).toBe(true);
 
-  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  const restarted = makeHarness(
+    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+  );
   await restarted.bridge.start();
-  const restartedInternal = restarted.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  const restartedInternal = restarted.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+  };
   expect(restartedInternal.handoffDrives.has(jobIDs[0]!)).toBe(false);
 });
 
@@ -6704,12 +8998,21 @@ test("a timeout-detached job stays outside the governor until a fresh drive", as
 // it is a real handoff. Excluding it from restore on shape alone stranded
 // exactly the jobs this restore exists to recover.
 test("restore recovers an auth-required handoff whose OpenURL base looks like a file", async () => {
-  const pdfShapedBase = "https://resolver.example.edu/openurl/content/pdf/resolve";
-  const first = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  const pdfShapedBase =
+    "https://resolver.example.edu/openurl/content/pdf/resolve";
+  const first = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
   await first.bridge.start();
-  const jobIDs = Array.from({ length: 4 }, (_, index) => `job_pdfbase_governor_${index}`);
+  const jobIDs = Array.from(
+    { length: 4 },
+    (_, index) => `job_pdfbase_governor_${index}`,
+  );
   for (const jobID of jobIDs) {
-    const offer = jobOffer(jobID, pdfShapedBase) as { payload: Record<string, unknown> };
+    const offer = jobOffer(jobID, pdfShapedBase) as {
+      payload: Record<string, unknown>;
+    };
     offer.payload["requires_auth"] = true;
     await first.port.inbound(offer);
   }
@@ -6720,7 +9023,9 @@ test("restore recovers an auth-required handoff whose OpenURL base looks like a 
   expect(parked.length).toBeGreaterThan(0);
   expect(parked.every((job) => job.status === "accepted")).toBe(true);
 
-  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  const restarted = makeHarness(
+    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+  );
   await restarted.bridge.start();
   const parkedIDs = parked.map((job) => job.job_id);
   const drivenAfterRestart = restarted.backend.store.activeJobs.filter(
@@ -6735,7 +9040,10 @@ test("per-origin sign-in hands the tab to the keepalive manager", async () => {
   await h.port.inbound(helloAck());
   const reauthOrigins: (string | undefined)[] = [];
   h.bridge.attachKeepalive({
-    getSnapshot: () => ({ resolverOrigin: "https://beta.example.edu", pausedForReauth: false }),
+    getSnapshot: () => ({
+      resolverOrigin: "https://beta.example.edu",
+      pausedForReauth: false,
+    }),
     noteResolverActivated: () => {},
     openReauth: async (originHint?: string) => {
       reauthOrigins.push(originHint);
@@ -6757,7 +9065,10 @@ test("per-origin sign-in falls back to a managed tab when the manager declines",
   await h.bridge.start();
   await h.port.inbound(helloAck());
   h.bridge.attachKeepalive({
-    getSnapshot: () => ({ resolverOrigin: "https://beta.example.edu", pausedForReauth: false }),
+    getSnapshot: () => ({
+      resolverOrigin: "https://beta.example.edu",
+      pausedForReauth: false,
+    }),
     noteResolverActivated: () => {},
     openReauth: async () => false,
   } as unknown as KeepaliveManager);
@@ -6767,7 +9078,6 @@ test("per-origin sign-in falls back to a managed tab when the manager declines",
   expect(h.tabs.created).toHaveLength(1);
 });
 
-
 test("manual inbox Open binds a DOI-less PDF in another tab to the existing job", async () => {
   const h = makeHarness();
   await h.bridge.start();
@@ -6776,6 +9086,7 @@ test("manual inbox Open binds a DOI-less PDF in another tab to the existing job"
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const jobID = "job_55c790d91b55f395759ecebe84";
@@ -6784,7 +9095,11 @@ test("manual inbox Open binds a DOI-less PDF in another tab to the existing job"
     h.bridge,
     {
       type: "papio.manual.open",
-      request: { job_id: jobID, url: landingURL, title: "Understanding workplace deviance" },
+      request: {
+        job_id: jobID,
+        url: landingURL,
+        title: "Understanding workplace deviance",
+      },
     },
     { id: urls.runtimeID, url: urls.inboxURL },
     urls,
@@ -6795,8 +9110,12 @@ test("manual inbox Open binds a DOI-less PDF in another tab to the existing job"
   const manualStored = findByJob(h.backend.store, jobID)!;
   expect(manualStored.manual_delivery_target).toBe(true);
   expect(manualStored.status).toBe("awaiting_download");
-  expect(manualStored.expected).toEqual({ title: "Understanding workplace deviance" });
-  expect(typeof manualStored.tab_id === "number" && manualStored.tab_id >= 0).toBe(true);
+  expect(manualStored.expected).toEqual({
+    title: "Understanding workplace deviance",
+  });
+  expect(
+    typeof manualStored.tab_id === "number" && manualStored.tab_id >= 0,
+  ).toBe(true);
 
   // A daemon re-offer can arrive while the researcher logs in or reads the
   // landing page. It cannot replace the explicit target or erase the safe
@@ -6805,8 +9124,12 @@ test("manual inbox Open binds a DOI-less PDF in another tab to the existing job"
   const afterOffer = findByJob(h.backend.store, jobID)!;
   expect(afterOffer.manual_delivery_target).toBe(true);
   expect(afterOffer.status).toBe("awaiting_download");
-  expect(afterOffer.provider_hosts).toEqual(expect.arrayContaining(["link.springer.com"]));
-  expect(typeof afterOffer.tab_id === "number" && afterOffer.tab_id >= 0).toBe(true);
+  expect(afterOffer.provider_hosts).toEqual(
+    expect.arrayContaining(["link.springer.com"]),
+  );
+  expect(typeof afterOffer.tab_id === "number" && afterOffer.tab_id >= 0).toBe(
+    true,
+  );
   const suggestions: string[] = [];
   await h.downloads.onDeterminingFilename.emit(
     {
@@ -6853,9 +9176,13 @@ test("manual inbox Open is inbox-only, HTTPS-only, and one target at a time", as
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
-  const request = (jobID: string, url = "https://publisher.example.edu/article") => ({
+  const request = (
+    jobID: string,
+    url = "https://publisher.example.edu/article",
+  ) => ({
     type: "papio.manual.open",
     request: { job_id: jobID, url, title: "Paper" },
   });
@@ -6871,7 +9198,10 @@ test("manual inbox Open is inbox-only, HTTPS-only, and one target at a time", as
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
-      request("job_manual_http_forbidden", "http://publisher.example.edu/article"),
+      request(
+        "job_manual_http_forbidden",
+        "http://publisher.example.edu/article",
+      ),
       { id: urls.runtimeID, url: urls.inboxURL },
       urls,
     ),
@@ -6887,15 +9217,18 @@ test("manual inbox Open is inbox-only, HTTPS-only, and one target at a time", as
       ),
     ).resolves.toEqual({ ok: true, opened: true });
   }
-  expect(h.backend.store.activeJobs.filter((job) => job.manual_delivery_target === true).map((job) => job.job_id))
-    .toEqual(["job_manual_target_two"]);
+  expect(
+    h.backend.store.activeJobs
+      .filter((job) => job.manual_delivery_target === true)
+      .map((job) => job.job_id),
+  ).toEqual(["job_manual_target_two"]);
   expect(findByJob(h.backend.store, "job_manual_target_one")?.tab_id).toBe(-1);
 
   // Compatibility with state persisted by the pre-fix build: even if an
   // unselected awaiting-download record still carries its former tab id, it
   // cannot claim a later native download from that tab.
   h.backend.store.activeJobs = h.backend.store.activeJobs.map((job) =>
-    job.job_id === "job_manual_target_one" ? { ...job, tab_id: 998 } : job
+    job.job_id === "job_manual_target_one" ? { ...job, tab_id: 998 } : job,
   );
   const staleSuggestions: string[] = [];
   await h.downloads.onDeterminingFilename.emit(
@@ -6910,7 +9243,7 @@ test("manual inbox Open is inbox-only, HTTPS-only, and one target at a time", as
   );
   expect(staleSuggestions).toEqual([]);
   h.backend.store.activeJobs = h.backend.store.activeJobs.map((job) =>
-    job.job_id === "job_manual_target_one" ? { ...job, tab_id: -1 } : job
+    job.job_id === "job_manual_target_one" ? { ...job, tab_id: -1 } : job,
   );
   h.tabs.seed({ id: 999, url: "https://provider.example.edu/paper.pdf" });
   await expect(
@@ -6947,6 +9280,7 @@ test("manual Send PDF downloads directly from a packaged SAGE journal viewer", a
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   await expect(
@@ -6964,7 +9298,8 @@ test("manual Send PDF downloads directly from a packaged SAGE journal viewer", a
     ),
   ).resolves.toEqual({ ok: true, opened: true });
 
-  const viewerURL = "https://journals.sagepub.com/doi/epdf/10.1177/0146167207301014";
+  const viewerURL =
+    "https://journals.sagepub.com/doi/epdf/10.1177/0146167207301014";
   const opened = findByJob(h.backend.store, "job_manual_sage_viewer")!;
   h.tabs.seed({ id: opened.tab_id, url: viewerURL });
   await expect(
@@ -6979,12 +9314,14 @@ test("manual Send PDF downloads directly from a packaged SAGE journal viewer", a
     state: "sending",
     job_id: "job_manual_sage_viewer",
   });
-  expect(h.downloads.started).toEqual([{
-    url: "https://journals.sagepub.com/doi/pdf/10.1177/0146167207301014?download=true",
-    filename: "papio/job_manual_sage_viewer/paper.pdf",
-    conflictAction: "uniquify",
-    saveAs: false,
-  }]);
+  expect(h.downloads.started).toEqual([
+    {
+      url: "https://journals.sagepub.com/doi/pdf/10.1177/0146167207301014?download=true",
+      filename: "papio/job_manual_sage_viewer/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
 });
 
 test("manual Send PDF accepts Cell's exact PII PDF response without a filename suffix", async () => {
@@ -6995,13 +9332,18 @@ test("manual Send PDF accepts Cell's exact PII PDF response without a filename s
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
-  const viewerURL = "https://www.cell.com/action/showPdf?pii=S2405-8440%2817%2930127-5";
+  const viewerURL =
+    "https://www.cell.com/action/showPdf?pii=S2405-8440%2817%2930127-5";
   await expect(
     handleInboxRuntimeMessage(
       h.bridge,
-      { type: "papio.manual.open", request: { job_id: "job_manual_cell_viewer", url: viewerURL } },
+      {
+        type: "papio.manual.open",
+        request: { job_id: "job_manual_cell_viewer", url: viewerURL },
+      },
       { id: urls.runtimeID, url: urls.inboxURL },
       urls,
     ),
@@ -7022,29 +9364,34 @@ test("manual Send PDF accepts Cell's exact PII PDF response without a filename s
     state: "sending",
     job_id: "job_manual_cell_viewer",
   });
-  expect(h.downloads.started).toEqual([{
-    url: viewerURL,
-    filename: "papio/job_manual_cell_viewer/paper.pdf",
-    conflictAction: "uniquify",
-    saveAs: false,
-  }]);
+  expect(h.downloads.started).toEqual([
+    {
+      url: viewerURL,
+      filename: "papio/job_manual_cell_viewer/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
 });
 
 test("ScienceDirect assets Send PDF arms the native viewer download instead of fetching init HTML", async () => {
   const store = emptyStore();
-  store.activeJobs = [{
-    job_id: "job_sciencedirect_native_viewer",
-    tab_id: 42,
-    offered_at: 1_700_000_000_000,
-    expires_at: 1_800_000_000_000,
-    status: "awaiting_download",
-    provider_hosts: ["sciencedirect.com", "pdf.sciencedirectassets.com"],
-    manual_delivery_target: true,
-    adapter_id: "sciencedirect",
-    access_mode: "delegated",
-  }];
+  store.activeJobs = [
+    {
+      job_id: "job_sciencedirect_native_viewer",
+      tab_id: 42,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000,
+      status: "awaiting_download",
+      provider_hosts: ["sciencedirect.com", "pdf.sciencedirectassets.com"],
+      manual_delivery_target: true,
+      adapter_id: "sciencedirect",
+      access_mode: "delegated",
+    },
+  ];
   const h = makeHarness(store);
-  const articleURL = "https://www.sciencedirect.com/science/article/pii/S0360131510000527";
+  const articleURL =
+    "https://www.sciencedirect.com/science/article/pii/S0360131510000527";
   const viewerURL =
     "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
   // Seed the tracked opener before worker restart reconciliation inspects the
@@ -7062,7 +9409,9 @@ test("ScienceDirect assets Send PDF arms the native viewer download instead of f
     message: expect.stringMatching(/viewer Download button/i),
   });
   expect(h.downloads.started).toEqual([]);
-  expect(findByJob(h.backend.store, "job_sciencedirect_native_viewer")).toMatchObject({
+  expect(
+    findByJob(h.backend.store, "job_sciencedirect_native_viewer"),
+  ).toMatchObject({
     tab_id: 99,
     status: "awaiting_download",
     manual_delivery_target: true,
@@ -7088,32 +9437,42 @@ test("ScienceDirect assets Send PDF arms the native viewer download instead of f
   ]);
 });
 
-
-
 test("Send PDF without DOI grabs the file through Chrome steering when no manual target exists", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
   const pdfURL = "https://provider.example.edu/download/article.pdf";
   h.tabs.seed({ id: 42, url: pdfURL });
   let grabCalled = false;
-  (h.bridge as unknown as Record<string, unknown>).requestPdfGrab = async (req: { tab_id: number; url?: string }) => {
-    grabCalled = true;
-    expect(req.tab_id).toBe(42);
-    return { ok: true, grab_id: "grab-file-0001" } as unknown as never;
-  };
+  (h.bridge as unknown as Record<string, unknown>).requestPdfGrab =
+    async (req: { tab_id: number; url?: string }) => {
+      grabCalled = true;
+      expect(req.tab_id).toBe(42);
+      return { ok: true, grab_id: "grab-file-0001" } as unknown as never;
+    };
   const result = await h.bridge.startPDFDelivery({ tab_id: 42, url: pdfURL });
   expect(grabCalled).toBe(true);
   expect(result).toMatchObject({ ok: true, state: "sending" });
   expect((result as { job_id?: string }).job_id).toBeUndefined();
-  expect(String((result as { message?: string }).message ?? "")).toMatch(/identify.*file/i);
+  expect(String((result as { message?: string }).message ?? "")).toMatch(
+    /identify.*file/i,
+  );
 });
 
 test("openManualDownload stores the created tab id and sets delegated when adapter_id exists", async () => {
   const h = makeHarness();
   await h.bridge.start();
   // Seed an existing job with adapter_id so delegated is set on open
-  await (h.bridge as unknown as { update: (fn: (s: unknown) => unknown) => Promise<void> }).update((s: unknown) => {
+  await (
+    h.bridge as unknown as {
+      update: (fn: (s: unknown) => unknown) => Promise<void>;
+    }
+  ).update((s: unknown) => {
     const store = s as import("../src/state").StoreShape;
     return {
       ...store,
@@ -7136,6 +9495,7 @@ test("openManualDownload stores the created tab id and sets delegated when adapt
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   // openManualDownload will create a new tab; the existing job already has manual_delivery_target
@@ -7143,7 +9503,11 @@ test("openManualDownload stores the created tab id and sets delegated when adapt
   // So we first remove the marker to allow open, then check delegated
   // Actually openManualDownload checks isManualDownloadWindow(existing) - if existing is a manual window, it allows reopen
   // Let's instead use a job without manual marker but with adapter_id
-  await (h.bridge as unknown as { update: (fn: (s: unknown) => unknown) => Promise<void> }).update((s: unknown) => {
+  await (
+    h.bridge as unknown as {
+      update: (fn: (s: unknown) => unknown) => Promise<void>;
+    }
+  ).update((s: unknown) => {
     const store = s as import("../src/state").StoreShape;
     return {
       ...store,
@@ -7162,14 +9526,27 @@ test("openManualDownload stores the created tab id and sets delegated when adapt
   });
   const opened = await handleInboxRuntimeMessage(
     h.bridge,
-    { type: "papio.manual.open", request: { job_id: "job_manual_delegated2", url: "https://publisher.example.edu/article" } },
+    {
+      type: "papio.manual.open",
+      request: {
+        job_id: "job_manual_delegated2",
+        url: "https://publisher.example.edu/article",
+      },
+    },
     { id: urls.runtimeID, url: urls.inboxURL },
     urls,
   );
   expect(opened).toEqual({ ok: true, opened: true });
-  const createdTabId = h.tabs.created[h.tabs.created.length - 1] ? (h.tabs.live.values().next().value as { id?: number })?.id : undefined;
+  const createdTabId = h.tabs.created[h.tabs.created.length - 1]
+    ? (h.tabs.live.values().next().value as { id?: number })?.id
+    : undefined;
   const stored = findByJob(h.backend.store, "job_manual_delegated2");
-  expect(stored).toMatchObject({ job_id: "job_manual_delegated2", manual_delivery_target: true, adapter_id: "sage", access_mode: "delegated" });
+  expect(stored).toMatchObject({
+    job_id: "job_manual_delegated2",
+    manual_delivery_target: true,
+    adapter_id: "sage",
+    access_mode: "delegated",
+  });
   // tab_id should be the created tab's id (not -1)
   expect(typeof stored?.tab_id === "number" && stored.tab_id >= 0).toBe(true);
 });
@@ -7182,6 +9559,7 @@ test("closing the tab of a manual_delivery_target does not cancel the job", asyn
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
     popupURL: "chrome-extension://papio-test-id/popup.html",
     historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
   const jobID = "job_manual_close_keep";
@@ -7203,7 +9581,9 @@ test("closing the tab of a manual_delivery_target does not cancel the job", asyn
   expect(after?.status).toBe("awaiting_download");
   expect(after?.manual_delivery_target).toBe(true);
   expect(after?.tab_id).toBe(-1);
-  expect(h.port.posted.some((f) => JSON.stringify(f).includes("provider_outcome"))).toBe(false);
+  expect(
+    h.port.posted.some((f) => JSON.stringify(f).includes("provider_outcome")),
+  ).toBe(false);
 });
 
 test("delivery provenance keeps the host that requested the download", async () => {
@@ -7243,7 +9623,10 @@ test("delivery provenance keeps the host that requested the download", async () 
     fileSize: 1000,
     state: "complete",
   });
-  await h.downloads.onChanged.emit({ id: downloadID, state: { current: "complete" } });
+  await h.downloads.onChanged.emit({
+    id: downloadID,
+    state: { current: "complete" },
+  });
 
   const context = h.frames().find((frame) => frame.type === "delivery_context");
   expect(context?.payload).toMatchObject({ page_host: "provider.example.edu" });
@@ -7279,7 +9662,9 @@ test("delivery session evidence is frozen at request time, not completion time",
   // An institutional sign-in lands elsewhere in the browser while this
   // non-institutional download is still in flight. A live read at
   // completion would credit this delivery with it; the frozen value must not.
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
 
   h.downloads.items.set(downloadID, {
     id: downloadID,
@@ -7289,7 +9674,10 @@ test("delivery session evidence is frozen at request time, not completion time",
     fileSize: 1000,
     state: "complete",
   });
-  await h.downloads.onChanged.emit({ id: downloadID, state: { current: "complete" } });
+  await h.downloads.onChanged.emit({
+    id: downloadID,
+    state: { current: "complete" },
+  });
 
   const context = h.frames().find((frame) => frame.type === "delivery_context");
   expect(context?.payload).toMatchObject({
@@ -7323,7 +9711,10 @@ test("failed delivery frozen host does not poison a later non-delivery download"
   await h.port.inbound(helloAck({ features: ["delivery_context_v1"] }));
 
   // Start a delivery — freezes page_host: "provider.example.edu".
-  const reply = await h.bridge.startPDFDelivery({ tab_id: 100, url: deliveryURL });
+  const reply = await h.bridge.startPDFDelivery({
+    tab_id: 100,
+    url: deliveryURL,
+  });
   expect(reply.ok).toBe(true);
   const deliveryDownloadID = 900 + h.downloads.started.length;
 
@@ -7337,7 +9728,10 @@ test("failed delivery frozen host does not poison a later non-delivery download"
     fileSize: 500,
     state: "complete",
   });
-  await h.downloads.onChanged.emit({ id: deliveryDownloadID, state: { current: "complete" } });
+  await h.downloads.onChanged.emit({
+    id: deliveryDownloadID,
+    state: { current: "complete" },
+  });
 
   // Now simulate a resolver-routed download for the same job from a different host.
   // This is a non-delivery download (track.delivery !== true), so the frozen host
@@ -7357,7 +9751,10 @@ test("failed delivery frozen host does not poison a later non-delivery download"
   // Emit onCreated first to set up the track (non-delivery).
   await h.downloads.onCreated.emit(h.downloads.items.get(secondDownloadID)!);
   // Now emit onChanged to complete it.
-  await h.downloads.onChanged.emit({ id: secondDownloadID, state: { current: "complete" } });
+  await h.downloads.onChanged.emit({
+    id: secondDownloadID,
+    state: { current: "complete" },
+  });
 
   // The delivery_context frame should report the SECOND host, not the stale frozen one.
   const context = h.frames().find((frame) => frame.type === "delivery_context");
@@ -7371,7 +9768,9 @@ test("successful adoption removes the job while leaving its managed handoff open
   await success.port.inbound(jobOffer("job_close_success"));
   const successTab = success.backend.store.activeJobs[0]?.tab_id ?? -1;
   const successTabInfo = success.tabs.snapshot(successTab);
-  (success.bridge as unknown as { tabLedgerCache: Record<string, unknown> }).tabLedgerCache = {
+  (
+    success.bridge as unknown as { tabLedgerCache: Record<string, unknown> }
+  ).tabLedgerCache = {
     [String(successTab)]: {
       openedAt: 1,
       url: successTabInfo?.url ?? "https://provider.example.edu/paper.pdf",
@@ -7379,7 +9778,11 @@ test("successful adoption removes the job while leaving its managed handoff open
     },
   };
   await success.tabs.userActivate(successTab);
-  await success.downloads.onCreated.emit({ id: 901, tabId: successTab, state: "in_progress" });
+  await success.downloads.onCreated.emit({
+    id: 901,
+    tabId: successTab,
+    state: "in_progress",
+  });
   success.downloads.items.set(901, {
     id: 901,
     tabId: successTab,
@@ -7388,7 +9791,10 @@ test("successful adoption removes the job while leaving its managed handoff open
     fileSize: 100,
     state: "complete",
   });
-  await success.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  await success.downloads.onChanged.emit({
+    id: 901,
+    state: { current: "complete" },
+  });
   await success.port.inbound({
     protocol: "papio-browser/1",
     type: "ack",
@@ -7399,44 +9805,68 @@ test("successful adoption removes the job while leaving its managed handoff open
   });
   expect(success.tabs.removed).toEqual([]);
   expect(success.tabs.snapshot(successTab) !== undefined).toBe(true);
-  expect(success.backend.store.activeJobs.find((job) => job.job_id === "job_close_success")).toBeUndefined();
-  const successInternal = success.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  expect(
+    success.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_close_success",
+    ),
+  ).toBeUndefined();
+  const successInternal = success.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+  };
   expect(successInternal.handoffDrives.has("job_close_success")).toBe(false);
 
   const human = makeHarness();
   await human.bridge.start();
   await human.port.inbound(jobOffer("job_close_human"));
   const humanTab = human.backend.store.activeJobs[0]?.tab_id ?? -1;
-  await human.tabs.completeNavigation(humanTab, "https://idp.example.edu/login");
+  await human.tabs.completeNavigation(
+    humanTab,
+    "https://idp.example.edu/login",
+  );
   expect(human.tabs.removed).toEqual([]);
   expect(human.tabs.snapshot(humanTab) !== undefined).toBe(true);
 });
 test("cold handoffs keep one tab until warm evidence releases the queue", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  const jobIDs = Array.from({ length: 5 }, (_, index) => `job_cold_governor_${index}`);
+  const jobIDs = Array.from(
+    { length: 5 },
+    (_, index) => `job_cold_governor_${index}`,
+  );
   for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
 
   expect(h.tabs.list().length).toBe(1);
   expect(h.tabs.created).toHaveLength(1);
-  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(4);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.tab_id < 0),
+  ).toHaveLength(4);
 
   // Evidence is scoped and release-grade, but cannot exceed the single
   // effectful drive while the existing tab is still active.
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
   expect(h.tabs.list().length).toBe(1);
   expect(h.tabs.created).toHaveLength(1);
-  expect(h.backend.store.activeJobs.filter((job) => job.tab_id < 0)).toHaveLength(4);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.tab_id < 0),
+  ).toHaveLength(4);
 });
 test("keepalive warmth releases only the matching resolver queue", async () => {
   const h = makeHarness();
   const collegeOrigin = "https://onesearch.library.example-college.edu";
   const collegeOpenURL = `${collegeOrigin}/openurl?ctx=college`;
-  const defaultOffer = jobOfferForHosts("job_default_origin_queue", [PROVIDER_HOST]) as {
+  const defaultOffer = jobOfferForHosts("job_default_origin_queue", [
+    PROVIDER_HOST,
+  ]) as {
     payload: Record<string, unknown>;
   };
   defaultOffer.payload["requires_auth"] = true;
-  const uwaOffer = jobOfferForHosts("job_uwa_origin_queue", ["link.springer.com"], collegeOpenURL) as {
+  const uwaOffer = jobOfferForHosts(
+    "job_uwa_origin_queue",
+    ["link.springer.com"],
+    collegeOpenURL,
+  ) as {
     payload: Record<string, unknown>;
   };
   uwaOffer.payload["requires_auth"] = true;
@@ -7446,11 +9876,19 @@ test("keepalive warmth releases only the matching resolver queue", async () => {
   await h.port.inbound(uwaOffer);
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, collegeOrigin));
 
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_default_origin_queue")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_default_origin_queue",
+    ),
+  ).toMatchObject({
     status: "queued",
     tab_id: -1,
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_uwa_origin_queue")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_uwa_origin_queue",
+    ),
+  ).toMatchObject({
     status: "accepted",
     tab_id: 100,
   });
@@ -7458,7 +9896,10 @@ test("keepalive warmth releases only the matching resolver queue", async () => {
 });
 
 test("handoff group reducer trails auth recollapse and stays quiet when collapsed", async () => {
-  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_group_debounce"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
@@ -7482,10 +9923,18 @@ test("handoff group reducer trails auth recollapse and stays quiet when collapse
 
 test("papio classifies its own surfaces and asks only about strays without closing tabs", async () => {
   const h = makeHarness(undefined, { tabGroups: true });
-  let ledger: Record<string, { openedAt: number; url: string; windowId?: number; groupId?: number }> = {
+  let ledger: Record<
+    string,
+    { openedAt: number; url: string; windowId?: number; groupId?: number }
+  > = {
     "300": { openedAt: 1, url: "https://provider.example.org/a" },
     "301": { openedAt: 1, url: "https://provider.example.org/b" },
-    "304": { openedAt: 1, url: "https://provider.example.org/d", groupId: 700, windowId: 1 },
+    "304": {
+      openedAt: 1,
+      url: "https://provider.example.org/d",
+      groupId: 700,
+      windowId: 1,
+    },
     "999": { openedAt: 1, url: "https://provider.example.org/missing" },
   };
   h.deps.tabLedger = {
@@ -7506,10 +9955,20 @@ test("papio classifies its own surfaces and asks only about strays without closi
   h.tabs.seed({ id: 302, url: "https://provider.example.org/c", groupId: 700 });
   // 304: ledgered AND still in papio's group — papio leaves it open for review.
   h.tabs.seed({ id: 304, url: "https://provider.example.org/d", groupId: 700 });
-  h.tabGroups!.live.set(700, { id: 700, collapsed: true, title: "papio", windowId: 1 });
+  h.tabGroups!.live.set(700, {
+    id: 700,
+    collapsed: true,
+    title: "papio",
+    windowId: 1,
+  });
   // 303: the pinned keepalive resolver tab folded into the papio group —
   // papio's own session anchor, never an orphan.
-  h.tabs.seed({ id: 303, url: "https://resolver.example.edu/keepalive", groupId: 700, pinned: true });
+  h.tabs.seed({
+    id: 303,
+    url: "https://resolver.example.edu/keepalive",
+    groupId: 700,
+    pinned: true,
+  });
 
   // The popup card offers ONLY the ambiguous stray, not the group member.
   const status = await h.bridge.orphanTabStatus();
@@ -7538,7 +9997,10 @@ test("papio classifies its own surfaces and asks only about strays without closi
 
 test("created broker tabs are ledgered durably and forgotten once they close", async () => {
   const h = makeHarness();
-  let ledger: Record<string, { openedAt: number; url: string; windowId?: number; groupId?: number }> = {};
+  let ledger: Record<
+    string,
+    { openedAt: number; url: string; windowId?: number; groupId?: number }
+  > = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -7556,7 +10018,10 @@ test("created broker tabs are ledgered durably and forgotten once they close", a
 });
 test("review drops a stale ledger id collision without focusing the foreign tab", async () => {
   const h = makeHarness();
-  let ledger: Record<string, { openedAt: number; url: string; windowId?: number; groupId?: number }> = {
+  let ledger: Record<
+    string,
+    { openedAt: number; url: string; windowId?: number; groupId?: number }
+  > = {
     "300": { openedAt: 1, url: "https://papio.example.edu/old" },
   };
   h.deps.tabLedger = {
@@ -7574,14 +10039,19 @@ test("review drops a stale ledger id collision without focusing the foreign tab"
 
 // Commit B: the browser tells papio when a resolver page changed (so the
 test("close gate leaves an active managed tab open", async () => {
-  const h = makeHarness(undefined, { windows: true, handoffSurface: "work-window" });
+  const h = makeHarness(undefined, {
+    windows: true,
+    handoffSurface: "work-window",
+  });
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_close_gate_active"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const tab = h.tabs.snapshot(tabID);
   if (tab !== undefined) {
     tab.active = true;
-    (h.bridge as unknown as { tabLedgerCache: Record<string, unknown> }).tabLedgerCache = {
+    (
+      h.bridge as unknown as { tabLedgerCache: Record<string, unknown> }
+    ).tabLedgerCache = {
       [String(tabID)]: { openedAt: 1, url: tab.url, windowId: tab.windowId },
     };
   }
@@ -7591,8 +10061,14 @@ test("close gate leaves an active managed tab open", async () => {
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
 });
 test("cancellation removes an inactive ledgered scaffold tab", async () => {
-  const h = makeHarness(undefined, { windows: true, handoffSurface: "work-window" });
-  let ledger: Record<string, { openedAt: number; url: string; windowId?: number; groupId?: number }> = {};
+  const h = makeHarness(undefined, {
+    windows: true,
+    handoffSurface: "work-window",
+  });
+  let ledger: Record<
+    string,
+    { openedAt: number; url: string; windowId?: number; groupId?: number }
+  > = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -7610,24 +10086,42 @@ test("cancellation removes an inactive ledgered scaffold tab", async () => {
 });
 
 test("cancellation leaves current PDF content in papio's surface", async () => {
-  const h = makeHarness(undefined, { windows: true, handoffSurface: "work-window" });
+  const h = makeHarness(undefined, {
+    windows: true,
+    handoffSurface: "work-window",
+  });
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_current_pdf_content"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const tab = h.tabs.snapshot(tabID);
   if (tab !== undefined) {
-    h.tabs.patch(tabID, { active: false, url: "https://provider.example.edu/paper.pdf" });
+    h.tabs.patch(tabID, {
+      active: false,
+      url: "https://provider.example.edu/paper.pdf",
+    });
   }
-  (h.bridge as unknown as { tabLedgerCache: Record<string, unknown> }).tabLedgerCache = {
-    [String(tabID)]: { openedAt: 1, url: "https://provider.example.edu/landing", windowId: tab?.windowId },
+  (
+    h.bridge as unknown as { tabLedgerCache: Record<string, unknown> }
+  ).tabLedgerCache = {
+    [String(tabID)]: {
+      openedAt: 1,
+      url: "https://provider.example.edu/landing",
+      windowId: tab?.windowId,
+    },
   };
   await h.bridge.requestCancel("job_current_pdf_content");
   expect(h.tabs.removed).not.toContain(tabID);
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
 });
 test("cancellation leaves a scaffold tab dragged out of papio's surface", async () => {
-  const h = makeHarness(undefined, { windows: true, handoffSurface: "work-window" });
-  let ledger: Record<string, { openedAt: number; url: string; windowId?: number; groupId?: number }> = {};
+  const h = makeHarness(undefined, {
+    windows: true,
+    handoffSurface: "work-window",
+  });
+  let ledger: Record<
+    string,
+    { openedAt: number; url: string; windowId?: number; groupId?: number }
+  > = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -7638,19 +10132,25 @@ test("cancellation leaves a scaffold tab dragged out of papio's surface", async 
   await h.port.inbound(jobOffer("job_close_dragged"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const tab = h.tabs.snapshot(tabID);
-  if (tab !== undefined) h.tabs.patch(tabID, { active: false, windowId: 999, groupId: undefined });
+  if (tab !== undefined)
+    h.tabs.patch(tabID, { active: false, windowId: 999, groupId: undefined });
   await h.bridge.requestCancel("job_close_dragged");
   expect(h.tabs.removed).not.toContain(tabID);
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
 });
 
 test("cancellation refuses an un-ledgered inactive tab", async () => {
-  const h = makeHarness(undefined, { windows: true, handoffSurface: "work-window" });
+  const h = makeHarness(undefined, {
+    windows: true,
+    handoffSurface: "work-window",
+  });
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_unledgered_refusal"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   h.tabs.patch(tabID, { active: false });
-  (h.bridge as unknown as { tabLedgerCache: Record<string, unknown> }).tabLedgerCache = {};
+  (
+    h.bridge as unknown as { tabLedgerCache: Record<string, unknown> }
+  ).tabLedgerCache = {};
   await h.bridge.requestCancel("job_unledgered_refusal");
   expect(h.tabs.removed).not.toContain(tabID);
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
@@ -7677,7 +10177,8 @@ test("a completed navigation on an untracked tab reaches noteResolverNavigation"
   await h.bridge.start();
 
   const libraryTabID = 555;
-  const libraryURL = "https://onesearch.library.example-college.edu/discovery/search";
+  const libraryURL =
+    "https://onesearch.library.example-college.edu/discovery/search";
   h.tabs.seed({ id: libraryTabID, url: libraryURL });
   await h.tabs.completeNavigation(libraryTabID, libraryURL);
 
@@ -7724,7 +10225,8 @@ test("keepalive manager is notified of a navigation synchronously, before bridge
   } as unknown as KeepaliveManager);
 
   void h.bridge.start();
-  const wakeURL = "https://onesearch.library.example-college.edu/discovery/search";
+  const wakeURL =
+    "https://onesearch.library.example-college.edu/discovery/search";
   h.tabs.seed({ id: 501, url: wakeURL });
   void h.tabs.userNavigate(501, wakeURL);
 
@@ -7809,22 +10311,38 @@ test("fresh evidence for one resolver releases only that resolver's queued hando
   const h = makeHarness();
   const originB = "https://example.primo.exlibrisgroup.com";
   const bOpenURL = `${originB}/openurl?ctx=b`;
-  const offerA = jobOffer("job_evidence_scope_a") as { payload: Record<string, unknown> };
+  const offerA = jobOffer("job_evidence_scope_a") as {
+    payload: Record<string, unknown>;
+  };
   offerA.payload["requires_auth"] = true;
-  const offerB = jobOffer("job_evidence_scope_b", bOpenURL) as { payload: Record<string, unknown> };
+  const offerB = jobOffer("job_evidence_scope_b", bOpenURL) as {
+    payload: Record<string, unknown>;
+  };
   offerB.payload["requires_auth"] = true;
 
   await h.bridge.start();
   await h.port.inbound(offerA);
   await h.port.inbound(offerB);
-  expect(h.backend.store.activeJobs.filter((job) => job.status === "queued")).toHaveLength(2);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.status === "queued"),
+  ).toHaveLength(2);
 
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
 
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_scope_a")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_evidence_scope_a",
+    ),
+  ).toMatchObject({
     status: "accepted",
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_scope_b")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_evidence_scope_b",
+    ),
+  ).toMatchObject({
     status: "queued",
     tab_id: -1,
   });
@@ -7837,15 +10355,23 @@ test("release authority expires with the evidence that granted it", async () => 
   // the rest of the worker's life. Evidence now lives only in the persisted,
   // timestamped map, so it ages out.
   const h = makeHarness();
-  const offer = jobOffer("job_evidence_expiry") as { payload: Record<string, unknown> };
+  const offer = jobOffer("job_evidence_expiry") as {
+    payload: Record<string, unknown>;
+  };
   offer.payload["requires_auth"] = true;
 
   await h.bridge.start();
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
   h.clock.now += 30 * 60_000 + 1;
 
   await h.port.inbound(offer);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_expiry")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_evidence_expiry",
+    ),
+  ).toMatchObject({
     status: "queued",
   });
 });
@@ -7856,7 +10382,9 @@ test("a committed sign-out revokes that origin's release authority immediately",
   // operator had signed out of, until the TTL or the worker expired.
   const h = makeHarness();
   const origin = "https://resolver.example.edu";
-  const offer = jobOffer("job_evidence_revoked") as { payload: Record<string, unknown> };
+  const offer = jobOffer("job_evidence_revoked") as {
+    payload: Record<string, unknown>;
+  };
   offer.payload["requires_auth"] = true;
 
   await h.bridge.start();
@@ -7864,14 +10392,22 @@ test("a committed sign-out revokes that origin's release authority immediately",
   await h.bridge.revokeAuthEvidence(origin);
 
   await h.port.inbound(offer);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_revoked")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_evidence_revoked",
+    ),
+  ).toMatchObject({
     status: "queued",
   });
   expect(h.backend.store.authEvidenceByOrigin?.[origin]).toBeUndefined();
 
   // Signing back in re-grants it, so revocation is not a one-way latch.
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, origin));
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_evidence_revoked")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_evidence_revoked",
+    ),
+  ).toMatchObject({
     status: "accepted",
   });
 });
@@ -7884,12 +10420,18 @@ test("fresh evidence for one resolver cannot be laundered into another's queue b
   const h = makeHarness();
   const originB = "https://onesearch.library.example-college.edu";
   const bOpenURL = `${originB}/openurl?ctx=b`;
-  const institutionalA = jobOffer("job_leak_guard_a") as { payload: Record<string, unknown> };
+  const institutionalA = jobOffer("job_leak_guard_a") as {
+    payload: Record<string, unknown>;
+  };
   institutionalA.payload["requires_auth"] = true;
-  const institutionalB = jobOffer("job_leak_guard_b", bOpenURL) as { payload: Record<string, unknown> };
+  const institutionalB = jobOffer("job_leak_guard_b", bOpenURL) as {
+    payload: Record<string, unknown>;
+  };
   institutionalB.payload["requires_auth"] = true;
   const openAccessURL = "https://oa.example.edu/article/leak-guard";
-  const openAccess = jobOffer("job_leak_guard_oa", openAccessURL) as { payload: Record<string, unknown> };
+  const openAccess = jobOffer("job_leak_guard_oa", openAccessURL) as {
+    payload: Record<string, unknown>;
+  };
   openAccess.payload["requires_auth"] = false;
   await h.bridge.start();
   await h.port.inbound(institutionalA);
@@ -7897,24 +10439,36 @@ test("fresh evidence for one resolver cannot be laundered into another's queue b
   await h.port.inbound(openAccess);
   // The open-access owner must settle before resolver evidence can admit A;
   // otherwise a second handoff would overlap the sole governor effect.
-  const openAccessJob = h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_oa");
+  const openAccessJob = h.backend.store.activeJobs.find(
+    (job) => job.job_id === "job_leak_guard_oa",
+  );
   if (openAccessJob?.tab_id !== undefined && openAccessJob.tab_id >= 0) {
     await h.bridge.parkHandoffForManual(openAccessJob.job_id);
   }
 
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://resolver.example.edu"));
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_a")).toMatchObject({
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_a"),
+  ).toMatchObject({
     status: "accepted",
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_b")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_b"),
+  ).toMatchObject({
     status: "queued",
   });
 
-  const openAccessTabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_oa")?.tab_id ?? -1;
+  const openAccessTabID =
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_oa")
+      ?.tab_id ?? -1;
   const providerURL = `https://${PROVIDER_HOST}/stable/leak-guard`;
   await h.tabs.completeNavigation(openAccessTabID, providerURL);
 
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_b")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_leak_guard_b"),
+  ).toMatchObject({
     status: "queued",
     tab_id: -1,
   });
@@ -7934,10 +10488,20 @@ test("session_evidence throttling is scoped per origin, not global", async () =>
   expect(h.bridge.emitSessionEvidence("warm_verified", originA)).toBe(false);
   expect(h.bridge.emitSessionEvidence("warm_verified", originB)).toBe(false);
 
-  const evidenceFrames = h.frames().filter((frame) => frame.type === "session_evidence");
+  const evidenceFrames = h
+    .frames()
+    .filter((frame) => frame.type === "session_evidence");
   expect(evidenceFrames.map((frame) => frame.payload)).toEqual([
-    { evidence: "warm_verified", origin_hint: originA, at: new Date(h.clock.now).toISOString() },
-    { evidence: "warm_verified", origin_hint: originB, at: new Date(h.clock.now).toISOString() },
+    {
+      evidence: "warm_verified",
+      origin_hint: originA,
+      at: new Date(h.clock.now).toISOString(),
+    },
+    {
+      evidence: "warm_verified",
+      origin_hint: originB,
+      at: new Date(h.clock.now).toISOString(),
+    },
   ]);
 });
 
@@ -7949,17 +10513,36 @@ test("currentSessionEvidence for a job on B is not labelled warm or fresh by A's
   const h = makeHarness({
     ...emptyStore(),
     activeJobs: [
-      { job_id: jobA, tab_id: 100, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: [] },
-      { job_id: jobB, tab_id: 101, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: [] },
+      {
+        job_id: jobA,
+        tab_id: 100,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        provider_hosts: [],
+      },
+      {
+        job_id: jobB,
+        tab_id: 101,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        provider_hosts: [],
+      },
     ],
-    offerURLs: { [jobA]: `${originA}/openurl?ctx=a`, [jobB]: `${originB}/openurl?ctx=b` },
+    offerURLs: {
+      [jobA]: `${originA}/openurl?ctx=a`,
+      [jobB]: `${originB}/openurl?ctx=b`,
+    },
   });
   h.tabs.seed({ id: 100, url: "https://provider.example.edu/article/a.pdf" });
   h.tabs.seed({ id: 101, url: "https://provider.example.edu/article/b.pdf" });
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: ["delivery_context_v1"] }));
 
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, originA, "live_tab"));
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, originA, "live_tab"),
+  );
 
   await h.downloads.onCreated.emit({ id: 1, tabId: 100, state: "in_progress" });
   h.downloads.items.set(1, {
@@ -7983,9 +10566,15 @@ test("currentSessionEvidence for a job on B is not labelled warm or fresh by A's
   });
   await h.downloads.onChanged.emit({ id: 2, state: { current: "complete" } });
 
-  const contexts = h.frames().filter((frame) => frame.type === "delivery_context");
-  expect(contexts.find((frame) => frame.job_id === jobA)?.payload).toMatchObject({ session_evidence: "fresh_auth" });
-  expect(contexts.find((frame) => frame.job_id === jobB)?.payload).toMatchObject({ session_evidence: "none" });
+  const contexts = h
+    .frames()
+    .filter((frame) => frame.type === "delivery_context");
+  expect(
+    contexts.find((frame) => frame.job_id === jobA)?.payload,
+  ).toMatchObject({ session_evidence: "fresh_auth" });
+  expect(
+    contexts.find((frame) => frame.job_id === jobB)?.payload,
+  ).toMatchObject({ session_evidence: "none" });
 });
 
 test("an institutional landing marks its origin dirty, releases and reloads its own origin, and never touches another's", async () => {
@@ -8026,7 +10615,11 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
         provider_hosts: ["link.springer.com"],
       },
     ],
-    offerURLs: { [landingJobID]: OPENURL, [peerJobID]: OPENURL, [otherOriginJobID]: otherOpenURL },
+    offerURLs: {
+      [landingJobID]: OPENURL,
+      [peerJobID]: OPENURL,
+      [otherOriginJobID]: otherOpenURL,
+    },
   });
   h.tabs.seed({ id: landingTabID, url: OPENURL });
   const dirtied: string[] = [];
@@ -8056,7 +10649,11 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
   } as unknown as KeepaliveManager);
 
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu", otherOrigin] }));
+  await h.port.inbound(
+    helloAck({
+      resolver_origins: ["https://resolver.example.edu", otherOrigin],
+    }),
+  );
 
   await h.tabs.completeNavigation(landingTabID, OPENURL);
 
@@ -8071,13 +10668,17 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
   // But papio itself drove this tab past authentication onto a page resolving
   // to a configured origin — first-hand evidence for THAT origin, so its own
   // queued sibling opens immediately, the same as any other release.
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === peerJobID)).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === peerJobID),
+  ).toMatchObject({
     status: "accepted",
   });
   expect(h.tabs.created).toEqual([{ url: OPENURL, active: false }]);
 
   // A different institution's queued handoff is never touched by this.
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === otherOriginJobID)).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === otherOriginJobID),
+  ).toMatchObject({
     status: "queued",
     tab_id: -1,
   });
@@ -8099,16 +10700,37 @@ test("reloadAuthenticationHandoffs reloads only the evidenced origin's tabs, lea
   const h = makeHarness({
     ...emptyStore(),
     activeJobs: [
-      { job_id: jobA, tab_id: tabA, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: [PROVIDER_HOST], access_mode: "delegated" },
-      { job_id: jobB, tab_id: tabB, offered_at: 1, expires_at: 2, status: "accepted", provider_hosts: ["link.springer.com"], access_mode: "delegated" },
+      {
+        job_id: jobA,
+        tab_id: tabA,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+        access_mode: "delegated",
+      },
+      {
+        job_id: jobB,
+        tab_id: tabB,
+        offered_at: 1,
+        expires_at: 2,
+        status: "accepted",
+        provider_hosts: ["link.springer.com"],
+        access_mode: "delegated",
+      },
     ],
-    offerURLs: { [jobA]: `${originA}/openurl?ctx=a`, [jobB]: `${originB}/openurl?ctx=b` },
+    offerURLs: {
+      [jobA]: `${originA}/openurl?ctx=a`,
+      [jobB]: `${originB}/openurl?ctx=b`,
+    },
   });
   h.tabs.seed({ id: tabA, url: idpA });
   h.tabs.seed({ id: tabB, url: idpB });
   await h.bridge.start();
 
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, originA, "live_tab"));
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, originA, "live_tab"),
+  );
 
   expect(h.tabs.reloaded).toEqual([tabA]);
 });
@@ -8116,17 +10738,28 @@ test("reloadAuthenticationHandoffs reloads only the evidenced origin's tabs, lea
 test("requestSessionSignIn rejects a non-configured origin once hello_ack has landed, and accepts a configured one", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://resolver.example.edu"] }),
+  );
 
-  await expect(h.bridge.requestSessionSignIn("https://unknown.example-college.edu")).resolves.toEqual({
+  await expect(
+    h.bridge.requestSessionSignIn("https://unknown.example-college.edu"),
+  ).resolves.toEqual({
     ok: false,
-    error: { code: "resolver_unavailable", message: "This institution is not currently configured" },
+    error: {
+      code: "resolver_unavailable",
+      message: "This institution is not currently configured",
+    },
   });
   expect(h.tabs.created).toEqual([]);
 
-  const reply = await h.bridge.requestSessionSignIn("https://resolver.example.edu");
+  const reply = await h.bridge.requestSessionSignIn(
+    "https://resolver.example.edu",
+  );
   expect(reply).toEqual({ ok: true, opened: true });
-  expect(h.tabs.created).toEqual([{ url: "https://resolver.example.edu", active: true }]);
+  expect(h.tabs.created).toEqual([
+    { url: "https://resolver.example.edu", active: true },
+  ]);
 });
 
 test("the 45-second forced-release fallback still opens a queued handoff with zero authentication evidence", async () => {
@@ -8145,7 +10778,11 @@ test("the 45-second forced-release fallback still opens a queued handoff with ze
   internals.releaseHandoffDrive("job_forced_release_active");
   await fallback?.fn();
 
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_forced_release_queued")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_forced_release_queued",
+    ),
+  ).toMatchObject({
     status: "accepted",
   });
   expect(h.tabs.created).toEqual([
@@ -8156,9 +10793,13 @@ test("the 45-second forced-release fallback still opens a queued handoff with ze
 
 test("an explicit queued open keeps its exact forced job ahead of unrelated queued work", async () => {
   const h = makeHarness();
-  h.backend.store.challengeCooldowns = { "www.jstor.org": h.clock.now + 600_000 };
+  h.backend.store.challengeCooldowns = {
+    "www.jstor.org": h.clock.now + 600_000,
+  };
   await h.bridge.start();
-  await h.port.inbound(jobOfferForHosts("job_forced_priority_active_a", ["nature.com"]));
+  await h.port.inbound(
+    jobOfferForHosts("job_forced_priority_active_a", ["nature.com"]),
+  );
 
   const jobA = "job_forced_priority_a";
   const jobB = "job_forced_priority_b";
@@ -8180,20 +10821,26 @@ test("an explicit queued open keeps its exact forced job ahead of unrelated queu
   h.backend.store.challengeCooldowns = {};
   // Explicit force may bypass that temporary block, but it must never
   // substitute B or C.
-  await expect(h.bridge.openHandoff(jobA)).resolves.toEqual({ ok: true, opened: true });
-  expect(h.tabs.created.map((tab) => tab.url)).toEqual([
-    OPENURL,
-    originA,
-  ]);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobA)).toMatchObject({
+  await expect(h.bridge.openHandoff(jobA)).resolves.toEqual({
+    ok: true,
+    opened: true,
+  });
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([OPENURL, originA]);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === jobA),
+  ).toMatchObject({
     status: "accepted",
     tab_id: expect.any(Number),
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobB)).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === jobB),
+  ).toMatchObject({
     status: "queued",
     tab_id: -1,
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobC)).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === jobC),
+  ).toMatchObject({
     status: "queued",
     tab_id: -1,
   });
@@ -8212,7 +10859,9 @@ test("a hello_ack immediately notifies the keepalive manager of configured-origi
   await h.bridge.start();
   expect(notifications).toEqual([]);
 
-  await h.port.inbound(helloAck({ resolver_origins: ["https://resolver.example.edu"] }));
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://resolver.example.edu"] }),
+  );
 
   expect(notifications).toEqual([0]);
 });
@@ -8224,7 +10873,10 @@ test("a hello_ack immediately notifies the keepalive manager of configured-origi
 const FED_ENTITY_ID = "https://idp.example.edu/entity";
 const FED_LOGIN_TEMPLATE =
   "https://login.idp.example.edu/Shibboleth.sso/DS?entityID={entityID}&target=https://login.idp.example.edu/home";
-const FED_LOGIN_URL = FED_LOGIN_TEMPLATE.replace("{entityID}", encodeURIComponent(FED_ENTITY_ID));
+const FED_LOGIN_URL = FED_LOGIN_TEMPLATE.replace(
+  "{entityID}",
+  encodeURIComponent(FED_ENTITY_ID),
+);
 const FED_IDP_ORIGIN = new URL(FED_LOGIN_URL).origin;
 let FED_CLAIM_KEY = "";
 const FED_PROVIDER_LOGIN_URL = `https://${PROVIDER_HOST}/login-wall`;
@@ -8254,21 +10906,32 @@ const FED_LOGIN_VERDICT: PageVerdict = {
   evidence: [],
 };
 
-function fedLoginOffer(jobID: string, entityID: string = FED_ENTITY_ID, openurl: string = OPENURL): unknown {
-  const offer = jobOffer(jobID, openurl) as { payload: Record<string, unknown> };
+function fedLoginOffer(
+  jobID: string,
+  entityID: string = FED_ENTITY_ID,
+  openurl: string = OPENURL,
+): unknown {
+  const offer = jobOffer(jobID, openurl) as {
+    payload: Record<string, unknown>;
+  };
   offer.payload["login_entity_id"] = entityID;
   return offer;
 }
 
 function makeFedLoginHarness(seed?: StoreShape): Harness {
   const h = makeHarness(
-    seed ?? { ...emptyStore(), authEvidenceByOrigin: { [RESOLVER_ORIGIN]: 1_700_000_000_000 } },
+    seed ?? {
+      ...emptyStore(),
+      authEvidenceByOrigin: { [RESOLVER_ORIGIN]: 1_700_000_000_000 },
+    },
   );
   h.deps.adapterSpecs.push(FED_LOGIN_SPEC);
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === planExecution) return plannerResult(injection, FED_LOGIN_VERDICT);
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution)
+      return plannerResult(injection, FED_LOGIN_VERDICT);
     return [];
   };
   return h;
@@ -8283,14 +10946,21 @@ async function landOnFedProviderWall(h: Harness, tabID: number): Promise<void> {
 /** Offers three jobs for the same institution with one effectful drive.
  * job_fed_a owns the live provider-login claim; the two siblings are durable
  * tabless waiting parks until that exact claim retires. */
-async function primeFedLoginTriad(): Promise<{ h: Harness; tabA: number; tabB: number; tabC: number }> {
+async function primeFedLoginTriad(): Promise<{
+  h: Harness;
+  tabA: number;
+  tabB: number;
+  tabC: number;
+}> {
   await ensureFedClaimKeys();
   const h = makeFedLoginHarness();
   await h.bridge.start();
   for (const jobID of ["job_fed_a", "job_fed_b", "job_fed_c"]) {
     await h.port.inbound(fedLoginOffer(jobID));
   }
-  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_a")?.tab_id ?? -1;
+  const tabA =
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_a")?.tab_id ??
+    -1;
   await landOnFedProviderWall(h, tabA);
 
   // With one global effect slot the siblings cannot materialize tabs while A
@@ -8335,7 +11005,9 @@ test("a re-offer reconciles a login wall that completed while the worker was sto
   );
   await expect(opening).resolves.toEqual({ ok: true, opened: true });
   const tabID = first.backend.store.activeJobs[0]?.tab_id ?? -1;
-  expect(first.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.phase).toBe("engaging");
+  expect(first.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.phase).toBe(
+    "engaging",
+  );
 
   const seed = JSON.parse(JSON.stringify(first.backend.store)) as StoreShape;
   const restarted = makeFedLoginHarness(seed);
@@ -8344,12 +11016,17 @@ test("a re-offer reconciles a login wall that completed while the worker was sto
   await restarted.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
   await restarted.port.inbound(offer);
 
-  expect(restarted.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]).toEqual({
-    jobID,
+  expect(restarted.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]).toEqual(
+    {
+      jobID,
+      tabID,
+      phase: "auth",
+    },
+  );
+  expect(restarted.tabs.navigations).toContainEqual({
     tabID,
-    phase: "auth",
+    url: FED_LOGIN_URL,
   });
-  expect(restarted.tabs.navigations).toContainEqual({ tabID, url: FED_LOGIN_URL });
 });
 
 test("cold same-institution engagements share one claim before any login tab exists", async () => {
@@ -8376,7 +11053,9 @@ test("cold same-institution engagements share one claim before any login tab exi
     },
   });
   expect(h.tabs.created).toEqual([]);
-  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toHaveLength(1);
 
   await h.port.inbound(
     nativeResult("handoff_link_result", {
@@ -8386,7 +11065,9 @@ test("cold same-institution engagements share one claim before any login tab exi
     }),
   );
   await expect(firstOpening).resolves.toEqual({ ok: true, opened: true });
-  const firstTabID = h.backend.store.activeJobs.find((job) => job.job_id === firstID)?.tab_id ?? -1;
+  const firstTabID =
+    h.backend.store.activeJobs.find((job) => job.job_id === firstID)?.tab_id ??
+    -1;
   expect(h.backend.store.federatedLoginOwners).toEqual({
     [FED_CLAIM_KEY]: { jobID: firstID, tabID: firstTabID, phase: "engaging" },
   });
@@ -8397,10 +11078,17 @@ test("cold same-institution engagements share one claim before any login tab exi
   expect(h.backend.store.federatedLoginOwners).toEqual({
     [FED_CLAIM_KEY]: { jobID: firstID, tabID: firstTabID, phase: "auth" },
   });
-  await expect(h.bridge.openHandoff(secondID)).resolves.toEqual({ ok: true, opened: true });
+  await expect(h.bridge.openHandoff(secondID)).resolves.toEqual({
+    ok: true,
+    opened: true,
+  });
   expect(h.tabs.created).toHaveLength(1);
-  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(1);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === secondID)).toMatchObject({
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toHaveLength(1);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === secondID),
+  ).toMatchObject({
     tab_id: -1,
     waiting_for_session: true,
     waiting_for_session_key: FED_CLAIM_KEY,
@@ -8410,7 +11098,9 @@ test("cold same-institution engagements share one claim before any login tab exi
   // Closing the owning tab retires the claim without auto-opening its waiter.
   await h.tabs.userClose(firstTabID);
   expect(h.backend.store.federatedLoginOwners).toEqual({});
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === secondID)).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === secondID),
+  ).toMatchObject({
     tab_id: -1,
     waiting_for_session: false,
     engagement_required: true,
@@ -8421,12 +11111,14 @@ test("cold same-institution engagements share one claim before any login tab exi
   for (
     let attempt = 0;
     attempt < 20 &&
-    h.frames().filter((frame) => frame.type === "handoff_link_request").length < 2;
+    h.frames().filter((frame) => frame.type === "handoff_link_request").length <
+      2;
     attempt += 1
   ) {
     await Promise.resolve();
   }
-  const secondRequest = h.frames()
+  const secondRequest = h
+    .frames()
     .filter((frame) => frame.type === "handoff_link_request")
     .at(-1);
   expect(secondRequest?.payload["job_id"]).toBe(secondID);
@@ -8439,9 +11131,10 @@ test("cold same-institution engagements share one claim before any login tab exi
   );
   await expect(secondOpening).resolves.toEqual({ ok: true, opened: true });
   expect(h.tabs.created).toHaveLength(2);
-  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toHaveLength(2);
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toHaveLength(2);
 });
-
 
 test("a sibling focus failure retains a live institutional claim", async () => {
   await ensureFedClaimKeys();
@@ -8481,24 +11174,32 @@ test("a sibling focus failure retains a live institutional claim", async () => {
   h.tabs.seed({ id: 100, url: FED_LOGIN_URL, active: false });
   const updateTab = h.tabs.update.bind(h.tabs);
   h.tabs.update = async (tabID, properties) => {
-    if (tabID === 100 && properties.active === true) throw new Error("focus denied");
+    if (tabID === 100 && properties.active === true)
+      throw new Error("focus denied");
     return updateTab(tabID, properties);
   };
 
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
-  await expect(h.bridge.openHandoff(waiterID)).resolves.toEqual({ ok: true, opened: true });
+  await expect(h.bridge.openHandoff(waiterID)).resolves.toEqual({
+    ok: true,
+    opened: true,
+  });
 
   expect(h.backend.store.federatedLoginOwners).toEqual({
     [FED_CLAIM_KEY]: { jobID: ownerID, tabID: 100, phase: "auth" },
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === waiterID)).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === waiterID),
+  ).toMatchObject({
     tab_id: -1,
     waiting_for_session: true,
     waiting_for_session_key: FED_CLAIM_KEY,
   });
   expect(h.tabs.created).toEqual([]);
-  expect(h.frames().filter((frame) => frame.type === "handoff_link_request")).toEqual([]);
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toEqual([]);
 });
 
 test("a sibling click rechecks an owner that retires while focus settles", async () => {
@@ -8580,7 +11281,9 @@ test("a sibling click rechecks an owner that retires while focus settles", async
     }),
   );
   await expect(opening).resolves.toEqual({ ok: true, opened: true });
-  expect(h.tabs.created).toEqual([{ url: FED_PROVIDER_LOGIN_URL, active: true }]);
+  expect(h.tabs.created).toEqual([
+    { url: FED_PROVIDER_LOGIN_URL, active: true },
+  ]);
 });
 
 test("one login tab per institution: two siblings park in waiting_for_session instead of opening their own IdP tab", async () => {
@@ -8619,8 +11322,14 @@ test("waiting siblings stay parked without gaining an IdP tab over time", async 
   h.clock.now += 3_600_000;
 
   expect(h.timers.filter((timer) => timer.ms === 600_000)).toHaveLength(0);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")?.waiting_for_session).toBe(true);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")?.waiting_for_session).toBe(true);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")
+      ?.waiting_for_session,
+  ).toBe(true);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")
+      ?.waiting_for_session,
+  ).toBe(true);
   expect(h.tabs.navigations).toEqual(navigations);
 });
 test("federated claim storage is opaque and one owner supplies the only sign-in badge blocker", async () => {
@@ -8631,15 +11340,21 @@ test("federated claim storage is opaque and one owner supplies the only sign-in 
   h.backend.store.connectionStatus = "connected";
   await h.bridge.syncConnectionBadge("connected");
   expect(h.action.texts.at(-1)).toBe("1");
-  expect(h.action.titles.at(-1)).toBe("papio: 1 paper waiting on your institution sign-in");
+  expect(h.action.titles.at(-1)).toBe(
+    "papio: 1 paper waiting on your institution sign-in",
+  );
 });
 
 test("startup drops legacy raw claim keys and resumes their waiters ownerlessly", async () => {
   const { h, tabA } = await primeFedLoginTriad();
   const legacyKey = JSON.stringify([FED_IDP_ORIGIN, FED_ENTITY_ID]);
   const seed = JSON.parse(JSON.stringify(h.backend.store)) as StoreShape;
-  seed.federatedLoginOwners = { [legacyKey]: { jobID: "job_fed_a", tabID: tabA, phase: "auth" } };
-  const ownerJob = seed.activeJobs.find((candidate) => candidate.job_id === "job_fed_a");
+  seed.federatedLoginOwners = {
+    [legacyKey]: { jobID: "job_fed_a", tabID: tabA, phase: "auth" },
+  };
+  const ownerJob = seed.activeJobs.find(
+    (candidate) => candidate.job_id === "job_fed_a",
+  );
   if (ownerJob !== undefined) ownerJob.institution_claim_key = legacyKey;
   for (const jobID of ["job_fed_b", "job_fed_c"]) {
     const job = seed.activeJobs.find((candidate) => candidate.job_id === jobID);
@@ -8649,10 +11364,16 @@ test("startup drops legacy raw claim keys and resumes their waiters ownerlessly"
   restarted.tabs.seed({ id: tabA, url: FED_LOGIN_URL });
   await restarted.bridge.start();
   expect(restarted.backend.store.federatedLoginOwners).toEqual({});
-  expect(restarted.backend.store.activeJobs.filter((job) => job.waiting_for_session === true)).toHaveLength(0);
+  expect(
+    restarted.backend.store.activeJobs.filter(
+      (job) => job.waiting_for_session === true,
+    ),
+  ).toHaveLength(0);
   expect(
     restarted.backend.store.activeJobs.every(
-      (job) => job.institution_claim_key === undefined || /^v2:[0-9a-f]{64}$/.test(job.institution_claim_key),
+      (job) =>
+        job.institution_claim_key === undefined ||
+        /^v2:[0-9a-f]{64}$/.test(job.institution_claim_key),
     ),
   ).toBe(true);
   const persisted = JSON.stringify(restarted.backend.store);
@@ -8663,13 +11384,16 @@ test("startup drops legacy raw claim keys and resumes their waiters ownerlessly"
     [FED_CLAIM_KEY]: { jobID: "job_fed_a", tabID: tabA, phase: "auth" },
   });
   expect(
-    restarted.backend.store.activeJobs.find((job) => job.job_id === "job_fed_a")?.institution_claim_key,
+    restarted.backend.store.activeJobs.find((job) => job.job_id === "job_fed_a")
+      ?.institution_claim_key,
   ).toBe(FED_CLAIM_KEY);
 });
 
 test("repeated decisive evidence events cost zero navigations for a waiter whose claim owner is still live", async () => {
   const { h, tabA } = await primeFedLoginTriad();
-  const originalDeadline = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b")?.waiting_deadline;
+  const originalDeadline = h.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_fed_b",
+  )?.waiting_deadline;
   expect(originalDeadline).toBeDefined();
   h.tabs.navigations.splice(0);
   const createdBefore = h.tabs.created.length;
@@ -8681,7 +11405,9 @@ test("repeated decisive evidence events cost zero navigations for a waiter whose
   // may resume job_fed_b or job_fed_c: resuming would only re-park them a
   // moment later, at the cost of a real navigation and a governor slot.
   for (let i = 0; i < 3; i += 1) {
-    await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
+    await h.bridge.recordFreshSessionEvidence(
+      freshEvidence(h, RESOLVER_ORIGIN),
+    );
   }
 
   expect(h.tabs.navigations).toEqual([]);
@@ -8703,9 +11429,14 @@ test("the claim owner leaving the IdP resumes its waiters exactly once, through 
   const { h, tabA } = await primeFedLoginTriad();
   // Three prior evidence events, all no-ops per the test above.
   for (let i = 0; i < 3; i += 1) {
-    await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
+    await h.bridge.recordFreshSessionEvidence(
+      freshEvidence(h, RESOLVER_ORIGIN),
+    );
   }
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b")?.waiting_for_session).toBe(true);
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b")
+      ?.waiting_for_session,
+  ).toBe(true);
   h.tabs.navigations.splice(0);
 
   // job_fed_a finally leaves the IdP and lands back on the provider.
@@ -8731,13 +11462,14 @@ test("the claim owner leaving the IdP resumes its waiters exactly once, through 
   // until A's existing drive releases.
 });
 
-
 test("re-parking a resumed waiter keeps its original waiting overlay hint", async () => {
   const h = makeFedLoginHarness();
   await h.bridge.start();
   await h.port.inbound(fedLoginOffer("job_redeadline_a"));
   await h.port.inbound(fedLoginOffer("job_redeadline_b"));
-  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_a")?.tab_id ?? -1;
+  const tabA =
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_a")
+      ?.tab_id ?? -1;
   await landOnFedProviderWall(h, tabA); // owns the claim
 
   const originalDeadline = h.clock.now + 600_000;
@@ -8758,9 +11490,14 @@ test("re-parking a resumed waiter keeps its original waiting overlay hint", asyn
 
   // Owner retirement resumes B sequentially into the only available slot.
   await h.tabs.userClose(tabA);
-  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")?.tab_id ?? -1;
+  const tabB =
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")
+      ?.tab_id ?? -1;
   expect(tabB).toBeGreaterThanOrEqual(0);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")?.waiting_for_session).toBe(false);
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b")
+      ?.waiting_for_session,
+  ).toBe(false);
 
   // A new claim owner appears before B reaches the provider wall, so B parks
   // again without changing its original display deadline.
@@ -8769,7 +11506,9 @@ test("re-parking a resumed waiter keeps its original waiting overlay hint", asyn
     [FED_CLAIM_KEY]: { jobID: "job_redeadline_c", tabID: -1, phase: "auth" },
   };
   await landOnFedProviderWall(h, tabB);
-  const bReparked = h.backend.store.activeJobs.find((j) => j.job_id === "job_redeadline_b");
+  const bReparked = h.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_redeadline_b",
+  );
   expect(bReparked?.waiting_for_session).toBe(true);
   expect(bReparked?.waiting_for_session_key).toBe(FED_CLAIM_KEY);
   expect(bReparked?.waiting_deadline).toBe(originalDeadline);
@@ -8779,7 +11518,9 @@ test("fresh session evidence for a different institution resumes no waiting_for_
   const { h } = await primeFedLoginTriad();
   h.tabs.navigations.splice(0);
 
-  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, "https://other-library.example.edu"));
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://other-library.example.edu"),
+  );
 
   expect(h.tabs.navigations).toEqual([]);
   const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
@@ -8798,8 +11539,14 @@ test("fresh session evidence resumes ownerless waiting siblings", async () => {
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
 
   expect(h.tabs.navigations).toHaveLength(0);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")?.waiting_for_session).toBe(false);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")?.waiting_for_session).toBe(false);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")
+      ?.waiting_for_session,
+  ).toBe(false);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")
+      ?.waiting_for_session,
+  ).toBe(false);
 });
 
 test("two institutions sharing a federated-login (DS) host never collide: distinct claim keys, and evidence for one never resumes the other's waiter", async () => {
@@ -8815,35 +11562,58 @@ test("two institutions sharing a federated-login (DS) host never collide: distin
 
   // Institution A owns the only effectful drive.
   await h.port.inbound(fedLoginOffer("job_x_a1", FED_ENTITY_ID, OPENURL));
-  const tabA1 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a1")?.tab_id ?? -1;
+  const tabA1 =
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_x_a1")?.tab_id ??
+    -1;
   await landOnFedProviderWall(h, tabA1);
-  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe("job_x_a1");
+  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe(
+    "job_x_a1",
+  );
 
   // Institution B queues behind A; evidence for A must not launder into B.
   await h.port.inbound(fedLoginOffer("job_x_b1", FED_ENTITY_ID_B, OPENURL_B));
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id).toBe(-1);
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id,
+  ).toBe(-1);
   h.tabs.navigations.splice(0);
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
   expect(h.tabs.navigations).toEqual([]);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id).toBe(-1);
-  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY_B]).toBeUndefined();
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id,
+  ).toBe(-1);
+  expect(
+    h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY_B],
+  ).toBeUndefined();
 
   // Retire A, then B claims its own institution sequentially.
   await h.tabs.userClose(tabA1);
-  const tabB1 = h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id ?? -1;
+  const tabB1 =
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.tab_id ??
+    -1;
   expect(tabB1).toBeGreaterThanOrEqual(0);
   await landOnFedProviderWall(h, tabB1);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")?.waiting_for_session).toBeUndefined();
-  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY_B]?.jobID).toBe("job_x_b1");
-  expect(Object.keys(h.backend.store.federatedLoginOwners ?? {})).toEqual([FED_CLAIM_KEY_B]);
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b1")
+      ?.waiting_for_session,
+  ).toBeUndefined();
+  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY_B]?.jobID).toBe(
+    "job_x_b1",
+  );
+  expect(Object.keys(h.backend.store.federatedLoginOwners ?? {})).toEqual([
+    FED_CLAIM_KEY_B,
+  ]);
 
   // A second B job remains queued behind B; A evidence still cannot resume it.
   await h.port.inbound(fedLoginOffer("job_x_b2", FED_ENTITY_ID_B, OPENURL_B));
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id).toBe(-1);
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id,
+  ).toBe(-1);
   h.tabs.navigations.splice(0);
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
   expect(h.tabs.navigations).toEqual([]);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id).toBe(-1);
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_x_b2")?.tab_id,
+  ).toBe(-1);
 });
 
 test("the federated-login registry clears when the owning tab closes, so the next login attempt navigates normally", async () => {
@@ -8852,7 +11622,9 @@ test("the federated-login registry clears when the owning tab closes, so the nex
   await h.port.inbound(fedLoginOffer("job_fed_close_a"));
   const tabA = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   await landOnFedProviderWall(h, tabA);
-  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe("job_fed_close_a");
+  expect(h.backend.store.federatedLoginOwners?.[FED_CLAIM_KEY]?.jobID).toBe(
+    "job_fed_close_a",
+  );
 
   // The tab at the login page closes (operator gives up, browser reclaims it —
   // the mechanism does not care which).
@@ -8863,12 +11635,19 @@ test("the federated-login registry clears when the owning tab closes, so the nex
   // hitting the same login wall, navigates straight to the IdP: nothing is
   // left to defer to.
   await h.port.inbound(fedLoginOffer("job_fed_close_b"));
-  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_close_b")?.tab_id ?? -1;
+  const tabB =
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_close_b")
+      ?.tab_id ?? -1;
   expect(tabB).toBeGreaterThanOrEqual(0);
   await landOnFedProviderWall(h, tabB);
 
-  expect(h.tabs.navigations).toContainEqual({ tabID: tabB, url: FED_LOGIN_URL });
-  const b = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_close_b");
+  expect(h.tabs.navigations).toContainEqual({
+    tabID: tabB,
+    url: FED_LOGIN_URL,
+  });
+  const b = h.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_fed_close_b",
+  );
   expect(b?.waiting_for_session).toBeUndefined();
   expect(h.backend.store.federatedLoginOwners).toEqual({
     [FED_CLAIM_KEY]: { jobID: "job_fed_close_b", tabID: tabB, phase: "auth" },
@@ -8882,12 +11661,16 @@ test("a service-worker restart with a dead claim owner requeues its waiters inst
   // onTabRemoved can never observe directly (MV3 tears the worker down
   // without firing it for tabs that close while the browser itself stays
   // open). job_fed_b and job_fed_c's tabs DO survive.
-  const restarted = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  const restarted = makeHarness(
+    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+  );
   restarted.deps.adapterSpecs.push(FED_LOGIN_SPEC);
   restarted.deps.permissions.contains = async () => true;
   restarted.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
-    if (injection.func === planExecution) return plannerResult(injection, FED_LOGIN_VERDICT);
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution)
+      return plannerResult(injection, FED_LOGIN_VERDICT);
     return [];
   };
   // The siblings are tabless waiting parks; startup must resume only the FIFO
@@ -8901,23 +11684,33 @@ test("a service-worker restart with a dead claim owner requeues its waiters inst
   // job_fed_a's dead tab reconciles like any other pre-download job whose
   // tab vanished: back to an ordinary queued handoff, park markers cleared —
   // never left stale.
-  const a = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_fed_a");
-  expect(a).toMatchObject({ status: "queued", tab_id: -1, waiting_for_session: false, parked_with_tab: false });
+  const a = restarted.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_fed_a",
+  );
+  expect(a).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+    waiting_for_session: false,
+    parked_with_tab: false,
+  });
   expect(a?.waiting_for_session_key).toBeUndefined();
 
   // Its now-dead claim retired at startup (reconcileFederatedLoginOwners),
   // which itself resumed every waiter of that exact claim — never left
   // ownerless.
   expect(restarted.backend.store.federatedLoginOwners ?? {}).toEqual({});
-  const b = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_fed_b");
-  const c = restarted.backend.store.activeJobs.find((j) => j.job_id === "job_fed_c");
+  const b = restarted.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_fed_b",
+  );
+  const c = restarted.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_fed_c",
+  );
   expect(b?.waiting_for_session).toBe(false);
   expect(c?.waiting_for_session).toBe(false);
   expect(restarted.tabs.created.some((tab) => tab.url === OPENURL)).toBe(true);
   expect(restartedInternals.handoffDrives.size).toBe(1);
   expect([...restartedInternals.handoffDrives.keys()]).toEqual(["job_fed_b"]);
 });
-
 
 test("the owner completing its own login resumes waiting siblings even when institution evidence is already warm", async () => {
   const h = makeFedLoginHarness({
@@ -8926,17 +11719,27 @@ test("the owner completing its own login resumes waiting siblings even when inst
     resolverOrigins: [RESOLVER_ORIGIN],
   });
   await h.bridge.start();
-  const offerA = fedLoginOffer("job_fed_owner_a") as { payload: Record<string, unknown> };
+  const offerA = fedLoginOffer("job_fed_owner_a") as {
+    payload: Record<string, unknown>;
+  };
   offerA.payload["requires_auth"] = true;
-  const offerB = fedLoginOffer("job_fed_owner_b") as { payload: Record<string, unknown> };
+  const offerB = fedLoginOffer("job_fed_owner_b") as {
+    payload: Record<string, unknown>;
+  };
   offerB.payload["requires_auth"] = true;
   await h.port.inbound(offerA);
   await h.port.inbound(offerB);
-  const tabA = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_a")?.tab_id ?? -1;
-  const tabB = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")?.tab_id ?? -1;
+  const tabA =
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_a")
+      ?.tab_id ?? -1;
+  const tabB =
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")
+      ?.tab_id ?? -1;
   expect(tabB).toBe(-1);
   await landOnFedProviderWall(h, tabA);
-  const bBefore = h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b");
+  const bBefore = h.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_fed_owner_b",
+  );
   if (bBefore !== undefined) {
     Object.assign(bBefore, {
       status: "auth_pending",
@@ -8952,7 +11755,10 @@ test("the owner completing its own login resumes waiting siblings even when inst
   // now reports its own follow-up navigation landing there — Chrome's real
   // onUpdated firing after the programmatic tabs.update papio issued.
   await h.tabs.completeNavigation(tabA, FED_LOGIN_URL);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_a")?.status).toBe("auth_pending");
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_a")
+      ?.status,
+  ).toBe("auth_pending");
 
   h.tabs.navigations.splice(0);
   // job_fed_a completes sign-in and lands back on the provider. No
@@ -8963,8 +11769,13 @@ test("the owner completing its own login resumes waiting siblings even when inst
   h.tabs.seed({ id: tabA, url: returnURL });
   await h.tabs.completeNavigation(tabA, returnURL);
 
-  expect(h.tabs.navigations.some((navigation) => navigation.url === OPENURL)).toBe(true);
-  expect(h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")?.waiting_for_session).toBe(false);
+  expect(
+    h.tabs.navigations.some((navigation) => navigation.url === OPENURL),
+  ).toBe(true);
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_fed_owner_b")
+      ?.waiting_for_session,
+  ).toBe(false);
 });
 test("removing a claim owner job frees its waiting siblings", async () => {
   const { h } = await primeFedLoginTriad();
@@ -8977,23 +11788,37 @@ test("removing a claim owner job frees its waiting siblings", async () => {
 
   expect(h.backend.store.federatedLoginOwners).toEqual({});
   expect(h.tabs.created.some((tab) => tab.url === OPENURL)).toBe(true);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")?.waiting_for_session).toBe(false);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")?.waiting_for_session).toBe(false);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_b")
+      ?.waiting_for_session,
+  ).toBe(false);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_fed_c")
+      ?.waiting_for_session,
+  ).toBe(false);
 });
 
 test("a challenge-parked handoff stays parked through fresh session evidence for its own institution (scope guard)", async () => {
   let challenge = true;
-  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { [RESOLVER_ORIGIN]: 1_700_000_000_000 } });
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { [RESOLVER_ORIGIN]: 1_700_000_000_000 },
+  });
   useUnknownProviderClassifier(h, () => challenge);
   const tabID = await classifyProviderUnknown(h, "job_challenge_evidence");
 
-  expect(h.backend.store.activeJobs[0]).toMatchObject({ challenge_blocked: true, parked_with_tab: true });
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    challenge_blocked: true,
+    parked_with_tab: true,
+  });
   expect(h.backend.store.activeJobs[0]?.waiting_for_session).toBeUndefined();
   h.tabs.navigations.splice(0);
 
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, RESOLVER_ORIGIN));
 
-  const job = h.backend.store.activeJobs.find((j) => j.job_id === "job_challenge_evidence");
+  const job = h.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_challenge_evidence",
+  );
   expect(job?.challenge_blocked).toBe(true);
   expect(job?.parked_with_tab).toBe(true);
   expect(job?.waiting_for_session).toBeUndefined();
@@ -9006,10 +11831,18 @@ test("papio.pageBulk.grabStatus pulls a structured durable result", async () => 
   const urls = pageBulkTestURLs;
   const sender = { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } };
   await h.bridge.start();
-  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, features: ["pdf_grab_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
   const replyPromise: Promise<unknown> = handleInboxRuntimeMessage(
     h.bridge,
-    { type: "papio.pageBulk.grabStatus", request: { grab_id: "grab-status-0001" } },
+    {
+      type: "papio.pageBulk.grabStatus",
+      request: { grab_id: "grab-status-0001" },
+    },
     sender,
     urls,
   );
@@ -9053,9 +11886,17 @@ test("runtime dispatcher rejection always sends a structured connection_lost rep
 });
 
 test("runtime message registry stays equal to the handler type chain", () => {
-  const source = readFileSync(new URL("../src/background.ts", import.meta.url), "utf8");
-  const handlerStart = source.indexOf("export async function handleInboxRuntimeMessage");
-  const dispatcherStart = source.indexOf("chrome.runtime.onMessage.addListener", handlerStart);
+  const source = readFileSync(
+    new URL("../src/background.ts", import.meta.url),
+    "utf8",
+  );
+  const handlerStart = source.indexOf(
+    "export async function handleInboxRuntimeMessage",
+  );
+  const dispatcherStart = source.indexOf(
+    "chrome.runtime.onMessage.addListener",
+    handlerStart,
+  );
   expect(handlerStart).toBeGreaterThanOrEqual(0);
   expect(dispatcherStart).toBeGreaterThan(handlerStart);
   const handlerSource = source.slice(handlerStart, dispatcherStart);
@@ -9086,8 +11927,12 @@ test("Firefox 128 suppresses page_capture transmission until consent", async () 
   const h = makeHarness(undefined, { firefox: true, captureConsent: false });
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
-  expect(await h.bridge.sendPageCapture(await pageCapturePayload())).toBe(false);
-  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(0);
+  expect(await h.bridge.sendPageCapture(await pageCapturePayload())).toBe(
+    false,
+  );
+  expect(
+    h.frames().filter((frame) => frame.type === "page_capture"),
+  ).toHaveLength(0);
 });
 
 test("Firefox 128 transmits page_capture after stored consent", async () => {
@@ -9095,7 +11940,9 @@ test("Firefox 128 transmits page_capture after stored consent", async () => {
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
   expect(await h.bridge.sendPageCapture(await pageCapturePayload())).toBe(true);
-  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "page_capture"),
+  ).toHaveLength(1);
 });
 
 test("Chrome keeps page_capture transmission always on", async () => {
@@ -9103,7 +11950,9 @@ test("Chrome keeps page_capture transmission always on", async () => {
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
   expect(await h.bridge.sendPageCapture(await pageCapturePayload())).toBe(true);
-  expect(h.frames().filter((frame) => frame.type === "page_capture")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "page_capture"),
+  ).toHaveLength(1);
 });
 test("assisted offers block every papio-initiated download path", async () => {
   for (const method of ["click", "url", "meta", "href"] as const) {
@@ -9124,27 +11973,51 @@ test("assisted offers block every papio-initiated download path", async () => {
                 idPattern: "stable/([^/]+)",
                 urlTemplate: "https://download.example/{1}.pdf",
               }
-            : { selector: "a.download", requireKind: "article", method, ...(method === "meta" ? { metaName: "citation_pdf_url" } : {}) },
+            : {
+                selector: "a.download",
+                requireKind: "article",
+                method,
+                ...(method === "meta" ? { metaName: "citation_pdf_url" } : {}),
+              },
     };
     h.deps.adapterSpecs.push(adapter);
     h.deps.permissions.contains = async () => true;
     h.deps.scripting.executeScript = async (injection) => {
-      if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+      if (injection.func === assessDrivenPage)
+        return [{ result: { kind: "normal" } }];
       if (injection.func === planExecution) {
-        return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
+        return plannerResult(injection, {
+          kind: "article",
+          adapter_id: adapter.id,
+          adapter_version: adapter.version,
+          evidence: [],
+        });
       }
-      return [{ result: method === "click" ? true : `https://${PROVIDER_HOST}/download/paper.pdf` }];
+      return [
+        {
+          result:
+            method === "click"
+              ? true
+              : `https://${PROVIDER_HOST}/download/paper.pdf`,
+        },
+      ];
     };
     await h.bridge.start();
-    await h.port.inbound(jobOffer(`job_assisted_${method}`, OPENURL, "assisted"));
-    await expect(h.bridge.openHandoff(`job_assisted_${method}`)).resolves.toEqual({ ok: true, opened: true });
+    await h.port.inbound(
+      jobOffer(`job_assisted_${method}`, OPENURL, "assisted"),
+    );
+    await expect(
+      h.bridge.openHandoff(`job_assisted_${method}`),
+    ).resolves.toEqual({ ok: true, opened: true });
     const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
+    await h.tabs.completeNavigation(
+      tabID,
+      `https://${PROVIDER_HOST}/stable/article`,
+    );
     expect(h.downloads.started).toHaveLength(0);
     expect(h.backend.store.activeJobs[0]?.download_initiated).not.toBe(true);
   }
 });
-
 
 test("delegated article offers retain automatic download behavior", async () => {
   const h = makeHarness();
@@ -9164,17 +12037,27 @@ test("delegated article offers retain automatic download behavior", async () => 
   h.deps.adapterSpecs.push(adapter);
   h.deps.permissions.contains = async () => true;
   h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
     if (injection.func === planExecution) {
-      return plannerResult(injection, { kind: "article", adapter_id: adapter.id, adapter_version: adapter.version, evidence: [] });
+      return plannerResult(injection, {
+        kind: "article",
+        adapter_id: adapter.id,
+        adapter_version: adapter.version,
+        evidence: [],
+      });
     }
-    if (injection.func === executePlannedPageEffect) return plannedEffectResult(injection);
+    if (injection.func === executePlannedPageEffect)
+      return plannedEffectResult(injection);
     return [{ result: "https://download.example/paper.pdf" }];
   };
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_delegated_url", OPENURL, "delegated"));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
+  await h.tabs.completeNavigation(
+    tabID,
+    `https://${PROVIDER_HOST}/stable/article`,
+  );
   expect(h.downloads.started).toHaveLength(1);
 });
 
@@ -9198,14 +12081,27 @@ test("assisted jobs still adopt a human-initiated download", async () => {
     state: "complete",
   });
   await h.downloads.onChanged.emit({ id: 81, state: { current: "complete" } });
-  expect(h.frames().some((frame) => frame.type === "download_complete" && frame.job_id === "job_assisted_human")).toBe(true);
+  expect(
+    h
+      .frames()
+      .some(
+        (frame) =>
+          frame.type === "download_complete" &&
+          frame.job_id === "job_assisted_human",
+      ),
+  ).toBe(true);
 });
 
-
 test("DOI normalization strips presentation prefixes but preserves repeated slashes", () => {
-  expect(normalizeExpectedDOI(" DOI: https://doi.org/10.1000//ABC ")).toBe("10.1000//abc");
-  expect(normalizeExpectedDOI("https://doi.org/10.1000//ABC")).toBe("10.1000//abc");
-  expect(normalizeExpectedDOI("10.1000/abc")).not.toBe(normalizeExpectedDOI("10.1000//abc"));
+  expect(normalizeExpectedDOI(" DOI: https://doi.org/10.1000//ABC ")).toBe(
+    "10.1000//abc",
+  );
+  expect(normalizeExpectedDOI("https://doi.org/10.1000//ABC")).toBe(
+    "10.1000//abc",
+  );
+  expect(normalizeExpectedDOI("10.1000/abc")).not.toBe(
+    normalizeExpectedDOI("10.1000//abc"),
+  );
 });
 
 describe("generic settled-unknown acquisition", () => {
@@ -9226,11 +12122,21 @@ describe("generic settled-unknown acquisition", () => {
       kind: "response",
       payload: {
         ...((args[1] ?? {}) as Record<string, unknown>),
-        outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+        outcome:
+          args[2] === "provider_drive_epoch_start_result"
+            ? "started"
+            : "applied",
       },
     }));
-    const offer = jobOffer(jobID, OPENURL, accessMode) as { payload: Record<string, unknown> };
+    const offer = jobOffer(jobID, OPENURL, accessMode) as {
+      payload: Record<string, unknown>;
+    };
     await h.bridge.start();
+    await h.port.inbound(
+      helloAck({
+        features: ["provider_drive_epoch_v1", "effect_permit_v1"],
+      }),
+    );
     // requestNative above models the feature-negotiated daemon ACK.
     offer.payload["expected"] = { doi: expectedDOI };
     if (driveEpoch) {
@@ -9241,31 +12147,276 @@ describe("generic settled-unknown acquisition", () => {
     }
     await h.port.inbound(offer);
     if (accessMode === "assisted") {
-      await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({ ok: true, opened: true });
+      await expect(h.bridge.openHandoff(jobID)).resolves.toEqual({
+        ok: true,
+        opened: true,
+      });
     }
     const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
     await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
     h.clock.now += 6_000;
     await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
   }
+  async function genericStartOutcome(
+    h: Harness,
+    jobID: string,
+    outcome:
+      | "started"
+      | "duplicate"
+      | "stale"
+      | "error"
+      | readonly ("started" | "duplicate" | "stale" | "error")[],
+  ): Promise<unknown[][]> {
+    const requests: unknown[][] = [];
+    const outcomes = Array.isArray(outcome) ? [...outcome] : [outcome];
+    const candidate: GenericCandidate = {
+      strategy_id: "generic-citation-pdf/1",
+      strategy_version: "1",
+      url: `https://www.jstor.org/download/${jobID}.pdf`,
+    };
+    h.deps.permissions.contains = async () => true;
+    h.deps.scripting.executeScript = async (injection) => {
+      if (injection.func === planGeneric) {
+        return [
+          {
+            result: {
+              evidence: ["e0:citation-doi=exact"],
+              candidates: [candidate],
+            },
+          },
+        ];
+      }
+      return [];
+    };
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      requests.push(args);
+      return {
+        kind: "response",
+        payload: {
+          ...((args[1] ?? {}) as Record<string, unknown>),
+          outcome:
+            args[2] === "provider_drive_epoch_start_result"
+              ? (outcomes.shift() ?? "stale")
+              : "applied",
+        },
+      };
+    });
+    await h.bridge.start();
+    await h.port.inbound(
+      helloAck({ features: ["provider_drive_epoch_v1", "effect_permit_v1"] }),
+    );
+    const offer = jobOffer(jobID, OPENURL, "delegated") as {
+      payload: Record<string, unknown>;
+    };
+    offer.payload["expected"] = { doi: "10.1000/generic" };
+    offer.payload["drive_attempt_id"] = `${jobID}-attempt`;
+    offer.payload["drive_ordinal"] = 0;
+    offer.payload["drive_strategy"] = "generic";
+    offer.payload["drive_revision"] = "1";
+    await h.port.inbound(offer);
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    h.clock.now += 6_000;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    return requests;
+  }
+  test.each(["duplicate", "stale", "error"] as const)(
+    "generic %s start result never downloads and retains the exact candidate tuple",
+    async (outcome) => {
+      const h = makeHarness();
+      const requests = await genericStartOutcome(
+        h,
+        `job_generic_${outcome}`,
+        outcome,
+      );
+      expect(h.downloads.started).toHaveLength(0);
+      expect(
+        requests.filter(
+          (args) => args[0] === "provider_drive_epoch_start_request",
+        ),
+      ).toHaveLength(1);
+      expect(requests[0]?.[1]).toMatchObject({
+        drive_attempt_id: `job_generic_${outcome}-attempt`,
+        ordinal: 0,
+        strategy: "generic",
+        revision: "1",
+      });
+      expect(h.backend.store.activeJobs[0]?.generic_drive_epoch).toMatchObject({
+        drive_attempt_id: `job_generic_${outcome}-attempt`,
+        ordinal: 0,
+        strategy: "generic",
+        revision: "1",
+      });
+      expect(
+        h.backend.store.activeJobs[0]?.generic_drive_epoch?.ordinal,
+      ).not.toBe(1);
+      if (outcome === "stale") {
+        expect(h.backend.store.activeJobs[0]?.generic_terminal).toBe(false);
+        expect(h.backend.store.activeJobs[0]?.generic_deferred).toBe(true);
+      } else {
+        expect(h.backend.store.activeJobs[0]?.generic_terminal).toBe(true);
+        expect(h.backend.store.activeJobs[0]?.generic_deferred).not.toBe(true);
+      }
+    },
+  );
+
+  test("duplicate generic start remains exactly reconcilable as unknown completion", async () => {
+    const h = makeHarness();
+    const jobID = "job_generic_duplicate_reconcile";
+    await genericStartOutcome(h, jobID, "duplicate");
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "effect_permit_reconcile_request",
+      msg_id: "generic-duplicate-reconcile-msg",
+      job_id: jobID,
+      seq: 9,
+      payload: {
+        request_id: "generic-duplicate-reconcile-request",
+        permit_id: "generic-duplicate-permit",
+        effect_kind: "generic_drive",
+        drive_attempt_id: `${jobID}-attempt`,
+        ordinal: 0,
+        strategy: "generic",
+        revision: "1",
+      },
+    });
+    const response = h
+      .frames()
+      .find(
+        (frame) =>
+          frame.type === "effect_permit_reconcile_response" &&
+          frame.payload["request_id"] === "generic-duplicate-reconcile-request",
+      );
+    expect(response?.payload).toMatchObject({
+      outcome: "recorded",
+      dispatched: false,
+      download_present: false,
+      acknowledged: false,
+      tab_present: false,
+    });
+  });
+
+  test("mixed-version generic start is unsupported before authorization and cannot download", async () => {
+    const h = makeHarness();
+    const candidate: GenericCandidate = {
+      strategy_id: "generic-citation-pdf/1",
+      strategy_version: "1",
+      url: "https://www.jstor.org/download/mixed-version.pdf",
+    };
+    h.deps.permissions.contains = async () => true;
+    h.deps.scripting.executeScript = async (injection) =>
+      injection.func === planGeneric
+        ? [
+            {
+              result: {
+                evidence: ["e0:citation-doi=exact"],
+                candidates: [candidate],
+              },
+            },
+          ]
+        : [];
+    await h.bridge.start();
+    // The daemon speaks provider_drive_epoch_v1 but not the permit feature.
+    await h.port.inbound(helloAck({ features: ["provider_drive_epoch_v1"] }));
+    const offer = jobOffer(
+      "job_generic_mixed_version",
+      OPENURL,
+      "delegated",
+    ) as { payload: Record<string, unknown> };
+    offer.payload["expected"] = { doi: "10.1000/generic" };
+    offer.payload["drive_attempt_id"] = "mixed-version-attempt";
+    offer.payload["drive_ordinal"] = 0;
+    offer.payload["drive_strategy"] = "generic";
+    offer.payload["drive_revision"] = "1";
+    await h.port.inbound(offer);
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    h.clock.now += 6_000;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+
+    expect(h.downloads.started).toHaveLength(0);
+    expect(h.backend.store.activeJobs[0]?.generic_drive_epoch).toMatchObject({
+      drive_attempt_id: "mixed-version-attempt",
+      ordinal: 0,
+      strategy: "generic",
+      revision: "1",
+    });
+    expect(
+      h.backend.store.activeJobs[0]?.generic_drive_epoch?.ordinal,
+    ).not.toBe(1);
+    expect(
+      h
+        .frames()
+        .some((frame) => frame.type === "provider_drive_epoch_start_request"),
+    ).toBe(false);
+  });
+  test("busy stale then exact re-offer reacquires the same never-acquired tuple", async () => {
+    const h = makeHarness();
+    const jobID = "job_generic_busy_reoffer";
+    const requests = await genericStartOutcome(h, jobID, ["stale", "started"]);
+    const firstStartCount = requests.filter(
+      (args) => args[0] === "provider_drive_epoch_start_request",
+    ).length;
+    const exactOffer = jobOffer(jobID, OPENURL, "delegated") as {
+      payload: Record<string, unknown>;
+    };
+    exactOffer.payload["expected"] = { doi: "10.1000/generic" };
+    exactOffer.payload["drive_attempt_id"] = `${jobID}-attempt`;
+    exactOffer.payload["drive_ordinal"] = 0;
+    exactOffer.payload["drive_strategy"] = "generic";
+    exactOffer.payload["drive_revision"] = "1";
+
+    // Settlement/wake is daemon-owned. A later offer retries exact identity X;
+    // the extension must never synthesize ordinal N+1.
+    await h.port.inbound(exactOffer);
+    // The stale defer clears on the exact same-tuple offer; the next settled-unknown drives the retry.
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    h.clock.now += 6_000;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    expect(h.downloads.started).toHaveLength(1);
+    expect(
+      requests.filter(
+        (args) => args[0] === "provider_drive_epoch_start_request",
+      ),
+    ).toHaveLength(firstStartCount + 1);
+    expect(requests.at(-1)?.[1]).toMatchObject({
+      drive_attempt_id: `${jobID}-attempt`,
+      ordinal: 0,
+      strategy: "generic",
+      revision: "1",
+    });
+    expect(h.backend.store.activeJobs[0]?.generic_drive_epoch).toMatchObject({
+      drive_attempt_id: `${jobID}-attempt`,
+      ordinal: 0,
+      strategy: "generic",
+      revision: "1",
+    });
+    expect(
+      h.backend.store.activeJobs[0]?.generic_drive_epoch?.ordinal,
+    ).not.toBe(1);
+  });
 
   test("assisted generic execution records E0 evidence without downloading", async () => {
     const h = makeHarness();
-    await reachUnknown(
-      h,
-      "job_generic_assisted",
-      "assisted",
-      {
-        evidence: ["e0:citation-doi=exact"],
-        candidates: [
-          { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/a.pdf" },
-        ],
-      },
-    );
+    await reachUnknown(h, "job_generic_assisted", "assisted", {
+      evidence: ["e0:citation-doi=exact"],
+      candidates: [
+        {
+          strategy_id: "generic-citation-pdf/1",
+          strategy_version: "1",
+          url: "https://www.jstor.org/a.pdf",
+        },
+      ],
+    });
     expect(h.downloads.started).toHaveLength(0);
     const outcome = h
       .frames()
-      .find((frame) => frame.type === "provider_outcome" && frame.payload.outcome === "ui_changed");
+      .find(
+        (frame) =>
+          frame.type === "provider_outcome" &&
+          frame.payload.outcome === "ui_changed",
+      );
     expect(outcome?.payload.detail).toContain("e0:citation-doi=exact");
   });
 
@@ -9288,12 +12439,24 @@ describe("generic settled-unknown acquisition", () => {
     h.deps.permissions.contains = async () => true;
     h.deps.scripting.executeScript = async (injection) => {
       if (injection.func === planGeneric) {
-        return [{ result: { evidence: ["e0:citation-doi=exact"], candidates: [candidate] } }];
+        return [
+          {
+            result: {
+              evidence: ["e0:citation-doi=exact"],
+              candidates: [candidate],
+            },
+          },
+        ];
       }
       return [];
     };
     await h.bridge.start();
-    const offer = jobOffer(jobID, OPENURL, "delegated") as { payload: Record<string, unknown> };
+    await h.port.inbound(
+      helloAck({ features: ["provider_drive_epoch_v1", "effect_permit_v1"] }),
+    );
+    const offer = jobOffer(jobID, OPENURL, "delegated") as {
+      payload: Record<string, unknown>;
+    };
     offer.payload["expected"] = { doi: "10.1000/revoked" };
     offer.payload["drive_attempt_id"] = "generic-revoked-epoch-1";
     offer.payload["drive_ordinal"] = 0;
@@ -9309,13 +12472,20 @@ describe("generic settled-unknown acquisition", () => {
         kind: "response",
         payload: {
           ...((args[1] ?? {}) as Record<string, unknown>),
-          outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+          outcome:
+            args[2] === "provider_drive_epoch_start_result"
+              ? "started"
+              : "applied",
         },
       };
     });
     const startGenericCandidate = (
       h.bridge as unknown as {
-        startGenericCandidate(jobID: string, candidates: GenericCandidate[], requestedIndex: number): Promise<void>;
+        startGenericCandidate(
+          jobID: string,
+          candidates: GenericCandidate[],
+          requestedIndex: number,
+        ): Promise<void>;
       }
     ).startGenericCandidate.bind(h.bridge);
     const attempt = startGenericCandidate(jobID, [candidate], 0);
@@ -9331,38 +12501,48 @@ describe("generic settled-unknown acquisition", () => {
 
   test("a declared citation URL downloads once and records its strategy", async () => {
     const h = makeHarness();
-    await reachUnknown(
-      h,
-      "job_generic_citation",
-      "delegated",
-      {
-        evidence: ["e0:citation-doi=exact", "e0:citation-pdf=unique"],
-        candidates: [
-          { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/citation.pdf" },
-        ],
-      },
-    );
+    await reachUnknown(h, "job_generic_citation", "delegated", {
+      evidence: ["e0:citation-doi=exact", "e0:citation-pdf=unique"],
+      candidates: [
+        {
+          strategy_id: "generic-citation-pdf/1",
+          strategy_version: "1",
+          url: "https://www.jstor.org/download/citation.pdf",
+        },
+      ],
+    });
     expect(h.downloads.started).toHaveLength(1);
-    expect(h.downloads.started[0]?.url).toBe("https://www.jstor.org/download/citation.pdf");
-    expect(h.backend.store.activeJobs[0]?.adapter_id).toBe("generic-citation-pdf/1");
+    expect(h.downloads.started[0]?.url).toBe(
+      "https://www.jstor.org/download/citation.pdf",
+    );
+    expect(h.backend.store.activeJobs[0]?.adapter_id).toBe(
+      "generic-citation-pdf/1",
+    );
   });
 
   test("an interrupted citation download stays parked without advancing", async () => {
     const h = makeHarness();
-    await reachUnknown(
-      h,
-      "job_generic_ordinary_failure",
-      "delegated",
-      {
-        evidence: ["e0:citation-doi=exact"],
-        candidates: [
-          { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/missing.pdf" },
-          { strategy_id: "generic-article-pdf-link/1", strategy_version: "1", url: "https://www.jstor.org/pdf/article.pdf" },
-        ],
-      },
-    );
+    await reachUnknown(h, "job_generic_ordinary_failure", "delegated", {
+      evidence: ["e0:citation-doi=exact"],
+      candidates: [
+        {
+          strategy_id: "generic-citation-pdf/1",
+          strategy_version: "1",
+          url: "https://www.jstor.org/download/missing.pdf",
+        },
+        {
+          strategy_id: "generic-article-pdf-link/1",
+          strategy_version: "1",
+          url: "https://www.jstor.org/pdf/article.pdf",
+        },
+      ],
+    });
     expect(h.downloads.started).toHaveLength(1);
-    await h.downloads.onChanged.emit({ id: 901, state: { current: "interrupted" }, error: { current: "NETWORK_FAILED" } });
+    await h.downloads.onChanged.emit({
+      id: 901,
+      state: { current: "interrupted" },
+      error: { current: "NETWORK_FAILED" },
+    });
     expect(h.downloads.started.map((entry) => entry.url)).toEqual([
       "https://www.jstor.org/download/missing.pdf",
     ]);
@@ -9401,13 +12581,21 @@ describe("generic settled-unknown acquisition", () => {
         kind: "response",
         payload: {
           ...((args[1] ?? {}) as Record<string, unknown>),
-          outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+          outcome:
+            args[2] === "provider_drive_epoch_start_result"
+              ? "started"
+              : "applied",
         },
       };
     });
     await h.bridge.start();
+    await h.port.inbound(
+      helloAck({ features: ["provider_drive_epoch_v1", "effect_permit_v1"] }),
+    );
     // requestNative above models the feature-negotiated daemon ACK.
-    const offer = jobOffer("job_generic_identity", OPENURL, "delegated") as { payload: Record<string, unknown> };
+    const offer = jobOffer("job_generic_identity", OPENURL, "delegated") as {
+      payload: Record<string, unknown>;
+    };
     offer.payload["expected"] = { doi: "10.1000/generic" };
     offer.payload["drive_attempt_id"] = "generic-identity-epoch-1";
     offer.payload["drive_ordinal"] = 0;
@@ -9424,7 +12612,8 @@ describe("generic settled-unknown acquisition", () => {
         (args) =>
           args[0] === "provider_drive_epoch_result_request" &&
           (args[1] as Record<string, unknown>)?.outcome === "wrong_work" &&
-          (args[1] as Record<string, unknown>)?.drive_attempt_id === "generic-identity-epoch-1",
+          (args[1] as Record<string, unknown>)?.drive_attempt_id ===
+            "generic-identity-epoch-1",
       ),
     ).toBe(true);
     expect(
@@ -9432,15 +12621,62 @@ describe("generic settled-unknown acquisition", () => {
         .filter((args) => args[0] === "provider_drive_epoch_result_request")
         .every((args) => args[5] === "job_generic_identity"),
     ).toBe(true);
-    expect(h.frames().some((frame) => frame.type === "provider_outcome" && frame.payload.outcome === "wrong_work")).toBe(false);
+    expect(
+      h
+        .frames()
+        .some(
+          (frame) =>
+            frame.type === "provider_outcome" &&
+            frame.payload.outcome === "wrong_work",
+        ),
+    ).toBe(false);
   });
 
   test("generic completed download is settled after worker restart", async () => {
     const h = makeHarness();
     await reachUnknown(h, "job_generic_restart_complete", "delegated", {
       evidence: ["e0:citation-doi=exact"],
-      candidates: [{ strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/restart-complete.pdf" }],
+      candidates: [
+        {
+          strategy_id: "generic-citation-pdf/1",
+          strategy_version: "1",
+          url: "https://www.jstor.org/download/restart-complete.pdf",
+        },
+      ],
     });
+    // Startup reconciliation may observe the exact in-flight download, but
+    // producer identity is feature-gated on the newly negotiated port. Keep
+    // the browser item in flight until that handshake has completed, then
+    // deliver the terminal event through the reloaded worker.
+    h.downloads.items.set(901, {
+      id: 901,
+      filename: "/tmp/restart-complete.pdf",
+      fileSize: 12,
+      mime: "application/pdf",
+      state: "in_progress",
+    });
+    const reloaded = new Bridge(h.deps);
+    Reflect.set(reloaded, "requestNative", async (...args: unknown[]) => ({
+      kind: "response",
+      payload: {
+        ...((args[1] ?? {}) as Record<string, unknown>),
+        outcome:
+          args[2] === "provider_drive_epoch_start_result"
+            ? "started"
+            : "applied",
+      },
+    }));
+    await reloaded.start();
+    const reloadedPort = h.ports[1];
+    expect(reloadedPort).toBeDefined();
+    await reloadedPort!.inbound(
+      helloAck({ features: ["provider_drive_epoch_v1", "effect_permit_v1"] }),
+    );
+    // The old worker's in-memory track dies with the worker; the persisted
+    // epoch is what the reloaded bridge reconstructs.
+    (Reflect.get(h.bridge, "downloads") as Map<string, unknown>).delete(
+      "job_generic_restart_complete",
+    );
     h.downloads.items.set(901, {
       id: 901,
       filename: "/tmp/restart-complete.pdf",
@@ -9448,27 +12684,43 @@ describe("generic settled-unknown acquisition", () => {
       mime: "application/pdf",
       state: "complete",
     });
-    const reloaded = new Bridge(h.deps);
-    Reflect.set(reloaded, "requestNative", async (...args: unknown[]) => ({
-      kind: "response",
-      payload: {
-        ...((args[1] ?? {}) as Record<string, unknown>),
-        outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
-      },
-    }));
-    await reloaded.start();
-    const complete = h.frames().filter((frame) => frame.type === "download_complete");
+    await h.downloads.onChanged.emit({
+      id: 901,
+      state: { current: "complete" },
+    });
+    const complete = h
+      .frames()
+      .filter((frame) => frame.type === "download_complete");
+    expect(complete[0]?.payload["producer"]).toEqual({
+      effect_kind: "generic_drive",
+      drive_attempt_id: "generic-test-epoch-1",
+      ordinal: 0,
+      strategy: "generic",
+      revision: "1",
+    });
     expect(complete).toHaveLength(1);
-    expect(h.backend.store.activeJobs[0]?.generic_drive_epoch?.in_flight_download_id).toBe(901);
+    expect(
+      h.backend.store.activeJobs[0]?.generic_drive_epoch?.in_flight_download_id,
+    ).toBe(901);
   });
 
   test("generic interrupted download settles its exact tuple after worker restart", async () => {
     const h = makeHarness();
     await reachUnknown(h, "job_generic_restart_interrupted", "delegated", {
       evidence: ["e0:citation-doi=exact"],
-      candidates: [{ strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/restart-interrupted.pdf" }],
+      candidates: [
+        {
+          strategy_id: "generic-citation-pdf/1",
+          strategy_version: "1",
+          url: "https://www.jstor.org/download/restart-interrupted.pdf",
+        },
+      ],
     });
-    h.downloads.items.set(901, { id: 901, state: "interrupted", mime: "application/pdf" });
+    h.downloads.items.set(901, {
+      id: 901,
+      state: "interrupted",
+      mime: "application/pdf",
+    });
     const reloaded = new Bridge(h.deps);
     const requests: unknown[][] = [];
     Reflect.set(reloaded, "requestNative", async (...args: unknown[]) => {
@@ -9477,7 +12729,10 @@ describe("generic settled-unknown acquisition", () => {
         kind: "response",
         payload: {
           ...((args[1] ?? {}) as Record<string, unknown>),
-          outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+          outcome:
+            args[2] === "provider_drive_epoch_start_result"
+              ? "started"
+              : "applied",
         },
       };
     });
@@ -9488,7 +12743,10 @@ describe("generic settled-unknown acquisition", () => {
         (args[1] as Record<string, unknown>)?.outcome === "cancelled",
     );
     expect(cancelled).toHaveLength(1);
-    await h.downloads.onChanged.emit({ id: 901, state: { current: "interrupted" } });
+    await h.downloads.onChanged.emit({
+      id: 901,
+      state: { current: "interrupted" },
+    });
     expect(
       requests.filter(
         (args) =>
@@ -9500,24 +12758,42 @@ describe("generic settled-unknown acquisition", () => {
 
   test("the generic attempt latch survives a worker restart", async () => {
     const h = makeHarness();
-    await reachUnknown(
-      h,
-      "job_generic_restart",
-      "delegated",
-      {
-        evidence: ["e0:citation-doi=exact"],
-        candidates: [
-          { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/restart.pdf" },
-        ],
-      },
-    );
+    await reachUnknown(h, "job_generic_restart", "delegated", {
+      evidence: ["e0:citation-doi=exact"],
+      candidates: [
+        {
+          strategy_id: "generic-citation-pdf/1",
+          strategy_version: "1",
+          url: "https://www.jstor.org/download/restart.pdf",
+        },
+      ],
+    });
     const before = h.downloads.started.length;
     const persisted = JSON.parse(JSON.stringify(h.backend.store)) as StoreShape;
     expect(JSON.stringify(persisted)).not.toContain("restart.pdf");
     const reloaded = new Bridge(h.deps);
+    let restartedStartRequests = 0;
+    Reflect.set(reloaded, "requestNative", async (...args: unknown[]) => {
+      if (args[0] === "provider_drive_epoch_start_request")
+        restartedStartRequests += 1;
+      return {
+        kind: "response",
+        payload: {
+          ...((args[1] ?? {}) as Record<string, unknown>),
+          outcome:
+            args[2] === "provider_drive_epoch_start_result"
+              ? "started"
+              : "applied",
+        },
+      };
+    });
     await reloaded.start();
+    expect(restartedStartRequests).toBe(0);
     expect(h.downloads.started).toHaveLength(before);
-    expect((persisted.activeJobs[0] as ActiveJob & { generic_evaluated?: boolean })?.generic_evaluated).toBe(true);
+    expect(
+      (persisted.activeJobs[0] as ActiveJob & { generic_evaluated?: boolean })
+        ?.generic_evaluated,
+    ).toBe(true);
   });
   test("generic browser-document MIME parks the current candidate without advancing", async () => {
     const h = makeHarness();
@@ -9525,50 +12801,135 @@ describe("generic settled-unknown acquisition", () => {
       kind: "response",
       payload: {
         ...((args[1] ?? {}) as Record<string, unknown>),
-        outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+        outcome:
+          args[2] === "provider_drive_epoch_start_result"
+            ? "started"
+            : "applied",
       },
     }));
-    await reachUnknown(h, "job_generic_html", "delegated", {
-      evidence: ["e0:citation-doi=exact"],
-      candidates: [
-        { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/html.pdf" },
-        { strategy_id: "generic-article-pdf-link/1", strategy_version: "1", url: "https://www.jstor.org/download/second.pdf" },
-      ],
-    }, "10.1000/generic", true);
-    h.downloads.items.set(901, { id: 901, filename: "/tmp/wrapper.html", fileSize: 10, mime: "text/html", state: "complete" });
-    await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
-    expect(h.downloads.started.map((entry) => entry.url)).toEqual(["https://www.jstor.org/download/html.pdf"]);
+    await reachUnknown(
+      h,
+      "job_generic_html",
+      "delegated",
+      {
+        evidence: ["e0:citation-doi=exact"],
+        candidates: [
+          {
+            strategy_id: "generic-citation-pdf/1",
+            strategy_version: "1",
+            url: "https://www.jstor.org/download/html.pdf",
+          },
+          {
+            strategy_id: "generic-article-pdf-link/1",
+            strategy_version: "1",
+            url: "https://www.jstor.org/download/second.pdf",
+          },
+        ],
+      },
+      "10.1000/generic",
+      true,
+    );
+    h.downloads.items.set(901, {
+      id: 901,
+      filename: "/tmp/wrapper.html",
+      fileSize: 10,
+      mime: "text/html",
+      state: "complete",
+    });
+    await h.downloads.onChanged.emit({
+      id: 901,
+      state: { current: "complete" },
+    });
+    expect(h.downloads.started.map((entry) => entry.url)).toEqual([
+      "https://www.jstor.org/download/html.pdf",
+    ]);
   });
 
-  test("generic clean non-browser MIME advances exactly once to candidate two", async () => {
+  test("generic clean non-browser MIME retains exact tuple and awaits daemon successor", async () => {
     const h = makeHarness();
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => ({
-      kind: "response",
-      payload: {
-        ...((args[1] ?? {}) as Record<string, unknown>),
-        outcome: args[2] === "provider_drive_epoch_start_result" ? "started" : "applied",
+    const requests: unknown[][] = [];
+    const makeResponse = async (...args: unknown[]) => {
+      requests.push(args);
+      return {
+        kind: "response",
+        payload: {
+          ...((args[1] ?? {}) as Record<string, unknown>),
+          outcome:
+            args[2] === "provider_drive_epoch_start_result"
+              ? "started"
+              : "applied",
+        },
+      };
+    };
+    Reflect.set(h.bridge, "requestNative", makeResponse);
+    await reachUnknown(
+      h,
+      "job_generic_clean",
+      "delegated",
+      {
+        evidence: ["e0:citation-doi=exact"],
+        candidates: [
+          {
+            strategy_id: "generic-citation-pdf/1",
+            strategy_version: "1",
+            url: "https://www.jstor.org/download/image.pdf",
+          },
+          {
+            strategy_id: "generic-article-pdf-link/1",
+            strategy_version: "1",
+            url: "https://www.jstor.org/download/second.pdf",
+          },
+        ],
       },
-    }));
-    await reachUnknown(h, "job_generic_clean", "delegated", {
-      evidence: ["e0:citation-doi=exact"],
-      candidates: [
-        { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://www.jstor.org/download/image.pdf" },
-        { strategy_id: "generic-article-pdf-link/1", strategy_version: "1", url: "https://www.jstor.org/download/second.pdf" },
-      ],
-    }, "10.1000/generic", true);
-    h.downloads.items.set(901, { id: 901, filename: "/tmp/image.png", fileSize: 10, mime: "image/png", state: "complete" });
-    await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+      "10.1000/generic",
+      true,
+    );
+    // reachUnknown overwrites requestNative; reinstall our tracker for the completion phase
+    Reflect.set(h.bridge, "requestNative", makeResponse);
     expect(h.downloads.started.map((entry) => entry.url)).toEqual([
       "https://www.jstor.org/download/image.pdf",
-      "https://www.jstor.org/download/second.pdf",
     ]);
+    h.downloads.items.set(901, {
+      id: 901,
+      filename: "/tmp/image.png",
+      fileSize: 10,
+      mime: "image/png",
+      state: "complete",
+    });
+    await h.downloads.onChanged.emit({
+      id: 901,
+      state: { current: "complete" },
+    });
+    expect(h.downloads.started.map((entry) => entry.url)).toEqual([
+      "https://www.jstor.org/download/image.pdf",
+    ]);
+    const resultRequests = requests.filter(
+      (args) => args[0] === "provider_drive_epoch_result_request",
+    );
+    expect(resultRequests).toHaveLength(1);
+    expect(resultRequests[0]?.[1]).toMatchObject({
+      drive_attempt_id: "generic-test-epoch-1",
+      ordinal: 0,
+      strategy: "generic",
+      revision: "1",
+    });
+    expect(h.backend.store.activeJobs[0]?.generic_drive_epoch).toMatchObject({
+      drive_attempt_id: "generic-test-epoch-1",
+      ordinal: 0,
+      strategy: "generic",
+      revision: "1",
+    });
+    expect(h.backend.store.activeJobs[0]?.generic_terminal).toBe(true);
+    expect(h.backend.store.activeJobs[0]?.generic_deferred).not.toBe(true);
   });
 });
 
 test("direct named DOI route completes a valid PDF without persisting its URL", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"] }),
+  );
   const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942";
   await h.port.inbound({
     protocol: "papio-browser/1",
@@ -9597,26 +12958,148 @@ test("direct named DOI route completes a valid PDF without persisting its URL", 
     url: directURL,
   });
   await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
-  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  const complete = h
+    .frames()
+    .find((frame) => frame.type === "download_complete");
+  expect(complete?.payload["producer"]).toEqual({
+    effect_kind: "direct_get",
+    drive_attempt_id: "direct-valid-attempt",
+    ordinal: 0,
+    strategy: "direct_get",
+    revision: "acm-doi-pdf/1",
+  });
+  const result = h
+    .frames()
+    .find((frame) => frame.type === "provider_direct_get_result");
   expect(result?.payload).toMatchObject({
     drive_attempt_id: "direct-valid-attempt",
     outcome: "success",
     landing_class: "pdf",
   });
-  expect(h.frames().filter((frame) => frame.type === "download_started")).toHaveLength(1);
-  expect(h.frames().filter((frame) => frame.type === "download_complete")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "download_started"),
+  ).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "download_complete"),
+  ).toHaveLength(1);
   expect(JSON.stringify(h.backend.store)).not.toContain(directURL);
+});
+
+test("an authorized institutional download carries only its exact producer tuple", async () => {
+  const jobID = "job_institutional_download_producer";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: 301,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_900_000_000_000,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+        access_mode: "delegated",
+      },
+    ],
+    materializations: {
+      [jobID]: {
+        job_id: jobID,
+        candidate_id: "cand-producer-0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim-producer-0001",
+        binding_id: "binding-producer-0001",
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+        phase: "navigated",
+        tab_id: 301,
+        effect_ordinal: 7,
+        institutional_request_id: "institutional-request-0001",
+      },
+    },
+  });
+  h.tabs.seed({
+    id: 301,
+    url: "https://provider.example.edu/article",
+    active: false,
+    windowId: 500,
+  });
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["effect_permit_v1", "institutional_materialization_v1"],
+    }),
+  );
+  // A same-job download from another tab may still be correlated by provider
+  // host, but it is not the materialization effect and must not inherit its
+  // producer tuple.
+  await h.downloads.onCreated.emit({
+    id: 904,
+    tabId: 302,
+    url: "https://provider.example.edu/download",
+    state: "in_progress",
+  });
+  h.downloads.items.set(904, {
+    id: 904,
+    tabId: 302,
+    filename: "/tmp/wrong-tab.pdf",
+    fileSize: 12,
+    mime: "application/pdf",
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 904, state: { current: "complete" } });
+  const wrongTabProducer = h
+    .frames()
+    .find(
+      (frame) =>
+        frame.type === "download_complete" &&
+        frame.payload["download_id"] === 904 &&
+        frame.payload["producer"] !== undefined,
+    );
+  expect(wrongTabProducer).toBeUndefined();
+  await h.downloads.onCreated.emit({
+    id: 905,
+    tabId: 301,
+    url: "https://provider.example.edu/download",
+    state: "in_progress",
+  });
+  h.downloads.items.set(905, {
+    id: 905,
+    tabId: 301,
+    filename: "/tmp/institutional.pdf",
+    fileSize: 12,
+    mime: "application/pdf",
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 905, state: { current: "complete" } });
+  const complete = h
+    .frames()
+    .find(
+      (frame) =>
+        frame.type === "download_complete" &&
+        frame.payload["download_id"] === 905,
+    );
+  expect(complete?.payload["producer"]).toEqual({
+    effect_kind: "institutional",
+    claim_id: "claim-producer-0001",
+    binding_id: "binding-producer-0001",
+    effect_ordinal: 7,
+    institutional_request_id: "institutional-request-0001",
+  });
 });
 test("tabless direct downloads share the single effect governor and release after initiation", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"] }),
+  );
   let unblock!: () => void;
   const blocked = new Promise<void>((resolve) => {
     unblock = resolve;
   });
   h.downloads.afterCreate = async () => blocked;
-  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (message: unknown) => Promise<void>;
+  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (
+    message: unknown,
+  ) => Promise<void>;
   const direct = (jobID: string, msgID: string) =>
     onDirect.call(h.bridge, {
       protocol: "papio-browser/1",
@@ -9636,7 +13119,11 @@ test("tabless direct downloads share the single effect governor and release afte
       },
     });
   const first = direct("job_direct_governor_a", "direct_governor_a");
-  for (let attempt = 0; attempt < 20 && h.downloads.started.length < 1; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < 20 && h.downloads.started.length < 1;
+    attempt += 1
+  ) {
     await Promise.resolve();
   }
   expect(h.downloads.started).toHaveLength(1);
@@ -9647,7 +13134,8 @@ test("tabless direct downloads share the single effect governor and release afte
   for (
     let attempt = 0;
     attempt < 200 &&
-      (h.downloads.started.length < 2 || Reflect.get(h.bridge, "effectGovernorOwner") !== undefined);
+    (h.downloads.started.length < 2 ||
+      Reflect.get(h.bridge, "effectGovernorOwner") !== undefined);
     attempt += 1
   ) {
     await Promise.resolve();
@@ -9657,15 +13145,22 @@ test("tabless direct downloads share the single effect governor and release afte
   expect(Reflect.get(h.bridge, "providerDrainLeaseOwners")).toEqual(new Map());
 });
 test("provider tab navigation waits behind an unlike direct effect and resumes after its consequence", async () => {
-  const h = makeHarness({ ...emptyStore(), authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 } });
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"] }),
+  );
   let unblock!: () => void;
   const blocked = new Promise<void>((resolve) => {
     unblock = resolve;
   });
   h.downloads.afterCreate = async () => blocked;
-  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (message: unknown) => Promise<void>;
+  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (
+    message: unknown,
+  ) => Promise<void>;
   const first = onDirect.call(h.bridge, {
     protocol: "papio-browser/1",
     type: "provider_direct_get_request",
@@ -9683,7 +13178,11 @@ test("provider tab navigation waits behind an unlike direct effect and resumes a
       terms_policy: "none",
     },
   });
-  for (let attempt = 0; attempt < 20 && h.downloads.started.length < 1; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < 20 && h.downloads.started.length < 1;
+    attempt += 1
+  ) {
     await Promise.resolve();
   }
   expect(h.downloads.started).toHaveLength(1);
@@ -9691,18 +13190,28 @@ test("provider tab navigation waits behind an unlike direct effect and resumes a
   expect(h.tabs.created).toHaveLength(0);
   unblock();
   await first;
-  for (let attempt = 0; attempt < 20 && h.tabs.created.length < 1; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < 20 && h.tabs.created.length < 1;
+    attempt += 1
+  ) {
     await Promise.resolve();
   }
   expect(h.tabs.created).toHaveLength(1);
-  expect(Reflect.get(h.bridge, "effectGovernorOwner")).toMatchObject({ jobID: "job_cross_kind_tab" });
+  expect(Reflect.get(h.bridge, "effectGovernorOwner")).toMatchObject({
+    jobID: "job_cross_kind_tab",
+  });
 });
 test("tabless direct download failure releases both governors for a retry", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"] }),
+  );
   h.downloads.failDownload = true;
-  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (message: unknown) => Promise<void>;
+  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (
+    message: unknown,
+  ) => Promise<void>;
   await onDirect.call(h.bridge, {
     protocol: "papio-browser/1",
     type: "provider_direct_get_request",
@@ -9724,12 +13233,52 @@ test("tabless direct download failure releases both governors for a retry", asyn
   expect(Reflect.get(h.bridge, "providerDrainLeaseOwners")).toEqual(new Map());
 });
 
-
+test("direct download persistence failure does not report a false network result", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"] }),
+  );
+  h.downloads.afterCreate = () => {
+    h.backend.failNextSave = true;
+  };
+  const onDirect = Reflect.get(h.bridge, "onProviderDirectGetRequest") as (
+    message: unknown,
+  ) => Promise<void>;
+  await onDirect.call(h.bridge, {
+    protocol: "papio-browser/1",
+    type: "provider_direct_get_request",
+    msg_id: "direct_persist_failure_0001",
+    job_id: "job_direct_persist_failure",
+    seq: 2,
+    payload: {
+      drive_attempt_id: "direct-persist-failure-attempt",
+      ordinal: 0,
+      route_revision: "acm-doi-pdf/1",
+      expected_identifier: "doi:10.1145/3630106.3658942",
+      url: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
+      allowed_origin: "https://dl.acm.org",
+      path_family: "/doi/pdf/{doi}",
+      terms_policy: "none",
+    },
+  });
+  expect(h.downloads.started).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_direct_get_result"),
+  ).toHaveLength(0);
+  expect(
+    Reflect.get(h.bridge, "downloads").get("job_direct_persist_failure")?.ids,
+  ).toEqual(new Set([901]));
+  expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
+  expect(Reflect.get(h.bridge, "providerDrainLeaseOwners")).toEqual(new Map());
+});
 
 test("direct PDF with a foreign final envelope never emits adoption events", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"] }),
+  );
   await h.port.inbound({
     protocol: "papio-browser/1",
     type: "provider_direct_get_request",
@@ -9758,20 +13307,28 @@ test("direct PDF with a foreign final envelope never emits adoption events", asy
   });
 
   await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
-  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  const result = h
+    .frames()
+    .find((frame) => frame.type === "provider_direct_get_result");
   expect(result?.payload).toMatchObject({
     drive_attempt_id: "direct-foreign-attempt",
     outcome: "foreign",
     landing_class: "foreign",
   });
-  expect(h.frames().filter((frame) => frame.type === "download_started")).toHaveLength(0);
-  expect(h.frames().filter((frame) => frame.type === "download_complete")).toHaveLength(0);
+  expect(
+    h.frames().filter((frame) => frame.type === "download_started"),
+  ).toHaveLength(0);
+  expect(
+    h.frames().filter((frame) => frame.type === "download_complete"),
+  ).toHaveLength(0);
   expect(h.downloads.removedFiles).toEqual([901]);
 });
 test("direct named-marker mismatch is rejected at completion", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["provider_direct_get_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"] }),
+  );
   await h.port.inbound({
     protocol: "papio-browser/1",
     type: "provider_direct_get_request",
@@ -9799,7 +13356,9 @@ test("direct named-marker mismatch is rejected at completion", async () => {
     url: "https://dl.acm.org/doi/pdf/10.1145/3630106.other",
   });
   await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
-  const result = h.frames().find((frame) => frame.type === "provider_direct_get_result");
+  const result = h
+    .frames()
+    .find((frame) => frame.type === "provider_direct_get_result");
   expect(result?.payload).toMatchObject({
     drive_attempt_id: "direct-marker-mismatch-attempt",
     outcome: "foreign",
@@ -9807,38 +13366,44 @@ test("direct named-marker mismatch is rejected at completion", async () => {
   });
   expect(h.downloads.started).toHaveLength(1);
   expect(h.downloads.removedFiles).toEqual([901]);
-  expect(h.frames().filter((frame) => frame.type === "download_started")).toHaveLength(0);
-  expect(h.frames().filter((frame) => frame.type === "download_complete")).toHaveLength(0);
+  expect(
+    h.frames().filter((frame) => frame.type === "download_started"),
+  ).toHaveLength(0);
+  expect(
+    h.frames().filter((frame) => frame.type === "download_complete"),
+  ).toHaveLength(0);
 });
 
 test("direct completed download is recovered once across worker restarts", async () => {
   const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942";
   const seed: StoreShape = {
     ...emptyStore(),
-    activeJobs: [{
-      job_id: "job_direct_restart",
-      tab_id: -1,
-      offered_at: 1_700_000_000_000,
-      expires_at: 1_800_000_000_000,
-      status: "accepted",
-      provider_hosts: ["dl.acm.org"],
-      access_mode: "delegated",
-      download_initiated: true,
-      direct_terminal: false,
-      drive_epoch: {
-        drive_attempt_id: "direct-restart-attempt",
-        ordinal: 0,
-        strategy: "direct",
-        route_revision: "acm-doi-pdf/1",
-        in_flight_download_id: 901,
-        attempt_count: 1,
+    activeJobs: [
+      {
+        job_id: "job_direct_restart",
+        tab_id: -1,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "accepted",
+        provider_hosts: ["dl.acm.org"],
+        access_mode: "delegated",
+        download_initiated: true,
+        direct_terminal: false,
+        drive_epoch: {
+          drive_attempt_id: "direct-restart-attempt",
+          ordinal: 0,
+          strategy: "direct",
+          route_revision: "acm-doi-pdf/1",
+          in_flight_download_id: 901,
+          attempt_count: 1,
+        },
+        direct_envelope: {
+          allowed_origin: "https://dl.acm.org",
+          path_family: "/doi/pdf/{doi}",
+          expected_identifier: "doi:10.1145/3630106.3658942",
+        },
       },
-      direct_envelope: {
-        allowed_origin: "https://dl.acm.org",
-        path_family: "/doi/pdf/{doi}",
-        expected_identifier: "doi:10.1145/3630106.3658942",
-      },
-    }],
+    ],
   };
   const first = makeHarness(seed);
   first.downloads.items.set(901, {
@@ -9851,11 +13416,17 @@ test("direct completed download is recovered once across worker restarts", async
     url: directURL,
   });
   await first.bridge.start();
-  expect(first.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(1);
+  expect(
+    first
+      .frames()
+      .filter((frame) => frame.type === "provider_direct_get_result"),
+  ).toHaveLength(1);
   expect(first.backend.store.activeJobs[0]?.direct_terminal).toBe(true);
   expect(JSON.stringify(first.backend.store)).not.toContain(directURL);
 
-  const second = makeHarness(JSON.parse(JSON.stringify(first.backend.store)) as StoreShape);
+  const second = makeHarness(
+    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+  );
   second.downloads.items.set(901, {
     id: 901,
     filename: "/tmp/direct-restart.pdf",
@@ -9866,34 +13437,40 @@ test("direct completed download is recovered once across worker restarts", async
     url: directURL,
   });
   await second.bridge.start();
-  expect(second.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(0);
+  expect(
+    second
+      .frames()
+      .filter((frame) => frame.type === "provider_direct_get_result"),
+  ).toHaveLength(0);
 });
-test("direct pre-ID download is recovered by its exact job filename and settled once", async () => {
+test("direct pre-ID restart does not infer correlation from a matching filename", async () => {
   const jobID = "job_direct_pre_id";
   const seed: StoreShape = {
     ...emptyStore(),
-    activeJobs: [{
-      job_id: jobID,
-      tab_id: -1,
-      offered_at: 1_700_000_000_000,
-      expires_at: 1_800_000_000_000,
-      status: "accepted",
-      provider_hosts: ["dl.acm.org"],
-      access_mode: "delegated",
-      download_initiated: true,
-      drive_epoch: {
-        drive_attempt_id: "direct-pre-id-attempt",
-        ordinal: 0,
-        strategy: "direct",
-        route_revision: "acm-doi-pdf/1",
-        attempt_count: 1,
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "accepted",
+        provider_hosts: ["dl.acm.org"],
+        access_mode: "delegated",
+        download_initiated: true,
+        drive_epoch: {
+          drive_attempt_id: "direct-pre-id-attempt",
+          ordinal: 0,
+          strategy: "direct",
+          route_revision: "acm-doi-pdf/1",
+          attempt_count: 1,
+        },
+        direct_envelope: {
+          allowed_origin: "https://dl.acm.org",
+          path_family: "/doi/pdf/{doi}",
+          expected_identifier: "doi:10.1145/3630106.3658942",
+        },
       },
-      direct_envelope: {
-        allowed_origin: "https://dl.acm.org",
-        path_family: "/doi/pdf/{doi}",
-        expected_identifier: "doi:10.1145/3630106.3658942",
-      },
-    }],
+    ],
   };
   const h = makeHarness(seed);
   h.downloads.items.set(901, {
@@ -9906,70 +13483,80 @@ test("direct pre-ID download is recovered by its exact job filename and settled 
     url: "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942",
   });
   await h.bridge.start();
-  expect(h.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(1);
-  expect(h.backend.store.activeJobs[0]?.direct_terminal).toBe(true);
-  expect(JSON.stringify(h.backend.store)).not.toContain("https://dl.acm.org/doi/pdf/10.1145/3630106.3658942");
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_direct_get_result"),
+  ).toHaveLength(0);
+  expect(h.backend.store.activeJobs[0]?.direct_terminal).not.toBe(true);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
   const second = new Bridge(h.deps);
   await second.start();
-  expect(h.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(1);
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_direct_get_result"),
+  ).toHaveLength(0);
 });
-test("direct pre-ID restart with no exact filename settles the tuple for retry", async () => {
+test("direct pre-ID restart with no exact id keeps the effect unresolved", async () => {
   const jobID = "job_direct_pre_id_missing";
   const h = makeHarness({
     ...emptyStore(),
-    activeJobs: [{
-      job_id: jobID,
-      tab_id: -1,
-      offered_at: 1_700_000_000_000,
-      expires_at: 1_800_000_000_000,
-      status: "accepted",
-      provider_hosts: ["dl.acm.org"],
-      access_mode: "delegated",
-      download_initiated: true,
-      drive_epoch: {
-        drive_attempt_id: "direct-pre-id-missing",
-        ordinal: 0,
-        strategy: "direct",
-        route_revision: "acm-doi-pdf/1",
-        attempt_count: 1,
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "accepted",
+        provider_hosts: ["dl.acm.org"],
+        access_mode: "delegated",
+        download_initiated: true,
+        drive_epoch: {
+          drive_attempt_id: "direct-pre-id-missing",
+          ordinal: 0,
+          strategy: "direct",
+          route_revision: "acm-doi-pdf/1",
+          attempt_count: 1,
+        },
+        direct_envelope: {
+          allowed_origin: "https://dl.acm.org",
+          path_family: "/doi/pdf/{doi}",
+          expected_identifier: "doi:10.1145/3630106.3658942",
+        },
       },
-      direct_envelope: {
-        allowed_origin: "https://dl.acm.org",
-        path_family: "/doi/pdf/{doi}",
-        expected_identifier: "doi:10.1145/3630106.3658942",
-      },
-    }],
+    ],
   });
   await h.bridge.start();
-  expect(h.frames().filter((frame) => frame.type === "provider_direct_get_result")).toHaveLength(1);
-  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(false);
-  expect(h.backend.store.activeJobs[0]?.direct_terminal).toBe(true);
+  expect(
+    h.frames().filter((frame) => frame.type === "provider_direct_get_result"),
+  ).toHaveLength(0);
+  expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(true);
+  expect(h.backend.store.activeJobs[0]?.direct_terminal).not.toBe(true);
 });
 
-
-test("generic pre-ID interrupted download settles once and no-match recovery clears the latch", async () => {
+test("generic exact-ID interruption settles once and missing exact ID remains unresolved", async () => {
   const jobID = "job_generic_pre_id";
   const requests: unknown[][] = [];
   const seed: StoreShape = {
     ...emptyStore(),
-    activeJobs: [{
-      job_id: jobID,
-      tab_id: -1,
-      offered_at: 1_700_000_000_000,
-      expires_at: 1_800_000_000_000,
-      status: "accepted",
-      provider_hosts: ["www.jstor.org"],
-      access_mode: "delegated",
-      download_initiated: true,
-      generic_drive_epoch: {
-        drive_attempt_id: "generic-pre-id-attempt",
-        ordinal: 0,
-        strategy: "generic",
-        revision: "1",
-        strategy_id: "generic-citation-pdf/1",
-        attempt_count: 1,
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "accepted",
+        provider_hosts: ["www.jstor.org"],
+        access_mode: "delegated",
+        download_initiated: true,
+        generic_drive_epoch: {
+          drive_attempt_id: "generic-pre-id-attempt",
+          ordinal: 0,
+          strategy: "generic",
+          revision: "1",
+          strategy_id: "generic-citation-pdf/1",
+          in_flight_download_id: 901,
+          attempt_count: 1,
+        },
       },
-    }],
+    ],
   };
   const h = makeHarness(seed);
   Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
@@ -9989,7 +13576,11 @@ test("generic pre-ID interrupted download settles once and no-match recovery cle
     state: "interrupted",
   });
   await h.bridge.start();
-  expect(requests.filter((args) => args[0] === "provider_drive_epoch_result_request")).toHaveLength(1);
+  expect(
+    requests.filter(
+      (args) => args[0] === "provider_drive_epoch_result_request",
+    ),
+  ).toHaveLength(1);
   expect(h.backend.store.activeJobs[0]?.generic_terminal).toBe(true);
   expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(false);
   const second = new Bridge(h.deps);
@@ -10004,25 +13595,43 @@ test("generic pre-ID interrupted download settles once and no-match recovery cle
     };
   });
   await second.start();
-  expect(requests.filter((args) => args[0] === "provider_drive_epoch_result_request")).toHaveLength(1);
+  expect(
+    requests.filter(
+      (args) => args[0] === "provider_drive_epoch_result_request",
+    ),
+  ).toHaveLength(1);
   expect(requests[0]?.[5]).toBe(jobID);
 
   const missing = makeHarness(seed);
   const missingRequests: unknown[][] = [];
   Reflect.set(missing.bridge, "requestNative", async (...args: unknown[]) => {
     missingRequests.push(args);
-    return { kind: "response", payload: { ...((args[1] ?? {}) as Record<string, unknown>), outcome: "applied" } };
+    return {
+      kind: "response",
+      payload: {
+        ...((args[1] ?? {}) as Record<string, unknown>),
+        outcome: "applied",
+      },
+    };
   });
   missing.downloads.items.clear();
   await missing.bridge.start();
-  expect(missingRequests.filter((args) => args[0] === "provider_drive_epoch_result_request")).toHaveLength(1);
-  expect(missing.backend.store.activeJobs[0]?.download_initiated).toBe(false);
-  expect(missing.backend.store.activeJobs[0]?.generic_terminal).toBe(true);
+  expect(
+    missingRequests.filter(
+      (args) => args[0] === "provider_drive_epoch_result_request",
+    ),
+  ).toHaveLength(0);
+  expect(missing.backend.store.activeJobs[0]?.download_initiated).toBe(true);
+  expect(missing.backend.store.activeJobs[0]?.generic_terminal).not.toBe(true);
 });
 test("institutional candidate offer dispatches claim without awaiting the correlated response", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   const inbound = h.port.inbound(candidateOffer("job_mat_0001"));
   await inbound;
   const claim = await h.port.waitForFrame("institutional_claim_request");
@@ -10039,7 +13648,9 @@ test("institutional candidate offer dispatches claim without awaiting the correl
     phase: "claiming",
     tab_id: -1,
   });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_mat_0001")).toMatchObject({
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_mat_0001"),
+  ).toMatchObject({
     job_id: "job_mat_0001",
     tab_id: -1,
     status: "accepted",
@@ -10047,25 +13658,45 @@ test("institutional candidate offer dispatches claim without awaiting the correl
     expected: { doi: "10.1234/example", title: "Example work" },
     requires_auth: true,
     access_mode: "delegated",
-    generic_drive_epoch: { drive_attempt_id: "attempt-001", ordinal: 0, strategy: "generic", revision: "rev-1" },
+    generic_drive_epoch: {
+      drive_attempt_id: "attempt-001",
+      ordinal: 0,
+      strategy: "generic",
+      revision: "rev-1",
+    },
   });
 });
 
 test("candidate materialization waits behind the global browser effect permit", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   const internals = h.bridge as unknown as {
     claimEffectGovernor: (jobID: string) => string | undefined;
-    releaseEffectGovernor: (jobID: string, token: string, wake?: boolean) => void;
+    releaseEffectGovernor: (
+      jobID: string,
+      token: string,
+      wake?: boolean,
+    ) => void;
   };
   const token = internals.claimEffectGovernor.call(h.bridge, "blocking-effect");
   expect(token).toBeDefined();
   await h.port.inbound(candidateOffer("job_mat_effect_wait"));
   await Promise.resolve();
-  expect(h.frames().some((frame) => frame.type === "institutional_claim_request")).toBe(false);
+  expect(
+    h.frames().some((frame) => frame.type === "institutional_claim_request"),
+  ).toBe(false);
 
-  internals.releaseEffectGovernor.call(h.bridge, "blocking-effect", token!, true);
+  internals.releaseEffectGovernor.call(
+    h.bridge,
+    "blocking-effect",
+    token!,
+    true,
+  );
   const claim = await h.port.waitForFrame("institutional_claim_request");
   expect(claim.job_id).toBe("job_mat_effect_wait");
 });
@@ -10086,10 +13717,17 @@ test("persisted materialization waits for capability negotiation and clears on d
       },
     },
   });
-  h.tabs.seed({ id: 902, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  h.tabs.seed({
+    id: 902,
+    url: "chrome-extension://test/materialize.html#bind_0001",
+    active: false,
+    windowId: 500,
+  });
   await h.bridge.start();
   expect(h.tabs.removed).not.toContain(902);
-  expect(h.frames().some((frame) => frame.type.startsWith("institutional_"))).toBe(false);
+  expect(
+    h.frames().some((frame) => frame.type.startsWith("institutional_")),
+  ).toBe(false);
 
   await h.port.inbound(helloAck());
   expect(h.tabs.removed).toContain(902);
@@ -10099,13 +13737,21 @@ test("persisted materialization waits for capability negotiation and clears on d
 test("candidate-only materialization binds ActiveJob tab before provider navigation", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   await h.port.inbound(candidateOffer("job_mat_candidate_only"));
   await h.port.waitForFrame("institutional_claim_request");
   const internals = h.bridge as unknown as {
     cancelMaterializationWorkflow: (jobID: string) => void;
     applyMaterialization: (jobID: string, event: unknown) => Promise<void>;
-    onTabUpdated: (tabID: number, change: Record<string, string>, tab: TabInfo) => Promise<void>;
+    onTabUpdated: (
+      tabID: number,
+      change: Record<string, string>,
+      tab: TabInfo,
+    ) => Promise<void>;
   };
   internals.cancelMaterializationWorkflow("job_mat_candidate_only");
   await internals.applyMaterialization("job_mat_candidate_only", {
@@ -10115,36 +13761,76 @@ test("candidate-only materialization binds ActiveJob tab before provider navigat
     browser_holder_generation: 1,
     lease_until: "2030-01-01T00:00:00Z",
   });
-  await internals.applyMaterialization("job_mat_candidate_only", { type: "scaffolded", tab_id: 777 });
-  await internals.applyMaterialization("job_mat_candidate_only", { type: "bound" });
-  await internals.applyMaterialization("job_mat_candidate_only", { type: "route_issued", route_issuance_ordinal: 1 });
-  await internals.applyMaterialization("job_mat_candidate_only", { type: "navigating" });
-  await internals.applyMaterialization("job_mat_candidate_only", { type: "navigated" });
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_mat_candidate_only")).toMatchObject({
+  await internals.applyMaterialization("job_mat_candidate_only", {
+    type: "scaffolded",
+    tab_id: 777,
+  });
+  await internals.applyMaterialization("job_mat_candidate_only", {
+    type: "bound",
+  });
+  await internals.applyMaterialization("job_mat_candidate_only", {
+    type: "route_issued",
+    route_issuance_ordinal: 1,
+  });
+  await internals.applyMaterialization("job_mat_candidate_only", {
+    type: "navigating",
+  });
+  await internals.applyMaterialization("job_mat_candidate_only", {
+    type: "navigated",
+  });
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_mat_candidate_only",
+    ),
+  ).toMatchObject({
     tab_id: 777,
     provider_hosts: [PROVIDER_HOST],
   });
-  h.tabs.seed({ id: 777, url: "https://www.jstor.org/stable/example", active: false, windowId: 500 });
+  h.tabs.seed({
+    id: 777,
+    url: "https://www.jstor.org/stable/example",
+    active: false,
+    windowId: 500,
+  });
   let classified: [string, string] | undefined;
   Reflect.set(h.bridge, "assessTrackedDrivenPage", async () => false);
   Reflect.set(h.bridge, "maybeDownloadPDFViewer", async () => {});
-  Reflect.set(h.bridge, "maybeClassify", async (jobID: string, host: string) => {
-    classified = [jobID, host];
-    return undefined;
-  });
+  Reflect.set(
+    h.bridge,
+    "maybeClassify",
+    async (jobID: string, host: string) => {
+      classified = [jobID, host];
+      return undefined;
+    },
+  );
   await internals.onTabUpdated(
     777,
     { url: "https://www.jstor.org/stable/example", status: "complete" },
-    { id: 777, url: "https://www.jstor.org/stable/example", active: false, windowId: 500 },
+    {
+      id: 777,
+      url: "https://www.jstor.org/stable/example",
+      active: false,
+      windowId: 500,
+    },
   );
   expect(classified).toEqual(["job_mat_candidate_only", "www.jstor.org"]);
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_mat_candidate_only")?.tab_id).toBe(777);
-  expect(JSON.stringify(h.backend.store)).not.toContain("https://resolver.example.edu");
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_mat_candidate_only",
+    )?.tab_id,
+  ).toBe(777);
+  expect(JSON.stringify(h.backend.store)).not.toContain(
+    "https://resolver.example.edu",
+  );
 });
 test("institutional claim busy uses bounded retry instead of a dead failed phase", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   await h.port.inbound(candidateOffer("job_mat_busy"));
   const claim = await h.port.waitForFrame("institutional_claim_request");
   await h.port.inbound({
@@ -10162,13 +13848,19 @@ test("institutional claim busy uses bounded retry instead of a dead failed phase
     phase: "offered",
     retry_attempts: 1,
   });
-  const internals = h.bridge as unknown as { materializationRetryTimers: Map<string, object> };
+  const internals = h.bridge as unknown as {
+    materializationRetryTimers: Map<string, object>;
+  };
   expect(internals.materializationRetryTimers.has("job_mat_busy")).toBe(true);
 });
 test("same candidate fresh expiry revives an expired pre-claim offer", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   await h.port.inbound(candidateOffer("job_mat_reoffer"));
   const firstClaim = await h.port.waitForFrame("institutional_claim_request");
   await h.port.inbound({
@@ -10188,13 +13880,20 @@ test("same candidate fresh expiry revives an expired pre-claim offer", async () 
   const retryTimer = h.timers.find((timer) => timer.ms === 1_000);
   expect(retryTimer).toBeDefined();
   h.clock.now = Date.parse("2031-01-01T00:00:00Z");
-  const fresh = candidateOffer("job_mat_reoffer") as { msg_id: string; seq: number; payload: Record<string, unknown> };
+  const fresh = candidateOffer("job_mat_reoffer") as {
+    msg_id: string;
+    seq: number;
+    payload: Record<string, unknown>;
+  };
   fresh.msg_id = "candidate_offer_000002";
   fresh.seq = 4;
   fresh.payload["expires_at"] = "2032-01-01T00:00:00Z";
   const afterFirstClaim = h.port.posted.length;
   await h.port.inbound(fresh);
-  const secondClaim = await h.port.waitForFrame("institutional_claim_request", afterFirstClaim);
+  const secondClaim = await h.port.waitForFrame(
+    "institutional_claim_request",
+    afterFirstClaim,
+  );
   expect(secondClaim.payload["candidate_id"]).toBe("cand_0001");
   expect(h.backend.store.materializations?.["job_mat_reoffer"]).toMatchObject({
     phase: "claiming",
@@ -10206,7 +13905,11 @@ test("same candidate fresh expiry revives an expired pre-claim offer", async () 
 test("institutional bind error uses bounded retry instead of a dead failed phase", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   const internals = h.bridge as unknown as {
     update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
     runMaterialization: (jobID: string) => Promise<void>;
@@ -10233,26 +13936,38 @@ test("institutional bind error uses bounded retry instead of a dead failed phase
     },
   }));
   const current = h.backend.store.materializations?.["job_mat_bind_error"];
-  expect(current).toMatchObject({ phase: "claimed", candidate_id: "cand_0001", binding_id: "bind_0001", tab_id: -1 });
-  expect(internals.cancelledMaterializationJobs.has("job_mat_bind_error")).toBe(false);
+  expect(current).toMatchObject({
+    phase: "claimed",
+    candidate_id: "cand_0001",
+    binding_id: "bind_0001",
+    tab_id: -1,
+  });
+  expect(internals.cancelledMaterializationJobs.has("job_mat_bind_error")).toBe(
+    false,
+  );
   const bindPromise = h.port.waitForFrame("institutional_bind_request");
   let runSettled = false;
-  const runPromise = internals.runMaterialization.call(h.bridge, "job_mat_bind_error").finally(() => {
-    runSettled = true;
-  });
+  const runPromise = internals.runMaterialization
+    .call(h.bridge, "job_mat_bind_error")
+    .finally(() => {
+      runSettled = true;
+    });
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
   const after = h.backend.store.materializations?.["job_mat_bind_error"];
   const frameTypes = h.frames().map((frame) => frame.type);
   if (!frameTypes.includes("institutional_bind_request")) {
-    throw new Error(JSON.stringify({
-      correlation: after,
-      created: h.tabs.created.length,
-      queries: h.tabs.queryCount,
-      pending: internals.pendingMaterializationRequests.length,
-      runSettled,
-      cancelled: internals.cancelledMaterializationJobs.has("job_mat_bind_error"),
-      features: h.backend.store.daemonFeatures,
-    }));
+    throw new Error(
+      JSON.stringify({
+        correlation: after,
+        created: h.tabs.created.length,
+        queries: h.tabs.queryCount,
+        pending: internals.pendingMaterializationRequests.length,
+        runSettled,
+        cancelled:
+          internals.cancelledMaterializationJobs.has("job_mat_bind_error"),
+        features: h.backend.store.daemonFeatures,
+      }),
+    );
   }
   const bind = await bindPromise;
   await h.port.inbound({
@@ -10266,17 +13981,25 @@ test("institutional bind error uses bounded retry instead of a dead failed phase
   await runPromise;
   await Promise.resolve();
   await Promise.resolve();
-  expect(h.backend.store.materializations?.["job_mat_bind_error"]).toMatchObject({
+  expect(
+    h.backend.store.materializations?.["job_mat_bind_error"],
+  ).toMatchObject({
     phase: "claimed",
     retry_attempts: 1,
   });
-  expect(internals.materializationRetryTimers.has("job_mat_bind_error")).toBe(true);
+  expect(internals.materializationRetryTimers.has("job_mat_bind_error")).toBe(
+    true,
+  );
 });
 
 test("scaffold creation failure retries and converges to one replacement", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   const internals = h.bridge as unknown as {
     update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
     runMaterialization: (jobID: string) => Promise<void>;
@@ -10286,7 +14009,9 @@ test("scaffold creation failure retries and converges to one replacement", async
   h.tabs.seed({ id: 999, url: OPENURL, active: false, windowId: 500 });
   await internals.update.call(h.bridge, (store) => ({
     ...store,
-    activeJobs: [{ ...materializationActiveJob("job_mat_scaffold_retry"), tab_id: 999 }],
+    activeJobs: [
+      { ...materializationActiveJob("job_mat_scaffold_retry"), tab_id: 999 },
+    ],
     workWindowID: 500,
     materializations: {
       job_mat_scaffold_retry: {
@@ -10304,28 +14029,56 @@ test("scaffold creation failure retries and converges to one replacement", async
     },
   }));
   const current = h.backend.store.materializations?.["job_mat_scaffold_retry"];
-  expect(current).toMatchObject({ phase: "claimed", candidate_id: "cand_0001", binding_id: "bind_0001", tab_id: -1 });
-  expect(Date.parse(current?.candidate_expires_at ?? "")).toBeGreaterThan(h.clock.now);
-  expect(internals.cancelledMaterializationJobs.has("job_mat_scaffold_retry")).toBe(false);
+  expect(current).toMatchObject({
+    phase: "claimed",
+    candidate_id: "cand_0001",
+    binding_id: "bind_0001",
+    tab_id: -1,
+  });
+  expect(Date.parse(current?.candidate_expires_at ?? "")).toBeGreaterThan(
+    h.clock.now,
+  );
+  expect(
+    internals.cancelledMaterializationJobs.has("job_mat_scaffold_retry"),
+  ).toBe(false);
   h.tabs.failCreate = true;
   await internals.runMaterialization.call(h.bridge, "job_mat_scaffold_retry");
-  expect(internals.materializationRetryTimers.has("job_mat_scaffold_retry")).toBe(true);
-  const retryTimer = h.timers.slice().reverse().find((timer) => timer.ms === 1_000);
+  expect(
+    internals.materializationRetryTimers.has("job_mat_scaffold_retry"),
+  ).toBe(true);
+  const retryTimer = h.timers
+    .slice()
+    .reverse()
+    .find((timer) => timer.ms === 1_000);
   expect(retryTimer).toBeDefined();
   h.tabs.failCreate = false;
   const bindPromise = h.port.waitForFrame("institutional_bind_request");
   await retryTimer!.fn();
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
-  expect(h.frames().map((frame) => frame.type)).toContain("institutional_bind_request");
+  expect(h.frames().map((frame) => frame.type)).toContain(
+    "institutional_bind_request",
+  );
   const bind = await bindPromise;
-  expect(bind.payload["tab_id"]).toBe(h.backend.store.materializations?.["job_mat_scaffold_retry"]?.tab_id);
-  expect(h.tabs.list().filter((tab) => tab.url?.includes("materialize.html#bind_0001") === true)).toHaveLength(1);
+  expect(bind.payload["tab_id"]).toBe(
+    h.backend.store.materializations?.["job_mat_scaffold_retry"]?.tab_id,
+  );
+  expect(
+    h.tabs
+      .list()
+      .filter(
+        (tab) => tab.url?.includes("materialize.html#bind_0001") === true,
+      ),
+  ).toHaveLength(1);
 });
 
 test("institutional claim stale clears local correlation for a later offer", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   await h.port.inbound(candidateOffer("job_mat_stale"));
   const claim = await h.port.waitForFrame("institutional_claim_request");
   await h.port.inbound({
@@ -10338,7 +14091,9 @@ test("institutional claim stale clears local correlation for a later offer", asy
   });
   await Promise.resolve();
   await Promise.resolve();
-  const internals = h.bridge as unknown as { materializationRetryTimers: Map<string, object> };
+  const internals = h.bridge as unknown as {
+    materializationRetryTimers: Map<string, object>;
+  };
   expect(h.backend.store.materializations?.["job_mat_stale"]).toBeUndefined();
   expect(internals.materializationRetryTimers.has("job_mat_stale")).toBe(false);
 });
@@ -10346,11 +14101,20 @@ test("institutional claim stale clears local correlation for a later offer", asy
 test("new institutional candidate supersedes old correlation and closes its scaffold", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   const internals = h.bridge as unknown as {
     update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
   };
-  h.tabs.seed({ id: 901, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  h.tabs.seed({
+    id: 901,
+    url: "chrome-extension://test/materialize.html#bind_0001",
+    active: false,
+    windowId: 500,
+  });
   await internals.update.call(h.bridge, (store) => ({
     ...store,
     activeJobs: [materializationActiveJob("job_mat_supersede")],
@@ -10374,18 +14138,24 @@ test("new institutional candidate supersedes old correlation and closes its scaf
   await h.port.inbound(candidateOffer("job_mat_supersede", "cand_0002"));
   const claim = await h.port.waitForFrame("institutional_claim_request");
   expect(claim.payload["candidate_id"]).toBe("cand_0002");
-  expect(h.backend.store.materializations?.["job_mat_supersede"]).toMatchObject({
-    candidate_id: "cand_0002",
-    phase: "claiming",
-    tab_id: -1,
-  });
+  expect(h.backend.store.materializations?.["job_mat_supersede"]).toMatchObject(
+    {
+      candidate_id: "cand_0002",
+      phase: "claiming",
+      tab_id: -1,
+    },
+  );
   expect(h.tabs.removed).toContain(901);
 });
 
 test("route update loss removes dead scaffold and next run rebinds a replacement", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
   const originalUpdate = h.tabs.update.bind(h.tabs);
   let failNextRoute = true;
   h.tabs.update = async (tabID, properties) => {
@@ -10402,7 +14172,12 @@ test("route update loss removes dead scaffold and next run rebinds a replacement
     cancelledMaterializationJobs: Set<string>;
     pendingMaterializationRequests: unknown[];
   };
-  h.tabs.seed({ id: 903, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  h.tabs.seed({
+    id: 903,
+    url: "chrome-extension://test/materialize.html#bind_0001",
+    active: false,
+    windowId: 500,
+  });
   await internals.update.call(h.bridge, (store) => ({
     ...store,
     activeJobs: [materializationActiveJob("job_mat_dead_tab")],
@@ -10425,29 +14200,46 @@ test("route update loss removes dead scaffold and next run rebinds a replacement
     },
   }));
   const current = h.backend.store.materializations?.["job_mat_dead_tab"];
-  expect(current).toMatchObject({ phase: "bound", candidate_id: "cand_0001", binding_id: "bind_0001", tab_id: 903 });
-  expect(Date.parse(current?.candidate_expires_at ?? "")).toBeGreaterThan(h.clock.now);
-  expect(internals.cancelledMaterializationJobs.has("job_mat_dead_tab")).toBe(false);
-  let runSettled = false;
-  const firstRun = internals.runMaterialization.call(h.bridge, "job_mat_dead_tab").finally(() => {
-    runSettled = true;
+  expect(current).toMatchObject({
+    phase: "bound",
+    candidate_id: "cand_0001",
+    binding_id: "bind_0001",
+    tab_id: 903,
   });
+  expect(Date.parse(current?.candidate_expires_at ?? "")).toBeGreaterThan(
+    h.clock.now,
+  );
+  expect(internals.cancelledMaterializationJobs.has("job_mat_dead_tab")).toBe(
+    false,
+  );
+  let runSettled = false;
+  const firstRun = internals.runMaterialization
+    .call(h.bridge, "job_mat_dead_tab")
+    .finally(() => {
+      runSettled = true;
+    });
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
   const after = h.backend.store.materializations?.["job_mat_dead_tab"];
   const frameTypes = h.frames().map((frame) => frame.type);
   if (!frameTypes.includes("institutional_route_request")) {
-    throw new Error(JSON.stringify({
-      correlation: after,
-      created: h.tabs.created.length,
-      queries: h.tabs.queryCount,
-      pending: internals.pendingMaterializationRequests.length,
-      runSettled,
-      cancelled: internals.cancelledMaterializationJobs.has("job_mat_dead_tab"),
-      features: h.backend.store.daemonFeatures,
-    }));
+    throw new Error(
+      JSON.stringify({
+        correlation: after,
+        created: h.tabs.created.length,
+        queries: h.tabs.queryCount,
+        pending: internals.pendingMaterializationRequests.length,
+        runSettled,
+        cancelled:
+          internals.cancelledMaterializationJobs.has("job_mat_dead_tab"),
+        features: h.backend.store.daemonFeatures,
+      }),
+    );
   }
-  const firstRoute = h.frames().find((frame) => frame.type === "institutional_route_request");
-  if (firstRoute === undefined) throw new Error("institutional route request is missing");
+  const firstRoute = h
+    .frames()
+    .find((frame) => frame.type === "institutional_route_request");
+  if (firstRoute === undefined)
+    throw new Error("institutional route request is missing");
   expect(internals.pendingMaterializationRequests.length).toBe(1);
   expect(typeof firstRoute.payload["request_id"]).toBe("string");
   await h.port.inbound({
@@ -10462,18 +14254,23 @@ test("route update loss removes dead scaffold and next run rebinds a replacement
       claim_id: "claim_0001",
       binding_id: "bind_0001",
       route_issuance_ordinal: 8,
+      effect_ordinal:
+        (firstRoute.payload["expected_effect_ordinal"] as number) + 1,
+      institutional_request_id: firstRoute.payload["institutional_request_id"],
       url: "https://resolver.example.edu/fresh/8",
     },
   });
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
   const afterRoute = h.backend.store.materializations?.["job_mat_dead_tab"];
   if (afterRoute?.phase === "bound") {
-    throw new Error(JSON.stringify({
-      correlation: afterRoute,
-      pending: internals.pendingMaterializationRequests.length,
-      frames: h.frames().map((frame) => frame.type),
-      runSettled,
-    }));
+    throw new Error(
+      JSON.stringify({
+        correlation: afterRoute,
+        pending: internals.pendingMaterializationRequests.length,
+        frames: h.frames().map((frame) => frame.type),
+        runSettled,
+      }),
+    );
   }
   await firstRun;
   expect(h.backend.store.materializations?.["job_mat_dead_tab"]).toMatchObject({
@@ -10486,7 +14283,10 @@ test("route update loss removes dead scaffold and next run rebinds a replacement
 
   const postedBeforeReplacement = h.port.posted.length;
   internals.scheduleMaterialization.call(h.bridge, "job_mat_dead_tab", true);
-  const bind = await h.port.waitForFrame("institutional_bind_request", postedBeforeReplacement);
+  const bind = await h.port.waitForFrame(
+    "institutional_bind_request",
+    postedBeforeReplacement,
+  );
   expect(bind.payload["tab_id"]).not.toBe(903);
   const replacementTabID = bind.payload["tab_id"];
   await h.port.inbound({
@@ -10502,7 +14302,10 @@ test("route update loss removes dead scaffold and next run rebinds a replacement
       binding_id: "bind_0001",
     },
   });
-  const secondRoute = await h.port.waitForFrame("institutional_route_request", postedBeforeReplacement);
+  const secondRoute = await h.port.waitForFrame(
+    "institutional_route_request",
+    postedBeforeReplacement,
+  );
   await h.port.inbound({
     protocol: "papio-browser/1",
     type: "institutional_route_response",
@@ -10515,11 +14318,83 @@ test("route update loss removes dead scaffold and next run rebinds a replacement
       claim_id: "claim_0001",
       binding_id: "bind_0001",
       route_issuance_ordinal: 9,
+      effect_ordinal:
+        (secondRoute.payload["expected_effect_ordinal"] as number) + 1,
+      institutional_request_id: secondRoute.payload["institutional_request_id"],
       url: "https://resolver.example.edu/fresh/9",
     },
   });
-  const navigated = await h.port.waitForFrame("institutional_navigated_request", postedBeforeReplacement);
+  const navigated = await h.port.waitForFrame(
+    "institutional_navigated_request",
+    postedBeforeReplacement,
+  );
   expect(navigated.payload["tab_id"]).toBe(replacementTabID);
+});
+
+test("restart replays a pre-permit navigating correlation with cleanup-only shape", async () => {
+  const h = makeHarness({
+    activeJobs: [materializationActiveJob("job_mat_legacy_restart")],
+    offerURLs: { job_mat_legacy_restart: OPENURL },
+    workWindowID: 500,
+    materializations: {
+      job_mat_legacy_restart: {
+        job_id: "job_mat_legacy_restart",
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim_0001",
+        binding_id: "bind_0001",
+        phase: "navigating",
+        tab_id: 905,
+        route_issuance_ordinal: 7,
+      },
+    },
+  });
+  h.tabs.seed({
+    id: 905,
+    url: "https://resolver.example.edu/open",
+    active: false,
+    windowId: 500,
+  });
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["institutional_materialization_v1"] }),
+  );
+  const internals = h.bridge as unknown as {
+    runMaterialization: (jobID: string) => Promise<void>;
+  };
+  const run = internals.runMaterialization.call(
+    h.bridge,
+    "job_mat_legacy_restart",
+  );
+  let navigation: BrowserMessage | undefined;
+  for (let i = 0; i < 100 && navigation === undefined; i += 1) {
+    const raw = h.port.posted.find(
+      (frame) =>
+        (frame as Record<string, unknown>)["type"] ===
+        "institutional_navigated_request",
+    );
+    if (raw !== undefined)
+      navigation = parseBrowserMessageWithLegacyInstitutionalNavigation(
+        raw,
+        true,
+      );
+    else await Promise.resolve();
+  }
+  if (navigation === undefined)
+    throw new Error("legacy navigation frame is missing");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_navigated_response",
+    msg_id: "legacy_restart_response",
+    job_id: "job_mat_legacy_restart",
+    seq: 4,
+    payload: {
+      request_id: navigation.payload["request_id"],
+      outcome: "stale",
+    },
+  });
+  await run;
 });
 
 test("cancelling materialization removes scaffold, retry timer, and correlation", async () => {
@@ -10539,7 +14414,12 @@ test("cancelling materialization removes scaffold, retry timer, and correlation"
       },
     },
   });
-  h.tabs.seed({ id: 902, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  h.tabs.seed({
+    id: 902,
+    url: "chrome-extension://test/materialize.html#bind_0001",
+    active: false,
+    windowId: 500,
+  });
   await h.bridge.start();
   const internals = h.bridge as unknown as {
     materializationRetryTimers: Map<string, object>;
@@ -10549,7 +14429,9 @@ test("cancelling materialization removes scaffold, retry timer, and correlation"
   await internals.removeJobWithOffer.call(h.bridge, "job_mat_cancel");
   expect(h.backend.store.materializations?.["job_mat_cancel"]).toBeUndefined();
   expect(h.tabs.removed).toContain(902);
-  expect(internals.materializationRetryTimers.has("job_mat_cancel")).toBe(false);
+  expect(internals.materializationRetryTimers.has("job_mat_cancel")).toBe(
+    false,
+  );
 });
 test("deferred route response from superseded candidate cannot navigate replacement", async () => {
   const h = makeHarness({
@@ -10571,14 +14453,30 @@ test("deferred route response from superseded candidate cannot navigate replacem
       },
     },
   });
-  h.tabs.seed({ id: 904, url: "chrome-extension://test/materialize.html#bind_0001", active: false, windowId: 500 });
+  h.tabs.seed({
+    id: 904,
+    url: "chrome-extension://test/materialize.html#bind_0001",
+    active: false,
+    windowId: 500,
+  });
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["institutional_materialization_v1"] }));
-  const internals = h.bridge as unknown as { runMaterialization: (jobID: string) => Promise<void> };
-  const oldRun = internals.runMaterialization.call(h.bridge, "job_mat_route_supersede");
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
+  const internals = h.bridge as unknown as {
+    runMaterialization: (jobID: string) => Promise<void>;
+  };
+  const oldRun = internals.runMaterialization.call(
+    h.bridge,
+    "job_mat_route_supersede",
+  );
   const oldRoute = await h.port.waitForFrame("institutional_route_request");
   await h.port.inbound(candidateOffer("job_mat_route_supersede", "cand_0002"));
-  const replacementClaim = await h.port.waitForFrame("institutional_claim_request");
+  const replacementClaim = await h.port.waitForFrame(
+    "institutional_claim_request",
+  );
   expect(replacementClaim.payload["candidate_id"]).toBe("cand_0002");
   await h.port.inbound({
     protocol: "papio-browser/1",
@@ -10592,10 +14490,757 @@ test("deferred route response from superseded candidate cannot navigate replacem
       claim_id: "claim_0001",
       binding_id: "bind_0001",
       route_issuance_ordinal: 1,
+      effect_ordinal:
+        (oldRoute.payload["expected_effect_ordinal"] as number) + 1,
+      institutional_request_id: oldRoute.payload["institutional_request_id"],
       url: "https://resolver.example.edu/old-route",
     },
   });
   await oldRun;
-  expect(h.tabs.navigations.some((entry) => entry.url.includes("old-route"))).toBe(false);
-  expect(h.backend.store.materializations?.["job_mat_route_supersede"]?.candidate_id).toBe("cand_0002");
+  expect(
+    h.tabs.navigations.some((entry) => entry.url.includes("old-route")),
+  ).toBe(false);
+  expect(
+    h.backend.store.materializations?.["job_mat_route_supersede"]?.candidate_id,
+  ).toBe("cand_0002");
+});
+describe("effect_permit reconcile inbound", () => {
+  function reconcileRequest(
+    jobID: string | undefined,
+    payload: Record<string, unknown>,
+  ): unknown {
+    const jobless = payload["effect_kind"] === "pdf_grab";
+    return {
+      protocol: "papio-browser/1",
+      type: "effect_permit_reconcile_request",
+      msg_id: `reconcile_${String(payload["request_id"])}`,
+      ...(jobID !== undefined && !jobless ? { job_id: jobID } : {}),
+      seq: 5,
+      payload,
+    };
+  }
+  function assertURLFree(frame: unknown): void {
+    const raw = JSON.stringify(frame);
+    expect(raw).not.toContain("https://");
+    expect(raw).not.toContain("http://");
+    expect(raw.toLowerCase()).not.toContain("provider_text");
+    expect(raw).not.toContain("resolver.example.edu/openurl");
+    expect(raw).not.toMatch(/"url"\s*:/);
+    expect(raw).not.toMatch(/"path"\s*:/);
+    expect(raw).not.toMatch(/"provider"/);
+    expect(raw).not.toMatch(/"origin"/);
+  }
+  function assertResponseShape(frame: BrowserMessage): void {
+    const rawPayload = frame.payload;
+    if (rawPayload === null || typeof rawPayload !== "object")
+      throw new Error("payload not object");
+    const p: Record<string, unknown> = rawPayload as Record<string, unknown>;
+    const allowed = [
+      "request_id",
+      "permit_id",
+      "outcome",
+      "dispatched",
+      "download_present",
+      "acknowledged",
+      "tab_present",
+      "detail",
+    ] as const;
+    for (const key of Object.keys(p)) {
+      expect((allowed as readonly string[]).includes(key)).toBe(true);
+    }
+    expect(typeof p["request_id"]).toBe("string");
+    expect(typeof p["permit_id"]).toBe("string");
+    expect(typeof p["outcome"]).toBe("string");
+    const outcome = p["outcome"];
+    expect(
+      typeof outcome === "string" &&
+        ["recorded", "settled", "stale", "duplicate", "error"].includes(
+          outcome,
+        ),
+    ).toBe(true);
+    for (const k of [
+      "dispatched",
+      "download_present",
+      "acknowledged",
+      "tab_present",
+    ] as const) {
+      expect(typeof p[k]).toBe("boolean");
+    }
+    if ("detail" in p) {
+      const detail = p["detail"];
+      expect(typeof detail).toBe("string");
+      if (typeof detail === "string") {
+        expect(detail.length).toBeLessThanOrEqual(1000);
+        expect(detail.includes("\u0000")).toBe(false);
+      }
+    }
+    assertURLFree(frame);
+  }
+
+  test("generic no-dispatch restart emits all-false recorded response deterministically and URL-free", async () => {
+    const jobID = "job_generic_reconcile_no_dispatch";
+    const driveAttemptID = "drive-attempt-generic-no-dispatch";
+    const seed: StoreShape = {
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: 101,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+          access_mode: "delegated",
+          // Persisted pre-dispatch intent is not evidence that the browser
+          // allocated an irreversible download effect.
+          download_initiated: true,
+          generic_drive_epoch: {
+            drive_attempt_id: driveAttemptID,
+            ordinal: 0,
+            strategy: "generic",
+            revision: "rev-1",
+            attempt_count: 0,
+          },
+        },
+      ],
+    };
+    const h = makeHarness(seed);
+    h.tabs.seed({
+      id: 101,
+      url: `https://${PROVIDER_HOST}/article`,
+      active: false,
+      windowId: 500,
+    });
+    await h.bridge.start();
+    const spy: unknown[][] = [];
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      spy.push(args);
+      return { kind: "response", payload: { outcome: "started" } };
+    });
+    const payload = {
+      request_id: "request-generic-no-dispatch-0001",
+      permit_id: "permit-generic-no-dispatch-0001",
+      effect_kind: "generic_drive",
+      drive_attempt_id: driveAttemptID,
+      ordinal: 0,
+      strategy: "generic",
+      revision: "rev-1",
+    };
+    await h.port.inbound(reconcileRequest(jobID, payload));
+    // second inbound proves the serialized queue was not deadlocked by awaiting requestNative
+    await h.port.inbound(
+      reconcileRequest(jobID, {
+        ...payload,
+        request_id: "request-generic-no-dispatch-0002",
+        permit_id: "permit-generic-no-dispatch-0002",
+      }),
+    );
+    const frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames).toHaveLength(2);
+    for (const frame of frames) {
+      expect(frame.job_id).toBe(jobID);
+      expect(frame.payload["dispatched"]).toBe(false);
+      expect(frame.payload["download_present"]).toBe(false);
+      expect(frame.payload["acknowledged"]).toBe(false);
+      expect(frame.payload["tab_present"]).toBe(false);
+      expect(frame.payload["outcome"]).toBe("recorded");
+      assertResponseShape(frame);
+    }
+    expect(spy).toHaveLength(0);
+    const persisted = JSON.parse(JSON.stringify(h.backend.store)) as StoreShape;
+    const restarted = makeHarness(persisted);
+    restarted.tabs.seed({
+      id: 101,
+      url: `https://${PROVIDER_HOST}/article`,
+      active: false,
+      windowId: 500,
+    });
+    await restarted.bridge.start();
+    const spy2: unknown[][] = [];
+    Reflect.set(
+      restarted.bridge,
+      "requestNative",
+      async (...args: unknown[]) => {
+        spy2.push(args);
+        return { kind: "response", payload: {} };
+      },
+    );
+    await restarted.port.inbound(reconcileRequest(jobID, payload));
+    const restartedFrames = restarted
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(restartedFrames).toHaveLength(1);
+    expect(restartedFrames[0]!.payload).toEqual(frames[0]!.payload);
+    assertResponseShape(restartedFrames[0]!);
+    expect(spy2).toHaveLength(0);
+  });
+
+  test("generic exact in-flight download reports dispatched and download_present true without deadlocking and without requestNative", async () => {
+    const jobID = "job_generic_reconcile_download";
+    const driveAttemptID = "drive-attempt-generic-download";
+    const downloadID = 901;
+    const seed: StoreShape = {
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: 102,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+          access_mode: "delegated",
+          download_initiated: true,
+          generic_drive_epoch: {
+            drive_attempt_id: driveAttemptID,
+            ordinal: 0,
+            strategy: "generic",
+            revision: "rev-1",
+            attempt_count: 0,
+            in_flight_download_id: downloadID,
+          },
+        },
+      ],
+    };
+    const h = makeHarness(seed);
+    h.tabs.seed({
+      id: 102,
+      url: `https://${PROVIDER_HOST}/article`,
+      active: false,
+      windowId: 500,
+    });
+    h.downloads.items.set(downloadID, {
+      id: downloadID,
+      url: "https://www.jstor.org/download/paper.pdf",
+      state: "in_progress",
+    });
+    await h.bridge.start();
+    const spy: unknown[][] = [];
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      spy.push(args);
+      return { kind: "response", payload: {} };
+    });
+    const payload = {
+      request_id: "request-generic-download-0001",
+      permit_id: "permit-generic-download-0001",
+      effect_kind: "generic_drive",
+      drive_attempt_id: driveAttemptID,
+      ordinal: 0,
+      strategy: "generic",
+      revision: "rev-1",
+    };
+    const before = h.port.posted.length;
+    await h.port.inbound(reconcileRequest(jobID, payload));
+    // queue a second reconcile on same tuple but different request_id to prove FIFO liveness
+    await h.port.inbound(
+      reconcileRequest(jobID, {
+        ...payload,
+        request_id: "request-generic-download-0002",
+        permit_id: "permit-generic-download-0002",
+      }),
+    );
+    const frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames).toHaveLength(2);
+    for (const frame of frames) {
+      expect(frame.payload["dispatched"]).toBe(true);
+      expect(frame.payload["download_present"]).toBe(true);
+      expect(frame.payload["acknowledged"]).toBe(false);
+      expect(frame.payload["tab_present"]).toBe(false);
+      expect(frame.payload["outcome"]).toBe("recorded");
+      assertResponseShape(frame);
+    }
+    expect(spy).toHaveLength(0);
+    // ensure no URL leaked even though download URL exists only in Downloads map, not in payload
+    for (const frame of frames) assertURLFree(frame);
+    expect(before).toBeLessThan(h.port.posted.length);
+  });
+
+  test("generic missing local tuple records unknown completion with no URL", async () => {
+    const jobID = "job_generic_reconcile_wrong";
+    const driveAttemptID = "drive-attempt-generic-wrong";
+    const h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: 103,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+          access_mode: "delegated",
+          generic_drive_epoch: {
+            drive_attempt_id: driveAttemptID,
+            ordinal: 0,
+            strategy: "generic",
+            revision: "rev-1",
+            attempt_count: 0,
+          },
+        },
+      ],
+    });
+    h.tabs.seed({
+      id: 103,
+      url: `https://${PROVIDER_HOST}/article`,
+      active: false,
+      windowId: 500,
+    });
+    h.downloads.items.set(901, { id: 901, state: "in_progress" });
+    await h.bridge.start();
+    const spy: unknown[][] = [];
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      spy.push(args);
+      return { kind: "response", payload: {} };
+    });
+    const wrong = {
+      request_id: "request-generic-wrong-0001",
+      permit_id: "permit-generic-wrong-0001",
+      effect_kind: "generic_drive",
+      drive_attempt_id: driveAttemptID,
+      ordinal: 1,
+      strategy: "generic",
+      revision: "rev-1",
+    };
+    await h.port.inbound(reconcileRequest(jobID, wrong));
+    const frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.payload["outcome"]).toBe("recorded");
+    expect(frames[0]!.payload["dispatched"]).toBe(false);
+    expect(frames[0]!.payload["download_present"]).toBe(false);
+    expect(frames[0]!.payload["acknowledged"]).toBe(false);
+    expect(frames[0]!.payload["tab_present"]).toBe(false);
+    assertResponseShape(frames[0]!);
+    expect(spy).toHaveLength(0);
+  });
+
+  test("direct_get exact tuple reports evidence and missing local tuple records unknown completion", async () => {
+    const jobID = "job_direct_reconcile";
+    const driveAttemptID = "drive-attempt-direct-reconcile";
+    const downloadID = 902;
+    const h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: 104,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+          access_mode: "delegated",
+          download_initiated: true,
+          direct_terminal: true,
+          drive_epoch: {
+            drive_attempt_id: driveAttemptID,
+            ordinal: 2,
+            strategy: "direct",
+            route_revision: "rev-direct-1",
+            attempt_count: 0,
+            in_flight_download_id: downloadID,
+          } as ProviderDriveEpoch,
+        } as ActiveJob,
+      ],
+    });
+    h.tabs.seed({
+      id: 104,
+      url: `https://${PROVIDER_HOST}/article`,
+      active: false,
+      windowId: 500,
+    });
+    h.downloads.items.set(downloadID, { id: downloadID, state: "in_progress" });
+    await h.bridge.start();
+    const spy: unknown[][] = [];
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      spy.push(args);
+      return { kind: "response", payload: {} };
+    });
+    const exact = {
+      request_id: "request-direct-exact-0001",
+      permit_id: "permit-direct-exact-0001",
+      effect_kind: "direct_get",
+      drive_attempt_id: driveAttemptID,
+      ordinal: 2,
+      strategy: "direct_get",
+      revision: "rev-direct-1",
+    };
+    await h.port.inbound(reconcileRequest(jobID, exact));
+    let frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames[0]!.payload["outcome"]).toBe("recorded");
+    expect(frames[0]!.payload["dispatched"]).toBe(true);
+    expect(frames[0]!.payload["download_present"]).toBe(true);
+    expect(frames[0]!.payload["acknowledged"]).toBe(false);
+    expect(frames[0]!.payload["tab_present"]).toBe(false);
+    assertResponseShape(frames[0]!);
+    const wrong = {
+      ...exact,
+      request_id: "request-direct-wrong-0001",
+      permit_id: "permit-direct-wrong-0001",
+      revision: "rev-wrong",
+    };
+    await h.port.inbound(reconcileRequest(jobID, wrong));
+    frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames[1]!.payload["outcome"]).toBe("recorded");
+    expect(frames[1]!.payload["dispatched"]).toBe(false);
+    expect(frames[1]!.payload["download_present"]).toBe(false);
+    assertResponseShape(frames[1]!);
+    expect(spy).toHaveLength(0);
+  });
+
+  test("pdf_grab exact correlation reports browser evidence; missing correlation records unknown completion", async () => {
+    const jobID = "job_pdf_grab_reconcile";
+    const grabID = "grab-reconcile-0001";
+    const h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: -1,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+        },
+      ],
+    });
+    await h.bridge.start();
+    const corr = {
+      scanID: "scan-pdf-0001",
+      tabID: 201,
+      downloadID: 903,
+      steeringPath: "papio/grabs/grabpath/",
+      state: "quarantined",
+    } as PdfGrabCorrelation;
+    (
+      h.bridge as unknown as {
+        pdfGrabCorrelations: Map<string, PdfGrabCorrelation>;
+      }
+    ).pdfGrabCorrelations.set(grabID, corr);
+    h.tabs.seed({
+      id: 201,
+      url: "https://example.com/page",
+      active: false,
+      windowId: 500,
+    });
+    h.downloads.items.set(903, { id: 903, state: "in_progress" });
+    const spy: unknown[][] = [];
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      spy.push(args);
+      return { kind: "response", payload: {} };
+    });
+    const exact = {
+      request_id: "request-pdf-exact-0001",
+      permit_id: "permit-pdf-exact-0001",
+      effect_kind: "pdf_grab",
+      grab_id: grabID,
+    };
+    await h.port.inbound(reconcileRequest(undefined, exact));
+    let frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames[0]!.payload["dispatched"]).toBe(true);
+    expect(frames[0]!.payload["download_present"]).toBe(true);
+    expect(frames[0]!.payload["acknowledged"]).toBe(false);
+    expect(frames[0]!.payload["tab_present"]).toBe(true);
+    expect(frames[0]!.payload["outcome"]).toBe("recorded");
+    assertResponseShape(frames[0]!);
+    const unknown = {
+      request_id: "request-pdf-unknown-0001",
+      permit_id: "permit-pdf-unknown-0001",
+      effect_kind: "pdf_grab",
+      grab_id: "grab-unknown-9999",
+    };
+    await h.port.inbound(reconcileRequest(undefined, unknown));
+    frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames[1]!.payload["outcome"]).toBe("recorded");
+    expect(frames[1]!.payload["dispatched"]).toBe(false);
+    expect(frames[1]!.payload["download_present"]).toBe(false);
+    expect(frames[1]!.payload["tab_present"]).toBe(false);
+    assertResponseShape(frames[1]!);
+    expect(spy).toHaveLength(0);
+  });
+
+  test("institutional bound reports acknowledged false with live tab, navigated reports acknowledged true", async () => {
+    const jobID = "job_institutional_reconcile";
+    const claimID = "claim-reconcile-0001";
+    const bindingID = "binding-reconcile-0001";
+    const h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: -1,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+        },
+      ],
+      materializations: {
+        [jobID]: {
+          job_id: jobID,
+          candidate_id: "cand-0001",
+          materialization_kind: "browser_tab",
+          candidate_expires_at: "2030-01-01T00:00:00Z",
+          claim_id: claimID,
+          binding_id: bindingID,
+          browser_holder_generation: 1,
+          lease_until: "2030-01-01T00:05:00Z",
+          phase: "bound",
+          tab_id: 301,
+        },
+      },
+    });
+    h.tabs.seed({
+      id: 301,
+      url: "chrome-extension://test/materialize.html#bind_0001",
+      active: false,
+      windowId: 500,
+    });
+    await h.bridge.start();
+    const spy: unknown[][] = [];
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      spy.push(args);
+      return { kind: "response", payload: {} };
+    });
+    const boundPayload = {
+      request_id: "request-inst-bound-0001",
+      permit_id: "permit-inst-bound-0001",
+      effect_kind: "institutional",
+      claim_id: claimID,
+      binding_id: bindingID,
+      effect_ordinal: 1,
+      institutional_request_id: "inst-req-0001",
+      tab_id: 301,
+    };
+    await h.port.inbound(reconcileRequest(jobID, boundPayload));
+    let frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames[0]!.payload["acknowledged"]).toBe(false);
+    expect(frames[0]!.payload["tab_present"]).toBe(true);
+    expect(frames[0]!.payload["outcome"]).toBe("recorded");
+    assertResponseShape(frames[0]!);
+    // navigated phase
+    await (
+      h.bridge as unknown as {
+        update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
+      }
+    ).update.call(h.bridge, (s) => ({
+      ...s,
+      materializations: {
+        ...s.materializations,
+        [jobID]: {
+          ...s.materializations![jobID]!,
+          phase: "navigated" as const,
+        },
+      },
+    }));
+    const navigatedPayload = {
+      ...boundPayload,
+      request_id: "request-inst-nav-0001",
+      permit_id: "permit-inst-nav-0001",
+      effect_ordinal: 2,
+      institutional_request_id: "inst-req-0002",
+    };
+    await h.port.inbound(reconcileRequest(jobID, navigatedPayload));
+    frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames[1]!.payload["acknowledged"]).toBe(true);
+    expect(frames[1]!.payload["tab_present"]).toBe(true);
+    expect(frames[1]!.payload["outcome"]).toBe("recorded");
+    assertResponseShape(frames[1]!);
+    // closed tab => tab_present false
+    await h.tabs.remove(301);
+    await h.port.inbound(
+      reconcileRequest(jobID, {
+        ...boundPayload,
+        request_id: "request-inst-closed-0001",
+        permit_id: "permit-inst-closed-0001",
+      }),
+    );
+    frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames[2]!.payload["tab_present"]).toBe(false);
+    assertResponseShape(frames[2]!);
+    expect(spy).toHaveLength(0);
+  });
+
+  test("institutional mismatched local claim records unknown completion", async () => {
+    const jobID = "job_inst_wrong";
+    const h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: -1,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+        },
+      ],
+      materializations: {
+        [jobID]: {
+          job_id: jobID,
+          candidate_id: "cand-0001",
+          materialization_kind: "browser_tab",
+          candidate_expires_at: "2030-01-01T00:00:00Z",
+          claim_id: "claim-correct",
+          binding_id: "binding-correct",
+          browser_holder_generation: 1,
+          lease_until: "2030-01-01T00:05:00Z",
+          phase: "bound",
+          tab_id: 311,
+        },
+      },
+    });
+    h.tabs.seed({
+      id: 311,
+      url: "chrome-extension://test/materialize.html#bind",
+      active: false,
+      windowId: 500,
+    });
+    await h.bridge.start();
+    const payload = {
+      request_id: "request-inst-wrong-0001",
+      permit_id: "permit-inst-wrong-0001",
+      effect_kind: "institutional",
+      claim_id: "claim-wrong",
+      binding_id: "binding-correct",
+      effect_ordinal: 1,
+      institutional_request_id: "inst-req-wrong",
+      tab_id: 311,
+    };
+    await h.port.inbound(reconcileRequest(jobID, payload));
+    const frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames[0]!.payload["outcome"]).toBe("recorded");
+    expect(frames[0]!.payload["dispatched"]).toBe(false);
+    expect(frames[0]!.payload["acknowledged"]).toBe(false);
+    expect(frames[0]!.payload["tab_present"]).toBe(false);
+    assertResponseShape(frames[0]!);
+  });
+
+  test("terms without persisted acknowledgement records unknown completion URL-free", async () => {
+    const jobID = "job_terms_reconcile";
+    const h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: -1,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+        },
+      ],
+    });
+    await h.bridge.start();
+    const spy: unknown[][] = [];
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      spy.push(args);
+      return { kind: "response", payload: {} };
+    });
+    const payload = {
+      request_id: "request-terms-0001",
+      permit_id: "permit-terms-0001",
+      effect_kind: "terms",
+      terms_occurrence_id: "terms-occurrence-0001",
+    };
+    await h.port.inbound(reconcileRequest(jobID, payload));
+    const frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames[0]!.payload["outcome"]).toBe("recorded");
+    expect(frames[0]!.payload["dispatched"]).toBe(false);
+    expect(frames[0]!.payload["download_present"]).toBe(false);
+    expect(frames[0]!.payload["acknowledged"]).toBe(false);
+    expect(frames[0]!.payload["tab_present"]).toBe(false);
+    assertResponseShape(frames[0]!);
+    expect(spy).toHaveLength(0);
+    // deterministic across restart
+    const persisted = JSON.parse(JSON.stringify(h.backend.store)) as StoreShape;
+    const restarted = makeHarness(persisted);
+    await restarted.bridge.start();
+    await restarted.port.inbound(reconcileRequest(jobID, payload));
+    const restartedFrames = restarted
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(restartedFrames[0]!.payload).toEqual(frames[0]!.payload);
+  });
+
+  test("reconcile response never carries URL/path/provider and deadlock-free concurrent inbound", async () => {
+    const jobID = "job_reconcile_privacy";
+    const driveAttemptID = "drive-attempt-privacy-0001";
+    const h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: 401,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: [PROVIDER_HOST],
+          access_mode: "delegated",
+          generic_drive_epoch: {
+            drive_attempt_id: driveAttemptID,
+            ordinal: 0,
+            strategy: "generic",
+            revision: "rev-privacy-1",
+            attempt_count: 0,
+          },
+        },
+      ],
+    });
+    h.tabs.seed({
+      id: 401,
+      url: `https://${PROVIDER_HOST}/article`,
+      active: false,
+      windowId: 500,
+    });
+    await h.bridge.start();
+    const spy: unknown[][] = [];
+    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+      spy.push(args);
+      return { kind: "response", payload: {} };
+    });
+    const payload = {
+      request_id: "request-privacy-0001",
+      permit_id: "permit-privacy-0001",
+      effect_kind: "generic_drive",
+      drive_attempt_id: driveAttemptID,
+      ordinal: 0,
+      strategy: "generic",
+      revision: "rev-privacy-1",
+    };
+    // fire reconcile and immediately queue a hello_ack behind it to prove FIFO liveness
+    const p1 = h.port.inbound(reconcileRequest(jobID, payload));
+    const p2 = h.port.inbound(helloAck({ features: ["effect_permit_v1"] }));
+    await Promise.all([p1, p2]);
+    const frames = h
+      .frames()
+      .filter((f) => f.type === "effect_permit_reconcile_response");
+    expect(frames).toHaveLength(1);
+    assertResponseShape(frames[0]!);
+    // hello_ack must have been processed (daemonFeatures set)
+    expect(h.backend.store.daemonFeatures).toContain("effect_permit_v1");
+    expect(spy).toHaveLength(0);
+  });
 });

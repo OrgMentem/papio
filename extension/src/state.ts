@@ -11,11 +11,13 @@
 import type { DeliverySessionEvidence } from "./protocol";
 import type { FederatedClaimPhase } from "./federated-claim";
 
-export type JobStatus = "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
+export type JobStatus =
+  "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
 
 /** Browser-managed delivery correlation. The source URL is worker-local and
  * intentionally omitted by the managed-state migration/serializer. */
-export type PendingDeliveryStatus = "sending" | "waiting_manual" | "downloaded" | "failed" | "adopted";
+export type PendingDeliveryStatus =
+  "sending" | "waiting_manual" | "downloaded" | "failed" | "adopted";
 export interface PendingDelivery {
   job_id: string;
   /** Present only while this worker is alive; never written to managed state. */
@@ -64,7 +66,6 @@ export async function getSuccessAckMode(
   }
 }
 
-
 /** Durable user choice for the dedicated background work window. `false`
  * disables routing and restores legacy in-window tabs; absent means enabled.
  * Retained for backward compatibility; new installs use HANDOFF_SURFACE_KEY. */
@@ -87,7 +88,8 @@ export const MANAGED_TAB_LEDGER_KEY = "papio_managed_tabs_v1";
 
 /** Native-daemon compatibility as last reported by the bridge. `undefined`
  * remains valid for state persisted by earlier extension versions. */
-export type DaemonConnectionStatus = "connected" | "disconnected" | "daemon_outdated" | "extension_outdated";
+export type DaemonConnectionStatus =
+  "connected" | "disconnected" | "daemon_outdated" | "extension_outdated";
 
 /** Durable drive epoch for one daemon-selected provider candidate. The URL is
  * intentionally absent: only the daemon's opaque attempt and public route
@@ -117,6 +119,19 @@ export interface DirectEnvelopeCorrelation {
   expected_identifier: string;
 }
 
+/** URL-free terms effect correlation. No URL, path, or page text is persisted;
+ * only opaque daemon-minted IDs and the deterministic authority digest survive
+ * restart. */
+export interface TermsEffectCorrelation {
+  job_id: string;
+  permit_id: string;
+  terms_occurrence_id: string;
+  authority_digest: string;
+  dispatched: boolean;
+  acknowledged: boolean;
+  /** Exact result awaiting (or having received) daemon acknowledgement. */
+  result_outcome?: "accepted" | "not_dispatched";
+}
 
 export interface ActiveJob {
   job_id: string;
@@ -151,7 +166,9 @@ export interface ActiveJob {
   /** Direct route envelope needed to classify the browser download after a
    * worker restart. The tuple and download id remain in drive_epoch. */
   direct_envelope?: DirectEnvelopeCorrelation;
-  /** Durable generic strategy tuple; candidate URLs remain worker-local. */
+  /** Durable generic strategy tuple and daemon-selected candidate identity;
+   * candidate URLs remain worker-local and are never persisted or sent over
+   * native messaging. */
   generic_drive_epoch?: ProviderDriveEpoch;
   /** Generic epoch bookkeeping is opaque correlation only. Candidate URLs and
    * page-derived evidence remain worker-local. */
@@ -159,6 +176,10 @@ export interface ActiveJob {
   generic_positive_attempts?: number;
   generic_attempted_strategies?: string[];
   generic_terminal?: boolean;
+  /** A daemon busy/stale start is deferred without consuming this identity;
+   * an exact same-tuple re-offer clears the defer and retries the same
+   * candidate. */
+  generic_deferred?: boolean;
   /** Cold auth offers wait for explicit inbox/popup engagement before opening
    * a managed tab. */
   engagement_required?: boolean;
@@ -302,12 +323,18 @@ export interface MaterializationCorrelation {
   route_issuance_ordinal?: number;
   /** Explicit crash/reconnect replay marker for an already-issued route. */
   route_replay_ordinal?: number;
+  /** Stable idempotency key for one logical institutional navigation. */
+  institutional_request_id?: string;
+  /** Claim effect ordinal supplied to the first acquire for this request. */
+  expected_effect_ordinal?: number;
+  /** Daemon-committed effect ordinal returned with route authorization. */
+  effect_ordinal?: number;
   /** Number of lost claim/bind responses in this bounded offer attempt. */
   retry_attempts?: number;
   /** Browser-local wake deadline for the next detached response-loss retry. */
   retry_after?: number;
 }
- 
+
 export type MaterializationEvent =
   | { type: "offer"; correlation: MaterializationCorrelation }
   | { type: "claiming" }
@@ -322,7 +349,17 @@ export type MaterializationEvent =
   | { type: "reconcile_tab"; tab_id: number }
   | { type: "scaffold_lost" }
   | { type: "bound" }
-  | { type: "route_issued"; route_issuance_ordinal: number }
+  | {
+      type: "route_prepared";
+      institutional_request_id: string;
+      expected_effect_ordinal: number;
+    }
+  | {
+      type: "route_issued";
+      route_issuance_ordinal: number;
+      effect_ordinal: number;
+      institutional_request_id: string;
+    }
   | { type: "navigating" }
   | { type: "navigated" }
   | { type: "retry_route"; tab_id?: number }
@@ -332,52 +369,100 @@ export type MaterializationEvent =
   | { type: "retry_navigated"; attempt: number; retry_after?: number }
   | { type: "failed" }
   | { type: "clear" };
- 
+
 const MATERIALIZATION_ID = /^[A-Za-z0-9_-]{8,128}$/u;
 
-const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
+const RFC3339 =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
 
 function validMaterializationID(value: unknown): value is string {
   return typeof value === "string" && MATERIALIZATION_ID.test(value);
 }
 
 function validRFC3339(value: unknown): value is string {
-  return typeof value === "string" && RFC3339.test(value) && Number.isFinite(Date.parse(value));
+  return (
+    typeof value === "string" &&
+    RFC3339.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
 }
 
-function validMaterializationCorrelation(value: unknown): value is MaterializationCorrelation {
-  if (!isRecord(value) ||
-      typeof value.job_id !== "string" ||
-      !validMaterializationID(value.candidate_id) ||
-      value.materialization_kind !== "browser_tab" ||
-      !validRFC3339(value.candidate_expires_at) ||
-      !MATERIALIZATION_PHASES.includes(value.phase as MaterializationPhase) ||
-      !isFiniteNumber(value.tab_id) ||
-      !Number.isSafeInteger(value.tab_id) ||
-      value.tab_id < -1) return false;
-  if (value.claim_id !== undefined && !validMaterializationID(value.claim_id)) return false;
-  if (value.binding_id !== undefined && !validMaterializationID(value.binding_id)) return false;
+function validMaterializationCorrelation(
+  value: unknown,
+): value is MaterializationCorrelation {
+  if (
+    !isRecord(value) ||
+    typeof value.job_id !== "string" ||
+    !validMaterializationID(value.candidate_id) ||
+    value.materialization_kind !== "browser_tab" ||
+    !validRFC3339(value.candidate_expires_at) ||
+    !MATERIALIZATION_PHASES.includes(value.phase as MaterializationPhase) ||
+    !isFiniteNumber(value.tab_id) ||
+    !Number.isSafeInteger(value.tab_id) ||
+    value.tab_id < -1
+  )
+    return false;
+  if (value.claim_id !== undefined && !validMaterializationID(value.claim_id))
+    return false;
+  if (
+    value.binding_id !== undefined &&
+    !validMaterializationID(value.binding_id)
+  )
+    return false;
   if (
     value.browser_holder_generation !== undefined &&
     (!isFiniteNumber(value.browser_holder_generation) ||
       !Number.isSafeInteger(value.browser_holder_generation) ||
       value.browser_holder_generation < 1)
-  ) return false;
-  if (value.lease_until !== undefined && !validRFC3339(value.lease_until)) return false;
-  if (value.route_issuance_ordinal !== undefined &&
-      (!isFiniteNumber(value.route_issuance_ordinal) ||
-        !Number.isSafeInteger(value.route_issuance_ordinal) ||
-        value.route_issuance_ordinal < 1)) return false;
-  if (value.route_replay_ordinal !== undefined &&
-      (!isFiniteNumber(value.route_replay_ordinal) ||
-        !Number.isSafeInteger(value.route_replay_ordinal) ||
-        value.route_replay_ordinal < 1)) return false;
-  if (value.retry_attempts !== undefined &&
-      (!isFiniteNumber(value.retry_attempts) ||
-        !Number.isSafeInteger(value.retry_attempts) ||
-        value.retry_attempts < 0)) return false;
-  if (value.retry_after !== undefined &&
-      (!isFiniteNumber(value.retry_after) || value.retry_after < 0)) return false;
+  )
+    return false;
+  if (value.lease_until !== undefined && !validRFC3339(value.lease_until))
+    return false;
+  if (
+    value.route_issuance_ordinal !== undefined &&
+    (!isFiniteNumber(value.route_issuance_ordinal) ||
+      !Number.isSafeInteger(value.route_issuance_ordinal) ||
+      value.route_issuance_ordinal < 1)
+  )
+    return false;
+  if (
+    value.route_replay_ordinal !== undefined &&
+    (!isFiniteNumber(value.route_replay_ordinal) ||
+      !Number.isSafeInteger(value.route_replay_ordinal) ||
+      value.route_replay_ordinal < 1)
+  )
+    return false;
+  if (
+    value.institutional_request_id !== undefined &&
+    !validMaterializationID(value.institutional_request_id)
+  )
+    return false;
+  if (
+    value.expected_effect_ordinal !== undefined &&
+    (!isFiniteNumber(value.expected_effect_ordinal) ||
+      !Number.isSafeInteger(value.expected_effect_ordinal) ||
+      value.expected_effect_ordinal < 0)
+  )
+    return false;
+  if (
+    value.effect_ordinal !== undefined &&
+    (!isFiniteNumber(value.effect_ordinal) ||
+      !Number.isSafeInteger(value.effect_ordinal) ||
+      value.effect_ordinal < 1)
+  )
+    return false;
+  if (
+    value.retry_attempts !== undefined &&
+    (!isFiniteNumber(value.retry_attempts) ||
+      !Number.isSafeInteger(value.retry_attempts) ||
+      value.retry_attempts < 0)
+  )
+    return false;
+  if (
+    value.retry_after !== undefined &&
+    (!isFiniteNumber(value.retry_after) || value.retry_after < 0)
+  )
+    return false;
   return true;
 }
 
@@ -392,14 +477,26 @@ const MATERIALIZATION_PHASES: readonly MaterializationPhase[] = [
   "failed",
 ];
 
-const MATERIALIZATION_TRANSITIONS: Readonly<Record<MaterializationEvent["type"], readonly MaterializationPhase[]>> = {
+const MATERIALIZATION_TRANSITIONS: Readonly<
+  Record<MaterializationEvent["type"], readonly MaterializationPhase[]>
+> = {
   offer: [],
   claiming: ["offered", "failed"],
   claimed: ["claiming"],
   scaffolded: ["claimed"],
-  reconcile_tab: ["offered", "claiming", "claimed", "bound", "route_issued", "navigating", "navigated", "failed"],
+  reconcile_tab: [
+    "offered",
+    "claiming",
+    "claimed",
+    "bound",
+    "route_issued",
+    "navigating",
+    "navigated",
+    "failed",
+  ],
   scaffold_lost: ["route_issued", "navigating"],
   bound: ["claimed"],
+  route_prepared: ["bound"],
   route_issued: ["bound"],
   navigating: ["route_issued"],
   navigated: ["navigating"],
@@ -408,22 +505,35 @@ const MATERIALIZATION_TRANSITIONS: Readonly<Record<MaterializationEvent["type"],
   retry_bind: ["claimed", "bound"],
   retry_route_response: ["bound"],
   retry_navigated: ["navigating"],
-  failed: ["offered", "claiming", "claimed", "bound", "route_issued", "navigating"],
+  failed: [
+    "offered",
+    "claiming",
+    "claimed",
+    "bound",
+    "route_issued",
+    "navigating",
+  ],
   clear: MATERIALIZATION_PHASES,
 };
 
 /** Focused reducer for one URL-free materialization correlation. Invalid or
  * out-of-order events are no-ops, making duplicate and stale callbacks safe. */
-export function reduceMaterialization(store: StoreShape, jobID: string, event: MaterializationEvent): StoreShape {
+export function reduceMaterialization(
+  store: StoreShape,
+  jobID: string,
+  event: MaterializationEvent,
+): StoreShape {
   const current = store.materializations?.[jobID];
   if (event.type === "offer") {
     const incoming = event.correlation;
-    if (incoming.job_id !== jobID || !validMaterializationCorrelation(incoming)) return store;
+    if (incoming.job_id !== jobID || !validMaterializationCorrelation(incoming))
+      return store;
     if (current !== undefined) {
       if (current.candidate_id === incoming.candidate_id) {
         const currentExpiry = Date.parse(current.candidate_expires_at);
         const incomingExpiry = Date.parse(incoming.candidate_expires_at);
-        if (!Number.isFinite(incomingExpiry) || incomingExpiry <= currentExpiry) return store;
+        if (!Number.isFinite(incomingExpiry) || incomingExpiry <= currentExpiry)
+          return store;
         const refreshed: MaterializationCorrelation = {
           ...current,
           candidate_expires_at: incoming.candidate_expires_at,
@@ -441,25 +551,40 @@ export function reduceMaterialization(store: StoreShape, jobID: string, event: M
         }
         return {
           ...store,
-          materializations: { ...(store.materializations ?? {}), [jobID]: refreshed },
+          materializations: {
+            ...(store.materializations ?? {}),
+            [jobID]: refreshed,
+          },
         };
       }
       return {
         ...store,
-        materializations: { ...(store.materializations ?? {}), [jobID]: { ...incoming } },
+        materializations: {
+          ...(store.materializations ?? {}),
+          [jobID]: { ...incoming },
+        },
       };
     }
     return {
       ...store,
-      materializations: { ...(store.materializations ?? {}), [jobID]: { ...incoming } },
+      materializations: {
+        ...(store.materializations ?? {}),
+        [jobID]: { ...incoming },
+      },
     };
   }
-  if (current === undefined || !MATERIALIZATION_TRANSITIONS[event.type].includes(current.phase)) return store;
+  if (
+    current === undefined ||
+    !MATERIALIZATION_TRANSITIONS[event.type].includes(current.phase)
+  )
+    return store;
   if (event.type === "clear") {
     const materializations = { ...(store.materializations ?? {}) };
     delete materializations[jobID];
     const activeJobs = store.activeJobs.map((job) =>
-      job.job_id === jobID && job.tab_id === current.tab_id ? { ...job, tab_id: -1 } : job,
+      job.job_id === jobID && job.tab_id === current.tab_id
+        ? { ...job, tab_id: -1 }
+        : job,
     );
     if (Object.keys(materializations).length === 0) {
       const next = { ...store, activeJobs };
@@ -480,7 +605,8 @@ export function reduceMaterialization(store: StoreShape, jobID: string, event: M
         !Number.isInteger(event.browser_holder_generation) ||
         event.browser_holder_generation < 1 ||
         !validRFC3339(event.lease_until)
-      ) return store;
+      )
+        return store;
       next = {
         ...next,
         claim_id: event.claim_id,
@@ -489,6 +615,9 @@ export function reduceMaterialization(store: StoreShape, jobID: string, event: M
         lease_until: event.lease_until,
         phase: "claimed",
       };
+      delete next.institutional_request_id;
+      delete next.expected_effect_ordinal;
+      delete next.effect_ordinal;
       delete next.retry_after;
       delete next.retry_attempts;
       break;
@@ -510,15 +639,39 @@ export function reduceMaterialization(store: StoreShape, jobID: string, event: M
       delete next.retry_after;
       delete next.retry_attempts;
       break;
+    case "route_prepared":
+      if (
+        !validMaterializationID(event.institutional_request_id) ||
+        !Number.isSafeInteger(event.expected_effect_ordinal) ||
+        event.expected_effect_ordinal < 0
+      )
+        return store;
+      next.institutional_request_id = event.institutional_request_id;
+      next.expected_effect_ordinal = event.expected_effect_ordinal;
+      break;
     case "route_issued": {
-      if (!Number.isInteger(event.route_issuance_ordinal) || event.route_issuance_ordinal < 1) return store;
-      const replaying = next.route_replay_ordinal === event.route_issuance_ordinal;
+      if (
+        !Number.isInteger(event.route_issuance_ordinal) ||
+        event.route_issuance_ordinal < 1 ||
+        !Number.isInteger(event.effect_ordinal) ||
+        event.effect_ordinal < 1 ||
+        !validMaterializationID(event.institutional_request_id) ||
+        next.institutional_request_id !== event.institutional_request_id ||
+        next.expected_effect_ordinal === undefined ||
+        event.effect_ordinal !== next.expected_effect_ordinal + 1
+      )
+        return store;
+      const replaying =
+        next.route_replay_ordinal === event.route_issuance_ordinal;
       if (
         next.route_issuance_ordinal !== undefined &&
         (event.route_issuance_ordinal < next.route_issuance_ordinal ||
-          (event.route_issuance_ordinal === next.route_issuance_ordinal && !replaying))
-      ) return store;
+          (event.route_issuance_ordinal === next.route_issuance_ordinal &&
+            !replaying))
+      )
+        return store;
       next.route_issuance_ordinal = event.route_issuance_ordinal;
+      next.effect_ordinal = event.effect_ordinal;
       delete next.route_replay_ordinal;
       next.phase = "route_issued";
       break;
@@ -534,14 +687,22 @@ export function reduceMaterialization(store: StoreShape, jobID: string, event: M
         if (!Number.isInteger(event.tab_id) || event.tab_id < 0) return store;
         next.tab_id = event.tab_id;
       }
-      if ((current.phase === "route_issued" || current.phase === "navigating") &&
-          next.route_issuance_ordinal !== undefined) {
+      if (
+        (current.phase === "route_issued" || current.phase === "navigating") &&
+        next.route_issuance_ordinal !== undefined
+      ) {
         next.route_replay_ordinal = next.route_issuance_ordinal;
       }
-      next.phase = next.binding_id === undefined ? "failed" : next.tab_id < 0 ? "claimed" : "bound";
+      next.phase =
+        next.binding_id === undefined
+          ? "failed"
+          : next.tab_id < 0
+            ? "claimed"
+            : "bound";
       break;
     case "retry_claim":
-      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0) return store;
+      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0)
+        return store;
       next.phase = "offered";
       next.tab_id = -1;
       delete next.claim_id;
@@ -550,26 +711,32 @@ export function reduceMaterialization(store: StoreShape, jobID: string, event: M
       delete next.lease_until;
       delete next.route_issuance_ordinal;
       delete next.route_replay_ordinal;
+      delete next.institutional_request_id;
+      delete next.expected_effect_ordinal;
+      delete next.effect_ordinal;
       next.retry_attempts = event.attempt;
       if (event.retry_after === undefined) delete next.retry_after;
       else next.retry_after = event.retry_after;
       break;
     case "retry_bind":
-      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0) return store;
+      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0)
+        return store;
       if (current.phase === "claimed") next.phase = "claimed";
       next.retry_attempts = event.attempt;
       if (event.retry_after === undefined) delete next.retry_after;
       else next.retry_after = event.retry_after;
       break;
     case "retry_route_response":
-      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0) return store;
+      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0)
+        return store;
       next.phase = "bound";
       next.retry_attempts = event.attempt;
       if (event.retry_after === undefined) delete next.retry_after;
       else next.retry_after = event.retry_after;
       break;
     case "retry_navigated":
-      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0) return store;
+      if (!Number.isSafeInteger(event.attempt) || event.attempt < 0)
+        return store;
       next.phase = "navigating";
       next.retry_attempts = event.attempt;
       if (event.retry_after === undefined) delete next.retry_after;
@@ -587,15 +754,20 @@ export function reduceMaterialization(store: StoreShape, jobID: string, event: M
     event.type === "scaffold_lost" ||
     event.type === "retry_route" ||
     event.type === "retry_claim";
-  if (!tabSync) return { ...store, materializations: { ...(store.materializations ?? {}), [jobID]: next } };
+  if (!tabSync)
+    return {
+      ...store,
+      materializations: { ...(store.materializations ?? {}), [jobID]: next },
+    };
   const tabID = next.tab_id;
   return {
     ...store,
     materializations: { ...(store.materializations ?? {}), [jobID]: next },
-    activeJobs: store.activeJobs.map((job) => job.job_id === jobID ? { ...job, tab_id: tabID } : job),
+    activeJobs: store.activeJobs.map((job) =>
+      job.job_id === jobID ? { ...job, tab_id: tabID } : job,
+    ),
   };
 }
-
 
 export interface StoreShape {
   activeJobs: ActiveJob[];
@@ -630,6 +802,10 @@ export interface StoreShape {
   /** URL-free daemon claim/binding ledger for explicit browser-tab
    * materialization. Response URLs are intentionally absent. */
   materializations?: Record<string, MaterializationCorrelation>;
+  /** URL-free terms effect correlations. No URL, path, or provider text is
+   * persisted; only opaque daemon-minted IDs and the deterministic authority
+   * digest survive restart. */
+  termsEffects?: Record<string, TermsEffectCorrelation>;
   /** Legacy browser claim map; never promoted by managed-state migration. */
   federatedLoginOwners?: Record<string, FederatedLoginOwner>;
 }
@@ -651,11 +827,17 @@ export function emptyStore(): StoreShape {
   };
 }
 
-export function findByJob(store: StoreShape, jobID: string): ActiveJob | undefined {
+export function findByJob(
+  store: StoreShape,
+  jobID: string,
+): ActiveJob | undefined {
   return store.activeJobs.find((j) => j.job_id === jobID);
 }
 
-export function findByTab(store: StoreShape, tabID: number): ActiveJob | undefined {
+export function findByTab(
+  store: StoreShape,
+  tabID: number,
+): ActiveJob | undefined {
   return store.activeJobs.find((j) => j.tab_id === tabID);
 }
 
@@ -672,7 +854,10 @@ export function upsertJob(store: StoreShape, job: ActiveJob): StoreShape {
 }
 
 export function removeJob(store: StoreShape, jobID: string): StoreShape {
-  return { ...store, activeJobs: store.activeJobs.filter((j) => j.job_id !== jobID) };
+  return {
+    ...store,
+    activeJobs: store.activeJobs.filter((j) => j.job_id !== jobID),
+  };
 }
 
 /** Return a new store with the named job patched. No-op if the job is gone. */
@@ -683,7 +868,9 @@ export function patchJob(
 ): StoreShape {
   return {
     ...store,
-    activeJobs: store.activeJobs.map((j) => (j.job_id === jobID ? { ...j, ...patch } : j)),
+    activeJobs: store.activeJobs.map((j) =>
+      j.job_id === jobID ? { ...j, ...patch } : j,
+    ),
   };
 }
 /** Atomically reserve the one download initiation allowed for a job.
@@ -695,16 +882,22 @@ export function claimJobDownloadInitiated(
   jobID: string,
 ): { store: StoreShape; claimed: boolean } {
   const job = findByJob(store, jobID);
-  if (job === undefined || job.download_initiated === true) return { store, claimed: false };
+  if (job === undefined || job.download_initiated === true)
+    return { store, claimed: false };
   return {
     store: patchJob(store, jobID, { download_initiated: true }),
     claimed: true,
   };
 }
 
-
-export function startPendingDelivery(store: StoreShape, delivery: PendingDelivery): StoreShape {
-  return { ...store, pendingDelivery: { ...delivery, status: delivery.status ?? "sending" } };
+export function startPendingDelivery(
+  store: StoreShape,
+  delivery: PendingDelivery,
+): StoreShape {
+  return {
+    ...store,
+    pendingDelivery: { ...delivery, status: delivery.status ?? "sending" },
+  };
 }
 
 /** Patch only the currently tracked delivery; a late download event from an
@@ -719,8 +912,15 @@ export function updatePendingDelivery(
   return { ...store, pendingDelivery: { ...current, ...patch } };
 }
 
-export function clearPendingDelivery(store: StoreShape, jobID?: string): StoreShape {
-  if (store.pendingDelivery === undefined || (jobID !== undefined && store.pendingDelivery.job_id !== jobID)) return store;
+export function clearPendingDelivery(
+  store: StoreShape,
+  jobID?: string,
+): StoreShape {
+  if (
+    store.pendingDelivery === undefined ||
+    (jobID !== undefined && store.pendingDelivery.job_id !== jobID)
+  )
+    return store;
   const next = { ...store };
   delete next.pendingDelivery;
   return next;
@@ -729,8 +929,9 @@ export function clearPendingDelivery(store: StoreShape, jobID?: string): StoreSh
 /** Version of the durable managed-state shape. The storage key predates this
  * field, so version 1 means the unversioned `papio_state_v1` blob. Version 3
  * added the URL-free explicit materialization correlation ledger; version 4
- * adds the URL-free operator-selected manual-delivery target. */
-export const MANAGED_STATE_VERSION = 4;
+ * adds the URL-free operator-selected manual-delivery target; version 5 adds
+ * the URL-free terms effect correlation ledger. */
+export const MANAGED_STATE_VERSION = 5;
 const STORAGE_KEY = "papio_state_v1";
 type UnknownRecord = Record<string, unknown>;
 
@@ -746,26 +947,37 @@ function safeHost(value: unknown): string | undefined {
   const host = value.trim().toLowerCase();
   if (host.length === 0 || host.length > 253) return undefined;
   const labels = host.split(".");
-  if (labels.some((label) =>
-    label.length === 0 ||
-    label.length > 63 ||
-    !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
-  )) return undefined;
+  if (
+    labels.some(
+      (label) =>
+        label.length === 0 ||
+        label.length > 63 ||
+        !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label),
+    )
+  )
+    return undefined;
   return host;
 }
 
 function isURLLike(value: string): boolean {
   const trimmed = value.trim();
-  return /^(?:https?|ftp|chrome|moz-extension|file|papio):/i.test(trimmed) ||
-    /^(?:[a-z][a-z\d+.-]*:)?\/\//i.test(trimmed);
+  return (
+    /^(?:https?|ftp|chrome|moz-extension|file|papio):/i.test(trimmed) ||
+    /^(?:[a-z][a-z\d+.-]*:)?\/\//i.test(trimmed)
+  );
 }
 
 function safeOrigin(value: unknown): string | undefined {
   if (typeof value !== "string" || value.trim() === "") return undefined;
   try {
     const parsed = new URL(value);
-    if ((parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
-        parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "") return undefined;
+    if (
+      (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+      parsed.pathname !== "/" ||
+      parsed.search !== "" ||
+      parsed.hash !== ""
+    )
+      return undefined;
     return parsed.origin;
   } catch {
     return undefined;
@@ -774,18 +986,74 @@ function safeOrigin(value: unknown): string | undefined {
 
 function forbiddenPersistedKey(key: string): boolean {
   const normalized = key.replace(/[-_]/g, "").toLowerCase();
-  const globalTermsAuthority = normalized !== "needstermsconsent" &&
+  const globalTermsAuthority =
+    normalized !== "needstermsconsent" &&
     normalized.includes("terms") &&
-    (normalized.includes("consent") || normalized.includes("accept") || normalized.includes("authority"));
-  return normalized.includes("url") ||
+    (normalized.includes("consent") ||
+      normalized.includes("accept") ||
+      normalized.includes("authority"));
+  return (
+    normalized.includes("url") ||
     globalTermsAuthority ||
     normalized.includes("claim") ||
     normalized.includes("authkey") ||
     normalized.includes("authhash") ||
     normalized.includes("authdigest") ||
-    normalized.includes("institutionhash");
+    normalized.includes("institutionhash")
+  );
 }
 
+const TERMS_EFFECT_ID = /^[A-Za-z0-9_-]{8,128}$/u;
+const AUTHORITY_DIGEST_RE = /^[0-9a-f]{64}$/u;
+
+function validTermsEffectCorrelation(
+  value: unknown,
+): value is TermsEffectCorrelation {
+  if (
+    !isRecord(value) ||
+    typeof value.job_id !== "string" ||
+    !TERMS_EFFECT_ID.test(value.job_id) ||
+    typeof value.permit_id !== "string" ||
+    !TERMS_EFFECT_ID.test(value.permit_id) ||
+    typeof value.terms_occurrence_id !== "string" ||
+    !TERMS_EFFECT_ID.test(value.terms_occurrence_id) ||
+    typeof value.authority_digest !== "string" ||
+    !AUTHORITY_DIGEST_RE.test(value.authority_digest) ||
+    typeof value.dispatched !== "boolean" ||
+    typeof value.acknowledged !== "boolean" ||
+    (value.result_outcome !== undefined &&
+      value.result_outcome !== "accepted" &&
+      value.result_outcome !== "not_dispatched")
+  )
+    return false;
+  return true;
+}
+
+function migratedTermsEffects(
+  value: unknown,
+): Record<string, TermsEffectCorrelation> | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: Record<string, TermsEffectCorrelation> = {};
+  for (const [jobID, candidate] of Object.entries(value)) {
+    if (
+      !validTermsEffectCorrelation(candidate) ||
+      (candidate as TermsEffectCorrelation).job_id !== jobID
+    )
+      continue;
+    const correlation: TermsEffectCorrelation = {
+      job_id: candidate.job_id,
+      permit_id: candidate.permit_id,
+      terms_occurrence_id: candidate.terms_occurrence_id,
+      authority_digest: candidate.authority_digest,
+      dispatched: candidate.dispatched,
+      acknowledged: candidate.acknowledged,
+    };
+    if (candidate.result_outcome !== undefined)
+      correlation.result_outcome = candidate.result_outcome;
+    out[jobID] = correlation;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
 /** Copy legacy data while dropping URL-bearing and authority-bearing leaves.
  * This is deliberately recursive: old worker versions added fields over time,
  * and an unknown nested URL must never become durable merely because its parent
@@ -794,7 +1062,9 @@ function scrubValue(value: unknown, key = ""): unknown {
   if (forbiddenPersistedKey(key)) return undefined;
   if (typeof value === "string") return isURLLike(value) ? undefined : value;
   if (Array.isArray(value)) {
-    return value.map((item) => scrubValue(item)).filter((item) => item !== undefined);
+    return value
+      .map((item) => scrubValue(item))
+      .filter((item) => item !== undefined);
   }
   if (!isRecord(value)) return value;
   const out: UnknownRecord = {};
@@ -809,50 +1079,85 @@ function scrubRecord(value: unknown): UnknownRecord | undefined {
   const scrubbed = scrubValue(value);
   return isRecord(scrubbed) ? scrubbed : undefined;
 }
-const JOB_STATUSES: readonly JobStatus[] = ["offered", "queued", "accepted", "auth_pending", "awaiting_download"];
-const DELIVERY_STATUSES: readonly PendingDeliveryStatus[] = ["sending", "waiting_manual", "downloaded", "failed", "adopted"];
+const JOB_STATUSES: readonly JobStatus[] = [
+  "offered",
+  "queued",
+  "accepted",
+  "auth_pending",
+  "awaiting_download",
+];
+const DELIVERY_STATUSES: readonly PendingDeliveryStatus[] = [
+  "sending",
+  "waiting_manual",
+  "downloaded",
+  "failed",
+  "adopted",
+];
 
 function validActiveJob(value: unknown): value is ActiveJob {
-  if (!isRecord(value) ||
-      typeof value.job_id !== "string" ||
-      typeof value.tab_id !== "number" ||
-      !Number.isInteger(value.tab_id) ||
-      !isFiniteNumber(value.offered_at) ||
-      !isFiniteNumber(value.expires_at) ||
-      typeof value.status !== "string" ||
-      !JOB_STATUSES.includes(value.status as JobStatus) ||
-      !Array.isArray(value.provider_hosts)) return false;
+  if (
+    !isRecord(value) ||
+    typeof value.job_id !== "string" ||
+    typeof value.tab_id !== "number" ||
+    !Number.isInteger(value.tab_id) ||
+    !isFiniteNumber(value.offered_at) ||
+    !isFiniteNumber(value.expires_at) ||
+    typeof value.status !== "string" ||
+    !JOB_STATUSES.includes(value.status as JobStatus) ||
+    !Array.isArray(value.provider_hosts)
+  )
+    return false;
   const providerHosts: unknown[] = value.provider_hosts;
   return providerHosts.every((host) => safeHost(host) !== undefined);
 }
 function migratedDriveEpoch(value: unknown): ProviderDriveEpoch | undefined {
-  if (!isRecord(value) || typeof value.drive_attempt_id !== "string" || isURLLike(value.drive_attempt_id)) {
+  if (
+    !isRecord(value) ||
+    typeof value.drive_attempt_id !== "string" ||
+    isURLLike(value.drive_attempt_id)
+  ) {
     return undefined;
   }
   const ordinal = value.ordinal;
   const strategy = value.strategy;
   const attemptCount = value.attempt_count;
-  if (!isFiniteNumber(ordinal) || !Number.isInteger(ordinal) ||
-      (strategy !== "direct" && strategy !== "generic") ||
-      !isFiniteNumber(attemptCount) || !Number.isInteger(attemptCount)) return undefined;
+  if (
+    !isFiniteNumber(ordinal) ||
+    !Number.isInteger(ordinal) ||
+    (strategy !== "direct" && strategy !== "generic") ||
+    !isFiniteNumber(attemptCount) ||
+    !Number.isInteger(attemptCount)
+  )
+    return undefined;
   const epoch: ProviderDriveEpoch = {
     drive_attempt_id: value.drive_attempt_id,
     ordinal,
     strategy,
     attempt_count: attemptCount,
   };
-  if (typeof value.route_revision === "string" && !isURLLike(value.route_revision)) {
+  if (
+    typeof value.route_revision === "string" &&
+    !isURLLike(value.route_revision)
+  ) {
     epoch.route_revision = value.route_revision;
   }
-  if (typeof value.revision === "string" && !isURLLike(value.revision)) epoch.revision = value.revision;
-  if (typeof value.strategy_id === "string" && !isURLLike(value.strategy_id)) epoch.strategy_id = value.strategy_id;
+  if (typeof value.revision === "string" && !isURLLike(value.revision))
+    epoch.revision = value.revision;
+  if (typeof value.strategy_id === "string" && !isURLLike(value.strategy_id))
+    epoch.strategy_id = value.strategy_id;
   const inFlightDownloadID = value.in_flight_download_id;
-  if (isFiniteNumber(inFlightDownloadID) && Number.isInteger(inFlightDownloadID)) {
+  if (
+    isFiniteNumber(inFlightDownloadID) &&
+    Number.isInteger(inFlightDownloadID)
+  ) {
     epoch.in_flight_download_id = inFlightDownloadID;
   }
   return epoch;
 }
-function migratedJob(value: ActiveJob, droppedClaimOwnerJobIDs: ReadonlySet<string>): ActiveJob {
+function migratedJob(
+  value: ActiveJob,
+  droppedClaimOwnerJobIDs: ReadonlySet<string>,
+): ActiveJob {
   const scrubbed = scrubRecord(value) ?? {};
   const migrated: ActiveJob = {
     ...scrubbed,
@@ -861,7 +1166,9 @@ function migratedJob(value: ActiveJob, droppedClaimOwnerJobIDs: ReadonlySet<stri
     offered_at: value.offered_at,
     expires_at: value.expires_at,
     status: value.status,
-    provider_hosts: value.provider_hosts.map(safeHost).filter((host): host is string => host !== undefined),
+    provider_hosts: value.provider_hosts
+      .map(safeHost)
+      .filter((host): host is string => host !== undefined),
   };
   const raw = value as unknown as UnknownRecord;
   const droppedWaitAuthority =
@@ -873,26 +1180,39 @@ function migratedJob(value: ActiveJob, droppedClaimOwnerJobIDs: ReadonlySet<stri
   delete migrated.waiting_for_session_key;
   delete migrated.direct_envelope;
   delete migrated.manual_delivery_target;
-  if (isFiniteNumber(value.auth_started_ms)) migrated.auth_started_ms = value.auth_started_ms;
+  if (isFiniteNumber(value.auth_started_ms))
+    migrated.auth_started_ms = value.auth_started_ms;
   const expectedRaw = value.expected;
   if (isRecord(expectedRaw)) {
     const expected: NonNullable<ActiveJob["expected"]> = {};
-    if (typeof expectedRaw.title === "string" && !isURLLike(expectedRaw.title)) expected.title = expectedRaw.title;
-    if (typeof expectedRaw.doi === "string" && !isURLLike(expectedRaw.doi)) expected.doi = expectedRaw.doi;
+    if (typeof expectedRaw.title === "string" && !isURLLike(expectedRaw.title))
+      expected.title = expectedRaw.title;
+    if (typeof expectedRaw.doi === "string" && !isURLLike(expectedRaw.doi))
+      expected.doi = expectedRaw.doi;
     if (Object.keys(expected).length > 0) migrated.expected = expected;
   }
-  if (typeof value.requires_auth === "boolean") migrated.requires_auth = value.requires_auth;
-  if (typeof value.direct_terminal === "boolean") migrated.direct_terminal = value.direct_terminal;
+  if (typeof value.requires_auth === "boolean")
+    migrated.requires_auth = value.requires_auth;
+  if (typeof value.direct_terminal === "boolean")
+    migrated.direct_terminal = value.direct_terminal;
   const driveEpoch = migratedDriveEpoch(value.drive_epoch);
   if (driveEpoch !== undefined) migrated.drive_epoch = driveEpoch;
+  delete migrated.generic_drive_epoch;
+  const genericDriveEpoch = migratedDriveEpoch(value.generic_drive_epoch);
+  if (genericDriveEpoch?.strategy === "generic")
+    migrated.generic_drive_epoch = genericDriveEpoch;
   const envelopeRaw = value.direct_envelope;
   if (isRecord(envelopeRaw)) {
     const allowedOrigin = safeOrigin(envelopeRaw.allowed_origin);
     const pathFamily = envelopeRaw.path_family;
     const expectedIdentifier = envelopeRaw.expected_identifier;
-    if (allowedOrigin !== undefined &&
-        typeof pathFamily === "string" && !isURLLike(pathFamily) &&
-        typeof expectedIdentifier === "string" && !isURLLike(expectedIdentifier)) {
+    if (
+      allowedOrigin !== undefined &&
+      typeof pathFamily === "string" &&
+      !isURLLike(pathFamily) &&
+      typeof expectedIdentifier === "string" &&
+      !isURLLike(expectedIdentifier)
+    ) {
       migrated.direct_envelope = {
         allowed_origin: allowedOrigin,
         path_family: pathFamily,
@@ -903,31 +1223,53 @@ function migratedJob(value: ActiveJob, droppedClaimOwnerJobIDs: ReadonlySet<stri
   const genericAttemptedStrategies = value.generic_attempted_strategies;
   if (Array.isArray(genericAttemptedStrategies)) {
     const strategies: unknown[] = genericAttemptedStrategies;
-    migrated.generic_attempted_strategies = strategies
-      .filter((strategy): strategy is string => typeof strategy === "string" && !isURLLike(strategy));
+    migrated.generic_attempted_strategies = strategies.filter(
+      (strategy): strategy is string =>
+        typeof strategy === "string" && !isURLLike(strategy),
+    );
   }
-  if (isFiniteNumber(value.generic_positive_attempts)) migrated.generic_positive_attempts = value.generic_positive_attempts;
-  if (typeof value.generic_terminal === "boolean") migrated.generic_terminal = value.generic_terminal;
-  if (typeof value.engagement_required === "boolean") migrated.engagement_required = value.engagement_required;
-  if (typeof value.fresh_handoff === "boolean") migrated.fresh_handoff = value.fresh_handoff;
-  if (typeof value.download_initiated === "boolean") migrated.download_initiated = value.download_initiated;
-  if (value.manual_delivery_target === true && value.status === "awaiting_download") {
+  if (isFiniteNumber(value.generic_positive_attempts))
+    migrated.generic_positive_attempts = value.generic_positive_attempts;
+  if (typeof value.generic_terminal === "boolean")
+    migrated.generic_terminal = value.generic_terminal;
+  if (typeof value.generic_deferred === "boolean")
+    migrated.generic_deferred = value.generic_deferred;
+  if (typeof value.engagement_required === "boolean")
+    migrated.engagement_required = value.engagement_required;
+  if (typeof value.fresh_handoff === "boolean")
+    migrated.fresh_handoff = value.fresh_handoff;
+  if (typeof value.download_initiated === "boolean")
+    migrated.download_initiated = value.download_initiated;
+  if (
+    value.manual_delivery_target === true &&
+    value.status === "awaiting_download"
+  ) {
     migrated.manual_delivery_target = true;
   }
   const unknownCount = value.unknown_count;
-  if (isFiniteNumber(unknownCount) && Number.isInteger(unknownCount)) migrated.unknown_count = unknownCount;
-  if (isFiniteNumber(value.last_unknown_ms)) migrated.last_unknown_ms = value.last_unknown_ms;
-  if (typeof value.needs_terms_consent === "boolean") migrated.needs_terms_consent = value.needs_terms_consent;
+  if (isFiniteNumber(unknownCount) && Number.isInteger(unknownCount))
+    migrated.unknown_count = unknownCount;
+  if (isFiniteNumber(value.last_unknown_ms))
+    migrated.last_unknown_ms = value.last_unknown_ms;
+  if (typeof value.needs_terms_consent === "boolean")
+    migrated.needs_terms_consent = value.needs_terms_consent;
   const blockedProviderHost = safeHost(value.blocked_provider_host);
-  if (blockedProviderHost !== undefined) migrated.blocked_provider_host = blockedProviderHost;
-  if (typeof value.challenge_blocked === "boolean") migrated.challenge_blocked = value.challenge_blocked;
+  if (blockedProviderHost !== undefined)
+    migrated.blocked_provider_host = blockedProviderHost;
+  if (typeof value.challenge_blocked === "boolean")
+    migrated.challenge_blocked = value.challenge_blocked;
   const challengeHost = safeHost(value.challenge_host);
   if (challengeHost !== undefined) migrated.challenge_host = challengeHost;
-  if (value.challenge_kind === "cloudflare" || value.challenge_kind === "redirect_loop") {
+  if (
+    value.challenge_kind === "cloudflare" ||
+    value.challenge_kind === "redirect_loop"
+  ) {
     migrated.challenge_kind = value.challenge_kind;
   }
-  if (isFiniteNumber(value.challenge_blocked_at)) migrated.challenge_blocked_at = value.challenge_blocked_at;
-  if (typeof value.handoffAckPending === "boolean") migrated.handoffAckPending = value.handoffAckPending;
+  if (isFiniteNumber(value.challenge_blocked_at))
+    migrated.challenge_blocked_at = value.challenge_blocked_at;
+  if (typeof value.handoffAckPending === "boolean")
+    migrated.handoffAckPending = value.handoffAckPending;
   if (droppedWaitAuthority) {
     // The old claim owner/key is deliberately not retained. Clear every
     // marker that depended on it so startup reconciliation sees a normal
@@ -946,38 +1288,54 @@ function migratedJob(value: ActiveJob, droppedClaimOwnerJobIDs: ReadonlySet<stri
       delete migratedRecord[key];
     }
   } else {
-    if (typeof value.parked_with_tab === "boolean") migrated.parked_with_tab = value.parked_with_tab;
-    if (typeof value.waiting_for_session === "boolean") migrated.waiting_for_session = value.waiting_for_session;
-    if (isFiniteNumber(value.waiting_deadline)) migrated.waiting_deadline = value.waiting_deadline;
+    if (typeof value.parked_with_tab === "boolean")
+      migrated.parked_with_tab = value.parked_with_tab;
+    if (typeof value.waiting_for_session === "boolean")
+      migrated.waiting_for_session = value.waiting_for_session;
+    if (isFiniteNumber(value.waiting_deadline))
+      migrated.waiting_deadline = value.waiting_deadline;
   }
   return migrated;
 }
 
 function migratedPendingDelivery(value: unknown): PendingDelivery | undefined {
-  if (!isRecord(value) || typeof value.job_id !== "string" || !isFiniteNumber(value.initiated_at)) return undefined;
+  if (
+    !isRecord(value) ||
+    typeof value.job_id !== "string" ||
+    !isFiniteNumber(value.initiated_at)
+  )
+    return undefined;
   const migrated: PendingDelivery = {
     job_id: value.job_id,
     initiated_at: value.initiated_at,
   };
-  if (typeof value.status === "string" && DELIVERY_STATUSES.includes(value.status as PendingDeliveryStatus)) {
+  if (
+    typeof value.status === "string" &&
+    DELIVERY_STATUSES.includes(value.status as PendingDeliveryStatus)
+  ) {
     migrated.status = value.status as PendingDeliveryStatus;
   }
   const pageHost = safeHost(value.page_host);
   if (pageHost !== undefined) migrated.page_host = pageHost;
-  if (typeof value.error === "string" && !isURLLike(value.error)) migrated.error = value.error;
-  if (value.session_evidence === "fresh_auth" || value.session_evidence === "warm" || value.session_evidence === "none") {
+  if (typeof value.error === "string" && !isURLLike(value.error))
+    migrated.error = value.error;
+  if (
+    value.session_evidence === "fresh_auth" ||
+    value.session_evidence === "warm" ||
+    value.session_evidence === "none"
+  ) {
     migrated.session_evidence = value.session_evidence;
   }
   return migrated;
 }
-
 
 function migratedOriginMap(value: unknown): Record<string, number> | undefined {
   if (!isRecord(value)) return undefined;
   const out: Record<string, number> = {};
   for (const [origin, timestamp] of Object.entries(value)) {
     const normalized = safeOrigin(origin);
-    if (normalized !== undefined && isFiniteNumber(timestamp)) out[normalized] = timestamp;
+    if (normalized !== undefined && isFiniteNumber(timestamp))
+      out[normalized] = timestamp;
   }
   return Object.keys(out).length === 0 ? undefined : out;
 }
@@ -991,34 +1349,54 @@ function migratedNumberMap(value: unknown): Record<string, number> | undefined {
   return Object.keys(out).length === 0 ? undefined : out;
 }
 
-function migratedLeaseMap(value: unknown): Record<string, ProviderDrainLease> | undefined {
+function migratedLeaseMap(
+  value: unknown,
+): Record<string, ProviderDrainLease> | undefined {
   if (!isRecord(value)) return undefined;
   const out: Record<string, ProviderDrainLease> = {};
   for (const [key, candidate] of Object.entries(value)) {
     const providerKey = safeHost(key);
-    if (!providerKey || !isRecord(candidate) || !isFiniteNumber(candidate.expiresAt)) continue;
-    const lease: ProviderDrainLease = { providerKey, expiresAt: candidate.expiresAt };
-    if (candidate.parkedReason === "challenge") lease.parkedReason = "challenge";
+    if (
+      !providerKey ||
+      !isRecord(candidate) ||
+      !isFiniteNumber(candidate.expiresAt)
+    )
+      continue;
+    const lease: ProviderDrainLease = {
+      providerKey,
+      expiresAt: candidate.expiresAt,
+    };
+    if (candidate.parkedReason === "challenge")
+      lease.parkedReason = "challenge";
     out[providerKey] = lease;
   }
   return Object.keys(out).length === 0 ? undefined : out;
 }
 
-function migratedCooldownMap(value: unknown): Record<string, number> | undefined {
+function migratedCooldownMap(
+  value: unknown,
+): Record<string, number> | undefined {
   if (!isRecord(value)) return undefined;
   const out: Record<string, number> = {};
   for (const [key, numberValue] of Object.entries(value)) {
     const host = safeHost(key);
-    if (host !== undefined && isFiniteNumber(numberValue)) out[host] = numberValue;
+    if (host !== undefined && isFiniteNumber(numberValue))
+      out[host] = numberValue;
   }
   return Object.keys(out).length === 0 ? undefined : out;
 }
 
-function migratedMaterializations(value: unknown): Record<string, MaterializationCorrelation> | undefined {
+function migratedMaterializations(
+  value: unknown,
+): Record<string, MaterializationCorrelation> | undefined {
   if (!isRecord(value)) return undefined;
   const out: Record<string, MaterializationCorrelation> = {};
   for (const [jobID, candidate] of Object.entries(value)) {
-    if (!validMaterializationCorrelation(candidate) || candidate.job_id !== jobID) continue;
+    if (
+      !validMaterializationCorrelation(candidate) ||
+      candidate.job_id !== jobID
+    )
+      continue;
     const correlation: MaterializationCorrelation = {
       job_id: candidate.job_id,
       candidate_id: candidate.candidate_id,
@@ -1027,20 +1405,35 @@ function migratedMaterializations(value: unknown): Record<string, Materializatio
       phase: candidate.phase,
       tab_id: candidate.tab_id,
     };
-    if (candidate.claim_id !== undefined) correlation.claim_id = candidate.claim_id;
-    if (candidate.binding_id !== undefined) correlation.binding_id = candidate.binding_id;
+    if (candidate.claim_id !== undefined)
+      correlation.claim_id = candidate.claim_id;
+    if (candidate.binding_id !== undefined)
+      correlation.binding_id = candidate.binding_id;
     if (candidate.browser_holder_generation !== undefined) {
-      correlation.browser_holder_generation = candidate.browser_holder_generation;
+      correlation.browser_holder_generation =
+        candidate.browser_holder_generation;
     }
-    if (candidate.lease_until !== undefined) correlation.lease_until = candidate.lease_until;
+    if (candidate.lease_until !== undefined)
+      correlation.lease_until = candidate.lease_until;
     if (candidate.route_issuance_ordinal !== undefined) {
       correlation.route_issuance_ordinal = candidate.route_issuance_ordinal;
     }
     if (candidate.route_replay_ordinal !== undefined) {
       correlation.route_replay_ordinal = candidate.route_replay_ordinal;
     }
-    if (candidate.retry_attempts !== undefined) correlation.retry_attempts = candidate.retry_attempts;
-    if (candidate.retry_after !== undefined) correlation.retry_after = candidate.retry_after;
+    if (candidate.institutional_request_id !== undefined) {
+      correlation.institutional_request_id = candidate.institutional_request_id;
+    }
+    if (candidate.expected_effect_ordinal !== undefined) {
+      correlation.expected_effect_ordinal = candidate.expected_effect_ordinal;
+    }
+    if (candidate.effect_ordinal !== undefined) {
+      correlation.effect_ordinal = candidate.effect_ordinal;
+    }
+    if (candidate.retry_attempts !== undefined)
+      correlation.retry_attempts = candidate.retry_attempts;
+    if (candidate.retry_after !== undefined)
+      correlation.retry_after = candidate.retry_after;
     out[jobID] = correlation;
   }
   return Object.keys(out).length === 0 ? undefined : out;
@@ -1054,7 +1447,9 @@ function migratedString(value: unknown): string | null | undefined {
 function migratedHosts(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const hostValues: unknown[] = value;
-  const hosts = hostValues.map(safeHost).filter((host): host is string => host !== undefined);
+  const hosts = hostValues
+    .map(safeHost)
+    .filter((host): host is string => host !== undefined);
   return hosts.length === 0 ? undefined : [...new Set(hosts)];
 }
 function migratedState(raw: UnknownRecord): StoreShape {
@@ -1071,8 +1466,12 @@ function migratedState(raw: UnknownRecord): StoreShape {
       }
     }
   }
-  let activeJobs = validJobs.map((job) => migratedJob(job, droppedClaimOwnerJobIDs));
-  if (activeJobs.filter((job) => job.manual_delivery_target === true).length > 1) {
+  let activeJobs = validJobs.map((job) =>
+    migratedJob(job, droppedClaimOwnerJobIDs),
+  );
+  if (
+    activeJobs.filter((job) => job.manual_delivery_target === true).length > 1
+  ) {
     activeJobs = activeJobs.map((job) => {
       if (job.manual_delivery_target !== true) return job;
       const { manual_delivery_target: _target, ...unselected } = job;
@@ -1087,29 +1486,40 @@ function migratedState(raw: UnknownRecord): StoreShape {
   const pending = migratedPendingDelivery(raw.pendingDelivery);
   if (pending !== undefined) output.pendingDelivery = pending;
   const lastAuthReturnedAt = raw.lastAuthReturnedAt;
-  if (isFiniteNumber(lastAuthReturnedAt)) output.lastAuthReturnedAt = lastAuthReturnedAt;
+  if (isFiniteNumber(lastAuthReturnedAt))
+    output.lastAuthReturnedAt = lastAuthReturnedAt;
   const authEvidenceByOrigin = migratedOriginMap(raw.authEvidenceByOrigin);
-  if (authEvidenceByOrigin !== undefined) output.authEvidenceByOrigin = authEvidenceByOrigin;
+  if (authEvidenceByOrigin !== undefined)
+    output.authEvidenceByOrigin = authEvidenceByOrigin;
   const authAttempts = migratedNumberMap(raw.authAttempts);
   if (authAttempts !== undefined) output.authAttempts = authAttempts;
   const providerDrainLeases = migratedLeaseMap(raw.providerDrainLeases);
-  if (providerDrainLeases !== undefined) output.providerDrainLeases = providerDrainLeases;
+  if (providerDrainLeases !== undefined)
+    output.providerDrainLeases = providerDrainLeases;
   const workWindowID = raw.workWindowID;
-  if (isFiniteNumber(workWindowID) && Number.isInteger(workWindowID)) output.workWindowID = workWindowID;
+  if (isFiniteNumber(workWindowID) && Number.isInteger(workWindowID))
+    output.workWindowID = workWindowID;
   const handoffGroupID = raw.handoffGroupID;
-  if (isFiniteNumber(handoffGroupID) && Number.isInteger(handoffGroupID)) output.handoffGroupID = handoffGroupID;
-  if (raw.connectionStatus === "connected" || raw.connectionStatus === "disconnected" ||
-      raw.connectionStatus === "daemon_outdated" || raw.connectionStatus === "extension_outdated") {
+  if (isFiniteNumber(handoffGroupID) && Number.isInteger(handoffGroupID))
+    output.handoffGroupID = handoffGroupID;
+  if (
+    raw.connectionStatus === "connected" ||
+    raw.connectionStatus === "disconnected" ||
+    raw.connectionStatus === "daemon_outdated" ||
+    raw.connectionStatus === "extension_outdated"
+  ) {
     output.connectionStatus = raw.connectionStatus;
   }
   const daemonVersion = migratedString(raw.daemonVersion);
   if (daemonVersion !== undefined) output.daemonVersion = daemonVersion;
-  if (typeof raw.daemonUpdateHint === "boolean") output.daemonUpdateHint = raw.daemonUpdateHint;
+  if (typeof raw.daemonUpdateHint === "boolean")
+    output.daemonUpdateHint = raw.daemonUpdateHint;
   const daemonFeatures = raw.daemonFeatures;
   if (Array.isArray(daemonFeatures)) {
     const featureValues: unknown[] = daemonFeatures;
     output.daemonFeatures = featureValues.filter(
-      (feature): feature is string => typeof feature === "string" && !isURLLike(feature),
+      (feature): feature is string =>
+        typeof feature === "string" && !isURLLike(feature),
     );
   }
   const resolverOrigins = raw.resolverOrigins;
@@ -1120,11 +1530,16 @@ function migratedState(raw: UnknownRecord): StoreShape {
       .filter((origin): origin is string => origin !== undefined);
   }
   const materializations = migratedMaterializations(raw.materializations);
-  if (materializations !== undefined) output.materializations = materializations;
+  if (materializations !== undefined)
+    output.materializations = materializations;
+  const termsEffects = migratedTermsEffects(raw.termsEffects);
+  if (termsEffects !== undefined) output.termsEffects = termsEffects;
   const blockedProviderHosts = migratedHosts(raw.blockedProviderHosts);
-  if (blockedProviderHosts !== undefined) output.blockedProviderHosts = blockedProviderHosts;
+  if (blockedProviderHosts !== undefined)
+    output.blockedProviderHosts = blockedProviderHosts;
   const challengeCooldowns = migratedCooldownMap(raw.challengeCooldowns);
-  if (challengeCooldowns !== undefined) output.challengeCooldowns = challengeCooldowns;
+  if (challengeCooldowns !== undefined)
+    output.challengeCooldowns = challengeCooldowns;
   // Legacy federatedLoginOwners and all per-job claim keys are deterministic
   // browser hashes, not daemon-issued opaque authority IDs. Do not promote.
   delete output.federatedLoginOwners;
@@ -1137,7 +1552,15 @@ function migratedState(raw: UnknownRecord): StoreShape {
 export function migrateManagedState(raw: unknown): StoreShape {
   if (!isRecord(raw) || !Array.isArray(raw.activeJobs)) return emptyStore();
   const version = raw.version;
-  if (version !== undefined && version !== 1 && version !== 2 && version !== 3 && version !== MANAGED_STATE_VERSION) return emptyStore();
+  if (
+    version !== undefined &&
+    version !== 1 &&
+    version !== 2 &&
+    version !== 3 &&
+    version !== 4 &&
+    version !== MANAGED_STATE_VERSION
+  )
+    return emptyStore();
   return migratedState(raw);
 }
 

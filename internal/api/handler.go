@@ -421,6 +421,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"browser.claim": func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserClaim(raw, system)
 		},
+		"browser.effect_permit.resolve": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return browserResolveEffectPermit(ctx, raw, system)
+		},
 		"delivery.get": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return deliveryGet(ctx, raw, system)
 		},
@@ -1637,6 +1640,28 @@ func browserClaim(raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.R
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "unknown browser session")}
 	}
 	return marshal(map[string]any{"claimed": true, "session_id": resolved})
+}
+
+func browserResolveEffectPermit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		PermitID string `json:"permit_id"`
+		Reason   string `json:"reason"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	params.PermitID = strings.TrimSpace(params.PermitID)
+	params.Reason = strings.TrimSpace(params.Reason)
+	if params.PermitID == "" || params.Reason == "" {
+		return badParams(errors.New("permit_id and reason are required"))
+	}
+	if err := system.Jobs.ResolveUnknownEffectPermit(ctx, params.PermitID, params.Reason); err != nil {
+		if errors.Is(err, job.ErrEffectPermitStale) {
+			return nil, &ipc.RPCError{Code: "invalid_argument", Message: "effect permit is missing or not unknown_completion"}
+		}
+		return failure(err)
+	}
+	return marshal(map[string]any{"resolved": true, "permit_id": params.PermitID})
 }
 
 // searchDiscovery maps strict RPC input to the bounded OpenAlex client.

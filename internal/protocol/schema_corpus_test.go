@@ -153,6 +153,33 @@ func TestPublishedSchemasCompile(t *testing.T) {
 	publishedSchemas(t)
 }
 
+func TestPublishedBrowserSchemaPinsStrictTermsEffectScope(t *testing.T) {
+	schema := compileSchema(t, "browser-v1.schema.json")
+	frame := func() map[string]any {
+		return map[string]any{
+			"protocol": "papio-browser/1", "type": "terms_effect_start_request",
+			"msg_id": "message-terms-001", "job_id": "job_terms_001", "seq": 1,
+			"payload": map[string]any{
+				"request_id": "request-terms-001", "adapter_id": "jstor",
+				"adapter_version": "1.0.0", "authority_digest": strings.Repeat("a", 64),
+			},
+		}
+	}
+	if err := schema.Validate(frame()); err != nil {
+		t.Fatalf("valid terms frame rejected: %v", err)
+	}
+	jobless := frame()
+	delete(jobless, "job_id")
+	if err := schema.Validate(jobless); err == nil {
+		t.Fatal("published schema accepted jobless terms frame")
+	}
+	unknown := frame()
+	unknown["payload"].(map[string]any)["unexpected"] = true
+	if err := schema.Validate(unknown); err == nil {
+		t.Fatal("published schema accepted unknown terms payload field")
+	}
+}
+
 func TestValidCorpusMatchesPublishedSchemas(t *testing.T) {
 	schemas := publishedSchemas(t)
 	for _, name := range corpusFixtures(t, "valid") {
@@ -181,6 +208,107 @@ func TestInvalidCorpusSchemaDispositionIsPinned(t *testing.T) {
 	for name := range schemaRuntimeOnly {
 		if !seen[name] {
 			t.Errorf("schemaRuntimeOnly names %s, which is not in the invalid corpus", name)
+		}
+	}
+}
+
+// TestEffectPermitReconcileSchemaCases pins the conditional identity matrix
+// directly in the published schema corpus. These cases deliberately stay here
+// rather than adding one fixture per branch: the matrix is easier to audit as a
+// single table, and every row still exercises the complete browser envelope.
+func TestEffectPermitReconcileSchemaCases(t *testing.T) {
+	schema := publishedSchemas(t)["browser-v1.schema.json"]
+	envelope := func(messageType string, payload map[string]any) map[string]any {
+		return map[string]any{
+			"protocol": "papio-browser/1",
+			"type":     messageType,
+			"msg_id":   "permit-msg-001",
+			"seq":      1,
+			"job_id":   "job-permit-001",
+			"payload":  payload,
+		}
+	}
+	joblessEnvelope := func(messageType string, payload map[string]any) map[string]any {
+		doc := envelope(messageType, payload)
+		delete(doc, "job_id")
+		return doc
+	}
+	valid := []struct {
+		name string
+		doc  map[string]any
+	}{
+		{"generic_drive", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-001", "permit_id": "permit-001", "effect_kind": "generic_drive",
+			"drive_attempt_id": "attempt-001", "ordinal": 0, "strategy": "fallback", "revision": "rev-1",
+		})},
+		{"direct_get", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-002", "permit_id": "permit-002", "effect_kind": "direct_get",
+			"drive_attempt_id": "attempt-002", "ordinal": 1, "strategy": "direct_get", "revision": "rev-2",
+		})},
+		{"pdf_grab", joblessEnvelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-003", "permit_id": "permit-003", "effect_kind": "pdf_grab", "grab_id": "grab-001",
+		})},
+		{"terms", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-004", "permit_id": "permit-004", "effect_kind": "terms",
+			"terms_occurrence_id": "terms-001",
+		})},
+		{"institutional", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-005", "permit_id": "permit-005", "effect_kind": "institutional",
+			"claim_id": "claim-001", "binding_id": "binding-001", "effect_ordinal": 2,
+			"institutional_request_id": "inst-req-001", "tab_id": 7,
+		})},
+		{"response", envelope("effect_permit_reconcile_response", map[string]any{
+			"request_id": "request-006", "permit_id": "permit-006", "outcome": "recorded",
+			"dispatched": true, "download_present": false, "acknowledged": false, "tab_present": true,
+		})},
+	}
+	for _, tc := range valid {
+		if err := schema.Validate(tc.doc); err != nil {
+			t.Errorf("valid effect permit case %s rejected: %v", tc.name, err)
+		}
+	}
+	invalid := []struct {
+		name string
+		doc  map[string]any
+	}{
+		{"generic_mixed_identity", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-101", "permit_id": "permit-101", "effect_kind": "generic_drive",
+			"drive_attempt_id": "attempt-101", "ordinal": 0, "strategy": "fallback", "revision": "rev-1", "grab_id": "grab-101",
+		})},
+		{"direct_nullable_strategy", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-102", "permit_id": "permit-102", "effect_kind": "direct_get",
+			"drive_attempt_id": "attempt-102", "ordinal": 0, "strategy": nil, "revision": "rev-1",
+		})},
+		{"terms_unknown_field", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-103", "permit_id": "permit-103", "effect_kind": "terms",
+			"terms_occurrence_id": "terms-103", "provider_text": "forbidden",
+		})},
+		{"unknown_kind", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-104", "permit_id": "permit-104", "effect_kind": "unknown",
+			"grab_id": "grab-104",
+		})},
+		{"pdf_grab_grab_id_too_long", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-105", "permit_id": "permit-105", "effect_kind": "pdf_grab",
+			"grab_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		})},
+		{"pdf_grab_with_job", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-106", "permit_id": "permit-106", "effect_kind": "pdf_grab",
+			"grab_id": "grab-106",
+		})},
+		{"institutional_zero_ordinal", envelope("effect_permit_reconcile_request", map[string]any{
+			"request_id": "request-107", "permit_id": "permit-107", "effect_kind": "institutional",
+			"claim_id": "claim-107", "binding_id": "binding-107", "effect_ordinal": 0,
+			"institutional_request_id": "inst-req-107",
+		})},
+		{"response_provider_text", envelope("effect_permit_reconcile_response", map[string]any{
+			"request_id": "request-108", "permit_id": "permit-108", "outcome": "recorded",
+			"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+			"detail": "provider returned /tmp/private.pdf",
+		})},
+	}
+	for _, tc := range invalid {
+		if err := schema.Validate(tc.doc); err == nil {
+			t.Errorf("invalid effect permit case %s accepted", tc.name)
 		}
 	}
 }

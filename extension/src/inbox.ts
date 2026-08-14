@@ -71,7 +71,19 @@ interface Confirmation {
   returnFocus: HTMLElement | null;
 }
 
-type FeedbackNotice = { text: string; deadline: number };
+type StatusTone = "actionable" | "continuing" | "degraded" | "danger" | "neutral";
+
+interface FeedbackNotice {
+  text: string;
+  deadline: number;
+  count: number;
+  phase: "enter" | "visible" | "exit";
+}
+
+interface QueuedFeedback {
+  text: string;
+  count: number;
+}
 
 
 // One dismissal waiting out its undo window. The item is kept whole so an undo
@@ -97,9 +109,11 @@ interface PageState {
   confirmation: Confirmation | null;
   dismissals: PendingDismissal[];
   undoDeadline: number | null;
+  undoUndoable: boolean;
   dismissalCommitInFlight: boolean;
   feedbackNotice: FeedbackNotice | null;
-  feedbackQueue: string[];
+  feedbackQueue: QueuedFeedback[];
+  lastAnnounced: string | null;
   focusSelectionAfterRender: boolean;
   loading: boolean;
   filterQuery: string;
@@ -139,9 +153,11 @@ const state: PageState = {
   confirmation: null,
   dismissals: [],
   undoDeadline: null,
+  undoUndoable: false,
   dismissalCommitInFlight: false,
   feedbackNotice: null,
   feedbackQueue: [],
+  lastAnnounced: null,
   focusSelectionAfterRender: false,
   loading: false,
   filterQuery: "",
@@ -365,7 +381,9 @@ function openNewTab(url: string): void {
   window.open(url, "_blank", "noopener,noreferrer");
 }
 function announce(text: string): void {
-  if (elements !== null) elements.operationStatus.textContent = text;
+  if (elements === null || text === state.lastAnnounced) return;
+  state.lastAnnounced = text;
+  elements.operationStatus.textContent = text;
 }
 
 function previewToken(item: TriageSnapshotItem): string | null {
@@ -452,8 +470,10 @@ function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): 
 }
 
 function operationMessage(itemID: string, text: string, tone: "info" | "error" | "offline" = "info"): void {
+  const previous = state.itemMessages.get(itemID);
   state.itemMessages.set(itemID, { text, tone });
-  if (elements !== null) elements.operationStatus.textContent = text;
+  if (previous?.text === text && previous.tone === tone) return;
+  announce(text);
 }
 function activityResponse(value: unknown): {
   feature: boolean;
@@ -980,12 +1000,22 @@ function previewButton(item: TriageSnapshotItem): HTMLButtonElement | null {
   return button;
 }
 
+
+function operationOpenLabel(item: TriageSnapshotItem): string {
+  if (item.kind === "watch_hit") return "Open result";
+  if (item.kind === "human_action" && item.action_kind === "manual_download") return "Open source";
+  if (item.kind === "human_action" && item.action_kind === "openurl_handoff") {
+    return item.requires_auth === true ? "Sign in" : "Open page";
+  }
+  return "Open";
+}
+
 function operationButton(item: TriageSnapshotItem, operation: TriageOperation): HTMLButtonElement | null {
   // Retry is reserved for a newer inbox contract. Do not expose a dead,
   // permanently disabled placeholder when the daemon includes it.
   if (operation === "retry") return null;
   if (operation === "accept" && item.action_kind === "unsafe_pdf") return null;
-  const label = operationLabel(operation);
+  const label = operation === "open" ? operationOpenLabel(item) : operationLabel(operation);
   const title = displayTitle(item).text;
   const button = element("button", label);
   button.type = "button";
@@ -1090,16 +1120,26 @@ const DELIVERY_STATE_LABELS: Record<TriageDelivery["state"], string> = {
 // the tooltip and accessible name. The action-kind vocabulary is open (a new
 // daemon can ship new kinds), so unknown kinds degrade to a neutral dot with
 // the raw kind as the label instead of breaking the row.
-function statusMeta(item: TriageSnapshotItem): { key: string; glyph: string; label: string } {
+
+function statusTone(item: TriageSnapshotItem, key: string, working: boolean, waiting: boolean): StatusTone {
+  if (working || waiting) return "continuing";
+  if (item.kind === "retraction" || item.action_kind === "unsafe_pdf") return "danger";
+  if (key === "manual_download_rejected_file" || key === "manual_download_wrong_work") return "degraded";
+  if (key === "watch_hit" || key === "unknown") return "neutral";
+  return "actionable";
+}
+
+function statusMeta(item: TriageSnapshotItem, working: boolean, waiting: boolean): { key: string; glyph: string; label: string; tone: StatusTone } {
   const key = item.kind === "human_action" && typeof item.action_kind === "string" ? item.action_kind : item.kind;
   // A rejected file and a wrong work are not "one more PDF to download"; they
   // get their own glyph and accessible name so a scanning eye cannot read them
   // as an ordinary manual download.
   const manual = manualDownloadCopy(item);
-  if (manual !== null) return { key: item.guidance_variant ?? key, glyph: manual.glyph, label: manual.statusLabel };
-  const meta = STATUS_META[key];
-  if (meta !== undefined) return { key, glyph: meta.glyph, label: meta.label };
-  return { key: "unknown", glyph: "•", label: key.replaceAll("_", " ") };
+  const resolvedKey = manual !== null ? (item.guidance_variant ?? key) : key;
+  const glyph = manual?.glyph ?? STATUS_META[key]?.glyph ?? "•";
+  const label = manual?.statusLabel ?? STATUS_META[key]?.label ?? key.replaceAll("_", " ");
+  const resolvedMetaKey = manual !== null ? resolvedKey : (STATUS_META[key] !== undefined ? key : "unknown");
+  return { key: resolvedMetaKey, glyph, label, tone: statusTone(item, resolvedMetaKey, working, waiting) };
 }
 
 // Access classification chooses the next action instead of adding a second
@@ -1482,10 +1522,11 @@ function renderItem(item: TriageSnapshotItem, family: FamilyRender | null = null
   card.addEventListener("focusin", () => selectItem(item.id, false));
   card.addEventListener("click", () => selectItem(item.id, false));
 
-  const status = statusMeta(item);
+  const status = statusMeta(item, working, waiting);
   const badge = element("span", status.glyph);
   badge.className = "item-status";
   badge.dataset.status = status.key;
+  badge.dataset.tone = status.tone;
   badge.dataset.label = status.label;
   badge.setAttribute("role", "img");
   badge.setAttribute("aria-label", status.label);
@@ -1563,7 +1604,6 @@ function renderItem(item: TriageSnapshotItem, family: FamilyRender | null = null
     const result = element("p", entry.text);
     result.className = "item-result";
     result.dataset.tone = entry.tone;
-    result.setAttribute("role", "status");
     body.append(result);
   }
   const controls = element("div");
@@ -1646,17 +1686,10 @@ function renderGroup(kind: TriageSnapshotItem["kind"], heading: string | null, i
 }
 
 
-function renderPulse(): void {
-  if (elements === null) return;
-  const display = derivePulseDisplay(state.pulse, state.connected ? "connected" : "disconnected", Date.now(), 45_000);
-  elements.pulse.textContent = display.primaryText;
-  elements.pulse.dataset.state = display.primary.toLowerCase().replaceAll(" ", "-");
-  elements.pulse.title = [display.buckets, display.next, display.capacity, display.batch].filter((part) => part !== "").join(" · ");
-}
-function genuinelyMovingCount(): number | undefined {
+function pulseMovingCount(): number | undefined {
   if (!state.connected || state.pulse === undefined) return undefined;
   const display = derivePulseDisplay(state.pulse, "connected", Date.now(), 45_000);
-  if (display.primary === "Unknown") return undefined;
+  if (display.primary !== "Moving") return undefined;
   const { in_flight: inFlight, continuing } = state.pulse.pulse;
   if (
     typeof inFlight !== "number" ||
@@ -1669,6 +1702,65 @@ function genuinelyMovingCount(): number | undefined {
   return inFlight + continuing;
 }
 
+function renderPulse(): void {
+  if (elements === null) return;
+  const connectionStatus = state.connected ? "connected" : "disconnected";
+  const display = derivePulseDisplay(state.pulse, connectionStatus, Date.now(), 45_000);
+  const detail = [display.buckets, display.next, display.capacity, display.batch].filter((part) => part !== "").join(" · ");
+  elements.pulse.dataset.state = display.primary.toLowerCase().replaceAll(" ", "-");
+  elements.pulse.title = detail;
+  elements.pulse.hidden = false;
+
+  if (!state.connected) {
+    elements.pulse.hidden = true;
+    return;
+  }
+
+  if (display.primary === "Moving") {
+    const moving = pulseMovingCount();
+    elements.pulse.textContent = moving === undefined
+      ? "papio is working"
+      : `papio is working on ${moving} paper${moving === 1 ? "" : "s"}`;
+    return;
+  }
+
+  if (display.primary === "Waiting on you") {
+    elements.pulse.hidden = true;
+    return;
+  }
+
+  if (display.primary === "Scheduled") {
+    elements.pulse.textContent = display.next !== "" ? display.next : display.primaryText;
+    return;
+  }
+
+  if (display.primary === "Stalled") {
+    elements.pulse.textContent = display.primaryText;
+    return;
+  }
+
+  if (display.primary === "Idle") {
+    if (display.primaryText.includes("last finished")) {
+      elements.pulse.textContent = display.primaryText;
+      return;
+    }
+    elements.pulse.hidden = true;
+    return;
+  }
+
+  if (display.primary === "Unknown") {
+    if (display.primaryText.startsWith("Status as of")) {
+      elements.pulse.textContent = display.primaryText;
+      return;
+    }
+    elements.pulse.textContent = "Live progress unavailable";
+    return;
+  }
+
+  elements.pulse.hidden = true;
+}
+
+
 function renderCounts(): void {
   if (elements === null) return;
   const counts = state.counts ?? state.snapshot?.counts;
@@ -1676,18 +1768,17 @@ function renderCounts(): void {
     elements.counts.textContent = "Counts unavailable";
     return;
   }
-  // Counts-v3 turns_required is the authority for decisions owed by the
-  // researcher; it must not be replaced with pulse.waiting_required.
   const required = counts.turns_required;
-  const needText = typeof required === "number" ? `${required} need you` : `${counts.pending_total} open`;
   const reference = counts.watch_hits + counts.retractions;
-  const parts = [`${counts.pending_total} open`, needText];
+  const turns = typeof required === "number" ? required : 0;
+  if (counts.pending_total === 0 && reference === 0 && turns === 0) {
+    elements.counts.textContent = "No open items";
+    return;
+  }
+  const parts = [`${counts.pending_total} open`];
+  if (typeof required === "number" && required > 0) parts.push(`${required} need you`);
   if (reference > 0) parts.push(`${reference} for reference`);
-  // Pulse in_flight + continuing is the only honest liveness authority;
-  // jobs_working also includes queued, awaiting-human, and retry-wait work.
-  const moving = genuinelyMovingCount();
-  if (moving !== undefined && moving > 0) parts.push(`papio is working on ${moving}`);
-  elements.counts.textContent = [...new Set(parts)].join(" · ");
+  elements.counts.textContent = parts.join(" · ");
 }
 
 function renderDialog(): void {
@@ -1727,6 +1818,8 @@ function render(): void {
     ? `Disconnected: ${state.connectionMessage} Reconnecting automatically — run papio status if this persists.`
     : state.connectionMessage;
   elements.connection.dataset.state = isDisconnected ? "disconnected" : "connected";
+  const showConnection = isDisconnected || /^connecting/i.test(state.connectionMessage);
+  elements.connection.hidden = !showConnection;
   elements.reconnect.hidden = !isDisconnected;
   elements.refresh.disabled = state.loading;
   elements.reconnect.disabled = state.loading;
@@ -1763,7 +1856,7 @@ function render(): void {
   } else if (actionItems.length === 0) {
     // The pulse projection, not counts.jobs_working, decides whether an
     // honest liveness sentence is warranted in the empty Actions view.
-    const moving = genuinelyMovingCount();
+    const moving = pulseMovingCount();
     elements.list.append(
       element(
         "p",
@@ -1816,7 +1909,7 @@ function render(): void {
   }
 
   renderDialog();
-  renderUndoBar();
+  renderFeedbackStrip();
   if (state.focusSelectionAfterRender) {
     state.focusSelectionAfterRender = false;
     if (state.selectedID !== null) rowForItem(state.selectedID)?.focus();
@@ -2215,9 +2308,72 @@ async function requestDeliveryReconcile(
 // all — only a second click on every single row.
 const UNDO_WINDOW_MS = 6000;
 const ACKNOWLEDGEMENT_WINDOW_MS = 4000;
-const UNDO_TICK_MS = 250;
+const FEEDBACK_EXIT_MS = 140;
+const FEEDBACK_ENTER_MS = 180;
 let undoTimer: number | Timer | undefined;
 let feedbackTimer: number | Timer | undefined;
+
+function prefersReducedMotion(): boolean {
+  return typeof globalThis.matchMedia === "function"
+    && globalThis.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+function feedbackExitDelay(): number {
+  return prefersReducedMotion() ? 0 : FEEDBACK_EXIT_MS;
+}
+
+function enqueueSuccessFeedback(entry: QueuedFeedback): void {
+  state.feedbackQueue.push(entry);
+  if (state.feedbackQueue.length > 3) {
+    const totalCount = state.feedbackQueue.reduce((sum, item) => sum + item.count, 0);
+    state.feedbackQueue = [{ text: `${totalCount} actions completed.`, count: totalCount }];
+  }
+}
+
+function scheduleFeedbackDismiss(): void {
+  clearTimeout(feedbackTimer);
+  const notice = state.feedbackNotice;
+  if (notice === null) return;
+  const remaining = notice.deadline - Date.now();
+  feedbackTimer = setTimeout(() => {
+    beginFeedbackExit();
+  }, Math.max(0, remaining));
+}
+
+function beginFeedbackExit(): void {
+  if (state.feedbackNotice === null) return;
+  state.feedbackNotice.phase = "exit";
+  renderFeedbackStrip();
+  clearTimeout(feedbackTimer);
+  feedbackTimer = setTimeout(() => {
+    state.feedbackNotice = null;
+    const next = state.feedbackQueue.shift();
+    if (next !== undefined) presentSuccessFeedback(next);
+    render();
+  }, feedbackExitDelay());
+}
+
+function presentSuccessFeedback(entry: QueuedFeedback): void {
+  if (state.successAckMode !== "all") return;
+  const now = Date.now();
+  state.feedbackNotice = {
+    text: entry.text,
+    count: entry.count,
+    deadline: now + ACKNOWLEDGEMENT_WINDOW_MS,
+    phase: prefersReducedMotion() ? "visible" : "enter",
+  };
+  clearTimeout(feedbackTimer);
+  if (prefersReducedMotion()) {
+    scheduleFeedbackDismiss();
+  } else {
+    feedbackTimer = setTimeout(() => {
+      if (state.feedbackNotice !== null) state.feedbackNotice.phase = "visible";
+      renderFeedbackStrip();
+      scheduleFeedbackDismiss();
+    }, FEEDBACK_ENTER_MS);
+  }
+  renderFeedbackStrip();
+}
 
 // Mirrors dismissalCancelsParkedJob in internal/job/job.go: a dismiss cancels
 // work only when the job is parked on THIS action. Everything else — advisory
@@ -2271,58 +2427,61 @@ function undoSummary(): string {
   return `Dismissed ${entries.length} items — ${cancelled} cancelled an acquisition.`;
 }
 
-function renderUndoBar(): void {
+function renderFeedbackStrip(): void {
   if (elements === null) return;
+  const bar = elements.undoBar;
+  const message = elements.undoMessage;
+  const button = elements.undoButton;
+
   if (state.dismissals.length > 0) {
-    const remaining = Math.max(0, Math.ceil(((state.undoDeadline ?? 0) - Date.now()) / 1000));
-    elements.undoMessage.textContent = undoSummary();
-    elements.undoButton.textContent = `Undo (${remaining})`;
-    elements.undoButton.hidden = false;
-    elements.undoBar.hidden = false;
+    bar.dataset.kind = "undo";
+    bar.classList.remove("is-enter", "is-exit");
+    message.textContent = undoSummary();
+    button.textContent = "Undo";
+    button.hidden = !state.undoUndoable;
+    button.disabled = !state.undoUndoable;
+    bar.hidden = false;
     return;
   }
+
   if (state.feedbackNotice !== null) {
-    elements.undoMessage.textContent = state.feedbackNotice.text;
-    elements.undoButton.hidden = true;
-    elements.undoBar.hidden = false;
+    bar.dataset.kind = "success";
+    message.textContent = state.feedbackNotice.text;
+    button.hidden = true;
+    button.disabled = false;
+    bar.hidden = false;
+    bar.classList.toggle("is-enter", state.feedbackNotice.phase === "enter");
+    bar.classList.toggle("is-exit", state.feedbackNotice.phase === "exit");
     return;
   }
-  elements.undoBar.hidden = true;
-  elements.undoButton.hidden = false;
+
+  bar.hidden = true;
+  bar.removeAttribute("data-kind");
+  bar.classList.remove("is-enter", "is-exit");
+  button.hidden = false;
+  button.disabled = false;
 }
 
-function showFeedback(text: string): void {
+function showFeedback(text: string, count = 1): void {
+  if (state.successAckMode !== "all") return;
+  const entry: QueuedFeedback = { text, count };
   if (state.dismissals.length > 0 || state.dismissalCommitInFlight || state.feedbackNotice !== null) {
-    if (!state.feedbackQueue.includes(text)) state.feedbackQueue.push(text);
-    if (state.feedbackQueue.length > 3) {
-      state.feedbackQueue = [`${state.feedbackQueue.length} actions completed.`];
-    }
-    renderUndoBar();
+    enqueueSuccessFeedback(entry);
+    renderFeedbackStrip();
     return;
   }
-  state.feedbackNotice = { text, deadline: Date.now() + ACKNOWLEDGEMENT_WINDOW_MS };
-  clearTimeout(feedbackTimer);
-  feedbackTimer = setTimeout(() => {
-    state.feedbackNotice = null;
-    const next = state.feedbackQueue.shift();
-    if (next !== undefined) showFeedback(next);
-    render();
-  }, ACKNOWLEDGEMENT_WINDOW_MS);
-  renderUndoBar();
+  presentSuccessFeedback(entry);
 }
 
-function scheduleUndoTick(): void {
+function scheduleUndoDeadline(): void {
   clearTimeout(undoTimer);
   if (boundDocument !== undefined && globalThis.document !== boundDocument) return;
+  const remaining = (state.undoDeadline ?? 0) - Date.now();
   undoTimer = setTimeout(() => {
-    if (state.dismissals.length === 0) return;
-    if (state.undoDeadline !== null && Date.now() >= state.undoDeadline) {
-      void commitDismissals();
-      return;
-    }
-    renderUndoBar();
-    scheduleUndoTick();
-  }, UNDO_TICK_MS);
+    state.undoUndoable = false;
+    renderFeedbackStrip();
+    void commitDismissals();
+  }, Math.max(0, remaining));
 }
 
 function scheduleDismissal(item: TriageSnapshotItem): void {
@@ -2340,7 +2499,8 @@ function scheduleDismissal(item: TriageSnapshotItem): void {
   state.dismissals.push({ item, cancelsJob: dismissCancelsJob(item) });
   removeItem(item.id);
   state.undoDeadline = Date.now() + UNDO_WINDOW_MS;
-  scheduleUndoTick();
+  state.undoUndoable = true;
+  scheduleUndoDeadline();
   announce(`${undoSummary()} Press u to undo.`);
   render();
 }
@@ -2352,13 +2512,15 @@ function takeDismissals(): PendingDismissal[] {
   const entries = state.dismissals;
   state.dismissals = [];
   state.undoDeadline = null;
+  state.undoUndoable = false;
   clearTimeout(undoTimer);
   if (elements !== null && document.activeElement === elements.undoButton) state.focusSelectionAfterRender = true;
-  renderUndoBar();
+  renderFeedbackStrip();
   return entries;
 }
 
 function undoDismissals(): void {
+  if (!state.undoUndoable || state.dismissals.length === 0) return;
   const entries = takeDismissals();
   const first = entries[0];
   if (first === undefined) return;
@@ -2385,13 +2547,13 @@ async function commitDismissals(): Promise<void> {
     if (applied === entries.length) {
       const message = applied === 1 ? "Dismissal applied." : `${applied} dismissals applied.`;
       announce(message);
-      showFeedback(message);
+      showFeedback(message, applied);
     }
     if (conflicted) await refreshInbox();
   } finally {
     state.dismissalCommitInFlight = false;
     const next = state.feedbackQueue.shift();
-    if (next !== undefined && state.feedbackNotice === null) showFeedback(next);
+    if (next !== undefined && state.feedbackNotice === null) presentSuccessFeedback(next);
     render();
   }
 }
@@ -2765,7 +2927,7 @@ function handleKeyboard(event: KeyboardEvent): void {
       return;
     }
     case "u":
-      if (state.dismissals.length > 0) {
+      if (state.dismissals.length > 0 && state.undoUndoable) {
         event.preventDefault();
         undoDismissals();
       }

@@ -11,6 +11,17 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Browser effects remain at-most-once across extension restarts.** Store
+  schema `34` adds daemon-owned effect permits for generic and direct provider
+  downloads, PDF grabs, configured terms acceptance, and institutional
+  navigation. Each effect must acquire the single global and provider-domain
+  lane before execution; a lost callback remains visibly blocking until its
+  exact result, correlated artifact winner, restart reconciliation, or an
+  exact-ID operator resolution proves the outcome. `papio pulse`,
+  `papio doctor`, and `papio browser permit resolve` expose unresolved
+  occupancy. The strict `effect_permit_v1` protocol requires extension 0.14.0;
+  older peers receive `unsupported` rather than acting without authority.
+
 - **Notification routing and liveness are durable and bounded.** The daemon now
   uses one typed notification router and durable notification ledger, with
   migrations `0030` and `0031` (store schema version 31), independent

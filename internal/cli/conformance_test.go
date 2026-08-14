@@ -156,6 +156,8 @@ var commandClassification = map[string]commandClass{
 	"papio browser":                    {kind: kindNone},
 	"papio browser sessions":           {kind: kindStructured, rpcMethods: []string{"browser.sessions"}},
 	"papio browser use":                {kind: kindStructured, rpcMethods: []string{"browser.sessions", "browser.claim"}},
+	"papio browser permit":             {kind: kindNone},
+	"papio browser permit resolve":     {kind: kindStructured, args: []string{"permit_01", "--reason", "operator verified no browser effect remains"}, rpcMethods: []string{"browser.effect_permit.resolve"}},
 	"papio inbox":                      {kind: kindStructured, rpcMethods: []string{"triage.snapshot"}},
 	"papio inbox counts":               {kind: kindStructured, rpcMethods: []string{"triage.counts"}},
 	"papio inbox decide":               {kind: kindStructured, rpcMethods: []string{"triage.decide"}},

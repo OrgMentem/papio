@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,9 @@ import (
 	"papio/internal/app"
 	"papio/internal/config"
 	"papio/internal/daemon"
+	"papio/internal/job"
+	"papio/internal/store"
+	"papio/internal/work"
 	"papio/internal/zotio"
 )
 
@@ -78,6 +82,190 @@ func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
 	}
 	if system.PDFCapability.PDFToPPM != "" || system.PDFCapability.Tesseract != "" {
 		t.Fatal("OCR helpers remained enabled when pdf.ocr_enabled=false")
+	}
+}
+
+func TestNewImportsEveryUnresolvedLegacyBrowserEffectBeforeAdmission(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	cfg.PDF.OCREnabled = false
+	cfg.Zotio.AutoEnrich = false
+
+	first, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyJob := func(label string) string {
+		id, createErr := first.Jobs.CreateRequest(
+			ctx, label, work.Work{DOI: "10.1002/" + label}, "", "", job.Policy{
+				AccessMode: config.ModeConservative, DesiredVersion: "any", FetchMaxBytes: 1 << 20,
+			}, nil, job.PrincipalUnknown,
+		)
+		if createErr != nil {
+			t.Fatalf("create %s job: %v", label, createErr)
+		}
+		return id
+	}
+	genericJob := legacyJob("legacy-effect-generic")
+	if err := first.Jobs.RecordEvent(ctx, genericJob, "browser.provider_drive_epoch_started", map[string]any{
+		"drive_attempt_id": "legacy-bootstrap-generic", "ordinal": int64(0),
+		"strategy": "generic", "revision": "1", "safety_domain": "institution:generic",
+	}); err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	directJob := legacyJob("legacy-effect-direct")
+	if err := first.Jobs.RecordEvent(ctx, directJob, "browser.direct_route", map[string]any{
+		"phase": "offered", "drive_attempt_id": "legacy-bootstrap-direct", "ordinal": int64(1),
+		"route_revision": "route-1", "safety_domain": "institution:direct",
+	}); err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	institutionalJob := legacyJob("legacy-effect-institutional")
+	execSQL := func(query string, args ...any) {
+		if _, err := first.Store.DB().ExecContext(ctx, query, args...); err != nil {
+			first.Close()
+			t.Fatalf("seed schema-33 browser state: %v", err)
+		}
+	}
+	execSQL(`
+		INSERT INTO institution_profiles
+		  (id, configured_name, revision, authority_digest, authentication_claim_id, created_at, updated_at)
+		VALUES ('legacy-bootstrap-profile', 'legacy profile', 1, 'digest', 'auth-claim',
+		        '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z')`)
+	execSQL(`
+		INSERT INTO browser_candidates
+		  (id, job_id, job_attempt_revision, institution_profile_id, institution_profile_revision,
+		   route_revision, route_class, identifier_strategy, pre_route_safety_key, safety_domain_id,
+		   adapter_revision, effect_contract_id, status, created_at, updated_at)
+		VALUES ('legacy-bootstrap-candidate', ?, 1, 'legacy-bootstrap-profile', 1, 1, 'institutional', 'doi',
+		        'pre-route', 'institution:institutional', 'adapter-1', 'effect-1', 'claimed',
+		        '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z')`, institutionalJob)
+	execSQL(`
+		INSERT INTO materialization_claims
+		  (id, candidate_id, browser_holder_generation, materialization_kind, binding_id,
+		   phase, route_issuance_ordinal, effect_ordinal, created_at, updated_at)
+		VALUES ('legacy-bootstrap-claim', 'legacy-bootstrap-candidate', 1, 'browser_tab', 'legacy-bootstrap-binding',
+		        'route_issued', 2, 3, '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z')`)
+	execSQL(`
+		INSERT INTO pdf_grabs(id, url_host, title, state, created_at, updated_at)
+		VALUES ('legacy-bootstrap-grab', 'example.test', 'legacy grab', 'awaiting_file',
+		        '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z')`)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal("bootstrap rejected valid legacy state:", err)
+	}
+	defer restarted.Close()
+	count, err := restarted.Jobs.UnresolvedLegacyEffectBlockerCount(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Fatalf("startup imported %d unresolved browser effects, want four", count)
+	}
+	var generic, direct, grab, institutional int
+	if err := restarted.Store.DB().QueryRowContext(ctx, `
+		SELECT
+		  COALESCE(SUM(effect_kind='generic_drive'),0),
+		  COALESCE(SUM(effect_kind='direct_get'),0),
+		  COALESCE(SUM(effect_kind='pdf_grab'),0),
+		  COALESCE(SUM(effect_kind='institutional'),0)
+		FROM legacy_effect_blockers WHERE status='unresolved'`).Scan(&generic, &direct, &grab, &institutional); err != nil {
+		t.Fatal(err)
+	}
+	if generic != 1 || direct != 1 || grab != 1 || institutional != 1 {
+		t.Fatalf("startup imported kinds generic=%d direct=%d grab=%d institutional=%d", generic, direct, grab, institutional)
+	}
+	freshJob, err := restarted.Jobs.CreateRequest(
+		ctx, "post-import-admission", work.Work{DOI: "10.1002/post-import-admission"}, "", "",
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20},
+		nil, job.PrincipalUnknown,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Jobs.Transition(ctx, freshJob, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Jobs.Transition(ctx, freshJob, job.StateResolving, job.StateAwaitingHuman, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Jobs.OpenHumanAction(ctx, freshJob, "openurl_handoff", "post-import admission", job.Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	_, outcome, err := restarted.Jobs.AcquireEffectPermit(ctx, job.EffectPermitAcquireInput{
+		Identity: job.EffectPermitIdentity{
+			JobID: freshJob, Kind: job.EffectKindGenericDrive, DriveAttemptID: "new-attempt",
+			Ordinal: 0, Strategy: "generic", Revision: "1",
+		},
+		JobAttemptRevision: 1, BrowserHolderGeneration: 1, SafetyDomainID: "institution:new",
+		LeaseUntil:    time.Now().Add(time.Minute),
+		Authorization: job.EffectPermitEvent{Kind: "effect.authorized"},
+	})
+	if !errors.Is(err, job.ErrEffectPermitBusy) || outcome != job.EffectPermitBusyOutcome {
+		t.Fatalf("admission outcome=%v err=%v, want busy from imported blocker", outcome, err)
+	}
+}
+
+func TestNewRejectsMalformedLegacyBrowserEffectBeforeBrowserConstruction(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	cfg.PDF.OCREnabled = false
+	cfg.Zotio.AutoEnrich = false
+
+	first, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, err := first.Jobs.CreateRequest(ctx, "legacy-effect-malformed", work.Work{DOI: "10.1002/malformed"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any", FetchMaxBytes: 1 << 20,
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	if err := first.Jobs.RecordEvent(ctx, jobID, "browser.provider_drive_epoch_started", map[string]any{
+		"drive_attempt_id": "legacy-bootstrap-malformed", "ordinal": int64(0),
+		"strategy": "generic", "revision": "1",
+	}); err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := New(ctx, cfg)
+	if err == nil || restarted != nil {
+		if restarted != nil {
+			restarted.Close()
+		}
+		t.Fatalf("malformed legacy state bootstrap = system=%v err=%v, want fatal startup error", restarted, err)
+	}
+	if !strings.Contains(err.Error(), "importing legacy browser effects") ||
+		!strings.Contains(err.Error(), "unclassifiable legacy provider drive effect") {
+		t.Fatalf("malformed bootstrap error = %v, want importer context", err)
+	}
+	db, err := store.Open(ctx, cfg.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var blockers int
+	if err := db.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM legacy_effect_blockers`).Scan(&blockers); err != nil {
+		t.Fatal(err)
+	}
+	if blockers != 0 {
+		t.Fatalf("failed startup left %d imported blockers, want transaction rollback", blockers)
 	}
 }
 

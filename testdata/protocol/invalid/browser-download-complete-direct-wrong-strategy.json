@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"download_complete","msg_id":"msg_download_producer_005","job_id":"job_download_producer_005","seq":1,"payload":{"download_id":75,"filename":"paper.pdf","size_bytes":4096,"producer":{"effect_kind":"direct_get","drive_attempt_id":"drive_attempt_005","ordinal":0,"strategy":"generic","revision":"1"}}}

@@ -1,6 +1,6 @@
 # Privacy policy
 
-_Last updated: 2026-08-12_
+_Last updated: 2026-08-14_
 
 *papio* runs on your computer. It has no hosted service, user account, telemetry, or
 analytics. This policy covers the *papio* application (daemon and CLI) and the
@@ -70,7 +70,9 @@ for the full field list.
 
 - **No OrgMentem data collection.** The extension has no backend and does not send data to OrgMentem. It communicates with the local native-messaging host `com.orgmentem.papio`.
 - **No browser credentials.** You enter institutional credentials and complete MFA or CAPTCHA in your browser. The extension does not read, store, or transmit your usernames, passwords, cookies, or session tokens.
-- **No background scraping.** Bulk selection runs only after you click it. It acts only on the papers you select, with a maximum of 200 canonical keys per durable cohort, submitted in bounded chunks. It does not crawl, harvest, or auto-submit pages.
+- **No background scraping, and scanning is separately consented.** Page scanning runs only when you click it, reads only the top frame of that one tab, and runs entirely inside the page: identifier detection is local JavaScript, not a network request. Before *papio* reads a page, the page's bare HTTPS origin must already be in a scanning allowlist that is separate from the host permissions used for downloads — granting a publisher page for acquisition never authorizes scanning it. The first scan of a new site asks once and performs no reading until you allow it. You can revoke any site later from the extension's **Page scanning** settings section or from the **Always allow scanning on this site** checkbox in the selection workspace; revoking blocks further reading immediately. Selection acts only on the papers you choose, with a maximum of 200 canonical keys per durable cohort, submitted in bounded chunks. It does not crawl, harvest, or auto-submit pages.
+- **What a scan sends to the local application.** The scan itself sends nothing. When the selection workspace opens, the detected identifiers (each a `doi`, `pmid`, `arxiv`, or `openalex` kind and value) plus a structural count of visible records go to the **local** *papio* application so it can mark which papers you already own and which are eligible. When you submit, only the canonical keys of the rows you selected are acquired, along with the page's bare lowercase HTTPS origin and the detector name. The short citation label shown beside each row — up to 240 characters of the nearest citation-shaped container's visible text — is display-only and stays in the browser; it is never sent. No page text, path, query, fragment, page title, or credential leaves the browser for a scan.
+- **The host-page action acknowledgement is ephemeral and local.** When a popup action succeeds and transient acknowledgements are set to show for all requests, the extension briefly draws a small chip in the page you acted on. It carries one of four fixed short phrases and nothing else — no identifier, title, URL, provider name, or job id — is not interactive, sends nothing anywhere, stores nothing, and removes itself after three seconds. It reads no page content and installs no watcher or content script.
 - **Focused-surface presence is minimal and local.** The feature-gated `surface_presence_v1` hint carries only an opaque per-instance id, the focused surface type (`popup` or `inbox`), a boolean focused value, and a timestamp. It goes to the local daemon only. It contains no URL, title, tab id, host, identifier, or page content.
 - **Page-bulk recovery is origin-bounded.** The browser-local restart-safe cohort record stores only a bare lowercase HTTPS origin, a bounded detector identifier, and canonical keys (plus the recovery bookkeeping needed to replay chunks). It stores no path, query, fragment, page title, or bearer value.
 - **Ownership marks come from a local check, not the network.** A page-bulk row's `owned_with_pdf` / `owned_missing_pdf` / `ownership_unknown` marks can come from your Zotero library through zotio, which the local application invokes as a local subprocess in local-only mode: the lookup answers from zotio's existing on-disk library mirror, and no network request is made for this check — in particular, papio never triggers a Zotero-account sync from a workspace scan. The mirror refreshes only through your own zotio activity (for example, when a paper is filed after acquisition), so a stale or failed check reports `ownership_unknown` honestly rather than a false "not owned."
@@ -87,6 +89,12 @@ restart-safe replay data: a bare lowercase HTTPS origin, a detector identifier,
 and the ordered canonical keys, together with opaque cohort/chunk bookkeeping
 and timestamps. It never stores a path, query, fragment, page title, or bearer
 value.
+
+The `papio_scanner_allowlist_v1` browser-local record holds only the bare
+lowercase HTTPS origins you have allowed page scanning for — no path, query,
+fragment, page title, or visit history. It is a permission list, not a record of
+where you have been: a site appears only because you allowed it, and removing it
+from **Page scanning** in settings deletes the entry.
 
 **Application storage.** The local application stores papers, metadata, and job
 records in its data directory. Validated PDFs live in `artifacts/`. Downloaded

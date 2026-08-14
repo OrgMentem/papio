@@ -51,7 +51,12 @@
         --brand-mark-size: 32px;
         --focus-width: 2px;
         --focus-offset: 2px;
-        --transition-fast: 140ms ease-out;
+        --motion-hover: 120ms;
+        --motion-state: 160ms;
+        --motion-feedback-in: 180ms;
+        --motion-feedback-out: 140ms;
+        --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+        --ease-in-quart: cubic-bezier(0.5, 0, 0.75, 0);
         --page-max-width: 60rem;
         accent-color: var(--color-primary);
         color: var(--color-ink);
@@ -305,7 +310,7 @@
         gap: var(--space-3);
         grid-template-columns: auto minmax(0, 1fr);
         padding: var(--space-3) var(--space-4);
-        transition: background-color var(--transition-fast);
+        transition: background-color var(--motion-hover) var(--ease-out-quart);
       }
 
       .pb-row:last-child {
@@ -404,8 +409,8 @@
         min-height: var(--control-height);
         padding: 0 var(--space-4);
         transition:
-          background-color var(--transition-fast),
-          border-color var(--transition-fast);
+          background-color var(--motion-hover) var(--ease-out-quart),
+          border-color var(--motion-hover) var(--ease-out-quart);
       }
 
       button:hover:not(:disabled) {
@@ -455,10 +460,30 @@
       }
 
       #allowlist-row {
-        align-items: center;
+        align-items: flex-start;
         display: flex;
+        flex-wrap: wrap;
         gap: var(--space-2);
         margin-top: var(--space-3);
+      }
+
+      #allowlist-row label {
+        color: var(--color-primary);
+        font-weight: 600;
+      }
+
+      #allowlist-message {
+        background: var(--color-warning-surface);
+        border: 1px solid var(--color-warning-border);
+        border-radius: var(--radius-control);
+        color: var(--color-warning);
+        flex: 1 1 100%;
+        font-size: var(--font-size-small);
+        padding: var(--space-2) var(--space-3);
+      }
+
+      #allowlist-message[hidden] {
+        display: none !important;
       }
 
       @media (max-width: 44rem) {
@@ -480,6 +505,9 @@
         *::before,
         *::after {
           transition-duration: 0.01ms !important;
+          transition-delay: 0ms !important;
+          animation-duration: 0.01ms !important;
+          animation-delay: 0ms !important;
         }
       }
     </style>
@@ -539,6 +567,7 @@
       <div id="allowlist-row">
         <input type="checkbox" id="allowlist-checkbox" />
         <label for="allowlist-checkbox">Always allow scanning on this site</label>
+        <p id="allowlist-message" role="alert" hidden></p>
       </div>
     </footer>
     <script src="./page-bulk.js" type="module"></script>

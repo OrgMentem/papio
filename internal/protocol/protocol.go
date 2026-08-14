@@ -878,6 +878,12 @@ const (
 	MsgInstitutionalNavigatedResponse = "institutional_navigated_response"
 	MsgInstitutionalReconcileRequest  = "institutional_reconcile_request"
 	MsgInstitutionalReconcileResponse = "institutional_reconcile_response"
+	MsgEffectPermitReconcileRequest   = "effect_permit_reconcile_request"
+	MsgEffectPermitReconcileResponse  = "effect_permit_reconcile_response"
+	MsgTermsEffectStartRequest        = "terms_effect_start_request"
+	MsgTermsEffectStartResult         = "terms_effect_start_result"
+	MsgTermsEffectResultRequest       = "terms_effect_result_request"
+	MsgTermsEffectResult              = "terms_effect_result"
 	// pdf_grab_v1). MsgPdfGrabResult is sent twice per grab: synchronously in
 	// reply to MsgPdfGrabRequest (request_id set, outcome "steering" with
 	// grab_id+steering_path, or a refusal outcome), and again later,
@@ -899,6 +905,73 @@ const (
 	MsgPageBulkSubmitV2Request = "page_bulk_submit_v2_request"
 	MsgPageBulkSubmitV2Result  = "page_bulk_submit_v2_result"
 )
+
+// EffectPermitFeature negotiates durable reconciliation before an irreversible
+// browser effect may be authorized.
+const EffectPermitFeature = "effect_permit_v1"
+
+// EffectPermitReconcileRequestPayload asks the current browser holder to report
+// only closed observations about one daemon-owned irreversible effect. Optional
+// identity fields are kind-specific; they never carry URLs, paths, or provider
+// text.
+type EffectPermitReconcileRequestPayload struct {
+	RequestID              string `json:"request_id"`
+	PermitID               string `json:"permit_id"`
+	EffectKind             string `json:"effect_kind"`
+	DriveAttemptID         string `json:"drive_attempt_id,omitempty"`
+	Ordinal                *int64 `json:"ordinal,omitempty"`
+	Strategy               string `json:"strategy,omitempty"`
+	Revision               string `json:"revision,omitempty"`
+	ClaimID                string `json:"claim_id,omitempty"`
+	BindingID              string `json:"binding_id,omitempty"`
+	EffectOrdinal          *int64 `json:"effect_ordinal,omitempty"`
+	GrabID                 string `json:"grab_id,omitempty"`
+	TermsOccurrenceID      string `json:"terms_occurrence_id,omitempty"`
+	InstitutionalRequestID string `json:"institutional_request_id,omitempty"`
+	TabID                  *int64 `json:"tab_id,omitempty"`
+}
+
+// EffectPermitReconcileResponsePayload reports bounded, closed observations
+// for one reconciliation request. No URL, path, provider text, or diagnostic
+// detail crosses the bridge.
+type EffectPermitReconcileResponsePayload struct {
+	RequestID       string `json:"request_id"`
+	PermitID        string `json:"permit_id"`
+	Outcome         string `json:"outcome"`
+	Dispatched      bool   `json:"dispatched"`
+	DownloadPresent bool   `json:"download_present"`
+	Acknowledged    bool   `json:"acknowledged"`
+	TabPresent      bool   `json:"tab_present"`
+}
+
+// Terms effect permit: job-scoped daemon-durable permit for configured terms acceptance.
+// Wire is URL-free: authority_digest is 64 lowercase hex.
+type TermsEffectStartRequestPayload struct {
+	RequestID       string `json:"request_id"`
+	AdapterID       string `json:"adapter_id"`
+	AdapterVersion  string `json:"adapter_version"`
+	AuthorityDigest string `json:"authority_digest"`
+}
+type TermsEffectStartResultPayload struct {
+	RequestID         string `json:"request_id"`
+	Outcome           string `json:"outcome"`
+	PermitID          string `json:"permit_id,omitempty"`
+	TermsOccurrenceID string `json:"terms_occurrence_id,omitempty"`
+	Detail            string `json:"detail,omitempty"`
+}
+type TermsEffectResultRequestPayload struct {
+	RequestID         string `json:"request_id"`
+	PermitID          string `json:"permit_id"`
+	TermsOccurrenceID string `json:"terms_occurrence_id"`
+	Outcome           string `json:"outcome"`
+}
+type TermsEffectResultPayload struct {
+	RequestID         string `json:"request_id"`
+	PermitID          string `json:"permit_id"`
+	TermsOccurrenceID string `json:"terms_occurrence_id"`
+	Outcome           string `json:"outcome"`
+	Detail            string `json:"detail,omitempty"`
+}
 
 const InstitutionalMaterializationFeature = "institutional_materialization_v1"
 
@@ -952,25 +1025,31 @@ type InstitutionalBindResponsePayload struct {
 	Detail    string `json:"detail,omitempty"`
 }
 type InstitutionalRouteRequestPayload struct {
-	RequestID string `json:"request_id"`
-	ClaimID   string `json:"claim_id"`
-	BindingID string `json:"binding_id"`
+	RequestID              string `json:"request_id"`
+	ClaimID                string `json:"claim_id"`
+	BindingID              string `json:"binding_id"`
+	ExpectedEffectOrdinal  int64  `json:"expected_effect_ordinal"`
+	InstitutionalRequestID string `json:"institutional_request_id"`
 }
 type InstitutionalRouteResponsePayload struct {
-	RequestID            string `json:"request_id"`
-	Outcome              string `json:"outcome"`
-	ClaimID              string `json:"claim_id,omitempty"`
-	BindingID            string `json:"binding_id,omitempty"`
-	RouteIssuanceOrdinal int64  `json:"route_issuance_ordinal,omitempty"`
-	URL                  string `json:"url,omitempty"`
-	Detail               string `json:"detail,omitempty"`
+	RequestID              string `json:"request_id"`
+	Outcome                string `json:"outcome"`
+	ClaimID                string `json:"claim_id,omitempty"`
+	BindingID              string `json:"binding_id,omitempty"`
+	RouteIssuanceOrdinal   int64  `json:"route_issuance_ordinal,omitempty"`
+	EffectOrdinal          int64  `json:"effect_ordinal,omitempty"`
+	InstitutionalRequestID string `json:"institutional_request_id,omitempty"`
+	URL                    string `json:"url,omitempty"`
+	Detail                 string `json:"detail,omitempty"`
 }
 type InstitutionalNavigatedRequestPayload struct {
-	RequestID            string `json:"request_id"`
-	ClaimID              string `json:"claim_id"`
-	BindingID            string `json:"binding_id"`
-	RouteIssuanceOrdinal int64  `json:"route_issuance_ordinal"`
-	TabID                int64  `json:"tab_id"`
+	RequestID              string `json:"request_id"`
+	ClaimID                string `json:"claim_id"`
+	BindingID              string `json:"binding_id"`
+	RouteIssuanceOrdinal   int64  `json:"route_issuance_ordinal"`
+	EffectOrdinal          int64  `json:"effect_ordinal"`
+	InstitutionalRequestID string `json:"institutional_request_id"`
+	TabID                  int64  `json:"tab_id"`
 }
 type InstitutionalNavigatedResponsePayload struct {
 	RequestID string `json:"request_id"`
@@ -1013,6 +1092,8 @@ var jobScoped = map[string]bool{
 	MsgInstitutionalBindRequest: true, MsgInstitutionalBindResponse: true,
 	MsgInstitutionalRouteRequest: true, MsgInstitutionalRouteResponse: true,
 	MsgInstitutionalNavigatedRequest: true, MsgInstitutionalNavigatedResponse: true,
+	MsgTermsEffectStartRequest: true, MsgTermsEffectStartResult: true,
+	MsgTermsEffectResultRequest: true, MsgTermsEffectResult: true,
 }
 
 // HelloPayload announces the extension, its adapter versions, and the
@@ -1239,10 +1320,30 @@ type DownloadStartedPayload struct {
 }
 
 // DownloadCompletePayload reports the finished download's metadata (never bytes).
+// Producer is a feature-gated, URL-free identity for the irreversible browser
+// effect that produced the file. Old peers omit it; omission is valid but can
+// never settle effect occupancy from the artifact alone.
 type DownloadCompletePayload struct {
-	DownloadID int64  `json:"download_id"`
-	Filename   string `json:"filename"`
-	SizeBytes  int64  `json:"size_bytes"`
+	DownloadID int64                    `json:"download_id"`
+	Filename   string                   `json:"filename"`
+	SizeBytes  int64                    `json:"size_bytes"`
+	Producer   *ArtifactProducerPayload `json:"producer,omitempty"`
+}
+
+// ArtifactProducerPayload is a closed identity union. Generic/direct effects
+// carry the complete drive tuple; institutional effects carry the complete
+// claim/request tuple. It deliberately has no URL, path, provider text, or
+// permit-id shortcut.
+type ArtifactProducerPayload struct {
+	EffectKind             string `json:"effect_kind"`
+	DriveAttemptID         string `json:"drive_attempt_id,omitempty"`
+	Ordinal                *int64 `json:"ordinal,omitempty"`
+	Strategy               string `json:"strategy,omitempty"`
+	Revision               string `json:"revision,omitempty"`
+	ClaimID                string `json:"claim_id,omitempty"`
+	BindingID              string `json:"binding_id,omitempty"`
+	EffectOrdinal          *int64 `json:"effect_ordinal,omitempty"`
+	InstitutionalRequestID string `json:"institutional_request_id,omitempty"`
 }
 
 // DeliveryContextPayload records the observed route and browser-session
@@ -1909,6 +2010,27 @@ type WorkPulseCapacity struct {
 	Waiting int64 `json:"waiting,omitempty"`
 }
 
+type WorkPulseEffectPermit struct {
+	PermitID string `json:"permit_id"`
+	Status   string `json:"status"`
+	Since    string `json:"since"`
+}
+
+// WorkPulseLegacyEffectBlocker is the bounded, privacy-safe projection of a
+// pre-permit global admission refusal. It intentionally carries no provider,
+// URL, path, safety-domain, claim, or binding text.
+type WorkPulseLegacyEffectBlocker struct {
+	BlockerID      string `json:"blocker_id"`
+	EffectKind     string `json:"effect_kind"`
+	JobID          string `json:"job_id,omitempty"`
+	DriveAttemptID string `json:"drive_attempt_id,omitempty"`
+	Ordinal        *int64 `json:"ordinal,omitempty"`
+	Strategy       string `json:"strategy,omitempty"`
+	Revision       string `json:"revision,omitempty"`
+	Since          string `json:"since"`
+	Recovery       string `json:"recovery"`
+}
+
 type WorkPulseHumanSurfaceCapacity struct {
 	Busy          int64 `json:"busy"`
 	Limit         int64 `json:"limit"`
@@ -1956,26 +2078,32 @@ type WorkPulseLatestBatch struct {
 }
 
 type WorkPulseResponsePayload struct {
-	RequestID              string                         `json:"request_id"`
-	Schema                 int64                          `json:"schema"`
-	GeneratedAt            string                         `json:"generated_at"`
-	NonterminalTotal       *int64                         `json:"nonterminal_total,omitempty"`
-	ProjectionComplete     *bool                          `json:"projection_complete,omitempty"`
-	InFlight               *int64                         `json:"in_flight,omitempty"`
-	Scheduled              *int64                         `json:"scheduled,omitempty"`
-	WaitingRequired        *int64                         `json:"waiting_required,omitempty"`
-	Continuing             *int64                         `json:"continuing,omitempty"`
-	Stalled                *int64                         `json:"stalled,omitempty"`
-	EffectCapacity         *WorkPulseCapacity             `json:"effect_capacity,omitempty"`
-	HumanSurfaceCapacity   *WorkPulseHumanSurfaceCapacity `json:"human_surface_capacity,omitempty"`
-	LastForwardAt          string                         `json:"last_forward_at,omitempty"`
-	StallEpisodes          []WorkPulseStallEpisode        `json:"stall_episodes,omitempty"`
-	StallEpisodesTruncated *bool                          `json:"stall_episodes_truncated,omitempty"`
-	LastFinishedAt         string                         `json:"last_finished_at,omitempty"`
-	NextAction             *WorkPulseNextAction           `json:"next_action,omitempty"`
-	Gates                  []WorkPulseGate                `json:"gates,omitempty"`
-	GatesTruncated         *bool                          `json:"gates_truncated,omitempty"`
-	LatestBatch            *WorkPulseLatestBatch          `json:"latest_batch,omitempty"`
+	RequestID          string             `json:"request_id"`
+	Schema             int64              `json:"schema"`
+	GeneratedAt        string             `json:"generated_at"`
+	NonterminalTotal   *int64             `json:"nonterminal_total,omitempty"`
+	ProjectionComplete *bool              `json:"projection_complete,omitempty"`
+	InFlight           *int64             `json:"in_flight,omitempty"`
+	Scheduled          *int64             `json:"scheduled,omitempty"`
+	WaitingRequired    *int64             `json:"waiting_required,omitempty"`
+	Continuing         *int64             `json:"continuing,omitempty"`
+	Stalled            *int64             `json:"stalled,omitempty"`
+	EffectCapacity     *WorkPulseCapacity `json:"effect_capacity,omitempty"`
+	// EffectAdmissionBlocked is independent of capacity: a legacy blocker can
+	// refuse every new effect while effect_capacity.busy remains zero.
+	EffectAdmissionBlocked        *bool                          `json:"effect_admission_blocked,omitempty"`
+	LegacyEffectBlockers          []WorkPulseLegacyEffectBlocker `json:"legacy_effect_blockers,omitempty"`
+	LegacyEffectBlockersTruncated *bool                          `json:"legacy_effect_blockers_truncated,omitempty"`
+	HumanSurfaceCapacity          *WorkPulseHumanSurfaceCapacity `json:"human_surface_capacity,omitempty"`
+	EffectPermits                 []WorkPulseEffectPermit        `json:"effect_permits,omitempty"`
+	LastForwardAt                 string                         `json:"last_forward_at,omitempty"`
+	StallEpisodes                 []WorkPulseStallEpisode        `json:"stall_episodes,omitempty"`
+	StallEpisodesTruncated        *bool                          `json:"stall_episodes_truncated,omitempty"`
+	LastFinishedAt                string                         `json:"last_finished_at,omitempty"`
+	NextAction                    *WorkPulseNextAction           `json:"next_action,omitempty"`
+	Gates                         []WorkPulseGate                `json:"gates,omitempty"`
+	GatesTruncated                *bool                          `json:"gates_truncated,omitempty"`
+	LatestBatch                   *WorkPulseLatestBatch          `json:"latest_batch,omitempty"`
 }
 
 type ActivityPageRequestPayload struct {
@@ -2047,6 +2175,18 @@ type browserEnvelope struct {
 // DecodeBrowserMessage strictly parses one bridge frame: size cap, envelope,
 // then a fail-closed type-specific payload decode.
 func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
+	return decodeBrowserMessage(data, false)
+}
+
+// DecodeBrowserMessageWithLegacyInstitutionalNavigation accepts the historical
+// institutional navigation shape only for a caller that has already proved the
+// peer negotiated institutional materialization without effect permits. The
+// default decoder remains strict current-v1.
+func DecodeBrowserMessageWithLegacyInstitutionalNavigation(data []byte) (*BrowserMessage, error) {
+	return decodeBrowserMessage(data, true)
+}
+
+func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) (*BrowserMessage, error) {
 	if len(data) > MaxBrowserMessageBytes {
 		return nil, fmt.Errorf("browser message: %d bytes exceeds cap %d", len(data), MaxBrowserMessageBytes)
 	}
@@ -2072,18 +2212,30 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	if env.Seq == nil || *env.Seq < 0 || *env.Seq > MaxBrowserInteger {
 		return nil, fmt.Errorf("browser message: seq required in range 0..%d", MaxBrowserInteger)
 	}
-	if jobScoped[env.Type] && env.JobID == "" {
-		return nil, fmt.Errorf("browser message: type %q requires a valid job_id", env.Type)
-	}
-	if (env.Type == MsgInstitutionalReconcileRequest || env.Type == MsgInstitutionalReconcileResponse) && env.JobID != "" {
-		return nil, fmt.Errorf("browser message: type %q must not carry job_id", env.Type)
-	}
 	if env.Payload == nil {
 		return nil, fmt.Errorf("browser message: payload required")
 	}
 	payloadFields, err := browserObjectFields(env.Payload, "browser message payload")
 	if err != nil {
 		return nil, err
+	}
+	if jobScoped[env.Type] && env.JobID == "" {
+		return nil, fmt.Errorf("browser message: type %q requires a valid job_id", env.Type)
+	}
+	if env.Type == MsgEffectPermitReconcileRequest {
+		effectKind, _ := payloadFields["effect_kind"]
+		var kind string
+		_ = json.Unmarshal(effectKind, &kind)
+		if kind == "pdf_grab" {
+			if env.JobID != "" {
+				return nil, fmt.Errorf("browser message: type %q with effect_kind %q must not carry job_id", env.Type, kind)
+			}
+		} else if env.JobID == "" {
+			return nil, fmt.Errorf("browser message: type %q requires a valid job_id", env.Type)
+		}
+	}
+	if (env.Type == MsgInstitutionalReconcileRequest || env.Type == MsgInstitutionalReconcileResponse) && env.JobID != "" {
+		return nil, fmt.Errorf("browser message: type %q must not carry job_id", env.Type)
 	}
 
 	msg := &BrowserMessage{Protocol: env.Protocol, Type: env.Type, MsgID: env.MsgID, JobID: env.JobID, Seq: *env.Seq}
@@ -2387,6 +2539,9 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 	case MsgDownloadComplete:
 		p := &DownloadCompletePayload{}
 		if err = browserRequireFields(payloadFields, "download_id", "filename", "size_bytes"); err == nil {
+			err = browserRejectNullFields(payloadFields, "producer")
+		}
+		if err == nil {
 			err = strictDecode(env.Payload, p)
 		}
 		if err == nil {
@@ -2394,6 +2549,16 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		}
 		if err == nil && (p.SizeBytes < 1 || p.SizeBytes > MaxBrowserInteger) {
 			err = fmt.Errorf("size_bytes must be in range 1..%d", MaxBrowserInteger)
+		}
+		if err == nil && p.Producer != nil {
+			var producerFields map[string]json.RawMessage
+			producerFields, err = browserObjectFields(payloadFields["producer"], "download_complete.producer")
+			if err == nil {
+				err = browserRejectNullValues(payloadFields["producer"], "download_complete.producer")
+			}
+			if err == nil {
+				err = p.Producer.validate(producerFields)
+			}
 		}
 		msg.Payload = p
 	case MsgProviderOutcome:
@@ -2488,6 +2653,69 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = enumRequired("provider_drive_epoch_result.outcome", p.Outcome, "applied", "stale", "duplicate", "unsupported", "error")
 		}
 		msg.Payload = p
+	case MsgEffectPermitReconcileRequest:
+		p := &EffectPermitReconcileRequestPayload{}
+		err = decodeEffectPermitPayload(env.Payload, payloadFields, "effect_permit_reconcile_request",
+			[]string{"request_id", "permit_id", "effect_kind"}, p)
+		if err == nil {
+			err = p.validate(payloadFields)
+		}
+		msg.Payload = p
+	case MsgEffectPermitReconcileResponse:
+		p := &EffectPermitReconcileResponsePayload{}
+		err = browserRejectNoncanonicalFields(payloadFields,
+			"request_id", "permit_id", "outcome", "dispatched", "download_present",
+			"acknowledged", "tab_present")
+		if err == nil {
+			err = decodeTriagePayload(env.Payload, payloadFields, "effect_permit_reconcile_response",
+				[]string{"request_id", "permit_id", "outcome", "dispatched", "download_present", "acknowledged", "tab_present"}, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgTermsEffectStartRequest:
+		p := &TermsEffectStartRequestPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "adapter_id", "adapter_version", "authority_digest"); err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgTermsEffectStartResult:
+		p := &TermsEffectStartResultPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "permit_id", "terms_occurrence_id", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate(payloadFields)
+		}
+		msg.Payload = p
+	case MsgTermsEffectResultRequest:
+		p := &TermsEffectResultRequestPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "permit_id", "terms_occurrence_id", "outcome"); err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgTermsEffectResult:
+		p := &TermsEffectResultPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "permit_id", "terms_occurrence_id", "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
 	case MsgInstitutionalCandidateOffer:
 		p := &InstitutionalCandidateOfferPayload{}
 		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_candidate_offer", []string{
@@ -2543,7 +2771,9 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgInstitutionalRouteRequest:
 		p := &InstitutionalRouteRequestPayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_route_request", []string{"request_id", "claim_id", "binding_id"}, p)
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_route_request", []string{
+			"request_id", "claim_id", "binding_id", "expected_effect_ordinal", "institutional_request_id",
+		}, p)
 		if err == nil {
 			err = p.validate()
 		}
@@ -2555,7 +2785,7 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 			err = p.validate()
 		}
 		if err == nil {
-			fields := []string{"claim_id", "binding_id", "route_issuance_ordinal", "url"}
+			fields := []string{"claim_id", "binding_id", "route_issuance_ordinal", "effect_ordinal", "institutional_request_id", "url"}
 			if p.Outcome == "issued" {
 				err = institutionalRequirePresence(payloadFields, "institutional_route_response", fields...)
 			} else {
@@ -2565,9 +2795,24 @@ func DecodeBrowserMessage(data []byte) (*BrowserMessage, error) {
 		msg.Payload = p
 	case MsgInstitutionalNavigatedRequest:
 		p := &InstitutionalNavigatedRequestPayload{}
-		err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_navigated_request", []string{"request_id", "claim_id", "binding_id", "route_issuance_ordinal", "tab_id"}, p)
-		if err == nil {
-			err = p.validate()
+		_, hasEffectOrdinal := payloadFields["effect_ordinal"]
+		_, hasRequestID := payloadFields["institutional_request_id"]
+		legacy := allowLegacyInstitutionalNavigation
+		if legacy && (hasEffectOrdinal || hasRequestID) {
+			err = fmt.Errorf("legacy institutional_navigated_request must not carry effect_ordinal or institutional_request_id")
+		} else {
+			required := []string{"request_id", "claim_id", "binding_id", "route_issuance_ordinal", "tab_id"}
+			if !legacy {
+				required = append(required[:4], "effect_ordinal", "institutional_request_id", "tab_id")
+			}
+			err = decodeInstitutionalPayload(env.Payload, payloadFields, "institutional_navigated_request", required, p)
+			if err == nil {
+				if legacy {
+					err = p.validateLegacy()
+				} else {
+					err = p.validate()
+				}
+			}
 		}
 		msg.Payload = p
 	case MsgInstitutionalNavigatedResponse:
@@ -3044,6 +3289,75 @@ func (p *WorkPulseResponsePayload) validate() error {
 		if err := p.EffectCapacity.validate("work_pulse_response.effect_capacity"); err != nil {
 			return err
 		}
+	}
+	if len(p.EffectPermits) > 4 {
+		return fmt.Errorf("work_pulse_response.effect_permits capped at 4")
+	}
+	seenPermits := map[string]bool{}
+	for _, permit := range p.EffectPermits {
+		if err := validateWireID("work_pulse_response.effect_permits.permit_id", permit.PermitID); err != nil || seenPermits[permit.PermitID] {
+			return fmt.Errorf("invalid or duplicate effect permit id")
+		}
+		seenPermits[permit.PermitID] = true
+		if err := enumRequired("work_pulse_response.effect_permits.status", permit.Status, "held", "unknown_completion"); err != nil {
+			return err
+		}
+		if err := validatePulseTime("work_pulse_response.effect_permits.since", permit.Since, true); err != nil {
+			return err
+		}
+	}
+	if len(p.LegacyEffectBlockers) > 0 && (p.EffectAdmissionBlocked == nil || !*p.EffectAdmissionBlocked) {
+		return fmt.Errorf("legacy effect blockers require effect_admission_blocked")
+	}
+	if p.EffectAdmissionBlocked != nil && *p.EffectAdmissionBlocked && len(p.LegacyEffectBlockers) == 0 && (p.LegacyEffectBlockersTruncated == nil || !*p.LegacyEffectBlockersTruncated) {
+		return fmt.Errorf("effect_admission_blocked requires a legacy blocker")
+	}
+	if len(p.LegacyEffectBlockers) > 16 {
+		return fmt.Errorf("work_pulse_response.legacy_effect_blockers capped at 16")
+	}
+	seenLegacy := map[string]bool{}
+	for i, blocker := range p.LegacyEffectBlockers {
+		if err := validateWireID("work_pulse_response.legacy_effect_blockers.blocker_id", blocker.BlockerID); err != nil || seenLegacy[blocker.BlockerID] {
+			return fmt.Errorf("invalid or duplicate legacy effect blocker id")
+		}
+		seenLegacy[blocker.BlockerID] = true
+		if err := enumRequired("work_pulse_response.legacy_effect_blockers.effect_kind", blocker.EffectKind, "generic_drive", "direct_get", "pdf_grab", "institutional"); err != nil {
+			return err
+		}
+		if blocker.JobID != "" {
+			if err := validateWireID("work_pulse_response.legacy_effect_blockers.job_id", blocker.JobID); err != nil {
+				return err
+			}
+		}
+		if blocker.EffectKind == "generic_drive" || blocker.EffectKind == "direct_get" {
+			if blocker.JobID == "" || blocker.DriveAttemptID == "" || blocker.Ordinal == nil || blocker.Strategy == "" || blocker.Revision == "" {
+				return fmt.Errorf("legacy drive blocker identity incomplete")
+			}
+			if err := validateDriveEpochTuple(blocker.DriveAttemptID, *blocker.Ordinal, blocker.Strategy, blocker.Revision, "work_pulse_response.legacy_effect_blockers"); err != nil {
+				return err
+			}
+			if blocker.EffectKind == "direct_get" && blocker.Strategy != "direct_get" {
+				return fmt.Errorf("legacy direct blocker strategy invalid")
+			}
+		} else if blocker.DriveAttemptID != "" || blocker.Ordinal != nil || blocker.Strategy != "" || blocker.Revision != "" {
+			return fmt.Errorf("legacy non-drive blocker carries drive identity")
+		}
+		if err := validatePulseTime("work_pulse_response.legacy_effect_blockers.since", blocker.Since, true); err != nil {
+			return err
+		}
+		if err := enumRequired("work_pulse_response.legacy_effect_blockers.recovery", blocker.Recovery, "exact_result_or_correlated_winner"); err != nil {
+			return err
+		}
+		if i > 0 {
+			prev, _ := time.Parse(time.RFC3339Nano, p.LegacyEffectBlockers[i-1].Since)
+			curr, _ := time.Parse(time.RFC3339Nano, blocker.Since)
+			if curr.Before(prev) || (curr.Equal(prev) && blocker.BlockerID < p.LegacyEffectBlockers[i-1].BlockerID) {
+				return fmt.Errorf("legacy effect blockers must be ordered")
+			}
+		}
+	}
+	if p.LegacyEffectBlockersTruncated != nil && *p.LegacyEffectBlockersTruncated && len(p.LegacyEffectBlockers) != 16 {
+		return fmt.Errorf("truncated legacy effect blockers require a full page")
 	}
 	if p.HumanSurfaceCapacity != nil {
 		if err := p.HumanSurfaceCapacity.validate("work_pulse_response.human_surface_capacity"); err != nil {
@@ -3903,6 +4217,56 @@ func validateDownload(id int64, filename string) error {
 	return nil
 }
 
+func (p *ArtifactProducerPayload) validate(fields map[string]json.RawMessage) error {
+	const what = "download_complete.producer"
+	if err := enumRequired(what+".effect_kind", p.EffectKind, "generic_drive", "direct_get", "institutional"); err != nil {
+		return err
+	}
+	driveFields := []string{"drive_attempt_id", "ordinal", "strategy", "revision"}
+	institutionalFields := []string{"claim_id", "binding_id", "effect_ordinal", "institutional_request_id"}
+	switch p.EffectKind {
+	case "generic_drive", "direct_get":
+		if err := browserRequireFields(fields, driveFields...); err != nil {
+			return err
+		}
+		if err := institutionalRejectPresence(fields, what+"."+p.EffectKind, institutionalFields...); err != nil {
+			return err
+		}
+		if p.Ordinal == nil {
+			return fmt.Errorf("%s.ordinal is required", what)
+		}
+		if err := validateDriveEpochTuple(p.DriveAttemptID, *p.Ordinal, p.Strategy, p.Revision, what); err != nil {
+			return err
+		}
+		if p.EffectKind == "direct_get" && p.Strategy != "direct_get" {
+			return fmt.Errorf("%s.strategy must be direct_get", what)
+		}
+		if p.EffectKind == "generic_drive" && p.Strategy == "direct_get" {
+			return fmt.Errorf("%s.strategy direct_get is forbidden for generic_drive", what)
+		}
+	case "institutional":
+		if err := browserRequireFields(fields, institutionalFields...); err != nil {
+			return err
+		}
+		if err := institutionalRejectPresence(fields, what+".institutional", driveFields...); err != nil {
+			return err
+		}
+		if err := institutionalID(what+".claim_id", p.ClaimID); err != nil {
+			return err
+		}
+		if err := institutionalID(what+".binding_id", p.BindingID); err != nil {
+			return err
+		}
+		if p.EffectOrdinal == nil || *p.EffectOrdinal < 1 || *p.EffectOrdinal > MaxBrowserInteger {
+			return fmt.Errorf("%s.effect_ordinal must be in range 1..%d", what, MaxBrowserInteger)
+		}
+		if err := institutionalRequestID(what+".institutional_request_id", p.InstitutionalRequestID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (p *DeliveryContextPayload) validate() error {
 	if p.DownloadID < 1 || p.DownloadID > MaxBrowserInteger {
 		return fmt.Errorf("delivery_context.download_id must be in range 1..%d", MaxBrowserInteger)
@@ -3946,7 +4310,203 @@ func decodeInstitutionalPayload(data []byte, fields map[string]json.RawMessage, 
 	}
 	return strictDecode(data, target)
 }
+func decodeEffectPermitPayload(data []byte, fields map[string]json.RawMessage, what string, required []string, target any) error {
+	if err := browserRequireFields(fields, required...); err != nil {
+		return err
+	}
+	if err := browserRejectNoncanonicalFields(fields,
+		"request_id", "permit_id", "effect_kind", "drive_attempt_id", "ordinal", "strategy", "revision",
+		"claim_id", "binding_id", "effect_ordinal", "grab_id", "terms_occurrence_id",
+		"institutional_request_id", "tab_id"); err != nil {
+		return err
+	}
+	if err := browserRejectNullValues(data, what); err != nil {
+		return err
+	}
+	return strictDecode(data, target)
+}
 
+func effectPermitRejectFields(fields map[string]json.RawMessage, kind string, names ...string) error {
+	return institutionalRejectPresence(fields, "effect_permit_reconcile_request."+kind, names...)
+}
+
+func (p *EffectPermitReconcileRequestPayload) validate(fields map[string]json.RawMessage) error {
+	const what = "effect_permit_reconcile_request"
+	if err := validateCorrelationID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".permit_id", p.PermitID); err != nil {
+		return err
+	}
+	if err := enumRequired(what+".effect_kind", p.EffectKind, "generic_drive", "direct_get", "pdf_grab", "terms", "institutional"); err != nil {
+		return err
+	}
+	driveFields := []string{"drive_attempt_id", "ordinal", "strategy", "revision"}
+	otherFields := []string{"claim_id", "binding_id", "effect_ordinal", "grab_id", "terms_occurrence_id", "institutional_request_id", "tab_id"}
+	switch p.EffectKind {
+	case "generic_drive", "direct_get":
+		if err := browserRequireFields(fields, driveFields...); err != nil {
+			return err
+		}
+		if err := effectPermitRejectFields(fields, p.EffectKind, otherFields...); err != nil {
+			return err
+		}
+		if p.Ordinal == nil {
+			return fmt.Errorf("%s.ordinal is required for %s", what, p.EffectKind)
+		}
+		if err := validateDriveEpochTuple(p.DriveAttemptID, *p.Ordinal, p.Strategy, p.Revision, what); err != nil {
+			return err
+		}
+		if p.EffectKind == "direct_get" && p.Strategy != "direct_get" {
+			return fmt.Errorf("%s.strategy must be direct_get", what)
+		}
+		if p.EffectKind == "generic_drive" && p.Strategy == "direct_get" {
+			return fmt.Errorf("%s.strategy direct_get is forbidden for generic_drive", what)
+		}
+	case "pdf_grab":
+		if err := browserRequireFields(fields, "grab_id"); err != nil {
+			return err
+		}
+		if err := effectPermitRejectFields(fields, p.EffectKind, "drive_attempt_id", "ordinal", "strategy", "revision", "claim_id", "binding_id", "effect_ordinal", "terms_occurrence_id", "institutional_request_id", "tab_id"); err != nil {
+			return err
+		}
+		if err := validateCorrelationID(what+".grab_id", p.GrabID); err != nil {
+			return err
+		}
+	case "terms":
+		if err := browserRequireFields(fields, "terms_occurrence_id"); err != nil {
+			return err
+		}
+		if err := effectPermitRejectFields(fields, p.EffectKind, "drive_attempt_id", "ordinal", "strategy", "revision", "claim_id", "binding_id", "effect_ordinal", "grab_id", "institutional_request_id", "tab_id"); err != nil {
+			return err
+		}
+		if err := institutionalID(what+".terms_occurrence_id", p.TermsOccurrenceID); err != nil {
+			return err
+		}
+	case "institutional":
+		if err := browserRequireFields(fields, "claim_id", "binding_id", "effect_ordinal", "institutional_request_id"); err != nil {
+			return err
+		}
+		if err := effectPermitRejectFields(fields, p.EffectKind, driveFields[0], driveFields[1], driveFields[2], driveFields[3], "grab_id", "terms_occurrence_id"); err != nil {
+			return err
+		}
+		if err := institutionalID(what+".claim_id", p.ClaimID); err != nil {
+			return err
+		}
+		if err := institutionalID(what+".binding_id", p.BindingID); err != nil {
+			return err
+		}
+		if p.EffectOrdinal == nil || *p.EffectOrdinal < 1 || *p.EffectOrdinal > MaxBrowserInteger {
+			return fmt.Errorf("%s.effect_ordinal must be in range 1..%d", what, MaxBrowserInteger)
+		}
+		if err := institutionalRequestID(what+".institutional_request_id", p.InstitutionalRequestID); err != nil {
+			return err
+		}
+		if p.TabID != nil {
+			if err := institutionalTabID(what+".tab_id", *p.TabID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+func validateAdapterID(what, value string) error {
+	if !adapterIDRE.MatchString(value) {
+		return fmt.Errorf("%s must match the adapter_id charset (1..64 chars)", what)
+	}
+	return nil
+}
+func validateAuthorityDigest(what, value string) error {
+	if !sha256RE.MatchString(value) {
+		return fmt.Errorf("%s must be 64 lowercase hex", what)
+	}
+	return nil
+}
+func (p *TermsEffectStartRequestPayload) validate() error {
+	if err := validateCorrelationID("terms_effect_start_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateAdapterID("terms_effect_start_request.adapter_id", p.AdapterID); err != nil {
+		return err
+	}
+	if browserTextLen(p.AdapterVersion) == 0 || browserTextLen(p.AdapterVersion) > 50 || browserHasNUL(p.AdapterVersion) {
+		return fmt.Errorf("terms_effect_start_request.adapter_version must be 1..50 chars without NUL")
+	}
+	return validateAuthorityDigest("terms_effect_start_request.authority_digest", p.AuthorityDigest)
+}
+func (p *TermsEffectStartResultPayload) validate(fields map[string]json.RawMessage) error {
+	const what = "terms_effect_start_result"
+	if err := validateCorrelationID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := enumRequired(what+".outcome", p.Outcome, "started", "duplicate", "busy", "stale", "unsupported", "error"); err != nil {
+		return err
+	}
+	if err := validateTriageText(what+".detail", p.Detail, 500); err != nil {
+		return err
+	}
+	if p.Outcome == "started" {
+		if err := institutionalRequirePresence(fields, what, "permit_id", "terms_occurrence_id"); err != nil {
+			return err
+		}
+		if err := institutionalID(what+".permit_id", p.PermitID); err != nil {
+			return err
+		}
+		return institutionalID(what+".terms_occurrence_id", p.TermsOccurrenceID)
+	}
+	if _, ok := fields["permit_id"]; ok {
+		return fmt.Errorf("%s.%s forbids permit_id", what, p.Outcome)
+	}
+	if _, ok := fields["terms_occurrence_id"]; ok {
+		return fmt.Errorf("%s.%s forbids terms_occurrence_id", what, p.Outcome)
+	}
+	if p.PermitID != "" || p.TermsOccurrenceID != "" {
+		return fmt.Errorf("%s.%s forbids permit fields", what, p.Outcome)
+	}
+	return nil
+}
+func (p *TermsEffectResultRequestPayload) validate() error {
+	const what = "terms_effect_result_request"
+	if err := validateCorrelationID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".permit_id", p.PermitID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".terms_occurrence_id", p.TermsOccurrenceID); err != nil {
+		return err
+	}
+	return enumRequired(what+".outcome", p.Outcome, "accepted", "not_dispatched")
+}
+func (p *TermsEffectResultPayload) validate() error {
+	const what = "terms_effect_result"
+	if err := validateCorrelationID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".permit_id", p.PermitID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".terms_occurrence_id", p.TermsOccurrenceID); err != nil {
+		return err
+	}
+	if err := enumRequired(what+".outcome", p.Outcome, "applied", "duplicate", "stale", "error"); err != nil {
+		return err
+	}
+	return validateTriageText(what+".detail", p.Detail, 500)
+}
+func (p *EffectPermitReconcileResponsePayload) validate() error {
+	const what = "effect_permit_reconcile_response"
+	if err := validateCorrelationID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".permit_id", p.PermitID); err != nil {
+		return err
+	}
+	if err := enumRequired(what+".outcome", p.Outcome, "recorded", "settled", "stale", "duplicate", "error"); err != nil {
+		return err
+	}
+	return nil
+}
 func institutionalID(what, value string) error {
 	if !requestIDRE.MatchString(value) {
 		return fmt.Errorf("%s must be a bounded opaque ID (8..128 chars)", what)
@@ -4084,7 +4644,13 @@ func (p *InstitutionalRouteRequestPayload) validate() error {
 	if err := institutionalID("institutional_route_request.claim_id", p.ClaimID); err != nil {
 		return err
 	}
-	return institutionalID("institutional_route_request.binding_id", p.BindingID)
+	if err := institutionalID("institutional_route_request.binding_id", p.BindingID); err != nil {
+		return err
+	}
+	if p.ExpectedEffectOrdinal < 0 || p.ExpectedEffectOrdinal > MaxBrowserInteger {
+		return fmt.Errorf("institutional_route_request.expected_effect_ordinal out of range")
+	}
+	return institutionalID("institutional_route_request.institutional_request_id", p.InstitutionalRequestID)
 }
 func (p *InstitutionalRouteResponsePayload) validate() error {
 	if err := institutionalRequestID("institutional_route_response.request_id", p.RequestID); err != nil {
@@ -4101,6 +4667,7 @@ func (p *InstitutionalRouteResponsePayload) validate() error {
 		if p.Detail != "" {
 			return fmt.Errorf("institutional_route_response.issued must not carry detail")
 		}
+
 		if err := institutionalID("institutional_route_response.claim_id", p.ClaimID); err != nil {
 			return err
 		}
@@ -4110,15 +4677,37 @@ func (p *InstitutionalRouteResponsePayload) validate() error {
 		if err := institutionalOrdinal("institutional_route_response.route_issuance_ordinal", p.RouteIssuanceOrdinal); err != nil {
 			return err
 		}
+		if err := institutionalOrdinal("institutional_route_response.effect_ordinal", p.EffectOrdinal); err != nil {
+			return err
+		}
+		if err := institutionalID("institutional_route_response.institutional_request_id", p.InstitutionalRequestID); err != nil {
+			return err
+		}
 		if err := validateTriageURL("institutional_route_response.url", p.URL, "https"); err != nil {
 			return err
 		}
 		return nil
 	}
-	if p.ClaimID != "" || p.BindingID != "" || p.RouteIssuanceOrdinal != 0 || p.URL != "" {
+	if p.ClaimID != "" || p.BindingID != "" || p.RouteIssuanceOrdinal != 0 ||
+		p.EffectOrdinal != 0 || p.InstitutionalRequestID != "" || p.URL != "" {
 		return fmt.Errorf("institutional_route_response.%s forbids route fields", p.Outcome)
 	}
 	return nil
+}
+func (p *InstitutionalNavigatedRequestPayload) validateLegacy() error {
+	if err := institutionalRequestID("institutional_navigated_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalID("institutional_navigated_request.claim_id", p.ClaimID); err != nil {
+		return err
+	}
+	if err := institutionalID("institutional_navigated_request.binding_id", p.BindingID); err != nil {
+		return err
+	}
+	if err := institutionalOrdinal("institutional_navigated_request.route_issuance_ordinal", p.RouteIssuanceOrdinal); err != nil {
+		return err
+	}
+	return institutionalTabID("institutional_navigated_request.tab_id", p.TabID)
 }
 func (p *InstitutionalNavigatedRequestPayload) validate() error {
 	if err := institutionalRequestID("institutional_navigated_request.request_id", p.RequestID); err != nil {
@@ -4131,6 +4720,12 @@ func (p *InstitutionalNavigatedRequestPayload) validate() error {
 		return err
 	}
 	if err := institutionalOrdinal("institutional_navigated_request.route_issuance_ordinal", p.RouteIssuanceOrdinal); err != nil {
+		return err
+	}
+	if p.EffectOrdinal < 1 || p.EffectOrdinal > MaxBrowserInteger {
+		return fmt.Errorf("institutional_navigated_request.effect_ordinal must be in range 1..%d", MaxBrowserInteger)
+	}
+	if err := institutionalID("institutional_navigated_request.institutional_request_id", p.InstitutionalRequestID); err != nil {
 		return err
 	}
 	return institutionalTabID("institutional_navigated_request.tab_id", p.TabID)

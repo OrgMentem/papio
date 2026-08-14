@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"effect_permit_reconcile_request","msg_id":"msg_permit_inst_002","job_id":"job_permit_inst_002","seq":1,"payload":{"request_id":"request_inst_002","permit_id":"permit_inst_002","effect_kind":"institutional","claim_id":"claim_inst_002","binding_id":"binding_inst_002","effect_ordinal":0,"institutional_request_id":"institutional_request_002"}}

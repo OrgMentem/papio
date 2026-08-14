@@ -56,6 +56,20 @@ func seedJobAndCandidate(t *testing.T, js *Store, prefix string) (string, string
 	return jobID, candidateID
 }
 
+func authorizeEffectPermitJob(t *testing.T, js *Store, jobID string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := js.Transition(ctx, jobID, StateQueued, StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, jobID, StateResolving, StateAwaitingHuman, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.OpenHumanAction(ctx, jobID, "openurl_handoff", "artifact producer test handoff", Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProfileEvidenceLostResponseAndFences(t *testing.T) {
 	js := testStore(t)
 	seedInstitutionProfile(t, js, "profile-evidence")
@@ -311,6 +325,488 @@ func TestArtifactWinnerDuplicateAndRollback(t *testing.T) {
 	}
 	if _, ok, err := js.ArtifactWinner(context.Background(), "job-rollback", 1); err != nil || ok {
 		t.Fatalf("rolled-back winner = ok=%v err=%v", ok, err)
+	}
+}
+
+func TestArtifactWinnerAndExactProducerCommitAtomically(t *testing.T) {
+	js := testStore(t)
+	jobID, candidateID := seedJobAndCandidate(t, js, "winner-producer-atomic")
+	authorizeEffectPermitJob(t, js, jobID)
+	ctx := context.Background()
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 1,
+		JobAttemptRevision: 1, InstitutionProfileRevision: 1, RouteRevision: 1,
+		MaterializationKind: "direct_download", LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := driveIdentity(jobID, "winner-producer-attempt", 0, "generic")
+	acquireDrive(t, js, identity, "winner-producer-domain", time.Now().Add(time.Minute))
+	ordinal := int64(0)
+	producer := ArtifactProducerIdentity{
+		Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID, Ordinal: &ordinal,
+		Strategy: identity.Strategy, Revision: identity.Revision,
+	}
+	winner, won, settled, err := js.CommitArtifactWinnerAndProducer(ctx, ArtifactWinner{
+		JobID: jobID, JobAttemptRevision: 1, CandidateID: candidateID,
+		BrowserHolderGeneration: claim.BrowserHolderGeneration, SHA256: strings.Repeat("e", 64),
+	}, &producer)
+	if err != nil || !won || !settled || winner.CandidateID != candidateID {
+		t.Fatalf("atomic commit winner=%+v won=%v settled=%v err=%v", winner, won, settled, err)
+	}
+	closed, err := js.GetEffectPermitByIdentity(ctx, identity)
+	if err != nil || closed == nil || closed.Status != Settled {
+		t.Fatalf("settled permit=%+v err=%v", closed, err)
+	}
+
+	// An invalid producer aborts the whole transaction; no winner leaks.
+	otherJob, otherCandidate := seedJobAndCandidate(t, js, "winner-producer-rollback")
+	otherClaim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: otherCandidate, BrowserHolderGeneration: 8,
+		JobAttemptRevision: 1, InstitutionProfileRevision: 1, RouteRevision: 1,
+		MaterializationKind: "direct_download", LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = js.CommitArtifactWinnerAndProducer(ctx, ArtifactWinner{
+		JobID: otherJob, JobAttemptRevision: 1, CandidateID: otherCandidate,
+		BrowserHolderGeneration: otherClaim.BrowserHolderGeneration, SHA256: strings.Repeat("f", 64),
+	}, &ArtifactProducerIdentity{Kind: GenericDrive})
+	if err == nil {
+		t.Fatal("invalid producer unexpectedly committed")
+	}
+	if _, ok, winnerErr := js.ArtifactWinner(ctx, otherJob, 1); winnerErr != nil || ok {
+		t.Fatalf("winner leaked from rolled-back producer: ok=%v err=%v", ok, winnerErr)
+	}
+}
+
+func TestLateArtifactWinnerUsesExactProducerHolderGeneration(t *testing.T) {
+	js := testStore(t)
+	jobID, candidateID := seedJobAndCandidate(t, js, "winner-producer-replaced-holder")
+	authorizeEffectPermitJob(t, js, jobID)
+	ctx := context.Background()
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 1,
+		JobAttemptRevision: 1, InstitutionProfileRevision: 1, RouteRevision: 1,
+		MaterializationKind: "direct_download", LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := driveIdentity(jobID, "winner-replaced-holder-attempt", 0, "generic")
+	permit := acquireDrive(t, js, identity, "winner-replaced-holder-domain", time.Now().Add(time.Minute))
+	ordinal := int64(0)
+	winner, won, settled, err := js.CommitArtifactWinnerAndProducer(ctx, ArtifactWinner{
+		JobID: jobID, JobAttemptRevision: 1, CandidateID: candidateID,
+		// Holder 9 is the bridge current when the late file is adopted. The
+		// exact producer belongs to holder 1 and is the authoritative fence.
+		BrowserHolderGeneration: 9, SHA256: strings.Repeat("9", 64),
+	}, &ArtifactProducerIdentity{
+		Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID, Ordinal: &ordinal,
+		Strategy: identity.Strategy, Revision: identity.Revision,
+	})
+	if err != nil || !won || !settled {
+		t.Fatalf("late commit winner=%+v won=%v settled=%v err=%v", winner, won, settled, err)
+	}
+	if winner.BrowserHolderGeneration != permit.BrowserHolderGeneration ||
+		winner.BrowserHolderGeneration != claim.BrowserHolderGeneration {
+		t.Fatalf("winner holder=%d permit holder=%d claim holder=%d",
+			winner.BrowserHolderGeneration, permit.BrowserHolderGeneration, claim.BrowserHolderGeneration)
+	}
+}
+
+func TestExistingArtifactWinnerRepairsExactProducerSettlement(t *testing.T) {
+	js := testStore(t)
+	jobID, candidateID := seedJobAndCandidate(t, js, "winner-producer-repair")
+	authorizeEffectPermitJob(t, js, jobID)
+	ctx := context.Background()
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 9,
+		JobAttemptRevision: 1, InstitutionProfileRevision: 1, RouteRevision: 1,
+		MaterializationKind: "direct_download", LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 64)
+	winner := ArtifactWinner{
+		JobID: jobID, JobAttemptRevision: 1, CandidateID: candidateID,
+		BrowserHolderGeneration: claim.BrowserHolderGeneration, SHA256: sha,
+	}
+	if _, won, err := js.ClaimArtifactWinner(ctx, winner); err != nil || !won {
+		t.Fatalf("seed winner won=%v err=%v", won, err)
+	}
+	identity := driveIdentity(jobID, "winner-repair-attempt", 0, "generic")
+	permit, outcome, err := js.AcquireEffectPermit(ctx, EffectPermitAcquireInput{
+		Identity: identity, JobAttemptRevision: 1,
+		BrowserHolderGeneration: claim.BrowserHolderGeneration,
+		SafetyDomainID:          "winner-repair-domain",
+		LeaseUntil:              time.Now().Add(time.Minute),
+		Authorization:           EffectPermitEvent{Kind: "effect.authorized"},
+	})
+	if err != nil || outcome != EffectPermitAcquired || permit == nil {
+		t.Fatalf("acquire outcome=%v permit=%+v err=%v", outcome, permit, err)
+	}
+	ordinal := int64(0)
+	_, won, settled, err := js.CommitArtifactWinnerAndProducer(ctx, winner, &ArtifactProducerIdentity{
+		Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID, Ordinal: &ordinal,
+		Strategy: identity.Strategy, Revision: identity.Revision,
+	})
+	if err != nil || !won || !settled {
+		t.Fatalf("repair won=%v settled=%v err=%v", won, settled, err)
+	}
+	closed, err := js.GetEffectPermitByIdentity(ctx, identity)
+	if err != nil || closed == nil || closed.Status != Settled {
+		t.Fatalf("repaired permit=%+v err=%v", closed, err)
+	}
+}
+
+func TestLosingArtifactWinnerSettlesExactProducerByKind(t *testing.T) {
+	tests := []struct {
+		name string
+		kind EffectKind
+	}{
+		{name: "generic", kind: GenericDrive},
+		{name: "direct", kind: DirectGet},
+		{name: "institutional", kind: Institutional},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := testStore(t)
+			ctx := context.Background()
+			jobID, candidateID := seedJobAndCandidate(t, js, "losing-winner-"+tc.name)
+			authorizeEffectPermitJob(t, js, jobID)
+			claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+				CandidateID: candidateID, BrowserHolderGeneration: 7,
+				JobAttemptRevision: 1, InstitutionProfileRevision: 1,
+				RouteRevision: 1, MaterializationKind: "browser_tab",
+				LeaseUntil: time.Now().UTC().Add(time.Minute),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var producer ArtifactProducerIdentity
+			switch tc.kind {
+			case GenericDrive, DirectGet:
+				strategy := "generic"
+				if tc.kind == DirectGet {
+					strategy = "direct_get"
+				}
+				identity := EffectPermitIdentity{
+					JobID: jobID, Kind: tc.kind,
+					DriveAttemptID: "losing-" + tc.name + "-attempt",
+					Ordinal:        0, Strategy: strategy, Revision: "r1",
+				}
+				_, outcome, err := js.AcquireEffectPermit(ctx, EffectPermitAcquireInput{
+					Identity: identity, JobAttemptRevision: 1,
+					BrowserHolderGeneration: 7,
+					SafetyDomainID:          "losing-" + tc.name + "-domain",
+					LeaseUntil:              time.Now().UTC().Add(time.Minute),
+					Authorization:           EffectPermitEvent{Kind: "effect.authorized"},
+				})
+				if err != nil || outcome != EffectPermitAcquired {
+					t.Fatalf("acquire outcome=%v err=%v", outcome, err)
+				}
+				ordinal := identity.Ordinal
+				producer = ArtifactProducerIdentity{
+					Kind: tc.kind, DriveAttemptID: identity.DriveAttemptID,
+					Ordinal: &ordinal, Strategy: identity.Strategy,
+					Revision: identity.Revision,
+				}
+			case Institutional:
+				if err := js.BindMaterialization(ctx, claim.ID, claim.BindingID, 7, 1, 9); err != nil {
+					t.Fatal(err)
+				}
+				_, outcome, err := js.AcquireInstitutionalEffectPermit(ctx, InstitutionalEffectPermitAcquireInput{
+					JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+					SafetyDomainID:         "domain",
+					InstitutionalRequestID: "losing-institutional-request",
+					JobAttemptRevision:     1, BrowserHolderGeneration: 7,
+					ExpectedEffectOrdinal: 0,
+					LeaseUntil:            time.Now().UTC().Add(time.Minute),
+					Authorization:         EffectPermitEvent{Kind: "institutional.authorized"},
+				})
+				if err != nil || outcome != EffectPermitAcquired {
+					t.Fatalf("institutional acquire outcome=%v err=%v", outcome, err)
+				}
+				effectOrdinal := int64(1)
+				producer = ArtifactProducerIdentity{
+					Kind: Institutional, ClaimID: claim.ID,
+					BindingID: claim.BindingID, EffectOrdinal: &effectOrdinal,
+					InstitutionalRequestID: "losing-institutional-request",
+				}
+			}
+
+			winner := ArtifactWinner{
+				JobID: jobID, JobAttemptRevision: 1, CandidateID: candidateID,
+				BrowserHolderGeneration: claim.BrowserHolderGeneration,
+				SHA256:                  strings.Repeat("a", 64),
+			}
+			if _, won, err := js.ClaimArtifactWinner(ctx, winner); err != nil || !won {
+				t.Fatalf("seed winner won=%v err=%v", won, err)
+			}
+			before, ok, err := js.ArtifactWinner(ctx, jobID, 1)
+			if err != nil || !ok {
+				t.Fatalf("seeded winner=%+v ok=%v err=%v", before, ok, err)
+			}
+
+			unrelatedJob := permitJob(t, js, "unrelated-"+tc.name)
+			unrelatedIdentity := driveIdentity(unrelatedJob, "unrelated-"+tc.name+"-attempt", 0, "generic")
+			now := store.Now()
+			if _, err := js.S.DB().ExecContext(ctx, `
+				INSERT INTO legacy_effect_blockers
+				  (id, effect_kind, job_id, safety_domain_id, drive_attempt_id, ordinal,
+				   strategy, revision, cleanup_only, status, created_at, updated_at)
+				VALUES (?, 'generic_drive', ?, ?, ?, 0, ?, ?, 1, 'unresolved', ?, ?)`,
+				"unrelated-"+tc.name+"-blocker", unrelatedJob,
+				"unrelated-"+tc.name+"-domain", unrelatedIdentity.DriveAttemptID,
+				unrelatedIdentity.Strategy, unrelatedIdentity.Revision, now, now); err != nil {
+				t.Fatal(err)
+			}
+
+			loser := winner
+			loser.SHA256 = strings.Repeat("b", 64)
+			got, won, settled, err := js.CommitArtifactWinnerAndProducer(ctx, loser, &producer)
+			if err != nil || won || !settled {
+				t.Fatalf("losing commit winner=%+v won=%v settled=%v err=%v", got, won, settled, err)
+			}
+			if got != before {
+				t.Fatalf("returned winner changed: got=%+v before=%+v", got, before)
+			}
+			after, ok, err := js.ArtifactWinner(ctx, jobID, 1)
+			if err != nil || !ok || after != before {
+				t.Fatalf("stored winner changed: after=%+v before=%+v ok=%v err=%v", after, before, ok, err)
+			}
+			closed, err := js.GetEffectPermitByIdentity(ctx, producer.effectIdentity(jobID))
+			if err != nil || closed == nil || closed.Status != Settled {
+				t.Fatalf("losing producer permit=%+v err=%v", closed, err)
+			}
+			var unrelatedStatus string
+			if err := js.S.DB().QueryRowContext(ctx,
+				`SELECT status FROM legacy_effect_blockers WHERE id=?`,
+				"unrelated-"+tc.name+"-blocker").Scan(&unrelatedStatus); err != nil {
+				t.Fatal(err)
+			}
+			if unrelatedStatus != string(LegacyEffectBlockerUnresolved) {
+				t.Fatalf("unrelated occupancy changed status=%q", unrelatedStatus)
+			}
+		})
+	}
+}
+
+func TestLosingArtifactWinnerProducerFailuresRollBack(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(context.Context, *Store, string) (ArtifactProducerIdentity, func(*testing.T))
+	}{
+		{
+			name: "missing",
+			setup: func(_ context.Context, _ *Store, jobID string) (ArtifactProducerIdentity, func(*testing.T)) {
+				ordinal := int64(0)
+				return ArtifactProducerIdentity{
+					Kind: GenericDrive, DriveAttemptID: "missing-producer",
+					Ordinal: &ordinal, Strategy: "generic", Revision: "r1",
+				}, func(*testing.T) {}
+			},
+		},
+		{
+			name: "wrong-job",
+			setup: func(ctx context.Context, js *Store, jobID string) (ArtifactProducerIdentity, func(*testing.T)) {
+				otherJob := permitJob(t, js, "wrong-job-producer")
+				identity := driveIdentity(otherJob, "wrong-job-attempt", 0, "generic")
+				permit := acquireDrive(t, js, identity, "wrong-job-domain", time.Now().Add(time.Minute))
+				ordinal := int64(0)
+				return ArtifactProducerIdentity{
+						Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
+						Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
+					}, func(t *testing.T) {
+						got, err := js.GetEffectPermit(ctx, permit.ID)
+						if err != nil || got == nil || got.Status != Held {
+							t.Fatalf("wrong-job occupancy changed permit=%+v err=%v", got, err)
+						}
+					}
+			},
+		},
+		{
+			name: "permit-and-legacy-ambiguous",
+			setup: func(ctx context.Context, js *Store, jobID string) (ArtifactProducerIdentity, func(*testing.T)) {
+				identity := driveIdentity(jobID, "ambiguous-losing-attempt", 0, "generic")
+				permit := acquireDrive(t, js, identity, "ambiguous-losing-domain", time.Now().Add(time.Minute))
+				now := store.Now()
+				if _, err := js.S.DB().ExecContext(ctx, `
+					INSERT INTO legacy_effect_blockers
+					  (id, effect_kind, job_id, safety_domain_id, drive_attempt_id, ordinal,
+					   strategy, revision, cleanup_only, status, created_at, updated_at)
+					VALUES (?, 'generic_drive', ?, ?, ?, 0, ?, ?, 1, 'unresolved', ?, ?)`,
+					"ambiguous-losing-blocker", jobID, "ambiguous-losing-domain",
+					identity.DriveAttemptID, identity.Strategy, identity.Revision, now, now); err != nil {
+					t.Fatal(err)
+				}
+				ordinal := int64(0)
+				return ArtifactProducerIdentity{
+						Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
+						Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
+					}, func(t *testing.T) {
+						got, err := js.GetEffectPermit(ctx, permit.ID)
+						if err != nil || got == nil || got.Status != Held {
+							t.Fatalf("ambiguous permit changed=%+v err=%v", got, err)
+						}
+						var status string
+						if err := js.S.DB().QueryRowContext(ctx,
+							`SELECT status FROM legacy_effect_blockers WHERE id=?`,
+							"ambiguous-losing-blocker").Scan(&status); err != nil {
+							t.Fatal(err)
+						}
+						if status != string(LegacyEffectBlockerUnresolved) {
+							t.Fatalf("ambiguous blocker status=%q", status)
+						}
+					}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := testStore(t)
+			ctx := context.Background()
+			jobID, candidateID := seedJobAndCandidate(t, js, "losing-failure-"+tc.name)
+			authorizeEffectPermitJob(t, js, jobID)
+			claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+				CandidateID: candidateID, BrowserHolderGeneration: 11,
+				JobAttemptRevision: 1, InstitutionProfileRevision: 1,
+				RouteRevision: 1, MaterializationKind: "browser_tab",
+				LeaseUntil: time.Now().UTC().Add(time.Minute),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			producer, check := tc.setup(ctx, js, jobID)
+			_, _, _, err = js.CommitArtifactWinnerAndProducer(ctx, ArtifactWinner{
+				JobID: jobID, JobAttemptRevision: 1, CandidateID: candidateID,
+				BrowserHolderGeneration: claim.BrowserHolderGeneration,
+				SHA256:                  strings.Repeat("c", 64),
+			}, &producer)
+			if err == nil {
+				t.Fatal("invalid producer unexpectedly committed")
+			}
+			if _, ok, winnerErr := js.ArtifactWinner(ctx, jobID, 1); winnerErr != nil || ok {
+				t.Fatalf("failed producer leaked winner: ok=%v err=%v", ok, winnerErr)
+			}
+			check(t)
+		})
+	}
+}
+func TestArtifactProducerForArtifactMixedEvidenceFailsClosedInEitherOrder(t *testing.T) {
+	orders := []struct {
+		name    string
+		reverse bool
+	}{
+		{name: "correlated then uncorrelated"},
+		{name: "uncorrelated then correlated", reverse: true},
+	}
+	for _, tc := range orders {
+		t.Run(tc.name, func(t *testing.T) {
+			js := testStore(t)
+			ctx := context.Background()
+			jobID := permitJob(t, js, "artifact-producer-mixed-"+strings.ReplaceAll(tc.name, " ", "-"))
+			identity := driveIdentity(jobID, "artifact-producer-mixed-attempt", 0, "generic")
+			permit := acquireDrive(t, js, identity, "artifact-producer-mixed-domain", time.Now().Add(time.Minute))
+			now := store.Now()
+			if _, err := js.S.DB().ExecContext(ctx, `
+				INSERT INTO legacy_effect_blockers
+				  (id, effect_kind, job_id, safety_domain_id, drive_attempt_id, ordinal,
+				   strategy, revision, cleanup_only, status, created_at, updated_at)
+				VALUES (?, 'generic_drive', ?, ?, ?, 0, ?, ?, 1, 'unresolved', ?, ?)`,
+				"artifact-producer-mixed-blocker", jobID, "artifact-producer-mixed-domain",
+				identity.DriveAttemptID, identity.Strategy, identity.Revision, now, now); err != nil {
+				t.Fatal(err)
+			}
+			sha := strings.Repeat("d", 64)
+			ordinal := int64(0)
+			correlated := map[string]any{
+				"filename": "mixed.pdf", "sha256": sha,
+				"producer": ArtifactProducerIdentity{
+					Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
+					Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
+				},
+			}
+			uncorrelated := map[string]any{
+				"filename": "mixed.pdf", "sha256": sha,
+			}
+			events := []map[string]any{correlated, uncorrelated}
+			if tc.reverse {
+				events[0], events[1] = events[1], events[0]
+			}
+			for _, detail := range events {
+				if err := js.RecordEvent(ctx, jobID, "browser.download_complete", detail); err != nil {
+					t.Fatal(err)
+				}
+			}
+			producer, err := js.ArtifactProducerForArtifact(ctx, jobID, "mixed.pdf", sha)
+			if !errors.Is(err, ErrArtifactProducerAmbiguous) || producer != nil {
+				t.Fatalf("producer=%+v err=%v, want typed ambiguity", producer, err)
+			}
+			// Model the adoption caller: ambiguity must prevent the exact
+			// settlement call, so neither occupancy projection can release.
+			gotPermit, err := js.GetEffectPermit(ctx, permit.ID)
+			if err != nil || gotPermit == nil || gotPermit.Status != EffectPermitHeld {
+				t.Fatalf("mixed evidence changed permit=%+v err=%v", gotPermit, err)
+			}
+			var blockerStatus string
+			if err := js.S.DB().QueryRowContext(ctx,
+				`SELECT status FROM legacy_effect_blockers WHERE id=?`,
+				"artifact-producer-mixed-blocker").Scan(&blockerStatus); err != nil {
+				t.Fatal(err)
+			}
+			if blockerStatus != string(LegacyEffectBlockerUnresolved) {
+				t.Fatalf("mixed evidence changed blocker status=%q", blockerStatus)
+			}
+			if _, ok, err := js.ArtifactWinner(ctx, jobID, 1); err != nil || ok {
+				t.Fatalf("mixed evidence created wrong winner: ok=%v err=%v", ok, err)
+			}
+		})
+	}
+}
+
+func TestArtifactProducerAmbiguousPermitAndLegacyRollsBack(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, _ := seedJobAndCandidate(t, js, "winner-producer-ambiguous")
+	authorizeEffectPermitJob(t, js, jobID)
+	identity := driveIdentity(jobID, "ambiguous-producer-attempt", 0, "generic")
+	acquireDrive(t, js, identity, "ambiguous-producer-domain", time.Now().Add(time.Minute))
+	now := store.Now()
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO legacy_effect_blockers
+		  (id, effect_kind, job_id, safety_domain_id, drive_attempt_id, ordinal,
+		   strategy, revision, cleanup_only, status, created_at, updated_at)
+		VALUES (?, 'generic_drive', ?, ?, ?, 0, ?, ?, 1, 'unresolved', ?, ?)`,
+		"legacy-ambiguous-producer", jobID, "ambiguous-producer-domain",
+		identity.DriveAttemptID, identity.Strategy, identity.Revision, now, now); err != nil {
+		t.Fatal(err)
+	}
+	ordinal := int64(0)
+	settled, err := js.SettleArtifactProducer(ctx, jobID, ArtifactProducerIdentity{
+		Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
+		Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
+	})
+	if !errors.Is(err, ErrEffectPermitStale) || settled {
+		t.Fatalf("ambiguous artifact settled=%v err=%v", settled, err)
+	}
+	permit, err := js.GetEffectPermitByIdentity(ctx, identity)
+	if err != nil || permit == nil || permit.Status != Held {
+		t.Fatalf("ambiguous permit=%+v err=%v", permit, err)
+	}
+	var status string
+	if err := js.S.DB().QueryRowContext(ctx,
+		`SELECT status FROM legacy_effect_blockers WHERE id=?`,
+		"legacy-ambiguous-producer").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(LegacyEffectBlockerUnresolved) {
+		t.Fatalf("ambiguous blocker status=%q", status)
 	}
 }
 

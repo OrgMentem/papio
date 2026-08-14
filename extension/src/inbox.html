@@ -59,7 +59,14 @@
         --dialog-max-width: 32rem;
         --content-measure: 60rem;
         --radius-pill: 999px;
-        --transition-fast: 140ms ease-out;
+        --motion-hover: 120ms;
+        --motion-state: 160ms;
+        --motion-feedback-in: 180ms;
+        --motion-feedback-out: 140ms;
+        --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+        --ease-in-quart: cubic-bezier(0.5, 0, 0.75, 0);
+        --row-control-size: 32px;
+        --shadow-feedback: 0 8px 24px rgb(24 34 49 / 16%);
         accent-color: var(--color-primary);
         color: var(--color-ink);
         font-family:
@@ -98,6 +105,7 @@
           --color-neutral-badge: #263340;
           --color-overlay: rgb(4 9 15 / 72%);
           --shadow-dialog: 0 24px 64px rgb(4 9 15 / 52%);
+          --shadow-feedback: 0 8px 24px rgb(4 9 15 / 40%);
         }
       }
 
@@ -309,9 +317,9 @@
         min-height: var(--control-height);
         padding: var(--space-1) var(--space-3);
         transition:
-          background-color var(--transition-fast),
-          border-color var(--transition-fast),
-          color var(--transition-fast);
+          background-color var(--motion-hover),
+          border-color var(--motion-hover),
+          color var(--motion-hover);
       }
 
       button:hover:not(:disabled) {
@@ -573,7 +581,7 @@
         grid-template-columns: auto minmax(0, 1fr) auto;
         min-width: 0;
         padding: var(--space-3) var(--space-4);
-        transition: background-color var(--transition-fast);
+        transition: background-color var(--motion-hover) var(--ease-out-quart);
       }
 
       /* Attention is expressed by the row's instruction and controls. It is
@@ -709,11 +717,11 @@
         flex: none;
         font-size: var(--font-size-small);
         font-weight: 700;
-        height: 26px;
+        height: var(--row-control-size);
         justify-content: center;
         margin-top: 1px;
         position: relative;
-        width: 26px;
+        width: var(--row-control-size);
       }
 
       /* Instant tooltip for icon-only affordances (status glyphs, the
@@ -733,70 +741,47 @@
         pointer-events: none;
         position: absolute;
         top: calc(100% + var(--space-1));
-        transition: opacity var(--transition-fast);
+        transition: opacity var(--motion-hover);
         white-space: nowrap;
         z-index: 1;
       }
 
       .triage-item .item-status:hover::after,
-      .triage-item .item-status:focus-visible::after,
+      .triage-item:focus-visible > .item-status::after,
       .triage-item .item-debug-toggle:hover::after,
       .triage-item .item-debug-toggle:focus-visible::after {
         opacity: 1;
       }
 
-      .item-status[data-status="manual_download"] {
+      .item-status[data-tone="actionable"] {
         background: var(--color-primary-surface);
         border-color: var(--color-primary-border);
         color: var(--color-primary);
       }
 
-      /* A rejected file and a wrong work are manual downloads with a different
-         meaning; colour is never their only carrier — the glyph, accessible
-         name, and family instruction all say which one it is. */
-      .item-status[data-status="manual_download_adapter_missing"],
-      .item-status[data-status="manual_download_page_undriveable"] {
-        background: var(--color-primary-surface);
-        border-color: var(--color-primary-border);
-        color: var(--color-primary);
+      .item-status[data-tone="continuing"] {
+        background: var(--color-neutral-badge);
+        border-color: var(--color-control-border);
+        color: var(--color-context);
       }
 
-      .item-status[data-status="manual_download_rejected_file"],
-      .item-status[data-status="manual_download_wrong_work"] {
+      .item-status[data-tone="degraded"] {
         background: var(--color-warning-surface);
         border-color: var(--color-warning-border);
         color: var(--color-warning);
       }
 
-      .item-status[data-status="openurl_handoff"] {
-        background: var(--color-ok-surface);
-        border-color: var(--color-ok-border);
-        color: var(--color-ok);
-      }
-
-      .item-status[data-status="verify_identity"] {
-        background: var(--color-warning-surface);
-        border-color: var(--color-warning-border);
-        color: var(--color-warning);
-      }
-
-      .item-status[data-status="retraction"] {
+      .item-status[data-tone="danger"] {
         background: var(--color-danger-surface);
         border-color: var(--color-danger-border);
-        color: var(--color-danger);
       }
 
-      .item-status[data-status="document_delivery"] {
-        background: var(--color-warning-surface);
-        border-color: var(--color-warning-border);
-        color: var(--color-warning);
+      .item-status[data-tone="neutral"] {
+        background: var(--color-neutral-badge);
+        border-color: var(--color-control-border);
+        color: var(--color-muted);
       }
 
-      .item-status[data-status="downloads_access_required"] {
-        background: var(--color-warning-surface);
-        border-color: var(--color-warning-border);
-        color: var(--color-warning);
-      }
 
       /* Bibliographic metadata and next-action copy stay quiet; supporting
          mechanism text is available from the inline disclosure. */
@@ -851,22 +836,24 @@
         cursor: pointer;
         display: inline-flex;
         font: inherit;
-        height: 1em;
+        height: var(--row-control-size);
         justify-content: center;
         line-height: 1;
         margin-inline-start: var(--space-1);
-        min-height: 0;
+        min-height: var(--row-control-size);
+        min-width: var(--row-control-size);
         padding: 0;
         position: relative;
         transition: none;
         vertical-align: middle;
-        width: 1em;
+        width: var(--row-control-size);
       }
 
       .item-debug-toggle svg {
         display: block;
         fill: none;
-        height: 100%;
+        height: 12px;
+        width: 12px;
         stroke: currentColor;
         stroke-linecap: round;
         stroke-linejoin: round;
@@ -947,7 +934,8 @@
       }
 
       .triage-item > .item-controls button {
-        min-height: calc(var(--control-height) - var(--space-2));
+        min-height: var(--row-control-size);
+        min-width: var(--row-control-size);
         padding: var(--space-1) var(--space-2);
       }
 
@@ -998,36 +986,58 @@
         align-items: center;
         background: var(--color-surface);
         border: 1px solid var(--color-control-border);
-        border-radius: var(--radius-pill);
-        bottom: calc(var(--space-12) + var(--space-4));
-        box-shadow: var(--shadow-dialog);
+        border-radius: var(--radius-card);
+        bottom: var(--space-4);
+        box-shadow: var(--shadow-feedback);
         display: flex;
+        flex-wrap: wrap;
         gap: var(--space-3);
-        left: 50%;
-        max-width: min(48rem, calc(100% - var(--space-8)));
-        padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+        inset-inline: var(--space-4);
+        margin-inline: auto;
+        max-inline-size: min(32rem, calc(100vw - 32px));
+        min-height: 44px;
+        padding: 12px 12px 12px 16px;
         position: fixed;
-        transform: translateX(-50%);
-        width: max-content;
         z-index: 2;
       }
 
+      #undo-bar[data-kind="success"] {
+        background: var(--color-ok-surface);
+        border-color: var(--color-ok-border);
+        color: var(--color-ok);
+      }
+
+      #undo-bar.is-enter {
+        opacity: 0;
+        transform: translateY(8px);
+        transition:
+          opacity var(--motion-feedback-in) var(--ease-out-quart),
+          transform var(--motion-feedback-in) var(--ease-out-quart);
+      }
+
+      #undo-bar.is-exit {
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(4px);
+        transition:
+          opacity var(--motion-feedback-out) var(--ease-in-quart),
+          transform var(--motion-feedback-out) var(--ease-in-quart);
+      }
+
       #undo-message {
+        flex: 1 1 auto;
         font-size: var(--font-size-small);
-        max-width: min(36rem, calc(100vw - var(--space-12)));
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        min-width: 0;
       }
 
       #undo-dismiss {
-        border-radius: var(--radius-pill);
         flex: 0 0 auto;
+        min-height: var(--row-control-size);
+        min-width: var(--row-control-size);
       }
 
-      /* The footer (status legend + keyboard help) sticks to the viewport
-         bottom so the glyph vocabulary is always in view; it settles into
-         normal flow once the list is scrolled to its end. */
+      /* Keyboard help and generated-at stick to the viewport bottom until the
+         list is scrolled to its end. */
       footer {
         align-items: baseline;
         background: var(--color-page);
@@ -1042,27 +1052,6 @@
         padding-block: var(--space-3);
         position: sticky;
         z-index: 1;
-      }
-
-      #status-legend {
-        align-items: center;
-        display: flex;
-        flex: 1 1 100%;
-        flex-wrap: wrap;
-        gap: var(--space-1) var(--space-3);
-      }
-
-      #status-legend .item-status {
-        display: inline-flex;
-        font-size: 10px;
-        height: 18px;
-        margin: 0 var(--space-1) 0 0;
-        vertical-align: middle;
-        width: 18px;
-      }
-
-      #status-legend span[data-status] + span {
-        margin-right: var(--space-2);
       }
 
       #shortcut-help {
@@ -1168,6 +1157,13 @@
         *::after {
           scroll-behavior: auto !important;
           transition-duration: 0.01ms !important;
+          transform: none !important;
+        }
+
+        #undo-bar.is-enter,
+        #undo-bar.is-exit {
+          opacity: 1;
+          transform: none;
         }
       }
 
@@ -1224,17 +1220,6 @@
       <button id="undo-dismiss" type="button">Undo</button>
     </div>
     <footer>
-      <p id="status-legend">
-        <span class="item-status" data-status="manual_download" aria-hidden="true">↓</span><span>manual download</span>
-        <span class="item-status" data-status="manual_download_rejected_file" aria-hidden="true">↺</span><span>rejected file</span>
-        <span class="item-status" data-status="manual_download_wrong_work" aria-hidden="true">≠</span><span>wrong paper</span>
-        <span class="item-status" data-status="openurl_handoff" aria-hidden="true">↗</span><span>browser handoff</span>
-        <span class="item-status" data-status="verify_identity" aria-hidden="true">?</span><span>verify identity</span>
-        <span class="item-status" data-status="document_delivery" aria-hidden="true">⇄</span><span>document delivery</span>
-        <span class="item-status" data-status="downloads_access_required" aria-hidden="true">⚠</span><span>downloads access</span>
-        <span class="item-status" data-status="watch_hit" aria-hidden="true">✶</span><span>watch hit</span>
-        <span class="item-status" data-status="retraction" aria-hidden="true">!</span><span>retraction</span>
-      </p>
       <p id="shortcut-help">
         <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>a</kbd> act · <kbd>d</kbd> dismiss ·
         <kbd>u</kbd> undo · <kbd>o</kbd> open

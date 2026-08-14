@@ -5,6 +5,7 @@ package doctor
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -108,6 +109,49 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 			add("database", Fail, "database schema version could not be read", "inspect database permissions")
 		} else {
 			add("database", Pass, fmt.Sprintf("SQLite integrity ok; schema version %d", version), "")
+		}
+	}
+
+	if db == nil {
+		add("effect_permit", Skip, "browser effect occupancy is checked by the daemon", "")
+	} else {
+		permit, err := unresolvedEffectPermit(ctx, db, time.Now())
+		switch {
+		case err != nil:
+			add("effect_permit", Warn, "browser effect occupancy could not be read", "inspect database permissions")
+		case permit == nil:
+			add("effect_permit", Pass, "no unresolved browser effect occupies the global lane", "")
+		case permit.status == string(job.EffectPermitUnknownCompletion):
+			add("effect_permit", Warn,
+				fmt.Sprintf("browser effect permit %s is %s and still occupies the global lane", permit.id, permit.status),
+				fmt.Sprintf("verify the effect first; if completion cannot be reconstructed, run `papio browser permit resolve %s --reason \"operator verified no browser effect remains\"`", permit.id))
+		case permit.overdue:
+			add("effect_permit", Warn,
+				fmt.Sprintf("browser effect permit %s is held past its result window and still occupies the global lane", permit.id),
+				"restart or reconnect the browser extension so it can reconcile the exact effect; a held permit cannot be administratively resolved")
+		default:
+			add("effect_permit", Pass,
+				fmt.Sprintf("browser effect permit %s is held while its exact result is pending", permit.id), "")
+		}
+	}
+	if db == nil {
+		add("legacy_effect_blockers", Skip, "legacy effect blockers are checked by the daemon", "")
+	} else {
+		blockers, truncated, err := unresolvedLegacyEffectBlockerIDs(ctx, db, job.LegacyEffectBlockerReadLimit)
+		switch {
+		case err != nil:
+			add("legacy_effect_blockers", Warn, "legacy effect blockers could not be read", "inspect database permissions")
+		case len(blockers) == 0 && !truncated:
+			add("legacy_effect_blockers", Pass, "no unresolved legacy effect blocker refuses effect admission", "")
+		default:
+			ids := blockers
+			suffix := ""
+			if truncated {
+				suffix = "; more blockers exist beyond the bounded report"
+			}
+			add("legacy_effect_blockers", Warn,
+				fmt.Sprintf("global effect admission is refused by legacy blocker(s) %s%s; recovery is an exact browser result or correlated artifact winner", strings.Join(ids, ", "), suffix),
+				fmt.Sprintf("wait for the exact browser result or correlated artifact winner for blocker(s) %s; no cleanup-only break-glass command is supported", strings.Join(ids, ", ")))
 		}
 	}
 
@@ -280,6 +324,66 @@ func uncollectedAcquisitions(ctx context.Context, db *store.Store) (int, time.Du
 		return n, 0, nil
 	}
 	return n, time.Since(settled), nil
+}
+
+type unresolvedPermit struct {
+	id      string
+	status  string
+	overdue bool
+}
+
+func unresolvedEffectPermit(ctx context.Context, db *store.Store, now time.Time) (*unresolvedPermit, error) {
+	var permit unresolvedPermit
+	var updatedAt string
+	err := db.DB().QueryRowContext(ctx, `
+		SELECT id, status, updated_at
+		FROM effect_permits
+		WHERE status IN ('held','unknown_completion')
+		ORDER BY CASE status WHEN 'unknown_completion' THEN 0 ELSE 1 END, updated_at, id
+		LIMIT 1`).
+		Scan(&permit.id, &permit.status, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, updatedAt); err == nil {
+		permit.overdue = !parsed.After(now.UTC().Add(-10 * time.Minute))
+	}
+	return &permit, nil
+}
+
+func unresolvedLegacyEffectBlockerIDs(ctx context.Context, db *store.Store, limit int) ([]string, bool, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	rows, err := db.DB().QueryContext(ctx, `
+		SELECT id
+		FROM legacy_effect_blockers
+		WHERE status='unresolved'
+		ORDER BY created_at, id
+		LIMIT ?`, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	ids := make([]string, 0, limit)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, false, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	truncated := len(ids) > limit
+	if truncated {
+		ids = ids[:limit]
+	}
+	return ids, truncated, nil
 }
 
 // quiescedActions counts open human actions that have aged past

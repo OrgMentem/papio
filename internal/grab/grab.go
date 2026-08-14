@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"papio/internal/store"
+	"strings"
 	"sync"
 	"time"
 )
@@ -60,12 +61,13 @@ func validState(s State) bool {
 
 // Grab mirrors one pdf_grabs row.
 type Grab struct {
-	ID             string
-	URLHost        string
-	Title          string
-	State          State
-	QuarantinePath string
-	JobID          string
+	ID              string
+	URLHost         string
+	Title           string
+	State           State
+	EffectRequestID string
+	QuarantinePath  string
+	JobID           string
 	// Outcome is the wire vocabulary internal/browser's poll() reports over
 	// pdf_grab_result once terminal: "job_created", "already_owned",
 	// "needs_identifier", or "failed_validation". Empty until terminal.
@@ -100,7 +102,26 @@ func NewID() string {
 	return "grab_" + hex.EncodeToString(b[:])
 }
 
-var columns = `id, url_host, title, state, quarantine_path, job_id, outcome, detail, notified_at, created_at, updated_at`
+func newPermitID() string {
+	var b [13]byte
+	_, _ = rand.Read(b[:])
+	return "permit_" + hex.EncodeToString(b[:])
+}
+
+// ErrBusy reports that the global effect lane is occupied or a legacy
+// blocker remains unresolved. Bridge maps it to a structured
+// pdf_grab_result unavailable refusal, never a raw error.
+var ErrBusy = errors.New("pdf grab busy")
+
+func isUniqueConstraintError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique")
+}
+
+var columns = `id, url_host, title, state, effect_request_id, quarantine_path, job_id, outcome, detail, notified_at, created_at, updated_at`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -111,7 +132,7 @@ func scanGrab(row scanner) (*Grab, error) {
 	var state string
 	var jobID, notifiedAt sql.NullString
 	if err := row.Scan(
-		&g.ID, &g.URLHost, &g.Title, &state, &g.QuarantinePath, &jobID, &g.Outcome, &g.Detail, &notifiedAt,
+		&g.ID, &g.URLHost, &g.Title, &state, &g.EffectRequestID, &g.QuarantinePath, &jobID, &g.Outcome, &g.Detail, &notifiedAt,
 		&g.CreatedAt, &g.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -134,9 +155,7 @@ func (s *Service) Allocate(ctx context.Context, urlHost, title string) (*Grab, e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row := s.store.DB().QueryRowContext(ctx, `
-		SELECT id, url_host, title, state, quarantine_path, job_id, outcome, detail,
-		       notified_at, created_at, updated_at
-		FROM pdf_grabs
+		SELECT `+columns+` FROM pdf_grabs
 		WHERE url_host = ? AND title = ? AND state IN (?, ?, ?, ?)
 		ORDER BY created_at ASC LIMIT 1`, urlHost, title,
 		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified), string(StateParkedNoIdentifier))
@@ -171,6 +190,125 @@ func (s *Service) Allocate(ctx context.Context, urlHost, title string) (*Grab, e
 	return s.Get(ctx, id)
 }
 
+// AllocateEffect is the permit-gated allocation used by the browser bridge.
+// It runs in one DB transaction under the service mutex. Existing active
+// grabs are returned with Outcome "existing" without acquiring occupancy or
+// calling prepare. An unresolved legacy blocker or any held/unknown effect
+// permit refuses with ErrBusy and no rows/prepare. Otherwise it mints a grab
+// id and permit id, inserts pdf_grabs (awaiting_file), effect_permits (held,
+// NULL job, attempt 0, holder/domain/kind pdf_grab/slot 0/grab id/lease), and
+// a URL-free browser.pdf_grab_started event with NULL job_id in the same
+// transaction, calls prepare(grabID) before commit, and returns the row with
+// Outcome "steering" only after commit. Any error rolls back DB mutations.
+func (s *Service) AllocateEffect(ctx context.Context, urlHost, title string, holderGeneration int64, safetyDomain string, leaseUntil time.Time, prepare func(string) error, requestIDs ...string) (*Grab, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	requestID := ""
+	if len(requestIDs) > 0 {
+		requestID = requestIDs[0]
+	}
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Existing active grab is never an authorization by itself. Only the
+	// original request identity, holder generation, and still-held permit may
+	// replay the steering response after a lost delivery.
+	row := tx.QueryRowContext(ctx, `
+		SELECT `+columns+` FROM pdf_grabs
+		WHERE url_host = ? AND title = ? AND state IN (?, ?, ?, ?)
+		ORDER BY created_at ASC LIMIT 1`, urlHost, title,
+		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified), string(StateParkedNoIdentifier))
+	if g, err := scanGrab(row); err == nil {
+		if requestID != "" && g.EffectRequestID == requestID {
+			var status string
+			var generation int64
+			if permitErr := tx.QueryRowContext(ctx, `SELECT status, browser_holder_generation FROM effect_permits WHERE grab_id=? AND effect_kind='pdf_grab'`, g.ID).Scan(&status, &generation); permitErr == nil &&
+				status == "held" && generation == holderGeneration {
+				_ = tx.Rollback()
+				g.Outcome = "steering"
+				return g, nil
+			}
+		}
+		_ = tx.Rollback()
+		g.Outcome = "existing"
+		return g, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("checking existing pdf grab: %w", err)
+	}
+
+	// Unresolved legacy blocker → busy.
+	var blocker int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM legacy_effect_blockers WHERE status='unresolved' LIMIT 1`).Scan(&blocker); err == nil {
+		return nil, ErrBusy
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	// Any held/unknown effect permit → busy (global single slot).
+	var live int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM effect_permits WHERE status IN ('held','unknown_completion') LIMIT 1`).Scan(&live); err == nil {
+		return nil, ErrBusy
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	grabID := NewID()
+	permitID := newPermitID()
+	nowStr := store.Now()
+	leaseStr := leaseUntil.UTC().Format(time.RFC3339Nano)
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO pdf_grabs (id, url_host, title, effect_request_id, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		grabID, urlHost, title, requestID, string(StateAwaitingFile), nowStr, nowStr); err != nil {
+		if isUniqueConstraintError(err) {
+			// Race on active source unique index.
+			row2 := tx.QueryRowContext(ctx, `
+				SELECT `+columns+` FROM pdf_grabs
+				WHERE url_host = ? AND title = ? AND state IN (?, ?, ?, ?)
+				ORDER BY created_at ASC LIMIT 1`, urlHost, title,
+				string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified), string(StateParkedNoIdentifier))
+			if g2, err2 := scanGrab(row2); err2 == nil {
+				_ = tx.Rollback()
+				g2.Outcome = "existing"
+				return g2, nil
+			}
+			return nil, ErrBusy
+		}
+		return nil, fmt.Errorf("inserting pdf grab: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO effect_permits(id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind, slot_index, grab_id, status, lease_until, created_at, updated_at)
+		VALUES(?, NULL, 0, ?, ?, 'pdf_grab', 0, ?, 'held', ?, ?, ?)`,
+		permitID, holderGeneration, safetyDomain, grabID, leaseStr, nowStr, nowStr); err != nil {
+		if isUniqueConstraintError(err) {
+			return nil, ErrBusy
+		}
+		return nil, fmt.Errorf("inserting effect permit: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(job_id, at, kind, detail_json) VALUES(NULL, ?, 'browser.pdf_grab_started', ?)`, nowStr, "{}"); err != nil {
+		return nil, err
+	}
+	if prepare != nil {
+		if err := prepare(grabID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	g, err := s.Get(ctx, grabID)
+	if err != nil {
+		return nil, err
+	}
+	if g != nil {
+		g.Outcome = "steering"
+	}
+	return g, nil
+}
+
 // Get returns the row by id, or (nil, nil) when none exists.
 func (s *Service) Get(ctx context.Context, id string) (*Grab, error) {
 	row := s.store.DB().QueryRowContext(ctx, `SELECT `+columns+` FROM pdf_grabs WHERE id = ?`, id)
@@ -184,17 +322,57 @@ func (s *Service) Get(ctx context.Context, id string) (*Grab, error) {
 	return g, nil
 }
 
-// MarkQuarantined transitions awaiting_file -> quarantined and records the
-// quarantine copy's path.
-func (s *Service) MarkQuarantined(ctx context.Context, id, quarantinePath string) error {
-	res, err := s.store.DB().ExecContext(ctx, `
-		UPDATE pdf_grabs SET state = ?, quarantine_path = ?, updated_at = ?
-		WHERE id = ? AND state = ?`,
-		string(StateQuarantined), quarantinePath, store.Now(), id, string(StateAwaitingFile))
+// settleLegacyPDFBlockerTx settles only the legacy blocker whose exact grab ID
+// matches the transitioned row. Missing rows and already-settled tombstones are
+// intentionally harmless: post-0034 rows have no legacy blocker, while a
+// legacy row may have been settled by an earlier exact transition. Any
+// unexpected multi-row match fails closed rather than broadening settlement.
+func settleLegacyPDFBlockerTx(ctx context.Context, tx *sql.Tx, id, now string) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE legacy_effect_blockers
+		SET status='settled', updated_at=?
+		WHERE effect_kind='pdf_grab' AND grab_id=? AND status='unresolved'`,
+		now, id)
 	if err != nil {
 		return err
 	}
-	return requireOneRow(res, id)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 1 {
+		return fmt.Errorf("legacy PDF blocker identity for grab %q is ambiguous", id)
+	}
+	return nil
+}
+
+// MarkQuarantined transitions awaiting_file -> quarantined and records the
+// quarantine copy's path. Settles a matching held/unknown pdf permit and the
+// exact legacy blocker in the same transaction; either may be absent.
+func (s *Service) MarkQuarantined(ctx context.Context, id, quarantinePath string) error {
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	res, err := tx.ExecContext(ctx, `
+		UPDATE pdf_grabs SET state = ?, quarantine_path = ?, updated_at = ?
+		WHERE id = ? AND state = ?`,
+		string(StateQuarantined), quarantinePath, now, id, string(StateAwaitingFile))
+	if err != nil {
+		return err
+	}
+	if err := requireOneRow(res, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE effect_permits SET status='settled', updated_at=? WHERE grab_id=? AND effect_kind='pdf_grab' AND status IN ('held','unknown_completion')`, now, id); err != nil {
+		return err
+	}
+	if err := settleLegacyPDFBlockerTx(ctx, tx, id, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // MarkJobCreated transitions to the terminal job_created state. outcome is
@@ -202,15 +380,30 @@ func (s *Service) MarkQuarantined(ctx context.Context, id, quarantinePath string
 // "already_owned" when the extracted identifier deduplicated onto an
 // already-live job — ADR-0010's ledger dedupe applying naturally).
 func (s *Service) MarkJobCreated(ctx context.Context, id, jobID, outcome string) error {
-	res, err := s.store.DB().ExecContext(ctx, `
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	res, err := tx.ExecContext(ctx, `
 		UPDATE pdf_grabs SET state = ?, job_id = ?, outcome = ?, updated_at = ?
 		WHERE id = ? AND state IN (?, ?, ?)`,
-		string(StateJobCreated), jobID, outcome, store.Now(), id,
+		string(StateJobCreated), jobID, outcome, now, id,
 		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified))
 	if err != nil {
 		return err
 	}
-	return requireOneRow(res, id)
+	if err := requireOneRow(res, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE effect_permits SET status='settled', updated_at=? WHERE grab_id=? AND effect_kind='pdf_grab' AND status IN ('held','unknown_completion')`, now, id); err != nil {
+		return err
+	}
+	if err := settleLegacyPDFBlockerTx(ctx, tx, id, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // MarkIdentified records that identifier extraction completed while retaining
@@ -230,52 +423,196 @@ func (s *Service) MarkIdentified(ctx context.Context, id string) error {
 // No synthetic title-only job is created; the grab is the durable pending
 // triage entity and its wire outcome is fixed at "needs_identifier".
 func (s *Service) MarkParkedNoIdentifier(ctx context.Context, id string) error {
-	res, err := s.store.DB().ExecContext(ctx, `
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	res, err := tx.ExecContext(ctx, `
 		UPDATE pdf_grabs SET state = ?, job_id = NULL, outcome = 'needs_identifier', updated_at = ?
 		WHERE id = ? AND state IN (?, ?, ?)`,
-		string(StateParkedNoIdentifier), store.Now(), id,
+		string(StateParkedNoIdentifier), now, id,
 		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified))
 	if err != nil {
 		return err
 	}
-	return requireOneRow(res, id)
+	if err := requireOneRow(res, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE effect_permits SET status='settled', updated_at=? WHERE grab_id=? AND effect_kind='pdf_grab' AND status IN ('held','unknown_completion')`, now, id); err != nil {
+		return err
+	}
+	if err := settleLegacyPDFBlockerTx(ctx, tx, id, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // MarkFailedValidation transitions to the terminal failed_validation state:
-// the settled file was not a valid PDF.
+// the correlated file arrived but was not a valid PDF. That observation is
+// conclusive for the exact grab, so settle its permit and legacy blocker in
+// the same transaction even when validation failed before quarantine.
 func (s *Service) MarkFailedValidation(ctx context.Context, id, detail string) error {
-	res, err := s.store.DB().ExecContext(ctx, `
-		UPDATE pdf_grabs SET state = ?, outcome = 'failed_validation', detail = ?, updated_at = ?
-		WHERE id = ? AND state IN (?, ?)`,
-		string(StateFailedValidation), detail, store.Now(), id, string(StateAwaitingFile), string(StateQuarantined))
+	tx, err := s.store.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return requireOneRow(res, id)
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	res, err := tx.ExecContext(ctx, `
+		UPDATE pdf_grabs SET state = ?, outcome = 'failed_validation', detail = ?, updated_at = ?
+		WHERE id = ? AND state IN (?, ?)`,
+		string(StateFailedValidation), detail, now, id, string(StateAwaitingFile), string(StateQuarantined))
+	if err != nil {
+		return err
+	}
+	if err := requireOneRow(res, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE effect_permits SET status='settled', updated_at=? WHERE grab_id=? AND effect_kind='pdf_grab' AND status IN ('held','unknown_completion')`, now, id); err != nil {
+		return err
+	}
+	if err := settleLegacyPDFBlockerTx(ctx, tx, id, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // MarkAbandoned settles an unfulfilled browser download after interruption.
+// Settles a matching held/unknown pdf permit and exact legacy blocker in the
+// same transaction; either may be absent for post-34 rows.
 func (s *Service) MarkAbandoned(ctx context.Context, id, detail string) error {
-	res, err := s.store.DB().ExecContext(ctx, `
-		UPDATE pdf_grabs SET state = ?, outcome = 'abandoned', detail = ?, updated_at = ?
-		WHERE id = ? AND state = ?`,
-		string(StateAbandoned), detail, store.Now(), id, string(StateAwaitingFile))
+	tx, err := s.store.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return requireOneRow(res, id)
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	res, err := tx.ExecContext(ctx, `
+		UPDATE pdf_grabs SET state = ?, outcome = 'abandoned', detail = ?, updated_at = ?
+		WHERE id = ? AND state = ?`,
+		string(StateAbandoned), detail, now, id, string(StateAwaitingFile))
+	if err != nil {
+		return err
+	}
+	if err := requireOneRow(res, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE effect_permits SET status='settled', updated_at=? WHERE grab_id=? AND effect_kind='pdf_grab' AND status IN ('held','unknown_completion')`, now, id); err != nil {
+		return err
+	}
+	if err := settleLegacyPDFBlockerTx(ctx, tx, id, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// AbandonStaleAwaiting settles captures that lost their browser correlation
-// before any file landed. The generous bound is a crash/restart backstop;
-// the extension's explicit abandon path remains primary.
+// MarkAbandonedForRequest is the holder/request-fenced interruption path.
+// A grab ID alone is deliberately insufficient to release occupancy. The
+// persisted request identity remains sufficient for exact cleanup after a
+// holder replacement; this path never grants steering.
+func (s *Service) MarkAbandonedForRequest(ctx context.Context, id, requestID string, holderGeneration int64, detail string) error {
+	_ = holderGeneration // retained in the API as the originating tuple component
+	if strings.TrimSpace(requestID) == "" {
+		return fmt.Errorf("grab %s: request identity is required", id)
+	}
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	res, err := tx.ExecContext(ctx, `
+		UPDATE pdf_grabs SET state = ?, outcome = 'abandoned', detail = ?, updated_at = ?
+		WHERE id = ? AND effect_request_id = ? AND state = ?
+		  AND EXISTS (SELECT 1 FROM effect_permits
+		    WHERE grab_id=pdf_grabs.id AND effect_kind='pdf_grab'
+		      AND status IN ('held','unknown_completion'))`,
+		string(StateAbandoned), detail, now, id, requestID, string(StateAwaitingFile))
+	if err != nil {
+		return err
+	}
+	if err := requireOneRow(res, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE effect_permits SET status='settled', updated_at=? WHERE grab_id=? AND effect_kind='pdf_grab' AND status IN ('held','unknown_completion')`, now, id); err != nil {
+		return err
+	}
+	if err := settleLegacyPDFBlockerTx(ctx, tx, id, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// AbandonStaleAwaiting settles captures that lost their browser correlation,
+// except when an unresolved durable effect still makes completion unknown.
 func (s *Service) AbandonStaleAwaiting(ctx context.Context, cutoff time.Time) error {
-	_, err := s.store.DB().ExecContext(ctx, `
-		UPDATE pdf_grabs
-		SET state = ?, outcome = 'abandoned', detail = 'The PDF grab download expired', updated_at = ?
-		WHERE state = ? AND updated_at < ?`,
-		string(StateAbandoned), store.Now(), string(StateAwaitingFile), cutoff)
-	return err
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	cutoffStr := cutoff.UTC().Format(time.RFC3339Nano)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM pdf_grabs
+		WHERE state = ? AND updated_at < ?
+		  AND NOT EXISTS (
+		    SELECT 1 FROM effect_permits
+		    WHERE effect_permits.grab_id = pdf_grabs.id
+		      AND status IN ('held','unknown_completion'))
+		  AND NOT EXISTS (
+		    SELECT 1 FROM legacy_effect_blockers
+		    WHERE legacy_effect_blockers.effect_kind = 'pdf_grab'
+		      AND legacy_effect_blockers.grab_id = pdf_grabs.id
+		      AND legacy_effect_blockers.status = 'unresolved')
+		ORDER BY id`,
+		string(StateAwaitingFile), cutoffStr)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	now := store.Now()
+	for _, id := range ids {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE pdf_grabs
+			SET state = ?, outcome = 'abandoned',
+			    detail = 'The PDF grab download expired', updated_at = ?
+			WHERE id = ? AND state = ?`,
+			string(StateAbandoned), now, id, string(StateAwaitingFile))
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			continue
+		}
+		if n > 1 {
+			return fmt.Errorf("stale PDF grab update for %q changed %d rows", id, n)
+		}
+		if err := settleLegacyPDFBlockerTx(ctx, tx, id, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // PendingNotifications returns up to limit grabs whose terminal outcome has

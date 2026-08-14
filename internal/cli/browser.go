@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -96,7 +97,37 @@ func newBrowserCommand(opt *options) *cobra.Command {
 	}
 	use.Flags().BoolVar(&latest, "latest", false, "switch to the most recently active pending session")
 
-	command.AddCommand(sessions, use)
+	var resolveReason string
+	resolvePermit := &cobra.Command{
+		Use:   "resolve <permit-id>",
+		Short: "Release one unknown-completion browser effect permit",
+		Long:  "Release one exact unknown-completion effect permit after an operator has independently resolved whether its browser effect completed. This is break-glass recovery; it never releases a held permit.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			reason := strings.TrimSpace(resolveReason)
+			if reason == "" {
+				return errors.New("--reason is required")
+			}
+			var result struct {
+				Resolved bool   `json:"resolved"`
+				PermitID string `json:"permit_id"`
+			}
+			if err := opt.call(cmd.Context(), "browser.effect_permit.resolve", map[string]string{
+				"permit_id": args[0], "reason": reason,
+			}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "effect permit %s resolved", result.PermitID)
+		},
+	}
+	resolvePermit.Flags().StringVar(&resolveReason, "reason", "", "operator reason recorded in the durable audit event")
+	permit := &cobra.Command{
+		Use:   "permit",
+		Short: "Recover daemon-owned browser effect permits",
+	}
+	permit.AddCommand(resolvePermit)
+
+	command.AddCommand(sessions, use, permit)
 	return command
 }
 

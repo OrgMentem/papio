@@ -1768,8 +1768,8 @@ func TestInstitutionalMaterializationPayloadsRoundTripAndDisposition(t *testing.
 		{"claim", MsgInstitutionalClaimRequest, "job_inst_001", InstitutionalClaimRequestPayload{RequestID: "req_inst_001", CandidateID: "cand_001", MaterializationKind: "browser_tab"}},
 		{"claim_response", MsgInstitutionalClaimResponse, "job_inst_001", InstitutionalClaimResponsePayload{RequestID: "req_inst_001", Outcome: "claimed", CandidateID: "cand_001", ClaimID: "claim_001", BindingID: "bind_001", BrowserHolderGeneration: &generation, LeaseUntil: "2026-08-11T12:00:00Z"}},
 		{"bind", MsgInstitutionalBindRequest, "job_inst_001", InstitutionalBindRequestPayload{RequestID: "req_inst_001", ClaimID: "claim_001", BindingID: "bind_001", TabID: 7}},
-		{"route", MsgInstitutionalRouteResponse, "job_inst_001", InstitutionalRouteResponsePayload{RequestID: "req_inst_001", Outcome: "issued", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, URL: "https://resolver.example/route"}},
-		{"navigated", MsgInstitutionalNavigatedRequest, "job_inst_001", InstitutionalNavigatedRequestPayload{RequestID: "req_inst_001", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, TabID: 7}},
+		{"route", MsgInstitutionalRouteResponse, "job_inst_001", InstitutionalRouteResponsePayload{RequestID: "req_inst_001", Outcome: "issued", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, EffectOrdinal: 1, InstitutionalRequestID: "inst_req_001", URL: "https://resolver.example/route"}},
+		{"navigated", MsgInstitutionalNavigatedRequest, "job_inst_001", InstitutionalNavigatedRequestPayload{RequestID: "req_inst_001", ClaimID: "claim_001", BindingID: "bind_001", RouteIssuanceOrdinal: 1, EffectOrdinal: 1, InstitutionalRequestID: "inst_req_001", TabID: 7}},
 		{"reconcile", MsgInstitutionalReconcileRequest, "", InstitutionalReconcileRequestPayload{RequestID: "req_inst_001", Bindings: []InstitutionalReconcileBinding{{BindingID: "bind_001", TabID: 7}}}},
 	}
 	for _, tc := range frames {
@@ -1800,6 +1800,58 @@ func TestInstitutionalMaterializationPayloadsRoundTripAndDisposition(t *testing.
 		if _, err := DecodeBrowserMessage(raw); err == nil {
 			t.Fatalf("invalid route response accepted: %#v", bad)
 		}
+	}
+}
+
+func TestInstitutionalNavigatedLegacyDecoderIsExplicitAndPaired(t *testing.T) {
+	env := map[string]any{
+		"protocol": BrowserProtocolVersion,
+		"type":     MsgInstitutionalNavigatedRequest,
+		"msg_id":   "msg_inst_legacy",
+		"seq":      1,
+		"job_id":   "job_inst_legacy",
+		"payload": map[string]any{
+			"request_id":             "req_inst_legacy",
+			"claim_id":               "claim_inst_legacy",
+			"binding_id":             "bind_inst_legacy",
+			"route_issuance_ordinal": 2,
+			"tab_id":                 7,
+		},
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(raw); err == nil {
+		t.Fatal("legacy navigation accepted by strict current-v1 decoder")
+	}
+	if _, err := DecodeBrowserMessageWithLegacyInstitutionalNavigation(raw); err != nil {
+		t.Fatalf("legacy cleanup decoder rejected old shape: %v", err)
+	}
+	for _, field := range []string{"effect_ordinal", "institutional_request_id"} {
+		payload := env["payload"].(map[string]any)
+		payload[field] = map[string]any{"effect_ordinal": 1}["effect_ordinal"]
+		if field == "institutional_request_id" {
+			payload[field] = "inst_req_legacy"
+		}
+		mutated, marshalErr := json.Marshal(env)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, decodeErr := DecodeBrowserMessageWithLegacyInstitutionalNavigation(mutated); decodeErr == nil {
+			t.Fatalf("legacy decoder accepted one-sided new field %q", field)
+		}
+		delete(payload, field)
+	}
+	payload := env["payload"].(map[string]any)
+	payload["effect_ordinal"] = 1
+	payload["institutional_request_id"] = "inst_req_legacy"
+	currentShaped, marshalErr := json.Marshal(env)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	if _, decodeErr := DecodeBrowserMessageWithLegacyInstitutionalNavigation(currentShaped); decodeErr == nil {
+		t.Fatal("legacy cleanup decoder accepted current-shaped navigation")
 	}
 }
 
@@ -2012,6 +2064,206 @@ func TestInstitutionalCandidateOfferRoundTripScopeAndBounds(t *testing.T) {
 		}
 	})
 }
+func TestEffectPermitReconcilePayloadsRoundTripAndValidation(t *testing.T) {
+	ordinal := int64(4)
+	effectOrdinal := int64(1)
+	tabID := int64(7)
+	tests := []struct {
+		name    string
+		kind    string
+		payload EffectPermitReconcileRequestPayload
+	}{
+		{"generic drive", "generic_drive", EffectPermitReconcileRequestPayload{
+			RequestID: "request-001", PermitID: "permit-001", EffectKind: "generic_drive",
+			DriveAttemptID: "attempt-001", Ordinal: &ordinal, Strategy: "download", Revision: "rev-001",
+		}},
+		{"direct get", "direct_get", EffectPermitReconcileRequestPayload{
+			RequestID: "request-002", PermitID: "permit-002", EffectKind: "direct_get",
+			DriveAttemptID: "attempt-002", Ordinal: &ordinal, Strategy: "direct_get", Revision: "rev-002",
+		}},
+		{"pdf grab", "pdf_grab", EffectPermitReconcileRequestPayload{
+			RequestID: "request-003", PermitID: "permit-003", EffectKind: "pdf_grab", GrabID: "grab-001",
+		}},
+		{"terms", "terms", EffectPermitReconcileRequestPayload{
+			RequestID: "request-004", PermitID: "permit-004", EffectKind: "terms", TermsOccurrenceID: "terms-001",
+		}},
+		{"institutional", "institutional", EffectPermitReconcileRequestPayload{
+			RequestID: "request-005", PermitID: "permit-005", EffectKind: "institutional",
+			ClaimID: "claim-001", BindingID: "binding-001", EffectOrdinal: &effectOrdinal,
+			InstitutionalRequestID: "institutional-001", TabID: &tabID,
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frame := effectPermitTestFrame(t, MsgEffectPermitReconcileRequest, tt.payload)
+			wantJobID := "job-effect-1"
+			if tt.kind == "pdf_grab" {
+				frame = protocolTestFrame(t, MsgEffectPermitReconcileRequest, tt.payload)
+				wantJobID = ""
+			}
+			got, err := DecodeBrowserMessage(frame)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got.JobID != wantJobID {
+				t.Fatalf("job id = %q, want %q", got.JobID, wantJobID)
+			}
+			if !reflect.DeepEqual(got.Payload, &tt.payload) {
+				t.Fatalf("payload mismatch:\n got %#v\nwant %#v", got.Payload, &tt.payload)
+			}
+		})
+	}
+	response := EffectPermitReconcileResponsePayload{
+		RequestID: "request-006", PermitID: "permit-006", Outcome: "recorded",
+		Dispatched: true, DownloadPresent: false, Acknowledged: true, TabPresent: true,
+	}
+	got, err := DecodeBrowserMessage(effectPermitTestFrame(t, MsgEffectPermitReconcileResponse, response))
+	if err != nil {
+		t.Fatalf("response decode: %v", err)
+	}
+	if !reflect.DeepEqual(got.Payload, &response) {
+		t.Fatalf("response mismatch:\n got %#v\nwant %#v", got.Payload, &response)
+	}
+
+}
+func TestEffectPermitReconcileJoblessPDFScope(t *testing.T) {
+	pdf := map[string]any{
+		"request_id": "request-pdf-001", "permit_id": "permit-pdf-001",
+		"effect_kind": "pdf_grab", "grab_id": "grab-pdf-001",
+	}
+	msg, err := DecodeBrowserMessage(protocolTestFrame(t, MsgEffectPermitReconcileRequest, pdf))
+	if err != nil {
+		t.Fatalf("jobless pdf request rejected: %v", err)
+	}
+	if msg.JobID != "" {
+		t.Fatalf("jobless pdf request job_id = %q", msg.JobID)
+	}
+	if _, err := DecodeBrowserMessage(effectPermitTestFrame(t, MsgEffectPermitReconcileRequest, pdf)); err == nil {
+		t.Fatal("job-scoped pdf request was accepted")
+	}
+	generic := map[string]any{
+		"request_id": "request-generic-001", "permit_id": "permit-generic-001",
+		"effect_kind": "generic_drive", "drive_attempt_id": "attempt-generic-001",
+		"ordinal": 0, "strategy": "fallback", "revision": "rev-1",
+	}
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgEffectPermitReconcileRequest, generic)); err == nil {
+		t.Fatal("jobless generic request was accepted")
+	}
+	response := map[string]any{
+		"request_id": "request-pdf-002", "permit_id": "permit-pdf-001",
+		"outcome": "recorded", "dispatched": false, "download_present": false,
+		"acknowledged": false, "tab_present": false,
+	}
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgEffectPermitReconcileResponse, response)); err != nil {
+		t.Fatalf("jobless response rejected: %v", err)
+	}
+}
+
+func TestEffectPermitReconcileRejectsUnknownNullAndForbiddenFields(t *testing.T) {
+	base := map[string]any{
+		"request_id": "request-001", "permit_id": "permit-001", "effect_kind": "generic_drive",
+		"drive_attempt_id": "attempt-001", "ordinal": 1, "strategy": "download", "revision": "rev-001",
+	}
+	expectProtocolReject(t, MsgEffectPermitReconcileRequest, func() map[string]any {
+		p := mapsClone(base)
+		p["unexpected"] = true
+		return p
+	}())
+	expectProtocolReject(t, MsgEffectPermitReconcileRequest, func() map[string]any {
+		p := mapsClone(base)
+		p["revision"] = nil
+		return p
+	}())
+	expectProtocolReject(t, MsgEffectPermitReconcileResponse, map[string]any{
+		"request_id": "request-004", "permit_id": "permit-004", "outcome": "recorded",
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+		"unexpected": true,
+	})
+	expectProtocolReject(t, MsgEffectPermitReconcileResponse, map[string]any{
+		"request_id": "request-005", "permit_id": "permit-005", "outcome": "recorded",
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+		"detail": "provider returned /tmp/private.pdf",
+	})
+	expectProtocolReject(t, MsgEffectPermitReconcileRequest, map[string]any{
+		"request_id": "request-006", "permit_id": "permit-006", "effect_kind": "institutional",
+		"claim_id": "claim-006", "binding_id": "binding-006", "effect_ordinal": 0,
+		"institutional_request_id": "institutional-006",
+	})
+	for _, tc := range []struct {
+		kind  string
+		field string
+		value any
+	}{
+		{"generic_drive", "grab_id", "grab-001"},
+		{"direct_get", "terms_occurrence_id", "terms-001"},
+		{"pdf_grab", "ordinal", 1},
+		{"terms", "tab_id", 1},
+		{"institutional", "drive_attempt_id", "attempt-001"},
+	} {
+		t.Run(tc.kind+"/"+tc.field, func(t *testing.T) {
+			p := map[string]any{"request_id": "request-002", "permit_id": "permit-002", "effect_kind": tc.kind}
+			switch tc.kind {
+			case "generic_drive", "direct_get":
+				p["drive_attempt_id"], p["ordinal"], p["strategy"], p["revision"] = "attempt-002", 1, "download", "rev-002"
+				if tc.kind == "direct_get" {
+					p["strategy"] = "direct_get"
+				}
+			case "pdf_grab":
+				p["grab_id"] = "grab-002"
+			case "terms":
+				p["terms_occurrence_id"] = "terms-002"
+			case "institutional":
+				p["claim_id"], p["binding_id"], p["effect_ordinal"], p["institutional_request_id"] = "claim-002", "binding-002", 1, "institutional-002"
+			}
+			p[tc.field] = tc.value
+			expectProtocolReject(t, MsgEffectPermitReconcileRequest, p)
+		})
+	}
+	for _, outcome := range []string{"applied", "started", "", "unknown"} {
+		t.Run("invalid response outcome "+outcome, func(t *testing.T) {
+			expectProtocolReject(t, MsgEffectPermitReconcileResponse, map[string]any{
+				"request_id": "request-003", "permit_id": "permit-003", "outcome": outcome,
+				"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+			})
+		})
+	}
+}
+
+func TestEffectPermitReconcileGrabIDIsCorrelationID(t *testing.T) {
+	valid := strings.Repeat("a", 64)
+	invalid := strings.Repeat("a", 65)
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgEffectPermitReconcileRequest, map[string]any{
+		"request_id": "request-001", "permit_id": "permit-001", "effect_kind": "pdf_grab", "grab_id": valid,
+	})); err != nil {
+		t.Fatalf("64-char grab_id rejected: %v", err)
+	}
+	expectProtocolReject(t, MsgEffectPermitReconcileRequest, map[string]any{
+		"request_id": "request-001", "permit_id": "permit-001", "effect_kind": "pdf_grab", "grab_id": invalid,
+	})
+}
+
+func TestProviderDriveEpochStartUnsupportedRemainsAccepted(t *testing.T) {
+	msg, err := DecodeBrowserMessage(effectPermitTestFrame(t, MsgProviderDriveEpochStartResult, map[string]any{
+		"request_id": "request-unsupported", "drive_attempt_id": "attempt-unsupported",
+		"ordinal": 1, "strategy": "download", "revision": "rev-unsupported", "outcome": "unsupported",
+	}))
+	if err != nil {
+		t.Fatalf("unsupported start result rejected: %v", err)
+	}
+	p, ok := msg.Payload.(*ProviderDriveEpochStartResultPayload)
+	if !ok || p.Outcome != "unsupported" {
+		t.Fatalf("unexpected payload %#v", msg.Payload)
+	}
+}
+
+func mapsClone(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func protocolTestFrame(t *testing.T, typ string, payload any) []byte {
 	t.Helper()
 	data, err := json.Marshal(map[string]any{
@@ -2045,9 +2297,27 @@ func protocolFrameMap(t *testing.T, typ string, payload map[string]any) []byte {
 	return protocolTestFrame(t, typ, payload)
 }
 
+func effectPermitTestFrame(t *testing.T, typ string, payload any) []byte {
+	t.Helper()
+	var frame map[string]any
+	if err := json.Unmarshal(protocolTestFrame(t, typ, payload), &frame); err != nil {
+		t.Fatal(err)
+	}
+	frame["job_id"] = "job-effect-1"
+	data, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 func expectProtocolReject(t *testing.T, typ string, payload any) {
 	t.Helper()
-	if _, err := DecodeBrowserMessage(protocolTestFrame(t, typ, payload)); err == nil {
+	frame := protocolTestFrame(t, typ, payload)
+	if typ == MsgEffectPermitReconcileRequest || typ == MsgEffectPermitReconcileResponse {
+		frame = effectPermitTestFrame(t, typ, payload)
+	}
+	if _, err := DecodeBrowserMessage(frame); err == nil {
 		t.Fatalf("%s payload was accepted: %#v", typ, payload)
 	}
 }
@@ -2068,6 +2338,7 @@ func fullWorkPulsePayload() *WorkPulseResponsePayload {
 		Continuing:         int64Ptr(2),
 		Stalled:            int64Ptr(2),
 		EffectCapacity:     &WorkPulseCapacity{Busy: 1, Limit: 2, Waiting: 3},
+		EffectPermits:      []WorkPulseEffectPermit{{PermitID: "permit-0001", Status: "held", Since: "2026-01-01T00:00:00Z"}},
 		HumanSurfaceCapacity: &WorkPulseHumanSurfaceCapacity{
 			Busy: 1, Limit: 2, WaitingClaims: 3,
 		},
@@ -2292,6 +2563,9 @@ func TestNewBrowserFramesRejectMalformedIDsTimesAndLabels(t *testing.T) {
 	pulse = protocolPayloadMap(t, fullWorkPulsePayload())
 	pulse["stall_episodes"].([]any)[0].(map[string]any)["public_label"] = "bad\nlabel"
 	expectProtocolReject(t, MsgWorkPulseResponse, pulse)
+	pulse = protocolPayloadMap(t, fullWorkPulsePayload())
+	pulse["effect_permits"].([]any)[0].(map[string]any)["permit_id"] = strings.Repeat("p", 65)
+	expectProtocolReject(t, MsgWorkPulseResponse, pulse)
 }
 
 func TestWorkPulseBoundsAndAlgebra(t *testing.T) {
@@ -2331,6 +2605,22 @@ func TestWorkPulseBoundsAndAlgebra(t *testing.T) {
 			t.Fatalf("16 gates rejected: %v", err)
 		}
 		p.Gates = append(p.Gates, WorkPulseGate{Kind: "source_budget", Source: "source-0016", Until: "2026-01-01T00:00:00Z", Count: 1})
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+	})
+	t.Run("effect permit bounds and identity", func(t *testing.T) {
+		p := fullWorkPulsePayload()
+		p.EffectPermits = make([]WorkPulseEffectPermit, 5)
+		for i := range p.EffectPermits {
+			p.EffectPermits[i] = WorkPulseEffectPermit{
+				PermitID: fmt.Sprintf("permit-%04d", i), Status: "held", Since: "2026-01-01T00:00:00Z",
+			}
+		}
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p.EffectPermits = p.EffectPermits[:2]
+		p.EffectPermits[1].PermitID = p.EffectPermits[0].PermitID
+		expectProtocolReject(t, MsgWorkPulseResponse, p)
+		p.EffectPermits[1].PermitID = "permit-0002"
+		p.EffectPermits[1].Status = "settled"
 		expectProtocolReject(t, MsgWorkPulseResponse, p)
 	})
 	t.Run("episode uniqueness and order", func(t *testing.T) {

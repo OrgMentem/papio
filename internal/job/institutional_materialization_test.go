@@ -194,7 +194,7 @@ func TestInstitutionProfileReconcileRollsBackOnDuplicate(t *testing.T) {
 	}
 }
 
-func TestMaterializationClaimCASAndOrdinals(t *testing.T) {
+func TestMaterializationClaimCASAndRouteOrdinals(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
 	jobID, err := js.CreateRequest(ctx, "materialization-claim-job", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
@@ -242,13 +242,6 @@ func TestMaterializationClaimCASAndOrdinals(t *testing.T) {
 	}
 	if err := js.AcknowledgeMaterializationNavigation(ctx, claim.ID, claim.BindingID, 11, 1, 7); err != nil {
 		t.Fatalf("navigation replay: %v", err)
-	}
-	effect, err := js.AdvanceMaterializationEffect(ctx, claim.ID, claim.BindingID, 11, 0)
-	if err != nil || effect != 1 {
-		t.Fatalf("effect ordinal = %d err=%v, want 1", effect, err)
-	}
-	if _, err := js.AdvanceMaterializationEffect(ctx, claim.ID, claim.BindingID, 11, 0); !errors.Is(err, ErrMaterializationStale) {
-		t.Fatalf("non-monotonic effect = %v, want stale", err)
 	}
 }
 func TestMaterializationRouteReplayRequiresCurrentProfileRevision(t *testing.T) {
@@ -541,7 +534,6 @@ func TestMaterializationMutationsRejectProfileDrift(t *testing.T) {
 		{name: "route"},
 		{name: "navigation"},
 		{name: "renew"},
-		{name: "effect"},
 		{name: "settle"},
 	}
 	for _, tc := range cases {
@@ -562,17 +554,17 @@ func TestMaterializationMutationsRejectProfileDrift(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tc.name == "route" || tc.name == "navigation" || tc.name == "effect" || tc.name == "settle" {
+			if tc.name == "route" || tc.name == "navigation" || tc.name == "settle" {
 				if err := js.BindMaterialization(ctx, claim.ID, claim.BindingID, 31, profile.Revision, 0); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if tc.name == "navigation" || tc.name == "effect" || tc.name == "settle" {
+			if tc.name == "navigation" || tc.name == "settle" {
 				if _, err := js.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, 31, 0); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if tc.name == "effect" || tc.name == "settle" {
+			if tc.name == "settle" {
 				if err := js.AcknowledgeMaterializationNavigation(ctx, claim.ID, claim.BindingID, 31, 1, 0); err != nil {
 					t.Fatal(err)
 				}
@@ -598,8 +590,6 @@ func TestMaterializationMutationsRejectProfileDrift(t *testing.T) {
 				mutationErr = js.AcknowledgeMaterializationNavigation(ctx, claim.ID, claim.BindingID, 31, 1, 0)
 			case "renew":
 				mutationErr = js.RenewMaterializationClaim(ctx, claim.ID, 31, time.Now().UTC().Add(2*time.Minute))
-			case "effect":
-				_, mutationErr = js.AdvanceMaterializationEffect(ctx, claim.ID, claim.BindingID, 31, 0)
 			case "settle":
 				mutationErr = js.SettleMaterialization(ctx, claim.ID, claim.BindingID, 31, profile.Revision)
 			}
@@ -613,9 +603,9 @@ func TestMaterializationMutationsRejectProfileDrift(t *testing.T) {
 			wantPhase := "claimed"
 			if tc.name == "route" {
 				wantPhase = "bound"
-			} else if tc.name == "navigation" || tc.name == "effect" || tc.name == "settle" {
+			} else if tc.name == "navigation" || tc.name == "settle" {
 				wantPhase = "route_issued"
-				if tc.name == "effect" || tc.name == "settle" {
+				if tc.name == "settle" {
 					wantPhase = "navigated"
 				}
 			}

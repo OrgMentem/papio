@@ -599,9 +599,17 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 		return nil, ErrMaterializationStale
 	}
 
-	// Expired claims no longer occupy the one-live-claim slot. This is done in
-	// the same transaction as insertion, so two workers cannot both win.
-	if _, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=? WHERE candidate_id=? AND phase IN ('claimed','bound','route_issued','navigated') AND lease_until IS NOT NULL AND lease_until <= ?`, now, in.CandidateID, now); err != nil {
+	// Expired claims no longer occupy the one-live-claim slot unless an
+	// institutional effect was authorized for the claim. The durable permit
+	// remains the at-most-once history after settlement; until an artifact
+	// winner closes the claim, retiring it could mint a fresh claim and repeat
+	// the provider navigation.
+	if _, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=?
+		WHERE candidate_id=? AND phase IN ('claimed','bound','route_issued','navigated')
+		  AND lease_until IS NOT NULL AND lease_until <= ?
+		  AND NOT EXISTS (SELECT 1 FROM effect_permits p
+		    WHERE p.claim_id=materialization_claims.id)`,
+		now, in.CandidateID, now); err != nil {
 		return nil, err
 	}
 	// The same artifact_winners anti-join the two sweeps carry. Without it a
@@ -611,9 +619,12 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 	// second irreversible provider effect the anti-join exists to prevent.
 	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates SET status='eligible', updated_at=?
 		WHERE id=? AND status='claimed'
-		  AND NOT EXISTS (SELECT 1 FROM materialization_claims WHERE candidate_id=?
-		    AND phase IN ('claimed','bound','route_issued','navigated')
-		    AND (lease_until IS NULL OR lease_until > ?))
+		  AND NOT EXISTS (SELECT 1 FROM materialization_claims
+		    WHERE candidate_id=?
+		      AND phase IN ('claimed','bound','route_issued','navigated')
+		      AND ((lease_until IS NULL OR lease_until > ?)
+		        OR EXISTS (SELECT 1 FROM effect_permits p
+		          WHERE p.claim_id=materialization_claims.id)))
 		  AND NOT EXISTS (SELECT 1 FROM artifact_winners
 		    WHERE candidate_id=browser_candidates.id
 		      AND job_attempt_revision=browser_candidates.job_attempt_revision)`,
@@ -1076,52 +1087,6 @@ func (js *Store) RenewMaterializationClaim(ctx context.Context, claimID string, 
 	return nil
 }
 
-// AdvanceMaterializationEffect increments the effect ordinal under the same
-// holder and binding fence used for navigation. The ordinal is the only
-// durable effect permit identity; effect details remain transient.
-func (js *Store) AdvanceMaterializationEffect(ctx context.Context, claimID, bindingID string, holderGeneration, expectedOrdinal int64) (int64, error) {
-	now := store.Now()
-	tx, err := js.S.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE materialization_claims
-		SET effect_ordinal=effect_ordinal+1, updated_at=?
-		WHERE id=? AND binding_id=? AND browser_holder_generation=? AND phase='navigated'
-		  AND effect_ordinal=? AND (lease_until IS NULL OR lease_until > ?)
-		  AND EXISTS (
-			SELECT 1 FROM browser_candidates c
-			JOIN institution_profiles p ON p.id=c.institution_profile_id
-			WHERE c.id=materialization_claims.candidate_id
-			  AND p.tombstoned_at IS NULL
-			  AND p.revision=c.institution_profile_revision
-			  AND c.job_attempt_revision = 1 + (
-				SELECT COUNT(*) FROM events e
-				 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
-			  )
-		  )`,
-		now, claimID, bindingID, holderGeneration, expectedOrdinal, now)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	if n != 1 {
-		return 0, ErrMaterializationStale
-	}
-	var ordinal int64
-	if err := tx.QueryRowContext(ctx, `SELECT effect_ordinal FROM materialization_claims WHERE id=?`, claimID).Scan(&ordinal); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return ordinal, nil
-}
-
 // ReconcileMaterializationClaims fences expired claims in one transaction and
 // returns the rows it retired. Unexpired claims, including those from an older
 // holder generation, are never stolen by reconciliation.
@@ -1132,7 +1097,10 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, claimSelect+` WHERE phase IN ('claimed','bound','route_issued','navigated') AND lease_until IS NOT NULL AND lease_until <= ? ORDER BY id`, stamp)
+	rows, err := tx.QueryContext(ctx, claimSelect+` WHERE phase IN ('claimed','bound','route_issued','navigated')
+		AND lease_until IS NOT NULL AND lease_until <= ?
+		AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id)
+		ORDER BY id`, stamp)
 	if err != nil {
 		return nil, err
 	}
@@ -1151,21 +1119,22 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 		return nil, err
 	}
 	_ = rows.Close()
-	if _, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=? WHERE phase IN ('claimed','bound','route_issued','navigated') AND lease_until IS NOT NULL AND lease_until <= ?`, stamp, stamp); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=?
+		WHERE phase IN ('claimed','bound','route_issued','navigated')
+		  AND lease_until IS NOT NULL AND lease_until <= ?
+		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id)`, stamp, stamp); err != nil {
 		return nil, err
 	}
-	// A candidate whose attempt already produced an artifact must not become
-	// eligible again just because its lease expired: re-issuing the route would
-	// drive a second irreversible provider effect for work that already landed.
-	// AbandonStaleMaterializations carries the same anti-join; expiry omitted it.
+	// Claims protected by any authorized institutional effect remain live
+	// after its permit settles and after their diagnostic lease expires. The
+	// candidate stays owned until the artifact winner closes the claim.
 	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates SET status='eligible', updated_at=?
 		WHERE status IN ('claimed','materializing')
 		  AND NOT EXISTS (SELECT 1 FROM materialization_claims WHERE candidate_id=browser_candidates.id
-		    AND phase IN ('claimed','bound','route_issued','navigated')
-		    AND (lease_until IS NULL OR lease_until > ?))
+		    AND phase IN ('claimed','bound','route_issued','navigated'))
 		  AND NOT EXISTS (SELECT 1 FROM artifact_winners
 		    WHERE candidate_id=browser_candidates.id
-		      AND job_attempt_revision=browser_candidates.job_attempt_revision)`, stamp, stamp); err != nil {
+		      AND job_attempt_revision=browser_candidates.job_attempt_revision)`, stamp); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1190,7 +1159,8 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 		SET phase='abandoned', updated_at=?
 		WHERE browser_holder_generation<>?
 		  AND phase IN ('claimed','bound','route_issued','navigated')
-		  AND (lease_until IS NULL OR lease_until > ?)`,
+		  AND (lease_until IS NULL OR lease_until > ?)
+		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id)`,
 		now, currentGeneration, now)
 	if err != nil {
 		return 0, err
@@ -1206,13 +1176,12 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 			SELECT 1 FROM materialization_claims
 			WHERE candidate_id=browser_candidates.id
 			  AND phase IN ('claimed','bound','route_issued','navigated')
-			  AND (lease_until IS NULL OR lease_until > ?)
 		  )
 		  AND NOT EXISTS (
 			SELECT 1 FROM artifact_winners
 			WHERE candidate_id=browser_candidates.id
 			  AND job_attempt_revision=browser_candidates.job_attempt_revision
-		  )`, now, now); err != nil {
+		  )`, now); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {

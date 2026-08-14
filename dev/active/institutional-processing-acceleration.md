@@ -1,7 +1,7 @@
 # Institutional processing acceleration
 
-**Status:** Phase −1, Phase 0, Phase 1, and Phase 2 complete; **Phase 3
-current**  
+**Status:** Phase −1 through Phase 3 complete; **Phase 4 current**
+
 **Ownering model:** solo-maintainer-sized changes landed directly on `main`  
 **Scope:** daemon authority, browser materialization, institutional cutover, and
 staged enablement. Existing UI work remains a dependency for typed attention
@@ -87,6 +87,35 @@ local work. Raw institutional URLs remain transient and memory-only.
 The legacy URL-bearing `job_offer` path remains available to peers that do not
 advertise the feature. Phase 2 does not change source-gate admission, automatic
 route scheduling, the global effect permit, provider readiness, or concurrency.
+
+### Coordinated Phase 3 implementation note
+
+Phase 3 is complete. Indexed keyset pagination, fair rotation across profiles
+and pre-route/provider safety domains, and database scheduling outside the
+session-arbitration mutex were already active. Migration `0034` closes the
+remaining authority gap with daemon-durable effect permits.
+
+`effect_permits` is its own table, not extra columns on
+`materialization_claims`. Occupying status is `held | unknown_completion` for
+both the single global slot (`slot_index = 0`) and the per-domain row. Acquire
+is transactional for every currently reachable irreversible path: generic
+drive, direct get, PDF grab, terms, and institutional navigation/click.
+Generic drive and direct get share one identity namespace. Terms identity is a
+stable job-scoped occurrence id. Institutional acquire is expected-ordinal CAS
+plus a stable request id and is the sole writer of `effect_ordinal`. Result,
+safety latch, and any successor *offer* share one transaction with settlement;
+the successor identity must acquire independently. Duplicate start remains
+`duplicate`. Busy `stale` defers the same never-acquired identity. Elapsed
+lease, ordinary retry/cancel, and the former ten-minute drive-epoch stall are
+not authorization.
+
+Unknown completion remains occupying until an exact late result, correlated
+winner, or exact-ID operator resolution. Startup imports pre-`0034` unresolved
+epochs as `legacy_effect_blockers`, not live-slot rows. The schema-33 guard
+binary refuses schema 34; downgrade to an earlier binary requires restoring a
+pre-migration backup. Peers must advertise `effect_permit_v1` before
+`started`. `AdvanceMaterializationEffect` stays dark. Automatic first-route,
+source-gate bypass, and concurrency greater than one stay off.
  
 The hard enablement chain is:
 
