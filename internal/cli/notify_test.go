@@ -71,8 +71,22 @@ func TestNotifyPreviewAndTestCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	root.SetArgs([]string{"notify", "test", string(notify.CategoryRequestOutcome)})
-	if err := root.Execute(); err != nil {
-		t.Fatal(err)
+	testErr := root.Execute()
+	available, _ := notify.PlatformCapability()
+	if !available {
+		if testErr == nil || !strings.Contains(testErr.Error(), "desktop notifications are unavailable") {
+			t.Fatalf("test error = %v, want platform unavailable", testErr)
+		}
+		if strings.Join(methods, ",") != "notify.preview_v1" {
+			t.Fatalf("unsupported platform methods = %v", methods)
+		}
+		if !strings.Contains(out.String(), "preview") {
+			t.Fatalf("output = %q", out.String())
+		}
+		return
+	}
+	if testErr != nil {
+		t.Fatal(testErr)
 	}
 	if !strings.Contains(out.String(), "preview") || !strings.Contains(out.String(), "no delivery acknowledgement") {
 		t.Fatalf("output = %q", out.String())

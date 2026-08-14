@@ -83,6 +83,16 @@ func TestNotifyMethodsReturnPurposeBuiltResults(t *testing.T) {
 	}
 
 	testRaw, rpcErr := notifyTest(context.Background(), []byte(`{"category":"request_outcome"}`), system)
+	available, _ := notify.PlatformCapability()
+	if !available {
+		if rpcErr == nil || rpcErr.Code != "unavailable" {
+			t.Fatalf("test error = %+v, want unavailable", rpcErr)
+		}
+		if len(sender.messages) != 0 {
+			t.Fatalf("unsupported platform sent %d messages", len(sender.messages))
+		}
+		return
+	}
 	if rpcErr != nil {
 		t.Fatal(rpcErr)
 	}
