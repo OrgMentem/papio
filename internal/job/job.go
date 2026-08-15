@@ -1002,6 +1002,123 @@ func closeTerminalHumanActions(ctx context.Context, tx *sql.Tx, jobID, to, now s
 	return err
 }
 
+var (
+	beforeTransitionTxForTest func() error
+	beforeRepairTxForTest     func() error
+)
+
+func SetBeforeTransitionTxForTest(h func() error) { beforeTransitionTxForTest = h }
+func SetBeforeRepairTxForTest(h func() error)     { beforeRepairTxForTest = h }
+
+type TransitionTxConfig struct {
+	RetryAt string
+}
+
+func (js *Store) TransitionTx(ctx context.Context, tx *sql.Tx, jobID, from, to string, detailJSON string, cfg TransitionTxConfig, now string) error {
+	if beforeTransitionTxForTest != nil {
+		if err := beforeTransitionTxForTest(); err != nil {
+			return err
+		}
+	}
+	if !allowed[from][to] {
+		return fmt.Errorf("%w: %s -> %s not allowed", ErrConflict, from, to)
+	}
+	releaseLease := releasesLease(to)
+	res, err := tx.ExecContext(ctx,
+		"UPDATE jobs SET state = ?, updated_at = ?, retry_at = ?, terminal_reason = COALESCE(?, terminal_reason), artifact_sha256 = COALESCE(?, artifact_sha256), selected_candidate_id = COALESCE(?, selected_candidate_id), lease_owner = CASE WHEN ? THEN NULL ELSE lease_owner END, lease_expires_at = CASE WHEN ? THEN NULL ELSE lease_expires_at END WHERE id = ? AND state = ?",
+		to, now, nullable(cfg.RetryAt), nil, nil, nil, releaseLease, releaseLease, jobID, from)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return fmt.Errorf("%w: job %s not in state %s", ErrConflict, jobID, from)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)", jobID, now, detailJSON); err != nil {
+		return err
+	}
+	if Terminal(to) {
+		if err := closeTerminalHumanActions(ctx, tx, jobID, to, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (js *Store) RepairAwaitingHumanTx(ctx context.Context, tx *sql.Tx, jobID string, actionIDs []int64, detailJSON string, now string) error {
+	if beforeRepairTxForTest != nil {
+		if err := beforeRepairTxForTest(); err != nil {
+			return err
+		}
+	}
+	expected := make(map[int64]struct{}, len(actionIDs))
+	for _, actionID := range actionIDs {
+		if _, dup := expected[actionID]; dup {
+			return fmt.Errorf("%w: duplicate human action %d", ErrConflict, actionID)
+		}
+		expected[actionID] = struct{}{}
+	}
+	res, err := tx.ExecContext(ctx, "UPDATE jobs SET state = ?, updated_at = ?, retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND state = ? AND (lease_owner IS NULL OR lease_expires_at < ?)", StateResolving, now, jobID, StateAwaitingHuman, now)
+	if err != nil {
+		return err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return fmt.Errorf("%w: job %s is not an unleased awaiting_human job", ErrConflict, jobID)
+	}
+	openRows, err := tx.QueryContext(ctx, "SELECT id FROM human_actions WHERE job_id = ? AND status = 'open'", jobID)
+	if err != nil {
+		return err
+	}
+	open := make(map[int64]struct{}, len(expected))
+	for openRows.Next() {
+		var aid int64
+		if err := openRows.Scan(&aid); err != nil {
+			_ = openRows.Close()
+			return err
+		}
+		if _, ok := expected[aid]; !ok {
+			_ = openRows.Close()
+			return fmt.Errorf("%w: open actions changed for job %s", ErrConflict, jobID)
+		}
+		open[aid] = struct{}{}
+	}
+	if err := openRows.Err(); err != nil {
+		_ = openRows.Close()
+		return err
+	}
+	if err := openRows.Close(); err != nil {
+		return err
+	}
+	if len(open) != len(expected) {
+		return fmt.Errorf("%w: open actions changed for job %s", ErrConflict, jobID)
+	}
+	if len(actionIDs) != 0 {
+		placeholders := ""
+		for i := range actionIDs {
+			if i > 0 {
+				placeholders += ","
+			}
+			placeholders += "?"
+		}
+		args := make([]any, 0, len(actionIDs)+2)
+		args = append(args, now, jobID)
+		for _, aid := range actionIDs {
+			args = append(args, aid)
+		}
+		res, err = tx.ExecContext(ctx, "UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE job_id = ? AND status = 'open' AND id IN ("+placeholders+")", args...)
+		if err != nil {
+			return err
+		}
+		if changed, _ := res.RowsAffected(); changed != int64(len(actionIDs)) {
+			return fmt.Errorf("%w: open actions changed for job %s", ErrConflict, jobID)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)", jobID, now, detailJSON); err != nil {
+		return err
+	}
+	return nil
+}
+
 // RepairAwaitingHuman atomically resolves a repair snapshot's open actions and
 // returns an unleased parked job to resolving. The lease predicate must share
 // this transaction: adoption can acquire its awaiting_human lease after

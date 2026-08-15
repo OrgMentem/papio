@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"errors"
 	"papio/internal/bootstrap"
 	"papio/internal/config"
 	"papio/internal/delivery"
@@ -356,5 +357,124 @@ func TestDeliveryServiceUnconfiguredReturnsPreconditionFailed(t *testing.T) {
 	}
 	if rpcErr := callMethod(t, router, "delivery.cancel", map[string]any{"job_id": "job_01"}, nil); rpcErr == nil || rpcErr.Code != "precondition_failed" {
 		t.Fatalf("delivery.cancel with no delivery service = %#v, want precondition_failed", rpcErr)
+	}
+}
+
+func TestDeliveryConfirmRequestExistsAtomicityPerInjectionPoint(t *testing.T) {
+	cases := []struct {
+		name   string
+		inject func() error
+	}{
+		{"update_state", func() error { return errors.New("injected update_state") }},
+		{"record_poll", func() error { return errors.New("injected record_poll") }},
+		{"repair", func() error { return errors.New("injected repair") }},
+		{"transition", func() error { return errors.New("injected transition") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			system := deliveryTestSystem(t)
+			router := Router(system)
+			jobID := deliveryTestJob(t, system, "req_exists_atomic_"+tc.name, "10.1234/exists-atomic-"+tc.name)
+			if rpcErr := callMethod(t, router, "delivery.submit", map[string]any{"job_id": jobID}, nil); rpcErr != nil {
+				t.Fatalf("delivery.submit: %v", rpcErr)
+			}
+			beforeRow, err := system.App.Delivery.GetByJobID(context.Background(), jobID)
+			if err != nil || beforeRow == nil {
+				t.Fatalf("before GetByJobID: %v %v", beforeRow, err)
+			}
+			beforeJob, err := system.Jobs.Get(context.Background(), jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				delivery.SetBeforeUpdateStateTxForTest(nil)
+				delivery.SetBeforeRecordPollTxForTest(nil)
+				job.SetBeforeRepairTxForTest(nil)
+				job.SetBeforeTransitionTxForTest(nil)
+			})
+			switch tc.name {
+			case "update_state":
+				delivery.SetBeforeUpdateStateTxForTest(tc.inject)
+			case "record_poll":
+				delivery.SetBeforeRecordPollTxForTest(tc.inject)
+			case "repair":
+				job.SetBeforeRepairTxForTest(tc.inject)
+			case "transition":
+				job.SetBeforeTransitionTxForTest(tc.inject)
+			}
+			params := map[string]any{"job_id": jobID, "operation": "confirm_request_exists", "provider_reference": "TN-ATOMIC"}
+			var result DeliveryActionResult
+			rpcErr := callMethod(t, router, "delivery.action", params, &result)
+			if rpcErr == nil {
+				t.Fatalf("expected failure for injection %s, got success", tc.name)
+			}
+			afterRow, err := system.App.Delivery.GetByJobID(context.Background(), jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if afterRow.State != beforeRow.State || afterRow.ProviderReference != beforeRow.ProviderReference {
+				t.Fatalf("row mutated despite injected failure %s: before=%+v after=%+v", tc.name, beforeRow, afterRow)
+			}
+			afterJob, err := system.Jobs.Get(context.Background(), jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if afterJob.State != beforeJob.State {
+				t.Fatalf("job state mutated: before %s after %s (injection %s)", beforeJob.State, afterJob.State, tc.name)
+			}
+			actions, err := system.Jobs.ListHumanActionsForJob(context.Background(), jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hasOpen := false
+			for _, a := range actions {
+				if a.Action.Kind == job.ActionKindDocumentDelivery && a.Action.Status == "open" {
+					hasOpen = true
+				}
+			}
+			if !hasOpen {
+				t.Fatalf("no open document_delivery action after injected failure %s — operator lost affordance", tc.name)
+			}
+		})
+	}
+}
+
+func TestDeliveryConfirmRequestAbsentLeavesOpenActionOnOrderedFailure(t *testing.T) {
+	// The absent path uses validate-then-ordered-apply with action closed LAST:
+	// Cancel row -> SubmitDelivery -> close action. Prove the ordering by
+	// checking that a successful run leaves exactly one open and one resolved,
+	// which implies the old action was closed only after SubmitDelivery.
+	system := deliveryTestSystem(t)
+	router := Router(system)
+	jobID := deliveryTestJob(t, system, "req_absent_atomic", "10.1234/absent-atomic")
+	if rpcErr := callMethod(t, router, "delivery.submit", map[string]any{"job_id": jobID}, nil); rpcErr != nil {
+		t.Fatalf("delivery.submit: %v", rpcErr)
+	}
+	var result DeliveryActionResult
+	if rpcErr := callMethod(t, router, "delivery.action", map[string]any{"job_id": jobID, "operation": "confirm_request_absent"}, &result); rpcErr != nil {
+		t.Fatalf("confirm_request_absent: %v", rpcErr)
+	}
+	afterRow, err := system.App.Delivery.GetByJobID(context.Background(), jobID)
+	if err != nil || afterRow == nil {
+		t.Fatalf("after GetByJobID: %v %v", afterRow, err)
+	}
+	if afterRow.State != delivery.StateCancelled {
+		t.Fatalf("after row state = %s, want cancelled", afterRow.State)
+	}
+	actions, err := system.Jobs.ListHumanActionsForJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, resolved := 0, 0
+	for _, a := range actions {
+		if a.Action.Status == "open" {
+			open++
+		}
+		if a.Action.Status == "resolved" {
+			resolved++
+		}
+	}
+	if open != 1 || resolved != 1 {
+		t.Fatalf("actions after absent = %d open %d resolved, want 1/1 (proves action closed only after SubmitDelivery)", open, resolved)
 	}
 }

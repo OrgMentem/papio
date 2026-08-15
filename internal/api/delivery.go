@@ -14,6 +14,7 @@ import (
 	"papio/internal/delivery"
 	"papio/internal/ipc"
 	"papio/internal/job"
+	"papio/internal/store"
 )
 
 // DeliveryRequest is the wire projection of one delivery_requests row
@@ -370,24 +371,53 @@ func deliveryConfirmRequestExists(ctx context.Context, system *bootstrap.System,
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	if err := system.Jobs.RepairAwaitingHuman(ctx, jobID, []int64{action.ID},
-		map[string]any{"reason": "document_delivery_confirmed_exists"}); err != nil {
-		return failure(err)
-	}
 	profile, err := svc.ResolveGateProfileFor(ctx, row.InstitutionProfile)
 	if err != nil {
 		return failure(err)
 	}
-	if err := svc.UpdateState(ctx, row.ID, delivery.StatePending); err != nil {
-		return failure(err)
-	}
 	next := delivery.NextCheck(time.Now(), 0, profile.StatusPollMinutes)
-	if err := svc.RecordPoll(ctx, row.ID, providerReference, next); err != nil {
+	// One threaded tx over the single pooled *sql.DB (SetMaxOpenConns(1)).
+	// Validate prerequisites before mutating; then apply delivery row mutations
+	// and job transitions atomically. Human action is closed LAST via
+	// RepairAwaitingHuman so a mid-sequence failure leaves the action OPEN and
+	// the operator retains the reconciliation affordance.
+	//
+	// Full atomicity is via one sql.Tx threaded through Tx-variants on the
+	// delivery and job stores (both share the same *store.Store / *sql.DB).
+	// If future absent-path logic must call app.Service.SubmitDelivery inside
+	// the same tx, that seam must gain a Tx-variant.
+	db := system.Store.DB()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
 		return failure(err)
 	}
-	if err := system.Jobs.Transition(ctx, jobID, job.StateResolving, job.StateRetryWait,
-		map[string]any{"reason": job.RetryReasonDocumentDeliveryPending, "provider_reference": providerReference},
-		job.WithRetryAt(next)); err != nil {
+	defer func() { _ = tx.Rollback() }()
+	if err := svc.UpdateStateTx(ctx, tx, row.ID, delivery.StatePending); err != nil {
+		return failure(err)
+	}
+	if err := svc.RecordPollTx(ctx, tx, row.ID, providerReference, next); err != nil {
+		return failure(err)
+	}
+	repairDetail := map[string]any{"reason": "document_delivery_confirmed_exists"}
+	repairDetail["from"], repairDetail["to"] = job.StateAwaitingHuman, job.StateResolving
+	repairJSON, err := json.Marshal(repairDetail)
+	if err != nil {
+		return failure(err)
+	}
+	now := store.Now()
+	if err := system.Jobs.RepairAwaitingHumanTx(ctx, tx, jobID, []int64{action.ID}, string(repairJSON), now); err != nil {
+		return failure(err)
+	}
+	retryDetail := map[string]any{"reason": job.RetryReasonDocumentDeliveryPending, "provider_reference": providerReference}
+	retryDetail["from"], retryDetail["to"] = job.StateResolving, job.StateRetryWait
+	retryJSON, err := json.Marshal(retryDetail)
+	if err != nil {
+		return failure(err)
+	}
+	if err := system.Jobs.TransitionTx(ctx, tx, jobID, job.StateResolving, job.StateRetryWait, string(retryJSON), job.TransitionTxConfig{RetryAt: next.UTC().Format(time.RFC3339Nano)}, now); err != nil {
+		return failure(err)
+	}
+	if err := tx.Commit(); err != nil {
 		return failure(err)
 	}
 	detail, rpcErr := deliveryRequestDetail(ctx, system, jobID)
@@ -427,6 +457,15 @@ func deliveryConfirmRequestAbsent(ctx context.Context, system *bootstrap.System,
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
+	// Ordering that satisfies both atomicity and the legal state graph:
+	//   allowed[A->R] via RepairAwaitingHuman, allowed[R->A] via SubmitDelivery's
+	//   reconciliation park. The prior Cancel->Submit->Repair order kept the
+	//   action open on Submit failure (good) but Submit saw job still A and
+	//   attempted A->A (illegal). Repair->Submit is the only legal order:
+	//   Cancel row, Repair A->R (close old), Submit R->A (open new). If Submit
+	//   fails after Repair, we compensate by re-opening a reconciliation
+	//   action so the operator never loses the affordance (row cancelled is a
+	//   documented recoverable state).
 	if err := svc.UpdateState(ctx, row.ID, delivery.StateCancelled); err != nil {
 		return failure(err)
 	}
@@ -434,9 +473,18 @@ func deliveryConfirmRequestAbsent(ctx context.Context, system *bootstrap.System,
 		map[string]any{"reason": "document_delivery_confirmed_absent"}); err != nil {
 		return failure(err)
 	}
-	_, err = system.App.SubmitDelivery(ctx, jobID)
-	if err != nil {
-		return failure(err)
+	_, submitErr := system.App.SubmitDelivery(ctx, jobID)
+	if submitErr != nil {
+		ref := row.ProviderReference
+		if ref == "" {
+			ref = "(no provider reference recorded)"
+		}
+		detail := fmt.Sprintf("a document-delivery request (provider %s, reference %s, state %s) needs reconciliation; run 'papio delivery get %s' for its history and resolve it by hand — papio never resubmits automatically",
+			row.Provider, ref, string(delivery.StateCancelled), jobID)
+		if _, openErr := system.Jobs.OpenHumanAction(ctx, jobID, job.ActionKindDocumentDelivery, detail, job.Access(false, "")); openErr == nil {
+			_ = system.Jobs.Transition(ctx, jobID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"})
+		}
+		return failure(submitErr)
 	}
 	after, err := system.Jobs.Get(ctx, jobID)
 	if err != nil {

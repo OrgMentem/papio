@@ -23,6 +23,7 @@ import (
 	"papio/internal/protocol"
 	"papio/internal/resolver"
 	"papio/internal/store"
+	"papio/internal/work"
 )
 
 // newDeliveryTestService builds an app.Service backed by a real, temporary
@@ -2029,5 +2030,176 @@ func TestOfferedDeliveryRecoveryUsesUniqueLeaseOwners(t *testing.T) {
 	second := svc.OfferedDeliveryRecovery()
 	if first.owner == "" || first.owner == second.owner {
 		t.Fatalf("recovery owners = %q and %q, want unique non-empty owners", first.owner, second.owner)
+	}
+}
+
+// TestDuplicateOfferedRowReownedBeforeSubmission proves the ea626f43 fix:
+// a duplicate offered row whose owner job was cancelled is re-owned by the
+// submitting job before the provider call. Without reassignment the provider
+// transaction would be orphaned (no durable local reference) and
+// RecordSubmission would affect 0 rows.
+func TestDuplicateOfferedRowReownedBeforeSubmission(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"TransactionNumber": 5555, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	jobA, err := svc.Submit(ctx, deliveryWorkRequest("wr_reown_owner", "10.1000/reown-owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowAJob, err := jobs.Get(ctx, jobA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowA, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID:              jobA,
+		InstitutionProfile: "default",
+		Provider:           "illiad",
+		RequestClass:       "digital_journal_article",
+		WorkIdentity:       rowAJob.Work.Describe(),
+		GateProfileDigest:  profile.Digest(),
+	})
+	if err != nil {
+		t.Fatalf("Create jobA row: %v", err)
+	}
+	if err := jobs.Cancel(ctx, jobA, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+	jobB, err := svc.Submit(ctx, deliveryWorkRequest("wr_reown_submitter", "10.1000/reown-owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobB == jobA {
+		t.Fatalf("jobB deduped to jobA; expected distinct job after cancellation")
+	}
+	if _, err := jobs.ClaimNext(ctx, "w", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, jobB, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.SubmitDelivery(ctx, jobB)
+	if err != nil {
+		t.Fatalf("SubmitDelivery for reowned row: %v", err)
+	}
+	if !req.Configured {
+		t.Fatal("not configured")
+	}
+	got, err := deliverySvc.Get(ctx, rowA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.JobID == jobA {
+		t.Fatalf("row %d still owned by cancelled job %s; expected re-owned by %s", got.ID, jobA, jobB)
+	}
+	if got.JobID != jobB {
+		t.Fatalf("row job_id = %s, want %s (re-owned)", got.JobID, jobB)
+	}
+	if got.State == delivery.StateSubmitted || got.State == delivery.StatePending {
+		if got.ProviderReference == "" {
+			t.Fatalf("row submitted but provider_reference empty — orphan risk")
+		}
+	}
+	key := delivery.IdempotencyKey("default", rowAJob.Work.Describe(), "illiad", "digital_journal_article")
+	lookup, err := deliverySvc.Lookup(ctx, key)
+	if err != nil || lookup == nil {
+		t.Fatalf("Lookup after reown: %v %v", lookup, err)
+	}
+	if lookup.ID != rowA.ID {
+		t.Fatalf("Lookup created a second row %d vs original %d — duplicate live request", lookup.ID, rowA.ID)
+	}
+}
+
+func TestReassignOfferedRequestCAS(t *testing.T) {
+	ctx := context.Background()
+	_, jobs, deliverySvc := newDeliveryTestService(t)
+	// Seed two distinct jobs so both FK targets exist. Use distinct DOIs to
+	// avoid work-deduplication (jobs.CreateRequest would return the existing
+	// live job for the same canonical DOI).
+	jobA, err := jobs.CreateRequest(ctx, "wr_reassign_a", work.Work{DOI: "10.1000/reassign-cas-a", Title: "t", Authors: []string{"A"}}, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobB, err := jobs.CreateRequest(ctx, "wr_reassign_b", work.Work{DOI: "10.1000/reassign-cas-b", Title: "t", Authors: []string{"A"}}, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobA == jobB {
+		t.Fatal("jobA and jobB must be distinct")
+	}
+	// Create offered row owned by jobA.
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{JobID: jobA, InstitutionProfile: "default", Provider: "illiad", RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1000/reassign-cas", GateProfileDigest: "d1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if req.JobID != jobA {
+		t.Fatalf("owner = %s want %s", req.JobID, jobA)
+	}
+	if req.State != delivery.StateOffered || req.ProviderReference != "" {
+		t.Fatalf("created row = %+v, want offered with empty reference", req)
+	}
+	// Transfer to jobB — correct old owner succeeds.
+	ok, err := deliverySvc.ReassignOfferedRequest(ctx, req.ID, jobB, jobA)
+	if err != nil || !ok {
+		t.Fatalf("Reassign: ok=%v err=%v", ok, err)
+	}
+	got, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil || got == nil {
+		t.Fatalf("Get after reassign: %v %v", got, err)
+	}
+	if got.JobID != jobB {
+		t.Fatalf("after reassign = %s want %s", got.JobID, jobB)
+	}
+	if got.State != delivery.StateOffered {
+		t.Fatalf("state after reassign = %s want offered", got.State)
+	}
+	// Second transfer with stale oldJob should fail — row is now owned by jobB.
+	ok, err = deliverySvc.ReassignOfferedRequest(ctx, req.ID, jobA, jobA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("stale reassignment should not succeed")
+	}
+	stale, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil || stale == nil {
+		t.Fatalf("Get after stale reassign: %v %v", stale, err)
+	}
+	if stale.JobID != jobB {
+		t.Fatalf("row job_id after stale reassign = %s want %s", stale.JobID, jobB)
+	}
+	// Already submitted rows must not be reassigned.
+	if err := deliverySvc.UpdateState(ctx, req.ID, delivery.StateSubmitted); err != nil {
+		t.Fatal(err)
+	}
+	submitted, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil || submitted == nil || submitted.State != delivery.StateSubmitted {
+		t.Fatalf("row after UpdateState = %+v %v", submitted, err)
+	}
+	ok, err = deliverySvc.ReassignOfferedRequest(ctx, req.ID, jobA, jobB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("reassign of submitted row must not succeed")
+	}
+	again, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil || again == nil {
+		t.Fatalf("Get after submitted reassign: %v %v", again, err)
+	}
+	if again.JobID != jobB {
+		t.Fatalf("row job_id after submitted reassign = %s want %s", again.JobID, jobB)
 	}
 }

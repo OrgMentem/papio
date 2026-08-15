@@ -597,8 +597,13 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		// else could possibly succeed". The typed relations run either way.
 		// Only PROVEN exhaustion is a permit: an unreadable history must not
 		// authorize the expensive search, even though the same unknown does
-		// settle the job elsewhere.
-		exhausted, _ := s.retryBudgetExhaustedProven(ctx, row.ID)
+		// settle the job elsewhere. The error is deliberately consumed here
+		// rather than propagated — a permit that cannot be established is
+		// simply absent, and the pass continues without the search.
+		exhausted, exhaustionErr := s.retryBudgetExhaustedProven(ctx, row.ID)
+		if exhaustionErr != nil {
+			exhausted = false
+		}
 		atBoundary := plan.Temporary().IsZero() || exhausted
 		siblings, siblingPlan := s.resolveSiblings(ctx, row, atBoundary)
 		all = append(all, siblings...)
@@ -2449,6 +2454,33 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 		return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
 	}
 	if duplicate {
+		// Transfer ownership when the existing offered row is owned by a
+		// different (potentially cancelled) job. Without this RecordSubmission
+		// would check the original owner's job state and leave a provider
+		// transaction orphaned with no durable local reference.
+		if created.JobID != row.ID {
+			ok, err := s.Delivery.ReassignOfferedRequest(ctx, created.ID, row.ID, created.JobID)
+			if err != nil {
+				return created, err
+			}
+			if !ok {
+				return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
+			}
+			refreshed, err := s.Delivery.Get(ctx, created.ID)
+			if err != nil {
+				return created, err
+			}
+			if refreshed != nil {
+				created = refreshed
+			}
+			// Successfully re-owned an offered row that never reached the
+			// provider: allow the retry without requiring a prior failure
+			// classification for this new job (the row itself proves no live
+			// request exists). This is the ea626f43 fix — bypass the gate
+			// that would otherwise route an unclassified duplicate to
+			// reconciliation.
+			return s.submitToProvider(ctx, row, from, dd, key, profile, created)
+		}
 		class, classified, err := s.submissionFailureClass(ctx, row.ID, created.ID)
 		if err != nil {
 			return created, err
