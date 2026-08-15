@@ -117,3 +117,48 @@ func TestDiscover(t *testing.T) {
 		})
 	}
 }
+
+func TestDiscover_ProquestAccountID(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "fragment-only accountid is ignored",
+			raw:  "https://x.proquest.com/path#?accountid=123",
+			want: "",
+		},
+		{
+			name: "query accountid is captured",
+			raw:  "https://x.proquest.com/path?accountid=123",
+			want: "123",
+		},
+		{
+			name: "mixed-case AccountID is captured",
+			raw:  "https://x.proquest.com/path?AccountID=456",
+			want: "456",
+		},
+		{
+			name: "non-numeric accountid is rejected",
+			raw:  "https://x.proquest.com/path?accountid=abc123",
+			want: "",
+		},
+		{
+			name: "absent accountid yields empty",
+			raw:  "https://x.proquest.com/path?foo=bar",
+			want: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Discover(tc.raw)
+			if err != nil {
+				t.Fatalf("Discover(%q) error = %v", tc.raw, err)
+			}
+			if got.ProquestAccountID != tc.want {
+				t.Errorf("ProquestAccountID = %q, want %q", got.ProquestAccountID, tc.want)
+			}
+		})
+	}
+}

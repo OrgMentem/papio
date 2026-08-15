@@ -7,7 +7,6 @@ package institution
 import (
 	"fmt"
 	"net/url"
-	"regexp"
 	"strings"
 )
 
@@ -32,8 +31,6 @@ type Discovery struct {
 	Note              string
 }
 
-var accountIDPattern = regexp.MustCompile(`(?i)[?&]accountid=([0-9]+)(?:[&#]|$)`)
-
 // Discover classifies raw syntactically and, for known-safe URL shapes,
 // derives an HTTPS OpenURL resolver base. It never contacts the service.
 func Discover(raw string) (Discovery, error) {
@@ -42,8 +39,8 @@ func Discover(raw string) (Discovery, error) {
 		return Discovery{}, err
 	}
 
-	accountID := accountID(strings.TrimSpace(raw))
-	discovery := Discovery{ProquestAccountID: accountID}
+	proquestID := accountID(parsed.Query())
+	discovery := Discovery{ProquestAccountID: proquestID}
 
 	host := strings.ToLower(parsed.Hostname())
 	switch {
@@ -202,10 +199,26 @@ func baseURL(parsed *url.URL, path string, query url.Values) string {
 	return base
 }
 
-func accountID(raw string) string {
-	match := accountIDPattern.FindStringSubmatch(raw)
-	if len(match) == 2 {
-		return match[1]
+func accountID(query url.Values) string {
+	for key, values := range query {
+		if !strings.EqualFold(key, "accountid") {
+			continue
+		}
+		for _, value := range values {
+			if value == "" {
+				continue
+			}
+			allDigits := true
+			for _, ch := range value {
+				if ch < '0' || ch > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				return value
+			}
+		}
 	}
 	return ""
 }
