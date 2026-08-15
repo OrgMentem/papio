@@ -302,6 +302,46 @@ made perfectly crash-durable if the machine dies before any write succeeds. The
 **daily fuse**, not the header floor, is the crash-hard monetary invariant; the
 plan must not claim more for the floor than that.
 
+**Scope decision, measured against every configured source (live headers,
+2026-08-15).** The question is whether the guarded one-hop primitive replaces the
+shared client for OpenAlex only, or becomes the pattern every source uses. The
+providers answer it, and they do not answer it the same way for both halves of the
+mechanism:
+
+| source | live rate/budget headers | shape |
+| --- | --- | --- |
+| openalex | `x-ratelimit-limit: 1000`, `remaining: 998`, `reset`, `cost-usd`, `limit-usd`, `prepaid-remaining-usd`, `onetime-remaining` | consumable daily budget, priced per call |
+| core | `x-ratelimit-limit: 10`, `x-ratelimit-remaining: 9`, `x-ratelimit-retry-after: <absolute RFC3339>` | consumable counter with an absolute reset |
+| openaire | `x-ratelimit-used: 1`, `x-ratelimit-limit: 7199` | consumable counter, no reset published |
+| crossref (metadata/TDM) | `x-rate-limit-limit: 5`, `x-rate-limit-interval: 1s`, `x-api-pool: public-single`; with `mailto` → `10`/`1s`, `polite-single` | pure rate, no exhaustion state |
+| semanticscholar, unpaywall, europepmc, arxiv | none | nothing observable; 429 on abuse only |
+
+So:
+- **The header-derived floor does NOT generalise.** Four of ten sources publish
+ nothing to read, and Crossref publishes a *rate* with no depletable quantity — a
+ 5%-remaining floor is undefined there. It generalises to exactly **core** and
+ **openaire**, and core is the strong case: `remaining` plus an absolute reset is
+ literally this mechanism's input shape. Treat those as follow-on adopters of
+ `sourcegate.Observer`, not as part of this tranche.
+- **The pacing/identity split does not generalise either, for a simpler reason:**
+ OpenAlex is the only source with two identities in the tree. Crossref's `mailto`
+ changes its pool (`public-single` → `polite-single`, 5/s → 10/s) but *papio* never
+ falls back between the two, so identity-scope and source-scope coincide everywhere
+ else and a pacing row would be a distinction without a difference.
+- **The primitive's transport hygiene SHOULD generalise**, and cheaply: every other
+ source is configured at ≤ 2 requests/second (`openaire` at 0.016 — its documented
+ keyless ceiling is 60/hour, and note the live `limit: 7199` disagrees with that, so
+ do not tighten pacing from the header alone). At those rates a fresh
+ connection per request costs one handshake per call on a background path that is
+ already bucket-limited, and it buys the same replay-free property everywhere.
+ Adopt it as the default transport for the shared client rather than an
+ OpenAlex-only special case; keep `DisableKeepAlives` a per-source policy field so a
+ future high-rate source can opt out with evidence.
+- **Recommendation: build the primitive OpenAlex-first but not OpenAlex-shaped.**
+ Put credit accounting behind the source's own policy, so `core`/`openaire` can
+ adopt the floor later without a second mechanism, and do not let the fuse's
+ credit-unit vocabulary leak into sources whose limit is a rate.
+
 **Requirement: a capability boundary, stated as something Go can enforce.** An
 earlier draft said to make the unguarded transport "unconstructible from outside".
 That is unachievable and the review is right to reject it: `sourcegate.New` and
