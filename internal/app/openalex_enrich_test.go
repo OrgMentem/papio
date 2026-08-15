@@ -29,7 +29,7 @@ func TestOpenAlexEnrichmentSourceDisabledSkipsEntirely(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.enrich(context.Background(), row); err != nil {
+	if _, err := svc.enrich(context.Background(), row); err != nil {
 		t.Fatal(err)
 	}
 	if openAlex.calls != 0 {

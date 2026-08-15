@@ -4,6 +4,7 @@ package enrich
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -91,14 +92,25 @@ func TestEnrichRejectsISBNAmbiguityAndMissingEditionEvidence(t *testing.T) {
 		t.Fatalf("ambiguous enrichment = %+v, matched=%v, err=%v; ambiguity must be refused", enriched, matched, err)
 	}
 
-	for _, requested := range []work.Work{
-		{Title: "A Precise Study", Authors: []string{"Smith"}},
-		{Title: "A Precise Study", Year: 2024},
-		{Title: "A Precise Study", Year: 2024, Authors: []string{"Smith"}, ISBN: "9781576753484"},
+	for _, test := range []struct {
+		requested work.Work
+		// An ISBN is refused BEFORE any request, so it reports
+		// resolver.ErrNotApplicable — the caller must not charge a call that
+		// never went out. Missing year/author evidence is refused only after
+		// the search, so it stays a plain no-match.
+		wantErr error
+	}{
+		{requested: work.Work{Title: "A Precise Study", Authors: []string{"Smith"}}},
+		{requested: work.Work{Title: "A Precise Study", Year: 2024}},
+		{
+			requested: work.Work{Title: "A Precise Study", Year: 2024, Authors: []string{"Smith"}, ISBN: "9781576753484"},
+			wantErr:   resolver.ErrNotApplicable,
+		},
 	} {
-		enriched, matched, err := NewWithOptions(Options{BaseURL: server.URL}).Enrich(context.Background(), requested)
-		if err != nil || matched || enriched.DOI != "" {
-			t.Fatalf("requested=%+v enrichment=%+v matched=%v err=%v; missing/ISBN evidence must be refused", requested, enriched, matched, err)
+		enriched, matched, err := NewWithOptions(Options{BaseURL: server.URL}).Enrich(context.Background(), test.requested)
+		if !errors.Is(err, test.wantErr) || matched || enriched.DOI != "" {
+			t.Fatalf("requested=%+v enrichment=%+v matched=%v err=%v; want err %v and no promotion",
+				test.requested, enriched, matched, err, test.wantErr)
 		}
 	}
 }

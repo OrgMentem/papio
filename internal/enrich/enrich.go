@@ -78,8 +78,10 @@ func NewWithOptions(opts Options) *Enricher {
 // normalized title match with positive, equal publication year and author-family
 // evidence; ISBN work is never promoted by title rescue.
 func (e *Enricher) Enrich(ctx context.Context, requested work.Work) (work.Work, bool, error) {
+	// A pre-wire decline: no request is made, so the caller must not charge
+	// this as a performed call (resolver.ErrNotApplicable).
 	if strings.TrimSpace(requested.DOI) != "" || strings.TrimSpace(requested.ISBN) != "" || strings.TrimSpace(requested.Title) == "" {
-		return requested, false, nil
+		return requested, false, resolver.ErrNotApplicable
 	}
 	if e == nil || e.client == nil {
 		return requested, false, errors.New("enrich: HTTP client is not configured")

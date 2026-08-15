@@ -478,18 +478,46 @@ func reviewedFetchResult(binding *job.HumanActionBinding) (fetch.Result, bool) {
 	}, true
 }
 
+// acquirePolicies lists the quota identities a source may call under, in
+// preference order. Only OpenAlex has a keyless fallback tier worth using
+// (help.openalex.org/api/authentication: casual use works with no key, free);
+// other keyed sources have no comparable anonymous tier, so the fallback is
+// deliberately not generic.
+func acquirePolicies(name string, policy config.Source) []config.Source {
+	if name == config.SourceOpenAlex && strings.TrimSpace(policy.APIKey) != "" {
+		anon := policy
+		anon.APIKey = ""
+		return []config.Source{policy, anon}
+	}
+	return []config.Source{policy}
+}
+
+// anonymousIfFallback marks the adapter call when admission fell back from the
+// configured keyed identity to the keyless one, so the adapter omits its API
+// key and the request is metered against the identity that admitted it.
+func anonymousIfFallback(ctx context.Context, configured, chosen config.Source) context.Context {
+	if chosen.APIKey == "" && configured.APIKey != "" {
+		return resolver.WithAnonymousCredentials(ctx)
+	}
+	return ctx
+}
+
 func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolver.Candidate, retryPlan, error) {
 	var plan retryPlan
-	if err := s.enrichDOIWork(ctx, row); err != nil {
+	enrichDOIPlan, err := s.enrichDOIWork(ctx, row)
+	if err != nil {
 		return nil, plan, err
 	}
+	plan.merge(enrichDOIPlan)
 	if err := s.Jobs.ResetCandidates(ctx, row.ID); err != nil {
 		return nil, plan, err
 	}
 	var all []resolver.Candidate
-	if err := s.enrich(ctx, row); err != nil {
+	enrichPlan, err := s.enrich(ctx, row)
+	if err != nil {
 		return nil, plan, err
 	}
+	plan.merge(enrichPlan)
 	for _, entry := range s.Resolvers {
 		if entry.Adapter == nil {
 			continue
@@ -502,8 +530,11 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		if err != nil {
 			return nil, plan, err
 		}
+		chosen := entry.Policy
 		if s.Budgets != nil {
-			if err := s.Budgets.Acquire(ctx, name, entry.Policy, entry.EstimatedCost); err != nil {
+			var err error
+			chosen, err = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, entry.Policy), entry.EstimatedCost)
+			if err != nil {
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
 				var exceeded *budget.ErrExceeded
 				if errors.As(err, &exceeded) {
@@ -521,7 +552,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 			}
 		}
 		plan.SourcesCalled++
-		cands, err := entry.Adapter.Resolve(ctx, row.Work)
+		cands, err := entry.Adapter.Resolve(anonymousIfFallback(ctx, entry.Policy, chosen), row.Work)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, plan, ctx.Err()
@@ -531,7 +562,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 				plan.ResolverTemporary = earlierTime(plan.ResolverTemporary, sourceRetry)
 				plan.TemporaryResolvers++
 				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, name, entry.Policy, sourceRetry)
+					_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
 				}
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
 			} else {
@@ -554,7 +585,18 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 	}
 
 	if len(all) == 0 && strings.TrimSpace(row.Work.DOI) != "" {
-		siblings, siblingPlan := s.resolveSiblings(ctx, row)
+		// A pending ordinary TEMPORARY retry means the primary sources get
+		// their next attempt before the ten-credit fuzzy search is worth
+		// asking. Note what this does and does not check: a pass held back
+		// only by a durable source gate has no temporary failure, so it
+		// satisfies the first arm and the search may run even though that
+		// gated source will get another opportunity later. That is
+		// deliberate for now — it matches siblingHop's caller exactly, and
+		// the per-basis marker bounds it to one search per question — but
+		// "necessary" here means "no ordinary retry is pending", not "nothing
+		// else could possibly succeed". The typed relations run either way.
+		atBoundary := plan.Temporary().IsZero() || s.retryBudgetExhausted(ctx, row.ID)
+		siblings, siblingPlan := s.resolveSiblings(ctx, row, atBoundary)
 		all = append(all, siblings...)
 		plan.merge(siblingPlan)
 	}
@@ -770,7 +812,9 @@ func (s *Service) siblingHop(ctx context.Context, row *job.Row, live map[string]
 	if strings.TrimSpace(row.Work.DOI) == "" {
 		return false
 	}
-	cands, siblingPlan := s.resolveSiblings(ctx, row)
+	// This hop only ever runs at the fetch-exhaustion boundary — its caller
+	// resolves endsHere before calling — so necessity is already established.
+	cands, siblingPlan := s.resolveSiblings(ctx, row, true)
 	plan.merge(siblingPlan)
 	if len(cands) == 0 {
 		return false
@@ -812,10 +856,35 @@ type VersionRelations interface {
 // matching happened in the fuzzy adapter, and PDF semantic-identity
 // validation against row.Work remains the acceptance gate either way.
 // Errors never fail resolution — the hop must not make an acquisition worse.
-func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver.Candidate, retryPlan) {
+func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary bool) ([]resolver.Candidate, retryPlan) {
 	typed, plan := s.typedSiblings(ctx, row)
 	if len(typed) > 0 {
 		return typed, plan
+	}
+	// Everything below is the fuzzy title search, and it is the most expensive
+	// request papio makes: OpenAlex prices a singleton entity GET at one credit
+	// and a search at ten. Measured over one day of real traffic, 304 of these
+	// ran, 280 returned nothing, and they accounted for ~90% of the daily
+	// spend. So it runs only when it is both NECESSARY and NOVEL.
+	//
+	// Necessary: the primary candidates have no ordinary retry left to take.
+	// This mirrors siblingHop's caller, whose rule is that a pending temporary
+	// retry deserves the next attempt before a sibling hop pre-empts it; the
+	// resolve() path never applied it and paid ten credits per pass while an
+	// unrelated source's 503 was still clearing.
+	//
+	// Novel: this job has not already completed one successful search for the
+	// same bibliographic basis. A search that returned zero candidates is a
+	// fact about the provider's index, not a transient failure, and re-asking
+	// the identical question cannot produce a different answer until the
+	// question changes. A transport failure records nothing, so it stays
+	// retryable.
+	if !atBoundary {
+		return nil, plan
+	}
+	basis := siblingSearchBasis(row.Work)
+	if s.siblingSearchRecorded(ctx, row.ID, basis) {
+		return nil, plan
 	}
 	for _, entry := range s.Resolvers {
 		sibling, ok := entry.Adapter.(SiblingResolver)
@@ -832,18 +901,29 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver
 		if err != nil {
 			return nil, plan
 		}
+		chosen := entry.Policy
 		if s.Budgets != nil {
-			if err := s.Budgets.Acquire(ctx, name, entry.Policy, entry.EstimatedCost); err != nil {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+			var acquireErr error
+			chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, entry.Policy), entry.EstimatedCost)
+			if acquireErr != nil {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
 				var deferred *budget.ErrDeferred
-				if errors.As(err, &deferred) {
+				if errors.As(acquireErr, &deferred) {
 					plan.recordDeferral(deferred)
 				}
 				continue
 			}
 		}
+		cands, err := sibling.ResolveSiblings(anonymousIfFallback(ctx, entry.Policy, chosen), row.Work)
+		// A sibling lookup can legitimately make no request at all: with no
+		// cached canonical record and no caller-supplied title there is
+		// nothing to search on. Charging that would spend a retry attempt on
+		// a pass where this source cost nothing.
+		if errors.Is(err, resolver.ErrNoSearchBasis) {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_search_basis")
+			continue
+		}
 		plan.SourcesCalled++
-		cands, err := sibling.ResolveSiblings(ctx, row.Work)
 		if err != nil {
 			// A rate-limited sibling lookup is not a verdict. Recording it as
 			// a plain failure let a 429 here settle the whole job unavailable,
@@ -854,7 +934,7 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver
 				plan.ResolverTemporary = earlierTime(plan.ResolverTemporary, sourceRetry)
 				plan.TemporaryResolvers++
 				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, name, entry.Policy, sourceRetry)
+					_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
 				}
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
 				continue
@@ -870,11 +950,92 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row) ([]resolver
 			valid = append(valid, c)
 		}
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("sibling_candidates=%d", len(valid)))
+		// The provider answered, so this basis is now known-searched whatever
+		// it returned. Recorded before the candidate check so a zero-result
+		// search — the expensive common case — is the one that gets
+		// suppressed next pass.
+		s.recordSiblingSearch(ctx, row.ID, basis)
 		if len(valid) > 0 {
 			return valid, plan
 		}
 	}
 	return nil, plan
+}
+
+// siblingSearchEventKind durably records that one fuzzy sibling search already
+// completed for a given bibliographic basis, so a later pass does not pay for
+// the identical question. Like oaBrowserHintEventKind, it carries no URL and
+// is read back through the job's own event stream.
+const siblingSearchEventKind = "job.sibling_search"
+
+// siblingSearchBasis names the question a fuzzy search asks: the identifiers
+// and bibliography it searches on. It uses the acquisition-side,
+// version-preserving DOI normalization — v2 is a different work to acquire
+// than v1, so it is also a different question to ask — and never the
+// ownership-side collapsing form. Enrichment that materially changes the
+// title, year, or authors changes the basis, which correctly buys one new
+// search.
+func siblingSearchBasis(w work.Work) string {
+	doi := strings.TrimSpace(w.DOI)
+	if normalized, err := work.NormalizeDOI(doi); err == nil {
+		doi = normalized
+	}
+	authors := make([]string, 0, len(w.Authors))
+	for _, author := range w.Authors {
+		if trimmed := strings.ToLower(strings.TrimSpace(author)); trimmed != "" {
+			authors = append(authors, trimmed)
+		}
+	}
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		doi,
+		strings.ToLower(strings.Join(strings.Fields(w.Title), " ")),
+		strconv.Itoa(w.Year),
+		strings.Join(authors, "|"),
+	}, "\x00")))
+	return hex.EncodeToString(sum[:8])
+}
+
+// siblingSearchRecorded reports whether this job already completed a fuzzy
+// search for this basis. It fails CLOSED in every direction it can: skipping a
+// ten-credit query papio cannot prove it needs is the cheap error, and the free
+// typed relations above it still run.
+//
+// "Every direction" includes an unreadable detail, which is not hypothetical:
+// Jobs.Events decodes each detail with `_ = json.Unmarshal(...)` and yields a
+// nil map on failure, so a truncated or corrupt row would otherwise leave
+// basis "" — matching nothing, buying the search again, and doing it precisely
+// when storage is already misbehaving. A marker of the right kind is proof a
+// search happened; only a marker whose basis is legible and different is
+// evidence that this particular question is new.
+func (s *Service) siblingSearchRecorded(ctx context.Context, jobID, basis string) bool {
+	events, err := s.Jobs.Events(ctx, jobID)
+	if err != nil {
+		return true
+	}
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != siblingSearchEventKind {
+			continue
+		}
+		detail, ok := event["detail"].(map[string]any)
+		if !ok {
+			return true
+		}
+		recorded, ok := detail["basis"].(string)
+		if !ok || recorded == "" || recorded == basis {
+			return true
+		}
+	}
+	return false
+}
+
+// recordSiblingSearch persists the basis just searched. A failure to record is
+// logged and tolerated: the search already happened, and the only consequence
+// is that a later pass may pay for it again.
+func (s *Service) recordSiblingSearch(ctx context.Context, jobID, basis string) {
+	if err := s.Jobs.RecordEvent(context.WithoutCancel(ctx), jobID, siblingSearchEventKind,
+		map[string]any{"basis": basis}); err != nil {
+		log.Printf("papio: record sibling search basis for job %s: %v", jobID, err)
+	}
 }
 
 // typedSiblings follows Crossref's typed version relations (has-preprint,
@@ -899,11 +1060,14 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 	if err != nil {
 		return nil, plan
 	}
+	chosen := policy
 	if s.Budgets != nil {
-		if err := s.Budgets.Acquire(ctx, name, policy, 0); err != nil {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+		var acquireErr error
+		chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, policy), 0)
+		if acquireErr != nil {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
 			var deferred *budget.ErrDeferred
-			if errors.As(err, &deferred) {
+			if errors.As(acquireErr, &deferred) {
 				plan.recordDeferral(deferred)
 			}
 			return nil, plan
@@ -917,7 +1081,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 			plan.ResolverTemporary = earlierTime(plan.ResolverTemporary, sourceRetry)
 			plan.TemporaryResolvers++
 			if s.Budgets != nil {
-				_ = s.Budgets.Defer(ctx, name, policy, sourceRetry)
+				_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
 			}
 			_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
 			return nil, plan
@@ -949,20 +1113,23 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 			// request and one estimated-cost unit atomically, so acquiring
 			// once for up to three sibling lookups would under-throttle the
 			// provider and under-charge a paid source's monthly cap.
+			sibChosen := entry.Policy
 			if s.Budgets != nil {
-				if err := s.Budgets.Acquire(ctx, rname, entry.Policy, entry.EstimatedCost); err != nil {
+				var acquireErr error
+				sibChosen, acquireErr = s.Budgets.AcquireAny(ctx, rname, acquirePolicies(rname, entry.Policy), entry.EstimatedCost)
+				if acquireErr != nil {
 					var deferred *budget.ErrDeferred
-					if errors.As(err, &deferred) {
+					if errors.As(acquireErr, &deferred) {
 						plan.recordDeferral(deferred)
 					}
 					if valid == 0 {
-						outcome, detail = "budget_blocked", safeType(err)
+						outcome, detail = "budget_blocked", safeType(acquireErr)
 					}
 					break
 				}
 			}
 			plan.SourcesCalled++
-			cands, err := entry.Adapter.Resolve(ctx, work.Work{DOI: sib})
+			cands, err := entry.Adapter.Resolve(anonymousIfFallback(ctx, entry.Policy, sibChosen), work.Work{DOI: sib})
 			if err != nil {
 				if ctx.Err() != nil {
 					if valid > 0 {
@@ -977,7 +1144,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 					plan.ResolverTemporary = earlierTime(plan.ResolverTemporary, sourceRetry)
 					plan.TemporaryResolvers++
 					if s.Budgets != nil {
-						_ = s.Budgets.Defer(ctx, rname, entry.Policy, sourceRetry)
+						_ = s.Budgets.Defer(ctx, rname, sibChosen, sourceRetry)
 					}
 					outcome, detail = "retryable", safeType(err)
 				} else {
@@ -1018,19 +1185,42 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 	return all, plan
 }
 
-func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) error {
+// enrichDOIWork fills a DOI-only work's bibliography from the discovery
+// backend. It returns a retryPlan because that lookup is a real, budgeted
+// provider request: a pass whose only outbound call was this one must still be
+// charged against the bounded retry budget, or a job that keeps failing later
+// re-runs it every cycle for free. Enrichment never fails the job.
+func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) (retryPlan, error) {
+	var plan retryPlan
 	if s.Discovery == nil || strings.TrimSpace(row.Work.Title) != "" || strings.TrimSpace(row.Work.DOI) == "" {
-		return nil
+		return plan, nil
+	}
+	if _, normErr := work.NormalizeDOI(row.Work.DOI); normErr != nil {
+		return plan, nil // invalid DOI: LookupWork would reject it pre-wire; skip the call entirely
 	}
 	discovered, err := s.Discovery.LookupWork(ctx, row.Work.DOI)
+	var exceeded *budget.ErrExceeded
+	var deferred *budget.ErrDeferred
+	if errors.As(err, &exceeded) || errors.As(err, &deferred) {
+		if deferred != nil {
+			plan.recordDeferral(deferred)
+		}
+		return plan, nil // admission refused inside sourcegate.Client: no request was made
+	}
+	plan.SourcesCalled++ // admission passed: the request reached the wire (the rare
+	// pre-wire seedURL-construction failure is charged too — bounded over-charge,
+	// vs. a post-wire 404/decode failure going uncharged, which is unbounded)
 	if err != nil {
-		return nil
+		return plan, nil // post-wire failure; enrichment never fails the job
 	}
 	changed, err := s.Jobs.EnrichWorkRequestMetadata(
 		ctx, row.WorkRequestID, discovered.Work.Title, discovered.Work.Authors, discovered.Work.Year,
 	)
-	if err != nil || !changed {
-		return err
+	if err != nil {
+		return plan, err
+	}
+	if !changed {
+		return plan, nil
 	}
 	if strings.TrimSpace(row.Work.Title) == "" {
 		row.Work.Title = discovered.Work.Title
@@ -1041,7 +1231,7 @@ func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) error {
 	if row.Work.Year == 0 {
 		row.Work.Year = discovered.Work.Year
 	}
-	return nil
+	return plan, nil
 }
 
 func (s *Service) metadataEnricherEntries() []MetadataEnricherEntry {
@@ -1058,9 +1248,18 @@ func (s *Service) metadataEnricherEntries() []MetadataEnricherEntry {
 	}}
 }
 
-func (s *Service) enrich(ctx context.Context, row *job.Row) error {
+// enrich runs the metadata enrichers over a title-only work. It returns a
+// retryPlan because each enricher call is a real, budgeted provider request —
+// an OpenAlex title search is the most expensive request shape papio makes —
+// and a pass that spent one must be charged against the bounded retry budget
+// even when it found nothing. Only an identified PRE-WIRE decline
+// (resolver.ErrNotApplicable, or admission refused before the adapter ran) is
+// exempt: undercharging a request that actually went out lets a mixed pass
+// classify source_gate and loop forever, spending real credits every cycle.
+func (s *Service) enrich(ctx context.Context, row *job.Row) (retryPlan, error) {
+	var plan retryPlan
 	if strings.TrimSpace(row.Work.Title) == "" {
-		return nil
+		return plan, nil
 	}
 	for _, entry := range s.metadataEnricherEntries() {
 		if entry.Enricher == nil || row.Work.HasFetchableIdentifier() {
@@ -1076,29 +1275,45 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) error {
 		}
 		attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
 		if err != nil {
-			return err
+			return plan, err
 		}
+		chosen := policy
 		if s.Budgets != nil {
-			if err := s.Budgets.Acquire(ctx, name, policy, 0); err != nil {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+			var acquireErr error
+			chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, policy), 0)
+			if acquireErr != nil {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
 				// An optional source that is spent or gated must not prevent a
 				// later metadata source from attempting this same pass.
 				var exceeded *budget.ErrExceeded
 				var deferred *budget.ErrDeferred
-				if errors.As(err, &exceeded) || errors.As(err, &deferred) {
+				if errors.As(acquireErr, &exceeded) || errors.As(acquireErr, &deferred) {
+					if deferred != nil {
+						plan.recordDeferral(deferred)
+					}
 					continue
 				}
-				return err
+				return plan, acquireErr
 			}
 		}
-		enriched, matched, err := entry.Enricher.Enrich(ctx, row.Work)
+		enriched, matched, err := entry.Enricher.Enrich(anonymousIfFallback(ctx, policy, chosen), row.Work)
+		if errors.Is(err, resolver.ErrNotApplicable) {
+			// The enricher declined before making any request: nothing was
+			// spent, so nothing is charged. Same silent skip as a no-op.
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "not_applicable")
+			continue
+		}
+		plan.SourcesCalled++
 		if err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return plan, ctx.Err()
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
+				sourceRetry := earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay)
+				plan.ResolverTemporary = earlierTime(plan.ResolverTemporary, sourceRetry)
+				plan.TemporaryResolvers++
 				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, name, policy, earlierRetry(time.Time{}, s.Now(), delay, s.RetryDelay))
+					_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
 				}
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
 			} else {
@@ -1118,7 +1333,7 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) error {
 		}
 		updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, enriched)
 		if err != nil {
-			return err
+			return plan, err
 		}
 		row.Work = updated.Work
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched")
@@ -1128,7 +1343,7 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) error {
 		// request has no canonical key.
 		_, _ = s.Jobs.RecordDuplicateWork(ctx, row.ID, row.Work)
 	}
-	return nil
+	return plan, nil
 }
 
 // oaBrowserHintEventKind durably records — without the bearer URL — that some
@@ -1480,7 +1695,7 @@ func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, p
 		// Only the gate still justifies waiting. Waking at the shorter
 		// temporary time would re-claim, find the budget still spent, and
 		// park again — a spin at the temporary interval until the gate opens.
-		at, kind = plan.Gate, retryKindExhaustedGate
+		at, kind = plan.LatestGate, retryKindExhaustedGate
 	}
 	if at.IsZero() || !at.After(now) {
 		// Either the gate elapsed while the rest of the pass ran, or nothing
@@ -1508,12 +1723,15 @@ func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, p
 
 // retryCutoverDecision classifies only facts observed in the current resolver
 // and fetch pass. A mixed temporary failure plus source gate is still a
-// transient retry: source_gate_only is reserved for the strict case where no
-// callable source made a request.
+// transient retry, and so is a pass that reached any source at all:
+// source_gate_only is reserved for the strict case where no callable source
+// made a request. The SourcesCalled condition keeps this in agreement with
+// retryPlan.Kind — otherwise the same transition would persist
+// retry_kind: temporary beside a source_gate_only diagnosis.
 func retryCutoverDecision(plan retryPlan) job.InstitutionCutoverDecision {
 	blocker := job.InstitutionCutoverBlockerNone
 	switch {
-	case !plan.Temporary().IsZero() || plan.RetryableCandidates > 0 || plan.TemporaryResolvers > 0:
+	case !plan.Temporary().IsZero() || plan.RetryableCandidates > 0 || plan.TemporaryResolvers > 0 || plan.SourcesCalled > 0:
 		blocker = job.InstitutionCutoverBlockerTransientRetryRemaining
 	case plan.ClosedSourceGates > 0 || !plan.Gate.IsZero():
 		blocker = job.InstitutionCutoverBlockerSourceGateOnly
@@ -1619,13 +1837,20 @@ const maxRetryAttempts = 8
 // bucket did). Charging either would settle a job "temporary source failures
 // did not clear" about sources papio never called. Events written before
 // those discriminators existed carry no retry_kind and are counted, which
-// preserves the original bound for existing jobs. A read error never
-// escalates: best-effort maintenance prefers another retry to falsely giving
-// up on a job.
+// preserves the original bound for existing jobs.
+//
+// An unreadable history fails CLOSED. This function is the only bound on
+// provider spend for a job whose candidates are all dead, so treating "I
+// cannot prove any budget remains" as "budget remains" makes the bound
+// unenforceable by construction: a persistently failing Events read authorizes
+// unlimited paid passes. Its sibling alreadyWaitedPastExhaustion has always
+// failed closed for the same reason, and the cost of being wrong here is one
+// job settling early — recoverable with `papio jobs retry` — against a
+// provider quota that is not recoverable until the next reset.
 func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
 	events, err := s.Jobs.Events(ctx, jobID)
 	if err != nil {
-		return false
+		return true
 	}
 	n := 0
 	for _, event := range events {
@@ -3028,6 +3253,12 @@ type retryPlan struct {
 	CandidateTemporary time.Time // a candidate fetch failed retryably
 	ResolverTemporary  time.Time // a resolver/sibling source failed retryably
 	Gate               time.Time // a durable source gate was closed; no request was made
+	// LatestGate is the LATEST durable source gate observed this pass (Gate is
+	// the earliest, used for scheduling At()). When the retry budget is spent,
+	// the job gets exactly one more wait (parkForRetry, retryKindExhaustedGate)
+	// — that wait, and the decision to grant it at all, must be driven by
+	// whichever gated source has the longest reset, not the shortest.
+	LatestGate time.Time
 	// Advisory is this process's own token bucket turning a request away.
 	// It is deliberately NOT a wake time: it is at most budget.MaxInlineWait
 	// out, so scheduling on it wakes the job seconds later to re-run every
@@ -3061,6 +3292,7 @@ func (p *retryPlan) merge(other retryPlan) {
 	p.CandidateTemporary = earlierTime(p.CandidateTemporary, other.CandidateTemporary)
 	p.ResolverTemporary = earlierTime(p.ResolverTemporary, other.ResolverTemporary)
 	p.Gate = earlierTime(p.Gate, other.Gate)
+	p.LatestGate = laterTime(p.LatestGate, other.LatestGate)
 	p.Advisory = earlierTime(p.Advisory, other.Advisory)
 	p.RetryableCandidates += other.RetryableCandidates
 	p.TemporaryResolvers += other.TemporaryResolvers
@@ -3082,6 +3314,7 @@ func (p *retryPlan) recordDeferral(deferred *budget.ErrDeferred) {
 		return
 	}
 	p.Gate = earlierTime(p.Gate, deferred.Until)
+	p.LatestGate = laterTime(p.LatestGate, deferred.Until)
 	p.ClosedSourceGates++
 }
 
@@ -3106,10 +3339,18 @@ func (p retryPlan) AdvisoryOnly() bool {
 func (p retryPlan) IsZero() bool { return p.At().IsZero() && p.AdvisoryBackoffs == 0 }
 
 // Kind names why the pass ended with no verdict. source_gate means a durable
-// gate held a source back; advisory means only this process's own throttle
-// did. Both made no request, so neither is charged against the retry budget;
-// they stay distinct so the durable log says which one it was.
+// gate held every callable source back and NOTHING was called this pass;
+// advisory means only this process's own throttle did. Neither made a request,
+// so neither is charged against the retry budget; they stay distinct so the
+// durable log says which one it was. A pass that reached at least one source is
+// chargeable even if another source was also gated: a job whose candidates are
+// all permanently dead otherwise re-runs the whole resolver chain forever,
+// spending real provider credits on every uncharged cycle, because some
+// unrelated source happened to be gated in the same pass.
 func (p retryPlan) Kind() string {
+	if p.SourcesCalled > 0 {
+		return retryKindTemporary
+	}
 	if !p.Temporary().IsZero() {
 		return retryKindTemporary
 	}
@@ -3125,14 +3366,27 @@ func (p retryPlan) Kind() string {
 // GatePending reports a durable source gate that has not yet elapsed. At the
 // retry exhaustion boundary this outranks a terminal verdict: the bounded
 // attempts are spent, but the gated source still deserves the one call it
-// never got. An advisory throttle is deliberately excluded — it is this
-// process's own backoff, not a source withholding access.
+// never got. It reads LatestGate, not Gate: when several sources are gated for
+// different durations, the one wait past exhaustion must be long enough for
+// the slowest of them, or that source still never gets its call. An advisory
+// throttle is deliberately excluded — it is this process's own backoff, not a
+// source withholding access.
 func (p retryPlan) GatePending(now time.Time) bool {
-	return !p.Gate.IsZero() && p.Gate.After(now)
+	return !p.LatestGate.IsZero() && p.LatestGate.After(now)
 }
 
 func earlierTime(current, candidate time.Time) time.Time {
 	if current.IsZero() || (!candidate.IsZero() && candidate.Before(current)) {
+		return candidate
+	}
+	return current
+}
+
+func laterTime(current, candidate time.Time) time.Time {
+	if candidate.IsZero() {
+		return current
+	}
+	if current.IsZero() || candidate.After(current) {
 		return candidate
 	}
 	return current

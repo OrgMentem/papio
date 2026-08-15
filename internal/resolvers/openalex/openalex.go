@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -25,6 +26,11 @@ const (
 	defaultBaseURL        = "https://api.openalex.org/works"
 	defaultMaxBody        = int64(1 << 20)
 	defaultSearchPageSize = 10
+	// workSelectFields bounds every works response to the fields this adapter
+	// actually reads. OpenAlex supports select on the singleton endpoint as
+	// well as on searches, and a full work record is an order of magnitude
+	// larger than the parts used here.
+	workSelectFields = "id,doi,ids,title,publication_year,authorships,open_access,best_oa_location,locations"
 )
 
 // HTTPClient is the injected HTTP dependency used to call OpenAlex.
@@ -50,7 +56,23 @@ type Resolver struct {
 	apiKey  string
 	baseURL string
 	maxBody int64
+
+	// records memoizes DOI singleton lookups so the sibling hop can reuse the
+	// canonical record a preceding Resolve already paid for instead of GETting
+	// it again. It holds metadata for title/year/author matching only — never a
+	// candidate URL — so a stale entry carries no dead-link risk.
+	mu      sync.Mutex
+	records map[string]recordMemo
 }
+
+type recordMemo struct {
+	record workRecord
+	found  bool
+	at     time.Time
+}
+
+const recordMemoTTL = 2 * time.Minute
+const recordMemoCap = 512
 
 var _ resolver.Resolver = (*Resolver)(nil)
 
@@ -77,6 +99,7 @@ func NewWithOptions(opts Options) *Resolver {
 	return &Resolver{
 		client: opts.Client, email: strings.TrimSpace(opts.ContactEmail),
 		apiKey: strings.TrimSpace(opts.APIKey), baseURL: baseURL, maxBody: maxBody,
+		records: make(map[string]recordMemo),
 	}
 }
 
@@ -94,16 +117,34 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		return nil, errors.New("openalex: contact email is required; configure an address for the OpenAlex polite pool")
 	}
 
-	endpoint, lookup, search, err := r.lookupURL(requested)
+	anon := resolver.AnonymousCredentials(ctx)
+	endpoint, lookup, search, err := r.lookupURL(requested, anon)
 	if err != nil {
 		return nil, err
 	}
 	if lookup == "" {
 		return nil, nil
 	}
+	// memoDOI is the normalized DOI this lookup keyed on, when it keyed on one.
+	// lookupURL does not expose it, and it cannot fail here — lookupURL already
+	// validated the same input — but the error is checked before any memo write.
+	memoDOI := ""
+	if lookup == "doi" {
+		if doi, doiErr := work.NormalizeDOI(requested.DOI); doiErr == nil {
+			memoDOI = doi
+		}
+	}
 	body, err := r.fetch(ctx, endpoint)
-	if err != nil || body == nil {
+	if err != nil {
 		return nil, err
+	}
+	if body == nil {
+		// A 404 is a durable answer about this DOI: remember the absence so a
+		// sibling hop in the same pass does not re-ask.
+		if memoDOI != "" {
+			r.writeMemo(memoDOI, workRecord{}, false)
+		}
+		return nil, nil
 	}
 	defer func() { _ = body.Close() }()
 
@@ -125,6 +166,10 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		}
 	} else if err := decodeBoundedJSON(body, r.maxBody, &record); err != nil {
 		return nil, fmt.Errorf("openalex: invalid response: %w", err)
+	} else if memoDOI != "" {
+		// Written before OA/candidate filtering: a paywalled record still
+		// carries the authoritative bibliography sibling matching needs.
+		r.writeMemo(memoDOI, record, true)
 	}
 
 	if !record.isOpenAccess() {
@@ -161,7 +206,11 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 	return []resolver.Candidate{candidate}, nil
 }
 
-func (r *Resolver) lookupURL(requested work.Work) (*url.URL, string, bool, error) {
+// lookupURL builds the works endpoint for whichever identifier the work
+// carries. anon omits the configured API key: the keyed identity's own
+// daily-quota signal has sent this call to OpenAlex's keyless tier, which is a
+// separate identity with its own budget.
+func (r *Resolver) lookupURL(requested work.Work, anon bool) (*url.URL, string, bool, error) {
 	base, err := url.Parse(r.baseURL)
 	if err != nil || !validHTTPURL(base.String()) {
 		return nil, "", false, errors.New("openalex: invalid endpoint configuration")
@@ -197,7 +246,13 @@ func (r *Resolver) lookupURL(requested work.Work) (*url.URL, string, bool, error
 	}
 	query := base.Query()
 	query.Set("mailto", r.email)
-	if r.apiKey != "" {
+	query.Set("select", workSelectFields)
+	// Unconditional Del before the key is re-applied: a dev base URL may carry
+	// its own api_key, and an "anonymous" request that silently stayed keyed
+	// would be metered against the wrong identity by both the observer and the
+	// budget manager.
+	query.Del("api_key")
+	if r.apiKey != "" && !anon {
 		query.Set("api_key", r.apiKey)
 	}
 	base.RawQuery = query.Encode()
@@ -253,10 +308,11 @@ const maxSiblingCandidates = 3
 
 // ResolveSiblings finds open-access sibling versions (preprints, repository
 // copies under a different DOI) of a work whose canonical identifier yielded
-// no OA candidates. It fetches the canonical record even when it is not open
-// access — the record supplies the authoritative title/year/authors used for
-// strict sibling matching — then runs one title search. Max two OpenAlex
-// requests.
+// no OA candidates. At most one OpenAlex request (the title search); the
+// canonical record, when needed for matching, is reused from a preceding
+// same-DOI Resolve call (TTL-fresh) or falls back to the requested work's own
+// metadata — never fetched here. With neither, returns
+// resolver.ErrNoSearchBasis without any request.
 func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]resolver.Candidate, error) {
 	if r.client == nil || r.email == "" {
 		return nil, nil
@@ -265,26 +321,19 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 	if err != nil {
 		return nil, nil
 	}
+	anon := resolver.AnonymousCredentials(ctx)
 	canonical := work.Work{Title: requested.Title, Year: requested.Year, Authors: requested.Authors}
-	if endpoint, lookup, _, err := r.lookupURL(work.Work{DOI: canonicalDOI}); err == nil && lookup != "" {
-		body, err := r.fetch(ctx, endpoint)
-		if err != nil {
-			return nil, err
-		}
-		if body != nil {
-			var record workRecord
-			decodeErr := decodeBoundedJSON(body, r.maxBody, &record)
-			_ = body.Close()
-			if decodeErr == nil {
-				canonical = resolvedWork(record)
-			}
-		}
+	if record, ok := r.recordFor(canonicalDOI); ok {
+		canonical = resolvedWork(record)
 	}
 	if strings.TrimSpace(canonical.Title) == "" {
-		return nil, nil
+		// Zero requests were made, and the caller must not charge one: with no
+		// memoized record and no caller-supplied title there is nothing to
+		// search on.
+		return nil, resolver.ErrNoSearchBasis
 	}
 
-	endpoint, lookup, _, err := r.lookupURL(work.Work{Title: canonical.Title})
+	endpoint, lookup, _, err := r.lookupURL(work.Work{Title: canonical.Title}, anon)
 	if err != nil || lookup == "" {
 		return nil, err
 	}
@@ -355,6 +404,41 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 	return candidates, nil
 }
 
+// writeMemo records what a DOI singleton lookup learned, so a sibling hop in
+// the same pass can match against it without paying for the record again. A
+// full map is dropped wholesale rather than scanned for the oldest entry:
+// entries are cheap to re-earn and the cap exists only to bound memory.
+func (r *Resolver) writeMemo(doi string, record workRecord, found bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.records == nil {
+		r.records = make(map[string]recordMemo)
+	}
+	if len(r.records) >= recordMemoCap {
+		r.records = make(map[string]recordMemo)
+	}
+	r.records["doi:"+doi] = recordMemo{record: record, found: found, at: time.Now()}
+}
+
+// recordFor returns a record written by a preceding Resolve call for the same
+// DOI, if one is fresh (< recordMemoTTL). It never fetches: on a miss,
+// ResolveSiblings falls back to the caller-supplied title/year/authors, exactly
+// like a malformed canonical response already did. The record is only ever used
+// for title/year/author matching, never to (re)construct a fetchable candidate
+// URL — ResolveSiblings' own candidates always come from a live, unmemoized
+// search response — so a stale entry carries no dead-URL risk; it is a
+// TTL-fresh metadata memo, resolver-wide and cross-pass by construction, not a
+// pass-scoped structure.
+func (r *Resolver) recordFor(doi string) (workRecord, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.records["doi:"+doi]
+	if !ok || time.Since(entry.at) > recordMemoTTL || !entry.found {
+		return workRecord{}, false
+	}
+	return entry.record, true
+}
+
 // normalizeSiblingTitle compares titles across publisher/preprint records,
 // which frequently disagree on punctuation and dashes ("Trust: A Study" vs
 // "Trust — A Study"). Non-alphanumeric runs collapse to single spaces. This
@@ -405,7 +489,6 @@ type workRecord struct {
 	Title           string       `json:"title"`
 	PublicationYear int          `json:"publication_year"`
 	Authorships     []authorship `json:"authorships"`
-	IsOA            bool         `json:"is_oa"`
 	OpenAccess      *openAccess  `json:"open_access"`
 	BestOALocation  *location    `json:"best_oa_location"`
 	Locations       []location   `json:"locations"`

@@ -90,6 +90,32 @@ func Temporary(err error) (time.Duration, bool) {
 	return 0, false
 }
 
+// ErrNoSearchBasis reports a sibling lookup that made no request at all:
+// the adapter had neither a cached canonical record nor caller-supplied
+// metadata to search on. Callers must not charge it as a performed call.
+var ErrNoSearchBasis = errors.New("resolver: sibling lookup has no title to search on")
+
+// ErrNotApplicable reports an enricher that declined before making any
+// request: the work is outside what it can act on (wrong identifiers,
+// missing metadata). Callers must not charge it as a performed call.
+var ErrNotApplicable = errors.New("resolver: enricher not applicable to this work")
+
+type anonymousCredentialsKey struct{}
+
+// WithAnonymousCredentials marks a call that must reach the provider without
+// the configured API key: the keyed identity's own daily-quota signal says it
+// is spent, and the keyless tier is a separate, separately-budgeted identity.
+// Adapters read it once per entry point and thread it to URL construction.
+func WithAnonymousCredentials(ctx context.Context) context.Context {
+	return context.WithValue(ctx, anonymousCredentialsKey{}, true)
+}
+
+// AnonymousCredentials reports whether this call must omit its API key.
+func AnonymousCredentials(ctx context.Context) bool {
+	v, _ := ctx.Value(anonymousCredentialsKey{}).(bool)
+	return v
+}
+
 // accessRank orders access bases: OA first, then licensed APIs, then
 // institutional, then manual (stack plan resolver order).
 var accessRank = map[string]int{

@@ -110,9 +110,20 @@ type tokenBucket struct {
 	last   time.Time
 }
 
+// Option configures a Manager at construction.
+type Option func(*Manager)
+
+// WithNow overrides the manager's clock; pair it with the same fake clock
+// driving Service.Now in tests that advance time across passes.
+func WithNow(now func() time.Time) Option { return func(m *Manager) { m.now = now } }
+
 // New binds a manager to the papio store.
-func New(s *store.Store) *Manager {
-	return &Manager{db: s.DB(), limiters: make(map[string]*tokenBucket), now: time.Now}
+func New(s *store.Store, opts ...Option) *Manager {
+	m := &Manager{db: s.DB(), limiters: make(map[string]*tokenBucket), now: time.Now}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // identityFor names the provider account a call is made under. A provider
@@ -184,6 +195,71 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 		return err
 	}
 	return m.reserve(ctx, source, identity, policy.MaxCostUSD, estimatedCost)
+}
+
+// AcquireAny admits the first policy, in order, whose own "<source>_quota"
+// signal (sourcegate.Observer) does not say its daily quota is exhausted. The
+// quota check runs BEFORE the ordinary per-source Acquire for every policy,
+// including the last: a policy whose own quota is gated is never given a real
+// admission attempt, so it can neither spend a real request proving what its
+// own header already said, nor silently accept an ordinary rate/retry state
+// that has nothing to do with quota.
+//
+// An ordinary (non-quota) Acquire failure on the policy actually attempted —
+// advisory (this process's own token bucket) or a durable retry/backoff gate
+// under the bare source name — is returned as-is and NEVER advances to the
+// next policy: only the identity's own reported quota exhaustion authorizes a
+// credential switch.
+//
+// For the last policy, a quota-gated identity has nowhere left to fall back
+// to: rather than spend a real request against an identity whose own quota
+// signal already says no, a synthetic *ErrDeferred naming that identity's
+// quota-reopen instant is returned.
+//
+// quotaGate's snapshot and the subsequent Acquire are deliberately NOT one
+// atomic step. An Observer's Defer of a "_quota" row can commit between them,
+// which admits at most one already-in-flight request per worker after the gate
+// lands; the very next AcquireAny sees it. Serializing the pair under a
+// manager-wide mutex would stall every worker's admission behind one Acquire
+// sleeping up to MaxInlineWait on an inline gate wait, and the floor fires
+// with budget to spare precisely so a handful of stragglers are absorbed. The
+// guarantee is "no new admission once the gate is visible", not "zero requests
+// after the header was received".
+func (m *Manager) AcquireAny(ctx context.Context, source string, policies []config.Source, estimatedCost float64) (config.Source, error) {
+	if len(policies) == 0 {
+		return config.Source{}, errors.New("no policies supplied")
+	}
+	for i, policy := range policies {
+		until, err := m.quotaGate(ctx, source, policy)
+		if err != nil {
+			// Fail closed on the read itself: an unverifiable quota signal
+			// authorizes neither continuing to spend this identity nor
+			// switching credentials on unverified grounds.
+			return config.Source{}, err
+		}
+		if until != nil {
+			if i < len(policies)-1 {
+				continue
+			}
+			return policy, &ErrDeferred{Source: source, Identity: identityFor(policy), Until: *until}
+		}
+		return policy, m.Acquire(ctx, source, policy, estimatedCost)
+	}
+	return config.Source{}, errors.New("acquireany: unreachable, all policies skipped")
+}
+
+// quotaGate reports the "<source>_quota" gate instant for policy's identity,
+// if one is currently active — the signal sourcegate.Observer writes from the
+// provider's own daily-budget headers. nil, nil means not gated.
+func (m *Manager) quotaGate(ctx context.Context, source string, policy config.Source) (*time.Time, error) {
+	snap, err := m.Snapshot(ctx, source+"_quota", policy)
+	if err != nil {
+		return nil, err
+	}
+	if snap.NextAllowedAt != nil && snap.NextAllowedAt.After(m.now().UTC()) {
+		return snap.NextAllowedAt, nil
+	}
+	return nil, nil
 }
 
 // takeToken spends one token, waiting for the bucket to refill. Like the gate

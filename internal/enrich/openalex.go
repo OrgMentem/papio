@@ -67,9 +67,11 @@ func NewOpenAlexWithOptions(opts OpenAlexOptions) *OpenAlexEnricher {
 // corroboration, and an explicit usable open-access location. ISBN work is
 // never promoted because OpenAlex provides no edition-level ISBN data.
 func (e *OpenAlexEnricher) Enrich(ctx context.Context, requested work.Work) (work.Work, bool, error) {
+	// A pre-wire decline: no request is made, so the caller must not charge
+	// this as a performed call (resolver.ErrNotApplicable).
 	if requested.HasFetchableIdentifier() || strings.TrimSpace(requested.ISBN) != "" ||
 		strings.TrimSpace(requested.Title) == "" || requested.Year <= 0 || len(requested.Authors) == 0 {
-		return requested, false, nil
+		return requested, false, resolver.ErrNotApplicable
 	}
 	if e == nil || e.client == nil {
 		return requested, false, errors.New("enrich: OpenAlex HTTP client is not configured")
@@ -80,7 +82,7 @@ func (e *OpenAlexEnricher) Enrich(ctx context.Context, requested work.Work) (wor
 
 	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	endpoint, err := e.searchURL(requested)
+	endpoint, err := e.searchURL(requestCtx, requested)
 	if err != nil {
 		return requested, false, err
 	}
@@ -151,7 +153,12 @@ func (e *OpenAlexEnricher) Enrich(ctx context.Context, requested work.Work) (wor
 	return requested, false, nil
 }
 
-func (e *OpenAlexEnricher) searchURL(requested work.Work) (*url.URL, error) {
+// searchURL builds the bounded title search. It takes a context because the
+// keyed identity's own daily-quota signal can send this call to OpenAlex's
+// keyless tier instead (resolver.WithAnonymousCredentials), and the api_key
+// must then be absent from the wire — a configured dev base URL may carry a
+// stale one, so it is deleted unconditionally before the key is re-applied.
+func (e *OpenAlexEnricher) searchURL(ctx context.Context, requested work.Work) (*url.URL, error) {
 	endpoint, err := url.Parse(e.baseURL)
 	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
 		return nil, errors.New("enrich: invalid configured OpenAlex endpoint")
@@ -167,7 +174,8 @@ func (e *OpenAlexEnricher) searchURL(requested work.Work) (*url.URL, error) {
 	if e.email != "" {
 		query.Set("mailto", e.email)
 	}
-	if e.apiKey != "" {
+	query.Del("api_key")
+	if e.apiKey != "" && !resolver.AnonymousCredentials(ctx) {
 		query.Set("api_key", e.apiKey)
 	}
 	endpoint.RawQuery = query.Encode()

@@ -373,6 +373,10 @@ func TestResolveEnrichesTitleOnlyWorkBeforeResolvers(t *testing.T) {
 	}
 }
 
+// A temporary enrichment failure is a request that actually went out, so the
+// pass it belongs to is chargeable: the plan must carry that observation, or a
+// job whose enrichment keeps failing re-runs the whole chain for free forever.
+// Resolution itself still continues in the same pass with the un-enriched work.
 func TestResolveContinuesAfterTemporaryEnrichmentFailure(t *testing.T) {
 	svc, jobs := newTestService(t)
 	enricher := &fakeEnricher{err: &resolver.TemporaryError{Err: errors.New("rate limited")}}
@@ -391,8 +395,13 @@ func TestResolveContinuesAfterTemporaryEnrichmentFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, retryAt, err := svc.resolve(context.Background(), row); err != nil || !retryAt.IsZero() {
-		t.Fatalf("resolve = retry %v, error %v", retryAt, err)
+	_, plan, err := svc.resolve(context.Background(), row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.TemporaryResolvers != 1 || plan.Kind() != retryKindTemporary {
+		t.Fatalf("plan = %+v, kind = %q; want one temporary observation charged as %q",
+			plan, plan.Kind(), retryKindTemporary)
 	}
 	if enricher.calls != 1 || adapter.calls != 1 {
 		t.Fatalf("enricher/resolver calls = %d/%d, want 1/1", enricher.calls, adapter.calls)

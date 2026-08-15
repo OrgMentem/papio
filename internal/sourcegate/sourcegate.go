@@ -18,7 +18,10 @@ package sourcegate
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
+	"strconv"
+	"time"
 
 	"papio/internal/config"
 )
@@ -74,4 +77,147 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	return c.inner.Do(req)
+}
+
+// Deferrer is the narrow capability NewObserver needs from a budget manager:
+// durably push a source/identity's next-allowed-at forward. Kept as an
+// interface for the same reason Reserver is one — one-way dependency,
+// testable without a store.
+type Deferrer interface {
+	Defer(ctx context.Context, source string, policy config.Source, until time.Time) error
+}
+
+// Observer wraps an HTTP client and converts a provider's own daily-budget
+// headers into a durable "<source>_quota" deferral, so a keyed identity lands
+// softly at a floor instead of sprinting into a day-long block. Unlike Client
+// it never refuses a request itself — only future ones.
+//
+// It reads the X-RateLimit-Remaining/Limit/Reset headers and nothing else. A
+// bare 429 is deliberately ignored: OpenAlex answers both an exhausted daily
+// budget and a burst past its ~100-requests-per-second ceiling with 429, and
+// the two are indistinguishable from the status and Retry-After alone. A
+// rate-ceiling 429 flows through the caller's ordinary TemporaryError/Defer
+// path under the bare source name, like any other retryable HTTP failure.
+type Observer struct {
+	inner    HTTPClient
+	deferrer Deferrer
+	source   string
+	keyed    config.Source
+	now      func() time.Time
+}
+
+// quotaFloorDivisor sets the floor at 1/20th (5%) of the reported daily
+// budget. The reported quantity is CREDITS, not requests, and the two are
+// priced an order of magnitude apart — a singleton entity GET costs 1 while a
+// search costs 10 — so the floor leaves ~500 credits of headroom on a
+// 10,000-credit day, which is between 50 and 500 requests depending on shape.
+// That is what keeps requests already in flight when the gate lands from
+// overrunning the budget.
+const quotaFloorDivisor = 20
+
+// maxQuotaResetSeconds range-guards X-RateLimit-Reset before it is multiplied
+// into a Duration. No daily reset is ever two days out; a negative or absurd
+// value is malformed, and converting it either overflows or yields a past
+// instant that budget.Defer's clamp does not repair — writing no future gate
+// at the exact moment the quota is lowest.
+const maxQuotaResetSeconds = 48 * 3600
+
+// quotaDeferTimeout bounds the floor write. It is generous for one local
+// SQLite upsert and short enough that a shutdown is not held open by it.
+const quotaDeferTimeout = 5 * time.Second
+
+// NewObserver wraps inner so each response's daily-budget headers can defer
+// future calls. A nil deferrer or inner client is a wiring error.
+func NewObserver(deferrer Deferrer, source string, keyed config.Source, inner HTTPClient) (*Observer, error) {
+	if deferrer == nil {
+		return nil, fmt.Errorf("sourcegate: %s observer has no deferrer", source)
+	}
+	if inner == nil {
+		return nil, fmt.Errorf("sourcegate: %s observer has no inner client", source)
+	}
+	return &Observer{inner: inner, deferrer: deferrer, source: source, keyed: keyed, now: time.Now}, nil
+}
+
+// Do forwards the request, then floor-defers the identity it was served under
+// when the provider reports its daily budget nearly spent. Unparseable or
+// self-inconsistent headers are a no-op: the observer never fails a request
+// that already succeeded at the transport level. A failed Defer cannot fail
+// the request either, but it is logged loudly — it is the only durable record
+// that the provider asked papio to stop, and losing it silently is how a
+// quota gets spent twice.
+func (o *Observer) Do(req *http.Request) (*http.Response, error) {
+	resp, err := o.inner.Do(req)
+	if resp == nil {
+		return resp, err
+	}
+	o.observe(req, resp)
+	return resp, err
+}
+
+func (o *Observer) observe(req *http.Request, resp *http.Response) {
+	// The identity is read from the OUTGOING request, not from configuration:
+	// this same client serves both the keyed and the keyless tier, and a gate
+	// earned by one credential must never be written against the other. The
+	// comparison is against the configured key by VALUE, not by presence: a
+	// request bearing some third key was served under an identity this
+	// observer cannot name, and guessing would write the gate against the
+	// wrong pool — worse than writing none.
+	served := o.keyed
+	sent := ""
+	if req.URL != nil {
+		sent = req.URL.Query().Get("api_key")
+	}
+	switch sent {
+	case o.keyed.APIKey:
+		// served as configured, keyed or keyless alike
+	case "":
+		served.APIKey = ""
+	default:
+		return
+	}
+	remaining, remErr := strconv.Atoi(resp.Header.Get("X-RateLimit-Remaining"))
+	limit, limErr := strconv.Atoi(resp.Header.Get("X-RateLimit-Limit"))
+	resetSeconds, resetErr := strconv.Atoi(resp.Header.Get("X-RateLimit-Reset"))
+	if remErr != nil || limErr != nil || resetErr != nil {
+		return
+	}
+	if resetSeconds < 0 || resetSeconds > maxQuotaResetSeconds {
+		return
+	}
+	// A budget must be positive and a balance must lie inside it. Without this
+	// a malformed "limit: 0, remaining: 0" response satisfies the floor test
+	// against the floor's own 1-credit minimum and gates a healthy identity
+	// for a whole reset period.
+	if limit <= 0 || remaining < 0 || remaining > limit {
+		return
+	}
+	floor := limit / quotaFloorDivisor
+	if floor < 1 {
+		floor = 1
+	}
+	if remaining > floor {
+		return
+	}
+	until := o.now().Add(time.Duration(resetSeconds) * time.Second)
+	// The provider has already spoken, so this write must not inherit the
+	// cancellation of the request that carried the news: a shutdown racing a
+	// low-quota response would otherwise drop the gate precisely when the
+	// budget is lowest.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), quotaDeferTimeout)
+	defer cancel()
+	if err := o.deferrer.Defer(ctx, o.source+"_quota", served, until); err != nil {
+		log.Printf("papio: %s quota low (%s pool, remaining=%d/%d) but the floor could not be recorded: %v",
+			o.source, poolName(served), remaining, limit, err)
+		return
+	}
+	log.Printf("papio: %s quota low (%s pool, remaining=%d/%d); deferred until %s",
+		o.source, poolName(served), remaining, limit, until.Format(time.RFC3339))
+}
+
+// poolName names the identity a request was served under, for logs only.
+func poolName(served config.Source) string {
+	if served.APIKey != "" {
+		return "keyed"
+	}
+	return "anonymous"
 }

@@ -4,8 +4,10 @@ package enrich
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"papio/internal/resolver"
@@ -49,6 +51,39 @@ func TestOpenAlexEnrichMeasuredBookRescue(t *testing.T) {
 	}
 	if enriched.DOI != "10.1002/pfi.4140340510" {
 		t.Fatalf("DOI = %q", enriched.DOI)
+	}
+}
+
+// The keyed identity's own daily-quota signal can send this search to
+// OpenAlex's keyless tier. The key must then be absent from the wire, or the
+// request is metered against an identity that did not admit it — and a stale
+// api_key on a configured dev base URL must not leak back in.
+func TestEnricherAnonymousOmitsAPIKey(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.RawQuery)
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+
+	requested := work.Work{Title: "A title", Year: 2024, Authors: []string{"Jane Smith"}}
+	enricher := NewOpenAlexWithOptions(OpenAlexOptions{
+		BaseURL: server.URL + "?api_key=stale", ContactEmail: "reader@example.org", APIKey: "private-key",
+	})
+	if _, _, err := enricher.Enrich(resolver.WithAnonymousCredentials(context.Background()), requested); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := enricher.Enrich(context.Background(), requested); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("requests = %#v, want one anonymous and one keyed", seen)
+	}
+	if strings.Contains(seen[0], "api_key") {
+		t.Fatalf("anonymous request carried a key: %s", seen[0])
+	}
+	if !strings.Contains(seen[1], "api_key=private-key") || strings.Contains(seen[1], "stale") {
+		t.Fatalf("keyed request = %s, want exactly the configured key", seen[1])
 	}
 }
 
@@ -232,8 +267,10 @@ func TestOpenAlexEnrichRejectsISBNAndAmbiguousMatches(t *testing.T) {
 	enriched, matched, err := NewOpenAlexWithOptions(OpenAlexOptions{BaseURL: server.URL, ContactEmail: "reader@example.org"}).Enrich(context.Background(), work.Work{
 		Title: "A title", Year: 2024, Authors: []string{"Jane Smith"}, ISBN: "9781576753484",
 	})
-	if err != nil || matched || enriched.OpenAlex != "" || called {
-		t.Fatalf("ISBN enrichment = %+v, matched=%v, err=%v, called=%v; ISBN must not be promoted", enriched, matched, err, called)
+	// An ISBN is refused before any request goes out, so the enricher reports
+	// resolver.ErrNotApplicable: the caller must not charge an uncalled source.
+	if !errors.Is(err, resolver.ErrNotApplicable) || matched || enriched.OpenAlex != "" || called {
+		t.Fatalf("ISBN enrichment = %+v, matched=%v, err=%v, called=%v; want a pre-wire ErrNotApplicable decline", enriched, matched, err, called)
 	}
 
 	enriched, matched, err = NewOpenAlexWithOptions(OpenAlexOptions{BaseURL: server.URL, ContactEmail: "reader@example.org"}).Enrich(context.Background(), work.Work{
@@ -271,13 +308,15 @@ func TestOpenAlexEnrichRequiresEditionEvidence(t *testing.T) {
 		_, _ = w.Write([]byte(`{"results":[{"id":"https://openalex.org/W12345","title":"A title","publication_year":2024,"authorships":[{"author":{"display_name":"Jane Smith"}}],"open_access":{"is_oa":true},"locations":[{"is_oa":true,"landing_page_url":"https://example.org/paper"}]}]}`))
 	}))
 	defer server.Close()
+	// Both cases lack the year/author evidence the enricher requires to even
+	// build a search, so both decline pre-wire.
 	for _, requested := range []work.Work{
 		{Title: "A title", Authors: []string{"Jane Smith"}},
 		{Title: "A title", Year: 2024},
 	} {
 		enriched, matched, err := NewOpenAlexWithOptions(OpenAlexOptions{BaseURL: server.URL, ContactEmail: "reader@example.org"}).Enrich(context.Background(), requested)
-		if err != nil || matched || enriched.OpenAlex != "" {
-			t.Fatalf("requested=%+v enrichment=%+v matched=%v err=%v; missing evidence must be refused", requested, enriched, matched, err)
+		if !errors.Is(err, resolver.ErrNotApplicable) || matched || enriched.OpenAlex != "" {
+			t.Fatalf("requested=%+v enrichment=%+v matched=%v err=%v; missing evidence must be refused pre-wire", requested, enriched, matched, err)
 		}
 	}
 }
@@ -313,7 +352,7 @@ func TestOpenAlexEnrichSkipsFetchableWork(t *testing.T) {
 
 	requested := work.Work{Title: "A title", DOI: "10.1234/existing"}
 	_, matched, err := NewOpenAlexWithOptions(OpenAlexOptions{BaseURL: server.URL}).Enrich(context.Background(), requested)
-	if err != nil || matched || called {
-		t.Fatalf("result matched=%v err=%v called=%v; fetchable work must skip", matched, err, called)
+	if !errors.Is(err, resolver.ErrNotApplicable) || matched || called {
+		t.Fatalf("result matched=%v err=%v called=%v; a fetchable work must decline pre-wire", matched, err, called)
 	}
 }

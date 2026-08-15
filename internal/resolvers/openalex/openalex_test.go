@@ -74,6 +74,11 @@ func TestResolveVectors(t *testing.T) {
 				if req.URL.Query().Get("mailto") != "contact@example.org" || req.URL.Query().Get("api_key") != "private-key" {
 					t.Fatalf("polite-pool credentials missing")
 				}
+				// Every works lookup — singleton GET as well as search — bounds
+				// the response to the fields this adapter reads.
+				if got := req.URL.Query().Get("select"); got != workSelectFields {
+					t.Fatalf("select = %q, want %q", got, workSelectFields)
+				}
 				return responseFor(tt.status, tt.body, tt.headers), nil
 			})
 			r := NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "private-key", BaseURL: "https://api.test/works"})

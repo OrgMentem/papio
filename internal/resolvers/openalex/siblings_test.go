@@ -47,9 +47,26 @@ func siblingResolver(t *testing.T, searchBody string) *Resolver {
 	return NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "key", BaseURL: "https://api.test/works"})
 }
 
+// canonicalWork is the requested work as the app hands it over once the
+// canonical DOI has already been resolved this pass: title, year and authors
+// are the same values the record carries. ResolveSiblings no longer GETs that
+// record — it reuses a Resolve memo, or these caller-supplied fields.
+func canonicalWork() work.Work {
+	return work.Work{
+		DOI: "10.1145/3531146.3533202", Title: "How Explanations Shape Trust",
+		Year: 2022, Authors: []string{"Andrea Ferrario", "Michele Loi"},
+	}
+}
+
 func TestResolveSiblingsFindsOAPreprintOfPaywalledDOI(t *testing.T) {
 	r := siblingResolver(t, siblingSearchBody(
 		"How Explanations Shape Trust", 2022, "10.2139/ssrn.4020557", "Andrea Ferrario", "https://ssrn.example/paper.pdf"))
+	// Seed the memo the way the pipeline does: the canonical DOI is resolved
+	// first (that GET is what writes the record), and the sibling hop reuses it
+	// instead of paying for a second canonical GET.
+	if _, err := r.Resolve(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
+		t.Fatal(err)
+	}
 	candidates, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +86,7 @@ func TestResolveSiblingsFindsOAPreprintOfPaywalledDOI(t *testing.T) {
 func TestResolveSiblingsMatchesAcrossPunctuationDrift(t *testing.T) {
 	r := siblingResolver(t, siblingSearchBody(
 		"How Explanations Shape Trust.", 2022, "10.2139/ssrn.4020557", "Andrea Ferrario", "https://ssrn.example/paper.pdf"))
-	candidates, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+	candidates, err := r.ResolveSiblings(context.Background(), canonicalWork())
 	if err != nil || len(candidates) != 1 {
 		t.Fatalf("candidates = %#v, err = %v; want punctuation-equivalent title to match", candidates, err)
 	}
@@ -93,7 +110,7 @@ func TestResolveSiblingsRejectsWeakMatches(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r := siblingResolver(t, test.body)
-			candidates, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+			candidates, err := r.ResolveSiblings(context.Background(), canonicalWork())
 			if err != nil || len(candidates) != 0 {
 				t.Fatalf("candidates = %#v, err = %v; want none", candidates, err)
 			}

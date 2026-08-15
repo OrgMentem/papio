@@ -11,6 +11,70 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **A corrupt search marker no longer buys the expensive search again.** The
+  per-question marker that stops *papio* re-asking a title search it has
+  already paid for is read back through the job's event stream, which decodes
+  each event detail leniently and yields nothing at all on a malformed row. An
+  illegible marker therefore matched no question and authorized a fresh
+  ten-credit query — exactly when storage was already misbehaving. A marker of
+  the right kind is now proof the search happened; only a legible, different
+  question buys another one.
+
+- **The expensive sibling search runs once per question, at the boundary where
+  it is the last thing left to try.** OpenAlex prices a singleton record
+  lookup at one credit and a title search at ten; measured against a day of
+  real traffic, 304 of those searches ran, 280 found nothing, and together
+  they were ~90% of the day's spend. The search now waits until the primary
+  candidates have no ordinary retry left to take — the rule the
+  exhaustion-boundary hop already followed and the resolver pass ignored — and
+  a search that completed for a given title, year, authors, and DOI is not
+  asked again, because a zero-result answer is a fact about the provider's
+  index rather than a transient failure. A transport failure records nothing
+  and stays retryable, enrichment that materially changes the bibliography
+  buys one new search, and the free typed version relations are unaffected.
+
+- **Two spend guards no longer fail open.** A job's retry history is the only
+  bound on provider spend once its candidates are all dead, so an unreadable
+  history now settles the job instead of authorizing another paid pass — the
+  cost of being wrong is one `papio jobs retry` against a quota that cannot be
+  refunded until the provider's next reset. The daily-budget floor is written
+  with a context detached from the request that carried the news, so a
+  shutdown racing a low-quota response can no longer discard the only durable
+  record that the provider asked *papio* to stop; a floor that cannot be
+  recorded is now logged rather than silently dropped. The floor also ignores
+  a response whose reported budget is not self-consistent, and one bearing an
+  API key *papio* did not send, rather than gating an identity it cannot name.
+
+- **A job whose candidates are all dead stops re-running the resolver chain
+  forever.** A pass that reached at least one source was labelled
+  `source_gate` — uncharged against the bounded retry budget — whenever some
+  unrelated source happened to be gated in the same pass, so the budget never
+  bound and the loop repeated every cadence indefinitely, spending real
+  provider credits each cycle. Metadata enrichment and DOI enrichment made
+  budgeted requests that the retry plan never saw at all; both now report
+  their own observations. A pass that made no request is still uncharged, and
+  when several sources are gated for different durations the one wait granted
+  past exhaustion now targets the longest of them, so the slowest gated source
+  still gets the call that rule exists to grant it.
+
+- **OpenAlex is paced by its own daily-budget headers instead of sprinting
+  into a day-long block.** Every response's `X-RateLimit-Remaining`/`Limit`/
+  `Reset` now lands a durable floor at 5% remaining for the exact credential
+  that served the request; the resolver, metadata enricher, and discovery
+  backend all read and honor it. A bare `429` deliberately does not trigger
+  it — the same status answers a per-second burst — and keeps using the
+  ordinary retry path. Once the keyed identity's own quota signal says stop,
+  acquisition continues on OpenAlex's keyless tier, which respects the
+  identical floor; an ordinary retry gate, a local throttle, or a candidate
+  file host's failure never switches credentials, and discovery stays
+  keyed-only.
+
+- **The sibling version hop no longer re-fetches a record *papio* just read.**
+  It reuses the canonical work record from the same pass's `Resolve` call, or
+  the caller's own metadata, instead of issuing a second lookup; with neither
+  it reports that it made no request rather than being charged for one. Every
+  works lookup now also bounds the response to the fields *papio* reads.
+
 - **Clean scheduler completion no longer races its final heartbeat.** A
   heartbeat already in flight when a worker parks or completes its job now
   recognizes the lease-releasing state as success, while a wrong owner on
