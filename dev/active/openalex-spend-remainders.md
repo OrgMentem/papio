@@ -6,7 +6,7 @@ anonymous fallback, the fuzzy-search boundary/basis gate, and three fail-closed
 guards). Those changes are complete; git history and `CHANGELOG.md` hold the
 record.
 
-**Nine adversarial reviews, eight rewrites.** Three early rounds sharpened a
+**Ten adversarial reviews, nine rewrites.** Three early rounds sharpened a
 two-part plan (a per-job spend guard plus a per-identity credit ceiling); a fourth,
 given no prior-round context and a wide brief, rejected the shape of both; three
 more reviewed the shipped code and found live defects in it; the eighth falsified a
@@ -16,7 +16,9 @@ previous rounds' own fixes — and named the two places where this plan promises
 its mechanism cannot deliver. Anything a review asserted about the provider or the
 language was confirmed independently before acceptance. Every finding is verified
 against the tree or the live provider before being written down. Reviews are
-preserved under `dev/scratch/oracle/20260815T0*`.
+preserved under `dev/scratch/oracle/20260815T*`. The tenth found no defect in shipped
+code — every finding was a plan claim the mechanism could not deliver, which is the
+first round that produced no code change.
 
 **Rejected designs** at the bottom records every dead end with its reason —
 twenty-three of the forty-four from earlier drafts of this file. Read it before
@@ -314,12 +316,65 @@ belongs in this item, not in item 3:
 | --- | --- | --- |
 | provider-quota / identity gated | that credential's `Until` | acquisition may retry under the next identity with fresh admission; a fixed-policy caller defers |
 | source-wide daily credit exhausted | next UTC boundary | park; **never** triggers identity fallback |
-| pricing-drift closure | remaining local window | park; never falls back |
+| pricing-drift closure | **sticky, no expiry** — see below | park; never falls back; needs an explicit acknowledgement to reopen |
 
 Each must be preserved — or deliberately translated — through `fetch` rather than
 flattened. The scheduler wiring can still land as item 3, but the taxonomy cannot
 wait for the egress implementation, because both sides encode it independently
 otherwise.
+
+**Requirement: the final transaction revalidates EVERY durable no-egress
+authority, not two.** Describing it as "provider quota + daily credit" reintroduces
+the exact race the shipped `reserve` already had to fix twice. Sequence: worker A
+clears `AcquireAny` with the ordinary source gate open; worker B takes a plain 429
+and durably `Defer`s the bare source name; A reaches the final transaction, finds
+its identity quota open and its debit fitting, and sends **after a durable ordinary
+gate already exists**. The predicate set is therefore: ordinary `next_allowed_at`
+for the bare source, the identity's `<source>_quota` floor, the source-wide
+pricing-drift/prepaid closure, and the daily credit allowance — all read inside the
+committing transaction.
+
+**The in-process latch must move.** `latched` currently lives on an `Observer`
+*instance* (`sourcegate.go`), which is correct for the layer it guards but is not a
+source-wide authority: the new egress authority cannot merely "consult the latch"
+across a package boundary, or a failed durable write recreates the same TOCTOU one
+layer down. Move the latch into — or share it with — the egress authority, and
+define the linearization point between setting it and admitting a request.
+
+**Requirement: do not promise crash-durability the mechanism cannot give.** This
+file already concedes it for the quota floor (latch first, persist best-effort);
+the same concession is mandatory for every other response-derived fact the plan
+wants to act on. Sequence: the persisted denominator is 10,000; a response
+establishes 1,000; the lowering write fails on a busy disk; the daemon crashes. The
+counter survived, the "monotone" denominator did not. So: **the debit plus an
+absolute hard maximum are crash-hard; provider-relative denominators and
+response-derived pricing/prepaid brakes are not.** Set their process latch
+immediately, and define restart behaviour explicitly — for keyed installs OpenAlex
+exposes `/rate-limit` (credits used/remaining, endpoint costs, prepaid state), so a
+restart preflight is available; where no authoritative preflight exists, fall back
+to the crash-hard absolute cap rather than assuming the relative guarantee survived.
+
+**Requirement: positive pricing drift is sticky, not a daily gate.** Giving it "the
+remaining local window" makes an unattended daemon repeat the unsafe request every
+day: search moves 10 -> 100 credits, *papio* debits 10 at 14:00, observes 100,
+closes until midnight, and at 00:00 the closure expires while the classifier still
+says 10. It closes the source until an explicit software or operator
+acknowledgement establishes a new conservative cost schedule, or an authoritative
+provider cost description is validated and adopted. Item 3 cannot model it as
+`{until: next UTC}`.
+
+**Requirement: name the migration-day and cold-start seeds.** Two ways the
+advertised daily bound is false in practice. *Upgrade day*: the migration creates
+`credits_committed = 0` while *papio* may already have authorized thousands of
+credits since midnight, so the fuse authorizes its full allowance a second time on
+the very day it deploys — either close the remainder of the current UTC day or seed
+from an authoritative usage observation, never silently start at zero. *Cold start*:
+"a conservative absolute until a limit is observed" is a cohort, not one request —
+100 workers can reach the authority before the first response persists a
+denominator, and a fallback sized for the keyed tier can overshoot the keyless
+tier's whole intended fraction. Name the exact fallback, make it safe against the
+lowest supported tier, or permit only a bounded bootstrap egress until the primary
+basis is established.
 
 **Debit placement matters for availability.** Committing before ordinary local
 admission would let a reset cohort burn a large slice of the daily allowance on
@@ -546,6 +601,38 @@ sibling hop entirely, and is sufficient justification for the invariant on its
 own: item 5 must not be narrowed to a fuzzy-sibling rule, and must not be gated on
 threshold tuning or a corpus.
 
+**The legacy cutover, measured rather than assumed.** A tenth review called this
+invariant unachievable retroactively, on the premise that no immutable record of
+the submission exists and the anchor would have to be seeded from mutated canonical
+state. That premise is half wrong, and the true shape is cheaper. `work_requests`
+already preserves the *submitted* title/authors/year: `internal/job/job.go:717-725`
+fills each field only when it is empty, so a supplied value is never overwritten by
+a resolver. And identifiers are not in `work_requests` at all — they live in
+`identifiers(work_request_id, kind, value, raw)`, inserted with a conflict check
+(`job.go:744-749`) that *errors* when a resolver reports a different value for an
+identifier the request already carried.
+
+So exactly one thing is missing, and it is a column: **`identifiers` has no
+provenance**. A DOI the user typed and a DOI adopted from a title-only match are the
+same row, and the conflict check cannot fire on the second case because there was
+nothing to conflict with. Live counts: 715 requests, 907 identifier rows, 98
+requests with no identifier at all.
+
+The cutover is therefore:
+- Add `identifiers.provenance` (`submitted` | `verified` | `adopted`), and set it at
+ every insert site. Post-cutover, a promotion may only write `adopted`, and only
+ `submitted`/`verified` may anchor a canonical-identity comparison.
+- Backfill every pre-cutover row as **`unattested`**, not `submitted`: the
+ distinction was never recorded and must not be manufactured now.
+- Prohibit canonical-identity promotion and the unattested `DOI -> SHA256` cache
+ fast-path on `unattested` anchors until independent revalidation or resubmission.
+ This is the review's requirement, and it is right; what changes is that the
+ remediation is a backfill plus a predicate, not a reconstruction of lost truth.
+
+Do not state the invariant as retroactively enforceable on existing rows. State it
+as prospectively enforced, with legacy rows explicitly quarantined from the paths
+that could act on an identity nobody attested.
+
 **Name the anchor, or an implementer has to choose one.** Validation and cache
 attestations must consume a **durable, immutable snapshot of the submitted
 identity**, captured at submit and never rewritten — not the mutable `row.Work`.
@@ -651,6 +738,21 @@ searched.** The app hashes `row.Work` *before* calling the adapter, and the
 adapter may then substitute a positive memoized canonical record and search on
 *its* title instead.
 
+**The hashed value must include the canonical DOI, and must not be `work.Work`.**
+Sibling acceptance does not depend only on title/year/authors: `ResolveSiblings`
+also *excludes* the canonical DOI from its result set (`resolved.DOI ==
+canonicalDOI`, `openalex.go`), so the canonical identifier is part of the question
+being asked. Hashing only the textual basis suppresses a search that genuinely
+changed: basis `{DOI: X, title: T, authors: A}` is marked done; canonical identity
+is later legitimately corrected to DOI Z with the text unchanged; under Z the
+excluded row is different and X is itself a candidate sibling, yet the hash matches
+and the needed search never runs. Hashing the whole `work.Work` makes the opposite
+error — an unrelated PMID or OpenAlex-ID enrichment buys a fresh 10-credit search.
+So the effective basis is a dedicated immutable value carrying exactly the fields
+that affect the request and the acceptance predicate: normalized search title, year,
+canonicalized author-match keys, and canonical DOI. Hash that value, and pass *that
+same value* into the search — do not use `work.Work` as the protocol object.
+
 A sentinel-triggered recovery does **not** fix that, which is what an earlier
 draft of this item got wrong. The damaging sequence never produces a sentinel at
 all:
@@ -721,12 +823,18 @@ Measuring the query shape (`search=` vs a title-scoped filter, `per_page` 10 vs
 truncated broad query, so the hop could be worth keeping *or* worth deleting and
 the measurement cannot tell you which until the shape is controlled for.
 
-Within item 1+2 the shortest correct path is: **fix the live merge-redirect
-identity/attribution defect → define, freeze and clamp the relative denominator →
-HTTP/1-only transport with no automatic redirects and per-hop re-admission → the
-atomic pre-wire credit commit.** The redirect work comes first because it is a
-live defect corrupting the floor the rest of the item depends on, and because it
-is what makes "one commit, one physical request" true at all.
+Within item 1+2 the shortest correct path is: **build the guarded one-hop request
+primitive → define, freeze and clamp the relative denominator → express `Wold →
+Wnew` as an explicit redirect loop over that primitive.** An earlier draft put the
+merge-redirect fix first, on the grounds that it is a live defect corrupting the
+floor. As a dependency graph that is backwards: a *correct* merge fix is exactly
+"every hop re-admits and re-debits", so it needs the primitive that was scheduled
+last. The primitive is: HTTP/1 only, no connection reuse, no redirect following,
+full revalidation of every durable no-egress authority, atomic debit — one commit,
+one physical request. Then the redirect loop calls it per hop and carries alias
+evidence forward. Bearer-header auth may land earlier as a narrow attribution fix
+(it keeps the key off redirected query strings), but redirects are not solved until
+the guarded-hop primitive exists.
 
 An earlier draft wrote `… → 4 → 5` while its own prose said item 5 must not queue
 behind spend work; the two contradicted each other and the ordering above is the
