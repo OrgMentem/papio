@@ -78,7 +78,7 @@ A reusable admission marker minted back in `AcquireAny` does not solve the
 problem, because it is still separated from egress by a step that can block —
 and it could authorize more than one `Do`.
 
-**The defect this closes, in the shipped code.** Two live holes, both found in
+**The defect this closes, in the shipped code.** Three live holes, all found in
 review:
 
 1. **The quota floor is not an egress barrier.** `Observer.observe` logs and
@@ -94,6 +94,14 @@ review:
    visible"; the implementation does not deliver it. With a synchronized cohort
    the 5% headroom is covering not just requests already on the wire but every
    worker that passed the precheck.
+3. **The credit fuse is a DIFFERENT boundary from the provider floor, and does
+   not repair it.** A source-wide daily credit counter answers "how much may this
+   instance commit today"; the floor answers "is this identity's provider balance
+   spent". A committed credit satisfies the first and says nothing about the
+   second, so unless the final egress authority **revalidates the outgoing
+   identity's provider gate at the same point it commits the credit**, holes 1
+   and 2 survive the fuse entirely. Treat identity-gate revalidation as part of
+   the egress authority's contract, not as something the counter subsumes.
 
 **The shape that fixes both.** Do all cheap validation and ordinary local gating
 first — token bucket, advisory throttle, applicability. Then, at the final
@@ -397,6 +405,34 @@ for real dollars. A billing feature, not a safety mechanism.
   budget remaining. It now returns an error, which the fail-closed liveness
   wrapper turns into "stop" while the permit path correctly declines to treat it
   as proof.
+- **The provider floor bound acquisition and ignored everyone else.**
+  `sourcegate.Client` — which is how discovery, DOI-only enrichment, watch
+  digests and MCP reach OpenAlex — admits through the single-policy
+  `budget.Acquire`, and the `"<source>_quota"` signal was consulted only in
+  `AcquireAny`. So the observer would write "keyed is spent", acquisition would
+  correctly fall back to the keyless identity, and discovery would keep sending
+  keyed until some ordinary 429 happened to establish a different gate. That is
+  the "enrichment spends independently" class from the original incident, still
+  open. The floor now binds inside `Acquire`, where every path passes; a
+  fixed-policy caller has no alternative identity, so it defers until the
+  provider's own reset rather than falling back. `AcquireAny` keeps its own
+  pre-check, which is what distinguishes "this identity is spent, try the next"
+  from an ordinary refusal. Regression:
+  `TestAcquireHonoursTheProviderQuotaFloor`, including keyed/keyless and
+  cross-source isolation.
+- **The sibling search basis was wrong in both directions.** A fresh negative DOI
+  memo returned `ErrNoSearchBasis` before the caller's own title and authors were
+  even considered — but that memo proves only that the provider does not resolve
+  *that DOI*, not that there is no basis for finding a sibling indexed under a
+  different one, so usable caller metadata was suppressed. In the other
+  direction, a bare title was accepted as sufficient to buy the ten-credit
+  search even though every result is then required to share an author surname,
+  and that check fails whenever either author list is empty — so the search was
+  bought on a foregone conclusion. "Usable basis" is now one predicate
+  (`usableSiblingBasis`) tied to what the acceptance side needs: a title plus at
+  least one canonicalizable author surname. Regressions:
+  `TestSiblingRefusesABasisThatCannotAccept` (table),
+  `TestNegativeMemoDoesNotSuppressACallerBasis`.
 
 ## Rejected designs (do not re-derive)
 

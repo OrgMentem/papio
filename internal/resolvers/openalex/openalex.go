@@ -333,23 +333,25 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 	}
 	anon := resolver.AnonymousCredentials(ctx)
 	canonical := work.Work{Title: requested.Title, Year: requested.Year, Authors: requested.Authors}
-	// A fresh negative memo is a fact, not a miss: Resolve recorded that the
-	// provider does not know this DOI, so there is no canonical bibliography to
-	// search on and asking again cannot change that inside the TTL. Without
-	// this the negative entry was written and then never consulted, because
-	// recordFor reports it exactly like an absent one.
-	if known, fresh := r.doiKnown(canonicalDOI); fresh && !known {
-		return nil, resolver.ErrNoSearchBasis
-	}
+	// A fresh negative memo means only "no MEMO-derived basis": it proves the
+	// provider does not currently resolve DOI X, not that the caller's own
+	// title and authors are unusable for finding a sibling indexed under its own
+	// DOI. Treating it as a full stop suppressed perfectly good caller
+	// metadata.
 	if record, ok := r.recordFor(canonicalDOI); ok {
 		canonical = resolvedWork(record)
 	}
-	if strings.TrimSpace(canonical.Title) == "" {
-		// Zero requests were made, and the caller must not charge one: with no
-		// usable memoized record and no caller-supplied title there is nothing
-		// to search on.
+	if !usableSiblingBasis(canonical) {
+		// Zero requests were made, and the caller must not charge one.
 		//
-		// This deliberately does NOT re-earn the basis with a singleton lookup.
+		// "Usable" means everything the post-search acceptance predicate
+		// requires, not merely a non-empty title. Every result is later required
+		// to share an author surname, and sharesAuthorSurname returns false
+		// whenever either list is empty — so a title with no canonicalizable
+		// author bought a ten-credit search that could not produce a candidate
+		// under any response.
+		//
+		// This deliberately does NOT re-earn a basis with a singleton lookup.
 		// That was tried and reverted: paying one credit here breaks the
 		// contract this sentinel exists to state (the caller reads it as "the
 		// adapter made no request at all" and skips charging the pass), and it
@@ -432,6 +434,24 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 	return candidates, nil
 }
 
+// usableSiblingBasis reports whether a work carries enough to make the
+// ten-credit title search capable of yielding a candidate. It is deliberately
+// tied to the acceptance side: a search whose every possible result would be
+// rejected must never be bought, so this requires at least what
+// sharesAuthorSurname needs — a title to search on, and one author surname the
+// canonicalizer can actually read.
+func usableSiblingBasis(basis work.Work) bool {
+	if strings.TrimSpace(basis.Title) == "" {
+		return false
+	}
+	for _, author := range basis.Authors {
+		if _, _, ok := canonicalAuthor(author); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // writeMemo records what a DOI singleton lookup learned, so a sibling hop in
 // the same pass can match against it without paying for the record again.
 //
@@ -486,20 +506,6 @@ func echoesDOI(record workRecord, want string) bool {
 		parsed++
 	}
 	return parsed > 0
-}
-
-// doiKnown reports what a fresh memo entry says about whether the provider
-// knows this DOI at all, and whether such an entry exists. A fresh negative is
-// a usable fact: ResolveSiblings has no canonical bibliography to search on and
-// must not pay to learn that again inside the TTL.
-func (r *Resolver) doiKnown(doi string) (known, fresh bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	entry, ok := r.records["doi:"+doi]
-	if !ok || time.Since(entry.at) > recordMemoTTL {
-		return false, false
-	}
-	return entry.found, true
 }
 
 // recordFor returns a record written by a preceding Resolve call for the same

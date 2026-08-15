@@ -101,11 +101,59 @@ func TestSiblingWithoutBasisMakesNoRequest(t *testing.T) {
 	}
 }
 
-// A fresh negative memo is a usable fact, not a miss: Resolve already learned
-// the provider does not know this DOI, so the hop must not pay to learn it
-// again inside the TTL.
-func TestSiblingHonoursAFreshNegativeMemo(t *testing.T) {
-	client := clientFunc(func(*http.Request) (*http.Response, error) {
+// A title with no readable author cannot yield a candidate: every result is
+// required to share an author surname, and that check fails whenever either list
+// is empty. Buying the ten-credit search anyway is spending on a foregone
+// conclusion.
+func TestSiblingRefusesABasisThatCannotAccept(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		basis work.Work
+		buys  bool
+	}{
+		{name: "title only", basis: work.Work{DOI: "10.1145/3531146.3533202", Title: "Shape Trust"}},
+		{
+			name:  "title and unreadable author",
+			basis: work.Work{DOI: "10.1145/3531146.3533202", Title: "Shape Trust", Authors: []string{"  "}},
+		},
+		{
+			name:  "title and author",
+			basis: work.Work{DOI: "10.1145/3531146.3533202", Title: "Shape Trust", Authors: []string{"Andrea Ferrario"}},
+			buys:  true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r, requests := countingResolver(t, `{"results":[]}`)
+			_, err := r.ResolveSiblings(context.Background(), test.basis)
+			if test.buys {
+				if err != nil {
+					t.Fatalf("err = %v, want the search to run on a usable basis", err)
+				}
+				if *requests != 1 {
+					t.Fatalf("requests = %d, want exactly the one search", *requests)
+				}
+				return
+			}
+			if !errors.Is(err, resolver.ErrNoSearchBasis) {
+				t.Fatalf("err = %v, want resolver.ErrNoSearchBasis", err)
+			}
+			if *requests != 0 {
+				t.Fatalf("requests = %d, want zero: no response could have been accepted", *requests)
+			}
+		})
+	}
+}
+
+// A negative DOI memo proves only that the provider does not resolve THAT DOI.
+// It says nothing about whether the caller's own bibliography can find a sibling
+// indexed under a different DOI, so it must not suppress a usable caller basis.
+func TestNegativeMemoDoesNotSuppressACallerBasis(t *testing.T) {
+	var searched bool
+	client := clientFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Query().Get("search") != "" {
+			searched = true
+			return responseFor(200, `{"results":[]}`, nil), nil
+		}
 		return responseFor(404, "", nil), nil
 	})
 	r := New(client, "contact@example.org", "private-key")
@@ -113,13 +161,15 @@ func TestSiblingHonoursAFreshNegativeMemo(t *testing.T) {
 	if _, err := r.Resolve(ctx, work.Work{DOI: "10.9999/unknown.work"}); err != nil {
 		t.Fatal(err)
 	}
-	r.client = clientFunc(func(*http.Request) (*http.Response, error) {
-		t.Fatal("a request was made despite a fresh negative memo")
-		return nil, nil
-	})
-	_, err := r.ResolveSiblings(ctx, work.Work{DOI: "10.9999/unknown.work", Title: "A Title The Caller Supplied"})
-	if !errors.Is(err, resolver.ErrNoSearchBasis) {
-		t.Fatalf("err = %v, want resolver.ErrNoSearchBasis for a DOI the provider does not know", err)
+	if _, err := r.ResolveSiblings(ctx, work.Work{
+		DOI:     "10.9999/unknown.work",
+		Title:   "A Title The Caller Supplied",
+		Authors: []string{"Andrea Ferrario"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !searched {
+		t.Fatal("a usable caller basis was suppressed by an unrelated negative DOI memo")
 	}
 }
 

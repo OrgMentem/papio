@@ -20,14 +20,14 @@ execution records kept during the initial build.
   unreadable history; permitting the expensive call now requires a fact *papio*
   actually read.
 
-- **A DOI-only work no longer loses its search basis to cache eviction.** The
-  sibling hop reuses the canonical record from earlier in the same pass rather
-  than fetching it twice, but that memo is an evictable two-minute cache — so
-  unrelated traffic filling it, or a fetch running long, silently cancelled
-  sibling discovery for a work whose own metadata carries no title. The cache
-  now evicts expired entries before discarding live ones, and a missing basis is
-  re-earned with the one-credit record lookup instead of assumed absent. Only a
-  DOI the provider does not know is treated as nothing to search on.
+- **A DOI-only work is less likely to lose its search basis to cache eviction.**
+  The sibling hop reuses the canonical record fetched earlier in the same pass
+  rather than fetching it twice, but that memo is an evictable two-minute cache,
+  and filling it used to discard everything — including entries still in use.
+  It now discards expired entries first and clears wholesale only if that frees
+  nothing. When no basis survives, the hop still makes no request at all and
+  reports exactly that, so the pass is not charged for a call that never
+  happened.
 
 - **A corrupt search marker no longer buys the expensive search again.** The
   per-question marker that stops *papio* re-asking a title search it has
@@ -37,6 +37,26 @@ execution records kept during the initial build.
   ten-credit query — exactly when storage was already misbehaving. A marker of
   the right kind is now proof the search happened; only a legible, different
   question buys another one.
+
+- **The daily-quota floor now stops every caller, not just acquisition.** When a
+  provider reports its daily budget nearly spent, *papio* records that against
+  the exact credential involved — but only the acquisition path consulted the
+  record. Discovery, DOI-only enrichment, watch digests and MCP admit through a
+  different entry point, so they kept sending on a credential already known to
+  be spent until an outright refusal arrived. The floor is now checked where
+  every path passes. A caller with no alternative credential waits for the
+  provider's own reset instead of falling back, and acquisition's keyed-then-
+  keyless preference is unchanged.
+
+- **The expensive sibling search is no longer bought on a foregone conclusion,
+  nor skipped when it could have worked.** Results are only accepted when they
+  share an author surname with the work being acquired, which cannot happen when
+  no author is known — yet a bare title was enough to pay for the search. In the
+  other direction, a record of "this DOI is not in the provider's index"
+  cancelled the search outright, even though the work's own title and authors
+  were a perfectly good basis for finding a copy published under a different
+  DOI. Both now follow one rule: the search runs when, and only when, the
+  information *papio* holds could actually produce an acceptable match.
 
 - **The expensive sibling search runs once per question, at the boundary where
   it is the last thing left to try.** OpenAlex prices a singleton record

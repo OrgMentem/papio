@@ -142,3 +142,38 @@ func TestAcquireAnyFailsClosedOnSnapshotError(t *testing.T) {
 		t.Fatalf("chosen = %+v, want no identity on a failed read", chosen)
 	}
 }
+
+// Every provider client in the tree admits through one of these two entry
+// points, and the floor must bind on both. sourcegate.Client — which is what
+// discovery, DOI-only enrichment, watch digests and MCP use — admits with the
+// single-policy Acquire, so a floor honoured only by AcquireAny left exactly
+// the independent callers sourcegate exists to account for spending freely.
+func TestAcquireHonoursTheProviderQuotaFloor(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	keyed, anon := keyedAndAnon()
+	reset := time.Now().UTC().Add(6 * time.Hour).Truncate(time.Second)
+	if err := m.Defer(ctx, "openalex_quota", keyed, reset); err != nil {
+		t.Fatal(err)
+	}
+
+	err := m.Acquire(ctx, "openalex", keyed, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("err = %v, want *ErrDeferred: a fixed-policy caller has no other identity to try", err)
+	}
+	if !deferred.Until.Equal(reset) {
+		t.Fatalf("Until = %s, want the provider's own reset %s", deferred.Until, reset)
+	}
+
+	// Cross-identity isolation: the keyless pool is metered separately, so its
+	// own admission is untouched by the keyed floor.
+	if err := m.Acquire(ctx, "openalex", anon, 0); err != nil {
+		t.Fatalf("anonymous Acquire = %v, want admission: that pool has its own balance", err)
+	}
+
+	// Cross-source isolation.
+	if err := m.Acquire(ctx, "crossref", keyed, 0); err != nil {
+		t.Fatalf("crossref Acquire = %v, want admission: an openalex floor is not a crossref floor", err)
+	}
+}

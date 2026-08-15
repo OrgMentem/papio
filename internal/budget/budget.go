@@ -172,6 +172,29 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 	}
 	identity := identityFor(policy)
 
+	// The provider's own daily-quota floor binds HERE, not only in AcquireAny.
+	// sourcegate.Observer writes that signal under source+"_quota" for whichever
+	// credential served the request, and every OpenAlex client in the tree is
+	// wrapped in that observer — but discovery, DOI-only enrichment, watch
+	// digests and MCP reach the provider through sourcegate.Client, which
+	// admits with this single-policy Acquire. Checking the floor only in
+	// AcquireAny therefore honoured it for acquisition and ignored it for
+	// exactly the independent callers sourcegate exists to account for: the
+	// observer would write "keyed is spent", acquisition would fall back to the
+	// keyless identity, and discovery would keep sending keyed until some
+	// ordinary 429 happened to establish a different gate.
+	//
+	// A fixed-policy caller has no alternative identity to try, so a gated
+	// quota is a deferral rather than a fallback: it fails closed until the
+	// provider's own reset. AcquireAny keeps its own pre-check, which is what
+	// lets it distinguish "this identity is spent, try the next" from an
+	// ordinary refusal.
+	if until, err := m.quotaGate(ctx, source, policy); err != nil {
+		return err
+	} else if until != nil {
+		return &ErrDeferred{Source: source, Identity: identity, Until: *until}
+	}
+
 	// One deadline for the whole loop: a gate that keeps being pushed out
 	// while we sleep must not extend the wait past a single MaxInlineWait.
 	deadline := m.now().UTC().Add(MaxInlineWait)
