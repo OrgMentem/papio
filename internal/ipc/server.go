@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"syscall"
@@ -205,6 +206,12 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
 	req, err := DecodeRequest(conn)
 	if err != nil {
+		// A local client that sends a malformed or partial frame is otherwise
+		// invisible: the connection just closes. Log it so a broken CLI, a
+		// stale native host, or a half-open probe can be diagnosed.
+		if !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) {
+			log.Printf("ipc: decode request: %v", err)
+		}
 		return
 	}
 	result, rpcErr := s.Handler.Handle(ctx, req)
@@ -228,7 +235,9 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	// Bound the response write so a client that never reads cannot stall this
 	// goroutine indefinitely.
 	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-	_, _ = conn.Write(data)
+	if _, err := conn.Write(data); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Printf("ipc: write response: %v", err)
+	}
 }
 
 func validJSON(raw []byte) bool {
