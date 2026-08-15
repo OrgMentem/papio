@@ -2196,11 +2196,18 @@ export function wireHistoryLauncher(doc: Document = document): void {
   if (!(button instanceof HTMLButtonElement) || button.dataset.wired) return;
   button.dataset.wired = "1";
   button.addEventListener("click", () => {
-    void chrome.tabs.create({ url: chrome.runtime.getURL(historyPagePath()) }).then(() => {
-      // Chrome dismisses the popup when the new tab takes focus; Firefox
-      // keeps it open, so close it explicitly once the tab exists.
-      window.close();
-    });
+    void chrome.tabs.create({ url: chrome.runtime.getURL(historyPagePath()) }).then(
+      () => {
+        // Chrome dismisses the popup when the new tab takes focus; Firefox
+        // keeps it open, so close it explicitly once the tab exists.
+        window.close();
+      },
+      (error: unknown) => {
+        // A rejected create means the history page never opened. Closing the
+        // popup would hide that outright, so keep it open and say so.
+        announcePopupOperation(doc, error instanceof Error ? error.message : "Could not open history");
+      },
+    );
   });
 }
 

@@ -1423,6 +1423,38 @@ test("history launcher opens the manifest-derived history page and closes the po
   expect(closed).toBe(1);
 });
 
+// A rejected tabs.create used to escape as an unhandled rejection: the history
+// page never opened and the popup said nothing at all.
+test("history launcher keeps the popup open and announces a failed tab creation", async () => {
+  const doc = popupDocument();
+  let closed = 0;
+  let rejection: Promise<unknown> | undefined;
+  Object.assign(globalThis, {
+    chrome: {
+      runtime: {
+        getManifest: () => ({ action: { default_popup: "dist/popup.html" } }),
+        getURL: (path: string) => path,
+      },
+      // The launcher registers its rejection handler on this exact promise
+      // before the test awaits it, so awaiting the settled rejection is enough
+      // to observe the handler's effect. No timer, no guessed delay.
+      tabs: {
+        create: () => {
+          rejection = Promise.reject(new Error("Tab creation blocked"));
+          return rejection;
+        },
+      },
+    },
+    window: { close: () => { closed += 1; } },
+  });
+  wireHistoryLauncher(doc);
+
+  (doc.getElementById("view-history-btn") as HTMLButtonElement).click();
+  await rejection?.catch(() => undefined);
+  expect(closed).toBe(0);
+  expect((doc.getElementById("popup-operation-status") as HTMLElement).textContent).toBe("Tab creation blocked");
+});
+
 test("Enter invokes the primary acquisition action", async () => {
   const doc = popupDocument();
   let calls = 0;
