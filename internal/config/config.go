@@ -669,8 +669,8 @@ func (c *Config) validate() error {
 	if c.Fetch.MaxBytes < 1<<20 {
 		return fmt.Errorf("fetch.max_bytes %d below 1 MiB floor", c.Fetch.MaxBytes)
 	}
-	if c.Fetch.TimeoutSeconds < 5 {
-		return fmt.Errorf("fetch.timeout_seconds %d below 5s floor", c.Fetch.TimeoutSeconds)
+	if c.Fetch.TimeoutSeconds < 5 || c.Fetch.TimeoutSeconds > 3600 {
+		return fmt.Errorf("fetch.timeout_seconds must be in 5..3600")
 	}
 	if c.PDF.TitleMatchThreshold <= 0 || c.PDF.TitleMatchThreshold > 1 {
 		return fmt.Errorf("pdf.title_match_threshold must be in (0,1]")
@@ -756,11 +756,14 @@ func (c *Config) validate() error {
 		}
 		c.Browser.DefaultResolver = defaultResolver
 	}
-	if c.Browser.ActionExpirySeconds < 0 {
-		return fmt.Errorf("browser.action_expiry_seconds must be >= 0")
+	// Both fields are multiplied by time.Second by their consumers, so an
+	// unbounded value wraps time.Duration negative and makes every derived
+	// deadline expire immediately instead of far in the future.
+	if c.Browser.ActionExpirySeconds < 0 || c.Browser.ActionExpirySeconds > 30*24*60*60 {
+		return fmt.Errorf("browser.action_expiry_seconds must be in 0..2592000")
 	}
-	if c.Actions.StaleAfterSeconds < 0 {
-		return fmt.Errorf("actions.stale_after_seconds must be >= 0")
+	if c.Actions.StaleAfterSeconds < 0 || c.Actions.StaleAfterSeconds > 365*24*60*60 {
+		return fmt.Errorf("actions.stale_after_seconds must be in 0..31536000")
 	}
 	if c.Captures.MaxPerHost < 1 || c.Captures.MaxPerHost > 1000 {
 		return fmt.Errorf("captures.max_per_host must be in 1..1000")
