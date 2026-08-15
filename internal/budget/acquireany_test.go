@@ -285,3 +285,40 @@ func TestAcquireAnyFallsBackOnAFloorCommittedDuringAnInlineWait(t *testing.T) {
 		t.Fatalf("chosen = %+v, want the keyless identity", chosen)
 	}
 }
+
+// A rate-limit backoff is a property of the source and the egress IP, not of the
+// credential presented, so it must survive a quota-driven credential switch.
+// Durable rows are keyed by (source, identity): skipping the keyed identity on
+// quota used to skip its 429 row with it, and the keyless identity - untouched,
+// same machine, same IP - was admitted inside the backoff the provider demanded.
+func TestAcquireAnyRefusesPastAnOrdinaryGateOnASkippedIdentity(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	keyed, anon := keyedAndAnon()
+	reset := time.Now().UTC().Add(6 * time.Hour)
+	backoff := time.Now().UTC().Add(90 * time.Second)
+	if err := m.Defer(ctx, "openalex_quota", keyed, reset); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Defer(ctx, "openalex", keyed, backoff); err != nil {
+		t.Fatal(err)
+	}
+	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("AcquireAny = (%+v, %v), want the 429 backoff returned, not a credential switch", chosen, err)
+	}
+	if deferred.Quota {
+		t.Fatalf("deferred.Quota = true, want the ordinary rate-limit gate reported as such")
+	}
+	if !deferred.Until.Equal(backoff.Truncate(time.Second)) && !deferred.Until.Equal(backoff) {
+		t.Fatalf("deferred.Until = %s, want the 429 backoff instant %s", deferred.Until, backoff)
+	}
+	anonSnap, err := m.Snapshot(ctx, "openalex", anon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anonSnap.RequestsInWindow != 0 {
+		t.Fatalf("anonymous reservations = %d, want none: the source is rate-limited for every identity", anonSnap.RequestsInWindow)
+	}
+}

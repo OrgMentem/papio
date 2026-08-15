@@ -272,6 +272,25 @@ func (m *Manager) AcquireAny(ctx context.Context, source string, policies []conf
 		}
 		if until != nil {
 			if i < last {
+				// Advancing past a quota-gated identity must not also advance
+				// past its ORDINARY gate. Durable rows are keyed by (source,
+				// identity), so skipping the identity skips its 429/backoff row
+				// too - and an OpenAlex 429 is a property of the source and the
+				// egress IP, not of the credential presented. Sequence: keyed
+				// request A installs the keyed quota floor while keyed request B
+				// takes a 429 that durably gates ("openalex", keyed); the next
+				// pass skips keyed on quota, finds the keyless row untouched,
+				// and sends from the same IP inside the backoff the provider
+				// just demanded. A rate-limit gate on ANY identity of this
+				// source is therefore returned, not stepped over: the source is
+				// unavailable, and no credential switch fixes that.
+				ordinary, ordErr := m.ordinaryGate(ctx, source, policy)
+				if ordErr != nil {
+					return config.Source{}, ordErr
+				}
+				if ordinary != nil {
+					return policy, &ErrDeferred{Source: source, Identity: identityFor(policy), Until: *ordinary}
+				}
 				continue
 			}
 			return policy, &ErrDeferred{Source: source, Identity: identityFor(policy), Until: *until, Quota: true}
@@ -303,6 +322,21 @@ func QuotaSourceName(source string) string { return source + "_quota" }
 // own daily-budget headers. nil, nil means not gated.
 func (m *Manager) quotaGate(ctx context.Context, source string, policy config.Source) (*time.Time, error) {
 	snap, err := m.Snapshot(ctx, QuotaSourceName(source), policy)
+	if err != nil {
+		return nil, err
+	}
+	if snap.NextAllowedAt != nil && snap.NextAllowedAt.After(m.now().UTC()) {
+		return snap.NextAllowedAt, nil
+	}
+	return nil, nil
+}
+
+// ordinaryGate reports the BARE source row's gate instant for policy's identity
+// — papio's own pacing and the durable 429/backoff gates — if one is currently
+// active. nil, nil means not gated. Read only by AcquireAny's skip path: Acquire
+// enforces this row itself for the identity it actually attempts.
+func (m *Manager) ordinaryGate(ctx context.Context, source string, policy config.Source) (*time.Time, error) {
+	snap, err := m.Snapshot(ctx, source, policy)
 	if err != nil {
 		return nil, err
 	}

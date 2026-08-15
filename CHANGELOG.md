@@ -11,6 +11,29 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **A pause demanded by OpenAlex is no longer skipped by switching accounts.**
+  When one account's daily allowance ran out, *papio* moved to the other one — but
+  a "slow down" the provider had asked for is about the connection, not the
+  account, and that request was left behind with the account it was recorded
+  against. *papio* could therefore keep calling from the same machine during a
+  pause it had already been told to take. It now waits out the pause whichever
+  account it belongs to, and still switches accounts when the reason really is
+  that one is out of credit.
+
+- **A reply that names two different papers is no longer half-believed.**
+  OpenAlex repeats each identifier in two places. *papio* checked only the one it
+  had searched by, and for the others quietly took whichever appeared first — so a
+  reply carrying two conflicting record numbers had one of them attached to your
+  paper as certain fact. When a reply disagrees with itself about an identifier,
+  that identifier is now discarded; the identifier that was actually verified is
+  kept.
+
+- **A paper no longer loses its place in the lookup cache to a record already
+  there.** Refreshing something the cache already held counted as needing room,
+  and evicted an unrelated paper's freshly fetched details — even though replacing
+  an entry cannot make the cache any bigger. The evicted paper then went looking
+  for related versions with nothing to search on.
+
 - **When OpenAlex says it is nearly out of budget, *papio* now stops even if it
   cannot write that down.** The warning was recorded to the database and, if that
   write failed — a busy or full disk — the warning was logged and otherwise

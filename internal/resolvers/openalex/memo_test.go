@@ -445,3 +445,61 @@ func TestIncompletePositiveMemoDoesNotSuppressACallerBasis(t *testing.T) {
 		t.Fatal("an incomplete positive memo suppressed a usable caller basis")
 	}
 }
+
+// Only a write that GROWS the map can breach the cap. Refreshing a key already
+// present ran eviction anyway, so at capacity a job's live canonical basis was
+// destroyed by unrelated repeat traffic - while the map stayed exactly the size
+// it already was. The victim was bounded and completely pointless.
+func TestMemoRefreshAtCapEvictsNothing(t *testing.T) {
+	r, _ := countingResolver(t, `{"results":[]}`)
+	basis := workRecord{Title: "Shape Trust", DOI: "https://doi.org/10.1145/3531146.3533202"}
+	r.mu.Lock()
+	// The basis is the OLDEST live entry, so any eviction pass takes it. All
+	// entries are fresh, so expiry frees nothing.
+	r.records["doi:10.1145/3531146.3533202"] = recordMemo{record: basis, found: true, at: time.Now().Add(-recordMemoTTL / 2)}
+	for i := range recordMemoCap - 1 {
+		r.records[fmt.Sprintf("doi:10.0000/filler.%d", i)] = recordMemo{
+			found: true, at: time.Now().Add(-recordMemoTTL / 4).Add(time.Duration(i) * time.Millisecond),
+		}
+	}
+	before := len(r.records)
+	r.mu.Unlock()
+	// A key that is already present: unrelated traffic re-resolving filler.0.
+	r.writeMemo("10.0000/filler.0", workRecord{}, true)
+	if _, ok := r.recordFor("10.1145/3531146.3533202"); !ok {
+		t.Fatal("refreshing an existing key evicted an unrelated live basis; a replacement cannot breach the cap")
+	}
+	r.mu.Lock()
+	after := len(r.records)
+	r.mu.Unlock()
+	if after != before {
+		t.Fatalf("map size %d -> %d, want unchanged: a replacement neither grows nor shrinks it", before, after)
+	}
+}
+
+// Verification only checks the identifier that selected the endpoint, so a DOI
+// lookup with a correct DOI echo could still publish a secondary strong
+// identifier the same response contradicted - first parseable field winning, the
+// other silently discarded, and the result attached at IdentityConfidence 1.0.
+// A response that contradicts itself about an identifier has not established it.
+func TestConflictingSecondaryIdentifierIsDropped(t *testing.T) {
+	doi := "10.1145/3531146.3533202"
+	client := clientFunc(func(*http.Request) (*http.Response, error) {
+		return responseFor(200, `{"id":"https://openalex.org/W2741809807","doi":"https://doi.org/`+doi+`","ids":{"doi":"https://doi.org/`+doi+`","openalex":"https://openalex.org/W1234567890"},"title":"Shape Trust","publication_year":2022,"open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.org/x.pdf","version":"publishedVersion"}}`, nil), nil
+	})
+	r := New(client, "contact@example.org", "private-key")
+	candidates, err := r.Resolve(context.Background(), work.Work{DOI: doi})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want the verified DOI match still published", len(candidates))
+	}
+	got := candidates[0].ResolvedWork
+	if got.DOI != doi {
+		t.Fatalf("DOI = %q, want the requested %q: the identifier that was verified survives", got.DOI, doi)
+	}
+	if got.OpenAlex != "" {
+		t.Fatalf("OpenAlex = %q, want empty: the response named W2741809807 and W1234567890 for the same work", got.OpenAlex)
+	}
+}

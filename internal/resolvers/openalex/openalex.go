@@ -496,16 +496,22 @@ func usableSiblingBasis(basis work.Work) bool {
 // between Resolve and the sibling hop silently removed that job's ability to
 // search at all.
 func (r *Resolver) writeMemo(doi string, record workRecord, found bool) {
+	key := "doi:" + doi
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.records == nil {
 		r.records = make(map[string]recordMemo)
 	}
-	if len(r.records) >= recordMemoCap {
+	// Only a write that GROWS the map can breach the cap. Refreshing a key
+	// already present used to run eviction anyway, so unrelated repeat traffic
+	// at capacity destroyed a live job's canonical basis while leaving the map
+	// exactly the size it already was - a bounded victim chosen for no reason.
+	_, replacing := r.records[key]
+	if !replacing && len(r.records) >= recordMemoCap {
 		now := time.Now()
-		for key, entry := range r.records {
+		for existing, entry := range r.records {
 			if now.Sub(entry.at) > recordMemoTTL {
-				delete(r.records, key)
+				delete(r.records, existing)
 			}
 		}
 		// If nothing had expired, evict the single oldest entry. Dropping the
@@ -527,7 +533,7 @@ func (r *Resolver) writeMemo(doi string, record workRecord, found bool) {
 			delete(r.records, oldestKey)
 		}
 	}
-	r.records["doi:"+doi] = recordMemo{record: record, found: found, at: time.Now()}
+	r.records[key] = recordMemo{record: record, found: found, at: time.Now()}
 }
 
 // echoesDOI reports whether a record is about the DOI that was requested.
@@ -696,36 +702,48 @@ func resolvedWork(record workRecord) work.Work {
 	if resolved.Year < 1 {
 		resolved.Year = 0
 	}
-	for _, raw := range []string{record.DOI, record.IDs.DOI} {
-		if doi, err := work.NormalizeDOI(raw); err == nil {
-			resolved.DOI = doi
-			break
-		}
-	}
-	for _, raw := range []string{record.IDs.PMID} {
-		if pmid, err := work.NormalizePMID(identifierTail(raw)); err == nil {
-			resolved.PMID = pmid
-			break
-		}
-	}
-	for _, raw := range []string{record.IDs.ArXiv} {
-		if arXiv, err := work.NormalizeArXiv(raw); err == nil {
-			resolved.ArXiv = arXiv
-			break
-		}
-	}
-	for _, raw := range []string{record.ID, record.IDs.OpenAlex} {
-		if openAlex, err := work.NormalizeOpenAlex(raw); err == nil {
-			resolved.OpenAlex = openAlex
-			break
-		}
-	}
+	// A duplicated identifier field must AGREE with itself, or it is dropped.
+	// Taking the first parseable value let an exact lookup launder a conflicting
+	// secondary identifier: verification only checks the identifier that selected
+	// the endpoint, so a DOI lookup that echoes its DOI correctly could still
+	// publish `ids.openalex = W2` beside `id = W1` — one silently discarded, the
+	// winner attached to a candidate at IdentityConfidence 1.0 and adopted as this
+	// work's identity. A response that contradicts itself has not identified
+	// anything, so the disagreeing field carries no identity at all.
+	resolved.DOI = agreeingIdentifier([]string{record.DOI, record.IDs.DOI}, work.NormalizeDOI)
+	resolved.PMID = agreeingIdentifier([]string{record.IDs.PMID}, func(raw string) (string, error) {
+		return work.NormalizePMID(identifierTail(raw))
+	})
+	resolved.ArXiv = agreeingIdentifier([]string{record.IDs.ArXiv}, work.NormalizeArXiv)
+	resolved.OpenAlex = agreeingIdentifier([]string{record.ID, record.IDs.OpenAlex}, work.NormalizeOpenAlex)
 	for _, authorship := range record.Authorships {
 		if name := strings.TrimSpace(authorship.Author.DisplayName); name != "" {
 			resolved.Authors = append(resolved.Authors, name)
 		}
 	}
 	return resolved
+}
+
+// agreeingIdentifier normalizes every non-empty candidate spelling of one
+// identifier and returns it only when they all agree. An unparseable or
+// disagreeing spelling yields "": the provider contradicted itself about this
+// identifier, and no reading of that is authoritative.
+func agreeingIdentifier(raws []string, normalize func(string) (string, error)) string {
+	agreed := ""
+	for _, raw := range raws {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		value, err := normalize(raw)
+		if err != nil {
+			return ""
+		}
+		if agreed != "" && value != agreed {
+			return ""
+		}
+		agreed = value
+	}
+	return agreed
 }
 
 func matchesTitleSearch(record workRecord, requested work.Work) bool {

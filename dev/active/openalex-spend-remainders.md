@@ -6,7 +6,7 @@ anonymous fallback, the fuzzy-search boundary/basis gate, and three fail-closed
 guards). Those changes are complete; git history and `CHANGELOG.md` hold the
 record.
 
-**Ten adversarial reviews, nine rewrites.** Three early rounds sharpened a
+**Eleven adversarial reviews, ten rewrites.** Three early rounds sharpened a
 two-part plan (a per-job spend guard plus a per-identity credit ceiling); a fourth,
 given no prior-round context and a wide brief, rejected the shape of both; three
 more reviewed the shipped code and found live defects in it; the eighth falsified a
@@ -17,8 +17,9 @@ its mechanism cannot deliver. Anything a review asserted about the provider or t
 language was confirmed independently before acceptance. Every finding is verified
 against the tree or the live provider before being written down. Reviews are
 preserved under `dev/scratch/oracle/20260815T*`. The tenth found no defect in shipped
-code — every finding was a plan claim the mechanism could not deliver, which is the
-first round that produced no code change.
+code — every finding was a plan claim the mechanism could not deliver. The eleventh
+found three more live defects, two of them in code earlier rounds had already fixed
+twice, so "a clean round" is not evidence of a clean slice.
 
 **Rejected designs** at the bottom records every dead end with its reason —
 twenty-three of the forty-four from earlier drafts of this file. Read it before
@@ -298,11 +299,26 @@ made perfectly crash-durable if the machine dies before any write succeeds. The
 **daily fuse**, not the header floor, is the crash-hard monetary invariant; the
 plan must not claim more for the floor than that.
 
-**Requirement: a capability boundary, not just a passing test.** "Every current
-callsite reaches the fuse" is worth asserting, but code outside the egress
-wrapper should not *possess* a client able to reach OpenAlex without the commit.
-Make the unguarded transport unconstructible from outside, then the test is a
-backstop rather than the guarantee.
+**Requirement: a capability boundary, stated as something Go can enforce.** An
+earlier draft said to make the unguarded transport "unconstructible from outside".
+That is unachievable and the review is right to reject it: `sourcegate.New` and
+`openalex.NewWithOptions` both accept a generic `HTTPClient`, and more
+fundamentally any package in the tree can build its own `http.Client` and issue an
+OpenAlex URL — the standard library exposes exactly that, deliberately. The type
+system cannot express "no code outside this wrapper possesses OpenAlex reach".
+
+The attainable property is narrower, and worth having:
+- **No production constructor hands back an OpenAlex-capable client that is not
+ already wrapped by the egress authority.** Unexport or remove the injection seams
+ that permit it, and keep the generic `HTTPClient` parameter only where a test
+ supplies it.
+- **One asserted inventory**, not a walk of current callsites: a test enumerating
+ every construction site that can reach `api.openalex.org` and failing on a new
+ one. That is a *tripwire on the tree*, honest about being a tripwire, rather than
+ a claim about what is possible in Go.
+- **The guarantee therefore rests on the debit being inside the wrapper**, and on
+ nothing else. Do not write the plan as though a capability type were doing work
+ the tripwire is actually doing.
 
 **Requirement: define the refusal taxonomy now, and make it survive `fetch`.**
 Moving refusal to HTTP egress moves it *behind* a layer that currently destroys
@@ -418,14 +434,21 @@ requests, not that its books balance to the credit.
   Otherwise keyed detects a 10→100 change, is gated, and the next call falls
   through to keyless and repeats the same undercharged shape.
 
-  **Decision: on any positive cost drift, durably close all OpenAlex egress
-  until the next UTC boundary**, and set the process latch immediately while that
-  write is being established. A process-only mark is not enough — commit 10,
-  learn the shape really cost 100, mark it closed, crash, restart, and only the
-  under-sized 10-credit debit survives, so the same operation is authorized
-  again. Closing the source rather than the individual shape avoids building a
-  second per-shape state machine for an event that should be rare and loud. Do
-  not build reconciliation to recover a few conservatively overcounted credits.
+  **Decision: on any positive cost drift, durably close all OpenAlex egress and
+  keep it closed until an explicit acknowledgement establishes a new conservative
+  cost schedule**, setting the process latch immediately while that write is being
+  established. This supersedes an earlier line in this same section that said
+  "until the next UTC boundary" — a review found both specifications stated
+  normatively, and they cannot both ship. UTC expiry is the wrong reset for this
+  refusal specifically: the classifier still says 10 after midnight, so an
+  unattended daemon repeats the undercharged request every day, once per reset,
+  forever. Drift is the one refusal in the taxonomy with no timed reopen; a
+  process-only mark is likewise not enough — commit 10, learn the shape really cost
+  100, mark it closed, crash, restart, and only the under-sized 10-credit debit
+  survives, so the same operation is authorized again. Closing the source rather
+  than the individual shape avoids building a second per-shape state machine for an
+  event that should be rare and loud. Do not build reconciliation to recover a few
+  conservatively overcounted credits.
 - **The provider reports USD as well as credits, so the unit question is settled
   by the wire, not by taste.** Measured live on every response:
   `x-ratelimit-credits-used: 1` **and** `x-ratelimit-cost-usd: 0.0001`;
@@ -612,11 +635,26 @@ a resolver. And identifiers are not in `work_requests` at all — they live in
 (`job.go:744-749`) that *errors* when a resolver reports a different value for an
 identifier the request already carried.
 
-So exactly one thing is missing, and it is a column: **`identifiers` has no
-provenance**. A DOI the user typed and a DOI adopted from a title-only match are the
-same row, and the conflict check cannot fire on the second case because there was
-nothing to conflict with. Live counts: 715 requests, 907 identifier rows, 98
-requests with no identifier at all.
+So the identifier table needs a column: **`identifiers` has no provenance**. A DOI
+the user typed and a DOI adopted from a title-only match are the same row, and the
+conflict check cannot fire on the second case because there was nothing to conflict
+with. Live counts: 715 requests, 907 identifier rows, 98 requests with no identifier
+at all.
+
+**Correction to an earlier draft of this section, which said that was the *only*
+thing missing.** It is not, and the distinction matters for exactly the comparison
+this item exists to protect. "Never overwrite a supplied value" is **not** the same
+property as "preserves the submitted snapshot": a field the user *omitted* is filled
+from the accepted record and is thereafter indistinguishable from one they supplied.
+A title-only submission is matched on normalized title alone — `matchesTitleSearch`
+skips the year test at `Year == 0` and `sameAuthorLists` accepts an empty requested
+author list — and the accepted record then supplies year and authors as well as
+identifiers. So a later "does this PDF match what was requested?" check reads a
+year and an author list that came from the very match it is meant to validate.
+Provenance is therefore needed **per field, not only per identifier**: at minimum
+`work_requests` must record which of title/year/authors were supplied at submission,
+and legacy rows must be treated as unattested for the fields whose origin was never
+recorded.
 
 The cutover is therefore:
 - Add `identifiers.provenance` (`submitted` | `verified` | `adopted`), and set it at
@@ -1042,6 +1080,39 @@ belongs in the fuse because drawing it down spends real money.
   preserves `*sourcegate.ErrQuotaLatched`; the rationale was corrected in place.
   Recorded because it is the same failure this file keeps finding: a comment
   describing intended wiring, read later as a fact about the tree.
+- **A quota-driven credential switch stepped over a durable 429 backoff.**
+ `AcquireAny` skipped an identity whose `<source>_quota` row was gated and moved
+ straight to the next policy — but durable rows are keyed by `(source, identity)`,
+ so skipping the identity skipped its ordinary rate-limit row with it. Sequence:
+ keyed request A installs the keyed floor while keyed request B takes a 429 that
+ durably gates `("openalex", keyed)`; the next pass skips keyed on quota, finds the
+ keyless row untouched, and sends **from the same IP inside the backoff the
+ provider just demanded**. This inverted the plan's own taxonomy, which says an
+ ordinary refusal never advances because the *source* is unavailable, while the
+ durable rows it reasons about are per credential. `AcquireAny` now reads the
+ skipped identity's ordinary gate (`Manager.ordinaryGate`) and returns it as a
+ non-quota `*ErrDeferred` rather than advancing. Regression:
+ `TestAcquireAnyRefusesPastAnOrdinaryGateOnASkippedIdentity`; mutation-checked.
+- **Exact-identity verification laundered a *secondary* strong identifier.**
+ `echoesDOI`/`echoesOpenAlex` prove agreement only for the identifier that selected
+ the endpoint, while `resolvedWork` took the **first parseable** value of every
+ duplicated field. So a DOI lookup that echoed its DOI perfectly could publish
+ `id: W2741809807` beside `ids.openalex: W1234567890` — one winner, one silently
+ discarded, attached to a candidate at `IdentityConfidence: 1.0` and adopted as this
+ work's identity, exactly the wrong-identity class item 5 exists to close.
+ `agreeingIdentifier` now requires every non-empty spelling of one identifier to
+ normalize to the same value, and drops the field otherwise: a response that
+ contradicts itself has not established that identifier. Regression:
+ `TestConflictingSecondaryIdentifierIsDropped`; mutation-checked. Note the fixture
+ trap found while writing it — `W1`/`W2` are not valid OpenAlex ids, so a
+ short-form fixture makes this test vacuously pass.
+- **The memo evicted a live basis to make room for a key it already had.**
+ `writeMemo` ran capacity eviction whenever `len(records) >= 512`, before checking
+ whether the key was already present. Only a write that *grows* the map can breach
+ the cap, so refreshing an existing entry destroyed an unrelated job's canonical
+ basis while leaving the map exactly the size it already was — the same
+ availability cliff as the two earlier eviction bugs, third variant. Regression:
+ `TestMemoRefreshAtCapEvictsNothing`; mutation-checked.
 
 ## Rejected designs (do not re-derive)
 
