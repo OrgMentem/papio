@@ -627,3 +627,282 @@ func TestTriageAcquireDigestsAtomicOnConflict(t *testing.T) {
 }
 
 func contains(s, substr string) bool { return strings.Contains(s, substr) }
+func TestRunDueExecutesOnlyDueWatches(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	due := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "due watch", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	notDue := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "not due", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	if err := watches.MarkRun(ctx, due.ID, now.Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := watches.MarkRun(ctx, notDue.ID, now.Add(-23*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// Both watches would be due if predicate inverted; only `due` should run.
+	discoveryFake := &fakeDiscovery{works: []discovery.DiscoveredWork{
+		{Work: work.Work{DOI: "10.1000/due-run", Title: "Due Work", Authors: []string{"Ada"}, Year: 2026}},
+	}}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}}
+	runner := &Runner{
+		Store: watches, Discovery: discoveryFake, Lookup: lookup, Submitter: &fakeSubmitter{},
+		DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	if err := runner.RunDue(ctx); err != nil {
+		t.Fatalf("RunDue() error = %v, want nil (per-watch failures are recorded, not returned)", err)
+	}
+	gotDue, err := watches.Get(ctx, due.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDue.LastRunAt != now.Format(time.RFC3339Nano) {
+		t.Fatalf("due watch LastRunAt = %q, want %q (due watch must have advanced)", gotDue.LastRunAt, now.Format(time.RFC3339Nano))
+	}
+	if gotDue.ConsecutiveFailures != 0 {
+		t.Fatalf("due watch ConsecutiveFailures = %d, want 0", gotDue.ConsecutiveFailures)
+	}
+	gotNotDue, err := watches.Get(ctx, notDue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotNotDue.LastRunAt == now.Format(time.RFC3339Nano) {
+		t.Fatalf("not-due watch LastRunAt = %q, must not have advanced", gotNotDue.LastRunAt)
+	}
+	// Inverted predicate would either leave due unadvanced or advance notDue.
+	if gotNotDue.LastRunAt != now.Add(-23*time.Hour).Format(time.RFC3339Nano) {
+		t.Fatalf("not-due watch LastRunAt = %q, want %q (must not have run)", gotNotDue.LastRunAt, now.Add(-23*time.Hour).Format(time.RFC3339Nano))
+	}
+	if len(lookup.requests) != 1 {
+		t.Fatalf("lookup requests = %d, want 1 (only due watch should have run)", len(lookup.requests))
+	}
+	digest, err := watches.Digest(ctx, due.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(digest) != 1 {
+		t.Fatalf("due watch digest = %+v, want 1 entry (observable MarkRun + RecordDigest side effect)", digest)
+	}
+	digestNotDue, err := watches.Digest(ctx, notDue.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(digestNotDue) != 0 {
+		t.Fatalf("not-due watch digest = %+v, want 0 entries", digestNotDue)
+	}
+}
+
+func TestRunDueSwallowsPerWatchFailureAndContinues(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	// Two due watches: first will fail (discovery error), second should still run.
+	firstDue := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "first due", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	secondDue := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "second due", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	if err := watches.MarkRun(ctx, firstDue.ID, now.Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := watches.MarkRun(ctx, secondDue.ID, now.Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// Discovery fake that fails on first search, succeeds on second.
+	callCount := 0
+	failingDiscovery := &failingThenSucceedingDiscovery{
+		works:     []discovery.DiscoveredWork{{Work: work.Work{DOI: "10.1000/second", Title: "Second", Authors: []string{"Ada"}, Year: 2026}}},
+		failFirst: true,
+		calls:     &callCount,
+	}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}}
+	runner := &Runner{
+		Store: watches, Discovery: failingDiscovery, Lookup: lookup, Submitter: &fakeSubmitter{},
+		DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	if err := runner.RunDue(ctx); err != nil {
+		t.Fatalf("RunDue() error = %v, want nil (per-watch failures are swallowed via RecordFailure, not returned)", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("discovery calls = %d, want 2 (RunDue must continue after first failure)", callCount)
+	}
+	gotFirst, err := watches.Get(ctx, firstDue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFirst.ConsecutiveFailures != 1 || !contains(gotFirst.LastError, "discovery search") {
+		t.Fatalf("first watch failure = %+v, want RecordFailure with discovery error", gotFirst)
+	}
+	if gotFirst.LastRunAt != now.Format(time.RFC3339Nano) {
+		t.Fatalf("first watch LastRunAt = %q, want %q (RecordFailure advances last_run_at)", gotFirst.LastRunAt, now.Format(time.RFC3339Nano))
+	}
+	gotSecond, err := watches.Get(ctx, secondDue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotSecond.ConsecutiveFailures != 0 || gotSecond.LastRunAt != now.Format(time.RFC3339Nano) {
+		t.Fatalf("second watch = %+v, want successful MarkRun despite first failure", gotSecond)
+	}
+	digest, err := watches.Digest(ctx, secondDue.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(digest) != 1 {
+		t.Fatalf("second watch digest = %+v, want 1 entry (must have run despite first failure)", digest)
+	}
+}
+
+type failingThenSucceedingDiscovery struct {
+	works     []discovery.DiscoveredWork
+	failFirst bool
+	calls     *int
+}
+
+func (f *failingThenSucceedingDiscovery) Search(_ context.Context, params discovery.SearchParams) ([]discovery.DiscoveredWork, error) {
+	*f.calls++
+	if f.failFirst && *f.calls == 1 {
+		return nil, errors.New("discovery search: OpenAlex unavailable")
+	}
+	return append([]discovery.DiscoveredWork(nil), f.works...), nil
+}
+
+func TestRunFailsWhenZotioReturnsFewerWorksThanRequests(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watched := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAcquire, Query: "zotio mismatch run", Collection: "Reading", CadenceHours: 24, PerRunCap: 5,
+	})
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	works := []discovery.DiscoveredWork{
+		{Work: work.Work{DOI: "10.1000/one", Title: "One", Authors: []string{"Ada"}, Year: 2026}},
+		{Work: work.Work{DOI: "10.1000/two", Title: "Two", Authors: []string{"Ada"}, Year: 2026}},
+	}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{
+		Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}},
+	}}
+	submitter := &fakeSubmitter{}
+	runner := &Runner{
+		Store: watches, Discovery: &fakeDiscovery{works: works}, Lookup: lookup, Submitter: submitter,
+		DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	_, err := runner.Run(ctx, watched.ID)
+	if err == nil || !contains(err.Error(), "Zotio ownership lookup returned 1 results for 2 works") {
+		t.Fatalf("Run() error = %v, want Zotio cardinality mismatch", err)
+	}
+	if contains(err.Error(), "stale") {
+		t.Fatalf("Run() error = %v, must not be staleness warning (stub has no warning)", err)
+	}
+	if len(submitter.calls) != 0 {
+		t.Fatalf("submitted = %+v, want no acquisition after cardinality mismatch (fail-closed)", submitter.calls)
+	}
+	stored, err := watches.Get(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConsecutiveFailures != 1 {
+		t.Fatalf("ConsecutiveFailures = %d, want 1 (fail-closed: no MarkRun, recorded via RecordFailure)", stored.ConsecutiveFailures)
+	}
+	if stored.LastRunAt != now.Format(time.RFC3339Nano) {
+		t.Fatalf("LastRunAt = %q, want %q (RecordFailure must advance last_run_at)", stored.LastRunAt, now.Format(time.RFC3339Nano))
+	}
+	if !contains(stored.LastError, "Zotio ownership lookup returned 1 results for 2 works") {
+		t.Fatalf("LastError = %q, want cardinality mismatch", stored.LastError)
+	}
+	// Alert-mode variant of the same guard (same executeBody line 497-499, but
+	// alert path also fails closed with no digest recorded).
+	alertWatch := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "zotio mismatch alert", Collection: "Reading", CadenceHours: 24, PerRunCap: 5,
+	})
+	alertRunner := &Runner{
+		Store: watches, Discovery: &fakeDiscovery{works: works},
+		Lookup:    &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}},
+		Submitter: &fakeSubmitter{}, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	_, err = alertRunner.Run(ctx, alertWatch.ID)
+	if err == nil || !contains(err.Error(), "Zotio ownership lookup returned 1 results for 2 works") {
+		t.Fatalf("alert Run() error = %v, want Zotio cardinality mismatch", err)
+	}
+	if digest, err := watches.Digest(ctx, alertWatch.ID, 100); err != nil || len(digest) != 0 {
+		t.Fatalf("alert digest after mismatch = %+v, %v; want no entries (fail-closed)", digest, err)
+	}
+}
+
+func TestAcquireDigestFailsClosedWhenZotioReturnsFewerWorksThanRequests(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "digest mismatch", Collection: "Reading", CadenceHours: 24, PerRunCap: 5,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{
+		{WorkKey: "10.1000/one", Title: "One", DOI: "10.1000/one"},
+		{WorkKey: "10.1000/two", Title: "Two", DOI: "10.1000/two"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{
+		Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}},
+	}}
+	submitter := &fakeSubmitter{}
+	runner := &Runner{
+		Store: watches, Lookup: lookup, Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	queued, err := runner.AcquireDigest(ctx, created.ID, nil)
+	if err == nil || !contains(err.Error(), "Zotio ownership lookup returned 1 results for 2 works") || queued != 0 {
+		t.Fatalf("AcquireDigest() = %d, %v; want 0 and Zotio cardinality mismatch", queued, err)
+	}
+	if len(lookup.requests) != 1 || len(lookup.requests[0].Works) != 2 {
+		t.Fatalf("lookup requests = %+v, want one lookup for 2 entries", lookup.requests)
+	}
+	if len(submitter.calls) != 0 {
+		t.Fatalf("submitted = %+v, want no submission after cardinality mismatch", submitter.calls)
+	}
+	entries, err := watches.Digest(ctx, created.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("digest after mismatch = %+v, want 2 pending entries (fail-closed, not consumed)", entries)
+	}
+	// Nil result variant exercises ownershipCount(nil)==0 branch at :161.
+	nilLookup := &fakeLookup{result: nil}
+	runner2 := &Runner{
+		Store: watches, Lookup: nilLookup, Submitter: &fakeSubmitter{}, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	queued, err = runner2.AcquireDigest(ctx, created.ID, nil)
+	if err == nil || !contains(err.Error(), "Zotio ownership lookup returned 0 results for 2 works") || queued != 0 {
+		t.Fatalf("AcquireDigest(nil) = %d, %v; want 0 results for 2 works", queued, err)
+	}
+}
+
+func TestAcquireDigestFailsClosedWhenZotioReturnsFewerWorksThanRequestsViaAcquireDigests(t *testing.T) {
+	// Exercises the same guard at :161 through the multi-watch AcquireDigests entry point.
+	ctx := context.Background()
+	watches := testStore(t)
+	w1 := createWatch(t, watches, CreateInput{Kind: KindDiscovery, Mode: ModeAlert, Query: "w1 mismatch", Collection: "Reading", CadenceHours: 24, PerRunCap: 5})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, w1.ID, now, []DigestEntry{{WorkKey: "10.1000/a", Title: "A", DOI: "10.1000/a"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Directly test the N-1 branch via a single-target AcquireDigests that still
+	// goes through acquireDigestWithEntriesLocked's cardinality check.
+	runner := &Runner{
+		Store: watches, Lookup: &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{}}},
+		Submitter: &fakeSubmitter{}, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	err := runner.AcquireDigests(ctx, []DigestTarget{{WatchID: w1.ID, WorkKey: "10.1000/a"}})
+	if err == nil || !contains(err.Error(), "Zotio ownership lookup returned 0 results for 1 works") {
+		t.Fatalf("AcquireDigests() error = %v, want Zotio cardinality mismatch", err)
+	}
+	entries, err := watches.Digest(ctx, w1.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("digest after AcquireDigests mismatch = %+v, want 1 pending entry", entries)
+	}
+}

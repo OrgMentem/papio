@@ -304,14 +304,13 @@ func TestStoreVerbatimHostRoundTrip(t *testing.T) {
 	byHost := map[string]bool{}
 	for _, c := range listed {
 		byHost[c.Host] = true
-		// The reported host must be the verbatim input, not a sanitized dir name.
-		if strings.Contains(c.Host, "%") {
-			// Percent is only in dir names; metadata host should not contain it unless verbatim did.
-			// Check dir matches encoded form.
-			dir := filepath.Base(filepath.Dir(c.Path))
-			if dir != hostDirName(c.Host) {
-				t.Fatalf("capture dir %q != hostDirName(%q)=%q", dir, c.Host, hostDirName(c.Host))
-			}
+		// The reported host must be the verbatim input, not the sanitized dir
+		// name, and the dir must be exactly that host's encoded form. This ran
+		// under a `strings.Contains(c.Host, "%")` guard that no input in this
+		// table satisfies, so it never executed.
+		dir := filepath.Base(filepath.Dir(c.Path))
+		if dir != hostDirName(c.Host) {
+			t.Fatalf("capture dir %q != hostDirName(%q)=%q", dir, c.Host, hostDirName(c.Host))
 		}
 	}
 	for _, h := range hosts {

@@ -330,3 +330,49 @@ func TestWithoutEnvRemovesAmbientGroupScope(t *testing.T) {
 		t.Fatalf("filtered env = %v", got)
 	}
 }
+func TestCommandName(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "plain", args: []string{"capabilities"}, want: "capabilities"},
+		{name: "plain-version", args: []string{"version", "--agent"}, want: "version"},
+		{name: "flag-prefixed", args: []string{"--agent", "sync"}, want: "sync"},
+		{name: "flag-prefixed-items", args: []string{"--agent", "items", "get", "AB12CD34"}, want: "items"},
+		{name: "subcommand-import", args: []string{"import", "apply"}, want: "import"},
+		{name: "empty-nil", args: nil, want: "command"},
+		{name: "empty-slice", args: []string{}, want: "command"},
+		{name: "degenerate-flags-only", args: []string{"--agent", "--yes"}, want: "command"},
+		{name: "degenerate-single-dash", args: []string{"-v"}, want: "command"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commandName(tc.args); got != tc.want {
+				t.Fatalf("commandName(%q) = %q, want %q", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// The operator-facing `zotio <command>: <detail>` label that run() builds on
+// its error path (client.go:405) is unreachable through the Exec seam, which
+// short-circuits at client.go:355 before that wrap. A table driving Exec can
+// only assert the formatting its own fake performed, so it would pass even if
+// run() stopped embedding commandName. TestCommandName pins commandName
+// directly; this pins the property that does survive the seam: a higher-level
+// wrapper must preserve the inner label verbatim rather than replacing it.
+func TestCommandLabelSurvivesPreflightWrapper(t *testing.T) {
+	client := &Client{Executable: "zotio", Exec: func(_ context.Context, args ...string) ([]byte, error) {
+		return nil, fmt.Errorf("zotio %s: %s", commandName(args), "boom")
+	}}
+	_, err := client.Preflight(context.Background())
+	if err == nil {
+		t.Fatal("Preflight expected error, got nil")
+	}
+	// Preflight runs "version --agent" first, so the label must name "version".
+	const want = "zotio version: boom"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Preflight err=%q, want to contain %q", err.Error(), want)
+	}
+}

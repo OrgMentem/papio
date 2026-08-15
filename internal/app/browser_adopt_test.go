@@ -4,8 +4,12 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -925,5 +929,279 @@ func TestTighteningTheDaemonModeRestrainsAlreadySubmittedJobs(t *testing.T) {
 	}
 	if !kinds["openurl_available"] {
 		t.Fatalf("open actions = %v, want the conservative advisory", kinds)
+	}
+}
+
+// TestAdoptDownloadWithContext_GateRejectsBeforeAdopt verifies the
+// security-relevant ordering: the BrowserAccessBasis gate must reject BEFORE
+// adopting the file. Moving the check after AdoptDownloadCandidate would let
+// the file be ingested (candidate row, state change, file consumed) even
+// though the provenance is invalid.
+func TestAdoptDownloadWithContext_GateRejectsBeforeAdopt(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_ctx_gate_reject")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	body := pdfBytes("gate-reject")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// "oa" with any evidence other than "none" is invalid per
+	// job.BrowserAccessBasis — pick a genuinely invalid pair.
+	route, evidence := "oa", "fresh_auth"
+	_, wantErr := job.BrowserAccessBasis(route, evidence)
+	if wantErr == nil {
+		t.Fatalf("chosen pair %q/%q should be rejected by BrowserAccessBasis", route, evidence)
+	}
+	ctx := context.Background()
+	candidateID, err := svc.AdoptDownloadWithContextCandidate(ctx, id, path, &BrowserDeliveryContext{
+		Route: route, SessionEvidence: evidence, PageHost: "example.test",
+	})
+	if err == nil {
+		t.Fatalf("AdoptDownloadWithContextCandidate should reject invalid context, got id %d", candidateID)
+	}
+	if err.Error() != wantErr.Error() {
+		t.Fatalf("gate error = %q, want %q (the exact BrowserAccessBasis error)", err.Error(), wantErr.Error())
+	}
+	if candidateID != 0 {
+		t.Fatalf("rejected gate must return zero candidate id, got %d", candidateID)
+	}
+	// No adoption side effect must have occurred.
+	var count int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM candidates WHERE job_id = ?`, id).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("rejected adoption created %d candidate rows, want 0 — gate must be before AdoptDownloadCandidate", count)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("job state after rejected gate = %s, want %s (unchanged)", row.State, job.StateAwaitingHuman)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("file at original path should remain after gate rejection, stat: %v", statErr)
+	}
+	// The error-only wrapper must behave identically and also not adopt.
+	if err := svc.AdoptDownloadWithContext(ctx, id, path, &BrowserDeliveryContext{
+		Route: route, SessionEvidence: evidence, PageHost: "example.test",
+	}); err == nil || err.Error() != wantErr.Error() {
+		t.Fatalf("AdoptDownloadWithContext wrapper gate error = %v, want %q", err, wantErr.Error())
+	}
+	var count2 int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM candidates WHERE job_id = ?`, id).Scan(&count2); err != nil {
+		t.Fatal(err)
+	}
+	if count2 != 0 {
+		t.Fatalf("wrapper rejected adoption created %d candidates, want 0", count2)
+	}
+}
+
+func TestAdoptDownloadWithContext_NilContextShortCircuits(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	ctx := context.Background()
+	// First job: exercised via the nil-context path.
+	id1 := parkAwaitingHuman(t, jobs, "wr_ctx_nil_1")
+	dir1 := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id1)
+	if err := os.MkdirAll(dir1, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path1 := filepath.Join(dir1, "paper.pdf")
+	if err := os.WriteFile(path1, pdfBytes("nil-context"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidateID, err := svc.AdoptDownloadWithContextCandidate(ctx, id1, path1, nil)
+	if err != nil {
+		t.Fatalf("nil context should short-circuit to plain adoption: %v", err)
+	}
+	if candidateID == 0 {
+		t.Fatal("nil context adoption must return a non-zero candidate id on success")
+	}
+	row, err := jobs.Get(ctx, id1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateReady {
+		t.Fatalf("nil-context adoption left job in %s, want ready (same as plain path)", row.State)
+	}
+	if err := svc.Artifacts.Verify(row.ArtifactSHA256); err != nil {
+		t.Fatalf("nil-context artifact verify: %v", err)
+	}
+	// Second job: plain AdoptDownloadCandidate baseline — same bytes, same
+	// outcome, proving the nil path behaves exactly like the plain path.
+	id2 := parkAwaitingHuman(t, jobs, "wr_ctx_nil_2")
+	dir2 := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id2)
+	if err := os.MkdirAll(dir2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path2 := filepath.Join(dir2, "paper.pdf")
+	if err := os.WriteFile(path2, pdfBytes("nil-context-plain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plainID, err := svc.AdoptDownloadCandidate(ctx, id2, path2)
+	if err != nil {
+		t.Fatalf("plain AdoptDownloadCandidate: %v", err)
+	}
+	if plainID == 0 {
+		t.Fatal("plain adoption must return non-zero candidate id")
+	}
+	// Also verify the error-only wrapper with nil context succeeds.
+	id3 := parkAwaitingHuman(t, jobs, "wr_ctx_nil_3")
+	dir3 := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id3)
+	if err := os.MkdirAll(dir3, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path3 := filepath.Join(dir3, "paper.pdf")
+	if err := os.WriteFile(path3, pdfBytes("nil-context-wrapper"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownloadWithContext(ctx, id3, path3, nil); err != nil {
+		t.Fatalf("AdoptDownloadWithContext with nil should succeed: %v", err)
+	}
+}
+
+func TestAdoptDownloadWithContext_AppliesProvenanceAndLanding(t *testing.T) {
+	validRoute, validEvidence := "direct", "fresh_auth"
+	if _, err := job.BrowserAccessBasis(validRoute, validEvidence); err != nil {
+		t.Fatalf("chosen valid pair %q/%q should be accepted: %v", validRoute, validEvidence, err)
+	}
+	t.Run("https landing from PageHost", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		svc.Validate = passValidation()
+		ctx := context.Background()
+		id := parkAwaitingHuman(t, jobs, "wr_ctx_landing_https")
+		dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "paper.pdf")
+		if err := os.WriteFile(path, pdfBytes("landing-https"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		pageHost := "example.test"
+		candidateID, err := svc.AdoptDownloadWithContextCandidate(ctx, id, path, &BrowserDeliveryContext{
+			Route: validRoute, SessionEvidence: validEvidence, PageHost: pageHost,
+		})
+		if err != nil {
+			t.Fatalf("adoption with valid context: %v", err)
+		}
+		if candidateID == 0 {
+			t.Fatal("expected non-zero candidate id")
+		}
+		cand, err := jobs.GetCandidate(ctx, candidateID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cand.BrowserRoute != validRoute || cand.SessionEvidence != validEvidence {
+			t.Fatalf("candidate provenance = %q/%q, want %q/%q", cand.BrowserRoute, cand.SessionEvidence, validRoute, validEvidence)
+		}
+		wantLanding := "https://" + pageHost
+		if cand.LandingRedacted != wantLanding {
+			t.Fatalf("landing = %q, want %q", cand.LandingRedacted, wantLanding)
+		}
+		// AccessBasis should be derived via BrowserAccessBasis.
+		wantBasis, _ := job.BrowserAccessBasis(validRoute, validEvidence)
+		if cand.AccessBasis != wantBasis {
+			t.Fatalf("access_basis = %q, want %q", cand.AccessBasis, wantBasis)
+		}
+	})
+	t.Run("empty PageHost yields empty landing", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		svc.Validate = passValidation()
+		ctx := context.Background()
+		id := parkAwaitingHuman(t, jobs, "wr_ctx_landing_empty")
+		dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "paper.pdf")
+		if err := os.WriteFile(path, pdfBytes("landing-empty"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		candidateID, err := svc.AdoptDownloadWithContextCandidate(ctx, id, path, &BrowserDeliveryContext{
+			Route: validRoute, SessionEvidence: validEvidence, PageHost: "",
+		})
+		if err != nil {
+			t.Fatalf("adoption with empty PageHost: %v", err)
+		}
+		cand, err := jobs.GetCandidate(ctx, candidateID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cand.LandingRedacted != "" {
+			t.Fatalf("empty PageHost should yield empty landing, got %q (must not be bare https://)", cand.LandingRedacted)
+		}
+		if cand.LandingRedacted == "https://" {
+			t.Fatal("landing must not be bare https:// when PageHost is empty")
+		}
+	})
+}
+
+func TestAdoptDownloadWithContext_UnappliedReturnsCandidateIDAndError(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_ctx_unapplied")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := pdfBytes("unapplied-context")
+	path := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-insert a non-browser candidate with the same content-hash key so
+	// AdoptDownloadCandidate reuses it (INSERT OR IGNORE) but the subsequent
+	// ApplyBrowserDeliveryContextToCandidate WHERE source='browser' matches
+	// zero rows and reports applied==false. This drives case 4 through the
+	// same store API the production code uses, without adding a seam.
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	key := "browser-adopt:sha256:" + sha
+	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "fixture", URLRedacted: "https://example.test/paper.pdf",
+		URLKey: key, Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen,
+		ReuseLicense: "unknown", ExpectedMIME: "application/pdf", Direct: true,
+		IdentityConfidence: 1,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: the pre-inserted row exists and is non-browser.
+	var preID int64
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT id FROM candidates WHERE job_id = ? AND url_key = ?`, id, key).Scan(&preID); err != nil {
+		t.Fatal(err)
+	}
+	if preID == 0 {
+		t.Fatal("pre-inserted candidate id should be non-zero")
+	}
+	candidateID, err := svc.AdoptDownloadWithContextCandidate(ctx, id, path, &BrowserDeliveryContext{
+		Route: "direct", SessionEvidence: "fresh_auth", PageHost: "example.test",
+	})
+	if err == nil {
+		t.Fatal("expected error when Apply reports applied==false")
+	}
+	if candidateID == 0 {
+		t.Fatal("unapplied context must still return a non-zero candidate id")
+	}
+	if candidateID != preID {
+		t.Fatalf("returned candidate id %d should be the reused pre-inserted row %d", candidateID, preID)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, id) {
+		t.Fatalf("error %q must name the job %q", msg, id)
+	}
+	if !strings.Contains(msg, fmt.Sprintf("%d", candidateID)) {
+		t.Fatalf("error %q must name candidate %d", msg, candidateID)
+	}
+	if !strings.Contains(msg, "browser delivery candidate") || !strings.Contains(msg, "is unavailable for job") {
+		t.Fatalf("error %q should contain 'browser delivery candidate <id> is unavailable for job <id>'", msg)
 	}
 }

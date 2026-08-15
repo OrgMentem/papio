@@ -18,6 +18,7 @@ import (
 	"papio/internal/artifact"
 	"papio/internal/budget"
 	"papio/internal/config"
+	"papio/internal/delivery"
 	"papio/internal/discovery"
 	"papio/internal/fetch"
 	"papio/internal/hook"
@@ -3093,4 +3094,172 @@ func TestProcessRejectsMissingFetchOrValidateDependencies(t *testing.T) {
 			}
 		})
 	}
+}
+func TestDeliveryJoinPollAtBoundaries(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	future := now.Add(4 * time.Hour).Format(time.RFC3339Nano)
+	past := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	justFuture := now.Add(time.Nanosecond).Format(time.RFC3339Nano)
+	exactNow := now.Format(time.RFC3339Nano)
+	defaultNext := now.Add(time.Hour) // NextCheck(now,0,0) == now+60m
+
+	cases := []struct {
+		name string
+		ex   *delivery.Request
+		want time.Time
+	}{
+		{"nil request falls back to default cadence", nil, defaultNext},
+		{"empty NextCheckAt falls back to default cadence", &delivery.Request{}, defaultNext},
+		{"invalid NextCheckAt falls back to default cadence", &delivery.Request{NextCheckAt: "not-a-time"}, defaultNext},
+		{"past NextCheckAt falls back to default cadence", &delivery.Request{NextCheckAt: past}, defaultNext},
+		{"exact now is not after, falls back to default cadence", &delivery.Request{NextCheckAt: exactNow}, defaultNext},
+		{"future NextCheckAt is reused verbatim", &delivery.Request{NextCheckAt: future}, mustParseRFC3339Nano(t, future)},
+		{"just-after-now is still in the future and reused", &delivery.Request{NextCheckAt: justFuture}, mustParseRFC3339Nano(t, justFuture)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := deliveryJoinPollAt(now, c.ex)
+			if !got.Equal(c.want) {
+				t.Fatalf("deliveryJoinPollAt(%v,%v)=%v want %v (delta %v)", now, exSummary(c.ex), got, c.want, got.Sub(c.want))
+			}
+		})
+	}
+
+	// Perturbation guard: the fallback must be exactly NextCheck(now,0,0)
+	// (60m default). If the default or base ever changes, this fails.
+	t.Run("fallback arithmetic is exactly 60m", func(t *testing.T) {
+		got := deliveryJoinPollAt(now, nil)
+		if got != now.Add(time.Hour) {
+			t.Fatalf("fallback = %v, want %v (exactly 60m)", got, now.Add(time.Hour))
+		}
+		// One nanosecond earlier must still reuse; one nanosecond equal must not.
+		futureOneNs := now.Add(time.Nanosecond).Format(time.RFC3339Nano)
+		if g := deliveryJoinPollAt(now, &delivery.Request{NextCheckAt: futureOneNs}); !g.Equal(mustParseRFC3339Nano(t, futureOneNs)) {
+			t.Fatalf("nanosecond-future not reused: %v", g)
+		}
+		if g := deliveryJoinPollAt(now, &delivery.Request{NextCheckAt: now.Format(time.RFC3339Nano)}); !g.Equal(now.Add(time.Hour)) {
+			t.Fatalf("exact-now should fall back to 60m, got %v", g)
+		}
+	})
+}
+
+func mustParseRFC3339Nano(t *testing.T, s string) time.Time {
+	t.Helper()
+	v, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		t.Fatalf("parse %q: %v", s, err)
+	}
+	return v
+}
+
+func exSummary(ex *delivery.Request) string {
+	if ex == nil {
+		return "<nil>"
+	}
+	if ex.NextCheckAt == "" {
+		return "<empty>"
+	}
+	return ex.NextCheckAt
+}
+func TestReconciliationAttemptCountSemantics(t *testing.T) {
+	ctx := context.Background()
+	reconCases := []struct {
+		name      string
+		requestID int64
+		seed      func(*testing.T, *job.Store, string)
+		want      int
+	}{
+		{
+			name:      "empty events returns zero",
+			requestID: 42,
+			seed:      func(t *testing.T, jobs *job.Store, id string) {},
+			want:      0,
+		},
+		{
+			name:      "counts only delivery.reconciliation_attempt for matching request",
+			requestID: 7,
+			seed: func(t *testing.T, jobs *job.Store, id string) {
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(7), "attempt": 1})
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(7), "attempt": 2})
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(8), "attempt": 1})
+				_ = jobs.RecordEvent(ctx, id, "zotio.auto_import", map[string]any{"status": "applied"})
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": "not-a-number"})
+			},
+			want: 2,
+		},
+		{
+			name:      "other request id counted separately",
+			requestID: 9,
+			seed: func(t *testing.T, jobs *job.Store, id string) {
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(7)})
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(7)})
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(9)})
+			},
+			want: 1,
+		},
+		{
+			name:      "zero request id matches only zero",
+			requestID: 0,
+			seed: func(t *testing.T, jobs *job.Store, id string) {
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(0)})
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(1)})
+			},
+			want: 1,
+		},
+		{
+			name:      "non-numeric detail ignored (not counted)",
+			requestID: 7,
+			seed: func(t *testing.T, jobs *job.Store, id string) {
+				_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": "oops"})
+			},
+			want: 0,
+		},
+	}
+	for _, c := range reconCases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			// Build a valid request_id from the case name: A-Za-z0-9_- only, 8-128 chars.
+			safe := strings.ReplaceAll(c.name, " ", "_")
+			safe = strings.ReplaceAll(safe, ".", "_")
+			safe = strings.ReplaceAll(safe, "(", "_")
+			safe = strings.ReplaceAll(safe, ")", "_")
+			id, err := svc.Submit(ctx, doiRequestFor("wr_recon_"+safe))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = c.name
+			c.seed(t, jobs, id)
+			got := reconciliationAttemptCount(ctx, jobs, id, c.requestID)
+			if got != c.want {
+				t.Fatalf("reconciliationAttemptCount(...,%d)=%d want %d", c.requestID, got, c.want)
+			}
+		})
+	}
+
+	t.Run("missing job returns zero not panic", func(t *testing.T) {
+		_, jobs := newTestService(t)
+		if got := reconciliationAttemptCount(ctx, jobs, "does-not-exist", 1); got != 0 {
+			t.Fatalf("missing job got %d want 0", got)
+		}
+	})
+
+	t.Run("counts across interleaved events exactly", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		id, err := svc.Submit(ctx, doiRequestFor("wr_count_interleaved"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(99)})
+		_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(99)})
+		_ = jobs.RecordEvent(ctx, id, "delivery.reconciliation_attempt", map[string]any{"delivery_request_id": float64(100)})
+		if got := reconciliationAttemptCount(ctx, jobs, id, 99); got != 2 {
+			t.Fatalf("count for 99 = %d, want 2", got)
+		}
+		if got := reconciliationAttemptCount(ctx, jobs, id, 100); got != 1 {
+			t.Fatalf("count for 100 = %d, want 1", got)
+		}
+		if got := reconciliationAttemptCount(ctx, jobs, id, 101); got != 0 {
+			t.Fatalf("count for 101 = %d, want 0", got)
+		}
+	})
 }
