@@ -269,17 +269,64 @@ reset via `InsertCandidates`' inserted-row count, a separate
 mandatory regression that crossing the ceiling must **not** make `atBoundary`
 true) is in git history at the third rewrite of this file.
 
+## 7. Two-step sibling basis, admitted and charged per call
+
+The availability gap left open by the reverted re-earn: a DOI-only job whose own
+metadata carries no title cannot search for siblings when the memo has expired or
+been evicted, and silently discovers nothing. The adapter cannot fix this, which
+is what the revert established — a resolver that pays for a second request inside
+one admission breaks both the "no request happened" sentinel and the
+one-admission-one-wire rule.
+
+**The caller owns it.** `app.resolveSiblings` should treat `ErrNoSearchBasis` as
+"this adapter needs a basis" and then, under its *own* separate admission and
+charge, ask the adapter for one — a `SiblingBasis(ctx, work) (work.Work, error)`
+capability that performs exactly the one-credit singleton lookup — before
+re-admitting and calling `ResolveSiblings` with the enriched work. Three
+properties fall out for free: each paid request is separately admitted, so a
+quota floor installed by the singleton's own response stops the search; the
+sentinel keeps meaning "no request happened"; and the durable basis marker is
+computed by the app from the work it actually passed, so it names the question
+that was really asked. That last point is a defect in the shipped marker
+today — the app hashes `row.Work` while the adapter may search a memoized
+canonical title — and this is its fix.
+
+## 8. Do not enrich the canonical work from an unvalidated fuzzy sibling
+
+A fuzzy sibling is accepted on normalized-title plus surname/year heuristics at
+`IdentityConfidence: 0.6`, and it deliberately names a *different* DOI. But back
+in `resolve`, every ranked candidate feeds `fillMissing`, and the merged result is
+persisted by `FillWorkMetadata` **before** fetch and semantic validation — even
+though PDF semantic identity is supposed to be the acceptance gate for exactly
+these candidates.
+
+Sequence: citation is DOI X with a sparse bibliography; canonical X establishes a
+common title; fuzzy result Y shares that normalized title, a surname, and a
+nearby year but is another work; Y's title/year/authors are persisted alongside
+DOI X before Y's PDF proves anything. Even when validation later rejects Y, the
+job is already bibliographically contaminated — and a validator that trusts the
+enriched work is then less independent, which is the self-confirming loop item 5
+describes.
+
+**Rule:** only DOI-verified canonical metadata may enrich the work pre-validation.
+Fuzzy-sibling metadata may inform candidate ranking and nothing else until its
+artifact passes identity validation. Audit `fillMissing`, `conflicts`, and
+`FillWorkMetadata` against that, and run `make identity-corpus` before and after.
+
 ## Ordering
 
-**`(0 estimate ‖ 5 identity audit)` alongside `(1+2 egress authority)` → 3
-truthful park → 4 jitter → 6 (deferrable only once 1+2 is deployed).**
+**`(0 estimate ‖ 5 identity audit ‖ 8 no fuzzy pre-enrichment)` alongside
+`(1+2 egress authority)` → 3 truthful park → 4 jitter → 7 two-step basis → 6
+(deferrable only once 1+2 is deployed).**
 
-The earlier draft wrote `… → 4 → 5` while its own prose said item 5 must not
-queue behind spend work; the two contradicted each other and the ordering above
-is the honest one. Item 0 informs whether the fuzzy search stays enabled but
-gates nothing. Items 1+2 are one boundary and one migration. Item 5 is a
-different class of risk — the only failure mode here that cannot be undone — and
-runs in parallel.
+An earlier draft wrote `… → 4 → 5` while its own prose said item 5 must not queue
+behind spend work; the two contradicted each other and the ordering above is the
+honest one. Item 0 informs whether the fuzzy search stays enabled but gates
+nothing. Items 1+2 are one boundary and one migration. Items 5 and 8 are the same
+class of risk — the only failure mode here that cannot be undone — and 8 is small
+and self-contained, so it should not wait. Item 7 restores an availability
+property and is cheapest once 1+2 has settled how admission is expressed, because
+it needs two admissions per hop.
 
 Each migration means daemon and CLI deploy together (`make dev-deploy`), which on
 this machine means both *papio* binaries plus the native-host symlink.
@@ -313,21 +360,55 @@ for real dollars. A billing feature, not a safety mechanism.
   `retryBudgetExhaustedProven` (returns the read error; only a proven fact is a
   permit). Regression:
   `TestUnreadableHistoryIsNoPermitForTheExpensiveSearch`.
-- **The memo made cache residency part of acquisition correctness.** At the cap,
-  `writeMemo` dropped the entire map, and a DOI-only job whose caller metadata
-  has no title depends on that memo for its search basis — so unrelated traffic
-  crossing the cap, or a fetch taking longer than the two-minute TTL, silently
-  cancelled that job's sibling discovery, where the pre-memo code did a
-  canonical GET. Two fixes: the cap now evicts expired entries first and drops
-  wholesale only if that frees nothing, and a missing basis is re-earned with the
-  one-credit singleton lookup (`canonicalRecord`) instead of being assumed
-  absent. Only a DOI the provider does not know still yields
-  `ErrNoSearchBasis`. Regressions: `TestSiblingWithoutBasisReearnsItCheaply`,
-  `TestSiblingStaleMemoReearnsBasis`, `TestMemoCapEvictsOnlyExpiredEntries`,
-  `TestSiblingNoSearchBasisAfterUnknownDOI`.
+- **The memo made cache residency part of acquisition correctness — half fixed,
+  half reverted.** At the cap, `writeMemo` dropped the entire map, and a DOI-only
+  job whose caller metadata has no title depends on that memo for its search
+  basis, so unrelated traffic crossing the cap silently cancelled that job's
+  sibling discovery. The cap now evicts expired entries first and drops
+  wholesale only if that frees nothing (`TestMemoCapEvictsOnlyExpiredEntries`),
+  and a fresh negative memo is now consulted instead of being reported like an
+  absent one, so a DOI the provider does not know costs nothing to re-ask inside
+  the TTL (`TestSiblingHonoursAFreshNegativeMemo`).
+
+  **The one-credit basis re-earn was reverted.** It closed the availability gap
+  and opened three worse holes, all found in review: it broke the
+  `ErrNoSearchBasis` contract (the caller reads that sentinel as "the adapter
+  made no request at all" and skips charging, so a paid singleton followed by
+  the sentinel put a false fact in the retry plan — the exact class of defect
+  this whole change set exists to remove); it let one `AcquireAny` admission
+  cover two HTTP requests, so the ten-credit search could go out *after* the
+  singleton's own response had installed the quota floor; and it made the
+  durable basis marker name a question that was not the one searched, because
+  the app hashes `row.Work` while the adapter searched the canonical record's
+  title. **The gap is real and remains open**; the fix belongs to the caller,
+  which can admit and charge two calls separately — see item 7 below.
+- **A misrouted record could still be accepted and cached.** `echoesDOI` took the
+  first parseable identity and stopped, so a record whose `doi` named the
+  requested work while `ids.doi` named a different one passed. It now requires at
+  least one parseable DOI and demands that *every* parseable echo equal the
+  requested one, rejecting internally inconsistent records rather than trusting
+  field order — and it is applied before the memo write, so an unverified record
+  never becomes a later pass's search basis. Regressions:
+  `TestEchoedDOIRejectsInconsistentIdentities`,
+  `TestMisroutedRecordIsNeitherPublishedNorMemoized`.
+- **An illegible transition detail silently shrank the retry budget's evidence.**
+  `retryBudgetExhaustedProven` type-asserted the detail map and treated a nil
+  result as a transition that does not count, so corrupt history read as *more*
+  budget remaining. It now returns an error, which the fail-closed liveness
+  wrapper turns into "stop" while the permit path correctly declines to treat it
+  as proof.
 
 ## Rejected designs (do not re-derive)
 
+- **Re-earning a sibling search basis inside `ResolveSiblings`.** Shipped and
+  reverted within the hour. One admission covered two HTTP requests, so the
+  ten-credit search could go out after the singleton's own response had installed
+  the quota floor; a paid singleton followed by `ErrNoSearchBasis` put a false
+  "no request happened" fact into the retry plan; and the durable marker then
+  named a question that was not the one searched. Item 7 is the caller-side fix.
+- **Accepting a record on the first parseable DOI echo.** A record naming the
+  requested work in `doi` and a different one in `ids.doi` passed. Every parseable
+  echo must agree.
 - **Re-basing `retryBudgetExhausted` on a lifetime `PaidAttempts(jobID)` count.**
   Wrong dimension (58–1,470 attempt rows per settled job, worst 4,949), and it
   inverts the sibling gate: that predicate is what *permits* the ten-credit

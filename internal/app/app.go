@@ -1881,7 +1881,16 @@ func (s *Service) retryBudgetExhaustedProven(ctx context.Context, jobID string) 
 		if kind, _ := event["kind"].(string); kind != "job.transition" {
 			continue
 		}
-		detail, _ := event["detail"].(map[string]any)
+		detail, ok := event["detail"].(map[string]any)
+		if !ok {
+			// Jobs.Events decodes each detail with `_ = json.Unmarshal(...)`, so
+			// an illegible row arrives as a nil map rather than an error.
+			// Skipping it would silently shrink the retry budget's evidence and
+			// let a job keep spending; a transition to some unknown state is
+			// still a transition this job made, so surface the doubt to the
+			// caller and let each read decide what unknown means.
+			return false, fmt.Errorf("job %s: unreadable transition detail", jobID)
+		}
 		if to, _ := detail["to"].(string); to != job.StateRetryWait {
 			continue
 		}

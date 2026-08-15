@@ -86,83 +86,87 @@ func TestSiblingColdMemoSearchesCallerMetadata(t *testing.T) {
 	}
 }
 
-// With a DOI but no basis anywhere, the hop re-earns one with the SINGLETON
-// lookup (one credit) rather than skipping discovery. Only a DOI the provider
-// does not know leaves nothing to search on.
-func TestSiblingWithoutBasisReearnsItCheaply(t *testing.T) {
+// With a DOI but no basis anywhere the hop makes NO request and says so. Paying
+// a singleton to re-earn a basis was tried and reverted: it broke this
+// sentinel's contract (the caller reads it as "no request happened" and skips
+// charging) and let one admission cover two HTTP requests.
+func TestSiblingWithoutBasisMakesNoRequest(t *testing.T) {
 	r, requests := countingResolver(t, `{"results":[]}`)
-	if _, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
-		t.Fatal(err)
+	_, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+	if !errors.Is(err, resolver.ErrNoSearchBasis) {
+		t.Fatalf("err = %v, want resolver.ErrNoSearchBasis", err)
 	}
-	if *requests != 2 {
-		t.Fatalf("requests = %d, want 2 (one singleton to re-earn the basis + one search)", *requests)
+	if *requests != 0 {
+		t.Fatalf("requests = %d, want zero: the sentinel promises no request happened", *requests)
 	}
 }
-func TestSiblingNoSearchBasisAfterUnknownDOI(t *testing.T) {
-	// The provider does not know this DOI, so re-earning a basis is impossible:
-	// the hop must report the singleton it spent and then decline, rather than
-	// paying for a search it cannot aim.
+
+// A fresh negative memo is a usable fact, not a miss: Resolve already learned
+// the provider does not know this DOI, so the hop must not pay to learn it
+// again inside the TTL.
+func TestSiblingHonoursAFreshNegativeMemo(t *testing.T) {
 	client := clientFunc(func(*http.Request) (*http.Response, error) {
 		return responseFor(404, "", nil), nil
 	})
 	r := New(client, "contact@example.org", "private-key")
-	candidates, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.9999/unknown.work"})
-	if !errors.Is(err, resolver.ErrNoSearchBasis) {
-		t.Fatalf("err = %v, want resolver.ErrNoSearchBasis", err)
+	ctx := context.Background()
+	if _, err := r.Resolve(ctx, work.Work{DOI: "10.9999/unknown.work"}); err != nil {
+		t.Fatal(err)
 	}
-	if candidates != nil {
-		t.Fatalf("candidates = %#v, want none", candidates)
+	r.client = clientFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("a request was made despite a fresh negative memo")
+		return nil, nil
+	})
+	_, err := r.ResolveSiblings(ctx, work.Work{DOI: "10.9999/unknown.work", Title: "A Title The Caller Supplied"})
+	if !errors.Is(err, resolver.ErrNoSearchBasis) {
+		t.Fatalf("err = %v, want resolver.ErrNoSearchBasis for a DOI the provider does not know", err)
 	}
 }
 
-// papio's worst outcome is a wrong paper filed under a right citation. A
-// re-earned basis is the sharpest way in: this record's title aims the sibling
-// search, and the search has no requested DOI left to check its results
-// against, so a misrouted answer would file another paper's versions here.
-func TestReearnedBasisRejectsAMisroutedRecord(t *testing.T) {
-	var searched bool
-	client := clientFunc(func(req *http.Request) (*http.Response, error) {
-		if strings.Contains(req.URL.RawQuery, "title.search") {
-			searched = true
-		}
-		// Answers with a DIFFERENT work than the one asked for.
-		return responseFor(200, `{"id":"https://openalex.org/W9","doi":"https://doi.org/10.9999/other.work","title":"An Entirely Different Paper","publication_year":2019}`, nil), nil
+// The record must be about the DOI that was asked for, and an internally
+// inconsistent record — one identity field naming the requested work, another
+// naming a different one — must be rejected rather than accepted on whichever
+// field parses first.
+func TestEchoedDOIRejectsInconsistentIdentities(t *testing.T) {
+	want := "10.1145/3531146.3533202"
+	for _, test := range []struct {
+		name   string
+		record workRecord
+		ok     bool
+	}{
+		{name: "both agree", record: workRecord{DOI: "https://doi.org/" + want, IDs: identifiers{DOI: "https://doi.org/" + want}}, ok: true},
+		{name: "only one present", record: workRecord{DOI: "https://doi.org/" + want}, ok: true},
+		{name: "second names another work", record: workRecord{DOI: "https://doi.org/" + want, IDs: identifiers{DOI: "https://doi.org/10.9999/other"}}},
+		{name: "first names another work", record: workRecord{DOI: "https://doi.org/10.9999/other", IDs: identifiers{DOI: "https://doi.org/" + want}}},
+		{name: "nothing legible", record: workRecord{}},
+		{name: "present but unparseable", record: workRecord{DOI: "not-a-doi"}},
+		{name: "version suffix is a different work", record: workRecord{DOI: "https://doi.org/" + want + "v2"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := echoesDOI(test.record, want); got != test.ok {
+				t.Fatalf("echoesDOI = %v, want %v", got, test.ok)
+			}
+		})
+	}
+}
+
+// A misrouted record must not be published as an exact-DOI match, and must not
+// reach the memo where a later sibling hop would trust its bibliography.
+// papio's worst outcome is a wrong paper filed under a right citation.
+func TestMisroutedRecordIsNeitherPublishedNorMemoized(t *testing.T) {
+	client := clientFunc(func(*http.Request) (*http.Response, error) {
+		return responseFor(200, `{"id":"https://openalex.org/W9","doi":"https://doi.org/10.9999/other.work","title":"An Entirely Different Paper","publication_year":2019,"open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"pdf_url":"https://example.org/other.pdf","version":"publishedVersion"}}`, nil), nil
 	})
 	r := New(client, "contact@example.org", "private-key")
-	candidates, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
-	if !errors.Is(err, resolver.ErrNoSearchBasis) {
-		t.Fatalf("err = %v, want resolver.ErrNoSearchBasis: a misrouted record is not a basis", err)
+	candidates, err := r.Resolve(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+	if err != nil {
+		t.Fatal(err)
 	}
 	if candidates != nil {
-		t.Fatalf("candidates = %#v, want none", candidates)
-	}
-	if searched {
-		t.Fatal("a search ran on a title belonging to a different work")
+		t.Fatalf("candidates = %#v, want none: the record is about another work", candidates)
 	}
 	if _, ok := r.recordFor("10.1145/3531146.3533202"); ok {
-		t.Fatal("the misrouted record was memoized and would be trusted by a later pass")
-	}
-}
-
-// A stale memo entry must not silently cancel discovery: the basis is re-earned
-// with the one-credit singleton, never assumed absent.
-func TestSiblingStaleMemoReearnsBasis(t *testing.T) {
-	r, requests := countingResolver(t, `{"results":[]}`)
-	ctx := context.Background()
-	if _, err := r.Resolve(ctx, work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
-		t.Fatal(err)
-	}
-	r.mu.Lock()
-	entry := r.records["doi:10.1145/3531146.3533202"]
-	entry.at = time.Now().Add(-recordMemoTTL - time.Second)
-	r.records["doi:10.1145/3531146.3533202"] = entry
-	r.mu.Unlock()
-	before := *requests
-	if _, err := r.ResolveSiblings(ctx, work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := *requests - before; got != 2 {
-		t.Fatalf("requests = %d, want 2 (singleton re-earn + search) after the memo went stale", got)
+		t.Fatal("the misrouted record was memoized and would be trusted by a later sibling hop")
 	}
 }
 

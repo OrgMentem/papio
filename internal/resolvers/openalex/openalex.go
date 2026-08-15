@@ -333,29 +333,32 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 	}
 	anon := resolver.AnonymousCredentials(ctx)
 	canonical := work.Work{Title: requested.Title, Year: requested.Year, Authors: requested.Authors}
+	// A fresh negative memo is a fact, not a miss: Resolve recorded that the
+	// provider does not know this DOI, so there is no canonical bibliography to
+	// search on and asking again cannot change that inside the TTL. Without
+	// this the negative entry was written and then never consulted, because
+	// recordFor reports it exactly like an absent one.
+	if known, fresh := r.doiKnown(canonicalDOI); fresh && !known {
+		return nil, resolver.ErrNoSearchBasis
+	}
 	if record, ok := r.recordFor(canonicalDOI); ok {
 		canonical = resolvedWork(record)
 	}
 	if strings.TrimSpace(canonical.Title) == "" {
-		// No memoized record and no caller-supplied title. The memo is an
-		// evictable TTL cache, so treating a miss as "this work has no search
-		// basis" made an unrelated traffic spike or a slow fetch silently
-		// cancel a DOI-only job's sibling discovery — the availability
-		// regression that removing the unconditional canonical GET introduced.
-		// Re-earn the basis with the SINGLETON lookup, which OpenAlex prices at
-		// one credit against the search's ten, and memoize it so the next hop
-		// is free again.
-		record, found, lookupErr := r.canonicalRecord(ctx, canonicalDOI, anon)
-		if lookupErr != nil {
-			return nil, lookupErr
-		}
-		if !found {
-			return nil, resolver.ErrNoSearchBasis
-		}
-		canonical = resolvedWork(record)
-		if strings.TrimSpace(canonical.Title) == "" {
-			return nil, resolver.ErrNoSearchBasis
-		}
+		// Zero requests were made, and the caller must not charge one: with no
+		// usable memoized record and no caller-supplied title there is nothing
+		// to search on.
+		//
+		// This deliberately does NOT re-earn the basis with a singleton lookup.
+		// That was tried and reverted: paying one credit here breaks the
+		// contract this sentinel exists to state (the caller reads it as "the
+		// adapter made no request at all" and skips charging the pass), and it
+		// let a single admission cover two HTTP requests — so the ten-credit
+		// search could still go out after the singleton's own response had
+		// already installed the quota floor. The availability gap it was meant
+		// to close is real but belongs to the caller, which can admit and
+		// charge two calls separately; see dev/active/openalex-spend-remainders.md.
+		return nil, resolver.ErrNoSearchBasis
 	}
 
 	endpoint, lookup, _, err := r.lookupURL(work.Work{Title: canonical.Title}, anon)
@@ -458,50 +461,45 @@ func (r *Resolver) writeMemo(doi string, record workRecord, found bool) {
 	r.records["doi:"+doi] = recordMemo{record: record, found: found, at: time.Now()}
 }
 
-// canonicalRecord fetches the singleton record for a normalized DOI and
-// memoizes what it learned, including a durable 404. It is the one-credit
-// shape; ResolveSiblings uses it only to re-earn a search basis the memo no
-// longer holds, never to build a candidate URL.
-func (r *Resolver) canonicalRecord(ctx context.Context, canonicalDOI string, anon bool) (workRecord, bool, error) {
-	endpoint, lookup, _, err := r.lookupURL(work.Work{DOI: canonicalDOI}, anon)
-	if err != nil || lookup == "" {
-		return workRecord{}, false, err
+// echoesDOI reports whether a record is about the DOI that was requested.
+//
+// Fail-closed in three ways, because the caller publishes a match at
+// IdentityConfidence 1.0. At least one parseable DOI is required, so a record
+// echoing nothing legible is rejected; EVERY parseable echo must equal the
+// requested DOI, so an internally inconsistent record — `doi` naming the
+// requested work while `ids.doi` names another — is rejected rather than
+// accepted on whichever field happens to parse first; and normalization is the
+// acquisition-side, version-preserving form, so v2 is not v1 here.
+func echoesDOI(record workRecord, want string) bool {
+	parsed := 0
+	for _, raw := range []string{record.DOI, record.IDs.DOI} {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		doi, err := work.NormalizeDOI(raw)
+		if err != nil {
+			return false
+		}
+		if doi != want {
+			return false
+		}
+		parsed++
 	}
-	body, err := r.fetch(ctx, endpoint)
-	if err != nil {
-		return workRecord{}, false, err
-	}
-	if body == nil {
-		r.writeMemo(canonicalDOI, workRecord{}, false)
-		return workRecord{}, false, nil
-	}
-	defer func() { _ = body.Close() }()
-	var record workRecord
-	if err := decodeBoundedJSON(body, r.maxBody, &record); err != nil {
-		return workRecord{}, false, fmt.Errorf("openalex: invalid response: %w", err)
-	}
-	// Same rule as Resolve's exact-DOI path, and for a sharper reason: this
-	// record's TITLE becomes the sibling search basis, and the search itself has
-	// no requested DOI left to check its results against. An unverified record
-	// here would aim the search at a different paper entirely and file its
-	// siblings under this citation.
-	if !echoesDOI(record, canonicalDOI) {
-		return workRecord{}, false, nil
-	}
-	r.writeMemo(canonicalDOI, record, true)
-	return record, true, nil
+	return parsed > 0
 }
 
-// echoesDOI reports whether a record is about the DOI that was requested. A
-// record echoing no parseable DOI fails closed. Normalization is the
-// acquisition-side, version-preserving form: v2 is not v1 here.
-func echoesDOI(record workRecord, want string) bool {
-	for _, raw := range []string{record.DOI, record.IDs.DOI} {
-		if doi, err := work.NormalizeDOI(raw); err == nil {
-			return doi == want
-		}
+// doiKnown reports what a fresh memo entry says about whether the provider
+// knows this DOI at all, and whether such an entry exists. A fresh negative is
+// a usable fact: ResolveSiblings has no canonical bibliography to search on and
+// must not pay to learn that again inside the TTL.
+func (r *Resolver) doiKnown(doi string) (known, fresh bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.records["doi:"+doi]
+	if !ok || time.Since(entry.at) > recordMemoTTL {
+		return false, false
 	}
-	return false
+	return entry.found, true
 }
 
 // recordFor returns a record written by a preceding Resolve call for the same
