@@ -28,6 +28,8 @@ const (
 	KindBackfill  = "backfill"
 	ModeAcquire   = "acquire"
 	ModeAlert     = "alert"
+
+	MaxCadenceHours = 87600 // 10 years; safe for time.Duration math.
 )
 
 // DigestLimitMax and DigestLimitDefault bound Store.Digest's limit parameter:
@@ -554,6 +556,38 @@ func (s *Store) consumeDigestEntry(ctx context.Context, watchID int64, workKey s
 	}
 	if count != 1 {
 		return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, workKey)
+	}
+	return nil
+}
+
+func (s *Store) consumeDigestEntriesTx(ctx context.Context, entries []DigestEntry, watchIDs []int64) error {
+	if s == nil || s.S == nil {
+		return errors.New("watch store is not configured")
+	}
+	tx, err := s.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting watch digest consume transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for i, entry := range entries {
+		watchID := watchIDs[i]
+		result, err := tx.ExecContext(ctx, `
+			UPDATE watch_digest_entries
+			SET consumed = 1
+			WHERE watch_id = ? AND work_key = ? AND consumed = 0`, watchID, entry.WorkKey)
+		if err != nil {
+			return fmt.Errorf("consuming watch digest entry: %w", err)
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("counting consumed watch digest entries: %w", err)
+		}
+		if count != 1 {
+			return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, entry.WorkKey)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing watch digest consume: %w", err)
 	}
 	return nil
 }
@@ -1164,6 +1198,9 @@ func normalizeCreateInput(input CreateInput) (CreateInput, error) {
 	}
 	if input.CadenceHours <= 0 {
 		return CreateInput{}, errors.New("watch cadence_hours must be positive")
+	}
+	if input.CadenceHours > MaxCadenceHours {
+		return CreateInput{}, fmt.Errorf("watch cadence_hours must be 1-%d", MaxCadenceHours)
 	}
 	if input.PerRunCap == 0 {
 		input.PerRunCap = DefaultPerRunCap

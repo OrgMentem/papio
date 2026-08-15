@@ -1,11 +1,11 @@
-// Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-
 package watch
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -419,4 +419,82 @@ func TestTakeDigest(t *testing.T) {
 			}
 		})
 	}
+}
+func TestCadenceHoursBound(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		cadence int
+		wantErr string
+	}{
+		{name: "maximum accepted", cadence: MaxCadenceHours},
+		{name: "one above maximum", cadence: MaxCadenceHours + 1, wantErr: "cadence_hours must be 1-"},
+		{name: "math.MaxInt64", cadence: math.MaxInt64, wantErr: "cadence_hours must be 1-"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			watches := testStore(t)
+			_, err := watches.Create(ctx, CreateInput{Query: "cadence bound", CadenceHours: tc.cadence, PerRunCap: 1})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Create(CadenceHours=%d) error = %v, want nil", tc.cadence, err)
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Create(CadenceHours=%d) error = %v, want containing %q", tc.cadence, err, tc.wantErr)
+				}
+			}
+		})
+	}
+
+	t.Run("maximum cadence not immediately due", func(t *testing.T) {
+		watches := testStore(t)
+		watch := createWatch(t, watches, CreateInput{Query: "max cadence due", CadenceHours: MaxCadenceHours, PerRunCap: 1})
+		now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+		if err := watches.MarkRun(ctx, watch.ID, now); err != nil {
+			t.Fatal(err)
+		}
+		due, err := watches.Due(ctx, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range due {
+			if w.ID == watch.ID {
+				t.Fatalf("watch at MaxCadenceHours should not be due immediately after MarkRun; due=%+v now=%v", due, now)
+			}
+		}
+		due, err = watches.Due(ctx, now.Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range due {
+			if w.ID == watch.ID {
+				t.Fatalf("watch at MaxCadenceHours should not be due one hour after MarkRun")
+			}
+		}
+		// One hour before the cadence expires it is still not due; at exactly
+		// MaxCadenceHours it becomes due, proving the duration did not overflow
+		// into the past.
+		due, err = watches.Due(ctx, now.Add(time.Duration(MaxCadenceHours)*time.Hour-time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range due {
+			if w.ID == watch.ID {
+				t.Fatalf("watch at MaxCadenceHours should not be due one hour before cadence")
+			}
+		}
+		due, err = watches.Due(ctx, now.Add(time.Duration(MaxCadenceHours)*time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, w := range due {
+			if w.ID == watch.ID {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("watch at MaxCadenceHours should be due after full cadence; due=%+v", due)
+		}
+	})
 }
