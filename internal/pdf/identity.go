@@ -14,6 +14,11 @@ import (
 
 var doiPattern = regexp.MustCompile(`(?i)\b10\.\d{4,9}/[-._;()/:a-z0-9]+`)
 
+// doiContinuationPattern matches the leading DOI-body run of the line that
+// follows a DOI cut off at a line break. pdftotext wraps a long DOI mid-token
+// with no hyphen, so the suffix arrives as the head of the next line.
+var doiContinuationPattern = regexp.MustCompile(`^[-._;()/:a-zA-Z0-9]+`)
+
 var nonArticleMarkers = []string{
 	"supporting information", "supplementary information", "supplementary material",
 	"supplemental information", "supplemental material", "online appendix",
@@ -141,14 +146,19 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	// erratum, and discarding a candidate cannot be undone the way parking
 	// it for a human can.
 	wantDOI := normalizeDOI(target.DOI)
-	gotDOIs := documentDOIs(frontMatter)
-	if wantDOI != "" && len(gotDOIs) != 0 {
-		for _, gotDOI := range gotDOIs {
+	matchableDOIs, conclusiveDOIs := documentDOIs(frontMatter)
+	if wantDOI != "" && len(matchableDOIs) != 0 {
+		for _, gotDOI := range matchableDOIs {
 			if gotDOI == wantDOI {
 				return capPass("exact normalized DOI match: " + wantDOI)
 			}
 		}
-		return reject("document DOI does not match requested DOI", "document DOI: "+strings.Join(gotDOIs, ", "))
+		// Only a DOI printed whole contradicts the request. A prefix truncated
+		// at a line break with no recoverable continuation says nothing, so the
+		// title rules below get their turn instead of discarding the candidate.
+		if len(conclusiveDOIs) != 0 {
+			return reject("document DOI does not match requested DOI", "document DOI: "+strings.Join(conclusiveDOIs, ", "))
+		}
 	}
 
 	tokens := identityTitleTokens(target.Title)
@@ -628,16 +638,59 @@ func normalizeDOI(v string) string {
 	return prefix + "/" + strings.TrimPrefix(suffix, "/")
 }
 
-func documentDOIs(text string) []string {
-	seen := make(map[string]bool)
-	var out []string
-	for _, raw := range doiPattern.FindAllString(text, -1) {
-		if doi := normalizeDOI(raw); doi != "" && !seen[doi] {
-			seen[doi] = true
-			out = append(out, doi)
+// documentDOIs returns two sets over the same window.
+//
+// matchable is every DOI this text could be asserting, including a DOI
+// reconstructed across a line break: pdftotext wraps a long DOI mid-token, so
+// PLOS front matter prints "…/10.1371/journal." on one line and "pone.0187342"
+// on the next. The truncated prefix normalizes to a syntactically valid but
+// wrong DOI, which used to be read as the document naming a DIFFERENT work —
+// every PLOS article was rejected as the wrong paper in production.
+//
+// conclusive is the subset that may be used to REFUSE a candidate: a match cut
+// off at a line break with nothing recoverable after it is incomplete
+// evidence, not contradictory evidence. Reconstruction can therefore only
+// rescue a match, never manufacture a rejection — the asymmetry matters
+// because a wrong reject costs a retry while a wrong accept files the wrong
+// paper under a citation.
+func documentDOIs(text string) (matchable, conclusive []string) {
+	seenMatchable, seenConclusive := make(map[string]bool), make(map[string]bool)
+	add := func(raw string, complete bool) {
+		doi := normalizeDOI(raw)
+		if doi == "" {
+			return
+		}
+		if !seenMatchable[doi] {
+			seenMatchable[doi] = true
+			matchable = append(matchable, doi)
+		}
+		if complete && !seenConclusive[doi] {
+			seenConclusive[doi] = true
+			conclusive = append(conclusive, doi)
 		}
 	}
-	return out
+	for _, span := range doiPattern.FindAllStringIndex(text, -1) {
+		raw := text[span[0]:span[1]]
+		rest := text[span[1]:]
+		if !strings.HasPrefix(rest, "\n") && !strings.HasPrefix(rest, "\r\n") {
+			add(raw, true)
+			continue
+		}
+		// Cut at a line break. The wrapped-token hypothesis is only live when
+		// the very next line opens with DOI-body characters; a DOI printed as
+		// the last thing on its line is complete, and demoting it would throw
+		// away real refusal evidence. Exactly one break is crossed: a blank
+		// line starts a new block, and fusing across it would invent a DOI.
+		next := strings.TrimPrefix(strings.TrimPrefix(rest, "\r"), "\n")
+		suffix := doiContinuationPattern.FindString(next)
+		if suffix == "" {
+			add(raw, true)
+			continue
+		}
+		add(raw, false)
+		add(raw+suffix, true)
+	}
+	return matchable, conclusive
 }
 
 // FrontMatterDOIs returns the normalized, deduplicated DOIs printed in a
@@ -648,8 +701,12 @@ func documentDOIs(text string) []string {
 // arXiv/PMID markers do not apply (they compare against a KNOWN
 // identifier); inventing a target-less arXiv/PMID extractor is out of scope
 // for this decision — only the DOI front-matter pattern extracts blind.
+// Blind identification uses the conclusive set: a DOI known to be cut off at a
+// line break names no work at all, so handing it to a target-less pipeline can
+// only file a capture under a fabricated identifier.
 func FrontMatterDOIs(text string) []string {
-	return documentDOIs(identityFrontMatter(text))
+	_, conclusive := documentDOIs(identityFrontMatter(text))
+	return conclusive
 }
 
 // identityWindow returns the head of page one, bounded by limit. Every
