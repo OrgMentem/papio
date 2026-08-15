@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"sort"
 	"strings"
@@ -269,10 +270,10 @@ func ValidateCandidate(c Candidate) error {
 	if c.ReuseLicense == "" {
 		return fmt.Errorf("candidate %s: reuse license required (use \"unknown\")", c.Source)
 	}
-	if c.IdentityConfidence < 0 || c.IdentityConfidence > 1 {
+	if math.IsNaN(c.IdentityConfidence) || math.IsInf(c.IdentityConfidence, 0) || c.IdentityConfidence < 0 || c.IdentityConfidence > 1 {
 		return fmt.Errorf("candidate %s: identity confidence out of range", c.Source)
 	}
-	if c.CostUSD < 0 {
+	if math.IsNaN(c.CostUSD) || math.IsInf(c.CostUSD, 0) || c.CostUSD < 0 {
 		return fmt.Errorf("candidate %s: negative cost", c.Source)
 	}
 	return nil

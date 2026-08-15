@@ -3,6 +3,7 @@
 package resolver
 
 import (
+	"math"
 	"testing"
 )
 
@@ -103,6 +104,37 @@ func TestValidateCandidateRequiresAbsoluteURL(t *testing.T) {
 	for _, rawURL := range accepted {
 		if err := ValidateCandidate(base(rawURL)); err != nil {
 			t.Errorf("URL %q rejected: %v", rawURL, err)
+		}
+	}
+}
+
+func TestValidateCandidateRejectsNonFinite(t *testing.T) {
+	base := func() Candidate {
+		return Candidate{Source: "unpaywall", URL: "https://x/y.pdf", Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: 0.5, CostUSD: 0}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(Candidate) Candidate
+		wantErr bool
+	}{
+		{name: "NaN confidence", mutate: func(c Candidate) Candidate { c.IdentityConfidence = math.NaN(); return c }, wantErr: true},
+		{name: "+Inf confidence", mutate: func(c Candidate) Candidate { c.IdentityConfidence = math.Inf(1); return c }, wantErr: true},
+		{name: "-Inf confidence", mutate: func(c Candidate) Candidate { c.IdentityConfidence = math.Inf(-1); return c }, wantErr: true},
+		{name: "NaN cost", mutate: func(c Candidate) Candidate { c.CostUSD = math.NaN(); return c }, wantErr: true},
+		{name: "+Inf cost", mutate: func(c Candidate) Candidate { c.CostUSD = math.Inf(1); return c }, wantErr: true},
+		{name: "-Inf cost", mutate: func(c Candidate) Candidate { c.CostUSD = math.Inf(-1); return c }, wantErr: true},
+		{name: "confidence 0", mutate: func(c Candidate) Candidate { c.IdentityConfidence = 0; return c }, wantErr: false},
+		{name: "confidence 1", mutate: func(c Candidate) Candidate { c.IdentityConfidence = 1; return c }, wantErr: false},
+		{name: "cost 0", mutate: func(c Candidate) Candidate { c.CostUSD = 0; return c }, wantErr: false},
+	}
+	for _, tc := range cases {
+		c := tc.mutate(base())
+		err := ValidateCandidate(c)
+		if tc.wantErr && err == nil {
+			t.Errorf("%s: expected error, got nil", tc.name)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("%s: unexpected error: %v", tc.name, err)
 		}
 	}
 }
