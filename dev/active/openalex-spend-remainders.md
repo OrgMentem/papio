@@ -16,7 +16,7 @@ Every finding was verified against the tree before being accepted. Reviews are
 preserved under `dev/scratch/oracle/20260815T0*`.
 
 **Rejected designs** at the bottom records every dead end with its reason —
-twenty-three of the thirty-one from earlier drafts of this file. Read it before
+twenty-three of the thirty-three from earlier drafts of this file. Read it before
 proposing a simplification; most of the obvious ones are in it, with the sequence
 that breaks them.
 
@@ -25,6 +25,40 @@ from information that is not durable yet, or is not what it claims to be.** An
 in-memory charge a crash erases; a fail-closed guard that becomes a permission
 when a second caller reads it; a best-effort note treated as an authority; a cache
 treated as a fact; a durable fact read by only one of its two readers.
+
+## Audience: the keyless install is the common case, not the edge case
+
+Every number in the original incident came from one keyed identity on the author's
+own machine. That is not the shape of a shared install, and designing against it
+produced at least one mechanism that would have shipped permanently inactive.
+
+- `SourceOpenAlex` defaults to `{Enabled: false}`
+  (`internal/config/config.go:579`). Enabling it is deliberate. API keys are
+  granted rather than self-serve, so **most installs that enable OpenAlex will have
+  no key.**
+- Measured live, both pools: keyed `X-RateLimit-Limit: 10000`; keyless `1000`. A
+  title search costs 10 credits, a singleton entity GET costs 1. So a keyless day
+  is **100 searches**, and one search is 1% of it.
+- Consequences for this plan, applied above but recorded here because they change
+  priority order, not just numbers:
+  1. **Policy is expressed relative to the provider-reported limit**, never as an
+     absolute credit count derived from one key.
+  2. **The fuzzy sibling search is disproportionately expensive on keyless.** The
+     measurement item — is a 10-credit search worth buying, given 73 of 3,165
+     ever returned anything — outranks metering it. Deleting a 10× cost beats
+     rationing it, and consider defaulting it off for keyless identities.
+  3. **Visibility ships with enforcement, not after it.** A stranger who hits a
+     ceiling sees "papio stopped working"; `spent_usd` currently reads `0.00`
+     against a real 3,393 credits. `papio doctor` must name today's credits, the
+     limit, and the identity in the same change that can refuse work.
+  4. **Safety numbers validated only against the author's Zotero library are
+     unfalsifiable elsewhere.** `make identity-corpus` reads a private library, so
+     item 5 needs a committed shareable corpus with published wrong-accept counts
+     before its thresholds can be tuned by anyone else.
+  5. **Re-derive item 6's deferral, don't inherit it.** "The fuse bounds the
+     damage" was argued on a 10,000-credit day. On keyless, one hopeless work
+     burning 8 passes at 10 credits is 8% of the budget, and a bulk import holds
+     many.
 
 ## Context: the incident, and what production says now
 
@@ -134,12 +168,19 @@ commit 10 → guarded wrapper calls the transport once → the GET is written on
 reused connection → a qualifying failure → the transport replays it → two
 physical requests under one debit.
 
-So: require a transport configuration or implementation with **provably no
-automatic physical replay**, or arrange for every replay to re-enter the egress
-authority. Disabling redirects remains necessary and is not sufficient. Pin it
-with a regression that fails a reused connection in the standard retry condition
-and asserts either one send, or a second debit for the second send. **Until this
-is decided, item 1+2 is not implementable as specified.**
+**Decision: disable connection reuse for the OpenAlex client
+(`DisableKeepAlives`), and disable redirect following.** Together those remove
+both replay mechanisms, so the guarded call site *is* the wire. Not offered as a
+config knob: correctness must not depend on a stranger's network quality, and
+"*papio*'s credit accounting is slightly wrong under packet loss" is undebuggable
+remotely. The cost is a handshake per request against rate-limited background
+calls that already wait on a token bucket — cheap for a property that can be
+stated in one sentence. Rejected alternative: wrapping the dialer to make replays
+re-enter the egress authority — correct and faster, but it puts the money
+invariant in the least-inspectable layer in the stack.
+
+Pin it with a regression that fails a reused connection in the standard retry
+condition and asserts either one send, or a second debit for the second send.
 
 **Requirement: latch on the parsed header, not on the failed write.** When a
 valid low-quota header is parsed, set the in-process fail-closed latch for that
@@ -240,17 +281,30 @@ requests, not that its books balance to the credit.
   `INSERT … ON CONFLICT DO UPDATE` that puts the limit test only in the update
   arm admits a first 10-credit request against an allowance of 5. Test the
   empty-row-over-limit case explicitly.
-- **Config, with the number decided: `daily_credit_limit`, default `4000` for
-  OpenAlex.** The blast radius is policy, not an implementation detail, so it
-  belongs here rather than being invented by whoever writes the code. 4,000 of a
-  keyed 10,000-credit day leaves the provider floor a wide margin, is ~1.2× the
-  3,393 credits the worst observed post-fix day actually spent, and still lets a
-  large backlog make real progress. Revisit from the first few days of
-  `credits_committed` telemetry, not from intuition. `0` means unmetered, matching
-  the existing convention, so `papio init` and the shipped defaults must write the
-  non-zero value — with a test on the defaults, or the fuse ships inert. Document
-  it in the hand-authored `docs/reference/config-reference.md`. Strict config
-  decoding means the field and the binary deploy together.
+- **Config: express the ceiling as a fraction of the provider-reported limit, not
+  as credits. `daily_credit_fraction`, default `0.5`.** An absolute default
+  overfits to one machine's key, and worse, it ships **inert** for the majority
+  install. `SourceOpenAlex` is `{Enabled: false}` by default
+  (`internal/config/config.go:579`), so a user enables OpenAlex deliberately and
+  almost never has a key — keys are granted, not self-serve. This session measured
+  both pools live: keyed `X-RateLimit-Limit: 10000`, keyless `1000`. A `4000`
+  default therefore never fires on the keyless tier, i.e. exactly the population
+  least able to diagnose it, while being tuned to the author's own keyed day.
+  A fraction means one policy that scales to a budget *papio* cannot know in
+  advance, and the observer already parses the limit it needs.
+  - `daily_credit_limit` (credits) stays as an absolute override for anyone who
+    wants a hard number; the fraction is what ships.
+  - **Before the first response of the day there is no reported limit.** Do not
+    gate the first request on an unknown budget: fall back to a conservative
+    absolute until a limit is observed, then switch to the fraction. Test the
+    cold-start path, or the fuse either blocks everything or nothing on a fresh
+    daemon.
+  - Revisit from `credits_committed` telemetry across real installs, not from one
+    library's numbers. `0` means unmetered, matching the existing convention, so
+    `papio init` and the shipped defaults must write the non-zero value — with a
+    test on the defaults, or the fuse ships inert. Document it in the
+    hand-authored `docs/reference/config-reference.md`. Strict config decoding
+    means the field and the binary deploy together.
 - **`0` disables the ceiling, never the commit.** Every OpenAlex request still
   executes the durable commit and increments `credits_committed`; otherwise the
   configuration that turns off enforcement also bypasses the egress invariant and
@@ -619,6 +673,18 @@ for real dollars. A billing feature, not a safety mechanism.
 
 ## Rejected designs (do not re-derive)
 
+- **An absolute credit ceiling as the shipped default (`daily_credit_limit =
+  4000`).** Derived from the author's keyed 10,000-credit day and ~1.2× his worst
+  observed spend. But OpenAlex ships disabled, keys are granted not self-serve,
+  and the keyless pool reports a limit of 1,000 — so the default would have been
+  **permanently inert for the majority install**, on a tier where a single search
+  costs 1% of the day. A fraction of the provider-reported limit is one policy for
+  every budget. The absolute form survives only as an operator override.
+- **Offering the replay-safe transport as a configuration choice.** Three options
+  were drafted (disable keep-alives / wrap the dialer / accept slight
+  undercounting). Handing a stranger a knob whose wrong setting produces quietly
+  wrong money accounting under packet loss is not a choice worth exposing — and the
+  failure is unreproducible remotely. Decided in-tree instead.
 - **Re-earning a sibling search basis inside `ResolveSiblings`.** Shipped and
   reverted within the hour. One admission covered two HTTP requests, so the
   ten-credit search could go out after the singleton's own response had installed
