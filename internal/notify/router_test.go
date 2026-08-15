@@ -9,11 +9,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"papio/internal/store"
 )
 
 type routerLedger struct {
-	next int64
-	rows map[int64]Record
+	next                    int64
+	rows                    map[int64]Record
+	failSetDesktopAvailable error
+	failSetDesktopState     error
 }
 
 func newRouterLedger() *routerLedger { return &routerLedger{rows: map[int64]Record{}} }
@@ -68,16 +72,30 @@ func (l *routerLedger) DueWebhook(_ context.Context, now time.Time, limit int) (
 	}
 	return out, nil
 }
-func (l *routerLedger) ReserveDesktop(_ context.Context, id int64, _ time.Time, _ int) (bool, error) {
+func (l *routerLedger) ReserveDesktop(_ context.Context, id int64, _ time.Time, maxPerHour int) (bool, error) {
 	r, ok := l.rows[id]
 	if !ok || (r.DesktopState != "pending" && r.DesktopState != "held") {
 		return false, nil
+	}
+	if maxPerHour > 0 {
+		used := 0
+		for _, row := range l.rows {
+			if row.DesktopState == "reserved" || row.DesktopState == "attempted" {
+				used++
+			}
+		}
+		if used >= maxPerHour {
+			return false, nil
+		}
 	}
 	r.DesktopState = "reserved"
 	l.rows[id] = r
 	return true, nil
 }
 func (l *routerLedger) SetDesktopState(_ context.Context, id int64, state string, _ time.Time) error {
+	if l.failSetDesktopState != nil {
+		return l.failSetDesktopState
+	}
 	r := l.rows[id]
 	r.DesktopState = state
 	l.rows[id] = r
@@ -86,6 +104,14 @@ func (l *routerLedger) SetDesktopState(_ context.Context, id int64, state string
 func (l *routerLedger) SetWebhookState(_ context.Context, id int64, state string, _ time.Time) error {
 	r := l.rows[id]
 	r.WebhookState = state
+	l.rows[id] = r
+	return nil
+}
+func (l *routerLedger) SetDesktopAvailable(_ context.Context, id int64, _ time.Time) error {
+	if l.failSetDesktopAvailable != nil {
+		return l.failSetDesktopAvailable
+	}
+	r := l.rows[id]
 	l.rows[id] = r
 	return nil
 }
@@ -435,4 +461,183 @@ func TestNotifyTestSendsOneSharedCopyPerCategory(t *testing.T) {
 			t.Fatalf("test %s sent %#v, want exactly one %q", category, sender.messages, want)
 		}
 	}
+}
+
+func TestRunDueAtPropagatesSetDesktopAvailableFailure(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := newRouterLedger()
+	ledger.failSetDesktopAvailable = errors.New("disk full")
+	quiet, _ := ParseQuietHours("22:00-12:30", time.UTC)
+	policy := Policy{MaxPerHour: 10, QuietHours: quiet, Categories: map[Category]CategoryPolicy{
+		CategoryDiscoveryNew: {Desktop: "immediate", Webhook: "off", Window: time.Minute},
+	}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Desktop: &routerSender{}, Policy: policy, Now: func() time.Time { return now }})
+	rec := Record{Intent: Intent{EventKind: "discovery.new", Category: CategoryDiscoveryNew, AggregateKey: "w:1", Phase: PhaseScan, WindowStart: now, HappenedAt: now, Message: "hit", Detail: Event{Message: "hit"}}, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, DesktopState: "pending"}
+	if _, err := ledger.Upsert(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	// Force quiet hours so RunDueAt goes through deferDesktop
+	if err := router.RunDueAt(context.Background(), now); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("RunDueAt = %v, want SetDesktopAvailable error", err)
+	}
+}
+
+func TestRunDueAtPropagatesRateLimitDeferralFailure(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := newRouterLedger()
+	ledger.failSetDesktopAvailable = errors.New("rate defer failed")
+	policy := Policy{MaxPerHour: 1, Categories: map[Category]CategoryPolicy{
+		CategoryDecisionOpened: {Desktop: "immediate", Webhook: "off", Window: time.Minute},
+	}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Desktop: &routerSender{}, Policy: policy, Now: func() time.Time { return now }})
+	// Insert two rows; first will exhaust rate limit for second
+	rec1 := Record{Intent: Intent{EventKind: "action.opened", Category: CategoryDecisionOpened, AggregateKey: "a:1", Phase: PhaseOpened, WindowStart: now, HappenedAt: now, Message: "opened", Detail: Event{Message: "opened"}}, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, DesktopState: "pending"}
+	rec2 := Record{Intent: Intent{EventKind: "action.opened", Category: CategoryDecisionOpened, AggregateKey: "a:2", Phase: PhaseOpened, WindowStart: now.Add(time.Second), HappenedAt: now.Add(time.Second), Message: "opened2", Detail: Event{Message: "opened2"}}, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, DesktopState: "pending"}
+	if _, err := ledger.Upsert(context.Background(), rec1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledger.Upsert(context.Background(), rec2); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.RunDueAt(context.Background(), now.Add(time.Minute)); err == nil || !strings.Contains(err.Error(), "rate defer failed") {
+		t.Fatalf("RunDueAt = %v, want rate defer error", err)
+	}
+}
+
+func TestRunDueAtDoesNotAuditSupersessionWhenWriteFails(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := newRouterLedger()
+	ledger.failSetDesktopState = errors.New("state write failed")
+	audited := 0
+	recorder := &countingActivity{count: &audited}
+	policy := Policy{MaxPerHour: 10, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "immediate", Webhook: "off", Window: time.Minute},
+	}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Desktop: &routerSender{}, Policy: policy, Activity: recorder, Now: func() time.Time { return now }, Revalidate: func(_ context.Context, _ Record) (bool, error) { return false, nil }})
+	rec := Record{Intent: Intent{EventKind: "request.outcome", Category: CategoryRequestOutcome, AggregateKey: "job:1", Phase: PhaseTerminal, WindowStart: now, HappenedAt: now, Message: "done", Detail: Event{Message: "done"}}, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, DesktopState: "pending"}
+	if _, err := ledger.Upsert(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.RunDueAt(context.Background(), now); err == nil || !strings.Contains(err.Error(), "state write failed") {
+		t.Fatalf("RunDueAt = %v, want supersede write error", err)
+	}
+	if audited != 0 {
+		t.Fatalf("audit count = %d, want 0 when supersede write failed", audited)
+	}
+}
+
+type countingActivity struct {
+	count *int
+}
+
+func (c *countingActivity) RecordSystemEvent(_ context.Context, _ string, _ map[string]any) error {
+	*c.count++
+	return nil
+}
+
+func TestSamePublicOutcomeReturnsErrorOnUnmarshalableDetail(t *testing.T) {
+	// Event.Detail is map[string]any — an unmarshalable value like a channel is reachable.
+	ch := make(chan int)
+	a := Event{Kind: "request.outcome", Message: "a", Detail: map[string]any{"bad": ch}}
+	b := Event{Kind: "request.outcome", Message: "a", Detail: map[string]any{"bad": ch}}
+	if _, err := samePublicOutcome(a, b); err == nil {
+		t.Fatal("samePublicOutcome = nil error, want marshal failure")
+	}
+}
+
+func TestRouteReturnsErrorWhenSamePublicOutcomeFails(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := newRouterLedger()
+	// Seed a prior checkpoint with attempted state
+	chk := Record{Intent: Intent{EventKind: "batch.checkpoint", Category: CategoryCompletionBatch, AggregateKey: "cohort:1", Phase: PhaseCheckpoint, WindowStart: now, HappenedAt: now, Detail: Event{Message: "checkpoint"}}, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, DesktopState: "attempted"}
+	ledger.rows[1] = chk
+	ledger.rows[1] = Record{ID: 1, Intent: Intent{EventKind: "batch.checkpoint", Category: CategoryCompletionBatch, AggregateKey: "cohort:1", Phase: PhaseCheckpoint, WindowStart: now, HappenedAt: now, Detail: Event{Message: "checkpoint"}}, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, DesktopState: "attempted"}
+	ledger.next = 1
+	router := NewRouter(RouterOptions{Ledger: ledger, Policy: Policy{}, Now: func() time.Time { return now }})
+	ch := make(chan int)
+	intent := Intent{EventKind: "batch.final", Category: CategoryCompletionBatch, AggregateKey: "cohort:1", Phase: PhaseFinal, WindowStart: now.Add(time.Hour), HappenedAt: now.Add(time.Hour), Detail: Event{Kind: "batch.final", Detail: map[string]any{"bad": ch}}}
+	if err := router.Route(context.Background(), intent); err == nil {
+		t.Fatal("Route = nil error, want samePublicOutcome marshal failure")
+	}
+}
+
+func TestStoreLedgerRejectsCorruptRows(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	sl := NewStoreLedger(db)
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	// Upsert a valid row then corrupt payload
+	rec := Record{Intent: Intent{EventKind: "request.outcome", Category: CategoryRequestOutcome, AggregateKey: "job:corrupt", Phase: PhaseTerminal, WindowStart: now, HappenedAt: now, Message: "ok", Detail: Event{Message: "ok"}}, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, DesktopState: "pending", WebhookState: "pending"}
+	stored, err := sl.Upsert(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `UPDATE notification_intents SET payload_json=? WHERE id=?`, "{bad json", stored.ID); err != nil {
+		t.Fatal(err)
+	}
+	check := func(name string, fn func() error) {
+		t.Helper()
+		if err := fn(); err == nil {
+			t.Fatalf("%s with bad payload = nil, want error naming row %d", name, stored.ID)
+		} else if !strings.Contains(err.Error(), itoaNotify(stored.ID)) {
+			t.Fatalf("%s error %q must name row %d", name, err, stored.ID)
+		}
+	}
+	check("DueDesktop", func() error { _, err := sl.DueDesktop(ctx, now.Add(time.Hour), 10); return err })
+	check("DueWebhook", func() error { _, err := sl.DueWebhook(ctx, now.Add(time.Hour), 10); return err })
+	check("Upsert", func() error {
+		_, err := sl.Upsert(ctx, Record{Intent: Intent{EventKind: "request.outcome", Category: CategoryRequestOutcome, AggregateKey: "job:corrupt", Phase: PhaseTerminal, WindowStart: now, HappenedAt: now, Detail: Event{Message: "new"}}, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, DesktopState: "pending", WebhookState: "pending"})
+		return err
+	})
+	// LatestCheckpoint requires a completion_batch checkpoint row; create separate
+	now2 := now.Add(time.Hour)
+	chk := Record{Intent: Intent{EventKind: "batch.checkpoint", Category: CategoryCompletionBatch, AggregateKey: "cohort:corrupt", Phase: PhaseCheckpoint, WindowStart: now2, HappenedAt: now2, Detail: Event{Message: "chk"}}, FirstAt: now2, LastAt: now2, AvailableAt: now2, Count: 1, DesktopState: "pending", WebhookState: "pending"}
+	chkStored, err := sl.Upsert(ctx, chk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `UPDATE notification_intents SET payload_json=? WHERE id=?`, "{bad", chkStored.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := sl.LatestCheckpoint(ctx, "cohort:corrupt"); err == nil {
+		t.Fatalf("LatestCheckpoint with bad payload = nil, want error naming row %d", chkStored.ID)
+	} else if !strings.Contains(err.Error(), itoaNotify(chkStored.ID)) {
+		t.Fatalf("LatestCheckpoint error %q must name row %d", err, chkStored.ID)
+	}
+	// Timestamp corruption path
+	if _, err := db.DB().ExecContext(ctx, `UPDATE notification_intents SET payload_json=? WHERE id=?`, `{"message":"fixed"}`, stored.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `UPDATE notification_intents SET first_at=? WHERE id=?`, "not-rfc3339", stored.ID); err != nil {
+		t.Fatal(err)
+	}
+	check("DueDesktop bad timestamp", func() error { _, err := sl.DueDesktop(ctx, now.Add(time.Hour), 10); return err })
+}
+
+func openTestStore(ctx context.Context, t *testing.T) (*store.Store, error) {
+	t.Helper()
+	return store.Open(ctx, t.TempDir())
+}
+
+func itoaNotify(n int64) string {
+	s := ""
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	for n > 0 {
+		s = string(rune('0'+n%10)) + s
+		n /= 10
+	}
+	if neg {
+		s = "-" + s
+	}
+	return s
 }

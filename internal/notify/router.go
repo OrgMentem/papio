@@ -96,8 +96,14 @@ func (r *Router) Route(ctx context.Context, intent Intent) error {
 		if err != nil {
 			return err
 		}
-		if found && previous.DesktopState == "attempted" && samePublicOutcome(previous.Intent.Detail, intent.Detail) {
-			return nil
+		if found && previous.DesktopState == "attempted" {
+			ok, err := samePublicOutcome(previous.Intent.Detail, intent.Detail)
+			if err != nil {
+				return err
+			}
+			if ok {
+				return nil
+			}
 		}
 	}
 	payload := intent.Detail
@@ -237,7 +243,9 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 				return err
 			}
 			if !valid {
-				_ = r.ledger.SetDesktopState(ctx, row.ID, "superseded", now)
+				if err := r.ledger.SetDesktopState(ctx, row.ID, "superseded", now); err != nil {
+					return err
+				}
 				r.audit(ctx, "notify.held", row, "superseded")
 				continue
 			}
@@ -258,7 +266,9 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 				if err := r.ledger.SetDesktopState(ctx, row.ID, "held", now); err != nil {
 					return err
 				}
-				r.deferDesktop(ctx, row.ID, r.nextQuietRelease(now))
+				if err := r.deferDesktop(ctx, row.ID, r.nextQuietRelease(now)); err != nil {
+					return err
+				}
 				r.audit(ctx, "notify.held", row, "quiet_hours")
 			}
 			continue
@@ -297,7 +307,9 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 			if err := r.ledger.SetDesktopState(ctx, row.ID, "held", now); err != nil {
 				return err
 			}
-			r.deferDesktop(ctx, row.ID, now.Add(time.Minute))
+			if err := r.deferDesktop(ctx, row.ID, now.Add(time.Minute)); err != nil {
+				return err
+			}
 			r.audit(ctx, "notify.held", row, "rate_limit")
 			continue
 		}
@@ -318,10 +330,11 @@ type desktopAvailabilitySetter interface {
 	SetDesktopAvailable(context.Context, int64, time.Time) error
 }
 
-func (r *Router) deferDesktop(ctx context.Context, id int64, at time.Time) {
+func (r *Router) deferDesktop(ctx context.Context, id int64, at time.Time) error {
 	if setter, ok := r.ledger.(desktopAvailabilitySetter); ok {
-		_ = setter.SetDesktopAvailable(ctx, id, at)
+		return setter.SetDesktopAvailable(ctx, id, at)
 	}
+	return nil
 }
 
 func (r *Router) nextQuietRelease(now time.Time) time.Time {
@@ -379,7 +392,7 @@ func (r *Router) audit(ctx context.Context, kind string, row Record, reason stri
 	if r.activity == nil {
 		return
 	}
-	_ = r.activity.RecordSystemEvent(ctx, kind, map[string]any{"category": row.Intent.Category, "event_kind": row.Intent.EventKind, "aggregate_key": row.Intent.AggregateKey, "phase": row.Intent.Phase, "count": row.Count, "reason": reason})
+	r.activity.RecordSystemEvent(ctx, kind, map[string]any{"category": row.Intent.Category, "event_kind": row.Intent.EventKind, "aggregate_key": row.Intent.AggregateKey, "phase": row.Intent.Phase, "count": row.Count, "reason": reason})
 }
 
 // ErrPreviewCountUnrepresentable reports a preview count a category can never
@@ -460,16 +473,32 @@ func stripTerminalControls(value string) string {
 	}, value)
 }
 
-func samePublicOutcome(a, b Event) bool {
-	clean := func(event Event) []byte {
-		data, _ := json.Marshal(event)
+func samePublicOutcome(a, b Event) (bool, error) {
+	clean := func(event Event) ([]byte, error) {
+		data, err := json.Marshal(event)
+		if err != nil {
+			return nil, err
+		}
 		var object map[string]any
-		_ = json.Unmarshal(data, &object)
+		if err := json.Unmarshal(data, &object); err != nil {
+			return nil, err
+		}
 		for _, key := range []string{"message", "at", "sent_at", "timestamp", "happened_at", "window_start", "first_at", "last_at"} {
 			delete(object, key)
 		}
-		data, _ = json.Marshal(object)
-		return data
+		data, err = json.Marshal(object)
+		if err != nil {
+			return nil, err
+		}
+		return data, nil
 	}
-	return string(clean(a)) == string(clean(b))
+	aClean, err := clean(a)
+	if err != nil {
+		return false, err
+	}
+	bClean, err := clean(b)
+	if err != nil {
+		return false, err
+	}
+	return string(aClean) == string(bClean), nil
 }

@@ -5,6 +5,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"papio/internal/store"
@@ -37,7 +38,11 @@ func (l *StoreLedger) Upsert(ctx context.Context, rec Record) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	return fromStoreRecord(stored), nil
+	rec2, err := fromStoreRecord(stored)
+	if err != nil {
+		return Record{}, err
+	}
+	return rec2, nil
 }
 
 func (l *StoreLedger) DueDesktop(ctx context.Context, now time.Time, limit int) ([]Record, error) {
@@ -47,7 +52,11 @@ func (l *StoreLedger) DueDesktop(ctx context.Context, now time.Time, limit int) 
 	}
 	out := make([]Record, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, fromStoreRecord(row))
+		rec, err := fromStoreRecord(row)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
 	}
 	return out, nil
 }
@@ -58,7 +67,11 @@ func (l *StoreLedger) DueWebhook(ctx context.Context, now time.Time, limit int) 
 	}
 	out := make([]Record, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, fromStoreRecord(row))
+		rec, err := fromStoreRecord(row)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
 	}
 	return out, nil
 }
@@ -90,7 +103,11 @@ func (l *StoreLedger) SupersedeAndUpsertCheckpoint(ctx context.Context, aggregat
 	if err != nil {
 		return Record{}, err
 	}
-	return fromStoreRecord(row), nil
+	rec2, err := fromStoreRecord(row)
+	if err != nil {
+		return Record{}, err
+	}
+	return rec2, nil
 }
 
 func (l *StoreLedger) LatestCheckpoint(ctx context.Context, aggregateKey string) (Record, bool, error) {
@@ -98,13 +115,19 @@ func (l *StoreLedger) LatestCheckpoint(ctx context.Context, aggregateKey string)
 	if err != nil || !ok {
 		return Record{}, ok, err
 	}
-	return fromStoreRecord(row), true, nil
+	rec, err := fromStoreRecord(row)
+	if err != nil {
+		return Record{}, true, err
+	}
+	return rec, true, nil
 }
 
-func fromStoreRecord(row store.NotificationRecord) Record {
+func fromStoreRecord(row store.NotificationRecord) (Record, error) {
 	var detail Event
-	_ = json.Unmarshal([]byte(row.PayloadJSON), &detail)
-	return Record{ID: row.ID, Intent: Intent{EventKind: row.EventKind, Category: Category(row.Category), AggregateKey: row.AggregateKey, Phase: Phase(row.Phase), WindowStart: row.WindowStart, JobID: row.JobID, BatchID: row.BatchID, ScanID: row.ScanID, HappenedAt: row.LastAt, Message: detail.Message, Detail: detail}, FirstAt: row.FirstAt, LastAt: row.LastAt, AvailableAt: row.AvailableAt, Count: row.Count, DesktopState: row.DesktopState, WebhookState: row.WebhookState, DesktopReservedAt: row.DesktopReservedAt, DesktopAttemptedAt: row.DesktopAttemptedAt, WebhookAttemptedAt: row.WebhookAttemptedAt}
+	if err := json.Unmarshal([]byte(row.PayloadJSON), &detail); err != nil {
+		return Record{}, fmt.Errorf("notification %d: payload_json: %w", row.ID, err)
+	}
+	return Record{ID: row.ID, Intent: Intent{EventKind: row.EventKind, Category: Category(row.Category), AggregateKey: row.AggregateKey, Phase: Phase(row.Phase), WindowStart: row.WindowStart, JobID: row.JobID, BatchID: row.BatchID, ScanID: row.ScanID, HappenedAt: row.LastAt, Message: detail.Message, Detail: detail}, FirstAt: row.FirstAt, LastAt: row.LastAt, AvailableAt: row.AvailableAt, Count: row.Count, DesktopState: row.DesktopState, WebhookState: row.WebhookState, DesktopReservedAt: row.DesktopReservedAt, DesktopAttemptedAt: row.DesktopAttemptedAt, WebhookAttemptedAt: row.WebhookAttemptedAt}, nil
 }
 
 func (l *StoreLedger) SetDesktopAvailable(ctx context.Context, id int64, available time.Time) error {

@@ -47,12 +47,15 @@ func formatNotificationTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
-func parseNotificationTime(text sql.NullString) time.Time {
+func parseNotificationTime(rowID int64, column string, text sql.NullString) (time.Time, error) {
 	if !text.Valid || text.String == "" {
-		return time.Time{}
+		return time.Time{}, nil
 	}
-	t, _ := time.Parse(time.RFC3339Nano, text.String)
-	return t
+	t, err := time.Parse(time.RFC3339Nano, text.String)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("notification %d: %s %q: %w", rowID, column, text.String, err)
+	}
+	return t, nil
 }
 
 // Upsert merges an intent by its five-part desktop identity. Coalesced rows
@@ -156,13 +159,27 @@ func scanNotification(row *sql.Row) (NotificationRecord, error) {
 	if err != nil {
 		return NotificationRecord{}, err
 	}
-	r.WindowStart = parseNotificationTime(window)
-	r.FirstAt = parseNotificationTime(first)
-	r.LastAt = parseNotificationTime(last)
-	r.AvailableAt = parseNotificationTime(available)
-	r.DesktopReservedAt = parseNotificationTime(reserved)
-	r.DesktopAttemptedAt = parseNotificationTime(attempted)
-	r.WebhookAttemptedAt = parseNotificationTime(webhook)
+	if r.WindowStart, err = parseNotificationTime(r.ID, "window_start", window); err != nil {
+		return NotificationRecord{}, err
+	}
+	if r.FirstAt, err = parseNotificationTime(r.ID, "first_at", first); err != nil {
+		return NotificationRecord{}, err
+	}
+	if r.LastAt, err = parseNotificationTime(r.ID, "last_at", last); err != nil {
+		return NotificationRecord{}, err
+	}
+	if r.AvailableAt, err = parseNotificationTime(r.ID, "available_at", available); err != nil {
+		return NotificationRecord{}, err
+	}
+	if r.DesktopReservedAt, err = parseNotificationTime(r.ID, "desktop_reserved_at", reserved); err != nil {
+		return NotificationRecord{}, err
+	}
+	if r.DesktopAttemptedAt, err = parseNotificationTime(r.ID, "desktop_attempted_at", attempted); err != nil {
+		return NotificationRecord{}, err
+	}
+	if r.WebhookAttemptedAt, err = parseNotificationTime(r.ID, "webhook_attempted_at", webhook); err != nil {
+		return NotificationRecord{}, err
+	}
 	if jobID.Valid {
 		r.JobID = jobID.String
 	}
@@ -188,8 +205,28 @@ func scanNotificationRow(row notificationScanner) (NotificationRecord, error) {
 	if err != nil {
 		return NotificationRecord{}, err
 	}
-	r.WindowStart, r.FirstAt, r.LastAt, r.AvailableAt = parseNotificationTime(window), parseNotificationTime(first), parseNotificationTime(last), parseNotificationTime(available)
-	r.DesktopReservedAt, r.DesktopAttemptedAt, r.WebhookAttemptedAt = parseNotificationTime(reserved), parseNotificationTime(attempted), parseNotificationTime(webhook)
+	var parseErr error
+	if r.WindowStart, parseErr = parseNotificationTime(r.ID, "window_start", window); parseErr != nil {
+		return NotificationRecord{}, parseErr
+	}
+	if r.FirstAt, parseErr = parseNotificationTime(r.ID, "first_at", first); parseErr != nil {
+		return NotificationRecord{}, parseErr
+	}
+	if r.LastAt, parseErr = parseNotificationTime(r.ID, "last_at", last); parseErr != nil {
+		return NotificationRecord{}, parseErr
+	}
+	if r.AvailableAt, parseErr = parseNotificationTime(r.ID, "available_at", available); parseErr != nil {
+		return NotificationRecord{}, parseErr
+	}
+	if r.DesktopReservedAt, parseErr = parseNotificationTime(r.ID, "desktop_reserved_at", reserved); parseErr != nil {
+		return NotificationRecord{}, parseErr
+	}
+	if r.DesktopAttemptedAt, parseErr = parseNotificationTime(r.ID, "desktop_attempted_at", attempted); parseErr != nil {
+		return NotificationRecord{}, parseErr
+	}
+	if r.WebhookAttemptedAt, parseErr = parseNotificationTime(r.ID, "webhook_attempted_at", webhook); parseErr != nil {
+		return NotificationRecord{}, parseErr
+	}
 	if jobID.Valid {
 		r.JobID = jobID.String
 	}
@@ -234,7 +271,7 @@ func (l *NotificationLedger) ReserveDesktop(ctx context.Context, id int64, now t
 	if err != nil {
 		return false, err
 	}
-	rollback := func(e error) (bool, error) { _ = tx.Rollback(); return false, e }
+	rollback := func(e error) (bool, error) { tx.Rollback(); return false, e }
 	if maxPerHour > 0 {
 		cutoff := now.Add(-time.Hour)
 		var used int
@@ -245,7 +282,7 @@ func (l *NotificationLedger) ReserveDesktop(ctx context.Context, id int64, now t
 			return rollback(err)
 		}
 		if used >= maxPerHour {
-			_ = tx.Rollback()
+			tx.Rollback()
 			return false, nil
 		}
 	}
@@ -259,7 +296,7 @@ func (l *NotificationLedger) ReserveDesktop(ctx context.Context, id int64, now t
 		return rollback(err)
 	}
 	if changed != 1 {
-		_ = tx.Rollback()
+		tx.Rollback()
 		return false, nil
 	}
 	if err := tx.Commit(); err != nil {
@@ -341,7 +378,7 @@ func (l *NotificationLedger) SupersedeAndUpsertCheckpoint(ctx context.Context, a
 		return NotificationRecord{}, err
 	}
 	rollback := func(err error) (NotificationRecord, error) {
-		_ = tx.Rollback()
+		tx.Rollback()
 		return NotificationRecord{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE notification_intents SET desktop_state='superseded'
