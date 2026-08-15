@@ -2,6 +2,7 @@ package bibparse
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -23,9 +24,10 @@ ER  -
 
 func TestParseRIS(t *testing.T) {
 	tests := []struct {
-		name string
-		data string
-		want []Record
+		name    string
+		data    string
+		want    []Record
+		wantErr string
 	}{
 		{
 			name: "multiple records",
@@ -66,15 +68,39 @@ func TestParseRIS(t *testing.T) {
 			want: []Record{{Title: "Enough to search"}},
 		},
 		{
-			name: "unterminated final record",
-			data: "TY  - JOUR\nTI  - No terminator\n",
-			want: []Record{{Title: "No terminator"}},
+			name: "trailing blank lines after ER",
+			data: "TY  - JOUR\nTI  - With trailing\nER  - \n\n   \n",
+			want: []Record{{Title: "With trailing"}},
+		},
+		{
+			name:    "unterminated final record",
+			data:    "TY  - JOUR\nTI  - No terminator\n",
+			wantErr: "unterminated",
+		},
+		{
+			name:    "truncated single record from issue",
+			data:    "TY  - JOUR\nTI  - x",
+			wantErr: "ER",
+		},
+		{
+			name:    "truncated final record after valid records",
+			data:    "TY  - JOUR\nTI  - First\nER  - \nTY  - JOUR\nTI  - Truncated\n",
+			wantErr: "unterminated",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := parseRIS([]byte(test.data))
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("parseRIS() error = nil, want error containing %q (got %#v)", test.wantErr, got)
+				}
+				if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(test.wantErr)) {
+					t.Fatalf("parseRIS() error = %q, want containing %q", err.Error(), test.wantErr)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("parseRIS() error = %v", err)
 			}

@@ -1,6 +1,7 @@
 package bibparse
 
 import (
+	"fmt"
 	"strings"
 )
 
@@ -10,6 +11,7 @@ func parseRIS(data []byte) ([]Record, error) {
 	var records []Record
 	var current risRecord
 	inRecord := false
+	terminated := true
 
 	finish := func() {
 		if !inRecord {
@@ -24,6 +26,7 @@ func parseRIS(data []byte) ([]Record, error) {
 		records = append(records, current.record)
 		current = risRecord{}
 		inRecord = false
+		terminated = true
 	}
 
 	for _, rawLine := range lines {
@@ -33,8 +36,12 @@ func parseRIS(data []byte) ([]Record, error) {
 			case "TY":
 				finish()
 				inRecord = true
+				terminated = false
 				current.last = risNone
 			case "ER":
+				if inRecord {
+					terminated = true
+				}
 				finish()
 			default:
 				if inRecord {
@@ -50,6 +57,9 @@ func parseRIS(data []byte) ([]Record, error) {
 				current.appendContinuation(content)
 			}
 		}
+	}
+	if inRecord && !terminated {
+		return nil, fmt.Errorf("ris: unterminated record: missing ER terminator")
 	}
 	finish()
 
