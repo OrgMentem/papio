@@ -74,6 +74,39 @@ func TestValidateCandidateFailsClosed(t *testing.T) {
 	}
 }
 
+// The old prefix check accepted any string starting with "https://", so
+// "https://" itself and "https:///relative" crossed the fail-closed source
+// boundary the function documents as requiring an absolute http(s) URL.
+func TestValidateCandidateRequiresAbsoluteURL(t *testing.T) {
+	base := func(rawURL string) Candidate {
+		return Candidate{Source: "unpaywall", URL: rawURL, Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: 0.9}
+	}
+	rejected := []string{
+		"https://",
+		"http://",
+		"https:///relative",
+		"/relative/path",
+		"example.com/paper.pdf",
+		"https://host with spaces/paper.pdf",
+		"",
+	}
+	for _, rawURL := range rejected {
+		if err := ValidateCandidate(base(rawURL)); err == nil {
+			t.Errorf("URL %q accepted", rawURL)
+		}
+	}
+	accepted := []string{
+		"https://onlinelibrary.wiley.com/doi/pdfdirect/10.1002/example?download=true",
+		"https://proxy.example.edu:8443/openurl/handler",
+		"http://export.arxiv.org/pdf/2101.00001v2",
+	}
+	for _, rawURL := range accepted {
+		if err := ValidateCandidate(base(rawURL)); err != nil {
+			t.Errorf("URL %q rejected: %v", rawURL, err)
+		}
+	}
+}
+
 func TestCandidateKeyStableAndURLFree(t *testing.T) {
 	c := Candidate{Source: "unpaywall", URL: "https://host/path?signature=SECRET"}
 	k1, k2 := c.Key(), c.Key()

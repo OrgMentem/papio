@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -248,7 +249,8 @@ func ValidateCandidate(c Candidate) error {
 	if c.Source == "" {
 		return fmt.Errorf("candidate missing source")
 	}
-	if !strings.HasPrefix(c.URL, "https://") && !strings.HasPrefix(c.URL, "http://") {
+	parsed, parseErr := url.Parse(c.URL)
+	if parseErr != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return fmt.Errorf("candidate %s: URL must be absolute http(s)", c.Source)
 	}
 	for name, value := range c.RequestHeaders {
