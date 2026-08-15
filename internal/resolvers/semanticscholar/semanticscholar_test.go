@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"papio/internal/resolver"
+	"papio/internal/resolvers/resolvertest"
 	"papio/internal/work"
 )
 
@@ -269,31 +270,51 @@ func TestResolveMissingLicenseIsUnknown(t *testing.T) {
 }
 
 func TestParseRetryAfterClampsHugeValues(t *testing.T) {
-	for _, value := range []string{"9223372037", "9999999999", "922337203685477581"} {
-		if got := parseRetryAfter(value, time.Now()); got < 0 {
-			t.Fatalf("parseRetryAfter(%q) = %v, want a non-negative clamped duration: a negative wait inverts Retry-After into an immediate retry storm", value, got)
-		}
-	}
-	if got := parseRetryAfter("7", time.Now()); got != 7*time.Second {
-		t.Fatalf("parseRetryAfter(7) = %v", got)
-	}
+	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }
 
-func TestResolveRejectsOversizedResponses(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"openAccessPdf": {"url": "https://example.org/p.pdf"}, "title": "` + strings.Repeat("x", 512) + `"}`))
-	}))
-	defer server.Close()
+func TestMalformedAndOversizedPayload(t *testing.T) {
+	t.Run("malformed json", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"openAccessPdf": {`))
+		}))
+		defer server.Close()
 
-	_, err := NewWithOptions(Options{
-		Client: http.DefaultClient, BaseURL: server.URL, MaxResponseBytes: 128,
-	}).Resolve(context.Background(), work.Work{DOI: "10.5555/example"})
-	if err == nil || !strings.Contains(err.Error(), "size limit") {
-		t.Fatalf("Resolve = %v, want a size-limit rejection", err)
-	}
-	if _, temporary := resolver.Temporary(err); temporary {
-		t.Fatalf("an oversized body is a malformed response, not a retryable condition: %v", err)
-	}
+		_, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).Resolve(context.Background(), work.Work{DOI: "10.5555/example"})
+		if err == nil {
+			t.Fatal("want error for malformed JSON")
+		}
+		if _, temp := resolver.Temporary(err); temp {
+			t.Error("malformed payload must not be temporary")
+		}
+	})
+	t.Run("trailing json rejected", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(fullRecord + `{"extra":1}`))
+		}))
+		defer server.Close()
+
+		_, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).Resolve(context.Background(), work.Work{DOI: "10.5555/example"})
+		if err == nil {
+			t.Fatal("want error for multiple JSON values")
+		}
+	})
+	t.Run("oversized bounded read", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"openAccessPdf": {"url": "https://example.org/p.pdf"}, "title": "` + strings.Repeat("x", 512) + `"}`))
+		}))
+		defer server.Close()
+
+		_, err := NewWithOptions(Options{
+			Client: http.DefaultClient, BaseURL: server.URL, MaxResponseBytes: 128,
+		}).Resolve(context.Background(), work.Work{DOI: "10.5555/example"})
+		if err == nil || !strings.Contains(err.Error(), "size limit") {
+			t.Fatalf("Resolve = %v, want a size-limit rejection", err)
+		}
+		if _, temporary := resolver.Temporary(err); temporary {
+			t.Fatalf("an oversized body is a malformed response, not a retryable condition: %v", err)
+		}
+	})
 }
 
 func TestResolvedWorkNormalizesEchoedArXivID(t *testing.T) {

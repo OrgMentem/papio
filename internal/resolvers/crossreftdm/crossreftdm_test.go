@@ -2,19 +2,16 @@ package crossreftdm
 
 import (
 	"context"
-	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"papio/internal/config"
-	"papio/internal/fetch"
 	"papio/internal/resolver"
+	"papio/internal/resolvers/resolvertest"
 	"papio/internal/work"
 )
 
@@ -134,61 +131,14 @@ type tdmTransportFunc func(*http.Request) (*http.Response, error)
 
 func (f tdmTransportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-type secureClientTestResolver struct{}
-
-func (secureClientTestResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
-	return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
-}
-
 func TestDoAcceptsSecureHTTPClientAndRejectsOpaqueClient(t *testing.T) {
-	secureClient, err := fetch.NewSecureHTTPClient(fetch.Policy{
-		MaxBytes:       1024,
-		Timeout:        time.Second,
-		ConnectTimeout: time.Second,
-		HeaderTimeout:  time.Second,
-		BodyTimeout:    time.Second,
-	}, secureClientTestResolver{}, tdmTransportFunc(func(*http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{}`)),
-		}, nil
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodGet, "https://metadata.example/works", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cases := []struct {
-		name       string
-		client     HTTPClient
-		wantUnsafe bool
-	}{
-		{name: "secure client", client: secureClient},
-		{name: "opaque client", client: tdmRoundTrip(func(*http.Request) (*http.Response, error) { return nil, errors.New("must not call") }), wantUnsafe: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			resp, err := (&Resolver{client: tc.client}).do(req.Clone(context.Background()))
-			if got := errors.Is(err, errUnsafeHTTPClient); got != tc.wantUnsafe {
-				t.Fatalf("errUnsafeHTTPClient = %v, err = %v", got, err)
-			}
-			if tc.wantUnsafe {
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if resp == nil {
-				t.Fatal("secure client returned nil response")
-			}
-			if err := resp.Body.Close(); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
+	resolvertest.CheckDoRejectsOpaqueClient(t, errUnsafeHTTPClient, func(client resolvertest.HTTPClient) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodGet, "https://metadata.example/works", nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		return (&Resolver{client: client}).do(req.Clone(context.Background()))
+	})
 }
 
 func TestResolveEscapesDOIAndScopesCredentialHeaders(t *testing.T) {
@@ -312,28 +262,5 @@ func TestResolveRequiresTextMiningMarkerAndLeavesUnknownVersionUnknown(t *testin
 // parsing: a header large enough to overflow the nanosecond multiply must clamp
 // to the max duration rather than wrap to a garbage (possibly negative) value.
 func TestParseRetryAfterClampsHugeValues(t *testing.T) {
-	const maxDuration = time.Duration(1<<63 - 1)
-	now := time.Now()
-	cases := []struct {
-		name  string
-		value string
-		want  time.Duration
-	}{
-		{"empty", "", 0},
-		{"garbage", "not-a-number", 0},
-		{"normal seconds", "5", 5 * time.Second},
-		{"overflow multiply clamps to max", "99999999999", maxDuration},
-		{"beyond int64 range falls through", "9999999999999999999", 0},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := parseRetryAfter(c.value, now)
-			if got != c.want {
-				t.Errorf("parseRetryAfter(%q) = %v, want %v", c.value, got, c.want)
-			}
-			if got < 0 {
-				t.Errorf("parseRetryAfter(%q) = %v, must never be negative", c.value, got)
-			}
-		})
-	}
+	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }
