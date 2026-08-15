@@ -413,7 +413,10 @@ func (s *Service) recordPollFailureAt(ctx context.Context, req *Request, now tim
 
 // backoffWithJitter is delivery.NextCheck's exponential schedule plus a
 // small random jitter (0-20% of the interval), so many rows failing
-// against the same outage do not all retry in lockstep.
+// against the same outage do not all retry in lockstep. The jittered
+// result is clamped to maxPollInterval: NextCheck caps the interval, and
+// adding jitter on top of an already-capped interval would push the check
+// past the documented 24h ceiling.
 func (s *Service) backoffWithJitter(now time.Time, attempt int, statusPollMinutes int) time.Time {
 	base := NextCheck(now, attempt, statusPollMinutes)
 	interval := base.Sub(now)
@@ -421,7 +424,11 @@ func (s *Service) backoffWithJitter(now time.Time, attempt int, statusPollMinute
 	if jitterFn == nil {
 		jitterFn = defaultJitter
 	}
-	return base.Add(jitterFn(interval))
+	jittered := base.Add(jitterFn(interval))
+	if ceiling := now.Add(maxPollInterval); jittered.After(ceiling) {
+		return ceiling
+	}
+	return jittered
 }
 
 func defaultJitter(interval time.Duration) time.Duration {

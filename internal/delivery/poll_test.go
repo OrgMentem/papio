@@ -825,6 +825,27 @@ func TestBackoffWithJitterGrowsAndIsBounded(t *testing.T) {
 	}
 }
 
+// The zero-jitter test above cannot see the ceiling breach: NextCheck already
+// caps the interval at maxPollInterval, so adding jitter on top pushed the
+// scheduled check past the documented 24h ceiling by up to the jitter budget.
+func TestBackoffWithJitterNeverExceedsMaxPollInterval(t *testing.T) {
+	svc, _ := testServiceClock(t)
+	svc.jitter = func(interval time.Duration) time.Duration { return interval } // worst case
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	for attempt := 1; attempt <= 12; attempt++ {
+		if got := svc.backoffWithJitter(now, attempt, 60).Sub(now); got > maxPollInterval {
+			t.Fatalf("attempt %d backoff %s exceeds maxPollInterval %s", attempt, got, maxPollInterval)
+		}
+	}
+	// Below the cap the jitter must still be applied, otherwise every row
+	// retries in lockstep against the same outage.
+	low := svc.backoffWithJitter(now, 1, 60)
+	if !low.After(NextCheck(now, 1, 60)) {
+		t.Fatalf("jitter was not applied below the cap: %s", low.Sub(now))
+	}
+}
+
 func TestBackoffJitterStaysWithinBudget(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	base := NextCheck(now, 2, 60)
