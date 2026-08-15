@@ -38,6 +38,11 @@ func executable(t *testing.T) string {
 func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	ctx := context.Background()
 	data := t.TempDir()
+	// t.TempDir() on Go 1.26 with umask 022 creates 0755 (Mkdir 0777).
+	// doctor now enforces 0700, so ensure the temp data dir is private.
+	if err := os.Chmod(data, 0o700); err != nil {
+		t.Fatalf("chmod data_dir: %v", err)
+	}
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)
@@ -1450,5 +1455,104 @@ func TestRunIncludesNotificationCapabilityWithoutWebhookSecret(t *testing.T) {
 	encoded, _ := json.Marshal(report)
 	if strings.Contains(string(encoded), cfg.Notify.WebhookSecret) {
 		t.Fatalf("doctor report leaked webhook secret")
+	}
+}
+func findDataDirCheck(checks []Check) (Check, bool) {
+	for _, c := range checks {
+		if c.Name == "data_dir" {
+			return c, true
+		}
+	}
+	return Check{}, false
+}
+
+func TestCheckDataDirReportsInsecurePermissionsAndLeavesMode(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = dir
+	cfg.Email = "a@b.test"
+	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: executable(t)}, executable(t), nil)
+	c, ok := findDataDirCheck(report.Checks)
+	if !ok {
+		t.Fatalf("data_dir check missing: %+v", report.Checks)
+	}
+	if c.Status != Fail {
+		t.Fatalf("data_dir = %+v, want Fail for 0755", c)
+	}
+	if !strings.Contains(c.Remediation, "chmod 0700 "+dir) {
+		t.Fatalf("remediation = %q, want %q", c.Remediation, "chmod 0700 "+dir)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Fatalf("mode after check = %04o, want 0755 unchanged", perm)
+	}
+}
+
+func TestCheckDataDirPassesWhenPrivate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = dir
+	cfg.Email = "a@b.test"
+	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: executable(t)}, executable(t), nil)
+	c, ok := findDataDirCheck(report.Checks)
+	if !ok {
+		t.Fatalf("data_dir check missing: %+v", report.Checks)
+	}
+	if c.Status != Pass {
+		t.Fatalf("data_dir = %+v, want Pass for 0700", c)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("mode after check = %04o, want 0700", perm)
+	}
+}
+
+func TestCheckDataDirCreatesAbsentDirectory(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "absent", "nested")
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("dir should be absent before check: %v", err)
+	}
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = dir
+	cfg.Email = "a@b.test"
+	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: executable(t)}, executable(t), nil)
+	c, ok := findDataDirCheck(report.Checks)
+	if !ok {
+		t.Fatalf("data_dir check missing: %+v", report.Checks)
+	}
+	if c.Status != Pass {
+		t.Fatalf("data_dir = %+v, want Pass for absent dir (created 0700)", c)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat after create: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("mode after create = %04o, want 0700", perm)
+	}
+	if c.Remediation != "" {
+		t.Fatalf("remediation on Pass should be empty, got %q", c.Remediation)
 	}
 }

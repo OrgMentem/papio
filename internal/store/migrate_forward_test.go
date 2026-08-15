@@ -226,6 +226,11 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
+	// t.TempDir() is 0755 under the default umask, and doctor's privacy check
+	// legitimately fails a group/world-readable data directory.
+	if err := os.Chmod(dataDir, 0o700); err != nil {
+		t.Fatalf("chmod data dir: %v", err)
+	}
 	dbPath := filepath.Join(dataDir, "papio.db")
 	raw, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)")
 	if err != nil {

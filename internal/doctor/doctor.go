@@ -79,7 +79,23 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	checkNotifications(ctx, cfg, db, add)
 
 	if err := checkDataDir(cfg.DataDir); err != nil {
-		add("data_dir", Fail, "data directory is not private and writable", err.Error())
+		msg := err.Error()
+		var detail string
+		switch {
+		case strings.HasPrefix(msg, "chmod 0700"):
+			detail = "data directory is not private"
+		case strings.HasPrefix(msg, "make ") && strings.Contains(msg, "writable"):
+			detail = "data directory is not writable"
+		case strings.Contains(msg, "is not a directory"):
+			detail = "data directory is not a directory"
+		case strings.HasPrefix(msg, "set data_dir"):
+			detail = "data directory is not set"
+		case strings.HasPrefix(msg, "stat ") || strings.HasPrefix(msg, "create "):
+			detail = "data directory cannot be accessed"
+		default:
+			detail = "data directory is not private and writable"
+		}
+		add("data_dir", Fail, detail, err.Error())
 	} else {
 		add("data_dir", Pass, "private writable data directory", "")
 	}
@@ -425,11 +441,21 @@ func checkDataDir(path string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("set data_dir")
 	}
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", path, err)
-	}
-	if err := os.Chmod(path, 0o700); err != nil {
-		return fmt.Errorf("chmod %s to 0700: %w", path, err)
+	info, err := os.Stat(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return fmt.Errorf("create %s: %w", path, err)
+		}
+	} else {
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", path)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("chmod 0700 %s", path)
+		}
 	}
 	probe, err := os.CreateTemp(path, ".doctor-write-*")
 	if err != nil {
