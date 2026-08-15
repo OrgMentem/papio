@@ -6,16 +6,17 @@ anonymous fallback, the fuzzy-search boundary/basis gate, and three fail-closed
 guards). Those changes are complete; git history and `CHANGELOG.md` hold the
 record.
 
-**Six adversarial reviews, five rewrites.** Three early rounds sharpened a
+**Seven adversarial reviews, six rewrites.** Three early rounds sharpened a
 two-part plan (a per-job spend guard plus a per-identity credit ceiling); a
 fourth, given no prior-round context and a wide brief, rejected the shape of both;
-a fifth and sixth reviewed the shipped code and found nine defects in it,
-including three in fixes made an hour earlier. Every finding was verified against
-the tree before being accepted. Reviews are preserved under
-`dev/scratch/oracle/20260815T0*`.
+rounds five to seven reviewed the shipped code and found twelve defects in it,
+including four in fixes made minutes earlier. The seventh judged the architecture
+converged — "do one more plan edit, not another redesign" — and this is that edit.
+Every finding was verified against the tree before being accepted. Reviews are
+preserved under `dev/scratch/oracle/20260815T0*`.
 
 **Rejected designs** at the bottom records every dead end with its reason —
-sixteen of the twenty-four from earlier drafts of this file. Read it before
+twenty-three of the thirty-one from earlier drafts of this file. Read it before
 proposing a simplification; most of the obvious ones are in it, with the sequence
 that breaks them.
 
@@ -123,24 +124,61 @@ failed commit means no wire, and a request reaching the transport without one
 must fail loudly. Do not fix the race with a manager-wide mutex — a decision
 taken before a blocking step cannot be authoritative for egress.
 
-**Requirement: the boundary must be a true one-wire boundary.** The wrapper
-interface accepts an `*http.Client`, and `Client.Do` follows redirects, so one
-commit could authorize several physical requests. Either place the authority at
-`RoundTripper.RoundTrip`, or make the OpenAlex client explicitly non-redirecting
-and treat a redirect as a response requiring fresh admission. With a
-configurable `BaseURL` this must not be left as an assumption.
+**Requirement: a boundary with provably no automatic replay — `RoundTrip` is not
+enough.** The wrapper accepts an `*http.Client`, and `Client.Do` follows
+redirects, so one commit could authorize several physical requests. But moving to
+a wrapper around `http.Transport.RoundTrip` is *still* insufficient: the standard
+`Transport` may internally retry an idempotent request after certain network
+failures on a reused connection, and every OpenAlex call is a GET. Sequence:
+commit 10 → guarded wrapper calls the transport once → the GET is written on a
+reused connection → a qualifying failure → the transport replays it → two
+physical requests under one debit.
 
-**Requirement: a process-local fail-closed latch for a lost floor.** When a
-low-quota response's durable `Defer` fails, set an in-process latch for that
-credential immediately, before and while retrying persistence. Otherwise a
-transient SQLite busy can lose the floor while the credit write succeeds — and
+So: require a transport configuration or implementation with **provably no
+automatic physical replay**, or arrange for every replay to re-enter the egress
+authority. Disabling redirects remains necessary and is not sufficient. Pin it
+with a regression that fails a reused connection in the standard retry condition
+and asserts either one send, or a second debit for the second send. **Until this
+is decided, item 1+2 is not implementable as specified.**
+
+**Requirement: latch on the parsed header, not on the failed write.** When a
+valid low-quota header is parsed, set the in-process fail-closed latch for that
+credential **immediately, before attempting persistence**, and clear it only once
+the durable gate exists or its reset passes. Waiting for `Defer` to fail leaves a
+window — the durable write can block for up to five seconds — in which the
+process already knows the fact while new egress transactions still see no gate. A
+transient SQLite busy can also drop the floor while the credit write succeeds, so
 "both writes fail together because the disk is full" is too narrow an assumption.
+
+**Be honest about the floor's limit.** A fact learned from a response cannot be
+made perfectly crash-durable if the machine dies before any write succeeds. The
+**daily fuse**, not the header floor, is the crash-hard monetary invariant; the
+plan must not claim more for the floor than that.
 
 **Requirement: a capability boundary, not just a passing test.** "Every current
 callsite reaches the fuse" is worth asserting, but code outside the egress
 wrapper should not *possess* a client able to reach OpenAlex without the commit.
 Make the unguarded transport unconstructible from outside, then the test is a
 backstop rather than the guarantee.
+
+**Requirement: define the refusal taxonomy now, and make it survive `fetch`.**
+Moving refusal to HTTP egress moves it *behind* a layer that currently destroys
+its meaning: `openalex.fetch` turns **every** client error into a fresh generic
+`resolver.TemporaryError`, discarding the original. A late keyed-quota refusal
+then cannot tell acquisition to try the anonymous identity, and a daily-credit
+refusal cannot tell item 3 to park until UTC midnight. So the *type* contract
+belongs in this item, not in item 3:
+
+| refusal | carries | caller behaviour |
+| --- | --- | --- |
+| provider-quota / identity gated | that credential's `Until` | acquisition may retry under the next identity with fresh admission; a fixed-policy caller defers |
+| source-wide daily credit exhausted | next UTC boundary | park; **never** triggers identity fallback |
+| pricing-drift closure | remaining local window | park; never falls back |
+
+Each must be preserved — or deliberately translated — through `fetch` rather than
+flattened. The scheduler wiring can still land as item 3, but the taxonomy cannot
+wait for the egress implementation, because both sides encode it independently
+otherwise.
 
 **Debit placement matters for availability.** Committing before ordinary local
 admission would let a reset cohort burn a large slice of the daily allowance on
@@ -182,10 +220,16 @@ requests, not that its books balance to the credit.
   that is provider-contract drift — and gating only the *credential* is too
   narrow, because pricing is a property of the **operation**, not the identity.
   Otherwise keyed detects a 10→100 change, is gated, and the next call falls
-  through to keyless and repeats the same undercharged shape. Fail that request
-  shape — or OpenAlex generally — closed for the remaining local window, and
-  surface it. Do not build reconciliation to recover a few conservatively
-  overcounted credits.
+  through to keyless and repeats the same undercharged shape.
+
+  **Decision: on any positive cost drift, durably close all OpenAlex egress
+  until the next UTC boundary**, and set the process latch immediately while that
+  write is being established. A process-only mark is not enough — commit 10,
+  learn the shape really cost 100, mark it closed, crash, restart, and only the
+  under-sized 10-credit debit survives, so the same operation is authorized
+  again. Closing the source rather than the individual shape avoids building a
+  second per-shape state machine for an event that should be rare and loud. Do
+  not build reconciliation to recover a few conservatively overcounted credits.
 - **Credits are a new unit, not the existing `estimatedCost`.** That argument
   flows to `reserve(ctx, source, identity, policy.MaxCostUSD, estimatedCost)` and
   into `spent_usd`: it is dollars. Using it for credits implements the
@@ -196,12 +240,17 @@ requests, not that its books balance to the credit.
   `INSERT … ON CONFLICT DO UPDATE` that puts the limit test only in the update
   arm admits a first 10-credit request against an allowance of 5. Test the
   empty-row-over-limit case explicitly.
-- **Config:** a per-source daily credit allowance. `0` means unmetered, matching
-  the existing convention — so the shipped OpenAlex default and `papio init`
-  output must be **non-zero**, with a test on the defaults, or the fuse ships
-  inert. Document it in the hand-authored
-  `docs/reference/config-reference.md`. Strict config decoding means the field
-  and the binary deploy together.
+- **Config, with the number decided: `daily_credit_limit`, default `4000` for
+  OpenAlex.** The blast radius is policy, not an implementation detail, so it
+  belongs here rather than being invented by whoever writes the code. 4,000 of a
+  keyed 10,000-credit day leaves the provider floor a wide margin, is ~1.2× the
+  3,393 credits the worst observed post-fix day actually spent, and still lets a
+  large backlog make real progress. Revisit from the first few days of
+  `credits_committed` telemetry, not from intuition. `0` means unmetered, matching
+  the existing convention, so `papio init` and the shipped defaults must write the
+  non-zero value — with a test on the defaults, or the fuse ships inert. Document
+  it in the hand-authored `docs/reference/config-reference.md`. Strict config
+  decoding means the field and the binary deploy together.
 - **`0` disables the ceiling, never the commit.** Every OpenAlex request still
   executes the durable commit and increments `credits_committed`; otherwise the
   configuration that turns off enforcement also bypasses the egress invariant and
@@ -227,14 +276,25 @@ windows must not collapse into one reset, and the pre-existing monetary
 `ErrExceeded` path must be fixed in the same change rather than leaving two
 dispositions for one condition.
 
+**Decision on representation: one typed local-budget refusal carrying unit,
+window and reset**, not two sibling error types. `budget.ErrExceeded` today is
+implicitly monthly and carries neither an `Until` nor a budget kind, so extending
+it is required either way; a single type with `{unit: credits|usd, window:
+utc-day|month, until: time.Time}` keeps one park path and makes a third budget
+cheap. This is the same contract as the egress taxonomy in item 1+2 — define it
+once, there.
+
 ## 4. Jitter the budget-reset wake
 
 Every job parked on a quota or local-budget gate becomes runnable at the same
 instant, because the park time is the reset instant exactly. The token bucket
 protects OpenAlex from the burst, but nothing protects the scheduler and SQLite
 from a cohort waking together — and a synchronized cohort is what produced the
-original 25-minute burn shape. Wake at `reset + stable_jitter(jobID)` over a
-modest window: deterministic, no new state, one line at the park site.
+original 25-minute burn shape. Wake at `reset + stable_jitter(jobID)`:
+deterministic, no new state, one line at the park site. **Window: 0–120 seconds**,
+chosen so a several-hundred-job cohort spreads to a handful of wakes per second
+while the added latency stays invisible against a day-long gate. Give the constant
+a name and let tests reference it rather than picking their own.
 
 **Jitter the job's wake time, never the underlying gate.** The gate instant is
 the provider's own fact and other logic reads it; smearing the gate would corrupt
@@ -252,14 +312,22 @@ promotion path**, not an audit that might conclude nothing.
 path:**
 
 > Search and routing evidence may create candidates. Only evidence independently
-> tied to the submitted canonical identity may mutate canonical identity metadata
-> before artifact validation.
+> **verified as describing the same submitted canonical work** may mutate
+> canonical identity metadata before artifact validation.
 
-Phrasing it that way covers every route at once — weak title matches, fuzzy
-siblings, typed siblings naming a different DOI or version, metadata enrichment,
-and cache attestations — instead of requiring each to be remembered separately. An
-exact-DOI-echo-verified canonical record is a *different authority class* and may
-enrich.
+"Tied to" was too weak, and the difference matters: a typed sibling relation *is*
+independently tied to work X while describing work Y. Verified-as-describing
+excludes it, along with search hits, version edges, and routing evidence — all of
+which may create candidates but may never promote their own work metadata. An
+exact-identity-echo-verified canonical record (DOI **or** OpenAlex ID) is a
+*different authority class* and may enrich.
+
+**Name the anchor, or an implementer has to choose one.** Validation and cache
+attestations must consume a **durable, immutable snapshot of the submitted
+identity**, captured at submit and never rewritten — not the mutable `row.Work`.
+Without that named explicitly, "compare against the submitted identity" silently
+becomes "compare against whatever the job now believes", which is the
+self-confirming loop this item exists to break.
 
 Known violating shapes to remediate:
 
@@ -336,8 +404,12 @@ Reasons it is deferred rather than built now:
    cannot overlap live `Process` execution, or carry a pass token in every
    authoritative charge and reset.
 
-Revisit only if telemetry shows repeated post-wire/pre-park failures, or if "one
-job may not occupy acquisition indefinitely" is adopted as a product invariant.
+Revisit when "one job may not occupy acquisition indefinitely" is adopted as a
+product invariant, or on an observable concentration signal — one job's share of a
+day's `credits_committed`, or repeated same-work passes visible in external logs.
+**Do not rely on in-database telemetry of post-wire/pre-park failures as the
+trigger**: storage failure is precisely the condition that produces those failures
+*and* erases their record, so that signal is quietest exactly when it matters.
 Then frame it as exactly that: a job-liveness fuse, not the remainder of the
 OpenAlex incident fix. Its worked design (conditional SQL charge, progress-only
 reset via `InsertCandidates`' inserted-row count, a separate
@@ -370,11 +442,16 @@ all:
 **The fix is to make the effective basis explicit and authoritative.** A
 side-effect-free `SiblingSearchBasis(requested) (work.Work, bool)` returns the
 basis the adapter *would* use — positive memo metadata or caller metadata,
-whichever wins, subject to the usable-basis rule (title plus a canonicalizable
-author surname; a negative DOI memo suppresses only the memo-derived basis, never
-the caller's own). The app hashes **that returned basis** for the novelty marker,
-and the subsequent search is then forced to use exactly it — no hidden
-substitution after the marker check.
+whichever wins, subject to one **explicit precedence rule: a positive memo wins
+only if it yields a usable basis; otherwise a usable caller basis remains
+eligible.** (That rule is now shipped in the adapter — wholesale replacement let a
+positive-but-incomplete canonical record suppress caller authors, which was the
+negative-memo defect arriving by the opposite route — so item 7 must preserve it
+rather than reintroduce a plain override.) Usable means title plus a
+canonicalizable author surname; a negative DOI memo suppresses only the
+memo-derived basis, never the caller's own. The app hashes **that returned basis**
+for the novelty marker, and the subsequent search is forced to use exactly it — no
+hidden substitution after the marker check.
 
 Only when no usable local basis exists does the caller, under its *own* separate
 admission and credit commit, ask for a one-credit `SiblingBasis` network lookup.
@@ -513,6 +590,32 @@ for real dollars. A billing feature, not a safety mechanism.
   least one canonicalizable author surname. Regressions:
   `TestSiblingRefusesABasisThatCannotAccept` (table),
   `TestNegativeMemoDoesNotSuppressACallerBasis`.
+- **Only one of the two exact endpoints verified its identity.** `Resolve` proved
+  a DOI lookup came back *about* the requested DOI, but an OpenAlex-ID lookup
+  trusted whatever the provider returned — and both publish at
+  `IdentityConfidence 1.0`. Submit `W…` with no DOI, receive a valid record for a
+  different work, and the resolver asserted an exact canonical match. Now
+  `echoesOpenAlex` mirrors `echoesDOI` with the same fail-closed rules (at least
+  one parseable echo, every parseable echo must agree, version-preserving
+  normalization), applied before the memo write. Regression:
+  `TestExactOpenAlexIDLookupRequiresAnEchoedID` — whose first draft was
+  *vacuous*, because `work.NormalizeOpenAlex("W1")` is invalid and every case
+  returned early; three of four "passed" for the wrong reason until the fixture
+  used a real id shape.
+- **A whitespace-padded API key defeated the 5% floor entirely.** The resolver
+  trims the configured key before putting it on the wire and `budget.identityFor`
+  trims it before deriving the identity, but the observer compared the outgoing
+  `"key"` against an untrimmed configured `" key "` — matching neither arm of its
+  switch, so it silently recorded nothing. A configuration the rest of the stack
+  deliberately treats as equivalent turned the floor off. The credential is now
+  canonicalized at `NewObserver`. Regression:
+  `TestObserverCanonicalizesTheConfiguredCredential`.
+- **A positive-but-incomplete memo suppressed a usable caller basis.** The memo
+  replaced caller metadata wholesale before the usable-basis test, so a canonical
+  record with a title and no legible authors cancelled the hop — the same defect
+  as the negative-memo case, arriving by the opposite route. A positive memo now
+  wins only if it yields a usable basis. Regression:
+  `TestIncompletePositiveMemoDoesNotSuppressACallerBasis`.
 
 ## Rejected designs (do not re-derive)
 
@@ -522,6 +625,28 @@ for real dollars. A billing feature, not a safety mechanism.
   the quota floor; a paid singleton followed by `ErrNoSearchBasis` put a false
   "no request happened" fact into the retry plan; and the durable marker then
   named a question that was not the one searched. Item 7 is the caller-side fix.
+- **`RoundTripper.RoundTrip` as the one-wire boundary.** The standard `Transport`
+  may replay an idempotent request after certain connection failures, and every
+  OpenAlex call is a GET — so one debit could still cover two physical requests.
+  Disabling redirects is necessary and insufficient.
+- **Latching the lost floor only when the durable write fails.** The write can
+  block for seconds; during that window the process knows the fact while egress
+  still sees no gate. Latch on the parsed header instead.
+- **A process-only pricing-drift closure.** Commit 10, learn the shape cost 100,
+  mark it closed, crash — only the under-sized debit survives and the operation is
+  authorized again. The closure must be durable.
+- **Leaving the late-refusal error contract to item 3.** `openalex.fetch` flattens
+  every client error into a fresh generic `TemporaryError`, so a quota refusal
+  raised at egress cannot reach the fallback logic and a credit refusal cannot
+  reach the park logic. The taxonomy belongs with the egress design.
+- **"Independently tied to the submitted identity" as the enrichment test.** A
+  typed sibling relation is genuinely tied to work X while describing work Y. The
+  test is *verified as describing the same work*.
+- **Comparing validation against the mutable `row.Work`.** That is the
+  self-confirming loop: the anchor must be an immutable snapshot of the submitted
+  identity.
+- **Verifying the echoed identity on the DOI endpoint only.** The OpenAlex-ID
+  endpoint publishes at the same 1.0 confidence and had no check at all.
 - **Expecting the daily credit fuse to restore the provider floor.** They are
   different boundaries: a source-wide counter answers "how much may this instance
   commit today", the floor answers "is this credential's provider balance spent".

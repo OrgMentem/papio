@@ -125,13 +125,19 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 	if lookup == "" {
 		return nil, nil
 	}
-	// memoDOI is the normalized DOI this lookup keyed on, when it keyed on one.
-	// lookupURL does not expose it, and it cannot fail here — lookupURL already
-	// validated the same input — but the error is checked before any memo write.
-	memoDOI := ""
-	if lookup == "doi" {
+	// memoDOI is the normalized DOI this lookup keyed on, when it keyed on one;
+	// memoOpenAlex likewise for the other exact endpoint. lookupURL does not
+	// expose either, and neither can fail here — lookupURL already validated the
+	// same input — but the error is checked before any memo write.
+	memoDOI, memoOpenAlex := "", ""
+	switch lookup {
+	case "doi":
 		if doi, doiErr := work.NormalizeDOI(requested.DOI); doiErr == nil {
 			memoDOI = doi
+		}
+	case "openalex":
+		if id, idErr := work.NormalizeOpenAlex(requested.OpenAlex); idErr == nil {
+			memoOpenAlex = id
 		}
 	}
 	body, err := r.fetch(ctx, endpoint)
@@ -172,14 +178,20 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		// caching an unverified record would launder a wrong-work title into a
 		// sibling search that no longer has the requested DOI to check against.
 		return nil, nil
+	} else if memoOpenAlex != "" && !echoesOpenAlex(record, memoOpenAlex) {
+		// The SAME rule for the other exact endpoint. Both publish at
+		// IdentityConfidence 1.0, so both must prove the response is about the
+		// identity that was requested; verifying only the DOI path left an
+		// OpenAlex-ID lookup trusting whatever came back.
+		return nil, nil
 	} else if memoDOI != "" {
 		// Written before OA/candidate filtering: a paywalled record still
 		// carries the authoritative bibliography sibling matching needs.
 		r.writeMemo(memoDOI, record, true)
 	}
 
-	// An exact-DOI lookup must come back ABOUT the DOI that was asked for:
-	// without it a misrouted or duplicated upstream answer is published with
+	// Every EXACT lookup must come back about the identity that was asked for:
+	// without that, a misrouted or duplicated upstream answer is published with
 	// IdentityConfidence 1.0, acquiring a different paper under this citation.
 	// Verified above, before the memo write.
 	if !record.isOpenAccess() {
@@ -338,8 +350,15 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 	// title and authors are unusable for finding a sibling indexed under its own
 	// DOI. Treating it as a full stop suppressed perfectly good caller
 	// metadata.
+	// A positive memo wins ONLY if it yields a usable basis. Replacing the
+	// caller's metadata wholesale let a positive-but-incomplete record — a
+	// canonical work with a title and no legible authors, say — suppress caller
+	// authors and cancel the hop, which is the same defect the negative-memo
+	// case had, arriving by the opposite route.
 	if record, ok := r.recordFor(canonicalDOI); ok {
-		canonical = resolvedWork(record)
+		if memoized := resolvedWork(record); usableSiblingBasis(memoized) {
+			canonical = memoized
+		}
 	}
 	if !usableSiblingBasis(canonical) {
 		// Zero requests were made, and the caller must not charge one.
@@ -501,6 +520,29 @@ func echoesDOI(record workRecord, want string) bool {
 			return false
 		}
 		if doi != want {
+			return false
+		}
+		parsed++
+	}
+	return parsed > 0
+}
+
+// echoesOpenAlex is echoesDOI for the other exact endpoint, with the same
+// fail-closed rules: at least one parseable echo is required, every parseable
+// echo must equal the requested id, and normalization is the acquisition-side
+// version-preserving form. Both endpoints publish at IdentityConfidence 1.0, so
+// both must prove the response describes the identity that was requested.
+func echoesOpenAlex(record workRecord, want string) bool {
+	parsed := 0
+	for _, raw := range []string{record.ID, record.IDs.OpenAlex} {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		id, err := work.NormalizeOpenAlex(raw)
+		if err != nil {
+			return false
+		}
+		if id != want {
 			return false
 		}
 		parsed++

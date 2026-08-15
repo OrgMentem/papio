@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"papio/internal/config"
@@ -135,6 +136,14 @@ func NewObserver(deferrer Deferrer, source string, keyed config.Source, inner HT
 	if inner == nil {
 		return nil, fmt.Errorf("sourcegate: %s observer has no inner client", source)
 	}
+	// Canonicalize the credential once, here, because every other layer already
+	// does: the OpenAlex resolver trims the configured key before putting it on
+	// the wire, and budget.identityFor trims it before deriving the identity. An
+	// untrimmed copy here compared an outgoing "key" against a configured
+	// " key ", matched neither arm of observe's switch, and silently dropped the
+	// low-quota floor — so a configuration the rest of the stack deliberately
+	// treats as equivalent defeated the 5% stop entirely.
+	keyed.APIKey = strings.TrimSpace(keyed.APIKey)
 	return &Observer{inner: inner, deferrer: deferrer, source: source, keyed: keyed, now: time.Now}, nil
 }
 

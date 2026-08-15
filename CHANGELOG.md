@@ -11,6 +11,29 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **An OpenAlex-ID lookup now has to come back about the work that was asked
+  for.** *papio* already refused a record that answered a DOI lookup with a
+  different paper, but the equivalent lookup by OpenAlex identifier trusted
+  whatever arrived — and both are treated as exact, fully-confident matches. A
+  misrouted or duplicated answer could therefore be filed under the citation that
+  requested it. Both lookups now apply the same rule, and disagreement between a
+  record's own identifier fields is refused rather than resolved by field order.
+
+- **An API key with stray whitespace no longer disables the daily-budget stop.**
+  The key is trimmed everywhere it is used — on the wire, and when deciding which
+  credential a budget belongs to — but the component that records "this
+  credential is nearly out" compared the trimmed key it saw against the untrimmed
+  one from configuration, matched neither, and silently recorded nothing. A
+  configuration *papio* otherwise treats as identical turned the stop off
+  entirely.
+
+- **A partial cached record no longer cancels sibling discovery.** The reused
+  canonical record replaced the work's own metadata outright, so a cached record
+  carrying a title but no readable authors could leave nothing to search on and
+  silently skip the search — even when the work's own title and authors were
+  perfectly usable. The cache now only takes precedence when it actually yields a
+  usable basis.
+
 - **An unreadable retry history no longer authorizes the expensive search.**
   Whether a job has spent its retry budget is read in two opposite senses: for
   deciding when to stop trying, "cannot tell" must mean stop, but the same

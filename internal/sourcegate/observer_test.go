@@ -228,3 +228,28 @@ func TestObserverRejectsSelfInconsistentBudget(t *testing.T) {
 		})
 	}
 }
+
+// The resolver trims the configured key before putting it on the wire and
+// budget.identityFor trims it before deriving the identity, so a configured
+// " key " must not read as a credential this observer cannot name. It used to:
+// the untrimmed comparison matched neither arm and silently dropped the floor.
+func TestObserverCanonicalizesTheConfiguredCredential(t *testing.T) {
+	deferrer := &fakeDeferrer{}
+	inner := &headerClient{status: http.StatusOK, headers: map[string]string{
+		"X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "12", "X-RateLimit-Reset": "3600",
+	}}
+	observer, err := NewObserver(deferrer, "openalex", config.Source{Enabled: true, APIKey: "  private-key\t"}, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer.now = func() time.Time { return observerNow }
+	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+		t.Fatal(err)
+	}
+	if len(deferrer.calls) != 1 {
+		t.Fatalf("Defer calls = %#v, want the floor recorded for the trimmed credential", deferrer.calls)
+	}
+	if got := deferrer.calls[0].policy.APIKey; got != "private-key" {
+		t.Fatalf("floor identity key = %q, want the canonical %q", got, "private-key")
+	}
+}

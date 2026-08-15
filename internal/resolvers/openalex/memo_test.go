@@ -205,7 +205,7 @@ func TestEchoedDOIRejectsInconsistentIdentities(t *testing.T) {
 // papio's worst outcome is a wrong paper filed under a right citation.
 func TestMisroutedRecordIsNeitherPublishedNorMemoized(t *testing.T) {
 	client := clientFunc(func(*http.Request) (*http.Response, error) {
-		return responseFor(200, `{"id":"https://openalex.org/W9","doi":"https://doi.org/10.9999/other.work","title":"An Entirely Different Paper","publication_year":2019,"open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"pdf_url":"https://example.org/other.pdf","version":"publishedVersion"}}`, nil), nil
+		return responseFor(200, `{"id":"https://openalex.org/W9","doi":"https://doi.org/10.9999/other.work","title":"An Entirely Different Paper","publication_year":2019,"open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.org/other.pdf","version":"publishedVersion"}}`, nil), nil
 	})
 	r := New(client, "contact@example.org", "private-key")
 	candidates, err := r.Resolve(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
@@ -303,5 +303,77 @@ func TestAnonymousStripsBaseURLKey(t *testing.T) {
 	}
 	if strings.Contains(seen[1].URL.RawQuery, "stale") {
 		t.Fatalf("keyed request kept the stale base-URL key: %s", seen[1].URL.RawQuery)
+	}
+}
+
+// Both exact endpoints publish at IdentityConfidence 1.0, so both must prove the
+// response describes the identity that was requested. Only the DOI path checked.
+func TestExactOpenAlexIDLookupRequiresAnEchoedID(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		body    string
+		accepts bool
+	}{
+		{
+			name:    "echoes the requested id",
+			body:    `{"id":"https://openalex.org/W2741809807","ids":{"openalex":"https://openalex.org/W2741809807"},"title":"Shape Trust","open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.org/a.pdf","version":"publishedVersion"}}`,
+			accepts: true,
+		},
+		{
+			name: "answers about another work",
+			body: `{"id":"https://openalex.org/W2741809808","ids":{"openalex":"https://openalex.org/W2741809808"},"title":"Another Paper","open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.org/b.pdf","version":"publishedVersion"}}`,
+		},
+		{
+			name: "identities disagree with each other",
+			body: `{"id":"https://openalex.org/W2741809807","ids":{"openalex":"https://openalex.org/W2741809808"},"title":"Shape Trust","open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.org/a.pdf","version":"publishedVersion"}}`,
+		},
+		{
+			name: "echoes nothing legible",
+			body: `{"title":"Shape Trust","open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.org/a.pdf","version":"publishedVersion"}}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := clientFunc(func(*http.Request) (*http.Response, error) {
+				return responseFor(200, test.body, nil), nil
+			})
+			r := New(client, "contact@example.org", "private-key")
+			candidates, err := r.Resolve(context.Background(), work.Work{OpenAlex: "W2741809807"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(candidates) > 0; got != test.accepts {
+				t.Fatalf("accepted = %v, want %v", got, test.accepts)
+			}
+		})
+	}
+}
+
+// A positive memo wins only if it yields a usable basis. Replacing caller
+// metadata wholesale let a canonical record with no legible authors cancel the
+// hop — the negative-memo defect arriving by the opposite route.
+func TestIncompletePositiveMemoDoesNotSuppressACallerBasis(t *testing.T) {
+	var searched bool
+	client := clientFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Query().Get("search") != "" {
+			searched = true
+			return responseFor(200, `{"results":[]}`, nil), nil
+		}
+		// Canonical record: a title, but no authors the canonicalizer can read.
+		return responseFor(200, `{"id":"https://openalex.org/W2741809807","doi":"https://doi.org/10.1145/3531146.3533202","title":"Shape Trust","publication_year":2022,"authorships":[]}`, nil), nil
+	})
+	r := New(client, "contact@example.org", "private-key")
+	ctx := context.Background()
+	if _, err := r.Resolve(ctx, work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ResolveSiblings(ctx, work.Work{
+		DOI:     "10.1145/3531146.3533202",
+		Title:   "Shape Trust",
+		Authors: []string{"Andrea Ferrario"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !searched {
+		t.Fatal("an incomplete positive memo suppressed a usable caller basis")
 	}
 }
