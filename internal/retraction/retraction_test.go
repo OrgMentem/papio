@@ -498,6 +498,170 @@ func TestSweepRespectsDisabledPolicyAndBudget(t *testing.T) {
 	}
 }
 
+func TestSharedNoticeDOIStillSurfacesEachAffectedWork(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	shared := "10.2000/shared"
+
+	t.Run("newFindings includes every affected DOI", func(t *testing.T) {
+		jobs := testStore(t)
+		addReadyDOI(t, jobs, "10.1234/alpha", 1)
+		addReadyDOI(t, jobs, "10.1234/beta", 2)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"` + shared + `","updated":"retraction"}]}}`))
+		}))
+		defer server.Close()
+		notifier := &recordingNotifier{}
+		sentinel := New(Options{
+			Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+			Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(), Notifier: notifier,
+			Now: func() time.Time { return now },
+		})
+		if err := sentinel.RunDue(ctx); err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		if len(notifier.events) != 1 {
+			t.Fatalf("events = %#v, want 1", notifier.events)
+		}
+		detail, ok := notifier.events[0].Detail["findings"].([]map[string]any)
+		if !ok || len(detail) != 2 {
+			t.Fatalf("findings detail = %#v, want 2", notifier.events[0].Detail["findings"])
+		}
+		got := map[string]bool{}
+		for _, row := range detail {
+			got[row["doi"].(string)] = true
+			if row["notice_doi"].(string) != shared {
+				t.Fatalf("notice_doi = %q, want %q", row["notice_doi"], shared)
+			}
+		}
+		if !got["10.1234/alpha"] || !got["10.1234/beta"] {
+			t.Fatalf("notification DOIs = %#v, want both affected DOIs", got)
+		}
+		sentinel.mu.Lock()
+		cached, _ := sentinel.readCache()
+		sentinel.mu.Unlock()
+		if len(cached.Notices) != 2 {
+			t.Fatalf("cache notices = %d, want 2", len(cached.Notices))
+		}
+		if _, ok := cached.Notices[findingKey(Finding{DOI: "10.1234/alpha", Nature: NatureRetraction, NoticeDOI: shared})]; !ok {
+			t.Fatal("alpha finding missing from cache")
+		}
+		if _, ok := cached.Notices[findingKey(Finding{DOI: "10.1234/beta", Nature: NatureRetraction, NoticeDOI: shared})]; !ok {
+			t.Fatal("beta finding missing from cache")
+		}
+		items, err := sentinel.SnapshotItems(ctx, nil)
+		if err != nil || len(items) != 2 {
+			t.Fatalf("snapshot items = %#v, %v; want 2", items, err)
+		}
+	})
+
+	t.Run("triage snapshot includes every affected DOI", func(t *testing.T) {
+		jobs := testStore(t)
+		sentinel := New(Options{
+			Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+			DataDir: t.TempDir(), Now: func() time.Time { return now },
+		})
+		a := Finding{DOI: "10.1234/alpha", Nature: NatureRetraction, NoticeDOI: shared, NoticedAt: now}
+		b := Finding{DOI: "10.1234/beta", Nature: NatureRetraction, NoticeDOI: shared, NoticedAt: now}
+		sentinel.mu.Lock()
+		if err := sentinel.writeCache(cache{Version: cacheVersion, CheckedAt: now, Notices: map[string]Finding{findingKey(a): a, findingKey(b): b}}); err != nil {
+			sentinel.mu.Unlock()
+			t.Fatalf("seed cache: %v", err)
+		}
+		sentinel.mu.Unlock()
+		items, err := sentinel.SnapshotItems(ctx, nil)
+		if err != nil || len(items) != 2 {
+			t.Fatalf("snapshot items = %#v, %v; want 2", items, err)
+		}
+		got := map[string]bool{}
+		for _, item := range items {
+			got[item.Retraction.DOI] = true
+		}
+		if !got["10.1234/alpha"] || !got["10.1234/beta"] {
+			t.Fatalf("snapshot DOIs = %#v, want both", got)
+		}
+	})
+}
+
+func TestGenuineDuplicateCollapsesToOne(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	dup := Finding{DOI: "10.1234/alpha", Nature: NatureRetraction, NoticeDOI: "10.2000/shared", NoticedAt: now}
+
+	sentinel := New(Options{
+		Store: testStore(t), Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		DataDir: t.TempDir(), Now: func() time.Time { return now },
+	})
+	sentinel.mu.Lock()
+	if err := sentinel.writeCache(cache{
+		Version: cacheVersion, CheckedAt: now,
+		Notices: map[string]Finding{
+			findingKey(dup): dup,
+			// Different map key for the same per-work identity; validNotices will
+			// reject it, leaving only the canonical entry. Either way SnapshotItems
+			// must still surface just one item.
+			"alias": dup,
+		},
+	}); err != nil {
+		sentinel.mu.Unlock()
+		t.Fatalf("seed cache: %v", err)
+	}
+	sentinel.mu.Unlock()
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("snapshot items = %#v, %v; want 1", items, err)
+	}
+	if items[0].Retraction.DOI != dup.DOI || items[0].Retraction.NoticeDOI != dup.NoticeDOI {
+		t.Fatalf("retraction = %+v, want %#v", items[0].Retraction, dup)
+	}
+
+	// newFindings path: a sweep that re-discovers the same affected DOI with
+	// the same notice must be considered already-seen.
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/alpha", 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/shared","updated":"retraction"}]}}`))
+	}))
+	defer server.Close()
+	notifier := &recordingNotifier{}
+	earlier := now.Add(-24 * time.Hour)
+	sentinel2 := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(), Notifier: notifier,
+		Now: func() time.Time { return now },
+	})
+	sentinel2.mu.Lock()
+	if err := sentinel2.writeCache(cache{Version: cacheVersion, CheckedAt: earlier, Notices: map[string]Finding{findingKey(dup): Finding{DOI: dup.DOI, Nature: dup.Nature, NoticeDOI: dup.NoticeDOI, NoticedAt: earlier}}}); err != nil {
+		sentinel2.mu.Unlock()
+		t.Fatalf("seed cache: %v", err)
+	}
+	sentinel2.mu.Unlock()
+	// Advance past sweepEvery so RunDue actually sweeps.
+	sentinel2.now = func() time.Time { return earlier.Add(sweepEvery + time.Second) }
+	if err := sentinel2.RunDue(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(notifier.events) != 0 {
+		t.Fatalf("events = %#v, want none for a genuine duplicate", notifier.events)
+	}
+}
+
+func TestEmptyAffectedDOIDedupsByNotice(t *testing.T) {
+	emptyA := Finding{DOI: "", Nature: NatureRetraction, NoticeDOI: "10.2000/shared", NoticedAt: time.Now()}
+	emptyB := Finding{DOI: "", Nature: NatureRetraction, NoticeDOI: "10.2000/shared", NoticedAt: time.Now()}
+	if noticeKey(emptyA) != noticeKey(emptyB) {
+		t.Fatalf("empty-DOI notice keys differ: %q vs %q", noticeKey(emptyA), noticeKey(emptyB))
+	}
+	if noticeKey(emptyA) != "10.2000/shared" {
+		t.Fatalf("empty-DOI notice key = %q, want the notice DOI alone", noticeKey(emptyA))
+	}
+	// FindingKey still separates empty-DOI findings from real ones.
+	real := Finding{DOI: "10.1234/alpha", Nature: NatureRetraction, NoticeDOI: "10.2000/shared"}
+	if findingKey(emptyA) == findingKey(real) {
+		t.Fatal("findingKey must distinguish an empty affected DOI from a real one")
+	}
+}
+
 func testStore(t *testing.T) *store.Store {
 	t.Helper()
 	db, err := store.Open(context.Background(), t.TempDir())

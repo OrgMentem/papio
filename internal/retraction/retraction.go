@@ -556,7 +556,7 @@ func validNotices(notices map[string]Finding) map[string]Finding {
 }
 
 func noticeKey(f Finding) string {
-	if f.NoticeDOI != "" {
+	if f.DOI == "" && f.NoticeDOI != "" {
 		return f.NoticeDOI
 	}
 	return findingKey(f)
