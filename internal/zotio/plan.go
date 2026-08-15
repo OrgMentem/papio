@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"papio/internal/job"
@@ -27,6 +28,22 @@ const (
 )
 
 var planIDRE = regexp.MustCompile(`^zplan_[a-f0-9]{26}$`)
+
+var (
+	materializeLocksMu sync.Mutex
+	materializeLocks   = make(map[string]*sync.Mutex)
+)
+
+func pathLock(path string) *sync.Mutex {
+	materializeLocksMu.Lock()
+	defer materializeLocksMu.Unlock()
+	if mu, ok := materializeLocks[path]; ok {
+		return mu
+	}
+	mu := &sync.Mutex{}
+	materializeLocks[path] = mu
+	return mu
+}
 
 // Plan is papio's immutable confirmation object around one exact Zotio preview.
 type Plan struct {
@@ -236,25 +253,32 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		return nil, fmt.Errorf("verifying planned artifact: %w", err)
 	}
 	idempotencyKey := "zotio_apply:" + plan.ID + ":" + confirmation
-	if existing, err := s.recordedApply(ctx, idempotencyKey); err != nil {
+	ledgerCtx := context.WithoutCancel(ctx)
+	if existing, err := s.recordedApply(ledgerCtx, idempotencyKey); err != nil {
 		return nil, err
 	} else if existing != nil {
+		if existing.Status == "ambiguous" {
+			return nil, s.ambiguousReplayError(existing, plan.ID)
+		}
 		s.fileCollection(ctx, plan, existing)
 		if err := s.markImported(ctx, existing); err != nil {
 			return nil, err
 		}
 		return existing, nil
 	}
-	claimed, err := s.claimApply(ctx, idempotencyKey, plan.JobID)
+	claimed, err := s.claimApply(ledgerCtx, idempotencyKey, plan.JobID)
 	if err != nil {
 		return nil, err
 	}
 	if !claimed {
-		result, recordErr := s.recordedApply(ctx, idempotencyKey)
+		result, recordErr := s.recordedApply(ledgerCtx, idempotencyKey)
 		if recordErr != nil {
 			return nil, recordErr
 		}
 		if result != nil {
+			if result.Status == "ambiguous" {
+				return nil, s.ambiguousReplayError(result, plan.ID)
+			}
 			s.fileCollection(ctx, plan, result)
 			if err := s.markImported(ctx, result); err != nil {
 				return nil, err
@@ -268,18 +292,23 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		// or contended mutation. Surface an explicit retryable conflict.
 		return nil, WithErrorInfo(fmt.Errorf("Zotio apply reservation for plan %s is in progress: %w", plan.ID, job.ErrConflict))
 	}
-
 	out, commandErr := s.CLI.RunJSON(ctx, plan.ApplyArgs...)
 	if commandErr != nil {
 		applyErr := fmt.Errorf("applying Zotio mutation: %w", commandErr)
 		if message, ok := mutationFailure(out); ok {
 			applyErr = fmt.Errorf("applying Zotio mutation: %s", message)
 		}
+		if errors.Is(commandErr, context.DeadlineExceeded) || errors.Is(commandErr, context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled) {
+			return nil, s.recordAmbiguousApply(ctx, idempotencyKey, plan, out, applyErr)
+		}
 		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
 	envelope, err := decodeApply(out)
 	if err != nil {
 		applyErr := fmt.Errorf("decoding Zotio apply result: %w", err)
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled) {
+			return nil, s.recordAmbiguousApply(ctx, idempotencyKey, plan, out, applyErr)
+		}
 		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
 	result := &ApplyResult{
@@ -701,6 +730,52 @@ func (s *Service) recordFailedApplyAndInvalidatePlan(ctx context.Context, key st
 	return WithErrorInfo(applyErr, zotio)
 }
 
+func (s *Service) recordAmbiguousApply(ctx context.Context, key string, plan *Plan, zotio json.RawMessage, applyErr error) error {
+	info := ClassifyError(applyErr, zotio)
+	result := &ApplyResult{
+		PlanID:    plan.ID,
+		JobID:     plan.JobID,
+		Status:    "ambiguous",
+		ParentKey: plan.ExpectedParentKey,
+		AppliedAt: s.now().UTC().Format(time.RFC3339),
+		Error:     info.Hint,
+		Zotio:     zotio,
+	}
+	durableCtx := context.WithoutCancel(ctx)
+	if err := s.recordApply(durableCtx, key, result); err != nil {
+		return WithErrorInfo(fmt.Errorf("recording ambiguous Zotio apply: %w", applyErr), zotio)
+	}
+	// Leave the plan intact: the mutation may have succeeded before the deadline
+	// so invalidating would let PlanJobs re-derive a fresh mutation for the same
+	// file, risking duplicate attachment or duplicate library entry. A follow-up
+	// PlanJobs is blocked by the ambiguous reservation until reconciliation
+	// completes and the verification either records success or reopens retry.
+	return WithErrorInfo(applyErr, zotio)
+}
+func (s *Service) ambiguousReplayError(result *ApplyResult, planID string) error {
+	// The durable ambiguous record holds only the redacted hint (e.g.
+	// "Zotio command canceled" / "Zotio command timed out"). Rebuild an error
+	// that preserves the original context sentinel so callers remain able to
+	// detect ambiguous/cancellable failures with errors.Is(..., context.Canceled)
+	// or errors.Is(..., context.DeadlineExceeded) across the replay path.
+	sentinel := context.Canceled
+	switch {
+	case strings.Contains(result.Error, "timed out"):
+		sentinel = context.DeadlineExceeded
+	case strings.Contains(result.Error, "canceled") || result.Error == "":
+		sentinel = context.Canceled
+	default:
+		// Fall back to a generic ambiguous sentinel that ClassifyError will
+		// map back onto the same class the first write recorded, even for
+		// cancellation flavours that the hint text does not fully capture.
+		sentinel = context.Canceled
+	}
+	base := fmt.Errorf("applying Zotio mutation: %s", result.Error)
+	if strings.TrimSpace(result.Error) == "" {
+		base = fmt.Errorf("Zotio apply is ambiguous: reconciliation required before retry for plan %s", planID)
+	}
+	return WithErrorInfo(fmt.Errorf("%w: %w", sentinel, base), result.Zotio)
+}
 func (s *Service) invalidatePlan(ctx context.Context, plan *Plan) error {
 	planPath := filepath.Join(s.DataDir, "zotio", "plans", plan.ID+".json")
 	manifestPath := plan.ManifestPath
@@ -750,6 +825,13 @@ func (s *Service) recordedApply(ctx context.Context, key string) (*ApplyResult, 
 	var result ApplyResult
 	if err := json.Unmarshal([]byte(raw.String), &result); err != nil {
 		return nil, fmt.Errorf("decoding recorded Zotio apply: %w", err)
+	}
+	if result.Status == "ambiguous" {
+		// An ambiguous apply (timeout/cancellation) may have mutated Zotero.
+		// Surface it as a finished outcome so Apply replays the error rather
+		// than silently reissuing the mutation. It remains non-reclaimable by
+		// claimApply until explicitly reconciled or expired.
+		return &result, nil
 	}
 	if result.Status == "in_progress" || result.Status == "failed" {
 		// A failed apply is replayable; an in-progress apply remains owned by
@@ -836,44 +918,51 @@ func atomicPrivateWrite(path string, data []byte) error {
 }
 
 func materializePrivateFile(source, target, expectedSHA string) error {
+	mu := pathLock(target)
+	mu.Lock()
+	defer mu.Unlock()
 	if err := verifyFileSHA256(target, expectedSHA); err == nil {
 		return nil
 	}
-	_ = os.Remove(target)
+	// Do not blindly remove a file that may be mid-create by a raced caller;
+	// our lock already serializes callers holding the same target path.
 	in, err := os.Open(source)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	dir := filepath.Dir(target)
+	tmp, err := os.CreateTemp(dir, ".papio-stage-*.tmp")
 	if err != nil {
 		return err
 	}
-	copyErr := func() error {
-		if _, err := io.Copy(out, in); err != nil {
-			return err
-		}
-		return out.Sync()
-	}()
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(target)
-		return copyErr
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
 	}
-	if closeErr != nil {
-		_ = os.Remove(target)
-		return closeErr
+	if _, err := io.Copy(tmp, in); err != nil {
+		_ = tmp.Close()
+		return err
 	}
-	if verifyErr := verifyFileSHA256(target, expectedSHA); verifyErr != nil {
-		// The copy completed but does not match the artifact digest: leaving it
-		// behind would publish a corrupt file under a name the manifest treats
-		// as verified.
-		_ = os.Remove(target)
-		return verifyErr
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
 	}
-	return nil
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := verifyFileSHA256(tmpName, expectedSHA); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		return err
+	}
+	// Re-verify through the final path name to guard against a last-moment
+	// replacement that an atomic rename still serializes away on POSIX.
+	return verifyFileSHA256(target, expectedSHA)
 }
-
 func verifyFileSHA256(path, expected string) error {
 	file, err := os.Open(path)
 	if err != nil {

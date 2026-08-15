@@ -336,19 +336,12 @@ func TestClaimApplyReclaimsExpiredReservation(t *testing.T) {
 	}
 }
 
-// A cancelled apply is recorded as a durable failure and its plan invalidated,
-// even though the killed `zotio apply` child may have reached Zotero's API
-// before the context died. That reads like the hazard Apply's reservation
-// comment warns about, and it is not: the reservation protects against a
-// CONCURRENT worker whose write is still in flight, which papio cannot observe.
-// A cancellation is different — this process owns the reservation and knows the
-// child is dead — and the retry cannot duplicate anything, because a new plan is
-// re-derived from the live library through `zotio import resolve`, which
-// classifies an already-written work as duplicate (manifest_duplicate) or as an
-// attach candidate (manifest_attach) instead of creating it again. Leaving the
-// reservation in_progress instead would strand the job behind applyClaimLease
-// with no worker coming back for it, so do not "fix" this into a retryable
-// conflict without first removing that re-derivation.
+// A cancelled apply is AMBIGUOUS: the Zotio child may have mutated Zotero
+// before the context died, so it is not a definitive failure. The plan is
+// retained and the ambiguous reservation blocks a silent retry that would
+// duplicate attachments or library entries; reconciliation must verify Zotero's
+// current state before the mutation may be re-issued. Failed applies remain
+// definitive and invalidating (see TestFailedManifestApplyInvalidatesCachedDerivation).
 func TestCancelledApplyFinalizesClaimAndReplans(t *testing.T) {
 	var cancel context.CancelFunc
 	cli := &planCLI{
@@ -381,23 +374,41 @@ func TestCancelledApplyFinalizesClaimAndReplans(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &recorded); err != nil {
 		t.Fatal(err)
 	}
-	if recorded.Status != "failed" {
-		t.Fatalf("cancelled apply record = %+v", recorded)
+	if recorded.Status != "ambiguous" {
+		t.Fatalf("cancelled apply record = %+v, want ambiguous", recorded)
 	}
-	cli.applyFn = nil
+	// Plan is retained, not invalidated, so a silent retry cannot duplicate.
+	if _, err := os.Stat(filepath.Join(service.DataDir, "zotio", "plans", plan.ID+".json")); err != nil {
+		t.Fatalf("ambiguous apply deleted its plan: %v", err)
+	}
+	var planCount int
+	if err := service.Store.DB().QueryRow(`SELECT count(*) FROM exports WHERE kind='zotio_plan'`).Scan(&planCount); err != nil {
+		t.Fatal(err)
+	}
+	if planCount != 1 {
+		t.Fatalf("plan rows after ambiguous = %d, want 1 retained", planCount)
+	}
+	// Re-applying the same plan must replay the ambiguous error, not re-issue
+	// the mutation. A new PlanJobs for the same job converges on the same
+	// retained plan, so it is also blocked.
+	if _, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256); !errors.Is(err, context.Canceled) {
+		t.Fatalf("replayed ambiguous apply err = %v, want context.Canceled", err)
+	}
+	if cli.applyCalls != 1 {
+		t.Fatalf("ambiguous replay re-issued Zotio mutation: applyCalls=%d want 1", cli.applyCalls)
+	}
 	replanned, err := service.PlanJobs(context.Background(), []string{jobID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replanned[0].ID == plan.ID {
-		t.Fatal("cancelled apply retained its invalidated plan")
+	if replanned[0].ID != plan.ID {
+		t.Fatalf("ambiguous apply should retain its plan: got %s want %s", replanned[0].ID, plan.ID)
 	}
-	result, err := service.Apply(context.Background(), replanned[0].ID, replanned[0].ConfirmationSHA256)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := service.Apply(context.Background(), replanned[0].ID, replanned[0].ConfirmationSHA256); !errors.Is(err, context.Canceled) {
+		t.Fatalf("replanned ambiguous apply err = %v, want context.Canceled", err)
 	}
-	if result.Status != "applied" || cli.applyCalls != 2 {
-		t.Fatalf("reapplied result = %+v calls=%d", result, cli.applyCalls)
+	if cli.applyCalls != 1 {
+		t.Fatalf("replanned ambiguous should not have re-issued: applyCalls=%d", cli.applyCalls)
 	}
 }
 
@@ -864,5 +875,126 @@ func TestApplyInFlightReservationConflictIsRetryable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "reservation for plan") || !strings.Contains(err.Error(), "is in progress") {
 		t.Fatalf("message = %q", err.Error())
+	}
+}
+
+func TestDeadlineExceededApplyIsAmbiguousAndDistinctFromDefinitiveFailure(t *testing.T) {
+	// Definitive failure: non-zero Zotio exit with known reason -> status failed, plan invalidated, retry re-derives.
+	cli := &planCLI{
+		preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:    `{"ok":false,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":0,"failed":1},"items":[{"status":"failed","reason":"quota exceeded"}]}}`,
+		applyErr: errors.New("zotio import apply: quota exceeded"),
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	plans, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := plans[0]
+	if _, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256); err == nil || !strings.Contains(err.Error(), "quota exceeded") {
+		t.Fatalf("definitive apply err = %v", err)
+	}
+	var failedRaw string
+	if err := service.Store.DB().QueryRow(`SELECT result_json FROM exports WHERE kind='zotio_apply'`).Scan(&failedRaw); err != nil {
+		t.Fatal(err)
+	}
+	var failed ApplyResult
+	if err := json.Unmarshal([]byte(failedRaw), &failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status != "failed" {
+		t.Fatalf("definitive failure status = %q, want failed", failed.Status)
+	}
+	if _, err := os.Stat(filepath.Join(service.DataDir, "zotio", "plans", plan.ID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("failed plan still exists: %v", err)
+	}
+
+	// Ambiguous: context deadline -> status ambiguous, plan retained, replay does not re-issue mutation.
+	deadlineCLI := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+	}
+	deadlineCLI.applyFn = func(ctx context.Context) (json.RawMessage, error) {
+		return json.RawMessage(`{"partial":true}`), context.DeadlineExceeded
+	}
+	service2, jobID2 := readyPlanService(t, "AB12CD34", deadlineCLI)
+	plans2, err := service2.PlanJobs(context.Background(), []string{jobID2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan2 := plans2[0]
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(time.Millisecond)
+	if _, err := service2.Apply(ctx, plan2.ID, plan2.ConfirmationSHA256); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline apply err = %v, want DeadlineExceeded", err)
+	}
+	var ambRaw string
+	if err := service2.Store.DB().QueryRow(`SELECT result_json FROM exports WHERE kind='zotio_apply'`).Scan(&ambRaw); err != nil {
+		t.Fatal(err)
+	}
+	var amb ApplyResult
+	if err := json.Unmarshal([]byte(ambRaw), &amb); err != nil {
+		t.Fatal(err)
+	}
+	if amb.Status != "ambiguous" {
+		t.Fatalf("timeout status = %q, want ambiguous", amb.Status)
+	}
+	if _, err := os.Stat(filepath.Join(service2.DataDir, "zotio", "plans", plan2.ID+".json")); err != nil {
+		t.Fatalf("ambiguous apply deleted its plan: %v", err)
+	}
+	if _, err := service2.Apply(context.Background(), plan2.ID, plan2.ConfirmationSHA256); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ambiguous replay err = %v, want DeadlineExceeded", err)
+	}
+	if deadlineCLI.applyCalls != 1 {
+		t.Fatalf("ambiguous replay re-issued mutation: applyCalls=%d want 1", deadlineCLI.applyCalls)
+	}
+	// A failed apply is reclaimable by claimApply; an ambiguous one is not.
+	if claimed, _ := service.claimApply(context.Background(), "zotio_apply:"+plan.ID+":"+plan.ConfirmationSHA256, jobID); !claimed {
+		t.Fatal("failed apply should be reclaimable")
+	}
+	if claimed, _ := service2.claimApply(context.Background(), "zotio_apply:"+plan2.ID+":"+plan2.ConfirmationSHA256, jobID2); claimed {
+		t.Fatal("ambiguous apply should not be reclaimable as failed")
+	}
+}
+
+func TestMaterializePrivateFileConcurrentSameTargetConverges(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.pdf")
+	target := filepath.Join(dir, "staging", "job", "sha", "paper.pdf")
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	contents := []byte("%PDF concurrent staging")
+	if err := os.WriteFile(source, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := fmt.Sprintf("%x", sha256.Sum256(contents))
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	start := make(chan struct{})
+	for i := range 2 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			errs[idx] = materializePrivateFile(source, target, expected)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("materialize[%d] err = %v", i, err)
+		}
+	}
+	if err := verifyFileSHA256(target, expected); err != nil {
+		t.Fatalf("target digest after concurrent materialize: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(contents) {
+		t.Fatalf("target contents = %q, want %q", got, contents)
 	}
 }
