@@ -25,7 +25,12 @@ const (
 )
 
 // linkFile lets tests simulate filesystems that do not support hard links.
-var linkFile = os.Link
+// chmodFile and removeFile let tests inject pre- and post-publication failures.
+var (
+	linkFile   = os.Link
+	chmodFile  = os.Chmod
+	removeFile = os.Remove
+)
 
 // Store manages quarantine and immutable artifact paths under dataDir.
 type Store struct{ dataDir string }
@@ -92,6 +97,13 @@ func (s *Store) Promote(tempPath, expectedSHA string) (string, error) {
 		return "", fmt.Errorf("quarantine file hash %s does not match expected %s", sha, expectedSHA)
 	}
 
+	// Apply read-only mode before the artifact becomes visible so no
+	// post-publication chmod is needed. This is the last fallible step
+	// before the atomic publication (link or rename).
+	if err := chmodFile(tempPath, 0o400); err != nil {
+		return "", err
+	}
+
 	renamed := false
 	if err := linkFile(tempPath, dest); err != nil {
 		switch {
@@ -120,13 +132,13 @@ func (s *Store) Promote(tempPath, expectedSHA string) (string, error) {
 			return "", fmt.Errorf("promoting artifact: %w", err)
 		}
 	}
-	if err := os.Chmod(dest, 0o400); err != nil {
-		return "", err
-	}
+	// Publication is complete. Temp cleanup is best-effort: a failure to
+	// remove the (now hard-linked or duplicate) quarantine file must not be
+	// reported as a promotion failure because the artifact IS published.
+	// Callers that roll back artifact metadata on Promote failure would
+	// incorrectly delete a valid artifact if cleanup were treated as fatal.
 	if !renamed {
-		if err := os.Remove(tempPath); err != nil {
-			return "", err
-		}
+		_ = removeFile(tempPath)
 	}
 	return dest, nil
 }

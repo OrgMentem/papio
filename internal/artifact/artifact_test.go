@@ -3,6 +3,7 @@
 package artifact
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -175,6 +176,91 @@ func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
 	}
 }
 
+func TestPromoteSucceedsWhenTempCleanupFails(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := s.QuarantineDir("job_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("%PDF-1.4 fixture body")
+	temp := filepath.Join(q, "download.tmp")
+	if err := os.WriteFile(temp, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := HashFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	origRemove := removeFile
+	removeFile = func(name string) error {
+		return errors.New("injected remove failure")
+	}
+	t.Cleanup(func() { removeFile = origRemove })
+
+	dest, err := s.Promote(temp, sha)
+	if err != nil {
+		t.Fatalf("promote with cleanup failure: %v", err)
+	}
+	// Artifact must be published despite cleanup failure.
+	if err := s.Verify(sha); err != nil {
+		t.Fatalf("verify after cleanup failure: %v", err)
+	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat dest after cleanup failure: %v", err)
+	}
+	if info.Mode().Perm() != 0o400 {
+		t.Fatalf("artifact mode = %v, want 0400", info.Mode().Perm())
+	}
+	// Temp duplicate remains because removal was injected to fail,
+	// but promotion itself succeeded — caller must not treat this as failure.
+	if _, err := os.Stat(temp); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("stat temp: %v", err)
+	} else if os.IsNotExist(err) {
+		t.Logf("temp was removed despite injected failure (hard-link accounting may have removed the name)")
+	}
+}
+
+func TestPromotePrePublicationFailureLeavesNoDestination(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := s.QuarantineDir("job_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("%PDF-1.4 fixture body")
+	temp := filepath.Join(q, "download.tmp")
+	if err := os.WriteFile(temp, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := HashFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destPath, err := s.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	origChmod := chmodFile
+	chmodFile = func(name string, mode os.FileMode) error {
+		return errors.New("injected chmod failure")
+	}
+	t.Cleanup(func() { chmodFile = origChmod })
+
+	if _, err := s.Promote(temp, sha); err == nil {
+		t.Fatal("expected pre-publication chmod failure")
+	}
+	if _, err := os.Stat(destPath); !os.IsNotExist(err) {
+		t.Fatalf("destination exists after pre-publication failure: %v", err)
+	}
+}
 func TestConfineRegularFile(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, "a.pdf")
