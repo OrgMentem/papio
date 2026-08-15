@@ -370,3 +370,75 @@ func TestPacingGateBindsEveryIdentityIncludingMidWait(t *testing.T) {
 		})
 	}
 }
+
+// A failed floor write leaves no durable "_quota" row but does set the
+// process-local latch. Admission must treat that exactly like a durable gate
+// and step to the next identity rather than reserving the latched credential.
+func TestAcquireAnyFallsBackOnProcessLocalLatchOnly(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	keyed, anon := keyedAndAnon()
+	until := m.now().UTC().Add(6 * time.Hour)
+	m.LatchQuota("openalex", identityFor(keyed), until)
+	quotaSnap, err := m.Snapshot(ctx, QuotaSourceName("openalex"), keyed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quotaSnap.NextAllowedAt != nil {
+		t.Fatal("test setup: durable quota row must be absent when only the latch is set")
+	}
+	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
+	if err != nil {
+		t.Fatalf("fallback returned %v, want the anonymous identity admitted", err)
+	}
+	if chosen.APIKey != "" {
+		t.Fatalf("chosen = %+v, want the anonymous identity", chosen)
+	}
+	keyedSnap, err := m.Snapshot(ctx, "openalex", keyed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyedSnap.RequestsInWindow != 0 {
+		t.Fatalf("keyed reservations = %d, want 0: the latch must skip keyed admission", keyedSnap.RequestsInWindow)
+	}
+}
+
+func TestAcquireAnyFallsBackOnProcessLocalLatchOnly_guardRequired(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	keyed, anon := keyedAndAnon()
+	m.LatchQuota("openalex", identityFor(keyed), m.now().UTC().Add(6*time.Hour))
+	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chosen.APIKey != "" {
+		t.Fatal("guard: without the latch pre-check AcquireAny would not fall back")
+	}
+	keyedSnap, err := m.Snapshot(ctx, "openalex", keyed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyedSnap.RequestsInWindow != 0 {
+		t.Fatalf("guard: keyed reservations = %d, want 0 when the latch binds admission", keyedSnap.RequestsInWindow)
+	}
+}
+
+func TestAcquireAnyParksWhenOnlyIdentityLatched(t *testing.T) {
+	m := testManager(t)
+	ctx := context.Background()
+	keyed := config.Source{Enabled: true, APIKey: "solo-key"}
+	until := m.now().UTC().Add(6 * time.Hour)
+	m.LatchQuota("openalex", identityFor(keyed), until)
+	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed}, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) || !deferred.Quota {
+		t.Fatalf("err = %v, want *ErrDeferred with Quota set", err)
+	}
+	if !deferred.Until.Equal(until) {
+		t.Fatalf("Until = %v, want the latch instant %v", deferred.Until, until)
+	}
+	if chosen.APIKey != keyed.APIKey {
+		t.Fatalf("chosen = %+v, want the last policy returned with the refusal", chosen)
+	}
+}

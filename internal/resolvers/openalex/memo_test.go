@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/budget"
 	"papio/internal/resolver"
+	"papio/internal/sourcegate"
 	"papio/internal/work"
 )
 
@@ -503,5 +505,48 @@ func TestConflictingSecondaryIdentifierIsDropped(t *testing.T) {
 	}
 	if got.OpenAlex != "" {
 		t.Fatalf("OpenAlex = %q, want empty: the response named W2741809807 and W1234567890 for the same work", got.OpenAlex)
+	}
+}
+
+func TestFetchPreservesQuotaDeferral(t *testing.T) {
+	until := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
+	deferred := &budget.ErrDeferred{Source: "openalex", Identity: "key-test", Until: until, Quota: true}
+	r := NewWithOptions(Options{
+		Client: clientFunc(func(*http.Request) (*http.Response, error) {
+			return nil, deferred
+		}),
+		ContactEmail: "contact@example.org", BaseURL: "https://api.test/works",
+	})
+	_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+	if err == nil {
+		t.Fatal("a quota-gated request resolved successfully")
+	}
+	var got *budget.ErrDeferred
+	if !errors.As(err, &got) || !got.Quota {
+		t.Fatalf("err = %v, want the quota refusal preserved for errors.As", err)
+	}
+	if !got.Until.Equal(until) {
+		t.Fatalf("Until = %v, want %v", got.Until, until)
+	}
+}
+
+func TestFetchPreservesQuotaLatched(t *testing.T) {
+	until := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
+	r := NewWithOptions(Options{
+		Client: clientFunc(func(*http.Request) (*http.Response, error) {
+			return nil, &sourcegate.ErrQuotaLatched{Source: "openalex", Identity: "keyed", Until: until}
+		}),
+		ContactEmail: "contact@example.org", BaseURL: "https://api.test/works",
+	})
+	_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+	if err == nil {
+		t.Fatal("a latched request resolved successfully")
+	}
+	var got *budget.ErrDeferred
+	if !errors.As(err, &got) || !got.Quota {
+		t.Fatalf("err = %v, want a quota ErrDeferred after translation", err)
+	}
+	if !got.Until.Equal(until) {
+		t.Fatalf("Until = %v, want %v", got.Until, until)
 	}
 }

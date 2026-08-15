@@ -1266,6 +1266,34 @@ belongs in the fuse because drawing it down spends real money.
  while writing this: the pacing reader queried `identity = ''` while `identityFor`
  spells a keyless identity `"anonymous"`, so the commit-time check matched nothing —
  found only because the mutation test failed to fail.
+- **The fuse shipped inert, and a defaults test did not catch it.** `allowanceFor`
+  read `daily_credit_limit == 0` as "unmetered" while the plan, the shipped default
+  and `docs/reference/config-reference.md` all define `0` as *no absolute override*
+  with `daily_credit_fraction = 0.5` still binding — so the shipped OpenAlex default
+  bypassed the daily credit fuse entirely, which is exactly the outcome the config
+  bullet warned about two rewrites earlier. The clamp now applies only when the
+  absolute limit is non-zero, the fraction is what `0` disables, and the regression
+  is asserted against `config.Default()` rather than a hand-built policy —
+  `TestShippedDefaultConfigFiniteAllowanceRefusesOverLimit`, verified to fail
+  pre-fix. A ceiling nobody's default configuration reaches is not a ceiling.
+- **The provider's own numbers never reached the fuse in production.**
+  `ObserveLimit`, `ObserveCreditsUsed` and `ObservePrepaidRemaining` had no callers
+  outside tests: the wiring installed the quota-floor `Observer` and nothing else, so
+  the day's denominator stayed NULL (the fraction had nothing to multiply), the
+  bootstrap seed never happened, and `prepaid-remaining-usd` — the one refusal in
+  this file that protects real money rather than an allowance — was parsed by nobody.
+  The mechanism was complete and unreachable, which is the same defect class as an
+  authority that is never read, one layer earlier.
+- **A failed floor write removed the fallback it was meant to protect.** The
+  process-local latch is set from the parsed header before persistence (correct, and
+  shipped last round), but `AcquireAny`'s pre-check consulted only the durable
+  `_quota` row. So when the durable write failed, the keyed identity looked open, was
+  chosen again, and the egress authority refused it with a latch error the callers
+  read as a generic temporary failure — leaving the configured, usable keyless tier
+  unused until the latch expired. The latch was supposed to make the floor safer, not
+  to delete the fallback. It now participates in the same per-identity skip as the
+  durable row, and the refusal carries the credential's own reset so acquisition
+  advances instead of stalling.
 
 ## Rejected designs (do not re-derive)
 

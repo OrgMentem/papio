@@ -86,7 +86,7 @@ func testObserver(t *testing.T, status int, headers map[string]string) (*Observe
 	now := func() time.Time { return observerNow }
 	floor := &fakeQuotaFloor{fakeDeferrer: deferrer, now: now}
 	inner := &headerClient{status: status, headers: headers}
-	observer, err := NewObserver(floor, "openalex", config.Source{Enabled: true, APIKey: "private-key"}, inner)
+	observer, err := NewObserver(floor, nil, "openalex", config.Source{Enabled: true, APIKey: "private-key"}, inner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestObserverCanonicalizesTheConfiguredCredential(t *testing.T) {
 	inner := &headerClient{status: http.StatusOK, headers: map[string]string{
 		"X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "12", "X-RateLimit-Reset": "3600",
 	}}
-	observer, err := NewObserver(&fakeQuotaFloor{fakeDeferrer: deferrer}, "openalex", config.Source{Enabled: true, APIKey: "  private-key\t"}, inner)
+	observer, err := NewObserver(&fakeQuotaFloor{fakeDeferrer: deferrer}, nil, "openalex", config.Source{Enabled: true, APIKey: "  private-key\t"}, inner)
 	if err != nil {
 		t.Fatal(err)
 	}

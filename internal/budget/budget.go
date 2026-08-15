@@ -371,10 +371,19 @@ func (m *Manager) DeferSourceWide(ctx context.Context, source string, until time
 	return m.Defer(ctx, PacingSourceName(source), config.Source{Enabled: true}, until)
 }
 
-// quotaGate reports the quota-row gate instant for policy's identity, if one is
-// currently active — the signal sourcegate.Observer writes from the provider's
-// own daily-budget headers. nil, nil means not gated.
+// quotaGate reports whether this credential's provider-reported daily quota is
+// currently exhausted for admission purposes. The signal is the durable
+// "<source>_quota" row sourcegate.Observer writes from the provider's headers,
+// OR the same fact held process-locally when that write failed — the latch must
+// bind admission exactly as the row would, or a failed persistence strands the
+// keyed identity while the keyless tier sits unused. nil, nil means not gated.
+// This is scoped to one identity only; source-wide pacing stays on the pacing
+// row enforced inside reserve / CommitEgress.
 func (m *Manager) quotaGate(ctx context.Context, source string, policy config.Source) (*time.Time, error) {
+	identity := identityFor(policy)
+	if until := m.latchedQuotaUntil(source, identity); until != nil {
+		return until, nil
+	}
 	snap, err := m.Snapshot(ctx, QuotaSourceName(source), policy)
 	if err != nil {
 		return nil, err

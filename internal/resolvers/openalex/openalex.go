@@ -17,6 +17,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"papio/internal/budget"
 	"papio/internal/redact"
 	"papio/internal/resolver"
 	"papio/internal/sourcegate"
@@ -283,6 +284,27 @@ func (r *Resolver) lookupURL(requested work.Work, anon bool) (*url.URL, string, 
 	return base, lookup, search, nil
 }
 
+// wrapFetchClientError preserves typed provider-quota refusals through the
+// resolver's TemporaryError classification. Substituting a fresh error left
+// callers unable to park until the credential's own reset or to distinguish
+// quota from transport failure.
+func wrapFetchClientError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var deferred *budget.ErrDeferred
+	if errors.As(err, &deferred) && deferred.Quota {
+		return &resolver.TemporaryError{Err: err}
+	}
+	var latched *sourcegate.ErrQuotaLatched
+	if errors.As(err, &latched) {
+		return &resolver.TemporaryError{Err: &budget.ErrDeferred{
+			Source: latched.Source, Identity: latched.Identity, Until: latched.Until, Quota: true,
+		}}
+	}
+	return &resolver.TemporaryError{Err: fmt.Errorf("openalex: request failed: %w", err)}
+}
+
 func (r *Resolver) applyOpenAlexAuth(req *http.Request, anon bool) {
 	if r.apiKey != "" && !anon {
 		sourcegate.SetOpenAlexAuthorization(req, r.apiKey)
@@ -310,7 +332,7 @@ func (r *Resolver) fetch(ctx context.Context, endpoint *url.URL, anon bool) (io.
 
 		resp, err := r.client.Do(req)
 		if err != nil {
-			return nil, entityMergeAlias{}, &resolver.TemporaryError{Err: fmt.Errorf("openalex: request failed: %w", err)}
+			return nil, entityMergeAlias{}, wrapFetchClientError(err)
 		}
 		if resp == nil {
 			return nil, entityMergeAlias{}, &resolver.TemporaryError{Err: errors.New("openalex: empty HTTP response")}

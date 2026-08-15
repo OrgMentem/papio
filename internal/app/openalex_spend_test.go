@@ -594,6 +594,28 @@ func TestFallbackRunsAdapterAnonymously(t *testing.T) {
 	}
 }
 
+func TestFallbackRunsAnonymouslyOnProcessLocalLatchOnly(t *testing.T) {
+	svc, jobs, adapter, id := fallbackService(t, "wr_latch_only_fallback", config.SourceOpenAlex)
+	ctx := context.Background()
+	keyed := svc.Config.SourcePolicy(config.SourceOpenAlex)
+	until := time.Now().UTC().Add(6 * time.Hour)
+	svc.Budgets.LatchQuota(config.SourceOpenAlex, budget.IdentityFor(keyed), until)
+	quotaSnap, err := svc.Budgets.Snapshot(ctx, config.SourceOpenAlex+"_quota", keyed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quotaSnap.NextAllowedAt != nil {
+		t.Fatal("test setup: durable quota row must be absent when only the latch is set")
+	}
+	planFromResolve(t, svc, jobs, id)
+	if adapter.calls != 1 {
+		t.Fatalf("adapter calls = %d, want the keyless tier attempted", adapter.calls)
+	}
+	if !resolver.AnonymousCredentials(adapter.capturedCtx[0]) {
+		t.Fatal("resolve must run anonymously when keyed is latched process-locally only")
+	}
+}
+
 func TestOrdinaryGateNeverAnonymous(t *testing.T) {
 	svc, jobs, adapter, id := fallbackService(t, "wr_ordinary_gate", config.SourceOpenAlex)
 	ctx := context.Background()
@@ -793,7 +815,7 @@ func (c *floorClient) Do(req *http.Request) (*http.Response, error) {
 }
 
 func newFloorObserver(budgets *budget.Manager, keyed config.Source, inner *floorClient) (*sourcegate.Observer, error) {
-	return sourcegate.NewObserver(budgets, config.SourceOpenAlex, keyed, inner)
+	return sourcegate.NewObserver(budgets, budgets, config.SourceOpenAlex, keyed, inner)
 }
 
 func floorProbe(t *testing.T, rawURL string) *http.Request {

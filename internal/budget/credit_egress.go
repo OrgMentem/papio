@@ -89,11 +89,11 @@ type driftLatch struct {
 // CreditPolicy configures the source-wide daily credit fuse.
 type CreditPolicy struct {
 	DailyCreditFraction float64
-	DailyCreditLimit    int // hard maximum; 0 = unmetered ceiling
+	DailyCreditLimit    int // hard maximum; 0 = no absolute cap, not unmetered
 }
 
 // WithCreditPolicy supplies per-source fuse knobs for CommitEgress. When nil,
-// fraction defaults to 0.5 and the ceiling is unmetered (limit 0).
+// fraction defaults to 0.5 with no hard maximum (limit 0).
 func WithCreditPolicy(fn func(source string) CreditPolicy) Option {
 	return func(m *Manager) {
 		m.creditPolicy = fn
@@ -102,11 +102,7 @@ func WithCreditPolicy(fn func(source string) CreditPolicy) Option {
 
 func (m *Manager) creditPolicyFor(source string) CreditPolicy {
 	if m.creditPolicy != nil {
-		p := m.creditPolicy(source)
-		if p.DailyCreditFraction <= 0 {
-			p.DailyCreditFraction = 0.5
-		}
-		return p
+		return m.creditPolicy(source)
 	}
 	return CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 0}
 }
@@ -190,14 +186,13 @@ type fuseRow struct {
 }
 
 func (m *Manager) allowanceFor(row fuseRow, policy CreditPolicy) (limit int, unmetered bool) {
-	hardMax := policy.DailyCreditLimit
-	if hardMax == 0 {
+	// 0 fraction disables the ceiling per plan (matching 0=unmetered for
+	// budgets) — but every request still commits. Only DailyCreditLimit==0
+	// is not unmetered; it is "no hard maximum".
+	if policy.DailyCreditFraction == 0 {
 		return 0, true
 	}
 	fraction := policy.DailyCreditFraction
-	if fraction <= 0 {
-		fraction = 0.5
-	}
 
 	var basis int
 	if row.denominator.Valid {
@@ -208,8 +203,8 @@ func (m *Manager) allowanceFor(row fuseRow, policy CreditPolicy) (limit int, unm
 		basis = BootstrapCreditCap
 	}
 	limit = basis
-	if limit > hardMax {
-		limit = hardMax
+	if policy.DailyCreditLimit != 0 && limit > policy.DailyCreditLimit {
+		limit = policy.DailyCreditLimit
 	}
 	return limit, false
 }

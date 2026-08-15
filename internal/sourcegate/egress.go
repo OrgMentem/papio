@@ -48,6 +48,14 @@ type QuotaFloorController interface {
 	QuotaLatchedUntil(source, identity string) (time.Time, bool)
 }
 
+// CreditObserver records provider-reported fuse inputs from response headers.
+// Implemented by budget.Manager; kept narrow so Observer stays one-way on budget.
+type CreditObserver interface {
+	ObserveLimit(ctx context.Context, source, identity string, limit int, primary bool) error
+	ObserveCreditsUsed(ctx context.Context, source string, used int) error
+	ObservePrepaidRemaining(ctx context.Context, source string, remainingUSD float64) error
+}
+
 type egressCommitted struct{}
 
 // ErrUncommittedEgress means a physical OpenAlex request reached the transport
@@ -180,7 +188,11 @@ func WrapOpenAlex(authority EgressAuthority, floor QuotaFloorController, source 
 	if err != nil {
 		return nil, err
 	}
-	observer, err := NewObserver(floor, source, keyed, tripwire)
+	var credit CreditObserver
+	if c, ok := authority.(CreditObserver); ok {
+		credit = c
+	}
+	observer, err := NewObserver(floor, credit, source, keyed, tripwire)
 	if err != nil {
 		return nil, err
 	}
