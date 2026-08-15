@@ -1473,6 +1473,68 @@ func TestTriageDismissConsumesSelectedWatchHit(t *testing.T) {
 	}
 }
 
+func TestTriageDecideTwoWatchConflictLeavesFirstIntact(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	ctx := context.Background()
+	w1, err := b.watchRunner.Store.Create(ctx, watch.CreateInput{
+		Query: "w1", Filters: watch.Filters{YearFrom: 2020},
+		Collection: "Reading", CadenceHours: 24, PerRunCap: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, err := b.watchRunner.Store.Create(ctx, watch.CreateInput{
+		Query: "w2", Filters: watch.Filters{YearFrom: 2020},
+		Collection: "Reading", CadenceHours: 24, PerRunCap: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := watch.DigestEntry{
+		WorkKey: "10.1000/shared", DOI: "10.1000/shared", Title: "Shared work",
+	}
+	if _, err := b.watchRunner.Store.RecordDigest(ctx, w1.ID, b.now(), []watch.DigestEntry{entry}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.watchRunner.Store.RecordDigest(ctx, w2.ID, b.now(), []watch.DigestEntry{entry}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := b.triage.Snapshot(ctx, triage.SnapshotRequest{Limit: 10})
+	if err != nil || len(snapshot.Items) != 1 || snapshot.Items[0].WatchHit == nil {
+		t.Fatalf("initial snapshot = %+v, %v", snapshot, err)
+	}
+	hit := snapshot.Items[0].WatchHit
+	if len(hit.Watches) != 2 {
+		t.Fatalf("grouped watches = %+v, want 2", hit.Watches)
+	}
+	// Pre-consume the second watch's entry so the batch conflicts on the second target.
+	if _, err := b.watchRunner.Store.ConsumeDigest(ctx, w2.ID, []string{entry.WorkKey}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageDecide, "",
+		protocol.TriageDecidePayload{
+			RequestID: "request-conflict-001", ItemID: snapshot.Items[0].ID, Op: "dismiss",
+			WatchScope: json.RawMessage(`"all"`),
+		}))
+	result := firstOfType(msgs, protocol.MsgTriageDecideResult)
+	if result == nil {
+		t.Fatalf("triage decision response missing: %v", msgs)
+	}
+	payload := result.Payload.(*protocol.TriageDecideResultPayload)
+	if payload.RequestID != "request-conflict-001" || payload.Outcome != "conflict" {
+		t.Fatalf("triage decision payload = %+v, want conflict", payload)
+	}
+	// First watch's entry must remain unconsumed: atomic batch left neither consumed.
+	entries, err := b.watchRunner.Store.Digest(ctx, w1.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].WorkKey != entry.WorkKey {
+		t.Fatalf("w1 digest after conflict = %+v, want one unconsumed entry", entries)
+	}
+	// The response is a structured outcome, not a transport error — Sync succeeded.
+}
+
 // The shipping path for a retraction dismissal: a real Crossref sweep fills the
 // sentinel, the inbox frame carries the notice, and the extension's existing
 // dismiss frame - watch_scope and all - clears it for good.

@@ -42,7 +42,72 @@ const (
 	EvidenceIndependent = "independent"
 )
 
+var captureHostRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:[0-9]{1,5})?$`)
+
 var sanitizerFixtureHeader = regexp.MustCompile(`^<!-- papio-fixture provider="([^"]+)" scenario="([^"]+)" origin="([^"]+)" captured="([^"]+)" -->$`)
+
+// hostDirName returns a filesystem-safe, injective directory name for the
+// verbatim host. Valid bare-origin hosts (lowercase hostname with optional
+// port) are stored verbatim except for ':' which is encoded to keep the name
+// safe on Windows. Any byte outside [a-z0-9.-] is percent-encoded, so
+// distinct hosts such as "foo/bar" and "foo-bar" map to distinct buckets
+// ("foo%2Fbar" vs "foo-bar"). The mapping is injective; the verbatim host is
+// recovered from the per-capture metadata sidecar, not the directory name.
+// Existing valid-host directories like "sagepub.com" are unchanged, so old
+// captures remain readable. Hosts containing ':' previously collapsed to '-';
+// those directories are not migrated automatically — they remain under the old
+// sanitized name and are still listed (host reported as the sanitized name)
+// but new captures for the same verbatim host will use the encoded name. This
+// is the minimal break noted in the fix report.
+func hostDirName(host string) string {
+	normalized := strings.ToLower(strings.TrimSpace(host))
+	if normalized == "" {
+		return "host"
+	}
+	var b strings.Builder
+	b.Grow(len(normalized) * 3)
+	for i := 0; i < len(normalized); i++ {
+		c := normalized[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' {
+			b.WriteByte(c)
+			continue
+		}
+		// Percent-encode any other byte (including ':', '/', '%', ' ').
+		b.WriteString(fmt.Sprintf("%%%02X", c))
+	}
+	result := b.String()
+	if result == "" || result == "." || result == ".." {
+		return "host"
+	}
+	if len(result) > 200 {
+		h := sha256.Sum256([]byte(normalized))
+		prefix := result
+		if len(prefix) > 100 {
+			prefix = prefix[:100]
+		}
+		return prefix + "-" + hex.EncodeToString(h[:])[:16]
+	}
+	if len(result) > 253 {
+		result = result[:253]
+	}
+	return result
+}
+
+// isValidCaptureHost reports whether host matches the bare-origin grammar
+// (hostname, optional :port; no scheme, path, query, or spaces). It mirrors
+// captureHostRE but also rejects empty and overlong values.
+func isValidCaptureHost(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	if strings.ContainsAny(host, " /?#") {
+		return false
+	}
+	if strings.Contains(host, "://") {
+		return false
+	}
+	return captureHostRE.MatchString(host)
+}
 
 // IsSanitizedFixture verifies the daemon-recognized provenance marker before
 // any bytes are persisted. The extension performs secret removal; the daemon
@@ -319,7 +384,8 @@ func (s *Store) store(ctx context.Context, host, scenario, adapterID, adapterVer
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	hostDir := filepath.Join(s.root, safeHost(host))
+	verbatimHost := host
+	hostDir := filepath.Join(s.root, hostDirName(host))
 	if err := os.MkdirAll(hostDir, 0o700); err != nil {
 		return "", fmt.Errorf("creating capture directory: %w", err)
 	}
@@ -329,7 +395,7 @@ func (s *Store) store(ctx context.Context, host, scenario, adapterID, adapterVer
 	}
 	sum := sha256.Sum256(html)
 	metadata, err := json.Marshal(captureMetadata{
-		AdapterID: adapterID, AdapterVersion: adapterVersion,
+		Host: verbatimHost, AdapterID: adapterID, AdapterVersion: adapterVersion,
 		SHA256: hex.EncodeToString(sum[:]), SanitizerProvenance: sanitizerProvenance,
 		SanitizerVersion: sanitizerVersion,
 	})
@@ -350,7 +416,7 @@ func (s *Store) store(ctx context.Context, host, scenario, adapterID, adapterVer
 			return path, err
 		}
 	}
-	if err := s.pruneHost(ctx, hostDir, safeHost(host)); err != nil {
+	if err := s.pruneHost(ctx, hostDir, verbatimHost); err != nil {
 		return path, err
 	}
 	return path, nil
@@ -440,9 +506,8 @@ func (s *Store) Purge(ctx context.Context, host string) (removed int, err error)
 		}
 		return len(all), nil
 	}
-
-	hostDir := filepath.Join(s.root, safeHost(host))
-	files, err := scanHost(ctx, hostDir, safeHost(host))
+	hostDir := filepath.Join(s.root, hostDirName(host))
+	files, err := scanHost(ctx, hostDir, host)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return 0, nil
@@ -450,7 +515,7 @@ func (s *Store) Purge(ctx context.Context, host string) (removed int, err error)
 		return 0, err
 	}
 	if err := os.RemoveAll(hostDir); err != nil {
-		return 0, fmt.Errorf("purging captures for %s: %w", safeHost(host), err)
+		return 0, fmt.Errorf("purging captures for %s: %w", host, err)
 	}
 	return len(files), nil
 }
@@ -627,6 +692,7 @@ type captureFile struct {
 }
 
 type captureMetadata struct {
+	Host                string `json:"host,omitempty"`
 	AdapterID           string `json:"adapter_id,omitempty"`
 	AdapterVersion      string `json:"adapter_version,omitempty"`
 	SHA256              string `json:"sha256,omitempty"`
@@ -738,6 +804,12 @@ func (s *Store) list(ctx context.Context) ([]Capture, error) {
 			metadata, err := readMetadata(file.metadataPath)
 			if err != nil {
 				return nil, err
+			}
+			// Recover verbatim host from metadata when available; legacy
+			// captures written before host was stored fall back to the
+			// filesystem-derived host (directory name).
+			if metadata.Host != "" {
+				file.Host = metadata.Host
 			}
 			data, err := os.ReadFile(file.Path)
 			if err != nil {
@@ -903,6 +975,10 @@ func validScenario(scenario string) bool {
 }
 
 func safeHost(host string) string {
+	return hostDirName(host)
+}
+
+func _legacySafeHost(host string) string {
 	var segment strings.Builder
 	for _, r := range strings.ToLower(strings.TrimSpace(host)) {
 		switch {

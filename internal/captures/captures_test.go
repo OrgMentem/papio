@@ -210,3 +210,113 @@ func TestPurge(t *testing.T) {
 		t.Fatalf("purge all = (%d, %v), want (1, nil)", removed, err)
 	}
 }
+
+func TestStoreDistinctHostsThatPreviouslyCollided(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 1, MaxAge: 14 * 24 * time.Hour})
+	at := time.Date(2026, time.July, 27, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return at }
+
+	// "foo/bar" and "foo-bar" both collapsed to "foo-bar" under safeHost; they
+	// must now occupy distinct buckets with independent retention.
+	hosts := []string{"foo/bar", "foo-bar"}
+	for i := range hosts {
+		at = at.Add(time.Minute)
+		store.now = func() time.Time { return at }
+		if _, err := store.Store(ctx, hosts[i], "observed", "", "", []byte(hosts[i])); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	listed, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("captures = %d, want 2 distinct hosts", len(listed))
+	}
+	byHost := map[string]int{}
+	for _, c := range listed {
+		byHost[c.Host]++
+	}
+	for _, h := range hosts {
+		if byHost[h] != 1 {
+			t.Fatalf("capture count for %q = %d, want 1 (dir=%q)", h, byHost[h], hostDirName(h))
+		}
+	}
+
+	// Pruning one host must not evict the other (MaxPerHost=1 already exercised).
+	// Add a second capture for foo/bar and verify foo-bar is still present.
+	at = at.Add(time.Minute)
+	store.now = func() time.Time { return at }
+	if _, err := store.Store(ctx, "foo/bar", "success", "", "", []byte("later")); err != nil {
+		t.Fatal(err)
+	}
+	listed, err = store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byHost = map[string]int{}
+	for _, c := range listed {
+		byHost[c.Host]++
+	}
+	if byHost["foo-bar"] != 1 {
+		t.Fatalf("retention for foo/bar pruned foo-bar: byHost=%v", byHost)
+	}
+	if byHost["foo/bar"] != 1 {
+		t.Fatalf("foo/bar retention = %d, want 1", byHost["foo/bar"])
+	}
+
+	// Purge one does not purge the other.
+	if removed, err := store.Purge(ctx, "foo-bar"); err != nil || removed != 1 {
+		t.Fatalf("purge foo-bar = (%d, %v), want (1, nil)", removed, err)
+	}
+	listed, err = store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].Host != "foo/bar" {
+		t.Fatalf("after purge captures = %#v, want only foo/bar", listed)
+	}
+}
+
+func TestStoreVerbatimHostRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 10, MaxAge: 14 * 24 * time.Hour})
+	hosts := []string{
+		"library.example.edu",
+		"library.example.edu:8443",
+		"foo/bar",
+		"exam ple.com",
+		"a..b.example",
+	}
+	for _, host := range hosts {
+		path, err := store.Store(ctx, host, "observed", "", "", []byte("body-"+host))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = path
+	}
+	listed, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byHost := map[string]bool{}
+	for _, c := range listed {
+		byHost[c.Host] = true
+		// The reported host must be the verbatim input, not a sanitized dir name.
+		if strings.Contains(c.Host, "%") {
+			// Percent is only in dir names; metadata host should not contain it unless verbatim did.
+			// Check dir matches encoded form.
+			dir := filepath.Base(filepath.Dir(c.Path))
+			if dir != hostDirName(c.Host) {
+				t.Fatalf("capture dir %q != hostDirName(%q)=%q", dir, c.Host, hostDirName(c.Host))
+			}
+		}
+	}
+	for _, h := range hosts {
+		if !byHost[h] {
+			t.Fatalf("verbatim host %q not in listing: %v", h, listed)
+		}
+	}
+}

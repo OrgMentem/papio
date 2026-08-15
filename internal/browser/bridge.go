@@ -2848,11 +2848,39 @@ func (b *Bridge) handoffLink(ctx context.Context, request *protocol.HandoffLinkR
 	return result("unavailable", "handoff links are temporarily unavailable", "")
 }
 
+// pageCapHostRE validates the page-capture ingress host as a bare origin
+// (hostname + optional :port, no scheme/path/query/spaces). It must stay in
+// lock-step with captures.captureHostRE — the same grammar the store uses to
+// guarantee injective bucketing — so validated hosts round-trip faithfully.
+var pageCapHostRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:[0-9]{1,5})?$`)
+
+func isValidPageCaptureHost(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	if strings.ContainsAny(host, " /?#") || strings.Contains(host, "://") {
+		return false
+	}
+	return pageCapHostRE.MatchString(host)
+}
+
 // pageCapture treats diagnostic content failures as local losses: disconnecting
 // the native session over a bad fixture would discard the handoff it was meant
 // to help diagnose.
 func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, payload *protocol.PageCapturePayload) {
 	if !b.cfg.Captures.Enabled || b.captureStore == nil {
+		return
+	}
+	if !isValidPageCaptureHost(payload.Host) {
+		log.Printf("papio: ignoring page capture with invalid host %q", payload.Host)
+		if pending := b.pendingCaptures[sessionID]; pending != nil && payload.RequestID != "" && pending.payload.RequestID == payload.RequestID {
+			delete(b.pendingCaptures, sessionID)
+			pending.result <- CaptureResult{
+				RequestID: pending.payload.RequestID,
+				Outcome:   "not_permitted",
+				Detail:    "page capture host must be a bare origin (hostname, optional port)",
+			}
+		}
 		return
 	}
 	html, err := decodePageCapture(payload)
@@ -3717,13 +3745,15 @@ func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecid
 		return b.triageDecisionResult(request.RequestID, "error", err.Error())
 	}
 	if request.Op == "acquire" {
+		targets := make([]watch.DigestTarget, 0, len(hit.Watches))
 		for _, watched := range hit.Watches {
-			if _, err := b.watchRunner.AcquireDigest(ctx, watched.ID, []string{watched.WorkKey}); err != nil {
-				if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
-					return b.triageDecisionResult(request.RequestID, "conflict", "")
-				}
-				return b.triageDecisionResult(request.RequestID, "error", err.Error())
+			targets = append(targets, watch.DigestTarget{WatchID: watched.ID, WorkKey: watched.WorkKey})
+		}
+		if err := b.watchRunner.AcquireDigests(ctx, targets); err != nil {
+			if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
+				return b.triageDecisionResult(request.RequestID, "conflict", "")
 			}
+			return b.triageDecisionResult(request.RequestID, "error", err.Error())
 		}
 		return b.triageDecisionResult(request.RequestID, "applied", "")
 	}
@@ -3731,16 +3761,18 @@ func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecid
 	if err != nil {
 		return b.triageDecisionResult(request.RequestID, "error", err.Error())
 	}
+	targets := make([]watch.DigestTarget, 0, len(hit.Watches))
 	for _, watched := range hit.Watches {
 		if !selected[watched.ID] {
 			continue
 		}
-		if _, err := b.watchRunner.ConsumeDigest(ctx, watched.ID, []string{watched.WorkKey}); err != nil {
-			if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
-				return b.triageDecisionResult(request.RequestID, "conflict", "")
-			}
-			return b.triageDecisionResult(request.RequestID, "error", err.Error())
+		targets = append(targets, watch.DigestTarget{WatchID: watched.ID, WorkKey: watched.WorkKey})
+	}
+	if err := b.watchRunner.ConsumeDigests(ctx, targets); err != nil {
+		if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
+			return b.triageDecisionResult(request.RequestID, "conflict", "")
 		}
+		return b.triageDecisionResult(request.RequestID, "error", err.Error())
 	}
 	return b.triageDecisionResult(request.RequestID, "applied", "")
 }
@@ -3952,24 +3984,61 @@ func (b *Bridge) openDocumentDeliveryAction(ctx context.Context, jobID string) (
 // pending delivery poll (StateRetryWait, RetryReasonDocumentDeliveryPending)
 // — never retry_submission.
 func (b *Bridge) deliveryConfirmRequestExists(ctx context.Context, request *protocol.DeliveryReconcilePayload, action *job.HumanAction, row *delivery.Request) ([]json.RawMessage, error) {
-	if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID},
-		map[string]any{"reason": "document_delivery_confirmed_exists"}); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
 	profile, err := b.svc.Delivery.ResolveGateProfileFor(ctx, row.InstitutionProfile)
 	if err != nil {
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
-	if err := b.svc.Delivery.UpdateState(ctx, row.ID, delivery.StatePending); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
 	next := delivery.NextCheck(b.now(), 0, profile.StatusPollMinutes)
-	if err := b.svc.Delivery.RecordPoll(ctx, row.ID, request.ProviderReference, next); err != nil {
+	repairDetail := map[string]any{"reason": "document_delivery_confirmed_exists"}
+	repairDetail["from"], repairDetail["to"] = job.StateAwaitingHuman, job.StateResolving
+	repairJSON, err := marshalJobDetail(repairDetail)
+	if err != nil {
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
-	if err := b.jobs.Transition(ctx, request.JobID, job.StateResolving, job.StateRetryWait,
-		map[string]any{"reason": job.RetryReasonDocumentDeliveryPending, "provider_reference": request.ProviderReference},
-		job.WithRetryAt(next)); err != nil {
+	retryDetail := map[string]any{"reason": job.RetryReasonDocumentDeliveryPending, "provider_reference": request.ProviderReference}
+	retryDetail["from"], retryDetail["to"] = job.StateResolving, job.StateRetryWait
+	retryJSON, err := marshalJobDetail(retryDetail)
+	if err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	// One threaded tx: delivery row mutations + job transitions atomically.
+	// Human action closed LAST via RepairAwaitingHumanTx.
+	db := b.svc.Delivery.DB()
+	if db == nil {
+		// Fallback to ordered apply if DB accessor unavailable.
+		if err := b.svc.Delivery.UpdateState(ctx, row.ID, delivery.StatePending); err != nil {
+			return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+		}
+		if err := b.svc.Delivery.RecordPoll(ctx, row.ID, request.ProviderReference, next); err != nil {
+			return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+		}
+		if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID}, map[string]any{"reason": "document_delivery_confirmed_exists"}); err != nil {
+			return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+		}
+		if err := b.jobs.Transition(ctx, request.JobID, job.StateResolving, job.StateRetryWait, map[string]any{"reason": job.RetryReasonDocumentDeliveryPending, "provider_reference": request.ProviderReference}, job.WithRetryAt(next)); err != nil {
+			return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+		}
+		return b.deliveryReconcileResult(request.RequestID, "applied", "")
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := b.svc.Delivery.UpdateStateTx(ctx, tx, row.ID, delivery.StatePending); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	if err := b.svc.Delivery.RecordPollTx(ctx, tx, row.ID, request.ProviderReference, next); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	now := bridgeNow()
+	if err := b.jobs.RepairAwaitingHumanTx(ctx, tx, request.JobID, []int64{action.ID}, string(repairJSON), now); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	if err := b.jobs.TransitionTx(ctx, tx, request.JobID, job.StateResolving, job.StateRetryWait, string(retryJSON), job.TransitionTxConfig{RetryAt: next.UTC().Format(time.RFC3339Nano)}, now); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
+	if err := tx.Commit(); err != nil {
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
 	return b.deliveryReconcileResult(request.RequestID, "applied", "")
@@ -3984,14 +4053,27 @@ func (b *Bridge) deliveryConfirmRequestAbsent(ctx context.Context, request *prot
 	if err := b.svc.Delivery.UpdateState(ctx, row.ID, delivery.StateCancelled); err != nil {
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
-	if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID},
-		map[string]any{"reason": "document_delivery_confirmed_absent"}); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
 	if _, err := b.svc.SubmitDelivery(ctx, request.JobID); err != nil {
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
+	if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID}, map[string]any{"reason": "document_delivery_confirmed_absent"}); err != nil {
+		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
+	}
 	return b.deliveryReconcileResult(request.RequestID, "applied", "")
+}
+
+func marshalJobDetail(detail map[string]any) (string, error) {
+	data, err := json.Marshal(detail)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func bridgeNow() string {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// Use store.Now() format; time.Now is fine for bridge context.
+	return now
 }
 
 func (b *Bridge) deliveryReconcileResult(requestID, outcome, detail string) ([]json.RawMessage, error) {
