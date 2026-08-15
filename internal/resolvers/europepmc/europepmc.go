@@ -117,6 +117,8 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		return nil, nil
+	case resp.StatusCode == http.StatusRequestTimeout:
+		return nil, temporaryStatus("europepmc", resp)
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return nil, temporaryStatus("europepmc", resp)
 	case resp.StatusCode >= 500 && resp.StatusCode <= 599:

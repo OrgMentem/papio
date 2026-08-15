@@ -288,6 +288,18 @@ func TestRetryClasses(t *testing.T) {
 			t.Fatalf("503 must be temporary; err=%v", err)
 		}
 	})
+	t.Run("408 temporary", func(t *testing.T) {
+		srv := serveAtom(t, http.StatusRequestTimeout, map[string]string{"Retry-After": "12"}, "", nil)
+		r := newResolver(srv)
+		_, err := r.Resolve(context.Background(), work.Work{ArXiv: "2101.00001"})
+		d, temp := resolver.Temporary(err)
+		if !temp {
+			t.Fatalf("408 must be temporary; err=%v", err)
+		}
+		if d.Seconds() != 12 {
+			t.Errorf("RetryAfter = %v, want 12s", d)
+		}
+	})
 	t.Run("403 permanent", func(t *testing.T) {
 		srv := serveAtom(t, http.StatusForbidden, nil, "", nil)
 		r := newResolver(srv)
