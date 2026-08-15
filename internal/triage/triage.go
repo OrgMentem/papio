@@ -388,12 +388,20 @@ func (s *Service) AcknowledgeRetraction(ctx context.Context, itemID string) (boo
 }
 
 // Snapshot returns one bounded page of a transactionally consistent inbox.
+//
+// Cursors are opaque keyset tokens bound to the exact item sequence they
+// were cut from: the token encodes the schema of that sequence and the ID
+// of the last item the caller consumed (a keyset anchor). Between page
+// requests insertions and deletions ahead of or behind the anchor are
+// naturally skipped without shifting the walk, because the next page resumes
+// by ID, not by positional offset. A cursor whose schema or version does not
+// match the caller's requested schema is rejected as invalid rather than
+// silently mis-sliced. The anchored ID is looked up in the CURRENT page's
+// view of the sequence, so a removed anchor surfaces as an explicit error
+// (the caller must restart from the head). Retrying with an obsolete
+// offset-only cursor (minted by a pre-fix daemon) is also rejected.
 func (s *Service) Snapshot(ctx context.Context, request SnapshotRequest) (Snapshot, error) {
 	all, counts, unsupported, generatedAt, err := s.collect(ctx, request.Schema)
-	if err != nil {
-		return Snapshot{}, err
-	}
-	limit, offset, err := parsePage(request)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -405,6 +413,34 @@ func (s *Service) Snapshot(ctx context.Context, request SnapshotRequest) (Snapsh
 			}
 		}
 		all = legacy
+	}
+	limit, err := parseLimit(request)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	offset := 0
+	if request.Cursor != "" {
+		cursor, err := decodeCursor(request.Cursor)
+		if err != nil {
+			return Snapshot{}, err
+		}
+		if cursor.Schema != request.Schema {
+			return Snapshot{}, errors.New("invalid triage cursor")
+		}
+		if cursor.LastID == "" {
+			return Snapshot{}, errors.New("invalid triage cursor")
+		}
+		found := -1
+		for index, item := range all {
+			if item.ID == cursor.LastID {
+				found = index
+				break
+			}
+		}
+		if found < 0 {
+			return Snapshot{}, errors.New("invalid triage cursor")
+		}
+		offset = found + 1
 	}
 	if offset > len(all) {
 		return Snapshot{}, errors.New("triage cursor is beyond the snapshot")
@@ -422,7 +458,7 @@ func (s *Service) Snapshot(ctx context.Context, request SnapshotRequest) (Snapsh
 		HasMore: end < len(all), UnsupportedItemsCount: unsupported,
 	}
 	if snapshot.HasMore {
-		snapshot.Cursor = encodeCursor(end)
+		snapshot.Cursor = encodeCursor(request.Schema, items[len(items)-1].ID)
 	}
 	return snapshot, nil
 }
@@ -598,7 +634,10 @@ func seriesWeeks(now time.Time, n int) []time.Time {
 }
 
 // FindWatchHit resolves an item ID against the full current inbox. The returned
-// keys are internal-only inputs for consume/acquire mutations.
+// keys are internal-only inputs for consume/acquire mutations. Watches include
+// every digest row in the hit's identity group, even when a row is already
+// consumed, so a multi-watch dismiss or acquire cannot shrink to the pending
+// subset and silently succeed while a sibling watch was cleared elsewhere.
 func (s *Service) FindWatchHit(ctx context.Context, id string) (*WatchHit, error) {
 	all, _, _, _, err := s.collect(ctx)
 	if err != nil {
@@ -606,48 +645,144 @@ func (s *Service) FindWatchHit(ctx context.Context, id string) (*WatchHit, error
 	}
 	for _, item := range all {
 		if item.ID == id && item.Kind == KindWatchHit {
-			return item.WatchHit, nil
+			return s.watchHitForMutation(ctx, item.WatchHit)
 		}
 	}
 	return nil, sql.ErrNoRows
 }
 
-type pageCursor struct {
-	Version int `json:"v"`
-	Offset  int `json:"o"`
+func (s *Service) watchHitForMutation(ctx context.Context, hit *WatchHit) (*WatchHit, error) {
+	if hit == nil {
+		return nil, errors.New("nil watch hit")
+	}
+	watches, err := s.watchDigestGroupWatches(ctx, watchHitGroupIdentity(hit))
+	if err != nil {
+		return nil, err
+	}
+	if len(watches) == 0 {
+		return hit, nil
+	}
+	expanded := *hit
+	expanded.Watches = watches
+	return &expanded, nil
 }
 
-func parsePage(request SnapshotRequest) (limit, offset int, _ error) {
-	limit = request.Limit
-	if limit == 0 {
-		limit = defaultLimit
+func watchHitGroupIdentity(hit *WatchHit) string {
+	workKey := ""
+	if len(hit.Watches) > 0 {
+		workKey = hit.Watches[0].WorkKey
 	}
-	if limit < 1 || limit > maxLimit {
-		return 0, 0, fmt.Errorf("triage limit must be between 1 and %d", maxLimit)
+	doi, arxiv, openalex := canonicalIdentifiers(hit.Work.DOI, protocol.Identifiers{ArXiv: hit.arXiv, OpenAlex: hit.openAlex})
+	return digestGroupIdentity(workKey, doi, arxiv, openalex)
+}
+
+func digestGroupIdentity(workKey, doi, arxiv, openalex string) string {
+	identity := "key:" + strings.ToLower(strings.TrimSpace(workKey))
+	switch {
+	case doi != "":
+		identity = "doi:" + doi
+	case arxiv != "":
+		identity = "arxiv:" + strings.ToLower(arxiv)
+	case openalex != "":
+		identity = "openalex:" + strings.ToLower(openalex)
 	}
-	if request.Cursor == "" {
-		return limit, 0, nil
+	return identity
+}
+
+func digestRowGroupIdentity(row digestRow, identifiers protocol.Identifiers) string {
+	doi, arxiv, openalex := canonicalIdentifiers(row.doi, identifiers)
+	return digestGroupIdentity(row.workKey, doi, arxiv, openalex)
+}
+
+func (s *Service) watchDigestGroupWatches(ctx context.Context, identity string) ([]Watch, error) {
+	if s == nil || s.Store == nil {
+		return nil, errors.New("triage service is not configured")
 	}
-	encoded, err := base64.RawURLEncoding.DecodeString(request.Cursor)
-	if err != nil || len(encoded) > 64 {
-		return 0, 0, errors.New("invalid triage cursor")
+	rows, err := s.Store.DB().QueryContext(ctx, `
+		SELECT d.watch_id, w.label, d.work_key, d.doi, d.identifiers_json
+		FROM watch_digest_entries d
+		JOIN watches w ON w.id = d.watch_id
+		ORDER BY d.watch_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	byID := make(map[int64]Watch)
+	for rows.Next() {
+		var row digestRow
+		if err := rows.Scan(&row.watchID, &row.watchLabel, &row.workKey, &row.doi, &row.identifiers); err != nil {
+			return nil, err
+		}
+		identifiers, err := decodeIdentifiers(row.identifiers)
+		if err != nil {
+			return nil, err
+		}
+		if digestRowGroupIdentity(row, identifiers) != identity {
+			continue
+		}
+		byID[row.watchID] = Watch{ID: row.watchID, Label: bounded(row.watchLabel, 500), WorkKey: row.workKey}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	watches := make([]Watch, 0, len(byID))
+	for _, watched := range byID {
+		watches = append(watches, watched)
+	}
+	sort.Slice(watches, func(i, j int) bool { return watches[i].ID < watches[j].ID })
+	return watches, nil
+}
+
+type pageCursor struct {
+	Version int    `json:"v"`
+	Schema  int    `json:"s"`
+	Offset  int    `json:"o,omitempty"`
+	LastID  string `json:"id,omitempty"`
+}
+
+func decodeCursor(token string) (pageCursor, error) {
+	encoded, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(encoded) > 256 {
+		return pageCursor{}, errors.New("invalid triage cursor")
 	}
 	var cursor pageCursor
 	decoder := json.NewDecoder(strings.NewReader(string(encoded)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&cursor); err != nil || cursor.Version != SchemaVersion || cursor.Offset < 0 {
-		return 0, 0, errors.New("invalid triage cursor")
+		return pageCursor{}, errors.New("invalid triage cursor")
 	}
 	var extra json.RawMessage
 	if err := decoder.Decode(&extra); err != io.EOF {
-		return 0, 0, errors.New("invalid triage cursor")
+		return pageCursor{}, errors.New("invalid triage cursor")
 	}
-	return limit, cursor.Offset, nil
+	return cursor, nil
 }
 
-func encodeCursor(offset int) string {
-	encoded, _ := json.Marshal(pageCursor{Version: SchemaVersion, Offset: offset})
-	return base64.RawURLEncoding.EncodeToString(encoded)
+// encodeCursor mints the opaque keyset token the client echoes back. The schema
+// is encoded inside it so a cursor cut from one filtered sequence cannot be
+// replayed against a differently-filtered one.
+func encodeCursor(schema int, lastID string) string {
+	payload, err := json.Marshal(pageCursor{Version: SchemaVersion, Schema: schema, LastID: lastID})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func parseLimit(request SnapshotRequest) (int, error) {
+	limit := request.Limit
+	if limit == 0 {
+		limit = defaultLimit
+	}
+	if limit < 1 || limit > maxLimit {
+		return 0, fmt.Errorf("triage limit must be between 1 and %d", maxLimit)
+	}
+	if request.Cursor != "" {
+		if _, err := decodeCursor(request.Cursor); err != nil {
+			return 0, err
+		}
+	}
+	return limit, nil
 }
 
 func (s *Service) collect(ctx context.Context, schema ...int) ([]Item, Counts, int, string, error) {
@@ -1151,15 +1286,7 @@ func watchHitItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 			return nil, err
 		}
 		doi, arxiv, openalex := canonicalIdentifiers(row.doi, identifiers)
-		identity := "key:" + strings.ToLower(strings.TrimSpace(row.workKey))
-		switch {
-		case doi != "":
-			identity = "doi:" + doi
-		case arxiv != "":
-			identity = "arxiv:" + strings.ToLower(arxiv)
-		case openalex != "":
-			identity = "openalex:" + strings.ToLower(openalex)
-		}
+		identity := digestRowGroupIdentity(row, identifiers)
 		group := groups[identity]
 		if group == nil {
 			group = &WatchHit{

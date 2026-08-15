@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1190,4 +1191,131 @@ func TestFamilyOrderingKeepsGuidanceVariantsApart(t *testing.T) {
 	if order := actionJobOrder(snapshot); !slices.Equal(order, want) {
 		t.Fatalf("emitted order = %v, want %v", order, want)
 	}
+}
+
+func TestSnapshotCursorSurvivesMutationAndRejectsSchemaSwitchAndStaleAnchor(t *testing.T) {
+	service, watches, jobs := triageTestService(t)
+
+	seeded := []*watch.Watch{
+		createTriageWatch(t, watches, "cursor-mutate-seed-a"),
+		createTriageWatch(t, watches, "cursor-mutate-seed-b"),
+		createTriageWatch(t, watches, "cursor-mutate-seed-c"),
+		createTriageWatch(t, watches, "cursor-mutate-seed-d"),
+	}
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	initial := []watch.DigestEntry{
+		{WorkKey: "10.1000/a", Title: "A", DOI: "10.1000/a"},
+		{WorkKey: "10.1000/b", Title: "B", DOI: "10.1000/b"},
+		{WorkKey: "10.1000/c", Title: "C", DOI: "10.1000/c"},
+		{WorkKey: "10.1000/d", Title: "D", DOI: "10.1000/d"},
+	}
+	for index := range seeded {
+		if _, err := watches.RecordDigest(context.Background(), seeded[index].ID, now.Add(time.Duration(index)*time.Second), []watch.DigestEntry{initial[index]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Schema: 5})
+	if err != nil || !first.HasMore || first.Cursor == "" || len(first.Items) != 1 {
+		t.Fatalf("first page = %+v, %v", first, err)
+	}
+	firstID := first.Items[0].ID
+
+	// Schema switch without page movement must be rejected, not silently
+	// mis-sliced: a schema-4 cursor encodes the pdf_grab filtering that
+	// preceded pagination, so replaying it under schema 5 (or vice versa)
+	// would shift offsets.
+	if _, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Cursor: first.Cursor, Schema: 4}); err == nil {
+		t.Fatal("schema-switched replay was accepted; expected invalid triage cursor")
+	}
+
+	// Remove the item the cursor was anchored on. The anchored item is a
+	// watch_hit whose work_key is the last component of its ID;
+	// ConsumeDigest wants the watched-digest work_key, not the grouped hit ID.
+	for wIdx, w := range seeded {
+		if _, err := watches.ConsumeDigest(context.Background(), w.ID, []string{initial[wIdx].WorkKey}); err == nil {
+			break
+		}
+	}
+	if _, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Cursor: first.Cursor, Schema: 5}); err == nil {
+		t.Fatalf("cursor anchored on removed %q was accepted; expected invalid triage cursor", firstID)
+	}
+
+	// Insertion-only walk must still yield every item exactly once: never
+	// skip or duplicate, regardless of a mid-page insert ahead of the cursor.
+	service2, watches2, _ := triageTestService(t)
+	seeded2 := make([]*watch.Watch, 0, 4)
+	for i := range 4 {
+		seeded2 = append(seeded2, createTriageWatch(t, watches2, fmt.Sprintf("cursor-walk-%d", i)))
+	}
+	seedEntries := []watch.DigestEntry{
+		{WorkKey: "10.1000/w1", Title: "W1", DOI: "10.1000/w1"},
+		{WorkKey: "10.1000/w2", Title: "W2", DOI: "10.1000/w2"},
+		{WorkKey: "10.1000/w3", Title: "W3", DOI: "10.1000/w3"},
+		{WorkKey: "10.1000/w4", Title: "W4", DOI: "10.1000/w4"},
+	}
+	for index := range seeded2 {
+		if _, err := watches2.RecordDigest(context.Background(), seeded2[index].ID, now.Add(time.Duration(index)*time.Second), []watch.DigestEntry{seedEntries[index]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first2, err := service2.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Schema: 5})
+	if err != nil || len(first2.Items) != 1 {
+		t.Fatalf("walk first page = %+v, %v", first2, err)
+	}
+	seen := map[string]int{}
+	seen[first2.Items[0].ID]++
+	cursor := first2.Cursor
+	injected := createTriageWatch(t, watches2, "cursor-walk-injected")
+	if _, err := watches2.RecordDigest(context.Background(), injected.ID, now.Add(-time.Hour), []watch.DigestEntry{
+		{WorkKey: "10.1000/injected", Title: "Injected", DOI: "10.1000/injected"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		page, err := service2.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Cursor: cursor, Schema: 5})
+		if err != nil {
+			t.Fatalf("walk page after insert = %v", err)
+		}
+		for _, item := range page.Items {
+			seen[item.ID]++
+		}
+		if !page.HasMore {
+			break
+		}
+		cursor = page.Cursor
+	}
+	for id, count := range seen {
+		if count != 1 {
+			t.Fatalf("walk produced duplicate/skip for %q: count %d, seen %v", id, count, seen)
+		}
+	}
+	if want := 5; len(seen) != want {
+		t.Fatalf("walk covered %d items, want %d: %v", len(seen), want, seen)
+	}
+
+	// Schema-boundary regression: a client that enumerates under schema 3
+	// must not have a cursor minted under schema 5 silently mis-slice as if
+	// pdf_grabs were invisible.
+	service3, _, jobs3 := triageTestService(t)
+	createTriageAction(t, jobs3, "wr_cursor_schema_human")
+	service3.RegisterSource(staticSource{items: []Item{
+		{Kind: KindPdfGrab, ID: PdfGrabIDPrefix + "grab_cursor_schema", Title: "Reading copy", Ops: []string{"provide_identifier", "dismiss"}, PdfGrab: &PdfGrab{GrabID: "grab_cursor_schema", State: "parked_no_identifier"}},
+	}})
+	schema5Page, err := service3.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Schema: 5})
+	if err != nil || len(schema5Page.Items) != 1 || schema5Page.Items[0].Kind != KindPdfGrab {
+		t.Fatalf("schema 5 first page = %+v, %v", schema5Page, err)
+	}
+	if _, err := service3.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Cursor: schema5Page.Cursor, Schema: 3}); err == nil {
+		t.Fatal("pdf_grab-anchored cursor replayed under legacy schema was accepted; expected invalid triage cursor")
+	}
+	// Offset-only cursors from the pre-fix wire shape are invalid now; we do
+	// not silently reinterpret them as a keyset.
+	offsetPayload, _ := json.Marshal(pageCursor{Version: SchemaVersion, Schema: 5, Offset: 1})
+	offsetOnly := base64.RawURLEncoding.EncodeToString(offsetPayload)
+	if _, err := service3.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Cursor: offsetOnly, Schema: 5}); err == nil {
+		t.Fatal("offset-only cursor was accepted; expected invalid triage cursor")
+	}
+
+	_ = jobs
 }
