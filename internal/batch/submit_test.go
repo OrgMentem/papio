@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -308,5 +309,45 @@ func TestBatchFallsBackToLegacySubmitOnAnOlderDaemon(t *testing.T) {
 	}
 	if !caller.sawBareReq {
 		t.Fatal("legacy submit never received the bare WorkRequest form")
+	}
+}
+
+func TestSubmitRejectsDuplicateWorks(t *testing.T) {
+	caller := &fingerprintBatchCaller{expectedFingerprint: ""}
+	work := doiWork("dup", "10.1000/dup")
+	dup := doiWork("dup2", "10.1000/dup")
+	output, err := Submit(context.Background(), caller, t.TempDir(), []protocol.WorkRequest{work, dup}, SubmitOptions{})
+	if err == nil {
+		t.Fatalf("Submit with duplicates = %+v, want an error naming the duplicate", output)
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("error %q must name the duplicate", err.Error())
+	}
+	if caller.called("acquire.submit_v2") || caller.called("zotio.lookup_works") || caller.called("library.lookup_works") {
+		t.Fatal("a duplicate batch must fail before any daemon RPC")
+	}
+}
+
+func TestSubmitDistinctWorksBehaveUnchanged(t *testing.T) {
+	caller := &fingerprintBatchCaller{expectedFingerprint: ""}
+	works := []protocol.WorkRequest{
+		doiWork("r1", "10.1000/a"),
+		doiWork("r2", "10.1000/b"),
+	}
+	output, err := Submit(context.Background(), caller, t.TempDir(), works, SubmitOptions{})
+	if err != nil {
+		t.Fatalf("Submit = %v", err)
+	}
+	if len(output.Submitted) != 2 {
+		t.Fatalf("Submitted = %+v, want 2", output.Submitted)
+	}
+	if output.Submitted[0].RequestID == output.Submitted[1].RequestID {
+		t.Fatalf("distinct works must have distinct RequestIDs: %q", output.Submitted[0].RequestID)
+	}
+	if output.Submitted[0].RequestID == "" || output.Submitted[1].RequestID == "" {
+		t.Fatalf("RequestIDs must be populated: %+v", output.Submitted)
+	}
+	if output.Submitted[0].JobID == "" || output.Submitted[1].JobID == "" {
+		t.Fatalf("JobIDs must be populated: %+v", output.Submitted)
 	}
 }

@@ -360,11 +360,16 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 	if options.Now.IsZero() {
 		options.Now = time.Now()
 	}
-	// Default the target collection to the batch's query context (label) so
-	// imported papers are filed under the search that produced them instead of
-	// landing loose in the library root.
 	if strings.TrimSpace(options.Collection) == "" {
 		options.Collection = strings.TrimSpace(options.Label)
+	}
+	seen := make(map[string]int, len(requests))
+	for i, req := range requests {
+		key := workIdentity(req)
+		if prev, ok := seen[key]; ok {
+			return nil, fmt.Errorf("batch contains duplicate work %q at positions %d and %d", key, prev+1, i+1)
+		}
+		seen[key] = i
 	}
 	manifest := NewManifest(requests, options.Label, options.Collection, options.Now)
 	for i := range requests {
@@ -374,7 +379,6 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 	for i := range manifest.Works {
 		manifestIndices[manifest.Works[i].RequestID] = i
 	}
-
 	classified, err := classifyBatchOwnership(ctx, caller, requests, options)
 	if err != nil {
 		return nil, err
