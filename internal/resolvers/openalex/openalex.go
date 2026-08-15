@@ -166,28 +166,22 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		}
 	} else if err := decodeBoundedJSON(body, r.maxBody, &record); err != nil {
 		return nil, fmt.Errorf("openalex: invalid response: %w", err)
+	} else if memoDOI != "" && !echoesDOI(record, memoDOI) {
+		// A misrouted or duplicated upstream answer must not reach the memo
+		// either: ResolveSiblings reads it later for its search basis, so
+		// caching an unverified record would launder a wrong-work title into a
+		// sibling search that no longer has the requested DOI to check against.
+		return nil, nil
 	} else if memoDOI != "" {
 		// Written before OA/candidate filtering: a paywalled record still
 		// carries the authoritative bibliography sibling matching needs.
 		r.writeMemo(memoDOI, record, true)
 	}
 
-	// An exact-DOI lookup must come back ABOUT the DOI that was asked for.
-	// Without this check a misrouted or duplicated upstream answer is published
-	// with IdentityConfidence 1.0, acquiring a different paper under this
-	// citation. A record echoing no parseable DOI fails closed.
-	if memoDOI != "" {
-		echoed := ""
-		for _, raw := range []string{record.DOI, record.IDs.DOI} {
-			if doi, err := work.NormalizeDOI(raw); err == nil {
-				echoed = doi
-				break
-			}
-		}
-		if echoed != memoDOI {
-			return nil, nil
-		}
-	}
+	// An exact-DOI lookup must come back ABOUT the DOI that was asked for:
+	// without it a misrouted or duplicated upstream answer is published with
+	// IdentityConfidence 1.0, acquiring a different paper under this citation.
+	// Verified above, before the memo write.
 	if !record.isOpenAccess() {
 		return nil, nil
 	}
@@ -486,8 +480,28 @@ func (r *Resolver) canonicalRecord(ctx context.Context, canonicalDOI string, ano
 	if err := decodeBoundedJSON(body, r.maxBody, &record); err != nil {
 		return workRecord{}, false, fmt.Errorf("openalex: invalid response: %w", err)
 	}
+	// Same rule as Resolve's exact-DOI path, and for a sharper reason: this
+	// record's TITLE becomes the sibling search basis, and the search itself has
+	// no requested DOI left to check its results against. An unverified record
+	// here would aim the search at a different paper entirely and file its
+	// siblings under this citation.
+	if !echoesDOI(record, canonicalDOI) {
+		return workRecord{}, false, nil
+	}
 	r.writeMemo(canonicalDOI, record, true)
 	return record, true, nil
+}
+
+// echoesDOI reports whether a record is about the DOI that was requested. A
+// record echoing no parseable DOI fails closed. Normalization is the
+// acquisition-side, version-preserving form: v2 is not v1 here.
+func echoesDOI(record workRecord, want string) bool {
+	for _, raw := range []string{record.DOI, record.IDs.DOI} {
+		if doi, err := work.NormalizeDOI(raw); err == nil {
+			return doi == want
+		}
+	}
+	return false
 }
 
 // recordFor returns a record written by a preceding Resolve call for the same

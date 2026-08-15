@@ -115,6 +115,35 @@ func TestSiblingNoSearchBasisAfterUnknownDOI(t *testing.T) {
 	}
 }
 
+// papio's worst outcome is a wrong paper filed under a right citation. A
+// re-earned basis is the sharpest way in: this record's title aims the sibling
+// search, and the search has no requested DOI left to check its results
+// against, so a misrouted answer would file another paper's versions here.
+func TestReearnedBasisRejectsAMisroutedRecord(t *testing.T) {
+	var searched bool
+	client := clientFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.RawQuery, "title.search") {
+			searched = true
+		}
+		// Answers with a DIFFERENT work than the one asked for.
+		return responseFor(200, `{"id":"https://openalex.org/W9","doi":"https://doi.org/10.9999/other.work","title":"An Entirely Different Paper","publication_year":2019}`, nil), nil
+	})
+	r := New(client, "contact@example.org", "private-key")
+	candidates, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+	if !errors.Is(err, resolver.ErrNoSearchBasis) {
+		t.Fatalf("err = %v, want resolver.ErrNoSearchBasis: a misrouted record is not a basis", err)
+	}
+	if candidates != nil {
+		t.Fatalf("candidates = %#v, want none", candidates)
+	}
+	if searched {
+		t.Fatal("a search ran on a title belonging to a different work")
+	}
+	if _, ok := r.recordFor("10.1145/3531146.3533202"); ok {
+		t.Fatal("the misrouted record was memoized and would be trusted by a later pass")
+	}
+}
+
 // A stale memo entry must not silently cancel discovery: the basis is re-earned
 // with the one-credit singleton, never assumed absent.
 func TestSiblingStaleMemoReearnsBasis(t *testing.T) {
