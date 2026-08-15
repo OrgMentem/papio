@@ -777,7 +777,7 @@ func libraryLookupWorks(ctx context.Context, raw json.RawMessage, system *bootst
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "generic library authority is not active"}
 	}
 	if len(request.Works) == 0 || len(request.Works) > 50 {
-		return nil, &ipc.RPCError{Code: "invalid_params", Message: "library lookup requires 1..50 works"}
+		return nil, &ipc.RPCError{Code: "invalid_argument", Message: "library lookup requires 1..50 works"}
 	}
 	return marshal(system.Holdings.Lookup(ctx, request.Works))
 }

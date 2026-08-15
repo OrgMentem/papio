@@ -1471,8 +1471,8 @@ func TestLibraryLookupWorksBounds(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, rpcErr := libraryLookupWorks(context.Background(), raw, system); rpcErr == nil || rpcErr.Code != "invalid_params" {
-			t.Fatalf("count %d: RPC error = %+v, want invalid_params", count, rpcErr)
+		if _, rpcErr := libraryLookupWorks(context.Background(), raw, system); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+			t.Fatalf("count %d: RPC error = %+v, want invalid_argument", count, rpcErr)
 		}
 	}
 }
