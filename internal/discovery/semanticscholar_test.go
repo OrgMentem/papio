@@ -251,3 +251,47 @@ func TestSemanticScholarRejectsTextQueryWithSnowball(t *testing.T) {
 		t.Fatalf("Search() error = %v, want text-query snowball rejection", err)
 	}
 }
+
+func TestSemanticScholarArXivNormalization(t *testing.T) {
+	cases := []struct {
+		name    string
+		fixture string
+		want    string
+	}{
+		{
+			name:    "normalizes arXiv abs URL preserving version",
+			fixture: `{"data":[{"externalIds":{"ArXiv":"https://arxiv.org/abs/2101.12345v2"},"title":"t"}]}`,
+			want:    "2101.12345v2",
+		},
+		{
+			name:    "normalizes arXiv prefix with pdf suffix",
+			fixture: `{"data":[{"externalIds":{"ArXiv":"arXiv:2401.12345v2.pdf"},"title":"t"}]}`,
+			want:    "2401.12345v2",
+		},
+		{
+			name:    "drops unnormalizable arXiv",
+			fixture: `{"data":[{"externalIds":{"ArXiv":"not-an-id"},"title":"t"}]}`,
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.fixture))
+			}))
+			defer server.Close()
+			client := NewSemanticScholarWithOptions(SemanticScholarOptions{Client: http.DefaultClient, BaseURL: server.URL})
+			works, err := client.Search(context.Background(), SearchParams{Query: "t"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(works) != 1 {
+				t.Fatalf("works = %d, want 1", len(works))
+			}
+			if got := works[0].Work.ArXiv; got != tc.want {
+				t.Fatalf("ArXiv = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

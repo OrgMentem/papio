@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -190,9 +191,39 @@ func discoveredWorkKey(discovered DiscoveredWork) string {
 		}
 		return "doi:" + strings.ToLower(doi)
 	}
-	title := strings.Join(strings.Fields(strings.ToLower(discovered.Work.Title)), " ")
+	title := strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(discovered.Work.Title))), " ")
 	if title == "" {
 		return ""
 	}
-	return "title:" + title
+	year := discovered.Work.Year
+	authorsKey := normalizedAuthorsKey(discovered.Work.Authors)
+	if year == 0 && authorsKey == "" {
+		return ""
+	}
+	key := "title:" + title
+	if year != 0 {
+		key += fmt.Sprintf("|year:%d", year)
+	}
+	if authorsKey != "" {
+		key += "|authors:" + authorsKey
+	}
+	return key
+}
+
+func normalizedAuthorsKey(authors []string) string {
+	if len(authors) == 0 {
+		return ""
+	}
+	normed := make([]string, 0, len(authors))
+	for _, a := range authors {
+		n := strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(a))), " ")
+		if n != "" {
+			normed = append(normed, n)
+		}
+	}
+	if len(normed) == 0 {
+		return ""
+	}
+	sort.Strings(normed)
+	return strings.Join(normed, "|")
 }

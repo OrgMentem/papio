@@ -337,13 +337,20 @@ func mapSemanticScholarPapers(papers []semanticScholarPaper) []DiscoveredWork {
 		if normalized, err := work.NormalizeDOI(doi); err == nil {
 			doi = normalized
 		}
+		arxivRaw := strings.TrimSpace(paper.ExternalIDs.ArXiv)
+		arxiv := ""
+		if arxivRaw != "" {
+			if normalized, err := work.NormalizeArXiv(arxivRaw); err == nil {
+				arxiv = normalized
+			}
+		}
 		oaURL := ""
 		if paper.OpenAccessPDF != nil {
 			oaURL = strings.TrimSpace(paper.OpenAccessPDF.URL)
 		}
 		works = append(works, DiscoveredWork{
 			Work: work.Work{
-				DOI: doi, ArXiv: strings.TrimSpace(paper.ExternalIDs.ArXiv),
+				DOI: doi, ArXiv: arxiv,
 				Title: strings.TrimSpace(paper.Title), Authors: authors,
 				Year: paper.Year, Container: strings.TrimSpace(paper.Venue),
 			},

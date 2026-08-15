@@ -31,12 +31,12 @@ func (s *fakeSource) Search(_ context.Context, _ SearchParams) ([]DiscoveredWork
 func TestMultiSearch(t *testing.T) {
 	firstWorks := []DiscoveredWork{
 		{Work: work.Work{DOI: "10.1000/duplicate", Title: "First DOI copy"}},
-		{Work: work.Work{Title: "A  title without DOI"}},
+		{Work: work.Work{Title: "A  title without DOI", Authors: []string{"Jane Doe"}, Year: 2021}},
 		{Work: work.Work{DOI: "10.1000/first-only", Title: "First only"}},
 	}
 	secondWorks := []DiscoveredWork{
 		{Work: work.Work{DOI: "https://doi.org/10.1000/DUPLICATE", Title: "Second DOI copy"}},
-		{Work: work.Work{Title: " a title WITHOUT doi "}},
+		{Work: work.Work{Title: " a title WITHOUT doi ", Authors: []string{"Jane Doe"}, Year: 2021}},
 		{Work: work.Work{DOI: "10.1000/second-only", Title: "Second only"}},
 	}
 	firstFailure := errors.New("first unavailable")
@@ -192,4 +192,54 @@ func TestMultiSearchKeepsWorksWithoutIdentity(t *testing.T) {
 	if works[0].Source != "first" || works[1].Source != "second" {
 		t.Fatalf("sources = %q, %q, want first, second", works[0].Source, works[1].Source)
 	}
+}
+func TestMergeWorksNarrowedTitleKey(t *testing.T) {
+	t.Run("same title different authors both survive", func(t *testing.T) {
+		a := []DiscoveredWork{{Work: work.Work{Title: "Imagined Edition", Authors: []string{"Ada"}, Year: 2021}}}
+		b := []DiscoveredWork{{Work: work.Work{Title: "  imagined  edition  ", Authors: []string{"Grace"}, Year: 2021}}}
+		multi := NewMulti(&fakeSource{name: "first", works: a}, &fakeSource{name: "second", works: b})
+		works, err := multi.Search(context.Background(), SearchParams{Query: "edition"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(works) != 2 {
+			t.Fatalf("works = %d, want 2 — different authors must not collapse", len(works))
+		}
+	})
+	t.Run("same title different year both survive", func(t *testing.T) {
+		a := []DiscoveredWork{{Work: work.Work{Title: "Imagined Edition", Authors: []string{"Ada"}, Year: 2020}}}
+		b := []DiscoveredWork{{Work: work.Work{Title: "Imagined Edition", Authors: []string{"Ada"}, Year: 2021}}}
+		multi := NewMulti(&fakeSource{name: "first", works: a}, &fakeSource{name: "second", works: b})
+		works, err := multi.Search(context.Background(), SearchParams{Query: "edition"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(works) != 2 {
+			t.Fatalf("works = %d, want 2 — different years must not collapse", len(works))
+		}
+	})
+	t.Run("same title no discriminators never dedup", func(t *testing.T) {
+		a := []DiscoveredWork{{Work: work.Work{Title: "Orphan Title"}}}
+		b := []DiscoveredWork{{Work: work.Work{Title: "orphan title"}}}
+		multi := NewMulti(&fakeSource{name: "first", works: a}, &fakeSource{name: "second", works: b})
+		works, err := multi.Search(context.Background(), SearchParams{Query: "orphan"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(works) != 2 {
+			t.Fatalf("works = %d, want 2 — absent discriminators must keep both", len(works))
+		}
+	})
+	t.Run("genuinely identical DOI-less records still dedup", func(t *testing.T) {
+		a := []DiscoveredWork{{Work: work.Work{Title: "Stable Title", Authors: []string{"Ada", "Grace"}, Year: 2022}}}
+		b := []DiscoveredWork{{Work: work.Work{Title: "  stable   title ", Authors: []string{"Grace", "Ada"}, Year: 2022}}}
+		multi := NewMulti(&fakeSource{name: "first", works: a}, &fakeSource{name: "second", works: b})
+		works, err := multi.Search(context.Background(), SearchParams{Query: "stable"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(works) != 1 {
+			t.Fatalf("works = %d, want 1 — identical records must merge", len(works))
+		}
+	})
 }
