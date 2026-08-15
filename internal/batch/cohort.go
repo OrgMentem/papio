@@ -524,6 +524,7 @@ func (c *Cohorts) Projection(ctx context.Context, batchID string, now time.Time)
 			}
 			continue
 		}
+		leaseExpired := false
 		if leaseOwner != "" {
 			t, ok := parseTimeChecked(leaseExpires)
 			if !ok {
@@ -534,6 +535,10 @@ func (c *Cohorts) Projection(ctx context.Context, batchID string, now time.Time)
 				inFlight++
 				continue
 			}
+			// The lease outlived its owner: a crashed or wedged worker still
+			// holds this job. It is not progressing, so it must not be counted
+			// as continuing below.
+			leaseExpired = true
 		}
 		if retryAt != "" {
 			t, ok := parseTimeChecked(retryAt)
@@ -561,7 +566,11 @@ func (c *Cohorts) Projection(ctx context.Context, batchID string, now time.Time)
 		}
 		switch state {
 		case job.StateQueued, job.StateResolving, job.StateFetching, job.StateValidating:
-			continuing++
+			if leaseExpired {
+				stalled++
+			} else {
+				continuing++
+			}
 		default:
 			complete = false
 		}

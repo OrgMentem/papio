@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/job"
 	"papio/internal/store"
 )
 
@@ -197,6 +198,72 @@ func TestPartialProjectionOmitsDenominatorAfterInactivity(t *testing.T) {
 	}
 	if p.Membership != "partial" || p.ProjectionComplete || p.Total != nil {
 		t.Fatalf("partial projection = %+v", p)
+	}
+}
+
+// seedCohortJob writes the work_request/job pair a cohort member points at, so
+// Projection can classify a real row rather than reporting an incomplete view.
+func seedCohortJob(t *testing.T, s *store.Store, jobID, state, leaseOwner string, leaseExpires time.Time, now time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	requestID := "wr-" + jobID
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO work_requests (id,created_at,requester,desired_version) VALUES (?,?,'cli','any')`, requestID, timestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	var expires any
+	if !leaseExpires.IsZero() {
+		expires = timestamp(leaseExpires)
+	}
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO jobs (id,work_request_id,state,policy_json,lease_owner,lease_expires_at,created_at,updated_at) VALUES (?,?,?,'{}',?,?,?,?)`,
+		jobID, requestID, state, leaseOwner, expires, timestamp(now), timestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A lease that outlived its owner means a crashed or wedged worker still holds
+// the job: it is stalled, not progressing. Counting it as `continuing` hid every
+// dead worker in a cohort behind a healthy-looking projection, and left
+// Projection.Stalled structurally zero.
+func TestProjectionCountsExpiredLeaseAsStalled(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name           string
+		leaseExpires   time.Time
+		wantStalled    int
+		wantContinuing int
+		wantInFlight   int
+	}{
+		{name: "expired lease is stalled", leaseExpires: now.Add(-time.Minute), wantStalled: 1, wantContinuing: 1, wantInFlight: 0},
+		{name: "lease expiring exactly now is still in flight", leaseExpires: now, wantStalled: 0, wantContinuing: 1, wantInFlight: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := cohortStore(t)
+			cohorts := New(s)
+			cohorts.Now = func() time.Time { return now }
+			manifest := keys(2)
+			req := ChunkRequest{RequestID: "request-1", CohortID: "cohort-1", Source: browserSource(), CohortTotal: 2, ChunkIndex: 0, FinalChunk: true, CanonicalKeys: manifest}
+			res, err := cohorts.SubmitChunk(ctx, req, func(context.Context, []string) ([]MemberOutcome, error) {
+				return outcomes(manifest, "submitted", "job-"), nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedCohortJob(t, s, "job-"+manifest[0], job.StateFetching, "worker-1", tt.leaseExpires, now)
+			seedCohortJob(t, s, "job-"+manifest[1], job.StateFetching, "", time.Time{}, now)
+
+			p, err := cohorts.Projection(ctx, res.BatchID, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !p.ProjectionComplete || p.Stalled == nil || p.Continuing == nil || p.InFlight == nil {
+				t.Fatalf("projection = %+v, want complete with counters", p)
+			}
+			if *p.Stalled != tt.wantStalled || *p.Continuing != tt.wantContinuing || *p.InFlight != tt.wantInFlight {
+				t.Fatalf("stalled=%d continuing=%d inFlight=%d, want %d/%d/%d",
+					*p.Stalled, *p.Continuing, *p.InFlight, tt.wantStalled, tt.wantContinuing, tt.wantInFlight)
+			}
+		})
 	}
 }
 
