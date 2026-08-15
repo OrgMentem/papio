@@ -65,8 +65,9 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 		// the user's instinct on a paywall message is to go sign in again.
 		return Explanation{"doi_not_registered",
 			"This DOI is not registered with the DOI system, so it resolves to a \"DOI NOT FOUND\" page and no link resolver can match it — almost always a typo or a mangled copy-paste. Signing in will not help. Check the DOI against the article's own page and re-submit with `papio acquire --doi <doi>`."}
-	case "candidates_exhausted", "no_legal_candidates":
-		return explainNoAccess(resolver, accessMode, cfg)
+	case "insufficient_identity_evidence":
+		return Explanation{"insufficient_identity_evidence",
+			"The request only supplied a title (or otherwise too little to verify identity), and no resolver echoed a submitted identifier. Papio will not file a PDF on search evidence alone. Re-submit with a DOI, PMID, or arXiv id, or confirm the match after a human review."}
 	}
 
 	// Fall back per state so nothing renders blank when the daemon emits a

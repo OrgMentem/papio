@@ -23,18 +23,25 @@ type SecureHTTPClient struct {
 // DNS, headers, body reads, redirects, total duration, and maximum body bytes.
 // The returned client is GET-only.
 func NewSecureHTTPClient(policy Policy, resolver Resolver, transport http.RoundTripper) (*SecureHTTPClient, error) {
-	return newSecureHTTPClient(policy, resolver, transport, false)
+	return newSecureHTTPClient(policy, resolver, transport, false, true)
+}
+
+// NewSecureHTTPClientNoRedirect constructs a GET-only client whose Do issues
+// exactly one physical request: redirects are returned to the caller instead
+// of being followed inside papio's hop loop.
+func NewSecureHTTPClientNoRedirect(policy Policy, resolver Resolver, transport http.RoundTripper) (*SecureHTTPClient, error) {
+	return newSecureHTTPClient(policy, resolver, transport, false, false)
 }
 
 // NewSecureHTTPClientWithPOST constructs an SSRF-resistant client that accepts
 // GET and POST requests. POST is an explicit opt-in because metadata resolvers
 // and discovery backends must remain GET-only.
 func NewSecureHTTPClientWithPOST(policy Policy, resolver Resolver, transport http.RoundTripper) (*SecureHTTPClient, error) {
-	return newSecureHTTPClient(policy, resolver, transport, true)
+	return newSecureHTTPClient(policy, resolver, transport, true, true)
 }
 
-func newSecureHTTPClient(policy Policy, resolver Resolver, transport http.RoundTripper, allowPost bool) (*SecureHTTPClient, error) {
-	d, err := New(policy, resolver, transport)
+func newSecureHTTPClient(policy Policy, resolver Resolver, transport http.RoundTripper, allowPost bool, followRedirects bool) (*SecureHTTPClient, error) {
+	d, err := newDownloader(policy, resolver, transport, followRedirects)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +80,7 @@ func (c *SecureHTTPClient) Do(request *http.Request) (*http.Response, error) {
 			cancelOverall()
 			return nil, classifyRequestError(err)
 		}
-		if isRedirect(resp.StatusCode) {
+		if c.downloader.followRedirects && isRedirect(resp.StatusCode) {
 			if current.Method != http.MethodGet {
 				closeBody(resp)
 				cancelOverall()

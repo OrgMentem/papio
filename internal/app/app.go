@@ -361,8 +361,15 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 		return err
 	}
 
+	anchor, err := s.Jobs.SubmittedIdentity(ctx, row.ID)
+	if err != nil {
+		return err
+	}
+
 	// Resolver order step 1: verified local content-addressed cache.
-	if row.Work.DOI != "" {
+	// Requires a submitted/verified DOI on the immutable anchor — not merely a
+	// DOI row.Work may have picked up from a later resolver pass.
+	if row.Work.DOI != "" && anchor.AnchorAllowsDOICache(row.Work.DOI) {
 		cached, source, err := s.Jobs.FindArtifactByDOI(ctx, row.Work.DOI)
 		if err != nil {
 			return err
@@ -391,6 +398,13 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 	live, plan, err := s.resolve(ctx, row)
 	if err != nil {
 		return err
+	}
+	row, err = s.Jobs.Get(ctx, row.ID)
+	if err != nil {
+		return err
+	}
+	if row.State != job.StateResolving {
+		return nil
 	}
 	if len(live) == 0 {
 		if !plan.IsZero() {
@@ -536,16 +550,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 			chosen, err = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, entry.Policy), entry.EstimatedCost)
 			if err != nil {
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
-				var exceeded *budget.ErrExceeded
-				if errors.As(err, &exceeded) {
-					continue
-				}
-				// The source is gated too far out to wait on (typically a daily
-				// quota reset). Skip it and let the job park until the gate
-				// lifts, instead of holding this worker's claim until then.
-				var deferred *budget.ErrDeferred
-				if errors.As(err, &deferred) {
-					plan.recordDeferral(deferred)
+				if absorbBudgetRefusal(&plan, err) {
 					continue
 				}
 				return nil, plan, err
@@ -604,23 +609,40 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		if exhaustionErr != nil {
 			exhausted = false
 		}
-		atBoundary := plan.Temporary().IsZero() || exhausted
+		atBoundary := plan.Temporary().IsZero() || exhausted || plan.StickyBudgetGate
 		siblings, siblingPlan := s.resolveSiblings(ctx, row, atBoundary)
 		all = append(all, siblings...)
 		plan.merge(siblingPlan)
 	}
 
 	ranked, evidence := resolver.Rank(row.Policy.DesiredVersion, all)
-	resolved := row.Work
-	for _, c := range ranked {
-		resolved = fillMissing(resolved, c.ResolvedWork)
+
+	anchor, err := s.Jobs.SubmittedIdentity(ctx, row.ID)
+	if err != nil {
+		return nil, plan, err
 	}
-	if !sameWork(resolved, row.Work) {
+
+	// Promotion gate (after enrich/resolver loops above): budget refusals recorded
+	// via absorbBudgetRefusal during those loops park the pass but never bypass
+	// this gate — a mixed pass may carry ClosedSourceGates on plan while still
+	// ranking candidates, and only AuthorityExactEcho may durably adopt identity
+	// fields from them. Sparse-anchor disposition (below) runs after promotion:
+	// title-only attested anchors may list candidates, but candidate-derived
+	// facts cannot verify canonical identity without independent authority.
+	resolved := accumulatePromotedIdentity(row.Work, ranked)
+	if !sameWorkIdentity(resolved, row.Work) {
 		updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, resolved)
 		if err != nil {
 			return nil, plan, err
 		}
 		row.Work = updated.Work
+	}
+
+	if anchor.InsufficientIdentityAuthority() && len(ranked) > 0 {
+		if err := s.settleInsufficientIdentity(ctx, row, job.StateResolving); err != nil {
+			return nil, plan, err
+		}
+		return map[string]resolver.Candidate{}, plan, nil
 	}
 
 	persisted, live := candidateRows(row, ranked, evidence)
@@ -916,10 +938,7 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary 
 			chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, entry.Policy), entry.EstimatedCost)
 			if acquireErr != nil {
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
-				var deferred *budget.ErrDeferred
-				if errors.As(acquireErr, &deferred) {
-					plan.recordDeferral(deferred)
-				}
+				absorbBudgetRefusal(&plan, acquireErr)
 				continue
 			}
 		}
@@ -1075,10 +1094,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 		chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, policy), 0)
 		if acquireErr != nil {
 			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
-			var deferred *budget.ErrDeferred
-			if errors.As(acquireErr, &deferred) {
-				plan.recordDeferral(deferred)
-			}
+			absorbBudgetRefusal(&plan, acquireErr)
 			return nil, plan
 		}
 	}
@@ -1127,10 +1143,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 				var acquireErr error
 				sibChosen, acquireErr = s.Budgets.AcquireAny(ctx, rname, acquirePolicies(rname, entry.Policy), entry.EstimatedCost)
 				if acquireErr != nil {
-					var deferred *budget.ErrDeferred
-					if errors.As(acquireErr, &deferred) {
-						plan.recordDeferral(deferred)
-					}
+					absorbBudgetRefusal(&plan, acquireErr)
 					if valid == 0 {
 						outcome, detail = "budget_blocked", safeType(acquireErr)
 					}
@@ -1211,6 +1224,9 @@ func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) (retryPlan, e
 	var exceeded *budget.ErrExceeded
 	var deferred *budget.ErrDeferred
 	if errors.As(err, &exceeded) || errors.As(err, &deferred) {
+		if exceeded != nil {
+			plan.recordExceeded(exceeded)
+		}
 		if deferred != nil {
 			plan.recordDeferral(deferred)
 		}
@@ -1294,12 +1310,7 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) (retryPlan, error) {
 				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
 				// An optional source that is spent or gated must not prevent a
 				// later metadata source from attempting this same pass.
-				var exceeded *budget.ErrExceeded
-				var deferred *budget.ErrDeferred
-				if errors.As(acquireErr, &exceeded) || errors.As(acquireErr, &deferred) {
-					if deferred != nil {
-						plan.recordDeferral(deferred)
-					}
+				if absorbBudgetRefusal(&plan, acquireErr) {
 					continue
 				}
 				return plan, acquireErr
@@ -1534,7 +1545,10 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 				}
 				var exceeded *budget.ErrExceeded
 				if errors.As(err, &exceeded) {
-					_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
+					if err := s.Jobs.MarkCandidate(ctx, stored.ID, "retryable"); err != nil {
+						return err
+					}
+					plan.recordExceeded(exceeded)
 					continue
 				}
 				// A gated source (daily quota reset) is temporary, so the
@@ -3337,6 +3351,12 @@ type retryPlan struct {
 	TemporaryResolvers  int // resolver/sibling calls that failed retryably this pass
 	ClosedSourceGates   int // durable source gates closed before any request this pass
 	AdvisoryBackoffs    int // token-bucket refusals before any request this pass
+	// StickyBudgetGate marks a local budget refusal with no timed reopen
+	// (pricing-drift / prepaid closure). Gate and LatestGate stay zero so the
+	// job never wakes at a UTC boundary while egress remains closed; parkForRetry
+	// still schedules RetryDelay so the scheduler has a wake time, and
+	// StickyBudgetGate blocks sibling search like a durable gate.
+	StickyBudgetGate bool
 	// SourcesCalled counts sources this pass actually reached. A pass that
 	// called something and came back empty is a real answer and must stay
 	// chargeable; only a pass where this process's own throttle turned away
@@ -3363,6 +3383,7 @@ func (p *retryPlan) merge(other retryPlan) {
 	p.TemporaryResolvers += other.TemporaryResolvers
 	p.ClosedSourceGates += other.ClosedSourceGates
 	p.AdvisoryBackoffs += other.AdvisoryBackoffs
+	p.StickyBudgetGate = p.StickyBudgetGate || other.StickyBudgetGate
 	p.SourcesCalled += other.SourcesCalled
 }
 
@@ -3383,6 +3404,44 @@ func (p *retryPlan) recordDeferral(deferred *budget.ErrDeferred) {
 	p.ClosedSourceGates++
 }
 
+// recordExceeded folds a typed local-budget refusal into the plan as a durable
+// park. Timed windows (UTC day, calendar month) carry the reset from the
+// refusal; WindowSticky has no reopen instant — Gate stays zero so UTC rollover
+// cannot revive the job.
+func (p *retryPlan) recordExceeded(exceeded *budget.ErrExceeded) {
+	if exceeded == nil {
+		return
+	}
+	if exceeded.Window == budget.WindowSticky {
+		p.StickyBudgetGate = true
+		p.ClosedSourceGates++
+		return
+	}
+	until := exceeded.Until.UTC()
+	if until.IsZero() {
+		return
+	}
+	p.Gate = earlierTime(p.Gate, until)
+	p.LatestGate = laterTime(p.LatestGate, until)
+	p.ClosedSourceGates++
+}
+
+// absorbBudgetRefusal records a budget admission refusal on the plan. Returns
+// true when err was a typed local-budget refusal the pass must park on.
+func absorbBudgetRefusal(plan *retryPlan, err error) bool {
+	var exceeded *budget.ErrExceeded
+	if errors.As(err, &exceeded) {
+		plan.recordExceeded(exceeded)
+		return true
+	}
+	var deferred *budget.ErrDeferred
+	if errors.As(err, &deferred) {
+		plan.recordDeferral(deferred)
+		return true
+	}
+	return false
+}
+
 // At is when the job should wake: the earliest real opportunity, because a
 // source that frees up sooner deserves its attempt sooner. An advisory
 // token-bucket backoff is never that opportunity — it says only that this
@@ -3401,7 +3460,9 @@ func (p retryPlan) AdvisoryOnly() bool {
 // IsZero means the pass observed nothing at all and the job can be settled.
 // Any throttle refusal keeps it non-zero — a source papio never asked cannot
 // justify a terminal verdict — but only an advisory-ONLY pass is uncharged.
-func (p retryPlan) IsZero() bool { return p.At().IsZero() && p.AdvisoryBackoffs == 0 }
+func (p retryPlan) IsZero() bool {
+	return p.At().IsZero() && !p.StickyBudgetGate && p.AdvisoryBackoffs == 0
+}
 
 // Kind names why the pass ended with no verdict. source_gate means a durable
 // gate held every callable source back and NOTHING was called this pass;

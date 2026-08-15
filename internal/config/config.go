@@ -93,14 +93,30 @@ var validNotifyCategoryNames = map[string]bool{
 	"system_degraded":  true,
 }
 
+// DefaultDailyCreditFraction is the shipped OpenAlex daily fuse fraction when
+// the operator does not override daily_credit_fraction.
+const DefaultDailyCreditFraction = 0.5
+
 // Source is one resolver's policy knobs.
 type Source struct {
-	Enabled       bool    `toml:"enabled"`
-	APIKey        string  `toml:"api_key,omitempty"`
-	RatePerSec    float64 `toml:"rate_per_sec,omitempty"`
-	Burst         int     `toml:"burst,omitempty"`
-	MaxCostUSD    float64 `toml:"max_cost_usd,omitempty"`     // monthly budget for paid sources
-	BaseURLForDev string  `toml:"base_url_for_dev,omitempty"` // test/dev override; loopback only
+	Enabled             bool    `toml:"enabled"`
+	APIKey              string  `toml:"api_key,omitempty"`
+	RatePerSec          float64 `toml:"rate_per_sec,omitempty"`
+	Burst               int     `toml:"burst,omitempty"`
+	MaxCostUSD          float64 `toml:"max_cost_usd,omitempty"`          // monthly budget for paid sources
+	DailyCreditFraction float64 `toml:"daily_credit_fraction,omitempty"` // daily credit fuse fraction; OpenAlex ships 0.5
+	DailyCreditLimit    int     `toml:"daily_credit_limit,omitempty"`    // absolute daily credit cap; 0 = unmetered ceiling
+	SiblingTitleSearch  bool    `toml:"sibling_title_search,omitempty"`  // OpenAlex fuzzy sibling title search; off by default (measured ≥138 credits per accepted artifact)
+	AllowKeepAlives     bool    `toml:"allow_keep_alives,omitempty"`     // false = one connection per metadata GET (replay hygiene)
+	BaseURLForDev       string  `toml:"base_url_for_dev,omitempty"`      // test/dev override; loopback only
+}
+
+// DisableKeepAlives reports whether metadata transports should disable
+// connection reuse for this source. The zero value (AllowKeepAlives=false)
+// means disabled, so absent config defaults to the safe replay-hygiene
+// posture without pointer plumbing.
+func (s Source) DisableKeepAlives() bool {
+	return !s.AllowKeepAlives
 }
 
 // Fetch bounds every artifact download.
@@ -571,22 +587,29 @@ func Default() Config {
 			CompletionQuietMinutes: 10, CompletionMaxHoldMinutes: 120,
 			StallAfterMinutes: 30,
 		},
-		Hooks: Hooks{TimeoutSeconds: 120},
-		Sources: map[string]Source{
-			SourceArXiv:            {Enabled: true, RatePerSec: 1, Burst: 1},
-			SourceEuropePMC:        {Enabled: true, RatePerSec: 2, Burst: 2},
-			SourceUnpaywall:        {Enabled: true, RatePerSec: 1, Burst: 1},
-			SourceOpenAlex:         {Enabled: false, RatePerSec: 2, Burst: 2},
-			SourceCORE:             {Enabled: false, RatePerSec: 0.4, Burst: 1},
-			SourceCrossrefTDM:      {Enabled: false, RatePerSec: 1, Burst: 1},
-			SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
-			SourceRetractionWatch:  {Enabled: true, RatePerSec: 1, Burst: 1},
-			SourceSemanticScholar:  {Enabled: true, RatePerSec: 1, Burst: 1},
-			// OpenAIRE's keyless public limit is 60 requests/hour; a personal
-			// token (api_key) raises the ceiling and can justify a higher
-			// rate_per_sec in the user's config.
-			SourceOpenAIRE: {Enabled: true, RatePerSec: 0.016, Burst: 1},
-		},
+		Hooks:   Hooks{TimeoutSeconds: 120},
+		Sources: defaultSources(),
+	}
+}
+
+// defaultSources is the shipped [sources.*] baseline. papio init and Load's
+// Default() overlay both depend on non-zero daily_credit_fraction for OpenAlex
+// so a credit fuse is not inert on first install.
+func defaultSources() map[string]Source {
+	return map[string]Source{
+		SourceArXiv:            {Enabled: true, RatePerSec: 1, Burst: 1},
+		SourceEuropePMC:        {Enabled: true, RatePerSec: 2, Burst: 2},
+		SourceUnpaywall:        {Enabled: true, RatePerSec: 1, Burst: 1},
+		SourceOpenAlex:         {Enabled: false, RatePerSec: 2, Burst: 2, DailyCreditFraction: DefaultDailyCreditFraction},
+		SourceCORE:             {Enabled: false, RatePerSec: 0.4, Burst: 1},
+		SourceCrossrefTDM:      {Enabled: false, RatePerSec: 1, Burst: 1},
+		SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
+		SourceRetractionWatch:  {Enabled: true, RatePerSec: 1, Burst: 1},
+		SourceSemanticScholar:  {Enabled: true, RatePerSec: 1, Burst: 1},
+		// OpenAIRE's keyless public limit is 60 requests/hour; a personal
+		// token (api_key) raises the ceiling and can justify a higher
+		// rate_per_sec in the user's config.
+		SourceOpenAIRE: {Enabled: true, RatePerSec: 0.016, Burst: 1},
 	}
 }
 
@@ -812,6 +835,12 @@ func (c *Config) validate() error {
 		}
 		if s.MaxCostUSD < 0 {
 			return fmt.Errorf("sources.%s.max_cost_usd must not be negative (0 means unmetered)", name)
+		}
+		if s.DailyCreditFraction < 0 || s.DailyCreditFraction > 1 {
+			return fmt.Errorf("sources.%s.daily_credit_fraction must be in [0,1]", name)
+		}
+		if s.DailyCreditLimit < 0 {
+			return fmt.Errorf("sources.%s.daily_credit_limit must not be negative (0 means unmetered ceiling)", name)
 		}
 	}
 	if err := validateNotify(c.Notify); err != nil {

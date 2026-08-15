@@ -37,7 +37,8 @@ func schema33Fixture(t *testing.T, seed string) string {
 	}
 	sort.Strings(paths)
 	for _, path := range paths {
-		if strings.HasPrefix(filepath.Base(path), "0034_") {
+		base := filepath.Base(path)
+		if strings.HasPrefix(base, "0034_") || strings.HasPrefix(base, "0035_") || strings.HasPrefix(base, "0036_") {
 			continue
 		}
 		migration, err := os.ReadFile(path)
@@ -199,8 +200,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 34 {
-		t.Fatalf("user_version = %d, %v; want 34", version, err)
+	if err != nil || version != 36 {
+		t.Fatalf("user_version = %d, %v; want 36", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -272,8 +273,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 34 {
-		t.Fatalf("user_version = %d, %v; want 34", version, err)
+	if err != nil || version != 36 {
+		t.Fatalf("user_version = %d, %v; want 36", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)

@@ -19,6 +19,7 @@ import (
 
 	"papio/internal/redact"
 	"papio/internal/resolver"
+	"papio/internal/sourcegate"
 	"papio/internal/work"
 )
 
@@ -40,22 +41,24 @@ type HTTPClient interface {
 
 // Options configures a Resolver. ContactEmail is required for OpenAlex's
 // polite pool. APIKey is required when calling the official API and is sent
-// only to OpenAlex as an api_key query parameter. BaseURL is the works endpoint root.
+// only to OpenAlex as an Authorization bearer token. BaseURL is the works endpoint root.
 type Options struct {
-	Client           HTTPClient
-	ContactEmail     string
-	APIKey           string
-	BaseURL          string
-	MaxResponseBytes int64
+	Client             HTTPClient
+	ContactEmail       string
+	APIKey             string
+	BaseURL            string
+	MaxResponseBytes   int64
+	SiblingTitleSearch bool
 }
 
 // Resolver implements resolver.Resolver using OpenAlex work records.
 type Resolver struct {
-	client  HTTPClient
-	email   string
-	apiKey  string
-	baseURL string
-	maxBody int64
+	client             HTTPClient
+	email              string
+	apiKey             string
+	baseURL            string
+	maxBody            int64
+	siblingTitleSearch bool
 
 	// records memoizes DOI singleton lookups so the sibling hop can reuse the
 	// canonical record a preceding Resolve already paid for instead of GETting
@@ -99,7 +102,8 @@ func NewWithOptions(opts Options) *Resolver {
 	return &Resolver{
 		client: opts.Client, email: strings.TrimSpace(opts.ContactEmail),
 		apiKey: strings.TrimSpace(opts.APIKey), baseURL: baseURL, maxBody: maxBody,
-		records: make(map[string]recordMemo),
+		siblingTitleSearch: opts.SiblingTitleSearch,
+		records:            make(map[string]recordMemo),
 	}
 }
 
@@ -140,7 +144,7 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 			memoOpenAlex = id
 		}
 	}
-	body, err := r.fetch(ctx, endpoint)
+	body, mergeAlias, err := r.fetch(ctx, endpoint, anon)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +182,7 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		// caching an unverified record would launder a wrong-work title into a
 		// sibling search that no longer has the requested DOI to check against.
 		return nil, nil
-	} else if memoOpenAlex != "" && !echoesOpenAlex(record, memoOpenAlex) {
+	} else if memoOpenAlex != "" && !mergeAlias.accepts(record, memoOpenAlex) {
 		// The SAME rule for the other exact endpoint. Both publish at
 		// IdentityConfidence 1.0, so both must prove the response is about the
 		// identity that was requested; verifying only the DOI path left an
@@ -207,14 +211,17 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 	}
 	landing := landingURL(location)
 	confidence := 1.0
+	authority := resolver.AuthorityExactEcho
 	if search {
 		confidence = 0.75
+		authority = resolver.AuthoritySearch
 	}
 	candidate := resolver.Candidate{
 		Source: "openalex", URL: candidateURL, Landing: landing,
 		Version: mapVersion(location.Version), AccessBasis: resolver.AccessOpen,
 		ReuseLicense: reuseLicense(location.License), ExpectedMIME: expectedMIME(direct),
 		Direct: direct, IdentityConfidence: confidence, ResolvedWork: resolvedWork(record),
+		Authority: authority,
 		Evidence: []string{
 			"openalex lookup=" + lookup,
 			"openalex location=" + source,
@@ -269,73 +276,88 @@ func (r *Resolver) lookupURL(requested work.Work, anon bool) (*url.URL, string, 
 	query := base.Query()
 	query.Set("mailto", r.email)
 	query.Set("select", workSelectFields)
-	// Unconditional Del before the key is re-applied: a dev base URL may carry
-	// its own api_key, and an "anonymous" request that silently stayed keyed
-	// would be metered against the wrong identity by both the observer and the
-	// budget manager.
+	// Credentials attach at request time in fetch (bearer header), not in the
+	// query string, so entity-merge redirects cannot strip them.
 	query.Del("api_key")
-	if r.apiKey != "" && !anon {
-		query.Set("api_key", r.apiKey)
-	}
 	base.RawQuery = query.Encode()
 	return base, lookup, search, nil
 }
 
-// fetch issues one authenticated OpenAlex GET and maps HTTP statuses to the
-// resolver error taxonomy. A nil ReadCloser with nil error means "not found".
-func (r *Resolver) fetch(ctx context.Context, endpoint *url.URL) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return nil, errors.New("openalex: could not construct request")
+func (r *Resolver) applyOpenAlexAuth(req *http.Request, anon bool) {
+	if r.apiKey != "" && !anon {
+		sourcegate.SetOpenAlexAuthorization(req, r.apiKey)
+	} else {
+		sourcegate.ClearOpenAlexAuthorization(req)
 	}
-	req.Header.Set("Accept", "application/json")
+}
 
-	resp, err := r.client.Do(req)
-	if err != nil {
-		// Wrap, never replace. Which typed causes actually arrive here depends on
-		// the wiring, and the earlier version of this comment asserted one that
-		// is only half true: resolverEntries injects a bare sourcegate.Observer
-		// (admission for that path happens upstream at the app.go AcquireAny
-		// call site, which is why it is deliberately NOT wrapped in
-		// sourcegate.Client), while the discovery wiring does wrap one. So the
-		// causes worth preserving are the Observer's own *ErrQuotaLatched and,
-		// on the wrapped paths, *budget.ErrDeferred / *budget.ErrExceeded.
-		// Substituting a fresh error destroyed all of them: a refusal naming a
-		// specific identity and reset instant arrived as an undifferentiated
-		// transport failure and cycled through generic retry instead of parking.
-		// TemporaryError unwraps, so errors.As finds the cause again while the
-		// retry classification stays as it was.
-		return nil, &resolver.TemporaryError{Err: fmt.Errorf("openalex: request failed: %w", err)}
+// fetch issues one or more authenticated OpenAlex GETs when the provider
+// answers an entity merge with 301. Each hop is a separate client Do. A nil
+// ReadCloser with nil error means "not found".
+func (r *Resolver) fetch(ctx context.Context, endpoint *url.URL, anon bool) (io.ReadCloser, entityMergeAlias, error) {
+	if endpoint == nil {
+		return nil, entityMergeAlias{}, errors.New("openalex: missing endpoint")
 	}
-	if resp == nil {
-		return nil, &resolver.TemporaryError{Err: errors.New("openalex: empty HTTP response")}
-	}
-	closeBody := func() {
-		if resp.Body != nil {
-			_ = resp.Body.Close()
+	current := *endpoint
+	var mergeAlias entityMergeAlias
+	for hop := 0; hop <= maxOpenAlexEntityRedirects; hop++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current.String(), nil)
+		if err != nil {
+			return nil, entityMergeAlias{}, errors.New("openalex: could not construct request")
 		}
+		req.Header.Set("Accept", "application/json")
+		r.applyOpenAlexAuth(req, anon)
+
+		resp, err := r.client.Do(req)
+		if err != nil {
+			return nil, entityMergeAlias{}, &resolver.TemporaryError{Err: fmt.Errorf("openalex: request failed: %w", err)}
+		}
+		if resp == nil {
+			return nil, entityMergeAlias{}, &resolver.TemporaryError{Err: errors.New("openalex: empty HTTP response")}
+		}
+		closeBody := func() {
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+		}
+
+		if resp.StatusCode == http.StatusMovedPermanently && isOpenAlexEntitySingleton(&current) {
+			nextURL, redirectErr := resolveEntityMergeLocation(&current, resp.Header.Get("Location"))
+			closeBody()
+			if redirectErr != nil {
+				return nil, entityMergeAlias{}, redirectErr
+			}
+			if alias := mergeAliasFromRedirect(&current, nextURL); alias.from != "" {
+				mergeAlias = alias
+			}
+			current = *nextURL
+			continue
+		}
+
+		switch {
+		case resp.StatusCode == http.StatusNotFound:
+			closeBody()
+			return nil, mergeAlias, nil
+		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+			closeBody()
+			return nil, entityMergeAlias{}, errors.New("openalex: request was rejected (check polite-pool contact and API credentials)")
+		case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests:
+			closeBody()
+			return nil, entityMergeAlias{}, temporaryStatus("openalex", resp)
+		case resp.StatusCode >= 500 && resp.StatusCode <= 599:
+			closeBody()
+			return nil, entityMergeAlias{}, temporaryStatus("openalex", resp)
+		case resp.StatusCode < 200 || resp.StatusCode > 299:
+			closeBody()
+			return nil, entityMergeAlias{}, fmt.Errorf("openalex: unexpected HTTP status %d", resp.StatusCode)
+		}
+		if resp.Body == nil {
+			closeBody()
+			return nil, entityMergeAlias{}, errors.New("openalex: response body is missing")
+		}
+		return resp.Body, mergeAlias, nil
 	}
-	switch {
-	case resp.StatusCode == http.StatusNotFound:
-		closeBody()
-		return nil, nil
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		closeBody()
-		return nil, errors.New("openalex: request was rejected (check polite-pool contact and API credentials)")
-	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests:
-		closeBody()
-		return nil, temporaryStatus("openalex", resp)
-	case resp.StatusCode >= 500 && resp.StatusCode <= 599:
-		closeBody()
-		return nil, temporaryStatus("openalex", resp)
-	case resp.StatusCode < 200 || resp.StatusCode > 299:
-		closeBody()
-		return nil, fmt.Errorf("openalex: unexpected HTTP status %d", resp.StatusCode)
-	}
-	if resp.Body == nil {
-		return nil, errors.New("openalex: response body is missing")
-	}
-	return resp.Body, nil
+	return nil, entityMergeAlias{}, errors.New("openalex: entity redirect depth exceeded")
 }
 
 // maxSiblingCandidates bounds how many OA sibling versions one hop may emit.
@@ -343,12 +365,19 @@ const maxSiblingCandidates = 3
 
 // ResolveSiblings finds open-access sibling versions (preprints, repository
 // copies under a different DOI) of a work whose canonical identifier yielded
-// no OA candidates. At most one OpenAlex request (the title search); the
-// canonical record, when needed for matching, is reused from a preceding
-// same-DOI Resolve call (TTL-fresh) or falls back to the requested work's own
-// metadata — never fetched here. With neither, returns
-// resolver.ErrNoSearchBasis without any request.
+// no OA candidates. It is gated by Options.SiblingTitleSearch, off by default
+// after measurement against the operator's own history (≥138 credits per
+// accepted artifact even under the most generous attribution). When enabled,
+// at most one OpenAlex request (the title search); the canonical record, when
+// needed for matching, is reused from a preceding same-DOI Resolve call
+// (TTL-fresh) or falls back to the requested work's own metadata — never
+// fetched here. With neither, returns resolver.ErrNoSearchBasis without any
+// request. When gated off it returns ErrNoSearchBasis without any request
+// regardless of basis availability.
 func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]resolver.Candidate, error) {
+	if !r.siblingTitleSearch {
+		return nil, resolver.ErrNoSearchBasis
+	}
 	if r.client == nil || r.email == "" {
 		return nil, nil
 	}
@@ -399,7 +428,7 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 	if err != nil || lookup == "" {
 		return nil, err
 	}
-	body, err := r.fetch(ctx, endpoint)
+	body, _, err := r.fetch(ctx, endpoint, anon)
 	if err != nil || body == nil {
 		return nil, err
 	}
@@ -449,7 +478,7 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 			Source: "openalex", URL: candidateURL, Landing: landingURL(location),
 			Version: mapVersion(location.Version), AccessBasis: resolver.AccessOpen,
 			ReuseLicense: reuseLicense(location.License), ExpectedMIME: expectedMIME(direct),
-			Direct: direct, IdentityConfidence: 0.6, ResolvedWork: resolved,
+			Direct: direct, IdentityConfidence: 0.6, ResolvedWork: resolved, Authority: resolver.AuthorityTypedRelation,
 			Evidence: []string{
 				"openalex lookup=sibling",
 				"openalex sibling_of=" + safeEvidenceValue(canonicalDOI),

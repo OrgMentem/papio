@@ -226,3 +226,66 @@ func TestSecureHTTPClientWithPOSTRefusesRedirectWithoutReplay(t *testing.T) {
 		t.Fatalf("round trips = %d, want 1", calls)
 	}
 }
+
+func TestSecureHTTPClientNoRedirectReturns301(t *testing.T) {
+	calls := 0
+	client, err := NewSecureHTTPClientNoRedirect(metadataPolicy(), publicTestResolver{}, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusMovedPermanently,
+			Header:     http.Header{"Location": {"https://other.test/final"}},
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://example.test/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(resp)
+	if resp.StatusCode != http.StatusMovedPermanently {
+		t.Fatalf("status = %d, want 301", resp.StatusCode)
+	}
+	if calls != 1 {
+		t.Fatalf("round trips = %d, want 1", calls)
+	}
+}
+
+func TestSecureHTTPClientFollowsRedirect(t *testing.T) {
+	calls := 0
+	client, err := NewSecureHTTPClient(metadataPolicy(), publicTestResolver{}, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": {"https://other.test/final"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), ContentLength: 2}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://example.test/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if calls != 2 {
+		t.Fatalf("round trips = %d, want 2", calls)
+	}
+}

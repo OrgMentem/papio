@@ -22,17 +22,44 @@ import (
 	"papio/internal/store"
 )
 
-// ErrExceeded means the configured monthly source budget would be crossed.
+// ErrExceeded is the single typed local-budget refusal. It carries the unit, the
+// window and the reset that actually applies, so a caller can park truthfully.
 type ErrExceeded struct {
 	Source   string
 	Identity string
-	Spent    float64
-	Limit    float64
-	Attempt  float64
+	Kind     BudgetKind
+	Window   Window
+	Until    time.Time // zero when Window is WindowSticky: no timed reopen
+
+	// Legacy monthly-USD fields retained for Error() and existing diagnostics.
+	Spent   float64
+	Limit   float64
+	Attempt float64
+
+	// Credit fuse diagnostics (KindCredits).
+	Committed int
 }
 
 func (e *ErrExceeded) Error() string {
-	return fmt.Sprintf("source %s (%s) monthly budget exceeded: spent $%.2f + request $%.2f > limit $%.2f", e.Source, e.Identity, e.Spent, e.Attempt, e.Limit)
+	switch e.Kind {
+	case KindCredits:
+		if e.Window == WindowSticky {
+			return fmt.Sprintf("source %s (%s) egress closed: %s budget", e.Source, e.Identity, e.Window)
+		}
+		until := "next UTC day"
+		if !e.Until.IsZero() {
+			until = e.Until.UTC().Format(time.RFC3339)
+		}
+		return fmt.Sprintf("source %s (%s) daily credit budget exceeded: committed %d + request %d > limit %d; until %s",
+			e.Source, e.Identity, e.Committed, int(e.Attempt), int(e.Limit), until)
+	default:
+		until := e.Until.UTC().Format(time.RFC3339)
+		if e.Until.IsZero() {
+			until = nextUTCMonth(time.Now().UTC()).Format(time.RFC3339)
+		}
+		return fmt.Sprintf("source %s (%s) monthly budget exceeded: spent $%.2f + request $%.2f > limit $%.2f; until %s",
+			e.Source, e.Identity, e.Spent, e.Attempt, e.Limit, until)
+	}
 }
 
 // MaxInlineWait bounds how long Acquire will block a caller on the durable
@@ -110,6 +137,12 @@ type Manager struct {
 	// which the provider does meter per credential.
 	limiters map[string]*tokenBucket
 	now      func() time.Time
+
+	creditPolicy func(source string) CreditPolicy
+
+	latchMu      sync.Mutex
+	quotaLatches map[string]quotaLatch
+	driftLatches map[string]driftLatch
 }
 
 type tokenBucket struct {
@@ -163,6 +196,13 @@ func identityFor(policy config.Source) string {
 	}
 	sum := sha256.Sum256([]byte(key))
 	return "key-" + hex.EncodeToString(sum[:8])
+}
+
+// IdentityFor names the provider account a call is made under. Wire-level
+// egress authority uses this on the outgoing credential, not construction-time
+// policy defaults.
+func IdentityFor(policy config.Source) string {
+	return identityFor(policy)
 }
 
 // Acquire waits for Retry-After and the in-memory token bucket, then atomically
@@ -508,7 +548,12 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 		window, requests, spent = month, 0, 0
 	}
 	if limit > 0 && spent+cost > limit+1e-9 {
-		return &ErrExceeded{Source: source, Identity: identity, Spent: spent, Limit: limit, Attempt: cost}
+		return &ErrExceeded{
+			Source: source, Identity: identity,
+			Kind: KindUSD, Window: WindowMonth,
+			Until: nextUTCMonth(now),
+			Spent: spent, Limit: limit, Attempt: cost,
+		}
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE source_budgets
 		SET window_start = ?, requests_in_window = ?, spent_usd = ?,

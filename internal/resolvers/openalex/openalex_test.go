@@ -77,8 +77,14 @@ func TestResolveVectors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := clientFunc(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Query().Get("mailto") != "contact@example.org" || req.URL.Query().Get("api_key") != "private-key" {
-					t.Fatalf("polite-pool credentials missing")
+				if req.URL.Query().Get("mailto") != "contact@example.org" {
+					t.Fatalf("polite-pool mailto missing")
+				}
+				if req.URL.Query().Get("api_key") != "" {
+					t.Fatalf("api_key must not be sent in the query")
+				}
+				if req.Header.Get("Authorization") != "Bearer private-key" {
+					t.Fatalf("Authorization bearer missing")
 				}
 				// Every works lookup — singleton GET as well as search — bounds
 				// the response to the fields this adapter reads.

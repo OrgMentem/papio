@@ -600,6 +600,7 @@ func TestProcessReadyEnrichesMetadataAndNeverPersistsSecrets(t *testing.T) {
 		ResolvedWork:   work.Work{DOI: "10.1002/example", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024},
 		Version:        resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "cc-by-4.0",
 		ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
+		Authority: resolver.AuthorityExactEcho,
 	}}}
 	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
 	fetches := 0
@@ -648,6 +649,52 @@ func TestProcessReadyEnrichesMetadataAndNeverPersistsSecrets(t *testing.T) {
 	encoded, _ := json.Marshal(events)
 	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "Authorization") {
 		t.Fatalf("event stream leaked ephemeral headers/query: %s", encoded)
+	}
+}
+
+func TestProcessReadyDoesNotEnrichFromSearchAuthority(t *testing.T) {
+	svc, jobs := newTestService(t)
+	// Same DOI request as TestProcessReadyEnrichesMetadataAndNeverPersistsSecrets,
+	// but the candidate carries the default AuthoritySearch (zero value).
+	// Search/routing evidence may create candidates but must not mutate
+	// canonical identity metadata before artifact validation — so the artifact
+	// still reaches ready while Work.Title/Year/Authors stay as-submitted.
+	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://example.test/paper.pdf",
+		ResolvedWork: work.Work{DOI: "10.1002/example", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024},
+		Version:      resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "cc-by-4.0",
+		ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
+		// Authority omitted: AuthoritySearch (zero value) must not promote.
+	}}}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = fakeDownload(&fetches)
+	svc.Validate = passValidation()
+
+	id, err := svc.Submit(context.Background(), doiRequest("wr_ready_search_auth_0001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(context.Background(), "worker", time.Minute)
+	if err != nil || row == nil || row.ID != id {
+		t.Fatalf("claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	ready, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.State != job.StateReady || ready.ArtifactSHA256 == "" || ready.SelectedCandidateID == 0 {
+		t.Fatalf("ready row = %+v", ready)
+	}
+	if ready.Work.Title != "" || len(ready.Work.Authors) != 0 || ready.Work.Year != 0 {
+		t.Fatalf("search-authority candidate must not promote metadata: %+v", ready.Work)
+	}
+	artifact, err := jobs.GetArtifact(context.Background(), ready.ArtifactSHA256)
+	if err != nil || artifact == nil || artifact.IdentityResult != pdf.IdentityPass {
+		t.Fatalf("pass artifact = %+v, %v", artifact, err)
 	}
 }
 

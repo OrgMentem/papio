@@ -355,13 +355,15 @@ ceiling. Each named section accepts these keys:
 | `api_key` | string | empty | Credential or token for a source that requires one. Doctor requires it for enabled `openalex`, `core`, and `crossref_tdm`; enabled OpenAlex also needs `email`. |
 | `rate_per_sec` | number | source-specific; see below | Per-source request-rate budget. |
 | `burst` | integer | source-specific; see below | Per-source burst budget. |
-| `max_cost_usd` | number | `0` | Monthly budget for paid sources. |
+| `max_cost_usd` | number | `0` | Monthly budget for paid sources. `0` means unmetered. |
+| `daily_credit_fraction` | number | `0` (OpenAlex default `0.5`) | Fraction of the provider's observed daily credit limit the daemon may spend before the daily fuse parks the identity. Must be in `[0,1]`. OpenAlex ships `0.5` in built-in defaults; other sources default to `0` until a fuse adopts them. |
+| `daily_credit_limit` | integer credits | `0` | Absolute operator override and hard maximum for the daily credit fuse; the fraction may never exceed this cap. `0` means no absolute ceiling (unmetered allowance from the observed limit × fraction). The egress debit still happens when metering is active. |
+| `sibling_title_search` | boolean | `false` | OpenAlex fuzzy sibling title search — a 10-credit `search=` query that looks for an open-access copy of a paywalled work under a different DOI. Off by default: measured against the operator's own history it cost **≥138 credits per accepted artifact** even under the most generous possible attribution (all 317 accepted artifacts attributed to 3,150 sibling-hop searches). When off, the hop makes no request at all and reports that it made none. Set `true` under `[sources.openalex]` to turn it back on. |
+| `allow_keep_alives` | boolean | `false` | When `false` (default), metadata transports open one connection per request — no HTTP keep-alive reuse, the replay-hygiene posture. Set `true` only with evidence that a high-rate source needs reuse; it is an opt-out of the safe default and requires per-source policy justification. HTTP/1-only negotiation is not configurable. |
 | `base_url_for_dev` | string URL | empty | Test/development endpoint override. If set, it must start with `http://127.0.0.1` or `http://localhost`; do not use it for a remote production endpoint. |
-
 ### Built-in source defaults
 
 | Source name | `enabled` | `rate_per_sec` | `burst` |
-| --- | ---: | ---: | ---: |
 | `arxiv` | `true` | 1 | 1 |
 | `europepmc` | `true` | 2 | 2 |
 | `unpaywall` | `true` | 1 | 1 |

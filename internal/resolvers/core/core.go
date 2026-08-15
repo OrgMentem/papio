@@ -210,14 +210,14 @@ func (r *Resolver) candidates(records []record, requested work.Work, requestedDO
 		recordDOI := canonicalDOI(record.DOI)
 		match := ""
 		confidence := 0.0
+		authority := resolver.AuthoritySearch
 		switch {
 		case requestedDOI != "":
-			// A DOI-bearing request can only emit an exact DOI match. Title
-			// fallback helps locate that record; it cannot relax identity.
 			if recordDOI != requestedDOI {
 				continue
 			}
 			match, confidence = "doi_match", 1
+			authority = resolver.AuthorityExactEcho
 		case titleSearch && matchesTitleSearch(record.Title, record.authorNames(), record.publicationYear(), requested):
 			match, confidence = "title_match", 0.8
 		default:
@@ -247,6 +247,7 @@ func (r *Resolver) candidates(records []record, requested work.Work, requestedDO
 				ResolvedWork:       record.resolvedWork(),
 				Direct:             true,
 				IdentityConfidence: confidence,
+				Authority:          authority,
 				Evidence:           []string{"core " + match},
 			})
 		}

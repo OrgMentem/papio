@@ -209,6 +209,7 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 			ExpectedMIME:       mime,
 			Direct:             direct,
 			IdentityConfidence: 1,
+			Authority:          resolver.AuthorityExactEcho,
 			ResolvedWork:       resolved,
 			Evidence: []string{
 				"openaire lookup=" + pid.evidence,

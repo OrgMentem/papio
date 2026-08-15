@@ -192,6 +192,7 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		ResolvedWork:       resolvedWork(base, entry),
 		Direct:             true,
 		IdentityConfidence: 0.98, // exact match on a canonical arXiv identifier
+		Authority:          resolver.AuthorityExactEcho,
 		Evidence:           evidence,
 	}
 	if err := resolver.ValidateCandidate(candidate); err != nil {

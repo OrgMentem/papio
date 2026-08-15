@@ -34,6 +34,7 @@ var knownTerminalReasons = []job.TerminalReason{
 	job.TerminalReasonBrowserCancelled,
 	job.TerminalReasonUserDismissed,
 	job.TerminalReasonReviewRejected,
+	job.TerminalReasonInsufficientIdentityEvidence,
 }
 
 func TestClassifyCoversEveryDeclaredTerminalReason(t *testing.T) {

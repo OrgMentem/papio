@@ -116,7 +116,7 @@ So the remaining exposure is not an unbounded loop; it is a legal, terminating
 workload buying a 10-credit operation that fails 97.7% of the time, with no
 aggregate ceiling of any kind.
 
-## 0. In parallel: estimate the yield of the thing we are budgeting
+## 0. In parallel: estimate the yield of the thing we are budgeting — measured 2026-08-16, hop now opt-in
 
 This **does not gate items 1–2** — a post-commit review of the shipped code
 established that the egress boundary and the fuse are the missing crash and
@@ -136,6 +136,29 @@ accepted artifacts attributable to OpenAlex title.search
 The 2.3% is a *result* rate; what matters is the *acquisition* rate — how many
 of those 73 hits produced a validated, imported PDF nothing else would have
 found.
+
+**Reported 2026-08-16 against the operator's own history:**
+
+```
+numerator (sibling-hop-attributed accepted artifacts): 8
+denominator (title.search credits spent):              43810
+sibling-hop searches: 3150 (31500 credits); enrichment searches: 1231 (12310 credits)
+accepted artifacts in window (ALL sources): 317
+lossiness: 3149 sibling_search events lost to the post-wire write window
+```
+
+The point estimate is 8 / 43810 ≈ 0.018% — severely lossy in the numerator
+and not decision-grade as a point estimate. The denominator and the 317
+accepted-artifact total are not lossy, and together they bound the answer:
+even if *every* one of the 317 accepted artifacts had come from an OpenAlex
+title search, the hop would still have cost ≥138 credits per accepted artifact
+(43810 / 317). Against a 10,000-credit keyed day and a 1,000-credit keyless
+day, that is not worth its cost in the current query shape. The hop therefore
+became **opt-in, default off** (`[sources.openalex].sibling_title_search = false`); the paid
+three-shape comparison (`search=` × `per_page`, `title.search` scoped) stays
+available for the operator to authorise later — it spends real credits, so it
+is the operator's call. Do not "improve" yield by loosening the acceptance
+predicate.
 
 **Treat the number as a lower-bound estimate, not a computation.** Two reasons,
 both structural: `job.sibling_search` is written post-wire and is lossy under
@@ -159,11 +182,11 @@ Same cost per call in every case, since pricing is per request and not per row.
 **Do not "improve" yield by loosening the acceptance predicate** — that trades the
 worst outcome *papio* has (item 5) for a metric.
 
-**Consequence for item 7:** item 0 gates nothing for the fuse or for item 5, but
-it *does* gate item 7. Item 7's ternary-basis and re-earn protocol exists to make
-the sibling hop correctly available and memoized; if the measurement says the hop
-should be deleted, building that protocol first is pure sunk cost. Sequence item 7
-after item 0 reports, not before.
+**Consequence for item 7:** item 0 reported and the hop is now opt-in, default
+off — building the memo/ternary-basis protocol first is pure sunk cost.
+Sequence item 7 after item 0, and do not build item 7 while the hop is gated
+off. The design below is kept intact because it is correct and cheap to revive
+if the paid comparison rehabilitates the hop.
 
 ## 1+2. One egress authority: commit the credit at the wire, or do not go
 
@@ -833,7 +856,17 @@ reset via `InsertCandidates`' inserted-row count, a separate
 mandatory regression that crossing the ceiling must **not** make `atBoundary`
 true) is in git history at the third rewrite of this file.
 
-## 7. Derive the effective basis explicitly, before novelty gating
+## 7. Derive the effective basis explicitly, before novelty gating — **Not built: hop is opt-in, default off**
+
+> Item 0 reported 2026-08-16: the fuzzy sibling hop is now gated off by default
+> (`[sources.openalex].sibling_title_search = false`) because it was measured at
+> ≥138 credits per accepted artifact even under the most generous possible
+> attribution — and plainly did not produce all attributed artifacts. The only
+> thing that could rehabilitate it is the paid three-shape comparison, which
+> spends real credits and is the operator's call. Building the memo protocol
+> first is pure sunk cost. **Do not build this section while the hop is gated
+> off.** The design below is correct and cheap to revive if that comparison
+> succeeds; it is preserved intact and unsimplified.
 
 Two problems, one abstraction. The first is availability: a DOI-only job whose own
 metadata carries no usable basis cannot search for siblings when the memo has
@@ -931,7 +964,9 @@ folded there rather than kept as a separate narrower rule.
 ## Ordering
 
 **`(0 estimate ‖ 5 evidence authority)` alongside `(1+2 egress authority)` → 3
-truthful park → 7 effective basis, *if item 0 says the sibling hop survives*.**
+truthful park.** Item 7 is not scheduled: item 0 reported and the hop is now
+opt-in, default off, so building the ternary-basis/memo protocol is sunk cost
+until and unless the paid three-shape comparison rehabilitates it.
 Then, deferred with reasons written down: **4 jitter** (operational smoothing, not
 an invariant) and **6 per-job guard** (fairness, capped in aggregate by the fuse).
 
@@ -946,12 +981,12 @@ recoverable by upgrading. Enforcement must therefore not be enabled in any relea
 binary until the typed refusal has its durable park semantics, which is the same
 rule as "visibility ships with enforcement", one layer earlier.
 
-Item 0 gates nothing else — not the fuse, not item 5 — but it does gate item 7,
-which exists solely to make the sibling hop correctly available and memoized.
-Measuring the query shape (`search=` vs a title-scoped filter, `per_page` 10 vs
-100) is part of item 0, not a separate task: the current 2.3% is the yield of one
-truncated broad query, so the hop could be worth keeping *or* worth deleting and
-the measurement cannot tell you which until the shape is controlled for.
+Item 0 gated item 7 and has now reported: the hop is opt-in, default off,
+so item 7 is not built — see its header. Item 0 gates nothing else — not the
+fuse, not item 5. Measuring the query shape (`search=` vs a title-scoped filter,
+`per_page` 10 vs 100) remains the only thing that could rehabilitate the hop,
+but it spends real credits and is the operator's call, so it is not scheduled
+here.
 
 Within item 1+2 the shortest correct path is: **build the guarded one-hop request
 primitive → define, freeze and clamp the relative denominator → express `Wold →
@@ -973,9 +1008,9 @@ nothing. Items 1+2 are one boundary and one migration, and the newly found
 `sourcegate.Client` quota bypass belongs **inside** that item — the shipped
 `Acquire` fix closes it at admission, but only the egress authority closes the
 TOCTOU window behind it. Item 5 is the only failure mode here that cannot be
-undone and must not queue behind spend work. Item 7 needs the effective-basis
-correction and its ternary result before implementation, and is cheapest once 1+2
-has settled how admission is expressed, because it may need two admissions per hop.
+undone and must not queue behind spend work. Item 7's effective-basis correction and ternary result stay as designed and are
+cheapest once 1+2 has settled how admission is expressed (it may need two
+admissions per hop) — but item 7 is not scheduled while the hop is gated off.
 
 Each migration means daemon and CLI deploy together (`make dev-deploy`), which on
 this machine means both *papio* binaries plus the native-host symlink.

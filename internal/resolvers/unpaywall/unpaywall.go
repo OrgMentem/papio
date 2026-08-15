@@ -165,6 +165,7 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		ExpectedMIME:       expectedMIME(candidateURL, direct),
 		Direct:             direct,
 		IdentityConfidence: 1,
+		Authority:          resolver.AuthorityExactEcho,
 		ResolvedWork:       resolvedWork(record),
 		Evidence: []string{
 			"unpaywall location=" + source,

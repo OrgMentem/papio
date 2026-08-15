@@ -35,6 +35,21 @@ const (
 	AccessManual        = "manual"
 )
 
+// EvidenceAuthority names how strongly a candidate's own metadata is tied to
+// the submitted canonical work. The zero value is the weakest, so an untagged
+// resolver can create candidates and never promote identity.
+type EvidenceAuthority string
+
+const (
+	AuthoritySearch        EvidenceAuthority = ""               // search/routing evidence: candidates only
+	AuthorityTypedRelation EvidenceAuthority = "typed_relation" // a typed edge to a different work
+	AuthorityExactEcho     EvidenceAuthority = "exact_echo"     // response echoes a requested identifier
+)
+
+// MayPromoteIdentity reports whether this authority class may mutate canonical
+// identity metadata before artifact validation.
+func (a EvidenceAuthority) MayPromoteIdentity() bool { return a == AuthorityExactEcho }
+
 // Candidate is one acquisition option for a work. URL may be bearer-signed and
 // MUST NOT be persisted or logged; use Redacted()/Key() for durable forms.
 type Candidate struct {
@@ -55,6 +70,10 @@ type Candidate struct {
 	Direct             bool    // a direct file URL rather than a landing page
 	IdentityConfidence float64 // 0..1 resolver-side confidence
 	Evidence           []string
+	// Authority names how strongly this candidate's metadata is tied to the
+	// submitted canonical work. The zero value (AuthoritySearch) is fail-closed:
+	// an untagged or search-derived candidate never promotes identity.
+	Authority EvidenceAuthority
 }
 
 // Key is a stable dedupe key for the candidate URL (hash, not the URL itself).

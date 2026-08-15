@@ -310,6 +310,7 @@ func (r *Resolver) candidates(payload response, requestedDOI string) []resolver.
 			ResolvedWork:       metadata.resolvedWork(),
 			Direct:             true,
 			IdentityConfidence: 1,
+			Authority:          resolver.AuthorityExactEcho,
 			Evidence:           []string{"crossref tdm DOI match; PDF link metadata"},
 		})
 	}

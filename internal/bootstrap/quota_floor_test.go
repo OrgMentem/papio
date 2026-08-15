@@ -58,11 +58,11 @@ func TestQuotaAwareReserverHonorsFloor(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := &countingInner{}
-	gated, err := sourcegate.New(quotaAwareReserver{budgets}, config.SourceOpenAlex, keyed, 0, inner)
+	stack, err := sourcegate.WrapOpenAlex(budgets, budgets, config.SourceOpenAlex, keyed, inner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = gated.Do(floorRequest(t, "https://api.openalex.org/works?api_key=private-key"))
+	_, err = stack.Do(floorRequest(t, "https://api.openalex.org/works?api_key=private-key"))
 	var deferred *budget.ErrDeferred
 	if !errors.As(err, &deferred) {
 		t.Fatalf("err = %v, want *budget.ErrDeferred from the quota floor", err)
@@ -152,7 +152,7 @@ func TestOpenAlexEnricherClientIsObserved(t *testing.T) {
 	}
 	// reflect cannot hand back a value read from an unexported field, so compare
 	// the interface's dynamic type instead.
-	if got := client.Elem().Type(); got != reflect.TypeFor[*sourcegate.Observer]() {
-		t.Fatalf("enricher client = %s, want *sourcegate.Observer", got)
+	if got := client.Elem().Type(); got != reflect.TypeFor[*sourcegate.GuardedClient]() {
+		t.Fatalf("enricher client = %s, want *sourcegate.GuardedClient", got)
 	}
 }

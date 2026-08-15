@@ -75,7 +75,12 @@ func Classify(state string, terminal job.TerminalReason, humanEpisodes int) (Rep
 			job.TerminalReasonDocumentDeliveryAvailable,
 			job.TerminalReasonCancelledByUser,
 			job.TerminalReasonBrowserCancelled,
-			job.TerminalReasonUserDismissed:
+			job.TerminalReasonUserDismissed,
+			// InsufficientIdentityEvidence is an honest "cannot verify from
+			// candidate-derived facts alone" outcome — it reports that a
+			// title-only anchor lacks independent authority, not a human
+			// review rejection, so it belongs with HonestUnavailable.
+			job.TerminalReasonInsufficientIdentityEvidence:
 			return ClassHonestUnavailable, nil
 		default:
 			return "", fmt.Errorf("bench: unrecognized terminal reason %q for state %q — classify.go's mapping must cover every job.TerminalReason", terminal, state)

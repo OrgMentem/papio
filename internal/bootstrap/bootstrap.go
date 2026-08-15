@@ -171,7 +171,13 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		MaxPerHost: cfg.Captures.MaxPerHost,
 		MaxAge:     time.Duration(cfg.Captures.MaxAgeDays) * 24 * time.Hour,
 	})
-	budgets := budget.New(db)
+	budgets := budget.New(db, budget.WithCreditPolicy(func(source string) budget.CreditPolicy {
+		p := cfg.SourcePolicy(source)
+		return budget.CreditPolicy{
+			DailyCreditFraction: p.DailyCreditFraction,
+			DailyCreditLimit:    p.DailyCreditLimit,
+		}
+	}))
 
 	artifactPolicy := fetch.DefaultPolicy()
 	artifactPolicy.MaxBytes = cfg.Fetch.MaxBytes
@@ -185,7 +191,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	metadataPolicy := artifactPolicy
 	metadataPolicy.MaxBytes = 8 << 20
 	metadataPolicy.MaxRedirects = 3
-	metadataClient, err := fetch.NewSecureHTTPClient(metadataPolicy, nil, http.DefaultTransport)
+	metadataClient, err := fetch.NewSecureHTTPClient(metadataPolicy, nil, fetch.MetadataTransport(metadataDisableKeepAlives(cfg)))
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +307,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		openAlexEnricher := enrich.NewOpenAlexWithOptions(enrich.OpenAlexOptions{
 			// Same daily budget as the resolver and discovery paths, so the
 			// enricher's own responses must feed the header-derived floor too.
-			Client:       mustObserver(sourcegate.NewObserver(budgets, config.SourceOpenAlex, cfg.SourcePolicy(config.SourceOpenAlex), metadataClient)),
+			Client:       mustOpenAlexClient(budgets, cfg, metadataClient),
 			ContactEmail: cfg.Email,
 			APIKey:       cfg.Sources[config.SourceOpenAlex].APIKey,
 			BaseURL:      cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
@@ -478,40 +484,48 @@ func (s *System) DoctorReport(ctx context.Context) doctor.Report {
 	return doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery)
 }
 
-// mustObserver panics on an observer wiring error, like the rest of the
-// startup wiring in this function: a provider client that silently loses its
-// quota-header observer is exactly the invisible-spend defect sourcegate
-// exists to prevent.
-func mustObserver(o *sourcegate.Observer, err error) *sourcegate.Observer {
+// metadataDisableKeepAlives aggregates every configured source's keep-alive
+// policy for the one shared metadata HTTP client. Any source that opts into
+// reuse disables keep-alive suppression for the shared transport.
+func metadataDisableKeepAlives(cfg config.Config) bool {
+	for name := range cfg.Sources {
+		if !cfg.SourcePolicy(name).DisableKeepAlives() {
+			return false
+		}
+	}
+	return true
+}
+
+// mustOpenAlexClient is the OpenAlex metadata HTTP stack: replay-bounded
+// transport, no in-client redirect following, and quota-header observation.
+// Admission still happens at app.go AcquireAny sites — not in sourcegate.Client.
+func mustOpenAlexClient(budgets *budget.Manager, cfg config.Config, _ *fetch.SecureHTTPClient) sourcegate.HTTPClient {
+	policy := cfg.SourcePolicy(config.SourceOpenAlex)
+	transport := fetch.MetadataTransport(policy.DisableKeepAlives())
+	metaPolicy := fetch.DefaultPolicy()
+	metaPolicy.MaxBytes = 8 << 20
+	inner, err := fetch.NewSecureHTTPClientNoRedirect(metaPolicy, nil, transport)
 	if err != nil {
 		panic(err)
 	}
-	return o
-}
-
-// quotaAwareReserver refuses admission at the "<source>_quota" floor
-// sourcegate.Observer writes, without granting a fallback identity — Discovery
-// stays keyed-only by design; it reuses budget.AcquireAny with a
-// single-element policy list.
-type quotaAwareReserver struct{ budgets *budget.Manager }
-
-func (r quotaAwareReserver) Acquire(ctx context.Context, source string, policy config.Source, cost float64) error {
-	_, err := r.budgets.AcquireAny(ctx, source, []config.Source{policy}, cost)
-	return err
+	client, err := sourcegate.WrapOpenAlex(budgets, budgets, config.SourceOpenAlex, policy, inner)
+	if err != nil {
+		panic(err)
+	}
+	return client
 }
 
 // resolverEntries builds the acquisition resolver chain. The OpenAlex adapter
 // is the one client that reads its own daily-budget headers: budgets is needed
-// for the sourcegate.Observer that turns them into a durable floor. The entry
-// is deliberately NOT wrapped in sourcegate.Client — admission already happens
-// at the app.go call sites through AcquireAny, and a second wrapper would
-// reserve a token per request twice.
+// for the OpenAlex egress stack (GuardedClient → Observer). The entry is
+// deliberately NOT wrapped in sourcegate.Client — admission already happens at
+// the app.go AcquireAny sites, and a second wrapper would reserve twice.
 func resolverEntries(cfg config.Config, budgets *budget.Manager, client *fetch.SecureHTTPClient) []app.ResolverEntry {
 	return []app.ResolverEntry{
 		{Adapter: arxiv.NewWithOptions(arxiv.Options{Client: client, BaseURL: cfg.Sources[config.SourceArXiv].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceArXiv)},
 		{Adapter: europepmc.NewWithOptions(europepmc.Options{Client: client, BaseURL: cfg.Sources[config.SourceEuropePMC].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceEuropePMC)},
 		{Adapter: unpaywall.NewWithOptions(unpaywall.Options{Client: client, ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceUnpaywall].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceUnpaywall)},
-		{Adapter: openalex.NewWithOptions(openalex.Options{Client: mustObserver(sourcegate.NewObserver(budgets, config.SourceOpenAlex, cfg.SourcePolicy(config.SourceOpenAlex), client)), ContactEmail: cfg.Email, APIKey: cfg.Sources[config.SourceOpenAlex].APIKey, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceOpenAlex)},
+		{Adapter: openalex.NewWithOptions(openalex.Options{Client: mustOpenAlexClient(budgets, cfg, client), ContactEmail: cfg.Email, APIKey: cfg.Sources[config.SourceOpenAlex].APIKey, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev, SiblingTitleSearch: cfg.Sources[config.SourceOpenAlex].SiblingTitleSearch}), Policy: cfg.SourcePolicy(config.SourceOpenAlex)},
 		{Adapter: semanticscholar.NewWithOptions(semanticscholar.Options{Client: client, APIKey: cfg.Sources[config.SourceSemanticScholar].APIKey, BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceSemanticScholar)},
 		{Adapter: coreresolver.NewWithOptions(coreresolver.Options{Client: client, APIKey: cfg.Sources[config.SourceCORE].APIKey, BaseURL: cfg.Sources[config.SourceCORE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCORE)},
 		{Adapter: crossreftdm.NewWithOptions(crossreftdm.Options{Client: client, APIKey: cfg.Sources[config.SourceCrossrefTDM].APIKey, BaseURL: cfg.Sources[config.SourceCrossrefTDM].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCrossrefTDM)},
@@ -551,13 +565,18 @@ func discoverySources(cfg config.Config, budgets *budget.Manager, client sourceg
 		// enrichment paths, so discovery must refuse admission at the same
 		// header-derived floor and observe the headers itself. It gains no
 		// fallback identity: that stays out of scope for discovery.
-		reserver := sourcegate.Reserver(budgets)
-		inner := client
+		var gated sourcegate.HTTPClient
+		var err error
 		if name == config.SourceOpenAlex {
-			reserver = quotaAwareReserver{budgets}
-			inner = mustObserver(sourcegate.NewObserver(budgets, name, cfg.SourcePolicy(name), client))
+			// OpenAlex discovery: wire-derived identity authority at GuardedClient;
+			// sourcegate.Client's construction-time policy is removed so it cannot
+			// pre-empt the keyed identity CommitEgress derives from the request.
+			// Identity-agnostic pacing sits outside the guarded stack.
+			stack := mustOpenAlexClient(budgets, cfg, nil)
+			gated, err = sourcegate.NewPacingOnly(budgets, name, discoveryPolicy(cfg, name), 0, stack)
+		} else {
+			gated, err = sourcegate.New(budgets, name, discoveryPolicy(cfg, name), 0, client)
 		}
-		gated, err := sourcegate.New(reserver, name, discoveryPolicy(cfg, name), 0, inner)
 		if err != nil {
 			return nil, err
 		}

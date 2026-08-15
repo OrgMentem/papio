@@ -1,4 +1,4 @@
-.PHONY: build test vet identity-corpus docs-gen docs-build docs-serve ext-bump hooks dev-deploy store-assets
+.PHONY: build test vet identity-corpus openalex-yield docs-gen docs-build docs-serve ext-bump hooks dev-deploy store-assets
 
 build:
 	go build ./...
@@ -16,6 +16,15 @@ vet:
 # dev/identity-corpus.md. Output names your own library — never commit a run.
 identity-corpus:
 	go run ./cmd/identity-corpus
+
+# Measure the yield of OpenAlex's title.search query shape against your own
+# papio store: accepted artifacts attributable to a title search, per
+# title.search credit spent. Free, read-only, no provider requests — see
+# dev/openalex-yield.md. Pass -compare -confirm-spend to ALSO run the paid
+# three-shape comparison (spends real OpenAlex credits; refuses without
+# -confirm-spend). Output names your own library — never commit a run.
+openalex-yield:
+	go run ./cmd/openalexyield
 
 # Regenerate the code-generated reference page (docs/reference/commands.md) from
 # the cobra command tree. Drift-gated in CI — run after any command/flag change.

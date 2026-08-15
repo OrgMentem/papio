@@ -415,6 +415,12 @@ func TestBooleanConfigDefaultsAndToggles(t *testing.T) {
 			wantDefault: false,
 			toml:        "access_mode='conservative'\n[updates]\ncheck=true\n",
 		},
+		{
+			name:        "openalex sibling_title_search defaults off and loads true",
+			get:         func(c Config) bool { return c.Sources[SourceOpenAlex].SiblingTitleSearch },
+			wantDefault: false,
+			toml:        "access_mode='conservative'\n[sources.openalex]\nsibling_title_search=true\n",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

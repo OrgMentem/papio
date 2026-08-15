@@ -31,14 +31,19 @@ type Resolver interface {
 type requestSchemeKey struct{}
 
 type Downloader struct {
-	policy    Policy
-	resolver  Resolver
-	transport http.RoundTripper
+	policy          Policy
+	resolver        Resolver
+	transport       http.RoundTripper
+	followRedirects bool
 }
 
 // New constructs a bounded downloader. A nil resolver uses net.DefaultResolver
 // and a nil transport uses a private clone of http.DefaultTransport.
 func New(policy Policy, resolver Resolver, transport http.RoundTripper) (*Downloader, error) {
+	return newDownloader(policy, resolver, transport, true)
+}
+
+func newDownloader(policy Policy, resolver Resolver, transport http.RoundTripper, followRedirects bool) (*Downloader, error) {
 	if policy.HeaderTimeout == 0 {
 		policy.HeaderTimeout = policy.Timeout
 	}
@@ -54,7 +59,7 @@ func New(policy Policy, resolver Resolver, transport http.RoundTripper) (*Downlo
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	d := &Downloader{policy: policy, resolver: resolver}
+	d := &Downloader{policy: policy, resolver: resolver, followRedirects: followRedirects}
 	d.transport = d.secureTransport(transport)
 	return d, nil
 }
@@ -134,7 +139,7 @@ func (d *Downloader) DownloadRequest(ctx context.Context, request *http.Request,
 			return Result{}, classifyRequestError(err)
 		}
 
-		if isRedirect(resp.StatusCode) {
+		if d.followRedirects && isRedirect(resp.StatusCode) {
 			location := resp.Header.Get("Location")
 			closeBody(resp)
 			if location == "" {

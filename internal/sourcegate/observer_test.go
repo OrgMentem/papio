@@ -13,6 +13,38 @@ import (
 	"papio/internal/config"
 )
 
+type fakeQuotaFloor struct {
+	*fakeDeferrer
+	latches map[string]time.Time
+	now     func() time.Time
+}
+
+func (f *fakeQuotaFloor) latchKey(source, identity string) string {
+	return source + "\x00" + identity
+}
+
+func (f *fakeQuotaFloor) LatchQuota(source, identity string, until time.Time) {
+	if f.latches == nil {
+		f.latches = make(map[string]time.Time)
+	}
+	f.latches[f.latchKey(source, identity)] = until.UTC()
+}
+
+func (f *fakeQuotaFloor) QuotaLatchedUntil(source, identity string) (time.Time, bool) {
+	if f.latches == nil {
+		return time.Time{}, false
+	}
+	until, ok := f.latches[f.latchKey(source, identity)]
+	now := observerNow
+	if f.now != nil {
+		now = f.now()
+	}
+	if !ok || !until.After(now) {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
 type deferCall struct {
 	source string
 	policy config.Source
@@ -48,16 +80,19 @@ func (c *headerClient) Do(*http.Request) (*http.Response, error) {
 
 var observerNow = time.Date(2026, 8, 15, 3, 0, 0, 0, time.UTC)
 
-func testObserver(t *testing.T, status int, headers map[string]string) (*Observer, *fakeDeferrer, *headerClient) {
+func testObserver(t *testing.T, status int, headers map[string]string) (*Observer, *fakeQuotaFloor, *headerClient) {
 	t.Helper()
 	deferrer := &fakeDeferrer{}
+	now := func() time.Time { return observerNow }
+	floor := &fakeQuotaFloor{fakeDeferrer: deferrer, now: now}
 	inner := &headerClient{status: status, headers: headers}
-	observer, err := NewObserver(deferrer, "openalex", config.Source{Enabled: true, APIKey: "private-key"}, inner)
+	observer, err := NewObserver(floor, "openalex", config.Source{Enabled: true, APIKey: "private-key"}, inner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	observer.now = func() time.Time { return observerNow }
-	return observer, deferrer, inner
+	observer.now = now
+	floor.now = now
+	return observer, floor, inner
 }
 
 func observerRequest(t *testing.T, rawURL string) *http.Request {
@@ -70,7 +105,7 @@ func observerRequest(t *testing.T, rawURL string) *http.Request {
 }
 
 func TestObserverDefersAtFloor(t *testing.T) {
-	observer, deferrer, inner := testObserver(t, http.StatusOK, map[string]string{
+	observer, floor, inner := testObserver(t, http.StatusOK, map[string]string{
 		"X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "400", "X-RateLimit-Reset": "3600",
 	})
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
@@ -79,10 +114,10 @@ func TestObserverDefersAtFloor(t *testing.T) {
 	if inner.calls != 1 {
 		t.Fatalf("inner calls = %d, want the request forwarded", inner.calls)
 	}
-	if len(deferrer.calls) != 1 {
-		t.Fatalf("Defer calls = %#v, want exactly one floor deferral", deferrer.calls)
+	if len(floor.fakeDeferrer.calls) != 1 {
+		t.Fatalf("Defer calls = %#v, want exactly one floor deferral", floor.fakeDeferrer.calls)
 	}
-	got := deferrer.calls[0]
+	got := floor.fakeDeferrer.calls[0]
 	if got.source != "openalex_quota" {
 		t.Fatalf("source = %q, want openalex_quota: only the header signal writes that row", got.source)
 	}
@@ -95,14 +130,14 @@ func TestObserverDefersAtFloor(t *testing.T) {
 }
 
 func TestObserverIgnoresHealthyRemaining(t *testing.T) {
-	observer, deferrer, _ := testObserver(t, http.StatusOK, map[string]string{
+	observer, floor, _ := testObserver(t, http.StatusOK, map[string]string{
 		"X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "9000", "X-RateLimit-Reset": "3600",
 	})
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatal(err)
 	}
-	if len(deferrer.calls) != 0 {
-		t.Fatalf("Defer calls = %#v, want none with the budget healthy", deferrer.calls)
+	if len(floor.fakeDeferrer.calls) != 0 {
+		t.Fatalf("Defer calls = %#v, want none with the budget healthy", floor.fakeDeferrer.calls)
 	}
 }
 
@@ -110,58 +145,58 @@ func TestObserverIgnoresHealthyRemaining(t *testing.T) {
 // a burst past its per-second ceiling that way. Only the daily-budget headers
 // may trigger the quota floor.
 func TestObserverIgnoresRateCeiling429(t *testing.T) {
-	observer, deferrer, _ := testObserver(t, http.StatusTooManyRequests, map[string]string{
+	observer, floor, _ := testObserver(t, http.StatusTooManyRequests, map[string]string{
 		"Retry-After": "120", "X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "9000", "X-RateLimit-Reset": "3600",
 	})
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatal(err)
 	}
-	if len(deferrer.calls) != 0 {
-		t.Fatalf("Defer calls = %#v, want none: a rate-ceiling 429 is not quota exhaustion", deferrer.calls)
+	if len(floor.fakeDeferrer.calls) != 0 {
+		t.Fatalf("Defer calls = %#v, want none: a rate-ceiling 429 is not quota exhaustion", floor.fakeDeferrer.calls)
 	}
 }
 
 func TestObserverLowRemaining429(t *testing.T) {
-	observer, deferrer, _ := testObserver(t, http.StatusTooManyRequests, map[string]string{
+	observer, floor, _ := testObserver(t, http.StatusTooManyRequests, map[string]string{
 		"Retry-After": "120", "X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "3", "X-RateLimit-Reset": "7200",
 	})
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatal(err)
 	}
-	if len(deferrer.calls) != 1 {
-		t.Fatalf("Defer calls = %#v, want the header-derived deferral", deferrer.calls)
+	if len(floor.fakeDeferrer.calls) != 1 {
+		t.Fatalf("Defer calls = %#v, want the header-derived deferral", floor.fakeDeferrer.calls)
 	}
-	if want := observerNow.Add(2 * time.Hour); !deferrer.calls[0].until.Equal(want) {
-		t.Fatalf("until = %v, want the reported reset %v, never Retry-After", deferrer.calls[0].until, want)
+	if want := observerNow.Add(2 * time.Hour); !floor.fakeDeferrer.calls[0].until.Equal(want) {
+		t.Fatalf("until = %v, want the reported reset %v, never Retry-After", floor.fakeDeferrer.calls[0].until, want)
 	}
 }
 
 func TestObserverAnonymousIdentity(t *testing.T) {
-	observer, deferrer, _ := testObserver(t, http.StatusOK, map[string]string{
+	observer, floor, _ := testObserver(t, http.StatusOK, map[string]string{
 		"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "10", "X-RateLimit-Reset": "600",
 	})
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?mailto=reader@example.org")); err != nil {
 		t.Fatal(err)
 	}
-	if len(deferrer.calls) != 1 {
-		t.Fatalf("Defer calls = %#v, want one", deferrer.calls)
+	if len(floor.fakeDeferrer.calls) != 1 {
+		t.Fatalf("Defer calls = %#v, want one", floor.fakeDeferrer.calls)
 	}
-	if deferrer.calls[0].policy.APIKey != "" {
-		t.Fatalf("policy = %+v, want the anonymous identity: the request carried no api_key", deferrer.calls[0].policy)
+	if floor.fakeDeferrer.calls[0].policy.APIKey != "" {
+		t.Fatalf("policy = %+v, want the anonymous identity: the request carried no api_key", floor.fakeDeferrer.calls[0].policy)
 	}
 }
 
 func TestObserverRejectsMalformedReset(t *testing.T) {
 	for _, reset := range []string{"-5", "10000000", "soon"} {
 		t.Run(reset, func(t *testing.T) {
-			observer, deferrer, _ := testObserver(t, http.StatusOK, map[string]string{
+			observer, floor, _ := testObserver(t, http.StatusOK, map[string]string{
 				"X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "1", "X-RateLimit-Reset": reset,
 			})
 			if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 				t.Fatal(err)
 			}
-			if len(deferrer.calls) != 0 {
-				t.Fatalf("Defer calls = %#v, want none: a malformed reset cannot write an honest gate", deferrer.calls)
+			if len(floor.fakeDeferrer.calls) != 0 {
+				t.Fatalf("Defer calls = %#v, want none: a malformed reset cannot write an honest gate", floor.fakeDeferrer.calls)
 			}
 		})
 	}
@@ -171,7 +206,7 @@ func TestObserverRejectsMalformedReset(t *testing.T) {
 // request context cancelled by a racing shutdown must not discard the only
 // durable record that this identity has to stop.
 func TestObserverFloorSurvivesRequestCancellation(t *testing.T) {
-	observer, deferrer, _ := testObserver(t, http.StatusOK, map[string]string{
+	observer, floor, _ := testObserver(t, http.StatusOK, map[string]string{
 		"X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "12", "X-RateLimit-Reset": "3600",
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,10 +215,10 @@ func TestObserverFloorSurvivesRequestCancellation(t *testing.T) {
 	if _, err := observer.Do(req); err != nil {
 		t.Fatal(err)
 	}
-	if len(deferrer.calls) != 1 {
-		t.Fatalf("Defer calls = %#v, want the floor recorded despite the cancelled request", deferrer.calls)
+	if len(floor.fakeDeferrer.calls) != 1 {
+		t.Fatalf("Defer calls = %#v, want the floor recorded despite the cancelled request", floor.fakeDeferrer.calls)
 	}
-	if err := deferrer.deferCtxErr; err != nil {
+	if err := floor.fakeDeferrer.deferCtxErr; err != nil {
 		t.Fatalf("Defer context error = %v, want a live context detached from the request", err)
 	}
 }
@@ -192,14 +227,14 @@ func TestObserverFloorSurvivesRequestCancellation(t *testing.T) {
 // observer cannot name. Attributing it to the configured key would gate the
 // wrong pool, which is worse than gating none.
 func TestObserverIgnoresUnknownCredential(t *testing.T) {
-	observer, deferrer, _ := testObserver(t, http.StatusOK, map[string]string{
+	observer, floor, _ := testObserver(t, http.StatusOK, map[string]string{
 		"X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "12", "X-RateLimit-Reset": "3600",
 	})
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=someone-elses-key")); err != nil {
 		t.Fatal(err)
 	}
-	if len(deferrer.calls) != 0 {
-		t.Fatalf("Defer calls = %#v, want none for an unrecognised credential", deferrer.calls)
+	if len(floor.fakeDeferrer.calls) != 0 {
+		t.Fatalf("Defer calls = %#v, want none for an unrecognised credential", floor.fakeDeferrer.calls)
 	}
 }
 
@@ -217,14 +252,14 @@ func TestObserverRejectsSelfInconsistentBudget(t *testing.T) {
 		{name: "remaining exceeds limit", limit: "10", remaining: "99"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			observer, deferrer, _ := testObserver(t, http.StatusOK, map[string]string{
+			observer, floor, _ := testObserver(t, http.StatusOK, map[string]string{
 				"X-RateLimit-Limit": test.limit, "X-RateLimit-Remaining": test.remaining, "X-RateLimit-Reset": "3600",
 			})
 			if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 				t.Fatal(err)
 			}
-			if len(deferrer.calls) != 0 {
-				t.Fatalf("Defer calls = %#v, want none: the reported budget is not self-consistent", deferrer.calls)
+			if len(floor.fakeDeferrer.calls) != 0 {
+				t.Fatalf("Defer calls = %#v, want none: the reported budget is not self-consistent", floor.fakeDeferrer.calls)
 			}
 		})
 	}
@@ -239,7 +274,7 @@ func TestObserverCanonicalizesTheConfiguredCredential(t *testing.T) {
 	inner := &headerClient{status: http.StatusOK, headers: map[string]string{
 		"X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "12", "X-RateLimit-Reset": "3600",
 	}}
-	observer, err := NewObserver(deferrer, "openalex", config.Source{Enabled: true, APIKey: "  private-key\t"}, inner)
+	observer, err := NewObserver(&fakeQuotaFloor{fakeDeferrer: deferrer}, "openalex", config.Source{Enabled: true, APIKey: "  private-key\t"}, inner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,8 +299,8 @@ func TestFailedFloorWriteLatchesEgressClosed(t *testing.T) {
 		"X-RateLimit-Limit":     "10000",
 		"X-RateLimit-Reset":     "3600",
 	}
-	observer, deferrer, inner := testObserver(t, 200, headers)
-	deferrer.err = errors.New("database is locked")
+	observer, floor, inner := testObserver(t, 200, headers)
+	floor.fakeDeferrer.err = errors.New("database is locked")
 
 	// The response that carried the news is served: it already happened.
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
@@ -297,8 +332,8 @@ func TestLatchIsPerIdentity(t *testing.T) {
 		"X-RateLimit-Limit":     "10000",
 		"X-RateLimit-Reset":     "3600",
 	}
-	observer, deferrer, inner := testObserver(t, 200, headers)
-	deferrer.err = errors.New("disk full")
+	observer, floor, inner := testObserver(t, 200, headers)
+	floor.fakeDeferrer.err = errors.New("disk full")
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatal(err)
 	}
@@ -318,12 +353,13 @@ func TestLatchExpiresAtReset(t *testing.T) {
 		"X-RateLimit-Limit":     "10000",
 		"X-RateLimit-Reset":     "3600",
 	}
-	observer, deferrer, inner := testObserver(t, 200, headers)
-	deferrer.err = errors.New("database is locked")
+	observer, floor, inner := testObserver(t, 200, headers)
+	floor.fakeDeferrer.err = errors.New("database is locked")
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatal(err)
 	}
 	observer.now = func() time.Time { return observerNow.Add(2 * time.Hour) }
+	floor.now = observer.now
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatalf("post-reset call = %v, want the latch expired", err)
 	}
@@ -340,8 +376,8 @@ func TestLatchIgnoresUnnameableCredential(t *testing.T) {
 		"X-RateLimit-Limit":     "10000",
 		"X-RateLimit-Reset":     "3600",
 	}
-	observer, deferrer, inner := testObserver(t, 200, headers)
-	deferrer.err = errors.New("database is locked")
+	observer, floor, inner := testObserver(t, 200, headers)
+	floor.fakeDeferrer.err = errors.New("database is locked")
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatal(err)
 	}
@@ -363,12 +399,12 @@ func TestFloorLatchesOnTheParsedHeaderNotOnAFailedWrite(t *testing.T) {
 		"X-RateLimit-Limit":     "10000",
 		"X-RateLimit-Reset":     "3600",
 	}
-	observer, deferrer, inner := testObserver(t, 200, headers)
+	observer, floor, inner := testObserver(t, 200, headers)
 	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatal(err)
 	}
-	if len(deferrer.calls) != 1 {
-		t.Fatalf("Defer calls = %d, want the durable floor written too", len(deferrer.calls))
+	if len(floor.fakeDeferrer.calls) != 1 {
+		t.Fatalf("Defer calls = %d, want the durable floor written too", len(floor.fakeDeferrer.calls))
 	}
 	_, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key"))
 	var latched *ErrQuotaLatched

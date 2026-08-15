@@ -175,8 +175,9 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		ExpectedMIME: "application/pdf",
 		Direct:       true,
 		// The lookup was by exact identifier and the echoed identifiers do
-		// not conflict, so identity confidence is the identifier's.
+		// not conflict, so the response describes the requested work.
 		IdentityConfidence: 1,
+		Authority:          resolver.AuthorityExactEcho,
 		ResolvedWork:       resolvedWork(record),
 		Evidence: []string{
 			"semanticscholar lookup=" + ref.evidence,

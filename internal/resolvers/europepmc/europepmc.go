@@ -141,10 +141,11 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 	if !strings.EqualFold(strings.TrimSpace(result.IsOpenAccess), "Y") {
 		return nil, nil
 	}
-
 	confidence := 0.6
+	authority := resolver.AuthoritySearch
 	if mode == matchDOI || mode == matchPMID {
 		confidence = 0.95
+		authority = resolver.AuthorityExactEcho
 	}
 	license := reuseLicense(result.License)
 	sourceID := safeEvidenceValue(strings.TrimSpace(result.Source) + "/" + strings.TrimSpace(result.ID))
@@ -175,13 +176,14 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 			Source:             "europepmc",
 			URL:                strings.TrimSpace(ft.URL),
 			Landing:            htmlLanding,
-			Version:            resolver.VersionPublished, // Europe PMC OA full text is the version of record
+			Version:            resolver.VersionPublished,
 			AccessBasis:        resolver.AccessOpen,
 			ReuseLicense:       license,
 			ExpectedMIME:       "application/pdf",
 			ResolvedWork:       resolved,
 			Direct:             true,
 			IdentityConfidence: confidence,
+			Authority:          authority,
 			Evidence: []string{
 				"europepmc match=" + string(mode),
 				"europepmc source_id=" + sourceID,
@@ -196,7 +198,6 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 	}
 	if len(candidates) == 0 && htmlLanding != "" {
 		// No direct PDF, but an OA landing page exists: emit it as a
-		// non-direct candidate rather than dropping the OA result.
 		candidate := resolver.Candidate{
 			Source:             "europepmc",
 			URL:                htmlLanding,
@@ -208,6 +209,7 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 			ResolvedWork:       resolved,
 			Direct:             false,
 			IdentityConfidence: confidence,
+			Authority:          authority,
 			Evidence: []string{
 				"europepmc match=" + string(mode),
 				"europepmc source_id=" + sourceID,

@@ -11,6 +11,14 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **An OpenAlex address copied out of a browser is now accepted.** The address
+  the OpenAlex website actually shows — `https://openalex.org/works/W2741809807`
+  — was refused as an invalid work id, because *papio* recognized only the
+  shorter form OpenAlex uses in its own records. Both are accepted now, along
+  with the `www.` and `api.` hosts and a trailing slash. A bare `works/…` with
+  no address around it is still refused: the positional argument guesses only at
+  shapes that cannot name a different kind of identifier.
+
 - **A "slow down" from OpenAlex now holds for every account, and an exhausted
   account no longer blocks the other one.** These are two different messages that
   arrive the same way, and *papio* was treating them as one. Being out of credit
@@ -196,6 +204,13 @@ execution records kept during the initial build.
   the caller's own metadata, instead of issuing a second lookup; with neither
   it reports that it made no request rather than being charged for one. Every
   works lookup now also bounds the response to the fields *papio* reads.
+
+- **Searching OpenAlex by title for another copy of a paywalled paper is now off by default.** That search costs 10 credits and was measured against the operator's own history at **at least 138 credits for every paper it actually delivered** — and it plainly did not deliver all of them — so it did not pay for itself in its current form. Nothing about how papers are accepted or ranked changed. You can turn it back on with one line under `[sources.openalex]`:
+
+  ```toml
+  [sources.openalex]
+  sibling_title_search = true
+  ```
 
 - **Clean scheduler completion no longer races its final heartbeat.** A
   heartbeat already in flight when a worker parks or completes its job now

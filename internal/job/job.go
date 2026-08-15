@@ -112,6 +112,7 @@ const (
 	TerminalReasonBrowserCancelled                      TerminalReason = "browser_cancelled"
 	TerminalReasonUserDismissed                         TerminalReason = "user_dismissed"
 	TerminalReasonReviewRejected                        TerminalReason = "review_rejected"
+	TerminalReasonInsufficientIdentityEvidence          TerminalReason = "insufficient_identity_evidence"
 )
 
 // NormalizeTerminalReason converts a stored terminal reason to the durable
@@ -131,11 +132,40 @@ func NormalizeTerminalReason(reason string) TerminalReason {
 		TerminalReasonCancelledByUser,
 		TerminalReasonBrowserCancelled,
 		TerminalReasonUserDismissed,
-		TerminalReasonReviewRejected:
+		TerminalReasonReviewRejected,
+		TerminalReasonInsufficientIdentityEvidence:
 		return TerminalReason(reason)
 	default:
 		return TerminalReasonUnknown
 	}
+}
+
+// Provenance records how an identifier entered durable storage.
+type Provenance string
+
+const (
+	ProvenanceUnattested Provenance = "unattested"
+	ProvenanceSubmitted  Provenance = "submitted"
+	ProvenanceVerified   Provenance = "verified"
+	ProvenanceAdopted    Provenance = "adopted"
+)
+
+// Identifier is one durable kind/value pair for a work request.
+type Identifier struct {
+	Kind       string
+	Value      string
+	Raw        string
+	Provenance Provenance
+}
+
+// SubmittedIdentity is the durable immutable anchor: what the requester actually
+// attested at submit. Attested is false for legacy rows whose field origins were
+// never recorded; such rows must not anchor a canonical-identity comparison.
+type SubmittedIdentity struct {
+	Work        work.Work
+	Attested    bool
+	Fields      map[string]bool
+	Identifiers []Identifier
 }
 
 // Principal is the durable source whose entitlement initiated an acquisition.
@@ -469,11 +499,22 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 	authorsJSON, _ := json.Marshal(w.Authors)
 	now := store.Now()
 	jobID := NewID("job")
-
+	submittedParts := make([]string, 0, 3)
+	if strings.TrimSpace(w.Title) != "" {
+		submittedParts = append(submittedParts, "title")
+	}
+	if w.Year != 0 {
+		submittedParts = append(submittedParts, "year")
+	}
+	if len(w.Authors) > 0 {
+		submittedParts = append(submittedParts, "authors")
+	}
+	submittedFields := strings.Join(submittedParts, ",")
+	var submittedFieldsVal any = submittedFields
 	if _, err := tx.ExecContext(ctx,
-		`INSERT OR IGNORE INTO work_requests (id, created_at, requester, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		requestID, now, who.Principal, nullable(zotioKey), nullable(collection), nullable(w.Title), string(authorsJSON), nullableInt(w.Year), pol.DesiredVersion, pol.MaxCostUSD); err != nil {
+		`INSERT OR IGNORE INTO work_requests (id, created_at, requester, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd, submitted_fields)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		requestID, now, who.Principal, nullable(zotioKey), nullable(collection), nullable(w.Title), string(authorsJSON), nullableInt(w.Year), pol.DesiredVersion, pol.MaxCostUSD, submittedFieldsVal); err != nil {
 		return CreateResult{}, fmt.Errorf("inserting work request: %w", err)
 	}
 	for kind, value := range map[string]string{"doi": w.DOI, "pmid": w.PMID, "arxiv": w.ArXiv, "isbn": w.ISBN, "openalex": w.OpenAlex} {
@@ -485,8 +526,8 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 			raw = value
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT OR REPLACE INTO identifiers (work_request_id, kind, value, raw) VALUES (?, ?, ?, ?)`,
-			requestID, kind, value, raw); err != nil {
+			`INSERT OR REPLACE INTO identifiers (work_request_id, kind, value, raw, provenance) VALUES (?, ?, ?, ?, ?)`,
+			requestID, kind, value, raw, string(ProvenanceSubmitted)); err != nil {
 			return CreateResult{}, fmt.Errorf("inserting identifier %s: %w", kind, err)
 		}
 	}
@@ -753,8 +794,8 @@ func (js *Store) FillWorkMetadata(ctx context.Context, jobID string, discovered 
 			return nil, err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO identifiers(work_request_id, kind, value, raw) VALUES(?, ?, ?, ?)`,
-			requestID, kind, value, value); err != nil {
+			`INSERT INTO identifiers(work_request_id, kind, value, raw, provenance) VALUES(?, ?, ?, ?, ?)`,
+			requestID, kind, value, value, string(ProvenanceAdopted)); err != nil {
 			return nil, err
 		}
 	}

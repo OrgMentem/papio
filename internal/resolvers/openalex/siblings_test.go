@@ -3,11 +3,13 @@ package openalex
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
 
+	"papio/internal/resolver"
 	"papio/internal/work"
 )
 
@@ -44,7 +46,7 @@ func siblingResolver(t *testing.T, searchBody string) *Resolver {
 		}
 		return responseFor(200, canonicalRecord, nil), nil
 	})
-	return NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "key", BaseURL: "https://api.test/works"})
+	return NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "key", BaseURL: "https://api.test/works", SiblingTitleSearch: true})
 }
 
 // canonicalWork is the requested work as the app hands it over once the
@@ -123,5 +125,43 @@ func TestResolveSiblingsWithoutDOIIsNoOp(t *testing.T) {
 	candidates, err := r.ResolveSiblings(context.Background(), work.Work{Title: "No DOI"})
 	if err != nil || candidates != nil {
 		t.Fatalf("candidates = %#v, err = %v; want nil", candidates, err)
+	}
+}
+
+func TestSiblingGateOffMakesNoRequest(t *testing.T) {
+	calls := 0
+	client := clientFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return responseFor(200, `{"results":[]}`, nil), nil
+	})
+	r := NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "key", BaseURL: "https://api.test/works"})
+	// default is off
+	if _, err := r.ResolveSiblings(context.Background(), canonicalWork()); !errors.Is(err, resolver.ErrNoSearchBasis) {
+		t.Fatalf("err = %v, want ErrNoSearchBasis when gated off", err)
+	}
+	if calls != 0 {
+		t.Fatalf("requests = %d, want 0 when gated off", calls)
+	}
+}
+
+func TestSiblingGateOnPreservesBehaviour(t *testing.T) {
+	calls := 0
+	client := clientFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Query().Get("search") != "" {
+			calls++
+			return responseFor(200, siblingSearchBody("How Explanations Shape Trust", 2022, "10.2139/ssrn.4020557", "Andrea Ferrario", "https://ssrn.example/paper.pdf"), nil), nil
+		}
+		return responseFor(200, canonicalRecord, nil), nil
+	})
+	r := NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "key", BaseURL: "https://api.test/works", SiblingTitleSearch: true})
+	cands, err := r.ResolveSiblings(context.Background(), canonicalWork())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) == 0 {
+		t.Fatal("gated-on sibling search returned no candidates")
+	}
+	if calls == 0 {
+		t.Fatal("gated-on sibling search made no request")
 	}
 }

@@ -21,8 +21,6 @@ import (
 	"log"
 	"net/http"
 	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	"papio/internal/budget"
@@ -102,18 +100,11 @@ type Deferrer interface {
 // rate-ceiling 429 flows through the caller's ordinary TemporaryError/Defer
 // path under the bare source name, like any other retryable HTTP failure.
 type Observer struct {
-	inner    HTTPClient
-	deferrer Deferrer
-	source   string
-	keyed    config.Source
-	now      func() time.Time
-
-	// mu guards latched, the process-local fail-closed floor used when the
-	// durable write fails. Keyed by the identity the response was served
-	// under, because the two pools are separately budgeted: the keyed tier
-	// being spent says nothing about the keyless one.
-	mu      sync.Mutex
-	latched map[string]time.Time
+	inner  HTTPClient
+	floor  QuotaFloorController
+	source string
+	keyed  config.Source
+	now    func() time.Time
 }
 
 // ErrQuotaLatched refuses a request because the provider reported this
@@ -154,9 +145,9 @@ const quotaDeferTimeout = 5 * time.Second
 
 // NewObserver wraps inner so each response's daily-budget headers can defer
 // future calls. A nil deferrer or inner client is a wiring error.
-func NewObserver(deferrer Deferrer, source string, keyed config.Source, inner HTTPClient) (*Observer, error) {
-	if deferrer == nil {
-		return nil, fmt.Errorf("sourcegate: %s observer has no deferrer", source)
+func NewObserver(floor QuotaFloorController, source string, keyed config.Source, inner HTTPClient) (*Observer, error) {
+	if floor == nil {
+		return nil, fmt.Errorf("sourcegate: %s observer has no quota floor controller", source)
 	}
 	if inner == nil {
 		return nil, fmt.Errorf("sourcegate: %s observer has no inner client", source)
@@ -168,8 +159,8 @@ func NewObserver(deferrer Deferrer, source string, keyed config.Source, inner HT
 	// " key ", matched neither arm of observe's switch, and silently dropped the
 	// low-quota floor — so a configuration the rest of the stack deliberately
 	// treats as equivalent defeated the 5% stop entirely.
-	keyed.APIKey = strings.TrimSpace(keyed.APIKey)
-	return &Observer{inner: inner, deferrer: deferrer, source: source, keyed: keyed, now: time.Now}, nil
+	keyed.APIKey = trimAPIKey(keyed.APIKey)
+	return &Observer{inner: inner, floor: floor, source: source, keyed: keyed, now: time.Now}, nil
 }
 
 // Do refuses a request whose identity is latched, forwards otherwise, then
@@ -181,9 +172,9 @@ func NewObserver(deferrer Deferrer, source string, keyed config.Source, inner HT
 // the NEXT one is refused here, before the wire, rather than being permitted by
 // the absence of a record papio failed to write.
 func (o *Observer) Do(req *http.Request) (*http.Response, error) {
-	served, known := o.servedIdentity(req)
+	served, known := ServedIdentity(req, o.keyed)
 	if known {
-		if until, latched := o.latchedUntil(served); latched {
+		if until, latched := o.floor.QuotaLatchedUntil(o.source, budget.IdentityFor(served)); latched {
 			return nil, &ErrQuotaLatched{Source: o.source, Identity: poolName(served), Until: until}
 		}
 	}
@@ -195,68 +186,8 @@ func (o *Observer) Do(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-// servedIdentity names the identity a request goes out under, read from the
-// OUTGOING request rather than from configuration: this same client serves both
-// the keyed and the keyless tier, and a gate earned by one credential must
-// never be attributed to the other. The comparison is against the configured
-// key by VALUE, not by presence: a request bearing some third key was served
-// under an identity this observer cannot name, so it reports not-known and
-// callers neither latch it nor obey a latch on its behalf — guessing would
-// bind the wrong pool, which is worse than binding none.
-func (o *Observer) servedIdentity(req *http.Request) (config.Source, bool) {
-	served := o.keyed
-	sent := ""
-	if req != nil && req.URL != nil {
-		sent = req.URL.Query().Get("api_key")
-	}
-	switch sent {
-	case o.keyed.APIKey:
-		// served as configured, keyed or keyless alike
-	case "":
-		served.APIKey = ""
-	default:
-		return config.Source{}, false
-	}
-	return served, true
-}
-
-// latch closes this process's egress for one identity until the provider's own
-// reset. A later, further-out floor extends it; an earlier one never shortens
-// it, because the reason the latch exists is that papio could not record what
-// it knows and must therefore keep the most conservative fact it has.
-func (o *Observer) latch(served config.Source, until time.Time) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.latched == nil {
-		o.latched = make(map[string]time.Time)
-	}
-	key := poolName(served)
-	if existing, ok := o.latched[key]; ok && !until.After(existing) {
-		return
-	}
-	o.latched[key] = until
-}
-
-// latchedUntil reports an active latch for served. An expired entry is deleted
-// rather than left to accumulate: the map holds at most two keys, but a stale
-// past instant read as "latched" would close egress forever.
-func (o *Observer) latchedUntil(served config.Source) (time.Time, bool) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	key := poolName(served)
-	until, ok := o.latched[key]
-	if !ok {
-		return time.Time{}, false
-	}
-	if !until.After(o.now()) {
-		delete(o.latched, key)
-		return time.Time{}, false
-	}
-	return until, true
-}
-
 func (o *Observer) observe(req *http.Request, resp *http.Response) {
-	served, known := o.servedIdentity(req)
+	served, known := ServedIdentity(req, o.keyed)
 	if !known {
 		return
 	}
@@ -292,14 +223,14 @@ func (o *Observer) observe(req *http.Request, resp *http.Response) {
 	// one commits. The latch is never cleared on success, because a successful
 	// write and the latch say the same thing until the same instant, and the
 	// conservative duplicate costs nothing.
-	o.latch(served, until)
+	o.floor.LatchQuota(o.source, budget.IdentityFor(served), until)
 	// The provider has already spoken, so this write must not inherit the
 	// cancellation of the request that carried the news: a shutdown racing a
 	// low-quota response would otherwise drop the gate precisely when the
 	// budget is lowest.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), quotaDeferTimeout)
 	defer cancel()
-	if err := o.deferrer.Defer(ctx, budget.QuotaSourceName(o.source), served, until); err != nil {
+	if err := o.floor.Defer(ctx, budget.QuotaSourceName(o.source), served, until); err != nil {
 		// The durable row is what other processes and later restarts read, so
 		// losing it matters — but it is not what makes THIS process stop, and the
 		// earlier version of this code made exactly that mistake: it logged and

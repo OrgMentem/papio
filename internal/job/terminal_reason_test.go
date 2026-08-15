@@ -32,6 +32,7 @@ var terminalReasonWriters = []TerminalReason{
 	TerminalReasonBrowserCancelled,
 	TerminalReasonUserDismissed,
 	TerminalReasonReviewRejected,
+	TerminalReasonInsufficientIdentityEvidence,
 }
 
 // TestTerminalReasonVocabularyIsExhaustive guards the guard. A hand-maintained

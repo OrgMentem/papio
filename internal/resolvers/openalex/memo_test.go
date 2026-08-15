@@ -28,7 +28,7 @@ func countingResolver(t *testing.T, searchBody string) (*Resolver, *int) {
 		return responseFor(200, canonicalRecord, nil), nil
 	})
 	r := NewWithOptions(Options{
-		Client: client, ContactEmail: "contact@example.org", APIKey: "key", BaseURL: "https://api.test/works",
+		Client: client, ContactEmail: "contact@example.org", APIKey: "key", BaseURL: "https://api.test/works", SiblingTitleSearch: true,
 	})
 	return r, &requests
 }
@@ -156,7 +156,7 @@ func TestNegativeMemoDoesNotSuppressACallerBasis(t *testing.T) {
 		}
 		return responseFor(404, "", nil), nil
 	})
-	r := New(client, "contact@example.org", "private-key")
+	r := NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "private-key", BaseURL: "https://api.test/works", SiblingTitleSearch: true})
 	ctx := context.Background()
 	if _, err := r.Resolve(ctx, work.Work{DOI: "10.9999/unknown.work"}); err != nil {
 		t.Fatal(err)
@@ -317,7 +317,7 @@ func TestAnonymousCredentialsOmitAPIKey(t *testing.T) {
 		return responseFor(200, canonicalRecord, nil), nil
 	})
 	r := NewWithOptions(Options{
-		Client: client, ContactEmail: "contact@example.org", APIKey: "private-key", BaseURL: "https://api.test/works",
+		Client: client, ContactEmail: "contact@example.org", APIKey: "private-key", BaseURL: "https://api.test/works", SiblingTitleSearch: true,
 	})
 	ctx := resolver.WithAnonymousCredentials(context.Background())
 	if _, err := r.Resolve(ctx, work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
@@ -330,11 +330,13 @@ func TestAnonymousCredentialsOmitAPIKey(t *testing.T) {
 		t.Fatalf("requests = %d, want the singleton lookup and the sibling search", len(seen))
 	}
 	for _, req := range seen {
-		query := req.URL.Query()
-		if query.Get("api_key") != "" {
+		if req.URL.Query().Get("api_key") != "" {
 			t.Fatalf("anonymous request carried api_key: %s", req.URL.RawQuery)
 		}
-		if query.Get("mailto") != "contact@example.org" {
+		if req.Header.Get("Authorization") != "" {
+			t.Fatalf("anonymous request carried Authorization")
+		}
+		if req.URL.Query().Get("mailto") != "contact@example.org" {
 			t.Fatalf("anonymous request dropped mailto: %s", req.URL.RawQuery)
 		}
 	}
@@ -363,11 +365,11 @@ func TestAnonymousStripsBaseURLKey(t *testing.T) {
 	if len(seen) != 2 {
 		t.Fatalf("requests = %d, want two", len(seen))
 	}
-	if got := seen[0].URL.Query().Get("api_key"); got != "" {
-		t.Fatalf("anonymous request api_key = %q, want it stripped", got)
+	if got := seen[0].Header.Get("Authorization"); got != "" {
+		t.Fatalf("anonymous request Authorization = %q, want empty", got)
 	}
-	if got := seen[1].URL.Query()["api_key"]; len(got) != 1 || got[0] != "private-key" {
-		t.Fatalf("keyed request api_key = %#v, want exactly the configured key once", got)
+	if got := seen[1].Header.Get("Authorization"); got != "Bearer private-key" {
+		t.Fatalf("keyed request Authorization = %q, want bearer private-key", got)
 	}
 	if strings.Contains(seen[1].URL.RawQuery, "stale") {
 		t.Fatalf("keyed request kept the stale base-URL key: %s", seen[1].URL.RawQuery)
@@ -429,7 +431,7 @@ func TestIncompletePositiveMemoDoesNotSuppressACallerBasis(t *testing.T) {
 		// Canonical record: a title, but no authors the canonicalizer can read.
 		return responseFor(200, `{"id":"https://openalex.org/W2741809807","doi":"https://doi.org/10.1145/3531146.3533202","title":"Shape Trust","publication_year":2022,"authorships":[]}`, nil), nil
 	})
-	r := New(client, "contact@example.org", "private-key")
+	r := NewWithOptions(Options{Client: client, ContactEmail: "contact@example.org", APIKey: "private-key", BaseURL: "https://api.test/works", SiblingTitleSearch: true})
 	ctx := context.Background()
 	if _, err := r.Resolve(ctx, work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
 		t.Fatal(err)
