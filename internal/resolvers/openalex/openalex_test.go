@@ -27,15 +27,19 @@ func responseFor(status int, body string, headers map[string]string) *http.Respo
 }
 
 func TestResolveVectors(t *testing.T) {
-	const best = `{"open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://best.example/article.pdf","landing_page_url":"https://best.example/article","license":"cc-by","version":"publishedVersion"},"locations":[{"is_oa":true,"pdf_url":"https://later.example/article.pdf"}]}`
-	const fallback = `{"open_access":{"is_oa":true,"oa_status":"green"},"best_oa_location":null,"locations":[{"is_oa":false,"pdf_url":"https://paywall.example/no.pdf"},{"is_oa":true,"pdf_url":"https://pdf.example/first.pdf","version":"acceptedVersion"},{"is_oa":true,"pdf_url":"https://pdf.example/second.pdf"}]}`
-	const missing = `{"open_access":{"is_oa":true,"oa_status":"bronze"},"best_oa_location":{"is_oa":true,"pdf_url":"https://best.example/article.pdf"}}`
-	const secret = `{"open_access":{"is_oa":true,"oa_status":"green"},"best_oa_location":{"is_oa":true,"pdf_url":"https://files.example/a.pdf?token=SECRET"}}`
-	const linkOnly = `{"open_access":{"is_oa":true,"oa_status":"green"},"best_oa_location":{"is_oa":false,"pdf_url":"https://paywall.example/no.pdf"}}`
-	const topLevelOnly = `{"is_oa":true,"best_oa_location":{"is_oa":true,"pdf_url":"https://best.example/article.pdf"}}`
-	const invalidBest = `{"open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"pdf_url":"not a URL"},"locations":[{"is_oa":true,"pdf_url":"https://pdf.example/fallback.pdf"}]}`
-	const bestLanding = `{"open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"landing_page_url":"https://landing.example/best"}}`
-	const fallbackLanding = `{"open_access":{"is_oa":true},"best_oa_location":{"is_oa":false,"landing_page_url":"https://paywall.example/no"},"locations":[{"is_oa":false,"landing_page_url":"https://paywall.example/also-no"},{"is_oa":true,"landing_page_url":"https://landing.example/fallback"}]}`
+	const best = `{"doi":"https://doi.org/10.1000/example","open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://best.example/article.pdf","landing_page_url":"https://best.example/article","license":"cc-by","version":"publishedVersion"},"locations":[{"is_oa":true,"pdf_url":"https://later.example/article.pdf"}]}`
+	const fallback = `{"doi":"https://doi.org/10.1000/example","open_access":{"is_oa":true,"oa_status":"green"},"best_oa_location":null,"locations":[{"is_oa":false,"pdf_url":"https://paywall.example/no.pdf"},{"is_oa":true,"pdf_url":"https://pdf.example/first.pdf","version":"acceptedVersion"},{"is_oa":true,"pdf_url":"https://pdf.example/second.pdf"}]}`
+	const missing = `{"doi":"https://doi.org/10.1000/example","open_access":{"is_oa":true,"oa_status":"bronze"},"best_oa_location":{"is_oa":true,"pdf_url":"https://best.example/article.pdf"}}`
+	const secret = `{"doi":"https://doi.org/10.1000/example","open_access":{"is_oa":true,"oa_status":"green"},"best_oa_location":{"is_oa":true,"pdf_url":"https://files.example/a.pdf?token=SECRET"}}`
+	const linkOnly = `{"doi":"https://doi.org/10.1000/example","open_access":{"is_oa":true,"oa_status":"green"},"best_oa_location":{"is_oa":false,"pdf_url":"https://paywall.example/no.pdf"}}`
+	const topLevelOnly = `{"doi":"https://doi.org/10.1000/example","is_oa":true,"best_oa_location":{"is_oa":true,"pdf_url":"https://best.example/article.pdf"}}`
+	const invalidBest = `{"doi":"https://doi.org/10.1000/example","open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"pdf_url":"not a URL"},"locations":[{"is_oa":true,"pdf_url":"https://pdf.example/fallback.pdf"}]}`
+	const bestLanding = `{"doi":"https://doi.org/10.1000/example","open_access":{"is_oa":true},"best_oa_location":{"is_oa":true,"landing_page_url":"https://landing.example/best"}}`
+	const fallbackLanding = `{"doi":"https://doi.org/10.1000/example","open_access":{"is_oa":true},"best_oa_location":{"is_oa":false,"landing_page_url":"https://paywall.example/no"},"locations":[{"is_oa":false,"landing_page_url":"https://paywall.example/also-no"},{"is_oa":true,"landing_page_url":"https://landing.example/fallback"}]}`
+	// An exact-DOI lookup that comes back describing a different work, or with
+	// no DOI at all, must not be published at maximal identity confidence.
+	const wrongDOI = `{"doi":"https://doi.org/10.1000/other","open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://best.example/article.pdf","license":"cc-by","version":"publishedVersion"}}`
+	const noDOI = `{"open_access":{"is_oa":true,"oa_status":"gold"},"best_oa_location":{"is_oa":true,"pdf_url":"https://best.example/article.pdf","license":"cc-by","version":"publishedVersion"}}`
 
 	tests := []struct {
 		name        string
@@ -66,6 +70,8 @@ func TestResolveVectors(t *testing.T) {
 		{name: "rate limited", status: 429, headers: map[string]string{"Retry-After": "9"}, wantErr: true, temporary: true, retry: 9 * time.Second},
 		{name: "upstream failure", status: 502, wantErr: true, temporary: true},
 		{name: "secret URL redacted in evidence", status: 200, body: secret, wantURL: "https://files.example/a.pdf?token=SECRET", wantVersion: resolver.VersionUnknown, wantLicense: "unknown", wantDirect: true},
+		{name: "echoed DOI names a different work", status: 200, body: wrongDOI},
+		{name: "record echoes no DOI", status: 200, body: noDOI},
 	}
 
 	for _, tt := range tests {

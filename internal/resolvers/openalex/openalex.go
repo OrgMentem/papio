@@ -172,6 +172,22 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		r.writeMemo(memoDOI, record, true)
 	}
 
+	// An exact-DOI lookup must come back ABOUT the DOI that was asked for.
+	// Without this check a misrouted or duplicated upstream answer is published
+	// with IdentityConfidence 1.0, acquiring a different paper under this
+	// citation. A record echoing no parseable DOI fails closed.
+	if memoDOI != "" {
+		echoed := ""
+		for _, raw := range []string{record.DOI, record.IDs.DOI} {
+			if doi, err := work.NormalizeDOI(raw); err == nil {
+				echoed = doi
+				break
+			}
+		}
+		if echoed != memoDOI {
+			return nil, nil
+		}
+	}
 	if !record.isOpenAccess() {
 		return nil, nil
 	}
@@ -327,10 +343,25 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 		canonical = resolvedWork(record)
 	}
 	if strings.TrimSpace(canonical.Title) == "" {
-		// Zero requests were made, and the caller must not charge one: with no
-		// memoized record and no caller-supplied title there is nothing to
-		// search on.
-		return nil, resolver.ErrNoSearchBasis
+		// No memoized record and no caller-supplied title. The memo is an
+		// evictable TTL cache, so treating a miss as "this work has no search
+		// basis" made an unrelated traffic spike or a slow fetch silently
+		// cancel a DOI-only job's sibling discovery — the availability
+		// regression that removing the unconditional canonical GET introduced.
+		// Re-earn the basis with the SINGLETON lookup, which OpenAlex prices at
+		// one credit against the search's ten, and memoize it so the next hop
+		// is free again.
+		record, found, lookupErr := r.canonicalRecord(ctx, canonicalDOI, anon)
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		if !found {
+			return nil, resolver.ErrNoSearchBasis
+		}
+		canonical = resolvedWork(record)
+		if strings.TrimSpace(canonical.Title) == "" {
+			return nil, resolver.ErrNoSearchBasis
+		}
 	}
 
 	endpoint, lookup, _, err := r.lookupURL(work.Work{Title: canonical.Title}, anon)
@@ -405,9 +436,14 @@ func (r *Resolver) ResolveSiblings(ctx context.Context, requested work.Work) ([]
 }
 
 // writeMemo records what a DOI singleton lookup learned, so a sibling hop in
-// the same pass can match against it without paying for the record again. A
-// full map is dropped wholesale rather than scanned for the oldest entry:
-// entries are cheap to re-earn and the cap exists only to bound memory.
+// the same pass can match against it without paying for the record again.
+//
+// At the cap, expired entries are evicted first and the whole map is dropped
+// only if that frees nothing. Dropping wholesale unconditionally was a real
+// availability bug rather than a tidy simplification: a DOI-only job whose
+// caller metadata has no title depends on this memo for its search basis, so
+// unrelated traffic pushing the resolver past the cap between Resolve and the
+// sibling hop silently removed that job's ability to search at all.
 func (r *Resolver) writeMemo(doi string, record workRecord, found bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -415,7 +451,15 @@ func (r *Resolver) writeMemo(doi string, record workRecord, found bool) {
 		r.records = make(map[string]recordMemo)
 	}
 	if len(r.records) >= recordMemoCap {
-		r.records = make(map[string]recordMemo)
+		now := time.Now()
+		for key, entry := range r.records {
+			if now.Sub(entry.at) > recordMemoTTL {
+				delete(r.records, key)
+			}
+		}
+		if len(r.records) >= recordMemoCap {
+			r.records = make(map[string]recordMemo)
+		}
 	}
 	r.records["doi:"+doi] = recordMemo{record: record, found: found, at: time.Now()}
 }
