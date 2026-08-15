@@ -34,6 +34,9 @@ interface OptionsPageOptions {
   allowlistSetFails?: Record<string, boolean>;
   /** Hold an `allowlist.set` open so a genuinely pending row can be observed. */
   allowlistSetGate?: (origin: string) => Promise<void>;
+  storageSetFails?: Set<string>;
+  storageGetFails?: Set<string>;
+  resolverOrigins?: string[];
 }
 
 async function settle(): Promise<void> {
@@ -62,6 +65,7 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
   const permissionRemovals: string[][] = [];
   const storageValues: Record<string, unknown> = {
     ...(options.pageCaptureConsent === undefined ? {} : { [PAGE_CAPTURE_CONSENT_KEY]: options.pageCaptureConsent }),
+    ...(options.resolverOrigins === undefined ? {} : { papio_state_v1: { resolverOrigins: options.resolverOrigins, version: 5 } }),
   };
   const containsCalls: string[][] = [];
   const grantedOrigins = new Set(options.origins ?? []);
@@ -79,6 +83,7 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
     HTMLButtonElement: window.HTMLButtonElement,
     HTMLInputElement: window.HTMLInputElement,
     HTMLSelectElement: window.HTMLSelectElement,
+    HTMLLIElement: window.HTMLLIElement,
     HTMLUListElement: window.HTMLUListElement,
     chrome: {
       permissions: {
@@ -126,17 +131,28 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
         },
       },
       storage: {
-        session: { get: async () => ({}) },
+        session: {
+          get: async (key?: unknown) => {
+            if (options.storageGetFails?.has("__any__") || options.storageGetFails?.has("papio_state_v1")) throw new Error("storage unavailable");
+            const k = typeof key === "string" ? key : Array.isArray(key) ? (key[0] as string) : key ? Object.keys(key as Record<string, unknown>)[0] : undefined;
+            if (k && k in storageValues) return { [k]: (storageValues as Record<string, unknown>)[k] };
+            if (k === undefined) return { ...storageValues };
+            return {};
+          },
+        },
         local: {
-          get: async (key: string | string[]) => {
-            const keys = Array.isArray(key) ? key : [key];
+          get: async (key: string | string[] | Record<string, unknown> | null | undefined) => {
+            const keys = Array.isArray(key) ? key : typeof key === "string" ? [key] : key ? Object.keys(key as Record<string, unknown>) : [];
             for (const entry of keys) storageGetKeys.push(entry);
+            if (options.storageGetFails && keys.some((k) => options.storageGetFails!.has(k))) throw new Error("storage unavailable");
+            if (options.storageGetFails?.has("__any__")) throw new Error("storage unavailable");
             return Object.fromEntries(
               keys.filter((entry) => entry in storageValues).map((entry) => [entry, storageValues[entry]]),
             );
           },
           set: async (items: Record<string, unknown>) => {
             for (const entry of Object.keys(items)) storageSetKeys.push(entry);
+            if (options.storageSetFails && Object.keys(items).some((k) => options.storageSetFails!.has(k))) throw new Error("quota exceeded");
             Object.assign(storageValues, items);
           },
         },
@@ -402,3 +418,103 @@ test("scanner allowlist management never reads scanner storage directly", async 
   expect(page.runtimeMessages.some((entry) => entry.type === "papio.pageBulk.allowlist.list")).toBe(true);
 });
 
+test("feedback settings revert and show an error when storage.set rejects", async () => {
+  const rejections: unknown[] = [];
+  const onRejection = (e: unknown) => rejections.push(e);
+  process.on("unhandledRejection", onRejection);
+  const page = await optionsDocument({ storageSetFails: new Set(["papio_toolbar_count_mode_v1"]) });
+  const toolbar = page.document.getElementById("toolbar-count-mode") as HTMLSelectElement;
+  const msg = page.document.getElementById("feedback-settings-message") as HTMLElement;
+  expect(toolbar.value).toBe("required");
+  toolbar.value = "all";
+  toolbar.dispatchEvent(new Event("change"));
+  await settle();
+  expect(rejections).toHaveLength(0);
+  expect(toolbar.value).toBe("required");
+  expect(toolbar.disabled).toBe(false);
+  expect(msg.hidden).toBe(false);
+  expect(msg.textContent).toContain("could not save");
+  process.off("unhandledRejection", onRejection);
+});
+
+test("catch-up toggle reverts and shows an error when storage.set rejects", async () => {
+  const rejections: unknown[] = [];
+  const onRejection = (e: unknown) => rejections.push(e);
+  process.on("unhandledRejection", onRejection);
+  const page = await optionsDocument({ storageSetFails: new Set(["papio_catch_up_enabled_v1"]) });
+  const catchUp = page.document.getElementById("catch-up-enabled") as HTMLInputElement;
+  const msg = page.document.getElementById("feedback-settings-message") as HTMLElement;
+  expect(catchUp.checked).toBe(true);
+  catchUp.checked = false;
+  catchUp.dispatchEvent(new Event("change"));
+  await settle();
+  expect(rejections).toHaveLength(0);
+  expect(catchUp.checked).toBe(true);
+  expect(catchUp.disabled).toBe(false);
+  expect(msg.hidden).toBe(false);
+  expect(msg.textContent).toContain("could not save");
+  process.off("unhandledRejection", onRejection);
+});
+
+test("success-ack select reverts and shows an error when storage.set rejects", async () => {
+  const rejections: unknown[] = [];
+  const onRejection = (e: unknown) => rejections.push(e);
+  process.on("unhandledRejection", onRejection);
+  const page = await optionsDocument({ storageSetFails: new Set(["papio_success_ack_mode_v1"]) });
+  const success = page.document.getElementById("success-ack-mode") as HTMLSelectElement;
+  const msg = page.document.getElementById("feedback-settings-message") as HTMLElement;
+  expect(success.value).toBe("all");
+  success.value = "errors";
+  success.dispatchEvent(new Event("change"));
+  await settle();
+  expect(rejections).toHaveLength(0);
+  expect(success.value).toBe("all");
+  expect(success.disabled).toBe(false);
+  expect(msg.hidden).toBe(false);
+  expect(msg.textContent).toContain("could not save");
+  process.off("unhandledRejection", onRejection);
+});
+
+test("handoff surface reverts and shows an error when storage.set rejects", async () => {
+  const rejections: unknown[] = [];
+  const onRejection = (e: unknown) => rejections.push(e);
+  process.on("unhandledRejection", onRejection);
+  const page = await optionsDocument({ storageSetFails: new Set(["papio_handoff_surface_v1"]) });
+  const tabGroup = page.document.getElementById("handoff-tab-group") as HTMLButtonElement;
+  const work = page.document.getElementById("handoff-work-window") as HTMLButtonElement;
+  const msg = page.document.getElementById("handoff-surface-message") as HTMLElement;
+  // Initial render: work-window is active
+  expect(work.getAttribute("aria-pressed")).toBe("true");
+  tabGroup.click();
+  await settle();
+  expect(rejections).toHaveLength(0);
+  expect(tabGroup.getAttribute("aria-pressed")).toBe("false");
+  expect(work.getAttribute("aria-pressed")).toBe("true");
+  expect(tabGroup.disabled).toBe(false);
+  expect(msg.hidden).toBe(false);
+  expect(msg.textContent).toContain("could not save");
+  process.off("unhandledRejection", onRejection);
+});
+
+test("configured resolvers renders unavailable state when storage load rejects", async () => {
+  const rejections: unknown[] = [];
+  const onRejection = (e: unknown) => rejections.push(e);
+  process.on("unhandledRejection", onRejection);
+  const page = await optionsDocument({
+    resolverOrigins: ["https://resolver.example"],
+    storageGetFails: new Set(["__any__"]),
+  });
+  await settle();
+  expect(rejections).toHaveLength(0);
+  const section = page.document.getElementById("configured-resolvers-section") as HTMLElement;
+  const list = page.document.getElementById("configured-resolvers") as HTMLUListElement;
+  const msg = page.document.getElementById("configured-resolvers-message") as HTMLElement;
+  expect(section.hidden).toBe(false);
+  expect(list.textContent).toContain("unavailable");
+  const li = list.querySelector("li");
+  expect(li).toBeDefined();
+  expect(li instanceof HTMLLIElement).toBe(true);
+  expect(msg.hidden).toBe(false);
+  expect(msg.textContent).toContain("could not load");
+  process.off("unhandledRejection", onRejection);
+});

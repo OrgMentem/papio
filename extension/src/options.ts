@@ -268,20 +268,85 @@ async function renderFeedbackSettings(): Promise<void> {
     catchUp.checked = true;
     success.value = "all";
   }
+  toolbar.dataset.lastPersisted = toolbar.value;
+  catchUp.dataset.lastPersisted = String(catchUp.checked);
+  success.dataset.lastPersisted = success.value;
+  setFeedbackSettingsNotice(null);
 }
 
 function wireFeedbackSettings(): void {
   const toolbar = document.getElementById("toolbar-count-mode");
   const catchUp = document.getElementById("catch-up-enabled");
   const success = document.getElementById("success-ack-mode");
+  const feedbackError = "papio could not save this preference";
   toolbar?.addEventListener("change", () => {
-    const value = toolbar instanceof HTMLSelectElement && (toolbar.value === "all" || toolbar.value === "off") ? toolbar.value : "required";
-    void chrome.storage.local.set({ [TOOLBAR_COUNT_MODE_KEY]: value });
+    if (!(toolbar instanceof HTMLSelectElement) || toolbar.disabled) return;
+    const pendingValue = toolbar.value === "all" || toolbar.value === "off" ? toolbar.value : "required";
+    const previous = toolbar.dataset.lastPersisted ?? "required";
+    toolbar.disabled = true;
+    setFeedbackSettingsNotice(null);
+    void chrome.storage.local.set({ [TOOLBAR_COUNT_MODE_KEY]: pendingValue }).then(
+      () => {
+        void renderFeedbackSettings()
+          .catch(() => {
+            setFeedbackSettingsNotice("papio could not refresh preferences");
+          })
+          .finally(() => {
+            toolbar.disabled = false;
+          });
+      },
+      () => {
+        toolbar.value = previous;
+        toolbar.disabled = false;
+        setFeedbackSettingsNotice(feedbackError);
+      },
+    );
   });
-  catchUp?.addEventListener("change", () => void chrome.storage.local.set({ [CATCH_UP_ENABLED_KEY]: catchUp instanceof HTMLInputElement && catchUp.checked }));
+  catchUp?.addEventListener("change", () => {
+    if (!(catchUp instanceof HTMLInputElement) || catchUp.disabled) return;
+    const pendingChecked = catchUp.checked;
+    const previous = catchUp.dataset.lastPersisted === "false" ? false : true;
+    catchUp.disabled = true;
+    setFeedbackSettingsNotice(null);
+    void chrome.storage.local.set({ [CATCH_UP_ENABLED_KEY]: pendingChecked }).then(
+      () => {
+        void renderFeedbackSettings()
+          .catch(() => {
+            setFeedbackSettingsNotice("papio could not refresh preferences");
+          })
+          .finally(() => {
+            catchUp.disabled = false;
+          });
+      },
+      () => {
+        catchUp.checked = previous;
+        catchUp.disabled = false;
+        setFeedbackSettingsNotice(feedbackError);
+      },
+    );
+  });
   success?.addEventListener("change", () => {
-    const value = success instanceof HTMLSelectElement && (success.value === "errors" || success.value === "off") ? success.value : "all";
-    void chrome.storage.local.set({ [SUCCESS_ACK_MODE_KEY]: value });
+    if (!(success instanceof HTMLSelectElement) || success.disabled) return;
+    const pendingValue = success.value === "errors" || success.value === "off" ? success.value : "all";
+    const previous = success.dataset.lastPersisted ?? "all";
+    success.disabled = true;
+    setFeedbackSettingsNotice(null);
+    void chrome.storage.local.set({ [SUCCESS_ACK_MODE_KEY]: pendingValue }).then(
+      () => {
+        void renderFeedbackSettings()
+          .catch(() => {
+            setFeedbackSettingsNotice("papio could not refresh preferences");
+          })
+          .finally(() => {
+            success.disabled = false;
+          });
+      },
+      () => {
+        success.value = previous;
+        success.disabled = false;
+        setFeedbackSettingsNotice(feedbackError);
+      },
+    );
   });
 }
 
@@ -373,10 +438,44 @@ function wireHandoffSurface(): void {
     const btn = document.getElementById(id);
     if (!(btn instanceof HTMLButtonElement)) continue;
     btn.addEventListener("click", () => {
-      // Keep the legacy boolean in sync so an older bridge build still honors it.
+      const previous = Object.entries(HANDOFF_SURFACE_BUTTONS).find(([, v]) => {
+        const b = document.getElementById(v);
+        return b instanceof HTMLButtonElement && b.getAttribute("aria-pressed") === "true";
+      })?.[0] as HandoffSurface | undefined;
+      for (const [, bid] of Object.entries(HANDOFF_SURFACE_BUTTONS)) {
+        const b = document.getElementById(bid);
+        if (b instanceof HTMLButtonElement) b.disabled = true;
+      }
+      setHandoffSurfaceNotice(null);
       void chrome.storage.local
         .set({ [HANDOFF_SURFACE_KEY]: surface, [WORK_WINDOW_KEY]: surface !== "in-window" })
-        .then(renderHandoffSurface);
+        .then(
+          () => {
+            void renderHandoffSurface()
+              .catch(() => {
+                setHandoffSurfaceNotice("papio could not refresh handoff preference");
+              })
+              .finally(() => {
+                for (const [, bid] of Object.entries(HANDOFF_SURFACE_BUTTONS)) {
+                  const b = document.getElementById(bid);
+                  if (b instanceof HTMLButtonElement) b.disabled = false;
+                }
+              });
+          },
+          () => {
+            if (previous !== undefined) {
+              for (const [s, bid] of Object.entries(HANDOFF_SURFACE_BUTTONS)) {
+                const b = document.getElementById(bid);
+                if (b instanceof HTMLButtonElement) b.setAttribute("aria-pressed", s === previous ? "true" : "false");
+              }
+            }
+            for (const [, bid] of Object.entries(HANDOFF_SURFACE_BUTTONS)) {
+              const b = document.getElementById(bid);
+              if (b instanceof HTMLButtonElement) b.disabled = false;
+            }
+            setHandoffSurfaceNotice("papio could not save this preference");
+          },
+        );
     });
   }
 }
@@ -489,6 +588,48 @@ const scannerAllowlistPending = new Set<string>();
 
 function setScannerAllowlistNotice(message: string | null): void {
   const notice = document.getElementById("scanner-allowlist-message");
+  if (!(notice instanceof HTMLElement)) return;
+  if (message === null) {
+    notice.hidden = true;
+    notice.textContent = "";
+    notice.removeAttribute("data-tone");
+    return;
+  }
+  notice.hidden = false;
+  notice.textContent = message;
+  notice.setAttribute("data-tone", "degraded");
+}
+
+function setFeedbackSettingsNotice(message: string | null): void {
+  const notice = document.getElementById("feedback-settings-message");
+  if (!(notice instanceof HTMLElement)) return;
+  if (message === null) {
+    notice.hidden = true;
+    notice.textContent = "";
+    notice.removeAttribute("data-tone");
+    return;
+  }
+  notice.hidden = false;
+  notice.textContent = message;
+  notice.setAttribute("data-tone", "degraded");
+}
+
+function setHandoffSurfaceNotice(message: string | null): void {
+  const notice = document.getElementById("handoff-surface-message");
+  if (!(notice instanceof HTMLElement)) return;
+  if (message === null) {
+    notice.hidden = true;
+    notice.textContent = "";
+    notice.removeAttribute("data-tone");
+    return;
+  }
+  notice.hidden = false;
+  notice.textContent = message;
+  notice.setAttribute("data-tone", "degraded");
+}
+
+function setConfiguredResolversNotice(message: string | null): void {
+  const notice = document.getElementById("configured-resolvers-message");
   if (!(notice instanceof HTMLElement)) return;
   if (message === null) {
     notice.hidden = true;
@@ -626,9 +767,22 @@ async function renderScannerAllowlist(options?: { keepNotice?: boolean }): Promi
 async function renderConfiguredResolvers(permissionSnapshot: PermissionSnapshot): Promise<void> {
   const list = document.getElementById("configured-resolvers");
   if (!(list instanceof HTMLUListElement)) return;
-  const store: StoreShape = await chromeBackend(chrome.storage).load();
-  const custom = (store.resolverOrigins ?? []).filter((origin) => !coveredByManifest(origin));
   const section = document.getElementById("configured-resolvers-section");
+  let store: StoreShape;
+  try {
+    store = await chromeBackend(chrome.storage).load();
+  } catch {
+    if (section instanceof HTMLElement) section.hidden = false;
+    list.replaceChildren();
+    setConfiguredResolversNotice("papio could not load your library resolvers");
+    const item = document.createElement("li");
+    item.textContent = "Your library resolvers are unavailable.";
+    item.className = "hint row";
+    list.append(item);
+    return;
+  }
+  setConfiguredResolversNotice(null);
+  const custom = (store.resolverOrigins ?? []).filter((origin) => !coveredByManifest(origin));
   if (section instanceof HTMLElement) section.hidden = custom.length === 0;
   render(
     list,
