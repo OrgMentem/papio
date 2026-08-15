@@ -321,41 +321,50 @@ func TestSaveAcceptsFirefoxExtensionIDs(t *testing.T) {
 	}
 }
 
-func TestSaveValidatesShibbolethEntityID(t *testing.T) {
-	cfg := Default()
-	cfg.AccessMode = ModeConservative
-	cfg.Browser.ShibbolethEntityID = "https://idp.example.edu/entity"
-	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
-		t.Fatalf("valid Shibboleth entity ID rejected: %v", err)
+// TestSaveValidatesBrowserIDs collapses two structurally identical Save
+// validation checks that share the same shape: build Default(), set
+// AccessMode to conservative, set one Browser field to a valid value and
+// expect Save to succeed, then loop over invalid values and expect Save
+// to fail for each. The table carries the field setter, the valid value,
+// and the list of invalid values so a failure still names which field and
+// which invalid value was accepted.
+func TestSaveValidatesBrowserIDs(t *testing.T) {
+	tests := []struct {
+		name    string
+		set     func(*Config, string)
+		valid   string
+		invalid []string
+	}{
+		{
+			name:    "browser.shibboleth_entity_id",
+			set:     func(c *Config, v string) { c.Browser.ShibbolethEntityID = v },
+			valid:   "https://idp.example.edu/entity",
+			invalid: []string{"http://idp.example.edu/entity", "https://"},
+		},
+		{
+			name:    "browser.proquest_account_id",
+			set:     func(c *Config, v string) { c.Browser.ProquestAccountID = v },
+			valid:   "12345",
+			invalid: []string{"12345x", strings.Repeat("1", 65)},
+		},
 	}
-
-	for _, entityID := range []string{"http://idp.example.edu/entity", "https://"} {
-		t.Run(entityID, func(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			cfg := Default()
 			cfg.AccessMode = ModeConservative
-			cfg.Browser.ShibbolethEntityID = entityID
-			if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err == nil {
-				t.Fatalf("invalid Shibboleth entity ID %q accepted", entityID)
+			tc.set(&cfg, tc.valid)
+			if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+				t.Fatalf("valid %s %q rejected: %v", tc.name, tc.valid, err)
 			}
-		})
-	}
-}
-
-func TestSaveValidatesProquestAccountID(t *testing.T) {
-	cfg := Default()
-	cfg.AccessMode = ModeConservative
-	cfg.Browser.ProquestAccountID = "12345"
-	if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
-		t.Fatalf("valid ProQuest account ID rejected: %v", err)
-	}
-
-	for _, accountID := range []string{"12345x", strings.Repeat("1", 65)} {
-		t.Run(accountID, func(t *testing.T) {
-			cfg := Default()
-			cfg.AccessMode = ModeConservative
-			cfg.Browser.ProquestAccountID = accountID
-			if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err == nil {
-				t.Fatalf("invalid ProQuest account ID %q accepted", accountID)
+			for _, iv := range tc.invalid {
+				t.Run(iv, func(t *testing.T) {
+					cfg := Default()
+					cfg.AccessMode = ModeConservative
+					tc.set(&cfg, iv)
+					if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err == nil {
+						t.Fatalf("invalid %s %q accepted", tc.name, iv)
+					}
+				})
 			}
 		})
 	}

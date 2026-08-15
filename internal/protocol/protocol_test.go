@@ -668,43 +668,48 @@ func TestAuthPayloadRejectsURLFields(t *testing.T) {
 	}
 }
 
-func TestJobOfferLoginEntityIDValidation(t *testing.T) {
-	const withoutEntityID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-1","job_id":"job_offer_1","seq":1,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","expires_at":"2026-07-17T12:00:00Z"}}`
-	const withEntityID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-2","job_id":"job_offer_2","seq":2,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","login_entity_id":"https://idp.example.edu/entity","expires_at":"2026-07-17T12:00:00Z"}}`
-	const nonHTTPS = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","login_entity_id":"http://idp.example.edu/entity","expires_at":"2026-07-17T12:00:00Z"}}`
-
-	msg, err := DecodeBrowserMessage([]byte(withEntityID))
-	if err != nil {
-		t.Fatalf("job_offer with login_entity_id rejected: %v", err)
+func TestJobOfferOptionalFieldValidation(t *testing.T) {
+	cases := []struct {
+		field       string
+		without     string
+		withValid   string
+		withInvalid string
+		wantValid   string
+		accessor    func(*JobOfferPayload) string
+	}{
+		{
+			field:       "login_entity_id",
+			without:     `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-1","job_id":"job_offer_1","seq":1,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","expires_at":"2026-07-17T12:00:00Z"}}`,
+			withValid:   `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-2","job_id":"job_offer_2","seq":2,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","login_entity_id":"https://idp.example.edu/entity","expires_at":"2026-07-17T12:00:00Z"}}`,
+			withInvalid: `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","login_entity_id":"http://idp.example.edu/entity","expires_at":"2026-07-17T12:00:00Z"}}`,
+			wantValid:   "https://idp.example.edu/entity",
+			accessor:    func(p *JobOfferPayload) string { return p.LoginEntityID },
+		},
+		{
+			field:       "proquest_account_id",
+			without:     `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-1","job_id":"job_offer_1","seq":1,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","expires_at":"2026-07-17T12:00:00Z"}}`,
+			withValid:   `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-2","job_id":"job_offer_2","seq":2,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","proquest_account_id":"12345","expires_at":"2026-07-17T12:00:00Z"}}`,
+			withInvalid: `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","proquest_account_id":"12345x","expires_at":"2026-07-17T12:00:00Z"}}`,
+			wantValid:   "12345",
+			accessor:    func(p *JobOfferPayload) string { return p.ProquestAccountID },
+		},
 	}
-	if got := msg.Payload.(*JobOfferPayload).LoginEntityID; got != "https://idp.example.edu/entity" {
-		t.Fatalf("login_entity_id = %q", got)
-	}
-	if _, err := DecodeBrowserMessage([]byte(nonHTTPS)); err == nil {
-		t.Fatal("job_offer with non-https login_entity_id accepted")
-	}
-	if _, err := DecodeBrowserMessage([]byte(withoutEntityID)); err != nil {
-		t.Fatalf("job_offer without login_entity_id rejected: %v", err)
-	}
-}
-
-func TestJobOfferProquestAccountIDValidation(t *testing.T) {
-	const withoutAccountID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-1","job_id":"job_offer_1","seq":1,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","expires_at":"2026-07-17T12:00:00Z"}}`
-	const withAccountID = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-2","job_id":"job_offer_2","seq":2,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","proquest_account_id":"12345","expires_at":"2026-07-17T12:00:00Z"}}`
-	const nonDigits = `{"protocol":"papio-browser/1","type":"job_offer","msg_id":"offer-msg-3","job_id":"job_offer_3","seq":3,"payload":{"openurl":"https://resolver.example.edu/openurl","provider_hosts":["example.edu"],"access_mode":"delegated","proquest_account_id":"12345x","expires_at":"2026-07-17T12:00:00Z"}}`
-
-	msg, err := DecodeBrowserMessage([]byte(withAccountID))
-	if err != nil {
-		t.Fatalf("job_offer with proquest_account_id rejected: %v", err)
-	}
-	if got := msg.Payload.(*JobOfferPayload).ProquestAccountID; got != "12345" {
-		t.Fatalf("proquest_account_id = %q", got)
-	}
-	if _, err := DecodeBrowserMessage([]byte(nonDigits)); err == nil {
-		t.Fatal("job_offer with non-digits proquest_account_id accepted")
-	}
-	if _, err := DecodeBrowserMessage([]byte(withoutAccountID)); err != nil {
-		t.Fatalf("job_offer without proquest_account_id rejected: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			msg, err := DecodeBrowserMessage([]byte(tc.withValid))
+			if err != nil {
+				t.Fatalf("job_offer with %s %q rejected: %v", tc.field, tc.wantValid, err)
+			}
+			if got := tc.accessor(msg.Payload.(*JobOfferPayload)); got != tc.wantValid {
+				t.Fatalf("%s = %q, want %q", tc.field, got, tc.wantValid)
+			}
+			if _, err := DecodeBrowserMessage([]byte(tc.withInvalid)); err == nil {
+				t.Fatalf("job_offer with invalid %s accepted", tc.field)
+			}
+			if _, err := DecodeBrowserMessage([]byte(tc.without)); err != nil {
+				t.Fatalf("job_offer without %s rejected: %v", tc.field, err)
+			}
+		})
 	}
 }
 
