@@ -6,19 +6,20 @@ anonymous fallback, the fuzzy-search boundary/basis gate, and three fail-closed
 guards). Those changes are complete; git history and `CHANGELOG.md` hold the
 record.
 
-**Eight adversarial reviews, seven rewrites.** Three early rounds sharpened a
+**Nine adversarial reviews, eight rewrites.** Three early rounds sharpened a
 two-part plan (a per-job spend guard plus a per-identity credit ceiling); a fourth,
-given no prior-round context and a wide brief, rejected the shape of both; rounds
-five to eight reviewed the shipped code and found fourteen defects in it, including
-several in fixes made minutes earlier. The seventh judged the architecture
-converged. The eighth then falsified a *factual premise* this file had been rebuilt
-around, and disproved a transport decision it had just recorded as settled — both
-with sources, both confirmed independently before acceptance. Every finding is
-verified against the tree or the live provider before being written down. Reviews
-are preserved under `dev/scratch/oracle/20260815T0*`.
+given no prior-round context and a wide brief, rejected the shape of both; three
+more reviewed the shipped code and found live defects in it; the eighth falsified a
+premise this file had just been rebuilt around; the ninth, given the deployed code
+and no prior context, found three more live defects — two of them created by the
+previous rounds' own fixes — and named the two places where this plan promises what
+its mechanism cannot deliver. Anything a review asserted about the provider or the
+language was confirmed independently before acceptance. Every finding is verified
+against the tree or the live provider before being written down. Reviews are
+preserved under `dev/scratch/oracle/20260815T0*`.
 
 **Rejected designs** at the bottom records every dead end with its reason —
-twenty-three of the thirty-eight from earlier drafts of this file. Read it before
+twenty-three of the forty-four from earlier drafts of this file. Read it before
 proposing a simplification; most of the obvious ones are in it, with the sequence
 that breaks them.
 
@@ -137,6 +138,27 @@ everywhere. And "attributable" needs winner/candidate provenance — if the
 ledger does not record which candidate won, do not manufacture causation from a
 title-search attempt happening to precede a ready job.
 
+**The 2.3% is the yield of this query shape, not of OpenAlex — measure the shape
+before condemning the feature.** The plan and the code both call this a "title
+search", and it is not one. `lookupURL` sends `?search=<title>&per_page=10`.
+OpenAlex documents `search=` as matching title **plus abstract and full text**,
+ranked by relevance and citation count, and permits `per_page` up to 100 (a
+title-scoped `title.search` filter also exists, currently marked deprecated).
+*papio* then applies its own exact-normalized-title test to whichever ten records
+that broad relevance ranking happened to return — so an exactly-titled record
+ranked eleventh is a ten-credit "no result". Three cheap variants to compare on
+the same sample before spending engineering on either rationing *or* removal:
+`search=` with `per_page=100`, `title.search=` scoped, and the current shape.
+Same cost per call in every case, since pricing is per request and not per row.
+**Do not "improve" yield by loosening the acceptance predicate** — that trades the
+worst outcome *papio* has (item 5) for a metric.
+
+**Consequence for item 7:** item 0 gates nothing for the fuse or for item 5, but
+it *does* gate item 7. Item 7's ternary-basis and re-earn protocol exists to make
+the sibling hop correctly available and memoized; if the measurement says the hop
+should be deleted, building that protocol first is pure sunk cost. Sequence item 7
+after item 0 reports, not before.
+
 ## 1+2. One egress authority: commit the credit at the wire, or do not go
 
 These were two items until a post-commit review showed they are one boundary.
@@ -230,14 +252,44 @@ Regressions: the production OpenAlex transport cannot negotiate HTTP/2; a
 merge-`301` yields one debit per physical hop, correct per-hop identity
 attribution, and an accepted merged record.
 
-**Requirement: latch on the parsed header, not on the failed write.** When a
-valid low-quota header is parsed, set the in-process fail-closed latch for that
-credential **immediately, before attempting persistence**, and clear it only once
-the durable gate exists or its reset passes. Waiting for `Defer` to fail leaves a
-window — the durable write can block for up to five seconds — in which the
-process already knows the fact while new egress transactions still see no gate. A
-transient SQLite busy can also drop the floor while the credit write succeeds, so
-"both writes fail together because the disk is full" is too narrow an assumption.
+**Requirement: the new authority derives identity from the OUTGOING request, and
+must not inherit `sourcegate.Client`'s construction-time policy.** The two live
+wirings differ, and the difference is easy to get wrong when the wrapper is added.
+`resolverEntries` (`bootstrap.go`) injects a bare `sourcegate.Observer` and is
+deliberately *not* wrapped in `sourcegate.Client`, because admission for that path
+already happens per call at the `app.go` `AcquireAny` sites — which is correct, and
+is why the keyless fallback accounts honestly today: the identity admitted is the
+identity `anonymousIfFallback` then puts on the wire. Discovery, DOI-only
+enrichment, watch digests and MCP go through `sourcegate.Client`, which holds one
+`config.Source` captured at construction and calls `Acquire` with it regardless of
+what the request carries. Those paths never strip the key, so nothing is
+mis-accounted **yet** — but a fixed-policy wrapper placed at the wire, on a client
+whose context can carry `resolver.WithAnonymousCredentials`, produces one physical
+request with two different identities in the two authorities. Decide explicitly
+whether the existing OpenAlex `sourcegate.Client` reservation is removed or
+narrowed to identity-agnostic pacing when the new authority lands; leaving both
+means the correct authority can still be pre-empted by the wrong-identity gate.
+
+**Option worth taking while touching this: move the credential to a header.**
+OpenAlex accepts bearer authentication as equivalent to `api_key=`. Sending it as
+`Authorization` removes the *query-stripping* half of the merge-redirect defect
+outright — a `Location` without the parameter no longer downgrades the hop to
+anonymous — and takes the key out of URLs that get logged. It does **not** remove
+the need for per-hop re-admission and re-debit, and `servedIdentity` must then read
+the header rather than the query, so the change is not a substitute for the
+redirect work.
+
+**Requirement (SHIPPED — see the fixed list): latch on the parsed header, not on
+the failed write.** The in-process fail-closed latch is set for that credential
+immediately, before persistence is attempted, and survives until the provider's own
+reset. Waiting for `Defer` to fail leaves a window — the durable write can block for
+up to five seconds — in which the process already knows the fact while new egress
+still sees no gate. A transient SQLite busy can also drop the floor while the credit
+write succeeds, so "both writes fail together because the disk is full" is too
+narrow an assumption. What remains for this item is the *reader* side: the new
+egress authority must consult the latch, since today only `sourcegate.Observer.Do`
+enforces it, which covers every OpenAlex client in the tree but is a different layer
+from the credit commit.
 
 **Be honest about the floor's limit.** A fact learned from a response cannot be
 made perfectly crash-durable if the machine dies before any write succeeds. The
@@ -325,20 +377,45 @@ requests, not that its books balance to the credit.
   `x-ratelimit-limit: 10000` **and** `x-ratelimit-limit-usd: 1`; plus
   `x-ratelimit-remaining-usd` and `x-ratelimit-prepaid-remaining-usd`. Credits are
   simply hundredths of a cent. **Decision: meter in credits internally** — they
-  are integers, so the conditional SQL cannot drift on float rounding — and record
-  the reported `cost-usd` alongside for the existing monetary axis. Do **not** pass
-  credits through `reserve(ctx, source, identity, policy.MaxCostUSD,
+  are integers, so the conditional SQL cannot drift on float rounding. Do **not**
+  pass credits through `reserve(ctx, source, identity, policy.MaxCostUSD,
   estimatedCost)`: that argument is dollars, and reusing it implements the
-  credits-as-dollars design this document rejects. The USD figures are now real
-  and provider-supplied, so the dormant axis can finally be fed truthfully.
+  credits-as-dollars design this document rejects.
+  - **Do not feed observed `cost-usd` into `spent_usd`.** An earlier draft of this
+    bullet said the provider's USD figures let "the dormant axis finally be fed
+    truthfully", and that contradicts what `spent_usd` *is*. It is not telemetry:
+    `reserve` reads it before the wire, refuses when `spent + cost > limit`, and
+    increments it as part of monthly admission — `ErrExceeded` is that refusal. A
+    second writer adding provider-reported dollars to the same column therefore
+    either double-counts every non-zero estimate or silently activates a monthly
+    admission authority this plan explicitly defers. **Decision: observed USD goes
+    to a separate diagnostic column with no admission semantics, or is not stored
+    at all this tranche.** `spent_usd` is left alone until the monthly-USD feature
+    is redesigned deliberately.
 - **`prepaid-remaining-usd` changes the stakes: a runaway loop can spend real
   money, not just today's allowance.** A prepaid balance covers usage beyond the
   daily budget, so on any paying installation the pre-fix failure mode was not
-  "gated until midnight" but "*papio* charged the user". The fuse must therefore gate
-  on the daily allowance **and** refuse to draw down prepaid balance implicitly;
-  spending real money needs an explicit opt-in that does not exist today. This is
-  the strongest argument in the file for the fuse being safety rather than hygiene,
-  and it was invisible while only `credits`/`remaining` were being read.
+  "gated until midnight" but "*papio* charged the user". This is the strongest
+  argument in the file for the fuse being safety rather than hygiene, and it was
+  invisible while only `credits`/`remaining` were being read.
+  - **State the guarantee as what the mechanism can actually deliver.** An earlier
+    draft promised the fuse would "refuse to draw down prepaid balance
+    implicitly". It cannot: the durable counter knows only what *papio*
+    committed, and the provider's balance is learned only from responses *after*
+    *papio* sends. An OpenAlex account is shared — the web UI and any other client
+    draw on the same budget — so another consumer can exhaust the free allowance
+    while *papio*'s own counter sits comfortably under its fraction, and *papio*'s
+    next admitted call is the first one charged to prepaid. No arrangement of
+    passive response headers closes that, and claiming otherwise is exactly the
+    class of error this file keeps catching: an observation treated as an
+    authority. **The honest invariant: *papio* bounds the credits it authorizes,
+    and stops as soon as it observes impending or actual prepaid use.** A hard
+    "*papio* can never spend prepaid dollars" claim requires provider-side
+    no-overage enforcement or exclusive account use, neither of which *papio* can
+    establish. Note the corollary for the escape hatches: an unmetered
+    `daily_credit_fraction = 0`, or an absolute override above the remaining free
+    allowance, removes even the bound — so `prepaid-remaining-usd` falling below
+    its starting value must close egress regardless of local ceilings.
 - **Atomic in SQL across insert AND update.** Hundreds of jobs target the same
   hot row, so it must be one conditional mutation — and the condition must cover
   the *first* write of a day, not only the conflict-update arm. A naive
@@ -455,6 +532,19 @@ excludes it, along with search hits, version edges, and routing evidence — all
 which may create candidates but may never promote their own work metadata. An
 exact-identity-echo-verified canonical record (DOI **or** OpenAlex ID) is a
 *different authority class* and may enrich.
+
+**The primary resolution path already manufactures such a candidate, and it is
+not a fuzzy-sibling edge case.** `matchesTitleSearch` (`openalex.go`) requires an
+exact normalized title, then skips the year test when `requested.Year == 0`, and
+`sameAuthorLists` returns `true` outright for an empty requested author list. So a
+submission of `{Title: T}` with no DOI, no year and no authors is matched on title
+*alone* — and the accepted record's own DOI, OpenAlex ID and PMID are emitted at
+`IdentityConfidence: 0.75`. Two works sharing a normalized title (a preprint and
+an unrelated paper, a common review title, a translation) are indistinguishable to
+that predicate. This is independent of the sibling hop, survives deleting the
+sibling hop entirely, and is sufficient justification for the invariant on its
+own: item 5 must not be narrowed to a fuzzy-sibling rule, and must not be gated on
+threshold tuning or a corpus.
 
 **Name the anchor, or an implementer has to choose one.** Validation and cache
 attestations must consume a **durable, immutable snapshot of the submitted
@@ -620,9 +710,16 @@ folded there rather than kept as a separate narrower rule.
 ## Ordering
 
 **`(0 estimate ‖ 5 evidence authority)` alongside `(1+2 egress authority)` → 3
-truthful park → 7 effective basis.** Then, deferred with reasons written down:
-**4 jitter** (operational smoothing, not an invariant) and **6 per-job guard**
-(fairness, capped in aggregate by the fuse).
+truthful park → 7 effective basis, *if item 0 says the sibling hop survives*.**
+Then, deferred with reasons written down: **4 jitter** (operational smoothing, not
+an invariant) and **6 per-job guard** (fairness, capped in aggregate by the fuse).
+
+Item 0 gates nothing else — not the fuse, not item 5 — but it does gate item 7,
+which exists solely to make the sibling hop correctly available and memoized.
+Measuring the query shape (`search=` vs a title-scoped filter, `per_page` 10 vs
+100) is part of item 0, not a separate task: the current 2.3% is the yield of one
+truncated broad query, so the hop could be worth keeping *or* worth deleting and
+the measurement cannot tell you which until the shape is controlled for.
 
 Within item 1+2 the shortest correct path is: **fix the live merge-redirect
 identity/attribution defect → define, freeze and clamp the relative denominator →
@@ -791,9 +888,89 @@ belongs in the fuse because drawing it down spends real money.
   changing the retry classification. Regression:
   `TestFetchPreservesTheClientCause`. The app-side park semantics remain item 3's
   typed taxonomy.
+- **A failed floor write handed permission back.** `Observer.observe` parsed
+  `remaining`/`limit`/`reset`, determined the 5% floor was crossed, attempted the
+  durable `Defer`, and on failure logged and returned — so a busy or full SQLite
+  converted a fact the process already held into more wire traffic at exactly the
+  moment the budget was lowest. This was the plan's own "latch on the parsed
+  header" requirement, unimplemented while the plan asserted the floor was
+  authoritative. Now: latch first, before persistence, per identity, until the
+  provider's own reset, and `Observer.Do` refuses a latched identity before the
+  wire. No retry or settlement machinery — losing availability for one reset
+  period is the safe side; spending a prepaid balance is not. Regressions:
+  `TestFloorLatchesOnTheParsedHeaderNotOnAFailedWrite`,
+  `TestFailedFloorWriteLatchesEgressClosed`, `TestLatchIsPerIdentity`,
+  `TestLatchExpiresAtReset`, `TestLatchIgnoresUnnameableCredential`.
+- **The provider floor was not atomic with the debit, so waiting workers escaped
+  it.** `Acquire`'s quota pre-check (added earlier this session) is not the
+  authority it was described as: after it passes, `Acquire` can sleep up to
+  `MaxInlineWait` in the gate loop or on the token bucket, and another goroutine's
+  headers can commit the floor during that sleep. `reserve` re-read
+  `next_allowed_at` for the *ordinary* row only, so such a worker committed and
+  sent. It had not reached the transport at all, so the old comment's defence —
+  "at most one already-in-flight request" — described a different situation than
+  the one that occurs. `reserve` now re-reads the quota row for the same identity
+  inside the committing transaction, and an unparseable floor fails closed.
+  Regression: `TestReserveRefusesAFloorThatLandedDuringTheWait`.
+- **Making the floor authoritative silently destroyed the anonymous fallback.**
+  With the above, `Acquire` can refuse for provider-quota reasons — and
+  `AcquireAny` could not tell that apart from an ordinary gate, so it returned the
+  deferral and parked the job with the keyless tier sitting there unspent. That is
+  the fallback's entire purpose, defeated by the fix meant to protect it. Now
+  `ErrDeferred.Quota` types the refusal and `AcquireAny` advances on it exactly as
+  its own pre-check would, while an ordinary gate is still returned unchanged —
+  a rate/retry gate is not a credential-switch licence. `budget.QuotaSourceName`
+  replaces the `source+"_quota"` string literal that three readers and one writer
+  in two packages were agreeing on by hand. Regressions:
+  `TestAcquireAnyFallsBackOnAFloorCommittedDuringAnInlineWait` (drives the real
+  race: an ordinary gate inside `MaxInlineWait` holds the worker while the floor
+  commits; both fixes are required, verified by mutation),
+  `TestAcquireAnyDoesNotFallBackOnAnOrdinaryGate`.
+- **The round-eight `fetch` comment asserted a wiring that does not exist.** It
+  claimed the injected client "is a `sourcegate.Client`". For `resolverEntries` it
+  is a bare `Observer` — admission happens upstream at the `AcquireAny` call site,
+  by design — and only the discovery wiring wraps a `Client`. The fix itself
+  (wrap, never replace) stands and is more useful than stated, since it now also
+  preserves `*sourcegate.ErrQuotaLatched`; the rationale was corrected in place.
+  Recorded because it is the same failure this file keeps finding: a comment
+  describing intended wiring, read later as a fact about the tree.
 
 ## Rejected designs (do not re-derive)
 
+- **Feeding provider-reported `cost-usd` into `spent_usd`.** Written into an
+  earlier draft of this file as "the dormant axis can finally be fed truthfully".
+  `spent_usd` is not a telemetry column: `reserve` reads it before the wire,
+  refuses on `spent + cost > limit`, and increments it as monthly admission. A
+  second writer either double-counts every non-zero estimate or activates an
+  admission authority this plan defers. Observed USD gets its own diagnostic
+  column or none.
+- **A fuse that "refuses to draw down prepaid balance implicitly".** Not
+  implementable from passive response headers: the local counter knows only what
+  *papio* committed, the provider balance is known only after *papio* sends, and an
+  OpenAlex account is shared with the web UI and any other client. Another consumer
+  can exhaust the free allowance while *papio* sits under its fraction, making
+  *papio*'s next admitted call the first charged to prepaid. Replaced by the
+  honest bound plus a stop on observed prepaid movement.
+- **Retrying or settling a failed floor write to regain availability.** Considered
+  when fixing the fail-open. Rejected: a latch held until the provider's own reset
+  is the safe failure mode, and retry machinery adds a second state machine whose
+  own failure modes need the same analysis. Availability lost for one reset period
+  is cheap; the alternative spends real money.
+- **Treating the 2.3% search yield as a property of OpenAlex.** It is the yield of
+  `?search=<title>&per_page=10` plus a local exact-title filter — a broad
+  relevance-ranked query (title, abstract, full text) truncated at ten rows, so an
+  exactly-titled record ranked eleventh is a paid miss. Compare query shapes before
+  concluding the feature is uneconomic; the per-request price does not change with
+  `per_page`.
+- **Building item 7 before item 0 reports.** Item 7's ternary basis and re-earn
+  protocol exists to make the sibling hop correctly available. If the measurement
+  says delete the hop, that protocol is sunk cost. Item 0 gates nothing else, but
+  it gates this.
+- **Bearer authentication as a substitute for the redirect work.** Moving the
+  credential to an `Authorization` header is worth doing — it removes the
+  query-stripping half of the merge-`301` identity downgrade and keeps keys out of
+  logged URLs — but it does not remove per-hop re-admission or re-debit, so it is
+  an addition to item 1+2, not a replacement for any part of it.
 - **An absolute credit ceiling as the shipped default (`daily_credit_limit =
   4000`).** Derived from the author's own keyed 10,000-credit day. Measured live,
   the keyless pool reports a limit of 1,000, so the default would have been

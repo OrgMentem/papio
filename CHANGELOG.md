@@ -11,6 +11,29 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **When OpenAlex says it is nearly out of budget, *papio* now stops even if it
+  cannot write that down.** The warning was recorded to the database and, if that
+  write failed — a busy or full disk — the warning was logged and otherwise
+  discarded, so the next request went out as though nothing had been said. *papio*
+  now stops asking that account until the provider's own reset regardless of
+  whether the note could be saved, and it stops the moment the warning is read
+  rather than after trying to save it. The two OpenAlex accounts — with and
+  without an API key — are budgeted separately, so stopping one never silences
+  the other.
+
+- **A paper that had already waited its turn could slip past that stop.** The
+  budget check happened before the wait for a free slot, not after, so a request
+  held up for a moment could be sent against a limit that had been reached while
+  it waited. The check is now part of the same step that records the spend, so
+  there is no gap between deciding and sending.
+
+- **Reaching an API key's daily limit no longer parks work that the keyless
+  account could still do.** Tightening the check above made a spent key look like
+  an ordinary outage, which stopped everything instead of falling back — the
+  fallback's whole purpose. A limit reached on one account now moves to the next
+  one, while an ordinary outage still stops the source for everybody, since that
+  is not something a different account can fix.
+
 - **A busy cache no longer throws away the one record a paper's search depends
   on.** The reused-record cache has a size limit, and on reaching it *papio*
   discarded stale entries — but if none were stale, it emptied the cache outright.

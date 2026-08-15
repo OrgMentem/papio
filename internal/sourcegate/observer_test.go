@@ -4,6 +4,7 @@ package sourcegate
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"testing"
@@ -251,5 +252,130 @@ func TestObserverCanonicalizesTheConfiguredCredential(t *testing.T) {
 	}
 	if got := deferrer.calls[0].policy.APIKey; got != "private-key" {
 		t.Fatalf("floor identity key = %q, want the canonical %q", got, "private-key")
+	}
+}
+
+// A failed floor write must not hand back permission. The provider has already
+// said this identity is nearly spent; losing the durable record is a reason to
+// stop, not a reason to keep sending.
+func TestFailedFloorWriteLatchesEgressClosed(t *testing.T) {
+	headers := map[string]string{
+		"X-RateLimit-Remaining": "100",
+		"X-RateLimit-Limit":     "10000",
+		"X-RateLimit-Reset":     "3600",
+	}
+	observer, deferrer, inner := testObserver(t, 200, headers)
+	deferrer.err = errors.New("database is locked")
+
+	// The response that carried the news is served: it already happened.
+	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+		t.Fatalf("first call = %v, want the already-served response", err)
+	}
+	if inner.calls != 1 {
+		t.Fatalf("inner calls = %d, want 1", inner.calls)
+	}
+
+	// The next one is refused here, before the wire.
+	_, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key"))
+	var latched *ErrQuotaLatched
+	if !errors.As(err, &latched) {
+		t.Fatalf("second call = %v, want *ErrQuotaLatched", err)
+	}
+	if want := observerNow.Add(time.Hour); !latched.Until.Equal(want) {
+		t.Fatalf("latched until %s, want the provider's own reset %s", latched.Until, want)
+	}
+	if inner.calls != 1 {
+		t.Fatalf("inner calls = %d, want no second request", inner.calls)
+	}
+}
+
+// The two pools are separately budgeted, so a keyed latch must not close the
+// keyless tier that the fallback path exists to reach.
+func TestLatchIsPerIdentity(t *testing.T) {
+	headers := map[string]string{
+		"X-RateLimit-Remaining": "100",
+		"X-RateLimit-Limit":     "10000",
+		"X-RateLimit-Reset":     "3600",
+	}
+	observer, deferrer, inner := testObserver(t, 200, headers)
+	deferrer.err = errors.New("disk full")
+	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works")); err != nil {
+		t.Fatalf("keyless call = %v, want it unaffected by the keyed latch", err)
+	}
+	if inner.calls != 2 {
+		t.Fatalf("inner calls = %d, want the keyless request forwarded", inner.calls)
+	}
+}
+
+// A latch expires at the provider's reset, not at process exit: a stale past
+// instant read as "still latched" would close egress forever.
+func TestLatchExpiresAtReset(t *testing.T) {
+	headers := map[string]string{
+		"X-RateLimit-Remaining": "100",
+		"X-RateLimit-Limit":     "10000",
+		"X-RateLimit-Reset":     "3600",
+	}
+	observer, deferrer, inner := testObserver(t, 200, headers)
+	deferrer.err = errors.New("database is locked")
+	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+		t.Fatal(err)
+	}
+	observer.now = func() time.Time { return observerNow.Add(2 * time.Hour) }
+	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+		t.Fatalf("post-reset call = %v, want the latch expired", err)
+	}
+	if inner.calls != 2 {
+		t.Fatalf("inner calls = %d, want the post-reset request forwarded", inner.calls)
+	}
+}
+
+// An unnameable third credential is neither latched nor governed by a latch:
+// the observer refuses to attribute it, and attributing it either way is wrong.
+func TestLatchIgnoresUnnameableCredential(t *testing.T) {
+	headers := map[string]string{
+		"X-RateLimit-Remaining": "100",
+		"X-RateLimit-Limit":     "10000",
+		"X-RateLimit-Reset":     "3600",
+	}
+	observer, deferrer, inner := testObserver(t, 200, headers)
+	deferrer.err = errors.New("database is locked")
+	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=someone-elses")); err != nil {
+		t.Fatalf("third-credential call = %v, want no latch applied to an identity we cannot name", err)
+	}
+	if inner.calls != 2 {
+		t.Fatalf("inner calls = %d, want the unnameable request forwarded", inner.calls)
+	}
+}
+
+// The latch must not be conditional on the write FAILING. A successful durable
+// write and a slow one are indistinguishable to the caller that arrives during
+// it, so the process-local stop is set from the parsed header. Here Defer
+// succeeds, and the next request is still refused before the wire.
+func TestFloorLatchesOnTheParsedHeaderNotOnAFailedWrite(t *testing.T) {
+	headers := map[string]string{
+		"X-RateLimit-Remaining": "100",
+		"X-RateLimit-Limit":     "10000",
+		"X-RateLimit-Reset":     "3600",
+	}
+	observer, deferrer, inner := testObserver(t, 200, headers)
+	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+		t.Fatal(err)
+	}
+	if len(deferrer.calls) != 1 {
+		t.Fatalf("Defer calls = %d, want the durable floor written too", len(deferrer.calls))
+	}
+	_, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?api_key=private-key"))
+	var latched *ErrQuotaLatched
+	if !errors.As(err, &latched) {
+		t.Fatalf("second call = %v, want *ErrQuotaLatched even though the write succeeded", err)
+	}
+	if inner.calls != 1 {
+		t.Fatalf("inner calls = %d, want no second request", inner.calls)
 	}
 }

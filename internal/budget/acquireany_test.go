@@ -177,3 +177,111 @@ func TestAcquireHonoursTheProviderQuotaFloor(t *testing.T) {
 		t.Fatalf("crossref Acquire = %v, want admission: an openalex floor is not a crossref floor", err)
 	}
 }
+
+// The floor must bind atomically with the debit, not merely at a pre-check.
+// A worker that clears the pre-check can still wait locally — in the gate loop
+// or on the token bucket — and during that wait another goroutine's response
+// headers commit the floor. Such a worker has not reached the transport, so
+// admitting it is a NEW request against a floor papio had already recorded.
+func TestReserveRefusesAFloorThatLandedDuringTheWait(t *testing.T) {
+	m := testManager(t)
+	keyed, _ := keyedAndAnon()
+	ctx := context.Background()
+	until := time.Now().UTC().Add(6 * time.Hour)
+
+	// Simulate the race precisely: the floor becomes durable after any
+	// pre-check would have passed, so go straight to the committing step.
+	if err := m.Defer(ctx, QuotaSourceName("openalex"), keyed, until); err != nil {
+		t.Fatal(err)
+	}
+	err := m.reserve(ctx, "openalex", identityFor(keyed), keyed.MaxCostUSD, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("reserve = %v, want *ErrDeferred from the provider floor", err)
+	}
+	if !deferred.Quota {
+		t.Fatalf("deferred.Quota = false, want the provider-quota discriminator")
+	}
+}
+
+// Making the floor authoritative inside Acquire silently destroyed the
+// fallback: AcquireAny's own pre-check passed, Acquire's did not, and the
+// resulting refusal was indistinguishable from an ordinary gate — so the
+// keyless identity sitting there unspent was never tried.
+func TestAcquireAnyFallsBackWhenTheFloorLandsAfterItsPreCheck(t *testing.T) {
+	m := testManager(t)
+	keyed, anon := keyedAndAnon()
+	ctx := context.Background()
+
+	// Gate the keyed identity's quota row. AcquireAny's pre-check sees it too,
+	// so to isolate the Acquire-side path the test asserts the observable
+	// outcome both share: the keyless identity is admitted, not parked.
+	if err := m.Defer(ctx, QuotaSourceName("openalex"), keyed, time.Now().UTC().Add(6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
+	if err != nil {
+		t.Fatalf("AcquireAny = %v, want the keyless identity admitted", err)
+	}
+	if chosen.APIKey != "" {
+		t.Fatalf("chosen = %+v, want the keyless identity", chosen)
+	}
+}
+
+// An ordinary gate is NOT a credential-switch licence: it says this source is
+// unavailable no matter who asks, so AcquireAny must return it rather than
+// spending a second identity's allowance on a refusal that has nothing to do
+// with quota.
+func TestAcquireAnyDoesNotFallBackOnAnOrdinaryGate(t *testing.T) {
+	m := testManager(t)
+	keyed, anon := keyedAndAnon()
+	ctx := context.Background()
+	if err := m.Defer(ctx, "openalex", keyed, time.Now().UTC().Add(6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
+	var deferred *ErrDeferred
+	if !errors.As(err, &deferred) {
+		t.Fatalf("AcquireAny = %v, want the ordinary gate returned", err)
+	}
+	if deferred.Quota {
+		t.Fatalf("deferred.Quota = true, want an ordinary gate")
+	}
+	if chosen.APIKey != keyed.APIKey {
+		t.Fatalf("chosen = %+v, want the keyed identity that was actually refused", chosen)
+	}
+}
+
+// The exact sequence, isolated: the floor lands AFTER the keyed identity's
+// pre-check and BEFORE its egress. An ordinary gate inside MaxInlineWait makes
+// Acquire sleep after its own quota check has already passed, and the floor is
+// committed during that sleep — so only the transactional re-read in reserve can
+// catch it, and only the typed refusal can keep the fallback alive. Before the
+// fix this parked the job with the keyless tier untouched.
+func TestAcquireAnyFallsBackOnAFloorCommittedDuringAnInlineWait(t *testing.T) {
+	m := testManager(t)
+	keyed, anon := keyedAndAnon()
+	ctx := context.Background()
+
+	// A short ordinary gate: well inside MaxInlineWait, so Acquire waits it out
+	// inline rather than deferring, leaving a window with no keyed quota gate.
+	if err := m.Defer(ctx, "openalex", keyed, time.Now().UTC().Add(300*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	committed := make(chan error, 1)
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		committed <- m.Defer(ctx, QuotaSourceName("openalex"), keyed, time.Now().UTC().Add(6*time.Hour))
+	}()
+
+	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
+	if deferErr := <-committed; deferErr != nil {
+		t.Fatal(deferErr)
+	}
+	if err != nil {
+		t.Fatalf("AcquireAny = %v, want the keyless identity admitted after the keyed floor landed mid-wait", err)
+	}
+	if chosen.APIKey != "" {
+		t.Fatalf("chosen = %+v, want the keyless identity", chosen)
+	}
+}

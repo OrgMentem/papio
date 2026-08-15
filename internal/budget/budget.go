@@ -70,6 +70,16 @@ type ErrDeferred struct {
 	// Advisory marks a process-local token-bucket backoff rather than a
 	// durable source gate.
 	Advisory bool
+	// Quota marks a refusal by the provider's OWN reported daily budget for
+	// this identity (the source+"_quota" row a sourcegate.Observer writes),
+	// rather than by papio's local pacing or an ordinary 429 gate. The
+	// distinction is load-bearing for AcquireAny: an identity whose provider
+	// quota is spent has a *different* identity worth trying, while an
+	// ordinary gate means this source is unavailable no matter who asks.
+	// Without the discriminator, AcquireAny can only make that call from its
+	// own pre-check, and any floor landing between that check and egress
+	// silently destroys the fallback it exists to provide.
+	Quota bool
 }
 
 func (e *ErrDeferred) Error() string {
@@ -192,7 +202,7 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 	if until, err := m.quotaGate(ctx, source, policy); err != nil {
 		return err
 	} else if until != nil {
-		return &ErrDeferred{Source: source, Identity: identity, Until: *until}
+		return &ErrDeferred{Source: source, Identity: identity, Until: *until, Quota: true}
 	}
 
 	// One deadline for the whole loop: a gate that keeps being pushed out
@@ -220,13 +230,12 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 	return m.reserve(ctx, source, identity, policy.MaxCostUSD, estimatedCost)
 }
 
-// AcquireAny admits the first policy, in order, whose own "<source>_quota"
-// signal (sourcegate.Observer) does not say its daily quota is exhausted. The
-// quota check runs BEFORE the ordinary per-source Acquire for every policy,
-// including the last: a policy whose own quota is gated is never given a real
-// admission attempt, so it can neither spend a real request proving what its
-// own header already said, nor silently accept an ordinary rate/retry state
-// that has nothing to do with quota.
+// AcquireAny admits the first policy, in order, whose own provider-reported
+// daily quota is not exhausted. The quota check runs BEFORE the ordinary
+// per-source Acquire for every policy, including the last: a policy whose own
+// quota is gated is never given a real admission attempt, so it can neither
+// spend a real request proving what its own header already said, nor silently
+// accept an ordinary rate/retry state that has nothing to do with quota.
 //
 // An ordinary (non-quota) Acquire failure on the policy actually attempted —
 // advisory (this process's own token bucket) or a durable retry/backoff gate
@@ -239,19 +248,20 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 // signal already says no, a synthetic *ErrDeferred naming that identity's
 // quota-reopen instant is returned.
 //
-// quotaGate's snapshot and the subsequent Acquire are deliberately NOT one
-// atomic step. An Observer's Defer of a "_quota" row can commit between them,
-// which admits at most one already-in-flight request per worker after the gate
-// lands; the very next AcquireAny sees it. Serializing the pair under a
-// manager-wide mutex would stall every worker's admission behind one Acquire
-// sleeping up to MaxInlineWait on an inline gate wait, and the floor fires
-// with budget to spare precisely so a handful of stragglers are absorbed. The
-// guarantee is "no new admission once the gate is visible", not "zero requests
-// after the header was received".
+// The pre-check is an ORDERING device, not the authority. The authority is
+// inside Acquire, which re-reads the floor itself and — in reserve — inside the
+// transaction that commits the debit. So a floor landing between the pre-check
+// and egress does stop the request. That correctness fix silently destroyed
+// the fallback, which is why the refusal is typed: Acquire returned its own
+// quota deferral, AcquireAny could not tell it apart from an ordinary gate,
+// and parked instead of trying the keyless identity that was sitting there
+// unspent. A quota refusal from the attempted policy therefore advances
+// exactly as the pre-check would have, and only the last identity parks.
 func (m *Manager) AcquireAny(ctx context.Context, source string, policies []config.Source, estimatedCost float64) (config.Source, error) {
 	if len(policies) == 0 {
 		return config.Source{}, errors.New("no policies supplied")
 	}
+	last := len(policies) - 1
 	for i, policy := range policies {
 		until, err := m.quotaGate(ctx, source, policy)
 		if err != nil {
@@ -261,21 +271,38 @@ func (m *Manager) AcquireAny(ctx context.Context, source string, policies []conf
 			return config.Source{}, err
 		}
 		if until != nil {
-			if i < len(policies)-1 {
+			if i < last {
 				continue
 			}
-			return policy, &ErrDeferred{Source: source, Identity: identityFor(policy), Until: *until}
+			return policy, &ErrDeferred{Source: source, Identity: identityFor(policy), Until: *until, Quota: true}
 		}
-		return policy, m.Acquire(ctx, source, policy, estimatedCost)
+		err = m.Acquire(ctx, source, policy, estimatedCost)
+		var deferred *ErrDeferred
+		if i < last && errors.As(err, &deferred) && deferred.Quota {
+			// The floor landed after the pre-check. Same disposition as the
+			// pre-check: this identity is spent, the next one may not be. No
+			// request left the machine, so nothing is double-charged.
+			continue
+		}
+		return policy, err
 	}
 	return config.Source{}, errors.New("acquireany: unreachable, all policies skipped")
 }
 
-// quotaGate reports the "<source>_quota" gate instant for policy's identity,
-// if one is currently active — the signal sourcegate.Observer writes from the
-// provider's own daily-budget headers. nil, nil means not gated.
+// QuotaSourceName is the source-budget row that holds a provider's OWN reported
+// daily-budget floor for an identity, as distinct from the row holding papio's
+// local pacing and ordinary 429 gates for the same source. It is a wire-level
+// key shared by the writer (sourcegate.Observer, which owns the headers) and
+// three readers here, so it lives in one place: two packages agreeing on a
+// string literal is a silent-no-op waiting to happen, and a floor that is
+// written under a name nobody reads fails open.
+func QuotaSourceName(source string) string { return source + "_quota" }
+
+// quotaGate reports the quota-row gate instant for policy's identity, if one is
+// currently active — the signal sourcegate.Observer writes from the provider's
+// own daily-budget headers. nil, nil means not gated.
 func (m *Manager) quotaGate(ctx context.Context, source string, policy config.Source) (*time.Time, error) {
-	snap, err := m.Snapshot(ctx, source+"_quota", policy)
+	snap, err := m.Snapshot(ctx, QuotaSourceName(source), policy)
 	if err != nil {
 		return nil, err
 	}
@@ -382,6 +409,31 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 		}
 		if gate.After(now) {
 			return &ErrDeferred{Source: source, Identity: identity, Until: gate}
+		}
+	}
+	// The same argument applies to the PROVIDER's floor, and it was missed:
+	// the re-read above covers only the ordinary row this reserve was handed.
+	// A worker that cleared Acquire's quotaGate pre-check can then sleep in
+	// the gate loop or takeToken for up to MaxInlineWait, during which another
+	// goroutine's response headers commit the quota row. That worker has not
+	// reached the transport at all — it is waiting locally — so admitting it
+	// is not "a request already in flight", it is a new request sent against a
+	// floor papio had already durably recorded. Both authorities must be read
+	// in the transaction that mutates the counters, or the floor binds only
+	// for callers who happened not to wait.
+	var quotaNext sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT next_allowed_at FROM source_budgets
+		WHERE source = ? AND identity = ?`, QuotaSourceName(source), identity).Scan(&quotaNext); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if quotaNext.Valid && quotaNext.String != "" {
+		gate, err := time.Parse(time.RFC3339Nano, quotaNext.String)
+		if err != nil {
+			// Fail closed: an unparseable floor is not an absent one.
+			return fmt.Errorf("source %s (%s) has invalid quota next_allowed_at: %w", source, identity, err)
+		}
+		if gate.After(now) {
+			return &ErrDeferred{Source: source, Identity: identity, Until: gate, Quota: true}
 		}
 	}
 	if window != month {

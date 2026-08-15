@@ -292,13 +292,19 @@ func (r *Resolver) fetch(ctx context.Context, endpoint *url.URL) (io.ReadCloser,
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		// Wrap, never replace. The injected client is a sourcegate.Client, which
-		// returns *budget.ErrDeferred / *budget.ErrExceeded unwrapped so a caller
-		// can park until that identity's real reset. Substituting a fresh error
-		// destroyed the cause: a deferral until UTC midnight arrived as an
-		// undifferentiated transport failure and cycled through generic retry
-		// instead of parking. TemporaryError unwraps, so errors.As finds the
-		// cause again while the retry classification stays as it was.
+		// Wrap, never replace. Which typed causes actually arrive here depends on
+		// the wiring, and the earlier version of this comment asserted one that
+		// is only half true: resolverEntries injects a bare sourcegate.Observer
+		// (admission for that path happens upstream at the app.go AcquireAny
+		// call site, which is why it is deliberately NOT wrapped in
+		// sourcegate.Client), while the discovery wiring does wrap one. So the
+		// causes worth preserving are the Observer's own *ErrQuotaLatched and,
+		// on the wrapped paths, *budget.ErrDeferred / *budget.ErrExceeded.
+		// Substituting a fresh error destroyed all of them: a refusal naming a
+		// specific identity and reset instant arrived as an undifferentiated
+		// transport failure and cycled through generic retry instead of parking.
+		// TemporaryError unwraps, so errors.As finds the cause again while the
+		// retry classification stays as it was.
 		return nil, &resolver.TemporaryError{Err: fmt.Errorf("openalex: request failed: %w", err)}
 	}
 	if resp == nil {

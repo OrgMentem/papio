@@ -22,8 +22,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"papio/internal/budget"
 	"papio/internal/config"
 )
 
@@ -105,6 +107,29 @@ type Observer struct {
 	source   string
 	keyed    config.Source
 	now      func() time.Time
+
+	// mu guards latched, the process-local fail-closed floor used when the
+	// durable write fails. Keyed by the identity the response was served
+	// under, because the two pools are separately budgeted: the keyed tier
+	// being spent says nothing about the keyless one.
+	mu      sync.Mutex
+	latched map[string]time.Time
+}
+
+// ErrQuotaLatched refuses a request because the provider reported this
+// identity's daily budget nearly spent and the durable floor could not be
+// written. It is deliberately its own type rather than a budget error: the
+// observer knows nothing about admission ledgers, and the seam between them is
+// the narrow Deferrer interface.
+type ErrQuotaLatched struct {
+	Source   string
+	Identity string
+	Until    time.Time
+}
+
+func (e *ErrQuotaLatched) Error() string {
+	return fmt.Sprintf("source %s (%s) quota floor is latched in this process until %s",
+		e.Source, e.Identity, e.Until.UTC().Format(time.RFC3339))
 }
 
 // quotaFloorDivisor sets the floor at 1/20th (5%) of the reported daily
@@ -147,14 +172,21 @@ func NewObserver(deferrer Deferrer, source string, keyed config.Source, inner HT
 	return &Observer{inner: inner, deferrer: deferrer, source: source, keyed: keyed, now: time.Now}, nil
 }
 
-// Do forwards the request, then floor-defers the identity it was served under
-// when the provider reports its daily budget nearly spent. Unparseable or
-// self-inconsistent headers are a no-op: the observer never fails a request
-// that already succeeded at the transport level. A failed Defer cannot fail
-// the request either, but it is logged loudly — it is the only durable record
-// that the provider asked papio to stop, and losing it silently is how a
-// quota gets spent twice.
+// Do refuses a request whose identity is latched, forwards otherwise, then
+// floor-defers the identity it was served under when the provider reports its
+// daily budget nearly spent. Unparseable or self-inconsistent headers are a
+// no-op: the observer never fails a request that already succeeded at the
+// transport level. A failed Defer cannot fail that request either — it has
+// already been served — but it latches this process closed for the identity so
+// the NEXT one is refused here, before the wire, rather than being permitted by
+// the absence of a record papio failed to write.
 func (o *Observer) Do(req *http.Request) (*http.Response, error) {
+	served, known := o.servedIdentity(req)
+	if known {
+		if until, latched := o.latchedUntil(served); latched {
+			return nil, &ErrQuotaLatched{Source: o.source, Identity: poolName(served), Until: until}
+		}
+	}
 	resp, err := o.inner.Do(req)
 	if resp == nil {
 		return resp, err
@@ -163,17 +195,18 @@ func (o *Observer) Do(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-func (o *Observer) observe(req *http.Request, resp *http.Response) {
-	// The identity is read from the OUTGOING request, not from configuration:
-	// this same client serves both the keyed and the keyless tier, and a gate
-	// earned by one credential must never be written against the other. The
-	// comparison is against the configured key by VALUE, not by presence: a
-	// request bearing some third key was served under an identity this
-	// observer cannot name, and guessing would write the gate against the
-	// wrong pool — worse than writing none.
+// servedIdentity names the identity a request goes out under, read from the
+// OUTGOING request rather than from configuration: this same client serves both
+// the keyed and the keyless tier, and a gate earned by one credential must
+// never be attributed to the other. The comparison is against the configured
+// key by VALUE, not by presence: a request bearing some third key was served
+// under an identity this observer cannot name, so it reports not-known and
+// callers neither latch it nor obey a latch on its behalf — guessing would
+// bind the wrong pool, which is worse than binding none.
+func (o *Observer) servedIdentity(req *http.Request) (config.Source, bool) {
 	served := o.keyed
 	sent := ""
-	if req.URL != nil {
+	if req != nil && req.URL != nil {
 		sent = req.URL.Query().Get("api_key")
 	}
 	switch sent {
@@ -182,6 +215,49 @@ func (o *Observer) observe(req *http.Request, resp *http.Response) {
 	case "":
 		served.APIKey = ""
 	default:
+		return config.Source{}, false
+	}
+	return served, true
+}
+
+// latch closes this process's egress for one identity until the provider's own
+// reset. A later, further-out floor extends it; an earlier one never shortens
+// it, because the reason the latch exists is that papio could not record what
+// it knows and must therefore keep the most conservative fact it has.
+func (o *Observer) latch(served config.Source, until time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.latched == nil {
+		o.latched = make(map[string]time.Time)
+	}
+	key := poolName(served)
+	if existing, ok := o.latched[key]; ok && !until.After(existing) {
+		return
+	}
+	o.latched[key] = until
+}
+
+// latchedUntil reports an active latch for served. An expired entry is deleted
+// rather than left to accumulate: the map holds at most two keys, but a stale
+// past instant read as "latched" would close egress forever.
+func (o *Observer) latchedUntil(served config.Source) (time.Time, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	key := poolName(served)
+	until, ok := o.latched[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	if !until.After(o.now()) {
+		delete(o.latched, key)
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+func (o *Observer) observe(req *http.Request, resp *http.Response) {
+	served, known := o.servedIdentity(req)
+	if !known {
 		return
 	}
 	remaining, remErr := strconv.Atoi(resp.Header.Get("X-RateLimit-Remaining"))
@@ -208,15 +284,32 @@ func (o *Observer) observe(req *http.Request, resp *http.Response) {
 		return
 	}
 	until := o.now().Add(time.Duration(resetSeconds) * time.Second)
+	// Latch FIRST, on the parsed header, before attempting persistence. Latching
+	// only after Defer fails leaves a window the width of the write — up to
+	// quotaDeferTimeout — in which this process has already been told to stop and
+	// keeps sending anyway, and "the durable write and the local state fail
+	// together" is too narrow an assumption: a slow write blocks while a healthy
+	// one commits. The latch is never cleared on success, because a successful
+	// write and the latch say the same thing until the same instant, and the
+	// conservative duplicate costs nothing.
+	o.latch(served, until)
 	// The provider has already spoken, so this write must not inherit the
 	// cancellation of the request that carried the news: a shutdown racing a
 	// low-quota response would otherwise drop the gate precisely when the
 	// budget is lowest.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), quotaDeferTimeout)
 	defer cancel()
-	if err := o.deferrer.Defer(ctx, o.source+"_quota", served, until); err != nil {
-		log.Printf("papio: %s quota low (%s pool, remaining=%d/%d) but the floor could not be recorded: %v",
-			o.source, poolName(served), remaining, limit, err)
+	if err := o.deferrer.Defer(ctx, budget.QuotaSourceName(o.source), served, until); err != nil {
+		// The durable row is what other processes and later restarts read, so
+		// losing it matters — but it is not what makes THIS process stop, and the
+		// earlier version of this code made exactly that mistake: it logged and
+		// returned, converting a fact the process already possessed back into
+		// permission, so a busy or full SQLite turned the safety floor into more
+		// wire traffic at the moment the budget was lowest. No retry or
+		// settlement machinery: losing availability for one reset period is the
+		// safe side of this trade, and spending someone's prepaid balance is not.
+		log.Printf("papio: %s quota low (%s pool, remaining=%d/%d) but the floor could not be recorded: %v; %s egress stays closed in this process until %s",
+			o.source, poolName(served), remaining, limit, err, o.source, until.Format(time.RFC3339))
 		return
 	}
 	log.Printf("papio: %s quota low (%s pool, remaining=%d/%d); deferred until %s",
