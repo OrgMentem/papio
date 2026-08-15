@@ -2935,12 +2935,215 @@ test("companion: the same truncated shape with only decisive out observations st
   });
 });
 
+// --- papio-efda0ab62e90faac: loadPreferences serialization --------------------
+// loadPreferences called from sync/probeForeground/probeOriginAutomatically/
+// onObserve/onReload/onReauthTick/onWake each awaits storage.get then
+// permissions.getAll before applying restoreOriginStates. Two concurrent
+// loads must not let the earlier one's stale snapshot clobber a fresher
+// in-memory dirty/paused mark whose only former protection was
+// `if (existing?.lastProbeAt !== null) skip` — that guard was null for a
+// freshly seeded origin.
+
+interface KeepaliveLoadAccess {
+  loadPreferences(): Promise<void>;
+}
+interface KeepaliveSnapshotAccess {
+  updateOriginSnapshot(origin: string, patch: Partial<KeepaliveOriginSnapshot>): Promise<void>;
+}
+type GatedStorageValues = Record<string, unknown>;
+type GatedStorageGate = { promise: Promise<GatedStorageValues>; resolve: (v: GatedStorageValues) => void; reject: (e: unknown) => void };
+type GatedPermissionGate = { promise: Promise<{ origins?: string[] }>; resolve: (v: { origins?: string[] }) => void; reject: (e: unknown) => void };
+
+test("papio-efda0ab62e90faac: a dirty mark set while a load is in flight survives the stale load", async () => {
+  const origin = "https://resolver.example.edu";
+  const storageValues: GatedStorageValues = {};
+  let loadGate: GatedStorageGate | undefined;
+  let permissionGate: GatedPermissionGate | undefined;
+  const api: KeepaliveAPI = {
+    tabs: new ChromeTabsFake(),
+    timers: new FakeTimers(() => Date.now()),
+    storage: {
+      get: async () => {
+        loadGate = Promise.withResolvers<GatedStorageValues>();
+        return loadGate.promise;
+      },
+      set: async (vals) => {
+        Object.assign(storageValues, vals);
+      },
+    },
+    permissions: {
+      getAll: async () => {
+        permissionGate = Promise.withResolvers<{ origins?: string[] }>();
+        return permissionGate.promise;
+      },
+    },
+    scripting: { executeScript: async () => [{ result: [] as ResolverMarker[] }] },
+    action: { setBadgeText: async () => {} },
+  };
+  const mgr = new KeepaliveManager(api, {
+    trackedJobCount: () => 1,
+    latestOpenURL: () => RESOLVER_OPENURL,
+    knownResolverOrigins: () => [origin],
+    configuredOriginsReady: () => false,
+    observeMs: 10,
+    reloadSettleMs: 1,
+  });
+  const access = mgr as unknown as KeepaliveLoadAccess;
+  const slowLoad = access.loadPreferences();
+  await flushMicrotasks();
+  expect(loadGate).toBeDefined();
+  // While load is awaiting storage.get, mark dirty synchronously (lastProbeAt still null).
+  await mgr.markDirty(origin);
+  await flushMicrotasks();
+  const dirtyAt = mgr.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince;
+  expect(dirtyAt).not.toBeNull();
+  // Stale load lands with a clean snapshot; widened restore must preserve dirtySince.
+  loadGate!.resolve({ "keepalive.originStates": [{ origin, dirtySince: null, pausedForReauth: false, lastProbeAt: null }] });
+  await flushMicrotasks();
+  expect(permissionGate).toBeDefined();
+  permissionGate!.resolve({ origins: [] });
+  await slowLoad;
+  await flushMicrotasks();
+  expect(mgr.getOriginSnapshots().find((s) => s.origin === origin)?.dirtySince).toBe(dirtyAt);
+  // onWake must still treat it as due and probe.
+  const liveTab = { id: 9001, url: `${origin}/discovery` };
+  const tabsFake = api.tabs as unknown as ChromeTabsFake;
+  tabsFake.seed(liveTab);
+  tabsFake.resolverTabs.push(liveTab);
+  const queriesBefore = tabsFake.queryCount;
+  // Make the wake's storage load resolve immediately with stale clean data.
+  api.storage.get = async () => ({ "keepalive.originStates": [{ origin, dirtySince: null, pausedForReauth: false, lastProbeAt: null }] });
+  api.permissions = { getAll: async () => ({ origins: [] }) };
+  await mgr.onWake();
+  await flushMicrotasks();
+  expect(tabsFake.queryCount).toBeGreaterThan(queriesBefore);
+});
+
+test("papio-efda0ab62e90faac: a pausedForReauth set while a load is in flight survives the stale load", async () => {
+  const origin = "https://resolver.example.edu";
+  const storageValues: GatedStorageValues = {};
+  let loadGate: GatedStorageGate | undefined;
+  let permissionGate: GatedPermissionGate | undefined;
+  const tabsFake = new ChromeTabsFake();
+  const api: KeepaliveAPI = {
+    tabs: tabsFake,
+    timers: new FakeTimers(() => Date.now()),
+    storage: {
+      get: async () => {
+        loadGate = Promise.withResolvers<GatedStorageValues>();
+        return loadGate.promise;
+      },
+      set: async (vals) => {
+        Object.assign(storageValues, vals);
+      },
+    },
+    permissions: {
+      getAll: async () => {
+        permissionGate = Promise.withResolvers<{ origins?: string[] }>();
+        return permissionGate.promise;
+      },
+    },
+    scripting: { executeScript: async () => [{ result: [] as ResolverMarker[] }] },
+    action: { setBadgeText: async () => {} },
+  };
+  const mgr = new KeepaliveManager(api, {
+    trackedJobCount: () => 1,
+    latestOpenURL: () => RESOLVER_OPENURL,
+    knownResolverOrigins: () => [origin],
+    configuredOriginsReady: () => false,
+    observeMs: 10,
+    reloadSettleMs: 1,
+  });
+  const loadAccess = mgr as unknown as KeepaliveLoadAccess;
+  const snapshotAccess = mgr as unknown as KeepaliveSnapshotAccess;
+  const firstLoad = loadAccess.loadPreferences();
+  await flushMicrotasks();
+  loadGate!.resolve({ "keepalive.originStates": [] });
+  await flushMicrotasks();
+  permissionGate!.resolve({ origins: [] });
+  await firstLoad;
+  await flushMicrotasks();
+  loadGate = undefined;
+  permissionGate = undefined;
+  const slowLoad = loadAccess.loadPreferences();
+  await flushMicrotasks();
+  expect(loadGate).toBeDefined();
+  await snapshotAccess.updateOriginSnapshot(origin, { pausedForReauth: true });
+  await flushMicrotasks();
+  expect(mgr.getOriginSnapshots().find((s) => s.origin === origin)?.pausedForReauth).toBe(true);
+  loadGate!.resolve({ "keepalive.originStates": [{ origin, pausedForReauth: false, dirtySince: null, lastProbeAt: null }] });
+  await flushMicrotasks();
+  permissionGate!.resolve({ origins: [] });
+  await slowLoad;
+  await flushMicrotasks();
+  expect(mgr.getOriginSnapshots().find((s) => s.origin === origin)?.pausedForReauth).toBe(true);
+});
+
+test("papio-efda0ab62e90faac: the later-started concurrent load wins over an earlier stale one", async () => {
+  const origin = "https://resolver.example.edu";
+  const storageValues: GatedStorageValues = {};
+  const storageGates: GatedStorageGate[] = [];
+  const permGates: GatedPermissionGate[] = [];
+  const api: KeepaliveAPI = {
+    tabs: new ChromeTabsFake(),
+    timers: new FakeTimers(() => Date.now()),
+    storage: {
+      get: async () => {
+        const gate = Promise.withResolvers<GatedStorageValues>();
+        storageGates.push(gate);
+        return gate.promise;
+      },
+      set: async (vals) => {
+        Object.assign(storageValues, vals);
+      },
+    },
+    permissions: {
+      getAll: async () => {
+        const gate = Promise.withResolvers<{ origins?: string[] }>();
+        permGates.push(gate);
+        return gate.promise;
+      },
+    },
+    scripting: { executeScript: async () => [{ result: [] as ResolverMarker[] }] },
+    action: { setBadgeText: async () => {} },
+  };
+  const mgr = new KeepaliveManager(api, {
+    trackedJobCount: () => 0,
+    latestOpenURL: () => undefined,
+    knownResolverOrigins: () => [origin],
+    configuredOriginsReady: () => false,
+    observeMs: 10,
+    reloadSettleMs: 1,
+  });
+  const access = mgr as unknown as KeepaliveLoadAccess;
+  const p1 = access.loadPreferences();
+  const p2 = access.loadPreferences();
+  await flushMicrotasks();
+  expect(storageGates.length).toBe(2);
+  // p1 is generation 1 (stale), p2 is generation 2 (latest). Resolving p1
+  // first must not apply — it is discarded at the storage generation check
+  // before even reaching permissions.getAll.
+  const [staleGate, freshGate] = storageGates;
+  if (!staleGate || !freshGate) {
+    throw new Error(`expected two gated storage loads, got ${storageGates.length}`);
+  }
+  staleGate.resolve({ "keepalive.interval": 9, "keepalive.originStates": [] });
+  await flushMicrotasks();
+  expect(permGates.length).toBe(0);
+  freshGate.resolve({ "keepalive.interval": 22, "keepalive.originStates": [] });
+  await flushMicrotasks();
+  expect(permGates.length).toBe(1);
+  const permGate = permGates[0];
+  if (!permGate) {
+    throw new Error("expected the fresh load to reach permissions.getAll");
+  }
+  permGate.resolve({ origins: [] });
+  await Promise.all([p1, p2]);
+  await flushMicrotasks();
+  expect(mgr.getSnapshot().intervalMinutes).toBe(22);
+});
+
 test("collectResolverMarkers' injected storage-identity closure agrees with classifyResolverJWTIdentity across a shared corpus", () => {
-  // hasStorageIdentity (injected, self-contained for executeScript) must
-  // stay byte-for-byte equivalent to classifyResolverJWTIdentity (the
-  // exported, tested spec) — the injected copy is what actually grants a
-  // release-grade "in", and the exported one is the only one the test suite
-  // can reach directly.
   const corpus: readonly [string, string, "in" | "unknown"][] = [
     ["named-claim token", syntheticJWT({ userName: "Jane Doe", userGroup: "STUDENT" }), "in"],
     ["GUEST-group token", syntheticJWT({ userName: "Jane Doe", userGroup: "GUEST" }), "unknown"],

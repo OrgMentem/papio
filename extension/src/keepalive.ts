@@ -787,6 +787,13 @@ export class KeepaliveManager {
    * interleaved, reordered chrome.storage.set that could resurrect an older
    * snapshot over a newer one. Mirrors BrowserBridge.saveChain. */
   private persistChain: Promise<void> = Promise.resolve();
+  /** Monotonic generation for loadPreferences: only the latest-started load
+   * may apply its storage/permission snapshot. Earlier loads that were
+   * already awaiting storage.get/permissions.getAll when a newer one started
+   * become stale and discard their result on landing, so a synchronous
+   * markDirty/pauseForReauth that landed while lastProbeAt was still null
+   * cannot be clobbered by a slower concurrent load's stale snapshot. */
+  private loadPreferencesGeneration = 0;
   /** Shared in-flight promise for createTabOnce(). sync() now runs from
    * every triage-counts response as well as the onObserve/onReload timers,
    * so reconcile/onObserve/onReload can each independently see
@@ -972,8 +979,23 @@ export class KeepaliveManager {
       if (existing !== undefined && existing.lastProbeAt !== null) continue;
       // Restored evidence keeps its original timestamps: freshness gates in
       // the popup decide how much to trust it, never a worker restart.
-      const dirtySince = typeof snapshot.dirtySince === "number" ? snapshot.dirtySince : null;
-      this.originStates.set(origin, { ...snapshot, origin, checking: false, dirtySince });
+      const restoredDirtySince = typeof snapshot.dirtySince === "number" ? snapshot.dirtySince : null;
+      const restoredPausedForReauth = !!snapshot.pausedForReauth;
+      // Preserve any field a fresher in-memory write may have set while this
+      // load was in flight. Mutable origin-state fields:
+      //   authenticated, verdict, probeSource, lastVerdictAt, lastProbeAt,
+      //   lastProbeOutcome, checking, likelyAuthenticated, pausedForReauth, dirtySince
+      // Of those, only dirtySince (via markDirty) and pausedForReauth (via
+      // pauseForReauth) can be set synchronously while lastProbeAt is still
+      // null. Probe-owned fields are already protected by the lastProbeAt
+      // guard above; checking is always reset to false on restore.
+      let dirtySince = restoredDirtySince;
+      let pausedForReauth = restoredPausedForReauth;
+      if (existing !== undefined) {
+        if (existing.dirtySince !== null) dirtySince = existing.dirtySince;
+        if (existing.pausedForReauth) pausedForReauth = true;
+      }
+      this.originStates.set(origin, { ...snapshot, origin, checking: false, dirtySince, pausedForReauth });
     }
   }
 
@@ -1662,6 +1684,7 @@ export class KeepaliveManager {
   }
 
   private async loadPreferences(): Promise<void> {
+    const generation = ++this.loadPreferencesGeneration;
     let values: Record<string, unknown> = {};
     let storageReadSucceeded = false;
     try {
@@ -1675,6 +1698,7 @@ export class KeepaliveManager {
     } catch {
       // Storage is advisory. A temporary failure must not stop an active batch.
     }
+    if (generation !== this.loadPreferencesGeneration) return;
     this.intervalMinutes = clampKeepaliveInterval(values["keepalive.interval"]);
     this.enabled = values["keepalive.enabled"] !== false;
 
@@ -1686,15 +1710,19 @@ export class KeepaliveManager {
     this.grantedResolverOrigins = [];
     this.grantedResolverOrigin = undefined;
     if (this.api.permissions !== undefined) {
+      let grantedOrigins: string[] | undefined;
       try {
         const granted = await this.api.permissions.getAll();
-        this.grantedResolverOrigins = resolverOriginsFromPermissionPatterns(granted.origins);
-        this.grantedResolverOrigin = this.grantedResolverOrigins[0];
+        if (generation !== this.loadPreferencesGeneration) return;
+        grantedOrigins = granted.origins;
       } catch {
-        // Optional permissions are advisory; the popup can still explain the
-        // missing resolver and an incoming handoff can seed storage later.
+        if (generation !== this.loadPreferencesGeneration) return;
+        grantedOrigins = undefined;
       }
+      this.grantedResolverOrigins = resolverOriginsFromPermissionPatterns(grantedOrigins);
+      this.grantedResolverOrigin = this.grantedResolverOrigins[0];
     }
+    if (generation !== this.loadPreferencesGeneration) return;
     this.syncOriginStates();
   }
 
