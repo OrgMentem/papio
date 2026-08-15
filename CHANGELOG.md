@@ -214,6 +214,16 @@ execution records kept during the initial build.
   count was reported — so a browser popup said *retrying 1* directly beneath
   *51 scheduled*, reading as though papio had forgotten the other fifty.
 
+- **An agent driving *papio* over MCP can no longer sever its own connection by
+  asking for standard input.** The MCP tools run each CLI command in-process
+  with its output captured, but standard input was left pointing at the real one
+  — which, for an MCP server, is the connection to the agent itself. Asking for
+  `acquire --batch -` therefore had the command read the agent's own messages as
+  though they were a list of papers, taking them away from the conversation that
+  was waiting for them. Commands run this way are now given no standard input at
+  all, so that request fails plainly and the connection is untouched. Supplying
+  many papers at once over MCP is what `papio_acquire_batch` is for.
+
 ## [0.21.0] - 2026-08-14
 
 ### Added

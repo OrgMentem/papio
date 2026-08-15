@@ -243,12 +243,21 @@ func toolOptionForFlag(flag *pflag.Flag) mcplib.ToolOption {
 // output, appends validated flags and positional args, and executes the command
 // with its output captured. Each call gets its own tree and the RPC router it
 // routes to is concurrency-safe, so no cross-call locking is needed.
+//
+// Standard input is bound to an empty reader, never left to fall through to
+// os.Stdin: under the stdio MCP server that descriptor IS the JSON-RPC
+// transport (see mcpserver.Run), so a command reading stdin — `acquire --batch
+// -` is the reachable one — would consume protocol frames and corrupt the
+// session. MCP has no stdin to offer, so every mirrored command sees EOF and
+// fails honestly (`batch contains no works`); papio_acquire_batch is the
+// supported bulk-input route.
 func runInProcess(ctx context.Context, factory RootFactory, path []string, flags map[string]any, argsStr string) *mcplib.CallToolResult {
 	var buf bytes.Buffer
 	root := factory(&buf, &buf)
 	if root == nil {
 		return mcplib.NewToolResultError("failed to build command tree")
 	}
+	root.SetIn(bytes.NewReader(nil))
 	finalArgs := append([]string{}, path...)
 	finalArgs = append(finalArgs, "--json")
 	finalArgs = append(finalArgs, cliArgsFromMCP(flags)...)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -82,7 +83,27 @@ func testFactory() RootFactory {
 			RunE:  func(_ *cobra.Command, _ []string) error { return nil },
 		})
 
-		root.AddCommand(visible, fail, hidden, parent, helpOnly)
+		// readstdin mirrors `acquire --batch -`: a flag-valued path where "-"
+		// means standard input, consumed through cmd.InOrStdin().
+		var batch bool
+		readStdin := &cobra.Command{
+			Use:   "readstdin",
+			Short: "Reads standard input",
+			RunE: func(cmd *cobra.Command, _ []string) error {
+				if !batch {
+					return nil
+				}
+				data, err := io.ReadAll(cmd.InOrStdin())
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(out, "read=%q", string(data))
+				return nil
+			},
+		}
+		readStdin.Flags().BoolVar(&batch, "batch", false, "read standard input")
+
+		root.AddCommand(visible, fail, hidden, parent, helpOnly, readStdin)
 		return root
 	}
 }
@@ -226,5 +247,42 @@ func TestSafeFlagNamesExcludesInherited(t *testing.T) {
 	}
 	if _, ok := names["json"]; ok {
 		t.Errorf("safeFlagNames leaked inherited flag json")
+	}
+}
+
+// TestRunInProcessNeverReadsProcessStdin pins the transport-safety invariant:
+// under the stdio MCP server os.Stdin IS the JSON-RPC transport, so a mirrored
+// command that reads standard input must see EOF and must leave the pending
+// protocol bytes in the descriptor for the transport to read.
+func TestRunInProcessNeverReadsProcessStdin(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer r.Close()
+	const frame = `{"jsonrpc":"2.0","id":7,"method":"tools/list"}`
+	if _, err := w.WriteString(frame); err != nil {
+		t.Fatalf("write frame: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	saved := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = saved }()
+
+	res := runInProcess(context.Background(), testFactory(), []string{"readstdin"},
+		map[string]any{"batch": true}, "")
+	if got := resultText(res); got != `read=""` {
+		t.Fatalf("mirrored command read standard input: %q", got)
+	}
+
+	leftover, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read leftover: %v", err)
+	}
+	if string(leftover) != frame {
+		t.Fatalf("protocol frame consumed: leftover = %q, want %q", leftover, frame)
 	}
 }
