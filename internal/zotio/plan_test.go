@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -420,6 +421,25 @@ func TestMaterializePrivateFileCopiesSource(t *testing.T) {
 	}
 	if string(got) != string(contents) {
 		t.Fatalf("source changed through staged file: %q", got)
+	}
+}
+
+// A staged copy that does not match the artifact digest must not be left at the
+// destination: the manifest treats a present target as the verified artifact,
+// so a retained mismatch publishes corrupt bytes under a trusted name.
+func TestMaterializePrivateFileRemovesTargetOnSHAMismatch(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source.pdf")
+	target := filepath.Join(t.TempDir(), "target.pdf")
+	if err := os.WriteFile(source, []byte("artifact contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wrong := fmt.Sprintf("%x", sha256.Sum256([]byte("a different artifact")))
+	err := materializePrivateFile(source, target, wrong)
+	if err == nil {
+		t.Fatal("mismatched digest accepted")
+	}
+	if _, statErr := os.Stat(target); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("target survived a failed verification: stat err = %v", statErr)
 	}
 }
 

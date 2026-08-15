@@ -864,7 +864,14 @@ func materializePrivateFile(source, target, expectedSHA string) error {
 		_ = os.Remove(target)
 		return closeErr
 	}
-	return verifyFileSHA256(target, expectedSHA)
+	if verifyErr := verifyFileSHA256(target, expectedSHA); verifyErr != nil {
+		// The copy completed but does not match the artifact digest: leaving it
+		// behind would publish a corrupt file under a name the manifest treats
+		// as verified.
+		_ = os.Remove(target)
+		return verifyErr
+	}
+	return nil
 }
 
 func verifyFileSHA256(path, expected string) error {
