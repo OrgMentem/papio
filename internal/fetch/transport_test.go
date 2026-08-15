@@ -3,7 +3,9 @@
 package fetch
 
 import (
+	"crypto/tls"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -34,5 +36,39 @@ func TestMetadataTransportAllowsKeepAlivesWhenDisabled(t *testing.T) {
 	rt := MetadataTransport(false).(*http.Transport)
 	if rt.DisableKeepAlives {
 		t.Fatal("DisableKeepAlives = true, want false")
+	}
+}
+
+// An HTTP/2-capable server must still be reachable. Restricting Protocols
+// without pinning ALPN leaves "h2" advertised in the handshake: the server
+// selects it, the HTTP/1 reader meets an HTTP/2 SETTINGS frame, and every
+// request to that host fails with "malformed HTTP response". That shipped
+// once and broke every metadata source in production, so this test makes a
+// real request rather than asserting on fields.
+func TestMetadataTransportReachesHTTP2CapableServer(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	rt := MetadataTransport(true).(*http.Transport)
+	if rt.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig unset: ALPN cannot be pinned")
+	}
+	if got := rt.TLSClientConfig.NextProtos; len(got) != 1 || got[0] != "http/1.1" {
+		t.Fatalf("NextProtos = %v, want [http/1.1]", got)
+	}
+	pool := srv.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	rt.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, NextProtos: rt.TLSClientConfig.NextProtos}
+
+	resp, err := (&http.Client{Transport: rt}).Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.Proto != "HTTP/1.1" {
+		t.Fatalf("proto = %s, want HTTP/1.1", resp.Proto)
 	}
 }
