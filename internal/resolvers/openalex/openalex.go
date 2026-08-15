@@ -292,7 +292,14 @@ func (r *Resolver) fetch(ctx context.Context, endpoint *url.URL) (io.ReadCloser,
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return nil, &resolver.TemporaryError{Err: errors.New("openalex: request failed")}
+		// Wrap, never replace. The injected client is a sourcegate.Client, which
+		// returns *budget.ErrDeferred / *budget.ErrExceeded unwrapped so a caller
+		// can park until that identity's real reset. Substituting a fresh error
+		// destroyed the cause: a deferral until UTC midnight arrived as an
+		// undifferentiated transport failure and cycled through generic retry
+		// instead of parking. TemporaryError unwraps, so errors.As finds the
+		// cause again while the retry classification stays as it was.
+		return nil, &resolver.TemporaryError{Err: fmt.Errorf("openalex: request failed: %w", err)}
 	}
 	if resp == nil {
 		return nil, &resolver.TemporaryError{Err: errors.New("openalex: empty HTTP response")}
@@ -474,12 +481,14 @@ func usableSiblingBasis(basis work.Work) bool {
 // writeMemo records what a DOI singleton lookup learned, so a sibling hop in
 // the same pass can match against it without paying for the record again.
 //
-// At the cap, expired entries are evicted first and the whole map is dropped
-// only if that frees nothing. Dropping wholesale unconditionally was a real
-// availability bug rather than a tidy simplification: a DOI-only job whose
-// caller metadata has no title depends on this memo for its search basis, so
-// unrelated traffic pushing the resolver past the cap between Resolve and the
-// sibling hop silently removed that job's ability to search at all.
+// At the cap, expired entries are evicted first; if none had expired, exactly
+// one oldest entry is evicted. Dropping the whole map was a real availability
+// bug rather than a tidy simplification, and bounding it to "only when expiry
+// frees nothing" merely moved the trigger to 512 simultaneously fresh entries:
+// a DOI-only job whose caller metadata has no title depends on this memo for
+// its search basis, so unrelated traffic pushing the resolver past the cap
+// between Resolve and the sibling hop silently removed that job's ability to
+// search at all.
 func (r *Resolver) writeMemo(doi string, record workRecord, found bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -493,8 +502,23 @@ func (r *Resolver) writeMemo(doi string, record workRecord, found bool) {
 				delete(r.records, key)
 			}
 		}
-		if len(r.records) >= recordMemoCap {
-			r.records = make(map[string]recordMemo)
+		// If nothing had expired, evict the single oldest entry. Dropping the
+		// whole map instead reintroduced exactly the availability failure this
+		// cap-handling exists to avoid, merely moving its trigger: 512
+		// simultaneously fresh entries between a job's Resolve and its sibling
+		// hop deleted that job's only canonical basis, and the hop then reported
+		// no search basis at all. One bounded victim keeps the cap honest.
+		for len(r.records) >= recordMemoCap {
+			oldestKey, oldestAt := "", time.Time{}
+			for key, entry := range r.records {
+				if oldestKey == "" || entry.at.Before(oldestAt) {
+					oldestKey, oldestAt = key, entry.at
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(r.records, oldestKey)
 		}
 	}
 	r.records["doi:"+doi] = recordMemo{record: record, found: found, at: time.Now()}

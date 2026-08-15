@@ -11,6 +11,21 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **A busy cache no longer throws away the one record a paper's search depends
+  on.** The reused-record cache has a size limit, and on reaching it *papio*
+  discarded stale entries — but if none were stale, it emptied the cache outright.
+  A paper waiting to search for other versions of itself could therefore lose the
+  only description it had, purely because 512 unrelated papers were looked up in
+  the meantime, and the search was then skipped as having nothing to search on.
+  Only the single oldest entry is discarded now.
+
+- **"Out of budget for today" no longer arrives as an unexplained network
+  failure.** When a daily budget stop paused OpenAlex, the message reaching the
+  rest of *papio* had its reason stripped out and replaced with a generic failure,
+  so the paper retried on the ordinary schedule instead of waiting for the budget
+  to reset. No money was spent by those retries — each was refused before leaving
+  the machine — but the wait was wrong and the logs said nothing useful.
+
 - **An OpenAlex-ID lookup now has to come back about the work that was asked
   for.** *papio* already refused a record that answered a DOI lookup with a
   different paper, but the equivalent lookup by OpenAlex identifier trusted

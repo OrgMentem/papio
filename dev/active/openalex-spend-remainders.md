@@ -6,17 +6,19 @@ anonymous fallback, the fuzzy-search boundary/basis gate, and three fail-closed
 guards). Those changes are complete; git history and `CHANGELOG.md` hold the
 record.
 
-**Seven adversarial reviews, six rewrites.** Three early rounds sharpened a
-two-part plan (a per-job spend guard plus a per-identity credit ceiling); a
-fourth, given no prior-round context and a wide brief, rejected the shape of both;
-rounds five to seven reviewed the shipped code and found twelve defects in it,
-including four in fixes made minutes earlier. The seventh judged the architecture
-converged — "do one more plan edit, not another redesign" — and this is that edit.
-Every finding was verified against the tree before being accepted. Reviews are
-preserved under `dev/scratch/oracle/20260815T0*`.
+**Eight adversarial reviews, seven rewrites.** Three early rounds sharpened a
+two-part plan (a per-job spend guard plus a per-identity credit ceiling); a fourth,
+given no prior-round context and a wide brief, rejected the shape of both; rounds
+five to eight reviewed the shipped code and found fourteen defects in it, including
+several in fixes made minutes earlier. The seventh judged the architecture
+converged. The eighth then falsified a *factual premise* this file had been rebuilt
+around, and disproved a transport decision it had just recorded as settled — both
+with sources, both confirmed independently before acceptance. Every finding is
+verified against the tree or the live provider before being written down. Reviews
+are preserved under `dev/scratch/oracle/20260815T0*`.
 
 **Rejected designs** at the bottom records every dead end with its reason —
-twenty-three of the thirty-three from earlier drafts of this file. Read it before
+twenty-three of the thirty-eight from earlier drafts of this file. Read it before
 proposing a simplification; most of the obvious ones are in it, with the sequence
 that breaks them.
 
@@ -26,39 +28,62 @@ in-memory charge a crash erases; a fail-closed guard that becomes a permission
 when a second caller reads it; a best-effort note treated as an authority; a cache
 treated as a fact; a durable fact read by only one of its two readers.
 
-## Audience: the keyless install is the common case, not the edge case
+## Audience: heterogeneous tiers, not one keyed machine
 
 Every number in the original incident came from one keyed identity on the author's
 own machine. That is not the shape of a shared install, and designing against it
-produced at least one mechanism that would have shipped permanently inactive.
+produced a mechanism that would have shipped permanently inactive.
 
 - `SourceOpenAlex` defaults to `{Enabled: false}`
-  (`internal/config/config.go:579`). Enabling it is deliberate. API keys are
-  granted rather than self-serve, so **most installs that enable OpenAlex will have
-  no key.**
-- Measured live, both pools: keyed `X-RateLimit-Limit: 10000`; keyless `1000`. A
-  title search costs 10 credits, a singleton entity GET costs 1. So a keyless day
-  is **100 searches**, and one search is 1% of it.
+  (`internal/config/config.go:579`), so enabling it is deliberate.
+- **An earlier draft of this section claimed API keys are "granted rather than
+  self-serve", and therefore that keyless is the common install. That is false**
+  and is recorded here rather than quietly deleted, because the conclusion it was
+  used to justify survived while its premise did not. OpenAlex's current
+  documentation (verified live: `help.openalex.org/api/authentication`) says a key
+  is free, self-serve, and about thirty seconds' work — an account plus a copy from
+  a settings page — and raises the daily budget 10×. So no claim about keyless
+  predominance is established, in either direction.
+- What *is* established is that capacities differ by an order of magnitude per
+  tier, measured live: keyless `X-RateLimit-Limit: 1000`, free keyed `10000`, paid
+  plans higher, plus a prepaid balance beyond the daily budget. Relative policy is
+  right because of that heterogeneity, not because of a population guess.
+- **A search costs 10 credits and a singleton costs 1** — measured, and note the
+  provider's own pricing page says singleton retrieval is *free*, which the header
+  contradicts. On the keyless tier one search is **1% of the entire day**.
+- **The best answer to a keyless user is not a smaller budget, it is a key.** A
+  10× increase for thirty seconds of work beats any rationing *papio* can implement,
+  so `papio doctor` should say so when OpenAlex is enabled without a key. That is a
+  one-check change and it dominates the tuning question.
 - Consequences for this plan, applied above but recorded here because they change
   priority order, not just numbers:
   1. **Policy is expressed relative to the provider-reported limit**, never as an
-     absolute credit count derived from one key.
-  2. **The fuzzy sibling search is disproportionately expensive on keyless.** The
-     measurement item — is a 10-credit search worth buying, given 73 of 3,165
-     ever returned anything — outranks metering it. Deleting a 10× cost beats
-     rationing it, and consider defaulting it off for keyless identities.
+     absolute credit count derived from one key — subject to the frozen, monotone
+     denominator in item 1+2, since a provider-reported number now has authority
+     over a safety limit.
+  2. **The fuzzy sibling search is disproportionately expensive on the low tier.**
+     The measurement item — is a 10-credit search worth buying, given 73 of 3,165
+     ever returned anything — outranks *optimising or rationing* it. It does not
+     outrank the egress fuse, which closes crash, storage-failure, cross-caller and
+     pricing-drift holes regardless of whether the search is worth buying at all.
   3. **Visibility ships with enforcement, not after it.** A stranger who hits a
      ceiling sees "papio stopped working"; `spent_usd` currently reads `0.00`
      against a real 3,393 credits. `papio doctor` must name today's credits, the
      limit, and the identity in the same change that can refuse work.
   4. **Safety numbers validated only against the author's Zotero library are
      unfalsifiable elsewhere.** `make identity-corpus` reads a private library, so
-     item 5 needs a committed shareable corpus with published wrong-accept counts
-     before its thresholds can be tuned by anyone else.
+     a committed shareable corpus with published wrong-accept counts is what lets
+     anyone else tune item 5's thresholds. **Not a blocker for item 5**, though: the
+     structural work — the immutable submitted-identity anchor, the promotion-path
+     remediation, deterministic adversarial regressions — closes the
+     self-confirmation defect without tuning any probability. The corpus gates
+     *changing a threshold*, not shipping the fix.
   5. **Re-derive item 6's deferral, don't inherit it.** "The fuse bounds the
-     damage" was argued on a 10,000-credit day. On keyless, one hopeless work
-     burning 8 passes at 10 credits is 8% of the budget, and a bulk import holds
-     many.
+     damage" was argued on a 10,000-credit day, where one hopeless work burning 8
+     passes at 10 credits is 0.8% of the budget. On the keyless tier the same work
+     is **8%**, and a bulk import holds many. Still deferrable — the fuse caps the
+     aggregate either way — but the justification changes with the tier, so state
+     which one it is being argued on.
 
 ## Context: the incident, and what production says now
 
@@ -158,29 +183,52 @@ failed commit means no wire, and a request reaching the transport without one
 must fail loudly. Do not fix the race with a manager-wide mutex — a decision
 taken before a blocking step cannot be authoritative for egress.
 
-**Requirement: a boundary with provably no automatic replay — `RoundTrip` is not
-enough.** The wrapper accepts an `*http.Client`, and `Client.Do` follows
-redirects, so one commit could authorize several physical requests. But moving to
-a wrapper around `http.Transport.RoundTrip` is *still* insufficient: the standard
-`Transport` may internally retry an idempotent request after certain network
-failures on a reused connection, and every OpenAlex call is a GET. Sequence:
-commit 10 → guarded wrapper calls the transport once → the GET is written on a
-reused connection → a qualifying failure → the transport replays it → two
-physical requests under one debit.
+**Requirement: a boundary with provably no automatic replay. There are *three*
+replay mechanisms, and `DisableKeepAlives` closes only one.** Verified in the tree
+and against Go 1.26.6:
 
-**Decision: disable connection reuse for the OpenAlex client
-(`DisableKeepAlives`), and disable redirect following.** Together those remove
-both replay mechanisms, so the guarded call site *is* the wire. Not offered as a
-config knob: correctness must not depend on a stranger's network quality, and
-"*papio*'s credit accounting is slightly wrong under packet loss" is undebuggable
-remotely. The cost is a handshake per request against rate-limited background
-calls that already wait on a token bucket — cheap for a property that can be
-stated in one sentence. Rejected alternative: wrapping the dialer to make replays
-re-enter the egress authority — correct and faster, but it puts the money
-invariant in the least-inspectable layer in the stack.
+1. ***papio*'s own redirect loop.** The metadata client is
+   `fetch.NewSecureHTTPClient(..., http.DefaultTransport)`, whose `Do` runs its
+   own hop loop (`internal/fetch`: `validateURL` → `roundTrip` → `isRedirect` →
+   repeat, bounded by `policy.MaxRedirects`). So one `Do` already issues **N
+   physical requests** under one admission today. This is not `net/http`'s
+   transparent following — *papio* replaced that to get an SSRF guard per hop — but
+   the accounting consequence is identical.
+2. **HTTP/2's internal retry.** `http.DefaultTransport` sets
+   `ForceAttemptHTTP2: true` (verified: `Protocols == nil`,
+   `ForceAttemptHTTP2 == true`), and Go's HTTP/2 transport has its own retry loop
+   around `RoundTrip` that will re-send a bodyless GET after a retryable
+   GOAWAY/stream failure. `DisableKeepAlives` bounds connection *reuse*; it makes
+   no promise about attempts per `RoundTrip`. So it does **not** close this.
+3. **HTTP/1 retry on a reused connection**, the one `DisableKeepAlives` does close.
 
-Pin it with a regression that fails a reused connection in the standard retry
-condition and asserts either one send, or a second debit for the second send.
+**Decision: an OpenAlex-specific transport that is HTTP/1-only, with
+`DisableKeepAlives`, no automatic redirect following, and every redirect hop
+re-entering the egress authority as a fresh guarded request.** Go 1.26 exposes
+`Transport.Protocols`, so `SetHTTP1(true)` / `SetHTTP2(false)` is available and
+testable (verified locally). Not offered as a config knob: correctness must not
+depend on a stranger's network quality, and "*papio*'s credit accounting is
+slightly wrong under packet loss" is undebuggable remotely. Rejected alternative:
+wrapping the dialer so replays re-enter the authority — correct and faster, but it
+puts the money invariant in the least-inspectable layer in the stack.
+
+**The redirect hop is not merely an accounting problem — it currently corrupts
+identity and attribution.** OpenAlex answers a merged entity with `301` whose
+`Location` carries only the new entity URL, and the credential travels in the
+`api_key` **query parameter**. So: request `Wold?api_key=K` → `301` → papio's hop
+loop re-requests a Location with **no `api_key`** → that physical request is
+anonymous → `Observer.observe` inspects the *original* request, sees `K`, and files
+the anonymous pool's headers against the keyed identity, corrupting the very floor
+this plan relies on. Then `echoesOpenAlex` compares `Wnew` against `Wold` and
+correctly rejects a legitimate merge. So the redirect work must: recognise a
+same-origin OpenAlex entity-merge `301`, validate the `Location`, re-admit and
+re-debit it as a new guarded request under a re-derived identity, bound the depth,
+and carry the redirect forward as **authoritative alias evidence** so `Wold → Wnew`
+passes exact identity verification instead of being discarded.
+
+Regressions: the production OpenAlex transport cannot negotiate HTTP/2; a
+merge-`301` yields one debit per physical hop, correct per-hop identity
+attribution, and an accepted merged record.
 
 **Requirement: latch on the parsed header, not on the failed write.** When a
 valid low-quota header is parsed, set the in-process fail-closed latch for that
@@ -271,10 +319,26 @@ requests, not that its books balance to the credit.
   again. Closing the source rather than the individual shape avoids building a
   second per-shape state machine for an event that should be rare and loud. Do
   not build reconciliation to recover a few conservatively overcounted credits.
-- **Credits are a new unit, not the existing `estimatedCost`.** That argument
-  flows to `reserve(ctx, source, identity, policy.MaxCostUSD, estimatedCost)` and
-  into `spent_usd`: it is dollars. Using it for credits implements the
-  credits-as-dollars design this document rejects.
+- **The provider reports USD as well as credits, so the unit question is settled
+  by the wire, not by taste.** Measured live on every response:
+  `x-ratelimit-credits-used: 1` **and** `x-ratelimit-cost-usd: 0.0001`;
+  `x-ratelimit-limit: 10000` **and** `x-ratelimit-limit-usd: 1`; plus
+  `x-ratelimit-remaining-usd` and `x-ratelimit-prepaid-remaining-usd`. Credits are
+  simply hundredths of a cent. **Decision: meter in credits internally** — they
+  are integers, so the conditional SQL cannot drift on float rounding — and record
+  the reported `cost-usd` alongside for the existing monetary axis. Do **not** pass
+  credits through `reserve(ctx, source, identity, policy.MaxCostUSD,
+  estimatedCost)`: that argument is dollars, and reusing it implements the
+  credits-as-dollars design this document rejects. The USD figures are now real
+  and provider-supplied, so the dormant axis can finally be fed truthfully.
+- **`prepaid-remaining-usd` changes the stakes: a runaway loop can spend real
+  money, not just today's allowance.** A prepaid balance covers usage beyond the
+  daily budget, so on any paying installation the pre-fix failure mode was not
+  "gated until midnight" but "*papio* charged the user". The fuse must therefore gate
+  on the daily allowance **and** refuse to draw down prepaid balance implicitly;
+  spending real money needs an explicit opt-in that does not exist today. This is
+  the strongest argument in the file for the fuse being safety rather than hygiene,
+  and it was invisible while only `credits`/`remaining` were being read.
 - **Atomic in SQL across insert AND update.** Hundreds of jobs target the same
   hot row, so it must be one conditional mutation — and the condition must cover
   the *first* write of a day, not only the conflict-update arm. A naive
@@ -282,22 +346,30 @@ requests, not that its books balance to the credit.
   arm admits a first 10-credit request against an allowance of 5. Test the
   empty-row-over-limit case explicitly.
 - **Config: express the ceiling as a fraction of the provider-reported limit, not
-  as credits. `daily_credit_fraction`, default `0.5`.** An absolute default
-  overfits to one machine's key, and worse, it ships **inert** for the majority
-  install. `SourceOpenAlex` is `{Enabled: false}` by default
-  (`internal/config/config.go:579`), so a user enables OpenAlex deliberately and
-  almost never has a key — keys are granted, not self-serve. This session measured
-  both pools live: keyed `X-RateLimit-Limit: 10000`, keyless `1000`. A `4000`
-  default therefore never fires on the keyless tier, i.e. exactly the population
-  least able to diagnose it, while being tuned to the author's own keyed day.
-  A fraction means one policy that scales to a budget *papio* cannot know in
-  advance, and the observer already parses the limit it needs.
-  - `daily_credit_limit` (credits) stays as an absolute override for anyone who
-    wants a hard number; the fraction is what ships.
+  as credits. `daily_credit_fraction`, default `0.5`, under a local hard
+  maximum.** An absolute default overfits to one machine's key: measured live,
+  keyed reports `X-RateLimit-Limit: 10000` and keyless `1000`, so a fixed `4000`
+  never fires on the keyless tier at all. A fraction is one policy for a budget
+  *papio* cannot know in advance.
+  - **Define the denominator, freeze it, and never let it grow.** "Fraction of the
+    provider-reported limit" is ambiguous the moment two identities report
+    different limits, and the counter is deliberately source-wide: keyed
+    establishes 10,000 → allowance 5,000 → fallback to anonymous reports 1,000 →
+    the allowance either shrinks below what is already committed, or stops meaning
+    what it says. **Decision: the denominator is the configured primary identity's
+    reported limit (keyed when configured, else anonymous), captured durably for
+    that UTC day; later reports may lower it, never raise it**, and anonymous
+    fallback does not rewrite it. Without the monotone rule a malformed
+    `X-RateLimit-Limit: 1000000000` would *enlarge* the fuse — an absolute limit
+    had no such dependency, and this is the price of relative policy.
+  - **Persist the day's basis.** The observer parses `limit` but only stores
+    anything when it reaches the floor, so nothing survives a restart today.
+  - `daily_credit_limit` (credits) stays as an absolute operator override and as
+    the hard maximum the fraction may never exceed.
   - **Before the first response of the day there is no reported limit.** Do not
     gate the first request on an unknown budget: fall back to a conservative
-    absolute until a limit is observed, then switch to the fraction. Test the
-    cold-start path, or the fuse either blocks everything or nothing on a fresh
+    absolute — itself bounded by the hard maximum — until a limit is observed. Test
+    the cold-start path, or the fuse either blocks everything or nothing on a fresh
     daemon.
   - Revisit from `credits_committed` telemetry across real installs, not from one
     library's numbers. `0` means unmetered, matching the existing convention, so
@@ -338,7 +410,15 @@ utc-day|month, until: time.Time}` keeps one park path and makes a third budget
 cheap. This is the same contract as the egress taxonomy in item 1+2 — define it
 once, there.
 
-## 4. Jitter the budget-reset wake
+## 4. Jitter the budget-reset wake — deferred out of this tranche
+
+**Cut on review, and the reasoning is worth keeping:** once final-egress admission
+and the token bucket are correct, a UTC-midnight wake cohort is an operational
+smoothing problem, not a monetary invariant. The burn shape was caused by the
+uncharged loop, not by the synchronised wake — the wake only made it visible.
+Implement when telemetry actually shows scheduler or store contention at a reset
+boundary. The design below is settled, so this is a scheduling decision, not
+unfinished work.
 
 Every job parked on a quota or local-budget gate becomes runnable at the same
 instant, because the park time is the reset instant exactly. The token bucket
@@ -494,20 +574,27 @@ all:
 7. A′ looks novel, and buys the identical B search again.
 
 **The fix is to make the effective basis explicit and authoritative.** A
-side-effect-free `SiblingSearchBasis(requested) (work.Work, bool)` returns the
-basis the adapter *would* use — positive memo metadata or caller metadata,
-whichever wins, subject to one **explicit precedence rule: a positive memo wins
-only if it yields a usable basis; otherwise a usable caller basis remains
-eligible.** (That rule is now shipped in the adapter — wholesale replacement let a
-positive-but-incomplete canonical record suppress caller authors, which was the
-negative-memo defect arriving by the opposite route — so item 7 must preserve it
-rather than reintroduce a plain override.) Usable means title plus a
-canonicalizable author surname; a negative DOI memo suppresses only the
-memo-derived basis, never the caller's own. The app hashes **that returned basis**
-for the novelty marker, and the subsequent search is forced to use exactly it — no
-hidden substitution after the marker check.
+side-effect-free `SiblingSearchBasis(requested)` returns the basis the adapter
+*would* use — positive memo metadata or caller metadata, whichever wins, subject to
+one **explicit precedence rule: a positive memo wins only if it yields a usable
+basis; otherwise a usable caller basis remains eligible.** (That rule is now
+shipped in the adapter — wholesale replacement let a positive-but-incomplete
+canonical record suppress caller authors, which was the negative-memo defect
+arriving by the opposite route — so item 7 must preserve it rather than reintroduce
+a plain override.) Usable means title plus a canonicalizable author surname; a
+negative DOI memo suppresses only the memo-derived basis, never the caller's own.
+The app hashes **that returned basis** for the novelty marker, and the subsequent
+search is forced to use exactly it — no hidden substitution after the marker check.
 
-Only when no usable local basis exists does the caller, under its *own* separate
+**The result must be ternary, not `(work.Work, bool)`.** `recordFor` deliberately
+returns `false` for both "never asked" and "asked, fresh negative memo", and a
+two-valued basis result collapses them again — so a pass whose DOI `Resolve` just
+got a 404 would immediately buy the *same* singleton back as a basis lookup. Return
+`usable` / `known_no_remote_basis` / `lookup_needed` (names immaterial): a fresh
+negative memo suppresses the redundant singleton without suppressing usable caller
+metadata.
+
+Only in the `lookup_needed` state does the caller, under its *own* separate
 admission and credit commit, ask for a one-credit `SiblingBasis` network lookup.
 That keeps three properties: each paid request is separately admitted, so a floor
 installed by the singleton's own response stops the search; `ErrNoSearchBasis`
@@ -533,8 +620,16 @@ folded there rather than kept as a separate narrower rule.
 ## Ordering
 
 **`(0 estimate ‖ 5 evidence authority)` alongside `(1+2 egress authority)` → 3
-truthful park → 4 jitter → 7 effective basis → 6 (deferrable only once 1+2 is
-deployed).**
+truthful park → 7 effective basis.** Then, deferred with reasons written down:
+**4 jitter** (operational smoothing, not an invariant) and **6 per-job guard**
+(fairness, capped in aggregate by the fuse).
+
+Within item 1+2 the shortest correct path is: **fix the live merge-redirect
+identity/attribution defect → define, freeze and clamp the relative denominator →
+HTTP/1-only transport with no automatic redirects and per-hop re-admission → the
+atomic pre-wire credit commit.** The redirect work comes first because it is a
+live defect corrupting the floor the rest of the item depends on, and because it
+is what makes "one commit, one physical request" true at all.
 
 An earlier draft wrote `… → 4 → 5` while its own prose said item 5 must not queue
 behind spend work; the two contradicted each other and the ordering above is the
@@ -544,14 +639,17 @@ nothing. Items 1+2 are one boundary and one migration, and the newly found
 `Acquire` fix closes it at admission, but only the egress authority closes the
 TOCTOU window behind it. Item 5 is the only failure mode here that cannot be
 undone and must not queue behind spend work. Item 7 needs the effective-basis
-correction before implementation and is cheapest once 1+2 has settled how
-admission is expressed, because it may need two admissions per hop.
+correction and its ternary result before implementation, and is cheapest once 1+2
+has settled how admission is expressed, because it may need two admissions per hop.
 
 Each migration means daemon and CLI deploy together (`make dev-deploy`), which on
 this machine means both *papio* binaries plus the native-host symlink.
 
-Genuinely deferred beyond all of this: wiring the dormant **monthly USD** axis
-for real dollars. A billing feature, not a safety mechanism.
+Genuinely deferred beyond all of this: wiring the dormant **monthly USD** axis for
+real dollars. Now cheaper than it looks — the provider reports `cost-usd`,
+`limit-usd` and `remaining-usd` on every response — but still a billing feature
+rather than a safety mechanism, *except* for `prepaid-remaining-usd`, whose refusal
+belongs in the fuse because drawing it down spends real money.
 
 ## Fixed while reviewing (already shipped)
 
@@ -670,16 +768,63 @@ for real dollars. A billing feature, not a safety mechanism.
   as the negative-memo case, arriving by the opposite route. A positive memo now
   wins only if it yields a usable basis. Regression:
   `TestIncompletePositiveMemoDoesNotSuppressACallerBasis`.
+- **The memo cap still dropped every fresh entry, just at a different trigger.**
+  An earlier fix evicted expired entries first and replaced the whole map only "if
+  that frees nothing" — which is the same availability cliff, reached by 512
+  *simultaneously fresh* entries instead of by any 512. A DOI-only job whose caller
+  metadata has no title depends on that memo for its search basis, so unrelated
+  traffic between its `Resolve` and its sibling hop could still delete its only
+  basis. Now exactly one oldest entry is evicted. Note the residual, stated in the
+  test: oldest-first is a *bound*, not a guarantee — a basis that genuinely is the
+  oldest live entry can still go, one at a time rather than 512 at once; item 7's
+  re-earn is the real repair. Regression:
+  `TestMemoCapEvictsOneOldestEntryWhenNothingHasExpired`, whose first draft failed
+  because the fixture made the basis itself the oldest entry.
+- **`openalex.fetch` destroyed every client error, including admission refusals.**
+  It replaced the cause with a fresh generic `resolver.TemporaryError`, so the
+  fixed-policy quota floor's `*budget.ErrDeferred{Until: midnight}` reached the
+  caller as an undifferentiated transport failure: it could not park until the
+  provider's reset and cycled through generic retry instead. Not a spend defect —
+  each retry is refused before the wire — but live liveness and diagnostic churn.
+  `TemporaryError` already implements `Unwrap`, so wrapping instead of replacing
+  restores `errors.As` without coupling the adapter to `internal/budget` or
+  changing the retry classification. Regression:
+  `TestFetchPreservesTheClientCause`. The app-side park semantics remain item 3's
+  typed taxonomy.
 
 ## Rejected designs (do not re-derive)
 
 - **An absolute credit ceiling as the shipped default (`daily_credit_limit =
-  4000`).** Derived from the author's keyed 10,000-credit day and ~1.2× his worst
-  observed spend. But OpenAlex ships disabled, keys are granted not self-serve,
-  and the keyless pool reports a limit of 1,000 — so the default would have been
-  **permanently inert for the majority install**, on a tier where a single search
-  costs 1% of the day. A fraction of the provider-reported limit is one policy for
-  every budget. The absolute form survives only as an operator override.
+  4000`).** Derived from the author's own keyed 10,000-credit day. Measured live,
+  the keyless pool reports a limit of 1,000, so the default would have been
+  **permanently inert** on the low tier — on which one 10-credit search is 1% of the
+  day. A fraction of the provider-reported limit is one policy for every tier. The
+  absolute form survives as an operator override and as the hard maximum.
+- **"API keys are granted, not self-serve", and the keyless-predominance argument
+  built on it.** Factually wrong: OpenAlex documents a free, self-serve key that
+  takes about thirty seconds and raises the budget 10×. Relative policy survives on
+  tier heterogeneity; the population claim does not. Recorded rather than deleted
+  because the conclusion outlived its premise.
+- **`DisableKeepAlives` alone as the one-physical-request boundary.** Closes HTTP/1
+  connection-reuse retry only. `http.DefaultTransport` sets
+  `ForceAttemptHTTP2: true`, and Go's HTTP/2 transport has its own retry loop that
+  re-sends a bodyless GET; papio's `fetch` also runs its own redirect loop, so one
+  admission already covers N hops today. HTTP/1-only plus no automatic redirects
+  plus per-hop re-admission is the actual requirement.
+- **A fraction of "the provider-reported limit" without a defined denominator.**
+  The counter is source-wide but the reported limit is identity-specific, so a keyed
+  10,000 establishing 5,000 followed by anonymous fallback reporting 1,000 either
+  shrinks the allowance below what is already committed or stops meaning what it
+  says — and a malformed `X-RateLimit-Limit: 1000000000` would *enlarge* the fuse.
+  Freeze the primary identity's limit for the UTC day, monotone downward, under a
+  local hard maximum.
+- **A two-valued `SiblingSearchBasis(work.Work, bool)`.** `recordFor` returns
+  `false` for both "never asked" and "fresh negative memo", so a two-valued result
+  re-buys the singleton *papio* was just told does not exist. The result is ternary.
+- **Treating the provider's published price list as authoritative.** Its pricing
+  page says single-entity retrieval is *free*; the live header charges 1 credit
+  ($0.0001) for exactly that request. Documented prices are telemetry; the header is
+  the fact, and the drift closure stays.
 - **Offering the replay-safe transport as a configuration choice.** Three options
   were drafted (disable keep-alives / wrap the dialer / accept slight
   undercounting). Handing a stranger a knob whose wrong setting produces quietly

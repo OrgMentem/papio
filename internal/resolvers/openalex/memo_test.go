@@ -239,6 +239,74 @@ func TestMemoCapEvictsOnlyExpiredEntries(t *testing.T) {
 	}
 }
 
+// The harder case, and the one that shipped broken: nothing has expired, so
+// expiry frees nothing and the old code replaced the entire map. A job's only
+// canonical basis then vanished because 512 unrelated works were looked up
+// between its own Resolve and its sibling hop. Exactly one victim may go, and it
+// must be the oldest.
+//
+// Oldest-first is a bound, not a guarantee: a basis that genuinely is the oldest
+// live entry can still be evicted, one entry at a time instead of 512 at once.
+// Item 7's re-earned basis is the real repair; this only stops the cliff.
+func TestMemoCapEvictsOneOldestEntryWhenNothingHasExpired(t *testing.T) {
+	r, _ := countingResolver(t, `{"results":[]}`)
+	r.mu.Lock()
+	// All fresh, so expiry frees nothing - and all OLDER than the basis written
+	// below, so the oldest entry is an unrelated filler rather than the entry a
+	// live job depends on.
+	for i := range recordMemoCap - 1 {
+		r.records[fmt.Sprintf("doi:10.0000/filler.%d", i)] = recordMemo{
+			found: true, at: time.Now().Add(-recordMemoTTL / 2).Add(time.Duration(i) * time.Millisecond),
+		}
+	}
+	r.mu.Unlock()
+	basis := workRecord{Title: "Shape Trust", DOI: "https://doi.org/10.1145/3531146.3533202"}
+	r.writeMemo("10.1145/3531146.3533202", basis, true)
+	r.mu.Lock()
+	before := len(r.records)
+	r.mu.Unlock()
+
+	r.writeMemo("10.0000/trigger", workRecord{}, true)
+
+	if _, ok := r.recordFor("10.1145/3531146.3533202"); !ok {
+		t.Fatal("an all-fresh cap-crossing write discarded a live job's basis; only the oldest entry may go")
+	}
+	r.mu.Lock()
+	after := len(r.records)
+	r.mu.Unlock()
+	if after > before {
+		t.Fatalf("memo grew past the cap: %d entries, was %d", after, before)
+	}
+	if after < recordMemoCap/2 {
+		t.Fatalf("memo was emptied wholesale: %d entries left of %d", after, before)
+	}
+}
+
+// fetch must wrap a client error, never replace it. The injected client is a
+// sourcegate.Client whose admission refusals carry the reset a caller has to
+// park until; substituting a fresh error left the caller with an
+// undifferentiated transport failure and generic retry behaviour.
+func TestFetchPreservesTheClientCause(t *testing.T) {
+	sentinel := errors.New("deferred until 2026-08-16T00:00:00Z")
+	r := NewWithOptions(Options{
+		Client: clientFunc(func(*http.Request) (*http.Response, error) {
+			return nil, sentinel
+		}),
+		ContactEmail: "contact@example.org", BaseURL: "https://api.test/works",
+	})
+
+	_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+	if err == nil {
+		t.Fatal("a refused request resolved successfully")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want the client's own cause to survive", err)
+	}
+	if _, temporary := resolver.Temporary(err); !temporary {
+		t.Fatalf("err = %v, want it still classified temporary", err)
+	}
+}
+
 func TestAnonymousCredentialsOmitAPIKey(t *testing.T) {
 	var seen []*http.Request
 	client := clientFunc(func(req *http.Request) (*http.Response, error) {
