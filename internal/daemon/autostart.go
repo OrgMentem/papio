@@ -116,6 +116,7 @@ func (a *Autostarter) EnsureWithResult(ctx context.Context) (EnsureResult, error
 		_ = logFile.Close()
 		return result, err
 	}
+	configureDaemonProcessGroup(cmd)
 	err = cfg.Start(ctx, cmd)
 	_ = null.Close()
 	_ = logFile.Close()
@@ -123,16 +124,35 @@ func (a *Autostarter) EnsureWithResult(ctx context.Context) (EnsureResult, error
 		return result, fmt.Errorf("start daemon: %w", err)
 	}
 	result.Started = true
-	if cmd.Process != nil {
-		go func() { _ = cmd.Wait() }()
-	}
-
 	readyCtx, cancel := context.WithTimeout(ctx, cfg.StartTimeout)
 	defer cancel()
 	if err := waitReady(readyCtx, cfg.Ready, cfg.SocketPath, cfg.RetryInterval); err != nil {
+		terminateOrphan(cmd)
 		return result, fmt.Errorf("wait for daemon socket: %w", err)
 	}
+	if cmd.Process != nil {
+		go func() { _ = cmd.Wait() }()
+	}
 	return result, nil
+}
+
+func terminateOrphan(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = terminateSignal(cmd, graceful)
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+		return
+	case <-time.After(2 * time.Second):
+	}
+	_ = terminateSignal(cmd, hard)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+	}
 }
 
 func (a *Autostarter) defaults() (Autostarter, error) {
