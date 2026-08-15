@@ -5,6 +5,7 @@ package openalex
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -85,40 +86,73 @@ func TestSiblingColdMemoSearchesCallerMetadata(t *testing.T) {
 	}
 }
 
-func TestSiblingNoSearchBasisZeroRequests(t *testing.T) {
+// With a DOI but no basis anywhere, the hop re-earns one with the SINGLETON
+// lookup (one credit) rather than skipping discovery. Only a DOI the provider
+// does not know leaves nothing to search on.
+func TestSiblingWithoutBasisReearnsItCheaply(t *testing.T) {
 	r, requests := countingResolver(t, `{"results":[]}`)
-	candidates, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"})
+	if _, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
+		t.Fatal(err)
+	}
+	if *requests != 2 {
+		t.Fatalf("requests = %d, want 2 (one singleton to re-earn the basis + one search)", *requests)
+	}
+}
+func TestSiblingNoSearchBasisAfterUnknownDOI(t *testing.T) {
+	// The provider does not know this DOI, so re-earning a basis is impossible:
+	// the hop must report the singleton it spent and then decline, rather than
+	// paying for a search it cannot aim.
+	client := clientFunc(func(*http.Request) (*http.Response, error) {
+		return responseFor(404, "", nil), nil
+	})
+	r := New(client, "contact@example.org", "private-key")
+	candidates, err := r.ResolveSiblings(context.Background(), work.Work{DOI: "10.9999/unknown.work"})
 	if !errors.Is(err, resolver.ErrNoSearchBasis) {
 		t.Fatalf("err = %v, want resolver.ErrNoSearchBasis", err)
 	}
 	if candidates != nil {
 		t.Fatalf("candidates = %#v, want none", candidates)
 	}
-	if *requests != 0 {
-		t.Fatalf("requests = %d, want zero: there was nothing to search on", *requests)
-	}
 }
 
-func TestSiblingStaleMemoMiss(t *testing.T) {
+// A stale memo entry must not silently cancel discovery: the basis is re-earned
+// with the one-credit singleton, never assumed absent.
+func TestSiblingStaleMemoReearnsBasis(t *testing.T) {
 	r, requests := countingResolver(t, `{"results":[]}`)
 	ctx := context.Background()
 	if _, err := r.Resolve(ctx, work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
 		t.Fatal(err)
 	}
-	// Age the entry past its TTL: a memo that old is a miss, and with no
-	// caller-supplied title the hop reports it made no request at all rather
-	// than matching against stale metadata.
 	r.mu.Lock()
 	entry := r.records["doi:10.1145/3531146.3533202"]
 	entry.at = time.Now().Add(-recordMemoTTL - time.Second)
 	r.records["doi:10.1145/3531146.3533202"] = entry
 	r.mu.Unlock()
 	before := *requests
-	if _, err := r.ResolveSiblings(ctx, work.Work{DOI: "10.1145/3531146.3533202"}); !errors.Is(err, resolver.ErrNoSearchBasis) {
-		t.Fatalf("err = %v, want resolver.ErrNoSearchBasis on a stale memo", err)
+	if _, err := r.ResolveSiblings(ctx, work.Work{DOI: "10.1145/3531146.3533202"}); err != nil {
+		t.Fatal(err)
 	}
-	if *requests != before {
-		t.Fatalf("requests = %d, want no re-fetch of the canonical record", *requests-before)
+	if got := *requests - before; got != 2 {
+		t.Fatalf("requests = %d, want 2 (singleton re-earn + search) after the memo went stale", got)
+	}
+}
+
+// The cap must evict what is expired, not everything: a live entry surviving a
+// cap-crossing write is what keeps a DOI-only job's search basis available.
+func TestMemoCapEvictsOnlyExpiredEntries(t *testing.T) {
+	r, _ := countingResolver(t, `{"results":[]}`)
+	fresh := workRecord{Title: "Shape Trust", DOI: "https://doi.org/10.1145/3531146.3533202"}
+	r.writeMemo("10.1145/3531146.3533202", fresh, true)
+	r.mu.Lock()
+	for i := range recordMemoCap {
+		r.records[fmt.Sprintf("doi:10.0000/filler.%d", i)] = recordMemo{
+			found: true, at: time.Now().Add(-recordMemoTTL - time.Second),
+		}
+	}
+	r.mu.Unlock()
+	r.writeMemo("10.0000/trigger", workRecord{}, true)
+	if _, ok := r.recordFor("10.1145/3531146.3533202"); !ok {
+		t.Fatal("a fresh entry was discarded by a cap-crossing write; expired entries should have gone first")
 	}
 }
 

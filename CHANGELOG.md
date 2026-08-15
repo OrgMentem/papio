@@ -11,6 +11,24 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **An unreadable retry history no longer authorizes the expensive search.**
+  Whether a job has spent its retry budget is read in two opposite senses: for
+  deciding when to stop trying, "cannot tell" must mean stop, but the same
+  answer is also one of the conditions that *permits* the ten-credit title
+  search. A single transient history read failure therefore bought a search
+  while an ordinary retry was still pending. Stopping still fails closed on an
+  unreadable history; permitting the expensive call now requires a fact *papio*
+  actually read.
+
+- **A DOI-only work no longer loses its search basis to cache eviction.** The
+  sibling hop reuses the canonical record from earlier in the same pass rather
+  than fetching it twice, but that memo is an evictable two-minute cache — so
+  unrelated traffic filling it, or a fetch running long, silently cancelled
+  sibling discovery for a work whose own metadata carries no title. The cache
+  now evicts expired entries before discarding live ones, and a missing basis is
+  re-earned with the one-credit record lookup instead of assumed absent. Only a
+  DOI the provider does not know is treated as nothing to search on.
+
 - **A corrupt search marker no longer buys the expensive search again.** The
   per-question marker that stops *papio* re-asking a title search it has
   already paid for is read back through the job's event stream, which decodes

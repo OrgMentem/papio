@@ -911,6 +911,30 @@ func TestRetryBudgetFailsClosedOnUnreadableHistory(t *testing.T) {
 	}
 }
 
+// The same "unknown" that settles a job must NOT authorize the ten-credit
+// search: exhaustion is read in two opposite senses, and only a proven fact is
+// a spend permit.
+func TestUnreadableHistoryIsNoPermitForTheExpensiveSearch(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, doiRequest("wr_permit_unknown"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if !svc.retryBudgetExhausted(cancelled, id) {
+		t.Fatal("liveness reading must fail closed on an unreadable history")
+	}
+	exhausted, err := svc.retryBudgetExhaustedProven(cancelled, id)
+	if err == nil {
+		t.Fatal("the proven form must surface the read failure instead of folding it into the verdict")
+	}
+	if exhausted {
+		t.Fatal("an unreadable history proves nothing and must not permit the expensive search")
+	}
+}
+
 // Jobs.Events decodes each detail with `_ = json.Unmarshal(...)`, so a corrupt
 // row yields a nil detail rather than an error. A marker of the right kind is
 // proof a search happened; an illegible one must not buy the ten-credit query

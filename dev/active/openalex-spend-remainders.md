@@ -43,56 +43,83 @@ So the remaining exposure is not an unbounded loop; it is a legal, terminating
 workload buying a 10-credit operation that fails 97.7% of the time, with no
 aggregate ceiling of any kind.
 
-## 0. First: measure the yield of the thing we are budgeting
+## 0. In parallel: estimate the yield of the thing we are budgeting
 
-Before building any ceiling, compute:
+This **does not gate items 1–2** — a post-commit review of the shipped code
+established that the egress boundary and the fuse are the missing crash and
+storage-failure safety boundary, not merely economics for a low-yield
+operation. Measure alongside, and let the result decide whether the fuzzy search
+stays enabled or gets narrowed, never whether *papio* needs a hard OpenAlex
+egress ceiling.
+
+Estimate, for both the fuzzy sibling hop and metadata enrichment:
 
 ```
-accepted artifacts uniquely attributable to OpenAlex title.search
------------------------------------------------------------------
-                title.search credits spent
+accepted artifacts attributable to OpenAlex title.search
+--------------------------------------------------------
+              title.search credits spent
 ```
 
-for **both** the fuzzy sibling hop and metadata enrichment. The 2.3% is a
-*result* rate; the number that matters is the *acquisition* rate — how many of
-those 73 hits produced a validated, imported PDF that nothing else would have
-found. `attempts` (source, stage, detail) joined to job outcomes carries enough
-to estimate it, and `job.sibling_search` markers now date every search.
+The 2.3% is a *result* rate; what matters is the *acquisition* rate — how many
+of those 73 hits produced a validated, imported PDF nothing else would have
+found.
 
-If the acquisition yield is as weak as the result rate, then narrowing
-eligibility or defaulting the fuzzy search off removes most remaining spend with
-**no new state machinery at all**, and items 2–3 become smaller. A ceiling makes
-a poor operation stop at 3,000 credits instead of 10,000; it does not make it
-worth buying. This measurement is cheap and it gates how much of the rest is
-justified.
+**Treat the number as a lower-bound estimate, not a computation.** Two reasons,
+both structural: `job.sibling_search` is written post-wire and is lossy under
+the crash window described in item 2, and `FinishAttempt` is best-effort
+everywhere. And "attributable" needs winner/candidate provenance — if the
+ledger does not record which candidate won, do not manufacture causation from a
+title-search attempt happening to precede a ready job.
 
-## 1. An egress invariant, not an audit checklist
+## 1+2. One egress authority: commit the credit at the wire, or do not go
 
-The two independently-exploitable spend paths in the incident existed because
-provider calls happened outside anything that could bound them. Five
-`AcquireAny` sites in `internal/app` cover today's resolver, sibling, and enrich
-paths, but `enrichDOIWork` reaches the discovery backend, and `internal/discovery`
-and `internal/enrich` hold their own `sourcegate` clients — that is how the
-*reactive* header floor reaches them and says nothing about *admission*. A code
-audit fixes today's tree; it does not stop the next OpenAlex call added outside
-the audited sites.
+These were two items until a post-commit review showed they are one boundary.
+A reusable admission marker minted back in `AcquireAny` does not solve the
+problem, because it is still separated from egress by a step that can block —
+and it could authorize more than one `Do`.
 
-**Enforce it at the HTTP boundary instead:** an OpenAlex request may not leave
-`sourcegate` unless it carries a valid credit-shape/admission marker for the
-identity it will be served under. A missing marker fails *before* `Do`, loudly.
-Then add a test per HTTP-producing path proving it reaches that guard.
+**The defect this closes, in the shipped code.** Two live holes, both found in
+review:
 
-This is the highest-leverage structural change in this document and it is worth
-more than anything in the deferred per-job guard: it converts "we checked" into
-"it cannot happen".
+1. **The quota floor is not an egress barrier.** `Observer.observe` logs and
+   continues when `Defer` fails, so valid low-quota headers followed by a failed
+   write leave no durable `_quota` row and the next job spends again. On a
+   full disk that runs straight through the supposed 5% stop until some later
+   write succeeds or the provider itself refuses.
+2. **TOCTOU between admission and the wire.** `AcquireAny` consults `quotaGate`
+   *before* an ordinary `Acquire` that may itself wait up to `MaxInlineWait`.
+   Workers A…N all pass the quota precheck while it is open, queue in `Acquire`,
+   another in-flight response installs the floor, and the queued workers then
+   send anyway. The code's comment promises "no new admission once the gate is
+   visible"; the implementation does not deliver it. With a synchronized cohort
+   the 5% headroom is covering not just requests already on the wire but every
+   worker that passed the precheck.
 
-## 2. One conservative source-wide credit fuse
+**The shape that fixes both.** Do all cheap validation and ordinary local gating
+first — token bucket, advisory throttle, applicability. Then, at the final
+OpenAlex HTTP boundary, **atomically commit the request's conservative credit
+cost and immediately call the network client.** That commit *is* the egress
+authority. No blocking wait may occur after it, a failed commit means no wire,
+and a request without a commit must fail before `Do`, loudly. Do not fix the
+race with a manager-wide mutex: a decision taken before a blocking step cannot
+be authoritative for egress.
+
+Then add a test per HTTP-producing path proving it reaches that boundary — the
+audit alone fixes today's tree and not the next call added outside it.
+
+**Debit placement matters for availability.** Committing before ordinary local
+admission would let a reset cohort burn a large slice of the daily allowance on
+requests that never leave the machine. After local admission, immediately before
+egress: `ErrNoSearchBasis` and `ErrNotApplicable` then cost zero with no
+settlement machinery at all.
+
+### The fuse itself
 
 **Not** a reservation ledger. The goal is that *papio* provably stops making
 requests, not that its books balance to the credit.
 
-- **One durable counter, `credits_committed`, per source per UTC day**, debited
-  atomically **before** admission by the request shape's conservative cost (1
+- **One durable counter, `credits_committed`, per source per UTC day**, committed
+  atomically at the egress boundary by the request shape's conservative cost (1
   for a singleton, 10 for a search), refused when the debit would exceed the
   configured daily allowance. **Never refunded within the window.**
 - **Source-wide, not per identity.** A limit enforced per `(source, identity)`
@@ -150,14 +177,18 @@ exists.** Credit exhaustion must carry its UTC reset instant and become a durabl
 park, and the pre-existing monetary `ErrExceeded` path must be fixed in the same
 change rather than leaving two dispositions for one condition.
 
-## 4. Jitter the post-reset wake
+## 4. Jitter the budget-reset wake
 
-Every job parked on a quota gate becomes runnable at the same instant, because
-the park time is the provider's reset instant exactly. The token bucket protects
-OpenAlex from the burst, but nothing protects the scheduler and SQLite from a
-cohort waking together — and a synchronized cohort is what produced the original
-25-minute burn shape. Wake at `reset + stable_jitter(jobID)` over a modest
-window: deterministic, no new state, one line at the park site.
+Every job parked on a quota or local-budget gate becomes runnable at the same
+instant, because the park time is the reset instant exactly. The token bucket
+protects OpenAlex from the burst, but nothing protects the scheduler and SQLite
+from a cohort waking together — and a synchronized cohort is what produced the
+original 25-minute burn shape. Wake at `reset + stable_jitter(jobID)` over a
+modest window: deterministic, no new state, one line at the park site.
+
+**Scope it to quota and local-budget reset parks specifically**, not to every
+source-gate wake. An ordinary short gate is not a synchronized cohort, and
+smearing those wakes adds latency for no benefit.
 
 ## 5. The identity-integrity audit (higher consequence than any of the above)
 
@@ -189,20 +220,31 @@ identity attestation, not merely `DOI → SHA256`. Audit `conflicts`,
 it. `make identity-corpus` measures wrong-accepts against the real library and
 must be run before and after any change here.
 
-## 6. Deferred: the per-job no-progress guard (former A″)
+## 6. A live defect now; deferrable only once the fuse is deployed
 
-A real but narrower hole exists: `Process` crash recovery rewinds to `resolving`,
-and a pass can fail on durable post-wire state updates (`FillWorkMetadata`,
-`InsertCandidates`) before any `retry_wait` transition exists — so
-wire → credits spent → post-wire failure → no retry event → recovery → wire
-again. Nothing charges that.
+`Process` crash recovery rewinds to `resolving`, and a pass can fail on durable
+post-wire state updates (`FillWorkMetadata`, `InsertCandidates`,
+`ResetCandidates`) before any `retry_wait` transition exists — so
+wire → credits spent → post-wire failure → no retry event → recovery → the same
+provider call authorized again. `retryBudgetExhausted` cannot contain it,
+because its count comes from persisted event history that this sequence never
+writes. The charging information is only an in-memory `retryPlan` until the job
+reaches its durable retry transition.
 
-**Deferred, not rejected**, for four reasons:
+**This is a current shipped spend-safety defect, not a future fairness
+concern** — the post-commit review was explicit about that, and storage failure
+is not hypothetical on this machine. It is listed sixth because the egress fuse
+(item 1+2) is the structural fix for its *consequence*: once every OpenAlex wire
+attempt requires a fail-closed daily credit commit, an uncharged repeat pass can
+no longer produce unbounded provider spend.
 
-1. The credit fuse (item 2) already bounds its *spend* consequence, which was the
-   urgent property. What the per-job guard adds is that the offending job
-   eventually dies rather than merely being prevented from draining the pool —
-   liveness and fairness, not spend safety.
+**Only after that fuse is deployed** does the remainder become a per-job
+liveness and fairness property, and only then is deferring the per-job guard
+reasonable. Reasons it is deferred rather than built now:
+
+1. The fuse bounds the spend consequence, which was the urgent property. What
+   the per-job guard adds is that the offending job eventually dies rather than
+   merely being prevented from draining the pool.
 2. It never actually delivers a hard per-job bound anyway: novel candidate
    insertion and material metadata changes reset the episode, so a source
    producing continuing low-value novelty keeps a job alive indefinitely.
@@ -229,13 +271,15 @@ true) is in git history at the third rewrite of this file.
 
 ## Ordering
 
-**0 (measure) → 1 (egress invariant) → 2 (credit fuse) → 3 (truthful park) → 4
-(jitter) → 5 (identity audit, in parallel and arguably first) → 6 (deferred).**
+**`(0 estimate ‖ 5 identity audit)` alongside `(1+2 egress authority)` → 3
+truthful park → 4 jitter → 6 (deferrable only once 1+2 is deployed).**
 
-Item 0 is cheap and can shrink 2. Item 1 is the structural win. Items 2–4 are one
-migration and one new admission input between them. Item 5 is a different kind of
-risk and should not queue behind spend work; it is the one whose failure mode is
-unrecoverable.
+The earlier draft wrote `… → 4 → 5` while its own prose said item 5 must not
+queue behind spend work; the two contradicted each other and the ordering above
+is the honest one. Item 0 informs whether the fuzzy search stays enabled but
+gates nothing. Items 1+2 are one boundary and one migration. Item 5 is a
+different class of risk — the only failure mode here that cannot be undone — and
+runs in parallel.
 
 Each migration means daemon and CLI deploy together (`make dev-deploy`), which on
 this machine means both *papio* binaries plus the native-host symlink.
@@ -259,6 +303,28 @@ for real dollars. A billing feature, not a safety mechanism.
   marker bounds it to one search per question), but the comment now says exactly
   that instead of implying necessity. **Open question for item 0's measurement:**
   whether a pending durable gate should also defer the search.
+- **An unreadable retry history was also a positive spend permit.** Exhaustion
+  is read in two opposite senses: for liveness "unknown" must mean stop, but
+  `resolve` also reads it as one arm of `atBoundary`, which is what *authorizes*
+  the ten-credit search. So a single transient `Jobs.Events` failure made
+  exhaustion read true, the separate marker read then succeeded and found no
+  marker, and the expensive query ran with a temporary retry still pending.
+  Split into `retryBudgetExhausted` (fails closed, liveness) and
+  `retryBudgetExhaustedProven` (returns the read error; only a proven fact is a
+  permit). Regression:
+  `TestUnreadableHistoryIsNoPermitForTheExpensiveSearch`.
+- **The memo made cache residency part of acquisition correctness.** At the cap,
+  `writeMemo` dropped the entire map, and a DOI-only job whose caller metadata
+  has no title depends on that memo for its search basis — so unrelated traffic
+  crossing the cap, or a fetch taking longer than the two-minute TTL, silently
+  cancelled that job's sibling discovery, where the pre-memo code did a
+  canonical GET. Two fixes: the cap now evicts expired entries first and drops
+  wholesale only if that frees nothing, and a missing basis is re-earned with the
+  one-credit singleton lookup (`canonicalRecord`) instead of being assumed
+  absent. Only a DOI the provider does not know still yields
+  `ErrNoSearchBasis`. Regressions: `TestSiblingWithoutBasisReearnsItCheaply`,
+  `TestSiblingStaleMemoReearnsBasis`, `TestMemoCapEvictsOnlyExpiredEntries`,
+  `TestSiblingNoSearchBasisAfterUnknownDOI`.
 
 ## Rejected designs (do not re-derive)
 

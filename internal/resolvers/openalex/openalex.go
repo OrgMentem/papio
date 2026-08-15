@@ -464,6 +464,32 @@ func (r *Resolver) writeMemo(doi string, record workRecord, found bool) {
 	r.records["doi:"+doi] = recordMemo{record: record, found: found, at: time.Now()}
 }
 
+// canonicalRecord fetches the singleton record for a normalized DOI and
+// memoizes what it learned, including a durable 404. It is the one-credit
+// shape; ResolveSiblings uses it only to re-earn a search basis the memo no
+// longer holds, never to build a candidate URL.
+func (r *Resolver) canonicalRecord(ctx context.Context, canonicalDOI string, anon bool) (workRecord, bool, error) {
+	endpoint, lookup, _, err := r.lookupURL(work.Work{DOI: canonicalDOI}, anon)
+	if err != nil || lookup == "" {
+		return workRecord{}, false, err
+	}
+	body, err := r.fetch(ctx, endpoint)
+	if err != nil {
+		return workRecord{}, false, err
+	}
+	if body == nil {
+		r.writeMemo(canonicalDOI, workRecord{}, false)
+		return workRecord{}, false, nil
+	}
+	defer func() { _ = body.Close() }()
+	var record workRecord
+	if err := decodeBoundedJSON(body, r.maxBody, &record); err != nil {
+		return workRecord{}, false, fmt.Errorf("openalex: invalid response: %w", err)
+	}
+	r.writeMemo(canonicalDOI, record, true)
+	return record, true, nil
+}
+
 // recordFor returns a record written by a preceding Resolve call for the same
 // DOI, if one is fresh (< recordMemoTTL). It never fetches: on a miss,
 // ResolveSiblings falls back to the caller-supplied title/year/authors, exactly

@@ -595,7 +595,11 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		// the per-basis marker bounds it to one search per question — but
 		// "necessary" here means "no ordinary retry is pending", not "nothing
 		// else could possibly succeed". The typed relations run either way.
-		atBoundary := plan.Temporary().IsZero() || s.retryBudgetExhausted(ctx, row.ID)
+		// Only PROVEN exhaustion is a permit: an unreadable history must not
+		// authorize the expensive search, even though the same unknown does
+		// settle the job elsewhere.
+		exhausted, _ := s.retryBudgetExhaustedProven(ctx, row.ID)
+		atBoundary := plan.Temporary().IsZero() || exhausted
 		siblings, siblingPlan := s.resolveSiblings(ctx, row, atBoundary)
 		all = append(all, siblings...)
 		plan.merge(siblingPlan)
@@ -1848,9 +1852,29 @@ const maxRetryAttempts = 8
 // job settling early — recoverable with `papio jobs retry` — against a
 // provider quota that is not recoverable until the next reset.
 func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
-	events, err := s.Jobs.Events(ctx, jobID)
+	exhausted, err := s.retryBudgetExhaustedProven(ctx, jobID)
 	if err != nil {
 		return true
+	}
+	return exhausted
+}
+
+// retryBudgetExhaustedProven reports exhaustion only from history it actually
+// read, and hands the read error back instead of folding it into the verdict.
+//
+// The distinction is load-bearing because exhaustion is consumed in two
+// opposite senses. For liveness (parkForRetry, siblingHop) "unknown" must mean
+// "stop", so retryBudgetExhausted above fails closed. But resolve() also reads
+// exhaustion as a positive PERMIT — it is one arm of atBoundary, which is what
+// authorizes the ten-credit fuzzy search — and there "unknown" must not mean
+// "go". A single transient Events failure would otherwise buy a search that no
+// proven fact justified: the read fails once, exhaustion reads true, the
+// separate marker read then succeeds and finds no marker, and the expensive
+// query runs while an ordinary temporary retry was still pending.
+func (s *Service) retryBudgetExhaustedProven(ctx context.Context, jobID string) (bool, error) {
+	events, err := s.Jobs.Events(ctx, jobID)
+	if err != nil {
+		return false, err
 	}
 	n := 0
 	for _, event := range events {
@@ -1867,7 +1891,7 @@ func (s *Service) retryBudgetExhausted(ctx context.Context, jobID string) bool {
 		}
 		n++
 	}
-	return n >= maxRetryAttempts
+	return n >= maxRetryAttempts, nil
 }
 
 // institutionalRouteExhausted reports whether an institutional OpenURL route
