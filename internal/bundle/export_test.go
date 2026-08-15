@@ -727,3 +727,126 @@ func TestExportedBundleIsV2AndCarriesTheEntitlement(t *testing.T) {
 		t.Fatalf("route %q leaked query data", entitlement.Route)
 	}
 }
+func TestExportReplacesSymlinkArtifact(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+	art, err := exporter.Jobs.GetArtifact(ctx, sha)
+	if err != nil || art == nil {
+		t.Fatalf("get artifact: %v", err)
+	}
+	body, err := os.ReadFile(art.Path)
+	if err != nil {
+		t.Fatalf("read source artifact: %v", err)
+	}
+	destination := filepath.Join(t.TempDir(), "export")
+	artifactsDir := filepath.Join(destination, "artifacts")
+	if err := os.MkdirAll(artifactsDir, 0o700); err != nil {
+		t.Fatalf("mkdir artifacts: %v", err)
+	}
+	external := filepath.Join(t.TempDir(), "external.pdf")
+	if err := os.WriteFile(external, body, 0o600); err != nil {
+		t.Fatalf("write external: %v", err)
+	}
+	linkPath := filepath.Join(artifactsDir, sha+".pdf")
+	if err := os.Symlink(external, linkPath); err != nil {
+		t.Fatalf("symlink artifact: %v", err)
+	}
+	// HashFile follows the symlink, so without Lstat the export would
+	// consider this already materialized.
+	if got, _, err := artifact.HashFile(linkPath); err != nil || got != sha {
+		t.Fatalf("symlink hash = %q, %v; want %q", got, err, sha)
+	}
+	if info, err := os.Lstat(linkPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("precondition: %s is not a symlink: %v %v", linkPath, info, err)
+	}
+	bundlePath, _, err := exporter.Export(ctx, id, destination)
+	if err != nil {
+		// materializeArtifact's Lstat branch is specified to either error
+		// or replace the symlink; both pin the fix over HashFile-follows-
+		// symlink. This implementation replaces, so an error would still be
+		// a correct pin, but we note it.
+		if info, lerr := os.Lstat(linkPath); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+			t.Fatalf("export errored but left symlink in place: %v", err)
+		}
+		return
+	}
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatalf("stat exported artifact: %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("exported artifact mode = %s, want regular file; symlink was trusted as materialized", info.Mode())
+	}
+	if got, _, err := artifact.HashFile(linkPath); err != nil || got != sha {
+		t.Fatalf("exported artifact hash = %q, %v; want %q", got, err, sha)
+	}
+	if _, err := os.Stat(bundlePath); err != nil {
+		t.Fatalf("bundle.json missing after symlink replacement: %v", err)
+	}
+}
+
+func TestExportRollbackRemovesFreshDestinationWhenMaterializeFails(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+	art, err := exporter.Jobs.GetArtifact(ctx, sha)
+	if err != nil || art == nil {
+		t.Fatalf("get artifact: %v", err)
+	}
+	source := art.Path
+	destination := filepath.Join(t.TempDir(), "fresh-dest")
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("precondition: fresh destination already exists: %v", err)
+	}
+	exportPreMaterializeHook = func() {
+		_ = os.Remove(source)
+	}
+	t.Cleanup(func() { exportPreMaterializeHook = nil })
+	_, _, err = exporter.Export(ctx, id, destination)
+	if err == nil {
+		t.Fatal("export succeeded; want failure after source removed in pre-materialize hook")
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("fresh destination not cleaned after materialize failure: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "artifacts")); !os.IsNotExist(err) {
+		t.Fatalf("fresh artifacts dir not cleaned after materialize failure: %v", err)
+	}
+}
+
+func TestExportRollbackPreservesExistingDestinationWhenMaterializeFails(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+	art, err := exporter.Jobs.GetArtifact(ctx, sha)
+	if err != nil || art == nil {
+		t.Fatalf("get artifact: %v", err)
+	}
+	source := art.Path
+	destination := filepath.Join(t.TempDir(), "existing")
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		t.Fatalf("mkdir existing destination: %v", err)
+	}
+	marker := filepath.Join(destination, "keep.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	exportPreMaterializeHook = func() {
+		_ = os.Remove(source)
+	}
+	t.Cleanup(func() { exportPreMaterializeHook = nil })
+	_, _, err = exporter.Export(ctx, id, destination)
+	if err == nil {
+		t.Fatal("export succeeded; want failure after source removed in pre-materialize hook")
+	}
+	if _, err := os.Stat(destination); err != nil {
+		t.Fatalf("pre-existing destination should survive rollback: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("pre-existing file should survive rollback: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "artifacts")); !os.IsNotExist(err) {
+		t.Fatalf("newly-created artifacts dir not cleaned after materialize failure: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "bundle.json")); !os.IsNotExist(err) {
+		t.Fatalf("bundle.json should not exist after materialize failure: %v", err)
+	}
+}

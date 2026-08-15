@@ -335,6 +335,13 @@ func (e *Exporter) Document(ctx context.Context, jobID string) (*protocol.Acquis
 	return b, art, nil
 }
 
+// exportPreMaterializeHook is a test hook invoked after the destination
+// directories are created but before artifact materialization. Tests use it to
+// make the source unreadable deterministically after Verify has already
+// succeeded, so materializeArtifact fails in its copy phase and exercises the
+// rollback path. Nil in production.
+var exportPreMaterializeHook func()
+
 // Export creates (or verifies and reuses) bundle.json and its relative
 // content-addressed artifact. An empty destination uses DataDir/bundles/<job>.
 func (e *Exporter) Export(ctx context.Context, jobID, destination string) (string, *protocol.AcquisitionBundle, error) {
@@ -357,15 +364,9 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if err != nil {
 		return "", nil, err
 	}
-	if err := os.MkdirAll(artifactsDir, 0o700); err != nil {
-		return "", nil, err
-	}
 	artifactPath := filepath.Join(destination, filepath.FromSlash(b.Artifact.Path))
-	artifactCreated, err := materializeArtifact(art.Path, artifactPath, art.SHA256)
-	if err != nil {
-		return "", nil, err
-	}
 	bundlePath := filepath.Join(destination, "bundle.json")
+	var artifactCreated bool
 	rollback := func(primary error, bundleCreated bool) (string, *protocol.AcquisitionBundle, error) {
 		cleanupErr := cleanupExport(destination, artifactsDir, artifactPath, bundlePath,
 			destinationExisted, artifactsDirExisted, artifactCreated, bundleCreated)
@@ -373,6 +374,16 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 			return "", nil, fmt.Errorf("exporting bundle: %w", errors.Join(primary, cleanupErr))
 		}
 		return "", nil, primary
+	}
+	if err := os.MkdirAll(artifactsDir, 0o700); err != nil {
+		return rollback(err, false)
+	}
+	if exportPreMaterializeHook != nil {
+		exportPreMaterializeHook()
+	}
+	artifactCreated, err = materializeArtifact(art.Path, artifactPath, art.SHA256)
+	if err != nil {
+		return rollback(err, false)
 	}
 	bundleExisted, err := pathExists(bundlePath)
 	if err != nil {
@@ -403,11 +414,25 @@ func digest(b *protocol.AcquisitionBundle) (string, error) {
 }
 
 func materializeArtifact(source, target, expectedSHA string) (created bool, retErr error) {
-	if got, _, err := artifact.HashFile(target); err == nil {
-		if got == expectedSHA {
-			return false, nil
+	if info, err := os.Lstat(target); err == nil {
+		if !info.Mode().IsRegular() {
+			// Preserve immutability contract: a symlink (or other non-regular
+			// file) to matching bytes would reference mutable/external bytes.
+			// Chose to replace it with a real immutable copy rather than
+			// failing, so the bundle always owns its bytes.
+			if rmErr := os.Remove(target); rmErr != nil {
+				return false, fmt.Errorf("existing bundle artifact %s is not a regular file (%s) and could not be replaced: %w", target, info.Mode().String(), rmErr)
+			}
+		} else {
+			if got, _, err := artifact.HashFile(target); err == nil {
+				if got == expectedSHA {
+					return false, nil
+				}
+				return false, fmt.Errorf("existing bundle artifact %s has hash %s, want %s", target, got, expectedSHA)
+			} else if !os.IsNotExist(err) {
+				return false, err
+			}
 		}
-		return false, fmt.Errorf("existing bundle artifact %s has hash %s, want %s", target, got, expectedSHA)
 	} else if !os.IsNotExist(err) {
 		return false, err
 	}
