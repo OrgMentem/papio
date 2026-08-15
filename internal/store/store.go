@@ -149,12 +149,19 @@ func (s *Store) migrate(ctx context.Context, migrationCeiling int) error {
 		if err != nil {
 			return err
 		}
+		// A failed rollback here is a second fault on top of the migration
+		// error: the on-disk schema state is then ambiguous, so it must not be
+		// swallowed behind the original error.
 		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
-			_ = tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil {
+				return fmt.Errorf("applying %s: %w (rollback also failed: %v)", name, err, rbErr)
+			}
 			return fmt.Errorf("applying %s: %w", name, err)
 		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", num)); err != nil {
-			_ = tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil {
+				return fmt.Errorf("bumping user_version for %s: %w (rollback also failed: %v)", name, err, rbErr)
+			}
 			return fmt.Errorf("bumping user_version for %s: %w", name, err)
 		}
 		if err := tx.Commit(); err != nil {
