@@ -6,6 +6,7 @@ package update
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +24,9 @@ const (
 	cacheName            = "update-cache.json"
 	zotioCacheName       = "update-cache-zotio.json"
 	checkEvery           = 24 * time.Hour
+	// maxReleaseBody bounds the release payload the same way every resolver
+	// bounds an upstream response body.
+	maxReleaseBody = 1 << 20
 )
 
 // Info describes the latest release known to a checker.
@@ -57,10 +61,16 @@ type Checker struct {
 }
 
 type cache struct {
-	ETag             string    `json:"etag,omitempty"`
-	LatestVersion    string    `json:"latest_version,omitempty"`
-	URL              string    `json:"url,omitempty"`
-	CheckedAt        time.Time `json:"checked_at,omitempty"`
+	ETag          string    `json:"etag,omitempty"`
+	LatestVersion string    `json:"latest_version,omitempty"`
+	URL           string    `json:"url,omitempty"`
+	CheckedAt     time.Time `json:"checked_at,omitempty"`
+	// LastAttemptAt records every completed check, successful or not, so an
+	// endpoint outage defers the next request for the full cadence instead of
+	// re-issuing one on every invocation. It is written without disturbing the
+	// previously cached release metadata, and an older cache file that lacks
+	// the field simply reads as zero.
+	LastAttemptAt    time.Time `json:"last_attempt_at,omitempty"`
 	LastNaggedAt     time.Time `json:"last_nagged_at,omitempty"`
 	InstalledVersion string    `json:"installed_version,omitempty"`
 }
@@ -122,7 +132,7 @@ func (c *Checker) Check(ctx context.Context) *Info {
 	c.mu.Lock()
 	cached := c.readCache()
 	now := c.now().UTC()
-	if checkedRecently(cached.CheckedAt, now) {
+	if cached.fresh(now) {
 		info := cached.info()
 		c.mu.Unlock()
 		return info
@@ -137,7 +147,7 @@ func (c *Checker) Check(ctx context.Context) *Info {
 	c.mu.Lock()
 	cached = c.readCache()
 	now = c.now().UTC()
-	if checkedRecently(cached.CheckedAt, now) {
+	if cached.fresh(now) {
 		info := cached.info()
 		c.mu.Unlock()
 		return info
@@ -154,32 +164,34 @@ func (c *Checker) Check(ctx context.Context) *Info {
 	}
 	response, err := c.client.Do(req)
 	if err != nil {
+		c.recordAttempt(now)
 		return cached.info()
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode == http.StatusNotModified {
-		if cached.info() == nil {
-			return nil
-		}
 		c.mu.Lock()
 		cached = c.readCache()
 		cached.CheckedAt = now
+		cached.LastAttemptAt = now
 		_ = c.writeCache(cached)
 		info := cached.info()
 		c.mu.Unlock()
 		return info
 	}
 	if response.StatusCode != http.StatusOK {
+		c.recordAttempt(now)
 		return cached.info()
 	}
 
 	var latest release
-	if err := json.NewDecoder(response.Body).Decode(&latest); err != nil {
+	if err := json.NewDecoder(io.LimitReader(response.Body, maxReleaseBody)).Decode(&latest); err != nil {
+		c.recordAttempt(now)
 		return cached.info()
 	}
 	latest.TagName = strings.TrimPrefix(latest.TagName, "v")
 	if latest.TagName == "" || latest.HTMLURL == "" {
+		c.recordAttempt(now)
 		return cached.info()
 	}
 	c.mu.Lock()
@@ -188,10 +200,22 @@ func (c *Checker) Check(ctx context.Context) *Info {
 	cached.LatestVersion = latest.TagName
 	cached.URL = latest.HTMLURL
 	cached.CheckedAt = now
+	cached.LastAttemptAt = now
 	_ = c.writeCache(cached)
 	info := cached.info()
 	c.mu.Unlock()
 	return info
+}
+
+// recordAttempt persists the attempt clock after a check that reached a
+// conclusion but produced no usable release, leaving any previously cached
+// release metadata untouched.
+func (c *Checker) recordAttempt(now time.Time) {
+	c.mu.Lock()
+	cached := c.readCache()
+	cached.LastAttemptAt = now
+	_ = c.writeCache(cached)
+	c.mu.Unlock()
 }
 
 // TryMarkNagged atomically records a displayed update prompt when none has
@@ -361,6 +385,18 @@ func (cached cache) info() *Info {
 	}
 }
 
+// fresh reports whether this cache was checked, or attempted, recently enough
+// that issuing another request would break the at-most-once-a-day cadence.
+func (cached cache) fresh(now time.Time) bool {
+	return checkedRecently(cached.CheckedAt, now) || checkedRecently(cached.LastAttemptAt, now)
+}
+
+// checkedRecently treats a future timestamp as NOT recent: a clock rollback or
+// a restored cache would otherwise suppress every check until the future
+// instant plus the cadence had elapsed.
 func checkedRecently(then, now time.Time) bool {
-	return !then.IsZero() && now.Sub(then) < checkEvery
+	if then.IsZero() || then.After(now) {
+		return false
+	}
+	return now.Sub(then) < checkEvery
 }

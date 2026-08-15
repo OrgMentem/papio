@@ -7,10 +7,91 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// A failing endpoint used to leave CheckedAt untouched, so the cache stayed
+// permanently "not recently checked" and every single Check re-hit the network
+// for the duration of the outage.
+func TestCheckDefersAfterFailedCheck(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
+	if err := checker.writeCache(cache{LatestVersion: "1.2.3", URL: "https://example.test/release", CheckedAt: now.Add(-checkEvery)}); err != nil {
+		t.Fatal(err)
+	}
+	first := checker.Check(context.Background())
+	second := checker.Check(context.Background())
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1 (the failed check must hold the cadence)", got)
+	}
+	// The failure must not blank what was already known.
+	for _, info := range []*Info{first, second} {
+		if info == nil || info.LatestVersion != "1.2.3" {
+			t.Fatalf("info = %#v, want the previously cached release", info)
+		}
+	}
+}
+
+// A wall-clock rollback (or a restored cache) leaves a future timestamp behind.
+// Treating it as fresh suppressed every check until that instant plus a day.
+func TestCheckIgnoresFutureCacheTimestamp(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"tag_name":"v2.0.0","html_url":"https://example.test/releases/v2.0.0"}`))
+	}))
+	defer server.Close()
+
+	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
+	if err := checker.writeCache(cache{LatestVersion: "1.2.3", URL: "https://example.test/release", CheckedAt: now.Add(48 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	info := checker.Check(context.Background())
+	if calls.Load() != 1 {
+		t.Fatal("a future cache timestamp suppressed the refresh")
+	}
+	if info == nil || info.LatestVersion != "2.0.0" {
+		t.Fatalf("info = %#v, want the refreshed release", info)
+	}
+}
+
+// Caches written before LastAttemptAt existed must still load and still honour
+// their own checked_at value.
+func TestCheckReadsCacheWithoutAttemptField(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		calls.Add(1)
+	}))
+	defer server.Close()
+
+	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
+	legacy := `{"latest_version":"1.2.3","url":"https://example.test/release","checked_at":"` + now.Add(-time.Hour).Format(time.RFC3339Nano) + `"}`
+	if err := os.MkdirAll(checker.dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(checker.cachePath(), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info := checker.Check(context.Background())
+	if calls.Load() != 0 {
+		t.Fatal("a fresh legacy cache still issued a request")
+	}
+	if info == nil || info.LatestVersion != "1.2.3" {
+		t.Fatalf("info = %#v, want the legacy cached release", info)
+	}
+}
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
