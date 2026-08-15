@@ -6,18 +6,24 @@ anonymous fallback, the fuzzy-search boundary/basis gate, and three fail-closed
 guards). Those changes are complete; git history and `CHANGELOG.md` hold the
 record.
 
-**Four adversarial reviews, four rewrites.** Three rounds sharpened a two-part
-plan (a per-job spend guard "A″" plus a per-identity credit ceiling "B″"); a
-fourth, deliberately given no prior-round context and a wide brief, rejected the
-shape of both and is the basis for this version. Its judgement:
+**Six adversarial reviews, five rewrites.** Three early rounds sharpened a
+two-part plan (a per-job spend guard plus a per-identity credit ceiling); a
+fourth, given no prior-round context and a wide brief, rejected the shape of both;
+a fifth and sixth reviewed the shipped code and found nine defects in it,
+including three in fixes made an hour earlier. Every finding was verified against
+the tree before being accepted. Reviews are preserved under
+`dev/scratch/oracle/20260815T0*`.
 
-> The proposed plan currently spends too much engineering on making spend
-> bookkeeping exact and too little on deciding whether the expensive operation is
-> worth buying at all.
+**Rejected designs** at the bottom records every dead end with its reason —
+sixteen of the twenty-four from earlier drafts of this file. Read it before
+proposing a simplification; most of the obvious ones are in it, with the sequence
+that breaks them.
 
-Reviews are preserved under `dev/scratch/oracle/20260815T0*`. **Rejected
-designs** at the bottom records every dead end with its reason — nine of them
-from earlier drafts of this file. Read it before proposing a simplification.
+The recurring shape of every defect found so far, mine included: **a decision made
+from information that is not durable yet, or is not what it claims to be.** An
+in-memory charge a crash erases; a fail-closed guard that becomes a permission
+when a second caller reads it; a best-effort note treated as an authority; a cache
+treated as a fact; a durable fact read by only one of its two readers.
 
 ## Context: the incident, and what production says now
 
@@ -103,17 +109,38 @@ review:
    and 2 survive the fuse entirely. Treat identity-gate revalidation as part of
    the egress authority's contract, not as something the counter subsumes.
 
-**The shape that fixes both.** Do all cheap validation and ordinary local gating
-first — token bucket, advisory throttle, applicability. Then, at the final
-OpenAlex HTTP boundary, **atomically commit the request's conservative credit
-cost and immediately call the network client.** That commit *is* the egress
-authority. No blocking wait may occur after it, a failed commit means no wire,
-and a request without a commit must fail before `Do`, loudly. Do not fix the
-race with a manager-wide mutex: a decision taken before a blocking step cannot
-be authoritative for egress.
+**The shape that fixes all three.** Do all cheap validation and ordinary local
+gating first — token bucket, advisory throttle, applicability. Then, at the final
+OpenAlex HTTP boundary, **one atomic transaction makes two independent decisions
+and then the network call happens immediately**:
 
-Then add a test per HTTP-producing path proving it reaches that boundary — the
-audit alone fixes today's tree and not the next call added outside it.
+1. the outgoing credential's `"<source>_quota"` signal is not currently gated; and
+2. the source-wide daily credit debit fits the configured allowance.
+
+Both are revalidated *there*, not inherited from an earlier decision. That
+transaction *is* the egress authority: no blocking wait may occur after it, a
+failed commit means no wire, and a request reaching the transport without one
+must fail loudly. Do not fix the race with a manager-wide mutex — a decision
+taken before a blocking step cannot be authoritative for egress.
+
+**Requirement: the boundary must be a true one-wire boundary.** The wrapper
+interface accepts an `*http.Client`, and `Client.Do` follows redirects, so one
+commit could authorize several physical requests. Either place the authority at
+`RoundTripper.RoundTrip`, or make the OpenAlex client explicitly non-redirecting
+and treat a redirect as a response requiring fresh admission. With a
+configurable `BaseURL` this must not be left as an assumption.
+
+**Requirement: a process-local fail-closed latch for a lost floor.** When a
+low-quota response's durable `Defer` fails, set an in-process latch for that
+credential immediately, before and while retrying persistence. Otherwise a
+transient SQLite busy can lose the floor while the credit write succeeds — and
+"both writes fail together because the disk is full" is too narrow an assumption.
+
+**Requirement: a capability boundary, not just a passing test.** "Every current
+callsite reaches the fuse" is worth asserting, but code outside the egress
+wrapper should not *possess* a client able to reach OpenAlex without the commit.
+Make the unguarded transport unconstructible from outside, then the test is a
+backstop rather than the guarantee.
 
 **Debit placement matters for availability.** Committing before ordinary local
 admission would let a reset cohort burn a large slice of the daily allowance on
@@ -152,21 +179,33 @@ requests, not that its books balance to the credit.
   request admitted at 23:59:59 may be accounted in either window, and a shape
   that costs more than its conservative charge has already happened by the time
   anyone knows. If observed `credits-used` ever exceeds the committed shape cost,
-  treat it as provider-contract drift: gate that identity for the rest of the
-  window and surface it. Do not build reconciliation to recover a few
-  conservatively overcounted credits.
+  that is provider-contract drift — and gating only the *credential* is too
+  narrow, because pricing is a property of the **operation**, not the identity.
+  Otherwise keyed detects a 10→100 change, is gated, and the next call falls
+  through to keyless and repeats the same undercharged shape. Fail that request
+  shape — or OpenAlex generally — closed for the remaining local window, and
+  surface it. Do not build reconciliation to recover a few conservatively
+  overcounted credits.
 - **Credits are a new unit, not the existing `estimatedCost`.** That argument
   flows to `reserve(ctx, source, identity, policy.MaxCostUSD, estimatedCost)` and
   into `spent_usd`: it is dollars. Using it for credits implements the
   credits-as-dollars design this document rejects.
-- **Atomic in SQL, not read-compare-write.** Hundreds of jobs target the same hot
-  row; it must be one conditional mutation.
+- **Atomic in SQL across insert AND update.** Hundreds of jobs target the same
+  hot row, so it must be one conditional mutation — and the condition must cover
+  the *first* write of a day, not only the conflict-update arm. A naive
+  `INSERT … ON CONFLICT DO UPDATE` that puts the limit test only in the update
+  arm admits a first 10-credit request against an allowance of 5. Test the
+  empty-row-over-limit case explicitly.
 - **Config:** a per-source daily credit allowance. `0` means unmetered, matching
   the existing convention — so the shipped OpenAlex default and `papio init`
   output must be **non-zero**, with a test on the defaults, or the fuse ships
   inert. Document it in the hand-authored
   `docs/reference/config-reference.md`. Strict config decoding means the field
   and the binary deploy together.
+- **`0` disables the ceiling, never the commit.** Every OpenAlex request still
+  executes the durable commit and increments `credits_committed`; otherwise the
+  configuration that turns off enforcement also bypasses the egress invariant and
+  its accounting, which is precisely when an operator most needs the numbers.
 - One migration; three hardcoded `user_version` assertions
   (`internal/cli/clean_install_test.go` twice, `internal/doctor/doctor_test.go`,
   `internal/store/migrate_forward_test.go`).
@@ -181,9 +220,12 @@ budget until the window resets". Dormant today only because monetary reservation
 are all `0.0`; the fuse makes it live.
 
 **A local policy budget being exhausted is not evidence that no legal candidate
-exists.** Credit exhaustion must carry its UTC reset instant and become a durable
-park, and the pre-existing monetary `ErrExceeded` path must be fixed in the same
-change rather than leaving two dispositions for one condition.
+exists.** It is a *timed* gate, so the disposition must carry the reset that
+actually applies — **UTC midnight for the credit fuse, the monthly boundary for
+the existing USD budget** — and become a durable park. Two budgets with different
+windows must not collapse into one reset, and the pre-existing monetary
+`ErrExceeded` path must be fixed in the same change rather than leaving two
+dispositions for one condition.
 
 ## 4. Jitter the budget-reset wake
 
@@ -194,39 +236,59 @@ from a cohort waking together — and a synchronized cohort is what produced the
 original 25-minute burn shape. Wake at `reset + stable_jitter(jobID)` over a
 modest window: deterministic, no new state, one line at the park site.
 
-**Scope it to quota and local-budget reset parks specifically**, not to every
-source-gate wake. An ordinary short gate is not a synchronized cohort, and
-smearing those wakes adds latency for no benefit.
+**Jitter the job's wake time, never the underlying gate.** The gate instant is
+the provider's own fact and other logic reads it; smearing the gate would corrupt
+that meaning, while smearing the wake preserves it. **Scope it to quota and
+local-budget reset parks**, not to every source-gate wake: an ordinary short gate
+is not a synchronized cohort, and smearing those adds latency for no benefit.
 
-## 5. The identity-integrity audit (higher consequence than any of the above)
+## 5. Evidence authority over canonical identity (highest consequence here)
 
 *papio*'s worst outcome is not a spent quota; it is the wrong PDF filed under the
-right citation. The fresh review flagged two authority boundaries that deserve a
-dedicated pass **before** more spend machinery:
+right citation. This is **audit plus mandatory remediation of every violating
+promotion path**, not an audit that might conclude nothing.
 
-- **Enrichment can add a strong identifier to `row.Work` from a fuzzy title
-  match**, after which acquisition operates on the enriched identity. That is
-  safe only if the originally submitted identity remains an immutable validation
-  anchor. If semantic validation asks merely "does this PDF match the *now
-  enriched* `row.Work`?", a false positive becomes self-confirming: wrong title
-  match → wrong DOI adopted → resolvers fetch that DOI → the PDF "agrees".
-- **`fillMissing` accumulates metadata across ranked candidates.** Candidates are
-  each conflict-checked against the *pre-merge* `row.Work`, so unless
-  `fillMissing` enforces cross-candidate consistency, a sparse request lets
-  candidate A contribute identifier X and candidate B contribute identifier Y
-  while A and B disagree with each other.
+**The one invariant, phrased around evidence authority rather than any particular
+path:**
+
+> Search and routing evidence may create candidates. Only evidence independently
+> tied to the submitted canonical identity may mutate canonical identity metadata
+> before artifact validation.
+
+Phrasing it that way covers every route at once — weak title matches, fuzzy
+siblings, typed siblings naming a different DOI or version, metadata enrichment,
+and cache attestations — instead of requiring each to be remembered separately. An
+exact-DOI-echo-verified canonical record is a *different authority class* and may
+enrich.
+
+Known violating shapes to remediate:
+
+- **A weak title match can be accepted on title alone.** When the submitted work
+  has no year and no authors, `requested.Year == 0` skips the year check and an
+  empty requested-author list makes `sameAuthorLists` return true — so a record
+  sharing only a normalized title is accepted at 0.75 confidence, carrying its own
+  strong identifiers.
+- **Every accepted candidate then flows through the same pre-validation merge**
+  (`rank → fillMissing(row.Work, c.ResolvedWork) → FillWorkMetadata`) *before*
+  fetching or semantic validation, so identifiers that originated solely in a
+  fuzzy match become canonical job metadata a later pass then trusts.
+- **`fillMissing` accumulates across ranked candidates**, each conflict-checked
+  only against the *pre-merge* `row.Work` — so unless it enforces cross-candidate
+  consistency, candidate A can contribute identifier X and candidate B identifier
+  Y while A and B disagree with each other.
+- **Enrichment adopting an identifier from a fuzzy title match** is the
+  self-confirming case: wrong title match → wrong DOI adopted → resolvers fetch
+  that DOI → the PDF "agrees". Safe only if the *originally submitted* identity
+  remains an immutable validation anchor.
 - **Amplifier:** a DOI cache hit verifies the artifact hash and transitions
-  straight to `ready`, with no visible semantic revalidation — correct only if
-  the cached artifact carries a strong exact validation attestation. Otherwise
-  one bad identity acceptance is reusable forever.
+  straight to `ready` with no visible semantic revalidation, so one bad acceptance
+  is reusable forever. Cache reuse must consume a durable identity attestation,
+  not merely `DOI → SHA256`.
 
-**Invariant to establish:** enrichment may add search and routing evidence, but
-only immutable request evidence plus independently validated evidence may
-authorize final artifact identity; and cache reuse must consume a durable
-identity attestation, not merely `DOI → SHA256`. Audit `conflicts`,
-`fillMissing`, `sameWork`, `validateCandidate`, and `FindArtifactByDOI` against
-it. `make identity-corpus` measures wrong-accepts against the real library and
-must be run before and after any change here.
+Audit and remediate `conflicts`, `fillMissing`, `sameWork`, `matchesTitleSearch`,
+`validateCandidate`, and `FindArtifactByDOI` against the invariant.
+`make identity-corpus` measures wrong-accepts against the real library and must be
+run before and after any change here.
 
 ## 6. A live defect now; deferrable only once the fuse is deployed
 
@@ -241,18 +303,24 @@ reaches its durable retry transition.
 
 **This is a current shipped spend-safety defect, not a future fairness
 concern** — the post-commit review was explicit about that, and storage failure
-is not hypothetical on this machine. It is listed sixth because the egress fuse
-(item 1+2) is the structural fix for its *consequence*: once every OpenAlex wire
-attempt requires a fail-closed daily credit commit, an uncharged repeat pass can
-no longer produce unbounded provider spend.
+is not hypothetical on this machine. It is listed sixth because the egress
+authority (item 1+2) is the structural fix for its *consequence*: once every
+OpenAlex wire attempt requires a fail-closed credit commit, an uncharged repeat
+pass can no longer produce unbounded provider spend.
 
-**Only after that fuse is deployed** does the remainder become a per-job
-liveness and fairness property, and only then is deferring the per-job guard
-reasonable. Reasons it is deferred rather than built now:
+**Be precise about what the fuse actually buys, though.** It does not make a
+pathological job's spend bounded over its lifetime — that job can consume the
+allowance again tomorrow, and the day after, starving unrelated jobs each time.
+What the fuse gives is an operator-defined **per-day blast radius**. If that is
+the accepted safety invariant then deferring the per-job guard is reasonable, but
+what remains deferred is a **cross-day starvation and liveness problem**, not
+cosmetic fairness.
 
-1. The fuse bounds the spend consequence, which was the urgent property. What
-   the per-job guard adds is that the offending job eventually dies rather than
-   merely being prevented from draining the pool.
+Reasons it is deferred rather than built now:
+
+1. The fuse bounds the per-day spend consequence, which was the urgent property.
+   What the per-job guard adds is that the offending job eventually dies rather
+   than merely being prevented from draining today's pool.
 2. It never actually delivers a hard per-job bound anyway: novel candidate
    insertion and material metadata changes reset the episode, so a source
    producing continuing low-value novelty keeps a job alive indefinitely.
@@ -277,64 +345,76 @@ reset via `InsertCandidates`' inserted-row count, a separate
 mandatory regression that crossing the ceiling must **not** make `atBoundary`
 true) is in git history at the third rewrite of this file.
 
-## 7. Two-step sibling basis, admitted and charged per call
+## 7. Derive the effective basis explicitly, before novelty gating
 
-The availability gap left open by the reverted re-earn: a DOI-only job whose own
-metadata carries no title cannot search for siblings when the memo has expired or
-been evicted, and silently discovers nothing. The adapter cannot fix this, which
-is what the revert established — a resolver that pays for a second request inside
-one admission breaks both the "no request happened" sentinel and the
-one-admission-one-wire rule.
+Two problems, one abstraction. The first is availability: a DOI-only job whose own
+metadata carries no usable basis cannot search for siblings when the memo has
+expired or been evicted, and silently discovers nothing. The second is worse and
+is live today: **the durable marker can name a different question from the one
+searched.** The app hashes `row.Work` *before* calling the adapter, and the
+adapter may then substitute a positive memoized canonical record and search on
+*its* title instead.
 
-**The caller owns it.** `app.resolveSiblings` should treat `ErrNoSearchBasis` as
-"this adapter needs a basis" and then, under its *own* separate admission and
-charge, ask the adapter for one — a `SiblingBasis(ctx, work) (work.Work, error)`
-capability that performs exactly the one-credit singleton lookup — before
-re-admitting and calling `ResolveSiblings` with the enriched work. Three
-properties fall out for free: each paid request is separately admitted, so a
-quota floor installed by the singleton's own response stops the search; the
-sentinel keeps meaning "no request happened"; and the durable basis marker is
-computed by the app from the work it actually passed, so it names the question
-that was really asked. That last point is a defect in the shipped marker
-today — the app hashes `row.Work` while the adapter may search a memoized
-canonical title — and this is its fix.
+A sentinel-triggered recovery does **not** fix that, which is what an earlier
+draft of this item got wrong. The damaging sequence never produces a sentinel at
+all:
 
-## 8. Do not enrich the canonical work from an unvalidated fuzzy sibling
+1. `row.Work` already has a usable title, so no sentinel is returned.
+2. A positive canonical memo also exists.
+3. The app hashes `row.Work` as basis A and finds no marker for A.
+4. The adapter silently searches memoized basis B.
+5. Basis B's search completes; the marker records **A**.
+6. Later enrichment changes `row.Work` to A′; the memo still holds B.
+7. A′ looks novel, and buys the identical B search again.
 
-A fuzzy sibling is accepted on normalized-title plus surname/year heuristics at
-`IdentityConfidence: 0.6`, and it deliberately names a *different* DOI. But back
-in `resolve`, every ranked candidate feeds `fillMissing`, and the merged result is
-persisted by `FillWorkMetadata` **before** fetch and semantic validation — even
-though PDF semantic identity is supposed to be the acceptance gate for exactly
-these candidates.
+**The fix is to make the effective basis explicit and authoritative.** A
+side-effect-free `SiblingSearchBasis(requested) (work.Work, bool)` returns the
+basis the adapter *would* use — positive memo metadata or caller metadata,
+whichever wins, subject to the usable-basis rule (title plus a canonicalizable
+author surname; a negative DOI memo suppresses only the memo-derived basis, never
+the caller's own). The app hashes **that returned basis** for the novelty marker,
+and the subsequent search is then forced to use exactly it — no hidden
+substitution after the marker check.
 
-Sequence: citation is DOI X with a sparse bibliography; canonical X establishes a
-common title; fuzzy result Y shares that normalized title, a surname, and a
-nearby year but is another work; Y's title/year/authors are persisted alongside
-DOI X before Y's PDF proves anything. Even when validation later rejects Y, the
-job is already bibliographically contaminated — and a validator that trusts the
-enriched work is then less independent, which is the self-confirming loop item 5
-describes.
+Only when no usable local basis exists does the caller, under its *own* separate
+admission and credit commit, ask for a one-credit `SiblingBasis` network lookup.
+That keeps three properties: each paid request is separately admitted, so a floor
+installed by the singleton's own response stops the search; `ErrNoSearchBasis`
+keeps meaning "no request happened"; and the marker names the question actually
+asked. This item must be designed against the *current* basis semantics, which
+changed after the earlier draft was written.
 
-**Rule:** only DOI-verified canonical metadata may enrich the work pre-validation.
-Fuzzy-sibling metadata may inform candidate ranking and nothing else until its
-artifact passes identity validation. Audit `fillMissing`, `conflicts`, and
-`FillWorkMetadata` against that, and run `make identity-corpus` before and after.
+## 8. Merged into item 5
+
+This was "do not enrich the canonical work from an unvalidated *fuzzy sibling*",
+with the sequence: citation is DOI X with a sparse bibliography; canonical X
+establishes a common title; fuzzy result Y shares that normalized title, a
+surname, and a nearby year but is another work; Y's title, year and authors are
+persisted alongside DOI X before Y's PDF proves anything.
+
+**It was too path-specific.** Typed siblings naming a different DOI or version go
+through the same `rank → fillMissing → FillWorkMetadata` stream, and so do
+ordinary weak title matches — so a rule written about fuzzy siblings would have
+left two equally dangerous routes open while looking complete. Item 5's
+evidence-authority invariant covers all of them in one sentence, so this item is
+folded there rather than kept as a separate narrower rule.
 
 ## Ordering
 
-**`(0 estimate ‖ 5 identity audit ‖ 8 no fuzzy pre-enrichment)` alongside
-`(1+2 egress authority)` → 3 truthful park → 4 jitter → 7 two-step basis → 6
-(deferrable only once 1+2 is deployed).**
+**`(0 estimate ‖ 5 evidence authority)` alongside `(1+2 egress authority)` → 3
+truthful park → 4 jitter → 7 effective basis → 6 (deferrable only once 1+2 is
+deployed).**
 
 An earlier draft wrote `… → 4 → 5` while its own prose said item 5 must not queue
 behind spend work; the two contradicted each other and the ordering above is the
 honest one. Item 0 informs whether the fuzzy search stays enabled but gates
-nothing. Items 1+2 are one boundary and one migration. Items 5 and 8 are the same
-class of risk — the only failure mode here that cannot be undone — and 8 is small
-and self-contained, so it should not wait. Item 7 restores an availability
-property and is cheapest once 1+2 has settled how admission is expressed, because
-it needs two admissions per hop.
+nothing. Items 1+2 are one boundary and one migration, and the newly found
+`sourcegate.Client` quota bypass belongs **inside** that item — the shipped
+`Acquire` fix closes it at admission, but only the egress authority closes the
+TOCTOU window behind it. Item 5 is the only failure mode here that cannot be
+undone and must not queue behind spend work. Item 7 needs the effective-basis
+correction before implementation and is cheapest once 1+2 has settled how
+admission is expressed, because it may need two admissions per hop.
 
 Each migration means daemon and CLI deploy together (`make dev-deploy`), which on
 this machine means both *papio* binaries plus the native-host symlink.
@@ -442,6 +522,32 @@ for real dollars. A billing feature, not a safety mechanism.
   the quota floor; a paid singleton followed by `ErrNoSearchBasis` put a false
   "no request happened" fact into the retry plan; and the durable marker then
   named a question that was not the one searched. Item 7 is the caller-side fix.
+- **Expecting the daily credit fuse to restore the provider floor.** They are
+  different boundaries: a source-wide counter answers "how much may this instance
+  commit today", the floor answers "is this credential's provider balance spent".
+  A committed credit satisfies the first and is silent on the second, so the
+  egress authority must revalidate the outgoing identity's gate too.
+- **Gating only the credential when observed cost exceeds the committed shape
+  cost.** Pricing is a property of the operation, not the identity, so keyed
+  detects the drift, gets gated, and the next call falls through to keyless and
+  repeats the same undercharged shape.
+- **A sentinel-triggered basis recovery as the fix for the marker mismatch.** The
+  damaging sequence never returns the sentinel: caller metadata is usable, the app
+  hashes basis A, the adapter silently searches memoized basis B, and the marker
+  records A.
+- **Putting the egress commit at a generic `HTTPClient.Do`.** `http.Client.Do`
+  follows redirects, so one commit can authorize several physical requests. Use
+  `RoundTripper.RoundTrip`, or disable redirects and treat one as a response
+  needing fresh admission.
+- **Letting `0 == unmetered` skip the durable commit.** Disabling enforcement
+  would then also bypass the egress invariant and its accounting — exactly when an
+  operator most needs the numbers.
+- **A conditional UPSERT whose limit test lives only in the conflict-update arm.**
+  The first write of a day then admits a 10-credit request against an allowance of
+  5.
+- **Item 8 as a fuzzy-sibling-specific rule.** Typed siblings and ordinary weak
+  title matches use the same pre-validation merge, so the narrow rule looked
+  complete while leaving two equally dangerous routes open.
 - **Accepting a record on the first parseable DOI echo.** A record naming the
   requested work in `doi` and a different one in `ids.doi` passed. Every parseable
   echo must agree.
