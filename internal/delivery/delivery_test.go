@@ -680,6 +680,141 @@ func TestOrphanIfLiveIgnoresNonLiveRows(t *testing.T) {
 	}
 }
 
+// TestOrphanIfLiveDoesNotClobberTerminalOutcome proves the CAS discipline:
+// a poll that settles the row to a terminal outcome between OrphanIfLive's
+// read and write must not be clobbered with unknown_outcome, and no
+// orphaned event is appended on the lost race. The interleaving is
+// simulated via SetBeforeOrphanCASForTest, the package seam that runs
+// between the GetByJobID snapshot and the guarded UPDATE — exactly the
+// window where CancelJob/DismissAction race the poller in production.
+// A second sub-case asserts the normal orphan path is unchanged: a
+// genuinely live row is still orphaned exactly once with its event.
+func TestOrphanIfLiveDoesNotClobberTerminalOutcome(t *testing.T) {
+	svc := testService(t, time.Now())
+	ctx := context.Background()
+
+	// Race: submitted -> fulfilled between read and CAS.
+	testJob(t, svc, "job_race_fulfilled")
+	req, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_race_fulfilled", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/race-fulfilled",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdateState(ctx, req.ID, StateSubmitted); err != nil {
+		t.Fatal(err)
+	}
+	svc.SetBeforeOrphanCASForTest(func() error {
+		_, err := svc.store.DB().ExecContext(ctx,
+			`UPDATE delivery_requests SET state = ?, updated_at = ? WHERE id = ?`,
+			string(StateFulfilled), store.Now(), req.ID)
+		return err
+	})
+	if err := svc.OrphanIfLive(ctx, "job_race_fulfilled", "job_cancelled"); err != nil {
+		t.Fatalf("OrphanIfLive race (submitted->fulfilled): err = %v, want nil (successful no-op)", err)
+	}
+	svc.SetBeforeOrphanCASForTest(nil)
+	after, err := svc.Get(ctx, req.ID)
+	if err != nil || after == nil {
+		t.Fatalf("Get after raced OrphanIfLive: %+v, %v", after, err)
+	}
+	if after.State != StateFulfilled {
+		t.Fatalf("state = %q, want fulfilled — CAS must not overwrite poller's terminal settlement", after.State)
+	}
+	var count int
+	if err := svc.store.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events WHERE kind = ? AND job_id = ?`, eventKindOrphaned, "job_race_fulfilled").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("orphaned events = %d, want 0 — CAS loss must not append event", count)
+	}
+
+	// Race: pending -> declined between read and CAS.
+	testJob(t, svc, "job_race_declined")
+	req2, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_race_declined", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/race-declined",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdateState(ctx, req2.ID, StatePending); err != nil {
+		t.Fatal(err)
+	}
+	svc.SetBeforeOrphanCASForTest(func() error {
+		_, err := svc.store.DB().ExecContext(ctx,
+			`UPDATE delivery_requests SET state = ?, updated_at = ? WHERE id = ?`,
+			string(StateDeclined), store.Now(), req2.ID)
+		return err
+	})
+	if err := svc.OrphanIfLive(ctx, "job_race_declined", "action_dismissed"); err != nil {
+		t.Fatalf("OrphanIfLive race (pending->declined): err = %v, want nil", err)
+	}
+	svc.SetBeforeOrphanCASForTest(nil)
+	after2, err := svc.Get(ctx, req2.ID)
+	if err != nil || after2 == nil {
+		t.Fatalf("Get after raced OrphanIfLive: %+v, %v", after2, err)
+	}
+	if after2.State != StateDeclined {
+		t.Fatalf("state = %q, want declined — CAS must not overwrite poller's settlement", after2.State)
+	}
+	if err := svc.store.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events WHERE kind = ? AND job_id = ?`, eventKindOrphaned, "job_race_declined").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("orphaned events = %d, want 0 — CAS loss must not append event", count)
+	}
+
+	// Normal path unchanged: genuinely live rows are still orphaned exactly once.
+	testJob(t, svc, "job_race_normal")
+	req3, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_race_normal", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/race-normal",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdateState(ctx, req3.ID, StateSubmitted); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OrphanIfLive(ctx, "job_race_normal", "job_cancelled"); err != nil {
+		t.Fatalf("OrphanIfLive normal: %v", err)
+	}
+	after3, err := svc.Get(ctx, req3.ID)
+	if err != nil || after3 == nil {
+		t.Fatalf("Get after normal OrphanIfLive: %+v, %v", after3, err)
+	}
+	if after3.State != StateUnknownOutcome {
+		t.Fatalf("state = %q, want unknown_outcome — live row must still be orphaned", after3.State)
+	}
+	var normalCount int
+	if err := svc.store.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events WHERE kind = ? AND job_id = ?`, eventKindOrphaned, "job_race_normal").Scan(&normalCount); err != nil {
+		t.Fatal(err)
+	}
+	if normalCount != 1 {
+		t.Fatalf("orphaned events = %d, want 1 — live orphan must append exactly one event", normalCount)
+	}
+	var detailJSON string
+	if err := svc.store.DB().QueryRowContext(ctx,
+		`SELECT detail_json FROM events WHERE kind = ? AND job_id = ?`, eventKindOrphaned, "job_race_normal").Scan(&detailJSON); err != nil {
+		t.Fatal(err)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal([]byte(detailJSON), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail["cause"] != "job_cancelled" {
+		t.Fatalf("detail cause = %v, want job_cancelled", detail["cause"])
+	}
+	if detail["delivery_request_id"] == nil {
+		t.Fatalf("detail missing delivery_request_id: %v", detail)
+	}
+}
+
 // TestResumeClearsFailureBookkeepingOnLiveRow proves the P2 recovery
 // primitive: a contract-drift-parked live row (consecutive_poll_failures
 // nonzero, last_poll_error_class set, next_check_at ~10 years out per

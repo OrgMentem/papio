@@ -90,6 +90,11 @@ type Service struct {
 	// runs after the conditional UPDATE but before Commit, proving rollback
 	// cannot expose a partially recorded submission.
 	beforeRecordSubmissionCommit func(*sql.Tx) error
+	// beforeOrphanCAS is a test-only seam invoked in OrphanIfLive after
+	// the initial GetByJobID read but before the guarded CAS write. It
+	// lets a test settle the row to a terminal outcome in the window
+	// between read and write, proving the CAS does not clobber it.
+	beforeOrphanCAS func() error
 }
 
 // New constructs a Service. now defaults to time.Now when nil.
@@ -110,6 +115,25 @@ func (s *Service) SetRecordSubmissionCommitHookForTest(h func() error) {
 		return
 	}
 	s.beforeRecordSubmissionCommit = func(*sql.Tx) error { return h() }
+}
+
+// SetBeforeOrphanCASForTest installs a hook invoked in OrphanIfLive after
+// the GetByJobID snapshot but before the CAS UPDATE. Only tests set this.
+var _ = func() error { return nil }
+
+// Test-only fault injection seams for per-injection-point atomicity tests.
+var (
+	beforeUpdateStateTxForTest func() error
+	beforeRecordPollTxForTest  func() error
+)
+
+func SetBeforeUpdateStateTxForTest(h func() error) { beforeUpdateStateTxForTest = h }
+func SetBeforeRecordPollTxForTest(h func() error)  { beforeRecordPollTxForTest = h }
+
+func (s *Service) DB() *sql.DB { return s.store.DB() }
+
+func (s *Service) SetBeforeOrphanCASForTest(h func() error) {
+	s.beforeOrphanCAS = h
 }
 
 // IdempotencyKey computes Decision 1's idempotency key: SHA-256 hex over
@@ -334,6 +358,55 @@ func (s *Service) UpdateState(ctx context.Context, id int64, state State) error 
 	return err
 }
 
+// UpdateStateTx and RecordPollTx are transaction-threaded variants that let
+// a caller group several delivery row mutations with human-action and job
+// transitions in one atomic commit. Callers MUST commit/rollback the tx
+// themselves.
+func (s *Service) _updateStateTxHook() error {
+	if beforeUpdateStateTxForTest != nil {
+		return beforeUpdateStateTxForTest()
+	}
+	return nil
+}
+func (s *Service) _recordPollTxHook() error {
+	if beforeRecordPollTxForTest != nil {
+		return beforeRecordPollTxForTest()
+	}
+	return nil
+}
+
+func (s *Service) UpdateStateTx(ctx context.Context, tx *sql.Tx, id int64, state State) error {
+	if err := s._updateStateTxHook(); err != nil {
+		return err
+	}
+	if !validState(state) {
+		return fmt.Errorf("delivery: invalid state %q", state)
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	if state == StateSubmitted {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE delivery_requests
+			SET state = ?, updated_at = ?, submitted_at = COALESCE(submitted_at, ?)
+			WHERE id = ?`, string(state), now, now, id)
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE delivery_requests SET state = ?, updated_at = ? WHERE id = ?`, string(state), now, id)
+	return err
+}
+
+func (s *Service) RecordPollTx(ctx context.Context, tx *sql.Tx, id int64, providerReference string, nextCheckAt time.Time) error {
+	if err := s._recordPollTxHook(); err != nil {
+		return err
+	}
+	now := store.Now()
+	next := nextCheckAt.UTC().Format(time.RFC3339Nano)
+	_, err := tx.ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET provider_reference = ?, last_checked_at = ?, next_check_at = ?, updated_at = ?
+		WHERE id = ?`, providerReference, now, next, now, id)
+	return err
+}
+
 // RecordPoll updates a row's provider reference and poll bookkeeping after
 // a status check: last_checked_at becomes now, next_check_at becomes the
 // caller-supplied schedule (typically NextCheck's result).
@@ -406,6 +479,48 @@ func (s *Service) RecordSubmission(ctx context.Context, id int64, providerRefere
 	return true, nil
 }
 
+// ReassignOfferedRequest atomically transfers ownership of an offered delivery
+// request from its original job to the submitting job. It succeeds only when
+// the row is still offered with an empty provider reference and still owned
+// by oldJobID. Design choice: ownership transfer (this method) is preferred
+// over changing RecordSubmission's CAS to check the submitting job's state,
+// because leaving delivery_requests.job_id pointing at a cancelled job would
+// keep GetByJobID and future Branch lookups stale and violate the FK's
+// intent that job_id names the driving job. Transfer keeps the row truthful
+// and lets RecordSubmission's existing guard (which checks the row's owner
+// job state) work unchanged.
+func (s *Service) ReassignOfferedRequest(ctx context.Context, id int64, newJobID, oldJobID string) (bool, error) {
+	if newJobID == "" || oldJobID == "" {
+		return false, errors.New("delivery: job ids required for reassignment")
+	}
+	if newJobID == oldJobID {
+		// Verify the row is still offered and actually owned by this job,
+		// otherwise report "no transfer" instead of a hollow success.
+		row, err := s.Get(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		if row == nil || row.State != StateOffered || row.ProviderReference != "" || row.JobID != oldJobID {
+			return false, nil
+		}
+		return true, nil
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	res, err := s.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET job_id = ?, updated_at = ?
+		WHERE id = ? AND state = ? AND provider_reference = '' AND job_id = ?`,
+		newJobID, now, id, string(StateOffered), oldJobID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 // Resume clears a live (submitted/pending) request's poll-failure
 // bookkeeping — consecutive_poll_failures, last_poll_error_class, and
 // next_check_at — including a contract-drift park at
@@ -430,12 +545,15 @@ func (s *Service) RecordSubmission(ctx context.Context, id int64, providerRefere
 // instead of propagating a raw error. Returns (nil, nil) when no row with
 // this id exists.
 func (s *Service) Resume(ctx context.Context, id int64) (*Request, error) {
-	req, err := s.Get(ctx, id)
-	if err != nil || req == nil {
-		return req, err
+	row, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
 	}
-	if req.State != StateSubmitted && req.State != StatePending {
-		return req, ErrRequestNotLive
+	if row == nil {
+		return nil, nil
+	}
+	if row.State != StateSubmitted && row.State != StatePending {
+		return row, ErrRequestNotLive
 	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	if _, err := s.store.DB().ExecContext(ctx, `
@@ -641,8 +759,6 @@ func (s *Service) AppendGateEvent(ctx context.Context, jobID string, evt GateEva
 	})
 }
 
-// eventKindOrphaned records that OrphanIfLive found a live request whose
-// driving job stopped watching it (ADR-0017 Decision 4).
 const eventKindOrphaned = "delivery.orphaned"
 
 // OrphanIfLive reconciles jobID's delivery_requests row when the job that
@@ -657,6 +773,15 @@ const eventKindOrphaned = "delivery.orphaned"
 // so reconciliation (`papio delivery get`/confirm-exists/confirm-absent)
 // is the way an operator picks it back up, exactly as an automatic poll
 // finding an unrecoverable outcome already uses unknown_outcome for.
+//
+// The orphan write is a compare-and-swap following the same discipline
+// persistPollSuccess documents in poll.go ("the UPDATE only applies WHERE
+// state/next_check_at still match what this call originally read"): the
+// UPDATE only applies WHERE state IN ('submitted','pending'). The orphaned
+// event appends inside the same transaction, so a lost CAS (zero rows
+// affected — the poller already settled the row between the read and this
+// write) leaves no duplicate event behind and returns nil as a successful
+// no-op.
 func (s *Service) OrphanIfLive(ctx context.Context, jobID, cause string) error {
 	req, err := s.GetByJobID(ctx, jobID)
 	if err != nil || req == nil {
@@ -665,13 +790,51 @@ func (s *Service) OrphanIfLive(ctx context.Context, jobID, cause string) error {
 	if req.State != StateSubmitted && req.State != StatePending {
 		return nil
 	}
-	if err := s.UpdateState(ctx, req.ID, StateUnknownOutcome); err != nil {
+	if s.beforeOrphanCAS != nil {
+		if err := s.beforeOrphanCAS(); err != nil {
+			return err
+		}
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	return s.store.AppendEvent(ctx, jobID, eventKindOrphaned, map[string]any{
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE delivery_requests SET state = ?, updated_at = ? WHERE id = ? AND state IN ('submitted','pending')`,
+		string(StateUnknownOutcome), now, req.ID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// Already settled by a concurrent poller — nothing to orphan.
+		return nil
+	}
+	data, err := json.Marshal(map[string]any{
 		"delivery_request_id": req.ID,
 		"cause":               cause,
 	})
+	if err != nil {
+		return err
+	}
+	var job any
+	if jobID != "" {
+		job = jobID
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, ?, ?)`,
+		job, now, eventKindOrphaned, string(data)); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // LatestGateEvent returns the most recently recorded delivery.gate_evaluated
