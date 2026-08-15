@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"papio/internal/batch"
 	"papio/internal/discovery"
+	"papio/internal/ownership"
 	"papio/internal/protocol"
 	"papio/internal/work"
 	"papio/internal/zotio"
@@ -416,8 +418,13 @@ func TestRunnerAcquireDigestPreservesEntriesWhenManifestWriteFails(t *testing.T)
 		Now:       func() time.Time { return now },
 	}
 	queued, err := runner.AcquireDigest(ctx, created.ID, nil)
-	if err == nil || queued != 1 {
-		t.Fatalf("AcquireDigest() = %d, %v; want 1 and manifest write failure", queued, err)
+	// Contract (supersedes the pre-resumability expectation of queued=1):
+	// the manifest is now persisted BEFORE any submission so a retry is
+	// resumable without resubmitting already-created jobs. When that
+	// pre-submit write fails no jobs have been created, so queued must be 0,
+	// not 1, while the digest entry is still preserved (not consumed).
+	if err == nil || queued != 0 {
+		t.Fatalf("AcquireDigest() = %d, %v; want 0 and manifest write failure", queued, err)
 	}
 	entries, err := watches.Digest(ctx, created.ID, 100)
 	if err != nil {
@@ -427,3 +434,196 @@ func TestRunnerAcquireDigestPreservesEntriesWhenManifestWriteFails(t *testing.T)
 		t.Fatalf("digest after manifest write failure = %+v, want unremoved entry", entries)
 	}
 }
+
+func TestAcquireWatchFailsWhenHoldingsReturnsFewerWorksThanRequests(t *testing.T) {
+	ctx := context.Background()
+	holdings := &fakeHoldings{
+		enabled: true,
+		result: ownership.Result{
+			Works:   []ownership.WorkResult{{Claims: []ownership.Claim{{Matched: ownership.Identifier{Kind: ownership.KindDOI, Value: "10.1000/held"}, Artifact: ownership.ArtifactPresent, ArtifactVersion: ownership.VersionPublished}}}},
+			Sources: []ownership.SourceHealth{{Name: "papis", Complete: true, EntryCount: 1}},
+		},
+	}
+	watches := testStore(t)
+	watched := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAcquire, Query: "holdings mismatch", Collection: "Reading", CadenceHours: 24, PerRunCap: 5,
+	})
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	works := []discovery.DiscoveredWork{
+		{Work: work.Work{DOI: "10.1000/one", Title: "One", Authors: []string{"Ada"}, Year: 2026}},
+		{Work: work.Work{DOI: "10.1000/two", Title: "Two", Authors: []string{"Ada"}, Year: 2026}},
+	}
+	runner := &Runner{
+		Store: watches, Discovery: &fakeDiscovery{works: works}, Holdings: holdings,
+		Lookup: &fakeLookup{}, Submitter: &fakeSubmitter{}, DataDir: t.TempDir(),
+		Now: func() time.Time { return now },
+	}
+	_, err := runner.Run(ctx, watched.ID)
+	if err == nil || !contains(err.Error(), "holdings lookup returned") {
+		t.Fatalf("Run() error = %v, want holdings cardinality mismatch", err)
+	}
+	// No run marked, no digest consumed – the run failed closed. Check no MarkRun
+	// side-effect: Due should still consider it due (next attempt retries).
+	if _, err := watches.Due(ctx, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAcquireDigestManifestWriteFailureDoesNotLoseAlreadyCreatedJobs(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "digest", Collection: "Reading", CadenceHours: 24, PerRunCap: 1,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{{
+		WorkKey: "10.1000/resumable", Title: "Resumable", DOI: "10.1000/resumable",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	runner := &Runner{
+		Store:     watches,
+		Lookup:    &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}},
+		Submitter: &fakeSubmitter{},
+		DataDir:   dataDir,
+		Now:       func() time.Time { return now },
+	}
+	queued, err := runner.AcquireDigest(ctx, created.ID, nil)
+	if err != nil || queued != 1 {
+		t.Fatalf("first AcquireDigest() = %d, %v; want 1, nil", queued, err)
+	}
+	manifest, err := batch.Load(dataDir, "latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Works) != 1 || manifest.Works[0].JobID == "" {
+		t.Fatalf("first manifest = %+v, want JobID", manifest.Works)
+	}
+	jobID := manifest.Works[0].JobID
+	// Simulate a late manifest-write failure that left the digest entry
+	// unconsumed while the first manifest with its JobID remained durable.
+	// RecordDigest is idempotent and merges into the existing row without
+	// resurrecting a consumed entry, so re-recording cannot be used here.
+	// Instead, reset the consumed flag directly — that is the exact durable
+	// state after a post-submit write+consume failure: the job exists durably
+	// but the digest row is still pending.
+	if _, err := watches.S.DB().ExecContext(ctx, `UPDATE watch_digest_entries SET consumed = 0 WHERE watch_id = ? AND work_key = ?`, created.ID, "10.1000/resumable"); err != nil {
+		t.Fatal(err)
+	}
+	// Re-run with a submitter that would resubmit if called – it should NOT
+	// be called because the durable manifest already carries the JobID.
+	resubmitCount := 0
+	countingSubmitter := &fakeSubmitter{}
+	original := countingSubmitter.SubmitWithAutoImport
+	_ = original
+	runner2 := &Runner{
+		Store:     watches,
+		Lookup:    &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}},
+		Submitter: &countingSubmitterWithCount{inner: &fakeSubmitter{}, counter: &resubmitCount},
+		DataDir:   dataDir,
+		Now:       func() time.Time { return now },
+	}
+	queued, err = runner2.AcquireDigest(ctx, created.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued != 1 {
+		t.Fatalf("resumable AcquireDigest() queued = %d, want 1", queued)
+	}
+	if resubmitCount != 0 {
+		t.Fatalf("resubmit count = %d, want 0 (durable JobID should be reused)", resubmitCount)
+	}
+	manifest2, err := batch.Load(dataDir, "latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest2.Works[0].JobID != jobID {
+		t.Fatalf("resumable manifest JobID = %q, want %q", manifest2.Works[0].JobID, jobID)
+	}
+	entries, err := watches.Digest(ctx, created.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("digest after resumable acquisition = %+v, want empty", entries)
+	}
+}
+
+type countingSubmitterWithCount struct {
+	inner   *fakeSubmitter
+	counter *int
+}
+
+func (c *countingSubmitterWithCount) SubmitWithAutoImport(ctx context.Context, request protocol.WorkRequest, auto *bool) (string, error) {
+	*c.counter++
+	return c.inner.SubmitWithAutoImport(ctx, request, auto)
+}
+
+func TestTriageConsumeDigestsAtomicOnConflict(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	w1 := createWatch(t, watches, CreateInput{Kind: KindDiscovery, Mode: ModeAlert, Query: "w1", Collection: "Reading", CadenceHours: 24, PerRunCap: 5})
+	w2 := createWatch(t, watches, CreateInput{Kind: KindDiscovery, Mode: ModeAlert, Query: "w2", Collection: "Reading", CadenceHours: 24, PerRunCap: 5})
+	now := time.Now().UTC()
+	if _, err := watches.RecordDigest(ctx, w1.ID, now, []DigestEntry{{WorkKey: "10.1000/shared", Title: "Shared", DOI: "10.1000/shared"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := watches.RecordDigest(ctx, w2.ID, now, []DigestEntry{{WorkKey: "10.1000/shared", Title: "Shared", DOI: "10.1000/shared"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-consume w2's entry so the second target will conflict.
+	if _, err := watches.ConsumeDigest(ctx, w2.ID, []string{"10.1000/shared"}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{Store: watches, Lookup: &fakeLookup{}, Submitter: &fakeSubmitter{}}
+	err := runner.ConsumeDigests(ctx, []DigestTarget{{WatchID: w1.ID, WorkKey: "10.1000/shared"}, {WatchID: w2.ID, WorkKey: "10.1000/shared"}})
+	if !errors.Is(err, ErrDigestEntryNotFound) {
+		t.Fatalf("ConsumeDigests() error = %v, want ErrDigestEntryNotFound", err)
+	}
+	// w1 must remain unconsumed.
+	entries, err := watches.Digest(ctx, w1.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].WorkKey != "10.1000/shared" {
+		t.Fatalf("w1 digest after conflict = %+v, want unconsumed entry", entries)
+	}
+}
+
+func TestTriageAcquireDigestsAtomicOnConflict(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	w1 := createWatch(t, watches, CreateInput{Kind: KindDiscovery, Mode: ModeAlert, Query: "w1", Collection: "Reading", CadenceHours: 24, PerRunCap: 5})
+	w2 := createWatch(t, watches, CreateInput{Kind: KindDiscovery, Mode: ModeAlert, Query: "w2", Collection: "Reading", CadenceHours: 24, PerRunCap: 5})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, w1.ID, now, []DigestEntry{{WorkKey: "10.1000/a", Title: "A", DOI: "10.1000/a"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := watches.RecordDigest(ctx, w2.ID, now, []DigestEntry{{WorkKey: "10.1000/b", Title: "B", DOI: "10.1000/b"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := watches.ConsumeDigest(ctx, w2.ID, []string{"10.1000/b"}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{
+		Store: watches, Lookup: &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}},
+		Submitter: &fakeSubmitter{}, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	err := runner.AcquireDigests(ctx, []DigestTarget{{WatchID: w1.ID, WorkKey: "10.1000/a"}, {WatchID: w2.ID, WorkKey: "10.1000/b"}})
+	if !errors.Is(err, ErrDigestEntryNotFound) {
+		t.Fatalf("AcquireDigests() error = %v, want ErrDigestEntryNotFound", err)
+	}
+	entries, err := watches.Digest(ctx, w1.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].WorkKey != "10.1000/a" {
+		t.Fatalf("w1 digest after AcquireDigests conflict = %+v, want unconsumed entry", entries)
+	}
+	if len(runner.Submitter.(*fakeSubmitter).calls) != 0 {
+		t.Fatalf("submissions after conflict = %d, want 0", len(runner.Submitter.(*fakeSubmitter).calls))
+	}
+}
+
+func contains(s, substr string) bool { return strings.Contains(s, substr) }

@@ -98,13 +98,15 @@ func triageDecide(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		return failure(err)
 	}
 	if params.Op == "acquire" {
+		targets := make([]watch.DigestTarget, 0, len(hit.Watches))
 		for _, watched := range hit.Watches {
-			if _, err := system.WatchRunner.AcquireDigest(ctx, watched.ID, []string{watched.WorkKey}); err != nil {
-				if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
-					return marshal(triageDecideResult{Outcome: "conflict"})
-				}
-				return watchFailure(err)
+			targets = append(targets, watch.DigestTarget{WatchID: watched.ID, WorkKey: watched.WorkKey})
+		}
+		if err := system.WatchRunner.AcquireDigests(ctx, targets); err != nil {
+			if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
+				return marshal(triageDecideResult{Outcome: "conflict"})
 			}
+			return watchFailure(err)
 		}
 		return marshal(triageDecideResult{Outcome: "applied"})
 	}
@@ -113,16 +115,18 @@ func triageDecide(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	if err != nil {
 		return badParams(err)
 	}
+	targets := make([]watch.DigestTarget, 0, len(hit.Watches))
 	for _, watched := range hit.Watches {
 		if !watchIDs[watched.ID] {
 			continue
 		}
-		if _, err := system.WatchRunner.ConsumeDigest(ctx, watched.ID, []string{watched.WorkKey}); err != nil {
-			if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
-				return marshal(triageDecideResult{Outcome: "conflict"})
-			}
-			return watchFailure(err)
+		targets = append(targets, watch.DigestTarget{WatchID: watched.ID, WorkKey: watched.WorkKey})
+	}
+	if err := system.WatchRunner.ConsumeDigests(ctx, targets); err != nil {
+		if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
+			return marshal(triageDecideResult{Outcome: "conflict"})
 		}
+		return watchFailure(err)
 	}
 	return marshal(triageDecideResult{Outcome: "applied"})
 }

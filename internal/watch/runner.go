@@ -97,15 +97,16 @@ func (r *Runner) Run(ctx context.Context, id int64) (*RunResult, error) {
 	return r.runWatch(ctx, *watch)
 }
 
-// AcquireDigest submits pending alert discoveries through the normal watch
-// acquisition path, consuming entries only after their manifest is durable.
 func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string) (queued int, err error) {
 	if r == nil || r.Store == nil || r.Lookup == nil || r.Submitter == nil {
 		return 0, errors.New("watch runner dependencies are not configured")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.acquireDigestLocked(ctx, watchID, keys)
+}
 
+func (r *Runner) acquireDigestLocked(ctx context.Context, watchID int64, keys []string) (queued int, err error) {
 	watch, err := r.Store.Get(ctx, watchID)
 	if err != nil {
 		return 0, err
@@ -120,7 +121,22 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 	if len(entries) == 0 {
 		return 0, nil
 	}
+	return r.acquireDigestWithEntriesLocked(ctx, watchID, entries)
+}
 
+// acquireDigestWithEntriesLocked is the work of AcquireDigest but operating on
+// pre-resolved entries. Caller must hold r.mu.
+func (r *Runner) acquireDigestWithEntriesLocked(ctx context.Context, watchID int64, entries []DigestEntry) (int, error) {
+	if len(entries) == 0 {
+		return 0, nil
+	}
+	watch, err := r.Store.Get(ctx, watchID)
+	if err != nil {
+		return 0, err
+	}
+	if watch.Kind != KindDiscovery {
+		return 0, fmt.Errorf("watch %d is not a discovery watch", watchID)
+	}
 	works := make([]protocol.WorkRequest, len(entries))
 	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(entries))}
 	for i, entry := range entries {
@@ -173,13 +189,45 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 	}
 
 	manifest := batch.NewManifest(eligibleWorks, "watch: "+watch.Label, watch.Collection, r.now())
-	autoImport := true
-	succeeded := make([]DigestEntry, 0, len(eligibleEntries))
 	for i := range manifest.Works {
 		requestID := batch.RequestID(fmt.Sprintf("watch-%d", watch.ID), manifest.Works[i].Work)
 		manifest.Works[i].RequestID = requestID
 		manifest.Works[i].Work.RequestID = requestID
-
+	}
+	// Make the manifest resumable: if a prior attempt left a durable manifest
+	// with JobIDs for the same requestIDs, reuse them so a retry does not
+	// resubmit already-created jobs. This covers the window where a job was
+	// created but its post-submit manifest write failed.
+	if existing, loadErr := batch.Load(r.DataDir, manifest.ID); loadErr == nil {
+		existingByRequest := make(map[string]string, len(existing.Works))
+		for _, w := range existing.Works {
+			if w.JobID != "" && w.Status != "submission_failed" {
+				existingByRequest[w.RequestID] = w.JobID
+			}
+		}
+		for i := range manifest.Works {
+			if jobID, ok := existingByRequest[manifest.Works[i].RequestID]; ok {
+				manifest.Works[i].JobID = jobID
+			}
+		}
+	}
+	// Persist the manifest before any submission so a later manifest-write
+	// failure does not leave already-created jobs without a durable record.
+	// Each successful submission is then persisted incrementally, making a
+	// retry resumable without resubmitting jobs whose JobIDs are already
+	// durable.
+	if err := batch.Write(r.DataDir, manifest); err != nil {
+		return 0, err
+	}
+	autoImport := true
+	succeeded := make([]DigestEntry, 0, len(eligibleEntries))
+	queued := 0
+	for i := range manifest.Works {
+		if manifest.Works[i].JobID != "" {
+			queued++
+			succeeded = append(succeeded, eligibleEntries[i])
+			continue
+		}
 		jobID, submitErr := r.Submitter.SubmitWithAutoImport(ctx, manifest.Works[i].Work, &autoImport)
 		if submitErr != nil {
 			manifest.Works[i].Status = "submission_failed"
@@ -198,9 +246,9 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 		manifest.Works[i].JobID = jobID
 		queued++
 		succeeded = append(succeeded, eligibleEntries[i])
-	}
-	if err := batch.Write(r.DataDir, manifest); err != nil {
-		return queued, err
+		if err := batch.Write(r.DataDir, manifest); err != nil {
+			return queued, err
+		}
 	}
 	for _, entry := range succeeded {
 		if err := r.Store.consumeDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
@@ -208,6 +256,73 @@ func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string
 		}
 	}
 	return queued, nil
+}
+
+// DigestTarget names one watch digest entry by watch and work key.
+type DigestTarget struct {
+	WatchID int64
+	WorkKey string
+}
+
+// AcquireDigests acquires one digest entry per target atomically with respect to
+// conflict reporting: if any target is missing (ErrDigestEntryNotFound / sql.ErrNoRows)
+// no target's entry is consumed. It holds one mutex across the whole operation so
+// the API's multi-watch decide either applies everywhere or nowhere.
+func (r *Runner) AcquireDigests(ctx context.Context, targets []DigestTarget) error {
+	if r == nil || r.Store == nil || r.Lookup == nil || r.Submitter == nil {
+		return errors.New("watch runner dependencies are not configured")
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	validated := make([][]DigestEntry, len(targets))
+	for i, t := range targets {
+		entries, err := r.Store.TakeDigest(ctx, t.WatchID, []string{t.WorkKey})
+		if err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, t.WorkKey)
+		}
+		validated[i] = entries
+	}
+	for i, t := range targets {
+		if _, err := r.acquireDigestWithEntriesLocked(ctx, t.WatchID, validated[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ConsumeDigests consumes one digest entry per target atomically: a conflict on
+// any target leaves no entry consumed.
+func (r *Runner) ConsumeDigests(ctx context.Context, targets []DigestTarget) error {
+	if r == nil || r.Store == nil {
+		return errors.New("watch runner is not configured")
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	validated := make([]DigestEntry, len(targets))
+	for i, t := range targets {
+		entries, err := r.Store.TakeDigest(ctx, t.WatchID, []string{t.WorkKey})
+		if err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, t.WorkKey)
+		}
+		validated[i] = entries[0]
+	}
+	watchIDs := make([]int64, len(targets))
+	for i, t := range targets {
+		watchIDs[i] = t.WatchID
+	}
+	return r.Store.consumeDigestEntriesTx(ctx, validated, watchIDs)
 }
 
 // ClearDigest consumes all pending alert discoveries while serializing with
@@ -661,11 +776,11 @@ func (r *Runner) selectUnheldRequests(ctx context.Context, requests []discovered
 	if incomplete := lookup.Incomplete(); len(incomplete) != 0 {
 		return nil, fmt.Errorf("library sources unavailable (%s); ownership could not be verified, so this run was not acquired", strings.Join(incomplete, ", "))
 	}
+	if len(lookup.Works) != len(requests) {
+		return nil, fmt.Errorf("holdings lookup returned %d results for %d works", len(lookup.Works), len(requests))
+	}
 	queued := make([]discoveredRequest, 0, min(cap, len(requests)))
 	for i := range requests {
-		if i >= len(lookup.Works) {
-			break
-		}
 		// A known citation without full text is not "already held": acquiring it
 		// is the whole point of a watch for someone backfilling a library.
 		if ownership.Decide(queries[i], lookup.Works[i]).Suppress {
