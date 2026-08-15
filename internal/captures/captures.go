@@ -393,6 +393,17 @@ func (s *Store) markIndependentLocked(path string) error {
 	if metadata.SHA256 == "" {
 		return errors.New("capture metadata has no content hash")
 	}
+	// The sidecar proves what was captured; only the bytes on disk prove the
+	// file still IS that capture. Promoting on the sidecar alone would label a
+	// modified or truncated file as independent provider evidence.
+	data, err := os.ReadFile(file.Path)
+	if err != nil {
+		return fmt.Errorf("reading capture %q: %w", file.Path, err)
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != metadata.SHA256 {
+		return errors.New("capture content no longer matches its recorded hash: refusing to mark a modified capture as independent evidence")
+	}
 	metadata.IndependentEvidence = true
 	encoded, err := json.Marshal(metadata)
 	if err != nil {

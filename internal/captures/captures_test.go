@@ -86,6 +86,29 @@ func TestUpdateJobMarksOnlyDaemonCorrelatedEvidenceIndependent(t *testing.T) {
 	}
 }
 
+// The sidecar proves what was captured; only the bytes prove the file still IS
+// that capture. Promoting on the sidecar alone labelled a modified file as
+// independent provider evidence.
+func TestUpdateJobRefusesModifiedCapture(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 2, MaxAge: 24 * time.Hour})
+	html := []byte("<!-- papio-fixture provider=\"sage\" scenario=\"success\" origin=\"https://sage.example/article\" captured=\"2026-08-10T00:00:00Z\" -->\n<html>safe</html>")
+	path, err := store.StoreSanitized(ctx, "sage.example", "success", "sage", "1.2.3", html)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(html, []byte("<!-- injected -->")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateJob(ctx, "job-correlated", path, path); err == nil {
+		t.Fatal("modified capture was promoted to independent evidence")
+	}
+	rows, err := store.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].IndependentEvidence {
+		t.Fatalf("modified capture evidence = %#v, %v; want still untrusted", rows, err)
+	}
+}
+
 func TestStorePrunesRetention(t *testing.T) {
 	t.Run("count", func(t *testing.T) {
 		ctx := context.Background()
