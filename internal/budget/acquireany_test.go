@@ -286,39 +286,87 @@ func TestAcquireAnyFallsBackOnAFloorCommittedDuringAnInlineWait(t *testing.T) {
 	}
 }
 
-// A rate-limit backoff is a property of the source and the egress IP, not of the
-// credential presented, so it must survive a quota-driven credential switch.
-// Durable rows are keyed by (source, identity): skipping the keyed identity on
-// quota used to skip its 429 row with it, and the keyless identity - untouched,
-// same machine, same IP - was admitted inside the backoff the provider demanded.
-func TestAcquireAnyRefusesPastAnOrdinaryGateOnASkippedIdentity(t *testing.T) {
+// Scope is the whole question. An ordinary row carries BOTH kinds of 429, and one
+// of them - Retry-After at the next UTC midnight, meaning "this credential is out
+// of allowance" - must leave the other identity usable: an anonymous midnight 429
+// once parked 95 jobs whose keyed budget was untouched (b9af0e5), and blocking
+// fallback on the keyed row is that same fault from the other side, with the
+// keyless tier sitting unspent exactly when it is the only tier left.
+func TestAcquireAnyStillFallsBackPastAnIdentityScopedBackoff(t *testing.T) {
 	m := testManager(t)
 	ctx := context.Background()
 	keyed, anon := keyedAndAnon()
-	reset := time.Now().UTC().Add(6 * time.Hour)
-	backoff := time.Now().UTC().Add(90 * time.Second)
-	if err := m.Defer(ctx, "openalex_quota", keyed, reset); err != nil {
+	if err := m.Defer(ctx, "openalex_quota", keyed, time.Now().UTC().Add(6*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Defer(ctx, "openalex", keyed, backoff); err != nil {
+	if err := m.Defer(ctx, "openalex", keyed, time.Now().UTC().Add(9*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
-	var deferred *ErrDeferred
-	if !errors.As(err, &deferred) {
-		t.Fatalf("AcquireAny = (%+v, %v), want the 429 backoff returned, not a credential switch", chosen, err)
-	}
-	if deferred.Quota {
-		t.Fatalf("deferred.Quota = true, want the ordinary rate-limit gate reported as such")
-	}
-	if !deferred.Until.Equal(backoff.Truncate(time.Second)) && !deferred.Until.Equal(backoff) {
-		t.Fatalf("deferred.Until = %s, want the 429 backoff instant %s", deferred.Until, backoff)
-	}
-	anonSnap, err := m.Snapshot(ctx, "openalex", anon)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("AcquireAny = %v, want the keyless tier admitted: the keyed refusals are both about the keyed credential", err)
 	}
-	if anonSnap.RequestsInWindow != 0 {
-		t.Fatalf("anonymous reservations = %d, want none: the source is rate-limited for every identity", anonSnap.RequestsInWindow)
+	if chosen.APIKey != "" {
+		t.Fatalf("chosen = %+v, want the keyless identity", chosen)
+	}
+}
+
+// The refusal that genuinely does bind every credential: a rate limit belongs to
+// the provider and this machine's egress IP. It must stop the fallback, and - the
+// part a pre-check cannot deliver - it must still stop it when the pacing write
+// lands AFTER the pre-check read, while the worker sleeps in the gate loop.
+func TestPacingGateBindsEveryIdentityIncludingMidWait(t *testing.T) {
+	ctx := context.Background()
+	keyed, anon := keyedAndAnon()
+	for _, test := range []struct {
+		name string
+		mid  bool
+	}{{"before the pre-check", false}, {"during the inline wait", true}} {
+		t.Run(test.name, func(t *testing.T) {
+			m := testManager(t)
+			if err := m.Defer(ctx, "openalex_quota", keyed, time.Now().UTC().Add(6*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			pacing := time.Now().UTC().Add(2 * time.Minute)
+			slow := anon
+			if test.mid {
+				// A refill inside MaxInlineWait: the worker sleeps in takeToken
+				// and really does reach the committing transaction. A slower
+				// refill would refuse advisorily before reserve, and the subtest
+				// would pass without exercising the commit-time re-read at all.
+				slow.RatePerSec, slow.Burst = 4, 1
+				if err := m.Acquire(ctx, "openalex", slow, 0); err != nil {
+					t.Fatalf("priming Acquire = %v", err)
+				}
+				go func() {
+					time.Sleep(40 * time.Millisecond)
+					_ = m.DeferSourceWide(ctx, "openalex", pacing)
+				}()
+			} else if err := m.DeferSourceWide(ctx, "openalex", pacing); err != nil {
+				t.Fatal(err)
+			}
+			chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, slow}, 0)
+			var deferred *ErrDeferred
+			if !errors.As(err, &deferred) {
+				t.Fatalf("AcquireAny = (%+v, %v), want the pacing gate to refuse every identity", chosen, err)
+			}
+			if deferred.Advisory {
+				t.Fatal("deferred.Advisory = true: the token bucket refused before the pacing gate was consulted, so this proves nothing")
+			}
+			if deferred.Quota {
+				t.Fatal("deferred.Quota = true, want a pacing refusal, not a credential-switch licence")
+			}
+			snap, err := m.Snapshot(ctx, "openalex", anon)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if test.mid {
+				want = 1 // the priming call only
+			}
+			if snap.RequestsInWindow != want {
+				t.Fatalf("keyless reservations = %d, want %d: the source is paced for every credential", snap.RequestsInWindow, want)
+			}
+		})
 	}
 }

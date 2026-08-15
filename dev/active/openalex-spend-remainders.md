@@ -6,7 +6,7 @@ anonymous fallback, the fuzzy-search boundary/basis gate, and three fail-closed
 guards). Those changes are complete; git history and `CHANGELOG.md` hold the
 record.
 
-**Eleven adversarial reviews, ten rewrites.** Three early rounds sharpened a
+**Twelve adversarial reviews, eleven rewrites.** Three early rounds sharpened a
 two-part plan (a per-job spend guard plus a per-identity credit ceiling); a fourth,
 given no prior-round context and a wide brief, rejected the shape of both; three
 more reviewed the shipped code and found live defects in it; the eighth falsified a
@@ -19,7 +19,10 @@ against the tree or the live provider before being written down. Reviews are
 preserved under `dev/scratch/oracle/20260815T*`. The tenth found no defect in shipped
 code — every finding was a plan claim the mechanism could not deliver. The eleventh
 found three more live defects, two of them in code earlier rounds had already fixed
-twice, so "a clean round" is not evidence of a clean slice.
+twice, so "a clean round" is not evidence of a clean slice. The twelfth found the
+eleventh's own fix enforcing a rate limit at the wrong scope — and its literal
+remedy would have reverted `b9af0e5`, so a finding being correct about the race does
+not make its remedy safe.
 
 **Rejected designs** at the bottom records every dead end with its reason —
 twenty-three of the forty-four from earlier drafts of this file. Read it before
@@ -657,19 +660,43 @@ and legacy rows must be treated as unattested for the fields whose origin was ne
 recorded.
 
 The cutover is therefore:
-- Add `identifiers.provenance` (`submitted` | `verified` | `adopted`), and set it at
- every insert site. Post-cutover, a promotion may only write `adopted`, and only
- `submitted`/`verified` may anchor a canonical-identity comparison.
-- Backfill every pre-cutover row as **`unattested`**, not `submitted`: the
- distinction was never recorded and must not be manufactured now.
+- Add `identifiers.provenance` with the domain **`unattested` | `submitted` |
+ `verified` | `adopted`**, and set it at every insert site. Post-cutover, a
+ promotion may only write `adopted`, and only `submitted`/`verified` may anchor a
+ canonical-identity comparison. Four states, not three: an earlier draft of this
+ section declared a three-state domain and then required legacy rows to be
+ backfilled as `unattested`, which no single migration can do — a `CHECK`
+ enforcing the three states rejects the backfill, and a migration permitting
+ anything else has no domain at all. Legacy quarantine is not ancillary metadata,
+ it is the mechanism, so it gets a first-class state and no column default able to
+ manufacture `submitted`.
+- Backfill every pre-cutover row as `unattested`: the distinction was never
+ recorded and must not be manufactured now.
 - Prohibit canonical-identity promotion and the unattested `DOI -> SHA256` cache
  fast-path on `unattested` anchors until independent revalidation or resubmission.
- This is the review's requirement, and it is right; what changes is that the
- remediation is a backfill plus a predicate, not a reconstruction of lost truth.
 
 Do not state the invariant as retroactively enforceable on existing rows. State it
 as prospectively enforced, with legacy rows explicitly quarantined from the paths
 that could act on an identity nobody attested.
+
+**An immutable anchor does not close the sparse-input case; it relocates it.**
+Suppose two works genuinely share normalized title T, the submitted snapshot is
+`{Title: T}` alone, and OpenAlex returns the wrong one first. The anchor correctly
+stops that record's metadata from rewriting the submission — and then validation
+has nothing left to discriminate with. Every fact the user actually supplied does
+match the wrong paper. So validation either consults candidate-derived
+author/year/DOI, which is the self-confirming loop moved one layer down, or it
+refuses candidate evidence and has no discriminator at all.
+
+Item 5 therefore needs an explicit **insufficient-authority disposition**: a
+title-only hit may create a candidate, but it may never become a verified canonical
+identity, a cache attestation, or a `ready` artifact unless an *independent*
+authority supplies additional identifying evidence — a second resolver agreeing, a
+matching identifier from another registry, or human confirmation. Otherwise the job
+stays unresolved and says so. This is structural rather than threshold tuning, so it
+needs neither the corpus nor item 0. Regression shape: two records and two PDFs with
+identical submitted title and different authors and DOIs; the first-ranked wrong one
+must never reach verified or `ready` on candidate-derived facts alone.
 
 **Name the anchor, or an implementer has to choose one.** Validation and cache
 attestations must consume a **durable, immutable snapshot of the submitted
@@ -791,6 +818,20 @@ that affect the request and the acceptance predicate: normalized search title, y
 canonicalized author-match keys, and canonical DOI. Hash that value, and pass *that
 same value* into the search — do not use `work.Work` as the protocol object.
 
+**And it must carry a search-protocol version, because item 0 is explicitly
+considering changing that protocol.** The marker's whole claim is "this exact
+question was already asked and paid for", and the question includes the physical
+query (`search=<title>`, `per_page=10`) and the acceptance predicate (canonical-DOI
+exclusion, title normalization, year bounds, surname matching) — none of which the
+bibliographic fields describe. Sequence: basis B is marked complete under today's
+shape; a later release moves to `per_page=100`, a title-scoped filter, or a
+materially different matcher; B hashes identically and the marker suppresses a
+question that has never been asked. So the hashed value carries a
+`SiblingSearchProtocolVersion` constant, bumped whenever query shape or acceptance
+semantics change. Since item 0 may change the query *before* item 7 lands, treat
+every pre-item-7 marker as stale deliberately, rather than relying on a
+serialization difference to do it by accident.
+
 A sentinel-triggered recovery does **not** fix that, which is what an earlier
 draft of this item got wrong. The damaging sequence never produces a sentinel at
 all:
@@ -853,6 +894,17 @@ folded there rather than kept as a separate narrower rule.
 truthful park → 7 effective basis, *if item 0 says the sibling hop survives*.**
 Then, deferred with reasons written down: **4 jitter** (operational smoothing, not
 an invariant) and **6 per-job guard** (fairness, capped in aggregate by the fuse).
+
+**`1+2` and `3` are ONE deployable unit, not two releases.** The arrow between them
+is an implementation order, not a shipping order. Today `resolve` turns a monetary
+`ErrExceeded` into `continue`, which can reach `no_legal_candidates`; the moment
+`1+2` enforces a real daily-credit refusal, a released binary without item 3 gains a
+new false-terminal path — the fuse opens, every source is skipped, and the job is
+declared to have no legal copy instead of parking until the reset. A later item-3
+deploy does not resurrect jobs that already terminated, so the damage is not
+recoverable by upgrading. Enforcement must therefore not be enabled in any released
+binary until the typed refusal has its durable park semantics, which is the same
+rule as "visibility ships with enforcement", one layer earlier.
 
 Item 0 gates nothing else — not the fuse, not item 5 — but it does gate item 7,
 which exists solely to make the sibling hop correctly available and memoized.
@@ -1113,6 +1165,32 @@ belongs in the fuse because drawing it down spends real money.
  basis while leaving the map exactly the size it already was — the same
  availability cliff as the two earlier eviction bugs, third variant. Regression:
  `TestMemoRefreshAtCapEvictsNothing`; mutation-checked.
+- **A rate limit was enforced at the wrong scope, twice, in opposite directions.**
+ A review found that the previous round's `AcquireAny` guard could still be raced:
+ it read the skipped identity's ordinary row once, and a 429 landing after that read
+ let the fallback commit and send from the same IP inside the backoff. Its literal
+ remedy — refuse against the latest active gate across every row of the source —
+ would have reverted `b9af0e5`, where an anonymous 429 carrying `Retry-After` at the
+ next UTC midnight parked 95 jobs whose keyed budget was untouched. That is not a
+ detail: the ordinary row conflates two refusals, one about the credential
+ ("allowance spent") and one about the machine ("slow down"), and the previous
+ round's guard had already re-created the same fault from the other side by blocking
+ the keyless fallback on the keyed row — leaving the last usable tier unspent
+ exactly when it was the only one left. Neither scope is right for both meanings, so
+ the meanings are now separated: `DeferSourceWide` writes a distinct shared pacing
+ row (`PacingSourceName`, identity from `pacingIdentity()`), and `reserve` re-reads
+ it inside the committing transaction, binding every identity. No caller classifies
+ 429s yet, so behaviour is unchanged today and the authority exists for item 1+2 to
+ use; classifying them is named there rather than guessed from a duration.
+ Regressions: `TestAcquireAnyStillFallsBackPastAnIdentityScopedBackoff` and
+ `TestPacingGateBindsEveryIdentityIncludingMidWait` (whose mid-wait arm needed a
+ refill *inside* `MaxInlineWait` — a slower one refused advisorily before `reserve`
+ and proved nothing). The pre-check version was then **deleted**: with the commit
+ check present, removing it failed no test, which is the evidence it was a second
+ authority rather than a guard. `Manager.ordinaryGate` went with it. Also fixed
+ while writing this: the pacing reader queried `identity = ''` while `identityFor`
+ spells a keyless identity `"anonymous"`, so the commit-time check matched nothing —
+ found only because the mutation test failed to fail.
 
 ## Rejected designs (do not re-derive)
 

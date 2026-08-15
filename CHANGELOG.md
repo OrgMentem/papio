@@ -11,14 +11,14 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
-- **A pause demanded by OpenAlex is no longer skipped by switching accounts.**
-  When one account's daily allowance ran out, *papio* moved to the other one — but
-  a "slow down" the provider had asked for is about the connection, not the
-  account, and that request was left behind with the account it was recorded
-  against. *papio* could therefore keep calling from the same machine during a
-  pause it had already been told to take. It now waits out the pause whichever
-  account it belongs to, and still switches accounts when the reason really is
-  that one is out of credit.
+- **A "slow down" from OpenAlex now holds for every account, and an exhausted
+  account no longer blocks the other one.** These are two different messages that
+  arrive the same way, and *papio* was treating them as one. Being out of credit
+  belongs to the account that spent them — the second account exists precisely to
+  be usable then — while a request to slow down belongs to this machine's
+  connection and no change of account satisfies it. They are recorded separately
+  now, and the shared pause is re-checked at the last moment before a call goes
+  out, so a pause that arrives while *papio* is waiting its turn still stops it.
 
 - **A reply that names two different papers is no longer half-believed.**
   OpenAlex repeats each identifier in two places. *papio* checked only the one it

@@ -272,25 +272,23 @@ func (m *Manager) AcquireAny(ctx context.Context, source string, policies []conf
 		}
 		if until != nil {
 			if i < last {
-				// Advancing past a quota-gated identity must not also advance
-				// past its ORDINARY gate. Durable rows are keyed by (source,
-				// identity), so skipping the identity skips its 429/backoff row
-				// too - and an OpenAlex 429 is a property of the source and the
-				// egress IP, not of the credential presented. Sequence: keyed
-				// request A installs the keyed quota floor while keyed request B
-				// takes a 429 that durably gates ("openalex", keyed); the next
-				// pass skips keyed on quota, finds the keyless row untouched,
-				// and sends from the same IP inside the backoff the provider
-				// just demanded. A rate-limit gate on ANY identity of this
-				// source is therefore returned, not stepped over: the source is
-				// unavailable, and no credential switch fixes that.
-				ordinary, ordErr := m.ordinaryGate(ctx, source, policy)
-				if ordErr != nil {
-					return config.Source{}, ordErr
-				}
-				if ordinary != nil {
-					return policy, &ErrDeferred{Source: source, Identity: identityFor(policy), Until: *ordinary}
-				}
+				// Advancing here steps over this identity's OWN rows only, and
+				// that is correct: both the spent quota and any 429 recorded
+				// against it are statements about this credential. A source-wide
+				// pacing gate - a rate limit, which belongs to the provider and
+				// this machine's egress IP - is enforced by reserve inside the
+				// committing transaction, for every identity, which is the only
+				// place that closes the window between a check and egress.
+				//
+				// An earlier version consulted the skipped identity's ordinary
+				// row here instead, and that was wrong twice over: those rows
+				// also carry exhausted-allowance 429s with Retry-After at the
+				// next UTC midnight, so it re-created b9af0e5's fault from the
+				// other side - the keyless tier left unspent exactly when it was
+				// the only tier left - and a pre-check cannot be the authority
+				// anyway. Removing it left no test failing but the pacing
+				// regression still passing, which is the evidence it was a
+				// second authority rather than a guard.
 				continue
 			}
 			return policy, &ErrDeferred{Source: source, Identity: identityFor(policy), Until: *until, Quota: true}
@@ -317,6 +315,22 @@ func (m *Manager) AcquireAny(ctx context.Context, source string, policies []conf
 // written under a name nobody reads fails open.
 func QuotaSourceName(source string) string { return source + "_quota" }
 
+// PacingSourceName is the row holding a source-wide pacing gate: a refusal that
+// belongs to the provider and this machine's egress IP rather than to any one
+// credential, so every identity of the source is bound by it. Stored under a
+// distinct source name with an empty identity, for the same reason the quota
+// floor is: the columns cannot express two scopes on one row.
+func PacingSourceName(source string) string { return source + "_pacing" }
+
+// DeferSourceWide records a pacing gate that binds every identity of source.
+// Callers must use it ONLY for a refusal they can attribute to the provider or
+// the egress IP - a true rate limit - never for an exhausted allowance, which
+// belongs to the credential that spent it and must leave the other identities
+// usable.
+func (m *Manager) DeferSourceWide(ctx context.Context, source string, until time.Time) error {
+	return m.Defer(ctx, PacingSourceName(source), config.Source{Enabled: true}, until)
+}
+
 // quotaGate reports the quota-row gate instant for policy's identity, if one is
 // currently active — the signal sourcegate.Observer writes from the provider's
 // own daily-budget headers. nil, nil means not gated.
@@ -331,20 +345,12 @@ func (m *Manager) quotaGate(ctx context.Context, source string, policy config.So
 	return nil, nil
 }
 
-// ordinaryGate reports the BARE source row's gate instant for policy's identity
-// — papio's own pacing and the durable 429/backoff gates — if one is currently
-// active. nil, nil means not gated. Read only by AcquireAny's skip path: Acquire
-// enforces this row itself for the identity it actually attempts.
-func (m *Manager) ordinaryGate(ctx context.Context, source string, policy config.Source) (*time.Time, error) {
-	snap, err := m.Snapshot(ctx, source, policy)
-	if err != nil {
-		return nil, err
-	}
-	if snap.NextAllowedAt != nil && snap.NextAllowedAt.After(m.now().UTC()) {
-		return snap.NextAllowedAt, nil
-	}
-	return nil, nil
-}
+// pacingIdentity names the row DeferSourceWide writes: one shared row per
+// source, derived from the same identityFor the writer goes through so the two
+// can never drift. They did drift once - the reader queried identity = ” while
+// identityFor spells a keyless identity "anonymous" - and the commit-time check
+// silently matched nothing while the pre-check matched.
+func pacingIdentity() string { return identityFor(config.Source{}) }
 
 // takeToken spends one token, waiting for the bucket to refill. Like the gate
 // loop in Acquire it is bounded by MaxInlineWait, and for the same reason: the
@@ -432,10 +438,9 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 	// that sleep. Without re-reading the gate here, this worker would open a
 	// transaction that only ever CLEARS an already-expired gate and never
 	// refuses on a live one, so its reservation commits and the request goes
-	// out against a gate another caller just set — defeating the guarantee
-	// that one 429 stops every caller of that source/identity. Re-read
-	// next_allowed_at in the same transaction that mutates the counters, so
-	// the check and the write are atomic with respect to a racing Defer.
+	// out against a gate another caller just set. Both are read here, in the
+	// transaction that mutates the counters, so check and write are atomic
+	// with respect to a racing Defer.
 	if next.Valid && next.String != "" {
 		gate, err := time.Parse(time.RFC3339Nano, next.String)
 		if err != nil {
@@ -445,8 +450,37 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 			return &ErrDeferred{Source: source, Identity: identity, Until: gate}
 		}
 	}
-	// The same argument applies to the PROVIDER's floor, and it was missed:
-	// the re-read above covers only the ordinary row this reserve was handed.
+	// A SHARED pacing gate binds every identity of this source, and must be
+	// re-read here for the same atomicity reason. Scope is why it is a separate
+	// row rather than a scan of this source's ordinary rows: a 429 carrying a
+	// Retry-After at the next UTC midnight is a statement about one credential's
+	// exhausted allowance, and blanket-blocking every identity on it is a fault
+	// this package already had - an anonymous midnight 429 parked 95 jobs whose
+	// keyed budget was untouched (b9af0e5), and the anonymous fallback exists
+	// precisely to be usable then. A true rate limit is instead a property of
+	// the provider and the egress IP, so it is recorded through DeferSourceWide
+	// and refuses here regardless of which credential arrived. Only a caller
+	// that can tell those two 429s apart may write this row; classifying them
+	// belongs to the refusal taxonomy in item 1+2, not to a duration heuristic.
+	var pacing sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT next_allowed_at FROM source_budgets
+		WHERE source = ? AND identity = ?`, PacingSourceName(source), pacingIdentity()).Scan(&pacing); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if pacing.Valid && pacing.String != "" {
+		gate, err := time.Parse(time.RFC3339Nano, pacing.String)
+		if err != nil {
+			// Fail closed: an unreadable pacing gate is not an absent one.
+			return fmt.Errorf("source %s has invalid pacing next_allowed_at: %w", source, err)
+		}
+		if gate.After(now) {
+			return &ErrDeferred{Source: source, Identity: identity, Until: gate}
+		}
+	}
+	// The same argument applies to the PROVIDER's floor, and it was missed. The
+	// floor stays scoped to THIS identity, unlike the ordinary gate above: a
+	// spent daily allowance really is a fact about one credential, and treating
+	// it source-wide would delete the anonymous fallback the plan requires.
 	// A worker that cleared Acquire's quotaGate pre-check can then sleep in
 	// the gate loop or takeToken for up to MaxInlineWait, during which another
 	// goroutine's response headers commit the quota row. That worker has not
