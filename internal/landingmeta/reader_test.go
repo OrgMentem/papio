@@ -169,3 +169,41 @@ func TestPDFURLForReturnsNilOnNotFound(t *testing.T) {
 		t.Fatalf("PDFURLFor = (%q, %v), want (\"\", nil)", got, err)
 	}
 }
+
+func TestPDFURLForReturnsErrorOnNilResponse(t *testing.T) {
+	client := doFunc(func(*http.Request) (*http.Response, error) {
+		return nil, nil
+	})
+	reader := NewReader(client, 1<<20)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("PDFURLFor panicked on (nil, nil): %v", r)
+		}
+	}()
+	_, err := reader.PDFURLFor(context.Background(), "https://example.test/landing")
+	if err == nil {
+		t.Fatal("want error for (nil, nil), got nil")
+	}
+	if !strings.Contains(err.Error(), "empty HTTP response") {
+		t.Fatalf("error = %q, want to contain %q", err.Error(), "empty HTTP response")
+	}
+}
+
+func TestPDFURLForReturnsErrorOnNilBodyWithoutPanicking(t *testing.T) {
+	client := doFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: nil, Header: make(http.Header)}, nil
+	})
+	reader := NewReader(client, 1<<20)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("PDFURLFor panicked on nil Body: %v", r)
+		}
+	}()
+	_, err := reader.PDFURLFor(context.Background(), "https://example.test/landing")
+	if err == nil {
+		t.Fatal("want error for nil response body, got nil")
+	}
+	if !strings.Contains(err.Error(), "response body is missing") {
+		t.Fatalf("error = %q, want to contain %q", err.Error(), "response body is missing")
+	}
+}

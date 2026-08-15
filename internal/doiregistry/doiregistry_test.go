@@ -234,3 +234,28 @@ func TestNilClientFailsClosedInsteadOfBuildingAnUnguardedOne(t *testing.T) {
 		t.Fatal("want an error when no HTTP client was injected")
 	}
 }
+
+type doFunc func(*http.Request) (*http.Response, error)
+
+func (f doFunc) Do(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestRegisteredReturnsErrorOnNilBodyWithoutPanicking(t *testing.T) {
+	client := New(Options{
+		Client: doFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: nil, Header: make(http.Header)}, nil
+		}),
+		BaseURL: "https://doi.org",
+	})
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Registered panicked on nil Body: %v", r)
+		}
+	}()
+	_, err := client.Registered(context.Background(), "10.1234/x")
+	if err == nil {
+		t.Fatal("want error for nil response body, got nil")
+	}
+	if !strings.Contains(err.Error(), "response body is missing") {
+		t.Fatalf("error = %q, want to contain %q", err.Error(), "response body is missing")
+	}
+}

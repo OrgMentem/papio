@@ -85,6 +85,12 @@ func (r *Reader) PDFURLFor(ctx context.Context, landingURL string) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("landingmeta: fetch %s: %w", landingURL, err)
 	}
+	if resp == nil {
+		return "", fmt.Errorf("landingmeta: empty HTTP response for %s", landingURL)
+	}
+	if resp.Body == nil {
+		return "", fmt.Errorf("landingmeta: response body is missing for %s", landingURL)
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

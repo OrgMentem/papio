@@ -167,8 +167,10 @@ func (c *Client) Registered(ctx context.Context, doi string) (bool, error) {
 	if resp == nil {
 		return false, errors.New("doiregistry: handle proxy returned an empty response")
 	}
+	if resp.Body == nil {
+		return false, errors.New("doiregistry: response body is missing")
+	}
 	defer func() { _ = resp.Body.Close() }()
-
 	// The proxy mirrors its response code in the HTTP status (200 for a
 	// resolved handle, 404 for an unknown one), but the body is authoritative
 	// and is present on both. Anything outside that pair is an upstream fault.
