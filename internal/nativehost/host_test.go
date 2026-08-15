@@ -233,8 +233,10 @@ func TestPollWriteFailureTerminatesRun(t *testing.T) {
 		return []json.RawMessage{rawMsg(t, protocol.MsgCancel, "cancelid0001", "job_1", 0, map[string]any{})}, nil
 	}}
 
+	b := newBridge(fake, stdinR, failWriter{}, io.Discard)
+	b.pollInterval = 5 * time.Millisecond
 	done := make(chan error, 1)
-	go func() { done <- newBridge(fake, stdinR, failWriter{}, io.Discard).run(context.Background()) }()
+	go func() { done <- b.run(context.Background()) }()
 
 	select {
 	case err := <-done:

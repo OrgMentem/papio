@@ -121,6 +121,7 @@ func TestAutostarterEscalatesToHardKillWhenGracefulIgnored(t *testing.T) {
 		},
 		Ready: func(context.Context, string) error { return errors.New("not ready") },
 	}
+	starter.gracePeriod = 15 * time.Millisecond
 	start := time.Now()
 	_, err := starter.EnsureWithResult(context.Background())
 	elapsed := time.Since(start)

@@ -349,6 +349,8 @@ type bridge struct {
 
 	lastSeq   int64
 	seenHello bool
+
+	pollInterval time.Duration
 }
 
 func newBridge(syncer Syncer, stdin io.Reader, stdout, stderr io.Writer) *bridge {
@@ -478,12 +480,18 @@ func (b *bridge) handleInbound(ctx context.Context, frame []byte) error {
 	}
 	return b.writeOutbound(outbound)
 }
+func (b *bridge) effectivePollInterval() time.Duration {
+	if b.pollInterval != 0 {
+		return b.pollInterval
+	}
+	return pollInterval
+}
 
 // pollLoop drains daemon-initiated frames while stdin is idle. Explicitly
 // application-level Sync failures are transient and never terminate the
 // bridge; transport/framing failures and stdout writes are fatal.
 func (b *bridge) pollLoop(ctx context.Context) error {
-	ticker := time.NewTicker(pollInterval)
+	ticker := time.NewTicker(b.effectivePollInterval())
 	defer ticker.Stop()
 	for {
 		select {

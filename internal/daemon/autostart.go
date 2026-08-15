@@ -35,6 +35,8 @@ type Autostarter struct {
 	Ready      func(context.Context, string) error
 	OpenNull   func() (*os.File, error)
 	OpenLog    func() (*os.File, error)
+
+	gracePeriod time.Duration
 }
 
 // NewAutostarter returns an autostarter with production-safe defaults.
@@ -123,11 +125,14 @@ func (a *Autostarter) EnsureWithResult(ctx context.Context) (EnsureResult, error
 	if err != nil {
 		return result, fmt.Errorf("start daemon: %w", err)
 	}
+	// The process was launched, so callers must learn a daemon was started even
+	// when readiness later fails: the CLI suppresses its version-skew warning on
+	// this flag, and the readiness-failure path below still terminates the child.
 	result.Started = true
 	readyCtx, cancel := context.WithTimeout(ctx, cfg.StartTimeout)
 	defer cancel()
 	if err := waitReady(readyCtx, cfg.Ready, cfg.SocketPath, cfg.RetryInterval); err != nil {
-		terminateOrphan(cmd)
+		terminateOrphan(cmd, cfg.gracePeriod)
 		return result, fmt.Errorf("wait for daemon socket: %w", err)
 	}
 	if cmd.Process != nil {
@@ -136,9 +141,12 @@ func (a *Autostarter) EnsureWithResult(ctx context.Context) (EnsureResult, error
 	return result, nil
 }
 
-func terminateOrphan(cmd *exec.Cmd) {
+func terminateOrphan(cmd *exec.Cmd, gracePeriod time.Duration) {
 	if cmd == nil || cmd.Process == nil {
 		return
+	}
+	if gracePeriod <= 0 {
+		gracePeriod = 2 * time.Second
 	}
 	_ = terminateSignal(cmd, graceful)
 	done := make(chan error, 1)
@@ -146,7 +154,7 @@ func terminateOrphan(cmd *exec.Cmd) {
 	select {
 	case <-done:
 		return
-	case <-time.After(2 * time.Second):
+	case <-time.After(gracePeriod):
 	}
 	_ = terminateSignal(cmd, hard)
 	select {
