@@ -229,13 +229,16 @@ func BibTeX(records []Record) []byte {
 		}
 		fmt.Fprintf(&b, "@%s{%s,\n", entryType, r.Key())
 		fields := make([]string, 0, 8)
-		add := func(name, value string) {
+		addRaw := func(name, value string) {
 			if value != "" {
-				fields = append(fields, "  "+name+" = {"+escapeBibTeX(value)+"}")
+				fields = append(fields, "  "+name+" = {"+value+"}")
 			}
 		}
+		add := func(name, value string) {
+			addRaw(name, escapeBibTeX(value))
+		}
 		add("title", r.Title)
-		add("author", strings.Join(r.Authors, " and "))
+		addRaw("author", bibTeXAuthors(r.Authors))
 		if r.Year > 0 {
 			add("year", strconv.Itoa(r.Year))
 		}
@@ -295,6 +298,22 @@ var bibtexEscaper = strings.NewReplacer(
 	"~", "\\textasciitilde{}",
 	"^", "\\textasciicircum{}",
 )
+
+// bibTeXAuthors renders author names for BibTeX. Each name is wrapped in its
+// own braces because BibTeX reads a top-level " and " inside the field value as
+// the author separator, so a literal name such as "Research and Development,
+// Ada" would otherwise import as two authors and silently change the citation.
+func bibTeXAuthors(authors []string) string {
+	names := make([]string, 0, len(authors))
+	for _, author := range authors {
+		escaped := escapeBibTeX(author)
+		if escaped == "" {
+			continue
+		}
+		names = append(names, "{"+escaped+"}")
+	}
+	return strings.Join(names, " and ")
+}
 
 func escapeBibTeX(value string) string {
 	return bibtexEscaper.Replace(singleLine(value))

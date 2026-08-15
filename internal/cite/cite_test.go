@@ -92,11 +92,26 @@ func TestBibTeXEscapesReservedCharactersAndJoinsAuthors(t *testing.T) {
 	if !strings.Contains(out, `50\% of R\&D \{matters\}\_here`) {
 		t.Fatalf("BibTeX output does not escape reserved characters:\n%s", out)
 	}
-	if !strings.Contains(out, "author = {Joshua Holzer and Ada Lovelace}") {
-		t.Fatalf("BibTeX output does not join literal authors with ' and ':\n%s", out)
+	if !strings.Contains(out, "author = {{Joshua Holzer} and {Ada Lovelace}}") {
+		t.Fatalf("BibTeX output does not brace each author name:\n%s", out)
 	}
 	if !strings.Contains(out, "@article{holzer-2022-") {
 		t.Fatalf("BibTeX entry type or key wrong:\n%s", out)
+	}
+}
+
+// A BibTeX parser reads a top-level " and " inside the author value as the
+// author separator, so an unbraced literal name containing it silently imports
+// as two authors and changes the citation.
+func TestBibTeXProtectsLiteralAndInsideOneAuthorName(t *testing.T) {
+	r := article()
+	r.Authors = []string{"Research and Development, Ada"}
+	out := string(BibTeX([]Record{r}))
+	if !strings.Contains(out, "author = {{Research and Development, Ada}}") {
+		t.Fatalf("literal \" and \" is not protected from author splitting:\n%s", out)
+	}
+	if strings.Contains(out, "author = {Research and Development, Ada}") {
+		t.Fatalf("author value is unbraced and would split into two authors:\n%s", out)
 	}
 }
 
