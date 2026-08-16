@@ -110,6 +110,15 @@ test("doiFromURL only strips an external suffix where the route declares one", (
 // override the others, and that is a cardinal path: a supplement URL carrying
 // `?doi=<article>` returned the ARTICLE while addressing the appendix.
 test("doiFromURL declines when a URL names two different works", () => {
+  // A REAL registered pair: Frontiers article `10.3389/fmolb.2021.618068` and its
+  // own supplement `…618068.s001`. The path names the article and the parameter
+  // names the supplement, so this is the cardinal shape with two identifiers that
+  // both genuinely exist — and each still resolves on its own, below.
+  expect(
+    doiFromURL("https://www.frontiersin.org/journals/molecular-biosciences/articles/10.3389/fmolb.2021.618068/full?doi=10.3389/fmolb.2021.618068.s001"),
+  ).toBeUndefined();
+  expect(doiFromURL("https://www.frontiersin.org/journals/molecular-biosciences/articles/10.3389/fmolb.2021.618068/full")).toBe("10.3389/fmolb.2021.618068");
+  expect(doiFromURL("https://doi.org/10.3389/fmolb.2021.618068.s001")).toBe("10.3389/fmolb.2021.618068.s001");
   expect(doiFromURL("https://dl.acm.org/doi/suppl/10.1145/X1/suppl_file/a.pdf?doi=10.1145/X1")).toBeUndefined();
   expect(doiFromURL("https://pub.example/article/10.1000/real?target=https%3A%2F%2Fo.example%2Fdoi%2Fpdf%2F10.2000%2Fother")).toBeUndefined();
   expect(doiFromURL("https://doi.org/10.1234/A?doi=10.5678/B")).toBeUndefined();
