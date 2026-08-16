@@ -18,7 +18,11 @@ vet:
 # every paper against its own metadata must pass, against every other paper's
 # must not. Reports the wrong-accept count the windows in internal/pdf/identity.go
 # are tuned against. Run it before AND after touching those rules; see
-# dev/identity-corpus.md. Output names your own library — never commit a run.
+# dev/identity-corpus.md. Pass -candidates to measure the OTHER rule instead —
+# pdf.SelectAutoBindCandidate choosing one candidate from a pool of N, over the
+# DOI-less subset — which reports wrong-BINDS per document and reads the live
+# papio store read-only for its backlog arm. Output names your own library —
+# never commit a run.
 identity-corpus:
 	go run ./cmd/identity-corpus
 

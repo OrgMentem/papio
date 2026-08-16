@@ -210,10 +210,20 @@ be used alone to choose a production pool cap. Making it calibration-grade
 requires event-time pool snapshots recorded going forward — a small, separable
 change worth doing early so the data exists later, but not a prerequisite here.
 
-Use `Store.ListCandidateEligibleJobs` (`internal/job/candidate_eligibility.go:169-194`)
-for a standalone read, matching the daemon's own initial pool
-(`bridge.go:7635`); the `...Tx` form (lines 197-211) is the daemon's freshness
-fence, not the enumeration. The pending-row count v1 quoted as "~27" is an
+Enumerate with `job.ListCandidateEligibleJobsTx(ctx, tx)` (lines 197-211)
+inside an explicitly read-only transaction on a `mode=ro` handle. An earlier
+draft of this plan said to use `Store.ListCandidateEligibleJobs` (lines
+169-194) because it is what the daemon's initial pool uses (`bridge.go:7635`);
+that instruction was **wrong and hazardous**. That method hangs off `*job.Store`
+wrapping `*store.Store`, whose connection can only come from `store.Open`,
+which `os.MkdirAll`s the data directory and runs `s.migrate`
+(`internal/store/store.go:44-57`) — so pointing it at a live operator database
+would migrate the store as a side effect of reporting on it. A measurement tool
+must not mutate what it measures. Both forms call the same
+`queryCandidateEligibleJobs` and both attach `BoundDOIs`, so the predicate is
+identical and nothing drifts; the `Tx` form is simply the only entry point that
+accepts a foreign handle. Restating the SQL locally stays rejected: the pool
+predicate is single-sourced on purpose. The pending-row count v1 quoted as "~27" is an
 operator-run figure with no repository evidence and must be reported from a
 query, not asserted.
 
@@ -316,3 +326,80 @@ and the same parsed front-matter assertion `/2` specifies. Two instruments
 arrived at separately, naming one missing capability — the strongest available
 evidence that `/2` aims at the right thing, and a reason to build that parser
 once and let both modes grade it.
+
+## First run, 2026-08-16 — and the hypothesis it refutes
+
+Instrument built and run against the operator's real library. Aggregates only
+here; the report itself names the operator's own papers and stays off disk in
+the repo, per the Privacy section of `dev/identity-corpus.md`.
+
+Corpus, which bounds every claim below: **640 documents loaded, 391 DOI-less
+(61.1%)**. That proportion had never been published and is higher than assumed
+— the population production actually reaches is the majority of the library,
+not an edge case. 293 documents survived into scored pools; 98 were excluded as
+`unestablished` rather than guessed. Seed 20260816, 6,712 trials.
+
+### The result
+
+| arm | wrong binds |
+|---|---|
+| random, all N, present and absent | **0** |
+| same-author, same-year, title-superset, same-venue-year | **0** |
+| **conjunction, target-absent, every N** | **286 of 286 — 100%** |
+
+Every single-axis arm is clean. The composed adversary fails **totally**, and
+fails identically at N=2 and N=25.
+
+This is the original methodological failure demonstrated rather than argued: a
+per-axis corpus reports zero because it never composes, and the composition is
+not a rare corner but a certainty. Each wrong bind terminates at
+`identifier-page-one` with evidence of the form "author family name matched;
+requested title printed as a line in the front matter; year matched; document
+prints the requested DOI" — where the DOI it "prints" is the one the document
+**cites**. All seven gates pass on a citation.
+
+### Hypothesis refuted: a pool cap is the wrong lever
+
+This plan expected the sweep to yield a pool cap ("the largest N whose bound
+sits under a risk budget"). It does not, and cannot: the wrong-bind rate is
+**flat at 100% across every pool size**, so no cap helps. Pool size is not the
+risk axis; composition is. Delete the cap from `/2`'s design space and spend the
+effort on the front-matter structural parser instead — the rule has no notion
+of a *self-assertion* versus a *mention*, and nothing about pool size changes
+that.
+
+Corroborating the same gap from the other side: conjunction **target-present**
+abstains on all 286, reason "ambiguous: multiple candidates qualify (2)". The
+rule cannot tell the cited work from the document's own work even when both are
+in the pool. That is precisely the capability `dev/identity-corpus.md` names as
+missing from the pairwise side.
+
+### The cost side, now quantified
+
+Missed binds are the dominant outcome wherever binding is safe: random N=2
+target-present is 44 correct against 249 missed, so today's substrate abstains
+on about **85%** of cases where the target is present and unique. Even made
+safe, this rule would rarely help. That reframes `/2`'s value case: the win is
+not "most PDFs file themselves" but a modest minority, which should be weighed
+against the popup picker already shipped.
+
+### Coverage this run does NOT have, stated so it is never read as clean
+
+- `conclusive-veto`: 0 trials — **unreachable by construction**, since every
+  measured document has an empty front-matter window. Untested, not passed.
+- `non-article-marker` and `correction-marker`: 0 trials — no arm synthesizes a
+  document bearing those markers, and they are exactly what an erratum trips.
+  This is the largest remaining hole and the composite arm is what closes it.
+- `same-venue-year` and `title-superset`: **0 of 293 eligible** — the library
+  cannot fill them, so those two axes are entirely unmeasured. They render as
+  `NOT REPRESENTATIVE`, not as zero-failure.
+- Composite prevalence: 14 proposals written, **all unreviewed**, so prevalence
+  has no upper bound and "composites are rare" is unfalsifiable from this run.
+  Labelling those 14 plus the 25 audit rows is the next human step.
+
+### Standing conclusion
+
+The `/2` substrate as it stands **cannot ship**, on measurement rather than
+argument, and the blocking defect is not tunable. The instrument now fails on
+the thing the old one could not see, which is the only property that made it
+worth building.

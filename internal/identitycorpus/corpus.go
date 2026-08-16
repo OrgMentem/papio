@@ -49,6 +49,18 @@ type Document struct {
 	Chars       int64
 	OCRUsed     bool
 	NeedsReview bool
+
+	// Secondary reports that this attachment is NOT its parent's primary
+	// PDF — the lowest-itemID one dedupOnePerParent keeps. It is always
+	// false in the default one-per-parent mode, where every document is
+	// its parent's primary by construction; only
+	// LoadOptions.AllAttachments can produce a document with it set. The
+	// composite arm reads it as a signal in its own right: a supplement,
+	// an alternate scan or a publisher cover sheet is ordinarily filed as
+	// a second attachment on the article's own Zotero item, so nothing in
+	// the parent's curated metadata describes the bytes this document
+	// actually holds.
+	Secondary bool
 }
 
 // Skip records a candidate PDF attachment that Load excluded from the
@@ -112,6 +124,13 @@ type candidate struct {
 	parentID      int64
 	linkMode      int
 	path          string
+
+	// secondary is set by selectAttachments in all-attachments mode for
+	// every attachment that is not its parent's lowest-itemID PDF, and
+	// travels through prepared into Document.Secondary. In the default
+	// mode nothing ever sets it: the one candidate kept per parent is the
+	// primary.
+	secondary bool
 }
 
 // prepared is a candidate that has cleared file resolution and metadata
@@ -129,7 +148,47 @@ type prepared struct {
 // record of every candidate that did not make it in. cacheDir, when
 // non-empty, caches extracted text across runs; workers bounds extraction
 // concurrency, defaulting to runtime.NumCPU() when <= 0.
+//
+// One PDF per bibliographic parent, as it always has been: this is the
+// corpus Measure's pairwise baseline is defined over, so its result must
+// not move. LoadWithOptions is the way to ask for anything else.
 func Load(ctx context.Context, zoteroDir, cacheDir string, workers int) ([]Document, []Skip, error) {
+	return load(ctx, zoteroDir, cacheDir, workers, false)
+}
+
+// LoadOptions is the parameter form of load, carrying the one thing Load's
+// positional signature cannot express without changing under every existing
+// caller.
+type LoadOptions struct {
+	ZoteroDir string
+	CacheDir  string
+	Workers   int
+
+	// AllAttachments keeps every PDF attachment of a parent item rather
+	// than only the parent's primary (see dedupOnePerParent for why the
+	// default drops the rest). It exists for the composite arm of the
+	// candidate-binding measurement: errata, corrigenda, supplements,
+	// cover sheets and journal expansions are precisely the attachments
+	// dedupOnePerParent removes, so measuring that failure class over the
+	// default corpus reports zero composites while the class sits
+	// untouched in the library — an empty measurement that reads as a
+	// clean one.
+	//
+	// The cost the default avoids is still real and is not fixed here: a
+	// secondary attachment's own front matter is scored against metadata
+	// describing its parent's primary PDF, so pairwise Measure must not
+	// be run over this mode's output. Document.Secondary marks which
+	// documents carry that caveat.
+	AllAttachments bool
+}
+
+// LoadWithOptions is Load with the loader's opt-in modes exposed. Called with
+// a zero AllAttachments it is Load exactly.
+func LoadWithOptions(ctx context.Context, opts LoadOptions) ([]Document, []Skip, error) {
+	return load(ctx, opts.ZoteroDir, opts.CacheDir, opts.Workers, opts.AllAttachments)
+}
+
+func load(ctx context.Context, zoteroDir, cacheDir string, workers int, allAttachments bool) ([]Document, []Skip, error) {
 	capability := pdf.DetectCapability()
 	if capability.PDFToText == "" {
 		return nil, nil, errors.New("poppler's pdftotext is not installed; identity corpus extraction requires it")
@@ -162,7 +221,7 @@ func Load(ctx context.Context, zoteroDir, cacheDir string, workers int) ([]Docum
 		return nil, nil, err
 	}
 
-	kept, skips := dedupOnePerParent(candidates)
+	kept, skips := selectAttachments(candidates, allAttachments)
 
 	// VAL-2: an "attachments:"-prefixed linkMode 2 path is relative to
 	// whatever the operator set as Zotero's Linked Attachment Base
@@ -585,6 +644,39 @@ func dedupOnePerParent(candidates []candidate) ([]candidate, []Skip) {
 		}
 	}
 	return kept, skips
+}
+
+// selectAttachments applies the loader's attachment-selection mode. The
+// default is dedupOnePerParent, unchanged and byte-identical: same kept
+// candidate, same Skip rows, same reasons.
+//
+// All-attachments mode keeps every candidate and skips none, marking every
+// attachment that is not its parent's primary. The primary is chosen by the
+// same rule dedupOnePerParent uses — the lowest attachment itemID, which
+// Zotero assigns on import — so a document's Secondary flag means the same
+// thing in both modes and does not depend on the order SQLite handed the
+// rows over in. The result is sorted by attachment itemID for the same
+// reason: it must not vary run to run, and the map walk above gives no
+// order at all.
+func selectAttachments(candidates []candidate, allAttachments bool) ([]candidate, []Skip) {
+	if !allAttachments {
+		return dedupOnePerParent(candidates)
+	}
+
+	primary := make(map[int64]int64, len(candidates))
+	for _, c := range candidates {
+		if id, ok := primary[c.parentID]; !ok || c.attachmentID < id {
+			primary[c.parentID] = c.attachmentID
+		}
+	}
+
+	kept := make([]candidate, 0, len(candidates))
+	for _, c := range candidates {
+		c.secondary = c.attachmentID != primary[c.parentID]
+		kept = append(kept, c)
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].attachmentID < kept[j].attachmentID })
+	return kept, nil
 }
 
 // resolveAttachmentPath turns a Zotero attachment's linkMode and stored
@@ -1400,7 +1492,7 @@ func classifyExtractionFailure(evidence []string) string {
 // corrupt, or scanned with no usable text layer, and one such file must not
 // cost the harness the rest.
 func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts pdf.SemanticOptions, cacheDir string) (Document, Skip, bool) {
-	base := Document{Key: p.cand.attachmentKey, ParentKey: p.cand.parentKey, Path: p.path, Work: p.work}
+	base := Document{Key: p.cand.attachmentKey, ParentKey: p.cand.parentKey, Path: p.path, Work: p.work, Secondary: p.cand.secondary}
 
 	// The cache key folds in size and modification time, not just the
 	// attachment key, so a PDF replaced or re-exported by Zotero misses the
