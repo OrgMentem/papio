@@ -29,7 +29,7 @@ import {
   type NativePort,
 } from "../src/background";
 import { fixtureExists, loadFixture, parseHTML } from "./harness";
-import { ChromeTabsFake } from "./fake-tabs";
+import { ChromeTabsFake, FakeWebNavigation } from "./fake-tabs";
 import { Window } from "happy-dom";
 
 // A representative ProQuest-shaped spec. Rules are ordered; first match wins.
@@ -1367,6 +1367,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
   const tabs = new ChromeTabsFake();
   const downloads = new FakeDownloads();
   const clock = { now: 1_700_000_000_000 };
+  const webNavigation = new FakeWebNavigation();
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
   const termsPermits = new Map<string, { permitID: string; occurrenceID: string; settled: boolean }>();
   port.autoReply = (raw) => {
@@ -1450,6 +1451,7 @@ function makeMapHarness(specs: AdapterSpec[] = [SPEC]): MapHarness {
     backend,
     tabs,
     downloads,
+    webNavigation,
     adapterSpecs: specs,
     scripting,
     permissions,

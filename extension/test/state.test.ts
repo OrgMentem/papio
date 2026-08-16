@@ -43,18 +43,25 @@ test("upsert inserts then replaces by job_id, never duplicating", () => {
   expect(findByJob(store, "job_00000001")?.status).toBe("auth_pending");
 });
 
-test("a daemon upsert cannot revoke an operator-selected manual delivery target", () => {
-  const selected = job({
+// The durable `manual_delivery_target` pin was deleted; the volatile one-shot
+// `deliveryChoiceNonces` map (offer-scoped, capped 32, 10-minute TTL) supersedes
+// it. A daemon upsert now simply replaces the job — there is no pinned record
+// to shield — so this asserts the new overwriting behaviour rather than the
+// old guard.
+test("a daemon upsert now overwrites — the volatile nonce replaced the durable pin", () => {
+  const existing = job({
     tab_id: -1,
     status: "awaiting_download",
     provider_hosts: [],
-    manual_delivery_target: true,
   });
   const store = upsertJob(
-    { ...emptyStore(), activeJobs: [selected] },
+    { ...emptyStore(), activeJobs: [existing] },
     job({ tab_id: 222, status: "accepted", access_mode: "delegated" }),
   );
-  expect(store.activeJobs).toEqual([selected]);
+  // No pin to preserve: the second offer wins and the tab migrates.
+  expect(store.activeJobs).toHaveLength(1);
+  expect(findByJob(store, "job_00000001")?.tab_id).toBe(222);
+  expect(findByJob(store, "job_00000001")?.status).toBe("accepted");
 });
 
 test("find by tab and by job resolve the same record", () => {
@@ -184,61 +191,18 @@ test("migration accepts a clean current state and writes an explicit version on 
   });
 });
 
-test("version 3 upgrades and the unique manual-delivery target survives restart", () => {
+test("version 3 upgrades and old manual_delivery_target is dropped", () => {
   const legacy = migrateManagedState({
     version: 3,
     activeJobs: [migrationJob()],
   });
   expect(legacy.activeJobs[0]?.job_id).toBe("job_migrate_0001");
-
-  const selected = migrationJob({
-    job_id: "job_manual_selected",
-    tab_id: -1,
-    status: "awaiting_download",
-    manual_delivery_target: true,
-  });
-  expect(
-    migrateManagedState({
-      version: MANAGED_STATE_VERSION,
-      activeJobs: [selected],
-    }).activeJobs[0]?.manual_delivery_target,
-  ).toBe(true);
-  expect(
-    migrateManagedState({
-      version: MANAGED_STATE_VERSION,
-      activeJobs: [
-        migrationJob({
-          job_id: "job_manual_open_tab",
-          tab_id: 88,
-          status: "awaiting_download",
-          access_mode: "delegated",
-          manual_delivery_target: true,
-        }),
-      ],
-    }).activeJobs[0]?.manual_delivery_target,
-  ).toBe(true);
-
-  const ambiguous = migrateManagedState({
+  const migrated = migrateManagedState({
     version: MANAGED_STATE_VERSION,
-    activeJobs: [
-      selected,
-      migrationJob({
-        job_id: "job_manual_other",
-        tab_id: -1,
-        status: "awaiting_download",
-        manual_delivery_target: true,
-      }),
-    ],
+    activeJobs: [migrationJob({ manual_delivery_target: true } as unknown as Record<string, unknown>)],
   });
-  expect(
-    ambiguous.activeJobs.every((job) => job.manual_delivery_target !== true),
-  ).toBe(true);
-  expect(
-    migrateManagedState({
-      version: MANAGED_STATE_VERSION,
-      activeJobs: [migrationJob({ manual_delivery_target: true })],
-    }).activeJobs[0]?.manual_delivery_target,
-  ).toBeUndefined();
+  const asRecord = migrated.activeJobs[0] as unknown as Record<string, unknown>;
+  expect(asRecord["manual_delivery_target"]).toBeUndefined();
 });
 
 test("materialization migration preserves only validated institutional effect identity", () => {
@@ -512,6 +476,21 @@ test("migration is deterministic and idempotent", () => {
   const second = migrateManagedState(first);
   expect(second).toEqual(first);
   expect(JSON.stringify(second)).not.toContain("https://secret.example");
+});
+test("waiting_manual pending delivery preserves page_identity, other statuses drop it", () => {
+  const pi = { tab_id: 5, nav_seq: 2, source_url: "https://example.com/paper.pdf", document_id: "doc1" };
+  const withPi = migrateManagedState({
+    version: MANAGED_STATE_VERSION,
+    activeJobs: [migrationJob({ status: "awaiting_download" })],
+    pendingDelivery: { job_id: "job_migrate_0001", initiated_at: 1, status: "waiting_manual", page_identity: pi },
+  });
+  expect(withPi.pendingDelivery?.page_identity).toEqual(pi);
+  const without = migrateManagedState({
+    version: MANAGED_STATE_VERSION,
+    activeJobs: [migrationJob()],
+    pendingDelivery: { job_id: "job_migrate_0001", initiated_at: 1, status: "sending", page_identity: pi },
+  });
+  expect(without.pendingDelivery?.page_identity).toBeUndefined();
 });
 test("materialization reducer keeps URL-free closed transitions and rejects stale callbacks", () => {
   const correlation: MaterializationCorrelation = {

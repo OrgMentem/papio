@@ -22,7 +22,8 @@
     "scripting",
     "storage",
     "alarms",
-    "tabGroups"
+    "tabGroups",
+    "webNavigation"
   ],
   "host_permissions": [
     "https://*.alma.exlibrisgroup.com/*",

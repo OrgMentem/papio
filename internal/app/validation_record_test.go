@@ -18,11 +18,12 @@ func TestValidationVerdictMirrorsCandidateBranches(t *testing.T) {
 	// This table deliberately follows validateCandidate's branch order. The
 	// recorded verdict must not drift from the transition the job actually takes.
 	tests := []struct {
-		name           string
-		report         pdf.ValidationReport
-		activeContent  bool
-		identityReview bool
-		want           string
+		name                string
+		report              pdf.ValidationReport
+		activeContent       bool
+		identityReview      bool
+		conclusiveDOIBlocks bool
+		want                string
 	}{
 		{
 			name: "payload rejected",
@@ -70,6 +71,47 @@ func TestValidationVerdictMirrorsCandidateBranches(t *testing.T) {
 			},
 			activeContent: true,
 			want:          validationUnsafe,
+		},
+		{
+			name: "conclusive DOI mismatch",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: true},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+			},
+			conclusiveDOIBlocks: true,
+			want:                validationConclusiveDOI,
+		},
+		{
+			name: "conclusive DOI wins over identity review",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: true},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityReview},
+			},
+			identityReview:      true,
+			conclusiveDOIBlocks: true,
+			want:                validationConclusiveDOI,
+		},
+		{
+			name: "unsafe wins over conclusive DOI",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: true, Encrypted: true},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+			},
+			conclusiveDOIBlocks: true,
+			want:                validationUnsafe,
+		},
+		{
+			name: "payload wins over conclusive DOI",
+			report: pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: false},
+				Structural: pdf.StructuralReport{Valid: true},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+			},
+			conclusiveDOIBlocks: true,
+			want:                validationPayloadRejected,
 		},
 		{
 			name: "identity review",
@@ -153,7 +195,7 @@ func TestValidationVerdictMirrorsCandidateBranches(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			activeContent := tc.activeContent || tc.report.Structural.HasJavaScript || tc.report.Structural.HasEmbeddedFiles
 			needsIdentityReview := tc.identityReview || tc.report.Text.NeedsReview || tc.report.Identity.Result == pdf.IdentityReview
-			if got := validationVerdict(tc.report, activeContent, needsIdentityReview); got != tc.want {
+			if got := validationVerdict(tc.report, activeContent, needsIdentityReview, tc.conclusiveDOIBlocks); got != tc.want {
 				t.Fatalf("validationVerdict() = %q, want %q", got, tc.want)
 			}
 		})

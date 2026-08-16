@@ -413,6 +413,37 @@
         flex: 1 1 8rem;
       }
 
+      .page-acquire-choice {
+        display: grid;
+        gap: var(--space-2);
+      }
+
+      .page-acquire-choice[hidden] {
+        display: none;
+      }
+
+      .page-acquire-choice-question {
+        color: var(--color-ink);
+        font-size: var(--font-size-small);
+        font-weight: 700;
+      }
+
+      .page-acquire-choice-list {
+        display: grid;
+        gap: var(--space-1);
+      }
+
+      .page-acquire-choice-option {
+        text-align: left;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        justify-content: flex-start;
+      }
+
+      .page-acquire-choice-dismiss {
+        justify-self: start;
+      }
+
       /* Every popup-local result has one geometry and one semantic border, so
          a queue acceptance, a refusal, and a transport failure differ by
          meaning rather than by shape. Hidden means zero height: no reserved
@@ -951,6 +982,7 @@
         <p id="page-bulk-scan-status" class="popup-result" hidden></p>
         <div id="page-acquire" class="page-acquire-feedback" hidden>
           <div id="page-acquire-status" class="popup-result" hidden></div>
+          <div id="page-acquire-choice" class="page-acquire-choice" hidden></div>
           <div id="page-acquire-live" class="page-acquire-live" hidden>
             <p id="page-acquire-live-title" class="page-acquire-live-title" hidden></p>
             <p id="page-acquire-live-status" class="page-acquire-live-status"></p>

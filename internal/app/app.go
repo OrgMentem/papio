@@ -3004,12 +3004,20 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	}
 	active := report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
 	needsIdentityReview := report.Text.NeedsReview || report.Identity.Result == pdf.IdentityReview
+	// The conclusive-identity veto: MatchIdentityWithThreshold's foreign-DOI
+	// rejection is gated on wantDOI != "" (identity.go:148-162), so a job
+	// with NO DOI can never be contradicted by the document's own
+	// conclusive DOI — an exact printed title plus matching authors returns
+	// IdentityPass and the bytes get promoted under the wrong citation.
+	// That silent wrong-accept is what this arm closes. Computed once
+	// alongside needsIdentityReview so switch and verdict share one value.
+	conclusiveVeto := pdf.CheckConclusiveIdentity(report.Text.Excerpt, boundDOIs(anchor, row))
 	// Recorded before the branch, not inside each arm: the verdict is a function
 	// of the report alone, so one call site cannot drift from the decision below,
 	// and evidence survives even for the candidates papio throws away — which is
 	// exactly the set a consumer asks "why not this one?" about.
 	s.recordValidation(ctx, row.ID, stored.ID, result.SHA256,
-		validationVerdict(report, active, needsIdentityReview), report)
+		validationVerdict(report, active, needsIdentityReview, conclusiveVeto.Blocks()), report)
 	switch {
 	case report.Structural.Encrypted || active:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "encrypted_or_active_content")
@@ -3029,6 +3037,27 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		_ = os.Remove(result.TempPath)
 		return false, false, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateFetching,
 			map[string]any{"reason": "invalid_pdf"})
+	case conclusiveVeto.Blocks() && !stored.ReviewOverride:
+		// ReviewOverride still wins: it is set only by an explicit human
+		// review of the quarantined preview (ADR-0002), and without that
+		// escape a legitimately mismatched document (a chapter DOI against a
+		// book job) could never be accepted at all. A job selection never
+		// sets ReviewOverride, so picks stay gated.
+		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "conclusive_doi_mismatch")
+		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
+		detail := fmt.Sprintf("Document front matter DOI %s does not match this job; local quarantine file: %s — %s",
+			strings.Join(conclusiveVeto.DOIs, ", "), result.TempPath, strings.Join(conclusiveVeto.Evidence, "; "))
+		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "verify_identity",
+			detail,
+			job.Access(false, ""),
+			job.WithHumanActionBinding(job.HumanActionBinding{
+				CandidateID: stored.ID, QuarantinePath: result.TempPath, QuarantineSHA256: result.SHA256,
+			}),
+		); err != nil {
+			return false, false, err
+		}
+		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
+			map[string]any{"reason": "conclusive_doi_mismatch"})
 	case needsIdentityReview && !stored.ReviewOverride:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "semantic_or_identity_review")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")

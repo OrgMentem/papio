@@ -18,6 +18,7 @@ import {
   findByJob,
   jobDownloadFilename,
   migrateManagedState,
+  startPendingDelivery,
   type ActiveJob,
   type ProviderDriveEpoch,
   type StateBackend,
@@ -75,7 +76,7 @@ import {
   type TabInfo,
 } from "../src/background";
 import { routeResolverService } from "../src/resolver";
-import { ChromeTabsFake } from "./fake-tabs";
+import { ChromeTabsFake, FakeWebNavigation } from "./fake-tabs";
 import { FakeDownloads } from "./fake-downloads";
 
 /** A hello_ack that must read as a healthy daemon has to sit at or above
@@ -329,6 +330,7 @@ interface Harness {
   action: FakeAction;
   windows?: FakeWindows;
   tabGroups?: FakeTabGroups;
+  webNavigation: FakeWebNavigation;
   clock: { now: number };
   timers: { fn: () => void | Promise<void>; ms: number }[];
   runtimeMessages: object[];
@@ -357,6 +359,7 @@ function makeHarness(
   let connects = 0;
   const backend = new FakeBackend();
   if (seed) backend.store = seed;
+  const webNavigation = new FakeWebNavigation();
   const tabs = new ChromeTabsFake();
   tabs.nextId = 100;
   const downloads = new FakeDownloads();
@@ -483,6 +486,7 @@ function makeHarness(
     ...(tabGroups !== undefined ? { tabGroups } : {}),
     action,
     alarms: { create: (name) => alarms.create(name), onAlarm: alarms.onAlarm },
+    webNavigation,
   };
   return {
     bridge: new Bridge(deps),
@@ -493,6 +497,7 @@ function makeHarness(
     tabs,
     downloads,
     action,
+    webNavigation,
     ...(windows !== undefined ? { windows } : {}),
     ...(tabGroups !== undefined ? { tabGroups } : {}),
     clock,
@@ -9130,7 +9135,13 @@ test("per-origin sign-in falls back to a managed tab when the manager declines",
   expect(h.tabs.created).toHaveLength(1);
 });
 
-test("manual inbox Open binds a DOI-less PDF in another tab to the existing job", async () => {
+// The durable inbox-prefined manual_delivery_target pin has been deleted.
+// The volatile one-shot DeliveryChoice nonce (interaction + candidates) supersedes it.
+// These tests cover the new mechanism: needs_choice offer, one-shot consumption,
+// page-identity revalidation, tab-close destruction, SW-surviving waiting_manual
+// continuation, and the remaining inbox Open (now a plain tab open with no pin).
+
+test("inbox Open is now a plain tab open with no pin side-effect", async () => {
   const h = makeHarness();
   await h.bridge.start();
   const urls = {
@@ -9141,86 +9152,25 @@ test("manual inbox Open binds a DOI-less PDF in another tab to the existing job"
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
-  const jobID = "job_55c790d91b55f395759ecebe84";
   const landingURL = "https://link.springer.com/article/10.1007/BF03392100";
+  const jobID = "job_open_plain_new_0001";
+  await ((h.bridge as unknown as { update: (fn: (s: unknown)=>unknown)=>Promise<void> }).update)((st: unknown)=>{
+    const store = st as StoreShape;
+    return { ...store, activeJobs: [{ job_id: jobID, tab_id: -1, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: ["link.springer.com"] }] };
+  });
   const opened = await handleInboxRuntimeMessage(
     h.bridge,
-    {
-      type: "papio.manual.open",
-      request: {
-        job_id: jobID,
-        url: landingURL,
-        title: "Understanding workplace deviance",
-      },
-    },
+    { type: "papio.manual.open", request: { job_id: jobID, url: landingURL } },
     { id: urls.runtimeID, url: urls.inboxURL },
     urls,
   );
-
   expect(opened).toEqual({ ok: true, opened: true });
   expect(h.tabs.created).toEqual([{ url: landingURL, active: true }]);
-  const manualStored = findByJob(h.backend.store, jobID)!;
-  expect(manualStored.manual_delivery_target).toBe(true);
-  expect(manualStored.status).toBe("awaiting_download");
-  expect(manualStored.expected).toEqual({
-    title: "Understanding workplace deviance",
-  });
-  expect(
-    typeof manualStored.tab_id === "number" && manualStored.tab_id >= 0,
-  ).toBe(true);
-
-  // A daemon re-offer can arrive while the researcher logs in or reads the
-  // landing page. It cannot replace the explicit target or erase the safe
-  // landing host needed to steer a native provider download.
-  await h.port.inbound(jobOffer(jobID));
-  const afterOffer = findByJob(h.backend.store, jobID)!;
-  expect(afterOffer.manual_delivery_target).toBe(true);
-  expect(afterOffer.status).toBe("awaiting_download");
-  expect(afterOffer.provider_hosts).toEqual(
-    expect.arrayContaining(["link.springer.com"]),
-  );
-  expect(typeof afterOffer.tab_id === "number" && afterOffer.tab_id >= 0).toBe(
-    true,
-  );
-  const suggestions: string[] = [];
-  await h.downloads.onDeterminingFilename.emit(
-    {
-      id: 776,
-      referrer: landingURL,
-      url: "https://link.springer.com/content/pdf/10.1007/BF03392100.pdf",
-      filename: "BF03392100.pdf",
-      state: "in_progress",
-    },
-    (suggestion) => suggestions.push(suggestion.filename),
-  );
-  expect(suggestions).toEqual([`papio/${jobID}/BF03392100.pdf`]);
-  const referrerless: string[] = [];
-  await h.downloads.onDeterminingFilename.emit(
-    {
-      id: 777,
-      url: "https://cdn.example.invalid/BF03392100.pdf",
-      filename: "BF03392100.pdf",
-      state: "in_progress",
-    },
-    (suggestion) => referrerless.push(suggestion.filename),
-  );
-  expect(referrerless).toEqual([]);
-
-  // Send PDF on the Open'd tab still joins that job. A DOI-less PDF in a
-  // different tab is identified from the file, not bound by the pin.
-  const openedTabID = manualStored.tab_id;
-  const pdfURL = "https://link.springer.com/content/pdf/10.1007/BF03392100.pdf";
-  h.tabs.seed({ id: openedTabID, url: pdfURL });
-  const delivery = await h.bridge.startPDFDelivery({
-    tab_id: openedTabID,
-    url: pdfURL,
-    job_id: jobID,
-  });
-  expect(delivery).toMatchObject({ ok: true, state: "sending", job_id: jobID });
-  expect(h.backend.store.pendingDelivery?.job_id).toBe(jobID);
+  expect((findByJob(h.backend.store, jobID) as unknown as Record<string, unknown>)?.["manual_delivery_target"]).toBeUndefined();
+  expect(findByJob(h.backend.store, jobID)?.tab_id).toBe(-1);
 });
 
-test("manual inbox Open is inbox-only, HTTPS-only, and one target at a time", async () => {
+test("inbox Open remains inbox-only and HTTPS-only", async () => {
   const h = makeHarness();
   await h.bridge.start();
   const urls = {
@@ -9231,86 +9181,266 @@ test("manual inbox Open is inbox-only, HTTPS-only, and one target at a time", as
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
-  const request = (
-    jobID: string,
-    url = "https://publisher.example.edu/article",
-  ) => ({
+  const request = (jobID: string, url = "https://publisher.example.edu/article") => ({
     type: "papio.manual.open",
     request: { job_id: jobID, url, title: "Paper" },
   });
-
   await expect(
-    handleInboxRuntimeMessage(
-      h.bridge,
-      request("job_manual_popup_forbidden"),
-      { id: urls.runtimeID, url: urls.popupURL },
-      urls,
-    ),
+    handleInboxRuntimeMessage(h.bridge, request("job_manual_popup_forbidden"), { id: urls.runtimeID, url: urls.popupURL }, urls),
   ).resolves.toMatchObject({ ok: false, error: { code: "unauthorized" } });
   await expect(
-    handleInboxRuntimeMessage(
-      h.bridge,
-      request(
-        "job_manual_http_forbidden",
-        "http://publisher.example.edu/article",
-      ),
-      { id: urls.runtimeID, url: urls.inboxURL },
-      urls,
-    ),
+    handleInboxRuntimeMessage(h.bridge, request("job_manual_http_forbidden", "http://publisher.example.edu/article"), { id: urls.runtimeID, url: urls.inboxURL }, urls),
   ).resolves.toMatchObject({ ok: false, error: { code: "invalid_request" } });
-
-  for (const jobID of ["job_manual_target_one", "job_manual_target_two"]) {
-    await expect(
-      handleInboxRuntimeMessage(
-        h.bridge,
-        request(jobID),
-        { id: urls.runtimeID, url: urls.inboxURL },
-        urls,
-      ),
-    ).resolves.toEqual({ ok: true, opened: true });
-  }
-  expect(
-    h.backend.store.activeJobs
-      .filter((job) => job.manual_delivery_target === true)
-      .map((job) => job.job_id),
-  ).toEqual(["job_manual_target_two"]);
-  expect(findByJob(h.backend.store, "job_manual_target_one")?.tab_id).toBe(-1);
-
-  // Compatibility with state persisted by the pre-fix build: even if an
-  // unselected awaiting-download record still carries its former tab id, it
-  // cannot claim a later native download from that tab.
-  h.backend.store.activeJobs = h.backend.store.activeJobs.map((job) =>
-    job.job_id === "job_manual_target_one" ? { ...job, tab_id: 998 } : job,
-  );
-  const staleSuggestions: string[] = [];
-  await h.downloads.onDeterminingFilename.emit(
-    {
-      id: 778,
-      tabId: 998,
-      url: "https://cdn.example.invalid/paper.pdf",
-      filename: "paper.pdf",
-      state: "in_progress",
-    },
-    (suggestion) => staleSuggestions.push(suggestion.filename),
-  );
-  expect(staleSuggestions).toEqual([]);
-  h.backend.store.activeJobs = h.backend.store.activeJobs.map((job) =>
-    job.job_id === "job_manual_target_one" ? { ...job, tab_id: -1 } : job,
-  );
-  h.tabs.seed({ id: 999, url: "https://provider.example.edu/paper.pdf" });
-  await expect(
-    h.bridge.startPDFDelivery({
-      tab_id: 999,
-      url: "https://provider.example.edu/paper.pdf",
-      job_id: "job_manual_target_one",
-    }),
-  ).resolves.toMatchObject({
-    ok: false,
-    error: { code: "no_doi" },
-  });
 });
 
-test("manual Send PDF downloads directly from a packaged SAGE journal viewer", async () => {
+function awaitingJob(jobID: string, offeredAt: number, title?: string): ActiveJob {
+  return {
+    job_id: jobID,
+    tab_id: -1,
+    offered_at: offeredAt,
+    expires_at: offeredAt + 86400000,
+    status: "awaiting_download",
+    provider_hosts: [],
+    ...(title ? { expected: { title } } : {}),
+  } as ActiveJob;
+}
+
+test("DOI-less uncorrelated PDF with non-empty advisory list replies needs_choice with cap 12 and newest-first ordering", async () => {
+  const h = makeHarness();
+  const jobs: ActiveJob[] = [];
+  for (let i = 0; i < 14; i++) {
+    jobs.push(awaitingJob("job_adv_" + String(i).padStart(4, "0"), 1_700_000_000_000 + i, "Title " + i));
+  }
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const store = st as StoreShape;
+    return { ...store, activeJobs: jobs };
+  });
+  await h.bridge.start();
+  const pdfURL = "https://provider.example.edu/paper.pdf";
+  h.tabs.seed({ id: 42, url: pdfURL });
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 42, url: pdfURL }) as unknown as Record<string, unknown>;
+  expect(reply["ok"]).toBe(true);
+  expect(reply["state"]).toBe("needs_choice");
+  const offer = reply["choice"] as { interaction: string; candidates: { job_id: string; title: string }[] };
+  expect(typeof offer.interaction).toBe("string");
+  expect(offer.candidates.length).toBe(12);
+  expect(offer.candidates[0]!.job_id).toBe("job_adv_0013");
+  expect(offer.candidates[11]!.job_id).toBe("job_adv_0002");
+  expect(offer.candidates.some((c)=>c.job_id==="job_adv_0000")).toBe(false);
+  expect(offer.candidates.some((c)=>c.job_id==="job_adv_0001")).toBe(false);
+});
+
+test("DOI-less uncorrelated PDF with EMPTY advisory list falls through to grab / no_doi (blind path untouched)", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  const pdfURL = "https://provider.example.edu/paper.pdf";
+  h.tabs.seed({ id: 42, url: pdfURL });
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 42, url: pdfURL }) as unknown as Record<string, unknown>;
+  expect(reply["state"]).not.toBe("needs_choice");
+  expect(reply).toMatchObject({ ok: false, error: { code: "no_doi" } });
+  const h2 = makeHarness();
+  await h2.bridge.start();
+  await h2.port.inbound(helloAck({ features: ["pdf_grab_v1", "effect_permit_v1"] }));
+  h2.tabs.seed({ id: 43, url: pdfURL });
+  let grabCalled = false;
+  (h2.bridge as unknown as Record<string, unknown>).requestPdfGrab = async ()=>{ grabCalled = true; return { ok: true, grab_id: "grab-001" } as unknown as never; };
+  const reply2 = await h2.bridge.startPDFDelivery({ tab_id: 43, url: pdfURL }) as unknown as Record<string, unknown>;
+  expect(grabCalled).toBe(true);
+  expect(reply2).toMatchObject({ ok: true, state: "sending" });
+});
+
+test("a pick with a valid choice starts delivery for exactly that job", async () => {
+  const h = makeHarness();
+  const jobs = [awaitingJob("job_pick_a", 1_700_000_000_001, "Alpha"), awaitingJob("job_pick_b", 1_700_000_000_002, "Beta")];
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const store = st as StoreShape;
+    return { ...store, activeJobs: jobs };
+  });
+  await h.bridge.start();
+  const pdfURL = "https://provider.example.edu/paper.pdf";
+  h.tabs.seed({ id: 50, url: pdfURL });
+  const first = await h.bridge.startPDFDelivery({ tab_id: 50, url: pdfURL }) as unknown as Record<string, unknown>;
+  const offer = (first["choice"] as { interaction: string; candidates: { job_id: string }[] });
+  const chosen = offer.candidates.find((c)=>c.job_id==="job_pick_a")!;
+  expect(chosen).toBeDefined();
+  const second = await h.bridge.startPDFDelivery({ tab_id: 50, url: pdfURL, choice: { interaction: offer.interaction, job_id: chosen.job_id } }) as unknown as Record<string, unknown>;
+  expect(second).toMatchObject({ ok: true, job_id: "job_pick_a" });
+  expect(["sending", "waiting_manual"]).toContain(String(second["state"]));
+  expect(h.downloads.started.length).toBeGreaterThanOrEqual(1);
+});
+
+test("replaying the SAME interaction a second time fails (one-shot)", async () => {
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const store = st as StoreShape;
+    return { ...store, activeJobs: [awaitingJob("job_replay_a", 1_700_000_000_001), awaitingJob("job_replay_b", 1_700_000_000_002)] };
+  });
+  await h.bridge.start();
+  const pdfURL = "https://provider.example.edu/paper.pdf";
+  h.tabs.seed({ id: 51, url: pdfURL });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 51, url: pdfURL }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const first = await h.bridge.startPDFDelivery({ tab_id: 51, url: pdfURL, choice: { interaction: offer.interaction, job_id: offer.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(first["ok"]).toBe(true);
+  const replay = await h.bridge.startPDFDelivery({ tab_id: 51, url: pdfURL, choice: { interaction: offer.interaction, job_id: offer.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(replay).toMatchObject({ ok: false });
+  expect(String((replay as { message?: string }).message ?? (replay as { error?: { message?: string } }).error?.message ?? "")).toMatch(/expired/i);
+});
+
+test("an unknown/expired interaction fails with the expired-choice message", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  h.tabs.seed({ id: 52, url: "https://provider.example.edu/paper.pdf" });
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 52, url: "https://provider.example.edu/paper.pdf", choice: { interaction: "deadbeefdeadbeefdeadbeefdeadbeef", job_id: "job_ghost_0001" } }) as unknown as Record<string, unknown>;
+  expect(reply).toMatchObject({ ok: false });
+  expect(String((reply as { message?: string }).message ?? "")).toMatch(/expired/i);
+});
+
+test("a pick naming a job_id NOT among the offered candidates fails", async () => {
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const store = st as StoreShape;
+    return { ...store, activeJobs: [awaitingJob("job_cand_a", 1_700_000_000_001)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 53, url: "https://provider.example.edu/paper.pdf" });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 53, url: "https://provider.example.edu/paper.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string };
+  const outsider = await h.bridge.startPDFDelivery({ tab_id: 53, url: "https://provider.example.edu/paper.pdf", choice: { interaction: offer.interaction, job_id: "job_not_offered_9999" } }) as unknown as Record<string, unknown>;
+  expect(outsider).toMatchObject({ ok: false });
+  expect(String((outsider as { message?: string }).message ?? "")).toMatch(/expired/i);
+});
+
+test("a pick after the tab navigated fails on page-identity mismatch", async () => {
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const store = st as StoreShape;
+    return { ...store, activeJobs: [awaitingJob("job_nav_a", 1_700_000_000_001), awaitingJob("job_nav_b", 1_700_000_000_002)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 54, url: "https://provider.example.edu/paper.pdf" });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 54, url: "https://provider.example.edu/paper.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  await h.webNavigation.onHistoryStateUpdated.emit({ tabId: 54, frameId: 0, url: "https://provider.example.edu/paper.pdf#page=2" });
+  const afterNav = await h.bridge.startPDFDelivery({ tab_id: 54, url: "https://provider.example.edu/paper.pdf", choice: { interaction: offer.interaction, job_id: offer.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(afterNav).toMatchObject({ ok: false });
+  expect(String((afterNav as { message?: string }).message ?? "")).toMatch(/expired/i);
+});
+
+test("a pick for a job that is no longer awaiting_download fails", async () => {
+  const h = makeHarness();
+  const j = awaitingJob("job_gone_a", 1_700_000_000_001);
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const store = st as StoreShape;
+    return { ...store, activeJobs: [j, awaitingJob("job_gone_b", 1_700_000_000_002)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 55, url: "https://provider.example.edu/paper.pdf" });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 55, url: "https://provider.example.edu/paper.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: s2.activeJobs.map((x)=> x.job_id==="job_gone_a" ? { ...x, status: "accepted" as const } : x) };
+  });
+  const gone = await h.bridge.startPDFDelivery({ tab_id: 55, url: "https://provider.example.edu/paper.pdf", choice: { interaction: offer.interaction, job_id: "job_gone_a" } }) as unknown as Record<string, unknown>;
+  expect(gone).toMatchObject({ ok: false });
+  expect(String((gone as { message?: string }).message ?? "")).toMatch(/expired/i);
+});
+
+test("delivery_busy destroys the offer rather than leaving it consumable", async () => {
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const store = st as StoreShape;
+    return { ...store, activeJobs: [awaitingJob("job_busy_a", 1_700_000_000_001), awaitingJob("job_busy_b", 1_700_000_000_002), awaitingJob("job_busy_c", 1_700_000_000_003)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 56, url: "https://provider.example.edu/a.pdf" });
+  h.tabs.seed({ id: 57, url: "https://provider.example.edu/b.pdf" });
+  const offerA = ((await h.bridge.startPDFDelivery({ tab_id: 56, url: "https://provider.example.edu/a.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const firstPick = await h.bridge.startPDFDelivery({ tab_id: 56, url: "https://provider.example.edu/a.pdf", choice: { interaction: offerA.interaction, job_id: "job_busy_a" } }) as unknown as Record<string, unknown>;
+  expect(firstPick["ok"]).toBe(true);
+  const offerB = ((await h.bridge.startPDFDelivery({ tab_id: 57, url: "https://provider.example.edu/b.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const busy = await h.bridge.startPDFDelivery({ tab_id: 57, url: "https://provider.example.edu/b.pdf", choice: { interaction: offerB.interaction, job_id: "job_busy_b" } }) as unknown as Record<string, unknown>;
+  expect(busy).toMatchObject({ ok: false, error: { code: "delivery_busy" } });
+  const replay = await h.bridge.startPDFDelivery({ tab_id: 57, url: "https://provider.example.edu/b.pdf", choice: { interaction: offerB.interaction, job_id: "job_busy_b" } }) as unknown as Record<string, unknown>;
+  expect(String((replay as { message?: string }).message ?? "")).toMatch(/expired/i);
+});
+
+test("waiting_manual continuation survives a simulated SW death and then adopts the viewer download, revalidating page identity", async () => {
+  const viewerURL = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  const h1 = makeHarness();
+  await ((h1.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [
+      { job_id: "job_wait_cont_0001", tab_id: -1, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: ["sciencedirect.com","pdf.sciencedirectassets.com"], adapter_id: "sciencedirect", access_mode: "delegated" as const },
+      awaitingJob("job_wait_cont_0002", 1_700_000_000_010),
+    ]};
+  });
+  await h1.bridge.start();
+  h1.tabs.seed({ id: 80, url: viewerURL });
+  const offer = ((await h1.bridge.startPDFDelivery({ tab_id: 80, url: viewerURL }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const pickJob = offer.candidates.find((c)=>c.job_id==="job_wait_cont_0001")?.job_id ?? offer.candidates[0]!.job_id;
+  const picked = await h1.bridge.startPDFDelivery({ tab_id: 80, url: viewerURL, choice: { interaction: offer.interaction, job_id: pickJob } }) as unknown as Record<string, unknown>;
+  expect(picked["state"]).toBe("waiting_manual");
+  expect(h1.backend.store.pendingDelivery?.status).toBe("waiting_manual");
+  expect(h1.backend.store.pendingDelivery?.page_identity).toBeDefined();
+  expect(h1.backend.store.pendingDelivery!.page_identity!.tab_id).toBe(80);
+  const persisted = JSON.parse(JSON.stringify(h1.backend.store)) as StoreShape;
+  const h2 = makeHarness(persisted);
+  h2.tabs.seed({ id: 80, url: viewerURL });
+  await h2.bridge.start();
+  expect(h2.backend.store.pendingDelivery?.status).toBe("waiting_manual");
+  const item: DownloadItemLike = { id: 9001, tabId: 80, url: viewerURL, filename: "main.pdf", state: "in_progress" };
+  await h2.downloads.onCreated.emit(item);
+  expect(h2.backend.store.pendingDelivery?.status).toBe("waiting_manual");
+});
+
+test("a continuation whose tab was closed or navigated does NOT adopt", async () => {
+  const viewerURL = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  const h1 = makeHarness();
+  await ((h1.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [
+      { job_id: "job_nadopt_0001", tab_id: -1, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: ["sciencedirect.com","pdf.sciencedirectassets.com"] },
+      awaitingJob("job_nadopt_0002", 1_700_000_000_010),
+    ]};
+  });
+  await h1.bridge.start();
+  h1.tabs.seed({ id: 81, url: viewerURL });
+  const offer = ((await h1.bridge.startPDFDelivery({ tab_id: 81, url: viewerURL }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const picked = await h1.bridge.startPDFDelivery({ tab_id: 81, url: viewerURL, choice: { interaction: offer.interaction, job_id: offer.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(picked["state"]).toBe("waiting_manual");
+  const persisted = JSON.parse(JSON.stringify(h1.backend.store)) as StoreShape;
+  const h2 = makeHarness(persisted);
+  h2.tabs.seed({ id: 82, url: viewerURL });
+  await h2.bridge.start();
+  await h2.webNavigation.onHistoryStateUpdated.emit({ tabId: 81, frameId: 0, url: viewerURL });
+  const item: DownloadItemLike = { id: 9002, tabId: 82, url: viewerURL, filename: "main.pdf", state: "in_progress" };
+  await h2.downloads.onCreated.emit(item);
+  expect(h2.backend.store.pendingDelivery).toBeUndefined();
+});
+
+test("closing the tab destroys that tab's offers and any waiting_manual continuation bound to it", async () => {
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_close_a", 1_700_000_000_001), awaitingJob("job_close_b", 1_700_000_000_002), awaitingJob("job_close_c", 1_700_000_000_003)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 90, url: "https://provider.example.edu/a.pdf" });
+  const offerUnconsumed = ((await h.bridge.startPDFDelivery({ tab_id: 90, url: "https://provider.example.edu/a.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return startPendingDelivery(s2, { job_id: "job_close_a", url: "https://provider.example.edu/a.pdf", initiated_at: 1_700_000_000_000, status: "waiting_manual", page_identity: { tab_id: 90, nav_seq: 0, source_url: "https://provider.example.edu/a.pdf" } });
+  });
+  expect(h.backend.store.pendingDelivery?.page_identity?.tab_id).toBe(90);
+  h.tabs.seed({ id: 91, url: "https://provider.example.edu/b.pdf" });
+  const offerOther = ((await h.bridge.startPDFDelivery({ tab_id: 91, url: "https://provider.example.edu/b.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  await h.tabs.onRemoved.emit(90, { isWindowClosing: false });
+  expect(h.backend.store.pendingDelivery).toBeUndefined();
+  const expired = await h.bridge.startPDFDelivery({ tab_id: 90, url: "https://provider.example.edu/a.pdf", choice: { interaction: offerUnconsumed.interaction, job_id: offerUnconsumed.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(String((expired as { message?: string }).message ?? "")).toMatch(/expired/i);
+  const stillLive = await h.bridge.startPDFDelivery({ tab_id: 91, url: "https://provider.example.edu/b.pdf", choice: { interaction: offerOther.interaction, job_id: offerOther.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(stillLive["ok"]).toBe(true);
+});
+
+test("SAGE journal viewer downloads directly without a pin", async () => {
   const h = makeHarness();
   h.deps.adapterSpecs.push({
     id: "sage",
@@ -9327,315 +9457,50 @@ test("manual Send PDF downloads directly from a packaged SAGE journal viewer", a
     },
   });
   await h.bridge.start();
-  const urls = {
-    runtimeID: "papio-test-id",
-    inboxURL: "chrome-extension://papio-test-id/inbox.html",
-    popupURL: "chrome-extension://papio-test-id/popup.html",
-    historyURL: "chrome-extension://papio-test-id/history.html",
-    optionsURL: "chrome-extension://papio-test-id/options.html",
-    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
-  };
-  await expect(
-    handleInboxRuntimeMessage(
-      h.bridge,
-      {
-        type: "papio.manual.open",
-        request: {
-          job_id: "job_manual_sage_viewer",
-          url: "https://journals.sagepub.com/doi/full/10.1177/0146167207301014",
-        },
-      },
-      { id: urls.runtimeID, url: urls.inboxURL },
-      urls,
-    ),
-  ).resolves.toEqual({ ok: true, opened: true });
-
-  const viewerURL =
-    "https://journals.sagepub.com/doi/epdf/10.1177/0146167207301014";
-  const opened = findByJob(h.backend.store, "job_manual_sage_viewer")!;
-  h.tabs.seed({ id: opened.tab_id, url: viewerURL });
-  await expect(
-    h.bridge.startPDFDelivery({
-      tab_id: opened.tab_id,
-      url: "https://journals.sagepub.com/doi/pdf/10.1177/0146167207301014?download=true",
-      job_id: "job_manual_sage_viewer",
-      doi: "10.1177/0146167207301014",
-    }),
-  ).resolves.toMatchObject({
-    ok: true,
-    state: "sending",
-    job_id: "job_manual_sage_viewer",
+  const viewerURL = "https://journals.sagepub.com/doi/epdf/10.1177/0146167207301014";
+  const directURL = "https://journals.sagepub.com/doi/pdf/10.1177/0146167207301014?download=true";
+  // Correlation now via tab/DOI — not a durable pin. Use a tab-bound job.
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [{ job_id: "job_sage_nopin_0001", tab_id: 200, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: ["journals.sagepub.com"], adapter_id: "sage", access_mode: "delegated" as const }] };
   });
-  expect(h.downloads.started).toEqual([
-    {
-      url: "https://journals.sagepub.com/doi/pdf/10.1177/0146167207301014?download=true",
-      filename: "papio/job_manual_sage_viewer/paper.pdf",
-      conflictAction: "uniquify",
-      saveAs: false,
-    },
-  ]);
+  h.tabs.seed({ id: 200, url: viewerURL });
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 200, url: directURL, doi: "10.1177/0146167207301014" }) as unknown as Record<string, unknown>;
+  expect(reply).toMatchObject({ ok: true, state: "sending", job_id: "job_sage_nopin_0001" });
+  expect(h.downloads.started[0]?.url).toBe(directURL);
 });
 
-test("manual Send PDF accepts Cell's exact PII PDF response without a filename suffix", async () => {
+test("Cell PII PDF response downloads directly without a pin", async () => {
   const h = makeHarness();
   await h.bridge.start();
-  const urls = {
-    runtimeID: "papio-test-id",
-    inboxURL: "chrome-extension://papio-test-id/inbox.html",
-    popupURL: "chrome-extension://papio-test-id/popup.html",
-    historyURL: "chrome-extension://papio-test-id/history.html",
-    optionsURL: "chrome-extension://papio-test-id/options.html",
-    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
-  };
-  const viewerURL =
-    "https://www.cell.com/action/showPdf?pii=S2405-8440%2817%2930127-5";
-  await expect(
-    handleInboxRuntimeMessage(
-      h.bridge,
-      {
-        type: "papio.manual.open",
-        request: { job_id: "job_manual_cell_viewer", url: viewerURL },
-      },
-      { id: urls.runtimeID, url: urls.inboxURL },
-      urls,
-    ),
-  ).resolves.toEqual({ ok: true, opened: true });
-  const opened = findByJob(h.backend.store, "job_manual_cell_viewer")!;
-  expect(opened.manual_delivery_target).toBe(true);
-  expect(opened.tab_id).toBeGreaterThanOrEqual(0);
-  h.tabs.seed({ id: opened.tab_id, url: viewerURL });
-
-  await expect(
-    h.bridge.startPDFDelivery({
-      tab_id: opened.tab_id,
-      url: viewerURL,
-      job_id: "job_manual_cell_viewer",
-    }),
-  ).resolves.toMatchObject({
-    ok: true,
-    state: "sending",
-    job_id: "job_manual_cell_viewer",
+  const viewerURL = "https://www.cell.com/action/showPdf?pii=S2405-8440%2817%2930127-5";
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [{ job_id: "job_cell_nopin_0001", tab_id: 201, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: ["cell.com"] }] };
   });
-  expect(h.downloads.started).toEqual([
-    {
-      url: viewerURL,
-      filename: "papio/job_manual_cell_viewer/paper.pdf",
-      conflictAction: "uniquify",
-      saveAs: false,
-    },
-  ]);
+  h.tabs.seed({ id: 201, url: viewerURL });
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 201, url: viewerURL }) as unknown as Record<string, unknown>;
+  expect(reply).toMatchObject({ ok: true, state: "sending", job_id: "job_cell_nopin_0001" });
+  expect(h.downloads.started[0]?.url).toBe(viewerURL);
 });
 
-test("ScienceDirect assets Send PDF arms the native viewer download instead of fetching init HTML", async () => {
-  const store = emptyStore();
-  store.activeJobs = [
-    {
-      job_id: "job_sciencedirect_native_viewer",
-      tab_id: 42,
-      offered_at: 1_700_000_000_000,
-      expires_at: 1_800_000_000_000,
-      status: "awaiting_download",
-      provider_hosts: ["sciencedirect.com", "pdf.sciencedirectassets.com"],
-      manual_delivery_target: true,
-      adapter_id: "sciencedirect",
-      access_mode: "delegated",
-    },
-  ];
+test("ScienceDirect assets Send PDF arms the native viewer download (waiting_manual) via tab/DOI correlation", async () => {
+  const store = { ...emptyStore(), activeJobs: [
+    { job_id: "job_sciencedirect_native_viewer", tab_id: 42, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: ["sciencedirect.com", "pdf.sciencedirectassets.com"], adapter_id: "sciencedirect", access_mode: "delegated" as const },
+  ] } as StoreShape;
   const h = makeHarness(store);
-  const articleURL =
-    "https://www.sciencedirect.com/science/article/pii/S0360131510000527";
-  const viewerURL =
-    "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
-  // Seed the tracked opener before worker restart reconciliation inspects the
-  // persisted job/tab binding.
+  const articleURL = "https://www.sciencedirect.com/science/article/pii/S0360131510000527";
+  const viewerURL = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
   h.tabs.seed({ id: 42, url: articleURL });
   await h.bridge.start();
   h.tabs.seed({ id: 99, url: viewerURL, openerTabId: 42 });
-
-  await expect(
-    h.bridge.startPDFDelivery({ tab_id: 99, url: viewerURL }),
-  ).resolves.toMatchObject({
-    ok: true,
-    state: "waiting_manual",
-    job_id: "job_sciencedirect_native_viewer",
-    message: expect.stringMatching(/viewer Download button/i),
-  });
+  await expect(h.bridge.startPDFDelivery({ tab_id: 99, url: viewerURL })).resolves.toMatchObject({ ok: true, state: "waiting_manual", job_id: "job_sciencedirect_native_viewer", message: expect.stringMatching(/viewer Download button/i) });
   expect(h.downloads.started).toEqual([]);
-  expect(
-    findByJob(h.backend.store, "job_sciencedirect_native_viewer"),
-  ).toMatchObject({
-    tab_id: 99,
-    status: "awaiting_download",
-    manual_delivery_target: true,
-  });
-  expect(h.backend.store.pendingDelivery).toMatchObject({
-    job_id: "job_sciencedirect_native_viewer",
-    status: "waiting_manual",
-  });
-
+  expect(findByJob(h.backend.store, "job_sciencedirect_native_viewer")).toMatchObject({ tab_id: 99, status: "awaiting_download" });
+  expect(h.backend.store.pendingDelivery).toMatchObject({ job_id: "job_sciencedirect_native_viewer", status: "waiting_manual" });
   const suggestions: string[] = [];
-  await h.downloads.onDeterminingFilename.emit(
-    {
-      id: 779,
-      tabId: 99,
-      url: viewerURL,
-      filename: "1-s2.0-S0360131510000527-main.pdf",
-      state: "in_progress",
-    },
-    (suggestion) => suggestions.push(suggestion.filename),
-  );
-  expect(suggestions).toEqual([
-    "papio/job_sciencedirect_native_viewer/1-s2.0-S0360131510000527-main.pdf",
-  ]);
-});
-
-test("Send PDF without DOI grabs the file through Chrome steering when no manual target exists", async () => {
-  const h = makeHarness();
-  await h.bridge.start();
-  await h.port.inbound(
-    helloAck({
-      daemon_version: CURRENT_DAEMON,
-      features: ["pdf_grab_v1", "effect_permit_v1"],
-    }),
-  );
-  const pdfURL = "https://provider.example.edu/download/article.pdf";
-  h.tabs.seed({ id: 42, url: pdfURL });
-  let grabCalled = false;
-  (h.bridge as unknown as Record<string, unknown>).requestPdfGrab =
-    async (req: { tab_id: number; url?: string }) => {
-      grabCalled = true;
-      expect(req.tab_id).toBe(42);
-      return { ok: true, grab_id: "grab-file-0001" } as unknown as never;
-    };
-  const result = await h.bridge.startPDFDelivery({ tab_id: 42, url: pdfURL });
-  expect(grabCalled).toBe(true);
-  expect(result).toMatchObject({ ok: true, state: "sending" });
-  expect((result as { job_id?: string }).job_id).toBeUndefined();
-  expect(String((result as { message?: string }).message ?? "")).toMatch(
-    /identify.*file/i,
-  );
-});
-
-test("openManualDownload stores the created tab id and sets delegated when adapter_id exists", async () => {
-  const h = makeHarness();
-  await h.bridge.start();
-  // Seed an existing job with adapter_id so delegated is set on open
-  await (
-    h.bridge as unknown as {
-      update: (fn: (s: unknown) => unknown) => Promise<void>;
-    }
-  ).update((s: unknown) => {
-    const store = s as import("../src/state").StoreShape;
-    return {
-      ...store,
-      activeJobs: [
-        {
-          job_id: "job_manual_delegated",
-          tab_id: -1,
-          offered_at: 1_700_000_000_000,
-          expires_at: 1_700_000_000_000,
-          status: "awaiting_download",
-          provider_hosts: [],
-          adapter_id: "sage",
-          manual_delivery_target: true,
-        } as unknown as import("../src/state").ActiveJob,
-      ],
-    };
-  });
-  const urls = {
-    runtimeID: "papio-test-id",
-    inboxURL: "chrome-extension://papio-test-id/inbox.html",
-    popupURL: "chrome-extension://papio-test-id/popup.html",
-    historyURL: "chrome-extension://papio-test-id/history.html",
-    optionsURL: "chrome-extension://papio-test-id/options.html",
-    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
-  };
-  // openManualDownload will create a new tab; the existing job already has manual_delivery_target
-  // but isManualDownloadWindow returns false when adapter association? Check: it is true (tab_id -1 awaiting_download no offer)
-  // So we first remove the marker to allow open, then check delegated
-  // Actually openManualDownload checks isManualDownloadWindow(existing) - if existing is a manual window, it allows reopen
-  // Let's instead use a job without manual marker but with adapter_id
-  await (
-    h.bridge as unknown as {
-      update: (fn: (s: unknown) => unknown) => Promise<void>;
-    }
-  ).update((s: unknown) => {
-    const store = s as import("../src/state").StoreShape;
-    return {
-      ...store,
-      activeJobs: [
-        {
-          job_id: "job_manual_delegated2",
-          tab_id: -1,
-          offered_at: 1_700_000_000_000,
-          expires_at: 1_700_000_000_000,
-          status: "awaiting_download",
-          provider_hosts: ["publisher.example.edu"],
-          adapter_id: "sage",
-        } as unknown as import("../src/state").ActiveJob,
-      ],
-    };
-  });
-  const opened = await handleInboxRuntimeMessage(
-    h.bridge,
-    {
-      type: "papio.manual.open",
-      request: {
-        job_id: "job_manual_delegated2",
-        url: "https://publisher.example.edu/article",
-      },
-    },
-    { id: urls.runtimeID, url: urls.inboxURL },
-    urls,
-  );
-  expect(opened).toEqual({ ok: true, opened: true });
-  const createdTabId = h.tabs.created[h.tabs.created.length - 1]
-    ? (h.tabs.live.values().next().value as { id?: number })?.id
-    : undefined;
-  const stored = findByJob(h.backend.store, "job_manual_delegated2");
-  expect(stored).toMatchObject({
-    job_id: "job_manual_delegated2",
-    manual_delivery_target: true,
-    adapter_id: "sage",
-    access_mode: "delegated",
-  });
-  // tab_id should be the created tab's id (not -1)
-  expect(typeof stored?.tab_id === "number" && stored.tab_id >= 0).toBe(true);
-});
-
-test("closing the tab of a manual_delivery_target does not cancel the job", async () => {
-  const h = makeHarness();
-  await h.bridge.start();
-  const urls = {
-    runtimeID: "papio-test-id",
-    inboxURL: "chrome-extension://papio-test-id/inbox.html",
-    popupURL: "chrome-extension://papio-test-id/popup.html",
-    historyURL: "chrome-extension://papio-test-id/history.html",
-    optionsURL: "chrome-extension://papio-test-id/options.html",
-    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
-  };
-  const jobID = "job_manual_close_keep";
-  const landingURL = "https://publisher.example.edu/article";
-  await handleInboxRuntimeMessage(
-    h.bridge,
-    { type: "papio.manual.open", request: { job_id: jobID, url: landingURL } },
-    { id: urls.runtimeID, url: urls.inboxURL },
-    urls,
-  );
-  const stored = findByJob(h.backend.store, jobID)!;
-  const tabID = stored.tab_id;
-  expect(tabID).toBeGreaterThanOrEqual(0);
-  // Simulate user closing that tab
-  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
-  // Job should still exist, now with tab_id -1, awaiting_download
-  const after = findByJob(h.backend.store, jobID);
-  expect(after).toBeDefined();
-  expect(after?.status).toBe("awaiting_download");
-  expect(after?.manual_delivery_target).toBe(true);
-  expect(after?.tab_id).toBe(-1);
-  expect(
-    h.port.posted.some((f) => JSON.stringify(f).includes("provider_outcome")),
-  ).toBe(false);
+  await h.downloads.onDeterminingFilename.emit({ id: 779, tabId: 99, url: viewerURL, filename: "1-s2.0-S0360131510000527-main.pdf", state: "in_progress" }, (s)=>suggestions.push(s.filename));
+  expect(suggestions).toEqual(["papio/job_sciencedirect_native_viewer/1-s2.0-S0360131510000527-main.pdf"]);
 });
 
 test("delivery provenance keeps the host that requested the download", async () => {

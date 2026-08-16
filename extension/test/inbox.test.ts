@@ -902,7 +902,7 @@ test("a successful handoff retry clears the prior inline failure", async () => {
   expect(attempts).toBe(2);
 });
 
-test("manual Open selects its existing job through the broker while watch links stay direct", async () => {
+test("manual Open is a plain tab open that binds nothing, while watch links stay direct", async () => {
   const manual = manualAction("action:manual-open", 1, "Manual link");
   manual.job_id = "job_manual_open_0001";
   manual.links = [{ rel: "landing", url: "https://example.test/manual" }];
@@ -911,27 +911,20 @@ test("manual Open selects its existing job through the broker while watch links 
   const fixture = snapshot([manual, hit], {
     counts: counts({ pending_total: 2, actions: 1, watch_hits: 1, retractions: 0 }),
   });
-  const page = await inboxDocument((message) => {
-    if (message.type === "papio.manual.open") return { ok: true, opened: true };
-    return snapshotReply(fixture, message);
-  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
 
   page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:manual-open'] [data-operation='open']")?.click();
   await settle();
-  expect(page.requests.filter((request) => request.type === "papio.manual.open")).toEqual([{
-    type: "papio.manual.open",
-    request: {
-      job_id: "job_manual_open_0001",
-      url: "https://example.test/manual",
-      title: "Manual link",
-    },
-  }]);
-  expect(page.document.getElementById("operation-status")?.textContent)
-    .toBe("Manual-download page opened. Send PDF will use this job.");
+  // The pre-pin is gone: Open no longer claims delivery authority for a job,
+  // so it sends no runtime message at all. The popup's own picker carries that
+  // intent at Send PDF time instead, where the researcher is actually looking
+  // at the PDF.
+  expect(page.requests.filter((request) => request.type === "papio.manual.open")).toEqual([]);
+  expect(page.opened).toContain("https://example.test/manual");
 
   page.document.querySelector<HTMLElement>("[data-triage-item-id='hit:open']")?.focus();
   key(page.document, "o");
-  expect(page.opened).toEqual(["https://doi.org/10.1234/watch"]);
+  expect(page.opened).toEqual(["https://example.test/manual", "https://doi.org/10.1234/watch"]);
 });
 
 test("a conflict leaves an inline refresh result and re-requests the snapshot", async () => {

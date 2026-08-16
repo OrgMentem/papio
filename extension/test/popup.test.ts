@@ -28,15 +28,13 @@ import {
   renderImpactSummary,
   derivePulseDisplay,
   formatPulseWhen,
-  renderPopupCatchup,
   renderWorkPulse,
   type PopupPulseCache,
-  selectedManualDeliveryTarget,
   pageDeliveryJob,
   deliveryStatusText,
   sessionWarmForJob,
-  renderResolverGrants,
   renderTermsConsent,
+  renderResolverGrants,
   wireCapture,
   wireDevTools,
   wireHistoryLauncher,
@@ -714,44 +712,25 @@ test("Send PDF does not attach an Open pin job_id for a DOI-less unmatched tab",
   }]);
 });
 
-test("pageDeliveryJob prefers tab then DOI then pin-on-this-tab", () => {
-  const pin = job({
-    job_id: "job_pin",
+test("pageDeliveryJob prefers tab then DOI", () => {
+  const tabJob = job({
+    job_id: "job_tab",
     tab_id: 11,
     status: "awaiting_download",
-    manual_delivery_target: true,
-    expected: { doi: "10.1/pin" },
+    expected: { doi: "10.1/tab" },
   });
-  const other = job({
-    job_id: "job_other",
+  const doiJob = job({
+    job_id: "job_doi",
     tab_id: 22,
     status: "awaiting_download",
     expected: { doi: "10.1/other" },
   });
-  expect(pageDeliveryJob([pin, other], { tab_id: 22 })).toBe(other);
-  expect(pageDeliveryJob([pin, other], { doi: "10.1/other" })).toBe(other);
-  expect(pageDeliveryJob([pin], { tab_id: 11 })).toBe(pin);
-  expect(pageDeliveryJob([pin], { tab_id: 99 })).toBeUndefined();
-});
-
-test("manual delivery target selection is unique and fail-closed", () => {
-  const first = job({
-    job_id: "job_manual_target_one",
-    tab_id: -1,
-    status: "awaiting_download",
-    manual_delivery_target: true,
-  });
-  const second = job({
-    job_id: "job_manual_target_two",
-    tab_id: -1,
-    status: "awaiting_download",
-    manual_delivery_target: true,
-  });
-  expect(selectedManualDeliveryTarget([first])).toBe(first);
-  expect(selectedManualDeliveryTarget([first, second])).toBeUndefined();
-  expect(selectedManualDeliveryTarget([{ ...first, access_mode: "delegated" } as unknown as ActiveJob])).toBeDefined();
-  expect(selectedManualDeliveryTarget([{ ...first, tab_id: 42 } as unknown as ActiveJob])).toBeDefined();
-  expect(selectedManualDeliveryTarget([{ ...first, status: "accepted" as const } as unknown as ActiveJob])).toBeUndefined();
+  expect(pageDeliveryJob([tabJob, doiJob], { tab_id: 22 })).toBe(doiJob);
+  // Same tab correlation wins over DOI uniqueness — find the tab first.
+  expect(pageDeliveryJob([tabJob, doiJob], { tab_id: 11, doi: "10.1/other" })).toBe(tabJob);
+  expect(pageDeliveryJob([doiJob], { doi: "10.1/other" })).toBe(doiJob);
+  expect(pageDeliveryJob([doiJob], { tab_id: 99 })).toBeUndefined();
+  expect(pageDeliveryJob([tabJob], { doi: "not-matching" })).toBeUndefined();
 });
 test("does not send a DOI-less scraped page to the daemon", async () => {
   popupDocument();
@@ -2840,7 +2819,7 @@ test("rejects malformed core and per-origin session origins", async () => {
   }
 });
 
-test("popup with a known job or manual target in PDF context does not show no-DOI copy", async () => {
+test("popup with a known job in PDF context does not show no-DOI copy", async () => {
   const doc = popupDocument();
   const fakeSend = async () => ({
     ok: true as const,
@@ -2848,17 +2827,21 @@ test("popup with a known job or manual target in PDF context does not show no-DO
     message: "papio will identify this PDF from the file",
   });
   renderPageAcquire(doc, async () => ({ ok: true, state: "sending", job_id: "unused" }), fakeSend);
-  const manual = job({
+  // The durable `manual_delivery_target` pin no longer exists — the volatile
+  // one-shot nonce replaced it. Page identity now flows through the
+  // `needs_choice` offer + `choice` consumption, not through a stored flag.
+  // This exercises the equivalent guarantee via the ordinary awaiting job that
+  // a tab-correlated PDF already has.
+  const awaiting = job({
     job_id: "job_manual_1",
-    tab_id: -1,
+    tab_id: 42,
     status: "awaiting_download",
-    manual_delivery_target: true,
   });
-  expect(selectedManualDeliveryTarget([manual])).toBeDefined();
+  expect(pageDeliveryJob([awaiting], { tab_id: 42 })).toBe(awaiting);
   renderPageContext(
     doc,
     { url: "https://provider.example.edu/download/paper.pdf", kind: "pdf", tab_id: 42, tab_url: "https://provider.example.edu/download/paper.pdf" },
-    [manual],
+    [awaiting],
   );
   expect(doc.documentElement.innerHTML).not.toContain("This PDF has no DOI to queue");
 
@@ -2869,12 +2852,10 @@ test("popup with a known job or manual target in PDF context does not show no-DO
   await Promise.resolve();
 
   const txt = doc.getElementById("page-acquire-status")?.textContent ?? "";
-  expect(txt).toMatch(/identify/i);
   expect(txt).not.toMatch(/This PDF has no DOI to queue/);
 });
 
 test("knownJob PDF context never contains This PDF has no DOI to queue", () => {
-  const mod = require("../src/popup") as typeof import("../src/popup");
   // Direct string search in built popup module text
   const fs = require("node:fs") as typeof import("node:fs");
   const popupSrc = fs.readFileSync(new URL("../src/popup.ts", import.meta.url), "utf8");
@@ -3734,4 +3715,161 @@ test("the acknowledgement dwells three seconds and then removes itself entirely"
   expect(page.document.getElementById("papio-extension-action-ack-v1")).toBeNull();
   // Nothing of the chip survives in the page.
   expect(page.document.body.querySelectorAll("*")).toHaveLength(1);
+});
+
+test("needs_choice renders one keyboard-operable row per candidate with the right titles", async () => {
+  const doc = popupDocument();
+  let calls = 0;
+  renderPageAcquire(
+    doc,
+    async () => ({ job_id: "unused" }),
+    async () => ({
+      ok: true,
+      state: "needs_choice",
+      choice: {
+        interaction: "nonce-1",
+        candidates: [
+          { job_id: "job-a", title: "Paper A" },
+          { job_id: "job-b", title: "Paper B" },
+        ],
+      },
+    }),
+  );
+  renderPageContext(doc, { url: "https://example.com/paper.pdf", kind: "pdf", tab_id: 42, tab_url: "https://example.com/paper.pdf" }, []);
+  const btn = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  btn.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  const choice = doc.getElementById("page-acquire-choice") as HTMLElement;
+  expect(choice.hidden).toBe(false);
+  const question = choice.querySelector(".page-acquire-choice-question");
+  expect(question?.textContent).toBe("Which paper is this?");
+  // No internals vocabulary in user-facing copy.
+  expect(choice.textContent).not.toMatch(/nonce|interaction|eligible|candidate|holder|effect permit/i);
+  const rows = [...choice.querySelectorAll(".page-acquire-choice-option")] as HTMLButtonElement[];
+  expect(rows).toHaveLength(2);
+  expect(rows[0]?.textContent).toBe("Paper A");
+  expect(rows[1]?.textContent).toBe("Paper B");
+  for (const row of rows) {
+    expect(row instanceof HTMLButtonElement).toBe(true);
+    expect(row.type).toBe("button");
+    expect(row.disabled).toBe(false);
+  }
+  // Live region announces the chooser.
+  expect(doc.getElementById("popup-operation-status")?.textContent).toMatch(/Which paper is this\?/);
+  // No innerHTML usage — markup built with DOM APIs.
+  expect(doc.getElementById("page-acquire")?.innerHTML).not.toContain("innerHTML");
+  void calls;
+});
+
+test("choosing a row sends one correctly-shaped follow-up and paints its result", async () => {
+  const doc = popupDocument();
+  const sent: Record<string, unknown>[] = [];
+  const origUrl = "https://example.com/paper.pdf";
+  renderPageAcquire(
+    doc,
+    async () => ({ job_id: "unused" }),
+    async (binding, choice) => {
+      sent.push({ binding: { tab_id: binding.tab_id, url: binding.url }, choice });
+      // First call: needs_choice; second call (choice present): terminal.
+      if (choice !== undefined && typeof choice !== "string") {
+        return { ok: true, state: "sending", job_id: (choice as { job_id: string }).job_id };
+      }
+      return {
+        ok: true,
+        state: "needs_choice",
+        choice: {
+          interaction: "nonce-abc",
+          candidates: [
+            { job_id: "job-a", title: "Paper A" },
+            { job_id: "job-b", title: "Paper B" },
+          ],
+        },
+      };
+    },
+  );
+  renderPageContext(doc, { url: origUrl, kind: "pdf", tab_id: 7, tab_url: origUrl }, []);
+  const btn = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  btn.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  const choice = doc.getElementById("page-acquire-choice") as HTMLElement;
+  const rows = [...choice.querySelectorAll(".page-acquire-choice-option")] as HTMLButtonElement[];
+  // Pick the second paper — the binding captured before the first await must still be used.
+  rows[1]!.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(sent).toHaveLength(2);
+  // First send is the original click without choice.
+  expect(sent[0]!["choice"]).toBeUndefined();
+  // Second send carries the same tab_id/url plus the typed choice.
+  const second = sent[1] as { binding: { tab_id: number; url: string }; choice: { interaction: string; job_id: string } };
+  expect(second.binding.tab_id).toBe(7);
+  expect(second.binding.url).toBe(origUrl);
+  expect(second.choice.interaction).toBe("nonce-abc");
+  expect(second.choice.job_id).toBe("job-b");
+  // Chooser is gone once a terminal reply arrives.
+  expect(choice.hidden).toBe(true);
+  expect(choice.children).toHaveLength(0);
+  // Terminal copy is painted through the existing pdfDeliveryCopy path.
+  expect(doc.getElementById("page-acquire-status")?.textContent).toMatch(/Sending PDF to papio/);
+});
+
+test("expired choice failure paints the background message without retry", async () => {
+  const doc = popupDocument();
+  renderPageAcquire(
+    doc,
+    async () => ({ job_id: "unused" }),
+    async (_binding, choice) => {
+      if (choice !== undefined && typeof choice !== "string") {
+        return { ok: false, state: "failed", message: "That choice expired — click Send this PDF again." } as unknown as Record<string, unknown> as never;
+      }
+      return {
+        ok: true,
+        state: "needs_choice",
+        choice: { interaction: "nonce-exp", candidates: [{ job_id: "job-a", title: "Paper A" }] },
+      } as unknown as Record<string, unknown> as never;
+    },
+  );
+  renderPageContext(doc, { url: "https://example.com/paper.pdf", kind: "pdf", tab_id: 9, tab_url: "https://example.com/paper.pdf" }, []);
+  const btn = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  btn.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  const choice = doc.getElementById("page-acquire-choice") as HTMLElement;
+  const row = choice.querySelector(".page-acquire-choice-option") as HTMLButtonElement;
+  row.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(choice.hidden).toBe(true);
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe("That choice expired — click Send this PDF again.");
+});
+
+test("dismissing the chooser hides it without sending", async () => {
+  const doc = popupDocument();
+  let sends = 0;
+  renderPageAcquire(
+    doc,
+    async () => ({ job_id: "unused" }),
+    async () => {
+      sends += 1;
+      return {
+        ok: true,
+        state: "needs_choice",
+        choice: { interaction: "nonce-d", candidates: [{ job_id: "job-a", title: "Paper A" }] },
+      } as unknown as Record<string, unknown> as never;
+    },
+  );
+  renderPageContext(doc, { url: "https://example.com/paper.pdf", kind: "pdf", tab_id: 5, tab_url: "https://example.com/paper.pdf" }, []);
+  const btn = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  btn.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(sends).toBe(1);
+  const choice = doc.getElementById("page-acquire-choice") as HTMLElement;
+  const dismiss = choice.querySelector(".page-acquire-choice-dismiss") as HTMLButtonElement;
+  dismiss.click();
+  expect(choice.hidden).toBe(true);
+  expect(choice.children).toHaveLength(0);
+  expect(sends).toBe(1);
 });

@@ -17,6 +17,12 @@ export class FakeEmitter<A extends unknown[]> {
   }
 }
 
+export class FakeWebNavigation {
+  readonly onHistoryStateUpdated = new FakeEmitter<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>();
+  readonly onReferenceFragmentUpdated = new FakeEmitter<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>();
+  readonly onTabReplaced = new FakeEmitter<[{ addedTabId: number; removedTabId: number }]>();
+}
+
 export type FakeTab = TabInfo & {
   muted?: boolean;
 };

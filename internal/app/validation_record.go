@@ -20,6 +20,7 @@ const (
 	validationPayloadRejected = "payload_rejected"
 	validationStructRejected  = "structure_rejected"
 	validationUnsafe          = "unsafe_content"
+	validationConclusiveDOI   = "conclusive_doi_mismatch"
 	validationIdentityReview  = "identity_review"
 	validationIdentityReject  = "identity_rejected"
 	validationIncomplete      = "validation_error"
@@ -29,7 +30,7 @@ const (
 // It mirrors validateCandidate's branch order exactly — the first matching arm
 // wins there too — so the recorded verdict cannot disagree with the transition
 // the job actually took.
-func validationVerdict(report pdf.ValidationReport, activeContent, needsIdentityReview bool) string {
+func validationVerdict(report pdf.ValidationReport, activeContent, needsIdentityReview bool, conclusiveDOIBlocks bool) string {
 	switch {
 	case report.Structural.Encrypted || activeContent:
 		return validationUnsafe
@@ -37,6 +38,8 @@ func validationVerdict(report pdf.ValidationReport, activeContent, needsIdentity
 		return validationPayloadRejected
 	case !report.Structural.Valid:
 		return validationStructRejected
+	case conclusiveDOIBlocks:
+		return validationConclusiveDOI
 	case needsIdentityReview:
 		return validationIdentityReview
 	case report.Identity.Result != pdf.IdentityPass:

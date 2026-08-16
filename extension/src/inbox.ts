@@ -2822,46 +2822,16 @@ async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
   }
 }
 
-/** Open the manual row through the broker rather than window.open. Besides
- * opening the same safe daemon-provided link, this records the researcher's
- * explicit job choice so a later Send PDF can bind DOI-less bytes to the
- * existing action even when the PDF opens in another tab or from local disk. */
 async function requestManualDownloadOpen(item: TriageSnapshotItem): Promise<void> {
-  const jobID = manualDownloadJobID(item);
   const url = firstSafeLink(item);
-  if (jobID === null || url === null) {
+  if (url === null) {
     openFailure(item, {
-      error: {
-        message:
-          jobID === null
-            ? "This manual download is missing its job identifier."
-            : "This manual download has no safe link to open.",
-      },
+      error: { message: "This manual download has no safe link to open." },
     });
     return;
   }
-  if (state.pending.has(item.id)) return;
-  state.pending.add(item.id);
-  render();
-  try {
-    const response = await runtimeMessage("papio.manual.open", {
-      job_id: jobID,
-      url,
-      title: item.title,
-    });
-    state.pending.delete(item.id);
-    if (!isRecord(response) || response["ok"] !== true || response["opened"] !== true) {
-      openFailure(item, response);
-      return;
-    }
-    operationMessage(item.id, "Manual-download page opened. Send PDF will use this job.", "info");
-    render();
-  } catch (error) {
-    state.pending.delete(item.id);
-    const message = error instanceof Error ? error.message : "The browser broker is unavailable.";
-    setConnection(false, message);
-    openFailure(item, { error: { message } }, "offline");
-  }
+  openNewTab(url);
+  announce("Opened the manual-download link in a new tab.");
 }
 
 

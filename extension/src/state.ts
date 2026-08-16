@@ -14,6 +14,16 @@ import type { FederatedClaimPhase } from "./federated-claim";
 export type JobStatus =
   "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
 
+/** Exact page identity frozen at the operator's Send-PDF time. Survives SW
+ * restart inside `pendingDelivery` so the viewer's later Download click cannot
+ * be borrowed by a later page in the same tab_id. */
+export interface PageIdentity {
+  tab_id: number;
+  document_id?: string;
+  nav_seq: number;
+  source_url: string;
+}
+
 /** Browser-managed delivery correlation. The source URL is worker-local and
  * intentionally omitted by the managed-state migration/serializer. */
 export type PendingDeliveryStatus =
@@ -32,6 +42,10 @@ export interface PendingDelivery {
   /** Session evidence available at the moment the delivery was requested,
    * frozen alongside page_host. */
   session_evidence?: DeliverySessionEvidence;
+  /** Exact page binding for the one authority-bearing continuation that must
+   * survive SW restart. Present only on `waiting_manual` records produced by
+   * the nonce picker. */
+  page_identity?: PageIdentity;
 }
 
 /** Durable, informed user choice for auto-accepting publisher terms &
@@ -199,11 +213,6 @@ export interface ActiveJob {
    * correlated without persisting a page URL, referrer, or live host. */
   download_initiated?: boolean;
   adapter_id?: string;
-  /** Explicit operator intent from opening a manual-download inbox row. At
-   * most one active job may carry this marker. It binds the popup's next
-   * Send PDF action to an existing job even when the PDF has no embedded DOI
-   * and opens in a different tab from the provider page. */
-  manual_delivery_target?: boolean;
   /** Consecutive `unknown` classification streak, and the epoch-ms of the
    * streak's first observation, for the 2×(≥5s apart) ui_changed debounce. */
   unknown_count?: number;
@@ -844,13 +853,8 @@ export function findByTab(
   return store.activeJobs.find((j) => j.tab_id === tabID);
 }
 
-/** Insert or replace a job by `job_id`. An operator-selected manual delivery
- * window is pinned until its action closes or delivery removes it: later
- * daemon offers describe available automation, but cannot revoke the user's
- * explicit choice while they navigate, download, and reopen a PDF. */
+/** Insert or replace a job by `job_id`. */
 export function upsertJob(store: StoreShape, job: ActiveJob): StoreShape {
-  const current = findByJob(store, job.job_id);
-  if (current?.manual_delivery_target === true) return store;
   const activeJobs = store.activeJobs.filter((j) => j.job_id !== job.job_id);
   activeJobs.push(job);
   return { ...store, activeJobs };
@@ -1182,7 +1186,10 @@ function migratedJob(
   delete migrated.institution_claim_key;
   delete migrated.waiting_for_session_key;
   delete migrated.direct_envelope;
-  delete migrated.manual_delivery_target;
+  // The pin the picker replaced. A blob persisted before the cutover still
+  // carries it through the spread above, and it must not survive as untyped
+  // ambient delivery authority.
+  delete (migrated as unknown as UnknownRecord).manual_delivery_target;
   if (isFiniteNumber(value.auth_started_ms))
     migrated.auth_started_ms = value.auth_started_ms;
   const expectedRaw = value.expected;
@@ -1243,12 +1250,6 @@ function migratedJob(
     migrated.fresh_handoff = value.fresh_handoff;
   if (typeof value.download_initiated === "boolean")
     migrated.download_initiated = value.download_initiated;
-  if (
-    value.manual_delivery_target === true &&
-    value.status === "awaiting_download"
-  ) {
-    migrated.manual_delivery_target = true;
-  }
   const unknownCount = value.unknown_count;
   if (isFiniteNumber(unknownCount) && Number.isInteger(unknownCount))
     migrated.unknown_count = unknownCount;
@@ -1274,7 +1275,6 @@ function migratedJob(
   if (typeof value.handoffAckPending === "boolean")
     migrated.handoffAckPending = value.handoffAckPending;
   if (droppedWaitAuthority) {
-    // The old claim owner/key is deliberately not retained. Clear every
     // marker that depended on it so startup reconciliation sees a normal
     // schedulable job, while preserving its safe tab/job correlation above.
     const migratedRecord = migrated as unknown as UnknownRecord;
@@ -1328,6 +1328,36 @@ function migratedPendingDelivery(value: unknown): PendingDelivery | undefined {
     value.session_evidence === "none"
   ) {
     migrated.session_evidence = value.session_evidence;
+  }
+  const pageIdentity = value.page_identity;
+  if (isRecord(pageIdentity)) {
+    const tabId = pageIdentity["tab_id"];
+    const navSeq = pageIdentity["nav_seq"];
+    const sourceURL = pageIdentity["source_url"];
+    const documentId = pageIdentity["document_id"];
+    if (
+      typeof tabId === "number" &&
+      Number.isInteger(tabId) &&
+      tabId >= 0 &&
+      typeof navSeq === "number" &&
+      Number.isInteger(navSeq) &&
+      navSeq >= 0 &&
+      typeof sourceURL === "string" &&
+      sourceURL.length > 0 &&
+      sourceURL.length <= 4000
+    ) {
+      const pi: PageIdentity = {
+        tab_id: tabId,
+        nav_seq: navSeq,
+        source_url: sourceURL,
+        ...(typeof documentId === "string" && documentId.length > 0
+          ? { document_id: documentId }
+          : {}),
+      };
+      // Only waiting_manual continuations carry page identity; drop otherwise
+      // so a stale non-manual record cannot borrow manual authority.
+      if (migrated.status === "waiting_manual") migrated.page_identity = pi;
+    }
   }
   return migrated;
 }
@@ -1469,18 +1499,9 @@ function migratedState(raw: UnknownRecord): StoreShape {
       }
     }
   }
-  let activeJobs = validJobs.map((job) =>
+  const activeJobs = validJobs.map((job) =>
     migratedJob(job, droppedClaimOwnerJobIDs),
   );
-  if (
-    activeJobs.filter((job) => job.manual_delivery_target === true).length > 1
-  ) {
-    activeJobs = activeJobs.map((job) => {
-      if (job.manual_delivery_target !== true) return job;
-      const { manual_delivery_target: _target, ...unselected } = job;
-      return unselected as ActiveJob;
-    });
-  }
   const output: StoreShape = {
     ...emptyStore(),
     activeJobs,

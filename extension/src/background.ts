@@ -86,6 +86,7 @@ import {
   type MaterializationCorrelation,
   type MaterializationEvent,
   type MaterializationPhase,
+  type PageIdentity,
   type StateBackend,
   type StoreShape,
   TERMS_CONSENT_KEY,
@@ -870,6 +871,11 @@ export interface BridgeDeps {
     onActivated: Listenable<[{ tabId: number; windowId: number }]>;
     group?(opts: { tabIds: number[]; groupId?: number }): Promise<number>;
   };
+  webNavigation?: {
+    onHistoryStateUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
+    onReferenceFragmentUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
+    onTabReplaced: Listenable<[{ addedTabId: number; removedTabId: number }]>;
+  };
   /** Extension-page broadcast channel (runtime.onMessage), distinct from tabs.sendMessage content-script delivery. */
   runtimeSendMessage?(message: object): Promise<unknown>;
   /** chrome.windows seam. When present (and the user setting allows), broker
@@ -1265,24 +1271,46 @@ interface ManualOpenPayload {
   title?: string;
 }
 
+export interface DeliveryChoice {
+  interaction: string;
+  job_id: string;
+}
+
+export interface DeliveryCandidate {
+  job_id: string;
+  title: string;
+}
+
+export interface DeliveryChoiceOffer {
+  interaction: string;
+  candidates: DeliveryCandidate[];
+}
+
 interface DeliveryStartPayload {
   tab_id: number;
   url: string;
   job_id?: string;
   doi?: string;
   title?: string;
+  choice?: DeliveryChoice;
 }
 
 type DeliveryState =
-  "sending" | "waiting_manual" | "downloaded" | "failed" | "adopted" | "idle";
+  | "sending"
+  | "waiting_manual"
+  | "downloaded"
+  | "failed"
+  | "adopted"
+  | "idle"
+  | "needs_choice";
 
 type DeliveryReply = BrokerReply<{
   state: DeliveryState;
   job_id?: string;
   duplicate?: boolean;
   message?: string;
+  choice?: DeliveryChoiceOffer;
 }>;
-
 function hostMatches(host: string, providerHosts: string[]): boolean {
   return providerHosts.some((h) => host === h || host.endsWith("." + h));
 }
@@ -2119,6 +2147,16 @@ export class Bridge {
   private lastDeliveryState:
     | { job_id: string; state: "adopted"; message: string; at: number }
     | undefined;
+  // Volatile one-shot nonce for DOI-less picker. Never persisted. Keyed by
+  // interaction nonce; value is frozen page identity + offered candidates.
+  private readonly deliveryChoiceNonces = new Map<
+    string,
+    { pageIdentity: PageIdentity; candidates: string[]; mintedAt: number }
+  >();
+  // Per-tab same-document navigation sequence. Invalidated on tab close/replace.
+  private readonly pageNavSeq = new Map<number, number>();
+  private readonly pageDocumentId = new Map<number, string | undefined>();
+  private webNavigationBound = false;
   /** Resolver-provided offer URLs are cached here after storage hydration. */
   private readonly offerURLs = new Map<string, string>();
   /** Institution Shibboleth entityIDs from job offers (login_entity_id), used to
@@ -4913,20 +4951,129 @@ export class Bridge {
       return undefined;
     return opener;
   }
-  private uniqueManualDeliveryTarget(): ActiveJob | undefined {
-    const targets = this.store.activeJobs.filter(
-      (job) =>
-        job.manual_delivery_target === true &&
-        job.status === "awaiting_download",
-    );
-    return targets.length === 1 ? targets[0] : undefined;
+  // Build current PageIdentity for tab. Guard for absence (no webNavigation).
+  private currentPageIdentity(tabId: number, sourceURL: string): PageIdentity {
+    return {
+      tab_id: tabId,
+      nav_seq: this.pageNavSeq.get(tabId) ?? 0,
+      source_url: sourceURL,
+      ...(this.pageDocumentId.get(tabId) !== undefined
+        ? { document_id: this.pageDocumentId.get(tabId)! }
+        : {}),
+    };
   }
-  /** Resolve the one operator-selected manual-download target. The marker is
-   * useful only on an inert, URL-free awaiting-download record; any broader
-   * shape could let stale autonomous authority borrow a later popup click. */
-  private manualDeliveryTarget(jobID: string): ActiveJob | undefined {
-    const pin = this.uniqueManualDeliveryTarget();
-    return pin?.job_id === jobID ? pin : undefined;
+
+  private pageIdentityMatches(a: PageIdentity, b: PageIdentity): boolean {
+    if (a.tab_id !== b.tab_id) return false;
+    if (a.nav_seq !== b.nav_seq) return false;
+    if (a.source_url !== b.source_url) return false;
+    // document_id present -> must match; absent on either side -> compare nav_seq only
+    if (a.document_id !== undefined && b.document_id !== undefined) {
+      if (a.document_id !== b.document_id) return false;
+    }
+    return true;
+  }
+
+  private advisoryCandidates(): DeliveryCandidate[] {
+    const candidates = this.store.activeJobs
+      .filter((j) => j.status === "awaiting_download")
+      .sort((a, b) => b.offered_at - a.offered_at)
+      .slice(0, 12)
+      .map((j) => ({ job_id: j.job_id, title: j.expected?.title?.trim() || j.job_id }));
+    return candidates;
+  }
+
+  private mintDeliveryChoice(pageIdentity: PageIdentity, candidates: DeliveryCandidate[]): DeliveryChoiceOffer {
+    const interaction = this.deps.randomUUID().replace(/-/g, "");
+    // Evict oldest if over cap
+    if (this.deliveryChoiceNonces.size >= 32) {
+      let oldestKey: string | undefined;
+      let oldestTime = Infinity;
+      for (const [k, v] of this.deliveryChoiceNonces) {
+        if (v.mintedAt < oldestTime) {
+          oldestTime = v.mintedAt;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey !== undefined) this.deliveryChoiceNonces.delete(oldestKey);
+    }
+    // Evict by age (10 min)
+    const now = this.deps.now();
+    for (const [k, v] of [...this.deliveryChoiceNonces]) {
+      if (now - v.mintedAt > 10 * 60_000) this.deliveryChoiceNonces.delete(k);
+    }
+    this.deliveryChoiceNonces.set(interaction, {
+      pageIdentity,
+      candidates: candidates.map((c) => c.job_id),
+      mintedAt: now,
+    });
+    return { interaction, candidates };
+  }
+
+  private consumeDeliveryChoice(choice: DeliveryChoice): { pageIdentity: PageIdentity; candidates: string[] } | undefined {
+    const entry = this.deliveryChoiceNonces.get(choice.interaction);
+    if (entry === undefined) return undefined;
+    // Delete BEFORE any await — one-shot.
+    this.deliveryChoiceNonces.delete(choice.interaction);
+    if (!entry.candidates.includes(choice.job_id)) return undefined;
+    return entry;
+  }
+
+  private destroyDeliveryChoiceState(): void {
+    this.deliveryChoiceNonces.clear();
+  }
+
+  private destroyDeliveryChoiceForTab(tabId: number): void {
+    for (const [k, v] of [...this.deliveryChoiceNonces]) {
+      if (v.pageIdentity.tab_id === tabId) this.deliveryChoiceNonces.delete(k);
+    }
+  }
+
+  private bindWebNavigation(): void {
+    if (this.webNavigationBound) return;
+    this.webNavigationBound = true;
+    try {
+      const wn = (globalThis as unknown as { chrome?: { webNavigation?: unknown } }).chrome?.webNavigation as
+        | {
+            onHistoryStateUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
+            onReferenceFragmentUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
+            onTabReplaced?: { addListener: (cb: (d: { addedTabId: number; removedTabId: number }) => void) => void };
+          }
+        | undefined;
+      // Also try deps.webNavigation
+      const depsWN = this.deps.webNavigation;
+      const nav = (depsWN as unknown) ?? wn;
+      if (nav === undefined || nav === null) return;
+      const n = nav as {
+        onHistoryStateUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
+        onReferenceFragmentUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
+        onTabReplaced?: { addListener: (cb: (d: { addedTabId: number; removedTabId: number }) => void) => void };
+      };
+      n.onHistoryStateUpdated?.addListener((d) => {
+        if (d.frameId !== 0) return;
+        const cur = this.pageNavSeq.get(d.tabId) ?? 0;
+        this.pageNavSeq.set(d.tabId, cur + 1);
+        if (d.documentId !== undefined) this.pageDocumentId.set(d.tabId, d.documentId);
+        this.destroyDeliveryChoiceForTab(d.tabId);
+      });
+      n.onReferenceFragmentUpdated?.addListener((d) => {
+        if (d.frameId !== 0) return;
+        const cur = this.pageNavSeq.get(d.tabId) ?? 0;
+        this.pageNavSeq.set(d.tabId, cur + 1);
+        if (d.documentId !== undefined) this.pageDocumentId.set(d.tabId, d.documentId);
+        this.destroyDeliveryChoiceForTab(d.tabId);
+      });
+      n.onTabReplaced?.addListener((d) => {
+        this.pageNavSeq.delete(d.removedTabId);
+        this.pageDocumentId.delete(d.removedTabId);
+        this.destroyDeliveryChoiceForTab(d.removedTabId);
+        this.destroyDeliveryChoiceForTab(d.addedTabId);
+        this.pageNavSeq.delete(d.addedTabId);
+        this.pageDocumentId.delete(d.addedTabId);
+      });
+    } catch {
+      // Runtime without webNavigation — degrade to undefined document_id.
+    }
   }
 
   private async startDeliveryDownload(
@@ -4991,6 +5138,93 @@ export class Bridge {
     payload: DeliveryStartPayload,
   ): Promise<DeliveryReply> {
     await this.ready;
+    // Choice accept path — handle before normal resolution, but after tab lookup
+    if (payload.choice !== undefined) {
+      const entry = this.consumeDeliveryChoice(payload.choice);
+      if (entry === undefined) {
+        return { ok: false, state: "failed", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+      }
+      // Revalidate before any await: job still awaiting_download, page identity still matches
+      const pickedJob = findByJob(this.store, payload.choice.job_id);
+      if (pickedJob === undefined || pickedJob.status !== "awaiting_download") {
+        return { ok: false, state: "failed", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+      }
+      // Page identity check: frozen vs live tab
+      let tabCheck: TabInfo | undefined;
+      try {
+        tabCheck = await this.deps.tabs.get(payload.tab_id);
+      } catch {
+        return { ok: false, state: "failed", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+      }
+      const liveIdentity: PageIdentity = {
+        tab_id: payload.tab_id,
+        nav_seq: this.pageNavSeq.get(payload.tab_id) ?? 0,
+        source_url: pdfSourceURL(payload.url || (typeof tabCheck.url === "string" ? tabCheck.url : payload.url)) ?? payload.url,
+        ...(this.pageDocumentId.get(payload.tab_id) !== undefined
+          ? { document_id: this.pageDocumentId.get(payload.tab_id)! }
+          : {}),
+      };
+      if (!this.pageIdentityMatches(entry.pageIdentity, liveIdentity)) {
+        return { ok: false, state: "failed", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+      }
+      this.destroyDeliveryChoiceForTab(payload.tab_id);
+      const tabURLForChoice = typeof tabCheck.url === "string" ? tabCheck.url : payload.url;
+      const viewerPDFURLForChoice = providerViewerPDFURL(tabURLForChoice, this.deps.adapterSpecs);
+      const urlForChoice = viewerPDFURLForChoice ?? pdfSourceURL(payload.url || tabURLForChoice);
+      const pending = this.store.pendingDelivery;
+      if (pending !== undefined && pending.status !== "failed" && pending.job_id !== pickedJob.job_id) {
+        return failure("delivery_busy", "Another PDF is already being sent to papio") as unknown as DeliveryReply;
+      }
+      if (pending?.job_id === pickedJob.job_id && pending.status !== "failed") {
+        return { ok: true, state: pending.status ?? "sending", job_id: pickedJob.job_id } as DeliveryReply;
+      }
+      if (requiresNativeViewerDownload(urlForChoice ?? "")) {
+        const message = "Use the PDF viewer Download button — papio will adopt that authorized file";
+        const deliveryPageHostAtStart = sanitizePageHost(tabURLForChoice);
+        const sessionEvidenceAtStart = this.currentSessionEvidence(pickedJob);
+        const pageIdentityForContinuation: PageIdentity = entry.pageIdentity;
+        await this.update((s) => {
+          const activeJobs = s.activeJobs.map((candidate) => {
+            if (candidate.job_id === pickedJob.job_id) {
+              return { ...candidate, tab_id: payload.tab_id, status: "awaiting_download" as const, download_initiated: false };
+            }
+            return candidate;
+          });
+          return startPendingDelivery(
+            { ...s, activeJobs },
+            {
+              job_id: pickedJob.job_id,
+              url: urlForChoice,
+              initiated_at: this.deps.now(),
+              status: "waiting_manual",
+              error: message,
+              ...(deliveryPageHostAtStart !== undefined ? { page_host: deliveryPageHostAtStart } : {}),
+              session_evidence: sessionEvidenceAtStart,
+              page_identity: pageIdentityForContinuation,
+            },
+          );
+        });
+        this.deliveryJobs.add(pickedJob.job_id);
+        this.lastDeliveryState = undefined;
+        return { ok: true, state: "waiting_manual", job_id: pickedJob.job_id, message } as DeliveryReply;
+      }
+      const deliveryPageHostAtStart = sanitizePageHost(tabURLForChoice);
+      const sessionEvidenceAtStart = this.currentSessionEvidence(pickedJob);
+      await this.update((s) =>
+        startPendingDelivery(s, {
+          job_id: pickedJob.job_id,
+          url: urlForChoice,
+          initiated_at: this.deps.now(),
+          status: "sending",
+          ...(deliveryPageHostAtStart !== undefined ? { page_host: deliveryPageHostAtStart } : {}),
+          session_evidence: sessionEvidenceAtStart,
+        }),
+      );
+      this.lastDeliveryState = undefined;
+      const started = await this.startDeliveryDownload(pickedJob.job_id, urlForChoice ?? payload.url);
+      if (!started) return failure("download_start", "Could not start the browser download") as unknown as DeliveryReply;
+      return { ok: true, state: "sending", job_id: pickedJob.job_id } as DeliveryReply;
+    }
     if (
       !Number.isSafeInteger(payload.tab_id) ||
       payload.tab_id < 0 ||
@@ -5018,34 +5252,17 @@ export class Bridge {
       findByTab(this.store, payload.tab_id) ??
       this.deliveryJobForOpener(tab) ??
       this.deliveryJobForDOI(doi);
-    if (job === undefined) {
-      const pin = this.uniqueManualDeliveryTarget();
-      if (pin !== undefined && pin.tab_id === payload.tab_id) {
-        job = pin;
-      } else if (payload.job_id !== undefined) {
-        const hinted = this.manualDeliveryTarget(payload.job_id);
-        const doiHint =
-          doi !== undefined &&
-          doi.trim() !== "" &&
-          hinted?.expected?.doi
-            ?.trim()
-            .toLowerCase()
-            .replace(/^doi:\s*/, "") ===
-            doi
-              .trim()
-              .toLowerCase()
-              .replace(/^doi:\s*/, "");
-        if (
-          hinted !== undefined &&
-          (hinted.tab_id === payload.tab_id || doiHint)
-        ) {
-          job = hinted;
-        }
-      }
-    }
     let duplicate = false;
     if (job === undefined) {
       if (doi === undefined || doi.trim() === "") {
+        // DOI-less uncorrelated: offer picker if candidates exist, else blind grab
+        const candidates = this.advisoryCandidates();
+        if (candidates.length > 0) {
+          const sourceURL = url ?? payload.url;
+          const pageIdentity = this.currentPageIdentity(payload.tab_id, sourceURL);
+          const offer = this.mintDeliveryChoice(pageIdentity, candidates);
+          return { ok: true, state: "needs_choice", choice: offer } as DeliveryReply;
+        }
         if (this.pdfGrabAvailable()) {
           const grab = await this.requestPdfGrab({
             tab_id: payload.tab_id,
@@ -5114,6 +5331,7 @@ export class Bridge {
       pending.status !== "failed" &&
       pending.job_id !== job.job_id
     ) {
+      this.destroyDeliveryChoiceForTab(payload.tab_id);
       return failure(
         "delivery_busy",
         "Another PDF is already being sent to papio",
@@ -5139,13 +5357,10 @@ export class Bridge {
               ...candidate,
               tab_id: payload.tab_id,
               status: "awaiting_download" as const,
-              manual_delivery_target: true,
               download_initiated: false,
             };
           }
-          if (candidate.manual_delivery_target !== true) return candidate;
-          const { manual_delivery_target: _target, ...unselected } = candidate;
-          return { ...unselected, tab_id: -1 } as ActiveJob;
+          return candidate;
         });
         return startPendingDelivery(
           { ...s, activeJobs },
@@ -5159,6 +5374,7 @@ export class Bridge {
               ? { page_host: deliveryPageHostAtStart }
               : {}),
             session_evidence: sessionEvidenceAtStart,
+            page_identity: this.currentPageIdentity(payload.tab_id, url ?? payload.url),
           },
         );
       });
@@ -5176,8 +5392,6 @@ export class Bridge {
     // interactive for the whole download, so this is the only moment the
     // page that actually produced these bytes is known for certain.
     const deliveryPageHostAtStart = sanitizePageHost(tabURL);
-    // Freeze session evidence too, for the same reason:
-    // store.authEvidenceByOrigin is live per-origin
     // state, not scoped to this tab or download, so an institutional probe
     // or sign-in landing anywhere in the browser during the multi-second
     // download must not retroactively credit this delivery.
@@ -5261,22 +5475,12 @@ export class Bridge {
       this.wakeEffectGovernor();
     }
   }
-  /** Open a manual-download row and bind the popup's next explicit Send PDF
-   * action to that existing job. The provider tab itself stays unowned: the
-   * PDF may open in another tab or from local disk, and retaining its tab id
-   * would make a close look like job cancellation. The only durable authority
-   * added here is the URL-free, unique manual_delivery_target marker. */
+  /** Plain tab open for manual-download rows: no delivery authority.
+   * Inbox "Open" is now just a link; the picker owns binding. */
   async openManualDownload(
     payload: ManualOpenPayload,
   ): Promise<BrokerReply<{ opened: true }>> {
     await this.ready;
-    const existing = findByJob(this.store, payload.job_id);
-    if (existing !== undefined && !this.isManualDownloadWindow(existing)) {
-      return failure(
-        "manual_target_busy",
-        "This job already has browser work in progress",
-      );
-    }
     const effectToken = this.claimEffectGovernor(payload.job_id);
     if (effectToken === undefined) {
       return failure(
@@ -5284,51 +5488,8 @@ export class Bridge {
         "Another browser action for this job is still finishing",
       );
     }
-    let opened: TabInfo | undefined;
-    let updated = false;
     try {
-      opened = await this.deps.tabs.create({ url: payload.url, active: true });
-      const now = this.deps.now();
-      const expected = {
-        ...(existing?.expected ?? {}),
-        ...(payload.title === undefined ? {} : { title: payload.title }),
-      };
-      const sourceHost = sanitizePageHost(payload.url);
-      const target: ActiveJob = {
-        job_id: payload.job_id,
-        tab_id: typeof opened?.id === "number" ? opened.id : -1,
-        offered_at: existing?.offered_at ?? now,
-        expires_at: existing?.expires_at ?? now,
-        status: "awaiting_download",
-        provider_hosts: [
-          ...new Set([
-            ...(existing?.provider_hosts ?? []),
-            ...(sourceHost === undefined ? [] : [sourceHost]),
-          ]),
-        ],
-        ...(existing?.adapter_id === undefined
-          ? {}
-          : {
-              adapter_id: existing.adapter_id,
-              access_mode: "delegated" as const,
-            }),
-        ...(Object.keys(expected).length === 0 ? {} : { expected }),
-        manual_delivery_target: true,
-      };
-      await this.update((store) => {
-        const activeJobs = store.activeJobs
-          .filter((job) => job.job_id !== payload.job_id)
-          .map((job) => {
-            if (job.manual_delivery_target !== true) return job;
-            // Demoting an explicit Open target must revoke its tab authority
-            // too. Keeping the old tab id lets a later native download on that
-            // tab outrank the newly selected job in correlate().
-            const { manual_delivery_target: _target, ...unselected } = job;
-            return { ...unselected, tab_id: -1 } as ActiveJob;
-          });
-        return { ...store, activeJobs: [...activeJobs, target] };
-      });
-      updated = true;
+      await this.deps.tabs.create({ url: payload.url, active: true });
     } catch {
       return failure(
         "tab_unavailable",
@@ -5337,12 +5498,6 @@ export class Bridge {
     } finally {
       this.releaseEffectGovernor(payload.job_id, effectToken, false);
       this.wakeEffectGovernor();
-    }
-    if (opened?.id === undefined || !updated) {
-      return failure(
-        "tab_unavailable",
-        "The manual-download page could not be opened",
-      );
     }
     return { ok: true, opened: true };
   }
@@ -9019,6 +9174,7 @@ export class Bridge {
     this.deps.tabs.onActivated.addListener(({ tabId }) => {
       return this.onTabActivated(tabId);
     });
+    this.bindWebNavigation();
     this.deps.downloads.onCreated.addListener((item) => {
       return this.onDownloadCreated(item);
     });
@@ -9343,35 +9499,7 @@ export class Bridge {
     job: ActiveJob,
     offerURL: string,
   ): Promise<void> {
-    let manualTargetPinned = false;
     await this.update((s) => {
-      const current = findByJob(s, job.job_id);
-      if (current?.manual_delivery_target === true) {
-        manualTargetPinned = true;
-        const mergedHosts = [
-          ...new Set([
-            ...(current.provider_hosts ?? []),
-            ...(job.provider_hosts ?? []),
-          ]),
-        ];
-        const mergedExpected = {
-          ...(current.expected ?? {}),
-          ...(job.expected ?? {}),
-        };
-        const patched = patchJob(s, job.job_id, {
-          provider_hosts: mergedHosts,
-          ...(Object.keys(mergedExpected).length > 0
-            ? { expected: mergedExpected }
-            : {}),
-          ...(job.adapter_id !== undefined
-            ? { adapter_id: job.adapter_id, access_mode: "delegated" as const }
-            : {}),
-        });
-        return {
-          ...patched,
-          offerURLs: { ...(s.offerURLs ?? {}), [job.job_id]: offerURL },
-        };
-      }
       const withJob = upsertJob(s, job);
       if (this.supportsFreshHandoffLinks() && job.requires_auth === true) {
         const offerURLs = { ...(s.offerURLs ?? {}) };
@@ -9384,11 +9512,9 @@ export class Bridge {
       };
     });
     this.offerURLs.set(job.job_id, offerURL);
-    if (manualTargetPinned) return;
     if (job.requires_auth === true)
       this.keepaliveManager?.learnResolver(offerURL);
   }
-  /** Persist a tabless job without retaining the resolver URL. */
   private async upsertJobWithoutOffer(job: ActiveJob): Promise<void> {
     this.offerURLs.delete(job.job_id);
     await this.update((s) => {
@@ -11903,48 +12029,6 @@ export class Bridge {
     // without its durable offer URL cannot represent an in-flight download:
     // discard that stale record so this offer recreates the real browser work.
     let existing = findByJob(this.store, jobID);
-    // Opening a manual-download inbox row is explicit operator intent. Re-offers
-    // may arrive throughout a long login/download/reopen path; acknowledge
-    // them, but never replace or reactivate the pinned manual target.
-    if (existing?.manual_delivery_target === true) {
-      const adapterID =
-        typeof p["adapter_id"] === "string" && p["adapter_id"].length > 0
-          ? p["adapter_id"]
-          : existing.adapter_id;
-      await this.update((s) => {
-        const current = findByJob(s, jobID);
-        if (current?.manual_delivery_target !== true) return s;
-        const mergedHosts = [
-          ...new Set([...(current.provider_hosts ?? []), ...providerHosts]),
-        ];
-        const mergedExpected = {
-          ...(current.expected ?? {}),
-          ...(expected ?? {}),
-        };
-        return patchJob(s, jobID, {
-          provider_hosts: mergedHosts,
-          ...(Object.keys(mergedExpected).length > 0
-            ? { expected: mergedExpected }
-            : {}),
-          ...(adapterID !== undefined
-            ? { adapter_id: adapterID, access_mode: "delegated" as const }
-            : {}),
-          ...(requiresAuth !== undefined
-            ? { requires_auth: requiresAuth }
-            : {}),
-          ...(offeredAccessMode !== undefined && adapterID === undefined
-            ? { access_mode: offeredAccessMode }
-            : {}),
-        });
-      });
-      this.offerURLs.set(jobID, openurl);
-      await this.update((s) => ({
-        ...s,
-        offerURLs: { ...(s.offerURLs ?? {}), [jobID]: openurl },
-      }));
-      this.send("job_accept", {}, jobID);
-      return;
-    }
     if (offeredEpoch !== undefined && existing !== undefined) {
       await this.update((s) => ({
         ...s,
@@ -15463,6 +15547,17 @@ export class Bridge {
 
   private async onTabRemoved(tabID: number): Promise<void> {
     await this.ready;
+    this.destroyDeliveryChoiceForTab(tabID);
+    this.pageNavSeq.delete(tabID);
+    this.pageDocumentId.delete(tabID);
+    // If pendingDelivery waiting_manual was bound to this tab, clear it — a later
+    // page in the same tab_id must never revive authority.
+    if (
+      this.store.pendingDelivery?.status === "waiting_manual" &&
+      this.store.pendingDelivery.page_identity?.tab_id === tabID
+    ) {
+      await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+    }
     const pageCaptureWaiter = this.pageCaptureLoadWaiters.get(tabID);
     if (pageCaptureWaiter !== undefined) pageCaptureWaiter(false);
     this.authCountedTabs.delete(tabID);
@@ -15513,11 +15608,6 @@ export class Bridge {
       await this.drainHandoffDriveQueue();
       return;
     }
-    if (job.manual_delivery_target === true) {
-      await this.update((s) => patchJob(s, job.job_id, { tab_id: -1 }));
-      await this.drainHandoffDriveQueue();
-      return;
-    }
     // Once the user is past authentication (awaiting_download), a closed tab is
     // NOT a cancel: a download may be in flight or already saved into the job's
     // adoption directory, where the daemon's poll-scan adopts it. Park it, as
@@ -15543,19 +15633,8 @@ export class Bridge {
       const byTab = findByTab(this.store, item.tabId);
       if (byTab) {
         if (this.isFirefoxClickDownload(byTab)) return undefined;
-        // Compatibility guard for persisted records created before Open
-        // demotion cleared tab_id. An unselected awaiting-download record
-        // has no authority to claim another PDF merely because its old tab
-        // id survived; current Open targets and initiated adapter downloads
-        // remain authoritative.
-        const staleManualTab =
-          byTab.status === "awaiting_download" &&
-          byTab.manual_delivery_target !== true &&
-          byTab.download_initiated !== true;
-        if (!staleManualTab) return byTab;
+        return byTab;
       }
-      // extension did not create; host matching below requires an advertised
-      // provider host or the job's persisted registry adapter.
     }
     const src = item.referrer ?? item.finalUrl ?? item.url;
     if (src === undefined || src.length === 0) return undefined;
@@ -15634,6 +15713,33 @@ export class Bridge {
       this.downloads.set(earlyJobID, early);
     }
     await this.ready;
+    // waiting_manual continuation must revalidate page identity before adopting
+    if (
+      this.store.pendingDelivery?.status === "waiting_manual" &&
+      this.store.pendingDelivery.page_identity !== undefined
+    ) {
+      const pi = this.store.pendingDelivery.page_identity;
+      const pendingJob = findByJob(this.store, this.store.pendingDelivery.job_id);
+      if (pendingJob === undefined || pendingJob.status !== "awaiting_download") {
+        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+        this.destroyDeliveryChoiceState();
+        return;
+      }
+      const liveNavSeq = this.pageNavSeq.get(pi.tab_id) ?? 0;
+      const liveDocId = this.pageDocumentId.get(pi.tab_id);
+      if (liveNavSeq !== pi.nav_seq || (pi.document_id !== undefined && liveDocId !== undefined && pi.document_id !== liveDocId)) {
+        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+        this.destroyDeliveryChoiceState();
+        return;
+      }
+      // Also ensure the download's tab matches the frozen tab_id when present
+      if (typeof item.tabId === "number" && item.tabId !== pi.tab_id) {
+        // Not the viewer tab — don't adopt via waiting_manual
+        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+        this.destroyDeliveryChoiceState();
+        return;
+      }
+    }
     const exactJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
     const job =
       exactJobID === undefined
@@ -16792,13 +16898,26 @@ function isSessionRetryRuntimeRequest(
   return isHandoffOpenRuntimeRequest(value);
 }
 
+function isDeliveryChoice(value: unknown): value is DeliveryChoice {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["interaction", "job_id"]))
+    return false;
+  return (
+    typeof value["interaction"] === "string" &&
+    value["interaction"].length >= 8 &&
+    value["interaction"].length <= 128 &&
+    isManualJobID(value["job_id"])
+  );
+}
+
 function isDeliveryStartRuntimeRequest(
   value: unknown,
 ): value is DeliveryStartPayload {
   if (
     !isObjectRecord(value) ||
-    !hasOnlyKeys(value, ["tab_id", "url", "job_id", "doi", "title"])
+    !hasOnlyKeys(value, ["tab_id", "url", "job_id", "doi", "title", "choice"])
   )
+    return false;
+  if (value["choice"] !== undefined && !isDeliveryChoice(value["choice"]))
     return false;
   return (
     typeof value["tab_id"] === "number" &&
@@ -17414,10 +17533,28 @@ function realDeps(): BridgeDeps {
           },
         }
       : {}),
+    ...(typeof chrome.webNavigation !== "undefined"
+      ? {
+          webNavigation: {
+            onHistoryStateUpdated: {
+              addListener: (cb) =>
+                chrome.webNavigation.onHistoryStateUpdated.addListener(cb as never),
+            },
+            onReferenceFragmentUpdated: {
+              addListener: (cb) =>
+                chrome.webNavigation.onReferenceFragmentUpdated.addListener(cb as never),
+            },
+            onTabReplaced: {
+              addListener: (cb) =>
+                chrome.webNavigation.onTabReplaced.addListener(cb as never),
+            },
+          },
+        }
+      : {}),
     downloads: {
-      download: (options) => chrome.downloads.download(options),
       removeFile: (downloadID) => chrome.downloads.removeFile(downloadID),
       erase: (query) => chrome.downloads.erase(query),
+      download: (options) => chrome.downloads.download(options),
       search: (query) => chrome.downloads.search(query),
       onCreated: {
         addListener: (cb) => chrome.downloads.onCreated.addListener(cb),

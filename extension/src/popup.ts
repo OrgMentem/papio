@@ -170,8 +170,25 @@ interface PageAcquireResponse {
   job_id?: string;
   duplicate?: boolean;
   error?: string | { code?: string; message?: string };
-  state?: "sending" | "downloaded" | "failed" | "adopted";
+  state?: "sending" | "downloaded" | "failed" | "adopted" | "needs_choice";
   message?: string;
+  ok?: boolean;
+  choice?: DeliveryChoiceOffer;
+}
+
+interface DeliveryChoice {
+  interaction: string;
+  job_id: string;
+}
+
+interface DeliveryCandidate {
+  job_id: string;
+  title: string;
+}
+
+interface DeliveryChoiceOffer {
+  interaction: string;
+  candidates: DeliveryCandidate[];
 }
 
 interface PageMetadata {
@@ -2915,23 +2932,27 @@ export async function acquireCurrentPage(binding: PageActionBinding): Promise<Pa
 
 /** Ask the broker to deliver the current PDF without opening another tab.
  * The broker joins by tab, then DOI, then an Open pin that owns this tab.
- * `targetJobID` is only a hint for that last case. */
+ * `choice` carries a volatile delivery interaction when the broker has asked
+ * the researcher to disambiguate a DOI-less PDF. A plain string is accepted
+ * for backward compatibility with existing callers and tests. */
 export async function sendCurrentPDF(
   binding: PageActionBinding,
-  targetJobID?: string,
+  choice?: DeliveryChoice | string,
 ): Promise<PageAcquireResponse> {
   if (!(await validatePageActionBinding(binding))) throw new Error(PAGE_CHANGED_MESSAGE);
   const page = binding;
   if (page.kind !== "pdf" && !isPDFPage(page.url)) {
     return { error: "No PDF detected on this page" };
   }
+  const choiceAsObject = typeof choice === "string" ? undefined : choice;
+  const jobIdHint = typeof choice === "string" ? choice : undefined;
   const result: unknown = await chrome.runtime.sendMessage({
-
     type: "papio.delivery.start",
     request: {
       tab_id: page.tab_id,
       url: pdfSourceURL(page.url),
-      ...(targetJobID ? { job_id: targetJobID } : {}),
+      ...(jobIdHint ? { job_id: jobIdHint } : {}),
+      ...(choiceAsObject !== undefined ? { choice: choiceAsObject } : {}),
       ...(page.doi ? { doi: page.doi } : {}),
       ...(page.title ? { title: page.title } : {}),
     },
@@ -3016,8 +3037,11 @@ function showAcquireFeedback(
   tone: PopupFeedbackTone,
 ): void {
   paintPopupResult(status, text === "" ? undefined : { generation: 0, ownerKey: "", phase: "result", text, tone });
+  clearDeliveryChoice(doc);
   const live = doc.getElementById("page-acquire-live");
-  section.hidden = status.hidden && !(live instanceof HTMLElement && !live.hidden);
+  const choice = doc.getElementById("page-acquire-choice");
+  const choiceVisible = choice instanceof HTMLElement && !choice.hidden;
+  section.hidden = status.hidden && !(live instanceof HTMLElement && !live.hidden) && !choiceVisible;
 }
 
 function paintPageAcquireResult(
@@ -3028,7 +3052,138 @@ function paintPageAcquireResult(
 ): void {
   paintPopupResult(status, popupOperation(doc, operationKey));
   const live = doc.getElementById("page-acquire-live");
-  section.hidden = status.hidden && !(live instanceof HTMLElement && !live.hidden);
+  const choice = doc.getElementById("page-acquire-choice");
+  const choiceVisible = choice instanceof HTMLElement && !choice.hidden;
+  section.hidden = status.hidden && !(live instanceof HTMLElement && !live.hidden) && !choiceVisible;
+}
+
+function clearDeliveryChoice(doc: Document): void {
+  const choiceEl = doc.getElementById("page-acquire-choice");
+  if (!(choiceEl instanceof HTMLElement)) return;
+  choiceEl.replaceChildren();
+  choiceEl.hidden = true;
+}
+
+function isDeliveryChoiceOffer(value: unknown): value is DeliveryChoiceOffer {
+  if (typeof value !== "object" || value === null) return false;
+  const o = value as Record<string, unknown>;
+  if (typeof o.interaction !== "string" || o.interaction.length === 0) return false;
+  if (!Array.isArray(o.candidates)) return false;
+  return (o.candidates as unknown[]).every(
+    (c) =>
+      typeof c === "object" &&
+      c !== null &&
+      typeof (c as Record<string, unknown>).job_id === "string" &&
+      typeof (c as Record<string, unknown>).title === "string",
+  );
+}
+
+function handleDeliveryResponse(
+  doc: Document,
+  section: HTMLElement,
+  status: HTMLElement,
+  button: HTMLButtonElement,
+  binding: PageActionBinding,
+  pageKey: string,
+  operationKey: string,
+  generation: number,
+  response: PageAcquireResponse,
+  onSendPDF: (binding: PageActionBinding, choice?: DeliveryChoice | string) => Promise<PageAcquireResponse>,
+  onAcknowledge: (binding: PageActionBinding, kind: InPageAcknowledgementKind) => Promise<void>,
+): void {
+  if (response.state === "needs_choice" && response.choice !== undefined && isDeliveryChoiceOffer(response.choice)) {
+    renderDeliveryChoice(doc, section, status, button, binding, pageKey, operationKey, generation, response.choice, onSendPDF, onAcknowledge);
+    return;
+  }
+  const copy = pdfDeliveryCopy(response);
+  if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, ...copy })) return;
+  clearDeliveryChoice(doc);
+  const deliveryPending = response.state === "sending" || response.state === "downloaded";
+  setAcquireButton(
+    button,
+    deliveryPending
+      ? response.duplicate === true
+        ? "Sending PDF for the existing job"
+        : "PDF sent to papio"
+      : "Send this PDF to papio",
+    deliveryPending,
+  );
+  paintPageAcquireResult(doc, section, status, operationKey);
+  announcePopupOperation(doc, copy.text);
+  const kind = acknowledgementKindFor(true, response);
+  if (kind !== undefined) void onAcknowledge(binding, kind);
+}
+
+function renderDeliveryChoice(
+  doc: Document,
+  section: HTMLElement,
+  status: HTMLElement,
+  button: HTMLButtonElement,
+  binding: PageActionBinding,
+  pageKey: string,
+  operationKey: string,
+  generation: number,
+  offer: DeliveryChoiceOffer,
+  onSendPDF: (binding: PageActionBinding, choice?: DeliveryChoice | string) => Promise<PageAcquireResponse>,
+  onAcknowledge: (binding: PageActionBinding, kind: InPageAcknowledgementKind) => Promise<void>,
+): void {
+  const choiceEl = doc.getElementById("page-acquire-choice");
+  if (!(choiceEl instanceof HTMLElement)) return;
+  paintPopupResult(status, undefined);
+  choiceEl.replaceChildren();
+  const question = doc.createElement("p");
+  question.className = "page-acquire-choice-question";
+  question.textContent = "Which paper is this?";
+  const list = doc.createElement("div");
+  list.className = "page-acquire-choice-list";
+  for (const candidate of offer.candidates) {
+    const row = doc.createElement("button");
+    row.type = "button";
+    row.className = "page-acquire-choice-option";
+    row.textContent = candidate.title;
+    row.addEventListener("click", () => {
+      for (const child of [...list.children]) {
+        if (child instanceof HTMLButtonElement) child.disabled = true;
+      }
+      const dismissBtn = choiceEl.querySelector(".page-acquire-choice-dismiss");
+      if (dismissBtn instanceof HTMLButtonElement) dismissBtn.disabled = true;
+      void onSendPDF(binding, { interaction: offer.interaction, job_id: candidate.job_id }).then(
+        (followUp) => {
+          handleDeliveryResponse(doc, section, status, button, binding, pageKey, operationKey, generation, followUp, onSendPDF, onAcknowledge);
+        },
+        (error: unknown) => {
+          const text = error instanceof Error ? error.message : "Could not send PDF to papio";
+          if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, text, tone: "degraded" })) return;
+          clearDeliveryChoice(doc);
+          setAcquireButton(button, "Send this PDF to papio", false);
+          paintPageAcquireResult(doc, section, status, operationKey);
+          announcePopupOperation(doc, text);
+        },
+      );
+    });
+    list.append(row);
+  }
+  const dismiss = doc.createElement("button");
+  dismiss.type = "button";
+  dismiss.className = "page-acquire-choice-dismiss ghost";
+  dismiss.textContent = "Not now";
+  dismiss.addEventListener("click", () => {
+    clearDeliveryChoice(doc);
+    if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, text: "", tone: "info" })) {
+      // Still hide the chooser even if the generation is stale.
+    } else {
+      paintPageAcquireResult(doc, section, status, operationKey);
+    }
+    setAcquireButton(button, "Send this PDF to papio", false);
+    const live = doc.getElementById("page-acquire-live");
+    section.hidden = status.hidden && !(live instanceof HTMLElement && !live.hidden);
+  });
+  choiceEl.append(question, list, dismiss);
+  choiceEl.hidden = false;
+  section.hidden = false;
+  setAcquireButton(button, "Send this PDF to papio", false);
+  paintPageAcquireResult(doc, section, status, operationKey);
+  announcePopupOperation(doc, "Which paper is this? Choose a paper to send this PDF to.");
 }
 
 export function pageOperationKey(binding: PageActionBinding, mode: "doi" | "pdf"): string {
@@ -3046,21 +3201,8 @@ function pdfDeliveryCopy(response: PageAcquireResponse): PopupResultCopy {
   const errorText = responseErrorMessage(response);
   const messageText = typeof response.message === "string" ? response.message : "";
   const hasIdentify = /identify|file/i.test(errorText) || /identify|file/i.test(messageText);
-  const isNoDOI = /no[_ -]?doi/i.test(errorText) || /no[_ -]?doi/i.test(messageText);
-  // With a manual target selected the broker would not answer no_doi, so that
-  // copy would be stale rather than informative.
-  let manualTargetSelected = false;
-  try {
-    const maybeJobs = (globalThis as unknown as { __papioLastJobs?: unknown }).__papioLastJobs;
-    if (Array.isArray(maybeJobs)) {
-      manualTargetSelected = selectedManualDeliveryTarget(maybeJobs as ActiveJob[]) !== undefined;
-    }
-  } catch {
-    // A missing job snapshot only costs this one copy refinement.
-  }
   if (hasIdentify && messageText) return { text: messageText, tone: "info" };
   if (hasIdentify && errorText) return { text: errorText, tone: "info" };
-  if (isNoDOI && manualTargetSelected) return { text: "Sending PDF to papio…", tone: "progress" };
   if (response.state === "sending") {
     return response.duplicate === true
       ? { text: "Sending PDF for the existing job", tone: "progress" }
@@ -3094,7 +3236,10 @@ function acknowledgementKindFor(
 export function renderPageAcquire(
   doc: Document,
   onAcquire: (binding: PageActionBinding) => Promise<PageAcquireResponse> = acquireCurrentPage,
-  onSendPDF: (binding: PageActionBinding) => Promise<PageAcquireResponse> = sendCurrentPDF,
+  onSendPDF: (
+    binding: PageActionBinding,
+    choice?: DeliveryChoice | string,
+  ) => Promise<PageAcquireResponse> = sendCurrentPDF,
   onAcknowledge: (
     binding: PageActionBinding,
     kind: InPageAcknowledgementKind,
@@ -3124,35 +3269,27 @@ export function renderPageAcquire(
     const pendingText = isPDF ? "Sending PDF to papio…" : "Acquiring…";
     const generation = beginPopupOperation(doc, operationKey, pageKey, pendingText);
     setAcquireButton(button, isPDF ? "Sending PDF to papio…" : "Acquiring this page…", true);
+    clearDeliveryChoice(doc);
     paintPageAcquireResult(doc, section, status, operationKey);
     announcePopupOperation(doc, pendingText);
     void (isPDF ? onSendPDF(binding) : onAcquire(binding)).then(
       (response) => {
-        const copy = isPDF ? pdfDeliveryCopy(response) : pageAcquireStatus(response);
-        if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, ...copy })) return;
         if (isPDF) {
-          const deliveryPending = response.state === "sending" || response.state === "downloaded";
-          setAcquireButton(
-            button,
-            deliveryPending
-              ? response.duplicate === true
-                ? "Sending PDF for the existing job"
-                : "PDF sent to papio"
-              : "Send this PDF to papio",
-            deliveryPending,
-          );
-        } else {
-          const queued = typeof response.job_id === "string" && response.job_id.length > 0;
-          setAcquireButton(
-            button,
-            queued
-              ? response.duplicate === true
-                ? "Already in papio"
-                : "Added to papio"
-              : button.dataset.idleLabel ?? "Acquire this page",
-            queued,
-          );
+          handleDeliveryResponse(doc, section, status, button, binding, pageKey, operationKey, generation, response, onSendPDF, onAcknowledge);
+          return;
         }
+        const copy = pageAcquireStatus(response);
+        if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, ...copy })) return;
+        const queued = typeof response.job_id === "string" && response.job_id.length > 0;
+        setAcquireButton(
+          button,
+          queued
+            ? response.duplicate === true
+              ? "Already in papio"
+              : "Added to papio"
+            : button.dataset.idleLabel ?? "Acquire this page",
+          queued,
+        );
         paintPageAcquireResult(doc, section, status, operationKey);
         announcePopupOperation(doc, copy.text);
         const kind = acknowledgementKindFor(isPDF, response);
@@ -3169,6 +3306,7 @@ export function renderPageAcquire(
         if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, text, tone: "degraded" })) {
           return;
         }
+        clearDeliveryChoice(doc);
         setAcquireButton(
           button,
           isPDF ? "Send this PDF to papio" : button.dataset.idleLabel ?? "Acquire this page",
@@ -3222,14 +3360,9 @@ export function sessionWarmForJob(
     demandedOrigin.authenticated === true &&
     demandedOrigin.checking === false &&
     isFreshSessionTimestamp(demandedOrigin.lastVerdictAt);
-
-}
-export function selectedManualDeliveryTarget(jobs: readonly ActiveJob[]): ActiveJob | undefined {
-  const targets = jobs.filter((job) => job.manual_delivery_target === true && job.status === "awaiting_download");
-  return targets.length === 1 ? targets[0] : undefined;
 }
 
-/** Tab, then unique expected DOI, then the Open pin only when it owns this tab. */
+/** Tab, then unique expected DOI. */
 export function pageDeliveryJob(
   jobs: readonly ActiveJob[],
   page: { tab_id?: number | undefined; doi?: string | undefined },
@@ -3245,8 +3378,6 @@ export function pageDeliveryJob(
     );
     if (byDOI.length === 1) return byDOI[0];
   }
-  const pin = selectedManualDeliveryTarget(jobs);
-  if (pin !== undefined && page.tab_id !== undefined && pin.tab_id === page.tab_id) return pin;
   return undefined;
 }
 
@@ -3298,12 +3429,23 @@ export function renderPageContext(
   }
   const scan = scanButton instanceof HTMLButtonElement ? scanButton : undefined;
   if (liveCard instanceof HTMLElement) liveCard.hidden = true;
+  const choiceEl = doc.getElementById("page-acquire-choice");
+  const pageKey = page === undefined ? undefined : popupPageKey(page);
+  if (choiceEl instanceof HTMLElement && !choiceEl.hidden) {
+    const isStale = (() => {
+      if (page === undefined) return true;
+      const key = pageOperationKey(page, "pdf");
+      const op = popupOperation(doc, key);
+      if (op === undefined) return true;
+      return op.ownerKey !== pageKey;
+    })();
+    if (isStale) clearDeliveryChoice(doc);
+  }
   section.hidden = true;
   paintPopupResult(status, undefined);
 
   // A page change clears any pending consent decision. It is never carried over:
   // consent belongs to the origin the researcher was actually shown.
-  const pageKey = page === undefined ? undefined : popupPageKey(page);
   if (scannerConsentPageKey !== undefined && scannerConsentPageKey !== pageKey) {
     clearScannerConsentPrompt(doc);
   }
@@ -3351,6 +3493,7 @@ export function renderPageContext(
     const disabled = delivery?.status === "sending" || delivery?.status === "downloaded";
     setAcquireButton(button, "Send this PDF to papio", disabled);
     if (knownJob !== undefined) {
+      clearDeliveryChoice(doc);
       // The live card keeps its richer copy and its own Open inbox / Open tab
       // authority; the rail does not flatten an in-progress acquisition.
       renderLiveAcquisition(
