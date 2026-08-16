@@ -89,8 +89,12 @@ than a capability it lacks:
    how false-accept grows with pool size.
 2. **It has no target-absent semantics.** The everyday case — a PDF whose paper
    is not pending at all — has no pairwise analogue.
-3. **It scores a different predicate** than production's five reachable
-   qualification gates.
+3. **It scores a different predicate** than production's qualification gates.
+   There are **seven** observable gates (`candidate_select.go:71-78`), not the
+   five numbered ones: the non-article and correction-marker gates are
+   evaluated on DOI-less input and can terminate the traversal
+   (`candidate_select.go:180-190`), so marker-gate coverage is required and a
+   report that tracks only five would silently omit it.
 4. **The composite class is invisible to its loader.** `Load`'s
    `dedupOnePerParent` (`corpus.go:165`, `555-584`) keeps one PDF per
    bibliographic parent and explicitly drops secondary attachments including
@@ -260,9 +264,15 @@ those paths, which v1 elided by claiming the report gates `/2` outright.
 
 ## Boundaries
 
-- **No production behaviour changes.** Autonomous binding stays disabled
-  (`bridge.go:7618-7625`, enabled only by tests); the popup picker and the
-  conclusive-identity veto stay exactly as shipped.
+- **No production behaviour changes.** Autonomous binding stays disabled behind
+  the unexported `autoBindDecisionEnabled`, initialized false and set true only
+  by tests (`bridge.go:7618-7625`, `grab_autobind_test.go:185-189`); the popup
+  picker and the conclusive-identity veto stay exactly as shipped. Note the
+  in-tree substrate is already labelled `/2` (`CandidateBindingRule`,
+  `candidate_select.go:47`): `/1` is historical provenance and a doctor check,
+  not a currently reachable function. So what this instrument measures is the
+  `/2` substrate as it stands today, which is the baseline any `/2` rule change
+  must then be compared against.
 - **No changes to `internal/pdf/identity.go` or `candidate_select.go`.** Measure
   first; rule changes are workstream 3 and are gated on this report.
 - Align the instrument's extraction with production or report the divergence:
