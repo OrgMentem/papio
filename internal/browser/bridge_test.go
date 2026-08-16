@@ -42,6 +42,7 @@ import (
 	"papio/internal/retraction"
 	"papio/internal/routes"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/triage"
 	"papio/internal/watch"
 	"papio/internal/work"
@@ -78,7 +79,9 @@ func newBridgeWithHoldings(t *testing.T, holdings holdingsProvider) (*Bridge, *j
 func newBridgeWithHoldingsAndZotio(t *testing.T, holdings holdingsProvider, zotioService *zotio.Service, tweak ...func(*config.Config)) (*Bridge, *job.Store, config.Config, string) {
 	t.Helper()
 	ctx := context.Background()
-	data := t.TempDir()
+	// Already migrated: 285 tests each running the full migration set under
+	// -race is what pushed this package past CI's per-package timeout.
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)

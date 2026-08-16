@@ -16,12 +16,15 @@ import (
 	"time"
 
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := store.Open(context.Background(), t.TempDir())
+	// Migrated template: see internal/store/storetest — a per-test migration run
+	// dominates this package's -race time and varies nothing.
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
