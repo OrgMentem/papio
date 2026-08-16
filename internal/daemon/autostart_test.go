@@ -15,12 +15,13 @@ import (
 	"time"
 )
 
+// isProcessGone asks the kernel, never the *exec.Cmd. Both the ready path
+// (autostart.go:139) and terminateOrphan reap the child in their OWN goroutine,
+// so cmd.ProcessState is written concurrently and a test that reads it is
+// racing the reaper for an answer signal 0 already gives correctly.
 func isProcessGone(t *testing.T, cmd *exec.Cmd) bool {
 	t.Helper()
 	if cmd == nil || cmd.Process == nil {
-		return true
-	}
-	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 		return true
 	}
 	// This file is //go:build !windows, so signal 0 is always available here.
@@ -171,22 +172,23 @@ func TestAutostarterLeavesReadyDaemonRunning(t *testing.T) {
 		t.Fatal("no process was launched")
 	}
 	// Successful readiness must detach and leave the daemon running — the
-	// opposite of the failure path. ProcessState stays nil until Wait, and
-	// Signal 0 must succeed.
-	if launched.ProcessState != nil {
-		t.Fatalf("ready daemon ProcessState = %v, want nil (still running, detached)", launched.ProcessState)
-	}
+	// opposite of the failure path. Signal 0 succeeding is the whole proof, and
+	// it is the kernel's answer rather than a field the reaper is writing.
 	if err := syscall.Kill(launched.Process.Pid, 0); err != nil {
 		t.Fatalf("ready daemon pid %d not running after detach: %v", launched.Process.Pid, err)
 	}
-	// Cleanup: the test now owns the detached helper.
+	// Cleanup. The test does NOT own this process: EnsureWithResult reaps a
+	// ready child in its own goroutine (autostart.go:139), and exec.Cmd.Wait
+	// may be called exactly once, so waiting here raced that reaper — which is
+	// what the race detector caught. Kill the group and let the reaper reap;
+	// the pid disappearing is the observable completion.
 	_ = syscall.Kill(-launched.Process.Pid, syscall.SIGKILL)
 	_ = launched.Process.Kill()
-	done := make(chan error, 1)
-	go func() { done <- launched.Wait() }()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for ready daemon cleanup")
+	deadline := time.Now().Add(3 * time.Second)
+	for !isProcessGone(t, launched) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for ready daemon cleanup")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
