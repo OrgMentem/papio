@@ -13,6 +13,13 @@ import (
 	"papio/internal/store/storetest"
 )
 
+// fixedDecision is a test in-transaction decision that returns prov
+// unconditionally. Production always recomputes inside the transaction; these
+// tests are about the row mechanics around that decision, not the decision.
+func fixedDecision(prov BindProvenance) func(context.Context, *sql.Tx) (BindProvenance, error) {
+	return func(context.Context, *sql.Tx) (BindProvenance, error) { return prov, nil }
+}
+
 func TestMarkBoundToJobLegalStates(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
@@ -80,13 +87,13 @@ func TestMarkBoundToJobLegalStates(t *testing.T) {
 			id := tc.setup(ctx, svc, s)
 			prov := BindProvenance{
 				Method:               "candidate_auto_bind",
-				Rule:                 "candidate_auto_bind/1",
+				Rule:                 "candidate_auto_bind/2",
 				Winner:               jobID,
 				CandidatesConsidered: 3,
 				Evidence:             []string{"title_printed", "year_compatible"},
 			}
-			if err := svc.MarkBoundToJob(ctx, id, jobID, "job_created", prov); err != nil {
-				t.Fatalf("MarkBoundToJob: %v", err)
+			if err := svc.MarkBoundToJobFenced(ctx, id, jobID, "job_created", fixedDecision(prov)); err != nil {
+				t.Fatalf("MarkBoundToJobFenced: %v", err)
 			}
 			got, err := svc.Get(ctx, id)
 			if err != nil || got == nil {
@@ -143,7 +150,7 @@ func TestMarkBoundToJobIllegalStates(t *testing.T) {
 		jobID, "req-illegal", "awaiting_human", `{}`, now, now); err != nil {
 		t.Fatal(err)
 	}
-	prov := BindProvenance{Method: "candidate_auto_bind", Rule: "candidate_auto_bind/1", Winner: jobID, CandidatesConsidered: 1}
+	prov := BindProvenance{Method: "candidate_auto_bind", Rule: "candidate_auto_bind/2", Winner: jobID, CandidatesConsidered: 1}
 
 	// Already job_created.
 	g1, err := svc.Allocate(ctx, "illegal.example.org", "already job_created")
@@ -153,9 +160,9 @@ func TestMarkBoundToJobIllegalStates(t *testing.T) {
 	if err := svc.MarkJobCreated(ctx, g1.ID, jobID, "job_created"); err != nil {
 		t.Fatal(err)
 	}
-	err = svc.MarkBoundToJob(ctx, g1.ID, jobID, "job_created", prov)
+	err = svc.MarkBoundToJobFenced(ctx, g1.ID, jobID, "job_created", fixedDecision(prov))
 	if err == nil || !strings.Contains(err.Error(), "changed underneath its own transition") {
-		t.Fatalf("MarkBoundToJob on job_created err = %v, want changed underneath", err)
+		t.Fatalf("MarkBoundToJobFenced on job_created err = %v, want changed underneath", err)
 	}
 	got, _ := svc.Get(ctx, g1.ID)
 	if got.State != StateJobCreated || got.JobID != jobID {
@@ -177,9 +184,9 @@ func TestMarkBoundToJobIllegalStates(t *testing.T) {
 	if err := svc.MarkAbandoned(ctx, g2.ID, "interrupted"); err != nil {
 		t.Fatal(err)
 	}
-	err = svc.MarkBoundToJob(ctx, g2.ID, jobID, "job_created", prov)
+	err = svc.MarkBoundToJobFenced(ctx, g2.ID, jobID, "job_created", fixedDecision(prov))
 	if err == nil || !strings.Contains(err.Error(), "changed underneath its own transition") {
-		t.Fatalf("MarkBoundToJob on abandoned err = %v, want changed underneath", err)
+		t.Fatalf("MarkBoundToJobFenced on abandoned err = %v, want changed underneath", err)
 	}
 	got2, _ := svc.Get(ctx, g2.ID)
 	if got2.State != StateAbandoned {
@@ -208,9 +215,9 @@ func TestMarkBoundToJobSettlesPermit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllocateEffect: %v", err)
 	}
-	prov := BindProvenance{Method: "candidate_auto_bind", Rule: "candidate_auto_bind/1", Winner: jobID, CandidatesConsidered: 1, Evidence: []string{"title_printed"}}
-	if err := svc.MarkBoundToJob(ctx, g.ID, jobID, "job_created", prov); err != nil {
-		t.Fatalf("MarkBoundToJob: %v", err)
+	prov := BindProvenance{Method: "candidate_auto_bind", Rule: "candidate_auto_bind/2", Winner: jobID, CandidatesConsidered: 1, Evidence: []string{"title_printed"}}
+	if err := svc.MarkBoundToJobFenced(ctx, g.ID, jobID, "job_created", fixedDecision(prov)); err != nil {
+		t.Fatalf("MarkBoundToJobFenced: %v", err)
 	}
 	var status string
 	if err := s.DB().QueryRowContext(ctx, `SELECT status FROM effect_permits WHERE grab_id=?`, g.ID).Scan(&status); err != nil {
@@ -242,7 +249,7 @@ func TestMarkBoundToJobValidation(t *testing.T) {
 		jobID, "req-validation", "awaiting_human", `{}`, now, now); err != nil {
 		t.Fatal(err)
 	}
-	validProv := BindProvenance{Method: "candidate_auto_bind", Rule: "candidate_auto_bind/1", Winner: jobID, CandidatesConsidered: 1}
+	validProv := BindProvenance{Method: "candidate_auto_bind", Rule: "candidate_auto_bind/2", Winner: jobID, CandidatesConsidered: 1}
 
 	cases := []struct {
 		name   string
@@ -251,9 +258,9 @@ func TestMarkBoundToJobValidation(t *testing.T) {
 		errSub string
 	}{
 		{"blank job id", "", validProv, "job id is required"},
-		{"blank method", jobID, BindProvenance{Method: "", Rule: "candidate_auto_bind/1", Winner: jobID}, "binding method is required"},
+		{"blank method", jobID, BindProvenance{Method: "", Rule: "candidate_auto_bind/2", Winner: jobID}, "binding method is required"},
 		{"blank rule", jobID, BindProvenance{Method: "candidate_auto_bind", Rule: "", Winner: jobID}, "binding rule is required"},
-		{"blank method whitespace", jobID, BindProvenance{Method: "   ", Rule: "candidate_auto_bind/1", Winner: jobID}, "binding method is required"},
+		{"blank method whitespace", jobID, BindProvenance{Method: "   ", Rule: "candidate_auto_bind/2", Winner: jobID}, "binding method is required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -263,9 +270,9 @@ func TestMarkBoundToJobValidation(t *testing.T) {
 			}
 			// Ensure a held permit exists so we can verify it is not settled on validation failure.
 			// Use AllocateEffect for one case, but Allocate is sufficient to check row untouched.
-			err = svc.MarkBoundToJob(ctx, g.ID, tc.jobID, "job_created", tc.prov)
+			err = svc.MarkBoundToJobFenced(ctx, g.ID, tc.jobID, "job_created", fixedDecision(tc.prov))
 			if err == nil || !strings.Contains(err.Error(), tc.errSub) {
-				t.Fatalf("MarkBoundToJob err = %v, want containing %q", err, tc.errSub)
+				t.Fatalf("MarkBoundToJobFenced err = %v, want containing %q", err, tc.errSub)
 			}
 			got, _ := svc.Get(ctx, g.ID)
 			if got.State != StateAwaitingFile {
@@ -349,7 +356,7 @@ func TestMarkBoundToJobNullProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = svc.MarkBoundToJob(ctx, g3.ID, jobID, "job_created", BindProvenance{})
+	err = svc.MarkBoundToJobFenced(ctx, g3.ID, jobID, "job_created", fixedDecision(BindProvenance{}))
 	if err == nil || !strings.Contains(err.Error(), "binding method is required") {
 		t.Fatalf("zero provenance err = %v, want binding method is required", err)
 	}

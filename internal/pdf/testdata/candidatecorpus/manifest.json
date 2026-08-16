@@ -38,8 +38,10 @@
       ],
       "truth": "A",
       "canonical_equivalence": [],
+      "equivalence_justification": null,
       "probe_gate": "veto",
-      "equivalence_justification": null
+      "probe_candidate": "A",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "exact-title-different-year",
@@ -79,8 +81,10 @@
       ],
       "truth": "C2021",
       "canonical_equivalence": [],
+      "equivalence_justification": null,
       "probe_gate": "veto",
-      "equivalence_justification": null
+      "probe_candidate": "C2021",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "citing-sequel",
@@ -120,8 +124,10 @@
       ],
       "truth": "SEQ_A",
       "canonical_equivalence": [],
+      "equivalence_justification": null,
       "probe_gate": "veto",
-      "equivalence_justification": null
+      "probe_candidate": "SEQ_A",
+      "expected_gate": "conclusive-veto"
     },
     {
       "id": "correction-notice",
@@ -160,8 +166,10 @@
       ],
       "truth": "ERRATUM",
       "canonical_equivalence": [],
+      "equivalence_justification": null,
       "probe_gate": "veto",
-      "equivalence_justification": null
+      "probe_candidate": "ERRATUM",
+      "expected_gate": "conclusive-veto"
     },
     {
       "id": "numbered-series",
@@ -199,8 +207,10 @@
       ],
       "truth": "V3",
       "canonical_equivalence": [],
+      "equivalence_justification": null,
       "probe_gate": "veto",
-      "equivalence_justification": null
+      "probe_candidate": "V3",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "conference-vs-journal",
@@ -242,8 +252,10 @@
       ],
       "truth": "JOURNAL",
       "canonical_equivalence": [],
+      "equivalence_justification": null,
       "probe_gate": "veto",
-      "equivalence_justification": null
+      "probe_candidate": "JOURNAL",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "preprint-vs-vor",
@@ -286,8 +298,10 @@
         "PREPRINT",
         "VOR"
       ],
+      "equivalence_justification": "preprint and VoR are same work, version-collapsing equivalence per ADR-0008; accepting either is not wrong-accept",
       "probe_gate": "veto",
-      "equivalence_justification": "preprint and VoR are same work, version-collapsing equivalence per ADR-0008; accepting either is not wrong-accept"
+      "probe_candidate": "VOR",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "author-less-target",
@@ -324,8 +338,10 @@
       ],
       "truth": "TRUE_NOAUTH",
       "canonical_equivalence": [],
+      "equivalence_justification": null,
       "probe_gate": "veto",
-      "equivalence_justification": null
+      "probe_candidate": "TRUE_NOAUTH",
+      "expected_gate": "author-evidence"
     },
     {
       "id": "year-less-target",
@@ -364,8 +380,10 @@
       ],
       "truth": "TRUE_NOYEAR",
       "canonical_equivalence": [],
+      "equivalence_justification": null,
       "probe_gate": "veto",
-      "equivalence_justification": null
+      "probe_candidate": "TRUE_NOYEAR",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "true-absent",
@@ -404,8 +422,10 @@
       ],
       "truth": null,
       "canonical_equivalence": [],
+      "equivalence_justification": null,
       "probe_gate": "veto",
-      "equivalence_justification": null
+      "probe_candidate": "NEIGHBOR_A",
+      "expected_gate": "conclusive-veto"
     },
     {
       "id": "veto-window-correct-with-foreign",
@@ -444,10 +464,12 @@
       ],
       "truth": "CORRECT",
       "canonical_equivalence": [],
-      "veto_window": true,
-      "veto_note": "CORRECT document carries foreign DOI at 1.5 KiB; blind veto window (1 KiB) should not see it",
+      "equivalence_justification": null,
       "probe_gate": "veto-window",
-      "equivalence_justification": null
+      "probe_candidate": "CORRECT",
+      "expected_gate": "identifier-page-one",
+      "veto_window": true,
+      "veto_note": "CORRECT document carries foreign DOI at 1.5 KiB; blind veto window (1 KiB) should not see it"
     },
     {
       "id": "veto-window-wrong-with-own-doi",
@@ -486,10 +508,12 @@
       ],
       "truth": "WRONG",
       "canonical_equivalence": [],
-      "veto_window": true,
-      "veto_note": "WRONG document cites TARGET's DOI on page one but its own DOI at 1.5 KiB; blind veto (1 KiB) misses own DOI",
+      "equivalence_justification": null,
       "probe_gate": "veto-window",
-      "equivalence_justification": null
+      "probe_candidate": "WRONG",
+      "expected_gate": "conclusive-veto",
+      "veto_window": true,
+      "veto_note": "WRONG document cites TARGET's DOI on page one but its own DOI at 1.5 KiB; blind veto (1 KiB) misses own DOI"
     },
     {
       "id": "same-author-near-title-no-doi",
@@ -529,7 +553,9 @@
       ],
       "truth": "A",
       "canonical_equivalence": [],
-      "probe_gate": "predicate"
+      "probe_gate": "predicate",
+      "probe_candidate": "A",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "exact-title-different-year-no-doi",
@@ -569,7 +595,9 @@
       ],
       "truth": "C2021",
       "canonical_equivalence": [],
-      "probe_gate": "predicate"
+      "probe_gate": "predicate",
+      "probe_candidate": "C2021",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "citing-sequel-no-doi",
@@ -609,7 +637,9 @@
       ],
       "truth": "SEQ_A",
       "canonical_equivalence": [],
-      "probe_gate": "predicate"
+      "probe_gate": "predicate",
+      "probe_candidate": "SEQ_A",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "correction-notice-no-doi",
@@ -648,7 +678,10 @@
       ],
       "truth": "ERRATUM",
       "canonical_equivalence": [],
-      "probe_gate": "predicate"
+      "probe_gate": "correction",
+      "probe_candidate": "ERRATUM",
+      "expected_gate": "correction-marker",
+      "ground_truth_note": "Relabelled from probe_gate 'predicate' to 'correction': the observed trace terminates at the front-matter correction gate (1b), so the case never reached gates 2-5 and its old label overstated coverage."
     },
     {
       "id": "numbered-series-no-doi",
@@ -686,7 +719,9 @@
       ],
       "truth": "V3",
       "canonical_equivalence": [],
-      "probe_gate": "predicate"
+      "probe_gate": "predicate",
+      "probe_candidate": "V3",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "conference-vs-journal-no-doi",
@@ -728,7 +763,9 @@
       ],
       "truth": "JOURNAL",
       "canonical_equivalence": [],
-      "probe_gate": "predicate"
+      "probe_gate": "predicate",
+      "probe_candidate": "JOURNAL",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "preprint-vs-vor-no-doi",
@@ -769,8 +806,10 @@
         "PREPRINT",
         "VOR"
       ],
+      "equivalence_justification": "preprint and VoR are same work, version-collapsing equivalence per ADR-0008; accepting either is not wrong-accept",
       "probe_gate": "predicate",
-      "equivalence_justification": "preprint and VoR are same work, version-collapsing equivalence per ADR-0008; accepting either is not wrong-accept"
+      "probe_candidate": "VOR",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "author-less-target-no-doi",
@@ -807,7 +846,9 @@
       ],
       "truth": "TRUE_NOAUTH",
       "canonical_equivalence": [],
-      "probe_gate": "predicate"
+      "probe_gate": "predicate",
+      "probe_candidate": "TRUE_NOAUTH",
+      "expected_gate": "author-evidence"
     },
     {
       "id": "year-less-target-no-doi",
@@ -846,7 +887,9 @@
       ],
       "truth": "TRUE_NOYEAR",
       "canonical_equivalence": [],
-      "probe_gate": "predicate"
+      "probe_gate": "predicate",
+      "probe_candidate": "TRUE_NOYEAR",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "true-absent-no-doi",
@@ -885,12 +928,14 @@
       ],
       "truth": null,
       "canonical_equivalence": [],
-      "probe_gate": "predicate"
+      "probe_gate": "predicate",
+      "probe_candidate": "NEIGHBOR_A",
+      "expected_gate": "title-printed-as-line"
     },
     {
       "id": "erratum-target-absent",
       "document": "case13_erratum_target_absent_no_doi.txt",
-      "risk_family": "correction/comment/retraction notice \u2014 erratum prints target metadata and DOI outside 1 KiB",
+      "risk_family": "correction/comment/retraction notice — erratum prints target metadata and DOI outside 1 KiB",
       "candidates": [
         {
           "key": "ORIG",
@@ -906,17 +951,34 @@
           "bound": [
             "10.5555/synth.2024.030"
           ]
+        },
+        {
+          "key": "NEIGHBOR",
+          "work": {
+            "doi": "10.5555/synth.2024.031",
+            "title": "Robust Estimation of Treatment Effects Under Interference",
+            "authors": [
+              "Priya Natarajan",
+              "David Clark"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.031"
+          ]
         }
       ],
       "truth": null,
       "canonical_equivalence": [],
+      "ground_truth_note": "document is erratum about target work, not target work itself; target absent so abstention is correct; DOI after 1 KiB window, so case reaches correction gate",
       "probe_gate": "correction",
-      "ground_truth_note": "document is erratum about target work, not target work itself; target absent so abstention is correct; DOI after 1 KiB window, so case reaches correction gate"
+      "probe_candidate": "ORIG",
+      "expected_gate": "correction-marker"
     },
     {
       "id": "chapter-footnote-pointer-accept",
       "document": "case14_chapter_footnote_pointer_should_accept_no_doi.txt",
-      "risk_family": "chapter-footnote counterpart \u2014 genuine article carries 'Erratum to this chapter is available at ...' footnote",
+      "risk_family": "chapter-footnote counterpart — genuine article carries 'Erratum to this chapter is available at ...' footnote",
       "candidates": [
         {
           "key": "CHAPTER",
@@ -949,12 +1011,14 @@
       ],
       "truth": "CHAPTER",
       "canonical_equivalence": [],
-      "probe_gate": "correction-pointer"
+      "probe_gate": "correction-pointer",
+      "probe_candidate": "CHAPTER",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "strict-prefix-title",
       "document": "case15_strict_prefix_title_no_doi.txt",
-      "risk_family": "strict-prefix title \u2014 document titled '<Target Title>: A Different Study', candidate is exact '<Target Title>'",
+      "risk_family": "strict-prefix title — document titled '<Target Title>: A Different Study', candidate is exact '<Target Title>'",
       "candidates": [
         {
           "key": "C2021",
@@ -988,12 +1052,14 @@
       ],
       "truth": null,
       "canonical_equivalence": [],
-      "probe_gate": "title-strict-prefix"
+      "probe_gate": "title-strict-prefix",
+      "probe_candidate": "C2021",
+      "expected_gate": "title-printed-as-line"
     },
     {
       "id": "year-inside-longer-number",
       "document": "case16_year_inside_longer_number_no_doi.txt",
-      "risk_family": "year inside longer number \u2014 DOI/grant containing candidate year as substring",
+      "risk_family": "year inside longer number — DOI/grant containing candidate year as substring",
       "candidates": [
         {
           "key": "WRONG2019",
@@ -1027,13 +1093,15 @@
       ],
       "truth": null,
       "canonical_equivalence": [],
+      "ground_truth_note": "Document year 2024, candidate year 2019, longer number 20191 must not count as 2019 token; candidate DOI without year on page one ensures year mismatch is not masked",
       "probe_gate": "year-token-boundary",
-      "ground_truth_note": "Document year 2024, candidate year 2019, longer number 20191 must not count as 2019 token; candidate DOI without year on page one ensures year mismatch is not masked"
+      "probe_candidate": "WRONG2019",
+      "expected_gate": "year-token"
     },
     {
       "id": "author-zero-markers",
       "document": "case17_author_zero_markers_no_doi.txt",
-      "risk_family": "author-marker stratification \u2014 zero marked surnames",
+      "risk_family": "author-marker stratification — zero marked surnames",
       "candidates": [
         {
           "key": "A",
@@ -1068,12 +1136,14 @@
       ],
       "truth": null,
       "canonical_equivalence": [],
-      "probe_gate": "author"
+      "probe_gate": "author",
+      "probe_candidate": "A",
+      "expected_gate": "author-evidence"
     },
     {
       "id": "author-two-markers",
       "document": "case18_author_two_markers_no_doi.txt",
-      "risk_family": "author-marker stratification \u2014 two affiliation-marked surnames",
+      "risk_family": "author-marker stratification — two affiliation-marked surnames",
       "candidates": [
         {
           "key": "TRUE",
@@ -1107,12 +1177,14 @@
       ],
       "truth": "TRUE",
       "canonical_equivalence": [],
-      "probe_gate": "author"
+      "probe_gate": "author",
+      "probe_candidate": "TRUE",
+      "expected_gate": "identifier-page-one"
     },
     {
       "id": "author-collision-clark-vs-clarke",
       "document": "case20_author_collision_clark_vs_clarke_no_doi.txt",
-      "risk_family": "author-marker stratification \u2014 surname collision Clark vs Clarke",
+      "risk_family": "author-marker stratification — surname collision Clark vs Clarke",
       "candidates": [
         {
           "key": "CLARK",
@@ -1145,12 +1217,14 @@
       ],
       "truth": null,
       "canonical_equivalence": [],
-      "probe_gate": "author-collision"
+      "probe_gate": "author-collision",
+      "probe_candidate": "CLARK",
+      "expected_gate": "author-evidence"
     },
     {
       "id": "one-author-numeric-marker",
       "document": "case21_one_author_numeric_marker_no_doi.txt",
-      "risk_family": "author-marker stratification \u2014 one author with single numeric affiliation marker",
+      "risk_family": "author-marker stratification — one author with single numeric affiliation marker",
       "candidates": [
         {
           "key": "STONE",
@@ -1183,12 +1257,14 @@
       ],
       "truth": "STONE",
       "canonical_equivalence": [],
-      "probe_gate": "author-one-numeric"
+      "probe_gate": "author-one-numeric",
+      "probe_candidate": "STONE",
+      "expected_gate": "author-evidence"
     },
     {
       "id": "one-author-lettered-marker",
       "document": "case22_one_author_lettered_marker_no_doi.txt",
-      "risk_family": "author-marker stratification \u2014 one author with single lettered marker (should miss, not wrong-accept)",
+      "risk_family": "author-marker stratification — one author with single lettered marker (should miss, not wrong-accept)",
       "candidates": [
         {
           "key": "STONE",
@@ -1221,12 +1297,14 @@
       ],
       "truth": "STONE",
       "canonical_equivalence": [],
-      "probe_gate": "author-one-lettered"
+      "probe_gate": "author-one-lettered",
+      "probe_candidate": "STONE",
+      "expected_gate": "author-evidence"
     },
     {
       "id": "surname-in-title-collision",
       "document": "case23_surname_in_title_no_doi.txt",
-      "risk_family": "author-marker stratification \u2014 surname appears in title, not byline",
+      "risk_family": "author-marker stratification — surname appears in title, not byline",
       "candidates": [
         {
           "key": "STONE",
@@ -1259,12 +1337,14 @@
       ],
       "truth": null,
       "canonical_equivalence": [],
-      "probe_gate": "author-positional"
+      "probe_gate": "author-positional",
+      "probe_candidate": "STONE",
+      "expected_gate": "author-evidence"
     },
     {
       "id": "author-one-marker",
       "document": "case24_author_one_marker_no_doi.txt",
-      "risk_family": "author-marker stratification \u2014 one affiliation-marked surname, two-author target",
+      "risk_family": "author-marker stratification — one affiliation-marked surname, two-author target",
       "candidates": [
         {
           "key": "TRUE",
@@ -1298,7 +1378,229 @@
       ],
       "truth": null,
       "canonical_equivalence": [],
-      "probe_gate": "author"
+      "probe_gate": "author",
+      "probe_candidate": "TRUE",
+      "expected_gate": "author-evidence"
+    },
+    {
+      "id": "composite-cited-identifier-expansion",
+      "document": "case25_cited_identifier_expansion_no_doi.txt",
+      "risk_family": "composite — journal expansion printing the conference paper's DOI as a cited identifier",
+      "candidates": [
+        {
+          "key": "CONF",
+          "work": {
+            "doi": "10.5555/synth.2022.501",
+            "title": "Adaptive Sampling for Streaming Graph Partitioning",
+            "authors": [
+              "Elena Vargas",
+              "Kenji Tanaka"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.2022.501"
+          ]
+        },
+        {
+          "key": "NEIGHBOR",
+          "work": {
+            "doi": "10.5555/synth.2022.502",
+            "title": "Adaptive Sampling for Batch Graph Partitioning",
+            "authors": [
+              "Elena Vargas"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.2022.502"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "ground_truth_note": "Composite hard negative: one relational block supplies title, authors, year AND identifier together, which is how a real wrong-accept arrives; the corpus's single-ingredient cases cannot see it. Target absent, so abstention is the only correct outcome. The document is the journal expansion (own DOI 10.5555/synth.2022.777, past 1 KiB, on page one); it shares the conference paper's title, authors and year and prints the conference DOI as 'Extended from DOI ...'. Gate 5 cannot tell a cited identifier from a self-asserted one, so every gate passes and the expansion is filed as the conference paper.",
+      "probe_gate": "composite-cited-identifier",
+      "probe_candidate": "CONF",
+      "expected_gate": "identifier-page-one",
+      "known_failing": true,
+      "known_failing_reason": "candidate_auto_bind/2 must make gate 5 distinguish a self-asserted identifier from a cited one; today any page-one occurrence of the target DOI corroborates."
+    },
+    {
+      "id": "composite-repository-cover-card",
+      "document": "case26_repository_cover_card_no_doi.txt",
+      "risk_family": "composite — repository cover card reprinting the target's whole citation above a different document",
+      "candidates": [
+        {
+          "key": "TARGET",
+          "work": {
+            "doi": "10.5555/synth.2022.610",
+            "title": "Robust Calibration of Ensemble Forecasts",
+            "authors": [
+              "Marta Silva",
+              "Andre Bouchard"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.2022.610"
+          ]
+        },
+        {
+          "key": "NEIGHBOR",
+          "work": {
+            "doi": "10.5555/synth.2022.612",
+            "title": "Robust Calibration of Single-Model Forecasts",
+            "authors": [
+              "Marta Silva"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.2022.612"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "ground_truth_note": "Composite hard negative: one relational block supplies title, authors, year AND identifier together, which is how a real wrong-accept arrives; the corpus's single-ingredient cases cannot see it. Target absent, so abstention is the only correct outcome. The deposit's cover block prints the target's title, authors and year as a citation card; the document's own title ('Verification Workflows for Operational Forecasting') appears further down, and the target DOI is padded past byte 1024 so the blind window stays empty. Gate 3 reads the card as the document's title because a card occupies the title position.",
+      "probe_gate": "composite-cover-card",
+      "probe_candidate": "TARGET",
+      "expected_gate": "title-printed-as-line",
+      "known_failing": true,
+      "known_failing_reason": "candidate_auto_bind/2 must refuse a title printed inside a labelled citation block ('Title:'/'Authors:'/'Year:') as evidence that the document IS that work."
+    },
+    {
+      "id": "composite-wrapped-subtitle",
+      "document": "case27_wrapped_subtitle_title_no_doi.txt",
+      "risk_family": "composite — printed title wrapping across a subtitle boundary the strict-prefix check cannot see",
+      "candidates": [
+        {
+          "key": "TARGET",
+          "work": {
+            "doi": "10.5555/synth.2023.301",
+            "title": "Attention Routing in Sparse Mixture Models",
+            "authors": [
+              "Priya Nandan",
+              "Tomas Ekberg"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.301"
+          ]
+        },
+        {
+          "key": "NEIGHBOR",
+          "work": {
+            "doi": "10.5555/synth.2023.303",
+            "title": "Attention Routing in Dense Models",
+            "authors": [
+              "Priya Nandan"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.303"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "ground_truth_note": "Composite hard negative: one relational block supplies title, authors, year AND identifier together, which is how a real wrong-accept arrives; the corpus's single-ingredient cases cannot see it. Target absent, so abstention is the only correct outcome. The document's title wraps as 'Attention Routing in Sparse Mixture Models:' / 'A Different Study of Router Collapse'. candidateStrictTitleRunMatches only inspects trailing content in the SAME printed segment, and the phrase ends at that segment's last word, so the subtitle on the next line is invisible to it — the very extension case15 pins when the subtitle stays on one line.",
+      "probe_gate": "composite-wrapped-subtitle",
+      "probe_candidate": "TARGET",
+      "expected_gate": "title-printed-as-line",
+      "known_failing": true,
+      "known_failing_reason": "candidate_auto_bind/2 must apply the subtitle-boundary test across the wrap, not only within one printed segment."
+    },
+    {
+      "id": "composite-numeric-title-extension",
+      "document": "case28_numeric_title_extension_no_doi.txt",
+      "risk_family": "composite — numbered sequel whose trailing digit is read as a footnote marker",
+      "candidates": [
+        {
+          "key": "TARGET",
+          "work": {
+            "doi": "10.5555/synth.2023.420",
+            "title": "Neural Operators for Turbulent Flow Prediction",
+            "authors": [
+              "Ingrid Solberg",
+              "Marco Ferrari"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.420"
+          ]
+        },
+        {
+          "key": "NEIGHBOR",
+          "work": {
+            "doi": "10.5555/synth.2023.422",
+            "title": "Neural Operators for Laminar Flow Prediction",
+            "authors": [
+              "Ingrid Solberg"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.422"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "ground_truth_note": "Composite hard negative: one relational block supplies title, authors, year AND identifier together, which is how a real wrong-accept arrives; the corpus's single-ingredient cases cannot see it. Target absent, so abstention is the only correct outcome. The document is titled 'Neural Operators for Turbulent Flow Prediction2' — a numbered sequel. titleRunMatches treats a trailing digit run as a flattened superscript footnote mark and returns a match, so a sequel wins its predecessor's title outright.",
+      "probe_gate": "composite-numeric-extension",
+      "probe_candidate": "TARGET",
+      "expected_gate": "title-printed-as-line",
+      "known_failing": true,
+      "known_failing_reason": "candidate_auto_bind/2 must not accept a trailing digit run as a footnote mark for autonomous selection; a numbered sequel and a footnote mark are indistinguishable at that bound."
+    },
+    {
+      "id": "composite-year-in-dotted-doi",
+      "document": "case29_year_in_dotted_doi_no_doi.txt",
+      "risk_family": "composite — candidate year satisfied by a year-shaped run inside a dotted DOI",
+      "candidates": [
+        {
+          "key": "C2019",
+          "work": {
+            "doi": "10.5555/synth.2019.220",
+            "title": "Community Resilience Metrics for Urban Flood Risk",
+            "authors": [
+              "Nadia Osei",
+              "Peter Lindqvist"
+            ],
+            "year": 2019
+          },
+          "bound": [
+            "10.5555/synth.2019.220"
+          ]
+        },
+        {
+          "key": "NEIGHBOR",
+          "work": {
+            "doi": "10.5555/synth.2019.222",
+            "title": "Community Resilience Metrics for Coastal Flood Risk",
+            "authors": [
+              "Nadia Osei"
+            ],
+            "year": 2019
+          },
+          "bound": [
+            "10.5555/synth.2019.222"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "ground_truth_note": "Composite hard negative: one relational block supplies title, authors, year AND identifier together, which is how a real wrong-accept arrives; the corpus's single-ingredient cases cannot see it. Target absent, so abstention is the only correct outcome. The document is the 2024 second edition. Page one prints '10.1234/j.2019.05.003' inside the 2 KiB byline window: dots are non-word characters, so \\b(19|20)\\d{2}\\b matches '2019' as a real token and the 2019 candidate's year is treated as corroborated against a 2024 document. case16 tests '20191', which has no right boundary, and therefore misses this path entirely.",
+      "probe_gate": "composite-year-in-dotted-doi",
+      "probe_candidate": "C2019",
+      "expected_gate": "year-token",
+      "known_failing": true,
+      "known_failing_reason": "candidate_auto_bind/2 must take year tokens from prose, not from inside identifier or reference strings; the token boundary alone does not establish that a year-shaped run is a date."
     }
   ]
 }

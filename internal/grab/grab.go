@@ -418,14 +418,48 @@ func (s *Service) MarkJobCreated(ctx context.Context, id, jobID, outcome string)
 	return tx.Commit()
 }
 
+// CandidateVerdict is one considered candidate's terminal disposition in the
+// 1-of-N selection that produced (or declined) a binding. Recording only the
+// winner makes a bind unreconstructable: "why this job" is answerable only
+// against the losers that were on the table at the same instant. Reason is
+// the predicate's own machine reason code (e.g. "title_not_printed_as_line"),
+// never document text — the audit trail must not become a second, unmanaged
+// copy of scholarly content.
+type CandidateVerdict struct {
+	JobID   string `json:"job_id"`
+	Verdict string `json:"verdict"` // "qualifies" | "review" | "rejected"
+	Reason  string `json:"reason,omitempty"`
+}
+
 // BindProvenance records why an automatic candidate binding was made, so a
 // human reading the ledger later can reconstruct the decision.
+//
+// It describes the decision that COMMITTED. The caller must build it from the
+// evaluation performed inside the binding transaction (see
+// MarkBoundToJobFenced), not from a pre-transaction one: a pool that changes
+// between the two can leave the winning key identical while the evidence,
+// the loser set, and the candidate count all moved.
+//
+// ExcerptSHA256 pins the exact bytes the predicate read without storing them.
+// The document text is already durable in the artifact store; duplicating it
+// into an audit column would put scholarly content somewhere nothing manages
+// its lifetime.
 type BindProvenance struct {
-	Method               string   `json:"method"`
-	Rule                 string   `json:"rule"`
-	Winner               string   `json:"winner"`
-	CandidatesConsidered int      `json:"candidates_considered"`
-	Evidence             []string `json:"evidence,omitempty"`
+	Method               string             `json:"method"`
+	Rule                 string             `json:"rule"`
+	Winner               string             `json:"winner"`
+	CandidatesConsidered int                `json:"candidates_considered"`
+	Evidence             []string           `json:"evidence,omitempty"`
+	Candidates           []CandidateVerdict `json:"candidates,omitempty"`
+	ExcerptSHA256        string             `json:"excerpt_sha256,omitempty"`
+}
+
+// recorded reports whether this provenance describes a real automatic
+// decision. An all-zero value stays NULL rather than committing "{}".
+func (p BindProvenance) recorded() bool {
+	return p.Method != "" || p.Rule != "" || p.Winner != "" ||
+		p.CandidatesConsidered != 0 || len(p.Evidence) != 0 ||
+		len(p.Candidates) != 0 || p.ExcerptSHA256 != ""
 }
 
 func nullable(s string) any {
@@ -435,31 +469,48 @@ func nullable(s string) any {
 	return s
 }
 
-// MarkBoundToJob binds a settled grab to an existing job and records the
+// MarkBoundToJobFenced binds a settled grab to an existing job and records the
 // provenance of that decision in the same transaction as the state change.
+//
+// decide runs INSIDE that transaction, before the row is updated, and returns
+// the provenance. There is deliberately no sibling that takes a caller-built
+// provenance: those two doors are how an audit row came to describe a
+// decision other than the one that committed. When the caller supplied
+// provenance and the in-transaction step only compared a winner key, a pool
+// that changed under an unchanged key committed the pre-transaction evidence,
+// loser set and candidate count. Making decide the only source of provenance
+// puts that invariant in the type rather than in a comment.
+//
+// A recompute outside the serialization point fences nothing: another writer
+// can change eligibility between the decision and the CAS, so the check and
+// the commit must be atomic. Any non-nil error from decide aborts the
+// transaction and rolls back without touching the row.
+//
+// decide MUST read through tx and never through the pool: the store is capped
+// at one connection, which this transaction already holds, so a pool read
+// there deadlocks.
 //
 // The binding method is never encoded in the wire outcome — outcome remains
 // the caller-supplied value (e.g. "job_created") so the extension's closed
 // outcome vocabulary is unchanged. The method lives only in the provenance
 // column, which is the durable audit trail for automatic decisions.
-func (s *Service) MarkBoundToJob(ctx context.Context, id, jobID, outcome string, prov BindProvenance) error {
-	return s.markBoundToJob(ctx, id, jobID, outcome, prov, nil)
-}
-
-// MarkBoundToJobFenced is MarkBoundToJob with a serialization fence.
-//
-// The fence runs INSIDE the same transaction that performs the CAS, before
-// the row is updated. A recompute outside the serialization point fences
-// nothing: another writer can change eligibility between the decision and the
-// CAS, so the check and the commit must be atomic. Any non-nil error from
-// fence aborts the transaction and rolls back without touching the row.
-func (s *Service) MarkBoundToJobFenced(ctx context.Context, id, jobID, outcome string, prov BindProvenance, fence func(ctx context.Context, tx *sql.Tx) error) error {
-	return s.markBoundToJob(ctx, id, jobID, outcome, prov, fence)
-}
-
-func (s *Service) markBoundToJob(ctx context.Context, id, jobID, outcome string, prov BindProvenance, fence func(ctx context.Context, tx *sql.Tx) error) error {
+func (s *Service) MarkBoundToJobFenced(ctx context.Context, id, jobID, outcome string, decide func(ctx context.Context, tx *sql.Tx) (BindProvenance, error)) error {
+	if decide == nil {
+		return fmt.Errorf("grab %s: a binding requires an in-transaction decision", id)
+	}
 	if strings.TrimSpace(jobID) == "" {
 		return fmt.Errorf("grab %s: job id is required", id)
+	}
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// The decision and the CAS share this transaction, so the provenance
+	// written below is by construction the decision that committed.
+	prov, err := decide(ctx, tx)
+	if err != nil {
+		return err
 	}
 	if strings.TrimSpace(prov.Method) == "" {
 		return fmt.Errorf("grab %s: binding method is required", id)
@@ -467,22 +518,9 @@ func (s *Service) markBoundToJob(ctx context.Context, id, jobID, outcome string,
 	if strings.TrimSpace(prov.Rule) == "" {
 		return fmt.Errorf("grab %s: binding rule is required", id)
 	}
-	tx, err := s.store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if fence != nil {
-		if err := fence(ctx, tx); err != nil {
-			return err
-		}
-	}
 	now := store.Now()
 	var provVal any
-	// A valid BindProvenance always has Method and Rule (validated above),
-	// so any non-empty field indicates a real automatic decision. An empty
-	// provenance stays NULL rather than "{}".
-	if prov.Method != "" || prov.Rule != "" || prov.Winner != "" || prov.CandidatesConsidered != 0 || len(prov.Evidence) != 0 {
+	if prov.recorded() {
 		b, err := json.Marshal(prov)
 		if err != nil {
 			return err
@@ -511,6 +549,60 @@ func (s *Service) markBoundToJob(ctx context.Context, id, jobID, outcome string,
 		return err
 	}
 	return tx.Commit()
+}
+
+// RuleBind names one grab that was bound under a particular rule version and
+// the job it was filed under. The job id is what an operator acts on: the
+// grab is the capture, the job is the library entry a wrong decision
+// corrupted.
+type RuleBind struct {
+	GrabID string
+	JobID  string
+}
+
+// BoundByRule returns the grabs whose recorded binding provenance names rule,
+// oldest first, plus a count of rows whose provenance JSON could not be read
+// at all.
+//
+// This is the rule-version audit: an acceptance rule is only meaningful as a
+// version, so when the acceptance set changes the constant changes with it
+// and every historical row keeps naming the rule that actually decided it.
+// Historical provenance is never rewritten, so asking "which rows were bound
+// under the superseded rule" is exactly this query.
+//
+// The rule is matched by parsing the JSON rather than by a LIKE over the
+// column: a substring match would depend on field ordering and escaping,
+// which are marshalling details, not facts about the decision. Unreadable
+// provenance is counted rather than dropped — a row whose audit trail cannot
+// be parsed needs a human at least as much as one bound under an old rule,
+// and silently reporting zero would be the wrong answer to give an operator.
+func (s *Service) BoundByRule(ctx context.Context, rule string) (binds []RuleBind, unreadable int, err error) {
+	rows, err := s.store.DB().QueryContext(ctx, `
+		SELECT id, COALESCE(job_id, ''), bind_provenance FROM pdf_grabs
+		WHERE bind_provenance IS NOT NULL AND bind_provenance != ''
+		ORDER BY created_at, id`)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, jobID, raw string
+		if err := rows.Scan(&id, &jobID, &raw); err != nil {
+			return nil, 0, err
+		}
+		var prov BindProvenance
+		if err := json.Unmarshal([]byte(raw), &prov); err != nil {
+			unreadable++
+			continue
+		}
+		if prov.Rule == rule {
+			binds = append(binds, RuleBind{GrabID: id, JobID: jobID})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return binds, unreadable, nil
 }
 
 // MarkIdentified records that identifier extraction completed while retaining

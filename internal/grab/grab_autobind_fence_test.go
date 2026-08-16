@@ -39,11 +39,10 @@ func TestMarkBoundToJobFencedRollbackOnFenceError(t *testing.T) {
 		t.Fatalf("MarkQuarantined: %v", err)
 	}
 	before, _ := svc.Get(ctx, g.ID)
-	prov := BindProvenance{Method: "candidate_auto_bind", Rule: "candidate_auto_bind/1", Winner: jobID, CandidatesConsidered: 1}
-	fence := func(ctx context.Context, tx *sql.Tx) error {
-		return sql.ErrNoRows // arbitrary fence rejection
+	decide := func(ctx context.Context, tx *sql.Tx) (BindProvenance, error) {
+		return BindProvenance{}, sql.ErrNoRows // arbitrary fence rejection
 	}
-	err = svc.MarkBoundToJobFenced(ctx, g.ID, jobID, "job_created", prov, fence)
+	err = svc.MarkBoundToJobFenced(ctx, g.ID, jobID, "job_created", decide)
 	if err == nil || !strings.Contains(err.Error(), "no rows") {
 		t.Fatalf("MarkBoundToJobFenced err = %v, want fence error", err)
 	}
@@ -81,9 +80,10 @@ func TestMarkBoundToJobFencedHappyWithFence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	prov := BindProvenance{Method: "candidate_auto_bind", Rule: "candidate_auto_bind/1", Winner: jobID, CandidatesConsidered: 1, Evidence: []string{"title_printed"}}
-	fence := func(ctx context.Context, tx *sql.Tx) error { return nil }
-	if err := svc.MarkBoundToJobFenced(ctx, g.ID, jobID, "job_created", prov, fence); err != nil {
+	decide := func(ctx context.Context, tx *sql.Tx) (BindProvenance, error) {
+		return BindProvenance{Method: "candidate_auto_bind", Rule: "candidate_auto_bind/2", Winner: jobID, CandidatesConsidered: 1, Evidence: []string{"title_printed"}}, nil
+	}
+	if err := svc.MarkBoundToJobFenced(ctx, g.ID, jobID, "job_created", decide); err != nil {
 		t.Fatalf("MarkBoundToJobFenced: %v", err)
 	}
 	got, _ := svc.Get(ctx, g.ID)

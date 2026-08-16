@@ -159,6 +159,13 @@ var ErrInvalidFrame = errors.New("invalid browser frame")
 // deterministic without relying on file-system timing. Nil in production.
 var beforeAutoBindFenceForTest func() error
 
+// beforeAutoBindTxForTest runs after the pre-transaction candidate decision
+// and before the binding transaction opens. That is the window the fence
+// exists to cover, and it is the only place a test can change the eligibility
+// pool safely: inside the transaction the store's single connection is
+// already held, so a pool write there would deadlock. Nil in production.
+var beforeAutoBindTxForTest func() error
+
 // afterAutoBindCommitForTest runs after MarkBoundToJobFenced commits but before
 // the validated bytes are staged into the winner's adoption directory. Tests
 // use it to simulate a concurrent cancel/terminal transition between commit
@@ -7424,138 +7431,41 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 	// a KNOWN identifier and do not apply here (see pdf.FrontMatterDOIs).
 	dois := pdf.FrontMatterDOIs(report.Text.Excerpt)
 	if len(dois) == 0 {
-		// Auto-bind attempt before the inevitable park: only ever converts a
-		// park into a bind, never a park into a failure. Reads the candidate
-		// pool once outside the transaction against the same immutable
-		// excerpt, then fenced inside MarkBoundToJobFenced. Abstention is
-		// the default — empty pool, ties, or Review all park exactly as
-		// today.
-		candidates, err := b.jobs.ListCandidateEligibleJobs(ctx)
-		if err != nil {
-			return err
-		}
-		if len(candidates) > 0 {
-			bindCandidates := make([]pdf.BindCandidate, 0, len(candidates))
-			for _, c := range candidates {
-				bindCandidates = append(bindCandidates, pdf.BindCandidate{
-					Key:   c.JobID,
-					Work:  c.Work,
-					Bound: c.BoundDOIs,
-				})
+		// AUTONOMOUS CANDIDATE BINDING IS DISABLED. A settled DOI-less grab
+		// parks for human identification.
+		//
+		// WHY: the acceptance rule's identifier gate treats a page-one
+		// occurrence of the candidate's identifier as the document
+		// identifying ITSELF, and it is not that.
+		// corroboratingIdentifier(identityPageOne(...)) accepts a CITED DOI
+		// exactly as readily as a printed self-identifier. So a journal
+		// expansion of a preprint that prints "Extended from DOI <target>" on
+		// page one corroborates the target, while its own DOI sits past the
+		// 1 KiB blind window the conclusive-identity veto reads — nothing
+		// contradicts, every gate passes, and a DIFFERENT work is filed under
+		// a right citation. That is this project's cardinal failure mode: the
+		// wrong accept is silent and permanent, while the park it replaces
+		// costs one human decision. Until the predicate can tell "this
+		// document is X" from "this document cites X", no autonomous decision
+		// is defensible.
+		//
+		// The machinery below stays whole and stays reachable. The predicate,
+		// the eligibility pool, the in-transaction fence, the provenance
+		// column and the measurement corpus are the substrate the
+		// candidate_auto_bind/2 rebuild needs, and /2 changes the predicate,
+		// not the transaction discipline around it. Only the DECISION is off:
+		// tests set autoBindDecisionEnabled so the fence, staging and recovery
+		// paths keep being exercised.
+		if autoBindDecisionEnabled {
+			bound, err := b.attemptAutoBind(ctx, g, dir, name, temp, report.Text.Excerpt)
+			if err != nil {
+				return err
 			}
-			excerpt := report.Text.Excerpt
-			winner, ok, abstainReason := pdf.SelectAutoBindCandidate(excerpt, bindCandidates)
-			if ok {
-				prov := grab.BindProvenance{
-					Method:               "candidate_auto_bind",
-					Rule:                 pdf.CandidateBindingRule,
-					Winner:               winner.Key,
-					CandidatesConsidered: len(bindCandidates),
-					Evidence:             winner.Evidence,
-				}
-				fence := func(ctx context.Context, tx *sql.Tx) error {
-					if beforeAutoBindFenceForTest != nil {
-						if err := beforeAutoBindFenceForTest(); err != nil {
-							return err
-						}
-					}
-					// Re-read through the transaction's connection only —
-					// the pool is a single connection the transaction already
-					// holds, so a pool read here would deadlock. A recompute
-					// outside the serialization point fences nothing, because
-					// another writer can change eligibility between the
-					// decision and the CAS.
-					fresh, err := job.ListCandidateEligibleJobsTx(ctx, tx)
-					if err != nil {
-						return err
-					}
-					freshCandidates := make([]pdf.BindCandidate, 0, len(fresh))
-					for _, c := range fresh {
-						freshCandidates = append(freshCandidates, pdf.BindCandidate{
-							Key:   c.JobID,
-							Work:  c.Work,
-							Bound: c.BoundDOIs,
-						})
-					}
-					freshWinner, freshOK, _ := pdf.SelectAutoBindCandidate(excerpt, freshCandidates)
-					if !freshOK || freshWinner.Key != winner.Key {
-						return grab.ErrFenceRejected
-					}
-					return nil
-				}
-				if err := b.grabs.MarkBoundToJobFenced(ctx, g.ID, winner.Key, "job_created", prov, fence); err != nil {
-					if errors.Is(err, grab.ErrFenceRejected) {
-						log.Printf("papio: auto-bind abstained for grab %s: fence rejected (winner %s, abstain %s)", g.ID, winner.Key, abstainReason)
-						_ = os.RemoveAll(dir)
-						return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
-					}
-					return err
-				}
-				if afterAutoBindCommitForTest != nil {
-					if err := afterAutoBindCommitForTest(g.ID, winner.Key); err != nil {
-						log.Printf("papio: afterAutoBindCommit hook: %v", err)
-					}
-				}
-				// Private staging is the validated immutable quarantine copy (temp).
-				// It is the only source that reaches the winner's adoption directory,
-				// and only after the claim is durable. This closes TOCTOU (mutable
-				// landing file), the name=="" directory-copy bug, and the pre-commit
-				// orphan-adoption window in one: no bytes are visible to
-				// SweepAdoptions until the bind has committed.
-				jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), winner.Key)
-				if err := os.MkdirAll(jobDir, 0o700); err != nil {
-					// Claim is durable but staging failed — keep temp for recovery
-					// and record a deferred adoption with the intended filename.
-					fallback := name
-					if fallback == "" || !filepath.IsLocal(fallback) || fallback == "." || fallback == string(filepath.Separator) {
-						fallback = "grab.pdf"
-					}
-					_ = b.recordAdoptionDeferred(ctx, winner.Key, fallback, err)
-					return nil
-				}
-				fallbackName := name
-				if fallbackName == "" || !filepath.IsLocal(fallbackName) || fallbackName == "." || fallbackName == string(filepath.Separator) {
-					fallbackName = "grab.pdf"
-				}
-				dest := uniqueAdoptionDest(jobDir, fallbackName)
-				if err := b.copyGrabFile(temp, dest); err != nil {
-					_ = b.recordAdoptionDeferred(ctx, winner.Key, fallbackName, err)
-					return nil
-				}
-				boundName := filepath.Base(dest)
-				if _, err := b.ingestAdoptedFile(ctx, winner.Key, boundName, nil, nil); err != nil {
-					if evErr := b.recordAdoptionDeferred(ctx, winner.Key, boundName, err); evErr != nil {
-						return evErr
-					}
-					// Keep temp and the staged dest for filename-keyed recovery;
-					// do NOT RemoveAll(dir) yet — the orphan would be cleaned on
-					// success only. A terminal winner's directory is normally
-					// collectible, so move the staged copy to rejected/ to keep it
-					// human-visible when the job cannot be adopted.
-					if row, getErr := b.jobs.Get(ctx, winner.Key); getErr == nil && row != nil && job.Terminal(row.State) {
-						_ = b.preserveDeferredAdoption(winner.Key, boundName, dest)
-					}
-					return nil
-				}
-				_ = os.Remove(temp)
-				_ = os.RemoveAll(dir)
+			if bound {
 				return nil
 			}
 		}
 		_ = os.RemoveAll(dir)
-
-		if len(candidates) == 0 {
-			log.Printf("papio: auto-bind abstained for grab %s: no candidates", g.ID)
-		} else {
-			bindCandidates2 := make([]pdf.BindCandidate, 0, len(candidates))
-			for _, c := range candidates {
-				bindCandidates2 = append(bindCandidates2, pdf.BindCandidate{Key: c.JobID, Work: c.Work, Bound: c.BoundDOIs})
-			}
-			_, _, abstainReason := pdf.SelectAutoBindCandidate(report.Text.Excerpt, bindCandidates2)
-			if abstainReason != "" {
-				log.Printf("papio: auto-bind abstained for grab %s: %s (candidates %d)", g.ID, abstainReason, len(bindCandidates2))
-			}
-		}
 		return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
 	}
 	var mismatch error
@@ -7571,6 +7481,185 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 		return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
 	}
 	return nil
+}
+
+// autoBindDecisionEnabled gates the autonomous candidate-binding decision. It
+// is false in every shipped build — see the WHY at the call site in
+// processSettledGrab — and only the package's own tests set it, so the /2
+// substrate stays under test while no operator's library can be corrupted by
+// it. It is a plain var rather than a config knob on purpose: this is not an
+// operator preference, and an unsafe rule must not be switchable back on from
+// a TOML file.
+var autoBindDecisionEnabled = false
+
+// attemptAutoBind runs the candidate-binding decision for one settled DOI-less
+// grab and, on success, stages and ingests its validated bytes. It reports
+// whether the grab was bound and fully handled; (false, nil) is abstention and
+// the caller must park.
+//
+// Abstention is the default: an empty pool, a tie, a Review verdict, or a
+// fence rejection all return (false, nil). The only path that returns true is
+// a committed bind.
+func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, temp, excerpt string) (bool, error) {
+	candidates, err := b.jobs.ListCandidateEligibleJobs(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(candidates) == 0 {
+		log.Printf("papio: auto-bind abstained for grab %s: no candidates", g.ID)
+		return false, nil
+	}
+	bindCandidates := make([]pdf.BindCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		bindCandidates = append(bindCandidates, pdf.BindCandidate{
+			Key:   c.JobID,
+			Work:  c.Work,
+			Bound: c.BoundDOIs,
+		})
+	}
+	winner, ok, abstainReason := pdf.SelectAutoBindCandidate(excerpt, bindCandidates)
+	if !ok {
+		if abstainReason != "" {
+			log.Printf("papio: auto-bind abstained for grab %s: %s (candidates %d)", g.ID, abstainReason, len(bindCandidates))
+		}
+		return false, nil
+	}
+	if beforeAutoBindTxForTest != nil {
+		if err := beforeAutoBindTxForTest(); err != nil {
+			return false, err
+		}
+	}
+	// The provenance is built by the decision that runs INSIDE the binding
+	// transaction, never by this pre-transaction one. Carrying provenance
+	// across the fence and comparing only the winner's KEY let a pool that
+	// changed under an unchanged key commit stale evidence, a stale loser set
+	// and a stale candidate count — an audit trail describing a decision that
+	// did not happen.
+	decide := func(ctx context.Context, tx *sql.Tx) (grab.BindProvenance, error) {
+		if beforeAutoBindFenceForTest != nil {
+			if err := beforeAutoBindFenceForTest(); err != nil {
+				return grab.BindProvenance{}, err
+			}
+		}
+		// Re-read through the transaction's connection only — the pool is a
+		// single connection the transaction already holds, so a pool read
+		// here would deadlock. A recompute outside the serialization point
+		// fences nothing, because another writer can change eligibility
+		// between the decision and the CAS.
+		fresh, err := job.ListCandidateEligibleJobsTx(ctx, tx)
+		if err != nil {
+			return grab.BindProvenance{}, err
+		}
+		freshCandidates := make([]pdf.BindCandidate, 0, len(fresh))
+		for _, c := range fresh {
+			freshCandidates = append(freshCandidates, pdf.BindCandidate{
+				Key:   c.JobID,
+				Work:  c.Work,
+				Bound: c.BoundDOIs,
+			})
+		}
+		freshWinner, freshOK, _ := pdf.SelectAutoBindCandidate(excerpt, freshCandidates)
+		if !freshOK || freshWinner.Key != winner.Key {
+			return grab.BindProvenance{}, grab.ErrFenceRejected
+		}
+		return autoBindProvenance(excerpt, freshCandidates, freshWinner), nil
+	}
+	if err := b.grabs.MarkBoundToJobFenced(ctx, g.ID, winner.Key, "job_created", decide); err != nil {
+		if errors.Is(err, grab.ErrFenceRejected) {
+			log.Printf("papio: auto-bind abstained for grab %s: fence rejected (winner %s)", g.ID, winner.Key)
+			return false, nil
+		}
+		return false, err
+	}
+	if afterAutoBindCommitForTest != nil {
+		if err := afterAutoBindCommitForTest(g.ID, winner.Key); err != nil {
+			log.Printf("papio: afterAutoBindCommit hook: %v", err)
+		}
+	}
+	// Private staging is the validated immutable quarantine copy (temp).
+	// It is the only source that reaches the winner's adoption directory,
+	// and only after the claim is durable. This closes TOCTOU (mutable
+	// landing file), the name=="" directory-copy bug, and the pre-commit
+	// orphan-adoption window in one: no bytes are visible to
+	// SweepAdoptions until the bind has committed.
+	jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), winner.Key)
+	if err := os.MkdirAll(jobDir, 0o700); err != nil {
+		// Claim is durable but staging failed — keep temp for recovery
+		// and record a deferred adoption with the intended filename.
+		fallback := name
+		if fallback == "" || !filepath.IsLocal(fallback) || fallback == "." || fallback == string(filepath.Separator) {
+			fallback = "grab.pdf"
+		}
+		_ = b.recordAdoptionDeferred(ctx, winner.Key, fallback, err)
+		return true, nil
+	}
+	fallbackName := name
+	if fallbackName == "" || !filepath.IsLocal(fallbackName) || fallbackName == "." || fallbackName == string(filepath.Separator) {
+		fallbackName = "grab.pdf"
+	}
+	dest := uniqueAdoptionDest(jobDir, fallbackName)
+	if err := b.copyGrabFile(temp, dest); err != nil {
+		_ = b.recordAdoptionDeferred(ctx, winner.Key, fallbackName, err)
+		return true, nil
+	}
+	boundName := filepath.Base(dest)
+	if _, err := b.ingestAdoptedFile(ctx, winner.Key, boundName, nil, nil); err != nil {
+		if evErr := b.recordAdoptionDeferred(ctx, winner.Key, boundName, err); evErr != nil {
+			return true, evErr
+		}
+		// Keep temp and the staged dest for filename-keyed recovery;
+		// do NOT RemoveAll(dir) yet — the orphan would be cleaned on
+		// success only. A terminal winner's directory is normally
+		// collectible, so move the staged copy to rejected/ to keep it
+		// human-visible when the job cannot be adopted.
+		if row, getErr := b.jobs.Get(ctx, winner.Key); getErr == nil && row != nil && job.Terminal(row.State) {
+			_ = b.preserveDeferredAdoption(winner.Key, boundName, dest)
+		}
+		return true, nil
+	}
+	_ = os.Remove(temp)
+	_ = os.RemoveAll(dir)
+	return true, nil
+}
+
+// autoBindProvenance serialises one 1-of-N binding decision into an audit
+// record a human can reconstruct: the ordered candidates that were on the
+// table with each one's terminal verdict, the winner's evidence, the exact
+// rule version, and a hash pinning the bytes the predicate read.
+//
+// It stores no scholarly text. The excerpt is identified by digest, not
+// copied: the document itself is already durable in the artifact store, and a
+// second copy in an audit column would be content nothing manages the lifetime
+// of. Losing candidates contribute their machine reason code only — the
+// winner's evidence is the one place document-derived strings belong, because
+// it is the justification for the row that was written.
+func autoBindProvenance(excerpt string, candidates []pdf.BindCandidate, winner pdf.CandidateQualification) grab.BindProvenance {
+	sum := sha256.Sum256([]byte(excerpt))
+	verdicts := make([]grab.CandidateVerdict, 0, len(candidates))
+	for _, c := range candidates {
+		q := pdf.QualifyCandidate(excerpt, c)
+		v := grab.CandidateVerdict{JobID: c.Key}
+		switch {
+		case q.Qualifies:
+			v.Verdict = "qualifies"
+		case q.Review:
+			v.Verdict = "review"
+			v.Reason = q.Reason
+		default:
+			v.Verdict = "rejected"
+			v.Reason = q.Reason
+		}
+		verdicts = append(verdicts, v)
+	}
+	return grab.BindProvenance{
+		Method:               "candidate_auto_bind",
+		Rule:                 pdf.CandidateBindingRule,
+		Winner:               winner.Key,
+		CandidatesConsidered: len(candidates),
+		Evidence:             winner.Evidence,
+		Candidates:           verdicts,
+		ExcerptSHA256:        hex.EncodeToString(sum[:]),
+	}
 }
 
 // errGrabIdentityMismatch means this front-matter DOI names a ready bundle

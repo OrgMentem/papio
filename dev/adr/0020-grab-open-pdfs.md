@@ -56,8 +56,18 @@ Constraints that bound the design:
      adoption) picks up the settled file.
 4. **Identity from the file, then an ordinary job.** The daemon quarantines
    the capture, runs structural validation, and extracts front-matter
-   identifiers (`documentDOIs`, plus the existing arXiv/PMID front-matter
-   patterns where present):
+   identifiers. *Amended 2026-08-16:* the blind identifier class is **DOI
+   only** (`FrontMatterDOIs`). This clause originally said "plus the
+   existing arXiv/PMID front-matter patterns where present"; that is
+   superseded. arXiv and PMID recognition is **target-aware** — it requires
+   a candidate to check against, so a target-less pipeline cannot use it
+   without minting an identifier, which Decision 4 forbids. The consequence
+   is deliberate and worth stating: a capture whose front matter names only
+   an arXiv id or a PMID parks rather than creating a job, and the
+   conclusive-identity veto likewise cannot see a foreign arXiv/PMID work.
+   Widening the blind class later means widening it in `FrontMatterDOIs`,
+   the veto, and ordinary grab identification together, using the existing
+   normalizers — not in one of the three.
    - **Identifier found** → create the ordinary identifier-keyed job
      (consumer `browser-pdf:<host>`), with the captured file injected as a
      top-ranked local candidate. Resolution proceeds normally — metadata
@@ -167,3 +177,50 @@ safety against curated hard negatives, not coverage over the operator's
 real library. Coverage is therefore unknown: the gate establishes that
 auto-bind does not misfile the cases it was shown, not how often it fires
 in practice.
+
+### Amended again, 2026-08-16: autonomous binding is disabled
+
+A fourth review round (pro-tier oracle, verdict NEEDS REVISION) found that
+`candidate_auto_bind/1` had deterministic wrong-accept paths, and that the
+gate above could not have seen them. **Autonomous binding is switched off.**
+A settled DOI-less grab parks for human identification, exactly as Decision 4
+originally specified. The picker (Phase 1) and the conclusive-identity veto
+stand; only the autonomous decision is withdrawn.
+
+The root cause was one error repeated across gates, not five separate bugs:
+the rule treated a hit anywhere in a 2 KiB window as positional evidence, and
+treated a candidate-aware identifier hit as the document identifying **itself**
+— when the entire danger class is "another document mentions the candidate".
+A journal expansion printing "Extended from DOI *X*", with its own DOI just
+past the 1 KiB blind window, satisfied every gate and would have been filed as
+*X*. The gate could not see it because its hard negatives supplied the
+ingredients separately (a foreign DOI with unrelated title and authors; a
+conference/journal pair distinguished by year) and never composed them into a
+single relational block — a citation card, a repository cover sheet, an
+"extends" line — which is how the failure actually presents.
+
+Two further corrections landed with the disablement, both independent of the
+rule: the veto **collapsed DOI registrant slash runs**, so a document
+conclusively naming `10.48612//x` read as compatible with a job bound to
+`10.48612/x` — two separately registered DataCite works (the pinned pair in
+`internal/ownership`). It now abstains on that difference, which is correct
+under both competing facts, since a legacy APA reprint printing `10.1037//…`
+for the same work is equally unresolvable lexically. And
+`corroboratingIdentifier` collapsed only its needle and never the page, so a
+target registered with a doubled slash searched for the single-slash form and
+reported the *other* work as corroboration.
+
+`candidate_auto_bind/2` is a redesign, not a patch. It requires
+self-identification rather than corroboration (scan the whole window for every
+identifier, abstain on any foreign or additional one, and require the
+candidate's identifier in a self-identifier locus), one parsed front-matter
+assertion supplying title/byline/year/own-identifier together with abstention
+on unrecognised layouts, an exact daemon-minted delivery lease naming job and
+action (which needs a new feature-gated message kind — the no-wire-change
+preference does not outrank exact authority), a durable claim that reserves
+the winning job and action so two grabs cannot both bind one job, a gate that
+asserts **observed** traversal rather than declared labels, and the previously
+deferred backlog replay with full candidate pools. That last item is now a
+blocker: deferring it was only defensible while the rule was believed sound.
+The working plan (`dev/active/send-pdf-candidate-binding.md`) carries the
+itemised blocking set; this ADR carries the decision.

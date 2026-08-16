@@ -1,0 +1,16 @@
+Adaptive Sampling for Streaming Graph Partitioning
+
+Elena Vargas, Kenji Tanaka
+Synthetic Systems Group, OrgMentem Institute
+
+Journal of Synthetic Systems, volume 8, pages 44-71, 2022
+
+Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. 
+Extended from DOI 10.5555/synth.2022.501, presented at the Synthetic Systems Workshop.
+This journal version doubles the evaluation, adds two datasets, and supersedes the workshop paper.
+Article DOI: 10.5555/synth.2022.777
+
+Abstract
+We revisit adaptive sampling for streaming graph partitioning with an extended evaluation.
+
+Keywords: streaming graphs, partitioning

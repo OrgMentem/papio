@@ -875,7 +875,18 @@ export interface BridgeDeps {
     onCommitted?: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
     onHistoryStateUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
     onReferenceFragmentUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
-    onTabReplaced: Listenable<[{ addedTabId: number; removedTabId: number }]>;
+    /** chrome.webNavigation.onTabReplaced delivers `{tabId, replacedTabId}`
+     * (tabId is the new tab). `{addedTabId, removedTabId}` belongs to the
+     * *separate* tabs.onReplaced API; reading those names off this event
+     * yields undefined and silently disarms every revocation below. */
+    onTabReplaced: Listenable<[{ tabId: number; replacedTabId: number }]>;
+    /** Live top-frame document epoch, read from the browser instead of from
+     * `pageNavSeq`/an in-memory map: MV3 kills the worker at will, and an
+     * emptied map must never read as "the page has not changed". */
+    getFrame?(details: {
+      tabId: number;
+      frameId: number;
+    }): Promise<{ documentId?: string } | null | undefined>;
   };
   /** Extension-page broadcast channel (runtime.onMessage), distinct from tabs.sendMessage content-script delivery. */
   runtimeSendMessage?(message: object): Promise<unknown>;
@@ -2155,8 +2166,9 @@ export class Bridge {
     { pageIdentity: PageIdentity; candidates: string[]; mintedAt: number }
   >();
   // Per-tab same-document navigation sequence. Invalidated on tab close/replace.
+  // Worker-local and therefore only ever corroborating evidence: the document
+  // epoch that actually gates authority is read live from webNavigation.
   private readonly pageNavSeq = new Map<number, number>();
-  private readonly pageDocumentId = new Map<number, string | undefined>();
   private webNavigationBound = false;
   /** Resolver-provided offer URLs are cached here after storage hydration. */
   private readonly offerURLs = new Map<string, string>();
@@ -4972,14 +4984,41 @@ export class Bridge {
       return comparable.slice(0, end);
     }
   }
-  private currentPageIdentity(tabId: number, sourceURL: string): PageIdentity {
+  /** The top frame's current document epoch, straight from the browser.
+   *
+   * Never from `pageNavSeq` or any worker-local cache: MV3 suspends the worker
+   * whenever it likes, and after a restart every such map is empty. An empty
+   * map that reads as "unchanged" is precisely how a picker minted against one
+   * document gets spent on a different one at the same path. `undefined` here
+   * means "papio cannot tell what this tab is showing" — every caller must
+   * treat that as a refusal, never as permission. */
+  private async liveDocumentEpoch(tabId: number): Promise<string | undefined> {
+    const nav = this.deps.webNavigation;
+    if (nav?.getFrame === undefined) return undefined;
+    try {
+      const frame = await nav.getFrame({ tabId, frameId: 0 });
+      const epoch = frame?.documentId;
+      return typeof epoch === "string" && epoch.length > 0 ? epoch : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Authority-bearing page identity, or `undefined` when the platform cannot
+   * supply a document epoch — on such a platform the picker and the persistent
+   * manual continuation are simply unavailable, because nothing else here can
+   * tell two documents at one path apart. */
+  private async currentPageIdentity(
+    tabId: number,
+    sourceURL: string,
+  ): Promise<PageIdentity | undefined> {
+    const epoch = await this.liveDocumentEpoch(tabId);
+    if (epoch === undefined) return undefined;
     return {
       tab_id: tabId,
       nav_seq: this.pageNavSeq.get(tabId) ?? 0,
       source_url: this.pageSourceToken(sourceURL),
-      ...(this.pageDocumentId.get(tabId) !== undefined
-        ? { document_id: this.pageDocumentId.get(tabId)! }
-        : {}),
+      document_id: epoch,
     };
   }
 
@@ -4987,11 +5026,13 @@ export class Bridge {
     if (a.tab_id !== b.tab_id) return false;
     if (a.nav_seq !== b.nav_seq) return false;
     if (a.source_url !== b.source_url) return false;
-    // Token is origin+pathname (query stripped for credential safety and to avoid rejecting same doc with re-issued signed query). Two docs from one path differing only in query look identical, so epoch distinguishes them.
-    if ((a.document_id === undefined) !== (b.document_id === undefined)) return false;
-    if (a.document_id === undefined && b.document_id === undefined) return true;
-    if (a.document_id !== b.document_id) return false;
-    return true;
+    // The token is origin+pathname only: a signed provider query is a bearer
+    // credential and providers re-issue it for the same document, so the query
+    // cannot be compared. Two *different* documents served from one path are
+    // therefore indistinguishable here and the epoch is the only separator.
+    // A missing epoch on either side is not "unchanged", it is "unknown".
+    if (a.document_id === undefined || b.document_id === undefined) return false;
+    return a.document_id === b.document_id;
   }
 
   private isFirefox(): boolean {
@@ -5065,57 +5106,58 @@ export class Bridge {
     if (this.webNavigationBound) return;
     this.webNavigationBound = true;
     try {
-      const wn = (globalThis as unknown as { chrome?: { webNavigation?: unknown } }).chrome?.webNavigation as
-        | {
-            onCommitted?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
-            onHistoryStateUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
-            onReferenceFragmentUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
-            onTabReplaced?: { addListener: (cb: (d: { addedTabId: number; removedTabId: number }) => void) => void };
-          }
-        | undefined;
+      type NavListener = {
+        addListener: (
+          cb: (d: { tabId: number; frameId: number; documentId?: string }) => void,
+        ) => void;
+      };
+      type NavAPI = {
+        onCommitted?: NavListener;
+        onHistoryStateUpdated?: NavListener;
+        onReferenceFragmentUpdated?: NavListener;
+        onTabReplaced?: {
+          addListener: (
+            cb: (d: { tabId: number; replacedTabId: number }) => void,
+          ) => void;
+        };
+      };
+      // The MV3 platform globals are not in this module's lib types; when
+      // `chrome.webNavigation` exists at all, the browser guarantees its shape.
+      const globalChrome = globalThis as unknown as {
+        chrome?: { webNavigation?: NavAPI };
+      };
+      const wn = globalChrome.chrome?.webNavigation;
       const depsWN = this.deps.webNavigation;
       const nav = (depsWN as unknown) ?? wn;
       if (nav === undefined || nav === null) return;
-      const n = nav as {
-        onCommitted?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
-        onHistoryStateUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
-        onReferenceFragmentUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
-        onTabReplaced?: { addListener: (cb: (d: { addedTabId: number; removedTabId: number }) => void) => void };
+      const n = nav as NavAPI;
+      const observeNavigation = (d: { tabId: number; frameId: number }): void => {
+        if (d.frameId !== 0) return;
+        this.pageNavSeq.set(d.tabId, (this.pageNavSeq.get(d.tabId) ?? 0) + 1);
+        this.destroyDeliveryChoiceForTab(d.tabId);
       };
       n.onCommitted?.addListener((d) => {
         if (d.frameId !== 0) return;
-        const cur = this.pageNavSeq.get(d.tabId) ?? 0;
-        this.pageNavSeq.set(d.tabId, cur + 1);
-        if (d.documentId !== undefined) this.pageDocumentId.set(d.tabId, d.documentId);
-        this.destroyDeliveryChoiceForTab(d.tabId);
+        observeNavigation(d);
+        // A committed top-frame navigation replaces the document the manual
+        // continuation was granted against, so the continuation dies with it.
         const pi = this.store.pendingDelivery?.page_identity;
         if (pi !== undefined && pi.tab_id === d.tabId) {
           void this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
         }
       });
-      n.onHistoryStateUpdated?.addListener((d) => {
-        if (d.frameId !== 0) return;
-        const cur = this.pageNavSeq.get(d.tabId) ?? 0;
-        this.pageNavSeq.set(d.tabId, cur + 1);
-        if (d.documentId !== undefined) this.pageDocumentId.set(d.tabId, d.documentId);
-        this.destroyDeliveryChoiceForTab(d.tabId);
-      });
-      n.onReferenceFragmentUpdated?.addListener((d) => {
-        if (d.frameId !== 0) return;
-        const cur = this.pageNavSeq.get(d.tabId) ?? 0;
-        this.pageNavSeq.set(d.tabId, cur + 1);
-        if (d.documentId !== undefined) this.pageDocumentId.set(d.tabId, d.documentId);
-        this.destroyDeliveryChoiceForTab(d.tabId);
-      });
+      n.onHistoryStateUpdated?.addListener(observeNavigation);
+      n.onReferenceFragmentUpdated?.addListener(observeNavigation);
+      // Prerender/instant activation swaps a whole tab out. `tabId` is the tab
+      // that took over; `replacedTabId` is the one that went away. Neither id
+      // keeps any authority: the page the researcher was looking at is gone.
       n.onTabReplaced?.addListener((d) => {
-        this.pageNavSeq.delete(d.removedTabId);
-        this.pageDocumentId.delete(d.removedTabId);
-        this.destroyDeliveryChoiceForTab(d.removedTabId);
-        this.destroyDeliveryChoiceForTab(d.addedTabId);
-        this.pageNavSeq.delete(d.addedTabId);
-        this.pageDocumentId.delete(d.addedTabId);
+        this.pageNavSeq.delete(d.replacedTabId);
+        this.pageNavSeq.delete(d.tabId);
+        this.destroyDeliveryChoiceForTab(d.replacedTabId);
+        this.destroyDeliveryChoiceForTab(d.tabId);
         const pi = this.store.pendingDelivery?.page_identity;
-        if (pi !== undefined && pi.tab_id === d.removedTabId) {
+        if (pi !== undefined && (pi.tab_id === d.replacedTabId || pi.tab_id === d.tabId)) {
           void this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
         }
       });
@@ -5217,21 +5259,28 @@ export class Bridge {
       } catch {
         return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
       }
-      const liveTabURL = typeof tabCheck.url === "string" ? tabCheck.url : payload.url;
+      // `Tab.url` is optional by API contract. Its absence means papio cannot
+      // see what this tab is showing — it is not a licence to fall back on the
+      // popup's own claim about the page it thinks it was on. Refuse.
+      if (typeof tabCheck.url !== "string" || tabCheck.url.length === 0) {
+        return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+      }
+      const liveTabURL = tabCheck.url;
+      const liveEpoch = await this.liveDocumentEpoch(payload.tab_id);
+      if (liveEpoch === undefined) {
+        return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+      }
       const liveIdentity: PageIdentity = {
         tab_id: payload.tab_id,
         nav_seq: this.pageNavSeq.get(payload.tab_id) ?? 0,
         source_url: this.pageSourceToken(liveTabURL),
-        ...(this.pageDocumentId.get(payload.tab_id) !== undefined
-          ? { document_id: this.pageDocumentId.get(payload.tab_id)! }
-          : {}),
+        document_id: liveEpoch,
       };
       if (!this.pageIdentityMatches(entry.pageIdentity, liveIdentity)) {
         return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
       }
       this.destroyDeliveryChoiceForTab(payload.tab_id);
-      const tabURLForChoice = liveTabURL;
-      const urlForChoice = this.comparableDeliverySourceURL(tabURLForChoice);
+      const urlForChoice = this.comparableDeliverySourceURL(liveTabURL);
       const pending = this.store.pendingDelivery;
       const isStuckSending = pending !== undefined && pending.status === "sending" && pending.job_id === pickedJob.job_id;
       if (isStuckSending) {
@@ -5250,9 +5299,9 @@ export class Bridge {
       } else if (pending?.job_id === pickedJob.job_id && pending.status !== "failed") {
         return { ok: true, state: pending.status ?? "sending", job_id: pickedJob.job_id } as DeliveryReply;
       }
-      if (requiresNativeViewerDownload(urlForChoice ?? "")) {
+      if (requiresNativeViewerDownload(urlForChoice)) {
         const message = "Use the PDF viewer Download button — papio will adopt that authorized file";
-        const deliveryPageHostAtStart = sanitizePageHost(tabURLForChoice);
+        const deliveryPageHostAtStart = sanitizePageHost(liveTabURL);
         const sessionEvidenceAtStart = this.currentSessionEvidence(pickedJob);
         const pageIdentityForContinuation: PageIdentity = entry.pageIdentity;
         await this.update((s) => {
@@ -5280,7 +5329,7 @@ export class Bridge {
         this.lastDeliveryState = undefined;
         return { ok: true, state: "waiting_manual", job_id: pickedJob.job_id, message } as DeliveryReply;
       }
-      const deliveryPageHostAtStart = sanitizePageHost(tabURLForChoice);
+      const deliveryPageHostAtStart = sanitizePageHost(liveTabURL);
       const sessionEvidenceAtStart = this.currentSessionEvidence(pickedJob);
       await this.update((s) =>
         startPendingDelivery(s, {
@@ -5293,7 +5342,7 @@ export class Bridge {
         }),
       );
       this.lastDeliveryState = undefined;
-      const started = await this.startDeliveryDownload(pickedJob.job_id, urlForChoice ?? payload.url);
+      const started = await this.startDeliveryDownload(pickedJob.job_id, urlForChoice);
       if (!started) return failure("download_start", "Could not start the browser download") as unknown as DeliveryReply;
       return { ok: true, state: "sending", job_id: pickedJob.job_id } as DeliveryReply;
     }
@@ -5313,7 +5362,16 @@ export class Bridge {
         "The current PDF tab is no longer available",
       );
     }
-    const tabURL = typeof tab.url === "string" ? tab.url : payload.url;
+    // `Tab.url` is optional by API contract; absent means papio cannot read the
+    // page. Substituting the popup's claim would let stale caller-supplied
+    // input decide which bytes get filed under which paper.
+    if (typeof tab.url !== "string" || tab.url.length === 0) {
+      return failure(
+        "tab_unavailable",
+        "papio can't read this tab — reload the page, then click Send this PDF again",
+      );
+    }
+    const tabURL = tab.url;
     const viewerPDFURL = providerViewerPDFURL(tabURL, this.deps.adapterSpecs);
     const url = viewerPDFURL ?? this.comparableDeliverySourceURL(tabURL);
     if (viewerPDFURL === undefined && !isPDFPage(tabURL) && !isPDFPage(url)) {
@@ -5332,8 +5390,13 @@ export class Bridge {
         }
         const candidates = this.advisoryCandidates();
         if (candidates.length > 0) {
-          const sourceURL = url;
-          const pageIdentity = this.currentPageIdentity(payload.tab_id, sourceURL);
+          const pageIdentity = await this.currentPageIdentity(payload.tab_id, url);
+          if (pageIdentity === undefined) {
+            return failure(
+              "page_unverified",
+              "papio can't confirm which document this tab is showing — reload the page, then click Send this PDF again",
+            ) as unknown as DeliveryReply;
+          }
           const offer = this.mintDeliveryChoice(pageIdentity, candidates);
           return { ok: true, state: "needs_choice", choice: offer } as DeliveryReply;
         }
@@ -5424,6 +5487,16 @@ export class Bridge {
         "Use the PDF viewer Download button — papio will adopt that authorized file";
       const deliveryPageHostAtStart = sanitizePageHost(tabURL);
       const sessionEvidenceAtStart = this.currentSessionEvidence(job);
+      // The manual continuation outlives this call and survives worker
+      // restarts, so it is authority-bearing: mint it only against a document
+      // epoch the browser can hand back later for comparison.
+      const pageIdentity = await this.currentPageIdentity(payload.tab_id, url);
+      if (pageIdentity === undefined) {
+        return failure(
+          "page_unverified",
+          "papio can't confirm which document this tab is showing — reload the page, then click Send this PDF again",
+        );
+      }
       await this.update((s) => {
         const activeJobs = s.activeJobs.map((candidate) => {
           if (candidate.job_id === job.job_id) {
@@ -5448,7 +5521,7 @@ export class Bridge {
               ? { page_host: deliveryPageHostAtStart }
               : {}),
             session_evidence: sessionEvidenceAtStart,
-            page_identity: this.currentPageIdentity(payload.tab_id, url ?? payload.url),
+            page_identity: pageIdentity,
           },
         );
       });
@@ -15624,7 +15697,6 @@ export class Bridge {
     await this.ready;
     this.destroyDeliveryChoiceForTab(tabID);
     this.pageNavSeq.delete(tabID);
-    this.pageDocumentId.delete(tabID);
     // If pendingDelivery waiting_manual was bound to this tab, clear it — a later
     // page in the same tab_id must never revive authority.
     if (
@@ -15793,45 +15865,54 @@ export class Bridge {
       this.store.pendingDelivery.page_identity !== undefined
     ) {
       const pi = this.store.pendingDelivery.page_identity;
+      // Claiming a manual download files these bytes under a paper the
+      // researcher picked against one specific document. MV3 may have
+      // suspended and restarted the worker since, so every check below reads
+      // the browser rather than worker-local memory, and anything that cannot
+      // be read refuses instead of assuming nothing moved.
+      const abandonContinuation = async (): Promise<void> => {
+        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+        this.destroyDeliveryChoiceState();
+      };
       const pendingJob = findByJob(this.store, this.store.pendingDelivery.job_id);
       if (pendingJob === undefined || pendingJob.status !== "awaiting_download") {
-        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
-        this.destroyDeliveryChoiceState();
+        await abandonContinuation();
         return;
       }
+      // No recorded epoch means the continuation cannot be revalidated at all:
+      // the source token is origin+pathname, which two different signed
+      // documents from one provider path share exactly.
+      if (pi.document_id === undefined) {
+        await abandonContinuation();
+        return;
+      }
+      let liveTab: TabInfo;
       try {
-        const liveTab = await this.deps.tabs.get(pi.tab_id);
-        const liveToken = liveTab.url !== undefined ? this.pageSourceToken(liveTab.url) : undefined;
-        if (liveToken !== undefined && liveToken !== pi.source_url) {
-          await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
-          this.destroyDeliveryChoiceState();
-          return;
-        }
+        liveTab = await this.deps.tabs.get(pi.tab_id);
       } catch {
-        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
-        this.destroyDeliveryChoiceState();
+        await abandonContinuation();
+        return;
+      }
+      if (
+        typeof liveTab.url !== "string" ||
+        liveTab.url.length === 0 ||
+        this.pageSourceToken(liveTab.url) !== pi.source_url
+      ) {
+        await abandonContinuation();
+        return;
+      }
+      const liveEpoch = await this.liveDocumentEpoch(pi.tab_id);
+      if (liveEpoch === undefined || liveEpoch !== pi.document_id) {
+        await abandonContinuation();
         return;
       }
       const liveNavSeq = this.pageNavSeq.get(pi.tab_id);
-      const liveDocId = this.pageDocumentId.get(pi.tab_id);
       if (liveNavSeq !== undefined && liveNavSeq !== pi.nav_seq) {
-        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
-        this.destroyDeliveryChoiceState();
-        return;
-      }
-      if (pi.document_id !== undefined && liveDocId !== undefined && pi.document_id !== liveDocId) {
-        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
-        this.destroyDeliveryChoiceState();
-        return;
-      }
-      if (pi.document_id === undefined && liveDocId !== undefined) {
-        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
-        this.destroyDeliveryChoiceState();
+        await abandonContinuation();
         return;
       }
       if (typeof item.tabId === "number" && item.tabId !== pi.tab_id) {
-        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
-        this.destroyDeliveryChoiceState();
+        await abandonContinuation();
         return;
       }
     }
@@ -17631,6 +17712,10 @@ function realDeps(): BridgeDeps {
     ...(typeof chrome.webNavigation !== "undefined"
       ? {
           webNavigation: {
+            onCommitted: {
+              addListener: (cb) =>
+                chrome.webNavigation.onCommitted.addListener(cb as never),
+            },
             onHistoryStateUpdated: {
               addListener: (cb) =>
                 chrome.webNavigation.onHistoryStateUpdated.addListener(cb as never),
@@ -17643,6 +17728,13 @@ function realDeps(): BridgeDeps {
               addListener: (cb) =>
                 chrome.webNavigation.onTabReplaced.addListener(cb as never),
             },
+            // The live document epoch. Present on Chromium; on a browser whose
+            // getFrame omits `documentId` this resolves without one and the
+            // picker and manual continuation stay unavailable there by design.
+            getFrame: (details) =>
+              chrome.webNavigation.getFrame(details) as Promise<
+                { documentId?: string } | null
+              >,
           },
         }
       : {}),

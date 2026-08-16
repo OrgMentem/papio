@@ -35,7 +35,16 @@ import (
 // is the safe default. Any change to a bound or threshold is a new rule
 // version that must rerun the selection gate before it may auto-bind
 // anything.
-const CandidateBindingRule = "candidate_auto_bind/1"
+//
+// Version history. `/1` was the rule as first committed. Its acceptance set
+// then moved materially — front-matter correction and non-article markers
+// became gates, author evidence was scoped, title-prefix semantics tightened,
+// year semantics changed — while the constant stayed `/1`. A version that
+// names two different acceptance sets is not a version: a `/1` provenance row
+// cannot be told apart from an unsafe pre-repair one. Hence `/2`. Historical
+// provenance is never rewritten; rows genuinely decided by `/1` keep saying so
+// and `papio doctor` names them (see grab.Service.BoundByRule).
+const CandidateBindingRule = "candidate_auto_bind/2"
 
 // BindCandidate is one job inbound bytes might belong to.
 type BindCandidate struct {
@@ -44,6 +53,31 @@ type BindCandidate struct {
 	Bound []string // DOIs durably bound to that job
 }
 
+// CandidateGate names one gate of the candidate-binding rule. It exists so a
+// caller — in practice the Phase 2 measurement gate — can assert which gate a
+// candidate actually REACHED rather than trusting a corpus label. A label is a
+// claim about the rule; a trace is an observation of it, and the two diverge
+// silently (a case labelled "year" that dies at the author gate still counted
+// as year coverage before this existed). Gate identifiers are part of the
+// measurement contract, not of the acceptance decision: nothing in
+// QualifyCandidate branches on them.
+type CandidateGate string
+
+// Gates in rule order: gate 1 is the conclusive-identity veto, gate 1b splits
+// into the non-article and correction marker checks, then gates 2 to 5 are
+// author evidence, printed title, year token and page-one identifier. Every
+// gate a run evaluates is appended to Reached, so the terminal gate plus the
+// disposition fully locate a verdict.
+const (
+	GateConclusiveVeto CandidateGate = "conclusive-veto"
+	GateNonArticle     CandidateGate = "non-article-marker"
+	GateCorrection     CandidateGate = "correction-marker"
+	GateAuthor         CandidateGate = "author-evidence"
+	GateTitle          CandidateGate = "title-printed-as-line"
+	GateYear           CandidateGate = "year-token"
+	GateIdentifier     CandidateGate = "identifier-page-one"
+)
+
 // CandidateQualification explains one candidate's verdict.
 type CandidateQualification struct {
 	Key       string
@@ -51,6 +85,34 @@ type CandidateQualification struct {
 	Review    bool     // suggestive but insufficient: park for confirmation
 	Reason    string   // why not, when Qualifies is false
 	Evidence  []string // human-readable evidence for audit and review
+
+	// Gate is the gate evaluation stopped at, and Reached is every gate
+	// evaluated in rule order (Gate is its last element). Both are observed
+	// during the traversal below; neither is read by any decision.
+	Gate    CandidateGate
+	Reached []CandidateGate
+}
+
+// Disposition names the terminal outcome: accept, review or abstain. The gate
+// alone does not distinguish them — a run that reaches the identifier gate
+// accepts when the identifier is printed and parks for review when it is not.
+func (q CandidateQualification) Disposition() string {
+	switch {
+	case q.Qualifies:
+		return "accept"
+	case q.Review:
+		return "review"
+	default:
+		return "abstain"
+	}
+}
+
+// reach records arrival at a gate. Recording happens before the gate's
+// evidence is examined, so a run that stops at a gate is reported as having
+// reached it — reachability is the question the measurement gate asks.
+func (q *CandidateQualification) reach(g CandidateGate) {
+	q.Reached = append(q.Reached, g)
+	q.Gate = g
 }
 
 // QualifyCandidate applies the candidate-binding acceptance rule to one candidate.
@@ -74,6 +136,7 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// blind front-matter window must not be auto-bound on title/author
 	// similarity alone. CheckConclusiveIdentity is reused single-sourced so
 	// the window definition never diverges.
+	q.reach(GateConclusiveVeto)
 	veto := CheckConclusiveIdentity(excerpt, candidate.Bound)
 	if veto.Blocks() {
 		q.Reason = "conclusive_identity_blocks: " + veto.Verdict
@@ -114,11 +177,13 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// helpers (correctionMarkerIn already handles wide-gap gluing and the
 	// pointer-phrase exclusion single-sourced from identity.go).
 	foldedByline := typographicFolder.Replace(bylineText)
+	q.reach(GateNonArticle)
 	if m := candidateNonArticleMarker(foldedByline); m != "" {
 		q.Reason = "non_article_marker: " + m
 		q.Evidence = append(q.Evidence, "front matter marks non-article content: "+m)
 		return q
 	}
+	q.reach(GateCorrection)
 	if m := correctionMarkerIn(strings.Split(foldedByline, "\n")); m != "" {
 		q.Reason = "correction_marker: " + m
 		q.Evidence = append(q.Evidence, "front matter marks a correction or comment: "+m)
@@ -168,6 +233,7 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// in "Stone Analysis of ...") satisfy the gate with no author line
 	// present. That unsupported WHY is why this gate now reads
 	// candidateAuthorTokenSet.
+	q.reach(GateAuthor)
 	if len(candidate.Work.Authors) == 0 {
 		q.Reason = "author_evidence_required: target has no authors"
 		return q
@@ -232,6 +298,7 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// the bag check. Title evidence must come from a plausible title
 	// position before the byline/abstract, not a repeated header. A repeated
 	// identical segment is evidence of a running head, not of a title.
+	q.reach(GateTitle)
 	if phrase == "" || !candidateTitlePrintedAsLine(segments, phrase) {
 		q.Reason = "title_not_printed_as_line"
 		return q
@@ -268,6 +335,7 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// year token as \b(?:19|20)\d{2}\b; this gate reuses that definition via
 	// bylineYearPattern so the predicate compares year tokens with real
 	// boundaries, preserving the three neutral cases exactly.
+	q.reach(GateYear)
 	if candidate.Work.Year != 0 {
 		yearTokens := bylineYearPattern.FindAllString(bylineText, -1)
 		hasYears := len(yearTokens) > 0
@@ -307,6 +375,7 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// and worth surfacing as a ranked suggestion, but without a document-
 	// printed identifier it must not bind autonomously. A future change to
 	// the 4 KiB bound is a new rule version.
+	q.reach(GateIdentifier)
 	pageOne := identityPageOne(excerpt)
 	if corr := corroboratingIdentifier(pageOne, candidate.Work); corr == "" {
 		q.Review = true

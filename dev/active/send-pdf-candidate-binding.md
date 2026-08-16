@@ -1,6 +1,15 @@
 # Send PDF without the inbox "Open" step: candidate binding for DOI-less PDFs
 
-Status: implemented 2026-08-16 — Phases 1–3 shipped (popup picker replacing the inbox pin, conclusive-identity veto, `candidate_auto_bind/1` auto-bind fenced in the binding transaction with `pdf_grabs.bind_provenance` / migration 0037 / schema 37, zero-wrong-accept gate on the main corpus). Phase 4 (ranked one-click confirm) remains deliberately unbuilt, gated on observed parked-grab volume after these phases ship. ADR-0020 amendment landed; see the ADR; salvage normative content into that amendment before deleting this file.
+Status: **Phase 3 DISABLED 2026-08-16 after a fourth review round (pro-tier
+oracle, verdict NEEDS REVISION).** Phases 1–2 stand: the popup picker replaced
+the inbox pin, and the conclusive-identity veto holds. Autonomous binding does
+not run — a settled DOI-less grab parks for human identification again, as it
+did before this work. The machinery (predicate, eligibility pool, transaction
+fence, `pdf_grabs.bind_provenance`, migration 0037 / schema 37, corpus and
+gate) all stay in tree for the `candidate_auto_bind/2` rebuild; only the
+automatic decision is switched off. Phase 4 (ranked one-click confirm) remains
+unbuilt and is now moot until `/2` exists. See "Round 4: why Phase 3 was
+disabled" below for the blocking set; ADR-0020 carries the decision.
 
 ## Problem
 
@@ -383,3 +392,84 @@ extension list + authoritative daemon predicate.
 
 - Phase 4 `bound_job` vs. reusing `job_created` for the human-confirmed
   outcome — both enums are closed; default is reuse.
+
+## Round 4: why Phase 3 was disabled, and what `/2` must satisfy
+
+A pro-tier oracle review (`dev/scratch/oracle/20260816T114543Z-review-audit-v3/`)
+returned NEEDS REVISION. Every load-bearing claim below was independently
+confirmed in source before acting. The findings are not a list of bugs in an
+otherwise sound rule; they share one root cause, which is why this is a
+redesign rather than a patch:
+
+**The rule reads a 2 KiB blob and treats a hit anywhere in it as positional
+evidence, and it treats a candidate-aware identifier hit as the document
+identifying itself.** Round 3 fixed each gate individually. It never asked
+whether ALL the evidence could come from ONE relational block — a citation
+card, a repository cover sheet, an "Extended from" line — which is exactly
+the shape of the danger class, since the whole class is "another document
+mentions the candidate".
+
+Blocking set for `candidate_auto_bind/2`:
+
+1. **Self-identification, not corroboration.** Gate 5 accepts
+   `corroboratingIdentifier(identityPageOne(excerpt), candidate.Work)`
+   anywhere on page one, so a journal expansion printing "Extended from DOI
+   <target>" qualifies while its own DOI sits past the 1 KiB blind window
+   where the veto cannot see it. Reading farther for NEGATIVE evidence mints
+   nothing and is safe: scan the whole selection window for every identifier,
+   abstain on any foreign or additional one, and require the candidate's
+   identifier to occur in a self-identifier locus rather than in prose,
+   references, "extends", "comment on", or correction linkage.
+2. **One parsed front-matter assertion, not a token bag.** Title, byline,
+   year and own-identifier must come from the same parsed structure: one
+   unambiguous title span, a contiguous byline immediately following it, an
+   explicit byline end at affiliation/correspondence/journal metadata/body,
+   a publication-year locus. Remove the all-tokens-before-`abstract`
+   fallback; on an unrecognised layout, abstain. Today `candidateAuthorTokenSet`
+   performs no journal or affiliation classification despite its comment, and
+   `candidateTitlePrintedAsLine` only searches segment starts 0–3, so it
+   cannot detect a running head appearing later.
+3. **Title-boundary holes.** `candidateStrictTitleRunMatches` accepts a
+   subtitle wrapped to the next segment (`Foo:` / `A Different Study`) and
+   accepts a digit suffix (`Foo2`) that may be a numbered sequel rather than
+   a glued footnote marker. Return the exact consumed span and inspect the
+   remainder plus any continued title segment.
+4. **Year still matches inside dotted identifiers.** `\b(19|20)\d{2}\b`
+   matches `2019` in `10.1234/j.2019.05.003` because dots are non-word
+   characters. Mask identifiers, URLs, ISSNs, page ranges and grant tokens
+   before extraction; derive the year from the parsed metadata region; abstain
+   on multiple distinct plausible publication years.
+5. **Exact authority for a human pick.** The pick never crosses the wire, so
+   the daemon cannot tell a picked delivery from any other and acceptance is
+   fenced on "some open human action" — vulnerable to A1-dismissed-then-A2-opened
+   (an ABA). Exact authority needs a daemon-minted delivery lease naming the
+   job AND the action, consumed in the same transaction as the job transition,
+   with a uniqueness constraint. That requires a new feature-gated message
+   kind — an optional field on an existing frame is fatal for an old parser.
+   The no-wire-change preference does not outrank exact authority.
+6. **Ownership, not just serialisation.** `MarkBoundToJobFenced` updates only
+   `pdf_grabs`; it neither reserves the winning job nor consumes its action,
+   and there is no `UNIQUE(job_id)`. Two grabs that each uniquely qualify for
+   job J can both commit `job_created` for J — the first transaction leaves
+   the candidate relation unchanged, so serialising them does not help. `/2`
+   needs a durable intermediate claim, exclusion of claimed jobs/actions from
+   the pool, and row-driven idempotent restage from quarantine.
+7. **A measurement that observes rather than declares.** The gate counted
+   coverage from the manifest's own `probe_gate` label and never asserted
+   which gate a candidate reached, so a mislabelled or early-failing case
+   counted as coverage for a gate it never touched. Ten predicate-reaching
+   cases with zero errors is also only a ~30% one-sided 95% upper bound on
+   the error rate under the rule of three: a synthetic corpus is regression
+   coverage, not deployment authorisation. **The deferred third layer —
+   replay against the real backlog with full candidate pools — is now a
+   blocker, not a nicety.** Deferring it was only defensible while the rule
+   was believed structurally sound.
+
+Also fixed in the containment round, independent of `/2`: the veto collapsed
+DOI registrant slash runs (so `10.48612//x` read as compatible with
+`10.48612/x`, two separately registered works) and now abstains on that
+difference; `webNavigation.onTabReplaced` was declared with `tabs.onReplaced`'s
+field names, so the tab-replacement revocation was inert at runtime while its
+hand-written type kept TypeScript quiet; and page identity failed OPEN when
+neither side had a document epoch, which is reachable for a pre-existing tab
+after a worker restart.

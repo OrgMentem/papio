@@ -1,0 +1,15 @@
+Community Resilience Metrics for Urban Flood Risk
+
+Nadia Osei, Peter Lindqvist
+Urban Systems Group, OrgMentem Institute
+
+Second edition, published 2024
+
+Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. 
+Supersedes 10.5555/synth.2019.220; see also the review series 10.1234/j.2019.05.003 for context.
+Edition DOI: 10.5555/synth.2024.221
+
+Abstract
+The second edition revises every metric and reports a new five-city validation.
+
+Keywords: resilience, flood risk

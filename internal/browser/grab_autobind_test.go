@@ -3,6 +3,8 @@ package browser
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -170,10 +172,29 @@ func writeLargeFixturePDF(t *testing.T, path string) {
 	}
 }
 
-func TestSettledGrabBindsUniqueQualifyingCandidate(t *testing.T) {
-	// 1. A settled grab whose text uniquely qualifies exactly one candidate-
-	// eligible job binds to it: grab state job_created, job_id set,
-	// provenance recorded with the rule version, and the file ingested.
+// enableAutoBindDecision turns the autonomous candidate-binding decision back
+// on for one test.
+//
+// The decision is off in every shipped build (see the WHY at the call site in
+// processSettledGrab). The transaction discipline around it — the
+// in-transaction fence, post-commit staging from the validated quarantine
+// copy, deferred-adoption recovery — is not what was found unsafe and is what
+// candidate_auto_bind/2 will reuse unchanged, so it must stay under test. A
+// test that needs a bind to happen says so here; every test that does not
+// call this observes production behaviour.
+func enableAutoBindDecision(t *testing.T) {
+	t.Helper()
+	prev := autoBindDecisionEnabled
+	autoBindDecisionEnabled = true
+	t.Cleanup(func() { autoBindDecisionEnabled = prev })
+}
+
+func TestSettledGrabUniqueQualifyingCandidateParks(t *testing.T) {
+	// 1. A settled grab whose text uniquely qualifies exactly one
+	// candidate-eligible job STILL PARKS. The predicate reads a page-one
+	// occurrence of the candidate's identifier as the document identifying
+	// itself, which a citation satisfies just as well as a self-identifier,
+	// so no autonomous decision is made: the grab goes to a human.
 	b, jobs, cfg, _ := newBridge(t)
 	candidateWork := work.Work{
 		Title:   "Quantum Networks Robustness Calibration Measurement",
@@ -182,12 +203,75 @@ func TestSettledGrabBindsUniqueQualifyingCandidate(t *testing.T) {
 		DOI:     "10.1234/autobind.0001",
 	}
 	candidateID := parkManualDownload(t, jobs, "wr_auto_ok", candidateWork)
-	// Seed an unrelated non-qualifying job so the winner is selected among N.
+	// Seed an unrelated non-qualifying job so the winner would be selected among N.
 	parkManualDownload(t, jobs, "wr_auto_other", work.Work{DOI: "10.9999/other.1", Title: "Attention Mechanisms for Sequence Transduction Networks", Authors: []string{"David Chen"}, Year: 2019})
 
 	excerpt := autobindExcerpt(t, candidateWork.Title, "Ada Lovelace (2026)", candidateWork.DOI)
 	// Explicit precondition: front-matter DOI set must be empty, otherwise this
-	// test would silently re-exercise the blind DOI path instead of auto-bind.
+	// test would silently re-exercise the blind DOI path instead of the
+	// candidate path.
+	if got := pdf.FrontMatterDOIs(excerpt); len(got) != 0 {
+		t.Fatalf("front-matter DOIs = %v, want empty for the candidate path", got)
+	}
+	// The fixture must be one the predicate WOULD have bound, or this test
+	// proves nothing about the disabled decision — it would just be another
+	// abstention.
+	if _, ok, reason := pdf.SelectAutoBindCandidate(excerpt, []pdf.BindCandidate{{Key: candidateID, Work: candidateWork, Bound: []string{candidateWork.DOI}}}); !ok {
+		t.Fatalf("fixture no longer uniquely qualifies (%s); this test would not exercise the disabled decision", reason)
+	}
+	b.svc.Validate = validateForExcerpt(excerpt)
+	ctx := context.Background()
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Bind Me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "paper.pdf"))
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, _ := b.grabs.Get(ctx, g.ID)
+	if got.State != grab.StateParkedNoIdentifier {
+		t.Fatalf("grab = %+v, want parked_no_identifier (autonomous binding is disabled)", got)
+	}
+	if got.Outcome != "needs_identifier" {
+		t.Fatalf("outcome = %q, want needs_identifier", got.Outcome)
+	}
+	if got.JobID != "" {
+		t.Fatalf("job_id = %q, want empty: no job may be claimed automatically", got.JobID)
+	}
+	if got.BindProvenance != "" {
+		t.Fatalf("bind_provenance = %q, want empty: no automatic decision was made", got.BindProvenance)
+	}
+	// The candidate job must be untouched — still waiting for its human.
+	row, _ := jobs.Get(ctx, candidateID)
+	if row.State != job.StateAwaitingHuman || row.ArtifactSHA256 != "" {
+		t.Fatalf("candidate job = %+v, want untouched awaiting_human with no artifact", row)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(cfg.EffectiveAdoptionRoot(), candidateID, "*.pdf")); len(matches) > 0 {
+		t.Fatalf("files %v staged into the candidate's adoption directory, want none", matches)
+	}
+}
+
+func TestSettledGrabBindsUniqueQualifyingCandidateWhenEnabled(t *testing.T) {
+	// 1b. The same fixture with the decision enabled binds, and the recorded
+	// provenance describes the decision: rule version, winner, its evidence,
+	// the ordered candidates with their verdicts, and a digest of the exact
+	// text the predicate read. This is the /2 substrate under test; it is not
+	// reachable in a shipped build.
+	enableAutoBindDecision(t)
+	b, jobs, cfg, _ := newBridge(t)
+	candidateWork := work.Work{
+		Title:   "Quantum Networks Robustness Calibration Measurement",
+		Authors: []string{"Ada Lovelace"},
+		Year:    2026,
+		DOI:     "10.1234/autobind.0001",
+	}
+	candidateID := parkManualDownload(t, jobs, "wr_auto_ok", candidateWork)
+	otherID := parkManualDownload(t, jobs, "wr_auto_other", work.Work{DOI: "10.9999/other.1", Title: "Attention Mechanisms for Sequence Transduction Networks", Authors: []string{"David Chen"}, Year: 2019})
+
+	excerpt := autobindExcerpt(t, candidateWork.Title, "Ada Lovelace (2026)", candidateWork.DOI)
 	if got := pdf.FrontMatterDOIs(excerpt); len(got) != 0 {
 		t.Fatalf("front-matter DOIs = %v, want empty for auto-bind", got)
 	}
@@ -217,16 +301,104 @@ func TestSettledGrabBindsUniqueQualifyingCandidate(t *testing.T) {
 	if err := json.Unmarshal([]byte(got.BindProvenance), &prov); err != nil {
 		t.Fatalf("unmarshal provenance: %v", err)
 	}
-	if prov.Method != "candidate_auto_bind" || prov.Rule != pdf.CandidateBindingRule || prov.Winner != candidateID || prov.CandidatesConsidered == 0 || len(prov.Evidence) == 0 {
+	if prov.Method != "candidate_auto_bind" || prov.Rule != pdf.CandidateBindingRule || prov.Winner != candidateID || len(prov.Evidence) == 0 {
 		t.Fatalf("provenance %+v missing expected fields", prov)
+	}
+	if prov.Rule != "candidate_auto_bind/2" {
+		t.Fatalf("rule = %q, want candidate_auto_bind/2", prov.Rule)
+	}
+	// The 1-of-N decision must be reconstructable: both candidates, in order,
+	// each with its terminal verdict.
+	if prov.CandidatesConsidered != 2 || len(prov.Candidates) != 2 {
+		t.Fatalf("candidates = %d / %+v, want both jobs recorded", prov.CandidatesConsidered, prov.Candidates)
+	}
+	seen := map[string]string{}
+	for _, c := range prov.Candidates {
+		seen[c.JobID] = c.Verdict
+	}
+	if seen[candidateID] != "qualifies" {
+		t.Fatalf("winner verdict = %q, want qualifies (%+v)", seen[candidateID], prov.Candidates)
+	}
+	if seen[otherID] != "rejected" {
+		t.Fatalf("loser verdict = %q, want rejected (%+v)", seen[otherID], prov.Candidates)
+	}
+	// The excerpt is pinned by digest, never copied into the audit column.
+	sum := sha256.Sum256([]byte(excerpt))
+	if prov.ExcerptSHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("excerpt digest = %q, want %x", prov.ExcerptSHA256, sum)
+	}
+	if strings.Contains(got.BindProvenance, "Abstract") {
+		t.Fatalf("provenance carries document text: %q", got.BindProvenance)
 	}
 	row, _ := jobs.Get(ctx, candidateID)
 	if row.State != job.StateReady || row.ArtifactSHA256 == "" {
 		t.Fatalf("candidate job not adopted: %+v", row)
 	}
-	if _, err := os.Stat(filepath.Join(cfg.EffectiveAdoptionRoot(), candidateID, "paper.pdf")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		// File may have been promoted to artifact store; absence alone is not failure.
-		// Ready state above already proves adoption.
+}
+
+func TestSettledGrabProvenanceDescribesTheDecisionThatCommitted(t *testing.T) {
+	// The pre-transaction decision is not the decision that commits. A pool
+	// that gains a LOSING candidate between the two leaves the winner's key
+	// unchanged, so a fence comparing only that key accepts — and provenance
+	// carried across the fence then records a candidate count and a loser set
+	// that were never true at commit time. The existing fence test only ever
+	// changes the winner, so it cannot see this: an audit row describing a
+	// decision that did not happen still looks correct to it.
+	enableAutoBindDecision(t)
+	b, jobs, cfg, _ := newBridge(t)
+	winnerWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.prov.1"}
+	winnerID := parkManualDownload(t, jobs, "wr_prov_win", winnerWork)
+	earlyLoserID := parkManualDownload(t, jobs, "wr_prov_loser_early", work.Work{Title: "Attention Mechanisms for Sequence Transduction Networks", Authors: []string{"David Chen"}, Year: 2019, DOI: "10.9999/prov.loser.early"})
+	excerpt := autobindExcerpt(t, winnerWork.Title, "Ada Lovelace (2026)", winnerWork.DOI)
+	b.svc.Validate = validateForExcerpt(excerpt)
+	ctx := context.Background()
+
+	// Another writer parks a third paper in the window the fence covers:
+	// after the pool has been read and the winner chosen, before the binding
+	// transaction opens. It does not qualify, so the winner is unchanged.
+	lateLoserID := ""
+	oldHook := beforeAutoBindTxForTest
+	beforeAutoBindTxForTest = func() error {
+		if lateLoserID != "" {
+			return nil
+		}
+		lateLoserID = parkManualDownload(t, jobs, "wr_prov_loser_late", work.Work{Title: "Thermal Tolerance in Alpine Bumblebee Populations", Authors: []string{"Beatrix Nakamura"}, Year: 2014, DOI: "10.9999/prov.loser.late"})
+		return nil
+	}
+	t.Cleanup(func() { beforeAutoBindTxForTest = oldHook })
+
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Provenance Freshness")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "paper.pdf"))
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if lateLoserID == "" {
+		t.Fatal("pre-transaction hook never ran; the decision path was not exercised")
+	}
+	got, _ := b.grabs.Get(ctx, g.ID)
+	if got.State != grab.StateJobCreated || got.JobID != winnerID {
+		t.Fatalf("grab = %+v, want job_created -> %s (winner key never changed)", got, winnerID)
+	}
+	var prov grab.BindProvenance
+	if err := json.Unmarshal([]byte(got.BindProvenance), &prov); err != nil {
+		t.Fatalf("unmarshal provenance: %v", err)
+	}
+	if prov.CandidatesConsidered != 3 {
+		t.Fatalf("candidates_considered = %d, want 3: the pool the transaction saw, not the pre-transaction one", prov.CandidatesConsidered)
+	}
+	verdicts := map[string]string{}
+	for _, c := range prov.Candidates {
+		verdicts[c.JobID] = c.Verdict
+	}
+	if verdicts[lateLoserID] != "rejected" {
+		t.Fatalf("late candidate %s recorded as %q, want rejected; provenance is stale (%+v)", lateLoserID, verdicts[lateLoserID], prov.Candidates)
+	}
+	if verdicts[earlyLoserID] != "rejected" || verdicts[winnerID] != "qualifies" {
+		t.Fatalf("verdicts = %v, want %s qualifies and %s rejected", verdicts, winnerID, earlyLoserID)
 	}
 }
 
@@ -364,6 +536,7 @@ func TestSettledGrabFenceRejectionParksAndRemovesStagedFile(t *testing.T) {
 	// happens after commit (private temp -> adoption dir), the fence window
 	// no longer depends on file-system timing; we make it deterministic
 	// by resolving the winner inside the fence transaction via a test hook.
+	enableAutoBindDecision(t)
 	b, jobs, cfg, _ := newBridge(t)
 	winnerWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.fence.1"}
 	winnerID := parkManualDownload(t, jobs, "wr_fence_win", winnerWork)
@@ -429,6 +602,7 @@ func TestSettledGrabConclusiveDOIShortCircuitsToBlindPath(t *testing.T) {
 	// This is the ONE case that SHOULD keep its DOI in the front matter —
 	// it is the odd one out by design, proving the DOI window short-circuits
 	// before auto-bind is consulted.
+	enableAutoBindDecision(t)
 	b, jobs, cfg, _ := newBridge(t)
 	parkManualDownload(t, jobs, "wr_doi_blind_other", work.Work{Title: "Unrelated Paper About Methodology", Authors: []string{"Other Author"}, Year: 2021, DOI: "10.9999/blind.other.1"})
 	doi := "10.1234/grab.blind.doi"
@@ -461,6 +635,7 @@ func TestSettledGrabConclusiveDOIShortCircuitsToBlindPath(t *testing.T) {
 func TestSettledGrabValidatedBytesStagedDespiteMutatedLandingFile(t *testing.T) {
 	// Landing file is mutated after validation: staging must use the validated
 	// immutable quarantine copy (temp), not the mutable dir/name file.
+	enableAutoBindDecision(t)
 	b, jobs, cfg, _ := newBridge(t)
 	candidateWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.mutated.1"}
 	candidateID := parkManualDownload(t, jobs, "wr_mutated_ok", candidateWork)
@@ -522,6 +697,7 @@ func TestSettledGrabValidatedBytesStagedDespiteMutatedLandingFile(t *testing.T) 
 func TestSettledGrabWinnerCancelledAfterCommitRemainsRecoverable(t *testing.T) {
 	// Commit succeeds, then winner is cancelled before ingest. Bytes must remain
 	// recoverable via deferred record and not be silently dropped.
+	enableAutoBindDecision(t)
 	b, jobs, cfg, _ := newBridge(t)
 	winnerWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.cancel.1"}
 	winnerID := parkManualDownload(t, jobs, "wr_cancel_win", winnerWork)
@@ -588,6 +764,7 @@ func TestSettledGrabWinnerCancelledAfterCommitRemainsRecoverable(t *testing.T) {
 func TestSettledGrabRetryAfterTransientValidationRecovers(t *testing.T) {
 	// First sweep: MarkQuarantined then transient Validate error -> remains quarantined.
 	// Second sweep: Validate succeeds, auto-bind wins -> must reach terminal (bound or parked).
+	enableAutoBindDecision(t)
 	b, jobs, cfg, _ := newBridge(t)
 	winnerWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.retry.1"}
 	winnerID := parkManualDownload(t, jobs, "wr_retry_win", winnerWork)
@@ -631,6 +808,7 @@ func TestSettledGrabAmbiguousAdoptionDirStillRecoversViaDeferredFilename(t *test
 	// staged file makes the dir ambiguous, so SweepAdoptions's settledFileIn
 	// would refuse it. Recovery must key on the deferred filename, not the
 	// single-file heuristic.
+	enableAutoBindDecision(t)
 	b, jobs, cfg, _ := newBridge(t)
 	winnerWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.ambig.1"}
 	winnerID := parkManualDownload(t, jobs, "wr_ambig_win", winnerWork)

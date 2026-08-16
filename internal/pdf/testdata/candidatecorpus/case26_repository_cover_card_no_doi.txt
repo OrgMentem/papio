@@ -1,0 +1,18 @@
+OrgMentem Institutional Repository: Deposited Item Record
+
+Title: Robust Calibration of Ensemble Forecasts
+Authors: Marta Silva, Andre Bouchard
+Year: 2022
+Deposited: 2023-04-11 by the Forecast Verification Unit
+
+Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. 
+Cited work identifier: 10.5555/synth.2022.610
+
+Verification Workflows for Operational Forecasting
+A technical report of the Forecast Verification Unit, deposited alongside the item above.
+Report DOI: 10.5555/synth.2023.611
+
+Abstract
+This report documents the operational workflow used to verify ensemble forecast products.
+
+Keywords: verification, forecasting

@@ -32,6 +32,26 @@ type manifestCase struct {
 	ProbeGate                string              `json:"probe_gate"`
 	VetoWindow               bool                `json:"veto_window"`
 	VetoNote                 string              `json:"veto_note,omitempty"`
+
+	// ProbeCandidate names the candidate whose traversal the case measures:
+	// the one the document is designed to tempt the predicate with. A case
+	// supplies a whole pool (a 1-of-N rule cannot be measured pairwise) and
+	// the pool is what SelectAutoBindCandidate scores, but exactly one
+	// candidate carries the gate the case claims to probe.
+	ProbeCandidate string `json:"probe_candidate"`
+
+	// ExpectedGate is the CandidateGate the probe candidate's evaluation must
+	// terminate at. It is asserted against the OBSERVED trace, which is the
+	// whole point: probe_gate is a label an author typed, expected_gate is a
+	// prediction the run can falsify.
+	ExpectedGate string `json:"expected_gate"`
+
+	// KnownFailing marks a case the current rule gets wrong on purpose. The
+	// case stays in the corpus, stays scored, and is reported as a /2
+	// blocker; it does not fail the build, and it must never be relaxed to
+	// pass.
+	KnownFailing       bool   `json:"known_failing,omitempty"`
+	KnownFailingReason string `json:"known_failing_reason,omitempty"`
 }
 
 type manifestFile struct {
@@ -50,14 +70,88 @@ func isEquivalent(key string, truth *string, equiv []string) bool {
 	return false
 }
 
+// candidateGateOrder is the rule's gate sequence. Index in this slice is the
+// only ordering the harness needs: a case that claims to probe gate G but
+// whose evaluation terminates BEFORE G never reached G, and its coverage claim
+// is false.
+var candidateGateOrder = []CandidateGate{
+	GateConclusiveVeto,
+	GateNonArticle,
+	GateCorrection,
+	GateAuthor,
+	GateTitle,
+	GateYear,
+	GateIdentifier,
+}
+
+func candidateGateIndex(g CandidateGate) int {
+	for i, known := range candidateGateOrder {
+		if known == g {
+			return i
+		}
+	}
+	return -1
+}
+
+// probeGateReaches maps a manifest probe_gate LABEL to the gate a case wearing
+// that label must actually have reached. This is the executable half of the
+// label: before it existed the harness indexed coverage by the label alone, so
+// a case labelled "year-token-boundary" that died at the author gate was still
+// counted as year coverage, and a "title-strict-prefix" case that never got as
+// far as the title comparison still counted as a title probe. Nothing observed
+// the difference. Now the observed terminal gate must sit at or past the
+// labelled gate, and coverage is tallied from the observation, never the label.
+var probeGateReaches = map[string]CandidateGate{
+	"veto":                         GateConclusiveVeto,
+	"veto-window":                  GateConclusiveVeto,
+	"predicate":                    GateAuthor,
+	"correction":                   GateCorrection,
+	"correction-pointer":           GateCorrection,
+	"author":                       GateAuthor,
+	"author-collision":             GateAuthor,
+	"author-one-numeric":           GateAuthor,
+	"author-one-lettered":          GateAuthor,
+	"author-positional":            GateAuthor,
+	"title-strict-prefix":          GateTitle,
+	"year-token-boundary":          GateYear,
+	"composite-cited-identifier":   GateIdentifier,
+	"composite-cover-card":         GateTitle,
+	"composite-wrapped-subtitle":   GateTitle,
+	"composite-numeric-extension":  GateTitle,
+	"composite-year-in-dotted-doi": GateYear,
+}
+
+func probeGateLabels() []string {
+	out := make([]string, 0, len(probeGateReaches))
+	for k := range probeGateReaches {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func gateNames() []string {
+	out := make([]string, 0, len(candidateGateOrder))
+	for _, g := range candidateGateOrder {
+		out = append(out, string(g))
+	}
+	return out
+}
+
 // TestCandidateSelectionGate is the Phase 2 measurement gate. It iterates the
 // labeled semantic corpus under testdata/candidatecorpus/, runs
-// SelectAutoBindCandidate per case, and classifies each outcome as
-// wrong-accept, correct-accept, correct-abstain, or missed-accept. The
-// headline number is wrong-accepts — zero is required to ship auto-bind.
-// Missed-accepts are conservative abstentions and do not fail the build.
-// Veto-window cases are reported separately, not folded into the main totals,
-// measuring the residual left by the deliberately narrow 1 KiB blind window.
+// SelectAutoBindCandidate over each case's WHOLE candidate pool, and
+// classifies each outcome as wrong-accept, correct-accept, correct-abstain, or
+// missed-accept. The headline number is wrong-accepts — zero is required to
+// ship auto-bind. Missed-accepts are conservative abstentions and do not fail
+// the build. Veto-window cases are reported separately, not folded into the
+// main totals, measuring the residual left by the deliberately narrow 1 KiB
+// blind window.
+//
+// Coverage is reported from the OBSERVED terminal gate of each case's probe
+// candidate — the trace QualifyCandidate records as it runs — not from the
+// manifest's probe_gate label. A label is a claim; only the trace is evidence
+// that the case exercised the gate it advertises.
 func TestCandidateSelectionGate(t *testing.T) {
 	t.Logf("candidate binding rule: %s", CandidateBindingRule)
 
@@ -75,10 +169,9 @@ func TestCandidateSelectionGate(t *testing.T) {
 	}
 
 	// --- schema / semantic validation over manifest.json ---
-	allowedProbeGates := map[string]bool{
-		"veto": true, "predicate": true, "veto-window": true, "author": true, "year": true, "title/author": true,
-		"correction": true, "correction-pointer": true, "title-strict-prefix": true, "year-token-boundary": true,
-		"author-collision": true, "author-one-numeric": true, "author-one-lettered": true, "author-positional": true,
+	knownGate := make(map[string]bool, len(candidateGateOrder))
+	for _, g := range candidateGateOrder {
+		knownGate[string(g)] = true
 	}
 	seenIDs := make(map[string]bool)
 	for i, c := range mf.Cases {
@@ -96,37 +189,60 @@ func TestCandidateSelectionGate(t *testing.T) {
 		if c.RiskFamily == "" {
 			t.Fatalf("%s: missing risk_family", pfx)
 		}
-		if len(c.Candidates) == 0 {
-			t.Fatalf("%s: no candidates", pfx)
+		// A 1-of-N rule cannot be measured pairwise, and it cannot be measured
+		// at all against a pool of one: with a single candidate there is no
+		// competitor to mis-select, so the case scores the verification
+		// question MatchIdentity answers, not the selection question this rule
+		// answers. Every case supplies the full pool it implies.
+		if len(c.Candidates) < 2 {
+			t.Fatalf("%s: pool of %d — a 1-of-N selection needs at least two live candidates to be measurable", pfx, len(c.Candidates))
+		}
+		candKeys := make(map[string]bool, len(c.Candidates))
+		for _, mc := range c.Candidates {
+			candKeys[mc.Key] = true
 		}
 		if c.ProbeGate == "" {
-			t.Fatalf("%s: missing probe_gate (must record which gate the case probes; see task item 1)", pfx)
+			t.Fatalf("%s: missing probe_gate (must record which gate the case probes)", pfx)
 		}
-		if !allowedProbeGates[c.ProbeGate] {
-			t.Fatalf("%s: unknown probe_gate %q (allowed: %v)", pfx, c.ProbeGate, keysOf(allowedProbeGates))
+		if _, ok := probeGateReaches[c.ProbeGate]; !ok {
+			t.Fatalf("%s: unknown probe_gate %q (allowed: %v)", pfx, c.ProbeGate, probeGateLabels())
+		}
+		if c.ProbeCandidate == "" {
+			t.Fatalf("%s: missing probe_candidate (name the candidate whose traversal this case measures)", pfx)
+		}
+		if !candKeys[c.ProbeCandidate] {
+			t.Fatalf("%s: probe_candidate %q is not among candidate keys %v", pfx, c.ProbeCandidate, keysOf(candKeys))
+		}
+		if c.ExpectedGate == "" {
+			t.Fatalf("%s: missing expected_gate (the CandidateGate the probe candidate must terminate at; allowed: %v)", pfx, gateNames())
+		}
+		if !knownGate[c.ExpectedGate] {
+			t.Fatalf("%s: unknown expected_gate %q (allowed: %v)", pfx, c.ExpectedGate, gateNames())
+		}
+		if c.KnownFailing && strings.TrimSpace(c.KnownFailingReason) == "" {
+			t.Fatalf("%s: known_failing true but known_failing_reason empty — a suppressed failure must say what it is waiting on", pfx)
+		}
+		if !c.KnownFailing && strings.TrimSpace(c.KnownFailingReason) != "" {
+			t.Fatalf("%s: known_failing_reason present but known_failing false", pfx)
 		}
 		if c.Truth != nil && *c.Truth == "" {
 			t.Fatalf("%s: truth is empty string, use null for absent", pfx)
+		}
+		if c.Truth != nil && !candKeys[*c.Truth] {
+			t.Fatalf("%s: truth %q is not among candidate keys %v", pfx, *c.Truth, keysOf(candKeys))
 		}
 		// Validate equivalence labels: if canonical_equivalence is non-empty, justification must be present.
 		if len(c.CanonicalEquivalence) > 0 {
 			if c.EquivalenceJustification == nil || strings.TrimSpace(*c.EquivalenceJustification) == "" {
 				t.Fatalf("%s: canonical_equivalence %v requires equivalence_justification (reviewer: silent same-work label converts wrong-accept to scored abstention)", pfx, c.CanonicalEquivalence)
 			}
-			// equivalence keys must refer to candidate keys, and truth must not be duplicated in equivalence? Actually truth may be inside equivalence; equivalence lists same-work keys including truth.
-			candKeys := make(map[string]bool)
-			for _, mc := range c.Candidates {
-				candKeys[mc.Key] = true
-			}
 			for _, ek := range c.CanonicalEquivalence {
 				if !candKeys[ek] {
 					t.Fatalf("%s: canonical_equivalence key %q not among candidate keys %v", pfx, ek, keysOf(candKeys))
 				}
 			}
-			// truth if non-nil should be in equivalence when equivalence is used for same-work version pairs
+			// We require that the declared equivalence actually covers the truth, otherwise the label is vacuous.
 			if c.Truth != nil && !isEquivalent(*c.Truth, nil, c.CanonicalEquivalence) {
-				// For same-work cases, truth should be in equivalence; for other uses, at least warn?
-				// We require that the declared equivalence actually covers the truth, otherwise label is vacuous.
 				t.Fatalf("%s: canonical_equivalence %v does not include truth %q (justification: %q)", pfx, c.CanonicalEquivalence, *c.Truth, *c.EquivalenceJustification)
 			}
 		} else {
@@ -134,23 +250,29 @@ func TestCandidateSelectionGate(t *testing.T) {
 				t.Fatalf("%s: equivalence_justification present but canonical_equivalence empty", pfx)
 			}
 		}
-		// Ground truth note is informative but not required except for new wrong-accept hunting cases; no hard check.
 
 		// Validate document exists
 		docPath := filepath.Join("testdata", "candidatecorpus", c.Document)
-		if _, err := os.Stat(docPath); err != nil {
-			t.Fatalf("%s: document %s not found: %v", pfx, docPath, err)
+		docBytes, err := os.ReadFile(docPath)
+		if err != nil {
+			t.Fatalf("%s: document %s not readable: %v", pfx, docPath, err)
 		}
 		// VetoWindow cases must have veto_note
 		if c.VetoWindow && strings.TrimSpace(c.VetoNote) == "" {
 			t.Fatalf("%s: veto_window true but veto_note empty", pfx)
 		}
-		// DOI-less predicate cases should have no conclusive DOI in 1 KiB window (auto-bind only runs when FrontMatterDOIs empty)
-		if c.ProbeGate != "veto" && c.ProbeGate != "veto-window" {
-			docBytes, _ := os.ReadFile(docPath)
-			if dois := FrontMatterDOIs(string(docBytes)); len(dois) != 0 {
-				t.Fatalf("%s: probe_gate %q indicates DOI-less case but FrontMatterDOIs (1 KiB) is %v — hard negative must be DOI-less in blind window to reach gates 2-5 (bridge.go:7271)", pfx, c.ProbeGate, dois)
-			}
+		// Structural reachability, both directions. Auto-bind only runs when
+		// the 1 KiB blind window holds no conclusive DOI (bridge.go), so a
+		// predicate case must be DOI-less there or it never reaches gates 2-5,
+		// and a veto-labelled case must NOT be, or it never exercises the veto
+		// it claims to measure.
+		frontDOIs := FrontMatterDOIs(string(docBytes))
+		vetoLabelled := c.ProbeGate == "veto" || c.ProbeGate == "veto-window"
+		if vetoLabelled && len(frontDOIs) == 0 {
+			t.Fatalf("%s: probe_gate %q claims the blind-window veto but FrontMatterDOIs (1 KiB) is empty — the veto is never consulted", pfx, c.ProbeGate)
+		}
+		if !vetoLabelled && len(frontDOIs) != 0 {
+			t.Fatalf("%s: probe_gate %q indicates a DOI-less case but FrontMatterDOIs (1 KiB) is %v — a hard negative must be DOI-less in the blind window to reach gates 2-5", pfx, c.ProbeGate, frontDOIs)
 		}
 	}
 
@@ -160,14 +282,26 @@ func TestCandidateSelectionGate(t *testing.T) {
 		correctAccept  int
 		correctAbstain int
 		missedAccept   int
+
+		// blockers counts known-failing cases; blockedWrong counts the subset
+		// of them whose failure is a wrong-accept, so the headline can subtract
+		// exactly the suppressed wrong-accepts and no more.
+		blockers     int
+		blockedWrong int
 	}
 	var mainT, vetoT tally
-	byGate := make(map[string]*tally)
+	byGate := make(map[CandidateGate]*tally)
 	var wrongDetails []string
-	// also per-risk-family coverage check
-	familyHasPredicate := make(map[string]bool)
+	var mismatchDetails []string
+	var blockerDetails []string
+	// Per-risk-family coverage, from observation: familyEscapesVeto records a
+	// family whose verdict some case reached the predicate to decide;
+	// familyReachesPredicate records the deeper claim of reaching gate 2.
+	familyEscapesVeto := make(map[string]bool)
+	familyReachesPredicate := make(map[string]bool)
 	familyHasAny := make(map[string]bool)
 
+	t.Logf("observed traces (probe candidate per case):")
 	for _, c := range mf.Cases {
 		docPath := filepath.Join("testdata", "candidatecorpus", c.Document)
 		excerptBytes, err := os.ReadFile(docPath)
@@ -185,6 +319,40 @@ func TestCandidateSelectionGate(t *testing.T) {
 			})
 		}
 
+		// Observation. The probe candidate's traversal is what the case
+		// claims to measure; every other candidate is traced too, so the log
+		// shows the whole pool the 1-of-N decision actually saw.
+		probe := QualifyCandidate(excerpt, bindCandidateByKey(candidates, c.ProbeCandidate))
+		observed := probe.Gate
+		t.Logf("  %-34s probe=%-12s gate=%-22s disposition=%-7s reached=%v reason=%q",
+			c.ID, c.ProbeCandidate, observed, probe.Disposition(), probe.Reached, probe.Reason)
+		for _, cand := range candidates {
+			if cand.Key == c.ProbeCandidate {
+				continue
+			}
+			q := QualifyCandidate(excerpt, cand)
+			t.Logf("      pool  %-12s gate=%-22s disposition=%-7s reason=%q", q.Key, q.Gate, q.Disposition(), q.Reason)
+		}
+
+		// Assertion 1: the observed terminal gate must equal the prediction.
+		var caseFailures []string
+		if string(observed) != c.ExpectedGate {
+			caseFailures = append(caseFailures, fmt.Sprintf(
+				"case %q: expected_gate %q but candidate %q terminated at %q (disposition %s, reason %q, reached %v)",
+				c.ID, c.ExpectedGate, c.ProbeCandidate, observed, probe.Disposition(), probe.Reason, probe.Reached))
+		}
+		// Assertion 2: the label must be reachable. Terminating before the
+		// gate the label advertises means the case never probed that gate,
+		// whatever the manifest says it measures.
+		claimed := probeGateReaches[c.ProbeGate]
+		if candidateGateIndex(observed) < candidateGateIndex(claimed) {
+			caseFailures = append(caseFailures, fmt.Sprintf(
+				"case %q: probe_gate label %q claims the run reaches %q, but candidate %q terminated earlier at %q (reason %q) — the label overstates coverage",
+				c.ID, c.ProbeGate, claimed, c.ProbeCandidate, observed, probe.Reason))
+		}
+
+		// Scoring runs over the WHOLE pool: this is a 1-of-N selection and a
+		// pairwise score would not see an ambiguous second qualifier.
 		winner, ok, _ := SelectAutoBindCandidate(excerpt, candidates)
 
 		cur := &mainT
@@ -192,36 +360,31 @@ func TestCandidateSelectionGate(t *testing.T) {
 			cur = &vetoT
 		}
 		cur.total++
-		// per-gate tally
-		gTally := byGate[c.ProbeGate]
+		gTally := byGate[observed]
 		if gTally == nil {
 			gTally = &tally{}
-			byGate[c.ProbeGate] = gTally
+			byGate[observed] = gTally
 		}
 		gTally.total++
 
 		familyHasAny[c.RiskFamily] = true
-		if c.ProbeGate != "veto" && c.ProbeGate != "veto-window" {
-			familyHasPredicate[c.RiskFamily] = true
+		if candidateGateIndex(observed) > candidateGateIndex(GateConclusiveVeto) {
+			familyEscapesVeto[c.RiskFamily] = true
+		}
+		if candidateGateIndex(observed) >= candidateGateIndex(GateAuthor) {
+			familyReachesPredicate[c.RiskFamily] = true
 		}
 
+		wrongMsg := ""
 		switch {
 		case ok:
 			if c.Truth == nil {
-				cur.wrongAccept++
-				gTally.wrongAccept++
-				wrongDetails = append(wrongDetails, fmt.Sprintf("case %q (%s) probe=%s: wrong-accept choosing %q but truth is absent (evidence %v)", c.ID, c.RiskFamily, c.ProbeGate, winner.Key, winner.Evidence))
+				wrongMsg = fmt.Sprintf("case %q (%s) observed-gate=%s: wrong-accept choosing %q but truth is absent (evidence %v)", c.ID, c.RiskFamily, observed, winner.Key, winner.Evidence)
 			} else if isEquivalent(winner.Key, c.Truth, c.CanonicalEquivalence) {
 				cur.correctAccept++
 				gTally.correctAccept++
 			} else {
-				cur.wrongAccept++
-				gTally.wrongAccept++
-				truth := "<nil>"
-				if c.Truth != nil {
-					truth = *c.Truth
-				}
-				wrongDetails = append(wrongDetails, fmt.Sprintf("case %q (%s) probe=%s: wrong-accept choosing %q but truth is %q equiv %v evidence %v", c.ID, c.RiskFamily, c.ProbeGate, winner.Key, truth, c.CanonicalEquivalence, winner.Evidence))
+				wrongMsg = fmt.Sprintf("case %q (%s) observed-gate=%s: wrong-accept choosing %q but truth is %q equiv %v evidence %v", c.ID, c.RiskFamily, observed, winner.Key, *c.Truth, c.CanonicalEquivalence, winner.Evidence)
 			}
 		default:
 			if c.Truth == nil {
@@ -235,54 +398,112 @@ func TestCandidateSelectionGate(t *testing.T) {
 				gTally.missedAccept++
 			}
 		}
+		if wrongMsg != "" {
+			cur.wrongAccept++
+			gTally.wrongAccept++
+		}
+
+		switch {
+		case c.KnownFailing && wrongMsg == "" && len(caseFailures) == 0:
+			// A known-failing case that passes is a stale suppression: the
+			// predicate improved and the marker now hides a real regression
+			// signal. Fail loudly rather than let the marker rot.
+			t.Errorf("case %q is marked known_failing (%s) but every assertion passed — remove known_failing so the case defends the fix", c.ID, c.KnownFailingReason)
+		case c.KnownFailing:
+			cur.blockers++
+			gTally.blockers++
+			if wrongMsg != "" {
+				cur.blockedWrong++
+				caseFailures = append(caseFailures, wrongMsg)
+			}
+			for _, f := range caseFailures {
+				blockerDetails = append(blockerDetails, f+"\n        waiting on: "+c.KnownFailingReason)
+			}
+		default:
+			mismatchDetails = append(mismatchDetails, caseFailures...)
+			if wrongMsg != "" {
+				wrongDetails = append(wrongDetails, wrongMsg)
+			}
+		}
 	}
 
 	t.Logf("gate report [%s]", CandidateBindingRule)
-	t.Logf("main corpus: total=%d correct-accept=%d correct-abstain=%d missed-accept=%d wrong-accept=%d", mainT.total, mainT.correctAccept, mainT.correctAbstain, mainT.missedAccept, mainT.wrongAccept)
+	t.Logf("main corpus: total=%d correct-accept=%d correct-abstain=%d missed-accept=%d wrong-accept=%d known-failing=%d", mainT.total, mainT.correctAccept, mainT.correctAbstain, mainT.missedAccept, mainT.wrongAccept, mainT.blockers)
 	if vetoT.total > 0 {
-		t.Logf("veto-window (1-4 KiB residual, not folded): total=%d correct-accept=%d correct-abstain=%d missed-accept=%d wrong-accept=%d", vetoT.total, vetoT.correctAccept, vetoT.correctAbstain, vetoT.missedAccept, vetoT.wrongAccept)
+		t.Logf("veto-window (1-4 KiB residual, not folded): total=%d correct-accept=%d correct-abstain=%d missed-accept=%d wrong-accept=%d known-failing=%d", vetoT.total, vetoT.correctAccept, vetoT.correctAbstain, vetoT.missedAccept, vetoT.wrongAccept, vetoT.blockers)
 		t.Logf("veto-window detail: measures the deliberately narrow 1 KiB blind window; see manifest veto_note")
 	}
-	// Per-gate breakdown: makes clear which gates were actually probed.
-	t.Logf("per-gate breakdown (probe_gate):")
-	keys := make([]string, 0, len(byGate))
-	for k := range byGate {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, gate := range keys {
+	// Per-gate breakdown, keyed by the gate the run was OBSERVED to terminate
+	// at. The manifest's probe_gate label does not appear here at all.
+	t.Logf("per-gate breakdown (OBSERVED terminal gate of the probe candidate; labels are not counted):")
+	for _, gate := range candidateGateOrder {
 		gt := byGate[gate]
-		t.Logf("  gate %-20s total=%d correct-accept=%d correct-abstain=%d missed-accept=%d wrong-accept=%d", gate, gt.total, gt.correctAccept, gt.correctAbstain, gt.missedAccept, gt.wrongAccept)
+		if gt == nil {
+			t.Logf("  gate %-22s total=0 — NO case was observed to terminate here", gate)
+			continue
+		}
+		t.Logf("  gate %-22s total=%d correct-accept=%d correct-abstain=%d missed-accept=%d wrong-accept=%d known-failing=%d", gate, gt.total, gt.correctAccept, gt.correctAbstain, gt.missedAccept, gt.wrongAccept, gt.blockers)
 	}
-	// Risk family coverage: every risk family must have at least one predicate-reaching case (DOI-less)
+	// Risk family coverage, observed on two levels.
+	//
+	// The hard requirement is that every family has at least one case whose
+	// verdict was DECIDED BY THE PREDICATE rather than by the 1 KiB blind
+	// window: a family whose every case terminates at the conclusive-identity
+	// veto has measured the veto, not the acceptance rule, and says nothing
+	// about autonomous selection.
+	//
+	// Reaching gate 2 or later is reported but not required, because for some
+	// families terminating earlier is the CORRECT behaviour — a correction
+	// notice is meant to die at the front-matter marker gate, and demanding a
+	// gate-2 case there would mean authoring a correction notice that does not
+	// announce itself, which is a different family.
 	missingPredicate := []string{}
+	shallow := []string{}
 	for fam := range familyHasAny {
 		// veto-window families measure the 1 KiB blind-window residual explicitly; they are not required to have a predicate variant
 		if strings.HasPrefix(fam, "veto-window") {
 			continue
 		}
-		if !familyHasPredicate[fam] {
+		if !familyEscapesVeto[fam] {
 			missingPredicate = append(missingPredicate, fam)
+		} else if !familyReachesPredicate[fam] {
+			shallow = append(shallow, fam)
 		}
+	}
+	if len(shallow) > 0 {
+		sort.Strings(shallow)
+		t.Logf("coverage note: families decided at gate 1/1b only, never observed at gate 2 or later: %v", shallow)
 	}
 	if len(missingPredicate) > 0 {
 		sort.Strings(missingPredicate)
-		t.Errorf("coverage: families without DOI-less predicate case (never reach gates 2-5): %v — add a DOI-less variant per task item 1", missingPredicate)
+		t.Errorf("coverage: families where every case was decided by the 1 KiB blind-window veto, so the acceptance rule was never measured: %v — add a DOI-less variant", missingPredicate)
 	}
+
+	if len(blockerDetails) > 0 {
+		t.Logf("/2 BLOCKING SET — %d case(s) the current rule gets wrong. These are composite documents:", mainT.blockers+vetoT.blockers)
+		t.Logf("  one relational block supplies title, authors, year and identifier at once, which is how a real")
+		t.Logf("  wrong-accept arrives. They are ground-truthed to abstain, they do not abstain, and they must NOT")
+		t.Logf("  be relaxed. Closing them is the acceptance criterion for candidate_auto_bind/2:")
+		for _, d := range blockerDetails {
+			t.Logf("    - %s", d)
+		}
+	}
+
 	totalWrong := mainT.wrongAccept + vetoT.wrongAccept
-	t.Logf("headline: wrong-accepts=%d (must be 0)", totalWrong)
-	if totalWrong == 0 {
-		t.Logf("gate: PASS — zero wrong-accepts")
-	}
+	blockedWrong := mainT.blockedWrong + vetoT.blockedWrong
+	t.Logf("headline: unblocked wrong-accepts=%d (must be 0); a further %d wrong-accept(s) are held in the /2 blocking set above, total wrong-accepts=%d", totalWrong-blockedWrong, blockedWrong, totalWrong)
 	if mainT.missedAccept > 0 || vetoT.missedAccept > 0 {
 		t.Logf("note: missed-accepts are conservative abstentions, not failures; coverage %d/%d main, %d/%d veto", mainT.correctAccept, mainT.correctAccept+mainT.missedAccept, vetoT.correctAccept, vetoT.correctAccept+vetoT.missedAccept)
 	}
 
+	for _, d := range mismatchDetails {
+		t.Errorf("%s", d)
+	}
 	if len(wrongDetails) > 0 {
 		for _, d := range wrongDetails {
 			t.Errorf("%s", d)
 		}
-		t.Fatalf("gate FAILED: %d wrong-accept(s) — the wrong paper would be filed under the right citation", totalWrong)
+		t.Fatalf("gate FAILED: %d unblocked wrong-accept(s) — the wrong paper would be filed under the right citation", len(wrongDetails))
 	}
 }
 
@@ -305,11 +526,28 @@ type sentinelSpec struct {
 	reviewKey    string
 }
 
+// candidateSentinelOptOut lets a developer without pdftotext installed run the
+// rest of the package. It is the ONLY way past the check below and it must be
+// set deliberately, per run.
+const candidateSentinelOptOut = "PAPIO_SKIP_PDF_SENTINELS"
+
 func TestCandidateGateSentinels(t *testing.T) {
 	cap := DetectCapability()
 	if !cap.Semantic() {
-		t.Logf("sentinel gate: SKIP — pdftotext unavailable, extraction toolchain missing (SKIP, not PASS)")
-		t.Skip("pdftotext unavailable — sentinel PDFs committed but extraction skipped (SKIP, not PASS)")
+		// WHY this fails instead of skipping: these nine sentinels are the
+		// only layer that pins hand-authored text against REAL extraction —
+		// ligatures, hyphen wraps, two-column gluing, the form-feed and 4 KiB
+		// window edges. Everything else in this package reads .txt files an
+		// author typed, so with the extractor absent the suite goes green
+		// having never once checked that pdftotext produces the text the rules
+		// are written against. A green suite that silently dropped its only
+		// contact with reality is worse than a red one: it is the same
+		// failure class the corpus exists to catch, applied to the corpus
+		// itself. The release path must therefore have the extractor.
+		if os.Getenv(candidateSentinelOptOut) != "" {
+			t.Skipf("sentinel gate: skipped by %s — extraction NOT verified; this must never be set on a release path", candidateSentinelOptOut)
+		}
+		t.Fatalf("sentinel gate: pdftotext unavailable — the nine extraction sentinels cannot run and the suite would be green without ever exercising real extraction. Install poppler-utils, or set %s=1 to run the rest of the package with extraction unverified.", candidateSentinelOptOut)
 	}
 
 	sentinels := []sentinelSpec{

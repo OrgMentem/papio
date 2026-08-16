@@ -1,0 +1,16 @@
+Attention Routing in Sparse Mixture Models:
+A Different Study of Router Collapse
+
+Priya Nandan, Tomas Ekberg
+Synthetic Learning Lab, OrgMentem Institute
+
+Published 2023
+
+Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. 
+Builds on DOI 10.5555/synth.2023.301 with a distinct research question and new experiments.
+Report DOI: 10.5555/synth.2023.302
+
+Abstract
+We study router collapse, a failure mode not analysed in the earlier routing paper.
+
+Keywords: sparse models, routing

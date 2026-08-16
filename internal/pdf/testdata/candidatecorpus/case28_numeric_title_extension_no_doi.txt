@@ -1,0 +1,15 @@
+Neural Operators for Turbulent Flow Prediction2
+
+Ingrid Solberg, Marco Ferrari
+Computational Physics Group, OrgMentem Institute
+
+Published 2023
+
+Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. Methods are described in the supplementary appendix released with this deposit, covering instrument calibration, sampling frames, and the reproducibility checklist applied to every reported figure. 
+Continues the programme begun in DOI 10.5555/synth.2023.420 with a second family of operators.
+Article DOI: 10.5555/synth.2023.421
+
+Abstract
+This second paper in the series extends neural operators to compressible turbulence.
+
+Keywords: neural operators, turbulence

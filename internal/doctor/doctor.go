@@ -21,6 +21,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/delivery"
 	"papio/internal/discovery"
+	"papio/internal/grab"
 	"papio/internal/job"
 	"papio/internal/notify"
 	"papio/internal/ownership"
@@ -103,6 +104,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	checkAdoptionRoot(cfg, add)
 	checkLegacyAdoptionRoot(cfg, add)
 	checkCreditSpend(ctx, cfg, db, add)
+	checkLegacyCandidateBind(ctx, db, add)
 	if cfg.Path != "" {
 		if info, err := os.Stat(cfg.Path); err == nil {
 			if info.Mode().Perm()&0o077 != 0 {
@@ -556,6 +558,64 @@ func checkLegacyAdoptionRoot(cfg config.Config, add func(string, string, string,
 			legacy, landing, plural(landing, "y", "ies")),
 		fmt.Sprintf("no action is required \u2014 new downloads land in %s. Once nothing there is still wanted, delete %s yourself; papio will not remove a download it cannot prove is already in the artifact store",
 			cfg.EffectiveAdoptionRoot(), legacy))
+}
+
+// supersededCandidateBindRules lists the automatic-matching rule versions
+// that ever decided a binding and are no longer trusted.
+//
+// It is a literal here rather than a symbol in internal/pdf because it is a
+// historical fact, not part of the rule vocabulary the predicate still
+// implements: internal/pdf declares the rule in force, and doctor declares
+// which retired rules leave rows a human should look at. Retiring a further
+// version means appending to this list, never rewriting a stored decision.
+var supersededCandidateBindRules = []string{"candidate_auto_bind/1"}
+
+// checkLegacyCandidateBind names any download that an earlier, now-distrusted
+// automatic matching rule filed under a paper on its own.
+//
+// papio no longer files a download automatically — a capture it cannot
+// identify from the document itself is parked for a person. But a decision
+// already committed stays committed, and the whole point of recording why a
+// binding happened is being able to ask this question afterwards. Silence
+// when there is nothing to report: an install that never made such a decision
+// should not carry a permanent line about decisions it did not make.
+func checkLegacyCandidateBind(ctx context.Context, db *store.Store, add func(string, string, string, string)) {
+	if db == nil {
+		return
+	}
+	svc := grab.New(db, nil)
+	var affected []grab.RuleBind
+	unreadable := 0
+	for _, rule := range supersededCandidateBindRules {
+		binds, bad, err := svc.BoundByRule(ctx, rule)
+		if err != nil {
+			add("grab_bind_legacy_rule", Warn,
+				"papio could not read the record of how downloads were matched to papers",
+				"check the database is readable and run papio doctor again; until this reads cleanly papio cannot tell you whether any paper was filed by the old matching rule")
+			return
+		}
+		affected = append(affected, binds...)
+		unreadable += bad
+	}
+	if len(affected) != 0 {
+		jobs := make([]string, 0, len(affected))
+		for _, b := range affected {
+			if b.JobID != "" {
+				jobs = append(jobs, b.JobID)
+			}
+		}
+		add("grab_bind_legacy_rule", Warn,
+			fmt.Sprintf("%d download%s %s filed under a paper by an earlier matching rule that papio no longer trusts, so the stored file may not be the paper its citation names",
+				len(affected), plural(len(affected), "", "s"), plural(len(affected), "was", "were")),
+			fmt.Sprintf("open each one with papio jobs receipt %s and read the first page of the stored PDF. If it is not the paper the citation names, run papio jobs cancel on it and download that paper again \u2014 papio no longer matches a download to a paper on its own, so this cannot happen again",
+				strings.Join(jobs, " ")))
+	}
+	if unreadable != 0 {
+		add("grab_bind_audit_unreadable", Warn,
+			fmt.Sprintf("%d download%s %s a record of how it was matched that papio cannot read",
+				unreadable, plural(unreadable, "", "s"), plural(unreadable, "has", "have")),
+			"papio never writes a record it cannot read back, so these rows were edited outside papio; restore the database from a verified backup if you did not edit it yourself")
+	}
 }
 
 // plural picks a suffix without dragging a formatting dependency into a

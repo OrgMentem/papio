@@ -21,7 +21,53 @@ export class FakeWebNavigation {
   readonly onCommitted = new FakeEmitter<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>();
   readonly onHistoryStateUpdated = new FakeEmitter<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>();
   readonly onReferenceFragmentUpdated = new FakeEmitter<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>();
-  readonly onTabReplaced = new FakeEmitter<[{ addedTabId: number; removedTabId: number }]>();
+  /** chrome.webNavigation.onTabReplaced delivers `{tabId, replacedTabId}`.
+   * `{addedTabId, removedTabId}` is the *separate* tabs.onReplaced event; a
+   * harness that emits those names tests a fiction the browser never sends. */
+  readonly onTabReplaced = new FakeEmitter<[{ tabId: number; replacedTabId: number }]>();
+  /** The browser's own top-frame document epochs — the state `getFrame`
+   * reports. It lives in the browser, so it outlives a service-worker
+   * restart; that is precisely why the background reads it instead of
+   * trusting a worker-local map that MV3 empties without warning.
+   *
+   * `null` models a tab (or a platform) the browser reports no epoch for.
+   * An untouched tab reports a stable id derived from the tab number, so a
+   * restarted worker looking at the same undisturbed tab sees the same
+   * document — exactly what Chrome does. */
+  private readonly liveFrames = new Map<number, string | null>();
+  private commits = 0;
+
+  constructor() {
+    // A committed top-frame navigation is a new document. When a test does not
+    // name the id, mint a fresh one anyway: pretending the epoch survived a
+    // real navigation is the fiction this harness exists to prevent.
+    this.onCommitted.addListener((d) => {
+      if (d.frameId !== 0) return;
+      this.commits += 1;
+      this.liveFrames.set(d.tabId, d.documentId ?? `doc-auto-${d.tabId}-c${this.commits}`);
+    });
+    this.onTabReplaced.addListener((d) => {
+      this.liveFrames.delete(d.replacedTabId);
+    });
+  }
+
+  /** State the browser's epoch without pretending an event was delivered —
+   * models a tab that already existed before this worker started listening. */
+  setFrame(tabId: number, documentId: string): void {
+    this.liveFrames.set(tabId, documentId);
+  }
+
+  /** Model a browser that reports no document epoch for this tab at all. */
+  clearFrame(tabId: number): void {
+    this.liveFrames.set(tabId, null);
+  }
+
+  async getFrame(details: { tabId: number; frameId: number }): Promise<{ documentId?: string } | null> {
+    if (details.frameId !== 0) return null;
+    const known = this.liveFrames.get(details.tabId);
+    if (known === null) return null;
+    return { documentId: known ?? `doc-auto-${details.tabId}` };
+  }
 }
 
 export type FakeTab = TabInfo & {

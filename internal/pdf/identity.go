@@ -148,14 +148,29 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	wantDOI := normalizeDOI(target.DOI)
 	matchableDOIs, conclusiveDOIs := documentDOIs(frontMatter)
 	if wantDOI != "" && len(matchableDOIs) != 0 {
+		// documentDOIs reports the suffix VERBATIM, so the registrant slash-run
+		// leniency is applied here, at the comparison, and only here. This is
+		// the attested-single-target side of the asymmetry documented on
+		// collapseRegistrantSlashRun: the caller already named the work, so
+		// reading a printed 10.1037//x as the requested 10.1037/x accepts the
+		// legacy APA reprint the operator asked for. The two hits are reported
+		// with different evidence because a reader of a park or an audit trail
+		// needs to know which relation fired.
+		wantCollapsed := collapseRegistrantSlashRun(wantDOI)
 		for _, gotDOI := range matchableDOIs {
 			if gotDOI == wantDOI {
 				return capPass("exact normalized DOI match: " + wantDOI)
 			}
 		}
+		for _, gotDOI := range matchableDOIs {
+			if collapseRegistrantSlashRun(gotDOI) == wantCollapsed {
+				return capPass("DOI match ignoring the registrant slash run: document prints " + gotDOI + ", request names " + wantDOI)
+			}
+		}
 		// Only a DOI printed whole contradicts the request. A prefix truncated
 		// at a line break with no recoverable continuation says nothing, so the
 		// title rules below get their turn instead of discarding the candidate.
+		// A slash-run-only difference never reaches here: it was accepted above.
 		if len(conclusiveDOIs) != 0 {
 			return reject("document DOI does not match requested DOI", "document DOI: "+strings.Join(conclusiveDOIs, ", "))
 		}
@@ -621,21 +636,58 @@ func correctionMarkerAt(segment string) string {
 	return ""
 }
 
+// normalizeDOI is the EXACT identity form of a DOI: work.NormalizeDOI's
+// canonical spelling, suffix left verbatim, slash runs included.
+//
+// A slash run after the registrant is NOT a spelling variant of one slash.
+// DataCite holds 10.48612//monograph-2025-2 and 10.48612/monograph-2025-2 as
+// two separately registered works with different titles by the same creators —
+// verified against the live API and pinned as a pair by internal/ownership's
+// TestNormalizeIdentifier; a tree-wide collapse was tried and reverted in
+// 5d1adce. And legacy APA PDFs genuinely do print 10.1037//0021-9010.87.4.611
+// for the work Crossref identifies with one slash. BOTH facts are true, so no
+// lexical rule can decide which of the two a given pair is. This function
+// therefore decides nothing: collapseRegistrantSlashRun below is a separate,
+// named, two-call-site leniency rather than the default every caller inherits.
 func normalizeDOI(v string) string {
 	n, err := work.NormalizeDOI(v)
 	if err != nil {
 		return ""
 	}
-	// Legacy APA PDFs print an extra slash after the registrant
-	// (for example 10.1037//0021-9010.87.4.611), while Crossref and modern
-	// resolvers identify the same work with one. Collapse that leading suffix
-	// slash for identity comparison only; the canonical work identifier remains
-	// untouched elsewhere.
-	prefix, suffix, ok := strings.Cut(n, "/")
+	return n
+}
+
+// collapseRegistrantSlashRun folds a run of slashes immediately after the
+// registrant down to a single one. It is the only leniency over normalizeDOI in
+// this package, and it exists at exactly two call sites which use it in
+// OPPOSITE directions. That asymmetry is the whole design:
+//
+//   - MatchIdentityWithThreshold (below) may be lenient, because it validates
+//     against a SINGLE ATTESTED TARGET. The caller has already asserted "this
+//     job is DOI X"; the only question left is whether the document in hand
+//     prints X. Reading a printed 10.1037//0021-9010.87.4.611 as the requested
+//     10.1037/0021-9010.87.4.611 accepts the legacy APA reprint the operator
+//     asked for by name, and the residual error is one wrong document against
+//     one attested target, which the operator sees and corrects.
+//
+//   - CheckConclusiveIdentity (candidate_binding.go) may NOT be lenient,
+//     because its job is to detect a FOREIGN work — and it must equally not
+//     call the pair foreign, because the APA fact says they may be the same
+//     work. So it uses this relation inverted: a slash-run-only difference is
+//     not evidence of sameness and not evidence of difference, it is proof that
+//     papio cannot tell which fact it is looking at, and the veto parks for a
+//     human rather than returning compatible or foreign.
+//
+// It is deliberately absent from acquisition and holdings normalization
+// (internal/work, internal/ownership): collapsing there merges two real
+// registered names and answers "already held" for a work the library does not
+// hold. Slash runs stay preserved on that side.
+func collapseRegistrantSlashRun(doi string) string {
+	prefix, suffix, ok := strings.Cut(doi, "/")
 	if !ok {
-		return n
+		return doi
 	}
-	return prefix + "/" + strings.TrimPrefix(suffix, "/")
+	return prefix + "/" + strings.TrimLeft(suffix, "/")
 }
 
 // documentDOIs returns two sets over the same window.
@@ -654,6 +706,14 @@ func normalizeDOI(v string) string {
 // caller already asked for — it can never manufacture a rejection, and it can
 // never be published as a captured file's identity. A wrong reject costs a
 // retry; a wrong accept files the wrong paper under a right citation.
+//
+// Both sets carry the suffix VERBATIM — a registrant slash run is preserved,
+// never collapsed, and dedup is over the verbatim spelling. A document printing
+// both 10.48612/x and 10.48612//x therefore reports TWO entries, which is the
+// truth: those are two separately registered DataCite works. Any caller that
+// wants the legacy-APA leniency asks for it by name through
+// collapseRegistrantSlashRun at its own comparison, where the safety argument
+// for it can be stated. See that function for why this side cannot decide.
 func documentDOIs(text string) (matchable, conclusive []string) {
 	seenMatchable, seenConclusive := make(map[string]bool), make(map[string]bool)
 	add := func(raw string, complete bool) {
@@ -702,12 +762,43 @@ func documentDOIs(text string) (matchable, conclusive []string) {
 
 // FrontMatterDOIs returns the normalized, deduplicated DOIs printed in a
 // document's front matter — the same window MatchIdentity reads its own-DOI
-// evidence from. Exported for the PDF-grab pipeline (ADR-0020), which must
-// identify a captured file before any job exists: there is no target
-// work.Work yet to corroborate against, so corroboratingIdentifier's
-// arXiv/PMID markers do not apply (they compare against a KNOWN
-// identifier); inventing a target-less arXiv/PMID extractor is out of scope
-// for this decision — only the DOI front-matter pattern extracts blind.
+// evidence from. Suffixes are verbatim (see documentDOIs): slash runs are
+// preserved, so two separately registered works never merge into one name.
+//
+// Exported for the PDF-grab pipeline (ADR-0020), which must identify a captured
+// file before any job exists.
+//
+// DOI IS THE SOLE BLIND IDENTIFIER CLASS, and that is now a decision rather
+// than an omission. ADR-0020's Decision 4 originally read as though arXiv and
+// PMID front-matter patterns identified blind too; they do not, here or in the
+// conclusive-identity veto, for a reason that is about what the identifiers
+// mean and not about implementation effort:
+//
+//   - A DOI in front matter is the publisher's assertion of THIS ARTICLE'S
+//     identity, which is what makes a non-matching one evidence of a foreign
+//     work — the inference the veto is built on.
+//   - An arXiv stamp ("arXiv:2401.12345v2 [cs.LG] 22 Jan 2024" down the margin)
+//     and a PubMed Central PMID stamp identify a MANIFESTATION or a catalogue
+//     record, not an exclusive work identity. The accepted manuscript of the
+//     very article a job names is routinely the thing carrying an arXiv stamp
+//     and no DOI at all.
+//
+// So admitting them would not add negative evidence, it would manufacture
+// false negative evidence: the veto compares against the job's durably bound
+// DOI set (job.BoundDOIs), which cannot express an arXiv id or a PMID, so every
+// preprint of a journal-DOI job would read as naming a work the job is not
+// bound to and park, and every arXiv-submitted job's own PDF would park against
+// its empty bound set. arXiv and PMID stay TARGET-AWARE only, where
+// corroboratingIdentifier compares them against an identifier the request
+// actually attested.
+//
+// The residual is real and measured rather than hidden: a document may
+// conclusively name a foreign arXiv or PMID work while printing no DOI, and
+// this function reports the empty set for it (pinned by
+// TestCheckConclusiveIdentityForeignArXivWithEmptyDOISet). Closing it needs a
+// TYPED identifier set on both sides — document and job — which is the /2
+// design, not a lexical widening of this one.
+//
 // Blind identification uses the conclusive set: a DOI known to be cut off at a
 // line break names no work at all, so handing it to a target-less pipeline can
 // only file a capture under a fabricated identifier.
@@ -902,6 +993,18 @@ func lowerASCII(c byte) byte {
 // also means they miss a DOI printed in a running footer or below the abstract
 // — 17 of 40 real papers in one library. Searching the whole document is safe
 // here only because the caller has already cleared the title gate.
+//
+// The DOI needle is the target's EXACT normalized form. This is the one place
+// the old collapse-by-default normalizer was not merely unsafe but backwards,
+// in both directions at once: it collapsed only the needle and never the page,
+// so a target registered as 10.48612//x searched the document for 10.48612/x —
+// finding, and reporting as corroboration, the OTHER separately registered
+// DataCite work — while never once finding the 10.48612//x the document
+// actually printed. It never delivered the legacy-APA leniency either, since
+// a page printing 10.1037//x does not contain the collapsed needle as a
+// complete token. Searching for what the request attested, verbatim, both
+// removes that wrong accept and recovers a real corroboration; there is no
+// leniency to preserve here, so collapseRegistrantSlashRun is not used.
 func corroboratingIdentifier(text string, target work.Work) string {
 	if doi := normalizeDOI(target.DOI); doi != "" && containsFlattenedToken(text, doi) {
 		return "document prints the requested DOI: " + doi

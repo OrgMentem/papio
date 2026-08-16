@@ -9572,7 +9572,7 @@ test("onTabReplaced prerender activation clears durable continuation and allows 
   const picked = await h1.bridge.startPDFDelivery({ tab_id: 80, url: viewer80, choice: { interaction: offer80.interaction, job_id: "job_replace_a" } }) as unknown as Record<string, unknown>;
   expect(picked["state"]).toBe("waiting_manual");
   expect(h1.backend.store.pendingDelivery?.page_identity?.tab_id).toBe(80);
-  await h1.webNavigation.onTabReplaced.emit({ addedTabId: 81, removedTabId: 80 });
+  await h1.webNavigation.onTabReplaced.emit({ tabId: 81, replacedTabId: 80 });
   expect(h1.backend.store.pendingDelivery).toBeUndefined();
   h1.tabs.seed({ id: 81, url: viewer80 });
   await h1.webNavigation.onCommitted!.emit({ tabId: 81, frameId: 0, documentId: "doc-81" });
@@ -9582,6 +9582,186 @@ test("onTabReplaced prerender activation clears durable continuation and allows 
   const repick = await h1.bridge.startPDFDelivery({ tab_id: 81, url: viewer80, choice: { interaction: offer81Choice.interaction, job_id: "job_replace_b" } }) as unknown as Record<string, unknown>;
   expect(repick["ok"]).toBe(true);
   expect(repick["job_id"]).toBe("job_replace_b");
+});
+
+/** chrome.webNavigation.onTabReplaced delivers `{tabId, replacedTabId}`; the
+ * `{addedTabId, removedTabId}` pair belongs to the separate tabs.onReplaced
+ * API. Reading the wrong names yields undefined on both sides, which disarms
+ * the revocation entirely while every assertion written against the wrong
+ * shape still passes. Both assertions below fail on the wrong field names:
+ * the first needs `replacedTabId`, the second needs `tabId`. */
+test("onTabReplaced revokes on the real {tabId, replacedTabId} field names", async () => {
+  const viewer = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_swap_a", 1_700_000_000_001), awaitingJob("job_swap_b", 1_700_000_000_002)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 300, url: viewer });
+  await h.webNavigation.onCommitted.emit({ tabId: 300, frameId: 0, documentId: "doc-300" });
+  const offer300 = ((await h.bridge.startPDFDelivery({ tab_id: 300, url: viewer }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const picked = await h.bridge.startPDFDelivery({ tab_id: 300, url: viewer, choice: { interaction: offer300.interaction, job_id: "job_swap_a" } }) as unknown as Record<string, unknown>;
+  expect(picked["state"]).toBe("waiting_manual");
+  // A second, still-unspent offer minted against the prerendered tab that is
+  // about to take over.
+  h.tabs.seed({ id: 301, url: viewer });
+  await h.webNavigation.onCommitted.emit({ tabId: 301, frameId: 0, documentId: "doc-301" });
+  const offer301 = ((await h.bridge.startPDFDelivery({ tab_id: 301, url: viewer }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  await h.webNavigation.onTabReplaced.emit({ tabId: 301, replacedTabId: 300 });
+  // `replacedTabId` side: the continuation granted against the tab that went away.
+  expect(h.backend.store.pendingDelivery).toBeUndefined();
+  // `tabId` side: the offer held against the tab that took over.
+  const spendNew = await h.bridge.startPDFDelivery({ tab_id: 301, url: viewer, choice: { interaction: offer301.interaction, job_id: "job_swap_b" } }) as unknown as Record<string, unknown>;
+  expect(spendNew).toMatchObject({ ok: false, code: "choice_expired" });
+});
+
+/** The dangerous composition finding 10 names: a picker minted for a tab the
+ * worker never saw commit, so it holds no epoch of its own. The epoch must come
+ * from the browser, because the source token strips the query and two signed
+ * documents at one provider path are otherwise indistinguishable. */
+test("a pre-existing tab with no observed epoch still binds to the browser's document, and a same-path swap is refused", async () => {
+  const pdfPath = "https://provider.example.edu/paper.pdf";
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_pre_a", 1_700_000_000_001), awaitingJob("job_pre_b", 1_700_000_000_002)] };
+  });
+  await h.bridge.start();
+  // Seeded, never committed: the worker's own navigation map knows nothing.
+  h.tabs.seed({ id: 310, url: `${pdfPath}?sig=AAA` });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 310, url: `${pdfPath}?sig=AAA` }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  expect(offer).toBeDefined();
+  // Same origin and path, freshly signed query, genuinely different document.
+  h.tabs.seed({ id: 310, url: `${pdfPath}?sig=BBB` });
+  h.webNavigation.setFrame(310, "doc-310-second");
+  const spend = await h.bridge.startPDFDelivery({ tab_id: 310, url: `${pdfPath}?sig=AAA`, choice: { interaction: offer.interaction, job_id: "job_pre_a" } }) as unknown as Record<string, unknown>;
+  expect(spend).toMatchObject({ ok: false, code: "choice_expired" });
+  expect(h.downloads.started).toHaveLength(0);
+});
+
+/** Worker restart empties `pageNavSeq` and the epoch map both, so neither can
+ * carry weight. Only the browser's own epoch can, and it must be re-read. */
+test("a continuation does not adopt after a query-only document swap across a worker restart", async () => {
+  const base = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  const h1 = makeHarness();
+  await ((h1.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_qswap_a", 1_700_000_000_001), awaitingJob("job_qswap_b", 1_700_000_000_002)] };
+  });
+  await h1.bridge.start();
+  h1.tabs.seed({ id: 320, url: `${base}?sig=AAA` });
+  await h1.webNavigation.onCommitted.emit({ tabId: 320, frameId: 0, documentId: "doc-320" });
+  const offer = ((await h1.bridge.startPDFDelivery({ tab_id: 320, url: `${base}?sig=AAA` }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const picked = await h1.bridge.startPDFDelivery({ tab_id: 320, url: `${base}?sig=AAA`, choice: { interaction: offer.interaction, job_id: "job_qswap_a" } }) as unknown as Record<string, unknown>;
+  expect(picked["state"]).toBe("waiting_manual");
+  expect(h1.backend.store.pendingDelivery?.page_identity?.document_id).toBe("doc-320");
+  const persisted = JSON.parse(JSON.stringify(h1.backend.store)) as StoreShape;
+  const h2 = makeHarness(persisted);
+  // Same tab, same path, different signed document. The token cannot see it.
+  h2.tabs.seed({ id: 320, url: `${base}?sig=BBB` });
+  h2.webNavigation.setFrame(320, "doc-320-other");
+  await h2.bridge.start();
+  await h2.downloads.onCreated.emit({ id: 9301, tabId: 320, url: `${base}?sig=BBB`, filename: "main.pdf", state: "in_progress" } as DownloadItemLike);
+  expect(h2.backend.store.pendingDelivery).toBeUndefined();
+});
+
+/** Same URL start to finish: only the document epoch reveals that the page was
+ * navigated (or reloaded) while MV3 had the worker suspended. */
+test("a continuation does not adopt after a full navigation while the worker was suspended", async () => {
+  const viewer = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  const h1 = makeHarness();
+  await ((h1.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_susp_a", 1_700_000_000_001), awaitingJob("job_susp_b", 1_700_000_000_002)] };
+  });
+  await h1.bridge.start();
+  h1.tabs.seed({ id: 330, url: viewer });
+  await h1.webNavigation.onCommitted.emit({ tabId: 330, frameId: 0, documentId: "doc-330" });
+  const offer = ((await h1.bridge.startPDFDelivery({ tab_id: 330, url: viewer }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const picked = await h1.bridge.startPDFDelivery({ tab_id: 330, url: viewer, choice: { interaction: offer.interaction, job_id: "job_susp_a" } }) as unknown as Record<string, unknown>;
+  expect(picked["state"]).toBe("waiting_manual");
+  const persisted = JSON.parse(JSON.stringify(h1.backend.store)) as StoreShape;
+  const h2 = makeHarness(persisted);
+  h2.tabs.seed({ id: 330, url: viewer });
+  // The worker slept through the navigation; the browser did not.
+  h2.webNavigation.setFrame(330, "doc-330-reloaded");
+  await h2.bridge.start();
+  await h2.downloads.onCreated.emit({ id: 9302, tabId: 330, url: viewer, filename: "main.pdf", state: "in_progress" } as DownloadItemLike);
+  expect(h2.backend.store.pendingDelivery).toBeUndefined();
+});
+
+/** `Tab.url` is optional by API contract. Absence is a refusal, never a licence
+ * to fall back on whatever URL the popup said it was looking at. */
+test("an absent live Tab.url refuses instead of reusing the caller-supplied URL", async () => {
+  const pdfURL = "https://provider.example.edu/paper.pdf";
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_nourl_a", 1_700_000_000_001), awaitingJob("job_nourl_b", 1_700_000_000_002)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 340, url: pdfURL });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 340, url: pdfURL }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  // Chrome now reports the tab without a URL.
+  h.tabs.seed({ id: 340 });
+  const spend = await h.bridge.startPDFDelivery({ tab_id: 340, url: pdfURL, choice: { interaction: offer.interaction, job_id: "job_nourl_a" } }) as unknown as Record<string, unknown>;
+  expect(spend).toMatchObject({ ok: false, code: "choice_expired" });
+  expect(h.downloads.started).toHaveLength(0);
+  const bare = await h.bridge.startPDFDelivery({ tab_id: 340, url: pdfURL }) as unknown as Record<string, unknown>;
+  expect(bare).toMatchObject({ ok: false, error: { code: "tab_unavailable" } });
+});
+
+/** No epoch from the platform means no way to tell two documents at one path
+ * apart, so the picker and the durable manual continuation are unavailable
+ * rather than approximate. */
+test("a browser that reports no document epoch mints no offer and no continuation", async () => {
+  const pdfURL = "https://provider.example.edu/paper.pdf";
+  const viewer = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [
+      awaitingJob("job_noepoch_a", 1_700_000_000_001),
+      { job_id: "job_noepoch_doi", tab_id: 361, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: ["pdf.sciencedirectassets.com"] },
+    ]};
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 360, url: pdfURL });
+  h.webNavigation.clearFrame(360);
+  const noOffer = await h.bridge.startPDFDelivery({ tab_id: 360, url: pdfURL }) as unknown as Record<string, unknown>;
+  expect(noOffer).toMatchObject({ ok: false, error: { code: "page_unverified" } });
+  h.tabs.seed({ id: 361, url: viewer });
+  h.webNavigation.clearFrame(361);
+  const noContinuation = await h.bridge.startPDFDelivery({ tab_id: 361, url: viewer }) as unknown as Record<string, unknown>;
+  expect(noContinuation).toMatchObject({ ok: false, error: { code: "page_unverified" } });
+  expect(h.backend.store.pendingDelivery).toBeUndefined();
+});
+
+/** Both epochs absent used to read as "nothing changed" and adopt. A
+ * continuation with no recorded epoch cannot be revalidated at all. */
+test("a continuation recorded without a document epoch never adopts", async () => {
+  const pdfURL = "https://provider.example.edu/paper.pdf";
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return startPendingDelivery(
+      { ...s2, activeJobs: [awaitingJob("job_noepoch_cont", 1_700_000_000_001)] },
+      {
+        job_id: "job_noepoch_cont",
+        url: pdfURL,
+        initiated_at: 1_700_000_000_000,
+        status: "waiting_manual",
+        page_identity: { tab_id: 370, nav_seq: 0, source_url: pdfURL },
+      },
+    );
+  });
+  await h.bridge.start();
+  // Everything else lines up: same tab, same token, worker map untouched.
+  h.tabs.seed({ id: 370, url: pdfURL });
+  expect(h.backend.store.pendingDelivery?.status).toBe("waiting_manual");
+  await h.downloads.onCreated.emit({ id: 9303, tabId: 370, url: pdfURL, filename: "paper.pdf", state: "in_progress" } as DownloadItemLike);
+  expect(h.backend.store.pendingDelivery).toBeUndefined();
 });
 
 test("death between sending persistence and downloads.download is recoverable via fresh pick", async () => {
