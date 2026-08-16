@@ -175,16 +175,37 @@ func NormalizeISBN(raw string) (string, error) {
 	return s, nil
 }
 
-// NormalizeOpenAlex validates a work id (W…), accepting the API URL form.
+// NormalizeOpenAlex validates a work id (W…). It accepts the "openalex:"
+// prefix, the canonical id URL (openalex.org/W…) that OpenAlex emits in a
+// record's own `id` field, and the "/works/" URL shapes served by the API and
+// by the web UI — the latter being what a user pastes out of a browser.
 func NormalizeOpenAlex(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
-	for _, prefix := range []string{"https://openalex.org/", "http://openalex.org/", "https://api.openalex.org/works/", "openalex:"} {
-		if strings.HasPrefix(strings.ToLower(s), prefix) {
-			s = s[len(prefix):]
-			break
+	lower := strings.ToLower(s)
+	for _, prefix := range []string{
+		"https://openalex.org/", "http://openalex.org/",
+		"https://www.openalex.org/", "http://www.openalex.org/",
+		"https://api.openalex.org/", "http://api.openalex.org/",
+		"openalex:",
+	} {
+		if !strings.HasPrefix(lower, prefix) {
+			continue
 		}
+		// Every prefix is ASCII, so a match means those bytes lowercased
+		// one-for-one and the offset is valid in both strings.
+		s, lower = s[len(prefix):], lower[len(prefix):]
+		// The API and the web UI carry a "works/" collection segment the
+		// canonical id form does not; both name the same work. It is stripped
+		// only once a prefix has matched, so a bare argument must still be the
+		// id itself: cli.inferBareIdentifier classifies a positional argument
+		// by calling this function, and "works/W…" is not a bare identifier
+		// shape it should start accepting.
+		if strings.HasPrefix(lower, "works/") {
+			s = s[len("works/"):]
+		}
+		break
 	}
-	s = strings.ToUpper(s)
+	s = strings.ToUpper(strings.TrimSuffix(s, "/"))
 	if !openalexRE.MatchString(s) {
 		return "", fmt.Errorf("invalid OpenAlex work id %q", raw)
 	}

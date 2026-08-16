@@ -112,6 +112,47 @@ func TestNormalizePMID(t *testing.T) {
 	}
 }
 
+// The canonical id form OpenAlex emits (`id`: "https://openalex.org/W…") and
+// the "/works/" form its web UI and API serve are both real, and the second is
+// what a user copies out of a browser address bar. Matching a bare
+// "https://openalex.org/" prefix left "works/W…" behind, so every pasted web
+// URL was rejected as an invalid work id.
+func TestNormalizeOpenAlex(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"W3128483323", "W3128483323"},
+		{" w3128483323 ", "W3128483323"}, // trimmed and uppercased
+		{"openalex:W3128483323", "W3128483323"},
+		{"https://openalex.org/W3128483323", "W3128483323"}, // canonical id URL
+		{"https://openalex.org/works/W3128483323", "W3128483323"},
+		{"http://openalex.org/works/W3128483323", "W3128483323"},
+		{"https://www.openalex.org/works/W3128483323", "W3128483323"},
+		{"https://api.openalex.org/works/W3128483323", "W3128483323"},
+		{"http://api.openalex.org/works/W3128483323", "W3128483323"},
+		{"https://openalex.org/works/w3128483323/", "W3128483323"}, // browser paste
+		{"works/W3128483323", ""},                                  // bare form must stay the id itself
+		{"https://openalex.org/A3128483323", ""},                   // author id, not a work
+		{"W123", ""},                                               // too few digits
+		{"W31284833231234", ""},                                    // too many digits
+		{"https://openalex.org/works/", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		got, err := NormalizeOpenAlex(c.in)
+		if c.want == "" {
+			if err == nil {
+				t.Errorf("NormalizeOpenAlex(%q) = %q, want error", c.in, got)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("NormalizeOpenAlex(%q) = %q, %v; want %q", c.in, got, err, c.want)
+		}
+	}
+}
+
 // ISBN satisfies HasIdentifier but no resolver consumes it, so the two
 // predicates must disagree exactly there. Conflating them is what routed
 // printed monographs into an institutional sign-in no login could complete.

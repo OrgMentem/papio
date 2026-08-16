@@ -59,6 +59,11 @@ func TestNormalizeIdentifiersInfersUnprefixedShapes(t *testing.T) {
 		{"bare arxiv new style", "2301.08745", protocol.Identifiers{ArXiv: "2301.08745"}},
 		{"bare arxiv with version", "2301.08745v2", protocol.Identifiers{ArXiv: "2301.08745v2"}},
 		{"bare arxiv old style", "math/0211159", protocol.Identifiers{ArXiv: "math/0211159"}},
+		// What a user copies out of a browser address bar: openalex.org's web
+		// UI serves /works/<id>, not the bare canonical id form.
+		{"pasted openalex web url", "https://openalex.org/works/W2036177018", protocol.Identifiers{OpenAlex: "W2036177018"}},
+		{"openalex api url", "https://api.openalex.org/works/W2036177018", protocol.Identifiers{OpenAlex: "W2036177018"}},
+		{"canonical openalex id url", "https://openalex.org/W2036177018", protocol.Identifiers{OpenAlex: "W2036177018"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ids, err := normalizeIdentifiers([]string{test.in}, "", "", "", "", "")
@@ -77,10 +82,11 @@ func TestNormalizeIdentifiersInfersUnprefixedShapes(t *testing.T) {
 // PMID width here would silently acquire the wrong work for every bare ISBN-10.
 func TestNormalizeIdentifiersRefusesIdentifiersThatNameTwoSchemes(t *testing.T) {
 	for _, in := range []string{
-		"0306406152",    // ISBN-10 digits, also within PMID width
-		"1234567890",    // ten digits, scheme genuinely ambiguous
-		"Wnt",           // starts with W but is not an OpenAlex id
-		"9781461330875", // bare ISBN-13 still needs isbn:/--isbn
+		"0306406152",        // ISBN-10 digits, also within PMID width
+		"1234567890",        // ten digits, scheme genuinely ambiguous
+		"Wnt",               // starts with W but is not an OpenAlex id
+		"9781461330875",     // bare ISBN-13 still needs isbn:/--isbn
+		"works/W2036177018", // the /works/ segment is stripped inside a URL only, never from a bare argument
 		"not-an-id",
 	} {
 		ids, err := normalizeIdentifiers([]string{in}, "", "", "", "", "")
