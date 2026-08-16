@@ -104,26 +104,33 @@ that ID. Firefox treats host access as opt-in at runtime, so the extension
 options page includes a resolver-access grant alongside the per-provider
 grants.
 
-## One browser holds the session
+## One browser receives handoffs; every browser can still act
 
 With *papio* installed in more than one browser — say the store extension in
 your daily browser and a development build in a second profile — exactly one
-browser holds the offer/handoff flow at a time. The first to connect wins;
+browser receives the offer/handoff flow at a time. The first to connect wins;
 others wait, visibly, instead of silently taking over:
 
-- `papio browser sessions` lists the holder and every waiting session with
-  extension versions and last-contact times.
-- `papio browser use <id>` (or `--latest`) hands the session to another
-  browser on demand.
-- Quitting the holder releases the session immediately; a holder that stops
+- `papio browser sessions` lists the browser currently receiving handoffs and
+  every waiting session, with extension versions and last-contact times.
+- `papio browser use <id>` (or `--latest`) moves handoffs to another browser
+  on demand.
+- Quitting that browser releases the slot immediately; one that stops
   responding (crashed browser) yields to a live waiting session within about
   ten seconds.
 - `papio doctor` and `papio status` report when other browsers are waiting.
 
-A browser that is not the holder says so in its popup and points at
-`papio browser use`; the daemon negotiates **Acquire this page** and the inbox
-with the browser whose session it acknowledged, so both return in whichever
-browser you hand the session to.
+That slot decides where *papio* sends work **it** starts. It does not decide
+where you are allowed to act. Anything you initiate yourself — **Acquire this
+page**, **Send PDF**, reading the inbox — works in whichever browser you are
+actually clicking in, because your click already says which browser you mean.
+A waiting browser is acknowledged with its own connection and told it is
+waiting, so its popup stays fully usable rather than refusing everything and
+pointing you at a terminal command.
+
+Two browsers cannot race a download, but the slot is not what prevents it: a
+single download authorization is outstanding at a time, so a second attempt is
+told *papio* is busy and can be retried, wherever it came from.
 
 ## The inbox stays current
 

@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"pdf_grab_result","msg_id":"pdf-grab-result-005","seq":25,"payload":{"request_id":"pdf-grab-request-frame","grab_id":"grab_0123456789abcdef01234567","outcome":"unavailable","reason":"busy","detail":"another effect holds the permit lane"}}

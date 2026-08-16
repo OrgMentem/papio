@@ -91,6 +91,12 @@ const (
 	pageBulkCohortV2Feature      = "page_bulk_cohort_v2"
 	triageCountsSchema3Feature   = "triage_counts_schema_v3"
 	triageSnapshotSchema5Feature = "triage_snapshot_schema_v5"
+	// sessionRolesFeature tells the extension this daemon acknowledges a
+	// hello it denies holdership to, and labels every hello_ack with the
+	// role it grants ("holder" or "pending"). Without it a pending session
+	// learns no daemon features and locally refuses every capability, even
+	// the holder-independent ones the dispatcher already admits from it.
+	sessionRolesFeature = "session_roles_v1"
 	// pdfGrabV1Feature is ADR-0020's PDF-grab capability flag: it gates both
 	// the pdf_grab_request/pdf_grab_result message pair and, extension-side,
 	// whether the workspace even renders the grab row.
@@ -131,6 +137,39 @@ const (
 	// The remainder stays queued for the next ordinary poll. Pinned by
 	// TestSyncResponseFitsResultCap.
 	maxFocusFramesPerPoll = 32
+)
+
+// Session roles carried by hello_ack. Absent means "holder": an old daemon
+// only ever acked the session it granted the bridge to.
+const (
+	sessionRoleHolder  = "holder"
+	sessionRolePending = "pending"
+)
+
+// PDF-grab refusal reasons. The extension switches on these to pick user
+// copy, so the set is closed and every member is produced by exactly one
+// condition; Detail stays a human-readable companion, never the thing a UI
+// parses. There is deliberately no "session_elsewhere": a grab is
+// user-initiated and self-routed, so holdership never refuses one.
+const (
+	// grabReasonNoSession: the sender never completed a hello.
+	grabReasonNoSession = "no_session"
+	// grabReasonExtensionOutdated: the session lacks pdf_grab_v1 or the
+	// effect-permit capability, or is below MinExtensionVersion.
+	grabReasonExtensionOutdated = "extension_outdated"
+	// grabReasonDaemonUnsupported: this daemon does not advertise pdf_grab_v1.
+	grabReasonDaemonUnsupported = "daemon_unsupported"
+	// grabReasonBusy: the single effect lane is occupied by another effect.
+	grabReasonBusy = "busy"
+	// grabReasonNotConfigured: grab storage is not configured.
+	grabReasonNotConfigured = "not_configured"
+	// grabReasonAdoptionUnhealthy: the adoption latch is unhealthy (on macOS,
+	// usually withheld TCC consent for the downloads folder).
+	grabReasonAdoptionUnhealthy = "adoption_unhealthy"
+	// grabReasonTabUnusable: the requested tab/URL cannot be grabbed.
+	grabReasonTabUnusable = "tab_unusable"
+	// grabReasonInternal: an unexpected daemon-side failure.
+	grabReasonInternal = "internal"
 )
 
 // HandoffFocusMinExtensionVersion is the first extension that parses
@@ -464,8 +503,9 @@ type browserSession struct {
 	// without turning each two-second browser poll into a maintenance sweep.
 	adapterUpgradeRepairPending bool
 	// needsAck makes the next Sync from this session deliver a hello_ack:
-	// a session promoted by claim or stale-takeover was denied its ack at
-	// hello time and must still receive one before offers mean anything.
+	// a session promoted by claim or stale-takeover was only acked as
+	// sessionRolePending at hello time and must hear it now holds the
+	// bridge before offers mean anything.
 	needsAck bool
 	// demotedNotice makes the next Sync from a claim-demoted holder deliver
 	// one session_busy frame. `papio browser use` moves the bridge without
@@ -532,7 +572,7 @@ func (source parkedGrabItemSource) SnapshotItems(ctx context.Context, tx *sql.Tx
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, effectPermitFeature, institutionalMaterializationFeature,
-		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature,
+		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature,
 	}
 	var grabs *grab.Service
 	var cohorts *batch.Cohorts
@@ -900,7 +940,7 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 			}
 			out = append(out, outdated...)
 		} else {
-			ack, err := b.helloAck()
+			ack, err := b.helloAck(sessionRoleHolder)
 			if err != nil {
 				return nil, err
 			}
@@ -1171,12 +1211,18 @@ func (b *Bridge) prunePending(now time.Time) {
 	}
 }
 
-// helloAck builds the capability acknowledgement frame. The caller holds b.mu.
-func (b *Bridge) helloAck() (json.RawMessage, error) {
+// helloAck builds the capability acknowledgement frame for the role this
+// session was granted: sessionRoleHolder, or sessionRolePending for a hello
+// that lost arbitration. A pending session is acked too — it still drives
+// the holder-independent surfaces the dispatcher admits from a non-holder,
+// and it can only know they exist from the feature list carried here.
+// The caller holds b.mu.
+func (b *Bridge) helloAck(role string) (json.RawMessage, error) {
 	return b.frame(protocol.MsgHelloAck, "", protocol.HelloAckPayload{
 		DaemonVersion:   b.Version,
 		Features:        b.Features,
 		ResolverOrigins: b.cfg.ResolverOrigins(),
+		Role:            role,
 	})
 }
 
@@ -1981,8 +2027,25 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			protocol.MsgPdfGrabRequest, protocol.MsgPdfGrabStatusRequest, protocol.MsgPdfGrabAbandonRequest,
 			protocol.MsgSurfacePresence, protocol.MsgWorkPulseRequest, protocol.MsgActivityPageRequest,
 			protocol.MsgProviderDriveEpochResultRequest, protocol.MsgProviderDirectGetResult,
-			protocol.MsgTermsEffectResultRequest:
-			// Read-only UI surfaces are holder-independent. Exact historical
+			protocol.MsgTermsEffectResultRequest,
+			protocol.MsgStatsRequest, protocol.MsgActivityRequest, protocol.MsgTriageDecide,
+			protocol.MsgHumanActionResolve, protocol.MsgDeliveryReconcileRequest,
+			protocol.MsgReviewPreviewRequest:
+			// A frame is holder-independent when the human initiated it in
+			// this browser, it starts no browser-side effect — no tab opened,
+			// focused, grouped or closed; no offer, handoff, cancel or focus
+			// frame emitted; no effect permit allocated or held; no provider
+			// drive, direct get, terms acceptance or institutional navigation
+			// started — and it claims no bridge-routed authority: it neither
+			// depends on being the session the daemon would route
+			// daemon-initiated work to, nor mutates holder-scoped bridge
+			// state (materialization generation/epoch, offer bookkeeping,
+			// schedule cursors, session evidence). Holdership is not a
+			// concurrency fence, so mutating the daemon's own records is not
+			// disqualifying: dismissing a triage item, resolving a parked
+			// human action or reconciling a delivery request are human
+			// decisions about daemon state, and the browser the human clicked
+			// in is the right browser by construction. Exact historical
 			// result frames are also accepted from a recognized old session:
 			// identity settlement is cleanup-only unless the transaction
 			// independently proves the current attempt and generation.
@@ -3013,7 +3076,21 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 		b.deniedHellos++
 		log.Printf("papio: browser session %s (v%s) denied: session held by %s (v%s)",
 			shortSession(sessionID), session.ExtensionVersion, shortSession(b.holder.ID), b.holder.ExtensionVersion)
-		return b.sessionBusy("")
+		// Ack first, then refuse holdership. The denial is about who receives
+		// daemon-initiated offers and handoffs — it is not a rejection of the
+		// session. A pending browser still serves user-initiated,
+		// holder-independent requests (the dispatcher's non-holder whitelist),
+		// and without an ack it never learns which of them this daemon
+		// supports, so its own UI fails closed on every one of them.
+		ack, err := b.helloAck(sessionRolePending)
+		if err != nil {
+			return nil, err
+		}
+		busy, err := b.sessionBusy("")
+		if err != nil {
+			return nil, err
+		}
+		return append([]json.RawMessage{ack}, busy...), nil
 	}
 	if b.holder != nil && !sameSession {
 		b.takeovers++
@@ -3070,7 +3147,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	if session.Outdated {
 		return b.extensionOutdatedError()
 	}
-	ack, err := b.helloAck()
+	ack, err := b.helloAck(sessionRoleHolder)
 	if err != nil {
 		return nil, err
 	}
@@ -4867,14 +4944,49 @@ func (b *Bridge) recordPageBulkRun(ctx context.Context, source protocol.PageBulk
 		source.Detector, source.Origin, selected, submitted, invalid, batchID, ts, ts)
 	return err
 }
-func (b *Bridge) pdfGrabSessionAuthorized(sessionID string) bool {
-	if b == nil || b.holder == nil || b.holder.ID != sessionID {
-		return false
+
+// pdfGrabRefusalReason reports why sessionID may not start a PDF grab, or ""
+// when it may. It is the whole admission test for the grab path.
+//
+// It deliberately does NOT compare sessionID against the holder, and the
+// conjunct that used to (`b.holder.ID != sessionID`) was wrong three times
+// over:
+//
+//   - handle's non-holder whitelist already admits MsgPdfGrabRequest (the
+//     `case protocol.MsgPdfGrabRequest, ...` arm around bridge.go:2026), so
+//     the dispatcher and this function contradicted each other and the
+//     stricter one silently won.
+//   - A grab is user-initiated and self-routed: the requesting session gets
+//     its own steering_path and runs its own chrome.downloads.download into
+//     it, and the sweep adopts by directory, not by session. Nothing in the
+//     flow needs the daemon to know how to reach this browser unprompted,
+//     which is the only thing holdership buys.
+//   - Concurrency is fenced by the single effect-permit lane (AllocateEffect
+//     below), not by holdership. Refusing a non-holder narrowed nothing and
+//     merely made the user's second browser useless.
+//
+// Holdership still routes DAEMON-initiated work — offers and handoffs — and
+// the whitelist's default arm still refuses those from a non-holder.
+//
+// This is NOT the same as pdfGrabAbandonSession's originator scoping, which
+// is correct and stays: "the session that created this grab" is a per-grab
+// fact carried by the effect request id, not a claim on the bridge. Do not
+// collapse the two — dropping holdership here says nothing about who may
+// cancel a grab already in flight.
+func (b *Bridge) pdfGrabRefusalReason(sessionID string) string {
+	if b == nil {
+		return grabReasonInternal
 	}
 	session := b.sessionByID(sessionID)
-	return session != nil &&
-		slices.Contains(session.Features, pdfGrabV1Feature) &&
-		slices.Contains(session.Features, effectPermitFeature)
+	if session == nil {
+		return grabReasonNoSession
+	}
+	if session.Outdated ||
+		!slices.Contains(session.Features, pdfGrabV1Feature) ||
+		!slices.Contains(session.Features, effectPermitFeature) {
+		return grabReasonExtensionOutdated
+	}
+	return ""
 }
 
 // pdfGrab allocates a PDF grab (ADR-0020 Decision 3): a grab id and a
@@ -4884,30 +4996,35 @@ func (b *Bridge) pdfGrabSessionAuthorized(sessionID string) bool {
 // Allocation is a single daemon-durable transaction: grab row + held PDF
 // permit + URL-free authorization event, with the landing directory prepared
 // before commit. Steering is returned only for a newly acquired allocation;
-// an existing active grab returns "existing" with no steering, and a busy or
-// unsupported holder returns structured "unavailable" with no steering.
+// an existing active grab returns "existing" with no steering, and anything
+// that cannot be served returns structured "unavailable" carrying both a
+// closed-enum reason the UI switches on and a human-readable detail.
 // Structured refusal only, never a raw error: an unhandled outcome here
 // would decode fine on the extension side but defeat the whole point of a
 // closed outcome enum a UI can safely switch on.
 func (b *Bridge) pdfGrab(ctx context.Context, sessionID string, request *protocol.PdfGrabRequestPayload) ([]json.RawMessage, error) {
-	if !b.pdfGrabSessionAuthorized(sessionID) {
-		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", "pdf grab requires the current holder with negotiated effect permits")
+	if reason := b.pdfGrabRefusalReason(sessionID); reason != "" {
+		detail := "papio is not connected to this browser yet"
+		if reason != grabReasonNoSession {
+			detail = "this browser extension cannot save PDFs yet; reload it to finish updating"
+		}
+		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", reason, detail)
 	}
 	if b.grabs == nil {
-		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", "pdf grab is not configured")
+		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", grabReasonNotConfigured, "papio is not set up to save PDFs")
 	}
 	if !slices.Contains(b.Features, pdfGrabV1Feature) {
-		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", "pdf grab is not supported by this daemon")
+		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", grabReasonDaemonUnsupported, "this papio cannot save PDFs")
 	}
 	if b.adoptionLatchUnhealthy() {
-		return b.pdfGrabRefusal(request.RequestID, "", "unavailable",
-			"the adoption folder is not responding (macOS privacy consent?); try again after granting access")
+		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", grabReasonAdoptionUnhealthy,
+			"the downloads folder is not responding (macOS privacy consent?); try again after granting access")
 	}
 	normalizedHost := strings.ToLower(strings.TrimSpace(request.Host))
 	normalizedHost = strings.TrimSuffix(normalizedHost, ".")
 	safetyDomain := hostSafetyDomain("pdf_grab", "https://"+normalizedHost)
 	if safetyDomain == "" {
-		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", "invalid host")
+		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", grabReasonTabUnusable, "this tab is not a PDF papio can save")
 	}
 	title := truncate(request.Title, 500)
 	var preparedDir string
@@ -4925,20 +5042,23 @@ func (b *Bridge) pdfGrab(ctx context.Context, sessionID string, request *protoco
 			_ = os.RemoveAll(preparedDir)
 		}
 		if errors.Is(err, grab.ErrBusy) || errors.Is(err, job.ErrEffectPermitBusy) {
-			return b.pdfGrabRefusal(request.RequestID, "", "unavailable", "the effect lane is occupied; try again after the current effect settles")
+			return b.pdfGrabRefusal(request.RequestID, "", "unavailable", grabReasonBusy, "papio is already busy with another download; try again in a moment")
 		}
 		log.Printf("papio: pdf grab allocation failed: %v", err)
-		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", "could not allocate a grab")
+		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", grabReasonInternal, "could not start this download")
 	}
 	if g.Outcome == "existing" {
-		return b.pdfGrabRefusal(request.RequestID, g.ID, "existing", "")
+		return b.pdfGrabRefusal(request.RequestID, g.ID, "existing", "", "")
 	}
 	return b.pdfGrabSteeringResult(request.RequestID, g.ID, preparedDir)
 }
 
-func (b *Bridge) pdfGrabRefusal(requestID, grabID, outcome, detail string) ([]json.RawMessage, error) {
+// pdfGrabRefusal answers one grab request without allocating anything.
+// reason is the closed-enum machine tag; the protocol permits it only on the
+// "unavailable" and "not_supported" outcomes, so "existing" passes "".
+func (b *Bridge) pdfGrabRefusal(requestID, grabID, outcome, reason, detail string) ([]json.RawMessage, error) {
 	frame, err := b.frame(protocol.MsgPdfGrabResult, "", protocol.PdfGrabResultPayload{
-		RequestID: requestID, GrabID: grabID, Outcome: outcome, Detail: detail,
+		RequestID: requestID, GrabID: grabID, Outcome: outcome, Reason: reason, Detail: detail,
 	})
 	if err != nil {
 		return nil, err
@@ -4971,7 +5091,7 @@ func (b *Bridge) pdfGrabStatus(ctx context.Context, request *protocol.PdfGrabSta
 	}
 	if b.grabs == nil {
 		result.Outcome = "unavailable"
-		result.Detail = "pdf grab is not configured"
+		result.Detail = "papio is not set up to save PDFs"
 	} else {
 		g, err := b.grabs.Get(ctx, request.GrabID)
 		if err != nil {
@@ -5000,11 +5120,23 @@ func (b *Bridge) pdfGrabAbandon(ctx context.Context, request *protocol.PdfGrabAb
 	})
 }
 
+// pdfGrabAbandonSession cancels a grab on behalf of the browser that started
+// it. The admission test is the same capability check the grab path uses —
+// holdership is irrelevant here too — and the originator fence lives where it
+// belongs, in MarkAbandonedForRequest: only the effect request id that
+// allocated this grab, in this epoch, can settle it. That scoping is a
+// per-grab fact, not a claim on the bridge, and it stays.
 func (b *Bridge) pdfGrabAbandonSession(ctx context.Context, sessionID string, request *protocol.PdfGrabAbandonRequestPayload) ([]json.RawMessage, error) {
-	if !b.pdfGrabSessionAuthorized(sessionID) {
+	if b.pdfGrabRefusalReason(sessionID) != "" {
+		// "unavailable", not "conflict": a conflict names a durable grab
+		// state, and this refusal reads no grab row at all. The old code
+		// emitted conflict with an empty state, which fails the outbound
+		// self-validation the frame builder runs — so the refusal did not
+		// refuse one request, it errored out of Sync and disconnected the
+		// browser.
 		frame, err := b.frame(protocol.MsgPdfGrabAbandonResult, "", protocol.PdfGrabAbandonResultPayload{
 			RequestID: request.RequestID, GrabID: request.GrabID,
-			Outcome: "conflict", Detail: "only the originating holder may abandon this PDF grab",
+			Outcome: "unavailable", Detail: "only the browser that started this download can cancel it",
 		})
 		if err != nil {
 			return nil, err
@@ -5025,7 +5157,7 @@ func (b *Bridge) pdfGrabAbandonWith(ctx context.Context, request *protocol.PdfGr
 	if b.grabs == nil {
 		result.State = ""
 		result.Outcome = "unavailable"
-		result.Detail = "pdf grab is not configured"
+		result.Detail = "papio is not set up to save PDFs"
 	} else if err := abandon(); err != nil {
 		// A lost acknowledgment is ambiguous: inspect the durable row before
 		// deciding whether the retry succeeded, found nothing, or conflicts
@@ -5046,7 +5178,7 @@ func (b *Bridge) pdfGrabAbandonWith(ctx context.Context, request *protocol.PdfGr
 		} else {
 			result.State = string(g.State)
 			result.Outcome = "conflict"
-			result.Detail = "pdf grab is already settled or request-fenced"
+			result.Detail = "this download has already finished, or a different browser started it"
 		}
 	}
 	frame, err := b.frame(protocol.MsgPdfGrabAbandonResult, "", result)

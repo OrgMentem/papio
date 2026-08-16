@@ -7,10 +7,12 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  BROWSER_SESSION_ROLES,
   GUIDANCE_VARIANTS,
   MAX_BROWSER_MESSAGE_BYTES,
   NEXT_ACTORS,
   OPERATION_VARIANTS,
+  PDF_GRAB_REFUSAL_REASONS,
   ProtocolError,
   isBareLowercaseHTTPSOrigin,
   isCanonicalKey,
@@ -714,6 +716,115 @@ test("hello_ack accepts optional daemon details and rejects invalid members", ()
   ]) {
     expect(() =>
       parseBrowserMessage(frame({ resolver_origins: [bad] })),
+    ).toThrow(ProtocolError);
+  }
+  // role: the acknowledged session's slot state. An absent role means holder —
+  // an older daemon only ever acknowledged the session it had just slotted — so
+  // the empty-payload case above must keep parsing.
+  for (const role of ["holder", "pending"]) {
+    expect(parseBrowserMessage(frame({ role })).payload).toEqual({ role });
+  }
+  for (const bad of [
+    "observer",
+    "Holder",
+    "pending ",
+    "primary",
+    "",
+    null,
+    1,
+  ]) {
+    expect(
+      () => parseBrowserMessage(frame({ role: bad })),
+      `role ${bad}`,
+    ).toThrow(ProtocolError);
+  }
+});
+
+test("pdf_grab_result.reason is a closed classifier confined to the two refusals", () => {
+  // The popup switches on reason to pick its own copy, so an unclassified value
+  // must never reach it, and reason must stay confined to the refusal outcomes —
+  // anywhere else it would imply a failure that did not happen. Absent on a
+  // refusal stays legal: an older daemon classified nothing.
+  const requestID = "pdf-grab-request-frame";
+  const grabID = "grab_0123456789abcdef01234567";
+  const frame = (payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type: "pdf_grab_result",
+    msg_id: "pdf-grab-result-reason",
+    seq: 31,
+    payload,
+  });
+
+  // session_elsewhere is deliberately absent: a grab is user-initiated and
+  // self-routing, so holdership never refuses one.
+  expect(PDF_GRAB_REFUSAL_REASONS).toEqual([
+    "no_session",
+    "extension_outdated",
+    "daemon_unsupported",
+    "busy",
+    "not_configured",
+    "adoption_unhealthy",
+    "tab_unusable",
+    "internal",
+  ]);
+  expect(BROWSER_SESSION_ROLES).toEqual(["holder", "pending"]);
+
+  for (const outcome of ["unavailable", "not_supported"]) {
+    for (const reason of PDF_GRAB_REFUSAL_REASONS) {
+      expect(
+        parseBrowserMessage(
+          frame({ request_id: requestID, grab_id: grabID, outcome, reason }),
+        ).payload["reason"],
+        `${outcome}/${reason}`,
+      ).toBe(reason);
+    }
+    expect(
+      parseBrowserMessage(frame({ request_id: requestID, outcome })).payload,
+    ).toEqual({ request_id: requestID, outcome });
+  }
+
+  for (const bad of [
+    "session_elsewhere",
+    "Busy",
+    "unknown",
+    "busy ",
+    "",
+    null,
+    1,
+  ]) {
+    expect(
+      () =>
+        parseBrowserMessage(
+          frame({ request_id: requestID, outcome: "unavailable", reason: bad }),
+        ),
+      `reason ${bad}`,
+    ).toThrow(ProtocolError);
+  }
+
+  const nonRefusals: Array<Record<string, unknown>> = [
+    {
+      request_id: requestID,
+      grab_id: grabID,
+      outcome: "steering",
+      steering_path: `papio/grabs/${grabID}/`,
+      reason: "busy",
+    },
+    {
+      request_id: requestID,
+      grab_id: grabID,
+      outcome: "existing",
+      reason: "busy",
+    },
+    { grab_id: grabID, outcome: "job_created", reason: "internal" },
+    { grab_id: grabID, outcome: "already_owned", reason: "internal" },
+    { grab_id: grabID, outcome: "needs_identifier", reason: "internal" },
+    { grab_id: grabID, outcome: "failed_validation", reason: "internal" },
+    { grab_id: grabID, outcome: "abandoned", reason: "internal" },
+  ];
+  for (const payload of nonRefusals) {
+    expect(
+      () => parseBrowserMessage(frame(payload)),
+      `reason on ${payload["outcome"]}`,
     ).toThrow(ProtocolError);
   }
 });

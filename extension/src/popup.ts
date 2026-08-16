@@ -27,7 +27,14 @@ import {
   TERMS_CONSENT_KEY,
 } from "./state";
 import type { ActivityEntryPayload, TriageCounts, WorkPulseResponsePayload } from "./protocol";
-import { classifyPage, isPDFPage, pdfSourceURL, sniffDOI, type PageKind } from "./deliver";
+import {
+  classifyPage,
+  isPDFPage,
+  pdfSourceURL,
+  sendPdfState,
+  sniffDOI,
+  type PageKind,
+} from "./deliver";
 import {
   SESSION_STALE_MS,
   type KeepaliveOriginSnapshot,
@@ -85,9 +92,12 @@ export function renderDaemonStatus(
       break;
     case "session_elsewhere":
       // The daemon answered; it is just pointed at a different browser. Only
-      // the operator can decide which browser should hold it, so name the
-      // one command that moves it here.
-      line = "another browser is holding your papio session — this one gets no papers until you switch it";
+      // the operator can decide which browser should hold it, so name the one
+      // command that moves it here. It does NOT say this browser gets nothing:
+      // Send PDF is user-initiated and routes itself, so it still works here,
+      // and claiming otherwise sent researchers to switch sessions they had no
+      // reason to switch.
+      line = "another browser is holding your papio session — papio sends papers it finds to that one; Send PDF still works here";
       action = "run: papio browser use --latest";
       break;
     case "disconnected":
@@ -3469,6 +3479,10 @@ function markPrimaryRailAction(
   else delete scan.dataset.primaryAction;
 }
 
+/** `daemon` is the store's own record of the last hello_ack. It is optional and
+ * defaults to "acknowledged nothing", which `sendPdfState` reads as unknown
+ * rather than unavailable: a caller that cannot supply it must never cause a
+ * capability to be denied. */
 export function renderPageContext(
   doc: Document,
   page: PageActionBinding | undefined,
@@ -3477,6 +3491,7 @@ export function renderPageContext(
   activityEntries: readonly ActivityEntryPayload[] = [],
   liveActions: PopupLiveActions = {},
   sessionWarm: PopupSessionWarmth = false,
+  daemon: Pick<StoreShape, "connectionStatus" | "daemonFeatures"> = {},
 ): void {
   const rail = doc.getElementById("current-page-actions");
   const section = doc.getElementById("page-acquire");
@@ -3556,8 +3571,25 @@ export function renderPageContext(
     const delivery = deliveryMatchesJob || deliveryMatchesURL ? pendingDelivery : undefined;
     button.dataset.mode = "pdf";
     button.dataset.idleLabel = "Send this PDF to papio";
-    const disabled = delivery?.status === "sending" || delivery?.status === "downloaded";
-    setAcquireButton(button, "Send this PDF to papio", disabled);
+    // One decision, taken from what this popup already knows, BEFORE the click.
+    // The button used to consult only delivery status, so it rendered enabled
+    // against a daemon that could not possibly serve it and reported the gap as
+    // a failure after the researcher committed.
+    const send = sendPdfState({
+      connectionStatus: daemon.connectionStatus,
+      daemonFeatures: daemon.daemonFeatures,
+      needsGrab: knownJob === undefined && (page?.doi ?? "").trim() === "",
+      deliveryStatus: delivery?.status,
+    });
+    button.dataset.sendPdf = send.kind;
+    setAcquireButton(button, "Send this PDF to papio", send.kind !== "ready");
+    if (send.kind === "refused") {
+      // The remedy, not the diagnosis: it rides the disabled control itself so
+      // hover and screen readers get it, and sits beside the rail so it is
+      // readable without hovering.
+      button.title = send.message;
+      button.setAttribute("aria-label", `Send this PDF to papio — ${send.message}`);
+    }
     if (knownJob !== undefined) {
       clearDeliveryChoice(doc);
       // The live card keeps its richer copy and its own Open inbox / Open tab
@@ -3578,6 +3610,8 @@ export function renderPageContext(
         ),
       );
       section.hidden = false;
+    } else if (send.kind === "refused") {
+      showAcquireFeedback(doc, section, status, send.message, "degraded");
     } else {
       const deliveryStatus = deliveryStatusText(delivery);
       if (deliveryStatus !== "") {
@@ -3858,6 +3892,7 @@ export async function refresh(): Promise<void> {
     popupActivity,
     {},
     session,
+    store,
   );
   renderInstitutionSession(document, session, openInstitutionSignIn, store.activeJobs);
   scheduleSessionProbeRetry(session, store.activeJobs);

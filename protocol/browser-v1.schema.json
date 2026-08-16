@@ -1938,7 +1938,8 @@
                   "maxLength": 300,
                   "pattern": "^https://[a-z0-9.-]{3,253}(:[0-9]{1,5})?$"
                 }
-              }
+              },
+              "role": { "enum": ["holder", "pending"] }
             }
           }
         }
@@ -4378,6 +4379,18 @@
                 "type": "string",
                 "pattern": "^papio/grabs/[A-Za-z0-9_-]{8,64}/$"
               },
+              "reason": {
+                "enum": [
+                  "no_session",
+                  "extension_outdated",
+                  "daemon_unsupported",
+                  "busy",
+                  "not_configured",
+                  "adoption_unhealthy",
+                  "tab_unusable",
+                  "internal"
+                ]
+              },
               "detail": {
                 "type": "string",
                 "maxLength": 1000,
@@ -4463,6 +4476,35 @@
               { "not": { "required": ["request_id"] } },
               { "not": { "required": ["steering_path"] } }
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "const": "pdf_grab_result" },
+          "payload": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "steering",
+                  "existing",
+                  "job_created",
+                  "already_owned",
+                  "needs_identifier",
+                  "failed_validation",
+                  "abandoned"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "allOf": [{ "not": { "required": ["reason"] } }]
           }
         }
       }

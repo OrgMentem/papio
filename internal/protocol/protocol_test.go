@@ -204,6 +204,111 @@ func TestHelloAckPayloadRoundTripAndBounds(t *testing.T) {
 			t.Fatalf("hello_ack accepted invalid resolver origin %q", bad)
 		}
 	}
+	// role: the acknowledged session's slot state. Absent means holder, so an
+	// older daemon's silent ack must keep decoding (the empty-payload case
+	// above already pins that); a value outside the pair must not.
+	for _, role := range []string{"holder", "pending"} {
+		msg, err := DecodeBrowserMessage(frame(HelloAckPayload{Role: role}))
+		if err != nil {
+			t.Fatalf("decode hello_ack role %q: %v", role, err)
+		}
+		if got := msg.Payload.(*HelloAckPayload).Role; got != role {
+			t.Fatalf("role round-trip = %q, want %q", got, role)
+		}
+	}
+	for _, bad := range []string{"observer", "Holder", "pending ", "primary", " "} {
+		if _, err := DecodeBrowserMessage(frame(map[string]any{"role": bad})); err == nil {
+			t.Fatalf("hello_ack accepted role %q", bad)
+		}
+	}
+	if _, err := DecodeBrowserMessage(frame(map[string]any{"role": nil})); err == nil {
+		t.Fatal("hello_ack accepted null role")
+	}
+}
+
+// TestPdfGrabResultReasonVocabulary pins the machine-readable refusal
+// classifier. The popup switches on reason to pick its own copy, so an
+// unclassified value must never reach it, and reason must stay confined to the
+// two refusal outcomes — anywhere else it would imply a failure that did not
+// happen. Absent on a refusal stays legal: an older daemon classified nothing.
+func TestPdfGrabResultReasonVocabulary(t *testing.T) {
+	frame := func(payload any) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     MsgPdfGrabResult,
+			"msg_id":   "pdf-grab-result-reason",
+			"seq":      31,
+			"payload":  payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	const requestID = "pdf-grab-request-frame"
+	const grabID = "grab_0123456789abcdef01234567"
+
+	reasons := []string{
+		"no_session", "extension_outdated", "daemon_unsupported", "busy",
+		"not_configured", "adoption_unhealthy", "tab_unusable", "internal",
+	}
+	for _, outcome := range []string{"unavailable", "not_supported"} {
+		for _, reason := range reasons {
+			msg, err := DecodeBrowserMessage(frame(PdfGrabResultPayload{
+				RequestID: requestID,
+				GrabID:    grabID,
+				Outcome:   outcome,
+				Reason:    reason,
+			}))
+			if err != nil {
+				t.Fatalf("decode %s refusal reason %q: %v", outcome, reason, err)
+			}
+			if got := msg.Payload.(*PdfGrabResultPayload).Reason; got != reason {
+				t.Fatalf("reason round-trip = %q, want %q", got, reason)
+			}
+		}
+		if _, err := DecodeBrowserMessage(frame(PdfGrabResultPayload{
+			RequestID: requestID,
+			Outcome:   outcome,
+			Detail:    "no classifier from an older daemon",
+		})); err != nil {
+			t.Fatalf("%s refusal without reason rejected: %v", outcome, err)
+		}
+	}
+	// session_elsewhere is deliberately absent from the vocabulary: a grab is
+	// user-initiated and self-routing, so holdership never refuses one.
+	for _, bad := range []string{"session_elsewhere", "Busy", "unknown", "busy ", " "} {
+		if _, err := DecodeBrowserMessage(frame(map[string]any{
+			"request_id": requestID,
+			"outcome":    "unavailable",
+			"reason":     bad,
+		})); err == nil {
+			t.Fatalf("pdf_grab_result accepted reason %q", bad)
+		}
+	}
+	if _, err := DecodeBrowserMessage(frame(map[string]any{
+		"request_id": requestID,
+		"outcome":    "unavailable",
+		"reason":     nil,
+	})); err == nil {
+		t.Fatal("pdf_grab_result accepted null reason")
+	}
+
+	nonRefusals := []PdfGrabResultPayload{
+		{RequestID: requestID, GrabID: grabID, Outcome: "steering", SteeringPath: "papio/grabs/" + grabID + "/", Reason: "busy"},
+		{RequestID: requestID, GrabID: grabID, Outcome: "existing", Reason: "busy"},
+		{GrabID: grabID, Outcome: "job_created", Reason: "internal"},
+		{GrabID: grabID, Outcome: "already_owned", Reason: "internal"},
+		{GrabID: grabID, Outcome: "needs_identifier", Reason: "internal"},
+		{GrabID: grabID, Outcome: "failed_validation", Reason: "internal"},
+		{GrabID: grabID, Outcome: "abandoned", Reason: "internal"},
+	}
+	for _, p := range nonRefusals {
+		if _, err := DecodeBrowserMessage(frame(p)); err == nil {
+			t.Fatalf("pdf_grab_result accepted reason on %s outcome", p.Outcome)
+		}
+	}
 }
 
 func TestHelloPayloadFeaturesStrictBoundsAndParity(t *testing.T) {

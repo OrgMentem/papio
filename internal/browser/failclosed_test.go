@@ -37,8 +37,11 @@ var failClosedHubs = map[string]string{
 }
 
 // frameBuilders construct a response frame and are the only calls whose error
-// may legitimately be returned raw from a leaf handler.
-var frameBuilders = map[string]bool{"frame": true, "helloAck": true}
+// may legitimately be returned raw from a leaf handler. sessionBusy qualifies
+// for the same reason frame and helloAck do: its sole error is the marshal of
+// the error frame it builds, and handleHello now composes it with an ack
+// rather than tail-returning it.
+var frameBuilders = map[string]bool{"frame": true, "helloAck": true, "sessionBusy": true}
 
 func TestLeafHandlersOnlyReturnFrameMarshalErrors(t *testing.T) {
 	fset := token.NewFileSet()
@@ -153,7 +156,8 @@ func errorGuardReturn(stmt ast.Stmt) (*ast.ReturnStmt, string) {
 	return ret, guard.Name
 }
 
-// bindsFrameError matches `<frame>, <name> := b.frame(...)` / `b.helloAck(...)`.
+// bindsFrameError matches `<frame>, <name> := b.frame(...)` / `b.helloAck(...)`
+// / `b.sessionBusy(...)`.
 func bindsFrameError(stmt ast.Stmt, name string) bool {
 	assign, ok := stmt.(*ast.AssignStmt)
 	if !ok || len(assign.Lhs) != 2 || len(assign.Rhs) != 1 {

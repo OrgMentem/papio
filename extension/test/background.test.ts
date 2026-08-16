@@ -10,8 +10,11 @@ import { Window } from "happy-dom";
 import {
   parseBrowserMessage,
   parseBrowserMessageWithLegacyInstitutionalNavigation,
+  PDF_GRAB_REFUSAL_REASONS,
   type BrowserMessage,
+  type BrowserSessionRole,
   type PageCapturePayload,
+  type PdfGrabRefusalReason,
 } from "../src/protocol";
 import {
   emptyStore,
@@ -24,6 +27,7 @@ import {
   type StateBackend,
   type StoreShape,
 } from "../src/state";
+import { pdfGrabRefusalText } from "../src/deliver";
 import {
   capturePage,
   encodePageCapture,
@@ -1015,6 +1019,7 @@ function helloAck(
     daemon_version?: string;
     features?: string[];
     resolver_origins?: string[];
+    role?: BrowserSessionRole;
   } = {},
 ): unknown {
   return {
@@ -1424,6 +1429,277 @@ test("a demoted browser keeps every capability it negotiated", async () => {
   await h.port.inbound(sessionBusyError());
   expect(h.backend.store.connectionStatus).toBe("session_elsewhere");
   expect(h.bridge.pageAcquireAvailable()).toBe(true);
+});
+
+test("a pending session sends a PDF: holdership never refuses a user-initiated grab", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  // The daemon now acknowledges a session it could not slot, ack FIRST, so the
+  // session learns every feature before being told it is not the holder.
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      role: "pending",
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  await h.port.inbound(sessionBusyError());
+  expect(h.backend.store.connectionStatus).toBe("session_elsewhere");
+  expect(h.backend.store.daemonFeatures).toEqual([
+    "pdf_grab_v1",
+    "effect_permit_v1",
+  ]);
+  // The reported bug: this returned false, so Send PDF failed at click time.
+  expect(h.bridge.pdfGrabAvailable()).toBe(true);
+
+  const pdfURL = "https://provider.example.edu/pending.pdf";
+  h.tabs.seed({ id: 42, url: pdfURL });
+  const reply = h.bridge.startPDFDelivery({ tab_id: 42, url: pdfURL });
+  const requestFrame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-pending-01",
+      steering_path: "papio/grabs/pendingpath/",
+    }),
+  );
+  await expect(reply).resolves.toMatchObject({ ok: true, state: "sending" });
+  expect(h.downloads.started[0]).toMatchObject({ url: pdfURL });
+});
+
+test("a pending session attempts no holder-only work", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      role: "pending",
+      features: [
+        "institutional_materialization_v1",
+        "effect_permit_v1",
+        "session_evidence_v1",
+        "page_capture_v1",
+      ],
+    }),
+  );
+  const before = h.frames().length;
+  // An offer is daemon-initiated work: every reply it earns is holder-only.
+  await h.port.inbound(jobOffer("job_0001_pending"));
+  // A handoff focus would fetch a fresh link, which is holder-only too.
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "handoff_focus",
+    msg_id: "handoff_focus_0001",
+    seq: 4,
+    job_id: "job_0001_pending",
+    payload: {},
+  });
+  expect(h.bridge.emitSessionEvidence("warm_verified")).toBe(false);
+  expect(h.bridge.pageCaptureAvailable()).toBe(false);
+  expect(h.tabs.created).toEqual([]);
+  expect(
+    h
+      .frames()
+      .slice(before)
+      .map((frame) => frame.type),
+  ).toEqual([]);
+});
+
+test("an absent hello_ack role behaves as holder", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  // A daemon predating session roles only ever acknowledged the session it had
+  // just slotted, so its silence is not ambiguous.
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["session_evidence_v1", "page_capture_v1"],
+    }),
+  );
+  await h.port.inbound(jobOffer("job_0001_legacy"));
+
+  expect(h.tabs.created.length).toBe(1);
+  expect(h.frames().find((f) => f.type === "job_accept")?.job_id).toBe(
+    "job_0001_legacy",
+  );
+  expect(h.bridge.emitSessionEvidence("warm_verified")).toBe(true);
+  expect(h.bridge.pageCaptureAvailable()).toBe(true);
+});
+
+test("an explicit holder role does holder-only work", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, role: "holder" }),
+  );
+  await h.port.inbound(jobOffer("job_0001_holder"));
+
+  expect(h.tabs.created.length).toBe(1);
+  expect(h.frames().find((f) => f.type === "job_accept")?.job_id).toBe(
+    "job_0001_holder",
+  );
+});
+
+test("a reclaimed session resumes holder-only work on its next ack", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, role: "pending" }),
+  );
+  await h.port.inbound(jobOffer("job_0001_reclaim"));
+  expect(h.tabs.created).toEqual([]);
+
+  // `papio browser use` seats this session; the ack arrives on the same port.
+  await h.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, role: "holder" }),
+  );
+  await h.port.inbound(jobOffer("job_0001_reclaim"));
+  expect(h.tabs.created.length).toBe(1);
+});
+
+test("every pdf_grab_result refusal reason reaches the popup as its own copy", async () => {
+  const expected: Record<PdfGrabRefusalReason, string> = {
+    busy: "papio is busy with another download — try again in a moment.",
+    daemon_unsupported: "papio needs an update — run papio doctor.",
+    extension_outdated: "Reload the papio extension to finish updating.",
+    not_configured: "papio isn't set up to save PDFs yet — run papio doctor.",
+    adoption_unhealthy:
+      "papio can't reach its downloads folder — run papio doctor.",
+    tab_unusable: "This tab isn't a PDF papio can save.",
+    no_session: "papio couldn't save this PDF — try again.",
+    internal: "papio couldn't save this PDF — try again.",
+  };
+  // Every reason in the closed wire vocabulary must be covered, so adding one
+  // to protocol.ts without deciding its copy fails here rather than shipping
+  // the daemon's log prose to a researcher.
+  expect(Object.keys(expected).sort()).toEqual(
+    [...PDF_GRAB_REFUSAL_REASONS].sort(),
+  );
+
+  for (const reason of PDF_GRAB_REFUSAL_REASONS) {
+    const h = makeHarness();
+    await h.bridge.start();
+    await h.port.inbound(
+      helloAck({
+        daemon_version: CURRENT_DAEMON,
+        role: "pending",
+        features: ["pdf_grab_v1", "effect_permit_v1"],
+      }),
+    );
+    const pdfURL = `https://provider.example.edu/${reason}.pdf`;
+    h.tabs.seed({ id: 42, url: pdfURL });
+    const reply = h.bridge.startPDFDelivery({ tab_id: 42, url: pdfURL });
+    const requestFrame = await h.port.waitForFrame("pdf_grab_request");
+    await h.port.inbound(
+      nativeResult("pdf_grab_result", {
+        request_id: requestFrame.payload["request_id"] as string,
+        outcome: "unavailable",
+        reason,
+        detail: "pdf grab requires the current holder with negotiated permits",
+      }),
+    );
+    await expect(reply).resolves.toEqual({
+      ok: false,
+      error: { code: "grab_failed", message: expected[reason] },
+    });
+  }
+});
+
+test("a refusal with no reason falls back to the daemon's plain detail", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const pdfURL = "https://provider.example.edu/legacy-refusal.pdf";
+  h.tabs.seed({ id: 42, url: pdfURL });
+  const reply = h.bridge.startPDFDelivery({ tab_id: 42, url: pdfURL });
+  const requestFrame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "unavailable",
+      detail: "the download folder is full",
+    }),
+  );
+  await expect(reply).resolves.toEqual({
+    ok: false,
+    error: { code: "grab_failed", message: "the download folder is full" },
+  });
+});
+
+test("a reasonless refusal never surfaces daemon-internal detail prose", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const pdfURL = "https://provider.example.edu/jargon.pdf";
+  h.tabs.seed({ id: 42, url: pdfURL });
+  const reply = h.bridge.startPDFDelivery({ tab_id: 42, url: pdfURL });
+  const requestFrame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "unavailable",
+      // The exact string the reported bug put in front of a researcher.
+      detail:
+        "pdf grab requires the current holder with negotiated effect permits",
+    }),
+  );
+  await expect(reply).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "grab_failed",
+      message: "papio couldn't save this PDF — try again.",
+    },
+  });
+});
+
+test("no PDF-send refusal this browser can produce names holdership or permits", async () => {
+  const jargon = /holder|permit|negotiat/i;
+  const h = makeHarness();
+  await h.bridge.start();
+  const pdfURL = "https://provider.example.edu/no-daemon.pdf";
+  h.tabs.seed({ id: 42, url: pdfURL });
+
+  const messages: string[] = [];
+  // No daemon at all.
+  const offline = (await h.bridge.startPDFDelivery({
+    tab_id: 42,
+    url: pdfURL,
+  })) as unknown as { error?: { message?: string } };
+  messages.push(offline.error?.message ?? "");
+  // A daemon that acknowledged nothing useful.
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON }));
+  const unsupported = (await h.bridge.startPDFDelivery({
+    tab_id: 42,
+    url: pdfURL,
+  })) as unknown as { error?: { message?: string } };
+  messages.push(unsupported.error?.message ?? "");
+  // A browser with no download steering to hand papio a file with.
+  const firefox = makeHarness(undefined, { firefox: true });
+  await firefox.bridge.start();
+  firefox.tabs.seed({ id: 42, url: pdfURL });
+  const noSteering = (await firefox.bridge.requestPdfGrab({
+    tab_id: 42,
+    url: pdfURL,
+  })) as unknown as { error?: { message?: string } };
+  messages.push(noSteering.error?.message ?? "");
+  // Every daemon-classified refusal.
+  for (const reason of PDF_GRAB_REFUSAL_REASONS) {
+    messages.push(pdfGrabRefusalText(reason));
+  }
+
+  expect(messages.every((message) => message.length > 0)).toBe(true);
+  for (const message of messages) expect(message).not.toMatch(jargon);
 });
 
 test("job_offer opens exactly one tab and replies job_accept", async () => {
@@ -6713,8 +6989,7 @@ test("papio.pageBulk.grabPdf fails closed before native request when effect perm
     ok: false,
     error: {
       code: "feature_unavailable",
-      message:
-        "PDF grabbing needs Chrome download steering and a compatible daemon",
+      message: "papio needs an update — run papio doctor.",
     },
   });
   expect(
@@ -6904,6 +7179,70 @@ test("papio.pageBulk.grabPdf clears a conflict acknowledgment with its settled s
     detail: "pdf grab is already settled",
   });
   expect(h.pdfGrabCorrelations.current).toEqual({});
+});
+
+test("a refused abandon is not reported as a cancellation", async () => {
+  const h = makeHarness();
+  const urls = pageBulkTestURLs;
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const request = {
+    tab_id: 42,
+    url: "https://resolver.example.edu/refused-abandon.pdf",
+    scan_id: "scan-grab-refused-abandon",
+  };
+  const replyPromise = handleInboxRuntimeMessage(
+    h.bridge,
+    { type: "papio.pageBulk.grabPdf", request },
+    { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } },
+    urls,
+  );
+  const requestFrame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-refused-abandon",
+      steering_path: "papio/grabs/refusedabandon/",
+    }),
+  );
+  await expect(replyPromise).resolves.toMatchObject({ ok: true });
+  await h.downloads.onChanged.emit({
+    id: 901,
+    state: { current: "interrupted" },
+  });
+  const abandonFrame = await h.port.waitForFrame("pdf_grab_abandon_request");
+  // The daemon declines to cancel and carries no state at all. Defaulting this
+  // to "abandoned" told the researcher their download had been cancelled while
+  // the daemon still owned whatever the grab became.
+  await h.port.inbound(
+    nativeResult("pdf_grab_abandon_result", {
+      request_id: abandonFrame.payload["request_id"] as string,
+      grab_id: "grab-refused-abandon",
+      state: "",
+      outcome: "unavailable",
+      detail: "only the browser that started this download can cancel it",
+    }),
+  );
+  expect(h.runtimeMessages).toContainEqual({
+    type: "papio.pageBulk.grabState",
+    scan_id: request.scan_id,
+    grab_id: "grab-refused-abandon",
+    state: "failed",
+    detail: "only the browser that started this download can cancel it",
+  });
+  expect(h.runtimeMessages).not.toContainEqual({
+    type: "papio.pageBulk.grabState",
+    scan_id: request.scan_id,
+    grab_id: "grab-refused-abandon",
+    state: "abandoned",
+    detail: "The PDF grab download was interrupted",
+  });
 });
 
 test("papio.pageBulk.grabPdf delivers an unsolicited terminal result after a service-worker restart", async () => {

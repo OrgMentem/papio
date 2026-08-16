@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"hello_ack","msg_id":"daemon-ack-004","seq":4,"payload":{"daemon_version":"0.1.0","features":["pdf_grab_v1","session_roles_v1"],"role":"pending"}}

@@ -31,6 +31,7 @@ import {
   type ArtifactProducerPayload,
   type BrowserMessage,
   type BrowserMessageType,
+  type BrowserSessionRole,
   type DeliveryRoute,
   type DeliverySessionEvidence,
   type PageAcquireAckPayload,
@@ -101,7 +102,13 @@ import {
   TOOLBAR_COUNT_MODE_KEY,
   type ToolbarCountMode,
 } from "./state";
-import { isPDFPage, pdfSourceURL, sanitizePageHost } from "./deliver";
+import {
+  isPDFPage,
+  pdfGrabRefusalText,
+  pdfSourceURL,
+  sanitizePageHost,
+  PDF_GRAB_FEATURE,
+} from "./deliver";
 import {
   adapters,
   type AdapterSpec,
@@ -298,7 +305,6 @@ const PAGE_CAPTURE_TERMS_FEATURE = "page_capture_terms_v1";
 /** ADR-0019 Decision 7: page_bulk_status_request/page_bulk_submit_request. */
 const PAGE_BULK_ACQUIRE_FEATURE = "page_bulk_acquire_v1";
 const PAGE_BULK_COHORT_V2_FEATURE = "page_bulk_cohort_v2";
-const PDF_GRAB_FEATURE = "pdf_grab_v1";
 const INSTITUTIONAL_MATERIALIZATION_FEATURE =
   "institutional_materialization_v1";
 const MATERIALIZE_PAGE_PATH = "materialize.html";
@@ -2384,6 +2390,12 @@ export class Bridge {
   private portGeneration = 0;
   private helloAckGeneration = -1;
   private helloSentGeneration = -1;
+  /** Session role from THIS port's hello_ack. Deliberately worker-memory only
+   * and cleared with the port: a role is a property of one live connection, so
+   * a persisted copy would outlive the daemon that issued it and be readable as
+   * "holder" during exactly the window after a worker restart when holder-only
+   * work must not be attempted. `undefined` means no ack on this port yet. */
+  private helloRole: BrowserSessionRole | undefined;
   /** Port generation whose hello the daemon answered with session_busy. That
    * hello never gets an ack, so without this every foreground request would
    * burn the full hello wait before failing — the popup's own status paint
@@ -4886,6 +4898,23 @@ export class Bridge {
     );
   }
 
+  /** True while this session may do work only the session HOLDER may do: accept
+   * or reject an offer, drive a handoff, claim/bind/route a materialization,
+   * start an effect. The daemon refuses every one of those from a non-holder
+   * (bridge.go's non-holder `default:` arm), and its refusal is a session_busy
+   * error that surfaces as a failure the researcher can do nothing about.
+   *
+   * An acknowledged `role: "pending"` is the ONLY thing that makes this false.
+   * No ack yet, a daemon old enough never to send `role`, and a worker that
+   * restarted with a stale persisted status all read as holder: silence has
+   * never been ambiguous, and the daemon's own arbitration stays the backstop.
+   *
+   * Capabilities are NOT gated here. A pending session negotiated the same
+   * features and routes its own user-initiated work; see `pdfGrabAvailable`. */
+  private holderRole(): boolean {
+    return !(this.hasCurrentHello() && this.helloRole === "pending");
+  }
+
   /** True only after this port's hello_ack has advertised page acquisition. */
   pageAcquireAvailable(): boolean {
     return (
@@ -4894,9 +4923,12 @@ export class Bridge {
     );
   }
 
+  /** `page_capture` is not on the daemon's holder-independent list, so a
+   * pending session cannot upload a fixture however well it negotiated. */
   pageCaptureAvailable(): boolean {
     return (
       this.daemonNegotiated() &&
+      this.holderRole() &&
       (this.store.daemonFeatures ?? []).includes(PAGE_CAPTURE_FEATURE)
     );
   }
@@ -5414,10 +5446,10 @@ export class Bridge {
             };
           return grab as unknown as DeliveryReply;
         } else {
-          return failure(
-            "no_doi",
-            "This PDF has no page DOI; Chrome download steering is required to identify it from the file",
-          );
+          // Same three causes as requestPdfGrab's own guard, and deliberately
+          // the same words: this PDF carries no page identifier, and the lane
+          // that would identify it from the file is unavailable.
+          return failure("no_doi", this.grabUnavailableText());
         }
       }
       if (job === undefined) {
@@ -6015,6 +6047,9 @@ export class Bridge {
    * provider page that is already downloading. */
   private async focusDaemonHandoff(jobID: string): Promise<void> {
     await this.ready;
+    // handoff_focus is daemon-initiated handoff work, and the fresh-link fetch
+    // it triggers (handoff_link_request) is holder-only.
+    if (!this.holderRole()) return;
     const job = findByJob(this.store, jobID);
     const openurl = this.offerURLs.get(jobID);
     if (job !== undefined && job.tab_id >= 0 && openurl !== undefined) {
@@ -6481,6 +6516,15 @@ export class Bridge {
       !(this.store.daemonFeatures ?? []).includes(
         INSTITUTIONAL_MATERIALIZATION_FEATURE,
       )
+    )
+      return undefined;
+    // Claim, bind, route and reconcile are holder-only in the daemon. The one
+    // exception is the historical navigation result, which the daemon accepts
+    // from any recognized session because it is cleanup authority for a permit
+    // this browser already earned — mirrored here so the two agree.
+    if (
+      requestType !== "institutional_navigated_request" &&
+      !this.holderRole()
     )
       return undefined;
     if (!(await this.ensureConnected())) return undefined;
@@ -7138,6 +7182,10 @@ export class Bridge {
   }
 
   private scheduleMaterialization(jobID: string, immediate = false): void {
+    // Stop before the workflow, not only before its frames: materializing opens
+    // a real browser tab to bind, and a pending session that cannot claim would
+    // leave that tab orphaned with nothing to attach it to.
+    if (!this.holderRole()) return;
     if (this.materializationRuns.has(jobID)) {
       this.materializationReruns.add(jobID);
       return;
@@ -8140,6 +8188,13 @@ export class Bridge {
       return failure("scan_not_found", "This scan is no longer open");
     return { ok: true, snapshot: existing };
   }
+
+  /** Deliberately holder-independent, and `holderRole()` must never be added.
+   * A grab is user-initiated and self-routing: the requesting session receives
+   * its own steering path and performs its own download into it, and adoption
+   * is by directory, not by session. The concurrency fence is the single
+   * effect-permit lane, which is unchanged. Requiring the session slot here
+   * only stole the researcher's other browser for nothing. */
   pdfGrabAvailable(): boolean {
     return (
       this.daemonNegotiated() &&
@@ -8147,6 +8202,18 @@ export class Bridge {
       (this.store.daemonFeatures ?? []).includes(PDF_GRAB_FEATURE) &&
       (this.store.daemonFeatures ?? []).includes(EFFECT_PERMIT_FEATURE)
     );
+  }
+
+  /** Why this browser cannot grab, in the researcher's words. Two boundaries
+   * refuse independently — the delivery entry point and the grab call itself,
+   * because the daemon underneath can be swapped between them — and they must
+   * never disagree about the remedy. */
+  private grabUnavailableText(): string {
+    return this.deps.downloads.onDeterminingFilename === undefined
+      ? "This browser can't hand a saved PDF to papio — use the viewer Download button instead."
+      : pdfGrabRefusalText(
+          this.daemonNegotiated() ? "daemon_unsupported" : "no_session",
+        );
   }
 
   private notifyPdfGrab(
@@ -8217,13 +8284,31 @@ export class Bridge {
     const result = await this.abandonPdfGrab(grabID);
     if (!result.ok) return;
     if (result.outcome === "conflict") {
+      // The daemon still owns a live, conflicting state; report exactly it.
       this.notifyPdfGrab(
         correlation.scanID,
         grabID,
         result.state,
         result.detail,
       );
+    } else if (
+      result.outcome === "unavailable" ||
+      result.outcome === "not_found"
+    ) {
+      // Refusals, not cancellations. Defaulting these to "abandoned" told the
+      // researcher their download had been cancelled when the daemon had
+      // declined to cancel it and still owned whatever the grab became. A
+      // refusal may also carry no state at all, and "failed" is the only
+      // honest display state for a grab this browser can no longer speak for.
+      this.notifyPdfGrab(
+        correlation.scanID,
+        grabID,
+        durablePdfGrabState(result.state) ?? "failed",
+        pdfGrabRefusalText(undefined, result.detail),
+      );
     } else {
+      // "abandoned", or a daemon that classified nothing and whose reported
+      // state already says this grab is gone.
       this.notifyPdfGrab(
         correlation.scanID,
         grabID,
@@ -8243,11 +8328,10 @@ export class Bridge {
     workspace_tab_id?: number | undefined;
     scan_id?: string | undefined;
   }): Promise<BrokerReply<{ grab_id: string }>> {
+    // The old single sentence named "Chrome download steering and a compatible
+    // daemon" for three unrelated causes at once; each has its own remedy.
     if (!this.pdfGrabAvailable())
-      return failure(
-        "feature_unavailable",
-        "PDF grabbing needs Chrome download steering and a compatible daemon",
-      );
+      return failure("feature_unavailable", this.grabUnavailableText());
     let requestURL = request.url;
     if (requestURL === undefined) {
       try {
@@ -8313,11 +8397,17 @@ export class Bridge {
         typeof grabID !== "string" ||
         typeof steeringPath !== "string"
       ) {
+        // `reason` is the daemon's machine classification; `detail` is prose it
+        // wrote for a log. One translation point decides which the researcher
+        // sees, so no refusal reaches the popup naming holdership or permits.
         return failure(
           "grab_failed",
-          typeof result.payload["detail"] === "string"
-            ? result.payload["detail"]
-            : "The daemon could not start this PDF grab",
+          pdfGrabRefusalText(
+            result.payload["reason"],
+            typeof result.payload["detail"] === "string"
+              ? result.payload["detail"]
+              : undefined,
+          ),
         );
       }
       const workspaceTabID = request.workspace_tab_id ?? request.tab_id;
@@ -9142,7 +9232,9 @@ export class Bridge {
     spec: AdapterSpec,
   ): Promise<TermsAcceptResult> {
     const job = findByJob(this.store, jobID);
-    if (job === undefined || !this.hasDelegatedAuthority(job))
+    // terms_effect_start_request is holder-only in the daemon; a pending
+    // session must not click a terms gate it cannot hold a permit for.
+    if (job === undefined || !this.hasDelegatedAuthority(job) || !this.holderRole())
       return "not_dispatched";
     let plan: Plan;
     try {
@@ -9408,6 +9500,7 @@ export class Bridge {
     this.port = port;
     this.portGeneration += 1;
     this.helloAckGeneration = -1;
+    this.helloRole = undefined;
     this.helloDeniedGeneration = -1;
     this.helloSentGeneration = -1;
     this.helloRequestID = undefined;
@@ -10717,7 +10810,12 @@ export class Bridge {
       const age = now - sentAt;
       if (age >= 0 && age < SESSION_EVIDENCE_THROTTLE_MS) return false;
     }
-    if (!(this.store.daemonFeatures ?? []).includes(SESSION_EVIDENCE_FEATURE))
+    // session_evidence releases parked handoffs, which only the holder owns;
+    // the daemon accordingly refuses the frame from a pending session.
+    if (
+      !this.holderRole() ||
+      !(this.store.daemonFeatures ?? []).includes(SESSION_EVIDENCE_FEATURE)
+    )
       return false;
     const payload: Record<string, unknown> = {
       evidence,
@@ -11953,6 +12051,10 @@ export class Bridge {
           resolverOrigins,
         }));
         await this.syncConnectionBadge(connectionStatus);
+        // Set before anything below can consult it. An absent `role` is a
+        // daemon that predates session roles, and it only ever acknowledged
+        // the session it had just slotted, so its silence means holder.
+        this.helloRole = msg.payload.role === "pending" ? "pending" : "holder";
         this.helloAckGeneration = this.portGeneration;
         // A claim can seat this session after it was refused; the ack arrives
         // on the same port, so the refusal must stop shortcutting requests.
@@ -12086,6 +12188,10 @@ export class Bridge {
   private async onJobOffer(msg: BrowserMessage): Promise<void> {
     const jobID = msg.job_id;
     if (jobID === undefined) return;
+    // Every reply an offer earns — job_accept, job_reject, provider_outcome —
+    // is holder-only. A pending session that answered anyway would open tabs
+    // and drive a provider for a slot it does not hold.
+    if (!this.holderRole()) return;
     const p = msg.payload;
     const openurl = p["openurl"];
     const hostsRaw = p["provider_hosts"];

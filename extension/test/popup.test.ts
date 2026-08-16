@@ -59,7 +59,15 @@ import {
   SESSION_STATE_MESSAGE,
 } from "../src/popup";
 import type { ActiveJob } from "../src/state";
-import type { WorkPulseResponsePayload } from "../src/protocol";
+import {
+  PDF_GRAB_REFUSAL_REASONS,
+  type WorkPulseResponsePayload,
+} from "../src/protocol";
+import {
+  PDF_GRAB_REFUSAL_COPY,
+  pdfGrabRefusalText,
+  sendPdfState,
+} from "../src/deliver";
 import { SESSION_STALE_MS } from "../src/keepalive";
 import { PROVIDERS, SCENARIOS } from "../src/capture";
 
@@ -576,7 +584,7 @@ test("a session held by another browser is not reported as an unreachable daemon
   expect(card?.hidden).toBe(false);
   // `papio daemon status` answers "ok" here, so it must not be the advice.
   expect(doc.getElementById("daemon-status-message")?.textContent).toBe(
-    "another browser is holding your papio session — this one gets no papers until you switch it",
+    "another browser is holding your papio session — papio sends papers it finds to that one; Send PDF still works here",
   );
   expect(doc.getElementById("daemon-status-hint")?.textContent).toBe("run: papio browser use --latest");
 
@@ -2940,6 +2948,219 @@ test("a PDF page offers Send PDF beside bulk selection, preserving the PDF-grab 
   expect(acquire.title).toBe("Send this PDF to papio");
   expect(scan.hidden).toBe(false);
   expect(acquire.dataset.primaryAction).toBe("true");
+});
+
+/** The PDF page every Send-PDF state test renders against: no live job, no page
+ * DOI, so identification genuinely needs the daemon's grab lane. */
+function pdfBinding(): PageActionBinding {
+  return binding({
+    url: "https://papers.example.edu/a.pdf",
+    kind: "pdf",
+    tab_url: "https://papers.example.edu/a.pdf",
+  });
+}
+
+test("a pending session with the grab features renders Send PDF enabled and sends", async () => {
+  const doc = popupDocument();
+  const sent: string[] = [];
+  renderPageAcquire(
+    doc,
+    async () => ({ error: "unused" }),
+    async (bound) => {
+      sent.push(bound.url);
+      return { state: "sending" };
+    },
+  );
+  // `session_elsewhere` IS the acknowledged-but-pending role. Before this fix
+  // that session had no features at all and Send PDF failed at click time with
+  // the daemon's own arbitration vocabulary.
+  renderPageContext(doc, pdfBinding(), [], undefined, [], {}, false, {
+    connectionStatus: "session_elsewhere",
+    daemonFeatures: ["pdf_grab_v1", "effect_permit_v1"],
+  });
+
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  expect(button.disabled).toBe(false);
+  expect(button.dataset.sendPdf).toBe("ready");
+  expect(button.title).toBe("Send this PDF to papio");
+  expect(button.dataset.primaryAction).toBe("true");
+
+  button.click();
+  await flushMicrotasks();
+  expect(sent).toEqual(["https://papers.example.edu/a.pdf"]);
+});
+
+test("a daemon without the grab features renders Send PDF disabled carrying its remedy, and no click is dispatched", async () => {
+  const doc = popupDocument();
+  let clicks = 0;
+  renderPageAcquire(
+    doc,
+    async () => ({ error: "unused" }),
+    async () => {
+      clicks += 1;
+      return { state: "sending" };
+    },
+  );
+  wirePrimaryShortcut(doc);
+  renderPageContext(doc, pdfBinding(), [], undefined, [], {}, false, {
+    connectionStatus: "connected",
+    daemonFeatures: ["page_acquire"],
+  });
+
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const remedy = "papio needs an update — run papio doctor.";
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-disabled")).toBe("true");
+  expect(button.dataset.sendPdf).toBe("refused");
+  expect(button.title).toBe(remedy);
+  expect(button.getAttribute("aria-label")).toBe(
+    `Send this PDF to papio — ${remedy}`,
+  );
+  // The remedy is readable without hovering the dead control.
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe(remedy);
+  // Enter still resolves to THIS button, so its refusal is what stops the send.
+  expect(button.dataset.primaryAction).toBe("true");
+
+  button.click();
+  doc.dispatchEvent(
+    new doc.defaultView!.KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+  );
+  await flushMicrotasks();
+  expect(clicks).toBe(0);
+});
+
+test("an extension the daemon will not talk to names its own remedy, DOI or not", () => {
+  for (const page of [pdfBinding(), binding({ url: "https://papers.example.edu/b.pdf", kind: "pdf", doi: "10.1000/x", tab_url: "https://papers.example.edu/b.pdf" })]) {
+    const doc = popupDocument();
+    renderPageContext(doc, page, [], undefined, [], {}, false, {
+      connectionStatus: "extension_outdated",
+      daemonFeatures: ["pdf_grab_v1", "effect_permit_v1"],
+    });
+    const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.title).toBe("Reload the papio extension to finish updating.");
+  }
+});
+
+test("an unreachable daemon leaves Send PDF enabled: nothing is known to be missing", () => {
+  const doc = popupDocument();
+  renderPageContext(doc, pdfBinding(), [], undefined, [], {}, false, {
+    connectionStatus: "disconnected",
+    daemonFeatures: [],
+  });
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  // The click reconnects and reports; a disabled button here would assert a
+  // capability gap nobody has confirmed.
+  expect(button.disabled).toBe(false);
+  expect(button.dataset.sendPdf).toBe("ready");
+});
+
+test("a PDF with its own DOI never needs the grab lane, so its features cannot disable it", () => {
+  const doc = popupDocument();
+  renderPageContext(
+    doc,
+    binding({
+      url: "https://papers.example.edu/c.pdf",
+      kind: "pdf",
+      doi: "10.1000/x",
+      tab_url: "https://papers.example.edu/c.pdf",
+    }),
+    [],
+    undefined,
+    [],
+    {},
+    false,
+    { connectionStatus: "connected", daemonFeatures: [] },
+  );
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  expect(button.disabled).toBe(false);
+});
+
+test("an in-flight delivery still disables Send PDF, and says so as progress not refusal", () => {
+  const doc = popupDocument();
+  renderPageContext(
+    doc,
+    pdfBinding(),
+    [],
+    {
+      job_id: "job_inflight",
+      url: "https://papers.example.edu/a.pdf",
+      initiated_at: 1,
+      status: "sending",
+    },
+    [],
+    {},
+    false,
+    {
+      connectionStatus: "connected",
+      daemonFeatures: ["pdf_grab_v1", "effect_permit_v1"],
+    },
+  );
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  expect(button.disabled).toBe(true);
+  expect(button.dataset.sendPdf).toBe("in_flight");
+  expect(button.title).toBe("Send this PDF to papio");
+});
+
+test("sendPdfState refuses only what it knows, and every refusal it names has copy", () => {
+  const base = {
+    daemonFeatures: ["pdf_grab_v1", "effect_permit_v1"],
+    needsGrab: true,
+    deliveryStatus: undefined,
+  };
+  // A pending role, expressed as the status it produces, is READY. This is the
+  // whole bug: holdership has no say over user-initiated, self-routing work.
+  expect(sendPdfState({ ...base, connectionStatus: "session_elsewhere" })).toEqual({
+    kind: "ready",
+  });
+  expect(sendPdfState({ ...base, connectionStatus: "connected" })).toEqual({
+    kind: "ready",
+  });
+  const unsupported = sendPdfState({
+    connectionStatus: "connected",
+    daemonFeatures: ["pdf_grab_v1"],
+    needsGrab: true,
+    deliveryStatus: undefined,
+  });
+  expect(unsupported).toEqual({
+    kind: "refused",
+    reason: "daemon_unsupported",
+    message: PDF_GRAB_REFUSAL_COPY.daemon_unsupported,
+  });
+  // An out-of-date daemon still acknowledged its features; if it advertises the
+  // grab lane the button works, and if it does not the remedy is the daemon's.
+  expect(
+    sendPdfState({ ...base, connectionStatus: "daemon_outdated" }),
+  ).toEqual({ kind: "ready" });
+
+  for (const reason of PDF_GRAB_REFUSAL_REASONS) {
+    expect(PDF_GRAB_REFUSAL_COPY[reason].length).toBeGreaterThan(0);
+  }
+});
+
+test("no Send-PDF string this popup can render names holdership or permits", () => {
+  const jargon = /holder|permit|negotiat/i;
+  const rendered: string[] = [];
+  for (const daemon of [
+    { connectionStatus: "connected" as const, daemonFeatures: [] },
+    { connectionStatus: "extension_outdated" as const, daemonFeatures: [] },
+    { connectionStatus: "session_elsewhere" as const, daemonFeatures: [] },
+    { connectionStatus: "daemon_outdated" as const, daemonFeatures: [] },
+  ]) {
+    const doc = popupDocument();
+    renderPageContext(doc, pdfBinding(), [], undefined, [], {}, false, daemon);
+    const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+    rendered.push(
+      button.textContent ?? "",
+      button.title,
+      button.getAttribute("aria-label") ?? "",
+      doc.getElementById("page-acquire-status")?.textContent ?? "",
+    );
+  }
+  rendered.push(...Object.values(PDF_GRAB_REFUSAL_COPY));
+  rendered.push(pdfGrabRefusalText(undefined, "held by the current holder"));
+  expect(rendered.some((text) => text.length > 0)).toBe(true);
+  for (const text of rendered) expect(text).not.toMatch(jargon);
 });
 
 test("an ordinary HTTPS page without a DOI shows bulk selection alone — no disabled Acquire placeholder", () => {

@@ -1,6 +1,12 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
 import { isAuthenticationURL } from "./keepalive";
+import {
+  EFFECT_PERMIT_FEATURE,
+  PDF_GRAB_REFUSAL_REASONS,
+  type PdfGrabRefusalReason,
+} from "./protocol";
+import type { DaemonConnectionStatus, PendingDeliveryStatus } from "./state";
 /** DOI-shaped identifiers are deliberately conservative: the daemon remains the
  * authority, while the popup only needs a useful first candidate. */
 export const DOI_PATTERN = /\b10\.\d{4,9}\/[^\s"'<>?#]+/;
@@ -240,4 +246,118 @@ export function sanitizePageHost(value: string): string | undefined {
     return undefined;
   }
   return host;
+}
+
+/** The daemon feature that advertises daemon-side PDF grabbing. Declared here,
+ * beside the copy that explains its absence, so the popup's pre-click decision
+ * and the bridge's send-time refusal cannot disagree about the name. */
+export const PDF_GRAB_FEATURE = "pdf_grab_v1";
+
+/** Shown when papio refused a grab for a reason the researcher cannot act on,
+ * and whenever an older daemon classified nothing at all. */
+export const PDF_GRAB_GENERIC_REFUSAL = "papio couldn't save this PDF — try again.";
+
+/** The single translation from the daemon's closed refusal vocabulary to the
+ * words a researcher reads. Every entry names either the one command that
+ * fixes it or the one fact that ends the attempt; none names holdership,
+ * effect permits, sessions, or feature negotiation, because none of those is
+ * something the person holding the mouse can do anything about. */
+export const PDF_GRAB_REFUSAL_COPY: Readonly<Record<PdfGrabRefusalReason, string>> = {
+  no_session: PDF_GRAB_GENERIC_REFUSAL,
+  extension_outdated: "Reload the papio extension to finish updating.",
+  daemon_unsupported: "papio needs an update — run papio doctor.",
+  busy: "papio is busy with another download — try again in a moment.",
+  not_configured: "papio isn't set up to save PDFs yet — run papio doctor.",
+  adoption_unhealthy: "papio can't reach its downloads folder — run papio doctor.",
+  tab_unusable: "This tab isn't a PDF papio can save.",
+  internal: PDF_GRAB_GENERIC_REFUSAL,
+};
+
+/** Daemon-internal vocabulary. `detail` is diagnostic prose written for someone
+ * reading a log, so it is only ever a fallback, and never one when it leaks the
+ * arbitration machinery the researcher is not party to. */
+const GRAB_DETAIL_INTERNAL_VOCABULARY =
+  /holder|holdership|permit\w*|negotiat\w*|session slot|effect lane/i;
+
+function isPdfGrabRefusalReason(value: unknown): value is PdfGrabRefusalReason {
+  return (
+    typeof value === "string" &&
+    (PDF_GRAB_REFUSAL_REASONS as readonly string[]).includes(value)
+  );
+}
+
+/** Translate one pdf_grab_result refusal into researcher-facing copy.
+ *
+ * An absent or unrecognized `reason` means an older daemon classified nothing,
+ * so the daemon's own `detail` is the best available text — unless it carries
+ * internal vocabulary, in which case there is nothing worth showing and the
+ * generic copy wins. */
+export function pdfGrabRefusalText(reason: unknown, detail?: string): string {
+  if (isPdfGrabRefusalReason(reason)) return PDF_GRAB_REFUSAL_COPY[reason];
+  const text = typeof detail === "string" ? detail.trim() : "";
+  if (text === "" || GRAB_DETAIL_INTERNAL_VOCABULARY.test(text))
+    return PDF_GRAB_GENERIC_REFUSAL;
+  return text;
+}
+
+/** Everything the extension already knows about a Send-PDF click before it
+ * happens. Deliberately store-shaped: the popup must not need a round trip to
+ * the worker to decide whether to offer a control.
+ *
+ * There is no `role` field, and that is the fix rather than an omission. The
+ * daemon's session role reaches the popup as `connectionStatus`:
+ * `session_elsewhere` IS the acknowledged-but-pending role, and a pending
+ * session routes its own grab, so it is exactly as able to send a PDF as the
+ * holder. Holdership decides who receives daemon-initiated work; it has no
+ * say over work the researcher initiates here. */
+export interface SendPdfFacts {
+  /** Last hello_ack outcome for the daemon session. Anything other than an
+   * acknowledged status means the extension does not yet know the daemon's
+   * real capabilities and must not claim one is missing. */
+  connectionStatus: DaemonConnectionStatus | undefined;
+  /** Features the daemon acknowledged. Empty until an ack arrives. */
+  daemonFeatures: readonly string[] | undefined;
+  /** True when identifying this PDF needs the daemon's grab lane: no live job
+   * owns the page and the page carries no DOI of its own. A page with either
+   * travels the ordinary acquisition route, which needs none of this. */
+  needsGrab: boolean;
+  /** This page's own in-flight delivery, if any. */
+  deliveryStatus: PendingDeliveryStatus | undefined;
+}
+
+/** Whether Send PDF can do anything if clicked right now.
+ *
+ * `refused` is only ever returned for something the extension KNOWS, which is
+ * why an unreachable daemon stays `ready`: the click reconnects, and its
+ * established error path is more honest than a disabled button asserting a
+ * capability gap nobody has confirmed. */
+export type SendPdfState =
+  | { kind: "ready" }
+  | { kind: "in_flight" }
+  | { kind: "refused"; reason: PdfGrabRefusalReason; message: string };
+
+function refusedSendPdf(reason: PdfGrabRefusalReason): SendPdfState {
+  return { kind: "refused", reason, message: PDF_GRAB_REFUSAL_COPY[reason] };
+}
+
+export function sendPdfState(facts: SendPdfFacts): SendPdfState {
+  if (facts.deliveryStatus === "sending" || facts.deliveryStatus === "downloaded")
+    return { kind: "in_flight" };
+  // The daemon refuses every frame from a version it will not talk to, so this
+  // one is known-dead regardless of which route the click would have taken.
+  if (facts.connectionStatus === "extension_outdated")
+    return refusedSendPdf("extension_outdated");
+  if (!facts.needsGrab) return { kind: "ready" };
+  const acknowledged =
+    facts.connectionStatus === "connected" ||
+    facts.connectionStatus === "session_elsewhere" ||
+    facts.connectionStatus === "daemon_outdated";
+  if (!acknowledged) return { kind: "ready" };
+  const features = facts.daemonFeatures ?? [];
+  if (
+    !features.includes(PDF_GRAB_FEATURE) ||
+    !features.includes(EFFECT_PERMIT_FEATURE)
+  )
+    return refusedSendPdf("daemon_unsupported");
+  return { kind: "ready" };
 }

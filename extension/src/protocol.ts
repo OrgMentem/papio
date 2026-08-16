@@ -105,12 +105,27 @@ export interface HelloPayload {
   features?: string[];
 }
 
+/** Closed session-role vocabulary carried by hello_ack. "holder" owns the
+ * daemon's single session slot and therefore receives daemon-initiated work;
+ * "pending" is a live-but-unslotted session that still learns the daemon's
+ * features and may drive user-initiated, self-routing requests.
+ *
+ * The array is the single source: `BrowserSessionRole` is derived from it and
+ * the parser validates against it, so the type and the runtime check cannot
+ * drift apart. */
+export const BROWSER_SESSION_ROLES = ["holder", "pending"] as const;
+
+export type BrowserSessionRole = (typeof BROWSER_SESSION_ROLES)[number];
+
 export interface HelloAckPayload {
   daemon_version?: string;
   features?: string[];
   /** https origins of the daemon's configured OpenURL resolvers. The extension
    * requests a host permission for each so it can steer that resolver's menu. */
   resolver_origins?: string[];
+  /** Absent means "holder": an older daemon only ever acknowledged the session
+   * it had just slotted, so its silence is not ambiguous. */
+  role?: BrowserSessionRole;
 }
 
 export interface PageAcquirePayload {
@@ -939,6 +954,34 @@ export interface PdfGrabStatusRequestPayload {
   grab_id: string;
 }
 
+/** Closed machine vocabulary for a pdf_grab_result refusal, so the popup picks
+ * its own copy instead of surfacing `detail` (diagnostic prose written for a
+ * human reading a log). There is deliberately no "session_elsewhere": a grab is
+ * user-initiated and self-routing, so holdership never refuses one.
+ *
+ * The array is the single source: `PdfGrabRefusalReason` is derived from it and
+ * the parser validates against it. */
+export const PDF_GRAB_REFUSAL_REASONS = [
+  /** the sender never completed a hello */
+  "no_session",
+  /** the session lacks a required feature or is below the daemon's floor */
+  "extension_outdated",
+  /** this daemon does not advertise pdf_grab_v1 */
+  "daemon_unsupported",
+  /** the effect lane is occupied by another in-flight effect */
+  "busy",
+  /** grab storage is not configured */
+  "not_configured",
+  /** the adoption latch is unhealthy (macOS TCC consent) */
+  "adoption_unhealthy",
+  /** the requested tab/URL cannot be grabbed */
+  "tab_unusable",
+  /** an unexpected daemon-side failure */
+  "internal",
+] as const;
+
+export type PdfGrabRefusalReason = (typeof PDF_GRAB_REFUSAL_REASONS)[number];
+
 export interface PdfGrabResultPayload {
   request_id?: string;
   grab_id?: string;
@@ -953,6 +996,10 @@ export interface PdfGrabResultPayload {
     | "failed_validation"
     | "abandoned";
   steering_path?: string;
+  /** Permitted only on the "unavailable" and "not_supported" refusals. Absent
+   * there means "unknown" — an older daemon classified nothing, so the UI falls
+   * back to generic copy rather than to `detail`. */
+  reason?: PdfGrabRefusalReason;
   detail?: string;
 }
 
@@ -3729,6 +3776,7 @@ function validatePayload(
         daemon_version: "optional",
         features: "optional",
         resolver_origins: "optional",
+        role: "optional",
       });
       if ("daemon_version" in p) str(p, "daemon_version", "hello_ack", 50);
       if ("features" in p) {
@@ -3776,6 +3824,13 @@ function validatePayload(
               "hello_ack.resolver_origins entries must be bounded https origins",
             );
         }
+      }
+      // Absent role means holder — an older daemon acknowledged only the
+      // session it had just slotted, so its silence is not ambiguous.
+      if ("role" in p) {
+        const role = str(p, "role", "hello_ack", 20);
+        if (!(BROWSER_SESSION_ROLES as readonly string[]).includes(role))
+          fail("hello_ack.role is invalid");
       }
       break;
     }
@@ -4735,6 +4790,7 @@ function validatePayload(
         grab_id: "optional",
         outcome: "required",
         steering_path: "optional",
+        reason: "optional",
         detail: "optional",
       });
       const outcome = str(p, "outcome", "pdf_grab_result", 30);
@@ -4753,6 +4809,14 @@ function validatePayload(
         ].includes(outcome)
       ) {
         fail("pdf_grab_result.outcome is invalid");
+      }
+      if (
+        "reason" in p &&
+        !(PDF_GRAB_REFUSAL_REASONS as readonly string[]).includes(
+          str(p, "reason", "pdf_grab_result", 40),
+        )
+      ) {
+        fail("pdf_grab_result.reason is invalid");
       }
       if (
         outcome !== "not_supported" &&
@@ -4779,6 +4843,8 @@ function validatePayload(
           fail("pdf_grab_result: steering outcome requires request_id");
         if (!("steering_path" in p))
           fail("pdf_grab_result: steering outcome requires steering_path");
+        if ("reason" in p)
+          fail("pdf_grab_result: steering outcome must not carry reason");
       } else if (outcome === "existing") {
         if (requestID === "" || !("grab_id" in p))
           fail(
@@ -4788,6 +4854,8 @@ function validatePayload(
           fail(
             "pdf_grab_result: existing outcome must not carry steering_path",
           );
+        if ("reason" in p)
+          fail("pdf_grab_result: existing outcome must not carry reason");
       } else if (outcome === "not_supported" || outcome === "unavailable") {
         if (requestID === "")
           fail(`pdf_grab_result: ${outcome} outcome requires request_id`);
@@ -4801,6 +4869,10 @@ function validatePayload(
         if ("steering_path" in p)
           fail(
             `pdf_grab_result: ${outcome} outcome must not carry steering_path`,
+          );
+        if ("reason" in p)
+          fail(
+            `pdf_grab_result: ${outcome} outcome must not carry reason (it is not a refusal)`,
           );
       }
       break;

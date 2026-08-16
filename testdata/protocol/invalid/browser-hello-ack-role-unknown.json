@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"hello_ack","msg_id":"daemon-ack-bad2","seq":3,"payload":{"role":"observer"}}

@@ -844,7 +844,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	}
 	if !slices.Equal(payload.Features, []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, protocol.EffectPermitFeature, institutionalMaterializationFeature,
-		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature,
+		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature,
 	}) {
 		t.Fatalf("features = %v", payload.Features)
 	}
@@ -7576,7 +7576,7 @@ func TestPdfGrabRequiresPermitAndRespectsOccupancy(t *testing.T) {
 // grab is allocated (no landing directory left behind).
 func TestPdfGrabRefusesOnUnhealthyLatch(t *testing.T) {
 	b, _, cfg, _ := newBridge(t)
-	runSync(t, b, hello())
+	runSync(t, b, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
 	b.adoptionScanSuspended = true
 	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
 		"request_id": "grab-req-0002", "host": "pdf.example.org",
@@ -7586,54 +7586,275 @@ func TestPdfGrabRefusesOnUnhealthyLatch(t *testing.T) {
 		t.Fatalf("no pdf_grab_result frame: %+v", msgs)
 	}
 	p := got.Payload.(*protocol.PdfGrabResultPayload)
-	if p.Outcome != "unavailable" || p.GrabID != "" || p.SteeringPath != "" || p.Detail == "" {
-		t.Fatalf("payload = %+v, want a structured unavailable refusal with no grab_id", p)
+	if p.Outcome != "unavailable" || p.Reason != grabReasonAdoptionUnhealthy ||
+		p.GrabID != "" || p.SteeringPath != "" || p.Detail == "" {
+		t.Fatalf("payload = %+v, want a structured adoption_unhealthy refusal with no grab_id", p)
 	}
 	entries, err := os.ReadDir(filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs"))
 	if err == nil && len(entries) != 0 {
 		t.Fatalf("refusal must not allocate a grab: found %d landing dirs", len(entries))
 	}
 }
-func TestPdfGrabAdmissionIsCurrentHolderAndFeatureFenced(t *testing.T) {
-	t.Run("non-holder", func(t *testing.T) {
-		b, jobs, _, _ := newBridge(t)
-		const holder = "sess-pdf-holder-00000000000000000000001"
-		const pending = "sess-pdf-pending-00000000000000000000001"
-		runSyncAs(t, b, holder, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
-		runSyncAs(t, b, pending, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
-		msgs, _ := runSyncAs(t, b, pending, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
-			"request_id": "pdf-non-holder-0001", "host": "pdf.example.org", "title": "Non-holder",
-		}))
-		result := firstOfType(msgs, protocol.MsgPdfGrabResult)
-		if result == nil || result.Payload.(*protocol.PdfGrabResultPayload).Outcome != "unavailable" {
-			t.Fatalf("non-holder result = %+v, want unavailable", msgs)
-		}
-		var n int
-		if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pdf_grabs`).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		if n != 0 {
-			t.Fatalf("non-holder created %d grab rows", n)
-		}
+
+// pdfGrabVia drives one pdf_grab_request from sessionID through Sync — the
+// production path, dispatcher included — and returns the decoded result.
+func pdfGrabVia(t *testing.T, b *Bridge, sessionID, requestID, host string) *protocol.PdfGrabResultPayload {
+	t.Helper()
+	msgs, _ := runSyncAs(t, b, sessionID, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+		"request_id": requestID, "host": host, "title": "A Paper",
+	}))
+	result := firstOfType(msgs, protocol.MsgPdfGrabResult)
+	if result == nil {
+		t.Fatalf("no pdf_grab_result frame: %+v", msgs)
+	}
+	return result.Payload.(*protocol.PdfGrabResultPayload)
+}
+
+// pdfGrabDirect calls the handler with no dispatcher in front of it. Two
+// refusal branches are only reachable this way, and both must stay: Sync
+// answers an unknown session with hello_required before the grab path sees
+// it, and the wire's bare-hostname rule rejects an unusable host at decode.
+// Calling the handler directly also proves the branch answers with a frame
+// rather than a raw Go error — which the native host treats as a dead
+// connection and tears the browser session down for.
+func pdfGrabDirect(t *testing.T, b *Bridge, sessionID, requestID, host string) *protocol.PdfGrabResultPayload {
+	t.Helper()
+	frames, err := b.pdfGrab(context.Background(), sessionID, &protocol.PdfGrabRequestPayload{
+		RequestID: requestID, Host: host, Title: "A Paper",
 	})
-	t.Run("featureless holder", func(t *testing.T) {
-		b, jobs, _, _ := newBridge(t)
-		runSync(t, b, hello())
-		msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
-			"request_id": "pdf-featureless-0001", "host": "pdf.example.org", "title": "Featureless",
-		}))
-		result := firstOfType(msgs, protocol.MsgPdfGrabResult)
-		if result == nil || result.Payload.(*protocol.PdfGrabResultPayload).Outcome != "unavailable" {
-			t.Fatalf("featureless result = %+v, want unavailable", msgs)
+	if err != nil {
+		t.Fatalf("pdf grab returned a raw Go error, which disconnects the browser: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("frames = %d, want one pdf_grab_result", len(frames))
+	}
+	msg, err := protocol.DecodeBrowserMessage(frames[0])
+	if err != nil {
+		t.Fatalf("refusal frame failed protocol decode: %v", err)
+	}
+	return msg.Payload.(*protocol.PdfGrabResultPayload)
+}
+
+func grabCapableHello(t *testing.T, b *Bridge) {
+	t.Helper()
+	runSync(t, b, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
+}
+
+// TestPdfGrabIsServedFromANonHolderSession is the regression test for the
+// field report behind this change: clicking "Send PDF" in a second browser
+// refused with an internal-vocabulary message. A grab is user-initiated and
+// carries its own routing — the requesting session gets its own steering
+// path and downloads into it — so holdership, which exists to route
+// daemon-initiated offers and handoffs, must not gate it. The grab must also
+// not steal the session slot from the browser that holds it.
+func TestPdfGrabIsServedFromANonHolderSession(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	const holder = "sess-pdf-holder-00000000000000000000001"
+	const pending = "sess-pdf-pending-00000000000000000000001"
+	runSyncAs(t, b, holder, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
+	runSyncAs(t, b, pending, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
+
+	p := pdfGrabVia(t, b, pending, "pdf-non-holder-0001", "pdf.example.org")
+	if p.Outcome != "steering" || p.GrabID == "" || p.Reason != "" {
+		t.Fatalf("non-holder grab = %+v, want steering with a grab id and no reason", p)
+	}
+	if want := "papio/grabs/" + p.GrabID + "/"; p.SteeringPath != want {
+		t.Fatalf("steering_path = %q, want %q", p.SteeringPath, want)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", p.GrabID)); err != nil {
+		t.Fatalf("landing directory not created for the non-holder grab: %v", err)
+	}
+	if b.holder == nil || b.holder.ID != holder {
+		t.Fatalf("holder = %+v, want the grab to leave the session slot with %s", b.holder, holder)
+	}
+	var n int
+	if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pdf_grabs`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("grab rows = %d, want the non-holder's single grab", n)
+	}
+}
+
+// pdfGrabRefusalCase drives exactly one refusal condition on its own bridge.
+type pdfGrabRefusalCase struct {
+	name   string
+	reason string
+	run    func(t *testing.T) *protocol.PdfGrabResultPayload
+}
+
+// pdfGrabRefusalCases covers the closed reason vocabulary: one condition per
+// value, so a reason cannot quietly become unreachable or start standing in
+// for a second cause the way the old single "unavailable" string did.
+func pdfGrabRefusalCases() []pdfGrabRefusalCase {
+	return []pdfGrabRefusalCase{
+		{"no session", grabReasonNoSession, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			b, _, _, _ := newBridge(t)
+			return pdfGrabDirect(t, b, "sess-never-said-hello-000000000001", "pdf-no-session-0001", "pdf.example.org")
+		}},
+		{"session without the effect capability", grabReasonExtensionOutdated, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			b, _, _, _ := newBridge(t)
+			runSync(t, b, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature))
+			return pdfGrabVia(t, b, testSessionID, "pdf-no-permit-0001", "pdf.example.org")
+		}},
+		{"session without pdf_grab_v1", grabReasonExtensionOutdated, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			b, _, _, _ := newBridge(t)
+			runSync(t, b, helloWithFeatures(t, "0.14.0", effectPermitFeature))
+			return pdfGrabVia(t, b, testSessionID, "pdf-no-grab-feat-01", "pdf.example.org")
+		}},
+		{"session below the version floor", grabReasonExtensionOutdated, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			// A non-holder carries its own outdated verdict here: the
+			// dispatcher's version gate only fires on the holder branch.
+			b, _, _, _ := newBridge(t)
+			const outdated = "sess-pdf-outdated-000000000000000001"
+			runSync(t, b, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
+			runSyncAs(t, b, outdated, helloWithFeatures(t, "0.4.0", pdfGrabV1Feature, effectPermitFeature))
+			return pdfGrabVia(t, b, outdated, "pdf-outdated-0001", "pdf.example.org")
+		}},
+		{"daemon without pdf_grab_v1", grabReasonDaemonUnsupported, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			b, _, _, _ := newBridge(t)
+			grabCapableHello(t, b)
+			b.Features = slices.DeleteFunc(slices.Clone(b.Features), func(f string) bool { return f == pdfGrabV1Feature })
+			return pdfGrabVia(t, b, testSessionID, "pdf-daemon-old-0001", "pdf.example.org")
+		}},
+		{"grab storage not configured", grabReasonNotConfigured, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			b, _, _, _ := newBridge(t)
+			grabCapableHello(t, b)
+			b.grabs = nil
+			return pdfGrabVia(t, b, testSessionID, "pdf-unconfigured-01", "pdf.example.org")
+		}},
+		{"adoption latch unhealthy", grabReasonAdoptionUnhealthy, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			b, _, _, _ := newBridge(t)
+			grabCapableHello(t, b)
+			b.adoptionScanSuspended = true
+			return pdfGrabVia(t, b, testSessionID, "pdf-latch-sick-0001", "pdf.example.org")
+		}},
+		{"tab url unusable", grabReasonTabUnusable, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			b, _, _, _ := newBridge(t)
+			grabCapableHello(t, b)
+			return pdfGrabDirect(t, b, testSessionID, "pdf-bad-host-0001", "")
+		}},
+		{"effect lane occupied", grabReasonBusy, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			b, _, _, _ := newBridge(t)
+			grabCapableHello(t, b)
+			if first := pdfGrabVia(t, b, testSessionID, "pdf-lane-first-001", "pdf.example.org"); first.Outcome != "steering" {
+				t.Fatalf("first grab = %+v, want steering so the lane is occupied", first)
+			}
+			return pdfGrabVia(t, b, testSessionID, "pdf-lane-second-01", "other.example.org")
+		}},
+		{"allocation fails unexpectedly", grabReasonInternal, func(t *testing.T) *protocol.PdfGrabResultPayload {
+			b, _, cfg, _ := newBridge(t)
+			grabCapableHello(t, b)
+			// A plain file where the grabs/ subtree belongs makes the
+			// landing-directory preparation fail inside the allocation
+			// transaction: a daemon-side fault, not a user-fixable one.
+			root := cfg.EffectiveAdoptionRoot()
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "grabs"), []byte("not a directory"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return pdfGrabVia(t, b, testSessionID, "pdf-alloc-broken-1", "pdf.example.org")
+		}},
+	}
+}
+
+// TestPdfGrabRefusalsCarryTheirOwnReason pins every refusal to a distinct
+// machine-readable cause. Before this, all of them collapsed into one
+// free-text "unavailable" the popup could not switch on.
+func TestPdfGrabRefusalsCarryTheirOwnReason(t *testing.T) {
+	seen := map[string]bool{}
+	for _, tc := range pdfGrabRefusalCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			p := tc.run(t)
+			if p.Outcome != "unavailable" || p.Reason != tc.reason {
+				t.Fatalf("payload = %+v, want unavailable/%s", p, tc.reason)
+			}
+			if p.GrabID != "" || p.SteeringPath != "" {
+				t.Fatalf("refusal %+v must name no grab and steer nowhere", p)
+			}
+			if p.Detail == "" {
+				t.Fatalf("refusal %+v must keep a human-readable detail", p)
+			}
+		})
+		seen[tc.reason] = true
+	}
+	for _, reason := range []string{
+		grabReasonNoSession, grabReasonExtensionOutdated, grabReasonDaemonUnsupported,
+		grabReasonBusy, grabReasonNotConfigured, grabReasonAdoptionUnhealthy,
+		grabReasonTabUnusable, grabReasonInternal,
+	} {
+		if !seen[reason] {
+			t.Errorf("no condition produces reason %q; a dead value in a closed enum is a bug in one of the two", reason)
 		}
-		var n int
-		if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pdf_grabs`).Scan(&n); err != nil {
-			t.Fatal(err)
+	}
+}
+
+// TestGrabPathDetailsCarryNoInternalVocabulary is the copy fence. Details
+// reach the popup verbatim when it has no mapping for a reason, so the daemon
+// may not leak its own arbitration words into them — "pdf grab requires the
+// current holder with negotiated effect permits" is the string that started
+// this.
+func TestGrabPathDetailsCarryNoInternalVocabulary(t *testing.T) {
+	details := []string{}
+	for _, tc := range pdfGrabRefusalCases() {
+		details = append(details, tc.run(t).Detail)
+	}
+
+	// The abandon reply is the same surface, including the originator refusal
+	// that used to say "holder" out loud. A second session that said hello
+	// without the grab capabilities is the condition that reaches it.
+	b, _, _, _ := newBridge(t)
+	const capable = "sess-abandon-capable-0000000000001"
+	const incapable = "sess-abandon-incapable-000000000001"
+	runSyncAs(t, b, capable, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
+	runSyncAs(t, b, incapable, helloWithFeatures(t, "0.14.0"))
+	// runSyncAs also proves the refusal frame passes outbound self-validation:
+	// this branch used to emit "conflict" with no state, which errored out of
+	// Sync and disconnected the browser instead of refusing one request.
+	refusal, _ := runSyncAs(t, b, incapable, inFrame(t, protocol.MsgPdfGrabAbandonRequest, "", map[string]any{
+		"request_id": "pdf-abandon-0001", "grab_id": "grab00000001",
+	}))
+	refused := firstOfType(refusal, protocol.MsgPdfGrabAbandonResult)
+	if refused == nil || refused.Payload.(*protocol.PdfGrabAbandonResultPayload).Outcome != "unavailable" {
+		t.Fatalf("abandon from an incapable session = %+v, want an unavailable refusal", refusal)
+	}
+	details = append(details, refused.Payload.(*protocol.PdfGrabAbandonResultPayload).Detail)
+
+	// Status and abandon both answer "not configured" from their own copy.
+	unconfigured, _, _, _ := newBridge(t)
+	grabCapableHello(t, unconfigured)
+	unconfigured.grabs = nil
+	for _, frame := range []struct {
+		typ     string
+		payload map[string]any
+	}{
+		{protocol.MsgPdfGrabStatusRequest, map[string]any{"request_id": "pdf-status-0001", "grab_id": "grab00000001"}},
+		{protocol.MsgPdfGrabAbandonRequest, map[string]any{"request_id": "pdf-abandon-0002", "grab_id": "grab00000001"}},
+	} {
+		msgs, _ := runSync(t, unconfigured, inFrame(t, frame.typ, "", frame.payload))
+		for _, msg := range msgs {
+			switch p := msg.Payload.(type) {
+			case *protocol.PdfGrabStatusResultPayload:
+				details = append(details, p.Detail)
+			case *protocol.PdfGrabAbandonResultPayload:
+				details = append(details, p.Detail)
+			}
 		}
-		if n != 0 {
-			t.Fatalf("featureless holder created %d grab rows", n)
+	}
+
+	if len(details) < len(pdfGrabRefusalCases())+3 {
+		t.Fatalf("collected %d details, want one per refusal plus the abandon and status replies", len(details))
+	}
+	for _, detail := range details {
+		lowered := strings.ToLower(detail)
+		for _, banned := range []string{"holder", "permit", "negotiated"} {
+			if strings.Contains(lowered, banned) {
+				t.Errorf("user-visible grab detail %q leaks internal vocabulary %q", detail, banned)
+			}
 		}
-	})
+	}
 }
 
 // grabDOIValidate returns a Validate stub whose Text.Excerpt prints doi in

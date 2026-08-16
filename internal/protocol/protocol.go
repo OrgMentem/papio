@@ -1105,9 +1105,9 @@ type HelloPayload struct {
 	Features         []string          `json:"features,omitempty"`
 }
 
-// HelloAckPayload announces the daemon version and supported bridge features.
-// Both fields are optional so extensions remain compatible with older daemons
-// that acknowledge hello with an empty object.
+// HelloAckPayload announces the daemon version, supported bridge features and
+// the acknowledged session's role. Every field is optional so extensions stay
+// compatible with older daemons that acknowledge hello with an empty object.
 type HelloAckPayload struct {
 	DaemonVersion string   `json:"daemon_version,omitempty"`
 	Features      []string `json:"features,omitempty"`
@@ -1115,6 +1115,13 @@ type HelloAckPayload struct {
 	// resolvers. The extension requests a host permission for each so it can
 	// steer that resolver's menu; institution identity stays in config, not code.
 	ResolverOrigins []string `json:"resolver_origins,omitempty"`
+	// Role tells the acknowledged session whether it holds the daemon's single
+	// session slot ("holder") or is a live-but-unslotted session ("pending").
+	// Holdership routes DAEMON-initiated work (job offers, handoffs); a pending
+	// session still learns Features and can drive user-initiated, self-routing
+	// requests such as pdf_grab_request. Absent means "holder": an older daemon
+	// only ever acknowledged the holder, so its silence is not ambiguous.
+	Role string `json:"role,omitempty"`
 }
 
 // PageAcquirePayload asks the daemon to queue the paper identified on the
@@ -1264,7 +1271,24 @@ type PdfGrabResultPayload struct {
 	GrabID       string `json:"grab_id,omitempty"`
 	Outcome      string `json:"outcome"`
 	SteeringPath string `json:"steering_path,omitempty"`
-	Detail       string `json:"detail,omitempty"`
+	// Reason machine-classifies a refusal so the popup can pick its own copy
+	// instead of surfacing Detail, which is diagnostic prose written for a
+	// human reading a log. It is permitted only on the two refusal outcomes
+	// ("unavailable", "not_supported") and is a closed enum there:
+	//
+	//	no_session          — the sender never completed a hello
+	//	extension_outdated  — the session lacks a required feature or is below MinExtensionVersion
+	//	daemon_unsupported  — this daemon does not advertise pdf_grab_v1
+	//	busy                — the effect lane is occupied by another in-flight effect
+	//	not_configured      — grab storage is not configured
+	//	adoption_unhealthy  — the adoption latch is unhealthy (macOS TCC consent)
+	//	tab_unusable        — the requested tab/URL cannot be grabbed
+	//	internal            — an unexpected daemon-side failure
+	//
+	// Absent on a refusal means "unknown": an older daemon classified nothing,
+	// so the extension falls back to generic copy rather than to Detail.
+	Reason string `json:"reason,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
@@ -2353,7 +2377,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		msg.Payload = p
 	case MsgHelloAck:
 		p := &HelloAckPayload{}
-		err = browserRejectNullFields(payloadFields, "daemon_version", "features", "resolver_origins")
+		err = browserRejectNullFields(payloadFields, "daemon_version", "features", "resolver_origins", "role")
 		var features []json.RawMessage
 		if raw, ok := payloadFields["features"]; ok && err == nil {
 			err = strictDecode(raw, &features)
@@ -3112,7 +3136,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 	case MsgPdfGrabResult:
 		p := &PdfGrabResultPayload{}
 		if err = browserRequireFields(payloadFields, "outcome"); err == nil {
-			err = browserRejectNullFields(payloadFields, "request_id", "grab_id", "steering_path", "detail")
+			err = browserRejectNullFields(payloadFields, "request_id", "grab_id", "steering_path", "reason", "detail")
 		}
 		if err == nil {
 			err = strictDecode(env.Payload, p)
@@ -3876,6 +3900,16 @@ var pdfGrabItemIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // subtree SweepTerminalAdoptions's unknown-dir hygiene must never sweep.
 var pdfGrabSteeringPathRE = regexp.MustCompile(`^papio/grabs/[A-Za-z0-9_-]{8,64}/$`)
 
+// pdfGrabRefusalReasons is the closed machine vocabulary for a pdf_grab_result
+// refusal, kept in one place so the extension's copy table and
+// protocol/browser-v1.schema.json's enum have a single Go-side counterpart.
+// There is deliberately no "session_elsewhere": a grab is user-initiated and
+// self-routing, so holdership never refuses one.
+var pdfGrabRefusalReasons = []string{
+	"no_session", "extension_outdated", "daemon_unsupported", "busy",
+	"not_configured", "adoption_unhealthy", "tab_unusable", "internal",
+}
+
 func (p *PdfGrabResultPayload) validate() error {
 	if p.RequestID != "" {
 		if err := validateCorrelationID("pdf_grab_result.request_id", p.RequestID); err != nil {
@@ -3892,6 +3926,9 @@ func (p *PdfGrabResultPayload) validate() error {
 		"job_created", "already_owned", "needs_identifier", "failed_validation", "abandoned"); err != nil {
 		return err
 	}
+	if err := enumOK("pdf_grab_result.reason", p.Reason, pdfGrabRefusalReasons...); err != nil {
+		return err
+	}
 	switch p.Outcome {
 	case "steering":
 		if p.RequestID == "" {
@@ -3903,12 +3940,18 @@ func (p *PdfGrabResultPayload) validate() error {
 		if !pdfGrabSteeringPathRE.MatchString(p.SteeringPath) {
 			return fmt.Errorf("pdf_grab_result.steering_path must match papio/grabs/<grab-id>/")
 		}
+		if p.Reason != "" {
+			return fmt.Errorf("pdf_grab_result: steering outcome must not carry reason")
+		}
 	case "existing":
 		if p.RequestID == "" || p.GrabID == "" {
 			return fmt.Errorf("pdf_grab_result: existing outcome requires request_id and grab_id")
 		}
 		if p.SteeringPath != "" {
 			return fmt.Errorf("pdf_grab_result: existing outcome must not carry steering_path")
+		}
+		if p.Reason != "" {
+			return fmt.Errorf("pdf_grab_result: existing outcome must not carry reason")
 		}
 	case "not_supported", "unavailable":
 		// grab_id is intentionally optional here: a refusal decided before
@@ -3930,6 +3973,9 @@ func (p *PdfGrabResultPayload) validate() error {
 		}
 		if p.SteeringPath != "" {
 			return fmt.Errorf("pdf_grab_result: %s must not carry steering_path", p.Outcome)
+		}
+		if p.Reason != "" {
+			return fmt.Errorf("pdf_grab_result: %s must not carry reason (it is not a refusal)", p.Outcome)
 		}
 	}
 	return validateTriageText("pdf_grab_result.detail", p.Detail, 1000)
@@ -4021,7 +4067,9 @@ func (p *HelloAckPayload) validate() error {
 			return fmt.Errorf("hello_ack.resolver_origins entries must be bounded https origins")
 		}
 	}
-	return nil
+	// An absent role means holder: an older daemon acknowledged only the session
+	// it had just slotted, so silence is unambiguous rather than unknown.
+	return enumOK("hello_ack.role", p.Role, "holder", "pending")
 }
 
 // validResolverOrigin reports whether s is a bounded https origin

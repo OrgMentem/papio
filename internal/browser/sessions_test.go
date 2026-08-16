@@ -8,6 +8,7 @@ package browser
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
@@ -66,6 +67,44 @@ func TestSecondBrowserHelloIsDeniedNotStolen(t *testing.T) {
 	_ = id
 }
 
+// TestHelloAckNamesTheGrantedRole pins the two-frame denial. A denied hello
+// used to get session_busy and nothing else, so that browser learned no
+// daemon features and locally refused even the holder-independent surfaces
+// the dispatcher already admits from it — a PDF grab among them. It now hears
+// what the daemon can do first, then that it is not the holder.
+func TestHelloAckNamesTheGrantedRole(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+
+	msgs, _ := runSyncAs(t, b, sessA, helloAs("0.14.0"))
+	ack := firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil || ack.Payload.(*protocol.HelloAckPayload).Role != "holder" {
+		t.Fatalf("granted hello = %+v, want a hello_ack with role holder", msgs)
+	}
+
+	msgs, _ = runSyncAs(t, b, sessB, helloAs("0.14.0"))
+	if len(msgs) != 2 {
+		t.Fatalf("denied hello returned %d frames, want the ack and the refusal: %+v", len(msgs), msgs)
+	}
+	if msgs[0].Type != protocol.MsgHelloAck {
+		t.Fatalf("first frame = %q, want the ack ahead of the refusal", msgs[0].Type)
+	}
+	pending := msgs[0].Payload.(*protocol.HelloAckPayload)
+	if pending.Role != "pending" {
+		t.Fatalf("denied hello role = %q, want pending", pending.Role)
+	}
+	if !slices.Contains(pending.Features, pdfGrabV1Feature) {
+		t.Fatalf("pending ack features = %v, want the daemon's full capability list", pending.Features)
+	}
+	if msgs[1].Type != protocol.MsgError ||
+		msgs[1].Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+		t.Fatalf("second frame = %+v, want the session_busy refusal", msgs[1])
+	}
+
+	if _, denied, _ := b.Sessions(); denied != 1 {
+		t.Fatalf("denied hellos = %d, want the denial still counted", denied)
+	}
+}
+
 func TestNonHolderStatelessFramesPassAndHandoffFramesBlock(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := park(t, jobs, "wr_arb_frames", handoffWork())
@@ -91,6 +130,128 @@ func TestNonHolderStatelessFramesPassAndHandoffFramesBlock(t *testing.T) {
 		if e["kind"] == "browser.job_accept" {
 			t.Fatal("non-holder job_accept must not be recorded")
 		}
+	}
+}
+
+// TestNonHolderHumanInitiatedFramesAreAdmitted pins the six inbox frames that
+// used to come back session_busy from a second browser. The refusal was
+// invisible while a denied hello carried no features — the extension learned
+// no daemon capabilities, so it never put these frames on the wire — and
+// became a click-time failure the moment a pending session started receiving
+// a real hello_ack with a "pending" role.
+//
+// Each frame qualifies on both halves of the admission rule. None opens,
+// focuses, groups or closes a tab; none emits an offer, handoff, cancel or
+// focus frame; none allocates or holds an effect permit; none starts a
+// provider drive, direct get, terms acceptance or institutional navigation.
+// And none claims bridge-routed authority: no handler takes the session ID,
+// depends on being the session daemon-initiated work routes to, or touches
+// holder-scoped bridge state. What they do mutate is the daemon's own
+// records — a watch digest, a human action, a delivery request — which is a
+// human decision about daemon state, and the browser the human clicked in is
+// the right browser by construction.
+//
+// The assertion is the type-specific result frame, not merely the absence of
+// session_busy: the arbitration gate returns an error frame instead of the
+// handler's answer, so the answer's presence is what proves dispatch reached
+// the handler.
+func TestNonHolderHumanInitiatedFramesAreAdmitted(t *testing.T) {
+	cases := []struct {
+		name  string
+		want  string
+		frame func(t *testing.T, jobID string) json.RawMessage
+	}{
+		{"stats_request", protocol.MsgStatsResponse, func(t *testing.T, _ string) json.RawMessage {
+			return inFrame(t, protocol.MsgStatsRequest, "", protocol.StatsRequestPayload{
+				RequestID: "arb-stats-0001",
+			})
+		}},
+		{"activity_request", protocol.MsgActivityResponse, func(t *testing.T, _ string) json.RawMessage {
+			return inFrame(t, protocol.MsgActivityRequest, "", protocol.ActivityRequestPayload{
+				RequestID: "arb-activity-0001", Limit: 1,
+			})
+		}},
+		{"triage_decide", protocol.MsgTriageDecideResult, func(t *testing.T, _ string) json.RawMessage {
+			return inFrame(t, protocol.MsgTriageDecide, "", protocol.TriageDecidePayload{
+				RequestID: "arb-dismiss-0001", ItemID: "arb-watch-hit-absent", Op: "dismiss",
+				WatchScope: json.RawMessage(`"all"`),
+			})
+		}},
+		{"human_action_resolve", protocol.MsgHumanActionResolveResult, func(t *testing.T, _ string) json.RawMessage {
+			return inFrame(t, protocol.MsgHumanActionResolve, "", protocol.HumanActionResolvePayload{
+				RequestID: "arb-resolve-0001", ActionID: 999999, Verdict: "dismiss", ExpectedRevision: 1,
+			})
+		}},
+		{"delivery_reconcile_request", protocol.MsgDeliveryReconcileResult, func(t *testing.T, jobID string) json.RawMessage {
+			return inFrame(t, protocol.MsgDeliveryReconcileRequest, "", protocol.DeliveryReconcilePayload{
+				RequestID: "arb-delivery-0001", JobID: jobID, Operation: "confirm_request_absent",
+			})
+		}},
+		{"review_preview_request", protocol.MsgReviewPreviewResult, func(t *testing.T, _ string) json.RawMessage {
+			return inFrame(t, protocol.MsgReviewPreviewRequest, "", protocol.ReviewPreviewRequestPayload{
+				RequestID: "arb-preview-0001", ActionID: 999999,
+			})
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			jobID := park(t, jobs, "wr_arb_admitted", handoffWork())
+			runSyncAs(t, b, sessA, helloAs("1.2.3"))
+			runSyncAs(t, b, sessB, helloAs("1.2.3"))
+
+			msgs, _ := runSyncAs(t, b, sessB, tc.frame(t, jobID))
+			if errMsg := firstOfType(msgs, protocol.MsgError); errMsg != nil &&
+				errMsg.Payload.(*protocol.ErrorPayload).Code == "session_busy" {
+				t.Fatalf("%s from a non-holder was refused: %v", tc.name, msgs)
+			}
+			if firstOfType(msgs, tc.want) == nil {
+				t.Fatalf("%s from a non-holder produced no %s: %v", tc.name, tc.want, msgs)
+			}
+			// Serving a non-holder must not hand it the session slot either.
+			if b.holder == nil || b.holder.ID != sessA {
+				t.Fatalf("holder = %+v, want the session slot left with %s", b.holder, sessA)
+			}
+		})
+	}
+}
+
+// TestNonHolderRoutedAuthorityFramesStayRefused pins the other direction of
+// the same boundary. Widening the whitelist for human-initiated frames must
+// not widen it into the offer/handoff flow: acting on a routed offer from a
+// browser the daemon did not route it to is the silent session fight the
+// arbitration exists to prevent, and handoff_link_request mints the link that
+// flow navigates with.
+func TestNonHolderRoutedAuthorityFramesStayRefused(t *testing.T) {
+	cases := []struct {
+		name  string
+		frame func(t *testing.T, jobID string) json.RawMessage
+	}{
+		{"job_accept", func(t *testing.T, jobID string) json.RawMessage {
+			return inFrame(t, protocol.MsgJobAccept, jobID, map[string]any{})
+		}},
+		{"job_reject", func(t *testing.T, jobID string) json.RawMessage {
+			return inFrame(t, protocol.MsgJobReject, jobID, map[string]any{})
+		}},
+		{"handoff_link_request", func(t *testing.T, jobID string) json.RawMessage {
+			return inFrame(t, protocol.MsgHandoffLinkRequest, "", protocol.HandoffLinkRequestPayload{
+				JobID: jobID, RequestID: "arb-link-0001",
+			})
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			jobID := park(t, jobs, "wr_arb_refused", handoffWork())
+			runSyncAs(t, b, sessA, helloAs("1.2.3"))
+			runSyncAs(t, b, sessB, helloAs("1.2.3"))
+
+			msgs, _ := runSyncAs(t, b, sessB, tc.frame(t, jobID))
+			errMsg := firstOfType(msgs, protocol.MsgError)
+			if errMsg == nil || errMsg.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+				t.Fatalf("%s from a non-holder = %v, want session_busy", tc.name, msgs)
+			}
+		})
 	}
 }
 
