@@ -100,6 +100,11 @@ test("pageAcquireOrigin drops everything a provider URL can carry a secret in", 
 // Stripping it unconditionally named a different work.
 test("doiFromURL only strips an external suffix where the route declares one", () => {
   expect(doiFromURL("https://doi.org/10.1234/article.pdf")).toBe("10.1234/article.pdf");
+  // Real Crossref component DOIs whose own suffix ends `.pdf`. On a resolver the
+  // whole path IS the identifier, so stripping named a document that does not
+  // exist. These are registered works, not invented fixtures.
+  expect(doiFromURL("https://doi.org/10.1107/s2059798323002498/qe5002sup1.pdf")).toBe("10.1107/s2059798323002498/qe5002sup1.pdf");
+  expect(doiFromURL("https://doi.org/10.1107/s160057671801289x/ks5605sup1.pdf")).toBe("10.1107/s160057671801289x/ks5605sup1.pdf");
   expect(doiFromURL("https://dl.acm.org/doi/pdf/10.1145/3630106.3660000.PDF")).toBe("10.1145/3630106.3660000");
   // A declared `doi` parameter is a value, not a file path.
   expect(doiFromURL("https://cdn.example/f?doi=10.1234/article.pdf")).toBe("10.1234/article.pdf");

@@ -72,8 +72,12 @@ a trap the next reader would fall into too.
 
 Known limits, stated rather than implied:
 
-- A real DOI whose own suffix ends `.pdf` on a publisher path is lost to the
-  suffix strip (the Crossref component `10.1107/s160057671801289x/ks5605sup1.pdf`).
+- A real DOI whose own suffix ends `.pdf` is lost **only on a publisher path**,
+  where the suffix cannot be told from a filename. On a DOI resolver it survives:
+  Crossref registers many such component DOIs
+  (`10.1107/s2059798323002498/qe5002sup1.pdf`), and both are pinned. So the loss
+  needs the same component reached through a publisher's PDF route, which is
+  narrower than it first looked.
 - **A legacy SICI DOI containing an encoded delimiter is lost, deliberately.**
   Crossref's own example `10.1002/(SICI)1521-3951(199911)216:1<135::AID-PSSB135>3.0.CO;2-#`
   is written `…2-%23` in a URL; `DOI_STRICT_RE` rejects the decoded `#`. The
