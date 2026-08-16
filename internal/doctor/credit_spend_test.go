@@ -12,12 +12,13 @@ import (
 	"papio/internal/config"
 	"papio/internal/pdf"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 func creditFixture(t *testing.T, fraction float64, hard int) (context.Context, config.Config, *store.Store) {
 	t.Helper()
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)

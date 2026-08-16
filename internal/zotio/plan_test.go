@@ -21,6 +21,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/redact"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
@@ -87,7 +88,7 @@ func (c *planCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage,
 func readyPlanService(t *testing.T, zotioKey string, cli CLI) (*Service, string) {
 	t.Helper()
 	ctx := context.Background()
-	dataDir := t.TempDir()
+	dataDir := storetest.DataDir(t)
 	db, err := store.Open(ctx, dataDir)
 	if err != nil {
 		t.Fatal(err)

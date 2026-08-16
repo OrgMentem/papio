@@ -9,11 +9,12 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 func statusManager(t *testing.T, cfg config.Config, now time.Time) *Manager {
 	t.Helper()
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

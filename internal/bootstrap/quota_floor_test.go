@@ -15,6 +15,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/sourcegate"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 type countingInner struct{ calls int }
@@ -26,7 +27,7 @@ func (c *countingInner) Do(*http.Request) (*http.Response, error) {
 
 func floorTestBudgets(t *testing.T) *budget.Manager {
 	t.Helper()
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 type routerLedger struct {
@@ -620,7 +621,7 @@ func TestStoreLedgerRejectsCorruptRows(t *testing.T) {
 
 func openTestStore(ctx context.Context, t *testing.T) (*store.Store, error) {
 	t.Helper()
-	return store.Open(ctx, t.TempDir())
+	return store.Open(ctx, storetest.DataDir(t))
 }
 
 func itoaNotify(n int64) string {

@@ -28,6 +28,7 @@ import (
 	"papio/internal/protocol"
 	"papio/internal/resolver"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/watch"
 	"papio/internal/work"
 	"papio/internal/zotio"
@@ -74,7 +75,7 @@ func (f *fakeWorkLookup) LookupWork(context.Context, string) (discovery.Discover
 func newTestService(t *testing.T) (*Service, *job.Store) {
 	t.Helper()
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)

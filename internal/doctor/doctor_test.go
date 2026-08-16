@@ -21,6 +21,7 @@ import (
 	"papio/internal/ownership"
 	"papio/internal/pdf"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/update"
 	"papio/internal/work"
 	"papio/internal/zotio"
@@ -37,7 +38,7 @@ func executable(t *testing.T) string {
 
 func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	// t.TempDir() on Go 1.26 with umask 022 creates 0755 (Mkdir 0777).
 	// doctor now enforces 0700, so ensure the temp data dir is private.
 	if err := os.Chmod(data, 0o700); err != nil {
@@ -85,7 +86,7 @@ func TestRunReadyProfilePassesWithoutLeakingSecrets(t *testing.T) {
 
 func TestRunNamesUnknownEffectPermitAndRecoveryCommand(t *testing.T) {
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +160,7 @@ func TestRunNamesUnknownEffectPermitAndRecoveryCommand(t *testing.T) {
 
 func TestRunNamesLegacyEffectBlockerAndExactRecovery(t *testing.T) {
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)
@@ -262,7 +263,7 @@ func TestCheckAdoptionRootTimesOutAndFailsWithGrantRemediation(t *testing.T) {
 // abandoned.
 func TestRunReportsAcquisitionsNobodyEverCollected(t *testing.T) {
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)
@@ -313,7 +314,7 @@ func TestRunReportsAcquisitionsNobodyEverCollected(t *testing.T) {
 
 func TestRunPassesWhenEveryAcquisitionWasCollected(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(ctx, t.TempDir())
+	db, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +350,7 @@ func uncollectedDetail(t *testing.T, ctx context.Context, db *store.Store, want 
 // daemon. A doctor check is a new element in a list that already exists.)
 func TestRunReportsActionsThatHaveGoneQuiet(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(ctx, t.TempDir())
+	db, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +387,7 @@ func TestRunReportsActionsThatHaveGoneQuiet(t *testing.T) {
 
 func TestRunPassesWhenNoActionHasGoneQuiet(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(ctx, t.TempDir())
+	db, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1065,7 +1066,7 @@ func documentDeliveryTestConfig(dataDir string) config.Config {
 
 func TestRunDocumentDeliveryDistinguishesDeclaredFromPass(t *testing.T) {
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)
@@ -1123,7 +1124,7 @@ func TestRunDocumentDeliveryDistinguishesDeclaredFromPass(t *testing.T) {
 
 func TestRunDocumentDeliveryLiveAcceptanceFlipsResultVerdict(t *testing.T) {
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)
@@ -1189,7 +1190,7 @@ func TestRunDocumentDeliveryLiveAcceptanceFlipsResultVerdict(t *testing.T) {
 // acceptance case above.
 func TestRunDocumentDeliveryResultLineForPermanentlyPrefillOnlyProvider(t *testing.T) {
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)
@@ -1254,7 +1255,7 @@ func TestRunDocumentDeliveryFulfillmentLine(t *testing.T) {
 	}
 
 	t.Run("absent patron_web_base_url warns fulfillment none, even once auto-capable for submission", func(t *testing.T) {
-		data := t.TempDir()
+		data := storetest.DataDir(t)
 		db, err := store.Open(ctx, data)
 		if err != nil {
 			t.Fatal(err)
@@ -1276,7 +1277,7 @@ func TestRunDocumentDeliveryFulfillmentLine(t *testing.T) {
 	})
 
 	t.Run("configured patron_web_base_url passes fulfillment patron_web", func(t *testing.T) {
-		data := t.TempDir()
+		data := storetest.DataDir(t)
 		db, err := store.Open(ctx, data)
 		if err != nil {
 			t.Fatal(err)
@@ -1314,7 +1315,7 @@ func TestRunDocumentDeliveryPollHealth(t *testing.T) {
 	}
 
 	t.Run("no live requests skips", func(t *testing.T) {
-		data := t.TempDir()
+		data := storetest.DataDir(t)
 		db, err := store.Open(ctx, data)
 		if err != nil {
 			t.Fatal(err)
@@ -1329,7 +1330,7 @@ func TestRunDocumentDeliveryPollHealth(t *testing.T) {
 	})
 
 	t.Run("3+ consecutive poll failures warns degraded", func(t *testing.T) {
-		data := t.TempDir()
+		data := storetest.DataDir(t)
 		db, err := store.Open(ctx, data)
 		if err != nil {
 			t.Fatal(err)
@@ -1379,7 +1380,7 @@ func TestRunDocumentDeliveryPollHealth(t *testing.T) {
 	// rather than shipping a remedy that names a command that does not
 	// exist — the P2 gap this test closes.
 	t.Run("contract drift names the real papio delivery resume command", func(t *testing.T) {
-		data := t.TempDir()
+		data := storetest.DataDir(t)
 		db, err := store.Open(ctx, data)
 		if err != nil {
 			t.Fatal(err)

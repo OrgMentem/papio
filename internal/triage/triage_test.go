@@ -17,6 +17,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/resolver"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/watch"
 	"papio/internal/work"
 )
@@ -29,7 +30,7 @@ func (source staticSource) SnapshotItems(context.Context, *sql.Tx) ([]Item, erro
 
 func triageTestService(t *testing.T) (*Service, *watch.Store, *job.Store) {
 	t.Helper()
-	db, err := store.Open(context.Background(), t.TempDir())
+	db, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

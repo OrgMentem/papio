@@ -13,6 +13,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
@@ -277,7 +278,7 @@ func TestSchedulerRunsMaintenanceHookWithoutAffectingWorkers(t *testing.T) {
 
 func TestSchedulerRecoversExpiredLease(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(ctx, t.TempDir())
+	db, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

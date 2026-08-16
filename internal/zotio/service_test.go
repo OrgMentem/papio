@@ -12,6 +12,7 @@ import (
 
 	"papio/internal/protocol"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 type fakeCLI struct {
@@ -300,7 +301,7 @@ func TestLookupWorksClassifiesOwnedByPMID(t *testing.T) {
 // "queued 1" notifications. Live requests must report as skipped.
 func TestQueueMissingPDFSkipsItemsWithLiveJobs(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -383,7 +384,7 @@ func TestQueueMissingPDFBoundsSkippedOutputWhileScanning(t *testing.T) {
 // disabled window (zero) preserves the historical retry-every-run behavior.
 func TestQueueMissingPDFUnavailableCooldown(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir())
+	st, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

@@ -16,6 +16,7 @@ import (
 	"papio/internal/redact"
 	"papio/internal/resolver"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
@@ -31,7 +32,7 @@ func readyFixture(t *testing.T) (*Exporter, string, string) {
 func readyFixtureWithIdentity(t *testing.T, identity string) (*Exporter, string, string) {
 	t.Helper()
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)

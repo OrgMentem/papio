@@ -8,11 +8,12 @@ import (
 	"time"
 
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 func TestAllocateReturnsExistingNonterminalGrab(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +43,7 @@ func count(t *testing.T, db *sql.DB, query string, args ...any) int {
 
 func TestAllocateEffectSteering(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +92,7 @@ func TestAllocateEffectSteering(t *testing.T) {
 
 func TestAllocateEffectPrepareErrorRollsBack(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestAllocateEffectPrepareErrorRollsBack(t *testing.T) {
 
 func TestAllocateEffectBusyLeavesZero(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +156,7 @@ func TestAllocateEffectBusyLeavesZero(t *testing.T) {
 
 func TestAllocateEffectLegacyBlockerBusy(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +193,7 @@ func TestAllocateEffectLegacyBlockerBusy(t *testing.T) {
 
 func TestAllocateEffectExistingNoPrepare(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +234,7 @@ func TestAllocateEffectExistingNoPrepare(t *testing.T) {
 
 func TestMarkQuarantinedSettlesPermit(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +266,7 @@ func TestMarkQuarantinedSettlesPermit(t *testing.T) {
 
 func TestMarkFailedValidationSettlesPermit(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +294,7 @@ func TestMarkFailedValidationSettlesPermit(t *testing.T) {
 
 func TestMarkQuarantinedLegacyNoPermit(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +315,7 @@ func TestMarkQuarantinedLegacyNoPermit(t *testing.T) {
 
 func TestMarkAbandonedSettlesPermit(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +343,7 @@ func TestMarkAbandonedSettlesPermit(t *testing.T) {
 
 func TestMarkAbandonedLegacyNoPermit(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +364,7 @@ func TestMarkAbandonedLegacyNoPermit(t *testing.T) {
 
 func TestAbandonStaleAwaitingRetainsOccupying(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +401,7 @@ func TestAbandonStaleAwaitingRetainsOccupying(t *testing.T) {
 }
 func TestAbandonStaleAwaitingLeavesLegacyBlockerBusyUntilExactEvidence(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +460,7 @@ func TestAbandonStaleAwaitingLeavesLegacyBlockerBusyUntilExactEvidence(t *testin
 }
 func TestAllocateEffectExactRequestReplayRequiresHeldGeneration(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +485,7 @@ func TestAllocateEffectExactRequestReplayRequiresHeldGeneration(t *testing.T) {
 
 func TestMarkAbandonedForRequestFencesKnownGrabID(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +554,7 @@ func TestMarkAbandonedForRequestFencesKnownGrabID(t *testing.T) {
 }
 func TestAllocateEffectSettledLegacyPDFTombstoneAllowsFreshRequest(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +659,7 @@ func TestLegacyPDFGrabTransitionsSettleExactBlocker(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := store.Open(ctx, t.TempDir())
+			s, err := store.Open(ctx, storetest.DataDir(t))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -737,7 +738,7 @@ func TestLegacyPDFGrabTransitionsSettleExactBlocker(t *testing.T) {
 
 func TestByJobID(t *testing.T) {
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,6 +10,7 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 // keyedAndAnon is the OpenAlex identity pair AcquireAny arbitrates between: the
@@ -121,7 +122,7 @@ func TestAcquireAnyAdvisoryNoFallback(t *testing.T) {
 }
 
 func TestAcquireAnyFailsClosedOnSnapshotError(t *testing.T) {
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

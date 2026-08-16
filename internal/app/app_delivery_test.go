@@ -23,6 +23,7 @@ import (
 	"papio/internal/protocol"
 	"papio/internal/resolver"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
@@ -36,7 +37,7 @@ import (
 func newDeliveryTestService(t *testing.T) (*Service, *job.Store, *delivery.Service) {
 	t.Helper()
 	ctx := context.Background()
-	data := t.TempDir()
+	data := storetest.DataDir(t)
 	db, err := store.Open(ctx, data)
 	if err != nil {
 		t.Fatal(err)

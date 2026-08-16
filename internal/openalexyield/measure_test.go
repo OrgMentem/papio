@@ -13,6 +13,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/redact"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
@@ -24,7 +25,7 @@ import (
 func newFixtureStore(t *testing.T) (*job.Store, *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, t.TempDir())
+	s, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

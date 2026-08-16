@@ -3,8 +3,13 @@
 build:
 	go build ./...
 
+# -race because CI runs -race, and a suite that is green without it proves less
+# than it looks: two shipped defects (a double cmd.Wait on one *exec.Cmd, and a
+# ProcessState read racing the reaper that writes it) were invisible locally and
+# caught only by CI. Matching the flag here is what makes "suite green" mean the
+# same thing in both places.
 test:
-	go test ./...
+	go test -race ./...
 
 vet:
 	go vet ./...

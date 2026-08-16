@@ -22,11 +22,12 @@ import (
 	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 func testService(t *testing.T, now time.Time) *Service {
 	t.Helper()
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

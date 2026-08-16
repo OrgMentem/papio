@@ -13,6 +13,7 @@ import (
 	"papio/internal/budget"
 	"papio/internal/config"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 type countingHTTP struct{ calls int }
@@ -24,7 +25,7 @@ func (c *countingHTTP) Do(*http.Request) (*http.Response, error) {
 
 func testGuardedBudget(t *testing.T) *budget.Manager {
 	t.Helper()
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

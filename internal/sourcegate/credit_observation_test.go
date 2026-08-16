@@ -13,6 +13,7 @@ import (
 	"papio/internal/budget"
 	"papio/internal/config"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 type recordingCredit struct {
@@ -126,7 +127,7 @@ func TestObserverCreditsUsedSeedsCounter(t *testing.T) {
 }
 
 func TestObserverCreditsUsedSeedsDatabase(t *testing.T) {
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +167,7 @@ func (p *prepaidLatchCredit) ObservePrepaidRemaining(ctx context.Context, source
 }
 
 func TestObserverPrepaidDropTriggersStickyClosure(t *testing.T) {
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +201,7 @@ func TestObserverPrepaidDropTriggersStickyClosure(t *testing.T) {
 }
 
 func TestObserverFailedPrepaidPersistLeavesLatch(t *testing.T) {
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +237,7 @@ func TestObserverFailedPrepaidPersistLeavesLatch(t *testing.T) {
 }
 
 func TestObserverSkipsCreditObservationWithoutObserver(t *testing.T) {
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

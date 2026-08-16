@@ -11,6 +11,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/triage"
 	"papio/internal/watch"
 	"papio/internal/work"
@@ -18,7 +19,7 @@ import (
 
 func pulseJobs(t *testing.T) *job.Store {
 	t.Helper()
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

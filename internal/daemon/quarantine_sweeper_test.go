@@ -12,12 +12,13 @@ import (
 	"papio/internal/artifact"
 	"papio/internal/job"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
 func TestSchedulerSweepsOnlyTerminalQuarantine(t *testing.T) {
 	ctx := context.Background()
-	dataDir := t.TempDir()
+	dataDir := storetest.DataDir(t)
 	db, err := store.Open(ctx, dataDir)
 	if err != nil {
 		t.Fatalf("open job store: %v", err)

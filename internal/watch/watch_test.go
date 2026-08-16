@@ -16,13 +16,14 @@ import (
 	"papio/internal/notify"
 	"papio/internal/protocol"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 	"papio/internal/zotio"
 )
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	db, err := store.Open(context.Background(), t.TempDir())
+	db, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

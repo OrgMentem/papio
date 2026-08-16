@@ -13,6 +13,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
@@ -105,7 +106,7 @@ func (f *slowTagCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessa
 
 func tagTestService(t *testing.T, cli CLI) (*Service, *job.Store) {
 	t.Helper()
-	db, err := store.Open(context.Background(), t.TempDir())
+	db, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

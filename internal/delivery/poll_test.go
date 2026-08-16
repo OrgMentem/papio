@@ -15,6 +15,7 @@ import (
 
 	"papio/internal/illiad"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 // testServiceClock is testService with a mutable clock, so a test can
@@ -22,7 +23,7 @@ import (
 // Request Finished delayed reconciliation pass, 404 propagation).
 func testServiceClock(t *testing.T) (*Service, *time.Time) {
 	t.Helper()
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

@@ -22,6 +22,7 @@ import (
 	"papio/internal/notify"
 	"papio/internal/resolver"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
@@ -664,7 +665,7 @@ func TestEmptyAffectedDOIDedupsByNotice(t *testing.T) {
 
 func testStore(t *testing.T) *store.Store {
 	t.Helper()
-	db, err := store.Open(context.Background(), t.TempDir())
+	db, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

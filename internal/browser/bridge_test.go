@@ -1256,7 +1256,7 @@ func TestTriageCountsNegotiatesAuthField(t *testing.T) {
 // database that poll() and the rest of Sync depend on.
 func breakTriage(t *testing.T, b *Bridge) {
 	t.Helper()
-	brokenDB, err := store.Open(context.Background(), t.TempDir())
+	brokenDB, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,11 +12,12 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 func testCreditManager(t *testing.T, policy CreditPolicy) (*Manager, *store.Store) {
 	t.Helper()
-	s, err := store.Open(context.Background(), t.TempDir())
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
