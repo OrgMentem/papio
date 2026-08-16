@@ -142,11 +142,21 @@ There is also a link check, because `zensical build` prints a broken link as an
   previously-executed signed binary poisons the kernel's signature cache and the next
   exec dies with SIGKILL (exit 137). Use `mv` or `rm` first so the copy gets a fresh
   inode.
-- **A new store migration bumps `user_version`, and three tests hardcode the number**:
-  `internal/cli/clean_install_test.go` ("schema version N", twice),
-  `internal/doctor/doctor_test.go`, `internal/store/migrate_forward_test.go`.
+- **A new store migration bumps `user_version`, and FOUR tests hardcode the number**:
+  `internal/cli/clean_install_test.go` ("schema version N", twice, plus a
+  `user_version` compare), `internal/doctor/doctor_test.go`,
+  `internal/store/migrate_forward_test.go` (twice), and — the one that gets
+  missed, because it is the only site that names *two* numbers —
+  `internal/store/migrate_guard_test.go`'s `TestOpenRefusesSchemaNewerThanBinary`,
+  which sets `user_version` to latest+1 and asserts the exact refusal string
+  `"database schema version <N+1> is newer than this binary supports (<N>);
+  refusing to open"`. Its sibling `TestGuardCapableSchema33RefusesSchema34`
+  deliberately models a historical ceiling and must NOT be bumped.
   `go test ./...` fails after adding `internal/store/migrations/NNNN_*.sql` until
-  all three assertions are bumped.
+  every one of those assertions is bumped. `migrate_forward_test.go`'s fixture
+  selects migrations with `migrationNumber(filename) > 33` rather than a
+  hardcoded prefix list, so its bound stays 33 and new migrations need no entry
+  there.
 - **Adding a `job.TerminalReason` is three edits, and the third is the one you
   forget**: the const block and `NormalizeTerminalReason`'s switch (both
   `internal/job/job.go`), plus `terminalReasonWriters` in
