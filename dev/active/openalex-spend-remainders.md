@@ -364,6 +364,25 @@ So:
  Put credit accounting behind the source's own policy, so `core`/`openaire` can
  adopt the floor later without a second mechanism, and do not let the fuse's
  credit-unit vocabulary leak into sources whose limit is a rate.
+- **Open, measured, not yet built: papio's own OpenAIRE bucket refuses ~42× more
+  often than OpenAIRE does.** Re-measured against the operator's live store on
+  2026-08-16, last 7 days: `openaire` recorded **27,375** attempts of which
+  **26,738** ended `budget_blocked` and only **632** succeeded — **3.77 requests per
+  hour actually reaching the wire** against a documented keyless ceiling of
+  **60/hour**. So ~94% of a free allowance goes unused while papio declines its own
+  work, and the shape is papio's config, not the provider's: `RatePerSec: 0.016,
+  Burst: 1` (`internal/config/config.go:625`) spreads permits evenly while demand
+  arrives in bursts, so a burst of 1 refuses the second caller in the same second
+  and the unused permits never accumulate. `openalex` shows the same pattern less
+  starkly (40,060 of 48,547 blocked), but there the refusals are partly the fuse
+  doing its job, so OpenAIRE is the clean case. Fixing it recovers throughput on a
+  free tier and costs nothing to get wrong-way — raising burst spreads bursts into
+  an allowance already ours.
+  **This is not scheduled here because it needs a live per-provider smoke first,
+  and that is the operator's call:** capture `x-ratelimit-used` before and after a
+  burst and confirm the used count stays under the *documented* 60/hour, not under
+  the live `limit: 7199` header, which the bullet above already flags as
+  untrustworthy. Do not tighten or loosen pacing from that header alone.
 
 **Requirement: a capability boundary, stated as something Go can enforce.** An
 earlier draft said to make the unguarded transport "unconstructible from outside".
