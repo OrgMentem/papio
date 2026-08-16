@@ -758,7 +758,9 @@ func (s *Service) ambiguousReplayError(result *ApplyResult, planID string) error
 	// that preserves the original context sentinel so callers remain able to
 	// detect ambiguous/cancellable failures with errors.Is(..., context.Canceled)
 	// or errors.Is(..., context.DeadlineExceeded) across the replay path.
-	sentinel := context.Canceled
+	// Declared without a value: every arm below assigns one, and seeding it with
+	// context.Canceled hid that from the reader and from the linter.
+	var sentinel error
 	switch {
 	case strings.Contains(result.Error, "timed out"):
 		sentinel = context.DeadlineExceeded

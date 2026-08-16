@@ -271,7 +271,9 @@ func (l *NotificationLedger) ReserveDesktop(ctx context.Context, id int64, now t
 	if err != nil {
 		return false, err
 	}
-	rollback := func(e error) (bool, error) { tx.Rollback(); return false, e }
+	// The caller's error is the one worth reporting; a rollback that also fails
+	// adds nothing it can act on, and the transaction is abandoned either way.
+	rollback := func(e error) (bool, error) { _ = tx.Rollback(); return false, e }
 	if maxPerHour > 0 {
 		cutoff := now.Add(-time.Hour)
 		var used int
@@ -282,7 +284,9 @@ func (l *NotificationLedger) ReserveDesktop(ctx context.Context, id int64, now t
 			return rollback(err)
 		}
 		if used >= maxPerHour {
-			tx.Rollback()
+			if err := tx.Rollback(); err != nil {
+				return false, err
+			}
 			return false, nil
 		}
 	}
@@ -296,7 +300,9 @@ func (l *NotificationLedger) ReserveDesktop(ctx context.Context, id int64, now t
 		return rollback(err)
 	}
 	if changed != 1 {
-		tx.Rollback()
+		if err := tx.Rollback(); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 	if err := tx.Commit(); err != nil {
@@ -378,7 +384,9 @@ func (l *NotificationLedger) SupersedeAndUpsertCheckpoint(ctx context.Context, a
 		return NotificationRecord{}, err
 	}
 	rollback := func(err error) (NotificationRecord, error) {
-		tx.Rollback()
+		// The caller's error is the one worth reporting; a rollback that also
+		// fails adds nothing it can act on.
+		_ = tx.Rollback()
 		return NotificationRecord{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE notification_intents SET desktop_state='superseded'

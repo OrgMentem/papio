@@ -42,8 +42,6 @@ const (
 	EvidenceIndependent = "independent"
 )
 
-var captureHostRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:[0-9]{1,5})?$`)
-
 var sanitizerFixtureHeader = regexp.MustCompile(`^<!-- papio-fixture provider="([^"]+)" scenario="([^"]+)" origin="([^"]+)" captured="([^"]+)" -->$`)
 
 // hostDirName returns a filesystem-safe, injective directory name for the
@@ -73,7 +71,7 @@ func hostDirName(host string) string {
 			continue
 		}
 		// Percent-encode any other byte (including ':', '/', '%', ' ').
-		b.WriteString(fmt.Sprintf("%%%02X", c))
+		fmt.Fprintf(&b, "%%%02X", c)
 	}
 	result := b.String()
 	if result == "" || result == "." || result == ".." {
@@ -91,22 +89,6 @@ func hostDirName(host string) string {
 		result = result[:253]
 	}
 	return result
-}
-
-// isValidCaptureHost reports whether host matches the bare-origin grammar
-// (hostname, optional :port; no scheme, path, query, or spaces). It mirrors
-// captureHostRE but also rejects empty and overlong values.
-func isValidCaptureHost(host string) bool {
-	if host == "" || len(host) > 253 {
-		return false
-	}
-	if strings.ContainsAny(host, " /?#") {
-		return false
-	}
-	if strings.Contains(host, "://") {
-		return false
-	}
-	return captureHostRE.MatchString(host)
 }
 
 // IsSanitizedFixture verifies the daemon-recognized provenance marker before
@@ -972,30 +954,6 @@ func validScenario(scenario string) bool {
 	default:
 		return false
 	}
-}
-
-func safeHost(host string) string {
-	return hostDirName(host)
-}
-
-func _legacySafeHost(host string) string {
-	var segment strings.Builder
-	for _, r := range strings.ToLower(strings.TrimSpace(host)) {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '-':
-			segment.WriteRune(r)
-		default:
-			segment.WriteByte('-')
-		}
-	}
-	result := strings.Trim(segment.String(), ".-")
-	if result == "" || result == "." || result == ".." {
-		return "host"
-	}
-	if len(result) > 253 {
-		return result[:253]
-	}
-	return result
 }
 
 func metadataPath(path string) string {

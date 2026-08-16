@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -24,25 +23,17 @@ func isProcessGone(t *testing.T, cmd *exec.Cmd) bool {
 	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 		return true
 	}
-	if runtime.GOOS != "windows" {
-		err := syscall.Kill(cmd.Process.Pid, 0)
-		if err != nil && errors.Is(err, syscall.ESRCH) {
-			return true
-		}
-		if err != nil {
-			return false
-		}
-		// Signal 0 succeeded — still alive. Double-check via ProcessState.
-		return false
+	// This file is //go:build !windows, so signal 0 is always available here.
+	err := syscall.Kill(cmd.Process.Pid, 0)
+	if err != nil && errors.Is(err, syscall.ESRCH) {
+		return true
 	}
-	// Windows: ProcessState is the only reliable indicator after Wait.
-	return cmd.ProcessState != nil
+	// Either the signal landed (still alive) or it failed for another reason,
+	// which is not evidence the process is gone.
+	return false
 }
 
 func TestAutostarterTerminatesOrphanOnReadinessTimeout(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("orphan termination uses POSIX process groups; covered on unix")
-	}
 	dir := t.TempDir()
 	socket := filepath.Join(dir, "papio.sock")
 	var launched *exec.Cmd
@@ -93,9 +84,6 @@ func TestAutostarterTerminatesOrphanOnReadinessTimeout(t *testing.T) {
 }
 
 func TestAutostarterEscalatesToHardKillWhenGracefulIgnored(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("SIGTERM-ignore escalation is POSIX-specific")
-	}
 	dir := t.TempDir()
 	socket := filepath.Join(dir, "papio.sock")
 	var launched *exec.Cmd
@@ -144,9 +132,6 @@ func TestAutostarterEscalatesToHardKillWhenGracefulIgnored(t *testing.T) {
 }
 
 func TestAutostarterLeavesReadyDaemonRunning(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("ready-detach semantics use POSIX process groups")
-	}
 	dir := t.TempDir()
 	socket := filepath.Join(dir, "papio.sock")
 	var launched *exec.Cmd

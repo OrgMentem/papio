@@ -154,13 +154,13 @@ func (s *Store) migrate(ctx context.Context, migrationCeiling int) error {
 		// swallowed behind the original error.
 		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
 			if rbErr := tx.Rollback(); rbErr != nil {
-				return fmt.Errorf("applying %s: %w (rollback also failed: %v)", name, err, rbErr)
+				return fmt.Errorf("applying %s: %w (rollback also failed: %w)", name, err, rbErr)
 			}
 			return fmt.Errorf("applying %s: %w", name, err)
 		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", num)); err != nil {
 			if rbErr := tx.Rollback(); rbErr != nil {
-				return fmt.Errorf("bumping user_version for %s: %w (rollback also failed: %v)", name, err, rbErr)
+				return fmt.Errorf("bumping user_version for %s: %w (rollback also failed: %w)", name, err, rbErr)
 			}
 			return fmt.Errorf("bumping user_version for %s: %w", name, err)
 		}

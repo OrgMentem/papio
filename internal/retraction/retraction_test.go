@@ -631,7 +631,7 @@ func TestGenuineDuplicateCollapsesToOne(t *testing.T) {
 		Now: func() time.Time { return now },
 	})
 	sentinel2.mu.Lock()
-	if err := sentinel2.writeCache(cache{Version: cacheVersion, CheckedAt: earlier, Notices: map[string]Finding{findingKey(dup): Finding{DOI: dup.DOI, Nature: dup.Nature, NoticeDOI: dup.NoticeDOI, NoticedAt: earlier}}}); err != nil {
+	if err := sentinel2.writeCache(cache{Version: cacheVersion, CheckedAt: earlier, Notices: map[string]Finding{findingKey(dup): {DOI: dup.DOI, Nature: dup.Nature, NoticeDOI: dup.NoticeDOI, NoticedAt: earlier}}}); err != nil {
 		sentinel2.mu.Unlock()
 		t.Fatalf("seed cache: %v", err)
 	}

@@ -127,10 +127,6 @@ type tdmRoundTrip func(*http.Request) (*http.Response, error)
 
 func (f tdmRoundTrip) Do(r *http.Request) (*http.Response, error) { return f(r) }
 
-type tdmTransportFunc func(*http.Request) (*http.Response, error)
-
-func (f tdmTransportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
 func TestDoAcceptsSecureHTTPClientAndRejectsOpaqueClient(t *testing.T) {
 	resolvertest.CheckDoRejectsOpaqueClient(t, errUnsafeHTTPClient, func(client resolvertest.HTTPClient) (*http.Response, error) {
 		req, err := http.NewRequest(http.MethodGet, "https://metadata.example/works", nil)

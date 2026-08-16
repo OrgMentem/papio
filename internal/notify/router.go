@@ -392,7 +392,10 @@ func (r *Router) audit(ctx context.Context, kind string, row Record, reason stri
 	if r.activity == nil {
 		return
 	}
-	r.activity.RecordSystemEvent(ctx, kind, map[string]any{"category": row.Intent.Category, "event_kind": row.Intent.EventKind, "aggregate_key": row.Intent.AggregateKey, "phase": row.Intent.Phase, "count": row.Count, "reason": reason})
+	// The audit trail is advisory: it explains a routing decision after the
+	// fact. A failed write must not change the decision itself, so the error is
+	// discarded here deliberately rather than propagated into delivery.
+	_ = r.activity.RecordSystemEvent(ctx, kind, map[string]any{"category": row.Intent.Category, "event_kind": row.Intent.EventKind, "aggregate_key": row.Intent.AggregateKey, "phase": row.Intent.Phase, "count": row.Count, "reason": reason})
 }
 
 // ErrPreviewCountUnrepresentable reports a preview count a category can never
