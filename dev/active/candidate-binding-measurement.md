@@ -1,181 +1,295 @@
 # Measuring candidate binding before rebuilding it
 
-Status: plan (2026-08-16). Workstream 4 of the acquisition roadmap. Must
-complete and report before `candidate_auto_bind/2` is designed, per the
-disablement recorded in ADR-0020 and `dev/active/send-pdf-candidate-binding.md`.
+Status: plan v2 (2026-08-16). Workstream 4 of the acquisition roadmap, gating
+workstream 3. Revised after three parallel plan reviews (blind-spot,
+plan-versus-source, statistics/method), all three returning NEEDS REVISION on
+v1. Every correction below is anchored to source; v1's overstated claims are
+corrected in place rather than quietly dropped, because the overstatements were
+the reviewable part.
 
-## Why this comes before the redesign
+## Why the instrument comes before the rule
 
-`candidate_auto_bind/1` was withdrawn (commit `0c85a52`) because it read a
-*cited* identifier as the document identifying *itself*. Four review rounds
-examined its gates individually and missed the composition. The reason they
-could miss it is the instrument: the gate corpus
-(`internal/pdf/testdata/candidatecorpus/manifest.json`, 36 cases) is
-hand-authored, and its hard negatives supplied the ingredients of the failure
-*separately* — a foreign DOI with unrelated title and authors, a
-conference/journal pair separated by year — and never assembled them into one
-relational block.
+`candidate_auto_bind/1` was withdrawn (commit `0c85a52`) after a pro-tier
+review found five deterministic wrong-accept paths in papio's cardinal failure
+class: the wrong paper filed under a right citation. Its root error was reading
+a *cited* identifier as the document identifying *itself* — an erratum,
+supplement or journal expansion printing "Extended from DOI X", with its own
+DOI past the 1 KiB window the safety veto reads.
 
-So the corpus could not fail. Building `/2` against the same instrument would
-reproduce exactly that, one rule generation later. The rule of three also puts
-a floor on what the synthetic corpus can ever claim: ten predicate-reaching
-cases at zero errors bounds the error rate at roughly 30%, which is not a
-safety argument.
+The synthetic gate corpus reported zero wrong-accepts at the time because its
+hard negatives supplied the ingredients of that failure separately and never
+composed them into one document. Four review rounds examined gates
+individually and missed the composition.
 
-`cmd/identity-corpus` already exists and already earned its keep — it found the
-printed-title weakness that no reviewer had (52 wrong accepts, all through one
-gate), and it killed a plausible-sounding trailing-superscript tolerance that
-measured as a no-op. This plan extends that instrument to the decision
-auto-binding actually makes, rather than inventing a second one.
+What this justifies is narrow and worth stating precisely, because v1 of this
+plan overclaimed it. The corpus was not incapable of expressing the failure in
+principle; it did not contain it. Since the withdrawal it does: the five
+composite documents are held as `known_failing` cases
+(`internal/pdf/testdata/candidatecorpus/manifest.json`, cases at lines
+1386-1603), and the corpus grew 33 → 38 cases. It also already contains
+`true-absent` and `true-absent-no-doi` cases (manifest lines 389-423, 895-929),
+so "the target-absent case was never measured" is **false** of the synthetic
+corpus and true only of the real-library instrument.
 
-## What the instrument measures today, and the three gaps
+The honest argument is therefore about *population*, not expressiveness:
 
-`identitycorpus.Measure` scores `pdf.MatchIdentity` pairwise over ~632
-documents from a real Zotero library: each document against its own curated
-metadata (must `pass`) and against every other document's (must never `pass`),
-reported as `Correct`/`Mismatch` × `Pass`/`Review`/`Reject` with a wrong-accept
-list. Two surviving wrong accepts are documented and understood.
+- The synthetic corpus is hand-authored, so it measures the cases someone
+  thought of. The rule of three bounds what it can ever claim — ten
+  predicate-reaching cases at zero errors bounds the error rate near 30%.
+- The real-library instrument (`internal/identitycorpus`) measures a real
+  population but scores the wrong decision: `pdf.MatchIdentity` **pairwise**,
+  one document against one metadata record.
+- Nothing measures `pdf.QualifyCandidate` or `pdf.SelectAutoBindCandidate`
+  against a real population at all. `QualifyCandidate` does have synthetic gate
+  tests (`internal/pdf/candidate_gate_test.go:155-356`), so v1's flat "never
+  scored" was an overstatement; "never scored against a real library" is the
+  claim that holds.
 
-Auto-binding makes a different decision in three ways this cannot see.
+## The admission condition, which defines the corpus
 
-1. **It is 1-of-N, not 1-of-1.** The daemon holds a pool of jobs awaiting a
-   manual download (`job.ListCandidateEligibleJobsTx`) and must pick at most
-   one. Pairwise scoring measures a predicate; it does not measure a
-   *selection*. Joint false-accept probability grows with pool size, and
-   nothing today reports how it grows.
-2. **It must abstain when the true target is absent.** The dominant real case
-   is a PDF whose paper is not in the pending pool at all — a supplement, a
-   reference someone sent you, a paper you grabbed before requesting it. The
-   pairwise corpus has no notion of a pool without a right answer, so the
-   behaviour that matters most for an autonomous rule is unmeasured.
-3. **It scores the wrong predicate.** Auto-bind ran
-   `pdf.QualifyCandidate` (`internal/pdf/candidate_select.go`), a five-gate
-   rule documented as stricter than `MatchIdentity`. That claim was wrong in
-   the one direction that mattered — an erratum printing the target's title,
-   authors, year *and its own DOI* passed all five — and `QualifyCandidate` has
-   never been scored against a real library at all.
+This is the correction that reshapes the plan. In production,
+`SelectAutoBindCandidate` is reached **only** from `processSettledGrab`'s
+`if len(dois) == 0` branch (`internal/browser/bridge.go:7565-7592`), where
+`dois` comes from `FrontMatterDOIs` over the same 1 KiB window
+`CheckConclusiveIdentity` uses. A document with a DOI in its front matter never
+enters candidate selection.
 
-Two further gaps are about corpus content rather than shape:
+So feeding every library document into the measurement would measure a
+population production never sees, and `QualifyCandidate` would short-circuit at
+`GateConclusiveVeto` (`candidate_select.go:139-144`) for most of them. The
+synthetic corpus already enforces this: `candidate_gate_test.go:265-285`
+requires DOI-less inputs for the predicate gates.
 
-4. **The composite class does not exist in the corpus.** Errata, supplements,
-   comments, retraction notices, cover sheets and journal expansions of
-   conference papers are the documents that defeat the rule, and they are real
-   library contents, not synthetic constructions. None are labelled today.
-5. **The operator's own backlog has never been replayed.** ~27 rows awaiting
-   manual download, plus historical grab metadata, are the only sample drawn
-   from the actual distribution the rule would run against.
+**Therefore: the measured corpus is the DOI-less subset** — documents whose
+`FrontMatterDOIs` over the production window is empty. Reporting the size of
+that subset is itself a primary finding, because it bounds everything the
+instrument can claim, and nobody currently knows it. A library where 40 of 632
+documents are DOI-less supports very different conclusions than one where 400
+are.
+
+Every trial must also record its **observed terminal gate**, so a cell that
+looks clean because nothing reached the gate under test is visibly distinct
+from one that reached it and passed. The gate rule has **seven**
+`CandidateGate` constants (`candidate_select.go:71-78`), not five as v1 said;
+non-article and correction markers are gates in their own right.
+
+## What the existing instrument measures, and the real gaps
+
+`identitycorpus.Measure` scores `MatchIdentity` over ~632 documents from the
+operator's Zotero library, each against its own metadata (must pass) and
+against every other document's *except* pairs it skips as the same work or the
+same document (`measure.go:247-249` — v1's "every other document's" was
+imprecise). Two surviving wrong accepts are documented and understood.
+
+Four gaps, each now stated as a decision the instrument cannot reach rather
+than a capability it lacks:
+
+1. **It measures a predicate, not a selection.** Production picks at most one
+   from a pool via `SelectAutoBindCandidate`. Pairwise scoring cannot express
+   how false-accept grows with pool size.
+2. **It has no target-absent semantics.** The everyday case — a PDF whose paper
+   is not pending at all — has no pairwise analogue.
+3. **It scores a different predicate** than production's five reachable
+   qualification gates.
+4. **The composite class is invisible to its loader.** `Load`'s
+   `dedupOnePerParent` (`corpus.go:165`, `555-584`) keeps one PDF per
+   bibliographic parent and explicitly drops secondary attachments including
+   supplements — exactly the class that defeats the rule. The composite arm is
+   unbuildable without an all-attachments mode; v1 did not notice this and
+   would have produced an empty arm reading as a clean one.
 
 ## Deliverables
 
-### 1. A candidate-set measurement mode
+### 1. Candidate-set measurement over the DOI-less corpus
 
-`identitycorpus.MeasureCandidateSets(docs, opts) CandidateReport` beside the
-existing `Measure`, scoring the real selection path — `QualifyCandidate` and
-whatever `/2` replaces it with — over pools synthesized from the library.
+`MeasureCandidateSets(docs, opts) CandidateReport` beside `Measure`, scoring
+`SelectAutoBindCandidate` over pools built from the library, restricted to the
+DOI-less subset and recording each trial's observed terminal gate.
 
-Four outcomes, not two, because a selection can fail in two directions and
-succeed in two:
+Four outcomes:
 
 | outcome | meaning |
 |---|---|
-| `correct-bind` | target present, chosen, and it is the right paper |
-| **`wrong-bind`** | a paper was chosen and it is the wrong one — the cardinal failure |
-| `correct-abstain` | nothing chosen when nothing should be (no unique qualifier, or target absent) |
-| `missed-bind` | target present and uniquely correct, but nothing chosen — the cost side |
+| `correct-bind` | chose a candidate in the target's equivalence class |
+| **`wrong-bind`** | chose a candidate outside it — the cardinal failure |
+| `correct-abstain` | chose nothing when nothing should be chosen |
+| `missed-bind` | target present and uniquely right, chose nothing |
 
-`wrong-bind` is the number read first, and the only one whose increase kills an
-increment outright, mirroring the existing wrong-accept discipline.
+**Pool sizes start at N=2.** N=1 cannot measure a 1-of-N selection and the
+synthetic gate corpus already rejects pools below 2
+(`candidate_gate_test.go:192-195`). Sweep N ∈ {2, 5, 10, 25}.
 
-### 2. Pool construction with a declared shape
+### 2. Ground truth as equivalence classes, not identity
 
-A uniformly random pool understates collisions, which is exactly how the
-synthetic corpus flattered the rule. Pools must be built deliberately:
+v1 set `TrueKey` to the document's own metadata row. Three reviewers
+independently rejected that, and they are right: a library holds a preprint and
+its version of record, duplicate rows from re-imports, and occasionally wrong
+Zotero metadata. Under v1's rule, binding a *same-work* candidate carrying
+different metadata would score as a `wrong-bind` — manufacturing the very
+failure the instrument exists to count.
 
-- **Size sweep** — N ∈ {1, 2, 5, 10, 25}. Report each N separately; a rule
-  that is safe at N=2 and unsafe at N=25 is a rule with a pool cap, not a safe
-  rule.
-- **Target-absent arm** — for every document, a pool of N distractors *not*
-  containing its own metadata. Any bind here is a `wrong-bind`. This arm alone
-  is the measurement `/1` never had.
-- **Adversarial arms**, each reported separately, drawn by the axis the gates
-  actually read: same first author; same venue and year; title-superset and
-  title-prefix pairs; same year with different authors. These are the axes the
-  round-3 guards were written against, so they are the axes that must be
-  measured rather than asserted.
+So ground truth is an **equivalence class** of candidate keys per document, and
+a bind inside the class is correct. Building it:
 
-### 3. A labelled composite class from the real library
+- Canonicalize strong identifiers with `ownership.NormalizeIdentifier`
+  (`internal/ownership/ownership.go:374-415`), the **version-collapsing**
+  relation, because "is this the same work?" is exactly the question ADR-0008
+  gives that normalizer. Do **not** use `work.Normalize*`, which is
+  version-preserving for acquisition.
+- **Do not reuse `sameWork`** (`measure.go:119-133`) as the distractor guard.
+  It is wrong in both directions: it compares raw exact DOI/arXiv/title and
+  exact PMID with no normalizer, so it misses `doi.org` URL versus bare DOI,
+  arXiv `v1`/`v2`, and PMID leading zeros; and its identical-title fallback
+  would **suppress legitimate distractors** — manifest case06 (lines 217-260)
+  is a same-title, same-author, different-DOI/year/container pair, which is a
+  genuinely different work and one of the most valuable distractors available.
+  Canonicalize identifiers; be conservative with any title fallback.
+- Preprint/VoR pairs are declared **same class** and must be enumerated rather
+  than inferred, since that is the case most likely to be silently wrong.
+- Every class carries **recorded provenance** — which candidate keys are in it
+  and on what basis (canonical identifier match, or human adjudication of a
+  named pair). Truth inferred from `Document.Work` alone is not admissible,
+  because `Work` is the Zotero parent's record (`corpus.go:42-51`) and a
+  mis-curated record or a preprint/VoR attachment mismatch would make a wrong
+  bind read as `correct-bind`.
+- Where the class cannot be established, the trial is **excluded and counted as
+  unestablished**, never guessed into an arm.
 
-Find and label the documents whose whole difficulty is that they *refer* to
-another work: errata, corrigenda, retraction notices, comments/replies,
-supplements, cover sheets, and journal expansions of conference papers. Zotero
-carries enough signal to propose candidates (item type, title markers, short
-page ranges, `relatedItem` links); the labelling itself is a human pass over
-the proposals, because the label is the ground truth and guessing it would
-recreate the original mistake at the corpus level.
+### 3. Pools built deliberately, including one conjunction arm
 
-Then score them as their own arm. The five synthetic blockers held in
-`candidatecorpus` are stand-ins for this class; this arm is whether the class
-is rare or routine in a real library, which nobody currently knows.
+Per-axis arms — `same-author`, `same-venue-year`, `title-superset`,
+`same-year`, `random` — plus a `target-absent` form of each.
 
-### 4. Backlog replay
+But per-axis arms alone reproduce v1's methodological error one level up:
+each varies a single axis, so no pool ever contains the *composed* adversary
+that withdrew the rule. So there is an explicit **conjunction arm**: a pool
+containing a distractor that simultaneously carries the target's title,
+authors and year, cites the target's DOI in body text, and prints its own
+different DOI past the blind window — in both target-present and target-absent
+forms. This arm is the direct reproduction of the withdrawn failure and is the
+arm whose result matters most.
 
-Score the operator's real pending pool and historical grabs: locally extracted
-PDFs plus the `manual_download` rows and terminal grab records. This is the
-only arm drawn from the true distribution — pool sizes as they actually occur,
-target-absent frequency as it actually occurs.
+### 4. Real composites, with an honest recall bound
 
-Contents never leave the machine, same handling as the existing report
-(`dev/identity-corpus.md`'s Privacy section applies unchanged, including
-stderr).
+Requires an all-attachments loader mode (see gap 4). Signals propose; a human
+confirms, because the label is ground truth. An unreviewed proposal is reported
+unlabelled and counted as neither class.
 
-### 5. Report, runbook, and an honest bound
+Proposer recall bounds the measured prevalence, so prevalence from proposals
+alone is a lower bound and must be labelled as one. A **random-sample audit** of
+documents the proposer did *not* flag is required to bound recall; without it
+"composites are rare" is unfalsifiable.
 
-- Extend the rendered report with the four outcomes per arm and per N.
-- Print the **rule-of-three upper bound** beside every zero: with no wrong-bind
-  in K trials the rate is bounded at about 3/K, and the report should say so
-  rather than letting "zero wrong-binds" imply safety at any N.
-- Add a `dev/identity-corpus.md` section for the candidate-set workflow, with
-  the same before/after discipline and one-increment-at-a-time rule that
-  section already establishes for `identity.go`.
+For a confirmed composite the correct behaviour is to bind **nothing**, so its
+pool carries an empty target class even when the work it refers to is present.
 
-## What this measurement is expected to decide
+### 5. Backlog replay — descriptive coverage, not calibration
 
-Not "is the rule good" but four specific numbers `/2` needs and does not have:
+v1 called this "the true distribution". It cannot be. `Grab` persists id,
+title, state, quarantine, job and outcome (`internal/grab/grab.go:64-82`) and
+**no candidate snapshot**, while `attemptAutoBind` enumerates live eligibility
+at selection time (`bridge.go:7635-7652`). The pool that existed when a
+historical grab settled is unrecoverable, and a present-day snapshot of pending
+rows is not a time-weighted distribution.
 
-1. The wrong-bind rate per pool size, which decides whether an autonomous rule
-   needs a pool cap and what it is.
-2. The target-absent abstention rate, which decides whether autonomous binding
-   is viable at all — a rule that binds *something* when the right answer is
-   absent cannot ship at any pool size.
-3. The composite-class frequency, which decides whether the front-matter
-   structural parser is the whole fix or merely the first one.
-4. The missed-bind rate, which is the user-visible cost of abstention and the
-   only argument for the feature existing.
+So: the backlog arm is **descriptive stress coverage** and explicitly may not
+be used alone to choose a production pool cap. Making it calibration-grade
+requires event-time pool snapshots recorded going forward — a small, separable
+change worth doing early so the data exists later, but not a prerequisite here.
+
+Use `Store.ListCandidateEligibleJobs` (`internal/job/candidate_eligibility.go:169-194`)
+for a standalone read, matching the daemon's own initial pool
+(`bridge.go:7635`); the `...Tx` form (lines 197-211) is the daemon's freshness
+fence, not the enumeration. The pending-row count v1 quoted as "~27" is an
+operator-run figure with no repository evidence and must be reported from a
+query, not asserted.
+
+### 6. Statistics stated correctly
+
+- **The sampling unit is the document**, not the trial. One document reused
+  across arms and sizes contributes many correlated observations, so a
+  per-trial denominator flatters the rate. If six arms and five sizes all fill,
+  `3/18,960 ≈ 0.016%` is roughly **30×** more optimistic than the
+  per-document-cluster bound `3/632 ≈ 0.47%`.
+- **Replace `3/K` with a cluster-aware bound** — a per-document one-sided
+  interval or cluster bootstrap — or report the raw count with an explicit
+  non-independence caveat. Printing `3/K` as a 95% bound over correlated trials
+  is simply the wrong statistic.
+- **Declare a denominator per reported quantity**: per-document safety (was
+  this document ever misbound, at each arm and N); per-pool operational
+  wrong-bind rate (wrong decisions over evaluated pools at that N);
+  target-absent abstention (correct-abstain over target-absent pools);
+  missed-bind (over unique target-present documents); composite prevalence
+  (labelled composites over all scored documents, never over replicated
+  trials). Never pool arms or sizes into one headline rate.
+- **Flag underfilled cells.** Report evaluated-versus-eligible counts per cell
+  and mark any cell that thinned as nonrepresentative — `same-venue-year` at
+  N=25 may survive only for one heavily-represented journal, which measures
+  that journal rather than the axis.
+
+### 7. Report, runbook, and thresholds
+
+Extend the rendered report with the four outcomes per arm and N, unique-document
+counts, terminal-gate distribution, and the cluster-aware bound. Add a
+`dev/identity-corpus.md` section in that runbook's voice, with its before/after
+and one-increment-at-a-time discipline, wrong-binds read first, and its Privacy
+section applying unchanged.
+
+**Predeclare the measurement thresholds**, because v1 called these outputs
+"decisions" while specifying no comparison that decides anything:
+
+- pool cap = the largest N whose cluster-adjusted wrong-bind upper bound sits
+  under a predeclared risk budget;
+- viability needs a maximum target-absent wrong-bind rate, not an abstention
+  rate alone;
+- parser sufficiency needs conditional composite wrong- and missed-bind rates
+  plus a coverage criterion, not prevalence alone;
+- missed-bind needs an acceptable human-workload budget.
+
+A numeric release bar for `/2` stays deferred — that is this workstream's
+scope — but the measurement's own estimands and risk bars must be fixed before
+data is collected, or the thresholds get chosen after seeing the numbers.
+
+## Scope honesty: what this gates, and what it does not
+
+A selector-level measurement cannot see `FrontMatterDOIs` reachability in
+production, eligibility-pool construction, the durable bind fence, ownership
+arbitration, or concurrency. So this workstream gates **the rule**, not the
+feature. Shipping `/2` additionally requires an integration-level gate over
+those paths, which v1 elided by claiming the report gates `/2` outright.
 
 ## Boundaries
 
-- **No production behaviour changes in this workstream.** Auto-binding stays
-  disabled; the popup picker and the conclusive-identity veto stay exactly as
-  shipped. This is instrumentation.
-- **No `internal/pdf/identity.go` rule changes.** Measure first. Any rule
-  change is workstream 3 and is gated on this report.
+- **No production behaviour changes.** Autonomous binding stays disabled
+  (`bridge.go:7618-7625`, enabled only by tests); the popup picker and the
+  conclusive-identity veto stay exactly as shipped.
+- **No changes to `internal/pdf/identity.go` or `candidate_select.go`.** Measure
+  first; rule changes are workstream 3 and are gated on this report.
+- Align the instrument's extraction with production or report the divergence:
+  the corpus loader uses `DefaultSemanticOptions` (MinChars 1000, OCR 3) while
+  the daemon's configured defaults are MinChars 400, OCR 4 with OCR enabled, and
+  `Document.Text` is an excerpt bounded by `MaxExcerpt` = 16 KiB
+  (`semantic.go:34-36`, sliced at lines 188-193). State the detectable range
+  rather than assuming it: a DOI printed past the 1 KiB blind window but inside
+  page one's 4 KiB cap **is** observable — composite case25 is built exactly
+  there — while `identityWindow` stops at the first form feed and caps page one
+  at 4 KiB (`identity.go:819-869`), so an identifier on page two, or anywhere
+  past 16 KiB, is invisible to the instrument and to the rules alike.
 - The existing pairwise `Measure` keeps working unchanged; its two documented
-  wrong accepts are the baseline, not a regression to fix here.
-- `cmd/identity-corpus` stays a local operator tool. It is not wired into CI:
-  it reads a personal library, and its output is the operator's reading list.
+  wrong accepts are the baseline.
+- `cmd/identity-corpus` stays a local operator tool, never wired into CI: it
+  reads a personal library and its output names the operator's own papers.
 
 ## The convergence worth noting
 
-`dev/identity-corpus.md` already records why its last two wrong accepts are
-hard: both print the requested title as a genuinely delimited line — one inside
-a contents list, one as a section heading — so separating them "needs a signal
-this rule doesn't have: structural position ... knowing where the contents list
-or heading structure is, not just how a phrase is delimited."
+`dev/identity-corpus.md` records that its two surviving wrong accepts both print
+the requested title as a genuinely delimited line — one inside a contents list,
+one as a section heading — and that separating them "needs a signal this rule
+doesn't have: structural position ... knowing where the contents list or heading
+structure is, not just how a phrase is delimited."
 
-That is independently the same conclusion the oracle review reached about
-`/1`, and the same fix `/2` specifies: a parsed front-matter assertion with one
-title span, a contiguous byline, an explicit byline end, a year locus and a
-self-identifier locus. Two instruments, arrived at separately, naming one
-missing capability. That is the strongest evidence available that `/2` is
-aimed at the right thing — and a reason to build the structural parser once,
-scored by both.
+That is independently the same conclusion the oracle review reached about `/1`,
+and the same parsed front-matter assertion `/2` specifies. Two instruments
+arrived at separately, naming one missing capability — the strongest available
+evidence that `/2` aims at the right thing, and a reason to build that parser
+once and let both modes grade it.
