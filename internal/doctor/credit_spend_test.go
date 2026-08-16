@@ -79,7 +79,9 @@ func TestCreditCheckNamesTodaysSpendWhileStillHealthy(t *testing.T) {
 
 // The credential fingerprint may be named; the credential may not. doctor prints
 // this on a terminal and serialises it to JSON, and the fingerprint exists so
-// "which identity spent this" is answerable without that risk.
+// the allowance can be tied to credentials without that risk. It must read as
+// what the ceiling is SHARED BY: the fuse keeps one row per source per day, so
+// naming a spend as one credential's would invent a breakdown nothing recorded.
 func TestCreditCheckNamesTheIdentityWithoutLeakingIt(t *testing.T) {
 	ctx, cfg, db := creditFixture(t, 0.5, 0)
 	budgets := budget.New(db, budget.WithCreditPolicy(budget.CreditPolicyFromConfig(cfg)))
@@ -97,7 +99,10 @@ func TestCreditCheckNamesTheIdentityWithoutLeakingIt(t *testing.T) {
 	}
 	got := creditCheck(t, ctx, cfg, db)
 	if !strings.Contains(got.Detail, "key-") {
-		t.Fatalf("detail %q names no identity; a spend nobody can attribute is not visibility", got.Detail)
+		t.Fatalf("detail %q names no credential; an allowance nobody can tie to an account is not visibility", got.Detail)
+	}
+	if !strings.Contains(got.Detail, "shared by") {
+		t.Fatalf("detail %q reads as per-credential attribution; the fuse records one row per source per day", got.Detail)
 	}
 }
 

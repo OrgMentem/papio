@@ -137,8 +137,10 @@ type CreditStatus struct {
 	// DriftReason is set when the provider's own prices stopped matching the
 	// schedule papio committed against, which closes egress until acknowledged.
 	DriftReason string
-	// Identities names the credentials that have transacted with this source,
-	// as credential fingerprints — never a credential.
+	// Identities names every credential that has transacted with this source,
+	// as fingerprints, never credentials. The fuse is source-wide and keeps one
+	// row per day, so this is what the allowance is SHARED BY — it is not a
+	// per-credential breakdown of the spend, which the ledger does not record.
 	Identities []string
 }
 

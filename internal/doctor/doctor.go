@@ -672,9 +672,14 @@ func checkCreditSpend(ctx context.Context, cfg config.Config, db *store.Store, a
 			continue
 		}
 		name := "credits_" + source
-		identity := "no request yet today"
+		// The fuse keeps ONE row per source per day, deliberately: a provider
+		// meters the account, and papio may fall back between credentials
+		// within a day. So this list is what the allowance is shared BY, not
+		// an attribution of the spend — claiming the latter would invent a
+		// breakdown the ledger does not record.
+		identity := "no credential has transacted yet"
 		if len(status.Identities) != 0 {
-			identity = strings.Join(status.Identities, ", ")
+			identity = "shared by " + strings.Join(status.Identities, ", ")
 		}
 		// The ceiling's provenance belongs in the readout: a limit derived
 		// from the provider's own reported figure and a conservative cap used

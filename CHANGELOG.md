@@ -16,8 +16,8 @@ execution records kept during the initial build.
   reporting it, so reaching it read as *papio* having stopped working. Doctor
   now names today's committed credits, the ceiling, whether that ceiling came
   from the provider's own reported limit or from the conservative cap used
-  before the day's first response, and the credential fingerprint the spend
-  belongs to — while the allowance is still healthy, not only once it is spent.
+  before the day's first response, and the credential fingerprints the allowance is
+  shared by — while the allowance is still healthy, not only once it is spent.
   A spent allowance warns and says work resumes at `00:00 UTC`.
 
 ### Fixed
