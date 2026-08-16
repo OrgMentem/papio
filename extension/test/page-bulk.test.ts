@@ -129,6 +129,15 @@ async function pageBulkDocument(
     },
   });
   importSerial += 1;
+  // Discard anything the PREVIOUS fixture's module instance managed to send
+  // between this fixture installing its `chrome` stub and its own module
+  // starting. orphanPreviousFixture drains microtasks, but a straggler parked
+  // behind a timer or a deeper await chain can still land in this window, and
+  // it lands in THIS request log because the module reads `chrome` off the
+  // global at call time. That made "never calls the runtime" flaky: the stray
+  // entry belonged to a retired fixture. Only calls made after the module under
+  // test starts are this fixture's, so the log begins here.
+  requests.length = 0;
   // Each fixture needs a fresh page module because its state is module-local.
   await import(`../src/page-bulk.ts?page-bulk-test=${importSerial}`);
   await settle();

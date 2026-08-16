@@ -111,7 +111,10 @@ export function deriveStablePageDOI(value: string): string | undefined {
  * depends on knowing the host. What made the old scan unsafe was reading the
  * *query and fragment* as if they were path, and that is closed structurally.
  */
-const DOI_STRICT_RE = /^10\.\d{4,9}\/[^\s?#&=]+$/;
+// `(?![\s\S])` rather than `$`: JS `$` matches before a FINAL line terminator, so
+// `10.1234/paper$` accepts `10.1234/paper\n` — reachable from a path carrying an
+// encoded `%0A`, which would then be stored as the identifier.
+const DOI_STRICT_RE = /^10\.\d{4,9}\/[^\s?#&=]+(?![\s\S])/;
 
 /**
  * Path segments that, when they appear *after* the DOI, mean the URL names a
@@ -121,11 +124,14 @@ const DOI_STRICT_RE = /^10\.\d{4,9}\/[^\s?#&=]+$/;
  * trimming the tail yields the article's real DOI and files an appendix as the
  * paper it supplements. These must decline, not be cleaned up.
  *
- * Route words are also rejected before the DOI (`/doi/suppl/…`), so a
- * supplement declines even when its file segment is named something else.
- * `abs`, `full`, `abstract`, `epdf`, `pdf`, `pdfdirect` are deliberately NOT
- * here: as a *prefix* they name the article itself, and as a *suffix* they are
- * caught by the post-DOI check below.
+ * The check runs across the whole path, before any candidate is read, so a
+ * supplement declines even when its file segment is named something else and even
+ * when the URL also carries a `?doi=<article>` parameter.
+ *
+ * `abs`, `full`, `abstract`, `epdf`, `pdf`, `pdfdirect` are deliberately NOT here:
+ * they name a *view of the article*, whichever side of the DOI they fall on, so
+ * `TRAILING_ROUTE_SEGMENTS` strips them instead of declining. Ordering is what
+ * makes that safe — see its comment.
  */
 const NON_ARTICLE_URL_SEGMENTS: ReadonlySet<string> = new Set([
   "suppl",
@@ -133,6 +139,9 @@ const NON_ARTICLE_URL_SEGMENTS: ReadonlySet<string> = new Set([
   "supplementary",
   "supplemental",
   "media",
+  // Springer supplementary files: `…/esm/art:<doi>/MediaObjects/<file>.pdf`.
+  "mediaobjects",
+  "esm",
   "figure",
   "figures",
   "table",
@@ -146,11 +155,17 @@ const NON_ARTICLE_URL_SEGMENTS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Route words that cannot be part of a DOI suffix once the DOI has at least a
- * registrant and one suffix segment. `/doi/pdf/10.1177/0163443725/full` is the
- * article's full-text view, not a DOI ending in `/full`.
+ * Route words that can trail a DOI in a publisher's article route:
+ * Emerald's `/content/doi/<doi>/full/pdf`, SAGE's `/doi/pdf/<doi>/full`. They
+ * name a *view of the article*, so the article's DOI is exactly what the URL
+ * means and they are stripped rather than rejected.
+ *
+ * Stripping is only safe because `NON_ARTICLE_URL_SEGMENTS` is rejected first.
+ * That ordering is the whole design: trimming a tail is dangerous precisely when
+ * the URL names a *different* document (a supplement under its article's DOI),
+ * and those never reach here.
  */
-const POST_DOI_ROUTE_SEGMENTS: ReadonlySet<string> = new Set([
+const TRAILING_ROUTE_SEGMENTS: ReadonlySet<string> = new Set([
   "full",
   "abs",
   "abstract",
@@ -161,6 +176,8 @@ const POST_DOI_ROUTE_SEGMENTS: ReadonlySet<string> = new Set([
   "full-xml",
   "download",
   "summary",
+  "html",
+  "meta",
 ]);
 
 function decodeURLPart(value: string): string {
@@ -172,32 +189,82 @@ function decodeURLPart(value: string): string {
 }
 
 /**
- * Validate a DOI candidate taken from URL structure. Only a single declared
- * `.pdf` suffix is removed; nothing else about the text is altered.
+ * Validate a DOI candidate taken from URL structure. Nothing about the text is
+ * altered beyond removing trailing route segments the caller's route declares;
+ * in particular no slash run is ever collapsed.
  */
-function qualifyURLDOI(candidate: string): string | undefined {
-  const doi = candidate.replace(/\.pdf$/i, "");
-  if (!DOI_STRICT_RE.test(doi)) return undefined;
-  const segments = doi.split("/");
-  // segments[0] is the registrant, segments[1] the first suffix segment; a
-  // two-segment DOI can never contain a route word, so only check beyond it.
-  for (const segment of segments.slice(2)) {
-    const lowered = segment.toLowerCase();
-    if (NON_ARTICLE_URL_SEGMENTS.has(lowered) || POST_DOI_ROUTE_SEGMENTS.has(lowered)) {
+function qualifyURLDOI(candidate: string, routed = false): string | undefined {
+  let value = candidate;
+  if (routed) {
+    // Peel view segments off the end. A DOI needs a registrant and at least one
+    // suffix segment, so peeling stops before it could empty the suffix.
+    for (;;) {
+      const segments = value.split("/");
+      const last = segments[segments.length - 1];
+      if (segments.length <= 2 || last === undefined) break;
+      if (!TRAILING_ROUTE_SEGMENTS.has(last.toLowerCase())) break;
+      value = segments.slice(0, -1).join("/");
+    }
+    // Peeling stops before emptying the suffix, so a route word can survive as
+    // the whole suffix. `/doi/pdf/10.1177/full` is a truncated route missing its
+    // article id, not the DOI `10.1177/full`.
+    const remaining = value.split("/");
+    const tail = remaining[remaining.length - 1];
+    if (remaining.length === 2 && tail !== undefined && TRAILING_ROUTE_SEGMENTS.has(tail.toLowerCase())) {
       return undefined;
     }
   }
-  return doi;
+  if (!DOI_STRICT_RE.test(value)) return undefined;
+  // A view marker fused onto the last segment, as bioRxiv and medRxiv write it
+  // (`10.1101/2024.06.04.594010v1.full`). It cannot be repaired by trimming: the
+  // real DOI also drops the `v1`, and version-collapsing is forbidden in the
+  // acquisition path (`internal/work` is version-preserving, AGENTS.md), so
+  // trimming would silently name a different work. Declining turns a job created
+  // for a DOI that does not exist into an honest no-answer.
+  if (/\.(?:full|abstract|supplementary|full-text)$/i.test(value)) return undefined;
+  for (const segment of value.split("/").slice(1)) {
+    if (NON_ARTICLE_URL_SEGMENTS.has(segment.toLowerCase())) return undefined;
+  }
+  return value;
 }
 
-/** Extract a DOI from a URL's structure, or decline. */
-export function doiFromURL(value: string, depth = 0): string | undefined {
+/**
+ * Extract a DOI from a URL's structure, or decline.
+ *
+ * Three independent structures can name a work: a wrapped inner URL, a declared
+ * `doi` parameter, and the path. They are gathered rather than raced, because
+ * whichever is consulted first would otherwise silently override the others —
+ * a supplement path with an `?doi=<article>` parameter returned the article
+ * while addressing the appendix, which is the cardinal failure. Every candidate
+ * found must name the same work, and the route is rejected before any of them
+ * is trusted.
+ *
+ * `base` resolves a relative value — a page's `<link rel=canonical href="/…">`
+ * is legitimate and dropping it lost identifiers the previous text scan found.
+ */
+export function doiFromURL(value: string, base?: string, depth = 0): string | undefined {
   let url: URL;
   try {
-    url = new URL(pdfSourceURL(value));
+    url = new URL(pdfSourceURL(value), base);
   } catch {
     return undefined;
   }
+
+  const host = url.hostname.toLowerCase();
+  const path = decodeURLPart(url.pathname);
+  const isDOIResolver = host === "doi.org" || host === "dx.doi.org" || host.endsWith(".doi.org");
+
+  // A non-article route disqualifies the whole URL, before any candidate is
+  // read: the URL names a supplement, a cited-by list or a media file, and no
+  // parameter elsewhere in it can make that the article. On a DOI resolver the
+  // path is the identifier rather than a route, so these words would be data.
+  if (!isDOIResolver) {
+    for (const segment of path.split("/")) {
+      if (NON_ARTICLE_URL_SEGMENTS.has(segment.toLowerCase())) return undefined;
+    }
+  }
+
+  const candidates: string[] = [];
 
   // A library proxy or link resolver wraps the real URL in a parameter. Recurse
   // once so the inner URL is parsed by these same rules rather than scanned.
@@ -205,40 +272,44 @@ export function doiFromURL(value: string, depth = 0): string | undefined {
     for (const key of ["url", "qurl", "target"]) {
       const inner = url.searchParams.get(key);
       if (inner === null || !/^https?:\/\//i.test(inner)) continue;
-      const nested = doiFromURL(inner, depth + 1);
-      if (nested !== undefined) return nested;
+      const nested = doiFromURL(inner, undefined, depth + 1);
+      if (nested !== undefined) candidates.push(nested);
     }
   }
 
   // An exact `doi` parameter is the publisher's own declaration and is bounded
-  // by the query grammar, so a neighbouring token cannot be absorbed.
+  // by the query grammar, so a neighbouring token cannot be absorbed. It is a
+  // declared value rather than a file path, so no suffix is stripped from it.
   for (const [key, raw] of url.searchParams) {
     if (key.toLowerCase() !== "doi") continue;
     const doi = qualifyURLDOI(decodeURLPart(raw.trim()));
-    if (doi !== undefined) return doi;
+    if (doi !== undefined) candidates.push(doi);
   }
 
-  const host = url.hostname.toLowerCase();
-  const path = decodeURLPart(url.pathname);
-
-  // doi.org resolves the whole path as the identifier by definition.
-  if (host === "doi.org" || host === "dx.doi.org" || host.endsWith(".doi.org")) {
-    return qualifyURLDOI(path.replace(/^\//, ""));
+  if (isDOIResolver) {
+    // The whole path is the identifier by definition, so there is no route and
+    // no external suffix: `10.1234/article.pdf` is a DOI that ends in `.pdf`,
+    // not a PDF of `10.1234/article`.
+    const resolved = qualifyURLDOI(path.replace(/^\//, ""));
+    if (resolved !== undefined) candidates.push(resolved);
+  } else {
+    const start = /\/(10\.\d{4,9}\/.+)$/.exec(path);
+    // Here the DOI is a file path, so one declared external suffix may be removed.
+    const fromPath = start?.[1] === undefined
+      ? undefined
+      : qualifyURLDOI(start[1].replace(/\.pdf$/i, ""), true);
+    if (fromPath !== undefined) candidates.push(fromPath);
   }
 
-  const start = /\/(10\.\d{4,9}\/.+)$/.exec(path);
-  if (start?.[1] === undefined) return undefined;
-  // Reject a non-article route declared before the DOI, so a supplement whose
-  // file segment is unrecognized still declines.
-  const prefix = path.slice(0, path.length - start[1].length).split("/");
-  for (const segment of prefix) {
-    if (NON_ARTICLE_URL_SEGMENTS.has(segment.toLowerCase())) return undefined;
-  }
-  return qualifyURLDOI(start[1]);
+  const first = candidates[0];
+  if (first === undefined) return undefined;
+  // Disagreement means one of them is wrong and nothing here can tell which.
+  return candidates.every((candidate) => candidate === first) ? first : undefined;
 }
 
-/** Extract a DOI from the ordered meta-tag layer. */
-export function extractMetaDOI(meta: readonly PageMetaProbe[] = []): string | undefined {
+/** Extract a DOI from the ordered meta-tag layer. `base` resolves a relative
+ * `citation_pdf_url`, which is a legitimate shape. */
+export function extractMetaDOI(meta: readonly PageMetaProbe[] = [], base?: string): string | undefined {
   const byName = new Map<string, string[]>();
   for (const tag of meta) {
     const name = tag.name.trim().toLowerCase();
@@ -262,7 +333,7 @@ export function extractMetaDOI(meta: readonly PageMetaProbe[] = []): string | un
   ]) {
     for (const value of byName.get(name) ?? []) {
       const doi = /^https?:\/\//i.test(value) || name === "citation_pdf_url"
-        ? doiFromURL(value)
+        ? doiFromURL(value, base)
         : sniffDOI(value);
       if (doi !== undefined) return doi;
     }
@@ -276,12 +347,12 @@ export function extractMetaDOI(meta: readonly PageMetaProbe[] = []): string | un
  * pinned by unit tests and reused by non-DOM callers.
  */
 export function extractPageDOI(probe: PageDOIProbe): string | undefined {
-  const fromMeta = extractMetaDOI(probe.meta);
+  const fromMeta = extractMetaDOI(probe.meta, probe.href);
   if (fromMeta !== undefined) return fromMeta;
 
   for (const value of [probe.canonical, probe.ogURL, probe.href]) {
     if (typeof value !== "string") continue;
-    const doi = doiFromURL(value);
+    const doi = doiFromURL(value, probe.href);
     if (doi !== undefined) return doi;
   }
 

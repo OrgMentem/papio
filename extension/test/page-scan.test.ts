@@ -7,6 +7,7 @@ import { expect, test } from "bun:test";
 
 import { parseHTML } from "./harness";
 import { PAGE_BULK_RAW_CANDIDATE_CAP, scanDocument, type DetectedPaper } from "../src/page-scan";
+import { doiFromURL } from "../src/deliver";
 
 function doc(html: string, baseURL = "https://scholar.example.edu/refs"): Document {
   return parseHTML(`<!doctype html><html><body>${html}</body></html>`, baseURL);
@@ -15,6 +16,50 @@ function doc(html: string, baseURL = "https://scholar.example.edu/refs"): Docume
 function identifiers(papers: readonly DetectedPaper[]): Array<{ kind: string; value: string }> {
   return papers.map((p) => p.identifier);
 }
+
+// papio has two DOI-from-URL extractors and cannot have one: `doiFromURL`
+// (deliver.ts) is the authority, but `scanDocument` is serialized into the page
+// by `chrome.scripting.executeScript`, which crosses only the function's own
+// source — an imported helper is unresolved in page scope. So the duplication is
+// structural, and this test is the mechanism that keeps it from drifting: both
+// extractors run over one shared table and must agree.
+//
+// A row where they legitimately differ belongs in `differsByDesign` with a
+// stated reason, never silently in one implementation.
+test("the page scanner and the delivery extractor agree on DOI-bearing URLs", () => {
+  const shared = [
+    "https://doi.org/10.1234/abcd.5678",
+    "https://doi.org/10.48612//monograph-2025-2",
+    "https://dl.acm.org/doi/pdf/10.1145/3630106.3660000.pdf",
+    "https://journals.sagepub.com/doi/abs/10.1177/01634437251234567",
+    "https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/jcpp.13440",
+    "https://link.springer.com/article/10.1007/s11192-024-04901-y",
+    // Non-article routes: a supplement lives in its ARTICLE's DOI namespace, so
+    // both extractors must decline rather than name the article.
+    "https://dl.acm.org/doi/suppl/10.1145/3630106.3660000/suppl_file/appendix.pdf",
+    // Article-view routes: the trailing segment names a view of the article, so
+    // both must strip it and yield the article rather than decline.
+    "https://www.emerald.com/insight/content/doi/10.1108/QEA-07-2024-0055/full/pdf",
+    "https://journals.sagepub.com/doi/pdf/10.1177/01634437251234567/full",
+    "https://www.tandfonline.com/doi/ref/10.1080/0144929X.2019.1578828",
+    // A view marker fused onto the DOI cannot be trimmed off safely.
+    "https://www.biorxiv.org/content/10.1101/2024.06.04.594010v1.full.pdf",
+    // A component DOI's own multi-segment suffix is not a route.
+    "https://doi.org/10.1109/tem.2022.3197196/mm1",
+    "https://example.com/news/story-42",
+  ];
+  const differsByDesign = new Set<string>([
+    // The scanner reads a link out of a citation list, so it has no page to
+    // resolve a `?doi=` parameter against and does not implement that tier.
+  ]);
+  for (const url of shared) {
+    if (differsByDesign.has(url)) continue;
+    const scanned = scanDocument(doc(`<ul><li><a href="${url}">t</a></li></ul>`)).papers
+      .filter((paper) => paper.identifier.kind === "doi")
+      .map((paper) => paper.identifier.value)[0];
+    expect({ url, doi: scanned }).toEqual({ url, doi: doiFromURL(url) });
+  }
+});
 
 // --- Recognized links (Decision 3 recognition order, item 1) ---------------
 

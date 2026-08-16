@@ -1241,7 +1241,11 @@ test("relays page acquisition and routes its acknowledgement to the popup", asyn
   );
 
   const acknowledgement = h.bridge.requestPageAcquire({
-    url: "https://publisher.example.edu/article/42",
+    // A landing-page URL routinely carries bearer-grade values — a Springer
+    // content-sharing token, an EZproxy ticket — and the daemon never reads this
+    // field, so the wire boundary reduces it to an origin for EVERY caller. It
+    // used to be forwarded verbatim.
+    url: "https://publisher.example.edu/article/42?sharing_token=SECRET123#s2",
     doi: "10.1000/example.42",
     title: "An Example Paper",
     source: "popup",
@@ -1250,7 +1254,7 @@ test("relays page acquisition and routes its acknowledgement to the popup", asyn
   const request = h.frames().at(-1);
   expect(request?.type).toBe("page_acquire");
   expect(request?.payload).toEqual({
-    url: "https://publisher.example.edu/article/42",
+    url: "https://publisher.example.edu",
     doi: "10.1000/example.42",
     title: "An Example Paper",
     source: "popup",
@@ -1266,6 +1270,37 @@ test("relays page acquisition and routes its acknowledgement to the popup", asyn
     job_id: "job_page_acquire_001",
     duplicate: true,
   });
+});
+
+test("page acquisition drops a URL-shaped title and refuses an unrepresentable address", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, features: ["page_acquire"] }),
+  );
+
+  // The daemon PERSISTS title into the job row, unlike url which it discards, so
+  // a title that is really an address must not smuggle one past the reduction.
+  void h.bridge.requestPageAcquire({
+    url: "https://publisher.example.edu/article/42",
+    doi: "10.1000/example.42",
+    title: "https://publisher.example.edu/article/42?ticket=ST-9f8e7d",
+    source: "popup",
+  });
+  await Promise.resolve();
+  expect(h.frames().at(-1)?.payload).toEqual({
+    url: "https://publisher.example.edu",
+    doi: "10.1000/example.42",
+    source: "popup",
+  });
+
+  // No safe address exists, so nothing is sent at all: refusing is correct, and
+  // falling back to the original would defeat the reduction.
+  const before = h.frames().length;
+  expect(
+    await h.bridge.requestPageAcquire({ url: "about:blank", doi: "10.1000/x", source: "popup" }),
+  ).toEqual({ error: "papio could not read this page's address" });
+  expect(h.frames().length).toBe(before);
 });
 
 test("refuses a DOI-less page acquisition without sending a frame", async () => {

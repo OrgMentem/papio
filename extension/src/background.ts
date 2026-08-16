@@ -101,6 +101,7 @@ import {
   MANAGED_TAB_LEDGER_KEY,
   TOOLBAR_COUNT_MODE_KEY,
   type ToolbarCountMode,
+  isURLLike,
 } from "./state";
 import {
   isPDFPage,
@@ -4959,13 +4960,27 @@ export class Bridge {
     if (typeof payload.doi !== "string" || payload.doi.trim() === "") {
       return { error: "page has no DOI" };
     }
+    // Reduce here rather than at each caller. The daemon never reads this field
+    // (`pageAcquireRequest` builds its request from DOI and title only), while a
+    // landing-page URL routinely carries bearer-grade values — a Springer
+    // content-sharing `?sharing_token=`, an EZproxy `?ticket=`. Doing it at one
+    // caller left the other sending them, and a guarantee that depends on every
+    // caller remembering is not a guarantee.
+    const origin = pageAcquireOrigin(payload.url);
+    if (origin === undefined) {
+      return { error: "papio could not read this page's address" };
+    }
     return new Promise<PageAcquireAckPayload>((resolve) => {
       const msgID = this.deps.randomUUID().replace(/-/g, "");
       this.pageAcquireWaiters.set(msgID, resolve);
       const frame: Record<string, unknown> = {
-        url: payload.url,
+        url: origin,
         ...(payload.doi !== undefined ? { doi: payload.doi } : {}),
-        ...(payload.title !== undefined ? { title: payload.title } : {}),
+        // A tab with no document title gets one derived from its URL, and the
+        // daemon PERSISTS this field into the job row (unlike url, which it
+        // discards). `state.ts` already refuses a URL-shaped title on disk; the
+        // wire boundary must not be weaker than the disk boundary.
+        ...(payload.title !== undefined && !isURLLike(payload.title) ? { title: payload.title } : {}),
         ...(payload.source !== undefined ? { source: payload.source } : {}),
       };
       if (!this.send("page_acquire", frame, undefined, msgID)) {
@@ -5454,19 +5469,10 @@ export class Bridge {
         }
       }
       if (job === undefined) {
-        // Origin only. `url` here is a PDF URL the researcher was reading, and a
-        // provider or proxy PDF URL carries bearer-grade values in its path and
-        // query (a signed token, an ILL ticket) — the same reason
-        // `pdf_grab_request` was reduced to host and title. The daemon discards
-        // this field, so nothing downstream needs the rest of it. Refuse rather
-        // than fall back to the full URL: an unrepresentable outbound frame is a
-        // fatal transport failure, and leaking the original defeats the point.
-        const origin = pageAcquireOrigin(url);
-        if (origin === undefined) {
-          return failure("page_acquire", "papio can't read this page's address — reload the page, then click Send this PDF again");
-        }
+        // `requestPageAcquire` reduces `url` to an origin at the wire boundary,
+        // so the full PDF URL is passed here and never leaves the extension.
         const ack = await this.requestPageAcquire({
-          url: origin,
+          url,
           ...(doi !== undefined && doi.trim() !== "" ? { doi } : {}),
           ...(payload.title ? { title: payload.title } : {}),
           source: "popup",
@@ -8377,7 +8383,9 @@ export class Bridge {
         "pdf_grab_request",
         {
           host,
-          ...(request.title !== undefined ? { title: request.title } : {}),
+          // Same rule as page_acquire: a URL-derived tab title must not smuggle
+          // the address past a frame that was reduced to host and title.
+          ...(request.title !== undefined && !isURLLike(request.title) ? { title: request.title } : {}),
         },
         "pdf_grab_result",
         PDF_GRAB_FEATURE,

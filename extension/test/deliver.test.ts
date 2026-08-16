@@ -38,8 +38,28 @@ test("doiFromURL declines a URL that names a document other than its DOI", () =>
   expect(doiFromURL("https://dl.acm.org/doi/suppl/10.1145/3630106.3660000/suppl_file/appendix.pdf")).toBeUndefined();
   expect(doiFromURL("https://dl.acm.org/doi/suppl/10.1145/3630106.3660000/unrecognized/x.pdf")).toBeUndefined();
   expect(doiFromURL("https://onlinelibrary.wiley.com/doi/citedby/10.1111/jcpp.13440")).toBeUndefined();
-  expect(doiFromURL("https://journals.sagepub.com/doi/pdf/10.1177/01634437251234567/full")).toBeUndefined();
   expect(doiFromURL("https://example.com/news/story-42")).toBeUndefined();
+  // A view marker fused onto the DOI cannot be trimmed back: the real bioRxiv DOI
+  // also drops the `v1`, and version-collapsing would name a different work.
+  expect(doiFromURL("https://www.biorxiv.org/content/10.1101/2024.06.04.594010v1.full.pdf")).toBeUndefined();
+  // Springer publishes supplementary files at `…/esm/art:<doi>/MediaObjects/…`.
+  expect(
+    doiFromURL("https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41592-022-01415-4/MediaObjects/41592_2022_1415_MOESM1_ESM.pdf"),
+  ).toBeUndefined();
+});
+
+// A trailing route word names a VIEW of the article, so the article's DOI is
+// exactly what the URL means and it is stripped rather than rejected. This is
+// only safe because a non-article route is rejected first: trimming a tail is
+// dangerous precisely when the URL names a different document.
+test("doiFromURL strips a trailing article-view route", () => {
+  expect(doiFromURL("https://www.frontiersin.org/journals/medicine/articles/10.3389/fmed.2026.1830485/full")).toBe("10.3389/fmed.2026.1830485");
+  expect(doiFromURL("https://www.emerald.com/insight/content/doi/10.1108/QEA-07-2024-0055/full/pdf")).toBe("10.1108/QEA-07-2024-0055");
+  expect(doiFromURL("https://journals.sagepub.com/doi/pdf/10.1177/01634437251234567/full")).toBe("10.1177/01634437251234567");
+  // Taylor & Francis's References tab carries the article's own DOI.
+  expect(doiFromURL("https://www.tandfonline.com/doi/ref/10.1080/0144929X.2019.1578828")).toBe("10.1080/0144929X.2019.1578828");
+  // A component DOI's own multi-segment suffix is not a route and survives.
+  expect(doiFromURL("https://doi.org/10.1109/tem.2022.3197196/mm1")).toBe("10.1109/tem.2022.3197196/mm1");
 });
 
 test("doiFromURL keeps a bounded query DOI and never absorbs a neighbouring token", () => {
@@ -72,6 +92,74 @@ test("pageAcquireOrigin drops everything a provider URL can carry a secret in", 
   // No safe value exists: the caller must refuse rather than send the original.
   expect(pageAcquireOrigin("about:blank")).toBeUndefined();
   expect(pageAcquireOrigin("not a url")).toBeUndefined();
+});
+
+// A route suffix is a property of the ROUTE, not of the candidate. On doi.org
+// the whole path is the identifier by definition, so there is no route and no
+// external suffix to remove: `10.1234/article.pdf` is a DOI that ends in `.pdf`.
+// Stripping it unconditionally named a different work.
+test("doiFromURL only strips an external suffix where the route declares one", () => {
+  expect(doiFromURL("https://doi.org/10.1234/article.pdf")).toBe("10.1234/article.pdf");
+  expect(doiFromURL("https://dl.acm.org/doi/pdf/10.1145/3630106.3660000.PDF")).toBe("10.1145/3630106.3660000");
+  // A declared `doi` parameter is a value, not a file path.
+  expect(doiFromURL("https://cdn.example/f?doi=10.1234/article.pdf")).toBe("10.1234/article.pdf");
+});
+
+// Three independent structures can name a work — a wrapped inner URL, a declared
+// `doi` parameter, and the path. Whichever were consulted first would silently
+// override the others, and that is a cardinal path: a supplement URL carrying
+// `?doi=<article>` returned the ARTICLE while addressing the appendix.
+test("doiFromURL declines when a URL names two different works", () => {
+  expect(doiFromURL("https://dl.acm.org/doi/suppl/10.1145/X1/suppl_file/a.pdf?doi=10.1145/X1")).toBeUndefined();
+  expect(doiFromURL("https://pub.example/article/10.1000/real?target=https%3A%2F%2Fo.example%2Fdoi%2Fpdf%2F10.2000%2Fother")).toBeUndefined();
+  expect(doiFromURL("https://doi.org/10.1234/A?doi=10.5678/B")).toBeUndefined();
+  expect(doiFromURL("https://pub.example/article/10.1000/real?doi=10.2000/other")).toBeUndefined();
+  expect(doiFromURL("https://cdn.example/f.pdf?doi=10.1234/first&doi=10.1234/second")).toBeUndefined();
+  // Agreement is not ambiguity.
+  expect(doiFromURL("https://pub.example/article/10.1000/real?doi=10.1000/real")).toBe("10.1000/real");
+});
+
+test("doiFromURL declines a route word standing in for the whole DOI suffix", () => {
+  // `/doi/pdf/10.1177/full` is a truncated route, not `10.1177/full`.
+  expect(doiFromURL("https://sage.example/doi/pdf/10.1177/full")).toBeUndefined();
+  // JS `$` matches before a FINAL line terminator, so an encoded `%0A` suffix
+  // would pass a `…$`-anchored pattern and be stored as the identifier.
+  expect(doiFromURL("https://publisher.example/doi/10.1234/paper%0A")).toBeUndefined();
+});
+
+test("doiFromURL rejects URL delimiters inside the identifier itself", () => {
+  // The old text scan decoded first and accepted `10.1234/paper&token=SECRET`,
+  // which `work.NormalizeDOI` also accepts, so the secret became the identity.
+  expect(doiFromURL("https://doi.org/10.1234/paper%26token%3DSECRET")).toBeUndefined();
+});
+
+test("doiFromURL accepts article prefix routes and multi-segment DOI suffixes", () => {
+  // `abs`/`full` before the DOI name the article itself; only after it do they
+  // name a view of it. A genuine DOI suffix may also have several segments.
+  expect(doiFromURL("https://journals.sagepub.com/doi/abs/10.1177/01634437251234567")).toBe("10.1177/01634437251234567");
+  expect(doiFromURL("https://journals.sagepub.com/doi/full/10.1177/01634437251234567")).toBe("10.1177/01634437251234567");
+  expect(doiFromURL("https://doi.org/10.1234/alpha/beta/gamma")).toBe("10.1234/alpha/beta/gamma");
+});
+
+test("doiFromURL resolves a relative candidate and bounds proxy unwrapping to one hop", () => {
+  expect(doiFromURL("/doi/pdf/10.1177/abc.pdf", "https://journals.sagepub.com/x")).toBe("10.1177/abc");
+  const inner = encodeURIComponent("https://wiley.com/doi/pdfdirect/10.1111/x?ticket=ST-42");
+  expect(doiFromURL(`https://a.proxy/login?url=${inner}`)).toBe("10.1111/x");
+  expect(doiFromURL(`https://a.proxy/login?url=${encodeURIComponent(`https://b.proxy/login?url=${inner}`)}`)).toBeUndefined();
+});
+
+test("pageAcquireOrigin drops userinfo credentials", () => {
+  expect(pageAcquireOrigin("https://user:pass@papers.example/p.pdf?ticket=S")).toBe("https://papers.example");
+});
+
+// The probe's tiers are URL-origin, so a relative value in any of them must
+// resolve against the page rather than be dropped.
+test("extractPageDOI resolves relative canonical and citation_pdf_url values", () => {
+  expect(extractPageDOI({ meta: [], canonical: "/article/10.1234/x", href: "https://pub.example/p" })).toBe("10.1234/x");
+  expect(extractMetaDOI([{ name: "citation_pdf_url", content: "/doi/pdf/10.1177/abc.pdf" }], "https://sage.example/p")).toBe("10.1177/abc");
+  // A bibliographic tag stating a URL takes the URL rules, so its delimiters
+  // cannot be absorbed either.
+  expect(extractMetaDOI([{ name: "dc.identifier", content: "https://doi.org/10.1234/paper%26t%3DS" }])).toBeUndefined();
 });
 
 test("sniffDOI returns the first DOI-shaped match and trims sentence punctuation", () => {

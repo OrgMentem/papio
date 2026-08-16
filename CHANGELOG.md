@@ -22,16 +22,19 @@ execution records kept during the initial build.
   A spent allowance warns and says work resumes at `00:00 UTC`.
 
 ### Fixed
-- **A PDF's address no longer reaches *papio* when you send it.** Sending a PDF
-  whose DOI is readable from its page reported the whole address, query
-  included. Publisher and library-proxy PDF links routinely carry signed tokens
-  and interlibrary-loan tickets there, which work like passwords, and the
-  path that identifies a PDF from the file itself was cut back to a bare host for
-  exactly that reason; this one was missed. Only the site is sent now. Relatedly,
-  an address carrying both a DOI and a token in the same query could fold the
-  token into the identifier and store it as the paper's identity — *papio* now
-  reads such an address by its structure, so nothing adjacent to the identifier
-  comes with it.
+- **Private link details no longer reach *papio* when you send a paper.**
+  Publisher and library links routinely carry signed tokens and interlibrary-loan
+  tickets, which work like passwords. Sending a paper reported the whole link;
+  only the publisher's site is shared now, on every path that files a paper from
+  a page. A page title that is really an address is dropped rather than stored as
+  the paper's title.
+- **A paper is no longer left unfiled because its link confused *papio*.** Where
+  a link carried a DOI beside other parameters, *papio* could read the identifier
+  wrong and then look for a paper that does not exist. It now keeps the
+  identifier separate from the rest of the address, so a private access token is
+  never mistaken for part of a paper's identity, and a link pointing at something
+  that is not the paper — a supplementary file, a cited-by list, a preprint's
+  full-text view — is left for you rather than filed under the article.
 - **Sending a PDF works in whichever browser you clicked in.** With *papio* connected to more than one browser — your everyday one and a second profile, or a stale connection left by an upgrade — **Send PDF** could fail outright, reporting that it "requires the current holder with negotiated effect permits". Two things were wrong. The message described *papio*'s internals rather than anything you could act on, and the refusal itself was unwarranted: one browser receives the papers *papio* goes and finds, but that has never had any bearing on an action you start yourself, which names its own browser by the fact that you clicked in it. Saving a PDF you are looking at is now independent of which browser is receiving handoffs, and the thing that stops two browsers racing a download is the single outstanding download authorization, which is what reports "busy" and can be retried.
 - **A waiting browser is no longer a browser that cannot do anything.** When another browser was already connected, the second one was never acknowledged at all, so it knew none of *papio*'s capabilities and turned away everything locally — the inbox, page acquisition and Send PDF alike — while `papio daemon status` correctly answered that all was well. It is now acknowledged as waiting: everything you initiate there works, and only the papers *papio* finds by itself go to the other browser. A consequence worth knowing if you switch between browsers: a browser handing over the slot no longer discards its record of institutional sign-ins in progress, which it previously cleared along with their tabs.
 - **Cancelling someone else's download no longer disconnects your browser.** The refusal for "only the browser that started this download can cancel it" was assembled in a form *papio* rejects on its way out, so instead of declining one request it failed the whole exchange and dropped the browser's connection. The same refusal is also no longer reported back as though the download had been successfully cancelled.

@@ -401,15 +401,35 @@ export function collectPageMetadata(): PageProbeResult {
     .filter((tag) => tag.name.length > 0 && tag.content.length > 0);
   const canonical = clean(document.querySelector('link[rel="canonical"]')?.getAttribute("href"));
   const ogURL = clean(document.querySelector('meta[property="og:url"]')?.getAttribute("content"));
+  // Keep any link that could resolve to doi.org, including a relative href on a
+  // doi.org page and an uppercased host. The extractor resolves against the
+  // page's own URL and re-checks the host, so an over-broad keep here is only a
+  // few extra strings, whereas an over-narrow one silently loses identifiers.
   const anchorHrefs = Array.from(document.querySelectorAll("a[href]"))
     .slice(0, 1000)
     .map((link) => clean(link.getAttribute("href")))
-    .filter((href) => href.length > 0 && href.includes("doi.org"));
-  // A locator, not an extractor: the page's text can be 200 KB and crossing
-  // that through the injection boundary on every popup open would be wasteful,
-  // so the first DOI-shaped run is located here and the authoritative trimming
-  // and validation still happen in `extractPageDOI`. The run is returned raw.
-  const bodyText = ((document.body?.innerText ?? "").slice(0, 200_000).match(/10\.\d{4,9}\/\S{1,200}/) ?? [""])[0];
+    .filter((href) => href.length > 0 && (href.toLowerCase().includes("doi.org") || /(^|\/)10\.\d{4,9}\//.test(href)));
+  // A locator, not an extractor: the page's text can be 200 KB and crossing that
+  // through the injection boundary on every popup open would be wasteful, so the
+  // first DOI-shaped run is located here and the authoritative trimming and
+  // validation still happen in `extractPageDOI`.
+  //
+  // The locator MUST agree with `sniffDOI` on which run comes first, or the
+  // answer changes. Three details do that, each of which was a real regression
+  // when it was missing: decode before matching (a page can print
+  // `10.1000%2Fx`), require a word boundary (so `x10.1000/embedded` does not
+  // beat a later genuine DOI), and never truncate a run — a run cut to a
+  // length limit can itself be a *valid but different* DOI, so an implausibly
+  // long one declines instead.
+  const rawBody = (document.body?.innerText ?? "").slice(0, 200_000);
+  let decodedBody = rawBody;
+  try {
+    decodedBody = decodeURIComponent(rawBody);
+  } catch {
+    // Keep raw text when the page contains malformed escapes.
+  }
+  const bodyRun = decodedBody.match(/\b10\.\d{4,9}\/[^\s"'<>?#]+/)?.[0] ?? "";
+  const bodyText = bodyRun.length > 0 && bodyRun.length <= 512 ? bodyRun : "";
   const title = meta.find((tag) => tag.name.toLowerCase() === "citation_title")?.content
     ?? document.title.trim();
   return {
@@ -587,13 +607,14 @@ export async function readCurrentPageMetadata(): Promise<PageActionBinding> {
       func: collectPageMetadata,
     });
     const result = injected?.result;
-    // Require the probe, not just a url: a result of an unexpected shape must
-    // degrade to the tab-URL path, never throw inside the popup's page read.
+    // Require the probe's own shape, not just its presence: a result of an
+    // unexpected shape must degrade to the tab-URL path, and `extractPageDOI`
+    // iterates `probe.meta`, so a non-array `meta` would throw here instead —
+    // the opposite of what this guard exists for.
     if (
       typeof result === "object" && result !== null &&
       typeof (result as PageProbeResult).url === "string" &&
-      typeof (result as PageProbeResult).probe === "object" &&
-      (result as PageProbeResult).probe !== null
+      Array.isArray((result as PageProbeResult).probe?.meta)
     ) {
       harvested = result as PageProbeResult;
     }

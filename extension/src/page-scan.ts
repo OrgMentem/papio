@@ -71,10 +71,28 @@ export function scanDocument(root: Document | Element | string = document, tabUR
   const DOI_TEXT_RE = /10\.\d{4,}\/\S+/g;
   const ARXIV_LABELED_RE = /\barXiv\s*:\s*([a-zA-Z0-9./-]+)/gi;
   const PMID_LABELED_RE = /\bPMID\s*:\s*(\d+)/gi;
-  const STRICT_DOI_RE = /^10\.\d{4,}\/\S+$/;
+  // Mirrors `DOI_STRICT_RE` in deliver.ts. `\S` was too broad: it admits the URL
+  // delimiters `& =`, so a path-carried query fragment could land inside the
+  // identifier. This function cannot IMPORT the authoritative extractor —
+  // scanDocument is serialized into the page and only its own source crosses —
+  // so `page-scan.test.ts` pins the two against one shared table instead.
+  // `(?![\s\S])` not `$`: JS `$` matches before a final line terminator, so a
+  // decoded `%0A` suffix would otherwise pass.
+  const STRICT_DOI_RE = /^10\.\d{4,}\/[^\s?#&=]+(?![\s\S])/;
+  // Mirrors `NON_ARTICLE_URL_SEGMENTS` in deliver.ts: a URL whose route names a
+  // supplement, a cited-by list or a media file does not name the article whose
+  // DOI it contains. Without this, an ACM supplement link in a citation list
+  // scanned as `10.1145/<article>/suppl_file/<file>` — a bogus identifier that
+  // resolves to nothing, and one trailing-segment trim away from being the
+  // article itself.
+  const NON_ARTICLE_SEGMENTS =
+    /(?:^|\/)(?:suppl|suppl_file|supplementary|supplemental|media|mediaobjects|esm|figure|figures|table|tables|references|citations|citedby|cited-by|metrics|permissions)(?:\/|$)/i;
 
   function trimTrailingPunct(value: string): string {
-    return value.replace(/[).,;:'"\]}]+$/, "").replace(/\/+$/, "");
+    // Sentence punctuation only. A trailing slash RUN is deliberately left
+    // alone: `10.48612//x` and `10.48612/x` are two separately registered works,
+    // so slash counts are data and must never be normalized (AGENTS.md).
+    return value.replace(/[).,;:'"\]}]+$/, "").replace(/\/$/, "");
   }
 
   function decodeSafe(value: string): string {
@@ -86,6 +104,39 @@ export function scanDocument(root: Document | Element | string = document, tabUR
   }
 
   type Identifier = { kind: "doi" | "pmid" | "arxiv" | "openalex"; value: string };
+
+  // Route words that can trail a DOI in a publisher's ARTICLE route — Emerald's
+  // `/content/doi/<doi>/full/pdf`, SAGE's `/doi/pdf/<doi>/full`. They name a view
+  // of the article, so they are stripped rather than rejected. Safe only because
+  // NON_ARTICLE_SEGMENTS is rejected first: trimming a tail is dangerous exactly
+  // when the URL names a DIFFERENT document. Mirrors deliver.ts's set.
+  const TRAILING_ROUTE =
+    /^(?:full|abs|abstract|pdf|epdf|epub|pdfdirect|full-xml|download|summary|html|meta)$/i;
+
+  /** Gate a DOI read out of URL structure. Mirrors `qualifyURLDOI` in
+   * deliver.ts; the drift test in page-scan.test.ts pins the pair. */
+  function qualifyDOI(raw: string, routed: boolean): Identifier | null {
+    let value = raw;
+    if (routed) {
+      for (;;) {
+        const segments = value.split("/");
+        const last = segments[segments.length - 1];
+        if (segments.length <= 2 || last === undefined || !TRAILING_ROUTE.test(last)) break;
+        value = segments.slice(0, -1).join("/");
+      }
+      const remaining = value.split("/");
+      const tail = remaining[remaining.length - 1];
+      // A route word surviving as the whole suffix is a truncated route.
+      if (remaining.length === 2 && tail !== undefined && TRAILING_ROUTE.test(tail)) return null;
+    }
+    if (!STRICT_DOI_RE.test(value)) return null;
+    // A view marker fused onto the last segment (bioRxiv's
+    // `10.1101/2024.06.04.594010v1.full`) cannot be trimmed back to the real DOI
+    // without also dropping the version, and version-collapsing would name a
+    // different work (AGENTS.md), so it declines.
+    if (/\.(?:full|abstract|supplementary|full-text)$/i.test(value)) return null;
+    return { kind: "doi", value };
+  }
 
   /** Recognized-link recognition order (Decision 3): doi.org, publisher
    * /doi/10.x paths, arXiv /abs|/pdf, PubMed article URLs. */
@@ -99,13 +150,18 @@ export function scanDocument(root: Document | Element | string = document, tabUR
     const host = url.hostname.toLowerCase();
     const path = url.pathname;
     if (host === "doi.org" || host === "dx.doi.org") {
-      const doi = trimTrailingPunct(decodeSafe(path.replace(/^\//, "")));
-      return STRICT_DOI_RE.test(doi) ? { kind: "doi", value: doi } : null;
+      // The whole path is the identifier, so there is no route to reject and no
+      // external suffix to strip.
+      return qualifyDOI(trimTrailingPunct(decodeSafe(path.replace(/^\//, ""))), false);
     }
+    // A non-article route disqualifies the URL before any candidate is read: it
+    // names a supplement or a cited-by list, not the article whose DOI it
+    // contains, and trimming the tail would yield that article.
+    if (NON_ARTICLE_SEGMENTS.test(path)) return null;
     const doiPath = /\/doi\/(?:abs\/|full\/|e?pdf\/|full-xml\/)?(10\.\d{4,}\/[^?#]+)/i.exec(path);
     if (doiPath?.[1]) {
-      const doi = trimTrailingPunct(decodeSafe(doiPath[1]).replace(/\.pdf$/i, ""));
-      if (STRICT_DOI_RE.test(doi)) return { kind: "doi", value: doi };
+      const doi = qualifyDOI(trimTrailingPunct(decodeSafe(doiPath[1]).replace(/\.pdf$/i, "")), true);
+      if (doi !== null) return doi;
     }
     // Generic fallback: a DOI-shaped run starting at any path segment —
     // Springer's /article/10.1007/…, /chapter/10.1007/…, IET's
@@ -116,8 +172,8 @@ export function scanDocument(root: Document | Element | string = document, tabUR
     // DOI-registration check rather than acquiring anything wrong.
     const doiSegment = /\/(10\.\d{4,}\/[^?#]+?)(?:\.pdf)?\/?$/i.exec(path);
     if (doiSegment?.[1]) {
-      const doi = trimTrailingPunct(decodeSafe(doiSegment[1]).replace(/\.pdf$/i, ""));
-      if (STRICT_DOI_RE.test(doi)) return { kind: "doi", value: doi };
+      const doi = qualifyDOI(trimTrailingPunct(decodeSafe(doiSegment[1]).replace(/\.pdf$/i, "")), true);
+      if (doi !== null) return doi;
     }
     if (host === "arxiv.org" || host.endsWith(".arxiv.org")) {
       const m = /^\/(?:abs|pdf)\/(.+?)(?:\.pdf)?\/?$/i.exec(path);

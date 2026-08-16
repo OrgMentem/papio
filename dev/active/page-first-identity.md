@@ -14,32 +14,91 @@ a trap the next reader would fall into too.
 
 ## What shipped
 
-- `doiFromURL` (`extension/src/deliver.ts`) is the single URL-origin extractor:
-  `URL`/`searchParams` structure only, a `doi` query parameter read as an exact
-  bounded value, one declared `.pdf` suffix stripped, DOI text never normalized
-  (slash runs preserved), viewer wrappers and one level of proxy `url=` wrapping
-  unwrapped, and two reject lists — non-article namespaces (`suppl`,
-  `suppl_file`, `citedby`, …) and post-DOI route words (`full`, `epdf`, …).
-  Recognition is keyed on a DOI-shaped **path segment**, not per host: host
-  keying would decline Springer, IET and every unenumerated publisher while
-  adding no safety, since the safety comes from strict validation plus the reject
-  lists. The unsafe part was reading query and fragment as if they were path.
-- `sniffDOI` is now text-origin only. Every URL-origin candidate in
-  `extractMetaDOI`/`extractPageDOI` routes through `doiFromURL`, including
-  `citation_pdf_url` and any bibliographic tag whose value is itself a URL.
+- `doiFromURL` (`extension/src/deliver.ts`) is the authority for URL-origin
+  extraction: `URL`/`searchParams` structure only; a `doi` query parameter read
+  as an exact bounded value; a declared `.pdf` suffix stripped **only on a
+  publisher path**, never on a DOI resolver, where the whole path is the
+  identifier and `10.1234/article.pdf` is a DOI that ends in `.pdf`; DOI text
+  never normalized (slash runs preserved); viewer wrappers and one level of proxy
+  `url=` wrapping unwrapped; two reject lists — non-article namespaces (`suppl`,
+  `citedby`, …) and route words (`full`, `epdf`, …) — plus a decline for a view
+  marker fused onto the DOI (bioRxiv's `…v1.full`), which cannot be trimmed back
+  without version-collapsing.
+  Three structures can name a work — a wrapped inner URL, a `doi` parameter, the
+  path — so all are gathered and must **agree**; disagreement declines. Racing
+  them was a cardinal path: a supplement URL carrying `?doi=<article>` returned
+  the article while addressing the appendix. A non-article route now disqualifies
+  the URL before any candidate is read.
+  Recognition is keyed on a DOI-shaped **path segment**, not per host. Be precise
+  about what that does and does not buy: it accepts a DOI-shaped run under *any*
+  host and path, so "unrecognized structure declines" is **false** as a general
+  claim — what declines is a *recognized non-article* route, or a candidate that
+  fails strict validation. Host keying was rejected because it would decline
+  Springer, IET and every unenumerated publisher; the safety comes from strict
+  validation plus the reject lists, and a bogus candidate surviving both fails
+  loudly at the daemon's DOI-registration check rather than misfiling.
+- `sniffDOI` is text-origin only and has no URL-origin caller. Every URL-origin
+  candidate in `extractMetaDOI`/`extractPageDOI` routes through `doiFromURL`,
+  resolved against the page as a base so a relative `canonical`/`citation_pdf_url`
+  still works — **except** the final JSTOR tier, which is the documented
+  `/stable/<id>` → `10.2307/<id>` mapping in `deriveStablePageDOI`, not URL
+  parsing.
 - `collectPageMetadata` (`extension/src/popup.ts`) is a **probe harvester**: it
-  returns raw candidates (`PageProbeResult`) and decides nothing. This dissolves
-  the injected-function problem the plan flagged as unsolved — there is no second
-  extractor to keep in sync, because page scope no longer extracts. Body text is
-  located in page scope (first DOI-shaped run only, so 200 KB does not cross the
-  boundary) but trimmed and validated by the shared path.
-- `pageAcquireOrigin` (`deliver.ts`) reduces the Send-PDF page-acquire `url` to
-  scheme and host. It returns `undefined` when no safe value exists and the
-  caller refuses, because an unrepresentable outbound frame is a fatal transport
-  failure rather than a refusal.
-- Regression fixtures: `extension/test/deliver.test.ts` — real provider URLs, the
-  supplement/cited-by/route-suffix rejects, the `?doi=…&token=…` case, the viewer
-  wrapper, and the slash-run pair.
+  returns raw candidates (`PageProbeResult`) and makes no identifier decision.
+  That dissolves the injected-function problem *for the popup path*. It does not
+  remove papio's second URL extractor: `scanDocument`'s nested `identifierFromURL`
+  (`page-scan.ts`) is under the same serialization constraint and cannot import
+  the authority, so the duplication is structural. The mechanism is a **drift
+  test** — `page-scan.test.ts` runs both over one shared table and requires
+  agreement, with an explicit `differsByDesign` set. It caught a real divergence
+  the moment it was written: the scanner accepted the ACM supplement.
+  Body text is located in page scope, and the locator deliberately matches
+  `sniffDOI`'s semantics — decode first, require a word boundary, never truncate a
+  run — because each omission changed which DOI won.
+- `pageAcquireOrigin` (`deliver.ts`) reduces `page_acquire.url` to scheme and host
+  **inside `requestPageAcquire`**, the single wire boundary, so it covers every
+  caller. Doing it at one call site left the other sending a full landing URL
+  including a Springer `?sharing_token=`. A URL-shaped `title` is dropped on both
+  reduced frames too, via the `isURLLike` predicate `state.ts` already applies on
+  disk — the daemon *persists* title while discarding url, so the wire boundary
+  must not be weaker than the disk boundary.
+- Regression fixtures: `extension/test/deliver.test.ts` (provider URLs; the
+  supplement, cited-by, route-suffix and view-marker declines; the
+  two-different-works declines; `?doi=…&token=…`; the viewer wrapper; the
+  repeated-slash case; relative resolution; userinfo), `background.test.ts` (the
+  emitted frame is origin-only, a URL-shaped title is dropped, an unrepresentable
+  address is refused with no frame sent), and `page-scan.test.ts` (the drift
+  table).
+
+Known limits, stated rather than implied:
+
+- A real DOI whose own suffix ends `.pdf` on a publisher path is lost to the
+  suffix strip (the Crossref component `10.1107/s160057671801289x/ks5605sup1.pdf`).
+- **A legacy SICI DOI containing an encoded delimiter is lost, deliberately.**
+  Crossref's own example `10.1002/(SICI)1521-3951(199911)216:1<135::AID-PSSB135>3.0.CO;2-#`
+  is written `…2-%23` in a URL; `DOI_STRICT_RE` rejects the decoded `#`. The
+  argument for relaxing it is sound — inside `url.pathname` a percent-encoded `#`
+  or `?` cannot be a delimiter, because a real one would have been split off by
+  the parser, so those characters there are data. It is kept anyway: the guard is
+  redundant only *while* every caller parses structurally, and the failure it
+  guards against — a credential absorbed into a stored identifier — shipped as a
+  live bug twice in one session. A lost paper is visible and recoverable; a stored
+  token is neither.
+- MDPI's `/article/<doi>/s1` supplement yields a bogus candidate rather than an
+  explicit decline. It fails loudly at the daemon's registration check rather than
+  misfiling, but `s1` is not caught by name, and `s1` is too plausible as a real
+  DOI suffix segment to add to a reject list without evidence.
+- **The reject list is deliberately wider than the cardinal risk, and this is the
+  one entry to revisit first.** Only `suppl`/`media`/`figure`/`table` name a
+  *different* document; `references`, `citations`, `citedby` and `metrics` are
+  views of the article itself, so declining them loses a paper that could have
+  been filed correctly. Losing a paper is visible and recoverable while misfiling
+  is neither, so the conservative side was chosen — but widening acceptance is a
+  measurable question, not a judgement call, and belongs with the measurement
+  workstream rather than in this fix. Note the asymmetry that makes it non-obvious:
+  Taylor & Francis's References tab is `/doi/ref/<doi>`, which is *not* on the list
+  and correctly yields the article, so the list already treats two spellings of
+  one idea differently.
 
 ## The retraction, first
 

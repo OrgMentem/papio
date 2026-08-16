@@ -968,7 +968,11 @@ function safeHost(value: unknown): string | undefined {
   return host;
 }
 
-function isURLLike(value: string): boolean {
+/** True when a string is an address rather than a name. Shared with the wire
+ * boundary in `background.ts`: a field the daemon persists must not be weaker
+ * than the same field on disk. Detects a scheme or a protocol-relative prefix,
+ * so a bare `host/path` string is NOT url-like by this test. */
+export function isURLLike(value: string): boolean {
   const trimmed = value.trim();
   return (
     /^(?:https?|ftp|chrome|moz-extension|file|papio):/i.test(trimmed) ||
