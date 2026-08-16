@@ -35,6 +35,39 @@ in-memory charge a crash erases; a fail-closed guard that becomes a permission
 when a second caller reads it; a best-effort note treated as an authority; a cache
 treated as a fact; a durable fact read by only one of its two readers.
 
+## Audit 2026-08-16 — this file's own claims, re-verified in the tree
+
+Read before trusting any section below: the prose was written while the work was in
+flight, so a section can describe something that has since shipped.
+
+- **SHIPPED** — item 0 (yield measurement): `cmd/openalexyield`, and the hop it
+  measured is off by default — `SiblingTitleSearch` at `internal/config/config.go:122`.
+- **SHIPPED** — items 1+2 (one egress authority; credit fuse):
+  `internal/budget/credit_egress.go`, migration `0036_credit_fuse.sql`.
+- **SHIPPED** — item 3 (truthful park on local exhaustion): `budget.ErrExceeded` as
+  the single typed refusal, carrying unit, window and reset.
+- **SHIPPED** — item 5 (evidence authority over canonical identity), and both halves
+  are wired at live call sites, which is the part that had been written and forgotten:
+  `enrichmentPersistWork` at `internal/app/app.go:1361` and `validationTarget` at
+  `internal/app/app.go:2987`. Migration `0035_identity_provenance.sql`.
+- **DEFERRED-BY-DESIGN** — item 4 (jitter the reset wake): operational smoothing,
+  not an invariant; reasons recorded in its section.
+- **DEFERRED-BY-DESIGN, and its condition is now satisfied** — item 6 (per-job
+  guard). The heading says "deferrable only once the fuse is deployed"; the fuse
+  shipped and is deployed, so the deferral now rests on its own terms rather than on
+  a pending prerequisite. The residue it leaves is cross-day starvation: one job can
+  still consume a disproportionate share of a day's allowance without exceeding it.
+- **NOT BUILT, deliberately** — item 7 (explicit effective basis before novelty
+  gating): item 0 measured the sibling hop as not worth its cost, so the primitive
+  this item needs has no consumer. Rehabilitating it requires the paid three-shape
+  comparison, which is the operator's call.
+- **OPEN** — the OpenAIRE self-throttle recorded at the end of the fuse
+  generalisation section: measured, unscheduled, needs a live per-provider smoke.
+
+**Trim candidate, not a deletion candidate.** Items 4, 6 and 7 plus the OpenAIRE
+finding are the live remainder; the shipped sections stay only as the reasoning
+behind the deferrals and should be salvaged into an ADR before this file is deleted.
+
 ## Audience: heterogeneous tiers, not one keyed machine
 
 Every number in the original incident came from one keyed identity on the author's

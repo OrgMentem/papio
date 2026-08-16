@@ -6,6 +6,36 @@ claims were verified against `internal/zotio/service.go` before acceptance.
 `page_bulk_runs` is already recording the yields the evidence gates below
 read (ADR-0019 Decision 10).
 
+## Audit 2026-08-16 — verified against the tree, not against this document
+
+- **SHIPPED** — 1 session liveness — `extension/src/keepalive.ts:SessionVerdict`/`ProbeOutcome` probe lifecycle, `internal/browser/bridge.go:sessionEvidence`
+- **SHIPPED** — 2 page-bulk ownership — `internal/browser/bridge.go:pageBulkZotioLookup/pageBulkStatusItem`, `internal/zotio/service.go:LookupWorks` (PMID and `ownership_unknown`)
+- **SHIPPED** — 3 batch discoverability and yield stats — `docs/guide/user-guide.md` (Export RIS → `--batch`), `internal/cli/stats.go:newStatsPageBulkCommand`, `internal/store/pagebulkstats.go:PageBulkStats`, `internal/store/migrations/0023_page_bulk_rendered_hint.sql`
+- **OPEN** — 4 comparative bench cohort — `internal/cli/bench.go` and `internal/bench/runner.go` exist, but `internal/bench/testdata/cohort.json` is still only a two-work proving cohort, not the frozen nine-work field cohort the plan requires
+- **SHIPPED** — 5 ILLiad polling — `internal/delivery/poll.go:Poll` plus its tests
+- **DEFERRED-BY-DESIGN** — 6 fulfillment retrieval — `internal/delivery/retrieval.go`, `internal/app/app.go:routeFulfilledDelivery`, `PatronWebBaseURL`, and fixtures landed; the plan requires real ILLiad institution acceptance before it can close
+- **SHIPPED** — 7 triage v3 riders — attention/auth/route riders across `internal/protocol`, `internal/triage`, and the extension
+- **OPEN** — 8 release — tree carries daemon 0.20.0 and extension package 0.14.0; release prep, QA, and store submission remain
+- **OPEN** — 9 Primo PNX reassessment — no PNX reader and no required run-data evidence pipeline
+- **SHIPPED** — Title-only asymmetry ruling — `internal/batch/submit.go:Submit`, `docs/guide/user-guide.md` (`acquire --batch`), `dev/adr/0019-on-page-bulk-acquisition.md:Decision`
+- **SHIPPED** — ResolveReview closure and action-kind completeness — `internal/job/job.go:ResolveReview` (verdict application) with the startup sweeper `internal/job/job.go:CloseStaleHumanActions`, and `internal/job/action_kind_coverage_test.go:TestActionKindDispositionIsExhaustive`
+- **DEFERRED-BY-DESIGN** — Later/dormant: DataCite — additive client behind the `VersionRelations` seam; build when a real version chain shows up
+- **DEFERRED-BY-DESIGN** — Later/dormant: LibKey remainder — `api` mode is blocked on Third Iron, doctor link-mode probe and init Library-List discovery remain; keyless link route is live and sufficient
+- **DEFERRED-BY-DESIGN** — Later/dormant: citation-record model — revisit when export users exist beyond the operator
+- **DEFERRED-BY-DESIGN** — Later/dormant: ILLiad live acceptance — wakes if a partner library materializes; #5/#6 must land first regardless
+- **DEFERRED-BY-DESIGN** — Later/dormant: OCLC/Rapido — config kinds stay rejected until built; Rapido must live-verify no auto-set declaration before compiling auto-capable
+- **DEFERRED-BY-DESIGN** — Later/dormant: in-panel Check routes — explicit selected-rows-only action, never pre-click badges; the privacy line does not move
+- **SHIPPED** — Release-blocker tranche (oracle r6), item 1 URL-free grab protocol — `internal/protocol/protocol.go:PdfGrabRequestPayload`, `internal/grab/grab.go:Allocate`, `extension/src/background.ts` (`pdf_grab_request` frame)
+- **SHIPPED** — Release-blocker tranche (oracle r6), item 2 pull status plus dedupe — `internal/browser/bridge.go:4937` `pdfGrabStatus`, and the dedupe invariant in `internal/grab/grab.go:152` (at most one nonterminal grab per source host and title, enforced by a unique constraint)
+- **SHIPPED** — Release-blocker tranche (oracle r6), item 3 triage v4 `pdf_identifier_needed` — `internal/triage/triage.go:157` emits the route class from `Service.Snapshot`; wire contract in `internal/protocol/protocol.go`
+- **SHIPPED** — Release-blocker tranche (oracle r6), item 4 identify-and-inject grab flow — `internal/api/grabs.go:identifyGrab` → `browser.IdentifyGrab`, with `internal/protocol/protocol.go:PdfGrabStatusResultPayload` carrying the outcome
+- **SHIPPED** — Release-blocker tranche (oracle r6), item 5 waiting-sibling overlay — `extension/src/inbox.ts:waitingSibling`
+- **SHIPPED** — Release-blocker tranche (oracle r6), item 6 SHA-256 federated claim keys — `extension/src/federated-claim.ts:reserveFederatedClaim`/`bindFederatedClaim`
+- **SHIPPED** — Release-blocker tranche (oracle r6), item 7 action-kind completeness test — `internal/job/action_kind_coverage_test.go:TestActionKindDispositionIsExhaustive`
+- **SHIPPED** — Release-blocker tranche (oracle r6), item 8 shared ResolveReview closure — `internal/job/job.go:ResolveReview`, reached from `internal/browser/bridge.go:3900` via `ResolveReviewCAS`
+
+Trim candidate, not deletion candidate, because items 4, 8, and 9 are open and item 6 is deferred pending a real institution.
+
 ## Execution order (settled, r5-arbitrated)
 
 1. **Diagnose/fix the stuck "Institution session — Checking session…"

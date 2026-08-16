@@ -11,6 +11,18 @@ The sections below preserve the useful pre-ADR design history. Assertions
 labelled **implemented Phase-0 authority** describe the code that exists now;
 later phase sections remain targets and must not be read as shipped behaviour.
 
+## Audit 2026-08-16 — verified against the tree, not against this document
+
+- **SHIPPED** — Phase-0 authority, packaged adapters, fixture-backed classification — `extension/src/adapters/types.ts` (packaged registry), `extension/src/plan.ts` (Plan, expected-work binding, revalidation, planExecution/planGeneric)
+- **SHIPPED** — generic E0/E1 planning and tuple correlation — `extension/src/plan.ts` planGeneric; `extension/src/background.ts` (planner injection, provider-drive epoch execution/correlation); `extension/src/state.ts` (opaque drive epoch, bounded restart bookkeeping)
+- **SHIPPED** — provider-drive epoch authority and access-mode enforcement — `internal/browser/bridge.go`; contracts in `internal/protocol/protocol.go`
+- **SHIPPED** — captures and local incident lifecycle with safety latching — `internal/captures/captures.go` (storage, pin/release, retention), `internal/incident/incident.go` (grouping, bounded failure-shape evidence)
+- **SHIPPED** — adapter-try offline diagnostic — `extension/tools/adapter-try.ts`, which invokes the production planner
+- **SHIPPED** — proposal-only repair scaffold — `internal/cli/adapter_repair.go` (daemon-listed/sanitized capture validation; proposals only)
+- **OPEN** — Firefox transmission consent; redacted observation reporting; URL-template expansion; generator/release automation; signed remote control plane; contribution intake; staged rollout; broadened Zotero/generator phases — none present in the tree: no signed control plane, no hosted reporting pipeline, no automatic patch/release generator
+
+Trim candidate: Phase-0 material shipped; later phases still live.
+
 ### Implemented Phase-0 authority (2026-08-10)
 
 - The daemon mints and durably records direct and generic provider-drive
@@ -1196,7 +1208,6 @@ Future strategy ideas (not Phase-0 claims) include tracked browser viewer
 tabs, exact browser download IDs, and Zotero-derived candidates after they
 become reviewed source. Control may eventually suspend exact packaged strategy
 IDs; it cannot supply their predicates.
-
 
 E0 discovery may use title/year metadata as evidence. Current `planGeneric`
 E1 candidates require an exact expected DOI corroborated by page citation

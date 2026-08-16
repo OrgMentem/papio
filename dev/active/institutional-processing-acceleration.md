@@ -1,11 +1,49 @@
 # Institutional processing acceleration
 
-**Status:** Phase −1 through Phase 3 complete; **Phase 4 current**
+**Status:** Phase −1 through **Phase 4 complete**; Phases 5–7 deferred by design;
+Phase 8 and the measurement vocabulary open. See the audit below.
 
 **Ownering model:** solo-maintainer-sized changes landed directly on `main`  
 **Scope:** daemon authority, browser materialization, institutional cutover, and
 staged enablement. Existing UI work remains a dependency for typed attention
 rendering, but does not move authority into the extension.
+
+## Audit 2026-08-16 — verified against the tree, not against this document
+
+Every claim below was checked by reading the named symbol. Shipped sections are
+**deletion candidates** under the `dev/active` rule (salvage anything normative
+into ADR-0022, then remove); this file stays only for the open and deferred work.
+
+- **SHIPPED** — Changes 0.1–0.3: authority/identity contract (ADR-0022;
+  `internal/job/institutional_materialization.go`), transactional cutover
+  classification (`internal/job/cutover.go` `InstitutionCutoverDecision`,
+  `WithCutoverDecision`), diagnosis v2 with bounded CLI fallback
+  (`internal/job/diagnosis.go` `DiagnoseV2`, `internal/cli/jobs_diagnose.go`).
+- **SHIPPED** — Phase −1 stability baseline: `internal/job/effect_permit.go`.
+- **SHIPPED** — Phase 0 decision observability: closed blocker vocabulary and
+  strict parser in `internal/job/cutover.go`.
+- **SHIPPED** — Phase 1 durable state and strict protocol: migration
+  `0026_institutional_materialization.sql`, `institutional_*` families in
+  `internal/protocol/protocol.go` and `extension/src/protocol.ts`.
+- **SHIPPED** — Phase 2 recoverable explicit materialization: migration
+  `0027_institution_authority_key.sql`; `prepareMaterializationCandidate` and the
+  claim/bind/route/reconcile flow in `internal/browser/bridge.go`.
+- **SHIPPED** — Phase 3 unified effects and fair scheduling at one: migration
+  `0034_effect_permits.sql`, `AcquireInstitutionalEffectPermit`,
+  `internal/job/institutional_scheduler.go`.
+- **SHIPPED** — Phase 4 profile evidence and typed human gates:
+  `internal/job/institutional_evidence.go`, `internal/job/institutional_gates.go`.
+  This document previously called Phase 4 "current"; it is not.
+- **DEFERRED-BY-DESIGN** — Phases 5–7 (provider readiness canary, source-gate
+  cutover canary, concurrency four). `canary_ready_route_exists` is still always
+  false, `retryCutoverDecision` still only records a blocker, and
+  `0034_effect_permits.sql` still pins one live permit at `slot_index=0`.
+- **OPEN** — Phase 8 coverage expansion: no expansion registry exists; packaged
+  adapters remain individually configured.
+- **OPEN** — Measurement and rollback: none of the seven primary outcome values
+  (`unattended_ready` … `still_working`) nor the benchmark denominator exist. This
+  is the gap that matters — the phases above shipped without the instrument that
+  was supposed to judge them.
 
 ## Current rollout state
 

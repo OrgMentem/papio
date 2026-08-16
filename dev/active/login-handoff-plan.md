@@ -5,6 +5,20 @@ Written after a four-angle plan review and one iteration round with the
 reviewers; findings in `dev/scratch/oracle/login-review-findings.md`. This
 document is the plan of record.
 
+## Audit 2026-08-16 — verified against the tree, not against this document
+
+- **SHIPPED** — claim/tab state stays browser-side — `extension/src/state.ts:284-288`, `extension/src/federated-claim.ts:10-88`; ADR-0003 and ADR-0013 retain holder-exclusive handoff and browser-local authority
+- **SHIPPED** — Slice 1 guarded close primitive — `extension/src/background.ts:3219-3280` `closeOwnedTab` (fresh `tabs.get`, content/active/surface checks, then remove); lifecycle callers at 4087, 5526, 6066, 9466, 10987, 12622; completeness pinned by `extension/test/tab-window-close-ast.test.ts`. This is the shipped NARROWER REPLACEMENT for the reverted total-closure redesign, not that redesign.
+- **SHIPPED** — Slice 2 truthful harness and SAML journey — `extension/test/fake-tabs.ts:63-225` (cloned snapshots, absent-ID errors, lifecycle events, completeNavigation/userNavigate/userActivate/userClose) and `:300-328` (fresh execution tokens, expired replay)
+- **SHIPPED** — Slice 3 cold tabless offers and explicit engagement — `extension/test/background.test.ts:1775-1912` proves no tab/request/persisted URL before click, one correlated request+tab after, reservation before create, re-request after restart, manual park on timeout; implementation `extension/src/background.ts:5384-5516` and `:5591-5630`
+- **SHIPPED** — Slice 3 shared fresh URL resolution — `internal/app/action_url.go:87-105` `ResolveHumanActionURL`, used by `internal/browser/bridge.go:2785-2845` for `handoff_link` (shared route, not duplicated)
+- **SHIPPED** — Slice 3 protocol/schema/corpus parity — `internal/protocol/protocol.go:1179-1194`, `extension/src/protocol.ts:779-794` and `:4038-4054`, `protocol/browser-v1.schema.json:2139-2188`, plus `testdata/protocol/{valid,invalid}/browser-handoff*`
+- **DEFERRED-BY-DESIGN** — Slice 4 explicit refresh — the plan's own rule: "If Slice 3 removes the accumulation, stop"; no unconditional refresh redesign is present
+- **DEFERRED-BY-DESIGN** — accepted mid-engagement takeover boundary — the plan says "We accept that boundary for now ... Revisit if takeover-during-sign-in is ever observed in the field"; the tree has holder-only dispatch but no session-epoch fence
+- **DEFERRED-BY-DESIGN** — the explicit "Do not re-attempt" list (forceNew, cross-job locks, federatedLoginVisited, owner-age/URL liveness, universal backstops, automatic waiter closure, rewritten removal state machine)
+
+Trim candidate — Slices 1-3 shipped, while Slice 4, the accepted takeover boundary, and the do-not-re-attempt list are the still-normative remainder worth salvaging to an ADR.
+
 ## The failure being fixed
 
 papio parks a job needing an institution sign-in behind a per-institution claim,

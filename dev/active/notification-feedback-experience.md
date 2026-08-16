@@ -1,6 +1,6 @@
 # Notification, feedback, and liveness experience
 
-Status: **Active implementation plan; requires a new ADR before protocol or badge changes.**
+Status: **Shipped; ADR-0023 (`dev/adr/0023-notification-feedback-and-liveness-surfaces.md`) is the accepted authority for protocol and badge changes.**
 
 This plan covers *papio*'s daemon-owned desktop notifications, in-surface feedback,
 full-page inbox and Activity presentation, browser-action popup, toolbar badge,
@@ -19,6 +19,13 @@ is authoritative, the inbox is the durable full-tab surface, the popup remains a
 launcher/current-page lens, browser-only facts remain browser-local, and Activity
 remains a solicited bounded pull. It does **not** revive ADR-0005's rejected live
 push/subscription mechanism.
+
+## Audit 2026-08-16 — verified against the tree, not against this document
+
+- **SHIPPED** — every substantive plan decision — ADR-0023 `dev/adr/0023-notification-feedback-and-liveness-surfaces.md` is `Accepted` (2026-08-12) and the implementation is present across `internal/notify/`, the notification ledger in `internal/store/notifications.go`, `internal/config/`, the CLI, pulse/protocol/bridge, cohorts and recovery, and the extension's inbox, popup and options pages
+- **OPEN** (procedural only) — the plan's own Manual acceptance checklist and the completion criteria that no tool can settle: that a 200-paper run produces bounded milestone notifications, and that Moving/Scheduled/Waiting/Idle/Stalled/Unknown are distinguishable without relying on colour — no code gap corresponds to these; they are operator observations.
+
+This file is a deletion candidate: every substantive plan decision has shipped and its normative authority is in ADR-0023; the remaining items are operator observations, not live implementation work.
 
 ## Current truth
 
