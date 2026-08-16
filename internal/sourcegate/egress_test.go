@@ -51,7 +51,10 @@ func TestGuardedCommitRefusalProducesZeroInnerRequests(t *testing.T) {
 	if err := m.Defer(context.Background(), budget.QuotaSourceName(config.SourceOpenAlex), keyed, time.Now().UTC().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	_, err := guarded.Do(guardedRequest(t, "https://api.openalex.org/works?api_key=private-key"))
+	refusedResp, err := guarded.Do(guardedRequest(t, "https://api.openalex.org/works?api_key=private-key"))
+	if refusedResp != nil {
+		_ = refusedResp.Body.Close()
+	}
 	var deferred *budget.ErrDeferred
 	if !errors.As(err, &deferred) {
 		t.Fatalf("Do = %v, want *budget.ErrDeferred", err)
@@ -70,7 +73,7 @@ func TestGuardedCommitRefusal_guardRequired(t *testing.T) {
 		t.Fatal(err)
 	}
 	budget.EgressTestDisableGates(t)
-	if _, err := guarded.Do(guardedRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+	if err := doAndClose(guarded, guardedRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatalf("guard disabled: err=%v, want commit to ignore quota gate", err)
 	}
 	if inner.calls != 1 {
@@ -87,7 +90,7 @@ func TestGuardedOneDoOnePhysicalRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	guarded := MustGuarded(m, config.SourceOpenAlex, keyed, OpenAlexCreditCost, tripwire)
-	if _, err := guarded.Do(guardedRequest(t, "https://api.openalex.org/works/W1234567890?api_key=private-key")); err != nil {
+	if err := doAndClose(guarded, guardedRequest(t, "https://api.openalex.org/works/W1234567890?api_key=private-key")); err != nil {
 		t.Fatal(err)
 	}
 	if inner.calls != 1 {
@@ -101,7 +104,7 @@ func TestGuardedIdentityFromOutgoingRequest(t *testing.T) {
 	inner := &countingHTTP{}
 	guarded := MustGuarded(m, config.SourceOpenAlex, keyed, OpenAlexCreditCost, inner)
 	// Construction-time policy is keyed; the wire omits api_key (anonymous fallback).
-	if _, err := guarded.Do(guardedRequest(t, "https://api.openalex.org/works/W1234567890")); err != nil {
+	if err := doAndClose(guarded, guardedRequest(t, "https://api.openalex.org/works/W1234567890")); err != nil {
 		t.Fatal(err)
 	}
 	if inner.calls != 1 {
@@ -115,7 +118,10 @@ func TestRequireEgressCommitFailsWithoutCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tripwire.Do(guardedRequest(t, "https://api.openalex.org/works"))
+	tripwireResp, err := tripwire.Do(guardedRequest(t, "https://api.openalex.org/works"))
+	if tripwireResp != nil {
+		_ = tripwireResp.Body.Close()
+	}
 	if !errors.Is(err, ErrUncommittedEgress) {
 		t.Fatalf("err = %v, want ErrUncommittedEgress", err)
 	}
@@ -132,7 +138,10 @@ func TestLatchObservedAtCommit(t *testing.T) {
 	m.LatchQuota(config.SourceOpenAlex, identity, until)
 	inner := &countingHTTP{}
 	guarded := MustGuarded(m, config.SourceOpenAlex, keyed, OpenAlexCreditCost, inner)
-	_, err := guarded.Do(guardedRequest(t, "https://api.openalex.org/works?api_key=private-key"))
+	latchedResp, err := guarded.Do(guardedRequest(t, "https://api.openalex.org/works?api_key=private-key"))
+	if latchedResp != nil {
+		_ = latchedResp.Body.Close()
+	}
 	var deferred *budget.ErrDeferred
 	if !errors.As(err, &deferred) || !deferred.Quota {
 		t.Fatalf("Do = %v, want quota ErrDeferred from latch at commit", err)
@@ -149,7 +158,7 @@ func TestLatchObservedAtCommit_guardRequired(t *testing.T) {
 	inner := &countingHTTP{}
 	guarded := MustGuarded(m, config.SourceOpenAlex, keyed, OpenAlexCreditCost, inner)
 	budget.EgressTestDisableGates(t)
-	if _, err := guarded.Do(guardedRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+	if err := doAndClose(guarded, guardedRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatalf("guard disabled: err=%v, want latch ignored at commit", err)
 	}
 	if inner.calls != 1 {

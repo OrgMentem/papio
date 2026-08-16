@@ -518,6 +518,13 @@ func anonymousIfFallback(ctx context.Context, configured, chosen config.Source) 
 
 func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolver.Candidate, retryPlan, error) {
 	var plan retryPlan
+	// One read for the whole pass: the anchor is immutable, and both the
+	// enrichment write below and the promotion gate at the end of this
+	// function must judge against the same attested identity.
+	anchor, err := s.Jobs.SubmittedIdentity(ctx, row.ID)
+	if err != nil {
+		return nil, plan, err
+	}
 	enrichDOIPlan, err := s.enrichDOIWork(ctx, row)
 	if err != nil {
 		return nil, plan, err
@@ -527,7 +534,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		return nil, plan, err
 	}
 	var all []resolver.Candidate
-	enrichPlan, err := s.enrich(ctx, row)
+	enrichPlan, err := s.enrich(ctx, row, anchor)
 	if err != nil {
 		return nil, plan, err
 	}
@@ -616,11 +623,6 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 	}
 
 	ranked, evidence := resolver.Rank(row.Policy.DesiredVersion, all)
-
-	anchor, err := s.Jobs.SubmittedIdentity(ctx, row.ID)
-	if err != nil {
-		return nil, plan, err
-	}
 
 	// Promotion gate (after enrich/resolver loops above): budget refusals recorded
 	// via absorbBudgetRefusal during those loops park the pass but never bypass
@@ -1281,7 +1283,7 @@ func (s *Service) metadataEnricherEntries() []MetadataEnricherEntry {
 // (resolver.ErrNotApplicable, or admission refused before the adapter ran) is
 // exempt: undercharging a request that actually went out lets a mixed pass
 // classify source_gate and loop forever, spending real credits every cycle.
-func (s *Service) enrich(ctx context.Context, row *job.Row) (retryPlan, error) {
+func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.SubmittedIdentity) (retryPlan, error) {
 	var plan retryPlan
 	if strings.TrimSpace(row.Work.Title) == "" {
 		return plan, nil
@@ -1347,15 +1349,31 @@ func (s *Service) enrich(ctx context.Context, row *job.Row) (retryPlan, error) {
 			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_confident_match")
 			continue
 		}
-		if conflicts(row.Work, enriched) {
+		// Item 5: an enricher match is SEARCH evidence. It may create
+		// candidates, but only evidence verified as describing the submitted
+		// canonical work may mutate canonical identity durably before
+		// validation. `matchesTitleSearch` accepts a title-only submission on
+		// the normalized title alone, so persisting the matched record's own
+		// DOI here would let a wrong title match adopt a wrong identifier —
+		// and validation then compares the PDF against that adopted identity
+		// and agrees with itself. enrichmentPersistWork keeps the durable
+		// write to gaps the anchor left open.
+		persistable, hasWrite, accepted := enrichmentPersistWork(anchor, enriched)
+		if !accepted {
 			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected")
 			continue
 		}
-		updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, enriched)
-		if err != nil {
-			return plan, err
+		if hasWrite {
+			updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, persistable)
+			if err != nil {
+				return plan, err
+			}
+			row.Work = updated.Work
 		}
-		row.Work = updated.Work
+		// The unpersisted remainder still serves THIS pass: resolvers may use a
+		// search-derived identifier to look for candidates, which is what
+		// search evidence is licensed to do. It is deliberately not written.
+		row.Work = mergeObservedInMemory(row.Work, enriched)
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched")
 		// Enrichment has just given this job a strong identifier, which is the
 		// first moment papio can know it duplicates a job it is already running:
@@ -2957,7 +2975,16 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	if err != nil {
 		return false, false, err
 	}
-	report, validateErr := s.Validate(ctx, result.TempPath, result.ContentType, row.Work)
+	// Validate against what the requester attested, not against row.Work, which
+	// earlier passes may have enriched from search evidence. Comparing a PDF to
+	// an identity that a resolver or enricher supplied lets a wrong match
+	// confirm itself: the adopted DOI is the one the document then "agrees"
+	// with. validationTarget keeps legacy rows (no attested anchor) unchanged.
+	anchor, err := s.Jobs.SubmittedIdentity(ctx, row.ID)
+	if err != nil {
+		return false, false, err
+	}
+	report, validateErr := s.Validate(ctx, result.TempPath, result.ContentType, validationTarget(anchor, row))
 	if validateErr != nil {
 		if ctx.Err() != nil {
 			_ = s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, "cancelled", 0, "context_cancelled")

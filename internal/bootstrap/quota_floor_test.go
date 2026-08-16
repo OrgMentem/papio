@@ -62,7 +62,12 @@ func TestQuotaAwareReserverHonorsFloor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = stack.Do(floorRequest(t, "https://api.openalex.org/works?api_key=private-key"))
+	resp, err := stack.Do(floorRequest(t, "https://api.openalex.org/works?api_key=private-key"))
+	if resp != nil {
+		// A refusal returns no response; closing only when one exists keeps the
+		// assertion below about the refusal, not about this cleanup.
+		_ = resp.Body.Close()
+	}
 	var deferred *budget.ErrDeferred
 	if !errors.As(err, &deferred) {
 		t.Fatalf("err = %v, want *budget.ErrDeferred from the quota floor", err)
@@ -86,7 +91,10 @@ func TestOrdinaryGateStillRefusesOtherDiscoverySources(t *testing.T) {
 	if err := budgets.Defer(ctx, config.SourceSemanticScholar, policy, time.Now().UTC().Add(6*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	_, err = gated.Do(floorRequest(t, "https://api.semanticscholar.org/graph/v1/paper/search"))
+	gatedResp, err := gated.Do(floorRequest(t, "https://api.semanticscholar.org/graph/v1/paper/search"))
+	if gatedResp != nil {
+		_ = gatedResp.Body.Close()
+	}
 	var deferred *budget.ErrDeferred
 	if !errors.As(err, &deferred) {
 		t.Fatalf("err = %v, want the ordinary durable gate to refuse admission", err)
@@ -107,8 +115,13 @@ func TestOrdinaryGateStillRefusesOtherDiscoverySources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := isolated.Do(floorRequest(t, "https://api.semanticscholar.org/graph/v1/paper/search")); err != nil {
+	isolatedResp, err := isolated.Do(floorRequest(t, "https://api.semanticscholar.org/graph/v1/paper/search"))
+	if err != nil {
 		t.Fatalf("err = %v, want an OpenAlex quota gate to leave other sources alone", err)
+	}
+	defer func() { _ = isolatedResp.Body.Close() }()
+	if err := isolatedResp.Body.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if isolatedInner.calls != 1 {
 		t.Fatalf("inner requests = %d, want the request forwarded", isolatedInner.calls)

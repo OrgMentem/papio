@@ -1023,6 +1023,41 @@ belongs in the fuse because drawing it down spends real money.
 
 ## Fixed while reviewing (already shipped)
 
+- **Item 5's enrichment half was written and never wired — found by `unused`,
+  not by a test.** `enrichmentPersistWork`, `mergeObservedInMemory` and
+  `validationTarget` existed in `internal/app/identity_promotion.go` with no
+  caller, while `enrich` kept persisting enricher output wholesale after only
+  the identifier-only `conflicts()` check, and `validateCandidate` kept
+  comparing the PDF against the `row.Work` that write had mutated. So the
+  ranked-candidate path was gated (`accumulatePromotedIdentity`) and the
+  *enricher* path — the one `matchesTitleSearch` feeds — was not. Both are wired
+  now, with the anchor read once per pass in `resolve` and once in
+  `validateCandidate`. Three findings inside the fix, each worth keeping:
+  - **The helper contradicted its own doc comment.** It documented that
+    search-derived strong identifiers must not be adopted, then adopted them
+    whenever the anchor's field was empty, gated on
+    `InsufficientIdentityAuthority()`. A complete title/authors/year tuple says
+    the requester described the work, not that a search naming an identifier for
+    it found the same one. The loop is deleted.
+  - **Its single `bool` conflated "refused as conflicting" with "nothing to
+    persist".** The first callsite read `false` as a conflict, so an *agreeing*
+    record was discarded and the in-memory merge skipped. Now
+    `(out, changed, ok)`.
+  - **`validationTarget`'s justification is narrower than it looks, and the
+    first test of it was vacuous.** `Process` reloads the row between stages, so
+    an in-memory enrichment never reaches validation, and durable promotion is
+    already exact-echo-only. The case it actually protects is a row that
+    persisted an unverified identifier *before* this gate existed — every job in
+    an existing database. That is what the regression now plants and asserts;
+    the first version planted a title on the claimed row, which `Process`
+    discarded, and passed with the guard disabled.
+  Regressions: `TestEnrichDoesNotAdoptASearchDerivedIdentifier`,
+  `TestEnrichStillRefusesAContradictingRecord`,
+  `TestValidationComparesAgainstTheAttestedAnchor`,
+  `TestValidationTargetFallsBackForUnattestedRows`, and
+  `TestResolveEnrichesTitleOnlyWorkForThisPassOnly` — the renamed shipped test
+  whose old contract asserted the persisted DOI this forbids.
+
 - **`siblingSearchRecorded` failed open on an unreadable marker.** `Jobs.Events`
   decodes each detail with `_ = json.Unmarshal(...)` and yields a nil map on
   failure, so a corrupt `job.sibling_search` row left the basis `""`, matched

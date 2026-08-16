@@ -77,7 +77,7 @@ func TestObserverPrimaryIdentityRecordsDenominator(t *testing.T) {
 		"X-RateLimit-Remaining": "9000",
 		"X-RateLimit-Reset":     "3600",
 	})
-	if _, err := observer.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	if inner.calls != 1 {
@@ -101,7 +101,7 @@ func TestObserverNonPrimaryIdentityDoesNotEstablishDenominator(t *testing.T) {
 		"X-RateLimit-Remaining": "900",
 		"X-RateLimit-Reset":     "3600",
 	})
-	if _, err := observer.Do(observerRequest(t, "https://api.openalex.org/works?mailto=reader@example.org")); err != nil {
+	if err := doAndClose(observer, observerRequest(t, "https://api.openalex.org/works?mailto=reader@example.org")); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.limitCalls) != 1 {
@@ -117,7 +117,7 @@ func TestObserverCreditsUsedSeedsCounter(t *testing.T) {
 	observer, _, _ := testObserverWithCredit(t, rec, map[string]string{
 		"X-RateLimit-Credits-Used": "240",
 	})
-	if _, err := observer.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.usedCalls) != 1 || rec.usedCalls[0] != 240 {
@@ -137,7 +137,7 @@ func TestObserverCreditsUsedSeedsDatabase(t *testing.T) {
 	observer, _, _ := testObserverWithCredit(t, m, map[string]string{
 		"X-RateLimit-Credits-Used": "240",
 	})
-	if _, err := observer.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	day := observerNow.UTC().Format("2006-01-02")
@@ -178,14 +178,14 @@ func TestObserverPrepaidDropTriggersStickyClosure(t *testing.T) {
 	observer, _, _ := testObserverWithCredit(t, wrapped, map[string]string{
 		"X-RateLimit-Prepaid-Remaining-USD": "1.0",
 	})
-	if _, err := observer.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	wrapped.failPersist = errors.New("disk full")
 	observer2, _, _ := testObserverWithCredit(t, wrapped, map[string]string{
 		"X-RateLimit-Prepaid-Remaining-USD": "0.5",
 	})
-	if _, err := observer2.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer2, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	err = m.CommitEgress(context.Background(), budget.EgressRequest{
@@ -212,13 +212,13 @@ func TestObserverFailedPrepaidPersistLeavesLatch(t *testing.T) {
 	observer, _, inner := testObserverWithCredit(t, wrapped, map[string]string{
 		"X-RateLimit-Prepaid-Remaining-USD": "1.0",
 	})
-	if _, err := observer.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	observer2, _, inner2 := testObserverWithCredit(t, wrapped, map[string]string{
 		"X-RateLimit-Prepaid-Remaining-USD": "0.5",
 	})
-	if _, err := observer2.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer2, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	if inner.calls != 1 || inner2.calls != 1 {
@@ -246,7 +246,7 @@ func TestObserverSkipsCreditObservationWithoutObserver(t *testing.T) {
 		"X-RateLimit-Credits-Used":          "240",
 		"X-RateLimit-Prepaid-Remaining-USD": "1.0",
 	})
-	if _, err := observer.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	day := observerNow.UTC().Format("2006-01-02")
@@ -267,7 +267,7 @@ func TestObserverPrimaryRecordsDenominator_guardRequired(t *testing.T) {
 	observer, _, _ := testObserverWithCredit(t, rec, map[string]string{
 		"X-RateLimit-Limit": "10000",
 	})
-	if _, err := observer.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.limitCalls) != 1 {
@@ -280,7 +280,7 @@ func TestObserverCreditsUsed_guardRequired(t *testing.T) {
 	observer, _, _ := testObserverWithCredit(t, rec, map[string]string{
 		"X-RateLimit-Credits-Used": "240",
 	})
-	if _, err := observer.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observer, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.usedCalls) != 1 {
@@ -289,10 +289,23 @@ func TestObserverCreditsUsed_guardRequired(t *testing.T) {
 	observerNil, _, _ := testObserverWithCredit(t, nil, map[string]string{
 		"X-RateLimit-Credits-Used": "240",
 	})
-	if _, err := observerNil.Do(bearerRequest(t)); err != nil {
+	if err := doAndClose(observerNil, bearerRequest(t)); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.usedCalls) != 1 {
 		t.Fatal("nil credit observer must not call ObserveCreditsUsed")
 	}
+}
+
+// doAndClose performs the request and closes the body. The observer reads its
+// credit headers off the response, so a test that leaks the body is testing the
+// same code with a resource the production caller does not leak.
+func doAndClose(c interface {
+	Do(*http.Request) (*http.Response, error)
+}, req *http.Request) error {
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
 }

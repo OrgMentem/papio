@@ -56,7 +56,11 @@ func TestWrapOpenAlexRecordsProviderFuseInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourcegate.SetOpenAlexAuthorization(req, "private-key")
-	if _, err := stack.Do(req.WithContext(context.Background())); err != nil {
+	resp, err := stack.Do(req.WithContext(context.Background()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
 	day := now.UTC().Format("2006-01-02")

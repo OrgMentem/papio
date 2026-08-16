@@ -94,15 +94,24 @@ func accumulatePromotedIdentity(base work.Work, ranked []resolver.Candidate) wor
 }
 
 // enrichmentPersistWork returns the subset of enricher output that may be written
-// durably. Search-derived strong identifiers are never exact-echo verified and must
-// not be adopted into canonical identity before validation; bibliographic gaps may
-// still be filled when they do not introduce new strong ids.
-func enrichmentPersistWork(anchor job.SubmittedIdentity, enriched work.Work) (work.Work, bool) {
+// durably. Every enricher reached from the enrich loop matches by title search,
+// so its strong identifiers are its guess about which of several same-titled
+// works the requester meant — never exact-echo verified — and adopting one makes
+// the guess this job's canonical identity, which validation then compares the
+// document against and confirms. Only bibliographic gaps the anchor left open
+// may be filled, and only when the record does not contradict it.
+//
+// The anchor's completeness is deliberately NOT a licence here: a full
+// title/authors/year tuple says the requester described the work, not that any
+// search result naming an identifier for it describes the same one.
+// The two failure meanings are separate returns on purpose: a record that
+// CONTRADICTS the anchor must abandon the match, while a record that simply has
+// nothing new to offer is a successful enrichment with no write. Folding both
+// into one bool made an agreeing record read as a conflict.
+func enrichmentPersistWork(anchor job.SubmittedIdentity, enriched work.Work) (out work.Work, changed, ok bool) {
 	if conflictsIdentity(anchor.Work, enriched) {
-		return work.Work{}, false
+		return work.Work{}, false, false
 	}
-	var out work.Work
-	changed := false
 	if anchor.Work.Title == "" && enriched.Title != "" {
 		out.Title = enriched.Title
 		changed = true
@@ -115,26 +124,7 @@ func enrichmentPersistWork(anchor job.SubmittedIdentity, enriched work.Work) (wo
 		out.Year = enriched.Year
 		changed = true
 	}
-	if anchor.InsufficientIdentityAuthority() {
-		return out, changed
-	}
-	for _, pair := range []struct {
-		dst   *string
-		value string
-		base  string
-	}{
-		{&out.DOI, enriched.DOI, anchor.Work.DOI},
-		{&out.PMID, enriched.PMID, anchor.Work.PMID},
-		{&out.ArXiv, enriched.ArXiv, anchor.Work.ArXiv},
-		{&out.ISBN, enriched.ISBN, anchor.Work.ISBN},
-		{&out.OpenAlex, enriched.OpenAlex, anchor.Work.OpenAlex},
-	} {
-		if pair.base == "" && pair.value != "" {
-			*pair.dst = pair.value
-			changed = true
-		}
-	}
-	return out, changed
+	return out, changed, true
 }
 
 // mergeObservedInMemory fills missing fields on base from observed for the

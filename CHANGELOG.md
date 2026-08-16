@@ -21,6 +21,22 @@ execution records kept during the initial build.
   A spent allowance warns and says work resumes at `00:00 UTC`.
 
 ### Fixed
+- **A paper found by title search no longer gets filed under that search's own
+  identifier.** Looking a title up returns a record, and *papio* was writing
+  that record's DOI onto your request as if you had supplied it. Two papers can
+  share a title — a preprint and an unrelated paper, a common review title, a
+  translation — so the identifier was a guess. It then became the thing the
+  downloaded PDF was checked against, and the PDF agreed, because it was the
+  document the guess came from: a wrong paper, filed under a citation it
+  matched, with nothing reporting a problem. The search still guides the same
+  attempt's search for a copy; it just no longer renames your request. Gaps you
+  left open — an author list, a year — are still filled in.
+- **Checking a downloaded PDF now asks whether it is the paper you asked for.**
+  The comparison used whichever identity the job had accumulated, so an
+  identifier adopted from an earlier search was the thing the document had to
+  agree with. It is now compared against what you submitted. Jobs already in
+  your database that picked up an identifier this way are re-checked against
+  your original request rather than against that identifier.
 - **An OpenAlex address copied out of a browser is now accepted.** The address
   the OpenAlex website actually shows — `https://openalex.org/works/W2741809807`
   — was refused as an invalid work id, because *papio* recognized only the

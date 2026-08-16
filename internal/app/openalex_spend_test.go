@@ -327,7 +327,11 @@ func TestEnrichmentSkippedEntirelyChargesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := svc.enrich(ctx, row)
+	anchor, err := jobs.SubmittedIdentity(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := svc.enrich(ctx, row, anchor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -781,7 +785,7 @@ func TestFloorPacingRefusesNextKeyedRequest(t *testing.T) {
 	if chosen.APIKey != keyed.APIKey {
 		t.Fatalf("first admission = %+v, want the keyed identity", chosen)
 	}
-	if _, err := observer.Do(floorProbe(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+	if err := probeAndClose(observer, floorProbe(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
 		t.Fatal(err)
 	}
 	if inner.keyed != 1 {
@@ -986,4 +990,17 @@ func TestUnreadableSiblingMarkerFailsClosed(t *testing.T) {
 	if sibling.siblings != 0 {
 		t.Fatalf("sibling calls = %d, want none against an unreadable marker", sibling.siblings)
 	}
+}
+
+// probeAndClose performs the probe and closes the body: the observer reads its
+// headers off the response, and a leaked body is a resource the production
+// caller does not leak.
+func probeAndClose(c interface {
+	Do(*http.Request) (*http.Response, error)
+}, req *http.Request) error {
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
 }

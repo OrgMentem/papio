@@ -47,7 +47,9 @@ func TestMetadataTransportAllowsKeepAlivesWhenDisabled(t *testing.T) {
 // real request rather than asserting on fields.
 func TestMetadataTransportReachesHTTP2CapableServer(t *testing.T) {
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
+		if _, err := w.Write([]byte("ok")); err != nil {
+			t.Errorf("handler write: %v", err)
+		}
 	}))
 	srv.EnableHTTP2 = true
 	srv.StartTLS()

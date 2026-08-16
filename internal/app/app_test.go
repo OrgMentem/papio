@@ -336,7 +336,12 @@ func terminalizeSubmitDedupJob(t *testing.T, jobs *job.Store, id, state string) 
 	}
 }
 
-func TestResolveEnrichesTitleOnlyWorkBeforeResolvers(t *testing.T) {
+// A title-search enrichment feeds THIS pass without becoming the job's
+// identity: the resolver is handed the matched DOI, and nothing durable adopts
+// it. This test asserted the opposite until the item-5 authority gate landed —
+// the old contract let a normalized-title match write its own DOI onto the
+// work, and validation then compared the document against that.
+func TestResolveEnrichesTitleOnlyWorkForThisPassOnly(t *testing.T) {
 	svc, jobs := newTestService(t)
 	enricher := &fakeEnricher{result: work.Work{
 		DOI: "10.1234/crossref", Title: "Exact Title", Authors: []string{"Jane Smith"}, Year: 2024,
@@ -366,11 +371,11 @@ func TestResolveEnrichesTitleOnlyWorkBeforeResolvers(t *testing.T) {
 	if enricher.calls != 1 || adapter.calls != 1 {
 		t.Fatalf("enricher/resolver calls = %d/%d, want 1/1", enricher.calls, adapter.calls)
 	}
-	if persisted.Work.DOI != "10.1234/crossref" {
-		t.Fatalf("persisted DOI = %q", persisted.Work.DOI)
+	if persisted.Work.DOI != "" {
+		t.Fatalf("persisted DOI = %q, want none: a title search cannot verify which work it matched", persisted.Work.DOI)
 	}
-	if len(adapter.requested) != 1 || adapter.requested[0].DOI != persisted.Work.DOI {
-		t.Fatalf("resolver received %+v, want enriched DOI", adapter.requested)
+	if len(adapter.requested) != 1 || adapter.requested[0].DOI != "10.1234/crossref" {
+		t.Fatalf("resolver received %+v, want the unpersisted enriched DOI", adapter.requested)
 	}
 }
 
