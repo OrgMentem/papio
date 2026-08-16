@@ -30,14 +30,34 @@ func TestWrappedFrontMatterDOIIsReconstructed(t *testing.T) {
 	}
 }
 
-// Reconstruction may only rescue a match. A wrapped DOI that reassembles into
-// a DIFFERENT work still refuses the candidate.
-func TestWrappedFrontMatterDOIStillRefusesAnotherWork(t *testing.T) {
-	target := work.Work{DOI: "10.1371/journal.pone.0187342", Title: "Motor-based bodily self", Authors: []string{"Campione"}}
-	text := "RESEARCH ARTICLE\n\nSomething Else Entirely\nAda Other\n2019\n" +
-		"Citation: ... https://doi.org/10.1371/journal.\npone.0999999\n"
-	if got := MatchIdentity(text, target); got.Result != IdentityReject {
-		t.Fatalf("result = %+v, want reject: the reassembled DOI names another work", got)
+// Reconstruction may only CONFIRM the requested DOI. A reassembled DOI is a
+// guess about typesetting, so it must never be the thing that refuses a
+// candidate: here the front matter reassembles into a different DOI while the
+// title and author corroborate the target, and the wrong-work verdict must not
+// come from the fused identifier.
+func TestReconstructedDOINeverRefusesACandidate(t *testing.T) {
+	target := work.Work{
+		DOI:     "10.1371/journal.pone.0187342",
+		Year:    2017,
+		Title:   "Motor-based bodily self is selectively impaired in eating disorders",
+		Authors: []string{"Campione"},
+	}
+	text := "RESEARCH ARTICLE\n\nMotor-based bodily self is selectively impaired\nin eating disorders\n" +
+		"Giovanna Cristina Campione\n2017\n" +
+		"Citation: Campione GC (2017) ... https://doi.org/10.1371/journal.\npone.0999999\n"
+	if got := MatchIdentity(text, target); got.Result == IdentityReject {
+		t.Fatalf("result = %+v, want no reject: a reassembled DOI is not refusal evidence", got)
+	}
+}
+
+// A DOI that is simply the last thing on its line is COMPLETE. Fusing it with
+// the first word of the following prose line invents an identifier no document
+// contains — which is exactly what the PDF-grab sweep then filed a captured
+// file under ("10.1234/grab.test" + "a" = "10.1234/grab.testa").
+func TestCompleteDOIAtLineEndDoesNotAbsorbTheNextLine(t *testing.T) {
+	got := FrontMatterDOIs("Grab Fixture\nDOI: 10.1234/grab.test\nabstract follows here\n")
+	if len(got) != 1 || got[0] != "10.1234/grab.test" {
+		t.Fatalf("FrontMatterDOIs = %v, want exactly the printed DOI", got)
 	}
 }
 
@@ -52,10 +72,11 @@ func TestWrappedDOIDoesNotFuseAcrossABlankLine(t *testing.T) {
 	}
 }
 
-// Blind identification must never publish a DOI known to be cut off.
-func TestFrontMatterDOIsOmitsTruncatedPrefix(t *testing.T) {
-	got := FrontMatterDOIs("Citation: ... https://doi.org/10.1371/journal.\npone.0187342\n")
-	if len(got) != 1 || got[0] != "10.1371/journal.pone.0187342" {
-		t.Fatalf("FrontMatterDOIs = %v, want only the reconstructed DOI", got)
+// Blind identification must publish only what the document actually printed:
+// neither the truncated prefix (a valid-looking DOI naming no work) nor the
+// reconstruction (papio's own guess) may name a captured file.
+func TestFrontMatterDOIsOmitsBothHalvesOfAWrappedDOI(t *testing.T) {
+	if got := FrontMatterDOIs("Citation: ... https://doi.org/10.1371/journal.\npone.0187342\n"); len(got) != 0 {
+		t.Fatalf("FrontMatterDOIs = %v, want nothing publishable from a wrapped DOI", got)
 	}
 }

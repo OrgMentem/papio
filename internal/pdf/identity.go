@@ -647,12 +647,13 @@ func normalizeDOI(v string) string {
 // wrong DOI, which used to be read as the document naming a DIFFERENT work —
 // every PLOS article was rejected as the wrong paper in production.
 //
-// conclusive is the subset that may be used to REFUSE a candidate: a match cut
-// off at a line break with nothing recoverable after it is incomplete
-// evidence, not contradictory evidence. Reconstruction can therefore only
-// rescue a match, never manufacture a rejection — the asymmetry matters
-// because a wrong reject costs a retry while a wrong accept files the wrong
-// paper under a citation.
+// conclusive is the subset that may REFUSE a candidate or, in the blind
+// PDF-grab path, NAME one: a match cut off at a line break is incomplete
+// evidence, and a DOI fused back together is a reconstruction, not something
+// the document printed. So a reconstruction can only ever CONFIRM a DOI the
+// caller already asked for — it can never manufacture a rejection, and it can
+// never be published as a captured file's identity. A wrong reject costs a
+// retry; a wrong accept files the wrong paper under a right citation.
 func documentDOIs(text string) (matchable, conclusive []string) {
 	seenMatchable, seenConclusive := make(map[string]bool), make(map[string]bool)
 	add := func(raw string, complete bool) {
@@ -676,19 +677,25 @@ func documentDOIs(text string) (matchable, conclusive []string) {
 			add(raw, true)
 			continue
 		}
-		// Cut at a line break. The wrapped-token hypothesis is only live when
-		// the very next line opens with DOI-body characters; a DOI printed as
-		// the last thing on its line is complete, and demoting it would throw
-		// away real refusal evidence. Exactly one break is crossed: a blank
-		// line starts a new block, and fusing across it would invent a DOI.
-		next := strings.TrimPrefix(strings.TrimPrefix(rest, "\r"), "\n")
-		suffix := doiContinuationPattern.FindString(next)
-		if suffix == "" {
+		// Cut at a line break. Only a prefix that CANNOT be a whole DOI is
+		// treated as truncated: pdftotext breaks the token after a separator,
+		// and a DOI never ends in one. Without that gate any DOI printed last
+		// on its line fuses with the first word of the following prose line,
+		// which invents an identifier that no document contains.
+		if !strings.ContainsAny(raw[len(raw)-1:], "./-_:;(") {
 			add(raw, true)
 			continue
 		}
+		// Exactly one break is crossed: a blank line starts a new block, and
+		// fusing across it would splice two unrelated identifiers.
+		next := strings.TrimPrefix(strings.TrimPrefix(rest, "\r"), "\n")
+		suffix := doiContinuationPattern.FindString(next)
+		if suffix == "" {
+			add(raw, false)
+			continue
+		}
 		add(raw, false)
-		add(raw+suffix, true)
+		add(raw+suffix, false)
 	}
 	return matchable, conclusive
 }

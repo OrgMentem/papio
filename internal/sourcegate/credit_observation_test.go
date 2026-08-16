@@ -131,7 +131,7 @@ func TestObserverCreditsUsedSeedsDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	m := budget.New(s, budget.WithCreditPolicy(func(string) budget.CreditPolicy {
+	m := budget.New(s, budget.WithNow(func() time.Time { return observerNow }), budget.WithCreditPolicy(func(string) budget.CreditPolicy {
 		return budget.CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 10_000}
 	}))
 	observer, _, _ := testObserverWithCredit(t, m, map[string]string{
@@ -171,7 +171,7 @@ func TestObserverPrepaidDropTriggersStickyClosure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	m := budget.New(s, budget.WithCreditPolicy(func(string) budget.CreditPolicy {
+	m := budget.New(s, budget.WithNow(func() time.Time { return observerNow }), budget.WithCreditPolicy(func(string) budget.CreditPolicy {
 		return budget.CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 10_000}
 	}))
 	wrapped := &prepaidLatchCredit{Manager: m}
@@ -205,7 +205,7 @@ func TestObserverFailedPrepaidPersistLeavesLatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	m := budget.New(s, budget.WithCreditPolicy(func(string) budget.CreditPolicy {
+	m := budget.New(s, budget.WithNow(func() time.Time { return observerNow }), budget.WithCreditPolicy(func(string) budget.CreditPolicy {
 		return budget.CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 10_000}
 	}))
 	wrapped := &prepaidLatchCredit{Manager: m, failPersist: errors.New("disk full")}
