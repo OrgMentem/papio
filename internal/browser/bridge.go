@@ -154,6 +154,17 @@ const CaptureRequestIDMinExtensionVersion = "0.10.0"
 // layer maps it to invalid_argument; other Sync errors are internal.
 var ErrInvalidFrame = errors.New("invalid browser frame")
 
+// beforeAutoBindFenceForTest, when non-nil, runs inside the fence transaction
+// before eligibility is re-checked. Tests use it to make the fence window
+// deterministic without relying on file-system timing. Nil in production.
+var beforeAutoBindFenceForTest func() error
+
+// afterAutoBindCommitForTest runs after MarkBoundToJobFenced commits but before
+// the validated bytes are staged into the winner's adoption directory. Tests
+// use it to simulate a concurrent cancel/terminal transition between commit
+// and ingest.
+var afterAutoBindCommitForTest func(grabID, jobID string) error
+
 // Bridge is the per-daemon-run browser bridge. Sessions are tracked in
 // memory: each native-host process carries a session_id, exactly one session
 // holds the offer/handoff flow, and later hellos from other browsers wait as
@@ -2166,6 +2177,18 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			// Another materialization already won this attempt. Retrying would
 			// re-deliver bytes that must never be attached, so the pending
 			// download is dropped instead of deferred.
+			delete(b.pendingDownloads, key)
+			delete(b.deliveryContexts, key)
+		case errors.Is(err, job.ErrAdoptNotAwaiting), errors.Is(err, job.ErrCandidateNotEligible):
+			// The picked job stopped awaiting this download before the bytes
+			// arrived (the human action was resolved or dismissed elsewhere).
+			// That is permanent, not environmental: deferring it would make
+			// the directory sweep retry an adoption the eligibility fence
+			// must refuse every time. Drop the pending frames and record the
+			// refusal so the reason is visible rather than silent.
+			if evErr := b.recordAdoptionDeferred(ctx, msg.JobID, p.Filename, err); evErr != nil {
+				log.Printf("papio: recording refused browser adoption: %v", evErr)
+			}
 			delete(b.pendingDownloads, key)
 			delete(b.deliveryContexts, key)
 		case err != nil:
@@ -5091,6 +5114,12 @@ func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *pro
 	}
 	if _, err := b.adoptOutsideSessionLock(ctx, jobID, pending.Filename, provenance, pending.Producer); err != nil {
 		_ = b.recordAdoptionDeferred(ctx, jobID, pending.Filename, err)
+		if errors.Is(err, job.ErrAdoptNotAwaiting) || errors.Is(err, job.ErrCandidateNotEligible) {
+			// Permanent, not environmental — see the same case in the
+			// download-complete handler. Retrying can only be refused again.
+			delete(b.deliveryContexts, key)
+			delete(b.pendingDownloads, key)
+		}
 		return nil
 	}
 	delete(b.deliveryContexts, key)
@@ -6945,6 +6974,106 @@ func (b *Bridge) recordAdoptionDeferred(ctx context.Context, jobID, filename str
 	return nil
 }
 
+func (b *Bridge) preserveDeferredAdoption(jobID, filename, stagedPath string) error {
+	rejectDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), "rejected", jobID)
+	if err := os.MkdirAll(rejectDir, 0o700); err != nil {
+		return err
+	}
+	dest := filepath.Join(rejectDir, filename)
+	if _, err := os.Stat(dest); err == nil {
+		dest = uniqueAdoptionDest(rejectDir, filename)
+	}
+	return b.moveGrabFile(stagedPath, dest)
+}
+
+func (b *Bridge) recoverDeferredAutoBind(ctx context.Context, grabID, jobID string) error {
+	if b.jobs == nil {
+		return nil
+	}
+	row, err := b.jobs.Get(ctx, jobID)
+	if err != nil || row == nil {
+		return nil
+	}
+	if job.Terminal(row.State) {
+		return nil
+	}
+	// Find the latest deferred filename for this job.
+	events, err := b.jobs.Events(ctx, jobID)
+	if err != nil {
+		return nil
+	}
+	var target string
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "browser.adoption_deferred" {
+			continue
+		}
+		detail, _ := events[i]["detail"].(map[string]any)
+		if f, _ := detail["filename"].(string); f != "" {
+			target = f
+			break
+		}
+	}
+	if target == "" {
+		return nil
+	}
+	// Prefer the staged file in the adoption directory; fall back to the
+	// rejected/ copy written for terminal jobs.
+	dirs := []string{
+		filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID),
+		filepath.Join(b.cfg.EffectiveAdoptionRoot(), "rejected", jobID),
+	}
+	var staged string
+	for _, d := range dirs {
+		candidate := filepath.Join(d, target)
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+			staged = candidate
+			break
+		}
+		if matches, _ := filepath.Glob(filepath.Join(d, target+"*")); len(matches) > 0 {
+			for _, m := range matches {
+				if info, err := os.Stat(m); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+					staged = m
+					break
+				}
+			}
+			if staged != "" {
+				break
+			}
+		}
+	}
+	if staged == "" {
+		return nil
+	}
+	// If the file is in rejected/, move it back to the adoption directory
+	// before ingestion (adoption requires confinement under the job's dir).
+	adoptDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
+	if filepath.Dir(staged) != adoptDir {
+		if err := os.MkdirAll(adoptDir, 0o700); err != nil {
+			return nil
+		}
+		dest := uniqueAdoptionDest(adoptDir, target)
+		if err := b.moveGrabFile(staged, dest); err != nil {
+			if err := b.copyGrabFile(staged, dest); err != nil {
+				return nil
+			}
+		}
+		staged = dest
+		target = filepath.Base(dest)
+	}
+	if _, err := b.ingestAdoptedFile(ctx, jobID, target, nil, nil); err != nil {
+		_ = b.recordAdoptionDeferred(ctx, jobID, target, err)
+		return nil
+	}
+	// Clean up grab staging if still present; grab row already job_created.
+	if grabRow, _ := b.grabs.Get(ctx, grabID); grabRow != nil {
+		_ = os.RemoveAll(filepath.Join(b.cfg.EffectiveAdoptionRoot(), "grabs", grabID))
+		if grabRow.QuarantinePath != "" {
+			_ = os.Remove(grabRow.QuarantinePath)
+		}
+	}
+	return nil
+}
+
 // scanAdoptionDir looks for exactly one settled candidate file in an
 // adoptable job's adoption directory. Dotfiles (.DS_Store) are invisible; any
 // .crdownload/.download marks an in-progress Chrome write and .part a
@@ -7046,6 +7175,13 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string) error {
 		}
 		name, ok := b.scanAdoptionDir(ctx, jobID)
 		if !ok {
+			// The directory is ambiguous (e.g. contains a pre-existing file
+			// alongside a deferred auto-bind staging). Try the filename-keyed
+			// deferred recovery, which names the exact file the committed claim
+			// meant to adopt and bypasses the single-file heuristic.
+			if g, _ := b.grabs.ByJobID(ctx, jobID); g != nil && g.State == grab.StateJobCreated {
+				_ = b.recoverDeferredAutoBind(ctx, g.ID, jobID)
+			}
 			continue
 		}
 		if _, err := b.ingestAdoptedFile(ctx, jobID, name, nil, nil); err != nil {
@@ -7144,6 +7280,17 @@ func (b *Bridge) sweepTerminalAdoptionsIn(ctx context.Context, root string, coll
 		if !collectible(row.State) {
 			continue
 		}
+		if g, _ := b.grabs.ByJobID(ctx, e.Name()); g != nil && g.State == grab.StateJobCreated && !artifactSafelyStored(row.State) {
+			// Committed auto-bind whose job never reached ready: bytes are
+			// in adoption/ or rejected/ and recovery keys on the exact filename.
+			// Ready/imported bytes are already in the immutable artifact store.
+			if entries, err := b.readAdoptionDir(filepath.Join(root, e.Name())); err == nil && len(entries) > 0 {
+				continue
+			}
+			if entries, err := b.readAdoptionDir(filepath.Join(filepath.Dir(root), "rejected", e.Name())); err == nil && len(entries) > 0 {
+				continue
+			}
+		}
 		_ = os.RemoveAll(filepath.Join(root, e.Name()))
 	}
 	return nil
@@ -7214,6 +7361,10 @@ func (b *Bridge) sweepGrabsIn(ctx context.Context, root string) error {
 			if !ok {
 				continue
 			}
+		} else if g.State == grab.StateQuarantined {
+			// Retry: validated bytes are in temp, not in the landing dir.
+			// Leave name empty — processSettledGrab stages temp directly.
+			name = ""
 		}
 		if err := b.processSettledGrab(ctx, g, filepath.Join(root, id), name); err != nil {
 			log.Printf("papio: pdf grab %s processing failed: %v", id, err)
@@ -7230,7 +7381,10 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 	if b.svc == nil || b.svc.Artifacts == nil || b.svc.Validate == nil {
 		return errors.New("acquisition service is not configured")
 	}
-	path := filepath.Join(dir, name)
+	path := ""
+	if name != "" {
+		path = filepath.Join(dir, name)
+	}
 	temp := g.QuarantinePath
 	if g.State != grab.StateQuarantined || temp == "" {
 		qdir, err := b.svc.Artifacts.QuarantineDir(g.ID)
@@ -7290,21 +7444,8 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 				})
 			}
 			excerpt := report.Text.Excerpt
-			winner, ok, _ := pdf.SelectAutoBindCandidate(excerpt, bindCandidates)
+			winner, ok, abstainReason := pdf.SelectAutoBindCandidate(excerpt, bindCandidates)
 			if ok {
-				jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), winner.Key)
-				if err := os.MkdirAll(jobDir, 0o700); err != nil {
-					return err
-				}
-				src := filepath.Join(dir, name)
-				if _, err := os.Stat(src); err != nil {
-					src = temp
-				}
-				dest := uniqueAdoptionDest(jobDir, name)
-				if err := b.copyGrabFile(src, dest); err != nil {
-					return err
-				}
-				boundName := filepath.Base(dest)
 				prov := grab.BindProvenance{
 					Method:               "candidate_auto_bind",
 					Rule:                 pdf.CandidateBindingRule,
@@ -7313,6 +7454,11 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 					Evidence:             winner.Evidence,
 				}
 				fence := func(ctx context.Context, tx *sql.Tx) error {
+					if beforeAutoBindFenceForTest != nil {
+						if err := beforeAutoBindFenceForTest(); err != nil {
+							return err
+						}
+					}
 					// Re-read through the transaction's connection only —
 					// the pool is a single connection the transaction already
 					// holds, so a pool read here would deadlock. A recompute
@@ -7333,30 +7479,83 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 					}
 					freshWinner, freshOK, _ := pdf.SelectAutoBindCandidate(excerpt, freshCandidates)
 					if !freshOK || freshWinner.Key != winner.Key {
-						return fmt.Errorf("candidate auto-bind fence rejected")
+						return grab.ErrFenceRejected
 					}
 					return nil
 				}
 				if err := b.grabs.MarkBoundToJobFenced(ctx, g.ID, winner.Key, "job_created", prov, fence); err != nil {
-					_ = os.Remove(dest)
-					if strings.Contains(err.Error(), "fence rejected") {
+					if errors.Is(err, grab.ErrFenceRejected) {
+						log.Printf("papio: auto-bind abstained for grab %s: fence rejected (winner %s, abstain %s)", g.ID, winner.Key, abstainReason)
 						_ = os.RemoveAll(dir)
 						return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
 					}
 					return err
 				}
-				_ = os.Remove(temp)
-				_ = os.RemoveAll(dir)
+				if afterAutoBindCommitForTest != nil {
+					if err := afterAutoBindCommitForTest(g.ID, winner.Key); err != nil {
+						log.Printf("papio: afterAutoBindCommit hook: %v", err)
+					}
+				}
+				// Private staging is the validated immutable quarantine copy (temp).
+				// It is the only source that reaches the winner's adoption directory,
+				// and only after the claim is durable. This closes TOCTOU (mutable
+				// landing file), the name=="" directory-copy bug, and the pre-commit
+				// orphan-adoption window in one: no bytes are visible to
+				// SweepAdoptions until the bind has committed.
+				jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), winner.Key)
+				if err := os.MkdirAll(jobDir, 0o700); err != nil {
+					// Claim is durable but staging failed — keep temp for recovery
+					// and record a deferred adoption with the intended filename.
+					fallback := name
+					if fallback == "" || !filepath.IsLocal(fallback) || fallback == "." || fallback == string(filepath.Separator) {
+						fallback = "grab.pdf"
+					}
+					_ = b.recordAdoptionDeferred(ctx, winner.Key, fallback, err)
+					return nil
+				}
+				fallbackName := name
+				if fallbackName == "" || !filepath.IsLocal(fallbackName) || fallbackName == "." || fallbackName == string(filepath.Separator) {
+					fallbackName = "grab.pdf"
+				}
+				dest := uniqueAdoptionDest(jobDir, fallbackName)
+				if err := b.copyGrabFile(temp, dest); err != nil {
+					_ = b.recordAdoptionDeferred(ctx, winner.Key, fallbackName, err)
+					return nil
+				}
+				boundName := filepath.Base(dest)
 				if _, err := b.ingestAdoptedFile(ctx, winner.Key, boundName, nil, nil); err != nil {
 					if evErr := b.recordAdoptionDeferred(ctx, winner.Key, boundName, err); evErr != nil {
 						return evErr
 					}
+					// Keep temp and the staged dest for filename-keyed recovery;
+					// do NOT RemoveAll(dir) yet — the orphan would be cleaned on
+					// success only. A terminal winner's directory is normally
+					// collectible, so move the staged copy to rejected/ to keep it
+					// human-visible when the job cannot be adopted.
+					if row, getErr := b.jobs.Get(ctx, winner.Key); getErr == nil && row != nil && job.Terminal(row.State) {
+						_ = b.preserveDeferredAdoption(winner.Key, boundName, dest)
+					}
+					return nil
 				}
+				_ = os.Remove(temp)
+				_ = os.RemoveAll(dir)
 				return nil
 			}
 		}
 		_ = os.RemoveAll(dir)
 
+		if len(candidates) == 0 {
+			log.Printf("papio: auto-bind abstained for grab %s: no candidates", g.ID)
+		} else {
+			bindCandidates2 := make([]pdf.BindCandidate, 0, len(candidates))
+			for _, c := range candidates {
+				bindCandidates2 = append(bindCandidates2, pdf.BindCandidate{Key: c.JobID, Work: c.Work, Bound: c.BoundDOIs})
+			}
+			_, _, abstainReason := pdf.SelectAutoBindCandidate(report.Text.Excerpt, bindCandidates2)
+			if abstainReason != "" {
+				log.Printf("papio: auto-bind abstained for grab %s: %s (candidates %d)", g.ID, abstainReason, len(bindCandidates2))
+			}
+		}
 		return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
 	}
 	var mismatch error

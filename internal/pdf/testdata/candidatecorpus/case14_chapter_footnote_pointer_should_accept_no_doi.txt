@@ -1,0 +1,15 @@
+Synaptic Plasticity in the Developing Cortex
+
+Elena Ruiz
+Department of Neuroscience, University of Examples
+
+Published 2018
+Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary method
+Erratum to this chapter is available at https://doi.org/10.1007/978-3-319-57379-3_19
+
+Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation poli
+DOI: 10.1007/978-3-319-57379-3_19
+
+Abstract
+We examine synaptic plasticity in developing cortex with synthetic electrophysiology.
+Results show age-dependent changes in potentiation thresholds.

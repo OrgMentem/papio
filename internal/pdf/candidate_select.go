@@ -82,7 +82,68 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	}
 
 	bylineText := identityByline(excerpt)
-	bylineSet := documentTokens(bylineText)
+	segments := bylineSegments(bylineText)
+	phrase := identityTitlePhrase(candidate.Work.Title)
+
+	// 1b. Front-matter correction and non-article markers.
+	//
+	// WHY this gate exists: candidate_select.go previously referenced
+	// nonArticleMarkers and correctionMarkers zero times, while MatchIdentity
+	// applies both (identity.go:22, :39, :55 and at :93, :112-122 via
+	// correctionMarkerIn and chapterErratumPrefixes). Consequence: an erratum
+	// whose front matter prints "Erratum: <target title>", the target's
+	// authors, the target's year and the target's own DOI passes all five
+	// gates and is auto-filed AS the original paper. The conclusive-identity
+	// veto cannot catch it because the DOI the document prints IS the target's.
+	// Reusing identity.go's helpers and its correctionPointerPhrases exclusion
+	// ("Erratum to this chapter is available at ..." must NOT be treated as
+	// the document being an erratum) closes that wrong-accept family.
+	//
+	// WHY the dispositions differ: a nonArticleMarkers hit (supplementary
+	// information, etc.) is a document that is not a paper at all and should
+	// hard-disqualify (fail, not Review). A correctionMarkers hit is a
+	// document ABOUT another work that legitimately reprints the target's
+	// front matter. For a single attested target MatchIdentity can afford
+	// Review there — the operator may have genuinely requested the erratum —
+	// and discarding it is irreversible while parking is not. A 1-of-N
+	// selection has no such attestation: no job claims "I am the erratum",
+	// so auto-binding the erratum to the paper's job is a silent misfile.
+	// The correct disposition for candidate binding is therefore abstain
+	// (hard fail, not Review, and never Qualifies): park the grab for a
+	// human, do not file it under the paper. Both dispositions reuse the same
+	// helpers (correctionMarkerIn already handles wide-gap gluing and the
+	// pointer-phrase exclusion single-sourced from identity.go).
+	foldedByline := typographicFolder.Replace(bylineText)
+	if m := candidateNonArticleMarker(foldedByline); m != "" {
+		q.Reason = "non_article_marker: " + m
+		q.Evidence = append(q.Evidence, "front matter marks non-article content: "+m)
+		return q
+	}
+	if m := correctionMarkerIn(strings.Split(foldedByline, "\n")); m != "" {
+		q.Reason = "correction_marker: " + m
+		q.Evidence = append(q.Evidence, "front matter marks a correction or comment: "+m)
+		return q
+	}
+
+	// Positional scoping for gates 2 and 3.
+	//
+	// WHY positional: gates 2 and 3 previously read a 2 KiB blob
+	// (identityByline) as a bag and treated any hit anywhere as positional
+	// evidence. documentTokens(bylineText) let a surname appearing only in the
+	// printed title or journal name satisfy "real author evidence", and
+	// titlePrintedAsLine accepted ANY matching segment, so a running head or
+	// a right-column reference line glued by wide-gap recovery satisfied
+	// "exact printed title". Combined with a shared author family name, a
+	// compatible year and the target's DOI cited on page one, the wrong
+	// document qualified. Both gates must read positionally: the author line
+	// is between the title line and the abstract, not inside the title or
+	// journal line; the title line is a plausible title position before the
+	// byline/abstract, not a repeated header. A repeated identical segment is
+	// evidence of a running head, not of a title. This fix shares one
+	// segmentation (bylineSegments, identityByline) so the positional
+	// definition never diverges.
+	titleStart, titleEnd, titleFoundForScope := findCandidateTitleRange(segments, phrase)
+	authorSet := candidateAuthorTokenSet(segments, titleStart, titleEnd, titleFoundForScope)
 
 	// 2. Real author evidence.
 	//
@@ -99,6 +160,14 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// lettered marker cannot be told from a different surname (Clarke vs
 	// Clark), so two independent markers are needed to establish authorship
 	// without an exact hit.
+	//
+	// WHY positional: author evidence is scoped to the byline segments
+	// between the title line and the abstract, excluding the title phrase's
+	// own tokens and journal/abstract segments. bylineHasExactly over the
+	// whole 2 KiB window let a surname appearing only in the title ("Stone"
+	// in "Stone Analysis of ...") satisfy the gate with no author line
+	// present. That unsupported WHY is why this gate now reads
+	// candidateAuthorTokenSet.
 	if len(candidate.Work.Authors) == 0 {
 		q.Reason = "author_evidence_required: target has no authors"
 		return q
@@ -110,12 +179,12 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 		if family == "" {
 			continue
 		}
-		if bylineHasExactly(bylineSet, family) {
+		if bylineHasExactly(authorSet, family) {
 			exact++
 			authorEvidence = append(authorEvidence, "author family name matched: "+family)
 			continue
 		}
-		if marked, _ := bylineMarkedSurname(bylineSet, family); marked {
+		if marked, _ := bylineMarkedSurname(authorSet, family); marked {
 			prefixed++
 			authorEvidence = append(authorEvidence, "author family name matched with an affiliation marker: "+family)
 		}
@@ -142,8 +211,28 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// same label and gluing recovery the identity rules use. Loose token
 	// overlap (60% threshold) is insufficient for autonomous selection; the
 	// whole title must be printed as a delimited line.
-	phrase := identityTitlePhrase(candidate.Work.Title)
-	if phrase == "" || !titlePrintedAsLine(bylineSegments(bylineText), phrase) {
+	//
+	// WHY strict prefix: titlePrintedAsLine accepts a punctuation boundary
+	// and up to four label words, so candidate "Target Title" is accepted
+	// against document "Target Title: A Different Study". For single-target
+	// verification that leniency is right (same work, subtitle dropped in
+	// metadata). For 1-of-N selection it lets a strict-prefix candidate win
+	// against a different work. This gate therefore requires that the printed
+	// line not be a strict extension across a subtitle boundary: after the
+	// phrase matches, the remainder of that segment must not introduce
+	// additional title content. Gluing recovery (ligature, hyphen-wrap,
+	// column-glue via bylineSegments) is kept intact; only trailing content
+	// is tightened. The same-work case (metadata genuinely lacking the
+	// subtitle) is deliberately sacrificed to abstention here: a wrong accept
+	// files the wrong paper, while abstention parks for a human and never
+	// corrupts the library.
+	//
+	// WHY positional: a title that appears as a running head or a
+	// right-column reference line glued by wide-gap recovery also satisfies
+	// the bag check. Title evidence must come from a plausible title
+	// position before the byline/abstract, not a repeated header. A repeated
+	// identical segment is evidence of a running head, not of a title.
+	if phrase == "" || !candidateTitlePrintedAsLine(segments, phrase) {
 		q.Reason = "title_not_printed_as_line"
 		return q
 	}
@@ -170,12 +259,31 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// The window is identityByline, the same 2 KiB byline the author/title
 	// gates read, so the year evidence is page-one front matter, not
 	// bibliography.
+	//
+	// WHY token-boundary: the previous check used strings.Contains on the
+	// raw byline text, so a year embedded in any longer number — a DOI like
+	// 10.1234/j.2019.05.003, an ISSN, a grant number or a page range
+	// containing 2019 — satisfied a 2019 candidate against a 2024 document
+	// and symmetrically masked a real conflict. bylineYears already defines a
+	// year token as \b(?:19|20)\d{2}\b; this gate reuses that definition via
+	// bylineYearPattern so the predicate compares year tokens with real
+	// boundaries, preserving the three neutral cases exactly.
 	if candidate.Work.Year != 0 {
-		if bylineYears(bylineText) && !strings.Contains(bylineText, fmt.Sprint(candidate.Work.Year)) {
+		yearTokens := bylineYearPattern.FindAllString(bylineText, -1)
+		hasYears := len(yearTokens) > 0
+		yearStr := fmt.Sprint(candidate.Work.Year)
+		contains := false
+		for _, y := range yearTokens {
+			if y == yearStr {
+				contains = true
+				break
+			}
+		}
+		if hasYears && !contains {
 			q.Reason = fmt.Sprintf("year_mismatch: byline year does not match requested year %d", candidate.Work.Year)
 			return q
 		}
-		if strings.Contains(bylineText, fmt.Sprint(candidate.Work.Year)) {
+		if contains {
 			q.Evidence = append(q.Evidence, "year matched")
 		}
 	}
@@ -213,6 +321,290 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	return q
 }
 
+// candidateNonArticleMarker reports the first nonArticleMarkers entry that
+// prefixes a segment of the byline window, or "" if none does. It mirrors
+// MatchIdentity's front-matter check but over the byline window and via
+// wideGapSegments, so a marker glued to a running head or page number
+// ("1  Supplementary information ...") is not missed for the same reason
+// correctionMarkerIn needs wide-gap recovery.
+func candidateNonArticleMarker(foldedByline string) string {
+	for _, line := range strings.Split(foldedByline, "\n") {
+		for _, seg := range wideGapSegments(line) {
+			lower := strings.ToLower(strings.TrimSpace(seg))
+			for _, marker := range nonArticleMarkers {
+				if strings.HasPrefix(lower, marker) {
+					return marker
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// findCandidateTitleRange returns the segment range that permissively matches
+// phrase via titleRunMatches, for positional scoping of the author gate. It
+// reuses titleRunMatches so the gluing and label recovery stay single-sourced.
+func findCandidateTitleRange(segments []titleSegment, phrase string) (startSeg, endSeg int, ok bool) {
+	if phrase == "" {
+		return 0, 0, false
+	}
+	for start, seg := range segments {
+		for offset := range min(len(seg.words), titleLabelWords+1) {
+			if offset != 0 && !seg.labels[offset-1] {
+				continue
+			}
+			if !titleRunMatches(segments[start:], offset, phrase) {
+				continue
+			}
+			// Walk to find where phrase completes to determine endSeg.
+			matched := 0
+			curOff := offset
+			for i := start; i < len(segments); i++ {
+				if matched != 0 && numberedRun(segments[i].words[curOff:]) {
+					curOff = 0
+					continue
+				}
+				words := segments[i].words[curOff:]
+				breaks := segments[i].breaks[curOff:]
+				curOff = 0
+				for j, word := range words {
+					switch {
+					case strings.HasPrefix(phrase[matched:], word):
+						matched += len(word)
+					case strings.HasPrefix(word, phrase[matched:]) && isASCIIDigits(word[len(phrase)-matched:]):
+						return start, i, true
+					default:
+						matched = -1
+						break
+					}
+					if matched == -1 {
+						break
+					}
+					if matched == len(phrase) {
+						if j == len(words)-1 || breaks[j] {
+							return start, i, true
+						}
+						matched = -1
+						break
+					}
+				}
+				if matched == -1 {
+					break
+				}
+				if i == len(segments)-1 {
+					break
+				}
+			}
+			return start, start, true
+		}
+	}
+	return 0, 0, false
+}
+
+// candidateAuthorTokenSet builds the token set that gate 2 may use for author
+// evidence. It excludes the title's own segments, any header before the title,
+// and anything at or after the abstract/keywords heading, so a surname that
+// appears only in the title or journal line cannot satisfy the gate.
+func candidateAuthorTokenSet(segments []titleSegment, titleStart, titleEnd int, hasTitle bool) map[string]struct{} {
+	set := make(map[string]struct{})
+	abstractIdx := len(segments)
+	for i, seg := range segments {
+		for _, w := range seg.words {
+			if w == "abstract" || w == "keywords" || w == "keyword" {
+				abstractIdx = i
+				break
+			}
+		}
+		if abstractIdx != len(segments) {
+			break
+		}
+	}
+	for i, seg := range segments {
+		if hasTitle {
+			if i < titleStart {
+				continue
+			}
+			if i >= titleStart && i <= titleEnd {
+				continue
+			}
+		}
+		if i >= abstractIdx {
+			continue
+		}
+		for _, w := range seg.words {
+			set[w] = struct{}{}
+		}
+	}
+	// If we excluded everything (no title found or title at end), fall back to
+	// all pre-abstract tokens so zero-author and similar gates still have
+	// evidence to report. This preserves the original fail-open for the
+	// author gate when title position is unknown, but title-positioned cases
+	// use the scoped set.
+	if len(set) == 0 && abstractIdx > 0 {
+		for i := 0; i < abstractIdx && i < len(segments); i++ {
+			for _, w := range segments[i].words {
+				set[w] = struct{}{}
+			}
+		}
+		if hasTitle {
+			for i := titleStart; i <= titleEnd && i < len(segments); i++ {
+				for _, w := range segments[i].words {
+					delete(set, w)
+				}
+			}
+		}
+	}
+	return set
+}
+
+// candidateTitlePrintedAsLine reports whether phrase is printed as a delimited
+// unit in a plausible title position with strict trailing-content enforcement.
+// It reuses titleRunMatches for gluing recovery but adds two tightenings over
+// the base helper: (1) strict prefix: after the phrase matches, the remainder
+// of that printed segment must not introduce additional title content (subtitle
+// boundary), and (2) positional: the match must start in the early byline
+// window before the author/abstract region, and a phrase that matches
+// identically in more than one distinct position is treated as a running head,
+// not a title.
+func candidateTitlePrintedAsLine(segments []titleSegment, phrase string) bool {
+	if phrase == "" {
+		return false
+	}
+	abstractIdx := len(segments)
+	for i, seg := range segments {
+		for _, w := range seg.words {
+			if w == "abstract" || w == "keywords" || w == "keyword" {
+				abstractIdx = i
+				break
+			}
+		}
+		if abstractIdx != len(segments) {
+			break
+		}
+	}
+	type matchPos struct{ start, end int }
+	var matches []matchPos
+	for start := range segments {
+		if start >= abstractIdx {
+			break
+		}
+		if start > 3 {
+			continue
+		}
+		seg := segments[start]
+		for offset := range min(len(seg.words), titleLabelWords+1) {
+			if offset != 0 && !seg.labels[offset-1] {
+				continue
+			}
+			if !candidateStrictTitleRunMatches(segments[start:], offset, phrase) {
+				continue
+			}
+			absEnd := start
+			matched := 0
+			curOff := offset
+			for i := start; i < len(segments); i++ {
+				if matched != 0 && numberedRun(segments[i].words[curOff:]) {
+					curOff = 0
+					continue
+				}
+				words := segments[i].words[curOff:]
+				breaks := segments[i].breaks[curOff:]
+				curOff = 0
+				for j, word := range words {
+					switch {
+					case strings.HasPrefix(phrase[matched:], word):
+						matched += len(word)
+					case strings.HasPrefix(word, phrase[matched:]) && isASCIIDigits(word[len(phrase)-matched:]):
+						absEnd = i
+						matched = len(phrase)
+						break
+					default:
+						matched = -1
+						break
+					}
+					if matched == -1 {
+						break
+					}
+					if matched == len(phrase) {
+						if j == len(words)-1 || breaks[j] {
+							absEnd = i
+							break
+						}
+						matched = -1
+						break
+					}
+				}
+				if matched == len(phrase) {
+					break
+				}
+				if matched == -1 {
+					break
+				}
+			}
+			matches = append(matches, matchPos{start: start, end: absEnd})
+		}
+	}
+	if len(matches) == 0 {
+		return false
+	}
+	if len(matches) > 1 {
+		seen := make(map[int]struct{})
+		for _, m := range matches {
+			seen[m.start] = struct{}{}
+		}
+		if len(seen) > 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// candidateStrictTitleRunMatches wraps titleRunMatches with strict trailing-
+// content enforcement: after the phrase matches, the remainder of that printed
+// segment must not introduce additional title content. A candidate "Target
+// Title" against document "Target Title: A Different Study" matches as a
+// prefix up to the colon, but the segment still contains "a different study"
+// after the boundary — that is a different work and must not auto-bind. Gluing
+// recovery (numberedRun, hyphen-wrap, ligature folding) is preserved because
+// the check delegates to titleRunMatches first; only trailing words beyond the
+// matched boundary are examined.
+func candidateStrictTitleRunMatches(segments []titleSegment, offset int, phrase string) bool {
+	if !titleRunMatches(segments, offset, phrase) {
+		return false
+	}
+	matched := 0
+	curOff := offset
+	for _, seg := range segments {
+		if matched != 0 && numberedRun(seg.words[curOff:]) {
+			curOff = 0
+			continue
+		}
+		words := seg.words[curOff:]
+		breaks := seg.breaks[curOff:]
+		curOff = 0
+		for j, word := range words {
+			switch {
+			case strings.HasPrefix(phrase[matched:], word):
+				matched += len(word)
+			case strings.HasPrefix(word, phrase[matched:]) && isASCIIDigits(word[len(phrase)-matched:]):
+				return true
+			default:
+				return false
+			}
+			if matched == len(phrase) {
+				if j == len(words)-1 {
+					return true
+				}
+				if breaks[j] {
+					return false
+				}
+				return false
+			}
+		}
+	}
+	return false
+}
+
 // SelectAutoBindCandidate returns the single candidate safe to bind automatically.
 // ok is false when none qualifies, more than one qualifies, or any candidate
 // lands in Review — ambiguity always abstains.
@@ -239,9 +631,6 @@ func SelectAutoBindCandidate(excerpt string, candidates []BindCandidate) (winner
 			qualified = append(qualified, q)
 		}
 	}
-	// Any Review alongside a qualifier is ambiguity: the document is
-	// suggestive of one candidate but conclusive for another. Abstain and
-	// surface the ambiguity rather than picking the qualifier.
 	if hasReview && len(qualified) > 0 {
 		return CandidateQualification{}, false, "ambiguous: qualifier alongside review (review: " + reviewKey + ")"
 	}

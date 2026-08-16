@@ -1,0 +1,15 @@
+Journal of Causal Synthesis 2020;3(1):1-19
+
+Causal Inference With Synthetic Controls Revisited
+
+Gregor Henschel, Fatima Rahman
+Causal Lab, University of Examples
+
+Published 2020
+Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation
+DOI: 10.5555/synth.2020.100
+
+Abstract
+We revisit synthetic control methods for causal inference with placebo tests.
+Simulations on synthetic panels assess bias and coverage.
+Recommendations for applied work are provided.

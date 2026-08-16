@@ -402,3 +402,206 @@ func TestSelectAutoBindCandidateEmptyPoolAbstains(t *testing.T) {
 		t.Fatalf("want reason no candidates, got %q", reason)
 	}
 }
+func TestQualifyCandidateErratumMarkerDisqualified(t *testing.T) {
+	w := work.Work{
+		Title:   "Quantum Networks Robustness Calibration Measurement",
+		Authors: []string{"Ada Lovelace"},
+		Year:    2026,
+		DOI:     "10.1234/abcd.1",
+	}
+	candidate := BindCandidate{Key: "job-erratum", Work: w, Bound: []string{"10.1234/abcd.1"}}
+	// Erratum front matter that reprints the target's title, authors, year and
+	// DOI verbatim — the veto cannot catch it because the DOI is the target's.
+	// Without the correction guard this would qualify; with it, abstain.
+	text := "Erratum: Quantum Networks Robustness Calibration Measurement\n" +
+		"Ada Lovelace (2026)\n" +
+		"DOI: 10.1234/abcd.1\n\nAbstract\nThis erratum corrects the previous paper.\n"
+	got := QualifyCandidate(text, candidate)
+	if got.Qualifies {
+		t.Fatalf("want Qualifies false for erratum marker, got %+v", got)
+	}
+	if got.Review {
+		t.Fatalf("want Review false for correction-marker abstention (hard fail, not Review), got %+v", got)
+	}
+	if !strings.Contains(got.Reason, "correction_marker:") {
+		t.Fatalf("want Reason correction_marker:, got %q evidence %v", got.Reason, got.Evidence)
+	}
+}
+
+func TestQualifyCandidateNonArticleMarkerDisqualified(t *testing.T) {
+	w := work.Work{
+		Title:   "Quantum Networks Robustness Calibration Measurement",
+		Authors: []string{"Ada Lovelace"},
+		Year:    2026,
+		DOI:     "10.1234/abcd.1",
+	}
+	candidate := BindCandidate{Key: "job-supp", Work: w, Bound: []string{"10.1234/abcd.1"}}
+	text := "Supplementary Information\n" +
+		"Quantum Networks Robustness Calibration Measurement\n" +
+		"Ada Lovelace (2026)\n" +
+		"DOI: 10.1234/abcd.1\n\nAbstract\nSupplemental data.\n"
+	got := QualifyCandidate(text, candidate)
+	if got.Qualifies {
+		t.Fatalf("want Qualifies false for non-article marker, got %+v", got)
+	}
+	if !strings.Contains(got.Reason, "non_article_marker:") {
+		t.Fatalf("want Reason non_article_marker:, got %q", got.Reason)
+	}
+}
+
+func TestQualifyCandidateChapterFootnoteNotErratum(t *testing.T) {
+	w := work.Work{
+		Title:   "Quantum Networks Robustness Calibration Measurement",
+		Authors: []string{"Ada Lovelace"},
+		Year:    2026,
+		DOI:     "10.1234/abcd.1",
+	}
+	candidate := BindCandidate{Key: "job-chapter", Work: w, Bound: []string{"10.1234/abcd.1"}}
+	// Springer chapter footnote pointing at an erratum published elsewhere must
+	// NOT be treated as the document being an erratum. The footnote sits past
+	// the 1 KiB front-matter DOI window but inside the 2 KiB byline window
+	// (matching the real fixture at offset ~1874), so FrontMatterDOIs does not
+	// see its DOI and the veto stays compatible; correctionMarkerIn must still
+	// exclude it via correctionPointerPhrases.
+	pad := strings.Repeat("x ", 600) // ~1200 bytes — pushes footnote past 1 KiB front-matter window, inside 2 KiB byline
+	text := "Quantum Networks Robustness Calibration Measurement\n" +
+		"Ada Lovelace (2026)\n" +
+		"DOI: 10.1234/abcd.1\n\nAbstract\nWe study quantum networks.\n" +
+		pad + "\n" +
+		"Erratum to this chapter is available at 10.1007/978-3-030-12345-6_12\n"
+	got := QualifyCandidate(text, candidate)
+	if !got.Qualifies {
+		t.Fatalf("want Qualifies true for chapter footnote (not an erratum), got %+v", got)
+	}
+	if got.Reason != "" {
+		t.Fatalf("want empty Reason for chapter footnote, got %q", got.Reason)
+	}
+}
+
+func TestQualifyCandidateYearTokenBoundary(t *testing.T) {
+	w := work.Work{
+		Title:   "Quantum Networks Robustness Calibration Measurement",
+		Authors: []string{"Ada Lovelace"},
+		Year:    2019,
+		DOI:     "10.1234/abcd.1",
+	}
+	candidate := BindCandidate{Key: "job-year-token", Work: w, Bound: []string{"10.1234/abcd.1"}}
+	// Byline contains grant "20191" which embeds 2019 as substring but not as
+	// a year token, plus the real document year 2024. Candidate year 2019 must
+	// DISQUALIFY (year_mismatch) — strings.Contains would have found 2019 inside
+	// 20191 and incorrectly qualified.
+	text := "Quantum Networks Robustness Calibration Measurement\n" +
+		"Ada Lovelace (2024) Grant 20191\n" +
+		"DOI: 10.1234/abcd.1\n\nAbstract\n"
+	got := QualifyCandidate(text, candidate)
+	if got.Qualifies {
+		t.Fatalf("want Qualifies false for year token mismatch (2019 vs 2024 with grant 20191), got %+v", got)
+	}
+	if !strings.Contains(got.Reason, "year_mismatch:") {
+		t.Fatalf("want Reason year_mismatch:, got %q evidence %v", got.Reason, got.Evidence)
+	}
+	// Symmetric: candidate expecting 2024 should still qualify (2024 token present).
+	w2 := work.Work{
+		Title:   "Quantum Networks Robustness Calibration Measurement",
+		Authors: []string{"Ada Lovelace"},
+		Year:    2024,
+		DOI:     "10.1234/abcd.1",
+	}
+	candidate2 := BindCandidate{Key: "job-year-token2", Work: w2, Bound: []string{"10.1234/abcd.1"}}
+	got2 := QualifyCandidate(text, candidate2)
+	if !got2.Qualifies {
+		t.Fatalf("want Qualifies true for matching year token 2024, got %+v", got2)
+	}
+}
+
+func TestQualifyCandidateStrictPrefixTitleDisqualified(t *testing.T) {
+	w := work.Work{
+		Title:   "Target Title",
+		Authors: []string{"Ada Lovelace"},
+		Year:    2026,
+		DOI:     "10.1234/abcd.1",
+	}
+	candidate := BindCandidate{Key: "job-prefix", Work: w, Bound: []string{"10.1234/abcd.1"}}
+	// Document's real title is "Target Title: A Different Study" — candidate
+	// "Target Title" is a strict prefix across a subtitle boundary. For
+	// single-target verification leniency is right; for 1-of-N it must abstain.
+	text := "Target Title: A Different Study\n" +
+		"Ada Lovelace (2026)\n" +
+		"DOI: 10.1234/abcd.1\n\nAbstract\n"
+	got := QualifyCandidate(text, candidate)
+	if got.Qualifies {
+		t.Fatalf("want Qualifies false for strict-prefix title, got %+v", got)
+	}
+	if !strings.Contains(got.Reason, "title_not_printed_as_line") {
+		t.Fatalf("want Reason title_not_printed_as_line for strict prefix, got %q", got.Reason)
+	}
+	// Exact-title document must still qualify: legitimate case still passes.
+	wExact := work.Work{
+		Title:   "Target Title",
+		Authors: []string{"Ada Lovelace"},
+		Year:    2026,
+		DOI:     "10.1234/abcd.1",
+	}
+	candidateExact := BindCandidate{Key: "job-exact", Work: wExact, Bound: []string{"10.1234/abcd.1"}}
+	textExact := "Target Title\n" +
+		"Ada Lovelace (2026)\n" +
+		"DOI: 10.1234/abcd.1\n\nAbstract\n"
+	gotExact := QualifyCandidate(textExact, candidateExact)
+	if !gotExact.Qualifies {
+		t.Fatalf("want Qualifies true for exact title, got %+v", gotExact)
+	}
+}
+
+func TestQualifyCandidateAuthorOnlyInTitleDisqualified(t *testing.T) {
+	w := work.Work{
+		Title:   "Stone Analysis of Soil Composition",
+		Authors: []string{"Stone"},
+		Year:    2024,
+		DOI:     "10.1234/abcd.1",
+	}
+	candidate := BindCandidate{Key: "job-stone", Work: w, Bound: []string{"10.1234/abcd.1"}}
+	// Title contains Stone, but byline has no author line with that surname —
+	// only the title, journal name and DOI. Author gate must read positionally
+	// (title segments excluded, only byline between title and abstract).
+	text := "Stone Analysis of Soil Composition\n" +
+		"Journal of Geosciences (2024)\n" +
+		"DOI: 10.1234/abcd.1\n\nAbstract\nWe study soil.\n"
+	got := QualifyCandidate(text, candidate)
+	if got.Qualifies {
+		t.Fatalf("want Qualifies false when surname only in title, got %+v", got)
+	}
+	if !strings.Contains(got.Reason, "author_evidence_required") {
+		t.Fatalf("want Reason author_evidence_required for title-only surname, got %q", got.Reason)
+	}
+	// Legitimate paper with real author line still qualifies.
+	textLegit := "Stone Analysis of Soil Composition\n" +
+		"Margaret Stone (2024)\n" +
+		"DOI: 10.1234/abcd.1\n\nAbstract\nWe study soil.\n"
+	gotLegit := QualifyCandidate(textLegit, candidate)
+	if !gotLegit.Qualifies {
+		t.Fatalf("want Qualifies true for legitimate author line, got %+v", gotLegit)
+	}
+}
+
+func TestQualifyCandidateRunningHeadTitleDisqualified(t *testing.T) {
+	w := work.Work{
+		Title:   "Quantum Networks Robustness Calibration Measurement",
+		Authors: []string{"Ada Lovelace"},
+		Year:    2026,
+		DOI:     "10.1234/abcd.1",
+	}
+	candidate := BindCandidate{Key: "job-head", Work: w, Bound: []string{"10.1234/abcd.1"}}
+	// Title appears both as the document's real title and again as a running
+	// head glued via wide-gap (simulated with double spaces). Positional gate
+	// must treat repeated identical segment as running head, not title evidence.
+	text := "Quantum Networks Robustness Calibration Measurement\n" +
+		"Ada Lovelace (2026)\n" +
+		"DOI: 10.1234/abcd.1  Quantum Networks Robustness Calibration Measurement\n\nAbstract\n"
+	got := QualifyCandidate(text, candidate)
+	if got.Qualifies {
+		t.Fatalf("want Qualifies false for running-head title, got %+v", got)
+	}
+	if !strings.Contains(got.Reason, "title_not_printed_as_line") {
+		t.Fatalf("want Reason title_not_printed_as_line for running head, got %q", got.Reason)
+	}
+}

@@ -5,10 +5,157 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
+	"papio/internal/store"
 	"papio/internal/work"
 )
+
+// CandidateEligibleKind and CandidateEligibleStatus define the single durable
+// predicate for the auto-bind pool: "still carrying an open manual_download
+// action". Every pool query MUST reference these rather than restating the
+// literals, so the veto and the pool agree by construction.
+const (
+	CandidateEligibleKind   = "manual_download"
+	CandidateEligibleStatus = "open"
+)
+
+// AdoptAwaitingDetail is the house-voice remedy when a job stops awaiting a
+// human download before bytes are adopted. No internals vocabulary.
+const AdoptAwaitingDetail = "This choice is no longer available — please open the popup and choose the paper again."
+
+// ErrAdoptNotAwaiting reports that adoption was refused because the job is
+// not awaiting any human action. It is deliberately NOT wrapped around
+// ErrCandidateNotEligible: the two answer different questions (may these
+// bytes enter this job at all, versus may the auto-bind pool offer this job),
+// so a caller that means one must not match the other by accident. Callers
+// that treat a refusal as permanent check both explicitly.
+var ErrAdoptNotAwaiting = errors.New("job is not awaiting a human handoff")
+
+// ErrCandidateNotEligible reports that the auto-bind pool did not offer this
+// job: not in StateAwaitingHuman or no open manual_download.
+var ErrCandidateNotEligible = errors.New("candidate not eligible")
+
+// CandidateNotEligibleDetail is the house-voice detail for ErrCandidateNotEligible.
+// Kept as alias for callers that name that error specifically.
+const CandidateNotEligibleDetail = AdoptAwaitingDetail
+
+// AdoptEligible reports whether a job in StateAwaitingHuman still has at
+// least one open human action of any kind. This is the broader adoption
+// acceptance predicate: a job accepts bytes only while it is genuinely waiting
+// for a human to supply them. It is deliberately weaker than
+// CandidateEligible (which requires kind=manual_download). Two predicates for
+// two different questions is intentional; what this tree forbids is two
+// definitions of the same relation.
+// See CandidateEligibleKind/CandidateEligibleStatus for the stricter pool
+// predicate.
+func (js *Store) AdoptEligible(ctx context.Context, jobID string) (bool, error) {
+	var dummy int
+	err := js.S.DB().QueryRowContext(ctx,
+		`SELECT 1 FROM jobs j WHERE j.id = ? AND j.state = ? AND EXISTS (SELECT 1 FROM human_actions a WHERE a.job_id = j.id AND a.status = 'open') LIMIT 1`,
+		jobID, StateAwaitingHuman).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// AdoptEligibleTx is the transaction-scoped variant of AdoptEligible.
+func AdoptEligibleTx(ctx context.Context, tx *sql.Tx, jobID string) (bool, error) {
+	var dummy int
+	err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM jobs j WHERE j.id = ? AND j.state = ? AND EXISTS (SELECT 1 FROM human_actions a WHERE a.job_id = j.id AND a.status = 'open') LIMIT 1`,
+		jobID, StateAwaitingHuman).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// TransitionAwaitingToValidatingIfAdoptEligible atomically verifies the
+// adoption acceptance predicate (StateAwaitingHuman + at least one open human
+// action of any kind) and moves the job to validating with the given
+// candidate. The verification and the state change share one transaction on
+// the same connection, so a concurrent DismissHumanAction commit cannot slip
+// between them. Reads inside go through tx only.
+func (js *Store) TransitionAwaitingToValidatingIfAdoptEligible(ctx context.Context, jobID string, candidateID int64) error {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	eligible, err := AdoptEligibleTx(ctx, tx, jobID)
+	if err != nil {
+		return err
+	}
+	if !eligible {
+		return fmt.Errorf("%w: %s", ErrAdoptNotAwaiting, AdoptAwaitingDetail)
+	}
+	now := store.Now()
+	detail := map[string]any{"reason": "adopt_browser_download", "source": "browser", "from": StateAwaitingHuman, "to": StateValidating}
+	detailJSON, err := json.Marshal(detail)
+	if err != nil {
+		return err
+	}
+	releaseLease := releasesLease(StateValidating)
+	res, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET state = ?, updated_at = ?, selected_candidate_id = COALESCE(?, selected_candidate_id), lease_owner = CASE WHEN ? THEN NULL ELSE lease_owner END, lease_expires_at = CASE WHEN ? THEN NULL ELSE lease_expires_at END WHERE id = ? AND state = ?`,
+		StateValidating, now, candidateID, releaseLease, releaseLease, jobID, StateAwaitingHuman)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		eligibleNow, _ := AdoptEligibleTx(ctx, tx, jobID)
+		if !eligibleNow {
+			return fmt.Errorf("%w: %s", ErrAdoptNotAwaiting, AdoptAwaitingDetail)
+		}
+		return fmt.Errorf("%w: job %s not in state %s", ErrConflict, jobID, StateAwaitingHuman)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.transition', ?)`, jobID, now, string(detailJSON)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CandidateEligible reports whether a single job currently satisfies the
+// auto-bind pool predicate (StateAwaitingHuman + open manual_download). This
+// is the stricter pool predicate; AdoptEligible is the broader acceptance one.
+func (js *Store) CandidateEligible(ctx context.Context, jobID string) (bool, error) {
+	var dummy int
+	err := js.S.DB().QueryRowContext(ctx,
+		`SELECT 1 FROM jobs j WHERE j.id = ? AND j.state = ? AND EXISTS (SELECT 1 FROM human_actions a WHERE a.job_id = j.id AND a.status = ? AND a.kind = ?) LIMIT 1`,
+		jobID, StateAwaitingHuman, CandidateEligibleStatus, CandidateEligibleKind).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// CandidateEligibleTx is the transaction-scoped variant.
+func CandidateEligibleTx(ctx context.Context, tx *sql.Tx, jobID string) (bool, error) {
+	var dummy int
+	err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM jobs j WHERE j.id = ? AND j.state = ? AND EXISTS (SELECT 1 FROM human_actions a WHERE a.job_id = j.id AND a.status = ? AND a.kind = ?) LIMIT 1`,
+		jobID, StateAwaitingHuman, CandidateEligibleStatus, CandidateEligibleKind).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
 // CandidateEligibleJob is a job that inbound PDF bytes may be correlated with:
 // live, awaiting a human download, and still carrying an open manual_download
@@ -37,10 +184,6 @@ func (js *Store) ListCandidateEligibleJobs(ctx context.Context) ([]CandidateElig
 	if err != nil {
 		return nil, err
 	}
-	// Populate BoundDOIs for every candidate. One SubmittedIdentity load per
-	// candidate is acceptable: the pool is a human's manual-download backlog,
-	// bounded and small, and the alternative is a second SQL expression of the
-	// same bound-DOI rule.
 	for i := range jobs {
 		anchor, err := fetchSubmittedIdentity(ctx, js.S.DB(), jobs[i].JobID)
 		if err != nil {
@@ -51,12 +194,7 @@ func (js *Store) ListCandidateEligibleJobs(ctx context.Context) ([]CandidateElig
 	return jobs, nil
 }
 
-// ListCandidateEligibleJobsTx is the transaction-scoped variant of
-// ListCandidateEligibleJobs. It MUST be used by callers already inside a
-// transaction: db.SetMaxOpenConns(1) means the transaction holds the ONLY
-// connection, so any query issued through the pool (rather than through that
-// tx) inside the transaction DEADLOCKS. Reading through the tx observes the
-// transaction's own view, which is the whole point of the fence.
+// ListCandidateEligibleJobsTx is the transaction-scoped variant.
 func ListCandidateEligibleJobsTx(ctx context.Context, tx *sql.Tx) ([]CandidateEligibleJob, error) {
 	jobs, err := queryCandidateEligibleJobs(ctx, tx)
 	if err != nil {
@@ -72,18 +210,7 @@ func ListCandidateEligibleJobsTx(ctx context.Context, tx *sql.Tx) ([]CandidateEl
 	return jobs, nil
 }
 
-// queryCandidateEligibleJobs shares ONE SQL body between the pool and
-// transaction entry points. It reuses the existing handoffQueryer interface
-// that already covers QueryContext for *sql.DB/*sql.Tx, checked before
-// inventing a new one.
 func queryCandidateEligibleJobs(ctx context.Context, q handoffQueryer) ([]CandidateEligibleJob, error) {
-	// One joined query so the pool cannot observe a half-written action/job
-	// pair between separate reads, and so work metadata arrives without N+1
-	// lookups. Work hydration mirrors the neighbouring joined queries (see
-	// queryOpenHandoffJobs): title/authors/year/zotio key from work_requests
-	// with COALESCE for nullable columns, and identifiers via scalar
-	// sub-selects, scanning with the same sql.NullString/COALESCE and
-	// jsonScanner style.
 	query := `
 		SELECT j.id,
 		       COALESCE(w.title,''),
@@ -98,11 +225,11 @@ func queryCandidateEligibleJobs(ctx context.Context, q handoffQueryer) ([]Candid
 		FROM human_actions a
 		JOIN jobs j ON j.id = a.job_id
 		JOIN work_requests w ON w.id = j.work_request_id
-		WHERE a.status = 'open' AND a.kind = 'manual_download' AND j.state = ?
+		WHERE a.status = ? AND a.kind = ? AND j.state = ?
 		GROUP BY j.id
 		ORDER BY MIN(a.created_at) ASC, MIN(a.id) ASC, j.id ASC`
 
-	rows, err := q.QueryContext(ctx, query, StateAwaitingHuman)
+	rows, err := q.QueryContext(ctx, query, CandidateEligibleStatus, CandidateEligibleKind, StateAwaitingHuman)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +258,7 @@ func queryCandidateEligibleJobs(ctx context.Context, q handoffQueryer) ([]Candid
 		item.Work.ArXiv = arxiv
 		item.Work.ISBN = isbn
 		item.Work.OpenAlex = openalex
-		_ = zotioKey // work.Work has no zotio field; scanned to keep column list aligned with Get/queryOpenHandoffJobs
+		_ = zotioKey
 		if err := json.Unmarshal([]byte(authorsJSON), &item.Work.Authors); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("job %s authors: %w", item.JobID, err)

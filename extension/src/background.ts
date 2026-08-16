@@ -872,6 +872,7 @@ export interface BridgeDeps {
     group?(opts: { tabIds: number[]; groupId?: number }): Promise<number>;
   };
   webNavigation?: {
+    onCommitted?: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
     onHistoryStateUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
     onReferenceFragmentUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
     onTabReplaced: Listenable<[{ addedTabId: number; removedTabId: number }]>;
@@ -4688,6 +4689,7 @@ export class Bridge {
       });
     }
     if (governorQueuedAtRestart.length > 0) await this.drainHandoffDriveQueue();
+    await this.reconcilePendingDeliveryOnStartup();
     await this.redrivePendingTermsGates();
     for (const job of this.store.activeJobs) {
       if (job.status === "queued")
@@ -4951,12 +4953,30 @@ export class Bridge {
       return undefined;
     return opener;
   }
-  // Build current PageIdentity for tab. Guard for absence (no webNavigation).
+  private comparableDeliverySourceURL(rawURL: string): string {
+    const viewer = providerViewerPDFURL(rawURL, this.deps.adapterSpecs);
+    if (viewer !== undefined) return viewer;
+    return pdfSourceURL(rawURL);
+  }
+  private pageSourceToken(rawURL: string): string {
+    const comparable = this.comparableDeliverySourceURL(rawURL);
+    try {
+      const u = new URL(comparable);
+      return `${u.origin}${u.pathname}`;
+    } catch {
+      const q = comparable.indexOf("?");
+      const h = comparable.indexOf("#");
+      let end = comparable.length;
+      if (q !== -1) end = Math.min(end, q);
+      if (h !== -1) end = Math.min(end, h);
+      return comparable.slice(0, end);
+    }
+  }
   private currentPageIdentity(tabId: number, sourceURL: string): PageIdentity {
     return {
       tab_id: tabId,
       nav_seq: this.pageNavSeq.get(tabId) ?? 0,
-      source_url: sourceURL,
+      source_url: this.pageSourceToken(sourceURL),
       ...(this.pageDocumentId.get(tabId) !== undefined
         ? { document_id: this.pageDocumentId.get(tabId)! }
         : {}),
@@ -4967,11 +4987,15 @@ export class Bridge {
     if (a.tab_id !== b.tab_id) return false;
     if (a.nav_seq !== b.nav_seq) return false;
     if (a.source_url !== b.source_url) return false;
-    // document_id present -> must match; absent on either side -> compare nav_seq only
-    if (a.document_id !== undefined && b.document_id !== undefined) {
-      if (a.document_id !== b.document_id) return false;
-    }
+    // Token is origin+pathname (query stripped for credential safety and to avoid rejecting same doc with re-issued signed query). Two docs from one path differing only in query look identical, so epoch distinguishes them.
+    if ((a.document_id === undefined) !== (b.document_id === undefined)) return false;
+    if (a.document_id === undefined && b.document_id === undefined) return true;
+    if (a.document_id !== b.document_id) return false;
     return true;
+  }
+
+  private isFirefox(): boolean {
+    return this.deps.downloads.onDeterminingFilename === undefined;
   }
 
   private advisoryCandidates(): DeliveryCandidate[] {
@@ -5013,7 +5037,10 @@ export class Bridge {
   private consumeDeliveryChoice(choice: DeliveryChoice): { pageIdentity: PageIdentity; candidates: string[] } | undefined {
     const entry = this.deliveryChoiceNonces.get(choice.interaction);
     if (entry === undefined) return undefined;
-    // Delete BEFORE any await — one-shot.
+    if (this.deps.now() - entry.mintedAt > 10 * 60_000) {
+      this.deliveryChoiceNonces.delete(choice.interaction);
+      return undefined;
+    }
     this.deliveryChoiceNonces.delete(choice.interaction);
     if (!entry.candidates.includes(choice.job_id)) return undefined;
     return entry;
@@ -5028,6 +5055,11 @@ export class Bridge {
       if (v.pageIdentity.tab_id === tabId) this.deliveryChoiceNonces.delete(k);
     }
   }
+  private destroyDeliveryChoicesForJob(jobId: string): void {
+    for (const [k, v] of [...this.deliveryChoiceNonces]) {
+      if (v.candidates.includes(jobId)) this.deliveryChoiceNonces.delete(k);
+    }
+  }
 
   private bindWebNavigation(): void {
     if (this.webNavigationBound) return;
@@ -5035,20 +5067,32 @@ export class Bridge {
     try {
       const wn = (globalThis as unknown as { chrome?: { webNavigation?: unknown } }).chrome?.webNavigation as
         | {
+            onCommitted?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
             onHistoryStateUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
             onReferenceFragmentUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
             onTabReplaced?: { addListener: (cb: (d: { addedTabId: number; removedTabId: number }) => void) => void };
           }
         | undefined;
-      // Also try deps.webNavigation
       const depsWN = this.deps.webNavigation;
       const nav = (depsWN as unknown) ?? wn;
       if (nav === undefined || nav === null) return;
       const n = nav as {
+        onCommitted?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
         onHistoryStateUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
         onReferenceFragmentUpdated?: { addListener: (cb: (d: { tabId: number; frameId: number; documentId?: string }) => void) => void };
         onTabReplaced?: { addListener: (cb: (d: { addedTabId: number; removedTabId: number }) => void) => void };
       };
+      n.onCommitted?.addListener((d) => {
+        if (d.frameId !== 0) return;
+        const cur = this.pageNavSeq.get(d.tabId) ?? 0;
+        this.pageNavSeq.set(d.tabId, cur + 1);
+        if (d.documentId !== undefined) this.pageDocumentId.set(d.tabId, d.documentId);
+        this.destroyDeliveryChoiceForTab(d.tabId);
+        const pi = this.store.pendingDelivery?.page_identity;
+        if (pi !== undefined && pi.tab_id === d.tabId) {
+          void this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+        }
+      });
       n.onHistoryStateUpdated?.addListener((d) => {
         if (d.frameId !== 0) return;
         const cur = this.pageNavSeq.get(d.tabId) ?? 0;
@@ -5070,9 +5114,27 @@ export class Bridge {
         this.destroyDeliveryChoiceForTab(d.addedTabId);
         this.pageNavSeq.delete(d.addedTabId);
         this.pageDocumentId.delete(d.addedTabId);
+        const pi = this.store.pendingDelivery?.page_identity;
+        if (pi !== undefined && pi.tab_id === d.removedTabId) {
+          void this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+        }
       });
     } catch {
-      // Runtime without webNavigation — degrade to undefined document_id.
+    }
+  }
+  private async reconcilePendingDeliveryOnStartup(): Promise<void> {
+    const pending = this.store.pendingDelivery;
+    if (pending === undefined) return;
+    if (pending.status === "sending" && !this.deliveryJobs.has(pending.job_id)) {
+      let live = false;
+      try {
+        const found = await this.deps.downloads.search({ filename: jobDownloadFilename(pending.job_id) });
+        live = found.length > 0;
+      } catch {}
+      if (!live) {
+        await this.update((s) => clearPendingDelivery(s, pending.job_id));
+        this.deliveryJobs.delete(pending.job_id);
+      }
     }
   }
 
@@ -5142,40 +5204,50 @@ export class Bridge {
     if (payload.choice !== undefined) {
       const entry = this.consumeDeliveryChoice(payload.choice);
       if (entry === undefined) {
-        return { ok: false, state: "failed", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+        return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
       }
       // Revalidate before any await: job still awaiting_download, page identity still matches
       const pickedJob = findByJob(this.store, payload.choice.job_id);
       if (pickedJob === undefined || pickedJob.status !== "awaiting_download") {
-        return { ok: false, state: "failed", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+        return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
       }
-      // Page identity check: frozen vs live tab
       let tabCheck: TabInfo | undefined;
       try {
         tabCheck = await this.deps.tabs.get(payload.tab_id);
       } catch {
-        return { ok: false, state: "failed", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+        return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
       }
+      const liveTabURL = typeof tabCheck.url === "string" ? tabCheck.url : payload.url;
       const liveIdentity: PageIdentity = {
         tab_id: payload.tab_id,
         nav_seq: this.pageNavSeq.get(payload.tab_id) ?? 0,
-        source_url: pdfSourceURL(payload.url || (typeof tabCheck.url === "string" ? tabCheck.url : payload.url)) ?? payload.url,
+        source_url: this.pageSourceToken(liveTabURL),
         ...(this.pageDocumentId.get(payload.tab_id) !== undefined
           ? { document_id: this.pageDocumentId.get(payload.tab_id)! }
           : {}),
       };
       if (!this.pageIdentityMatches(entry.pageIdentity, liveIdentity)) {
-        return { ok: false, state: "failed", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
+        return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
       }
       this.destroyDeliveryChoiceForTab(payload.tab_id);
-      const tabURLForChoice = typeof tabCheck.url === "string" ? tabCheck.url : payload.url;
-      const viewerPDFURLForChoice = providerViewerPDFURL(tabURLForChoice, this.deps.adapterSpecs);
-      const urlForChoice = viewerPDFURLForChoice ?? pdfSourceURL(payload.url || tabURLForChoice);
+      const tabURLForChoice = liveTabURL;
+      const urlForChoice = this.comparableDeliverySourceURL(tabURLForChoice);
       const pending = this.store.pendingDelivery;
-      if (pending !== undefined && pending.status !== "failed" && pending.job_id !== pickedJob.job_id) {
+      const isStuckSending = pending !== undefined && pending.status === "sending" && pending.job_id === pickedJob.job_id;
+      if (isStuckSending) {
+        let liveDownload = false;
+        try {
+          const found = await this.deps.downloads.search({ filename: jobDownloadFilename(pending.job_id) });
+          liveDownload = found.length > 0;
+        } catch {}
+        if (!liveDownload && !this.deliveryJobs.has(pending.job_id)) {
+          await this.update((s) => clearPendingDelivery(s, pending.job_id));
+        } else {
+          return { ok: true, state: pending.status ?? "sending", job_id: pickedJob.job_id } as DeliveryReply;
+        }
+      } else if (pending !== undefined && pending.status !== "failed" && pending.job_id !== pickedJob.job_id) {
         return failure("delivery_busy", "Another PDF is already being sent to papio") as unknown as DeliveryReply;
-      }
-      if (pending?.job_id === pickedJob.job_id && pending.status !== "failed") {
+      } else if (pending?.job_id === pickedJob.job_id && pending.status !== "failed") {
         return { ok: true, state: pending.status ?? "sending", job_id: pickedJob.job_id } as DeliveryReply;
       }
       if (requiresNativeViewerDownload(urlForChoice ?? "")) {
@@ -5243,7 +5315,7 @@ export class Bridge {
     }
     const tabURL = typeof tab.url === "string" ? tab.url : payload.url;
     const viewerPDFURL = providerViewerPDFURL(tabURL, this.deps.adapterSpecs);
-    const url = viewerPDFURL ?? pdfSourceURL(payload.url || tabURL);
+    const url = viewerPDFURL ?? this.comparableDeliverySourceURL(tabURL);
     if (viewerPDFURL === undefined && !isPDFPage(tabURL) && !isPDFPage(url)) {
       return failure("not_pdf", "No PDF detected on this page");
     }
@@ -5255,10 +5327,12 @@ export class Bridge {
     let duplicate = false;
     if (job === undefined) {
       if (doi === undefined || doi.trim() === "") {
-        // DOI-less uncorrelated: offer picker if candidates exist, else blind grab
+        if (requiresNativeViewerDownload(url) && this.isFirefox()) {
+          return failure("not_pdf", "Open this PDF in your browser's viewer and use the viewer Download button — papio will file that download for you");
+        }
         const candidates = this.advisoryCandidates();
         if (candidates.length > 0) {
-          const sourceURL = url ?? payload.url;
+          const sourceURL = url;
           const pageIdentity = this.currentPageIdentity(payload.tab_id, sourceURL);
           const offer = this.mintDeliveryChoice(pageIdentity, candidates);
           return { ok: true, state: "needs_choice", choice: offer } as DeliveryReply;
@@ -9526,6 +9600,7 @@ export class Bridge {
   }
 
   private async removeJobWithOffer(jobID: string): Promise<void> {
+    this.destroyDeliveryChoicesForJob(jobID);
     const job = findByJob(this.store, jobID);
     const materialization = this.materializationCorrelation(jobID);
     const tabID = job?.tab_id;
@@ -15713,7 +15788,6 @@ export class Bridge {
       this.downloads.set(earlyJobID, early);
     }
     await this.ready;
-    // waiting_manual continuation must revalidate page identity before adopting
     if (
       this.store.pendingDelivery?.status === "waiting_manual" &&
       this.store.pendingDelivery.page_identity !== undefined
@@ -15725,16 +15799,37 @@ export class Bridge {
         this.destroyDeliveryChoiceState();
         return;
       }
-      const liveNavSeq = this.pageNavSeq.get(pi.tab_id) ?? 0;
-      const liveDocId = this.pageDocumentId.get(pi.tab_id);
-      if (liveNavSeq !== pi.nav_seq || (pi.document_id !== undefined && liveDocId !== undefined && pi.document_id !== liveDocId)) {
+      try {
+        const liveTab = await this.deps.tabs.get(pi.tab_id);
+        const liveToken = liveTab.url !== undefined ? this.pageSourceToken(liveTab.url) : undefined;
+        if (liveToken !== undefined && liveToken !== pi.source_url) {
+          await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+          this.destroyDeliveryChoiceState();
+          return;
+        }
+      } catch {
         await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
         this.destroyDeliveryChoiceState();
         return;
       }
-      // Also ensure the download's tab matches the frozen tab_id when present
+      const liveNavSeq = this.pageNavSeq.get(pi.tab_id);
+      const liveDocId = this.pageDocumentId.get(pi.tab_id);
+      if (liveNavSeq !== undefined && liveNavSeq !== pi.nav_seq) {
+        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+        this.destroyDeliveryChoiceState();
+        return;
+      }
+      if (pi.document_id !== undefined && liveDocId !== undefined && pi.document_id !== liveDocId) {
+        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+        this.destroyDeliveryChoiceState();
+        return;
+      }
+      if (pi.document_id === undefined && liveDocId !== undefined) {
+        await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
+        this.destroyDeliveryChoiceState();
+        return;
+      }
       if (typeof item.tabId === "number" && item.tabId !== pi.tab_id) {
-        // Not the viewer tab — don't adopt via waiting_manual
         await this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
         this.destroyDeliveryChoiceState();
         return;

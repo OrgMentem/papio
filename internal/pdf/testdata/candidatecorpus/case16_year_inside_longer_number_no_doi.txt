@@ -1,0 +1,15 @@
+Scaling Laws for Synthetic Language Models
+
+Rebecca Klein, Omar Haddad
+Synthetic Language Lab, University of Examples
+
+Published 2024
+Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary method
+Grant: 20191-007
+ISSN: 1234-20191
+DOI: 10.5555/synth.20191-999
+Candidate identifier on page one: doi:10.5555/synth.wrong.abc
+Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, an
+Abstract
+We study scaling laws for synthetic language models across compute budgets.
+This document cites the candidate DOI for identifier corroboration.

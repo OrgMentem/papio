@@ -1,0 +1,13 @@
+Network Embedding With Adaptive Sampling for Community Detection
+
+Foreign Author, External Collaborator
+Department of Synthetic Studies, University of Examples
+
+Published 2024
+Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation
+DOI: 10.5555/synth.2024.001
+
+Abstract
+We present an adaptive sampling method for community detection in large graphs.
+The approach selects landmark nodes and reconstructs embeddings efficiently.
+Keywords: network embedding, community detection

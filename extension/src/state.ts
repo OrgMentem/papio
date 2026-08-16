@@ -937,8 +937,10 @@ export function clearPendingDelivery(
  * field, so version 1 means the unversioned `papio_state_v1` blob. Version 3
  * added the URL-free explicit materialization correlation ledger; version 4
  * adds the URL-free operator-selected manual-delivery target; version 5 adds
- * the URL-free terms effect correlation ledger. */
-export const MANAGED_STATE_VERSION = 5;
+ * the URL-free terms effect correlation ledger; version 6 drops that pin and
+ * binds the one restart-surviving `waiting_manual` continuation to its exact
+ * page identity. */
+export const MANAGED_STATE_VERSION = 6;
 const STORAGE_KEY = "papio_state_v1";
 type UnknownRecord = Record<string, unknown>;
 
@@ -1188,8 +1190,40 @@ function migratedJob(
   delete migrated.direct_envelope;
   // The pin the picker replaced. A blob persisted before the cutover still
   // carries it through the spread above, and it must not survive as untyped
-  // ambient delivery authority.
+  // ambient delivery authority. Only the pin justified a non-handoff
+  // `awaiting_download` tab; without it that tab_id is unscoped residue that
+  // can claim a later unrelated download via `findByTab` / `correlate`.
+  // Handoff-driven jobs keep their tab_id (governor, parked_with_tab,
+  // daemon-issued drive epochs) — that correlation is daemon-scoped, not
+  // pin-scoped.
+  const wasPinned = raw.manual_delivery_target === true;
   delete (migrated as unknown as UnknownRecord).manual_delivery_target;
+  if (wasPinned) {
+    // Strip the residue only the pin justified: a tab opened for a manual
+    // viewer download, with no daemon drive behind it. Otherwise the tab_id
+    // survived exactly to catch the viewer's Download click as `findByTab`
+    // ambient authority — with the pin gone there's no visible state to
+    // explain that claim, and a later unrelated PDF in the same tab would be
+    // mis-attributed.
+    const hasDaemonDrive =
+      raw.drive_epoch !== undefined ||
+      raw.generic_drive_epoch !== undefined ||
+      raw.parked_with_tab === true ||
+      raw.handoffAckPending === true ||
+      raw.engagement_required === true ||
+      raw.direct_terminal === true ||
+      raw.generic_terminal === true;
+    if (!hasDaemonDrive) {
+      // Return to a pickable state: clear the inert awaiting_download park
+      // so the candidate picker can see this job again. Leave tab_id alone
+      // for `accepted` or other transient statuses — only the pin parked
+      // this job in awaiting_download.
+      if (migrated.status === "awaiting_download") {
+        migrated.status = "accepted";
+      }
+      (migrated as unknown as UnknownRecord).tab_id = -1;
+    }
+  }
   if (isFiniteNumber(value.auth_started_ms))
     migrated.auth_started_ms = value.auth_started_ms;
   const expectedRaw = value.expected;
@@ -1358,6 +1392,15 @@ function migratedPendingDelivery(value: unknown): PendingDelivery | undefined {
       // so a stale non-manual record cannot borrow manual authority.
       if (migrated.status === "waiting_manual") migrated.page_identity = pi;
     }
+  }
+  // A legacy `waiting_manual` without page_identity was written before the
+  // picker existed and cannot be revalidated against a page identity. It
+  // must fail closed rather than silently correlate by stale tab. Mark it
+  // failed so the job returns to a pickable state and the background's
+  // adoption guard (`page_identity !== undefined`) rejects it.
+  if (migrated.status === "waiting_manual" && migrated.page_identity === undefined) {
+    migrated.status = "failed";
+    migrated.error = "That download prompt expired — click Send this PDF again.";
   }
   return migrated;
 }
@@ -1583,6 +1626,7 @@ export function migrateManagedState(raw: unknown): StoreShape {
     version !== 2 &&
     version !== 3 &&
     version !== 4 &&
+    version !== 5 &&
     version !== MANAGED_STATE_VERSION
   )
     return emptyStore();

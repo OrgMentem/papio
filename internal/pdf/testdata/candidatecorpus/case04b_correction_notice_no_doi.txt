@@ -1,0 +1,15 @@
+Erratum: Robust Estimation of Treatment Effects Under Confounding
+
+Priya Natarajan
+Department of Synthetic Statistics, OrgMentem
+
+Published 2024
+Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation
+DOI: 10.5555/synth.2024.030-corr
+
+Abstract
+This erratum corrects the funding statement of the original article.
+The original article 10.5555/synth.2024.030 reported treatment effect estimation under confounding.
+
+Correction to: 10.5555/synth.2024.030
+Original title: Robust Estimation of Treatment Effects Under Confounding

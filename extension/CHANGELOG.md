@@ -61,6 +61,13 @@ for the full pre-split extension history.
   live job status spent their remaining width restating that nothing had aged
   yet; the age appears once there is one.
 
+### Fixed
+- **A pick is now checked against the page the browser reports, not the address the popup sent.** The acceptance check rebuilt the "live" page identity from the URL the popup had passed in, so it only ever proved the popup sent the same string twice — and on provider viewer routes the two sides computed that value by different rules, so the check could never succeed at all. Both sides now derive it the same way from the live tab. Ordinary page loads and reloads also count as page changes now (previously only in-page navigation did, so reloading a tab left an earlier pick valid), a pick expires once it is old rather than only when a newer one displaces it, and an epoch known on one side but not the other fails closed instead of falling back to the weaker comparison.
+- **A pick no longer outlives what it was granted for.** Finishing or removing a delivery revokes any outstanding offer that listed that paper, so a second PDF sent from the same page cannot be filed under a choice made for the first. Replacing a tab — a prerendered page activating, for example — clears the *Download* continuation bound to the old tab instead of leaving it stranded so every later pick returned the same stale state. A *sending* delivery interrupted by a service-worker restart is now reconciled at startup rather than leaving a paper you cannot retry.
+- **Only the address without its query is remembered.** A signed provider download link is a credential; the stored comparison value is now the origin and path only, so no signed link is written to extension storage.
+- **The picker no longer promises Firefox behaviour that cannot happen.** Firefox has no way for *papio* to follow a viewer's own *Download* button, so offering the picker for a native-viewer PDF left the delivery waiting forever. Firefox now says to use the viewer's Download button and explains that *papio* files that download.
+- **A pick made against a restarted worker re-offers the list instead of just clearing.** The popup re-requests the choice once and shows the fresh list, rather than resetting the button and making you click **Send PDF** again — which, given how aggressively the worker is stopped, was the common path rather than a rare one.
+
 ## [0.14.0] - 2026-08-14
 
 ### Added

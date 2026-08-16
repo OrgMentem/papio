@@ -1,0 +1,14 @@
+Bayesian Optimization for Hyperparameter Tuning in Deep Networks: A Different Study
+
+Mira Patel, Jonas Heller
+Synthetic Learning Lab, OrgMentem Institute
+
+Published 2021
+Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation
+DOI: 10.5555/synth.2021.010
+
+Abstract
+We describe a different study extending Bayesian optimization with additional experiments.
+This is not the original hyperparameter tuning paper but a sequel with distinct results.
+
+Keywords: bayesian optimization, sequel

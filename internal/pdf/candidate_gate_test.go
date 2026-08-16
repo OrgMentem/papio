@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -20,14 +21,17 @@ type manifestCandidate struct {
 }
 
 type manifestCase struct {
-	ID                   string              `json:"id"`
-	Document             string              `json:"document"`
-	RiskFamily           string              `json:"risk_family"`
-	Candidates           []manifestCandidate `json:"candidates"`
-	Truth                *string             `json:"truth"`
-	CanonicalEquivalence []string            `json:"canonical_equivalence"`
-	VetoWindow           bool                `json:"veto_window"`
-	VetoNote             string              `json:"veto_note,omitempty"`
+	ID                       string              `json:"id"`
+	Document                 string              `json:"document"`
+	RiskFamily               string              `json:"risk_family"`
+	Candidates               []manifestCandidate `json:"candidates"`
+	Truth                    *string             `json:"truth"`
+	CanonicalEquivalence     []string            `json:"canonical_equivalence"`
+	EquivalenceJustification *string             `json:"equivalence_justification"`
+	GroundTruthNote          string              `json:"ground_truth_note,omitempty"`
+	ProbeGate                string              `json:"probe_gate"`
+	VetoWindow               bool                `json:"veto_window"`
+	VetoNote                 string              `json:"veto_note,omitempty"`
 }
 
 type manifestFile struct {
@@ -70,6 +74,86 @@ func TestCandidateSelectionGate(t *testing.T) {
 		t.Fatalf("manifest has no cases")
 	}
 
+	// --- schema / semantic validation over manifest.json ---
+	allowedProbeGates := map[string]bool{
+		"veto": true, "predicate": true, "veto-window": true, "author": true, "year": true, "title/author": true,
+		"correction": true, "correction-pointer": true, "title-strict-prefix": true, "year-token-boundary": true,
+		"author-collision": true, "author-one-numeric": true, "author-one-lettered": true, "author-positional": true,
+	}
+	seenIDs := make(map[string]bool)
+	for i, c := range mf.Cases {
+		pfx := fmt.Sprintf("manifest cases[%d] %q", i, c.ID)
+		if c.ID == "" {
+			t.Fatalf("%s: missing id", pfx)
+		}
+		if seenIDs[c.ID] {
+			t.Fatalf("%s: duplicate id", pfx)
+		}
+		seenIDs[c.ID] = true
+		if c.Document == "" {
+			t.Fatalf("%s: missing document", pfx)
+		}
+		if c.RiskFamily == "" {
+			t.Fatalf("%s: missing risk_family", pfx)
+		}
+		if len(c.Candidates) == 0 {
+			t.Fatalf("%s: no candidates", pfx)
+		}
+		if c.ProbeGate == "" {
+			t.Fatalf("%s: missing probe_gate (must record which gate the case probes; see task item 1)", pfx)
+		}
+		if !allowedProbeGates[c.ProbeGate] {
+			t.Fatalf("%s: unknown probe_gate %q (allowed: %v)", pfx, c.ProbeGate, keysOf(allowedProbeGates))
+		}
+		if c.Truth != nil && *c.Truth == "" {
+			t.Fatalf("%s: truth is empty string, use null for absent", pfx)
+		}
+		// Validate equivalence labels: if canonical_equivalence is non-empty, justification must be present.
+		if len(c.CanonicalEquivalence) > 0 {
+			if c.EquivalenceJustification == nil || strings.TrimSpace(*c.EquivalenceJustification) == "" {
+				t.Fatalf("%s: canonical_equivalence %v requires equivalence_justification (reviewer: silent same-work label converts wrong-accept to scored abstention)", pfx, c.CanonicalEquivalence)
+			}
+			// equivalence keys must refer to candidate keys, and truth must not be duplicated in equivalence? Actually truth may be inside equivalence; equivalence lists same-work keys including truth.
+			candKeys := make(map[string]bool)
+			for _, mc := range c.Candidates {
+				candKeys[mc.Key] = true
+			}
+			for _, ek := range c.CanonicalEquivalence {
+				if !candKeys[ek] {
+					t.Fatalf("%s: canonical_equivalence key %q not among candidate keys %v", pfx, ek, keysOf(candKeys))
+				}
+			}
+			// truth if non-nil should be in equivalence when equivalence is used for same-work version pairs
+			if c.Truth != nil && !isEquivalent(*c.Truth, nil, c.CanonicalEquivalence) {
+				// For same-work cases, truth should be in equivalence; for other uses, at least warn?
+				// We require that the declared equivalence actually covers the truth, otherwise label is vacuous.
+				t.Fatalf("%s: canonical_equivalence %v does not include truth %q (justification: %q)", pfx, c.CanonicalEquivalence, *c.Truth, *c.EquivalenceJustification)
+			}
+		} else {
+			if c.EquivalenceJustification != nil && strings.TrimSpace(*c.EquivalenceJustification) != "" {
+				t.Fatalf("%s: equivalence_justification present but canonical_equivalence empty", pfx)
+			}
+		}
+		// Ground truth note is informative but not required except for new wrong-accept hunting cases; no hard check.
+
+		// Validate document exists
+		docPath := filepath.Join("testdata", "candidatecorpus", c.Document)
+		if _, err := os.Stat(docPath); err != nil {
+			t.Fatalf("%s: document %s not found: %v", pfx, docPath, err)
+		}
+		// VetoWindow cases must have veto_note
+		if c.VetoWindow && strings.TrimSpace(c.VetoNote) == "" {
+			t.Fatalf("%s: veto_window true but veto_note empty", pfx)
+		}
+		// DOI-less predicate cases should have no conclusive DOI in 1 KiB window (auto-bind only runs when FrontMatterDOIs empty)
+		if c.ProbeGate != "veto" && c.ProbeGate != "veto-window" {
+			docBytes, _ := os.ReadFile(docPath)
+			if dois := FrontMatterDOIs(string(docBytes)); len(dois) != 0 {
+				t.Fatalf("%s: probe_gate %q indicates DOI-less case but FrontMatterDOIs (1 KiB) is %v — hard negative must be DOI-less in blind window to reach gates 2-5 (bridge.go:7271)", pfx, c.ProbeGate, dois)
+			}
+		}
+	}
+
 	type tally struct {
 		total          int
 		wrongAccept    int
@@ -78,7 +162,11 @@ func TestCandidateSelectionGate(t *testing.T) {
 		missedAccept   int
 	}
 	var mainT, vetoT tally
+	byGate := make(map[string]*tally)
 	var wrongDetails []string
+	// also per-risk-family coverage check
+	familyHasPredicate := make(map[string]bool)
+	familyHasAny := make(map[string]bool)
 
 	for _, c := range mf.Cases {
 		docPath := filepath.Join("testdata", "candidatecorpus", c.Document)
@@ -104,29 +192,47 @@ func TestCandidateSelectionGate(t *testing.T) {
 			cur = &vetoT
 		}
 		cur.total++
+		// per-gate tally
+		gTally := byGate[c.ProbeGate]
+		if gTally == nil {
+			gTally = &tally{}
+			byGate[c.ProbeGate] = gTally
+		}
+		gTally.total++
+
+		familyHasAny[c.RiskFamily] = true
+		if c.ProbeGate != "veto" && c.ProbeGate != "veto-window" {
+			familyHasPredicate[c.RiskFamily] = true
+		}
 
 		switch {
 		case ok:
 			if c.Truth == nil {
 				cur.wrongAccept++
-				wrongDetails = append(wrongDetails, fmt.Sprintf("case %q (%s): wrong-accept choosing %q but truth is absent (evidence %v)", c.ID, c.RiskFamily, winner.Key, winner.Evidence))
+				gTally.wrongAccept++
+				wrongDetails = append(wrongDetails, fmt.Sprintf("case %q (%s) probe=%s: wrong-accept choosing %q but truth is absent (evidence %v)", c.ID, c.RiskFamily, c.ProbeGate, winner.Key, winner.Evidence))
 			} else if isEquivalent(winner.Key, c.Truth, c.CanonicalEquivalence) {
 				cur.correctAccept++
+				gTally.correctAccept++
 			} else {
 				cur.wrongAccept++
+				gTally.wrongAccept++
 				truth := "<nil>"
 				if c.Truth != nil {
 					truth = *c.Truth
 				}
-				wrongDetails = append(wrongDetails, fmt.Sprintf("case %q (%s): wrong-accept choosing %q but truth is %q equiv %v evidence %v", c.ID, c.RiskFamily, winner.Key, truth, c.CanonicalEquivalence, winner.Evidence))
+				wrongDetails = append(wrongDetails, fmt.Sprintf("case %q (%s) probe=%s: wrong-accept choosing %q but truth is %q equiv %v evidence %v", c.ID, c.RiskFamily, c.ProbeGate, winner.Key, truth, c.CanonicalEquivalence, winner.Evidence))
 			}
 		default:
 			if c.Truth == nil {
 				cur.correctAbstain++
+				gTally.correctAbstain++
 			} else if len(c.CanonicalEquivalence) > 0 {
 				cur.correctAbstain++
+				gTally.correctAbstain++
 			} else {
 				cur.missedAccept++
+				gTally.missedAccept++
 			}
 		}
 	}
@@ -136,6 +242,32 @@ func TestCandidateSelectionGate(t *testing.T) {
 	if vetoT.total > 0 {
 		t.Logf("veto-window (1-4 KiB residual, not folded): total=%d correct-accept=%d correct-abstain=%d missed-accept=%d wrong-accept=%d", vetoT.total, vetoT.correctAccept, vetoT.correctAbstain, vetoT.missedAccept, vetoT.wrongAccept)
 		t.Logf("veto-window detail: measures the deliberately narrow 1 KiB blind window; see manifest veto_note")
+	}
+	// Per-gate breakdown: makes clear which gates were actually probed.
+	t.Logf("per-gate breakdown (probe_gate):")
+	keys := make([]string, 0, len(byGate))
+	for k := range byGate {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, gate := range keys {
+		gt := byGate[gate]
+		t.Logf("  gate %-20s total=%d correct-accept=%d correct-abstain=%d missed-accept=%d wrong-accept=%d", gate, gt.total, gt.correctAccept, gt.correctAbstain, gt.missedAccept, gt.wrongAccept)
+	}
+	// Risk family coverage: every risk family must have at least one predicate-reaching case (DOI-less)
+	missingPredicate := []string{}
+	for fam := range familyHasAny {
+		// veto-window families measure the 1 KiB blind-window residual explicitly; they are not required to have a predicate variant
+		if strings.HasPrefix(fam, "veto-window") {
+			continue
+		}
+		if !familyHasPredicate[fam] {
+			missingPredicate = append(missingPredicate, fam)
+		}
+	}
+	if len(missingPredicate) > 0 {
+		sort.Strings(missingPredicate)
+		t.Errorf("coverage: families without DOI-less predicate case (never reach gates 2-5): %v — add a DOI-less variant per task item 1", missingPredicate)
 	}
 	totalWrong := mainT.wrongAccept + vetoT.wrongAccept
 	t.Logf("headline: wrong-accepts=%d (must be 0)", totalWrong)
@@ -152,6 +284,14 @@ func TestCandidateSelectionGate(t *testing.T) {
 		}
 		t.Fatalf("gate FAILED: %d wrong-accept(s) — the wrong paper would be filed under the right citation", totalWrong)
 	}
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 type sentinelSpec struct {

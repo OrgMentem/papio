@@ -37,7 +37,9 @@
         }
       ],
       "truth": "A",
-      "canonical_equivalence": []
+      "canonical_equivalence": [],
+      "probe_gate": "veto",
+      "equivalence_justification": null
     },
     {
       "id": "exact-title-different-year",
@@ -76,7 +78,9 @@
         }
       ],
       "truth": "C2021",
-      "canonical_equivalence": []
+      "canonical_equivalence": [],
+      "probe_gate": "veto",
+      "equivalence_justification": null
     },
     {
       "id": "citing-sequel",
@@ -115,7 +119,9 @@
         }
       ],
       "truth": "SEQ_A",
-      "canonical_equivalence": []
+      "canonical_equivalence": [],
+      "probe_gate": "veto",
+      "equivalence_justification": null
     },
     {
       "id": "correction-notice",
@@ -153,7 +159,9 @@
         }
       ],
       "truth": "ERRATUM",
-      "canonical_equivalence": []
+      "canonical_equivalence": [],
+      "probe_gate": "veto",
+      "equivalence_justification": null
     },
     {
       "id": "numbered-series",
@@ -190,7 +198,9 @@
         }
       ],
       "truth": "V3",
-      "canonical_equivalence": []
+      "canonical_equivalence": [],
+      "probe_gate": "veto",
+      "equivalence_justification": null
     },
     {
       "id": "conference-vs-journal",
@@ -231,7 +241,9 @@
         }
       ],
       "truth": "JOURNAL",
-      "canonical_equivalence": []
+      "canonical_equivalence": [],
+      "probe_gate": "veto",
+      "equivalence_justification": null
     },
     {
       "id": "preprint-vs-vor",
@@ -273,7 +285,9 @@
       "canonical_equivalence": [
         "PREPRINT",
         "VOR"
-      ]
+      ],
+      "probe_gate": "veto",
+      "equivalence_justification": "preprint and VoR are same work, version-collapsing equivalence per ADR-0008; accepting either is not wrong-accept"
     },
     {
       "id": "author-less-target",
@@ -309,7 +323,9 @@
         }
       ],
       "truth": "TRUE_NOAUTH",
-      "canonical_equivalence": []
+      "canonical_equivalence": [],
+      "probe_gate": "veto",
+      "equivalence_justification": null
     },
     {
       "id": "year-less-target",
@@ -347,7 +363,9 @@
         }
       ],
       "truth": "TRUE_NOYEAR",
-      "canonical_equivalence": []
+      "canonical_equivalence": [],
+      "probe_gate": "veto",
+      "equivalence_justification": null
     },
     {
       "id": "true-absent",
@@ -385,7 +403,9 @@
         }
       ],
       "truth": null,
-      "canonical_equivalence": []
+      "canonical_equivalence": [],
+      "probe_gate": "veto",
+      "equivalence_justification": null
     },
     {
       "id": "veto-window-correct-with-foreign",
@@ -425,7 +445,9 @@
       "truth": "CORRECT",
       "canonical_equivalence": [],
       "veto_window": true,
-      "veto_note": "CORRECT document carries foreign DOI at 1.5 KiB; blind veto window (1 KiB) should not see it"
+      "veto_note": "CORRECT document carries foreign DOI at 1.5 KiB; blind veto window (1 KiB) should not see it",
+      "probe_gate": "veto-window",
+      "equivalence_justification": null
     },
     {
       "id": "veto-window-wrong-with-own-doi",
@@ -465,7 +487,818 @@
       "truth": "WRONG",
       "canonical_equivalence": [],
       "veto_window": true,
-      "veto_note": "WRONG document cites TARGET's DOI on page one but its own DOI at 1.5 KiB; blind veto (1 KiB) misses own DOI"
+      "veto_note": "WRONG document cites TARGET's DOI on page one but its own DOI at 1.5 KiB; blind veto (1 KiB) misses own DOI",
+      "probe_gate": "veto-window",
+      "equivalence_justification": null
+    },
+    {
+      "id": "same-author-near-title-no-doi",
+      "document": "case01b_same_author_near_title_no_doi.txt",
+      "risk_family": "same-author near-title",
+      "candidates": [
+        {
+          "key": "A",
+          "work": {
+            "doi": "10.5555/synth.2024.001",
+            "title": "Network Embedding With Adaptive Sampling for Community Detection",
+            "authors": [
+              "Elena Vargas",
+              "Kenji Tanaka"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.001"
+          ]
+        },
+        {
+          "key": "B",
+          "work": {
+            "doi": "10.5555/synth.2024.002",
+            "title": "Network Embedding With Adaptive Sampling for Link Prediction",
+            "authors": [
+              "Elena Vargas",
+              "Kenji Tanaka"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.002"
+          ]
+        }
+      ],
+      "truth": "A",
+      "canonical_equivalence": [],
+      "probe_gate": "predicate"
+    },
+    {
+      "id": "exact-title-different-year-no-doi",
+      "document": "case02b_exact_title_different_year_no_doi.txt",
+      "risk_family": "exact title with a different year",
+      "candidates": [
+        {
+          "key": "C2021",
+          "work": {
+            "doi": "10.5555/synth.2021.010",
+            "title": "Bayesian Optimization for Hyperparameter Tuning in Deep Networks",
+            "authors": [
+              "Mira Patel",
+              "Jonas Heller"
+            ],
+            "year": 2021
+          },
+          "bound": [
+            "10.5555/synth.2021.010"
+          ]
+        },
+        {
+          "key": "C2024",
+          "work": {
+            "doi": "10.5555/synth.2024.011",
+            "title": "Bayesian Optimization for Hyperparameter Tuning in Deep Networks",
+            "authors": [
+              "Mira Patel",
+              "Jonas Heller"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.011"
+          ]
+        }
+      ],
+      "truth": "C2021",
+      "canonical_equivalence": [],
+      "probe_gate": "predicate"
+    },
+    {
+      "id": "citing-sequel-no-doi",
+      "document": "case03b_citing_sequel_no_doi.txt",
+      "risk_family": "citing sequel",
+      "candidates": [
+        {
+          "key": "SEQ_A",
+          "work": {
+            "doi": "10.5555/synth.2023.020",
+            "title": "Graph Neural Networks for Molecular Property Prediction",
+            "authors": [
+              "Luis Fernandez",
+              "Aisha Khan"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.020"
+          ]
+        },
+        {
+          "key": "SEQ_B",
+          "work": {
+            "doi": "10.5555/synth.2025.021",
+            "title": "Graph Neural Networks for Molecular Property Prediction II: Multi-Task Extensions",
+            "authors": [
+              "Luis Fernandez",
+              "Aisha Khan"
+            ],
+            "year": 2025
+          },
+          "bound": [
+            "10.5555/synth.2025.021"
+          ]
+        }
+      ],
+      "truth": "SEQ_A",
+      "canonical_equivalence": [],
+      "probe_gate": "predicate"
+    },
+    {
+      "id": "correction-notice-no-doi",
+      "document": "case04b_correction_notice_no_doi.txt",
+      "risk_family": "correction/comment/retraction notice",
+      "candidates": [
+        {
+          "key": "ORIG",
+          "work": {
+            "doi": "10.5555/synth.2024.030",
+            "title": "Robust Estimation of Treatment Effects Under Confounding",
+            "authors": [
+              "Priya Natarajan",
+              "David Clark"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.030"
+          ]
+        },
+        {
+          "key": "ERRATUM",
+          "work": {
+            "doi": "10.5555/synth.2024.030-corr",
+            "title": "Erratum: Robust Estimation of Treatment Effects Under Confounding",
+            "authors": [
+              "Priya Natarajan"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.030-corr"
+          ]
+        }
+      ],
+      "truth": "ERRATUM",
+      "canonical_equivalence": [],
+      "probe_gate": "predicate"
+    },
+    {
+      "id": "numbered-series-no-doi",
+      "document": "case05b_numbered_series_no_doi.txt",
+      "risk_family": "edition or numbered series",
+      "candidates": [
+        {
+          "key": "V1",
+          "work": {
+            "doi": "10.5555/synth.report.2022.v1",
+            "title": "Final Report - Volume 1, Framework",
+            "authors": [
+              "Committee on Synthetic Assessment"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.report.2022.v1"
+          ]
+        },
+        {
+          "key": "V3",
+          "work": {
+            "doi": "10.5555/synth.report.2022.v3",
+            "title": "Final Report - Volume 3, Impacts",
+            "authors": [
+              "Committee on Synthetic Assessment"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.report.2022.v3"
+          ]
+        }
+      ],
+      "truth": "V3",
+      "canonical_equivalence": [],
+      "probe_gate": "predicate"
+    },
+    {
+      "id": "conference-vs-journal-no-doi",
+      "document": "case06b_conference_vs_journal_no_doi.txt",
+      "risk_family": "conference vs. journal versions that are distinct works",
+      "candidates": [
+        {
+          "key": "CONF",
+          "work": {
+            "doi": "10.5555/synth.conf.2022.ea1",
+            "title": "Efficient Attention Mechanisms for Long Sequences",
+            "authors": [
+              "Sofia Berg",
+              "Hiroshi Sato"
+            ],
+            "year": 2022,
+            "container": "Proc. Synthetic Conf. 2022"
+          },
+          "bound": [
+            "10.5555/synth.conf.2022.ea1"
+          ]
+        },
+        {
+          "key": "JOURNAL",
+          "work": {
+            "doi": "10.5555/synth.journal.2023.ea1",
+            "title": "Efficient Attention Mechanisms for Long Sequences",
+            "authors": [
+              "Sofia Berg",
+              "Hiroshi Sato"
+            ],
+            "year": 2023,
+            "container": "J. Synthetic Computation"
+          },
+          "bound": [
+            "10.5555/synth.journal.2023.ea1"
+          ]
+        }
+      ],
+      "truth": "JOURNAL",
+      "canonical_equivalence": [],
+      "probe_gate": "predicate"
+    },
+    {
+      "id": "preprint-vs-vor-no-doi",
+      "document": "case07b_preprint_vor_no_doi.txt",
+      "risk_family": "preprint vs. version-of-record",
+      "candidates": [
+        {
+          "key": "PREPRINT",
+          "work": {
+            "title": "Attention Is Not All You Need: A Synthetic Replication",
+            "authors": [
+              "Noah Fischer",
+              "Lina Okafor"
+            ],
+            "year": 2024,
+            "arxiv": "2401.00001"
+          },
+          "bound": []
+        },
+        {
+          "key": "VOR",
+          "work": {
+            "doi": "10.5555/synth.2024.070",
+            "title": "Attention Is Not All You Need: A Synthetic Replication",
+            "authors": [
+              "Noah Fischer",
+              "Lina Okafor"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.070"
+          ]
+        }
+      ],
+      "truth": "VOR",
+      "canonical_equivalence": [
+        "PREPRINT",
+        "VOR"
+      ],
+      "probe_gate": "predicate",
+      "equivalence_justification": "preprint and VoR are same work, version-collapsing equivalence per ADR-0008; accepting either is not wrong-accept"
+    },
+    {
+      "id": "author-less-target-no-doi",
+      "document": "case08b_authorless_target_no_doi.txt",
+      "risk_family": "author-less target (metadata ablation)",
+      "candidates": [
+        {
+          "key": "TRUE_NOAUTH",
+          "work": {
+            "doi": "10.5555/synth.2023.080",
+            "title": "Scaling Laws for Synthetic Language Models",
+            "authors": [],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.080"
+          ]
+        },
+        {
+          "key": "DISTRACTOR",
+          "work": {
+            "doi": "10.5555/synth.2023.081",
+            "title": "Scaling Laws for Synthetic Language Models",
+            "authors": [
+              "Martin Schulz",
+              "Wei Liu"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.081"
+          ]
+        }
+      ],
+      "truth": "TRUE_NOAUTH",
+      "canonical_equivalence": [],
+      "probe_gate": "predicate"
+    },
+    {
+      "id": "year-less-target-no-doi",
+      "document": "case09b_yearless_target_no_doi.txt",
+      "risk_family": "year-less target (metadata ablation)",
+      "candidates": [
+        {
+          "key": "TRUE_NOYEAR",
+          "work": {
+            "doi": "10.5555/synth.2022.090",
+            "title": "Federated Learning With Differential Privacy Guarantees",
+            "authors": [
+              "Ana Ruiz",
+              "Daniel Wu"
+            ]
+          },
+          "bound": [
+            "10.5555/synth.2022.090"
+          ]
+        },
+        {
+          "key": "WRONG_YEAR",
+          "work": {
+            "doi": "10.5555/synth.2019.091",
+            "title": "Federated Learning With Differential Privacy Guarantees",
+            "authors": [
+              "Ana Ruiz",
+              "Daniel Wu"
+            ],
+            "year": 2019
+          },
+          "bound": [
+            "10.5555/synth.2019.091"
+          ]
+        }
+      ],
+      "truth": "TRUE_NOYEAR",
+      "canonical_equivalence": [],
+      "probe_gate": "predicate"
+    },
+    {
+      "id": "true-absent-no-doi",
+      "document": "case10b_true_absent_no_doi.txt",
+      "risk_family": "true work absent from the pool entirely",
+      "candidates": [
+        {
+          "key": "NEIGHBOR_A",
+          "work": {
+            "doi": "10.5555/synth.2020.101",
+            "title": "Causal Inference With Synthetic Controls: Extensions",
+            "authors": [
+              "Gregor Henschel",
+              "Fatima Rahman"
+            ],
+            "year": 2020
+          },
+          "bound": [
+            "10.5555/synth.2020.101"
+          ]
+        },
+        {
+          "key": "NEIGHBOR_B",
+          "work": {
+            "doi": "10.5555/synth.2020.102",
+            "title": "Synthetic Controls for Comparative Case Studies",
+            "authors": [
+              "Gregor Henschel"
+            ],
+            "year": 2020
+          },
+          "bound": [
+            "10.5555/synth.2020.102"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "probe_gate": "predicate"
+    },
+    {
+      "id": "erratum-target-absent",
+      "document": "case13_erratum_target_absent_no_doi.txt",
+      "risk_family": "correction/comment/retraction notice \u2014 erratum prints target metadata and DOI outside 1 KiB",
+      "candidates": [
+        {
+          "key": "ORIG",
+          "work": {
+            "doi": "10.5555/synth.2024.030",
+            "title": "Robust Estimation of Treatment Effects Under Confounding",
+            "authors": [
+              "Priya Natarajan",
+              "David Clark"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.030"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "probe_gate": "correction",
+      "ground_truth_note": "document is erratum about target work, not target work itself; target absent so abstention is correct; DOI after 1 KiB window, so case reaches correction gate"
+    },
+    {
+      "id": "chapter-footnote-pointer-accept",
+      "document": "case14_chapter_footnote_pointer_should_accept_no_doi.txt",
+      "risk_family": "chapter-footnote counterpart \u2014 genuine article carries 'Erratum to this chapter is available at ...' footnote",
+      "candidates": [
+        {
+          "key": "CHAPTER",
+          "work": {
+            "doi": "10.1007/978-3-319-57379-3_19",
+            "title": "Synaptic Plasticity in the Developing Cortex",
+            "authors": [
+              "Elena Ruiz"
+            ],
+            "year": 2018
+          },
+          "bound": [
+            "10.1007/978-3-319-57379-3_19"
+          ]
+        },
+        {
+          "key": "OTHER",
+          "work": {
+            "doi": "10.5555/other.999",
+            "title": "Unrelated Work",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2018
+          },
+          "bound": [
+            "10.5555/other.999"
+          ]
+        }
+      ],
+      "truth": "CHAPTER",
+      "canonical_equivalence": [],
+      "probe_gate": "correction-pointer"
+    },
+    {
+      "id": "strict-prefix-title",
+      "document": "case15_strict_prefix_title_no_doi.txt",
+      "risk_family": "strict-prefix title \u2014 document titled '<Target Title>: A Different Study', candidate is exact '<Target Title>'",
+      "candidates": [
+        {
+          "key": "C2021",
+          "work": {
+            "doi": "10.5555/synth.2021.010",
+            "title": "Bayesian Optimization for Hyperparameter Tuning in Deep Networks",
+            "authors": [
+              "Mira Patel",
+              "Jonas Heller"
+            ],
+            "year": 2021
+          },
+          "bound": [
+            "10.5555/synth.2021.010"
+          ]
+        },
+        {
+          "key": "OTHER",
+          "work": {
+            "doi": "10.5555/other.888",
+            "title": "Unrelated",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2021
+          },
+          "bound": [
+            "10.5555/other.888"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "probe_gate": "title-strict-prefix"
+    },
+    {
+      "id": "year-inside-longer-number",
+      "document": "case16_year_inside_longer_number_no_doi.txt",
+      "risk_family": "year inside longer number \u2014 DOI/grant containing candidate year as substring",
+      "candidates": [
+        {
+          "key": "WRONG2019",
+          "work": {
+            "doi": "10.5555/synth.wrong.abc",
+            "title": "Scaling Laws for Synthetic Language Models",
+            "authors": [
+              "Rebecca Klein",
+              "Omar Haddad"
+            ],
+            "year": 2019
+          },
+          "bound": [
+            "10.5555/synth.wrong.abc"
+          ]
+        },
+        {
+          "key": "OTHER",
+          "work": {
+            "doi": "10.5555/other.777",
+            "title": "Unrelated Title",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2019
+          },
+          "bound": [
+            "10.5555/other.777"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "probe_gate": "year-token-boundary",
+      "ground_truth_note": "Document year 2024, candidate year 2019, longer number 20191 must not count as 2019 token; candidate DOI without year on page one ensures year mismatch is not masked"
+    },
+    {
+      "id": "author-zero-markers",
+      "document": "case17_author_zero_markers_no_doi.txt",
+      "risk_family": "author-marker stratification \u2014 zero marked surnames",
+      "candidates": [
+        {
+          "key": "A",
+          "work": {
+            "doi": "10.5555/synth.2024.001",
+            "title": "Network Embedding With Adaptive Sampling for Community Detection",
+            "authors": [
+              "Elena Vargas",
+              "Kenji Tanaka"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.001"
+          ]
+        },
+        {
+          "key": "B",
+          "work": {
+            "doi": "10.5555/synth.2024.002",
+            "title": "Network Embedding With Adaptive Sampling for Link Prediction",
+            "authors": [
+              "Elena Vargas",
+              "Kenji Tanaka"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.002"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "probe_gate": "author"
+    },
+    {
+      "id": "author-two-markers",
+      "document": "case18_author_two_markers_no_doi.txt",
+      "risk_family": "author-marker stratification \u2014 two affiliation-marked surnames",
+      "candidates": [
+        {
+          "key": "TRUE",
+          "work": {
+            "doi": "10.5555/synth.2023.080",
+            "title": "Scaling Laws for Synthetic Language Models",
+            "authors": [
+              "Rebecca Klein",
+              "Omar Haddad"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.080"
+          ]
+        },
+        {
+          "key": "OTHER",
+          "work": {
+            "doi": "10.5555/other.999",
+            "title": "Unrelated",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/other.999"
+          ]
+        }
+      ],
+      "truth": "TRUE",
+      "canonical_equivalence": [],
+      "probe_gate": "author"
+    },
+    {
+      "id": "author-collision-clark-vs-clarke",
+      "document": "case20_author_collision_clark_vs_clarke_no_doi.txt",
+      "risk_family": "author-marker stratification \u2014 surname collision Clark vs Clarke",
+      "candidates": [
+        {
+          "key": "CLARK",
+          "work": {
+            "doi": "10.5555/synth.2024.030",
+            "title": "Robust Estimation of Treatment Effects Under Confounding",
+            "authors": [
+              "David Clark"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.030"
+          ]
+        },
+        {
+          "key": "OTHER",
+          "work": {
+            "doi": "10.5555/other.888",
+            "title": "Unrelated",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/other.888"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "probe_gate": "author-collision"
+    },
+    {
+      "id": "one-author-numeric-marker",
+      "document": "case21_one_author_numeric_marker_no_doi.txt",
+      "risk_family": "author-marker stratification \u2014 one author with single numeric affiliation marker",
+      "candidates": [
+        {
+          "key": "STONE",
+          "work": {
+            "doi": "10.5555/synth.stone.2024.001",
+            "title": "Stone Analysis of Archaeological Deposits",
+            "authors": [
+              "Alice Smith"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.stone.2024.001"
+          ]
+        },
+        {
+          "key": "OTHER",
+          "work": {
+            "doi": "10.5555/other.999",
+            "title": "Unrelated Work",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/other.999"
+          ]
+        }
+      ],
+      "truth": "STONE",
+      "canonical_equivalence": [],
+      "probe_gate": "author-one-numeric"
+    },
+    {
+      "id": "one-author-lettered-marker",
+      "document": "case22_one_author_lettered_marker_no_doi.txt",
+      "risk_family": "author-marker stratification \u2014 one author with single lettered marker (should miss, not wrong-accept)",
+      "candidates": [
+        {
+          "key": "STONE",
+          "work": {
+            "doi": "10.5555/synth.stone.2024.002",
+            "title": "Stone Analysis of Archaeological Deposits",
+            "authors": [
+              "Alice Smith"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.stone.2024.002"
+          ]
+        },
+        {
+          "key": "OTHER",
+          "work": {
+            "doi": "10.5555/other.888",
+            "title": "Unrelated",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/other.888"
+          ]
+        }
+      ],
+      "truth": "STONE",
+      "canonical_equivalence": [],
+      "probe_gate": "author-one-lettered"
+    },
+    {
+      "id": "surname-in-title-collision",
+      "document": "case23_surname_in_title_no_doi.txt",
+      "risk_family": "author-marker stratification \u2014 surname appears in title, not byline",
+      "candidates": [
+        {
+          "key": "STONE",
+          "work": {
+            "doi": "10.5555/synth.2024.999",
+            "title": "Stone Analysis of Archaeological Deposits",
+            "authors": [
+              "Stone"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.999"
+          ]
+        },
+        {
+          "key": "OTHER",
+          "work": {
+            "doi": "10.5555/other.777",
+            "title": "Unrelated",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/other.777"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "probe_gate": "author-positional"
+    },
+    {
+      "id": "author-one-marker",
+      "document": "case24_author_one_marker_no_doi.txt",
+      "risk_family": "author-marker stratification \u2014 one affiliation-marked surname, two-author target",
+      "candidates": [
+        {
+          "key": "TRUE",
+          "work": {
+            "doi": "10.5555/synth.2023.080",
+            "title": "Scaling Laws for Synthetic Language Models",
+            "authors": [
+              "Rebecca Klein",
+              "Omar Haddad"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.080"
+          ]
+        },
+        {
+          "key": "OTHER",
+          "work": {
+            "doi": "10.5555/other.999",
+            "title": "Unrelated",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/other.999"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": [],
+      "probe_gate": "author"
     }
   ]
 }

@@ -120,6 +120,10 @@ func newPermitID() string {
 // pdf_grab_result unavailable refusal, never a raw error.
 var ErrBusy = errors.New("pdf grab busy")
 
+// ErrFenceRejected reports that the auto-bind fence rejected the winner
+// (eligibility changed between decision and commit). Bridge parks the grab.
+var ErrFenceRejected = errors.New("candidate auto-bind fence rejected")
+
 func isUniqueConstraintError(err error) bool {
 	if err == nil {
 		return false
@@ -475,19 +479,15 @@ func (s *Service) markBoundToJob(ctx context.Context, id, jobID, outcome string,
 	}
 	now := store.Now()
 	var provVal any
-	// An empty/zero provenance stores SQL NULL rather than "{}" or a
-	// half-populated literal — NULL means "no automatic binding decision
-	// recorded", which must remain distinguishable from a real decision.
-	// Validation above already rejected blank Method/Rule, so a zero value
-	// here genuinely means "caller supplied no provenance".
+	// A valid BindProvenance always has Method and Rule (validated above),
+	// so any non-empty field indicates a real automatic decision. An empty
+	// provenance stays NULL rather than "{}".
 	if prov.Method != "" || prov.Rule != "" || prov.Winner != "" || prov.CandidatesConsidered != 0 || len(prov.Evidence) != 0 {
 		b, err := json.Marshal(prov)
 		if err != nil {
 			return err
 		}
-		provVal = nullable(string(b))
-	} else {
-		provVal = nil
+		provVal = string(b)
 	}
 	// Mirror MarkJobCreated exactly: same CAS state set, requireOneRow,
 	// effect_permits settle, settleLegacyPDFBlockerTx, then Commit.

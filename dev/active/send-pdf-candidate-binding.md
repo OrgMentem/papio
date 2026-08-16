@@ -173,10 +173,17 @@ picker-specific wire provenance and no protocol change.**
     when it offers choices, held in service-worker memory ONLY. SW death
     invalidates the offer; a selection against a dead worker gets "stale
     interaction" and re-mints. Unconsumed offers are never persisted.
-  - **Consume (synchronous).** Selection removes the nonce synchronously
-    before the first `await`; a crash before conversion fails closed. At
-    acceptance the background revalidates the advisory facts and the
-    frozen page identity.
+  - **Consume (atomic).** Selection looks the nonce up and deletes it in
+    one synchronous statement pair, with no `await` between the read and
+    the delete — that adjacency, not the absence of any earlier `await`,
+    is what makes the nonce one-shot: JS is single-threaded, so two
+    concurrent accepts cannot both observe it. (An earlier draft of this
+    plan said "before the first `await`", and the shipped code does await
+    `this.ready` first; the wording was wrong, not the code.) A crash
+    before conversion fails closed. At acceptance the background
+    revalidates the advisory facts and the frozen page identity, and
+    every refusal path emits `code: "choice_expired"` so callers classify
+    on the code rather than on user-facing copy.
   - **Direct delivery:** no picker authority survives; the existing
     durable pending-delivery machinery owns the operation from here.
   - **Convert (session-persistent).** A `requiresNativeViewerDownload`
@@ -232,14 +239,28 @@ layers; ship Phase 3 only at zero wrong-accepts across layers 1+2.
    author affiliation-marker glue; plus the window cases (blank cover
    leaf; own identifier at 2–4 KiB; identifier only after first form
    feed; dense no-form-feed page with identifier past the 4 KiB cap).
-   Cases may overlap. Each sentinel asserts BOTH the golden extracted
-   text shape and the final predicate verdict — hand-authored layer-1
+   Cases may overlap. Each sentinel asserts the final predicate verdict
+   AND golden substrings of the extracted text — hand-authored layer-1
    text drifts from real `pdftotext` output (ligatures, hyphenation,
    line order are exactly what `identity.go` accumulated special
-   handling for); the sentinels pin that boundary.
-3. **Real backlog replay** — locally extracted PDFs + historical
-   manual-download metadata for coverage, multiple-pass abstention, and
-   true-target-absent behaviour. Report contents never leave the machine.
+   handling for); the sentinels pin that boundary. Note the assertion is
+   `strings.Contains` over chosen fragments, not an exact whole-document
+   snapshot: it catches the extraction artifacts these cases exist for
+   and tolerates unrelated layout churn, so a wholesale extractor change
+   could still pass. An exact snapshot per sentinel would be stronger and
+   is the obvious upgrade if the extractor is ever swapped.
+3. **Real backlog replay — DEFERRED, not shipped.** Locally extracted
+   PDFs + historical manual-download metadata for coverage, multiple-pass
+   abstention, and true-target-absent behaviour. Report contents never
+   leave the machine. This layer was never built: no replay harness or
+   backlog corpus exists in the tree. Layers 1+2 are what authorized
+   Phase 3 (this section's own gate is "zero wrong-accepts across layers
+   1+2"), so the safety condition was met as written — but coverage over
+   the operator's real library is therefore UNMEASURED. What is unknown
+   without it: how often auto-bind actually fires on the real backlog,
+   whether multi-candidate abstention is common enough to make Phase 4
+   worth building, and the true-absent rate. Build this before widening
+   the rule or claiming a coverage number.
 
 ### Phase 3 — daemon auto-bind on `candidate_auto_bind` (gated)
 

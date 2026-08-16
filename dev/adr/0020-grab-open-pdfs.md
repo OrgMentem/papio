@@ -158,5 +158,12 @@ transaction that CASes the grab to `job_created`; provenance
 considered, winner) is written atomically as nullable
 `pdf_grabs.bind_provenance` (migration 0037, store schema 37). The outward
 wire outcome remains `job_created` — the method is never encoded in the
-outcome. The rule shipped only after the three-layer measurement gate
-reported zero wrong-accepts on its main corpus.
+outcome. The rule shipped only after the
+measurement gate reported zero wrong-accepts. Two of the three planned
+layers ran: the labeled semantic corpus and the extractor sentinels over
+real PDFs. The third layer — replay against the local backlog of
+historical manual-download jobs — is deferred, so what is measured is
+safety against curated hard negatives, not coverage over the operator's
+real library. Coverage is therefore unknown: the gate establishes that
+auto-bind does not misfile the cases it was shown, not how often it fires
+in practice.

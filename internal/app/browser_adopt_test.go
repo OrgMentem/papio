@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -316,6 +317,11 @@ func parkAwaitingHuman(t *testing.T, jobs *job.Store, reqID string) string {
 		if err := jobs.Transition(ctx, id, step[0], step[1], nil); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// New adoption fence requires StateAwaitingHuman + at least one open human
+	// action. Every legitimate test job parked here is awaiting a manual download.
+	if _, err := jobs.OpenHumanAction(ctx, id, job.CandidateEligibleKind, "please download the paper", job.Access(false, "")); err != nil {
+		t.Fatal(err)
 	}
 	return id
 }
@@ -747,6 +753,9 @@ func TestAdoptedCandidateVersionIsAlwaysUnknown(t *testing.T) {
 				if err := jobs.Transition(ctx, id, step[0], step[1], nil); err != nil {
 					t.Fatal(err)
 				}
+			}
+			if _, err := jobs.OpenHumanAction(ctx, id, job.CandidateEligibleKind, "please download the paper", job.Access(false, "")); err != nil {
+				t.Fatal(err)
 			}
 			dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
 			if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -1203,5 +1212,127 @@ func TestAdoptDownloadWithContext_UnappliedReturnsCandidateIDAndError(t *testing
 	}
 	if !strings.Contains(msg, "browser delivery candidate") || !strings.Contains(msg, "is unavailable for job") {
 		t.Fatalf("error %q should contain 'browser delivery candidate <id> is unavailable for job <id>'", msg)
+	}
+}
+
+func TestAdoptDownloadRejectsWhenManualDownloadClosed(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_reject_closed")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Park helper opened one manual_download; resolve it so job has ZERO open actions.
+	// This is the real dismiss-window shape: sole action was manual_download and it was cancelled.
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manualID int64
+	for _, a := range actions {
+		if a.JobID == id && a.Kind == job.CandidateEligibleKind && a.Status == job.CandidateEligibleStatus {
+			manualID = a.ID
+			break
+		}
+	}
+	if manualID == 0 {
+		t.Fatal("no open manual_download to close")
+	}
+	if err := jobs.ResolveHumanAction(ctx, manualID, "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	row, _ := jobs.Get(ctx, id)
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("want still awaiting_human, got %s", row.State)
+	}
+	// Verify zero open actions now (otherwise the broader predicate would still pass)
+	open, _ := jobs.ListHumanActions(ctx, true)
+	hasOpen := false
+	for _, a := range open {
+		if a.JobID == id && a.Status == "open" {
+			hasOpen = true
+		}
+	}
+	if hasOpen {
+		t.Fatal("expected zero open actions after closing sole manual_download")
+	}
+	pdfPath := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(pdfPath, pdfBytes("stale pick"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = svc.AdoptDownload(ctx, id, pdfPath)
+	if err == nil {
+		t.Fatal("want eligibility refusal, got nil")
+	}
+	if !errors.Is(err, job.ErrAdoptNotAwaiting) && !errors.Is(err, job.ErrCandidateNotEligible) {
+		t.Fatalf("want ErrAdoptNotAwaiting (or ErrCandidateNotEligible), got %v", err)
+	}
+	if !strings.Contains(err.Error(), job.AdoptAwaitingDetail) {
+		t.Fatalf("want house-voice detail, got %q", err.Error())
+	}
+	row, _ = jobs.Get(ctx, id)
+	if row.State == job.StateReady || row.ArtifactSHA256 != "" {
+		t.Fatalf("stale pick promoted: state=%s artifact=%q", row.State, row.ArtifactSHA256)
+	}
+}
+
+func TestAdoptDownloadRaceDismissWindowRefuses(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_race")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	actions, _ := jobs.ListHumanActions(ctx, true)
+	var aid int64
+	for _, a := range actions {
+		if a.JobID == id && a.Kind == job.CandidateEligibleKind {
+			aid = a.ID
+			break
+		}
+	}
+	if aid == 0 {
+		t.Fatal("no manual_download")
+	}
+	if err := jobs.ResolveHumanAction(ctx, aid, "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	pdfPath := filepath.Join(dir, "race.pdf")
+	if err := os.WriteFile(pdfPath, pdfBytes("race"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := svc.AdoptDownload(ctx, id, pdfPath)
+	if !errors.Is(err, job.ErrAdoptNotAwaiting) && !errors.Is(err, job.ErrCandidateNotEligible) {
+		t.Fatalf("race window: want ErrAdoptNotAwaiting, got %v", err)
+	}
+	row, _ := jobs.Get(ctx, id)
+	if row.State == job.StateReady {
+		t.Fatal("race: promoted despite dismissed action")
+	}
+}
+
+func TestAdoptDownloadNormalPickedDeliveryStillSucceeds(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_normal_ok")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pdfPath := filepath.Join(dir, "normal.pdf")
+	if err := os.WriteFile(pdfPath, pdfBytes("normal adoption"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, pdfPath); err != nil {
+		t.Fatalf("normal pick should succeed, got %v", err)
+	}
+	row, _ := jobs.Get(ctx, id)
+	if row.State != job.StateReady || row.ArtifactSHA256 == "" {
+		t.Fatalf("normal pick not promoted: %+v", row)
 	}
 }

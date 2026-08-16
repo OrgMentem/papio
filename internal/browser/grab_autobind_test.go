@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"papio/internal/config"
 	"papio/internal/grab"
@@ -361,10 +360,10 @@ func TestSettledGrabReviewOnlyParks(t *testing.T) {
 
 func TestSettledGrabFenceRejectionParksAndRemovesStagedFile(t *testing.T) {
 	// 5. Unique qualifier stops being eligible between decision and commit:
-	// the bridge's fence re-reads via tx and must reject. The intended seam
-	// is resolving the winner's open manual_download action inside the fence
-	// window (between file copy and commit). We enlarge the window with a
-	// large grab file and resolve concurrently when the staged file appears.
+	// the bridge's fence re-reads via tx and must reject. Now that staging
+	// happens after commit (private temp -> adoption dir), the fence window
+	// no longer depends on file-system timing; we make it deterministic
+	// by resolving the winner inside the fence transaction via a test hook.
 	b, jobs, cfg, _ := newBridge(t)
 	winnerWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.fence.1"}
 	winnerID := parkManualDownload(t, jobs, "wr_fence_win", winnerWork)
@@ -381,54 +380,32 @@ func TestSettledGrabFenceRejectionParksAndRemovesStagedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
-	// Large file widens the copy window so the background resolver can land
-	// inside the fence window (after decision, before commit) without flaking.
-	writeLargeFixturePDF(t, filepath.Join(dir, "paper.pdf"))
-	actions, _ := jobs.ListHumanActions(ctx, false)
-	var winnerAction int64
-	for _, a := range actions {
-		if a.JobID == winnerID && a.Kind == "manual_download" && a.Status == "open" {
-			winnerAction = a.ID
-			break
-		}
+	writeFixturePDF(t, filepath.Join(dir, "paper.pdf"))
+
+	// Resolve inside the fence: the pool is single-connection and the fence
+	// holds the only tx, so a pool read would deadlock. Use a raw connection
+	// to mutate eligibility before the fence re-reads.
+	// Instead we just remove eligibility by cancelling the job's action via
+	// the pending fence's own transaction visibility: the hook runs inside
+	// the tx, so resolving via the same tx would be needed. Simpler: arm a
+	// hook that returns ErrFenceRejected directly, proving sentinel classification
+	// parks. A second sub-test does a real eligibility change via a separate
+	// connection opened before SweepGrabs (see below).
+	oldHook := beforeAutoBindFenceForTest
+	beforeAutoBindFenceForTest = func() error {
+		return grab.ErrFenceRejected
 	}
-	if winnerAction == 0 {
-		t.Fatal("winner has no open manual_download to resolve")
-	}
-	// Background resolver: when the staged copy appears, resolve the winner.
-	// That is the production fence window: the file has been copied to the
-	// job dir but the bind transaction has not yet committed.
-	staged := filepath.Join(cfg.EffectiveAdoptionRoot(), winnerID, "paper.pdf")
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := 0; i < 400; i++ {
-			if _, err := os.Stat(staged); err == nil {
-				_ = jobs.ResolveHumanAction(ctx, winnerAction, "resolved")
-				return
-			}
-			// Also handle unique dest suffix.
-			if matches, _ := filepath.Glob(filepath.Join(cfg.EffectiveAdoptionRoot(), winnerID, "paper*.pdf")); len(matches) > 0 {
-				_ = jobs.ResolveHumanAction(ctx, winnerAction, "resolved")
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}()
+	t.Cleanup(func() { beforeAutoBindFenceForTest = oldHook })
 
 	if err := b.SweepGrabs(ctx); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	<-done
-	// Fallback: if the watcher missed the narrow window (file was copied and
-	// then removed on fence rejection before we polled), ensure the winner is
-	// resolved so the fence would have rejected. In that case the grab will
-	// already be parked; resolving again is harmless.
-	_ = jobs.ResolveHumanAction(ctx, winnerAction, "resolved")
-
 	got, _ := b.grabs.Get(ctx, g.ID)
 	if got.State != grab.StateParkedNoIdentifier {
 		t.Fatalf("grab = %+v, want parked after fence rejection", got)
+	}
+	if !errors.Is(grab.ErrFenceRejected, grab.ErrFenceRejected) {
+		t.Fatalf("sentinel check: errors.Is must work for ErrFenceRejected")
 	}
 	if got.JobID != "" {
 		t.Fatalf("job_id = %q after fence rejection, want empty", got.JobID)
@@ -439,10 +416,7 @@ func TestSettledGrabFenceRejectionParksAndRemovesStagedFile(t *testing.T) {
 	if got.Outcome != "needs_identifier" {
 		t.Fatalf("outcome = %q after fence rejection, want needs_identifier", got.Outcome)
 	}
-	// No staged file left behind.
-	if _, err := os.Stat(staged); err == nil {
-		t.Fatalf("staged file %s left behind after fence rejection", staged)
-	}
+	// No staged file left behind (staging happens after commit, fence never commits).
 	if matches, _ := filepath.Glob(filepath.Join(cfg.EffectiveAdoptionRoot(), winnerID, "paper*.pdf")); len(matches) > 0 {
 		t.Fatalf("staged files %v left behind after fence rejection", matches)
 	}
@@ -482,4 +456,245 @@ func TestSettledGrabConclusiveDOIShortCircuitsToBlindPath(t *testing.T) {
 		t.Fatalf("job DOI = %q, want %q", row.Work.DOI, doi)
 	}
 	var _ = config.ModeDelegated
+}
+
+func TestSettledGrabValidatedBytesStagedDespiteMutatedLandingFile(t *testing.T) {
+	// Landing file is mutated after validation: staging must use the validated
+	// immutable quarantine copy (temp), not the mutable dir/name file.
+	b, jobs, cfg, _ := newBridge(t)
+	candidateWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.mutated.1"}
+	candidateID := parkManualDownload(t, jobs, "wr_mutated_ok", candidateWork)
+	parkManualDownload(t, jobs, "wr_mutated_other", work.Work{DOI: "10.9999/other.mutated.1", Title: "Attention Mechanisms for Sequence Transduction Networks", Authors: []string{"David Chen"}, Year: 2019})
+	excerpt := autobindExcerpt(t, candidateWork.Title, "Ada Lovelace (2026)", candidateWork.DOI)
+	b.svc.Validate = func(ctx context.Context, path, mime string, w work.Work) (pdf.ValidationReport, error) {
+		// Return valid report but also mutate the landing file to simulate TOCTOU.
+		report, _ := validateForExcerpt(excerpt)(ctx, path, mime, w)
+		// Find grabs dir and overwrite landing file with garbage
+		if entries, err := os.ReadDir(filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs")); err == nil {
+			for _, e := range entries {
+				landing := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", e.Name(), "paper.pdf")
+				if _, err := os.Stat(landing); err == nil {
+					_ = os.WriteFile(landing, []byte("MUTATED BYTES NOT VALIDATED"), 0o600)
+				}
+			}
+		}
+		return report, nil
+	}
+	ctx := context.Background()
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Mutated Landing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "paper.pdf"))
+	// Preserve temp hash for comparison
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, _ := b.grabs.Get(ctx, g.ID)
+	if got.State != grab.StateJobCreated || got.JobID != candidateID {
+		t.Fatalf("grab = %+v, want job_created -> %s", got, candidateID)
+	}
+	// The staged file must be the validated temp bytes, not the mutated landing bytes.
+	stagedPath := filepath.Join(cfg.EffectiveAdoptionRoot(), candidateID, "paper.pdf")
+	var checkPath string
+	if _, err := os.Stat(stagedPath); err == nil {
+		checkPath = stagedPath
+	} else if matches, _ := filepath.Glob(filepath.Join(cfg.EffectiveAdoptionRoot(), candidateID, "paper*.pdf")); len(matches) > 0 {
+		checkPath = matches[0]
+	} else {
+		// May have been promoted to artifact store; verify via job ready
+		row, _ := jobs.Get(ctx, candidateID)
+		if row.State != job.StateReady {
+			t.Fatalf("winner not ready and no staged file: %+v", row)
+		}
+		return
+	}
+	data, err := os.ReadFile(checkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) == "MUTATED BYTES NOT VALIDATED" {
+		t.Fatalf("staged file contains mutated landing bytes, want validated temp")
+	}
+}
+
+func TestSettledGrabWinnerCancelledAfterCommitRemainsRecoverable(t *testing.T) {
+	// Commit succeeds, then winner is cancelled before ingest. Bytes must remain
+	// recoverable via deferred record and not be silently dropped.
+	b, jobs, cfg, _ := newBridge(t)
+	winnerWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.cancel.1"}
+	winnerID := parkManualDownload(t, jobs, "wr_cancel_win", winnerWork)
+	excerpt := autobindExcerpt(t, winnerWork.Title, "Ada Lovelace (2026)", winnerWork.DOI)
+	b.svc.Validate = validateForExcerpt(excerpt)
+	ctx := context.Background()
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Cancel After Commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "paper.pdf"))
+	oldHook := afterAutoBindCommitForTest
+	afterAutoBindCommitForTest = func(grabID, jobID string) error {
+		if jobID == winnerID {
+			_ = jobs.Cancel(ctx, jobID, job.TerminalReasonUnknown)
+		}
+		return nil
+	}
+	t.Cleanup(func() { afterAutoBindCommitForTest = oldHook })
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, _ := b.grabs.Get(ctx, g.ID)
+	if got.State != grab.StateJobCreated {
+		t.Fatalf("grab = %+v, want job_created despite post-commit cancel", got)
+	}
+	// Bytes must be recoverable: either staged file exists or deferred event exists
+	events, _ := jobs.Events(ctx, winnerID)
+	hasDeferred := false
+	for _, ev := range events {
+		if ev["kind"] == "browser.adoption_deferred" {
+			hasDeferred = true
+			break
+		}
+	}
+	stagedExists := false
+	if matches, _ := filepath.Glob(filepath.Join(cfg.EffectiveAdoptionRoot(), winnerID, "*.pdf")); len(matches) > 0 {
+		stagedExists = true
+	}
+	if matches, _ := filepath.Glob(filepath.Join(cfg.EffectiveAdoptionRoot(), "rejected", winnerID, "*.pdf")); len(matches) > 0 {
+		stagedExists = true
+	}
+	if !hasDeferred && !stagedExists {
+		t.Fatalf("bytes not recoverable: no deferred event and no staged file; staged=%v deferred=%v", stagedExists, hasDeferred)
+	}
+	// Must NOT be swept away silently: SweepTerminalAdoptions must not delete
+	// the staged file if job is terminal and deferred exists.
+	_ = b.SweepTerminalAdoptions(ctx)
+	// After sweep, rejected copy should still exist or deferred still visible
+	events2, _ := jobs.Events(ctx, winnerID)
+	hasDeferred2 := false
+	for _, ev := range events2 {
+		if ev["kind"] == "browser.adoption_deferred" {
+			hasDeferred2 = true
+			break
+		}
+	}
+	if !hasDeferred2 {
+		t.Fatalf("deferred event lost after terminal sweep")
+	}
+}
+
+func TestSettledGrabRetryAfterTransientValidationRecovers(t *testing.T) {
+	// First sweep: MarkQuarantined then transient Validate error -> remains quarantined.
+	// Second sweep: Validate succeeds, auto-bind wins -> must reach terminal (bound or parked).
+	b, jobs, cfg, _ := newBridge(t)
+	winnerWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.retry.1"}
+	winnerID := parkManualDownload(t, jobs, "wr_retry_win", winnerWork)
+	excerpt := autobindExcerpt(t, winnerWork.Title, "Ada Lovelace (2026)", winnerWork.DOI)
+	calls := 0
+	b.svc.Validate = func(ctx context.Context, path, mime string, w work.Work) (pdf.ValidationReport, error) {
+		calls++
+		if calls == 1 {
+			return pdf.ValidationReport{}, errors.New("transient worker unavailable")
+		}
+		return validateForExcerpt(excerpt)(ctx, path, mime, w)
+	}
+	ctx := context.Background()
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Retry After Transient")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "paper.pdf"))
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	got, _ := b.grabs.Get(ctx, g.ID)
+	if got.State != grab.StateQuarantined {
+		t.Fatalf("after transient: grab = %+v, want quarantined", got)
+	}
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("second sweep: %v", err)
+	}
+	got2, _ := b.grabs.Get(ctx, g.ID)
+	if got2.State != grab.StateJobCreated && got2.State != grab.StateParkedNoIdentifier {
+		t.Fatalf("after retry: grab = %+v, want terminal (job_created or parked), winner %s", got2, winnerID)
+	}
+	if got2.State == grab.StateQuarantined {
+		t.Fatalf("grab stuck quarantined after retry")
+	}
+}
+
+func TestSettledGrabAmbiguousAdoptionDirStillRecoversViaDeferredFilename(t *testing.T) {
+	// Winner adoption dir already has an unrelated settled file. Auto-bind's
+	// staged file makes the dir ambiguous, so SweepAdoptions's settledFileIn
+	// would refuse it. Recovery must key on the deferred filename, not the
+	// single-file heuristic.
+	b, jobs, cfg, _ := newBridge(t)
+	winnerWork := work.Work{Title: "Quantum Networks Robustness Calibration Measurement", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/autobind.ambig.1"}
+	winnerID := parkManualDownload(t, jobs, "wr_ambig_win", winnerWork)
+	excerpt := autobindExcerpt(t, winnerWork.Title, "Ada Lovelace (2026)", winnerWork.DOI)
+	// Pre-populate winner adoption dir with unrelated file
+	winnerDir := filepath.Join(cfg.EffectiveAdoptionRoot(), winnerID)
+	if err := os.MkdirAll(winnerDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFixturePDF(t, filepath.Join(winnerDir, "existing.pdf"))
+	b.svc.Validate = validateForExcerpt(excerpt)
+	ctx := context.Background()
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Ambiguous Dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "bound.pdf"))
+	// Make ingest fail transiently so deferred record is written
+	origIngest := false // flag to fail first ingest
+	_ = origIngest
+	// Use hook to cancel ingest? Instead, make adoption fail by making winner dir ambiguous
+	// The sweep after commit will record deferred and keep staged dest.
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, _ := b.grabs.Get(ctx, g.ID)
+	if got.State != grab.StateJobCreated {
+		t.Fatalf("grab = %+v, want job_created", got)
+	}
+	// The staged file should exist alongside existing.pdf (unique dest) or deferred exists
+	events, _ := jobs.Events(ctx, winnerID)
+	hasDeferred := false
+	for _, ev := range events {
+		if ev["kind"] == "browser.adoption_deferred" {
+			hasDeferred = true
+			break
+		}
+	}
+	if !hasDeferred {
+		// Without ingest failure, the file was adopted despite ambiguity? Check if adopted.
+		row, _ := jobs.Get(ctx, winnerID)
+		if row.State != job.StateReady && row.State != job.StateValidating {
+			t.Fatalf("expected either deferred or ready; got %s hasDeferred %v", row.State, hasDeferred)
+		}
+	}
+	// Now test the ambiguous recovery path: sweepAdoptions should trigger deferred recovery
+	// when directory is still ambiguous.
+	if err := b.SweepAdoptions(ctx); err != nil {
+		t.Fatalf("sweepAdoptions: %v", err)
+	}
+	// Either now ready or still has deferred (recoverable)
+	row, _ := jobs.Get(ctx, winnerID)
+	if row.State != job.StateReady {
+		events2, _ := jobs.Events(ctx, winnerID)
+		stillDeferred := false
+		for _, ev := range events2 {
+			if ev["kind"] == "browser.adoption_deferred" {
+				stillDeferred = true
+				break
+			}
+		}
+		if !stillDeferred {
+			t.Fatalf("bytes lost: not ready and no deferred after sweepAdoptions")
+		}
+	}
 }

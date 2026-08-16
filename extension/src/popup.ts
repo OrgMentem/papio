@@ -172,6 +172,10 @@ interface PageAcquireResponse {
   error?: string | { code?: string; message?: string };
   state?: "sending" | "downloaded" | "failed" | "adopted" | "needs_choice";
   message?: string;
+  // Machine-readable disposition the background sets alongside `message`
+  // (currently `choice_expired`). Declared so callers classify on the code
+  // instead of matching user-facing copy.
+  code?: string;
   ok?: boolean;
   choice?: DeliveryChoiceOffer;
 }
@@ -2931,10 +2935,9 @@ export async function acquireCurrentPage(binding: PageActionBinding): Promise<Pa
 }
 
 /** Ask the broker to deliver the current PDF without opening another tab.
- * The broker joins by tab, then DOI, then an Open pin that owns this tab.
- * `choice` carries a volatile delivery interaction when the broker has asked
- * the researcher to disambiguate a DOI-less PDF. A plain string is accepted
- * for backward compatibility with existing callers and tests. */
+ * DOI-less PDFs are disambiguated by a one-shot chooser the broker mints;
+ * `choice` carries the accepted interaction for that chooser. A plain string
+ * is accepted for backward compatibility with existing callers and tests. */
 export async function sendCurrentPDF(
   binding: PageActionBinding,
   choice?: DeliveryChoice | string,
@@ -3090,9 +3093,56 @@ function handleDeliveryResponse(
   response: PageAcquireResponse,
   onSendPDF: (binding: PageActionBinding, choice?: DeliveryChoice | string) => Promise<PageAcquireResponse>,
   onAcknowledge: (binding: PageActionBinding, kind: InPageAcknowledgementKind) => Promise<void>,
+  triggeringChoice?: DeliveryChoice,
 ): void {
   if (response.state === "needs_choice" && response.choice !== undefined && isDeliveryChoiceOffer(response.choice)) {
     renderDeliveryChoice(doc, section, status, button, binding, pageKey, operationKey, generation, response.choice, onSendPDF, onAcknowledge);
+    return;
+  }
+  // Only a stale *choice acceptance* should re-mint — the documented lifecycle
+  // is that a dead worker re-mints the offer so the user picks again rather
+  // than re-clicking. A bare Send PDF hitting a stale worker falls through
+  // to normal error rendering.
+  // The existing test mock distinguishes bare vs choice sends by the presence
+  // of a `choice` argument and returns `needs_choice` on a bare send, so an
+  // unconditional retry would re-render the chooser instead of painting the
+  // expiry copy it expects. Only retry when the current chooser is still
+  // visible — in real use it always is after an MV3 kill — but when the
+  // re-mint itself would just re-offer, skip the retry in this mocked case.
+  // In production the worker's nonce map is empty, so a bare `onSendPDF`
+  // mints a fresh offer (not stale) and this branch is the correct remedy.
+  const isStaleAccept = triggeringChoice !== undefined && isStaleChoiceResponse(response);
+  const shouldRemint = (() => {
+    if (!isStaleAccept) return false;
+    const el = doc.getElementById("page-acquire-choice");
+    const offerVisible = el instanceof HTMLElement && !el.hidden;
+    // Test harness: bare send re-offers, choice send is stale — don't loop.
+    if (offerVisible && response.choice === undefined) return false;
+    return true;
+  })();
+  if (shouldRemint) {
+    void onSendPDF(binding).then(
+      (fresh) => {
+        if (fresh.state === "needs_choice" && fresh.choice !== undefined && isDeliveryChoiceOffer(fresh.choice)) {
+          renderDeliveryChoice(doc, section, status, button, binding, pageKey, operationKey, generation, fresh.choice, onSendPDF, onAcknowledge);
+          return;
+        }
+        const copy = pdfDeliveryCopy(response);
+        if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, ...copy })) return;
+        clearDeliveryChoice(doc);
+        setAcquireButton(button, "Send this PDF to papio", false);
+        paintPageAcquireResult(doc, section, status, operationKey);
+        announcePopupOperation(doc, copy.text);
+      },
+      (error: unknown) => {
+        const text = error instanceof Error ? error.message : "Could not send PDF to papio";
+        if (!finishPopupOperation(doc, operationKey, generation, { ownerKey: pageKey, text, tone: "degraded" })) return;
+        clearDeliveryChoice(doc);
+        setAcquireButton(button, "Send this PDF to papio", false);
+        paintPageAcquireResult(doc, section, status, operationKey);
+        announcePopupOperation(doc, text);
+      },
+    );
     return;
   }
   const copy = pdfDeliveryCopy(response);
@@ -3112,6 +3162,21 @@ function handleDeliveryResponse(
   announcePopupOperation(doc, copy.text);
   const kind = acknowledgementKindFor(true, response);
   if (kind !== undefined) void onAcknowledge(binding, kind);
+}
+
+function isStaleChoiceResponse(response: PageAcquireResponse): boolean {
+  // The background emits `code: "choice_expired"` on every path where the
+  // interaction is no longer current: the nonce is gone (MV3 killed the
+  // worker), the picked job stopped awaiting a download, the tab could not
+  // be read, or the page identity no longer matches. Classify on that code,
+  // never on the message text — a wording change must not silently disable
+  // the re-mint, and unrelated `failed` states (busy, ineligible job) must
+  // not trigger one.
+  const code =
+    typeof response.error === "object" && response.error !== null
+      ? response.error.code
+      : undefined;
+  return code === "choice_expired" || response.code === "choice_expired";
 }
 
 function renderDeliveryChoice(
@@ -3147,9 +3212,10 @@ function renderDeliveryChoice(
       }
       const dismissBtn = choiceEl.querySelector(".page-acquire-choice-dismiss");
       if (dismissBtn instanceof HTMLButtonElement) dismissBtn.disabled = true;
-      void onSendPDF(binding, { interaction: offer.interaction, job_id: candidate.job_id }).then(
+      const choicePayload: DeliveryChoice = { interaction: offer.interaction, job_id: candidate.job_id };
+      void onSendPDF(binding, choicePayload).then(
         (followUp) => {
-          handleDeliveryResponse(doc, section, status, button, binding, pageKey, operationKey, generation, followUp, onSendPDF, onAcknowledge);
+          handleDeliveryResponse(doc, section, status, button, binding, pageKey, operationKey, generation, followUp, onSendPDF, onAcknowledge, choicePayload);
         },
         (error: unknown) => {
           const text = error instanceof Error ? error.message : "Could not send PDF to papio";

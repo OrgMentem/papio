@@ -24,9 +24,10 @@ import (
 // parkForBrowserAdoption moves a live job onto the existing human-adoption
 // boundary. queued has no direct edge to awaiting_human, so it first follows
 // the legal queued -> resolving edge; a scheduler race is retried from the
-// durable state it won. No human action is opened because the browser
-// download itself is the operator gesture and directory sweeps use the
-// job-scoped adoption directory as the durable pickup signal.
+// durable state it won. Parking from resolving/fetching opens a
+// manual_download action so the any-open-action adoption fence sees a genuine
+// awaiting-human action — the browser download itself is the human gesture
+// that justified the park.
 func (s *Service) parkForBrowserAdoption(ctx context.Context, jobID string) error {
 	const detailReason = "browser_download_adoption"
 	for range 4 {
@@ -41,9 +42,13 @@ func (s *Service) parkForBrowserAdoption(ctx context.Context, jobID string) erro
 			err = s.Jobs.Transition(ctx, jobID, job.StateQueued, job.StateResolving,
 				map[string]any{"reason": detailReason})
 		case job.StateResolving, job.StateFetching:
-			err = s.Jobs.Transition(ctx, jobID, row.State, job.StateAwaitingHuman,
+			prev := row.State
+			err = s.Jobs.Transition(ctx, jobID, prev, job.StateAwaitingHuman,
 				map[string]any{"reason": detailReason})
 			if err == nil {
+				if _, aErr := s.Jobs.OpenHumanAction(ctx, jobID, job.CandidateEligibleKind, "please download the paper", job.Access(false, "")); aErr != nil {
+					return nil
+				}
 				return nil
 			}
 		default:
@@ -244,9 +249,7 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		TempPath: temp, SHA256: sha, SizeBytes: size,
 		SniffedMIME: "application/pdf", ContentType: "application/pdf", FinalHost: "browser",
 	}
-	if err := s.Jobs.Transition(ctx, jobID, job.StateAwaitingHuman, job.StateValidating,
-		map[string]any{"reason": "adopt_browser_download", "source": "browser"},
-		job.WithCandidate(stored.ID)); err != nil {
+	if err := s.Jobs.TransitionAwaitingToValidatingIfAdoptEligible(ctx, jobID, stored.ID); err != nil {
 		_ = os.Remove(temp)
 		return err
 	}

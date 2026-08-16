@@ -9484,6 +9484,159 @@ test("Cell PII PDF response downloads directly without a pin", async () => {
   expect(h.downloads.started[0]?.url).toBe(viewerURL);
 });
 
+
+test("A->B click race does not bind B under A's choice (live tab URL)", async () => {
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_race_a", 1_700_000_000_001), awaitingJob("job_race_b", 1_700_000_000_002), awaitingJob("job_race_c", 1_700_000_000_003)] };
+  });
+  await h.bridge.start();
+  const urlA = "https://provider.example.edu/a.pdf?sig=AAA";
+  const urlB = "https://provider.example.edu/b.pdf?sig=BBB";
+  h.tabs.seed({ id: 70, url: urlA });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 70, url: urlA }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  h.tabs.seed({ id: 70, url: urlB });
+  const race = await h.bridge.startPDFDelivery({ tab_id: 70, url: urlA, choice: { interaction: offer.interaction, job_id: "job_race_a" } }) as unknown as Record<string, unknown>;
+  expect(race).toMatchObject({ ok: false, code: "choice_expired" });
+});
+
+test("same-URL full reload between mint and accept fails closed (onCommitted epoch)", async () => {
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_reload_a", 1_700_000_000_001), awaitingJob("job_reload_b", 1_700_000_000_002)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 71, url: "https://provider.example.edu/paper.pdf" });
+  await h.webNavigation.onCommitted!.emit({ tabId: 71, frameId: 0, documentId: "doc-1" });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 71, url: "https://provider.example.edu/paper.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  await h.webNavigation.onCommitted!.emit({ tabId: 71, frameId: 0, documentId: "doc-2" });
+  h.tabs.seed({ id: 71, url: "https://provider.example.edu/paper.pdf" });
+  const afterReload = await h.bridge.startPDFDelivery({ tab_id: 71, url: "https://provider.example.edu/paper.pdf", choice: { interaction: offer.interaction, job_id: offer.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(afterReload).toMatchObject({ ok: false, code: "choice_expired" });
+});
+
+test("expired nonce beyond TTL fails at consume (not just sweep)", async () => {
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_ttl_a", 1_700_000_000_001), awaitingJob("job_ttl_b", 1_700_000_000_002)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 72, url: "https://provider.example.edu/paper.pdf" });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 72, url: "https://provider.example.edu/paper.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  h.clock.now += 10 * 60_000 + 1000;
+  const expired = await h.bridge.startPDFDelivery({ tab_id: 72, url: "https://provider.example.edu/paper.pdf", choice: { interaction: offer.interaction, job_id: offer.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(expired).toMatchObject({ ok: false, code: "choice_expired" });
+  const expired2 = await h.bridge.startPDFDelivery({ tab_id: 72, url: "https://provider.example.edu/paper.pdf", choice: { interaction: offer.interaction, job_id: offer.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(expired2).toMatchObject({ ok: false, code: "choice_expired" });
+});
+
+test("waiting_manual revalidation fails closed after worker death with empty volatile maps (live token mismatch)", async () => {
+  const viewerURL = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  const otherURL = "https://pdf.sciencedirectassets.com/271849/other.pdf";
+  const h1 = makeHarness();
+  await ((h1.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [
+      { job_id: "job_wmanual_a", tab_id: -1, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: [] },
+      awaitingJob("job_wmanual_b", 1_700_000_000_010),
+    ]};
+  });
+  await h1.bridge.start();
+  h1.tabs.seed({ id: 73, url: viewerURL });
+  const offer = ((await h1.bridge.startPDFDelivery({ tab_id: 73, url: viewerURL }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const picked = await h1.bridge.startPDFDelivery({ tab_id: 73, url: viewerURL, choice: { interaction: offer.interaction, job_id: offer.candidates[0]!.job_id } }) as unknown as Record<string, unknown>;
+  expect(picked["state"]).toBe("waiting_manual");
+  const persisted = JSON.parse(JSON.stringify(h1.backend.store)) as StoreShape;
+  const h2 = makeHarness(persisted);
+  h2.tabs.seed({ id: 73, url: otherURL });
+  await h2.bridge.start();
+  const item: DownloadItemLike = { id: 9101, tabId: 73, url: otherURL, filename: "other.pdf", state: "in_progress" };
+  await h2.downloads.onCreated.emit(item);
+  expect(h2.backend.store.pendingDelivery).toBeUndefined();
+});
+
+test("onTabReplaced prerender activation clears durable continuation and allows fresh pick", async () => {
+  const viewer80 = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  const h1 = makeHarness();
+  await ((h1.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_replace_a", 1_700_000_000_001), awaitingJob("job_replace_b", 1_700_000_000_002)] };
+  });
+  await h1.bridge.start();
+  h1.tabs.seed({ id: 80, url: viewer80 });
+  await h1.webNavigation.onCommitted!.emit({ tabId: 80, frameId: 0, documentId: "doc-80" });
+  const offer80 = ((await h1.bridge.startPDFDelivery({ tab_id: 80, url: viewer80 }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  const picked = await h1.bridge.startPDFDelivery({ tab_id: 80, url: viewer80, choice: { interaction: offer80.interaction, job_id: "job_replace_a" } }) as unknown as Record<string, unknown>;
+  expect(picked["state"]).toBe("waiting_manual");
+  expect(h1.backend.store.pendingDelivery?.page_identity?.tab_id).toBe(80);
+  await h1.webNavigation.onTabReplaced.emit({ addedTabId: 81, removedTabId: 80 });
+  expect(h1.backend.store.pendingDelivery).toBeUndefined();
+  h1.tabs.seed({ id: 81, url: viewer80 });
+  await h1.webNavigation.onCommitted!.emit({ tabId: 81, frameId: 0, documentId: "doc-81" });
+  const offer81 = await h1.bridge.startPDFDelivery({ tab_id: 81, url: viewer80 }) as unknown as Record<string, unknown>;
+  expect(offer81["state"]).toBe("needs_choice");
+  const offer81Choice = (offer81["choice"] as { interaction: string; candidates: { job_id: string }[] });
+  const repick = await h1.bridge.startPDFDelivery({ tab_id: 81, url: viewer80, choice: { interaction: offer81Choice.interaction, job_id: "job_replace_b" } }) as unknown as Record<string, unknown>;
+  expect(repick["ok"]).toBe(true);
+  expect(repick["job_id"]).toBe("job_replace_b");
+});
+
+test("death between sending persistence and downloads.download is recoverable via fresh pick", async () => {
+  const h1 = makeHarness();
+  await ((h1.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_send_a", 1_700_000_000_001), awaitingJob("job_send_b", 1_700_000_000_002)] };
+  });
+  await h1.bridge.start();
+  const pdfURL = "https://provider.example.edu/paper.pdf";
+  h1.tabs.seed({ id: 90, url: pdfURL });
+  await h1.webNavigation.onCommitted!.emit({ tabId: 90, frameId: 0, documentId: "doc-90" });
+  const offer = ((await h1.bridge.startPDFDelivery({ tab_id: 90, url: pdfURL }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  await ((h1.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, pendingDelivery: { job_id: offer.candidates[0]!.job_id, initiated_at: 1_700_000_000_000, status: "sending" as const } };
+  });
+  (h1.bridge as unknown as { deliveryJobs: Set<string> }).deliveryJobs.clear();
+  const persisted = JSON.parse(JSON.stringify(h1.backend.store)) as StoreShape;
+  const h2 = makeHarness(persisted);
+  h2.tabs.seed({ id: 90, url: pdfURL });
+  await h2.bridge.start();
+  expect(h2.backend.store.pendingDelivery).toBeUndefined();
+  const freshOffer = await h2.bridge.startPDFDelivery({ tab_id: 90, url: pdfURL }) as unknown as Record<string, unknown>;
+  expect(freshOffer["state"]).toBe("needs_choice");
+});
+
+test("Firefox native viewer PDF does not offer picker (assisted)", async () => {
+  const h = makeHarness(undefined, { firefox: true });
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_ff_a", 1_700_000_000_001)] };
+  });
+  await h.bridge.start();
+  const viewerURL = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  h.tabs.seed({ id: 100, url: viewerURL });
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 100, url: viewerURL }) as unknown as Record<string, unknown>;
+  expect(reply["ok"]).toBe(false);
+  expect(String((reply as { error?: { message?: string } }).error?.message ?? "")).toMatch(/viewer Download/i);
+});
+
+test("terminal delivery destroys outstanding choices so same-page resend cannot reuse old nonce", async () => {
+  const h = makeHarness();
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_term_a", 1_700_000_000_001), awaitingJob("job_term_b", 1_700_000_000_002), awaitingJob("job_term_c", 1_700_000_000_003)] };
+  });
+  await h.bridge.start();
+  h.tabs.seed({ id: 110, url: "https://provider.example.edu/paper.pdf" });
+  const offer = ((await h.bridge.startPDFDelivery({ tab_id: 110, url: "https://provider.example.edu/paper.pdf" }) as unknown as Record<string, unknown>)["choice"]) as { interaction: string; candidates: { job_id: string }[] };
+  await (h.bridge as unknown as { removeJobWithOffer: (id:string)=>Promise<void> }).removeJobWithOffer("job_term_b");
+  const reuse = await h.bridge.startPDFDelivery({ tab_id: 110, url: "https://provider.example.edu/paper.pdf", choice: { interaction: offer.interaction, job_id: "job_term_a" } }) as unknown as Record<string, unknown>;
+  expect(reuse).toMatchObject({ ok: false, code: "choice_expired" });
+});
+
 test("ScienceDirect assets Send PDF arms the native viewer download (waiting_manual) via tab/DOI correlation", async () => {
   const store = { ...emptyStore(), activeJobs: [
     { job_id: "job_sciencedirect_native_viewer", tab_id: 42, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: ["sciencedirect.com", "pdf.sciencedirectassets.com"], adapter_id: "sciencedirect", access_mode: "delegated" as const },
