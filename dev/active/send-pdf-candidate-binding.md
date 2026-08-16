@@ -1,12 +1,6 @@
 # Send PDF without the inbox "Open" step: candidate binding for DOI-less PDFs
 
-Status: plan v4 (2026-08-16). Three oracle review rounds (GPT-5.6 Sol, all
-REVISE, monotonically converging: round 3 scored round 2 as 5 addressed /
-2 partial / 0 unaddressed and called the rest "specification surgery
-rather than redesign"; answers under `dev/scratch/oracle/20260816T*/`).
-Round-3 findings all adopted after source verification. Work in flight;
-salvage normative content into the ADR-0020 amendment on ship, then delete
-this file.
+Status: implemented 2026-08-16 — Phases 1–3 shipped (popup picker replacing the inbox pin, conclusive-identity veto, `candidate_auto_bind/1` auto-bind fenced in the binding transaction with `pdf_grabs.bind_provenance` / migration 0037 / schema 37, zero-wrong-accept gate on the main corpus). Phase 4 (ranked one-click confirm) remains deliberately unbuilt, gated on observed parked-grab volume after these phases ship. ADR-0020 amendment landed; see the ADR; salvage normative content into that amendment before deleting this file.
 
 ## Problem
 

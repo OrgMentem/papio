@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"papio/internal/store"
@@ -76,6 +77,12 @@ type Grab struct {
 	NotifiedAt string
 	CreatedAt  string
 	UpdatedAt  string
+	// BindProvenance is the JSON audit for an automatic candidate binding,
+	// or empty when no automatic decision has been recorded. NULL in the
+	// database means "no automatic binding decision recorded" — every row
+	// predating the provenance column and any grab not bound via
+	// candidate_auto_bind is honestly absent rather than guessed.
+	BindProvenance string
 }
 
 // Service is internal/grab's store-backed entry point.
@@ -121,7 +128,7 @@ func isUniqueConstraintError(err error) bool {
 	return strings.Contains(msg, "unique")
 }
 
-var columns = `id, url_host, title, state, effect_request_id, quarantine_path, job_id, outcome, detail, notified_at, created_at, updated_at`
+var columns = `id, url_host, title, state, effect_request_id, quarantine_path, job_id, outcome, detail, notified_at, created_at, updated_at, bind_provenance`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -130,16 +137,17 @@ type scanner interface {
 func scanGrab(row scanner) (*Grab, error) {
 	var g Grab
 	var state string
-	var jobID, notifiedAt sql.NullString
+	var jobID, notifiedAt, bindProvenance sql.NullString
 	if err := row.Scan(
 		&g.ID, &g.URLHost, &g.Title, &state, &g.EffectRequestID, &g.QuarantinePath, &jobID, &g.Outcome, &g.Detail, &notifiedAt,
-		&g.CreatedAt, &g.UpdatedAt,
+		&g.CreatedAt, &g.UpdatedAt, &bindProvenance,
 	); err != nil {
 		return nil, err
 	}
 	g.State = State(state)
 	g.JobID = jobID.String
 	g.NotifiedAt = notifiedAt.String
+	g.BindProvenance = bindProvenance.String
 	if !validState(g.State) {
 		// Fail closed on a row whose state this binary does not know —
 		// hand-edited databases and future-schema rows must never be
@@ -390,6 +398,105 @@ func (s *Service) MarkJobCreated(ctx context.Context, id, jobID, outcome string)
 		UPDATE pdf_grabs SET state = ?, job_id = ?, outcome = ?, updated_at = ?
 		WHERE id = ? AND state IN (?, ?, ?)`,
 		string(StateJobCreated), jobID, outcome, now, id,
+		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified))
+	if err != nil {
+		return err
+	}
+	if err := requireOneRow(res, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE effect_permits SET status='settled', updated_at=? WHERE grab_id=? AND effect_kind='pdf_grab' AND status IN ('held','unknown_completion')`, now, id); err != nil {
+		return err
+	}
+	if err := settleLegacyPDFBlockerTx(ctx, tx, id, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// BindProvenance records why an automatic candidate binding was made, so a
+// human reading the ledger later can reconstruct the decision.
+type BindProvenance struct {
+	Method               string   `json:"method"`
+	Rule                 string   `json:"rule"`
+	Winner               string   `json:"winner"`
+	CandidatesConsidered int      `json:"candidates_considered"`
+	Evidence             []string `json:"evidence,omitempty"`
+}
+
+func nullable(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// MarkBoundToJob binds a settled grab to an existing job and records the
+// provenance of that decision in the same transaction as the state change.
+//
+// The binding method is never encoded in the wire outcome — outcome remains
+// the caller-supplied value (e.g. "job_created") so the extension's closed
+// outcome vocabulary is unchanged. The method lives only in the provenance
+// column, which is the durable audit trail for automatic decisions.
+func (s *Service) MarkBoundToJob(ctx context.Context, id, jobID, outcome string, prov BindProvenance) error {
+	return s.markBoundToJob(ctx, id, jobID, outcome, prov, nil)
+}
+
+// MarkBoundToJobFenced is MarkBoundToJob with a serialization fence.
+//
+// The fence runs INSIDE the same transaction that performs the CAS, before
+// the row is updated. A recompute outside the serialization point fences
+// nothing: another writer can change eligibility between the decision and the
+// CAS, so the check and the commit must be atomic. Any non-nil error from
+// fence aborts the transaction and rolls back without touching the row.
+func (s *Service) MarkBoundToJobFenced(ctx context.Context, id, jobID, outcome string, prov BindProvenance, fence func(ctx context.Context, tx *sql.Tx) error) error {
+	return s.markBoundToJob(ctx, id, jobID, outcome, prov, fence)
+}
+
+func (s *Service) markBoundToJob(ctx context.Context, id, jobID, outcome string, prov BindProvenance, fence func(ctx context.Context, tx *sql.Tx) error) error {
+	if strings.TrimSpace(jobID) == "" {
+		return fmt.Errorf("grab %s: job id is required", id)
+	}
+	if strings.TrimSpace(prov.Method) == "" {
+		return fmt.Errorf("grab %s: binding method is required", id)
+	}
+	if strings.TrimSpace(prov.Rule) == "" {
+		return fmt.Errorf("grab %s: binding rule is required", id)
+	}
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if fence != nil {
+		if err := fence(ctx, tx); err != nil {
+			return err
+		}
+	}
+	now := store.Now()
+	var provVal any
+	// An empty/zero provenance stores SQL NULL rather than "{}" or a
+	// half-populated literal — NULL means "no automatic binding decision
+	// recorded", which must remain distinguishable from a real decision.
+	// Validation above already rejected blank Method/Rule, so a zero value
+	// here genuinely means "caller supplied no provenance".
+	if prov.Method != "" || prov.Rule != "" || prov.Winner != "" || prov.CandidatesConsidered != 0 || len(prov.Evidence) != 0 {
+		b, err := json.Marshal(prov)
+		if err != nil {
+			return err
+		}
+		provVal = nullable(string(b))
+	} else {
+		provVal = nil
+	}
+	// Mirror MarkJobCreated exactly: same CAS state set, requireOneRow,
+	// effect_permits settle, settleLegacyPDFBlockerTx, then Commit.
+	// The state written is still job_created and the outward outcome is
+	// still caller-supplied — the binding method lives only in provenance.
+	res, err := tx.ExecContext(ctx, `
+		UPDATE pdf_grabs SET state = ?, job_id = ?, outcome = ?, bind_provenance = ?, updated_at = ?
+		WHERE id = ? AND state IN (?, ?, ?)`,
+		string(StateJobCreated), jobID, outcome, provVal, now, id,
 		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified))
 	if err != nil {
 		return err

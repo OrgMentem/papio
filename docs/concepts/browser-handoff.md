@@ -176,8 +176,12 @@ The extension requests these regular permissions: `nativeMessaging`, `activeTab`
 `tabs`, `downloads`, `scripting`, and `storage` for the connector link, tab
 tracking, and download adoption described above; `alarms` for the one-minute
 keepalive wake cycle that refreshes the pending-job count and connection state
-without a *papio* tab open; and `tabGroups` for the "papio" tab group the
-extension uses to gather handoff tabs when tab-group mode is active.
+without a *papio* tab open; `tabGroups` for the "papio" tab group the
+extension uses to gather handoff tabs when tab-group mode is active; and
+`webNavigation` so that when you pick which paper a PDF belongs to, *papio*
+notices if that tab later navigates somewhere else and lets the choice lapse
+instead of filing the next document under it. `webNavigation` reports that a
+navigation happened and the address it went to; it reads no page content.
 
 Host access splits into two tiers. Three host permissions are required and
 granted at install on Chrome: `https://*.alma.exlibrisgroup.com/*` and

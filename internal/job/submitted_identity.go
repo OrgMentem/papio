@@ -9,16 +9,36 @@ import (
 	"strings"
 )
 
+// submittedIdentityQuerier is satisfied by both *sql.DB and *sql.Tx so the
+// submitted-identity load has ONE SQL body with two entry points: pool and
+// transaction.
+type submittedIdentityQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // SubmittedIdentity loads the immutable submit snapshot for one job. Legacy rows
 // with NULL submitted_fields return Attested false so cache reuse and validation
 // cannot treat adopted metadata as if the requester supplied it.
 func (js *Store) SubmittedIdentity(ctx context.Context, jobID string) (SubmittedIdentity, error) {
-	db := js.S.DB()
+	return fetchSubmittedIdentity(ctx, js.S.DB(), jobID)
+}
+
+// SubmittedIdentityTx is the transaction-scoped variant of SubmittedIdentity.
+// It MUST be used by callers already inside a transaction:
+// db.SetMaxOpenConns(1) means the transaction holds the ONLY connection, so
+// any query issued through the pool (rather than through that tx) inside the
+// transaction DEADLOCKS.
+func SubmittedIdentityTx(ctx context.Context, tx *sql.Tx, jobID string) (SubmittedIdentity, error) {
+	return fetchSubmittedIdentity(ctx, tx, jobID)
+}
+
+func fetchSubmittedIdentity(ctx context.Context, q submittedIdentityQuerier, jobID string) (SubmittedIdentity, error) {
 	var requestID string
 	var title, authorsJSON sql.NullString
 	var year sql.NullInt64
 	var submittedFields sql.NullString
-	err := db.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT j.work_request_id, w.title, w.authors_json, w.year, w.submitted_fields
 		FROM jobs j
 		JOIN work_requests w ON w.id = j.work_request_id
@@ -52,7 +72,7 @@ func (js *Store) SubmittedIdentity(ctx context.Context, jobID string) (Submitted
 		}
 	}
 
-	rows, err := db.QueryContext(ctx, `
+	rows, err := q.QueryContext(ctx, `
 		SELECT kind, value, COALESCE(raw, value), provenance
 		FROM identifiers WHERE work_request_id = ? AND provenance IN ('submitted','verified')`, requestID)
 	if err != nil {

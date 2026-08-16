@@ -105,3 +105,58 @@ Constraints that bound the design:
 - **Automatic grabbing of every PDF tab** — the Nomad lesson (ADR-0019):
   ambient collection is the product papio refused to be; grabs are
   explicit, one click, one file.
+
+## Amendment 2026-08-16: candidate binding is an acceptance-affecting route
+
+Candidate binding IS a new acceptance-affecting route, superseding the
+Consequences claim that "no new acceptance path exists" and narrowing
+Decision 4.
+
+Blind capture still never creates or names a work from title evidence. A
+capture lacking a conclusive blind identifier may be correlated with an
+already-established job, but that correlation is itself an identity
+decision. Automatic correlation must satisfy the separately specified
+candidate-binding rule (`candidate_auto_bind/1`) and must abstain on
+ambiguity or contradictory identity evidence. A human job selection
+supplies correlation evidence, not authority to override conclusive
+document identity, and ordinary candidate validation remains mandatory
+before an artifact becomes a job's accepted PDF.
+
+Narrows by number: **Decision 4** — "No identifier → the grab parks as a
+human action" now parks only when automatic correlation abstains (zero or
+multiple qualifiers, any `Review`, or a conclusive-identity veto); and the
+Consequences bullet that the wrong-accept doctrine is untouched. Decisions
+1–3 and 5, the privacy posture, and the transport (steered download, no
+bytes over native messaging) are unchanged. ADR-0019's title-only stance
+holds — no phase creates a work from title — and ADR-0010's dedupe
+invariants hold — no new job-creation path.
+
+Two predicates enforce the amendment at the single convergence
+`validateCandidate` (direct delivery, grab binds, adoption sweeps, resolver
+fetches) and at the settled-grab sweep:
+
+- **Conclusive-identity veto.** `D` is the conclusive DOI set from the
+  1 KiB blind front-matter window (`pdf.FrontMatterDOIs`). `|D| = 0` → no
+  veto; `|D| > 1` → park `verify_identity`; `|D| = 1` → compatible only
+  when the job's DOI equals it under the identity-comparison normalisation
+  or the job's submission-time recorded metadata already binds that DOI.
+  No runtime resolver lookup. `ReviewOverride` (explicit human review of
+  the quarantined preview, ADR-0002) still overrides; a picker selection
+  never does.
+- **`candidate_auto_bind/1`.** DOI-less settled grabs are scored against
+  the daemon-authoritative candidate-eligible pool (live,
+  `StateAwaitingHuman`, open `manual_download` action). Auto-bind requires
+  real author evidence, exact printed title (`titlePrintedAsLine`), the
+  candidate-binding year predicate (distinct from `MatchIdentity.yearConflict`),
+  identifier corroboration over `identityPageOne` (4 KiB), and the
+  conclusive-identity veto — with exactly one qualifier and no `Review`.
+  Otherwise the grab stays parked.
+
+Binding is fenced by a serialized final recompute inside the same
+transaction that CASes the grab to `job_created`; provenance
+(`method=candidate_auto_bind`, rule version, evidence, candidates
+considered, winner) is written atomically as nullable
+`pdf_grabs.bind_provenance` (migration 0037, store schema 37). The outward
+wire outcome remains `job_created` — the method is never encoded in the
+outcome. The rule shipped only after the three-layer measurement gate
+reported zero wrong-accepts on its main corpus.

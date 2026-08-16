@@ -16,7 +16,12 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
-### Fixed
+### Added
+- **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
+
+### Changed
+- **A paper you picked no longer stays picked after you leave the PDF.** The popup's offer is now one-shot: the background mints an opaque nonce held only in service-worker memory, consumes it synchronously on selection, and freezes the page identity — tab, document, same-document navigation sequence and resolved source URL — against that pick. The offer dies when the worker restarts, when the tab navigates, closes, or is replaced, or when the delivery settles or fails; a later page in the same tab id never revives it. The native-viewer *Download* continuation is the one state that does survive a restart, held in session storage with its own job binding and page identity and re-validated when the download is claimed, and it is destroyed on every cancel or close path. This replaces the old `manual_delivery_target` pin (`Open` in the inbox) and `uniqueManualDeliveryTarget` cross-tab authority — a DOI-less file that reaches the daemon without your pick follows the blind grab path as before. To recognise when a tab has navigated away from the PDF you picked, the extension now requests the `webNavigation` permission (Chrome and Firefox); no browsing history is collected.
+
 - **A browser that is not the session holder no longer claims the daemon is
   unreachable.** With the extension enabled in two browsers, the one waiting
   its turn showed *papio daemon isn't reachable — run: papio daemon status*,

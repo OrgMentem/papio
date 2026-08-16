@@ -3011,7 +3011,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	// IdentityPass and the bytes get promoted under the wrong citation.
 	// That silent wrong-accept is what this arm closes. Computed once
 	// alongside needsIdentityReview so switch and verdict share one value.
-	conclusiveVeto := pdf.CheckConclusiveIdentity(report.Text.Excerpt, boundDOIs(anchor, row))
+	conclusiveVeto := pdf.CheckConclusiveIdentity(report.Text.Excerpt, job.BoundDOIs(anchor, row.Work))
 	// Recorded before the branch, not inside each arm: the verdict is a function
 	// of the report alone, so one call site cannot drift from the decision below,
 	// and evidence survives even for the candidates papio throws away — which is

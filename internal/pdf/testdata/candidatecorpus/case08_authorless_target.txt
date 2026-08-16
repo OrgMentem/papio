@@ -1,0 +1,14 @@
+Synthetic Language Review 2023;5(2):88-104
+
+Scaling Laws for Synthetic Language Models
+
+Rebecca Klein, Omar Haddad
+Synthetic Language Lab, University of Examples
+
+Published 2023
+DOI: 10.5555/synth.2023.080
+
+Abstract
+We study scaling laws for synthetic language models across compute budgets.
+Model families from 10M to 10B parameters are evaluated.
+Fits are reported for loss versus tokens and parameters.

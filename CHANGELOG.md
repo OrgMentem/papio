@@ -11,6 +11,7 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **A captured PDF without a front-matter DOI can now find its paper on its own.** When a grabbed DOI-less PDF settles and the daemon holds exactly one pending paper whose title, authors, year and identifier corroboration all agree — and no other pending paper also qualifies and no contradictory identity evidence is present — *papio* binds the capture to that paper automatically instead of leaving a `needs_identifier` row that asks you to run `papio grabs identify` in a terminal. The ordinary candidate validation still runs before the bytes become the job's accepted PDF, and ambiguous cases stay parked rather than guessed. The binding is fenced by a recompute inside the same transaction that claims the grab, and the rule version, evidence, and number of candidates considered are recorded alongside the grab as provenance (`pdf_grabs.bind_provenance`, migration 0037). Store schema 37; wire outcome stays `job_created` — the method is not encoded in the outcome.
 - **`papio doctor` now says how much of today's metered allowance is gone.** A
   daily ceiling that can park a source was enforced with nothing on any surface
   reporting it, so reaching it read as *papio* having stopped working. Doctor
@@ -21,6 +22,7 @@ execution records kept during the initial build.
   A spent allowance warns and says work resumes at `00:00 UTC`.
 
 ### Fixed
+- **A document that names a different paper is now held for review instead of being filed.** A captured or directly delivered PDF whose front matter conclusively names a DOI belonging to a work the job is not bound to now parks for `verify_identity` instead of being accepted. This closes a wrong-accept that ordinary identity scoring did not cover for DOI-less jobs: a PDF whose printed title and authors matched the requested paper exactly could be filed under the wrong citation, because the foreign-DOI check only applied when the job itself had a DOI. The veto runs in `validateCandidate` — the single convergence for direct delivery, grab binds, adoption sweeps and resolver fetches — so every bytes-to-artifact path is gated the same way. An explicit human review of the quarantined preview (`ReviewOverride`, ADR-0002) still overrides the veto, exactly as it overrides the neighbouring identity-review arm; picking a job in the popup does not — a selection supplies correlation evidence, not authority to overrule conclusive document identity, and a review remains the only way to accept a document whose own front matter says it is a different work. That extra step is deliberate: a silent wrong-accept is a worse failure than an honest `verify_identity` turn.
 - **A paper found by title search no longer gets filed under that search's own
   identifier.** Looking a title up returns a record, and *papio* was writing
   that record's DOI onto your request as if you had supplied it. Two papers can

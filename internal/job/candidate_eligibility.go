@@ -3,6 +3,7 @@ package job
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 
@@ -13,8 +14,9 @@ import (
 // live, awaiting a human download, and still carrying an open manual_download
 // action.
 type CandidateEligibleJob struct {
-	JobID string
-	Work  work.Work
+	JobID     string
+	Work      work.Work
+	BoundDOIs []string
 }
 
 // ListCandidateEligibleJobs returns every candidate-eligible job, oldest action
@@ -31,6 +33,50 @@ type CandidateEligibleJob struct {
 // so callers and tests never depend on SQLite row order. If a job somehow
 // carries two open manual_download actions it appears once.
 func (js *Store) ListCandidateEligibleJobs(ctx context.Context) ([]CandidateEligibleJob, error) {
+	jobs, err := queryCandidateEligibleJobs(ctx, js.S.DB())
+	if err != nil {
+		return nil, err
+	}
+	// Populate BoundDOIs for every candidate. One SubmittedIdentity load per
+	// candidate is acceptable: the pool is a human's manual-download backlog,
+	// bounded and small, and the alternative is a second SQL expression of the
+	// same bound-DOI rule.
+	for i := range jobs {
+		anchor, err := fetchSubmittedIdentity(ctx, js.S.DB(), jobs[i].JobID)
+		if err != nil {
+			return nil, err
+		}
+		jobs[i].BoundDOIs = BoundDOIs(anchor, jobs[i].Work)
+	}
+	return jobs, nil
+}
+
+// ListCandidateEligibleJobsTx is the transaction-scoped variant of
+// ListCandidateEligibleJobs. It MUST be used by callers already inside a
+// transaction: db.SetMaxOpenConns(1) means the transaction holds the ONLY
+// connection, so any query issued through the pool (rather than through that
+// tx) inside the transaction DEADLOCKS. Reading through the tx observes the
+// transaction's own view, which is the whole point of the fence.
+func ListCandidateEligibleJobsTx(ctx context.Context, tx *sql.Tx) ([]CandidateEligibleJob, error) {
+	jobs, err := queryCandidateEligibleJobs(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range jobs {
+		anchor, err := fetchSubmittedIdentity(ctx, tx, jobs[i].JobID)
+		if err != nil {
+			return nil, err
+		}
+		jobs[i].BoundDOIs = BoundDOIs(anchor, jobs[i].Work)
+	}
+	return jobs, nil
+}
+
+// queryCandidateEligibleJobs shares ONE SQL body between the pool and
+// transaction entry points. It reuses the existing handoffQueryer interface
+// that already covers QueryContext for *sql.DB/*sql.Tx, checked before
+// inventing a new one.
+func queryCandidateEligibleJobs(ctx context.Context, q handoffQueryer) ([]CandidateEligibleJob, error) {
 	// One joined query so the pool cannot observe a half-written action/job
 	// pair between separate reads, and so work metadata arrives without N+1
 	// lookups. Work hydration mirrors the neighbouring joined queries (see
@@ -56,7 +102,7 @@ func (js *Store) ListCandidateEligibleJobs(ctx context.Context) ([]CandidateElig
 		GROUP BY j.id
 		ORDER BY MIN(a.created_at) ASC, MIN(a.id) ASC, j.id ASC`
 
-	rows, err := js.S.DB().QueryContext(ctx, query, StateAwaitingHuman)
+	rows, err := q.QueryContext(ctx, query, StateAwaitingHuman)
 	if err != nil {
 		return nil, err
 	}

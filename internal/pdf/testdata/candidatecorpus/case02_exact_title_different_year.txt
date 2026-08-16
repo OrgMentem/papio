@@ -1,0 +1,14 @@
+Transactions on Synthetic Learning 2021;15(4):55-72
+
+Bayesian Optimization for Hyperparameter Tuning in Deep Networks
+
+Mira Patel, Jonas Heller
+Synthetic Learning Lab, OrgMentem Institute
+
+Published 2021
+DOI: 10.5555/synth.2021.010
+
+Abstract
+We describe a Bayesian optimization framework for tuning deep networks.
+Acquisition functions and surrogate models are evaluated on synthetic tasks.
+Results indicate faster convergence than grid search.

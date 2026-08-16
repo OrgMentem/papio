@@ -1,0 +1,14 @@
+Journal of Synthetic Computation 2023;18(9):2100-2125
+
+Efficient Attention Mechanisms for Long Sequences
+
+Sofia Berg, Hiroshi Sato
+Synthetic Computation Laboratory, University of Examples
+
+Published 2023
+DOI: 10.5555/synth.journal.2023.ea1
+
+Abstract
+We introduce attention variants that scale linearly with sequence length.
+Experiments on synthetic long-context tasks demonstrate efficiency gains.
+The journal version extends the conference paper with new ablations.

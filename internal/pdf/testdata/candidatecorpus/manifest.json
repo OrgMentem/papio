@@ -1,0 +1,471 @@
+{
+  "cases": [
+    {
+      "id": "same-author-near-title",
+      "document": "case01_same_author_near_title.txt",
+      "risk_family": "same-author near-title",
+      "candidates": [
+        {
+          "key": "A",
+          "work": {
+            "doi": "10.5555/synth.2024.001",
+            "title": "Network Embedding With Adaptive Sampling for Community Detection",
+            "authors": [
+              "Elena Vargas",
+              "Kenji Tanaka"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.001"
+          ]
+        },
+        {
+          "key": "B",
+          "work": {
+            "doi": "10.5555/synth.2024.002",
+            "title": "Network Embedding With Adaptive Sampling for Link Prediction",
+            "authors": [
+              "Elena Vargas",
+              "Kenji Tanaka"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.002"
+          ]
+        }
+      ],
+      "truth": "A",
+      "canonical_equivalence": []
+    },
+    {
+      "id": "exact-title-different-year",
+      "document": "case02_exact_title_different_year.txt",
+      "risk_family": "exact title with a different year",
+      "candidates": [
+        {
+          "key": "C2021",
+          "work": {
+            "doi": "10.5555/synth.2021.010",
+            "title": "Bayesian Optimization for Hyperparameter Tuning in Deep Networks",
+            "authors": [
+              "Mira Patel",
+              "Jonas Heller"
+            ],
+            "year": 2021
+          },
+          "bound": [
+            "10.5555/synth.2021.010"
+          ]
+        },
+        {
+          "key": "C2024",
+          "work": {
+            "doi": "10.5555/synth.2024.011",
+            "title": "Bayesian Optimization for Hyperparameter Tuning in Deep Networks",
+            "authors": [
+              "Mira Patel",
+              "Jonas Heller"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.011"
+          ]
+        }
+      ],
+      "truth": "C2021",
+      "canonical_equivalence": []
+    },
+    {
+      "id": "citing-sequel",
+      "document": "case03_citing_sequel.txt",
+      "risk_family": "citing sequel",
+      "candidates": [
+        {
+          "key": "SEQ_A",
+          "work": {
+            "doi": "10.5555/synth.2023.020",
+            "title": "Graph Neural Networks for Molecular Property Prediction",
+            "authors": [
+              "Luis Fernandez",
+              "Aisha Khan"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.020"
+          ]
+        },
+        {
+          "key": "SEQ_B",
+          "work": {
+            "doi": "10.5555/synth.2025.021",
+            "title": "Graph Neural Networks for Molecular Property Prediction II: Multi-Task Extensions",
+            "authors": [
+              "Luis Fernandez",
+              "Aisha Khan"
+            ],
+            "year": 2025
+          },
+          "bound": [
+            "10.5555/synth.2025.021"
+          ]
+        }
+      ],
+      "truth": "SEQ_A",
+      "canonical_equivalence": []
+    },
+    {
+      "id": "correction-notice",
+      "document": "case04_correction_notice.txt",
+      "risk_family": "correction/comment/retraction notice",
+      "candidates": [
+        {
+          "key": "ORIG",
+          "work": {
+            "doi": "10.5555/synth.2024.030",
+            "title": "Robust Estimation of Treatment Effects Under Confounding",
+            "authors": [
+              "Priya Natarajan",
+              "David Clark"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.030"
+          ]
+        },
+        {
+          "key": "ERRATUM",
+          "work": {
+            "doi": "10.5555/synth.2024.030-corr",
+            "title": "Erratum: Robust Estimation of Treatment Effects Under Confounding",
+            "authors": [
+              "Priya Natarajan"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.030-corr"
+          ]
+        }
+      ],
+      "truth": "ERRATUM",
+      "canonical_equivalence": []
+    },
+    {
+      "id": "numbered-series",
+      "document": "case05_numbered_series.txt",
+      "risk_family": "edition or numbered series",
+      "candidates": [
+        {
+          "key": "V1",
+          "work": {
+            "doi": "10.5555/synth.report.2022.v1",
+            "title": "Final Report - Volume 1, Framework",
+            "authors": [
+              "Committee on Synthetic Assessment"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.report.2022.v1"
+          ]
+        },
+        {
+          "key": "V3",
+          "work": {
+            "doi": "10.5555/synth.report.2022.v3",
+            "title": "Final Report - Volume 3, Impacts",
+            "authors": [
+              "Committee on Synthetic Assessment"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.report.2022.v3"
+          ]
+        }
+      ],
+      "truth": "V3",
+      "canonical_equivalence": []
+    },
+    {
+      "id": "conference-vs-journal",
+      "document": "case06_conference_vs_journal.txt",
+      "risk_family": "conference vs. journal versions that are distinct works",
+      "candidates": [
+        {
+          "key": "CONF",
+          "work": {
+            "doi": "10.5555/synth.conf.2022.ea1",
+            "title": "Efficient Attention Mechanisms for Long Sequences",
+            "authors": [
+              "Sofia Berg",
+              "Hiroshi Sato"
+            ],
+            "year": 2022,
+            "container": "Proc. Synthetic Conf. 2022"
+          },
+          "bound": [
+            "10.5555/synth.conf.2022.ea1"
+          ]
+        },
+        {
+          "key": "JOURNAL",
+          "work": {
+            "doi": "10.5555/synth.journal.2023.ea1",
+            "title": "Efficient Attention Mechanisms for Long Sequences",
+            "authors": [
+              "Sofia Berg",
+              "Hiroshi Sato"
+            ],
+            "year": 2023,
+            "container": "J. Synthetic Computation"
+          },
+          "bound": [
+            "10.5555/synth.journal.2023.ea1"
+          ]
+        }
+      ],
+      "truth": "JOURNAL",
+      "canonical_equivalence": []
+    },
+    {
+      "id": "preprint-vs-vor",
+      "document": "case07_preprint_vor.txt",
+      "risk_family": "preprint vs. version-of-record",
+      "candidates": [
+        {
+          "key": "PREPRINT",
+          "work": {
+            "title": "Attention Is Not All You Need: A Synthetic Replication",
+            "authors": [
+              "Noah Fischer",
+              "Lina Okafor"
+            ],
+            "year": 2024,
+            "arxiv": "2401.00001"
+          },
+          "bound": [
+            "10.48550/arxiv.2401.00001"
+          ]
+        },
+        {
+          "key": "VOR",
+          "work": {
+            "doi": "10.5555/synth.2024.070",
+            "title": "Attention Is Not All You Need: A Synthetic Replication",
+            "authors": [
+              "Noah Fischer",
+              "Lina Okafor"
+            ],
+            "year": 2024
+          },
+          "bound": [
+            "10.5555/synth.2024.070"
+          ]
+        }
+      ],
+      "truth": "VOR",
+      "canonical_equivalence": [
+        "PREPRINT",
+        "VOR"
+      ]
+    },
+    {
+      "id": "author-less-target",
+      "document": "case08_authorless_target.txt",
+      "risk_family": "author-less target (metadata ablation)",
+      "candidates": [
+        {
+          "key": "TRUE_NOAUTH",
+          "work": {
+            "doi": "10.5555/synth.2023.080",
+            "title": "Scaling Laws for Synthetic Language Models",
+            "authors": [],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.080"
+          ]
+        },
+        {
+          "key": "DISTRACTOR",
+          "work": {
+            "doi": "10.5555/synth.2023.081",
+            "title": "Scaling Laws for Synthetic Language Models",
+            "authors": [
+              "Martin Schulz",
+              "Wei Liu"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.081"
+          ]
+        }
+      ],
+      "truth": "TRUE_NOAUTH",
+      "canonical_equivalence": []
+    },
+    {
+      "id": "year-less-target",
+      "document": "case09_yearless_target.txt",
+      "risk_family": "year-less target (metadata ablation)",
+      "candidates": [
+        {
+          "key": "TRUE_NOYEAR",
+          "work": {
+            "doi": "10.5555/synth.2022.090",
+            "title": "Federated Learning With Differential Privacy Guarantees",
+            "authors": [
+              "Ana Ruiz",
+              "Daniel Wu"
+            ]
+          },
+          "bound": [
+            "10.5555/synth.2022.090"
+          ]
+        },
+        {
+          "key": "WRONG_YEAR",
+          "work": {
+            "doi": "10.5555/synth.2019.091",
+            "title": "Federated Learning With Differential Privacy Guarantees",
+            "authors": [
+              "Ana Ruiz",
+              "Daniel Wu"
+            ],
+            "year": 2019
+          },
+          "bound": [
+            "10.5555/synth.2019.091"
+          ]
+        }
+      ],
+      "truth": "TRUE_NOYEAR",
+      "canonical_equivalence": []
+    },
+    {
+      "id": "true-absent",
+      "document": "case10_true_absent.txt",
+      "risk_family": "true work absent from the pool entirely",
+      "candidates": [
+        {
+          "key": "NEIGHBOR_A",
+          "work": {
+            "doi": "10.5555/synth.2020.101",
+            "title": "Causal Inference With Synthetic Controls: Extensions",
+            "authors": [
+              "Gregor Henschel",
+              "Fatima Rahman"
+            ],
+            "year": 2020
+          },
+          "bound": [
+            "10.5555/synth.2020.101"
+          ]
+        },
+        {
+          "key": "NEIGHBOR_B",
+          "work": {
+            "doi": "10.5555/synth.2020.102",
+            "title": "Synthetic Controls for Comparative Case Studies",
+            "authors": [
+              "Gregor Henschel"
+            ],
+            "year": 2020
+          },
+          "bound": [
+            "10.5555/synth.2020.102"
+          ]
+        }
+      ],
+      "truth": null,
+      "canonical_equivalence": []
+    },
+    {
+      "id": "veto-window-correct-with-foreign",
+      "document": "case11_veto_correct_with_foreign_1_4k.txt",
+      "risk_family": "veto-window: correct document with foreign DOI at 1-4 KiB",
+      "candidates": [
+        {
+          "key": "CORRECT",
+          "work": {
+            "doi": "10.5555/synth.2023.110",
+            "title": "Deep Learning for Histopathology Image Classification",
+            "authors": [
+              "Clara Jensen",
+              "Rashid Ali"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.2023.110"
+          ]
+        },
+        {
+          "key": "FOREIGN",
+          "work": {
+            "doi": "10.5555/synth.foreign.999",
+            "title": "Synthetic Foreign Work Unrelated to Histopathology",
+            "authors": [
+              "Foreign Author"
+            ],
+            "year": 2023
+          },
+          "bound": [
+            "10.5555/synth.foreign.999"
+          ]
+        }
+      ],
+      "truth": "CORRECT",
+      "canonical_equivalence": [],
+      "veto_window": true,
+      "veto_note": "CORRECT document carries foreign DOI at 1.5 KiB; blind veto window (1 KiB) should not see it"
+    },
+    {
+      "id": "veto-window-wrong-with-own-doi",
+      "document": "case12_veto_wrong_with_own_doi_1_4k.txt",
+      "risk_family": "veto-window: wrong document whose own DOI sits at 1-4 KiB while target identifier is cited on page one",
+      "candidates": [
+        {
+          "key": "TARGET",
+          "work": {
+            "doi": "10.5555/synth.target.2022.120",
+            "title": "Statistical Methods for Synthetic Longitudinal Data",
+            "authors": [
+              "Yuki Matsuda",
+              "Eva Lindqvist"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.target.2022.120"
+          ]
+        },
+        {
+          "key": "WRONG",
+          "work": {
+            "doi": "10.5555/synth.wrong.2022.121",
+            "title": "Unrelated Synthetic Study on Soil Microbiomes",
+            "authors": [
+              "Mark Fielding"
+            ],
+            "year": 2022
+          },
+          "bound": [
+            "10.5555/synth.wrong.2022.121"
+          ]
+        }
+      ],
+      "truth": "WRONG",
+      "canonical_equivalence": [],
+      "veto_window": true,
+      "veto_note": "WRONG document cites TARGET's DOI on page one but its own DOI at 1.5 KiB; blind veto (1 KiB) misses own DOI"
+    }
+  ]
+}

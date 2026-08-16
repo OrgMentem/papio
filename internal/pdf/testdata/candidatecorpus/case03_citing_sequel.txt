@@ -1,0 +1,16 @@
+Chemical Synthetic Letters 2023;8(1):11-28
+
+Graph Neural Networks for Molecular Property Prediction
+
+Luis Fernandez, Aisha Khan
+Department of Chemical Synthesis, University of Examples
+
+Published 2023
+DOI: 10.5555/synth.2023.020
+
+Abstract
+We evaluate graph neural networks for molecular property prediction.
+The model is trained on synthetic molecular graphs and tested on held-out sets.
+Performance exceeds baselines on regression and classification metrics.
+
+We build on our sequel Graph Neural Networks for Molecular Property Prediction II: Multi-Task Extensions (doi:10.5555/synth.2025.021) for multi-task evaluation.

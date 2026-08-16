@@ -222,6 +222,8 @@ ADR-0010 also makes the daemon-wide `access_mode` a ceiling: a per-request `acce
 
 **Why:** The transport frame cap makes byte upload a non-starter, identity-less jobs would undermine every dedupe guarantee, and a grab that submitted title guesses would reopen the weak-match risk ADR-0019 closed. One click, one file, the standard pipeline — the wrong-paper guard applies to grabbed PDFs exactly as to acquired ones.
 
+*Amendment 2026-08-16:* correlation with an already-established job is itself an identity decision, narrowing the original consequence that no new acceptance path exists. A DOI-less settled grab may be bound to a uniquely qualifying pending paper only under `candidate_auto_bind/1` (author, exact title, year, identifier corroboration, single winner, no contradictory evidence) fenced inside the binding transaction; picking a paper in the popup supplies correlation evidence, not authority to override conclusive front-matter identity, and every path still passes ordinary candidate validation — a conflicting conclusive DOI now parks for review instead of being filed.
+
 ## Packaged behaviour, daemon-first repair, restrictive-only control
 
 **Context:** Repairing a provider adapter costs a hand-written source edit plus two browser-store reviews, which does not scale to hundreds of provider families or to users who try the extension once and write it off. Measurement on a live installation showed page drift (`ui_changed`) dominating browser-side failures, and a primary-source policy check found that remotely updated selector/action rules for authenticated page actions sit in a gray zone Chrome has enforced against in comparable cases, while the closest academic precedent remains unresolved on Chrome's current manifest platform.

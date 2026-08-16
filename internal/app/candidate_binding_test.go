@@ -300,8 +300,7 @@ func TestBoundDOIsCollectsEligibleDOIs(t *testing.T) {
 			{Kind: "doi", Value: "10.1000/unattested", Provenance: job.ProvenanceUnattested},
 		},
 	}
-	row := &job.Row{Work: work.Work{DOI: "10.1000/row"}}
-	got := boundDOIs(anchor, row)
+	got := job.BoundDOIs(anchor, work.Work{DOI: "10.1000/row"})
 	want := map[string]bool{
 		"10.1000/anchor":    true,
 		"10.1000/submitted": true,
@@ -309,7 +308,7 @@ func TestBoundDOIsCollectsEligibleDOIs(t *testing.T) {
 		"10.1000/row":       true,
 	}
 	if len(got) != len(want) {
-		t.Fatalf("boundDOIs = %v, want %v", got, want)
+		t.Fatalf("BoundDOIs = %v, want %v", got, want)
 	}
 	for _, v := range got {
 		if !want[v] {
@@ -343,8 +342,8 @@ func TestBoundDOIsWithNilRow(t *testing.T) {
 			{Kind: "doi", Value: "10.1000/b", Provenance: job.ProvenanceSubmitted},
 		},
 	}
-	got := boundDOIs(anchor, nil)
+	got := job.BoundDOIs(anchor, work.Work{})
 	if len(got) != 2 {
-		t.Fatalf("boundDOIs with nil row = %v, want 2", got)
+		t.Fatalf("BoundDOIs with empty work = %v, want 2", got)
 	}
 }

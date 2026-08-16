@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -38,7 +39,12 @@ func schema33Fixture(t *testing.T, seed string) string {
 	sort.Strings(paths)
 	for _, path := range paths {
 		base := filepath.Base(path)
-		if strings.HasPrefix(base, "0034_") || strings.HasPrefix(base, "0035_") || strings.HasPrefix(base, "0036_") {
+		// This fixture must stay a schema-33 database: rolling the later
+		// migrations forward is exactly what the test exercises, so applying one
+		// here would make store.Open apply it twice. Deriving the bound from the
+		// filename keeps the next migration from silently landing in the fixture
+		// and failing as a duplicate column.
+		if migrationNumber(t, base) > 33 {
 			continue
 		}
 		migration, err := os.ReadFile(path)
@@ -63,6 +69,20 @@ func schema33Fixture(t *testing.T, seed string) string {
 		t.Fatal(err)
 	}
 	return dataDir
+}
+
+// migrationNumber reads the NNNN prefix every migration filename carries.
+func migrationNumber(t *testing.T, base string) int {
+	t.Helper()
+	digits, _, ok := strings.Cut(base, "_")
+	if !ok {
+		t.Fatalf("migration %s: want a NNNN_name.sql filename", base)
+	}
+	number, err := strconv.Atoi(digits)
+	if err != nil {
+		t.Fatalf("migration %s: %v", base, err)
+	}
+	return number
 }
 
 func TestSchema33UpgradeImportsEveryLegacyEffectKind(t *testing.T) {
@@ -200,8 +220,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 36 {
-		t.Fatalf("user_version = %d, %v; want 36", version, err)
+	if err != nil || version != 37 {
+		t.Fatalf("user_version = %d, %v; want 37", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -273,8 +293,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 36 {
-		t.Fatalf("user_version = %d, %v; want 36", version, err)
+	if err != nil || version != 37 {
+		t.Fatalf("user_version = %d, %v; want 37", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)

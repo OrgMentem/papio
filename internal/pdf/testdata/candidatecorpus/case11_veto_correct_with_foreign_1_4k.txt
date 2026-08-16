@@ -1,0 +1,19 @@
+Medical Synthetic Imaging 2023;9(5):401-419
+
+Deep Learning for Histopathology Image Classification
+
+Clara Jensen, Rashid Ali
+Department of Medical Synthesis, University of Examples
+
+Published 2023
+DOI: 10.5555/synth.2023.110
+
+Abstract
+We train deep networks for histopathology image classification on synthetic slides.
+Stain normalization and patch sampling are evaluated systematically.
+Results show robust performance across synthetic cohorts.
+
+Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods describe synthetic slide generation, augmentation policies, and evaluation protocols. Supplementary methods de
+Foreign reference DOI: 10.5555/synth.foreign.999
+
+Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. Continued methods and results sections follow with additional synthetic experiments. 

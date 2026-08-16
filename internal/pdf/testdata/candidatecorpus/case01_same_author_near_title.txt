@@ -1,0 +1,16 @@
+Journal of Synthetic Networks 2024;10(2):101-118
+
+Network Embedding With Adaptive Sampling for Community Detection
+
+Elena Vargas, Kenji Tanaka
+Department of Synthetic Studies, University of Examples
+
+Published 2024
+DOI: 10.5555/synth.2024.001
+
+Abstract
+We present an adaptive sampling method for community detection in large graphs.
+The approach selects landmark nodes and reconstructs embeddings efficiently.
+Experiments on synthetic benchmarks show improved modularity and runtime.
+
+Keywords: network embedding, community detection

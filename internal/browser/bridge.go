@@ -7270,6 +7270,91 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 	// a KNOWN identifier and do not apply here (see pdf.FrontMatterDOIs).
 	dois := pdf.FrontMatterDOIs(report.Text.Excerpt)
 	if len(dois) == 0 {
+		// Auto-bind attempt before the inevitable park: only ever converts a
+		// park into a bind, never a park into a failure. Reads the candidate
+		// pool once outside the transaction against the same immutable
+		// excerpt, then fenced inside MarkBoundToJobFenced. Abstention is
+		// the default — empty pool, ties, or Review all park exactly as
+		// today.
+		candidates, err := b.jobs.ListCandidateEligibleJobs(ctx)
+		if err != nil {
+			return err
+		}
+		if len(candidates) > 0 {
+			bindCandidates := make([]pdf.BindCandidate, 0, len(candidates))
+			for _, c := range candidates {
+				bindCandidates = append(bindCandidates, pdf.BindCandidate{
+					Key:   c.JobID,
+					Work:  c.Work,
+					Bound: c.BoundDOIs,
+				})
+			}
+			excerpt := report.Text.Excerpt
+			winner, ok, _ := pdf.SelectAutoBindCandidate(excerpt, bindCandidates)
+			if ok {
+				jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), winner.Key)
+				if err := os.MkdirAll(jobDir, 0o700); err != nil {
+					return err
+				}
+				src := filepath.Join(dir, name)
+				if _, err := os.Stat(src); err != nil {
+					src = temp
+				}
+				dest := uniqueAdoptionDest(jobDir, name)
+				if err := b.copyGrabFile(src, dest); err != nil {
+					return err
+				}
+				boundName := filepath.Base(dest)
+				prov := grab.BindProvenance{
+					Method:               "candidate_auto_bind",
+					Rule:                 pdf.CandidateBindingRule,
+					Winner:               winner.Key,
+					CandidatesConsidered: len(bindCandidates),
+					Evidence:             winner.Evidence,
+				}
+				fence := func(ctx context.Context, tx *sql.Tx) error {
+					// Re-read through the transaction's connection only —
+					// the pool is a single connection the transaction already
+					// holds, so a pool read here would deadlock. A recompute
+					// outside the serialization point fences nothing, because
+					// another writer can change eligibility between the
+					// decision and the CAS.
+					fresh, err := job.ListCandidateEligibleJobsTx(ctx, tx)
+					if err != nil {
+						return err
+					}
+					freshCandidates := make([]pdf.BindCandidate, 0, len(fresh))
+					for _, c := range fresh {
+						freshCandidates = append(freshCandidates, pdf.BindCandidate{
+							Key:   c.JobID,
+							Work:  c.Work,
+							Bound: c.BoundDOIs,
+						})
+					}
+					freshWinner, freshOK, _ := pdf.SelectAutoBindCandidate(excerpt, freshCandidates)
+					if !freshOK || freshWinner.Key != winner.Key {
+						return fmt.Errorf("candidate auto-bind fence rejected")
+					}
+					return nil
+				}
+				if err := b.grabs.MarkBoundToJobFenced(ctx, g.ID, winner.Key, "job_created", prov, fence); err != nil {
+					_ = os.Remove(dest)
+					if strings.Contains(err.Error(), "fence rejected") {
+						_ = os.RemoveAll(dir)
+						return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
+					}
+					return err
+				}
+				_ = os.Remove(temp)
+				_ = os.RemoveAll(dir)
+				if _, err := b.ingestAdoptedFile(ctx, winner.Key, boundName, nil, nil); err != nil {
+					if evErr := b.recordAdoptionDeferred(ctx, winner.Key, boundName, err); evErr != nil {
+						return evErr
+					}
+				}
+				return nil
+			}
+		}
 		_ = os.RemoveAll(dir)
 
 		return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
