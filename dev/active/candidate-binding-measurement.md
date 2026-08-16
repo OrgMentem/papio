@@ -56,9 +56,13 @@ enters candidate selection.
 
 So feeding every library document into the measurement would measure a
 population production never sees, and `QualifyCandidate` would short-circuit at
-`GateConclusiveVeto` (`candidate_select.go:139-144`) for most of them. The
-synthetic corpus already enforces this: `candidate_gate_test.go:265-285`
-requires DOI-less inputs for the predicate gates.
+`GateConclusiveVeto` (`candidate_select.go:139-144`) for every document
+carrying a front-matter DOI. What share of the library that is has never been
+published — each run emits an own-identifier histogram, not a front-matter
+bucket count — so the proportion is a measurement result of this workstream,
+not a premise of it. The synthetic corpus already enforces the same admission:
+`candidate_gate_test.go:265-285` requires DOI-less inputs for the predicate
+gates.
 
 **Therefore: the measured corpus is the DOI-less subset** — documents whose
 `FrontMatterDOIs` over the production window is empty. Reporting the size of
@@ -190,11 +194,16 @@ pool carries an empty target class even when the work it refers to is present.
 ### 5. Backlog replay — descriptive coverage, not calibration
 
 v1 called this "the true distribution". It cannot be. `Grab` persists id,
-title, state, quarantine, job and outcome (`internal/grab/grab.go:64-82`) and
-**no candidate snapshot**, while `attemptAutoBind` enumerates live eligibility
-at selection time (`bridge.go:7635-7652`). The pool that existed when a
-historical grab settled is unrecoverable, and a present-day snapshot of pending
-rows is not a time-weighted distribution.
+title, state, quarantine, job and outcome (`internal/grab/grab.go:64-82`), and
+no selection-time pool snapshot for historical or manually delivered rows,
+while `attemptAutoBind` enumerates live eligibility at selection
+(`bridge.go:7635-7652`). Automatic-bind provenance does persist partial
+evidence — `Candidates []CandidateVerdict` plus `ExcerptSHA256`
+(`grab.go:421-454`, `bridge.go:7768-7794`) — but that is per-candidate verdicts
+and keys for binds that already ran, not the pool as it stood for the rows this
+arm would replay. The pool that existed when a historical grab settled is
+therefore unrecoverable, and a present-day snapshot of pending rows is not a
+time-weighted distribution.
 
 So: the backlog arm is **descriptive stress coverage** and explicitly may not
 be used alone to choose a production pool cap. Making it calibration-grade
@@ -284,7 +293,11 @@ those paths, which v1 elided by claiming the report gates `/2` outright.
   page one's 4 KiB cap **is** observable — composite case25 is built exactly
   there — while `identityWindow` stops at the first form feed and caps page one
   at 4 KiB (`identity.go:819-869`), so an identifier on page two, or anywhere
-  past 16 KiB, is invisible to the instrument and to the rules alike.
+  past 16 KiB, is invisible to the instrument and to the candidate-binding
+  page-one rules. Scope that claim carefully: it does **not** hold for
+  `MatchIdentity`, which calls `corroboratingIdentifier` over the whole excerpt
+  (`identity.go:287`), so a page-two DOI can still corroborate in the pairwise
+  rule up to the 16 KiB bound.
 - The existing pairwise `Measure` keeps working unchanged; its two documented
   wrong accepts are the baseline.
 - `cmd/identity-corpus` stays a local operator tool, never wired into CI: it
