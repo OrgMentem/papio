@@ -106,6 +106,7 @@ import {
   isPDFPage,
   pdfGrabRefusalText,
   pdfSourceURL,
+  pageAcquireOrigin,
   sanitizePageHost,
   PDF_GRAB_FEATURE,
 } from "./deliver";
@@ -5453,8 +5454,19 @@ export class Bridge {
         }
       }
       if (job === undefined) {
+        // Origin only. `url` here is a PDF URL the researcher was reading, and a
+        // provider or proxy PDF URL carries bearer-grade values in its path and
+        // query (a signed token, an ILL ticket) — the same reason
+        // `pdf_grab_request` was reduced to host and title. The daemon discards
+        // this field, so nothing downstream needs the rest of it. Refuse rather
+        // than fall back to the full URL: an unrepresentable outbound frame is a
+        // fatal transport failure, and leaking the original defeats the point.
+        const origin = pageAcquireOrigin(url);
+        if (origin === undefined) {
+          return failure("page_acquire", "papio can't read this page's address — reload the page, then click Send this PDF again");
+        }
         const ack = await this.requestPageAcquire({
-          url,
+          url: origin,
           ...(doi !== undefined && doi.trim() !== "" ? { doi } : {}),
           ...(payload.title ? { title: payload.title } : {}),
           source: "popup",

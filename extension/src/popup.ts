@@ -32,7 +32,9 @@ import {
   isPDFPage,
   pdfSourceURL,
   sendPdfState,
-  sniffDOI,
+  doiFromURL,
+  extractPageDOI,
+  type PageDOIProbe,
   type PageKind,
 } from "./deliver";
 import {
@@ -368,87 +370,58 @@ export function paintPopupResult(element: HTMLElement, state: PopupOperationStat
 
 const NO_DOI_FOUND = "no DOI found on this page";
 
+/** What the injected harvester returns: raw candidates plus the page's own
+ * title. No identifier decision is made in page scope. */
+export interface PageProbeResult {
+  url: string;
+  probe: PageDOIProbe;
+  title?: string;
+}
+
 /**
  * Runs INSIDE the page via scripting.executeScript — must stay fully
  * self-contained (no outer-scope references survive serialization).
  *
- * DOI sources are deliberately ordered from page-authored metadata through
- * stable links and finally visible text. The daemon re-validates and
- * normalizes whatever we send.
+ * It therefore harvests *candidates* and decides nothing. Identifier
+ * extraction lives in `extractPageDOI`/`doiFromURL` (`deliver.ts`), which the
+ * popup applies to this probe once it is back in extension scope. That split
+ * exists because URL-origin extraction needs a route registry that cannot be
+ * serialized into a page, and keeping a second copy of it here is exactly how
+ * the two implementations drifted: this function used to scan URLs with a text
+ * regex, which absorbed query tokens into the DOI.
  */
-export function collectPageMetadata(): PageMetadata {
+export function collectPageMetadata(): PageProbeResult {
   const clean = (value: string | null | undefined): string => (value ?? "").trim();
-  const firstDOI = (value: string): string => {
-    let decoded = value;
-    try { decoded = decodeURIComponent(value); } catch { /* keep raw */ }
-    const match = decoded.match(/\b10\.\d{4,9}\/[^\s"'<>?#]+/);
-    return match === null ? "" : match[0].replace(/[.,;:!?\]}>'"]+$/g, "");
-  };
   const metaTags = Array.from(document.querySelectorAll("meta[name]"));
-  const metaValues = (name: string): string[] =>
-    metaTags
-      .filter((element) => clean(element.getAttribute("name")).toLowerCase() === name)
-      .map((element) => clean(element.getAttribute("content")))
-      .filter((value) => value.length > 0);
-  let doi = "";
-  // Specific standards win over broad fallbacks; publication_doi retains
-  // support for older SAGE/Atypon pages.
-  for (const name of [
-    "citation_doi",
-    "dc.identifier",
-    "prism.doi",
-    "publication_doi",
-    "citation_pdf_url",
-  ]) {
-    for (const value of metaValues(name)) {
-      doi = firstDOI(value);
-      if (doi) break;
-    }
-    if (doi) break;
-  }
-  if (!doi) {
-    const canonical = clean(document.querySelector('link[rel="canonical"]')?.getAttribute("href"));
-    const ogURL = clean(document.querySelector('meta[property="og:url"]')?.getAttribute("content"));
-    doi = firstDOI(canonical) || firstDOI(ogURL) || firstDOI(location.href);
-  }
-  if (!doi) {
-    for (const link of Array.from(document.querySelectorAll("a[href]")).slice(0, 1000)) {
-      const href = clean(link.getAttribute("href"));
-      try {
-        const hostname = new URL(href, location.href).hostname.toLowerCase();
-        if (hostname !== "doi.org" && !hostname.endsWith(".doi.org")) continue;
-      } catch {
-        continue;
-      }
-      doi = firstDOI(href);
-      if (doi) break;
-    }
-  }
-  if (!doi) {
-    doi = firstDOI((document.body?.innerText ?? "").slice(0, 200_000));
-  }
-  if (!doi) {
-    try {
-      const pageURL = new URL(location.href);
-      if (
-        pageURL.hostname.toLowerCase() === "jstor.org" ||
-        pageURL.hostname.toLowerCase().endsWith(".jstor.org")
-      ) {
-        const stableID = pageURL.pathname.match(/^\/stable\/([^/]+)\/?$/i)?.[1];
-        if (stableID) {
-          let decoded = stableID;
-          try { decoded = decodeURIComponent(stableID); } catch { /* keep raw */ }
-          doi = `10.2307/${decoded}`;
-        }
-      }
-    } catch {
-      // A malformed location cannot produce a safe stable-page identifier.
-    }
-  }
-  const title = metaValues("citation_title")[0] || document.title.trim();
+  const meta = metaTags
+    .map((element) => ({
+      name: clean(element.getAttribute("name")),
+      content: clean(element.getAttribute("content")),
+    }))
+    .filter((tag) => tag.name.length > 0 && tag.content.length > 0);
+  const canonical = clean(document.querySelector('link[rel="canonical"]')?.getAttribute("href"));
+  const ogURL = clean(document.querySelector('meta[property="og:url"]')?.getAttribute("content"));
+  const anchorHrefs = Array.from(document.querySelectorAll("a[href]"))
+    .slice(0, 1000)
+    .map((link) => clean(link.getAttribute("href")))
+    .filter((href) => href.length > 0 && href.includes("doi.org"));
+  // A locator, not an extractor: the page's text can be 200 KB and crossing
+  // that through the injection boundary on every popup open would be wasteful,
+  // so the first DOI-shaped run is located here and the authoritative trimming
+  // and validation still happen in `extractPageDOI`. The run is returned raw.
+  const bodyText = ((document.body?.innerText ?? "").slice(0, 200_000).match(/10\.\d{4,9}\/\S{1,200}/) ?? [""])[0];
+  const title = meta.find((tag) => tag.name.toLowerCase() === "citation_title")?.content
+    ?? document.title.trim();
   return {
     url: location.href,
-    ...(doi ? { doi } : {}),
+    probe: {
+      meta,
+      ...(canonical ? { canonical } : {}),
+      ...(ogURL ? { ogURL } : {}),
+      href: location.href,
+      ...(anchorHrefs.length > 0 ? { anchorHrefs } : {}),
+      ...(bodyText ? { bodyText } : {}),
+    },
     ...(title ? { title } : {}),
   };
 }
@@ -607,15 +580,22 @@ export async function readCurrentPageMetadata(): Promise<PageActionBinding> {
       ? (tab as unknown as Record<string, unknown>)["contentType"] as string
       : undefined;
   const tabPDF = isPDFPage(tabURL, contentType);
-  let metadata: PageMetadata | undefined;
+  let harvested: PageProbeResult | undefined;
   try {
     const [injected] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: collectPageMetadata,
     });
     const result = injected?.result;
-    if (typeof result === "object" && result !== null && typeof (result as PageMetadata).url === "string") {
-      metadata = result as PageMetadata;
+    // Require the probe, not just a url: a result of an unexpected shape must
+    // degrade to the tab-URL path, never throw inside the popup's page read.
+    if (
+      typeof result === "object" && result !== null &&
+      typeof (result as PageProbeResult).url === "string" &&
+      typeof (result as PageProbeResult).probe === "object" &&
+      (result as PageProbeResult).probe !== null
+    ) {
+      harvested = result as PageProbeResult;
     }
   } catch {
     // PDF viewers and privileged pages reject scripting; their tab URL is
@@ -625,10 +605,15 @@ export async function readCurrentPageMetadata(): Promise<PageActionBinding> {
   if (after?.id !== tab.id || (typeof after.url === "string" ? after.url : "") !== tabURL) {
     throw new Error(PAGE_CHANGED_MESSAGE);
   }
-  const pageURL = tabURL || metadata?.url;
+  const pageURL = tabURL || harvested?.url;
   if (pageURL === undefined || pageURL.length === 0) throw new Error("Could not read the current page");
   const viewerPDFURL = providerViewerPDFURL(pageURL);
-  const inferredDOI = metadata?.doi ?? sniffDOI(pageURL);
+  // One extraction path for both cases: with a probe the full candidate order
+  // applies, and without one (a viewer tab, which rejects scripting) the tab URL
+  // is still a legitimate candidate — but a *structural* one, never a text scan.
+  const inferredDOI = harvested !== undefined
+    ? extractPageDOI(harvested.probe)
+    : doiFromURL(pageURL);
   const classification = tabPDF || viewerPDFURL !== undefined
     ? { kind: "pdf" as const, ...(inferredDOI ? { doi: inferredDOI } : {}) }
     : classifyPage(pageURL, {
@@ -639,7 +624,7 @@ export async function readCurrentPageMetadata(): Promise<PageActionBinding> {
   return {
     url: viewerPDFURL ?? pageURL,
     ...(pageDOI ? { doi: pageDOI } : {}),
-    ...(metadata?.title || tab.title ? { title: metadata?.title || tab.title! } : {}),
+    ...(harvested?.title || tab.title ? { title: harvested?.title || tab.title! } : {}),
     kind: classification.kind,
     tab_id: tab.id,
     tab_url: tabURL,

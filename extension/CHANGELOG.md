@@ -62,6 +62,31 @@ for the full pre-split extension history.
   yet; the age appears once there is one.
 
 ### Fixed
+- **A paper whose DOI sits in its PDF's address is now read correctly instead of
+  failing for no visible reason.** *papio* read the identifier out of a PDF's
+  address by scanning for something DOI-shaped, which on ACM and Springer links
+  swept the filename in with it — the DOI came out as
+  `10.1145/3630106.3660000.pdf`, which nothing resolves to, so **Send PDF**
+  appeared to break on papers it should have handled without a thought. The
+  address is now read by its structure, so what *papio* takes from it is the
+  identifier and nothing adjacent to it.
+
+  Two consequences worth knowing. A link that carries a DOI *and* a session
+  token in the same query no longer folds the token into the identifier — it
+  previously became part of the paper's stored identity. And a link that names a
+  document other than the DOI it contains — a publisher's supplementary file
+  living under its article's identifier, a cited-by page, a full-text view —
+  is now declined rather than trimmed down to the article, because trimming it
+  would have filed an appendix as the paper it supplements.
+
+- **Sending a PDF no longer sends its address to *papio*.** **Send PDF** on a
+  page whose DOI *papio* can read reported the whole address it was reading,
+  including the query. Publisher and library-proxy PDF links routinely carry
+  signed tokens and interlibrary-loan tickets there, which work like passwords,
+  and this is the same reason the address was cut back to a bare host on the
+  path that identifies a PDF from the file itself. Only the site — scheme and
+  host — is sent now.
+
 - **A pick is now checked against the page the browser reports, not the address the popup sent.** The acceptance check rebuilt the "live" page identity from the URL the popup had passed in, so it only ever proved the popup sent the same string twice — and on provider viewer routes the two sides computed that value by different rules, so the check could never succeed at all. Both sides now derive it the same way from the live tab. Ordinary page loads and reloads also count as page changes now (previously only in-page navigation did, so reloading a tab left an earlier pick valid), a pick expires once it is old rather than only when a newer one displaces it, and an epoch known on one side but not the other fails closed instead of falling back to the weaker comparison.
 - **A pick no longer outlives what it was granted for.** Finishing or removing a delivery revokes any outstanding offer that listed that paper, so a second PDF sent from the same page cannot be filed under a choice made for the first. Replacing a tab — a prerendered page activating, for example — clears the *Download* continuation bound to the old tab instead of leaving it stranded so every later pick returned the same stale state. A *sending* delivery interrupted by a service-worker restart is now reconciled at startup rather than leaving a paper you cannot retry.
 - **Only the address without its query is remembered.** A signed provider download link is a credential; the stored comparison value is now the origin and path only, so no signed link is written to extension storage.

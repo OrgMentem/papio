@@ -1,9 +1,45 @@
 # Page-first identity: already shipped, and two live defects in it
 
-Status: findings + fix plan (2026-08-16). **Supersedes this file's own first
-draft**, whose premise was wrong three separate ways — see "What the first draft
-got wrong" for the retraction, because the errors are instructive and one of them
-is a trap the next reader would fall into too.
+Status: **both defects fixed 2026-08-16** (extension-only; no protocol, ADR, or
+migration change). What remains open is the structural front-matter parser, which
+is workstream 3 of the roadmap and gated on the measurement in
+`candidate-binding-measurement.md`. This file stays in `active/` until that
+lands; the defect sections below are kept because the *reason* the naive repair
+was unsafe is the durable part.
+
+Originally: findings + fix plan, **superseding this file's own first draft**,
+whose premise was wrong three separate ways — see "What the first draft got
+wrong" for the retraction, because the errors are instructive and one of them is
+a trap the next reader would fall into too.
+
+## What shipped
+
+- `doiFromURL` (`extension/src/deliver.ts`) is the single URL-origin extractor:
+  `URL`/`searchParams` structure only, a `doi` query parameter read as an exact
+  bounded value, one declared `.pdf` suffix stripped, DOI text never normalized
+  (slash runs preserved), viewer wrappers and one level of proxy `url=` wrapping
+  unwrapped, and two reject lists — non-article namespaces (`suppl`,
+  `suppl_file`, `citedby`, …) and post-DOI route words (`full`, `epdf`, …).
+  Recognition is keyed on a DOI-shaped **path segment**, not per host: host
+  keying would decline Springer, IET and every unenumerated publisher while
+  adding no safety, since the safety comes from strict validation plus the reject
+  lists. The unsafe part was reading query and fragment as if they were path.
+- `sniffDOI` is now text-origin only. Every URL-origin candidate in
+  `extractMetaDOI`/`extractPageDOI` routes through `doiFromURL`, including
+  `citation_pdf_url` and any bibliographic tag whose value is itself a URL.
+- `collectPageMetadata` (`extension/src/popup.ts`) is a **probe harvester**: it
+  returns raw candidates (`PageProbeResult`) and decides nothing. This dissolves
+  the injected-function problem the plan flagged as unsolved — there is no second
+  extractor to keep in sync, because page scope no longer extracts. Body text is
+  located in page scope (first DOI-shaped run only, so 200 KB does not cross the
+  boundary) but trimmed and validated by the shared path.
+- `pageAcquireOrigin` (`deliver.ts`) reduces the Send-PDF page-acquire `url` to
+  scheme and host. It returns `undefined` when no safe value exists and the
+  caller refuses, because an unrepresentable outbound frame is a fatal transport
+  failure rather than a refusal.
+- Regression fixtures: `extension/test/deliver.test.ts` — real provider URLs, the
+  supplement/cited-by/route-suffix rejects, the `?doi=…&token=…` case, the viewer
+  wrapper, and the slash-run pair.
 
 ## The retraction, first
 

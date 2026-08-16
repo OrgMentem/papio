@@ -5,6 +5,8 @@ import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
 
+import { extractPageDOI } from "../src/deliver";
+
 import {
   acquireCurrentPage,
   sendCurrentPDF,
@@ -1507,9 +1509,15 @@ test("hides the library grant prompt when every resolver is granted", () => {
   expect(section?.children.length).toBe(0);
 });
 
-// --- collectPageMetadata DOI fallback chain -------------------------------
-// SAGE (Atypon) abstract pages carry no citation_doi; the scraper must fall
-// back through publication_doi, dc.Identifier[scheme=doi], and the URL path.
+// --- page probe + shared extraction ---------------------------------------
+// SAGE (Atypon) abstract pages carry no citation_doi; the chain must fall back
+// through publication_doi, dc.Identifier[scheme=doi], and the URL path. The
+// injected harvester decides nothing, so these exercise the composed path the
+// popup actually runs: harvest in page scope, extract in extension scope.
+
+function pageDOI(): string | undefined {
+  return extractPageDOI(collectPageMetadata().probe);
+}
 
 function pageDocument(html: string, href: string): void {
   const window = new Window({ url: href });
@@ -1523,7 +1531,7 @@ test("collectPageMetadata prefers citation_doi when present", () => {
     "https://onlinelibrary.wiley.com/doi/10.1002/prefer",
   );
   const page = collectPageMetadata();
-  expect(page.doi).toBe("10.1002/prefer");
+  expect(pageDOI()).toBe("10.1002/prefer");
   expect(page.title).toBe("Preferred");
 });
 
@@ -1532,13 +1540,13 @@ test("collectPageMetadata reads SAGE publication_doi and dc.Identifier", () => {
     `<html><head><meta name="dc.Identifier" scheme="publisher-id" content="10.1177_1071181319631264"><meta name="dc.Identifier" scheme="doi" content="10.1177/1071181319631264"><title>Trust Engineering</title></head></html>`,
     "https://journals.sagepub.com/doi/abs/10.1177/1071181319631264",
   );
-  expect(collectPageMetadata().doi).toBe("10.1177/1071181319631264");
+  expect(pageDOI()).toBe("10.1177/1071181319631264");
 
   pageDocument(
     `<html><head><meta name="publication_doi" content="10.1177/1071181319631264"></head></html>`,
     "https://journals.sagepub.com/doi/abs/10.1177/1071181319631264",
   );
-  expect(collectPageMetadata().doi).toBe("10.1177/1071181319631264");
+  expect(pageDOI()).toBe("10.1177/1071181319631264");
 });
 
 test("collectPageMetadata falls back to a DOI-shaped URL path", () => {
@@ -1546,8 +1554,7 @@ test("collectPageMetadata falls back to a DOI-shaped URL path", () => {
     `<html><head><title>Bare page</title></head></html>`,
     "https://journals.sagepub.com/doi/abs/10.1177/1071181319631264?journalCode=pro",
   );
-  const page = collectPageMetadata();
-  expect(page.doi).toBe("10.1177/1071181319631264");
+  expect(pageDOI()).toBe("10.1177/1071181319631264");
 });
 
 test("collectPageMetadata reports no DOI on DOI-less pages", () => {
@@ -1555,8 +1562,8 @@ test("collectPageMetadata reports no DOI on DOI-less pages", () => {
     `<html><head><title>News article</title></head></html>`,
     "https://example.com/news/story-42",
   );
+  expect(pageDOI()).toBeUndefined();
   const page = collectPageMetadata();
-  expect(page.doi).toBeUndefined();
   expect(page.title).toBe("News article");
 });
 
@@ -1564,7 +1571,7 @@ test("collectPageMetadata classifies a JSTOR stable landing as its documented DO
   const fixture = readFileSync(new URL("../fixtures/jstor/success.html", import.meta.url), "utf8")
     .replaceAll("2095101", "20183234");
   pageDocument(fixture, "https://www.jstor.org/stable/20183234");
-  expect(collectPageMetadata().doi).toBe("10.2307/20183234");
+  expect(pageDOI()).toBe("10.2307/20183234");
 });
 
 test("collectPageMetadata finds a DOI in visible body text after metadata and links", () => {
@@ -1572,7 +1579,7 @@ test("collectPageMetadata finds a DOI in visible body text after metadata and li
     `<html><head><title>Visible paper</title></head><body><p>The DOI is 10.1000/body-layer.</p></body></html>`,
     "https://publisher.example/article",
   );
-  expect(collectPageMetadata().doi).toBe("10.1000/body-layer");
+  expect(pageDOI()).toBe("10.1000/body-layer");
 });
 
 test("openInstitutionSignIn surfaces the background failure reason", async () => {
@@ -1620,7 +1627,7 @@ test("SAGE's epub journal viewer becomes a direct Send PDF surface", async () =>
         executeScript: async () => [{
           result: {
             url: viewerURL,
-            doi: "10.1177/14757257231222647",
+            probe: { meta: [{ name: "citation_doi", content: "10.1177/14757257231222647" }], href: viewerURL },
             title: "Against All Odds",
           },
         }],
@@ -1646,7 +1653,7 @@ test("Taylor and Francis's epdf viewer becomes a direct Send PDF surface", async
         executeScript: async () => [{
           result: {
             url: viewerURL,
-            doi: "10.1080/10705511.2018.1431046",
+            probe: { meta: [{ name: "citation_doi", content: "10.1080/10705511.2018.1431046" }], href: viewerURL },
             title: "Drawing Conclusions",
           },
         }],

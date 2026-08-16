@@ -84,6 +84,159 @@ export function deriveStablePageDOI(value: string): string | undefined {
   return decoded.length > 0 ? `${prefix}/${decoded}` : undefined;
 }
 
+/**
+ * A DOI read out of a URL is structurally different from a DOI read out of
+ * text, and conflating them was a live defect: a URL has delimiters, so a
+ * text scan absorbs whatever follows the identifier. `?doi=10.1234/paper&
+ * token=SECRET123` scanned as text yields `10.1234/paper&token=SECRET123`,
+ * which `work.NormalizeDOI` accepts (`doiCoreRE`'s `\S` matches `&` and `=`),
+ * so a session token became the job's persisted identity. URL-origin
+ * candidates therefore go through this function, never through `sniffDOI`.
+ *
+ * Rules, in the order they matter:
+ *   1. Structure decides where an identifier ends — `URL` parsing and
+ *      `searchParams`, never a regex over the serialized URL.
+ *   2. A URL that names a document other than its DOI declines. A wrong DOI
+ *      that resolves to a real *other* paper is the cardinal failure; returning
+ *      nothing is not.
+ *   3. Only a *declared* URL suffix may be stripped, and DOI text is never
+ *      normalized — a repeated slash (`10.48612//x`) names a different work
+ *      from a single one, so slash runs are preserved exactly (AGENTS.md).
+ *
+ * The recognized structure is a DOI-shaped **path segment**, not a per-host
+ * route table. Host-keying was considered and rejected: it would decline
+ * Springer's `/content/pdf/{doi}.pdf`, IET's `/content/{doi}`, and every
+ * publisher nobody has enumerated yet, while adding no safety — the safety here
+ * comes from strict validation plus the two reject lists below, none of which
+ * depends on knowing the host. What made the old scan unsafe was reading the
+ * *query and fragment* as if they were path, and that is closed structurally.
+ */
+const DOI_STRICT_RE = /^10\.\d{4,9}\/[^\s?#&=]+$/;
+
+/**
+ * Path segments that, when they appear *after* the DOI, mean the URL names a
+ * different document than the DOI it contains. This list is why the obvious
+ * "strip the trailing junk" fix is unsafe: ACM publishes supplements in the
+ * ARTICLE's DOI namespace (`/doi/suppl/<article DOI>/suppl_file/<file>`), so
+ * trimming the tail yields the article's real DOI and files an appendix as the
+ * paper it supplements. These must decline, not be cleaned up.
+ *
+ * Route words are also rejected before the DOI (`/doi/suppl/…`), so a
+ * supplement declines even when its file segment is named something else.
+ * `abs`, `full`, `abstract`, `epdf`, `pdf`, `pdfdirect` are deliberately NOT
+ * here: as a *prefix* they name the article itself, and as a *suffix* they are
+ * caught by the post-DOI check below.
+ */
+const NON_ARTICLE_URL_SEGMENTS: ReadonlySet<string> = new Set([
+  "suppl",
+  "suppl_file",
+  "supplementary",
+  "supplemental",
+  "media",
+  "figure",
+  "figures",
+  "table",
+  "tables",
+  "references",
+  "citations",
+  "citedby",
+  "cited-by",
+  "metrics",
+  "permissions",
+]);
+
+/**
+ * Route words that cannot be part of a DOI suffix once the DOI has at least a
+ * registrant and one suffix segment. `/doi/pdf/10.1177/0163443725/full` is the
+ * article's full-text view, not a DOI ending in `/full`.
+ */
+const POST_DOI_ROUTE_SEGMENTS: ReadonlySet<string> = new Set([
+  "full",
+  "abs",
+  "abstract",
+  "pdf",
+  "epdf",
+  "epub",
+  "pdfdirect",
+  "full-xml",
+  "download",
+  "summary",
+]);
+
+function decodeURLPart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Validate a DOI candidate taken from URL structure. Only a single declared
+ * `.pdf` suffix is removed; nothing else about the text is altered.
+ */
+function qualifyURLDOI(candidate: string): string | undefined {
+  const doi = candidate.replace(/\.pdf$/i, "");
+  if (!DOI_STRICT_RE.test(doi)) return undefined;
+  const segments = doi.split("/");
+  // segments[0] is the registrant, segments[1] the first suffix segment; a
+  // two-segment DOI can never contain a route word, so only check beyond it.
+  for (const segment of segments.slice(2)) {
+    const lowered = segment.toLowerCase();
+    if (NON_ARTICLE_URL_SEGMENTS.has(lowered) || POST_DOI_ROUTE_SEGMENTS.has(lowered)) {
+      return undefined;
+    }
+  }
+  return doi;
+}
+
+/** Extract a DOI from a URL's structure, or decline. */
+export function doiFromURL(value: string, depth = 0): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(pdfSourceURL(value));
+  } catch {
+    return undefined;
+  }
+
+  // A library proxy or link resolver wraps the real URL in a parameter. Recurse
+  // once so the inner URL is parsed by these same rules rather than scanned.
+  if (depth === 0) {
+    for (const key of ["url", "qurl", "target"]) {
+      const inner = url.searchParams.get(key);
+      if (inner === null || !/^https?:\/\//i.test(inner)) continue;
+      const nested = doiFromURL(inner, depth + 1);
+      if (nested !== undefined) return nested;
+    }
+  }
+
+  // An exact `doi` parameter is the publisher's own declaration and is bounded
+  // by the query grammar, so a neighbouring token cannot be absorbed.
+  for (const [key, raw] of url.searchParams) {
+    if (key.toLowerCase() !== "doi") continue;
+    const doi = qualifyURLDOI(decodeURLPart(raw.trim()));
+    if (doi !== undefined) return doi;
+  }
+
+  const host = url.hostname.toLowerCase();
+  const path = decodeURLPart(url.pathname);
+
+  // doi.org resolves the whole path as the identifier by definition.
+  if (host === "doi.org" || host === "dx.doi.org" || host.endsWith(".doi.org")) {
+    return qualifyURLDOI(path.replace(/^\//, ""));
+  }
+
+  const start = /\/(10\.\d{4,9}\/.+)$/.exec(path);
+  if (start?.[1] === undefined) return undefined;
+  // Reject a non-article route declared before the DOI, so a supplement whose
+  // file segment is unrecognized still declines.
+  const prefix = path.slice(0, path.length - start[1].length).split("/");
+  for (const segment of prefix) {
+    if (NON_ARTICLE_URL_SEGMENTS.has(segment.toLowerCase())) return undefined;
+  }
+  return qualifyURLDOI(start[1]);
+}
+
 /** Extract a DOI from the ordered meta-tag layer. */
 export function extractMetaDOI(meta: readonly PageMetaProbe[] = []): string | undefined {
   const byName = new Map<string, string[]>();
@@ -96,7 +249,10 @@ export function extractMetaDOI(meta: readonly PageMetaProbe[] = []): string | un
     else values.push(content);
   }
   // Preserve the priority of specific metadata standards over broad fallback
-  // tags. publication_doi remains for older SAGE/Atypon pages.
+  // tags. publication_doi remains for older SAGE/Atypon pages. citation_pdf_url
+  // is a URL and is parsed structurally; the bibliographic tags are text, but a
+  // page may legitimately state one as a doi.org link, so any value that is
+  // itself a URL takes the URL rules.
   for (const name of [
     "citation_doi",
     "dc.identifier",
@@ -105,7 +261,9 @@ export function extractMetaDOI(meta: readonly PageMetaProbe[] = []): string | un
     "citation_pdf_url",
   ]) {
     for (const value of byName.get(name) ?? []) {
-      const doi = sniffDOI(value);
+      const doi = /^https?:\/\//i.test(value) || name === "citation_pdf_url"
+        ? doiFromURL(value)
+        : sniffDOI(value);
       if (doi !== undefined) return doi;
     }
   }
@@ -123,19 +281,21 @@ export function extractPageDOI(probe: PageDOIProbe): string | undefined {
 
   for (const value of [probe.canonical, probe.ogURL, probe.href]) {
     if (typeof value !== "string") continue;
-    const doi = sniffDOI(value);
+    const doi = doiFromURL(value);
     if (doi !== undefined) return doi;
   }
 
   for (const href of probe.anchorHrefs ?? []) {
+    let absolute: string;
     try {
       const anchorURL = new URL(href, probe.href);
       const hostname = anchorURL.hostname.toLowerCase();
       if (hostname !== "doi.org" && !hostname.endsWith(".doi.org")) continue;
+      absolute = anchorURL.href;
     } catch {
       continue;
     }
-    const doi = sniffDOI(href);
+    const doi = doiFromURL(absolute);
     if (doi !== undefined) return doi;
   }
 
@@ -246,6 +406,29 @@ export function sanitizePageHost(value: string): string | undefined {
     return undefined;
   }
   return host;
+}
+
+/**
+ * The only part of a page URL that may cross to the daemon on the Send-PDF
+ * path: scheme and host, with path, query, fragment, and any userinfo dropped.
+ *
+ * `sanitizePageHost` above serves `pdf_grab_request`, which wants a bare
+ * hostname; `page_acquire.url` must be a parseable http(s) URL
+ * (`protocol.go`'s `PageAcquirePayload.validate`), so this returns an origin
+ * rather than a host. Undefined means no safe value exists — callers must
+ * refuse rather than send the original, because an unrepresentable outbound
+ * frame is a fatal transport failure, not a refusal (AGENTS.md).
+ */
+export function pageAcquireOrigin(value: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(pdfSourceURL(value));
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+  if (url.hostname.length === 0) return undefined;
+  return `${url.protocol}//${url.host}`;
 }
 
 /** The daemon feature that advertises daemon-side PDF grabbing. Declared here,

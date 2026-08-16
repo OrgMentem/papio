@@ -5,13 +5,74 @@ import { expect, test } from "bun:test";
 import {
   classifyPage,
   deriveStablePageDOI,
+  doiFromURL,
   extractMetaDOI,
   extractPageDOI,
   isPDFPage,
   isPDFURL,
+  pageAcquireOrigin,
   pdfSourceURL,
   sniffDOI,
 } from "../src/deliver";
+
+// A DOI read out of a URL must come from URL *structure*. Scanning the
+// serialized URL as text was a live defect with two distinct consequences, both
+// pinned below: a route suffix glued onto the DOI (ACM, Springer), and a query
+// token absorbed into it (`?doi=…&token=…`), which `work.NormalizeDOI` accepts
+// because `doiCoreRE`'s `\S` matches `&` and `=`.
+test("doiFromURL reads real provider PDF URLs without absorbing route suffixes", () => {
+  expect(doiFromURL("https://dl.acm.org/doi/pdf/10.1145/3630106.3660000.pdf")).toBe("10.1145/3630106.3660000");
+  expect(doiFromURL("https://link.springer.com/content/pdf/10.1007/s11192-024-04901-y.pdf")).toBe("10.1007/s11192-024-04901-y");
+  expect(doiFromURL("https://journals.sagepub.com/doi/pdf/10.1177/01634437251234567?download=true")).toBe("10.1177/01634437251234567");
+  expect(doiFromURL("https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/jcpp.13440?download=true")).toBe("10.1111/jcpp.13440");
+  expect(doiFromURL("https://doi.org/10.1002/prefer")).toBe("10.1002/prefer");
+});
+
+// The cardinal failure this project refuses: a wrong document filed under a
+// right citation. ACM publishes supplements in the ARTICLE's DOI namespace, so
+// "strip the trailing junk" would yield the article's real DOI and file an
+// appendix as the paper. Declining is the only safe answer, which is why the
+// bug's original form (a bogus identifier that resolves to nothing) was safer
+// than its naive repair.
+test("doiFromURL declines a URL that names a document other than its DOI", () => {
+  expect(doiFromURL("https://dl.acm.org/doi/suppl/10.1145/3630106.3660000/suppl_file/appendix.pdf")).toBeUndefined();
+  expect(doiFromURL("https://dl.acm.org/doi/suppl/10.1145/3630106.3660000/unrecognized/x.pdf")).toBeUndefined();
+  expect(doiFromURL("https://onlinelibrary.wiley.com/doi/citedby/10.1111/jcpp.13440")).toBeUndefined();
+  expect(doiFromURL("https://journals.sagepub.com/doi/pdf/10.1177/01634437251234567/full")).toBeUndefined();
+  expect(doiFromURL("https://example.com/news/story-42")).toBeUndefined();
+});
+
+test("doiFromURL keeps a bounded query DOI and never absorbs a neighbouring token", () => {
+  expect(doiFromURL("https://cdn.example/file.pdf?doi=10.1234/paper&token=SECRET123")).toBe("10.1234/paper");
+  expect(doiFromURL("https://prov.example/doi/pdf/10.1111/abc?ticket=ST-9f8e7d")).toBe("10.1111/abc");
+  // A library proxy wraps the real URL in a parameter; the inner URL is parsed
+  // by these same rules rather than scanned, so its ticket cannot ride along.
+  expect(
+    doiFromURL("https://proxy.lib.edu/login?url=https%3A%2F%2Fwiley.com%2Fdoi%2Fpdfdirect%2F10.1111%2Fx%3Fticket%3DST-42"),
+  ).toBe("10.1111/x");
+});
+
+test("doiFromURL unwraps a browser viewer tab and preserves DOI slash runs", () => {
+  // The commonest Send PDF shape on Chrome: the DOI is inside an encoded `file`
+  // parameter, so narrowing to `url.pathname` alone would lose it.
+  expect(
+    doiFromURL("chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html?file=https%3A%2F%2Fdl.acm.org%2Fdoi%2Fpdf%2F10.1145%2F3630106.3660000.pdf"),
+  ).toBe("10.1145/3630106.3660000");
+  // 10.48612//x and 10.48612/x are two separately registered DataCite works, so
+  // a repeated slash is data, not a typo to normalize away (AGENTS.md).
+  expect(doiFromURL("https://doi.org/10.48612//monograph-2025-2")).toBe("10.48612//monograph-2025-2");
+});
+
+test("pageAcquireOrigin drops everything a provider URL can carry a secret in", () => {
+  expect(pageAcquireOrigin("https://cdn.example/file.pdf?doi=10.1234/p&token=SECRET123#frag")).toBe("https://cdn.example");
+  expect(pageAcquireOrigin("https://prov.example:8443/doi/pdf/10.1111/abc?ticket=ST-9f8e7d")).toBe("https://prov.example:8443");
+  expect(
+    pageAcquireOrigin("chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html?file=https%3A%2F%2Fpapers.example%2Fp.pdf%3Ft%3DS"),
+  ).toBe("https://papers.example");
+  // No safe value exists: the caller must refuse rather than send the original.
+  expect(pageAcquireOrigin("about:blank")).toBeUndefined();
+  expect(pageAcquireOrigin("not a url")).toBeUndefined();
+});
 
 test("sniffDOI returns the first DOI-shaped match and trims sentence punctuation", () => {
   expect(sniffDOI("See 10.1000/first.example. Then 10.1000/second")).toBe("10.1000/first.example");
