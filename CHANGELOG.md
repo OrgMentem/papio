@@ -10,6 +10,16 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Added
+- **`papio doctor` now says how much of today's metered allowance is gone.** A
+  daily ceiling that can park a source was enforced with nothing on any surface
+  reporting it, so reaching it read as *papio* having stopped working. Doctor
+  now names today's committed credits, the ceiling, whether that ceiling came
+  from the provider's own reported limit or from the conservative cap used
+  before the day's first response, and the credential fingerprint the spend
+  belongs to — while the allowance is still healthy, not only once it is spent.
+  A spent allowance warns and says work resumes at `00:00 UTC`.
+
 ### Fixed
 - **An OpenAlex address copied out of a browser is now accepted.** The address
   the OpenAlex website actually shows — `https://openalex.org/works/W2741809807`

@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -63,6 +64,18 @@ var validSourceNames = map[string]bool{
 	SourceRetractionWatch:  true,
 	SourceSemanticScholar:  true,
 	SourceOpenAIRE:         true,
+}
+
+// SourceNames enumerates every implemented source, sorted, so a caller that
+// must visit all of them reads the same authority validate() rejects against
+// rather than keeping its own list to fall out of date.
+func SourceNames() []string {
+	names := make([]string, 0, len(validSourceNames))
+	for name := range validSourceNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // removedSourceNames are names papio shipped in Default() at some point and no

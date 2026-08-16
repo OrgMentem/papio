@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"papio/internal/browser"
+	"papio/internal/budget"
 	"papio/internal/config"
 	"papio/internal/delivery"
 	"papio/internal/discovery"
@@ -101,6 +102,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	}
 	checkAdoptionRoot(cfg, add)
 	checkLegacyAdoptionRoot(cfg, add)
+	checkCreditSpend(ctx, cfg, db, add)
 	if cfg.Path != "" {
 		if info, err := os.Stat(cfg.Path); err == nil {
 			if info.Mode().Perm()&0o077 != 0 {
@@ -643,6 +645,58 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 			add(name, Fail, source+" is enabled without its API credential", "configure the API key/token, or disable the source")
 		} else {
 			add(name, Pass, source+" credential configured", "")
+		}
+	}
+}
+
+// checkCreditSpend names today's metered spend. Enforcement without visibility
+// is what makes a ceiling read as "papio stopped working": the daily fuse can
+// refuse real work, and until this check existed nothing on any surface said
+// how much of the allowance was gone, what the allowance was, or which
+// credential it belonged to. Reported for every source whose fuse is armed,
+// whether or not it is close to the limit — a number you only see once it is
+// too late is not visibility.
+func checkCreditSpend(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string)) {
+	if db == nil {
+		return
+	}
+	budgets := budget.New(db, budget.WithCreditPolicy(budget.CreditPolicyFromConfig(cfg)))
+	for _, source := range config.SourceNames() {
+		policy := cfg.SourcePolicy(source)
+		if !policy.Enabled || policy.DailyCreditFraction == 0 {
+			continue
+		}
+		status, err := budgets.CreditStatus(ctx, source)
+		if err != nil {
+			add("credits_"+source, Warn, source+" credit accounting could not be read", err.Error())
+			continue
+		}
+		name := "credits_" + source
+		identity := "no request yet today"
+		if len(status.Identities) != 0 {
+			identity = strings.Join(status.Identities, ", ")
+		}
+		// The ceiling's provenance belongs in the readout: a limit derived
+		// from the provider's own reported figure and a conservative cap used
+		// before today's first response arrives are different claims, and the
+		// second silently looks like a much smaller quota.
+		basis := "conservative cap until this provider's first response today"
+		if status.Denominator != 0 {
+			basis = fmt.Sprintf("%d reported by the provider", status.Denominator)
+		}
+		switch {
+		case status.DriftReason != "":
+			add(name, Warn,
+				fmt.Sprintf("%s egress is closed: %s", source, status.DriftReason),
+				"the provider's prices no longer match the schedule papio committed against; acknowledge the new schedule to reopen egress")
+		case status.Exhausted():
+			add(name, Warn,
+				fmt.Sprintf("%s has spent today's allowance: %d of %d credits, from %s (%s)", source, status.Committed, status.Limit, basis, identity),
+				"papio resumes at 00:00 UTC; raise sources."+source+".daily_credit_fraction to reserve less, or add capacity on the provider")
+		default:
+			add(name, Pass,
+				fmt.Sprintf("%s has committed %d of %d credits today, from %s (%s)", source, status.Committed, status.Limit, basis, identity),
+				"")
 		}
 	}
 }

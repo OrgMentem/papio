@@ -213,6 +213,7 @@ report not OK. The checks below explain every check the command can emit.
 | `source_openalex` | An enabled OpenAlex source has email and API key. | Set `email` and `sources.openalex.api_key`, or disable the source. |
 | `source_core` | An enabled CORE source has an API credential. | Configure `sources.core.api_key`, or disable the source. |
 | `source_crossref-tdm` | An enabled Crossref TDM source has an API credential. | Configure `sources.crossref_tdm.api_key`, or disable the source. |
+| `credits_<source>` | Today's metered spend is named, with the ceiling and the credential it belongs to: `openalex has committed 12 of 5000 credits today, from 10000 reported by the provider (key-05e71a0b2f38b802)`. Reported for every source whose `daily_credit_fraction` is non-zero, healthy or not. | A warning means today's allowance is spent and that source is parked until `00:00 UTC` — *papio* is waiting, not broken. Lower the reserve by raising `daily_credit_fraction`, or add capacity on the provider. A warning naming a changed cost schedule means the provider's prices no longer match what *papio* committed against, and egress stays closed until the new schedule is acknowledged. Before the day's first response arrives the ceiling reads as a conservative cap rather than a fraction of the provider's figure. |
 
 See [`config-reference.md`](../reference/config-reference.md) for exact keys and allowed
 values.

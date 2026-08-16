@@ -171,13 +171,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		MaxPerHost: cfg.Captures.MaxPerHost,
 		MaxAge:     time.Duration(cfg.Captures.MaxAgeDays) * 24 * time.Hour,
 	})
-	budgets := budget.New(db, budget.WithCreditPolicy(func(source string) budget.CreditPolicy {
-		p := cfg.SourcePolicy(source)
-		return budget.CreditPolicy{
-			DailyCreditFraction: p.DailyCreditFraction,
-			DailyCreditLimit:    p.DailyCreditLimit,
-		}
-	}))
+	budgets := budget.New(db, budget.WithCreditPolicy(budget.CreditPolicyFromConfig(cfg)))
 
 	artifactPolicy := fetch.DefaultPolicy()
 	artifactPolicy.MaxBytes = cfg.Fetch.MaxBytes

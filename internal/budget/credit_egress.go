@@ -10,6 +10,8 @@ import (
 	"math"
 	"strings"
 	"time"
+
+	"papio/internal/config"
 )
 
 // BootstrapCreditCap is the bounded egress permitted before a primary identity
@@ -98,6 +100,95 @@ func WithCreditPolicy(fn func(source string) CreditPolicy) Option {
 	return func(m *Manager) {
 		m.creditPolicy = fn
 	}
+}
+
+// CreditPolicyFromConfig is the ONE mapping from source configuration to fuse
+// policy. Every reader of the day's allowance — the egress authority that
+// refuses work, and the diagnostics that explain the refusal — must derive it
+// here, because a second copy of this mapping is a second answer to "how much
+// may this identity spend today", and the two disagree the moment one is
+// edited.
+func CreditPolicyFromConfig(cfg config.Config) func(string) CreditPolicy {
+	return func(source string) CreditPolicy {
+		p := cfg.SourcePolicy(source)
+		return CreditPolicy{
+			DailyCreditFraction: p.DailyCreditFraction,
+			DailyCreditLimit:    p.DailyCreditLimit,
+		}
+	}
+}
+
+// CreditStatus reports what the fuse would enforce for one source right now.
+// Read-only: it opens no transaction and commits nothing, so it can never be
+// the thing that authorizes a request.
+type CreditStatus struct {
+	Source string
+	Day    string
+	// Committed is the credits this source has durably paid for today.
+	Committed int
+	// Limit is the ceiling Committed is measured against. Meaningless when
+	// Unmetered.
+	Limit int
+	// Denominator is the provider-reported daily limit the ceiling is a
+	// fraction of; 0 means today's first response has not been read yet, so
+	// Limit is the conservative bootstrap/cold-start cap instead.
+	Denominator int
+	Unmetered   bool
+	// DriftReason is set when the provider's own prices stopped matching the
+	// schedule papio committed against, which closes egress until acknowledged.
+	DriftReason string
+	// Identities names the credentials that have transacted with this source,
+	// as credential fingerprints — never a credential.
+	Identities []string
+}
+
+// Exhausted reports whether today's allowance is spent. It is deliberately not
+// an authority: CommitEgress re-decides this inside the committing transaction.
+func (s CreditStatus) Exhausted() bool {
+	return s.DriftReason != "" || (!s.Unmetered && s.Committed >= s.Limit)
+}
+
+// CreditStatus reads one source's fuse state for the current UTC day.
+func (m *Manager) CreditStatus(ctx context.Context, source string) (CreditStatus, error) {
+	day := utcDay(m.now().UTC())
+	status := CreditStatus{Source: source, Day: day}
+	var row fuseRow
+	var reason sql.NullString
+	err := m.db.QueryRowContext(ctx, `SELECT credits_committed, denominator, drift_closed_at, drift_reason
+		FROM source_credit_fuse WHERE source = ? AND utc_day = ?`, source, day).
+		Scan(&row.committed, &row.denominator, &row.driftClosed, &reason)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// No row is a fact, not a miss: nothing has been spent today.
+	case err != nil:
+		return CreditStatus{}, err
+	}
+	if row.driftClosed.Valid && row.driftClosed.String != "" {
+		status.DriftReason = reason.String
+		if status.DriftReason == "" {
+			status.DriftReason = "cost schedule changed"
+		}
+	}
+	status.Committed = row.committed
+	if row.denominator.Valid {
+		status.Denominator = int(row.denominator.Int64)
+	}
+	status.Limit, status.Unmetered = m.allowanceFor(row, m.creditPolicyFor(source))
+
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT DISTINCT identity FROM source_budgets WHERE source = ? ORDER BY identity`, source)
+	if err != nil {
+		return CreditStatus{}, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var identity string
+		if err := rows.Scan(&identity); err != nil {
+			return CreditStatus{}, err
+		}
+		status.Identities = append(status.Identities, identity)
+	}
+	return status, rows.Err()
 }
 
 func (m *Manager) creditPolicyFor(source string) CreditPolicy {
