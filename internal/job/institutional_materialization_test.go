@@ -148,7 +148,12 @@ func TestMaterializationExpiredBindReplayIsStaleAndCandidateEligible(t *testing.
 	}
 	profile := institutionalProfile(t, js, "library", "digest-a", "auth-a")
 	candidate := institutionalCandidate(t, js, profile, "candidate-expired-bind", jobID)
-	expires := time.Now().UTC().Add(20 * time.Millisecond)
+	// The lease must outlive the bind below by a margin no scheduler can eat:
+	// BindMaterialization compares lease_until against store.Now(), so a 20ms
+	// lease made the *valid* bind fail as stale on a loaded -race runner. Expiry
+	// is driven by ReconcileMaterializationClaims' explicit cutoff instead, which
+	// is what this test is actually about.
+	expires := time.Now().UTC().Add(time.Hour)
 	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
 		CandidateID: candidate.ID, BrowserHolderGeneration: 3, JobAttemptRevision: 1,
 		InstitutionProfileRevision: profile.Revision, RouteRevision: 7,
@@ -172,6 +177,41 @@ func TestMaterializationExpiredBindReplayIsStaleAndCandidateEligible(t *testing.
 	}
 	if got.Status != "eligible" {
 		t.Fatalf("candidate status after expiry = %q, want eligible", got.Status)
+	}
+}
+
+// BindMaterialization's own lease_until predicate, which the two reconcile tests
+// above do NOT reach: they expire the claim through ReconcileMaterializationClaims,
+// so bind refuses on phase and passes with the lease compare removed. A holder that
+// sat past its lease and binds before any reconciler runs must be refused by bind
+// itself, or a tab is driven under a lease someone else may already have taken.
+func TestBindRefusesAClaimWhoseLeaseHasPassedWithoutReconciliation(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, err := js.CreateRequest(ctx, "materialization-lease-lapsed", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := institutionalProfile(t, js, "library", "digest-a", "auth-a")
+	candidate := institutionalCandidate(t, js, profile, "candidate-lease-lapsed", jobID)
+	// ClaimMaterialization requires a future lease, so the lapse has to happen
+	// after the claim. Ageing the row is time passing with no scheduler involved;
+	// crucially no reconciler runs, so the claim stays phase='claimed' and the
+	// lease is the only thing left that can refuse the bind.
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidate.ID, BrowserHolderGeneration: 3, JobAttemptRevision: 1,
+		InstitutionProfileRevision: profile.Revision, RouteRevision: 7,
+		MaterializationKind: "browser_tab", LeaseUntil: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lapsed := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims SET lease_until=? WHERE id=?`, lapsed, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.BindMaterialization(ctx, claim.ID, claim.BindingID, 3, profile.Revision, 0); !errors.Is(err, ErrMaterializationStale) {
+		t.Fatalf("bind on a lapsed lease = %v, want stale", err)
 	}
 }
 
@@ -446,7 +486,8 @@ func TestMaterializationExpiryReconcilesAndRejectsStaleHolder(t *testing.T) {
 	}
 	profile := institutionalProfile(t, js, "library", "digest-a", "auth-a")
 	candidate := institutionalCandidate(t, js, profile, "candidate-expiry", jobID)
-	expires := time.Now().UTC().Add(20 * time.Millisecond)
+	// Far future, expired by the cutoff below rather than by elapsed wall time.
+	expires := time.Now().UTC().Add(time.Hour)
 	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{CandidateID: candidate.ID, BrowserHolderGeneration: 4, JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision, RouteRevision: 7, MaterializationKind: "direct_download", LeaseUntil: expires})
 	if err != nil {
 		t.Fatal(err)
