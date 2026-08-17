@@ -457,6 +457,114 @@ Reproduce: load the corpus, filter to `len(FrontMatterDOIs(text)) == 0`, and ask
 `IdentifierPrinted(w, doc.Work)` for each window from `IdentityWindows(text)`. Aggregate counts
 only — never emit per-document output, which names the operator's papers.
 
+## Alternative technologies — measured, 2026-08-17
+
+This design recovers structure from a shredded text string. That is one technology choice
+among several, and two of the alternatives were cheap enough to measure on the same 322
+admitted documents rather than argued about.
+
+### A. Embedded publisher metadata — the strongest result in this workstream
+
+`ExtractText` reads only the text stream. But publishers write the DOI into the Info dictionary
+and XMP during production, and papio already discovers `pdfinfo` (`semantic.go:62`, used today
+only for structural cross-checks, never identity).
+
+| | documents | share of admitted |
+|---|---|---|
+| own identifier present in Info dict or XMP | 110 | **34.2%** |
+| present **and absent** from the byline window — net new | 101 | **31.4%** |
+| attributable to a specific named field | 106 | 32.9% |
+| metadata naming **another library work** | **0** | **0.0%** |
+
+Field histogram (documents; several fields may carry it): `xmp/dc:identifier` 76,
+`xmp/prism:url` 73, `info/Subject` 68, `xmp/prism:doi` 67, `xmp/crossmark:DOI` 62,
+`xmp/pdfx:doi` 60, `info/Title` 17. These are PRISM, CrossMark and pdfx production fields —
+publisher assertions about **this** document, not text that happens to appear on a page.
+
+Three things follow, and together they outrank the parser:
+
+1. **Nearly twice the reach of the frame rule, and almost disjoint from it.** 34.2% against
+   18%, with 31.4 points of it in documents the frame rule cannot serve. Combined reach of
+   metadata *or* today's frame is **49.4%**.
+2. **The attribution problem does not arise.** `prism:doi` *means* "this document's DOI". No
+   `SELF`/`MENTION` inference, no monotonicity invariant, no positive-form grammar — the field's
+   semantics answer the question that the entire 364-line parser exists to guess at.
+3. **Zero measured wrong-accept exposure.** Every admitted document was checked against every
+   other identified library work (~185k pairwise checks): **no document's metadata carried
+   another work's identifier**. Exact one-sided 95% upper bound on the per-document
+   contamination rate: **≤0.93%**. Contrast the text path, where the whole design problem is
+   that page one routinely carries other works' identifiers.
+
+Constraints that still apply, and are not negotiable:
+
+- **Target-aware only.** Ask "does this document's metadata name *the candidate's* identifier?"
+  Never mint identity from metadata blind: a template or aggregator error would name a work
+  with nothing to check it against, which is the `FrontMatterDOIs` hazard with a new source.
+- **A named field is required**, not a substring of the whole blob — 4 of the 110 matched only
+  the concatenated output, which is a probe artifact, not evidence.
+- **This library under-samples aggregator cover sheets.** ProQuest is papio's highest-volume
+  destination and a stamped cover leaf is exactly the shape that could rewrite XMP; 48
+  papio-owned artifacts and 175 missing files were outside this run. Contamination must be
+  re-measured on a grab-sourced population before metadata is allowed to authorise alone.
+
+### B. Layout-preserving extraction — refuted, as measured
+
+`pdftotext` runs with **no flags** (`semantic.go:90`), so "no layout data exists" is a property
+of the invocation, not of poppler: `-layout`, `-bbox` and `-bbox-layout` are all available. The
+obvious hypothesis is that column shredding hides own identifiers from the byline window.
+
+It does not survive measurement. With `-layout`:
+
+| window | bare (today) | `-layout` |
+|---|---|---|
+| 2 KiB byline | 58 | **47** |
+| 4 KiB page one | 149 | **85** |
+
+`-layout` **loses** reach, and adds exactly **1** document to the frame. The cause is
+structural: the identity windows are **byte**-bounded, and layout padding fills them with
+whitespace, so the same 4 KiB reaches less of the page. Any real test of layout awareness
+therefore requires structure-bounded windows first — which is a larger change than this plan,
+and one whose payoff is now known to be small on this population.
+
+`-bbox-layout` (word-level coordinates and font data) is a genuinely different capability and
+remains unmeasured. It is the only version of "layout" worth revisiting, and only after
+metadata corroboration ships.
+
+### C. Assessed, not measured — where ML belongs and does not
+
+- **GROBID** is the purpose-built tool for exactly this task: TEI header extraction with
+  reference-list segmentation, trained on it. It would subsume both the parser and the
+  reference/body separation. The cost is architectural, not technical: a Java service contradicts
+  papio's single-binary, offline, zero-runtime-dependency posture, and it is not obviously worth
+  it once metadata covers a third of the population for free. Reconsider only if metadata plus
+  picker ranking leaves a large residue — and then measure its wrong-accept rate on this same
+  corpus before adopting, not its published F1.
+- **Document-AI models** (Nougat, Marker, MinerU, Docling) reconstruct documents to markdown.
+  They **hallucinate**, including in identifier strings, and identifier acceptance is the one
+  place papio cannot tolerate a plausible invention. Disqualified for authorising. Tolerable as
+  a ranking signal.
+- **A local LLM verdict on "is this DOI the document's own?"** is disqualified for the same
+  reason plus a specific one: v3's settled safety parameter is *the reviewable, versioned set of
+  implemented positive forms*. A model's decision boundary is neither reviewable nor versionable,
+  so it cannot be the acceptance authority. It can veto, and it can rank.
+- **Embeddings for picker ranking is the safe, high-value ML use, and it needs none of this
+  machinery.** Rank the already-shipped popup picker by similarity between page-one text and
+  candidate metadata. Bad ranking is visible and reversible — the plan's own stop-rule
+  reasoning — so it carries no wrong-accept budget at all. If the floor is not cleared, this is
+  the fallback, and it can ship independently of every increment here.
+- **Crossref/OpenAlex reverse lookup by extracted title** adds little *for binding*: the
+  candidate's metadata is already known, so `MatchIdentity` compares title/author/year directly
+  without a network round trip, rate limits, or offline failure. Reverse lookup earns its keep
+  for **blind** identification (a PDF with no pending job), which is a different feature.
+
+### Consequence for the sequence
+
+**Metadata corroboration becomes the first behaviour-changing increment, ahead of the parser.**
+It is deterministic, needs no new safety vocabulary, reuses the existing target-aware
+corroboration seam, and measures better on both axes than the rule this plan was built to add.
+The parser's marginal value must then be re-derived against the residue it actually leaves —
+not against today's 100% gap.
+
 ## Viability — the stop rule, and what it must not be attached to
 
 Auto-binding today is a minority win: random N=2 produced **44 correct** against **249 missed**
@@ -528,11 +636,15 @@ unavailable, therefore this page-one standalone DOI stays `UNKNOWN`" is coherent
 
 ## Preserved from v1 (still verified)
 
-- **No layout data exists.** `ExtractText` yields a `pdftotext`/OCR string; `textReport` stores
-  a byte-truncated excerpt; no coordinates or font metadata. Attribution must work from text,
-  line structure and segment boundaries only. TOC detection from numbered lines and indent
-  stacks, not column x; headings from short lines, numbering prefixes and following blanks, not
-  font size; running heads from repeated early lines.
+- **No layout data exists *in what papio extracts*** — a correction to v1's flat claim.
+  `ExtractText` runs `pdftotext` with no flags, so it yields a plain `pdftotext`/OCR string and
+  `textReport` stores a byte-truncated excerpt: no coordinates, no font metadata. So attribution
+  as designed here must work from text, line structure and segment boundaries only — TOC
+  detection from numbered lines and indent stacks, not column x; headings from short lines,
+  numbering prefixes and following blanks, not font size; running heads from repeated early
+  lines. But poppler *can* supply coordinates and font data (`-bbox-layout`), so this is a
+  boundary of the current invocation rather than of the format. §Alternative technologies
+  measures the cheap version (`-layout`, which loses reach) and leaves `-bbox-layout` open.
 - **Do not consolidate** `internal/work` (version-preserving) with `internal/ownership`
   (version-collapsing); preserve DOI slash runs. Attribution receives hits produced under
   existing identifier semantics and classifies their surroundings — it changes **no**
@@ -551,14 +663,16 @@ unavailable, therefore this page-one standalone DOI stays `UNKNOWN`" is coherent
    `not-composite`. The prevalence bound is recorded above; because it yielded no positives,
    held-out positive composite shapes remain a release prerequisite rather than a claim this
    library can substantiate.
-3. **Whether to build at all — answered "yes, narrowly", on §The authorisation ceiling.** Three
-   of four reviews were adverse, each on a different architectural flaw, so the prior was
-   rightly "probably not". The ceiling measurement moved it: the identity-frame population is
-   18% of admitted documents, above the proposed floor, so the design is not structurally
-   empty and the remaining question is ordinary engineering rather than viability. What is
-   still *not* supported is broad autonomous binding — 61% of page-one-printed own identifiers
-   fall outside the frame and will `Review`. Build increments 0-5 and let the floor decide;
-   nothing past Increment 5 starts until the floor's value is agreed.
+3. **Whether to build *this* at all — reopened by §Alternative technologies.** The ceiling
+   measurement said the design is not structurally empty (18% of admitted documents), which
+   answered viability. The technology measurement then found a source with **34.2%** reach,
+   31.4 points of it net new, and **zero** measured contamination — where the attribution
+   problem does not exist at all. So the order changed: **ship metadata corroboration first**,
+   then re-derive the parser's value against the residue. Broad autonomous binding remains
+   unsupported either way; 61% of page-one-printed own identifiers fall outside the frame.
+4. **Contamination re-measurement on a grab-sourced population** before metadata may authorise
+   alone — this library under-samples aggregator cover sheets, which are the one shape that
+   plausibly rewrites XMP.
 
 ## Review history
 
