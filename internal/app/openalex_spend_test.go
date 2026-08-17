@@ -1029,3 +1029,21 @@ func TestBudgetRefusalDetailNamesTheKind(t *testing.T) {
 		t.Errorf("detail leaked upstream text: %q", leaky)
 	}
 }
+
+func TestDeferralDetailDistinguishesSelfPacingFromProviderGate(t *testing.T) {
+	// These are opposite diagnoses: one is a local pacing choice the operator
+	// can change, the other is the provider's own answer. 87,471 rows on the
+	// operator's store recorded neither, and telling them apart needed
+	// out-of-band knowledge that OpenAIRE has never returned 429.
+	mine := safeType(&budget.ErrDeferred{Source: "openaire", Advisory: true})
+	theirs := safeType(&budget.ErrDeferred{Source: "openalex"})
+	if mine == theirs {
+		t.Fatalf("self-paced and provider-gated refusals both record %q", mine)
+	}
+	if !strings.Contains(mine, "self_paced") {
+		t.Errorf("advisory detail = %q, want self_paced", mine)
+	}
+	if !strings.Contains(theirs, "source_gate") {
+		t.Errorf("durable detail = %q, want source_gate", theirs)
+	}
+}

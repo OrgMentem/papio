@@ -3374,6 +3374,20 @@ func safeType(err error) string {
 	if errors.As(err, &exceeded) {
 		return fmt.Sprintf("%T(%s/%s)", exceeded, exceeded.Kind, exceeded.Window)
 	}
+	// The same problem, one budget layer up, and it is the more expensive one
+	// to lack: 87,471 of 241,093 attempt rows on the operator's own store are
+	// `*budget.ErrDeferred` with nothing to say whether papio's own token
+	// bucket declined to make the request or the provider gated us. Those are
+	// opposite diagnoses — one is a local pacing choice the operator can
+	// change, the other is the provider's answer — and telling them apart
+	// required knowing out of band that OpenAIRE has never once returned 429.
+	var deferred *budget.ErrDeferred
+	if errors.As(err, &deferred) {
+		if deferred.Advisory {
+			return fmt.Sprintf("%T(self_paced)", deferred)
+		}
+		return fmt.Sprintf("%T(source_gate)", deferred)
+	}
 	// Persist only the type/category, never arbitrary upstream text that may
 	// contain a bearer URL, query, body, token, or credential.
 	return fmt.Sprintf("%T", err)
