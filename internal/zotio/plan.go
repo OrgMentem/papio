@@ -156,7 +156,7 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 	artifactPath := filepath.Join(filepath.Dir(bundlePath), filepath.FromSlash(acquisition.Artifact.Path))
 	attachmentMode := s.attachmentMode()
 	collection := strings.TrimSpace(row.Policy.Collection)
-	idempotencyKey := "zotio_plan:" + jobID + ":" + acquisition.Artifact.SHA256 + ":" + attachmentMode + ":" + collection
+	idempotencyKey := planIdempotencyKey(jobID, acquisition.Artifact.SHA256, attachmentMode, collection, newItemRoute)
 	if existing, err := s.recordedPlan(ctx, idempotencyKey); err != nil {
 		return nil, err
 	} else if existing != nil {
@@ -204,6 +204,14 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		plan.CollectionIsKey = keyRE.MatchString(collection)
 		plan.Route = "existing_item"
 		plan.ExpectedParentKey = acquisition.ZotioItemKey
+		// This path has no desktop route to choose: "zotio attachments add"
+		// works only through the Zotero Web API, so in "stored" mode it always
+		// uploads into Zotero's own file storage and consumes that plan,
+		// whatever file storage the operator configured in Zotero. Only
+		// "linked-file" avoids it here. The route fix below therefore covers
+		// item creation, not this branch — 13 of 161 plans on the machine where
+		// this was measured. Closing the gap needs an upstream desktop route
+		// for attaching to an item that already exists.
 		plan.PreviewArgs = []string{"--agent", "attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
 		plan.ApplyArgs = []string{"--agent", "--yes", "attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
 	} else {
@@ -222,8 +230,16 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		if err != nil {
 			return nil, err
 		}
-		plan.PreviewArgs = []string{"--agent", "--via", "web", "import", "apply", manifestPath, "--attach-mode", attachmentMode}
-		plan.ApplyArgs = []string{"--agent", "--yes", "--via", "web", "import", "apply", manifestPath, "--attach-mode", attachmentMode}
+		// "auto" prefers the local Zotero desktop and falls back to
+		// api.zotero.org when it is not reachable. Forcing "web" here uploaded
+		// every attachment into Zotero's own file storage, which ignores
+		// whatever file storage the operator configured in Zotero — a WebDAV
+		// server, for instance. On this machine that quietly consumed a 300 MB
+		// plan the operator does not use and had not chosen, and once it filled
+		// no paper could be filed at all. The desktop route hands the file to
+		// Zotero, so Zotero puts it wherever the operator told it to.
+		plan.PreviewArgs = []string{"--agent", "--via", newItemRoute, "import", "apply", manifestPath, "--attach-mode", attachmentMode}
+		plan.ApplyArgs = []string{"--agent", "--yes", "--via", newItemRoute, "import", "apply", manifestPath, "--attach-mode", attachmentMode}
 	}
 
 	preview, err := s.CLI.RunJSON(ctx, plan.PreviewArgs...)

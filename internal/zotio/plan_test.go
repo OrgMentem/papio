@@ -455,6 +455,62 @@ func TestMaterializePrivateFileRemovesTargetOnSHAMismatch(t *testing.T) {
 	}
 }
 
+// New-item creation must not force zotio's "web" route. That route uploads the
+// attachment into Zotero's own file storage, which ignores the file storage the
+// operator configured in Zotero — for a WebDAV user it silently consumes a
+// storage plan they never chose to use, and when it fills, filing stops
+// entirely with a bare HTTP 413. "auto" prefers the local desktop, which hands
+// the file to Zotero and lets Zotero honour that configuration, and still falls
+// back to the web API when no desktop is reachable.
+func TestNewItemPlanDoesNotForceZoteroCloudRoute(t *testing.T) {
+	cli := &planCLI{
+		manifest: `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper","DOI":"10.1002/example"}}]}`,
+		preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+	}
+	service, jobID := readyPlanService(t, "", cli)
+	plans, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"preview": plans[0].PreviewArgs,
+		"apply":   plans[0].ApplyArgs,
+	} {
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "--via web") {
+			t.Fatalf("%s args force the Zotero cloud route: %s", name, joined)
+		}
+		if !strings.Contains(joined, "--via auto") {
+			t.Fatalf("%s args = %s, want the auto route", name, joined)
+		}
+	}
+}
+
+// A cached plan is replayed verbatim, so anything that decides where the file
+// lands must take part in its identity. Changing the route while the key
+// ignored it left every already-planned paper — 159 of them on the machine
+// where this was found — still pointed at Zotero's cloud storage, so the fix
+// would have applied only to papers acquired afterwards.
+func TestPlanIdempotencyKeyDistinguishesRoute(t *testing.T) {
+	base := planIdempotencyKey("job_1", "sha", "stored", "", "auto")
+	if base == planIdempotencyKey("job_1", "sha", "stored", "", "web") {
+		t.Fatal("plan cache key ignores the route: a route change would reuse plans aimed at the old destination")
+	}
+	if !strings.Contains(base, "auto") {
+		t.Fatalf("key = %q, want the route in it", base)
+	}
+	for name, other := range map[string]string{
+		"job":             planIdempotencyKey("job_2", "sha", "stored", "", "auto"),
+		"artifact":        planIdempotencyKey("job_1", "sha2", "stored", "", "auto"),
+		"attachment mode": planIdempotencyKey("job_1", "sha", "linked-file", "", "auto"),
+		"collection":      planIdempotencyKey("job_1", "sha", "stored", "COLL1234", "auto"),
+	} {
+		if base == other {
+			t.Fatalf("plan cache key ignores the %s", name)
+		}
+	}
+}
+
 func TestFailedManifestApplyInvalidatesCachedDerivation(t *testing.T) {
 	invalidManifest := `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"document","title":"Example Paper","publicationTitle":"not allowed for document"}}]}`
 	correctedManifest := `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper","DOI":"10.1002/example"}}]}`

@@ -11,6 +11,26 @@ import (
 
 const newItemRoutingRefusal = "new-item Zotio routing requires a DOI, PMID, arXiv ID, or ISBN"
 
+// newItemRoute is the zotio item-creation route papio asks for when it creates
+// a Zotero item. "auto" uses the local Zotero desktop when it is reachable and
+// falls back to api.zotero.org otherwise.
+//
+// It must not be "web". That route uploads the attachment into Zotero's own
+// file storage and so ignores the file storage the operator configured inside
+// Zotero. On a WebDAV setup it consumes a storage plan the operator never chose
+// to use, and when that plan fills, every filing stops with a bare HTTP 413.
+// Handing the file to the desktop lets Zotero honour its own configuration.
+const newItemRoute = "auto"
+
+// planIdempotencyKey identifies a cached zotio plan. Every input that changes
+// the mutation papio would perform belongs in it, because a cached plan is
+// replayed verbatim: the route is here for the same reason the attachment mode
+// is, and omitting it meant a route change left already-planned papers still
+// pointed at the old destination.
+func planIdempotencyKey(jobID, artifactSHA256, attachmentMode, collection, route string) string {
+	return "zotio_plan:" + jobID + ":" + artifactSHA256 + ":" + attachmentMode + ":" + collection + ":" + route
+}
+
 // lookupWorkFrom copies the stable identifiers papio uses for new-item Zotio
 // routing and library ownership checks. Title is deliberately excluded: it
 // describes works rather than asserting identity (ADR-0019).
