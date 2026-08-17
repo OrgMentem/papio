@@ -398,6 +398,59 @@ table: v2 listed "foreign `SELF` identifier is negative evidence" as a bound on 
 Under selector-level resolution it is no longer a bound at all — a foreign `SELF` that is
 itself false is precisely the hazard, so it cannot also be the mitigation.
 
+## The authorisation ceiling — measured, 2026-08-17
+
+Before the increments, one question had to be answered or the whole design could be
+**structurally empty**: admission to the candidate path requires `FrontMatterDOIs` to be
+**empty**, and v3 requires `SELF` to rest on **identity-frame** evidence. A conclusive DOI in
+the blind 1 KiB window means the work is already named and candidate selection is never
+reached. So if the identity frame is roughly the front matter, the population where v3's
+identifier gate can ever authorise anything might be near zero *by construction*.
+
+Neither review raised this. It is measurable now, through the same corroborator the verdict
+uses (`IdentifierPrinted`, `identity.go:887-889`) over the real library:
+
+| | documents |
+|---|---|
+| corpus documents | 668 |
+| with a known own identifier | 576 |
+| blind path names them — never reach candidates | 254 |
+| **admitted to the candidate path** | **322** |
+
+Of those 322, where is their **own** identifier printed?
+
+| window | documents | share of admitted |
+|---|---|---|
+| 1 KiB front matter (matchable but not conclusive) | 33 | 10% |
+| **2 KiB byline — proxy for v3's identity frame** | **58** | **18%** |
+| anywhere in 4 KiB page one | 149 | 46% |
+| page one but **not** byline — v3 refuses these | 91 | 28% |
+| admitted documents from OCR | 5 (0 byline-printed) | 2% |
+
+Two conclusions, and they point in opposite directions:
+
+1. **The design is not structurally empty.** 18% of admitted documents print their own
+   identifier inside the byline window despite the blind window having found nothing
+   conclusive there — because those occurrences are line-wrapped or letter-spaced (matchable,
+   not conclusive), or sit between 1 KiB and 2 KiB. That is a real population, and it is
+   already above the proposed 10% floor **before** any recovery form. The mechanism has
+   something to work with.
+2. **The cost of dropping form 2 is now quantified, and it is the majority.** Of the 149
+   admitted documents that print their own identifier anywhere on page one, **91 (61%)** print
+   it outside the byline window. v3 sends every one of those to `Review`. That is the honest
+   price of the monotonicity invariant, measured on this library rather than extrapolated from
+   the 17-of-40 sample — and it is the strongest argument for prioritising Increment 8 recovery
+   forms once the safe core is proven.
+
+Read as a bound, not a forecast: 18% is a **ceiling** on identifier-gate authorisation, not
+predicted coverage. A bind still needs title, author and year to agree, and false-`SELF`
+filtering only removes candidates from that 18%. The byline window is also a *proxy* — a
+narrower parsed frame measures lower, all of page one would measure 46%.
+
+Reproduce: load the corpus, filter to `len(FrontMatterDOIs(text)) == 0`, and ask
+`IdentifierPrinted(w, doc.Work)` for each window from `IdentityWindows(text)`. Aggregate counts
+only — never emit per-document output, which names the operator's papers.
+
 ## Viability — the stop rule, and what it must not be attached to
 
 Auto-binding today is a minority win: random N=2 produced **44 correct** against **249 missed**
@@ -490,13 +543,14 @@ unavailable, therefore this page-one standalone DOI stays `UNKNOWN`" is coherent
    was proposed; its placement (Increment 5, frozen denominator) is settled, its value is not.
 2. **Composite labelling** — `make composite-labels`, 15 proposals + 25 audit rows. Gates every
    real-world claim about this failure class, and can only be done by the operator.
-3. **Whether to build at all.** Three of four reviews were adverse, each on a different
-   architectural flaw, and the honest reading of the value case is that a safe rule is a
-   minority win against an already-shipped picker. v3 is now specific enough to implement, but
-   the sequence deliberately front-loads two decision-inert increments (the matcher, then
-   multiplicity measurement) so the question can be answered with numbers before any acceptance
-   behaviour changes. Nothing after Increment 4 should start until Increment 5's floor is
-   agreed.
+3. **Whether to build at all — answered "yes, narrowly", on §The authorisation ceiling.** Three
+   of four reviews were adverse, each on a different architectural flaw, so the prior was
+   rightly "probably not". The ceiling measurement moved it: the identity-frame population is
+   18% of admitted documents, above the proposed floor, so the design is not structurally
+   empty and the remaining question is ordinary engineering rather than viability. What is
+   still *not* supported is broad autonomous binding — 61% of page-one-printed own identifiers
+   fall outside the frame and will `Review`. Build increments 0-5 and let the floor decide;
+   nothing past Increment 5 starts until the floor's value is agreed.
 
 ## Review history
 
