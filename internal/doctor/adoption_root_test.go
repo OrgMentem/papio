@@ -3,12 +3,15 @@
 package doctor
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"papio/internal/config"
+	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 // adoptionHome isolates the home-derived download directory so a developer's
@@ -144,7 +147,9 @@ func TestCheckLegacyAdoptionRootNamesFilesLeftBehind(t *testing.T) {
 	}
 	cfg := config.Config{DataDir: data}
 
-	checks := collectChecks(t, func(add func(string, string, string, string)) { checkLegacyAdoptionRoot(cfg, add) })
+	checks := collectChecks(t, func(add func(string, string, string, string)) {
+		checkLegacyAdoptionRoot(context.Background(), cfg, nil, add)
+	})
 	if len(checks) != 1 {
 		t.Fatalf("checks = %#v, want exactly one legacy check", checks)
 	}
@@ -169,7 +174,7 @@ func TestCheckLegacyAdoptionRootIsSilentWhenThereIsNothingToSay(t *testing.T) {
 	t.Run("absent", func(t *testing.T) {
 		cfg := config.Config{DataDir: data}
 		if checks := collectChecks(t, func(add func(string, string, string, string)) {
-			checkLegacyAdoptionRoot(cfg, add)
+			checkLegacyAdoptionRoot(context.Background(), cfg, nil, add)
 		}); len(checks) != 0 {
 			t.Fatalf("checks = %#v, want none", checks)
 		}
@@ -181,7 +186,7 @@ func TestCheckLegacyAdoptionRootIsSilentWhenThereIsNothingToSay(t *testing.T) {
 		}
 		cfg := config.Config{DataDir: data}
 		if checks := collectChecks(t, func(add func(string, string, string, string)) {
-			checkLegacyAdoptionRoot(cfg, add)
+			checkLegacyAdoptionRoot(context.Background(), cfg, nil, add)
 		}); len(checks) != 0 {
 			t.Fatalf("checks = %#v, want none", checks)
 		}
@@ -199,7 +204,7 @@ func TestCheckLegacyAdoptionRootIsSilentWhenThereIsNothingToSay(t *testing.T) {
 		}
 		cfg := config.Config{DataDir: data}
 		if checks := collectChecks(t, func(add func(string, string, string, string)) {
-			checkLegacyAdoptionRoot(cfg, add)
+			checkLegacyAdoptionRoot(context.Background(), cfg, nil, add)
 		}); len(checks) != 0 {
 			t.Fatalf("checks = %#v, want none for a dotfile-only legacy root", checks)
 		}
@@ -212,9 +217,70 @@ func TestCheckLegacyAdoptionRootIsSilentWhenThereIsNothingToSay(t *testing.T) {
 		}
 		cfg := config.Config{DataDir: data, Browser: config.Browser{AdoptionRoot: legacy}}
 		if checks := collectChecks(t, func(add func(string, string, string, string)) {
-			checkLegacyAdoptionRoot(cfg, add)
+			checkLegacyAdoptionRoot(context.Background(), cfg, nil, add)
 		}); len(checks) != 0 {
 			t.Fatalf("checks = %#v, want none when the legacy root is still the configured one", checks)
 		}
 	})
+}
+
+// TestCheckLegacyAdoptionRootCancelledJobNeverDrains pins that a legacy landing
+// directory for a cancelled job with an unadopted file is not promised ongoing
+// drain — papio deliberately keeps the only copy on disk and names a real
+// recovery path instead.
+func TestCheckLegacyAdoptionRootCancelledJobNeverDrains(t *testing.T) {
+	adoptionHome(t)
+	ctx := context.Background()
+	data := storetest.DataDir(t)
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	cfg := config.Config{DataDir: data}
+	legacy := cfg.LegacyAdoptionRoot()
+	jobID := "job_00000000000000000000000099"
+	title := "Cancelled Legacy Drain Fixture Paper"
+	now := store.Now()
+	if _, err := db.DB().ExecContext(ctx, `INSERT INTO work_requests(id, created_at, title) VALUES(?, ?, ?)`,
+		"req-legacy-cancelled", now, title); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		jobID, "req-legacy-cancelled", "cancelled", `{}`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(legacy, jobID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, jobID, "paper.pdf"), []byte("%PDF-1.4"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	checks := collectChecks(t, func(add func(string, string, string, string)) {
+		checkLegacyAdoptionRoot(ctx, cfg, db, add)
+	})
+	if len(checks) != 1 {
+		t.Fatalf("checks = %#v, want exactly one legacy check", checks)
+	}
+	c := checks[0]
+	if c.Name != "adoption_root_legacy" || c.Status != Warn {
+		t.Fatalf("check = %#v, want a Warn adoption_root_legacy check", c)
+	}
+	if strings.Contains(c.Detail, "still adopts settled files") {
+		t.Fatalf("detail = %q, must not promise drain for a cancelled job", c.Detail)
+	}
+	if !strings.Contains(c.Detail, "will not drain on its own") {
+		t.Fatalf("detail = %q, want the never-drains wording", c.Detail)
+	}
+	if !strings.Contains(c.Detail, title) {
+		t.Fatalf("detail = %q, want the paper title %q", c.Detail, title)
+	}
+	if !strings.Contains(c.Remediation, "Send PDF to papio") {
+		t.Fatalf("remediation = %q, want the extension Send PDF recovery path", c.Remediation)
+	}
+	if !strings.Contains(c.Remediation, "Acquire this page") {
+		t.Fatalf("remediation = %q, want the re-acquire recovery path", c.Remediation)
+	}
 }

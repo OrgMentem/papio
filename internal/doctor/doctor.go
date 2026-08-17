@@ -102,7 +102,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		add("data_dir", Pass, "private writable data directory", "")
 	}
 	checkAdoptionRoot(cfg, add)
-	checkLegacyAdoptionRoot(cfg, add)
+	checkLegacyAdoptionRoot(ctx, cfg, db, add)
 	checkCreditSpend(ctx, cfg, db, add)
 	checkLegacyCandidateBind(ctx, db, add)
 	if cfg.Path != "" {
@@ -577,7 +577,7 @@ func checkAdoptionRoot(cfg config.Config, add func(string, string, string, strin
 // theirs to remove. It counts landing directories rather than raw entries: a
 // stray .DS_Store must not produce a permanent warning about files that are
 // not there.
-func checkLegacyAdoptionRoot(cfg config.Config, add func(string, string, string, string)) {
+func checkLegacyAdoptionRoot(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string)) {
 	legacy := cfg.LegacyAdoptionRoot()
 	if legacy == "" {
 		return
@@ -586,20 +586,102 @@ func checkLegacyAdoptionRoot(cfg config.Config, add func(string, string, string,
 	if err != nil {
 		return // absent or unreadable: nothing actionable to say here
 	}
-	landing := 0
+	var landingDirs []string
 	for _, e := range entries {
 		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			landing++
+			landingDirs = append(landingDirs, e.Name())
 		}
 	}
-	if landing == 0 {
+	if len(landingDirs) == 0 {
 		return
 	}
-	add("adoption_root_legacy", Warn,
-		fmt.Sprintf("%s still holds %d job director%s from the superseded adoption root; papio still adopts settled files from it but never writes to it",
-			legacy, landing, plural(landing, "y", "ies")),
-		fmt.Sprintf("no action is required \u2014 new downloads land in %s. Once nothing there is still wanted, delete %s yourself; papio will not remove a download it cannot prove is already in the artifact store",
-			cfg.EffectiveAdoptionRoot(), legacy))
+
+	var stalled []legacyStalledLanding
+	if db != nil {
+		jobs := &job.Store{S: db}
+		for _, jobID := range landingDirs {
+			row, err := jobs.Get(ctx, jobID)
+			if err != nil {
+				continue
+			}
+			if row.State != job.StateCancelled || row.ArtifactSHA256 != "" {
+				continue
+			}
+			if !legacyLandingHoldsFile(filepath.Join(legacy, jobID)) {
+				continue
+			}
+			stalled = append(stalled, legacyStalledLanding{jobID: jobID, title: row.Work.Title})
+		}
+	}
+
+	landing := len(landingDirs)
+	stalledCount := len(stalled)
+	draining := landing - stalledCount
+	effective := cfg.EffectiveAdoptionRoot()
+
+	switch {
+	case stalledCount == 0:
+		add("adoption_root_legacy", Warn,
+			fmt.Sprintf("%s still holds %d job director%s from the superseded adoption root; papio still adopts settled files from it but never writes to it",
+				legacy, landing, plural(landing, "y", "ies")),
+			fmt.Sprintf("no action is required \u2014 new downloads land in %s. Once nothing there is still wanted, delete %s yourself; papio will not remove a download it cannot prove is already in the artifact store",
+				effective, legacy))
+	case draining == 0:
+		add("adoption_root_legacy", Warn,
+			fmt.Sprintf("%s still holds %d job director%s from the superseded adoption root; %s papio will not drain on its own (%s)",
+				legacy, landing, plural(landing, "y", "ies"),
+				legacyStalledDetail(stalledCount),
+				legacyStalledTitles(stalled)),
+			legacyStalledRemediation(legacy))
+	default:
+		add("adoption_root_legacy", Warn,
+			fmt.Sprintf("%s still holds %d job director%s from the superseded adoption root; papio still adopts settled files from the other %d but %s papio will not drain on its own (%s)",
+				legacy, landing, plural(landing, "y", "ies"), draining,
+				legacyStalledDetail(stalledCount),
+				legacyStalledTitles(stalled)),
+			fmt.Sprintf("no action is required for the directories papio still drains \u2014 new downloads land in %s. %s",
+				effective, legacyStalledRemediation(legacy)))
+	}
+}
+
+type legacyStalledLanding struct {
+	jobID string
+	title string
+}
+
+func legacyLandingHoldsFile(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func legacyStalledDetail(count int) string {
+	return fmt.Sprintf("%d %s for cancelled jobs whose files",
+		count, plural(count, "directory is", "directories are"))
+}
+
+func legacyStalledTitles(stalled []legacyStalledLanding) string {
+	parts := make([]string, 0, len(stalled))
+	for _, s := range stalled {
+		if strings.TrimSpace(s.title) != "" {
+			parts = append(parts, fmt.Sprintf("%q", s.title))
+			continue
+		}
+		parts = append(parts, s.jobID)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func legacyStalledRemediation(legacy string) string {
+	return fmt.Sprintf("open each PDF in your browser and choose Send PDF to papio in the extension popup, or re-acquire the work with Acquire this page on the provider page \u2014 papio will not delete the only copy of a download for a cancelled job that never reached the artifact store (files remain under %s)", legacy)
 }
 
 // supersededCandidateBindRules lists the automatic-matching rule versions

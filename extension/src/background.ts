@@ -328,6 +328,14 @@ const MATERIALIZATION_RESPONSE_TYPES: Record<string, true> = {
   institutional_reconcile_response: true,
 };
 const PDF_GRAB_CORRELATION_STORAGE_KEY = "papio_pdf_grab_correlations_v1";
+/** States this worker writes into a live correlation record. Anything else in
+ * storage is stale or hostile and must be dropped — repairing it could steer
+ * bytes into a grab this session no longer owns. */
+const PDF_GRAB_CORRELATION_STATES = new Set<string>([
+  "awaiting_viewer",
+  "grabbed",
+  "identifying",
+]);
 /** ADR-0019 Decision 2: kept separate from acquisition/adapter host grants. */
 const PAGE_BULK_ALLOWLIST_KEY = "papio_scanner_allowlist_v1";
 const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
@@ -4660,9 +4668,20 @@ export class Bridge {
       for (const [grabID, correlation] of Object.entries(correlations)) {
         if (
           typeof correlation.scanID !== "string" ||
-          typeof correlation.tabID !== "number" ||
-          typeof correlation.state !== "string" ||
-          typeof correlation.steeringPath !== "string"
+          !Number.isSafeInteger(correlation.tabID) ||
+          correlation.tabID < 1 ||
+          typeof correlation.steeringPath !== "string" ||
+          correlation.steeringPath === "" ||
+          isURLLike(correlation.steeringPath) ||
+          !PDF_GRAB_CORRELATION_STATES.has(correlation.state) ||
+          (correlation.abandonPending !== undefined &&
+            typeof correlation.abandonPending !== "boolean") ||
+          (correlation.downloadID !== undefined &&
+            !isPositiveSafeInteger(correlation.downloadID)) ||
+          (correlation.effectRequestID !== undefined &&
+            (typeof correlation.effectRequestID !== "string" ||
+              correlation.effectRequestID === "" ||
+              isURLLike(correlation.effectRequestID)))
         ) {
           continue;
         }
@@ -4673,18 +4692,27 @@ export class Bridge {
         // time MV3 recycled the worker — which it does within seconds of going
         // idle.
         const legacy = correlation as PdfGrabCorrelation & { url?: string };
-        // A build before the route change persisted the full delivery URL,
-        // signing token and all. Convert it rather than dropping the record:
-        // the daemon-side capture is still armed and still holds its permit, so
-        // discarding the correlation would strand it exactly as an orphan. The
-        // route keeps the steering working and the token is left behind.
-        const route =
-          typeof legacy.route === "string"
-            ? legacy.route
-            : typeof legacy.url === "string"
-              ? downloadRoute(legacy.url)
-              : undefined;
-        const started = typeof correlation.downloadID === "number";
+        let route: string | undefined;
+        if (typeof legacy.route === "string") {
+          // `isDownloadRoute` is the whole test: a route equals its own
+          // origin-and-path reduction, so a query, a fragment, credentials or a
+          // non-web scheme all fail it. Do NOT also reject URL-shaped values —
+          // a route IS an origin and a path, so that would drop every armed
+          // capture at hydration, exactly when an awaiting-viewer grab depends
+          // on surviving the worker death that precedes the researcher's click.
+          if (!isDownloadRoute(legacy.route)) {
+            continue;
+          }
+          route = legacy.route;
+        } else if (typeof legacy.url === "string") {
+          // A build before the route change persisted the full delivery URL,
+          // signing token and all. Convert it rather than dropping the record:
+          // the daemon-side capture is still armed and still holds its permit, so
+          // discarding the correlation would strand it exactly as an orphan. The
+          // route keeps the steering working and the token is left behind.
+          route = downloadRoute(legacy.url);
+        }
+        const started = correlation.downloadID !== undefined;
         const armed =
           correlation.downloadID === undefined &&
           route !== undefined &&
@@ -8371,6 +8399,35 @@ export class Bridge {
       ...(detail !== undefined ? { detail } : {}),
     }).catch(() => {});
   }
+  /** Drop armed-route steering for a grab that is over. The correlation record
+   * may already be gone; the route and track url are what keep matching later
+   * downloads after terminal settlement. */
+  private evictPdfGrabRouteSteering(
+    grabID: string,
+    correlation?: PdfGrabCorrelation,
+  ): void {
+    const record = correlation ?? this.pdfGrabCorrelations.get(grabID);
+    const route = record?.route;
+    if (route !== undefined) {
+      const pending = this.pendingGrabDownloadURLs.get(route);
+      if (pending?.grabID === grabID) {
+        this.pendingGrabDownloadURLs.delete(route);
+      }
+    }
+    const track = this.grabDownloads.get(grabID);
+    if (track !== undefined) {
+      const trackRoute = isDownloadRoute(track.url)
+        ? track.url
+        : downloadRoute(track.url);
+      if (trackRoute !== undefined) {
+        const pending = this.pendingGrabDownloadURLs.get(trackRoute);
+        if (pending?.grabID === grabID) {
+          this.pendingGrabDownloadURLs.delete(trackRoute);
+        }
+      }
+    }
+  }
+
   private persistPdfGrabCorrelations(): void {
     if (this.deps.pdfGrabCorrelations === undefined) return;
     void this.deps.pdfGrabCorrelations
@@ -8469,6 +8526,7 @@ export class Bridge {
         "The PDF grab download was interrupted",
       );
     }
+    this.evictPdfGrabRouteSteering(grabID, correlation);
     this.grabDownloads.delete(grabID);
     this.pdfGrabCorrelations.delete(grabID);
     this.persistPdfGrabCorrelations();
@@ -8603,6 +8661,7 @@ export class Bridge {
               "grab_unresumable",
               "papio is still finishing an earlier attempt for this tab — reopen the PDF from the article page and try again",
             );
+          this.evictPdfGrabRouteSteering(grabID);
           // Retry outside this effect lease: re-claiming the same governor key
           // from inside it would only answer `effect_busy`. `orphan_cleared` is
           // internal and never reaches a researcher.
@@ -8758,6 +8817,8 @@ export class Bridge {
         try {
           await this.abandonPdfGrab(grabID, effectRequestID);
         } catch {}
+        const failedCorrelation = this.pdfGrabCorrelations.get(grabID);
+        this.evictPdfGrabRouteSteering(grabID, failedCorrelation);
         this.grabDownloads.delete(grabID);
         this.pdfGrabCorrelations.delete(grabID);
         this.persistPdfGrabCorrelations();
@@ -9698,7 +9759,7 @@ export class Bridge {
     }
     return matched;
   }
-  private pendingGrabFor(item: DownloadItemLike): PdfGrabTrack | undefined {
+  private pendingGrabIDFor(item: DownloadItemLike): string | undefined {
     const observed = [item.url, item.finalUrl].filter(
       (value): value is string => typeof value === "string",
     );
@@ -9708,12 +9769,16 @@ export class Bridge {
           (url) => url === pendingURL || sameDownloadRoute(url, pendingURL),
         )
       ) {
-        return this.grabDownloads.get(pending.grabID);
+        return pending.grabID;
       }
     }
     return undefined;
   }
-
+  private pendingGrabFor(item: DownloadItemLike): PdfGrabTrack | undefined {
+    const grabID = this.pendingGrabIDFor(item);
+    if (grabID === undefined) return undefined;
+    return this.grabDownloads.get(grabID);
+  }
   private trackedGrabFor(downloadID: number): string | undefined {
     for (const [grabID, track] of this.grabDownloads) {
       if (track.ids.has(downloadID)) return grabID;
@@ -11851,6 +11916,7 @@ export class Bridge {
               ? "abandoned"
               : "failed";
     this.notifyPdfGrab(correlation.scanID, grabID, terminal, detail);
+    this.evictPdfGrabRouteSteering(grabID, persisted);
     this.grabDownloads.delete(grabID);
     this.pdfGrabCorrelations.delete(grabID);
     this.persistPdfGrabCorrelations();
@@ -16315,7 +16381,11 @@ export class Bridge {
       const pendingGrab = this.pendingGrabFor(item);
       if (pendingGrab !== undefined) {
         pendingGrab.ids.add(item.id);
-        this.grabDownloads.set(this.trackedGrabFor(item.id) ?? "", pendingGrab);
+        const grabID =
+          this.trackedGrabFor(item.id) ?? this.pendingGrabIDFor(item);
+        if (grabID !== undefined) {
+          this.grabDownloads.set(grabID, pendingGrab);
+        }
         return;
       }
     }

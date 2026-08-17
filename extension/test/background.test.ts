@@ -4816,16 +4816,10 @@ test("a correlated download is steered into papio/<job_id>/; unrelated untouched
   expect(suggestions.length).toBe(1);
 });
 
-test("a signed PDF URL is never refetched; the viewer's own download completes the grab", async () => {
-  // Observed live on watermark02.silverchair.com. A handoff tab opened for one
-  // paper was reused to read another, and the signed URL's token had expired,
-  // so refetching it returned "Your session has timed out." from the provider.
-  // Three behaviours have to compose for the researcher to get anywhere:
-  //   1. papio must not attempt the doomed fetch, and must say what does work;
-  //   2. it must not report "sending" for a download it never started;
-  //   3. the viewer's Download button must land in the GRAB directory, not in
-  //      the directory of the job the tab happens to be correlated with.
-  const h = makeHarness();
+/** Live Silverchair watermark delivery: bearer-grade `token` query (~850 chars). */
+const SILVERCHAIR_SIGNED_HOST = "watermark02.silverchair.com";
+
+async function helloPdfGrabCapable(h: Harness): Promise<void> {
   await h.bridge.start();
   await h.port.inbound(
     helloAck({
@@ -4833,12 +4827,37 @@ test("a signed PDF URL is never refetched; the viewer's own download completes t
       features: ["pdf_grab_v1", "effect_permit_v1"],
     }),
   );
-  await h.port.inbound(jobOffer("job_0009_stale_tab"));
-  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+}
 
-  // A real signing token, in length and shape: short values are page
-  // parameters and must keep taking the ordinary fetch path.
-  const pdfURL = `https://watermark.example.com/paper.pdf?token=${"a".repeat(852)}`;
+function silverchairSignedPDFURL(
+  pathname = "/paper.pdf",
+  tokenChar = "a",
+): string {
+  return `https://${SILVERCHAIR_SIGNED_HOST}${pathname}?token=${tokenChar.repeat(852)}`;
+}
+
+async function armSignedViewerGrab(
+  h: Harness,
+  opts?: {
+    tabID?: number;
+    pathname?: string;
+    grabID?: string;
+    steeringPath?: string;
+    tokenChar?: string;
+  },
+): Promise<{
+  tabID: number;
+  pdfURL: string;
+  route: string;
+  grabID: string;
+  steeringPath: string;
+}> {
+  const tabID = opts?.tabID ?? 81;
+  const pathname = opts?.pathname ?? "/paper.pdf";
+  const grabID = opts?.grabID ?? "grab-signed-comp";
+  const steeringPath = opts?.steeringPath ?? "papio/grabs/signedcomp/";
+  const pdfURL = silverchairSignedPDFURL(pathname, opts?.tokenChar ?? "a");
+  const route = `https://${SILVERCHAIR_SIGNED_HOST}${pathname}`;
   h.tabs.seed({ id: tabID, url: pdfURL });
   const reply = h.bridge.requestPdfGrab({ tab_id: tabID, url: pdfURL });
   const requestFrame = await h.port.waitForFrame("pdf_grab_request");
@@ -4846,33 +4865,138 @@ test("a signed PDF URL is never refetched; the viewer's own download completes t
     nativeResult("pdf_grab_result", {
       request_id: requestFrame.payload["request_id"] as string,
       outcome: "steering",
-      grab_id: "grab-stale-tab-01",
-      steering_path: "papio/grabs/stalepath/",
+      grab_id: grabID,
+      steering_path: steeringPath,
     }),
   );
   await expect(reply).resolves.toMatchObject({
     ok: true,
     awaiting_viewer: true,
   });
-  // Nothing was fetched: the grant belongs to the session that minted it.
-  expect(h.downloads.started).toEqual([]);
+  return { tabID, pdfURL, route, grabID, steeringPath };
+}
 
-  // The researcher presses the viewer's Download button. papio did not start
-  // this download, and the tab still correlates to the offered job.
-  const suggestions: { filename: string; conflictAction: string }[] = [];
-  await h.downloads.onDeterminingFilename.emit(
-    {
-      id: 77,
-      tabId: tabID,
+describe("single-use signed delivery URL composition", () => {
+  test("an armed grab starts no download and replies awaiting_viewer", async () => {
+    // Removing `requiresNativeViewerDownload` → `downloads.download` on Send PDF
+    // would break this: a doomed refetch of the one-time link.
+    const h = makeHarness();
+    await helloPdfGrabCapable(h);
+    const armed = await armSignedViewerGrab(h, {
+      grabID: "grab-no-fetch",
+      steeringPath: "papio/grabs/nofetch01/",
+    });
+    expect(h.downloads.started).toEqual([]);
+    const correlation = h.pdfGrabCorrelations.current[armed.grabID];
+    expect(correlation).toMatchObject({
+      state: "awaiting_viewer",
+      route: armed.route,
+    });
+    // No download id at all — papio started nothing, so there is nothing to
+    // carry one. An id here would mean the doomed refetch had run.
+    expect(correlation).not.toHaveProperty("downloadID");
+  });
+
+  test("the researcher's own download is steered into the armed grab on the same route", async () => {
+    // Removing `onDeterminingFilename` grab steering (pendingGrabFor) would
+    // break this: the viewer click would not land in the grab directory.
+    const h = makeHarness();
+    await helloPdfGrabCapable(h);
+    const armed = await armSignedViewerGrab(h, {
+      grabID: "grab-same-route",
+      steeringPath: "papio/grabs/sameroute/",
+    });
+    const suggestions: { filename: string; conflictAction: string }[] = [];
+    await h.downloads.onDeterminingFilename.emit(
+      {
+        id: 881,
+        tabId: armed.tabID,
+        url: armed.pdfURL,
+        filename: "paper.pdf",
+        state: "in_progress",
+      },
+      (s) => suggestions.push(s),
+    );
+    expect(suggestions).toEqual([
+      {
+        filename: `${armed.steeringPath}paper.pdf`,
+        conflictAction: "uniquify",
+      },
+    ]);
+  });
+
+  test("a download on a different route is not claimed by the armed grab", async () => {
+    // Removing route-keyed `pendingGrabDownloadURLs` matching would break this:
+    // every signed URL on the host would steer into one grab.
+    const h = makeHarness();
+    await helloPdfGrabCapable(h);
+    const armed = await armSignedViewerGrab(h, {
+      pathname: "/paper-a.pdf",
+      grabID: "grab-route-a",
+      steeringPath: "papio/grabs/routea001/",
+      tokenChar: "a",
+    });
+    const otherURL = silverchairSignedPDFURL("/paper-b.pdf", "b");
+    expect(
+      await suggestFilenameFor(h, {
+        id: 882,
+        tabId: armed.tabID,
+        url: otherURL,
+        filename: "paper-b.pdf",
+        state: "in_progress",
+      }),
+    ).toEqual([]);
+  });
+
+  test("an awaiting-viewer grab survives worker death and remains steerable after hydration", async () => {
+    // Removing hydration `reconcilePdfGrabCorrelations` re-registration would
+    // break this: MV3 recycles the worker before the researcher's click.
+    const first = makeHarness();
+    await helloPdfGrabCapable(first);
+    const armed = await armSignedViewerGrab(first, {
+      grabID: "grab-sw-hydrate",
+      steeringPath: "papio/grabs/swhydrate/",
+    });
+    const persisted = JSON.parse(
+      JSON.stringify(first.pdfGrabCorrelations.current),
+    ) as Record<string, PdfGrabCorrelation>;
+
+    const restarted = makeHarness();
+    restarted.pdfGrabCorrelations.current = persisted;
+    await helloPdfGrabCapable(restarted);
+    expect(restarted.pdfGrabCorrelations.current[armed.grabID]).toMatchObject({
+      state: "awaiting_viewer",
+      route: armed.route,
+    });
+    expect(
+      await suggestFilenameFor(restarted, {
+        id: 883,
+        tabId: armed.tabID,
+        url: armed.pdfURL,
+        filename: "paper.pdf",
+        state: "in_progress",
+      }),
+    ).toEqual([`${armed.steeringPath}paper.pdf`]);
+  });
+
+  test("Firefox declines a signed link without promising to file the download", async () => {
+    // Removing the Firefox `requiresNativeViewerDownload` refusal in
+    // `startPDFDelivery` would break this: the old copy promised filing.
+    const h = makeHarness(undefined, { firefox: true });
+    await helloPdfGrabCapable(h);
+    const pdfURL = silverchairSignedPDFURL();
+    h.tabs.seed({ id: 90, url: pdfURL });
+    const reply = await h.bridge.startPDFDelivery({
+      tab_id: 90,
       url: pdfURL,
-      filename: "paper.pdf",
-      state: "in_progress",
-    },
-    (s) => suggestions.push(s),
-  );
-  expect(suggestions).toEqual([
-    { filename: "papio/grabs/stalepath/paper.pdf", conflictAction: "uniquify" },
-  ]);
+    });
+    expect(reply.ok).toBe(false);
+    const message = reply.ok ? "" : reply.error.message;
+    expect(message).toMatch(/Chrome/);
+    expect(message).not.toMatch(/papio will file/i);
+    expect(h.downloads.started).toEqual([]);
+    expect(h.frames().some((f) => f.type === "pdf_grab_request")).toBe(false);
+  });
 });
 
 test("a download interrupted before its id is known settles the grab instead of stalling", async () => {
