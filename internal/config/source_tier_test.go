@@ -1,7 +1,11 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 package config
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 // minimalConfig is the loadable prefix each tier case appends its own
 // [sources.openaire] table to.
@@ -99,5 +103,48 @@ func TestHasClientCredentialsRequiresBothHalves(t *testing.T) {
 		if got := test.source.HasClientCredentials(); got != test.want {
 			t.Errorf("HasClientCredentials(%+v) = %v, want %v", test.source, got, test.want)
 		}
+	}
+}
+
+func TestDerivedPacingIsNeverPersisted(t *testing.T) {
+	// Save marshals Sources. If the derivation wrote into that map, the
+	// authenticated rate would be written back as an EXPLICIT operator
+	// setting — and would then survive the credential being removed, leaving
+	// papio pacing an unauthenticated tier at 120x its allowance. The
+	// derivation must therefore be an accessor, not stored state.
+	path := writeConfig(t, minimalConfig+"[sources.openaire]\nclient_id = \"svc\"\nclient_secret = \"shh\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.SourcePolicy(SourceOpenAIRE).RatePerSec; got != OpenAIREAuthenticatedRatePerSec {
+		t.Fatalf("effective rate = %v, want the authenticated tier", got)
+	}
+	if got := cfg.Sources[SourceOpenAIRE].RatePerSec; got != OpenAIREKeylessRatePerSec {
+		t.Fatalf("stored rate = %v, want the config's own %v", got, OpenAIREKeylessRatePerSec)
+	}
+
+	if err := Save(cfg, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	// Reload with the credentials removed, exactly as an operator would after
+	// revoking a service: pacing must fall back to the keyless ceiling.
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripped := strings.ReplaceAll(string(saved), "client_id = 'svc'", "")
+	stripped = strings.ReplaceAll(stripped, "client_secret = 'shh'", "")
+	stripped = strings.ReplaceAll(stripped, `client_id = "svc"`, "")
+	stripped = strings.ReplaceAll(stripped, `client_secret = "shh"`, "")
+	if err := os.WriteFile(path, []byte(stripped), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := reloaded.SourcePolicy(SourceOpenAIRE).RatePerSec; got != OpenAIREKeylessRatePerSec {
+		t.Fatalf("rate after removing credentials = %v, want the keyless %v", got, OpenAIREKeylessRatePerSec)
 	}
 }

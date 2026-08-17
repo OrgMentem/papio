@@ -654,16 +654,21 @@ const (
 	OpenAIREAuthenticatedBurst = 5
 )
 
-// applySourceTiers raises pacing that is still at a tier's shipped default when
-// the configured credentials move the source to a higher tier. Without this a
-// registered-service credential would authenticate correctly and change
-// nothing observable, because rate_per_sec would still be metering out the
-// keyless allowance — two knobs for one intent. An operator who sets any other
-// rate keeps it: only the untouched default is derived.
-func applySourceTiers(sources map[string]Source) {
-	s, ok := sources[SourceOpenAIRE]
-	if !ok || !s.HasClientCredentials() {
-		return
+// effectiveSourceTier raises pacing that is still at a tier's shipped default
+// when the configured credentials move the source to a higher tier. Without it a
+// registered-service credential would authenticate correctly and change nothing
+// observable, because rate_per_sec would still be metering out the keyless
+// allowance — two knobs for one intent. An operator who sets any other rate
+// keeps it: only the untouched default is derived.
+//
+// It is a pure function of one Source and never writes to Config.Sources, so the
+// derived rate cannot be persisted by Save. Only client credentials promote the
+// tier: a personal access token also raises OpenAIRE's ceiling, but expires an
+// hour after issue, and pacing to the authenticated ceiling on a credential that
+// can vanish mid-hour leaves papio at 120x what a keyless caller may do.
+func effectiveSourceTier(name string, s Source) Source {
+	if name != SourceOpenAIRE || !s.HasClientCredentials() {
+		return s
 	}
 	if s.RatePerSec == OpenAIREKeylessRatePerSec {
 		s.RatePerSec = OpenAIREAuthenticatedRatePerSec
@@ -671,7 +676,7 @@ func applySourceTiers(sources map[string]Source) {
 	if s.Burst <= 1 {
 		s.Burst = OpenAIREAuthenticatedBurst
 	}
-	sources[SourceOpenAIRE] = s
+	return s
 }
 
 // ErrAccessModeUnset is returned by RequireAccessMode until first-run setup.
@@ -712,7 +717,6 @@ func Load(path string) (Config, error) {
 	if err := cfg.validate(); err != nil {
 		return cfg, fmt.Errorf("config %s: %w", path, err)
 	}
-	applySourceTiers(cfg.Sources)
 	for name := range removedSourceNames {
 		delete(cfg.Sources, name)
 	}
@@ -1334,8 +1338,13 @@ func (c *Config) FetchTimeout() time.Duration {
 }
 
 // SourcePolicy returns the effective source policy (zero value when absent).
+// Pacing is derived here rather than stored, because Save marshals Sources:
+// writing a derived rate back into config.toml would turn it into an explicit
+// operator setting that outlives the credential that justified it, and removing
+// the credential would then leave papio pacing an unauthenticated tier at 120x
+// its allowance.
 func (c *Config) SourcePolicy(name string) Source {
-	return c.Sources[name]
+	return effectiveSourceTier(name, c.Sources[name])
 }
 
 // InstitutionFor returns the institutional-access identity for a resolver
