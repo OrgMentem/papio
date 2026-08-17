@@ -4909,9 +4909,13 @@ test("a download interrupted before its id is known settles the grab instead of 
   );
 
   // The daemon is told, so it can settle the permit on definite evidence
-  // rather than being left to guess whether the fetch happened.
+  // rather than being left to guess whether the fetch happened — and it is told
+  // under the *allocation's* request id. Cancellation is fenced on the id the
+  // daemon stored as `effect_request_id`, so a freshly minted correlation id is
+  // answered `conflict` and the capture keeps occupying the effect lane.
   const abandon = await h.port.waitForFrame("pdf_grab_abandon_request");
   expect(abandon.payload["grab_id"]).toBe("grab-dead-link-01");
+  expect(abandon.payload["request_id"]).toBe(frame.payload["request_id"]);
   await expect(reply).resolves.toMatchObject({ ok: false });
 });
 test("closing the tab before auth cancels; after auth (awaiting_download) does not", async () => {
@@ -5013,7 +5017,10 @@ test("an existing armed grab is resumed for the tab's current URL, never reporte
   expect(suggestions[0]?.filename).toBe("papio/grabs/existing01/paper.pdf");
 });
 
-test("an existing grab this browser cannot steer is refused, not called sent", async () => {
+test("an existing grab this browser cannot steer is cleared, and the retry allocates a fresh one", async () => {
+  // Session-scoped correlations do not survive an extension reload, so after one
+  // the daemon still answers `existing` for a grab nothing can steer into. It
+  // would otherwise hold the tab for the daemon's six-hour stale bound.
   const h = makeHarness();
   await h.bridge.start();
   await h.port.inbound(
@@ -5022,11 +5029,9 @@ test("an existing grab this browser cannot steer is refused, not called sent", a
       features: ["pdf_grab_v1", "effect_permit_v1"],
     }),
   );
-  h.tabs.seed({ id: 72, url: "https://provider.example.edu/x.pdf" });
-  const reply = h.bridge.requestPdfGrab({
-    tab_id: 72,
-    url: "https://provider.example.edu/x.pdf",
-  });
+  const signed = `https://watermark02.silverchair.com/orphan.pdf?token=${"q".repeat(120)}`;
+  h.tabs.seed({ id: 72, url: signed });
+  const reply = h.bridge.requestPdfGrab({ tab_id: 72, url: signed });
   const frame = await h.port.waitForFrame("pdf_grab_request");
   await h.port.inbound(
     nativeResult("pdf_grab_result", {
@@ -5043,7 +5048,33 @@ test("an existing grab this browser cannot steer is refused, not called sent", a
       state: "awaiting_file",
     }),
   );
-  await expect(reply).resolves.toMatchObject({ ok: false });
+  const abandonFrame = await h.port.waitForFrame("pdf_grab_abandon_request");
+  expect(abandonFrame.payload["grab_id"]).toBe("grab-orphan-01");
+  await h.port.inbound(
+    nativeResult("pdf_grab_abandon_result", {
+      request_id: abandonFrame.payload["request_id"] as string,
+      grab_id: "grab-orphan-01",
+      state: "abandoned",
+      outcome: "abandoned",
+    }),
+  );
+
+  // One retry, and only one: the fresh allocation is armed for the viewer.
+  const seen = h.port.posted.length;
+  const retryFrame = await h.port.waitForFrame("pdf_grab_request", seen - 1);
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: retryFrame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-orphan-02",
+      steering_path: "papio/grabs/orphan02/",
+    }),
+  );
+  await expect(reply).resolves.toMatchObject({
+    ok: true,
+    grab_id: "grab-orphan-02",
+    awaiting_viewer: true,
+  });
 });
 test("restart recovery re-hellos and does not duplicate a live tab", async () => {
   const seed: StoreShape = {

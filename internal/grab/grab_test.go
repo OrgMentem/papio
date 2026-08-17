@@ -341,6 +341,51 @@ func TestMarkAbandonedSettlesPermit(t *testing.T) {
 	}
 }
 
+// The two fenced abandon paths must be complementary, not overlapping: a
+// capture still occupying its permit may only be retired by the request
+// identity that allocated it, and a capture whose permit is already settled
+// may be retired on the grab id alone because nothing is in flight. Without
+// the second, an armed capture whose browser generation is gone holds its tab
+// unsendable until AbandonStaleAwaiting's cutoff, hours later.
+func TestMarkAbandonedUnoccupiedRequiresSettledPermit(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	svc := New(s, nil)
+	g, err := svc.AllocateEffect(ctx, "pdf.example.org", "Paper", 7, "pdf_grab:pdf.example.org", time.Now().Add(time.Hour), nil, "req-unoccupied-1")
+	if err != nil {
+		t.Fatalf("AllocateEffect: %v", err)
+	}
+	// Held permit: occupancy is live, so this path must refuse.
+	if err := svc.MarkAbandonedUnoccupied(ctx, g.ID, "interrupted"); err == nil {
+		t.Fatal("MarkAbandonedUnoccupied succeeded while the permit was held")
+	}
+	if got, _ := svc.Get(ctx, g.ID); got.State != StateAwaitingFile {
+		t.Fatalf("state = %q, want awaiting_file", got.State)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE effect_permits SET status='settled' WHERE grab_id=?`, g.ID); err != nil {
+		t.Fatalf("settle permit: %v", err)
+	}
+	// The occupancy-releasing path is now the one that must refuse: there is no
+	// occupancy left for it to release, even with the right request identity.
+	if err := svc.MarkAbandonedForRequest(ctx, g.ID, "req-unoccupied-1", 7, "interrupted"); err == nil {
+		t.Fatal("MarkAbandonedForRequest succeeded with a settled permit")
+	}
+	if err := svc.MarkAbandonedUnoccupied(ctx, g.ID, "interrupted"); err != nil {
+		t.Fatalf("MarkAbandonedUnoccupied: %v", err)
+	}
+	got, _ := svc.Get(ctx, g.ID)
+	if got.State != StateAbandoned {
+		t.Fatalf("state = %q, want abandoned", got.State)
+	}
+	if got.Outcome != "abandoned" {
+		t.Fatalf("outcome = %q, want abandoned", got.Outcome)
+	}
+}
+
 func TestMarkAbandonedLegacyNoPermit(t *testing.T) {
 	ctx := context.Background()
 	s, err := store.Open(ctx, storetest.DataDir(t))

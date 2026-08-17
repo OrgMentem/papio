@@ -5124,8 +5124,7 @@ func (b *Bridge) pdfGrabAbandon(ctx context.Context, request *protocol.PdfGrabAb
 // it. The admission test is the same capability check the grab path uses —
 // holdership is irrelevant here too — and the originator fence lives where it
 // belongs, in MarkAbandonedForRequest: only the effect request id that
-// allocated this grab, in this epoch, can settle it. That scoping is a
-// per-grab fact, not a claim on the bridge, and it stays.
+// allocated a capture may release its occupancy.
 func (b *Bridge) pdfGrabAbandonSession(ctx context.Context, sessionID string, request *protocol.PdfGrabAbandonRequestPayload) ([]json.RawMessage, error) {
 	if b.pdfGrabRefusalReason(sessionID) != "" {
 		// "unavailable", not "conflict": a conflict names a durable grab
@@ -5144,9 +5143,19 @@ func (b *Bridge) pdfGrabAbandonSession(ctx context.Context, sessionID string, re
 		return []json.RawMessage{frame}, nil
 	}
 	return b.pdfGrabAbandonWith(ctx, request, request.RequestID, func() error {
-		return b.grabs.MarkAbandonedForRequest(ctx, request.GrabID, request.RequestID, b.epoch, "The PDF grab download was interrupted")
+		err := b.grabs.MarkAbandonedForRequest(ctx, request.GrabID, request.RequestID, b.epoch, "The PDF grab download was interrupted")
+		if err == nil {
+			return nil
+		}
+		// The fenced path deliberately covers only occupying captures, so a
+		// capture whose permit is already settled falls through to here with
+		// nothing in flight. Refusing it would leave the row — and every retry
+		// for that tab, allocation being idempotent per host — waiting on
+		// AbandonStaleAwaiting's cutoff hours later for no safety gain.
+		return b.grabs.MarkAbandonedUnoccupied(ctx, request.GrabID, "The PDF grab download was interrupted")
 	})
 }
+
 func (b *Bridge) pdfGrabAbandonWith(ctx context.Context, request *protocol.PdfGrabAbandonRequestPayload, expectedRequestID string, abandon func() error) ([]json.RawMessage, error) {
 	result := protocol.PdfGrabAbandonResultPayload{
 		RequestID: request.RequestID,

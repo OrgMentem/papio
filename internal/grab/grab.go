@@ -744,6 +744,41 @@ func (s *Service) MarkAbandonedForRequest(ctx context.Context, id, requestID str
 	return tx.Commit()
 }
 
+// MarkAbandonedUnoccupied retires an awaiting capture whose durable effect is
+// already settled, and is the exact complement of MarkAbandonedForRequest:
+// that path releases occupancy and therefore demands the originating request
+// identity, while this one requires that no occupying permit exists at all.
+// Nothing is in flight when the permit is settled — the browser generation
+// that armed the capture reported its outcome, or the permit was resolved
+// against evidence — so no effect can be lost by retiring the row, and a
+// caller holding only the grab id cannot use this to cancel live work.
+//
+// Without it the row survives until AbandonStaleAwaiting's cutoff hours
+// later, and the tab it belongs to cannot be re-sent for that whole window:
+// allocation is idempotent per host, so every retry answers "existing" for a
+// capture nobody can complete.
+func (s *Service) MarkAbandonedUnoccupied(ctx context.Context, id, detail string) error {
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `
+		UPDATE pdf_grabs SET state = ?, outcome = 'abandoned', detail = ?, updated_at = ?
+		WHERE id = ? AND state = ?
+		  AND NOT EXISTS (SELECT 1 FROM effect_permits
+		    WHERE grab_id=pdf_grabs.id AND effect_kind='pdf_grab'
+		      AND status IN ('held','unknown_completion'))`,
+		string(StateAbandoned), detail, store.Now(), id, string(StateAwaitingFile))
+	if err != nil {
+		return err
+	}
+	if err := requireOneRow(res, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // AbandonStaleAwaiting settles captures that lost their browser correlation,
 // except when an unresolved durable effect still makes completion unknown.
 func (s *Service) AbandonStaleAwaiting(ctx context.Context, cutoff time.Time) error {

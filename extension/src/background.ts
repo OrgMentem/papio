@@ -837,6 +837,10 @@ export interface PdfGrabCorrelation {
    * correlated to nothing. */
   url?: string;
   steeringPath: string;
+  /** The request id the daemon stored as this grab's `effect_request_id`. The
+   * cancellation fence compares against it, so a later worker generation of
+   * this same browser needs it to clean up its own interrupted grab. */
+  effectRequestID?: string;
   abandonPending?: boolean;
 }
 
@@ -8356,7 +8360,10 @@ export class Bridge {
     grabID: string,
     correlation: PdfGrabCorrelation,
   ): Promise<void> {
-    const result = await this.abandonPdfGrab(grabID);
+    const result = await this.abandonPdfGrab(
+      grabID,
+      correlation.effectRequestID,
+    );
     if (!result.ok) return;
     if (result.outcome === "conflict") {
       // The daemon still owns a live, conflicting state; report exactly it.
@@ -8395,6 +8402,10 @@ export class Bridge {
     this.persistPdfGrabCorrelations();
   }
 
+  /** A grab allocation, plus at most one retry after clearing a stale grab this
+   * browser can no longer steer. The retry is here rather than inside
+   * `attemptPdfGrab` because that method holds the effect governor for the
+   * duration, and re-entering it would answer `effect_busy`. */
   async requestPdfGrab(request: {
     tab_id: number;
     url?: string;
@@ -8402,6 +8413,21 @@ export class Bridge {
     workspace_tab_id?: number | undefined;
     scan_id?: string | undefined;
   }): Promise<BrokerReply<{ grab_id: string; awaiting_viewer?: boolean }>> {
+    const first = await this.attemptPdfGrab(request, false);
+    if (first.ok || first.error?.code !== "orphan_cleared") return first;
+    return this.attemptPdfGrab(request, true);
+  }
+
+  private async attemptPdfGrab(
+    request: {
+      tab_id: number;
+      url?: string;
+      title?: string | undefined;
+      workspace_tab_id?: number | undefined;
+      scan_id?: string | undefined;
+    },
+    retried: boolean,
+  ): Promise<BrokerReply<{ grab_id: string; awaiting_viewer?: boolean }>> {
     // The old single sentence named "Chrome download steering and a compatible
     // daemon" for three unrelated causes at once; each has its own remedy.
     if (!this.pdfGrabAvailable())
@@ -8434,6 +8460,12 @@ export class Bridge {
         "PDF grab will start when the current browser effect finishes",
       );
     }
+    // The daemon stores this id as the grab's `effect_request_id` and fences
+    // cancellation on it: a grab id alone must never release occupancy. So the
+    // id has to be minted here and retained, or no abandon this extension sends
+    // can ever match — every interruption report was answered `conflict` and
+    // the grab stayed occupying.
+    const effectRequestID = this.deps.randomUUID().replace(/-/g, "");
     try {
       const result = await this.requestNative(
         "pdf_grab_request",
@@ -8446,6 +8478,8 @@ export class Bridge {
         "pdf_grab_result",
         PDF_GRAB_FEATURE,
         true,
+        undefined,
+        effectRequestID,
       );
       if (result.kind !== "response" || result.payload === undefined)
         return this.nativeFailure(result);
@@ -8474,14 +8508,34 @@ export class Bridge {
         // them with a bare `ok` reported success for a grab that was waiting
         // for a download nobody was performing.
         const known = this.pdfGrabCorrelations.get(grabID);
-        if (known === undefined)
-          // Armed by a browser or a worker generation whose memory is gone, so
-          // its steering cannot be re-registered from here and any download
-          // would land outside the grab. The daemon's own bound retires it.
-          return failure(
-            "grab_unresumable",
-            "papio is already waiting for a file for this tab and can't resume it here — try again in a few minutes",
-          );
+        if (known === undefined) {
+          // Armed by a browser generation whose memory is gone: session-scoped
+          // correlations do not survive an extension reload, and only the
+          // browser that armed a grab can steer bytes into it. Reaching here at
+          // all means this session is the holder — a non-holder grab request is
+          // refused long before — so nothing live can be speaking for it. It
+          // would otherwise occupy this tab for the daemon's six-hour stale
+          // bound, which is the same permanently-unsendable paper as before,
+          // just quieter. Retire it on the evidence and allocate a fresh one.
+          if (retried)
+            return failure(
+              "grab_unresumable",
+              "papio can't start a new download for this tab yet — reopen the PDF from the article page and try again",
+            );
+          // `ok` alone is not clearance: the daemon answers a refused
+          // cancellation with `outcome: "conflict"` inside a successful reply,
+          // and retrying on that just repeats the same refusal.
+          const cleared = await this.abandonPdfGrab(grabID);
+          if (!cleared.ok || cleared.outcome !== "abandoned")
+            return failure(
+              "grab_unresumable",
+              "papio is still finishing an earlier attempt for this tab — reopen the PDF from the article page and try again",
+            );
+          // Retry outside this effect lease: re-claiming the same governor key
+          // from inside it would only answer `effect_busy`. `orphan_cleared` is
+          // internal and never reaches a researcher.
+          return failure("orphan_cleared", "the stale grab was cleared");
+        }
         if (known.downloadID !== undefined)
           // papio's own fetch is genuinely in flight; "sending" is true.
           return { ok: true, grab_id: grabID };
@@ -8557,6 +8611,7 @@ export class Bridge {
           state: "awaiting_viewer",
           url: requestURL,
           steeringPath,
+          effectRequestID,
         });
         this.persistPdfGrabCorrelations();
         return { ok: true, grab_id: grabID, awaiting_viewer: true };
@@ -8575,6 +8630,7 @@ export class Bridge {
           state: "grabbed",
           downloadID: id,
           steeringPath,
+          effectRequestID,
         });
         this.persistPdfGrabCorrelations();
         // Chrome can interrupt a download before `download()` resolves — an
@@ -8606,7 +8662,7 @@ export class Bridge {
         return { ok: true, grab_id: grabID };
       } catch {
         try {
-          await this.abandonPdfGrab(grabID);
+          await this.abandonPdfGrab(grabID, effectRequestID);
         } catch {}
         this.grabDownloads.delete(grabID);
         this.pdfGrabCorrelations.delete(grabID);
@@ -8667,7 +8723,10 @@ export class Bridge {
         : {}),
     };
   }
-  private async abandonPdfGrab(grabID: string): Promise<
+  private async abandonPdfGrab(
+    grabID: string,
+    effectRequestID?: string,
+  ): Promise<
     BrokerReply<{
       grab_id: string;
       state: string;
@@ -8681,6 +8740,12 @@ export class Bridge {
       "pdf_grab_abandon_result",
       PDF_GRAB_FEATURE,
       true,
+      undefined,
+      // The daemon fences cancellation on the grab's originating request id, so
+      // reusing it here is what makes this call effective rather than a
+      // `conflict` the caller then has to interpret. Absent for a grab this
+      // worker generation did not arm; the daemon answers on its own evidence.
+      effectRequestID,
     );
     const result = await Promise.race([
       request,
