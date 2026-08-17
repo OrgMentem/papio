@@ -331,3 +331,80 @@ feature-gated pull reads preserve old-peer compatibility and ADR-0005's tested
 operational boundary. Durable cohort identity makes mixed browser/CLI batches
 honest across retries and restarts, and the institutional boundary prevents
 presentation code from becoming a second scheduler or owner.
+## Credit egress authority for metered metadata providers
+
+**Context:** *papio* exhausted a 10,000-credit OpenAlex daily allowance in 25
+minutes. A job whose candidates were all permanently dead re-ran the resolver
+chain about once a minute forever, because a pass in which any other source was
+gated went uncharged against the retry budget; metadata enrichment repeated the
+same defect while being disconnected from retry accounting entirely. Because the
+provider reports a prepaid balance, the failure mode on a paying installation is
+not "gated until midnight" but charging the user, and because an OpenAlex account
+is shared, another consumer can exhaust the free allowance while *papio*'s own
+accounting sits under its ceiling. ADR-0012 already covers provider-derived
+pacing; this is a different question at a different layer.
+
+**Decision:** ADR-0024 makes one transaction the egress authority: it commits a
+durable credit and revalidates every no-egress signal at the wire, no blocking
+wait may follow it, a failed commit means no request, and a request reaching the
+transport without one fails loudly. Metered metadata travels over an HTTP/1-only
+transport with keep-alives disabled, pinned ALPN, and no automatic redirect
+following, so one admission cannot become several physical requests; each redirect
+hop re-enters the authority under a re-derived identity and carries alias evidence
+so a provider entity merge verifies instead of being rejected. Identity is read
+from the outgoing request and the credential travels as an `Authorization` bearer
+token rather than a query parameter. The fuse is a stop rather than a ledger: one
+source-wide `credits_committed` counter per UTC day, charged at a conservative
+shape cost, never refunded in-window, atomic across first-write and update, with
+availability as the safe failure mode. Its ceiling is a fraction of the
+provider-reported limit under a frozen, monotonically non-increasing denominator;
+`0` disables the ceiling but never the commit. Metering is in credits, observed
+dollars never feed the monthly admission column, positive cost drift closes the
+source until acknowledged with no timed reopen, and pacing (source-wide, egress-IP
+scoped) is a separate authority from per-credential exhaustion so keyless fallback
+cannot bypass a real rate limit.
+
+**Why:** A quota that is only observed after spending cannot bound spending. Making
+the debit a precondition of egress, inside the transaction that revalidates the
+gates, converts an advisory hope into an enforced ceiling that survives a crash —
+while the source-wide counter, the frozen denominator, and the drift closure keep
+the ceiling meaning one thing across two identities, two tiers, and a provider that
+may change its own prices.
+
+## Evidence authority over canonical identity
+
+**Context:** *papio*'s worst outcome is the wrong PDF filed under the right
+citation — silent, durable, and propagating into a library and its citations. The
+primary resolution path produced exactly that: a submission carrying only a title
+was matched on normalized title alone, because the year check is skipped when no
+year was supplied and an empty author list compares as agreeing. The accepted
+record's own identifiers were then merged into canonical job metadata before any
+fetch or validation, so a wrong match adopted a wrong DOI, resolvers fetched that
+DOI, and the arriving PDF "agreed" with metadata derived from the same bad match. A
+DOI cache hit then reached `ready` on a hash comparison, making one bad acceptance
+reusable forever.
+
+**Decision:** ADR-0025 draws the line at evidence authority: search and routing
+evidence may create candidates, but only evidence independently verified as
+describing the same submitted canonical work may mutate canonical identity before
+artifact validation. Validation and cache attestation consume a durable, immutable
+snapshot of the submitted identity captured at submit, never the mutable job work —
+enrichment may still inform the current pass in memory, but not durably promote.
+Provenance is recorded per field, not only per identifier, because a field the user
+omitted is otherwise indistinguishable from one they supplied; identifier
+provenance carries four states so that legacy rows can be quarantined as
+unattested, which is the mechanism rather than ancillary metadata. The invariant is
+prospective and never claimed retroactive, and unattested anchors are barred from
+promotion and from the DOI-to-hash cache fast-path. Because an immutable anchor
+relocates rather than closes the sparse-input case, a title-only hit gets an
+explicit insufficient-authority disposition: it may create a candidate but never
+become a verified identity, a cache attestation, or a `ready` artifact without an
+independent authority agreeing, and otherwise the job stays unresolved and says so.
+Yield may never be bought by loosening the acceptance predicate, and wrong-accepts
+are measured against the operator's own library before and after any change here.
+
+**Why:** Every other acquisition failure is visible and recoverable; this one is
+neither. Naming the anchor explicitly is what stops "compare against what was
+requested" from silently degrading into "compare against whatever the job now
+believes", and the insufficient-authority disposition is what keeps a sparse
+submission from being resolved by evidence that only confirms itself.

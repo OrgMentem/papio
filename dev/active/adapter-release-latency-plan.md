@@ -61,6 +61,13 @@ Trim candidate: Phase-0 material shipped; later phases still live.
   Local capture pinning already implements role-scoped first/latest retention
   and release; hosted intake lifecycle remains future.
 
+## Trimmed 2026-08-17
+
+Sections describing shipped work were removed. The pre-trim text is recoverable in
+full at `git show 2d29e7a:dev/active/adapter-release-latency-plan.md`. Cut: Why the
+pre-Phase-0 loop did not scale (historical baseline), Options, 0. Daemon URL
+intelligence — the fastest repair path.
+
 ## Decision (2026-08-10, operator-ratified; subordinate to ADR-0021)
 
 Build, in this order of leverage:
@@ -142,102 +149,6 @@ overall win — `no_identifier`, 126 jobs — belongs to daemon metadata
 resolution: it is out of this plan's scope and is the explicit **next
 priority after Phase 1**, ahead of Phase 2 control and Phase 3 intake, for a
 single-installation deployment.
-
-## Why the pre-Phase-0 loop did not scale (historical baseline)
-
-The following loop is retained to explain the repair-latency objective; it is
-not a statement that the new planner/epoch authority is absent:
-
-```text
-provider changes
-  → local capture (sanitized/provenanced only before future intake)
-  → maintainer diagnoses the drift
-  → TypeScript adapter + fixture edit
-  → extension version/tag
-  → Chrome and AMO review
-  → browser auto-update
-  → affected jobs retry
-```
-
-*papio* already has declarative adapters, fixture-backed classification, stored
-captures, an offline `adapter-try` tool, and automated submission to both stores
-from an `ext-v*` tag. The missing pieces are not another interpreter or another
-store-submission script. They are:
-
-1. action-aware evidence captured at failure time;
-2. deterministic repair generation against the real production engine;
-3. an effect-based review classifier;
-4. automatic patch/version/tag preparation;
-5. an immediate kill switch and post-install activation path; and
-6. a private, deduplicated contribution path for nontechnical users.
-
-The target is not “700 bespoke scripts.” It is:
-
-1. a stronger generic engine for boring, identity-provable cases;
-2. a broad store-bundled adapter corpus generated and maintained mechanically;
-3. failures that automatically become one deduplicated repair incident; and
-4. extension releases only when positive packaged behaviour changes.
-
-## Options
-
-### A. Daemon URL intelligence + adapter patch generator + restrictive control
-
-**Chosen (2026-08-10).**
-
-- URL-shaped provider knowledge moves daemon-side and deploys in hours with no
-  store surface at all; the extension exercises only packaged primitives.
-- Every extension effect remains reviewable in the submitted source.
-- Signed restrictive control (suspend exact packaged revisions; permanent
-  revocation deferred with the offline root) provides
-  immediate safety rollback without a store release.
-- Store review remains for new positive DOM behaviour, but *papio* removes the
-  maintainer queue before it and user interruption after it.
-- One implementation serves Chrome and Firefox.
-
-### B. Signed runtime behaviour catalog
-
-The daemon downloads signed locator/action rules and the extension interprets
-them.
-
-- Provenance is better than ADR-0015's untrusted amendments.
-- Still changes classification and browser actions outside the submitted
-  extension.
-- **Deferred, not categorically prohibited.** Chrome's policy allows remote
-  data/config without logic and forbids an "interpreter to run complex
-  commands fetched as data"; the boundary between those for a selector/action
-  catalog is undefined in the text and adverse in the closest enforcement
-  precedent (see "Store policy: what is actually established"). Resolvable
-  only by a deliberate pilot; recorded under "Deferred alternatives".
-
-### C. Hosted repair service returning an ad-hoc action
-
-Upload the page and execute the service’s returned selector or command.
-
-- Fast apparent feedback.
-- Rejected. It is positive remote logic without store review, signature
-  lineage, corpus replay, or rollback semantics.
-
-### D. Runtime Zotero translator compatibility
-
-Execute Zotero translator JavaScript in *papio* or defer to an installed Zotero
-Connector.
-
-- Broad nominal coverage.
-- Translators are arbitrary JavaScript with different helper, network, test,
-  licensing, and authority assumptions.
-- No planned implementation until a build-time evidence survey proves a
-  material uncovered need.
-
-### E. Build-time Zotero evidence ingestion
-
-Pin an upstream translator revision and import only mechanically representable
-recognition, metadata, attachment hints, and tests into source repair
-candidates.
-
-- Recommended after the adapter patch generator exists.
-- Upstream behaviour is evidence, never runtime authority.
-- Generated changes pass *papio*’s work-identity and negative corpora and enter
-  the same source/store path as a native adapter.
 
 ## Store policy: what is actually established (2026-08-10)
 
@@ -404,137 +315,6 @@ The architecture has seven boundaries:
 12. **Reporting consent is durable but profile-scoped.** Each Chrome/Firefox
     profile authorizes `structural` and optional `rich_capture` transmission
     tiers once; routine failures do not reopen the decision.
-
-## 0. Daemon URL intelligence — the fastest repair path
-
-The daemon updates outside browser stores (brew, `make dev-deploy`), so any
-provider knowledge expressible as **URLs and routing** can repair in hours.
-Half of current successes already complete without a browser. The authority
-boundary is nevertheless explicit: `job_offer` carries the ordinary handoff
-context, while direct provider routes are daemon-minted
-`provider_direct_get_request` frames. No direct route is inferred from a
-`job_offer` URL, host, or URL heuristic.
-
-Move URL-shaped provider knowledge daemon-side:
-
-- direct PDF endpoint templates per provider family (e.g. Wiley
-  `/doi/pdfdirect/<doi>?download=true`, SAGE `/doi/pdf/<doi>?download=true`),
-  emitted as one tuple-correlated request and adopted through existing
-  packaged machinery;
-- versioned per-provider route knowledge (`route_revision`), cited in every
-  durable direct-route event so a bad template is diagnosable and revertible
-  like any other config. Institution-configured parameters (`accountid`, IdP
-  entity routing, openurl quirks) remain the separate institution-config path
-  they already are — not remotely maintained provider intelligence.
-
-### `provider_direct_get_v1`
-
-The daemon emits **one** candidate at a time, never an ordered list in one
-offer, so two candidates cannot race one work. The request carries the
-daemon-minted tuple fields (`drive_attempt_id`, `ordinal`, and
-`route_revision`) in addition to the route envelope:
-
-```json
-{
-  "strategy": "provider_direct_get",
-  "drive_attempt_id": "daemon-minted opaque id",
-  "ordinal": 0,
-  "route_revision": "wiley-doi-pdfdirect/1",
-  "expected_identifier": "doi:…",
-  "url": "https://…",
-  "allowed_origin": "https://…",
-  "path_family": "/doi/pdfdirect/{doi}"
-}
-```
-
-The extension checks `delegated`, verifies GET/HTTPS/origin/path/no-userinfo,
-starts one browser-managed download, and reports the tuple-correlated terminal
-observation; it never persists the URL. The daemon decides whether another
-route is warranted after seeing the result.
-
-Generic positive attempts use the same daemon-owned epoch shape:
-`drive_attempt_id + ordinal + strategy=generic + revision`. The daemon
-durably records offered/started/result/superseded tuples and accepts a result
-only for the currently authorized, started tuple. The extension may persist
-the opaque tuple and bounded attempt bookkeeping, but not the candidate URL;
-MV3 restart therefore cannot replay an arbitrary URL or mint candidate two
-locally.
-
-### Route-template contract (v1)
-
-```text
-method              GET only
-substitution        canonical public work identifiers only
-query               fixed public keys/values or the work identifier;
-                    no tokens, signatures, cookies, patron IDs
-destination         packaged provider family
-scheme              HTTPS; userinfo forbidden
-redirects           initial and final URL validated (see below)
-effect              navigation/viewer/download only
-terms               no new or bypassed terms requirement
-cardinality         one candidate in flight per job
-terms_policy        none | durable_consent:<packaged-policy-id> | human_required
-```
-
-A route template may interpolate only canonical public work identifiers. It
-cannot carry signed/bearer values, patron identity, form data, consent
-assertions, non-GET methods, or an endpoint whose use bypasses a terms step
-not already covered by durable packaged consent policy. Any page-derived
-secret remains extension-memory-only and cannot originate in daemon route
-knowledge. Final PDF validation protects against wrong adoption; it does not
-make an unsafe navigation harmless, which is why the envelope above is
-enforced before navigation, not after.
-
-Redirect visibility is bounded by browser primitives: a navigation or
-`chrome.downloads.download()` does not expose every intermediate HTTP hop.
-The initial URL and the final observed/download URL must satisfy the packaged
-provider-family envelope; a final URL outside it, or a login/terms/challenge
-landing, stops automatic execution. V1 does not claim per-hop visibility.
-
-Terms safety is a representable fact, not URL syntax: every route revision
-declares its `terms_policy`, and only `none` or `durable_consent` routes are
-autonomous candidates — `human_required` (and anything unknown) is not.
-
-Template expansion is a closed compiler, not string templating: one canonical
-public identifier substitutes into named slots, with tests covering percent
-encoding, embedded/repeated slashes, dot segments, Unicode, fragments, and
-query duplication. Every direct and generic terminal observation is accepted
-only against the daemon-durable tuple
-`job_id + drive_attempt_id + ordinal + strategy + revision` (direct routes use
-`route_revision` as `revision`). A late candidate-one result therefore cannot
-release a later candidate or affect a retried handoff.
-
-Rules:
-
-- direct-route requests carry a daemon-minted tuple and the route URL is
-  consumed only by the feature-capable packaged executor; later route repairs
-  need no new store submission, but the first `provider_direct_get_v1`
-  extension release is required;
-- every candidate still crosses PDF and work-identity validation; future
-  redacted observations, when shipped, must use the same safety domains as
-  adapter effects.
-
-### Sequencing against Phase 0
-
-Autonomous provider-direct candidates are emitted only after the connected
-extension advertises `provider_direct_get_v1` and the daemon has an eligible
-`delegated` job. Under `assisted`, the ordinary handoff records an openable
-action and performs no automatic navigation; under `conservative`, no provider
-offer is emitted. Enforcement is feature gating, not parser rejection: the
-daemon never emits a direct-route offer unless the session advertises
-`provider_direct_get_v1` — emitting it anyway is itself a defect that can tear
-down the strict native-messaging session. The same extension release that
-understands direct routes is the one that enforces access mode.
-
-The bridge also forces ISBN catalogue/ebook institutional handoffs to
-`assisted` in `offerableAccessMode`, regardless of the configured delegated
-mode. That is an implemented safety boundary, not a future route-template
-exception.
-
-Once that Phase-0-capable extension is in the stores, every later route
-repair is daemon-only: same-day deployment, no store involvement. When a
-provider redesign breaks DOM classification but keeps its PDF endpoint shape
-(common), the `ui_changed` class shrinks without waiting on a store.
 
 ## 1. Split execution from observation
 
@@ -1514,67 +1294,24 @@ shipping translator logic or remotely supplied behaviour.
    repeated event, failed transaction, and old no-ID events each name their
    expected job state, lease owner, and action set afterward; leased,
    adopting, and identity-review jobs remain untouched.
-6. **Safety-domain monotonicity:** ordinary drift may run the bounded generic
-   chain; wrong-work, validation, unexpected-effect, and envelope failures
-   never execute another positive effect — including after MV3 restart,
-   duplicate outcomes, and tab reclassification.
-7. **Generic identity boundary:** title-token similarity produces E0 only; the
-   current generic E1 refuses a missing/mismatched expected DOI or page DOI
-   corroboration, requires article binding, and a final identity mismatch sets
-   `no_positive_effects`.
-8. **Consent/profile isolation:** automated tests cover profile persistence and
+6. **Consent/profile isolation:** automated tests cover profile persistence and
    isolation across reconnect and holder switch with zero prompts; manual
    checklists cover Firefox 140+ built-in and 128–139 custom consent
    acceptance.
-9. **Report privacy/deletion (Phase 3):** authorization denial blocks upload;
+7. **Report privacy/deletion (Phase 3):** authorization denial blocks upload;
    rich capture cannot upload under structural consent; delete produces a
    tombstone and clears raw objects, indexes, rows, and logs, with backups
    expiring by the published maximum.
-10. **Zotero hermetic replay (Phase 5):** attempted network fails, DOM
-    reads/outputs are recorded under CPU/time/output limits, old/new pinned
-    revisions diff deterministically, and licence exclusion is asserted at the
-    SBOM/source-package level.
-11. **Planner parity:** live injection and `adapter-try` produce the same plan
-    or assisted result for every fixture.
-12. **Fatality containment:** injected failure in every new bridge handler is
-    followed by a successful unrelated RPC on the same native session.
-13. **Route access mode:** under `assisted` the candidate is recorded as an
-    openable action with no automatic navigation; under `delegated` it
-    downloads once; under `conservative` it is never offered.
-14. **Route secrecy:** valid route URLs necessarily cross native messaging;
-    assert that signed-query, cookie, patron-ID, and authorization sentinels
-    never appear in daemon route templates, native frames, extension
-    storage, logs, captures, or events.
-15. **Route envelope:** reject non-GET, HTTP, userinfo, private/local
-    addresses, wrong provider family, wrong path family, and cross-origin
-    credential propagation on the initial and final URL; a final URL outside
-    the envelope or a login/terms/challenge landing stops execution; only
-    `terms_policy` of `none`/`durable_consent` is autonomous. Template
-    expansion covers percent encoding, embedded/repeated slashes, dot
-    segments, Unicode, fragments, and query duplication; final payloads are
-    classified by MIME/disposition, not URL shape.
-16. **Sequential candidates:** a second daemon candidate cannot be offered
-    until the first has a correlated terminal observation bound to
-    `job_id + drive_attempt_id + ordinal + strategy + revision` — including
-    across worker restart, daemon restart, duplicate results, late results,
-    and CAS-lost races. Direct routes use `route_revision` as `revision`.
-17. **Strong latch:** wrong-work on page shape A prevents generic and adapter
-    effects after navigation to page shape B and after MV3 restart; the latch
-    clears only on explicit human retry or terminal outcome.
-18. **Generic bound:** all E0 strategies may observe; at most two E1
-    executions occur per daemon-minted `drive_attempt_id` — asserted across
-    navigation, redirects, tab replacement, worker restart, daemon restart,
-    duplicate results, late results, and CAS-lost races — strictly
-    sequentially, and an identity/validation/unexpected-effect failure stops
-    the chain. A restart never authorizes URL replay without a current daemon
-    epoch.
-19. **Production composition:** the route and observation paths are exercised
+8. **Zotero hermetic replay (Phase 5):** attempted network fails, DOM
+   reads/outputs are recorded under CPU/time/output limits, old/new pinned
+   revisions diff deterministically, and licence exclusion is asserted at the
+   SBOM/source-package level.
+9. **Fatality containment:** injected failure in every new bridge handler is
+   followed by a successful unrelated RPC on the same native session.
+10. **Production composition:** the route and observation paths are exercised
     through the real background dispatcher, native host, daemon bridge, and
     planner — not just direct handler calls — because individually tested
     handlers have repeatedly been unreachable or fatal in composition.
-20. **Feature-skew survival:** a session that never advertised
-    `provider_direct_get_v1` receives no direct-route frame and completes an
-    unrelated RPC on the same native session.
 
 ## Release-class verdicts
 

@@ -45,116 +45,52 @@ into ADR-0022, then remove); this file stays only for the open and deferred work
   is the gap that matters — the phases above shipped without the instrument that
   was supposed to judge them.
 
+## Trimmed 2026-08-17
+
+Sections describing shipped work were removed. The pre-trim text is recoverable in
+full at `git show 2d29e7a:dev/active/institutional-processing-acceleration.md`. Cut:
+
+- `Initial three direct-to-main changes — complete`
+- `Phase 0 contract and observability — complete`
+- `Phase −1 — complete baseline`
+- `Phase 1 — additive durable state and strict protocol (implemented-but-dark)`
+- `Phase 2 — recoverable explicit materialization`
+- `Phase 3 — unified effects and fair scheduling at one`
+- `Phase 4 — profile evidence and typed human gates`
+
+Normative sentences from the cut phases were relocated into
+`Authority and identity contract` (baseline invariants, the atomic decision payload
+and its redaction rule, the single global effect permit, "a descriptor cache is never
+eligibility authority", the signed-out/unknown evidence rules, and the rule that one
+current action is projected per gate scope) and into `Phase 5` (the
+authentication-entry lease precondition). `Current rollout state` was condensed to
+present-tense fact only.
+
 ## Current rollout state
 
 The current release keeps automatic first-route behaviour and source-gate
 bypass disabled. The global browser-effect permit is one. Existing explicit
 handoff and direct/generic paths remain the fallback behind their current
-feature, access-mode, holder, and safety gates.
+feature, access-mode, holder, and safety gates. No provider tuple is broadly
+enabled; the readiness stream continues independently, and no provider holds
+a `ready` claim here.
 
-Phase 0 is complete for this coordinated change: it records decisions without
-creating candidates, opening tabs, bypassing a source gate, or changing
-concurrency. No provider tuple is broadly enabled. The readiness stream
-continues independently; no provider is given a `ready` claim here because no
-current live validated success plus adoption evidence is being asserted.
-Phase 1's durable projections and strict protocol are now active only for
-holders that explicitly advertise `institutional_materialization_v1`. Phase 2
-adds recoverable, user-invoked candidate materialization; automatic claiming,
-automatic first-route behavior, source-gate bypass, provider canaries, and
-concurrency changes remain off.
- 
-### Coordinated Phase 0/Phase 1 implementation note
- 
-This is a direct-to-main implementation boundary, not a claim that a later
-phase has shipped. Phase 0 is complete: transactional cutover classification,
-diagnosis v2, stable vocabulary, privacy inventory, and active-plan
-reconciliation are in place. Phase 1 is implemented-but-dark:
- 
-1. Migration `0026` adds the seven daemon-owned dark projections and advances
-   `user_version` to `26`: `institution_profiles`, URL-free
-   `browser_candidates`, `materialization_claims`, `profile_evidence`,
-   `human_gate_observations`, `route_suppressions`, and insert-only
-   `artifact_winners`. Profile IDs, authentication-claim IDs, candidate IDs,
-   claim IDs, binding IDs, and safety-domain IDs are opaque and daemon-minted.
-   Authority columns and revisions are immutable for a candidate claim.
-2. The strict, feature-negotiated `institutional_materialization_v1` contract
-   lands together in the Go validator, TypeScript types/parser, and JSON
-   Schema. It adds paired `institutional_claim_request`/`institutional_claim_response`,
-   `institutional_bind_request`/`institutional_bind_response`,
-   `institutional_route_request`/`institutional_route_response`,
-   `institutional_navigated_request`/`institutional_navigated_response`, and
-   `institutional_reconcile_request`/`institutional_reconcile_response`
-   families. Requests are bounded and URL-free; only a successful route
-   response may carry a transient URL. Responses use the closed outcome
-   vocabulary (`feature_disabled`, `claimed`, `bound`, `issued`, `acknowledged`,
-   `reconciled`, `stale`, `not_eligible`, `busy`, `error`) and
-   disposition-gated fields; unknown fields are rejected. Reconcile is the only
-   non-job-scoped request.
-3. The extension's explicit versioned managed-state migration scrubs legacy
-   URLs, hashes, and global terms authority, while preserving only safe current
-   non-URL job, download, and lease state. Ambiguous browser queues are not
-   promoted into daemon authority.
-4. Every new handler returns structured `feature_disabled` without mutation.
-   Feature advertisement and bounded negotiation do not activate a handler or
-   create a candidate.
- 
-That Phase 0/Phase 1 change included no Phase 2 materialization behavior,
-provider readiness, automatic first route, source-gate cutover, or concurrency
-increase. It kept the direct-to-main fallback paths and made no compatibility
-promise beyond bounded feature negotiation.
-
-### Coordinated Phase 2 implementation note
-
-Phase 2 closes the explicit daemon-to-extension handoff without enabling
-automatic candidate claiming. Migration `0027` adds the daemon authority key,
-candidate materialization kind, and the tab identity bound to each live claim.
-The daemon mints URL-free candidate offers and fences claim, bind, route,
-navigation acknowledgement, settlement, and replay by the current job attempt,
-institution profile revision, browser-holder generation, binding, and tab.
-
-The extension negotiates the feature explicitly in `hello`, persists only
-opaque IDs and ordinals, creates one inert `materialize.html#<binding>` scaffold,
-requests a fresh route, navigates that same tab, and acknowledges the result.
-Per-request opaque IDs prevent a late timed-out response from satisfying a
-newer retry. Bounded retries cover claim, bind, route, and navigation response
-loss; startup reconciliation is paginated, treats tab-scan uncertainty as
-uncertainty rather than absence, replaces a lost pre-route scaffold through an
-exact rebind, abandons stale-holder claims, and clears cancelled or orphaned
-local work. Raw institutional URLs remain transient and memory-only.
-
-The legacy URL-bearing `job_offer` path remains available to peers that do not
-advertise the feature. Phase 2 does not change source-gate admission, automatic
-route scheduling, the global effect permit, provider readiness, or concurrency.
-
-### Coordinated Phase 3 implementation note
-
-Phase 3 is complete. Indexed keyset pagination, fair rotation across profiles
-and pre-route/provider safety domains, and database scheduling outside the
-session-arbitration mutex were already active. Migration `0034` closes the
-remaining authority gap with daemon-durable effect permits.
+Phase 1's durable protocol, `institutional_materialization_v1`, is active
+only for holders that explicitly negotiate it in `hello`; responses stay
+disposition-gated and unknown fields are rejected. Phase 2's recoverable,
+user-invoked candidate materialization is live. A scaffold contains only an
+opaque binding ID and is recoverable after a worker crash. The legacy
+URL-bearing `job_offer` path remains available to peers that do not
+advertise the feature. Automatic candidate claiming, automatic first-route
+behavior, source-gate bypass, provider canaries, and concurrency changes
+remain off.
 
 `effect_permits` is its own table, not extra columns on
-`materialization_claims`. Occupying status is `held | unknown_completion` for
-both the single global slot (`slot_index = 0`) and the per-domain row. Acquire
-is transactional for every currently reachable irreversible path: generic
-drive, direct get, PDF grab, terms, and institutional navigation/click.
-Generic drive and direct get share one identity namespace. Terms identity is a
-stable job-scoped occurrence id. Institutional acquire is expected-ordinal CAS
-plus a stable request id and is the sole writer of `effect_ordinal`. Result,
-safety latch, and any successor *offer* share one transaction with settlement;
-the successor identity must acquire independently. Duplicate start remains
-`duplicate`. Busy `stale` defers the same never-acquired identity. Elapsed
-lease, ordinary retry/cancel, and the former ten-minute drive-epoch stall are
-not authorization.
+`materialization_claims`. The single global slot is `slot_index = 0`;
+occupying status is `held | unknown_completion`. Peers must advertise
+`effect_permit_v1` before `started`. `AdvanceMaterializationEffect` stays
+dark.
 
-Unknown completion remains occupying until an exact late result, correlated
-winner, or exact-ID operator resolution. Startup imports pre-`0034` unresolved
-epochs as `legacy_effect_blockers`, not live-slot rows. The schema-33 guard
-binary refuses schema 34; downgrade to an earlier binary requires restoring a
-pre-migration backup. Peers must advertise `effect_permit_v1` before
-`started`. `AdvanceMaterializationEffect` stays dark. Automatic first-route,
-source-gate bypass, and concurrency greater than one stay off.
- 
 The hard enablement chain is:
 
 ```text
@@ -172,51 +108,6 @@ Phase −1 stability
 The chain is strict. Provider repair, cohort preparation, and fixture work may
 run in parallel with Phases 0–4, but no phase may consume evidence from a later
 phase or silently enable its behavior.
-
-## Initial three direct-to-main changes — complete
-
-These were the first three direct-to-main changes. Each has one primary owner,
-one bounded review surface, and a narrow rollback.
-
-### Change 0.1 — Ratify the authority and identity contract
-
-**Targets:** ADR-0022, this plan, and the curated architecture summary.  
-**Purpose:** freeze the daemon/extension split, the three business identities,
-holder generation, attempt/revision rules, typed gates, cooldown scopes,
-suppression/winner rules, privacy inventory, and the −1–8 sequence.  
-**Non-goals:** no runtime behavior change, no new provider qualification, and
-no source-gate bypass.
-
-**Exit:** the three documents agree on terminology and all later changes can
-cite one authority model without reopening it.
-
-### Change 0.2 — Add transactional cutover classification
-
-**Targets:** `internal/job/cutover.go` and the decisive processing transition.  
-**Purpose:** normalize and persist exactly one closed cutover decision on the
-same transaction as the `job.transition` that records it. The stable payload has
-`institution_cutover_blocker` and `canary_ready_route_exists`; `none` is explicit.
-Phase 0 conservatively records the route flag as false because no qualified-
-route registry exists yet.  
-**Non-goals:** no automatic institutional candidate, no source-gate bypass, no
-new route registry, and no provider URL or credential in detail.
-
-**Exit:** every decisive cutover path has one atomic, parse-enforced decision;
-ordinary unrelated transitions do not acquire a fabricated decision.
-
-### Change 0.3 — Add backward-compatible diagnosis v2
-
-**Targets:** `jobs.diagnose_v2`, current CLI preference/fallback, and focused
-contract tests.  
-**Purpose:** project the latest valid transactional decision without changing
-the byte shape of `jobs.diagnose_v1`. The CLI tries v2 first and falls back to
-v1 only for a bounded unknown-method response.  
-**Non-goals:** no widening of v1, no generic error fallback, no autonomous
-repair, and no new acquisition decision.
-
-**Exit:** old strict clients decode v1 exactly as before; new diagnosis can state
-why the current decision was made without exposing URLs, credentials, local
-paths, institution names, or work identifiers.
 
 ## Authority and identity contract
 
@@ -263,37 +154,6 @@ extension memory, the active tab, and ordinary browser history. Durable state,
 events, diagnostics, logs, captures, and errors retain only opaque claim data,
 route class, revisions, and bounded result codes.
 
-## Phase 0 contract and observability — complete
-
-Phase 0 was an observation-only cutover. At the decision point, the processing
-epoch classifies one blocker from this closed vocabulary:
-
-```text
-none
-source_gate_only
-live_source_remaining
-transient_retry_remaining
-no_legal_route
-policy_gate
-identifier_gate
-```
-
-`none` is written when no blocker exists; omission is not a second meaning.
-`canary_ready_route_exists` is a separate boolean. It is conservatively false
-until Phase 5 adds exact qualified-route state.
-
-The decision payload is committed atomically with the decisive transition and
-is never a separate appended event. It contains no provider route, bearer,
-credential, local path, institution name, or work identifier. `jobs.diagnose_v1`
-remains byte-shape compatible. `jobs.diagnose_v2` is additive and projects the
-latest valid decision; the current CLI uses bounded unknown-method fallback only.
-
-Phase 0 also reconciles active plans and records migration/rollback constraints:
-legacy fresh URLs, deterministic claim hashes, global terms authority, and
-browser-side unmaterialized queues are not promoted into new authority.
-
-## Phase −1 — complete baseline
-
 The baseline is fixed and stays enabled while later phases land:
 
 - exact forced-open selection never substitutes one job for another;
@@ -305,98 +165,18 @@ The baseline is fixed and stays enabled while later phases land:
 - tab ownership, safe close behavior, faithful browser/download fakes, and
   current integration ownership remain intact.
 
-Automatic first-route behavior, source-gate bypass, and concurrency four remain
-off. Phase −1 completion is not evidence that any provider is ready.
-
-## Phase 1 — additive durable state and strict protocol (implemented-but-dark)
-
-Migration `0026` adds seven daemon-owned projections that cannot be safely
-reconstructed from replay:
-1. `institution_profiles`, including opaque profile and authentication-claim
-   IDs plus authority revisions;
-2. URL-free `browser_candidates` with immutable authority columns;
-3. `materialization_claims` with opaque binding IDs and holder generations;
-4. `profile_evidence` observations with a current exact-profile projection;
-5. `human_gate_observations` as the current typed gate projection;
-6. `route_suppressions` at the exact profile/route/safety/adapter/strategy
-   scope; and
-7. insert-only `artifact_winners` CAS state.
-
-`user_version` is `26`. The extension's explicit versioned managed-state
-migration scrubs old URLs, hashes, global terms authority, and ambiguous
-unmaterialized browser queues; it preserves only safe current non-URL job,
-download, and lease state. No fresh route is migrated or durably stored.
-
-The strict, feature-negotiated `institutional_materialization_v1` protocol
-contains paired `institutional_claim_request`/`institutional_claim_response`,
-`institutional_bind_request`/`institutional_bind_response`,
-`institutional_route_request`/`institutional_route_response`,
-`institutional_navigated_request`/`institutional_navigated_response`, and
-`institutional_reconcile_request`/`institutional_reconcile_response` families.
-All requests except reconcile are job-scoped. IDs are opaque bounded strings;
-tab IDs and ordinals are bounded safe integers. URLs are forbidden except in a
-successful transient route response and are never stored or logged.
-
-Responses use only the closed outcomes `feature_disabled`, `claimed`, `bound`,
-`issued`, `acknowledged`, `reconciled`, `stale`, `not_eligible`, `busy`, and
-`error`. Fields are disposition-gated and unknown fields are rejected. Every
-Phase 1 handler is hard-disabled: it returns structured `feature_disabled` and
-performs no mutation. Feature negotiation is the only compatibility burden;
-there are no broad shims or widened existing messages.
-
-Automatic candidate claiming, materialization, tab creation, navigation,
-downloads, source-gate bypass, provider canaries, and concurrency changes
-remain disabled. Phase 2 behavior is not implemented by this note.
-
-## Phase 2 — recoverable explicit materialization
-
-Move only explicit Open/focus/redrive/retry/restart recovery onto the common
-operation:
-
-```text
-claim → self-identifying scaffold → two-party binding → revalidation
-→ transient route → navigation → acknowledgement → existing handling
-```
-
-A scaffold contains only an opaque binding ID and is recoverable after a worker
-crash. Direct downloads use the tabless form of the same claim and fence. Fault
-injection after every boundary must converge to one scaffold or a clean retry.
-Automatic candidate claiming remains disabled.
-
-**Gate:** crash/restart, duplicate binding, stale callback, old-peer, and fresh-
-route storage scans pass. The old explicit path remains a fallback until the
-new path is proven.
-
-## Phase 3 — unified effects and fair scheduling at one
+The decision payload is committed atomically with the decisive transition and
+is never a separate appended event. It contains no provider route, bearer,
+credential, local path, institution name, or work identifier.
 
 Use one global effect permit for provider navigation, clicks/forms, provider
-APIs, direct downloads, configured terms effects, and PDF-viewer adoption. Hold
-it through the declared consequence or bounded failure; do not release the
-provider lane before the protected effect starts or establishes its result.
+APIs, direct downloads, configured terms effects, and PDF-viewer adoption.
+Hold it through the declared consequence or bounded failure; do not release
+the provider lane before the protected effect starts or establishes its
+result. A descriptor cache is never eligibility authority.
 
-The daemon scheduler uses indexed keyset pagination and fair rotation across
-profiles and pre-route/provider safety domains. A descriptor cache is never
-eligibility authority. It must not stop at a fixed first page or hold the
-session-arbitration mutex during database scheduling work. Keep one parked bound
-scaffold per landed safety domain; leave other siblings daemon-side.
-
-**Gate:** fairness beyond positions 200 and 500, long database stall without
-false holder takeover, direct/tab parity, effect-permit, duplicate result, and
-artifact-winner tests pass at concurrency one.
-
-## Phase 4 — profile evidence and typed human gates
-
-Persist idempotent current-fact evidence with holder generation, exact profile
-revision, daemon receipt time, source, and validity. Daemon receipt time drives
-TTL. New decisive signed-out evidence revokes warm; unknown authorizes nothing
-and does not erase a decisive fact. Two profile observations in one sync both
-become durable and independently schedulable.
-
-Before an automatic signed-out/unknown route is eventually enabled, reserve an
-authentication-entry lease for its authentication claim. Convert it to a human
-owner only after login, MFA, CAPTCHA, or security evidence is observed. Exact
-profile warm evidence may proceed independently even when profiles share an
-authentication claim.
+New decisive signed-out evidence revokes warm; unknown authorizes nothing and
+does not erase a decisive fact.
 
 Project one current action per gate scope: login, MFA, CAPTCHA/security,
 browser-host permission, downloads-folder permission, terms, contractual
@@ -404,10 +184,6 @@ declaration, or identity ambiguity. Keep one live human-attention surface and
 aggregate dependent siblings. A successful gate closes that gate and lets the
 daemon schedule eligible siblings; it does not autonomously resolve an
 unrelated human action.
-
-**Gate:** two-profile, restart, lost-response, stale-profile, one-claim/many-
-siblings, typed-platform-permission, and terms/declaration separation tests
-pass. Automatic first-route remains disabled until Phase 5.
 
 ## Phase 5 — provider readiness and automatic first-route canary
 
@@ -437,6 +213,12 @@ current human gate.
 unexplained wrong-work, duplicate-winner, stale-download, or privacy result.
 No broad provider readiness is inferred from installation counts or from a
 provider outcome alone.
+
+Before an automatic signed-out/unknown route is eventually enabled, reserve
+an authentication-entry lease for its authentication claim. Convert it to a
+human owner only after login, MFA, CAPTCHA, or security evidence is
+observed. Exact profile warm evidence may proceed independently even when
+profiles share an authentication claim.
 
 ## Phase 6 — source-gate cutover canary
 

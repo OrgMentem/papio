@@ -36,38 +36,21 @@ read (ADR-0019 Decision 10).
 
 Trim candidate, not deletion candidate, because items 4, 8, and 9 are open and item 6 is deferred pending a real institution.
 
+## Trimmed 2026-08-17
+
+Sections describing shipped work were removed. The pre-trim text is
+recoverable in full at `git show 2d29e7a:dev/active/post-build-followups.md`.
+Cut: Release-blocker tranche (oracle r6, 2026-08-08), and the shipped
+entries in Execution order — item 1 (stuck session probes), item 2 (zotio
+ownership wiring), item 3 (Silent-UI docs + `papio stats page-bulk`),
+item 5 (ILLiad poll executor 2A), item 7 (triage-snapshot/3).
+
+Relocated: "NO `papio import` alias (r5: cut — duplicates a clear verb to
+compensate for documentation)" — from the cut item 3, into this note; no
+open item is its natural home.
+
 ## Execution order (settled, r5-arbitrated)
 
-1. **Diagnose/fix the stuck "Institution session — Checking session…"
-   probes.** Shipped-path bug, not product work; observed rows that never
-   resolve to signed-in/out. Diagnose before touching — may be probe
-   lifecycle, may be Primo-NDE-specific.
-2. **Wire zotio ownership into page-bulk status.** The scout question is
-   already answered in-tree: `zotio.Service.LookupWorks` (1–50 works,
-   `owned_with_pdf`/`owned_missing_pdf`, staleness warning, unconfigured
-   degrades to not-owned) already serves batch submit — the browser bridge
-   just never calls it. Inject it into `page_bulk_status`, merge with
-   `canonicalJobStatus` under the precedence: papio ready bundle →
-   zotio owned_with_pdf → zotio owned_missing_pdf (+ item key) → live job
-   queued → complete negative = eligible → zotio unavailable/stale =
-   ownership_unknown (never painted as unowned). Extend `LookupWork` with
-   PMID (zotio supports it; the facade carries only DOI/arXiv). Measure
-   lookup latency before asking zotio for a bulk command. This repairs the
-   most visible false limitation in every fresh workspace.
-3. **Silent-UI docs + `papio stats page-bulk`.** Bulk import already exists
-   (`papio acquire --batch`: JSONL/RIS/BibTeX/CSL-JSON/NBIB since the
-   ADR-0008 work; live-verified — cache dedupe applies, title-only entries
-   submit through enrichment). The work is discoverability: user-guide
-   section for the OneSearch/Primo/Scholar "Export RIS → --batch" flow,
-   pointers from `acquire --help` and the workspace's collapsed-note copy.
-   NO `papio import` alias (r5: cut — duplicates a clear verb to
-   compensate for documentation). Stats surface is a `stats` command (not
-   doctor), through the conformance registry + printPage like everything
-   else: sessions, useful-scan rate, bulk leverage, submit conversion,
-   per-origin-class yield. Add ONE nullable aggregate field to
-   `page_bulk_runs` — `rendered_record_count_hint` (count of visible result
-   cards for known page classes; no titles/URLs/queries/docids) — so
-   identifier_yield gets an honest denominator.
 4. **`papio bench` — comparative, not absolute.** Cohort file
    (`papio-bench-cohort/1`: work request + expected class from
    {autonomous_ready, ready_after_human_boundary, honest_unavailable,
@@ -78,23 +61,6 @@ Trim candidate, not deletion candidate, because items 4, 8, and 9 are open and i
    **incremental_autonomous_ready** ("+2 / 9 works") on the frozen
    nine-work field cohort — the question the unmeasured resolver work left
    open. Manual live mode later; never blocks v1.
-5. **ILLiad poll executor (2A — fixtures now).** GetTransaction on wake.
-   State map: any successful nonterminal read → `pending` (reset failure
-   count); `Delivered to Web` → `fulfilled` (stop polling, start
-   retrieval); `Cancelled by Customer` → `cancelled`; `Cancelled by ILL
-   Staff` → `declined`; `Request Finished` classifies from prior
-   observations, `unknown_outcome` only after one delayed reconciliation;
-   unknown custom statuses → `pending` + `provider_status_unmapped` (ILLiad
-   statuses are customizable — no exhaustive enum; persist raw). **A failed
-   poll NEVER becomes unknown_outcome**: transient/auth/schema failures
-   leave request state unchanged and degrade integration health instead
-   (3 consecutive → degraded; 24 h without success → operator advisory
-   saying papio cannot OBSERVE the request, never that it failed).
-   `unknown_outcome` is reserved for provider-side uncertainty after
-   successful communication + exhausted reconciliation (404 after a prior
-   successful lookup → UserRequests + idempotency-reference
-   reconciliation first). Persist: provider_status_raw, display status,
-   last_successful_poll_at, consecutive_poll_failures, error class.
 6. **Fulfillment retrieval (2B — design + fixtures now, live acceptance
    gated).** The r5 correction that killed the plan's hidden hole: ILLiad's
    API does NOT serve the delivered PDF bytes; electronic delivery posts to
@@ -113,22 +79,21 @@ Trim candidate, not deletion candidate, because items 4, 8, and 9 are open and i
    end-to-end auto-capable even with an auto-capable submission API.
    Unit-correct from fixtures; ACCEPTANCE requires a real ILLiad
    institution (structurally not the operator's own — s49/Alma).
-7. **`triage-snapshot/3` — one rev, three riders.** (a) document_delivery
-   reconciliation rendering + closed ops; (b) ADR-0016 tri-state
-   `auth_requirement` + `route_class` + post-contact auth observations;
-   (c) r5's third rider so v4 isn't needed within months: closed
-   `attention` field — `working` / `required` / `advisory` (unknown-auth
-   LibKey handoff = working; login/MFA boundary = required; delivery
-   unknown_outcome = required; integrity notice = advisory). `blocked_by`
-   becomes a v3 enum (adds delivery_outcome, identity_review, unknown —
-   never overload v2 values). Pending pollable delivery stays
-   Activity-side, out of the snapshot.
 8. **Extension store release.** Bundle: page-bulk (zero new manifest
    permissions — verified), LibKey origin-derivation fix, snapshot v3
    consumers, auth-observation presentation, any ILLiad fixture work ready
    by cut time. Listing/privacy text gains the scan disclosure per
    ADR-0019 Decision 8. Non-urgent while the verified zero-install window
-   holds; re-verify AMO/CWS counts at cut time.
+   holds; re-verify AMO/CWS counts at cut time. The next release train is
+   **v0.20.0 + ext-v0.12.0** (NOT the staged ext-v0.11.0 — the tree moved
+   past its QA identity; do not publish 0.11.0 and immediately resubmit).
+   r6 also REVERSES the store-timing call: the public daemon now
+   substantially outruns the store extension and the second wave is
+   user-visible browser functionality — after this tranche + the QA
+   matrix, submit immediately, before any new provider/resolver work.
+   Remaining before the v0.20.0 + ext-v0.12.0 train: release prep
+   (changelog fold to 0.12.0, ext-bump, compat preflight, capture smoke),
+   the operator QA matrix, store submission.
 9. **Reassess Primo/Scholar class-2 from run data.** Primo moved to
    Later/conditional (r5): Export-RIS → `--batch` already preserves MORE
    metadata than an extractor could scrape. Evidence gate — advisory
@@ -146,7 +111,13 @@ Trim candidate, not deletion candidate, because items 4, 8, and 9 are open and i
    replay queries, paginate, or read unrendered records (that crosses the
    privacy line and duplicates RIS). If NDE exposes no stable client-side
    PNX object: stop. Scholar class-2 stays evidence-gated behind the same
-   metrics (currently 7/10 post-generalization).
+   metrics (currently 7/10 post-generalization). Post-submission next
+   build: **Primo NDE rendered-row PNX feasibility scout** (one day, not
+   the full extractor) — r6 declares the evidence threshold already fired
+   (daily tool, both institutions, 1/50 structural yield). Join rendered
+   cards to already-loaded client-state PNX by record id; hard stop if it
+   requires search APIs, query replay, pagination, unrendered records, or
+   unstable minified state.
 
 ## Title-only asymmetry — deliberate today, not permanent (r5 ruling)
 
@@ -189,78 +160,3 @@ door open, v1 unweakened.
   internal/cli/errcat_guidance_test.go): a future kind added to job.go
   passes all three without coverage. Same trap class the TerminalReason
   parse-enforced test closed; close it the same way.
-## Release-blocker tranche (oracle r6, 2026-08-08 — full review in
-## dev/scratch/oracle/papio-session-review-r6.md)
-
-The next release train is **v0.20.0 + ext-v0.12.0** (NOT the staged
-ext-v0.11.0 — the tree moved past its QA identity; do not publish 0.11.0
-and immediately resubmit). r6 also REVERSES the store-timing call: the
-public daemon now substantially outruns the store extension and the second
-wave is user-visible browser functionality — after this tranche + the QA
-matrix, submit immediately, before any new provider/resolver work.
-
-**Status: LANDED 2026-08-08** — all eight blockers built; three reviewer
-streams to explicit ship verdicts (the grab spine took nine adversarial
-rounds; the v4 counts rule settled on floor-always after the terminal-page
-wire ambiguity). Remaining before the v0.20.0 + ext-v0.12.0 train: release
-prep (changelog fold to 0.12.0, ext-bump, compat preflight, capture smoke),
-the operator QA matrix, store submission. Noted hardening follow-up: the
-fixture corpus is never validated against browser-v1.schema.json itself
-(jq checks syntax only) — two schema-impossible branches shipped past the
-corpus tests this round before reviewers caught them; a JSON-Schema-
-validating corpus test needs a validator-dependency decision.
-
-Blockers, in order:
-1. **URL-free grab protocol** (r6 P0-A): pdf_grab_request carries the full
-   tab URL — signed CDN queries are bearer-grade — and the persisted
-   correlation stores it. Daemon needs only {host, title}; the extension
-   already holds the URL and performs the download. Strip it from the wire,
-   the storage record, and the pdf_grabs row before pdf_grab_v1's first
-   release; grab-id path-join sanitization stays.
-2. **Pull-recoverable grab state + active-grab dedupe** (r6 P0-C):
-   at-most-once notification is fine ONLY over a pullable durable read.
-   Add pdf_grab_status_request/result (or a grab projection in
-   pageBulk.load) and a daemon-side one-nonterminal-grab-per-source
-   constraint, so a reopened workspace can never show "Ready to grab" over
-   a settled grab or start a duplicate.
-3. **triage-snapshot/4** (r6 P0-B): pdf_identifier_needed cannot be
-   represented in v3's closed route_class vocabulary (INTERIM guard now
-   omits such items from v3 snapshots — commit-pinned by
-   TestTriageSnapshotV3OmitsUnrepresentableActionKinds). v4 carries
-   route_class pdf_identifier_needed, blocked_by identifier_missing,
-   op provide_identifier, and a grab sub-object {grab_id, state}. Never
-   alias to manual_download/verify_identity.
-4. **Grabs stay grabs until identified** (r6 P1): drop the title-only
-   host job for no-identifier grabs; the pdf_grabs row is the durable
-   pending entity. `papio grabs identify <grab-id> <doi|pmid|arxiv>`
-   creates/joins the canonical job and injects the already-quarantined
-   SHA as the top local candidate — the captured bytes are never
-   re-fetched.
-5. **Waiting-sibling attention overlay** (r6 P1): badge/inbox must count
-   ONE required sign-in, not three — waiters get a browser-local override
-   to attention=working with "waiting for the sign-in already open" copy
-   and no Focus op; reverts to required on deadline expiry (the ADR-0013
-   browser-local-overlay pattern; the daemon never learns IdP state).
-6. **Opaque federated claim keys** (r6 P1): the persisted claim registry
-   stores raw [idpOrigin, entityID] against the state module's own
-   no-IdP-identity invariant — persist a digest; equality is the only
-   operation the registry needs.
-7. **Action-kind mapping completeness test**: the latent trap FIRED
-   (pdf_identifier_needed missed the v3 vocabulary). Parse-enforce that
-   every job.go action kind has a disposition in: guidance, reminders,
-   errcat, the snapshot route-class vocabulary (or an explicit
-   omit-from-vN list), and the TS rendering tables.
-8. **ResolveReview shared action closure** (promoted from Later): a
-   rejected review must close every non-advisory open action through the
-   shared transition path, not the startup-only sweep.
-
-Post-submission next build: **Primo NDE rendered-row PNX feasibility
-scout** (one day, not the full extractor) — r6 declares the evidence
-threshold already fired (daily tool, both institutions, 1/50 structural
-yield). Join rendered cards to already-loaded client-state PNX by record
-id; hard stop if it requires search APIs, query replay, pagination,
-unrendered records, or unstable minified state.
-
-Cut list confirmed by r6: Scholar class-2, in-panel route checks, LibKey
-api mode (no partner key), OCLC/Rapido adapters, DataCite relations,
-`papio import` alias — all stay cut/dormant.

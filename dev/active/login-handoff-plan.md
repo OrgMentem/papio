@@ -19,6 +19,13 @@ document is the plan of record.
 
 Trim candidate — Slices 1-3 shipped, while Slice 4, the accepted takeover boundary, and the do-not-re-attempt list are the still-normative remainder worth salvaging to an ADR.
 
+## Trimmed 2026-08-17
+
+Sections describing shipped work were removed. The pre-trim text is recoverable in
+full at `git show 2d29e7a:dev/active/login-handoff-plan.md`. Cut: Slice 1 — one
+guarded close primitive (LANDED), Slice 2 — make the harness tell the truth
+(LANDED), Slice 3 — cold offers are tabless until engagement (LANDED).
+
 ## The failure being fixed
 
 papio parks a job needing an institution sign-in behind a per-institution claim,
@@ -67,139 +74,6 @@ structural (capabilities deleted + AST test) and does not depend on event
 fidelity, whereas building a faithful fake first would model `closingTabs` and
 cancellation semantics that Slice 1 immediately deletes.
 
-### Slice 1 — one guarded close primitive (LANDED)
-
-The total closure ban originally specified here was built, and the operator
-reversed it: trading a rare race for a guaranteed daily tab-litter chore was
-the wrong trade. What shipped instead, after six review rounds and a final
-simplification:
-
-- **One primitive, `closeOwnedTab(tabID, reason)`.** Every lifecycle close
-  routes through it. An AST completeness test pins the call sites to exactly
-  {the primitive, the Chrome adapter that wires it, keepalive's three
-  pinned-tab teardowns} with count-based bidirectional comparison — a new
-  `.remove` anywhere fails CI.
-- **Chrome is asked at the moment of decision.** The gate is: ledger says
-  papio created it → job lifecycle settled → not a content tab → one
-  `tabs.get` → refuse if active, refuse if its CURRENT window/group is
-  outside papio's surface (dragged-out and recycled-id protection in one) →
-  remove in the same turn. The lesson from the failed rounds is written on
-  the primitive: the forbidden pattern is UNRELATED awaits between check and
-  act, not the one authoritative freshness read. No shadow-state
-  reconstruction — the six rounds of seeding races, tombstones and
-  completeness markers all existed to avoid one await, and are deleted.
-- **One rollback exception cannot create tab litter.** If a fresh one-use link
-  materializes after its job or claim was cancelled while `tabs.create` awaited,
-  that private tab never bound to live work. The guarded close primitive removes
-  it even if Chrome briefly marked it active or outside the managed surface;
-  the PDF/content guard still wins. Preserving it would retire the claim while
-  leaving its login live, allowing the next sibling to create a duplicate.
-- **papio never auto-closes content.** A PDF viewer — whoever opened it, and
-  including a scaffold tab that NAVIGATED to a PDF (checked against the
-  fresh `tabs.get` url, not just the creation record) — always stays. Only
-  papio's own scaffolding (job/handoff/capture tabs) closes. This deletes
-  the durable activation-history machinery entirely; the litter the operator
-  actually reported was login tabs, which Slice 3 removes at the source.
-- Legacy timeout keeps detach-then-park semantics (no close). A Slice 3 fresh
-  handoff has no reusable URL, so its timeout preserves the live tab as an
-  explicit manual park; cancel, settle, replacement and page capture still
-  close through the primitive. The work window is never closed directly —
-  Chrome discards it when its last tab closes.
-- The inertness net: every closing route has a positive test asserting the
-  tab is genuinely gone, and per-predicate negatives proven non-vacuous
-  (each fails if its predicate is deleted).
-
-### Slice 2 — make the harness tell the truth (LANDED)
-
-Three times this session, work was green in tests and wrong in a real browser.
-
-- Replace the three independent tab fakes (`adapters`, `background`, `keepalive`)
-  with one stateful fake that behaves like Chrome: clone returned snapshots,
-  reject absent ids, maintain one active tab per window, and emit `onUpdated`,
-  `onActivated` and `onRemoved` for programmatic operations. Do **not**
-  auto-complete navigation — Chrome completes later and tests must control it.
-- Expose explicit `completeNavigation`, `userNavigate`, `userActivate`,
-  `userClose` helpers and migrate the hand-rolled `live.set/delete` + manual
-  emits.
-- Add a sanitized cross-origin journey fixture: distinct local origins for SP,
-  discovery, IdP and callback; the IdP form carrying only a freshly generated
-  `execution` token; a callback; an expired-token response. Every engagement gets
-  a different token; replaying an old one must fail as stale.
-- Breakage in governor draining, self-navigation gates or cancellation is
-  **signal**; mechanical helper migration is churn.
-
-The faithful event model surfaced seven production defects that the old silent
-fakes could not express: login redrives during an unfinished sign-in, outcomes
-from closed tabs, duplicate stale-page surfacing, duplicate waiter redrives,
-and three keepalive supersession races. Each is now fixed against the shared
-fake; the SAML journey fixture also pins fresh execution tokens and stale-token
-replay rejection.
-
-Correction to an earlier assumption: the manifest requests broad `tabs`
-permission, so undefined `tab.url` is **not** a current production cause. Keep
-the case covered because the API type permits it, but the live risk is
-scripting/host permission across the IdP origin.
-
-### Slice 3 — cold offers are tabless until engagement (LANDED)
-
-Behind a negotiated `handoff_link_v1` feature flag:
-
-- Every `requires_auth: true` cold `job_offer` is stored as engagement-required
-  with **no tab and no persisted URL**. `requires_auth` selects this branch — not
-  "first adapter with federated login plus entity id". Missing federation
-  metadata is a structured engagement failure, never permission to pre-open.
-- `openHandoff` requests the URL by job id and creates exactly one tab. A later
-  click, or a click after restart, requests again rather than reading browser
-  storage.
-- The request is **holder-only** (ADR-0003). An old daemon keeps today's
-  behaviour rather than receiving an unknown request.
-- Daemon side: extract the CLI `actionURL` resolver into one shared helper used
-  by the CLI, offers and this handler — the reverted patch grew a second resolver
-  that had already diverged. Add the pair through Go, TypeScript, schema and
-  corpus, with fixtures both parsers decode.
-- The already-in-flight path is unchanged: a drive that hits a login wall still
-  navigates **its own** tab (pinned by `adapters.test.ts:1904-1962`).
-
-**The choke point (this is the part that failed before).** ONE claim-level choke
-point must cover both cold `openHandoff` engagements across different jobs AND
-in-flight login-wall routing. Today `openHandoffRequests` dedupes per job only,
-so "one click produces one tab" does not stop two sibling jobs concurrently
-passing an owner check. The transition must be:
-
-1. check the claim, and reserve durable ownership **before** any navigation —
-   the owner write lands before `tabs.update`/`tabs.create`, never after;
-2. re-check after the reservation;
-3. create or navigate;
-4. bind the returned tab id **synchronously**, before any later await;
-5. roll back the reservation on failure.
-
-A mutex wrapped around the reverted order (navigate, then write the owner) is
-**not** sufficient — that was the original defect. Worker death may then leave a
-stale reservation, which restart reconciliation repairs; it cannot produce two
-navigations. This lives in a small pure reducer, not a global lifecycle rewrite.
-
-Ship gates: offer produces zero tabs; one click produces one correlated request
-and one tab; a later click or a restart re-requests rather than reading browser
-storage; missing entity metadata stays tabless; direct-action, institutional and
-retrieval URLs match `actions open`; both skew directions stay connected;
-owner-write-before-navigate is pinned by a test; two sibling jobs racing the same
-institution produce exactly one navigation.
-
-Landed with the ship gates above. The fresh route exists only from correlated
-response through synchronous tab materialization: it is then deleted from the
-worker map, omitted from persisted job state, and represented in the managed-tab
-ledger only by a private sentinel. A durable opaque claim and fresh-handoff
-marker recover arbitration and timeout semantics after worker restart; the
-daemon's first re-offer also reassesses a login wall whose completion event ran
-while the worker was stopped. Structured failures remain in the popup/inbox
-instead of becoming session-fatal bridge errors.
-Engagement-required rows are outside every legacy queued-offer timer and
-evidence drain, while verified warm-session evidence retains the eager path.
-A re-offer also rebinds a migrated opaque claim to a live IdP tab and leaves a
-manually parked fresh tab outside governor capacity.
-A denied focus is best-effort and never retires a claim whose owner tab still
-exists.
-
 ### Slice 4 — only if field evidence still warrants it
 
 Explicit operator refresh of an already-owned stale in-flight tab, minting a new
@@ -215,6 +89,17 @@ central removal/governor/work-window/page-capture paths beyond the explicit
 per-caller transitions in Slice 1. These delivered none of the operator value and
 caused the final round's TOCTOU, persisted-URL, intentional-close and
 drive-release regressions.
+
+Relocated from the trimmed Slice 1-3 text: papio never auto-closes content —
+only papio's own scaffolding (job/handoff/capture tabs) closes. The forbidden
+pattern is UNRELATED awaits between check and act, not the one authoritative
+freshness read; no shadow-state reconstruction. The work window is never closed
+directly — Chrome discards it when its last tab closes. Do not auto-complete
+navigation in the harness — Chrome completes later and tests must control it.
+Missing federation metadata is a structured engagement failure, never
+permission to pre-open. A mutex wrapped around the reverted order (navigate,
+then write the owner) is not sufficient — the owner write must land before
+`tabs.update`/`tabs.create`, never after.
 
 ## Working discipline
 
