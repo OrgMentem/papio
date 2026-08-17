@@ -1041,3 +1041,144 @@ func TestPlanAndApplySkipsDOIOnlyReadyJobWhenLibraryAlreadyHasPDF(t *testing.T) 
 		t.Fatalf("status=%q parent=%q", status, parent)
 	}
 }
+
+func readyPlanServiceWork(t *testing.T, zotioKey string, cli CLI, w work.Work) (*Service, string) {
+	t.Helper()
+	ctx := context.Background()
+	dataDir := storetest.DataDir(t)
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	jobs := &job.Store{S: db}
+	artifacts, err := artifact.New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := "request_plan_" + job.NewID("wr")
+	jobID, err := jobs.CreateRequest(ctx, requestID, w, zotioKey, "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
+		JobID: jobID, Source: "unpaywall", URLRedacted: redact.URL("https://example.test/paper.pdf"), URLKey: "url-key",
+		LandingRedacted: "https://example.test/article", Version: "published", AccessBasis: "open_access",
+		ReuseLicense: "cc-by-4.0", ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := jobs.NextPendingCandidate(ctx, jobID)
+	if err != nil || candidate == nil {
+		t.Fatalf("candidate = %+v, %v", candidate, err)
+	}
+	if err := jobs.MarkCandidate(ctx, candidate.ID, "accepted"); err != nil {
+		t.Fatal(err)
+	}
+	quarantine, err := artifacts.QuarantineDir(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(quarantine, "paper.tmp")
+	body := []byte("%PDF-1.4\nfixture " + w.Describe() + "\n%%EOF")
+	if err := os.WriteFile(temp, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := artifact.HashFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactPath, err := artifacts.Promote(temp, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.UpsertArtifact(ctx, job.Artifact{
+		SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1,
+		TextChars: 1000, IdentityResult: "pass", Path: artifactPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}, {job.StateFetching, job.StateValidating}} {
+		if err := jobs.Transition(ctx, jobID, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := jobs.Transition(ctx, jobID, job.StateValidating, job.StateReady, nil, job.WithCandidate(candidate.ID), job.WithArtifact(sha)); err != nil {
+		t.Fatal(err)
+	}
+	exporter := &bundle.Exporter{Jobs: jobs, Artifacts: artifacts, DataDir: dataDir}
+	return &Service{
+		CLI: cli, Bundle: exporter, Store: db, DataDir: dataDir,
+		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC) },
+	}, jobID
+}
+
+func TestManifestCreatePlanStagesArXivWithoutDOI(t *testing.T) {
+	cli := &planCLI{
+		manifest: `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"arxiv","identifier":"2301.08745","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper"}}]}`,
+		preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:    `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"status":"applied","reason":{"via":"web","parent_key":"PA12RE34","attachment_key":"AT56CH90"}}]}}`,
+	}
+	service, jobID := readyPlanServiceWork(t, "", cli, work.Work{
+		ArXiv: "2301.08745", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	})
+	plans, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := plans[0]
+	if plan.Route != "manifest_create" || cli.syncCalls != 1 || cli.resolveCalls != 1 {
+		t.Fatalf("plan=%+v syncCalls=%d resolveCalls=%d", plan, cli.syncCalls, cli.resolveCalls)
+	}
+	staged := filepath.Join(cli.lastResolveAt, "arxiv-2301.08745.pdf")
+	if _, err := os.Stat(staged); err != nil {
+		t.Fatalf("staged arXiv PDF: %v", err)
+	}
+}
+
+func TestPlanRejectsNewItemWithoutRoutingIdentifier(t *testing.T) {
+	cli := &planCLI{}
+	service, jobID := readyPlanServiceWork(t, "", cli, work.Work{
+		Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	})
+	_, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err == nil || !strings.Contains(err.Error(), newItemRoutingRefusal) {
+		t.Fatalf("plan error = %v, want %q", err, newItemRoutingRefusal)
+	}
+	if cli.previewCalls != 0 || cli.syncCalls != 0 {
+		t.Fatalf("previewCalls=%d syncCalls=%d, want no Zotio calls", cli.previewCalls, cli.syncCalls)
+	}
+}
+
+func TestPlanAndApplySkipsArXivOnlyReadyJobWhenLibraryAlreadyHasPDF(t *testing.T) {
+	cli := &fakeCLI{
+		find: map[string]json.RawMessage{
+			"arxiv:2301.08745": json.RawMessage(`[{"key":"ARXIV001","data":{}}]`),
+		},
+	}
+	service, jobID := readyPlanServiceWork(t, "", cli, work.Work{
+		ArXiv: "2301.08745", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	})
+	status, parent, attach, err := service.PlanAndApply(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "duplicate" || parent != "ARXIV001" || attach != "" {
+		t.Fatalf("status=%q parent=%q attach=%q", status, parent, attach)
+	}
+}
+
+func TestImportBackfillClassifiesNoRoutingIdentifier(t *testing.T) {
+	ctx := context.Background()
+	service, jobID := readyPlanServiceWork(t, "", &planCLI{}, work.Work{
+		Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	})
+	class, reason, _, err := service.classifyImportBackfillJob(ctx, jobID, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if class != importBackfillExpectedFail || reason != newItemRoutingRefusal {
+		t.Fatalf("class=%d reason=%q, want expected_fail and %q", class, reason, newItemRoutingRefusal)
+	}
+}

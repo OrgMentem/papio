@@ -4,10 +4,12 @@ package zotio
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
+	"papio/internal/agentjson"
 	"papio/internal/job"
 )
 
@@ -36,27 +38,66 @@ type ImportBackfillItem struct {
 
 // ImportBackfillSummary counts the cohort honestly for operators and agents.
 type ImportBackfillSummary struct {
-	Selected             int  `json:"selected"`
-	WouldImport          int  `json:"would_import"`
-	AlreadyOwned         int  `json:"already_owned"`
-	ExpectedFail         int  `json:"expected_fail"`
-	Applied              int  `json:"applied,omitempty"`
-	Failed               int  `json:"failed,omitempty"`
-	IncludeNotRequested  bool `json:"include_not_requested"`
-	NotRequestedExcluded int  `json:"not_requested_excluded,omitempty"`
+	Selected                 int  `json:"selected"`
+	WouldImport              int  `json:"would_import"`
+	AlreadyOwned             *int `json:"already_owned,omitempty"`
+	AlreadyOwnedUndetermined bool `json:"already_owned_undetermined,omitempty"`
+	ExpectedFail             int  `json:"expected_fail"`
+	NewlyFiled               int  `json:"newly_filed,omitempty"`
+	AlreadyInLibrary         int  `json:"already_in_library,omitempty"`
+	SharedResolutionJobs     int  `json:"shared_resolution_jobs,omitempty"`
+	Failed                   int  `json:"failed,omitempty"`
+	IncludeNotRequested      bool `json:"include_not_requested"`
+	NotRequestedExcluded     int  `json:"not_requested_excluded,omitempty"`
 }
 
 // ImportBackfillResult is stable machine output for `papio zotio import-backfill`.
 type ImportBackfillResult struct {
-	DryRun       bool                  `json:"dry_run"`
-	Summary      ImportBackfillSummary `json:"summary"`
-	WouldImport  []ImportBackfillItem  `json:"would_import"`
-	AlreadyOwned []ImportBackfillItem  `json:"already_owned"`
-	ExpectedFail []ImportBackfillItem  `json:"expected_fail"`
-	Applied      []ImportBackfillItem  `json:"applied,omitempty"`
-	Failed       []ImportBackfillItem  `json:"failed,omitempty"`
-	Cursor       string                `json:"cursor,omitempty"`
-	Truncated    bool                  `json:"truncated"`
+	DryRun           bool                  `json:"dry_run"`
+	Summary          ImportBackfillSummary `json:"summary"`
+	WouldImport      []ImportBackfillItem  `json:"would_import"`
+	AlreadyOwned     []ImportBackfillItem  `json:"already_owned"`
+	ExpectedFail     []ImportBackfillItem  `json:"expected_fail"`
+	NewlyFiled       []ImportBackfillItem  `json:"newly_filed,omitempty"`
+	AlreadyInLibrary []ImportBackfillItem  `json:"already_in_library,omitempty"`
+	Failed           []ImportBackfillItem  `json:"failed,omitempty"`
+	Cursor           string                `json:"cursor,omitempty"`
+	Truncated        bool                  `json:"truncated"`
+}
+
+// MarshalJSON normalizes list fields through agentjson so machine output never
+// carries null row arrays and stays aligned with other papio agent surfaces.
+func (r ImportBackfillResult) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		DryRun           bool                  `json:"dry_run"`
+		Summary          ImportBackfillSummary `json:"summary"`
+		WouldImport      []ImportBackfillItem  `json:"would_import"`
+		AlreadyOwned     []ImportBackfillItem  `json:"already_owned"`
+		ExpectedFail     []ImportBackfillItem  `json:"expected_fail"`
+		NewlyFiled       []ImportBackfillItem  `json:"newly_filed,omitempty"`
+		AlreadyInLibrary []ImportBackfillItem  `json:"already_in_library,omitempty"`
+		Failed           []ImportBackfillItem  `json:"failed,omitempty"`
+		Cursor           string                `json:"cursor,omitempty"`
+		Truncated        bool                  `json:"truncated"`
+	}
+	wouldImport, _ := agentjson.Truncate(r.WouldImport, 0)
+	alreadyOwned, _ := agentjson.Truncate(r.AlreadyOwned, 0)
+	expectedFail, _ := agentjson.Truncate(r.ExpectedFail, 0)
+	newlyFiled, _ := agentjson.Truncate(r.NewlyFiled, 0)
+	alreadyInLibrary, _ := agentjson.Truncate(r.AlreadyInLibrary, 0)
+	failed, _ := agentjson.Truncate(r.Failed, 0)
+	return json.Marshal(wire{
+		DryRun:           r.DryRun,
+		Summary:          r.Summary,
+		WouldImport:      wouldImport,
+		AlreadyOwned:     alreadyOwned,
+		ExpectedFail:     expectedFail,
+		NewlyFiled:       newlyFiled,
+		AlreadyInLibrary: alreadyInLibrary,
+		Failed:           failed,
+		Cursor:           r.Cursor,
+		Truncated:        r.Truncated,
+	})
 }
 
 // ImportBackfillImporter plans and applies one ready job through the same path
@@ -111,15 +152,26 @@ func (s *Service) ImportBackfill(ctx context.Context, req ImportBackfillRequest,
 		},
 	}
 	if req.Apply {
-		result.Applied = []ImportBackfillItem{}
+		result.NewlyFiled = []ImportBackfillItem{}
+		result.AlreadyInLibrary = []ImportBackfillItem{}
 		result.Failed = []ImportBackfillItem{}
 	}
+
+	ownedParents, ownershipKnown := s.resolveImportBackfillOwnership(ctx, candidates)
+	if !ownershipKnown {
+		result.Summary.AlreadyOwnedUndetermined = true
+	} else {
+		count := 0
+		result.Summary.AlreadyOwned = &count
+	}
+
+	parentResolutionCounts := make(map[string]int)
 
 	for _, candidate := range candidates {
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
-		class, reason, parentKey, classifyErr := s.classifyImportBackfillJob(ctx, candidate.JobID)
+		class, reason, parentKey, classifyErr := s.classifyImportBackfillJob(ctx, candidate.JobID, ownedParents, ownershipKnown)
 		if classifyErr != nil {
 			return nil, classifyErr
 		}
@@ -134,7 +186,12 @@ func (s *Service) ImportBackfill(ctx context.Context, req ImportBackfillRequest,
 			result.Summary.WouldImport++
 			result.WouldImport = append(result.WouldImport, item)
 		case importBackfillAlreadyOwned:
-			result.Summary.AlreadyOwned++
+			if result.Summary.AlreadyOwned != nil {
+				*result.Summary.AlreadyOwned++
+			}
+			if item.ParentKey != "" {
+				parentResolutionCounts[item.ParentKey]++
+			}
 			result.AlreadyOwned = append(result.AlreadyOwned, item)
 		case importBackfillExpectedFail:
 			result.Summary.ExpectedFail++
@@ -154,49 +211,62 @@ func (s *Service) ImportBackfill(ctx context.Context, req ImportBackfillRequest,
 		case importBackfillAlreadyOwned:
 			status, appliedParent, attachmentKey, applyErr := importer.PlanAndApply(ctx, candidate.JobID)
 			s.recordAutoImportEvent(ctx, candidate.JobID, status, appliedParent, attachmentKey, applyErr)
-			applied := ImportBackfillItem{
+			outcome := ImportBackfillItem{
 				JobID:     candidate.JobID,
 				CreatedAt: candidate.CreatedAt,
 				Status:    status,
 				ParentKey: appliedParent,
 			}
 			if applyErr != nil {
-				applied.Status = "error"
-				applied.Error = SanitizeErrorHint(applyErr.Error())
-				if applied.Error == "" {
-					applied.Error = ErrorInfoFrom(applyErr).Hint
-				}
+				outcome.Status = "error"
+				outcome.Error = importBackfillItemError(applyErr)
 				result.Summary.Failed++
-				result.Failed = append(result.Failed, applied)
+				result.Failed = append(result.Failed, outcome)
 				continue
 			}
-			result.Summary.Applied++
-			result.Applied = append(result.Applied, applied)
+			if importBackfillStatusAlreadyInLibrary(status) {
+				outcome.Reason = "already_in_library"
+				if outcome.ParentKey != "" {
+					parentResolutionCounts[outcome.ParentKey]++
+				}
+				result.Summary.AlreadyInLibrary++
+				result.AlreadyInLibrary = append(result.AlreadyInLibrary, outcome)
+				continue
+			}
+			result.Summary.NewlyFiled++
+			result.NewlyFiled = append(result.NewlyFiled, outcome)
 			continue
 		}
 
 		status, appliedParent, attachmentKey, applyErr := importer.PlanAndApply(ctx, candidate.JobID)
 		s.recordAutoImportEvent(ctx, candidate.JobID, status, appliedParent, attachmentKey, applyErr)
-		applied := ImportBackfillItem{
+		outcome := ImportBackfillItem{
 			JobID:     candidate.JobID,
 			CreatedAt: candidate.CreatedAt,
 			Status:    status,
 			ParentKey: appliedParent,
 		}
 		if applyErr != nil {
-			applied.Status = "error"
-			applied.Error = SanitizeErrorHint(applyErr.Error())
-			if applied.Error == "" {
-				applied.Error = ErrorInfoFrom(applyErr).Hint
-			}
+			outcome.Status = "error"
+			outcome.Error = importBackfillItemError(applyErr)
 			result.Summary.Failed++
-			result.Failed = append(result.Failed, applied)
+			result.Failed = append(result.Failed, outcome)
 			continue
 		}
-		result.Summary.Applied++
-		result.Applied = append(result.Applied, applied)
+		if importBackfillStatusAlreadyInLibrary(status) {
+			outcome.Reason = "already_in_library"
+			if outcome.ParentKey != "" {
+				parentResolutionCounts[outcome.ParentKey]++
+			}
+			result.Summary.AlreadyInLibrary++
+			result.AlreadyInLibrary = append(result.AlreadyInLibrary, outcome)
+			continue
+		}
+		result.Summary.NewlyFiled++
+		result.NewlyFiled = append(result.NewlyFiled, outcome)
 	}
 
+	result.Summary.SharedResolutionJobs = countSharedResolutionJobs(parentResolutionCounts)
 	result.Summary.Selected = len(candidates)
 	if len(candidates) > 0 {
 		result.Cursor = candidates[len(candidates)-1].JobID
@@ -317,13 +387,15 @@ func (s *Service) countImportBackfillExcluded(ctx context.Context, includeNotReq
 	return count, err
 }
 
-func (s *Service) classifyImportBackfillJob(ctx context.Context, jobID string) (class importBackfillClass, reason, parentKey string, err error) {
+func (s *Service) classifyImportBackfillJob(ctx context.Context, jobID string, ownedParents map[string]string, ownershipKnown bool) (class importBackfillClass, reason, parentKey string, err error) {
 	row, err := s.Bundle.Jobs.Get(ctx, jobID)
 	if err != nil {
 		return importBackfillExpectedFail, "", "", err
 	}
-	if parentKey, owned := s.peekOwnedReadyImport(ctx, *row); owned {
-		return importBackfillAlreadyOwned, "already_in_library", parentKey, nil
+	if ownershipKnown {
+		if parentKey = ownedParents[jobID]; parentKey != "" {
+			return importBackfillAlreadyOwned, "already_in_library", parentKey, nil
+		}
 	}
 	if _, _, exportErr := s.Bundle.Export(ctx, jobID, ""); exportErr != nil {
 		info := ErrorInfoFrom(exportErr)
@@ -334,12 +406,69 @@ func (s *Service) classifyImportBackfillJob(ctx context.Context, jobID string) (
 		return importBackfillExpectedFail, reason, "", nil
 	}
 	if strings.TrimSpace(row.ZotioItemKey) == "" {
-		lookup := LookupWork{DOI: row.Work.DOI, ArXiv: row.Work.ArXiv, PMID: row.Work.PMID}
-		if lookup.DOI == "" && lookup.ArXiv == "" && lookup.PMID == "" {
-			return importBackfillExpectedFail, "new-item Zotio routing requires a DOI", "", nil
+		if !hasNewItemRoutingIdentifier(row.Work) {
+			info := ErrorInfoFrom(WithErrorInfo(fmt.Errorf(newItemRoutingRefusal)))
+			return importBackfillExpectedFail, info.Hint, "", nil
 		}
 	}
 	return importBackfillWouldImport, "", "", nil
+}
+
+// resolveImportBackfillOwnership batches LookupWorks the same way apply does so
+// dry-run can report real already-owned counts without one sync per job. For
+// 200 jobs this is four LookupWorks calls (50 works each), each doing one
+// mirror sync — roughly four syncs total, not 200.
+func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates []importBackfillCandidate) (map[string]string, bool) {
+	if s == nil || s.CLI == nil {
+		return nil, false
+	}
+	ownedParents := make(map[string]string, len(candidates))
+	const batchSize = 50
+	batchJobs := make([]string, 0, batchSize)
+	batchWorks := make([]LookupWork, 0, batchSize)
+	flush := func() bool {
+		if len(batchWorks) == 0 {
+			return true
+		}
+		result, err := s.LookupWorks(ctx, LookupWorksRequest{Works: batchWorks})
+		if err != nil {
+			return false
+		}
+		for i, jobID := range batchJobs {
+			if i >= len(result.Works) {
+				break
+			}
+			if result.Works[i].Status == OwnershipOwnedWithPDF && result.Works[i].ItemKey != "" {
+				ownedParents[jobID] = result.Works[i].ItemKey
+			}
+		}
+		batchJobs = batchJobs[:0]
+		batchWorks = batchWorks[:0]
+		return true
+	}
+	for _, candidate := range candidates {
+		row, err := s.Bundle.Jobs.Get(ctx, candidate.JobID)
+		if err != nil {
+			return nil, false
+		}
+		if strings.TrimSpace(row.ZotioItemKey) != "" {
+			continue
+		}
+		if !hasNewItemRoutingIdentifier(row.Work) {
+			continue
+		}
+		batchJobs = append(batchJobs, candidate.JobID)
+		batchWorks = append(batchWorks, lookupWorkFrom(row.Work))
+		if len(batchWorks) == batchSize {
+			if !flush() {
+				return nil, false
+			}
+		}
+	}
+	if !flush() {
+		return nil, false
+	}
+	return ownedParents, true
 }
 
 func (s *Service) peekOwnedReadyImport(ctx context.Context, row job.Row) (parentKey string, owned bool) {
@@ -355,6 +484,33 @@ func (s *Service) peekOwnedReadyImport(ctx context.Context, row job.Row) (parent
 		return "", false
 	}
 	return result.Works[0].ItemKey, true
+}
+
+func importBackfillStatusAlreadyInLibrary(status string) bool {
+	switch status {
+	case "no_op", "duplicate":
+		return true
+	default:
+		return false
+	}
+}
+
+func importBackfillItemError(err error) string {
+	message := SanitizeErrorHint(err.Error())
+	if message != "" {
+		return message
+	}
+	return ErrorInfoFrom(err).Hint
+}
+
+func countSharedResolutionJobs(parentCounts map[string]int) int {
+	shared := 0
+	for _, count := range parentCounts {
+		if count > 1 {
+			shared += count - 1
+		}
+	}
+	return shared
 }
 
 func (s *Service) recordAutoImportEvent(ctx context.Context, jobID, status, parentKey, attachmentKey string, err error) {

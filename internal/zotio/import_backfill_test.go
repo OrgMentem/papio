@@ -21,9 +21,10 @@ import (
 )
 
 type trackingImporter struct {
-	calls  []string
-	status map[string]string
-	errs   map[string]error
+	calls   []string
+	status  map[string]string
+	parents map[string]string
+	errs    map[string]error
 }
 
 func (t *trackingImporter) PlanAndApply(_ context.Context, jobID string) (string, string, string, error) {
@@ -35,7 +36,11 @@ func (t *trackingImporter) PlanAndApply(_ context.Context, jobID string) (string
 	if status == "" {
 		status = "applied"
 	}
-	return status, "PARENT01", "ATTACH01", nil
+	parentKey := t.parents[jobID]
+	if parentKey == "" {
+		parentKey = "PARENT01"
+	}
+	return status, parentKey, "ATTACH01", nil
 }
 
 func seedImportBackfillJob(t *testing.T, ctx context.Context, db *store.Store, id, createdAt string, autoImport bool, identity string, importStatus string) {
@@ -199,11 +204,14 @@ func TestImportBackfillMarksDuplicateForOwnedPapers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Summary.AlreadyOwned != 1 || len(result.AlreadyOwned) != 1 || result.AlreadyOwned[0].JobID != ownedJobID {
+	if result.Summary.AlreadyOwned == nil || *result.Summary.AlreadyOwned != 1 || len(result.AlreadyOwned) != 1 || result.AlreadyOwned[0].JobID != ownedJobID {
 		t.Fatalf("already_owned breakdown = %+v", result)
 	}
-	if result.Summary.Applied != 1 || result.Applied[0].Status != "duplicate" {
-		t.Fatalf("duplicate apply = %+v", result.Applied)
+	if result.Summary.NewlyFiled != 0 || len(result.NewlyFiled) != 0 {
+		t.Fatalf("newly_filed = %+v, want none for owned duplicate", result.NewlyFiled)
+	}
+	if result.Summary.AlreadyInLibrary != 1 || len(result.AlreadyInLibrary) != 1 || result.AlreadyInLibrary[0].Status != "duplicate" {
+		t.Fatalf("already_in_library apply = %+v", result.AlreadyInLibrary)
 	}
 	result2, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 10}, service)
 	if err != nil {
@@ -227,7 +235,7 @@ func TestImportBackfillApplyIdempotentReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Summary.Applied != 1 {
+	if result.Summary.NewlyFiled != 1 {
 		t.Fatalf("first apply summary = %+v", result.Summary)
 	}
 	result2, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 10}, service)
@@ -332,8 +340,8 @@ func TestImportBackfillFailureIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Summary.Failed != 1 || result.Summary.Applied != 1 {
-		t.Fatalf("summary = %+v, want one failed and one applied", result.Summary)
+	if result.Summary.Failed != 1 || result.Summary.NewlyFiled != 1 {
+		t.Fatalf("summary = %+v, want one failed and one newly filed", result.Summary)
 	}
 	if len(importer.calls) != 2 {
 		t.Fatalf("importer calls = %v, want both jobs attempted", importer.calls)
@@ -356,5 +364,96 @@ func TestImportBackfillExpectedFailEmptyTitle(t *testing.T) {
 	}
 	if !strings.Contains(result.ExpectedFail[0].Reason, "title") {
 		t.Fatalf("reason = %q, want a title validation failure", result.ExpectedFail[0].Reason)
+	}
+}
+
+func TestImportBackfillNoOpNotCountedAsNewlyFiled(t *testing.T) {
+	ctx := context.Background()
+	service, jobID := readyPlanService(t, "", &planCLI{})
+	enableAutoImportPolicy(t, ctx, service.Store, jobID)
+
+	importer := &trackingImporter{
+		status:  map[string]string{jobID: "no_op"},
+		parents: map[string]string{jobID: "AB12CD34"},
+	}
+	result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 10}, importer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.NewlyFiled != 0 || len(result.NewlyFiled) != 0 {
+		t.Fatalf("newly_filed = %+v, want no_op excluded", result)
+	}
+	if result.Summary.AlreadyInLibrary != 1 || result.AlreadyInLibrary[0].Status != "no_op" {
+		t.Fatalf("already_in_library = %+v", result.AlreadyInLibrary)
+	}
+}
+
+func TestImportBackfillDryRunOwnershipUndeterminedWithoutCLI(t *testing.T) {
+	ctx := context.Background()
+	dataDir := storetest.DataDir(t)
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	seedImportBackfillJob(t, ctx, db, "job_no_cli", createdAt, true, "pass", "")
+	service := importBackfillService(t, dataDir, db, nil)
+
+	result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Limit: 10}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Summary.AlreadyOwnedUndetermined {
+		t.Fatalf("summary = %+v, want ownership undetermined without CLI", result.Summary)
+	}
+	if result.Summary.AlreadyOwned != nil {
+		t.Fatalf("already_owned = %v, want omitted when undetermined", result.Summary.AlreadyOwned)
+	}
+}
+
+func TestImportBackfillDuplicateJobResolutionReported(t *testing.T) {
+	ctx := context.Background()
+	service, jobOne := readyPlanService(t, "", &planCLI{})
+	jobTwo := addReadyPlanJob(t, service, "request_backfill_dup_b")
+	enableAutoImportPolicy(t, ctx, service.Store, jobOne)
+	enableAutoImportPolicy(t, ctx, service.Store, jobTwo)
+
+	importer := &trackingImporter{
+		status: map[string]string{
+			jobOne: "duplicate",
+			jobTwo: "duplicate",
+		},
+		parents: map[string]string{
+			jobOne: "7HVY4FYV",
+			jobTwo: "7HVY4FYV",
+		},
+	}
+	result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 10}, importer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.AlreadyInLibrary != 2 {
+		t.Fatalf("already_in_library = %d, want 2", result.Summary.AlreadyInLibrary)
+	}
+	if result.Summary.SharedResolutionJobs != 1 {
+		t.Fatalf("shared_resolution_jobs = %d, want 1", result.Summary.SharedResolutionJobs)
+	}
+}
+
+func TestImportBackfillMarshalJSONNormalizesNullSlices(t *testing.T) {
+	raw, err := json.Marshal(ImportBackfillResult{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"would_import", "already_owned", "expected_fail"} {
+		if string(payload[key]) == "null" {
+			t.Fatalf("%s marshaled as null: %s", key, raw)
+		}
 	}
 }

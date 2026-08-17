@@ -54,17 +54,41 @@ Jobs submitted without policy.auto_import are excluded unless you pass
 			if !result.DryRun {
 				mode = "apply"
 			}
-			if _, err := fmt.Fprintf(opt.out,
-				"import-backfill %s: selected=%d would_import=%d already_owned=%d expected_fail=%d applied=%d failed=%d truncated=%t\n",
-				mode,
-				result.Summary.Selected,
-				result.Summary.WouldImport,
-				result.Summary.AlreadyOwned,
-				result.Summary.ExpectedFail,
-				result.Summary.Applied,
-				result.Summary.Failed,
-				result.Truncated,
-			); err != nil {
+			if result.DryRun {
+				alreadyOwned := "already_owned=undetermined"
+				if !result.Summary.AlreadyOwnedUndetermined && result.Summary.AlreadyOwned != nil {
+					alreadyOwned = fmt.Sprintf("already_owned=%d", *result.Summary.AlreadyOwned)
+				}
+				if _, err := fmt.Fprintf(opt.out,
+					"import-backfill %s: selected=%d would_import=%d %s expected_fail=%d truncated=%t\n",
+					mode,
+					result.Summary.Selected,
+					result.Summary.WouldImport,
+					alreadyOwned,
+					result.Summary.ExpectedFail,
+					result.Truncated,
+				); err != nil {
+					return err
+				}
+				if result.Summary.AlreadyOwnedUndetermined {
+					if _, err := fmt.Fprintf(opt.out, "ownership is resolved at apply time when Zotio is not configured\n"); err != nil {
+						return err
+					}
+				}
+			} else {
+				if _, err := fmt.Fprintf(opt.out,
+					"import-backfill %s: selected=%d newly_filed=%d already_in_library=%d failed=%d truncated=%t\n",
+					mode,
+					result.Summary.Selected,
+					result.Summary.NewlyFiled,
+					result.Summary.AlreadyInLibrary,
+					result.Summary.Failed,
+					result.Truncated,
+				); err != nil {
+					return err
+				}
+			}
+			if err := writeImportBackfillSharedResolutionNotice(opt.out, result); err != nil {
 				return err
 			}
 			if result.Summary.NotRequestedExcluded > 0 {
@@ -88,4 +112,23 @@ Jobs submitted without policy.auto_import are excluded unless you pass
 	command.Flags().IntVar(&limit, "limit", zotio.ImportBackfillLimitDefault, "maximum jobs per invocation (1-50)")
 	command.Flags().StringVar(&cursor, "cursor", "", "resume after the cursor returned by a previous invocation")
 	return command
+}
+
+func writeImportBackfillSharedResolutionNotice(out interface{ Write([]byte) (int, error) }, result zotio.ImportBackfillResult) error {
+	if result.Summary.SharedResolutionJobs == 0 {
+		return nil
+	}
+	alreadyCount := result.Summary.AlreadyInLibrary
+	if result.DryRun && result.Summary.AlreadyOwned != nil {
+		alreadyCount = *result.Summary.AlreadyOwned
+	}
+	if alreadyCount == 0 {
+		return nil
+	}
+	_, err := fmt.Fprintf(out,
+		"%d paper(s) in this batch resolved to items you already had; %d shared a Zotero item with another job in this batch\n",
+		alreadyCount,
+		result.Summary.SharedResolutionJobs,
+	)
+	return err
 }

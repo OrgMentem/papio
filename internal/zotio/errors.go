@@ -28,6 +28,7 @@ const (
 	ErrorClassLocalDBLocked            = "local_db_locked"
 	ErrorClassNetwork                  = "network"
 	ErrorClassBundleValidation         = "bundle_validation"
+	ErrorClassRoutingRequiresDOI       = "routing_requires_doi"
 	ErrorClassAlreadyInLibrary         = "already_in_library"
 	ErrorClassUnknown                  = "unknown"
 )
@@ -151,6 +152,9 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 	if strings.Contains(lower, "bundle validation:") {
 		return safeErrorInfo(ErrorClassBundleValidation, bundleValidationHint(lower), 0)
 	}
+	if strings.Contains(lower, "routing requires") {
+		return safeErrorInfo(ErrorClassRoutingRequiresDOI, newItemRoutingRefusal, 0)
+	}
 	if strings.Contains(lower, "classification=") && strings.Contains(lower, "duplicate") {
 		return safeErrorInfo(ErrorClassAlreadyInLibrary, "paper already in Zotero library", 0)
 	}
@@ -191,6 +195,7 @@ func IsErrorClass(class string) bool {
 		ErrorClassLocalDBLocked,
 		ErrorClassNetwork,
 		ErrorClassBundleValidation,
+		ErrorClassRoutingRequiresDOI,
 		ErrorClassAlreadyInLibrary,
 		ErrorClassUnknown:
 		return true

@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,6 +19,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/store"
+	"papio/internal/work"
 )
 
 const (
@@ -190,13 +190,13 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		plan.PreviewArgs = []string{"--agent", "attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
 		plan.ApplyArgs = []string{"--agent", "--yes", "attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
 	} else {
-		if acquisition.Identity.DOI == "" {
-			return nil, fmt.Errorf("new-item Zotio routing requires a DOI")
+		if !hasNewItemRoutingIdentifier(row.Work) {
+			return nil, fmt.Errorf(newItemRoutingRefusal)
 		}
 		if err := s.CLI.Sync(ctx); err != nil {
 			return nil, fmt.Errorf("refreshing Zotio library before deduplication: %w", err)
 		}
-		manifestPath, manifest, err := s.resolveManifest(ctx, plan)
+		manifestPath, manifest, err := s.resolveManifest(ctx, plan, row.Work)
 		if err != nil {
 			return nil, err
 		}
@@ -490,8 +490,8 @@ func (s *Service) skipOwnedReadyImport(ctx context.Context, jobID string) (statu
 	if strings.TrimSpace(row.ZotioItemKey) != "" {
 		return "", "", false, nil
 	}
-	lookupWork := LookupWork{DOI: row.Work.DOI, ArXiv: row.Work.ArXiv, PMID: row.Work.PMID}
-	if lookupWork.DOI == "" && lookupWork.ArXiv == "" && lookupWork.PMID == "" {
+	lookupWork := lookupWorkFrom(row.Work)
+	if lookupWork.DOI == "" && lookupWork.ArXiv == "" && lookupWork.PMID == "" && lookupWork.ISBN == "" {
 		return "", "", false, nil
 	}
 	lookup, err := s.LookupWorks(ctx, LookupWorksRequest{Works: []LookupWork{lookupWork}})
@@ -536,12 +536,15 @@ func (s *Service) LoadPlan(planID string) (*Plan, error) {
 	return &plan, nil
 }
 
-func (s *Service) resolveManifest(ctx context.Context, plan *Plan) (string, importManifest, error) {
+func (s *Service) resolveManifest(ctx context.Context, plan *Plan, w work.Work) (string, importManifest, error) {
 	stagingDir := filepath.Join(s.DataDir, "zotio", "staging", plan.JobID, plan.ArtifactSHA256)
 	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
 		return "", importManifest{}, err
 	}
-	name := url.PathEscape(strings.ToLower(plan.DOI)) + ".pdf"
+	name, err := importStagingBasename(w)
+	if err != nil {
+		return "", importManifest{}, err
+	}
 	staged := filepath.Join(stagingDir, name)
 	if err := materializePrivateFile(plan.ArtifactPath, staged, plan.ArtifactSHA256); err != nil {
 		return "", importManifest{}, err

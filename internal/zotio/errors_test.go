@@ -41,6 +41,7 @@ func TestClassifyErrorTable(t *testing.T) {
 		{name: "bundle validation title", err: errors.New("planning job job_deadbeef: bundle validation: identity has no citation title: resolve bibliographic metadata from the identifier or supply title and authors on the work request"), wantClass: ErrorClassBundleValidation, wantHint: "no citation record for this paper: verify the DOI or supply title and authors"},
 		{name: "already in library manifest", err: errors.New(`unsupported Zotio manifest outcome action="skip" classification="duplicate"`), wantClass: ErrorClassAlreadyInLibrary, wantHint: "paper already in Zotero library"},
 		{name: "unknown carries sanitized text", err: errors.New(pathLaden), wantClass: ErrorClassUnknown, wantHint: SanitizeErrorHint(pathLaden)},
+		{name: "routing requires doi", err: errors.New("planning job job_deadbeef: new-item Zotio routing requires a DOI"), wantClass: ErrorClassRoutingRequiresDOI, wantHint: newItemRoutingRefusal},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
