@@ -1184,16 +1184,25 @@ func (b *builder) evaluate(arm Arm, n int, absent bool, pools []Pool, eligible, 
 // outcome against the equivalence CLASS.
 func (b *builder) evaluatePool(arm Arm, n int, p Pool) Trial {
 	text := p.text
+	var metadata pdf.MetadataFields
 	if text == "" {
-		text = b.byKey[p.DocKey].Text
+		// A caller-supplied or per-axis pool names a real document by
+		// DocKey and is scored against that document's own extracted
+		// text AND its own embedded metadata; only a synthesized pool
+		// (conjunction, marker-gate) sets text directly, and it has no
+		// real file behind it to carry metadata for.
+		doc := b.byKey[p.DocKey]
+		text = doc.Text
+		metadata = doc.Metadata
 	}
+	bindDoc := pdf.BindDocument{Excerpt: text, Metadata: metadata}
 	trial := Trial{
 		DocKey:       p.DocKey,
 		Arm:          arm,
 		PoolSize:     len(p.Candidates),
 		TargetAbsent: p.TargetAbsent,
 	}
-	winner, ok, reason := pdf.SelectAutoBindCandidate(text, p.Candidates)
+	winner, ok, reason := pdf.SelectAutoBindCandidate(bindDoc, p.Candidates)
 	if ok {
 		trial.ChosenKey = winner.Key
 		trial.Evidence = winner.Evidence
@@ -1216,7 +1225,7 @@ func (b *builder) evaluatePool(arm Arm, n int, p Pool) Trial {
 	} else {
 		trial.Outcome = BindMissed
 	}
-	trial.TerminalGate = decisiveGate(text, p)
+	trial.TerminalGate = decisiveGate(bindDoc, p)
 	return trial
 }
 
@@ -1229,7 +1238,7 @@ const gateLabelNone = "(no gate reached)"
 // decisiveGate returns the observed terminal gate of the qualification an
 // ABSTENTION turned on. The selector returns a zero qualification when it
 // abstains, so the traversal is re-run here — QualifyCandidate is a pure
-// function of (excerpt, candidate) and the pool order is the same, so this
+// function of (doc, candidate) and the pool order is the same, so this
 // observes the same traversal rather than modelling it.
 //
 // Which qualification is decisive follows the selector's own causality
@@ -1245,13 +1254,13 @@ const gateLabelNone = "(no gate reached)"
 //
 // Ties resolve to pool order, which is key-sorted, so the answer is
 // deterministic.
-func decisiveGate(text string, p Pool) string {
+func decisiveGate(doc pdf.BindDocument, p Pool) string {
 	if len(p.Candidates) == 0 {
 		return gateLabelNone
 	}
 	quals := make([]pdf.CandidateQualification, len(p.Candidates))
 	for i, c := range p.Candidates {
-		quals[i] = pdf.QualifyCandidate(text, c)
+		quals[i] = pdf.QualifyCandidate(doc, c)
 	}
 	for _, q := range quals {
 		if q.Review {

@@ -179,7 +179,7 @@ func writeLargeFixturePDF(t *testing.T, path string) {
 // processSettledGrab). The transaction discipline around it — the
 // in-transaction fence, post-commit staging from the validated quarantine
 // copy, deferred-adoption recovery — is not what was found unsafe and is what
-// candidate_auto_bind/2 will reuse unchanged, so it must stay under test. A
+// the rebuilt candidate rule will reuse unchanged, so it must stay under test. A
 // test that needs a bind to happen says so here; every test that does not
 // call this observes production behaviour.
 func enableAutoBindDecision(t *testing.T) {
@@ -216,7 +216,7 @@ func TestSettledGrabUniqueQualifyingCandidateParks(t *testing.T) {
 	// The fixture must be one the predicate WOULD have bound, or this test
 	// proves nothing about the disabled decision — it would just be another
 	// abstention.
-	if _, ok, reason := pdf.SelectAutoBindCandidate(excerpt, []pdf.BindCandidate{{Key: candidateID, Work: candidateWork, Bound: []string{candidateWork.DOI}}}); !ok {
+	if _, ok, reason := pdf.SelectAutoBindCandidate(pdf.BindDocument{Excerpt: excerpt}, []pdf.BindCandidate{{Key: candidateID, Work: candidateWork, Bound: []string{candidateWork.DOI}}}); !ok {
 		t.Fatalf("fixture no longer uniquely qualifies (%s); this test would not exercise the disabled decision", reason)
 	}
 	b.svc.Validate = validateForExcerpt(excerpt)
@@ -304,8 +304,8 @@ func TestSettledGrabBindsUniqueQualifyingCandidateWhenEnabled(t *testing.T) {
 	if prov.Method != "candidate_auto_bind" || prov.Rule != pdf.CandidateBindingRule || prov.Winner != candidateID || len(prov.Evidence) == 0 {
 		t.Fatalf("provenance %+v missing expected fields", prov)
 	}
-	if prov.Rule != "candidate_auto_bind/2" {
-		t.Fatalf("rule = %q, want candidate_auto_bind/2", prov.Rule)
+	if prov.Rule != "candidate_auto_bind/3" {
+		t.Fatalf("rule = %q, want candidate_auto_bind/3", prov.Rule)
 	}
 	// The 1-of-N decision must be reconstructable: both candidates, in order,
 	// each with its terminal verdict.
@@ -523,12 +523,12 @@ func TestSettledGrabTieParks(t *testing.T) {
 		{Key: "b", Work: w2, Bound: []string{w2.DOI}},
 	}
 	for _, c := range cands {
-		q := pdf.QualifyCandidate(excerpt, c)
+		q := pdf.QualifyCandidate(pdf.BindDocument{Excerpt: excerpt}, c)
 		if !q.Qualifies {
 			t.Fatalf("tie fixture: candidate %s should qualify but got %+v", c.Key, q)
 		}
 	}
-	if _, ok, _ := pdf.SelectAutoBindCandidate(excerpt, cands); ok {
+	if _, ok, _ := pdf.SelectAutoBindCandidate(pdf.BindDocument{Excerpt: excerpt}, cands); ok {
 		t.Fatalf("tie fixture: SelectAutoBindCandidate should abstain on two qualifiers")
 	}
 
@@ -571,7 +571,7 @@ func TestSettledGrabReviewOnlyParks(t *testing.T) {
 		t.Fatalf("front-matter DOIs = %v, want empty for review-only", got)
 	}
 	// Prove the fixture is Review, not Qualifies.
-	q := pdf.QualifyCandidate(excerpt, pdf.BindCandidate{Key: "x", Work: w, Bound: []string{w.DOI}})
+	q := pdf.QualifyCandidate(pdf.BindDocument{Excerpt: excerpt}, pdf.BindCandidate{Key: "x", Work: w, Bound: []string{w.DOI}})
 	if q.Qualifies || !q.Review {
 		t.Fatalf("review fixture: want Review true Qualifies false, got %+v", q)
 	}

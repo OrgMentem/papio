@@ -2,6 +2,8 @@
 package pdf
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -41,10 +43,46 @@ import (
 // became gates, author evidence was scoped, title-prefix semantics tightened,
 // year semantics changed — while the constant stayed `/1`. A version that
 // names two different acceptance sets is not a version: a `/1` provenance row
-// cannot be told apart from an unsafe pre-repair one. Hence `/2`. Historical
-// provenance is never rewritten; rows genuinely decided by `/1` keep saying so
-// and `papio doctor` names them (see grab.Service.BoundByRule).
-const CandidateBindingRule = "candidate_auto_bind/2"
+// cannot be told apart from an unsafe pre-repair one. Hence `/2`. `/3` adds
+// embedded metadata as a second source for gate 5's identifier corroboration
+// (see metadata.go), which widens the acceptance set — a document naming
+// itself only in its XMP packet qualifies under `/3` and reached Review under
+// `/2`. Historical provenance is never rewritten; rows genuinely decided by an
+// earlier rule keep saying so and `papio doctor` names them (see
+// grab.Service.BoundByRule).
+const CandidateBindingRule = "candidate_auto_bind/3"
+
+// BindDocument is the inbound document side of a candidate decision: the text
+// the identity rules read, plus the file's own embedded metadata.
+//
+// Metadata is optional and additive. An empty Metadata reproduces the text-only
+// behaviour exactly, which is the ordinary case for scans and for any file no
+// publisher produced — so a caller that cannot supply it (a synthetic fixture,
+// a gate-reachability probe over constructed text) loses no correctness, only
+// the coverage metadata would have added.
+type BindDocument struct {
+	Excerpt  string
+	Metadata MetadataFields
+}
+
+// Digest identifies everything the predicate read, for callers that must pin a
+// decision's input without storing scholarly text — in practice the auto-bind
+// provenance row.
+//
+// A document carrying no usable metadata digests to exactly the SHA-256 of its
+// excerpt, unchanged from when text was the only input, so the common case stays
+// comparable across rule versions. Metadata is folded in only when it exists,
+// separated by a NUL that cannot occur in either part, because two decisions
+// differing only in metadata — one binding, one parking — must not record the
+// same digest: an audit row that cannot distinguish its own inputs cannot
+// reconstruct its decision.
+func (d BindDocument) Digest() string {
+	sum := sha256.Sum256([]byte(d.Excerpt))
+	if canonical := d.Metadata.Canonical(); canonical != "" {
+		sum = sha256.Sum256([]byte(d.Excerpt + "\x00" + canonical))
+	}
+	return hex.EncodeToString(sum[:])
+}
 
 // BindCandidate is one job inbound bytes might belong to.
 type BindCandidate struct {
@@ -120,10 +158,11 @@ func (q *CandidateQualification) reach(g CandidateGate) {
 // The rule is deliberately stricter than MatchIdentity. Each numbered gate
 // below carries a WHY comment recording the divergence and the measured risk
 // it closes. All gates must pass for Qualifies to be true. Absent identifier
-// corroboration on page one is the one gate that yields Review instead of a
-// hard disqualification, because metadata agreement without a document-printed
-// identifier is suggestive but not self-asserting.
-func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualification {
+// corroboration — in the document's page-one text or in its own embedded
+// metadata — is the one gate that yields Review instead of a hard
+// disqualification, because curated-metadata agreement without the document
+// naming itself is suggestive but not self-asserting.
+func QualifyCandidate(doc BindDocument, candidate BindCandidate) CandidateQualification {
 	q := CandidateQualification{Key: candidate.Key}
 
 	// 1. Conclusive-identity veto must not block.
@@ -137,14 +176,14 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// similarity alone. CheckConclusiveIdentity is reused single-sourced so
 	// the window definition never diverges.
 	q.reach(GateConclusiveVeto)
-	veto := CheckConclusiveIdentity(excerpt, candidate.Bound)
+	veto := CheckConclusiveIdentity(doc.Excerpt, candidate.Bound)
 	if veto.Blocks() {
 		q.Reason = "conclusive_identity_blocks: " + veto.Verdict
 		q.Evidence = append([]string(nil), veto.Evidence...)
 		return q
 	}
 
-	bylineText := identityByline(excerpt)
+	bylineText := identityByline(doc.Excerpt)
 	segments := bylineSegments(bylineText)
 	phrase := identityTitlePhrase(candidate.Work.Title)
 
@@ -356,10 +395,11 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 		}
 	}
 
-	// 5. Identifier corroboration scoped to page one.
+	// 5. Identifier corroboration: the document naming itself, in page-one
+	//    text or in its own embedded metadata.
 	//
-	// WHY scoped and WHY review: corroboratingIdentifier is what separates
-	// "the metadata agrees" from "the document says so itself". The blind
+	// WHY scoped and WHY review: corroboration here is what separates "the
+	// curated metadata agrees" from "the document says so itself". The blind
 	// front-matter DOI window (1 KiB, conclusive DOIs only) misses a DOI
 	// printed in a running footer or below the abstract — 17 of 40 real
 	// papers — so a metadata-only title/author/year agreement would park
@@ -367,22 +407,41 @@ func QualifyCandidate(excerpt string, candidate BindCandidate) CandidateQualific
 	// Searching the whole document is safe for MatchIdentity only because the
 	// title gate has already fired; for candidate selection the same whole-
 	// document search would let a reference-list citation of the candidate's
-	// DOI corroborate the wrong document. This gate therefore reuses
+	// DOI corroborate the wrong document. The text arm therefore reuses
 	// corroboratingIdentifier but against identityPageOne (4 KiB, first page)
 	// — the widest front-matter window that still excludes the bibliography
-	// — never the whole excerpt. Absent corroboration the candidate is not
-	// auto-bindable but IS Review:true: the metadata agreement is suggestive
-	// and worth surfacing as a ranked suggestion, but without a document-
-	// printed identifier it must not bind autonomously. A future change to
-	// the 4 KiB bound is a new rule version.
+	// — never the whole excerpt. A future change to the 4 KiB bound is a new
+	// rule version.
+	//
+	// WHY embedded metadata satisfies the same gate: the attribution problem
+	// the text arm can only approximate does not arise there. A reference list
+	// cannot reach a file's XMP packet, and prism:doi means "this file is that
+	// DOI" by definition of the field, so an allowlisted hit is the document
+	// asserting its own identity rather than text that might be a citation.
+	// Measured over the operator's library it reaches 34.2% of the documents
+	// that get this far against the text arm's 18%, nearly disjointly, with no
+	// document's metadata naming a different library work (~185k pairs).
+	//
+	// WHY it corroborates but never authorises: this is gate 5, so title,
+	// author and year have already had to agree. That ordering is what keeps a
+	// supplement out — its XMP ordinarily carries its PARENT article's DOI, so
+	// metadata alone would bind supplementary bytes under the article's
+	// citation, and only the earlier gates can tell them apart. Metadata may
+	// substitute for WHERE the identifier was found, never for identity-frame
+	// agreement.
 	q.reach(GateIdentifier)
-	pageOne := identityPageOne(excerpt)
-	if corr := corroboratingIdentifier(pageOne, candidate.Work); corr == "" {
-		q.Review = true
-		q.Reason = "identifier_not_printed_on_page_one"
-		return q
-	} else {
+	pageOne := identityPageOne(doc.Excerpt)
+	switch corr := corroboratingIdentifier(pageOne, candidate.Work); {
+	case corr != "":
 		q.Evidence = append(q.Evidence, corr)
+	default:
+		meta := doc.Metadata.NamesWork(candidate.Work)
+		if meta == "" {
+			q.Review = true
+			q.Reason = "identifier_not_printed_on_page_one"
+			return q
+		}
+		q.Evidence = append(q.Evidence, meta)
 	}
 
 	q.Qualifies = true
@@ -681,7 +740,7 @@ func candidateStrictTitleRunMatches(segments []titleSegment, offset int, phrase 
 // Deterministic iteration order; never depends on map order. The caller
 // supplies candidates in a stable slice order and this function evaluates them
 // in that order.
-func SelectAutoBindCandidate(excerpt string, candidates []BindCandidate) (winner CandidateQualification, ok bool, reason string) {
+func SelectAutoBindCandidate(doc BindDocument, candidates []BindCandidate) (winner CandidateQualification, ok bool, reason string) {
 	if len(candidates) == 0 {
 		return CandidateQualification{}, false, "no candidates"
 	}
@@ -689,7 +748,7 @@ func SelectAutoBindCandidate(excerpt string, candidates []BindCandidate) (winner
 	var hasReview bool
 	var reviewKey string
 	for _, c := range candidates {
-		q := QualifyCandidate(excerpt, c)
+		q := QualifyCandidate(doc, c)
 		if q.Review {
 			hasReview = true
 			if reviewKey == "" {

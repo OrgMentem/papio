@@ -34,6 +34,7 @@ type ValidationReport struct {
 	Payload    PayloadReport
 	Structural StructuralReport
 	Text       TextReport
+	Metadata   MetadataFields
 	Identity   IdentityDecision
 	Evidence   []string
 }
@@ -68,6 +69,16 @@ func Validate(ctx context.Context, in ValidationInput, opt ValidationOptions) (V
 		return report, err
 	}
 	report.Text = text
+	// Embedded metadata is read for every valid PDF, before the identity
+	// decision, because the candidate-binding predicate consumes it as a
+	// second source for the same identifier corroboration the text supplies
+	// (see metadata.go). It is never required: absence yields empty fields and
+	// no error, so a file no publisher produced validates exactly as before.
+	metadata, err := ExtractMetadata(ctx, in.Path, in.Capability, opt.Semantic)
+	if err != nil {
+		return report, err
+	}
+	report.Metadata = metadata
 	if text.NeedsReview {
 		report.Identity = IdentityDecision{Result: IdentityReview, Evidence: append([]string(nil), text.Evidence...)}
 		return report, nil

@@ -11,6 +11,24 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **A captured PDF that names itself in its own file metadata can now be
+  recognised, without reading a word of the page.** Publishers stamp a paper's
+  DOI into the PDF's invisible metadata during production (the PRISM,
+  CrossMark, `pdfx` and Dublin Core fields), and *papio* never looked. Reading
+  it answers a question the page text cannot: a reference list can never reach
+  a file's metadata packet, so a DOI found there is the document stating its
+  own identity rather than text that might be a citation of someone else's
+  work — the ambiguity that made automatic filing unsafe. Measured against the
+  papers in your own library that reach this decision, it recognises **27%**,
+  and nearly all of them are papers where the printed page never shows the
+  identifier at all. It is deliberately narrow: only fields whose defined
+  meaning is "this document's identifier" are read, never free text like the
+  Subject or Title, which anyone can fill with anything. It corroborates and
+  never decides alone — title, authors and year must still agree, which is what
+  keeps a supplementary-materials file, whose metadata carries its parent
+  article's DOI, from being filed as the article. Automatic filing itself stays
+  switched off pending measurement, so today this makes the evidence better
+  rather than changing what happens to your captures.
 - **A captured PDF without a front-matter DOI parks for you to identify, as before.** Automatic binding — filing such a capture against the single pending paper whose title, authors, year and identifier all agreed — was built, measured, and then **withdrawn before release** during review. It read a mention of a paper's identifier as the document identifying itself, so a document that merely *cites* a paper (an erratum, a supplement, a journal expansion printing "Extended from DOI …") could be filed as that paper. That is the one mistake *papio* refuses to make, so the capture parks for human identification instead. The measurement corpus keeps the five documents that demonstrate the failure, so the rule cannot return until it abstains on all of them. What you keep from this work: the popup asks which paper a PDF belongs to at the moment you send it, and the daemon refuses any choice the document's own front matter contradicts.
 - **`papio doctor` now says how much of today's metered allowance is gone.** A
   daily ceiling that can park a source was enforced with nothing on any surface

@@ -7632,11 +7632,14 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 		//
 		// The machinery below stays whole and stays reachable. The predicate,
 		// the eligibility pool, the in-transaction fence, the provenance
-		// column and the measurement corpus are the substrate the
-		// candidate_auto_bind/2 rebuild needs, and /2 changes the predicate,
-		// not the transaction discipline around it. Only the DECISION is off:
-		// tests set autoBindDecisionEnabled so the fence, staging and recovery
-		// paths keep being exercised.
+		// column and the measurement corpus are the substrate the rebuilt
+		// rule needs, and a rule version change alters the predicate, not the
+		// transaction discipline around it. candidate_auto_bind/3 has since
+		// added embedded-metadata corroboration to the identifier gate — a
+		// source with no attribution ambiguity, since a reference list cannot
+		// reach a file's XMP packet — but the DECISION stays off until the
+		// corpus measures the new predicate: tests set autoBindDecisionEnabled
+		// so the fence, staging and recovery paths keep being exercised.
 		candidates, err := b.jobs.ListCandidateEligibleJobs(ctx)
 		if err != nil {
 			return err
@@ -7645,7 +7648,7 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 		autoBindAttempted := autoBindDecisionEnabled
 		autoBindOutcome := grab.AutoBindOutcomeNotAttempted()
 		if autoBindDecisionEnabled {
-			bound, err := b.attemptAutoBind(ctx, g, dir, name, temp, report.Text.Excerpt)
+			bound, err := b.attemptAutoBind(ctx, g, dir, name, temp, pdf.BindDocument{Excerpt: report.Text.Excerpt, Metadata: report.Metadata})
 			if err != nil {
 				return err
 			}
@@ -7696,7 +7699,7 @@ var autoBindDecisionEnabled = false
 // Abstention is the default: an empty pool, a tie, a Review verdict, or a
 // fence rejection all return (false, nil). The only path that returns true is
 // a committed bind.
-func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, temp, excerpt string) (bool, error) {
+func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, temp string, doc pdf.BindDocument) (bool, error) {
 	candidates, err := b.jobs.ListCandidateEligibleJobs(ctx)
 	if err != nil {
 		return false, err
@@ -7713,7 +7716,7 @@ func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, t
 			Bound: c.BoundDOIs,
 		})
 	}
-	winner, ok, abstainReason := pdf.SelectAutoBindCandidate(excerpt, bindCandidates)
+	winner, ok, abstainReason := pdf.SelectAutoBindCandidate(doc, bindCandidates)
 	if !ok {
 		if abstainReason != "" {
 			log.Printf("papio: auto-bind abstained for grab %s: %s (candidates %d)", g.ID, abstainReason, len(bindCandidates))
@@ -7754,7 +7757,7 @@ func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, t
 				Bound: c.BoundDOIs,
 			})
 		}
-		freshWinner, freshOK, _ := pdf.SelectAutoBindCandidate(excerpt, freshCandidates)
+		freshWinner, freshOK, _ := pdf.SelectAutoBindCandidate(doc, freshCandidates)
 		if !freshOK || freshWinner.Key != winner.Key {
 			return grab.BindProvenance{}, grab.ErrFenceRejected
 		}
@@ -7763,7 +7766,7 @@ func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, t
 		if err := grab.RecordEligibilitySnapshotTx(ctx, tx, g.ID, grab.SnapshotPhaseFencedCommit, fencedSnap); err != nil {
 			return grab.BindProvenance{}, err
 		}
-		return autoBindProvenance(excerpt, freshCandidates, freshWinner), nil
+		return autoBindProvenance(doc, freshCandidates, freshWinner), nil
 	}
 	if err := b.grabs.MarkBoundToJobFenced(ctx, g.ID, winner.Key, "job_created", decide); err != nil {
 		if errors.Is(err, grab.ErrFenceRejected) {
@@ -7828,17 +7831,22 @@ func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, t
 // table with each one's terminal verdict, the winner's evidence, the exact
 // rule version, and a hash pinning the bytes the predicate read.
 //
-// It stores no scholarly text. The excerpt is identified by digest, not
+// It stores no scholarly text. The document is identified by digest, not
 // copied: the document itself is already durable in the artifact store, and a
 // second copy in an audit column would be content nothing manages the lifetime
 // of. Losing candidates contribute their machine reason code only — the
 // winner's evidence is the one place document-derived strings belong, because
 // it is the justification for the row that was written.
-func autoBindProvenance(excerpt string, candidates []pdf.BindCandidate, winner pdf.CandidateQualification) grab.BindProvenance {
-	sum := sha256.Sum256([]byte(excerpt))
+//
+// The digest covers everything the predicate read, which under
+// candidate_auto_bind/3 is the excerpt AND the file's allowlisted embedded
+// metadata — see pdf.BindDocument.Digest, which keeps a document with no
+// metadata digesting to exactly its excerpt hash so the common case stays
+// comparable with rows written by earlier rules.
+func autoBindProvenance(doc pdf.BindDocument, candidates []pdf.BindCandidate, winner pdf.CandidateQualification) grab.BindProvenance {
 	verdicts := make([]grab.CandidateVerdict, 0, len(candidates))
 	for _, c := range candidates {
-		q := pdf.QualifyCandidate(excerpt, c)
+		q := pdf.QualifyCandidate(doc, c)
 		v := grab.CandidateVerdict{JobID: c.Key}
 		switch {
 		case q.Qualifies:
@@ -7859,7 +7867,7 @@ func autoBindProvenance(excerpt string, candidates []pdf.BindCandidate, winner p
 		CandidatesConsidered: len(candidates),
 		Evidence:             winner.Evidence,
 		Candidates:           verdicts,
-		ExcerptSHA256:        hex.EncodeToString(sum[:]),
+		ExcerptSHA256:        doc.Digest(),
 	}
 }
 

@@ -105,7 +105,7 @@ func TestCandidateFixtureGeometry(t *testing.T) {
 	if strings.Contains(alpha.Text, "\f") {
 		t.Fatal("fixture emits a form feed, which would truncate the page-one window")
 	}
-	q := pdf.QualifyCandidate(alpha.Text, candidateFor(alpha))
+	q := pdf.QualifyCandidate(pdf.BindDocument{Excerpt: alpha.Text}, candidateFor(alpha))
 	if !q.Qualifies {
 		t.Fatalf("fixture does not qualify against its own metadata: gate %s reason %q", q.Gate, q.Reason)
 	}

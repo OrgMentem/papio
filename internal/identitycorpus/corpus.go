@@ -51,6 +51,14 @@ type Document struct {
 	OCRUsed     bool
 	NeedsReview bool
 
+	// Metadata is the PDF's own embedded metadata — the allowlisted fields
+	// of its Info dictionary and XMP packet whose semantics name the
+	// document itself (PRISM/CrossMark/pdfx DOI fields, and the like),
+	// from pdf.ExtractMetadata. An empty value means the file carried none
+	// of them, which reproduces today's text-only candidate-binding
+	// behaviour exactly.
+	Metadata pdf.MetadataFields
+
 	// Secondary reports that this attachment is NOT its parent's primary
 	// PDF — the lowest-itemID one dedupOnePerParent keeps. It is always
 	// false in the default one-per-parent mode, where every document is
@@ -1394,18 +1402,24 @@ const cacheTempPattern = "identity-corpus-*.tmp"
 // cacheFormatVersion is part of every cache entry's filename. Bump it whenever
 // ExtractText's output or cacheEntry's shape changes, so a warm cache cannot
 // serve text produced by an extractor that no longer exists. Version 2 carries
-// the OCR page separator and the extraction flags below.
-const cacheFormatVersion = 2
+// the OCR page separator and the extraction flags below. Version 3 adds the
+// embedded Info-dict/XMP metadata pdf.ExtractMetadata reads alongside the
+// text, for the same reason: a warm cache from before that extraction
+// existed would otherwise go on serving entries with no Metadata forever,
+// silently reading as "this document carries no embedded metadata" for
+// every document it ever touched.
+const cacheFormatVersion = 3
 
 // cacheEntry is one cached extraction. It holds the flags as well as the text
 // because a cache hit used to reconstruct only Text and Chars, leaving OCRUsed
 // and NeedsReview false — so a warm run reported every document as having a
 // real text layer, and any rule conditioned on OCR read that as true.
 type cacheEntry struct {
-	Text        string `json:"text"`
-	Chars       int64  `json:"chars"`
-	OCRUsed     bool   `json:"ocr_used"`
-	NeedsReview bool   `json:"needs_review"`
+	Text        string             `json:"text"`
+	Chars       int64              `json:"chars"`
+	OCRUsed     bool               `json:"ocr_used"`
+	NeedsReview bool               `json:"needs_review"`
+	Metadata    pdf.MetadataFields `json:"metadata,omitempty"`
 }
 
 // writeCacheEntry writes text to cachePath by creating a same-directory
@@ -1539,6 +1553,7 @@ func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts
 				base.Chars = entry.Chars
 				base.OCRUsed = entry.OCRUsed
 				base.NeedsReview = entry.NeedsReview
+				base.Metadata = entry.Metadata
 				return base, Skip{}, true
 			}
 		}
@@ -1550,6 +1565,16 @@ func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts
 	}
 	if report.Excerpt == "" {
 		return Document{}, Skip{Key: p.cand.attachmentKey, Reason: classifyExtractionFailure(report.Evidence)}, false
+	}
+
+	// Embedded metadata is corroborating evidence for an otherwise-admitted
+	// document, never an admission criterion of its own: a read failure
+	// here must degrade to "no metadata evidence" — exactly how a document
+	// that genuinely carries none already behaves — and must never turn a
+	// good text extraction into a Skip.
+	metadata, err := pdf.ExtractMetadata(ctx, p.path, capability, opts)
+	if err != nil {
+		metadata = nil
 	}
 
 	if cachePath != "" {
@@ -1564,6 +1589,7 @@ func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts
 			Chars:       report.Chars,
 			OCRUsed:     report.OCRUsed,
 			NeedsReview: report.NeedsReview,
+			Metadata:    metadata,
 		}); err == nil {
 			_ = writeCacheEntry(cachePath, encoded)
 		}
@@ -1573,5 +1599,6 @@ func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts
 	base.Chars = report.Chars
 	base.OCRUsed = report.OCRUsed
 	base.NeedsReview = report.NeedsReview
+	base.Metadata = metadata
 	return base, Skip{}, true
 }

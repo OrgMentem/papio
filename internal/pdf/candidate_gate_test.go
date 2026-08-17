@@ -322,7 +322,7 @@ func TestCandidateSelectionGate(t *testing.T) {
 		// Observation. The probe candidate's traversal is what the case
 		// claims to measure; every other candidate is traced too, so the log
 		// shows the whole pool the 1-of-N decision actually saw.
-		probe := QualifyCandidate(excerpt, bindCandidateByKey(candidates, c.ProbeCandidate))
+		probe := QualifyCandidate(BindDocument{Excerpt: excerpt}, bindCandidateByKey(candidates, c.ProbeCandidate))
 		observed := probe.Gate
 		t.Logf("  %-34s probe=%-12s gate=%-22s disposition=%-7s reached=%v reason=%q",
 			c.ID, c.ProbeCandidate, observed, probe.Disposition(), probe.Reached, probe.Reason)
@@ -330,7 +330,7 @@ func TestCandidateSelectionGate(t *testing.T) {
 			if cand.Key == c.ProbeCandidate {
 				continue
 			}
-			q := QualifyCandidate(excerpt, cand)
+			q := QualifyCandidate(BindDocument{Excerpt: excerpt}, cand)
 			t.Logf("      pool  %-12s gate=%-22s disposition=%-7s reason=%q", q.Key, q.Gate, q.Disposition(), q.Reason)
 		}
 
@@ -353,7 +353,7 @@ func TestCandidateSelectionGate(t *testing.T) {
 
 		// Scoring runs over the WHOLE pool: this is a 1-of-N selection and a
 		// pairwise score would not see an ambiguous second qualifier.
-		winner, ok, _ := SelectAutoBindCandidate(excerpt, candidates)
+		winner, ok, _ := SelectAutoBindCandidate(BindDocument{Excerpt: excerpt}, candidates)
 
 		cur := &mainT
 		if c.VetoWindow {
@@ -694,7 +694,7 @@ func TestCandidateGateSentinels(t *testing.T) {
 				}
 			}
 
-			winner, ok, reason := SelectAutoBindCandidate(excerpt, s.candidates)
+			winner, ok, reason := SelectAutoBindCandidate(BindDocument{Excerpt: excerpt}, s.candidates)
 			if ok != s.expectOk {
 				t.Fatalf("sentinel %s (%s): SelectAutoBind ok=%v want %v reason %q winner %+v", s.file, s.description, ok, s.expectOk, reason, winner)
 			}
@@ -706,7 +706,7 @@ func TestCandidateGateSentinels(t *testing.T) {
 					t.Fatalf("sentinel %s (%s): winner should qualify but got %+v", s.file, s.description, winner)
 				}
 			} else if s.expectReview {
-				q := QualifyCandidate(excerpt, bindCandidateByKey(s.candidates, s.reviewKey))
+				q := QualifyCandidate(BindDocument{Excerpt: excerpt}, bindCandidateByKey(s.candidates, s.reviewKey))
 				if !q.Review {
 					t.Fatalf("sentinel %s (%s): expected Review for %q but got Qualify %+v (Select reason %q)", s.file, s.description, s.reviewKey, q, reason)
 				}

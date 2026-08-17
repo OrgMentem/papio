@@ -5,18 +5,31 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"papio/internal/pdf"
 )
 
-// TestCacheEntryRoundTripsExtractionFlags pins the flags into the entry.
+// TestCacheEntryRoundTripsExtractionFlags pins the flags, and now the
+// embedded metadata, into the entry.
 //
 // A cache hit used to rebuild only the text and character count, so OCRUsed and
 // NeedsReview came back false for every cached document. A warm run therefore
 // reported a library with no OCR in it, and any rule conditioned on OCR — the
 // structural work's refusal to trust page boundaries in OCR text is the one
-// that matters — read that as "this document has a real text layer".
+// that matters — read that as "this document has a real text layer". Metadata
+// is pinned for the identical reason: a cache hit that dropped it would go on
+// reporting a document with embedded metadata as carrying none, forever,
+// until its cache entry happened to expire some other way.
 func TestCacheEntryRoundTripsExtractionFlags(t *testing.T) {
-	want := cacheEntry{Text: "page one\fpage two", Chars: 17, OCRUsed: true, NeedsReview: true}
+	want := cacheEntry{
+		Text:        "page one\fpage two",
+		Chars:       17,
+		OCRUsed:     true,
+		NeedsReview: true,
+		Metadata:    pdf.MetadataFields{{Field: "xmp/prism:doi", Value: "10.5555/test.2022.501"}},
+	}
 
 	encoded, err := json.Marshal(want)
 	if err != nil {
@@ -26,7 +39,7 @@ func TestCacheEntryRoundTripsExtractionFlags(t *testing.T) {
 	if err := json.Unmarshal(encoded, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("entry round-tripped as %+v, want %+v", got, want)
 	}
 }

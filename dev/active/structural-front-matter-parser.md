@@ -532,6 +532,57 @@ Constraints that still apply, and are not negotiable:
   That is a threat-model question this measurement does not address and is the one part of this
   increment worth adversarial review.
 
+### A1. Shipped, 2026-08-17 — metadata corroboration
+
+Implemented as the first behaviour-changing increment, ahead of the parser, in
+`internal/pdf/metadata.go` with the gate change in `candidate_select.go`:
+
+- `ExtractMetadata` reads the XMP packet through `pdfinfo` in one bounded subprocess.
+  The Info dictionary is **not** read: the PDF specification gives it no
+  identifier-semantic key, and every Info-dict hit in the measurement was free text.
+- Allowlist of fields whose defined meaning is "this document's identifier":
+  `prism:doi`, `prism:url`, `crossmark:doi`, `crossmark:doiurl`, `pdfx:doi`,
+  `pdfx:WPS-ARTICLEDOI`, `dc:identifier`, `dcterms:identifier`. Free-text fields are
+  excluded even though the exploratory probe found 68 documents with a DOI in
+  `info/Subject` — that field asserts nothing about whose identifier it is.
+- Vocabularies resolve by **namespace URI substring**, not by the prefix written in
+  the file (arbitrary) and not by exact URI (PRISM ships four schema versions, and
+  exact matching would fail closed on the next one).
+- Values are attributed to the nearest enclosing **property**, not to the RDF
+  container they sit in. This was a real bug found before the first test run:
+  `dc:identifier` → `rdf:Bag` → `rdf:li` is the commonest shape, and resolving
+  `rdf:li` to its namespace URI silently dropped the largest measured population.
+  Pinned by `TestParseXMPAttributesValuesToTheEnclosingProperty`.
+- `NamesWork` delegates to `corroboratingIdentifier` — the same matcher the text arm
+  uses — closing the two-matcher divergence Pro's finding 9 named, in this arm.
+- Gate 5 accepts metadata **as an alternative source for the same gate**, never as a
+  bypass, so title/author/year still gate a supplement carrying its parent's DOI.
+- Acceptance set widened ⇒ `CandidateBindingRule` is now `candidate_auto_bind/3`.
+- `BindDocument.Digest` pins what the predicate read. A document with no metadata
+  digests to exactly its excerpt hash (so existing provenance stays comparable);
+  metadata that contributed changes it, because an audit row that cannot
+  distinguish its own inputs cannot reconstruct its decision.
+
+**Production reader measured on the real library**, admitted population (n=322):
+
+| | documents | share |
+|---|---|---|
+| carry at least one allowlisted field | 94 | 29.2% |
+| **metadata names the work** | **87** | **27.0%** |
+| field present but no match | 7 | 2.2% |
+| — of those, curated record has no DOI (arXiv/PMID-only) | 2 | |
+| — of those, naming a **different** library work | **0** | |
+| exploratory probe, whole blob incl. free text | 110 | 34.2% |
+
+So the safety-defensible narrowing costs 23 documents (7.2 points) against the probe,
+and still reaches **27.0%** versus the text frame rule's 18%. The five remaining
+mismatches name no other library work — preprint/version-of-record DOI differences,
+which are misses, not wrong accepts.
+
+`autoBindDecisionEnabled` stays **false**. This increment improves the predicate and
+the evidence; it does not turn autonomous binding on, which still requires the
+corpus measurement and the floor.
+
 ### B. Layout-preserving extraction — refuted, as measured
 
 `pdftotext` runs with **no flags** (`semantic.go:90`), so "no layout data exists" is a property

@@ -291,7 +291,15 @@ func markerProbe(text string) (hit markerHit, found, blocked bool) {
 	if strings.TrimSpace(text) == "" {
 		return markerHit{}, false, false
 	}
-	q := pdf.QualifyCandidate(text, pdf.BindCandidate{Key: markerProbeKey, Bound: pdf.FrontMatterDOIs(text)})
+	// This probes gate reachability on text alone. Metadata is
+	// deliberately withheld from both callers below — the constructed
+	// title-only probe has no file behind it at all, and the real
+	// document.Text probe exists only to observe which marker gate the
+	// vocabulary check stops at, never to decide a bind. Threading
+	// metadata in here would make the marker-vocabulary probe sensitive
+	// to a gate this function does not test for, rather than reading
+	// vocabulary out of the production rule unchanged.
+	q := pdf.QualifyCandidate(pdf.BindDocument{Excerpt: text}, pdf.BindCandidate{Key: markerProbeKey, Bound: pdf.FrontMatterDOIs(text)})
 	switch {
 	case q.Gate == pdf.GateConclusiveVeto:
 		return markerHit{}, false, true

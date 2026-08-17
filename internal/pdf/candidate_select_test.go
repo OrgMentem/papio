@@ -26,7 +26,7 @@ func TestQualifyCandidateFullAgreementQualifies(t *testing.T) {
 		"Ada Lovelace (2026)\n" +
 		"DOI: 10.1234/abcd.1\n\n" +
 		"Abstract\nWe study quantum networks.\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if !got.Qualifies {
 		t.Fatalf("want Qualifies true, got %+v", got)
 	}
@@ -57,7 +57,7 @@ func TestQualifyCandidateIdentifierAbsentIsReview(t *testing.T) {
 	text := "Quantum Networks Robustness Calibration Measurement\n" +
 		"Ada Lovelace (2026)\n\n" +
 		"Abstract\nWe study quantum networks.\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false when identifier absent, got %+v", got)
 	}
@@ -95,7 +95,7 @@ func TestQualifyCandidateZeroAuthorDisqualified(t *testing.T) {
 	if got := MatchIdentity(text, w); got.Result != IdentityPass {
 		t.Fatalf("MatchIdentity with zero authors: want %q got %+v", IdentityPass, got)
 	}
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false for zero-author target, got %+v", got)
 	}
@@ -134,7 +134,7 @@ func TestQualifyCandidateConflictingYearDisqualified(t *testing.T) {
 	if got := MatchIdentity(text, w); got.Result == IdentityReject {
 		t.Fatalf("MatchIdentity with exact title but conflicting year: want pass/review, got %+v (yearConflict defeated by exact title)", got)
 	}
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false for conflicting byline year, got %+v", got)
 	}
@@ -164,7 +164,7 @@ func TestQualifyCandidateTitleNotPrintedAsLineDisqualified(t *testing.T) {
 	text := "We extend and update the earlier work that cites \"Quantum Networks Robustness Calibration Measurement\" for guidance.\n" +
 		"Ada Lovelace (2026)\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false when title not printed as line, got %+v", got)
 	}
@@ -194,7 +194,7 @@ func TestQualifyCandidateVetoForeignDisqualified(t *testing.T) {
 		"Ada Lovelace (2026)\n" +
 		pad + "\n" +
 		"DOI: 10.1234/abcd.1 footer\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false when veto blocks, got %+v", got)
 	}
@@ -223,7 +223,7 @@ func TestQualifyCandidateIdentifierPastPageOneNotQualifies(t *testing.T) {
 		"Ada Lovelace (2026)\n\nAbstract\n" +
 		pad + "\n" +
 		"DOI: 10.1234/abcd.1 appears beyond page one\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false when identifier past page one, got %+v", got)
 	}
@@ -264,7 +264,7 @@ func TestSelectAutoBindCandidateExactlyOneQualifies(t *testing.T) {
 	text := "Quantum Networks Robustness Calibration Measurement\n" +
 		"Ada Lovelace (2026)\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\n"
-	winner, ok, reason := SelectAutoBindCandidate(text, candidates)
+	winner, ok, reason := SelectAutoBindCandidate(BindDocument{Excerpt: text}, candidates)
 	if !ok {
 		t.Fatalf("want ok true when exactly one qualifies, got ok false reason %q", reason)
 	}
@@ -305,7 +305,7 @@ func TestSelectAutoBindCandidateTwoQualifyAbstains(t *testing.T) {
 	text := "Quantum Networks Robustness Calibration Measurement\n" +
 		"Ada Lovelace (2026)\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\n"
-	_, ok, reason := SelectAutoBindCandidate(text, candidates)
+	_, ok, reason := SelectAutoBindCandidate(BindDocument{Excerpt: text}, candidates)
 	if ok {
 		t.Fatalf("want ok false when two qualify, got ok true")
 	}
@@ -353,10 +353,10 @@ func TestSelectAutoBindCandidateQualifierAlongsideReviewAbstains(t *testing.T) {
 		pad + "\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\n"
 	// Sanity: r alone would be Review.
-	if got := QualifyCandidate(text, candidates[1]); !got.Review || got.Qualifies {
+	if got := QualifyCandidate(BindDocument{Excerpt: text}, candidates[1]); !got.Review || got.Qualifies {
 		t.Fatalf("sanity: review candidate want Review true Qualifies false, got %+v", got)
 	}
-	_, ok, reason := SelectAutoBindCandidate(text, candidates)
+	_, ok, reason := SelectAutoBindCandidate(BindDocument{Excerpt: text}, candidates)
 	if ok {
 		t.Fatalf("want ok false when qualifier alongside review, got ok true")
 	}
@@ -384,7 +384,7 @@ func TestSelectAutoBindCandidateNoneQualifiesAbstains(t *testing.T) {
 	}
 	// Excerpt matches neither candidate's title.
 	text := "An Unrelated Study of Soil Composition\nWilhelmina Farnsworth (2022)\n\nAbstract\nWe examine soil.\n"
-	_, ok, reason := SelectAutoBindCandidate(text, candidates)
+	_, ok, reason := SelectAutoBindCandidate(BindDocument{Excerpt: text}, candidates)
 	if ok {
 		t.Fatalf("want ok false when none qualifies, got ok true")
 	}
@@ -394,7 +394,7 @@ func TestSelectAutoBindCandidateNoneQualifiesAbstains(t *testing.T) {
 }
 
 func TestSelectAutoBindCandidateEmptyPoolAbstains(t *testing.T) {
-	_, ok, reason := SelectAutoBindCandidate("anything", nil)
+	_, ok, reason := SelectAutoBindCandidate(BindDocument{Excerpt: "anything"}, nil)
 	if ok {
 		t.Fatalf("want ok false for empty pool, got ok true")
 	}
@@ -416,7 +416,7 @@ func TestQualifyCandidateErratumMarkerDisqualified(t *testing.T) {
 	text := "Erratum: Quantum Networks Robustness Calibration Measurement\n" +
 		"Ada Lovelace (2026)\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\nThis erratum corrects the previous paper.\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false for erratum marker, got %+v", got)
 	}
@@ -440,7 +440,7 @@ func TestQualifyCandidateNonArticleMarkerDisqualified(t *testing.T) {
 		"Quantum Networks Robustness Calibration Measurement\n" +
 		"Ada Lovelace (2026)\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\nSupplemental data.\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false for non-article marker, got %+v", got)
 	}
@@ -469,7 +469,7 @@ func TestQualifyCandidateChapterFootnoteNotErratum(t *testing.T) {
 		"DOI: 10.1234/abcd.1\n\nAbstract\nWe study quantum networks.\n" +
 		pad + "\n" +
 		"Erratum to this chapter is available at 10.1007/978-3-030-12345-6_12\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if !got.Qualifies {
 		t.Fatalf("want Qualifies true for chapter footnote (not an erratum), got %+v", got)
 	}
@@ -493,7 +493,7 @@ func TestQualifyCandidateYearTokenBoundary(t *testing.T) {
 	text := "Quantum Networks Robustness Calibration Measurement\n" +
 		"Ada Lovelace (2024) Grant 20191\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false for year token mismatch (2019 vs 2024 with grant 20191), got %+v", got)
 	}
@@ -508,7 +508,7 @@ func TestQualifyCandidateYearTokenBoundary(t *testing.T) {
 		DOI:     "10.1234/abcd.1",
 	}
 	candidate2 := BindCandidate{Key: "job-year-token2", Work: w2, Bound: []string{"10.1234/abcd.1"}}
-	got2 := QualifyCandidate(text, candidate2)
+	got2 := QualifyCandidate(BindDocument{Excerpt: text}, candidate2)
 	if !got2.Qualifies {
 		t.Fatalf("want Qualifies true for matching year token 2024, got %+v", got2)
 	}
@@ -528,7 +528,7 @@ func TestQualifyCandidateStrictPrefixTitleDisqualified(t *testing.T) {
 	text := "Target Title: A Different Study\n" +
 		"Ada Lovelace (2026)\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false for strict-prefix title, got %+v", got)
 	}
@@ -546,7 +546,7 @@ func TestQualifyCandidateStrictPrefixTitleDisqualified(t *testing.T) {
 	textExact := "Target Title\n" +
 		"Ada Lovelace (2026)\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\n"
-	gotExact := QualifyCandidate(textExact, candidateExact)
+	gotExact := QualifyCandidate(BindDocument{Excerpt: textExact}, candidateExact)
 	if !gotExact.Qualifies {
 		t.Fatalf("want Qualifies true for exact title, got %+v", gotExact)
 	}
@@ -566,7 +566,7 @@ func TestQualifyCandidateAuthorOnlyInTitleDisqualified(t *testing.T) {
 	text := "Stone Analysis of Soil Composition\n" +
 		"Journal of Geosciences (2024)\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\nWe study soil.\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false when surname only in title, got %+v", got)
 	}
@@ -577,7 +577,7 @@ func TestQualifyCandidateAuthorOnlyInTitleDisqualified(t *testing.T) {
 	textLegit := "Stone Analysis of Soil Composition\n" +
 		"Margaret Stone (2024)\n" +
 		"DOI: 10.1234/abcd.1\n\nAbstract\nWe study soil.\n"
-	gotLegit := QualifyCandidate(textLegit, candidate)
+	gotLegit := QualifyCandidate(BindDocument{Excerpt: textLegit}, candidate)
 	if !gotLegit.Qualifies {
 		t.Fatalf("want Qualifies true for legitimate author line, got %+v", gotLegit)
 	}
@@ -597,7 +597,7 @@ func TestQualifyCandidateRunningHeadTitleDisqualified(t *testing.T) {
 	text := "Quantum Networks Robustness Calibration Measurement\n" +
 		"Ada Lovelace (2026)\n" +
 		"DOI: 10.1234/abcd.1  Quantum Networks Robustness Calibration Measurement\n\nAbstract\n"
-	got := QualifyCandidate(text, candidate)
+	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
 	if got.Qualifies {
 		t.Fatalf("want Qualifies false for running-head title, got %+v", got)
 	}
