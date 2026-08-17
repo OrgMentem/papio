@@ -433,6 +433,74 @@ func TestSettledGrabEmptyPoolParks(t *testing.T) {
 	}
 }
 
+func TestSettledGrabRecordsEligibilitySnapshot(t *testing.T) {
+	// A DOI-less settlement records exactly one event-time pool snapshot with
+	// the candidate membership that existed at park time, even when autonomous
+	// binding is disabled.
+	b, jobs, cfg, _ := newBridge(t)
+	w1 := work.Work{Title: "Snapshot Pool Alpha", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/snapshot.alpha"}
+	w2 := work.Work{Title: "Snapshot Pool Beta", Authors: []string{"Grace Hopper"}, Year: 2025, DOI: "10.1234/snapshot.beta"}
+	id1 := parkManualDownload(t, jobs, "wr_snap_a", w1)
+	id2 := parkManualDownload(t, jobs, "wr_snap_b", w2)
+	excerpt := doiLessExcerpt(t, "No Pool DOI Here", "Wilhelmina Farnsworth (2024)")
+	if got := pdf.FrontMatterDOIs(excerpt); len(got) != 0 {
+		t.Fatalf("front-matter DOIs = %v, want empty", got)
+	}
+	b.svc.Validate = validateForExcerpt(excerpt)
+	ctx := context.Background()
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Snapshot Park")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	got, _ := b.grabs.Get(ctx, g.ID)
+	if got.State != grab.StateParkedNoIdentifier {
+		t.Fatalf("grab = %+v, want parked_no_identifier", got)
+	}
+	var snapCount int
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM pdf_grab_eligibility_snapshots WHERE grab_id = ?`, g.ID).Scan(&snapCount); err != nil {
+		t.Fatalf("count snapshots: %v", err)
+	}
+	if snapCount != 1 {
+		t.Fatalf("snapshot count = %d, want 1", snapCount)
+	}
+	snap, err := b.grabs.EligibilitySnapshot(ctx, g.ID)
+	if err != nil {
+		t.Fatalf("EligibilitySnapshot: %v", err)
+	}
+	if snap.Schema != grab.EligibilityPoolSnapshotSchema {
+		t.Fatalf("schema = %q, want %q", snap.Schema, grab.EligibilityPoolSnapshotSchema)
+	}
+	if snap.Phase != grab.SnapshotPhasePreBind {
+		t.Fatalf("phase = %q, want %q", snap.Phase, grab.SnapshotPhasePreBind)
+	}
+	if snap.PoolSize != 2 || len(snap.Entries) != 2 {
+		t.Fatalf("pool = %+v, want two entries", snap)
+	}
+	if snap.RuleEnabled {
+		t.Fatal("rule_enabled = true, want false with autonomous binding disabled")
+	}
+	if snap.AutoBindAttempted || snap.AutoBindOutcome != grab.AutoBindOutcomeNotAttempted() {
+		t.Fatalf("auto_bind metadata = attempted %v outcome %q, want not attempted", snap.AutoBindAttempted, snap.AutoBindOutcome)
+	}
+	if snap.Predicate.Kind != job.CandidateEligibleKind || snap.Predicate.Status != job.CandidateEligibleStatus || snap.Predicate.JobState != job.StateAwaitingHuman {
+		t.Fatalf("predicate = %+v, want frozen manual_download/open/awaiting_human", snap.Predicate)
+	}
+	if snap.Entries[0].JobID != id1 || snap.Entries[1].JobID != id2 {
+		t.Fatalf("entries = [%s, %s], want [%s, %s] in oldest-action order", snap.Entries[0].JobID, snap.Entries[1].JobID, id1, id2)
+	}
+	if snap.Entries[0].Work.DOI != w1.DOI || snap.Entries[1].Work.DOI != w2.DOI {
+		t.Fatalf("entry work = %+v, %+v; want bibliographic snapshots only", snap.Entries[0].Work, snap.Entries[1].Work)
+	}
+	if len(snap.Entries[0].BoundDOIs) == 0 || snap.Entries[0].BoundDOIs[0] != w1.DOI {
+		t.Fatalf("bound_dois[0] = %v, want normalized cite-side DOIs", snap.Entries[0].BoundDOIs)
+	}
+}
+
 func TestSettledGrabTieParks(t *testing.T) {
 	// 3. Two candidate-eligible jobs both qualify → selector abstains (tie).
 	// Honest construction: two eligible jobs describing the same work

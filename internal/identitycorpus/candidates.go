@@ -84,6 +84,12 @@ const (
 	ArmSameVenueYear Arm = "same-venue-year"
 	ArmTitleSuperset Arm = "title-superset"
 	ArmSameYear      Arm = "same-year"
+	// ArmMarkerCorrection and ArmMarkerNonArticle synthesize documents bearing
+	// correctionMarkers and nonArticleMarkers vocabulary respectively. They
+	// close the gate-coverage hole where a zero trial count read as a gate that
+	// held rather than coverage the run never had.
+	ArmMarkerCorrection Arm = "marker-correction"
+	ArmMarkerNonArticle Arm = "marker-non-article"
 	// ArmConjunction is the composed adversary: a synthesized document that
 	// carries the target's title, authors and year, cites the target's
 	// identifier in body text, and prints its own different identifier past the
@@ -103,6 +109,7 @@ const (
 // allArms is the fixed order every report renders arms in.
 var allArms = []Arm{
 	ArmRandom, ArmSameAuthor, ArmSameVenueYear, ArmTitleSuperset, ArmSameYear,
+	ArmMarkerCorrection, ArmMarkerNonArticle,
 	ArmConjunction, ArmComposite, ArmBacklog,
 }
 
@@ -370,6 +377,12 @@ func MeasureCandidateSets(docs []Document, opts CandidateOptions) CandidateRepor
 		}
 		for _, n := range report.PoolSizes {
 			for _, absent := range []bool{false, true} {
+				// Marker-gate arms are target-absent only: synthesis closes the
+				// correction/non-article coverage hole, not a bind/no-bind choice
+				// at target-present.
+				if (arm == ArmMarkerCorrection || arm == ArmMarkerNonArticle) && !absent {
+					continue
+				}
 				report.Results = append(report.Results, b.measureCell(arm, n, absent, &report, gates))
 			}
 		}
@@ -1004,15 +1017,26 @@ func fnvOf(s string) uint64 {
 
 // measureCell builds and evaluates one synthesized cell.
 func (b *builder) measureCell(arm Arm, n int, absent bool, report *CandidateReport, gates map[string]int) ArmResult {
+	if (arm == ArmMarkerCorrection || arm == ArmMarkerNonArticle) && !absent {
+		return ArmResult{
+			Arm: arm, PoolSize: n, TargetAbsent: absent,
+			Eligible: b.eligCount, Unestablished: b.unestab,
+		}
+	}
 	pools := make([]Pool, 0, len(b.eligible))
 	for _, base := range b.eligible {
 		var (
 			p  Pool
 			ok bool
 		)
-		if arm == ArmConjunction {
+		switch arm {
+		case ArmConjunction:
 			p, ok = b.buildConjunctionPool(base, n, absent)
-		} else {
+		case ArmMarkerCorrection:
+			p, ok = b.buildMarkerCorrectionPool(base, n)
+		case ArmMarkerNonArticle:
+			p, ok = b.buildMarkerNonArticlePool(base, n)
+		default:
 			p, ok = b.buildPool(base, arm, n, absent)
 		}
 		if !ok {
@@ -1542,7 +1566,7 @@ func (r CandidateReport) Render() string {
 	}
 	fmt.Fprintf(w, "%s is unreachable by construction in this report: every measured document has an empty front-matter DOI window, so the conclusive-identity veto always returns absent. Its zero means untested, not passed.\n", pdf.GateConclusiveVeto)
 	if untested := r.untestedGates(); len(untested) > 0 {
-		fmt.Fprintf(w, "no trial in this run reached %s either. There are SEVEN gates and no arm here synthesizes a document bearing a non-article or correction marker, so a zero above is a gate this run never exercised — read it as coverage this report does not have, never as a gate that held.\n", strings.Join(untested, ", "))
+		fmt.Fprintf(w, "no trial in this run reached %s. A zero above is coverage this report does not have, never a gate that held.\n", strings.Join(untested, ", "))
 	}
 	w.Flush()
 

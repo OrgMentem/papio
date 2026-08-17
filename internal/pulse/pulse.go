@@ -184,12 +184,21 @@ func (s *Service) Read(ctx context.Context) (result Snapshot, retErr error) {
 			openActions[action.JobID]++
 		}
 	}
+	nonterminalIDs := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		nonterminalIDs[row.ID] = true
+	}
 	gateJobs := make(map[string]bool)
 	gateTurns := int64(0)
 	for _, gate := range attention.Gates {
 		member := false
 		for _, id := range append(append([]string(nil), gate.DependentJobIDs...), gate.ClaimMemberJobIDs...) {
 			if id == "" || (stalledPermit != nil && id == stalledPermit.jobID) {
+				continue
+			}
+			if !nonterminalIDs[id] {
+				// Terminal siblings are not nonterminal work; excluding them
+				// here keeps gateMemberCount aligned with loop skips.
 				continue
 			}
 			gateJobs[id] = true

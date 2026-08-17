@@ -218,7 +218,22 @@ func classifyOwnIdentifier(doc Document) string {
 // metadata (which should always pass) and against every other document's
 // metadata (which should never pass), and tabulates a window-placement
 // histogram for each document's own identifier.
+//
+// Secondary attachments — supplements, alternate scans, errata PDFs filed as
+// a second attachment on the same Zotero parent — are excluded entirely.
+// LoadWithOptions{AllAttachments: true} can produce them, but their front
+// matter describes the attachment's own bytes while Document.Work still
+// carries the parent's curated metadata, so pairing them would score a
+// question the pairwise baseline was never meant to pose.
 func Measure(docs []Document) Report {
+	scored := make([]Document, 0, len(docs))
+	for _, doc := range docs {
+		if !doc.Secondary {
+			scored = append(scored, doc)
+		}
+	}
+	docs = scored
+
 	report := Report{Documents: len(docs)}
 
 	for _, doc := range docs {
@@ -411,4 +426,102 @@ func renderPairs(w *tabwriter.Writer, pairs []PairResult) {
 	if len(pairs) > maxRenderedPairs {
 		fmt.Fprintf(w, "… %d more not shown (capped at %d captured)\n", len(pairs)-maxRenderedPairs, maxListedPairs)
 	}
+}
+
+// markerGateFiller pads synthesized marker-gate documents past the 1 KiB blind
+// window without introducing DOIs, year tokens that could be mistaken for gate
+// evidence, or vocabulary that would terminate at a different gate.
+const markerGateFiller = "Calibration notes, sampling frames, ablation settings and the reproducibility checklist for this study are described in the deposit released alongside this article. "
+
+// markerCorrectionDocument synthesizes an erratum-shaped document: a
+// correctionMarkers prefix, the referred-to work's title, authors and year,
+// filler past the blind window, and an optional cited DOI on page one.
+func markerCorrectionDocument(w work.Work, docKey string) string {
+	var b strings.Builder
+	b.WriteString("Erratum: ")
+	b.WriteString(w.Title)
+	b.WriteString("\n\n")
+	for _, author := range w.Authors {
+		b.WriteString(author)
+		b.WriteByte('\n')
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "Published %d\n\n", w.Year)
+	for b.Len() < conjunctionCitedOffset {
+		b.WriteString(markerGateFiller)
+	}
+	if w.DOI != "" {
+		fmt.Fprintf(&b, "\nDOI: %s\n", w.DOI)
+	}
+	ownDOI := conjunctionOwnPrefix + fmt.Sprintf("%08x", fnvOf(docKey))
+	fmt.Fprintf(&b, "Article DOI: %s\n", ownDOI)
+	b.WriteString("\nAbstract\nThis erratum corrects the funding statement of the original article.\n")
+	return b.String()
+}
+
+// markerNonArticleDocument synthesizes a supplement-shaped document using a
+// wide-gap running-head prefix so candidateNonArticleMarker's recovery path is
+// exercised, not only a clean line-initial marker.
+func markerNonArticleDocument(w work.Work) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "12  Supplementary information for %s\n\n", w.Title)
+	if len(w.Authors) > 0 {
+		b.WriteString(strings.Join(w.Authors, ", "))
+		b.WriteString("\n\n")
+	}
+	fmt.Fprintf(&b, "%d\n\n", w.Year)
+	for b.Len() < conjunctionCitedOffset {
+		b.WriteString(markerGateFiller)
+	}
+	b.WriteString("\nMethods\nSupplementary methods describe synthetic data generation and evaluation protocols.\n")
+	return b.String()
+}
+
+// buildMarkerCorrectionPool and buildMarkerNonArticlePool synthesize the
+// marker-gate arms: target-absent pools whose distractor is the referred-to
+// work itself — the adversarial "would bind the paper" case — plus random
+// DOI-less fillers from the candidate universe.
+func (b *builder) buildMarkerCorrectionPool(base Document, n int) (Pool, bool) {
+	return b.buildMarkerGatePool(base, markerCorrectionDocument(base.Work, base.Key), "correction-marker", ArmMarkerCorrection, n)
+}
+
+func (b *builder) buildMarkerNonArticlePool(base Document, n int) (Pool, bool) {
+	return b.buildMarkerGatePool(base, markerNonArticleDocument(base.Work), "non-article-marker", ArmMarkerNonArticle, n)
+}
+
+func (b *builder) buildMarkerGatePool(base Document, text, gateLabel string, arm Arm, n int) (Pool, bool) {
+	if base.Work.Title == "" || len(base.Work.Authors) == 0 || base.Work.Year == 0 {
+		return Pool{}, false
+	}
+	if len(pdf.FrontMatterDOIs(text)) != 0 {
+		return Pool{}, false
+	}
+
+	class := b.classes.class[base.Key]
+	cands := []pdf.BindCandidate{candidateOf(base)}
+	need := n - 1
+
+	pool := make([]Document, 0, len(b.universe))
+	for _, other := range b.universe {
+		if inClass(other.Key, class) {
+			continue
+		}
+		pool = append(pool, other)
+	}
+	picked, ok := sample(poolRand(b.seed, arm, n, true, base.Key), pool, need)
+	if !ok {
+		return Pool{}, false
+	}
+	for _, d := range picked {
+		cands = append(cands, candidateOf(d))
+	}
+	sortCandidates(cands)
+
+	return Pool{
+		DocKey:       base.Key,
+		Candidates:   cands,
+		Provenance:   "adjudicated:marker-gate synthesis (" + gateLabel + ")",
+		TargetAbsent: true,
+		text:         text,
+	}, true
 }

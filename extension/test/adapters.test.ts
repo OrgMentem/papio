@@ -2552,6 +2552,35 @@ test("cross-origin api download is relocated into papio/<job>/ via the ID bound 
   );
 });
 
+test("delegated api-method download with no armed grab binds at onCreated and relocates", async () => {
+  const ebscoSpec = adapters.find((a) => a.id === "ebsco") as AdapterSpec;
+  const h = makeMapHarness([ebscoSpec]);
+  h.scripting.verdict = {
+    kind: "article",
+    adapter_id: "ebsco",
+    adapter_version: ebscoSpec.version,
+    evidence: [],
+  };
+  h.scripting.documentURL =
+    "https://research.ebsco.com/c/6to2aa/viewer/pdf/mhqkskujrf?route=details";
+  h.scripting.constructedURL = "https://content.ebscohost.com/cds/retrieve?content=TOKEN";
+  h.downloads.emitOnCreated = true;
+  h.downloads.crossOriginRedirect =
+    "https://content.ebscohost.com/cds/retrieve?content=signed";
+  h.downloads.determineBeforeReturn = true;
+  await h.bridge.start();
+  await h.port.inbound(offer("job_api_nograb_0001", { title: EXPECTED_TITLE }));
+  await landOnProvider(
+    h,
+    "job_api_nograb_0001",
+    "research.ebsco.com",
+    "https://research.ebsco.com/c/6to2aa/viewer/pdf/mhqkskujrf?route=details",
+  );
+  expect(h.downloads.items.get(701)?.filename).toBe(
+    "/Users/test/Downloads/papio/job_api_nograb_0001/out.pdf",
+  );
+});
+
 // Primo NDE renders Ex Libris's own "Get PDF" delivery anchor on entitled and
 // Open Access full-display records; the language-independent key is the
 // /discovery/sourceRecord href, and the live anchor carries the delivery

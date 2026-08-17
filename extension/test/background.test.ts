@@ -317,9 +317,19 @@ class FakeTabGroups {
 
 class FakeAlarms {
   readonly onAlarm = new FakeEmitter<[{ name: string }]>();
-  readonly created: string[] = [];
-  create(name: string): void {
-    this.created.push(name);
+  readonly created: { name: string; info?: { periodInMinutes: number } }[] =
+    [];
+  private readonly scheduled = new Set<string>();
+  create(name: string, info?: { periodInMinutes: number }): void {
+    if (this.scheduled.has(name)) return;
+    this.scheduled.add(name);
+    this.created.push({
+      name,
+      ...(info === undefined ? {} : { info }),
+    });
+  }
+  async get(name: string): Promise<{ name: string } | undefined> {
+    return this.scheduled.has(name) ? { name } : undefined;
   }
 }
 
@@ -489,7 +499,11 @@ function makeHarness(
     ...(windows !== undefined ? { windows } : {}),
     ...(tabGroups !== undefined ? { tabGroups } : {}),
     action,
-    alarms: { create: (name) => alarms.create(name), onAlarm: alarms.onAlarm },
+    alarms: {
+      create: (name, info) => alarms.create(name, info),
+      get: (name) => alarms.get(name),
+      onAlarm: alarms.onAlarm,
+    },
     webNavigation,
   };
   return {
@@ -4996,6 +5010,201 @@ describe("single-use signed delivery URL composition", () => {
     expect(message).not.toMatch(/papio will file/i);
     expect(h.downloads.started).toEqual([]);
     expect(h.frames().some((f) => f.type === "pdf_grab_request")).toBe(false);
+  });
+});
+
+describe("click-adapter job vs armed grab ambiguity", () => {
+  function downloadOwnership(h: Harness): {
+    jobTrack: (jobID: string) => Set<number> | undefined;
+    grabTrack: (grabID: string) => Set<number> | undefined;
+  } {
+    const internals = h.bridge as unknown as {
+      downloads: Map<string, { ids: Set<number> }>;
+      grabDownloads: Map<string, { ids: Set<number> }>;
+    };
+    return {
+      jobTrack: (jobID) => internals.downloads.get(jobID)?.ids,
+      grabTrack: (grabID) => internals.grabDownloads.get(grabID)?.ids,
+    };
+  }
+
+  async function awaitBridgeReady(h: Harness): Promise<void> {
+    await (h.bridge as unknown as { ready: Promise<void> }).ready;
+  }
+
+  test("a live same-tab delegated click job and armed grab both match: park, steer nothing", async () => {
+    const tabID = 100;
+    const jobID = "job_click_grab_ambig";
+    const h = makeHarness({
+      ...emptyStore(),
+      offerURLs: { [jobID]: OPENURL },
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: tabID,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_800_000_000_000,
+          status: "accepted",
+          access_mode: "delegated",
+          provider_hosts: [SILVERCHAIR_SIGNED_HOST],
+          download_initiated: true,
+          adapter_id: "provider",
+        },
+      ],
+    });
+    h.tabs.seed({ id: tabID, url: OPENURL });
+    await helloPdfGrabCapable(h);
+    const armed = await armSignedViewerGrab(h, {
+      tabID,
+      grabID: "grab-ambig",
+      steeringPath: "papio/grabs/grambig01/",
+    });
+    const item: DownloadItemLike = {
+      id: 991,
+      tabId: tabID,
+      url: armed.pdfURL,
+      filename: "paper.pdf",
+      state: "in_progress",
+    };
+
+    await awaitBridgeReady(h);
+    expect(await suggestFilenameFor(h, item)).toEqual([]);
+    await h.downloads.onCreated.emit(item);
+
+    const { jobTrack, grabTrack } = downloadOwnership(h);
+    expect(jobTrack(jobID)?.has(item.id)).not.toBe(true);
+    expect(grabTrack(armed.grabID)?.has(item.id)).not.toBe(true);
+
+    h.downloads.items.set(item.id, {
+      ...item,
+      filename: "/Users/x/Downloads/paper.pdf",
+      fileSize: 1_500_000,
+      mime: "application/pdf",
+      state: "complete",
+    });
+    await h.downloads.onChanged.emit({
+      id: item.id,
+      state: { current: "complete" },
+    });
+    expect(h.frames().some((frame) => frame.type === "download_complete")).toBe(
+      false,
+    );
+    expect(
+      h.runtimeMessages.some(
+        (message) =>
+          (message as { type?: string; state?: string }).type ===
+            "papio.pageBulk.grabState" &&
+          (message as { state?: string }).state === "identifying",
+      ),
+    ).toBe(false);
+  });
+
+  test("a live grab still beats a stale same-tab job correlation without download_initiated", async () => {
+    const tabID = 101;
+    const jobID = "job_stale_tab_grab";
+    const h = makeHarness({
+      ...emptyStore(),
+      offerURLs: { [jobID]: OPENURL },
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: tabID,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_800_000_000_000,
+          status: "accepted",
+          access_mode: "delegated",
+          provider_hosts: [SILVERCHAIR_SIGNED_HOST],
+          download_initiated: false,
+        },
+      ],
+    });
+    h.tabs.seed({ id: tabID, url: OPENURL });
+    await helloPdfGrabCapable(h);
+    const armed = await armSignedViewerGrab(h, {
+      tabID,
+      grabID: "grab-stale-tab",
+      steeringPath: "papio/grabs/staletab/",
+    });
+    const item: DownloadItemLike = {
+      id: 992,
+      tabId: tabID,
+      url: armed.pdfURL,
+      filename: "paper.pdf",
+      state: "in_progress",
+    };
+
+    await awaitBridgeReady(h);
+    expect(await suggestFilenameFor(h, item)).toEqual([
+      `${armed.steeringPath}paper.pdf`,
+    ]);
+    await h.downloads.onCreated.emit(item);
+
+    const { jobTrack, grabTrack } = downloadOwnership(h);
+    expect(grabTrack(armed.grabID)?.has(item.id)).toBe(true);
+    expect(jobTrack(jobID)?.has(item.id)).not.toBe(true);
+    expect(
+      h.runtimeMessages.some(
+        (message) =>
+          (message as { type?: string; state?: string }).type ===
+            "papio.pageBulk.grabState" &&
+          (message as { state?: string }).state === "failed",
+      ),
+    ).toBe(false);
+  });
+
+  test("the ambiguity conflict message names both claimants and does not claim the file was sent", async () => {
+    const tabID = 102;
+    const jobID = "job_conflict_copy";
+    const h = makeHarness({
+      ...emptyStore(),
+      offerURLs: { [jobID]: OPENURL },
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: tabID,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_800_000_000_000,
+          status: "accepted",
+          access_mode: "delegated",
+          provider_hosts: [SILVERCHAIR_SIGNED_HOST],
+          download_initiated: true,
+        },
+      ],
+    });
+    h.tabs.seed({ id: tabID, url: OPENURL });
+    await helloPdfGrabCapable(h);
+    const armed = await armSignedViewerGrab(h, {
+      tabID,
+      grabID: "grab-conflict-copy",
+      steeringPath: "papio/grabs/conflictcopy/",
+    });
+    await awaitBridgeReady(h);
+    await h.downloads.onCreated.emit({
+      id: 993,
+      tabId: tabID,
+      url: armed.pdfURL,
+      filename: "paper.pdf",
+      state: "in_progress",
+    });
+
+    const conflict = h.runtimeMessages.find(
+      (message) =>
+        (message as { type?: string; grab_id?: string }).type ===
+          "papio.pageBulk.grabState" &&
+        (message as { grab_id?: string }).grab_id === armed.grabID,
+    ) as { state?: string; detail?: string } | undefined;
+    expect(conflict).toMatchObject({
+      state: "failed",
+    });
+    expect(conflict?.detail).toMatch(/handoff acquisition/i);
+    expect(conflict?.detail).toMatch(/Send PDF grab/i);
+    expect(conflict?.detail).toMatch(/finish or cancel the handoff job/i);
+    expect(conflict?.detail).toMatch(/cancel the grab/i);
+    expect(conflict?.detail?.toLowerCase()).not.toMatch(
+      /sent to papio|saved to papio|filed it|pdf sent/,
+    );
+    expect(conflict?.state).not.toBe("grabbed");
+    expect(conflict?.state).not.toBe("identifying");
   });
 });
 
@@ -11351,6 +11560,141 @@ test("the keepalive alarm calls onWake even while the native port is down", asyn
 
   expect(wakes.length).toBe(1);
 });
+
+/** Answer the two correlated requests a keepalive wake issues, in the order it
+ * issues them. Two harness facts make the obvious version deadlock:
+ *
+ * `waitForFrame` replays from the start, so `offset` MUST be the posted-frame
+ * count from before the wake — otherwise this answers a stale request id from
+ * hello and the wake's own request is never replied to at all.
+ *
+ * `inbound` resolves only when the whole inbound chain for that frame has run,
+ * and the triage reply's continuation issues the pulse request and waits for ITS
+ * reply. So awaiting the triage delivery before answering the pulse blocks the
+ * answer it is waiting for. Deliver, do not await, then settle at the end. */
+async function respondToKeepaliveRefresh(
+  port: FakePort,
+  offset: number,
+): Promise<void> {
+  const triage = await port.waitForFrame("triage_counts_request", offset);
+  const triageDelivered = port.inbound(
+    nativeResult("triage_counts_response", {
+      request_id: triage.payload["request_id"],
+      counts: triageCounts(0),
+    }),
+  );
+  const pulse = await port.waitForFrame("work_pulse_request", offset);
+  await port.inbound(
+    nativeResult("work_pulse_response", {
+      request_id: pulse.payload["request_id"],
+      schema: 1,
+      generated_at: "2027-01-01T00:00:00Z",
+      nonterminal_total: 0,
+      projection_complete: true,
+      in_flight: 0,
+      continuing: 0,
+      scheduled: 0,
+      waiting_required: 0,
+      stalled: 0,
+    }),
+  );
+  await triageDelivered;
+}
+
+test("duplicate keepalive alarm delivery issues one work pulse request per interval", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_v1", "work_pulse_v1"],
+    }),
+  );
+
+  // Both deliveries are in flight before either settles, which is the shape
+  // Chrome produced when start() re-created the persisted alarm on every worker
+  // spin-up: two wake callbacks in the same second.
+  const postedBeforeWake = h.port.posted.length;
+  const duplicateWake = Promise.all([
+    h.alarms.onAlarm.emit({ name: "papio-keepalive" }),
+    h.alarms.onAlarm.emit({ name: "papio-keepalive" }),
+  ]);
+  await respondToKeepaliveRefresh(h.port, postedBeforeWake);
+  await duplicateWake;
+
+  expect(h.frames().filter((frame) => frame.type === "work_pulse_request")).toHaveLength(
+    1,
+  );
+
+  // Past the dedupe window the next wake is a real interval, not a duplicate.
+  h.clock.now += 55_001;
+  const postedBeforeSecondWake = h.port.posted.length;
+  // The wake cannot settle until its own requests are answered, so start it,
+  // answer, then settle it.
+  const secondWake = h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  await respondToKeepaliveRefresh(h.port, postedBeforeSecondWake);
+  await secondWake;
+  expect(h.frames().filter((frame) => frame.type === "work_pulse_request")).toHaveLength(
+    2,
+  );
+});
+
+test("worker restart does not re-create an existing keepalive alarm", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  expect(h.alarms.created.filter((alarm) => alarm.name === "papio-keepalive")).toHaveLength(
+    1,
+  );
+  await h.bridge.start();
+  expect(h.alarms.created.filter((alarm) => alarm.name === "papio-keepalive")).toHaveLength(
+    1,
+  );
+});
+
+test("fresh worker generation issues keepalive work pulse inside dedupe window", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_v1", "work_pulse_v1"],
+    }),
+  );
+
+  const postedBeforeFirstWake = h.port.posted.length;
+  const firstWake = h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  await respondToKeepaliveRefresh(h.port, postedBeforeFirstWake);
+  await firstWake;
+  expect(h.frames().filter((frame) => frame.type === "work_pulse_request")).toHaveLength(
+    1,
+  );
+
+  const reloaded = new Bridge(h.deps);
+  await reloaded.start();
+  const restartedPort = h.ports[h.ports.length - 1]!;
+  await restartedPort.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["triage_snapshot_v1", "work_pulse_v1"],
+    }),
+  );
+
+  // Same alarm, inside the previous generation's 55s dedupe window. The dedupe
+  // state lives on the Bridge instance, so worker death clears it: a fresh
+  // generation must still get its pulse, or MV3's ~30s idle kill would silence
+  // the surface the dedupe exists to protect.
+  const postedBeforeReload = restartedPort.posted.length;
+  const reloadWake = h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  await respondToKeepaliveRefresh(restartedPort, postedBeforeReload);
+  await reloadWake;
+  expect(
+    restartedPort.posted
+      .map(parseBrowserMessage)
+      .filter((frame) => frame.type === "work_pulse_request"),
+  ).toHaveLength(1);
+  void reloaded;
+});
+
 
 // Commit C: an observed sign-in must release only its own institution's
 // parked handoffs, and every path that can release/reload/label evidence is

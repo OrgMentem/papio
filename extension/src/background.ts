@@ -279,6 +279,9 @@ const MAX_AUTH_ATTEMPTS = 3;
 // is Chrome's reliable floor for a packed extension; it bounds delivery latency.
 const KEEPALIVE_ALARM = "papio-keepalive";
 const KEEPALIVE_ALARM_MINUTES = 1;
+/** Chrome can deliver the same keepalive wake twice when start() re-registers
+ * the alarm; ignore a second handler inside one period minus slack. */
+const KEEPALIVE_ALARM_DEDUPE_MS = KEEPALIVE_ALARM_MINUTES * 60_000 - 5_000;
 /** Bound a foreground runtime request without retaining it past the worker's
  * lifetime. Native frames themselves are bounded by the protocol parser. */
 const TRIAGE_REQUEST_TIMEOUT_MS = 15_000;
@@ -1067,6 +1070,7 @@ export interface BridgeDeps {
    * reach an idle worker with no keepalive tab or user activity. */
   alarms: {
     create(name: string, info: { periodInMinutes: number }): void;
+    get?(name: string): Promise<{ name: string } | undefined>;
     onAlarm: Listenable<[{ name: string }]>;
   };
 }
@@ -2200,10 +2204,15 @@ export class Bridge {
    * settles and persists the latest snapshot, so a stale write never wins. */
   private saveChain: Promise<void> = Promise.resolve();
   private listenersBound = false;
+  private keepaliveAlarmInFlight = false;
+  private keepaliveAlarmHandledAt = 0;
   private readonly downloads = new Map<string, DownloadTrack>();
   /** Page-derived generic evidence stays worker-local and is not durable. */
   private readonly genericEvidence = new Map<string, string[]>();
   private readonly grabDownloads = new Map<string, PdfGrabTrack>();
+  /** Download ids for which a click-adapter vs armed-grab conflict was already
+   * surfaced. Both listeners may observe the same item; notify once. */
+  private readonly downloadGrabConflictNotified = new Set<number>();
   /** Browser-driven fixture capture shares the two-slot handoff governor. */
   private pageCaptureDriving = false;
   /** Serializes every managed-tab ledger load/mutate/save transaction. */
@@ -4733,10 +4742,9 @@ export class Bridge {
     this.connect();
     // Wake this worker even when idle so queued daemon offers reach it (the
     // native connection originates here, so the daemon cannot wake a dormant
-    // worker itself). Idempotent: re-creating the same alarm just resets it.
-    this.deps.alarms.create(KEEPALIVE_ALARM, {
-      periodInMinutes: KEEPALIVE_ALARM_MINUTES,
-    });
+    // worker itself). Register only when absent: re-creating an existing alarm
+    // on every MV3 spin-up resets its schedule and can deliver the wake twice.
+    await this.ensureKeepaliveAlarm();
     await this.ready;
     await this.captureTransmissionPolicyReady;
     await this.reconcilePdfGrabCorrelations();
@@ -9785,6 +9793,56 @@ export class Bridge {
     }
     return undefined;
   }
+  /** A delegated click-adapter job whose `download_initiated` latch is live on
+   * the download's tab. Host-wide `correlate()` is broader and survives tab
+   * reuse; ambiguity parks only when this tab-scoped job is genuinely live. */
+  private liveDelegatedClickJobOnTab(
+    item: DownloadItemLike,
+  ): ActiveJob | undefined {
+    // Firefox has no onDeterminingFilename and disables broad correlate(); only
+    // exact downloads.download ids are owned there — this Chrome-only path
+    // cannot steer or promise grab-vs-job resolution on Firefox.
+    if (this.deps.downloads.onDeterminingFilename === undefined) return undefined;
+    if (typeof item.tabId !== "number") return undefined;
+    const job = findByTab(this.store, item.tabId);
+    if (
+      job === undefined ||
+      !this.hasDelegatedAuthority(job) ||
+      job.download_initiated !== true
+    ) {
+      return undefined;
+    }
+    return job;
+  }
+  /** Both a live same-tab delegated click job and an armed grab match this
+   * download. Exact papio-initiated bindings are excluded — they are not
+   * ambiguous. */
+  private downloadGrabConflict(
+    item: DownloadItemLike,
+  ): { job: ActiveJob; grab: PdfGrabTrack; grabID: string } | undefined {
+    if (this.trackedJobFor(item.id) ?? this.pendingJobFor(item)) return undefined;
+    const job = this.liveDelegatedClickJobOnTab(item);
+    if (job === undefined) return undefined;
+    const grabID =
+      this.trackedGrabFor(item.id) ?? this.pendingGrabIDFor(item);
+    if (grabID === undefined) return undefined;
+    const grab = this.grabDownloads.get(grabID);
+    if (grab === undefined) return undefined;
+    return { job, grab, grabID };
+  }
+  private surfaceDownloadGrabConflict(
+    downloadID: number,
+    conflict: { job: ActiveJob; grab: PdfGrabTrack; grabID: string },
+  ): void {
+    if (this.downloadGrabConflictNotified.has(downloadID)) return;
+    this.downloadGrabConflictNotified.add(downloadID);
+    this.notifyPdfGrab(
+      conflict.grab.scanID,
+      conflict.grabID,
+      "failed",
+      "This download matches both a handoff acquisition in progress on this tab and an armed Send PDF grab for the same file — papio claimed it for neither. Finish or cancel the handoff job, or cancel the grab.",
+    );
+  }
 
   private bindListeners(): void {
     if (this.listenersBound) return;
@@ -9822,6 +9880,13 @@ export class Bridge {
           ? this.pendingGrabFor(item)
           : this.grabDownloads.get(grabID);
       const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
+      const conflict = this.downloadGrabConflict(item);
+      if (conflict !== undefined) {
+        // Same-tab delegated click job and armed grab both match; neither may
+        // steer. Firefox never reaches this listener.
+        this.surfaceDownloadGrabConflict(item.id, conflict);
+        return;
+      }
       // A grab outranks an inferred job. It is the researcher naming THIS
       // document, in this tab, just now; the inference is about what the tab
       // used to hold. Observed live: a handoff tab opened for one paper was
@@ -9849,12 +9914,43 @@ export class Bridge {
     });
   }
 
+  /** Register the MV3 keepalive alarm once. Chrome persists alarms across
+   * worker termination; resetting an existing alarm on every start() is what
+   * produces duplicate same-second wake callbacks observed in daemon.log. */
+  private async ensureKeepaliveAlarm(): Promise<void> {
+    if (this.deps.alarms.get !== undefined) {
+      const existing = await this.deps.alarms.get(KEEPALIVE_ALARM);
+      if (existing !== undefined) return;
+    }
+    this.deps.alarms.create(KEEPALIVE_ALARM, {
+      periodInMinutes: KEEPALIVE_ALARM_MINUTES,
+    });
+  }
+
   /** The keepalive alarm woke the worker. The top-level start() on this same
    * spin-up already reconnects; this is the safety net that re-establishes the
    * daemon connection if it is still down, so any queued offers arrive. */
   /** The keepalive alarm both reconnects the broker and refreshes the
    * non-authoritative pending count when the negotiated schema supports it. */
   private async onKeepaliveAlarm(): Promise<void> {
+    const now = this.deps.now();
+    if (this.keepaliveAlarmInFlight) return;
+    if (
+      this.keepaliveAlarmHandledAt > 0 &&
+      now - this.keepaliveAlarmHandledAt < KEEPALIVE_ALARM_DEDUPE_MS
+    ) {
+      return;
+    }
+    this.keepaliveAlarmInFlight = true;
+    try {
+      await this.runKeepaliveAlarm();
+      this.keepaliveAlarmHandledAt = this.deps.now();
+    } finally {
+      this.keepaliveAlarmInFlight = false;
+    }
+  }
+
+  private async runKeepaliveAlarm(): Promise<void> {
     await this.ready;
     await this.releaseExpiredQueuedHandoffs();
     // Recovery runs unconditionally on this wake, independent of the native
@@ -16367,6 +16463,23 @@ export class Bridge {
     // routes differ only in a signed query string, which `sameDownloadRoute`
     // deliberately ignores. That is the wrong-paper direction: job X's file
     // steered into grab Y's directory.
+    // Chrome may call onDeterminingFilename before this async handler resumes
+    // (and before downloads.download returns), so bind exact pending URLs here
+    // synchronously. Cross-origin redirects then steer by ID, not stale URL
+    // correlation; ambiguity parking below still applies only when there is no
+    // exact binding yet.
+    const syncJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
+    if (syncJobID !== undefined) {
+      const sync = this.downloads.get(syncJobID) ?? {
+        ids: new Set<number>(),
+        ambiguous: false,
+        directOffer: false,
+      };
+      sync.ids.add(item.id);
+      if (sync.ids.size > 1) sync.ambiguous = true;
+      this.downloads.set(syncJobID, sync);
+    }
+    await this.ready;
     const earlyJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
     if (earlyJobID !== undefined) {
       const early = this.downloads.get(earlyJobID) ?? {
@@ -16378,6 +16491,11 @@ export class Bridge {
       if (early.ids.size > 1) early.ambiguous = true;
       this.downloads.set(earlyJobID, early);
     } else {
+      const conflict = this.downloadGrabConflict(item);
+      if (conflict !== undefined) {
+        this.surfaceDownloadGrabConflict(item.id, conflict);
+        return;
+      }
       const pendingGrab = this.pendingGrabFor(item);
       if (pendingGrab !== undefined) {
         pendingGrab.ids.add(item.id);
@@ -16389,7 +16507,6 @@ export class Bridge {
         return;
       }
     }
-    await this.ready;
     if (
       this.store.pendingDelivery?.status === "waiting_manual" &&
       this.store.pendingDelivery.page_identity !== undefined
@@ -18467,6 +18584,10 @@ function realDeps(): BridgeDeps {
     },
     alarms: {
       create: (name, info) => chrome.alarms?.create(name, info),
+      get: async (name) => {
+        const alarm = await chrome.alarms?.get(name);
+        return alarm?.name === name ? { name: alarm.name } : undefined;
+      },
       onAlarm: {
         addListener: (cb) => chrome.alarms?.onAlarm?.addListener(cb),
       },

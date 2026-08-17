@@ -163,6 +163,72 @@ func TestReadTypedGateCountsOneTurnForOwnerAndSiblings(t *testing.T) {
 	}
 }
 
+func TestReadTypedGateAlgebraIgnoresTerminalMembers(t *testing.T) {
+	// Live algebra failures came from human_gate claim_member_job_ids listing
+	// terminal siblings: gateMemberCount subtracted every member id while only
+	// nonterminal rows are skipped in the bucket loop.
+	ctx := context.Background()
+	js := pulseJobs(t)
+	nonterminal := make([]string, 4)
+	for i := range nonterminal {
+		id, err := js.CreateRequest(ctx, "wr_pulse_gate_nt_"+string(rune('a'+i)), pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nonterminal[i] = id
+		if _, err := js.S.DB().ExecContext(ctx, `UPDATE jobs SET state = 'awaiting_human' WHERE id = ?`, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.OpenHumanAction(ctx, id, "manual_download", "download", job.Access(false, "landing_page")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ready := make([]string, 2)
+	for i := range ready {
+		id, err := js.CreateRequest(ctx, "wr_pulse_gate_ready_"+string(rune('a'+i)), pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ready[i] = id
+		if err := js.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := js.Transition(ctx, id, job.StateResolving, job.StateReady, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cancelled, err := js.CreateRequest(ctx, "wr_pulse_gate_cancel", pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, cancelled, job.StateQueued, job.StateCancelled, nil); err != nil {
+		t.Fatal(err)
+	}
+	members := append(append([]string(nil), nonterminal...), ready[0], ready[1], cancelled)
+	if err := js.UpsertHumanGateObservation(ctx, job.HumanGateObservation{
+		ID: "pulse-gate-terminal-members", GateType: job.HumanGateLogin,
+		ScopeClass: string(job.HumanGateScopeInstitutionProfile), ScopeKey: "profile-term",
+		DependentJobIDs: members[1:], ClaimMemberJobIDs: members,
+		ObservationRevision: 1, Status: job.HumanGateOpen, DetailJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	snap, err := (&Service{Jobs: js, Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if snap.ProjectionComplete == nil || !*snap.ProjectionComplete {
+		t.Fatalf("projection_complete = %v", snap.ProjectionComplete)
+	}
+	if snap.WaitingRequired == nil || *snap.WaitingRequired != 1 || snap.NonterminalTotal == nil || *snap.NonterminalTotal != 1 {
+		t.Fatalf("typed gate with terminal members = waiting %v total %v", snap.WaitingRequired, snap.NonterminalTotal)
+	}
+	if got := *snap.InFlight + *snap.Scheduled + *snap.Continuing + *snap.WaitingRequired + *snap.Stalled; got != *snap.NonterminalTotal {
+		t.Fatalf("pulse buckets sum to %d, want nonterminal_total %d", got, *snap.NonterminalTotal)
+	}
+}
+
 // TestTerminalJobActionKeepsTurnAndPulseScopesDistinct pins the live case that
 // motivated this contract: an open openurl_available action survived its job's
 // terminal unavailable outcome ("no legal candidates"). The inbox still owns

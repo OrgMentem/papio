@@ -71,6 +71,12 @@ type Skip struct {
 	Reason string
 }
 
+// SkipReasonDuplicateAttachment is the reason dedupOnePerParent assigns when
+// a parent carries more than one PDF. cmd/identity-corpus classifies these
+// skips when cross-referencing how many secondaries the composite arm would
+// need LoadWithOptions{AllAttachments: true} to surface.
+const SkipReasonDuplicateAttachment = "parent has another PDF attachment"
+
 // scholarlyItemTypes are the Zotero item types worth measuring identity
 // against: everything that carries its own title and, ordinarily, an author
 // list. An attachment whose parent has some other type (a note, a webpage
@@ -639,7 +645,7 @@ func dedupOnePerParent(candidates []candidate) ([]candidate, []Skip) {
 		kept = append(kept, best)
 		for _, c := range group {
 			if c.attachmentID != best.attachmentID {
-				skips = append(skips, Skip{Key: c.attachmentKey, Reason: "parent has another PDF attachment"})
+				skips = append(skips, Skip{Key: c.attachmentKey, Reason: SkipReasonDuplicateAttachment})
 			}
 		}
 	}

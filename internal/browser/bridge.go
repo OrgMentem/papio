@@ -425,6 +425,11 @@ type Bridge struct {
 	presence              map[string]presenceLease
 	presenceOrder         []string
 	adoptionScanSuspended bool
+	// unavailableLogMu guards unavailableLog. Repeated identical read-model
+	// failures (same surface and cause) log once per window instead of every
+	// UI poll.
+	unavailableLogMu sync.Mutex
+	unavailableLog   map[string]unavailableLogState
 	// adoptionScanGate is a capacity-1 semaphore held for the full lifetime
 	// of one underlying root/dir listing.
 	adoptionScanGate chan struct{}
@@ -606,6 +611,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		pendingCaptures:        map[string]*pendingPageCapture{},
 		materializationOffered: map[string]materializationOffer{},
 		presence:               map[string]presenceLease{},
+		unavailableLog:         map[string]unavailableLogState{},
 		materializationTracked: map[string]bool{},
 		now:                    time.Now,
 		readDir:                os.ReadDir,
@@ -3610,12 +3616,46 @@ func (b *Bridge) triageCounts(ctx context.Context, request *protocol.TriageCount
 // sessionBusy/helloRequired/extensionOutdatedError instead. The cause is
 // logged rather than sent: the extension gets a stable code it can render as
 // "temporarily unavailable", the operator keeps the diagnosis.
-func (b *Bridge) unavailable(requestID, code, message, surface string, cause error) ([]json.RawMessage, error) {
+const unavailableLogSummaryWindow = 5 * time.Minute
+
+type unavailableLogState struct {
+	firstAt    time.Time
+	suppressed int
+}
+
+const unavailableLogKeySep = ""
+
+func unavailableLogKey(surface string, cause error) string {
+	if cause == nil {
+		return surface + unavailableLogKeySep + "no-triage-service"
+	}
+	return surface + unavailableLogKeySep + cause.Error()
+}
+
+func (b *Bridge) logUnavailable(surface string, cause error) {
+	key := unavailableLogKey(surface, cause)
+	now := time.Now()
+	b.unavailableLogMu.Lock()
+	defer b.unavailableLogMu.Unlock()
+	prev, seen := b.unavailableLog[key]
+	if seen && now.Sub(prev.firstAt) < unavailableLogSummaryWindow {
+		prev.suppressed++
+		b.unavailableLog[key] = prev
+		return
+	}
+	if seen && prev.suppressed > 0 {
+		log.Printf("papio: %s unavailable: suppressed %d identical errors in 5m", surface, prev.suppressed)
+	}
 	if cause != nil {
 		log.Printf("papio: %s unavailable: %v", surface, cause)
 	} else {
 		log.Printf("papio: %s unavailable: no triage service configured", surface)
 	}
+	b.unavailableLog[key] = unavailableLogState{firstAt: now, suppressed: 0}
+}
+
+func (b *Bridge) unavailable(requestID, code, message, surface string, cause error) ([]json.RawMessage, error) {
+	b.logUnavailable(surface, cause)
 	frame, err := b.frame(protocol.MsgError, "", protocol.ErrorPayload{
 		Code: code, Message: message, RequestID: requestID,
 	})
@@ -7597,6 +7637,13 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 		// not the transaction discipline around it. Only the DECISION is off:
 		// tests set autoBindDecisionEnabled so the fence, staging and recovery
 		// paths keep being exercised.
+		candidates, err := b.jobs.ListCandidateEligibleJobs(ctx)
+		if err != nil {
+			return err
+		}
+		logAbnormalEligibilityPoolSize(g.ID, len(candidates))
+		autoBindAttempted := autoBindDecisionEnabled
+		autoBindOutcome := grab.AutoBindOutcomeNotAttempted()
 		if autoBindDecisionEnabled {
 			bound, err := b.attemptAutoBind(ctx, g, dir, name, temp, report.Text.Excerpt)
 			if err != nil {
@@ -7605,9 +7652,11 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 			if bound {
 				return nil
 			}
+			autoBindOutcome = grab.AutoBindOutcomeAbstained()
 		}
+		snap := grab.NewEligibilityPoolSnapshot(candidates, grab.SnapshotPhasePreBind, autoBindDecisionEnabled, autoBindAttempted, autoBindOutcome)
 		_ = os.RemoveAll(dir)
-		return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
+		return b.grabs.MarkParkedNoIdentifierWithEligibilitySnapshot(ctx, g.ID, snap)
 	}
 	var mismatch error
 	for _, doi := range dois {
@@ -7622,6 +7671,12 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 		return b.grabs.MarkParkedNoIdentifier(ctx, g.ID)
 	}
 	return nil
+}
+
+func logAbnormalEligibilityPoolSize(grabID string, poolSize int) {
+	if poolSize > 1000 {
+		log.Printf("papio: eligibility pool size %d for grab %s exceeds normal bounds", poolSize, grabID)
+	}
 }
 
 // autoBindDecisionEnabled gates the autonomous candidate-binding decision. It
@@ -7702,6 +7757,11 @@ func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, t
 		freshWinner, freshOK, _ := pdf.SelectAutoBindCandidate(excerpt, freshCandidates)
 		if !freshOK || freshWinner.Key != winner.Key {
 			return grab.BindProvenance{}, grab.ErrFenceRejected
+		}
+		fencedSnap := grab.NewEligibilityPoolSnapshot(fresh, grab.SnapshotPhaseFencedCommit, true, true, grab.AutoBindOutcomeBound())
+		logAbnormalEligibilityPoolSize(g.ID, fencedSnap.PoolSize)
+		if err := grab.RecordEligibilitySnapshotTx(ctx, tx, g.ID, grab.SnapshotPhaseFencedCommit, fencedSnap); err != nil {
+			return grab.BindProvenance{}, err
 		}
 		return autoBindProvenance(excerpt, freshCandidates, freshWinner), nil
 	}

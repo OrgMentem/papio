@@ -1,6 +1,6 @@
 # Work-pulse log volume — diagnosis (2026-08-17)
 
-Status: diagnosis only; no code changes in this pass.
+Status: fixed (2026-08-17); see Implementation section below.
 
 ## Symptom
 
@@ -135,11 +135,59 @@ window). Zero change to extension timers, `KEEPALIVE_ALARM`, or resolver
 keepalive. Pair with a separate ticket to fix `pulse bucket algebra is
 inconsistent`.
 
-## Follow-up (out of scope here)
+## Follow-up (out of scope here) — closed 2026-08-17
 
-- Reproduce algebra failure with `papio pulse` / DB snapshot and fix
-  `pulse.Service.Read` classification (`pulse.go:281–291`).
-- Investigate **double `work_pulse_request` per minute** on a single holder (two
-  lines same second) — likely overlapping alarm and another poll or duplicate
-  alarm delivery; worth confirming with seq-level tracing, not required to stop
-  log spam via (1).
+### Double `work_pulse_request` per minute (single holder)
+
+**Live evidence checked 2026-08-17:**
+
+```text
+grep -c 'work_pulse_request' ~/.local/share/papio/native-host.log   → 0
+grep 'work_pulse_request' ~/.local/share/papio/native-host.log | tail -20   → (no matches)
+```
+
+`native-host.log` records host lifecycle and stderr only (`internal/nativehost/host.go`); it does **not** log frame types. Pulse volume is visible in `daemon.log` via `Bridge.unavailable` (`bridge.go:3613–3615`).
+
+Daemon tail (idle holder, inbox/popup not open):
+
+```text
+2026/08/17 13:12:39 papio: work pulse unavailable: pulse bucket algebra is inconsistent
+2026/08/17 13:12:39 papio: work pulse unavailable: pulse bucket algebra is inconsistent
+2026/08/17 13:13:39 papio: work pulse unavailable: pulse bucket algebra is inconsistent
+2026/08/17 13:13:39 papio: work pulse unavailable: pulse bucket algebra is inconsistent
+```
+
+Analysis over the last 120 pulse lines: **median gap 60s** between unique seconds; **~93% of lines arrive in same-second pairs**. That cadence matches `KEEPALIVE_ALARM_MINUTES = 1`, not inbox (15s) or popup (5s).
+
+| Hypothesis | Verdict |
+|------------|---------|
+| MV3 alarm + separate interval poll both pulsing on idle | **No** — interval is 60s, not 15s/5s; only `onKeepaliveAlarm` and `papio.work.pulse` call `requestWorkPulse()` in `background.ts`. |
+| One alarm delivered twice (re-create on every worker start) | **Yes** — `start()` always called `alarms.create("papio-keepalive")` (`background.ts:4740–4742`), resetting a persisted alarm; Chrome can deliver the wake twice in the same second. |
+| Two surfaces (inbox + popup) each polling | **No on idle** — would produce 5s/15s cadence, not 60s pairs; not correct-by-design for a single holder with no UI open. |
+| State-change event + timer | **No** — `hello_ack` does not call `requestWorkPulse()`; runtime `papio.work.pulse` is inbox/popup-only. |
+
+**Fix (extension, session liveness unchanged):**
+
+1. `ensureKeepaliveAlarm()` — create the alarm only when `chrome.alarms.get` reports it missing (alarms persist across MV3 worker death; re-create was resetting the schedule).
+2. `onKeepaliveAlarm()` dedupe — in-flight guard plus `KEEPALIVE_ALARM_DEDUPE_MS` (55s) so a duplicate same-minute callback cannot issue a second `work_pulse_request`.
+
+Tests: `duplicate keepalive alarm delivery issues one work pulse request per interval` and `worker restart does not re-create an existing keepalive alarm` in `extension/test/background.test.ts`.
+
+Remaining open item from the original follow-up: reproduce/fix any residual **`pulse bucket algebra is inconsistent`** product bug (Layer 2 above) — that is separate from duplicate request delivery.
+
+## Implementation (2026-08-17)
+
+**Layer 1 — log volume:** `Bridge.logUnavailable` rate-limits identical
+`surface+cause` pairs: first failure logs at info; repeats within 5 minutes are
+suppressed; when the window elapses, a summary line
+`suppressed N identical errors in 5m` precedes the next info log. Wire behaviour
+unchanged (`pulse_unavailable` still returned every request).
+
+**Layer 2 — bucket algebra:** `pulse.Service.Read` subtracted
+`len(gateJobs)` from `nonterminal_total` even when `gateJobs` included terminal
+sibling ids from `CurrentHumanAttention` (ready/cancelled members still listed
+on open human gates). Only nonterminal gate members are skipped in the bucket
+loop, so three terminal ids in one live login gate made
+`in_flight+…+stalled` exceed `nonterminal_total` by three. Fix: build `gateJobs`
+and `gateTurns` only from ids present in the nonterminal job rows.
+`TestReadTypedGateAlgebraIgnoresTerminalMembers` pins the shape.
