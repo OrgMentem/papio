@@ -318,6 +318,11 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 	if s.RetryDelay <= 0 {
 		s.RetryDelay = 30 * time.Second
 	}
+	// Attribute every credit this pass spends to this job. Set once here, at
+	// the top of the pass, so resolve, enrichment, discovery and the sibling
+	// hop all charge the same fair-share row without any of them carrying a
+	// job id in its signature.
+	ctx = budget.WithJobID(ctx, row.ID)
 
 	var err error
 	switch row.State {
@@ -3357,6 +3362,17 @@ func fetchFailure(err error) (class string, status int, delay time.Duration) {
 func safeType(err error) string {
 	if err == nil {
 		return ""
+	}
+	// A typed local-budget refusal carries WHY in a closed vocabulary papio
+	// defines, and the type alone cannot express it: a job parked because it
+	// took its share of the day and a job parked because the whole day is
+	// spent are both *budget.ErrExceeded, and an operator reading the attempt
+	// row has no way to tell a fair-share wait from an exhausted allowance.
+	// Kind and Window are enums with fixed strings, so recording them cannot
+	// leak upstream text.
+	var exceeded *budget.ErrExceeded
+	if errors.As(err, &exceeded) {
+		return fmt.Sprintf("%T(%s/%s)", exceeded, exceeded.Kind, exceeded.Window)
 	}
 	// Persist only the type/category, never arbitrary upstream text that may
 	// contain a bearer URL, query, body, token, or credential.

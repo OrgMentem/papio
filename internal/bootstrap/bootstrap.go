@@ -171,7 +171,13 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		MaxPerHost: cfg.Captures.MaxPerHost,
 		MaxAge:     time.Duration(cfg.Captures.MaxAgeDays) * 24 * time.Hour,
 	})
-	budgets := budget.New(db, budget.WithCreditPolicy(budget.CreditPolicyFromConfig(cfg)))
+	budgets := budget.New(db,
+		budget.WithCreditPolicy(budget.CreditPolicyFromConfig(cfg)),
+		// Without this the per-job credit share never binds: an unspent
+		// allowance cannot be carried forward, so deferring a job when
+		// nothing else is waiting would cost throughput and buy nothing.
+		budget.WithContentionProbe(jobs.OtherWorkWaiting),
+	)
 
 	artifactPolicy := fetch.DefaultPolicy()
 	artifactPolicy.MaxBytes = cfg.Fetch.MaxBytes

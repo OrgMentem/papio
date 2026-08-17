@@ -175,3 +175,42 @@ func TestOpenAlexCreditCostClassifier(t *testing.T) {
 		t.Fatalf("search = %d, want 10", got)
 	}
 }
+
+// recordingAuthority captures the EgressRequest the guarded client builds, so a
+// test can assert what actually reached the egress authority.
+type recordingAuthority struct{ last budget.EgressRequest }
+
+func (r *recordingAuthority) CommitEgress(_ context.Context, req budget.EgressRequest) error {
+	r.last = req
+	return nil
+}
+
+func TestGuardedClientAttributesEgressToTheContextJob(t *testing.T) {
+	authority := &recordingAuthority{}
+	inner := &countingHTTP{}
+	g := MustGuarded(authority, config.SourceOpenAlex,
+		config.Source{Enabled: true, APIKey: "key-a"}, OpenAlexCreditCost, inner)
+
+	// The job id rides the context because the commit happens here, at the
+	// wire, several layers below anything that knows what work is running.
+	// If this attribution is lost the fair-share counter silently records
+	// nothing and the share can never bind.
+	req := guardedRequest(t, "https://api.openalex.org/works/W1?api_key=key-a")
+	req = req.WithContext(budget.WithJobID(req.Context(), "job-abc"))
+	if _, err := g.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if authority.last.JobID != "job-abc" {
+		t.Fatalf("JobID = %q, want job-abc", authority.last.JobID)
+	}
+
+	// An unattributed request must carry no job rather than inherit the last
+	// one seen.
+	plain := guardedRequest(t, "https://api.openalex.org/works/W2?api_key=key-a")
+	if _, err := g.Do(plain); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if authority.last.JobID != "" {
+		t.Fatalf("JobID = %q, want empty for an unattributed request", authority.last.JobID)
+	}
+}

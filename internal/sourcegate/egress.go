@@ -113,6 +113,7 @@ func (g *GuardedClient) Do(req *http.Request) (*http.Response, error) {
 		Source:   g.source,
 		Identity: identity,
 		Credits:  credits,
+		JobID:    budget.JobIDFrom(req.Context()),
 	}); err != nil {
 		return nil, err
 	}

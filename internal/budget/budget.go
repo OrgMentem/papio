@@ -36,8 +36,13 @@ type ErrExceeded struct {
 	Limit   float64
 	Attempt float64
 
-	// Credit fuse diagnostics (KindCredits).
+	// Credit fuse diagnostics (KindCredits, KindJobShare). For KindJobShare
+	// these describe the JOB's own consumption and its share of the day, not
+	// the source-wide figures — a per-job refusal that printed source-wide
+	// numbers would be a false authority in the one place an operator looks
+	// to understand why their paper stopped.
 	Committed int
+	JobID     string
 }
 
 func (e *ErrExceeded) Error() string {
@@ -52,6 +57,13 @@ func (e *ErrExceeded) Error() string {
 		}
 		return fmt.Sprintf("source %s (%s) daily credit budget exceeded: committed %d + request %d > limit %d; until %s",
 			e.Source, e.Identity, e.Committed, int(e.Attempt), int(e.Limit), until)
+	case KindJobShare:
+		until := "next UTC day"
+		if !e.Until.IsZero() {
+			until = e.Until.UTC().Format(time.RFC3339)
+		}
+		return fmt.Sprintf("job %s has used its share of today's %s allowance: committed %d + request %d > share %d; other work is waiting; until %s",
+			e.JobID, e.Source, e.Committed, int(e.Attempt), int(e.Limit), until)
 	default:
 		until := e.Until.UTC().Format(time.RFC3339)
 		if e.Until.IsZero() {
@@ -60,6 +72,29 @@ func (e *ErrExceeded) Error() string {
 		return fmt.Sprintf("source %s (%s) monthly budget exceeded: spent $%.2f + request $%.2f > limit $%.2f; until %s",
 			e.Source, e.Identity, e.Spent, e.Attempt, e.Limit, until)
 	}
+}
+
+type jobIDKey struct{}
+
+// WithJobID attributes every egress commit made under ctx to a job. The
+// attribution rides the context because the commit happens at the wire, inside
+// an HTTP client wrapper several layers below any code that knows what work is
+// being done — the alternative is a job id parameter threaded through every
+// resolver, enricher and discovery signature for the benefit of one accounting
+// row.
+func WithJobID(ctx context.Context, jobID string) context.Context {
+	if jobID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, jobIDKey{}, jobID)
+}
+
+// JobIDFrom reports the job an egress commit belongs to. An empty result means
+// the caller did not attribute the request, and fair-share accounting is
+// skipped rather than charged to a guess.
+func JobIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(jobIDKey{}).(string)
+	return id
 }
 
 // MaxInlineWait bounds how long Acquire will block a caller on the durable
@@ -139,6 +174,7 @@ type Manager struct {
 	now      func() time.Time
 
 	creditPolicy func(source string) CreditPolicy
+	contention   ContentionProbe
 
 	latchMu      sync.Mutex
 	quotaLatches map[string]quotaLatch

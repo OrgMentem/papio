@@ -246,6 +246,57 @@ Representation is **one** typed local-budget refusal carrying unit, window and
 reset (`BudgetKind`, `Window`, and an `Until` on `budget.ErrExceeded`), not two
 sibling error types: one park path, and a third budget stays cheap to add.
 
+### 14. One job may not occupy acquisition indefinitely — enforced on exclusion, never on lifetime
+
+A day-bounded fuse still permits one pathological job to consume the whole
+allowance every day, starving unrelated work indefinitely. That residue is now
+bounded: **no job may consume more than `JobCreditShare` (0.25) of a source's
+daily allowance while other work is waiting on that source.**
+
+**The obvious instrument is unsafe, and this is measured rather than argued.**
+Wire attempts per job on the operator's live store, for jobs that reached
+`ready`: p50 **11**, p90 29, p99 **616**, max **1,376**; the worst non-terminal
+offender sat at 3,404. Healthy and pathological jobs overlap by more than a
+decimal order of magnitude, so no attempt-count kill threshold separates them —
+set it low enough to bite the offender and it destroys a paper that would have
+arrived, which is the outcome class papio refuses. **Any future proposal here
+MUST re-run that measurement before naming a number.** A quarter of OpenAlex's
+10,000-credit day is 2,500 credits, so the observed worst-case *successful* job
+fits inside its share with room to spare.
+
+**Enforce on exclusion, not lifetime.** The harm is not that a job lives long;
+it is that its spend excludes others. So the gate binds only under contention,
+because the OpenAIRE smoke established that an unspent allowance cannot be
+banked: deferring a hog while nothing else waits costs throughput and buys
+nothing. Contention is "another job is in `resolving`, `retry_wait`, or
+`queued`" — `awaiting_human` is excluded on evidence, since zero of 139 parked
+jobs had made a wire attempt since parking, and counting them would make
+contention permanently true.
+
+**The counter is monotone and has no reset path.** `job_credit_share` is
+incremented in the *same transaction* as the source-wide debit, so a job can
+never spend a credit its own share did not record, and it is charged even when
+the share does not currently bind (otherwise the first contended pass would read
+as the job's first spend). The only legitimate reset is a human resubmission,
+which produces a different job id. This is what dissolves both deferral reasons:
+there is no progress-triggered reset to get wrong — the reason the earlier design
+could not deliver a bound, since a source dribbling low-value novelty kept
+rearming the episode — and **lease fencing stops being a blocker**, because a
+stale pass's increment can only move the counter toward the bound, so the worst
+case is slightly less availability for the job already identified as the hog.
+`InsertCandidates` still performs no generation check; that remains true and
+remains separate.
+
+**No job is ever retired.** The refusal is a durable park to the next UTC day
+(`KindJobShare`, `WindowUTCDay`), so a hog progresses at up to a quarter of a
+day's allowance per day rather than dying. `KindJobShare` is a distinct kind
+because `Error()`'s default branch prints money, and because a per-job refusal
+that reported source-wide figures would be a false authority in the one place an
+operator looks to learn why their paper stopped. For the same reason the
+persisted attempt detail records the refusal's kind and window, not just its Go
+type: both refusals are `*budget.ErrExceeded`, and "took its share" and "the day
+is spent" are different facts.
+
 ## Consequences
 
 - The production OpenAlex transport cannot negotiate HTTP/2, and a merge-`301`
@@ -263,12 +314,9 @@ sibling error types: one park path, and a third budget stays cheap to add.
 
 ## Not decided here
 
-- **A per-job spending cap.** The fuse bounds a *day*, not a job, so one
-  pathological job can consume the allowance again tomorrow and starve unrelated
-  work each time. Deferred: a per-job cap resets on novel candidates and so never
-  delivers a hard bound anyway, and lease fencing is unresolved —
-  `InsertCandidates` performs no generation check, so a stale pass could rearm the
-  current holder's authority.
+- ~~**A per-job spending cap.**~~ **Decided 2026-08-17 — see Decision 14 below.**
+  The deferral's two stated reasons were both dissolved by choosing a different
+  instrument, not by revisiting the judgement.
 - **Jitter on the budget-reset wake.** Operational smoothing, not an invariant.
 - **Generalising the header-derived floor to other sources.** Four of ten
   configured sources publish nothing usable, and only OpenAlex has two pools; the

@@ -164,89 +164,34 @@ that meaning, while smearing the wake preserves it. **Scope it to quota and
 local-budget reset parks**, not to every source-gate wake: an ordinary short gate
 is not a synchronized cohort, and smearing those adds latency for no benefit.
 
-## 6. Cross-day starvation — invariant ADOPTED 2026-08-17, instrument re-chosen
+## 6. Cross-day starvation — **SHIPPED 2026-08-17** (ADR-0024 Decision 14)
 
-`Process` crash recovery rewinds to `resolving`, and a pass can fail on durable
-post-wire state updates (`FillWorkMetadata`, `InsertCandidates`,
-`ResetCandidates`) before any `retry_wait` transition exists — so
-wire → credits spent → post-wire failure → no retry event → recovery → the same
-provider call authorized again. `retryBudgetExhausted` cannot contain it,
-because its count comes from persisted event history that this sequence never
-writes. The charging information is only an in-memory `retryPlan` until the job
-reaches its durable retry transition.
+The invariant "one job may not occupy acquisition indefinitely" is adopted, built
+and tested. The decision, its measurement, and the reasoning that rejected the
+attempt-count instrument now live in **ADR-0024 Decision 14** — read that, not
+this section, and do not re-derive the design from the history below.
 
-**This is a current shipped spend-safety defect, not a future fairness
-concern** — the post-commit review was explicit about that, and storage failure
-is not hypothetical on this machine. It is listed sixth because the egress
-authority (item 1+2) is the structural fix for its *consequence*: once every
-OpenAlex wire attempt requires a fail-closed credit commit, an uncharged repeat
-pass can no longer produce unbounded provider spend.
+What shipped: migration `0040_job_credit_share.sql` (monotone per-(job, source,
+day) counter, no reset path), `budget.JobCreditShare` = 0.25 enforced inside the
+egress transaction, `job.Store.OtherWorkWaiting` as the contention signal,
+`budget.WithJobID` attributing every credit a pass spends, and `KindJobShare` as
+a distinct typed refusal that parks to the next UTC day.
 
-**Be precise about what the fuse actually buys, though.** It does not make a
-pathological job's spend bounded over its lifetime — that job can consume the
-allowance again tomorrow, and the day after, starving unrelated jobs each time.
-What the fuse gives is an operator-defined **per-day blast radius**. If that is
-the accepted safety invariant then deferring the per-job guard is reasonable, but
-what remains deferred is a **cross-day starvation and liveness problem**, not
-cosmetic fairness.
+Residue, deliberately not built:
 
-**ADOPTED 2026-08-17: "one job may not occupy acquisition indefinitely" is a product
-invariant.** What follows is the design that survives measurement, and it is not the
-one this section previously sketched.
-
-**The attempt-count instrument is dead on arrival — measured, not argued.** Wire
-attempts per job in the operator's live store, for jobs that actually reached `ready`
-(163 of them): p50 **11**, p90 **29**, p99 **616**, max **1,376**. The worst
-non-terminal offender is **3,404**. The successful and pathological distributions
-overlap across more than a decimal order of magnitude, so no attempt-count kill
-threshold separates them: a cap low enough to bite the offenders would have destroyed
-a job that took 1,376 passes and *succeeded* — a lost paper, silently, which is the
-outcome class this project treats as unacceptable. Any future proposal here must
-re-run that measurement before proposing a number.
-
-**So enforce the invariant on exclusion, not on lifetime.** The harm is not that a
-job lives long; it is that a job's spend *excludes other jobs* from the day's
-allowance. Restate it as: **no job may consume more than a fraction F of a source's
-daily allowance while another job is waiting on that source.** That is enforceable,
-it cannot destroy work — the hog is deferred to the next window, never retired — and
-it needs no new terminal reason, no adapter preflight, and no grace-gate provenance.
-
-**Mechanism, mirroring the fuse's own discipline (ADR-0024):** one monotone counter
-per `(job, source, UTC day)`, incremented in the *same transaction* as
-`CommitEgress`, never decremented and never reset by progress. Monotone is what
-dissolves the two blockers this section could not previously get past:
-
-- **Reset semantics disappear.** There is no progress-triggered reset to make
-  transactional, because the only legitimate reset is a **human resubmission** — an
-  authorized act, not an inferred signal. A source dribbling low-value novelty can no
-  longer keep a job's authority alive, which was the reason the original design could
-  not deliver a bound.
-- **Lease fencing stops being a blocker.** A stale pass's increment only ever moves
-  the counter *toward* the bound, so the failure mode is a little availability for the
-  hog — exactly ADR-0024's "availability is the safe failure mode". No generation
-  check, and no pass token, is required for correctness. (`InsertCandidates` still has
-  no generation check; that remains true and remains a separate concern, but this
-  design no longer depends on it.)
-
-**The gate is conditional on contention**, because the OpenAIRE smoke established
-that an unused hourly or daily allowance cannot be banked: if nothing else is waiting
-on that source, deferring the hog wastes allowance and helps nobody. Fairness only
-binds when there is somebody to be fair to.
-
-**If the strict reading is wanted as well** — every job eventually dies — it must key
-on a *typed* state, never a count: all candidates in permanently-dead states and no
-novel candidate across a bounded window. That is what the `unavailable` cooldown
-already approximates, so build it there if at all, and measure first.
-
-Superseded design, for the record: the earlier worked sketch (conditional SQL charge,
-progress-only reset via `InsertCandidates`' inserted-row count, a separate
-`retryProgressBasis`, a dedicated terminal reason, and the regression that crossing
-the ceiling must not make `atBoundary` true) is in git history at the third rewrite of
-this file. It is superseded by the measurement above, not by taste.
-
-**Do not rely on in-database telemetry of post-wire/pre-park failures as the
-trigger**: storage failure is precisely the condition that produces those failures
-*and* erases their record, so that signal is quietest exactly when it matters.
+- **`InsertCandidates` still performs no generation check.** The share design no
+  longer depends on one (a monotone counter's stale increment only costs the hog
+  availability), so this is now an ordinary lease-fencing question rather than a
+  blocker on anything.
+- **The strict reading — every job eventually *dies* — is not implemented.** If it
+  is ever wanted it MUST key on typed state (all candidates permanently dead, no
+  novel candidate in a bounded window), never on a count, for the reason ADR-0024
+  Decision 14 records. `internal/zotio`'s `unavailable` cooldown already
+  approximates it and would be the place; it needs its own measurement first.
+- **Do not rely on in-database telemetry of post-wire/pre-park failures as a
+  trigger** for any future work here: storage failure is precisely the condition
+  that produces those failures *and* erases their record, so that signal is
+  quietest exactly when it matters.
 
 ## 7. Derive the effective basis explicitly, before novelty gating — **Not built: hop is opt-in, default off**
 

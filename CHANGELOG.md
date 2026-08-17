@@ -38,6 +38,27 @@ execution records kept during the initial build.
   an unauthenticated caller is allowed. `papio doctor` names which credential
   you are on and warns when it is the expiring one. Setup is on the
   configuration reference page.
+- **One paper can no longer eat a whole day's search allowance while your other
+  papers get nothing.** A daily spending ceiling already stopped *papio* running
+  a metered source dry, but it bounded the **day**, not any one paper — so a
+  single hopeless request could still spend the entire allowance every morning
+  and leave everything else you asked for waiting until midnight, every day.
+  Now, **while other work is waiting**, no single paper may use more than a
+  quarter of a source's daily allowance; the rest stays available to the queue.
+  Nothing is ever given up on: a paper that reaches its quarter waits for
+  tomorrow and keeps going, rather than being abandoned. When nothing else is
+  waiting, one paper may still use the whole day, because an unused allowance
+  cannot be saved up — refusing the only running job would cost you throughput
+  and buy nothing.
+
+  The obvious version of this rule would have been "stop after N tries", and
+  measuring it against your own history is what ruled it out: papers that
+  eventually **succeeded** needed 11 tries at the median but **1,376** at the
+  worst, while the worst runaway sat at 3,404. Any cutoff low enough to catch
+  the runaway would have thrown away a paper that was going to arrive, so the
+  rule counts *spending under contention* instead of attempts. A paper parked
+  this way now says so specifically, rather than being indistinguishable from
+  the whole day's allowance being gone.
 
 ### Fixed
 - **Sending a PDF from your browser no longer refuses every time.** The daemon

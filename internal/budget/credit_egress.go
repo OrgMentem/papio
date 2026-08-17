@@ -26,9 +26,11 @@ const ColdStartCreditCap = 500
 var egressTestHooks = struct {
 	enforceDebitLimit  bool
 	enforceEgressGates bool
+	enforceJobShare    bool
 }{
 	enforceDebitLimit:  true,
 	enforceEgressGates: true,
+	enforceJobShare:    true,
 }
 
 // BudgetKind names which local budget refused egress.
@@ -37,6 +39,11 @@ type BudgetKind int
 const (
 	KindCredits BudgetKind = iota
 	KindUSD
+	// KindJobShare refuses one job's request because that job has already
+	// taken its share of a source's daily allowance while other work waits.
+	// It is a separate kind because Error()'s default branch prints money:
+	// a new kind that fell through would report a credit refusal in dollars.
+	KindJobShare
 )
 
 func (k BudgetKind) String() string {
@@ -45,6 +52,8 @@ func (k BudgetKind) String() string {
 		return "credits"
 	case KindUSD:
 		return "usd"
+	case KindJobShare:
+		return "job_share"
 	default:
 		return fmt.Sprintf("budget_kind(%d)", k)
 	}
@@ -73,11 +82,14 @@ func (w Window) String() string {
 }
 
 // EgressRequest is the wire-side credit commit. Identity is the outgoing
-// credential fingerprint, never a construction-time policy default.
+// credential fingerprint, never a construction-time policy default. JobID
+// attributes the debit to the work that caused it; empty means the caller could
+// not attribute it, and fair-share accounting is skipped rather than guessed.
 type EgressRequest struct {
 	Source   string
 	Identity string
 	Credits  int
+	JobID    string
 }
 
 type quotaLatch struct {
@@ -99,6 +111,47 @@ type CreditPolicy struct {
 func WithCreditPolicy(fn func(source string) CreditPolicy) Option {
 	return func(m *Manager) {
 		m.creditPolicy = fn
+	}
+}
+
+// JobCreditShare is the fraction of a source's daily allowance one job may
+// consume while other work is waiting on that source.
+//
+// 0.25 is measured, not chosen for roundness. Against the operator's own store,
+// jobs that reached `ready` needed a median of 11 wire attempts, 616 at p99 and
+// 1,376 at the maximum; on OpenAlex's 10,000-credit day a quarter share is
+// 2,500 credits, so the observed worst-case SUCCESSFUL job stays inside it with
+// room to spare. The share is what stops one job draining a day, not a guess at
+// how much work a paper "should" need — which is why the earlier attempt-count
+// cap was rejected outright: healthy and pathological jobs overlap by a decimal
+// order of magnitude on that axis, so any threshold that bit the hog also
+// killed papers that would have arrived.
+const JobCreditShare = 0.25
+
+// ContentionProbe reports whether work other than exceptJobID is currently
+// waiting to make requests. It is injected because the job lifecycle is not
+// budget's to know: budget owns the money, the job package owns the states.
+//
+// The question is not per-source because papio's resolve pass is not: a pass
+// calls every enabled source, so a job waiting to resolve contends for all of
+// them.
+//
+// It is read OUTSIDE the egress transaction on purpose. The counter it guards
+// must be atomic because it is money, but the contention answer may be one pass
+// stale with no lasting consequence: a false "nobody waiting" grants one extra
+// request to a job already at its share, and a false "someone waiting" defers a
+// job that could have run. Availability is the safe failure mode (ADR-0024), so
+// a probe that errors is treated as no contention rather than as a refusal.
+type ContentionProbe func(ctx context.Context, exceptJobID string) (bool, error)
+
+// WithContentionProbe supplies the "other work is waiting" signal that makes
+// the per-job share bind. Without it the share never binds at all: deferring a
+// job when nothing else wants the source helps nobody, because an unspent
+// allowance cannot be banked — measured live against OpenAIRE, where 94% of a
+// free hourly allowance went unused across hours that had no demand.
+func WithContentionProbe(probe ContentionProbe) Option {
+	return func(m *Manager) {
+		m.contention = probe
 	}
 }
 
@@ -358,6 +411,19 @@ func (m *Manager) CommitEgress(ctx context.Context, req EgressRequest) error {
 		return creditExceeded(req, row.committed, req.Credits, limit, now)
 	}
 
+	// Fair share, checked before the debit and only where there is an
+	// allowance to divide: an unmetered source has no day to run out of.
+	if egressTestHooks.enforceJobShare && !unmetered && req.JobID != "" {
+		taken, err := m.jobShareTaken(ctx, tx, req.JobID, req.Source, day)
+		if err != nil {
+			return err
+		}
+		share := jobShareLimit(limit)
+		if taken+req.Credits > share && m.otherWorkWaiting(ctx, req.JobID) {
+			return jobShareExceeded(req, taken, req.Credits, share, now)
+		}
+	}
+
 	debitUnmetered := unmetered || !egressTestHooks.enforceDebitLimit
 	affected, err := m.debitCredits(ctx, tx, req.Source, day, req.Credits, limit, debitUnmetered)
 	if err != nil {
@@ -369,6 +435,16 @@ func (m *Manager) CommitEgress(ctx context.Context, req EgressRequest) error {
 			return err
 		}
 		return creditExceeded(req, row.committed, req.Credits, limit, now)
+	}
+	// The job's share is charged in the SAME transaction as the source-wide
+	// debit, so a job can never spend a credit that its own share did not
+	// record. Charged even when the share does not currently bind: the
+	// counter must be a complete record of what the job spent today, or the
+	// first pass under contention would read as the job's first spend.
+	if req.JobID != "" {
+		if err := m.chargeJobShare(ctx, tx, req.JobID, req.Source, day, req.Credits); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -384,6 +460,70 @@ func creditExceeded(req EgressRequest, committed, attempt, limit int, now time.T
 		Attempt:   float64(attempt),
 		Limit:     float64(limit),
 	}
+}
+
+// jobShareLimit is one job's ceiling out of a day's allowance. It floors at 1
+// so a tiny allowance (the bootstrap cap, before any provider figure has been
+// observed) still admits single requests rather than refusing every job
+// including the only one running.
+func jobShareLimit(limit int) int {
+	share := int(float64(limit) * JobCreditShare)
+	if share < 1 {
+		return 1
+	}
+	return share
+}
+
+func jobShareExceeded(req EgressRequest, taken, attempt, share int, now time.Time) *ErrExceeded {
+	return &ErrExceeded{
+		Source:    req.Source,
+		Identity:  req.Identity,
+		JobID:     req.JobID,
+		Kind:      KindJobShare,
+		Window:    WindowUTCDay,
+		Until:     nextUTCMidnight(now),
+		Committed: taken,
+		Attempt:   float64(attempt),
+		Limit:     float64(share),
+	}
+}
+
+func (m *Manager) jobShareTaken(ctx context.Context, tx *sql.Tx, jobID, source, day string) (int, error) {
+	var taken int
+	err := tx.QueryRowContext(ctx,
+		`SELECT credits_committed FROM job_credit_share
+		 WHERE job_id = ? AND source = ? AND utc_day = ?`, jobID, source, day).Scan(&taken)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return taken, err
+}
+
+// chargeJobShare increments the job's monotone counter for the day. There is no
+// reset path by design: the only legitimate reset is a human resubmitting the
+// work, which produces a different job id.
+func (m *Manager) chargeJobShare(ctx context.Context, tx *sql.Tx, jobID, source, day string, credits int) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO job_credit_share (job_id, source, utc_day, credits_committed)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(job_id, source, utc_day)
+		 DO UPDATE SET credits_committed = credits_committed + excluded.credits_committed`,
+		jobID, source, day, credits)
+	return err
+}
+
+// otherWorkWaiting asks the injected probe whether anything else wants this
+// source. A missing or failing probe answers false: the share must never refuse
+// work because the signal that would justify refusing it could not be read.
+func (m *Manager) otherWorkWaiting(ctx context.Context, exceptJobID string) bool {
+	if m.contention == nil {
+		return false
+	}
+	waiting, err := m.contention(ctx, exceptJobID)
+	if err != nil {
+		return false
+	}
+	return waiting
 }
 
 func (m *Manager) readFuseRow(ctx context.Context, tx *sql.Tx, source, day string) (fuseRow, error) {

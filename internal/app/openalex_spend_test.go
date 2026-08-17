@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"strings"
+
 	"papio/internal/budget"
 	"papio/internal/config"
 	"papio/internal/discovery"
@@ -1003,4 +1005,27 @@ func probeAndClose(c interface {
 		return err
 	}
 	return resp.Body.Close()
+}
+
+func TestBudgetRefusalDetailNamesTheKind(t *testing.T) {
+	// A job parked because it took its share of the day and a job parked
+	// because the whole day is spent are the same Go type. The persisted
+	// attempt detail is where an operator finds out which happened, so the
+	// closed-vocabulary kind has to survive into it.
+	share := safeType(&budget.ErrExceeded{Kind: budget.KindJobShare, Window: budget.WindowUTCDay})
+	day := safeType(&budget.ErrExceeded{Kind: budget.KindCredits, Window: budget.WindowUTCDay})
+	if share == day {
+		t.Fatalf("share and day refusals both record %q: indistinguishable", share)
+	}
+	if !strings.Contains(share, "job_share") {
+		t.Errorf("share detail = %q, want it to name job_share", share)
+	}
+	if !strings.Contains(day, "credits") {
+		t.Errorf("day detail = %q, want it to name credits", day)
+	}
+	// The reason safeType exists at all: no upstream text may be persisted.
+	leaky := safeType(errors.New("https://api.openalex.org/works?api_key=SECRET"))
+	if strings.Contains(leaky, "SECRET") {
+		t.Errorf("detail leaked upstream text: %q", leaky)
+	}
 }
