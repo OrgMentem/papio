@@ -4916,7 +4916,21 @@ test("a download interrupted before its id is known settles the grab instead of 
   const abandon = await h.port.waitForFrame("pdf_grab_abandon_request");
   expect(abandon.payload["grab_id"]).toBe("grab-dead-link-01");
   expect(abandon.payload["request_id"]).toBe(frame.payload["request_id"]);
+  // Answer it, so the reply proves the settled cancellation rather than the
+  // two-second timeout the request falls back to when nothing responds.
+  await h.port.inbound(
+    nativeResult("pdf_grab_abandon_result", {
+      request_id: abandon.payload["request_id"] as string,
+      grab_id: "grab-dead-link-01",
+      state: "abandoned",
+      outcome: "abandoned",
+    }),
+  );
   await expect(reply).resolves.toMatchObject({ ok: false });
+  // The correlation is gone, so a later Send PDF starts clean instead of
+  // finding a stale record for a download that failed — and no signing token is
+  // left behind in storage.
+  expect(h.pdfGrabCorrelations.current["grab-dead-link-01"]).toBeUndefined();
 });
 test("closing the tab before auth cancels; after auth (awaiting_download) does not", async () => {
   // Before auth return: tab close is a genuine user cancel.
@@ -5075,6 +5089,61 @@ test("an existing grab this browser cannot steer is cleared, and the retry alloc
     grab_id: "grab-orphan-02",
     awaiting_viewer: true,
   });
+});
+
+test("an existing grab the daemon refuses to cancel is reported, not retried", async () => {
+  // The daemon answers `conflict` inside a successful reply when the capture
+  // still occupies its permit — held, or lost with completion unknown — which is
+  // the deliberate rule that only the request identity which allocated an
+  // occupying capture may release it. Treating that as clearance and retrying
+  // just repeats the refusal, and reporting it as sent is the lie this whole
+  // sequence exists to remove.
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const signed = `https://watermark02.silverchair.com/held.pdf?token=${"h".repeat(120)}`;
+  h.tabs.seed({ id: 73, url: signed });
+  const reply = h.bridge.requestPdfGrab({ tab_id: 73, url: signed });
+  const frame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: frame.payload["request_id"] as string,
+      outcome: "existing",
+      grab_id: "grab-held-01",
+    }),
+  );
+  const statusFrame = await h.port.waitForFrame("pdf_grab_status_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_status_result", {
+      request_id: statusFrame.payload["request_id"] as string,
+      grab_id: "grab-held-01",
+      state: "awaiting_file",
+    }),
+  );
+  const abandonFrame = await h.port.waitForFrame("pdf_grab_abandon_request");
+  const postedBeforeRefusal = h.port.posted.length;
+  await h.port.inbound(
+    nativeResult("pdf_grab_abandon_result", {
+      request_id: abandonFrame.payload["request_id"] as string,
+      grab_id: "grab-held-01",
+      state: "awaiting_file",
+      outcome: "conflict",
+      detail: "this download has already finished, or a different browser started it",
+    }),
+  );
+  const settled = await reply;
+  expect(settled.ok).toBe(false);
+  // No second allocation: a refused cancellation is final for this attempt.
+  const laterGrabRequests = h.port.posted
+    .slice(postedBeforeRefusal)
+    .map(parseBrowserMessage)
+    .filter((f) => f.type === "pdf_grab_request");
+  expect(laterGrabRequests).toEqual([]);
 });
 test("restart recovery re-hellos and does not duplicate a live tab", async () => {
   const seed: StoreShape = {
@@ -10391,20 +10460,6 @@ test("death between sending persistence and downloads.download is recoverable vi
   expect(freshOffer["state"]).toBe("needs_choice");
 });
 
-test("Firefox native viewer PDF does not offer picker (assisted)", async () => {
-  const h = makeHarness(undefined, { firefox: true });
-  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
-    const s2 = st as StoreShape;
-    return { ...s2, activeJobs: [awaitingJob("job_ff_a", 1_700_000_000_001)] };
-  });
-  await h.bridge.start();
-  const viewerURL = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
-  h.tabs.seed({ id: 100, url: viewerURL });
-  const reply = await h.bridge.startPDFDelivery({ tab_id: 100, url: viewerURL }) as unknown as Record<string, unknown>;
-  expect(reply["ok"]).toBe(false);
-  expect(String((reply as { error?: { message?: string } }).error?.message ?? "")).toMatch(/viewer Download/i);
-});
-
 test("terminal delivery destroys outstanding choices so same-page resend cannot reuse old nonce", async () => {
   const h = makeHarness();
   await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
@@ -10438,6 +10493,27 @@ test("ScienceDirect assets Send PDF arms the native viewer download (waiting_man
   expect(suggestions).toEqual(["papio/job_sciencedirect_native_viewer/1-s2.0-S0360131510000527-main.pdf"]);
 });
 
+
+test("Firefox refuses a single-use PDF link instead of promising to file it", async () => {
+  // Firefox has no onDeterminingFilename, so papio cannot steer or adopt a
+  // download it did not start. The refusal used to say "use the viewer Download
+  // button — papio will file that download for you", which the platform cannot
+  // do: the researcher would download the paper and papio would never see it.
+  const h = makeHarness(undefined, { firefox: true });
+  await ((h.bridge as unknown as { update: (fn:(s:unknown)=>unknown)=>Promise<void>}).update)((st: unknown)=>{
+    const s2 = st as StoreShape;
+    return { ...s2, activeJobs: [awaitingJob("job_ff_a", 1_700_000_000_001)] };
+  });
+  await h.bridge.start();
+  const viewerURL = "https://pdf.sciencedirectassets.com/271849/1-s2.0-S0360131510X00057/1-s2.0-S0360131510000527/main.pdf";
+  h.tabs.seed({ id: 100, url: viewerURL });
+  const reply = await h.bridge.startPDFDelivery({ tab_id: 100, url: viewerURL });
+  expect(reply.ok).toBe(false);
+  const message = reply.ok ? "" : reply.error.message;
+  expect(message).toMatch(/Chrome/);
+  expect(message).not.toMatch(/papio will file/i);
+});
+
 test("delivery provenance keeps the host that requested the download", async () => {
   const jobID = "job_delivery_provenance";
   const pdfURL = "https://provider.example.edu/article/10.1000-x.pdf";
@@ -10448,7 +10524,7 @@ test("delivery provenance keeps the host that requested the download", async () 
         job_id: jobID,
         tab_id: 100,
         offered_at: 1_700_000_000_000,
-        expires_at: 1_700_000_600_000,
+        expires_at: 1_800_000_000_000,
         status: "accepted",
         provider_hosts: [],
       },

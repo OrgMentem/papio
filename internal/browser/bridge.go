@@ -5150,7 +5150,7 @@ func (b *Bridge) pdfGrabAbandonSession(ctx context.Context, sessionID string, re
 		// The fenced path deliberately covers only occupying captures, so a
 		// capture whose permit is already settled falls through to here with
 		// nothing in flight. Refusing it would leave the row — and every retry
-		// for that tab, allocation being idempotent per host — waiting on
+		// for that paper, allocation being idempotent per host and title — waiting on
 		// AbandonStaleAwaiting's cutoff hours later for no safety gain.
 		return b.grabs.MarkAbandonedUnoccupied(ctx, request.GrabID, "The PDF grab download was interrupted")
 	})

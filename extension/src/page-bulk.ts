@@ -100,7 +100,7 @@ interface WorkspaceState {
   rescanning: boolean;
   submitting: boolean;
   result: SubmitResult | null;
-  grabState: "idle" | "grabbed" | "identifying" | "job_created" | "already_owned" | "needs_identifier" | "failed";
+  grabState: "idle" | "grabbed" | "awaiting_viewer" | "identifying" | "job_created" | "already_owned" | "needs_identifier" | "failed";
   grabID: string | null;
   grabDetail: string | null;
   allowlistStored: boolean;
@@ -575,6 +575,10 @@ async function handleGrab(row: RowState): Promise<void> {
     });
     if (isRecord(response) && response["ok"] === true && typeof response["grab_id"] === "string") {
       state.grabID = response["grab_id"];
+      // papio started no download of its own for a single-use link, so saying
+      // "Grabbed" would claim work nobody is doing. The researcher's own viewer
+      // Download click is what completes it.
+      if (response["awaiting_viewer"] === true) state.grabState = "awaiting_viewer";
       render();
       return;
     }
@@ -608,6 +612,7 @@ function buildRow(row: RowState, ownershipCollapsed: boolean): HTMLElement {
       state.grabState === "idle" && row.grabURL === null && !canReacquire ? "Reopen or rescan the PDF tab to grab it" :
       state.grabState === "idle" ? (grabSupported() ? "Ready to grab" : "PDF grabbing needs Chrome download steering and a compatible daemon") :
       state.grabState === "grabbed" ? "Grabbed" :
+      state.grabState === "awaiting_viewer" ? "Use the PDF viewer Download button — papio will adopt that file" :
       state.grabState === "identifying" ? "Identifying…" :
       state.grabState === "job_created" ? "Job created" :
       state.grabState === "already_owned" ? "Already in your library" :

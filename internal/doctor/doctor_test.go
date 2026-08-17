@@ -1557,3 +1557,58 @@ func TestCheckDataDirCreatesAbsentDirectory(t *testing.T) {
 		t.Fatalf("remediation on Pass should be empty, got %q", c.Remediation)
 	}
 }
+
+// store.Open leaves the one-capture-per-paper index off when a legacy database
+// already holds two active captures for one paper, because deciding which is
+// real is exactly what papio must never guess. That state is invisible without
+// a check: the database opens, everything works, and the guard silently is not
+// there. Doctor must name it and say how to clear it.
+func TestRunWarnsWhenOnePaperCanHoldTwoCaptures(t *testing.T) {
+	ctx := context.Background()
+	data := storetest.DataDir(t)
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	cfg := config.Default()
+	cfg.DataDir = data
+	healthy := Run(ctx, cfg, db, pdf.Capability{}, executable(t), nil)
+	clean, ok := findCheck(healthy, "capture_uniqueness")
+	if !ok {
+		t.Fatalf("capture_uniqueness check missing: %+v", healthy.Checks)
+	}
+	if clean.Status != Pass {
+		t.Fatalf("status = %v on a clean database, want Pass (%q)", clean.Status, clean.Detail)
+	}
+
+	for _, stmt := range []string{
+		`DROP INDEX IF EXISTS pdf_grabs_active_source`,
+		`INSERT INTO pdf_grabs(id, url_host, title, state, created_at, updated_at)
+		 VALUES ('grab-doc-01', 'pdf.example.org', 'One Paper', 'quarantined',
+		         '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z')`,
+		`INSERT INTO pdf_grabs(id, url_host, title, state, created_at, updated_at)
+		 VALUES ('grab-doc-02', 'pdf.example.org', 'One Paper', 'awaiting_file',
+		         '2026-08-17T01:00:00Z', '2026-08-17T01:00:00Z')`,
+	} {
+		if _, err := db.DB().ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("seed duplicate captures: %v", err)
+		}
+	}
+
+	report := Run(ctx, cfg, db, pdf.Capability{}, executable(t), nil)
+	got, ok := findCheck(report, "capture_uniqueness")
+	if !ok {
+		t.Fatalf("capture_uniqueness check missing: %+v", report.Checks)
+	}
+	if got.Status != Warn {
+		t.Fatalf("status = %v with duplicate captures, want Warn (%q)", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "two captures") {
+		t.Fatalf("detail = %q, want it to name the condition", got.Detail)
+	}
+	if got.Remediation == "" {
+		t.Fatal("remediation is empty; the researcher is told nothing they can do")
+	}
+}

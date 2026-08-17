@@ -8,16 +8,24 @@
 -- MarkAbandonedForRequest, MarkAbandonedUnoccupied and AbandonStaleAwaiting
 -- each fail with a CHECK violation, which the browser bridge reports as
 -- "conflict". The observable symptom is a capture stuck in awaiting_file
--- forever: allocation is idempotent per host, so every later Send PDF for that
--- tab is answered "existing" for a capture nothing can complete or retire, and
--- the six-hour stale sweep cannot clear it either. Tests never saw it because
--- they migrate a fresh database, which gets the edited constraint.
+-- forever: allocation is idempotent per host and title, so every later Send PDF
+-- for that paper is answered "existing" for a capture nothing can complete or
+-- retire, and the six-hour stale sweep cannot clear it either. Tests never saw
+-- it because they migrate a fresh database, which gets the edited constraint.
 --
 -- SQLite cannot alter a CHECK, so the table is rebuilt. Column list, indexes
 -- and the partial unique indexes are reproduced from 0025 plus the columns
 -- added by 0034 (effect_request_id) and 0037 (bind_provenance). On a database
 -- created after the edit this is an identity rebuild.
-PRAGMA foreign_keys=OFF;
+--
+-- No PRAGMA foreign_keys here: Store.migrate runs each migration inside a
+-- transaction, and that pragma is a no-op inside one — writing it would state a
+-- protection this file does not have. The rebuild is safe with enforcement left
+-- on because nothing references pdf_grabs: its only foreign key is outbound
+-- (job_id -> jobs.id), reproduced below, and no table, trigger or view in the
+-- schema references it. A future rebuild of a table with *inbound* references
+-- cannot copy this pattern — it needs PRAGMA defer_foreign_keys, which does
+-- work inside a transaction.
 
 CREATE TABLE pdf_grabs_rebuilt (
   id                 TEXT PRIMARY KEY,
@@ -48,18 +56,32 @@ FROM pdf_grabs;
 DROP TABLE pdf_grabs;
 ALTER TABLE pdf_grabs_rebuilt RENAME TO pdf_grabs;
 
+-- The pdf_grabs_active_source unique index is deliberately NOT recreated here.
+-- It was added by the same in-place edit that added 'abandoned', so a database
+-- old enough to need this migration also lacks that index — and the Allocate of
+-- that era was an unconditional INSERT with no existence check, so repeated
+-- Send PDF calls for one paper really did leave several active rows. Creating a
+-- unique index over them fails, the migration's transaction rolls back, and
+-- Store.Open then refuses to open the database at all: papio would not start,
+-- with no way for a researcher to recover.
+--
+-- Retiring the extra rows to make the index fit was tried and rejected. A
+-- duplicate may be 'quarantined', which means it owns the only copy of a
+-- paper's bytes, and SweepGrabs skips retired rows — so the repair would
+-- silently discard a paper rather than file it. Under this project's cardinal
+-- rule, no migration may guess which of two captures is the real one.
+--
+-- So this migration changes no data at all. ensurePdfGrabActiveSourceIndex in
+-- store.go creates the index after migrating, tolerating exactly the duplicate
+-- collision, and papio doctor reports a database left without it.
+
 CREATE INDEX pdf_grabs_by_state ON pdf_grabs(state);
 CREATE INDEX pdf_grabs_by_job ON pdf_grabs(job_id);
 CREATE INDEX pdf_grabs_pending_notify ON pdf_grabs(notified_at) WHERE outcome != '';
 
--- At most one in-flight grab may exist for a host/title. This closes the
--- cross-worker race; Allocate also serializes same-process callers.
-CREATE UNIQUE INDEX pdf_grabs_active_source
-  ON pdf_grabs(url_host, title)
-  WHERE state IN ('awaiting_file','quarantined','identified','parked_no_identifier');
+-- pdf_grabs_effect_request_id came from 0034, a migration nobody edited, so it
+-- has always been enforced and cannot have duplicates to collide with.
 
 CREATE UNIQUE INDEX pdf_grabs_effect_request_id
   ON pdf_grabs(effect_request_id)
   WHERE effect_request_id <> '';
-
-PRAGMA foreign_keys=ON;

@@ -40,6 +40,29 @@ test("carriesSignedCredential separates signing tokens from page parameters", ()
   expect(carriesSignedCredential("https://provider.example.edu/x.pdf?token=1")).toBe(false);
   expect(carriesSignedCredential("https://provider.example.edu/x.pdf")).toBe(false);
   expect(carriesSignedCredential("not a url")).toBe(false);
+
+  // The threshold is a boundary, so pin both sides of it rather than one far
+  // example: 32 is the shortest shape in use (a hex MD5), and publisher
+  // parameters reusing these names are ordinals and flags.
+  expect(carriesSignedCredential(`https://provider.example.edu/x.pdf?sig=${"c".repeat(32)}`)).toBe(true);
+  expect(carriesSignedCredential(`https://provider.example.edu/x.pdf?sig=${"c".repeat(31)}`)).toBe(false);
+
+  // Names added after a reviewer walked real delivery URLs. Each of these was
+  // taking the doomed second fetch, which a provider answers with an error page.
+  for (const name of ["expires", "hash", "sso", "ticket", "jwt", "access_token"]) {
+    expect(
+      carriesSignedCredential(`https://provider.example.edu/x.pdf?${name}=${"d".repeat(40)}`),
+    ).toBe(true);
+  }
+
+  // A long human article slug in the path is not a credential. Recognising one
+  // by path length was tried and reverted: it declined ordinary Cambridge and
+  // Emerald article routes, which papio can simply fetch.
+  expect(
+    carriesSignedCredential(
+      "https://www.cambridge.org/core/journals/x/article/abs/property-and-use-in-the-access-economy/A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6",
+    ),
+  ).toBe(false);
 });
 // A DOI read out of a URL must come from URL *structure*. Scanning the
 // serialized URL as text was a live defect with two distinct consequences, both

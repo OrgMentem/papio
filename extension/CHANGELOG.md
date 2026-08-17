@@ -69,13 +69,15 @@ for the full pre-split extension history.
   turned down a capability the extension had had all along.
 
 - **Pressing Send PDF a second time no longer says "PDF sent to papio" while
-  doing nothing.** *papio* keeps one request per tab, so a second press was
+  doing nothing.** *papio* keeps one request per paper, so a second press was
   answered "you already have one of those" — and that was reported as a
   success, for a paper nothing was fetching. Worse, a paper left in that state
   could never be sent again: every later press repeated the same false
   reassurance. The second press now resumes the request against the page you
-  are looking at and asks for the one click that can finish it; if it belongs to
-  a browser session that is gone, you are told so instead.
+  are looking at and asks for the one click that can finish it. If the earlier
+  attempt belongs to a browser session that is gone, *papio* clears it and starts
+  a fresh one; if it cannot be cleared safely — because something may still be
+  arriving — you are told that instead of being told it worked.
 
 - **A paper served on an expiring link now reaches *papio* instead of stalling.**
   Publishers such as Silverchair — JAMA and Oxford University Press among them
@@ -84,7 +86,14 @@ for the full pre-split extension history.
   fetched an error page and then went quiet. It now recognises a link that can
   only be used once and, rather than trying, asks you to press the PDF viewer's
   own **Download** button — the file is already in your browser, so nothing is
-  fetched twice. That file is then adopted as the paper you were reading.
+  fetched twice. *papio* takes that file and reads the paper's identity out of
+  it; when the document does not name itself anywhere *papio* can see, it waits
+  in your inbox to be identified rather than guessing.
+
+  On Firefox this is declined outright rather than half-promised. Firefox gives
+  an extension no way to adopt a download it did not start itself, so *papio*
+  now says to open that paper in Chrome instead of asking for a **Download**
+  click it could never act on.
 
 - **The viewer's Download button files the paper you are reading, not the one
   the tab was opened for.** A tab *papio* opened for one paper and you then

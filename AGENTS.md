@@ -167,7 +167,7 @@ There is also a link check, because `zensical build` prints a broken link as an
   total: no grab abandonment could be written on the dev box at all — the CHECK
   violation surfaced as `outcome: "conflict"`, so a capture stuck in
   `awaiting_file` forever, its tab answered `existing` for good (allocation is
-  idempotent per host), and even `AbandonStaleAwaiting` could not retire it. It
+  idempotent per host and title), and even `AbandonStaleAwaiting` could not retire it. It
   cost most of a session to find, because the daemon, the extension and every
   suite were all correct. `0038_pdf_grabs_abandoned_state.sql` repairs it by
   rebuilding the table; a constraint or column change needs a *new* migration,

@@ -132,6 +132,30 @@ Two browsers cannot race a download, but the slot is not what prevents it: a
 single download authorization is outstanding at a time, so a second attempt is
 told *papio* is busy and can be retried, wherever it came from.
 
+## When *papio* asks you to press Download
+
+Some publishers — Silverchair, which serves JAMA and Oxford University Press
+among others — hand your browser a link that works exactly once. It is signed
+for the session that opened it, and asking for it a second time returns *"Your
+session has timed out"* rather than the file. *papio* cannot fetch such a link,
+so it does not try.
+
+Instead it prepares a place for the file and asks you to press the PDF viewer's
+own **Download** button. The file is already in your browser; that button writes
+it out without asking the publisher for anything. *papio* steers it into the
+capture it prepared, reads the paper's identity out of the file, and files it —
+or, when the document does not name itself anywhere *papio* can see, leaves it in
+your inbox to identify rather than guessing.
+
+Two consequences worth knowing:
+
+- **The paper you clicked wins over the tab's history.** A handoff tab opened for
+  one paper and then reused to read another files the paper you asked about, not
+  the one the tab was opened for.
+- **Firefox declines this rather than half-promising it.** Firefox gives an
+  extension no way to adopt a download it did not start, so *papio* says to open
+  that paper in Chrome instead of asking for a click it could not act on.
+
 ## The inbox stays current
 
 The inbox refreshes the moment you return to its tab, so a job that finished

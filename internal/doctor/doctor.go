@@ -133,6 +133,24 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	}
 
 	if db == nil {
+		add("capture_uniqueness", Skip, "capture uniqueness is checked by the daemon", "")
+	} else if present, duplicates, err := pdfGrabActiveSourceIndex(ctx, db); err != nil {
+		add("capture_uniqueness", Fail, "could not read whether one paper can hold two captures", "inspect database permissions")
+	} else if present {
+		add("capture_uniqueness", Pass, "one capture per paper is enforced by the database", "")
+	} else {
+		// The index entered the schema through an in-place edit of migration
+		// 0025 rather than a new one, so a database old enough to predate that
+		// edit can hold several active captures for one paper — and creating
+		// the index over them fails. Migration 0038 deliberately refuses to
+		// pick a survivor, because a duplicate may be 'quarantined' and hold
+		// the only copy of a paper's bytes.
+		add("capture_uniqueness", Warn,
+			fmt.Sprintf("one paper can hold two captures at once (%d duplicate group(s) block the guard)", duplicates),
+			"papio grabs list --json, then papio grabs identify or dismiss the superseded captures; the guard installs itself once no paper has two")
+	}
+
+	if db == nil {
 		add("effect_permit", Skip, "browser effect occupancy is checked by the daemon", "")
 	} else {
 		permit, err := unresolvedEffectPermit(ctx, db, time.Now())
@@ -350,6 +368,30 @@ type unresolvedPermit struct {
 	id      string
 	status  string
 	overdue bool
+}
+
+// pdfGrabActiveSourceIndex reports whether the at-most-one-active-capture-per-paper
+// index is installed, and if it is not, how many papers currently hold more than
+// one active capture — which is the only reason store.Open leaves it off.
+func pdfGrabActiveSourceIndex(ctx context.Context, db *store.Store) (bool, int, error) {
+	var present int
+	if err := db.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM sqlite_master
+		 WHERE type='index' AND name='pdf_grabs_active_source'`).Scan(&present); err != nil {
+		return false, 0, err
+	}
+	if present > 0 {
+		return true, 0, nil
+	}
+	var duplicates int
+	if err := db.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+		  SELECT url_host, title FROM pdf_grabs
+		   WHERE state IN ('awaiting_file','quarantined','identified','parked_no_identifier')
+		   GROUP BY url_host, title HAVING COUNT(*) > 1)`).Scan(&duplicates); err != nil {
+		return false, 0, err
+	}
+	return false, duplicates, nil
 }
 
 func unresolvedEffectPermit(ctx context.Context, db *store.Store, now time.Time) (*unresolvedPermit, error) {

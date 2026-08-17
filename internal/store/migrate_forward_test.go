@@ -586,7 +586,10 @@ func TestOpenRepairsLegacyPdfGrabStateConstraint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Reproduce the pre-edit table exactly, rows and all.
+	// Reproduce the pre-edit table, its three original indexes, and its rows.
+	// The index set matters: the unique one that keeps a paper to a single active
+	// capture arrived with the same in-place edit, so a database this old does
+	// not have it either.
 	for _, stmt := range []string{
 		`CREATE TABLE pdf_grabs_legacy (
 			id              TEXT PRIMARY KEY,
@@ -607,6 +610,9 @@ func TestOpenRepairsLegacyPdfGrabStateConstraint(t *testing.T) {
 		         '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z')`,
 		`DROP TABLE pdf_grabs`,
 		`ALTER TABLE pdf_grabs_legacy RENAME TO pdf_grabs`,
+		`CREATE INDEX pdf_grabs_by_state ON pdf_grabs(state)`,
+		`CREATE INDEX pdf_grabs_by_job ON pdf_grabs(job_id)`,
+		`CREATE INDEX pdf_grabs_pending_notify ON pdf_grabs(notified_at) WHERE outcome != ''`,
 	} {
 		if _, err := raw.ExecContext(ctx, stmt); err != nil {
 			_ = raw.Close()
@@ -649,5 +655,90 @@ func TestOpenRepairsLegacyPdfGrabStateConstraint(t *testing.T) {
 	}
 	if indexes != 5 {
 		t.Fatalf("pdf_grabs indexes = %d, want 5", indexes)
+	}
+}
+
+// A database predating the in-place edit also predates Allocate's existence
+// check, so it can hold several active captures for one paper. The unique index
+// cannot be created over those rows, and creating it inside the migration would
+// mean Store.Open failing and papio refusing to start. Retiring the extra rows
+// instead is not allowed either: a duplicate may be 'quarantined', holding the
+// only copy of a paper's bytes, and no migration may guess which capture is the
+// real one. So the database must open, keep every row, and go without the index
+// until a human resolves the collision.
+func TestOpenToleratesDuplicateActiveCaptures(t *testing.T) {
+	ctx := context.Background()
+	dataDir := schema33Fixture(t, "")
+	dbPath := filepath.Join(dataDir, "papio.db")
+	raw, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		// The legacy state this models: the guard did not exist yet.
+		`DROP INDEX IF EXISTS pdf_grabs_active_source`,
+		`INSERT INTO pdf_grabs(id, url_host, title, state, created_at, updated_at)
+		 VALUES ('grab-dup-01', 'pdf.example.org', 'One Paper', 'quarantined',
+		         '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z')`,
+		`INSERT INTO pdf_grabs(id, url_host, title, state, created_at, updated_at)
+		 VALUES ('grab-dup-02', 'pdf.example.org', 'One Paper', 'awaiting_file',
+		         '2026-08-17T01:00:00Z', '2026-08-17T01:00:00Z')`,
+	} {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			_ = raw.Close()
+			t.Fatalf("seed duplicate captures: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("Open refused a database with duplicate captures: %v", err)
+	}
+	defer db.Close()
+
+	var rows int
+	if err := db.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM pdf_grabs WHERE id IN ('grab-dup-01','grab-dup-02')`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("pdf_grabs rows = %d, want both duplicates kept", rows)
+	}
+	// Neither row may have been retired: the quarantined one owns bytes the
+	// sweep still has to adopt, and SweepGrabs skips retired captures.
+	var quarantined string
+	if err := db.DB().QueryRowContext(ctx, `SELECT state FROM pdf_grabs WHERE id='grab-dup-01'`).Scan(&quarantined); err != nil {
+		t.Fatal(err)
+	}
+	if quarantined != "quarantined" {
+		t.Fatalf("grab-dup-01 state = %q, want quarantined", quarantined)
+	}
+	var index int
+	if err := db.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='pdf_grabs_active_source'`).Scan(&index); err != nil {
+		t.Fatal(err)
+	}
+	if index != 0 {
+		t.Fatal("pdf_grabs_active_source exists despite duplicate active captures")
+	}
+
+	// Once the collision is resolved the guard installs itself on the next open.
+	if _, err := db.DB().ExecContext(ctx, `UPDATE pdf_grabs SET state='job_created' WHERE id='grab-dup-02'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if err := reopened.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='pdf_grabs_active_source'`).Scan(&index); err != nil {
+		t.Fatal(err)
+	}
+	if index != 1 {
+		t.Fatal("pdf_grabs_active_source still absent after the collision was resolved")
 	}
 }

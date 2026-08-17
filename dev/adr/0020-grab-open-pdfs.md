@@ -46,12 +46,31 @@ Constraints that bound the design:
    affordance covers the remainder (asset CDNs, repositories, signed URLs).
 3. **Capture before job.** Accepting the grab:
    - extension → daemon `pdf_grab_request` (new message pair behind a
-     `pdf_grab_v1` hello-ack feature): tab URL + title; daemon allocates a
-     grab id and returns the steering path `papio/grabs/<grab-id>/` under
-     the adoption root;
-   - extension `chrome.downloads.download(tab.url)` steered to that path —
-     the browser's own cookies/session fetch the bytes; nothing is
-     re-requested through papio and no bytes cross native messaging;
+     `pdf_grab_v1` hello-ack feature): *Amended 2026-08-17:* **host and title
+     only**, never the tab URL. This clause originally said "tab URL + title";
+     a provider or library-proxy delivery URL carries a signing token or an
+     interlibrary-loan ticket that works like a password, so the address is
+     compared locally and never crosses the bridge or reaches a log. The daemon
+     allocates a grab id and returns the steering path
+     `papio/grabs/<grab-id>/` under the adoption root;
+   - extension `chrome.downloads.download(...)` steered to that path — the
+     browser's own cookies/session fetch the bytes; nothing is re-requested
+     through papio and no bytes cross native messaging;
+   - *Amended 2026-08-17:* **a single-use delivery URL is never fetched.**
+     `carriesSignedCredential` recognises the class structurally, and the grab
+     arms its steering and asks the researcher to press the PDF viewer's own
+     **Download** button instead — bytes the browser already holds. Asking a
+     second time returns the provider's session-timeout page, not the file,
+     which stalled the capture and occupied the effect lane until its permit
+     was resolved. Firefox refuses this path outright: without
+     `onDeterminingFilename` a download papio did not start can never be
+     steered or adopted, so promising to file it would be a promise the
+     platform cannot keep;
+   - *Amended 2026-08-17:* **an exact job binding outranks a grab; an inferred
+     one does not.** A download this extension started for a job keeps that
+     job. A stale tab correlation no longer beats a live grab, which had been
+     steering a paper the researcher named into the directory of a paper the
+     tab was opened for days earlier;
    - the daemon's grab sweeper (same bounded, latch-aware reader as
      adoption) picks up the settled file.
 4. **Identity from the file, then an ordinary job.** The daemon quarantines
@@ -224,3 +243,49 @@ deferred backlog replay with full candidate pools. That last item is now a
 blocker: deferring it was only defensible while the rule was believed sound.
 The working plan (`dev/active/send-pdf-candidate-binding.md`) carries the
 itemised blocking set; this ADR carries the decision.
+
+### Amended again, 2026-08-17: a capture must be cancellable
+
+The original decision recorded how a capture is created and settled but not how
+one is given up on, and the gap was total: no cancellation this extension sent
+could take effect. `pdf_grab_abandon_request` is fenced on the capture's
+originating `effect_request_id` — a grab id alone must not release occupancy,
+which stands — but the extension minted a fresh correlation id per call, so every
+attempt missed and came back `conflict` inside a successful reply. The extension
+now mints that id itself, persists it, and presents it.
+
+Two rules follow, and both are narrower than "cancel on request":
+
+- **A capture whose permit is settled may be retired on the grab id alone**
+  (`MarkAbandonedUnoccupied`), because a settled permit is positive evidence
+  that there is no occupancy left to release. The predicate demands that
+  evidence rather than merely the absence of an occupying permit: absence passes
+  vacuously for a capture predating `0034_effect_permits.sql`, whose unresolved
+  `legacy_effect_blocker` would then be stranded, and one unresolved blocker
+  refuses every future allocation. Held and `unknown_completion` remain
+  untouchable, so ADR-0022's rule that lost or ambiguous completion keeps
+  occupying is unchanged.
+- **A refused cancellation is reported, never retried into.** `conflict` inside
+  an `ok` reply is not clearance, and treating it as such produced a second
+  attempt that repeated the same refusal while telling the researcher the paper
+  had been sent.
+
+The storage half of this is also constrained: an armed capture persists the
+download **route** (origin and path), never the URL, so the signing token stays
+out of extension storage while the steering key remains exactly what
+`sameDownloadRoute` compares.
+
+One migration-shaped consequence is recorded here because it is a decision, not
+an implementation detail. `0025_pdf_grabs.sql` was edited in place after release
+to add `'abandoned'` to its state CHECK and to add the single-active-capture
+unique index. Databases migrated in between have neither, so on those *no*
+abandonment could be written at all. `0038` rebuilds the table for the CHECK but
+**changes no data**, and the unique index is installed by
+`ensurePdfGrabActiveSourceIndex` at open time, tolerating the one case that can
+fail: a paper that already holds two active captures. Retiring one to make the
+index fit was implemented and then rejected — a duplicate may be `quarantined`,
+holding the only copy of a paper's bytes, and `SweepGrabs` skips retired
+captures, so the repair would discard a paper instead of filing it. No migration
+may guess which of two captures is the real one; `papio doctor`'s
+`capture_uniqueness` check names the condition and the remedy instead.
+

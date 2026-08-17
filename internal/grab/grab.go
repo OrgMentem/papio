@@ -745,18 +745,30 @@ func (s *Service) MarkAbandonedForRequest(ctx context.Context, id, requestID str
 }
 
 // MarkAbandonedUnoccupied retires an awaiting capture whose durable effect is
-// already settled, and is the exact complement of MarkAbandonedForRequest:
+// recorded as settled, and is the exact complement of MarkAbandonedForRequest:
 // that path releases occupancy and therefore demands the originating request
-// identity, while this one requires that no occupying permit exists at all.
-// Nothing is in flight when the permit is settled — the browser generation
-// that armed the capture reported its outcome, or the permit was resolved
-// against evidence — so no effect can be lost by retiring the row, and a
+// identity, while this one demands positive evidence that there is no occupancy
+// left to release. A settled permit is that evidence — the browser generation
+// that armed the capture reported its outcome, or an operator resolved the
+// permit against evidence — so no effect can be lost by retiring the row, and a
 // caller holding only the grab id cannot use this to cancel live work.
 //
-// Without it the row survives until AbandonStaleAwaiting's cutoff hours
-// later, and the tab it belongs to cannot be re-sent for that whole window:
-// allocation is idempotent per host, so every retry answers "existing" for a
-// capture nobody can complete.
+// The predicate requires a settled permit to EXIST rather than merely requiring
+// that no occupying one does. The difference is not stylistic: absence passes
+// vacuously for a capture that has no permit row at all, which is every capture
+// predating 0034_effect_permits.sql. Those carry an unresolved
+// legacy_effect_blocker instead, and AllocateEffect rejects every future
+// allocation while one is unresolved (see the blocker check there), so retiring
+// such a row on absence-of-permit would strand the global effect lane for good
+// — a worse failure than the stall this path exists to clear, and one no
+// browser action could recover. AbandonStaleAwaiting handles those rows
+// properly, settling the blocker in the same transaction; this path declines
+// them.
+//
+// Without it the row survives until AbandonStaleAwaiting's cutoff hours later,
+// and the paper it belongs to cannot be re-sent for that whole window:
+// allocation is idempotent per host and title, so every retry answers
+// "existing" for a capture nobody can complete.
 func (s *Service) MarkAbandonedUnoccupied(ctx context.Context, id, detail string) error {
 	tx, err := s.store.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -766,9 +778,15 @@ func (s *Service) MarkAbandonedUnoccupied(ctx context.Context, id, detail string
 	res, err := tx.ExecContext(ctx, `
 		UPDATE pdf_grabs SET state = ?, outcome = 'abandoned', detail = ?, updated_at = ?
 		WHERE id = ? AND state = ?
+		  AND EXISTS (SELECT 1 FROM effect_permits
+		    WHERE grab_id=pdf_grabs.id AND effect_kind='pdf_grab'
+		      AND status='settled')
 		  AND NOT EXISTS (SELECT 1 FROM effect_permits
 		    WHERE grab_id=pdf_grabs.id AND effect_kind='pdf_grab'
-		      AND status IN ('held','unknown_completion'))`,
+		      AND status IN ('held','unknown_completion'))
+		  AND NOT EXISTS (SELECT 1 FROM legacy_effect_blockers
+		    WHERE grab_id=pdf_grabs.id AND effect_kind='pdf_grab'
+		      AND status='unresolved')`,
 		string(StateAbandoned), detail, store.Now(), id, string(StateAwaitingFile))
 	if err != nil {
 		return err

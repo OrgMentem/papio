@@ -57,6 +57,10 @@ func open(ctx context.Context, dir string, migrationCeiling int) (*Store, error)
 		_ = db.Close()
 		return nil, err
 	}
+	if err := ensurePdfGrabActiveSourceIndex(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	var integrity string
 	if err := db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity); err != nil || integrity != "ok" {
 		_ = db.Close()
@@ -88,6 +92,41 @@ func (s *Store) IntegrityCheck(ctx context.Context) error {
 		return fmt.Errorf("integrity_check: %s", result)
 	}
 	return nil
+}
+
+// ensurePdfGrabActiveSourceIndex creates the at-most-one-active-capture-per-paper
+// index when the data allows it, and leaves it absent when it does not.
+//
+// The index is unusual in that it entered the schema through an in-place edit of
+// an already-applied migration (0025) rather than a new one, so whether a
+// database has it does not follow from its schema version. Databases predating
+// that edit also predate the existence check in Allocate, so they can hold
+// several active captures for one paper — and a plain CREATE UNIQUE INDEX over
+// those rows fails, which inside migration 0038's transaction would mean
+// Store.Open refusing to open the database and papio not starting at all.
+//
+// Deciding the collision here is not an option: a duplicate may be
+// 'quarantined', holding the only copy of a paper's bytes, and guessing which of
+// two captures is real is exactly what this project must never do. So a
+// collision leaves the index absent, which is the state that database was
+// already in, and papio doctor reports it with the remedy. Every other database
+// — every fresh install, and every legacy one without duplicates — gets the
+// constraint.
+func ensurePdfGrabActiveSourceIndex(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+		CREATE UNIQUE INDEX IF NOT EXISTS pdf_grabs_active_source
+		  ON pdf_grabs(url_host, title)
+		  WHERE state IN ('awaiting_file','quarantined','identified','parked_no_identifier')`)
+	if err == nil {
+		return nil
+	}
+	// Only the duplicate collision is tolerated. Anything else — a missing
+	// table, a corrupt file — is a real failure to open.
+	if strings.Contains(err.Error(), "UNIQUE constraint failed") ||
+		strings.Contains(err.Error(), "constraint failed") {
+		return nil
+	}
+	return fmt.Errorf("creating pdf_grabs_active_source: %w", err)
 }
 
 // migrate applies numbered migrations above the current user_version, each in

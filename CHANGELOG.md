@@ -37,8 +37,11 @@ execution records kept during the initial build.
   paper, every later attempt was answered "there's already one of those", and a
   paper that failed once — a link that had expired, a download the browser
   interrupted — could never be sent again. The database is repaired on the next
-  start, keeping every record; fresh installations were never affected, which is
-  why this survived a suite that builds its database from scratch.
+  start, keeping every record. Installations set up after the correction landed
+  were never affected, which is why this survived a suite that builds its
+  database from scratch — and if two captures of one paper are still open, that
+  repair leaves both alone and `papio doctor` says so, rather than guessing which
+  one is the paper you wanted.
 - **Private link details no longer reach *papio* when you send a paper.**
   Publisher and library links routinely carry signed tokens and interlibrary-loan
   tickets, which work like passwords. Sending a paper reported the whole link;

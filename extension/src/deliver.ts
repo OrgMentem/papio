@@ -504,23 +504,42 @@ export function pageAcquireOrigin(value: string): string | undefined {
 
 /** Query parameter names that carry a bearer-grade credential when their value
  * is long enough to be one. Publisher and CDN delivery links are signed with
- * these; a short `?token=1` is a page parameter, not a credential. */
+ * these; a short `?token=1` is a page parameter, not a credential.
+ *
+ * Names only, never the path: a path-length heuristic was tried and reverted
+ * because ordinary article routes carry long human slugs — Cambridge's
+ * `/article/abs/property-and-use-in-the-access-economy/…` and Emerald's
+ * `/The-different-relations-of-extrinsic-introjected…` both exceed any length
+ * bound that would catch a signature, and declining those would send a
+ * researcher hunting for a viewer button on a link papio can simply fetch. */
 const CREDENTIAL_PARAMS = new Set([
   "token",
   "signature",
+  "sig",
   "x-amz-signature",
   "x-amz-credential",
   "x-amz-security-token",
   "key-pair-id",
   "awsaccesskeyid",
   "hmac",
+  "hash",
   "jwt",
   "access_token",
   "sessionid",
   "ticket",
+  "sso",
+  "expires",
 ]);
 
-/** A credential value shorter than this is a page parameter, not a signature. */
+/** A credential value shorter than this is a page parameter, not a signature.
+ *
+ * 32 is the shortest thing the shapes in use can be: a hex MD5 is 32, a base64
+ * HMAC-SHA1 is 28, and the live Silverchair token was 852. Publisher page
+ * parameters that reuse these names are ordinals and flags — `?sig=1`,
+ * `?expires=0` — orders of magnitude below it. The bound errs toward fetching,
+ * because the cost of a missed credential is one refused request the researcher
+ * can retry from the article page, while the cost of a false positive is
+ * refusing to fetch a link that works. */
 const CREDENTIAL_VALUE_MIN = 32;
 
 /**

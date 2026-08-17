@@ -831,11 +831,16 @@ export interface PdfGrabCorrelation {
   /** Absent while the grab waits for the researcher's own viewer download:
    * papio started no download of its own, so there is no id yet. */
   downloadID?: number;
-  /** The URL the grab was armed for. Persisted only for the awaiting-viewer
-   * state, which has to re-register its pending-URL steering after MV3 kills
-   * the worker — otherwise the researcher's Download click a minute later is
-   * correlated to nothing. */
-  url?: string;
+  /** The download route — origin and pathname only — the grab was armed for.
+   *
+   * The awaiting-viewer state has to re-register its steering after MV3 kills
+   * the worker, or the researcher's Download click a minute later correlates to
+   * nothing. It must not persist the URL to do that: a provider delivery URL
+   * carries a bearer-grade signing token in its query, and this record is
+   * written to extension storage. A route is what matching actually compares
+   * (`sameDownloadRoute` ignores query and fragment by design), so it is
+   * exactly as strong a key and carries no credential. */
+  route?: string;
   steeringPath: string;
   /** The request id the daemon stored as this grab's `effect_request_id`. The
    * cancellation fence compares against it, so a later worker generation of
@@ -1467,6 +1472,28 @@ function sameDownloadRoute(a: string, b: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** The origin-and-pathname key `sameDownloadRoute` compares, with the query and
+ * fragment dropped. A provider delivery URL signs its query, so this is the only
+ * part of it that may be written to extension storage. */
+function downloadRoute(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:")
+      return undefined;
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when a persisted value is a route this worker generation may act on: a
+ * bare origin and path. Anything carrying a query, a fragment, credentials or a
+ * non-web scheme was not written by `downloadRoute`, so it is rejected rather
+ * than used as a steering key or re-persisted. */
+function isDownloadRoute(value: string): boolean {
+  return downloadRoute(value) === value;
 }
 
 function directEnvelopePath(
@@ -4641,15 +4668,36 @@ export class Bridge {
         }
         // Exactly one of the two shapes: a download papio started, or a grab
         // armed and waiting for the researcher's own viewer download, which
-        // carries the URL instead so it can re-register its steering. Dropping
-        // the second shape here would silently discard the grab every time MV3
-        // recycled the worker — which it does within seconds of going idle.
+        // carries the route instead so it can re-register its steering.
+        // Dropping the second shape here would silently discard the grab every
+        // time MV3 recycled the worker — which it does within seconds of going
+        // idle.
+        const legacy = correlation as PdfGrabCorrelation & { url?: string };
+        // A build before the route change persisted the full delivery URL,
+        // signing token and all. Convert it rather than dropping the record:
+        // the daemon-side capture is still armed and still holds its permit, so
+        // discarding the correlation would strand it exactly as an orphan. The
+        // route keeps the steering working and the token is left behind.
+        const route =
+          typeof legacy.route === "string"
+            ? legacy.route
+            : typeof legacy.url === "string"
+              ? downloadRoute(legacy.url)
+              : undefined;
         const started = typeof correlation.downloadID === "number";
         const armed =
           correlation.downloadID === undefined &&
-          typeof correlation.url === "string";
+          route !== undefined &&
+          isDownloadRoute(route);
         if (!started && !armed) continue;
-        this.pdfGrabCorrelations.set(grabID, correlation);
+        const { url: _token, ...rest } = legacy;
+        this.pdfGrabCorrelations.set(grabID, {
+          ...rest,
+          ...(route !== undefined ? { route } : {}),
+        });
+        // Re-persist unconditionally: a legacy record's token must be evicted
+        // from storage now, not whenever the next mutation happens to run.
+        this.persistPdfGrabCorrelations();
       }
       this.hydrated = true;
       await this.update((current) => current);
@@ -5381,6 +5429,15 @@ export class Bridge {
         return { ok: true, state: pending.status ?? "sending", job_id: pickedJob.job_id } as DeliveryReply;
       }
       if (requiresNativeViewerDownload(urlForChoice)) {
+        if (this.isFirefox())
+          // Firefox has no onDeterminingFilename, so a download papio did not
+          // start cannot be steered or adopted: `correlate()` refuses it before
+          // any host or tab ownership is considered. Promising to file the
+          // viewer's download here would leave the delivery waiting forever.
+          return failure(
+            "not_permitted",
+            "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open this PDF in Chrome to send it",
+          ) as unknown as DeliveryReply;
         const message = "Use the PDF viewer Download button — papio will adopt that authorized file";
         const deliveryPageHostAtStart = sanitizePageHost(liveTabURL);
         const sessionEvidenceAtStart = this.currentSessionEvidence(pickedJob);
@@ -5467,7 +5524,13 @@ export class Bridge {
     if (job === undefined) {
       if (doi === undefined || doi.trim() === "") {
         if (requiresNativeViewerDownload(url) && this.isFirefox()) {
-          return failure("not_pdf", "Open this PDF in your browser's viewer and use the viewer Download button — papio will file that download for you");
+          // The old copy here promised papio would file the viewer's download,
+          // which on Firefox it cannot: there is no onDeterminingFilename, so
+          // `correlate()` refuses a download papio did not start.
+          return failure(
+            "not_permitted",
+            "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open this PDF in Chrome to send it",
+          );
         }
         const candidates = this.advisoryCandidates();
         if (candidates.length > 0) {
@@ -5576,6 +5639,14 @@ export class Bridge {
       };
     }
     if (requiresNativeViewerDownload(url)) {
+      if (this.isFirefox())
+        // Same reason as the choice path above: Firefox cannot steer or adopt a
+        // download papio did not start, so this instruction would be a promise
+        // the platform cannot keep.
+        return failure(
+          "not_permitted",
+          "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open this PDF in Chrome to send it",
+        );
       const message =
         "Use the PDF viewer Download button — papio will adopt that authorized file";
       const deliveryPageHostAtStart = sanitizePageHost(tabURL);
@@ -8316,15 +8387,16 @@ export class Bridge {
       // researcher to press the viewer's Download button. Re-register the
       // steering this worker lost when it died, and leave the grab alone.
       if (correlation.downloadID === undefined) {
-        if (correlation.url === undefined) continue;
+        const route = correlation.route;
+        if (route === undefined || !isDownloadRoute(route)) continue;
         this.grabDownloads.set(grabID, {
           ids: new Set<number>(),
           tabID: correlation.tabID,
           scanID: correlation.scanID,
-          url: correlation.url,
+          url: route,
           steeringPath: correlation.steeringPath,
         });
-        this.pendingGrabDownloadURLs.set(correlation.url, {
+        this.pendingGrabDownloadURLs.set(route, {
           grabID,
           tabID: correlation.tabID,
           steeringPath: correlation.steeringPath,
@@ -8536,22 +8608,35 @@ export class Bridge {
           // internal and never reaches a researcher.
           return failure("orphan_cleared", "the stale grab was cleared");
         }
-        if (known.downloadID !== undefined)
-          // papio's own fetch is genuinely in flight; "sending" is true.
+        if (known.downloadID !== undefined && known.abandonPending !== true)
+          // papio's own fetch is genuinely in flight; "sending" is true. A
+          // correlation already being given up on is not in flight, so it falls
+          // through rather than reporting a download that is over.
           return { ok: true, grab_id: grabID };
         // Armed and waiting for the researcher's own download. Re-register the
-        // steering for the URL in front of them now — the earlier arming may
-        // have been for a URL this tab has since navigated away from — and ask
+        // steering for the route in front of them now — the earlier arming may
+        // have been for a page this tab has since navigated away from — and ask
         // for the click that can still complete it.
+        const resumeRoute = downloadRoute(requestURL);
+        if (resumeRoute === undefined)
+          return failure(
+            "grab_unresumable",
+            "papio can't read this page's address — reload the PDF and try again",
+          );
         const resumeTabID = request.workspace_tab_id ?? request.tab_id;
+        // The previous route must go, or it keeps matching: `sameDownloadRoute`
+        // ignores the query, so a later download on the route this tab used to
+        // hold would still be steered into this grab.
+        if (known.route !== undefined && known.route !== resumeRoute)
+          this.pendingGrabDownloadURLs.delete(known.route);
         this.grabDownloads.set(grabID, {
           ids: new Set<number>(),
           tabID: resumeTabID,
           scanID: known.scanID,
-          url: requestURL,
+          url: resumeRoute,
           steeringPath: known.steeringPath,
         });
-        this.pendingGrabDownloadURLs.set(requestURL, {
+        this.pendingGrabDownloadURLs.set(resumeRoute, {
           grabID,
           tabID: resumeTabID,
           steeringPath: known.steeringPath,
@@ -8560,7 +8645,7 @@ export class Bridge {
           ...known,
           tabID: resumeTabID,
           state: "awaiting_viewer",
-          url: requestURL,
+          route: resumeRoute,
         });
         this.persistPdfGrabCorrelations();
         return { ok: true, grab_id: grabID, awaiting_viewer: true };
@@ -8585,31 +8670,40 @@ export class Bridge {
       }
       const workspaceTabID = request.workspace_tab_id ?? request.tab_id;
       const scanID = request.scan_id ?? "";
+      const armedRoute = downloadRoute(requestURL) ?? requestURL;
       this.grabDownloads.set(grabID, {
         ids: new Set<number>(),
         tabID: workspaceTabID,
         scanID,
-        url: requestURL,
+        url: armedRoute,
         steeringPath,
       });
-      this.pendingGrabDownloadURLs.set(requestURL, {
+      this.pendingGrabDownloadURLs.set(armedRoute, {
         grabID,
         tabID: workspaceTabID,
         steeringPath,
       });
       // A signed delivery URL cannot be fetched again, so do not try. The grab
-      // and its steering are already armed above, and the pending-URL entry is
+      // and its steering are already armed above, and the pending entry is
       // deliberately left in place: the researcher's own viewer Download click
-      // arrives later, matches this URL in `pendingGrabFor`, and is steered
+      // arrives later, matches this route in `pendingGrabFor`, and is steered
       // into the grab directory (a live grab outranks an inferred job there).
       // Returning `ok` without a download would claim work papio never did, so
       // the caller reports the one action that can still complete the grab.
       if (requiresNativeViewerDownload(requestURL)) {
+        if (this.isFirefox())
+          // Firefox has no onDeterminingFilename, so a download papio did not
+          // start can never be steered into the grab or adopted from it. Asking
+          // for the viewer button here would promise filing that cannot happen.
+          return failure(
+            "not_permitted",
+            "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open the PDF in Chrome to send it",
+          );
         this.pdfGrabCorrelations.set(grabID, {
           scanID,
           tabID: workspaceTabID,
           state: "awaiting_viewer",
-          url: requestURL,
+          route: armedRoute,
           steeringPath,
           effectRequestID,
         });
@@ -16200,12 +16294,13 @@ export class Bridge {
   }
 
   private async onDownloadCreated(item: DownloadItemLike): Promise<void> {
-    const pendingGrab = this.pendingGrabFor(item);
-    if (pendingGrab !== undefined) {
-      pendingGrab.ids.add(item.id);
-      this.grabDownloads.set(this.trackedGrabFor(item.id) ?? "", pendingGrab);
-      return;
-    }
+    // A download papio itself started for a job outranks any grab, and must be
+    // classified first. The grab check used to run before this one and returned
+    // early, so a click-adapter download whose route matched an armed grab was
+    // recorded as that grab's bytes and never bound to its own job — the two
+    // routes differ only in a signed query string, which `sameDownloadRoute`
+    // deliberately ignores. That is the wrong-paper direction: job X's file
+    // steered into grab Y's directory.
     const earlyJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
     if (earlyJobID !== undefined) {
       const early = this.downloads.get(earlyJobID) ?? {
@@ -16216,6 +16311,13 @@ export class Bridge {
       early.ids.add(item.id);
       if (early.ids.size > 1) early.ambiguous = true;
       this.downloads.set(earlyJobID, early);
+    } else {
+      const pendingGrab = this.pendingGrabFor(item);
+      if (pendingGrab !== undefined) {
+        pendingGrab.ids.add(item.id);
+        this.grabDownloads.set(this.trackedGrabFor(item.id) ?? "", pendingGrab);
+        return;
+      }
     }
     await this.ready;
     if (
