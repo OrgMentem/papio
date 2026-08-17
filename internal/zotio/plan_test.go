@@ -999,3 +999,45 @@ func TestMaterializePrivateFileConcurrentSameTargetConverges(t *testing.T) {
 		t.Fatalf("target contents = %q, want %q", got, contents)
 	}
 }
+
+func TestPlanAndApplySkipsWhenLibraryAlreadyHasPDF(t *testing.T) {
+	cli := &fakeCLI{
+		find: map[string]json.RawMessage{
+			"doi:10.1002/example": json.RawMessage(`[{"key":"AB12CD34","data":{}}]`),
+		},
+	}
+	service, jobID := readyPlanService(t, "", cli)
+	status, parent, attach, err := service.PlanAndApply(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "duplicate" || parent != "AB12CD34" || attach != "" {
+		t.Fatalf("status=%q parent=%q attach=%q", status, parent, attach)
+	}
+	row, err := service.Bundle.Jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateImported {
+		t.Fatalf("state = %s, want imported", row.State)
+	}
+}
+
+func TestPlanAndApplySkipsDOIOnlyReadyJobWhenLibraryAlreadyHasPDF(t *testing.T) {
+	cli := &fakeCLI{
+		find: map[string]json.RawMessage{
+			"doi:10.1002/example": json.RawMessage(`[{"key":"AB12CD34","data":{}}]`),
+		},
+	}
+	service, jobID := readyPlanService(t, "", cli)
+	if _, err := service.Store.DB().Exec(`UPDATE work_requests SET title = '', authors_json = '[]' WHERE id = (SELECT work_request_id FROM jobs WHERE id = ?)`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	status, parent, _, err := service.PlanAndApply(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "duplicate" || parent != "AB12CD34" {
+		t.Fatalf("status=%q parent=%q", status, parent)
+	}
+}

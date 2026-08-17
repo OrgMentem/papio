@@ -209,6 +209,25 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		}
 	}
 
+	if db == nil {
+		add("undelivered_zotero_imports", Skip, "undelivered Zotero imports are checked by the daemon", "")
+	} else {
+		n, oldest, err := undeliveredZoteroImports(ctx, db)
+		switch {
+		case err != nil:
+			add("undelivered_zotero_imports", Warn, "acquired papers waiting for Zotero import could not be counted", "inspect database permissions")
+		case n == 0:
+			add("undelivered_zotero_imports", Pass, "every validated acquisition with auto-import enabled has been delivered to Zotero", "")
+		default:
+			detail := fmt.Sprintf("%d validated %s %s waiting for Zotero import", n, plural(n, "paper", "papers"), plural(n, "is", "are"))
+			if oldest > 0 {
+				detail += fmt.Sprintf("; oldest acquired %s ago", oldest.Round(time.Hour))
+			}
+			add("undelivered_zotero_imports", Warn, detail,
+				"run `papio jobs list --state ready --limit 500` and inspect `zotio.auto_import` events — many mean the paper is already in Zotero and need no manual import; the daemon reconciles owned papers automatically on its import-retry pass")
+		}
+	}
+
 	// The counterpart to going quiet. An action papio has stopped volunteering
 	// is still the user's to finish, so the queue must not become invisible
 	// just because it stopped being noisy.
@@ -392,6 +411,43 @@ func pdfGrabActiveSourceIndex(ctx context.Context, db *store.Store) (bool, int, 
 		return false, 0, err
 	}
 	return false, duplicates, nil
+}
+
+// undeliveredZoteroImports counts ready jobs whose bytes are validated but whose
+// latest durable zotio.auto_import outcome is not a successful delivery.
+func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.Duration, error) {
+	row := db.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MIN(j.created_at), '')
+		FROM jobs j
+		JOIN job_artifacts ja ON ja.job_id = j.id
+		WHERE j.state = 'ready'
+		  AND ja.identity_result IN ('pass', 'user_confirmed')
+		  AND json_extract(j.policy_json, '$.auto_import') = 1
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM events e
+			WHERE e.job_id = j.id
+			  AND e.kind = 'zotio.auto_import'
+			  AND json_extract(e.detail_json, '$.status') IN ('applied', 'no_op', 'duplicate')
+			  AND e.seq = (
+				SELECT MAX(e2.seq)
+				FROM events e2
+				WHERE e2.job_id = j.id AND e2.kind = 'zotio.auto_import'
+			  )
+		  )`)
+	var n int
+	var oldest string
+	if err := row.Scan(&n, &oldest); err != nil {
+		return 0, 0, err
+	}
+	if n == 0 || oldest == "" {
+		return n, 0, nil
+	}
+	created, err := time.Parse(time.RFC3339Nano, oldest)
+	if err != nil {
+		return n, 0, nil
+	}
+	return n, time.Since(created), nil
 }
 
 func unresolvedEffectPermit(ctx context.Context, db *store.Store, now time.Time) (*unresolvedPermit, error) {

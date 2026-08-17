@@ -38,7 +38,9 @@ func TestClassifyErrorTable(t *testing.T) {
 		{name: "reservation conflict", err: errors.New("Zotio apply reservation was not finalized"), wantClass: ErrorClassReservationConflict, wantHint: "Zotio apply reservation conflict"},
 		{name: "local db locked", err: errors.New("database is locked"), wantClass: ErrorClassLocalDBLocked, wantHint: "local database is locked"},
 		{name: "network chain", err: &net.DNSError{Err: "no such host", Name: "zotero.example.test"}, wantClass: ErrorClassNetwork, wantHint: "network connection failed"},
-		{name: "unknown never copies stderr", err: errors.New(pathLaden), wantClass: ErrorClassUnknown},
+		{name: "bundle validation title", err: errors.New("planning job job_deadbeef: bundle validation: identity.title length out of range"), wantClass: ErrorClassBundleValidation, wantHint: "bundle title missing or out of range"},
+		{name: "already in library manifest", err: errors.New(`unsupported Zotio manifest outcome action="skip" classification="duplicate"`), wantClass: ErrorClassAlreadyInLibrary, wantHint: "paper already in Zotero library"},
+		{name: "unknown carries sanitized text", err: errors.New(pathLaden), wantClass: ErrorClassUnknown, wantHint: SanitizeErrorHint(pathLaden)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -35,6 +35,7 @@ import (
 	"papio/internal/redact"
 	"papio/internal/resolver"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 // FetchFunc downloads one live in-memory candidate into the exact, nonexistent
@@ -3194,10 +3195,25 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 		if httpStatus != 0 {
 			detail["error_http_status"] = httpStatus
 		}
+		message := zotio.SanitizeErrorHint(err.Error())
+		if message != "" {
+			detail["error_message"] = message
+			if hint == "" {
+				detail["error_hint"] = message
+			}
+		}
+		logged := message
+		if logged == "" {
+			logged = hint
+		}
+		log.Printf("papio: auto-import for job %s failed [%s]: %s", row.ID, class, logged)
 		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
 		return
 	}
 	detail["status"] = status
+	if status == "duplicate" {
+		detail["reason"] = "already_in_library"
+	}
 	_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
 }
 

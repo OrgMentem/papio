@@ -27,6 +27,8 @@ const (
 	ErrorClassReservationConflict      = "reservation_conflict"
 	ErrorClassLocalDBLocked            = "local_db_locked"
 	ErrorClassNetwork                  = "network"
+	ErrorClassBundleValidation         = "bundle_validation"
+	ErrorClassAlreadyInLibrary         = "already_in_library"
 	ErrorClassUnknown                  = "unknown"
 )
 
@@ -146,7 +148,24 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 	if isNetworkError(err, lower) {
 		return safeErrorInfo(ErrorClassNetwork, "network connection failed", 0)
 	}
-	return ErrorInfo{Class: ErrorClassUnknown}
+	if strings.Contains(lower, "bundle validation:") {
+		return safeErrorInfo(ErrorClassBundleValidation, bundleValidationHint(lower), 0)
+	}
+	if strings.Contains(lower, "classification=") && strings.Contains(lower, "duplicate") {
+		return safeErrorInfo(ErrorClassAlreadyInLibrary, "paper already in Zotero library", 0)
+	}
+	return safeErrorInfo(ErrorClassUnknown, SanitizeErrorHint(text), 0)
+}
+
+func bundleValidationHint(lower string) string {
+	switch {
+	case strings.Contains(lower, "identity.title length out of range"):
+		return "bundle title missing or out of range"
+	case strings.Contains(lower, "identity.authors must have"):
+		return "bundle authors missing or out of range"
+	default:
+		return "bundle validation failed"
+	}
 }
 
 func safeErrorInfo(class, hint string, status int) ErrorInfo {
@@ -167,6 +186,8 @@ func IsErrorClass(class string) bool {
 		ErrorClassReservationConflict,
 		ErrorClassLocalDBLocked,
 		ErrorClassNetwork,
+		ErrorClassBundleValidation,
+		ErrorClassAlreadyInLibrary,
 		ErrorClassUnknown:
 		return true
 	default:

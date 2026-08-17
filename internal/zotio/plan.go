@@ -365,7 +365,7 @@ func (s *Service) markImported(ctx context.Context, result *ApplyResult) error {
 		return nil
 	}
 	switch result.Status {
-	case "applied", "no_op":
+	case "applied", "no_op", "duplicate":
 	default:
 		return nil
 	}
@@ -454,6 +454,9 @@ func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, resu
 // applies that exact plan. Both steps use the exports-ledger idempotency keys,
 // so replays do not issue a second Zotero mutation.
 func (s *Service) PlanAndApply(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, err error) {
+	if status, parentKey, skip, err := s.skipOwnedReadyImport(ctx, jobID); skip || err != nil {
+		return status, parentKey, "", err
+	}
 	plans, err := s.PlanJobs(ctx, []string{jobID})
 	if err != nil {
 		return "failed", "", "", err
@@ -470,6 +473,40 @@ func (s *Service) PlanAndApply(ctx context.Context, jobID string) (status, paren
 		return "failed", plan.ExpectedParentKey, "", err
 	}
 	return result.Status, result.ParentKey, result.AttachmentKey, err
+}
+
+// skipOwnedReadyImport short-circuits auto-import when Zotio's mirror already
+// holds a parent item with a PDF for the job's identifiers. This avoids bundle
+// export for DOI-only requests and records a duplicate outcome instead of an
+// error when the library already has the paper.
+func (s *Service) skipOwnedReadyImport(ctx context.Context, jobID string) (status, parentKey string, skip bool, err error) {
+	if s == nil || s.CLI == nil || s.Bundle == nil {
+		return "", "", false, nil
+	}
+	row, err := s.Bundle.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return "", "", false, err
+	}
+	if strings.TrimSpace(row.ZotioItemKey) != "" {
+		return "", "", false, nil
+	}
+	lookupWork := LookupWork{DOI: row.Work.DOI, ArXiv: row.Work.ArXiv, PMID: row.Work.PMID}
+	if lookupWork.DOI == "" && lookupWork.ArXiv == "" && lookupWork.PMID == "" {
+		return "", "", false, nil
+	}
+	lookup, err := s.LookupWorks(ctx, LookupWorksRequest{Works: []LookupWork{lookupWork}})
+	if err != nil {
+		return "", "", false, nil
+	}
+	if len(lookup.Works) != 1 || lookup.Works[0].Status != OwnershipOwnedWithPDF {
+		return "", "", false, nil
+	}
+	parentKey = lookup.Works[0].ItemKey
+	result := &ApplyResult{JobID: jobID, Status: "duplicate", ParentKey: parentKey}
+	if err := s.markImported(ctx, result); err != nil {
+		return "", parentKey, false, err
+	}
+	return "duplicate", parentKey, true, nil
 }
 
 // LoadPlan reads and verifies one private plan file by opaque ID.
