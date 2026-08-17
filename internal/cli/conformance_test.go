@@ -173,6 +173,7 @@ var commandClassification = map[string]commandClass{
 	"papio zotio preflight":            {kind: kindStructured, rpcMethods: []string{"zotio.preflight"}},
 	"papio zotio plan":                 {kind: kindStructured, rpcMethods: []string{"zotio.plan"}},
 	"papio zotio apply":                {kind: kindStructured, rpcMethods: []string{"zotio.apply"}},
+	"papio zotio import-backfill":      {kind: kindStructured, rpcMethods: []string{"zotio.import_backfill"}},
 	"papio zotio tags":                 {kind: kindNone},
 	"papio zotio tags reconcile":       {kind: kindStructured, rpcMethods: []string{"zotio.tags.reconcile"}},
 	"papio daemon":                     {kind: kindNone},

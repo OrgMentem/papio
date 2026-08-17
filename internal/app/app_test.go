@@ -749,6 +749,75 @@ func TestLocalCacheCompletesWithoutResolverOrFetch(t *testing.T) {
 	}
 }
 
+func TestLocalCacheEnrichesDOIOnlyWorkFromDiscovery(t *testing.T) {
+	svc, jobs := newTestService(t)
+	lookup := &fakeWorkLookup{result: discovery.DiscoveredWork{Work: work.Work{
+		DOI: "10.1002/example", Title: "Discovered title", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}}}
+	svc.Discovery = lookup
+	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://example.test/paper.pdf", ResolvedWork: work.Work{DOI: "10.1002/example", Title: "Example Paper", Authors: []string{"A"}, Year: 2024},
+		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+	}}}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = fakeDownload(&fetches)
+	svc.Validate = passValidation()
+
+	first, _ := svc.Submit(context.Background(), doiRequest("wr_cache_enrich_0001"))
+	row, _ := jobs.ClaimNext(context.Background(), "w", time.Minute)
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := jobs.Get(context.Background(), first); got.State != job.StateReady {
+		t.Fatalf("first state = %s", got.State)
+	}
+	if lookup.calls != 1 {
+		t.Fatalf("discovery lookups after first job = %d, want 1", lookup.calls)
+	}
+
+	second, _ := svc.Submit(context.Background(), doiRequest("wr_cache_enrich_0002"))
+	row, _ = jobs.ClaimNext(context.Background(), "w", time.Minute)
+	if err := svc.Process(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	cached, _ := jobs.Get(context.Background(), second)
+	if cached.State != job.StateReady || cached.ArtifactSHA256 == "" {
+		t.Fatalf("cache state = %+v", cached)
+	}
+	if got := cached.Work; got.Title != "Discovered title" || strings.Join(got.Authors, ", ") != "Ada Lovelace" || got.Year != 2024 {
+		t.Fatalf("cached work metadata = %+v, want discovery record", got)
+	}
+	if lookup.calls != 2 {
+		t.Fatalf("discovery lookups after cache hit = %d, want 2", lookup.calls)
+	}
+	if fetches != 1 || adapter.calls != 1 {
+		t.Fatalf("cache repeated network: fetch=%d resolve=%d", fetches, adapter.calls)
+	}
+}
+
+func TestDOIOnlyWorkWithoutCitationRecordFailsWithOperatorLegibleBundleError(t *testing.T) {
+	b := protocol.AcquisitionBundle{
+		SchemaVersion: protocol.AcquisitionBundleSchemaVersionV2,
+		JobID:         "job_deadbeef0001", RequestID: "wr_missing_citation01",
+		Identity: protocol.BundleIdentity{DOI: "10.1002/example"},
+		Candidate: protocol.BundleCandidate{
+			Source: "fixture", Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen,
+			ReuseLicense: "unknown",
+		},
+	}
+	err := b.Validate()
+	if err == nil {
+		t.Fatal("expected missing citation record error")
+	}
+	if !strings.Contains(err.Error(), "citation title") {
+		t.Fatalf("err = %q, want operator-legible missing citation title", err)
+	}
+	if strings.Contains(err.Error(), "length out of range") {
+		t.Fatalf("err = %q, want human situation not struct-field complaint", err)
+	}
+}
+
 func TestWrongPaperFallsThroughToNextCandidate(t *testing.T) {
 	svc, jobs := newTestService(t)
 	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{

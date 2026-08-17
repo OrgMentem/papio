@@ -1,0 +1,360 @@
+// Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
+package zotio
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"papio/internal/artifact"
+	"papio/internal/bundle"
+	"papio/internal/job"
+	"papio/internal/redact"
+	"papio/internal/store"
+	"papio/internal/store/storetest"
+	"papio/internal/work"
+)
+
+type trackingImporter struct {
+	calls  []string
+	status map[string]string
+	errs   map[string]error
+}
+
+func (t *trackingImporter) PlanAndApply(_ context.Context, jobID string) (string, string, string, error) {
+	t.calls = append(t.calls, jobID)
+	if err := t.errs[jobID]; err != nil {
+		return "failed", "", "", err
+	}
+	status := t.status[jobID]
+	if status == "" {
+		status = "applied"
+	}
+	return status, "PARENT01", "ATTACH01", nil
+}
+
+func seedImportBackfillJob(t *testing.T, ctx context.Context, db *store.Store, id, createdAt string, autoImport bool, identity string, importStatus string) {
+	t.Helper()
+	policy, err := json.Marshal(map[string]any{"auto_import": autoImport, "access_mode": "conservative"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO work_requests (id, created_at, title) VALUES (?, ?, 'Example paper')`,
+		"wr_"+id, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+		VALUES (?, ?, 'ready', ?, ?, ?)`, id, "wr_"+id, string(policy), createdAt, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO artifacts (sha256, size_bytes, mime, path, created_at)
+		VALUES (?, 1, 'application/pdf', ?, ?)`, id+"sha", "/tmp/"+id+".pdf", createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO job_artifacts (job_id, artifact_sha256, role, identity_result, created_at)
+		VALUES (?, ?, 'main', ?, ?)`, id, id+"sha", identity, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if importStatus != "" {
+		detail, err := json.Marshal(map[string]any{"status": importStatus})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx, `
+			INSERT INTO events (job_id, at, kind, detail_json)
+			VALUES (?, ?, 'zotio.auto_import', ?)`, id, createdAt, string(detail)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func importBackfillService(t *testing.T, dataDir string, db *store.Store, cli CLI) *Service {
+	t.Helper()
+	jobs := &job.Store{S: db}
+	artifacts, err := artifact.New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Service{
+		CLI:     cli,
+		Bundle:  &bundle.Exporter{Jobs: jobs, Artifacts: artifacts, DataDir: dataDir},
+		Store:   db,
+		DataDir: dataDir,
+	}
+}
+
+func enableAutoImportPolicy(t *testing.T, ctx context.Context, db *store.Store, jobID string) {
+	t.Helper()
+	if _, err := db.DB().ExecContext(ctx, `
+		UPDATE jobs SET policy_json = json_set(policy_json, '$.auto_import', json('true')) WHERE id = ?`, jobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestImportBackfillSelectionOldestFirstAndGate(t *testing.T) {
+	ctx := context.Background()
+	dataDir := storetest.DataDir(t)
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	old := time.Now().UTC().Add(-72 * time.Hour).Format(time.RFC3339Nano)
+	mid := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
+	newest := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
+
+	seedImportBackfillJob(t, ctx, db, "job_old_requested", old, true, "pass", "")
+	seedImportBackfillJob(t, ctx, db, "job_mid_requested", mid, true, "pass", "")
+	seedImportBackfillJob(t, ctx, db, "job_new_requested", newest, true, "pass", "")
+	seedImportBackfillJob(t, ctx, db, "job_not_requested", mid, false, "pass", "")
+	seedImportBackfillJob(t, ctx, db, "job_imported", old, true, "pass", "applied")
+	seedImportBackfillJob(t, ctx, db, "job_bad_identity", mid, true, "fail", "")
+
+	service := importBackfillService(t, dataDir, db, nil)
+	candidates, truncated, err := service.listImportBackfillCandidates(ctx, false, "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 2 || !truncated {
+		t.Fatalf("candidates = %#v truncated=%t, want 2 and truncated", candidates, truncated)
+	}
+	if candidates[0].JobID != "job_old_requested" || candidates[1].JobID != "job_mid_requested" {
+		t.Fatalf("order = %#v, want oldest requested first", candidates)
+	}
+	more, truncated, err := service.listImportBackfillCandidates(ctx, false, candidates[1].JobID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(more) != 1 || more[0].JobID != "job_new_requested" {
+		t.Fatalf("cursor continuation = %#v", more)
+	}
+	excluded, err := service.countImportBackfillExcluded(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if excluded != 1 {
+		t.Fatalf("not_requested_excluded = %d, want 1", excluded)
+	}
+	withFlag, _, err := service.listImportBackfillCandidates(ctx, true, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, candidate := range withFlag {
+		if candidate.JobID == "job_not_requested" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("include-not-requested cohort missing: %#v", withFlag)
+	}
+}
+
+func TestImportBackfillDryRunDefault(t *testing.T) {
+	ctx := context.Background()
+	service, jobID := readyPlanService(t, "", &planCLI{})
+	enableAutoImportPolicy(t, ctx, service.Store, jobID)
+
+	importer := &trackingImporter{status: map[string]string{jobID: "applied"}}
+	result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Limit: 10}, importer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.DryRun {
+		t.Fatal("dry-run must be the default")
+	}
+	if len(importer.calls) != 0 {
+		t.Fatalf("importer calls = %v, want none in dry-run", importer.calls)
+	}
+	var eventCount int
+	if err := service.Store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = 'zotio.auto_import'`, jobID).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("events = %d, want none in dry-run", eventCount)
+	}
+}
+
+func TestImportBackfillMarksDuplicateForOwnedPapers(t *testing.T) {
+	ctx := context.Background()
+	ownedCLI := &fakeCLI{
+		find: map[string]json.RawMessage{
+			"doi:10.1002/example": json.RawMessage(`[{"key":"AB12CD34","data":{}}]`),
+		},
+	}
+	service, ownedJobID := readyPlanService(t, "", ownedCLI)
+	enableAutoImportPolicy(t, ctx, service.Store, ownedJobID)
+
+	result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 10}, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.AlreadyOwned != 1 || len(result.AlreadyOwned) != 1 || result.AlreadyOwned[0].JobID != ownedJobID {
+		t.Fatalf("already_owned breakdown = %+v", result)
+	}
+	if result.Summary.Applied != 1 || result.Applied[0].Status != "duplicate" {
+		t.Fatalf("duplicate apply = %+v", result.Applied)
+	}
+	result2, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 10}, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result2.Summary.Selected != 0 {
+		t.Fatalf("second run selected = %d, want 0 after duplicate delivery", result2.Summary.Selected)
+	}
+}
+
+func TestImportBackfillApplyIdempotentReplay(t *testing.T) {
+	ctx := context.Background()
+	cli := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	enableAutoImportPolicy(t, ctx, service.Store, jobID)
+
+	result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 10}, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Applied != 1 {
+		t.Fatalf("first apply summary = %+v", result.Summary)
+	}
+	result2, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 10}, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result2.Summary.Selected != 0 {
+		t.Fatalf("second apply selected = %d, want 0", result2.Summary.Selected)
+	}
+	if cli.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1 across two apply backfills", cli.applyCalls)
+	}
+	events, err := service.Bundle.Jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	success := 0
+	for _, event := range events {
+		if event["kind"] != "zotio.auto_import" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if detail["status"] == "applied" {
+			success++
+		}
+	}
+	if success != 1 {
+		t.Fatalf("successful auto_import events = %d, want 1", success)
+	}
+}
+
+func addReadyPlanJob(t *testing.T, service *Service, requestID string) string {
+	t.Helper()
+	ctx := context.Background()
+	jobID, err := service.Bundle.Jobs.CreateRequest(ctx, requestID, work.Work{
+		DOI: "10.1002/second", Title: "Second Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Bundle.Jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
+		JobID: jobID, Source: "unpaywall", URLRedacted: redact.URL("https://example.test/second.pdf"), URLKey: "url-key-2",
+		LandingRedacted: "https://example.test/second", Version: "published", AccessBasis: "open_access",
+		ReuseLicense: "cc-by-4.0", ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := service.Bundle.Jobs.NextPendingCandidate(ctx, jobID)
+	if err != nil || candidate == nil {
+		t.Fatalf("candidate = %+v, %v", candidate, err)
+	}
+	if err := service.Bundle.Jobs.MarkCandidate(ctx, candidate.ID, "accepted"); err != nil {
+		t.Fatal(err)
+	}
+	quarantine, err := service.Bundle.Artifacts.QuarantineDir(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(quarantine, "paper.tmp")
+	body := []byte("%PDF-1.4\nfixture DOI 10.1002/second\n%%EOF")
+	if err := os.WriteFile(temp, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := artifact.HashFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactPath, err := service.Bundle.Artifacts.Promote(temp, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Bundle.Jobs.UpsertArtifact(ctx, job.Artifact{
+		SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1,
+		TextChars: 1000, IdentityResult: "pass", Path: artifactPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}, {job.StateFetching, job.StateValidating}} {
+		if err := service.Bundle.Jobs.Transition(ctx, jobID, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := service.Bundle.Jobs.Transition(ctx, jobID, job.StateValidating, job.StateReady, nil, job.WithCandidate(candidate.ID), job.WithArtifact(sha)); err != nil {
+		t.Fatal(err)
+	}
+	return jobID
+}
+
+func TestImportBackfillFailureIsolation(t *testing.T) {
+	ctx := context.Background()
+	service, jobFail := readyPlanService(t, "", &planCLI{})
+	enableAutoImportPolicy(t, ctx, service.Store, jobFail)
+	jobOK := addReadyPlanJob(t, service, "request_backfill_ok")
+	enableAutoImportPolicy(t, ctx, service.Store, jobOK)
+
+	importer := &trackingImporter{
+		status: map[string]string{jobOK: "applied"},
+		errs:   map[string]error{jobFail: fmt.Errorf("previewing Zotio mutation: boom")},
+	}
+	result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 10}, importer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Failed != 1 || result.Summary.Applied != 1 {
+		t.Fatalf("summary = %+v, want one failed and one applied", result.Summary)
+	}
+	if len(importer.calls) != 2 {
+		t.Fatalf("importer calls = %v, want both jobs attempted", importer.calls)
+	}
+}
+
+func TestImportBackfillExpectedFailEmptyTitle(t *testing.T) {
+	ctx := context.Background()
+	service, jobID := readyPlanService(t, "", &planCLI{})
+	enableAutoImportPolicy(t, ctx, service.Store, jobID)
+	if _, err := service.Store.DB().Exec(`UPDATE work_requests SET title = '', authors_json = '[]' WHERE id = (SELECT work_request_id FROM jobs WHERE id = ?)`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Limit: 10}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.ExpectedFail != 1 || len(result.ExpectedFail) != 1 {
+		t.Fatalf("expected_fail = %+v", result.ExpectedFail)
+	}
+	if !strings.Contains(result.ExpectedFail[0].Reason, "title") {
+		t.Fatalf("reason = %q, want a title validation failure", result.ExpectedFail[0].Reason)
+	}
+}

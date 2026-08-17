@@ -497,10 +497,10 @@ func (b *AcquisitionBundle) Validate() error {
 	// bounds still apply to any values that are present.
 	if b.ZotioItemKey == "" {
 		if len(b.Identity.Title) < 3 {
-			return fmt.Errorf("identity.title length out of range")
+			return fmt.Errorf("identity has no citation title: resolve bibliographic metadata from the identifier or supply title and authors on the work request")
 		}
 		if len(b.Identity.Authors) == 0 {
-			return fmt.Errorf("identity.authors must have 1..100 entries")
+			return fmt.Errorf("identity has no citation authors: resolve bibliographic metadata from the identifier or supply title and authors on the work request")
 		}
 	}
 	if len(b.Identity.Title) > 500 {

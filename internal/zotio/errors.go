@@ -159,10 +159,14 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 
 func bundleValidationHint(lower string) string {
 	switch {
+	case strings.Contains(lower, "identity has no citation title"):
+		return "no citation record for this paper: verify the DOI or supply title and authors"
+	case strings.Contains(lower, "identity has no citation authors"):
+		return "no citation authors for this paper: verify the DOI or supply title and authors"
 	case strings.Contains(lower, "identity.title length out of range"):
-		return "bundle title missing or out of range"
+		return "citation title out of range"
 	case strings.Contains(lower, "identity.authors must have"):
-		return "bundle authors missing or out of range"
+		return "citation authors missing or out of range"
 	default:
 		return "bundle validation failed"
 	}

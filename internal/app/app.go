@@ -376,6 +376,15 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 			return err
 		}
 		if cached != nil && s.Artifacts.Verify(cached.SHA256) == nil {
+			// A cache hit skips resolve(), which is where enrichDOIWork normally
+			// runs, so a DOI-only work would reach `ready` carrying no citation
+			// record and could never be exported to the library. Enrich here
+			// rather than before the lookup: on a miss, resolve() performs it
+			// with proper retry-budget accounting, and this branch cannot
+			// re-charge the lookup on a later pass because the job goes `ready`.
+			if _, err := s.enrichDOIWork(ctx, row); err != nil {
+				return err
+			}
 			// Carry the source acquisition's candidate: these bytes are its
 			// bytes, so its licence and access basis are the honest provenance
 			// of this job's artifact. Recording it also replaces any stale

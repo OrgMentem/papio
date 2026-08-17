@@ -409,6 +409,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"zotio.apply": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioApply(ctx, raw, system)
 		},
+		"zotio.import_backfill": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return zotioImportBackfill(ctx, raw, system)
+		},
 		"zotio.tags.reconcile": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioTagsReconcile(ctx, raw, system)
 		},
@@ -1549,6 +1552,28 @@ func zotioPlan(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 		return zotioFailure(err)
 	}
 	return marshal(map[string]any{"plans": plans})
+}
+
+func zotioImportBackfill(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var req zotio.ImportBackfillRequest
+	if err := ipc.DecodeParams(raw, &req); err != nil {
+		return badParams(err)
+	}
+	if system.Zotio == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "Zotio integration is not configured"}
+	}
+	var importer zotio.ImportBackfillImporter
+	if req.Apply {
+		if system.App == nil || system.App.AutoImporter == nil {
+			return nil, &ipc.RPCError{Code: "precondition_failed", Message: "Zotio integration is not configured"}
+		}
+		importer = system.App.AutoImporter
+	}
+	result, err := system.Zotio.ImportBackfill(ctx, req, importer)
+	if err != nil {
+		return zotioFailure(err)
+	}
+	return marshal(result)
 }
 
 func zotioTagsReconcile(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
