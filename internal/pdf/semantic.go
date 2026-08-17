@@ -268,7 +268,29 @@ func extractOCR(parent context.Context, path string, cap Capability, opt Semanti
 		if err != nil {
 			return "", fmt.Errorf("tesseract: %w", err)
 		}
-		all.WriteString(text)
+		appendOCRPage(&all, text)
 	}
 	return all.String(), nil
+}
+
+// appendOCRPage joins one page of OCR text to the document, separating pages
+// with a form feed.
+//
+// The separator is load-bearing, not cosmetic. pdftotext emits a form feed at
+// every page break and identityWindow derives "page one" by cutting on the
+// first one, so text with no form feed makes every front-matter rule read the
+// first N bytes of the WHOLE document as page one. Tesseract is invoked once
+// per page and its output carries no page break of its own, so concatenating
+// the pages plainly — which this did — handed the identity rules a page one
+// spanning as many pages as OCR produced.
+//
+// The blind path is where that mattered most: FrontMatterDOIs takes the
+// conclusive DOI set from the 1 KiB window, so a scanned page one with little
+// text let a DOI printed on page two fall inside that window, and a targetless
+// capture could be named as whatever work page two happened to cite.
+func appendOCRPage(all *strings.Builder, text string) {
+	if all.Len() > 0 {
+		all.WriteString("\f")
+	}
+	all.WriteString(text)
 }

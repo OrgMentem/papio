@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1390,6 +1391,23 @@ func fileOwnerUID(info os.FileInfo) (uid uint32, ok bool) {
 // this pattern) or swept before it is even written.
 const cacheTempPattern = "identity-corpus-*.tmp"
 
+// cacheFormatVersion is part of every cache entry's filename. Bump it whenever
+// ExtractText's output or cacheEntry's shape changes, so a warm cache cannot
+// serve text produced by an extractor that no longer exists. Version 2 carries
+// the OCR page separator and the extraction flags below.
+const cacheFormatVersion = 2
+
+// cacheEntry is one cached extraction. It holds the flags as well as the text
+// because a cache hit used to reconstruct only Text and Chars, leaving OCRUsed
+// and NeedsReview false — so a warm run reported every document as having a
+// real text layer, and any rule conditioned on OCR read that as true.
+type cacheEntry struct {
+	Text        string `json:"text"`
+	Chars       int64  `json:"chars"`
+	OCRUsed     bool   `json:"ocr_used"`
+	NeedsReview bool   `json:"needs_review"`
+}
+
 // writeCacheEntry writes text to cachePath by creating a same-directory
 // temp file with O_EXCL — refusing to follow or overwrite anything already
 // there — and renaming it into place. VAL-6/PRIV-3b found the previous
@@ -1503,14 +1521,26 @@ func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts
 	// The cache key folds in size and modification time, not just the
 	// attachment key, so a PDF replaced or re-exported by Zotero misses the
 	// stale entry instead of silently reusing another file's text.
+	//
+	// It also folds in cacheFormatVersion, because nothing else can. A cache
+	// entry is the output of an extractor that changes: the OCR page
+	// separator was added long after these entries were first written, and a
+	// warm cache would have gone on serving unseparated text — a measurement
+	// reading pre-fix output while the code under test was fixed, with
+	// nothing recording the difference. Bump the version with any change to
+	// what ExtractText produces or to this entry's shape.
 	var cachePath string
 	if cacheDir != "" {
-		cachePath = filepath.Join(cacheDir, fmt.Sprintf("%s-%d-%d.txt", p.cand.attachmentKey, p.info.Size(), p.info.ModTime().Unix()))
+		cachePath = filepath.Join(cacheDir, fmt.Sprintf("%s-%d-%d-v%d.json", p.cand.attachmentKey, p.info.Size(), p.info.ModTime().Unix(), cacheFormatVersion))
 		if cached, err := os.ReadFile(cachePath); err == nil && len(cached) > 0 {
-			text := string(cached)
-			base.Text = text
-			base.Chars = int64(len(text))
-			return base, Skip{}, true
+			var entry cacheEntry
+			if err := json.Unmarshal(cached, &entry); err == nil && entry.Text != "" {
+				base.Text = entry.Text
+				base.Chars = entry.Chars
+				base.OCRUsed = entry.OCRUsed
+				base.NeedsReview = entry.NeedsReview
+				return base, Skip{}, true
+			}
 		}
 	}
 
@@ -1529,7 +1559,14 @@ func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts
 		// behind if this process is killed mid-write; see writeCacheEntry.
 		// A write failure is still silently tolerated — a full re-run is
 		// always correct, just slower — but it never fails the document.
-		_ = writeCacheEntry(cachePath, []byte(report.Excerpt))
+		if encoded, err := json.Marshal(cacheEntry{
+			Text:        report.Excerpt,
+			Chars:       report.Chars,
+			OCRUsed:     report.OCRUsed,
+			NeedsReview: report.NeedsReview,
+		}); err == nil {
+			_ = writeCacheEntry(cachePath, encoded)
+		}
 	}
 
 	base.Text = report.Excerpt

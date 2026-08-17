@@ -1,17 +1,21 @@
 # Identity attribution for DOI-less binding (formerly "structural front-matter parser")
 
-Status: **design v2 (2026-08-17)** — synthesised from three independent reviews of v1.
-v1 was written by a single research unit and shipped unreviewed in `dd9c792`; it survived
-none of the three. Review artifacts:
+Status: **design v3 (2026-08-17)** — four reviews, three of them adverse. v1 shipped
+unreviewed in `dd9c792` and survived none. Review artifacts:
 
 - Reviewer verdict **NEEDS REVISION** (7 findings) — `history://ParserDesignReview`
 - Factual anchor audit — `history://ParserAnchorAudit`
 - Independent competing design, GPT-5.6 Sol —
   `dev/scratch/oracle/20260817T131434Z-parser-independent-design/answer.md`
+- **Adversarial review of v2, GPT-5.6 Sol Pro — NEEDS REVISION (10 findings)** —
+  `dev/scratch/oracle/20260817T132720Z-parser-v2-pro-review/answer.md`
 
-Every code claim below was re-verified against the tree during synthesis; anchors in v1 had
-drifted and are corrected here. **Nothing in this document is built.** It supersedes v1's
-design; v1's substrate survives where marked.
+Every code claim below was verified against the tree. **Nothing in this document is built**
+except the OCR page-separator fix, which the fourth review moved out of this plan entirely
+(§P0, shipped).
+
+v2's central safety claim was **false**, and v3 exists to state the invariant that makes it
+true. The correction is in §The monotonicity invariant; read that before anything else.
 
 ## What changed from v1, and why
 
@@ -34,18 +38,61 @@ an autonomous bind:
 | `MENTION` | the span refers to another work | no |
 | `UNKNOWN` | plain text does not justify either conclusion | no |
 
-Consequence, and the whole point: **failing to recognise a mention yields `UNKNOWN`, not
-`SELF`.** It costs a missed bind, never a wrong accept. The only dangerous error left is a
-**false `SELF`**, and that is bounded *by construction* rather than by a threshold — see
-§Bounding.
+Consequence, and v2 stopped here: **failing to recognise a mention yields `UNKNOWN`, not
+`SELF`.** True as far as it goes, and not sufficient — see immediately below.
 
-The second change is scope. v1 was named for a parser and sized like one. The capability
-actually needed is narrower: **attribution over already-extracted text**, not document
+## The monotonicity invariant
+
+v2 claimed the ternary type removed detector recall as a safety parameter. **That claim was
+false**, and the fourth review broke it: the proposed `SELF` grammar contained predicates
+whose truth is *created by missing evidence*.
+
+- "**only one** plausible title anchor" — miss the real anchor and the false one becomes the
+  only anchor *found*, so the ambiguity veto never fires and `UNKNOWN` becomes `SELF`.
+- "standalone identifier line with **no surrounding prose**" — lose the relationship sentence
+  to column shredding or reading order and absent context becomes positive evidence.
+- "**no** competing identity assertion" — an assertion that was not detected reads as one that
+  does not exist.
+
+These are not hypothetical: the corpus already contains correct documents whose real titles
+are unavailable as contiguous text (column shredding) and wrong documents whose requested
+title survives intact as a contents-list entry or section heading. A document combining two
+already-observed extraction phenomena leaves the false anchor as the only found anchor.
+
+So the ternary type is a genuine improvement — it removes v1's "not recognised as a mention
+means acceptable" — but by itself it **relocates** the safety parameter into the `SELF` proof
+system rather than removing it. The label changed; the dependence did not.
+
+The polarity becomes an end-to-end safety property only under one invariant, which v3 adopts
+as its governing rule:
+
+> **Information loss may demote `SELF`. It may never create it.**
+>
+> Any predicate of the form "no prose **found**", "only one anchor **found**", "no conflicting
+> assertion **found**" may **veto** or **abstain**. None may positively establish `SELF`.
+> Every authorising `SELF` proof must rest on evidence that is **present**.
+
+Two immediate casualties, both required:
+
+1. **`SELF` form 2 — the standalone labelled identifier line — is no longer authorising.** It
+   becomes `UNKNOWN`, i.e. `Review`. Its warrant was an absence ("no surrounding prose"), and
+   the review found an ordinary-publisher counterexample family, not just a constructed one:
+   an Oxford Academic *Editor's Note* has its own DOI while rendering the 2004 article it
+   discusses as a bare `doi: 10.1210/en.2003-0985` line, and eNeuro commentaries carry
+   "See related article" DOI footnotes alongside their own article DOI. `Editor's Note` is not
+   in the correction-marker vocabulary. A publisher-controlled standalone `DOI: X` line is
+   therefore **not** intrinsically self-identifying. Only identity-frame evidence authorises.
+2. **The ambiguity rule is a veto, not a selector.** Two found anchors abstain; one found
+   anchor does not thereby become `SELF`.
+
+v2 also contradicted itself here and the contradiction is instructive: it said the adversarial
+shape "wrong-binds" and then claimed it is "left at `Review`", with no specified transition
+producing that. Under the invariant it genuinely is `Review`, because form 2 no longer
+authorises.
+
+The remaining scope change from v1: v1 was named for a parser and sized like one. The
+capability is narrower — **attribution over already-extracted text**, not document
 understanding. Renamed accordingly.
-
-The third change is sequencing: v2 puts a **cheap non-parser veto first**, with a predeclared
-stop rule that can end this workstream before any parser exists (§Increment 1, §Viability).
-
 ## Corrections to v1's factual claims
 
 These are errors, not drift. v1's argument rested on the first two.
@@ -111,23 +158,40 @@ in order at `:71-78`; `FrontMatterDOIs` exported while every other identity help
 (`identityPageOne`, `bylineSegments`, `wideGapSegments`, `corroboratingIdentifier`,
 `titlePrintedAsLine`) is **unexported** — so attribution must live **inside `internal/pdf`**.
 
-## New defect found during review (independent of this workstream)
+## P0 — the OCR page-boundary defect (found in review, **shipped**, not part of this plan)
 
-**`identityPageOne` is not page one for any OCR'd document.** `extractOCR`
-(`internal/pdf/semantic.go:254-273`) concatenates per-page Tesseract output with
-`all.WriteString(text)` and **inserts no form feed** between pages. `identityWindow` derives
-"page one" by cutting at the first form feed (`identity.go:825-826`); with none present, the
-window becomes the first 4 KiB of the **whole document**, silently including pages 2-4 —
-reference lists and other works' identifiers among them.
+`extractOCR` concatenated per-page Tesseract output with `all.WriteString(text)` and inserted
+**no form feed**. `identityWindow` derives "page one" by cutting at the first form feed, so
+with none present every front-matter window became the first N bytes of the **whole document**.
 
-This is live in production today: the daemon defaults to OCR enabled with `max_ocr_pages` 4.
-It is a pre-existing safety hole in the shipped identifier rule, wider than this workstream.
-Two consequences:
+v2 filed this as parser risk and deferred it to the last increment. The fourth review showed
+that reading is wrong, and it is right: the defect corrupts the **blind** path, today.
+`FrontMatterDOIs` takes the *conclusive* DOI set from the 1 KiB window
+(`identity.go:805-807`), and blind naming runs *before* the DOI-less candidate branch
+(`bridge.go:7613-7615`). The blind path has no candidate to check against, so a DOI reaching
+that window does not corroborate an identity — **it mints one**. A scanned page one with
+little text lets a DOI printed on page two land inside the synthetic "first 1 KiB", and the
+capture is filed as whatever work page two happened to cite. Production defaults to OCR
+enabled with `max_ocr_pages` 4.
 
-- **No structure-derived `SELF` decision may run when `OCRUsed` is true**, until page
-  boundaries are trustworthy (Increment 7).
-- Fixing OCR page separators is **its own measured change** with its own baseline, and it
-  should be filed independently of this plan rather than bundled into it.
+Fixed independently of this plan: `appendOCRPage` inserts `\f` between pages, with the
+reproduction pinned in `internal/pdf/ocr_page_boundary_test.go` — sparse page one plus a
+foreign DOI on page two, asserted against all three windows, including a test that the
+*unseparated* form still leaks so the causal claim cannot silently stop being true.
+
+Two consequences that **did** stay with this plan:
+
+- The extraction cache had no version (`<key>-<size>-<mtime>.txt`), so a warm cache would have
+  served pre-fix text while the code under test was fixed — the same shape as editing an
+  applied migration in place. Entries are now `-v<N>.json` with `cacheFormatVersion`; bump it
+  with any change to what `ExtractText` produces.
+- A cache hit reconstructed only text and char count, leaving `OCRUsed` **false** for every
+  cached document. Any rule conditioned on OCR — including this plan's refusal to trust page
+  boundaries in OCR text — would have read that lie as "this document has a real text layer".
+  Flags are now part of the entry.
+
+Still true for this plan: **no structure-derived `SELF` decision runs when `OCRUsed` is true**
+until the fix has been measured on a cold cache.
 
 ## The capability
 
@@ -157,18 +221,28 @@ which is why requirement 2 above is a prerequisite.
 
 **No numeric confidence score.** Recognition uses finite predicates: exact structural headings
 (`abstract`, `keywords`, `contents`, `references`); numbered-heading syntax once the body has
-started; the existing title delimiter machinery; **adjacency** (a `SELF` title must anchor a
-plausible title→byline/affiliation sequence, not merely appear early); and **ambiguity** (two
-positions that independently look like the document's own title yield `UNKNOWN`, not a pick).
+started; the existing title delimiter machinery; and **adjacency** — a `SELF` title must anchor
+a *present* title→byline/affiliation sequence, not merely appear early.
 
-`SELF` for an identifier requires positive structural evidence, initially only two forms:
+**Ambiguity is a veto, never a selector.** Two positions that independently look like the
+document's own title yield `UNKNOWN`. One position that looks like it does **not** thereby
+become `SELF`: "only one anchor found" is an absence, and under the monotonicity invariant an
+absence may abstain but may not authorise. A missed real anchor must not promote the false one.
 
-1. it occurs in the parsed identity frame on a metadata-shaped identifier segment; or
-2. it occupies a standalone page-one identifier line — essentially `DOI: <doi>` /
-   `https://doi.org/<doi>` or the target-aware arXiv/PMID equivalent — with no surrounding prose.
+`SELF` for an identifier requires positive structural evidence, and initially **one** form
+only:
 
-Form 2 is what recovers part of the 17-of-40 population that prints its own DOI below the
-abstract (`identity.go:993-994`) without declaring "anything on page one is self".
+1. it occurs in the parsed identity frame on a metadata-shaped identifier segment, adjacent to
+   present title/byline evidence for the same document.
+
+The standalone labelled page-one line — `DOI: <doi>`, `https://doi.org/<doi>` and the
+arXiv/PMID equivalents — is **`UNKNOWN`, not `SELF`**. v2 made it authorising to recover part
+of the 17-of-40 population that prints its own DOI below the abstract
+(`identity.go:993-994`); the fourth review showed it is an ordinary-publisher wrong-accept
+primitive (§The monotonicity invariant: Editor's Notes, related-article commentaries). Those
+documents now reach `Review`, which is the honest outcome — recovering them needs a structural
+feature stronger than the label itself, demonstrated on real extracted PDFs, and enters as an
+Increment 8 recovery form that must earn ≥1 correct bind with zero new wrong ones.
 
 `MENTION` is assigned when the **region** establishes reference/contents/body provenance, or
 the identifier sits in an explicitly referential construction. Deliberately **not** a large
@@ -186,28 +260,40 @@ before it must not be separated by the integer 3; adjacency and ambiguity replac
 rejected: parser success is not evidence about a candidate, and running it before the
 `conclusive-veto` and marker gates forces full parsing where those abort early.
 
-One exception earns a new gate:
+**And no new gate.** v2 proposed `GateSelfIdentifierConflict` as a pre-author hard abstain, on
+the argument that `Review` alongside a qualifier suppresses selection
+(`candidate_select.go:703-704`, verified) so the cited candidate must hard-fail for the real
+one to qualify. The fourth review inverted that argument, and the inversion holds:
 
-```
-conclusive-veto → non-article-marker → correction-marker
-  → self-identifier-conflict (NEW) → author-evidence → title-printed-as-line
-  → year-token → identifier-page-one
-```
+> That suppression **is a shield**. Take the dangerous direction this design is built to
+> resist — a false `SELF`. Candidate A is the real work but its own identifier lies outside
+> the observed window, so A would reach `Review`. A mention of candidate B is falsely
+> classified `SELF`, so B qualifies. **Without** the new gate, A's `Review` suppresses B and a
+> human is asked. **With** it, A is hard-failed before ever reaching `Review` — B is left as
+> the sole qualifier and the false `SELF` becomes a wrong autonomous bind.
 
-`GateSelfIdentifierConflict` examines **every** positively `SELF`-attributed page-one
-identifier, not just occurrences of this candidate's. A document that `SELF`-asserts an
-identifier incompatible with the candidate **hard-abstains** that candidate.
+A gate that deletes candidates before the selector can weigh them converts the selector's
+conservatism into confidence. So conflict is resolved **at selector level, after every
+candidate has been evaluated**, and eliminates a candidate only when a positively established
+document-self identifier is *positively compatible* with a different candidate under an
+**explicit typed equivalence relation**.
 
-It must be a hard abstain, not `Review`, and this is measured, not aesthetic:
-`SelectAutoBindCandidate` returns `"ambiguous: qualifier alongside review"` whenever any
-candidate reviews **alongside** a qualifying one (`candidate_select.go:703-704`). In the
-target-present conjunction case the cited-work candidate must **hard-fail** so the real
-candidate can still qualify; a `Review` there poisons it and reproduces today's all-abstain
-result (`candidate-binding-measurement.md:371-375`).
+Cross-kind absence of equivalence is `UNKNOWN`, never conflict. There is no safe implicit
+relation available: an accepted manuscript may legitimately carry an arXiv stamp while the
+journal job is DOI-oriented, and `BoundDOIs` cannot express arXiv or PMID identity at all. So
+"incompatible with the candidate" must not mean "not among its durable DOIs", and must not
+mean cross-kind inequality.
 
-Kept separate from `CheckConclusiveIdentity` on purpose: that veto's contract is the
-conclusive DOI set from the blind 1 KiB window with slash-preserving comparison
-(`candidate_binding.go:55-64`). Widening it would couple blind naming to targeted matching.
+`CheckConclusiveIdentity` stays untouched: its contract is the conclusive DOI set from the
+blind 1 KiB window with slash-preserving comparison (`candidate_binding.go:55-64`), and
+widening it would couple blind naming to targeted matching.
+
+If a later increment does add a gate, `gateOrder` in `internal/identitycorpus/candidates.go`
+**must change in the same increment**. It duplicates the rule's gate list and `gateDepth`
+returns `-1` for anything unlisted (`candidates.go:1288-1305`), so a candidate terminating at a
+new gate gets depth `-1` and the report can nominate an earlier candidate as decisive — the
+per-gate evidence would be wrong exactly during the increment that introduced the gate. Better:
+single-source the order in `internal/pdf`, or derive depth from `CandidateQualification.Reached`.
 
 Per gate:
 
@@ -241,30 +327,60 @@ collecting.
 
 | # | Change | Predeclared criterion |
 |---|---|---|
-| **0** | none — capture baselines, fixed seed/flags, and separately under daemon-equivalent `MinChars`/OCR | baselines captured; **no release conclusion** if the two extraction settings differ materially |
-| **1** | **page-one multi-DOI ambiguity veto** — no parser at all: a candidate reaching corroboration cannot auto-bind if page one conclusively prints multiple distinct DOIs | conjunction target-absent **286/286 → 0**; every currently clean real cell stays at 0; target-present coverage **≥10%** of unique eligible documents or **stop** (§Viability) |
-| **2** | attribution computed and traced, **decisions unchanged** | selector outcomes **identical** to Increment 1; both known pairwise false-title spans classify non-`SELF`; each conjunction's cited identifier classifies non-`SELF` **or** its own DOI classifies `SELF`; report what fraction of the 17-of-40 late own-DOI cases classify `SELF` |
-| **3** | `GateSelfIdentifierConflict` replaces the coarse veto | 0 conjunction target-absent wrong binds; 0 new wrong-bind documents anywhere; must **recover ≥1 correct bind** lost by Increment 1, or the added complexity is deleted |
-| **4** | `SELF` title/byline feed `title-printed-as-line` / `author-evidence`; same attribution applied experimentally to pairwise `MatchIdentity` | pairwise wrong accepts **2 → 0**; no new candidate wrong binds; pairwise own-document pass falls by **≤1 percentage point** on the same corpus, else revert to candidate-only |
-| **5** | identifier gate accepts **only** `SELF` | 0 wrong binds in every target-absent cell and every named adversarial construction; coverage **≥10%** of unique target-present eligible documents |
-| **6** | one attested `SELF` recovery form per increment (e.g. a specific late footer-DOI grammar) | each must recover **≥1 unique correct bind**, add **0** wrong binds and **0** pairwise wrong accepts; a no-op is deleted |
-| **7** | OCR page boundaries preserved, structure enabled on OCR, then grab admission / pool construction / bind fence | same zero-wrong criteria under **production** extraction; no enabling flag until integration passes |
+| **P0** | OCR page separator — **shipped**, see §P0 | reproduction pinned; blind window no longer spans pages |
+| **0** | none — freeze the baseline: exact document keys, truth classes, extraction mode, pool definitions, and the specific cell(s) whose coverage constitutes the floor. Capture pairwise and candidate baselines on a **cold** cache (P0 changed extraction) | baselines captured under both corpus and daemon-equivalent `MinChars`/OCR; **no release conclusion** if they differ materially; admission changes from P0 reported separately |
+| **1** | **single-source offset-bearing matcher**, decision-inert: replace the `bool` primitive with `findFlattenedTokenSpans(text, needle) []Span` and define `containsFlattenedToken` as `len(spans) != 0` | every corroborating and attribution caller consumes the **same** spans; property tests pin start boundary, trailing prefix collision (PMID `12345` vs `123456`), whitespace/newline/Unicode spacing, punctuation, and `bool == (len(spans) > 0)`; **all** occurrences classified, not the first |
+| **2** | measure page-one identifier **multiplicity** across DOI **and arXiv and PMID** using those spans | adversarial construction per identifier class, including letter-spaced and line-wrapped variants; report multiplicity distribution over real documents |
+| **3** | *optional* conservative multiplicity veto as a temporary safety baseline | conjunction target-absent → 0 for **every** identifier class; every currently clean real cell stays at 0. **No viability stop attached** (see §Viability) |
+| **4** | attribution computed and traced, **decisions unchanged** | every known **cited** identifier classifies `MENTION` or `UNKNOWN` — **never** `SELF`, as an independent mandatory assertion; every labelled own-identifier case matches its own expected role; both pairwise false-title spans classify non-`SELF`; report the fraction of late own-DOI cases reachable |
+| **5** | smallest attribution-aware acceptance rule: **identity-frame `SELF` only**; standalone labelled lines stay `UNKNOWN` | 0 wrong binds in every target-absent cell and every named adversarial construction; **this** is where the viability floor applies, on the frozen denominator |
+| **6** | `SELF` title/byline feed `title-printed-as-line` / `author-evidence`; same attribution applied experimentally to pairwise `MatchIdentity` | pairwise wrong accepts **2 → 0**; no new candidate wrong binds; pairwise own-document pass falls by **≤1 percentage point**, else revert to candidate-only |
+| **7** | selector-level conflict resolution under a typed equivalence relation | must **recover ≥1 correct bind** lost by the multiplicity veto, or it is deleted; no candidate is eliminated except by a positively established, positively compatible self identifier |
+| **8** | one attested `SELF` recovery form per increment | each recovers **≥1 unique correct bind**, adds **0** wrong binds and **0** pairwise wrong accepts; a no-op is deleted |
+| **9** | enable structure on OCR text; then grab admission / pool construction / bind fence | same zero-wrong criteria under **production** extraction; no enabling flag until integration passes |
 
-Additional gates on the whole sequence, from review:
+Three changes here are corrections, not reordering, and each has a reason:
+
+- **Increment 4's criterion lost an `or`.** v2 required that each conjunction's cited
+  identifier classify non-`SELF` **or** its own DOI classify `SELF`. The second arm makes the
+  test green while the *cardinal* classifier error — cited identifier read as `SELF` — passes
+  unnoticed. Worse, a later conflict rule would then mask it: while the synthetic own DOI is
+  present, the conflict resolution hard-fails the cited candidate and the arm still records
+  zero wrong binds. Move that same false-`SELF` classifier to the production adversary where
+  the own DOI is on page two or absent, the masking disappears, and the cited identifier is the
+  only `SELF` left. The two assertions are now independent and both mandatory.
+- **Multiplicity is measured before it is enforced**, and over every identifier class. A
+  multi-**DOI** veto does nothing to an arXiv-target conjunction (`arXiv:TARGET` plus one own
+  DOI is not multiple DOIs), and PMID has no conjunction regression at all.
+- **The matcher comes first** because there is already a live semantic divergence to close:
+  `documentDOIs` recognises contiguous regex-shaped DOI text while the corroborator uses
+  `containsFlattenedToken`, which deliberately ignores whitespace inside identifiers. So
+  `Extended from DOI: 10.1145/ 30 6 5 3 8 6` can corroborate `10.1145/3065386` while a
+  conclusive-DOI multiplicity check sees only the own DOI. Any multiplicity observation must
+  derive from the **same** spans the corroborator used, or the veto and the acceptance rule
+  disagree about what the document contains.
+
+Additional gates on the whole sequence:
 
 - **Marker gates** (`non-article-marker`, `correction-marker`) recorded **0 trials** in the
   first run (`candidate-binding-measurement.md:390-392`). Release is gated on labelling the
-  **14 composite proposals + 25 audit rows** — the one irreducibly human hour
-  (`:396-398`). Until then, no claim about real-world composites.
-- **Per-role budgets are required, not optional.** A labelled, held-out role set must include
-  real footer-DOI placements and true titles that resemble headings and TOC entries, with
-  per-role false-positive/false-negative and abstention budgets. Aggregate pass counts cannot
-  identify *which* detector regressed, and an all-`UNKNOWN` parser trivially satisfies a
-  wrong-accept bar.
-- "Zero observed" is a **regression bar**, not a probability claim. Only 293 documents survived
+  **15 composite proposals + 25 audit rows** (`make composite-labels`) — the one irreducibly
+  human step (`:396-398`). Until then, no claim about real-world composites.
+- **Per-role criteria must be numeric and fixed before labels are collected.** For an
+  authorising role: **any** observed held-out false `SELF` is an automatic failure. Sample
+  insufficiency is reported as **not measured**, never as pass. The held-out set must include
+  real footer-DOI placements, true titles resembling headings and TOC entries, and the
+  Editor's-Note / related-article commentary templates from §The monotonicity invariant. The
+  role inventory is frozen at Increment 0; aggregate pass counts cannot identify which detector
+  regressed, and an all-`UNKNOWN` classifier trivially satisfies a wrong-accept bar.
+- **"Zero observed" is a regression bar, not a probability claim.** Only 293 documents survived
   into scored pools in the first run; this corpus cannot substantiate a small production
-  corruption rate. `autoBindDecisionEnabled` (`bridge.go:7682-7689`) stays **off** after all
-  increments unless evidence beyond this one library justifies it.
+  corruption rate. `autoBindDecisionEnabled` (`bridge.go:7682-7689`) stays **off** after every
+  increment unless evidence beyond this one library justifies it.
+- **A parser failure is a missed bind, never a reason to remove a document from the
+  denominator.** Eligibility is constructed before pools and arms thin independently — the
+  first run already shows the gap (293 documents scored, 286 conjunctions built) — so an
+  increment must not satisfy the floor by changing eligibility.
 
 ## Bounding the two error directions
 
@@ -272,33 +388,50 @@ No "structure confidence threshold" is exposed — that would recreate the defec
 
 | Error | Cost | Bound |
 |---|---|---|
-| false `MENTION` / missed `SELF` | missed bind | ≥10% coverage floor; ≤1pp pairwise pass loss for shared changes |
-| missed `MENTION` | **`UNKNOWN`, so a missed bind** — cannot preserve today's wrong accept | polarity, by construction |
-| **false `SELF`** | **wrong accept** | finite positive grammar with no score; new forms one at a time, each earning ≥1 correct bind; ambiguous title anchors → `UNKNOWN`; foreign `SELF` identifier is negative evidence; no `SELF` on OCR until Increment 7; zero-wrong retained at every step |
+| false `MENTION` / missed `SELF` | missed bind | coverage floor at Increment 5; ≤1pp pairwise pass loss for shared changes |
+| missed `MENTION` | **`UNKNOWN`, so a missed bind** — cannot preserve today's wrong accept | polarity |
+| **false `SELF`** | **wrong accept** | the monotonicity invariant: no absence may establish `SELF`; finite positive grammar with no score; forms added one at a time, each earning ≥1 correct bind; ambiguity is a veto, never a selector; no `SELF` on OCR until Increment 9; any held-out false `SELF` fails the increment outright |
 
 The safety parameter is therefore **the reviewable, versioned set of implemented positive
-`SELF` forms** — not an integer someone can quietly move from 0.72 to 0.65.
+`SELF` forms** — not an integer someone can quietly move from 0.72 to 0.65. Note what left this
+table: v2 listed "foreign `SELF` identifier is negative evidence" as a bound on false `SELF`.
+Under selector-level resolution it is no longer a bound at all — a foreign `SELF` that is
+itself false is precisely the hazard, so it cannot also be the mitigation.
 
-## Viability — the stop rule
+## Viability — the stop rule, and what it must not be attached to
 
 Auto-binding today is a minority win: random N=2 produced **44 correct** against **249 missed**
 (~85% abstention) *before* any of this tightening
 (`candidate-binding-measurement.md:379-381`). The safe fallback — popup picker and inbox — is
 **already shipped** (`bridge.go:7613-7671`).
 
-So the sequence carries an explicit stop rule: **run Increment 1 first.** If safe
-target-present coverage is already below the 10% floor, **do not build attribution for
-autonomous binding at all.** Use qualification and structure to **rank the popup picker**
-instead, and leave binding human-confirmed. Bad ranking is visible and reversible; wrong
-autonomous acceptance is neither.
+So the sequence carries a stop rule: if safe target-present coverage falls below the floor,
+**do not build attribution for autonomous binding.** Use qualification and structure to **rank
+the popup picker** instead, and leave binding human-confirmed. Bad ranking is visible and
+reversible; wrong autonomous acceptance is neither.
 
-The 10% floor is a **product-policy choice**, not derivable from this corpus — the value is
-open to revision, its existence is not.
+**v2 attached that stop to the wrong measurement.** It fired on the coarse multiplicity veto —
+but Increment 7 exists precisely to *recover* binds the veto lost, so the veto's coverage is a
+**lower bound** on what attribution can safely recover, not an upper bound on its value. A
+result of 8% would be unreadable: it could mean "this capability is worthless" or "the crude
+veto is extremely crude and attribution has a large recovery population". Those are opposite
+conclusions and the veto cannot distinguish them. Worse, the veto craters coverage *precisely
+when* ordinary papers carry a second DOI — a data-availability, related-work, correction or
+funder DOI — which is exactly the distinction attribution exists to make. The stop rule would
+have killed the workstream on the crudeness of its own placeholder.
+
+So: the floor applies at **Increment 5**, the first attribution-aware acceptance rule, on the
+denominator frozen at Increment 0. The multiplicity veto may still ship as a temporary safety
+baseline; it carries no viability verdict. If the safe positive-only rule cannot clear the
+floor, **that** is a meaningful negative result and the answer is picker ranking.
+
+The floor's **value** (10% was proposed) is a product-policy choice, not derivable from this
+corpus, and needs the operator's number. Its existence is not optional.
 
 That 61.1% of the real corpus was DOI-less makes the *admission path* important; it does not
 make *automatic resolution inside it* valuable. Different questions.
 
-## Adversarial shape that defeats this design
+## The adversarial shape, and how v3 resolves it
 
 Page one, after extraction, of a related-work expansion:
 
@@ -315,20 +448,24 @@ DOI: 10.1234/TARGET
 with the sentence establishing the relationship lost to text ordering (a visually separate
 box), and the document's **own** DOI on page two, beyond the 4 KiB window.
 
-The standalone `DOI: TARGET` line satisfies `SELF` form 2. No foreign page-one `SELF`
-identifier contradicts it. If title, authors and year genuinely agree, every gate agrees, and
-it **wrong-binds**.
+**Under v2 this wrong-bound**, and v2's own text admitted it while simultaneously claiming the
+shape was "left at `Review`" — a contradiction with no transition to support it. The standalone
+`DOI: TARGET` line satisfied form 2; nothing contradicted it; every other gate agreed.
 
-Both covers are refused, deliberately:
+**Under v3 it reaches `Review`**, and by construction rather than by exception: form 2 no longer
+authorises, so the only page-one identifier evidence is `UNKNOWN`. This is the single clearest
+demonstration of why the monotonicity invariant is the design, not a caveat on it — the
+adversary's whole method is *removing* the relationship sentence, and under the invariant
+removal can never manufacture `SELF`.
 
-- Tightening `SELF` to "identifier structurally tied to the identity frame" sacrifices the
-  17-of-40 late-own-DOI population — the reason page-one corroboration exists at all.
-- Searching page two collides with the 16 KiB excerpt cap and with the OCR page-boundary
-  defect above.
+The cost is stated honestly: the 17-of-40 population that prints its own DOI below the abstract
+now reaches `Review` too. That is a **missed bind**, the cheap error, and it is recoverable
+later — but only by a positive structural feature stronger than the label itself, demonstrated
+on real extracted PDFs, entering one form at a time (Increment 8).
 
-So it is **documented as an unsupported shape and left at `Review`**. Recovering it means
-multi-page structural extraction: a new capability with its own measurement, not another
-exception bolted onto `SELF`.
+Refusing multi-page extraction remains correct, and is now consistent: "page-two evidence is
+unavailable, therefore this page-one standalone DOI stays `UNKNOWN`" is coherent. v2's position
+— refuse page two *and* treat a standalone page-one DOI as `SELF` — was not.
 
 ## Preserved from v1 (still verified)
 
@@ -349,7 +486,28 @@ exception bolted onto `SELF`.
 
 ## Open before implementation
 
-1. **Pro adversarial review of this v2** — commissioned; this document is the input.
-2. The **10% viability floor** is a product decision and needs the operator's number.
-3. The **OCR form-feed defect** should be filed as its own change before Increment 7 depends
-   on it.
+1. **The viability floor's value** is a product decision and needs the operator's number. 10%
+   was proposed; its placement (Increment 5, frozen denominator) is settled, its value is not.
+2. **Composite labelling** — `make composite-labels`, 15 proposals + 25 audit rows. Gates every
+   real-world claim about this failure class, and can only be done by the operator.
+3. **Whether to build at all.** Three of four reviews were adverse, each on a different
+   architectural flaw, and the honest reading of the value case is that a safe rule is a
+   minority win against an already-shipped picker. v3 is now specific enough to implement, but
+   the sequence deliberately front-loads two decision-inert increments (the matcher, then
+   multiplicity measurement) so the question can be answered with numbers before any acceptance
+   behaviour changes. Nothing after Increment 4 should start until Increment 5's floor is
+   agreed.
+
+## Review history
+
+| Version | Fatal finding | Source |
+|---|---|---|
+| v1 | safety depended on **detecting** a mention; unbounded detector recall | reviewer, 7 findings |
+| v1 | 286/286 was a **synthetic** arm, not a real measurement; every `bridge.go` anchor stale | reviewer + anchor audit |
+| v1 | one newline defeated Increment A; DOI-only while the gate accepts arXiv/PMID; gate numbering self-contradictory | reviewer + my verification |
+| v2 | the ternary claim was **false** — absence-based predicates create `SELF` | Pro, finding 1 |
+| v2 | `SELF` form 2 has an **ordinary-publisher** counterexample family | Pro, finding 2 |
+| v2 | the OCR defect corrupts the **blind path today**; belongs first, not last | Pro, finding 3 |
+| v2 | the new hard gate **removes** an existing selector shield | Pro, finding 7 |
+| v2 | the stop rule drew the **opposite** inference from its own measurement | Pro, finding 5 |
+| v2 | Increment 2's `or` let the cardinal classifier error pass | Pro, finding 6 |
