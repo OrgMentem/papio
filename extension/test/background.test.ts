@@ -1166,8 +1166,14 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
   expect(first?.seq).toBe(0);
   expect(first?.msg_id).toMatch(/^[A-Za-z0-9_-]{8,64}$/);
   expect(first?.payload["extension_version"]).toBe("0.1.0");
+  // Exact list, not a superset check: an entry missing here is a feature the
+  // daemon silently refuses rather than a parse error. `pdf_grab_v1` was
+  // absent while `pdfGrabRefusalReason` required it, so "Send PDF" answered
+  // `extension_outdated` in every browser. The Go tests could not catch it —
+  // `grabCapableHello` builds its own hello containing the feature.
   expect(first?.payload["features"]).toEqual([
     "effect_permit_v1",
+    "pdf_grab_v1",
     "institutional_materialization_v1",
     "surface_presence_v1",
     "work_pulse_v1",

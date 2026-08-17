@@ -9546,8 +9546,20 @@ export class Bridge {
         {
           extension_version: this.deps.manifestVersion,
           adapter_versions: adapterVersions,
+          // Every entry here is a capability the DAEMON gates a request on, so
+          // an omission is a silently dead feature rather than a parse error:
+          // `pdfGrabRefusalReason` (internal/browser/bridge.go) refuses a grab
+          // with `extension_outdated` unless the SESSION advertised both
+          // `pdf_grab_v1` and `effect_permit_v1`. `pdf_grab_v1` was missing
+          // here while the daemon required it, so "Send PDF" was refused in
+          // every browser, always — and no test saw it, because the Go tests
+          // build their own hello (`grabCapableHello`) that does include it.
+          // Adding a value is wire-safe both ways: both parsers validate this
+          // array by shape only ([a-z0-9_]{1,64}, max 32, no duplicates), so
+          // an older daemon accepts a name it does not know.
           features: [
             EFFECT_PERMIT_FEATURE,
+            PDF_GRAB_FEATURE,
             INSTITUTIONAL_MATERIALIZATION_FEATURE,
             SURFACE_PRESENCE_FEATURE,
             WORK_PULSE_FEATURE,
