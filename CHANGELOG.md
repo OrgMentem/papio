@@ -22,6 +22,13 @@ execution records kept during the initial build.
   A spent allowance warns and says work resumes at `00:00 UTC`.
 
 ### Fixed
+- **Sending a PDF from your browser no longer refuses every time.** The daemon
+  required a capability the extension never claimed, so every **Send PDF** was
+  turned down as though the extension were out of date, in every browser. The
+  extension now states that capability during its handshake, and a daemon test
+  fails if any request is gated on something the extension does not offer —
+  which was previously invisible, because the daemon's own tests supplied a
+  handshake no browser ever sends.
 - **Private link details no longer reach *papio* when you send a paper.**
   Publisher and library links routinely carry signed tokens and interlibrary-loan
   tickets, which work like passwords. Sending a paper reported the whole link;

@@ -108,6 +108,7 @@ import {
   pdfGrabRefusalText,
   pdfSourceURL,
   pageAcquireOrigin,
+  carriesSignedCredential,
   sanitizePageHost,
   PDF_GRAB_FEATURE,
 } from "./deliver";
@@ -827,7 +828,14 @@ export interface PdfGrabCorrelation {
   scanID: string;
   tabID: number;
   state: string;
-  downloadID: number;
+  /** Absent while the grab waits for the researcher's own viewer download:
+   * papio started no download of its own, so there is no id yet. */
+  downloadID?: number;
+  /** The URL the grab was armed for. Persisted only for the awaiting-viewer
+   * state, which has to re-register its pending-URL steering after MV3 kills
+   * the worker — otherwise the researcher's Download click a minute later is
+   * correlated to nothing. */
+  url?: string;
   steeringPath: string;
   abandonPending?: boolean;
 }
@@ -1335,16 +1343,27 @@ function hostMatches(host: string, providerHosts: string[]): boolean {
   return providerHosts.some((h) => host === h || host.endsWith("." + h));
 }
 
+/**
+ * True when papio must not fetch this URL itself, and should ask for the PDF
+ * viewer's own Download button instead — bytes the browser already holds.
+ *
+ * Two cases. `pdf.sciencedirectassets.com` is a named host whose viewer URL is
+ * not a file at all. The general case is any URL carrying a signed, expiring
+ * delivery credential: re-requesting one returns an error page, because the
+ * grant belongs to the session that minted it. That was a single hard-coded
+ * hostname while the mechanism it guards was fully built, so every other
+ * signed-CDN publisher — Silverchair, which serves JAMA and Oxford University
+ * Press among others — took the doomed fetch instead of this path.
+ */
 function requiresNativeViewerDownload(url: string): boolean {
   try {
     const parsed = new URL(url);
-    return (
-      parsed.protocol === "https:" &&
-      parsed.hostname === "pdf.sciencedirectassets.com"
-    );
+    if (parsed.protocol !== "https:") return false;
+    if (parsed.hostname === "pdf.sciencedirectassets.com") return true;
   } catch {
     return false;
   }
+  return carriesSignedCredential(url);
 }
 
 /** Parse a released semver (with an optional leading v) without retaining its
@@ -4609,14 +4628,24 @@ export class Bridge {
           : await this.deps.pdfGrabCorrelations.get();
       for (const [grabID, correlation] of Object.entries(correlations)) {
         if (
-          typeof correlation.scanID === "string" &&
-          typeof correlation.tabID === "number" &&
-          typeof correlation.state === "string" &&
-          typeof correlation.downloadID === "number" &&
-          typeof correlation.steeringPath === "string"
+          typeof correlation.scanID !== "string" ||
+          typeof correlation.tabID !== "number" ||
+          typeof correlation.state !== "string" ||
+          typeof correlation.steeringPath !== "string"
         ) {
-          this.pdfGrabCorrelations.set(grabID, correlation);
+          continue;
         }
+        // Exactly one of the two shapes: a download papio started, or a grab
+        // armed and waiting for the researcher's own viewer download, which
+        // carries the URL instead so it can re-register its steering. Dropping
+        // the second shape here would silently discard the grab every time MV3
+        // recycled the worker — which it does within seconds of going idle.
+        const started = typeof correlation.downloadID === "number";
+        const armed =
+          correlation.downloadID === undefined &&
+          typeof correlation.url === "string";
+        if (!started && !armed) continue;
+        this.pdfGrabCorrelations.set(grabID, correlation);
       }
       this.hydrated = true;
       await this.update((current) => current);
@@ -5454,6 +5483,16 @@ export class Bridge {
             url,
             title: payload.title,
           });
+          if (grab.ok && grab.awaiting_viewer === true)
+            // papio started no download, so it must not claim to be sending
+            // one. The grab is armed; the researcher's own Download click is
+            // the step that completes it.
+            return {
+              ok: true,
+              state: "waiting_manual",
+              message:
+                "Use the PDF viewer Download button — papio will adopt that authorized file",
+            };
           if (grab.ok)
             return {
               ok: true,
@@ -8269,11 +8308,29 @@ export class Bridge {
         void this.finishAbandon(grabID, correlation);
         continue;
       }
+      // No download of papio's own: this grab is armed and waiting for the
+      // researcher to press the viewer's Download button. Re-register the
+      // steering this worker lost when it died, and leave the grab alone.
+      if (correlation.downloadID === undefined) {
+        if (correlation.url === undefined) continue;
+        this.grabDownloads.set(grabID, {
+          ids: new Set<number>(),
+          tabID: correlation.tabID,
+          scanID: correlation.scanID,
+          url: correlation.url,
+          steeringPath: correlation.steeringPath,
+        });
+        this.pendingGrabDownloadURLs.set(correlation.url, {
+          grabID,
+          tabID: correlation.tabID,
+          steeringPath: correlation.steeringPath,
+        });
+        continue;
+      }
+      const downloadID = correlation.downloadID;
       let items: DownloadItemLike[];
       try {
-        items = await this.deps.downloads.search({
-          id: correlation.downloadID,
-        });
+        items = await this.deps.downloads.search({ id: downloadID });
       } catch {
         continue;
       }
@@ -8286,7 +8343,7 @@ export class Bridge {
       }
       if (item?.state === "complete") continue;
       this.grabDownloads.set(grabID, {
-        ids: new Set([correlation.downloadID]),
+        ids: new Set([downloadID]),
         tabID: correlation.tabID,
         scanID: correlation.scanID,
         url: item?.url ?? item?.finalUrl ?? "",
@@ -8326,7 +8383,6 @@ export class Bridge {
       );
     } else {
       // "abandoned", or a daemon that classified nothing and whose reported
-      // state already says this grab is gone.
       this.notifyPdfGrab(
         correlation.scanID,
         grabID,
@@ -8345,7 +8401,7 @@ export class Bridge {
     title?: string | undefined;
     workspace_tab_id?: number | undefined;
     scan_id?: string | undefined;
-  }): Promise<BrokerReply<{ grab_id: string }>> {
+  }): Promise<BrokerReply<{ grab_id: string; awaiting_viewer?: boolean }>> {
     // The old single sentence named "Chrome download steering and a compatible
     // daemon" for three unrelated causes at once; each has its own remedy.
     if (!this.pdfGrabAvailable())
@@ -8444,6 +8500,24 @@ export class Bridge {
         tabID: workspaceTabID,
         steeringPath,
       });
+      // A signed delivery URL cannot be fetched again, so do not try. The grab
+      // and its steering are already armed above, and the pending-URL entry is
+      // deliberately left in place: the researcher's own viewer Download click
+      // arrives later, matches this URL in `pendingGrabFor`, and is steered
+      // into the grab directory (a live grab outranks an inferred job there).
+      // Returning `ok` without a download would claim work papio never did, so
+      // the caller reports the one action that can still complete the grab.
+      if (requiresNativeViewerDownload(requestURL)) {
+        this.pdfGrabCorrelations.set(grabID, {
+          scanID,
+          tabID: workspaceTabID,
+          state: "awaiting_viewer",
+          url: requestURL,
+          steeringPath,
+        });
+        this.persistPdfGrabCorrelations();
+        return { ok: true, grab_id: grabID, awaiting_viewer: true };
+      }
       try {
         const id = await this.deps.downloads.download({
           url: requestURL,
@@ -8460,6 +8534,31 @@ export class Bridge {
           steeringPath,
         });
         this.persistPdfGrabCorrelations();
+        // Chrome can interrupt a download before `download()` resolves — an
+        // expired signing token does exactly that — and the `onChanged` delta
+        // carrying that failure arrived while this id was still untracked, so
+        // `trackedGrabFor` dropped it. The grab then sat `awaiting_file` with
+        // its permit occupying the single effect lane until the next worker
+        // start ran `reconcilePdfGrabCorrelations`. Re-read the item now that
+        // it is tracked: the daemon settles this permit the moment it is given
+        // definite evidence, and refuses to guess without it.
+        let interrupted = false;
+        try {
+          const found = await this.deps.downloads.search({ id });
+          interrupted = found[0]?.state === "interrupted";
+        } catch {}
+        if (interrupted) {
+          const correlation = this.pdfGrabCorrelations.get(grabID);
+          if (correlation !== undefined) {
+            correlation.abandonPending = true;
+            this.persistPdfGrabCorrelations();
+            await this.finishAbandon(grabID, correlation);
+          }
+          return failure(
+            "grab_failed",
+            "papio couldn't download this PDF — the link didn't work. Use the PDF viewer Download button instead.",
+          );
+        }
         this.notifyPdfGrab(scanID, grabID, "grabbed");
         return { ok: true, grab_id: grabID };
       } catch {
@@ -9441,24 +9540,37 @@ export class Bridge {
       return this.onDownloadChanged(delta);
     });
     this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
+      // An EXACT job binding means this extension started this download for
+      // that job, so nothing may hijack it. `correlate()` is different in kind:
+      // an inference from the tab (and its handoff group) that survives the tab
+      // navigating to a different document.
       const exactJobID =
         this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
-      const job = exactJobID
+      const exactJob = exactJobID
         ? findByJob(this.store, exactJobID)
-        : this.correlate(item);
+        : undefined;
       const grabID = this.trackedGrabFor(item.id);
       const grab =
         grabID === undefined
           ? this.pendingGrabFor(item)
           : this.grabDownloads.get(grabID);
       const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
-      if (grab !== undefined && base.length > 0 && job === undefined) {
+      // A grab outranks an inferred job. It is the researcher naming THIS
+      // document, in this tab, just now; the inference is about what the tab
+      // used to hold. Observed live: a handoff tab opened for one paper was
+      // reused to read another, and the viewer's own Download button — the only
+      // byte source that works once a signed provider URL has expired — was
+      // steered into the first paper's job directory while a grab for the
+      // second sat unfulfilled. The bytes then failed identity validation and
+      // parked for review, and the grab never settled at all.
+      if (grab !== undefined && base.length > 0 && exactJob === undefined) {
         suggest({
           filename: `${grab.steeringPath}${base}`,
           conflictAction: "uniquify",
         });
         return;
       }
+      const job = exactJob ?? this.correlate(item);
       if (!job || base.length === 0) return;
       suggest({
         filename: `papio/${job.job_id}/${base}`,

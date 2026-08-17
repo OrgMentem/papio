@@ -3,6 +3,7 @@
 import { expect, test } from "bun:test";
 
 import {
+  carriesSignedCredential,
   classifyPage,
   deriveStablePageDOI,
   doiFromURL,
@@ -15,6 +16,31 @@ import {
   sniffDOI,
 } from "../src/deliver";
 
+// A signed delivery URL cannot be fetched twice, so papio must recognise one
+// before trying. Measured against the live case: watermark02.silverchair.com
+// serves JAMA with an 852-character `token`, and answers a second request with
+// "Your session has timed out."
+test("carriesSignedCredential separates signing tokens from page parameters", () => {
+  const token = "a".repeat(852);
+  expect(
+    carriesSignedCredential(`https://watermark02.silverchair.com/paper.pdf?token=${token}`),
+  ).toBe(true);
+  expect(
+    carriesSignedCredential(
+      `https://cdn.example.com/x.pdf?X-Amz-Signature=${"b".repeat(64)}&X-Amz-Expires=60`,
+    ),
+  ).toBe(true);
+
+  // Ordinary publisher parameters are not credentials, and a short value of a
+  // credential-shaped name is a page parameter — over-reporting would send
+  // every SAGE and Wiley reader down the manual path for nothing.
+  expect(
+    carriesSignedCredential("https://journals.sagepub.com/doi/pdf/10.1177/01634437251234567?download=true"),
+  ).toBe(false);
+  expect(carriesSignedCredential("https://provider.example.edu/x.pdf?token=1")).toBe(false);
+  expect(carriesSignedCredential("https://provider.example.edu/x.pdf")).toBe(false);
+  expect(carriesSignedCredential("not a url")).toBe(false);
+});
 // A DOI read out of a URL must come from URL *structure*. Scanning the
 // serialized URL as text was a live defect with two distinct consequences, both
 // pinned below: a route suffix glued onto the DOI (ACM, Springer), and a query

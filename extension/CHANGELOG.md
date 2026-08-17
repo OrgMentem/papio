@@ -62,6 +62,37 @@ for the full pre-split extension history.
   yet; the age appears once there is one.
 
 ### Fixed
+- **Send PDF works again.** It was refused in every browser, every time, with
+  *Reload the papio extension to finish updating* — advice that could not work,
+  because reloading never changed the thing being complained about. The
+  extension was not telling the daemon it could grab PDFs at all, so the daemon
+  turned down a capability the extension had had all along.
+
+- **A paper served on an expiring link now reaches *papio* instead of stalling.**
+  Publishers such as Silverchair — JAMA and Oxford University Press among them
+  — hand your browser a single-use link. *papio* was asking for the file a
+  second time, and being told *"Your session has timed out"*, so **Send PDF**
+  fetched an error page and then went quiet. It now recognises a link that can
+  only be used once and, rather than trying, asks you to press the PDF viewer's
+  own **Download** button — the file is already in your browser, so nothing is
+  fetched twice. That file is then adopted as the paper you were reading.
+
+- **The viewer's Download button files the paper you are reading, not the one
+  the tab was opened for.** A tab *papio* opened for one paper and you then
+  reused for another was steering downloads into the first paper's folder while
+  the request for the second went unanswered. The paper you named when you
+  clicked **Send PDF** now wins over what the tab used to hold. Nothing was
+  misfiled by this — the file was checked against the citation and set aside for
+  review — but it cost you a review that had no reason to exist.
+
+- **A download that fails instantly is reported instead of leaving *papio*
+  waiting.** When a link failed the moment it was tried, the failure arrived
+  before *papio* had finished learning which download it belonged to, so it was
+  dropped: the request stayed open, and the one download *papio* permits itself
+  at a time stayed spoken for, so the next **Send PDF** answered *busy* until
+  the browser restarted the extension on its own schedule. The failure is now
+  noticed straight away and you are told the link did not work.
+
 - **A paper is no longer left unfiled because its PDF's link confused *papio*.**
   On ACM and Springer, and on any link that carried a DOI beside other
   parameters, *papio* could read the DOI wrong and then look for a paper that

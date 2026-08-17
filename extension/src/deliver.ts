@@ -502,6 +502,56 @@ export function pageAcquireOrigin(value: string): string | undefined {
   return `${url.protocol}//${url.host}`;
 }
 
+/** Query parameter names that carry a bearer-grade credential when their value
+ * is long enough to be one. Publisher and CDN delivery links are signed with
+ * these; a short `?token=1` is a page parameter, not a credential. */
+const CREDENTIAL_PARAMS = new Set([
+  "token",
+  "signature",
+  "x-amz-signature",
+  "x-amz-credential",
+  "x-amz-security-token",
+  "key-pair-id",
+  "awsaccesskeyid",
+  "hmac",
+  "jwt",
+  "access_token",
+  "sessionid",
+  "ticket",
+]);
+
+/** A credential value shorter than this is a page parameter, not a signature. */
+const CREDENTIAL_VALUE_MIN = 32;
+
+/**
+ * True when a URL's query carries a signed, expiring delivery credential.
+ *
+ * Such a URL cannot be fetched a second time, so papio must never try: the
+ * grant is bound to the session that minted it, and asking again returns an
+ * error page rather than the file. Measured against a live publisher link
+ * (`watermark02.silverchair.com`, `token` of 852 characters), which answered a
+ * second request with `HTTP 400` and, in the provider's own words, "Your
+ * session has timed out. Please go back to the article page and click the PDF
+ * link again."
+ *
+ * Over-reporting is the safe direction: papio degrades to asking the
+ * researcher to press the viewer's own Download button — which serves bytes
+ * already in hand, needing no fetch — instead of failing after a doomed one.
+ */
+export function carriesSignedCredential(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(pdfSourceURL(value));
+  } catch {
+    return false;
+  }
+  for (const [name, param] of url.searchParams.entries()) {
+    if (!CREDENTIAL_PARAMS.has(name.toLowerCase())) continue;
+    if (param.length >= CREDENTIAL_VALUE_MIN) return true;
+  }
+  return false;
+}
+
 /** The daemon feature that advertises daemon-side PDF grabbing. Declared here,
  * beside the copy that explains its absence, so the popup's pre-click decision
  * and the bridge's send-time refusal cannot disagree about the name. */

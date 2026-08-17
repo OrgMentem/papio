@@ -4815,6 +4815,105 @@ test("a correlated download is steered into papio/<job_id>/; unrelated untouched
   );
   expect(suggestions.length).toBe(1);
 });
+
+test("a signed PDF URL is never refetched; the viewer's own download completes the grab", async () => {
+  // Observed live on watermark02.silverchair.com. A handoff tab opened for one
+  // paper was reused to read another, and the signed URL's token had expired,
+  // so refetching it returned "Your session has timed out." from the provider.
+  // Three behaviours have to compose for the researcher to get anywhere:
+  //   1. papio must not attempt the doomed fetch, and must say what does work;
+  //   2. it must not report "sending" for a download it never started;
+  //   3. the viewer's Download button must land in the GRAB directory, not in
+  //      the directory of the job the tab happens to be correlated with.
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  await h.port.inbound(jobOffer("job_0009_stale_tab"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  // A real signing token, in length and shape: short values are page
+  // parameters and must keep taking the ordinary fetch path.
+  const pdfURL = `https://watermark.example.com/paper.pdf?token=${"a".repeat(852)}`;
+  h.tabs.seed({ id: tabID, url: pdfURL });
+  const reply = h.bridge.requestPdfGrab({ tab_id: tabID, url: pdfURL });
+  const requestFrame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-stale-tab-01",
+      steering_path: "papio/grabs/stalepath/",
+    }),
+  );
+  await expect(reply).resolves.toMatchObject({
+    ok: true,
+    awaiting_viewer: true,
+  });
+  // Nothing was fetched: the grant belongs to the session that minted it.
+  expect(h.downloads.started).toEqual([]);
+
+  // The researcher presses the viewer's Download button. papio did not start
+  // this download, and the tab still correlates to the offered job.
+  const suggestions: { filename: string; conflictAction: string }[] = [];
+  await h.downloads.onDeterminingFilename.emit(
+    {
+      id: 77,
+      tabId: tabID,
+      url: pdfURL,
+      filename: "paper.pdf",
+      state: "in_progress",
+    },
+    (s) => suggestions.push(s),
+  );
+  expect(suggestions).toEqual([
+    { filename: "papio/grabs/stalepath/paper.pdf", conflictAction: "uniquify" },
+  ]);
+});
+
+test("a download interrupted before its id is known settles the grab instead of stalling", async () => {
+  // Chrome interrupts an instantly-failing download before `download()`
+  // resolves, so the onChanged delta carrying that failure arrives while the id
+  // is still untracked and `trackedGrabFor` drops it. The grab then held the
+  // single effect lane as `unknown_completion` until the next worker start.
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const pdfURL = "https://provider.example.edu/dead-link.pdf";
+  h.tabs.seed({ id: 61, url: pdfURL });
+  h.downloads.afterCreate = (downloadID) => {
+    const item = h.downloads.items.get(downloadID);
+    if (item !== undefined) {
+      h.downloads.items.set(downloadID, { ...item, state: "interrupted" });
+    }
+  };
+
+  const reply = h.bridge.requestPdfGrab({ tab_id: 61, url: pdfURL });
+  const frame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: frame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-dead-link-01",
+      steering_path: "papio/grabs/deadlink/",
+    }),
+  );
+
+  // The daemon is told, so it can settle the permit on definite evidence
+  // rather than being left to guess whether the fetch happened.
+  const abandon = await h.port.waitForFrame("pdf_grab_abandon_request");
+  expect(abandon.payload["grab_id"]).toBe("grab-dead-link-01");
+  await expect(reply).resolves.toMatchObject({ ok: false });
+});
 test("closing the tab before auth cancels; after auth (awaiting_download) does not", async () => {
   // Before auth return: tab close is a genuine user cancel.
   const pre = makeHarness();
