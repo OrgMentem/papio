@@ -220,8 +220,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 37 {
-		t.Fatalf("user_version = %d, %v; want 37", version, err)
+	if err != nil || version != 38 {
+		t.Fatalf("user_version = %d, %v; want 38", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -293,8 +293,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 37 {
-		t.Fatalf("user_version = %d, %v; want 37", version, err)
+	if err != nil || version != 38 {
+		t.Fatalf("user_version = %d, %v; want 38", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -567,5 +567,87 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 		if !foundIndexes[name] {
 			t.Errorf("migration did not create index %q", name)
 		}
+	}
+}
+
+// 0025_pdf_grabs.sql shipped without 'abandoned' in its state CHECK and was
+// later edited in place to add it, so databases migrated in between kept the
+// original constraint while every fresh one — including every test database —
+// got the corrected one. That drift is invisible to the schema version and
+// silently fatal: no abandonment can be recorded, so a capture sticks in
+// awaiting_file, its tab answers "existing" for good, and the stale sweep
+// cannot retire it either. 0038 rebuilds the table; this pins the repair
+// against a database that actually carries the legacy constraint.
+func TestOpenRepairsLegacyPdfGrabStateConstraint(t *testing.T) {
+	ctx := context.Background()
+	dataDir := schema33Fixture(t, "")
+	dbPath := filepath.Join(dataDir, "papio.db")
+	raw, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce the pre-edit table exactly, rows and all.
+	for _, stmt := range []string{
+		`CREATE TABLE pdf_grabs_legacy (
+			id              TEXT PRIMARY KEY,
+			url_host        TEXT NOT NULL,
+			title           TEXT NOT NULL DEFAULT '',
+			state           TEXT NOT NULL
+			  CHECK (state IN ('awaiting_file','quarantined','identified','job_created','parked_no_identifier','failed_validation')),
+			quarantine_path TEXT NOT NULL DEFAULT '',
+			job_id          TEXT REFERENCES jobs(id),
+			outcome         TEXT NOT NULL DEFAULT '',
+			detail          TEXT NOT NULL DEFAULT '',
+			notified_at     TEXT,
+			created_at      TEXT NOT NULL,
+			updated_at      TEXT NOT NULL
+		)`,
+		`INSERT INTO pdf_grabs_legacy(id, url_host, title, state, created_at, updated_at)
+		 VALUES ('grab-legacy-01', 'pdf.example.org', 'A Paper', 'awaiting_file',
+		         '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z')`,
+		`DROP TABLE pdf_grabs`,
+		`ALTER TABLE pdf_grabs_legacy RENAME TO pdf_grabs`,
+	} {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			_ = raw.Close()
+			t.Fatalf("build legacy pdf_grabs: %v", err)
+		}
+	}
+	// Prove the fixture reproduces the defect rather than assuming it.
+	if _, err := raw.ExecContext(ctx, `UPDATE pdf_grabs SET state='abandoned' WHERE id='grab-legacy-01'`); err == nil {
+		_ = raw.Close()
+		t.Fatal("legacy fixture accepted an abandoned state; it does not reproduce the drift")
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	var host, state string
+	if err := db.DB().QueryRowContext(ctx, `SELECT url_host, state FROM pdf_grabs WHERE id='grab-legacy-01'`).Scan(&host, &state); err != nil {
+		t.Fatalf("legacy row lost in rebuild: %v", err)
+	}
+	if host != "pdf.example.org" || state != "awaiting_file" {
+		t.Fatalf("row = (%q, %q), want (pdf.example.org, awaiting_file)", host, state)
+	}
+	if _, err := db.DB().ExecContext(ctx, `UPDATE pdf_grabs SET state='abandoned' WHERE id='grab-legacy-01'`); err != nil {
+		t.Fatalf("abandoned state still rejected after migration: %v", err)
+	}
+	// The columns later migrations added must survive the rebuild, and so must
+	// the partial unique index that closes the cross-worker allocation race.
+	if _, err := db.DB().ExecContext(ctx, `UPDATE pdf_grabs SET effect_request_id='req-legacy-01', bind_provenance='{}' WHERE id='grab-legacy-01'`); err != nil {
+		t.Fatalf("columns from later migrations missing: %v", err)
+	}
+	var indexes int
+	if err := db.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='pdf_grabs' AND name IN ('pdf_grabs_by_state','pdf_grabs_by_job','pdf_grabs_pending_notify','pdf_grabs_active_source','pdf_grabs_effect_request_id')`).Scan(&indexes); err != nil {
+		t.Fatal(err)
+	}
+	if indexes != 5 {
+		t.Fatalf("pdf_grabs indexes = %d, want 5", indexes)
 	}
 }

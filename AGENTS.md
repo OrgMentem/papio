@@ -142,21 +142,36 @@ There is also a link check, because `zensical build` prints a broken link as an
   previously-executed signed binary poisons the kernel's signature cache and the next
   exec dies with SIGKILL (exit 137). Use `mv` or `rm` first so the copy gets a fresh
   inode.
-- **A new store migration bumps `user_version`, and THREE test files pin the
+- **A new store migration bumps `user_version`, and FOUR test files pin the
   latest number** — plus two historical fixtures that must NOT be bumped, which is
   where this goes wrong. Bump: `internal/cli/clean_install_test.go` ("schema
   version N", twice, plus a `user_version` compare), `internal/doctor/doctor_test.go`,
-  and `internal/store/migrate_guard_test.go`'s `TestOpenRefusesSchemaNewerThanBinary`
+  `internal/store/migrate_forward_test.go`'s two post-migration `user_version`
+  compares, and `internal/store/migrate_guard_test.go`'s
+  `TestOpenRefusesSchemaNewerThanBinary`
   — the easiest to miss, because it is the only site naming *two* numbers, setting
   `user_version` to latest+1 and asserting the exact refusal string `"database
   schema version <N+1> is newer than this binary supports (<N>); refusing to open"`.
   Leave alone: that file's sibling `TestGuardCapableSchema33RefusesSchema34`
-  deliberately models a historical ceiling, and `migrate_forward_test.go` pins
-  schema 33 on purpose — its fixture selects migrations by
+  deliberately models a historical ceiling, and `migrate_forward_test.go`'s
+  *fixture* pins schema 33 on purpose — it selects migrations by
   `migrationNumber(filename) > 33` rather than a hardcoded prefix list, so the
   bound stays 33 and a new migration needs no entry there. `go test ./...` fails
-  after adding `internal/store/migrations/NNNN_*.sql` until the three latest-version
+  after adding `internal/store/migrations/NNNN_*.sql` until the four latest-version
   assertions are bumped.
+- **NEVER edit an applied migration in place.** `0025_pdf_grabs.sql` shipped
+  without `'abandoned'` in its `state` CHECK and was later edited to add it
+  (`28fbc97` -> `70055e7`). Every database migrated in between kept the original
+  constraint, no schema version records the difference, and every test migrates a
+  fresh database and therefore sees the corrected one. The result was silent and
+  total: no grab abandonment could be written on the dev box at all — the CHECK
+  violation surfaced as `outcome: "conflict"`, so a capture stuck in
+  `awaiting_file` forever, its tab answered `existing` for good (allocation is
+  idempotent per host), and even `AbandonStaleAwaiting` could not retire it. It
+  cost most of a session to find, because the daemon, the extension and every
+  suite were all correct. `0038_pdf_grabs_abandoned_state.sql` repairs it by
+  rebuilding the table; a constraint or column change needs a *new* migration,
+  even when the old one is "obviously wrong".
 - **Adding a `job.TerminalReason` is three edits, and the third is the one you
   forget**: the const block and `NormalizeTerminalReason`'s switch (both
   `internal/job/job.go`), plus `terminalReasonWriters` in

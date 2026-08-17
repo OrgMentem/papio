@@ -7506,6 +7506,53 @@ func TestPdfGrabAllocatesSteeringPath(t *testing.T) {
 		t.Fatalf("pdf grab authorization events = %d, want one", authEvents)
 	}
 }
+
+// A capture whose permit is already settled must be cancellable by the browser
+// even though it cannot present the originating request id — that identity dies
+// with the worker generation that armed the capture, and session-scoped
+// correlations do not survive an extension reload. Allocation is idempotent per
+// host, so refusing here left every later Send PDF for that tab answered
+// "existing" for a capture nobody could complete, until AbandonStaleAwaiting's
+// six-hour cutoff. Nothing is in flight once the permit is settled, so there is
+// no occupancy to protect.
+func TestPdfGrabAbandonSessionClearsSettledCapture(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, helloWithFeatures(t, "0.14.0", pdfGrabV1Feature, effectPermitFeature))
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+		"request_id": "grab-req-settled-1", "host": "pdf.example.org", "title": "A Paper",
+	}))
+	allocated := firstOfType(msgs, protocol.MsgPdfGrabResult).Payload.(*protocol.PdfGrabResultPayload)
+
+	// A fresh request id is refused while the capture still occupies its permit:
+	// that is the fence, and it stays.
+	refused, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabAbandonRequest, "", map[string]any{
+		"request_id": "grab-abandon-settled-1", "grab_id": allocated.GrabID,
+	}))
+	held := firstOfType(refused, protocol.MsgPdfGrabAbandonResult).Payload.(*protocol.PdfGrabAbandonResultPayload)
+	if held.Outcome != "conflict" {
+		t.Fatalf("outcome = %q with a held permit, want conflict", held.Outcome)
+	}
+
+	if _, err := jobs.S.DB().Exec(`UPDATE effect_permits SET status='settled' WHERE grab_id=?`, allocated.GrabID); err != nil {
+		t.Fatalf("settle permit: %v", err)
+	}
+	cleared, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabAbandonRequest, "", map[string]any{
+		"request_id": "grab-abandon-settled-2", "grab_id": allocated.GrabID,
+	}))
+	done := firstOfType(cleared, protocol.MsgPdfGrabAbandonResult).Payload.(*protocol.PdfGrabAbandonResultPayload)
+	if done.Outcome != "abandoned" || done.State != string(grab.StateAbandoned) {
+		t.Fatalf("payload = %+v, want abandoned", done)
+	}
+
+	// And the tab is usable again: allocation no longer answers "existing".
+	again, _ := runSync(t, b, inFrame(t, protocol.MsgPdfGrabRequest, "", map[string]any{
+		"request_id": "grab-req-settled-2", "host": "pdf.example.org", "title": "A Paper",
+	}))
+	fresh := firstOfType(again, protocol.MsgPdfGrabResult).Payload.(*protocol.PdfGrabResultPayload)
+	if fresh.Outcome != "steering" {
+		t.Fatalf("outcome = %q after clearing, want steering", fresh.Outcome)
+	}
+}
 func TestPdfGrabRequiresPermitAndRespectsOccupancy(t *testing.T) {
 	t.Run("unsupported", func(t *testing.T) {
 		b, jobs, cfg, _ := newBridge(t)
