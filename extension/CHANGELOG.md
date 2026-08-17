@@ -68,6 +68,15 @@ for the full pre-split extension history.
   extension was not telling the daemon it could grab PDFs at all, so the daemon
   turned down a capability the extension had had all along.
 
+- **Pressing Send PDF a second time no longer says "PDF sent to papio" while
+  doing nothing.** *papio* keeps one request per tab, so a second press was
+  answered "you already have one of those" — and that was reported as a
+  success, for a paper nothing was fetching. Worse, a paper left in that state
+  could never be sent again: every later press repeated the same false
+  reassurance. The second press now resumes the request against the page you
+  are looking at and asks for the one click that can finish it; if it belongs to
+  a browser session that is gone, you are told so instead.
+
 - **A paper served on an expiring link now reaches *papio* instead of stalling.**
   Publishers such as Silverchair — JAMA and Oxford University Press among them
   — hand your browser a single-use link. *papio* was asking for the file a

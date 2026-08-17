@@ -4953,6 +4953,98 @@ test("a malformed inbound frame fails closed by disconnecting", async () => {
   expect(h.port.disconnected).toBe(true);
 });
 
+
+test("an existing armed grab is resumed for the tab's current URL, never reported as sending", async () => {
+  // Observed live on watermark02.silverchair.com: a second Send PDF for a tab
+  // whose grab was already armed answered `existing`, and the popup said "PDF
+  // sent to papio" for a grab waiting on a download nobody was performing.
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const signed = `https://watermark02.silverchair.com/paper.pdf?token=${"z".repeat(120)}`;
+  h.tabs.seed({ id: 71, url: signed });
+
+  // First click arms the grab and asks for the viewer's own download.
+  const armed = h.bridge.requestPdfGrab({ tab_id: 71, url: signed });
+  const first = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: first.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: "grab-existing-01",
+      steering_path: "papio/grabs/existing01/",
+    }),
+  );
+  await expect(armed).resolves.toMatchObject({ ok: true, awaiting_viewer: true });
+
+  // Second click: the daemon answers `existing` with no steering of its own.
+  const seen = h.port.posted.length;
+  const again = h.bridge.requestPdfGrab({ tab_id: 71, url: signed });
+  const second = await h.port.waitForFrame("pdf_grab_request", seen);
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: second.payload["request_id"] as string,
+      outcome: "existing",
+      grab_id: "grab-existing-01",
+    }),
+  );
+  const statusFrame = await h.port.waitForFrame("pdf_grab_status_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_status_result", {
+      request_id: statusFrame.payload["request_id"] as string,
+      grab_id: "grab-existing-01",
+      state: "awaiting_file",
+    }),
+  );
+  await expect(again).resolves.toMatchObject({ ok: true, awaiting_viewer: true });
+
+  // Steering survives, so the researcher's own Download click still lands in
+  // the grab directory rather than being adopted as an unrelated file.
+  const suggestions: { filename: string }[] = [];
+  h.downloads.onDeterminingFilename.emit(
+    { id: 900, url: signed, filename: "paper.pdf", state: "in_progress" },
+    (s) => suggestions.push(s),
+  );
+  expect(suggestions[0]?.filename).toBe("papio/grabs/existing01/paper.pdf");
+});
+
+test("an existing grab this browser cannot steer is refused, not called sent", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  h.tabs.seed({ id: 72, url: "https://provider.example.edu/x.pdf" });
+  const reply = h.bridge.requestPdfGrab({
+    tab_id: 72,
+    url: "https://provider.example.edu/x.pdf",
+  });
+  const frame = await h.port.waitForFrame("pdf_grab_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: frame.payload["request_id"] as string,
+      outcome: "existing",
+      grab_id: "grab-orphan-01",
+    }),
+  );
+  const statusFrame = await h.port.waitForFrame("pdf_grab_status_request");
+  await h.port.inbound(
+    nativeResult("pdf_grab_status_result", {
+      request_id: statusFrame.payload["request_id"] as string,
+      grab_id: "grab-orphan-01",
+      state: "awaiting_file",
+    }),
+  );
+  await expect(reply).resolves.toMatchObject({ ok: false });
+});
 test("restart recovery re-hellos and does not duplicate a live tab", async () => {
   const seed: StoreShape = {
     activeJobs: [

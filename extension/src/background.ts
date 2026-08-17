@@ -8466,7 +8466,50 @@ export class Bridge {
             status.state,
             status.detail,
           );
-        return { ok: true, grab_id: grabID };
+        // The daemon is idempotent per tab and deliberately withholds steering
+        // for a grab it already allocated, so "existing" alone says nothing
+        // about whether bytes are on their way. Only this browser knows: it is
+        // the one that armed the grab, and it persists that arming. Three
+        // distinct states hide behind this one outcome, and answering all of
+        // them with a bare `ok` reported success for a grab that was waiting
+        // for a download nobody was performing.
+        const known = this.pdfGrabCorrelations.get(grabID);
+        if (known === undefined)
+          // Armed by a browser or a worker generation whose memory is gone, so
+          // its steering cannot be re-registered from here and any download
+          // would land outside the grab. The daemon's own bound retires it.
+          return failure(
+            "grab_unresumable",
+            "papio is already waiting for a file for this tab and can't resume it here — try again in a few minutes",
+          );
+        if (known.downloadID !== undefined)
+          // papio's own fetch is genuinely in flight; "sending" is true.
+          return { ok: true, grab_id: grabID };
+        // Armed and waiting for the researcher's own download. Re-register the
+        // steering for the URL in front of them now — the earlier arming may
+        // have been for a URL this tab has since navigated away from — and ask
+        // for the click that can still complete it.
+        const resumeTabID = request.workspace_tab_id ?? request.tab_id;
+        this.grabDownloads.set(grabID, {
+          ids: new Set<number>(),
+          tabID: resumeTabID,
+          scanID: known.scanID,
+          url: requestURL,
+          steeringPath: known.steeringPath,
+        });
+        this.pendingGrabDownloadURLs.set(requestURL, {
+          grabID,
+          tabID: resumeTabID,
+          steeringPath: known.steeringPath,
+        });
+        this.pdfGrabCorrelations.set(grabID, {
+          ...known,
+          tabID: resumeTabID,
+          state: "awaiting_viewer",
+          url: requestURL,
+        });
+        this.persistPdfGrabCorrelations();
+        return { ok: true, grab_id: grabID, awaiting_viewer: true };
       }
       if (
         outcome !== "steering" ||
