@@ -489,11 +489,32 @@ Three things follow, and together they outrank the parser:
 2. **The attribution problem does not arise.** `prism:doi` *means* "this document's DOI". No
    `SELF`/`MENTION` inference, no monotonicity invariant, no positive-form grammar — the field's
    semantics answer the question that the entire 364-line parser exists to guess at.
-3. **Zero measured wrong-accept exposure.** Every admitted document was checked against every
-   other identified library work (~185k pairwise checks): **no document's metadata carried
-   another work's identifier**. Exact one-sided 95% upper bound on the per-document
-   contamination rate: **≤0.93%**. Contrast the text path, where the whole design problem is
-   that page one routinely carries other works' identifiers.
+3. **Zero measured wrong-accept exposure — among primary attachments.** Every admitted document
+   was checked against every other identified library work (~185k pairwise checks): **no
+   document's metadata carried another work's identifier**. Exact one-sided 95% upper bound on
+   the per-document contamination rate: **≤0.93%**. Contrast the text path, where the whole
+   design problem is that page one routinely carries other works' identifiers.
+
+**That third claim has a structural blind spot, found by re-measuring rather than by review.**
+The run loaded the corpus one-per-parent, so every **secondary** attachment — supplement,
+alternate scan, publisher cover sheet — was excluded *before* measurement. And a supplement is
+the one shape that defeats metadata corroboration: the publisher produced it as part of the
+article, so its XMP ordinarily carries the **parent article's** DOI. Bind target-aware with the
+parent as candidate and the metadata agrees while the bytes are the wrong document.
+
+Re-run with `AllAttachments: true`, only **4** secondary attachments reach the admitted
+population, and **1 of the 4** carries the parent's identifier in metadata. So this library
+**cannot measure the hazard** — n=4 puts the one-sided 95% upper bound near 50% — and the
+honest statement is *unmeasured*, not low. Two consequences, both binding:
+
+- **Metadata corroborates; it never authorises alone.** It enters as an additional source for
+  the existing `identifier-page-one` role, inside the existing conjunction, so a supplement must
+  still pass `title-printed-as-line`, `author-evidence` and `year-token`. Metadata may not
+  substitute for identity-frame agreement, only for where the identifier was found.
+- **The composite signals are the specific counter-measure**, not a general safety story:
+  `secondary-attachment` and `title-quotes-title` are precisely the detectors for "supplement
+  carrying its parent's identity", and they are the arm the labelling run left at zero
+  confirmed positives.
 
 Constraints that still apply, and are not negotiable:
 
@@ -506,6 +527,10 @@ Constraints that still apply, and are not negotiable:
   destination and a stamped cover leaf is exactly the shape that could rewrite XMP; 48
   papio-owned artifacts and 175 missing files were outside this run. Contamination must be
   re-measured on a grab-sourced population before metadata is allowed to authorise alone.
+- **XMP is author-controllable.** Unlike the text path, where a wrong identifier must survive
+  visible typesetting, metadata is invisible and freely writable by whoever produced the file.
+  That is a threat-model question this measurement does not address and is the one part of this
+  increment worth adversarial review.
 
 ### B. Layout-preserving extraction — refuted, as measured
 
