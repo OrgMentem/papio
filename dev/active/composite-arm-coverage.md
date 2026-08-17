@@ -1,6 +1,6 @@
 # Composite-arm coverage holes — scoping (2026-08-17)
 
-Status: scoping deliverable for workstream 4 (`dev/active/candidate-binding-measurement.md`).
+Status: **holes 1 and 2 shipped** in `aa242f2` (marker-gate synthesis arms, all-attachments path, anti-empty-arm reporting). **Hole 3 remains open and needs the operator**: 14 composite proposals plus 25 audit rows require human labelling before prevalence has any upper bound.
 No implementation in this file; anchors are to the tree at the time of writing.
 
 ## Context from the 2026-08-16 run

@@ -1,6 +1,6 @@
 # Event-time candidate eligibility pool snapshots
 
-Status: scoping only (2026-08-17). No implementation in this change.
+Status: **shipped** in `aa242f2` as migration `0039` — recording at every DOI-less settlement including parks. Snapshots accumulate from now on; everything already settled stays descriptive-only, so calibration is not unblocked today.
 
 Parent: `dev/active/candidate-binding-measurement.md` §5 (backlog replay arm).
 That arm is **descriptive stress coverage** today because the pool a historical

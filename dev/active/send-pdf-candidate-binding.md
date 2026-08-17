@@ -11,6 +11,18 @@ automatic decision is switched off. Phase 4 (ranked one-click confirm) remains
 unbuilt and is now moot until `/2` exists. See "Round 4: why Phase 3 was
 disabled" below for the blocking set; ADR-0020 carries the decision.
 
+**Where `/2` now stands (2026-08-17).** The measurement that gates it has run
+(`dev/active/candidate-binding-measurement.md`): every single-axis arm is clean,
+the composed adversary fails **100% at every pool size**, and a pool cap is
+therefore not the lever — composition is. The named blocking capability is the
+structural front-matter parser, designed in
+`dev/active/structural-front-matter-parser.md`; the rule cannot tell a
+**self-assertion** of identity from a **mention** of someone else's. That
+measurement also priced the feature honestly: even made safe, this substrate
+abstains on ~85% of cases where the target is present and unique, so `/2` should
+be weighed against the popup picker that already ships rather than assumed to
+supersede it.
+
 ## Problem
 
 A DOI-less PDF can only reach its job today if the researcher first clicks

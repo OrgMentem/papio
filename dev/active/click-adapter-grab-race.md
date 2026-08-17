@@ -1,6 +1,6 @@
 # Click-adapter download vs armed PDF grab — surviving classification race
 
-Status: **characterization only** (2026-08-17). No code change in this note.
+Status: **characterization, then shipped** in `aa242f2` — ambiguity now parks, tab-scoped. The first implementation broke the exact-job-binding path; see the commit for why the ordering, not the predicate, was at fault.
 
 ## Summary
 
