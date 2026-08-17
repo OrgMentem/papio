@@ -114,6 +114,8 @@ const DefaultDailyCreditFraction = 0.5
 type Source struct {
 	Enabled             bool    `toml:"enabled"`
 	APIKey              string  `toml:"api_key,omitempty"`
+	ClientID            string  `toml:"client_id,omitempty"`     // OpenAIRE registered service; non-expiring, unlike a personal token
+	ClientSecret        string  `toml:"client_secret,omitempty"` // pairs with client_id
 	RatePerSec          float64 `toml:"rate_per_sec,omitempty"`
 	Burst               int     `toml:"burst,omitempty"`
 	MaxCostUSD          float64 `toml:"max_cost_usd,omitempty"`          // monthly budget for paid sources
@@ -130,6 +132,14 @@ type Source struct {
 // posture without pointer plumbing.
 func (s Source) DisableKeepAlives() bool {
 	return !s.AllowKeepAlives
+}
+
+// HasClientCredentials reports whether this source carries a registered-service
+// credential pair. OpenAIRE is the only source that reads one today: its
+// personal access tokens expire an hour after issue, so `api_key` cannot run
+// unattended and a client id/secret exchange is the only durable path.
+func (s Source) HasClientCredentials() bool {
+	return strings.TrimSpace(s.ClientID) != "" && strings.TrimSpace(s.ClientSecret) != ""
 }
 
 // Fetch bounds every artifact download.
@@ -619,11 +629,49 @@ func defaultSources() map[string]Source {
 		SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
 		SourceRetractionWatch:  {Enabled: true, RatePerSec: 1, Burst: 1},
 		SourceSemanticScholar:  {Enabled: true, RatePerSec: 1, Burst: 1},
-		// OpenAIRE's keyless public limit is 60 requests/hour; a personal
-		// token (api_key) raises the ceiling and can justify a higher
-		// rate_per_sec in the user's config.
-		SourceOpenAIRE: {Enabled: true, RatePerSec: 0.016, Burst: 1},
+		// OpenAIRE publishes two ceilings, and papio paces to whichever
+		// tier the request is actually made in (see ADR-0024: never to a
+		// response header, which reports the authenticated ceiling even
+		// to keyless callers). Keyless is 60 requests/hour, so the
+		// shipped rate spends 57.6 of them.
+		SourceOpenAIRE: {Enabled: true, RatePerSec: OpenAIREKeylessRatePerSec, Burst: 1},
 	}
+}
+
+// OpenAIRE's two documented rate ceilings, and the pacing papio uses inside
+// each. Both leave headroom against a fixed hourly window, where the hour's
+// budget is burst + rate_per_sec × 3600: keyless spends 58.6 of 60, and
+// authenticated 6,845 of 7,200.
+const (
+	// OpenAIREKeylessRatePerSec paces the 60 requests/hour that OpenAIRE
+	// allows an unauthenticated caller.
+	OpenAIREKeylessRatePerSec = 0.016
+	// OpenAIREAuthenticatedRatePerSec paces the 7,200 requests/hour that a
+	// registered service is allowed — 120x the keyless allowance.
+	OpenAIREAuthenticatedRatePerSec = 1.9
+	// OpenAIREAuthenticatedBurst absorbs the bursty arrival pattern papio
+	// actually generates, which a burst of 1 turns into refusals.
+	OpenAIREAuthenticatedBurst = 5
+)
+
+// applySourceTiers raises pacing that is still at a tier's shipped default when
+// the configured credentials move the source to a higher tier. Without this a
+// registered-service credential would authenticate correctly and change
+// nothing observable, because rate_per_sec would still be metering out the
+// keyless allowance — two knobs for one intent. An operator who sets any other
+// rate keeps it: only the untouched default is derived.
+func applySourceTiers(sources map[string]Source) {
+	s, ok := sources[SourceOpenAIRE]
+	if !ok || !s.HasClientCredentials() {
+		return
+	}
+	if s.RatePerSec == OpenAIREKeylessRatePerSec {
+		s.RatePerSec = OpenAIREAuthenticatedRatePerSec
+	}
+	if s.Burst <= 1 {
+		s.Burst = OpenAIREAuthenticatedBurst
+	}
+	sources[SourceOpenAIRE] = s
 }
 
 // ErrAccessModeUnset is returned by RequireAccessMode until first-run setup.
@@ -664,6 +712,7 @@ func Load(path string) (Config, error) {
 	if err := cfg.validate(); err != nil {
 		return cfg, fmt.Errorf("config %s: %w", path, err)
 	}
+	applySourceTiers(cfg.Sources)
 	for name := range removedSourceNames {
 		delete(cfg.Sources, name)
 	}

@@ -523,8 +523,29 @@ func resolverEntries(cfg config.Config, budgets *budget.Manager, client *fetch.S
 		{Adapter: semanticscholar.NewWithOptions(semanticscholar.Options{Client: client, APIKey: cfg.Sources[config.SourceSemanticScholar].APIKey, BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceSemanticScholar)},
 		{Adapter: coreresolver.NewWithOptions(coreresolver.Options{Client: client, APIKey: cfg.Sources[config.SourceCORE].APIKey, BaseURL: cfg.Sources[config.SourceCORE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCORE)},
 		{Adapter: crossreftdm.NewWithOptions(crossreftdm.Options{Client: client, APIKey: cfg.Sources[config.SourceCrossrefTDM].APIKey, BaseURL: cfg.Sources[config.SourceCrossrefTDM].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCrossrefTDM)},
-		{Adapter: openaire.NewWithOptions(openaire.Options{Client: client, APIKey: cfg.Sources[config.SourceOpenAIRE].APIKey, BaseURL: cfg.Sources[config.SourceOpenAIRE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceOpenAIRE)},
+		{Adapter: openaire.NewWithOptions(openaire.Options{Client: client, Tokens: openAIRETokens(cfg, client), APIKey: cfg.Sources[config.SourceOpenAIRE].APIKey, BaseURL: cfg.Sources[config.SourceOpenAIRE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceOpenAIRE)},
 	}
+}
+
+// openAIRETokens selects OpenAIRE's credential path, preferring the only one
+// that survives unattended: a registered service's client id and secret, which
+// do not expire, exchanged for short-lived access tokens as needed. Returning
+// nil leaves the adapter on its api_key fallback (or keyless).
+//
+// The exchange runs against OpenAIRE's AAI host rather than the Graph API, so
+// it is neither metered by the Graph rate ceiling papio paces itself to nor
+// admitted through the source's budget gate — one request per token lifetime
+// against a different service.
+func openAIRETokens(cfg config.Config, client *fetch.SecureHTTPClient) openaire.TokenSource {
+	source := cfg.Sources[config.SourceOpenAIRE]
+	if !source.HasClientCredentials() {
+		return nil
+	}
+	return openaire.NewClientCredentials(openaire.ClientCredentialsOptions{
+		Client:       client,
+		ClientID:     source.ClientID,
+		ClientSecret: source.ClientSecret,
+	})
 }
 
 // discoveryPolicy is the budget policy for a discovery backend: the source's

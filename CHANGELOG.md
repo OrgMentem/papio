@@ -20,6 +20,24 @@ execution records kept during the initial build.
   before the day's first response, and the credential fingerprints the allowance is
   shared by — while the allowance is still healthy, not only once it is spent.
   A spent allowance warns and says work resumes at `00:00 UTC`.
+- **OpenAIRE can now be authenticated in a way that survives the night, raising
+  its ceiling 120×.** Authenticating with OpenAIRE lifts you from 60 requests an
+  hour to 7,200, and *papio* accepted a token for this before — but the only
+  credential it accepted was OpenAIRE's *personal access token*, which OpenAIRE
+  expires **one hour** after issuing it. Pasted into `api_key` it authenticated
+  through a test and then refused every request for the rest of the day, and
+  read as an OpenAIRE outage rather than as an expiry. *papio* now accepts a
+  registered service's `client_id` and `client_secret` — credentials that do not
+  expire — and exchanges them for short-lived tokens itself, refreshing before
+  each one runs out. Setting them also raises the request pacing to match the
+  higher ceiling, because a credential that authenticated and changed nothing
+  observable is two settings for one intention; an explicit `rate_per_sec` still
+  wins. Pasting a personal token into `api_key` keeps working for manual checks
+  and deliberately does *not* raise pacing, since pacing to 7,200 an hour on a
+  credential that can vanish mid-hour would leave *papio* running at 120× what
+  an unauthenticated caller is allowed. `papio doctor` names which credential
+  you are on and warns when it is the expiring one. Setup is on the
+  configuration reference page.
 
 ### Fixed
 - **Sending a PDF from your browser no longer refuses every time.** The daemon

@@ -352,7 +352,9 @@ ceiling. Each named section accepts these keys:
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | source-specific; see below | Enables the resolver policy. |
-| `api_key` | string | empty | Credential or token for a source that requires one. Doctor requires it for enabled `openalex`, `core`, and `crossref_tdm`; enabled OpenAlex also needs `email`. |
+| `api_key` | string | empty | Credential or token for a source that requires one. Doctor requires it for enabled `openalex`, `core`, and `crossref_tdm`; enabled OpenAlex also needs `email`. For `openaire` this holds a *personal access token*, which OpenAIRE expires one hour after issuing it — usable for a manual check, not for unattended operation; use `client_id`/`client_secret` instead. |
+| `client_id` | string | empty | OpenAIRE registered-service client id. Read only by `openaire` today. Unlike a personal access token these credentials do not expire, so this is the only OpenAIRE credential that survives unattended operation. Must be set together with `client_secret`; half a pair is ignored. |
+| `client_secret` | string | empty | Secret paired with `client_id`. *papio* exchanges the pair for a short-lived access token at OpenAIRE's AAI endpoint and re-exchanges it before expiry; the secret is never logged or echoed in an error. |
 | `rate_per_sec` | number | source-specific; see below | Per-source request-rate budget. |
 | `burst` | integer | source-specific; see below | Per-source burst budget. |
 | `max_cost_usd` | number | `0` | Monthly budget for paid sources. `0` means unmetered. |
@@ -381,16 +383,34 @@ ceiling: OpenAIRE allows **60 requests per hour** to unauthenticated callers, an
 hourly budget is `burst + rate_per_sec × 3600`, so at this rate a burst above about 2
 would breach the published ceiling.
 
-To get more OpenAIRE throughput, authenticate instead: a **free personal token**
-raises the ceiling to 7,200 requests per hour, which is 120× the keyless allowance.
-Register at [OpenAIRE](https://services.openaire.eu/uoa-user-management/register.jsp),
-copy the token from your account's personal-token page, and set it as `api_key` under
-`[sources.openaire]` — then raise `rate_per_sec` to suit the higher ceiling. *papio*
-sends the token as an `Authorization: Bearer` header.
+To get more OpenAIRE throughput, authenticate: **7,200 requests per hour** is 120× the
+keyless allowance, and it is free. OpenAIRE issues two kinds of credential and only one
+of them can run a daemon:
+
+1. Fill in the [personal information form](https://develop.openaire.eu/personal-info) —
+   the newer registration flow gates both credential types behind it.
+2. Go to [Registered Services](https://develop.openaire.eu/apis), click **+ New Service**,
+   pick the **Basic** security level, and create it. Copy the *Client ID* and
+   *Client Secret* it shows you.
+3. Put them in `[sources.openaire]` as `client_id` and `client_secret`.
+
+*papio* exchanges that pair for an access token as needed and refreshes it before it
+expires. The alternative credential — a [personal access
+token](https://develop.openaire.eu/personal-token) — is a single string you can paste
+into `api_key`, but OpenAIRE expires it **one hour** after issuing it, so it is only
+useful for a manual check. `papio doctor` warns when `api_key` is carrying one.
 
 Note that OpenAIRE reports `x-ratelimit-limit: 7199` in its responses **even to
 unauthenticated requests**, so that header is not a safe basis for choosing
 `rate_per_sec`. Use the documented ceiling for the tier you are actually in.
+
+Setting `client_id`/`client_secret` also raises `rate_per_sec` to `1.9` and `burst`
+to `5` (6,845 requests/hour against the documented 7,200), because a credential that
+authenticated but changed nothing observable would be two knobs for one intent. An
+explicit `rate_per_sec` or `burst` in your config always wins. A personal access
+token in `api_key` does **not** raise pacing: it authenticates for an hour, and pacing
+to the authenticated ceiling on a credential that can vanish mid-hour would leave
+*papio* running at 120× an unauthenticated allowance.
 
 ## Watch configuration
 

@@ -46,11 +46,14 @@ type HTTPClient interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
-// Options configures a Resolver. APIKey is an OpenAIRE personal token sent
-// as a bearer credential; keyless access works at OpenAIRE's public rate
+// Options configures a Resolver. Tokens is the preferred credential path (see
+// auth.go: a registered service's client id and secret do not expire, while a
+// personal access token lasts an hour); APIKey is a raw pre-issued bearer kept
+// for short manual checks. Keyless access works at OpenAIRE's public rate
 // limit. BaseURL is for tests or explicitly configured dev endpoints.
 type Options struct {
 	Client           HTTPClient
+	Tokens           TokenSource
 	APIKey           string
 	BaseURL          string
 	MaxResponseBytes int64
@@ -60,7 +63,7 @@ type Options struct {
 // researchProducts lookup by persistent identifier.
 type Resolver struct {
 	client  HTTPClient
-	apiKey  string
+	tokens  TokenSource
 	baseURL string
 	maxBody int64
 }
@@ -82,9 +85,15 @@ func NewWithOptions(opts Options) *Resolver {
 	if maxBody <= 0 {
 		maxBody = defaultMaxBody
 	}
+	tokens := opts.Tokens
+	if tokens == nil {
+		if key := strings.TrimSpace(opts.APIKey); key != "" {
+			tokens = StaticToken(key)
+		}
+	}
 	return &Resolver{
 		client:  opts.Client,
-		apiKey:  strings.TrimSpace(opts.APIKey),
+		tokens:  tokens,
 		baseURL: baseURL,
 		maxBody: maxBody,
 	}
@@ -117,8 +126,12 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		return nil, errors.New("openaire: could not construct request")
 	}
 	req.Header.Set("Accept", "application/json")
-	if r.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+r.apiKey)
+	if r.tokens != nil {
+		token, err := r.tokens.Token(ctx)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := r.client.Do(req)
@@ -135,7 +148,9 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 	case resp.StatusCode == http.StatusNotFound:
 		return nil, nil
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return nil, errors.New("openaire: request was rejected (check the configured api_key token)")
+		// A static api_key that worked until now has most likely just
+		// expired: OpenAIRE personal access tokens last one hour.
+		return nil, errors.New("openaire: request was rejected (a personal access token in api_key expires one hour after issue; set client_id and client_secret for unattended access)")
 	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests:
 		return nil, temporaryStatus(resp)
 	case resp.StatusCode >= 500 && resp.StatusCode <= 599:

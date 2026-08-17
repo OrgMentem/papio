@@ -447,6 +447,50 @@ func TestRunReportsMissingModeCredentialsToolsAndUnsafeConfig(t *testing.T) {
 	}
 }
 
+func TestRunWarnsWhenOpenAIRECredentialExpires(t *testing.T) {
+	// A personal access token is present, valid, and about to become the
+	// cause of a silent day-long outage. Doctor is the only surface that can
+	// say so before it happens, so a clean pass here would be a bug.
+	base := func(t *testing.T) config.Config {
+		cfg := config.Default()
+		cfg.AccessMode = config.ModeConservative
+		cfg.Email = "reader@example.org"
+		cfg.DataDir = t.TempDir()
+		cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+		return cfg
+	}
+
+	cfg := base(t)
+	cfg.Sources[config.SourceOpenAIRE] = config.Source{Enabled: true, APIKey: "personal-token"}
+	if status, detail := checkStatus(t, Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil), "source_openaire"); status != Warn {
+		t.Errorf("api_key status = %v (%s), want Warn", status, detail)
+	}
+
+	cfg = base(t)
+	cfg.Sources[config.SourceOpenAIRE] = config.Source{Enabled: true, ClientID: "svc", ClientSecret: "shh"}
+	if status, detail := checkStatus(t, Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil), "source_openaire"); status != Pass {
+		t.Errorf("registered-service status = %v (%s), want Pass", status, detail)
+	}
+
+	// Keyless is the shipped default for every install, so warning about it
+	// would put a permanent warning in front of every user.
+	cfg = base(t)
+	if status, detail := checkStatus(t, Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil), "source_openaire"); status != Pass {
+		t.Errorf("keyless status = %v (%s), want Pass", status, detail)
+	}
+}
+
+func checkStatus(t *testing.T, report Report, name string) (string, string) {
+	t.Helper()
+	for _, c := range report.Checks {
+		if c.Name == name {
+			return c.Status, c.Detail
+		}
+	}
+	t.Fatalf("check %s missing: %+v", name, report.Checks)
+	return "", ""
+}
+
 func TestRunWarnsWhenOCRExplicitlyDisabled(t *testing.T) {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative

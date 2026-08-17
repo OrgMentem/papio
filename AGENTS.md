@@ -589,12 +589,23 @@ There is also a link check, because `zensical build` prints a broken link as an
   a keyless install would raise its own rate ~120× and get the operator rate-limited.
   Pace from the provider's **documented** ceiling for the tier the request is actually
   made in; ADR-0024 records this as the reason the header-derived floor does not
-  generalise. Two live consequences worth knowing: `openaire`'s `rate_per_sec: 0.016`
-  is *correct* (0.016 × 3600 = 57.6/hour, just under the documented 60) and must not be
-  "fixed" by raising `burst`, since `burst + rate × 3600 ≤ 60` allows a burst of at
-  most 2.4; and a free personal token raises the ceiling 120× — already wired
-  (`openaire.Options.APIKey` → `Authorization: Bearer`), so it is a config change, not
-  a code change.
+  generalise. `openaire`'s `rate_per_sec: 0.016` is therefore *correct* (0.016 × 3600 =
+  57.6/hour, just under the documented 60) and must not be "fixed" by raising `burst`,
+  since `burst + rate × 3600 ≤ 60` allows a burst of at most 2.4.
+- **An OpenAIRE personal access token expires one hour after OpenAIRE issues it, so
+  `[sources.openaire].api_key` cannot run a daemon** — it authenticates through your
+  test and then fails every request for the rest of the day, presenting as a provider
+  outage rather than an expiry. This note previously claimed the 120× authenticated
+  tier was "already wired, a config change not a code change"; that was wrong, and it
+  was wrong because `Options.APIKey` → `Authorization: Bearer` *looks* like complete
+  support. The durable credential is a **registered service** (Basic level, at
+  `develop.openaire.eu/apis`): a client id and secret that do not expire, exchanged for
+  short-lived tokens by `openaire.ClientCredentials` (`internal/resolvers/openaire/auth.go`)
+  and wired in `bootstrap.openAIRETokens`. Two consequences to preserve: the exchange
+  runs against the AAI host, so it is deliberately outside the source's budget gate and
+  its Graph rate ceiling; and `config.applySourceTiers` raises pacing for client
+  credentials but **never** for `api_key`, because pacing to 7,200/hour on a credential
+  that can vanish mid-hour leaves papio at 120× a keyless ceiling.
 - **Before tuning any threshold against job history, plot both distributions first.**
   The `make identity-corpus` discipline above generalises. Measured on the live store:
   jobs that reached `ready` needed p50 **11** wire attempts, p90 29, p99 616, max

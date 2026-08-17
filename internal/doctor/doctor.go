@@ -987,6 +987,24 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 			add("source_openalex", Pass, "OpenAlex credentials configured", "")
 		}
 	}
+	if p := cfg.SourcePolicy(config.SourceOpenAIRE); p.Enabled {
+		switch {
+		case p.HasClientCredentials():
+			add("source_openaire", Pass, "OpenAIRE registered-service credentials configured (7,200 requests/hour)", "")
+		case strings.TrimSpace(p.APIKey) != "":
+			// This one has to warn even though the credential is present
+			// and working: OpenAIRE documents a personal access token as
+			// valid for one hour, so it authenticates through a test and
+			// then fails every request afterwards, looking like a provider
+			// outage rather than an expiry.
+			add("source_openaire", Warn, "OpenAIRE api_key is a personal access token, which expires one hour after OpenAIRE issued it",
+				"register a service at https://develop.openaire.eu/apis (Basic) and set sources.openaire.client_id and client_secret instead; those do not expire")
+		default:
+			// Keyless is the shipped default and papio paces it correctly,
+			// so this states the tier rather than nagging about it.
+			add("source_openaire", Pass, "OpenAIRE is keyless, paced to its documented 60 requests/hour", "")
+		}
+	}
 	for _, source := range []string{config.SourceCORE, config.SourceCrossrefTDM} {
 		p := cfg.SourcePolicy(source)
 		if !p.Enabled {
