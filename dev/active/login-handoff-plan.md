@@ -74,10 +74,25 @@ structural (capabilities deleted + AST test) and does not depend on event
 fidelity, whereas building a faithful fake first would model `closingTabs` and
 cancellation semantics that Slice 1 immediately deletes.
 
-### Slice 4 — only if field evidence still warrants it
+### Slice 4 — DROPPED 2026-08-17 by its own criterion
 
-Explicit operator refresh of an already-owned stale in-flight tab, minting a new
-URL into that same tab. **If Slice 3 removes the accumulation, stop.**
+Was: explicit operator refresh of an already-owned stale in-flight tab, minting a new
+URL into that same tab, "**if Slice 3 removes the accumulation, stop**".
+
+**It did.** Slice 3 shipped as `e6ff3e4 feat: mint fresh handoff links at engagement`
+(2026-08-10), which mints the URL at the moment of engagement — so a cold offer never
+carries a URL that can go stale before it is opened, which was the accumulation
+mechanism (15 handoffs / 21 hours → 14 dead SSO forms). The trigger has recurred five
+times since (login-class human actions on 08-12, 08-13 and 08-15) with no pileup.
+
+What remains after Slice 3 is one tab, already engaged, whose flow token expired while
+the researcher was in it — so the researcher is present and looking at it. Closing it
+and clicking again costs the same gesture an operator "refresh" affordance would, and
+needs no new holder-exclusive mint path — which is what would re-open the
+mid-engagement takeover boundary this plan deliberately accepted rather than fenced.
+
+Revisit only on the field evidence the original condition named: a *repeated* stale
+owned tab the researcher did not abandon themselves.
 
 ## Explicitly dropped
 

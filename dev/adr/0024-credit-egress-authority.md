@@ -273,4 +273,15 @@ sibling error types: one park path, and a third budget stays cheap to add.
 - **Generalising the header-derived floor to other sources.** Four of ten
   configured sources publish nothing usable, and only OpenAlex has two pools; the
   transport hygiene generalises and has been applied, the floor does not.
+
+  A rate-limit header may also report the **wrong tier's** ceiling, which makes
+  "derive pacing from the header" unsafe in a way no amount of parsing fixes. Verified
+  live on 2026-08-17: an **unauthenticated** OpenAIRE request is answered
+  `x-ratelimit-limit: 7199`, while OpenAIRE documents 7200/hour for *authenticated*
+  and **60/hour for unauthenticated** requests
+  (`graph.openaire.eu/docs/apis/terms`). A feature that trusted that header on a
+  keyless install would raise its own rate about 120× and get the operator
+  rate-limited. Pacing changes must be justified by a provider's **documented**
+  ceiling for the tier the request is actually made in, never by a response header
+  alone.
 - **Monthly USD admission.** `spent_usd` is left exactly as it was.

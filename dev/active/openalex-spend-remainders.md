@@ -57,45 +57,86 @@ into item 5`, `Fixed while reviewing`.
 
 **What is left, and why each is still open:**
 
-- **Item 4 — jitter the budget-reset wake.** Deferred by design: operational
-  smoothing, not an invariant.
-- **Item 6 — per-job spend guard.** Its stated condition ("deferrable only once the
-  fuse is deployed") is now satisfied, so the deferral rests on its own terms rather
-  than on a pending prerequisite. The residue is cross-day starvation: one job can
-  consume a disproportionate share of a day's allowance without ever exceeding it.
-  Lease fencing must be decided before it can be built safely.
+- **Item 4 — jitter the budget-reset wake.** Deferred by design as operational
+  smoothing, but the OpenAIRE smoke below supplied the measured justification it
+  previously lacked: refused callers wake in lockstep and re-attempt, costing 43
+  `budget_blocked` attempt rows per delivered request, and **36% of every attempt row
+  in the store** (87,471 of 241,093). Still not an invariant; now quantified.
+- **Item 6 — fair share of a source's daily allowance.** The invariant "one job may
+  not occupy acquisition indefinitely" was **adopted 2026-08-17**. The instrument
+  changed with it: an attempt-count cap is ruled out by measurement (successful jobs
+  reach 1,376 wire attempts; the worst offender is 3,404 — the distributions overlap),
+  so the invariant is enforced on **exclusion** rather than lifetime, via a monotone
+  per-`(job, source, day)` counter written in the `CommitEgress` transaction and a
+  contention-conditional deferral. No job is ever retired. This dissolves the lease-
+  fencing blocker: a monotone counter's stale increment only costs the hog a little
+  availability.
 - **Item 7 — derive the effective basis explicitly.** Not built deliberately: item 0
   measured the sibling hop as not worth its cost, so this primitive has no consumer.
   Reviving it requires the paid three-shape comparison, which spends real credits and
   is therefore the operator's call.
-- **OpenAIRE self-throttle.** Measured, unscheduled, needs a live per-provider smoke
-  first.
+- **OpenAIRE self-throttle — CLOSED 2026-08-17, finding falsified.** The smoke ran:
+  papio delivers its full configured rate at exact 62-second spacing, just under the
+  documented 60/hour keyless ceiling, so it is not declining work it could do — and
+  the proposed remedy (raise `Burst`) would have pushed it over. The section is kept
+  because the header it warned about provably lies, and because the real cost it
+  exposed belongs to item 4.
 
-## OpenAIRE self-throttle — measured, unscheduled
+## OpenAIRE self-throttle — smoke run 2026-08-17, finding FALSIFIED
 
-Extracted from the fuse generalisation analysis; the rest of that analysis, including
-why the header-derived floor does not generalise beyond `core` and `openaire`, is in
-ADR-0024.
+The live per-provider smoke this item was waiting for has been run. **It contradicts
+the finding.** papio is not self-throttling; it is running at the documented ceiling,
+and the remedy this section proposed (raise `Burst`) would have pushed it over.
 
-**papio's own OpenAIRE bucket refuses ~42× more often than OpenAIRE does.**
-Re-measured against the operator's live store on 2026-08-16, last 7 days: `openaire`
-recorded **27,375** attempts of which **26,738** ended `budget_blocked` and only
-**632** succeeded — **3.77 requests per hour actually reaching the wire** against a
-documented keyless ceiling of **60/hour**. So ~94% of a free allowance goes unused
-while papio declines its own work, and the shape is papio's config, not the
-provider's: `RatePerSec: 0.016, Burst: 1` (`internal/config/config.go:625`) spreads
-permits evenly while demand arrives in bursts, so a burst of 1 refuses the second
-caller in the same second and the unused permits never accumulate. `openalex` shows
-the same pattern less starkly (40,060 of 48,547 blocked), but there the refusals are
-partly the fuse doing its job, so OpenAIRE is the clean case. Fixing it recovers
-throughput on a free tier and costs nothing to get wrong-way — raising burst spreads
-bursts into an allowance already ours.
+**What the smoke measured.** Unauthenticated `GET
+api.openaire.eu/graph/v1/researchProducts`, eight requests: `x-ratelimit-used`
+incremented by exactly 1 per request, monotonically, and had not decayed 65 seconds
+later — an hourly counter, consistent with the documented ceiling. No 429.
 
-**This is not scheduled because it needs a live per-provider smoke first, and that is
-the operator's call:** capture `x-ratelimit-used` before and after a burst and confirm
-the used count stays under the *documented* 60/hour, not under the live `limit: 7199`
-header, which is untrustworthy — it contradicts OpenAIRE's own documented ceiling. Do
-not tighten or loosen pacing from that header alone.
+**Where the original figure went wrong.** "3.77 requests per hour" divided 632
+successes by 168 hours, but only **25 of those 168 hours had any OpenAIRE demand at
+all**. Per active hour the store shows 58, 58, 58, 63, 58, 48, 45, 40, 37, 36
+attempts reaching the wire, and the successful attempts in one such hour are spaced
+`09:00:20, 09:01:22, 09:02:24, 09:03:20 …` — **62-second intervals, exactly
+`1/0.016`**. The bucket is delivering its full configured 57.6/hour against a
+documented 60/hour. The "unused 94%" is the 143 hours with no demand, and an hourly
+allowance cannot be banked.
+
+**So `Burst: 1` is not the defect.** Raising it would spend the hour's allowance in
+one burst and exceed 60/hour, because `burst + rate × 3600 ≤ 60` leaves room for a
+burst of at most 2.4 at the current rate. Do not raise it without lowering the rate
+in the same change, and there is no measured reason to do either.
+
+**The header actively lies, and this is now verified rather than suspected.** An
+**unauthenticated** request is answered with `x-ratelimit-limit: 7199` — the
+*authenticated* ceiling (documented: 7200/hour authenticated, **60/hour
+unauthenticated**, `graph.openaire.eu/docs/apis/terms`). A future header-derived
+pacing feature would read 7199 on a keyless install, raise the rate ~120×, and get
+the operator rate-limited or blocked. Recorded in ADR-0024.
+
+**The one real throughput lever is a personal token**, not pacing: 7200/hour
+authenticated versus 60 keyless is 120×, and the path is already implemented and
+wired — `openaire.Options.APIKey` is sent as `Authorization: Bearer`
+(`internal/resolvers/openaire/openaire.go:120`) and bootstrap passes
+`cfg.Sources["openaire"].APIKey` (`internal/bootstrap/bootstrap.go:526`). Registering
+a token, setting `api_key`, and then raising `rate_per_sec` is an operator decision,
+not a code change. Yield justifies it: 718 wire attempts all-time returned candidates
+86 times (~12%), which is three orders of magnitude better than the sibling hop that
+item 0 switched off.
+
+**What the smoke did surface — and it is not OpenAIRE-specific.** Delivering 63
+requests in that hour cost **2,716 `budget_blocked` attempt rows**, a 43:1 write
+amplification: 336 distinct jobs wake in lockstep, one takes the token, the rest are
+refused and re-park on the same reset. Across the whole store, **87,471 of 241,093
+attempt rows (36%) are `budget_blocked`**. That is the real cost, it is the measured
+justification item 4 previously lacked, and it belongs to item 4 rather than here —
+a refused caller should wait for `next_allowed_at` rather than re-attempt and write a
+row, and the cohort should not wake in lockstep.
+
+**Latent, unrelated to pacing:** papio calls Graph API **v1**
+(`/graph/v1/researchProducts`, `internal/resolvers/openaire/openaire.go:34`). It
+still answers 200, but OpenAIRE documents **V3** (`/v3/research-products`) as
+current. Not urgent, not free either — a version cutover changes the response shape.
 
 ## 4. Jitter the budget-reset wake — deferred out of this tranche
 
@@ -123,7 +164,7 @@ that meaning, while smearing the wake preserves it. **Scope it to quota and
 local-budget reset parks**, not to every source-gate wake: an ordinary short gate
 is not a synchronized cohort, and smearing those adds latency for no benefit.
 
-## 6. Cross-day starvation — the residue the fuse does not bound (condition now satisfied)
+## 6. Cross-day starvation — invariant ADOPTED 2026-08-17, instrument re-chosen
 
 `Process` crash recovery rewinds to `resolving`, and a pass can fail on durable
 post-wire state updates (`FillWorkMetadata`, `InsertCandidates`,
@@ -149,38 +190,63 @@ the accepted safety invariant then deferring the per-job guard is reasonable, bu
 what remains deferred is a **cross-day starvation and liveness problem**, not
 cosmetic fairness.
 
-Reasons it is deferred rather than built now:
+**ADOPTED 2026-08-17: "one job may not occupy acquisition indefinitely" is a product
+invariant.** What follows is the design that survives measurement, and it is not the
+one this section previously sketched.
 
-1. The fuse bounds the per-day spend consequence, which was the urgent property.
-   What the per-job guard adds is that the offending job eventually dies rather
-   than merely being prevented from draining today's pool.
-2. It never actually delivers a hard per-job bound anyway: novel candidate
-   insertion and material metadata changes reset the episode, so a source
-   producing continuing low-value novelty keeps a job alive indefinitely.
-3. It carries a migration, a new terminal reason, transactionally coupled reset
-   semantics, adapter preflight changes, and grace-gate provenance — a large
-   surface for a fairness property.
-4. **Lease fencing is unresolved.** The store has `lease_owner` /
-   `lease_expires_at`, but `InsertCandidates` takes only a job ID and performs no
-   generation check. If a resolver call can outlive its lease, a stale pass can
-   insert a genuinely novel candidate and rearm the *current* holder's authority —
-   or consume it. "Same transaction as progress" is insufficient; it must be
-   *progress from the currently authorized pass*. Either prove lease expiry
-   cannot overlap live `Process` execution, or carry a pass token in every
-   authoritative charge and reset.
+**The attempt-count instrument is dead on arrival — measured, not argued.** Wire
+attempts per job in the operator's live store, for jobs that actually reached `ready`
+(163 of them): p50 **11**, p90 **29**, p99 **616**, max **1,376**. The worst
+non-terminal offender is **3,404**. The successful and pathological distributions
+overlap across more than a decimal order of magnitude, so no attempt-count kill
+threshold separates them: a cap low enough to bite the offenders would have destroyed
+a job that took 1,376 passes and *succeeded* — a lost paper, silently, which is the
+outcome class this project treats as unacceptable. Any future proposal here must
+re-run that measurement before proposing a number.
 
-Revisit when "one job may not occupy acquisition indefinitely" is adopted as a
-product invariant, or on an observable concentration signal — one job's share of a
-day's `credits_committed`, or repeated same-work passes visible in external logs.
+**So enforce the invariant on exclusion, not on lifetime.** The harm is not that a
+job lives long; it is that a job's spend *excludes other jobs* from the day's
+allowance. Restate it as: **no job may consume more than a fraction F of a source's
+daily allowance while another job is waiting on that source.** That is enforceable,
+it cannot destroy work — the hog is deferred to the next window, never retired — and
+it needs no new terminal reason, no adapter preflight, and no grace-gate provenance.
+
+**Mechanism, mirroring the fuse's own discipline (ADR-0024):** one monotone counter
+per `(job, source, UTC day)`, incremented in the *same transaction* as
+`CommitEgress`, never decremented and never reset by progress. Monotone is what
+dissolves the two blockers this section could not previously get past:
+
+- **Reset semantics disappear.** There is no progress-triggered reset to make
+  transactional, because the only legitimate reset is a **human resubmission** — an
+  authorized act, not an inferred signal. A source dribbling low-value novelty can no
+  longer keep a job's authority alive, which was the reason the original design could
+  not deliver a bound.
+- **Lease fencing stops being a blocker.** A stale pass's increment only ever moves
+  the counter *toward* the bound, so the failure mode is a little availability for the
+  hog — exactly ADR-0024's "availability is the safe failure mode". No generation
+  check, and no pass token, is required for correctness. (`InsertCandidates` still has
+  no generation check; that remains true and remains a separate concern, but this
+  design no longer depends on it.)
+
+**The gate is conditional on contention**, because the OpenAIRE smoke established
+that an unused hourly or daily allowance cannot be banked: if nothing else is waiting
+on that source, deferring the hog wastes allowance and helps nobody. Fairness only
+binds when there is somebody to be fair to.
+
+**If the strict reading is wanted as well** — every job eventually dies — it must key
+on a *typed* state, never a count: all candidates in permanently-dead states and no
+novel candidate across a bounded window. That is what the `unavailable` cooldown
+already approximates, so build it there if at all, and measure first.
+
+Superseded design, for the record: the earlier worked sketch (conditional SQL charge,
+progress-only reset via `InsertCandidates`' inserted-row count, a separate
+`retryProgressBasis`, a dedicated terminal reason, and the regression that crossing
+the ceiling must not make `atBoundary` true) is in git history at the third rewrite of
+this file. It is superseded by the measurement above, not by taste.
+
 **Do not rely on in-database telemetry of post-wire/pre-park failures as the
 trigger**: storage failure is precisely the condition that produces those failures
 *and* erases their record, so that signal is quietest exactly when it matters.
-Then frame it as exactly that: a job-liveness fuse, not the remainder of the
-OpenAlex incident fix. Its worked design (conditional SQL charge, progress-only
-reset via `InsertCandidates`' inserted-row count, a separate
-`retryProgressBasis`, prospective checking, a dedicated terminal reason, and the
-mandatory regression that crossing the ceiling must **not** make `atBoundary`
-true) is in git history at the third rewrite of this file.
 
 ## 7. Derive the effective basis explicitly, before novelty gating — **Not built: hop is opt-in, default off**
 
