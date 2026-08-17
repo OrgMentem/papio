@@ -26,6 +26,18 @@ vet:
 identity-corpus:
 	go run ./cmd/identity-corpus
 
+# Label the composite review file the candidate-binding measurement needs: the
+# proposer's flagged rows plus an audit sample it did NOT flag, which is what
+# bounds recall. One keystroke per row, resumable, saved after every answer.
+# Until these are labelled the composite arm measures nothing and "composites
+# are rare in this library" is unfalsifiable. Shows the extracted text the
+# identity rules actually read, not the rendered PDF, so a label cannot rest on
+# evidence the rule cannot see. Reads your own library — never commit the file.
+composite-labels: LABELS ?= dev/scratch/labels/composites.json
+composite-labels:
+	@test -f $(LABELS) || go run ./cmd/identity-corpus -candidates -composite-labels $(LABELS)
+	go run ./cmd/composite-label -labels $(LABELS)
+
 # Measure the yield of OpenAlex's title.search query shape against your own
 # papio store: accepted artifacts attributable to a title search, per
 # title.search credit spent. Free, read-only, no provider requests — see
