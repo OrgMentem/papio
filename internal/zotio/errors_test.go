@@ -37,6 +37,47 @@ func TestClassifyErrorTable(t *testing.T) {
 			wantHint:   "Zotero file storage refused upload (HTTP 413)",
 			wantStatus: 413,
 		},
+		{
+			// zotio HTML-escapes the separator in its reason text.
+			name:       "zotero storage quota html escaped",
+			err:        errors.New("zotio import apply failed"),
+			envelope:   json.RawMessage(`{"ok":false,"error":{"http_status":413,"message":"authorizing upload: File would exceed quota (300.4 &gt; 300)"}}`),
+			wantClass:  ErrorClassZoteroStorageQuota,
+			wantHint:   "Zotero storage plan is full (300.4 of 300 MB used)",
+			wantStatus: 413,
+		},
+		{
+			// The shape a real row holds, copied from the operator's exports
+			// ledger: zotio's "&gt;" with the "&" escaped again by
+			// encoding/json. The nested reason also carries a URL path, so this
+			// case additionally proves the hint survives sanitisation — an
+			// earlier version returned "" here because the raw reason contained
+			// slashes.
+			name:       "zotero storage quota as stored in the ledger",
+			err:        errors.New("Zotero HTTP 413"),
+			envelope:   json.RawMessage(`{"ok":false,"result":{"items":[{"status":"failed","reason":"attachment item 33ZSEDQ9 created but its file is not registered: authorizing upload: the upload exceeds the library owner's Zotero storage quota (HTTP 413): POST /items/33ZSEDQ9/file returned HTTP 413: File would exceed quota (300.4 \u0026gt; 300)"}]},"error":{"http_status":413}}`),
+			wantClass:  ErrorClassZoteroStorageQuota,
+			wantHint:   "Zotero storage plan is full (300.4 of 300 MB used)",
+			wantStatus: 413,
+		},
+		{
+			name:       "zotero storage quota bare separator",
+			err:        errors.New("zotio import apply failed"),
+			envelope:   json.RawMessage(`{"ok":false,"error":{"http_status":413,"message":"File would exceed quota (1024 > 1000)"}}`),
+			wantClass:  ErrorClassZoteroStorageQuota,
+			wantHint:   "Zotero storage plan is full (1024 of 1000 MB used)",
+			wantStatus: 413,
+		},
+		{
+			// A quota refusal Zotero did not put figures on is still a quota
+			// refusal; the class must not depend on the numbers parsing.
+			name:       "zotero storage quota without figures",
+			err:        errors.New("zotio import apply failed"),
+			envelope:   json.RawMessage(`{"ok":false,"error":{"http_status":413,"message":"upload exceeds the library owner's storage quota"}}`),
+			wantClass:  ErrorClassZoteroStorageQuota,
+			wantHint:   "Zotero storage plan is full",
+			wantStatus: 413,
+		},
 		{name: "field validation", err: errors.New("zotio stderr: Unknown item field 'abstractNote'"), wantClass: ErrorClassZoteroFieldValidation, wantHint: "unknown item field"},
 		{name: "mirror sync", err: errors.New("syncing Zotio library: upstream rejected request"), wantClass: ErrorClassMirrorSyncFailed, wantHint: "Zotio mirror sync failed"},
 		{name: "exec timeout", err: errors.New("zotio command timed out after 30s"), wantClass: ErrorClassZotioExecTimeout, wantHint: "Zotio command timed out"},

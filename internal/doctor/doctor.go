@@ -238,12 +238,23 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		case summary == nil || summary.count == 0:
 			add("zotero_file_storage_refused", Pass, "no recent Zotero apply failed with HTTP 413 file-storage refusal", "")
 		default:
-			detail := fmt.Sprintf("%d recent Zotero apply %s returned HTTP 413 (file storage refused the upload)",
-				summary.count, plural(summary.count, "failure", "failures"))
+			var detail string
+			if summary.quota > 0 {
+				detail = fmt.Sprintf("%d recent Zotero apply %s could not upload the file",
+					summary.count, plural(summary.count, "failure", "failures"))
+				if summary.hint != "" {
+					detail += ": " + summary.hint
+				} else {
+					detail += ": Zotero storage plan is full"
+				}
+			} else {
+				detail = fmt.Sprintf("%d recent Zotero apply %s returned HTTP 413 (file storage refused the upload)",
+					summary.count, plural(summary.count, "failure", "failures"))
+			}
 			if !summary.first.IsZero() {
 				detail += fmt.Sprintf("; first seen %s", summary.first.UTC().Format("2006-01-02"))
 			}
-			add("zotero_file_storage_refused", Warn, detail, zoteroFileStorageRefusedRemediation())
+			add("zotero_file_storage_refused", Warn, detail, zoteroFileStorageRefusedRemediation(summary.quota > 0))
 		}
 	}
 
@@ -476,6 +487,13 @@ const zoteroFileStorageRefusedRecency = 7 * 24 * time.Hour
 
 type zoteroFileStorageRefusedSummary struct {
 	count int
+	// quota counts the subset Zotero explained as a full storage plan, and
+	// hint carries its figures. Both classes are collected here because they
+	// are one operator situation — papers stopped reaching the library — and
+	// splitting them into two checks would report one as passing while the
+	// other fails.
+	quota int
+	hint  string
 	first time.Time
 }
 
@@ -509,7 +527,14 @@ func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store)
 			continue
 		}
 		info := zotio.ClassifyError(errors.New(recorded.Error), recorded.Zotio)
-		if info.Class != zotio.ErrorClassZoteroFileStorageRefused {
+		switch info.Class {
+		case zotio.ErrorClassZoteroStorageQuota:
+			summary.quota++
+			if summary.hint == "" {
+				summary.hint = info.Hint
+			}
+		case zotio.ErrorClassZoteroFileStorageRefused:
+		default:
 			continue
 		}
 		summary.count++
@@ -530,8 +555,11 @@ func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store)
 	return summary, nil
 }
 
-func zoteroFileStorageRefusedRemediation() string {
-	return `set attachment_mode = "linked-file" under [zotio] so papio links PDFs from its artifact store with no upload — linked files do not sync to other devices and break if the file moves; or check free space and quotas on the file store Zotero syncs to (often WebDAV) and whether Zotero's Sync pane reports the same HTTP 413 — papio will retry once upstream storage accepts uploads again`
+func zoteroFileStorageRefusedRemediation(quota bool) string {
+	if quota {
+		return `free space in Zotero by deleting large attachments you no longer need, or raise the storage plan; or set attachment_mode = "linked-file" under [zotio] so papio links PDFs from its own artifact store and needs no Zotero storage at all — linked files do not sync to other devices and break if the file moves. This is Zotero's own file storage, not a WebDAV target in Zotero's sync settings. Papio retries once uploads are accepted again`
+	}
+	return `check whether Zotero's own Sync pane reports the same HTTP 413 — if it does, the problem is upstream of papio; or set attachment_mode = "linked-file" under [zotio] so papio links PDFs from its artifact store with no upload — linked files do not sync to other devices and break if the file moves. Papio retries once uploads are accepted again`
 }
 
 func unresolvedEffectPermit(ctx context.Context, db *store.Store, now time.Time) (*unresolvedPermit, error) {

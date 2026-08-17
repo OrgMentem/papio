@@ -76,9 +76,52 @@ func TestRunWarnsOnRecentZoteroFileStorageRefusedApplies(t *testing.T) {
 		t.Fatalf("detail = %q, want first failure date", got.Detail)
 	}
 	for _, want := range []string{
-		"WebDAV",
+		"Sync pane",
 		"attachment_mode = \"linked-file\"",
 		"do not sync to other devices",
+	} {
+		if !strings.Contains(got.Remediation, want) {
+			t.Fatalf("remediation = %q, missing %q", got.Remediation, want)
+		}
+	}
+}
+
+// The operator's real rows carry Zotero's own sentence, and the check must
+// report that instead of an anonymous 413: a full plan and an unexplained
+// refusal have different remedies, and telling someone with their own WebDAV
+// server to inspect it when Zotero's plan is full wastes the one thing the
+// upstream response already settled.
+func TestRunReportsZoteroQuotaWhenZoteroExplainedIt(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	first := time.Now().UTC().Add(-24 * time.Hour)
+	seedFailedZotioApply(t, ctx, db, "job_quota_1", first.Format(time.RFC3339Nano), map[string]any{
+		"ok": false,
+		"error": map[string]any{
+			"http_status": 413,
+			"message":     "authorizing upload: File would exceed quota (300.4 > 300)",
+		},
+	})
+
+	got := zoteroFileStorageRefusedCheck(t, ctx, db)
+	if got.Status != Warn {
+		t.Fatalf("status = %q, want warn: %+v", got.Status, got)
+	}
+	if !strings.Contains(got.Detail, "storage plan is full (300.4 of 300 MB used)") {
+		t.Fatalf("detail = %q, want Zotero's own figures", got.Detail)
+	}
+	if strings.Contains(got.Remediation, "Sync pane") {
+		t.Fatalf("remediation = %q, must not send the operator upstream when Zotero named the cause", got.Remediation)
+	}
+	for _, want := range []string{
+		"free space in Zotero",
+		"attachment_mode = \"linked-file\"",
+		"not a WebDAV target",
 	} {
 		if !strings.Contains(got.Remediation, want) {
 			t.Fatalf("remediation = %q, missing %q", got.Remediation, want)

@@ -203,10 +203,15 @@ func WaitGuidanceWithOpenAction(state, reason, resolver, accessMode string, acti
 // back to the raw class name.
 func ExplainZotioImportError(errorClass string) (Explanation, bool) {
 	switch errorClass {
+	case zotio.ErrorClassZoteroStorageQuota:
+		return Explanation{
+			Category: "zotero_storage_quota_exceeded",
+			Guidance: "Papio has the paper and the PDF is safe in its own store; nothing is corrupted and nothing is lost. Your Zotero storage plan is full, so Zotero rejected the file upload and no further paper can be filed until space exists. Note this is Zotero's own file storage, reached through the Zotero API — it is not the same channel as a WebDAV target configured in Zotero's sync settings, which only syncs the Zotero app. Three ways out: set attachment_mode = \"linked-file\" under [zotio] so papio files papers by linking the PDF it already holds, with no upload and no Zotero storage at all (linked files do not sync to your other devices and break if the file moves); or free space in Zotero by deleting large attachments you no longer need; or raise the plan. Papio retries on its own once uploads are accepted again.",
+		}, true
 	case zotio.ErrorClassZoteroFileStorageRefused:
 		return Explanation{
 			Category: "zotero_file_storage_refused",
-			Guidance: "Papio has the paper and the PDF is safe in its store; nothing is corrupted. Zotero refused the file upload (HTTP 413 via the local Zotero API) — papio only knows the attachment file store rejected it, not whose disk or quota failed. Most likely your WebDAV sync target (or whatever backs Zotero file storage) is out of space or over its own quota; a per-request size limit on that server is also possible but unlikely here (a 3 MB upload succeeded while 700 KB and 428 KB ones failed, with the cutover on a single day). Check free space on your WebDAV host and whether Zotero's Sync pane reports the same failure — if Zotero sync also errors, the problem is upstream of papio. For a local-first setup, set attachment_mode = \"linked-file\" under [zotio] so papio links the PDF from its artifact store with no upload and no remote file storage — linked files do not sync to other devices and break if the file moves. Alternatively free space or raise limits on the file store Zotero syncs to, then papio will retry on its next import pass.",
+			Guidance: "Papio has the paper and the PDF is safe in its own store; nothing is corrupted. Zotero returned HTTP 413 for the file upload without naming a reason, so papio is not guessing one. Zotero says so explicitly when a storage plan is full, and this response did not, which leaves a size or request limit on whatever serves Zotero's file uploads as the likelier cause. Check whether Zotero's own Sync pane reports the same failure — if it does, the problem is upstream of papio. Setting attachment_mode = \"linked-file\" under [zotio] sidesteps uploads entirely by linking the PDF papio already holds (linked files do not sync to other devices and break if the file moves).",
 		}, true
 	default:
 		return Explanation{}, false

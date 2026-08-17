@@ -210,6 +210,32 @@ func TestNoIdentifierGuidanceNeverAsksForASignIn(t *testing.T) {
 	}
 }
 
+// A full Zotero plan is the case the operator actually hit, and the guidance
+// must not send them to inspect a WebDAV target: Zotero's sync settings and
+// its API file storage are different channels, and conflating them cost this
+// diagnosis a wrong turn.
+func TestExplainZotioImportErrorStorageQuota(t *testing.T) {
+	got, ok := ExplainZotioImportError("zotero_storage_quota_exceeded")
+	if !ok {
+		t.Fatal("ExplainZotioImportError returned false for zotero_storage_quota_exceeded")
+	}
+	if got.Category != "zotero_storage_quota_exceeded" {
+		t.Fatalf("category = %q, want zotero_storage_quota_exceeded", got.Category)
+	}
+	for _, want := range []string{
+		"PDF is safe",
+		"storage plan is full",
+		"not the same channel as a WebDAV target",
+		"attachment_mode = \"linked-file\"",
+		"do not sync to your other devices",
+		"retries on its own",
+	} {
+		if !strings.Contains(got.Guidance, want) {
+			t.Fatalf("guidance missing %q: %q", want, got.Guidance)
+		}
+	}
+}
+
 func TestExplainZotioImportErrorFileStorageRefused(t *testing.T) {
 	got, ok := ExplainZotioImportError("zotero_file_storage_refused")
 	if !ok {
@@ -223,9 +249,7 @@ func TestExplainZotioImportErrorFileStorageRefused(t *testing.T) {
 		"PDF is safe",
 		"nothing is corrupted",
 		"HTTP 413",
-		"WebDAV",
-		"3 MB upload succeeded",
-		"428 KB",
+		"not guessing",
 		"Sync pane",
 		"attachment_mode = \"linked-file\"",
 		"[zotio]",

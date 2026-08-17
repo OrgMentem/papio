@@ -19,6 +19,7 @@ import (
 const (
 	ErrorClassZoteroHTTP4xx            = "zotero_http_4xx"
 	ErrorClassZoteroFileStorageRefused = "zotero_file_storage_refused"
+	ErrorClassZoteroStorageQuota       = "zotero_storage_quota_exceeded"
 	ErrorClassZoteroFieldValidation    = "zotero_field_validation"
 	ErrorClassMirrorSyncFailed         = "mirror_sync_failed"
 	ErrorClassZotioExecTimeout         = "zotio_exec_timeout"
@@ -119,9 +120,17 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 
 	if status := zoteroHTTP4xxStatus(text, envelopes...); status != 0 {
 		if status == 413 {
-			// HTTP 413 is literally "Payload Too Large". Papio sees it relayed
-			// through the local Zotero API when the attachment file store refuses
-			// an upload; it cannot see whose disk, quota, or limit failed.
+			// HTTP 413 reads as "Payload Too Large", but Zotero returns it for a
+			// full storage plan too, and the size reading is the wrong one: a
+			// 3,040,464-byte upload succeeded while 428,128-byte ones failed
+			// after the plan filled. Zotero states which it is in the response
+			// body ("File would exceed quota (300.4 > 300)"), so classify from
+			// that text rather than re-deriving a cause papio cannot observe.
+			// Papio discarded this sentence for five days and reported an
+			// anonymous 4xx while every upload failed.
+			if quota := zoteroQuotaHint(text); quota != "" {
+				return safeErrorInfo(ErrorClassZoteroStorageQuota, quota, status)
+			}
 			return safeErrorInfo(ErrorClassZoteroFileStorageRefused, "Zotero file storage refused upload (HTTP 413)", status)
 		}
 		return safeErrorInfo(ErrorClassZoteroHTTP4xx, "Zotero HTTP "+strconv.Itoa(status), status)
@@ -183,6 +192,34 @@ func bundleValidationHint(lower string) string {
 	}
 }
 
+// zoteroQuotaHintRE captures the figures Zotero reports when a library's
+// storage plan is full, e.g. "File would exceed quota (300.4 > 300)". The
+// units are megabytes and Zotero omits them.
+//
+// The separator is matched in four encodings because the classifier reads raw
+// envelope JSON, and the bare ">" is the form least likely to appear. zotio
+// HTML-escapes it to "&gt;" in its reason text, and Go's encoding/json then
+// escapes the "&" again, so the operator's ledger actually holds
+// "\u0026gt;" — the doubly-escaped form, verified against a real row. Go
+// alone produces "\u003e". Matching only ">" dropped the figures silently and
+// left a hint with no numbers in it, and matching only the single escape still
+// missed every real row.
+var zoteroQuotaHintRE = regexp.MustCompile(`(?i)quota\s*\(\s*([0-9]+(?:\.[0-9]+)?)\s*(?:>|&gt;|\\u003e|\\u0026gt;)\s*([0-9]+(?:\.[0-9]+)?)\s*\)`)
+
+// zoteroQuotaHint reports a hint naming the storage plan as full, with
+// Zotero's own figures when it stated them. It returns "" when the text is a
+// 413 for some other reason, so the caller keeps the weaker class rather than
+// asserting a quota it did not observe.
+func zoteroQuotaHint(text string) string {
+	if !strings.Contains(strings.ToLower(text), "quota") {
+		return ""
+	}
+	if m := zoteroQuotaHintRE.FindStringSubmatch(text); m != nil {
+		return "Zotero storage plan is full (" + m[1] + " of " + m[2] + " MB used)"
+	}
+	return "Zotero storage plan is full"
+}
+
 func safeErrorInfo(class, hint string, status int) ErrorInfo {
 	return ErrorInfo{Class: class, Hint: SanitizeErrorHint(hint), HTTPStatus: status}
 }
@@ -193,6 +230,7 @@ func IsErrorClass(class string) bool {
 	switch class {
 	case ErrorClassZoteroHTTP4xx,
 		ErrorClassZoteroFileStorageRefused,
+		ErrorClassZoteroStorageQuota,
 		ErrorClassZoteroFieldValidation,
 		ErrorClassMirrorSyncFailed,
 		ErrorClassZotioExecTimeout,
