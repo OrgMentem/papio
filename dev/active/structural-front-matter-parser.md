@@ -1,364 +1,355 @@
-Status: design v1 (2026-08-17). Workstream 3 of the acquisition roadmap.
-Ungated by the first real-library candidate-set run (`dev/active/candidate-binding-measurement.md`,
-§First run, 2026-08-16). Read-only design; no implementation in this document.
-
-## Why this exists
-
-The measurement run settled a verdict the synthetic per-axis corpus could not reach:
-**286 of 286** conjunction-arm, target-absent pools produced **wrong binds**, flat at N=2 and
-N=25 (`dev/active/candidate-binding-measurement.md:344-359`). Every wrong bind passed all seven
-gates and terminated at `identifier-page-one` with evidence that the document “prints the
-requested DOI” — where that DOI is the one the document **cites** (`bridge.go:7578-7591`,
-`candidate_select.go:359-386`). Pool size is not the risk axis; **composition** is
-(`candidate-binding-measurement.md:361-369`).
-
-Independently, the pairwise instrument’s two surviving wrong accepts need **structural
-position**, not delimiter shape (`dev/identity-corpus.md:271-281`). Two instruments naming one
-missing capability is the strongest evidence this design targets the right defect
-(`candidate-binding-measurement.md:316-328`).
-
-## Problem statement
-
-Today’s rules answer: “Does this **phrase** appear as a delimited line?” and “Does this **token**
-appear in this **byte window**?” They do not answer: “Is this document **asserting** that it
-is work X, or **mentioning** work X?”
-
-That distinction is load-bearing because:
-
-- **Blind grab admission** — production reaches `SelectAutoBindCandidate` only when
-  `FrontMatterDOIs` over the **1 KiB** blind window is empty (`bridge.go:7573-7610`,
-  `identity.go:834-836`, `identity.go:805-807`). The adversary’s **own** DOI sits past that
-  window; the **cited** DOI sits inside page one (`candidates.go:847-853`,
-  `candidates.go:870-900`).
-- **Gate 5** — `corroboratingIdentifier(identityPageOne(excerpt), candidate.Work)` treats any
-  page-one occurrence of the candidate’s DOI as self-corroboration (`candidate_select.go:378-386`,
-  `identity.go:1008-1010`). `MatchIdentity` can corroborate over the **whole excerpt** up to
-  `MaxExcerpt` (`identity.go:287-288`, `semantic.go:36`, `semantic.go:188-192`).
-- **Title gate** — `candidateTitlePrintedAsLine` / `titlePrintedAsLine` accept a delimited
-  match in a **contents list** or **section heading** (`dev/identity-corpus.md:271-281`).
-
-The structural front-matter parser is the capability that assigns **roles** to spans inside
-the executable page-one window so gates can ask self-assertion questions instead of substring
-questions.
-
-## Executable window (what the parser reads)
-
-All candidate-binding gates and blind `FrontMatterDOIs` ultimately read text that has already
-been:
-
-1. Extracted by `pdftotext` (or OCR fallback when below `MinChars`) (`semantic.go:82-127`).
-2. Truncated to `MaxExcerpt` (**16 KiB**) for `report.Text.Excerpt` (`semantic.go:188-192`).
-3. Cut to **page one** at the first form feed, with leading blank-leaf trimming, then capped
-   (`identity.go:810-832`, `identity.go:867-869`).
-
-Three nested windows inside that excerpt matter today:
-
-| Window | Bytes | Used for |
-|--------|-------|----------|
-| Front matter (blind) | 1 KiB (`identityFrontMatterBytes`) | `FrontMatterDOIs`, `CheckConclusiveIdentity` (`identity.go:834-836`, `candidate_binding.go:55-64`) |
-| Byline | 2 KiB (`identityBylineBytes`) | Author, title, year, marker gates (`identity.go:854-856`, `candidate_select.go:147-148`) |
-| Page one | 4 KiB (`identityPageOneBytes`) | Identifier gate (`identity.go:867-869`, `candidate_select.go:379`) |
-
-The parser’s **primary input** should be `identityPageOne(excerpt)` — the same executable
-“page one” the identifier gate already uses (`identity.go:858-869`). Pairwise
-`MatchIdentity` title evidence uses the 2 KiB byline (`identity.go:108`, `identity.go:227`);
-corroboration can use whole excerpt to 16 KiB (`identity.go:287`). The parser should expose
-role queries on page one first; byline-only consumers can query a sub-view.
-
-**Extraction divergence (measurement vs production):** corpus loader uses
-`DefaultSemanticOptions()` (`MinChars` **1000**, `OCRPages` **3**) (`semantic.go:30-40`);
-daemon defaults `min_text_chars` **400**, `max_ocr_pages` **4**, OCR enabled
-(`config/config.go:592`, `bootstrap/bootstrap.go:330`). Both bound excerpt at 16 KiB
-(`candidate-binding-measurement.md:297-300`). Any parser increment must be graded with that
-divergence noted in the report, not assumed identical OCR paths.
-
-## Structural roles (vocabulary)
-
-Roles are assigned to **line spans** (contiguous line ranges) or **segments** (within-line
-runs from existing `wideGapSegments` / `bylineSegments` — `identity.go:548-577`,
-`identity.go:355-375`). They are hypotheses over plain text, not PDF geometry.
-
-### Positive roles (self-assertion band)
-
-| Role | Meaning | Typical cues in papio’s text layer |
-|------|---------|-------------------------------------|
-| `title_block` | Document’s own title line(s) | Early page-one position; largest standalone line block before author band; matches publisher title-wrap segments (`identity.go:426-454`) |
-| `author_byline` | Author / affiliation band | Between title block and abstract keywords; tokens used by `candidateAuthorTokenSet` (`candidate_select.go:473-527`) |
-| `own_identifier` | Document asserts **its** identifier | DOI/arXiv/PMID with publisher label (`doi:`, `DOI:`, `https://doi.org/`, `Article DOI:`) in masthead/footer band **outside** citation introducers; may use `documentDOIs` conclusive set in blind 1 KiB when complete (`identity.go:717-761`) |
-| `abstract_start` | Start of abstract body | Line matching `abstract` / `summary` heading; upper bound for title/byline scoping (already approximated in `candidateAuthorTokenSet` via keywords — `candidate_select.go:473-527`) |
-
-### Negative roles (defeat “printed as title” / “prints DOI”)
-
-| Role | Meaning | Why it matters |
-|------|---------|----------------|
-| `contents_list_entry` | Line inside a table of contents / outline | Pairwise wrong accept #1 (`dev/identity-corpus.md:273-274`) |
-| `section_heading` | Numbered or unnumbered section title | Pairwise wrong accept #2 (`dev/identity-corpus.md:274-275`) |
-| `reference_citation` | Bibliography / reference-list line | DOI in citation shape; must not corroborate candidate (`identity.go:990-995`) |
-| `citation_context` | In-body mention of another work | “Extended from …”, “cited in …”, parenthetical citation lines — conjunction adversary (`candidates.go:895`, `bridge.go:7583-7584`) |
-| `extended_from_marker` | Provenance / expansion line | Journal expansion printing target metadata + citing target DOI (`candidates.go:870-877`) |
-| `correction_about_other` | Document is *about* another work | `correctionMarkers` / `nonArticleMarkers` families (`identity.go:22-44`, `candidate_select.go:179-190`) — **0 trials** in first measurement run (`candidate-binding-measurement.md:390-392`) |
-
-### Document-kind (orthogonal to span roles)
-
-| Kind | Effect on gates |
-|------|-----------------|
-| `primary_article` | Default |
-| `non_article` | Hard disqualify (supplement, data sheet, etc.) — gate `non-article-marker` (`candidate_select.go:72-73`, `180-184`) |
-| `correction_or_comment` | Abstain for 1-of-N — gate `correction-marker` (`candidate_select.go:73-74`, `186-190`) |
-| `unknown` | Parser could not classify; gates must fail closed |
-
-Roles are **not** mutually exclusive at line level (a line can be both `section_heading` and
-contain a DOI); the parser returns the **strongest applicable negative role** for a candidate
-match span when adjudicating gates.
-
-## Self-asserted DOI vs cited DOI — concrete signals
-
-| Signal | Self-assertion evidence | Mention evidence | Papio today | Needs new extraction |
-|--------|-------------------------|------------------|-------------|----------------------|
-| **Window position** | Blind 1 KiB (`identityFrontMatter`) for *blind naming* only (`identity.go:805-807`) | Cited DOI in page-one body past 1 KiB but inside 4 KiB (`candidates.go:847-853`) | **Yes** — byte offset via `identityPageOne` vs `identityFrontMatter` | **Yes** — role “in blind band vs body band” is not a gate input today |
-| **Label proximity** | `DOI:`, `doi.org/`, `Article DOI:` on same line/segment (`conjunctionDocument` uses `Article DOI:` for own — `candidates.go:897`) | DOI after “Extended from”, “Available at”, “Erratum to” (`identity.go:46-57`, `candidates.go:895`) | **Partial** — regex finds DOI; introducer phrases are not classified | **Yes** — introducer + DOI pairing |
-| **Relative to byline / abstract** | Footer / masthead below abstract keywords | Mid-page provenance paragraph before abstract (`candidates.go:891-898`) | **Partial** — `abstract` keyword scoping exists for authors (`candidate_select.go:473-527`) | **Yes** — explicit region graph |
-| **Inside references region** | Rare on page one | Citation lines | **No** — whole-excerpt search unsafe for 1-of-N (`candidate_select.go:367-370`) | **Yes** — references band detector |
-| **Citation shape** | Standalone labeled identifier line | DOI embedded in sentence with citation verbs | **No** | **Yes** |
-| **Duplicate DOI roles** | One DOI labeled own, another cited | Conjunction: target DOI cited, `10.5555/...` own (`candidates.go:897`) | **Partial** — `documentDOIs` lists all; no role (`identity.go:717-761`) | **Yes** — per-occurrence classification |
-| **Slash-run verbatim** | `normalizeDOI` preserves suffix (`identity.go:639-658`) | Same | **Yes** | No |
-| **Line-break reconstruction** | `documentDOIs` matchable vs conclusive (`identity.go:702-708`) | Incomplete DOI must not blind-name | **Yes** | Parser should attach roles only to **conclusive** occurrences for blind naming |
-
-**Decision rule (gate input, not a second binding rule):** a candidate’s DOI corroborates only
-if at least one page-one occurrence is classified `own_identifier` **or** appears in
-`title_block`/`author_byline` with a publisher label and **no** overriding negative role on
-that span. An occurrence in `citation_context`, `contents_list_entry`, `section_heading`, or
-`reference_citation` **cannot** satisfy gate 5, even if `containsFlattenedToken` would match
-(`identity.go:897-933`).
-
-For **blind** `FrontMatterDOIs`, the parser should only promote DOIs to “conclusive blind
-identity” when they appear in `own_identifier` within the 1 KiB front-matter slice — **not**
-when they appear only as cited mentions in that slice. That is a coordinated ADR-0020 /
-three-artifact change if production blind naming changes; gate-5-only classification is the
-first increment (see Phasing).
-
-## Uncertainty — outcome vocabulary
-
-The parser must **fail closed**: “no confident self-assertion” routes to popup picker, inbox,
-and `MarkParkedNoIdentifier` — already correct shipped behaviour (`bridge.go:7609-7610`).
-
-### Parser-level outcomes (per document, not per candidate)
-
-| Outcome | Meaning | Downstream |
-|---------|---------|------------|
-| `parsed_ok` | Region graph built with stated confidence | Gates query roles |
-| `sparse_text` | Below useful structure (OCR noise, shattered columns) | All self-assertion queries → unknown; identifier gate → `Review` / abstain |
-| `no_confident_self_assertion` | No identifier span classified `own_identifier` | Gate 5 → `Review` (`candidate_select.go:380-383`); blind path unchanged if 1 KiB empty |
-| `ambiguous_own_identifier` | Multiple competing labeled DOIs in assertion band | Veto-compatible with `CheckConclusiveIdentity` multi-DOI (`candidate_binding.go:55-64`) |
-| `structure_unknown` | Could not separate TOC/headings from title block | Title/identifier gates treat candidate matches in unknown regions as **not** self-assertion |
-
-### Per-span classification (for measurement traces)
-
-| Label | Use |
-|-------|-----|
-| `self_asserted` | Span may support gate 5 or blind naming |
-| `mention` | Span may support metadata similarity but not corroboration |
-| `excluded` | Negative role active (TOC, heading, citation) |
-| `unclassified` | Do not use for accept paths |
-
-Gate traces should record **parser role at match site**, not replace `CandidateGate` constants
-(`candidate_select.go:71-78`) — extend `Evidence` strings and measurement export, not the gate
-enumeration, until a rule version bump warrants new gate IDs.
-
-## How this changes the seven gates
-
-Current order (`candidate_select.go:66-78`, `126-391`):
-
-1. `conclusive-veto` — blind 1 KiB DOIs (`candidate_select.go:139-144`)
-2. `non-article-marker` (`candidate_select.go:180-184`)
-3. `correction-marker` (`candidate_select.go:186-190`)
-4. `author-evidence` (`candidate_select.go:236-263`)
-5. `title-printed-as-line` (`candidate_select.go:301-306`)
-6. `year-token` (`candidate_select.go:338-357`)
-7. `identifier-page-one` (`candidate_select.go:378-386`)
-
-### Rejected: replace `identifier-page-one`
-
-Gate 5 is also the **only** gate that produces `Review` instead of hard abstain when metadata
-agrees but identifier is missing (`candidate_select.go:122-124`, `380-383`). Replacing it
-with a monolithic “parser gate” would collapse suggestive ranking into a single pass/fail
-or duplicate Review semantics. The measurement contract explicitly needs terminal gate +
-disposition (`candidate_select.go:96-107`).
-
-### Rejected: add an eighth gate before everything
-
-A standalone `structural-parser` gate that runs before author/title would force full parsing
-even when `conclusive-veto` or marker gates would abort early (`candidate_select.go:139-190`).
-It also splits “title printed as line” from “title in TOC” across two gates, duplicating
-segmentation work (`bylineSegments` vs parser). Gate count in the measurement plan is seven
-(`candidate-binding-measurement.md:76-78`); adding an eighth is a **rule version** and
-instrument migration without moving the conjunction arm until gate 5 still accepts citations.
-
-### **Chosen: feed existing gates (parser as shared substrate)**
-
-Introduce `ParseFrontMatter(pageOne string) FrontMatterParse` (name TBD) in `internal/pdf`,
-computed **once per excerpt** per `QualifyCandidate` call (or once per `SelectAutoBindCandidate`
-batch). Gates consult it:
-
-| Gate | Parser feed |
-|------|-------------|
-| `non-article-marker` / `correction-marker` | `document_kind` + span roles (erratum **heading** vs pointer footnote — `identity.go:614-620`) |
-| `title-printed-as-line` | Match must lie in `title_block`; reject if match span has `contents_list_entry` or `section_heading` |
-| `identifier-page-one` | `corroboratingIdentifier` only after filter: candidate DOI must match in `own_identifier` or labeled self band, not `mention` roles |
-| `conclusive-veto` | **Phase 2+** optional: blind 1 KiB `own_identifier` only — coordinated with `FrontMatterDOIs` (`identity.go:805-807`) |
-
-`MatchIdentity` / `titlePrintedAsLine` / pairwise corroboration consume the same parser for
-the two wrong accepts (`dev/identity-corpus.md:283-287`) without changing the 60% token gate
-(`identity.go:179-203`).
-
-## Layout / position data — feasibility (verified in source)
-
-**The text pipeline does not preserve x/y layout or font metadata.**
-
-- `ExtractText` runs `pdftotext` to stdout string (`semantic.go:90-94`) or OCR text
-  (`semantic.go:115-121`).
-- `textReport` stores a **byte-truncated** excerpt (`semantic.go:188-192`); no coordinates.
-- Page boundaries appear only as **form feed** `\f` in the string (`identity.go:825-826`).
-- Positional logic today is **line order**, **wide-gap splits**, and **byte windows**
-  (`identity.go:548-577`, `identity.go:810-832`) — not boxes.
-
-Therefore the parser **must** work from **plain text + line structure + segment boundaries**
-only. Feasibility is **confirmed**; dependence on PDF layout APIs is **out of scope** unless
-extraction is extended (new rule version, new measurement baseline).
-
-Implications:
-
-- TOC detection: numbered lines + indent/stack heuristics, “Contents” heading, not column x.
-- Section headings: short lines, numbering prefixes, following blank line — not font size.
-- Running heads: repeated identical early lines (already used in `candidateTitlePrintedAsLine`
-  — `candidate_select.go:536-537`).
-- Column interleaving failures remain **parser-opaque** (`dev/identity-corpus.md:261-262`).
-
-## Measurement
-
-Both instruments must grade each increment (`dev/identity-corpus.md:283-287`,
-`candidate-binding-measurement.md:316-328`):
-
-| Instrument | Command | Primary estimands |
-|------------|---------|-------------------|
-| Pairwise | `go run ./cmd/identity-corpus` | Wrong accepts (mismatched pairs `pass`); then own-metadata pass rate (`dev/identity-corpus.md:166-173`) |
-| Candidate-set | `go run ./cmd/identity-corpus -candidates` | **Wrong binds first**; then `missed-bind` on target-present unique pools (`dev/identity-corpus.md:317-322`, `candidate-binding-measurement.md:117-124`) |
-
-### Pass criteria (fixed before collecting after each increment)
-
-1. **Wrong accepts / wrong binds:** count must **not increase** vs baseline on the **same**
-   library and cache (`dev/identity-corpus.md:296-297`).
-2. **Conjunction arm, target-absent:** wrong binds must drop from **286/286** — the arm that
-   matters (`candidate-binding-measurement.md:348-359`). Target-present conjunction should
-   move from ambiguous multi-qualify (`candidate-binding-measurement.md:371-375`) toward
-   correct abstain or correct bind, measured separately.
-3. **Pairwise wrong accepts:** target **2 → 0** on reference library (`dev/identity-corpus.md:271-281`).
-4. **Correct passes / correct binds:** compared **only after** safety is flat or better
-   (`dev/identity-corpus.md:298-299`). Acceptable missed-bind budget: predeclared per
-   increment; today ~**85%** missed on random N=2 target-present (`candidate-binding-measurement.md:379-381`) — improvements are welcome but not required for safety increments.
-5. **Marker gates:** synthetic + real arms must produce **non-zero** trials for
-   `non-article-marker` and `correction-marker` (`candidate-binding-measurement.md:390-392`);
-   label 14 composite proposals + audit (`candidate-binding-measurement.md:396-398`).
-6. **Denominators:** per-document cluster bounds for safety; per-arm/N operational rates;
-   never one headline rate (`candidate-binding-measurement.md:232-247`).
-7. **Gate traces:** terminal gate + parser role at match site for conjunction failures.
-
-Report extraction divergence when corpus MinChars/OCR ≠ daemon (`identitycorpus/backlog.go:471-472`).
-
-## Phasing — one increment at a time
-
-Discipline: one measured increment; revert if wrong accepts/bindings rise; ship only what moves
-numbers (`dev/identity-corpus.md:289-301`).
-
-### Increment A (smallest move off 100% conjunction wrong-binds)
-
-**Citation-aware identifier gate only** — no TOC/heading yet.
-
-- Parse page one into coarse bands: `masthead/byline`, `body_before_abstract`, `abstract+`.
-- Classify each DOI occurrence: `own_identifier` if labeled `Article DOI:` / `DOI:` on its line
-  without citation introducer prefix; `mention` if on line matching introducers used in
-  conjunction synthesis (`Extended from`, etc. — `candidates.go:895`) or reference shape.
-- Change gate 5 only: call existing `corroboratingIdentifier` but **ignore** matches whose
-  span role is `mention` (`candidate_select.go:378-386`).
-
-**Expected measurement:** conjunction target-absent wrong binds **0**; marker gates still 0
-trials; pairwise wrong accepts still **2** until Increment B.
-
-### Increment B (pairwise wrong accepts + title gate)
-
-- Detect `contents_list_entry` and `section_heading` regions (heuristic TOC/heading bands).
-- Feed `title-printed-as-line` and `candidateTitlePrintedAsLine` (`candidate_select.go:301-306`,
-  `identity.go:426-454`).
-
-**Expected measurement:** pairwise wrong accepts **0**; conjunction still clean.
-
-### Increment C (marker gates + composites)
-
-- Feed `document_kind` for `correction-marker` / `non-article-marker` using parsed erratum
-  headings vs `correctionPointerPhrases` exclusion (`identity.go:46-57`, `identity.go:614-620`,
-  `candidate_select.go:186-190`).
-- Real composite labels + audit (`candidate-binding-measurement.md:396-398`).
-
-### Increment D (optional, coordinated product change)
-
-- Blind `FrontMatterDOIs` uses parser `own_identifier` in 1 KiB only — affects grab path
-  before candidate selection (`bridge.go:7573`, ADR-0020). **Not** required to fix conjunction
-  arm; separate gate and protocol review.
-
-Do **not** bundle A+B+C in one PR.
-
-## What this parser does **not** fix
-
-| Gap | Why |
-|-----|-----|
-| **Pool cap as safety lever** | Refuted: 100% wrong binds at all N (`candidate-binding-measurement.md:361-367`) |
-| **Majority auto-bind coverage** | ~85% missed binds when binding is “safe” (`candidate-binding-measurement.md:379-381`) |
-| **`conclusive-veto` at 0 trials** | Unreachable in DOI-less corpus by design (`candidate-binding-measurement.md:388-389`) |
-| **Unfilled arms** | `same-venue-year`, `title-superset` 0 eligible (`candidate-binding-measurement.md:393-395`) |
-| **Foreign arXiv/PMID blind veto** | DOI-only blind class (`identity.go:771-800`, `candidate_binding_test.go:216-220`) |
-| **Integration safety** | Eligibility pool, bind fence, ownership, concurrency (`candidate-binding-measurement.md:277-282`) |
-| **Slash-run foreign/same ambiguity** | `CheckConclusiveIdentity` parks (`identity.go:673-679`) |
-| **Books / output cap** | Corpus bias (`dev/identity-corpus.md:79-90`) |
-| **Column-shredded text layers** | No layout (`dev/identity-corpus.md:261-262`) |
-| **Whole-document bibliography** | Excerpt ends at 16 KiB; page two+ invisible to page-one rules (`candidate-binding-measurement.md:304-310`) |
-| **Operator backlog pool at settlement time** | Backlog arm is descriptive, not calibration (`candidate-binding-measurement.md:194-211`) |
-
-## Value case vs popup picker (do not overclaim)
-
-Even a **safe** `/2` rule is a **modest minority** win: the measurement quantified cost as
-~**85%** missed binds on random N=2 target-present vs 44 correct (`candidate-binding-measurement.md:379-381`). The win case is not “most PDFs file themselves” but **some**
-DOI-less grabs bind without a human when composition is benign — weighed against the **popup
-picker and inbox already shipped** (`bridge.go:7575-7610`, `candidate-binding-measurement.md:382-384`).
-
-Autonomous binding stays behind `autoBindDecisionEnabled` until integration gates pass
-(`bridge.go:7627-7634`, `candidate-binding-measurement.md:286-294`). The parser makes a
-**defensible** predicate possible; it does not by itself justify turning the decision on.
-
-## Contrary evidence and strongest risks
-
-| Risk | Source |
-|------|--------|
-| Heuristic TOC/heading detectors false-negative real titles (more missed binds) | Trade-off explicit in printed-title rule (`dev/identity-corpus.md:257-269`) |
-| Heuristic false-positive “mention” on real footer DOIs (new missed binds, not wrong binds) | 17/40 papers print own DOI below abstract (`identity.go:993-994`) — label + region rules must stay conservative |
-| Introducer phrase list incomplete | Conjunction uses one shape (`Extended from` — `candidates.go:895`); real publishers vary |
-| Marker gates need **labeled composites** | 0 trials without human labels (`candidate-binding-measurement.md:390-392`) |
-| Parser on OCR text differs from pdftotext | MinChars 400 vs 1000 (`semantic.go:34`, `config/config.go:592`) |
-
-## Implementation boundaries (for later workstreams)
-
-- Parser and gate feeds live in `internal/pdf` beside existing windows (`identity.go:871-878`).
-- Do not consolidate `internal/work` (version-preserving) with `internal/ownership`
-  (version-collapsing) (`candidate-binding-measurement.md:142-146`).
-- Wire/protocol changes only if blind `FrontMatterDOIs` semantics change (Increment D).
-- `CandidateBindingRule` bumps to `/3` when acceptance set changes (`candidate_select.go:39-47`).
-
-## References (load-bearing)
-
-- `identityPageOne` / windows: `identity.go:810-869`
-- `FrontMatterDOIs` 1 KiB blind: `identity.go:805-807`, `identity.go:834-836`
-- `corroboratingIdentifier` whole excerpt vs page one: `identity.go:287-288`, `identity.go:1008-1010`, `candidate_select.go:378-380`
-- Gates: `candidate_select.go:71-78`, `candidate_select.go:126-391`
-- Grab admission: `bridge.go:7573-7610`
-- Text excerpt: `semantic.go:30-40`, `semantic.go:188-192`
-- Measurement verdict: `candidate-binding-measurement.md:330-405`
-- Pairwise wrong accepts: `dev/identity-corpus.md:271-287`
+# Identity attribution for DOI-less binding (formerly "structural front-matter parser")
+
+Status: **design v2 (2026-08-17)** — synthesised from three independent reviews of v1.
+v1 was written by a single research unit and shipped unreviewed in `dd9c792`; it survived
+none of the three. Review artifacts:
+
+- Reviewer verdict **NEEDS REVISION** (7 findings) — `history://ParserDesignReview`
+- Factual anchor audit — `history://ParserAnchorAudit`
+- Independent competing design, GPT-5.6 Sol —
+  `dev/scratch/oracle/20260817T131434Z-parser-independent-design/answer.md`
+
+Every code claim below was re-verified against the tree during synthesis; anchors in v1 had
+drifted and are corrected here. **Nothing in this document is built.** It supersedes v1's
+design; v1's substrate survives where marked.
+
+## What changed from v1, and why
+
+v1 proposed a general front-matter parser with a vocabulary of positive and **negative** span
+roles (`contents_list_entry`, `citation_context`, …), and asked gates to reject a match whose
+span carried a negative role. Three independent objections converged on the same structural
+flaw and it is fatal to that polarity:
+
+> **v1 made safety depend on successfully detecting a mention.** A mention detector that misses
+> leaves the wrong accept exactly where it is. That makes every detector's recall a
+> library-integrity parameter, and v1 supplied no bound on any of them
+> (reviewer finding 4; v1 `:247-262` promised a "predeclared" budget and never declared one).
+
+v2 inverts the polarity. Attribution is **ternary** and only the positive class may authorise
+an autonomous bind:
+
+| Role | Meaning | May authorise a bind |
+|---|---|---|
+| `SELF` | the document asserts this span as its own identity | **yes** |
+| `MENTION` | the span refers to another work | no |
+| `UNKNOWN` | plain text does not justify either conclusion | no |
+
+Consequence, and the whole point: **failing to recognise a mention yields `UNKNOWN`, not
+`SELF`.** It costs a missed bind, never a wrong accept. The only dangerous error left is a
+**false `SELF`**, and that is bounded *by construction* rather than by a threshold — see
+§Bounding.
+
+The second change is scope. v1 was named for a parser and sized like one. The capability
+actually needed is narrower: **attribution over already-extracted text**, not document
+understanding. Renamed accordingly.
+
+The third change is sequencing: v2 puts a **cheap non-parser veto first**, with a predeclared
+stop rule that can end this workstream before any parser exists (§Increment 1, §Viability).
+
+## Corrections to v1's factual claims
+
+These are errors, not drift. v1's argument rested on the first two.
+
+1. **The 286/286 conjunction arm is a *synthetic regression*, not a real-library measurement.**
+   `conjunctionDocument` (`internal/identitycorpus/candidates.go:893-913`) *constructs* each
+   excerpt: it writes the target's title, authors and year as front matter, then a hard-coded
+   `Extended from <cited identifier>` line, then `Article DOI: <different own DOI>`.
+   The count is therefore trials of a hand-authored shape, and says **nothing about incidence
+   in the real grab stream**.
+   It is still valuable: its own comment (`:934-936`) calls the target-absent arm "the
+   reproduction of the withdrawn failure", so it models a **real observed defect**. Keep it as
+   a safety regression. Do not cite it as frequency evidence, and do not claim it converges
+   *independently* with the pairwise instrument — the pairwise wrong accepts are real PDFs
+   failing by a different mechanism (title *position*, `dev/identity-corpus.md:271-281`).
+   v1's "two instruments naming one capability is the strongest evidence" is withdrawn.
+
+2. **v1's Increment A was defeatable, and by one newline.** `isIdentitySpace`
+   (`internal/pdf/identity.go:975-981`) includes `'\n'`, and `containsFlattenedToken`
+   (`:902-933`) skips identity-space *mid-token* while matching. So `Extended from\nDOI:
+   10.x/target` puts the introducer on one line and the label on the DOI's line: a
+   line-scoped rule reads `own_identifier`, the flattened matcher still finds the target, and
+   the wrong bind survives. A wrapped DOI does the same.
+   **Requirement this creates:** attribution must be defined over the **flattened match
+   extent** — from the match's start byte to its end, spanning the newlines the matcher
+   skipped — plus multi-line context. `containsFlattenedToken` returns `bool` and exposes no
+   offsets, so an **offset-bearing match contract** is a prerequisite, not a detail. Coarse
+   region bands cannot satisfy this alone.
+
+3. **v1's Increment A covered only DOIs.** `corroboratingIdentifier` accepts arXiv and PMID
+   too, and the conjunction generator deliberately falls back to an `arXiv:` citation for a
+   Work with no DOI (`candidates.go:922-929`). An arXiv-only target-absent conjunction would
+   have passed v1's Increment A untouched. Attribution is defined over **every target-aware
+   identifier class**, and any unclassified match **fails closed**.
+
+4. **"Candidate selection has no notion of position" was too strong.** `candidate_select.go`
+   already scopes authors relative to a found title and requires a candidate title match to
+   precede the abstract, sit among the first few segments, and not recur elsewhere. That is
+   **ordinal** position, not semantic role. The real defect is narrower and survives: the
+   identifier gate runs `corroboratingIdentifier` over the 4 KiB page-one window, and that
+   helper is a target-aware token search that cannot distinguish self from cited.
+
+5. **Gate numbering was internally contradictory** — a spec defect, not a typo. v1 numbered
+   `identifier-page-one` as **7** in its own list, then said a mention "cannot satisfy gate 5",
+   that "gate 5" is the only gate yielding `Review`, and that Increment A should "change gate 5
+   only" while citing `candidate_select.go:378-386`. Read literally, Increment A edits
+   `title-printed-as-line`. v2 names gates by **constant**, never by ordinal.
+
+6. **Corrected anchors** (v1's bridge references were all stale):
+   `bridge.go:7573` → `7613`; `7573-7610` → `7613-7671`; `7578-7591` → `7613-7634`
+   (`Extended from` commentary at `7622-7629`); `7609-7610` → `7657-7659` (DOI-less park) or
+   `7670-7671` (mismatch park); `7627-7634` and `7618-7625` → `7637-7639` (call-site rationale)
+   plus `7682-7689` (flag declared false). Also: `identity.go:810-869` is partial
+   (`IdentityWindows` at `876-877`); the TOC evidence is at `dev/identity-corpus.md:271-281`,
+   not `257-269`; `Extended from` is at `candidates.go:908-910`, not `:895`.
+
+Verified unchanged from v1 and still load-bearing: `identityFrontMatterBytes` 1 KiB,
+`identityBylineBytes` 2 KiB, `identityPageOneBytes` 4 KiB; `identityWindow` trims leading
+whitespace/form-feed/BOM, cuts at the first form feed, then byte-caps; `MinChars` 1000 /
+`OCRPages` 3 / excerpt 16 KiB in `semantic.go` vs daemon 400 / 4 / OCR enabled;
+`CandidateBindingRule` = `/2` (`candidate_select.go:47`); the seven `CandidateGate` constants
+in order at `:71-78`; `FrontMatterDOIs` exported while every other identity helper
+(`identityPageOne`, `bylineSegments`, `wideGapSegments`, `corroboratingIdentifier`,
+`titlePrintedAsLine`) is **unexported** — so attribution must live **inside `internal/pdf`**.
+
+## New defect found during review (independent of this workstream)
+
+**`identityPageOne` is not page one for any OCR'd document.** `extractOCR`
+(`internal/pdf/semantic.go:254-273`) concatenates per-page Tesseract output with
+`all.WriteString(text)` and **inserts no form feed** between pages. `identityWindow` derives
+"page one" by cutting at the first form feed (`identity.go:825-826`); with none present, the
+window becomes the first 4 KiB of the **whole document**, silently including pages 2-4 —
+reference lists and other works' identifiers among them.
+
+This is live in production today: the daemon defaults to OCR enabled with `max_ocr_pages` 4.
+It is a pre-existing safety hole in the shipped identifier rule, wider than this workstream.
+Two consequences:
+
+- **No structure-derived `SELF` decision may run when `OCRUsed` is true**, until page
+  boundaries are trustworthy (Increment 7).
+- Fixing OCR page separators is **its own measured change** with its own baseline, and it
+  should be filed independently of this plan rather than bundled into it.
+
+## The capability
+
+`internal/pdf/identity_structure.go` — beside the lexical normalisation code, not inside it.
+Lexical identity answers *what* is printed; attribution answers *what role that span plays*;
+candidate selection decides whether the attributed evidence is enough to act.
+
+```go
+type AssertionRole uint8   // AssertionUnknown | AssertionSelf | AssertionMention
+type IdentityRegion uint8  // RegionUnknown | RegionIdentityFrame | RegionContents | RegionBody | RegionReferences
+
+type IdentitySpan struct {
+    Kind    SpanKind // title, DOI, arXiv, PMID
+    Start   int      // flattened match extent, not the containing line
+    End     int
+    Segment int
+    Region  IdentityRegion
+    Role    AssertionRole
+    Reason  string   // for measurement traces
+}
+```
+
+`StructuralSegment` derives from the same line folding and wide-gap recovery `bylineSegments`
+already uses — that machinery handles running heads and columns without treating single spaces
+as boundaries — but **must retain byte offsets**. `titleSegment` currently discards them,
+which is why requirement 2 above is a prerequisite.
+
+**No numeric confidence score.** Recognition uses finite predicates: exact structural headings
+(`abstract`, `keywords`, `contents`, `references`); numbered-heading syntax once the body has
+started; the existing title delimiter machinery; **adjacency** (a `SELF` title must anchor a
+plausible title→byline/affiliation sequence, not merely appear early); and **ambiguity** (two
+positions that independently look like the document's own title yield `UNKNOWN`, not a pick).
+
+`SELF` for an identifier requires positive structural evidence, initially only two forms:
+
+1. it occurs in the parsed identity frame on a metadata-shaped identifier segment; or
+2. it occupies a standalone page-one identifier line — essentially `DOI: <doi>` /
+   `https://doi.org/<doi>` or the target-aware arXiv/PMID equivalent — with no surrounding prose.
+
+Form 2 is what recovers part of the 17-of-40 population that prints its own DOI below the
+abstract (`identity.go:993-994`) without declaring "anything on page one is self".
+
+`MENTION` is assigned when the **region** establishes reference/contents/body provenance, or
+the identifier sits in an explicitly referential construction. Deliberately **not** a large
+introducer-phrase vocabulary: an incomplete mention lexicon must never create acceptance. It
+is a diagnostic, not the safety boundary. The positive `SELF` grammar is the boundary.
+
+**Delete, do not tune, the candidate-title `start <= 3` check.** It is an undocumented numeric
+structural cutoff in wrong-accept-critical code — exactly the free knob this design forbids. A
+masthead with four extracted segments before the real title and a section heading with two
+before it must not be separated by the integer 3; adjacency and ambiguity replace it.
+
+## Composition with the gates
+
+**Feed the existing gates.** A generic "structure ran" gate in front of everything is
+rejected: parser success is not evidence about a candidate, and running it before the
+`conclusive-veto` and marker gates forces full parsing where those abort early.
+
+One exception earns a new gate:
+
+```
+conclusive-veto → non-article-marker → correction-marker
+  → self-identifier-conflict (NEW) → author-evidence → title-printed-as-line
+  → year-token → identifier-page-one
+```
+
+`GateSelfIdentifierConflict` examines **every** positively `SELF`-attributed page-one
+identifier, not just occurrences of this candidate's. A document that `SELF`-asserts an
+identifier incompatible with the candidate **hard-abstains** that candidate.
+
+It must be a hard abstain, not `Review`, and this is measured, not aesthetic:
+`SelectAutoBindCandidate` returns `"ambiguous: qualifier alongside review"` whenever any
+candidate reviews **alongside** a qualifying one (`candidate_select.go:703-704`). In the
+target-present conjunction case the cited-work candidate must **hard-fail** so the real
+candidate can still qualify; a `Review` there poisons it and reproduces today's all-abstain
+result (`candidate-binding-measurement.md:371-375`).
+
+Kept separate from `CheckConclusiveIdentity` on purpose: that veto's contract is the
+conclusive DOI set from the blind 1 KiB window with slash-preserving comparison
+(`candidate_binding.go:55-64`). Widening it would couple blind naming to targeted matching.
+
+Per gate:
+
+| Gate | Change |
+|---|---|
+| `author-evidence` | consume the byline attached to the unique `SELF`-title anchor; report "no structural byline" rather than falling back to a bag of pre-abstract tokens |
+| `title-printed-as-line` | `structure.SelfTitle(...)` replaces `candidateTitlePrintedAsLine`; a title-shaped section heading or TOC entry is `MENTION`/`UNKNOWN`, never a pass. This is the piece later shared with `MatchIdentity` for the two pairwise survivors |
+| `year-token` | read the year from the identity frame/byline block, not an independently sliced window; keep the existing posture where a year conflict independently disqualifies |
+| `identifier-page-one` | **stays last and keeps its `Review` disposition.** Asks: is there a `SELF` occurrence of one of this candidate's target-aware identifiers? `MENTION` → `Review(identifier_only_mentioned_on_page_one)`; `UNKNOWN` → `Review(identifier_role_unknown_on_page_one)` |
+
+Acceptance-set change ⇒ `CandidateBindingRule` bumps to `/3`.
+
+## The blind 1 KiB path does not change
+
+v1's Increment D is **dropped**. `FrontMatterDOIs` stays exactly as it is: DOI-only,
+conclusive-only, targetless. Two independent reasons:
+
+- Its contract is that reconstruction may *confirm* a known target but may never *manufacture*
+  an identifier for a targetless capture. That is a different acceptance question, needing a
+  targetless false-mint corpus and its own thresholds.
+- Production performs blind naming **before** entering the DOI-less candidate branch
+  (`bridge.go:7613-7615`). Changing blind reachability while measuring the candidate rule would
+  move the population underneath the measurement.
+
+A later `blind_identity/2` may revisit this. It is not this workstream.
+
+## Increments and predeclared pass criteria
+
+One increment at a time; each revertible on a safety regression; criteria fixed **before**
+collecting.
+
+| # | Change | Predeclared criterion |
+|---|---|---|
+| **0** | none — capture baselines, fixed seed/flags, and separately under daemon-equivalent `MinChars`/OCR | baselines captured; **no release conclusion** if the two extraction settings differ materially |
+| **1** | **page-one multi-DOI ambiguity veto** — no parser at all: a candidate reaching corroboration cannot auto-bind if page one conclusively prints multiple distinct DOIs | conjunction target-absent **286/286 → 0**; every currently clean real cell stays at 0; target-present coverage **≥10%** of unique eligible documents or **stop** (§Viability) |
+| **2** | attribution computed and traced, **decisions unchanged** | selector outcomes **identical** to Increment 1; both known pairwise false-title spans classify non-`SELF`; each conjunction's cited identifier classifies non-`SELF` **or** its own DOI classifies `SELF`; report what fraction of the 17-of-40 late own-DOI cases classify `SELF` |
+| **3** | `GateSelfIdentifierConflict` replaces the coarse veto | 0 conjunction target-absent wrong binds; 0 new wrong-bind documents anywhere; must **recover ≥1 correct bind** lost by Increment 1, or the added complexity is deleted |
+| **4** | `SELF` title/byline feed `title-printed-as-line` / `author-evidence`; same attribution applied experimentally to pairwise `MatchIdentity` | pairwise wrong accepts **2 → 0**; no new candidate wrong binds; pairwise own-document pass falls by **≤1 percentage point** on the same corpus, else revert to candidate-only |
+| **5** | identifier gate accepts **only** `SELF` | 0 wrong binds in every target-absent cell and every named adversarial construction; coverage **≥10%** of unique target-present eligible documents |
+| **6** | one attested `SELF` recovery form per increment (e.g. a specific late footer-DOI grammar) | each must recover **≥1 unique correct bind**, add **0** wrong binds and **0** pairwise wrong accepts; a no-op is deleted |
+| **7** | OCR page boundaries preserved, structure enabled on OCR, then grab admission / pool construction / bind fence | same zero-wrong criteria under **production** extraction; no enabling flag until integration passes |
+
+Additional gates on the whole sequence, from review:
+
+- **Marker gates** (`non-article-marker`, `correction-marker`) recorded **0 trials** in the
+  first run (`candidate-binding-measurement.md:390-392`). Release is gated on labelling the
+  **14 composite proposals + 25 audit rows** — the one irreducibly human hour
+  (`:396-398`). Until then, no claim about real-world composites.
+- **Per-role budgets are required, not optional.** A labelled, held-out role set must include
+  real footer-DOI placements and true titles that resemble headings and TOC entries, with
+  per-role false-positive/false-negative and abstention budgets. Aggregate pass counts cannot
+  identify *which* detector regressed, and an all-`UNKNOWN` parser trivially satisfies a
+  wrong-accept bar.
+- "Zero observed" is a **regression bar**, not a probability claim. Only 293 documents survived
+  into scored pools in the first run; this corpus cannot substantiate a small production
+  corruption rate. `autoBindDecisionEnabled` (`bridge.go:7682-7689`) stays **off** after all
+  increments unless evidence beyond this one library justifies it.
+
+## Bounding the two error directions
+
+No "structure confidence threshold" is exposed — that would recreate the defect.
+
+| Error | Cost | Bound |
+|---|---|---|
+| false `MENTION` / missed `SELF` | missed bind | ≥10% coverage floor; ≤1pp pairwise pass loss for shared changes |
+| missed `MENTION` | **`UNKNOWN`, so a missed bind** — cannot preserve today's wrong accept | polarity, by construction |
+| **false `SELF`** | **wrong accept** | finite positive grammar with no score; new forms one at a time, each earning ≥1 correct bind; ambiguous title anchors → `UNKNOWN`; foreign `SELF` identifier is negative evidence; no `SELF` on OCR until Increment 7; zero-wrong retained at every step |
+
+The safety parameter is therefore **the reviewable, versioned set of implemented positive
+`SELF` forms** — not an integer someone can quietly move from 0.72 to 0.65.
+
+## Viability — the stop rule
+
+Auto-binding today is a minority win: random N=2 produced **44 correct** against **249 missed**
+(~85% abstention) *before* any of this tightening
+(`candidate-binding-measurement.md:379-381`). The safe fallback — popup picker and inbox — is
+**already shipped** (`bridge.go:7613-7671`).
+
+So the sequence carries an explicit stop rule: **run Increment 1 first.** If safe
+target-present coverage is already below the 10% floor, **do not build attribution for
+autonomous binding at all.** Use qualification and structure to **rank the popup picker**
+instead, and leave binding human-confirmed. Bad ranking is visible and reversible; wrong
+autonomous acceptance is neither.
+
+The 10% floor is a **product-policy choice**, not derivable from this corpus — the value is
+open to revision, its existence is not.
+
+That 61.1% of the real corpus was DOI-less makes the *admission path* important; it does not
+make *automatic resolution inside it* valuable. Different questions.
+
+## Adversarial shape that defeats this design
+
+Page one, after extraction, of a related-work expansion:
+
+```text
+<same title as candidate>
+<same authors>
+
+Abstract
+...
+
+DOI: 10.1234/TARGET
+```
+
+with the sentence establishing the relationship lost to text ordering (a visually separate
+box), and the document's **own** DOI on page two, beyond the 4 KiB window.
+
+The standalone `DOI: TARGET` line satisfies `SELF` form 2. No foreign page-one `SELF`
+identifier contradicts it. If title, authors and year genuinely agree, every gate agrees, and
+it **wrong-binds**.
+
+Both covers are refused, deliberately:
+
+- Tightening `SELF` to "identifier structurally tied to the identity frame" sacrifices the
+  17-of-40 late-own-DOI population — the reason page-one corroboration exists at all.
+- Searching page two collides with the 16 KiB excerpt cap and with the OCR page-boundary
+  defect above.
+
+So it is **documented as an unsupported shape and left at `Review`**. Recovering it means
+multi-page structural extraction: a new capability with its own measurement, not another
+exception bolted onto `SELF`.
+
+## Preserved from v1 (still verified)
+
+- **No layout data exists.** `ExtractText` yields a `pdftotext`/OCR string; `textReport` stores
+  a byte-truncated excerpt; no coordinates or font metadata. Attribution must work from text,
+  line structure and segment boundaries only. TOC detection from numbered lines and indent
+  stacks, not column x; headings from short lines, numbering prefixes and following blanks, not
+  font size; running heads from repeated early lines.
+- **Do not consolidate** `internal/work` (version-preserving) with `internal/ownership`
+  (version-collapsing); preserve DOI slash runs. Attribution receives hits produced under
+  existing identifier semantics and classifies their surroundings — it changes **no**
+  equivalence relation.
+- **What this does not fix:** pool cap as a safety lever (refuted); majority auto-bind
+  coverage; `conclusive-veto` at 0 trials; unfilled `same-venue-year` / `title-superset` arms;
+  foreign arXiv/PMID blind veto; integration safety (eligibility pool, bind fence, ownership,
+  concurrency); slash-run foreign/same ambiguity; books/output cap; column-shredded text
+  layers; whole-document bibliography past 16 KiB; backlog arm as calibration.
+
+## Open before implementation
+
+1. **Pro adversarial review of this v2** — commissioned; this document is the input.
+2. The **10% viability floor** is a product decision and needs the operator's number.
+3. The **OCR form-feed defect** should be filed as its own change before Increment 7 depends
+   on it.
