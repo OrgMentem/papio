@@ -362,10 +362,16 @@ Three changes here are corrections, not reordering, and each has a reason:
 
 Additional gates on the whole sequence:
 
-- **Marker gates** (`non-article-marker`, `correction-marker`) recorded **0 trials** in the
-  first run (`candidate-binding-measurement.md:390-392`). Release is gated on labelling the
-  **15 composite proposals + 25 audit rows** (`make composite-labels`) — the one irreducibly
-  human step (`:396-398`). Until then, no claim about real-world composites.
+- **Real-library composite labelling is complete (2026-08-17).** The operator reviewed all
+  **15 signal proposals + 25 random audit rows** (`make composite-labels`): every document was
+  the article/item its metadata purported it to be, so all 40 labels are `not-composite`.
+  Re-running the composite arm produced **0 confirmed composites**, **0 missed in the 25-row
+  audit**, and therefore **0 adversarial pools**. This establishes only a prevalence interval:
+  observed lower bound 0%; audit-bounded upper bound **11.04%** overall and **11.29%** among
+  unflagged documents (exact one-sided 95%). It does **not** establish that the class is absent
+  and does **not** test an authorising `SELF` classifier against a positive composite. Release
+  therefore still requires the predeclared held-out positive shapes below; the library arm is
+  recorded as **not measured for classifier safety**, never passed.
 - **Per-role criteria must be numeric and fixed before labels are collected.** For an
   authorising role: **any** observed held-out false `SELF` is an automatic failure. Sample
   insufficiency is reported as **not measured**, never as pass. The held-out set must include
@@ -541,8 +547,10 @@ unavailable, therefore this page-one standalone DOI stays `UNKNOWN`" is coherent
 
 1. **The viability floor's value** is a product decision and needs the operator's number. 10%
    was proposed; its placement (Increment 5, frozen denominator) is settled, its value is not.
-2. **Composite labelling** — `make composite-labels`, 15 proposals + 25 audit rows. Gates every
-   real-world claim about this failure class, and can only be done by the operator.
+2. **Composite labelling — complete.** All 15 proposals and 25 audit rows were
+   `not-composite`. The prevalence bound is recorded above; because it yielded no positives,
+   held-out positive composite shapes remain a release prerequisite rather than a claim this
+   library can substantiate.
 3. **Whether to build at all — answered "yes, narrowly", on §The authorisation ceiling.** Three
    of four reviews were adverse, each on a different architectural flaw, so the prior was
    rightly "probably not". The ceiling measurement moved it: the identity-frame population is
