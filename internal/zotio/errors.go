@@ -18,6 +18,7 @@ import (
 // the Zotio boundary. They are safe to persist and show to a local CLI user.
 const (
 	ErrorClassZoteroHTTP4xx            = "zotero_http_4xx"
+	ErrorClassZoteroFileStorageRefused = "zotero_file_storage_refused"
 	ErrorClassZoteroFieldValidation    = "zotero_field_validation"
 	ErrorClassMirrorSyncFailed         = "mirror_sync_failed"
 	ErrorClassZotioExecTimeout         = "zotio_exec_timeout"
@@ -117,6 +118,12 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 	lower := strings.ToLower(text)
 
 	if status := zoteroHTTP4xxStatus(text, envelopes...); status != 0 {
+		if status == 413 {
+			// HTTP 413 is literally "Payload Too Large". Papio sees it relayed
+			// through the local Zotero API when the attachment file store refuses
+			// an upload; it cannot see whose disk, quota, or limit failed.
+			return safeErrorInfo(ErrorClassZoteroFileStorageRefused, "Zotero file storage refused upload (HTTP 413)", status)
+		}
 		return safeErrorInfo(ErrorClassZoteroHTTP4xx, "Zotero HTTP "+strconv.Itoa(status), status)
 	}
 	if strings.Contains(lower, "unknown item field") {
@@ -185,6 +192,7 @@ func safeErrorInfo(class, hint string, status int) ErrorInfo {
 func IsErrorClass(class string) bool {
 	switch class {
 	case ErrorClassZoteroHTTP4xx,
+		ErrorClassZoteroFileStorageRefused,
 		ErrorClassZoteroFieldValidation,
 		ErrorClassMirrorSyncFailed,
 		ErrorClassZotioExecTimeout,

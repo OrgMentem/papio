@@ -160,7 +160,24 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 	if existing, err := s.recordedPlan(ctx, idempotencyKey); err != nil {
 		return nil, err
 	} else if existing != nil {
-		return existing, nil
+		stale, err := s.planManifestUnresolved(existing)
+		if err != nil {
+			return nil, err
+		}
+		if stale {
+			// Safe to invalidate: an unresolved manifest entry means Zotio
+			// selected zero import operations (selected=0, planned=0), so no
+			// Zotero mutation was attempted for this cached routing decision.
+			// That is unlike ambiguous apply, where the mutation may have
+			// succeeded before the deadline and invalidating would let PlanJobs
+			// re-derive a fresh mutation for the same file, risking duplicate
+			// attachment or duplicate library entry.
+			if err := s.invalidatePlan(ctx, existing); err != nil {
+				return nil, err
+			}
+		} else {
+			return existing, nil
+		}
 	}
 
 	plan := &Plan{
@@ -252,8 +269,19 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	if err := verifyFileSHA256(plan.ArtifactPath, plan.ArtifactSHA256); err != nil {
 		return nil, fmt.Errorf("verifying planned artifact: %w", err)
 	}
-	idempotencyKey := "zotio_apply:" + plan.ID + ":" + confirmation
 	ledgerCtx := context.WithoutCancel(ctx)
+	if stale, err := s.planManifestUnresolved(plan); err != nil {
+		return nil, err
+	} else if stale {
+		// Same nothing-attempted reasoning as the cached-plan path in planJob:
+		// unresolved means Zotio never selected an import operation for this
+		// manifest, so invalidating cannot discard a partial Zotero write.
+		if err := s.invalidatePlan(ledgerCtx, plan); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("cached Zotio plan %s references an unresolved manifest; replan required", plan.ID)
+	}
+	idempotencyKey := "zotio_apply:" + plan.ID + ":" + confirmation
 	if existing, err := s.recordedApply(ledgerCtx, idempotencyKey); err != nil {
 		return nil, err
 	} else if existing != nil {
@@ -565,10 +593,69 @@ func (s *Service) resolveManifest(ctx context.Context, plan *Plan, w work.Work) 
 		return "", importManifest{}, err
 	}
 	manifestPath := filepath.Join(manifestDir, plan.JobID+"-"+plan.ArtifactSHA256+".json")
+	if err := s.removeStaleUnresolvedManifest(manifestPath); err != nil {
+		return "", importManifest{}, err
+	}
 	if err := atomicPrivateWrite(manifestPath, append(manifestJSON, '\n')); err != nil {
 		return "", importManifest{}, err
 	}
 	return manifestPath, manifest, nil
+}
+
+func manifestIsUnresolved(manifest importManifest) bool {
+	if len(manifest.Entries) != 1 {
+		return true
+	}
+	return manifest.Entries[0].Status != "resolved"
+}
+
+func (s *Service) loadManifestAt(path string) (importManifest, error) {
+	if path == "" {
+		return importManifest{}, fmt.Errorf("empty Zotio manifest path")
+	}
+	if filepath.Dir(path) != filepath.Join(s.DataDir, "zotio", "manifests") {
+		return importManifest{}, fmt.Errorf("Zotio manifest path is outside the private manifest directory")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return importManifest{}, err
+	}
+	var manifest importManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return importManifest{}, fmt.Errorf("decoding Zotio import manifest: %w", err)
+	}
+	return manifest, nil
+}
+
+func (s *Service) planManifestUnresolved(plan *Plan) (bool, error) {
+	if plan == nil || plan.ManifestPath == "" {
+		return false, nil
+	}
+	manifest, err := s.loadManifestAt(plan.ManifestPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return true, nil
+		}
+		return false, err
+	}
+	return manifestIsUnresolved(manifest), nil
+}
+
+func (s *Service) removeStaleUnresolvedManifest(path string) error {
+	manifest, err := s.loadManifestAt(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !manifestIsUnresolved(manifest) {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func manifestRoute(manifest importManifest) (route, parent string, err error) {

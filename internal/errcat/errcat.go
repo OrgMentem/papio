@@ -11,6 +11,7 @@ import (
 	"papio/internal/app"
 	"papio/internal/config"
 	"papio/internal/job"
+	"papio/internal/zotio"
 )
 
 // Explanation is an actionable interpretation of a job's state: a short, stable
@@ -195,6 +196,21 @@ func explainNoAccess(resolver, accessMode string, cfg config.Config) Explanation
 // a live action supersedes the reason recorded when the job first parked.
 func WaitGuidanceWithOpenAction(state, reason, resolver, accessMode string, actions []job.HumanAction, cfg config.Config) string {
 	return renderWaitGuidance(state, ExplainWithOpenAction(state, reason, resolver, accessMode, actions, cfg))
+}
+
+// ExplainZotioImportError maps a durable zotio.auto_import error_class to
+// operator-facing guidance. Unknown classes return false so callers can fall
+// back to the raw class name.
+func ExplainZotioImportError(errorClass string) (Explanation, bool) {
+	switch errorClass {
+	case zotio.ErrorClassZoteroFileStorageRefused:
+		return Explanation{
+			Category: "zotero_file_storage_refused",
+			Guidance: "Papio has the paper and the PDF is safe in its store; nothing is corrupted. Zotero refused the file upload (HTTP 413 via the local Zotero API) — papio only knows the attachment file store rejected it, not whose disk or quota failed. Most likely your WebDAV sync target (or whatever backs Zotero file storage) is out of space or over its own quota; a per-request size limit on that server is also possible but unlikely here (a 3 MB upload succeeded while 700 KB and 428 KB ones failed, with the cutover on a single day). Check free space on your WebDAV host and whether Zotero's Sync pane reports the same failure — if Zotero sync also errors, the problem is upstream of papio. For a local-first setup, set attachment_mode = \"linked-file\" under [zotio] so papio links the PDF from its artifact store with no upload and no remote file storage — linked files do not sync to other devices and break if the file moves. Alternatively free space or raise limits on the file store Zotero syncs to, then papio will retry on its next import pass.",
+		}, true
+	default:
+		return Explanation{}, false
+	}
 }
 
 func renderWaitGuidance(state string, exp Explanation) string {

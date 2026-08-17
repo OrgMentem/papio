@@ -228,6 +228,25 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		}
 	}
 
+	if db == nil {
+		add("zotero_file_storage_refused", Skip, "Zotero file-storage upload refusals are checked by the daemon", "")
+	} else {
+		summary, err := recentZoteroFileStorageRefusedApplies(ctx, db)
+		switch {
+		case err != nil:
+			add("zotero_file_storage_refused", Warn, "recent Zotero file-storage upload refusals could not be read from the exports ledger", "inspect database permissions")
+		case summary == nil || summary.count == 0:
+			add("zotero_file_storage_refused", Pass, "no recent Zotero apply failed with HTTP 413 file-storage refusal", "")
+		default:
+			detail := fmt.Sprintf("%d recent Zotero apply %s returned HTTP 413 (file storage refused the upload)",
+				summary.count, plural(summary.count, "failure", "failures"))
+			if !summary.first.IsZero() {
+				detail += fmt.Sprintf("; first seen %s", summary.first.UTC().Format("2006-01-02"))
+			}
+			add("zotero_file_storage_refused", Warn, detail, zoteroFileStorageRefusedRemediation())
+		}
+	}
+
 	// The counterpart to going quiet. An action papio has stopped volunteering
 	// is still the user's to finish, so the queue must not become invisible
 	// just because it stopped being noisy.
@@ -448,6 +467,71 @@ func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.D
 		return n, 0, nil
 	}
 	return n, time.Since(created), nil
+}
+
+// zoteroFileStorageRefusedRecency is how long a failed Zotero apply in the
+// exports ledger still reads as an active file-storage refusal. Once the
+// operator fixes upstream storage, older failed rows remain but age out here.
+const zoteroFileStorageRefusedRecency = 7 * 24 * time.Hour
+
+type zoteroFileStorageRefusedSummary struct {
+	count int
+	first time.Time
+}
+
+// recentZoteroFileStorageRefusedApplies scans failed zotio_apply rows in the exports
+// ledger and re-classifies them from the durable hint plus Zotio envelope.
+func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store) (*zoteroFileStorageRefusedSummary, error) {
+	cutoff := time.Now().UTC().Add(-zoteroFileStorageRefusedRecency).Format(time.RFC3339Nano)
+	rows, err := db.DB().QueryContext(ctx, `
+		SELECT created_at, result_json
+		FROM exports
+		WHERE kind = 'zotio_apply'
+		  AND json_extract(result_json, '$.status') = 'failed'
+		  AND created_at >= ?
+		ORDER BY created_at`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	summary := &zoteroFileStorageRefusedSummary{}
+	for rows.Next() {
+		var createdAt, raw string
+		if err := rows.Scan(&createdAt, &raw); err != nil {
+			return nil, err
+		}
+		var recorded struct {
+			Error string          `json:"error"`
+			Zotio json.RawMessage `json:"zotio"`
+		}
+		if err := json.Unmarshal([]byte(raw), &recorded); err != nil {
+			continue
+		}
+		info := zotio.ClassifyError(errors.New(recorded.Error), recorded.Zotio)
+		if info.Class != zotio.ErrorClassZoteroFileStorageRefused {
+			continue
+		}
+		summary.count++
+		parsed, err := time.Parse(time.RFC3339Nano, createdAt)
+		if err != nil {
+			continue
+		}
+		if summary.first.IsZero() || parsed.Before(summary.first) {
+			summary.first = parsed
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if summary.count == 0 {
+		return nil, nil
+	}
+	return summary, nil
+}
+
+func zoteroFileStorageRefusedRemediation() string {
+	return `set attachment_mode = "linked-file" under [zotio] so papio links PDFs from its artifact store with no upload — linked files do not sync to other devices and break if the file moves; or check free space and quotas on the file store Zotero syncs to (often WebDAV) and whether Zotero's Sync pane reports the same HTTP 413 — papio will retry once upstream storage accepts uploads again`
 }
 
 func unresolvedEffectPermit(ctx context.Context, db *store.Store, now time.Time) (*unresolvedPermit, error) {

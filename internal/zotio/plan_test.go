@@ -1182,3 +1182,98 @@ func TestImportBackfillClassifiesNoRoutingIdentifier(t *testing.T) {
 		t.Fatalf("class=%d reason=%q, want expected_fail and %q", class, reason, newItemRoutingRefusal)
 	}
 }
+
+func TestStaleUnresolvedManifestReplansInsteadOfFailing(t *testing.T) {
+	resolvedManifest := `{"schema_version":2,"entries":[{"path":"arxiv-2301.08745.pdf","classification":"new","action":"create","identifier_type":"arxiv","identifier":"2301.08745","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper"}}]}`
+	unresolvedManifest := `{"schema_version":2,"entries":[{"path":"arxiv-2301.08745.pdf","classification":"new","action":"create","identifier_type":"arxiv","identifier":"2301.08745","status":"unresolved"}]}`
+	cli := &planCLI{
+		manifest: resolvedManifest,
+		preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:    `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"status":"applied","reason":{"via":"web","parent_key":"PA12RE34","attachment_key":"AT56CH90"}}]}}`,
+	}
+	service, jobID := readyPlanServiceWork(t, "", cli, work.Work{
+		ArXiv: "2301.08745", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	})
+	plans, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalePlan := plans[0]
+	if err := os.WriteFile(stalePlan.ManifestPath, []byte(unresolvedManifest+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	replanned, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatalf("replan after stale unresolved manifest: %v", err)
+	}
+	if len(replanned) != 1 || replanned[0].ID == stalePlan.ID {
+		t.Fatalf("replanned=%+v stalePlan=%+v resolveCalls=%d", replanned, stalePlan, cli.resolveCalls)
+	}
+	if cli.resolveCalls != 2 {
+		t.Fatalf("resolveCalls=%d, want 2", cli.resolveCalls)
+	}
+	if _, err := os.Stat(filepath.Join(service.DataDir, "zotio", "plans", stalePlan.ID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("stale plan still exists: %v", err)
+	}
+	manifestBytes, err := os.ReadFile(replanned[0].ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(manifestBytes) != resolvedManifest+"\n" {
+		t.Fatalf("replanned manifest = %s", manifestBytes)
+	}
+	applied, err := service.Apply(context.Background(), replanned[0].ID, replanned[0].ConfirmationSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.Status != "applied" || applied.ParentKey != "PA12RE34" {
+		t.Fatalf("applied = %+v", applied)
+	}
+}
+
+func TestAmbiguousApplyDoesNotInvalidateCachedPlan(t *testing.T) {
+	cli := &planCLI{
+		manifest: `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper","DOI":"10.1002/example"}}]}`,
+		preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+	}
+	cli.applyFn = func(ctx context.Context) (json.RawMessage, error) {
+		return nil, context.DeadlineExceeded
+	}
+	service, jobID := readyPlanService(t, "", cli)
+	plans, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := plans[0]
+	manifestPath := plan.ManifestPath
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(time.Millisecond)
+	if _, err := service.Apply(ctx, plan.ID, plan.ConfirmationSHA256); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ambiguous apply err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(service.DataDir, "zotio", "plans", plan.ID+".json")); err != nil {
+		t.Fatalf("ambiguous apply deleted plan: %v", err)
+	}
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("ambiguous apply deleted manifest: %v", err)
+	}
+	var planCount int
+	if err := service.Store.DB().QueryRow(`SELECT count(*) FROM exports WHERE kind='zotio_plan'`).Scan(&planCount); err != nil {
+		t.Fatal(err)
+	}
+	if planCount != 1 {
+		t.Fatalf("plan rows after ambiguous apply = %d, want 1", planCount)
+	}
+	replanned, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replanned[0].ID != plan.ID {
+		t.Fatalf("ambiguous apply invalidated plan: got %s want %s", replanned[0].ID, plan.ID)
+	}
+	if cli.resolveCalls != 1 {
+		t.Fatalf("ambiguous apply triggered re-resolve: resolveCalls=%d", cli.resolveCalls)
+	}
+}

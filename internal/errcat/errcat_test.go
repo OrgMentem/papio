@@ -209,3 +209,34 @@ func TestNoIdentifierGuidanceNeverAsksForASignIn(t *testing.T) {
 		t.Fatalf("wait guidance = %q", g)
 	}
 }
+
+func TestExplainZotioImportErrorFileStorageRefused(t *testing.T) {
+	got, ok := ExplainZotioImportError("zotero_file_storage_refused")
+	if !ok {
+		t.Fatal("ExplainZotioImportError returned false for zotero_file_storage_refused")
+	}
+	if got.Category != "zotero_file_storage_refused" {
+		t.Fatalf("category = %q, want zotero_file_storage_refused", got.Category)
+	}
+	for _, want := range []string{
+		"Papio has the paper",
+		"PDF is safe",
+		"nothing is corrupted",
+		"HTTP 413",
+		"WebDAV",
+		"3 MB upload succeeded",
+		"428 KB",
+		"Sync pane",
+		"attachment_mode = \"linked-file\"",
+		"[zotio]",
+		"do not sync to other devices",
+		"break if the file moves",
+	} {
+		if !strings.Contains(got.Guidance, want) {
+			t.Fatalf("guidance missing %q: %q", want, got.Guidance)
+		}
+	}
+	if _, ok := ExplainZotioImportError("zotero_http_4xx"); ok {
+		t.Fatal("unknown class should not match")
+	}
+}
