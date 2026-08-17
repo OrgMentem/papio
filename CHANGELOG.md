@@ -29,6 +29,16 @@ execution records kept during the initial build.
   fails if any request is gated on something the extension does not offer —
   which was previously invisible, because the daemon's own tests supplied a
   handshake no browser ever sends.
+- **A download *papio* could not finish no longer blocks that paper for good.**
+  On databases created during a narrow window of earlier development, *papio*
+  was unable to record a download as given up on — the database itself rejected
+  the word. Nothing could clear such a download: not *papio*, not the periodic
+  tidy-up that exists for exactly this case. Since *papio* keeps one download per
+  paper, every later attempt was answered "there's already one of those", and a
+  paper that failed once — a link that had expired, a download the browser
+  interrupted — could never be sent again. The database is repaired on the next
+  start, keeping every record; fresh installations were never affected, which is
+  why this survived a suite that builds its database from scratch.
 - **Private link details no longer reach *papio* when you send a paper.**
   Publisher and library links routinely carry signed tokens and interlibrary-loan
   tickets, which work like passwords. Sending a paper reported the whole link;
