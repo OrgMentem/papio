@@ -375,6 +375,23 @@ ceiling. Each named section accepts these keys:
 | `retraction_watch` | `true` | 1 | 1 |
 | `semanticscholar` | `true` | 1 | 1 |
 
+`openaire`'s `rate_per_sec` looks oddly precise because it is pinned to a documented
+ceiling: OpenAIRE allows **60 requests per hour** to unauthenticated callers, and
+`0.016 × 3600 = 57.6`. Do not raise `burst` to make bursty demand go through — the
+hourly budget is `burst + rate_per_sec × 3600`, so at this rate a burst above about 2
+would breach the published ceiling.
+
+To get more OpenAIRE throughput, authenticate instead: a **free personal token**
+raises the ceiling to 7,200 requests per hour, which is 120× the keyless allowance.
+Register at [OpenAIRE](https://services.openaire.eu/uoa-user-management/register.jsp),
+copy the token from your account's personal-token page, and set it as `api_key` under
+`[sources.openaire]` — then raise `rate_per_sec` to suit the higher ceiling. *papio*
+sends the token as an `Authorization: Bearer` header.
+
+Note that OpenAIRE reports `x-ratelimit-limit: 7199` in its responses **even to
+unauthenticated requests**, so that header is not a safe basis for choosing
+`rate_per_sec`. Use the documented ceiling for the tier you are actually in.
+
 ## Watch configuration
 
 There is no `[watch]` section or watch-specific key in *papio*'s TOML config.

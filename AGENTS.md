@@ -78,6 +78,18 @@ topic, because completed build plans otherwise pile up and drift back into `docs
   then delete it. Git history is the archive — there is deliberately no
   `archive/`, which is only ever where stale docs rot while still looking
   authoritative.
+  Two rules make that deletion safe, and both were learned by nearly breaking them.
+  **An ADR must never depend on a `dev/active/` file for normative content** — the
+  active file is deleted when the work ships, so the ADR is left pointing at nothing.
+  `dev/adr/0021-packaged-behaviour-and-restrictive-control.md` says its acceptance
+  tests "live in `dev/active/adapter-release-latency-plan.md`", which is exactly this
+  hazard: that plan cannot be deleted until the tests move into the ADR. And **every
+  `file:symbol` citation in a plan must actually resolve**, because a citation that
+  does not reads as verified evidence. An audit pass caught nine fabricated ones
+  (`TestActionKindCoverage` for `TestActionKindDispositionIsExhaustive`,
+  `grab.go:Identify` where `internal/grab` has no `Identify` at all); the check is one
+  script over `` `path:Symbol` `` pairs and it is worth re-running after any bulk
+  documentation edit, especially a delegated one.
 - `dev/scratch/` — gitignored throwaway (oracle rounds, one-shots).
 - Loose files at `dev/` root are durable non-plans: runbooks (`identity-corpus.md`)
   and evidence. Field reports stay put — `internal/cli/conformance_test.go` and
@@ -569,6 +581,27 @@ There is also a link check, because `zensical build` prints a broken link as an
   exercise an institutional/provider path, use a **non-OA** title.
 - Institution federated-login entityID for Example University is `https://idp.example.edu/entity` (NOT
   `/idp/shibboleth`); ProQuest account id is `12345`. These live in `config.toml`, not code.
+- **Never derive pacing from a provider's `x-ratelimit-*` header — it may report a
+  different tier's ceiling than the one your request is in.** Verified live 2026-08-17:
+  an **unauthenticated** OpenAIRE request is answered `x-ratelimit-limit: 7199`, while
+  OpenAIRE documents 7200/hour for *authenticated* and **60/hour for unauthenticated**
+  requests (`graph.openaire.eu/docs/apis/terms`). Anything that trusted that header on
+  a keyless install would raise its own rate ~120× and get the operator rate-limited.
+  Pace from the provider's **documented** ceiling for the tier the request is actually
+  made in; ADR-0024 records this as the reason the header-derived floor does not
+  generalise. Two live consequences worth knowing: `openaire`'s `rate_per_sec: 0.016`
+  is *correct* (0.016 × 3600 = 57.6/hour, just under the documented 60) and must not be
+  "fixed" by raising `burst`, since `burst + rate × 3600 ≤ 60` allows a burst of at
+  most 2.4; and a free personal token raises the ceiling 120× — already wired
+  (`openaire.Options.APIKey` → `Authorization: Bearer`), so it is a config change, not
+  a code change.
+- **Before tuning any threshold against job history, plot both distributions first.**
+  The `make identity-corpus` discipline above generalises. Measured on the live store:
+  jobs that reached `ready` needed p50 **11** wire attempts, p90 29, p99 616, max
+  **1,376**, while the worst pathological job sat at 3,404 — so an attempt-count cap
+  intended to kill runaway jobs would have killed a job that succeeded on pass 1,376.
+  When the healthy and pathological distributions overlap by a decimal order of
+  magnitude, the count is the wrong instrument, not the wrong number.
 
 ### Windows / UX
 - Work-window mode (`papio_work_window_v1`, default on) puts handoff tabs in a **minimized
