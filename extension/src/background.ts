@@ -933,6 +933,13 @@ export interface BridgeDeps {
       tabId: number;
       frameId: number;
     }): Promise<{ documentId?: string } | null | undefined>;
+    /** chrome.webNavigation.onErrorOccurred — a top-frame navigation that
+     * failed to commit (net error, aborted, blocked). No URL is read from
+     * this event: it exists only to order navigation-error evidence before
+     * generic auth-wall detection (surface-lifecycle-plan.md Slice 1). */
+    onErrorOccurred?: Listenable<
+      [{ tabId: number; frameId: number; error?: string }]
+    >;
   };
   /** Extension-page broadcast channel (runtime.onMessage), distinct from tabs.sendMessage content-script delivery. */
   runtimeSendMessage?(message: object): Promise<unknown>;
@@ -2271,6 +2278,15 @@ export class Bridge {
   // epoch that actually gates authority is read live from webNavigation.
   private readonly pageNavSeq = new Map<number, number>();
   private webNavigationBound = false;
+  /** Tab id -> deps.now() timestamp of the last unconsumed top-frame
+   * navigation error observed on a papio-managed tab. Consulted (and
+   * consumed) by the generic auth-wall detector before it charges an
+   * auth attempt: a dead end is not a human sign-in wall (surface-
+   * lifecycle-plan.md invariant "every dead end has a daemon-side
+   * disposition"). Worker-local; a fresh worker starts with no markers,
+   * which only widens the window in which a genuine auth wall is
+   * (correctly) treated as one. */
+  private readonly navigationErrors = new Map<number, number>();
   /** Resolver-provided offer URLs are cached here after storage hydration. */
   private readonly offerURLs = new Map<string, string>();
   /** Institution Shibboleth entityIDs from job offers (login_entity_id), used to
@@ -5408,6 +5424,15 @@ export class Bridge {
             cb: (d: { tabId: number; replacedTabId: number }) => void,
           ) => void;
         };
+        onErrorOccurred?: {
+          addListener: (
+            cb: (d: {
+              tabId: number;
+              frameId: number;
+              error?: string;
+            }) => void,
+          ) => void;
+        };
       };
       // The MV3 platform globals are not in this module's lib types; when
       // `chrome.webNavigation` exists at all, the browser guarantees its shape.
@@ -5449,8 +5474,32 @@ export class Bridge {
           void this.update((s) => clearPendingDelivery(s, s.pendingDelivery?.job_id));
         }
       });
+      // A failed top-frame navigation is a dead end, not a human sign-in
+      // wall; the marker it leaves is read (and consumed) by the generic
+      // auth-wall detector in onTabUpdated before that detector charges an
+      // auth attempt (surface-lifecycle-plan.md Slice 1).
+      n.onErrorOccurred?.addListener((d) => {
+        void this.onNavigationError(d);
+      });
     } catch {
     }
+  }
+  /** Record navigation-error evidence for a papio-managed tab. Ordering only:
+   * no URL is read or persisted, and the job itself is left untouched — the
+   * marker is consulted (and consumed) by the generic auth-wall detector in
+   * onTabUpdated before that detector could otherwise mistake this dead end
+   * for a human sign-in wall. */
+  private async onNavigationError(d: {
+    tabId: number;
+    frameId: number;
+  }): Promise<void> {
+    if (d.frameId !== 0) return;
+    await this.ready;
+    const managed =
+      findByTab(this.store, d.tabId) !== undefined ||
+      this.tabLedgerCache?.[String(d.tabId)] !== undefined;
+    if (!managed) return;
+    this.navigationErrors.set(d.tabId, this.deps.now());
   }
   private async reconcilePendingDeliveryOnStartup(): Promise<void> {
     const pending = this.store.pendingDelivery;
@@ -13989,7 +14038,23 @@ export class Bridge {
     }
     const successfulLanding =
       change.status === "complete" && !isAuthenticationURL(url);
+    // Navigation-error precedence (surface-lifecycle-plan.md Slice 1): a
+    // failed top-frame load lands here as an unsuccessful document, same as
+    // a genuine auth wall. Consult the marker before challenge assessment or
+    // auth-wall detection ever runs for it — a dead end must not charge an
+    // auth attempt, enter challenge cooldown, or send auth_pending. The job
+    // is left untouched; a daemon-side disposition is Slice 3's addition.
+    const documentSettled =
+      change.status === "complete" || change.title !== undefined;
+    if (
+      documentSettled &&
+      !successfulLanding &&
+      this.navigationErrors.delete(tabID)
+    ) {
+      return;
+    }
     if (successfulLanding) {
+      this.navigationErrors.delete(tabID);
       const institutionalSession = await this.recordInstitutionalSession(
         job,
         url,
@@ -16676,6 +16741,7 @@ export class Bridge {
     await this.ready;
     this.destroyDeliveryChoiceForTab(tabID);
     this.pageNavSeq.delete(tabID);
+    this.navigationErrors.delete(tabID);
     // If pendingDelivery waiting_manual was bound to this tab, clear it — a later
     // page in the same tab_id must never revive authority.
     if (
@@ -18802,6 +18868,10 @@ function realDeps(): BridgeDeps {
             onTabReplaced: {
               addListener: (cb) =>
                 chrome.webNavigation.onTabReplaced.addListener(cb as never),
+            },
+            onErrorOccurred: {
+              addListener: (cb) =>
+                chrome.webNavigation.onErrorOccurred.addListener(cb as never),
             },
             // The live document epoch. Present on Chromium; on a browser whose
             // getFrame omits `documentId` this resolves without one and the

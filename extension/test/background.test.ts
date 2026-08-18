@@ -82,6 +82,11 @@ import {
 import { routeResolverService } from "../src/resolver";
 import { ChromeTabsFake, FakeWebNavigation } from "./fake-tabs";
 import { FakeDownloads } from "./fake-downloads";
+import {
+  expectLedgerRetains,
+  restartWorker,
+  simulateExtensionUpdate,
+} from "./lifecycle";
 
 /** A hello_ack that must read as a healthy daemon has to sit at or above
  * background.ts's MIN_DAEMON_VERSION. Deriving it keeps a floor bump from
@@ -17128,4 +17133,159 @@ describe("effect_permit reconcile inbound", () => {
     expect(h.backend.store.daemonFeatures).toContain("effect_permit_v1");
     expect(spy).toHaveLength(0);
   });
+});
+
+// Slice 1 (surface-lifecycle-plan.md): navigation-error ordering ahead of
+// generic auth-wall detection, and the lifecycle.ts harness seams
+// (restartWorker/simulateExtensionUpdate/expectLedgerRetains).
+test("Slice 1: a navigation error on a managed handoff tab never charges an auth attempt", async () => {
+  const idpURL = "https://idp.example.edu/sso";
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_naverr_managed"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  await h.webNavigation.emitError(tabID);
+  // The failed provider load settles at the IdP URL as an error document —
+  // Chrome delivers that as a single "complete" landing, with no separate
+  // "loading" transition (that would itself model a fresh operator
+  // navigation and prematurely start authentication before the marker is
+  // ever consulted). Mirrors the already-covered recovery sibling below.
+  await h.tabs.completeNavigation(tabID, idpURL);
+
+  expect(h.frames().some((f) => f.type === "auth_pending")).toBe(false);
+  expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+
+  // Ordering pin: the same IdP landing, without a preceding navigation
+  // error, still starts human authentication normally.
+  const control = makeHarness();
+  await control.bridge.start();
+  await control.port.inbound(jobOffer("job_naverr_control"));
+  const controlTabID = control.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await control.tabs.userNavigate(controlTabID, idpURL);
+  await control.tabs.completeNavigation(controlTabID, idpURL);
+  expect(
+    control.frames().filter((f) => f.type === "auth_pending"),
+  ).toHaveLength(1);
+  expect(control.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+});
+
+test("Slice 1: the navigation-error marker clears on the next successful navigation", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_naverr_clears"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  await h.webNavigation.emitError(tabID);
+  // The tab recovers and lands back on the provider — a genuinely
+  // successful navigation, not the erroring document.
+  await h.tabs.completeNavigation(
+    tabID,
+    `https://${PROVIDER_HOST}/stable/recovered`,
+  );
+  expect(h.backend.store.activeJobs[0]?.status).not.toBe("auth_pending");
+
+  // A later, unrelated IdP landing on the same tab classifies normally —
+  // proof the marker did not survive the successful landing above.
+  const idpURL = "https://idp.example.edu/sso";
+  await h.tabs.userNavigate(tabID, idpURL);
+  await h.tabs.completeNavigation(tabID, idpURL);
+  expect(
+    h.frames().filter((f) => f.type === "auth_pending"),
+  ).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+});
+
+test("Slice 1: simulateExtensionUpdate reproduces the session-storage-clears tab-group reload", async () => {
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_navlife_tg_a"));
+  const groupID = h.backend.store.handoffGroupID;
+  expect(groupID).toBeDefined();
+  expect(h.tabGroups?.live.size).toBe(1);
+  await h.tabGroups!.update(groupID!, {
+    title: "papio — A paper still awaiting institutional access",
+    collapsed: false,
+  });
+
+  // Simulate an extension reload: chrome.storage.session is wiped while the
+  // physical group remains labeled with the paper that needs attention —
+  // same scenario as the hand-rolled reload above, rebuilt on the helper to
+  // prove it is truthful (assertions kept identical).
+  const updated = simulateExtensionUpdate(h);
+  await updated.bridge.start();
+  await updated.port.inbound(jobOffer("job_navlife_tg_b"));
+
+  expect(h.tabGroups?.live.size).toBe(1);
+  expect(h.backend.store.handoffGroupID).toBe(groupID);
+  expect(h.tabs.grouped).toEqual([
+    { tabIds: [100] },
+    { tabIds: [101], groupId: groupID! },
+  ]);
+  expect(h.tabGroups?.live.get(groupID!)?.title).toBe(
+    "papio — A paper still awaiting institutional access",
+  );
+});
+
+test("Slice 1: restartWorker keeps a claim-gate park's offer URL and the durable tab ledger across a worker restart", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  const ledger = installManagedTabLedger(h, {});
+  const offer = jobOffer("job_navlife_gate_restart") as {
+    payload: Record<string, unknown>;
+  };
+  offer.payload["requires_auth"] = true;
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(offer);
+  expect(h.backend.store.offerURLs?.["job_navlife_gate_restart"]).toBe(
+    OPENURL,
+  );
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_navlife_gate_restart",
+    ),
+  ).toMatchObject({ tab_id: -1, status: "queued", engagement_required: true });
+
+  // A second, ordinary handoff proves the durable ledger — not just the
+  // parked offer URL — survives the same restart.
+  await h.port.inbound(jobOffer("job_navlife_ledger_restart"));
+  const ledgeredTabID =
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_navlife_ledger_restart",
+    )?.tab_id ?? -1;
+  expect(ledgeredTabID).toBeGreaterThanOrEqual(0);
+  expectLedgerRetains(ledger.current(), ledgeredTabID);
+  // Free the single governor slot this ordinary handoff still holds: the
+  // claim-gate job's explicit open below must not be blocked by an
+  // unrelated handoff's live tab. parkHandoffForManual's own restart-safety
+  // contract (see its doc comment) is exactly this — releasing the drive
+  // while retaining tab_id, so reconciliation on restart does not
+  // re-consume the slot for a tab that is no longer actively driving.
+  await h.bridge.parkHandoffForManual("job_navlife_ledger_restart");
+  const createdBeforeRestart = h.tabs.created.length;
+
+  const restarted = restartWorker(h);
+  await restarted.bridge.start();
+  await restarted.port.inbound(helloAck());
+  // The park and its offer URL survive the worker restart untouched — the
+  // same durable storage the dead worker wrote is what the new one reads.
+  expect(restarted.backend.store.offerURLs?.["job_navlife_gate_restart"]).toBe(
+    OPENURL,
+  );
+  const opened = await restarted.bridge.openHandoff(
+    "job_navlife_gate_restart",
+  );
+  expect(opened.ok).toBe(true);
+  expect(restarted.tabs.created.slice(createdBeforeRestart)).toEqual([
+    { url: OPENURL, active: true },
+  ]);
+  expectLedgerRetains(ledger.current(), ledgeredTabID);
 });

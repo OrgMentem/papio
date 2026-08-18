@@ -25,6 +25,10 @@ export class FakeWebNavigation {
    * `{addedTabId, removedTabId}` is the *separate* tabs.onReplaced event; a
    * harness that emits those names tests a fiction the browser never sends. */
   readonly onTabReplaced = new FakeEmitter<[{ tabId: number; replacedTabId: number }]>();
+  /** chrome.webNavigation.onErrorOccurred — a top-frame navigation that
+   * failed to commit. Deliberately carries no URL beyond what a real caller
+   * supplies: the seam exists only to test navigation-error ordering. */
+  readonly onErrorOccurred = new FakeEmitter<[{ tabId: number; frameId: number; error?: string }]>();
   /** The browser's own top-frame document epochs — the state `getFrame`
    * reports. It lives in the browser, so it outlives a service-worker
    * restart; that is precisely why the background reads it instead of
@@ -67,6 +71,15 @@ export class FakeWebNavigation {
     const known = this.liveFrames.get(details.tabId);
     if (known === null) return null;
     return { documentId: known ?? `doc-auto-${details.tabId}` };
+  }
+
+  /** Convenience: emit a top-frame navigation error for a tab. */
+  async emitError(tabId: number, error?: string): Promise<void> {
+    await this.onErrorOccurred.emit({
+      tabId,
+      frameId: 0,
+      ...(error === undefined ? {} : { error }),
+    });
   }
 }
 
