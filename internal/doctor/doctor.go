@@ -167,13 +167,13 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	// institutional-access list with nothing marking the pair.
 	if db == nil {
 		add("work_uniqueness", Skip, "duplicate live jobs are checked by the daemon", "")
-	} else if works, jobs, err := duplicateLiveWorks(ctx, db); err != nil {
+	} else if jobs, groups, err := duplicateLiveWorks(ctx, db); err != nil {
 		add("work_uniqueness", Warn, "duplicate live jobs could not be read", "inspect database permissions")
-	} else if works == 0 {
+	} else if jobs == 0 {
 		add("work_uniqueness", Pass, "no paper has two live jobs", "")
 	} else {
 		add("work_uniqueness", Warn,
-			fmt.Sprintf("%d paper(s) have more than one live job (%d jobs); each opens its own human action, so the same paper is asked for twice", works, jobs),
+			fmt.Sprintf("%d live job(s) share a paper with another live job (%d identifier group(s)); each opens its own human action, so the same paper is asked for twice", jobs, groups),
 			"papio jobs list --json to find the pair, then papio jobs cancel <id> on the later one; papio never merges them itself, because a consumer may already hold the other job id")
 	}
 
@@ -470,17 +470,23 @@ func pdfGrabActiveSourceIndex(ctx context.Context, db *store.Store) (bool, int, 
 	return false, duplicates, nil
 }
 
-// duplicateLiveWorks counts works that hold more than one live job, and the
-// total number of live jobs those works hold.
+// duplicateLiveWorks counts the live jobs that share a work with another live
+// job, and the number of identifier groups those jobs fall into.
 //
-// Every identifier kind counts, not just DOI: liveJobForCanonicalWork keys on
-// work.Describe(), which resolves to whichever strong identifier a work has, so
-// a pair sharing only a PMID is the same duplication. The live-state set mirrors
-// job.Terminal exactly — a terminal job is a finished acquisition and a second
-// live job for the same work is then legitimate, which is the case
-// supersededJobsForCanonicalWork already handles on the force path.
+// It returns JOBS rather than works on purpose. Every identifier kind counts,
+// because liveJobForCanonicalWork keys on work.Describe() and a pair sharing only
+// a PMID is the same duplication — but a pair that shares a DOI *and* a PMID *and*
+// an OpenAlex id forms three identifier groups, so counting groups reports one
+// duplicated paper as three. Measured on a real store the group count was 51
+// against 32 duplicated jobs. A count of distinct job ids cannot inflate that
+// way, and it is also the number the operator acts on: each of those jobs is a
+// row asking them to fetch something another row already covers.
+//
+// The live-state set mirrors job.Terminal exactly — a terminal job is a finished
+// acquisition and a second live job for the same work is then legitimate, which
+// is the case supersededJobsForCanonicalWork already handles on the force path.
 func duplicateLiveWorks(ctx context.Context, db *store.Store) (int, int, error) {
-	var works, jobs int
+	var jobs, groups int
 	if err := db.DB().QueryRowContext(ctx, `
 		WITH live AS (
 		  SELECT i.kind, i.value, j.id
@@ -488,13 +494,15 @@ func duplicateLiveWorks(ctx context.Context, db *store.Store) (int, int, error) 
 		    JOIN jobs j ON j.work_request_id = i.work_request_id
 		   WHERE j.state NOT IN ('ready','imported','unavailable','failed','cancelled')
 		), dup AS (
-		  SELECT kind, value, COUNT(*) AS n FROM live
+		  SELECT kind, value FROM live
 		   GROUP BY kind, value HAVING COUNT(*) > 1
 		)
-		SELECT COUNT(*), COALESCE(SUM(n), 0) FROM dup`).Scan(&works, &jobs); err != nil {
+		SELECT COUNT(DISTINCT l.id), (SELECT COUNT(*) FROM dup)
+		  FROM live l
+		  JOIN dup d ON d.kind = l.kind AND d.value = l.value`).Scan(&jobs, &groups); err != nil {
 		return 0, 0, err
 	}
-	return works, jobs, nil
+	return jobs, groups, nil
 }
 
 // undeliveredZoteroImports counts ready jobs whose bytes are validated but whose

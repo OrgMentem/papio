@@ -1707,7 +1707,7 @@ func TestRunWarnsWhenOneWorkHasTwoLiveJobs(t *testing.T) {
 	if got.Status != Warn {
 		t.Fatalf("status = %v with a duplicated work, want Warn (%q)", got.Status, got.Detail)
 	}
-	if !strings.Contains(got.Detail, "more than one live job") {
+	if !strings.Contains(got.Detail, "share a paper with another live job") {
 		t.Fatalf("detail = %q, want it to name the condition", got.Detail)
 	}
 	if got.Remediation == "" {
