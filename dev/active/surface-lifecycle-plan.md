@@ -1,164 +1,191 @@
-# Attempt six (rev 2): papio owns every surface it creates
+# Attempt six (rev 3): *papio* owns every surface it creates
 
-Successor to `dev/active/login-handoff-plan.md` (attempt five). Revised
-2026-08-18 after a four-reviewer round on rev 1 (verdicts: all four
-"incorrect"/"sound-with-changes"; ~30 anchored findings). Rev 1's central error:
-it proposed extension-local durable claims and gates — re-implementing, on the
-wrong side of the authority boundary, machinery ADR-0022 already designed and
-partially shipped. This revision builds on that machinery instead.
+Successor to `dev/active/login-handoff-plan.md` (attempt five). Rev 1
+(extension-local durable claims) was rejected by a four-reviewer round —
+wrong side of the ADR-0022 authority boundary. Rev 2 rebuilt on the daemon's
+machinery; an independent pro-effort oracle review of rev 2 against the raw
+sources (verdict: **sound-with-changes**;
+`dev/scratch/oracle/20260818T074205Z-surface-lifecycle/answer.md`) confirmed
+the foundation and corrected the slice order, the cardinality rule, the
+compatibility fallback, and the connectivity sequencing. This revision folds
+in all twelve of its prioritized changes.
 
 ## The field failure (2026-08-18, operator's browser)
 
-One papio tab group with ~17 tabs — six-plus IdP sign-in tabs, several
-unrendered Primo tabs, a ScienceDirect ATN-12 error page — plus duplicate papio
-groups/windows across extension reloads, drives fired into a dead network after
-wake, and siblings stranded at sign-in walls after the operator authenticated
-in one tab. The operator's directive: papio owns the full lifecycle of every
-surface it creates; a tab is ceded to the user only when papio asks for user
-action (rare by design) or the user takes the tab over.
+One *papio* tab group with ~17 tabs — six-plus IdP sign-in tabs, several
+unrendered Primo tabs, a ScienceDirect ATN-12 error page — plus duplicate
+groups/windows across extension reloads, drives fired into a dead network
+after wake, and siblings stranded at sign-in walls after the operator
+authenticated in one tab. The operator's directive: *papio* owns the full
+lifecycle of every surface it creates; a tab is ceded to the user only when
+*papio* asks for user action (rare by design) or the user takes the tab over.
 
-## Corrected audit (rev 1 claims re-verified by reviewers; lines at `cfbfec6`)
+## Corrected audit (rev 1 → reviewers → oracle; lines re-verified at HEAD 2026-08-18)
 
-What is true:
-
-1. **Automated drives leave one tab per auth wall.** The drive timeout
-   (3 min) parks a fresh handoff with its live tab preserved
-   (`background.ts:4196-4221`); a sibling that classifies as "login" while
-   another job owns the institution claim is deliberately left at the provider
-   wall (`parkHandoffWaitingForSession:4376-4413`); the claim gate runs only
-   inside `maybeRouteFederatedLogin` (15002-15067), **after** navigation, and
-   only for adapters with a `federatedLogin` template — the generic auth path
-   (13771-13788) takes no claim. Auth-stall (10401-10409) and challenge
-   (10626-10629) parks also preserve tabs. N cold institutional jobs ⇒ up to N
-   wall tabs, one live owner.
-2. **Fresh-link parks are unreachable by every resume path.** `openFreshHandoff`
-   deletes `offerURLs` at materialization (privacy cutover), so
-   `reloadAuthenticationHandoffs` (11599-11625) cannot renavigate them,
-   `isInstitutionalSessionLanding` cannot record their landings, and
-   `resumeWaitingForSessionJobs` (14884-14933) matches only
-   `waiting_for_session` — timeout parks lack the marker. Legacy URL-bearing
-   parks do resume; the shipped fresh-link path strands. ("Everything waits
-   forever" in rev 1 was overstated; this is the precise version.)
-3. **Coordination state is session-scoped; surfaces are durable.** The whole
-   managed store lives in `chrome.storage.session` (`state.ts:1645-1666`,
-   wiped on update/reload/browser restart) — and `federatedLoginOwners` is not
-   persisted at all: the serializer deletes it (`state.ts:1617-1618`). Claims
-   are worker-memory. Startup does adopt: groups are re-found by title and
-   folded, `reconcileTabs` revalidates tracked tabs, and both are awaited
-   before the governor drain (4756-4834) — rev 1's "drives before reconcile"
-   was wrong. What has no adoption: the work window (no rediscovery; stale ID
-   ⇒ new window, 3959-3983), prior-generation tabs whose jobs the wiped store
-   forgot (ledger classify closes 0 by documented design, 3587-3607), and any
-   claim.
-4. **No connectivity gate.** No online/probe signal exists anywhere in the
-   background; `connectionStatus` reflects the native port only. Cold fresh
-   `requires_auth` offers ARE already gated tabless (`hasHandoffReleaseEvidence`
-   10462-10476, `onJobOffer` 12910-12990) — the ungated paths are legacy
-   URL-bearing offers, re-offers of live jobs (13210-13214, 13353-13357), and
-   the 45s queued-handoff release. The daemon emits up to 4 offers per 2s poll
-   after a reconnect hello resets its offered map (`bridge.go:124-131`, 8405+).
-5. **Silent dead ends.** `MAX_CLASSIFY_RETRIES` exhaustion deletes worker-local
-   retry state and returns (14724-14728) — and because `classifyRetries` is a
-   worker-local Map, an MV3 restart resets the count, so a dead page can retry
-   indefinitely across worker lifetimes. Navigation errors are unobservable
-   (no error event seam in `BridgeDeps`; an error document flows into generic
-   auth detection and can charge an auth attempt). Daemon `goodbye` releases
-   the session only (`bridge.go:914-916`) — it is transport loss, never
-   terminal job evidence.
+1. **Automated drives leave one tab per auth wall — and the drive limit is
+   not a surface limit.** `HANDOFF_DRIVE_LIMIT = 1` caps tabs that may
+   *drive an effect* (`background.ts:168-171`); every park (timeout callback
+   4201-4226, waiting-for-session 4393, auth-stall `reportAuthStalled`
+   10506-10511, challenge 10694-10732) preserves its live tab while releasing
+   the slot, so one nominal drive coexists with a 17-tab group. The claim
+   gate runs only inside `maybeRouteFederatedLogin` (15104+), **after**
+   navigation and only for adapters with a `federatedLogin` template; the
+   generic off-provider path takes no claim and charges an auth attempt
+   (`auth_pending` send + `noteAuthAttempt`, 13846-13848). Sibling discovery
+   of an existing owner retires nothing — the redundant wall tab is kept
+   (`parkHandoffWaitingForSession`).
+2. **Stranded siblings are a park-type mismatch.** Fresh-link timeout parks
+   set `auth_pending` via `parkHandoffForManual` and never set
+   `waiting_for_session` (4213-4218); every cross-job resume path filters on
+   `waiting_for_session`/claim key or matches origins from `offerURLs`
+   (`resumeWaitingForSessionJobs` 14986, `…ByClaim` 15053-15058,
+   `…Handoffs` 15041-15044) — both absent for fresh-link jobs
+   (`openFreshHandoff` deletes `offerURLs` at materialization, 6023).
+   The fix is a daemon claim-resolution transition, **not** a broad
+   "session evidence redrives every auth tab" sweep.
+3. **A separate sign-in multiplier: the jobless fallback.**
+   `requestSessionSignIn` falls back to `openManagedTab` without a `jobId`
+   (2717-2823; `openManagedTab` calls at 2786, 2814 carry no `jobId`), and
+   ledger scanning/reuse runs only under
+   `options.jobId !== undefined` — repeated fallbacks mint repeated sign-in
+   tabs even when an earlier one is live.
+4. **Coordination state is session-scoped; surfaces are durable.** The
+   managed store lives in `chrome.storage.session` (`state.ts:1645+`);
+   `federatedLoginOwners` and `offerURLs` are deleted by the serializer's
+   migration on every save (`state.ts:1615-1618`) — claims are worker-memory.
+   Startup adoption is real but **per-window and startup-only**: groups are
+   re-found by title then partitioned by `windowId` with a primary per
+   partition (3895-3915), so multiple *papio* groups across windows are a
+   supported steady state; the work window has no rediscovery at all (stale
+   ID ⇒ new window, 3944-3987); and `connect()` precedes reconciliation while
+   `onInbound` awaits only storage hydration (4747-4764) — native offers can
+   materialize mid-adoption. There is a crash gap between `tabs.create` and
+   `foldIntoHandoffGroup` that leaves an ungrouped tab.
+5. **Ordinary navigation erases ownership evidence.** `ledgerManagedTab`
+   records the creation URL (3470-3497); after the resolver→SSO→provider
+   redirect chain, `classifyLedgeredTabs` sees a URL mismatch and **deletes
+   the ledger record** (3540-3574). Reconciliation then closes zero by design
+   (`reconcileOwnedTabs` 3594-3597) while startup schedules it as cleanup
+   (4853-4855).
+   `closeOwnedTab` additionally refuses live-job tabs (`findByTab`,
+   3356-3365) and recognizes only the single remembered group ID despite the
+   group code keeping one group per window. The timeout callback fires
+   `closeOwnedTab(tabID, "timeout")` without awaiting it (4224-4225).
+6. **Wake releases before it probes.** `onKeepaliveAlarm` awaits
+   `releaseExpiredQueuedHandoffs` first (10057), then fires the deliberately
+   non-awaited keepalive probe (10065) and reconnects; the 45s fallback
+   release (11364) explicitly bypasses release-grade evidence for its forced
+   job (11483-11487). No
+   online/probe/navigation-error signal exists anywhere in the background;
+   an error document flows into generic auth detection. `classifyRetries`
+   is a worker-local Map — MV3 restart resets exhaustion (14826-14829).
+   Daemon `goodbye` releases the session only (`bridge.go:923-925`): it is
+   transport loss, never terminal job evidence.
 
 ## Why five attempts did not land this
 
 - **The replacement architecture already exists, disabled.** ADR-0022 shipped
   Phases 1-3: daemon-owned `materialization_claims`, two-party claim→bind→
-  route→navigated→reconcile (`institutional_materialization_v1`, strict and
-  feature-negotiated), self-identifying scaffolds, paginated reconciliation,
-  effect permits, and scheduler grouping whose anti-join yields **one bound
-  scaffold per institution by design**. Automatic first-route behavior is
-  deliberately off until Phase 4/5 readiness. Every attempt so far patched the
-  legacy offer/drive path that this machinery is meant to replace — the
-  "resistance" was real: the legacy path cannot express ownership, and the
-  ADRs forbid building a second authority beside the daemon's.
+  route→navigated→reconcile (`institutional_materialization_v1`), opaque
+  self-identifying scaffolds (`materialize.html#<binding>`), paginated
+  reconciliation, effect permits. Automatic first-route behavior is off until
+  Phase 4/5 readiness. Every attempt patched the legacy offer/drive path this
+  machinery is meant to replace; the ADRs forbid a second authority beside it.
 - **Scope boundary drawn at the wrong path.** Attempt five fixed cold
-  human-action offers (tabless until engagement, fresh URL mint — shipped and
-  effective). The pileup lives in the automated warm-session drive path.
+  human-action offers (tabless until engagement, fresh URL mint — shipped).
+  The pileup lives in the automated warm-session drive path.
 - **Risk asymmetry ratcheted into taboo.** Reviews punished closing (real
   TOCTOU P0s) and never punished leaving open; the "do not re-attempt" list
-  plus the AST close-allowlist were then read as "lifecycle ownership is
+  plus the AST close-allowlist were read as "lifecycle ownership is
   forbidden," freezing policy along with mechanism.
 
 ## Architecture decision: finish ADR-0022, do not build beside it
 
-Rev 1's extension-local v2-hash claims, durable browser-side claim owners, and
-evidence-triggered auto-drives violate ADR-0022 Decisions 1/2/5/6 (daemon-issued
-opaque authentication claims, two-party binding, transient routes, typed human
-gates as the only attention authority) — confirmed by review. The corrected
-shape, which also matches the daemon-side claim-arbitration design reviewed in
-August:
-
-- The **daemon** owns institution claims (authentication-entry leases, Phase
-  4), durable job/park state, and resume scheduling. Claims survive extension
-  updates and browser restarts for free.
-- The **extension** owns browser-local facts only: physical tabs/groups/
-  windows, binding acknowledgements, wall/landing observations, operator
-  engagement, and the guarded close primitive.
-- Sibling resume is Decision 6 verbatim: one authentication claim ⇒ one human
-  surface with a dependent count; successful resolution resumes eligible
-  siblings through normal daemon scheduling — never through keepalive-probe
-  evidence callbacks.
+- The **daemon** owns jobs, candidate ordering, the opaque authentication
+  claim and its authentication-entry lease, holder generation,
+  materialization claims/bindings, typed human-gate occurrences, dependent
+  counts, durable park/retry state, sibling resume scheduling, effect
+  permits, and terminal/detach dispositions.
+- The **extension** owns browser-local facts: physical tabs/groups/windows,
+  binding acknowledgements, wall/landing/error observations, operator
+  engagement and cession, the current connectivity observation plus a short
+  probe lease, and the guarded close primitive. Loss of worker memory never
+  authorizes a replacement tab, a close, or a gate resolution.
+- **Cardinality (corrected):** one unresolved human sign-in surface per
+  **daemon-issued authentication claim** — not "per institution."
+  Institution-profile evidence (exact profile+revision) and provider safety
+  domains are separate axes: a claim may group profiles sharing one human
+  entry; a profile may span unrelated provider safety domains whose parked
+  scaffolds are limited independently, alongside the global effect permit.
+  Resolving a claim never auto-asserts entitled session evidence for every
+  profile grouped under it.
+- **Storage tiers:** `chrome.storage.session` holds re-derivable mirrors
+  only (binding→tab map, observation outbox, *papio*-issued action tokens,
+  page epochs, pending close transaction, advisory deadlines) — loss ⇒
+  retain/no-drive, never inference. `storage.local` holds settings plus a
+  URL-free birth certificate per owned surface: opaque `binding_id`, tab-ID
+  hint, purpose, browser-session epoch, extension generation, creation
+  timestamp, cession state, pending-close tombstone. No route URLs, titles,
+  DOIs, hosts, entity material, candidate ordering, or accepted-work queue —
+  the extension is never a durable queue (ADR-0022 Decision 1). A
+  browser-start epoch invalidates old tab-ID authority; after a browser
+  restart only a self-identifying scaffold is remapped automatically.
 
 ## Amendments to attempt five's "do not re-attempt" list (operator decision)
 
 - **"Automatic waiter-tab closure" is re-permitted, narrowly**: scaffold-only,
-  through `closeOwnedTab`, after an explicit detach/terminal transition, with
-  an intentional-close marker consumed by `onTabRemoved` (a narrow, tested
-  addition — not the banned removal-state-machine rewrite). Since `e6ff3e4`
-  every engagement mints a fresh URL, so a stale wall page has zero residual
-  value. Unknown engagement ⇒ retain, never close.
-- **Owner-age/URL-shape liveness stays banned.** Claim retirement and resume
-  ride daemon claim state and explicit auth-return/landing transitions only.
+  through the close transaction below, never for engaged/active/PDF/adopted
+  content. Unknown engagement ⇒ retain.
+- **Owner-age/URL-shape liveness stays banned.** Retirement and resume ride
+  daemon claim state and explicit transitions only.
 
-Everything else on the list remains banned. Attempt five's still-normative rule
-is also reaffirmed against rev 1: **missing federation metadata is a structured
-engagement failure, never permission to pre-open** — rev 1's "no-metadata jobs
-keep today's behavior" is retracted; all `requires_auth` work goes tabless
-without a granted claim.
+Everything else on the list remains banned. Reaffirmed: **missing federation
+metadata is a structured engagement failure, never permission to pre-open**;
+all `requires_auth` work goes tabless without a granted claim.
 
-## Design invariants
+## Design invariants (each names its enforcing slice)
 
-- **Scaffold vs content, durably.** A scaffold is a papio-created tab with a
-  durable URL-free ownership record (pre-create intent + post-create binding)
-  and no recorded operator engagement. Engagement (activation or user
-  navigation, excluding papio's own focus/navigation) is recorded durably at
-  observation time; today's signals are worker-local and die with the worker.
-  Content — engaged, active, PDF, adopted viewer — is never auto-closed.
-- **A claim precedes a surface.** No tab for `requires_auth` work without a
-  daemon-granted claim; reserve/claim before `tabs.create`, roll back on every
-  create/bind failure path (the reverted attempt's dead-owner orphan class).
-- **One institution, one sign-in surface** — enforced by daemon claim
-  arbitration and scheduler grouping, not by racing extension maps.
-- **Resume is a one-shot transition.** Successful auth-return/claim resolution
-  resumes siblings once, epoch-fenced; repeated warm probe evidence never
-  mints surfaces; failed retirement (owner closed without success) leaves
-  waiters tabless awaiting the typed gate.
-- **In-place renavigation is fenced.** Immediately before any automatic
-  `tabs.update` of a parked tab: fresh `tabs.get`, active check, engagement
-  check, no unrelated awaits between check and act. An operator-active tab is
-  never renavigated. After the update, the continuation re-reads job and tab
-  state before registering a drive — a removal during the await must not
-  resurrect a dead job (Chrome events are not serialized with the drive
-  chain). Automatic resumes never focus or foreground a tab
-  (`openFreshHandoff`'s unconditional focus needs a non-focusing variant).
-- **Positive evidence closes; absence retains.** A prior-generation scaffold
-  closes only on daemon cancel/terminal acknowledgement or complete reconcile
-  response — never on absence from a bounded 4-offer batch, never on `goodbye`.
-- **Every dead end has a durable disposition.** Classify exhaustion (persisted
-  retry epoch), navigation error (observed before auth detection, no auth
-  charge, no cooldown), daemon cancel — each parks with an inbox action and
-  retires its scaffold.
-- **Startup: adopt before drive, bounded.** Every drive-producing entrypoint
-  (queue drain, `onJobOffer` direct paths, runtime opens) waits on an adoption
-  gate; hello/poll stay responsive; scans have deadlines that fail closed to
-  no-adoption/no-close; browser-session-restore gets a grace pass.
+- **A claim precedes a surface** (Slices 0/3): no tab for `requires_auth`
+  work without a daemon-granted claim; scaffold-first creation; rollback on
+  every create/bind/cancel path including the reuse branch (today
+  `openManagedTab`'s reusable branch skips the materialization callback,
+  3300-3311).
+- **One unresolved human surface per authentication claim** (Slice 3):
+  enforced by the daemon claim transaction and monotonic event reducer.
+- **Resume is a one-shot transition** (Slice 3): keyed by gate occurrence ID
+  and event ordinal; duplicates ack idempotently; stale holder/binding/
+  ordinal cannot mutate current state; warm probe evidence never mints
+  surfaces; owner closure without success commits abandonment and leaves
+  dependants tabless.
+- **Warm evidence is not a lease** (Slice 3): exact-profile-scoped, admits an
+  attempted route only; a wall bounce converges on the claim at wall
+  observation.
+- **In-place renavigation is fenced** (Slices 0/4): fresh `tabs.get` +
+  active/engagement check with no unrelated awaits before `tabs.update`;
+  post-update continuation re-reads job and tab state before registering a
+  drive; automatic resumes never focus (non-focusing `openFreshHandoff`
+  variant).
+- **Positive evidence closes; absence retains** (Slice 2): close requires the
+  one-use daemon authorization below — never absence from a bounded 4-offer
+  batch, never `goodbye`, never timer expiry or transport loss.
+- **Causal operator cession** (Slice 2): *papio*-issued focus/navigation
+  action tokens keyed to tab + document epoch; matching events consume the
+  token and do not count as takeover; ambiguity ⇒ engagement ⇒ retain.
+- **Every dead end has a daemon-side disposition** (Slices 1/3): navigation
+  error (observed before auth detection, no auth charge, no cooldown),
+  classify exhaustion (extension reports the exhausted page epoch; the
+  daemon commits the terminal park), daemon cancel.
+- **`surfaceReady` gates every effect-producing entrypoint** (Slice 2): one
+  barrier (managed-state load + birth-record validation + scaffold scan +
+  complete paginated reconcile + tombstone replay + group/window adoption)
+  awaited by native offers, runtime opens, queue drains, materialization
+  retries, and close paths; hello/poll and reads stay responsive; bounded
+  scans fail closed to no-adoption/no-close; session-restore grace pass.
+- **Lifecycle work never rides the global effect permit** (Slices 2/4):
+  adoption scans, lease renewal, claim observations, group folding, and
+  terminal reconciliation use a separate lifecycle mutex; only irreversible
+  provider navigation, page mutation, and download initiation acquire the
+  effect permit.
 
 ## Slices
 
@@ -166,126 +193,158 @@ Discipline carried over from attempt five verbatim: one `background.ts` owner
 per slice, exact deletion manifests, full-suite runs only, ≤400 changed lines
 outside tests per slice, no assertion weakening. Protocol work lands at
 four-site parity (Go validator, TS parser, JSON schema, corpus) behind
-negotiated features.
+negotiated features; timing-only `auth_pending`/`auth_returned` frames are
+never widened.
 
-### Slice 0 — harness seams (prerequisite, mostly test code)
+### Slice 0 — containment (extension-only; stops new litter now)
+
+The smallest slice with most operator value; no aggressive cleanup.
+
+- No autonomous `requires_auth` surface unless the daemon advertises the
+  authentication-claim feature **and** the current connectivity probe passes.
+  Old daemon or failed probe ⇒ the job stays tabless with
+  `engagement_required`; explicit Open remains via attempt five's fresh-link
+  path. This is also the permanent degraded-compatibility behavior — there is
+  **no** legacy pre-open fallback (store extensions auto-update against
+  hand-updated daemons; the legacy path *is* the field failure).
+- Wake ordering reversed: probe before any release; the 45s
+  evidence-bypassing queued-handoff release is disabled for institutional
+  authentication work.
+- `classifyLedgeredTabs` stops deleting ledger records on URL change
+  (navigation is a lifecycle transition, not lost ownership) — but legacy
+  URL-ledger records never authorize auto-closing remote content.
+- The jobless `requestSessionSignIn` fallback reuses a live ledger-owned
+  sign-in tab instead of minting another.
+- Auto-close only an inactive, unengaged, self-identifying materialization
+  scaffold whose exact binding has positive daemon detach/terminal/reconcile
+  authority. Everything else is retained.
+
+### Slice 1 — harness seams (test code)
 
 Network/online/offline seam and navigation-error events in `BridgeDeps` +
 `fake-tabs.ts` (genuinely absent today); a lifecycle helper formalizing the
-existing update-simulation pattern (`background.test.ts:6035-6061`: wiped
-session store, surviving fakes, new `Bridge`); durable-ledger assertions.
+update-simulation pattern (`background.test.ts:6035-6061`); full background
+teardown between claim/create/bind/route/close/ack steps (Firefox event-page
+timing); durable-ledger assertions. Navigation-error handling ordered before
+generic auth detection lands here with its seam.
 
-### Slice 1 — dispositions and the safe close fence (extension-only)
+### Slice 2 — durable identity, adoption, and the close transaction
 
-- Detach-then-close: a scaffold close first records an intentional-close
-  marker and detaches/settles the job, then calls `closeOwnedTab`;
-  `onTabRemoved` consumes the marker and skips the cancellation path (the
-  reverted attempt's defect was dropping this consumption — restore it as a
-  narrow guard, not a rewrite). Today `closeOwnedTab`'s `findByTab` guard
-  makes every live-job close a silent no-op (3357-3359); the detach transition
-  is what makes closes real without relaxing content/active/PDF guards.
-- Navigation-error handling ordered **before** generic auth detection: park
-  for retry, no auth-attempt charge, no provider cooldown, scaffold retired.
-- Persisted classify-retry epoch; exhaustion parks with an inbox action and
-  retires the scaffold.
-- Timeout parks: retain the tab only while operator engagement is recorded;
-  otherwise close the scaffold — the inbox action re-mints fresh on click.
-- `goodbye`/disconnect is explicitly non-terminal: no closes.
+Pre-split (size): **2a** schema/migration, **2b** adoption + close.
 
-### Slice 2 — durable ownership and startup adoption (extension-only)
+- 2a: the `storage.local` birth certificate (above) as the ledger's URL-free
+  successor; legacy raw-URL entries redacted on migration; entries without
+  `jobID` retained for manual review. The record is a birth certificate for
+  a daemon binding — never a second claim or scheduling record.
+- 2b: restart-class validation (SW restart: IDs valid, session intact;
+  update: IDs valid, session wiped; browser restart: all IDs invalid) —
+  every adopted ID re-proven via `tabs.get`/query plus scaffold identity
+  before any claim/owner revalidation; session-restore timing gets bounded
+  grace/retries (absence ≠ dead). Group adoption starts from positively
+  owned member tabs and derives group/window — a *papio*-titled group with
+  no owned member is never adopted, merged, or closed; the work window is
+  rediscovered only through an owned member or extension sentinel.
+  `surfaceReady` barrier wired into every entrypoint.
+- The close transaction: (1) extension reports the disposition against
+  current claim/binding/holder generation/occurrence; (2) daemon transaction
+  commits state and returns a one-use `close_authorization_id` for that
+  exact binding; (3) tombstone persisted (tab ID, binding, generation,
+  authorization, nonce) before `tabs.remove`; (4) one fresh `tabs.get` —
+  still bound, unceded, inactive, non-PDF, not adopted — with no unrelated
+  await before remove; (5) `onTabRemoved` consumes the exact tombstone and
+  suppresses the user-cancel path; (6) failed remove or worker death leaves
+  a reconciliable tombstone revalidated with the daemon at startup; (7) a
+  tab that became active/navigated/kept is marked ceded and retained, its
+  binding detached. Every close call is awaited (the fire-and-forget at
+  4224-4225 is removed).
+- **Migration promise, narrowed:** only exact current bindings and
+  self-identifying scaffolds are cleaned automatically; pre-cutover
+  ambiguous tabs (ledger evidence already erased) go to a bounded one-time
+  operator review. No inference from group/window/title.
 
-- URL-free durable ownership skeleton beside the ledger: job/tab/group/window
-  IDs, purpose, generation, engagement bit, bounded timestamps. No titles,
-  DOIs, hosts, URLs, or entity material (the session store remains the only
-  home for those; serializer stays fail-closed). Pre-create intent record so
-  a worker death between `tabs.create` and ledger write cannot orphan;
-  legacy ledger entries without `jobID` are retained for manual review, never
-  auto-closed; legacy raw-URL ledger entries are redacted on migration.
-- Restart-class validation before trusting any stored ID: SW restart (IDs
-  valid, session intact), update (IDs valid, session wiped), browser restart
-  (all IDs invalid) — every adopted ID is re-proven via `tabs.get`/query plus
-  scaffold identity; claims/owners are revalidated only **after** physical
-  remap; no proof ⇒ retire the record, retain the tab.
-- Group folding requires a ledger-owned member proof, never title alone
-  (ADR-0013: membership is not ownership); the work window gets a
-  self-identifying rediscovery marker independent of keepalive.
-- Adoption gate on every drive entrypoint with bounded scans and a
-  session-restore grace pass; orphan closure only on positive daemon evidence
-  (cancel/terminal ack or complete paginated reconcile).
+### Slice 3 — claim-observation protocol and the authentication-entry lease
 
-### Slice 3 — authentication-entry lease and one attention surface (Phase 4 core)
+Daemon-side, on the shipped Phase 1-3 projections. **Gated on a written
+protocol design** (four-site parity) before implementation:
 
-Daemon-side, on the shipped Phase 1-3 projections and
-`institutional_materialization_v1`:
-
-- Daemon-issued opaque authentication claim (Decision 2) with an
-  authentication-entry lease; one transaction arbitrates claim requests and
-  answers `navigate_existing` / `open_new` / `focus_owner` / `park` (the
-  August-reviewed design).
-- Extension consults the claim **before** any `requires_auth` tab exists; all
-  ungranted institutional work is tabless-parked daemon-side. Wall/landing/
-  auth-return observations flow up as claim events; the login surface is one
-  tab with a dependent-sibling count (Decision 6).
-- Successful resolution resumes eligible siblings through daemon scheduling:
-  fresh route mint per sibling (routes stay transient, Decision 5), in-place
-  renavigation only through the Slice 1 fence, one-shot epoch semantics, a
-  per-job mint latch, and slot reservation before mint (today
-  `openFreshHandoff` materializes before the drive-limit check).
-- Binding acknowledgement covers **both** materialization branches: today
-  `openManagedTab`'s reusable-tab branch returns after `recordManagedTab`
-  without the materialization callback (3300-3311), so a reserve-before-create
-  claim would stay unbound forever on tab reuse. Claim create/bind rollback
-  runs on every failure path, including a tab closed or job cancelled mid
-  materialization (the reverted attempt's dual orphan race).
-- Warm evidence is **not** a lease: it is exact-profile-scoped (Decision 2)
-  and admits a drive without holding the claim. A stale warm session that
-  bounces to a wall converges on the same single authentication-entry lease
-  at wall observation; a fixed 30-minute origin timestamp never substitutes
-  for claim ownership.
+- New feature-gated correlated claim-observation method family. Each
+  observation carries `request_id`, `authentication_claim_id`,
+  `materialization_claim_id`, `binding_id`, `browser_holder_generation`,
+  `gate_occurrence_id`, `observation_id`, `event_ordinal`, `event_kind`
+  (wall observed / login started / MFA / challenge / auth returned /
+  entitled landing / owner closed / navigation error) — no URL, host,
+  title, query, IdP material, or credentials. Business ordering comes from
+  occurrence + ordinal, never native receipt order (`inboundChain` is FIFO
+  per port generation only; the transport is fail-fatal on framing errors).
+  Unacked events replay with the same ID; the daemon reducer is idempotent
+  and monotonic — duplicates ack, stale transitions are rejected without
+  disconnecting; a parse failure retains surfaces and resolves nothing.
+- One transaction arbitrates claim requests (`navigate_existing` /
+  `open_new` / `focus_owner` / `park` — the August-reviewed design) and
+  issues the authentication-entry lease. Human-paced flows renew the lease
+  through current wall/MFA/challenge observations, never worker-local
+  timers; a restarted worker reconciles before renewing; an event from an
+  old holder generation cannot revive a lease; lease expiry alone never
+  authorizes a replacement while an effect permit is unresolved.
+- Extension consults the claim **before** any `requires_auth` tab exists;
+  ungranted work parks tabless daemon-side. The login surface is one tab
+  with a dependent-sibling count (Decision 6).
+- Successful resolution schedules eligible siblings through the daemon:
+  fresh revalidated route per sibling (routes stay transient), renavigation
+  only through the fence, slot reservation before mint, per-job mint latch
+  (today `openFreshHandoff` materializes before the drive-limit check and
+  has no latch).
 - Legacy extension claim code (`federatedLoginOwners`, v2 hash keys,
-  `parkHandoffWaitingForSession` collision path) is retired in the same
+  `parkHandoffWaitingForSession` collision path) retired in the same
   cutover — no second authority.
 
 ### Slice 4 — automatic drives ride materialization claims (Phase 5 cutover)
 
-Move the automatic offer/drive path onto claim→bind→route→navigated→reconcile,
-retiring legacy pre-open: persisted offer URLs disappear (routes are minted at
-drive time), re-offers revalidate the claim instead of re-opening, and the
-4-per-poll offer batch becomes claim-paced. This is the clean cutover that
-makes "at most one bound scaffold per institution" structural rather than
-best-effort. Gated by ADR-0022's staged-enablement readiness criteria; the
-extension keeps a degraded legacy path only until the feature negotiates.
+Scaffold-first becomes structural: every automatically owned institutional
+tab begins as the opaque `materialize.html#<binding>` scaffold —
+claim → binding → inactive scaffold tab → bind ack (both create **and**
+reuse branches) → revalidation → connectivity admission + effect permit →
+transient route → same-tab navigation → navigated ack. Persisted offer URLs
+disappear; re-offers revalidate the claim instead of re-opening; the
+4-per-poll offer batch becomes claim-paced. Connectivity admission precedes
+route issuance by construction. Rollout order: daemon/host first (feature
+advertised, automatic routing dark) → extension second (emits nothing until
+`hello_ack` advertises) → mixed-version evidence → daemon enables the
+claim-bound automatic path. Structural migration is distinct from ADR-0022
+Phase 5 *enablement* of signed-out first routes, which keeps its own
+readiness criteria — the litter fix does not wait for provider readiness.
 
-### Slice 5 — connectivity gating (extension-only, small)
-
-A defined connectivity authority (online events + one probe lease), consulted
-by **every** materialization entrypoint — queue drain, both `onJobOffer`
-direct paths, queued-handoff release — failing closed to tabless parks.
-Offers queue browser-side; the daemon is untouched.
-
-Sequencing: 0 → 1 → 2 → 3 → 4 → 5. Slices 1-2 are extension-local hygiene that
-shrink the litter immediately and are prerequisites for safe closure; Slice 3
-kills the pileup at its source; Slice 4 is the structural cutover; Slice 5
-closes the wake-flood residual. Rev 1's A-before-C ordering was reviewed as
-unsound (claims were worker-memory; the gate had nothing durable to stand on).
+Sequencing: 0 → 1 → 2a → 2b → 3 → 4. Slice 0 stops the bleeding on day one;
+1-2 build the identity and close machinery that 3-4 stand on. Rev 2's order
+(closes before durable identity; connectivity last; degraded legacy
+fallback) was reviewed as unsafe and is retracted.
 
 ## Test scenarios
 
-1. Update simulation: session wiped, fakes survive, new Bridge — zero new
-   groups/windows, prior scaffolds adopted or retained, none closed without
-   positive evidence, no duplicate claim surfaces after re-offers.
-2. N institutional jobs, cold session: exactly one sign-in tab, N−1 daemon
-   parks; login succeeds once ⇒ all N resume (fresh routes), scaffolds retire;
-   owner closed without success ⇒ zero new surfaces.
-3. Wake flood: 4 offers, network down ⇒ zero tabs; online + probe ⇒ paced
-   drives.
-4. Nav-error and classify exhaustion: park + scaffold close, no auth charge,
-   no cancellation emitted (marker consumed).
-5. Operator-active parked tab is never renavigated or closed; engagement
-   survives a worker restart.
+1. Old daemon / no feature: zero autonomous `requires_auth` tabs; explicit
+   Open still works; nothing legacy pre-opens.
+2. Update simulation: session wiped, fakes survive, new Bridge — zero new
+   groups/windows, scaffolds adopted or retained, none closed without a
+   one-use authorization, no duplicate claim surfaces after re-offers.
+3. N institutional jobs, cold session: exactly one sign-in tab per
+   authentication claim, N−1 daemon parks; login succeeds once ⇒ all N
+   resume (fresh routes), scaffolds retire; owner closed without success ⇒
+   zero new surfaces; duplicate/late claim events (old holder generation,
+   lower ordinal) mutate nothing.
+4. Wake flood: 4 offers, network down ⇒ zero tabs (probe precedes release);
+   online + probe ⇒ paced drives.
+5. Nav-error and classify exhaustion: daemon-committed park + scaffold
+   close, no auth charge, no cancellation emitted (tombstone consumed);
+   exhaustion survives a worker restart.
+6. Operator-active parked tab is never renavigated or closed; engagement
+   and cession survive a worker restart; *papio*'s own focus (action token)
+   does not count as engagement.
+7. Firefox <139: group identity degrades to work-window without silently
+   becoming work-window *ownership*; full event-page teardown between every
+   protocol step.
 
 ## Abort criteria
 
 Attempt five's carry over verbatim. Additionally: any slice that requires
-widening `Response`/IPC shapes (fail-closed skew, see AGENTS.md) stops and
-redesigns behind a new method/feature.
+widening `Response`/IPC shapes or the timing-only auth frames (fail-closed
+skew, see AGENTS.md) stops and redesigns behind a new method/feature.
