@@ -202,6 +202,12 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		if instanceURL == "" || seen[instanceURL] {
 			continue
 		}
+		// Checked before the slot is consumed, not after: the bound is on
+		// candidates emitted, so a DOI echo admitted here is a repository copy
+		// dropped.
+		if isDOIResolverURL(instanceURL) {
+			continue
+		}
 		seen[instanceURL] = true
 		if license == "" {
 			license = "unknown"
@@ -358,6 +364,32 @@ func isObviousPDFURL(value string) bool {
 		return false
 	}
 	return strings.HasSuffix(strings.ToLower(parsed.Path), ".pdf")
+}
+
+// isDOIResolverURL reports whether the URL is nothing but a DOI resolver.
+//
+// OpenAIRE lists these among a record's instances, and they are not acquisition
+// routes: following one lands on the publisher page for the DOI papio submitted
+// in the first place, so the candidate carries no information papio did not
+// already have. Emitting them is worse than useless, because
+// maxInstanceCandidates bounds a record to three candidates and a DOI echo
+// consumes one: measured on the operator's own store, 29 of 42 jobs that
+// reached OpenAIRE had EVERY slot filled this way, which is why the source's
+// genuine contribution — a green-OA copy in an institutional repository that no
+// other configured source indexes — never appeared.
+//
+// Handle resolvers (hdl.handle.net) are deliberately NOT included: a handle
+// names a repository copy papio has no other way to learn about.
+func isDOIResolverURL(value string) bool {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimPrefix(parsed.Hostname(), "www.")) {
+	case "doi.org", "dx.doi.org":
+		return true
+	}
+	return false
 }
 
 func resolvedWork(rec record) work.Work {

@@ -60,8 +60,15 @@ func TestResolveMapsOpenInstancesAsLandingCandidates(t *testing.T) {
 		t.Fatalf("authorization = %q, want the bearer token", gotAuth)
 	}
 	// The pubmed instance has no license and no OPEN access right: skipped.
-	if len(cands) != 2 {
-		t.Fatalf("candidates = %d, want the two licensed instances", len(cands))
+	// The first instance is a doi.org echo of the very DOI being resolved —
+	// note this fixture is a real captured record, so that is what OpenAIRE
+	// actually returns — and it is not an acquisition route: following it lands
+	// on the publisher page for an identifier papio already holds.
+	if len(cands) != 1 {
+		t.Fatalf("candidates = %d, want only the PLOS file instance", len(cands))
+	}
+	if !strings.Contains(cands[0].URL, "journals.plos.org") {
+		t.Fatalf("candidate = %q, want the PLOS instance and not the DOI echo", cands[0].URL)
 	}
 	for _, c := range cands {
 		if c.Source != "openaire" || c.AccessBasis != resolver.AccessOpen {
@@ -326,5 +333,58 @@ func TestResolveMarksObviousPDFPathsDirect(t *testing.T) {
 	}
 	if cands[1].Direct {
 		t.Fatalf("record-page candidate = %+v, want a landing observation", cands[1])
+	}
+}
+
+// crowdedRecord mirrors what the operator's store showed: OpenAIRE lists DOI
+// resolvers among a record's instances, and maxInstanceCandidates admits only
+// three. The two repository copies here are the ONLY thing this source can give
+// that unpaywall (DOI/publisher-centric), europepmc (biomed) and arxiv
+// (preprints) cannot — a green-OA copy deposited in an institutional repository.
+const crowdedRecord = `{
+	"results": [{
+		"id": "50|doi_________::crowded",
+		"mainTitle": "Observation of Gravitational Waves",
+		"publicationDate": "2016-02-11",
+		"bestAccessRight": {"label": "OPEN"},
+		"pids": [{"scheme": "doi", "value": "10.1103/physrevlett.116.061102"}],
+		"authors": [{"fullName": "B. P. Abbott"}],
+		"instances": [
+			{"license": "CC BY", "urls": ["https://doi.org/10.1103/physrevlett.116.061102"], "refereed": "peerReviewed"},
+			{"license": "CC BY", "urls": ["http://dx.doi.org/10.1103/physrevlett.116.061102"]},
+			{"license": "CC BY", "urls": ["https://repo.uni-hannover.de/bitstream/123456789/2133/1/PhysRevLett.116.061102.pdf"]},
+			{"license": "CC BY", "urls": ["https://hdl.handle.net/10400.14/23396"]}
+		]
+	}]
+}`
+
+func TestDOIEchoesDoNotCrowdOutRepositoryCopies(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(crowdedRecord))
+	}))
+	defer server.Close()
+
+	cands, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL}).
+		Resolve(context.Background(), work.Work{DOI: "10.1103/physrevlett.116.061102"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unfiltered, the two DOI echoes take two of the three slots and the
+	// handle copy is never emitted at all.
+	if len(cands) != 2 {
+		t.Fatalf("candidates = %d, want both repository copies", len(cands))
+	}
+	for _, c := range cands {
+		if strings.Contains(c.URL, "doi.org") {
+			t.Fatalf("candidate %q is a DOI echo, not an acquisition route", c.URL)
+		}
+	}
+	if !strings.Contains(cands[0].URL, "repo.uni-hannover.de") || !cands[0].Direct {
+		t.Fatalf("first candidate = %+v, want the repository PDF marked direct", cands[0])
+	}
+	// A handle resolver must survive: unlike a DOI echo, it names a repository
+	// copy papio has no other way to learn about.
+	if !strings.Contains(cands[1].URL, "hdl.handle.net") {
+		t.Fatalf("second candidate = %q, want the handle-style repository copy", cands[1].URL)
 	}
 }
