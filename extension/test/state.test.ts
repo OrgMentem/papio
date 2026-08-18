@@ -153,7 +153,6 @@ test("migration accepts a clean current state and writes an explicit version on 
       url: "https://secret.example/runtime.pdf",
       initiated_at: 1,
     },
-    offerURLs: { job_migrate_0001: "https://secret.example/offer" },
   });
   expect(JSON.stringify(fixture.data.papio_state_v1)).not.toContain(
     "https://secret.example",
@@ -253,7 +252,6 @@ test("migration scrubs every legacy URL, claim hash, and global terms authority"
   expect(serialized).not.toContain(sentinel);
   expect(serialized).not.toContain("legacy-claim");
   expect(serialized).not.toContain("termsConsent");
-  expect(migrated.offerURLs).toBeUndefined();
   expect(serialized).not.toContain("federatedLoginOwners");
   expect(migrated.pendingDelivery?.url).toBeUndefined();
   expect(migrated.activeJobs[0]?.institution_claim_key).toBeUndefined();

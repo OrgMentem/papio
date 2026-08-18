@@ -9,6 +9,7 @@ package browser
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"papio/internal/job"
@@ -560,5 +561,175 @@ func TestClaimObservationNavigationErrorParksWithoutMutatingLease(t *testing.T) 
 	}
 	if after.State != before.State || after.LeaseUntil != before.LeaseUntil || after.OwnerBindingID != before.OwnerBindingID {
 		t.Fatalf("navigation_error mutated the entry lease: before=%+v after=%+v", before, after)
+	}
+}
+
+// The following tests pin Slice 4 (dev/active/surface-lifecycle-plan.md):
+// automatic (non-focus) materialization candidate offers, claim-paced by
+// the authentication-entry lease this file already exercises. None of them
+// ever call FocusHandoffs — the offers below are the daemon's own
+// automatic admission (admitAutomaticMaterializationCandidates), not an
+// explicit human gesture.
+
+// TestAutomaticCandidateOfferForClaimGrantedInstitution proves an ordinary
+// poll offers a candidate whose authentication claim is already granted to
+// this exact job, with no focus request anywhere in the test.
+func TestAutomaticCandidateOfferForClaimGrantedInstitution(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	jobID := parkInstitutional(t, jobs, "auto-claim-granted", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auto-claim-granted-claim")
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-auto-granted")
+
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, jobID,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auto-claim-granted-req", CandidateID: candidateID,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	if grant.Outcome != "open_new" {
+		t.Fatalf("grant outcome = %s, want open_new", grant.Outcome)
+	}
+	offer := firstOfType(granted, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil {
+		// The grant reply itself may or may not carry the offer depending on
+		// scheduler timing within the same poll; a following ordinary poll
+		// must carry it regardless — no focus request is ever sent.
+		var polled []*protocol.BrowserMessage
+		polled, _ = runSync(t, b)
+		offer = firstOfType(polled, protocol.MsgInstitutionalCandidateOffer)
+	}
+	if offer == nil || offer.JobID != jobID {
+		t.Fatalf("claim-granted institution did not receive an automatic candidate offer")
+	}
+	if got := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID; got != candidateID {
+		t.Fatalf("automatic offer candidate_id = %s, want %s", got, candidateID)
+	}
+}
+
+// TestAutomaticCandidateOfferParksDependentUntilEntitledLanding proves a
+// dependent sharing an unresolved authentication claim receives zero
+// automatic candidate offers while the claim owner's sign-in is in
+// progress, and is admitted only after the daemon observes
+// entitled_landing — never via an explicit focus request.
+func TestAutomaticCandidateOfferParksDependentUntilEntitledLanding(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	owner := parkInstitutional(t, jobs, "auto-claim-dep-owner", handoffWork(), "")
+	dependent := parkInstitutional(t, jobs, "auto-claim-dep-dependent", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auto-claim-dep-shared")
+	ownerCandidate := explicitMaterializationCandidate(t, jobs, owner, "domain-dep-owner")
+	dependentCandidate := explicitMaterializationCandidate(t, jobs, dependent, "domain-dep-dependent")
+
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, owner,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auto-claim-dep-req", CandidateID: ownerCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	if grant.Outcome != "open_new" {
+		t.Fatalf("owner grant outcome = %s, want open_new", grant.Outcome)
+	}
+
+	// The claim is reserved to owner but not yet landed: the dependent must
+	// stay parked across several ordinary polls.
+	for range 2 {
+		polled, _ := runSync(t, b)
+		if offer := firstOfType(polled, protocol.MsgInstitutionalCandidateOffer); offer != nil && offer.JobID == dependent {
+			t.Fatalf("dependent of an unresolved claim received a candidate offer: %v", polled)
+		}
+	}
+
+	bindingID := bindCandidate(t, b, owner, ownerCandidate, "auto-claim-dep", 4)
+	runSync(t, b, claimObservationFrame(t, owner, "auto-claim-dep-obs-returned", "auto-claim-dep-shared",
+		bindingID, grant.GateOccurrenceID, "auto-claim-dep-observation-returned", b.epoch, 0, "auth_returned"))
+	landed, _ := runSync(t, b, claimObservationFrame(t, owner, "auto-claim-dep-obs-landing", "auto-claim-dep-shared",
+		bindingID, grant.GateOccurrenceID, "auto-claim-dep-observation-landing", b.epoch, 1, "entitled_landing"))
+	ack := claimObservationAckPayload(t, landed)
+	if ack.Outcome != "applied" {
+		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
+	}
+
+	resumed, _ := runSync(t, b)
+	offer := firstOfType(resumed, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil || offer.JobID != dependent {
+		t.Fatalf("dependent did not receive an automatic candidate offer after entitled_landing: %v", resumed)
+	}
+	if got := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID; got != dependentCandidate {
+		t.Fatalf("resumed dependent offer candidate_id = %s, want %s", got, dependentCandidate)
+	}
+}
+
+// TestAutomaticCandidateOfferSuppressedByLiveOwnerBinding proves the
+// one-bound-scaffold-per-institution pacing: once the claim owner's lease
+// carries a live owner_binding_id (a real bound scaffold), a sibling under
+// the same claim receives no automatic candidate offer, even though its own
+// candidate exists and is otherwise eligible.
+func TestAutomaticCandidateOfferSuppressedByLiveOwnerBinding(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	owner := parkInstitutional(t, jobs, "auto-claim-bound-owner", handoffWork(), "")
+	dependent := parkInstitutional(t, jobs, "auto-claim-bound-dependent", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auto-claim-bound-shared")
+	ownerCandidate := explicitMaterializationCandidate(t, jobs, owner, "domain-bound-owner")
+	explicitMaterializationCandidate(t, jobs, dependent, "domain-bound-dependent")
+
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, owner,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auto-claim-bound-req", CandidateID: ownerCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	authClaimResponse(t, granted)
+	bindCandidate(t, b, owner, ownerCandidate, "auto-claim-bound", 3)
+
+	lease, found, err := jobs.GetAuthenticationEntryLease(context.Background(), "auto-claim-bound-shared")
+	if err != nil || !found || lease.OwnerBindingID == "" {
+		t.Fatalf("owner binding was not recorded on the lease: %+v found=%v err=%v", lease, found, err)
+	}
+
+	polled, _ := runSync(t, b)
+	if offer := firstOfType(polled, protocol.MsgInstitutionalCandidateOffer); offer != nil && offer.JobID == dependent {
+		t.Fatalf("dependent received a candidate offer while the claim held a live owner binding: %v", polled)
+	}
+}
+
+// TestAutomaticCandidateOfferWakeFloodPacesToOneClaimOwner is the wake-flood
+// fence: four institutional jobs across four provider-safety domains share
+// one still-unclaimed authentication claim, so the scheduler's fair,
+// per-domain batch would otherwise hand all four to the offer loop in one
+// poll. Claim pacing must reduce that to exactly one candidate offer.
+func TestAutomaticCandidateOfferWakeFloodPacesToOneClaimOwner(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auto-claim-flood-shared")
+	for i := range 4 {
+		jobID := parkInstitutional(t, jobs, fmt.Sprintf("auto-claim-flood-%d", i), handoffWork(), "")
+		explicitMaterializationCandidate(t, jobs, jobID, fmt.Sprintf("domain-flood-%d", i))
+	}
+	msgs, _ := runSync(t, b)
+	if got := countType(msgs, protocol.MsgInstitutionalCandidateOffer); got != 1 {
+		t.Fatalf("wake flood emitted %d candidate offers against one unresolved claim, want 1: %v", got, msgs)
+	}
+}
+
+// TestLegacySessionAutomaticPathStaysDarkWithoutMaterializationFeature pins
+// the compatibility boundary: a session that never negotiated
+// institutional_materialization_v1 gets exactly today's legacy behavior —
+// the ordinary URL-bearing job offer, never a materialization candidate
+// offer — regardless of any authentication-claim state.
+func TestLegacySessionAutomaticPathStaysDarkWithoutMaterializationFeature(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	jobID := parkInstitutional(t, jobs, "legacy-no-materialization", handoffWork(), "")
+	initial, _ := runSync(t, b, hello())
+	msgs, _ := runSync(t, b)
+	if firstOfType(initial, protocol.MsgInstitutionalCandidateOffer) != nil || firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer) != nil {
+		t.Fatalf("legacy session received a materialization candidate offer: hello=%v poll=%v", initial, msgs)
+	}
+	offer := firstOfType(initial, protocol.MsgJobOffer)
+	if offer == nil {
+		offer = firstOfType(msgs, protocol.MsgJobOffer)
+	}
+	if offer == nil || offer.JobID != jobID {
+		t.Fatalf("legacy session did not receive the ordinary job offer: hello=%v poll=%v", initial, msgs)
 	}
 }

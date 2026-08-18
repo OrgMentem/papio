@@ -763,7 +763,8 @@ export type ManagedTabPurpose =
   | "session-signin"
   | "redrive"
   | "reoffer"
-  | "capture";
+  | "capture"
+  | "claim-scaffold";
 /** Non-URL free-text marker for a one-use federated-login mint's birth
  * record (Slice 2b): excluded from cross-job reuse pools the same way the
  * legacy raw-URL ledger's `privateURL` flag was. */
@@ -803,6 +804,11 @@ export interface OpenManagedTabOptions {
   onTabMaterialized?: (tabID: number) => void;
   /** Persist only a private ownership marker, never the one-use URL. */
   privateLedgerURL?: boolean;
+  /** Explicit birth-certificate binding for a self-identifying scaffold
+   * (Slice 4): the ledger record must carry the SAME id baked into the
+   * scaffold URL's fragment, never an independently minted one. Ignored on
+   * a reuse hit — a reused tab's ledger binding is already fixed. */
+  bindingID?: string;
 }
 
 export interface TabChangeInfo {
@@ -3495,6 +3501,7 @@ export class Bridge {
       options.purpose,
       options.privateLedgerURL === true,
       options.jobId,
+      options.bindingID,
     );
     if (options.purpose === "session-signin") {
       try {
@@ -3658,6 +3665,7 @@ export class Bridge {
     purpose: string,
     privateSurface = false,
     jobID?: string,
+    bindingID?: string,
   ): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
     let tab: TabInfo;
@@ -3673,7 +3681,7 @@ export class Bridge {
       if (ledger[key] !== undefined)
         return { value: undefined, changed: false };
       ledger[key] = {
-        binding_id: this.deps.randomUUID(),
+        binding_id: bindingID ?? this.deps.randomUUID(),
         tab_hint: tabID,
         purpose: privateSurface ? PRIVATE_SURFACE_PURPOSE : purpose,
         browser_epoch: this.browserEpoch ?? "unknown",
@@ -5275,29 +5283,6 @@ export class Bridge {
     this.bindListeners();
     this.ready = this.deps.backend.load().then(async (s) => {
       this.store = clearNegotiationState(s);
-      this.offerURLs.clear();
-      const persistedOffers = { ...(s.offerURLs ?? {}) };
-      for (const [jobID, url] of Object.entries(persistedOffers)) {
-        const restored = findByJob(s, jobID);
-        if (typeof url !== "string" || restored === undefined) {
-          delete persistedOffers[jobID];
-          continue;
-        }
-        if (
-          restored.requires_auth === true &&
-          restored.engagement_required === true &&
-          restored.fresh_handoff === true
-        ) {
-          // A minted fresh link is a one-call capability and must never
-          // survive a restart. A LEGACY engagement park (no fresh_handoff)
-          // keeps its offer URL: it is the only route the operator's
-          // explicit open has against a daemon without fresh links.
-          delete persistedOffers[jobID];
-          continue;
-        }
-        this.offerURLs.set(jobID, url);
-      }
-      this.store = { ...this.store, offerURLs: persistedOffers };
       const correlations =
         this.deps.pdfGrabCorrelations === undefined
           ? {}
@@ -6589,7 +6574,11 @@ export class Bridge {
           "The daemon could not authorize a sign-in surface right now",
         );
       }
-      // consult.kind === "open_new": fall through to mint below.
+      // consult.kind === "open_new": this job now owns the claim — Slice 4
+      // scaffold-first mint (plan lines 341-360), never the legacy
+      // direct-URL path below (that path is reserved for jobs with no
+      // live candidate at all — see the branch below).
+      return this.materializeClaimOwnedScaffold(jobID, job, trigger);
     } else if (job.claim_identity_known !== true) {
       // Neither identity source (a job_offer's login_entity_id, an
       // institutional_candidate_offer's candidate id, or a durably-marked
@@ -6687,6 +6676,142 @@ export class Bridge {
       this.releaseEffectGovernor(jobID, effectToken, false);
       this.wakeEffectGovernor();
       return { ok: true, opened: true };
+    } finally {
+      this.mintingFreshHandoffs.delete(jobID);
+    }
+  }
+
+  /** Slice 4 (plan lines 341-360): scaffold-first creation for a granted
+   * open_new claim. The scaffold is an opaque materialize.html#<binding>
+   * tab identified by this job's OWN birth-certificate binding — distinct
+   * from ADR-0022's daemon-issued materialization binding, a separate
+   * Phase 5 (signed-out-first-route) mechanism this slice does not
+   * conflate with. openManagedTab's existing job_id-scoped ledger reuse
+   * (never URL family matching) is the create/rebind fork: a scaffold
+   * surviving a worker restart is picked back up by binding identity
+   * instead of minting a duplicate — the structural "at most one bound
+   * scaffold per claim" guarantee, since only the job holding the granted
+   * claim ever reaches this method. Connectivity admission and the effect
+   * permit gate the transient route and the same-tab navigation, never the
+   * inert scaffold create/reuse itself. */
+  private async materializeClaimOwnedScaffold(
+    jobID: string,
+    job: ActiveJob,
+    trigger: "automatic" | "explicit",
+  ): Promise<BrokerReply<{ opened: true }>> {
+    this.mintingFreshHandoffs.add(jobID);
+    try {
+      const bindingID = this.deps.randomUUID();
+      const scaffoldURL = this.materializationURL(bindingID);
+      if (scaffoldURL === undefined) {
+        await this.parkForEngagement(jobID);
+        return failure(
+          "handoff_unavailable",
+          "The daemon could not authorize a sign-in surface right now",
+        );
+      }
+      let tabID: number | undefined;
+      try {
+        tabID = await this.openManagedTab({
+          url: scaffoldURL,
+          jobId: jobID,
+          purpose: "claim-scaffold",
+          surfaceFallback: false,
+          focusExisting: false,
+          bindingID,
+        });
+      } catch {
+        tabID = undefined;
+      }
+      if (tabID === undefined) {
+        return failure(
+          "tab_creation_failed",
+          "The handoff tab could not be created",
+        );
+      }
+      if (findByJob(this.store, jobID) === undefined) {
+        // The job was cancelled/removed while the scaffold was being
+        // created. It carries no route yet and no other job can claim
+        // it (the claim is this job's alone); leave it for the standard
+        // close-authorization transaction to reclaim.
+        return failure(
+          "tab_creation_failed",
+          "The handoff tab could not be created",
+        );
+      }
+      await this.update((s) =>
+        patchJob(s, jobID, {
+          status: "accepted",
+          engagement_required: false,
+          fresh_handoff: true,
+        }),
+      );
+      if (!(this.deps.online?.() ?? true)) {
+        // Connectivity admission precedes route issuance by construction:
+        // the scaffold stays live and reusable (the reuse branch above
+        // picks it back up), nothing navigates it into a dead network.
+        await this.parkForEngagement(jobID);
+        return failure(
+          "handoff_unavailable",
+          "The daemon could not authorize a sign-in surface right now",
+        );
+      }
+      const effectToken = this.claimEffectGovernor(jobID);
+      if (effectToken === undefined) {
+        this.pendingFreshHandoffs.set(jobID, { job, trigger });
+        return failure(
+          "effect_busy",
+          "Handoff will open when the current browser effect finishes",
+        );
+      }
+      try {
+        const minted = await this.requestFreshHandoffLink(jobID);
+        if (!minted.ok) return minted;
+        if (findByJob(this.store, jobID) === undefined) {
+          return failure(
+            "handoff_unavailable",
+            "The handoff changed before it could be opened",
+          );
+        }
+        // Revalidation / renavigation fence (plan lines 175-184): a fresh
+        // read immediately before the act, no unrelated await between —
+        // never renavigate a scaffold the operator has since made active.
+        let live: TabInfo | undefined;
+        try {
+          live = await this.deps.tabs.get(tabID);
+        } catch {
+          live = undefined;
+        }
+        if (
+          live?.id !== tabID ||
+          live.active === true ||
+          this.deps.tabs.update === undefined
+        ) {
+          return failure(
+            "handoff_unavailable",
+            "The claimed sign-in surface is no longer live",
+          );
+        }
+        try {
+          await this.deps.tabs.update(tabID, { url: minted.url });
+        } catch {
+          return failure(
+            "tab_creation_failed",
+            "The handoff tab could not be created",
+          );
+        }
+        this.beginProviderDrive(jobID);
+        this.registerHandoffDrive(jobID, tabID);
+        try {
+          await this.focusManagedTab(tabID);
+        } catch {
+          // The managed tab remains available in its papio surface.
+        }
+        return { ok: true, opened: true };
+      } finally {
+        this.releaseEffectGovernor(jobID, effectToken, false);
+        this.wakeEffectGovernor();
+      }
     } finally {
       this.mintingFreshHandoffs.delete(jobID);
     }
@@ -11233,30 +11358,14 @@ export class Bridge {
     job: ActiveJob,
     offerURL: string,
   ): Promise<void> {
-    await this.update((s) => {
-      const withJob = upsertJob(s, job);
-      if (this.supportsFreshHandoffLinks() && job.requires_auth === true) {
-        const offerURLs = { ...(s.offerURLs ?? {}) };
-        delete offerURLs[job.job_id];
-        return { ...withJob, offerURLs };
-      }
-      return {
-        ...withJob,
-        offerURLs: { ...(s.offerURLs ?? {}), [job.job_id]: offerURL },
-      };
-    });
+    await this.update((s) => upsertJob(s, job));
     this.offerURLs.set(job.job_id, offerURL);
     if (job.requires_auth === true)
       this.keepaliveManager?.learnResolver(offerURL);
   }
   private async upsertJobWithoutOffer(job: ActiveJob): Promise<void> {
     this.offerURLs.delete(job.job_id);
-    await this.update((s) => {
-      const withJob = upsertJob(s, job);
-      const offerURLs = { ...(s.offerURLs ?? {}) };
-      delete offerURLs[job.job_id];
-      return { ...withJob, offerURLs };
-    });
+    await this.update((s) => upsertJob(s, job));
   }
 
   private async removeJobWithOffer(jobID: string): Promise<void> {
@@ -11306,12 +11415,8 @@ export class Bridge {
       await this.removeMaterializationTab(materializationTabID);
     }
     await this.update((s) => {
-      const offerURLs = { ...(s.offerURLs ?? {}) };
-      delete offerURLs[jobID];
       const withoutJob = clearPendingDelivery(removeJob(s, jobID), jobID);
-      return reduceMaterialization({ ...withoutJob, offerURLs }, jobID, {
-        type: "clear",
-      });
+      return reduceMaterialization(withoutJob, jobID, { type: "clear" });
     });
     if (providerKey !== undefined)
       await this.releaseProviderDrainWhenUnused(providerKey);
@@ -13628,19 +13733,14 @@ export class Bridge {
             .filter((job) => job.requires_auth === true)
             .map((job) => job.job_id);
           for (const jobID of authJobIDs) this.offerURLs.delete(jobID);
-          await this.update((s) => {
-            const offerURLs = { ...(s.offerURLs ?? {}) };
-            for (const jobID of authJobIDs) delete offerURLs[jobID];
-            return {
-              ...s,
-              offerURLs,
-              activeJobs: s.activeJobs.map((job) =>
-                job.requires_auth === true && job.tab_id < 0
-                  ? { ...job, engagement_required: true, fresh_handoff: true }
-                  : job,
-              ),
-            };
-          });
+          await this.update((s) => ({
+            ...s,
+            activeJobs: s.activeJobs.map((job) =>
+              job.requires_auth === true && job.tab_id < 0
+                ? { ...job, engagement_required: true, fresh_handoff: true }
+                : job,
+            ),
+          }));
         }
         void this.reconcileMaterializationTabs().then(() => {
           for (const [jobID, entry] of Object.entries(
@@ -14050,11 +14150,6 @@ export class Bridge {
     if (freshLinks && requiresAuth === true && existing !== undefined) {
       this.offerURLs.delete(jobID);
       this.keepaliveManager?.learnResolver(openurl);
-      await this.update((s) => {
-        const offerURLs = { ...(s.offerURLs ?? {}) };
-        delete offerURLs[jobID];
-        return { ...s, offerURLs };
-      });
     }
     if (existing !== undefined && existing.requires_auth !== requiresAuth) {
       // A restored job can predate this field; its first re-offer must learn the

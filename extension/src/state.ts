@@ -759,9 +759,6 @@ export interface StoreShape {
   /** The one operator-initiated PDF delivery currently awaiting daemon
    * adoption. URL is worker-local and is not durable. */
   pendingDelivery?: PendingDelivery;
-  /** Resolver-provided offer URLs remain worker-local compatibility data and
-   * are always dropped by managed persistence. */
-  offerURLs?: Record<string, string>;
   /** Most recent auth return, retained as a display hint. */
   lastAuthReturnedAt?: number;
   /** Release-grade evidence by configured resolver origin. */
@@ -1572,9 +1569,6 @@ function migratedState(raw: UnknownRecord): StoreShape {
   const challengeCooldowns = migratedCooldownMap(raw.challengeCooldowns);
   if (challengeCooldowns !== undefined)
     output.challengeCooldowns = challengeCooldowns;
-  // offerURLs are worker-local compatibility data (handoff URLs), always
-  // dropped by managed persistence.
-  delete output.offerURLs;
   return output;
 }
 
