@@ -20,6 +20,23 @@ for the full pre-split extension history.
 - **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
 
 ### Changed
+- ***papio* no longer opens institutional sign-in tabs on its own.** Every
+  autonomous path that used to create a `requires_auth` surface — a warm
+  session admitting a queued offer, the 45-second fallback timer, a daemon
+  re-offer recreating a closed tab, startup re-driving a restored backlog,
+  and the sibling resume after a login — now parks the work tabless in the
+  inbox as *needs your engagement* instead, until the daemon advertises the
+  ADR-0022 authentication-claim feature (no shipped daemon does yet) AND the
+  network is up. Clicking **Open** works exactly as before; what is gone is
+  papio deciding by itself that now is the moment for a sign-in tab, which
+  is how a tab group grew seventeen tabs across a weekend. Three sibling
+  fixes land with it: a wake from sleep now checks connectivity before
+  releasing queued work (tabs were being driven into a dead network), a
+  repeated *Sign in* request reuses the live sign-in tab instead of minting
+  another, and a papio-created tab that has navigated through its
+  resolver→SSO→provider redirect chain is no longer forgotten by the tab
+  ledger — it is remembered as papio's own, though never touched, until the
+  durable-ownership work can prove tab identity across restarts.
 - **A paper you picked no longer stays picked after you leave the PDF.** The popup's offer is now one-shot: the background mints an opaque nonce held only in service-worker memory, consumes it synchronously on selection, and freezes the page identity — tab, document, same-document navigation sequence and resolved source URL — against that pick. The offer dies when the worker restarts, when the tab navigates, closes, or is replaced, or when the delivery settles or fails; a later page in the same tab id never revives it. The native-viewer *Download* continuation is the one state that does survive a restart, held in session storage with its own job binding and page identity and re-validated when the download is claimed, and it is destroyed on every cancel or close path. This replaces the old `manual_delivery_target` pin (`Open` in the inbox) and `uniqueManualDeliveryTarget` cross-tab authority — a DOI-less file that reaches the daemon without your pick follows the blind grab path as before. To recognise when a tab has navigated away from the PDF you picked, the extension now requests the `webNavigation` permission (Chrome and Firefox); no browsing history is collected.
 
 - **A browser that is not the session holder no longer claims the daemon is

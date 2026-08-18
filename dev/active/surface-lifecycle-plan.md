@@ -198,6 +198,15 @@ never widened.
 
 ### Slice 0 — containment (extension-only; stops new litter now)
 
+**SHIPPED 2026-08-18.** Feature gate `institutional_authentication_claim_v1`
+(extension-side check only; the daemon defines it in Slice 3), `BridgeDeps.
+online` seam, gates at every autonomous entry (offer tail, fresh-link
+cold/recovery, legacy recovery, drive-queue create, startup reopen/requeue,
+45s release, forced release, opportunistic drain, claim-resume auto-drive),
+probe-before-release wake ordering, ledger retention on navigation
+(surfaced nowhere until Slice 2 identity), jobless sign-in tab reuse.
+Pinned by the "Slice 0:" test block in `extension/test/background.test.ts`.
+
 The smallest slice with most operator value; no aggressive cleanup.
 
 - No autonomous `requires_auth` surface unless the daemon advertises the

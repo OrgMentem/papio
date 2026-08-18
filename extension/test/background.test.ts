@@ -93,6 +93,11 @@ const CURRENT_DAEMON = MIN_DAEMON_VERSION;
 
 const OPENURL = "https://resolver.example.edu/openurl?ctx=abc";
 const PROVIDER_HOST = "www.jstor.org";
+/** Simulates the ADR-0022 Phase 4 authentication-claim daemon (surface-
+ * lifecycle plan, Slice 3). Tests exercising the AUTONOMOUS requires_auth
+ * open/release machinery negotiate it; without it the Slice 0 containment
+ * gate parks that work tabless as engagement_required. */
+const AUTH_CLAIM = "institutional_authentication_claim_v1";
 test("managed tab dedupe ignores URL fragments and prioritizes a tracked tab", () => {
   const candidates: TabInfo[] = [
     { id: 100, url: "https://sage.example/article?download=1#section-a" },
@@ -2075,7 +2080,7 @@ test("a cold requires-auth handoff is signalled while queued and opens after its
   offer.payload["requires_auth"] = true;
 
   await h.bridge.start();
-  await h.port.inbound(helloAck());
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   await h.port.inbound(offer);
 
   expect(h.tabs.created).toEqual([]);
@@ -2258,7 +2263,9 @@ test("handoff_link_v1 keeps a warm requires-auth offer on the eager path", async
   offer.payload["login_entity_id"] = "https://idp.example.edu/entity";
 
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }),
+  );
   await h.port.inbound(offer);
 
   expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
@@ -2272,6 +2279,208 @@ test("handoff_link_v1 keeps a warm requires-auth offer on the eager path", async
   expect(
     h.frames().filter((frame) => frame.type === "handoff_link_request"),
   ).toEqual([]);
+});
+
+// --- Slice 0 containment (dev/active/surface-lifecycle-plan.md) ---
+// Without the daemon-side authentication-claim feature, NO autonomous path
+// may create a requires_auth surface; the work parks tabless for explicit
+// engagement. These pin the gate closed; the machinery itself stays covered
+// by the AUTH_CLAIM-negotiating tests above.
+
+test("Slice 0: a warm legacy requires-auth offer parks for engagement without the claim feature", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  const offer = jobOffer("job_gate_warm_legacy") as {
+    payload: Record<string, unknown>;
+  };
+  offer.payload["requires_auth"] = true;
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    job_id: "job_gate_warm_legacy",
+    tab_id: -1,
+    status: "queued",
+    engagement_required: true,
+    requires_auth: true,
+  });
+  // A legacy offer keeps its URL so the operator's explicit open can use it.
+  expect(h.backend.store.offerURLs?.["job_gate_warm_legacy"]).toBe(OPENURL);
+
+  // The 45s fallback wake never admits engagement-gated work.
+  h.clock.now += 60_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  expect(h.tabs.created).toEqual([]);
+});
+
+test("Slice 0: a warm fresh-link requires-auth offer stays tabless without the claim feature", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  const offer = jobOffer("job_gate_warm_fresh") as {
+    payload: Record<string, unknown>;
+  };
+  offer.payload["requires_auth"] = true;
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    job_id: "job_gate_warm_fresh",
+    tab_id: -1,
+    status: "queued",
+    engagement_required: true,
+    fresh_handoff: true,
+  });
+  // The fresh-link privacy cutover holds: no persisted route.
+  expect(h.backend.store.offerURLs?.["job_gate_warm_fresh"]).toBeUndefined();
+});
+
+test("Slice 0: the claim feature alone does not open into a dead network", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  h.deps.online = () => false;
+  const offer = jobOffer("job_gate_offline") as {
+    payload: Record<string, unknown>;
+  };
+  offer.payload["requires_auth"] = true;
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
+  await h.port.inbound(offer);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    tab_id: -1,
+    status: "queued",
+    engagement_required: true,
+  });
+});
+
+test("Slice 0: an offline wake releases nothing; the next online wake releases", async () => {
+  const jobID = "job_gate_wake";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 9_999_999_999_999,
+        status: "queued",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: { [jobID]: OPENURL },
+  });
+  let online = false;
+  h.deps.online = () => online;
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
+  h.clock.now += 60_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  // Probe-before-release: a dead-network wake must not navigate anything.
+  expect(h.tabs.created).toEqual([]);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === jobID),
+  ).toMatchObject({ status: "queued", tab_id: -1 });
+
+  online = true;
+  h.clock.now += 60_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  // The bounded fallback release deliberately surfaces auth work (active).
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+});
+
+test("Slice 0: claim retirement without the claim feature parks the tabless waiter for engagement", async () => {
+  const claimKey = "claim_gate_waiter";
+  const ownerID = "job_gate_owner";
+  const waiterID = "job_gate_waiter";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: ownerID,
+        tab_id: 55,
+        offered_at: 1,
+        expires_at: 9_999_999_999_999,
+        status: "auth_pending",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+        institution_claim_key: claimKey,
+      },
+      {
+        job_id: waiterID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 9_999_999_999_999,
+        status: "queued",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+        waiting_for_session: true,
+        waiting_for_session_key: claimKey,
+      },
+    ],
+    federatedLoginOwners: {
+      [claimKey]: { jobID: ownerID, tabID: 55, phase: "auth" },
+    },
+    offerURLs: { [waiterID]: OPENURL },
+  });
+  h.tabs.seed({ id: 55, url: "https://idp.example.edu/sso" });
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.tabs.userClose(55);
+
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === waiterID),
+  ).toMatchObject({
+    tab_id: -1,
+    status: "queued",
+    waiting_for_session: false,
+    engagement_required: true,
+  });
+  expect(h.tabs.created).toEqual([]);
+});
+
+test("Slice 0: repeated sign-in requests reuse the live papio sign-in tab", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness();
+  let ledger: Record<string, { openedAt: number; url: string }> = {};
+  h.deps.tabLedger = {
+    load: async () => ({ ...ledger }),
+    save: async (entries) => {
+      ledger = { ...entries };
+    },
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: [origin] }));
+  const first = await h.bridge.requestSessionSignIn(origin);
+  expect(first.ok).toBe(true);
+  expect(h.tabs.created).toHaveLength(1);
+  const tabID =
+    [...Object.keys(ledger)].map(Number).find((id) => id >= 0) ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  // The operator is mid-SAML on the IdP: same sign-in surface, no new tab.
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+  const second = await h.bridge.requestSessionSignIn(origin);
+  expect(second.ok).toBe(true);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.tabs.activated).toContain(tabID);
 });
 
 test("a fresh tab that loses its binding to cancellation is closed", async () => {
@@ -3579,6 +3788,7 @@ test("a challenge parks only its provider and leaves another provider draining",
   const h = makeHarness();
   useUnknownProviderClassifier(h, () => true);
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   await h.port.inbound(jobOffer("job_challenge_source"));
   const sourceTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const challengeURL = `https://${PROVIDER_HOST}/stable/challenge`;
@@ -3630,6 +3840,7 @@ test("an expired provider lease reclaims its queued handoff without a new offer"
   const h = makeHarness();
   useUnknownProviderClassifier(h, () => true);
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   await h.port.inbound(jobOffer("job_lease_source"));
   const sourceTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const challengeURL = `https://${PROVIDER_HOST}/stable/challenge`;
@@ -10066,6 +10277,7 @@ test("restore recovers an auth-required handoff whose OpenURL base looks like a 
     authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
   });
   await first.bridge.start();
+  await first.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   const jobIDs = Array.from(
     { length: 4 },
     (_, index) => `job_pdfbase_governor_${index}`,
@@ -10084,15 +10296,26 @@ test("restore recovers an auth-required handoff whose OpenURL base looks like a 
   expect(parked.length).toBeGreaterThan(0);
   expect(parked.every((job) => job.status === "accepted")).toBe(true);
 
+  // A restarted worker has no negotiated features until its own hello_ack
+  // lands, and reconciliation runs first — so the Slice 0 containment gate
+  // parks the requires_auth backlog for explicit engagement instead of
+  // re-driving it into surfaces (surface-lifecycle plan: restore must not
+  // multiply sign-in tabs). The direct-download shortcut still never fires.
   const restarted = makeHarness(
     JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
   );
   await restarted.bridge.start();
+  expect(restarted.downloads.started).toHaveLength(0);
   const parkedIDs = parked.map((job) => job.job_id);
-  const drivenAfterRestart = restarted.backend.store.activeJobs.filter(
-    (job) => parkedIDs.includes(job.job_id) && job.tab_id >= 0,
+  const afterRestart = restarted.backend.store.activeJobs.filter((job) =>
+    parkedIDs.includes(job.job_id),
   );
-  expect(drivenAfterRestart.length).toBeGreaterThan(0);
+  expect(afterRestart.length).toBeGreaterThan(0);
+  for (const job of afterRestart) {
+    expect(job.tab_id).toBe(-1);
+    expect(job.status).toBe("queued");
+    expect(job.engagement_required).toBe(true);
+  }
 });
 
 test("per-origin sign-in hands the tab to the keepalive manager", async () => {
@@ -11133,6 +11356,7 @@ test("keepalive warmth releases only the matching resolver queue", async () => {
   uwaOffer.payload["requires_auth"] = true;
 
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   await h.port.inbound(defaultOffer);
   await h.port.inbound(uwaOffer);
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, collegeOrigin));
@@ -11277,7 +11501,7 @@ test("created broker tabs are ledgered durably and forgotten once they close", a
   await h.tabs.userClose(tabID);
   expect(ledger[String(tabID)]).toBeUndefined();
 });
-test("review drops a stale ledger id collision without focusing the foreign tab", async () => {
+test("review never focuses a stale ledger id collision; the unproven entry is retained", async () => {
   const h = makeHarness();
   let ledger: Record<
     string,
@@ -11293,9 +11517,13 @@ test("review drops a stale ledger id collision without focusing the foreign tab"
   };
   h.tabs.seed({ id: 300, url: "https://foreign.example.edu/current" });
   await h.bridge.start();
+  // By URL alone a navigated papio tab and a recycled tab id naming a
+  // foreign tab are indistinguishable, so the entry authorizes no action —
+  // but it is NOT deleted: ordinary redirects must not erase ownership
+  // evidence (surface-lifecycle plan, Slice 0; identity proof is Slice 2).
   expect(await h.bridge.cleanupOrphanTabs()).toEqual({ closed: 0, focused: 0 });
   expect(h.tabs.activated).not.toContain(300);
-  expect(ledger["300"]).toBeUndefined();
+  expect(ledger["300"]).toBeDefined();
 });
 
 // Commit B: the browser tells papio when a resolver page changed (so the
@@ -11717,6 +11945,7 @@ test("fresh evidence for one resolver releases only that resolver's queued hando
   offerB.payload["requires_auth"] = true;
 
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   await h.port.inbound(offerA);
   await h.port.inbound(offerB);
   expect(
@@ -11784,6 +12013,7 @@ test("a committed sign-out revokes that origin's release authority immediately",
   offer.payload["requires_auth"] = true;
 
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   await h.bridge.recordFreshSessionEvidence(freshEvidence(h, origin));
   await h.bridge.revokeAuthEvidence(origin);
 
@@ -11830,6 +12060,7 @@ test("fresh evidence for one resolver cannot be laundered into another's queue b
   };
   openAccess.payload["requires_auth"] = false;
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   await h.port.inbound(institutionalA);
   await h.port.inbound(institutionalB);
   await h.port.inbound(openAccess);
@@ -12047,6 +12278,7 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
   await h.bridge.start();
   await h.port.inbound(
     helloAck({
+      features: [AUTH_CLAIM],
       resolver_origins: ["https://resolver.example.edu", otherOrigin],
     }),
   );
@@ -13115,6 +13347,7 @@ test("the owner completing its own login resumes waiting siblings even when inst
     resolverOrigins: [RESOLVER_ORIGIN],
   });
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   const offerA = fedLoginOffer("job_fed_owner_a") as {
     payload: Record<string, unknown>;
   };

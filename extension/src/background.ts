@@ -301,6 +301,13 @@ const SESSION_EVIDENCE_FEATURE = "session_evidence_v1";
 const DELIVERY_CONTEXT_FEATURE = "delivery_context_v1";
 const PROVIDER_DIRECT_GET_FEATURE = "provider_direct_get_v1";
 const HANDOFF_LINK_FEATURE = "handoff_link_v1";
+/** Reserved for ADR-0022 Phase 4 (surface-lifecycle plan, Slice 3): the
+ * daemon-side authentication-claim arbitration. No shipped daemon advertises
+ * it yet, so the Slice 0 containment gate below is closed everywhere: an
+ * autonomous `requires_auth` surface cannot be created, and institutional
+ * work parks tabless for explicit engagement instead. This is also the
+ * permanent degraded-compatibility behavior against an older daemon. */
+const AUTHENTICATION_CLAIM_FEATURE = "institutional_authentication_claim_v1";
 const PROVIDER_DRIVE_EPOCH_FEATURE = "provider_drive_epoch_v1";
 const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
 const STATS_FEATURE = "browser_stats_v1";
@@ -1076,6 +1083,10 @@ export interface BridgeDeps {
     get?(name: string): Promise<{ name: string } | undefined>;
     onAlarm: Listenable<[{ name: string }]>;
   };
+  /** navigator.onLine snapshot. Absent (older harnesses) reads as online.
+   * False gates queued-handoff releases and the autonomous-auth surface
+   * gate: a wake after sleep must not navigate work into a dead network. */
+  online?: () => boolean;
 }
 
 interface GenericDownloadAttempt {
@@ -3232,6 +3243,17 @@ export class Bridge {
         // A stale persisted id is not proof that a matching tab is absent.
       }
     }
+    if (options.jobId === undefined && options.purpose === "session-signin") {
+      const reusedTabID = await this.findLedgeredSignInTab(options.url);
+      if (reusedTabID !== undefined) {
+        try {
+          await this.focusManagedTab(reusedTabID);
+        } catch {
+          // Focus denial leaves the live sign-in tab where it already is.
+        }
+        return reusedTabID;
+      }
+    }
     if (options.jobId !== undefined) {
       const ledger = await this.snapshotTabLedger();
       const offerFamily = managedTabURLFamily(options.url);
@@ -3511,10 +3533,51 @@ export class Bridge {
     });
   }
 
+  /** A live papio-created sign-in tab for this origin family. The jobless
+   * sign-in fallback used to skip ledger reuse entirely (candidate gathering
+   * is jobId-scoped), so repeated fallbacks minted repeated sign-in tabs
+   * (surface-lifecycle plan, Slice 0). A tab qualifies while its current
+   * document is still at the requested origin family or on an authentication
+   * page — either way the sign-in surface already exists. A tab tracked by
+   * any job is never a candidate: sign-in must not steal a job's surface. */
+  private async findLedgeredSignInTab(url: string): Promise<number | undefined> {
+    const family = managedTabURLFamily(url);
+    if (family === undefined) return undefined;
+    const ledger = await this.snapshotTabLedger();
+    for (const key of Object.keys(ledger)) {
+      const tabID = Number(key);
+      if (!Number.isInteger(tabID) || tabID < 0) continue;
+      const entry = ledger[key];
+      if (entry === undefined || entry.privateURL === true) continue;
+      if (managedTabURLFamily(entry.url) !== family) continue;
+      if (findByTab(this.store, tabID) !== undefined) continue;
+      let tab: TabInfo;
+      try {
+        tab = await this.deps.tabs.get(tabID);
+      } catch {
+        continue;
+      }
+      if (tab.id !== tabID || typeof tab.url !== "string") continue;
+      if (
+        managedTabURLFamily(tab.url) !== family &&
+        !isAuthenticationURL(tab.url)
+      )
+        continue;
+      return tabID;
+    }
+    return undefined;
+  }
+
   /** Classify ledgered, untracked tabs without taking lifecycle action. Tabs
-   * in papio surfaces and tabs the operator can review are returned separately;
-   * dead or identity-mismatched entries are pruned. Tracked, active, and
-   * pinned (keepalive) tabs are never candidates. */
+   * in papio surfaces and tabs the operator can review are returned
+   * separately; dead entries are pruned. A tab that navigated away from its
+   * creation URL stays ledgered — ordinary resolver→SSO→provider redirects
+   * must not erase ownership evidence (surface-lifecycle plan, Slice 0) —
+   * but it is surfaced NOWHERE: by URL alone a navigated papio tab is
+   * indistinguishable from a recycled tab id naming a foreign tab, so the
+   * entry authorizes no action (not even review focus) until restart-class
+   * identity proof exists (Slice 2). Tracked, active, and pinned (keepalive)
+   * tabs are never candidates. */
   private async classifyLedgeredTabs(): Promise<{
     auto: number[];
     ask: number[];
@@ -3557,12 +3620,9 @@ export class Bridge {
           changed = true;
           continue;
         }
-        if (entry.privateURL !== true && tab.url !== entry.url) {
-          delete ledger[key];
-          changed = true;
-          continue;
-        }
+        const navigated = entry.privateURL !== true && tab.url !== entry.url;
         if (tab.active === true || tab.pinned === true) continue;
+        if (navigated) continue;
         let ownedSurface =
           tab.windowId !== undefined &&
           tab.windowId === this.store.workWindowID;
@@ -4245,6 +4305,24 @@ export class Bridge {
           tabID = undefined;
         }
       }
+      if (
+        tabID === undefined &&
+        job.requires_auth === true &&
+        !this.institutionalAuthGateOpen()
+      ) {
+        // Slice 0 containment: a drive-queue entry with no live tab would
+        // CREATE a sign-in surface. Autonomous callers (governor overflow,
+        // startup requeue, claim resume) all pass through here; operator
+        // opens use openHandoff/retryAuthStalled directly. Park for explicit
+        // engagement; a retained offer URL keeps the operator's open usable.
+        await this.update((s) =>
+          patchJob(s, request.jobID, {
+            status: "queued",
+            engagement_required: true,
+          }),
+        );
+        continue;
+      }
       const url = this.offerURLs.get(request.jobID);
       const mustNavigate =
         url !== undefined &&
@@ -4891,7 +4969,8 @@ export class Bridge {
         !hasQueuedGovernorWork &&
         job.status !== "awaiting_download" &&
         this.store.pendingDelivery?.job_id !== job.job_id &&
-        offerURL !== undefined
+        offerURL !== undefined &&
+        (job.requires_auth !== true || this.institutionalAuthGateOpen())
       ) {
         const effectToken = this.claimEffectGovernor(job.job_id);
         if (effectToken === undefined) {
@@ -4982,7 +5061,10 @@ export class Bridge {
           // has just been retired, and only that claim's waiters are eligible
           // for the freed slot. Requiring fresh operator engagement prevents
           // the dead owner from winning the FIFO ahead of those waiters.
-          ...(ownsFederatedLoginClaim ? { engagement_required: true } : {}),
+          ...(ownsFederatedLoginClaim ||
+          (job.requires_auth === true && !this.institutionalAuthGateOpen())
+            ? { engagement_required: true }
+            : {}),
           // A dead tab discovered only at restart (MV3 never fired
           // onRemoved while this worker slept) never went through
           // onTabRemoved's own waiting_for_session demotion — clear both
@@ -6476,6 +6558,20 @@ export class Bridge {
 
   private supportsFreshHandoffLinks(): boolean {
     return (this.store.daemonFeatures ?? []).includes(HANDOFF_LINK_FEATURE);
+  }
+
+  /** Slice 0 containment gate (dev/active/surface-lifecycle-plan.md): an
+   * autonomous `requires_auth` surface needs the daemon-side authentication
+   * claim feature (ADR-0022 Phase 4) AND a live network. While the gate is
+   * closed — every shipped daemon today — institutional work parks tabless
+   * as engagement_required; the operator's explicit open (inbox click,
+   * popup retry) is the only path to a sign-in surface. */
+  private institutionalAuthGateOpen(): boolean {
+    return (
+      (this.store.daemonFeatures ?? []).includes(
+        AUTHENTICATION_CLAIM_FEATURE,
+      ) && (this.deps.online?.() ?? true)
+    );
   }
 
   private async applyMaterialization(
@@ -10054,20 +10150,27 @@ export class Bridge {
 
   private async runKeepaliveAlarm(): Promise<void> {
     await this.ready;
-    await this.releaseExpiredQueuedHandoffs();
-    // Recovery runs unconditionally on this wake, independent of the native
-    // port: a service worker that died mid-probe still needs its dirty/paused
-    // origins re-probed even while the daemon connection is also down. It is
-    // deliberately NOT awaited — reconnecting the daemon and refreshing the
-    // triage count are latency-sensitive on this one wake, and a session probe
-    // can take seconds of browser API work with nothing here depending on its
-    // result.
+    // Recovery runs FIRST and unconditionally on this wake, independent of
+    // the native port: a service worker that died mid-probe still needs its
+    // dirty/paused origins re-probed even while the daemon connection is
+    // also down. It is deliberately NOT awaited — reconnecting the daemon
+    // and refreshing the triage count are latency-sensitive on this one
+    // wake, and a session probe can take seconds of browser API work with
+    // nothing here depending on its result.
     void this.keepaliveManager?.onWake();
     if (this.port === null && !this.closingDeliberately) {
+      // A disconnected wake reconnects and stops: releasing queued handoffs
+      // here used to navigate work into a dead network after machine sleep
+      // (surface-lifecycle plan, Slice 0). The next connected wake releases.
       this.reconnectAttempts = 0;
       this.connect();
       return;
     }
+    // Queued releases run only against a live network, and only after the
+    // probe above has been kicked off — release-then-probe was the wake
+    // ordering that drove tabs into dead networks.
+    if (this.deps.online?.() ?? true)
+      await this.releaseExpiredQueuedHandoffs();
     if (
       this.hasCurrentHello() &&
       (this.store.daemonFeatures ?? []).includes(TRIAGE_SNAPSHOT_FEATURE)
@@ -11363,15 +11466,25 @@ export class Bridge {
    * times so a cold queue cannot restart its fallback window forever on sleep. */
   private async releaseExpiredQueuedHandoffs(): Promise<void> {
     const deadline = this.deps.now() - QUEUED_HANDOFF_RELEASE_MS;
-    const dueJobIDs = this.store.activeJobs
-      .filter(
-        (job) =>
-          job.status === "queued" &&
-          job.engagement_required !== true &&
-          job.offered_at <= deadline,
-      )
-      .map((job) => job.job_id);
-    for (const jobID of dueJobIDs) await this.releaseQueuedHandoffs(jobID);
+    const due = this.store.activeJobs.filter(
+      (job) =>
+        job.status === "queued" &&
+        job.engagement_required !== true &&
+        job.offered_at <= deadline,
+    );
+    for (const job of due) {
+      if (job.requires_auth === true && !this.institutionalAuthGateOpen()) {
+        // Slice 0 containment: the 45s fallback may not bypass evidence for
+        // institutional authentication work. Park it for explicit
+        // engagement instead of forcing a sign-in surface; the inbox action
+        // mints or reuses the route on click.
+        await this.update((s) =>
+          patchJob(s, job.job_id, { engagement_required: true }),
+        );
+        continue;
+      }
+      await this.releaseQueuedHandoffs(job.job_id);
+    }
   }
 
   /** Startup has no worker-local timer state. A tracked tab already settled
@@ -11581,6 +11694,20 @@ export class Bridge {
             this.pendingForcedReleases.delete(jobID);
             continue;
           }
+          if (
+            candidate.requires_auth === true &&
+            !forceProvider &&
+            !this.institutionalAuthGateOpen()
+          ) {
+            // Slice 0 containment: a timer/expiry-driven forced release may
+            // not mint a sign-in surface. Park for explicit engagement; the
+            // operator's own open passes forceProvider and stays admitted.
+            this.pendingForcedReleases.delete(jobID);
+            await this.update((s) =>
+              patchJob(s, jobID, { engagement_required: true }),
+            );
+            continue;
+          }
           if (this.challengeCooldownActiveForHosts(candidate.provider_hosts)) {
             forcedTemporarilyBlocked = true;
             continue;
@@ -11602,6 +11729,8 @@ export class Bridge {
               matchesOrigin(job) &&
               job.status === "queued" &&
               job.engagement_required !== true &&
+              (job.requires_auth !== true ||
+                this.institutionalAuthGateOpen()) &&
               this.hasHandoffReleaseEvidence(
                 jobOrigin(job),
                 job.requires_auth,
@@ -13028,23 +13157,30 @@ export class Bridge {
       try {
         await this.deps.tabs.get(existing.tab_id);
       } catch {
-        const recoveredTabID = await this.openManagedTab({
-          url: openurl,
-          jobId: jobID,
-          purpose: "reoffer",
-          focusExisting: false,
-        });
-        existing =
-          recoveredTabID === undefined
-            ? undefined
-            : findByJob(this.store, jobID);
-        if (existing === undefined) await this.removeJobWithOffer(jobID);
+        if (!this.institutionalAuthGateOpen()) {
+          // Slice 0 containment: a dead sign-in tab is never recovered
+          // autonomously. Demote to tabless so the cold park below takes it.
+          await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
+          existing = findByJob(this.store, jobID);
+        } else {
+          const recoveredTabID = await this.openManagedTab({
+            url: openurl,
+            jobId: jobID,
+            purpose: "reoffer",
+            focusExisting: false,
+          });
+          existing =
+            recoveredTabID === undefined
+              ? undefined
+              : findByJob(this.store, jobID);
+          if (existing === undefined) await this.removeJobWithOffer(jobID);
+        }
       }
     }
     if (
       freshLinks &&
       requiresAuth === true &&
-      !hasReleaseEvidence &&
+      (!hasReleaseEvidence || !this.institutionalAuthGateOpen()) &&
       (existing === undefined || existing.tab_id < 0)
     ) {
       const now = this.deps.now();
@@ -13148,6 +13284,27 @@ export class Bridge {
           live = false;
         }
         if (!live) {
+          if (requiresAuth === true && !this.institutionalAuthGateOpen()) {
+            // Slice 0 containment: never autonomously recreate a sign-in
+            // surface for a job whose tab is gone. Park for explicit
+            // engagement; a legacy offer keeps its URL so the operator's
+            // open can use it (the fresh-link variant of this state was
+            // already demoted to the tabless cold park above).
+            await this.upsertJobWithOffer(
+              {
+                ...existing,
+                tab_id: -1,
+                status: "queued",
+                offered_at: this.deps.now(),
+                provider_hosts: providerHosts,
+                engagement_required: true,
+                parked_with_tab: false,
+              },
+              openurl,
+            );
+            this.send("job_accept", {}, jobID);
+            return;
+          }
           const recoveredTabID = await this.openManagedTab({
             url: openurl,
             jobId: jobID,
@@ -13400,6 +13557,22 @@ export class Bridge {
         ? { access_mode: effectiveAccessMode }
         : {}),
     });
+
+    if (requiresAuth === true && !this.institutionalAuthGateOpen()) {
+      // Slice 0 containment (dev/active/surface-lifecycle-plan.md): no
+      // autonomous sign-in surface without the daemon-side authentication
+      // claim feature and a live network. Only legacy (non-fresh-link)
+      // offers reach this tail with requires_auth — the fresh-link variants
+      // were parked tabless above — so the offer URL is retained for the
+      // operator's explicit open. No release timer: the 45s fallback may
+      // not bypass this gate.
+      await this.upsertJobWithOffer(
+        { ...makeJob(-1, "queued"), engagement_required: true },
+        openurl,
+      );
+      this.send("job_accept", {}, jobID);
+      return;
+    }
 
     const governorQueued =
       !providerParked &&
@@ -14997,7 +15170,11 @@ export class Bridge {
         continue;
       }
       if (job.tab_id < 0) {
-        if (autoDriveTabless && job.engagement_required !== true) {
+        if (
+          autoDriveTabless &&
+          job.engagement_required !== true &&
+          (job.requires_auth !== true || this.institutionalAuthGateOpen())
+        ) {
           await this.update((s) =>
             patchJob(s, job.job_id, {
               waiting_for_session: false,
@@ -18433,6 +18610,7 @@ function realDeps(): BridgeDeps {
     runtimeGetURL: (path) => chrome.runtime.getURL(path),
     randomUUID: () => crypto.randomUUID(),
     now: () => Date.now(),
+    online: () => navigator.onLine,
     setTimeout: (fn, ms) => {
       setTimeout(fn, ms);
     },
