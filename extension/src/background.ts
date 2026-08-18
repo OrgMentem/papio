@@ -1161,6 +1161,12 @@ interface QueuedHandoffDrive {
    * a governor/effect slot. The Slice 0 containment gate never converts an
    * operator request into an engagement park. */
   operator?: boolean;
+  /** Claim-resume redrives fence on an operator-active tab (the sibling the
+   * operator may be typing credentials into). Other redrives — stale-IdP
+   * recovery after papio raised its own tab, operator retries — navigate;
+   * distinguishing papio's own focus from the operator's needs the Slice 2
+   * cession tokens. */
+  fenceOperatorActive?: boolean;
 }
 
 interface HandoffDrive {
@@ -4368,10 +4374,26 @@ export class Bridge {
           url !== undefined &&
           this.deps.tabs.update !== undefined
         ) {
-          try {
-            await this.deps.tabs.update(tabID, { url });
-          } catch {
-            tabID = undefined;
+          let operatorActive = false;
+          if (request.fenceOperatorActive === true) {
+            // Renavigation fence: fresh read immediately before the act, no
+            // unrelated awaits between. A claim-resume redrive never
+            // renavigates an operator-active tab (mid-credential-entry is
+            // exactly when this resume fires); the drive still registers so
+            // the operator's own progress moves the job.
+            try {
+              operatorActive =
+                (await this.deps.tabs.get(tabID)).active === true;
+            } catch {
+              operatorActive = false;
+            }
+          }
+          if (!operatorActive) {
+            try {
+              await this.deps.tabs.update(tabID, { url });
+            } catch {
+              tabID = undefined;
+            }
           }
         }
         if (tabID === undefined && url === undefined) {
@@ -10946,7 +10968,14 @@ export class Bridge {
     }
     try {
       const tab = await this.deps.tabs.get(pending.tabID);
-      if (typeof tab.url === "string" && isAuthenticationURL(tab.url))
+      // Renavigation fence: a reload wipes anything the operator has typed
+      // into a credential form. Skip the operator-active tab; the evidence
+      // reload is an optimization, and the operator's own progress moves it.
+      if (
+        typeof tab.url === "string" &&
+        isAuthenticationURL(tab.url) &&
+        tab.active !== true
+      )
         await this.deps.tabs.reload(pending.tabID);
     } finally {
       this.releaseEffectGovernor(`auth-reload:${jobID}`, token, false);
@@ -11886,9 +11915,13 @@ export class Bridge {
         }
         try {
           const current = findByJob(this.store, job.job_id);
+          // Renavigation fence: fresh read under the held permit — a reload
+          // wipes anything the operator has typed into a credential form.
+          const fresh = await this.deps.tabs.get(job.tab_id);
           if (
             current?.tab_id === job.tab_id &&
-            this.hasDelegatedAuthority(current)
+            this.hasDelegatedAuthority(current) &&
+            fresh.active !== true
           ) {
             await this.deps.tabs.reload(job.tab_id);
           }
@@ -15258,6 +15291,7 @@ export class Bridge {
         purpose: "redrive",
         focusExisting: false,
         surfaceFallback: false,
+        fenceOperatorActive: true,
       });
     }
     await this.drainHandoffDriveQueue();

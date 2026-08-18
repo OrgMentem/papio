@@ -2621,6 +2621,96 @@ test("Slice 0: claim retirement without the claim feature parks the tabless wait
   expect(h.tabs.created).toEqual([]);
 });
 
+test("Slice 0: an automatic redrive never renavigates an operator-active tab", async () => {
+  const claimKey = "claim_fence_active";
+  const ownerID = "job_fence_owner";
+  const waiterID = "job_fence_waiter";
+  const wallURL = "https://idp.example.edu/sso";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: ownerID,
+        tab_id: 55,
+        offered_at: 1,
+        expires_at: 9_999_999_999_999,
+        status: "auth_pending",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+        institution_claim_key: claimKey,
+      },
+      {
+        job_id: waiterID,
+        tab_id: 88,
+        offered_at: 1,
+        expires_at: 9_999_999_999_999,
+        status: "queued",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+        waiting_for_session: true,
+        waiting_for_session_key: claimKey,
+      },
+    ],
+    federatedLoginOwners: {
+      [claimKey]: { jobID: ownerID, tabID: 55, phase: "auth" },
+    },
+    offerURLs: { [waiterID]: OPENURL },
+  });
+  h.tabs.seed({ id: 55, url: wallURL });
+  // The waiter's own wall tab is the operator's ACTIVE tab: they may be
+  // mid-credential-entry on it right now.
+  h.tabs.seed({ id: 88, url: wallURL, active: true });
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
+  // Owner closes ⇒ claim retires ⇒ the waiter's live tab is redriven — but
+  // the renavigation fence must leave the operator-active document alone.
+  await h.tabs.userClose(55);
+
+  expect(
+    h.tabs.navigations.some((navigation) => navigation.url === OPENURL),
+  ).toBe(false);
+  const wallTab = h.tabs.snapshot(88);
+  expect(wallTab?.url).toBe(wallURL);
+});
+
+test("Slice 0: session evidence reloads parked auth tabs but never the operator-active one", async () => {
+  const idpURL = "https://idp.example.edu/sso";
+  const jobs = ["job_fence_reload_a", "job_fence_reload_b"].map(
+    (jobID, index) => ({
+      job_id: jobID,
+      tab_id: 61 + index,
+      offered_at: 1,
+      expires_at: 9_999_999_999_999,
+      status: "auth_pending" as const,
+      requires_auth: true,
+      access_mode: "delegated" as const,
+      provider_hosts: [PROVIDER_HOST],
+    }),
+  );
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: jobs,
+    offerURLs: {
+      job_fence_reload_a: OPENURL,
+      job_fence_reload_b: `${OPENURL}&sibling=1`,
+    },
+  });
+  h.tabs.seed({ id: 61, url: idpURL });
+  // The operator is typing credentials into tab 62 RIGHT NOW: a reload
+  // would wipe the form.
+  h.tabs.seed({ id: 62, url: idpURL, active: true });
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
+
+  expect(h.tabs.reloaded).toContain(61);
+  expect(h.tabs.reloaded).not.toContain(62);
+});
+
 test("Slice 0: repeated sign-in requests reuse the live papio sign-in tab", async () => {
   const origin = "https://resolver.example.edu";
   const h = makeHarness();

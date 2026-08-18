@@ -28,10 +28,11 @@ and are annotated below; the rest still describes HEAD.
 
 1. **Automated drives leave one tab per auth wall — and the drive limit is
    not a surface limit.** `HANDOFF_DRIVE_LIMIT = 1` caps tabs that may
-   *drive an effect* (`background.ts:168-171`); every park (timeout callback
-   4201-4226, waiting-for-session 4393, auth-stall `reportAuthStalled`
-   10506-10511, challenge 10694-10732) preserves its live tab while releasing
-   the slot, so one nominal drive coexists with a 17-tab group. The claim
+   *drive an effect* (`background.ts:168-171`); the waiting-for-session
+   (4393), auth-stall (`reportAuthStalled` 10506-10511), challenge
+   (10694-10732), and fresh-link timeout parks preserve their live tab while
+   releasing the slot (the legacy timeout park detaches and closes its tab,
+   4213-4226), so one nominal drive coexists with a 17-tab group. The claim
    gate runs only inside `maybeRouteFederatedLogin` (15104+), **after**
    navigation and only for adapters with a `federatedLogin` template; the
    generic off-provider path takes no claim and charges an auth attempt
@@ -55,9 +56,12 @@ and are annotated below; the rest still describes HEAD.
    `options.jobId !== undefined` — repeated fallbacks mint repeated sign-in
    tabs even when an earlier one is live.
 4. **Coordination state is session-scoped; surfaces are durable.** The
-   managed store lives in `chrome.storage.session` (`state.ts:1645+`);
-   `federatedLoginOwners` and `offerURLs` are deleted by the serializer's
-   migration on every save (`state.ts:1615-1618`) — claims are worker-memory.
+   managed store prefers `chrome.storage.session` with a `storage.local`
+   fallback when the session API is absent (`state.ts:1645-1652`) — so on
+   such runtimes job mirrors DO survive reload/update/restart, and only the
+   serializer's migration keeps URL-bearing state out either way:
+   `federatedLoginOwners` and `offerURLs` are deleted on every save
+   (`state.ts:1615-1618`) — claims are worker-memory.
    Startup adoption is real but **per-window and startup-only**: groups are
    re-found by title then partitioned by `windowId` with a primary per
    partition (3895-3915), so multiple *papio* groups across windows are a
@@ -168,11 +172,16 @@ all `requires_auth` work goes tabless without a granted claim.
 - **Warm evidence is not a lease** (Slice 3): exact-profile-scoped, admits an
   attempted route only; a wall bounce converges on the claim at wall
   observation.
-- **In-place renavigation is fenced** (Slices 0/4): fresh `tabs.get` +
-  active/engagement check with no unrelated awaits before `tabs.update`;
-  post-update continuation re-reads job and tab state before registering a
-  drive; automatic resumes never focus (non-focusing `openFreshHandoff`
-  variant).
+- **In-place renavigation is fenced** (minimal fence SHIPPED in Slice 0:
+  a claim-resume redrive does a fresh `tabs.get` immediately before
+  `tabs.update` and never renavigates an operator-active tab — the sibling
+  the operator may be typing credentials into. The FULL fence — every
+  automatic renavigation, engagement checks, post-update re-read before
+  drive registration, non-focusing `openFreshHandoff` variant — needs the
+  Slice 2 cession tokens first: today papio cannot distinguish its own
+  focus (in-window active creation, stale-IdP work-window raise) from the
+  operator's, so a blanket active-tab fence would block its own recovery
+  paths; Slices 2/4).
 - **Positive evidence closes; absence retains** (Slice 2): close requires the
   one-use daemon authorization below — never absence from a bounded 4-offer
   batch, never `goodbye`, never timer expiry or transport loss.
