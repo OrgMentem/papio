@@ -608,6 +608,26 @@ papio grabs binds [flags]
 | --- | --- | --- | --- |
 | `--limit` | `int` | `50` | maximum autonomous binds to list (default 50, max 200) |
 
+### `papio grabs confirm`
+
+File a parked capture against the job you picked
+
+Bind a parked capture to a specific pending job chosen by a human —
+typically the top (or any) row of `papio grabs suggest`'s ranking.
+
+papio still refuses the pick if the document's own front matter names a
+different paper: extracted identity outranks a human pick, the same rule
+autonomous binding already applies to itself. A refusal changes nothing —
+no job is created and the capture stays parked exactly as it was before.
+
+```
+papio grabs confirm <grab-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--job` | `string` |  | pending job id to file this capture against |
+
 ### `papio grabs identify`
 
 Bind an operator-supplied identifier to a captured PDF grab
@@ -621,6 +641,28 @@ papio grabs identify <grab-id> [flags]
 | `--arxiv` | `string` |  | identify by arXiv ID |
 | `--doi` | `string` |  | identify by DOI |
 | `--pmid` | `string` |  | identify by PubMed ID |
+
+### `papio grabs suggest`
+
+Rank pending jobs against a parked capture: which paper is this?
+
+Rank the pending jobs that best match a capture which parked instead of
+binding on its own, most-likely first, with the evidence behind each
+ranking. Nothing is filed by running this — it only orders the candidates
+a human would otherwise have to hunt through by hand; pick one and run
+`papio grabs confirm` to actually file it.
+
+If the captured file states its own DOI, PMID, or arXiv ID in its front
+matter, that identifier is printed first: `papio grabs identify` with that
+value is faster and more certain than picking from the ranked list below it.
+
+```
+papio grabs suggest <grab-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--limit` | `int` | `5` | maximum ranked suggestions to return (default 5, max 25) |
 
 ## `papio inbox`
 

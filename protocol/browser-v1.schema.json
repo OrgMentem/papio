@@ -72,6 +72,10 @@
         "pdf_grab_status_result",
         "pdf_grab_abandon_request",
         "pdf_grab_abandon_result",
+        "pdf_grab_suggest_request",
+        "pdf_grab_suggest_response",
+        "pdf_grab_confirm_request",
+        "pdf_grab_confirm_response",
         "institutional_candidate_offer",
         "institutional_claim_request",
         "institutional_claim_response",
@@ -1782,6 +1786,91 @@
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$"
+        }
+      }
+    },
+    "pdf_grab_document_identifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "source"],
+      "properties": {
+        "kind": { "enum": ["doi", "arxiv", "pmid"] },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "pattern": "^[^\u0000]+$"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[^\u0000]+$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "const": "doi" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "value": { "pattern": "^10\\.[0-9]{4,9}/\\S{1,200}$" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "arxiv" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "pattern": "^(([0-9]{4}\\.[0-9]{4,5})(v[0-9]+)?)|([a-z-]+(\\.[A-Z]{2})?/[0-9]{7})$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "pmid" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": { "value": { "pattern": "^[0-9]{1,10}$" } }
+          }
+        }
+      ]
+    },
+    "pdf_grab_suggestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "title", "verdict", "evidence"],
+      "properties": {
+        "job_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
+        "title": {
+          "type": "string",
+          "maxLength": 500,
+          "pattern": "^[^\u0000]*$"
+        },
+        "year": { "type": "integer", "minimum": 1, "maximum": 9999 },
+        "doi": { "type": "string", "pattern": "^10\\.[0-9]{4,9}/\\S{1,200}$" },
+        "verdict": { "enum": ["qualifies", "review", "rejected"] },
+        "reason": {
+          "type": "string",
+          "maxLength": 500,
+          "pattern": "^[^\u0000]*$"
+        },
+        "evidence": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "maxLength": 300,
+            "pattern": "^[^\u0000]*$"
+          }
         }
       }
     }
@@ -4505,6 +4594,185 @@
         "properties": {
           "payload": {
             "allOf": [{ "not": { "required": ["reason"] } }]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "pdf_grab_suggest_request" } }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "grab_id"],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "grab_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "limit": { "type": "integer", "minimum": 1, "maximum": 25 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "pdf_grab_suggest_response" } }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "grab_id", "outcome", "suggestions", "truncated"],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "grab_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "outcome": {
+                "enum": ["ok", "unknown_grab", "wrong_state", "unavailable", "failed"]
+              },
+              "detail": {
+                "type": "string",
+                "maxLength": 1000,
+                "pattern": "^[^\u0000]*$"
+              },
+              "document_identifiers": {
+                "type": "array",
+                "maxItems": 8,
+                "items": { "$ref": "#/$defs/pdf_grab_document_identifier" }
+              },
+              "suggestions": {
+                "type": "array",
+                "maxItems": 25,
+                "items": { "$ref": "#/$defs/pdf_grab_suggestion" }
+              },
+              "truncated": { "type": "boolean" }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "outcome": { "const": "ok" } },
+                  "required": ["outcome"]
+                },
+                "then": { "not": { "required": ["detail"] } }
+              },
+              {
+                "if": {
+                  "properties": { "outcome": { "not": { "const": "ok" } } },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "required": ["detail"],
+                  "properties": {
+                    "suggestions": { "maxItems": 0 },
+                    "document_identifiers": { "maxItems": 0 }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "pdf_grab_confirm_request" } }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "grab_id", "job_id"],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "grab_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "job_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "pdf_grab_confirm_response" } }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "grab_id", "outcome"],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "grab_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "job_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "outcome": {
+                "enum": [
+                  "job_created",
+                  "refused_identity",
+                  "unknown_grab",
+                  "unknown_job",
+                  "wrong_state",
+                  "conflict",
+                  "unavailable",
+                  "failed"
+                ]
+              },
+              "detail": {
+                "type": "string",
+                "maxLength": 1000,
+                "pattern": "^[^\u0000]*$"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "outcome": { "const": "job_created" } },
+                  "required": ["outcome"]
+                },
+                "then": { "not": { "required": ["detail"] } }
+              },
+              {
+                "if": {
+                  "properties": { "outcome": { "not": { "const": "job_created" } } },
+                  "required": ["outcome"]
+                },
+                "then": { "required": ["detail"] }
+              }
+            ]
           }
         }
       }

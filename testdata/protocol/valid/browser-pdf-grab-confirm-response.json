@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"pdf_grab_confirm_response","msg_id":"confirm-resp-0001","seq":5,"payload":{"request_id":"request-0003","grab_id":"grab-0000001","job_id":"job-000001","outcome":"job_created"}}

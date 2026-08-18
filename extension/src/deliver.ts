@@ -576,6 +576,13 @@ export function carriesSignedCredential(value: string): boolean {
  * and the bridge's send-time refusal cannot disagree about the name. */
 export const PDF_GRAB_FEATURE = "pdf_grab_v1";
 
+/** The daemon feature that advertises the "which paper is this?" picker
+ * (grabs.suggest/grabs.confirm) behind the inbox's provide_identifier op.
+ * Declared here beside PDF_GRAB_FEATURE, for the same reason: the inbox's
+ * pre-click gate and the bridge's outbound frame decision must read one
+ * name, never two independently-typed copies of the same string. */
+export const PDF_GRAB_SUGGEST_FEATURE = "pdf_grab_suggest_v1";
+
 /** Shown when papio refused a grab for a reason the researcher cannot act on,
  * and whenever an older daemon classified nothing at all. */
 export const PDF_GRAB_GENERIC_REFUSAL = "papio couldn't save this PDF — try again.";

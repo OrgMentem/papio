@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"pdf_grab_suggest_response","msg_id":"suggest-resp-0002","seq":3,"payload":{"request_id":"request-0002","grab_id":"grab-0000002","outcome":"wrong_state","detail":"pdf grab is not parked awaiting an identifier","suggestions":[],"truncated":false}}

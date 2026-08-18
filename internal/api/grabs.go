@@ -102,3 +102,74 @@ func listAutonomousBinds(ctx context.Context, raw json.RawMessage, system *boots
 	}
 	return marshal(agentjson.Envelope("binds", rows, truncated))
 }
+
+// GrabSuggestResult, GrabSuggestionRow, and DocumentIdentifier are aliased
+// from internal/browser the same way GrabIdentifyResult is above: Bridge is
+// the only holder of the grab service and job store, so it owns the wire
+// shape, and aliasing here lets the CLI decode api.GrabSuggestResult without
+// a second declaration that could drift from the one the daemon encodes.
+type GrabSuggestResult = browser.GrabSuggestResult
+type GrabSuggestionRow = browser.GrabSuggestionRow
+type DocumentIdentifier = browser.DocumentIdentifier
+
+type grabsSuggestParams struct {
+	GrabID string `json:"grab_id"`
+	// Limit <= 0 means the daemon's own default (5); values above its hard
+	// cap (25) clamp rather than error, same contract as grabsBindsParams
+	// above and enforced by Bridge.SuggestGrabCandidates itself, since the
+	// ranking and the bound it fits inside must never disagree.
+	Limit int `json:"limit,omitempty"`
+}
+
+// listGrabSuggestions serves grabs.suggest, the read-only "which pending job
+// is this?" ranking for a parked DOI-less grab. It is intentionally as thin
+// as identifyGrab above: parameter validation and the unconfigured-daemon
+// short-circuit live here, every other outcome (unknown grab, wrong state,
+// re-validation failure, the ranking itself) is Bridge.SuggestGrabCandidates'
+// job, because that is the one place production auto-bind's decision inputs
+// are already built correctly and must not be rebuilt a second way.
+func listGrabSuggestions(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params grabsSuggestParams
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if strings.TrimSpace(params.GrabID) == "" {
+		return badParams(errors.New("grab_id is required"))
+	}
+	if system == nil || system.Browser == nil {
+		return marshal(GrabSuggestResult{GrabID: params.GrabID, Outcome: "unavailable", Detail: "pdf grabs are not configured"})
+	}
+	return marshal(system.Browser.SuggestGrabCandidates(ctx, params.GrabID, params.Limit))
+}
+
+// GrabConfirmResult is aliased from internal/browser the same way
+// GrabIdentifyResult and GrabSuggestResult are above: Bridge owns the wire
+// shape because it is the only holder of the grab service and job store.
+type GrabConfirmResult = browser.GrabConfirmResult
+
+type grabConfirmParams struct {
+	GrabID string `json:"grab_id"`
+	JobID  string `json:"job_id"`
+}
+
+// confirmGrabCandidate serves grabs.confirm, the write counterpart to
+// grabs.suggest: a human has picked one ranked candidate and this binds the
+// parked grab to it. As thin as identifyGrab and listGrabSuggestions above —
+// parameter validation and the unconfigured-daemon short-circuit live here,
+// every other outcome (unknown grab/job, wrong state, the identity veto, the
+// fenced bind itself) is Bridge.ConfirmGrabCandidate's job, so the decision
+// stays built from the one place production auto-bind's decision inputs are
+// already correct.
+func confirmGrabCandidate(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params grabConfirmParams
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if strings.TrimSpace(params.GrabID) == "" || strings.TrimSpace(params.JobID) == "" {
+		return badParams(errors.New("grab_id and job_id are required"))
+	}
+	if system == nil || system.Browser == nil {
+		return marshal(GrabConfirmResult{GrabID: params.GrabID, JobID: params.JobID, Outcome: "unavailable", Detail: "pdf grabs are not configured"})
+	}
+	return marshal(system.Browser.ConfirmGrabCandidate(ctx, params.GrabID, params.JobID))
+}

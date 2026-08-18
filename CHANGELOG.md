@@ -11,6 +11,30 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **The inbox now answers "which paper is this?" itself, instead of telling you
+  to go and type an identifier.** A captured PDF that *papio* could not file on
+  its own parks in the inbox, and until now the button on that row printed a
+  terminal command for you to run — it made no request of the daemon at all.
+  It now asks the daemon to score every paper you are waiting for against the
+  bytes it actually captured, and shows them ranked, best first, each with the
+  evidence that put it there: the title matched, the authors matched, the year
+  matched, the identifier was printed on page one. One click on the right one
+  files it.
+
+  Nothing here can misfile a paper, because you are the one choosing — which is
+  why the ranking is allowed to use weaker signals than automatic filing is. Two
+  things it still refuses to do. It will not accept your pick if the document's
+  own front matter names a different paper: the bytes get the last word on what
+  they are, you get the last word on which pending paper you meant. And when the
+  file states its own identity in its embedded metadata but no pending paper
+  matches, it now shows you that identifier, with the exact command to file it —
+  previously *papio* read that value, discarded it, and asked you to find it
+  yourself.
+
+  Same thing from the terminal: `papio grabs suggest <capture>` ranks the
+  candidates and prints the `papio grabs confirm` line for the top one. Older
+  daemons keep the previous guidance text, since the browser asks first whether
+  the daemon can answer.
 - **A captured PDF that names itself in its own file metadata can now be
   recognised, without reading a word of the page.** Publishers stamp a paper's
   DOI into the PDF's invisible metadata during production (the PRISM,

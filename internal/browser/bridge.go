@@ -106,6 +106,15 @@ const (
 	providerDriveEpochV1Feature         = "provider_drive_epoch_v1"
 	effectPermitFeature                 = protocol.EffectPermitFeature
 	institutionalMaterializationFeature = protocol.InstitutionalMaterializationFeature
+	// pdfGrabSuggestV1Feature gates the inbox's operator candidate picker:
+	// the pdf_grab_suggest_request/response ranked "which pending job is
+	// this?" answer and the pdf_grab_confirm_request/response fenced bind
+	// on the operator's chosen job (both wire Bridge.SuggestGrabCandidates/
+	// ConfirmGrabCandidate, the same methods `papio grabs suggest`/`grabs
+	// confirm` already call locally). An extension below this feature keeps
+	// showing the old provide_identifier guidance text instead of sending a
+	// frame the daemon has not proven it can answer.
+	pdfGrabSuggestV1Feature = protocol.PdfGrabSuggestFeature
 	// ProviderDirectGetMinExtensionVersion gates the additive frame away from
 	// released 0.13.x sessions whose strict parser cannot know this message.
 	ProviderDirectGetMinExtensionVersion = "0.14.0"
@@ -577,7 +586,7 @@ func (source parkedGrabItemSource) SnapshotItems(ctx context.Context, tx *sql.Tx
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, effectPermitFeature, institutionalMaterializationFeature,
-		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature,
+		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature, pdfGrabSuggestV1Feature,
 	}
 	var grabs *grab.Service
 	var cohorts *batch.Cohorts
@@ -2031,6 +2040,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
 			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest, protocol.MsgPageBulkSubmitV2Request,
 			protocol.MsgPdfGrabRequest, protocol.MsgPdfGrabStatusRequest, protocol.MsgPdfGrabAbandonRequest,
+			protocol.MsgPdfGrabSuggestRequest, protocol.MsgPdfGrabConfirmRequest,
 			protocol.MsgSurfacePresence, protocol.MsgWorkPulseRequest, protocol.MsgActivityPageRequest,
 			protocol.MsgProviderDriveEpochResultRequest, protocol.MsgProviderDirectGetResult,
 			protocol.MsgTermsEffectResultRequest,
@@ -2049,12 +2059,16 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			// schedule cursors, session evidence). Holdership is not a
 			// concurrency fence, so mutating the daemon's own records is not
 			// disqualifying: dismissing a triage item, resolving a parked
-			// human action or reconciling a delivery request are human
-			// decisions about daemon state, and the browser the human clicked
-			// in is the right browser by construction. Exact historical
-			// result frames are also accepted from a recognized old session:
-			// identity settlement is cleanup-only unless the transaction
-			// independently proves the current attempt and generation.
+			// human action, reconciling a delivery request, ranking a parked
+			// grab's candidates, or binding one to the operator's pick are
+			// human decisions about daemon state, and the browser the human
+			// clicked in is the right browser by construction. Confirm still
+			// runs through the same fenced bind autonomous binding uses, so
+			// holdership buys no extra safety a non-holder confirm lacks.
+			// Exact historical result frames are also accepted from a
+			// recognized old session: identity settlement is cleanup-only
+			// unless the transaction independently proves the current
+			// attempt and generation.
 		default:
 			// Offer/handoff frames from a non-holder are refused: acting on
 			// them is exactly the silent session fight this arbitration
@@ -2127,6 +2141,12 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgPdfGrabAbandonRequest:
 		return b.pdfGrabAbandonSession(ctx, sessionID, msg.Payload.(*protocol.PdfGrabAbandonRequestPayload))
+
+	case protocol.MsgPdfGrabSuggestRequest:
+		return b.pdfGrabSuggest(ctx, msg.Payload.(*protocol.PdfGrabSuggestRequestPayload))
+
+	case protocol.MsgPdfGrabConfirmRequest:
+		return b.pdfGrabConfirm(ctx, msg.Payload.(*protocol.PdfGrabConfirmRequestPayload))
 
 	case protocol.MsgPageCapture:
 		b.pageCapture(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.PageCapturePayload))
@@ -5237,6 +5257,93 @@ func (b *Bridge) pdfGrabAbandonWith(ctx context.Context, request *protocol.PdfGr
 	return []json.RawMessage{frame}, nil
 }
 
+// pdfGrabSuggest serves pdf_grab_suggest_request, the inbox's read-only
+// "which pending job is this?" ranking for one parked, DOI-less grab. It is
+// a thin wire adapter over Bridge.SuggestGrabCandidates — the same method
+// `papio grabs suggest` and the grabs.suggest RPC already call — so the
+// ranking is built from exactly one decision path, never redecided per
+// surface.
+//
+// SuggestGrabCandidates re-validates the quarantined PDF through the worker
+// on every call (see its own doc comment for why a cached report would be
+// wrong), which is materially slower than an ordinary frame handler. This
+// needs no concurrency cap of its own: handle() runs inside Sync's frame
+// loop with b.mu held for the whole call — the one exception, the
+// materialization scheduler, explicitly releases and re-acquires it around
+// its own query — so at most one frame, across every session the bridge
+// holds and not just this one, is ever being processed at a time. A burst
+// of suggest_request polls cannot pile up concurrent validations; each one
+// queues behind the mutex like every other bridge RPC.
+//
+// Every routine failure SuggestGrabCandidates reports through its closed
+// Outcome enum is carried straight to the wire outcome; nothing here may
+// become a raw Go error, or a stale inbox click would tear down the whole
+// browser session (the reviewPreview footgun AGENTS.md documents).
+//
+// Frame size: a maximal legal payload — 25 suggestions each at their field
+// caps (64-char job_id, 500-char title, 213-char DOI, 500-char reason, 16
+// evidence strings at 300 chars) plus 8 document identifiers at their own
+// caps — encodes to roughly 156 KiB, leaving real headroom under
+// MaxBrowserMessageBytes (256 KiB). b.frame self-validates against that cap
+// on every call, so this never needs its own truncation path the way
+// triageSnapshot's frameFits/item-count backoff does; TestSyncResponseFitsResultCap's
+// existing worst-case bound already treats "one solicited response" as a
+// full 256 KiB regardless of type, so it covers this frame type without a
+// type-specific addition.
+func (b *Bridge) pdfGrabSuggest(ctx context.Context, request *protocol.PdfGrabSuggestRequestPayload) ([]json.RawMessage, error) {
+	result := b.SuggestGrabCandidates(ctx, request.GrabID, int(request.Limit))
+	identifiers := make([]protocol.PdfGrabDocumentIdentifier, 0, len(result.DocumentIdentifiers))
+	for _, id := range result.DocumentIdentifiers {
+		identifiers = append(identifiers, protocol.PdfGrabDocumentIdentifier{
+			Kind: id.Kind, Value: id.Value, Source: id.Source,
+		})
+	}
+	// Authors deliberately does not travel on this wire (see
+	// PdfGrabSuggestionRow's doc comment): title/year/DOI plus the verdict
+	// and its evidence are the minimum a human needs to tell candidates
+	// apart, not a mirror of the internal RPC shape.
+	suggestions := make([]protocol.PdfGrabSuggestionRow, 0, len(result.Suggestions))
+	for _, row := range result.Suggestions {
+		suggestions = append(suggestions, protocol.PdfGrabSuggestionRow{
+			JobID: row.JobID, Title: row.Title, Year: int64(row.Year), DOI: row.DOI,
+			Verdict: row.Verdict, Reason: row.Reason, Evidence: row.Evidence,
+		})
+	}
+	frame, err := b.frame(protocol.MsgPdfGrabSuggestResponse, "", protocol.PdfGrabSuggestResponsePayload{
+		RequestID: request.RequestID, GrabID: result.GrabID, Outcome: result.Outcome, Detail: result.Detail,
+		DocumentIdentifiers: identifiers, Suggestions: suggestions, Truncated: result.Truncated,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+// pdfGrabConfirm serves pdf_grab_confirm_request, the write counterpart to
+// pdf_grab_suggest_request: the operator has picked one ranked candidate in
+// the inbox and this binds the parked grab to it. It is a thin wire adapter
+// over Bridge.ConfirmGrabCandidate — the same method `papio grabs confirm`
+// and the grabs.confirm RPC already call, through the same
+// MarkBoundToJobFenced fence autonomous binding uses — so there is exactly
+// one place that decision is made.
+//
+// See pdfGrabSuggest's doc comment for why this needs no concurrency cap of
+// its own: it runs under the same Sync-held b.mu.
+//
+// Every routine failure ConfirmGrabCandidate reports, including the
+// refused_identity veto, is carried straight to the wire outcome; nothing
+// here may become a raw Go error.
+func (b *Bridge) pdfGrabConfirm(ctx context.Context, request *protocol.PdfGrabConfirmRequestPayload) ([]json.RawMessage, error) {
+	result := b.ConfirmGrabCandidate(ctx, request.GrabID, request.JobID)
+	frame, err := b.frame(protocol.MsgPdfGrabConfirmResponse, "", protocol.PdfGrabConfirmResponsePayload{
+		RequestID: request.RequestID, GrabID: result.GrabID, JobID: result.JobID, Outcome: result.Outcome, Detail: result.Detail,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
 // pruneDeliveryMetadata drops unpaired frames after the short handoff window.
 // The maps carry only job/download correlation and bounded route evidence.
 func (b *Bridge) pruneDeliveryMetadata(now time.Time) {
@@ -7998,6 +8105,284 @@ type GrabIdentifyResult struct {
 	Detail  string `json:"detail,omitempty"`
 }
 
+// GrabConfirmResult is the structured outcome of binding an operator-chosen
+// pending job to a parked, DOI-less grab. It sits beside GrabIdentifyResult
+// on the same closed wire vocabulary — routine refusals stay outcomes, never
+// local-RPC failures — but where IdentifyGrab keys on an IDENTIFIER,
+// ConfirmGrabCandidate keys on a JOB the human already picked from
+// grabs.suggest, which is required because a pending job need not carry any
+// identifier at all.
+type GrabConfirmResult struct {
+	GrabID string `json:"grab_id"`
+	JobID  string `json:"job_id,omitempty"`
+
+	Outcome string `json:"outcome"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+// GrabSuggestResult is the structured outcome of grabs.suggest: a ranked
+// "which pending job is this?" answer for a parked DOI-less grab, built by
+// scoring every candidate-eligible job with the SAME predicate and the SAME
+// document construction attemptAutoBind uses. It is read-only by
+// construction — there is no field here that binds anything — which is what
+// lets ranking use signals the acceptance rule itself is deliberately too
+// strict to accept on: a bad rank only wastes a human's glance, where a bad
+// accept would misfile a paper.
+type GrabSuggestResult struct {
+	GrabID string `json:"grab_id"`
+
+	Outcome string `json:"outcome"`
+	Detail  string `json:"detail,omitempty"`
+
+	// DocumentIdentifiers is what the FILE says about itself, surfaced so a
+	// human is not asked to retype an identifier papio already read out of
+	// the PDF's own embedded metadata. This is the "target-aware only,
+	// never mint" metadata rule (see internal/pdf/metadata.go) applied to
+	// DISPLAY rather than to acceptance: nothing here is compared against a
+	// candidate or fed back into QualifyCandidate, so a wrong or aggregator-
+	// mangled value costs a glance, not a misfile.
+	DocumentIdentifiers []DocumentIdentifier `json:"document_identifiers,omitempty"`
+
+	// Suggestions is the ranked candidate pool. Empty and Outcome=="ok"
+	// together mean the grab is genuinely parked with nobody to offer —
+	// distinct from every non-ok outcome, which means the ranking could not
+	// be computed at all.
+	Suggestions []GrabSuggestionRow `json:"suggestions,omitempty"`
+	// Truncated reports whether the eligible pool was larger than the
+	// effective limit, exactly like grabs.binds' own Truncated: a caller
+	// asking for 5 must be able to tell "these are the only 5" from "these
+	// are the top 5 of more".
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// DocumentIdentifier is one allowlisted embedded-metadata value the
+// quarantined file carries about itself, spelled the same way
+// work.NormalizeDOI/NormalizeArXiv/NormalizePMID would accept it back from a
+// human, so a value shown here is exactly what `grabs identify` needs typed.
+type DocumentIdentifier struct {
+	Kind   string `json:"kind"`   // "doi", "arxiv", or "pmid"
+	Value  string `json:"value"`  // normalized, ready to retype
+	Source string `json:"source"` // allowlisted field name, e.g. "xmp/prism:doi"
+}
+
+// GrabSuggestionRow is one candidate-eligible job scored against a parked
+// grab's bytes. Verdict/Reason/Evidence are CandidateQualification carried
+// through verbatim (see pdf.QualifyCandidate) — this row makes no claim
+// QualifyCandidate itself did not already make.
+type GrabSuggestionRow struct {
+	JobID   string   `json:"job_id"`
+	Title   string   `json:"title,omitempty"`
+	Authors []string `json:"authors,omitempty"`
+	Year    int      `json:"year,omitempty"`
+	DOI     string   `json:"doi,omitempty"`
+
+	Verdict  string   `json:"verdict"` // "qualifies", "review", or "rejected"
+	Reason   string   `json:"reason,omitempty"`
+	Evidence []string `json:"evidence,omitempty"`
+}
+
+// grabSuggestDefaultLimit and grabSuggestMaxLimit bound grabs.suggest's
+// ranked list the same way grabsBindsDefaultLimit/grabsBindsMaxLimit (see
+// internal/api/grabs.go) bound grabs.binds: an unspecified limit still
+// returns a usable page, and an oversized one clamps down rather than
+// resetting to the default, so asking for more never returns fewer rows
+// than asking for less.
+const (
+	grabSuggestDefaultLimit = 5
+	grabSuggestMaxLimit     = 25
+)
+
+func clampSuggestLimit(limit int) int {
+	switch {
+	case limit <= 0:
+		return grabSuggestDefaultLimit
+	case limit > grabSuggestMaxLimit:
+		return grabSuggestMaxLimit
+	default:
+		return limit
+	}
+}
+
+// SuggestGrabCandidates answers "which pending job is this?" for one parked
+// DOI-less grab: it scores every candidate-eligible job against the parked
+// bytes with the production predicate and returns a ranked, human-readable
+// list. It is read-only end to end — no state transition, no file movement,
+// no bind — because a bad RANK only costs a wasted glance while a bad ACCEPT
+// misfiles a paper; see the ranking-vs-acceptance split at the top of
+// pdf/candidate_select.go.
+//
+// A suggestion list is computed fresh on every call rather than persisted,
+// because the pending-job pool it scores against changes independently of
+// this grab: a job that qualified an hour ago may since have been filed by
+// another grab or abandoned by the operator, and a stored suggestion could
+// not know that. The parked grab keeps its bytes at QuarantinePath for
+// exactly this reason — recomputing is always possible and always current.
+//
+// The guard order and outcome vocabulary mirror IdentifyGrab, which this
+// suggestion is a preview for: the same grab must be found, in the same
+// state, with the same bytes on disk, before either RPC can do anything.
+func (b *Bridge) SuggestGrabCandidates(ctx context.Context, grabID string, limit int) GrabSuggestResult {
+	result := GrabSuggestResult{GrabID: grabID}
+	if b == nil || b.grabs == nil || b.jobs == nil || b.svc == nil || b.svc.Validate == nil {
+		result.Outcome, result.Detail = "unavailable", "pdf grabs are not configured"
+		return result
+	}
+	g, err := b.grabs.Get(ctx, grabID)
+	if err != nil {
+		result.Outcome, result.Detail = "unavailable", "pdf grab is temporarily unavailable"
+		return result
+	}
+	if g == nil {
+		result.Outcome, result.Detail = "unknown_grab", "pdf grab not found"
+		return result
+	}
+	if g.State != grab.StateParkedNoIdentifier {
+		result.Outcome, result.Detail = "wrong_state", "pdf grab is not parked awaiting an identifier"
+		return result
+	}
+	if g.QuarantinePath == "" {
+		result.Outcome, result.Detail = "failed", "pdf grab has no quarantined file"
+		return result
+	}
+	// Re-run the same structural validation processSettledGrab already ran
+	// over these exact bytes, rather than trusting a cached report: nothing
+	// persists that report, and the daemon may have restarted since the
+	// park. This reproduces the identical pdf.ValidationReport the
+	// production decision would build were this grab settling right now —
+	// the whole point of reusing it instead of drifting a second decision
+	// path that scores different inputs than a real bind would.
+	report, err := b.svc.Validate(ctx, g.QuarantinePath, "application/pdf", work.Work{})
+	if err != nil {
+		// Infrastructure failure (worker unavailable, deadline), exactly
+		// like processSettledGrab's own Validate call: it says nothing
+		// about whether the file is valid, so "failed" — a terminal
+		// verdict on this grab — would be wrong. The caller should retry.
+		result.Outcome, result.Detail = "unavailable", "pdf grab could not be re-validated"
+		return result
+	}
+	candidates, err := b.jobs.ListCandidateEligibleJobs(ctx)
+	if err != nil {
+		result.Outcome, result.Detail = "unavailable", "eligible job pool is temporarily unavailable"
+		return result
+	}
+	doc := pdf.BindDocument{Excerpt: report.Text.Excerpt, Metadata: report.Metadata}
+	rows := make([]GrabSuggestionRow, 0, len(candidates))
+	for _, c := range candidates {
+		// QualifyCandidate, deliberately never SelectAutoBindCandidate:
+		// SelectAutoBindCandidate answers "may I bind unattended" and
+		// abstains the moment more than one candidate qualifies or the
+		// pool is ambiguous — exactly the situation a ranked list exists to
+		// help a human resolve. QualifyCandidate scores every candidate
+		// independently, which a ranking needs and a bind decision must not
+		// have (see the file header's 1-of-1-vs-1-of-N distinction).
+		q := pdf.QualifyCandidate(doc, pdf.BindCandidate{Key: c.JobID, Work: c.Work, Bound: c.BoundDOIs})
+		verdict := "rejected"
+		switch {
+		case q.Qualifies:
+			verdict = "qualifies"
+		case q.Review:
+			verdict = "review"
+		}
+		rows = append(rows, GrabSuggestionRow{
+			JobID:    c.JobID,
+			Title:    c.Work.Title,
+			Authors:  c.Work.Authors,
+			Year:     c.Work.Year,
+			DOI:      c.Work.DOI,
+			Verdict:  verdict,
+			Reason:   q.Reason,
+			Evidence: q.Evidence,
+		})
+	}
+	// Deterministic per the grabs.suggest contract: qualifies before review
+	// before rejected; within a tier, more evidence first (a candidate a
+	// human can confirm faster belongs first); ties broken by job id so two
+	// calls against an unchanged pool always render identically.
+	sort.SliceStable(rows, func(i, j int) bool {
+		ri, rj := suggestVerdictRank(rows[i].Verdict), suggestVerdictRank(rows[j].Verdict)
+		if ri != rj {
+			return ri < rj
+		}
+		if len(rows[i].Evidence) != len(rows[j].Evidence) {
+			return len(rows[i].Evidence) > len(rows[j].Evidence)
+		}
+		return rows[i].JobID < rows[j].JobID
+	})
+	limit = clampSuggestLimit(limit)
+	if len(rows) > limit {
+		rows, result.Truncated = rows[:limit], true
+	}
+	result.Suggestions = rows
+	result.DocumentIdentifiers = extractDocumentIdentifiers(report.Metadata)
+	result.Outcome = "ok"
+	return result
+}
+
+func suggestVerdictRank(verdict string) int {
+	switch verdict {
+	case "qualifies":
+		return 0
+	case "review":
+		return 1
+	default:
+		return 2
+	}
+}
+
+// extractDocumentIdentifiers renders a file's allowlisted embedded metadata
+// (pdf.MetadataFields — the same fields QualifyCandidate's gate 5 reads for
+// corroboration) as a list of identifiers for DISPLAY.
+//
+// This is deliberately the one place in this codebase that reads an
+// identifier OUT of metadata rather than checking metadata AGAINST one: see
+// "TARGET-AWARE ONLY" in internal/pdf/metadata.go, which forbids exactly that
+// for acceptance, because a template error or aggregator rewrite would then
+// mint a wrong identity with nothing to catch it — the same hazard
+// FrontMatterDOIs carries for page-one text. Showing the raw value to a human
+// who is about to pick among a list of named candidates is a different
+// operation with a different failure mode: at worst they see a value that
+// is not theirs and ignore it. Nothing this returns may be compared against a
+// candidate or threaded into QualifyCandidate/SelectAutoBindCandidate.
+func extractDocumentIdentifiers(fields pdf.MetadataFields) []DocumentIdentifier {
+	ordered := make(pdf.MetadataFields, len(fields))
+	copy(ordered, fields)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Field != ordered[j].Field {
+			return ordered[i].Field < ordered[j].Field
+		}
+		return ordered[i].Value < ordered[j].Value
+	})
+	out := make([]DocumentIdentifier, 0, len(ordered))
+	for _, f := range ordered {
+		kind, value := classifyMetadataIdentifier(f.Value)
+		if kind == "" {
+			continue
+		}
+		out = append(out, DocumentIdentifier{Kind: kind, Value: value, Source: f.Field})
+	}
+	return out
+}
+
+// classifyMetadataIdentifier normalizes one raw metadata value the same way
+// IdentifyGrab normalizes a human-typed one, so a value surfaced here is
+// spelled exactly as `grabs identify`/`grabs confirm` would need it retyped.
+// DOI is tried first because every field in identifierFields (metadata.go)
+// is a documented DOI container in production practice; arXiv and PMID are
+// checked after because dc:identifier/dcterms:identifier are generic Dublin
+// Core slots some publishers populate with either instead.
+func classifyMetadataIdentifier(raw string) (kind, value string) {
+	if doi, err := work.NormalizeDOI(raw); err == nil {
+		return "doi", doi
+	}
+	if id, err := work.NormalizeArXiv(raw); err == nil {
+		return "arxiv", id
+	}
+	if pmid, err := work.NormalizePMID(raw); err == nil {
+		return "pmid", pmid
+	}
+	return "", ""
+}
+
 func (b *Bridge) copyGrabFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -8156,6 +8541,224 @@ func (b *Bridge) IdentifyGrab(ctx context.Context, grabID, kind, raw string) Gra
 	}
 	result.Outcome = "job_created"
 	return result
+}
+
+// ConfirmGrabCandidate binds one parked, DOI-less grab to a job the human
+// chose from the grabs.suggest ranking. It is IdentifyGrab's sibling for the
+// captures an identifier cannot reach — a pending job need not carry any
+// identifier at all — so the human names a JOB instead, and this method
+// re-derives the SAME candidate-binding decision attemptAutoBind makes for
+// that one job and commits it through the SAME fence (MarkBoundToJobFenced)
+// rather than opening a second door to the bind. See the file header split
+// between 1-of-1 verification and 1-of-N selection: this is still 1-of-N in
+// shape, just with the human doing the selecting instead of
+// SelectAutoBindCandidate.
+//
+// The one thing a human pick cannot override is document identity. The
+// bytes' own front matter is re-read and checked with
+// pdf.CheckConclusiveIdentity against the CHOSEN job's bound DOIs; a
+// blocking verdict refuses with refused_identity and changes nothing. A
+// human is authority about WHICH pending paper they meant to click; they are
+// not authority about what the bytes actually are, and papio's shipped
+// precedence rule — unchanged from the autonomous path — is that extracted
+// identity outranks a human pick.
+func (b *Bridge) ConfirmGrabCandidate(ctx context.Context, grabID, jobID string) GrabConfirmResult {
+	result := GrabConfirmResult{GrabID: grabID, JobID: jobID}
+	if b == nil || b.grabs == nil || b.jobs == nil || b.svc == nil || b.svc.Validate == nil {
+		result.Outcome, result.Detail = "unavailable", "pdf grabs are not configured"
+		return result
+	}
+	g, err := b.grabs.Get(ctx, grabID)
+	if err != nil {
+		result.Outcome, result.Detail = "unavailable", "pdf grab is temporarily unavailable"
+		return result
+	}
+	if g == nil {
+		result.Outcome, result.Detail = "unknown_grab", "pdf grab not found"
+		return result
+	}
+	if g.State != grab.StateParkedNoIdentifier {
+		result.Outcome, result.Detail = "wrong_state", "pdf grab is not parked awaiting an identifier"
+		return result
+	}
+	if g.QuarantinePath == "" {
+		result.Outcome, result.Detail = "failed", "pdf grab has no quarantined file"
+		return result
+	}
+	// Scope the verb to exactly the pool grabs.suggest ranked: a stale UI
+	// showing a job that was since filed, cancelled, or closed must not be
+	// able to bind bytes to an arbitrary job id.
+	candidates, err := b.jobs.ListCandidateEligibleJobs(ctx)
+	if err != nil {
+		result.Outcome, result.Detail = "unavailable", "candidate pool is temporarily unavailable"
+		return result
+	}
+	var boundDOIs []string
+	found := false
+	for _, c := range candidates {
+		if c.JobID == jobID {
+			boundDOIs, found = c.BoundDOIs, true
+			break
+		}
+	}
+	if !found {
+		result.Outcome, result.Detail = "unknown_job", "job is not in the candidate-eligible pool"
+		return result
+	}
+	// Re-run the same structural validation processSettledGrab already ran
+	// over these exact bytes (see SuggestGrabCandidates just above, which
+	// reads this identically for the same reason: nothing persists that
+	// report, and the daemon may have restarted since the park).
+	report, err := b.svc.Validate(ctx, g.QuarantinePath, "application/pdf", work.Work{})
+	if err != nil {
+		result.Outcome, result.Detail = "unavailable", "pdf grab could not be re-validated"
+		return result
+	}
+	active := report.Structural.Encrypted || report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
+	if !active && (!report.Payload.OK || !report.Structural.Valid) {
+		result.Outcome, result.Detail = "failed", "the captured file is not a valid PDF"
+		return result
+	}
+	doc := pdf.BindDocument{Excerpt: report.Text.Excerpt, Metadata: report.Metadata}
+
+	// THE ONE REFUSAL THAT MATTERS. The veto is job-scoped (bound to the
+	// CHOSEN job's own DOIs, not the whole pool): it is answering "is this
+	// the work I said it was", not "is this any work in the pool". A
+	// blocking verdict means the document conclusively names a different
+	// work than the human picked, and that outranks the pick.
+	if veto := pdf.CheckConclusiveIdentity(report.Text.Excerpt, boundDOIs); veto.Blocks() {
+		result.Outcome, result.Detail = "refused_identity", veto.Verdict
+		return result
+	}
+
+	// The decision is recomputed INSIDE the transaction, exactly as
+	// attemptAutoBind's decide does, and provenance comes only from this
+	// closure — MarkBoundToJobFenced enforces that as its only door.
+	// Re-checking the winner against a TX-scoped read (rather than trusting
+	// the pre-transaction `found` above) is what makes this a fence and not
+	// a check-then-act race: the job could leave the pool between the
+	// preflight read and this commit.
+	decide := func(ctx context.Context, tx *sql.Tx) (grab.BindProvenance, error) {
+		fresh, err := job.ListCandidateEligibleJobsTx(ctx, tx)
+		if err != nil {
+			return grab.BindProvenance{}, err
+		}
+		freshCandidates := make([]pdf.BindCandidate, 0, len(fresh))
+		winnerIdx := -1
+		for i, c := range fresh {
+			freshCandidates = append(freshCandidates, pdf.BindCandidate{Key: c.JobID, Work: c.Work, Bound: c.BoundDOIs})
+			if c.JobID == jobID {
+				winnerIdx = i
+			}
+		}
+		if winnerIdx == -1 {
+			return grab.BindProvenance{}, grab.ErrFenceRejected
+		}
+		return operatorConfirmProvenance(doc, freshCandidates, winnerIdx), nil
+	}
+	// A parked grab is in parked_no_identifier, which MarkBoundToJobFenced's
+	// CAS does not accept — it binds from awaiting_file, quarantined or
+	// identified, the states an unparked settlement passes through. Identifying
+	// the grab first is exactly what IdentifyGrab does for the same reason, and
+	// the ordering is the same: this transition says "a human has answered the
+	// identity question", which is true the moment the pick clears the veto,
+	// and the fenced bind below is what makes the answer durable.
+	if err := b.grabs.MarkIdentified(ctx, grabID); err != nil {
+		result.Outcome, result.Detail = "conflict", "pdf grab changed before the pick was applied"
+		return result
+	}
+	if err := b.grabs.MarkBoundToJobFenced(ctx, grabID, jobID, "job_created", decide); err != nil {
+		if errors.Is(err, grab.ErrFenceRejected) {
+			result.Outcome, result.Detail = "conflict", "job left the candidate pool before the bind committed"
+			return result
+		}
+		result.Outcome, result.Detail = "failed", "pdf grab could not be finalized"
+		return result
+	}
+	// Stage and ingest exactly as attemptAutoBind does after its own
+	// commit: the validated quarantine copy is the only source that
+	// reaches the winner's adoption directory, and only after the claim is
+	// durable. This is the ordering that survives a crash between commit
+	// and staging; reusing it here rather than reinventing it is the
+	// point. Every failure branch below still reports job_created, because
+	// the bind itself already committed — recordAdoptionDeferred is how a
+	// staging failure stays visible and recoverable instead of silently
+	// losing bytes the row now claims to own.
+	jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
+	fallbackName := filepath.Base(g.QuarantinePath)
+	if fallbackName == "" || !filepath.IsLocal(fallbackName) || fallbackName == "." || fallbackName == string(filepath.Separator) {
+		fallbackName = "grab.pdf"
+	}
+	if err := os.MkdirAll(jobDir, 0o700); err != nil {
+		_ = b.recordAdoptionDeferred(ctx, jobID, fallbackName, err)
+		result.Outcome = "job_created"
+		return result
+	}
+	dest := uniqueAdoptionDest(jobDir, fallbackName)
+	if err := b.copyGrabFile(g.QuarantinePath, dest); err != nil {
+		_ = b.recordAdoptionDeferred(ctx, jobID, fallbackName, err)
+		result.Outcome = "job_created"
+		return result
+	}
+	boundName := filepath.Base(dest)
+	if _, err := b.ingestAdoptedFile(ctx, jobID, boundName, nil, nil); err != nil {
+		if evErr := b.recordAdoptionDeferred(ctx, jobID, boundName, err); evErr != nil {
+			result.Outcome, result.Detail = "failed", "pdf grab bound but bytes could not be adopted"
+			return result
+		}
+		if row, getErr := b.jobs.Get(ctx, jobID); getErr == nil && row != nil && job.Terminal(row.State) {
+			_ = b.preserveDeferredAdoption(jobID, boundName, dest)
+		}
+		result.Outcome = "job_created"
+		return result
+	}
+	_ = os.Remove(g.QuarantinePath)
+	_ = os.RemoveAll(filepath.Dir(g.QuarantinePath))
+	result.Outcome = "job_created"
+	return result
+}
+
+// operatorConfirmProvenance mirrors autoBindProvenance's shape exactly — the
+// same ordered per-candidate verdicts, the same rule and digest — with two
+// deliberate differences. Method is "operator_confirm", never
+// "candidate_auto_bind": grab.Service.ListAutonomousBinds filters on that
+// exact string, and its whole claim is "no human was involved in this
+// filing" — a row this function writes would falsify that claim if it used
+// the same method name. And Evidence is taken from the CHOSEN candidate even
+// when QualifyCandidate did not qualify it, because the audit value of this
+// row is precisely that a human overrode a machine that declined or
+// abstained; recording the predicate's own reasoning for that candidate is
+// what makes the override reconstructable later.
+func operatorConfirmProvenance(doc pdf.BindDocument, candidates []pdf.BindCandidate, winnerIdx int) grab.BindProvenance {
+	verdicts := make([]grab.CandidateVerdict, 0, len(candidates))
+	var winnerQual pdf.CandidateQualification
+	for i, c := range candidates {
+		q := pdf.QualifyCandidate(doc, c)
+		if i == winnerIdx {
+			winnerQual = q
+		}
+		v := grab.CandidateVerdict{JobID: c.Key}
+		switch {
+		case q.Qualifies:
+			v.Verdict = "qualifies"
+		case q.Review:
+			v.Verdict = "review"
+			v.Reason = q.Reason
+		default:
+			v.Verdict = "rejected"
+			v.Reason = q.Reason
+		}
+		verdicts = append(verdicts, v)
+	}
+	return grab.BindProvenance{
+		Method:               "operator_confirm",
+		Rule:                 pdf.CandidateBindingRule,
+		Winner:               candidates[winnerIdx].Key,
+		CandidatesConsidered: len(candidates),
+		Evidence:             winnerQual.Evidence,
+		Candidates:           verdicts,
+		ExcerptSHA256:        doc.Digest(),
+	}
 }
 
 // AutonomousBinds forwards to the grab store's grabs.binds audit query. It

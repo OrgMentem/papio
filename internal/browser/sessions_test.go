@@ -192,6 +192,24 @@ func TestNonHolderHumanInitiatedFramesAreAdmitted(t *testing.T) {
 				RequestID: "arb-preview-0001", ActionID: 999999,
 			})
 		}},
+		// The inbox is a plain extension page and is routinely open in a
+		// session that does not hold the bridge, so its ranked candidate
+		// picker has to be served to a non-holder or the feature simply does
+		// not work in the browser the operator is actually using. Both frames
+		// name an absent grab on purpose: what is under test is that a routine
+		// failure comes back as a structured response rather than as an error
+		// frame or a session teardown, which is the disposition AGENTS.md
+		// records reviewPreview getting wrong.
+		{"pdf_grab_suggest_request", protocol.MsgPdfGrabSuggestResponse, func(t *testing.T, _ string) json.RawMessage {
+			return inFrame(t, protocol.MsgPdfGrabSuggestRequest, "", protocol.PdfGrabSuggestRequestPayload{
+				RequestID: "arb-suggest-0001", GrabID: "grab_00000000000000000000000000", Limit: 5,
+			})
+		}},
+		{"pdf_grab_confirm_request", protocol.MsgPdfGrabConfirmResponse, func(t *testing.T, jobID string) json.RawMessage {
+			return inFrame(t, protocol.MsgPdfGrabConfirmRequest, "", protocol.PdfGrabConfirmRequestPayload{
+				RequestID: "arb-confirm-0001", GrabID: "grab_00000000000000000000000000", JobID: jobID,
+			})
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

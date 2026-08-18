@@ -74,6 +74,10 @@ export type BrowserMessageType =
   | "pdf_grab_status_result"
   | "pdf_grab_abandon_request"
   | "pdf_grab_abandon_result"
+  | "pdf_grab_suggest_request"
+  | "pdf_grab_suggest_response"
+  | "pdf_grab_confirm_request"
+  | "pdf_grab_confirm_response"
   | "institutional_candidate_offer"
   | "institutional_claim_request"
   | "institutional_claim_response"
@@ -1168,6 +1172,90 @@ export interface PdfGrabAbandonResultPayload {
   detail?: string;
 }
 
+/** pdf_grab_suggest_v1 gates the inbox's operator candidate picker: a
+ * ranked "which pending job is this?" answer for a parked, DOI-less grab
+ * (pdf_grab_suggest_request/response), plus the human-chosen bind through
+ * the same fence autonomous binding uses (pdf_grab_confirm_request/response).
+ * A daemon that has not advertised this feature never receives either
+ * request; the extension falls back to today's terminal-command guidance.
+ * The feature name itself is `PDF_GRAB_SUGGEST_FEATURE` in ./deliver, beside
+ * its sibling `PDF_GRAB_FEATURE` — not redeclared here. */
+
+export interface PdfGrabSuggestRequestPayload {
+  request_id: string;
+  grab_id: string;
+  limit?: number;
+}
+
+/** One allowlisted embedded-metadata value the quarantined file carries
+ * about itself — what the FILE says, surfaced for DISPLAY only. Never
+ * compared against a candidate. */
+export interface PdfGrabDocumentIdentifier {
+  kind: "doi" | "arxiv" | "pmid";
+  value: string;
+  source: string;
+}
+
+export type PdfGrabSuggestVerdict = "qualifies" | "review" | "rejected";
+
+/** One candidate-eligible job scored against the parked grab's bytes with
+ * the production qualification predicate. Verdict/reason/evidence are
+ * carried through verbatim; this row makes no claim the predicate did not
+ * already make. */
+export interface PdfGrabSuggestionRow {
+  job_id: string;
+  title: string;
+  year?: number;
+  doi?: string;
+  verdict: PdfGrabSuggestVerdict;
+  reason?: string;
+  evidence: string[];
+}
+
+export type PdfGrabSuggestOutcome =
+  | "ok"
+  | "unknown_grab"
+  | "wrong_state"
+  | "unavailable"
+  | "failed";
+
+/** suggestions/truncated are always present, even on a refusal outcome
+ * (empty/false), so the inbox never special-cases a missing key.
+ * document_identifiers is populated only on "ok". */
+export interface PdfGrabSuggestResponsePayload {
+  request_id: string;
+  grab_id: string;
+  outcome: PdfGrabSuggestOutcome;
+  detail?: string;
+  document_identifiers?: PdfGrabDocumentIdentifier[];
+  suggestions: PdfGrabSuggestionRow[];
+  truncated: boolean;
+}
+
+export interface PdfGrabConfirmRequestPayload {
+  request_id: string;
+  grab_id: string;
+  job_id: string;
+}
+
+export type PdfGrabConfirmOutcome =
+  | "job_created"
+  | "refused_identity"
+  | "unknown_grab"
+  | "unknown_job"
+  | "wrong_state"
+  | "conflict"
+  | "unavailable"
+  | "failed";
+
+export interface PdfGrabConfirmResponsePayload {
+  request_id: string;
+  grab_id: string;
+  job_id?: string;
+  outcome: PdfGrabConfirmOutcome;
+  detail?: string;
+}
+
 export type PdfGrabDisplayState =
   | "idle"
   | "grabbed"
@@ -1269,6 +1357,10 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   pdf_grab_status_result: true,
   pdf_grab_abandon_request: true,
   pdf_grab_abandon_result: true,
+  pdf_grab_suggest_request: true,
+  pdf_grab_suggest_response: true,
+  pdf_grab_confirm_request: true,
+  pdf_grab_confirm_response: true,
   institutional_candidate_offer: true,
   institutional_claim_request: true,
   institutional_claim_response: true,
@@ -5346,6 +5438,282 @@ function validatePayload(
         fail("pdf_grab_abandon_result.state required");
       if (outcome === "abandoned" && state !== "abandoned")
         fail("pdf_grab_abandon_result.abandoned state required");
+      break;
+    }
+    case "pdf_grab_suggest_request": {
+      requireFields<PdfGrabSuggestRequestPayload>(
+        p,
+        "pdf_grab_suggest_request",
+        {
+          request_id: "required",
+          grab_id: "required",
+          limit: "optional",
+        },
+      );
+      correlationID(p, "request_id", "pdf_grab_suggest_request");
+      correlationID(p, "grab_id", "pdf_grab_suggest_request");
+      if ("limit" in p) {
+        const limit = int(p, "limit", "pdf_grab_suggest_request", 1);
+        if (limit > 25) fail("pdf_grab_suggest_request.limit must be 1..25");
+      }
+      break;
+    }
+    case "pdf_grab_suggest_response": {
+      requireFields<PdfGrabSuggestResponsePayload>(
+        p,
+        "pdf_grab_suggest_response",
+        {
+          request_id: "required",
+          grab_id: "required",
+          outcome: "required",
+          detail: "optional",
+          document_identifiers: "optional",
+          suggestions: "required",
+          truncated: "required",
+        },
+      );
+      correlationID(p, "request_id", "pdf_grab_suggest_response");
+      correlationID(p, "grab_id", "pdf_grab_suggest_response");
+      const outcome = str(p, "outcome", "pdf_grab_suggest_response", 20);
+      if (
+        !(
+          [
+            "ok",
+            "unknown_grab",
+            "wrong_state",
+            "unavailable",
+            "failed",
+          ] as string[]
+        ).includes(outcome)
+      )
+        fail("pdf_grab_suggest_response.outcome is invalid");
+      if (outcome === "ok") {
+        if ("detail" in p)
+          fail("pdf_grab_suggest_response: ok outcome must not carry detail");
+      } else if (
+        !("detail" in p) ||
+        triageText(p, "detail", "pdf_grab_suggest_response", 1000) === ""
+      ) {
+        fail(`pdf_grab_suggest_response: ${outcome} outcome requires detail`);
+      }
+      if ("detail" in p)
+        triageText(p, "detail", "pdf_grab_suggest_response", 1000);
+      const suggestions = p["suggestions"];
+      if (!Array.isArray(suggestions) || suggestions.length > 25)
+        fail(
+          "pdf_grab_suggest_response.suggestions must have at most 25 entries",
+        );
+      if (outcome !== "ok" && suggestions.length !== 0)
+        fail(
+          `pdf_grab_suggest_response: ${outcome} outcome must not carry suggestions`,
+        );
+      for (const rawRow of suggestions) {
+        const row = asRecord(rawRow, "pdf_grab_suggest_response.suggestions");
+        requireFields<PdfGrabSuggestionRow>(
+          row,
+          "pdf_grab_suggest_response.suggestions",
+          {
+            job_id: "required",
+            title: "required",
+            year: "optional",
+            doi: "optional",
+            verdict: "required",
+            reason: "optional",
+            evidence: "required",
+          },
+        );
+        correlationID(row, "job_id", "pdf_grab_suggest_response.suggestions");
+        triageText(row, "title", "pdf_grab_suggest_response.suggestions", 500);
+        if ("year" in row) {
+          const year = int(
+            row,
+            "year",
+            "pdf_grab_suggest_response.suggestions",
+            1,
+          );
+          if (year > 9999)
+            fail(
+              "pdf_grab_suggest_response.suggestions.year must be a 4-digit year",
+            );
+        }
+        if ("doi" in row) {
+          const doi = str(
+            row,
+            "doi",
+            "pdf_grab_suggest_response.suggestions",
+            300,
+          );
+          if (!/^10\.[0-9]{4,9}\/\S{1,200}$/.test(doi))
+            fail("pdf_grab_suggest_response.suggestions.doi is invalid");
+        }
+        const verdict = str(
+          row,
+          "verdict",
+          "pdf_grab_suggest_response.suggestions",
+          20,
+        );
+        if (
+          !(["qualifies", "review", "rejected"] as string[]).includes(verdict)
+        )
+          fail("pdf_grab_suggest_response.suggestions.verdict is invalid");
+        if ("reason" in row)
+          triageText(
+            row,
+            "reason",
+            "pdf_grab_suggest_response.suggestions",
+            500,
+          );
+        const evidence = row["evidence"];
+        if (!Array.isArray(evidence) || evidence.length > 16)
+          fail(
+            "pdf_grab_suggest_response.suggestions.evidence must have at most 16 entries",
+          );
+        for (const e of evidence) {
+          if (
+            typeof e !== "string" ||
+            Array.from(e).length > 300 ||
+            e.includes("\0")
+          )
+            fail(
+              "pdf_grab_suggest_response.suggestions.evidence entry is invalid",
+            );
+        }
+      }
+      if ("document_identifiers" in p) {
+        const identifiers = p["document_identifiers"];
+        if (!Array.isArray(identifiers) || identifiers.length > 8)
+          fail(
+            "pdf_grab_suggest_response.document_identifiers must have at most 8 entries",
+          );
+        if (outcome !== "ok" && identifiers.length !== 0)
+          fail(
+            `pdf_grab_suggest_response: ${outcome} outcome must not carry document_identifiers`,
+          );
+        for (const rawID of identifiers) {
+          const id = asRecord(
+            rawID,
+            "pdf_grab_suggest_response.document_identifiers",
+          );
+          requireFields<PdfGrabDocumentIdentifier>(
+            id,
+            "pdf_grab_suggest_response.document_identifiers",
+            {
+              kind: "required",
+              value: "required",
+              source: "required",
+            },
+          );
+          const kind = str(
+            id,
+            "kind",
+            "pdf_grab_suggest_response.document_identifiers",
+            10,
+          );
+          if (!(["doi", "arxiv", "pmid"] as string[]).includes(kind))
+            fail(
+              "pdf_grab_suggest_response.document_identifiers.kind is invalid",
+            );
+          const value = triageText(
+            id,
+            "value",
+            "pdf_grab_suggest_response.document_identifiers",
+            300,
+          );
+          if (value === "")
+            fail(
+              "pdf_grab_suggest_response.document_identifiers.value is required",
+            );
+          if (kind === "doi" && !/^10\.[0-9]{4,9}\/\S{1,200}$/.test(value))
+            fail(
+              "pdf_grab_suggest_response.document_identifiers.value does not match its kind",
+            );
+          if (
+            kind === "arxiv" &&
+            !/^([0-9]{4}\.[0-9]{4,5})(v[0-9]+)?$|^[a-z-]+(\.[A-Z]{2})?\/[0-9]{7}$/.test(
+              value,
+            )
+          )
+            fail(
+              "pdf_grab_suggest_response.document_identifiers.value does not match its kind",
+            );
+          if (kind === "pmid" && !/^[0-9]{1,10}$/.test(value))
+            fail(
+              "pdf_grab_suggest_response.document_identifiers.value does not match its kind",
+            );
+          const source = triageText(
+            id,
+            "source",
+            "pdf_grab_suggest_response.document_identifiers",
+            100,
+          );
+          if (source === "")
+            fail(
+              "pdf_grab_suggest_response.document_identifiers.source is required",
+            );
+        }
+      }
+      if (typeof p["truncated"] !== "boolean")
+        fail("pdf_grab_suggest_response.truncated must be boolean");
+      break;
+    }
+    case "pdf_grab_confirm_request": {
+      requireFields<PdfGrabConfirmRequestPayload>(
+        p,
+        "pdf_grab_confirm_request",
+        {
+          request_id: "required",
+          grab_id: "required",
+          job_id: "required",
+        },
+      );
+      correlationID(p, "request_id", "pdf_grab_confirm_request");
+      correlationID(p, "grab_id", "pdf_grab_confirm_request");
+      correlationID(p, "job_id", "pdf_grab_confirm_request");
+      break;
+    }
+    case "pdf_grab_confirm_response": {
+      requireFields<PdfGrabConfirmResponsePayload>(
+        p,
+        "pdf_grab_confirm_response",
+        {
+          request_id: "required",
+          grab_id: "required",
+          job_id: "optional",
+          outcome: "required",
+          detail: "optional",
+        },
+      );
+      correlationID(p, "request_id", "pdf_grab_confirm_response");
+      correlationID(p, "grab_id", "pdf_grab_confirm_response");
+      if ("job_id" in p)
+        correlationID(p, "job_id", "pdf_grab_confirm_response");
+      const outcome = str(p, "outcome", "pdf_grab_confirm_response", 20);
+      if (
+        !(
+          [
+            "job_created",
+            "refused_identity",
+            "unknown_grab",
+            "unknown_job",
+            "wrong_state",
+            "conflict",
+            "unavailable",
+            "failed",
+          ] as string[]
+        ).includes(outcome)
+      )
+        fail("pdf_grab_confirm_response.outcome is invalid");
+      if (outcome === "job_created") {
+        if ("detail" in p)
+          fail(
+            "pdf_grab_confirm_response: job_created outcome must not carry detail",
+          );
+      } else if (
+        !("detail" in p) ||
+        triageText(p, "detail", "pdf_grab_confirm_response", 1000) === ""
+      ) {
+        fail(`pdf_grab_confirm_response: ${outcome} outcome requires detail`);
+      }
       break;
     }
     case "effect_permit_reconcile_request": {

@@ -367,6 +367,12 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"grabs.identify": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return identifyGrab(ctx, raw, system)
 		},
+		"grabs.suggest": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listGrabSuggestions(ctx, raw, system)
+		},
+		"grabs.confirm": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return confirmGrabCandidate(ctx, raw, system)
+		},
 		"grabs.binds": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listAutonomousBinds(ctx, raw, system)
 		},

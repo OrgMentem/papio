@@ -3,11 +3,28 @@
 Status: **Phase 3 ENABLED 2026-08-18, on the operator's decision.** A settled
 DOI-less grab that qualifies exactly one pending job is now filed automatically
 at rule version `candidate_auto_bind/3`; everything else parks as before.
-Phases 1–2 stand (popup picker, conclusive-identity veto). Phase 4 (ranked
-one-click confirm on the parked row) is **the next work**, and is now the
-higher-value half: automatic filing handles about one capture in five, so four
-in five still reach a human, and improving that prompt cannot file anything
-wrongly because the human chooses.
+Phases 1–2 stand (popup picker, conclusive-identity veto). **Phase 4 shipped
+2026-08-18**: the parked inbox row now serves a daemon-ranked candidate list with
+per-candidate evidence and a one-click confirm (`pdf_grab_suggest_request` /
+`pdf_grab_confirm_request`, feature `pdf_grab_suggest_v1`; CLI `papio grabs
+suggest` / `papio grabs confirm`). It was the higher-value half, since automatic
+filing reaches about one capture in five and the other four still come to a
+human, and it carries no wrong-accept risk of its own because the human chooses.
+
+Three things Phase 4 fixed that the design had not anticipated:
+
+- `provide_identifier` was an op that made **no daemon request at all** — it
+  printed a terminal command into the row and re-rendered
+  (`extension/src/inbox.ts`). Keeping the op name and changing its behaviour is
+  what let the whole feature land with **zero changes to existing frames**:
+  `pdf_grab_item_v4` pins `ops` as a `const` in the JSON schema and the TS parser
+  checks it exactly, so adding an op would have been a three-artifact break.
+- Suggestions are computed on demand and never persisted. The pool changes after
+  a park, so a stored suggestion names jobs that have since been filed.
+- `MarkBoundToJobFenced` binds from `awaiting_file|quarantined|identified` and a
+  parked grab is in `parked_no_identifier`, so confirm has to `MarkIdentified`
+  first, exactly as `IdentifyGrab` does. This was caught by a test, not by
+  review: without it every confirm in production would have returned `failed`.
 
 What authorised the change was measurement on the population this path serves —
 ~9,800 trials, zero wrong binds, per-document bound 0.94%, 65/318 (20.4%)

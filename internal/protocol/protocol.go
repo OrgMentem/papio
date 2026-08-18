@@ -890,12 +890,21 @@ const (
 	// unsolicited, once the grab sweeper finishes identifying the captured
 	// file (request_id empty, outcome one of the terminal identification
 	// outcomes). See PdfGrabResultPayload.
-	MsgPdfGrabRequest          = "pdf_grab_request"
-	MsgPdfGrabResult           = "pdf_grab_result"
-	MsgPdfGrabStatusRequest    = "pdf_grab_status_request"
-	MsgPdfGrabStatusResult     = "pdf_grab_status_result"
-	MsgPdfGrabAbandonRequest   = "pdf_grab_abandon_request"
-	MsgPdfGrabAbandonResult    = "pdf_grab_abandon_result"
+	MsgPdfGrabRequest        = "pdf_grab_request"
+	MsgPdfGrabResult         = "pdf_grab_result"
+	MsgPdfGrabStatusRequest  = "pdf_grab_status_request"
+	MsgPdfGrabStatusResult   = "pdf_grab_status_result"
+	MsgPdfGrabAbandonRequest = "pdf_grab_abandon_request"
+	MsgPdfGrabAbandonResult  = "pdf_grab_abandon_result"
+	// MsgPdfGrabSuggestRequest/Response and MsgPdfGrabConfirmRequest/Response
+	// back the inbox's operator-driven candidate picker — pdf_grab_suggest_v1's
+	// wire half of the same read-only ranking (Bridge.SuggestGrabCandidates)
+	// and fenced human bind (Bridge.ConfirmGrabCandidate) the `papio grabs
+	// suggest`/`papio grabs confirm` CLI commands already expose locally.
+	MsgPdfGrabSuggestRequest   = "pdf_grab_suggest_request"
+	MsgPdfGrabSuggestResponse  = "pdf_grab_suggest_response"
+	MsgPdfGrabConfirmRequest   = "pdf_grab_confirm_request"
+	MsgPdfGrabConfirmResponse  = "pdf_grab_confirm_response"
 	MsgSurfacePresence         = "surface_presence"
 	MsgSurfacePresenceAck      = "surface_presence_ack"
 	MsgWorkPulseRequest        = "work_pulse_request"
@@ -1289,6 +1298,126 @@ type PdfGrabResultPayload struct {
 	// so the extension falls back to generic copy rather than to Detail.
 	Reason string `json:"reason,omitempty"`
 	Detail string `json:"detail,omitempty"`
+}
+
+// PdfGrabSuggestFeature gates the operator candidate-picker pair
+// (pdf_grab_suggest_request/response, pdf_grab_confirm_request/response):
+// the inbox's ranked "which pending job is this?" answer for a parked,
+// DOI-less grab, and the human-chosen bind through the same fence
+// autonomous binding uses. Advertised only once the daemon can serve
+// Bridge.SuggestGrabCandidates/ConfirmGrabCandidate.
+const PdfGrabSuggestFeature = "pdf_grab_suggest_v1"
+
+// PdfGrabSuggestRequestPayload asks for a ranked candidate-job list for one
+// parked, DOI-less grab (internal/browser.Bridge.SuggestGrabCandidates).
+// Never cached by the caller: the eligible-job pool a suggestion ranks
+// against changes independently of the grab (another grab may file or
+// abandon a candidate between two calls), so Limit is the only thing that
+// makes two calls differ — the ranking itself is always recomputed fresh.
+type PdfGrabSuggestRequestPayload struct {
+	RequestID string `json:"request_id"`
+	GrabID    string `json:"grab_id"`
+	Limit     int64  `json:"limit,omitempty"`
+}
+
+// PdfGrabDocumentIdentifier is one allowlisted embedded-metadata value the
+// quarantined file carries about itself (internal/browser.DocumentIdentifier),
+// surfaced for DISPLAY only — never compared against a candidate or fed back
+// into the qualification predicate.
+type PdfGrabDocumentIdentifier struct {
+	Kind   string `json:"kind"`
+	Value  string `json:"value"`
+	Source string `json:"source"`
+}
+
+// PdfGrabSuggestionRow is one candidate-eligible job scored against the
+// parked grab's bytes with the production pdf.QualifyCandidate predicate
+// (internal/browser.GrabSuggestionRow). Verdict/Reason/Evidence are carried
+// through verbatim; this row makes no claim QualifyCandidate did not already
+// make. Authors deliberately does not travel on this wire — the contract is
+// the minimum a human needs to tell candidates apart, not a mirror of the
+// internal RPC shape.
+type PdfGrabSuggestionRow struct {
+	JobID    string   `json:"job_id"`
+	Title    string   `json:"title"`
+	Year     int64    `json:"year,omitempty"`
+	DOI      string   `json:"doi,omitempty"`
+	Verdict  string   `json:"verdict"`
+	Reason   string   `json:"reason,omitempty"`
+	Evidence []string `json:"evidence"`
+}
+
+// UnmarshalJSON enforces field presence for job_id/title/verdict/evidence,
+// not merely their decoded value: encoding/json alone cannot tell "key
+// absent" from "key present with the zero value", and for Title (any bounded
+// text permitted, including "") and Evidence (any bounded array permitted,
+// including []) that is the only thing separating this decoder from the
+// stricter "the key itself must be present" reading of `required` that
+// extension/src/protocol.ts's requireFields and the published JSON Schema
+// both enforce. JobID and Verdict are already covered by their own
+// non-empty value checks in validate(), but are included here too so a
+// missing key fails at decode time with the same message shape as every
+// other field, rather than surfacing later as a confusing "invalid" error.
+func (row *PdfGrabSuggestionRow) UnmarshalJSON(data []byte) error {
+	what := "pdf_grab_suggest_response.suggestions"
+	fields, err := browserObjectFields(data, what)
+	if err != nil {
+		return err
+	}
+	if err := browserRequireFields(fields, "job_id", "title", "verdict", "evidence"); err != nil {
+		return err
+	}
+	if err := browserRejectNullFields(fields, "year", "doi", "reason"); err != nil {
+		return err
+	}
+	type plain PdfGrabSuggestionRow
+	var decoded plain
+	if err := strictDecode(data, &decoded); err != nil {
+		return err
+	}
+	*row = PdfGrabSuggestionRow(decoded)
+	return row.validate()
+}
+
+// PdfGrabSuggestResponsePayload is the correlated ranked answer. Suggestions
+// and Truncated are always present on the wire — even empty/false on a
+// refusal outcome — so the extension never has to special-case a missing
+// key; DocumentIdentifiers is populated only on "ok", mirroring
+// GrabSuggestResult's own "empty and outcome==ok together mean genuinely
+// nobody to offer" contract.
+type PdfGrabSuggestResponsePayload struct {
+	RequestID           string                      `json:"request_id"`
+	GrabID              string                      `json:"grab_id"`
+	Outcome             string                      `json:"outcome"`
+	Detail              string                      `json:"detail,omitempty"`
+	DocumentIdentifiers []PdfGrabDocumentIdentifier `json:"document_identifiers,omitempty"`
+	Suggestions         []PdfGrabSuggestionRow      `json:"suggestions"`
+	Truncated           bool                        `json:"truncated"`
+}
+
+// PdfGrabConfirmRequestPayload asks the daemon to bind one parked grab to a
+// job the operator chose from a prior pdf_grab_suggest_response
+// (internal/browser.Bridge.ConfirmGrabCandidate). JobID is required: unlike
+// IdentifyGrab, which is keyed on a typed identifier, this RPC is keyed on
+// the job the human already picked from the ranking.
+type PdfGrabConfirmRequestPayload struct {
+	RequestID string `json:"request_id"`
+	GrabID    string `json:"grab_id"`
+	JobID     string `json:"job_id"`
+}
+
+// PdfGrabConfirmResponsePayload is the correlated bind outcome. JobID is
+// optional on the wire but in practice present whenever the handler
+// resolved a job id for the response. Detail is required on every outcome
+// but "job_created", the same coupling internal/browser.GrabConfirmResult's
+// construction enforces (Detail is set on every branch except the one that
+// finishes the bind).
+type PdfGrabConfirmResponsePayload struct {
+	RequestID string `json:"request_id"`
+	GrabID    string `json:"grab_id"`
+	JobID     string `json:"job_id,omitempty"`
+	Outcome   string `json:"outcome"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 // JobOfferPayload asks the extension to open one OpenURL-resolved job.
@@ -3178,6 +3307,51 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			err = p.validate()
 		}
 		msg.Payload = p
+	case MsgPdfGrabSuggestRequest:
+		p := &PdfGrabSuggestRequestPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "grab_id"); err == nil {
+			err = browserRejectNullFields(payloadFields, "limit")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPdfGrabSuggestResponse:
+		p := &PdfGrabSuggestResponsePayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "grab_id", "outcome", "suggestions", "truncated"); err == nil {
+			err = browserRejectNullFields(payloadFields, "detail", "document_identifiers")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPdfGrabConfirmRequest:
+		p := &PdfGrabConfirmRequestPayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "grab_id", "job_id"); err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgPdfGrabConfirmResponse:
+		p := &PdfGrabConfirmResponsePayload{}
+		if err = browserRequireFields(payloadFields, "request_id", "grab_id", "outcome"); err == nil {
+			err = browserRejectNullFields(payloadFields, "job_id", "detail")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
 	case MsgAck, MsgJobAccept, MsgJobReject, MsgCancel, MsgHandoffFocus:
 		p := &EmptyPayload{}
 		err = strictDecode(env.Payload, p)
@@ -4045,6 +4219,174 @@ func (p *PdfGrabAbandonResultPayload) validate() error {
 		return fmt.Errorf("pdf_grab_abandon_result.abandoned state required")
 	}
 	return validateTriageText("pdf_grab_abandon_result.detail", p.Detail, 1000)
+}
+
+func (p *PdfGrabSuggestRequestPayload) validate() error {
+	if err := validateCorrelationID("pdf_grab_suggest_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("pdf_grab_suggest_request.grab_id", p.GrabID); err != nil {
+		return err
+	}
+	if p.Limit != 0 && (p.Limit < 1 || p.Limit > 25) {
+		return fmt.Errorf("pdf_grab_suggest_request.limit must be between 1 and 25")
+	}
+	return nil
+}
+
+// pdfGrabDocumentIdentifierValueRE maps a document identifier's kind to the
+// same charset its normalized form must already satisfy — the identical
+// regexes work.Identifiers already validates against, so a value this
+// package accepts here is spelled exactly as `grabs identify`/`grabs
+// confirm` would need it retyped (see extractDocumentIdentifiers/
+// classifyMetadataIdentifier in internal/browser/bridge.go).
+func pdfGrabDocumentIdentifierValueRE(kind string) *regexp.Regexp {
+	switch kind {
+	case "doi":
+		return doiRE
+	case "arxiv":
+		return arxivRE
+	case "pmid":
+		return pmidRE
+	default:
+		return nil
+	}
+}
+
+func (id *PdfGrabDocumentIdentifier) validate() error {
+	if err := enumRequired("pdf_grab_suggest_response.document_identifiers.kind", id.Kind, "doi", "arxiv", "pmid"); err != nil {
+		return err
+	}
+	if id.Value == "" || browserTextLen(id.Value) > 300 || browserHasNUL(id.Value) {
+		return fmt.Errorf("pdf_grab_suggest_response.document_identifiers.value is invalid")
+	}
+	if re := pdfGrabDocumentIdentifierValueRE(id.Kind); re != nil && !re.MatchString(id.Value) {
+		return fmt.Errorf("pdf_grab_suggest_response.document_identifiers.value does not match its kind")
+	}
+	if id.Source == "" || browserTextLen(id.Source) > 100 || browserHasNUL(id.Source) {
+		return fmt.Errorf("pdf_grab_suggest_response.document_identifiers.source is invalid")
+	}
+	return nil
+}
+
+func (row *PdfGrabSuggestionRow) validate() error {
+	if err := validateCorrelationID("pdf_grab_suggest_response.suggestions.job_id", row.JobID); err != nil {
+		return err
+	}
+	if err := validateTriageText("pdf_grab_suggest_response.suggestions.title", row.Title, 500); err != nil {
+		return err
+	}
+	if row.Year != 0 && (row.Year < 1 || row.Year > 9999) {
+		return fmt.Errorf("pdf_grab_suggest_response.suggestions.year must be a 4-digit year")
+	}
+	if row.DOI != "" && !doiRE.MatchString(row.DOI) {
+		return fmt.Errorf("pdf_grab_suggest_response.suggestions.doi is invalid")
+	}
+	if err := enumRequired("pdf_grab_suggest_response.suggestions.verdict", row.Verdict, "qualifies", "review", "rejected"); err != nil {
+		return err
+	}
+	if err := validateTriageText("pdf_grab_suggest_response.suggestions.reason", row.Reason, 500); err != nil {
+		return err
+	}
+	if len(row.Evidence) > 16 {
+		return fmt.Errorf("pdf_grab_suggest_response.suggestions.evidence capped at 16")
+	}
+	for _, e := range row.Evidence {
+		if err := validateTriageText("pdf_grab_suggest_response.suggestions.evidence", e, 300); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validate enforces the ok/refusal split: a refusal always explains itself
+// with Detail and never carries a ranking a caller would have to know to
+// ignore; "ok" is the only outcome that may carry one (and, per
+// GrabSuggestResult's own contract, may still carry an empty one — a grab
+// can be genuinely parked with nobody to offer).
+func (p *PdfGrabSuggestResponsePayload) validate() error {
+	if err := validateCorrelationID("pdf_grab_suggest_response.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("pdf_grab_suggest_response.grab_id", p.GrabID); err != nil {
+		return err
+	}
+	if err := enumRequired("pdf_grab_suggest_response.outcome", p.Outcome,
+		"ok", "unknown_grab", "wrong_state", "unavailable", "failed"); err != nil {
+		return err
+	}
+	if p.Outcome == "ok" {
+		if p.Detail != "" {
+			return fmt.Errorf("pdf_grab_suggest_response: ok outcome must not carry detail")
+		}
+	} else {
+		if p.Detail == "" {
+			return fmt.Errorf("pdf_grab_suggest_response: %s outcome requires detail", p.Outcome)
+		}
+		if len(p.Suggestions) != 0 || len(p.DocumentIdentifiers) != 0 {
+			return fmt.Errorf("pdf_grab_suggest_response: %s outcome must not carry suggestions or document_identifiers", p.Outcome)
+		}
+	}
+	if err := validateTriageText("pdf_grab_suggest_response.detail", p.Detail, 1000); err != nil {
+		return err
+	}
+	if len(p.Suggestions) > 25 {
+		return fmt.Errorf("pdf_grab_suggest_response.suggestions capped at 25")
+	}
+	for i := range p.Suggestions {
+		if err := p.Suggestions[i].validate(); err != nil {
+			return err
+		}
+	}
+	if len(p.DocumentIdentifiers) > 8 {
+		return fmt.Errorf("pdf_grab_suggest_response.document_identifiers capped at 8")
+	}
+	for i := range p.DocumentIdentifiers {
+		if err := p.DocumentIdentifiers[i].validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *PdfGrabConfirmRequestPayload) validate() error {
+	if err := validateCorrelationID("pdf_grab_confirm_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("pdf_grab_confirm_request.grab_id", p.GrabID); err != nil {
+		return err
+	}
+	return validateCorrelationID("pdf_grab_confirm_request.job_id", p.JobID)
+}
+
+// validate enforces the same job_created/refusal detail coupling
+// GrabConfirmResult's construction already carries: Detail is set on every
+// branch except the one that finishes the bind.
+func (p *PdfGrabConfirmResponsePayload) validate() error {
+	if err := validateCorrelationID("pdf_grab_confirm_response.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("pdf_grab_confirm_response.grab_id", p.GrabID); err != nil {
+		return err
+	}
+	if err := enumRequired("pdf_grab_confirm_response.outcome", p.Outcome,
+		"job_created", "refused_identity", "unknown_grab", "unknown_job",
+		"wrong_state", "conflict", "unavailable", "failed"); err != nil {
+		return err
+	}
+	if p.JobID != "" {
+		if err := validateCorrelationID("pdf_grab_confirm_response.job_id", p.JobID); err != nil {
+			return err
+		}
+	}
+	if p.Outcome == "job_created" {
+		if p.Detail != "" {
+			return fmt.Errorf("pdf_grab_confirm_response: job_created outcome must not carry detail")
+		}
+	} else if p.Detail == "" {
+		return fmt.Errorf("pdf_grab_confirm_response: %s outcome requires detail", p.Outcome)
+	}
+	return validateTriageText("pdf_grab_confirm_response.detail", p.Detail, 1000)
 }
 
 func (p *HelloAckPayload) validate() error {

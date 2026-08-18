@@ -1,7 +1,8 @@
 // Copyright 2026 OrgMentem. Licensed under MIT.
 
 import { derivePulseDisplay, pulseIsUnmeasured, requestWorkPulse, type PopupPulseCache } from "./popup";
-import { getSuccessAckMode, type SuccessAckMode } from "./state";
+import { chromeBackend, getSuccessAckMode, type SuccessAckMode } from "./state";
+import { PDF_GRAB_SUGGEST_FEATURE } from "./deliver";
 import type { ActivityEntryPayload, TriageCounts, TriageDelivery, TriageSnapshotItem, TriageSnapshotResponsePayload } from "./protocol";
 
 type Snapshot = Omit<TriageSnapshotResponsePayload, "request_id">;
@@ -93,6 +94,50 @@ interface PendingDismissal {
   cancelsJob: boolean;
 }
 
+/** One document's identifier, read out of its own embedded metadata by the
+ * daemon (never compared against a candidate — see extractDocumentIdentifiers
+ * in internal/browser/bridge.go); shown so the operator's `papio grabs
+ * identify` retype is copy-ready instead of hunted for. */
+interface GrabDocumentIdentifier {
+  kind: string;
+  value: string;
+  source: string;
+}
+
+/** One candidate-eligible job scored against the parked grab's bytes by the
+ * daemon's production QualifyCandidate — the same predicate autonomous
+ * binding uses, just run against every candidate instead of stopping at the
+ * first unambiguous one. */
+interface GrabSuggestionRow {
+  job_id: string;
+  title?: string;
+  year?: number;
+  doi?: string;
+  verdict: "qualifies" | "review" | "rejected";
+  reason?: string;
+  evidence: string[];
+}
+
+/** Ranked-picker state for one pdf_grab row, fetched on click and never
+ * persisted: grabs.suggest recomputes the candidate pool fresh on every
+ * call, so a cached list would name a job the pool has since filed or
+ * abandoned. */
+interface GrabPickerState {
+  status: "loading" | "loaded";
+  outcome?: string;
+  detail?: string;
+  documentIdentifiers: GrabDocumentIdentifier[];
+  suggestions: GrabSuggestionRow[];
+  truncated: boolean;
+  /** Set after a confirm response whose outcome must stay visible without
+   * clearing the picker — refused_identity above all: the pick was not
+   * applied and this is the only place that says so. */
+  confirmNotice?: { text: string; tone: "info" | "error" };
+  /** job_id of a confirm currently in flight, so only that suggestion's
+   * button shows a busy state and a second click cannot double-fire. */
+  confirmingJobID?: string;
+}
+
 interface PageState {
   snapshot: Snapshot | null;
   counts: TriageCounts | null;
@@ -140,6 +185,14 @@ interface PageState {
   activityLimited: boolean;
   activityHasMore: boolean;
   waitingJobs: Map<string, number>;
+  grabPickers: Map<string, GrabPickerState>;
+  /** Features from the last hello_ack, read directly off the persisted
+   * BrokerStore (state.ts) the way popup.ts already does — the
+   * triage-snapshot RPC carries no capability information. Empty until the
+   * first successful read, so the picker gate below always fails closed to
+   * today's guidance text before this has ever loaded or when the daemon
+   * has never negotiated. */
+  daemonFeatures: string[];
 }
 
 type FocusTarget =
@@ -187,6 +240,8 @@ const state: PageState = {
   activityLimited: false,
   activityHasMore: false,
   waitingJobs: new Map(),
+  grabPickers: new Map(),
+  daemonFeatures: [],
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -267,6 +322,26 @@ async function loadSuccessAckMode(): Promise<void> {
   if (typeof chrome === "undefined" || chrome.storage?.local === undefined) return;
   state.successAckMode = await getSuccessAckMode(chrome.storage.local);
   render();
+}
+
+async function loadDaemonFeatures(): Promise<void> {
+  if (typeof chrome === "undefined" || chrome.storage === undefined) return;
+  try {
+    const store = await chromeBackend(chrome.storage).load();
+    state.daemonFeatures = store.daemonFeatures ?? [];
+  } catch {
+    // Storage may be unavailable in private/test contexts; keep whatever
+    // was last learned rather than silently disabling the picker.
+  }
+}
+
+// Both halves must hold before the picker replaces today's guidance text: a
+// stale feature list surviving a disconnect (the persisted store is cleared
+// only at the START of the next hello, not the moment the port drops) must
+// not by itself promise a picker the daemon just stopped answering to — see
+// deliver.ts's sendPdfState, which gates the same way on its own surface.
+function grabPickerAvailable(): boolean {
+  return state.connected && state.daemonFeatures.includes(PDF_GRAB_SUGGEST_FEATURE);
 }
 
 // A disconnect is usually the daemon's own port healing (extension reload,
@@ -573,6 +648,31 @@ function isActivityEntry(value: unknown): value is ActivityEntry {
     (value["job_id"] === undefined || typeof value["job_id"] === "string") &&
     (value["title"] === undefined || typeof value["title"] === "string")
   );
+}
+
+function toGrabDocumentIdentifier(raw: unknown): GrabDocumentIdentifier | null {
+  if (!isRecord(raw) || typeof raw["kind"] !== "string" || typeof raw["value"] !== "string" || typeof raw["source"] !== "string") {
+    return null;
+  }
+  return { kind: raw["kind"], value: raw["value"], source: raw["source"] };
+}
+
+function toGrabSuggestionRow(raw: unknown): GrabSuggestionRow | null {
+  if (!isRecord(raw) || typeof raw["job_id"] !== "string") return null;
+  const verdict = raw["verdict"];
+  if (verdict !== "qualifies" && verdict !== "review" && verdict !== "rejected") return null;
+  const evidence = Array.isArray(raw["evidence"])
+    ? raw["evidence"].filter((entry): entry is string => typeof entry === "string")
+    : [];
+  return {
+    job_id: raw["job_id"],
+    verdict,
+    evidence,
+    ...(typeof raw["title"] === "string" ? { title: raw["title"] } : {}),
+    ...(typeof raw["year"] === "number" ? { year: raw["year"] } : {}),
+    ...(typeof raw["doi"] === "string" ? { doi: raw["doi"] } : {}),
+    ...(typeof raw["reason"] === "string" ? { reason: raw["reason"] } : {}),
+  };
 }
 
 
@@ -1058,7 +1158,15 @@ function operationButton(item: TriageSnapshotItem, operation: TriageOperation): 
   // permanently disabled placeholder when the daemon includes it.
   if (operation === "retry") return null;
   if (operation === "accept" && item.action_kind === "unsafe_pdf") return null;
-  const label = operation === "open" ? operationOpenLabel(item) : operationLabel(operation);
+  const label = operation === "open"
+    ? operationOpenLabel(item)
+    // Relabelled only once the daemon has actually advertised the picker
+    // (grabPickerAvailable checks both daemonFeatures and live
+    // connectivity): an old daemon still gets "Provide identifier" and the
+    // guidance-only behaviour activateOperation falls back to below.
+    : operation === "provide_identifier" && item.kind === "pdf_grab" && grabPickerAvailable()
+      ? "Which paper is this?"
+      : operationLabel(operation);
   const title = displayTitle(item).text;
   const button = element("button", label);
   button.type = "button";
@@ -1069,11 +1177,13 @@ function operationButton(item: TriageSnapshotItem, operation: TriageOperation): 
   const needsPreview = operation === "accept" && item.action_kind === "verify_identity";
   const handoff = item.kind === "human_action" && item.action_kind === "openurl_handoff";
   const unavailable = operation === "open" && (handoff ? handoffJobID(item) === null : firstSafeLink(item) === null);
+  const grabLoading = operation === "provide_identifier" && state.grabPickers.get(item.id)?.status === "loading";
   button.disabled =
     state.pending.has(item.id) ||
     unavailable ||
     (isMutation(operation) && !state.connected) ||
-    (needsPreview && !hasViewedPreview(item));
+    (needsPreview && !hasViewedPreview(item)) ||
+    grabLoading;
   if (needsPreview && !hasViewedPreview(item)) button.title = "View the PDF before accepting it.";
   button.addEventListener("click", () => {
     activateOperation(item, operation);
@@ -1488,6 +1598,138 @@ function renderDeliveryDetail(item: TriageSnapshotItem): HTMLElement | null {
   return list;
 }
 
+const GRAB_VERDICT_LABELS: Record<GrabSuggestionRow["verdict"], string> = {
+  qualifies: "Qualifies",
+  review: "Needs review",
+  rejected: "Rejected",
+};
+
+function renderGrabSuggestionRow(item: TriageSnapshotItem, grabID: string, suggestion: GrabSuggestionRow, confirming: boolean): HTMLElement {
+  const row = element("li");
+  row.className = "grab-picker-suggestion";
+  row.dataset.verdict = suggestion.verdict;
+
+  const heading = element("div");
+  heading.className = "grab-picker-suggestion-heading";
+  const displayName = suggestion.title !== undefined && suggestion.title !== "" ? suggestion.title : suggestion.job_id;
+  const titleText = suggestion.year !== undefined ? `${displayName} (${suggestion.year})` : displayName;
+  const titleEl = element("span", titleText);
+  titleEl.className = "grab-picker-suggestion-title";
+  const badge = element("span", GRAB_VERDICT_LABELS[suggestion.verdict]);
+  badge.className = "grab-picker-verdict";
+  badge.dataset.verdict = suggestion.verdict;
+  heading.append(titleEl, badge);
+  row.append(heading);
+
+  if (suggestion.reason !== undefined && suggestion.reason !== "") {
+    const reason = element("p", suggestion.reason);
+    reason.className = "grab-picker-suggestion-reason";
+    row.append(reason);
+  }
+
+  // The evidence is the reason the operator can trust the ranking, so it is
+  // never hidden behind a disclosure — even a one-line qualifying match
+  // shows what qualified it.
+  if (suggestion.evidence.length > 0) {
+    const evidenceList = element("ul");
+    evidenceList.className = "grab-picker-evidence";
+    for (const line of suggestion.evidence) evidenceList.append(element("li", line));
+    row.append(evidenceList);
+  }
+
+  const confirmButton = element("button", confirming ? "Filing…" : "This is the one");
+  confirmButton.type = "button";
+  confirmButton.className = "grab-picker-confirm";
+  confirmButton.disabled = confirming || state.pending.has(item.id);
+  confirmButton.setAttribute("aria-label", `File this capture as ${displayName}`);
+  confirmButton.addEventListener("click", () => {
+    void confirmGrabCandidate(item, grabID, suggestion.job_id);
+  });
+  row.append(confirmButton);
+  return row;
+}
+
+/** Renders the ranked "which paper is this?" picker for one pdf_grab row.
+ * Nothing here fires until requestGrabSuggestions has been asked for by a
+ * click — see the button wiring in operationButton/activateOperation — and
+ * the result is never persisted across a re-render caused by anything else
+ * (a poll tick, another row's action), since grabPickers lives in page
+ * state exactly like itemMessages and survives render() the same way. */
+function renderGrabPicker(item: TriageSnapshotItem): HTMLElement | null {
+  const grabID = item.grab?.grab_id;
+  if (grabID === undefined) return null;
+  const picker = state.grabPickers.get(item.id);
+  if (picker === undefined) return null;
+  const container = element("div");
+  container.className = "grab-picker";
+
+  if (picker.status === "loading") {
+    const status = element("p", "Looking for a match…");
+    status.className = "grab-picker-status";
+    container.append(status);
+    return container;
+  }
+
+  if (picker.confirmNotice !== undefined) {
+    const notice = element("p", picker.confirmNotice.text);
+    notice.className = "grab-picker-confirm-notice";
+    notice.dataset.tone = picker.confirmNotice.tone;
+    container.append(notice);
+  }
+
+  if (picker.outcome !== "ok") {
+    const status = element("p", picker.detail ?? "papio could not compute suggestions for this file.");
+    status.className = "grab-picker-status";
+    status.dataset.tone = "error";
+    container.append(status);
+    return container;
+  }
+
+  if (picker.documentIdentifiers.length > 0) {
+    const section = element("div");
+    section.className = "grab-picker-identifiers";
+    section.append(element("h4", "papio found in the file"));
+    const list = element("ul");
+    for (const identifier of picker.documentIdentifiers) {
+      const row = element("li");
+      const label = element("span", `${identifier.kind.toUpperCase()}: ${identifier.value}`);
+      label.className = "grab-picker-identifier-value";
+      const source = element("span", `found in ${identifier.source}`);
+      source.className = "grab-picker-identifier-source";
+      const command = element("code", `papio grabs identify ${grabID} --${identifier.kind} ${identifier.value}`);
+      row.append(label, document.createTextNode(" — "), source, element("br"), command);
+      list.append(row);
+    }
+    section.append(list);
+    container.append(section);
+  }
+
+  if (picker.suggestions.length > 0) {
+    const section = element("div");
+    section.className = "grab-picker-suggestions";
+    section.append(element("h4", "Which paper is this?"));
+    const list = element("ul");
+    for (const suggestion of picker.suggestions) {
+      list.append(renderGrabSuggestionRow(item, grabID, suggestion, picker.confirmingJobID === suggestion.job_id));
+    }
+    section.append(list);
+    if (picker.truncated) {
+      const note = element("p", "More candidates exist than are shown here.");
+      note.className = "grab-picker-truncated";
+      section.append(note);
+    }
+    container.append(section);
+  }
+
+  if (picker.documentIdentifiers.length === 0 && picker.suggestions.length === 0) {
+    const status = element("p", "No pending candidates matched this file, and papio found no identifier in it. Use papio grabs identify to file it manually.");
+    status.className = "grab-picker-status";
+    container.append(status);
+  }
+
+  return container;
+}
+
 // Supporting explanation and backend identifiers share one compact disclosure,
 // preserving native button keyboard semantics and state.
 function renderDebug(
@@ -1612,6 +1854,10 @@ function renderItem(item: TriageSnapshotItem, family: FamilyRender | null = null
   if (liveStatus !== null) body.append(liveStatus);
   const delivery = renderDeliveryDetail(item);
   if (delivery !== null) body.append(delivery);
+  if (item.kind === "pdf_grab") {
+    const picker = renderGrabPicker(item);
+    if (picker !== null) body.append(picker);
+  }
 
   const leftovers = item.facts.filter((fact) => KNOWN_FACT_LABELS[fact.label] !== true);
   if (leftovers.length > 0) {
@@ -1995,6 +2241,7 @@ function removeItem(itemID: string): void {
   const remaining = state.snapshot.items.filter((item) => item.id !== itemID);
   state.snapshot = { ...state.snapshot, items: remaining };
   state.itemMessages.delete(itemID);
+  state.grabPickers.delete(itemID);
   adjustCounts(removed, -1);
   if (state.selectedID === itemID) {
     const next = items[index + 1] ?? items[index - 1] ?? null;
@@ -2095,7 +2342,17 @@ async function refreshInbox(append = false): Promise<void> {
       .catch((error: unknown) => ({ ok: false as const, message: error instanceof Error ? error.message : "The daemon is unavailable." }));
   const pulsePromise = append ? Promise.resolve(undefined) : requestWorkPulse();
   const waitingPromise = readWaitingSessionJobs();
-  const [snapshotResult, countsResult, pulseResult, waitingResult] = await Promise.all([snapshotPromise, countsPromise, pulsePromise, waitingPromise]);
+  // Piggybacks on the same wave, not the lightweight counts poll: the picker
+  // gate only needs to be as fresh as the row it renders on, and this read
+  // already happens exactly when a full snapshot does.
+  const daemonFeaturesPromise = append ? Promise.resolve() : loadDaemonFeatures();
+  const [snapshotResult, countsResult, pulseResult, waitingResult] = await Promise.all([
+    snapshotPromise,
+    countsPromise,
+    pulsePromise,
+    waitingPromise,
+    daemonFeaturesPromise,
+  ]);
   state.loading = false;
   if (!append) state.pulse = pulseResult;
 
@@ -2791,6 +3048,135 @@ async function requestPreview(item: TriageSnapshotItem): Promise<void> {
   }
 }
 
+/** Fetched fresh on every click, never cached: the daemon's own suggest RPC
+ * recomputes the candidate pool on every call for exactly this reason (see
+ * SuggestGrabCandidates in internal/browser/bridge.go), so a stored list
+ * here would name a job the pool has since filed or abandoned. */
+async function requestGrabSuggestions(item: TriageSnapshotItem): Promise<void> {
+  const grabID = item.grab?.grab_id;
+  if (grabID === undefined) return;
+  if (!state.connected) {
+    operationMessage(item.id, "Daemon unavailable — reconnecting automatically.", "offline");
+    render();
+    return;
+  }
+  if (state.grabPickers.get(item.id)?.status === "loading") return;
+  state.grabPickers.set(item.id, {
+    status: "loading",
+    documentIdentifiers: [],
+    suggestions: [],
+    truncated: false,
+  });
+  render();
+  try {
+    const response = await runtimeMessage("papio.grab.suggest", { grab_id: grabID });
+    if (!isRecord(response) || response["ok"] !== true || typeof response["outcome"] !== "string") {
+      state.grabPickers.delete(item.id);
+      const message = errorFromResponse(response);
+      setConnection(false, message);
+      operationMessage(item.id, message, "offline");
+      render();
+      return;
+    }
+    const documentIdentifiers = Array.isArray(response["document_identifiers"])
+      ? response["document_identifiers"].map(toGrabDocumentIdentifier).filter((entry): entry is GrabDocumentIdentifier => entry !== null)
+      : [];
+    const suggestions = Array.isArray(response["suggestions"])
+      ? response["suggestions"].map(toGrabSuggestionRow).filter((entry): entry is GrabSuggestionRow => entry !== null)
+      : [];
+    state.grabPickers.set(item.id, {
+      status: "loaded",
+      outcome: response["outcome"],
+      ...(typeof response["detail"] === "string" ? { detail: response["detail"] } : {}),
+      documentIdentifiers,
+      suggestions,
+      truncated: response["truncated"] === true,
+    });
+    render();
+  } catch (error) {
+    state.grabPickers.delete(item.id);
+    const message = error instanceof Error ? error.message : "The daemon is unavailable.";
+    setConnection(false, message);
+    operationMessage(item.id, message, "offline");
+    render();
+  }
+}
+
+function clearGrabConfirming(itemID: string): void {
+  const current = state.grabPickers.get(itemID);
+  if (current === undefined) return;
+  // The key is dropped rather than set to undefined: exactOptionalPropertyTypes
+  // is on, so an explicit undefined is not assignable to an optional property.
+  const { confirmingJobID: _settled, ...rest } = current;
+  state.grabPickers.set(itemID, rest);
+}
+
+/** Binds the parked grab to the human's pick through the same fenced
+ * operator_confirm path autonomous binding uses (ConfirmGrabCandidate). The
+ * one outcome that must be unmistakable is refused_identity: the document's
+ * own front matter names a different work than the pick, the bind was
+ * refused, and nothing changed — extracted identity outranks a human pick,
+ * unchanged from the autonomous path's own precedence. */
+async function confirmGrabCandidate(item: TriageSnapshotItem, grabID: string, jobID: string): Promise<void> {
+  const picker = state.grabPickers.get(item.id);
+  if (picker === undefined || picker.status !== "loaded" || picker.confirmingJobID !== undefined) return;
+  if (!beginMutation(item)) return;
+  const { confirmNotice: _superseded, ...priorPicker } = picker;
+  state.grabPickers.set(item.id, { ...priorPicker, confirmingJobID: jobID });
+  render();
+  try {
+    const response = await runtimeMessage("papio.grab.confirm", { grab_id: grabID, job_id: jobID });
+    state.pending.delete(item.id);
+    if (!isRecord(response) || response["ok"] !== true || typeof response["outcome"] !== "string") {
+      clearGrabConfirming(item.id);
+      operationMessage(item.id, errorFromResponse(response), "error");
+      render();
+      return;
+    }
+    const outcome = response["outcome"];
+    const detail = typeof response["detail"] === "string" ? response["detail"] : undefined;
+    if (outcome === "job_created") {
+      const matched = picker.suggestions.find((row) => row.job_id === jobID);
+      const title = matched?.title !== undefined && matched.title !== "" ? matched.title : jobID;
+      const message = `Filed as “${boundedProse(title, 60)}”.`;
+      state.grabPickers.delete(item.id);
+      announce(message);
+      removeItem(item.id);
+      if (state.successAckMode === "all") showFeedback(message);
+      render();
+      return;
+    }
+    if (outcome === "refused_identity") {
+      clearGrabConfirming(item.id);
+      const current = state.grabPickers.get(item.id);
+      if (current !== undefined) {
+        state.grabPickers.set(item.id, {
+          ...current,
+          confirmNotice: {
+            text: `papio refused this pick — the file's own front matter names a different paper, so nothing was changed.${detail !== undefined ? ` (${detail})` : ""}`,
+            tone: "error",
+          },
+        });
+      }
+      render();
+      return;
+    }
+    if (outcome === "conflict") {
+      clearGrabConfirming(item.id);
+      operationMessage(item.id, "changed elsewhere — refreshed", "info");
+      render();
+      await refreshInbox();
+      return;
+    }
+    clearGrabConfirming(item.id);
+    operationMessage(item.id, detail ?? "The daemon could not confirm this pick.", "error");
+    render();
+  } catch (error) {
+    clearGrabConfirming(item.id);
+    failMutationOffline(item, error);
+  }
+}
+
 async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
   const jobID = handoffJobID(item);
   if (jobID === null) {
@@ -2845,8 +3231,12 @@ function activateOperation(item: TriageSnapshotItem, operation: TriageOperation)
       scheduleDismissal(item);
       return;
     case "provide_identifier":
-      operationMessage(item.id, guidanceText(item, false) ?? "Provide an identifier with the papio grabs identify command.", "info");
-      render();
+      if (item.kind === "pdf_grab" && grabPickerAvailable()) {
+        void requestGrabSuggestions(item);
+      } else {
+        operationMessage(item.id, guidanceText(item, false) ?? "Provide an identifier with the papio grabs identify command.", "info");
+        render();
+      }
       return;
     case "accept":
     case "reject":

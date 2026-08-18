@@ -111,6 +111,7 @@ import {
   carriesSignedCredential,
   sanitizePageHost,
   PDF_GRAB_FEATURE,
+  PDF_GRAB_SUGGEST_FEATURE,
 } from "./deliver";
 import {
   adapters,
@@ -375,6 +376,8 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "provider_drive_epoch_result",
   "terms_effect_start_result",
   "terms_effect_result",
+  "pdf_grab_suggest_response",
+  "pdf_grab_confirm_response",
 ]);
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
 const POPUP_PAGE_PATH = "dist/popup.html";
@@ -1286,6 +1289,8 @@ export const INBOX_RUNTIME_MESSAGE_TYPES = [
   "papio.action.resolve",
   "papio.delivery.reconcile",
   "papio.preview",
+  "papio.grab.suggest",
+  "papio.grab.confirm",
 ] as const;
 type InboxRuntimeMessageType = (typeof INBOX_RUNTIME_MESSAGE_TYPES)[number];
 
@@ -9495,6 +9500,103 @@ export class Bridge {
     return { ok: true, outcome, preview };
   }
 
+  // requestGrabSuggestions/requestGrabConfirm are the picker's read then
+  // write, mirroring Bridge.SuggestGrabCandidates/ConfirmGrabCandidate on
+  // the daemon: the suggest RPC re-validates the parked bytes and ranks the
+  // live candidate pool fresh on every call (never cached — a stored list
+  // would name a job the pool has since filed or abandoned), and confirm
+  // binds through the same fenced operator_confirm path autonomous binding
+  // uses. Both are gated on PDF_GRAB_SUGGEST_FEATURE so an older daemon that
+  // never advertised the picker is never sent either frame: requestNative's
+  // own feature check answers `feature_unavailable` before anything is sent,
+  // and the inbox's own daemonFeatures gate (read from the persisted store)
+  // keeps the button from offering the picker at all in that case — this is
+  // the second, server-side backstop.
+  async requestGrabSuggestions(request: { grab_id: string; limit?: number }): Promise<
+    BrokerReply<{
+      grab_id: string;
+      outcome: string;
+      detail?: string;
+      document_identifiers: Array<{ kind: string; value: string; source: string }>;
+      suggestions: Array<{
+        job_id: string;
+        title?: string;
+        year?: number;
+        doi?: string;
+        verdict: string;
+        reason?: string;
+        evidence: string[];
+      }>;
+      truncated: boolean;
+    }>
+  > {
+    const result = await this.requestNative(
+      "pdf_grab_suggest_request",
+      request,
+      "pdf_grab_suggest_response",
+      PDF_GRAB_SUGGEST_FEATURE,
+      false,
+    );
+    if (result.kind !== "response" || result.payload === undefined)
+      return this.nativeFailure(result);
+    if (result.code !== undefined)
+      return failure(
+        result.code,
+        result.message ?? "PDF grab suggestions are unavailable",
+      );
+    const payload = result.payload;
+    return {
+      ok: true,
+      grab_id: payload["grab_id"] as string,
+      outcome: payload["outcome"] as string,
+      ...(typeof payload["detail"] === "string" ? { detail: payload["detail"] } : {}),
+      document_identifiers:
+        (payload["document_identifiers"] as
+          | Array<{ kind: string; value: string; source: string }>
+          | undefined) ?? [],
+      suggestions:
+        (payload["suggestions"] as
+          | Array<{
+              job_id: string;
+              title?: string;
+              year?: number;
+              doi?: string;
+              verdict: string;
+              reason?: string;
+              evidence: string[];
+            }>
+          | undefined) ?? [],
+      truncated: payload["truncated"] === true,
+    };
+  }
+
+  async requestGrabConfirm(request: { grab_id: string; job_id: string }): Promise<
+    BrokerReply<{ grab_id: string; job_id?: string; outcome: string; detail?: string }>
+  > {
+    const result = await this.requestNative(
+      "pdf_grab_confirm_request",
+      request,
+      "pdf_grab_confirm_response",
+      PDF_GRAB_SUGGEST_FEATURE,
+      true,
+    );
+    if (result.kind !== "response" || result.payload === undefined)
+      return this.nativeFailure(result);
+    if (result.code !== undefined)
+      return failure(
+        result.code,
+        result.message ?? "The pick could not be confirmed",
+      );
+    const payload = result.payload;
+    return {
+      ok: true,
+      grab_id: payload["grab_id"] as string,
+      outcome: payload["outcome"] as string,
+      ...(typeof payload["job_id"] === "string" ? { job_id: payload["job_id"] } : {}),
+      ...(typeof payload["detail"] === "string" ? { detail: payload["detail"] } : {}),
+    };
+  }
+
   /**
    * Record the user's informed terms-consent choice (popup first-use prompt),
    * clear the pending-prompt flags, and — when they consented — re-drive the
@@ -17183,6 +17285,23 @@ type InboxRuntimeReply =
     }>
   | BrokerReply<{ allowed: boolean }>
   | BrokerReply<{ origins: string[] }>
+  | BrokerReply<{
+      grab_id: string;
+      outcome: string;
+      detail?: string;
+      document_identifiers: Array<{ kind: string; value: string; source: string }>;
+      suggestions: Array<{
+        job_id: string;
+        title?: string;
+        year?: number;
+        doi?: string;
+        verdict: string;
+        reason?: string;
+        evidence: string[];
+      }>;
+      truncated: boolean;
+    }>
+  | BrokerReply<{ grab_id: string; job_id?: string; outcome: string; detail?: string }>
   | DeliveryReply;
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -17490,6 +17609,37 @@ function isPageBulkGrabStatusRuntimeRequest(
     typeof value["grab_id"] === "string" &&
     value["grab_id"].length > 0 &&
     value["grab_id"].length <= 128
+  );
+}
+
+function isGrabSuggestRuntimeRequest(
+  value: unknown,
+): value is { grab_id: string; limit?: number } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["grab_id", "limit"]))
+    return false;
+  const grabID = value["grab_id"];
+  if (typeof grabID !== "string" || grabID.length === 0 || grabID.length > 128)
+    return false;
+  return (
+    value["limit"] === undefined ||
+    (isPositiveSafeInteger(value["limit"]) && value["limit"] <= 25)
+  );
+}
+
+function isGrabConfirmRuntimeRequest(
+  value: unknown,
+): value is { grab_id: string; job_id: string } {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["grab_id", "job_id"]))
+    return false;
+  const grabID = value["grab_id"];
+  const jobID = value["job_id"];
+  return (
+    typeof grabID === "string" &&
+    grabID.length > 0 &&
+    grabID.length <= 128 &&
+    typeof jobID === "string" &&
+    jobID.length > 0 &&
+    jobID.length <= 128
   );
 }
 
@@ -18174,7 +18324,9 @@ export async function handleInboxRuntimeMessage(
     type !== "papio.triage.decide" &&
     type !== "papio.action.resolve" &&
     type !== "papio.delivery.reconcile" &&
-    type !== "papio.preview"
+    type !== "papio.preview" &&
+    type !== "papio.grab.suggest" &&
+    type !== "papio.grab.confirm"
   ) {
     return undefined;
   }
@@ -18229,6 +18381,18 @@ export async function handleInboxRuntimeMessage(
       return isPreviewRuntimeRequest(request)
         ? bridge.requestPreview(request)
         : failure("invalid_request", "Invalid preview request");
+    // Both read-only (suggest) and holder-independent-shaped (confirm — it
+    // mutates, but through the same fenced bind operator_confirm already
+    // uses, never a second door): inbox-only like every other triage
+    // mutation above, gated by isInboxSender via senderAuthorized.
+    case "papio.grab.suggest":
+      return isGrabSuggestRuntimeRequest(request)
+        ? bridge.requestGrabSuggestions(request)
+        : failure("invalid_request", "Invalid PDF grab suggestion request");
+    case "papio.grab.confirm":
+      return isGrabConfirmRuntimeRequest(request)
+        ? bridge.requestGrabConfirm(request)
+        : failure("invalid_request", "Invalid PDF grab confirmation request");
     default:
       return undefined;
   }

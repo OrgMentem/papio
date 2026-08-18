@@ -956,6 +956,164 @@
         color: var(--color-warning);
       }
 
+      /* The "which paper is this?" picker for a parked pdf_grab row.
+         Rendered inline in the row's body once requestGrabSuggestions has
+         answered — never a separate dialog, so the ranked list and its
+         evidence stay beside the capture they name. */
+      .grab-picker {
+        display: grid;
+        gap: var(--space-2);
+        margin-top: var(--space-1);
+      }
+
+      .grab-picker-status {
+        color: var(--color-muted);
+        font-size: var(--font-size-small);
+        margin: 0;
+      }
+
+      .grab-picker-status[data-tone="error"] {
+        color: var(--color-danger);
+      }
+
+      /* refused_identity above all: the pick was NOT applied, and this is
+         the only place that says so — it must read as a refusal, not a hint. */
+      .grab-picker-confirm-notice {
+        background: var(--color-danger-surface);
+        border: 1px solid var(--color-danger-border);
+        border-radius: var(--radius-control);
+        color: var(--color-danger);
+        font-size: var(--font-size-small);
+        font-weight: 600;
+        margin: 0;
+        padding: var(--space-2) var(--space-3);
+      }
+
+      .grab-picker-confirm-notice[data-tone="info"] {
+        background: var(--color-neutral-badge);
+        border-color: var(--color-control-border);
+        color: var(--color-context);
+        font-weight: 500;
+      }
+
+      .grab-picker-identifiers h4,
+      .grab-picker-suggestions h4 {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        margin: 0 0 var(--space-1);
+        text-transform: uppercase;
+      }
+
+      .grab-picker-identifiers ul,
+      .grab-picker-suggestions ul {
+        display: grid;
+        gap: var(--space-2);
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+
+      .grab-picker-identifiers li {
+        color: var(--color-context);
+        font-size: var(--font-size-small);
+      }
+
+      .grab-picker-identifier-value {
+        font-weight: 600;
+      }
+
+      .grab-picker-identifier-source {
+        color: var(--color-muted);
+      }
+
+      .grab-picker-identifiers code {
+        background: var(--color-neutral-badge);
+        border-radius: var(--radius-control);
+        display: inline-block;
+        font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+        font-size: var(--font-size-label);
+        margin-top: var(--space-1);
+        overflow-wrap: anywhere;
+        padding: var(--space-1) var(--space-2);
+      }
+
+      .grab-picker-suggestion {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-control);
+        display: grid;
+        gap: var(--space-1);
+        padding: var(--space-2) var(--space-3);
+      }
+
+      .grab-picker-suggestion-heading {
+        align-items: baseline;
+        display: flex;
+        gap: var(--space-2);
+        justify-content: space-between;
+      }
+
+      .grab-picker-suggestion-title {
+        color: var(--color-ink);
+        font-weight: 600;
+        overflow-wrap: anywhere;
+      }
+
+      .grab-picker-verdict {
+        border-radius: var(--radius-control);
+        flex: none;
+        font-size: var(--font-size-label);
+        font-weight: 700;
+        padding: 2px var(--space-2);
+        text-transform: uppercase;
+      }
+
+      .grab-picker-verdict[data-verdict="qualifies"] {
+        background: var(--color-ok-surface);
+        color: var(--color-ok);
+      }
+
+      .grab-picker-verdict[data-verdict="review"] {
+        background: var(--color-warning-surface);
+        color: var(--color-warning);
+      }
+
+      .grab-picker-verdict[data-verdict="rejected"] {
+        background: var(--color-neutral-badge);
+        color: var(--color-muted);
+      }
+
+      .grab-picker-suggestion-reason {
+        color: var(--color-context);
+        font-size: var(--font-size-small);
+        margin: 0;
+      }
+
+      /* The evidence is the reason the operator can trust the ranking, so it
+         is never hidden behind a disclosure. */
+      .grab-picker-evidence {
+        color: var(--color-muted);
+        display: grid;
+        font-size: var(--font-size-label);
+        gap: 2px;
+        margin: 0;
+        padding-left: var(--space-4);
+      }
+
+      .grab-picker-confirm {
+        justify-self: start;
+        min-height: var(--row-control-size);
+        padding: var(--space-1) var(--space-3);
+      }
+
+      .grab-picker-truncated {
+        color: var(--color-muted);
+        font-size: var(--font-size-label);
+        margin: 0;
+      }
+
       #item-list > p {
         color: var(--color-muted);
         padding: var(--space-8) 0;

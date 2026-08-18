@@ -37,7 +37,7 @@ async function settle(): Promise<void> {
 
 async function inboxDocument(
   reply: (message: RuntimeRequest) => unknown | Promise<unknown>,
-  options: { downloadSteering?: boolean } = {},
+  options: { downloadSteering?: boolean; daemonFeatures?: string[] } = {},
 ): Promise<{ document: Document; window: Window; requests: RuntimeRequest[]; opened: string[] }> {
   const window = new Window();
   window.document.write(readFileSync(new URL("../src/inbox.html", import.meta.url), "utf8"));
@@ -71,6 +71,25 @@ async function inboxDocument(
       downloads: options.downloadSteering === true
         ? { onDeterminingFilename: { addListener: () => undefined } }
         : {},
+      // chrome.storage backs loadDaemonFeatures' read of the persisted
+      // BrokerStore (the same chromeBackend(chrome.storage).load() popup.ts
+      // already uses) — present only when a test needs the picker gated
+      // open. Its absence is itself a fixture: refreshInbox's
+      // loadDaemonFeatures then no-ops, daemonFeatures stays [], and the
+      // picker stays gated closed, exercising the old-daemon fallback with
+      // no extra setup.
+      ...(options.daemonFeatures !== undefined
+        ? {
+            storage: {
+              local: {
+                get: async () => ({
+                  papio_state_v1: { activeJobs: [], daemonFeatures: options.daemonFeatures },
+                }),
+                set: async () => undefined,
+              },
+            },
+          }
+        : {}),
     },
   });
   importSerial += 1;
@@ -1332,6 +1351,187 @@ test("renders v4 PDF grabs, guides identifier entry, and dismisses by grab ident
     op: "dismiss",
     watch_scope: "all",
   });
+});
+
+test("the parked-capture picker renders the daemon's ranked suggestions with their evidence", async () => {
+  const fixture = snapshot([pdfGrab()], {
+    schema: 4,
+    counts: counts({ pending_total: 1, actions: 0, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.grab.suggest") {
+      return {
+        ok: true,
+        grab_id: "grab_test_1",
+        outcome: "ok",
+        document_identifiers: [],
+        suggestions: [
+          {
+            job_id: "job_qualifies_1",
+            title: "Attention Is All You Need",
+            year: 2017,
+            verdict: "qualifies",
+            reason: "excerpt title matches the pending job",
+            evidence: ["front-matter title matches", "DOI corroborated by excerpt"],
+          },
+          {
+            job_id: "job_review_1",
+            title: "A Different Paper",
+            verdict: "review",
+            evidence: ["partial title overlap only"],
+          },
+        ],
+        truncated: false,
+      };
+    }
+    return snapshotReply(fixture, message);
+  }, { daemonFeatures: ["pdf_grab_suggest_v1"] });
+
+  const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='pdf_grab:grab_test_1']");
+  const button = row?.querySelector<HTMLButtonElement>("[data-operation='provide_identifier']");
+  expect(button?.textContent).toBe("Which paper is this?");
+  button?.click();
+  await settle();
+
+  expect(page.requests.find((request) => request.type === "papio.grab.suggest")?.request).toEqual({ grab_id: "grab_test_1" });
+  const suggestions = page.document.querySelectorAll<HTMLElement>("[data-triage-item-id='pdf_grab:grab_test_1'] .grab-picker-suggestion");
+  expect(suggestions.length).toBe(2);
+  expect(suggestions[0]?.querySelector(".grab-picker-suggestion-title")?.textContent).toBe("Attention Is All You Need (2017)");
+  expect(suggestions[0]?.querySelector(".grab-picker-verdict")?.textContent).toBe("Qualifies");
+  const evidence = Array.from(suggestions[0]?.querySelectorAll(".grab-picker-evidence li") ?? []).map((li) => li.textContent);
+  expect(evidence).toEqual(["front-matter title matches", "DOI corroborated by excerpt"]);
+  expect(suggestions[1]?.querySelector(".grab-picker-verdict")?.textContent).toBe("Needs review");
+});
+
+test("a document_identifiers-only suggest result shows what the file itself declares", async () => {
+  const fixture = snapshot([pdfGrab()], {
+    schema: 4,
+    counts: counts({ pending_total: 1, actions: 0, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.grab.suggest") {
+      return {
+        ok: true,
+        grab_id: "grab_test_1",
+        outcome: "ok",
+        document_identifiers: [{ kind: "doi", value: "10.1234/example", source: "xmp/prism:doi" }],
+        suggestions: [],
+        truncated: false,
+      };
+    }
+    return snapshotReply(fixture, message);
+  }, { daemonFeatures: ["pdf_grab_suggest_v1"] });
+
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='pdf_grab:grab_test_1'] [data-operation='provide_identifier']")?.click();
+  await settle();
+
+  const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='pdf_grab:grab_test_1']");
+  expect(row?.querySelector(".grab-picker-identifier-value")?.textContent).toBe("DOI: 10.1234/example");
+  expect(row?.querySelector(".grab-picker-identifier-source")?.textContent).toBe("found in xmp/prism:doi");
+  expect(row?.querySelector(".grab-picker-identifiers code")?.textContent).toBe(
+    "papio grabs identify grab_test_1 --doi 10.1234/example",
+  );
+  expect(row?.querySelector(".grab-picker-suggestions")).toBeNull();
+});
+
+test("confirming a suggested candidate files the capture and settles the row", async () => {
+  const fixture = snapshot([pdfGrab()], {
+    schema: 4,
+    counts: counts({ pending_total: 1, actions: 0, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.grab.suggest") {
+      return {
+        ok: true,
+        grab_id: "grab_test_1",
+        outcome: "ok",
+        document_identifiers: [],
+        suggestions: [
+          { job_id: "job_qualifies_1", title: "Attention Is All You Need", verdict: "qualifies", evidence: ["front-matter title matches"] },
+        ],
+        truncated: false,
+      };
+    }
+    if (message.type === "papio.grab.confirm") {
+      return { ok: true, grab_id: "grab_test_1", job_id: "job_qualifies_1", outcome: "job_created" };
+    }
+    return snapshotReply(fixture, message);
+  }, { daemonFeatures: ["pdf_grab_suggest_v1"] });
+
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='pdf_grab:grab_test_1'] [data-operation='provide_identifier']")?.click();
+  await settle();
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='pdf_grab:grab_test_1'] .grab-picker-confirm")?.click();
+  await settle();
+
+  expect(page.requests.find((request) => request.type === "papio.grab.confirm")?.request).toEqual({
+    grab_id: "grab_test_1",
+    job_id: "job_qualifies_1",
+  });
+  expect(page.document.querySelector("[data-triage-item-id='pdf_grab:grab_test_1']")).toBeNull();
+});
+
+test("a refused_identity confirm leaves the row present with the refusal visible", async () => {
+  const fixture = snapshot([pdfGrab()], {
+    schema: 4,
+    counts: counts({ pending_total: 1, actions: 0, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.grab.suggest") {
+      return {
+        ok: true,
+        grab_id: "grab_test_1",
+        outcome: "ok",
+        document_identifiers: [],
+        suggestions: [
+          { job_id: "job_review_1", title: "A Different Paper", verdict: "review", evidence: ["partial title overlap only"] },
+        ],
+        truncated: false,
+      };
+    }
+    if (message.type === "papio.grab.confirm") {
+      return {
+        ok: true,
+        grab_id: "grab_test_1",
+        outcome: "refused_identity",
+        detail: "excerpt names DOI 10.9/other, not the picked job's",
+      };
+    }
+    return snapshotReply(fixture, message);
+  }, { daemonFeatures: ["pdf_grab_suggest_v1"] });
+
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='pdf_grab:grab_test_1'] [data-operation='provide_identifier']")?.click();
+  await settle();
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='pdf_grab:grab_test_1'] .grab-picker-confirm")?.click();
+  await settle();
+
+  const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='pdf_grab:grab_test_1']");
+  expect(row).not.toBeNull();
+  const notice = row?.querySelector(".grab-picker-confirm-notice");
+  expect(notice?.getAttribute("data-tone")).toBe("error");
+  expect(notice?.textContent).toContain("papio refused this pick");
+  expect(notice?.textContent).toContain("excerpt names DOI 10.9/other, not the picked job's");
+  // The picker is still showing the same ranked candidate — nothing changed.
+  expect(row?.querySelector(".grab-picker-suggestion")).not.toBeNull();
+});
+
+test("without the daemon's pdf_grab_suggest_v1 feature, provide_identifier keeps its guidance-only fallback", async () => {
+  const fixture = snapshot([pdfGrab()], {
+    schema: 4,
+    counts: counts({ pending_total: 1, actions: 0, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='pdf_grab:grab_test_1']");
+  const button = row?.querySelector<HTMLButtonElement>("[data-operation='provide_identifier']");
+  expect(button?.textContent).toBe("Provide identifier");
+  button?.click();
+  await settle();
+
+  expect(page.requests.some((request) => request.type === "papio.grab.suggest")).toBe(false);
+  expect(row?.querySelector(".grab-picker")).toBeNull();
+  expect(page.document.querySelector("[data-triage-item-id='pdf_grab:grab_test_1'] .item-result")?.textContent ?? "").toContain(
+    "papio grabs identify grab_test_1",
+  );
 });
 
 test("the action kind renders as a status glyph with an accessible label, not a fact row", async () => {
