@@ -418,15 +418,31 @@ func QualifyCandidate(doc BindDocument, candidate BindCandidate) CandidateQualif
 	// cannot reach a file's XMP packet, and prism:doi means "this file is that
 	// DOI" by definition of the field, so an allowlisted hit is the document
 	// asserting its own identity rather than text that might be a citation.
-	// Measured over the operator's library it reaches 34.2% of the documents
-	// that get this far against the text arm's 18%, nearly disjointly, with no
-	// document's metadata naming a different library work (~185k pairs).
+	// Measured over the operator's library the shipped allowlisted reader
+	// reaches 27.0% of the documents that get this far against the text arm's
+	// 18%, nearly disjointly, with no document's metadata naming a different
+	// library work (~185k pairs). 34.2% is the exploratory figure that also
+	// counted free-text fields; those are excluded here on purpose, so do not
+	// quote it for this reader.
 	//
 	// WHY it corroborates but never authorises: this is gate 5, so title,
-	// author and year have already had to agree. That ordering is what keeps a
-	// supplement out — its XMP ordinarily carries its PARENT article's DOI, so
-	// metadata alone would bind supplementary bytes under the article's
-	// citation, and only the earlier gates can tell them apart. Metadata may
+	// author and year have already had to agree. A supplement's XMP ordinarily
+	// carries its PARENT article's DOI, so metadata alone would bind
+	// supplementary bytes under the article's citation.
+	//
+	// Which earlier gate actually stops that was measured, not assumed, by
+	// scoring every secondary attachment in the operator's library against its
+	// own parent's record — the exact adversary, since a supplement inherits
+	// the parent's curated identity. Over 6 trials: 0 accepts, 5 hard-fenced
+	// and 1 parked. The fencing was done by GateTitle (3), GateAuthor (1) and
+	// GateYear (1); candidateNonArticleMarker fenced NOTHING, so the marker
+	// vocabulary is not what protects this path and hardening it would be
+	// theatre. The one park reached THIS gate and stopped only because the
+	// file's metadata did not name its parent — i.e. the fence in front of the
+	// metadata arm is one field thick, and 6 trials cannot measure it. Do not
+	// read the 0 accepts as authorisation: a Zotero library holds the papers
+	// the operator kept, so it under-samples supplements and aggregator cover
+	// sheets, which are what the browser path actually captures. Metadata may
 	// substitute for WHERE the identifier was found, never for identity-frame
 	// agreement.
 	q.reach(GateIdentifier)

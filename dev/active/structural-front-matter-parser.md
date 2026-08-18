@@ -583,6 +583,58 @@ which are misses, not wrong accepts.
 the evidence; it does not turn autonomous binding on, which still requires the
 corpus measurement and the floor.
 
+### A2. Reviewed after shipping, 2026-08-17 — two questions A1 had not asked
+
+A1's safety claim ("0 documents whose metadata named a different library work,
+~185k pairs") was measured over **primary** attachments. Two populations it
+therefore says nothing about, both measured now.
+
+**1. Intra-metadata disagreement — non-monotone by construction, zero prevalence.**
+`NamesWork` returns on the FIRST allowlisted field carrying the candidate's
+identifier and never asks whether a sibling field names something else. So a file
+whose XMP carries two DOIs corroborates any candidate matching either one, and
+finding *more* identifiers can never cause abstention — the exact inversion of the
+monotonicity invariant §The monotonicity invariant states for the text arm.
+
+Measured: of 95 admitted documents carrying allowlisted metadata, **0 carry ≥2
+distinct DOIs** (exact one-sided 95% upper bound ≤3.1%). So the defect is real in
+logic and unmeasurable here. **Do not fence it yet**: a fence costs a rule version
+and this library cannot show it firing. Recorded so the next grab-sourced
+population re-asks it — aggregator cover sheets are the shape that would carry two.
+
+**2. Supplements scored against their own parents — the fence is one field thick.**
+A supplement's XMP ordinarily carries its parent's DOI, and in the corpus
+`Document.Work` for a secondary attachment IS the parent's record, so every
+secondary attachment is a ready-made adversarial trial with ground truth: an
+`accept` means supplementary bytes filed under the article's citation.
+
+| | trials |
+|---|---|
+| secondary attachments, empty front-matter DOI window | 6 |
+| **accept (wrong-accept)** | **0** |
+| review (parks) | 1 |
+| abstain (hard-fenced) | 5 |
+
+Fenced by `GateTitle` 3, `GateAuthor` 1, `GateYear` 1 — and by
+`candidateNonArticleMarker` **0**. Two consequences:
+
+- The marker vocabulary is **not** what protects this path, so extending it
+  (`"supplementary appendix"` (NEJM), `"additional file"` (BMC), `"data supplement"`
+  (AHA) are all absent) would be theatre against this evidence. Left alone.
+- The single park **reached the identifier gate** and stopped only because that
+  file's metadata did not name its parent. Had it, the trial would have been an
+  accept. So in front of the metadata arm the fence is title+author+year and
+  nothing else, and 6 trials cannot bound it.
+
+`n=6` is the finding. A Zotero library holds the papers the operator **kept**, so
+it structurally under-samples supplements, cover sheets and aggregator rewrites —
+which is what the browser path captures, ProQuest being papio's highest-volume
+destination. Both of A1's safety numbers are therefore measured on the wrong
+population for authorising autonomous binding, and no larger run against this
+library fixes that. **Release gate: the grab-sourced population owed by §A's
+constraints is now the blocking measurement, not an improvement to the predicate.**
+
+
 ### B. Layout-preserving extraction — refuted, as measured
 
 `pdftotext` runs with **no flags** (`semantic.go:90`), so "no layout data exists" is a property
