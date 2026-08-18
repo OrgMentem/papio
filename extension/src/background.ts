@@ -5429,6 +5429,23 @@ export class Bridge {
       if (entry.tab_id >= 0) await this.removeMaterializationTab(entry.tab_id);
       await this.applyMaterialization(jobID, { type: "clear" });
     }
+    // requestCloseAuthorization refuses locally (before even sending a
+    // request) once this is undefined (~4096-4097), and it is otherwise
+    // worker-memory only: rehydrate it from the newest browser epoch any
+    // surviving (still-active-job) materialization correlation itself
+    // already carries, so a restart with no further claim consult in this
+    // worker's lifetime does not permanently strand every future close.
+    let rehydratedHolderGeneration: number | undefined;
+    for (const entry of Object.values(this.store.materializations ?? {})) {
+      if (typeof entry.browser_holder_generation !== "number") continue;
+      if (
+        rehydratedHolderGeneration === undefined ||
+        entry.browser_holder_generation > rehydratedHolderGeneration
+      )
+        rehydratedHolderGeneration = entry.browser_holder_generation;
+    }
+    if (rehydratedHolderGeneration !== undefined)
+      this.lastKnownBrowserHolderGeneration = rehydratedHolderGeneration;
     const governorQueuedAtRestart: string[] = [];
     for (const job of this.store.activeJobs) {
       if (!this.hasDelegatedAuthority(job)) {
@@ -7542,6 +7559,31 @@ export class Bridge {
         );
         if (hasEarlierSibling) continue;
       }
+      if (ack.outcome === "applied" && entry.event_kind === "navigation_error") {
+        // §2.3: the daemon has now durably recorded this route as exhausted
+        // (the observation itself, not the eventual park response, is the
+        // trigger — the park may never come if the job is abandoned first).
+        // The scaffold this navigation error happened on is otherwise a
+        // permanent dead end: nothing else ever retires it. Detach the job
+        // from its tab first (closeOwnedTab's own safety guard — mirrors
+        // the HANDOFF_DRIVE_TIMEOUT_MS legacy-park precedent above —
+        // refuses to remove a tab a job still tracks) so the close
+        // transaction can actually run the removal, not just tombstone it.
+        const job = findByJob(this.store, jobID);
+        if (job !== undefined && job.tab_id >= 0) {
+          const tabID = job.tab_id;
+          void (async () => {
+            const current = findByJob(this.store, jobID);
+            if (current === undefined || current.tab_id !== tabID) return;
+            await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
+            await this.closeOwnedSurface(
+              tabID,
+              "claim_abandoned",
+              ack.gate_occurrence_id,
+            );
+          })();
+        }
+      }
       this.claimObservationOutboxEntries.delete(entry.observation_id);
       this.persistClaimObservationOutbox();
     }
@@ -7818,24 +7860,30 @@ export class Bridge {
           tab_id: chosen.id,
         });
       }
+      // The close transaction (materialization_settled, §2.3) authorizes by
+      // binding_id off this same birth-record ledger every other owned
+      // surface uses — without an entry here a settled scaffold could never
+      // be retired. Idempotent: a no-op once already ledgered under this
+      // browser epoch, and a no-op entirely when no tabLedger backend is
+      // configured (ledgerManagedTab's own guard).
+      await this.ledgerManagedTab(chosen.id, "materialization", false, jobID, bindingID);
       return { tabID: chosen.id, reliable: true };
     }
     const scaffoldURL = this.materializationURL(bindingID);
     if (scaffoldURL === undefined) return { reliable: false };
-    try {
-      const created = await this.deps.tabs.create({
-        url: scaffoldURL,
-        active: false,
-      });
-      if (created.id === undefined) return { reliable: false };
-      await this.applyMaterialization(jobID, {
-        type: "scaffolded",
-        tab_id: created.id,
-      });
-      return { tabID: created.id, reliable: true };
-    } catch {
-      return { reliable: false };
-    }
+    // Placed through the same broker-tab machinery every other papio tab
+    // uses (work-window/tab-group/Firefox-fallback, always inactive) so it
+    // is a member of the work window or papio tab group: closeOwnedTab's
+    // ownership gate (inWorkWindow || inPapioGroup) would otherwise refuse
+    // to ever remove it, even after a fully authorized close.
+    const createdID = await this.openBrokerTab(scaffoldURL, false);
+    if (createdID === undefined) return { reliable: false };
+    await this.applyMaterialization(jobID, {
+      type: "scaffolded",
+      tab_id: createdID,
+    });
+    await this.ledgerManagedTab(createdID, "materialization", false, jobID, bindingID);
+    return { tabID: createdID, reliable: true };
   }
 
   private materializationRetryExpiry(
@@ -13790,14 +13838,17 @@ export class Bridge {
         if (features.includes(INSTITUTIONAL_MATERIALIZATION_FEATURE)) {
           // Inbound frames are serialized. Reconciliation sends correlated
           // requests whose replies must traverse this same queue, so it must
-          // never be awaited from the hello_ack handler.
+          // never be awaited from the hello_ack handler. Exactly one
+          // reconcile pass per handshake: this used to run again,
+          // unconditionally, right after the handoff_link_v1 block below,
+          // doubling every institutional_reconcile_request the daemon saw.
           void (async () => {
             await this.reconcileMaterializationTabs();
             for (const [jobID, entry] of Object.entries(
               this.store.materializations ?? {},
             )) {
               if (entry.phase !== "navigated")
-                this.scheduleMaterialization(jobID);
+                this.scheduleMaterialization(jobID, true);
             }
           })();
         } else {
@@ -13823,14 +13874,6 @@ export class Bridge {
             ),
           }));
         }
-        void this.reconcileMaterializationTabs().then(() => {
-          for (const [jobID, entry] of Object.entries(
-            this.store.materializations ?? {},
-          )) {
-            if (entry.phase !== "navigated")
-              this.scheduleMaterialization(jobID, true);
-          }
-        });
         this.settleHelloWaiters(true);
         // Resume only after this serialized handler yields; a correlated
         // result must be able to traverse the inbound FIFO.
@@ -14695,6 +14738,31 @@ export class Bridge {
       await this.update((s) => clearPendingDelivery(s, jobID));
       await this.removeJobWithOffer(jobID);
       return;
+    }
+    const materialization = this.materializationCorrelation(jobID);
+    if (materialization?.phase === "navigated") {
+      // A successfully-delivered institutional materialize.html scaffold has
+      // no other retirement path — the close authorization transaction is
+      // the only thing that ever tells the daemon (and then this browser)
+      // to tear it down. Detach the job from its tab first (closeOwnedTab's
+      // own safety guard, mirrored at the navigation_error/scaffold_idle
+      // close sites above, refuses to remove a tab any job still tracks —
+      // and reduceMaterialization's "scaffolded"/"reconcile_tab" tabSync
+      // mirrors the scaffold's tab id onto job.tab_id) so the close
+      // transaction can actually run the removal, not just tombstone it.
+      const settledTabID = materialization.tab_id;
+      const gateOccurrenceID = this.claimGrants.get(jobID)?.gateOccurrenceID;
+      void (async () => {
+        const current = findByJob(this.store, jobID);
+        if (current !== undefined && current.tab_id === settledTabID) {
+          await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
+        }
+        await this.closeOwnedSurface(
+          settledTabID,
+          "materialization_settled",
+          gateOccurrenceID,
+        );
+      })();
     }
     const tabID =
       this.adoptedViewerTabs.get(jobID) ??

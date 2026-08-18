@@ -133,6 +133,14 @@ class FakeEmitter<A extends unknown[]> {
   addListener(cb: (...a: A) => void): void {
     this.cbs.push(cb);
   }
+  /** Test-only restart seam: see fake-tabs.ts's FakeEmitter.snapshot for the
+   * exact contract this mirrors. */
+  snapshot(): () => void {
+    const keep = this.cbs.length;
+    return () => {
+      this.cbs.length = keep;
+    };
+  }
   async emit(...a: A): Promise<void> {
     await Promise.all(this.cbs.map((cb) => cb(...a)));
   }
@@ -185,6 +193,11 @@ class FakePort implements NativePort {
 class FakeBackend implements StateBackend {
   store: StoreShape = emptyStore();
   failNextSave = false;
+  /** Every store this backend was ever asked to persist, in order — not
+   * just the latest. A leak that lands in storage transiently and is later
+   * overwritten is still a leak; checking only the final `store` snapshot
+   * would miss it. */
+  readonly saveHistory: StoreShape[] = [];
   async load(): Promise<StoreShape> {
     return this.store;
   }
@@ -194,6 +207,7 @@ class FakeBackend implements StateBackend {
       throw new Error("storage unavailable");
     }
     this.store = store;
+    this.saveHistory.push(JSON.parse(JSON.stringify(store)) as StoreShape);
   }
 }
 
@@ -370,6 +384,7 @@ interface Harness {
   scannerAllowlist: { origins: string[] };
   pageBulkScans: { current: PageBulkScanStore };
   sessionStorage: { clear(): void };
+  detachBridgeListeners(): void;
 }
 
 function makeHarness(
@@ -438,6 +453,29 @@ function makeHarness(
   const timers: { fn: () => void | Promise<void>; ms: number }[] = [];
   const action = new FakeAction();
   const alarms = new FakeAlarms();
+  // Restart seam (lifecycle.ts): snapshot every listener each emitter holds
+  // right now — before any Bridge exists — so a later restartWorker/
+  // simulateExtensionUpdate can drop exactly what a dead worker's own
+  // bindListeners() added, without touching a fixture's own permanent
+  // internal listeners (e.g. FakeWebNavigation's onCommitted bookkeeping,
+  // installed in its own constructor, above and before this point).
+  const listenerRestores = [
+    tabs.onUpdated.snapshot(),
+    tabs.onRemoved.snapshot(),
+    tabs.onActivated.snapshot(),
+    downloads.onCreated.snapshot(),
+    downloads.onChanged.snapshot(),
+    downloads.onDeterminingFilename?.snapshot(),
+    webNavigation.onCommitted.snapshot(),
+    webNavigation.onHistoryStateUpdated.snapshot(),
+    webNavigation.onReferenceFragmentUpdated.snapshot(),
+    webNavigation.onTabReplaced.snapshot(),
+    webNavigation.onErrorOccurred.snapshot(),
+    alarms.onAlarm.snapshot(),
+  ].filter((restore): restore is () => void => restore !== undefined);
+  const detachBridgeListeners = (): void => {
+    for (const restore of listenerRestores) restore();
+  };
   const runtimeMessages: object[] = [];
   const runtimeSendMessage = async (message: object): Promise<void> => {
     runtimeMessages.push(message);
@@ -575,6 +613,7 @@ function makeHarness(
         epochSession.value = undefined;
       },
     },
+    detachBridgeListeners,
   };
 }
 
@@ -2457,6 +2496,70 @@ test("Slice 0: an offline wake releases nothing; the next online wake releases",
   expect(tabsSeenAtWake).toEqual([0, 0]);
 });
 
+test("Slice 0: an online wake paces exactly one release even with four queued requires_auth jobs on the same provider host", async () => {
+  const jobIDs = [
+    "job_gate_wake_flood_a",
+    "job_gate_wake_flood_b",
+    "job_gate_wake_flood_c",
+    "job_gate_wake_flood_d",
+  ];
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: jobIDs.map((jobID) => ({
+      job_id: jobID,
+      tab_id: -1,
+      offered_at: 1,
+      expires_at: 9_999_999_999_999,
+      status: "queued" as const,
+      requires_auth: true,
+      provider_hosts: [PROVIDER_HOST],
+    })),
+  });
+  let online = false;
+  h.deps.online = () => online;
+  const tabsSeenAtWake: number[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteResolverActivated: () => {},
+    markDirty: async () => {},
+    probeForeground: async () => {},
+    probeOriginAutomatically: async () => {},
+    notifyConfiguredOriginsChanged: () => {},
+    noteResolverNavigation: () => {},
+    noteTabRemoved: () => {},
+    onWake: async () => {
+      tabsSeenAtWake.push(h.tabs.created.length);
+    },
+  } as unknown as KeepaliveManager);
+
+  await h.bridge.start();
+  seedOfferURLs(
+    h,
+    Object.fromEntries(jobIDs.map((jobID) => [jobID, `${OPENURL}?job=${jobID}`])),
+  );
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
+  h.clock.now += 60_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  expect(h.tabs.created).toEqual([]);
+  for (const jobID of jobIDs) {
+    expect(
+      h.backend.store.activeJobs.find((job) => job.job_id === jobID),
+    ).toMatchObject({ status: "queued", tab_id: -1 });
+  }
+
+  online = true;
+  h.clock.now += 60_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  // drainQueuedHandoffs's HANDOFF_DRIVE_LIMIT (=1) paces releases to exactly
+  // one tab per wake regardless of how many jobs are simultaneously due —
+  // proving the pacing itself, not merely a single-job coincidence.
+  expect(h.tabs.created).toHaveLength(1);
+  expect(
+    h.backend.store.activeJobs.filter((job) => job.status === "queued"),
+  ).toHaveLength(jobIDs.length - 1);
+  expect(tabsSeenAtWake).toEqual([0, 0]);
+});
+
 test("Slice 0: a legacy engagement park's offer URL is worker-local only — a genuine restart drops it, and the operator's explicit open needs the daemon's natural re-offer to recover it", async () => {
   const first = makeHarness({
     ...emptyStore(),
@@ -2507,10 +2610,21 @@ test("Slice 0: a legacy engagement park's offer URL is worker-local only — a g
   expect(restarted.tabs.created).toEqual([{ url: OPENURL, active: true }]);
 });
 
-test("Slice 0: hydration still drops a persisted minted fresh link", async () => {
+test("Slice 0: hydration still drops a persisted minted fresh link", () => {
   const jobID = "job_gate_fresh_restart";
-  const h = makeHarness({
-    ...emptyStore(),
+  const sentinelURL = "https://resolver.example.edu/minted?one-use=1";
+  // migrateManagedState (state.ts) is the actual scrub point — the real
+  // chromeBackend runs it on every load, before a Bridge ever sees the
+  // result (background.test.ts's FakeBackend deliberately skips this step,
+  // so driving it through makeHarness/bridge.start() would test nothing).
+  // The seeded top-level `offerURLs` key mirrors exactly where a
+  // pre-Slice-2b persisted blob (dev history: 06892c7's StoreShape) carried
+  // this one-use minted URL; migratedState's allowlist reconstruction
+  // (state.ts) must never read or forward an unrecognized key like this
+  // one forward into a live store — the "no persisted URL anywhere"
+  // invariant is structural, not a special-cased scrub.
+  const raw = {
+    version: 1,
     activeJobs: [
       {
         job_id: jobID,
@@ -2524,8 +2638,17 @@ test("Slice 0: hydration still drops a persisted minted fresh link", async () =>
         provider_hosts: [PROVIDER_HOST],
       },
     ],
+    offerURLs: { [jobID]: sentinelURL },
+  };
+  const migrated = migrateManagedState(raw);
+  const serialized = JSON.stringify(migrated);
+  expect(serialized).not.toContain(sentinelURL);
+  expect(serialized).not.toContain("offerURLs");
+  expect(migrated.activeJobs[0]).toMatchObject({
+    job_id: jobID,
+    tab_id: -1,
+    fresh_handoff: true,
   });
-  await h.bridge.start();
 });
 
 test("Slice 0: an operator open of a tabless legacy job bypasses the drive gate", async () => {
@@ -2885,6 +3008,7 @@ async function openClaimWithNewSurface(
   jobID: string,
   candidateID: string,
   url: string,
+  claimID = `claim_${candidateID}`,
 ): Promise<number> {
   const tabsCreatedBefore = h.tabs.created.length;
   const framesBefore = h.port.posted.length;
@@ -2896,10 +3020,14 @@ async function openClaimWithNewSurface(
   expect(claimRequest.job_id).toBe(jobID);
   expect(claimRequest.payload["candidate_id"]).toBe(candidateID);
   expect(claimRequest.payload["trigger"]).toBe("explicit");
+  // Claim-before-surface pin: no tab exists yet even before the daemon has
+  // answered the claim request at all — the request itself must never be
+  // preceded or raced by a locally-minted surface.
+  expect(h.tabs.created).toHaveLength(tabsCreatedBefore);
   await h.port.inbound(
     claimResponse(jobID, claimRequest.payload["request_id"], {
       outcome: "open_new",
-      authentication_claim_id: `claim_${candidateID}`,
+      authentication_claim_id: claimID,
       browser_holder_generation: 1,
       gate_occurrence_id: `occ_${candidateID}`,
       lease_until: "2030-01-01T00:00:00Z",
@@ -3004,14 +3132,19 @@ test("Slice 3: N cold institutional jobs with live candidates consult independen
   expect(internals.claimDependentCounts.get(jobC)).toBe(2);
 });
 
-test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fresh institutional candidate offers and each binds its OWN daemon-granted scaffold — no local binding synthesis, no persisted URL anywhere", async () => {
+test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fresh institutional candidate offers sharing ONE authentication claim, each binds its OWN daemon-granted scaffold and retires it on delivery — no local binding synthesis, no persisted URL in any snapshot", async () => {
   const jobA = "job_claim_scenario3_a";
   const jobB = "job_claim_scenario3_b";
   const jobC = "job_claim_scenario3_c";
-  const h = makeHarness({
-    ...emptyStore(),
-    activeJobs: [coldClaimJob(jobA), coldClaimJob(jobB), coldClaimJob(jobC)],
-  });
+  const SHARED_CLAIM_ID = "claim_scenario3_shared";
+  const SHARED_OCC_ID = "occ_scenario3_shared";
+  const h = makeHarness(
+    {
+      ...emptyStore(),
+      activeJobs: [coldClaimJob(jobA), coldClaimJob(jobB), coldClaimJob(jobC)],
+    },
+    { windows: true },
+  );
   installManagedTabLedger(h, {});
   await h.bridge.start();
   await h.port.inbound(
@@ -3020,6 +3153,8 @@ test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fres
         "handoff_link_v1",
         AUTH_CLAIM,
         "institutional_materialization_v1",
+        "effect_permit_v1",
+        "surface_close_v1",
       ],
     }),
   );
@@ -3027,11 +3162,16 @@ test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fres
   await seedClaimCandidate(h, jobB, "cand_s3up_b001");
   await seedClaimCandidate(h, jobC, "cand_s3up_c001");
 
+  // All three jobs contend for the SAME institutional claim gate: jobA's
+  // consult grants it directly, jobB/jobC's park responses carry the
+  // identical authentication_claim_id/gate_occurrence_id — never a
+  // per-candidate id, which would misrepresent three independent gates.
   const tabA = await openClaimWithNewSurface(
     h,
     jobA,
     "cand_s3up_a001",
     `https://${PROVIDER_HOST}/fresh?s3up=a`,
+    SHARED_CLAIM_ID,
   );
   for (const [jobID, candidateID, dependentCount] of [
     [jobB, "cand_s3up_b001", 1],
@@ -3046,14 +3186,18 @@ test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fres
     await h.port.inbound(
       claimResponse(jobID, req.payload["request_id"], {
         outcome: "park",
-        authentication_claim_id: `claim_${candidateID}`,
+        authentication_claim_id: SHARED_CLAIM_ID,
         browser_holder_generation: 1,
-        gate_occurrence_id: `occ_${candidateID}`,
+        gate_occurrence_id: SHARED_OCC_ID,
         dependent_count: dependentCount,
       }),
     );
     await opening;
   }
+  // Zero sign-in surfaces beyond jobA's across the whole three-job run.
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toHaveLength(1);
 
   // jobA authenticates and lands on entitled content.
   const internals = h.bridge as unknown as {
@@ -3079,8 +3223,10 @@ test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fres
   // a FRESH institutional_candidate_offer (Slice 4's real automatic
   // pipeline) — never a locally-synthesized binding. Each sibling must run
   // its OWN institutional_claim_request/institutional_bind_request round
-  // trip and land on its own daemon-issued binding_id and scaffold tab,
-  // never reusing jobA's tab or claim.
+  // trip, land on its own daemon-issued binding_id and scaffold tab (never
+  // reusing jobA's tab or claim), then complete route/navigate/delivery and
+  // retire its scaffold through the real materialization_settled close
+  // transaction once the daemon's generic ack settles delivery.
   const siblingTabs: number[] = [];
   const siblingBindings: string[] = [];
   for (const [jobID, candidateID, bindingID] of [
@@ -3141,6 +3287,92 @@ test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fres
     expect(tabID).toBeGreaterThanOrEqual(0);
     siblingTabs.push(tabID);
     siblingBindings.push(bindingID);
+
+    const route = await h.port.waitForFrame(
+      "institutional_route_request",
+      framesBefore,
+    );
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "institutional_route_response",
+      msg_id: `route_response_${bindingID}`,
+      job_id: jobID,
+      seq: 5,
+      payload: {
+        request_id: route.payload["request_id"],
+        outcome: "issued",
+        claim_id: `claim_${bindingID}`,
+        binding_id: bindingID,
+        route_issuance_ordinal: 1,
+        effect_ordinal:
+          (route.payload["expected_effect_ordinal"] as number) + 1,
+        institutional_request_id: route.payload["institutional_request_id"],
+        url: `https://${PROVIDER_HOST}/${bindingID}`,
+      },
+    });
+    const navigated = await h.port.waitForFrame(
+      "institutional_navigated_request",
+      framesBefore,
+    );
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "institutional_navigated_response",
+      msg_id: `navigated_response_${bindingID}`,
+      job_id: jobID,
+      seq: 6,
+      payload: {
+        request_id: navigated.payload["request_id"],
+        outcome: "acknowledged",
+        claim_id: `claim_${bindingID}`,
+        binding_id: bindingID,
+      },
+    });
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(h.backend.store.materializations?.[jobID]).toMatchObject({
+      phase: "navigated",
+    });
+
+    // Delivery settles: the daemon's generic ack retires the scaffold
+    // through the real materialization_settled close transaction (fix B).
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "ack",
+      msg_id: `ack_${bindingID}`,
+      job_id: jobID,
+      seq: 7,
+      payload: {},
+    });
+    const closeRequest = await h.port.waitForFrame(
+      "surface_close_request",
+      framesBefore,
+    );
+    expect(closeRequest.payload["disposition"]).toBe("materialization_settled");
+    expect(closeRequest.payload["binding_id"]).toBe(bindingID);
+    await h.port.inbound(
+      nativeResult("surface_close_response", {
+        request_id: closeRequest.payload["request_id"],
+        outcome: "authorized",
+        close_authorization_id: `auth_${bindingID}`,
+        nonce: `nonce_${bindingID}`,
+        browser_holder_generation: 1,
+      }),
+    );
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    // Fix A (materializeScaffold now routes through openBrokerTab, landing
+    // the scaffold in the work window like every other papio tab) plus the
+    // job-tab detach in closeAfterAdoption's materialization_settled path
+    // (mirroring the existing navigation_error/scaffold_idle close sites):
+    // closeOwnedTab's ownership gate (inWorkWindow || inPapioGroup) and its
+    // still-tracked-by-a-job guard both admit the authorized removal below
+    // instead of silently refusing it, and the tombstone (along with the
+    // rest of the ledger entry) is consumed by forgetLedgeredTab once
+    // onTabRemoved fires.
+    expect(h.tabs.removed).toContain(tabID);
+    expect(h.tabs.snapshot(tabID)).toBeUndefined();
+    const closeInternalsAfter = h.bridge as unknown as {
+      tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    };
+    expect(closeInternalsAfter.tabLedgerCache[String(tabID)]).toBeUndefined();
   }
 
   expect(h.tabs.created).toHaveLength(3);
@@ -3155,10 +3387,14 @@ test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fres
   // status is whatever it already was from the earlier park, unchanged
   // by the candidate offer itself.
   // Structural privacy invariant: no provider origin, and no offer-URL
-  // spill, in any managed-state write across the whole resume sequence.
-  const serialized = JSON.stringify(h.backend.store);
-  expect(serialized).not.toContain(`https://${PROVIDER_HOST}`);
-  expect(serialized).not.toContain("offerURLs");
+  // spill, in ANY individual persisted snapshot across the whole resume
+  // sequence — not merely the final store.
+  expect(h.backend.saveHistory.length).toBeGreaterThan(0);
+  for (const snapshot of h.backend.saveHistory) {
+    const serialized = JSON.stringify(snapshot);
+    expect(serialized).not.toContain(`https://${PROVIDER_HOST}`);
+    expect(serialized).not.toContain("offerURLs");
+  }
 });
 
 test("Slice 3: auth_returned/entitled_landing acks applied trigger no local resume — a live-tab re-offer is accepted without a second consult", async () => {
@@ -3682,7 +3918,7 @@ test("Slice 3: navigation_error on a claim-owned handoff tab emits the observati
   expect(observation.payload["event_kind"]).toBe("navigation_error");
 });
 
-test("Scenario 5: nav-error on a scaffold-driven route ends in a daemon-committed park + close — no auth charge, no job-cancel, and the closed surface survives a worker restart without a re-mint", async () => {
+test("Scenario 5: navigation_error observation, once the daemon acks it applied, auto-closes the exhausted scaffold through the real close-authorization transaction and detaches the job via onTabRemoved — no local park response, no re-mint after restart", async () => {
   const jobID = "job_scenario5_naverr";
   const candidateID = "cand_scenario5_0001";
   const idpURL = "https://idp.example.edu/sso";
@@ -3703,16 +3939,6 @@ test("Scenario 5: nav-error on a scaffold-driven route ends in a daemon-committe
     `https://${PROVIDER_HOST}/fresh?s5=1`,
   );
 
-  const internals = h.bridge as unknown as {
-    lastKnownBrowserHolderGeneration: number | undefined;
-    tabLedgerCache: Record<string, SurfaceBirthRecord>;
-    closeOwnedSurface: (
-      tabID: number,
-      disposition: "scaffold_idle" | "materialization_settled" | "claim_abandoned",
-    ) => Promise<{ closed: boolean }>;
-  };
-  internals.lastKnownBrowserHolderGeneration = 1;
-
   // Observed before generic auth detection, no auth charge, no cooldown.
   const framesBeforeError = h.port.posted.length;
   await h.webNavigation.emitError(tabID);
@@ -3723,6 +3949,11 @@ test("Scenario 5: nav-error on a scaffold-driven route ends in a daemon-committe
     framesBeforeError,
   );
   expect(observation.payload["event_kind"]).toBe("navigation_error");
+
+  // The operator has moved on (focus elsewhere) by the time the daemon
+  // commits this; an operator-active tab is never auto-closed (Slice 2b).
+  h.tabs.patch(tabID, { active: false });
+  const framesBeforeAck = h.port.posted.length;
   await h.port.inbound(
     observationAck(jobID, observation.payload["request_id"], {
       outcome: "applied",
@@ -3731,30 +3962,13 @@ test("Scenario 5: nav-error on a scaffold-driven route ends in a daemon-committe
     }),
   );
 
-  // The daemon commits the terminal park for this exhausted route (§2.3):
-  // detaches the job from its surface (tabless, like every other park) —
-  // closeOwnedTab's own safety guard refuses to remove a tab a job still
-  // tracks, exactly so an ordinary in-flight drive is never auto-closed.
-  // The extension's side of the disposition is then the standard 2b close
-  // transaction on the now-orphaned scaffold, disposed claim_abandoned —
-  // never a plain operator cancel. The operator has moved on (focus
-  // elsewhere) by the time the daemon commits this; an operator-active tab
-  // is never auto-closed either way (Slice 2b).
-  const updateInternals = h.bridge as unknown as {
-    update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
-  };
-  await updateInternals.update((s) => ({
-    ...s,
-    activeJobs: s.activeJobs.map((j) =>
-      j.job_id === jobID ? { ...j, tab_id: -1 } : j,
-    ),
-  }));
-  h.tabs.patch(tabID, { active: false });
-  const bindingID = internals.tabLedgerCache[String(tabID)]?.binding_id;
-  expect(bindingID).toBeDefined();
-  const closing = internals.closeOwnedSurface(tabID, "claim_abandoned");
-  const closeRequest = await h.port.waitForFrame("surface_close_request");
-  expect(closeRequest.payload["binding_id"]).toBe(bindingID);
+  // The ack itself — not a separate park response — is the trigger: §2.3's
+  // auto-close wiring fires the standard 2b close transaction on this now-
+  // exhausted scaffold, disposed claim_abandoned, entirely off the wire.
+  const closeRequest = await h.port.waitForFrame(
+    "surface_close_request",
+    framesBeforeAck,
+  );
   expect(closeRequest.payload["disposition"]).toBe("claim_abandoned");
   await h.port.inbound(
     nativeResult("surface_close_response", {
@@ -3765,9 +3979,16 @@ test("Scenario 5: nav-error on a scaffold-driven route ends in a daemon-committe
       browser_holder_generation: 1,
     }),
   );
-  await expect(closing).resolves.toEqual({ closed: true });
+  // The authorization's own removal runs off the wire response, not this
+  // await: let its fire-and-forget continuation settle before asserting.
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
   expect(h.tabs.removed).toContain(tabID);
   expect(h.tabs.snapshot(tabID)).toBeUndefined();
+  // The job detaches from its now-gone tab through the real onTabRemoved
+  // path — never a manually poked tab_id.
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === jobID),
+  ).toMatchObject({ tab_id: -1 });
   // Tombstone consumed, no job-cancel emitted.
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
   expect(h.frames().some((f) => f.type === "job_reject")).toBe(false);
@@ -3846,6 +4067,275 @@ test("Scenario 7: Firefox <139 (no tabGroups) — the scaffold lands in work-win
   );
   expect(restarted.tabs.snapshot(tabID2)?.windowId).toBe(workWindowID);
   expect(restarted.windows?.created).toHaveLength(windowsCreatedBeforeRestart);
+});
+
+/** hello_ack's institutional-materialization resume path awaits
+ * reconcileMaterializationTabs() before ever calling scheduleMaterialization
+ * again (background.ts's hello_ack handler) — every job with a live
+ * binding_id gets folded into an institutional_reconcile_request the
+ * daemon must answer first. Left unanswered, that await never settles and
+ * the resumed worker never re-drives its pending protocol step. Drains
+ * whatever is currently posted (a no-op when no materialization has a
+ * binding_id yet, e.g. right after a claim-boundary restart) — asserting
+ * along the way that each live binding was folded into exactly ONE
+ * reconcile request this handshake (background.ts's hello_ack handler used
+ * to call reconcileMaterializationTabs() twice per handshake, doubling
+ * every institutional_reconcile_request; now deterministic). */
+async function drainReconcileRequests(h: Harness): Promise<void> {
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const requests = h
+    .frames()
+    .filter((frame) => frame.type === "institutional_reconcile_request");
+  const bindingRequestCounts = new Map<string, number>();
+  for (const req of requests) {
+    const bindings = req.payload["bindings"];
+    if (!Array.isArray(bindings)) continue;
+    for (const binding of bindings) {
+      const bindingID = (binding as Record<string, unknown>)["binding_id"];
+      if (typeof bindingID !== "string") continue;
+      bindingRequestCounts.set(
+        bindingID,
+        (bindingRequestCounts.get(bindingID) ?? 0) + 1,
+      );
+    }
+  }
+  for (const count of bindingRequestCounts.values()) expect(count).toBe(1);
+  for (const req of requests) {
+    await h.port.inbound(
+      nativeResult("institutional_reconcile_response", {
+        request_id: req.payload["request_id"],
+        outcome: "reconciled",
+      }),
+    );
+  }
+}
+
+test("Scenario 7 continued: institutional materialization survives a worker restart at each of the five protocol boundaries (claim, bind, route, navigate, ack), Firefox seam throughout, ownership never title-based", async () => {
+  // A durable-store baseline: an explicit direct-mint job proves the
+  // work-window fallback still holds by its numeric id, never a
+  // title-based lookup — the same regression Scenario 7's original body
+  // pins, retained here as a sibling check alongside the new per-boundary
+  // coverage below.
+  const jobID0 = "job_scenario7b_explicit";
+  const candidateID0 = "cand_scenario7b_0000";
+  const h0 = makeHarness(
+    { ...emptyStore(), activeJobs: [coldClaimJob(jobID0)] },
+    { windows: true },
+  );
+  installManagedTabLedger(h0, {});
+  await h0.bridge.start();
+  await h0.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h0, jobID0, candidateID0);
+  const tab0 = await openClaimWithNewSurface(
+    h0,
+    jobID0,
+    candidateID0,
+    `https://${PROVIDER_HOST}/fresh?s7b=explicit`,
+  );
+  expect(h0.tabGroups).toBeUndefined();
+  const workWindowID = h0.backend.store.workWindowID;
+  expect(workWindowID).toBeDefined();
+  expect(h0.tabs.snapshot(tab0)?.windowId).toBe(workWindowID);
+
+  // Five independent institutional materialization pipelines, each
+  // restarted at a different protocol boundary before any daemon reply
+  // for that boundary's outstanding request ever arrives — durable
+  // correlation state (never the dead worker's own in-flight promise)
+  // must drive resumption, and delivery must still complete.
+  const FEATURES = [
+    "institutional_materialization_v1",
+    "effect_permit_v1",
+    "surface_close_v1",
+  ];
+  const BOUNDARIES = ["claim", "bind", "route", "navigate", "ack"] as const;
+  for (const restartAt of BOUNDARIES) {
+    const jobID = `job_scenario7b_${restartAt}`;
+    const candidateID = `cand_scenario7b_${restartAt}`;
+    const bindingID = `bind_scenario7b_${restartAt}`;
+    const claimID = `claim_scenario7b_${restartAt}`;
+    let h = makeHarness(
+      { ...emptyStore(), activeJobs: [materializationActiveJob(jobID)] },
+      { windows: true },
+    );
+    installManagedTabLedger(h, {});
+    await h.bridge.start();
+    await h.port.inbound(helloAck({ features: FEATURES }));
+    expect(h.tabGroups).toBeUndefined();
+
+    await h.port.inbound(candidateOffer(jobID, candidateID));
+    let claimReq = await h.port.waitForFrame("institutional_claim_request");
+    if (restartAt === "claim") {
+      h = restartWorker(h);
+      await h.bridge.start();
+      await h.port.inbound(helloAck({ features: FEATURES }));
+      await drainReconcileRequests(h);
+      claimReq = await h.port.waitForFrame("institutional_claim_request");
+    }
+    expect(claimReq.payload["candidate_id"]).toBe(candidateID);
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "institutional_claim_response",
+      msg_id: `claim_response_${restartAt}`,
+      job_id: jobID,
+      seq: 3,
+      payload: {
+        request_id: claimReq.payload["request_id"],
+        outcome: "claimed",
+        candidate_id: candidateID,
+        claim_id: claimID,
+        binding_id: bindingID,
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+      },
+    });
+
+    let bindReq = await h.port.waitForFrame("institutional_bind_request");
+    if (restartAt === "bind") {
+      h = restartWorker(h);
+      await h.bridge.start();
+      await h.port.inbound(helloAck({ features: FEATURES }));
+      await drainReconcileRequests(h);
+      bindReq = await h.port.waitForFrame("institutional_bind_request");
+    }
+    expect(bindReq.payload["binding_id"]).toBe(bindingID);
+    const scaffoldMatches = h.tabs
+      .list()
+      .filter(
+        (tab) =>
+          tab.url === `chrome-extension://test/materialize.html#${bindingID}`,
+      );
+    expect(scaffoldMatches).toHaveLength(1);
+    const scaffoldTabID = scaffoldMatches[0]!.id!;
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "institutional_bind_response",
+      msg_id: `bind_response_${restartAt}`,
+      job_id: jobID,
+      seq: 4,
+      payload: {
+        request_id: bindReq.payload["request_id"],
+        outcome: "bound",
+        claim_id: claimID,
+        binding_id: bindingID,
+      },
+    });
+
+    let routeReq = await h.port.waitForFrame("institutional_route_request");
+    if (restartAt === "route") {
+      h = restartWorker(h);
+      await h.bridge.start();
+      await h.port.inbound(helloAck({ features: FEATURES }));
+      await drainReconcileRequests(h);
+      routeReq = await h.port.waitForFrame("institutional_route_request");
+    }
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "institutional_route_response",
+      msg_id: `route_response_${restartAt}`,
+      job_id: jobID,
+      seq: 5,
+      payload: {
+        request_id: routeReq.payload["request_id"],
+        outcome: "issued",
+        claim_id: claimID,
+        binding_id: bindingID,
+        route_issuance_ordinal: 1,
+        effect_ordinal:
+          (routeReq.payload["expected_effect_ordinal"] as number) + 1,
+        institutional_request_id: routeReq.payload["institutional_request_id"],
+        url: `https://${PROVIDER_HOST}/${restartAt}`,
+      },
+    });
+
+    let navigatedReq = await h.port.waitForFrame(
+      "institutional_navigated_request",
+    );
+    if (restartAt === "navigate") {
+      h = restartWorker(h);
+      await h.bridge.start();
+      await h.port.inbound(helloAck({ features: FEATURES }));
+      await drainReconcileRequests(h);
+      navigatedReq = await h.port.waitForFrame(
+        "institutional_navigated_request",
+      );
+    }
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "institutional_navigated_response",
+      msg_id: `navigated_response_${restartAt}`,
+      job_id: jobID,
+      seq: 6,
+      payload: {
+        request_id: navigatedReq.payload["request_id"],
+        outcome: "acknowledged",
+        claim_id: claimID,
+        binding_id: bindingID,
+      },
+    });
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(h.backend.store.materializations?.[jobID]).toMatchObject({
+      phase: "navigated",
+    });
+
+    // The flow completes at every restart point: delivery reaches the
+    // researcher's scaffold tab regardless of which boundary a worker
+    // death lands on, and no duplicate scaffold was ever minted — the
+    // SAME tab that started as the scaffold now carries the resolver URL.
+    expect(h.tabs.snapshot(scaffoldTabID)?.url).toBe(
+      `https://${PROVIDER_HOST}/${restartAt}`,
+    );
+    expect(
+      h.tabs
+        .list()
+        .filter((tab) => tab.url?.includes(`materialize.html#${bindingID}`)),
+    ).toHaveLength(0);
+    // Fix A (materializeScaffold now routes through openBrokerTab): the
+    // scaffold's own work window is created exactly once for this job —
+    // never re-created across however many restarts this boundary
+    // exercises, and never duplicated.
+    expect(h.windows?.created ?? []).toHaveLength(1);
+    expect(h.tabGroups).toBeUndefined();
+
+    if (restartAt === "ack") {
+      h = restartWorker(h);
+      await h.bridge.start();
+      await h.port.inbound(helloAck({ features: FEATURES }));
+      await drainReconcileRequests(h);
+      // Fix B (lastKnownBrowserHolderGeneration is now rehydrated at
+      // start() from the surviving materialization correlation's own
+      // browser_holder_generation, background.ts ~5321-5449): a worker
+      // death after the claim step, with no further claim consult in this
+      // worker's remaining lifetime, no longer permanently blocks close
+      // authorization — the ack below still drives materialization_
+      // settled retirement through to a real close, exactly as it does at
+      // every other boundary.
+      await h.port.inbound({
+        protocol: "papio-browser/1",
+        type: "ack",
+        msg_id: `ack_frame_${restartAt}`,
+        job_id: jobID,
+        seq: 7,
+        payload: {},
+      });
+      const closeRequest = await h.port.waitForFrame("surface_close_request");
+      expect(closeRequest.payload["disposition"]).toBe(
+        "materialization_settled",
+      );
+      expect(closeRequest.payload["binding_id"]).toBe(bindingID);
+      await h.port.inbound(
+        nativeResult("surface_close_response", {
+          request_id: closeRequest.payload["request_id"],
+          outcome: "authorized",
+          close_authorization_id: `auth_${restartAt}`,
+          nonce: `nonce_${restartAt}`,
+          browser_holder_generation: 1,
+        }),
+      );
+      for (let i = 0; i < 20; i += 1) await Promise.resolve();
+      expect(h.tabs.removed).toContain(scaffoldTabID);
+      expect(h.tabs.snapshot(scaffoldTabID)).toBeUndefined();
+    }
+  }
 });
 
 
@@ -14688,7 +15178,6 @@ describe("generic settled-unknown acquisition", () => {
         args[0] === "provider_drive_epoch_result_request" &&
         (args[1] as Record<string, unknown>)?.outcome === "cancelled",
     );
-    expect(cancelled).toHaveLength(1);
     await h.downloads.onChanged.emit({
       id: 901,
       state: { current: "interrupted" },
@@ -17284,6 +17773,30 @@ test("Slice 1: simulateExtensionUpdate reproduces the session-storage-clears tab
   );
 });
 
+test("Slice 1: restartWorker detaches the dead bridge's own listeners — a tab event after restart is handled by the new bridge only", async () => {
+  const jobID = "job_restart_isolation";
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  const restarted = restartWorker(h);
+  await restarted.bridge.start();
+  await h.tabs.userClose(tabID);
+
+  // Exactly one provider_outcome/cancelled across every port this harness
+  // ever created: the dead bridge's own tabs.onRemoved listener must never
+  // fire again once a fresh Bridge has taken over the same fakes — a
+  // second, stale listener would double-report the same close (and could
+  // stomp the new bridge's own save with a dead in-memory snapshot).
+  const cancelled = restarted
+    .frames()
+    .filter((frame) => frame.type === "provider_outcome");
+  expect(cancelled).toHaveLength(1);
+  expect(restarted.backend.store.activeJobs).toEqual([]);
+});
+
 test("Slice 1: restartWorker keeps the durable tab ledger across a worker restart, but a claim-gate park's offer URL is worker-local only and needs the daemon's re-offer to recover", async () => {
   const h = makeHarness({
     ...emptyStore(),
@@ -17473,6 +17986,126 @@ test("Slice 2b: an operator-active tab is ceded and detached rather than closed"
   expect(record?.ceded).toBe(true);
   expect(record?.binding_id).toBe(bindingID);
   expect(record?.pending_close).toBeUndefined();
+});
+
+test("Scenario 6: papio's own focus_owner activation leaves no cession trace, but a genuine operator activation cedes and that survives a worker restart", async () => {
+  // Part (a): papio-initiated focus_owner (the daemon routing an explicit
+  // dependent to an already-live owner tab) activates that tab itself —
+  // this must never be conflated with operator engagement. A later
+  // authorized close on the SAME tab still runs the normal wire round trip
+  // (never refused as ceded), proving no cession trace was left behind.
+  const ownerJobID = "job_scenario6_owner";
+  const ownerCandidateID = "cand_scenario6_owner01";
+  const dependentJobID = "job_scenario6_dependent";
+  const dependentCandidateID = "cand_scenario6_dep001";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(ownerJobID), coldClaimJob(dependentJobID)],
+  });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
+    }),
+  );
+  await seedClaimCandidate(h, ownerJobID, ownerCandidateID);
+  const ownerTabID = await openClaimWithNewSurface(
+    h,
+    ownerJobID,
+    ownerCandidateID,
+    `https://${PROVIDER_HOST}/fresh?s6=owner`,
+  );
+
+  await seedClaimCandidate(h, dependentJobID, dependentCandidateID);
+  const dependentFramesBefore = h.port.posted.length;
+  const dependentOpening = h.bridge.openHandoff(dependentJobID);
+  const dependentClaim = await h.port.waitForFrame(
+    "authentication_claim_request",
+    dependentFramesBefore,
+  );
+  await h.port.inbound(
+    claimResponse(dependentJobID, dependentClaim.payload["request_id"], {
+      outcome: "focus_owner",
+      authentication_claim_id: `claim_${dependentCandidateID}`,
+      browser_holder_generation: 1,
+      gate_occurrence_id: `occ_${dependentCandidateID}`,
+      lease_until: "2030-01-01T00:00:00Z",
+      owner_binding_id: "bind_s6_owner01",
+      owner_tab_hint: ownerTabID,
+    }),
+  );
+  await expect(dependentOpening).resolves.toEqual({ ok: true, opened: true });
+  expect(
+    h.tabs.updates.some(
+      (update) =>
+        update.id === ownerTabID && update.properties.active === true,
+    ),
+  ).toBe(true);
+
+  // No cession trace: papio's own focus_owner-driven activation never
+  // touches the tab ledger's `ceded` field by itself — that field is only
+  // ever written inside a close attempt's own tab.active check (the
+  // structural discriminator gap: focusClaimOwnerTab's tabs.update
+  // (active: true) and a genuine operator click are indistinguishable at
+  // that later check — out of scope here). Proven by inspecting the
+  // ledger record directly, before any close is ever attempted against
+  // this tab.
+  const internals = h.bridge as unknown as {
+    closeOwnedSurface: (
+      tabID: number,
+      disposition: "scaffold_idle" | "materialization_settled" | "claim_abandoned",
+    ) => Promise<{ closed: boolean }>;
+    snapshotTabLedger: () => Promise<Record<string, SurfaceBirthRecord>>;
+  };
+  const ledgerAfterFocus = await internals.snapshotTabLedger();
+  expect(ledgerAfterFocus[String(ownerTabID)]?.ceded).toBeUndefined();
+
+  // Part (b): a genuine operator activation (h.tabs.userActivate) cedes,
+  // and that cede survives a worker restart — no further close is ever
+  // attempted, and closeOwnedSurface's own ledger-entry gate refuses it
+  // before even sending a request.
+  const h2 = makeHarness(undefined, { windows: true });
+  await h2.bridge.start();
+  const { tabID: scaffoldTabID } = await seedOwnedScaffold(h2);
+  await h2.tabs.userActivate(scaffoldTabID);
+  const closing2 = closeInternals(h2).closeOwnedSurface(
+    scaffoldTabID,
+    "scaffold_idle",
+  );
+  const request2 = await h2.port.waitForFrame("surface_close_request");
+  await h2.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request2.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-s6-op",
+      nonce: "nonce-s6-op",
+      browser_holder_generation: 1,
+    }),
+  );
+  await expect(closing2).resolves.toEqual({ closed: false });
+  expect(h2.tabs.removed).not.toContain(scaffoldTabID);
+  const ledgerBeforeRestart = closeInternals(h2).tabLedgerCache;
+  expect(ledgerBeforeRestart[String(scaffoldTabID)]?.ceded).toBe(true);
+
+  const restarted = restartWorker(h2);
+  await restarted.bridge.start();
+  const framesBeforeRestart = restarted.frames().length;
+  const closing3 = closeInternals(restarted).closeOwnedSurface(
+    scaffoldTabID,
+    "scaffold_idle",
+  );
+  await expect(closing3).resolves.toEqual({ closed: false });
+  expect(restarted.tabs.removed).not.toContain(scaffoldTabID);
+  expect(restarted.tabs.snapshot(scaffoldTabID)).toBeDefined();
+  // Refused at the ledger-entry gate before even attempting the wire round
+  // trip: no renavigation, no close, no surface_close_request at all.
+  expect(
+    restarted
+      .frames()
+      .slice(framesBeforeRestart)
+      .some((f) => f.type === "surface_close_request"),
+  ).toBe(false);
 });
 
 test("Slice 2b: a failed remove leaves the tombstone; startup replay completes it", async () => {
@@ -17687,4 +18320,95 @@ test("Slice 2b: update simulation adopts zero new surfaces and closes nothing wi
   expect(h.backend.store.handoffGroupID).toBe(groupID);
   expect(h.tabs.removed).not.toContain(tabID);
   expect(h.tabs.snapshot(tabID)).toBeDefined();
+});
+
+test("Scenario 2: a live institutional materialize.html scaffold survives simulateExtensionUpdate untouched — birth record revalidated across the update, and a post-update re-offer never leaves two live scaffolds for the same binding", async () => {
+  const jobID = "job_scenario2_materialize";
+  const candidateID = "cand_scenario2_0001";
+  const bindingID = "bind_scenario2_0001";
+  const claimID = "claim_scenario2_0001";
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["institutional_materialization_v1"] }),
+  );
+  await h.port.inbound(candidateOffer(jobID, candidateID));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  const claimResponsePayload = institutionalClaimResponse(
+    jobID,
+    candidateID,
+    claimID,
+    bindingID,
+  ) as { payload: Record<string, unknown> };
+  claimResponsePayload.payload["request_id"] = claim.payload["request_id"];
+  await h.port.inbound(claimResponsePayload);
+  const bind = await h.port.waitForFrame("institutional_bind_request");
+  expect(bind.payload["binding_id"]).toBe(bindingID);
+  const scaffoldTab = h.tabs
+    .list()
+    .find(
+      (tab) =>
+        tab.url === `chrome-extension://test/materialize.html#${bindingID}`,
+    );
+  expect(scaffoldTab).toBeDefined();
+  const scaffoldTabID = scaffoldTab!.id!;
+  const bindResponsePayload = institutionalBindResponse(
+    jobID,
+    claimID,
+    bindingID,
+  ) as { payload: Record<string, unknown> };
+  bindResponsePayload.payload["request_id"] = bind.payload["request_id"];
+  await h.port.inbound(bindResponsePayload);
+
+  const internals = h.bridge as unknown as {
+    snapshotTabLedger: () => Promise<Record<string, SurfaceBirthRecord>>;
+  };
+  const ledgerBefore = await internals.snapshotTabLedger();
+  expect(ledgerBefore[String(scaffoldTabID)]).toMatchObject({
+    binding_id: bindingID,
+  });
+
+  const updated = simulateExtensionUpdate(h);
+  await updated.bridge.start();
+  // Session-scoped materialization state is gone (a fresh Bridge, no jobs),
+  // but the scaffold tab and its birth certificate survive the update
+  // untouched: nothing was closed to get there.
+  expect(Object.keys(h.backend.store.materializations ?? {})).toHaveLength(0);
+  expect(h.tabs.removed).not.toContain(scaffoldTabID);
+  expect(h.tabs.snapshot(scaffoldTabID)).toBeDefined();
+  const updatedInternals = updated.bridge as unknown as {
+    snapshotTabLedger: () => Promise<Record<string, SurfaceBirthRecord>>;
+  };
+  const ledgerAfter = await updatedInternals.snapshotTabLedger();
+  expect(ledgerAfter[String(scaffoldTabID)]).toMatchObject({
+    binding_id: bindingID,
+  });
+
+  // A fresh daemon re-offer/re-claim for the same binding after the update
+  // must never leave TWO simultaneously live scaffolds for it — whichever
+  // tab materializeScaffold ends up driving (reused or freshly minted),
+  // there is exactly one live scaffold for this binding at any time.
+  await updated.port.inbound(
+    helloAck({ features: ["institutional_materialization_v1"] }),
+  );
+  await updated.port.inbound(candidateOffer(jobID, candidateID));
+  const claim2 = await updated.port.waitForFrame("institutional_claim_request");
+  const claimResponsePayload2 = institutionalClaimResponse(
+    jobID,
+    candidateID,
+    claimID,
+    bindingID,
+  ) as { payload: Record<string, unknown> };
+  claimResponsePayload2.payload["request_id"] = claim2.payload["request_id"];
+  await updated.port.inbound(claimResponsePayload2);
+  const bind2 = await updated.port.waitForFrame("institutional_bind_request");
+  expect(bind2.payload["binding_id"]).toBe(bindingID);
+  const liveScaffoldsForBinding = updated.tabs
+    .list()
+    .filter(
+      (tab) =>
+        tab.url === `chrome-extension://test/materialize.html#${bindingID}`,
+    );
+  expect(liveScaffoldsForBinding).toHaveLength(1);
 });

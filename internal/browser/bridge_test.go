@@ -5916,6 +5916,184 @@ func TestSurfaceClosePhaseMismatchIsNotEligible(t *testing.T) {
 	}
 }
 
+// TestSurfaceCloseRequestDispatchedThroughSyncAuthorizes drives
+// surface_close_request through the real inbound frame decode and dispatch
+// path (Bridge.Sync -> handle -> the MsgSurfaceCloseRequest case), not the
+// private surfaceClose method every other test in this file calls
+// directly. A missing or mis-gated dispatcher entry (the case in handle()'s
+// switch, or the holder/outdated gate ahead of it) falls through to the
+// generic unknown-frame default, which is ErrInvalidFrame and fatal to
+// Sync — so this test's runSync would fail loudly rather than silently
+// passing if that wiring regressed.
+func TestSurfaceCloseRequestDispatchedThroughSyncAuthorizes(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-dispatch", "settled")
+
+	frame := inFrame(t, protocol.MsgSurfaceCloseRequest, "", protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-dispatch", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+	})
+	msgs, _ := runSync(t, b, frame)
+	resp := firstOfType(msgs, protocol.MsgSurfaceCloseResponse)
+	if resp == nil {
+		t.Fatalf("dispatched surface_close_request produced no surface_close_response: %v", msgs)
+	}
+	got := resp.Payload.(*protocol.SurfaceCloseResponsePayload)
+	if got.Outcome != "authorized" || got.CloseAuthorizationID == "" || got.Nonce == "" {
+		t.Fatalf("dispatched outcome = %+v, want authorized with id/nonce", got)
+	}
+}
+
+// TestSurfaceCloseRequestFromNonHolderSessionIsRefused pins the holder gate
+// ahead of the MsgSurfaceCloseRequest dispatch case in handle() — the same
+// class of gate TestHandoffLinkRoutineOutcomesAndFreshResolution pins for
+// handoff_link_request: a session that never became holder must be
+// refused session_busy through the real dispatch path, never routed to the
+// handler.
+func TestSurfaceCloseRequestFromNonHolderSessionIsRefused(t *testing.T) {
+	const holder = "sess-close-dispatch-holder-00000000000"
+	const nonHolder = "sess-close-dispatch-pending-0000000000"
+	b, jobs, _, _ := newBridge(t)
+	runSyncAs(t, b, holder, materializationHello(t))
+	runSyncAs(t, b, nonHolder, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-dispatch-nonholder", "settled")
+
+	frame := inFrame(t, protocol.MsgSurfaceCloseRequest, "", protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-dispatch-nonholder", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+	})
+	msgs, _ := runSyncAs(t, b, nonHolder, frame)
+	errFrame := firstOfType(msgs, protocol.MsgError)
+	if errFrame == nil || errFrame.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+		t.Fatalf("non-holder surface_close_request = %v, want session_busy", msgs)
+	}
+}
+
+// surfaceCloseEligibleAt encodes surfaceClose's shipped disposition x phase
+// eligibility matrix (bridge.go): scaffold_idle authorizes claimed/bound
+// (subject to LiveEffectPermit ownership, pinned separately below),
+// claim_abandoned authorizes only abandoned, and materialization_settled
+// authorizes only settled. Every other combination must answer
+// not_eligible — never silently authorize, and never error.
+var surfaceCloseEligibleAt = map[string]map[string]bool{
+	"scaffold_idle":           {"claimed": true, "bound": true},
+	"claim_abandoned":         {"abandoned": true},
+	"materialization_settled": {"settled": true},
+}
+
+// TestSurfaceCloseEligibilityMatrixAcrossPhases exercises every
+// (disposition, phase) combination the shipped switch in surfaceClose
+// distinguishes, across the full phase set a materialization claim can
+// occupy (claimed, bound, route_issued, navigated, settled, abandoned).
+// TestSurfaceCloseAuthorizedHappyPath, TestSurfaceCloseAuthorizedRepeatIsIdempotent
+// and TestSurfaceClosePhaseMismatchIsNotEligible each pin one cell already;
+// this proves the rest of the matrix — most importantly that route_issued
+// and navigated never authorize ANY disposition, which none of the other
+// tests cover.
+func TestSurfaceCloseEligibilityMatrixAcrossPhases(t *testing.T) {
+	phases := []string{"claimed", "bound", "route_issued", "navigated", "settled", "abandoned"}
+	dispositions := []string{"scaffold_idle", "claim_abandoned", "materialization_settled"}
+	for _, disposition := range dispositions {
+		for _, phase := range phases {
+			wantAuthorized := surfaceCloseEligibleAt[disposition][phase]
+			t.Run(disposition+"_on_"+phase, func(t *testing.T) {
+				b, jobs, _, _ := newBridge(t)
+				runSync(t, b, materializationHello(t))
+				claim := seedSurfaceCloseClaim(t, b, jobs, "matrix-"+disposition+"-"+phase, phase)
+				frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
+					RequestID: "req-matrix-" + disposition + "-" + phase, BindingID: claim.BindingID,
+					BrowserHolderGeneration: b.epoch, Disposition: disposition,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := decodeSurfaceCloseResponse(t, frames)
+				switch {
+				case wantAuthorized && got.Outcome != "authorized":
+					t.Fatalf("phase=%s disposition=%s outcome=%q, want authorized (detail=%q)", phase, disposition, got.Outcome, got.Detail)
+				case !wantAuthorized && got.Outcome != "not_eligible":
+					t.Fatalf("phase=%s disposition=%s outcome=%q, want not_eligible", phase, disposition, got.Outcome)
+				}
+			})
+		}
+	}
+}
+
+// seedLiveEffectPermitForClaim inserts a held institutional effect_permits
+// row tied to claim — the same shape production code writes when a browser
+// tab actually drives an institutional effect — so scaffold_idle's
+// LiveEffectPermit occupancy check has something live to see. Only one live
+// permit can ever exist at a time (effect_permits_live_slot's slot_index
+// uniqueness), so a test using this must not seed a second one on the same
+// store.
+func seedLiveEffectPermitForClaim(t *testing.T, jobs *job.Store, claim *job.MaterializationClaim, permitID string) {
+	t.Helper()
+	ctx := context.Background()
+	var jobID string
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT job_id FROM browser_candidates WHERE id = ?`, claim.CandidateID).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		INSERT INTO effect_permits
+		  (id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind,
+		   claim_id, binding_id, effect_ordinal, institutional_request_id, status, lease_until, created_at, updated_at)
+		VALUES (?, ?, 1, ?, ?, 'institutional', ?, ?, 1, ?, 'held', ?, ?, ?)`,
+		permitID, jobID, claim.BrowserHolderGeneration, "domain-"+permitID,
+		claim.ID, claim.BindingID, "institutional-request-"+permitID,
+		time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano), now, now,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSurfaceCloseScaffoldIdleRespectsLiveEffectPermitOwnership: the
+// scaffold_idle phase check (claimed/bound) alone is not sufficient —
+// LiveEffectPermit must also show no live effect occupying THIS exact
+// claim. A permit already held for a DIFFERENT claim must never block; only
+// occupancy on the claim being closed does.
+func TestSurfaceCloseScaffoldIdleRespectsLiveEffectPermitOwnership(t *testing.T) {
+	ctx := context.Background()
+	t.Run("permit_on_same_claim_blocks", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, materializationHello(t))
+		claim := seedSurfaceCloseClaim(t, b, jobs, "matrix-permit-same", "bound")
+		seedLiveEffectPermitForClaim(t, jobs, claim, "permit-matrix-same")
+
+		frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
+			RequestID: "req-matrix-permit-same", BindingID: claim.BindingID,
+			BrowserHolderGeneration: b.epoch, Disposition: "scaffold_idle",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := decodeSurfaceCloseResponse(t, frames)
+		if got.Outcome != "not_eligible" {
+			t.Fatalf("outcome = %q, want not_eligible (a live permit on the same claim occupies the scaffold)", got.Outcome)
+		}
+	})
+	t.Run("permit_on_different_claim_does_not_block", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, materializationHello(t))
+		claim := seedSurfaceCloseClaim(t, b, jobs, "matrix-permit-diff", "bound")
+		other := seedSurfaceCloseClaim(t, b, jobs, "matrix-permit-diff-other", "bound")
+		seedLiveEffectPermitForClaim(t, jobs, other, "permit-matrix-diff")
+
+		frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
+			RequestID: "req-matrix-permit-diff", BindingID: claim.BindingID,
+			BrowserHolderGeneration: b.epoch, Disposition: "scaffold_idle",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := decodeSurfaceCloseResponse(t, frames)
+		if got.Outcome != "authorized" {
+			t.Fatalf("outcome = %q, want authorized (detail=%q)", got.Outcome, got.Detail)
+		}
+	})
+}
+
 // End-to-end: the redaction must be applied where the event is written, not
 // merely available as a helper.
 func TestPersistedProviderOutcomeDetailIsRedacted(t *testing.T) {

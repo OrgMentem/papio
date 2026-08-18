@@ -1681,8 +1681,28 @@ function requireKeys(
  * `forbidden` names a field the wire contract defines but this schema version
  * must reject (e.g. a v2-only counter seen on a v1 frame). */
 type FieldSpec<T> = {
-  [K in keyof T & string]-?: "required" | "optional" | "forbidden";
+  [K in keyof T & string]-?:
+    | "required"
+    | "optional"
+    | "forbidden"
+    | "forbidden-unless-empty";
 };
+
+/** Go's wire struct for this field is a plain `string`, so an inapplicable
+ * field always round-trips as an explicit `""` rather than an absent key —
+ * `!= ""` there, not key-presence, is the actual forbidding rule (see
+ * AuthenticationClaimResponsePayload.Detail / SurfaceCloseRequestPayload.
+ * GateOccurrenceID in internal/protocol/protocol.go). Treat `""` here the
+ * same way: as absent. Any other value, present at all, still fails closed. */
+function forbiddenUnlessEmpty(
+  obj: Record<string, unknown>,
+  key: string,
+  what: string,
+): void {
+  if (key in obj && obj[key] !== "") {
+    fail(`${what}: unknown field ${JSON.stringify(key)} (fail closed)`);
+  }
+}
 
 function requireFields<T>(
   obj: Record<string, unknown>,
@@ -1700,6 +1720,9 @@ function requireFields<T>(
     }
     if (disposition === "forbidden" && key in obj) {
       fail(`${what}: unknown field ${JSON.stringify(key)} (fail closed)`);
+    }
+    if (disposition === "forbidden-unless-empty") {
+      forbiddenUnlessEmpty(obj, key, what);
     }
   }
 }
@@ -6083,12 +6106,11 @@ function validatePayload(
         disposition !== "claim_abandoned"
       )
         fail(`${type}.disposition is invalid`);
-      if (disposition !== "claim_abandoned" && "gate_occurrence_id" in p)
-        fail(
-          `${type}.gate_occurrence_id is only valid for claim_abandoned`,
-        );
-      if ("gate_occurrence_id" in p)
+      if (disposition !== "claim_abandoned") {
+        forbiddenUnlessEmpty(p, "gate_occurrence_id", type);
+      } else if ("gate_occurrence_id" in p && p["gate_occurrence_id"] !== "") {
         institutionalID(p, "gate_occurrence_id", type);
+      }
       break;
     }
     case "surface_close_response": {
@@ -6190,7 +6212,7 @@ function validatePayload(
         if ("detail" in p) triageText(p, "detail", type, 1000);
         break;
       }
-      if ("detail" in p) fail(`${type}.${outcome} must not carry detail`);
+      forbiddenUnlessEmpty(p, "detail", type);
       institutionalID(p, "authentication_claim_id", type);
       int(p, "browser_holder_generation", type, 0);
       institutionalID(p, "gate_occurrence_id", type);

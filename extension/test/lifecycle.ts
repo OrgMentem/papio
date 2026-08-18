@@ -31,6 +31,14 @@ export interface RestartableHarness {
    * exactly like the real API; absent ones are untouched (existing
    * harnesses without the epoch seam keep working unchanged). */
   sessionStorage?: { clear(): void };
+  /** Optional restart seam: detach every listener the dying Bridge
+   * registered on the harness's browser-side fakes (tabs/downloads/
+   * webNavigation/alarms emitters), modeling the MV3 worker's JS realm
+   * being destroyed. Absent on a harness with no such fakes (existing
+   * harnesses without the seam keep working unchanged, just without this
+   * protection). Both restart helpers call it BEFORE minting the fresh
+   * Bridge, so the new Bridge's own bindListeners() is never touched. */
+  detachBridgeListeners?(): void;
 }
 
 /** Redefine `port` on a harness clone as a live accessor instead of a value
@@ -64,6 +72,7 @@ function installLivePortAccessor<H extends RestartableHarness>(
  * gone. The caller awaits `bridge.start()` and sends hello on the returned
  * harness's `port`. */
 export function restartWorker<H extends RestartableHarness>(h: H): H {
+  h.detachBridgeListeners?.();
   const next: H = { ...h };
   next.bridge = new Bridge(h.deps);
   installLivePortAccessor(next, h.ports);
@@ -81,6 +90,7 @@ export function simulateExtensionUpdate<H extends RestartableHarness>(
 ): H {
   h.backend.store = emptyStore();
   h.sessionStorage?.clear();
+  h.detachBridgeListeners?.();
   const next: H = { ...h };
   next.bridge = new Bridge(h.deps);
   installLivePortAccessor(next, h.ports);

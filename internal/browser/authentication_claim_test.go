@@ -418,6 +418,94 @@ func TestClaimObservationAuthReturnedPromotesLeaseToHuman(t *testing.T) {
 	}
 }
 
+// TestClaimObservationDuplicateStaleRejectedNeverTouchLeaseOrEvidence pins
+// §3's no-op guarantee (claim_observation_apply.go's ApplyClaimObservation
+// doc comment: "a duplicate, stale, or rejected observation is a true no-op
+// that never touches lease state") specifically for auth_returned, the one
+// event kind whose apply path ALSO writes profile_evidence
+// (AuthReturnedEvidenceObservationID) alongside the lease promotion
+// TestClaimObservationAuthReturnedPromotesLeaseToHuman already pins for the
+// applied path. TestClaimObservationIdempotencyTrio already proves the
+// outcome strings for duplicate/rejected/stale; checking outcome alone
+// cannot catch a reducer that mutates durable state before returning one of
+// those closed outcomes, so this reads both rows before and after each
+// replay.
+func TestClaimObservationDuplicateStaleRejectedNeverTouchLeaseOrEvidence(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	jobID := parkInstitutional(t, jobs, "wr_observation_dup_evidence", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auth-observation-dup-evidence")
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-dup-evidence")
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, jobID,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auth-observation-dup-evidence-req", CandidateID: candidateID,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-dup-evidence", 6)
+	generation := b.epoch
+
+	applied, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-dup-evidence-req-1", "auth-observation-dup-evidence",
+		bindingID, grant.GateOccurrenceID, "observation-dup-evidence-1", generation, 0, "auth_returned"))
+	appliedAck := claimObservationAckPayload(t, applied)
+	if appliedAck.Outcome != "applied" {
+		t.Fatalf("first auth_returned observation = %+v, want applied", appliedAck)
+	}
+
+	readState := func() (evidenceCount int, leaseState job.AuthenticationEntryLeaseState, leaseUntil string) {
+		t.Helper()
+		if err := jobs.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM profile_evidence`).Scan(&evidenceCount); err != nil {
+			t.Fatal(err)
+		}
+		lease, found, err := jobs.GetAuthenticationEntryLease(ctx, "auth-observation-dup-evidence")
+		if err != nil || !found {
+			t.Fatalf("lease read: found=%v err=%v", found, err)
+		}
+		return evidenceCount, lease.State, lease.LeaseUntil
+	}
+	assertUnchanged := func(wantEvidence int, wantState job.AuthenticationEntryLeaseState, wantLeaseUntil string) {
+		t.Helper()
+		evidence, state, leaseUntil := readState()
+		if evidence != wantEvidence || state != wantState || leaseUntil != wantLeaseUntil {
+			t.Fatalf("observation mutated durable state: evidence=%d(%d) state=%q(%q) lease_until=%q(%q)",
+				evidence, wantEvidence, state, wantState, leaseUntil, wantLeaseUntil)
+		}
+	}
+	baselineEvidence, baselineState, baselineLeaseUntil := readState()
+	if baselineState != job.AuthenticationEntryLeaseHuman {
+		t.Fatalf("baseline lease state = %q, want human", baselineState)
+	}
+
+	// Exact replay: same observation_id, ordinal, and occurrence.
+	duplicate, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-dup-evidence-req-2", "auth-observation-dup-evidence",
+		bindingID, grant.GateOccurrenceID, "observation-dup-evidence-1", generation, 0, "auth_returned"))
+	duplicateAck := claimObservationAckPayload(t, duplicate)
+	if duplicateAck.Outcome != "duplicate" {
+		t.Fatalf("exact replay = %+v, want duplicate", duplicateAck)
+	}
+	assertUnchanged(baselineEvidence, baselineState, baselineLeaseUntil)
+
+	// Mismatched replay under the same observation_id: rejected.
+	rejected, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-dup-evidence-req-3", "auth-observation-dup-evidence",
+		bindingID, grant.GateOccurrenceID, "observation-dup-evidence-1", generation, 1, "auth_returned"))
+	rejectedAck := claimObservationAckPayload(t, rejected)
+	if rejectedAck.Outcome != "rejected" {
+		t.Fatalf("mismatched replay = %+v, want rejected", rejectedAck)
+	}
+	assertUnchanged(baselineEvidence, baselineState, baselineLeaseUntil)
+
+	// New observation_id whose ordinal does not exceed the highest applied
+	// ordinal for this gate occurrence: stale.
+	stale, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-dup-evidence-req-4", "auth-observation-dup-evidence",
+		bindingID, grant.GateOccurrenceID, "observation-dup-evidence-stale", generation, 0, "auth_returned"))
+	staleAck := claimObservationAckPayload(t, stale)
+	if staleAck.Outcome != "stale" {
+		t.Fatalf("superseded ordinal = %+v, want stale", staleAck)
+	}
+	assertUnchanged(baselineEvidence, baselineState, baselineLeaseUntil)
+}
+
 // TestClaimObservationEntitledLandingReoffersParkedSibling proves the
 // end-to-end resumption path: entitled_landing on the owner's binding
 // re-offers a sibling job parked on the SAME resolver profile through the
@@ -708,7 +796,14 @@ func TestAutomaticCandidateOfferSuppressedByLiveOwnerBinding(t *testing.T) {
 // fence: four institutional jobs across four provider-safety domains share
 // one still-unclaimed authentication claim, so the scheduler's fair,
 // per-domain batch would otherwise hand all four to the offer loop in one
-// poll. Claim pacing must reduce that to exactly one candidate offer.
+// poll. Claim pacing must reduce that to exactly one candidate offer. It
+// also proves the sibling half-budget reservation
+// (admitAutomaticMaterializationCandidates' automaticCap = maxOutstandingOffers/2):
+// with a SECOND poll where four automatic-eligible candidates sit under
+// four DISTINCT (unpaced) claims alongside two ordinary legacy handoffs,
+// automatic admission must never spend more than half of the
+// maxOutstandingOffers transport budget, leaving the legacy loop at least
+// its reserved half.
 func TestAutomaticCandidateOfferWakeFloodPacesToOneClaimOwner(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	runSync(t, b, authClaimHello(t))
@@ -720,6 +815,55 @@ func TestAutomaticCandidateOfferWakeFloodPacesToOneClaimOwner(t *testing.T) {
 	msgs, _ := runSync(t, b)
 	if got := countType(msgs, protocol.MsgInstitutionalCandidateOffer); got != 1 {
 		t.Fatalf("wake flood emitted %d candidate offers against one unresolved claim, want 1: %v", got, msgs)
+	}
+
+	mixed, mixedJobs, _, _ := newBridge(t)
+	runSync(t, mixed, authClaimHello(t))
+	specs := make([]job.InstitutionProfileSpec, 4)
+	for i := range specs {
+		claimID := fmt.Sprintf("auto-claim-flood-budget-%d", i)
+		specs[i] = job.InstitutionProfileSpec{
+			ConfiguredName:  fmt.Sprintf("auto-claim-flood-budget-institution-%d", i),
+			AuthorityDigest: "digest-" + claimID, AuthenticationClaimID: claimID,
+		}
+	}
+	// ReconcileInstitutionProfiles tombstones any active profile omitted from
+	// its specs, so the four distinct (unpaced) profiles this scenario needs
+	// must be reconciled together in one call, not one call per claim.
+	profiles, err := mixedJobs.ReconcileInstitutionProfiles(context.Background(), specs)
+	if err != nil || len(profiles) != 4 {
+		t.Fatalf("reconcile institution profiles: %v (%d)", err, len(profiles))
+	}
+	for i, profile := range profiles {
+		jobID := parkInstitutional(t, mixedJobs, fmt.Sprintf("auto-claim-flood-budget-%d", i), handoffWork(), "")
+		attempt, err := mixedJobs.MaterializationAttemptRevision(context.Background(), jobID)
+		if err != nil {
+			t.Fatalf("materialization attempt: %v", err)
+		}
+		if _, err := mixedJobs.CreateBrowserCandidate(context.Background(), job.BrowserCandidateInput{
+			JobID: jobID, JobAttemptRevision: attempt,
+			InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+			RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+			PreRouteSafetyKey: fmt.Sprintf("pre-route-flood-budget-%d", i), SafetyDomainID: fmt.Sprintf("domain-flood-budget-%d", i),
+			AdapterRevision: "test-adapter", EffectContractID: "test-effect", Status: "eligible",
+		}); err != nil {
+			t.Fatalf("create automatic candidate for profile %s: %v", profile.ConfiguredName, err)
+		}
+	}
+	for i := range 2 {
+		park(t, mixedJobs, fmt.Sprintf("auto-claim-flood-budget-legacy-%d", i), handoffWork())
+	}
+	mixedMsgs, _ := runSync(t, mixed)
+	automaticOffers := countType(mixedMsgs, protocol.MsgInstitutionalCandidateOffer)
+	legacyOffers := countType(mixedMsgs, protocol.MsgJobOffer)
+	if automaticOffers > maxOutstandingOffers/2 {
+		t.Fatalf("mixed poll admitted %d automatic candidate offers, want at most the half-budget cap %d", automaticOffers, maxOutstandingOffers/2)
+	}
+	if legacyOffers < 2 {
+		t.Fatalf("mixed poll admitted %d legacy job offers, want at least 2 reserved by the half-budget cap", legacyOffers)
+	}
+	if automaticOffers+legacyOffers > maxOutstandingOffers {
+		t.Fatalf("mixed poll admitted %d total offers, want at most the %d-slot transport budget", automaticOffers+legacyOffers, maxOutstandingOffers)
 	}
 }
 

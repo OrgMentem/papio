@@ -662,6 +662,12 @@ allowed when ... all land in the same commit, and the extension is rebuilt
 and reloaded alongside the daemon"), same discipline `effect_permit_v1`
 used (ADR-0022 Amendment 2026-08-13).
 
+Parity note: where Go validates a plain-string field's applicability with
+`!= ""` rather than key-presence (`AuthenticationClaimResponsePayload.Detail`,
+`SurfaceCloseRequestPayload.GateOccurrenceID`), the TS parser's `FieldSpec`
+carries the matching `"forbidden-unless-empty"` disposition so an explicit
+empty string on the wire parses identically on both sides.
+
 Rollout order, mirroring Slice 4's already-decided pattern
 (`dev/active/surface-lifecycle-plan.md` lines 350-352) rather than inventing
 a new one:

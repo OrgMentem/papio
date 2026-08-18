@@ -3299,6 +3299,26 @@ test("surface_close_request/response round-trip and enforce §2.3 field rules", 
     ).toThrow(ProtocolError);
   }
 
+  // §parity: Go's GateOccurrenceID field is a plain string validated via
+  // `!= ""`, not key-presence — an explicit empty string round-trips the
+  // same as an absent field even on a disposition that forbids it.
+  for (const disposition of [
+    "scaffold_idle",
+    "materialization_settled",
+  ] as const) {
+    expect(
+      parseBrowserMessage(
+        frame("surface_close_request", {
+          request_id: "close-request-004b",
+          binding_id: "binding-close-001",
+          browser_holder_generation: 1,
+          disposition,
+          gate_occurrence_id: "",
+        }),
+      ).type,
+    ).toBe("surface_close_request");
+  }
+
   // Unknown disposition value rejected.
   expect(() =>
     parseBrowserMessage(
@@ -3618,6 +3638,24 @@ test("authentication_claim_request/response round-trip and enforce §2.1 field r
         }),
       ),
     ).toThrow(ProtocolError);
+    // §parity: Go's Detail field is a plain string validated via `!= ""`,
+    // not key-presence — an explicit empty string round-trips the same as
+    // an absent field even though the operational outcomes forbid it.
+    expect(
+      parseBrowserMessage(
+        frame("authentication_claim_response", {
+          ...operationalBase,
+          outcome,
+          detail: "",
+          ...(outcome === "park"
+            ? { dependent_count: 0 }
+            : { lease_until: "2026-08-18T00:00:00Z" }),
+          ...(outcome === "navigate_existing" || outcome === "focus_owner"
+            ? { owner_binding_id: "binding-owner-0001" }
+            : {}),
+        }),
+      ).type,
+    ).toBe("authentication_claim_response");
   }
 
   // navigate_existing: lease_until + owner_binding_id required, owner_tab_hint optional.

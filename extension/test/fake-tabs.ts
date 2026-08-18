@@ -12,6 +12,20 @@ export class FakeEmitter<A extends unknown[]> {
     if (index >= 0) this.listeners.splice(index, 1);
   }
 
+  /** Test-only restart seam: capture how many listeners exist right now
+   * (typically zero, or however many a fixture's own constructor installed)
+   * and return a closure that truncates back to exactly that count. Models
+   * an MV3 worker death/update: the dead worker's closures — never a
+   * fixture's own internal bookkeeping listeners, which are always
+   * installed before any Bridge exists — must stop being invoked once a
+   * fresh Bridge takes over the same fake. */
+  snapshot(): () => void {
+    const keep = this.listeners.length;
+    return () => {
+      this.listeners.length = keep;
+    };
+  }
+
   async emit(...args: A): Promise<void> {
     await Promise.all(this.listeners.map((listener) => listener(...args)));
   }
