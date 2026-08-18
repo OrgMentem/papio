@@ -1656,3 +1656,72 @@ func TestRunWarnsWhenOnePaperCanHoldTwoCaptures(t *testing.T) {
 		t.Fatal("remediation is empty; the researcher is told nothing they can do")
 	}
 }
+
+// A work with two live jobs is not a defect papio can repair — ADR-0010's handle
+// promise forbids converging them behind a consumer's back — but it is invisible
+// today: the duplication is recorded in a job.duplicate_work_detected event that
+// nothing reads, and the operator meets it as the same paper listed twice with
+// nothing marking the pair. Doctor is where a condition papio refuses to guess at
+// gets named, exactly as for capture_uniqueness above.
+func TestRunWarnsWhenOneWorkHasTwoLiveJobs(t *testing.T) {
+	ctx := context.Background()
+	data := storetest.DataDir(t)
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	cfg := config.Default()
+	cfg.DataDir = data
+	healthy := Run(ctx, cfg, db, pdf.Capability{}, executable(t), nil)
+	clean, ok := findCheck(healthy, "work_uniqueness")
+	if !ok {
+		t.Fatalf("work_uniqueness check missing: %+v", healthy.Checks)
+	}
+	if clean.Status != Pass {
+		t.Fatalf("status = %v on a clean database, want Pass (%q)", clean.Status, clean.Detail)
+	}
+
+	seed := []string{
+		`INSERT INTO work_requests(id, created_at, requester, title) VALUES ('wr-dup-a', '2026-08-12T08:52:06Z', 'unknown', 'One Paper')`,
+		`INSERT INTO work_requests(id, created_at, requester, title) VALUES ('wr-dup-b', '2026-08-12T08:52:06Z', 'unknown', 'One Paper')`,
+		`INSERT INTO identifiers(work_request_id, kind, value, raw) VALUES ('wr-dup-a', 'doi', '10.3233/example.1', '10.3233/example.1')`,
+		`INSERT INTO identifiers(work_request_id, kind, value, raw) VALUES ('wr-dup-b', 'doi', '10.3233/example.1', '10.3233/example.1')`,
+		`INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at)
+		 VALUES ('job-dup-a', 'wr-dup-a', 'awaiting_human', '{}', '2026-08-12T08:52:06Z', '2026-08-12T08:52:06Z')`,
+		`INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at)
+		 VALUES ('job-dup-b', 'wr-dup-b', 'awaiting_human', '{}', '2026-08-12T08:52:06Z', '2026-08-12T08:52:06Z')`,
+	}
+	for _, stmt := range seed {
+		if _, err := db.DB().ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("seed duplicate jobs: %v", err)
+		}
+	}
+
+	report := Run(ctx, cfg, db, pdf.Capability{}, executable(t), nil)
+	got, ok := findCheck(report, "work_uniqueness")
+	if !ok {
+		t.Fatalf("work_uniqueness check missing: %+v", report.Checks)
+	}
+	if got.Status != Warn {
+		t.Fatalf("status = %v with a duplicated work, want Warn (%q)", got.Status, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "more than one live job") {
+		t.Fatalf("detail = %q, want it to name the condition", got.Detail)
+	}
+	if got.Remediation == "" {
+		t.Fatal("remediation is empty; the operator is told nothing they can do")
+	}
+
+	// A finished acquisition plus a fresh attempt is legitimate, so the check
+	// must fall silent once one side is terminal rather than nagging forever.
+	if _, err := db.DB().ExecContext(ctx, `UPDATE jobs SET state='ready' WHERE id='job-dup-b'`); err != nil {
+		t.Fatal(err)
+	}
+	settled := Run(ctx, cfg, db, pdf.Capability{}, executable(t), nil)
+	after, _ := findCheck(settled, "work_uniqueness")
+	if after.Status != Pass {
+		t.Fatalf("status = %v once one job is terminal, want Pass (%q)", after.Status, after.Detail)
+	}
+}

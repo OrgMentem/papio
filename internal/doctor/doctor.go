@@ -150,6 +150,33 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 			"papio grabs list --json, then papio grabs identify or dismiss the superseded captures; the guard installs itself once no paper has two")
 	}
 
+	// Duplicate live jobs for one work are a KNOWN and deliberate outcome, not a
+	// defect: papio deduplicates at submit, where a title-only request correctly
+	// matches nothing because liveJobForCanonicalWork keys on strong
+	// identifiers, and enrichment can discover a shared DOI long afterwards.
+	// job.RecordDuplicateWork's comment sets out why papio refuses to converge
+	// them — ADR-0010 promises that `existing: true` answers a question asked at
+	// submit, and consumers persist that job id, so a false merge breaks a live
+	// handle while a duplicate costs one wasted fetch and, artifacts being
+	// content addressed, one stored file either way.
+	//
+	// That reasoning ends with the relationship being "written down and left for
+	// a consumer to act on knowingly". This check is what makes it knowable:
+	// without it the duplication is recorded in an event nothing reads, and the
+	// operator meets it as the same paper appearing twice in the popup's
+	// institutional-access list with nothing marking the pair.
+	if db == nil {
+		add("work_uniqueness", Skip, "duplicate live jobs are checked by the daemon", "")
+	} else if works, jobs, err := duplicateLiveWorks(ctx, db); err != nil {
+		add("work_uniqueness", Warn, "duplicate live jobs could not be read", "inspect database permissions")
+	} else if works == 0 {
+		add("work_uniqueness", Pass, "no paper has two live jobs", "")
+	} else {
+		add("work_uniqueness", Warn,
+			fmt.Sprintf("%d paper(s) have more than one live job (%d jobs); each opens its own human action, so the same paper is asked for twice", works, jobs),
+			"papio jobs list --json to find the pair, then papio jobs cancel <id> on the later one; papio never merges them itself, because a consumer may already hold the other job id")
+	}
+
 	if db == nil {
 		add("effect_permit", Skip, "browser effect occupancy is checked by the daemon", "")
 	} else {
@@ -441,6 +468,33 @@ func pdfGrabActiveSourceIndex(ctx context.Context, db *store.Store) (bool, int, 
 		return false, 0, err
 	}
 	return false, duplicates, nil
+}
+
+// duplicateLiveWorks counts works that hold more than one live job, and the
+// total number of live jobs those works hold.
+//
+// Every identifier kind counts, not just DOI: liveJobForCanonicalWork keys on
+// work.Describe(), which resolves to whichever strong identifier a work has, so
+// a pair sharing only a PMID is the same duplication. The live-state set mirrors
+// job.Terminal exactly — a terminal job is a finished acquisition and a second
+// live job for the same work is then legitimate, which is the case
+// supersededJobsForCanonicalWork already handles on the force path.
+func duplicateLiveWorks(ctx context.Context, db *store.Store) (int, int, error) {
+	var works, jobs int
+	if err := db.DB().QueryRowContext(ctx, `
+		WITH live AS (
+		  SELECT i.kind, i.value, j.id
+		    FROM identifiers i
+		    JOIN jobs j ON j.work_request_id = i.work_request_id
+		   WHERE j.state NOT IN ('ready','imported','unavailable','failed','cancelled')
+		), dup AS (
+		  SELECT kind, value, COUNT(*) AS n FROM live
+		   GROUP BY kind, value HAVING COUNT(*) > 1
+		)
+		SELECT COUNT(*), COALESCE(SUM(n), 0) FROM dup`).Scan(&works, &jobs); err != nil {
+		return 0, 0, err
+	}
+	return works, jobs, nil
 }
 
 // undeliveredZoteroImports counts ready jobs whose bytes are validated but whose

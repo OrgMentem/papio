@@ -11,6 +11,18 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **`papio doctor` now tells you when the same paper is queued twice.** Two live
+  jobs for one paper each open their own row, so the popup asks you to fetch the
+  same paper twice with nothing marking the pair — and until now *papio* recorded
+  that it had noticed into an event no surface ever read. It happens because
+  duplicate detection runs when you submit, and a batch picked off a page has
+  only titles at that point; the shared identifier turns up later, when a
+  resolver fills the metadata in. *papio* deliberately does not merge the two
+  then — something may already be holding the other job's id, and a wrong merge
+  breaks it, while a duplicate costs one wasted fetch — so doctor names the
+  condition and leaves the choice to you, exactly as it does for a paper holding
+  two captures. It falls silent once one of the two has finished, since a fresh
+  attempt after a completed one is not a duplicate.
 - **The inbox now answers "which paper is this?" itself, instead of telling you
   to go and type an identifier.** A captured PDF that *papio* could not file on
   its own parks in the inbox, and until now the button on that row printed a
