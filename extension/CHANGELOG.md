@@ -26,17 +26,64 @@ for the full pre-split extension history.
   re-offer recreating a closed tab, startup re-driving a restored backlog,
   and the sibling resume after a login — now parks the work tabless in the
   inbox as *needs your engagement* instead, until the daemon advertises the
-  ADR-0022 authentication-claim feature (no shipped daemon does yet) AND the
-  network is up. Clicking **Open** works exactly as before; what is gone is
-  papio deciding by itself that now is the moment for a sign-in tab, which
-  is how a tab group grew seventeen tabs across a weekend. Three sibling
-  fixes land with it: a wake from sleep now checks connectivity before
-  releasing queued work (tabs were being driven into a dead network), a
-  repeated *Sign in* request reuses the live sign-in tab instead of minting
-  another, and a papio-created tab that has navigated through its
-  resolver→SSO→provider redirect chain is no longer forgotten by the tab
-  ledger — it is remembered as papio's own, though never touched, until the
-  durable-ownership work can prove tab identity across restarts.
+  ADR-0022 authentication-claim feature AND the network is up (the daemon
+  arbitration that grants it, below, has since shipped). Clicking **Open**
+  works exactly as before; what is gone is papio deciding by itself that
+  now is the moment for a sign-in tab, which is how a tab group grew
+  seventeen tabs across a weekend. Three sibling fixes land with it: a wake
+  from sleep now checks connectivity before releasing queued work (tabs
+  were being driven into a dead network), a repeated *Sign in* request
+  reuses the live sign-in tab instead of minting another, and a
+  papio-created tab that has navigated through its resolver→SSO→provider
+  redirect chain is no longer forgotten by the tab ledger — it is
+  remembered as papio's own, though never touched, until the
+  durable-ownership work below can prove tab identity across restarts.
+- **Every paper waiting on the same institution now shares one sign-in, and
+  resumes together the moment it succeeds.** The tabless park above is now
+  a real grant: the daemon brokers exactly one login tab per institution
+  across every paper that needs it — a second paper's autonomous drive is
+  told to wait behind it or focus it explicitly, never to open a duplicate
+  — and when that sign-in succeeds, every sibling paper resumes on its own
+  freshly revalidated route without you touching them individually. An
+  abandoned sign-in (the tab closed without success) commits that outcome
+  once; it does not leave a sibling guessing whether to keep waiting.
+- **A papio-opened institutional tab now starts on papio's own blank page,
+  never the provider's.** Automatic sign-in and access tabs open first to
+  an opaque internal `materialize.html#<binding>` page and only navigate to
+  the real provider once the daemon has admitted the route — the provider
+  address is never the tab's first destination, and never a stored one
+  either: the on-disk ledger no longer records any route, provider, host,
+  or paper for a papio-owned tab, only an opaque binding id, a SHA-256
+  digest of the tab's origin, and the bookkeeping needed to prove it is
+  still papio's own. This replaces the previous ledger, which kept the
+  actual sign-in URL in `storage.local`.
+- ***papio* never closes a tab you have touched.** Every automatic close
+  now requires a fresh, one-use authorization the daemon issues for that
+  exact tab and reason — an idle scaffold you never engaged with, one whose
+  job already finished, or one whose sign-in was abandoned. A tab that went
+  active, was pinned, turned into a PDF, or was adopted into a job is
+  retained instead, every time; a papio tab from before this shipped that
+  cannot be re-verified this way is listed in the popup's existing
+  stray-tabs review card rather than acted on.
+- **A page that fails to load is no longer mistaken for a sign-in wall.** A
+  dead-end navigation — a broken link, a timeout, a resolver page that
+  never resolves — is now recognized before papio asks whether the page is
+  an authentication wall, so it stops the attempt cleanly instead of
+  charging it against your sign-in retries or opening a cooldown a real
+  wall would deserve.
+- **Sign-in progress is no longer lost or double-counted across a
+  service-worker restart.** Every wall/login/MFA/challenge/landing/close
+  event papio observes on a sign-in tab is now queued durably before it is
+  sent and replayed under the same identity after a restart, so a login
+  completed right as the worker restarted is not asked of you again, and
+  nothing observed before the restart can be counted twice.
+- **Firefox below 139 keeps working, with grouping degraded rather than
+  assumed.** Visually grouping a papio sign-in tab with its siblings needs
+  the `tabGroups` API (Firefox 139+); where it is absent, group identity
+  now falls back cleanly to papio's existing work window instead of ever
+  inferring ownership from a group's title alone. The minimum supported
+  Firefox stays 128.0 ESR, the release many institutions run, unchanged by
+  any of this.
 - **A paper you picked no longer stays picked after you leave the PDF.** The popup's offer is now one-shot: the background mints an opaque nonce held only in service-worker memory, consumes it synchronously on selection, and freezes the page identity — tab, document, same-document navigation sequence and resolved source URL — against that pick. The offer dies when the worker restarts, when the tab navigates, closes, or is replaced, or when the delivery settles or fails; a later page in the same tab id never revives it. The native-viewer *Download* continuation is the one state that does survive a restart, held in session storage with its own job binding and page identity and re-validated when the download is claimed, and it is destroyed on every cancel or close path. This replaces the old `manual_delivery_target` pin (`Open` in the inbox) and `uniqueManualDeliveryTarget` cross-tab authority — a DOI-less file that reaches the daemon without your pick follows the blind grab path as before. To recognise when a tab has navigated away from the PDF you picked, the extension now requests the `webNavigation` permission (Chrome and Firefox); no browsing history is collected.
 
 - **A browser that is not the session holder no longer claims the daemon is

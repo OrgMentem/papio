@@ -580,6 +580,17 @@ func TestAutomaticCandidateOfferForClaimGrantedInstitution(t *testing.T) {
 	runSync(t, b, authClaimHello(t))
 	seedAuthenticationClaimProfile(t, jobs, "auto-claim-granted-claim")
 	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-auto-granted")
+	// The institutional profile/candidate did not exist yet for the very
+	// first poll above, so that poll necessarily fell back to a legacy
+	// URL-bearing offer for this job. Item 5's double-drive guard now
+	// correctly withholds automatic admission while that offer is still
+	// live — a job migrates to the candidate path only after the legacy
+	// offer is retired (cancel/timeout), never both at once. Simulate that
+	// retirement directly (the daemon's own cancel/timeout paths are
+	// exercised elsewhere) so this test can go on proving what it always
+	// proved: an ordinary poll offers a candidate whose claim is already
+	// granted, with no focus request.
+	delete(b.offered, jobID)
 
 	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, jobID,
 		protocol.AuthenticationClaimRequestPayload{
@@ -731,5 +742,97 @@ func TestLegacySessionAutomaticPathStaysDarkWithoutMaterializationFeature(t *tes
 	}
 	if offer == nil || offer.JobID != jobID {
 		t.Fatalf("legacy session did not receive the ordinary job offer: hello=%v poll=%v", initial, msgs)
+	}
+}
+
+// TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim
+// covers the three checkpoints the claim-paced automatic admission switch
+// (admitAutomaticMaterializationCandidates) must get right for its landed
+// branch: auth_returned alone (lease state 'human') is NOT permission to
+// resume dependents — only a fenced entitled_landing observation is, since
+// state='human' alone only proves an IdP round trip happened, not that it
+// reached entitled content. And owner_closed, even after entitled_landing
+// already fired, fully retires the claim's current occupancy: dependents
+// park again until a fresh arbitration grants a new reservation, never
+// resuming on the stale entitlement alone.
+func TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	owner := parkInstitutional(t, jobs, "auto-claim-gate-owner", handoffWork(), "")
+	dependent := parkInstitutional(t, jobs, "auto-claim-gate-dependent", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auto-claim-gate-shared")
+	ownerCandidate := explicitMaterializationCandidate(t, jobs, owner, "domain-gate-owner")
+	dependentCandidate := explicitMaterializationCandidate(t, jobs, dependent, "domain-gate-dependent")
+
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, owner,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auto-claim-gate-req", CandidateID: ownerCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	if grant.Outcome != "open_new" {
+		t.Fatalf("owner grant outcome = %s, want open_new", grant.Outcome)
+	}
+	bindingID := bindCandidate(t, b, owner, ownerCandidate, "auto-claim-gate", 9)
+
+	// Checkpoint 1: auth_returned lands the lease (state='human') but never
+	// observed entitled_landing. The dependent must stay parked.
+	authReturned, _ := runSync(t, b, claimObservationFrame(t, owner, "auto-claim-gate-obs-returned",
+		"auto-claim-gate-shared", bindingID, grant.GateOccurrenceID,
+		"auto-claim-gate-observation-returned", b.epoch, 0, "auth_returned"))
+	if ack := claimObservationAckPayload(t, authReturned); ack.Outcome != "applied" {
+		t.Fatalf("auth_returned outcome = %+v, want applied", ack)
+	}
+	for range 2 {
+		polled, _ := runSync(t, b)
+		if offer := firstOfType(polled, protocol.MsgInstitutionalCandidateOffer); offer != nil && offer.JobID == dependent {
+			t.Fatalf("dependent received a candidate offer after auth_returned alone (before entitled_landing): %v", polled)
+		}
+	}
+
+	// Checkpoint 2: entitled_landing durably marks the lease entitled. The
+	// dependent is admitted on the next poll.
+	landed, _ := runSync(t, b, claimObservationFrame(t, owner, "auto-claim-gate-obs-landing",
+		"auto-claim-gate-shared", bindingID, grant.GateOccurrenceID,
+		"auto-claim-gate-observation-landing", b.epoch, 1, "entitled_landing"))
+	if ack := claimObservationAckPayload(t, landed); ack.Outcome != "applied" {
+		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
+	}
+	resumed, _ := runSync(t, b)
+	offer := firstOfType(resumed, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil || offer.JobID != dependent {
+		t.Fatalf("dependent did not receive an automatic candidate offer after entitled_landing: %v", resumed)
+	}
+	if got := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID; got != dependentCandidate {
+		t.Fatalf("resumed dependent offer candidate_id = %s, want %s", got, dependentCandidate)
+	}
+
+	// Checkpoint 3: owner_closed retires the claim's current occupancy even
+	// though entitled_landing already fired. Any dependent still parked (or
+	// re-parked by this retirement) must wait for a fresh arbitration
+	// rather than resuming on the now-stale entitlement.
+	closed, _ := runSync(t, b, claimObservationFrame(t, owner, "auto-claim-gate-obs-closed",
+		"auto-claim-gate-shared", bindingID, grant.GateOccurrenceID,
+		"auto-claim-gate-observation-closed", b.epoch, 2, "owner_closed"))
+	if ack := claimObservationAckPayload(t, closed); ack.Outcome != "applied" {
+		t.Fatalf("owner_closed outcome = %+v, want applied", ack)
+	}
+	for range 2 {
+		polled, _ := runSync(t, b)
+		if offer := firstOfType(polled, protocol.MsgInstitutionalCandidateOffer); offer != nil && offer.JobID == dependent {
+			t.Fatalf("dependent received a candidate offer after owner_closed retired the claim: %v", polled)
+		}
+	}
+	// A fresh arbitration (a new authentication_claim_request) must be able
+	// to grant again — the retired lease is fully available, not merely
+	// entitlement-cleared and permanently busy.
+	reclaimed, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, dependent,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auto-claim-gate-req-2", CandidateID: dependentCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	reclaim := authClaimResponse(t, reclaimed)
+	if reclaim.Outcome != "open_new" {
+		t.Fatalf("post-owner_closed arbitration outcome = %s, want open_new", reclaim.Outcome)
 	}
 }

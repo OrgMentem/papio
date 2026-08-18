@@ -1653,25 +1653,26 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 		result.Outcome, result.Detail = "not_eligible", "the handoff is no longer open"
 		return b.frameInstitutionalBind(jobID, result)
 	}
-	err = b.jobs.BindMaterialization(ctx, claim.ID, p.BindingID, b.epoch, candidate.InstitutionProfileRevision, p.TabID)
+	// The candidate's institution profile decides whether this bind also
+	// owes the authentication-entry lease its owner-binding side channel
+	// (claim-observation-protocol.md §4.1). Resolved before the bind itself
+	// so a lookup failure fails closed instead of leaving a bound scaffold
+	// whose lease ownership was never even attempted.
+	authenticationClaimID := ""
+	if profile, profileErr := b.jobs.GetInstitutionProfile(ctx, candidate.InstitutionProfileID); profileErr != nil {
+		result.Outcome, result.Detail = "error", "institution profile state is unavailable"
+		return b.frameInstitutionalBind(jobID, result)
+	} else if profile != nil {
+		authenticationClaimID = profile.AuthenticationClaimID
+	}
+	err = b.jobs.BindMaterializationWithLeaseOwner(ctx, claim.ID, p.BindingID, b.epoch,
+		candidate.InstitutionProfileRevision, p.TabID, authenticationClaimID, jobID)
 	if err != nil {
 		result.Outcome = "stale"
 		if !errors.Is(err, job.ErrMaterializationStale) && !errors.Is(err, job.ErrMaterializationConflict) {
 			result.Outcome, result.Detail = "error", "binding could not be recorded"
 		}
 		return b.frameInstitutionalBind(jobID, result)
-	}
-	// Best-effort side channel (claim-observation-protocol.md §4.1): record
-	// which surface now occupies this candidate's authentication-entry
-	// lease, so a later navigate_existing/focus_owner can echo it. A
-	// mismatched fence is a silent no-op inside the store method; a genuine
-	// store failure is logged, never fatal to the bind that already
-	// committed.
-	if profile, profileErr := b.jobs.GetInstitutionProfile(ctx, candidate.InstitutionProfileID); profileErr == nil &&
-		profile != nil && profile.AuthenticationClaimID != "" {
-		if err := b.jobs.SetAuthenticationEntryLeaseOwnerBinding(ctx, profile.AuthenticationClaimID, jobID, b.epoch, p.BindingID, p.TabID); err != nil {
-			log.Printf("papio: authentication entry lease owner binding could not be recorded: %v", err)
-		}
 	}
 	result.Outcome = "bound"
 	result.ClaimID, result.BindingID = claim.ID, p.BindingID
@@ -2297,106 +2298,22 @@ func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol
 			GateOccurrenceID: "claim-observation-missing-payload", BrowserHolderGeneration: generation,
 		})
 	}
-	result := protocol.ClaimObservationAckPayload{
-		RequestID: p.RequestID, GateOccurrenceID: p.GateOccurrenceID, BrowserHolderGeneration: generation,
-	}
-	if row, ok, err := b.authenticationClaimCurrentGateOccurrence(ctx, p.AuthenticationClaimID); err != nil {
-		result.Outcome, result.Detail = "error", "gate occurrence state is unavailable"
-		return b.claimObservationAck(jobID, result)
-	} else if ok {
-		result.GateOccurrenceID = row.ID
-	}
-	applyErr := func(outcome, detail string) ([]json.RawMessage, error) {
-		result.Outcome, result.Detail = outcome, detail
-		return b.claimObservationAck(jobID, result)
-	}
-	if p.BrowserHolderGeneration != generation {
-		return applyErr("stale", "")
-	}
-	claim, err := b.jobs.MaterializationClaimByBindingID(ctx, p.BindingID)
+	applied, err := b.jobs.ApplyClaimObservation(ctx, job.ApplyClaimObservationInput{
+		JobID: jobID, AuthenticationClaimID: p.AuthenticationClaimID, BindingID: p.BindingID,
+		ObservationID: p.ObservationID, GateOccurrenceID: p.GateOccurrenceID,
+		EventKind: p.EventKind, EventOrdinal: p.EventOrdinal,
+		FrameGeneration: p.BrowserHolderGeneration, Generation: generation,
+		AuthReturnedEvidenceObservationID: evidenceObservationID("claim_observation_auth_returned", p.ObservationID),
+		LeaseUntil:                        b.now().Add(b.actionExpiry()),
+		Now:                               b.now(),
+	})
 	if err != nil {
-		return applyErr("error", "binding state is unavailable")
-	}
-	ownerJobID := jobID
-	var candidate *job.BrowserCandidate
-	if claim != nil {
-		candidate, err = b.jobs.GetBrowserCandidate(ctx, claim.CandidateID)
-		if err != nil {
-			return applyErr("error", "candidate state is unavailable")
-		}
-		if candidate != nil && candidate.JobID != "" {
-			ownerJobID = candidate.JobID
-		}
-	}
-	lease, leaseFound, leaseErr := b.jobs.GetAuthenticationEntryLease(ctx, p.AuthenticationClaimID)
-	if leaseErr != nil {
-		return applyErr("error", "authentication entry lease state is unavailable")
-	}
-
-	journalOutcome, checkErr := b.jobs.CheckClaimObservationJournal(ctx, p.ObservationID, result.GateOccurrenceID, p.EventOrdinal)
-	if checkErr != nil {
-		return applyErr("error", "claim observation journal state is unavailable")
-	}
-	if journalOutcome != "" {
-		result.Outcome = journalOutcome
-		return b.claimObservationAck(jobID, result)
-	}
-
-	switch p.EventKind {
-	case "wall_observed", "login_started", "mfa", "challenge":
-		if !leaseFound || lease.State != job.AuthenticationEntryLeaseReserved ||
-			lease.OwnerID != ownerJobID || lease.BrowserHolderGeneration != generation {
-			return applyErr("rejected", "no live reserved entry for this owner")
-		}
-		leaseUntil := b.now().Add(b.actionExpiry())
-		renewed, renewErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
-			AuthenticationClaimID: p.AuthenticationClaimID, LeaseID: lease.LeaseID, OwnerID: ownerJobID,
-			BrowserHolderGeneration: generation, LeaseUntil: leaseUntil,
+		return b.claimObservationAck(jobID, protocol.ClaimObservationAckPayload{
+			RequestID: p.RequestID, Outcome: "error", Detail: "claim observation could not be applied",
+			GateOccurrenceID: p.GateOccurrenceID, BrowserHolderGeneration: generation,
 		})
-		if renewErr != nil {
-			if errors.Is(renewErr, job.ErrAuthenticationEntryLeaseBusy) {
-				return applyErr("rejected", "the entry is owned elsewhere")
-			}
-			return applyErr("error", "lease renewal is unavailable")
-		}
-		result.LeaseUntil = renewed.LeaseUntil
-	case "auth_returned":
-		if !leaseFound || lease.State != job.AuthenticationEntryLeaseReserved ||
-			lease.OwnerID != ownerJobID || lease.BrowserHolderGeneration != generation {
-			return applyErr("rejected", "no live reserved entry for this owner")
-		}
-		if candidate == nil {
-			return applyErr("rejected", "binding has no live materialization claim")
-		}
-		candidateProfile, profileErr := b.jobs.GetInstitutionProfile(ctx, candidate.InstitutionProfileID)
-		if profileErr != nil {
-			return applyErr("error", "institution profile state is unavailable")
-		}
-		if candidateProfile == nil || candidateProfile.AuthenticationClaimID != p.AuthenticationClaimID {
-			return applyErr("rejected", "binding does not belong to this authentication claim")
-		}
-		nowText := b.now().UTC().Format(time.RFC3339Nano)
-		evidence := job.ProfileEvidenceObservation{
-			ObservationID:              evidenceObservationID("claim_observation_auth_returned", p.ObservationID),
-			BrowserHolderGeneration:    generation,
-			InstitutionProfileID:       candidate.InstitutionProfileID,
-			InstitutionProfileRevision: candidate.InstitutionProfileRevision,
-			Verdict:                    job.ProfileEvidenceAuthReturned,
-			Source:                     job.ProfileEvidenceAuthReturn,
-			ProducerObservedAt:         nowText,
-			DaemonReceivedAt:           nowText,
-		}
-		if err := b.jobs.RecordProfileEvidence(ctx, evidence); err != nil {
-			return applyErr("error", "profile evidence could not be recorded")
-		}
-		if convertErr := b.jobs.ConvertAuthenticationEntryLeaseToHuman(ctx, p.AuthenticationClaimID, lease.LeaseID, ownerJobID, generation, evidence); convertErr != nil &&
-			!errors.Is(convertErr, job.ErrAuthenticationEntryLeaseDenied) && !errors.Is(convertErr, job.ErrAuthenticationEntryLeaseStale) {
-			return applyErr("error", "authentication entry lease promotion is unavailable")
-		}
-	case "entitled_landing":
-		if !leaseFound || lease.State != job.AuthenticationEntryLeaseHuman || lease.HumanOwnerID != ownerJobID {
-			return applyErr("rejected", "entry is not a settled human sign-in for this owner")
-		}
+	}
+	if applied.EntitledLanding {
 		// Nudge the existing materialization scheduler
 		// (Bridge.Sync -> ScheduleEligibleBrowserCandidates, already run
 		// unconditionally every Sync) and the legacy federated-login
@@ -2405,43 +2322,31 @@ func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol
 		// carries a durable browser_candidates row (Slice 4,
 		// dev/active/surface-lifecycle-plan.md) is picked up by
 		// admitAutomaticMaterializationCandidates on the next poll purely
-		// from the now-human lease state — no legacy reoffer needed for
+		// from the now-entitled lease state — no legacy reoffer needed for
 		// it, and reofferInstitutionalSiblings is a harmless no-op for a
 		// materialization-tracked job (poll's jobLoop skips tracked,
 		// non-focused ids ahead of any legacy offer). A dependent with no
 		// candidate at all has nothing to connect to yet and still needs
-		// this call to resume.
+		// this call to resume. Run only after ApplyClaimObservation's own
+		// transaction has committed: reofferInstitutionalSiblings opens its
+		// own store transactions and would deadlock the single-writer
+		// connection if nested inside that one.
+		ownerJobID := jobID
+		if claim, claimErr := b.jobs.MaterializationClaimByBindingID(ctx, p.BindingID); claimErr == nil && claim != nil {
+			if candidate, candErr := b.jobs.GetBrowserCandidate(ctx, claim.CandidateID); candErr == nil && candidate != nil && candidate.JobID != "" {
+				ownerJobID = candidate.JobID
+			}
+		}
 		b.materializationScheduleVersion++
 		if err := b.reofferInstitutionalSiblings(ctx, ownerJobID); err != nil {
 			log.Printf("papio: claim observation entitled_landing reoffer unavailable: %v", err)
 		}
-	case "owner_closed":
-		if err := b.jobs.AbandonMaterializationClaimByBinding(ctx, p.BindingID); err != nil {
-			return applyErr("error", "materialization claim could not be abandoned")
-		}
-		if err := b.jobs.ClearAuthenticationEntryLeaseOwnerBinding(ctx, p.AuthenticationClaimID, p.BindingID); err != nil {
-			return applyErr("error", "authentication entry lease owner binding could not be cleared")
-		}
-		if err := b.jobs.ConsumeCloseAuthorizationForBinding(ctx, p.BindingID, b.now()); err != nil {
-			return applyErr("error", "close authorization could not be consumed")
-		}
-	case "navigation_error":
-		// Daemon-committed park with no auth-attempt charge, no cooldown,
-		// and the lease is never touched (plan Slice 1/3 invariant, "every
-		// dead end has a daemon-side disposition"). No daemon-side
-		// auth-attempt counter exists to avoid charging — the journal write
-		// below is this event's only durable effect; the candidate stays
-		// 'eligible' and the existing scheduler decides whether to retry.
 	}
-
-	if err := b.jobs.RecordClaimObservation(ctx, job.ClaimObservationRecord{
-		ObservationID: p.ObservationID, GateOccurrenceID: result.GateOccurrenceID,
-		AuthenticationClaimID: p.AuthenticationClaimID, BindingID: p.BindingID,
-		BrowserHolderGeneration: generation, EventKind: p.EventKind, EventOrdinal: p.EventOrdinal,
-	}); err != nil {
-		return applyErr("error", "claim observation could not be recorded")
-	}
-	return applyErr("applied", "")
+	return b.claimObservationAck(jobID, protocol.ClaimObservationAckPayload{
+		RequestID: p.RequestID, Outcome: applied.Outcome, Detail: applied.Detail,
+		GateOccurrenceID: applied.GateOccurrenceID, BrowserHolderGeneration: generation,
+		LeaseUntil: applied.LeaseUntil,
+	})
 }
 
 // handle dispatches one decoded inbound frame from sessionID.
@@ -9385,6 +9290,15 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 			return nil, nil
 		}
 		b.materializationClaimReconcileUnavailable = false
+		// close_authorizations §4.3: a token the extension never explicitly
+		// consumes or acks (the daemon-driven settle/abandon paths now
+		// consume theirs directly; this sweeps whatever is left — a token
+		// issued for a tab the daemon never heard a removal for) must not
+		// stay 'issued' forever. Best-effort, like the reconcile pass above:
+		// a transient failure here must never block ordinary polling.
+		if _, err := b.jobs.ExpireCloseAuthorizations(ctx, b.now().Add(-b.actionExpiry())); err != nil {
+			log.Printf("papio: expiring stale close authorizations: %v", err)
+		}
 	}
 	if b.materializationRecoveryPending {
 		if err := b.recoverMaterializationFocus(ctx); err != nil {
@@ -9548,10 +9462,22 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	// Slice 4 (dev/active/surface-lifecycle-plan.md): claim-paced automatic
 	// candidate offers ride the same maxOutstandingOffers transport budget
 	// as legacy/direct-route offers, so their admission is computed and
-	// reserved before the legacy loop below spends the remainder.
+	// reserved before the legacy loop below spends the remainder. Their
+	// share is capped at half of maxOutstandingOffers (never all of it, and
+	// never zero when automatic work exists) so a mixed poll — automatic
+	// claim-paced candidates alongside legacy/direct-route offers — always
+	// leaves the legacy loop room instead of a same-poll flood of distinct
+	// automatic claims spending the whole transport budget.
 	automaticAdmitted := map[string]bool{}
 	if b.claimBoundAutomaticMaterializationEnabled() {
-		automaticAdmitted = b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, slots)
+		automaticCap := maxOutstandingOffers / 2
+		if automaticCap < 1 {
+			automaticCap = 1
+		}
+		if automaticCap > slots {
+			automaticCap = slots
+		}
+		automaticAdmitted = b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, automaticCap)
 		slots -= len(automaticAdmitted)
 		if slots < 0 {
 			slots = 0
@@ -10329,20 +10255,38 @@ func (b *Bridge) claimBoundAutomaticMaterializationEnabled() bool {
 // (dev/active/claim-observation-protocol.md §4) rather than re-deriving
 // claim ownership:
 //
-//   - no lease yet for the claim: exactly one job is admitted this poll (the
-//     wake-flood fence — the scheduler can return several same-claim,
-//     different-domain descriptors in one pass, one per institution profile
-//     safety domain);
+//   - no lease yet for the claim: the daemon reserves one for exactly this
+//     job right here — the architecture ruling's "consult → open_new means
+//     the lease is reserved for the job" — so the single-admission fence is
+//     durable across polls instead of a per-call in-memory map (the
+//     scheduler can return several same-claim, different-domain descriptors
+//     in one pass, and a fresh reservation each poll would let each of them
+//     win a separate poll in turn). A reservation failure (raced busy, or a
+//     genuine store error) parks this descriptor for a later poll;
 //   - the lease is reserved to this exact job: stays admitted, so its offer
-//     keeps refreshing until bound or resolved;
-//   - the lease is human (landed/warm): every eligible dependent is
-//     admitted, since each proceeds on its own materialization binding
-//     without a fresh login wall (ADR-0022 Decision 6: "successful
-//     resolution resumes eligible siblings through normal daemon
-//     scheduling");
-//   - any other state (reserved by a different job, or a lookup failure):
-//     parked — this job is a dependent of an unresolved claim and stays
-//     tabless until the daemon observes entitled_landing.
+//     keeps refreshing until bound or resolved. At most one descriptor for
+//     that job is admitted per poll even here — a job with several eligible
+//     candidates across revisions/safety domains must not scaffold more
+//     than one at a time while its claim is still unresolved;
+//   - the lease is human AND durably entitled (a fenced entitled_landing
+//     observation applied — not merely auth_returned's state='human', which
+//     only proves an IdP round trip happened, not that it reached entitled
+//     content): every eligible dependent is admitted, since each proceeds
+//     on its own materialization binding without a fresh login wall
+//     (ADR-0022 Decision 6: "successful resolution resumes eligible
+//     siblings through normal daemon scheduling");
+//   - any other state (reserved by a different job, human-but-not-yet-
+//     entitled, expired/retired after owner_closed, or a lookup failure):
+//     parked — this job is a dependent of an unresolved (or just-retired)
+//     claim and stays tabless until the daemon observes entitled_landing or
+//     grants a fresh arbitration.
+//
+// A descriptor already carrying a live legacy handoff offer (b.offered) is
+// skipped outright: a job migrates from the legacy URL-bearing offer to the
+// claim-paced candidate path only after that offer is retired (cancelled or
+// timed out), never both at once — otherwise the extension would receive two
+// drives for the same job and could retain the old tab while also creating
+// the institutional scaffold.
 //
 // limit bounds total admissions to the remaining maxOutstandingOffers
 // budget shared with legacy/direct-route offers. The caller holds b.mu.
@@ -10359,7 +10303,7 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 		if len(admitted) >= limit {
 			break
 		}
-		if descriptor.JobID == "" || b.focusPending[descriptor.JobID] {
+		if descriptor.JobID == "" || b.focusPending[descriptor.JobID] || b.offered[descriptor.JobID] {
 			continue
 		}
 		action, hasAction := handoff[descriptor.JobID]
@@ -10385,13 +10329,25 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 			if claimSlotUsed[claimID] {
 				continue
 			}
+			leaseID := evidenceObservationID("authentication_claim_lease", claimID, descriptor.JobID, strconv.FormatInt(b.epoch, 10))
+			if _, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+				AuthenticationClaimID: claimID, LeaseID: leaseID, OwnerID: descriptor.JobID,
+				BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
+			}); reserveErr != nil {
+				continue
+			}
 			claimSlotUsed[claimID] = true
-		case lease.State == job.AuthenticationEntryLeaseHuman:
-			// Landed: every eligible dependent proceeds on its own binding.
+		case lease.State == job.AuthenticationEntryLeaseHuman && lease.EntitledAt != "":
+			// Landed and entitled: every eligible dependent proceeds on its
+			// own binding.
 		case lease.State == job.AuthenticationEntryLeaseReserved && lease.OwnerID == descriptor.JobID:
-			// Already granted to this exact job.
+			if claimSlotUsed[claimID] {
+				continue
+			}
+			claimSlotUsed[claimID] = true
 		default:
-			// Reserved by a different job, or expired/unknown state: parked.
+			// Reserved by a different job, human-but-not-entitled, expired,
+			// or unknown state: parked.
 			continue
 		}
 		admitted[descriptor.JobID] = true

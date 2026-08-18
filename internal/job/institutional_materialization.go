@@ -245,8 +245,12 @@ func (js *Store) ReconcileInstitutionProfiles(ctx context.Context, specs []Insti
 // GetInstitutionProfile loads a profile by opaque ID. Tombstoned rows remain
 // readable for audit and stale-fence diagnostics.
 func (js *Store) GetInstitutionProfile(ctx context.Context, id string) (*InstitutionProfile, error) {
+	return getInstitutionProfileTx(ctx, js.S.DB(), id)
+}
+
+func getInstitutionProfileTx(ctx context.Context, q dbtx, id string) (*InstitutionProfile, error) {
 	var p InstitutionProfile
-	err := js.S.DB().QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT id, configured_name, revision, authority_digest,
 		       authentication_claim_id, COALESCE(tombstoned_at,''), created_at, updated_at
 		  FROM institution_profiles WHERE id=?`, id).Scan(
@@ -411,7 +415,11 @@ func browserCandidateSelect() string {
 }
 
 func (js *Store) GetBrowserCandidate(ctx context.Context, id string) (*BrowserCandidate, error) {
-	c, err := scanBrowserCandidate(js.S.DB().QueryRowContext(ctx, browserCandidateSelect()+` WHERE id=?`, id))
+	return getBrowserCandidateTx(ctx, js.S.DB(), id)
+}
+
+func getBrowserCandidateTx(ctx context.Context, q dbtx, id string) (*BrowserCandidate, error) {
+	c, err := scanBrowserCandidate(q.QueryRowContext(ctx, browserCandidateSelect()+` WHERE id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -604,6 +612,15 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 	// remains the at-most-once history after settlement; until an artifact
 	// winner closes the claim, retiring it could mint a fresh claim and repeat
 	// the provider navigation.
+	var expiringBindingID sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT binding_id FROM materialization_claims
+		WHERE candidate_id=? AND phase IN ('claimed','bound','route_issued','navigated')
+		  AND lease_until IS NOT NULL AND lease_until <= ?
+		  AND NOT EXISTS (SELECT 1 FROM effect_permits p
+		    WHERE p.claim_id=materialization_claims.id)`,
+		in.CandidateID, now).Scan(&expiringBindingID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=?
 		WHERE candidate_id=? AND phase IN ('claimed','bound','route_issued','navigated')
 		  AND lease_until IS NOT NULL AND lease_until <= ?
@@ -611,6 +628,11 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 		    WHERE p.claim_id=materialization_claims.id)`,
 		now, in.CandidateID, now); err != nil {
 		return nil, err
+	}
+	if expiringBindingID.Valid {
+		if err := consumeCloseAuthorizationsTx(ctx, tx, []string{expiringBindingID.String}, now); err != nil {
+			return nil, err
+		}
 	}
 	// The same artifact_winners anti-join the two sweeps carry. Without it a
 	// winner-bearing candidate that reconciliation deliberately left parked in
@@ -694,10 +716,14 @@ func (js *Store) GetMaterializationClaim(ctx context.Context, id string) (*Mater
 // MaterializationClaimByBindingID resolves the daemon claim owning a physical
 // scaffold binding. Binding IDs are unique across claim history.
 func (js *Store) MaterializationClaimByBindingID(ctx context.Context, bindingID string) (*MaterializationClaim, error) {
+	return materializationClaimByBindingIDTx(ctx, js.S.DB(), bindingID)
+}
+
+func materializationClaimByBindingIDTx(ctx context.Context, q dbtx, bindingID string) (*MaterializationClaim, error) {
 	if strings.TrimSpace(bindingID) == "" {
 		return nil, nil
 	}
-	c, err := claimScan(js.S.DB().QueryRowContext(ctx, claimSelect+` WHERE binding_id=?`, bindingID))
+	c, err := claimScan(q.QueryRowContext(ctx, claimSelect+` WHERE binding_id=?`, bindingID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -784,11 +810,74 @@ func (js *Store) CandidateForAttempt(ctx context.Context, jobID string, jobAttem
 // IDs are minted at claim creation. A live claim may replace its tab while
 // bound or route_issued; navigated and settled tab fences are immutable.
 func (js *Store) BindMaterialization(ctx context.Context, claimID, bindingID string, holderGeneration, profileRevision, tabID int64) error {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := bindMaterializationTx(ctx, tx, claimID, bindingID, holderGeneration, profileRevision, tabID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// BindMaterializationWithLeaseOwner is institutionalBind's atomic entry
+// point (internal/browser/bridge.go): the physical-resource acknowledgement
+// and the authentication-entry lease's owner-binding side channel
+// (claim-observation-protocol.md §4.1) commit or roll back together. A
+// fenced no-op on the lease side (expired/reassigned/wrong holder) fails the
+// whole bind with ErrMaterializationStale — matching BindMaterialization's
+// own stale outcome — instead of leaving a bound scaffold whose lease never
+// recorded it, which would let a later navigate_existing/focus_owner arm
+// while nothing durable names this surface as the owner. authenticationClaimID
+// empty means the candidate's institution profile carries no claim (nothing
+// to record); the bind proceeds as a plain BindMaterialization.
+func (js *Store) BindMaterializationWithLeaseOwner(ctx context.Context, claimID, bindingID string, holderGeneration, profileRevision, tabID int64, authenticationClaimID, ownerJobID string) error {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := bindMaterializationTx(ctx, tx, claimID, bindingID, holderGeneration, profileRevision, tabID); err != nil {
+		return err
+	}
+	if authenticationClaimID != "" {
+		res, err := setAuthenticationEntryLeaseOwnerBindingTx(ctx, tx, authenticationClaimID, ownerJobID, holderGeneration, bindingID, tabID)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return err
+		} else if n == 0 {
+			// Distinguish "no lease was ever reserved for this claim" (an
+			// explicit focus-driven bind that never went through
+			// authentication-claim arbitration — nothing to fence against,
+			// a benign no-op exactly like the old best-effort side channel)
+			// from "a lease row exists but did not fence-match" (expired,
+			// reassigned, or a different holder generation/owner — a real
+			// fence failure that must fail the whole bind rather than leave
+			// a bound scaffold no lease names as owned).
+			var exists int
+			existsErr := tx.QueryRowContext(ctx,
+				`SELECT 1 FROM authentication_entry_leases WHERE authentication_claim_id=?`,
+				authenticationClaimID).Scan(&exists)
+			if existsErr != nil && !errors.Is(existsErr, sql.ErrNoRows) {
+				return existsErr
+			}
+			if existsErr == nil {
+				return ErrMaterializationStale
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+func bindMaterializationTx(ctx context.Context, q dbtx, claimID, bindingID string, holderGeneration, profileRevision, tabID int64) error {
 	if claimID == "" || bindingID == "" || tabID < 0 {
 		return errors.New("materialization binding requires claim, binding ID, and nonnegative tab ID")
 	}
 	now := store.Now()
-	res, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims
+	res, err := q.ExecContext(ctx, `UPDATE materialization_claims
 		SET phase='bound', tab_id=?, updated_at=?
 		WHERE id=? AND binding_id=? AND browser_holder_generation=? AND phase='claimed'
 		  AND (lease_until IS NULL OR lease_until > ?)
@@ -819,7 +908,7 @@ func (js *Store) BindMaterialization(ctx context.Context, claimID, bindingID str
 	// A live scaffold can disappear before navigation. Allow the same
 	// holder/profile to rebind a bound or route-issued claim to its replacement
 	// tab without changing its route phase or issuance ordinal.
-	res, err = js.S.DB().ExecContext(ctx, `UPDATE materialization_claims
+	res, err = q.ExecContext(ctx, `UPDATE materialization_claims
 		SET tab_id=?, updated_at=?
 		WHERE id=? AND binding_id=? AND browser_holder_generation=? AND phase IN ('bound','route_issued')
 		  AND tab_id<>?
@@ -847,7 +936,7 @@ func (js *Store) BindMaterialization(ctx context.Context, claimID, bindingID str
 	}
 
 	var present int
-	err = js.S.DB().QueryRowContext(ctx, `SELECT 1
+	err = q.QueryRowContext(ctx, `SELECT 1
 		FROM materialization_claims m
 		JOIN browser_candidates c ON c.id=m.candidate_id
 		JOIN institution_profiles p ON p.id=c.institution_profile_id
@@ -1034,6 +1123,9 @@ func (js *Store) SettleMaterialization(ctx context.Context, claimID, bindingID s
 	} else if n != 1 {
 		return ErrMaterializationStale
 	}
+	if err := consumeCloseAuthorizationsTx(ctx, tx, []string{bindingID}, now); err != nil {
+		return err
+	}
 	res, err = tx.ExecContext(ctx, `UPDATE browser_candidates SET status='succeeded', updated_at=?
 		WHERE id=? AND institution_profile_revision=?
 		  AND EXISTS (
@@ -1125,6 +1217,13 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id)`, stamp, stamp); err != nil {
 		return nil, err
 	}
+	retiredBindings := make([]string, len(expired))
+	for i, c := range expired {
+		retiredBindings[i] = c.BindingID
+	}
+	if err := consumeCloseAuthorizationsTx(ctx, tx, retiredBindings, stamp); err != nil {
+		return nil, err
+	}
 	// Claims protected by any authorized institutional effect remain live
 	// after its permit settles and after their diagnostic lease expires. The
 	// candidate stays owned until the artifact winner closes the claim.
@@ -1155,6 +1254,29 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var retiredBindings []string
+	staleRows, err := tx.QueryContext(ctx, `SELECT binding_id FROM materialization_claims
+		WHERE browser_holder_generation<>?
+		  AND phase IN ('claimed','bound','route_issued','navigated')
+		  AND (lease_until IS NULL OR lease_until > ?)
+		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id)`,
+		currentGeneration, now)
+	if err != nil {
+		return 0, err
+	}
+	for staleRows.Next() {
+		var bindingID string
+		if err := staleRows.Scan(&bindingID); err != nil {
+			_ = staleRows.Close()
+			return 0, err
+		}
+		retiredBindings = append(retiredBindings, bindingID)
+	}
+	if err := staleRows.Err(); err != nil {
+		_ = staleRows.Close()
+		return 0, err
+	}
+	_ = staleRows.Close()
 	res, err := tx.ExecContext(ctx, `UPDATE materialization_claims
 		SET phase='abandoned', updated_at=?
 		WHERE browser_holder_generation<>?
@@ -1167,6 +1289,9 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 	}
 	count, err := res.RowsAffected()
 	if err != nil {
+		return 0, err
+	}
+	if err := consumeCloseAuthorizationsTx(ctx, tx, retiredBindings, now); err != nil {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates

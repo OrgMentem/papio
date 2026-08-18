@@ -10,6 +10,14 @@ the foundation and corrected the slice order, the cardinality rule, the
 compatibility fallback, and the connectivity sequencing. This revision folds
 in all twelve of its prioritized changes.
 
+**Status (2026-08-19): Slices 1, 2a, 2b, 3, and 4 have shipped** (per-slice
+markers below), on top of Slice 0 (`b550a9d` + review-fix commit). This file
+is not deletable yet: per AGENTS.md's `dev/active/` discipline, a plan
+leaves this directory only after whatever is still normative is salvaged
+into an ADR, and the design invariants and test scenarios here have not yet
+been validated against real institutional traffic in the field — that
+evidence, not the code landing, is the remaining gate on deletion.
+
 ## The field failure (2026-08-18, operator's browser)
 
 One *papio* tab group with ~17 tabs — six-plus IdP sign-in tabs, several
@@ -261,6 +269,8 @@ The smallest slice with most operator value; no aggressive cleanup.
 
 ### Slice 1 — harness seams (test code)
 
+**SHIPPED 2026-08-18** (`e2c7c45`).
+
 Network/online/offline seam and navigation-error events in `BridgeDeps` +
 `fake-tabs.ts` (genuinely absent today); a lifecycle helper formalizing the
 update-simulation pattern (`background.test.ts:6035-6061`); full background
@@ -270,12 +280,19 @@ generic auth detection lands here with its seam.
 
 ### Slice 2 — durable identity, adoption, and the close transaction
 
+**SHIPPED**: 2a `e2c7c45` (2026-08-18), 2b `06892c7` (2026-08-18).
+
 Pre-split (size): **2a** schema/migration, **2b** adoption + close.
 
 - 2a: the `storage.local` birth certificate (above) as the ledger's URL-free
   successor; legacy raw-URL entries redacted on migration; entries without
   `jobID` retained for manual review. The record is a birth certificate for
-  a daemon binding — never a second claim or scheduling record.
+  a daemon binding — never a second claim or scheduling record. **Shipped
+  as designed**: `ManagedTabLedgerEntry`, `PRIVATE_HANDOFF_LEDGER_URL`, and
+  `managedTabURLFamily` are deleted from `background.ts`; `ledger.ts`'s
+  `SurfaceBirthRecord` carries only an opaque `binding_id`, an
+  `origin_digest` (SHA-256 of scheme+host+port), and bookkeeping fields —
+  no route, host, title, or DOI.
 - 2b: restart-class validation (SW restart: IDs valid, session intact;
   update: IDs valid, session wiped; browser restart: all IDs invalid) —
   every adopted ID re-proven via `tabs.get`/query plus scaffold identity
@@ -300,9 +317,14 @@ Pre-split (size): **2a** schema/migration, **2b** adoption + close.
 - **Migration promise, narrowed:** only exact current bindings and
   self-identifying scaffolds are cleaned automatically; pre-cutover
   ambiguous tabs (ledger evidence already erased) go to a bounded one-time
-  operator review. No inference from group/window/title.
+  operator review. No inference from group/window/title. **Shipped**: the
+  review queue surfaces through the existing popup stray-tabs card
+  (`orphanTabStatus`/`legacyLedgerReview` in `background.ts`).
 
 ### Slice 3 — claim-observation protocol and the authentication-entry lease
+
+**SHIPPED**: protocol design gate `e2c7c45` (2026-08-18); implementation
+`7662f6a` (2026-08-18).
 
 Daemon-side, on the shipped Phase 1-3 projections. **Gated on a written
 protocol design** (four-site parity) before implementation:
@@ -336,16 +358,24 @@ protocol design** (four-site parity) before implementation:
   has no latch).
 - Legacy extension claim code (`federatedLoginOwners`, v2 hash keys,
   `parkHandoffWaitingForSession` collision path) retired in the same
-  cutover — no second authority.
+  cutover — no second authority. **Shipped**: `extension/src/federated-claim.ts`
+  is deleted; `federatedLoginOwners`/`parkHandoffWaitingForSession` no
+  longer exist as code (comment-only references to the retirement remain).
 
 ### Slice 4 — automatic drives ride materialization claims (Phase 5 cutover)
+
+**SHIPPED 2026-08-19** (`5b866d2`).
 
 Scaffold-first becomes structural: every automatically owned institutional
 tab begins as the opaque `materialize.html#<binding>` scaffold —
 claim → binding → inactive scaffold tab → bind ack (both create **and**
 reuse branches) → revalidation → connectivity admission + effect permit →
-transient route → same-tab navigation → navigated ack. Persisted offer URLs
-disappear; re-offers revalidate the claim instead of re-opening; the
+transient route → same-tab navigation → navigated ack. Persisted offer
+URLs disappear (**shipped**: `storage.local`'s birth certificate carries
+no route; the in-memory `offerURLs` map that remains is worker-only and
+excluded from every save, serving the still-separate explicit-engagement
+`handoff_link_v1` path, not automatic materialization); re-offers
+revalidate the claim instead of re-opening; the
 4-per-poll offer batch becomes claim-paced. Connectivity admission precedes
 route issuance by construction. Rollout order: daemon/host first (feature
 advertised, automatic routing dark) → extension second (emits nothing until

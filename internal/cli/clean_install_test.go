@@ -99,12 +99,12 @@ func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 	}
 	databaseReady := false
 	for _, check := range doctorReport.Checks {
-		if check.Name == "database" && check.Status == doctor.Pass && strings.Contains(check.Detail, "schema version 42") {
+		if check.Name == "database" && check.Status == doctor.Pass && strings.Contains(check.Detail, "schema version 43") {
 			databaseReady = true
 		}
 	}
 	if !databaseReady {
-		t.Fatalf("fresh-profile doctor database check missing schema version 42: %+v", doctorReport.Checks)
+		t.Fatalf("fresh-profile doctor database check missing schema version 43: %+v", doctorReport.Checks)
 	}
 
 	cfg, err := config.Load(configPath)
@@ -127,8 +127,8 @@ func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 		t.Fatal("daemon bootstrap did not construct a scheduler")
 	}
 	version, err := system.Store.UserVersion(ctx)
-	if err != nil || version != 42 {
-		t.Fatalf("fresh schema version = %d, %v; want 42", version, err)
+	if err != nil || version != 43 {
+		t.Fatalf("fresh schema version = %d, %v; want 43", version, err)
 	}
 
 	stub := &cleanInstallResolver{}

@@ -2870,12 +2870,16 @@ function observationAck(
 }
 /** Drives `jobID`'s explicit open through an `open_new` consult outcome and
  * answers the resulting handoff_link_request, leaving a live, ledgered
- * claim-owned tab and an established claimGrants entry — the state every
- * later claim_observation-emitting event (entitled_landing, owner_closed,
- * navigation_error) requires. Assumes helloAck already negotiated
- * handoff_link_v1 + AUTH_CLAIM, `jobID` is already a cold candidate job
- * (coldClaimJob, seeded before bridge.start()), and seedClaimCandidate has
- * already run for it. */
+ * directly-minted tab and an established claimGrants entry — the state
+ * every later claim_observation-emitting event (entitled_landing,
+ * owner_closed, navigation_error) requires. Per the architecture ruling,
+ * an explicit operator gesture on a granted claim mints the fresh link
+ * directly (no materialize.html scaffold, no daemon materialization
+ * binding — that path is reserved for the daemon's own automatic Slice 4
+ * pipeline). Assumes helloAck already negotiated handoff_link_v1 +
+ * AUTH_CLAIM, `jobID` is already a cold candidate job (coldClaimJob,
+ * seeded before bridge.start()), and seedClaimCandidate has already run
+ * for it. */
 async function openClaimWithNewSurface(
   h: Harness,
   jobID: string,
@@ -2905,14 +2909,10 @@ async function openClaimWithNewSurface(
     "handoff_link_request",
     framesBefore,
   );
-  // Slice 4 (plan lines 341-360): scaffold-first — the daemon's mint RPC is
-  // requested only AFTER an inactive materialize.html#<binding> scaffold
-  // exists, never before. No provider URL leaks into a created-tab record.
-  const scaffoldCreated = h.tabs.created[tabsCreatedBefore];
-  expect(scaffoldCreated?.active).toBe(false);
-  expect(scaffoldCreated?.url).toMatch(
-    /^chrome-extension:\/\/test\/materialize\.html#[A-Za-z0-9_-]{8,128}$/u,
-  );
+  // No tab exists yet: the explicit direct mint never self-mints a
+  // scaffold — the daemon's mint RPC is requested before any tab exists,
+  // exactly as before Slice 3/4.
+  expect(h.tabs.created).toHaveLength(tabsCreatedBefore);
   await h.port.inbound(
     nativeResult("handoff_link_result", {
       request_id: linkRequest.payload["request_id"],
@@ -2925,13 +2925,10 @@ async function openClaimWithNewSurface(
     h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id ??
     -1;
   expect(tabID).toBeGreaterThanOrEqual(0);
-  // The scaffold is navigated in place — never replaced by a second tab.
+  // One tab, created directly with the final URL — no separate scaffold
+  // navigation step.
   expect(h.tabs.created).toHaveLength(tabsCreatedBefore + 1);
-  expect(
-    h.tabs.updates.some(
-      (update) => update.id === tabID && update.properties.url === url,
-    ),
-  ).toBe(true);
+  expect(h.tabs.created[tabsCreatedBefore]?.url).toBe(url);
   return tabID;
 }
 
@@ -3007,7 +3004,7 @@ test("Slice 3: N cold institutional jobs with live candidates consult independen
   expect(internals.claimDependentCounts.get(jobC)).toBe(2);
 });
 
-test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fresh candidate re-offers, each binds its own scaffold and navigates a transient route — no persisted URL anywhere", async () => {
+test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fresh institutional candidate offers and each binds its OWN daemon-granted scaffold — no local binding synthesis, no persisted URL anywhere", async () => {
   const jobA = "job_claim_scenario3_a";
   const jobB = "job_claim_scenario3_b";
   const jobC = "job_claim_scenario3_c";
@@ -3017,7 +3014,15 @@ test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fres
   });
   installManagedTabLedger(h, {});
   await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await h.port.inbound(
+    helloAck({
+      features: [
+        "handoff_link_v1",
+        AUTH_CLAIM,
+        "institutional_materialization_v1",
+      ],
+    }),
+  );
   await seedClaimCandidate(h, jobA, "cand_s3up_a001");
   await seedClaimCandidate(h, jobB, "cand_s3up_b001");
   await seedClaimCandidate(h, jobC, "cand_s3up_c001");
@@ -3070,30 +3075,85 @@ test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fres
     }),
   );
 
-  // The daemon resolves the claim and schedules eligible siblings: each
-  // gets a FRESH candidate — standing in for the daemon's revalidated
-  // per-sibling route (plan lines 332-336) — and each must bind its OWN
-  // scaffold and transient route independently, never reusing jobA's tab
-  // or URL.
+  // The daemon resolves the claim and admits each eligible sibling through
+  // a FRESH institutional_candidate_offer (Slice 4's real automatic
+  // pipeline) — never a locally-synthesized binding. Each sibling must run
+  // its OWN institutional_claim_request/institutional_bind_request round
+  // trip and land on its own daemon-issued binding_id and scaffold tab,
+  // never reusing jobA's tab or claim.
   const siblingTabs: number[] = [];
-  for (const [jobID, candidateID, url] of [
-    [jobB, "cand_s3up_b_resume", `https://${PROVIDER_HOST}/fresh?s3up=b`],
-    [jobC, "cand_s3up_c_resume", `https://${PROVIDER_HOST}/fresh?s3up=c`],
+  const siblingBindings: string[] = [];
+  for (const [jobID, candidateID, bindingID] of [
+    [jobB, "cand_s3up_b_resume", "bind_s3up_b01"],
+    [jobC, "cand_s3up_c_resume", "bind_s3up_c01"],
   ] as const) {
-    await seedClaimCandidate(h, jobID, candidateID);
-    siblingTabs.push(await openClaimWithNewSurface(h, jobID, candidateID, url));
+    const framesBefore = h.port.posted.length;
+    const tabsCreatedBefore = h.tabs.created.length;
+    await h.port.inbound(candidateOffer(jobID, candidateID));
+    const claim = await h.port.waitForFrame(
+      "institutional_claim_request",
+      framesBefore,
+    );
+    expect(claim.job_id).toBe(jobID);
+    expect(claim.payload["candidate_id"]).toBe(candidateID);
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "institutional_claim_response",
+      msg_id: `claim_response_${bindingID}`,
+      job_id: jobID,
+      seq: 3,
+      payload: {
+        request_id: claim.payload["request_id"],
+        outcome: "claimed",
+        candidate_id: candidateID,
+        claim_id: `claim_${bindingID}`,
+        binding_id: bindingID,
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+      },
+    });
+    const bind = await h.port.waitForFrame(
+      "institutional_bind_request",
+      framesBefore,
+    );
+    expect(bind.payload["binding_id"]).toBe(bindingID);
+    const scaffoldCreated = h.tabs.created[tabsCreatedBefore];
+    expect(scaffoldCreated?.active).toBe(false);
+    expect(scaffoldCreated?.url).toBe(
+      `chrome-extension://test/materialize.html#${bindingID}`,
+    );
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "institutional_bind_response",
+      msg_id: `bind_response_${bindingID}`,
+      job_id: jobID,
+      seq: 4,
+      payload: {
+        request_id: bind.payload["request_id"],
+        outcome: "bound",
+        claim_id: `claim_${bindingID}`,
+        binding_id: bindingID,
+      },
+    });
+    const correlation = h.backend.store.materializations?.[jobID];
+    expect(correlation).toMatchObject({ phase: "bound", binding_id: bindingID });
+    const tabID = correlation?.tab_id ?? -1;
+    expect(tabID).toBeGreaterThanOrEqual(0);
+    siblingTabs.push(tabID);
+    siblingBindings.push(bindingID);
   }
 
   expect(h.tabs.created).toHaveLength(3);
   expect(new Set([tabA, ...siblingTabs]).size).toBe(3);
+  expect(new Set(siblingBindings).size).toBe(2);
   expect(
-    h.frames().filter((frame) => frame.type === "handoff_link_request"),
-  ).toHaveLength(3);
-  for (const jobID of [jobA, jobB, jobC]) {
-    expect(
-      h.backend.store.activeJobs.find((job) => job.job_id === jobID),
-    ).toMatchObject({ status: "accepted" });
-  }
+    h.backend.store.activeJobs.find((job) => job.job_id === jobA),
+  ).toMatchObject({ status: "accepted" });
+  // Siblings resumed through the real pipeline are driven by their own
+  // materialization correlation (asserted per-sibling above, phase
+  // "bound" with a distinct daemon-issued binding_id) — their ActiveJob
+  // status is whatever it already was from the earlier park, unchanged
+  // by the candidate offer itself.
   // Structural privacy invariant: no provider origin, and no offer-URL
   // spill, in any managed-state write across the whole resume sequence.
   const serialized = JSON.stringify(h.backend.store);
@@ -3355,7 +3415,74 @@ test("Slice 3: a claim_observation outbox entry replays before any lease-renewin
   await starting;
 });
 
-test("Slice 3: two concurrent automatic drives for the same job produce exactly one mint", async () => {
+test("Slice 3: a job_offer delivered before the startup outbox replay's ack does not stall the inbound chain", async () => {
+  const jobA = "job_claim_deadlock_owner";
+  const jobD = "job_claim_deadlock_offer";
+  const candidateA = "cand_deadlock_a001";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobA)],
+  });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobA, candidateA);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobA,
+    candidateA,
+    `https://${PROVIDER_HOST}/fresh?deadlock=1`,
+  );
+  const internals = h.bridge as unknown as {
+    emitClaimObservation(
+      jobID: string,
+      tabID: number,
+      eventKind: string,
+      latch?: boolean,
+    ): Promise<void>;
+  };
+  await internals.emitClaimObservation(jobA, tabID, "wall_observed", true);
+  await h.port.waitForFrame("claim_observation");
+  // Never acked: this observation survives, unresolved, into the restart.
+
+  const restarted = restartWorker(h);
+  const starting = restarted.bridge.start();
+  await restarted.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }),
+  );
+  // The startup replay's own claim_observation is now in flight, unacked.
+  // A job_offer delivered on the SAME serialized inbound FIFO before that
+  // ack must still be accepted promptly: the pre-fix bug awaited the
+  // replay inside the surfaceReady barrier every job_offer handler also
+  // awaits, so the ack — which can only arrive back through this same FIFO
+  // — queued behind the offer and neither one ever resolved. If this
+  // regresses, the awaited `inbound` call below hangs and the test times
+  // out.
+  await restarted.port.inbound(jobOffer(jobD));
+  expect(
+    restarted
+      .frames()
+      .filter((frame) => frame.type === "job_accept" && frame.job_id === jobD),
+  ).toHaveLength(1);
+
+  // The outbox replay itself still completes normally afterward.
+  const replay = await restarted.port.waitForFrame("claim_observation");
+  expect(replay.job_id).toBe(jobA);
+  const observationID = replay.payload["observation_id"] as string;
+  await restarted.port.inbound(
+    observationAck(jobA, replay.payload["request_id"], {
+      outcome: "duplicate",
+      gate_occurrence_id: "occ_deadlock_ack01",
+      browser_holder_generation: 1,
+    }),
+  );
+  expect(
+    restarted.claimObservationOutbox.current[observationID],
+  ).toBeUndefined();
+  await starting;
+});
+
+test("Slice 3: two concurrent automatic drives for the same job produce exactly one consult", async () => {
   const jobID = "job_claim_mint_latch";
   const candidateID = "cand_mint_latch01";
   const h = makeHarness({
@@ -3379,6 +3506,21 @@ test("Slice 3: two concurrent automatic drives for the same job produce exactly 
   };
   const job = h.backend.store.activeJobs.find((j) => j.job_id === jobID)!;
   const first = internals.openFreshHandoff(jobID, job, "automatic");
+
+  // A second automatic drive races in while the first is still mid-consult
+  // (before the daemon's authentication_claim_response arrives): the
+  // mintingFreshHandoffs latch is reserved BEFORE consultAuthenticationClaim
+  // runs, so it — not the consult outcome — is what makes two racing
+  // wakes produce exactly one authentication_claim_request.
+  const second = internals.openFreshHandoff(jobID, job, "automatic");
+  await expect(second).resolves.toEqual({
+    ok: false,
+    error: {
+      code: "handoff_opening",
+      message: "A sign-in surface for this job is already being created",
+    },
+  });
+
   const claimRequest = await h.port.waitForFrame(
     "authentication_claim_request",
   );
@@ -3392,36 +3534,27 @@ test("Slice 3: two concurrent automatic drives for the same job produce exactly 
       lease_until: "2030-01-01T00:00:00Z",
     }),
   );
-  const linkRequest = await h.port.waitForFrame("handoff_link_request");
-
-  // A second automatic drive races in while the first is mid-mint (past
-  // consult, inside requestFreshHandoffLink): the mintingFreshHandoffs latch
-  // — not the consult — is what makes two racing drives produce one mint.
-  const second = internals.openFreshHandoff(jobID, job, "automatic");
-  await expect(second).resolves.toEqual({
+  // Architecture ruling: an automatic drive never self-mints a
+  // materialization binding on a granted claim — it stays tabless and
+  // holds the grant for the daemon's own Slice 4 pipeline to drive.
+  await expect(first).resolves.toEqual({
     ok: false,
     error: {
-      code: "handoff_opening",
-      message: "A sign-in surface for this job is already being created",
+      code: "handoff_pending",
+      message: "The sign-in surface will open once the daemon materializes it",
     },
   });
 
-  await h.port.inbound(
-    nativeResult("handoff_link_result", {
-      request_id: linkRequest.payload["request_id"],
-      outcome: "opened",
-      url: `https://${PROVIDER_HOST}/fresh?latch=1`,
-    }),
-  );
-  await expect(first).resolves.toEqual({ ok: true, opened: true });
-
-  expect(h.tabs.created).toHaveLength(1);
+  expect(h.tabs.created).toHaveLength(0);
   expect(
     h.frames().filter((frame) => frame.type === "authentication_claim_request"),
   ).toHaveLength(1);
   expect(
     h.frames().filter((frame) => frame.type === "handoff_link_request"),
-  ).toHaveLength(1);
+  ).toHaveLength(0);
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === jobID),
+  ).toMatchObject({ status: "queued", tab_id: -1 });
 });
 
 test("Slice 3: trigger routing — explicit open on a claim owned elsewhere focuses the owner tab, automatic parks", async () => {
@@ -17418,6 +17551,57 @@ test("Slice 2b: a browser restart invalidates tab-ID authority; records survive 
   expect(await internals.ownedMemberTab(tabID, ledgerAfter)).toBeUndefined();
   // The record itself is never deleted — it survives, review-only.
   expect(ledgerAfter[String(tabID)]).toBeDefined();
+});
+
+test("Slice 2b: a browser restart's fresh epoch retains a stale pending tombstone's tab instead of closing it", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    browserEpoch: string | undefined;
+    replayPendingCloseTombstones: () => Promise<void>;
+  };
+  const preRestartEpoch = internals.tabLedgerCache[String(tabID)]?.browser_epoch;
+  internals.tabLedgerCache = {
+    [String(tabID)]: {
+      ...internals.tabLedgerCache[String(tabID)]!,
+      pending_close: {
+        authorization_id: "auth-stale-0001",
+        nonce: "nonce-stale-0001",
+        holder_generation: 1,
+        recorded_at: 1_700_000_000_000,
+        disposition: "scaffold_idle",
+      },
+    },
+  };
+  // A genuine browser restart mints a fresh epoch no existing record can
+  // re-prove against (classifyRestart's "browser" branch) — simulated
+  // directly on the same worker lifetime's epoch field, matching the
+  // adjacent epoch-invalidation test's technique, since a real restart
+  // spins up an entirely separate process with no shared harness state.
+  expect(preRestartEpoch).toBeDefined();
+  internals.browserEpoch = "post-restart-epoch";
+
+  const framesBefore = h.port.posted.length;
+  await internals.replayPendingCloseTombstones();
+
+  // No close authorization was ever requested for a tab-ID whose ledger
+  // authority died with the old epoch — never authorize or remove
+  // against it.
+  expect(
+    h.frames().slice(framesBefore).some((f) => f.type === "surface_close_request"),
+  ).toBe(false);
+  expect(h.tabs.removed).not.toContain(tabID);
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+
+  // The record itself survives — ceded for the standing operator-review
+  // path, its pending tombstone and job binding cleared so nothing acts on
+  // it again.
+  const record = internals.tabLedgerCache[String(tabID)];
+  expect(record?.ceded).toBe(true);
+  expect(record?.binding_id).toBe(bindingID);
+  expect(record?.pending_close).toBeUndefined();
 });
 
 test("Slice 2b: adoption ignores a papio-titled group with no owned member", async () => {

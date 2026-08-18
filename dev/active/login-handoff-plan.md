@@ -1,5 +1,17 @@
 # Attempt five: institutional sign-in handoffs without tab litter
 
+**Superseded (2026-08-19):** succeeded by `dev/active/surface-lifecycle-plan.md`,
+which has shipped through Slice 4 (`b550a9d` through `5b866d2`). This file is
+retained rather than deleted because the successor still normatively depends
+on it without inlining: its "Amendments to attempt five's 'do not re-attempt'
+list" section and its "Abort criteria" section ("Attempt five's carry over
+verbatim") both point back here instead of restating the list, the accepted
+mid-engagement takeover boundary, and the working discipline below. Per
+AGENTS.md's `dev/active/` rule, an active document may not depend on another
+`dev/active/` file for normative content that would vanish on deletion — this
+file is deletable only once those carried-over lists are inlined into the
+successor plan or an ADR.
+
 Supersedes the reverted restructure (`dev/scratch/oracle/login-restructure-reverted.patch`).
 Written after a four-angle plan review and one iteration round with the
 reviewers; findings in `dev/scratch/oracle/login-review-findings.md`. This

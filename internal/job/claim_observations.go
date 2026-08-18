@@ -56,12 +56,22 @@ func (r ClaimObservationRecord) validate() error {
 // new observation_id whose event_ordinal does not exceed the highest
 // applied ordinal for this gate_occurrence_id.
 func (js *Store) CheckClaimObservationJournal(ctx context.Context, observationID, gateOccurrenceID string, eventOrdinal int64) (string, error) {
+	return checkClaimObservationJournalTx(ctx, js.S.DB(), observationID, gateOccurrenceID, eventOrdinal)
+}
+
+// checkClaimObservationJournalTx is CheckClaimObservationJournal's core.
+// ApplyClaimObservation (claim_observation_apply.go) runs it first, inside
+// the observation's own transaction and strictly before any lease read —
+// GetAuthenticationEntryLease performs a mutating expiry UPDATE for an
+// overdue reserved lease, and §3 requires a duplicate/stale/rejected
+// observation to be a true no-op that never touches lease state.
+func checkClaimObservationJournalTx(ctx context.Context, q dbtx, observationID, gateOccurrenceID string, eventOrdinal int64) (string, error) {
 	if strings.TrimSpace(observationID) == "" || strings.TrimSpace(gateOccurrenceID) == "" {
 		return "", errors.New("claim observation journal check requires observation and occurrence ids")
 	}
 	var existingOrdinal int64
 	var existingOccurrence string
-	err := js.S.DB().QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT event_ordinal, gate_occurrence_id FROM claim_observation_journal WHERE observation_id=?`,
 		observationID).Scan(&existingOrdinal, &existingOccurrence)
 	switch {
@@ -75,7 +85,7 @@ func (js *Store) CheckClaimObservationJournal(ctx context.Context, observationID
 		return "", err
 	}
 	var maxOrdinal sql.NullInt64
-	if err := js.S.DB().QueryRowContext(ctx,
+	if err := q.QueryRowContext(ctx,
 		`SELECT MAX(event_ordinal) FROM claim_observation_journal WHERE gate_occurrence_id=?`,
 		gateOccurrenceID).Scan(&maxOrdinal); err != nil {
 		return "", err
@@ -96,10 +106,14 @@ func (js *Store) CheckClaimObservationJournal(ctx context.Context, observationID
 // against a concurrent double-apply this single-writer daemon should never
 // reach in practice.
 func (js *Store) RecordClaimObservation(ctx context.Context, in ClaimObservationRecord) error {
+	return recordClaimObservationTx(ctx, js.S.DB(), in)
+}
+
+func recordClaimObservationTx(ctx context.Context, q dbtx, in ClaimObservationRecord) error {
 	if err := in.validate(); err != nil {
 		return err
 	}
-	_, err := js.S.DB().ExecContext(ctx, `
+	_, err := q.ExecContext(ctx, `
 		INSERT INTO claim_observation_journal
 		  (observation_id, gate_occurrence_id, authentication_claim_id, binding_id,
 		   browser_holder_generation, event_kind, event_ordinal, applied_at)
@@ -132,13 +146,25 @@ func (js *Store) EligibleAuthenticationClaimDependents(ctx context.Context, auth
 // binding — an idle scaffold that never advanced past nothing, or a claim
 // already resolved, is not this call's business.
 func (js *Store) AbandonMaterializationClaimByBinding(ctx context.Context, bindingID string) error {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := abandonMaterializationClaimByBindingTx(ctx, tx, bindingID, store.Now()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func abandonMaterializationClaimByBindingTx(ctx context.Context, q dbtx, bindingID, now string) error {
 	if strings.TrimSpace(bindingID) == "" {
 		return errors.New("binding is required")
 	}
-	_, err := js.S.DB().ExecContext(ctx, `
+	_, err := q.ExecContext(ctx, `
 		UPDATE materialization_claims SET phase='abandoned', updated_at=?
 		 WHERE binding_id=? AND phase IN ('claimed','bound','route_issued','navigated')`,
-		store.Now(), bindingID)
+		now, bindingID)
 	return err
 }
 
@@ -150,10 +176,41 @@ func (js *Store) ConsumeCloseAuthorizationForBinding(ctx context.Context, bindin
 	if strings.TrimSpace(bindingID) == "" {
 		return errors.New("binding is required")
 	}
-	_, err := js.S.DB().ExecContext(ctx, `
+	return consumeCloseAuthorizationTx(ctx, js.S.DB(), bindingID, now.UTC().Format(time.RFC3339Nano))
+}
+
+func consumeCloseAuthorizationTx(ctx context.Context, q dbtx, bindingID, now string) error {
+	_, err := q.ExecContext(ctx, `
 		UPDATE close_authorizations
 		   SET status='consumed', consumed_at=?
 		 WHERE binding_id=? AND status='issued'`,
-		now.UTC().Format(time.RFC3339Nano), bindingID)
+		now, bindingID)
 	return err
+}
+
+// consumeCloseAuthorizationsTx marks every live ('issued') close-authorization
+// token for the given bindings 'consumed', in the caller's own transaction.
+// It exists so every daemon-side materialization-claim terminal transition —
+// not only the owner_closed observation reducer — retires whatever token it
+// mints: SettleMaterialization, ClaimMaterialization's own lease-timeout
+// abandon, ReconcileMaterializationClaims, and AbandonStaleMaterializations
+// (institutional_materialization.go) all call this right after they retire
+// the claim(s) owning those bindings. Without it, a close authorized for a
+// disposition the extension never explicitly acks (the common case: the
+// daemon itself drove the claim to settled/abandoned, so surface_close_request
+// for that disposition may never arrive) is left 'issued' forever, and
+// IssueCloseAuthorization's idempotent replay keeps re-minting the same
+// already-moot token. Empty binding ids are skipped rather than rejected —
+// callers pass whatever a claim's binding_id column held, which is legally
+// empty for pre-bind claims.
+func consumeCloseAuthorizationsTx(ctx context.Context, q dbtx, bindingIDs []string, now string) error {
+	for _, id := range bindingIDs {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if err := consumeCloseAuthorizationTx(ctx, q, id, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -220,8 +220,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 42 {
-		t.Fatalf("user_version = %d, %v; want 42", version, err)
+	if err != nil || version != 43 {
+		t.Fatalf("user_version = %d, %v; want 43", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -293,8 +293,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 42 {
-		t.Fatalf("user_version = %d, %v; want 42", version, err)
+	if err != nil || version != 43 {
+		t.Fatalf("user_version = %d, %v; want 43", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)

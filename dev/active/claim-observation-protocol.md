@@ -1,11 +1,14 @@
 # Claim-observation protocol: written design (Slice 3 gate)
 
-Status: **design, not shipped**. This document is the deliverable
-`dev/active/surface-lifecycle-plan.md` line 307 requires before Slice 3
-implementation starts ("Gated on a written protocol design (four-site
-parity) before implementation"). It specifies wire messages, storage,
-ordering, lease, and rollout precisely enough for three implementing agents
-— Go daemon (`internal/protocol`, `internal/browser/bridge.go`,
+Status: **implemented, shipped**. The design below shipped in two parts: the
+protocol design (this document) landed in `e2c7c45` (2026-08-18); the full
+four-site implementation landed in `7662f6a` (2026-08-18), with Slice 4's
+consumption of the claim-bound path in `5b866d2` (2026-08-19). This document
+was the deliverable `dev/active/surface-lifecycle-plan.md` line 330 required
+before Slice 3 implementation started ("Gated on a written protocol design
+(four-site parity) before implementation"). It specifies wire messages,
+storage, ordering, lease, and rollout precisely enough for three implementing
+agents — Go daemon (`internal/protocol`, `internal/browser/bridge.go`,
 `internal/store/migrations`), TS extension (`extension/src/protocol.ts`,
 `extension/src/background.ts`), and JSON Schema
 (`protocol/browser-v1.schema.json`) — to build without negotiating shape
@@ -13,6 +16,17 @@ between themselves. It supersedes no ADR; it fills in the mechanism ADR-0022
 Phase 4 reserved (Decisions 2, 3, 5, 6) and the August-reviewed arbitration
 design referenced by the plan (`navigate_existing` / `open_new` /
 `focus_owner` / `park`).
+
+Having shipped, this document now also serves as **the reference for the
+shipped wire contract** — the exact message shapes in §2, the
+ordering/idempotency rules in §3, and the storage/migration detail in §4 —
+until that content is salvaged into an ADR. Per AGENTS.md's `dev/active/`
+discipline ("a file leaves this directory when the work ships: salvage
+anything still normative into an ADR, then delete it" — and an ADR must
+never depend on a `dev/active/` file for normative content), this file
+cannot be deleted yet: it is deletable only once its normative wire-contract
+detail has a permanent ADR home, not merely because the code it describes
+has shipped.
 
 Every `file:symbol` citation below was read from the current tree before
 being written down (AGENTS.md's `dev/active/` discipline). §8 lists them

@@ -137,6 +137,43 @@ execution records kept during the initial build.
   rule counts *spending under contention* instead of attempts. A paper parked
   this way now says so specifically, rather than being indistinguishable from
   the whole day's allowance being gone.
+- **Institutional sign-ins are now brokered so only one tab per institution
+  ever asks for one.** The daemon now arbitrates every request for an
+  autonomous sign-in tab in one transaction over a durable
+  authentication-entry lease (migration `0042`, extending the
+  already-shipped `authentication_entry_leases` table and adding an
+  append-only `claim_observation_journal`): a job whose institution has no
+  live sign-in gets a fresh grant, a job whose institution is already
+  mid-sign-in is told to wait or focus the tab that has it, and every paper
+  waiting behind that one login resumes automatically, on its own freshly
+  revalidated route, the moment it succeeds. The lease is renewed only by
+  the human-paced wall/login/MFA/challenge events the extension reports —
+  never by a worker-local timer — and a duplicated or out-of-order report
+  can never mutate it twice, since every observation is journaled against a
+  strictly increasing sequence number. The daemon advertises this as
+  `institutional_authentication_claim_v1`, the 32nd and last protocol
+  feature the current fail-closed negotiation cap allows — any protocol
+  feature added after this one has to retire or fold in an existing one
+  first. An extension that has not yet negotiated it keeps behaving exactly
+  as before: tabless parking until you click Open.
+- **Automatic institutional offers no longer race every waiting paper into
+  the same poll.** Offering a candidate for automatic sign-in is now paced
+  by its authentication claim: an institution with a sign-in still
+  unresolved admits exactly one candidate per poll instead of one attempt
+  per paper at once, and an institution whose sign-in already has a live
+  owner never generates a second, redundant candidate for it while that
+  owner stands. Automatic admissions continue to share the existing
+  four-per-poll transport budget with every other kind of offer.
+- **The daemon now authorizes, one use at a time, every tab the extension
+  automatically closes.** Migration `0041` adds a `close_authorizations`
+  table issuing a single live token per browser tab, gated behind the new
+  `surface_close_v1` feature: the extension may close an idle,
+  never-engaged scaffold, a tab whose materialization already settled, or a
+  sign-in whose claim was abandoned, but only against a token the daemon
+  minted for that exact tab and reason — never on the tab's mere absence
+  from a poll, a lost connection, or a timer. An extension that has not yet
+  negotiated `surface_close_v1` keeps its existing closing behavior
+  unchanged.
 
 ### Fixed
 - **Sending a PDF from your browser no longer refuses every time.** The daemon

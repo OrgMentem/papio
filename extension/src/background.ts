@@ -2382,6 +2382,18 @@ export class Bridge {
    * drive-queue drains, materialization retries, and close paths; never by
    * hello/poll/read paths. */
   private surfaceReady: Promise<void> = Promise.resolve();
+  /** Resolves once the durable claim_observation outbox has finished its
+   * post-barrier replay (§4.5). Split from surfaceReady on purpose: that
+   * barrier's own callers (job offers, runtime opens, reads) must never
+   * block on a correlated ack this replay awaits on the SAME serialized
+   * inbound FIFO those callers can themselves be queued behind — only
+   * lease-renewing observation emission (consultAuthenticationClaim,
+   * enqueueClaimObservation) awaits this promise instead. */
+  private outboxReplayed: Promise<void> = Promise.resolve();
+  /** Serializes drainObservationOutbox: a drain already running absorbs a
+   * concurrent trigger as one more full pass instead of racing it. */
+  private outboxDrainRunning = false;
+  private outboxDrainRerunRequested = false;
   private readonly pageCaptureLoadWaiters = new Map<
     number,
     (loaded: boolean) => void
@@ -3992,18 +4004,25 @@ export class Bridge {
   private async bootstrapSurfaceLifecycle(): Promise<void> {
     await this.inLifecycleChain(async () => {
       this.restartClass = await this.classifyRestart();
-      // §4.5: a restarted worker must replay any outstanding
-      // claim_observation before any lease-renewing action runs — every
-      // caller of consultAuthenticationClaim/emitClaimObservation awaits
-      // surfaceReady first, so draining here, before this barrier resolves,
-      // is sufficient to order it ahead of every one of them.
       await this.hydrateClaimObservationOutbox();
-      await this.drainObservationOutbox();
       const ledger = await this.snapshotTabLedger();
       await this.reconcileHandoffGroups();
       await this.adoptWorkWindowFromOwnedMembers(ledger);
       await this.replayPendingCloseTombstones();
     });
+    // §4.5 corrective: a restarted worker must replay any outstanding
+    // claim_observation before any lease-renewing action runs, but
+    // draining it INSIDE the barrier above deadlocked the inbound FIFO —
+    // every caller of consultAuthenticationClaim/emitClaimObservation
+    // awaits surfaceReady, and so does onJobOffer for unrelated reasons;
+    // a job_offer delivered after hello_ack but before the replay's own
+    // correlated ack would block behind this barrier while that ack
+    // queues behind the job_offer on the SAME serialized chain. Schedule
+    // the drain after the barrier resolves instead — surfaceReady is free
+    // immediately, and outboxReplayed (awaited only by lease-renewing
+    // observation emission, never job offers or reads) tracks the replay
+    // separately.
+    this.scheduleObservationOutboxDrain();
   }
 
   /** Load the durable claim_observation outbox (chrome.storage.session) into
@@ -4190,6 +4209,28 @@ export class Bridge {
       if (pending === undefined) continue;
       const tabID = Number(key);
       if (!Number.isInteger(tabID) || tabID < 0) continue;
+      if (record.browser_epoch !== this.browserEpoch) {
+        // A tombstone minted under a prior browser epoch carries no live
+        // tab-ID authority (classifyRestart's browser-restart case: the
+        // numeric id may already have been reused by an unrelated tab).
+        // Never authorize or remove against it — cede the record to the
+        // standing operator-review path instead of risking a close/reuse
+        // collision.
+        await this.runTabLedgerTransaction((current) => {
+          const existing = current[key];
+          if (
+            existing === undefined ||
+            existing.binding_id !== record.binding_id
+          )
+            return { value: undefined, changed: false };
+          const next: SurfaceBirthRecord = { ...existing, ceded: true };
+          delete next.pending_close;
+          delete next.job_id;
+          current[key] = next;
+          return { value: undefined, changed: true };
+        });
+        continue;
+      }
       const disposition = isSurfaceCloseDisposition(pending.disposition)
         ? pending.disposition
         : "scaffold_idle";
@@ -6510,14 +6551,25 @@ export class Bridge {
   }
   /** Mints a fresh sign-in surface for `jobID`. Per plan lines 329-336: when
    * this job has a live institutional candidate, the daemon's claim
-   * arbitration is consulted before any tab exists — `open_new` proceeds to
-   * mint below; `navigate_existing`/`focus_owner` route to the claim's
-   * already-live owner tab through the renavigation fence; `park`/`refuse`
-   * never mint. A job with no candidate (institutional_candidate_offer
-   * never ran for it) skips consultation entirely and mints exactly as
-   * before Slice 3 — no daemon-side collision avoidance exists for it,
-   * matching the retirement of the extension-local federatedLoginOwners
-   * mechanism this function used to implement that with. */
+   * arbitration is consulted before any tab exists — `navigate_existing`/
+   * `focus_owner` route to the claim's already-live owner tab through the
+   * renavigation fence; `park`/`refuse` never mint. `open_new` grants this
+   * job's candidate the lease: an EXPLICIT operator gesture (the
+   * engagement the lease exists to gate) mints the fresh link directly
+   * below, exactly as before Slice 3; an AUTOMATIC drive never self-mints
+   * a materialization binding — the extension never runs its own
+   * claim/bind/scaffold sequence. It stays tabless and holds the grant;
+   * the daemon admits a fresh `institutional_candidate_offer` for this
+   * now-admitted claim within its next poll (Slice 4), and the existing
+   * `onInstitutionalCandidateOffer`/`runMaterialization` pipeline — the
+   * ONLY automatic surface path — drives the real scaffold from there. A
+   * job with no candidate (institutional_candidate_offer never ran for
+   * it) never mints automatically either: `claim_identity_known` alone is
+   * not a claim. An explicit operator engagement with no candidate mints
+   * exactly as before Slice 3 — no daemon-side collision avoidance exists
+   * for it, matching the retirement of the extension-local
+   * federatedLoginOwners mechanism this function used to implement that
+   * with. */
   private async openFreshHandoff(
     jobID: string,
     job: ActiveJob,
@@ -6529,292 +6581,194 @@ export class Bridge {
         "A sign-in surface for this job is already being created",
       );
     }
-    const candidateID = this.materializationCorrelation(jobID)?.candidate_id;
-    if (candidateID !== undefined) {
-      const consult = await this.consultAuthenticationClaim(
-        jobID,
-        candidateID,
-        trigger,
-      );
-      if (consult.kind === "navigate_existing") {
-        const focused = await this.focusClaimOwnerTab(consult.ownerTabHint);
-        if (!focused || consult.ownerTabHint === undefined) {
+    // Reserve-before-consult: the latch must cover
+    // consultAuthenticationClaim itself, not only the mint that can follow
+    // it — two concurrent wakes racing the has() check above must still
+    // produce exactly one authentication_claim_request, never two.
+    this.mintingFreshHandoffs.add(jobID);
+    try {
+      const candidateID = this.materializationCorrelation(jobID)?.candidate_id;
+      if (candidateID !== undefined) {
+        const consult = await this.consultAuthenticationClaim(
+          jobID,
+          candidateID,
+          trigger,
+        );
+        if (consult.kind === "navigate_existing") {
+          const focused = await this.focusClaimOwnerTab(consult.ownerTabHint);
+          if (!focused || consult.ownerTabHint === undefined) {
+            await this.parkForEngagement(jobID);
+            return failure(
+              "handoff_unavailable",
+              "The claimed sign-in surface is no longer live",
+            );
+          }
+          await this.update((s) =>
+            patchJob(s, jobID, {
+              tab_id: consult.ownerTabHint as number,
+              status: "auth_pending",
+              engagement_required: false,
+            }),
+          );
+          this.registerHandoffDrive(jobID, consult.ownerTabHint);
+          return { ok: true, opened: true };
+        }
+        if (consult.kind === "focus_owner") {
+          await this.focusClaimOwnerTab(consult.ownerTabHint);
+          await this.parkOnClaim(jobID);
+          return { ok: true, opened: true };
+        }
+        if (consult.kind === "park") {
+          await this.parkOnClaim(jobID, consult.dependentCount);
+          return failure(
+            "handoff_busy",
+            "Another sign-in for this institution is already in progress",
+          );
+        }
+        if (consult.kind === "refuse") {
           await this.parkForEngagement(jobID);
           return failure(
             "handoff_unavailable",
-            "The claimed sign-in surface is no longer live",
+            "The daemon could not authorize a sign-in surface right now",
           );
         }
-        await this.update((s) =>
-          patchJob(s, jobID, {
-            tab_id: consult.ownerTabHint as number,
-            status: "auth_pending",
-            engagement_required: false,
-          }),
-        );
-        this.registerHandoffDrive(jobID, consult.ownerTabHint);
-        return { ok: true, opened: true };
+        // consult.kind === "open_new": the authentication claim is
+        // granted for this job's candidate.
+        if (trigger === "automatic") {
+          // Architecture ruling: the extension never self-mints a
+          // materialization binding. Stay tabless and let the daemon's
+          // own Slice 4 pipeline drive the real scaffold once its fresh
+          // candidate offer arrives.
+          await this.parkOnClaim(jobID);
+          return failure(
+            "handoff_pending",
+            "The sign-in surface will open once the daemon materializes it",
+          );
+        }
+        return this.mintFreshHandoffDirect(jobID, job);
       }
-      if (consult.kind === "focus_owner") {
-        await this.focusClaimOwnerTab(consult.ownerTabHint);
-        await this.parkOnClaim(jobID);
-        return { ok: true, opened: true };
-      }
-      if (consult.kind === "park") {
-        await this.parkOnClaim(jobID, consult.dependentCount);
-        return failure(
-          "handoff_busy",
-          "Another sign-in for this institution is already in progress",
-        );
-      }
-      if (consult.kind === "refuse") {
+      // No live institutional candidate ever ran for this job.
+      if (trigger === "automatic") {
+        // Slice 0 containment, closed even when claim_identity_known: an
+        // automatic release only ever answers a live daemon-arbitrated
+        // candidate (the branch above) — identity metadata alone never
+        // opens a surface autonomously.
         await this.parkForEngagement(jobID);
         return failure(
           "handoff_unavailable",
           "The daemon could not authorize a sign-in surface right now",
         );
       }
-      // consult.kind === "open_new": this job now owns the claim — Slice 4
-      // scaffold-first mint (plan lines 341-360), never the legacy
-      // direct-URL path below (that path is reserved for jobs with no
-      // live candidate at all — see the branch below).
-      return this.materializeClaimOwnedScaffold(jobID, job, trigger);
-    } else if (job.claim_identity_known !== true) {
-      // Neither identity source (a job_offer's login_entity_id, an
-      // institutional_candidate_offer's candidate id, or a durably-marked
-      // prior sighting of either — job.claim_identity_known) ever ran for
-      // this job. There is nothing here to identify an institution to
-      // arbitrate or mint against; refuse locally before any wire call,
-      // exactly like every other structured engagement failure.
-      return failure(
-        "missing_claim",
-        "The handoff is missing institution identity metadata",
-      );
-    }
-    this.mintingFreshHandoffs.add(jobID);
-    try {
-      const minted = await this.requestFreshHandoffLink(jobID);
-      if (!minted.ok) return minted;
-      const current = findByJob(this.store, jobID);
-      if (current === undefined) {
+      if (job.claim_identity_known !== true) {
+        // Neither identity source (a job_offer's login_entity_id, an
+        // institutional_candidate_offer's candidate id, or a durably-marked
+        // prior sighting of either — job.claim_identity_known) ever ran for
+        // this job. There is nothing here to identify an institution to
+        // arbitrate or mint against; refuse locally before any wire call,
+        // exactly like every other structured engagement failure.
         return failure(
-          "handoff_unavailable",
-          "The handoff changed before it could be opened",
+          "missing_claim",
+          "The handoff is missing institution identity metadata",
         );
       }
-      this.offerURLs.set(jobID, minted.url);
-      let materializedTabID: number | undefined;
-      let recordSave: Promise<void> | undefined;
-      const onTabMaterialized = (tabID: number): void => {
-        materializedTabID = tabID;
-        recordSave = this.update((s) =>
-          patchJob(s, jobID, {
-            tab_id: tabID,
-            status: "accepted",
-            engagement_required: false,
-            fresh_handoff: true,
-          }),
-        );
-      };
-      const effectToken = this.claimEffectGovernor(jobID);
-      if (effectToken === undefined) {
-        this.pendingFreshHandoffs.set(jobID, { job, trigger });
-        return failure(
-          "effect_busy",
-          "Handoff will open when the current browser effect finishes",
-        );
-      }
-      let returnedTabID: number | undefined;
-      try {
-        returnedTabID = await this.openManagedTab({
-          url: minted.url,
-          jobId: jobID,
-          purpose: "session-signin",
-          onTabMaterialized,
-          privateLedgerURL: true,
-        });
-        if (recordSave !== undefined) await recordSave;
-      } catch {
-        returnedTabID = undefined;
-      } finally {
-        // A minted link is a one-call capability. It is retained only across
-        // the synchronous tab-creation handoff, never beyond materialization.
-        this.offerURLs.delete(jobID);
-      }
-      const tabID = returnedTabID ?? materializedTabID;
-      if (tabID === undefined) {
-        this.releaseEffectGovernor(jobID, effectToken, false);
-        this.wakeEffectGovernor();
-        return failure(
-          "tab_creation_failed",
-          "The handoff tab could not be created",
-        );
-      }
-      if (findByJob(this.store, jobID) === undefined) {
-        // The job was cancelled/removed while the tab was being created.
-        // This private one-use tab never bound to a live job — preserving
-        // it would let a sibling open a duplicate institutional login.
-        await this.closeOwnedTab(tabID, "fresh-materialization-rollback");
-        this.releaseEffectGovernor(jobID, effectToken, false);
-        this.wakeEffectGovernor();
-        return failure(
-          "tab_creation_failed",
-          "The handoff tab could not be created",
-        );
-      }
-      if (returnedTabID === undefined) {
-        await this.recordManagedTab(jobID, tabID);
-        await this.ledgerManagedTab(tabID, "session-signin", true, jobID);
-      }
-      this.beginProviderDrive(jobID);
-      this.registerHandoffDrive(jobID, tabID);
-      try {
-        await this.focusManagedTab(tabID);
-      } catch {
-        // The managed tab remains available in its papio surface.
-      }
-      this.releaseEffectGovernor(jobID, effectToken, false);
-      this.wakeEffectGovernor();
-      return { ok: true, opened: true };
+      return this.mintFreshHandoffDirect(jobID, job);
     } finally {
       this.mintingFreshHandoffs.delete(jobID);
     }
   }
 
-  /** Slice 4 (plan lines 341-360): scaffold-first creation for a granted
-   * open_new claim. The scaffold is an opaque materialize.html#<binding>
-   * tab identified by this job's OWN birth-certificate binding — distinct
-   * from ADR-0022's daemon-issued materialization binding, a separate
-   * Phase 5 (signed-out-first-route) mechanism this slice does not
-   * conflate with. openManagedTab's existing job_id-scoped ledger reuse
-   * (never URL family matching) is the create/rebind fork: a scaffold
-   * surviving a worker restart is picked back up by binding identity
-   * instead of minting a duplicate — the structural "at most one bound
-   * scaffold per claim" guarantee, since only the job holding the granted
-   * claim ever reaches this method. Connectivity admission and the effect
-   * permit gate the transient route and the same-tab navigation, never the
-   * inert scaffold create/reuse itself. */
-  private async materializeClaimOwnedScaffold(
+  /** Legacy direct mint: request a one-use handoff link and open it in a
+   * fresh tab immediately — no scaffold, no daemon materialization claim.
+   * Reached only for an explicit operator engagement (the operator's own
+   * gesture on either a granted claim or a no-candidate job); the caller
+   * already holds the mintingFreshHandoffs latch for jobID. */
+  private async mintFreshHandoffDirect(
     jobID: string,
     job: ActiveJob,
-    trigger: "automatic" | "explicit",
   ): Promise<BrokerReply<{ opened: true }>> {
-    this.mintingFreshHandoffs.add(jobID);
-    try {
-      const bindingID = this.deps.randomUUID();
-      const scaffoldURL = this.materializationURL(bindingID);
-      if (scaffoldURL === undefined) {
-        await this.parkForEngagement(jobID);
-        return failure(
-          "handoff_unavailable",
-          "The daemon could not authorize a sign-in surface right now",
-        );
-      }
-      let tabID: number | undefined;
-      try {
-        tabID = await this.openManagedTab({
-          url: scaffoldURL,
-          jobId: jobID,
-          purpose: "claim-scaffold",
-          surfaceFallback: false,
-          focusExisting: false,
-          bindingID,
-        });
-      } catch {
-        tabID = undefined;
-      }
-      if (tabID === undefined) {
-        return failure(
-          "tab_creation_failed",
-          "The handoff tab could not be created",
-        );
-      }
-      if (findByJob(this.store, jobID) === undefined) {
-        // The job was cancelled/removed while the scaffold was being
-        // created. It carries no route yet and no other job can claim
-        // it (the claim is this job's alone); leave it for the standard
-        // close-authorization transaction to reclaim.
-        return failure(
-          "tab_creation_failed",
-          "The handoff tab could not be created",
-        );
-      }
-      await this.update((s) =>
+    const minted = await this.requestFreshHandoffLink(jobID);
+    if (!minted.ok) return minted;
+    const current = findByJob(this.store, jobID);
+    if (current === undefined) {
+      return failure(
+        "handoff_unavailable",
+        "The handoff changed before it could be opened",
+      );
+    }
+    this.offerURLs.set(jobID, minted.url);
+    let materializedTabID: number | undefined;
+    let recordSave: Promise<void> | undefined;
+    const onTabMaterialized = (tabID: number): void => {
+      materializedTabID = tabID;
+      recordSave = this.update((s) =>
         patchJob(s, jobID, {
+          tab_id: tabID,
           status: "accepted",
           engagement_required: false,
           fresh_handoff: true,
         }),
       );
-      if (!(this.deps.online?.() ?? true)) {
-        // Connectivity admission precedes route issuance by construction:
-        // the scaffold stays live and reusable (the reuse branch above
-        // picks it back up), nothing navigates it into a dead network.
-        await this.parkForEngagement(jobID);
-        return failure(
-          "handoff_unavailable",
-          "The daemon could not authorize a sign-in surface right now",
-        );
-      }
-      const effectToken = this.claimEffectGovernor(jobID);
-      if (effectToken === undefined) {
-        this.pendingFreshHandoffs.set(jobID, { job, trigger });
-        return failure(
-          "effect_busy",
-          "Handoff will open when the current browser effect finishes",
-        );
-      }
-      try {
-        const minted = await this.requestFreshHandoffLink(jobID);
-        if (!minted.ok) return minted;
-        if (findByJob(this.store, jobID) === undefined) {
-          return failure(
-            "handoff_unavailable",
-            "The handoff changed before it could be opened",
-          );
-        }
-        // Revalidation / renavigation fence (plan lines 175-184): a fresh
-        // read immediately before the act, no unrelated await between —
-        // never renavigate a scaffold the operator has since made active.
-        let live: TabInfo | undefined;
-        try {
-          live = await this.deps.tabs.get(tabID);
-        } catch {
-          live = undefined;
-        }
-        if (
-          live?.id !== tabID ||
-          live.active === true ||
-          this.deps.tabs.update === undefined
-        ) {
-          return failure(
-            "handoff_unavailable",
-            "The claimed sign-in surface is no longer live",
-          );
-        }
-        try {
-          await this.deps.tabs.update(tabID, { url: minted.url });
-        } catch {
-          return failure(
-            "tab_creation_failed",
-            "The handoff tab could not be created",
-          );
-        }
-        this.beginProviderDrive(jobID);
-        this.registerHandoffDrive(jobID, tabID);
-        try {
-          await this.focusManagedTab(tabID);
-        } catch {
-          // The managed tab remains available in its papio surface.
-        }
-        return { ok: true, opened: true };
-      } finally {
-        this.releaseEffectGovernor(jobID, effectToken, false);
-        this.wakeEffectGovernor();
-      }
-    } finally {
-      this.mintingFreshHandoffs.delete(jobID);
+    };
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) {
+      this.pendingFreshHandoffs.set(jobID, { job, trigger: "explicit" });
+      return failure(
+        "effect_busy",
+        "Handoff will open when the current browser effect finishes",
+      );
     }
+    let returnedTabID: number | undefined;
+    try {
+      returnedTabID = await this.openManagedTab({
+        url: minted.url,
+        jobId: jobID,
+        purpose: "session-signin",
+        onTabMaterialized,
+        privateLedgerURL: true,
+      });
+      if (recordSave !== undefined) await recordSave;
+    } catch {
+      returnedTabID = undefined;
+    } finally {
+      // A minted link is a one-call capability. It is retained only across
+      // the synchronous tab-creation handoff, never beyond materialization.
+      this.offerURLs.delete(jobID);
+    }
+    const tabID = returnedTabID ?? materializedTabID;
+    if (tabID === undefined) {
+      this.releaseEffectGovernor(jobID, effectToken, false);
+      this.wakeEffectGovernor();
+      return failure(
+        "tab_creation_failed",
+        "The handoff tab could not be created",
+      );
+    }
+    if (findByJob(this.store, jobID) === undefined) {
+      // The job was cancelled/removed while the tab was being created.
+      // This private one-use tab never bound to a live job — preserving
+      // it would let a sibling open a duplicate institutional login.
+      await this.closeOwnedTab(tabID, "fresh-materialization-rollback");
+      this.releaseEffectGovernor(jobID, effectToken, false);
+      this.wakeEffectGovernor();
+      return failure(
+        "tab_creation_failed",
+        "The handoff tab could not be created",
+      );
+    }
+    if (returnedTabID === undefined) {
+      await this.recordManagedTab(jobID, tabID);
+      await this.ledgerManagedTab(tabID, "session-signin", true, jobID);
+    }
+    this.beginProviderDrive(jobID);
+    this.registerHandoffDrive(jobID, tabID);
+    try {
+      await this.focusManagedTab(tabID);
+    } catch {
+      // The managed tab remains available in its papio surface.
+    }
+    this.releaseEffectGovernor(jobID, effectToken, false);
+    this.wakeEffectGovernor();
+    return { ok: true, opened: true };
   }
 
   private async focusExistingHandoff(
@@ -7296,6 +7250,14 @@ export class Bridge {
     candidateID: string,
     trigger: "automatic" | "explicit",
   ): Promise<ClaimConsultResult> {
+    // §4.5: a lease-renewing negotiation must never race the startup
+    // replay of unacked pre-restart observations for the SAME occurrence —
+    // the daemon needs that backlog applied first to arbitrate correctly.
+    // Never awaited by an inbound-frame handler (this method is only ever
+    // reached off-chain, from openFreshHandoff's automatic void-call or an
+    // explicit non-native message), so awaiting it here cannot deadlock
+    // the FIFO it itself depends on.
+    await this.outboxReplayed;
     const result = await this.requestNative(
       "authentication_claim_request",
       { candidate_id: candidateID, materialization_kind: "browser_tab", trigger },
@@ -7316,10 +7278,25 @@ export class Bridge {
       typeof p.authentication_claim_id === "string" &&
       typeof p.gate_occurrence_id === "string"
     ) {
+      const gateOccurrenceID = p.gate_occurrence_id;
+      // §5: ordinal is monotonic per gate_occurrence_id, never per grant —
+      // a fresh grant on the SAME occurrence (a restart re-consulting
+      // before its own prior observations drained) must never restart at
+      // 0 while those entries still queue; the daemon's unique
+      // (occurrence, ordinal) index would reject the collision as stale.
+      let nextOrdinal = 0;
+      for (const entry of this.claimObservationOutboxEntries.values()) {
+        if (
+          entry.gate_occurrence_id === gateOccurrenceID &&
+          entry.event_ordinal >= nextOrdinal
+        ) {
+          nextOrdinal = entry.event_ordinal + 1;
+        }
+      }
       this.claimGrants.set(jobID, {
         authenticationClaimID: p.authentication_claim_id,
-        gateOccurrenceID: p.gate_occurrence_id,
-        nextOrdinal: 0,
+        gateOccurrenceID,
+        nextOrdinal,
       });
       if (p.outcome === "open_new") return { kind: "open_new" };
       if (typeof p.owner_binding_id === "string") {
@@ -7352,12 +7329,35 @@ export class Bridge {
     } catch {
       return false;
     }
+    await this.reduceHandoffGroupState(ownerTabHint);
+    // Renavigation fence (plan lines 175-184): re-prove the hint
+    // immediately before the activating update, no unrelated await
+    // between — a stale hint (owner closed, id reused mid-await) is
+    // never trusted bare.
+    let live: TabInfo;
     try {
-      await this.focusManagedTab(ownerTabHint);
-      return true;
+      live = await this.deps.tabs.get(ownerTabHint);
+      if (live.id !== ownerTabHint) return false;
     } catch {
       return false;
     }
+    try {
+      await this.deps.tabs.update?.(ownerTabHint, { active: true });
+    } catch {
+      return false;
+    }
+    if (live.windowId !== undefined && this.deps.windows !== undefined) {
+      try {
+        const win = await this.deps.windows.get(live.windowId);
+        await this.deps.windows.update(live.windowId, {
+          focused: true,
+          ...(win.state === "minimized" ? { state: "normal" as const } : {}),
+        });
+      } catch {
+        // A closed work window is handled by the normal tab-removal path.
+      }
+    }
+    return true;
   }
 
   /** `park`: tabless, daemon-driven — never engagement_required (that would
@@ -7393,10 +7393,11 @@ export class Bridge {
   }
 
   /** §2.2/§5: append one claim_observation to the durable outbox and
-   * best-effort flush it. Never itself awaited — the caller fires this and
-   * moves on, satisfying AGENTS.md's "never await a correlated request
-   * inside an inbound-frame handler" for every emission site below, since
-   * none of them are on the critical path of the frame that triggered them. */
+   * best-effort schedule a flush. Never itself awaited — the caller fires
+   * this and moves on, satisfying AGENTS.md's "never await a correlated
+   * request inside an inbound-frame handler" for every emission site
+   * below, since none of them are on the critical path of the frame that
+   * triggered them. */
   private enqueueClaimObservation(
     jobID: string,
     bindingID: string,
@@ -7419,7 +7420,7 @@ export class Bridge {
     };
     this.claimObservationOutboxEntries.set(entry.observation_id, entry);
     this.persistClaimObservationOutbox();
-    void this.drainObservationOutbox();
+    this.scheduleObservationOutboxDrain();
   }
 
   /** Resolve a claim-owned tab's binding id from the birth-certificate
@@ -7438,20 +7439,70 @@ export class Bridge {
       if (this.claimObservationLatch.has(key)) return;
       this.claimObservationLatch.add(key);
     }
+    // §4.5: never emit a fresh lease-renewing observation ahead of any
+    // unacked backlog from a prior worker lifetime — this call is never
+    // awaited by an inbound-frame handler (every call site above is
+    // `void`), so waiting here cannot deadlock the FIFO outboxReplayed
+    // itself depends on.
+    await this.outboxReplayed;
     const ledger = await this.snapshotTabLedger();
     const bindingID = ledger[String(tabID)]?.binding_id;
     if (bindingID === undefined) return;
     this.enqueueClaimObservation(jobID, bindingID, eventKind);
   }
 
-  /** §5's per-poll batch cap (32), reused here as a per-drain cap. Applied/
-   * duplicate/stale/rejected all terminate the entry locally (rejected is
-   * still logged server-side by the daemon, nothing more to do here); only
-   * a transport failure or an `error` ack leaves it queued for the next
-   * drain, retried under the SAME observation_id so the daemon's
-   * idempotency table absorbs it. */
-  private async drainObservationOutbox(): Promise<void> {
-    const entries = [...this.claimObservationOutboxEntries.values()].slice(0, 32);
+  /** Coalescing trigger for drainObservationOutbox: a drain already
+   * running absorbs a concurrent trigger as one more full pass instead of
+   * two racing to send the same entries. Exposes its outcome through
+   * outboxReplayed for the one other consumer allowed to await it
+   * (lease-renewing observation emission). */
+  private scheduleObservationOutboxDrain(): void {
+    if (this.outboxDrainRunning) {
+      this.outboxDrainRerunRequested = true;
+      return;
+    }
+    this.outboxDrainRunning = true;
+    this.outboxReplayed = this.drainObservationOutboxLoop()
+      .catch((error) =>
+        console.error("papio: claim observation outbox drain failed", error),
+      )
+      .finally(() => {
+        this.outboxDrainRunning = false;
+        if (this.outboxDrainRerunRequested) {
+          this.outboxDrainRerunRequested = false;
+          this.scheduleObservationOutboxDrain();
+        }
+      });
+  }
+
+  /** §5's per-poll batch cap (32), reused here as a per-batch cap; loops
+   * batches until the outbox is empty or a full pass makes no progress
+   * (offline, feature withdrawn, or every request timed out) — retried by
+   * the next enqueue, hello_ack, or reconnect instead of busy-looping. */
+  private async drainObservationOutboxLoop(): Promise<void> {
+    for (;;) {
+      const before = this.claimObservationOutboxEntries.size;
+      if (before === 0) return;
+      await this.drainObservationOutboxBatch();
+      if (this.claimObservationOutboxEntries.size >= before) return;
+    }
+  }
+
+  /** Applied/duplicate/stale terminate the entry locally (a daemon-side
+   * rejection is still logged server-side, nothing more to do here except
+   * the out-of-order guard below); only a transport failure or an `error`
+   * ack leaves it queued for the next drain, retried under the SAME
+   * observation_id so the daemon's idempotency table absorbs it. */
+  private async drainObservationOutboxBatch(): Promise<void> {
+    const entries = [...this.claimObservationOutboxEntries.values()]
+      .sort((a, b) =>
+        a.gate_occurrence_id === b.gate_occurrence_id
+          ? a.event_ordinal - b.event_ordinal
+          : a.gate_occurrence_id < b.gate_occurrence_id
+            ? -1
+            : 1,
+      )
+      .slice(0, 32);
     for (const entry of entries) {
       const { job_id: jobID, ...payload } = entry;
       const result = await this.requestNative(
@@ -7474,6 +7525,23 @@ export class Bridge {
         }
       }
       if (ack.outcome === "error") continue;
+      if (ack.outcome === "rejected") {
+        // A rejection can be stale relative to a lower-ordinal sibling for
+        // the SAME occurrence that has not sent yet (still queued from a
+        // prior partial drain, or later in this very batch after a
+        // transport failure) — dropping it now would silently lose that
+        // sibling's ordering. Keep it queued only while such a sibling is
+        // still pending; otherwise the rejection is final.
+        const hasEarlierSibling = [
+          ...this.claimObservationOutboxEntries.values(),
+        ].some(
+          (other) =>
+            other.observation_id !== entry.observation_id &&
+            other.gate_occurrence_id === entry.gate_occurrence_id &&
+            other.event_ordinal < entry.event_ordinal,
+        );
+        if (hasEarlierSibling) continue;
+      }
       this.claimObservationOutboxEntries.delete(entry.observation_id);
       this.persistClaimObservationOutbox();
     }
@@ -11842,6 +11910,13 @@ export class Bridge {
     this.pendingFreshHandoffs.delete(jobID);
     const current = findByJob(this.store, jobID);
     if (current === undefined || current.engagement_required !== true) return;
+    if (queued.trigger === "automatic" && !this.institutionalAuthGateOpen()) {
+      // The gate can close between the original queueing (effect permit
+      // busy) and this drain running (reconnect, hello downgrade, feature
+      // loss) — never mint an automatic drive against a gate that has
+      // since closed; leave it for the standing engagement_required park.
+      return;
+    }
     await this.openFreshHandoff(jobID, current, queued.trigger);
   }
   private async drainPendingSessionSignIns(): Promise<void> {
@@ -13706,6 +13781,12 @@ export class Bridge {
         // on the same port, so the refusal must stop shortcutting requests.
         this.helloDeniedGeneration = -1;
         this.keepaliveManager?.notifyConfiguredOriginsChanged();
+        if (features.includes(AUTHENTICATION_CLAIM_FEATURE)) {
+          // Same off-chain rule as reconciliation below: schedule only,
+          // never await — scheduleObservationOutboxDrain is itself
+          // non-blocking and safe to call directly from this handler.
+          this.scheduleObservationOutboxDrain();
+        }
         if (features.includes(INSTITUTIONAL_MATERIALIZATION_FEATURE)) {
           // Inbound frames are serialized. Reconciliation sends correlated
           // requests whose replies must traverse this same queue, so it must
@@ -14057,47 +14138,33 @@ export class Bridge {
       try {
         await this.deps.tabs.get(existing.tab_id);
       } catch {
-        if (!this.institutionalAuthGateOpen()) {
-          // Slice 0 containment: a dead sign-in tab is never recovered
-          // autonomously. Demote to tabless so the cold park below takes it.
+        const candidateID =
+          this.materializationCorrelation(jobID)?.candidate_id;
+        if (this.institutionalAuthGateOpen() && candidateID !== undefined) {
+          // Fresh-link recovery reopen: a dead sign-in tab is about to be
+          // recreated for a job with a live institutional candidate —
+          // consult the daemon's claim arbitration first (openFreshHandoff,
+          // the sole mint chokepoint). That consult awaits a correlated
+          // authentication_claim_response, which can only arrive back
+          // through this same serialized inbound chain
+          // (enqueueInbound/onInbound). Awaiting it here would deadlock it
+          // exactly as AGENTS.md describes. Demote to tabless (the cold
+          // park below takes it) and detach openFreshHandoff to run
+          // off-chain; its own effect governor and mint latch make it safe
+          // to race against any other drive of this job.
           await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
           existing = findByJob(this.store, jobID);
-        } else {
-          // Fresh-link recovery reopen: a dead sign-in tab is about to be
-          // recreated for a job that may hold a live institutional
-          // candidate. A job WITHOUT one reopens its already-known reoffer
-          // URL directly, exactly as before Slice 3. A job WITH one must
-          // consult the daemon's claim arbitration first (openFreshHandoff,
-          // the sole mint chokepoint) — but that consult awaits a
-          // correlated authentication_claim_response, which can only
-          // arrive back through this same serialized inbound chain
-          // (enqueueInbound/onInbound). Awaiting it here would deadlock it
-          // exactly as AGENTS.md describes. Demote to tabless instead (same
-          // as the gate-closed branch above, so the cold park below takes
-          // it) and detach openFreshHandoff to run off-chain; its own
-          // effect governor and mint latch make it safe to race against
-          // any other drive of this job.
-          const candidateID =
-            this.materializationCorrelation(jobID)?.candidate_id;
-          if (candidateID === undefined) {
-            const recoveredTabID = await this.openManagedTab({
-              url: openurl,
-              jobId: jobID,
-              purpose: "reoffer",
-              focusExisting: false,
-            });
-            existing =
-              recoveredTabID === undefined
-                ? undefined
-                : findByJob(this.store, jobID);
-            if (existing === undefined) await this.removeJobWithOffer(jobID);
-          } else {
-            await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
-            existing = findByJob(this.store, jobID);
-            if (existing !== undefined) {
-              void this.openFreshHandoff(jobID, existing, "automatic");
-            }
+          if (existing !== undefined) {
+            void this.openFreshHandoff(jobID, existing, "automatic");
           }
+        } else {
+          // Slice 0 containment: a dead sign-in tab is never recovered
+          // autonomously — a closed gate, or no live institutional
+          // candidate at all (claim_identity_known alone is never a
+          // claim), both stay tabless. Demote so the cold park below
+          // takes it.
+          await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
+          existing = findByJob(this.store, jobID);
         }
       }
     }
