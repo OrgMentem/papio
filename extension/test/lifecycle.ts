@@ -26,6 +26,11 @@ export interface RestartableHarness {
    * only once the caller awaits the returned bridge's `start()`; the `port`
    * accessor installed below reads whatever is latest at access time. */
   readonly ports: readonly unknown[];
+  /** Optional fake chrome.storage.session backing (Slice 2b's browser-epoch
+   * seam). Present harnesses get it cleared by simulateExtensionUpdate,
+   * exactly like the real API; absent ones are untouched (existing
+   * harnesses without the epoch seam keep working unchanged). */
+  sessionStorage?: { clear(): void };
 }
 
 /** Redefine `port` on a harness clone as a live accessor instead of a value
@@ -75,6 +80,7 @@ export function simulateExtensionUpdate<H extends RestartableHarness>(
   h: H,
 ): H {
   h.backend.store = emptyStore();
+  h.sessionStorage?.clear();
   const next: H = { ...h };
   next.bridge = new Bridge(h.deps);
   installLivePortAccessor(next, h.ports);

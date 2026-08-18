@@ -844,7 +844,7 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	}
 	if !slices.Equal(payload.Features, []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, protocol.EffectPermitFeature, institutionalMaterializationFeature,
-		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature, pdfGrabSuggestV1Feature,
+		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature, pdfGrabSuggestV1Feature, surfaceCloseFeature,
 	}) {
 		t.Fatalf("features = %v", payload.Features)
 	}
@@ -5714,6 +5714,200 @@ func TestSafetyDomainIsSharedAcrossJobsOnOneProfile(t *testing.T) {
 	}
 	if candA.PreRouteSafetyKey == candB.PreRouteSafetyKey {
 		t.Fatal("pre-route safety keys must stay per job")
+	}
+}
+
+// seedSurfaceCloseClaim creates a job, institution profile, browser
+// candidate, and materialization claim, then forces the claim to the given
+// phase via direct SQL — settled/abandoned are real handler outcomes with no
+// single store constructor, so the fixture reaches them the same way
+// TestReconcileConfirmsAClaimedButUnboundClaim reaches "claimed, never
+// bound": build the claim, then set the exact state under test.
+func seedSurfaceCloseClaim(t *testing.T, b *Bridge, jobs *job.Store, prefix, phase string) *job.MaterializationClaim {
+	t.Helper()
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "wr_"+prefix, handoffWork(), "")
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "default", AuthorityDigest: "digest-" + prefix, AuthenticationClaimID: "auth-" + prefix,
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("profile reconcile: %+v %v", profiles, err)
+	}
+	if _, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+		ID: "candidate-" + prefix, JobID: jobID, JobAttemptRevision: 1,
+		InstitutionProfileID: profiles[0].ID, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+		PreRouteSafetyKey: "safety-" + prefix, SafetyDomainID: "domain-" + prefix,
+		AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: "candidate-" + prefix, BrowserHolderGeneration: b.epoch,
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phase != "claimed" {
+		if _, err := jobs.S.DB().ExecContext(ctx,
+			`UPDATE materialization_claims SET phase = ? WHERE id = ?`, phase, claim.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		claim.Phase = phase
+	}
+	return claim
+}
+
+func decodeSurfaceCloseResponse(t *testing.T, frames []json.RawMessage) *protocol.SurfaceCloseResponsePayload {
+	t.Helper()
+	if len(frames) != 1 {
+		t.Fatalf("surface close: got %d frames, want 1", len(frames))
+	}
+	msg, err := protocol.DecodeBrowserMessage(frames[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := msg.Payload.(*protocol.SurfaceCloseResponsePayload)
+	if !ok {
+		t.Fatalf("surface close: unexpected payload type %T", msg.Payload)
+	}
+	return got
+}
+
+// The happy path: a settled claim with disposition materialization_settled
+// is authorized and mints a durable token.
+func TestSurfaceCloseAuthorizedHappyPath(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-happy", "settled")
+
+	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-happy", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeSurfaceCloseResponse(t, frames)
+	if got.Outcome != "authorized" {
+		t.Fatalf("outcome = %q, want authorized (detail=%q)", got.Outcome, got.Detail)
+	}
+	if got.CloseAuthorizationID == "" || got.Nonce == "" {
+		t.Fatalf("authorized response missing id/nonce: %+v", got)
+	}
+	if got.BrowserHolderGeneration == nil || *got.BrowserHolderGeneration != b.epoch {
+		t.Fatalf("browser_holder_generation = %v, want %d", got.BrowserHolderGeneration, b.epoch)
+	}
+
+	var status string
+	if err := jobs.S.DB().QueryRowContext(context.Background(),
+		`SELECT status FROM close_authorizations WHERE id = ?`, got.CloseAuthorizationID,
+	).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "issued" {
+		t.Fatalf("close_authorizations.status = %q, want issued", status)
+	}
+}
+
+// A repeated authorized request for the same live binding must return the
+// exact same token rather than minting (or refusing to mint) a second one.
+func TestSurfaceCloseAuthorizedRepeatIsIdempotent(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-idempotent", "abandoned")
+
+	req := &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-idempotent", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "claim_abandoned",
+	}
+	first, err := b.surfaceClose(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstResp := decodeSurfaceCloseResponse(t, first)
+	if firstResp.Outcome != "authorized" {
+		t.Fatalf("first outcome = %q, want authorized (detail=%q)", firstResp.Outcome, firstResp.Detail)
+	}
+
+	second, err := b.surfaceClose(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResp := decodeSurfaceCloseResponse(t, second)
+	if secondResp.Outcome != "authorized" {
+		t.Fatalf("second outcome = %q, want authorized (detail=%q)", secondResp.Outcome, secondResp.Detail)
+	}
+	if secondResp.CloseAuthorizationID != firstResp.CloseAuthorizationID || secondResp.Nonce != firstResp.Nonce {
+		t.Fatalf("repeat request minted a new token: first=%+v second=%+v", firstResp, secondResp)
+	}
+}
+
+// A binding_id with no materialization_claims row at all — an unknown
+// binding, or an extension-minted pre-cutover scaffold — is never
+// daemon-closable.
+func TestSurfaceCloseUnknownBindingIsNotEligible(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
+
+	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-unknown", BindingID: "binding-never-claimed-00001",
+		BrowserHolderGeneration: b.epoch, Disposition: "scaffold_idle",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeSurfaceCloseResponse(t, frames)
+	if got.Outcome != "not_eligible" {
+		t.Fatalf("outcome = %q, want not_eligible", got.Outcome)
+	}
+	if got.CloseAuthorizationID != "" || got.Nonce != "" || got.BrowserHolderGeneration != nil {
+		t.Fatalf("not_eligible response carries authorization fields: %+v", got)
+	}
+}
+
+// A request reporting a browser_holder_generation below the daemon's
+// current fence is stale, not authorized and not a transport error.
+func TestSurfaceCloseStaleGenerationIsRejected(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-stale", "settled")
+
+	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-stale", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch - 1, Disposition: "materialization_settled",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeSurfaceCloseResponse(t, frames)
+	if got.Outcome != "stale" {
+		t.Fatalf("outcome = %q, want stale", got.Outcome)
+	}
+}
+
+// A disposition inconsistent with the binding's current claim phase must
+// not be authorized: e.g. materialization_settled on a claim still merely
+// claimed.
+func TestSurfaceClosePhaseMismatchIsNotEligible(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-mismatch", "claimed")
+
+	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-mismatch", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeSurfaceCloseResponse(t, frames)
+	if got.Outcome != "not_eligible" {
+		t.Fatalf("outcome = %q, want not_eligible", got.Outcome)
 	}
 }
 

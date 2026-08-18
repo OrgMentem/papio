@@ -50,16 +50,16 @@ func TestGuardCapableSchema33RefusesSchema34(t *testing.T) {
 func TestOpenRefusesSchemaNewerThanBinary(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
-	setSchemaVersion(t, ctx, dataDir, 41)
+	setSchemaVersion(t, ctx, dataDir, 42)
 	opened, err := Open(ctx, dataDir)
 	if opened != nil {
 		_ = opened.Close()
 		t.Fatal("Open returned a store for a future schema")
 	}
 	if err == nil {
-		t.Fatal("Open accepted schema version 41 with latest embedded migration 40")
+		t.Fatal("Open accepted schema version 42 with latest embedded migration 41")
 	}
-	if got, want := err.Error(), "database schema version 41 is newer than this binary supports (40); refusing to open"; !strings.Contains(got, want) {
+	if got, want := err.Error(), "database schema version 42 is newer than this binary supports (41); refusing to open"; !strings.Contains(got, want) {
 		t.Fatalf("Open error = %q, want containing %q", got, want)
 	}
 }

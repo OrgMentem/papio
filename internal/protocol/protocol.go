@@ -913,6 +913,12 @@ const (
 	MsgActivityPageResponse    = "activity_page_response"
 	MsgPageBulkSubmitV2Request = "page_bulk_submit_v2_request"
 	MsgPageBulkSubmitV2Result  = "page_bulk_submit_v2_result"
+	// surface_close_v1 authorizes a one-use close of any daemon-bound
+	// scaffold, independent of any job (see SurfaceCloseFeature). It is
+	// generic — not authentication-specific — so it can ship ahead of
+	// institutional_authentication_claim_v1.
+	MsgSurfaceCloseRequest  = "surface_close_request"
+	MsgSurfaceCloseResponse = "surface_close_response"
 )
 
 // EffectPermitFeature negotiates durable reconciliation before an irreversible
@@ -1087,6 +1093,39 @@ type InstitutionalReconcileResponsePayload struct {
 	Outcome   string                        `json:"outcome"`
 	Claims    []InstitutionalReconcileClaim `json:"claims,omitempty"`
 	Detail    string                        `json:"detail,omitempty"`
+}
+
+// SurfaceCloseFeature gates the generic one-use close-authorization
+// request/response pair (surface_close_request/surface_close_response).
+// It authorizes closing any daemon-bound scaffold — institutional or not —
+// independent of institutional_authentication_claim_v1, and it is
+// deliberately not job-scoped: a scaffold being closed may have no live
+// job (e.g. an abandoned claim's scaffold after owner_closed).
+const SurfaceCloseFeature = "surface_close_v1"
+
+// SurfaceCloseRequestPayload asks the daemon to authorize closing one
+// daemon-bound scaffold. Never job-scoped (see SurfaceCloseFeature).
+// gate_occurrence_id is only ever populated when disposition is
+// "claim_abandoned", echoing the occurrence that closed.
+type SurfaceCloseRequestPayload struct {
+	RequestID               string `json:"request_id"`
+	BindingID               string `json:"binding_id"`
+	BrowserHolderGeneration int64  `json:"browser_holder_generation"`
+	Disposition             string `json:"disposition"`
+	GateOccurrenceID        string `json:"gate_occurrence_id,omitempty"`
+}
+
+// SurfaceCloseResponsePayload reports the daemon's close-authorization
+// decision for one surface_close_request. close_authorization_id, nonce,
+// and browser_holder_generation are required exactly on "authorized" and
+// forbidden on every other outcome; detail is forbidden on "authorized".
+type SurfaceCloseResponsePayload struct {
+	RequestID               string `json:"request_id"`
+	Outcome                 string `json:"outcome"`
+	CloseAuthorizationID    string `json:"close_authorization_id,omitempty"`
+	Nonce                   string `json:"nonce,omitempty"`
+	BrowserHolderGeneration *int64 `json:"browser_holder_generation,omitempty"`
+	Detail                  string `json:"detail,omitempty"`
 }
 
 // jobScoped lists the types that must carry a job_id.
@@ -2998,6 +3037,32 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		}
 		if err == nil && p.Outcome != "reconciled" {
 			err = institutionalRejectPresence(payloadFields, "institutional_reconcile_response", "claims")
+		}
+		msg.Payload = p
+	case MsgSurfaceCloseRequest:
+		p := &SurfaceCloseRequestPayload{}
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "surface_close_request",
+			[]string{"request_id", "binding_id", "browser_holder_generation", "disposition"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		if err == nil && p.Disposition != "claim_abandoned" {
+			err = institutionalRejectPresence(payloadFields, "surface_close_request", "gate_occurrence_id")
+		}
+		msg.Payload = p
+	case MsgSurfaceCloseResponse:
+		p := &SurfaceCloseResponsePayload{}
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "surface_close_response", []string{"request_id", "outcome"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		if err == nil {
+			fields := []string{"close_authorization_id", "nonce", "browser_holder_generation"}
+			if p.Outcome == "authorized" {
+				err = institutionalRequirePresence(payloadFields, "surface_close_response", fields...)
+			} else {
+				err = institutionalRejectPresence(payloadFields, "surface_close_response", fields...)
+			}
 		}
 		msg.Payload = p
 	case MsgError:
@@ -5208,6 +5273,63 @@ func (p *InstitutionalReconcileResponsePayload) validate() error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (p *SurfaceCloseRequestPayload) validate() error {
+	if err := institutionalRequestID("surface_close_request.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalID("surface_close_request.binding_id", p.BindingID); err != nil {
+		return err
+	}
+	if err := institutionalOrdinal("surface_close_request.browser_holder_generation", p.BrowserHolderGeneration); err != nil {
+		return err
+	}
+	if err := enumRequired("surface_close_request.disposition", p.Disposition,
+		"scaffold_idle", "materialization_settled", "claim_abandoned"); err != nil {
+		return err
+	}
+	if p.Disposition == "claim_abandoned" {
+		if p.GateOccurrenceID != "" {
+			return institutionalID("surface_close_request.gate_occurrence_id", p.GateOccurrenceID)
+		}
+		return nil
+	}
+	if p.GateOccurrenceID != "" {
+		return fmt.Errorf("surface_close_request.%s forbids gate_occurrence_id", p.Disposition)
+	}
+	return nil
+}
+func (p *SurfaceCloseResponsePayload) validate() error {
+	if err := institutionalRequestID("surface_close_response.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalOutcome("surface_close_response.outcome", p.Outcome,
+		"authorized", "stale", "not_eligible", "busy", "error"); err != nil {
+		return err
+	}
+	if err := validateTriageText("surface_close_response.detail", p.Detail, 1000); err != nil {
+		return err
+	}
+	if p.Outcome == "authorized" {
+		if p.Detail != "" {
+			return fmt.Errorf("surface_close_response.authorized must not carry detail")
+		}
+		if err := institutionalID("surface_close_response.close_authorization_id", p.CloseAuthorizationID); err != nil {
+			return err
+		}
+		if err := institutionalID("surface_close_response.nonce", p.Nonce); err != nil {
+			return err
+		}
+		if p.BrowserHolderGeneration == nil {
+			return fmt.Errorf("surface_close_response.browser_holder_generation is required")
+		}
+		return institutionalOrdinal("surface_close_response.browser_holder_generation", *p.BrowserHolderGeneration)
+	}
+	if p.CloseAuthorizationID != "" || p.Nonce != "" || p.BrowserHolderGeneration != nil {
+		return fmt.Errorf("surface_close_response.%s forbids authorization fields", p.Outcome)
 	}
 	return nil
 }

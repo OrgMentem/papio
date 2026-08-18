@@ -380,16 +380,35 @@ refusal that never calls this RPC at all — no wire round trip needed to say
 
 ## 4. Authentication-entry lease and storage sketch
 
-Migration number: **`0041`** (next free after `0040_job_credit_share.sql` —
-verified via `internal/store/migrations/` listing; no gap to fill). Bump the
-four `user_version`-pinned assertions AGENTS.md names as a checklist item for
-whoever implements this: `internal/cli/clean_install_test.go` (two "schema
-version N" strings plus a `user_version` compare),
-`internal/doctor/doctor_test.go`,
-`internal/store/migrate_forward_test.go`'s two post-migration compares, and
-`internal/store/migrate_guard_test.go`'s
-`TestOpenRefusesSchemaNewerThanBinary` (the exact-string refusal assertion,
-the one AGENTS.md calls "the easiest to miss"). Leave
+Migration numbers: **`0041`** and **`0042`** (next free after
+`0040_job_credit_share.sql` — verified via `internal/store/migrations/`
+listing; no gap to fill).
+
+**Deviation from the split originally sketched here, landed during Slice
+2b's implementation:** `0041_close_authorizations.sql` carries **only**
+the `close_authorizations` table (§4.3, SQL verbatim) — nothing else. The
+`authentication_entry_leases` `ALTER` (§4.1) and the new
+`claim_observation_journal` table (§4.2) move to Slice 3's own `0042`
+migration. The reason is sequencing, not storage: the plan sequences Slice
+2b strictly before Slice 3 (`Sequencing: 0 → 1 → 2a → 2b → 3 → 4`, plan
+line 357), and Slice 2b's close transaction (plan lines 288-299) needs
+only `close_authorizations` under `surface_close_v1` — it has no
+dependency on the authentication-claim arbitration tables §4.1/§4.2 exist
+for. Bundling all three into one `0041` would have made Slice 2b's
+migration wait on Slice 3 schema that Slice 2b never reads, for no
+protocol reason. Whoever implements Slice 3 mints `0042` from
+`authentication_entry_leases`'s `ALTER` and `claim_observation_journal`'s
+`CREATE TABLE` exactly as sketched in §4.1/§4.2 below; nothing about
+either table's shape changes because of the split.
+
+Bump the four `user_version`-pinned assertions AGENTS.md names as a
+checklist item for whoever implements each migration:
+`internal/cli/clean_install_test.go` (two "schema version N" strings plus
+a `user_version` compare), `internal/doctor/doctor_test.go`,
+`internal/store/migrate_forward_test.go`'s two post-migration compares,
+and `internal/store/migrate_guard_test.go`'s
+`TestOpenRefusesSchemaNewerThanBinary` (the exact-string refusal
+assertion, the one AGENTS.md calls "the easiest to miss"). Leave
 `TestGuardCapableSchema33RefusesSchema34` and `migrate_forward_test.go`'s
 schema-33 fixture untouched, per the same note.
 
@@ -404,8 +423,9 @@ Slice 3 needs: `authentication_claim_id` (PK), `lease_id`, `owner_id`
 `ConvertAuthenticationEntryLeaseToHuman`; `ExpireAuthenticationEntryLease`)
 are complete and tested (`internal/job/institutional_evidence_test.go`) but
 have **zero production callers** — Slice 3's arbitration reducer (§2.1.1)
-and observation reducer (§2.2.1) are the first callers. Migration `0041`
-**alters** this table rather than adding a parallel one:
+and observation reducer (§2.2.1) are the first callers. Migration `0042`
+(Slice 3; see the split note at the top of §4) **alters** this table
+rather than adding a parallel one:
 
 ```sql
 ALTER TABLE authentication_entry_leases ADD COLUMN owner_binding_id TEXT;
@@ -429,12 +449,15 @@ read in this design (§2.1.1, §2.2.1, §4.4) joins through
 enough pair of parents that a third table would only be a cache that could
 go stale, not new authority.
 
-### 4.2 New: `claim_observation_journal`
+### 4.2 New: `claim_observation_journal` (Slice 3's `0042`)
 
 Idempotency and ordering ledger for §3, and the append-only home for what
 `profile_evidence`/`human_gate_observations` intentionally do **not** track
 (raw per-event replay safety, as opposed to the current-verdict/current-
-occurrence projections those tables already are).
+occurrence projections those tables already are). Lands in `0042` beside
+§4.1's `authentication_entry_leases` `ALTER` (see the split note at the
+top of §4) — nothing about this table's shape changes because of the
+split.
 
 ```sql
 CREATE TABLE claim_observation_journal (
@@ -465,7 +488,7 @@ behind the transactional `MAX()` check; a bug that races two concurrent
 appliers into the same ordinal fails the `INSERT` instead of silently
 double-applying.
 
-### 4.3 New: `close_authorizations`
+### 4.3 New: `close_authorizations` (shipped in `0041`)
 
 One-use tokens for §2.3, deliberately its own table (not folded into
 `materialization_claims`) because a close authorization can be issued for a
@@ -497,11 +520,22 @@ CREATE INDEX close_authorizations_by_status ON close_authorizations(status);
 The partial unique index enforces "at most one live authorization per
 binding" the same way `materialization_claims_live_candidate`
 (migration `0026`) enforces "at most one live claim per candidate" — matching
-an established idiom rather than inventing a new one. Consuming a token
-(reported by a later reconcile pass or the `onTabRemoved` tombstone-replay
-path Slice 2b owns) sets `status='consumed', consumed_at=now`; it is never
-deleted, so a startup reconciliation pass can distinguish "never asked" from
-"asked and already used."
+an established idiom rather than inventing a new one. Token issuance
+(`internal/job.Store.IssueCloseAuthorization`) is idempotent per binding: a
+repeated `authorized` request for the same live binding returns the SAME
+`close_authorization_id`/`nonce` rather than racing a second token into
+existence against the partial unique index; a repeat carrying a strictly
+higher `browser_holder_generation` re-stamps the row, and a live token with
+a *different* disposition than the one now requested is refused as `busy`
+rather than silently repurposed. Consuming a token (reported by a later
+reconcile pass or the `onTabRemoved` tombstone-replay path Slice 2b owns)
+sets `status='consumed', consumed_at=now`; that consumed-marking write
+itself arrives with Slice 3's `owner_closed` reducer (§2.2.1) and Slice
+2b's own `onTabRemoved` path, not with this migration. Expired-but-never-
+consumed tokens are swept by `internal/job.Store.ExpireCloseAuthorizations`,
+a plain housekeeping pass with no reducer of its own. Rows are never
+deleted, so a startup reconciliation pass can distinguish "never asked"
+from "asked and already used" from "asked and it timed out."
 
 ### 4.4 Dependent count: derived, not stored
 

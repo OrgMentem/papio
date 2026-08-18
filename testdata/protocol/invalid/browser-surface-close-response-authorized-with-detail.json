@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"surface_close_response","msg_id":"close-resp-0003","seq":8,"payload":{"request_id":"request-close-0003","outcome":"authorized","close_authorization_id":"authorization-close-0003","nonce":"nonce-close-0003","browser_holder_generation":1,"detail":"should not be here"}}

@@ -102,7 +102,9 @@ export type BrowserMessageType =
   | "terms_effect_start_request"
   | "terms_effect_start_result"
   | "terms_effect_result_request"
-  | "terms_effect_result";
+  | "terms_effect_result"
+  | "surface_close_request"
+  | "surface_close_response";
 export interface HelloPayload {
   extension_version: string;
   adapter_versions?: Record<string, string>;
@@ -336,6 +338,7 @@ export interface ProviderDriveEpochResultPayload extends ProviderDriveEpochTuple
   detail?: string;
 }
 export const EFFECT_PERMIT_FEATURE = "effect_permit_v1" as const;
+export const SURFACE_CLOSE_FEATURE = "surface_close_v1" as const;
 
 export type EffectPermitKind =
   "generic_drive" | "direct_get" | "pdf_grab" | "terms" | "institutional";
@@ -1110,6 +1113,30 @@ export interface InstitutionalNavigatedResponsePayload {
   binding_id?: string;
 }
 
+/** §2.3 of dev/active/claim-observation-protocol.md: generic close
+ * authorization, not job-scoped and not institutional-specific — a scaffold
+ * being closed may have no live job (e.g. an abandoned claim's scaffold
+ * after owner_closed). */
+export interface SurfaceCloseRequestPayload {
+  request_id: string;
+  binding_id: string;
+  browser_holder_generation: number;
+  disposition:
+    | "scaffold_idle"
+    | "materialization_settled"
+    | "claim_abandoned";
+  /** Permitted only when disposition is claim_abandoned. */
+  gate_occurrence_id?: string;
+}
+export interface SurfaceCloseResponsePayload {
+  request_id: string;
+  outcome: "authorized" | "stale" | "not_eligible" | "busy" | "error";
+  close_authorization_id?: string;
+  nonce?: string;
+  browser_holder_generation?: number;
+  detail?: string;
+}
+
 export interface InstitutionalBindingPair {
   binding_id: string;
   tab_id: number;
@@ -1386,6 +1413,8 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   terms_effect_start_result: true,
   terms_effect_result_request: true,
   terms_effect_result: true,
+  surface_close_request: true,
+  surface_close_response: true,
 };
 
 const JOB_SCOPED: Record<string, true> = {
@@ -5946,6 +5975,66 @@ function validatePayload(
       if (!["applied", "duplicate", "stale", "error"].includes(outcome))
         fail(`${type}.outcome is invalid`);
       if ("detail" in p) triageText(p, "detail", type, 500);
+      break;
+    }
+    case "surface_close_request": {
+      requireFields<SurfaceCloseRequestPayload>(p, type, {
+        request_id: "required",
+        binding_id: "required",
+        browser_holder_generation: "required",
+        disposition: "required",
+        gate_occurrence_id: "optional",
+      });
+      institutionalID(p, "request_id", type);
+      institutionalID(p, "binding_id", type);
+      int(p, "browser_holder_generation", type, 0);
+      const disposition = str(p, "disposition", type, 32);
+      if (
+        disposition !== "scaffold_idle" &&
+        disposition !== "materialization_settled" &&
+        disposition !== "claim_abandoned"
+      )
+        fail(`${type}.disposition is invalid`);
+      if (disposition !== "claim_abandoned" && "gate_occurrence_id" in p)
+        fail(
+          `${type}.gate_occurrence_id is only valid for claim_abandoned`,
+        );
+      if ("gate_occurrence_id" in p)
+        institutionalID(p, "gate_occurrence_id", type);
+      break;
+    }
+    case "surface_close_response": {
+      requireFields<SurfaceCloseResponsePayload>(p, type, {
+        request_id: "required",
+        outcome: "required",
+        close_authorization_id: "optional",
+        nonce: "optional",
+        browser_holder_generation: "optional",
+        detail: "optional",
+      });
+      institutionalID(p, "request_id", type);
+      const outcome = str(p, "outcome", type, 20);
+      if (
+        !["authorized", "stale", "not_eligible", "busy", "error"].includes(
+          outcome,
+        )
+      )
+        fail(`${type}.outcome is invalid`);
+      if (outcome === "authorized") {
+        institutionalID(p, "close_authorization_id", type);
+        institutionalID(p, "nonce", type);
+        int(p, "browser_holder_generation", type, 0);
+        if ("detail" in p) fail(`${type}.authorized must not carry detail`);
+      } else {
+        for (const key of [
+          "close_authorization_id",
+          "nonce",
+          "browser_holder_generation",
+        ]) {
+          if (key in p) fail(`${type}.${outcome} must not carry ${key}`);
+        }
+        if ("detail" in p) triageText(p, "detail", type, 1000);
+      }
       break;
     }
   }

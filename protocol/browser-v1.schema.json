@@ -94,7 +94,9 @@
         "activity_page_request",
         "activity_page_response",
         "page_bulk_submit_v2_request",
-        "page_bulk_submit_v2_result"
+        "page_bulk_submit_v2_result",
+        "surface_close_request",
+        "surface_close_response"
       ]
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
@@ -6175,6 +6177,140 @@
                       }
                     }
                   ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "surface_close_request" } }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "binding_id",
+              "browser_holder_generation",
+              "disposition"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "binding_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "browser_holder_generation": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "disposition": {
+                "enum": [
+                  "scaffold_idle",
+                  "materialization_settled",
+                  "claim_abandoned"
+                ]
+              },
+              "gate_occurrence_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "disposition": { "const": "claim_abandoned" }
+                    },
+                    "required": ["disposition"]
+                  }
+                },
+                "then": { "not": { "required": ["gate_occurrence_id"] } }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "surface_close_response" } }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "outcome"],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "outcome": {
+                "enum": ["authorized", "stale", "not_eligible", "busy", "error"]
+              },
+              "close_authorization_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "nonce": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "browser_holder_generation": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "detail": {
+                "type": "string",
+                "maxLength": 1000,
+                "pattern": "^[^\u0000]*$"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "outcome": { "const": "authorized" } },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "required": [
+                    "close_authorization_id",
+                    "nonce",
+                    "browser_holder_generation"
+                  ],
+                  "not": { "required": ["detail"] }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "enum": ["stale", "not_eligible", "busy", "error"]
+                    }
+                  },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "not": {
+                    "anyOf": [
+                      { "required": ["close_authorization_id"] },
+                      { "required": ["nonce"] },
+                      { "required": ["browser_holder_generation"] }
+                    ]
+                  }
                 }
               }
             ]

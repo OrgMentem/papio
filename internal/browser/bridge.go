@@ -106,6 +106,10 @@ const (
 	providerDriveEpochV1Feature         = "provider_drive_epoch_v1"
 	effectPermitFeature                 = protocol.EffectPermitFeature
 	institutionalMaterializationFeature = protocol.InstitutionalMaterializationFeature
+	// surfaceCloseFeature gates the generic one-use close-authorization
+	// request/response pair (surface_close_request/surface_close_response),
+	// independent of institutional_authentication_claim_v1.
+	surfaceCloseFeature = protocol.SurfaceCloseFeature
 	// pdfGrabSuggestV1Feature gates the inbox's operator candidate picker:
 	// the pdf_grab_suggest_request/response ranked "which pending job is
 	// this?" answer and the pdf_grab_confirm_request/response fenced bind
@@ -586,7 +590,7 @@ func (source parkedGrabItemSource) SnapshotItems(ctx context.Context, tx *sql.Tx
 func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service, watchRunner *watch.Runner, previewServer *preview.Server, captureStore *captures.Store, holdings holdingsProvider, zotioService *zotio.Service, cfg config.Config, version string) *Bridge {
 	required := []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, effectPermitFeature, institutionalMaterializationFeature,
-		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature, pdfGrabSuggestV1Feature,
+		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature, pdfGrabSuggestV1Feature, surfaceCloseFeature,
 	}
 	var grabs *grab.Service
 	var cohorts *batch.Cohorts
@@ -1959,6 +1963,78 @@ func (b *Bridge) institutionalReconcile(ctx context.Context, p *protocol.Institu
 	return []json.RawMessage{frame}, nil
 }
 
+// surfaceClose answers surface_close_request (surface_close_v1,
+// dev/active/claim-observation-protocol.md §2.3). Generic, not job-scoped:
+// a scaffold being closed may have no live job. A binding_id with no
+// materialization_claims row at all is never daemon-closable — that covers
+// both an unknown binding and an extension-minted pre-cutover scaffold,
+// which the plan's narrowed migration promise deliberately leaves to a
+// bounded operator review rather than daemon inference.
+func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseRequestPayload) ([]json.RawMessage, error) {
+	requestID := ""
+	if p != nil {
+		requestID = p.RequestID
+	}
+	result := protocol.SurfaceCloseResponsePayload{RequestID: requestID}
+	frame := func() ([]json.RawMessage, error) {
+		f, err := b.frame(protocol.MsgSurfaceCloseResponse, "", result)
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{f}, nil
+	}
+	if p == nil {
+		result.Outcome, result.Detail = "error", "surface close request is missing"
+		return frame()
+	}
+	claim, err := b.jobs.MaterializationClaimByBindingID(ctx, p.BindingID)
+	if err != nil {
+		result.Outcome, result.Detail = "error", "binding state is unavailable"
+		return frame()
+	}
+	if claim == nil {
+		result.Outcome, result.Detail = "not_eligible", "binding has no live materialization claim"
+		return frame()
+	}
+	if p.BrowserHolderGeneration != b.epoch {
+		result.Outcome, result.Detail = "stale", "browser holder generation is not current"
+		return frame()
+	}
+	eligible := false
+	switch p.Disposition {
+	case "materialization_settled":
+		eligible = claim.Phase == "settled"
+	case "claim_abandoned":
+		eligible = claim.Phase == "abandoned"
+	case "scaffold_idle":
+		if claim.Phase == "claimed" || claim.Phase == "bound" {
+			permit, permitErr := b.jobs.LiveEffectPermit(ctx)
+			if permitErr != nil {
+				result.Outcome, result.Detail = "error", "effect permit state is unavailable"
+				return frame()
+			}
+			eligible = permit == nil || permit.ClaimID != claim.ID
+		}
+	}
+	if !eligible {
+		result.Outcome, result.Detail = "not_eligible", "disposition does not match the binding's current phase"
+		return frame()
+	}
+	id, nonce, issueErr := b.jobs.IssueCloseAuthorization(ctx, p.BindingID, p.BrowserHolderGeneration, p.Disposition, b.now())
+	if issueErr != nil {
+		if errors.Is(issueErr, job.ErrCloseAuthorizationConflict) {
+			result.Outcome, result.Detail = "busy", "a live close authorization already exists for this binding"
+		} else {
+			result.Outcome, result.Detail = "error", "close authorization could not be recorded"
+		}
+		return frame()
+	}
+	generation := p.BrowserHolderGeneration
+	result.Outcome, result.CloseAuthorizationID, result.Nonce, result.BrowserHolderGeneration =
+		"authorized", id, nonce, &generation
+	return frame()
+}
+
 // handle dispatches one decoded inbound frame from sessionID.
 func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.BrowserMessage) ([]json.RawMessage, error) {
 	if msg.Type == protocol.MsgHello {
@@ -1983,6 +2059,17 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return b.sessionBusy(msg.JobID)
 	}
 	if msg.Type == protocol.MsgTermsEffectStartRequest {
+		if session == nil {
+			return b.helloRequired()
+		}
+		if b.holder == nil || b.holder.ID != sessionID {
+			return b.sessionBusy(msg.JobID)
+		}
+		if session.Outdated {
+			return b.extensionOutdatedError()
+		}
+	}
+	if msg.Type == protocol.MsgSurfaceCloseRequest {
 		if session == nil {
 			return b.helloRequired()
 		}
@@ -2113,6 +2200,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return b.termsEffectStart(ctx, msg.JobID, msg.Payload.(*protocol.TermsEffectStartRequestPayload))
 	case protocol.MsgTermsEffectResultRequest:
 		return b.termsEffectResult(ctx, msg.JobID, msg.Payload.(*protocol.TermsEffectResultRequestPayload))
+
+	case protocol.MsgSurfaceCloseRequest:
+		return b.surfaceClose(ctx, msg.Payload.(*protocol.SurfaceCloseRequestPayload))
 
 	case protocol.MsgHandoffLinkRequest:
 		return b.handoffLink(ctx, msg.Payload.(*protocol.HandoffLinkRequestPayload))

@@ -44,7 +44,16 @@ import {
   type PageCaptureRequestResultPayload,
   type SurfacePresencePayload,
   type WorkPulseResponsePayload,
+  type SurfaceCloseRequestPayload,
+  type SurfaceCloseResponsePayload,
+  SURFACE_CLOSE_FEATURE,
 } from "./protocol";
+import {
+  isSurfaceBirthRecord,
+  migrateTabLedger,
+  originDigestOf,
+  type SurfaceBirthRecord,
+} from "./ledger";
 import {
   bindFederatedClaim,
   promoteFederatedClaim,
@@ -371,6 +380,7 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
   "pdf_grab_result",
   "surface_presence_ack",
   "work_pulse_response",
+  "surface_close_response",
   // Registered 2026-08-12: the page-bulk bridge (ADR-0019 phase B) landed after
   // this guard and never added its own reply types, so every availability check
   // and v1 submit threw before sending a frame. page_bulk_runs recorded six
@@ -749,17 +759,6 @@ export function findManagedTab(
       normalizeManagedTabURL(candidate.url) === normalized,
   );
 }
-/** Match handoff URL families across re-offers whose resolver query changes.
- * The ledger is the ownership proof; this deliberately ignores query and
- * fragment components only after a ledger entry has identified a papio tab. */
-function managedTabURLFamily(rawURL: string): string | undefined {
-  try {
-    const url = new URL(rawURL);
-    return `${url.origin}${url.pathname}`;
-  } catch {
-    return undefined;
-  }
-}
 
 export type ManagedTabPurpose =
   | "handoff"
@@ -768,7 +767,22 @@ export type ManagedTabPurpose =
   | "redrive"
   | "reoffer"
   | "capture";
-const PRIVATE_HANDOFF_LEDGER_URL = "papio:private-handoff";
+/** Non-URL free-text marker for a one-use federated-login mint's birth
+ * record (Slice 2b): excluded from cross-job reuse pools the same way the
+ * legacy raw-URL ledger's `privateURL` flag was. */
+const PRIVATE_SURFACE_PURPOSE = "federated-login";
+/** Bound on how many same-epoch ledger records classifyRestart() probes
+ * with tabs.get while re-proving an update-class restart. */
+const RESTART_LIVENESS_SCAN_LIMIT = 25;
+const BROWSER_EPOCH_LOCAL_KEY = "papio_browser_epoch_v1";
+const BROWSER_EPOCH_SESSION_KEY = "papio_browser_epoch_session_v1";
+/** The three closed-permitted disposition reasons (claim-observation
+ * protocol design §2.3): idle scaffold never engaged, settled after
+ * artifact win, or an authentication claim's abandonment. */
+type SurfaceCloseDisposition =
+  | "scaffold_idle"
+  | "materialization_settled"
+  | "claim_abandoned";
 export interface OpenManagedTabOptions {
   url: string;
   jobId?: string;
@@ -870,14 +884,6 @@ export interface PdfGrabCorrelation {
   abandonPending?: boolean;
 }
 
-type ManagedTabLedgerEntry = {
-  openedAt: number;
-  url: string;
-  jobID?: string;
-  windowId?: number;
-  groupId?: number;
-  privateURL?: boolean;
-};
 
 export interface BridgeDeps {
   connectNative(name: string): NativePort;
@@ -1044,13 +1050,29 @@ export interface BridgeDeps {
      * tabGroups is absent. */
     getHandoffSurface(): Promise<HandoffSurface>;
   };
-  /** Durable managed-tab ledger (chrome.storage.local). Entries carry the
-   * URL and browser surface captured when papio created the tab, so a stale
-   * id collision after restart cannot focus a foreign tab. Optional: absent
-   * disables durable orphan ownership tracking. */
+  /** Durable managed-tab ledger (chrome.storage.local): URL-free birth
+   * certificates (Slice 2b, `./ledger.ts`). `load()` returns raw storage
+   * contents — possibly still the legacy raw-URL shape — because migration
+   * happens once, lazily, inside the ledger-transaction cache, never here.
+   * Optional: absent disables durable orphan ownership tracking. */
   tabLedger?: {
-    load(): Promise<Record<string, ManagedTabLedgerEntry>>;
-    save(entries: Record<string, ManagedTabLedgerEntry>): Promise<void>;
+    load(): Promise<unknown>;
+    save(entries: Record<string, SurfaceBirthRecord>): Promise<void>;
+  };
+  /** Browser-session epoch (Slice 2b): a session-scoped mirror
+   * (chrome.storage.session, wiped by an update or a restart) paired with a
+   * durable copy (chrome.storage.local, survives an update) so
+   * classifyRestart() can tell an SW restart (session intact, every tab id
+   * still authoritative) from an update (session wiped, but the durable
+   * epoch's own tabs still resolve live) from a genuine browser restart
+   * (neither holds — no existing record's tab-ID authority survives).
+   * Optional: absent classifies every start as a browser restart, the
+   * fail-closed default. */
+  epoch?: {
+    getSession(): Promise<string | undefined>;
+    setSession(value: string): Promise<void>;
+    getLocal(): Promise<string | undefined>;
+    setLocal(value: string): Promise<void>;
   };
   /** Ephemeral scan snapshots (chrome.storage.session): never chrome.storage
    * local/sync, never persisted, never sent to the daemon (ADR-0019
@@ -2250,9 +2272,29 @@ export class Bridge {
   private pageCaptureDriving = false;
   /** Serializes every managed-tab ledger load/mutate/save transaction. */
   private tabLedgerChain: Promise<void> = Promise.resolve();
-  /** Lazily-loaded durable ledger of broker tabs papio created. Entries retain
-   * the original URL/surface identity for safe post-restart review. */
-  private tabLedgerCache: Record<string, ManagedTabLedgerEntry> | undefined;
+  /** Lazily-loaded durable ledger of broker tabs papio created, migrated to
+   * URL-free birth certificates on first touch (Slice 2b). */
+  private tabLedgerCache: Record<string, SurfaceBirthRecord> | undefined;
+  /** Pre-cutover ledger entries retained for one-time manual review because
+   * their provenance could not be re-verified at migration (no jobID to
+   * correlate against). Recomputed by the same migration pass every worker
+   * start; surfaced through orphanTabStatus(). */
+  private legacyLedgerReview: string[] = [];
+  /** This worker lifetime's browser-session epoch (Slice 2b), resolved by
+   * classifyRestart(). Undefined until bootstrapSurfaceLifecycle() runs. */
+  private browserEpoch: string | undefined;
+  private restartClass: "worker" | "update" | "browser" | undefined;
+  /** Most recently observed daemon browser-holder-generation fence, tapped
+   * from any response that carries one. Undefined until the daemon has told
+   * this session a generation at least once — closeOwnedSurface refuses
+   * locally rather than send a request with a made-up value. */
+  private lastKnownBrowserHolderGeneration: number | undefined;
+  /** Resolves once managed-state load, ledger migration, group/window
+   * adoption, and close-tombstone replay have all completed (Slice 2b's
+   * `surfaceReady` barrier). Awaited by native job offers, runtime opens,
+   * drive-queue drains, materialization retries, and close paths; never by
+   * hello/poll/read paths. */
+  private surfaceReady: Promise<void> = Promise.resolve();
   private readonly pageCaptureLoadWaiters = new Map<
     number,
     (loaded: boolean) => void
@@ -2456,6 +2498,11 @@ export class Bridge {
   private workTabChain: Promise<unknown> = Promise.resolve();
   private handoffGroupChain: Promise<void> = Promise.resolve();
   private readonly handoffGroupIDsByWindow = new Map<number, number>();
+  /** Serializes adoption scans, group folding, tombstone replay, and
+   * terminal reconciliation (Slice 2b) — never the effect governor, which
+   * only irreversible provider navigation, page mutation, and download
+   * initiation acquire. */
+  private lifecycleChain: Promise<void> = Promise.resolve();
   /** Native port messages may await storage, tabs, or downloads. Preserve
    * receipt order across those awaits so state transitions never interleave. */
   /** Best-effort display cache only, refreshed from daemon counts or snapshots. */
@@ -3285,7 +3332,6 @@ export class Bridge {
     }
     if (options.jobId !== undefined) {
       const ledger = await this.snapshotTabLedger();
-      const offerFamily = managedTabURLFamily(options.url);
       const ledgerIDs = new Set(
         Object.keys(ledger)
           .map((key) => Number(key))
@@ -3305,31 +3351,27 @@ export class Bridge {
               tabs.filter((tab): tab is TabInfo => tab !== undefined),
             )
           : await this.deps.tabs.query({}).catch(() => []);
+      // Only a tab this exact job already owns is ever a reuse candidate:
+      // with no persisted URL to match a DIFFERENT job's tab against,
+      // cross-job "same resolver family" reuse (the legacy heuristic) no
+      // longer has anything safe to compare, so it is retired rather than
+      // reduced to a coarser, privacy-neutral origin guess.
       for (const candidate of ledgerTabs) {
         if (candidate.id === undefined) continue;
         const entry = ledger[String(candidate.id)];
-        if (entry === undefined || entry.privateURL === true) continue;
-        const ownedByJob = entry.jobID === options.jobId;
+        if (
+          entry === undefined ||
+          entry.purpose === PRIVATE_SURFACE_PURPOSE ||
+          entry.job_id !== options.jobId
+        )
+          continue;
         const trackedCandidate = findByTab(this.store, candidate.id);
         if (
           trackedCandidate !== undefined &&
           trackedCandidate.job_id !== options.jobId
         )
           continue;
-        if (!ownedByJob) {
-          const entryFamily = managedTabURLFamily(entry.url);
-          const currentFamily =
-            typeof candidate.url === "string"
-              ? managedTabURLFamily(candidate.url)
-              : undefined;
-          if (
-            offerFamily === undefined ||
-            (entryFamily !== offerFamily && currentFamily !== offerFamily)
-          )
-            continue;
-        } else {
-          ledgerOwnedTabID = candidate.id;
-        }
+        ledgerOwnedTabID = candidate.id;
         addCandidate(candidate);
       }
     }
@@ -3375,6 +3417,7 @@ export class Bridge {
     await this.recordManagedTab(options.jobId, tabID);
     await this.ledgerManagedTab(
       tabID,
+      options.purpose,
       options.privateLedgerURL === true,
       options.jobId,
     );
@@ -3408,28 +3451,21 @@ export class Bridge {
     const entry = this.tabLedgerCache?.[String(tabID)];
     const materializationCleanup = reason === "materialization-reconcile";
     const rollbackPrivate =
-      reason === "fresh-materialization-rollback" && entry?.privateURL === true;
+      reason === "fresh-materialization-rollback" &&
+      entry?.purpose === PRIVATE_SURFACE_PURPOSE;
     if (
       !materializationCleanup &&
       (entry === undefined || findByTab(this.store, tabID) !== undefined)
     )
       return;
-    if (
-      reason === "adopted-viewer" ||
-      (entry !== undefined && isPDFPage(entry.url))
-    )
-      return;
+    if (reason === "adopted-viewer") return;
     let tab: TabInfo;
     try {
       tab = await this.deps.tabs.get(tabID);
     } catch {
       return;
     }
-    if (
-      reason === "adopted-viewer" ||
-      (tab.url !== undefined && isPDFPage(tab.url))
-    )
-      return;
+    if (tab.url !== undefined && isPDFPage(tab.url)) return;
     if (materializationCleanup) {
       const base = this.deps.runtimeGetURL?.(MATERIALIZE_PAGE_PATH);
       if (
@@ -3462,13 +3498,15 @@ export class Bridge {
     if (
       !rollbackPrivate &&
       !materializationCleanup &&
-      (tab.active === true || (!inWorkWindow && !inPapioGroup))
+      (tab.active === true ||
+        tab.pinned === true ||
+        (!inWorkWindow && !inPapioGroup))
     )
       return;
     await this.deps.tabs.remove(tabID).catch(() => undefined);
   }
   private async saveTabLedger(
-    ledger: Record<string, ManagedTabLedgerEntry>,
+    ledger: Record<string, SurfaceBirthRecord>,
   ): Promise<void> {
     const snapshot = { ...ledger };
     try {
@@ -3478,22 +3516,37 @@ export class Bridge {
     }
   }
   /** Load, mutate, and persist the managed-tab ledger as one serialized
-   * transaction. Every cache and storage value is a fresh snapshot so a later
-   * mutation cannot rewrite an earlier save's object in place. */
+   * transaction. The first load of a worker lifetime runs the raw storage
+   * contents through migrateTabLedger (Slice 2b) — idempotent on an
+   * already-migrated ledger — so every caller sees URL-free birth
+   * certificates regardless of which one happens to touch the ledger
+   * first; the migration itself is persisted once, immediately. Every
+   * cache and storage value is a fresh snapshot so a later mutation cannot
+   * rewrite an earlier save's object in place. */
   private runTabLedgerTransaction<T>(
     transaction: (
-      ledger: Record<string, ManagedTabLedgerEntry>,
+      ledger: Record<string, SurfaceBirthRecord>,
     ) =>
       Promise<{ value: T; changed: boolean }> | { value: T; changed: boolean },
   ): Promise<T> {
     const operation = this.tabLedgerChain.then(async () => {
       let cached = this.tabLedgerCache;
       if (cached === undefined) {
+        let raw: unknown = {};
         try {
-          cached = (await this.deps.tabLedger?.load()) ?? {};
+          raw = (await this.deps.tabLedger?.load()) ?? {};
         } catch {
-          cached = {};
+          raw = {};
         }
+        const migrated = await migrateTabLedger(
+          raw,
+          () => this.deps.randomUUID(),
+          () => this.deps.now(),
+        );
+        cached = migrated.ledger;
+        this.legacyLedgerReview = migrated.review;
+        this.tabLedgerCache = { ...cached };
+        await this.saveTabLedger(this.tabLedgerCache);
       }
 
       const ledger = { ...cached };
@@ -3509,7 +3562,7 @@ export class Bridge {
     return operation;
   }
   private async snapshotTabLedger(): Promise<
-    Record<string, ManagedTabLedgerEntry>
+    Record<string, SurfaceBirthRecord>
   > {
     if (this.deps.tabLedger === undefined) return {};
     return this.runTabLedgerTransaction((ledger) => ({
@@ -3518,13 +3571,17 @@ export class Bridge {
     }));
   }
 
-  /** Record a broker tab papio CREATED. Reused tabs are deliberately never
-   * ledgered: a URL-matched reuse can be the user's own tab, and the ledger
-   * exists to authorize closing — papio must never earn that authority over
-   * a tab it did not open. */
+  /** Record a broker tab papio CREATED as a URL-free birth certificate
+   * (Slice 2b). Reused tabs are deliberately never ledgered: a URL-matched
+   * reuse can be the user's own tab, and the ledger exists to authorize
+   * closing — papio must never earn that authority over a tab it did not
+   * open. `privateSurface` marks a one-use federated-login mint, isolated
+   * from cross-job reuse the same way the legacy `privateLedgerURL` flag
+   * isolated it. */
   private async ledgerManagedTab(
     tabID: number,
-    privateURL = false,
+    purpose: string,
+    privateSurface = false,
     jobID?: string,
   ): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
@@ -3534,19 +3591,21 @@ export class Bridge {
     } catch {
       return;
     }
-    if (typeof tab.url !== "string" || tab.url.length === 0) return;
-    const tabURL = tab.url;
+    const originDigest =
+      typeof tab.url === "string" ? await originDigestOf(tab.url) : undefined;
     await this.runTabLedgerTransaction(async (ledger) => {
       const key = String(tabID);
       if (ledger[key] !== undefined)
         return { value: undefined, changed: false };
       ledger[key] = {
-        openedAt: this.deps.now(),
-        url: privateURL ? PRIVATE_HANDOFF_LEDGER_URL : tabURL,
-        ...(jobID === undefined ? {} : { jobID }),
-        ...(privateURL ? { privateURL: true } : {}),
-        ...(tab.windowId === undefined ? {} : { windowId: tab.windowId }),
-        ...(tab.groupId === undefined ? {} : { groupId: tab.groupId }),
+        binding_id: this.deps.randomUUID(),
+        tab_hint: tabID,
+        purpose: privateSurface ? PRIVATE_SURFACE_PURPOSE : purpose,
+        browser_epoch: this.browserEpoch ?? "unknown",
+        extension_generation: this.deps.manifestVersion,
+        created_at: this.deps.now(),
+        ...(originDigest === undefined ? {} : { origin_digest: originDigest }),
+        ...(jobID === undefined ? {} : { job_id: jobID }),
       };
       return { value: undefined, changed: true };
     });
@@ -3562,23 +3621,23 @@ export class Bridge {
     });
   }
 
-  /** A live papio-created sign-in tab for this origin family. The jobless
-   * sign-in fallback used to skip ledger reuse entirely (candidate gathering
-   * is jobId-scoped), so repeated fallbacks minted repeated sign-in tabs
+  /** A live papio-created sign-in tab for this origin. The jobless sign-in
+   * fallback used to skip ledger reuse entirely (candidate gathering is
+   * jobId-scoped), so repeated fallbacks minted repeated sign-in tabs
    * (surface-lifecycle plan, Slice 0). A tab qualifies while its current
-   * document is still at the requested origin family or on an authentication
-   * page — either way the sign-in surface already exists. A tab tracked by
-   * any job is never a candidate: sign-in must not steal a job's surface. */
+   * document is still at the requested origin or on an authentication page
+   * — either way the sign-in surface already exists. A tab tracked by any
+   * job is never a candidate: sign-in must not steal a job's surface. */
   private async findLedgeredSignInTab(url: string): Promise<number | undefined> {
-    const family = managedTabURLFamily(url);
-    if (family === undefined) return undefined;
+    const requestedDigest = await originDigestOf(url);
+    if (requestedDigest === undefined) return undefined;
     const ledger = await this.snapshotTabLedger();
     for (const key of Object.keys(ledger)) {
       const tabID = Number(key);
       if (!Number.isInteger(tabID) || tabID < 0) continue;
       const entry = ledger[key];
-      if (entry === undefined || entry.privateURL === true) continue;
-      if (managedTabURLFamily(entry.url) !== family) continue;
+      if (entry === undefined || entry.origin_digest !== requestedDigest)
+        continue;
       if (findByTab(this.store, tabID) !== undefined) continue;
       let tab: TabInfo;
       try {
@@ -3587,10 +3646,8 @@ export class Bridge {
         continue;
       }
       if (tab.id !== tabID || typeof tab.url !== "string") continue;
-      if (
-        managedTabURLFamily(tab.url) !== family &&
-        !isAuthenticationURL(tab.url)
-      )
+      const liveDigest = await originDigestOf(tab.url);
+      if (liveDigest !== requestedDigest && !isAuthenticationURL(tab.url))
         continue;
       return tabID;
     }
@@ -3599,19 +3656,19 @@ export class Bridge {
 
   /** Classify ledgered, untracked tabs without taking lifecycle action. Tabs
    * in papio surfaces and tabs the operator can review are returned
-   * separately; dead entries are pruned. A tab that navigated away from its
-   * creation URL stays ledgered — ordinary resolver→SSO→provider redirects
-   * must not erase ownership evidence (surface-lifecycle plan, Slice 0) —
-   * but it is surfaced NOWHERE: by URL alone a navigated papio tab is
-   * indistinguishable from a recycled tab id naming a foreign tab, so the
-   * entry authorizes no action (not even review focus) until restart-class
-   * identity proof exists (Slice 2). Tracked, active, and pinned (keepalive)
-   * tabs are never candidates. */
+   * separately. A tab whose live origin no longer digests to its birth
+   * certificate's `origin_digest` stays ledgered — ordinary resolver→SSO→
+   * provider redirects must not erase ownership evidence (surface-lifecycle
+   * plan, Slice 0) — but it is surfaced NOWHERE: a navigated papio tab is
+   * indistinguishable from a recycled tab id naming a foreign tab by digest
+   * alone. Tracked, active, and pinned (keepalive) tabs are never
+   * candidates. */
   private async classifyLedgeredTabs(): Promise<{
     auto: number[];
     ask: number[];
   }> {
     await this.ready;
+    await this.surfaceReady;
     if (this.deps.tabLedger === undefined) return { auto: [], ask: [] };
     const tracked = new Set<number>();
     for (const job of this.store.activeJobs)
@@ -3630,13 +3687,7 @@ export class Bridge {
         }
         if (tracked.has(tabID)) continue;
         const entry = ledger[key];
-        if (
-          entry === undefined ||
-          typeof entry.url !== "string" ||
-          entry.url.length === 0 ||
-          (entry.privateURL === true &&
-            entry.url !== PRIVATE_HANDOFF_LEDGER_URL)
-        ) {
+        if (entry === undefined) {
           delete ledger[key];
           changed = true;
           continue;
@@ -3649,7 +3700,10 @@ export class Bridge {
           changed = true;
           continue;
         }
-        const navigated = entry.privateURL !== true && tab.url !== entry.url;
+        const navigated =
+          entry.origin_digest === undefined ||
+          typeof tab.url !== "string" ||
+          (await originDigestOf(tab.url)) !== entry.origin_digest;
         if (tab.active === true || tab.pinned === true) continue;
         if (navigated) continue;
         let ownedSurface =
@@ -3672,10 +3726,17 @@ export class Bridge {
     });
   }
 
-  /** Popup card contents: only the strays papio will not touch on its own. */
+  /** Popup card contents: the strays papio will not touch on its own, plus
+   * pre-cutover ledger entries the Slice 2a migration could not re-verify
+   * (no jobID to correlate against). */
   async orphanTabStatus(): Promise<{ count: number; tab_ids: number[] }> {
-    const { ask } = await this.classifyLedgeredTabs();
-    return { count: ask.length, tab_ids: ask };
+    const { auto, ask } = await this.classifyLedgeredTabs();
+    const classified = new Set([...auto, ...ask]);
+    const ledger = await this.snapshotTabLedger();
+    const legacyCount = this.legacyLedgerReview.filter(
+      (key) => ledger[key] !== undefined && !classified.has(Number(key)),
+    ).length;
+    return { count: ask.length + legacyCount, tab_ids: ask };
   }
 
   /** papio owns its surfaces but never closes them; startup reconciliation
@@ -3698,6 +3759,287 @@ export class Bridge {
       return { closed: 0, focused: 0 };
     }
   }
+
+  private async inLifecycleChain<T>(work: () => Promise<T>): Promise<T> {
+    const queued = this.lifecycleChain.then(work);
+    this.lifecycleChain = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
+  /** Slice 2b restart classification, run once at startup. SW restart:
+   * chrome.storage.session still holds the epoch, so every tab id in the
+   * ledger is still authoritative. Update: session was wiped, but the
+   * durable local epoch's own tabs still resolve live, so the browser
+   * process itself never died. Browser restart: neither holds — every tab
+   * id's authority is gone, so a fresh epoch is minted that no existing
+   * record can accidentally re-prove against; every record becomes
+   * review-only until it is touched by a fresh open or close. */
+  private async classifyRestart(): Promise<"worker" | "update" | "browser"> {
+    const epoch = this.deps.epoch;
+    if (epoch === undefined) {
+      this.browserEpoch = this.deps.randomUUID();
+      return "browser";
+    }
+    const sessionEpoch = await epoch.getSession().catch(() => undefined);
+    if (sessionEpoch !== undefined && sessionEpoch.length > 0) {
+      this.browserEpoch = sessionEpoch;
+      return "worker";
+    }
+    const localEpoch = await epoch.getLocal().catch(() => undefined);
+    if (
+      localEpoch !== undefined &&
+      localEpoch.length > 0 &&
+      (await this.epochStillLive(localEpoch))
+    ) {
+      this.browserEpoch = localEpoch;
+      await epoch.setSession(localEpoch).catch(() => undefined);
+      return "update";
+    }
+    const fresh = this.deps.randomUUID();
+    this.browserEpoch = fresh;
+    await epoch.setLocal(fresh).catch(() => undefined);
+    await epoch.setSession(fresh).catch(() => undefined);
+    return "browser";
+  }
+
+  /** "Any birth-record tab_hint resolves via tabs.get" — the bounded
+   * liveness re-proof backing the update-vs-browser-restart distinction.
+   * Reads storage directly: this runs before the ledger migration populates
+   * the transaction cache. */
+  private async epochStillLive(localEpoch: string): Promise<boolean> {
+    if (this.deps.tabLedger === undefined) return false;
+    let raw: unknown;
+    try {
+      raw = await this.deps.tabLedger.load();
+    } catch {
+      return false;
+    }
+    if (typeof raw !== "object" || raw === null) return false;
+    const candidates = Object.values(raw as Record<string, unknown>)
+      .filter(isSurfaceBirthRecord)
+      .filter((record) => record.browser_epoch === localEpoch)
+      .slice(0, RESTART_LIVENESS_SCAN_LIMIT);
+    for (const record of candidates) {
+      try {
+        const tab = await this.deps.tabs.get(record.tab_hint);
+        if (tab.id === record.tab_hint) return true;
+      } catch {
+        // One dead tab is not proof the browser restarted; keep scanning.
+      }
+    }
+    return false;
+  }
+
+  /** A ledger record proves live ownership only when it was minted under
+   * the CURRENT browser epoch (a "pre-v2" or stale epoch never re-proves —
+   * the restart-class invariant above) and its tab_hint still resolves
+   * live. Only such tabs may seed group/window adoption. */
+  private async ownedMemberTab(
+    tabID: number,
+    ledger: Record<string, SurfaceBirthRecord>,
+  ): Promise<TabInfo | undefined> {
+    const record = ledger[String(tabID)];
+    if (record === undefined || record.browser_epoch !== this.browserEpoch)
+      return undefined;
+    try {
+      const tab = await this.deps.tabs.get(tabID);
+      return tab.id === tabID ? tab : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async groupHasOwnedMember(
+    group: TabGroupInfo,
+    ledger: Record<string, SurfaceBirthRecord>,
+  ): Promise<boolean> {
+    const tabs = this.deps.tabs;
+    if (tabs.query === undefined) return false;
+    let members: TabInfo[];
+    try {
+      members = await tabs.query({ groupId: group.id });
+    } catch {
+      return false;
+    }
+    for (const tab of members) {
+      if (tab.id === undefined) continue;
+      if ((await this.ownedMemberTab(tab.id, ledger)) !== undefined)
+        return true;
+    }
+    return false;
+  }
+
+  /** Rediscover the dedicated work window through an owned member instead
+   * of trusting the persisted id: a stale id can 404 (openWorkWindowTab's
+   * own fallback already handles that) or, worse, collide with a window
+   * Chrome reassigned the same numeric id to after a restart. */
+  private async adoptWorkWindowFromOwnedMembers(
+    ledger: Record<string, SurfaceBirthRecord>,
+  ): Promise<void> {
+    if (this.deps.tabs.query === undefined) return;
+    const owned: TabInfo[] = [];
+    for (const key of Object.keys(ledger)) {
+      const tabID = Number(key);
+      if (!Number.isInteger(tabID) || tabID < 0) continue;
+      const tab = await this.ownedMemberTab(tabID, ledger);
+      if (tab !== undefined) owned.push(tab);
+    }
+    const current = this.store.workWindowID;
+    if (current !== undefined && owned.some((tab) => tab.windowId === current))
+      return;
+    const adopted = owned.find((tab) => tab.windowId !== undefined)?.windowId;
+    if (adopted !== current) {
+      await this.update((s) => {
+        const next = { ...s };
+        if (adopted === undefined) delete next.workWindowID;
+        else next.workWindowID = adopted;
+        return next;
+      });
+    }
+  }
+
+  /** Reconciles the persisted tab ledger, papio-owned groups/windows, and
+   * any close tombstone left by a prior worker lifetime, under the
+   * lifecycle mutex — never the effect governor. A bounded-scan failure
+   * fails closed to no-adoption/no-close rather than throwing into a
+   * crashed barrier (surfaceReady itself catches this). */
+  private async bootstrapSurfaceLifecycle(): Promise<void> {
+    await this.inLifecycleChain(async () => {
+      this.restartClass = await this.classifyRestart();
+      const ledger = await this.snapshotTabLedger();
+      await this.reconcileHandoffGroups();
+      await this.adoptWorkWindowFromOwnedMembers(ledger);
+      await this.replayPendingCloseTombstones();
+    });
+  }
+
+  /** The generic Slice 2b close transaction: request a one-use daemon
+   * authorization for the tab's binding, persist its tombstone before
+   * touching the tab, then re-verify liveness before running the removal
+   * through the existing closeOwnedTab primitive. Positive evidence closes;
+   * every other outcome retains the surface. */
+  private async closeOwnedSurface(
+    tabID: number,
+    disposition: SurfaceCloseDisposition,
+    gateOccurrenceID?: string,
+  ): Promise<{ closed: boolean }> {
+    await this.surfaceReady;
+    const ledger = await this.snapshotTabLedger();
+    const record = ledger[String(tabID)];
+    if (record === undefined || record.ceded === true)
+      return { closed: false };
+    return this.inLifecycleChain(() =>
+      this.closeAuthorizedRecord(tabID, record, disposition, gateOccurrenceID),
+    );
+  }
+
+  private async closeAuthorizedRecord(
+    tabID: number,
+    record: SurfaceBirthRecord,
+    disposition: SurfaceCloseDisposition,
+    gateOccurrenceID: string | undefined,
+  ): Promise<{ closed: boolean }> {
+    const generation = this.lastKnownBrowserHolderGeneration;
+    if (generation === undefined) return { closed: false };
+    const result = await this.requestNative(
+      "surface_close_request",
+      {
+        binding_id: record.binding_id,
+        browser_holder_generation: generation,
+        disposition,
+        ...(disposition === "claim_abandoned" && gateOccurrenceID !== undefined
+          ? { gate_occurrence_id: gateOccurrenceID }
+          : {}),
+      },
+      "surface_close_response",
+      SURFACE_CLOSE_FEATURE,
+      true,
+    );
+    if (result.kind !== "response" || result.payload === undefined)
+      return { closed: false };
+    if (result.payload["outcome"] !== "authorized") return { closed: false };
+    const authorizationID = result.payload["close_authorization_id"];
+    const nonce = result.payload["nonce"];
+    const responseGeneration = result.payload["browser_holder_generation"];
+    if (
+      typeof authorizationID !== "string" ||
+      typeof nonce !== "string" ||
+      typeof responseGeneration !== "number"
+    )
+      return { closed: false };
+    this.lastKnownBrowserHolderGeneration = responseGeneration;
+    const bindingID = record.binding_id;
+    const tombstoned = await this.runTabLedgerTransaction((ledger) => {
+      const current = ledger[String(tabID)];
+      if (current === undefined || current.binding_id !== bindingID)
+        return { value: false, changed: false };
+      ledger[String(tabID)] = {
+        ...current,
+        pending_close: {
+          authorization_id: authorizationID,
+          nonce,
+          holder_generation: responseGeneration,
+          recorded_at: this.deps.now(),
+        },
+      };
+      return { value: true, changed: true };
+    });
+    if (!tombstoned) return { closed: false };
+    return this.consumeCloseTombstone(tabID, bindingID);
+  }
+
+  /** The one fresh tabs.get the plan requires before the awaited removal.
+   * A tab that became active, pinned, or navigated to content papio must
+   * never auto-close (a PDF viewer — closeOwnedTab's own group/window gate
+   * covers "not adopted-content") is ceded and detached instead of
+   * retried: its tombstone is cleared so a later restart never re-requests
+   * a closure the operator has already claimed by using the tab. */
+  private async consumeCloseTombstone(
+    tabID: number,
+    bindingID: string,
+  ): Promise<{ closed: boolean }> {
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(tabID);
+    } catch {
+      // Already gone — nothing left to remove or cede.
+      return { closed: true };
+    }
+    if (tab.active === true || tab.pinned === true || (tab.url !== undefined && isPDFPage(tab.url))) {
+      await this.runTabLedgerTransaction((ledger) => {
+        const current = ledger[String(tabID)];
+        if (current === undefined || current.binding_id !== bindingID)
+          return { value: undefined, changed: false };
+        const next: SurfaceBirthRecord = { ...current, ceded: true };
+        delete next.pending_close;
+        delete next.job_id;
+        ledger[String(tabID)] = next;
+        return { value: undefined, changed: true };
+      });
+      return { closed: false };
+    }
+    await this.closeOwnedTab(tabID, "authorized-close");
+    return { closed: true };
+  }
+
+  /** Startup replay: a failed remove or a worker death between tombstone
+   * persistence and removal leaves the tombstone in place. Re-requesting
+   * the same binding's authorization is idempotent daemon-side (the same
+   * live token comes back), so replay is just re-running the transaction
+   * from its authorization step. */
+  private async replayPendingCloseTombstones(): Promise<void> {
+    const ledger = await this.snapshotTabLedger();
+    for (const [key, record] of Object.entries(ledger)) {
+      if (record.pending_close === undefined) continue;
+      const tabID = Number(key);
+      if (!Number.isInteger(tabID) || tabID < 0) continue;
+      await this.closeAuthorizedRecord(tabID, record, "scaffold_idle", undefined);
+    }
+  }
+
   private handoffNeedsHumanNow(): boolean {
     return this.store.activeJobs.some(
       (job) => job.status === "auth_pending" || job.challenge_blocked === true,
@@ -3847,22 +4189,38 @@ export class Bridge {
     }
   }
 
-  private preferredHandoffGroup(
+  /** Never trusts a papio-titled group by title alone (surface-lifecycle
+   * plan, Slice 2b): a candidate is preferred only once it is confirmed to
+   * contain at least one positively owned member tab. A group with no
+   * owned member is never adopted, merged, or closed. */
+  private async preferredHandoffGroup(
     candidates: TabGroupInfo[],
     windowID: number | undefined,
-  ): TabGroupInfo | undefined {
+    ledger: Record<string, SurfaceBirthRecord>,
+  ): Promise<TabGroupInfo | undefined> {
     const remembered =
       windowID === undefined
         ? undefined
         : this.handoffGroupIDsByWindow.get(windowID);
-    return (
-      candidates.find((candidate) => candidate.id === remembered) ??
+    const ordered: TabGroupInfo[] = [];
+    const seen = new Set<number>();
+    const push = (candidate: TabGroupInfo | undefined): void => {
+      if (candidate === undefined || seen.has(candidate.id)) return;
+      seen.add(candidate.id);
+      ordered.push(candidate);
+    };
+    push(candidates.find((candidate) => candidate.id === remembered));
+    push(
       candidates.find(
         (candidate) => candidate.id === this.store.handoffGroupID,
-      ) ??
-      candidates.find((candidate) => candidate.collapsed === false) ??
-      candidates[0]
+      ),
     );
+    push(candidates.find((candidate) => candidate.collapsed === false));
+    for (const candidate of candidates) push(candidate);
+    for (const candidate of ordered) {
+      if (await this.groupHasOwnedMember(candidate, ledger)) return candidate;
+    }
+    return undefined;
   }
 
   /** Merge legacy duplicates before another tab is added, so adoption repairs
@@ -3936,7 +4294,8 @@ export class Bridge {
     }
     const found = await this.findHandoffGroups(windowID);
     if (found !== undefined) {
-      reuse = this.preferredHandoffGroup(found, windowID) ?? reuse;
+      const ledger = await this.snapshotTabLedger();
+      reuse = (await this.preferredHandoffGroup(found, windowID, ledger)) ?? reuse;
     }
     if (reuse !== undefined) {
       if (found !== undefined)
@@ -3984,6 +4343,7 @@ export class Bridge {
   private async reconcileHandoffGroupsUnlocked(): Promise<void> {
     const candidates = await this.findHandoffGroups();
     if (candidates === undefined || candidates.length === 0) return;
+    const ledger = await this.snapshotTabLedger();
     const byWindow = new Map<number, TabGroupInfo[]>();
     for (const candidate of candidates) {
       const windowID = await this.handoffGroupWindowID(candidate);
@@ -3997,7 +4357,7 @@ export class Bridge {
     }
     const selected: { group: TabGroupInfo; windowID: number }[] = [];
     for (const [windowID, groups] of byWindow) {
-      const primary = this.preferredHandoffGroup(groups, windowID);
+      const primary = await this.preferredHandoffGroup(groups, windowID, ledger);
       if (primary === undefined) continue;
       await this.foldDuplicateHandoffGroups(primary, groups, windowID);
       this.handoffGroupIDsByWindow.set(windowID, primary.id);
@@ -4141,9 +4501,9 @@ export class Bridge {
         if (group !== undefined) return group.id;
       }
       const found = await this.findHandoffGroups(windowID);
-      return found === undefined
-        ? undefined
-        : this.preferredHandoffGroup(found, windowID)?.id;
+      if (found === undefined) return undefined;
+      const ledger = await this.snapshotTabLedger();
+      return (await this.preferredHandoffGroup(found, windowID, ledger))?.id;
     } catch {
       // A disappearing tab must not prevent the native handoff from progressing.
       return undefined;
@@ -4310,12 +4670,13 @@ export class Bridge {
         // detach semantics.
         await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
       }
-      this.closeOwnedTab(tabID, "timeout");
+      await this.closeOwnedSurface(tabID, "scaffold_idle");
       await this.parkHandoffForManual(jobID);
     }, HANDOFF_DRIVE_TIMEOUT_MS);
   }
 
   private async drainHandoffDriveQueueUnlocked(): Promise<void> {
+    await this.surfaceReady;
     while (
       this.handoffDrives.size < HANDOFF_DRIVE_LIMIT &&
       this.handoffDriveQueue.length > 0
@@ -4874,6 +5235,14 @@ export class Bridge {
       this.hydrated = true;
       await this.update((current) => current);
     });
+    this.surfaceReady = this.ready
+      .then(() => this.bootstrapSurfaceLifecycle())
+      .catch((e) => {
+        console.error(
+          "papio: surface-lifecycle startup failed; adoption/close skipped",
+          e,
+        );
+      });
     this.connect();
     // Wake this worker even when idle so queued daemon offers reach it (the
     // native connection originates here, so the daemon cannot wake a dormant
@@ -4886,9 +5255,10 @@ export class Bridge {
     await this.restoreProviderDrainLeaseTimers();
     await this.reconcileDirectDownloads();
     await this.reconcileGenericDownloads();
-    // Reconcile persisted papio groups before any new fold can race the
-    // startup repair and multiply groups in the same browser window.
-    await this.reconcileHandoffGroups();
+    // Reconcile persisted papio groups, ledger identity, and any close
+    // tombstone before any new fold can race the startup repair and
+    // multiply groups in the same browser window (surfaceReady barrier).
+    await this.surfaceReady;
     await this.syncConnectionBadge();
     await this.reconcileTabs();
     await this.reconcileFederatedLoginOwners();
@@ -6208,7 +6578,7 @@ export class Bridge {
     }
     if (returnedTabID === undefined) {
       await this.recordManagedTab(jobID, tabID);
-      await this.ledgerManagedTab(tabID, true, jobID);
+      await this.ledgerManagedTab(tabID, "session-signin", true, jobID);
     }
     this.beginProviderDrive(jobID);
     this.registerHandoffDrive(jobID, tabID);
@@ -6249,6 +6619,7 @@ export class Bridge {
     jobID: string,
   ): Promise<BrokerReply<{ opened: true }>> {
     await this.ready;
+    await this.surfaceReady;
     let job = findByJob(this.store, jobID);
     if (job?.requires_auth === true && !this.hasCurrentHello()) {
       await this.ensureConnected();
@@ -7061,6 +7432,7 @@ export class Bridge {
   }
 
   private async runMaterialization(jobID: string): Promise<void> {
+    await this.surfaceReady;
     if (this.cancelledMaterializationJobs.has(jobID)) return;
     let correlation = this.materializationCorrelation(jobID);
     if (correlation === undefined || correlation.phase === "navigated") return;
@@ -7137,6 +7509,7 @@ export class Bridge {
         await this.retryMaterializationAfterResponseLoss(jobID, "claim");
         return;
       }
+      this.lastKnownBrowserHolderGeneration = holderGeneration;
       await this.applyMaterialization(jobID, {
         type: "claimed",
         claim_id: claimID,
@@ -13041,6 +13414,7 @@ export class Bridge {
     // is holder-only. A pending session that answered anyway would open tabs
     // and drive a provider for a slot it does not hold.
     if (!this.holderRole()) return;
+    await this.surfaceReady;
     const p = msg.payload;
     const openurl = p["openurl"];
     const hostsRaw = p["provider_hosts"];
@@ -13849,7 +14223,7 @@ export class Bridge {
     this.adoptedViewerTabs.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
     await this.removeJobWithOffer(jobID);
-    await this.ledgerManagedTab(tabID);
+    await this.ledgerManagedTab(tabID, "adopted-viewer");
     void this.closeOwnedTab(tabID, "adopted-viewer");
   }
 
@@ -14633,7 +15007,7 @@ export class Bridge {
       const openerMatches =
         this.hasDelegatedAuthority(j) &&
         openerTabId !== undefined &&
-        (j.tab_id === openerTabId || openerLedgerEntry?.jobID === j.job_id);
+        (j.tab_id === openerTabId || openerLedgerEntry?.job_id === j.job_id);
       const packagedCDNMatch =
         openerTabId === undefined &&
         this.hasRecordedProviderCDNRelationship(j, host);
@@ -16753,10 +17127,19 @@ export class Bridge {
     const pageCaptureWaiter = this.pageCaptureLoadWaiters.get(tabID);
     if (pageCaptureWaiter !== undefined) pageCaptureWaiter(false);
     this.authCountedTabs.delete(tabID);
+    const authorizedClose =
+      this.tabLedgerCache?.[String(tabID)]?.pending_close !== undefined;
     void this.forgetLedgeredTab(tabID);
     await this.clearFederatedLoginOwnerForTab(tabID);
     const job = findByTab(this.store, tabID);
     if (!job) return;
+    if (authorizedClose) {
+      // A deliberate, daemon-authorized close (closeOwnedSurface), not an
+      // operator cancel: detach the job from its now-gone tab without
+      // emitting provider_outcome/cancellation or tearing the job down.
+      await this.update((s) => patchJob(s, job.job_id, { tab_id: -1 }));
+      return;
+    }
     this.releaseHandoffDrive(job.job_id);
     if (this.classifyRetries.delete(job.job_id)) {
       // The close has already settled the in-flight classification lifecycle;
@@ -18935,37 +19318,28 @@ function realDeps(): BridgeDeps {
     tabLedger: {
       load: async () => {
         const got = await chrome.storage.local.get(MANAGED_TAB_LEDGER_KEY);
-        const v = got[MANAGED_TAB_LEDGER_KEY];
-        if (typeof v !== "object" || v === null || Array.isArray(v)) return {};
-        const entries: Record<string, ManagedTabLedgerEntry> = {};
-        for (const [key, value] of Object.entries(
-          v as Record<string, unknown>,
-        )) {
-          if (
-            typeof value === "object" &&
-            value !== null &&
-            typeof (value as Record<string, unknown>).openedAt === "number" &&
-            typeof (value as Record<string, unknown>).url === "string"
-          ) {
-            const item = value as Record<string, unknown>;
-            entries[key] = {
-              openedAt: item.openedAt as number,
-              url: item.url as string,
-              ...(typeof item.jobID === "string" ? { jobID: item.jobID } : {}),
-              ...(item.privateURL === true ? { privateURL: true } : {}),
-              ...(typeof item.windowId === "number"
-                ? { windowId: item.windowId }
-                : {}),
-              ...(typeof item.groupId === "number"
-                ? { groupId: item.groupId }
-                : {}),
-            };
-          }
-        }
-        return entries;
+        return got[MANAGED_TAB_LEDGER_KEY];
       },
       save: async (entries) => {
         await chrome.storage.local.set({ [MANAGED_TAB_LEDGER_KEY]: entries });
+      },
+    },
+    epoch: {
+      getSession: async () => {
+        const got = await chrome.storage.session.get(BROWSER_EPOCH_SESSION_KEY);
+        const v = got[BROWSER_EPOCH_SESSION_KEY];
+        return typeof v === "string" ? v : undefined;
+      },
+      setSession: async (value: string) => {
+        await chrome.storage.session.set({ [BROWSER_EPOCH_SESSION_KEY]: value });
+      },
+      getLocal: async () => {
+        const got = await chrome.storage.local.get(BROWSER_EPOCH_LOCAL_KEY);
+        const v = got[BROWSER_EPOCH_LOCAL_KEY];
+        return typeof v === "string" ? v : undefined;
+      },
+      setLocal: async (value: string) => {
+        await chrome.storage.local.set({ [BROWSER_EPOCH_LOCAL_KEY]: value });
       },
     },
     permissions: {

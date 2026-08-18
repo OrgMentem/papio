@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"surface_close_response","msg_id":"close-resp-0007","seq":12,"payload":{"request_id":"request-close-0007","outcome":"not_eligible","close_authorization_id":"authorization-close-0007"}}

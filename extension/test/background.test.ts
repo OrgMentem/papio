@@ -16,6 +16,7 @@ import {
   type PageCapturePayload,
   type PdfGrabRefusalReason,
 } from "../src/protocol";
+import { type SurfaceBirthRecord } from "../src/ledger";
 import {
   emptyStore,
   findByJob,
@@ -364,6 +365,7 @@ interface Harness {
   postedStrings(): string[];
   scannerAllowlist: { origins: string[] };
   pageBulkScans: { current: PageBulkScanStore };
+  sessionStorage: { clear(): void };
 }
 
 function makeHarness(
@@ -446,6 +448,12 @@ function makeHarness(
   const pageBulkScans: { current: PageBulkScanStore } = {
     current: emptyPageBulkScanStore(),
   };
+  // Slice 2b browser-session epoch: mirrors chrome.storage.session (wiped by
+  // simulateExtensionUpdate below) paired with chrome.storage.local (never
+  // wiped) — restartWorker leaves both cells alone, exactly like a real SW
+  // restart.
+  const epochSession: { value: string | undefined } = { value: undefined };
+  const epochLocal: { value: string | undefined } = { value: undefined };
   const deps: BridgeDeps = {
     connectNative: () => {
       if (connects++ === 0) return port;
@@ -474,6 +482,16 @@ function makeHarness(
       get: async () => scannerAllowlist.origins,
       set: async (origins) => {
         scannerAllowlist.origins = origins;
+      },
+    },
+    epoch: {
+      getSession: async () => epochSession.value,
+      setSession: async (value) => {
+        epochSession.value = value;
+      },
+      getLocal: async () => epochLocal.value,
+      setLocal: async (value) => {
+        epochLocal.value = value;
       },
     },
     pageBulkScans: {
@@ -538,6 +556,11 @@ function makeHarness(
       ports.flatMap((p) => p.posted.map((f) => JSON.stringify(f))),
     scannerAllowlist,
     pageBulkScans,
+    sessionStorage: {
+      clear: () => {
+        epochSession.value = undefined;
+      },
+    },
   };
 }
 
@@ -643,29 +666,34 @@ function jobOfferForHosts(
   offer.payload["provider_hosts"] = providerHosts;
   return offer;
 }
+/** Minimal valid SurfaceBirthRecord for tests that poke tabLedgerCache
+ * directly (bypassing migration, which only legacy raw-storage fixtures go
+ * through). Field values are placeholders unless a test overrides one it
+ * actually exercises. */
+function fakeBirthRecord(overrides: Partial<SurfaceBirthRecord> = {}): SurfaceBirthRecord {
+  return {
+    binding_id: "test-binding-0001",
+    tab_hint: 0,
+    purpose: "handoff",
+    browser_epoch: "test-epoch",
+    extension_generation: "test",
+    created_at: 1,
+    ...overrides,
+  };
+}
+/** Wires a raw, pre-migration-shaped ledger fixture (legacy or already-
+ * migrated, tests may seed either) behind deps.tabLedger. migrateTabLedger
+ * runs over it on first touch, exactly as production does, so `current()`
+ * reflects birth certificates once the bridge has written anything back. */
 function installManagedTabLedger(
   h: Harness,
-  initial: Record<string, { openedAt: number; url: string; jobID?: string }>,
-): {
-  current: () => Record<
-    string,
-    { openedAt: number; url: string; jobID?: string }
-  >;
-} {
-  let ledger = { ...initial };
+  initial: Record<string, unknown>,
+): { current: () => Record<string, unknown> } {
+  let ledger: Record<string, unknown> = { ...initial };
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
-      ledger = Object.fromEntries(
-        Object.entries(entries).map(([key, entry]) => [
-          key,
-          {
-            openedAt: entry.openedAt,
-            url: entry.url,
-            ...(entry.jobID === undefined ? {} : { jobID: entry.jobID }),
-          },
-        ]),
-      );
+      ledger = { ...entries };
     },
   };
   return { current: () => ({ ...ledger }) };
@@ -1833,7 +1861,7 @@ test("a stale tab id with no ledger match mints once and records the replacement
     (job) => job.job_id === jobID,
   )?.tab_id;
   expect(replacement).toBe(100);
-  expect(ledger.current()["100"]).toMatchObject({ url: offerURL, jobID });
+  expect(ledger.current()["100"]).toMatchObject({ job_id: jobID });
 });
 
 test("repeated reoffers reuse one ledger tab without growing the browser surface", async () => {
@@ -2124,16 +2152,7 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
   const claimKey = await federatedLoginClaimKey(entityID);
   const freshURL = `https://${PROVIDER_HOST}/openurl?fresh=1`;
   const h = makeHarness();
-  let ledger: Record<
-    string,
-    {
-      openedAt: number;
-      url: string;
-      privateURL?: boolean;
-      windowId?: number;
-      groupId?: number;
-    }
-  > = {};
+  let ledger: Record<string, unknown> = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -2195,8 +2214,8 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
   expect(reservationObservedBeforeCreate).toBe(true);
   expect(h.tabs.created).toEqual([{ url: freshURL, active: true }]);
   expect(ledger["100"]).toMatchObject({
-    url: "papio:private-handoff",
-    privateURL: true,
+    purpose: "federated-login",
+    job_id: jobID,
   });
   expect(JSON.stringify(ledger)).not.toContain(freshURL);
   expect(h.backend.store.offerURLs?.[jobID]).toBeUndefined();
@@ -2719,7 +2738,7 @@ test("Slice 0: session evidence reloads parked auth tabs but never the operator-
 test("Slice 0: repeated sign-in requests reuse the live papio sign-in tab", async () => {
   const origin = "https://resolver.example.edu";
   const h = makeHarness();
-  let ledger: Record<string, { openedAt: number; url: string }> = {};
+  let ledger: Record<string, unknown> = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -2749,16 +2768,7 @@ test("a fresh tab that loses its binding to cancellation is closed", async () =>
   const entityID = "https://idp.example.edu/entity";
   const freshURL = `https://${PROVIDER_HOST}/openurl?fresh=cancelled`;
   const h = makeHarness();
-  let ledger: Record<
-    string,
-    {
-      openedAt: number;
-      url: string;
-      privateURL?: boolean;
-      windowId?: number;
-      groupId?: number;
-    }
-  > = {};
+  let ledger: Record<string, unknown> = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -6495,6 +6505,7 @@ test("tab-group mode rediscovers a renamed papio group after session storage cle
     tabGroups: true,
     handoffSurface: "tab-group",
   });
+  installManagedTabLedger(h, {});
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_tg_reload_a"));
   const groupID = h.backend.store.handoffGroupID;
@@ -6528,6 +6539,9 @@ test("startup consolidates three papio groups in one window", async () => {
     tabGroups: true,
     handoffSurface: "tab-group",
   });
+  const fixedEpoch = "epoch-fixed-consolidate";
+  h.deps.randomUUID = () => fixedEpoch;
+  const seededLedger: Record<string, unknown> = {};
   for (const groupID of [700, 701, 702]) {
     const tab = await h.tabs.create({
       url: `${OPENURL}&group=${groupID}`,
@@ -6540,9 +6554,13 @@ test("startup consolidates three papio groups in one window", async () => {
       title: "papio",
       windowId: 1,
     });
+    seededLedger[String(tab.id)] = fakeBirthRecord({
+      tab_hint: tab.id!,
+      browser_epoch: fixedEpoch,
+    });
   }
   h.tabGroups!.nextID = 703;
-
+  installManagedTabLedger(h, seededLedger);
   await h.bridge.start();
 
   expect(h.tabs.grouped).toEqual([
@@ -6917,15 +6935,17 @@ test("capture consent refreshes live false-to-true and true-to-false", async () 
   ).toHaveLength(1);
 });
 
+// The ledger's origin_digest (Slice 2b) is computed with crypto.subtle.digest,
+// which Bun never settles across a pure microtask (`await Promise.resolve()`)
+// spin — deterministic fake timers cannot help either, since nothing here
+// waits on a timer. `setTimeout(r, 0)` is the minimal real yield that lets
+// the pending digest's native completion callback run.
 test("page capture request closes an inactive ledgered managed tab after focus moves away", async () => {
   const h = makeHarness(undefined, {
     windows: true,
     handoffSurface: "work-window",
   });
-  let ledger: Record<
-    string,
-    { openedAt: number; url: string; windowId?: number; groupId?: number }
-  > = {};
+  let ledger: Record<string, unknown> = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -6970,14 +6990,14 @@ test("page capture request closes an inactive ledgered managed tab after focus m
     attempt < 20 && h.tabs.created.length === 0;
     attempt += 1
   ) {
-    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
   }
   for (
     let attempt = 0;
     attempt < 100 && (h.windows?.updated.length ?? 0) === 0;
     attempt += 1
   ) {
-    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
   }
   expect(h.windows?.created).toEqual([
     {
@@ -7000,7 +7020,7 @@ test("page capture request closes an inactive ledgered managed tab after focus m
     attempt < 20 && ledger[String(tabID)] === undefined;
     attempt += 1
   ) {
-    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
   }
   expect(ledger[String(tabID)]).toBeDefined();
   h.tabs.seed({
@@ -7015,7 +7035,7 @@ test("page capture request closes an inactive ledgered managed tab after focus m
     attempt < 20 && !h.timers.some((timer) => timer.ms === 30_000);
     attempt += 1
   ) {
-    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
   }
   await h.tabs.completeNavigation(tabID);
   for (
@@ -7023,7 +7043,7 @@ test("page capture request closes an inactive ledgered managed tab after focus m
     attempt < 20 && !h.timers.some((timer) => timer.ms === 3_000);
     attempt += 1
   ) {
-    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
   }
   await h.timers.find((timer) => timer.ms === 3_000)?.fn();
   await pending;
@@ -11516,11 +11536,7 @@ test("successful adoption removes the job while leaving its managed handoff open
   (
     success.bridge as unknown as { tabLedgerCache: Record<string, unknown> }
   ).tabLedgerCache = {
-    [String(successTab)]: {
-      openedAt: 1,
-      url: successTabInfo?.url ?? "https://provider.example.edu/paper.pdf",
-      windowId: successTabInfo?.windowId,
-    },
+    [String(successTab)]: fakeBirthRecord({ tab_hint: successTab }),
   };
   await success.tabs.userActivate(successTab);
   await success.downloads.onCreated.emit({
@@ -11669,19 +11685,21 @@ test("handoff group reducer trails auth recollapse and stays quiet when collapse
 
 test("papio classifies its own surfaces and asks only about strays without closing tabs", async () => {
   const h = makeHarness(undefined, { tabGroups: true });
-  let ledger: Record<
-    string,
-    { openedAt: number; url: string; windowId?: number; groupId?: number }
-  > = {
-    "300": { openedAt: 1, url: "https://provider.example.org/a" },
-    "301": { openedAt: 1, url: "https://provider.example.org/b" },
+  let ledger: Record<string, unknown> = {
+    "300": { openedAt: 1, url: "https://provider.example.org/a", jobID: "job_other_a" },
+    "301": { openedAt: 1, url: "https://provider.example.org/b", jobID: "job_other_b" },
     "304": {
       openedAt: 1,
       url: "https://provider.example.org/d",
       groupId: 700,
       windowId: 1,
+      jobID: "job_other_d",
     },
-    "999": { openedAt: 1, url: "https://provider.example.org/missing" },
+    "999": {
+      openedAt: 1,
+      url: "https://provider.example.org/missing",
+      jobID: "job_other_missing",
+    },
   };
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
@@ -11743,10 +11761,7 @@ test("papio classifies its own surfaces and asks only about strays without closi
 
 test("created broker tabs are ledgered durably and forgotten once they close", async () => {
   const h = makeHarness();
-  let ledger: Record<
-    string,
-    { openedAt: number; url: string; windowId?: number; groupId?: number }
-  > = {};
+  let ledger: Record<string, unknown> = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -11764,10 +11779,7 @@ test("created broker tabs are ledgered durably and forgotten once they close", a
 });
 test("review never focuses a stale ledger id collision; the unproven entry is retained", async () => {
   const h = makeHarness();
-  let ledger: Record<
-    string,
-    { openedAt: number; url: string; windowId?: number; groupId?: number }
-  > = {
+  let ledger: Record<string, unknown> = {
     "300": { openedAt: 1, url: "https://papio.example.edu/old" },
   };
   h.deps.tabLedger = {
@@ -11801,9 +11813,7 @@ test("close gate leaves an active managed tab open", async () => {
     tab.active = true;
     (
       h.bridge as unknown as { tabLedgerCache: Record<string, unknown> }
-    ).tabLedgerCache = {
-      [String(tabID)]: { openedAt: 1, url: tab.url, windowId: tab.windowId },
-    };
+    ).tabLedgerCache = { [String(tabID)]: fakeBirthRecord({ tab_hint: tabID }) };
   }
   expect(tabID).toBeGreaterThanOrEqual(0);
   await h.tabs.userActivate(tabID);
@@ -11815,10 +11825,7 @@ test("cancellation removes an inactive ledgered scaffold tab", async () => {
     windows: true,
     handoffSurface: "work-window",
   });
-  let ledger: Record<
-    string,
-    { openedAt: number; url: string; windowId?: number; groupId?: number }
-  > = {};
+  let ledger: Record<string, unknown> = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -11853,11 +11860,7 @@ test("cancellation leaves current PDF content in papio's surface", async () => {
   (
     h.bridge as unknown as { tabLedgerCache: Record<string, unknown> }
   ).tabLedgerCache = {
-    [String(tabID)]: {
-      openedAt: 1,
-      url: "https://provider.example.edu/landing",
-      windowId: tab?.windowId,
-    },
+    [String(tabID)]: fakeBirthRecord({ tab_hint: tabID }),
   };
   await h.bridge.requestCancel("job_current_pdf_content");
   expect(h.tabs.removed).not.toContain(tabID);
@@ -11868,10 +11871,7 @@ test("cancellation leaves a scaffold tab dragged out of papio's surface", async 
     windows: true,
     handoffSurface: "work-window",
   });
-  let ledger: Record<
-    string,
-    { openedAt: number; url: string; windowId?: number; groupId?: number }
-  > = {};
+  let ledger: Record<string, unknown> = {};
   h.deps.tabLedger = {
     load: async () => ({ ...ledger }),
     save: async (entries) => {
@@ -17203,6 +17203,7 @@ test("Slice 1: simulateExtensionUpdate reproduces the session-storage-clears tab
     tabGroups: true,
     handoffSurface: "tab-group",
   });
+  installManagedTabLedger(h, {});
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_navlife_tg_a"));
   const groupID = h.backend.store.handoffGroupID;
@@ -17288,4 +17289,290 @@ test("Slice 1: restartWorker keeps a claim-gate park's offer URL and the durable
     { url: OPENURL, active: true },
   ]);
   expectLedgerRetains(ledger.current(), ledgeredTabID);
+});
+
+// Slice 2b: durable identity, adoption, and the close transaction
+// (surface-lifecycle-plan.md lines 271-303; claim-observation-protocol.md
+// §2.3/§4.3). Helpers build a scaffold tab already recorded as an owned
+// SurfaceBirthRecord under the bridge's own browser_epoch, with a known
+// daemon holder generation, so closeOwnedSurface's local eligibility check
+// passes and only the wire round trip is exercised per test.
+async function seedOwnedScaffold(
+  h: Harness,
+  opts: { active?: boolean; pinned?: boolean; windowId?: number } = {},
+): Promise<{ tabID: number; bindingID: string }> {
+  if (h.deps.tabLedger === undefined) installManagedTabLedger(h, {});
+  await h.port.inbound(helloAck({ features: ["surface_close_v1"] }));
+  const windowId = opts.windowId ?? 1;
+  const tab = await h.tabs.create({
+    url: "https://materialize.example/scaffold",
+    active: opts.active ?? false,
+    windowId,
+  });
+  const tabID = tab.id!;
+  if (opts.pinned === true) h.tabs.patch(tabID, { pinned: true });
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    browserEpoch: string | undefined;
+    lastKnownBrowserHolderGeneration: number | undefined;
+    update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
+    closeOwnedSurface: (
+      tabID: number,
+      disposition: "scaffold_idle" | "materialization_settled" | "claim_abandoned",
+    ) => Promise<{ closed: boolean }>;
+  };
+  const bindingID = "binding-owned-0001";
+  internals.tabLedgerCache = {
+    [String(tabID)]: fakeBirthRecord({
+      binding_id: bindingID,
+      tab_hint: tabID,
+      browser_epoch: internals.browserEpoch ?? "test-epoch",
+    }),
+  };
+  internals.lastKnownBrowserHolderGeneration = 1;
+  await internals.update((s) => ({ ...s, workWindowID: windowId }));
+  return { tabID, bindingID };
+}
+function closeInternals(h: Harness): {
+  closeOwnedSurface: (
+    tabID: number,
+    disposition: "scaffold_idle" | "materialization_settled" | "claim_abandoned",
+  ) => Promise<{ closed: boolean }>;
+  tabLedgerCache: Record<string, SurfaceBirthRecord>;
+} {
+  return h.bridge as unknown as {
+    closeOwnedSurface: (
+      tabID: number,
+      disposition: "scaffold_idle" | "materialization_settled" | "claim_abandoned",
+    ) => Promise<{ closed: boolean }>;
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+}
+
+test("Slice 2b: close transaction happy path authorizes, tombstones, removes, and suppresses cancellation", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const closing = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
+  const request = await h.port.waitForFrame("surface_close_request");
+  expect(request.payload["binding_id"]).toBe(bindingID);
+  expect(request.payload["disposition"]).toBe("scaffold_idle");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-0001",
+      nonce: "nonce-0001",
+      browser_holder_generation: 1,
+    }),
+  );
+  await expect(closing).resolves.toEqual({ closed: true });
+  expect(h.tabs.removed).toContain(tabID);
+  expect(h.tabs.snapshot(tabID)).toBeUndefined();
+  // A daemon-authorized close is not an operator cancel: no provider_outcome.
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+});
+
+test("Slice 2b: a non-authorized outcome retains the surface", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID } = await seedOwnedScaffold(h);
+  const closing = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
+  const request = await h.port.waitForFrame("surface_close_request");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "not_eligible",
+    }),
+  );
+  await expect(closing).resolves.toEqual({ closed: false });
+  expect(h.tabs.removed).not.toContain(tabID);
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+});
+
+test("Slice 2b: an operator-active tab is ceded and detached rather than closed", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  await h.tabs.userActivate(tabID);
+  const closing = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
+  const request = await h.port.waitForFrame("surface_close_request");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-0002",
+      nonce: "nonce-0002",
+      browser_holder_generation: 1,
+    }),
+  );
+  await expect(closing).resolves.toEqual({ closed: false });
+  expect(h.tabs.removed).not.toContain(tabID);
+  const record = closeInternals(h).tabLedgerCache[String(tabID)];
+  expect(record?.ceded).toBe(true);
+  expect(record?.binding_id).toBe(bindingID);
+  expect(record?.pending_close).toBeUndefined();
+});
+
+test("Slice 2b: a failed remove leaves the tombstone; startup replay completes it", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID } = await seedOwnedScaffold(h);
+  h.deps.tabs.remove = async () => {
+    throw new Error("remove failed");
+  };
+  const closing = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
+  const request = await h.port.waitForFrame("surface_close_request");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-0003",
+      nonce: "nonce-0003",
+      browser_holder_generation: 1,
+    }),
+  );
+  await closing;
+  // closeOwnedTab swallows the remove failure; the tab and its tombstone survive.
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+  expect(closeInternals(h).tabLedgerCache[String(tabID)]?.pending_close).toBeDefined();
+
+  const restarted = restartWorker(h);
+  (
+    restarted.bridge as unknown as { lastKnownBrowserHolderGeneration: number }
+  ).lastKnownBrowserHolderGeneration = 1;
+  const startPromise = restarted.bridge.start();
+  await restarted.port.inbound(helloAck({ features: ["surface_close_v1"] }));
+  const replay = await restarted.port.waitForFrame("surface_close_request");
+  expect(replay.payload["binding_id"]).toBeDefined();
+  restarted.deps.tabs.remove = async (id) => {
+    h.tabs.live.delete(id);
+  };
+  await restarted.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: replay.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-0004",
+      nonce: "nonce-0004",
+      browser_holder_generation: 1,
+    }),
+  );
+  await startPromise;
+  expect(h.tabs.snapshot(tabID)).toBeUndefined();
+});
+
+test("Slice 2b: a browser restart invalidates tab-ID authority; records survive only for review", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_epoch_a"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  const internals = h.bridge as unknown as {
+    browserEpoch: string | undefined;
+    ownedMemberTab: (
+      tabID: number,
+      ledger: Record<string, SurfaceBirthRecord>,
+    ) => Promise<TabInfo | undefined>;
+    snapshotTabLedger: () => Promise<Record<string, SurfaceBirthRecord>>;
+  };
+  const ledgerBefore = await internals.snapshotTabLedger();
+  expect(ledgerBefore[String(tabID)]?.browser_epoch).toBe(internals.browserEpoch);
+  expect(await internals.ownedMemberTab(tabID, ledgerBefore)).toBeDefined();
+
+  // A genuine browser restart mints a fresh epoch no existing record can
+  // re-prove against (classifyRestart's "browser" branch) — simulated here
+  // directly on the same worker lifetime's epoch field, since a real restart
+  // spins up an entirely separate process with no shared harness state.
+  internals.browserEpoch = "post-restart-epoch";
+  const ledgerAfter = await internals.snapshotTabLedger();
+  expect(await internals.ownedMemberTab(tabID, ledgerAfter)).toBeUndefined();
+  // The record itself is never deleted — it survives, review-only.
+  expect(ledgerAfter[String(tabID)]).toBeDefined();
+});
+
+test("Slice 2b: adoption ignores a papio-titled group with no owned member", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  const foreign = await h.tabs.create({
+    url: "https://foreign.example.edu/current",
+    active: false,
+  });
+  h.tabs.patch(foreign.id!, { groupId: 700 });
+  h.tabGroups!.live.set(700, { id: 700, collapsed: true, title: "papio", windowId: 1 });
+  h.tabGroups!.nextID = 701;
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_no_owned_member"));
+  // A brand new group was created; the foreign "papio"-titled group was
+  // never merged into or adopted as the persisted group.
+  expect(h.backend.store.handoffGroupID).not.toBe(700);
+  expect(h.tabs.grouped.some((g) => g.groupId === 700)).toBe(false);
+});
+
+test("Slice 2b: jobless sign-in reuse still works via origin-digest match", async () => {
+  const h = makeHarness();
+  const origin = "https://resolver.example.edu";
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: [origin] }));
+  const first = await h.bridge.requestSessionSignIn(origin);
+  expect(first.ok).toBe(true);
+  expect(h.tabs.created).toHaveLength(1);
+  const tabID = h.tabs.created.length > 0 ? h.tabs.list()[0]!.id! : -1;
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+  const second = await h.bridge.requestSessionSignIn(origin);
+  expect(second.ok).toBe(true);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.tabs.activated).toContain(tabID);
+});
+
+test("Slice 2b: legacy timeout park detaches and retains when the daemon answers not_eligible", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["surface_close_v1"] }));
+  await h.port.inbound(jobOffer("job_timeout_not_eligible"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+  const internals = h.bridge as unknown as {
+    lastKnownBrowserHolderGeneration: number | undefined;
+  };
+  internals.lastKnownBrowserHolderGeneration = 1;
+  const timeout = h.timers.find((timer) => timer.ms === 3 * 60_000);
+  expect(timeout).toBeDefined();
+  const fired = timeout!.fn();
+  const request = await h.port.waitForFrame("surface_close_request");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "not_eligible",
+    }),
+  );
+  await fired;
+  // Detached (job no longer tracks the tab) and retained (never closed).
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_timeout_not_eligible")?.tab_id,
+  ).toBe(-1);
+  expect(h.tabs.removed).not.toContain(tabID);
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+});
+
+test("Slice 2b: update simulation adopts zero new surfaces and closes nothing without authorization", async () => {
+  const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_scenario2_a"));
+  const groupID = h.backend.store.handoffGroupID;
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(h.tabGroups?.live.size).toBe(1);
+
+  const updated = simulateExtensionUpdate(h);
+  await updated.bridge.start();
+  // Session-scoped job state is gone (a fresh Bridge, no jobs), but the
+  // birth certificate and its group are revalidated and reused untouched:
+  // no new group, no new window, and nothing was closed to get there.
+  expect(h.tabGroups?.live.size).toBe(1);
+  expect(h.backend.store.handoffGroupID).toBe(groupID);
+  expect(h.tabs.removed).not.toContain(tabID);
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
 });

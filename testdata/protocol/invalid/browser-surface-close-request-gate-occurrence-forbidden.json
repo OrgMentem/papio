@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"surface_close_request","msg_id":"close-req-0004","seq":6,"payload":{"request_id":"request-close-0004","binding_id":"binding-close-0004","browser_holder_generation":1,"disposition":"scaffold_idle","gate_occurrence_id":"occurrence-close-0004"}}

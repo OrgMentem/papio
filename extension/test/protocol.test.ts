@@ -3,7 +3,7 @@
 // reject exactly the browser-* fixtures the Go core does.
 
 import { expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -3221,4 +3221,252 @@ test("provider drive epoch start-result still parses unsupported without treatin
     );
   }
   expect(() => parseBrowserMessage(mkFrame("applied"))).toThrow(ProtocolError);
+});
+
+test("surface_close_request/response round-trip and enforce §2.3 field rules", () => {
+  const frame = (
+    type: "surface_close_request" | "surface_close_response",
+    payload: Record<string, unknown>,
+  ) => ({
+    protocol: "papio-browser/1" as const,
+    type,
+    msg_id: "msg-close-001",
+    seq: 1,
+    payload,
+  });
+
+  // Not job-scoped: a job_id-less envelope parses fine for both directions.
+  for (const disposition of [
+    "scaffold_idle",
+    "materialization_settled",
+  ] as const) {
+    const msg = parseBrowserMessage(
+      frame("surface_close_request", {
+        request_id: "close-request-001",
+        binding_id: "binding-close-001",
+        browser_holder_generation: 1,
+        disposition,
+      }),
+    );
+    expect(msg.type).toBe("surface_close_request");
+    expect(msg.job_id).toBeUndefined();
+  }
+
+  // gate_occurrence_id is optional even on claim_abandoned.
+  expect(
+    parseBrowserMessage(
+      frame("surface_close_request", {
+        request_id: "close-request-002",
+        binding_id: "binding-close-001",
+        browser_holder_generation: 1,
+        disposition: "claim_abandoned",
+      }),
+    ).type,
+  ).toBe("surface_close_request");
+  expect(
+    parseBrowserMessage(
+      frame("surface_close_request", {
+        request_id: "close-request-003",
+        binding_id: "binding-close-001",
+        browser_holder_generation: 1,
+        disposition: "claim_abandoned",
+        gate_occurrence_id: "gate-occurrence-001",
+      }),
+    ).payload,
+  ).toEqual({
+    request_id: "close-request-003",
+    binding_id: "binding-close-001",
+    browser_holder_generation: 1,
+    disposition: "claim_abandoned",
+    gate_occurrence_id: "gate-occurrence-001",
+  });
+
+  // gate_occurrence_id is forbidden on any disposition other than claim_abandoned.
+  for (const disposition of [
+    "scaffold_idle",
+    "materialization_settled",
+  ] as const) {
+    expect(() =>
+      parseBrowserMessage(
+        frame("surface_close_request", {
+          request_id: "close-request-004",
+          binding_id: "binding-close-001",
+          browser_holder_generation: 1,
+          disposition,
+          gate_occurrence_id: "gate-occurrence-001",
+        }),
+      ),
+    ).toThrow(ProtocolError);
+  }
+
+  // Unknown disposition value rejected.
+  expect(() =>
+    parseBrowserMessage(
+      frame("surface_close_request", {
+        request_id: "close-request-005",
+        binding_id: "binding-close-001",
+        browser_holder_generation: 1,
+        disposition: "orphaned",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+
+  // Every required request field is enforced.
+  for (const key of [
+    "request_id",
+    "binding_id",
+    "browser_holder_generation",
+    "disposition",
+  ]) {
+    const payload: Record<string, unknown> = {
+      request_id: "close-request-006",
+      binding_id: "binding-close-001",
+      browser_holder_generation: 1,
+      disposition: "scaffold_idle",
+    };
+    delete payload[key];
+    expect(() =>
+      parseBrowserMessage(frame("surface_close_request", payload)),
+    ).toThrow(ProtocolError);
+  }
+
+  // Unknown field fails closed.
+  expect(() =>
+    parseBrowserMessage(
+      frame("surface_close_request", {
+        request_id: "close-request-007",
+        binding_id: "binding-close-001",
+        browser_holder_generation: 1,
+        disposition: "scaffold_idle",
+        extra: true,
+      }),
+    ),
+  ).toThrow(ProtocolError);
+
+  // Response: authorized requires and carries exactly the token triple.
+  expect(
+    parseBrowserMessage(
+      frame("surface_close_response", {
+        request_id: "close-request-001",
+        outcome: "authorized",
+        close_authorization_id: "close-auth-001",
+        nonce: "close-nonce-001",
+        browser_holder_generation: 1,
+      }),
+    ).payload,
+  ).toEqual({
+    request_id: "close-request-001",
+    outcome: "authorized",
+    close_authorization_id: "close-auth-001",
+    nonce: "close-nonce-001",
+    browser_holder_generation: 1,
+  });
+  expect(() =>
+    parseBrowserMessage(
+      frame("surface_close_response", {
+        request_id: "close-request-001",
+        outcome: "authorized",
+        close_authorization_id: "close-auth-001",
+        nonce: "close-nonce-001",
+        browser_holder_generation: 1,
+        detail: "should not be here",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+  for (const key of [
+    "close_authorization_id",
+    "nonce",
+    "browser_holder_generation",
+  ]) {
+    const payload: Record<string, unknown> = {
+      request_id: "close-request-001",
+      outcome: "authorized",
+      close_authorization_id: "close-auth-001",
+      nonce: "close-nonce-001",
+      browser_holder_generation: 1,
+    };
+    delete payload[key];
+    expect(() =>
+      parseBrowserMessage(frame("surface_close_response", payload)),
+    ).toThrow(ProtocolError);
+  }
+
+  // Every non-authorized outcome forbids the token triple and accepts detail.
+  for (const outcome of ["stale", "not_eligible", "busy", "error"] as const) {
+    expect(
+      parseBrowserMessage(
+        frame("surface_close_response", {
+          request_id: "close-request-001",
+          outcome,
+          detail: "cannot close",
+        }),
+      ).type,
+    ).toBe("surface_close_response");
+    for (const key of [
+      "close_authorization_id",
+      "nonce",
+      "browser_holder_generation",
+    ]) {
+      const forbidden: Record<string, unknown> = {
+        request_id: "close-request-001",
+        outcome,
+        [key]: key === "browser_holder_generation" ? 1 : "close-value-0001",
+      };
+      expect(() =>
+        parseBrowserMessage(frame("surface_close_response", forbidden)),
+      ).toThrow(ProtocolError);
+    }
+  }
+
+  // Unknown outcome value rejected.
+  expect(() =>
+    parseBrowserMessage(
+      frame("surface_close_response", {
+        request_id: "close-request-001",
+        outcome: "parked",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+
+  // detail is bounded to 1000 chars on non-authorized outcomes.
+  expect(() =>
+    parseBrowserMessage(
+      frame("surface_close_response", {
+        request_id: "close-request-001",
+        outcome: "error",
+        detail: "x".repeat(1001),
+      }),
+    ),
+  ).toThrow(ProtocolError);
+});
+
+// The shared-corpus half of this contract lives in testdata/protocol/{valid,
+// invalid}/browser-surface-close-*.json, added by the sibling Go daemon
+// agent implementing internal/protocol and internal/browser/bridge.go. The
+// blanket "valid browser corpus parses"/"invalid browser corpus fails
+// closed" tests above already pick up any browser-*.json fixture with no
+// per-type allowlist, so no wiring change is needed here; this test adds a
+// clearly-named, skip-if-absent check specific to this message family so a
+// failure names surface_close rather than an anonymous corpus fixture.
+test("surface_close corpus fixtures parse when the sibling daemon slice has landed", () => {
+  const validDir = join(corpusRoot, "valid");
+  const invalidDir = join(corpusRoot, "invalid");
+  const validFixtures = existsSync(validDir)
+    ? readdirSync(validDir).filter((name) =>
+        name.startsWith("browser-surface-close"),
+      )
+    : [];
+  const invalidFixtures = existsSync(invalidDir)
+    ? readdirSync(invalidDir).filter((name) =>
+        name.startsWith("browser-surface-close"),
+      )
+    : [];
+  for (const name of validFixtures) {
+    const text = readFileSync(join(validDir, name), "utf8");
+    expect(() => parseBrowserMessageBytes(text), name).not.toThrow();
+  }
+  for (const name of invalidFixtures) {
+    const text = readFileSync(join(invalidDir, name), "utf8");
+    expect(() => parseBrowserMessageBytes(text), name).toThrow(ProtocolError);
+  }
 });
