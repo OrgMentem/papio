@@ -1021,8 +1021,41 @@ type AuthenticationEntryLease struct {
 	LeaseUntil              string                        `json:"lease_until,omitempty"`
 	HumanOwnerID            string                        `json:"human_owner_id,omitempty"`
 	EvidenceObservationID   string                        `json:"evidence_observation_id,omitempty"`
-	CreatedAt               string                        `json:"created_at"`
-	UpdatedAt               string                        `json:"updated_at"`
+	// OwnerBindingID/OwnerTabHint name the surface currently occupying this
+	// lease, set when the owning candidate's institutional_bind_response
+	// lands and cleared on lease reassignment or owner_closed (claim-
+	// observation-protocol.md §4.1).
+	OwnerBindingID string `json:"owner_binding_id,omitempty"`
+	OwnerTabHint   *int64 `json:"owner_tab_hint,omitempty"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
+}
+
+// authenticationEntryLeaseSelect is the shared column list every reader of
+// authentication_entry_leases uses, so a future column addition changes one
+// place instead of drifting across Reserve/Get's independent SELECTs.
+const authenticationEntryLeaseSelect = `
+	SELECT authentication_claim_id, lease_id, owner_id, browser_holder_generation,
+	       state, COALESCE(lease_until,''), COALESCE(human_owner_id,''),
+	       COALESCE(evidence_observation_id,''), COALESCE(owner_binding_id,''),
+	       owner_tab_hint, created_at, updated_at
+	FROM authentication_entry_leases`
+
+// scanAuthenticationEntryLease reads one row via scan (*sql.Row.Scan or
+// *sql.Rows.Scan), matching authenticationEntryLeaseSelect's column order.
+func scanAuthenticationEntryLease(scan func(...any) error) (AuthenticationEntryLease, error) {
+	var l AuthenticationEntryLease
+	var ownerTabHint sql.NullInt64
+	if err := scan(&l.AuthenticationClaimID, &l.LeaseID, &l.OwnerID, &l.BrowserHolderGeneration,
+		&l.State, &l.LeaseUntil, &l.HumanOwnerID, &l.EvidenceObservationID,
+		&l.OwnerBindingID, &ownerTabHint, &l.CreatedAt, &l.UpdatedAt); err != nil {
+		return AuthenticationEntryLease{}, err
+	}
+	if ownerTabHint.Valid {
+		v := ownerTabHint.Int64
+		l.OwnerTabHint = &v
+	}
+	return l, nil
 }
 
 func (in AuthenticationEntryLeaseInput) validate() error {
@@ -1052,15 +1085,8 @@ func (js *Store) ReserveAuthenticationEntryLease(ctx context.Context, in Authent
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var current AuthenticationEntryLease
-	err = tx.QueryRowContext(ctx, `
-		SELECT authentication_claim_id, lease_id, owner_id, browser_holder_generation,
-		       state, COALESCE(lease_until,''), COALESCE(human_owner_id,''),
-		       COALESCE(evidence_observation_id,''), created_at, updated_at
-		FROM authentication_entry_leases WHERE authentication_claim_id = ?`,
-		in.AuthenticationClaimID).Scan(&current.AuthenticationClaimID, &current.LeaseID,
-		&current.OwnerID, &current.BrowserHolderGeneration, &current.State, &current.LeaseUntil,
-		&current.HumanOwnerID, &current.EvidenceObservationID, &current.CreatedAt, &current.UpdatedAt)
+	row := tx.QueryRowContext(ctx, authenticationEntryLeaseSelect+` WHERE authentication_claim_id = ?`, in.AuthenticationClaimID)
+	current, err := scanAuthenticationEntryLease(row.Scan)
 	if err == nil {
 		var ownerState string
 		ownerErr := tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id=?`, current.OwnerID).Scan(&ownerState)
@@ -1094,9 +1120,25 @@ func (js *Store) ReserveAuthenticationEntryLease(ctx context.Context, in Authent
 				humanRevoked = verdict == ProfileEvidenceSignedOut
 			}
 		}
-		expired := current.State == AuthenticationEntryLeaseExpired || humanRevoked ||
-			(current.State == AuthenticationEntryLeaseReserved &&
-				(ownerTerminal || current.LeaseUntil != "" && current.LeaseUntil <= nowText))
+		reservedExpired := current.State == AuthenticationEntryLeaseReserved &&
+			(ownerTerminal || current.LeaseUntil != "" && current.LeaseUntil <= nowText)
+		// claim-observation-protocol.md §4.5: expiry alone never authorizes a
+		// replacement while an effect permit is unresolved. An in-flight
+		// browser-local navigation on the lease's own occupying surface must
+		// keep occupying even past a timer.
+		if reservedExpired && current.OwnerBindingID != "" {
+			var occupied int
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM effect_permits
+				WHERE binding_id=? AND effect_kind='institutional' AND status IN ('held','unknown_completion')`,
+				current.OwnerBindingID).Scan(&occupied); err != nil {
+				return nil, err
+			}
+			if occupied > 0 {
+				reservedExpired = false
+			}
+		}
+		expired := current.State == AuthenticationEntryLeaseExpired || humanRevoked || reservedExpired
 		if !expired {
 			if current.State == AuthenticationEntryLeaseReserved &&
 				current.LeaseID == in.LeaseID && current.OwnerID == in.OwnerID &&
@@ -1116,6 +1158,7 @@ func (js *Store) ReserveAuthenticationEntryLease(ctx context.Context, in Authent
 			UPDATE authentication_entry_leases
 			   SET lease_id=?, owner_id=?, browser_holder_generation=?, state='reserved',
 			       lease_until=?, human_owner_id=NULL, evidence_observation_id=NULL,
+			       owner_binding_id=NULL, owner_tab_hint=NULL,
 			       updated_at=?
 			 WHERE authentication_claim_id=?`,
 			in.LeaseID, in.OwnerID, in.BrowserHolderGeneration, untilText, nowText,
@@ -1135,20 +1178,15 @@ func (js *Store) ReserveAuthenticationEntryLease(ctx context.Context, in Authent
 			return nil, err
 		}
 	}
-	if err := tx.QueryRowContext(ctx, `
-		SELECT authentication_claim_id, lease_id, owner_id, browser_holder_generation,
-		       state, COALESCE(lease_until,''), COALESCE(human_owner_id,''),
-		       COALESCE(evidence_observation_id,''), created_at, updated_at
-		FROM authentication_entry_leases WHERE authentication_claim_id=?`,
-		in.AuthenticationClaimID).Scan(&current.AuthenticationClaimID, &current.LeaseID,
-		&current.OwnerID, &current.BrowserHolderGeneration, &current.State, &current.LeaseUntil,
-		&current.HumanOwnerID, &current.EvidenceObservationID, &current.CreatedAt, &current.UpdatedAt); err != nil {
+	finalRow := tx.QueryRowContext(ctx, authenticationEntryLeaseSelect+` WHERE authentication_claim_id=?`, in.AuthenticationClaimID)
+	final, err := scanAuthenticationEntryLease(finalRow.Scan)
+	if err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &current, nil
+	return &final, nil
 }
 
 // GetAuthenticationEntryLease reads the durable current lease and marks an
@@ -1158,15 +1196,8 @@ func (js *Store) GetAuthenticationEntryLease(ctx context.Context, authentication
 	if strings.TrimSpace(authenticationClaimID) == "" {
 		return nil, false, errors.New("authentication claim is required")
 	}
-	var l AuthenticationEntryLease
-	err := js.S.DB().QueryRowContext(ctx, `
-		SELECT authentication_claim_id, lease_id, owner_id, browser_holder_generation,
-		       state, COALESCE(lease_until,''), COALESCE(human_owner_id,''),
-		       COALESCE(evidence_observation_id,''), created_at, updated_at
-		FROM authentication_entry_leases WHERE authentication_claim_id=?`,
-		authenticationClaimID).Scan(&l.AuthenticationClaimID, &l.LeaseID, &l.OwnerID,
-		&l.BrowserHolderGeneration, &l.State, &l.LeaseUntil, &l.HumanOwnerID,
-		&l.EvidenceObservationID, &l.CreatedAt, &l.UpdatedAt)
+	row := js.S.DB().QueryRowContext(ctx, authenticationEntryLeaseSelect+` WHERE authentication_claim_id=?`, authenticationClaimID)
+	l, err := scanAuthenticationEntryLease(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -1174,6 +1205,20 @@ func (js *Store) GetAuthenticationEntryLease(ctx context.Context, authentication
 		return nil, false, err
 	}
 	if l.State == AuthenticationEntryLeaseReserved && l.LeaseUntil != "" && l.LeaseUntil <= store.Now() {
+		occupied := false
+		if l.OwnerBindingID != "" {
+			var n int
+			if err := js.S.DB().QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM effect_permits
+				WHERE binding_id=? AND effect_kind='institutional' AND status IN ('held','unknown_completion')`,
+				l.OwnerBindingID).Scan(&n); err != nil {
+				return nil, false, err
+			}
+			occupied = n > 0
+		}
+		if occupied {
+			return &l, true, nil
+		}
 		if err := js.ExpireAuthenticationEntryLease(ctx, l.AuthenticationClaimID, l.BrowserHolderGeneration, l.LeaseID); err != nil && !errors.Is(err, ErrAuthenticationEntryLeaseStale) {
 			return nil, false, err
 		}
@@ -1299,4 +1344,44 @@ func (js *Store) ConvertAuthenticationEntryLeaseToHuman(ctx context.Context, aut
 		return ErrAuthenticationEntryLeaseStale
 	}
 	return tx.Commit()
+}
+
+// SetAuthenticationEntryLeaseOwnerBinding records the physical surface
+// currently occupying a live authentication-entry lease
+// (claim-observation-protocol.md §4.1). Called when the owning candidate's
+// institutional_bind_response lands. Best-effort and non-authoritative,
+// matching this package's other side-channel bookkeeping: a mismatched
+// fence (the lease was reassigned, expired, or is held by a different
+// owner/generation) is a silent no-op rather than an error, because a stale
+// bind side effect must never resurrect or steal a lease.
+func (js *Store) SetAuthenticationEntryLeaseOwnerBinding(ctx context.Context, authenticationClaimID, ownerID string, holderGeneration int64, bindingID string, tabID int64) error {
+	if strings.TrimSpace(authenticationClaimID) == "" || strings.TrimSpace(ownerID) == "" ||
+		holderGeneration < 0 || strings.TrimSpace(bindingID) == "" || tabID < 0 {
+		return errors.New("authentication entry lease owner binding requires exact fence")
+	}
+	_, err := js.S.DB().ExecContext(ctx, `
+		UPDATE authentication_entry_leases
+		   SET owner_binding_id=?, owner_tab_hint=?, updated_at=?
+		 WHERE authentication_claim_id=? AND owner_id=? AND browser_holder_generation=?
+		   AND state IN ('reserved','human')`,
+		bindingID, tabID, store.Now(), authenticationClaimID, ownerID, holderGeneration)
+	return err
+}
+
+// ClearAuthenticationEntryLeaseOwnerBinding clears owner_binding_id/
+// owner_tab_hint for the exact binding an owner_closed observation names
+// (claim-observation-protocol.md §2.2.1). The lease itself stays whatever
+// state its own expiry/promotion rules already put it in — closing a tab is
+// not evidence about the sign-in outcome. Silent no-op when the binding no
+// longer matches (already reassigned or already cleared).
+func (js *Store) ClearAuthenticationEntryLeaseOwnerBinding(ctx context.Context, authenticationClaimID, bindingID string) error {
+	if strings.TrimSpace(authenticationClaimID) == "" || strings.TrimSpace(bindingID) == "" {
+		return errors.New("authentication entry lease owner binding clear requires exact fence")
+	}
+	_, err := js.S.DB().ExecContext(ctx, `
+		UPDATE authentication_entry_leases
+		   SET owner_binding_id=NULL, owner_tab_hint=NULL, updated_at=?
+		 WHERE authentication_claim_id=? AND owner_binding_id=?`,
+		store.Now(), authenticationClaimID, bindingID)
+	return err
 }

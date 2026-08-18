@@ -220,8 +220,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 41 {
-		t.Fatalf("user_version = %d, %v; want 41", version, err)
+	if err != nil || version != 42 {
+		t.Fatalf("user_version = %d, %v; want 42", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -293,8 +293,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 41 {
-		t.Fatalf("user_version = %d, %v; want 41", version, err)
+	if err != nil || version != 42 {
+		t.Fatalf("user_version = %d, %v; want 42", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -405,7 +405,8 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 			'artifact_winners',
 			'authentication_entry_leases',
 			'effect_permits',
-			'legacy_effect_blockers'
+			'legacy_effect_blockers',
+			'claim_observation_journal'
 		)`
 
 	rows, err := db.DB().QueryContext(ctx, tables)
@@ -436,6 +437,7 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 		"authentication_entry_leases",
 		"effect_permits",
 		"legacy_effect_blockers",
+		"claim_observation_journal",
 	} {
 		if !foundTables[name] {
 			t.Errorf("migration did not create table %q", name)

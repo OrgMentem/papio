@@ -42,9 +42,10 @@ import (
 // below fails both when an unlisted fixture is accepted and when a listed one
 // is rejected, so the map cannot silently over-cover as the schemas tighten.
 var schemaRuntimeOnly = map[string]string{
-	"acquisition-bundle-path-mismatch.json":                   "artifact path must equal the SHA-256 digest; a cross-field identity JSON Schema has no vocabulary for",
-	"browser-job-offer-invalid-date.json":                     "expected-completion timestamp is validated as a real RFC 3339 instant; JSON Schema format is annotation-only by default",
-	"browser-triage-snapshot-counts-pending-mismatch-v3.json": "counts must agree with the item array they summarise; a cross-field arithmetic invariant",
+	"acquisition-bundle-path-mismatch.json":                      "artifact path must equal the SHA-256 digest; a cross-field identity JSON Schema has no vocabulary for",
+	"browser-job-offer-invalid-date.json":                        "expected-completion timestamp is validated as a real RFC 3339 instant; JSON Schema format is annotation-only by default",
+	"browser-triage-snapshot-counts-pending-mismatch-v3.json":    "counts must agree with the item array they summarise; a cross-field arithmetic invariant",
+	"browser-claim-observation-ack-applied-bad-lease-until.json": "lease_until is validated as a real RFC 3339 instant; JSON Schema format is annotation-only by default",
 }
 
 func repoPath(t *testing.T, parts ...string) string {

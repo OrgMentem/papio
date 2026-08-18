@@ -3470,3 +3470,578 @@ test("surface_close corpus fixtures parse when the sibling daemon slice has land
     expect(() => parseBrowserMessageBytes(text), name).toThrow(ProtocolError);
   }
 });
+
+test("authentication_claim_request/response round-trip and enforce §2.1 field rules", () => {
+  const frame = (
+    type: "authentication_claim_request" | "authentication_claim_response",
+    payload: Record<string, unknown>,
+  ) => ({
+    protocol: "papio-browser/1" as const,
+    type,
+    msg_id: "msg-auth-claim-001",
+    seq: 1,
+    job_id: "job-auth-claim-00001",
+    payload,
+  });
+
+  // Job-scoped: a job_id-less envelope is rejected for both directions.
+  expect(() =>
+    parseBrowserMessage({
+      protocol: "papio-browser/1",
+      type: "authentication_claim_request",
+      msg_id: "msg-auth-claim-001",
+      seq: 1,
+      payload: {
+        request_id: "auth-claim-request-001",
+        candidate_id: "candidate-00000001",
+        materialization_kind: "browser_tab",
+        trigger: "automatic",
+      },
+    }),
+  ).toThrow(ProtocolError);
+
+  // Round-trip for both materialization_kind and trigger values.
+  for (const materializationKind of ["browser_tab", "direct_download"] as const) {
+    for (const trigger of ["automatic", "explicit"] as const) {
+      const msg = parseBrowserMessage(
+        frame("authentication_claim_request", {
+          request_id: "auth-claim-request-001",
+          candidate_id: "candidate-00000001",
+          materialization_kind: materializationKind,
+          trigger,
+        }),
+      );
+      expect(msg.type).toBe("authentication_claim_request");
+      expect(msg.job_id).toBe("job-auth-claim-00001");
+    }
+  }
+
+  // Every required request field is enforced.
+  for (const key of [
+    "request_id",
+    "candidate_id",
+    "materialization_kind",
+    "trigger",
+  ]) {
+    const payload: Record<string, unknown> = {
+      request_id: "auth-claim-request-001",
+      candidate_id: "candidate-00000001",
+      materialization_kind: "browser_tab",
+      trigger: "automatic",
+    };
+    delete payload[key];
+    expect(() =>
+      parseBrowserMessage(frame("authentication_claim_request", payload)),
+    ).toThrow(ProtocolError);
+  }
+
+  // Unknown field, invalid materialization_kind, invalid trigger all fail closed.
+  expect(() =>
+    parseBrowserMessage(
+      frame("authentication_claim_request", {
+        request_id: "auth-claim-request-001",
+        candidate_id: "candidate-00000001",
+        materialization_kind: "browser_tab",
+        trigger: "automatic",
+        extra: true,
+      }),
+    ),
+  ).toThrow(ProtocolError);
+  expect(() =>
+    parseBrowserMessage(
+      frame("authentication_claim_request", {
+        request_id: "auth-claim-request-001",
+        candidate_id: "candidate-00000001",
+        materialization_kind: "pdf_download",
+        trigger: "automatic",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+  expect(() =>
+    parseBrowserMessage(
+      frame("authentication_claim_request", {
+        request_id: "auth-claim-request-001",
+        candidate_id: "candidate-00000001",
+        materialization_kind: "browser_tab",
+        trigger: "curious",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+
+  // Response: each of the four operational outcomes requires
+  // authentication_claim_id/browser_holder_generation/gate_occurrence_id
+  // and forbids detail.
+  const operationalBase = {
+    request_id: "auth-claim-request-001",
+    authentication_claim_id: "auth-claim-00000001",
+    browser_holder_generation: 7,
+    gate_occurrence_id: "gate-occurrence-00001",
+  };
+  for (const outcome of [
+    "navigate_existing",
+    "open_new",
+    "focus_owner",
+    "park",
+  ] as const) {
+    for (const key of [
+      "authentication_claim_id",
+      "browser_holder_generation",
+      "gate_occurrence_id",
+    ]) {
+      const payload: Record<string, unknown> = {
+        ...operationalBase,
+        outcome,
+        ...(outcome === "park"
+          ? { dependent_count: 0 }
+          : { lease_until: "2026-08-18T00:00:00Z" }),
+        ...(outcome === "navigate_existing" || outcome === "focus_owner"
+          ? { owner_binding_id: "binding-owner-0001" }
+          : {}),
+      };
+      delete payload[key];
+      expect(() =>
+        parseBrowserMessage(frame("authentication_claim_response", payload)),
+      ).toThrow(ProtocolError);
+    }
+    expect(() =>
+      parseBrowserMessage(
+        frame("authentication_claim_response", {
+          ...operationalBase,
+          outcome,
+          detail: "should not be here",
+          ...(outcome === "park"
+            ? { dependent_count: 0 }
+            : { lease_until: "2026-08-18T00:00:00Z" }),
+          ...(outcome === "navigate_existing" || outcome === "focus_owner"
+            ? { owner_binding_id: "binding-owner-0001" }
+            : {}),
+        }),
+      ),
+    ).toThrow(ProtocolError);
+  }
+
+  // navigate_existing: lease_until + owner_binding_id required, owner_tab_hint optional.
+  expect(
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        ...operationalBase,
+        outcome: "navigate_existing",
+        lease_until: "2026-08-18T00:00:00Z",
+        owner_binding_id: "binding-owner-0001",
+        owner_tab_hint: 42,
+      }),
+    ).payload,
+  ).toEqual({
+    ...operationalBase,
+    outcome: "navigate_existing",
+    lease_until: "2026-08-18T00:00:00Z",
+    owner_binding_id: "binding-owner-0001",
+    owner_tab_hint: 42,
+  });
+  expect(
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        ...operationalBase,
+        outcome: "navigate_existing",
+        lease_until: "2026-08-18T00:00:00Z",
+        owner_binding_id: "binding-owner-0001",
+      }),
+    ).type,
+  ).toBe("authentication_claim_response");
+  expect(() =>
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        ...operationalBase,
+        outcome: "navigate_existing",
+        owner_binding_id: "binding-owner-0001",
+      }),
+    ),
+  ).toThrow(ProtocolError); // missing lease_until
+  expect(() =>
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        ...operationalBase,
+        outcome: "navigate_existing",
+        lease_until: "2026-08-18T00:00:00Z",
+      }),
+    ),
+  ).toThrow(ProtocolError); // missing owner_binding_id
+
+  // open_new: lease_until required, but no binding_id/owner_tab_hint/dependent_count.
+  expect(
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        ...operationalBase,
+        outcome: "open_new",
+        lease_until: "2026-08-18T00:00:00Z",
+      }),
+    ).type,
+  ).toBe("authentication_claim_response");
+  for (const key of ["owner_binding_id", "owner_tab_hint", "dependent_count"]) {
+    expect(() =>
+      parseBrowserMessage(
+        frame("authentication_claim_response", {
+          ...operationalBase,
+          outcome: "open_new",
+          lease_until: "2026-08-18T00:00:00Z",
+          [key]: key === "owner_binding_id" ? "binding-owner-0001" : 1,
+        }),
+      ),
+    ).toThrow(ProtocolError);
+  }
+
+  // focus_owner: same shape as navigate_existing.
+  expect(
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        ...operationalBase,
+        outcome: "focus_owner",
+        lease_until: "2026-08-18T00:00:00Z",
+        owner_binding_id: "binding-owner-0001",
+      }),
+    ).type,
+  ).toBe("authentication_claim_response");
+
+  // park: dependent_count required, lease_until/owner_binding_id/owner_tab_hint forbidden.
+  expect(
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        ...operationalBase,
+        outcome: "park",
+        dependent_count: 3,
+      }),
+    ).payload,
+  ).toEqual({
+    ...operationalBase,
+    outcome: "park",
+    dependent_count: 3,
+  });
+  expect(() =>
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        ...operationalBase,
+        outcome: "park",
+      }),
+    ),
+  ).toThrow(ProtocolError); // missing dependent_count
+  for (const key of ["lease_until", "owner_binding_id", "owner_tab_hint"]) {
+    expect(() =>
+      parseBrowserMessage(
+        frame("authentication_claim_response", {
+          ...operationalBase,
+          outcome: "park",
+          dependent_count: 3,
+          [key]: key === "lease_until" ? "2026-08-18T00:00:00Z" : "x",
+        }),
+      ),
+    ).toThrow(ProtocolError);
+  }
+
+  // The four non-operational outcomes forbid every operational-only field
+  // and accept only detail.
+  for (const outcome of [
+    "feature_disabled",
+    "not_eligible",
+    "busy",
+    "error",
+  ] as const) {
+    expect(
+      parseBrowserMessage(
+        frame("authentication_claim_response", {
+          request_id: "auth-claim-request-001",
+          outcome,
+          detail: "cannot arbitrate",
+        }),
+      ).type,
+    ).toBe("authentication_claim_response");
+    for (const key of [
+      "authentication_claim_id",
+      "browser_holder_generation",
+      "gate_occurrence_id",
+      "lease_until",
+      "dependent_count",
+      "owner_binding_id",
+      "owner_tab_hint",
+    ]) {
+      const forbidden: Record<string, unknown> = {
+        request_id: "auth-claim-request-001",
+        outcome,
+        [key]: key === "browser_holder_generation" || key === "dependent_count" || key === "owner_tab_hint"
+          ? 1
+          : key === "lease_until"
+            ? "2026-08-18T00:00:00Z"
+            : "auth-claim-00000001",
+      };
+      expect(() =>
+        parseBrowserMessage(frame("authentication_claim_response", forbidden)),
+      ).toThrow(ProtocolError);
+    }
+  }
+
+  // detail is bounded to 1000 chars on non-operational outcomes.
+  expect(() =>
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        request_id: "auth-claim-request-001",
+        outcome: "error",
+        detail: "x".repeat(1001),
+      }),
+    ),
+  ).toThrow(ProtocolError);
+
+  // Unknown outcome value rejected.
+  expect(() =>
+    parseBrowserMessage(
+      frame("authentication_claim_response", {
+        request_id: "auth-claim-request-001",
+        outcome: "granted",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+});
+
+test("claim_observation/claim_observation_ack round-trip and enforce §2.2 field rules", () => {
+  const frame = (
+    type: "claim_observation" | "claim_observation_ack",
+    payload: Record<string, unknown>,
+  ) => ({
+    protocol: "papio-browser/1" as const,
+    type,
+    msg_id: "msg-claim-obs-001",
+    seq: 1,
+    job_id: "job-claim-obs-00001",
+    payload,
+  });
+
+  const observationBase = {
+    request_id: "claim-obs-request-001",
+    authentication_claim_id: "auth-claim-00000001",
+    binding_id: "binding-obs-00000001",
+    browser_holder_generation: 4,
+    gate_occurrence_id: "gate-occurrence-00001",
+    observation_id: "observation-0000001",
+    event_ordinal: 0,
+  };
+
+  // Job-scoped: a job_id-less envelope is rejected.
+  expect(() =>
+    parseBrowserMessage({
+      protocol: "papio-browser/1",
+      type: "claim_observation",
+      msg_id: "msg-claim-obs-001",
+      seq: 1,
+      payload: { ...observationBase, event_kind: "wall_observed" },
+    }),
+  ).toThrow(ProtocolError);
+
+  // Round-trip for every event_kind value, with and without the optional
+  // materialization_claim_id.
+  for (const eventKind of [
+    "wall_observed",
+    "login_started",
+    "mfa",
+    "challenge",
+    "auth_returned",
+    "entitled_landing",
+    "owner_closed",
+    "navigation_error",
+  ] as const) {
+    expect(
+      parseBrowserMessage(
+        frame("claim_observation", {
+          ...observationBase,
+          event_kind: eventKind,
+        }),
+      ).type,
+    ).toBe("claim_observation");
+  }
+  expect(
+    parseBrowserMessage(
+      frame("claim_observation", {
+        ...observationBase,
+        materialization_claim_id: "materialization-claim-001",
+        event_kind: "wall_observed",
+      }),
+    ).payload,
+  ).toEqual({
+    ...observationBase,
+    materialization_claim_id: "materialization-claim-001",
+    event_kind: "wall_observed",
+  });
+
+  // Every required field is enforced (materialization_claim_id excluded — optional).
+  for (const key of Object.keys(observationBase)) {
+    const payload: Record<string, unknown> = {
+      ...observationBase,
+      event_kind: "wall_observed",
+    };
+    delete payload[key];
+    expect(() =>
+      parseBrowserMessage(frame("claim_observation", payload)),
+    ).toThrow(ProtocolError);
+  }
+  expect(() =>
+    parseBrowserMessage(
+      frame("claim_observation", { ...observationBase }),
+    ),
+  ).toThrow(ProtocolError); // missing event_kind
+
+  // Unknown field and invalid event_kind both fail closed.
+  expect(() =>
+    parseBrowserMessage(
+      frame("claim_observation", {
+        ...observationBase,
+        event_kind: "wall_observed",
+        extra: true,
+      }),
+    ),
+  ).toThrow(ProtocolError);
+  expect(() =>
+    parseBrowserMessage(
+      frame("claim_observation", {
+        ...observationBase,
+        event_kind: "auth_pending",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+
+  // Negative event_ordinal rejected.
+  expect(() =>
+    parseBrowserMessage(
+      frame("claim_observation", {
+        ...observationBase,
+        event_ordinal: -1,
+        event_kind: "wall_observed",
+      }),
+    ),
+  ).toThrow(ProtocolError);
+
+  // Ack: gate_occurrence_id and browser_holder_generation are always
+  // required; detail is forbidden on applied/duplicate.
+  const ackBase = {
+    request_id: "claim-obs-request-001",
+    gate_occurrence_id: "gate-occurrence-00002",
+    browser_holder_generation: 5,
+  };
+  for (const outcome of ["applied", "duplicate"] as const) {
+    expect(
+      parseBrowserMessage(
+        frame("claim_observation_ack", { ...ackBase, outcome }),
+      ).type,
+    ).toBe("claim_observation_ack");
+    expect(() =>
+      parseBrowserMessage(
+        frame("claim_observation_ack", {
+          ...ackBase,
+          outcome,
+          detail: "should not be here",
+        }),
+      ),
+    ).toThrow(ProtocolError);
+  }
+  for (const outcome of ["stale", "rejected", "error"] as const) {
+    expect(
+      parseBrowserMessage(
+        frame("claim_observation_ack", {
+          ...ackBase,
+          outcome,
+          detail: "not applied",
+        }),
+      ).type,
+    ).toBe("claim_observation_ack");
+  }
+
+  // applied: lease_until is optional (present for the four renewing kinds,
+  // absent otherwise — the ack cannot see the request's event_kind).
+  expect(
+    parseBrowserMessage(
+      frame("claim_observation_ack", {
+        ...ackBase,
+        outcome: "applied",
+        lease_until: "2026-08-18T00:05:00Z",
+      }),
+    ).payload,
+  ).toEqual({
+    ...ackBase,
+    outcome: "applied",
+    lease_until: "2026-08-18T00:05:00Z",
+  });
+  expect(
+    parseBrowserMessage(
+      frame("claim_observation_ack", { ...ackBase, outcome: "applied" }),
+    ).payload,
+  ).toEqual({ ...ackBase, outcome: "applied" });
+
+  // lease_until is forbidden on every other outcome.
+  for (const outcome of ["duplicate", "stale", "rejected", "error"] as const) {
+    expect(() =>
+      parseBrowserMessage(
+        frame("claim_observation_ack", {
+          ...ackBase,
+          outcome,
+          lease_until: "2026-08-18T00:05:00Z",
+        }),
+      ),
+    ).toThrow(ProtocolError);
+  }
+
+  // gate_occurrence_id and browser_holder_generation required for every outcome.
+  for (const key of ["gate_occurrence_id", "browser_holder_generation"]) {
+    const payload: Record<string, unknown> = { ...ackBase, outcome: "applied" };
+    delete payload[key];
+    expect(() =>
+      parseBrowserMessage(frame("claim_observation_ack", payload)),
+    ).toThrow(ProtocolError);
+  }
+
+  // Unknown outcome value rejected.
+  expect(() =>
+    parseBrowserMessage(
+      frame("claim_observation_ack", { ...ackBase, outcome: "accepted" }),
+    ),
+  ).toThrow(ProtocolError);
+
+  // detail is bounded to 1000 chars on outcomes that permit it.
+  expect(() =>
+    parseBrowserMessage(
+      frame("claim_observation_ack", {
+        ...ackBase,
+        outcome: "error",
+        detail: "x".repeat(1001),
+      }),
+    ),
+  ).toThrow(ProtocolError);
+});
+
+// The shared-corpus half of this contract lives in testdata/protocol/{valid,
+// invalid}/browser-authentication-claim-*.json and browser-claim-
+// observation-*.json, added by the sibling Go daemon agent implementing
+// internal/protocol and internal/browser/bridge.go. The blanket "valid
+// browser corpus parses"/"invalid browser corpus fails closed" tests above
+// already pick up any browser-*.json fixture with no per-type allowlist, so
+// no wiring change is needed here; this test adds a clearly-named,
+// skip-if-absent check specific to this message family so a failure names
+// the claim-observation protocol rather than an anonymous corpus fixture.
+test("authentication_claim/claim_observation corpus fixtures parse when the sibling daemon slice has landed", () => {
+  const validDir = join(corpusRoot, "valid");
+  const invalidDir = join(corpusRoot, "invalid");
+  const prefixes = ["browser-authentication-claim", "browser-claim-observation"];
+  const validFixtures = existsSync(validDir)
+    ? readdirSync(validDir).filter((name) =>
+        prefixes.some((prefix) => name.startsWith(prefix)),
+      )
+    : [];
+  const invalidFixtures = existsSync(invalidDir)
+    ? readdirSync(invalidDir).filter((name) =>
+        prefixes.some((prefix) => name.startsWith(prefix)),
+      )
+    : [];
+  for (const name of validFixtures) {
+    const text = readFileSync(join(validDir, name), "utf8");
+    expect(() => parseBrowserMessageBytes(text), name).not.toThrow();
+  }
+  for (const name of invalidFixtures) {
+    const text = readFileSync(join(invalidDir, name), "utf8");
+    expect(() => parseBrowserMessageBytes(text), name).toThrow(ProtocolError);
+  }
+});

@@ -21,7 +21,6 @@ import {
   type MaterializationCorrelation,
   type StoreShape,
 } from "../src/state";
-import { federatedLoginClaimKey } from "../src/background";
 
 function job(overrides: Partial<ActiveJob> = {}): ActiveJob {
   return {
@@ -106,33 +105,6 @@ test("pending delivery reducers replace, patch, and clear only the matching job"
   store = clearPendingDelivery(store, delivery.job_id);
   expect(store.pendingDelivery).toBeUndefined();
 });
-test("waiting-for-session persistence stores only the opaque claim digest", async () => {
-  const origin = "https://login.idp.example.edu";
-  const entityID = "https://idp.example.edu/entity";
-  const digest = await federatedLoginClaimKey(entityID);
-  const store = upsertJob(
-    {
-      ...emptyStore(),
-      federatedLoginOwners: {
-        [digest]: { jobID: "job_00000001", tabID: 100, phase: "auth" },
-      },
-    },
-    job({ waiting_for_session: true, waiting_for_session_key: digest }),
-  );
-  const persisted = JSON.stringify(store);
-  expect(persisted).toContain(digest);
-  expect(persisted).not.toContain(origin);
-  expect(persisted).not.toContain(entityID);
-});
-
-test("institution claim key is versioned and origin-independent", async () => {
-  const entityID = "https://idp.example.edu/entity";
-  const first = await federatedLoginClaimKey(entityID);
-  const second = await federatedLoginClaimKey(entityID);
-  expect(first).toBe(second);
-  expect(first).toMatch(/^v2:[0-9a-f]{64}$/);
-});
-
 const migrationJob = (
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> => ({
@@ -282,7 +254,7 @@ test("migration scrubs every legacy URL, claim hash, and global terms authority"
   expect(serialized).not.toContain("legacy-claim");
   expect(serialized).not.toContain("termsConsent");
   expect(migrated.offerURLs).toBeUndefined();
-  expect(migrated.federatedLoginOwners).toBeUndefined();
+  expect(serialized).not.toContain("federatedLoginOwners");
   expect(migrated.pendingDelivery?.url).toBeUndefined();
   expect(migrated.activeJobs[0]?.institution_claim_key).toBeUndefined();
   expect(migrated.activeJobs[0]?.waiting_for_session_key).toBeUndefined();

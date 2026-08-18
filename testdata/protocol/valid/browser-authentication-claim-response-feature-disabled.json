@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"authentication_claim_response","msg_id":"msg-claim-resp-0006","seq":1,"job_id":"job-claim-0008","payload":{"request_id":"request-claim-0008","outcome":"feature_disabled","detail":"institutional authentication claim is not negotiated by the current holder"}}

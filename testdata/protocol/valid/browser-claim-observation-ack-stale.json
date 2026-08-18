@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"claim_observation_ack","msg_id":"msg-obs-ack-0004","seq":1,"job_id":"job-obs-0003","payload":{"request_id":"request-obs-0003","outcome":"stale","detail":"event ordinal already superseded","gate_occurrence_id":"occurrence-claim-0001","browser_holder_generation":3}}

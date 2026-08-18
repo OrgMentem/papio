@@ -9,7 +9,6 @@
 // shape below; handoff URLs remain worker-local compatibility data only.
 
 import type { DeliverySessionEvidence } from "./protocol";
-import type { FederatedClaimPhase } from "./federated-claim";
 
 export type JobStatus =
   "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
@@ -200,13 +199,23 @@ export interface ActiveJob {
   /** Cold auth offers wait for explicit inbox/popup engagement before opening
    * a managed tab. */
   engagement_required?: boolean;
-  /** Opaque, versioned digest used to coordinate one institution's cold
-   * engagement without persisting its entity ID or resolver route. */
+  /** Legacy: an opaque digest coordinating one institution's cold engagement
+   * under the retired `federatedLoginOwners` mechanism. No longer written;
+   * always stripped on migration (see `migratedJob`). */
   institution_claim_key?: string;
   /** This job was accepted under handoff_link_v1, so no reusable URL exists
    * after engagement. Persisted because feature negotiation can be transiently
    * absent while a drive timeout fires. */
   fresh_handoff?: boolean;
+  /** Sticky signal (Slice 3) that this job's institution was ever
+   * identified — via a job offer's login_entity_id or a live institutional
+   * candidate (materializationCorrelation) — so a cold engagement that has
+   * lost the worker-local record of which (a service-worker restart drops
+   * both) still knows the daemon has enough to arbitrate a claim. No
+   * entity/candidate value is ever stored here, only this boolean; once
+   * set it is never cleared — a re-offer that omits the signal must not
+   * un-set an identity already established. */
+  claim_identity_known?: boolean;
   /** One-download-initiation-per-job latch. Once an adapter has clicked the
    * declared download target, it can never click again for this job. The
    * source-controlled adapter id allows concurrent provider downloads to be
@@ -252,53 +261,17 @@ export interface ActiveJob {
    * transition in the tab-update handler) — never left stale, or the job
    * would be skipped by every future restore forever. */
   parked_with_tab?: boolean;
-  /** Set when this handoff's classify verdict was "login" and its
-   * federated-login claim key (federatedLoginOwners, below — the IdP origin
-   * maybeRouteFederatedLogin would navigate to, PLUS the offer's entityID:
-   * a shared WAYF/Discovery-Service host serving many institutions exposes
-   * only ONE origin, so entityID is the axis that actually distinguishes
-   * them) already has a live sibling tab driving that sign-in — so this tab
-   * is deliberately left on the provider's login wall instead of opening a
-   * second, redundant IdP tab. A distinct marker from parked_with_tab (which
-   * it is always set alongside whenever a tab is preserved) so UI copy and
-   * the multiple resume paths below can tell "this job's own timeout/
-   * challenge park" apart from "this job is only waiting on ANOTHER job's
-   * shared institution sign-in". Resumes on: the claim's owner finishing
-   * (recordInstitutionalSession, unconditionally — even when this
-   * institution's evidence was already warm), the owner's claim retiring
-   * for any reason (clearFederatedLoginOwner, which always resumes that
-   * claim's own waiters — never leaves one ownerless), or fresh session
-   * evidence for the same institution once its claim is no longer live. It
-   * stays parked until one of those real events frees it. Cleared the moment
-   * job drives again (registerHandoffDrive, via clearParkedMarker) or, if its
-   * tab closes while parked, when onTabRemoved demotes it to an ordinary
-   * queued drive. */
+  /** Legacy: set when this handoff's classify verdict was "login" and a
+   * sibling tab already owned that institution's federated-login sign-in
+   * (the pre-Slice-3 `federatedLoginOwners` mechanism, retired). No longer
+   * written; retained only so a blob persisted before the cutover migrates
+   * cleanly (`migratedState` always strips it on load). */
   waiting_for_session?: boolean;
-  /** Opaque versioned SHA-256 digest of the institution entity ID. The raw
-   * IdP origin and entityID are never persisted; this key exists only for
-   * equality against federatedLoginOwners. */
+  /** Legacy companion to `waiting_for_session`, above. No longer written. */
   waiting_for_session_key?: string | undefined;
-  /** Absolute epoch ms used only as a display hint for the inbox waiting
-   * overlay. It does not demote a waiting_for_session park; the marker stays
-   * set until owner removal, startup owner validation, or fresh session
-   * evidence resumes the job. Persisted so the overlay can retain its
-   * original timestamp across a service-worker restart and re-park. */
+  /** Legacy display hint for the retired waiting-for-session overlay. No
+   * longer written; retained only for migration. */
   waiting_deadline?: number | undefined;
-}
-/** Cross-job record of the one live tab currently driving federated login for
- * an opaque SHA-256 digest of the institution entity ID. Resolver and IdP
- * origins are deliberately excluded because discovery services are shared.
- * Lets multiple papers needing the same institution share one login tab:
- * a job whose login verdict resolves to an existing digest parks as a waiter.
- * Session storage preserves the claim across service-worker restarts;
- * reconciliation drops stale owners and resumes their waiters. The owning
- * tab closing, returning from authentication, or its job ending retires it. */
-export interface FederatedLoginOwner {
-  jobID: string;
-  tabID: number;
-  /** "engaging" reserves a cold click before daemon RPC; "auth" is an
-   * in-flight federated login after the provider login verdict. */
-  phase: FederatedClaimPhase;
 }
 /** A short, browser-session lease over one provider's queued handoffs. The
  * owner token stays only in the service worker; session storage retains this
@@ -818,8 +791,6 @@ export interface StoreShape {
    * persisted; only opaque daemon-minted IDs and the deterministic authority
    * digest survive restart. */
   termsEffects?: Record<string, TermsEffectCorrelation>;
-  /** Legacy browser claim map; never promoted by managed-state migration. */
-  federatedLoginOwners?: Record<string, FederatedLoginOwner>;
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests
@@ -939,8 +910,12 @@ export function clearPendingDelivery(
  * adds the URL-free operator-selected manual-delivery target; version 5 adds
  * the URL-free terms effect correlation ledger; version 6 drops that pin and
  * binds the one restart-surviving `waiting_manual` continuation to its exact
- * page identity. */
-export const MANAGED_STATE_VERSION = 6;
+ * page identity; version 7 (Slice 3 of surface-lifecycle-plan.md) drops the
+ * `federatedLoginOwners` cross-job claim map and its per-job
+ * `waiting_for_session`/`waiting_for_session_key`/`waiting_deadline`
+ * markers — superseded by the daemon-arbitrated authentication-claim
+ * protocol. */
+export const MANAGED_STATE_VERSION = 7;
 const STORAGE_KEY = "papio_state_v1";
 type UnknownRecord = Record<string, unknown>;
 
@@ -1167,10 +1142,7 @@ function migratedDriveEpoch(value: unknown): ProviderDriveEpoch | undefined {
   }
   return epoch;
 }
-function migratedJob(
-  value: ActiveJob,
-  droppedClaimOwnerJobIDs: ReadonlySet<string>,
-): ActiveJob {
+function migratedJob(value: ActiveJob): ActiveJob {
   const scrubbed = scrubRecord(value) ?? {};
   const migrated: ActiveJob = {
     ...scrubbed,
@@ -1184,11 +1156,6 @@ function migratedJob(
       .filter((host): host is string => host !== undefined),
   };
   const raw = value as unknown as UnknownRecord;
-  const droppedWaitAuthority =
-    droppedClaimOwnerJobIDs.has(value.job_id) ||
-    raw.waiting_for_session === true ||
-    raw.waiting_for_session_key !== undefined ||
-    raw.institution_claim_key !== undefined;
   delete migrated.institution_claim_key;
   delete migrated.waiting_for_session_key;
   delete migrated.direct_envelope;
@@ -1312,9 +1279,17 @@ function migratedJob(
     migrated.challenge_blocked_at = value.challenge_blocked_at;
   if (typeof value.handoffAckPending === "boolean")
     migrated.handoffAckPending = value.handoffAckPending;
+  const droppedWaitAuthority =
+    raw.waiting_for_session === true ||
+    raw.waiting_for_session_key !== undefined ||
+    raw.institution_claim_key !== undefined;
   if (droppedWaitAuthority) {
-    // marker that depended on it so startup reconciliation sees a normal
-    // schedulable job, while preserving its safe tab/job correlation above.
+    // These belonged to the retired federatedLoginOwners mechanism (Slice
+    // 3) and are never carried forward; parked_with_tab/parked_at/
+    // parked_reason are stripped alongside it only here, because the one
+    // retired write path (parkHandoffWaitingForSession) always set
+    // parked_with_tab together with waiting_for_session — an ordinary
+    // handoff-timeout park (parkHandoffForManual) never sets the latter.
     const migratedRecord = migrated as unknown as UnknownRecord;
     for (const key of [
       "waiting_for_session",
@@ -1328,13 +1303,8 @@ function migratedJob(
     ]) {
       delete migratedRecord[key];
     }
-  } else {
-    if (typeof value.parked_with_tab === "boolean")
-      migrated.parked_with_tab = value.parked_with_tab;
-    if (typeof value.waiting_for_session === "boolean")
-      migrated.waiting_for_session = value.waiting_for_session;
-    if (isFiniteNumber(value.waiting_deadline))
-      migrated.waiting_deadline = value.waiting_deadline;
+  } else if (typeof value.parked_with_tab === "boolean") {
+    migrated.parked_with_tab = value.parked_with_tab;
   }
   return migrated;
 }
@@ -1538,17 +1508,7 @@ function migratedState(raw: UnknownRecord): StoreShape {
   // A malformed job is not allowed to silently become an empty active job.
   const validJobs = jobs.filter(validActiveJob);
   if (validJobs.length !== jobs.length) return emptyStore();
-  const droppedClaimOwnerJobIDs = new Set<string>();
-  if (isRecord(raw.federatedLoginOwners)) {
-    for (const owner of Object.values(raw.federatedLoginOwners)) {
-      if (isRecord(owner) && typeof owner.jobID === "string") {
-        droppedClaimOwnerJobIDs.add(owner.jobID);
-      }
-    }
-  }
-  const activeJobs = validJobs.map((job) =>
-    migratedJob(job, droppedClaimOwnerJobIDs),
-  );
+  const activeJobs = validJobs.map((job) => migratedJob(job));
   const output: StoreShape = {
     ...emptyStore(),
     activeJobs,
@@ -1612,9 +1572,8 @@ function migratedState(raw: UnknownRecord): StoreShape {
   const challengeCooldowns = migratedCooldownMap(raw.challengeCooldowns);
   if (challengeCooldowns !== undefined)
     output.challengeCooldowns = challengeCooldowns;
-  // Legacy federatedLoginOwners and all per-job claim keys are deterministic
-  // browser hashes, not daemon-issued opaque authority IDs. Do not promote.
-  delete output.federatedLoginOwners;
+  // offerURLs are worker-local compatibility data (handoff URLs), always
+  // dropped by managed persistence.
   delete output.offerURLs;
   return output;
 }
@@ -1631,6 +1590,7 @@ export function migrateManagedState(raw: unknown): StoreShape {
     version !== 3 &&
     version !== 4 &&
     version !== 5 &&
+    version !== 6 &&
     version !== MANAGED_STATE_VERSION
   )
     return emptyStore();

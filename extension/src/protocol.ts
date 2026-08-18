@@ -104,7 +104,11 @@ export type BrowserMessageType =
   | "terms_effect_result_request"
   | "terms_effect_result"
   | "surface_close_request"
-  | "surface_close_response";
+  | "surface_close_response"
+  | "authentication_claim_request"
+  | "authentication_claim_response"
+  | "claim_observation"
+  | "claim_observation_ack";
 export interface HelloPayload {
   extension_version: string;
   adapter_versions?: Record<string, string>;
@@ -339,6 +343,8 @@ export interface ProviderDriveEpochResultPayload extends ProviderDriveEpochTuple
 }
 export const EFFECT_PERMIT_FEATURE = "effect_permit_v1" as const;
 export const SURFACE_CLOSE_FEATURE = "surface_close_v1" as const;
+export const INSTITUTIONAL_AUTHENTICATION_CLAIM_FEATURE =
+  "institutional_authentication_claim_v1" as const;
 
 export type EffectPermitKind =
   "generic_drive" | "direct_get" | "pdf_grab" | "terms" | "institutional";
@@ -1113,6 +1119,80 @@ export interface InstitutionalNavigatedResponsePayload {
   binding_id?: string;
 }
 
+/** §2.1 of dev/active/claim-observation-protocol.md: resolves whether and
+ * how a human sign-in surface for a candidate's authentication claim may
+ * exist right now, in one daemon transaction. Job-scoped (JOB_SCOPED
+ * below). */
+export interface AuthenticationClaimRequestPayload {
+  request_id: string;
+  candidate_id: string;
+  materialization_kind: "browser_tab" | "direct_download";
+  trigger: "automatic" | "explicit";
+}
+
+/** The four operational outcomes (navigate_existing/open_new/focus_owner/
+ * park) require authentication_claim_id/browser_holder_generation/
+ * gate_occurrence_id and forbid detail; every other outcome forbids all
+ * five and permits only detail. lease_until is further restricted to
+ * navigate_existing/open_new/focus_owner, dependent_count to park only,
+ * and owner_binding_id/owner_tab_hint to navigate_existing/focus_owner. */
+export interface AuthenticationClaimResponsePayload {
+  request_id: string;
+  outcome:
+    | "navigate_existing"
+    | "open_new"
+    | "focus_owner"
+    | "park"
+    | "feature_disabled"
+    | "not_eligible"
+    | "busy"
+    | "error";
+  detail?: string;
+  authentication_claim_id?: string;
+  browser_holder_generation?: number;
+  gate_occurrence_id?: string;
+  lease_until?: string;
+  dependent_count?: number;
+  owner_binding_id?: string;
+  owner_tab_hint?: number;
+}
+
+/** §2.2: fire-and-forget-with-ack human-paced event stream (extension →
+ * daemon) that keeps the authentication-entry lease alive. Job-scoped. */
+export interface ClaimObservationPayload {
+  request_id: string;
+  authentication_claim_id: string;
+  binding_id: string;
+  materialization_claim_id?: string;
+  browser_holder_generation: number;
+  gate_occurrence_id: string;
+  observation_id: string;
+  event_ordinal: number;
+  event_kind:
+    | "wall_observed"
+    | "login_started"
+    | "mfa"
+    | "challenge"
+    | "auth_returned"
+    | "entitled_landing"
+    | "owner_closed"
+    | "navigation_error";
+}
+
+/** lease_until is set by the daemon only on outcome `applied` and only for
+ * the four lease-renewing event kinds (wall_observed/login_started/mfa/
+ * challenge) — but this parser validates the ack in isolation from the
+ * paired claim_observation's event_kind, so it is OPTIONAL (not required)
+ * on applied and FORBIDDEN on every other outcome. */
+export interface ClaimObservationAckPayload {
+  request_id: string;
+  outcome: "applied" | "duplicate" | "stale" | "rejected" | "error";
+  detail?: string;
+  gate_occurrence_id: string;
+  browser_holder_generation: number;
+  lease_until?: string;
+}
+
 /** §2.3 of dev/active/claim-observation-protocol.md: generic close
  * authorization, not job-scoped and not institutional-specific — a scaffold
  * being closed may have no live job (e.g. an abandoned claim's scaffold
@@ -1415,6 +1495,10 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   terms_effect_result: true,
   surface_close_request: true,
   surface_close_response: true,
+  authentication_claim_request: true,
+  authentication_claim_response: true,
+  claim_observation: true,
+  claim_observation_ack: true,
 };
 
 const JOB_SCOPED: Record<string, true> = {
@@ -1449,6 +1533,10 @@ const JOB_SCOPED: Record<string, true> = {
   terms_effect_start_result: true,
   terms_effect_result_request: true,
   terms_effect_result: true,
+  authentication_claim_request: true,
+  authentication_claim_response: true,
+  claim_observation: true,
+  claim_observation_ack: true,
 };
 const OUTCOMES: Record<string, true> = {
   no_entitlement: true,
@@ -6034,6 +6122,178 @@ function validatePayload(
           if (key in p) fail(`${type}.${outcome} must not carry ${key}`);
         }
         if ("detail" in p) triageText(p, "detail", type, 1000);
+      }
+      break;
+    }
+    case "authentication_claim_request": {
+      requireFields<AuthenticationClaimRequestPayload>(p, type, {
+        request_id: "required",
+        candidate_id: "required",
+        materialization_kind: "required",
+        trigger: "required",
+      });
+      institutionalID(p, "request_id", type);
+      institutionalID(p, "candidate_id", type);
+      const kind = str(p, "materialization_kind", type, 32);
+      if (kind !== "browser_tab" && kind !== "direct_download")
+        fail(`${type}.materialization_kind is invalid`);
+      const trigger = str(p, "trigger", type, 20);
+      if (trigger !== "automatic" && trigger !== "explicit")
+        fail(`${type}.trigger is invalid`);
+      break;
+    }
+    case "authentication_claim_response": {
+      requireFields<AuthenticationClaimResponsePayload>(p, type, {
+        request_id: "required",
+        outcome: "required",
+        detail: "optional",
+        authentication_claim_id: "optional",
+        browser_holder_generation: "optional",
+        gate_occurrence_id: "optional",
+        lease_until: "optional",
+        dependent_count: "optional",
+        owner_binding_id: "optional",
+        owner_tab_hint: "optional",
+      });
+      institutionalID(p, "request_id", type);
+      const outcome = str(p, "outcome", type, 32);
+      if (
+        ![
+          "navigate_existing",
+          "open_new",
+          "focus_owner",
+          "park",
+          "feature_disabled",
+          "not_eligible",
+          "busy",
+          "error",
+        ].includes(outcome)
+      )
+        fail(`${type}.outcome is invalid`);
+      const operational =
+        outcome === "navigate_existing" ||
+        outcome === "open_new" ||
+        outcome === "focus_owner" ||
+        outcome === "park";
+      if (!operational) {
+        for (const key of [
+          "authentication_claim_id",
+          "browser_holder_generation",
+          "gate_occurrence_id",
+          "lease_until",
+          "dependent_count",
+          "owner_binding_id",
+          "owner_tab_hint",
+        ]) {
+          if (key in p) fail(`${type}.${outcome} must not carry ${key}`);
+        }
+        if ("detail" in p) triageText(p, "detail", type, 1000);
+        break;
+      }
+      if ("detail" in p) fail(`${type}.${outcome} must not carry detail`);
+      institutionalID(p, "authentication_claim_id", type);
+      int(p, "browser_holder_generation", type, 0);
+      institutionalID(p, "gate_occurrence_id", type);
+      if (
+        outcome === "navigate_existing" ||
+        outcome === "open_new" ||
+        outcome === "focus_owner"
+      ) {
+        triageTime(p, "lease_until", type);
+      } else if ("lease_until" in p) {
+        fail(`${type}.${outcome} must not carry lease_until`);
+      }
+      if (outcome === "park") {
+        int(p, "dependent_count", type, 0);
+      } else if ("dependent_count" in p) {
+        fail(`${type}.${outcome} must not carry dependent_count`);
+      }
+      if (outcome === "navigate_existing" || outcome === "focus_owner") {
+        institutionalID(p, "owner_binding_id", type);
+        if ("owner_tab_hint" in p)
+          institutionalTabID(p, "owner_tab_hint", type);
+      } else {
+        if ("owner_binding_id" in p)
+          fail(`${type}.${outcome} must not carry owner_binding_id`);
+        if ("owner_tab_hint" in p)
+          fail(`${type}.${outcome} must not carry owner_tab_hint`);
+      }
+      break;
+    }
+    case "claim_observation": {
+      requireFields<ClaimObservationPayload>(p, type, {
+        request_id: "required",
+        authentication_claim_id: "required",
+        binding_id: "required",
+        materialization_claim_id: "optional",
+        browser_holder_generation: "required",
+        gate_occurrence_id: "required",
+        observation_id: "required",
+        event_ordinal: "required",
+        event_kind: "required",
+      });
+      institutionalID(p, "request_id", type);
+      institutionalID(p, "authentication_claim_id", type);
+      institutionalID(p, "binding_id", type);
+      if ("materialization_claim_id" in p)
+        institutionalID(p, "materialization_claim_id", type);
+      int(p, "browser_holder_generation", type, 0);
+      institutionalID(p, "gate_occurrence_id", type);
+      institutionalID(p, "observation_id", type);
+      int(p, "event_ordinal", type, 0);
+      const eventKind = str(p, "event_kind", type, 32);
+      if (
+        ![
+          "wall_observed",
+          "login_started",
+          "mfa",
+          "challenge",
+          "auth_returned",
+          "entitled_landing",
+          "owner_closed",
+          "navigation_error",
+        ].includes(eventKind)
+      )
+        fail(`${type}.event_kind is invalid`);
+      break;
+    }
+    case "claim_observation_ack": {
+      requireFields<ClaimObservationAckPayload>(p, type, {
+        request_id: "required",
+        outcome: "required",
+        detail: "optional",
+        gate_occurrence_id: "required",
+        browser_holder_generation: "required",
+        lease_until: "optional",
+      });
+      institutionalID(p, "request_id", type);
+      const outcome = str(p, "outcome", type, 20);
+      if (
+        !["applied", "duplicate", "stale", "rejected", "error"].includes(
+          outcome,
+        )
+      )
+        fail(`${type}.outcome is invalid`);
+      institutionalID(p, "gate_occurrence_id", type);
+      int(p, "browser_holder_generation", type, 0);
+      if (outcome === "applied" || outcome === "duplicate") {
+        if ("detail" in p) fail(`${type}.${outcome} must not carry detail`);
+      } else if ("detail" in p) {
+        triageText(p, "detail", type, 1000);
+      }
+      // §2.2 of dev/active/claim-observation-protocol.md: lease_until is
+      // only set by the daemon on `applied` for the four lease-renewing
+      // event kinds (wall_observed/login_started/mfa/challenge), never for
+      // auth_returned/entitled_landing/owner_closed/navigation_error — but
+      // this parser validates the ack frame on its own, with no visibility
+      // into the paired claim_observation's event_kind, so lease_until is
+      // OPTIONAL (not required) on applied and FORBIDDEN on every other
+      // outcome; the caller correlates presence against its own locally
+      // remembered event_kind for the matching request_id.
+      if (outcome === "applied") {
+        if ("lease_until" in p) triageTime(p, "lease_until", type);
+      } else if ("lease_until" in p) {
+        fail(`${type}.${outcome} must not carry lease_until`);
       }
       break;
     }

@@ -59,6 +59,13 @@ export interface SurfaceBirthRecord {
     nonce: string;
     holder_generation: number;
     recorded_at: number;
+    /** The disposition the close transaction was authorized under (Slice 3).
+     * Absent on records written before this field existed — replay then
+     * falls back to `scaffold_idle`, the only disposition that existed at
+     * the time. Carrying it through means a `claim_abandoned` close that
+     * failed mid-transaction replays under its own disposition, not a
+     * silently substituted one. */
+    disposition?: string;
   };
 }
 
@@ -108,6 +115,8 @@ export function isSurfaceBirthRecord(value: unknown): value is SurfaceBirthRecor
     if (typeof pending.nonce !== "string") return false;
     if (typeof pending.holder_generation !== "number") return false;
     if (typeof pending.recorded_at !== "number") return false;
+    if (pending.disposition !== undefined && typeof pending.disposition !== "string")
+      return false;
   }
   return true;
 }

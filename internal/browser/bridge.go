@@ -110,6 +110,15 @@ const (
 	// request/response pair (surface_close_request/surface_close_response),
 	// independent of institutional_authentication_claim_v1.
 	surfaceCloseFeature = protocol.SurfaceCloseFeature
+	// institutionalAuthenticationClaimFeature gates the full claim-request
+	// and claim-observation family (authentication_claim_request/response,
+	// claim_observation/claim_observation_ack). This is the 32nd and last
+	// advertised feature before the fail-closed 32-feature cap
+	// (protocol.go's hello.features/hello_ack.features bound, pinned by
+	// protocol_test.go) — no further protocol feature may be added without
+	// retiring or consolidating an existing one first
+	// (dev/active/claim-observation-protocol.md §1).
+	institutionalAuthenticationClaimFeature = protocol.InstitutionalAuthenticationClaimFeature
 	// pdfGrabSuggestV1Feature gates the inbox's operator candidate picker:
 	// the pdf_grab_suggest_request/response ranked "which pending job is
 	// this?" answer and the pdf_grab_confirm_request/response fenced bind
@@ -150,6 +159,13 @@ const (
 	// The remainder stays queued for the next ordinary poll. Pinned by
 	// TestSyncResponseFitsResultCap.
 	maxFocusFramesPerPoll = 32
+	// maxClaimObservationsPerPoll bounds how many queued claim_observation
+	// frames one Sync poll answers with acks, mirroring
+	// maxFocusFramesPerPoll's rationale: the extension MUST send at most
+	// this many per poll (dev/active/claim-observation-protocol.md §5),
+	// carrying any remainder to the next poll. Pinned by
+	// TestSyncResponseFitsResultCap.
+	maxClaimObservationsPerPoll = 32
 )
 
 // Session roles carried by hello_ack. Absent means "holder": an old daemon
@@ -591,6 +607,10 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 	required := []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, effectPermitFeature, institutionalMaterializationFeature,
 		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature, pdfGrabSuggestV1Feature, surfaceCloseFeature,
+		// institutionalAuthenticationClaimFeature is the 32nd and final slot
+		// under the fail-closed cap (see its own doc comment); do not add
+		// another feature after it without retiring one first.
+		institutionalAuthenticationClaimFeature,
 	}
 	var grabs *grab.Service
 	var cohorts *batch.Cohorts
@@ -1255,6 +1275,24 @@ func institutionalMaterializationMessage(msgType string) bool {
 	return false
 }
 
+// institutionalAuthenticationClaimMessage reports whether msgType is part
+// of the claim-observation protocol family
+// (dev/active/claim-observation-protocol.md §2.1/§2.2).
+// authentication_claim_request precedes a requires_auth tab and is
+// current-holder-only; claim_observation is a historical-report frame,
+// admitted from any known session per Decision 4's "an old holder's
+// browser is still allowed to report what already happened locally" —
+// every reducer path checks browser_holder_generation before mutating, so a
+// non-holder or demoted session cannot revive a stale claim, it can only
+// report it (which acks stale).
+func institutionalAuthenticationClaimMessage(msgType string) bool {
+	switch msgType {
+	case protocol.MsgAuthenticationClaimRequest, protocol.MsgClaimObservation:
+		return true
+	}
+	return false
+}
+
 func (b *Bridge) institutionalMaterializationAvailable() bool {
 	return b != nil && b.holder != nil && b.holder.ID != legacySessionID &&
 		!b.materializationAuthorityUncertain &&
@@ -1622,6 +1660,18 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 			result.Outcome, result.Detail = "error", "binding could not be recorded"
 		}
 		return b.frameInstitutionalBind(jobID, result)
+	}
+	// Best-effort side channel (claim-observation-protocol.md §4.1): record
+	// which surface now occupies this candidate's authentication-entry
+	// lease, so a later navigate_existing/focus_owner can echo it. A
+	// mismatched fence is a silent no-op inside the store method; a genuine
+	// store failure is logged, never fatal to the bind that already
+	// committed.
+	if profile, profileErr := b.jobs.GetInstitutionProfile(ctx, candidate.InstitutionProfileID); profileErr == nil &&
+		profile != nil && profile.AuthenticationClaimID != "" {
+		if err := b.jobs.SetAuthenticationEntryLeaseOwnerBinding(ctx, profile.AuthenticationClaimID, jobID, b.epoch, p.BindingID, p.TabID); err != nil {
+			log.Printf("papio: authentication entry lease owner binding could not be recorded: %v", err)
+		}
 	}
 	result.Outcome = "bound"
 	result.ClaimID, result.BindingID = claim.ID, p.BindingID
@@ -2035,6 +2085,356 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 	return frame()
 }
 
+// institutionalAuthenticationClaimDisabled answers the two claim-observation
+// message types when the negotiating session has not advertised
+// institutional_authentication_claim_v1. claim_observation_ack's closed
+// outcome vocabulary (§2.2) has no "feature_disabled" member, so an
+// unnegotiated observation is acked "rejected" instead — an ordinary,
+// expected failure per this file's structured-outcome rule, never a raw
+// error or a disconnect.
+func (b *Bridge) institutionalAuthenticationClaimDisabled(msg *protocol.BrowserMessage) ([]json.RawMessage, error) {
+	detail := "institutional authentication claim is not negotiated by the current holder"
+	switch msg.Type {
+	case protocol.MsgAuthenticationClaimRequest:
+		p := msg.Payload.(*protocol.AuthenticationClaimRequestPayload)
+		frame, err := b.frame(protocol.MsgAuthenticationClaimResponse, msg.JobID, protocol.AuthenticationClaimResponsePayload{
+			RequestID: p.RequestID, Outcome: "feature_disabled", Detail: detail,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{frame}, nil
+	case protocol.MsgClaimObservation:
+		p := msg.Payload.(*protocol.ClaimObservationPayload)
+		frame, err := b.frame(protocol.MsgClaimObservationAck, msg.JobID, protocol.ClaimObservationAckPayload{
+			RequestID: p.RequestID, Outcome: "rejected", Detail: detail,
+			GateOccurrenceID: p.GateOccurrenceID, BrowserHolderGeneration: b.epoch,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{frame}, nil
+	}
+	return nil, nil
+}
+
+// authenticationClaimCurrentGateOccurrence reads the current human_gate.login
+// occurrence scoped to one authentication claim, whatever its status
+// (open or resolved) — the read-only half claim_observation's ack needs to
+// always echo "the daemon's current occurrence id" (§2.2).
+func (b *Bridge) authenticationClaimCurrentGateOccurrence(ctx context.Context, claimID string) (job.HumanGateObservation, bool, error) {
+	rows, err := b.jobs.CurrentHumanGateObservations(ctx, string(job.HumanGateScopeAuthenticationClaim), claimID)
+	if err != nil {
+		return job.HumanGateObservation{}, false, err
+	}
+	for _, row := range rows {
+		if row.GateType == job.HumanGateLogin {
+			return row, true, nil
+		}
+	}
+	return job.HumanGateObservation{}, false, nil
+}
+
+// ensureAuthenticationClaimGateOccurrence returns the id of the currently
+// OPEN human_gate.login occurrence for claimID, minting one via the same
+// occurrence-minting machinery institutional handlers already use
+// (upsertProfileGate) whenever none is open — either because none exists
+// yet (first grant) or because a prior cycle resolved it (a fresh grant
+// reopens with a new occurrence id: "the gate id carries the frame's
+// msg_id" rollover rule, ADR-0022 "Human gates are keyed to the
+// occurrence"). Only the arbitration reducer (authenticationClaim) calls
+// this; the observation reducer only ever reads the current occurrence.
+func (b *Bridge) ensureAuthenticationClaimGateOccurrence(ctx context.Context, profile *job.InstitutionProfile, claimID, jobID, requestID string) (string, error) {
+	if row, ok, err := b.authenticationClaimCurrentGateOccurrence(ctx, claimID); err != nil {
+		return "", err
+	} else if ok && row.Status == job.HumanGateOpen {
+		return row.ID, nil
+	}
+	observationKey := evidenceObservationID("authentication_claim_grant", requestID, claimID)
+	if err := b.upsertProfileGate(ctx, observationKey, profile.ConfiguredName, jobID, job.HumanGateLogin, job.HumanGateOpen,
+		`{"source":"authentication_claim_request"}`); err != nil {
+		return "", err
+	}
+	row, ok, err := b.authenticationClaimCurrentGateOccurrence(ctx, claimID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", errors.New("authentication claim gate occurrence could not be established")
+	}
+	return row.ID, nil
+}
+
+func (b *Bridge) authenticationClaimResponse(jobID string, p protocol.AuthenticationClaimResponsePayload) ([]json.RawMessage, error) {
+	frame, err := b.frame(protocol.MsgAuthenticationClaimResponse, jobID, p)
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+// authenticationClaim answers authentication_claim_request: the §2.1.1
+// arbitration reducer. authentication_claim_id is always resolved here from
+// candidate_id (Decision 2), never accepted from the wire. The lease id is
+// deterministic per (claim, owning job, holder generation) — mirroring the
+// legacy reserveAuthenticationEntry's derivation — so a genuine retry from
+// the same owner replays into the same reservation instead of racing a
+// fresh one.
+func (b *Bridge) authenticationClaim(ctx context.Context, jobID string, p *protocol.AuthenticationClaimRequestPayload) ([]json.RawMessage, error) {
+	requestID := ""
+	if p != nil {
+		requestID = p.RequestID
+	}
+	response := func(outcome, detail string) ([]json.RawMessage, error) {
+		return b.authenticationClaimResponse(jobID, protocol.AuthenticationClaimResponsePayload{
+			RequestID: requestID, Outcome: outcome, Detail: detail,
+		})
+	}
+	if p == nil {
+		return response("error", "authentication claim request is missing")
+	}
+	candidate, err := b.jobs.GetBrowserCandidate(ctx, p.CandidateID)
+	if err != nil || candidate == nil || candidate.JobID != jobID {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return response("error", "candidate state is unavailable")
+		}
+		return response("not_eligible", "candidate is not current")
+	}
+	if candidate.Status != "eligible" && candidate.Status != "claimed" && candidate.Status != "materializing" {
+		return response("not_eligible", "candidate is no longer eligible")
+	}
+	profile, err := b.jobs.GetInstitutionProfile(ctx, candidate.InstitutionProfileID)
+	if err != nil {
+		return response("error", "institution profile state is unavailable")
+	}
+	if profile == nil || profile.TombstonedAt != "" || profile.Revision != candidate.InstitutionProfileRevision || profile.AuthenticationClaimID == "" {
+		return response("not_eligible", "institution profile authority was lost")
+	}
+	claimID := profile.AuthenticationClaimID
+	leaseID := evidenceObservationID("authentication_claim_lease", claimID, jobID, strconv.FormatInt(b.epoch, 10))
+	lease, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: claimID, LeaseID: leaseID, OwnerID: jobID,
+		BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
+	})
+	generation := b.epoch
+	if reserveErr != nil {
+		if !errors.Is(reserveErr, job.ErrAuthenticationEntryLeaseBusy) {
+			return response("error", "authentication entry lease is unavailable")
+		}
+		owner, ok, ownerErr := b.jobs.GetAuthenticationEntryLease(ctx, claimID)
+		if ownerErr != nil || !ok {
+			return response("error", "authentication entry lease state is unavailable")
+		}
+		occurrenceID, occErr := b.ensureAuthenticationClaimGateOccurrence(ctx, profile, claimID, jobID, requestID)
+		if occErr != nil {
+			return response("error", "gate occurrence state is unavailable")
+		}
+		// focus_owner requires a real surface to focus (owner_binding_id is
+		// wire-required on it); a busy lease whose owner has not bound a
+		// surface yet (a race between its own open_new grant and its
+		// institutional_bind_request) has nothing to focus, so it parks
+		// exactly like the automatic-trigger case regardless of trigger.
+		if p.Trigger == "explicit" && owner.OwnerBindingID != "" {
+			return b.authenticationClaimResponse(jobID, protocol.AuthenticationClaimResponsePayload{
+				RequestID: requestID, Outcome: "focus_owner",
+				AuthenticationClaimID: claimID, BrowserHolderGeneration: &generation,
+				GateOccurrenceID: occurrenceID, LeaseUntil: owner.LeaseUntil,
+				OwnerBindingID: owner.OwnerBindingID, OwnerTabHint: owner.OwnerTabHint,
+			})
+		}
+		dependents, depErr := b.jobs.EligibleAuthenticationClaimDependents(ctx, claimID)
+		if depErr != nil {
+			return response("error", "dependent count is unavailable")
+		}
+		return b.authenticationClaimResponse(jobID, protocol.AuthenticationClaimResponsePayload{
+			RequestID: requestID, Outcome: "park",
+			AuthenticationClaimID: claimID, BrowserHolderGeneration: &generation,
+			GateOccurrenceID: occurrenceID, DependentCount: &dependents,
+		})
+	}
+	occurrenceID, occErr := b.ensureAuthenticationClaimGateOccurrence(ctx, profile, claimID, jobID, requestID)
+	if occErr != nil {
+		return response("error", "gate occurrence state is unavailable")
+	}
+	// A live owner_binding_id means a surface already exists to navigate;
+	// its absence — whether this reservation is brand new, or a replay of
+	// one that has not reached institutional_bind_response yet — means
+	// there is nothing to navigate to, so the extension is granted
+	// permission to open one exactly as a fresh grant would (§2.1.1 case
+	// 2/3 collapse to the same wire outcome here).
+	if lease.OwnerBindingID != "" {
+		return b.authenticationClaimResponse(jobID, protocol.AuthenticationClaimResponsePayload{
+			RequestID: requestID, Outcome: "navigate_existing",
+			AuthenticationClaimID: claimID, BrowserHolderGeneration: &generation,
+			GateOccurrenceID: occurrenceID, LeaseUntil: lease.LeaseUntil,
+			OwnerBindingID: lease.OwnerBindingID, OwnerTabHint: lease.OwnerTabHint,
+		})
+	}
+	return b.authenticationClaimResponse(jobID, protocol.AuthenticationClaimResponsePayload{
+		RequestID: requestID, Outcome: "open_new",
+		AuthenticationClaimID: claimID, BrowserHolderGeneration: &generation,
+		GateOccurrenceID: occurrenceID, LeaseUntil: lease.LeaseUntil,
+	})
+}
+
+func (b *Bridge) claimObservationAck(jobID string, p protocol.ClaimObservationAckPayload) ([]json.RawMessage, error) {
+	frame, err := b.frame(protocol.MsgClaimObservationAck, jobID, p)
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{frame}, nil
+}
+
+// claimObservation answers claim_observation: the §2.2.1 observation
+// reducer, fenced by §3's idempotency/ordering rule. gate_occurrence_id and
+// browser_holder_generation are populated on every path, including the
+// earliest possible returns, because the ack requires both unconditionally.
+func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol.ClaimObservationPayload) ([]json.RawMessage, error) {
+	generation := b.epoch
+	if p == nil {
+		return b.claimObservationAck(jobID, protocol.ClaimObservationAckPayload{
+			Outcome: "error", Detail: "claim observation is missing",
+			GateOccurrenceID: "claim-observation-missing-payload", BrowserHolderGeneration: generation,
+		})
+	}
+	result := protocol.ClaimObservationAckPayload{
+		RequestID: p.RequestID, GateOccurrenceID: p.GateOccurrenceID, BrowserHolderGeneration: generation,
+	}
+	if row, ok, err := b.authenticationClaimCurrentGateOccurrence(ctx, p.AuthenticationClaimID); err != nil {
+		result.Outcome, result.Detail = "error", "gate occurrence state is unavailable"
+		return b.claimObservationAck(jobID, result)
+	} else if ok {
+		result.GateOccurrenceID = row.ID
+	}
+	applyErr := func(outcome, detail string) ([]json.RawMessage, error) {
+		result.Outcome, result.Detail = outcome, detail
+		return b.claimObservationAck(jobID, result)
+	}
+	if p.BrowserHolderGeneration != generation {
+		return applyErr("stale", "")
+	}
+	claim, err := b.jobs.MaterializationClaimByBindingID(ctx, p.BindingID)
+	if err != nil {
+		return applyErr("error", "binding state is unavailable")
+	}
+	ownerJobID := jobID
+	var candidate *job.BrowserCandidate
+	if claim != nil {
+		candidate, err = b.jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+		if err != nil {
+			return applyErr("error", "candidate state is unavailable")
+		}
+		if candidate != nil && candidate.JobID != "" {
+			ownerJobID = candidate.JobID
+		}
+	}
+	lease, leaseFound, leaseErr := b.jobs.GetAuthenticationEntryLease(ctx, p.AuthenticationClaimID)
+	if leaseErr != nil {
+		return applyErr("error", "authentication entry lease state is unavailable")
+	}
+
+	journalOutcome, checkErr := b.jobs.CheckClaimObservationJournal(ctx, p.ObservationID, result.GateOccurrenceID, p.EventOrdinal)
+	if checkErr != nil {
+		return applyErr("error", "claim observation journal state is unavailable")
+	}
+	if journalOutcome != "" {
+		result.Outcome = journalOutcome
+		return b.claimObservationAck(jobID, result)
+	}
+
+	switch p.EventKind {
+	case "wall_observed", "login_started", "mfa", "challenge":
+		if !leaseFound || lease.State != job.AuthenticationEntryLeaseReserved ||
+			lease.OwnerID != ownerJobID || lease.BrowserHolderGeneration != generation {
+			return applyErr("rejected", "no live reserved entry for this owner")
+		}
+		leaseUntil := b.now().Add(b.actionExpiry())
+		renewed, renewErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+			AuthenticationClaimID: p.AuthenticationClaimID, LeaseID: lease.LeaseID, OwnerID: ownerJobID,
+			BrowserHolderGeneration: generation, LeaseUntil: leaseUntil,
+		})
+		if renewErr != nil {
+			if errors.Is(renewErr, job.ErrAuthenticationEntryLeaseBusy) {
+				return applyErr("rejected", "the entry is owned elsewhere")
+			}
+			return applyErr("error", "lease renewal is unavailable")
+		}
+		result.LeaseUntil = renewed.LeaseUntil
+	case "auth_returned":
+		if !leaseFound || lease.State != job.AuthenticationEntryLeaseReserved ||
+			lease.OwnerID != ownerJobID || lease.BrowserHolderGeneration != generation {
+			return applyErr("rejected", "no live reserved entry for this owner")
+		}
+		if candidate == nil {
+			return applyErr("rejected", "binding has no live materialization claim")
+		}
+		candidateProfile, profileErr := b.jobs.GetInstitutionProfile(ctx, candidate.InstitutionProfileID)
+		if profileErr != nil {
+			return applyErr("error", "institution profile state is unavailable")
+		}
+		if candidateProfile == nil || candidateProfile.AuthenticationClaimID != p.AuthenticationClaimID {
+			return applyErr("rejected", "binding does not belong to this authentication claim")
+		}
+		nowText := b.now().UTC().Format(time.RFC3339Nano)
+		evidence := job.ProfileEvidenceObservation{
+			ObservationID:              evidenceObservationID("claim_observation_auth_returned", p.ObservationID),
+			BrowserHolderGeneration:    generation,
+			InstitutionProfileID:       candidate.InstitutionProfileID,
+			InstitutionProfileRevision: candidate.InstitutionProfileRevision,
+			Verdict:                    job.ProfileEvidenceAuthReturned,
+			Source:                     job.ProfileEvidenceAuthReturn,
+			ProducerObservedAt:         nowText,
+			DaemonReceivedAt:           nowText,
+		}
+		if err := b.jobs.RecordProfileEvidence(ctx, evidence); err != nil {
+			return applyErr("error", "profile evidence could not be recorded")
+		}
+		if convertErr := b.jobs.ConvertAuthenticationEntryLeaseToHuman(ctx, p.AuthenticationClaimID, lease.LeaseID, ownerJobID, generation, evidence); convertErr != nil &&
+			!errors.Is(convertErr, job.ErrAuthenticationEntryLeaseDenied) && !errors.Is(convertErr, job.ErrAuthenticationEntryLeaseStale) {
+			return applyErr("error", "authentication entry lease promotion is unavailable")
+		}
+	case "entitled_landing":
+		if !leaseFound || lease.State != job.AuthenticationEntryLeaseHuman || lease.HumanOwnerID != ownerJobID {
+			return applyErr("rejected", "entry is not a settled human sign-in for this owner")
+		}
+		// Nudge the existing materialization scheduler
+		// (Bridge.Sync -> ScheduleEligibleBrowserCandidates, already run
+		// unconditionally every Sync) and the legacy federated-login
+		// reoffer path (reofferInstitutionalSiblings) — both already
+		// poll/reopen on exactly this signal; no new scheduling code.
+		b.materializationScheduleVersion++
+		if err := b.reofferInstitutionalSiblings(ctx, ownerJobID); err != nil {
+			log.Printf("papio: claim observation entitled_landing reoffer unavailable: %v", err)
+		}
+	case "owner_closed":
+		if err := b.jobs.AbandonMaterializationClaimByBinding(ctx, p.BindingID); err != nil {
+			return applyErr("error", "materialization claim could not be abandoned")
+		}
+		if err := b.jobs.ClearAuthenticationEntryLeaseOwnerBinding(ctx, p.AuthenticationClaimID, p.BindingID); err != nil {
+			return applyErr("error", "authentication entry lease owner binding could not be cleared")
+		}
+		if err := b.jobs.ConsumeCloseAuthorizationForBinding(ctx, p.BindingID, b.now()); err != nil {
+			return applyErr("error", "close authorization could not be consumed")
+		}
+	case "navigation_error":
+		// Daemon-committed park with no auth-attempt charge, no cooldown,
+		// and the lease is never touched (plan Slice 1/3 invariant, "every
+		// dead end has a daemon-side disposition"). No daemon-side
+		// auth-attempt counter exists to avoid charging — the journal write
+		// below is this event's only durable effect; the candidate stays
+		// 'eligible' and the existing scheduler decides whether to retry.
+	}
+
+	if err := b.jobs.RecordClaimObservation(ctx, job.ClaimObservationRecord{
+		ObservationID: p.ObservationID, GateOccurrenceID: result.GateOccurrenceID,
+		AuthenticationClaimID: p.AuthenticationClaimID, BindingID: p.BindingID,
+		BrowserHolderGeneration: generation, EventKind: p.EventKind, EventOrdinal: p.EventOrdinal,
+	}); err != nil {
+		return applyErr("error", "claim observation could not be recorded")
+	}
+	return applyErr("applied", "")
+}
+
 // handle dispatches one decoded inbound frame from sessionID.
 func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.BrowserMessage) ([]json.RawMessage, error) {
 	if msg.Type == protocol.MsgHello {
@@ -2120,6 +2520,42 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			// therefore transport-fatal — so the extension's post-restart
 			// binding re-sync tore down the very session it was repairing.
 			return b.institutionalReconcile(ctx, msg.Payload.(*protocol.InstitutionalReconcileRequestPayload))
+		}
+	}
+	if institutionalAuthenticationClaimMessage(msg.Type) {
+		if session == nil {
+			return b.helloRequired()
+		}
+		historicalResult := msg.Type == protocol.MsgClaimObservation
+		if !historicalResult {
+			if b.holder == nil || b.holder.ID != sessionID {
+				return b.sessionBusy(msg.JobID)
+			}
+			if session.Outdated {
+				return b.extensionOutdatedError()
+			}
+		}
+		// Unlike institutional_materialization_v1 (which negotiates a wire
+		// shape old extensions cannot parse), authentication_claim_request
+		// and claim_observation are brand-new message types with no legacy
+		// shape to disambiguate: the mere fact that a session sent one
+		// proves it understands it. This gate checks the DAEMON's own
+		// advertised capability, not the session's negotiated list, so
+		// landing it daemon-side needs zero extension change (§6 rollout
+		// point 1) — an old extension never sends these types at all, and a
+		// new one only sends them after its OWN client-side gate
+		// (background.ts's AUTHENTICATION_CLAIM_FEATURE) already saw this
+		// daemon advertise it in hello_ack. b.Features is the required list
+		// NewBridge hardcodes, so this is unreachable in practice — defense
+		// in depth, exactly as the design doc's §2.1.1 rule 5 says.
+		if !slices.Contains(b.Features, institutionalAuthenticationClaimFeature) {
+			return b.institutionalAuthenticationClaimDisabled(msg)
+		}
+		switch msg.Type {
+		case protocol.MsgAuthenticationClaimRequest:
+			return b.authenticationClaim(ctx, msg.JobID, msg.Payload.(*protocol.AuthenticationClaimRequestPayload))
+		case protocol.MsgClaimObservation:
+			return b.claimObservation(ctx, msg.JobID, msg.Payload.(*protocol.ClaimObservationPayload))
 		}
 	}
 	if b.holder == nil || b.holder.ID != sessionID {

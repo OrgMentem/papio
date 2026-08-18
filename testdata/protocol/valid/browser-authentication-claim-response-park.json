@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"authentication_claim_response","msg_id":"msg-claim-resp-0005","seq":1,"job_id":"job-claim-0007","payload":{"request_id":"request-claim-0007","outcome":"park","authentication_claim_id":"authclaim-0001","browser_holder_generation":3,"gate_occurrence_id":"occurrence-claim-0001","dependent_count":2}}

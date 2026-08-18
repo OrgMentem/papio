@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"authentication_claim_response","msg_id":"msg-claim-resp-0007","seq":1,"job_id":"job-claim-0009","payload":{"request_id":"request-claim-0009","outcome":"not_eligible"}}

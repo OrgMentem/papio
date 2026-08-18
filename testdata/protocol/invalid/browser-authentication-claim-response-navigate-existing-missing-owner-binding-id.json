@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"authentication_claim_response","msg_id":"msg-badresp-0008","seq":1,"job_id":"job-badresp-0008","payload":{"request_id":"request-badresp-0008","outcome":"navigate_existing","authentication_claim_id":"authclaim-bad-0008","browser_holder_generation":3,"gate_occurrence_id":"occurrence-bad-0008","lease_until":"2026-08-18T12:00:00Z"}}

@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"authentication_claim_request","msg_id":"msg-badreq-0004","seq":1,"job_id":"job-badreq-0004","payload":{"request_id":"request-badreq-0004","candidate_id":"candidate-badreq-0004","materialization_kind":"browser_tab"}}

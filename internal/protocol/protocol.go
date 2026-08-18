@@ -919,6 +919,17 @@ const (
 	// institutional_authentication_claim_v1.
 	MsgSurfaceCloseRequest  = "surface_close_request"
 	MsgSurfaceCloseResponse = "surface_close_response"
+	// institutional_authentication_claim_v1 (dev/active/claim-observation-protocol.md
+	// §2.1/§2.2): the claim-observation protocol. authentication_claim_request/
+	// response arbitrates one human sign-in surface per authentication claim
+	// before any requires_auth tab exists; claim_observation/ack streams the
+	// human-paced events that keep the resulting entry lease alive. Both
+	// pairs are job-scoped. Neither touches the frozen auth_pending/
+	// auth_returned/session_evidence frames — see InstitutionalAuthenticationClaimFeature.
+	MsgAuthenticationClaimRequest  = "authentication_claim_request"
+	MsgAuthenticationClaimResponse = "authentication_claim_response"
+	MsgClaimObservation            = "claim_observation"
+	MsgClaimObservationAck         = "claim_observation_ack"
 )
 
 // EffectPermitFeature negotiates durable reconciliation before an irreversible
@@ -1128,6 +1139,80 @@ type SurfaceCloseResponsePayload struct {
 	Detail                  string `json:"detail,omitempty"`
 }
 
+// InstitutionalAuthenticationClaimFeature gates the full claim-request and
+// claim-observation family (§2.1, §2.2 of the design doc). It is the
+// already-shipped extension-side gate string
+// (background.ts's AUTHENTICATION_CLAIM_FEATURE) that Slice 0 pinned before
+// any daemon advertised it; this is the first daemon that does.
+const InstitutionalAuthenticationClaimFeature = "institutional_authentication_claim_v1"
+
+// AuthenticationClaimRequestPayload precedes any requires_auth tab. The
+// daemon resolves institution_profile_id/revision -> authentication_claim_id
+// from candidate_id itself (Decision 2: never accepted from the wire).
+type AuthenticationClaimRequestPayload struct {
+	RequestID           string `json:"request_id"`
+	CandidateID         string `json:"candidate_id"`
+	MaterializationKind string `json:"materialization_kind"`
+	Trigger             string `json:"trigger"`
+}
+
+// AuthenticationClaimResponsePayload resolves the human-surface disposition
+// for one candidate's authentication claim in one daemon transaction.
+// authentication_claim_id/browser_holder_generation/gate_occurrence_id are
+// required on the four operational outcomes (navigate_existing/open_new/
+// focus_owner/park) and forbidden otherwise; lease_until is required on
+// navigate_existing/open_new/focus_owner only; dependent_count is required
+// on park only; owner_binding_id is required on navigate_existing/
+// focus_owner only, and owner_tab_hint is optional there and forbidden
+// elsewhere. detail is forbidden on every operational outcome.
+type AuthenticationClaimResponsePayload struct {
+	RequestID               string `json:"request_id"`
+	Outcome                 string `json:"outcome"`
+	Detail                  string `json:"detail,omitempty"`
+	AuthenticationClaimID   string `json:"authentication_claim_id,omitempty"`
+	BrowserHolderGeneration *int64 `json:"browser_holder_generation,omitempty"`
+	GateOccurrenceID        string `json:"gate_occurrence_id,omitempty"`
+	LeaseUntil              string `json:"lease_until,omitempty"`
+	DependentCount          *int64 `json:"dependent_count,omitempty"`
+	OwnerBindingID          string `json:"owner_binding_id,omitempty"`
+	OwnerTabHint            *int64 `json:"owner_tab_hint,omitempty"`
+}
+
+// ClaimObservationPayload streams one human-paced event
+// (wall/login/MFA/challenge/auth-return/entitled-landing/owner-close/
+// nav-error) that keeps the authentication-entry lease alive. Business
+// order comes from (gate_occurrence_id, event_ordinal), never native
+// receipt order; observation_id is the idempotency key.
+// materialization_claim_id is a diagnostic cross-check only — the daemon's
+// authority is always binding_id.
+type ClaimObservationPayload struct {
+	RequestID               string `json:"request_id"`
+	AuthenticationClaimID   string `json:"authentication_claim_id"`
+	BindingID               string `json:"binding_id"`
+	MaterializationClaimID  string `json:"materialization_claim_id,omitempty"`
+	BrowserHolderGeneration int64  `json:"browser_holder_generation"`
+	GateOccurrenceID        string `json:"gate_occurrence_id"`
+	ObservationID           string `json:"observation_id"`
+	EventOrdinal            int64  `json:"event_ordinal"`
+	EventKind               string `json:"event_kind"`
+}
+
+// ClaimObservationAckPayload correlates one claim_observation by request_id.
+// gate_occurrence_id and browser_holder_generation are required on every
+// outcome; lease_until is only ever present on "applied" (and, within
+// "applied", only for the wall/login/mfa/challenge event kinds — a rule
+// this payload cannot itself enforce, since event_kind lives on the
+// request, not the ack; the bridge handler is the sole authority for that
+// half of the rule). detail is forbidden on applied/duplicate.
+type ClaimObservationAckPayload struct {
+	RequestID               string `json:"request_id"`
+	Outcome                 string `json:"outcome"`
+	Detail                  string `json:"detail,omitempty"`
+	GateOccurrenceID        string `json:"gate_occurrence_id"`
+	BrowserHolderGeneration int64  `json:"browser_holder_generation"`
+	LeaseUntil              string `json:"lease_until,omitempty"`
+}
+
 // jobScoped lists the types that must carry a job_id.
 var jobScoped = map[string]bool{
 	MsgDownloadStarted: true, MsgDownloadComplete: true, MsgDeliveryContext: true,
@@ -1142,6 +1227,8 @@ var jobScoped = map[string]bool{
 	MsgInstitutionalNavigatedRequest: true, MsgInstitutionalNavigatedResponse: true,
 	MsgTermsEffectStartRequest: true, MsgTermsEffectStartResult: true,
 	MsgTermsEffectResultRequest: true, MsgTermsEffectResult: true,
+	MsgAuthenticationClaimRequest: true, MsgAuthenticationClaimResponse: true,
+	MsgClaimObservation: true, MsgClaimObservationAck: true,
 }
 
 // HelloPayload announces the extension, its adapter versions, and the
@@ -3063,6 +3150,72 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			} else {
 				err = institutionalRejectPresence(payloadFields, "surface_close_response", fields...)
 			}
+		}
+		msg.Payload = p
+	case MsgAuthenticationClaimRequest:
+		p := &AuthenticationClaimRequestPayload{}
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "authentication_claim_request",
+			[]string{"request_id", "candidate_id", "materialization_kind", "trigger"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgAuthenticationClaimResponse:
+		p := &AuthenticationClaimResponsePayload{}
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "authentication_claim_response", []string{"request_id", "outcome"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		if err == nil {
+			claimFields := []string{"authentication_claim_id", "browser_holder_generation", "gate_occurrence_id"}
+			if authenticationClaimOperationalOutcome(p.Outcome) {
+				err = institutionalRequirePresence(payloadFields, "authentication_claim_response", claimFields...)
+			} else {
+				err = institutionalRejectPresence(payloadFields, "authentication_claim_response", claimFields...)
+			}
+		}
+		if err == nil {
+			leaseRequired := p.Outcome == "navigate_existing" || p.Outcome == "open_new" || p.Outcome == "focus_owner"
+			if leaseRequired {
+				err = institutionalRequirePresence(payloadFields, "authentication_claim_response", "lease_until")
+			} else {
+				err = institutionalRejectPresence(payloadFields, "authentication_claim_response", "lease_until")
+			}
+		}
+		if err == nil {
+			if p.Outcome == "park" {
+				err = institutionalRequirePresence(payloadFields, "authentication_claim_response", "dependent_count")
+			} else {
+				err = institutionalRejectPresence(payloadFields, "authentication_claim_response", "dependent_count")
+			}
+		}
+		if err == nil {
+			ownerRequired := p.Outcome == "navigate_existing" || p.Outcome == "focus_owner"
+			if ownerRequired {
+				err = institutionalRequirePresence(payloadFields, "authentication_claim_response", "owner_binding_id")
+			} else {
+				err = institutionalRejectPresence(payloadFields, "authentication_claim_response", "owner_binding_id", "owner_tab_hint")
+			}
+		}
+		msg.Payload = p
+	case MsgClaimObservation:
+		p := &ClaimObservationPayload{}
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "claim_observation",
+			[]string{"request_id", "authentication_claim_id", "binding_id", "browser_holder_generation",
+				"gate_occurrence_id", "observation_id", "event_ordinal", "event_kind"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgClaimObservationAck:
+		p := &ClaimObservationAckPayload{}
+		err = decodeInstitutionalPayload(env.Payload, payloadFields, "claim_observation_ack",
+			[]string{"request_id", "outcome", "gate_occurrence_id", "browser_holder_generation"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		if err == nil && p.Outcome != "applied" {
+			err = institutionalRejectPresence(payloadFields, "claim_observation_ack", "lease_until")
 		}
 		msg.Payload = p
 	case MsgError:
@@ -5330,6 +5483,174 @@ func (p *SurfaceCloseResponsePayload) validate() error {
 	}
 	if p.CloseAuthorizationID != "" || p.Nonce != "" || p.BrowserHolderGeneration != nil {
 		return fmt.Errorf("surface_close_response.%s forbids authorization fields", p.Outcome)
+	}
+	return nil
+}
+
+func (p *AuthenticationClaimRequestPayload) validate() error {
+	const what = "authentication_claim_request"
+	if err := institutionalRequestID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".candidate_id", p.CandidateID); err != nil {
+		return err
+	}
+	if err := enumRequired(what+".materialization_kind", p.MaterializationKind, "browser_tab", "direct_download"); err != nil {
+		return err
+	}
+	return enumRequired(what+".trigger", p.Trigger, "automatic", "explicit")
+}
+
+// authenticationClaimOperationalOutcome reports whether outcome is one of
+// the four outcomes that actually resolve a human-surface disposition, as
+// opposed to the four refusal outcomes (feature_disabled/not_eligible/
+// busy/error) that carry no claim fields at all.
+func authenticationClaimOperationalOutcome(outcome string) bool {
+	switch outcome {
+	case "navigate_existing", "open_new", "focus_owner", "park":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *AuthenticationClaimResponsePayload) validate() error {
+	const what = "authentication_claim_response"
+	if err := institutionalRequestID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalOutcome(what+".outcome", p.Outcome,
+		"navigate_existing", "open_new", "focus_owner", "park",
+		"feature_disabled", "not_eligible", "busy", "error"); err != nil {
+		return err
+	}
+	if err := validateTriageText(what+".detail", p.Detail, 1000); err != nil {
+		return err
+	}
+	operational := authenticationClaimOperationalOutcome(p.Outcome)
+	if !operational {
+		if p.AuthenticationClaimID != "" || p.BrowserHolderGeneration != nil ||
+			p.GateOccurrenceID != "" || p.LeaseUntil != "" || p.DependentCount != nil ||
+			p.OwnerBindingID != "" || p.OwnerTabHint != nil {
+			return fmt.Errorf("%s.%s forbids claim fields", what, p.Outcome)
+		}
+		return nil
+	}
+	if p.Detail != "" {
+		return fmt.Errorf("%s.%s must not carry detail", what, p.Outcome)
+	}
+	if err := institutionalID(what+".authentication_claim_id", p.AuthenticationClaimID); err != nil {
+		return err
+	}
+	if p.BrowserHolderGeneration == nil {
+		return fmt.Errorf("%s.browser_holder_generation is required", what)
+	}
+	if err := institutionalOrdinal(what+".browser_holder_generation", *p.BrowserHolderGeneration); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".gate_occurrence_id", p.GateOccurrenceID); err != nil {
+		return err
+	}
+	leaseRequired := p.Outcome == "navigate_existing" || p.Outcome == "open_new" || p.Outcome == "focus_owner"
+	if leaseRequired {
+		if err := validateTriageTime(what+".lease_until", p.LeaseUntil); err != nil {
+			return err
+		}
+	} else if p.LeaseUntil != "" {
+		return fmt.Errorf("%s.%s forbids lease_until", what, p.Outcome)
+	}
+	if p.Outcome == "park" {
+		if p.DependentCount == nil {
+			return fmt.Errorf("%s.dependent_count is required for park", what)
+		}
+		if err := institutionalOrdinal(what+".dependent_count", *p.DependentCount); err != nil {
+			return err
+		}
+	} else if p.DependentCount != nil {
+		return fmt.Errorf("%s.%s forbids dependent_count", what, p.Outcome)
+	}
+	ownerRequired := p.Outcome == "navigate_existing" || p.Outcome == "focus_owner"
+	if ownerRequired {
+		if err := institutionalID(what+".owner_binding_id", p.OwnerBindingID); err != nil {
+			return err
+		}
+		if p.OwnerTabHint != nil {
+			if err := institutionalTabID(what+".owner_tab_hint", *p.OwnerTabHint); err != nil {
+				return err
+			}
+		}
+	} else {
+		if p.OwnerBindingID != "" {
+			return fmt.Errorf("%s.%s forbids owner_binding_id", what, p.Outcome)
+		}
+		if p.OwnerTabHint != nil {
+			return fmt.Errorf("%s.%s forbids owner_tab_hint", what, p.Outcome)
+		}
+	}
+	return nil
+}
+
+func (p *ClaimObservationPayload) validate() error {
+	const what = "claim_observation"
+	if err := institutionalRequestID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".authentication_claim_id", p.AuthenticationClaimID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".binding_id", p.BindingID); err != nil {
+		return err
+	}
+	if p.MaterializationClaimID != "" {
+		if err := institutionalID(what+".materialization_claim_id", p.MaterializationClaimID); err != nil {
+			return err
+		}
+	}
+	if err := institutionalOrdinal(what+".browser_holder_generation", p.BrowserHolderGeneration); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".gate_occurrence_id", p.GateOccurrenceID); err != nil {
+		return err
+	}
+	if err := institutionalID(what+".observation_id", p.ObservationID); err != nil {
+		return err
+	}
+	if err := institutionalOrdinal(what+".event_ordinal", p.EventOrdinal); err != nil {
+		return err
+	}
+	return enumRequired(what+".event_kind", p.EventKind,
+		"wall_observed", "login_started", "mfa", "challenge", "auth_returned",
+		"entitled_landing", "owner_closed", "navigation_error")
+}
+
+func (p *ClaimObservationAckPayload) validate() error {
+	const what = "claim_observation_ack"
+	if err := institutionalRequestID(what+".request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := institutionalOutcome(what+".outcome", p.Outcome,
+		"applied", "duplicate", "stale", "rejected", "error"); err != nil {
+		return err
+	}
+	if err := validateTriageText(what+".detail", p.Detail, 1000); err != nil {
+		return err
+	}
+	if (p.Outcome == "applied" || p.Outcome == "duplicate") && p.Detail != "" {
+		return fmt.Errorf("%s.%s must not carry detail", what, p.Outcome)
+	}
+	if err := institutionalID(what+".gate_occurrence_id", p.GateOccurrenceID); err != nil {
+		return err
+	}
+	if err := institutionalOrdinal(what+".browser_holder_generation", p.BrowserHolderGeneration); err != nil {
+		return err
+	}
+	if p.LeaseUntil != "" {
+		if p.Outcome != "applied" {
+			return fmt.Errorf("%s.%s forbids lease_until", what, p.Outcome)
+		}
+		if err := validateTriageTime(what+".lease_until", p.LeaseUntil); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -842,9 +842,14 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	if payload.DaemonVersion != "0.1.0-test" {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
+	// This is the fail-closed 32-feature cap, exactly saturated
+	// (dev/active/claim-observation-protocol.md §1): institutionalAuthenticationClaimFeature
+	// is the 32nd and last slot. No feature may be added after it without
+	// retiring or consolidating an existing one first.
 	if !slices.Equal(payload.Features, []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, protocol.EffectPermitFeature, institutionalMaterializationFeature,
 		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature, pdfGrabSuggestV1Feature, surfaceCloseFeature,
+		institutionalAuthenticationClaimFeature,
 	}) {
 		t.Fatalf("features = %v", payload.Features)
 	}
@@ -6419,11 +6424,15 @@ func TestFocusHandoffsRefusesAnUnofferableJob(t *testing.T) {
 //
 // The bound holds because (a) b.frame self-validates every outbound frame
 // through the strict decoder, so no single frame exceeds
-// protocol.MaxBrowserMessageBytes, (b) the host relays at most one inbound
-// frame per sync, so at most one max-size solicited response can ride one
-// response, and (c) the offer and focus batches are capped by
-// maxOutstandingOffers and maxFocusFramesPerPoll. Loosening any of those trips
-// this test.
+// protocol.MaxBrowserMessageBytes, (b) at most one max-size solicited
+// response rides one poll (job_offer/handoff-type replies are one-at-a-time
+// correlated calls), and (c) every batch the daemon can otherwise grow
+// unboundedly is capped: the offer and focus batches by
+// maxOutstandingOffers/maxFocusFramesPerPoll, and the claim_observation_ack
+// batch by maxClaimObservationsPerPoll (the extension MUST send at most
+// this many queued claim_observation frames per poll,
+// dev/active/claim-observation-protocol.md §5). Loosening any of those
+// trips this test.
 func TestSyncResponseFitsResultCap(t *testing.T) {
 	b := &Bridge{}
 	// A job_offer is the largest frame the daemon emits unsolicited, and every
@@ -6451,13 +6460,23 @@ func TestSyncResponseFitsResultCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A claim_observation_ack at its legal maxima: 128-char ids and a
+	// full-width 1000-char detail (only legal on a non-applied outcome, but
+	// this is a worst-case size bound, not a realistic single reply).
+	ack, err := b.frame(protocol.MsgClaimObservationAck, "job_"+strings.Repeat("o", 26), protocol.ClaimObservationAckPayload{
+		RequestID: strings.Repeat("r", 128), Outcome: "error", Detail: strings.Repeat("e", 1000),
+		GateOccurrenceID: strings.Repeat("g", 128), BrowserHolderGeneration: protocol.MaxBrowserInteger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Cancel and focus frames carry only a job id and an empty payload, so
 	// sizing every batched frame as a maximal offer is deliberately pessimistic.
-	batched := (maxOutstandingOffers + maxFocusFramesPerPoll) * len(offer)
+	batched := (maxOutstandingOffers+maxFocusFramesPerPoll)*len(offer) + maxClaimObservationsPerPoll*len(ack)
 	worst := protocol.MaxBrowserMessageBytes + batched
 	if worst > ipc.MaxResultBytes {
-		t.Fatalf("worst-case sync response %d bytes exceeds ipc.MaxResultBytes %d: one max-size solicited response (%d) + %d batched frames of %d bytes",
-			worst, ipc.MaxResultBytes, protocol.MaxBrowserMessageBytes, maxOutstandingOffers+maxFocusFramesPerPoll, len(offer))
+		t.Fatalf("worst-case sync response %d bytes exceeds ipc.MaxResultBytes %d: one max-size solicited response (%d) + %d offer/focus frames of %d bytes + %d claim_observation_ack frames of %d bytes",
+			worst, ipc.MaxResultBytes, protocol.MaxBrowserMessageBytes, maxOutstandingOffers+maxFocusFramesPerPoll, len(offer), maxClaimObservationsPerPoll, len(ack))
 	}
 }
 

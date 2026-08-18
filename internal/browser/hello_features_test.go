@@ -33,9 +33,10 @@ import (
 // the map is exhaustive by parsing bridge.go, so omitting an entry fails rather
 // than silently narrowing the check.
 var sessionFeatureValues = map[string]string{
-	"pdfGrabV1Feature":                    pdfGrabV1Feature,
-	"effectPermitFeature":                 effectPermitFeature,
-	"institutionalMaterializationFeature": institutionalMaterializationFeature,
+	"pdfGrabV1Feature":                        pdfGrabV1Feature,
+	"effectPermitFeature":                     effectPermitFeature,
+	"institutionalMaterializationFeature":     institutionalMaterializationFeature,
+	"institutionalAuthenticationClaimFeature": institutionalAuthenticationClaimFeature,
 }
 
 var sessionFeatureGateRE = regexp.MustCompile(

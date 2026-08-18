@@ -96,7 +96,11 @@
         "page_bulk_submit_v2_request",
         "page_bulk_submit_v2_result",
         "surface_close_request",
-        "surface_close_response"
+        "surface_close_response",
+        "authentication_claim_request",
+        "authentication_claim_response",
+        "claim_observation",
+        "claim_observation_ack"
       ]
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
@@ -1913,7 +1917,11 @@
               "institutional_route_request",
               "institutional_route_response",
               "institutional_navigated_request",
-              "institutional_navigated_response"
+              "institutional_navigated_response",
+              "authentication_claim_request",
+              "authentication_claim_response",
+              "claim_observation",
+              "claim_observation_ack"
             ]
           }
         }
@@ -6312,6 +6320,351 @@
                     ]
                   }
                 }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "authentication_claim_request" } }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "candidate_id",
+              "materialization_kind",
+              "trigger"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "candidate_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "materialization_kind": {
+                "enum": ["browser_tab", "direct_download"]
+              },
+              "trigger": { "enum": ["automatic", "explicit"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "authentication_claim_response" } }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "outcome"],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "outcome": {
+                "enum": [
+                  "navigate_existing",
+                  "open_new",
+                  "focus_owner",
+                  "park",
+                  "feature_disabled",
+                  "not_eligible",
+                  "busy",
+                  "error"
+                ]
+              },
+              "detail": {
+                "type": "string",
+                "maxLength": 1000,
+                "pattern": "^[^\u0000]*$"
+              },
+              "authentication_claim_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "browser_holder_generation": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "gate_occurrence_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "lease_until": {
+                "type": "string",
+                "format": "date-time",
+                "maxLength": 64
+              },
+              "dependent_count": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "owner_binding_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "owner_tab_hint": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "enum": [
+                        "navigate_existing",
+                        "open_new",
+                        "focus_owner",
+                        "park"
+                      ]
+                    }
+                  },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "required": [
+                    "authentication_claim_id",
+                    "browser_holder_generation",
+                    "gate_occurrence_id"
+                  ],
+                  "not": { "required": ["detail"] }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "enum": [
+                        "feature_disabled",
+                        "not_eligible",
+                        "busy",
+                        "error"
+                      ]
+                    }
+                  },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "not": {
+                    "anyOf": [
+                      { "required": ["authentication_claim_id"] },
+                      { "required": ["browser_holder_generation"] },
+                      { "required": ["gate_occurrence_id"] },
+                      { "required": ["lease_until"] },
+                      { "required": ["dependent_count"] },
+                      { "required": ["owner_binding_id"] },
+                      { "required": ["owner_tab_hint"] }
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "enum": ["navigate_existing", "open_new", "focus_owner"]
+                    }
+                  },
+                  "required": ["outcome"]
+                },
+                "then": { "required": ["lease_until"] }
+              },
+              {
+                "if": {
+                  "properties": { "outcome": { "const": "park" } },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "required": ["dependent_count"],
+                  "not": {
+                    "anyOf": [
+                      { "required": ["lease_until"] },
+                      { "required": ["owner_binding_id"] },
+                      { "required": ["owner_tab_hint"] }
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": { "outcome": { "const": "open_new" } },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "not": {
+                    "anyOf": [
+                      { "required": ["dependent_count"] },
+                      { "required": ["owner_binding_id"] },
+                      { "required": ["owner_tab_hint"] }
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "outcome": { "enum": ["navigate_existing", "focus_owner"] }
+                  },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "required": ["owner_binding_id"],
+                  "not": { "required": ["dependent_count"] }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "claim_observation" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "authentication_claim_id",
+              "binding_id",
+              "browser_holder_generation",
+              "gate_occurrence_id",
+              "observation_id",
+              "event_ordinal",
+              "event_kind"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "authentication_claim_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "binding_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "materialization_claim_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "browser_holder_generation": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "gate_occurrence_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "observation_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "event_ordinal": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "event_kind": {
+                "enum": [
+                  "wall_observed",
+                  "login_started",
+                  "mfa",
+                  "challenge",
+                  "auth_returned",
+                  "entitled_landing",
+                  "owner_closed",
+                  "navigation_error"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "claim_observation_ack" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "outcome",
+              "gate_occurrence_id",
+              "browser_holder_generation"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "outcome": {
+                "enum": ["applied", "duplicate", "stale", "rejected", "error"]
+              },
+              "detail": {
+                "type": "string",
+                "maxLength": 1000,
+                "pattern": "^[^\u0000]*$"
+              },
+              "gate_occurrence_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "browser_holder_generation": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "lease_until": {
+                "type": "string",
+                "format": "date-time",
+                "maxLength": 64
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "outcome": { "enum": ["applied", "duplicate"] }
+                  },
+                  "required": ["outcome"]
+                },
+                "then": { "not": { "required": ["detail"] } }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "enum": ["duplicate", "stale", "rejected", "error"]
+                    }
+                  },
+                  "required": ["outcome"]
+                },
+                "then": { "not": { "required": ["lease_until"] } }
               }
             ]
           }

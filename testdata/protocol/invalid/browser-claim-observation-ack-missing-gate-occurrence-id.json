@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"claim_observation_ack","msg_id":"msg-badack-0006","seq":1,"job_id":"job-badack-0006","payload":{"request_id":"request-badack-0006","outcome":"applied","browser_holder_generation":3}}
