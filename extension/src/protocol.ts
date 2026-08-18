@@ -136,6 +136,12 @@ export interface HelloAckPayload {
   /** Absent means "holder": an older daemon only ever acknowledged the session
    * it had just slotted, so its silence is not ambiguous. */
   role?: BrowserSessionRole;
+  /** The daemon's current browser_holder_generation fence, present only when
+   * role is "holder" (or absent, meaning holder). Lets a holder session
+   * request or replay a persisted close tombstone's authorization as soon as
+   * it connects, without waiting on an unrelated claim/materialization round
+   * trip to first learn the generation. */
+  browser_holder_generation?: number;
 }
 
 export interface PageAcquirePayload {
@@ -1554,6 +1560,17 @@ const WIRE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const CLIENT_FEATURE_RE = /^[a-z0-9_]+$/;
 const JOB_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const ZOTERO_KEY_RE = /^[A-Za-z0-9]{1,32}$/;
+// HELLO_ACK_FEATURES_ACCEPT_CAP is the extension's accept-side bound on
+// hello_ack.features — deliberately wider than the 32-feature bound every
+// daemon still emits (internal/browser/bridge.go's `required` literal,
+// pinned exactly by bridge_test.go's TestHelloAckAnnouncesDaemonVersion).
+// This is stage 1 of a two-stage mixed-version migration: ship an extension
+// that tolerates a larger advertised set (unknown entries are simply never
+// matched by any `slices.Contains` check) before any daemon is allowed to
+// emit past 32. Raising the daemon's emitted cap is stage 2 and must not
+// happen until this accept-side change has been live for a full release.
+// See AGENTS.md's fail-closed-feature-bound note.
+const HELLO_ACK_FEATURES_ACCEPT_CAP = 64;
 const utf8ByteLength = (value: string): number =>
   new TextEncoder().encode(value).byteLength;
 const HOST_RE = /^[a-z0-9.-]{3,253}$/;
@@ -4009,12 +4026,18 @@ function validatePayload(
         features: "optional",
         resolver_origins: "optional",
         role: "optional",
+        browser_holder_generation: "optional",
       });
       if ("daemon_version" in p) str(p, "daemon_version", "hello_ack", 50);
       if ("features" in p) {
         const features = p["features"];
-        if (!Array.isArray(features) || features.length > 32) {
-          fail("hello_ack.features must be an array with at most 32 entries");
+        if (
+          !Array.isArray(features) ||
+          features.length > HELLO_ACK_FEATURES_ACCEPT_CAP
+        ) {
+          fail(
+            `hello_ack.features must be an array with at most ${HELLO_ACK_FEATURES_ACCEPT_CAP} entries`,
+          );
         }
         for (const feature of features) {
           if (
@@ -4059,10 +4082,18 @@ function validatePayload(
       }
       // Absent role means holder — an older daemon acknowledged only the
       // session it had just slotted, so its silence is not ambiguous.
-      if ("role" in p) {
-        const role = str(p, "role", "hello_ack", 20);
-        if (!(BROWSER_SESSION_ROLES as readonly string[]).includes(role))
-          fail("hello_ack.role is invalid");
+      const role = "role" in p ? str(p, "role", "hello_ack", 20) : undefined;
+      if (role !== undefined && !(BROWSER_SESSION_ROLES as readonly string[]).includes(role))
+        fail("hello_ack.role is invalid");
+      // Only a holder session was minted this browser's current generation;
+      // a pending session presenting one would be indistinguishable from a
+      // stale/foreign value at the requestCloseAuthorization call site.
+      if ("browser_holder_generation" in p) {
+        int(p, "browser_holder_generation", "hello_ack", 0);
+        if (role === "pending")
+          fail(
+            "hello_ack.browser_holder_generation must not accompany a pending role",
+          );
       }
       break;
     }

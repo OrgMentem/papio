@@ -327,6 +327,7 @@ const MATERIALIZATION_RESPONSE_TYPES: Record<string, true> = {
 const PDF_GRAB_CORRELATION_STORAGE_KEY = "papio_pdf_grab_correlations_v1";
 const CLAIM_OBSERVATION_OUTBOX_STORAGE_KEY =
   "papio_claim_observation_outbox_v1";
+const NAVIGATION_ERROR_MARKER_STORAGE_KEY = "papio_navigation_error_markers_v1";
 /** Valid `event_kind` values (protocol.ts's `ClaimObservationPayload`),
  * duplicated here as a static lookup so hydrateClaimObservationOutbox can
  * validate a persisted entry without importing a type as a value. */
@@ -916,6 +917,27 @@ export interface ClaimObservationOutboxEntry {
   event_kind: ClaimObservationPayload["event_kind"];
 }
 
+/** Durable evidence of a top-frame webNavigation.onErrorOccurred, keyed by
+ * tab id (chrome.storage.session, oracle finding 5): the worker-local
+ * `navigationErrors` Map is the only OTHER record of this, so a worker
+ * teardown between the error and its document-settle consumption would
+ * otherwise lose it completely — the generic auth-wall detector could then
+ * mistake the dead end for a human sign-in wall, or the daemon could never
+ * learn the route died. `authentication_claim_id`/`gate_occurrence_id`/
+ * `browser_holder_generation` are populated only when a claim grant already
+ * existed at error time; when absent, bootstrap reconciliation can restore
+ * the local exclusion marker but not synthesize a durable claim_observation
+ * out of nothing. */
+export interface NavigationErrorMarkerEntry {
+  tab_id: number;
+  binding_id: string;
+  at: number;
+  job_id?: string;
+  authentication_claim_id?: string;
+  gate_occurrence_id?: string;
+  browser_holder_generation?: number;
+}
+
 /** Structured outcome of consultAuthenticationClaim (§2.1.1). The four
  * operational outcomes narrow to what each one actually needs; `refuse`
  * covers feature_disabled/not_eligible/busy/error and every transport/parse
@@ -1138,6 +1160,17 @@ export interface BridgeDeps {
   claimObservationOutbox?: {
     get(): Promise<Record<string, ClaimObservationOutboxEntry>>;
     set(value: Record<string, ClaimObservationOutboxEntry>): Promise<void>;
+  };
+  /** Durable navigation-error marker (chrome.storage.session), oracle
+   * finding 5: the worker-local `navigationErrors` Map alone cannot
+   * survive an MV3 worker restart, so a teardown between
+   * webNavigation.onErrorOccurred and its document-settle consumption
+   * must not silently broaden auth-wall treatment or leak the scaffold.
+   * Optional: absent degrades to the pre-existing worker-memory-only
+   * behavior. */
+  navigationErrorMarkers?: {
+    get(): Promise<Record<string, NavigationErrorMarkerEntry>>;
+    set(value: Record<string, NavigationErrorMarkerEntry>): Promise<void>;
   };
   /** Scanner-scoped origin allowlist (chrome.storage.local), kept and
    * revocable separately from acquisition/adapter host-permission grants
@@ -2329,6 +2362,13 @@ export class Bridge {
   /** Lazily-loaded durable ledger of broker tabs papio created, migrated to
    * URL-free birth certificates on first touch (Slice 2b). */
   private tabLedgerCache: Record<string, SurfaceBirthRecord> | undefined;
+  /** Bumped synchronously (before any async work) by the onActivated/
+   * onUpdated listeners whenever Chrome reports a tab change — activation,
+   * pin, or navigation alike. closeOwnedTab captures this per-tab counter
+   * at entry and compares it again immediately before tabs.remove, with no
+   * intervening await, so a touch that happens (and even reverts) during a
+   * close attempt is never invisible to a single before/after tabs.get. */
+  private readonly tabTouchEpoch = new Map<number, number>();
   /** Pre-cutover ledger entries retained for one-time manual review because
    * their provenance could not be re-verified at migration (no jobID to
    * correlate against). Recomputed by the same migration pass every worker
@@ -2343,6 +2383,12 @@ export class Bridge {
    * this session a generation at least once — closeOwnedSurface refuses
    * locally rather than send a request with a made-up value. */
   private lastKnownBrowserHolderGeneration: number | undefined;
+  /** Coalescing trigger state for scheduleCloseTombstoneReplay: a replay
+   * already in flight absorbs a concurrent trigger as one more full pass
+   * instead of racing it — same shape as outboxDrainRunning/
+   * outboxDrainRerunRequested below. */
+  private closeTombstoneReplayRunning = false;
+  private closeTombstoneReplayRerunRequested = false;
   /** Per-job authentication-claim grant (Slice 3), worker-memory only: the
    * job whose sign-in surface is currently answering an `open_new`/
    * `navigate_existing`/`focus_owner` outcome. `nextOrdinal` is this job's
@@ -2367,8 +2413,22 @@ export class Bridge {
   /** At-most-once latch for observation kinds the tab-update handler would
    * otherwise re-fire on every poll while a claim-owned tab sits still (wall
    * observed, the wall→post-wall transition standing in for login_started
-   * per the design's fallback). Keyed `${jobID}:${event_kind}`. */
+   * per the design's fallback). Keyed by the SAME identity that builds
+   * observation_id — `${authentication_claim_id}:${binding_id}:
+   * ${gate_occurrence_id}:${event_kind}` (observationSuppressionKey) — never
+   * by jobID/event_kind alone: a job-scoped key would keep suppressing a
+   * fresh gate occurrence's first wall/login event with a stale prior
+   * occurrence's latch (oracle finding 4). */
   private readonly claimObservationLatch = new Set<string>();
+  /** Reverse index of claimObservationLatch: exactly which keys the CURRENT
+   * grant latched for a job, so clearClaimGrant can retire only this job's
+   * own entries — authentication_claim_id is shared across every dependent
+   * parked on the same institutional gate, so a prefix scan on it alone
+   * would also wipe a sibling job's still-active latch. */
+  private readonly claimObservationLatchKeysByJob = new Map<
+    string,
+    Set<string>
+  >();
   /** Durable claim_observation outbox (chrome.storage.session), keyed by
    * observation_id. Hydrated from deps.claimObservationOutbox at
    * bootstrapSurfaceLifecycle; every mutation re-persists it. */
@@ -2424,10 +2484,23 @@ export class Bridge {
    * consumed) by the generic auth-wall detector before it charges an
    * auth attempt: a dead end is not a human sign-in wall (surface-
    * lifecycle-plan.md invariant "every dead end has a daemon-side
-   * disposition"). Worker-local; a fresh worker starts with no markers,
-   * which only widens the window in which a genuine auth wall is
-   * (correctly) treated as one. */
+   * disposition"). Worker-memory only, but no longer the ONLY record
+   * (oracle finding 5): reconcileNavigationErrorMarkers restores it from
+   * navigationErrorMarkerEntries at bootstrap, so a fresh worker that
+   * inherits a durable marker starts with it already set instead of
+   * starting empty. */
   private readonly navigationErrors = new Map<number, number>();
+  /** Durable shadow of navigationErrors (chrome.storage.session), keyed by
+   * tab id — oracle finding 5. Written synchronously at onErrorOccurred,
+   * before any later classification runs, so a worker teardown before the
+   * document settles still leaves durable evidence behind. Cleared exactly
+   * where navigationErrors itself is: a settled successful landing, a
+   * settled unsuccessful one (the real emission consumes it), or
+   * reconciliation folding it into the outbox directly. */
+  private readonly navigationErrorMarkerEntries = new Map<
+    number,
+    NavigationErrorMarkerEntry
+  >();
   /** Resolver-provided offer URLs are cached here after storage hydration. */
   private readonly offerURLs = new Map<string, string>();
   /** Institution Shibboleth entityIDs from job offers (login_entity_id), used to
@@ -3541,7 +3614,10 @@ export class Bridge {
    * A failed fresh-link materialization is the one surface exception: the
    * private one-use tab never bound to a live job, so preserving it would let
    * a sibling open a duplicate institutional login. PDF content still stays. */
-  private async closeOwnedTab(tabID: number, reason: string): Promise<void> {
+  private async closeOwnedTab(
+    tabID: number,
+    reason: string,
+  ): Promise<boolean> {
     const entry = this.tabLedgerCache?.[String(tabID)];
     const materializationCleanup = reason === "materialization-reconcile";
     const rollbackPrivate =
@@ -3551,15 +3627,21 @@ export class Bridge {
       !materializationCleanup &&
       (entry === undefined || findByTab(this.store, tabID) !== undefined)
     )
-      return;
-    if (reason === "adopted-viewer") return;
+      return false;
+    if (reason === "adopted-viewer") return false;
+    // Captured before the only await below: any onActivated/onUpdated
+    // listener that fires while the fresh tabs.get is in flight bumps this
+    // tab's touch epoch synchronously (bindListeners), so a transient
+    // activate-then-revert invisible to the fresh get's active/pinned
+    // fields still shows up as a mismatch at the final compare.
+    const epochAtStart = this.tabTouchEpoch.get(tabID) ?? 0;
     let tab: TabInfo;
     try {
       tab = await this.deps.tabs.get(tabID);
     } catch {
-      return;
+      return false;
     }
-    if (tab.url !== undefined && isPDFPage(tab.url)) return;
+    if (tab.url !== undefined && isPDFPage(tab.url)) return false;
     if (materializationCleanup) {
       const base = this.deps.runtimeGetURL?.(MATERIALIZE_PAGE_PATH);
       if (
@@ -3567,7 +3649,7 @@ export class Bridge {
         tab.active === true ||
         typeof tab.url !== "string"
       )
-        return;
+        return false;
       try {
         const expected = new URL(base);
         const actual = new URL(tab.url);
@@ -3580,9 +3662,9 @@ export class Bridge {
           actual.search !== "" ||
           !MATERIALIZATION_ID_PATTERN.test(bindingID)
         )
-          return;
+          return false;
       } catch {
-        return;
+        return false;
       }
     }
     const inWorkWindow =
@@ -3596,8 +3678,41 @@ export class Bridge {
         tab.pinned === true ||
         (!inWorkWindow && !inPapioGroup))
     )
-      return;
+      return false;
+    // Final recheck immediately before remove, no intervening await: a
+    // touch epoch bumped since entry — even one the fresh get above cannot
+    // see because it already reverted — means the operator touched this
+    // tab sometime during this close attempt. Cede rather than risk it.
+    if ((this.tabTouchEpoch.get(tabID) ?? 0) !== epochAtStart) {
+      await this.cedeOwnedTab(tabID, entry?.binding_id);
+      return false;
+    }
     await this.deps.tabs.remove(tabID).catch(() => undefined);
+    return true;
+  }
+  /** Detach a surface from automation without removing it: ceded permanently
+   * per the retained-forever contract, its pending tombstone and job binding
+   * cleared so nothing (a replay, a later reconcile pass) acts on it again.
+   * A no-op when the ledger no longer has a matching record for `tabID`, or
+   * when `bindingID` is given and the current record binds to a different
+   * one (the numeric id was reused under a stale record). */
+  private async cedeOwnedTab(
+    tabID: number,
+    bindingID: string | undefined,
+  ): Promise<void> {
+    await this.runTabLedgerTransaction((ledger) => {
+      const current = ledger[String(tabID)];
+      if (
+        current === undefined ||
+        (bindingID !== undefined && current.binding_id !== bindingID)
+      )
+        return { value: undefined, changed: false };
+      const next: SurfaceBirthRecord = { ...current, ceded: true };
+      delete next.pending_close;
+      delete next.job_id;
+      ledger[String(tabID)] = next;
+      return { value: undefined, changed: true };
+    });
   }
   private async saveTabLedger(
     ledger: Record<string, SurfaceBirthRecord>,
@@ -4000,7 +4115,17 @@ export class Bridge {
    * any close tombstone left by a prior worker lifetime, under the
    * lifecycle mutex — never the effect governor. A bounded-scan failure
    * fails closed to no-adoption/no-close rather than throwing into a
-   * crashed barrier (surfaceReady itself catches this). */
+   * crashed barrier (surfaceReady itself catches this).
+   *
+   * The replayPendingCloseTombstones call below is best-effort local
+   * hydration only: on a fresh worker lastKnownBrowserHolderGeneration is
+   * unset until rehydrateBrowserHolderGenerationFromMaterializations (just
+   * above it) finds a cached one or the daemon supplies one, and this whole
+   * pass can simply lose the race against hello_ack. It never strands a
+   * tombstone permanently: scheduleCloseTombstoneReplay (called from the
+   * hello_ack handler, after reconnect, and after role promotion) re-runs
+   * the same idempotent transaction once the daemon has actually told this
+   * session a live generation. */
   private async bootstrapSurfaceLifecycle(): Promise<void> {
     await this.inLifecycleChain(async () => {
       this.restartClass = await this.classifyRestart();
@@ -4008,7 +4133,9 @@ export class Bridge {
       const ledger = await this.snapshotTabLedger();
       await this.reconcileHandoffGroups();
       await this.adoptWorkWindowFromOwnedMembers(ledger);
+      this.rehydrateBrowserHolderGenerationFromMaterializations();
       await this.replayPendingCloseTombstones();
+      await this.reconcileNavigationErrorMarkers();
     });
     // §4.5 corrective: a restarted worker must replay any outstanding
     // claim_observation before any lease-renewing action runs, but
@@ -4054,6 +4181,110 @@ export class Bridge {
       }
       this.claimObservationOutboxEntries.set(observationID, entry);
     }
+  }
+
+  /** Restart-safety half of oracle finding 5: hydrate every durable
+   * navigation-error marker onNavigationError persisted, then resolve each
+   * one against the tab's CURRENT live state — no onUpdated event is
+   * guaranteed to ever arrive for a tab whose document already finished
+   * settling while this worker was dead, so waiting for one can strand the
+   * marker forever. A marker whose tab is gone or still shows an
+   * unsuccessful/auth-wall document is promoted straight into the durable
+   * claim_observation outbox — bypassing worker-memory claimGrants, which
+   * does NOT survive a restart — so the daemon-visible auth-attempt count
+   * never depends on this worker's memory surviving. A marker whose tab
+   * has since landed successfully on its own is simply discarded. Either
+   * way navigationErrors itself is restored first, so the generic
+   * auth-wall detector's exclusion still applies to any LATE onUpdated
+   * event Chrome does still deliver for that tab. */
+  private async reconcileNavigationErrorMarkers(): Promise<void> {
+    if (this.deps.navigationErrorMarkers === undefined) return;
+    let stored: Record<string, NavigationErrorMarkerEntry>;
+    try {
+      stored = await this.deps.navigationErrorMarkers.get();
+    } catch {
+      return;
+    }
+    const retained: [number, NavigationErrorMarkerEntry][] = [];
+    for (const [key, entry] of Object.entries(stored)) {
+      if (
+        typeof entry !== "object" ||
+        entry === null ||
+        typeof entry.tab_id !== "number" ||
+        typeof entry.binding_id !== "string" ||
+        typeof entry.at !== "number" ||
+        String(entry.tab_id) !== key
+      ) {
+        continue;
+      }
+      let stillUnsuccessful = true;
+      try {
+        const tab = await this.deps.tabs.get(entry.tab_id);
+        stillUnsuccessful =
+          typeof tab.url !== "string" || isAuthenticationURL(tab.url);
+      } catch {
+        // Tab gone while this worker was dead: no further event will ever
+        // arrive for it. Keep the conservative default so a genuine dead
+        // end still reaches the daemon instead of silently leaking.
+      }
+      if (!stillUnsuccessful) continue; // Recovered on its own; discard.
+      this.navigationErrors.set(entry.tab_id, entry.at);
+      if (
+        typeof entry.job_id === "string" &&
+        typeof entry.authentication_claim_id === "string" &&
+        typeof entry.gate_occurrence_id === "string" &&
+        typeof entry.browser_holder_generation === "number"
+      ) {
+        this.enqueueRestartRecoveredNavigationError(
+          entry as Required<NavigationErrorMarkerEntry>,
+        );
+      } else {
+        // Occurrence unknown at error time: nothing here can synthesize
+        // one. Keep it queued for the normal document-settle path once a
+        // fresh consult (if any) re-establishes a grant for this job.
+        retained.push([entry.tab_id, entry]);
+      }
+    }
+    this.navigationErrorMarkerEntries.clear();
+    for (const [tabID, entry] of retained) {
+      this.navigationErrorMarkerEntries.set(tabID, entry);
+    }
+    this.persistNavigationErrorMarkers();
+  }
+
+  /** Fold a fully-identified durable marker directly into the
+   * claim_observation outbox, mirroring enqueueClaimObservation but without
+   * needing a live claimGrants entry (gone on restart). Ordinal is computed
+   * the same way consultAuthenticationClaim seeds a fresh grant's own
+   * counter: the lowest value strictly greater than every already-queued
+   * ordinal for this occurrence. */
+  private enqueueRestartRecoveredNavigationError(
+    entry: Required<NavigationErrorMarkerEntry>,
+  ): void {
+    let ordinal = 0;
+    for (const existing of this.claimObservationOutboxEntries.values()) {
+      if (
+        existing.gate_occurrence_id === entry.gate_occurrence_id &&
+        existing.event_ordinal >= ordinal
+      ) {
+        ordinal = existing.event_ordinal + 1;
+      }
+    }
+    const observationEntry: ClaimObservationOutboxEntry = {
+      observation_id: this.deps.randomUUID(),
+      job_id: entry.job_id,
+      authentication_claim_id: entry.authentication_claim_id,
+      binding_id: entry.binding_id,
+      browser_holder_generation: entry.browser_holder_generation,
+      gate_occurrence_id: entry.gate_occurrence_id,
+      event_ordinal: ordinal,
+      event_kind: "navigation_error",
+    };
+    this.claimObservationOutboxEntries.set(
+      observationEntry.observation_id,
+      observationEntry,
+    );
+    this.persistClaimObservationOutbox();
   }
 
   /** The generic Slice 2b close transaction: request a one-use daemon
@@ -4168,7 +4399,12 @@ export class Bridge {
    * never auto-close (a PDF viewer — closeOwnedTab's own group/window gate
    * covers "not adopted-content") is ceded and detached instead of
    * retried: its tombstone is cleared so a later restart never re-requests
-   * a closure the operator has already claimed by using the tab. */
+   * a closure the operator has already claimed by using the tab. This is
+   * the FIRST of two independent freshness checks, not the only one —
+   * closeOwnedTab below re-derives the same predicates off its own fresh
+   * get, and additionally compares the touch epoch, so a touch landing
+   * anywhere between this get and the eventual tabs.remove is still caught
+   * even when it is invisible to this particular snapshot. */
   private async consumeCloseTombstone(
     tabID: number,
     bindingID: string,
@@ -4181,20 +4417,11 @@ export class Bridge {
       return { closed: true };
     }
     if (tab.active === true || tab.pinned === true || (tab.url !== undefined && isPDFPage(tab.url))) {
-      await this.runTabLedgerTransaction((ledger) => {
-        const current = ledger[String(tabID)];
-        if (current === undefined || current.binding_id !== bindingID)
-          return { value: undefined, changed: false };
-        const next: SurfaceBirthRecord = { ...current, ceded: true };
-        delete next.pending_close;
-        delete next.job_id;
-        ledger[String(tabID)] = next;
-        return { value: undefined, changed: true };
-      });
+      await this.cedeOwnedTab(tabID, bindingID);
       return { closed: false };
     }
-    await this.closeOwnedTab(tabID, "authorized-close");
-    return { closed: true };
+    const removed = await this.closeOwnedTab(tabID, "authorized-close");
+    return { closed: removed };
   }
 
   /** Startup replay: a failed remove or a worker death between tombstone
@@ -4236,6 +4463,61 @@ export class Bridge {
         : "scaffold_idle";
       await this.closeAuthorizedRecord(tabID, record, disposition, undefined);
     }
+  }
+
+  /** Best-effort local guess for lastKnownBrowserHolderGeneration, scanned
+   * from whatever browser_holder_generation values this worker's persisted
+   * materializations still carry (the newest — highest — wins). Called from
+   * bootstrapSurfaceLifecycle before its local tombstone-replay pass so that
+   * pass has the best chance of an immediate authorization; a value found
+   * here can still be stale (a holder transition since it was recorded) and
+   * the daemon's own generation fence in surface_close_request rejects a
+   * stale guess as harmlessly as an absent one. */
+  private rehydrateBrowserHolderGenerationFromMaterializations(): void {
+    let rehydrated: number | undefined;
+    for (const entry of Object.values(this.store.materializations ?? {})) {
+      if (typeof entry.browser_holder_generation !== "number") continue;
+      if (rehydrated === undefined || entry.browser_holder_generation > rehydrated)
+        rehydrated = entry.browser_holder_generation;
+    }
+    if (rehydrated !== undefined)
+      this.lastKnownBrowserHolderGeneration = rehydrated;
+  }
+
+  /** Coalescing trigger for replayPendingCloseTombstones, called from the
+   * hello_ack handler every time a fresh ack actually carries
+   * browser_holder_generation (always true for a holder ack once every
+   * daemon this extension talks to ships that field — a fresh connect, a
+   * reconnect, and a pending→holder role promotion are all, from this
+   * worker's perspective, just another such ack). bootstrapSurfaceLifecycle
+   * cannot itself close this gap: it runs once, before this worker
+   * necessarily knows the daemon's live browser_holder_generation, and a
+   * race it loses today has no other scheduled retry (P0: a persisted
+   * close tombstone can strand forever). Gating on the ack actually
+   * carrying a generation — rather than merely negotiating the feature —
+   * keeps this a no-storage-touch no-op on every hello_ack that carries
+   * nothing new to act on. A replay already in flight absorbs a concurrent
+   * trigger as one more full pass instead of racing it, same shape as
+   * scheduleObservationOutboxDrain below. Never awaited from the hello_ack
+   * handler — inLifecycleChain's queued work must be free to outlive that
+   * handler's own turn on the inbound FIFO. */
+  private scheduleCloseTombstoneReplay(): void {
+    if (this.closeTombstoneReplayRunning) {
+      this.closeTombstoneReplayRerunRequested = true;
+      return;
+    }
+    this.closeTombstoneReplayRunning = true;
+    void this.inLifecycleChain(() => this.replayPendingCloseTombstones())
+      .catch((error) =>
+        console.error("papio: close-tombstone replay failed", error),
+      )
+      .finally(() => {
+        this.closeTombstoneReplayRunning = false;
+        if (this.closeTombstoneReplayRerunRequested) {
+          this.closeTombstoneReplayRerunRequested = false;
+          this.scheduleCloseTombstoneReplay();
+        }
+      });
   }
 
   private handoffNeedsHumanNow(): boolean {
@@ -5429,23 +5711,6 @@ export class Bridge {
       if (entry.tab_id >= 0) await this.removeMaterializationTab(entry.tab_id);
       await this.applyMaterialization(jobID, { type: "clear" });
     }
-    // requestCloseAuthorization refuses locally (before even sending a
-    // request) once this is undefined (~4096-4097), and it is otherwise
-    // worker-memory only: rehydrate it from the newest browser epoch any
-    // surviving (still-active-job) materialization correlation itself
-    // already carries, so a restart with no further claim consult in this
-    // worker's lifetime does not permanently strand every future close.
-    let rehydratedHolderGeneration: number | undefined;
-    for (const entry of Object.values(this.store.materializations ?? {})) {
-      if (typeof entry.browser_holder_generation !== "number") continue;
-      if (
-        rehydratedHolderGeneration === undefined ||
-        entry.browser_holder_generation > rehydratedHolderGeneration
-      )
-        rehydratedHolderGeneration = entry.browser_holder_generation;
-    }
-    if (rehydratedHolderGeneration !== undefined)
-      this.lastKnownBrowserHolderGeneration = rehydratedHolderGeneration;
     const governorQueuedAtRestart: string[] = [];
     for (const job of this.store.activeJobs) {
       if (!this.hasDelegatedAuthority(job)) {
@@ -6014,11 +6279,15 @@ export class Bridge {
     } catch {
     }
   }
-  /** Record navigation-error evidence for a papio-managed tab. Ordering only:
-   * no URL is read or persisted, and the job itself is left untouched — the
-   * marker is consulted (and consumed) by the generic auth-wall detector in
-   * onTabUpdated before that detector could otherwise mistake this dead end
-   * for a human sign-in wall. */
+  /** Record navigation-error evidence for a papio-managed tab. Ordering
+   * only: no URL is read or persisted, and the job itself is left
+   * untouched — the marker is consulted (and consumed) by the generic
+   * auth-wall detector in onTabUpdated before that detector could
+   * otherwise mistake this dead end for a human sign-in wall. Also
+   * synchronously enqueues a durable copy (oracle finding 5) before any
+   * later classification runs: the worker-local map above does not
+   * survive an MV3 worker restart, so this durable marker is the only
+   * evidence left if the worker dies before the document settles. */
   private async onNavigationError(d: {
     tabId: number;
     frameId: number;
@@ -6030,6 +6299,47 @@ export class Bridge {
       this.tabLedgerCache?.[String(d.tabId)] !== undefined;
     if (!managed) return;
     this.navigationErrors.set(d.tabId, this.deps.now());
+    const bindingID = this.tabLedgerCache?.[String(d.tabId)]?.binding_id;
+    if (bindingID === undefined) return;
+    const job = findByTab(this.store, d.tabId);
+    const grant = job === undefined ? undefined : this.claimGrants.get(job.job_id);
+    const entry: NavigationErrorMarkerEntry = {
+      tab_id: d.tabId,
+      binding_id: bindingID,
+      at: this.deps.now(),
+      ...(job === undefined ? {} : { job_id: job.job_id }),
+      ...(grant === undefined
+        ? {}
+        : {
+            authentication_claim_id: grant.authenticationClaimID,
+            gate_occurrence_id: grant.gateOccurrenceID,
+            ...(this.lastKnownBrowserHolderGeneration === undefined
+              ? {}
+              : {
+                  browser_holder_generation:
+                    this.lastKnownBrowserHolderGeneration,
+                }),
+          }),
+    };
+    this.navigationErrorMarkerEntries.set(d.tabId, entry);
+    this.persistNavigationErrorMarkers();
+  }
+  private persistNavigationErrorMarkers(): void {
+    if (this.deps.navigationErrorMarkers === undefined) return;
+    const record: Record<string, NavigationErrorMarkerEntry> = {};
+    for (const [tabID, entry] of this.navigationErrorMarkerEntries) {
+      record[String(tabID)] = entry;
+    }
+    void this.deps.navigationErrorMarkers.set(record).catch(() => {});
+  }
+  /** Consume the durable marker exactly where the worker-local one is
+   * consumed: a settled successful landing (discard) or a settled
+   * unsuccessful one (the real emitClaimObservation call is about to
+   * durably represent it in the claim_observation outbox instead). */
+  private clearNavigationErrorMarker(tabID: number): void {
+    if (this.navigationErrorMarkerEntries.delete(tabID)) {
+      this.persistNavigationErrorMarkers();
+    }
   }
   private async reconcilePendingDeliveryOnStartup(): Promise<void> {
     const pending = this.store.pendingDelivery;
@@ -7242,15 +7552,20 @@ export class Bridge {
 
   /** Retire every Slice 3 worker-memory marker for a job: the claim grant,
    * its dependent-count display hint, the mint latch, and any observation
-   * latches. Mirrors the old clearFederatedLoginOwnerForJob's role, called
-   * from the same job-removal/close paths. */
+   * latches this job itself set. Mirrors the old clearFederatedLoginOwnerForJob's
+   * role, called from the same job-removal/close paths. Uses the reverse
+   * index rather than a key-prefix scan: authentication_claim_id (part of
+   * the latch key) is shared by every dependent parked on the same
+   * institutional gate, so a prefix scan on it would also wipe a sibling
+   * job's still-active latch. */
   private clearClaimGrant(jobID: string): void {
     this.claimGrants.delete(jobID);
     this.claimDependentCounts.delete(jobID);
     this.mintingFreshHandoffs.delete(jobID);
-    const prefix = `${jobID}:`;
-    for (const key of this.claimObservationLatch) {
-      if (key.startsWith(prefix)) this.claimObservationLatch.delete(key);
+    const keys = this.claimObservationLatchKeysByJob.get(jobID);
+    if (keys !== undefined) {
+      for (const key of keys) this.claimObservationLatch.delete(key);
+      this.claimObservationLatchKeysByJob.delete(jobID);
     }
   }
 
@@ -7440,10 +7755,47 @@ export class Bridge {
     this.scheduleObservationOutboxDrain();
   }
 
+  /** Derive the SAME identity `observation_id` is built from (minus
+   * ordinal): `authentication_claim_id`, `binding_id`, `gate_occurrence_id`,
+   * `event_kind`. Used to scope at-most-once suppression to a single gate
+   * occurrence (oracle finding 4) — a job-only key would keep suppressing a
+   * fresh occurrence's first wall/login event with a stale prior
+   * occurrence's latch, since consultAuthenticationClaim overwrites
+   * claimGrants[jobID] in place on every new grant. Returns undefined if
+   * the job has no live grant to scope against. */
+  private observationSuppressionKey(
+    jobID: string,
+    bindingID: string,
+    eventKind: ClaimObservationPayload["event_kind"],
+  ): string | undefined {
+    const grant = this.claimGrants.get(jobID);
+    if (grant === undefined) return undefined;
+    return `${grant.authenticationClaimID}:${bindingID}:${grant.gateOccurrenceID}:${eventKind}`;
+  }
+
+  /** Whether `eventKind` was already latched for `jobID`'s CURRENT gate
+   * occurrence. Shares observationSuppressionKey with emitClaimObservation
+   * so the login_started gate below can never disagree with the latch it
+   * is reading. */
+  private hasLatchedObservation(
+    jobID: string,
+    tabID: number,
+    eventKind: ClaimObservationPayload["event_kind"],
+  ): boolean {
+    const bindingID = this.tabLedgerCache?.[String(tabID)]?.binding_id;
+    if (bindingID === undefined) return false;
+    const key = this.observationSuppressionKey(jobID, bindingID, eventKind);
+    return key !== undefined && this.claimObservationLatch.has(key);
+  }
+
   /** Resolve a claim-owned tab's binding id from the birth-certificate
    * ledger and enqueue one observation for it. `latch`ed kinds (wall/login)
-   * fire at most once per job — the tab-update handler would otherwise
-   * re-fire on every settle while the tab sits still. */
+   * fire at most once per gate occurrence — the tab-update handler would
+   * otherwise re-fire on every settle while the tab sits still, and a
+   * fresh occurrence for the SAME job must still get its own first
+   * emission (oracle finding 4). The latch check-and-set stays fully
+   * synchronous (tabLedgerCache, not the async ledger snapshot below) so
+   * two overlapping calls for the same identity can never both pass it. */
   private async emitClaimObservation(
     jobID: string,
     tabID: number,
@@ -7452,9 +7804,18 @@ export class Bridge {
   ): Promise<void> {
     if (!this.claimGrants.has(jobID)) return;
     if (latch) {
-      const key = `${jobID}:${eventKind}`;
+      const bindingID = this.tabLedgerCache?.[String(tabID)]?.binding_id;
+      if (bindingID === undefined) return;
+      const key = this.observationSuppressionKey(jobID, bindingID, eventKind);
+      if (key === undefined) return;
       if (this.claimObservationLatch.has(key)) return;
       this.claimObservationLatch.add(key);
+      let keys = this.claimObservationLatchKeysByJob.get(jobID);
+      if (keys === undefined) {
+        keys = new Set<string>();
+        this.claimObservationLatchKeysByJob.set(jobID, keys);
+      }
+      keys.add(key);
     }
     // §4.5: never emit a fresh lease-renewing observation ahead of any
     // unacked backlog from a prior worker lifetime — this call is never
@@ -7835,25 +8196,57 @@ export class Bridge {
       return { reliable: false };
     if (!scan.reliable) return { reliable: false };
     const candidates = scan.byBinding.get(bindingID) ?? [];
+    // review round finding 1: an operator-active/pinned candidate is ceded
+    // permanently, never flipped back to inactive and reclaimed — Chrome's
+    // active flag is the one signal papio must never overrule. Adoption is
+    // restricted to a candidate that positively re-proves itself as papio's
+    // own — ledgered under this exact binding and the current browser
+    // epoch, never ceded — so a merely-URL-matching tab (a restored or
+    // user-duplicated scaffold papio never actually ledgered) is never
+    // mistaken for ownership authority either.
+    const ledger = await this.snapshotTabLedger();
+    const positivelyOwned = (tab: TabInfo): boolean => {
+      if (tab.id === undefined) return false;
+      const record = ledger[String(tab.id)];
+      return (
+        record !== undefined &&
+        record.ceded !== true &&
+        record.binding_id === bindingID &&
+        record.browser_epoch === this.browserEpoch
+      );
+    };
+    const eligible = (tab: TabInfo): boolean =>
+      tab.active !== true && tab.pinned !== true && positivelyOwned(tab);
     let chosen: TabInfo | undefined;
     if (correlation.tab_id >= 0) {
-      chosen = candidates.find((tab) => tab.id === correlation.tab_id);
+      const match = candidates.find((tab) => tab.id === correlation.tab_id);
+      if (match !== undefined && eligible(match)) chosen = match;
     }
-    chosen ??= candidates[0];
+    chosen ??= candidates.find(eligible);
+    // Every other candidate is a duplicate papio must never silently
+    // adopt, deactivate, or delete out from under the operator or before
+    // proving ownership: active/pinned is ceded permanently (a no-op when
+    // unledgered — nothing to mark); a positively owned idle duplicate
+    // retires through the same authorized-close transaction every other
+    // owned surface uses, fired without blocking this reconciliation on
+    // an unrelated tab's daemon round trip; anything else — unledgered,
+    // or ledgered under a stale epoch that cannot re-prove itself — is
+    // left open and untouched, never directly removed.
     for (const candidate of candidates) {
-      if (candidate.id !== undefined && candidate.id !== chosen?.id) {
-        await this.removeMaterializationTab(candidate.id);
+      if (candidate.id === undefined || candidate.id === chosen?.id)
+        continue;
+      if (candidate.active === true || candidate.pinned === true) {
+        await this.cedeOwnedTab(
+          candidate.id,
+          ledger[String(candidate.id)]?.binding_id,
+        );
+        continue;
+      }
+      if (positivelyOwned(candidate)) {
+        void this.closeOwnedSurface(candidate.id, "scaffold_idle");
       }
     }
     if (chosen?.id !== undefined) {
-      if (chosen.active === true) {
-        if (this.deps.tabs.update === undefined) return { reliable: false };
-        try {
-          await this.deps.tabs.update(chosen.id, { active: false });
-        } catch {
-          return { reliable: false };
-        }
-      }
       if (correlation.tab_id !== chosen.id) {
         await this.applyMaterialization(jobID, {
           type: "scaffolded",
@@ -11064,18 +11457,27 @@ export class Bridge {
       "This download matches both a handoff acquisition in progress on this tab and an armed Send PDF grab for the same file — papio claimed it for neither. Finish or cancel the handoff job, or cancel the grab.",
     );
   }
+  /** Synchronous, no async work: called from inside the onUpdated/
+   * onActivated listener callbacks themselves, before those callbacks'
+   * own async handlers ever run. See tabTouchEpoch. */
+  private touchTab(tabID: number): void {
+    this.tabTouchEpoch.set(tabID, (this.tabTouchEpoch.get(tabID) ?? 0) + 1);
+  }
 
   private bindListeners(): void {
     if (this.listenersBound) return;
     this.listenersBound = true;
     this.deps.tabs.onUpdated.addListener((tabID, change, tab) => {
+      this.touchTab(tabID);
       return this.onTabUpdated(tabID, change, tab);
     });
     this.deps.tabs.onRemoved.addListener((tabID) => {
+      this.tabTouchEpoch.delete(tabID);
       this.keepaliveManager?.noteTabRemoved(tabID);
       return this.onTabRemoved(tabID);
     });
     this.deps.tabs.onActivated.addListener(({ tabId }) => {
+      this.touchTab(tabId);
       return this.onTabActivated(tabId);
     });
     this.bindWebNavigation();
@@ -13828,12 +14230,32 @@ export class Bridge {
         // A claim can seat this session after it was refused; the ack arrives
         // on the same port, so the refusal must stop shortcutting requests.
         this.helloDeniedGeneration = -1;
+        // Only ever present on a holder ack (protocol.ts rejects it
+        // alongside role "pending"); always the freshest truth available,
+        // so it unconditionally overwrites any earlier local guess.
+        const ackHolderGeneration = msg.payload.browser_holder_generation;
+        if (typeof ackHolderGeneration === "number") {
+          this.lastKnownBrowserHolderGeneration = ackHolderGeneration;
+        }
         this.keepaliveManager?.notifyConfiguredOriginsChanged();
         if (features.includes(AUTHENTICATION_CLAIM_FEATURE)) {
           // Same off-chain rule as reconciliation below: schedule only,
           // never await — scheduleObservationOutboxDrain is itself
           // non-blocking and safe to call directly from this handler.
           this.scheduleObservationOutboxDrain();
+        }
+        if (
+          features.includes(SURFACE_CLOSE_FEATURE) &&
+          typeof ackHolderGeneration === "number"
+        ) {
+          // P0 fix: bootstrapSurfaceLifecycle's local replay can lose the
+          // race against this very ack (or find no cached generation at
+          // all) and has no other scheduled retry. Gated on THIS ack
+          // supplying a generation (not merely negotiating the feature) so
+          // an ordinary ack that repeats nothing new stays a no-op — no
+          // storage touch, no request. Schedule only, never await, same
+          // rule as above.
+          this.scheduleCloseTombstoneReplay();
         }
         if (features.includes(INSTITUTIONAL_MATERIALIZATION_FEATURE)) {
           // Inbound frames are serialized. Reconciliation sends correlated
@@ -14976,11 +15398,13 @@ export class Bridge {
       // §2.2.1 navigation_error (Slice 3): a daemon-committed park with no
       // auth charge, no cooldown — this early return already leaves the
       // job untouched and charges nothing; only the observation is new.
+      this.clearNavigationErrorMarker(tabID);
       void this.emitClaimObservation(job.job_id, tabID, "navigation_error");
       return;
     }
     if (successfulLanding) {
       this.navigationErrors.delete(tabID);
+      this.clearNavigationErrorMarker(tabID);
       const institutionalSession = await this.recordInstitutionalSession(
         job,
         url,
@@ -14994,7 +15418,7 @@ export class Bridge {
     } else if (
       change.status === "loading" &&
       isAuthenticationURL(url) &&
-      this.claimObservationLatch.has(`${job.job_id}:wall_observed`)
+      this.hasLatchedObservation(job.job_id, tabID, "wall_observed")
     ) {
       // §2.2.1 login_started (Slice 3): no real form-submit signal exists
       // in the browser. A further navigation while still on the auth wall,
@@ -17411,6 +17835,7 @@ export class Bridge {
     this.destroyDeliveryChoiceForTab(tabID);
     this.pageNavSeq.delete(tabID);
     this.navigationErrors.delete(tabID);
+    this.clearNavigationErrorMarker(tabID);
     // If pendingDelivery waiting_manual was bound to this tab, clear it — a later
     // page in the same tab_id must never revive authority.
     if (
@@ -19761,6 +20186,25 @@ function realDeps(): BridgeDeps {
       async set(value) {
         await chrome.storage.session.set({
           [CLAIM_OBSERVATION_OUTBOX_STORAGE_KEY]: value,
+        });
+      },
+    },
+    navigationErrorMarkers: {
+      async get() {
+        try {
+          const got = await chrome.storage.session.get(
+            NAVIGATION_ERROR_MARKER_STORAGE_KEY,
+          );
+          const stored = got[NAVIGATION_ERROR_MARKER_STORAGE_KEY];
+          if (typeof stored !== "object" || stored === null) return {};
+          return stored as Record<string, NavigationErrorMarkerEntry>;
+        } catch {
+          return {};
+        }
+      },
+      async set(value) {
+        await chrome.storage.session.set({
+          [NAVIGATION_ERROR_MARKER_STORAGE_KEY]: value,
         });
       },
     },

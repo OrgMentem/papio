@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"papio/internal/job"
@@ -978,5 +979,150 @@ func TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim(
 	reclaim := authClaimResponse(t, reclaimed)
 	if reclaim.Outcome != "open_new" {
 		t.Fatalf("post-owner_closed arbitration outcome = %s, want open_new", reclaim.Outcome)
+	}
+}
+
+// rawOfType returns the first message of typ from an index-aligned
+// (msgs, raw) pair returned by runSync/runSyncAs, alongside its exact
+// on-wire JSON.
+func rawOfType(msgs []*protocol.BrowserMessage, raw []json.RawMessage, typ string) (*protocol.BrowserMessage, string) {
+	for i, m := range msgs {
+		if m.Type == typ {
+			return m, string(raw[i])
+		}
+	}
+	return nil, ""
+}
+
+// TestClaimObservationCloseFramesCarryNoRawMaterial is the denylist
+// regression for the oracle review's finding 6
+// (dev/scratch/oracle/20260818T202529Z-lifecycle-endtoend/answer3.md,
+// test gap 7's second half): it drives a job whose DOI, title, provider
+// institution entity ID, and ProQuest account ID are all
+// deliberately-recognisable secrets through the real
+// candidate-offer -> authentication_claim -> claim_observation ->
+// surface_close pipeline, then asserts that not one of those raw values
+// appears on the wire in any authentication_claim_response,
+// claim_observation_ack, or surface_close_response frame.
+//
+// institutional_candidate_offer is checked too, but as a POSITIVE
+// control: dev/active/surface-lifecycle-plan.md's storage-tier scope note
+// and dev/active/claim-observation-protocol.md's §2 scope note document
+// that this frame (part of the pre-existing institutional_materialization_v1
+// route/offer family, shipped in 0b716b3 before this effort) legitimately
+// carries exactly this material, mirroring the long-standing job_offer
+// contract (AGENTS.md) — the extension needs it to navigate and verify a
+// route. If that ever stops being true the digest-only claim below is
+// vacuous, so this test fails either way the boundary moves.
+func TestClaimObservationCloseFramesCarryNoRawMaterial(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	cfg.Browser.ShibbolethEntityID = "https://idp.example-institute.edu/idp/shibboleth"
+	cfg.Browser.ProquestAccountID = "679012345678"
+	b = NewBridge(b.jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+	ctx := context.Background()
+	runSync(t, b, authClaimHello(t))
+
+	denylist := []string{
+		handoffWork().DOI, handoffWork().Title,
+		"idp.example-institute.edu", "679012345678",
+	}
+
+	// Positive control, on its own job: institutional_candidate_offer must
+	// still carry every denylisted value, exactly as documented.
+	offerJobID := parkInstitutional(t, jobs, "wr_denylist_offer", handoffWork(), "")
+	explicitMaterializationCandidate(t, jobs, offerJobID, "domain-denylist-offer")
+	if _, live, err := b.FocusHandoffs(ctx, []string{offerJobID}); err != nil || !live {
+		t.Fatalf("focus handoff: live=%v err=%v", live, err)
+	}
+	offeredMsgs, offeredRaw := runSync(t, b)
+	offerMsg, offerJSON := rawOfType(offeredMsgs, offeredRaw, protocol.MsgInstitutionalCandidateOffer)
+	if offerMsg == nil {
+		t.Fatalf("no institutional_candidate_offer emitted: %v", offeredMsgs)
+	}
+	for _, needle := range denylist {
+		if !strings.Contains(offerJSON, needle) {
+			t.Fatalf("candidate offer no longer carries documented route material %q (update the plan's scope note if intentional): %s", needle, offerJSON)
+		}
+	}
+	// Settle the offer job so it stops being re-flushed as a fresh
+	// candidate offer alongside every later Sync batch for this session.
+	if err := jobs.Cancel(ctx, offerJobID, job.TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b)
+
+	// The subject under test, on a fresh job: walk the full
+	// authentication_claim -> claim_observation -> surface_close pipeline
+	// and demand none of the denylisted values appear anywhere on the wire.
+	jobID := parkInstitutional(t, jobs, "wr_denylist_claim", handoffWork(), "")
+	seedAuthenticationClaimProfile(t, jobs, "auth-claim-denylist")
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-denylist-claim")
+
+	// Only these types are covered by the digest-only promise (the
+	// scope notes added to both docs for finding 6); every batch below is
+	// walked, but institutional_candidate_offer and any other
+	// pre-existing materialization-family frame that a shared poll may
+	// also flush alongside these is deliberately not asserted against —
+	// that boundary is exercised separately above.
+	claimObservationCloseFamily := map[string]bool{
+		protocol.MsgAuthenticationClaimRequest:  true,
+		protocol.MsgAuthenticationClaimResponse: true,
+		protocol.MsgClaimObservation:            true,
+		protocol.MsgClaimObservationAck:         true,
+		protocol.MsgSurfaceCloseRequest:         true,
+		protocol.MsgSurfaceCloseResponse:        true,
+	}
+	var allMsgs []*protocol.BrowserMessage
+	var allRaw []json.RawMessage
+	record := func(msgs []*protocol.BrowserMessage, raw []json.RawMessage) {
+		for i, m := range msgs {
+			if claimObservationCloseFamily[m.Type] {
+				allMsgs = append(allMsgs, m)
+				allRaw = append(allRaw, raw[i])
+			}
+		}
+	}
+
+	authMsgs, authRaw := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, jobID,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "denylist-auth-req", CandidateID: candidateID,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	record(authMsgs, authRaw)
+	authResp := authClaimResponse(t, authMsgs)
+	if authResp.Outcome != "open_new" || authResp.GateOccurrenceID == "" {
+		t.Fatalf("authentication_claim_response = %+v, want open_new with a gate_occurrence_id", authResp)
+	}
+
+	bindingID := bindCandidate(t, b, jobID, candidateID, "denylist", 41)
+
+	obsMsgs, obsRaw := runSync(t, b, claimObservationFrame(t, jobID, "denylist-obs-req",
+		"auth-claim-denylist", bindingID, authResp.GateOccurrenceID,
+		"obs-denylist-0001", b.epoch, 0, "wall_observed"))
+	record(obsMsgs, obsRaw)
+	if ack := claimObservationAckPayload(t, obsMsgs); ack.Outcome != "applied" {
+		t.Fatalf("claim_observation_ack outcome = %s, want applied: %+v", ack.Outcome, ack)
+	}
+
+	closeMsgs, closeRaw := runSync(t, b, inFrame(t, protocol.MsgSurfaceCloseRequest, "",
+		protocol.SurfaceCloseRequestPayload{
+			RequestID: "denylist-close-req", BindingID: bindingID,
+			BrowserHolderGeneration: b.epoch, Disposition: "scaffold_idle",
+		}))
+	record(closeMsgs, closeRaw)
+	if closeResp := decodeSurfaceCloseResponse(t, closeRaw); closeResp.Outcome != "authorized" {
+		t.Fatalf("surface_close_response outcome = %s, want authorized: %+v", closeResp.Outcome, closeResp)
+	}
+
+	if len(allMsgs) == 0 {
+		t.Fatalf("no claim/observation/close frames captured to check")
+	}
+	for i, msg := range allMsgs {
+		raw := string(allRaw[i])
+		for _, needle := range denylist {
+			if strings.Contains(raw, needle) {
+				t.Fatalf("%s frame leaked raw material %q: %s", msg.Type, needle, raw)
+			}
+		}
 	}
 }

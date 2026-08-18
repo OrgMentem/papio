@@ -150,6 +150,17 @@ and are annotated below; the rest still describes HEAD.
   the extension is never a durable queue (ADR-0022 Decision 1). A
   browser-start epoch invalidates old tab-ID authority; after a browser
   restart only a self-identifying scaffold is remapped automatically.
+  **Scope note:** this digest-only promise is about the lifecycle state
+  this document introduces (the birth certificate above, and the
+  claim/observation/close frames in
+  `dev/active/claim-observation-protocol.md`). It does not apply to, and
+  does not narrow, the pre-existing `institutional_materialization_v1`
+  candidate-offer/claim/bind/route family (shipped before this effort,
+  `0b716b3`), whose frames carry provider hosts, a bounded DOI/title hint,
+  and institution login identifiers by design — the extension needs them
+  to navigate and verify a route, mirroring the long-standing `job_offer`
+  contract. That route material is never itself persisted (see
+  claim-observation-protocol.md §2 scope note for the code citations).
 
 ## Amendments to attempt five's "do not re-attempt" list (operator decision)
 

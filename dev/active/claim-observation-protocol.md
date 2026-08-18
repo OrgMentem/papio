@@ -145,11 +145,37 @@ exactly as `AuthPayload{elapsed_ms?}` with no URL/host ever, forever; the new
 entirely. Keep the plan's chosen name — renaming it would only add a second
 source of truth to reconcile against the plan text.
 
-Every ID field below reuses the existing opaque-ID convention: 8-128 chars,
-`institutionalID`/`institutionalRequestID`-shaped (`protocol.go:4900-4911`,
-`requestIDRE`), no URL/host/title/DOI/query/IdP/credential material ever, per
-the plan's Slice 3 bullet (line 315) and the schema's standing description
+Every ID field below (§2.1-§2.3: `authentication_claim_request`/
+`_response`, `claim_observation`/`_ack`, `surface_close_request`/
+`_response` — the three new pairs this section introduces) reuses the
+existing opaque-ID convention: 8-128 chars, `institutionalID`/
+`institutionalRequestID`-shaped (`protocol.go:4900-4911`, `requestIDRE`),
+no URL/host/title/DOI/query/IdP/credential material ever, per the plan's
+Slice 3 bullet (line 315) and the schema's standing description
 (`protocol/browser-v1.schema.json:5`).
+
+**Scope, explicit**: this digest-only promise covers exactly the three
+pairs above plus the persisted `SurfaceBirthRecord` birth certificate
+(`extension/src/ledger.ts`) — the state this effort introduced. It does
+**not** apply to, and does not narrow, the pre-existing materialization
+family (`institutional_candidate_offer`, `institutional_claim_request`/
+`_response`, `institutional_bind_request`/`_response`,
+`institutional_route_request`/`_response`, `institutional_navigated_*`,
+`institutional_reconcile_*` — all shipped under `institutional_materialization_v1`
+before this effort, `0b716b3`). Those frames carry provider hosts, a
+bounded DOI/title hint, and (candidate-offer only) the institution's
+`login_entity_id`/`proquest_account_id` because the extension needs them
+to navigate and verify a route, exactly like the long-standing `job_offer`
+contract (AGENTS.md: per-institution `login_entity_id`/`proquest_account_id`
+are long-standing, resolved unconditionally from the job's own
+institution). `institutional_route_response.url` is the actual navigation
+target for the same reason. None of this route material is ever persisted
+past materialization: `extension/src/background.ts`'s `offerURLs` map is
+worker-local, excluded from every `storage.local` save, and cleared at tab
+creation (`background.ts:6715,6752`); `ActiveJob.provider_hosts`/`.expected`
+(`extension/src/state.ts:158-172`) are the pre-existing job-bookkeeping
+fields already covered by the same "not sensitive — resolver-declared
+destinations, never an IdP address" note there, not new lifecycle state.
 
 ### 2.1 `authentication_claim_request` / `authentication_claim_response`
 

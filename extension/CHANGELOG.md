@@ -124,8 +124,40 @@ for the full pre-split extension history.
 - **A fresh line no longer says "just now".** The institution-session card and
   live job status spent their remaining width restating that nothing had aged
   yet; the age appears once there is one.
+- **A daemon that has begun advertising more than 32 `hello_ack` features no
+  longer locks this extension out of the whole native session.** The parser's
+  accept-side bound on `hello_ack.features` is now 64, up from the 32 every
+  daemon still emits (`internal/browser/bridge.go`'s fail-closed feature list
+  is unchanged). This is stage 1 of a two-stage mixed-version migration: an
+  extension that tolerates a longer list, so a daemon's emitted cap can be
+  raised later without a manually-upgraded daemon failing the whole
+  `hello`/`hello_ack` handshake against an as-yet-unupdated extension. An
+  older daemon's short feature list still negotiates exactly as before.
 
 ### Fixed
+- **A tab you are looking at is never pulled back under papio's control.**
+  An independent review of the ownership work above found the one remaining
+  path that could: rediscovering an existing placeholder page could flip it
+  back to inactive and re-adopt it, and could close a duplicate it had never
+  proven it owned. Rediscovery now permanently cedes any tab you have
+  activated or pinned, adopts only a tab whose birth record proves it is
+  papio's own, and retires a proven duplicate through the daemon-authorized
+  close — an unproven one is simply left alone. The close primitive itself
+  now also notices a touch that lands *during* the close — activate a tab in
+  the same instant papio decides to retire it and the tab stays, ceded to
+  you, even if it looks untouched again by the time the close would land.
+- **A close that was authorized just before the extension restarted now
+  finishes instead of stranding the tab forever.** The restart replay ran
+  before the daemon handshake had supplied the authority it needs, so it
+  silently did nothing — every restart repeated the same dead race. The
+  daemon now tells a reconnecting extension its live holder generation in
+  the handshake itself, and that acknowledgement re-runs the pending close.
+- **A second sign-in gate for the same paper reports its progress again.**
+  Login/wall progress events were de-duplicated per paper rather than per
+  gate, so a paper whose first sign-in ended without success could never
+  report the second gate — its siblings stayed parked. And a page that
+  failed to *load* is no longer mistaken for a login wall after an
+  extension restart: the navigation-error marker now survives the worker.
 - **Send PDF works again.** It was refused in every browser, every time, with
   *Reload the papio extension to finish updating* — advice that could not work,
   because reloading never changed the thing being complained about. The

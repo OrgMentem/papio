@@ -740,6 +740,52 @@ test("hello_ack accepts optional daemon details and rejects invalid members", ()
   }
 });
 
+test("hello_ack tolerates a wider feature set from a mixed-version-ahead daemon", () => {
+  // Oracle review finding 7 (dev/scratch/oracle/20260818T202529Z-lifecycle-endtoend/
+  // answer3.md lines 139-154): every daemon still emits at most 32 features
+  // (internal/browser/bridge.go's `required` literal, pinned exactly by
+  // bridge_test.go's TestHelloAckAnnouncesDaemonVersion), but a manually
+  // upgraded daemon that has NOT yet had its emit cap raised must not be able
+  // to lock a currently-shipped extension out of the whole native session by
+  // simply advertising a longer list. Stage 1 of the migration widens only the
+  // accept side (HELLO_ACK_FEATURES_ACCEPT_CAP = 64 in protocol.ts) while the
+  // daemon's emitted cap is untouched.
+  const frame = (features: string[]) => ({
+    protocol: "papio-browser/1",
+    type: "hello_ack",
+    msg_id: "daemon-ack-mixed-version",
+    seq: 1,
+    payload: { features },
+  });
+
+  // A future daemon with the emit cap eventually raised to 33 (feature 33
+  // from the review) must still negotiate against today's extension: the
+  // extra, unrecognized feature name is simply never matched by any
+  // `slices.Contains`-style capability check, not a parse failure.
+  const thirtyThree = Array.from(
+    { length: 33 },
+    (_, i) => `future_feature_${i}`,
+  );
+  const parsed33 = parseBrowserMessage(frame(thirtyThree));
+  expect(parsed33.payload["features"]).toEqual(thirtyThree);
+
+  // The widened bound is itself finite: 64 entries parse, 65 fail closed,
+  // exactly mirroring the old 32/33 boundary one order of magnitude up.
+  const sixtyFour = Array.from({ length: 64 }, (_, i) => `wide_feature_${i}`);
+  expect(
+    parseBrowserMessage(frame(sixtyFour)).payload["features"],
+  ).toHaveLength(64);
+  const sixtyFive = Array.from({ length: 65 }, (_, i) => `wide_feature_${i}`);
+  expect(() => parseBrowserMessage(frame(sixtyFive))).toThrow(ProtocolError);
+
+  // An old daemon that never learned about the widened bound — advertising
+  // only its small legacy list — must keep negotiating exactly as before.
+  const legacy = ["browser_handoff", "session_roles_v1"];
+  expect(parseBrowserMessage(frame(legacy)).payload["features"]).toEqual(
+    legacy,
+  );
+});
+
 test("pdf_grab_result.reason is a closed classifier confined to the two refusals", () => {
   // The popup switches on reason to pick its own copy, so an unclassified value
   // must never reach it, and reason must stay confined to the refusal outcomes —

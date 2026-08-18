@@ -76,6 +76,7 @@ import {
   type DownloadDeltaLike,
   type DownloadItemLike,
   type NativePort,
+  type NavigationErrorMarkerEntry,
   type PageBulkSnapshotView,
   type PdfGrabCorrelation,
   type TabChangeInfo,
@@ -378,6 +379,9 @@ interface Harness {
   claimObservationOutbox: {
     current: Record<string, ClaimObservationOutboxEntry>;
   };
+  navigationErrorMarkers: {
+    current: Record<string, NavigationErrorMarkerEntry>;
+  };
   frames(): BrowserMessage[];
   alarms: FakeAlarms;
   postedStrings(): string[];
@@ -486,6 +490,9 @@ function makeHarness(
   const claimObservationOutbox: {
     current: Record<string, ClaimObservationOutboxEntry>;
   } = { current: {} };
+  const navigationErrorMarkers: {
+    current: Record<string, NavigationErrorMarkerEntry>;
+  } = { current: {} };
   // The scanner-consent record ADR-0019 Decision 2 gates DOM reads on. Real
   // storage semantics (validated, deduplicated, sorted) live in realDeps; this
   // is a bare cell so a test can seed or observe exactly what it means to.
@@ -526,6 +533,12 @@ function makeHarness(
       get: async () => claimObservationOutbox.current,
       set: async (value) => {
         claimObservationOutbox.current = value;
+      },
+    },
+    navigationErrorMarkers: {
+      get: async () => navigationErrorMarkers.current,
+      set: async (value) => {
+        navigationErrorMarkers.current = value;
       },
     },
     downloads,
@@ -602,6 +615,7 @@ function makeHarness(
     runtimeMessages,
     pdfGrabCorrelations,
     claimObservationOutbox,
+    navigationErrorMarkers,
     alarms,
     frames: () => ports.flatMap((p) => p.posted.map(parseBrowserMessage)),
     postedStrings: () =>
@@ -1135,6 +1149,7 @@ function helloAck(
     features?: string[];
     resolver_origins?: string[];
     role?: BrowserSessionRole;
+    browser_holder_generation?: number;
   } = {},
 ): unknown {
   return {
@@ -3560,6 +3575,74 @@ test("Slice 3: an owner tab closed without success emits owner_closed with the c
   expect(h.tabs.created).toHaveLength(1);
 });
 
+test("Slice 3 (oracle finding 4): an ack's fresh gate_occurrence_id rotates the SAME still-owned job's grant in place — a later wall_observed for the new occurrence is not suppressed by the prior occurrence's latch", async () => {
+  const jobA = "job_claim_occ_rotate";
+  const candidateA = "cand_occ_rotate01";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobA)],
+  });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobA, candidateA);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobA,
+    candidateA,
+    `https://${PROVIDER_HOST}/fresh?occ=1`,
+  );
+  const internals = h.bridge as unknown as {
+    emitClaimObservation(
+      jobID: string,
+      tabID: number,
+      eventKind: string,
+      latch?: boolean,
+    ): Promise<void>;
+  };
+
+  // G1 (openClaimWithNewSurface's own `occ_${candidateA}`): the first
+  // wall_observed for this occurrence, latched.
+  const framesBeforeFirst = h.port.posted.length;
+  await internals.emitClaimObservation(jobA, tabID, "wall_observed", true);
+  const first = await h.port.waitForFrame("claim_observation", framesBeforeFirst);
+  expect(first.payload["gate_occurrence_id"]).toBe(`occ_${candidateA}`);
+
+  // The daemon acks it applied but rotates the occurrence on this SAME
+  // still-owned grant — no tab close, no re-consult, no job removal in
+  // between (oracle finding 4's "the first arbitration otherwise ends
+  // without removing the job"). drainObservationOutboxBatch's own ack
+  // handling applies a fresh gate_occurrence_id to every grant sharing
+  // this authentication_claim_id in place.
+  await h.port.inbound(
+    observationAck(jobA, first.payload["request_id"], {
+      outcome: "applied",
+      gate_occurrence_id: "occ_rotate_g2",
+      browser_holder_generation: 1,
+    }),
+  );
+
+  // A further wall_observed must still reach the daemon for the NEW
+  // occurrence: the pre-fix job-level latch (`${jobID}:wall_observed`)
+  // would suppress this as already-emitted even though it belongs to a
+  // completely different occurrence than the one that set the latch.
+  const framesBeforeSecond = h.port.posted.length;
+  await internals.emitClaimObservation(jobA, tabID, "wall_observed", true);
+  const second = await h.port.waitForFrame(
+    "claim_observation",
+    framesBeforeSecond,
+  );
+  expect(second.payload["gate_occurrence_id"]).toBe("occ_rotate_g2");
+  expect(second.payload["event_kind"]).toBe("wall_observed");
+  expect(second.payload["observation_id"]).not.toBe(first.payload["observation_id"]);
+
+  // A THIRD call for the SAME (now current) occurrence is still
+  // suppressed: the fix re-scopes the latch, it does not remove it.
+  const framesBeforeThird = h.port.posted.length;
+  await internals.emitClaimObservation(jobA, tabID, "wall_observed", true);
+  expect(h.port.posted.length).toBe(framesBeforeThird);
+});
+
 test("Slice 3: a claim_observation outbox entry replays before any lease-renewing action after a restart, and a duplicate ack clears it without local mutation", async () => {
   const jobA = "job_claim_replay_owner";
   const jobB = "job_claim_replay_cold";
@@ -4004,6 +4087,95 @@ test("Scenario 5: navigation_error observation, once the daemon acks it applied,
     helloAck({ features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"] }),
   );
   expect(restarted.tabs.created).toHaveLength(tabsCreatedBeforeRestart);
+});
+
+test("Scenario 5 at the teardown boundary (oracle finding 5): the worker dies right after onErrorOccurred, before the document ever settles — restart still charges no auth attempt and still reaches a durable terminal disposition", async () => {
+  const jobID = "job_scenario5_teardown";
+  const candidateID = "cand_scenario5_td01";
+  const idpURL = "https://idp.example.edu/sso";
+  const h = makeHarness(
+    { ...emptyStore(), activeJobs: [coldClaimJob(jobID)] },
+    { windows: true },
+  );
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"] }),
+  );
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/fresh?s5td=1`,
+  );
+
+  // The top-frame load fails — the ONLY signal Chrome delivers before this
+  // worker dies. In real Chrome the document goes on to settle at the IdP's
+  // error page almost immediately, but that onUpdated "complete" event is
+  // delivered to whichever listener is alive AT THAT MOMENT: a dead worker
+  // never receives it, and Chrome never replays it later. `patch` (not
+  // `completeNavigation`) models exactly that — the browser-side tab state
+  // moves on without ever firing the event this now-dead worker would have
+  // consumed.
+  await h.webNavigation.emitError(tabID);
+  h.tabs.patch(tabID, { url: idpURL, status: "complete" });
+
+  const restarted = restartWorker(h);
+  await restarted.bridge.start();
+  await restarted.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"] }),
+  );
+
+  // The daemon-visible auth-attempt count is unchanged: no auth_pending (or
+  // any other attempt-charging frame) was ever sent for this dead end, even
+  // though the new worker's own navigationErrors map started out empty —
+  // the durable marker, not worker memory, is what excluded it.
+  expect(restarted.frames().some((f) => f.type === "auth_pending")).toBe(false);
+
+  const observation = await restarted.port.waitForFrame("claim_observation");
+  expect(observation.payload["event_kind"]).toBe("navigation_error");
+  expect(observation.payload["binding_id"]).toBeDefined();
+  expect(observation.job_id).toBe(jobID);
+
+  // The operator has moved on by the time the daemon commits this; an
+  // operator-active tab is never auto-closed (Slice 2b) — same guard as the
+  // same-worker path exercises.
+  restarted.tabs.patch(tabID, { active: false });
+  const framesBeforeAck = restarted.port.posted.length;
+  await restarted.port.inbound(
+    observationAck(jobID, observation.payload["request_id"], {
+      outcome: "applied",
+      gate_occurrence_id: "occ_s5td_naverr",
+      browser_holder_generation: 1,
+    }),
+  );
+
+  // The scaffold reaches a durable terminal disposition: the standard
+  // close-authorization transaction fires for the now-exhausted scaffold,
+  // exactly as it would if the same-worker path had classified this
+  // navigation error itself — proving the exclusion never depended on this
+  // worker's memory surviving the teardown.
+  const closeRequest = await restarted.port.waitForFrame(
+    "surface_close_request",
+    framesBeforeAck,
+  );
+  expect(closeRequest.payload["disposition"]).toBe("claim_abandoned");
+  await restarted.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: closeRequest.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-s5td-0001",
+      nonce: "nonce-s5td-0001",
+      browser_holder_generation: 1,
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(restarted.tabs.removed).toContain(tabID);
+  expect(restarted.tabs.snapshot(tabID)).toBeUndefined();
+  expect(
+    restarted.backend.store.activeJobs.find((job) => job.job_id === jobID),
+  ).toMatchObject({ tab_id: -1 });
 });
 
 test("Scenario 7: Firefox <139 (no tabGroups) — the scaffold lands in work-window mode, ownership stays binding-based, and full event-page teardown at each protocol boundary still resumes from durable state", async () => {
@@ -17988,6 +18160,53 @@ test("Slice 2b: an operator-active tab is ceded and detached rather than closed"
   expect(record?.pending_close).toBeUndefined();
 });
 
+test("Review round finding 3: an operator activation landing inside the close window (after consumeCloseTombstone's own check, strictly before tabs.remove is issued) cedes instead of closing", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const rawGet = h.tabs.get.bind(h.tabs);
+  let getCalls = 0;
+  h.deps.tabs.get = async (id) => {
+    const snapshot = await rawGet(id);
+    if (id === tabID) {
+      getCalls += 1;
+      // Call #1 is consumeCloseTombstone's own required check (sees
+      // inactive, proceeds). Call #2 is closeOwnedTab's own fresh get,
+      // issued immediately after it captures the touch epoch at entry.
+      // Land a genuine operator activation strictly inside that async
+      // round trip, then let it revert before the snapshot is handed
+      // back — so the returned tab still reads inactive, exactly what a
+      // single before/after tabs.get cannot see, and exactly why the
+      // fix compares a touch epoch instead of trusting one snapshot.
+      if (getCalls === 2) {
+        await h.tabs.userActivate(tabID);
+        h.tabs.patch(tabID, { active: false });
+      }
+    }
+    return snapshot;
+  };
+  const closing = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
+  const request = await h.port.waitForFrame("surface_close_request");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-toctou-0001",
+      nonce: "nonce-toctou-0001",
+      browser_holder_generation: 1,
+    }),
+  );
+  // The cession, not merely an earlier activity check the operator's
+  // later touch could still outrun.
+  await expect(closing).resolves.toEqual({ closed: false });
+  expect(h.tabs.removed).not.toContain(tabID);
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+  const record = closeInternals(h).tabLedgerCache[String(tabID)];
+  expect(record?.ceded).toBe(true);
+  expect(record?.binding_id).toBe(bindingID);
+  expect(record?.pending_close).toBeUndefined();
+});
+
 test("Scenario 6: papio's own focus_owner activation leaves no cession trace, but a genuine operator activation cedes and that survives a worker restart", async () => {
   // Part (a): papio-initiated focus_owner (the daemon routing an explicit
   // dependent to an already-live owner tab) activates that tab itself —
@@ -18153,6 +18372,84 @@ test("Slice 2b: a failed remove leaves the tombstone; startup replay completes i
   );
   await startPromise;
   expect(h.tabs.snapshot(tabID)).toBeUndefined();
+});
+
+test("P0 (oracle finding 2): a persisted close tombstone survives a hello_ack race — local bootstrap alone cannot replay it, but the SAME holder ack that finally supplies browser_holder_generation closes the tab in the SAME worker lifetime", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID } = await seedOwnedScaffold(h);
+  h.deps.tabs.remove = async () => {
+    throw new Error("remove failed");
+  };
+  const closing = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
+  const request = await h.port.waitForFrame("surface_close_request");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-p0-0001",
+      nonce: "nonce-p0-0001",
+      browser_holder_generation: 7,
+    }),
+  );
+  await closing;
+  // Same fixture as the sibling "failed remove" test: the tombstone
+  // (durably persisted, not merely in worker memory) survives.
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+  expect(closeInternals(h).tabLedgerCache[String(tabID)]?.pending_close).toBeDefined();
+
+  // A worker restart wipes lastKnownBrowserHolderGeneration (worker-memory
+  // only, per its own doc comment) but keeps the persisted tombstone and
+  // the browser epoch it was minted under — deliberately NOT pre-seeding
+  // it the way the sibling test does, to actually exercise the race.
+  const restarted = restartWorker(h);
+  restarted.deps.tabs.remove = async (id) => {
+    h.tabs.live.delete(id);
+  };
+  await restarted.bridge.start();
+  // hello_ack has not arrived yet: local bootstrap's own replay pass ran
+  // during start() and lost the race exactly as the oracle finding
+  // describes — no live browser_holder_generation to send, and
+  // requestCloseAuthorization refuses locally rather than guess one. Before
+  // the P0 fix this was the end of the story: nothing else ever retried,
+  // and the tombstone (and the tab) would strand forever. Scoped to this
+  // restarted worker's OWN port — the pre-restart port's own successful
+  // surface_close_request from above is still in `frames()`'s aggregate.
+  expect(
+    restarted.port.posted
+      .map(parseBrowserMessage)
+      .some((f) => f.type === "surface_close_request"),
+  ).toBe(false);
+  expect(restarted.tabs.snapshot(tabID)).toBeDefined();
+
+  // hello_ack finally arrives, carrying surface_close_v1 AND the live
+  // holder generation together — the fix's trigger. No second restart.
+  // waitForFrame is started BEFORE the trigger: scheduleCloseTombstoneReplay
+  // is fire-and-forget from the hello_ack handler, so the request can post
+  // after port.inbound's own promise has already resolved.
+  const replay = restarted.port.waitForFrame("surface_close_request");
+  await restarted.port.inbound(
+    helloAck({ features: ["surface_close_v1"], browser_holder_generation: 7 }),
+  );
+  const replayFrame = await replay;
+  expect(replayFrame.payload["binding_id"]).toBeDefined();
+  expect(replayFrame.payload["browser_holder_generation"]).toBe(7);
+  await restarted.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: replayFrame.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-p0-0002",
+      nonce: "nonce-p0-0002",
+      browser_holder_generation: 7,
+    }),
+  );
+  // scheduleCloseTombstoneReplay's inLifecycleChain work is fire-and-forget
+  // from the hello_ack handler; let its continuation (closeAuthorizedRecord
+  // through closeOwnedTab) settle before asserting the removal it performs.
+  // The tab closes in THIS worker lifetime — no second restart required,
+  // closing the gap the oracle's finding 2 and test-gap 5 describe.
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(restarted.tabs.snapshot(tabID)).toBeUndefined();
 });
 
 test("Slice 2b: a browser restart invalidates tab-ID authority; records survive only for review", async () => {
@@ -18411,4 +18708,75 @@ test("Scenario 2: a live institutional materialize.html scaffold survives simula
         tab.url === `chrome-extension://test/materialize.html#${bindingID}`,
     );
   expect(liveScaffoldsForBinding).toHaveLength(1);
+});
+
+test("Review round finding 1: reconciliation facing an operator-active scaffold plus an unledgered duplicate cedes the active one and retains both, never adopting, deactivating, or deleting either", async () => {
+  const jobID = "job_scenario_duplicate_reconcile";
+  const candidateID = "cand_duplicate_0001";
+  const bindingID = "bind_duplicate_0001";
+  const claimID = "claim_duplicate_0001";
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["institutional_materialization_v1"] }),
+  );
+  const scaffoldURL = `chrome-extension://test/materialize.html#${bindingID}`;
+  // The active scaffold is papio's own prior work (ledgered, under this
+  // exact binding and browser epoch) that the operator has since claimed
+  // by activating it. The duplicate is a second live tab that merely
+  // matches the URL pattern — never ledgered by this worker lifetime, the
+  // review round's finding 1 scenario for "a restored or user-duplicated
+  // scaffold".
+  const activeTab = await h.tabs.create({ url: scaffoldURL, active: true });
+  const duplicateTab = await h.tabs.create({
+    url: scaffoldURL,
+    active: false,
+  });
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    browserEpoch: string | undefined;
+  };
+  internals.tabLedgerCache = {
+    ...internals.tabLedgerCache,
+    [String(activeTab.id)]: fakeBirthRecord({
+      binding_id: bindingID,
+      tab_hint: activeTab.id!,
+      browser_epoch: internals.browserEpoch ?? "test-epoch",
+    }),
+  };
+
+  await h.port.inbound(candidateOffer(jobID, candidateID));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  const claimResponsePayload = institutionalClaimResponse(
+    jobID,
+    candidateID,
+    claimID,
+    bindingID,
+  ) as { payload: Record<string, unknown> };
+  claimResponsePayload.payload["request_id"] = claim.payload["request_id"];
+  await h.port.inbound(claimResponsePayload);
+  // materializeScaffold's own ceding/adoption pass runs synchronously
+  // before either the reused branch's ledgerManagedTab or the create-new
+  // branch's institutional_bind_request — waiting for the eventual
+  // bind request (for whichever tab it ends up driving) proves that pass
+  // has already completed.
+  await h.port.waitForFrame("institutional_bind_request");
+  // Never deactivated, never adopted as the working scaffold: the
+  // operator's activation is permanent cession, not a papio-overridable
+  // hint — persisted on the ledger record, not merely inferred.
+  expect(
+    h.tabs.updates.some(
+      (update) =>
+        update.id === activeTab.id && update.properties.active === false,
+    ),
+  ).toBe(false);
+  expect(h.tabs.snapshot(activeTab.id!)?.active).toBe(true);
+  expect(h.tabs.removed).not.toContain(activeTab.id);
+  expect(internals.tabLedgerCache[String(activeTab.id)]?.ceded).toBe(true);
+  // Never silently deleted: an unledgered duplicate is retained, never
+  // routed through closeOwnedTab's materialization-reconcile bypass
+  // (which needs no birth record at all) just because its URL matches.
+  expect(h.tabs.removed).not.toContain(duplicateTab.id);
+  expect(h.tabs.snapshot(duplicateTab.id!)).toBeDefined();
 });

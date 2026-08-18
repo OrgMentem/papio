@@ -176,6 +176,14 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
+- **A browser-authorized tab close that raced an extension restart now
+  completes instead of stranding the tab.** The daemon's handshake
+  acknowledgement to a holder session now carries its live holder
+  generation (`hello_ack.browser_holder_generation`), so an extension that
+  restarted after persisting a close authorization can replay that close
+  the moment the handshake lands, rather than waiting on state that only
+  arrived through a later materialization — which on a quiet profile meant
+  never.
 - **Sending a PDF from your browser no longer refuses every time.** The daemon
   required a capability the extension never claimed, so every **Send PDF** was
   turned down as though the extension were out of date, in every browser. The

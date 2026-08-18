@@ -1257,6 +1257,15 @@ type HelloAckPayload struct {
 	// requests such as pdf_grab_request. Absent means "holder": an older daemon
 	// only ever acknowledged the holder, so its silence is not ambiguous.
 	Role string `json:"role,omitempty"`
+	// BrowserHolderGeneration is the current browser_holder_generation fence,
+	// present only when Role is "holder" (or absent, meaning holder): a
+	// pending session was not minted this browser's current generation and
+	// must not present one. Lets a holder session request/replay a persisted
+	// close-tombstone's authorization as soon as it connects, without first
+	// needing an unrelated claim/materialization round trip to learn the
+	// generation — the daemon's own fence in surface_close_request and every
+	// other generation-carrying request still rejects a wrong value as stale.
+	BrowserHolderGeneration *int64 `json:"browser_holder_generation,omitempty"`
 }
 
 // PageAcquirePayload asks the daemon to queue the paper identified on the

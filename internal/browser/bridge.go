@@ -1257,12 +1257,17 @@ func (b *Bridge) prunePending(now time.Time) {
 // and it can only know they exist from the feature list carried here.
 // The caller holds b.mu.
 func (b *Bridge) helloAck(role string) (json.RawMessage, error) {
-	return b.frame(protocol.MsgHelloAck, "", protocol.HelloAckPayload{
+	payload := protocol.HelloAckPayload{
 		DaemonVersion:   b.Version,
 		Features:        b.Features,
 		ResolverOrigins: b.cfg.ResolverOrigins(),
 		Role:            role,
-	})
+	}
+	if role == sessionRoleHolder {
+		generation := b.epoch
+		payload.BrowserHolderGeneration = &generation
+	}
+	return b.frame(protocol.MsgHelloAck, "", payload)
 }
 
 func institutionalMaterializationMessage(msgType string) bool {

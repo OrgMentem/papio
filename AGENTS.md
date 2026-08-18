@@ -396,8 +396,15 @@ There is also a link check, because `zensical build` prints a broken link as an
   `user_version` bumps above, but now only one site — the second assertion
   (`TestHelloAckFeatureCapReservesMandatoryFeatures`, whose slice bound was arithmetic on the
   mandatory-feature count) is gone along with the dead caller-supplied `features` seam it
-  covered. The fail-closed 32-feature bound now lives only in `internal/protocol` and
-  `extension/src/protocol.ts`; do not reintroduce a second copy in the bridge.
+  covered. The daemon's emitted feature list stays fail-closed at exactly 32
+  (`internal/browser/bridge.go`'s `required` literal and
+  `internal/protocol/protocol.go`'s `HelloAckPayload.validate` decode-side cap — one
+  constant on that side). `extension/src/protocol.ts`'s accept-side bound
+  (`HELLO_ACK_FEATURES_ACCEPT_CAP`) is deliberately wider (64): a mixed-version
+  migration's stage 1, so a currently-shipped extension does not fail closed the
+  instant a newer daemon advertises feature 33. Do not raise the daemon's emitted
+  cap past 32 until an accepting extension has shipped, and do not reintroduce a
+  second copy of either bound in the bridge.
 - **Never `await` a correlated request from inside an inbound-frame handler.**
   `background.ts` serializes inbound native frames through one chain
   (`enqueueInbound`/`onInbound`); a correlated reply can only arrive *through that same
