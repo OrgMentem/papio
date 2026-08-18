@@ -20,7 +20,11 @@ authenticated in one tab. The operator's directive: *papio* owns the full
 lifecycle of every surface it creates; a tab is ceded to the user only when
 *papio* asks for user action (rare by design) or the user takes the tab over.
 
-## Corrected audit (rev 1 → reviewers → oracle; lines re-verified at HEAD 2026-08-18)
+## Corrected audit (rev 1 → reviewers → oracle; lines verified pre-Slice-0, 2026-08-18)
+
+Items 3, 5 (ledger erasure), and 6 (wake ordering, missing online signal)
+describe the tree BEFORE Slice 0 shipped (`b550a9d` + its review-fix commit)
+and are annotated below; the rest still describes HEAD.
 
 1. **Automated drives leave one tab per auth wall — and the drive limit is
    not a surface limit.** `HANDOFF_DRIVE_LIMIT = 1` caps tabs that may
@@ -43,7 +47,8 @@ lifecycle of every surface it creates; a tab is ceded to the user only when
    (`openFreshHandoff` deletes `offerURLs` at materialization, 6023).
    The fix is a daemon claim-resolution transition, **not** a broad
    "session evidence redrives every auth tab" sweep.
-3. **A separate sign-in multiplier: the jobless fallback.**
+3. **A separate sign-in multiplier: the jobless fallback** *(fixed in
+   Slice 0: ledger reuse for jobless sign-in opens)*.
    `requestSessionSignIn` falls back to `openManagedTab` without a `jobId`
    (2717-2823; `openManagedTab` calls at 2786, 2814 carry no `jobId`), and
    ledger scanning/reuse runs only under
@@ -61,21 +66,24 @@ lifecycle of every surface it creates; a tab is ceded to the user only when
    `onInbound` awaits only storage hydration (4747-4764) — native offers can
    materialize mid-adoption. There is a crash gap between `tabs.create` and
    `foldIntoHandoffGroup` that leaves an ungrouped tab.
-5. **Ordinary navigation erases ownership evidence.** `ledgerManagedTab`
+5. **Ordinary navigation erases ownership evidence** *(erasure fixed in
+   Slice 0: navigated entries are retained but surfaced nowhere — by URL
+   alone they are indistinguishable from a recycled tab id, so identity
+   proof waits for Slice 2)*. `ledgerManagedTab`
    records the creation URL (3470-3497); after the resolver→SSO→provider
-   redirect chain, `classifyLedgeredTabs` sees a URL mismatch and **deletes
-   the ledger record** (3540-3574). Reconciliation then closes zero by design
+   redirect chain, `classifyLedgeredTabs` used to see a URL mismatch and
+   **delete the ledger record**. Reconciliation then closes zero by design
    (`reconcileOwnedTabs` 3594-3597) while startup schedules it as cleanup
    (4853-4855).
    `closeOwnedTab` additionally refuses live-job tabs (`findByTab`,
    3356-3365) and recognizes only the single remembered group ID despite the
    group code keeping one group per window. The timeout callback fires
    `closeOwnedTab(tabID, "timeout")` without awaiting it (4224-4225).
-6. **Wake releases before it probes.** `onKeepaliveAlarm` awaits
-   `releaseExpiredQueuedHandoffs` first (10057), then fires the deliberately
-   non-awaited keepalive probe (10065) and reconnects; the 45s fallback
-   release (11364) explicitly bypasses release-grade evidence for its forced
-   job (11483-11487). No
+6. **Wake releases before it probes** *(fixed in Slice 0: probe kicks off
+   first, releases run only on a connected wake with `navigator.onLine`;
+   the 45s evidence bypass is refused for institutional auth work while the
+   gate is closed — with the gate open it remains ADR-0009-ratified
+   behavior until Slice 3 retires the timer)*. No
    online/probe/navigation-error signal exists anywhere in the background;
    an error document flows into generic auth detection. `classifyRetries`
    is a worker-local Map — MV3 restart resets exhaustion (14826-14829).
@@ -198,14 +206,25 @@ never widened.
 
 ### Slice 0 — containment (extension-only; stops new litter now)
 
-**SHIPPED 2026-08-18.** Feature gate `institutional_authentication_claim_v1`
-(extension-side check only; the daemon defines it in Slice 3), `BridgeDeps.
-online` seam, gates at every autonomous entry (offer tail, fresh-link
-cold/recovery, legacy recovery, drive-queue create, startup reopen/requeue,
-45s release, forced release, opportunistic drain, claim-resume auto-drive),
-probe-before-release wake ordering, ledger retention on navigation
-(surfaced nowhere until Slice 2 identity), jobless sign-in tab reuse.
-Pinned by the "Slice 0:" test block in `extension/test/background.test.ts`.
+**SHIPPED 2026-08-18** (`b550a9d` + review-fix commit; three-reviewer round
+applied). Feature gate `institutional_authentication_claim_v1`
+(extension-side check only; the daemon defines it in Slice 3) — open only
+with a **current** hello on the live port, holder role, the feature, and a
+`navigator.onLine` snapshot (`BridgeDeps.online`; a true probe/lease is
+Slice 5 follow-on work, so "online" here is a hint, not proof). Gates at
+every autonomous entry: offer tail, fresh-link cold/recovery, legacy
+recovery, drive-queue create (operator-flagged requests exempt), startup
+reopen/requeue, 45s release, forced release, opportunistic drain,
+claim-resume auto-drive, stale-IdP recovery when its tracked tab is gone.
+Probe-before-release wake ordering; ledger retention on navigation
+(surfaced nowhere until Slice 2 identity); jobless sign-in tab reuse (known
+limit: a recycled tab id parked on an IdP page can be wrongly focused —
+browser-restart identity is Slice 2). Legacy engagement parks keep their
+offer URL, survive hydration, and open via the forced queued release;
+fresh parks mint. Pinned by the "Slice 0:" test block in
+`extension/test/background.test.ts`. The AUTH_CLAIM-negotiating tests pin
+the LEGACY gate-open machinery and are deletion-manifest entries for
+Slices 3/4.
 
 The smallest slice with most operator value; no aggressive cleanup.
 
@@ -224,9 +243,12 @@ The smallest slice with most operator value; no aggressive cleanup.
   URL-ledger records never authorize auto-closing remote content.
 - The jobless `requestSessionSignIn` fallback reuses a live ledger-owned
   sign-in tab instead of minting another.
-- Auto-close only an inactive, unengaged, self-identifying materialization
-  scaffold whose exact binding has positive daemon detach/terminal/reconcile
-  authority. Everything else is retained.
+- Slice 0 adds **no new close paths** (the AST close-allowlist is
+  untouched). The pre-existing timeout/cancel close of an inactive ledgered
+  in-surface tab — which can remove navigated non-PDF remote content on a
+  legacy URL ledger record — remains until Slice 2's close transaction
+  replaces it; scaffold-only, daemon-authorized closure is a Slice 2
+  deliverable, not a shipped Slice 0 property.
 
 ### Slice 1 — harness seams (test code)
 

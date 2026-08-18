@@ -2316,6 +2316,12 @@ test("Slice 0: a warm legacy requires-auth offer parks for engagement without th
   h.clock.now += 60_000;
   await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
   expect(h.tabs.created).toEqual([]);
+
+  // The operator's explicit open drives the RETAINED legacy URL — it must
+  // not dead-end in openFreshHandoff (missing_claim) on an old daemon.
+  const opened = await h.bridge.openHandoff("job_gate_warm_legacy");
+  expect(opened.ok).toBe(true);
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
 });
 
 test("Slice 0: a warm fresh-link requires-auth offer stays tabless without the claim feature", async () => {
@@ -2386,6 +2392,22 @@ test("Slice 0: an offline wake releases nothing; the next online wake releases",
   });
   let online = false;
   h.deps.online = () => online;
+  // Pins probe-before-release ordering: onWake must observe zero created
+  // tabs on every wake, including the online one that releases below.
+  const tabsSeenAtWake: number[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteResolverActivated: () => {},
+    markDirty: async () => {},
+    probeForeground: async () => {},
+    probeOriginAutomatically: async () => {},
+    notifyConfiguredOriginsChanged: () => {},
+    noteResolverNavigation: () => {},
+    noteTabRemoved: () => {},
+    onWake: async () => {
+      tabsSeenAtWake.push(h.tabs.created.length);
+    },
+  } as unknown as KeepaliveManager);
 
   await h.bridge.start();
   await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
@@ -2402,6 +2424,150 @@ test("Slice 0: an offline wake releases nothing; the next online wake releases",
   await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
   // The bounded fallback release deliberately surfaces auth work (active).
   expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+  expect(tabsSeenAtWake).toEqual([0, 0]);
+});
+
+test("Slice 0: a legacy engagement park keeps its offer URL across a worker restart", async () => {
+  const first = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  const offer = jobOffer("job_gate_legacy_restart") as {
+    payload: Record<string, unknown>;
+  };
+  offer.payload["requires_auth"] = true;
+  await first.bridge.start();
+  await first.port.inbound(helloAck());
+  await first.port.inbound(offer);
+  expect(first.backend.store.offerURLs?.["job_gate_legacy_restart"]).toBe(
+    OPENURL,
+  );
+
+  const restarted = makeHarness(
+    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+  );
+  await restarted.bridge.start();
+  await restarted.port.inbound(helloAck());
+  // The retained legacy URL is the operator's only open path against an old
+  // daemon; hydration must not strip it (only minted fresh links die).
+  expect(restarted.backend.store.offerURLs?.["job_gate_legacy_restart"]).toBe(
+    OPENURL,
+  );
+  const opened = await restarted.bridge.openHandoff("job_gate_legacy_restart");
+  expect(opened.ok).toBe(true);
+  expect(restarted.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+});
+
+test("Slice 0: hydration still drops a persisted minted fresh link", async () => {
+  const jobID = "job_gate_fresh_restart";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 9_999_999_999_999,
+        status: "queued",
+        requires_auth: true,
+        engagement_required: true,
+        fresh_handoff: true,
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: { [jobID]: "https://resolver.example.edu/minted?one-use=1" },
+  });
+  await h.bridge.start();
+  expect(h.backend.store.offerURLs?.[jobID]).toBeUndefined();
+});
+
+test("Slice 0: an operator open of a tabless legacy job bypasses the drive gate", async () => {
+  const jobID = "job_gate_operator_open";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 9_999_999_999_999,
+        status: "accepted",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: { [jobID]: OPENURL },
+  });
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  const opened = await h.bridge.openHandoff(jobID);
+  expect(opened.ok).toBe(true);
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+});
+
+test("Slice 0: a port disconnect closes the gate despite negotiated features", async () => {
+  const jobID = "job_gate_disconnect";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 9_999_999_999_999,
+        status: "queued",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: { [jobID]: OPENURL },
+  });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
+  await h.port.emitDisconnect();
+  // Fresh session evidence arriving in the reconnect gap must not spend the
+  // stale feature list on creating a sign-in surface with no daemon.
+  await h.bridge.recordFreshSessionEvidence(
+    freshEvidence(h, "https://resolver.example.edu"),
+  );
+  expect(h.tabs.created).toEqual([]);
+});
+
+test("Slice 0: a stale-IdP recovery with a dead tab parks instead of minting", async () => {
+  const jobID = "job_gate_stale_redrive";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: 777,
+        offered_at: 1,
+        expires_at: 9_999_999_999_999,
+        status: "auth_pending",
+        requires_auth: true,
+        access_mode: "delegated",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+    offerURLs: { [jobID]: OPENURL },
+  });
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  const job = h.backend.store.activeJobs[0];
+  const internals = h.bridge as unknown as {
+    redriveStaleHandoff(job: unknown, epoch: number): Promise<boolean>;
+  };
+  // Tab 777 was never seeded: the tracked tab is gone, so this autonomous
+  // recovery would CREATE a replacement sign-in surface. Gate closed ⇒ park.
+  expect(await internals.redriveStaleHandoff(job, 0)).toBe(false);
+  expect(h.tabs.created).toEqual([]);
+  expect(
+    h.backend.store.activeJobs.find((candidate) => candidate.job_id === jobID),
+  ).toMatchObject({
+    tab_id: -1,
+    status: "queued",
+    engagement_required: true,
+  });
 });
 
 test("Slice 0: claim retirement without the claim feature parks the tabless waiter for engagement", async () => {

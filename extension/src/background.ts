@@ -1157,6 +1157,10 @@ interface QueuedHandoffDrive {
   purpose: ManagedTabPurpose;
   surfaceFallback?: boolean;
   focusExisting?: boolean;
+  /** An explicit operator gesture (inbox open, popup retry) queued only for
+   * a governor/effect slot. The Slice 0 containment gate never converts an
+   * operator request into an engagement park. */
+  operator?: boolean;
 }
 
 interface HandoffDrive {
@@ -2893,6 +2897,7 @@ export class Bridge {
         jobID,
         purpose: "redrive",
         focusExisting: false,
+        operator: true,
       });
       await this.drainHandoffDriveQueue();
       return { ok: true, opened: true };
@@ -2924,6 +2929,7 @@ export class Bridge {
         jobID,
         purpose: "redrive",
         focusExisting: false,
+        operator: true,
       });
       this.authStalledReported.delete(jobID);
       this.stalledAuthHandoffs.delete(jobID);
@@ -2937,6 +2943,7 @@ export class Bridge {
         jobID,
         purpose: "redrive",
         focusExisting: false,
+        operator: true,
       });
       await this.drainHandoffDriveQueue();
       return { ok: true, opened: true };
@@ -4308,6 +4315,8 @@ export class Bridge {
       if (
         tabID === undefined &&
         job.requires_auth === true &&
+        request.operator !== true &&
+        request.purpose !== "inbox-open" &&
         !this.institutionalAuthGateOpen()
       ) {
         // Slice 0 containment: a drive-queue entry with no live tab would
@@ -4745,8 +4754,13 @@ export class Bridge {
         }
         if (
           restored.requires_auth === true &&
-          restored.engagement_required === true
+          restored.engagement_required === true &&
+          restored.fresh_handoff === true
         ) {
+          // A minted fresh link is a one-call capability and must never
+          // survive a restart. A LEGACY engagement park (no fresh_handoff)
+          // keeps its offer URL: it is the only route the operator's
+          // explicit open has against a daemon without fresh links.
           delete persistedOffers[jobID];
           continue;
         }
@@ -6215,7 +6229,14 @@ export class Bridge {
           );
     }
     if (job.requires_auth === true && job.engagement_required === true) {
-      return this.openFreshHandoff(jobID, job);
+      // A Slice 0 legacy park retains its offer URL (the offer predates
+      // fresh links or carried no institution identity); the operator's
+      // open drives that URL through the forced queued release below —
+      // openFreshHandoff would dead-end on missing_claim/feature. Fresh
+      // parks have no retained URL and mint a new route.
+      if (!this.offerURLs.has(jobID)) {
+        return this.openFreshHandoff(jobID, job);
+      }
     }
     if (!this.offerURLs.has(jobID)) {
       return failure(
@@ -6561,16 +6582,23 @@ export class Bridge {
   }
 
   /** Slice 0 containment gate (dev/active/surface-lifecycle-plan.md): an
-   * autonomous `requires_auth` surface needs the daemon-side authentication
-   * claim feature (ADR-0022 Phase 4) AND a live network. While the gate is
-   * closed — every shipped daemon today — institutional work parks tabless
-   * as engagement_required; the operator's explicit open (inbox click,
-   * popup retry) is the only path to a sign-in surface. */
+   * autonomous `requires_auth` surface needs a live daemon session that is
+   * the holder AND advertises the authentication-claim feature (ADR-0022
+   * Phase 4) AND a live network. hasCurrentHello() ties the negotiated
+   * features to the CURRENT port: a disconnected worker's stale feature
+   * list must not authorize surface creation during the reconnect gap, and
+   * a pending (non-holder) session must not act on another browser's queue.
+   * While the gate is closed — every shipped daemon today — institutional
+   * work parks tabless as engagement_required; the operator's explicit open
+   * (inbox click, popup retry) is the only path to a sign-in surface. */
   private institutionalAuthGateOpen(): boolean {
     return (
+      this.hasCurrentHello() &&
+      this.holderRole() &&
       (this.store.daemonFeatures ?? []).includes(
         AUTHENTICATION_CLAIM_FEATURE,
-      ) && (this.deps.online?.() ?? true)
+      ) &&
+      (this.deps.online?.() ?? true)
     );
   }
 
@@ -14284,6 +14312,30 @@ export class Bridge {
     this.staleRecoveryAttemptedEpochs.set(job.job_id, recoveryEpoch);
     this.staleRecoveryInFlightEpochs.set(job.job_id, recoveryEpoch);
     try {
+      if (!this.institutionalAuthGateOpen()) {
+        let live = false;
+        try {
+          const tab = await this.deps.tabs.get(job.tab_id);
+          live = tab.id === job.tab_id;
+        } catch {
+          live = false;
+        }
+        if (!live) {
+          // Slice 0 containment: with the tracked tab gone this recovery
+          // would CREATE a replacement sign-in surface (and charge an auth
+          // attempt for it). Park for explicit engagement instead; the
+          // retained offer URL keeps the operator's open usable.
+          await this.update((s) =>
+            patchJob(s, job.job_id, {
+              tab_id: -1,
+              status: "queued",
+              engagement_required: true,
+              parked_with_tab: false,
+            }),
+          );
+          return false;
+        }
+      }
       if (this.authAttemptsFor(job.job_id) >= MAX_AUTH_ATTEMPTS) {
         this.rememberStalledAuthHandoff(job.job_id, {
           url: openurl,
