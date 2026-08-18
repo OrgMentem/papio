@@ -588,6 +588,26 @@ Manage captured PDF grabs
 papio grabs
 ```
 
+### `papio grabs binds`
+
+List captures papio filed automatically, without asking
+
+List captures papio bound to a pending job on its own, newest first.
+
+papio only does this when a settled, DOI-less capture qualifies exactly one
+pending job; everything else still parks for a human. Because there is no
+unbind command, this listing — the rule version, how many candidates were on
+the table, and the evidence that made one of them the winner — is the only
+way to check an automatic filing after the fact.
+
+```
+papio grabs binds [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--limit` | `int` | `50` | maximum autonomous binds to list (default 50, max 200) |
+
 ### `papio grabs identify`
 
 Bind an operator-supplied identifier to a captured PDF grab
@@ -1042,6 +1062,31 @@ papio zotio apply <plan-id> [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--confirm-sha256` | `string` |  | Exact confirmation SHA-256 printed by `papio zotio plan` |
+
+### `papio zotio import-backfill`
+
+Backfill stranded ready papers into Zotero (dry-run by default)
+
+Deliver validated ready jobs whose Zotero import never succeeded.
+
+Dry-run is the default: the command reports what it would import, which
+papers are already owned (and would be marked duplicate), and which are
+expected to fail (for example bundle validation on an empty title). Pass
+--apply to write to your library.
+
+Jobs submitted without policy.auto_import are excluded unless you pass
+--include-not-requested, because importing them was never requested.
+
+```
+papio zotio import-backfill [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--apply` | `bool` | `false` | apply imports to the configured Zotero library (default is dry-run) |
+| `--cursor` | `string` |  | resume after the cursor returned by a previous invocation |
+| `--include-not-requested` | `bool` | `false` | include ready jobs that did not request policy.auto_import |
+| `--limit` | `int` | `50` | maximum jobs per invocation (1-50) |
 
 ### `papio zotio plan`
 

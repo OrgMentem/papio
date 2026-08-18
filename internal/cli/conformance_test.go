@@ -112,6 +112,7 @@ var commandClassification = map[string]commandClass{
 	"papio jobs":                       {kind: kindNone},
 	"papio grabs":                      {kind: kindNone},
 	"papio grabs identify":             {kind: kindStructured, args: []string{"grab_01", "--doi", "10.1000/conformance"}, rpcMethods: []string{"grabs.identify"}},
+	"papio grabs binds":                {kind: kindEnvelope, rowKey: "binds", rpcMethods: []string{"grabs.binds"}},
 	"papio activity":                   {kind: kindEnvelope, rowKey: "entries", rpcMethods: []string{"activity.list"}},
 	"papio failures":                   {kind: kindEnvelope, rowKey: "failures", rpcMethods: []string{"failures.list_v1"}},
 	"papio jobs list":                  {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.list_v3", "jobs.list_v2", "jobs.list"}},

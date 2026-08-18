@@ -289,3 +289,76 @@ captures, so the repair would discard a paper instead of filing it. No migration
 may guess which of two captures is the real one; `papio doctor`'s
 `capture_uniqueness` check names the condition and the remedy instead.
 
+### Amended again, 2026-08-18: autonomous binding is enabled, overriding the 2026-08-16 blocking set
+
+**Autonomous binding is switched back on** (`autoBindDecisionEnabled = true`),
+on the operator's decision, at rule version `candidate_auto_bind/3`. A settled
+DOI-less grab that qualifies exactly one pending job is filed automatically;
+everything else parks exactly as before.
+
+This amendment **overrides** rather than satisfies the blocking set the
+2026-08-16 amendment laid down for `/2`, and the honest accounting matters more
+than the decision. Of the six items that amendment required:
+
+| required for `/2` | status at `/3` |
+|---|---|
+| durable claim so two grabs cannot bind one job | **satisfied** — in-transaction fence, `ErrFenceRejected` |
+| gate asserting *observed* traversal, not declared labels | **satisfied** — `CandidateQualification.Reached` is recorded during the traversal |
+| self-identification rather than corroboration | **partly** — the metadata arm is genuine self-identification; the text arm still corroborates |
+| one parsed front-matter assertion, abstain on unknown layouts | **not built** — `dev/active/structural-front-matter-parser.md`, ungated |
+| exact daemon-minted delivery lease naming job and action | **not applicable** — that requirement belongs to the human picker path, which shipped with its own binding; an autonomous decision has no human choice to authenticate |
+| backlog replay with full candidate pools | **cannot run** — the replay arm builds zero pools, because 318 of the operator's eligible jobs carry no canonicalizable identifier. It is not deferred; it is unanswerable against this store |
+
+So three of six hold, one is partial, one is void, and one is unanswerable. What
+authorises the change is therefore **not** design completion but measurement
+against the population this path actually serves, plus one structural argument
+about that population:
+
+- A grab exists because a human clicked Send PDF **with the document open in
+  front of them**. The wrong-kind-of-document families that no predicate catches
+  reliably — supplements, cover sheets, obvious errata — are excluded by the
+  person, before any rule runs. That is what makes the operator's own library a
+  representative sample of this path rather than a convenient one, and it is the
+  argument the 2026-08-16 amendment did not have available, because it was
+  reasoning about bytes in general.
+- Over ~9,800 trials at pool sizes 2/5/10/25 across the random, same-author,
+  same-year, title-superset and same-venue-year arms: **zero wrong binds**,
+  per-document one-sided 95% bound **0.94%**, **65 of 318** documents (20.4%)
+  correctly bound — above the 10% viability floor. Pool size is not a risk axis:
+  N=2 and N=25 are identical, because a randomly drawn distractor essentially
+  never clears title AND author AND year together.
+- `candidate_auto_bind/3` added embedded-metadata corroboration, which raised
+  correct binds from 44 to 65 on the same corpus. Metadata cannot be reached by a
+  reference list, so it carries the attribution the text arm can only approximate.
+
+**The residual risk is named, not bounded.** The "conjunction" family — a
+document printing another work's title, authors, year AND identifier with no
+correction word — is bound wrongly 311 times out of 311 in the measurement's
+synthetic arm. Adversarial review found real instances (an Oxford Academic
+Editor's Note, an eNeuro "See related article" commentary) and both phrases are
+now `correctionMarkers`, so labelled instances park. **An unlabelled instance
+remains a live wrong-accept path**, and no vocabulary closes it — only the
+structural parser does. This is a deliberate exposure, accepted with the
+measurement above, and it is the reason the structural parser stays the plan of
+record rather than being dropped as superseded.
+
+Two operational gaps are recorded because they bound the decision's reversibility:
+
+1. **There is no unbind.** `papio grabs identify` binds a parked grab; nothing
+   reverses a bind. A wrong autonomous filing is corrected by hand, in Zotero and
+   in the job, today.
+2. Provenance was written and never surfaced. Because an irreversible automatic
+   decision with no audit surface is not reviewable at all, `papio grabs binds`
+   ships with this change: it lists what the machine decided, newest first, with
+   the rule version, the candidates considered and the winner's evidence. That
+   listing is the operator's only recourse until an unbind exists, and it is also
+   how the 20.4% and the zero-wrong-binds figures get re-tested against real
+   captures rather than a library replay.
+
+Narrows by number: **Decision 4** — a grab with no identifier parks — now parks
+only when the autonomous decision abstains. The 2026-08-16 amendment's sentence
+"Autonomous binding is switched off" no longer describes the code; it is retained
+above as the record of why it was off and of what was found unsafe, all of which
+remains true.
+
+

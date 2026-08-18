@@ -26,10 +26,34 @@ execution records kept during the initial build.
   Subject or Title, which anyone can fill with anything. It corroborates and
   never decides alone — title, authors and year must still agree, which is what
   keeps a supplementary-materials file, whose metadata carries its parent
-  article's DOI, from being filed as the article. Automatic filing itself stays
-  switched off pending measurement, so today this makes the evidence better
-  rather than changing what happens to your captures.
-- **A captured PDF without a front-matter DOI parks for you to identify, as before.** Automatic binding — filing such a capture against the single pending paper whose title, authors, year and identifier all agreed — was built, measured, and then **withdrawn before release** during review. It read a mention of a paper's identifier as the document identifying itself, so a document that merely *cites* a paper (an erratum, a supplement, a journal expansion printing "Extended from DOI …") could be filed as that paper. That is the one mistake *papio* refuses to make, so the capture parks for human identification instead. The measurement corpus keeps the five documents that demonstrate the failure, so the rule cannot return until it abstains on all of them. What you keep from this work: the popup asks which paper a PDF belongs to at the moment you send it, and the daemon refuses any choice the document's own front matter contradicts.
+  article's DOI, from being filed as the article. Reading it raised the number
+  of captures *papio* can file on its own by half again — see the next entry.
+- **A captured PDF with no DOI on its first page can now be filed automatically,
+  against the one paper you are waiting for that it matches.** You send a PDF;
+  if exactly one pending paper agrees on title, authors, year and identifier,
+  *papio* files it and says so, instead of parking it and asking you which paper
+  it was. Measured against your own library, this handles about **one capture in
+  five**; the other four still park and ask, unchanged. Automatic filing was
+  built earlier, then **withdrawn before release** during review, because it read
+  a *mention* of a paper's identifier as the document identifying itself — so an
+  erratum or a journal expansion printing "Extended from DOI …" could be filed as
+  the paper it merely discusses. What changed is measurement rather than
+  confidence: replaying every paper in your library as if you had just sent it,
+  against pending lists of 2 to 25 papers, produced **no wrong filing in roughly
+  9,800 trials**, and the size of your pending list turns out not to matter at
+  all. One document family is still known to defeat it — an editorial note or
+  commentary that reprints the discussed paper's title, authors, year and DOI
+  with no correction word anywhere. The two real forms of it (an Oxford Academic
+  "Editor's Note", an eNeuro "See related article") are now recognised and park;
+  an unlabelled one would still be filed wrongly, which is why the structural
+  work on front-matter parsing is still planned rather than dropped.
+- **`papio grabs binds` shows you what *papio* filed on its own.** An automatic
+  filing cannot currently be undone — `papio grabs identify` binds a parked
+  capture, but nothing reverses a bind — so the decision record is the only
+  recourse, and until now it was written to the database and never shown. The
+  command lists automatic filings newest first with the rule version, how many
+  pending papers were considered, and the evidence the winning match was made
+  on. Worth a glance after a batch of captures.
 - **`papio doctor` now says how much of today's metered allowance is gone.** A
   daily ceiling that can park a source was enforced with nothing on any surface
   reporting it, so reaching it read as *papio* having stopped working. Doctor

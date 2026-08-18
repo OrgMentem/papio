@@ -172,16 +172,19 @@ func writeLargeFixturePDF(t *testing.T, path string) {
 	}
 }
 
-// enableAutoBindDecision turns the autonomous candidate-binding decision back
-// on for one test.
+// enableAutoBindDecision and disableAutoBindDecision pin the autonomous
+// candidate-binding decision for one test in each direction.
 //
-// The decision is off in every shipped build (see the WHY at the call site in
-// processSettledGrab). The transaction discipline around it — the
-// in-transaction fence, post-commit staging from the validated quarantine
-// copy, deferred-adoption recovery — is not what was found unsafe and is what
-// the rebuilt candidate rule will reuse unchanged, so it must stay under test. A
-// test that needs a bind to happen says so here; every test that does not
-// call this observes production behaviour.
+// The decision is ON in shipped builds as of 2026-08-18 (see the WHY at the call
+// site in processSettledGrab for the measurement that authorised it), so
+// enableAutoBindDecision now states an expectation that already holds rather
+// than overriding production. It is kept, and kept explicit, because a test that
+// needs a bind to happen should say so at the top instead of depending on a
+// package-level default it does not name — that dependency is exactly what made
+// flipping the default a test-editing exercise.
+//
+// disableAutoBindDecision is for the tests whose subject IS the gate: that
+// nothing binds when the decision is off, and that the snapshot records it.
 func enableAutoBindDecision(t *testing.T) {
 	t.Helper()
 	prev := autoBindDecisionEnabled
@@ -189,12 +192,25 @@ func enableAutoBindDecision(t *testing.T) {
 	t.Cleanup(func() { autoBindDecisionEnabled = prev })
 }
 
-func TestSettledGrabUniqueQualifyingCandidateParks(t *testing.T) {
-	// 1. A settled grab whose text uniquely qualifies exactly one
-	// candidate-eligible job STILL PARKS. The predicate reads a page-one
-	// occurrence of the candidate's identifier as the document identifying
-	// itself, which a citation satisfies just as well as a self-identifier,
-	// so no autonomous decision is made: the grab goes to a human.
+func disableAutoBindDecision(t *testing.T) {
+	t.Helper()
+	prev := autoBindDecisionEnabled
+	autoBindDecisionEnabled = false
+	t.Cleanup(func() { autoBindDecisionEnabled = prev })
+}
+
+func TestSettledGrabParksWhenDecisionDisabled(t *testing.T) {
+	// The gate itself: a settled grab whose text uniquely qualifies exactly one
+	// candidate-eligible job parks anyway when the decision is off, and stages
+	// nothing. Its sibling TestSettledGrabBindsUniqueQualifyingCandidateWhenEnabled
+	// asserts the opposite on the same shape, so the pair proves the flag is
+	// what decides and not some incidental property of the fixture.
+	//
+	// This was production behaviour until 2026-08-18 and is retained as the
+	// disable path: an operator-facing off switch would land here (the flag is
+	// still a plain var, see its declaration), and a regression that quietly
+	// ignored the flag would otherwise be invisible.
+	disableAutoBindDecision(t)
 	b, jobs, cfg, _ := newBridge(t)
 	candidateWork := work.Work{
 		Title:   "Quantum Networks Robustness Calibration Measurement",
@@ -435,8 +451,10 @@ func TestSettledGrabEmptyPoolParks(t *testing.T) {
 
 func TestSettledGrabRecordsEligibilitySnapshot(t *testing.T) {
 	// A DOI-less settlement records exactly one event-time pool snapshot with
-	// the candidate membership that existed at park time, even when autonomous
-	// binding is disabled.
+	// the candidate membership that existed at park time. This document matches
+	// neither candidate, so the decision runs, abstains, and parks — the common
+	// production shape now that the decision is on, and the reason the snapshot
+	// must record that the rule ran and declined rather than never having run.
 	b, jobs, cfg, _ := newBridge(t)
 	w1 := work.Work{Title: "Snapshot Pool Alpha", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/snapshot.alpha"}
 	w2 := work.Work{Title: "Snapshot Pool Beta", Authors: []string{"Grace Hopper"}, Year: 2025, DOI: "10.1234/snapshot.beta"}
@@ -481,11 +499,11 @@ func TestSettledGrabRecordsEligibilitySnapshot(t *testing.T) {
 	if snap.PoolSize != 2 || len(snap.Entries) != 2 {
 		t.Fatalf("pool = %+v, want two entries", snap)
 	}
-	if snap.RuleEnabled {
-		t.Fatal("rule_enabled = true, want false with autonomous binding disabled")
+	if !snap.RuleEnabled {
+		t.Fatal("rule_enabled = false, want true: autonomous binding is on in shipped builds")
 	}
-	if snap.AutoBindAttempted || snap.AutoBindOutcome != grab.AutoBindOutcomeNotAttempted() {
-		t.Fatalf("auto_bind metadata = attempted %v outcome %q, want not attempted", snap.AutoBindAttempted, snap.AutoBindOutcome)
+	if !snap.AutoBindAttempted || snap.AutoBindOutcome != grab.AutoBindOutcomeAbstained() {
+		t.Fatalf("auto_bind metadata = attempted %v outcome %q, want attempted and abstained: the rule ran against a pool that matched nothing", snap.AutoBindAttempted, snap.AutoBindOutcome)
 	}
 	if snap.Predicate.Kind != job.CandidateEligibleKind || snap.Predicate.Status != job.CandidateEligibleStatus || snap.Predicate.JobState != job.StateAwaitingHuman {
 		t.Fatalf("predicate = %+v, want frozen manual_download/open/awaiting_human", snap.Predicate)

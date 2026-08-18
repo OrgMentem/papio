@@ -7612,34 +7612,53 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 	// a KNOWN identifier and do not apply here (see pdf.FrontMatterDOIs).
 	dois := pdf.FrontMatterDOIs(report.Text.Excerpt)
 	if len(dois) == 0 {
-		// AUTONOMOUS CANDIDATE BINDING IS DISABLED. A settled DOI-less grab
-		// parks for human identification.
+		// AUTONOMOUS CANDIDATE BINDING IS ENABLED (2026-08-18, operator's
+		// decision). A settled DOI-less grab is bound to the single pending
+		// job it qualifies against, and parks when none does.
 		//
-		// WHY: the acceptance rule's identifier gate treats a page-one
-		// occurrence of the candidate's identifier as the document
-		// identifying ITSELF, and it is not that.
-		// corroboratingIdentifier(identityPageOne(...)) accepts a CITED DOI
-		// exactly as readily as a printed self-identifier. So a journal
-		// expansion of a preprint that prints "Extended from DOI <target>" on
-		// page one corroborates the target, while its own DOI sits past the
-		// 1 KiB blind window the conclusive-identity veto reads — nothing
-		// contradicts, every gate passes, and a DIFFERENT work is filed under
-		// a right citation. That is this project's cardinal failure mode: the
-		// wrong accept is silent and permanent, while the park it replaces
-		// costs one human decision. Until the predicate can tell "this
-		// document is X" from "this document cites X", no autonomous decision
-		// is defensible.
+		// WHY it was off, and what changed. The identifier gate reads a
+		// page-one occurrence of the candidate's identifier as the document
+		// identifying ITSELF, and corroboratingIdentifier accepts a CITED DOI
+		// exactly as readily. So a journal expansion printing "Extended from
+		// DOI <target>" corroborates the target while its own DOI sits past
+		// the 1 KiB blind window — nothing contradicts, every gate passes,
+		// and a DIFFERENT work is filed under a right citation. That is this
+		// project's cardinal failure, silent and permanent, against a park
+		// that costs one human decision.
 		//
-		// The machinery below stays whole and stays reachable. The predicate,
-		// the eligibility pool, the in-transaction fence, the provenance
-		// column and the measurement corpus are the substrate the rebuilt
-		// rule needs, and a rule version change alters the predicate, not the
-		// transaction discipline around it. candidate_auto_bind/3 has since
-		// added embedded-metadata corroboration to the identifier gate — a
-		// source with no attribution ambiguity, since a reference list cannot
-		// reach a file's XMP packet — but the DECISION stays off until the
-		// corpus measures the new predicate: tests set autoBindDecisionEnabled
-		// so the fence, staging and recovery paths keep being exercised.
+		// Two things now bound that risk, and neither is an argument.
+		//
+		// First, measurement against the population this path actually sees.
+		// A grab exists because a researcher clicked Send PDF with the
+		// document open in front of them, so the human has already excluded
+		// the wrong-kind-of-document families (supplements, cover sheets,
+		// obvious errata) that no predicate reliably catches. That is what
+		// makes the operator's own library a representative sample here
+		// rather than a convenient one. Over ~9,800 trials at pool sizes
+		// 2/5/10/25 across the random, same-author, same-year, title-superset
+		// and same-venue-year arms: ZERO wrong binds, per-document one-sided
+		// 95% bound 0.94%, and 65 of 318 documents (20.4%) correctly bound —
+		// above the 10% viability floor. Pool size is not a risk axis: N=2
+		// and N=25 are identical, because a randomly drawn distractor
+		// essentially never clears title AND author AND year.
+		//
+		// Second, the one family that does fail is now named rather than
+		// hypothetical. A document printing another work's title, authors,
+		// year AND identifier with no correction word is bound as that work
+		// 311 times out of 311 in the measurement's synthetic "conjunction"
+		// arm. Adversarial review found real instances — an Oxford Academic
+		// Editor's Note, an eNeuro "See related article" commentary — and
+		// both phrases are now correctionMarkers, so labelled instances park.
+		// An UNLABELLED instance remains the one way this rule can still file
+		// the wrong paper, and no vocabulary closes it; only the structural
+		// work in dev/active/structural-front-matter-parser.md does.
+		//
+		// What makes that survivable rather than reckless: every bind is
+		// committed inside the eligibility fence with a provenance row
+		// recording all candidates in order, each one's verdict, the winner's
+		// evidence, the rule version, and a digest of exactly what the
+		// predicate read — so a wrong bind can be found and reconstructed
+		// afterwards instead of being indistinguishable from a right one.
 		candidates, err := b.jobs.ListCandidateEligibleJobs(ctx)
 		if err != nil {
 			return err
@@ -7682,14 +7701,19 @@ func logAbnormalEligibilityPoolSize(grabID string, poolSize int) {
 	}
 }
 
-// autoBindDecisionEnabled gates the autonomous candidate-binding decision. It
-// is false in every shipped build — see the WHY at the call site in
-// processSettledGrab — and only the package's own tests set it, so the /2
-// substrate stays under test while no operator's library can be corrupted by
-// it. It is a plain var rather than a config knob on purpose: this is not an
-// operator preference, and an unsafe rule must not be switchable back on from
-// a TOML file.
-var autoBindDecisionEnabled = false
+// autoBindDecisionEnabled gates the autonomous candidate-binding decision — see
+// the WHY at the call site in processSettledGrab for the measurement that
+// authorised turning it on, and for the one failure family it does not close.
+//
+// It stays a plain var rather than a config knob. The original reason was that
+// an unsafe rule must not be switchable back ON from a TOML file; the reason it
+// is still not config is the mirror of that, and weaker: nobody has asked for an
+// off switch, and a `[browser]` field cannot be added without the strict-config
+// deploy dance (AGENTS.md). If an operator ever needs to disable this without a
+// rebuild, that is the change to make, and it is a config addition rather than a
+// new mechanism. Tests flip it in both directions through the helpers in
+// grab_autobind_test.go, so both paths stay exercised.
+var autoBindDecisionEnabled = true
 
 // attemptAutoBind runs the candidate-binding decision for one settled DOI-less
 // grab and, on success, stages and ingests its validated bytes. It reports
@@ -8132,6 +8156,21 @@ func (b *Bridge) IdentifyGrab(ctx context.Context, grabID, kind, raw string) Gra
 	}
 	result.Outcome = "job_created"
 	return result
+}
+
+// AutonomousBinds forwards to the grab store's grabs.binds audit query. It
+// exists because Bridge is the only place that holds the *grab.Service —
+// bootstrap.System has no field for it — the same reason IdentifyGrab, just
+// above, is the entry point api.identifyGrab calls rather than the api
+// package reaching into internal/grab on its own. b.grabs unset (PDF grabs
+// not configured) reports no binds rather than an error: an operator asking
+// what a machine has filed on an install with grabs off should see "none",
+// not a fault.
+func (b *Bridge) AutonomousBinds(ctx context.Context, limit int) ([]grab.BindRecord, error) {
+	if b == nil || b.grabs == nil {
+		return nil, nil
+	}
+	return b.grabs.ListAutonomousBinds(ctx, limit)
 }
 
 // copyFile streams src into a freshly created dst. Unlike copyHashed

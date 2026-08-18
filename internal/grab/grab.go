@@ -469,6 +469,20 @@ func nullable(s string) any {
 	return s
 }
 
+// BindRecord names one grab an automatic candidate bind filed: the grab that
+// captured it, the job it was filed under, when the bind committed, and the
+// full BindProvenance that justified the decision. It exists because a
+// candidate auto-bind is currently irreversible — there is no unbind command
+// — so this tuple, surfaced by ListAutonomousBinds, is the only way an
+// operator has to find such a filing after the fact and re-read the decision
+// that produced it.
+type BindRecord struct {
+	GrabID     string
+	JobID      string
+	BoundAt    time.Time
+	Provenance BindProvenance
+}
+
 // MarkBoundToJobFenced binds a settled grab to an existing job and records the
 // provenance of that decision in the same transaction as the state change.
 //
@@ -549,6 +563,67 @@ func (s *Service) MarkBoundToJobFenced(ctx context.Context, id, jobID, outcome s
 		return err
 	}
 	return tx.Commit()
+}
+
+// ListAutonomousBinds returns the grabs an automatic candidate bind filed,
+// newest first, for the audit surface behind the grabs.binds RPC. It exists
+// because autoBindDecisionEnabled files jobs with nobody in the loop and
+// there is no unbind command to reverse one: this is the only way an
+// operator can find which filings a machine made and re-read the provenance
+// that justified each one.
+//
+// bound_at is read off updated_at rather than a dedicated column: pdf_grabs
+// has none, and MarkBoundToJobFenced sets updated_at in the exact UPDATE
+// that writes bind_provenance and transitions the row to job_created, so the
+// two are the same instant by construction.
+//
+// limit bounds the SQL fetch directly and is not itself clamped here — the
+// grabs.binds handler owns the default/hard-cap policy, and a caller wanting
+// to detect truncation passes one more row than it intends to keep and
+// compares the returned length, the same "may be more, not a proof"
+// approximation agentjson.Capped documents.
+//
+// A row is included only when its stored provenance parses and names method
+// candidate_auto_bind — a human identify (grabs.identify) writes no
+// provenance at all, so the WHERE clause already excludes it, but a
+// provenance column can in principle record other methods later. A row
+// whose provenance JSON fails to parse is a defect the operator needs told
+// about, not one an audit listing should quietly hide, so that case returns
+// an error instead of skipping the row (contrast BoundByRule, which counts
+// unreadable rows because a rule audit is not this audit's job).
+func (s *Service) ListAutonomousBinds(ctx context.Context, limit int) ([]BindRecord, error) {
+	rows, err := s.store.DB().QueryContext(ctx, `
+		SELECT id, COALESCE(job_id, ''), updated_at, bind_provenance FROM pdf_grabs
+		WHERE bind_provenance IS NOT NULL AND bind_provenance != ''
+		ORDER BY updated_at DESC, id DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BindRecord
+	for rows.Next() {
+		var id, jobID, updatedAt, raw string
+		if err := rows.Scan(&id, &jobID, &updatedAt, &raw); err != nil {
+			return nil, err
+		}
+		var prov BindProvenance
+		if err := json.Unmarshal([]byte(raw), &prov); err != nil {
+			return nil, fmt.Errorf("grab %s: unreadable bind provenance: %w", id, err)
+		}
+		if prov.Method != "candidate_auto_bind" {
+			continue
+		}
+		boundAt, err := time.Parse(time.RFC3339Nano, updatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("grab %s: unreadable bind timestamp: %w", id, err)
+		}
+		out = append(out, BindRecord{GrabID: id, JobID: jobID, BoundAt: boundAt, Provenance: prov})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // RuleBind names one grab that was bound under a particular rule version and

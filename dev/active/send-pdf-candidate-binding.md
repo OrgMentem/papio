@@ -1,15 +1,31 @@
 # Send PDF without the inbox "Open" step: candidate binding for DOI-less PDFs
 
-Status: **Phase 3 DISABLED 2026-08-16 after a fourth review round (pro-tier
-oracle, verdict NEEDS REVISION).** Phases 1–2 stand: the popup picker replaced
-the inbox pin, and the conclusive-identity veto holds. Autonomous binding does
-not run — a settled DOI-less grab parks for human identification again, as it
-did before this work. The machinery (predicate, eligibility pool, transaction
-fence, `pdf_grabs.bind_provenance`, migration 0037 / schema 37, corpus and
-gate) all stay in tree for the `candidate_auto_bind/2` rebuild; only the
-automatic decision is switched off. Phase 4 (ranked one-click confirm) remains
-unbuilt and is now moot until `/2` exists. See "Round 4: why Phase 3 was
-disabled" below for the blocking set; ADR-0020 carries the decision.
+Status: **Phase 3 ENABLED 2026-08-18, on the operator's decision.** A settled
+DOI-less grab that qualifies exactly one pending job is now filed automatically
+at rule version `candidate_auto_bind/3`; everything else parks as before.
+Phases 1–2 stand (popup picker, conclusive-identity veto). Phase 4 (ranked
+one-click confirm on the parked row) is **the next work**, and is now the
+higher-value half: automatic filing handles about one capture in five, so four
+in five still reach a human, and improving that prompt cannot file anything
+wrongly because the human chooses.
+
+What authorised the change was measurement on the population this path serves —
+~9,800 trials, zero wrong binds, per-document bound 0.94%, 65/318 (20.4%)
+correct — plus the structural argument that a grab only exists because someone
+clicked Send PDF with the document in front of them, so the families no
+predicate catches are excluded by the person before any rule runs. It did NOT
+satisfy the `/2` blocking set below; ADR-0020's 2026-08-18 amendment carries the
+item-by-item accounting of what holds, what is partial, and what turned out to
+be unanswerable against this store. Read "Round 4: why Phase 3 was disabled"
+as the record of what was found unsafe — all of it still true — not as the
+current state.
+
+One exposure is accepted and live: an unlabelled member of the conjunction
+family (a document reprinting another work's title, authors, year and
+identifier) is still filed wrongly. `dev/active/structural-front-matter-parser.md`
+is its only mitigation, which is why that plan is not superseded by this
+decision. `papio grabs binds` ships alongside so the decisions are reviewable,
+because there is still no unbind.
 
 **Where `/2` now stands (2026-08-17).** The measurement that gates it has run
 (`dev/active/candidate-binding-measurement.md`): every single-axis arm is clean,

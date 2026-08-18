@@ -10,6 +10,22 @@ unreviewed in `dd9c792` and survived none. Review artifacts:
 - **Adversarial review of v2, GPT-5.6 Sol Pro — NEEDS REVISION (10 findings)** —
   `dev/scratch/oracle/20260817T132720Z-parser-v2-pro-review/answer.md`
 
+
+**Role changed 2026-08-18.** Autonomous binding is now ON (ADR-0020, 2026-08-18
+amendment), enabled on measurement rather than on this design being finished. So
+this plan is no longer a *precondition* for autonomous binding — it is the only
+mitigation for an exposure that is now **live**: an unlabelled document that
+reprints another work's title, authors, year and identifier is filed as that
+work, 311 times out of 311 in the measurement's synthetic arm. The two real
+forms found by review are now `correctionMarkers` and park, but a vocabulary
+cannot close the family. That raises this work's priority and lowers its
+optionality; it does not change a line of the design below, and §The
+monotonicity invariant is still what it must satisfy.
+
+The viability floor question in §Open before implementation is **answered**: the
+operator's number is the decision to enable at 20.4% correct binds, so the floor
+is at or below that. The remaining open item is the labelling hour.
+
 Every code claim below was verified against the tree. **Nothing in this document is built**
 except the OCR page-separator fix, which the fourth review moved out of this plan entirely
 (§P0, shipped).
