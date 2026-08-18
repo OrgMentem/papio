@@ -41,6 +41,17 @@ var correctionMarkers = []string{
 	"publisher correction", "retraction of", "retraction note", "retracted article",
 	"expression of concern", "comment on", "comments on", "commentary on",
 	"reply to", "rejoinder to", "withdrawal notice",
+	// "editor's note" and "see related article" are the two shapes an
+	// adversarial review found in live publisher output rather than in a
+	// fixture: Oxford Academic gives an Editor's Note its own DOI while
+	// printing the 2004 article it discusses as a bare "doi:" line, and eNeuro
+	// commentaries carry an explicit "See related article" footnote beside
+	// their own. Both therefore print another work's title, authors, year AND
+	// identifier in their own front matter with no correction word anywhere —
+	// the one document family the candidate-binding measurement scores as a
+	// wrong bind 100% of the time (its "conjunction" arm synthesizes exactly
+	// this shape). A hit parks rather than rejects, as for every entry here.
+	"editor's note", "editors' note", "see related article", "related article:",
 }
 
 // correctionPointerPhrases catches the shape a corrected work prints ON

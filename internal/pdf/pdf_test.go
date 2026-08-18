@@ -709,6 +709,55 @@ func TestIdentityCorrectionMarkersAnchorAsLinePrefixes(t *testing.T) {
 	})
 }
 
+// TestIdentityEditorsNoteFamilyParks covers the shape adversarial review found
+// in live publisher output rather than in a fixture, and which the candidate
+// binding measurement's "conjunction" arm scores as a wrong bind 100% of the
+// time: an editorial note or commentary that has its own DOI while printing the
+// article it discusses — that article's title as a line, its authors, its year,
+// and its bare identifier. No word in the older correction vocabulary appears
+// anywhere in it, so before these entries the document satisfied every gate as
+// the discussed article and would have been filed as it.
+//
+// The requested work here is the DISCUSSED article, which is what makes it the
+// hazard: everything the rule checks genuinely agrees, because the note is
+// faithfully reproducing the front matter of someone else's paper.
+func TestIdentityEditorsNoteFamilyParks(t *testing.T) {
+	discussed := work.Work{
+		DOI:     "10.1210/en.2003-0985",
+		Title:   "Inhibition of Death-Receptor Mediated Apoptosis in Human Adipocytes",
+		Authors: []string{"Huang"},
+		Year:    2004,
+	}
+	for _, tc := range []struct {
+		name   string
+		marker string
+		text   string
+	}{
+		{
+			name:   "oxford academic editor's note",
+			marker: "editor's note",
+			text: "Editor's Note to: Inhibition of Death-Receptor Mediated Apoptosis in Human Adipocytes\n" +
+				"Huang\n2004\ndoi: 10.1210/en.2003-0985\n",
+		},
+		{
+			name:   "eneuro related-article commentary",
+			marker: "see related article",
+			text: "See related article: Inhibition of Death-Receptor Mediated Apoptosis in Human Adipocytes\n" +
+				"Huang\n2004\nhttps://doi.org/10.1210/en.2003-0985\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MatchIdentity(tc.text, discussed)
+			if got.Result != IdentityReview {
+				t.Fatalf("result = %+v, want review: a note discussing a paper must not be accepted AS that paper", got)
+			}
+			if want := "front matter marks a correction or comment: " + tc.marker; !strings.Contains(strings.Join(got.Evidence, " "), want) {
+				t.Fatalf("evidence = %v, want %q named", got.Evidence, want)
+			}
+		})
+	}
+}
+
 // A comment article can cite the requested paper's DOI past the first form
 // feed rather than in its own front matter — "Comment on: <title>" clears the
 // title gate, the byline names a different author, and corroboratingIdentifier
