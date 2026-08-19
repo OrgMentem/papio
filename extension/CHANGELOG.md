@@ -135,6 +135,16 @@ for the full pre-split extension history.
   older daemon's short feature list still negotiates exactly as before.
 
 ### Fixed
+- **Closing an abandoned sign-in tab frees the other papers immediately, even
+  hours later.** Giving up on a library sign-in released that institution's
+  single sign-in slot only while *papio*'s background worker happened to still
+  be awake — and the browser shuts that worker down after about thirty seconds
+  of quiet. Close the tab after that, and nothing was reported: every other
+  paper waiting on the same sign-in stayed silently parked for up to half an
+  hour, and pressing **Open** on one appeared to do nothing at all. Each tab
+  *papio* opens now carries the sign-in it belongs to in its own durable
+  record, so closing it reports the abandonment whether or not the worker was
+  still running.
 - **The placeholder page *papio* opens for institutional work now loads.** It
   was pointed at a file that shipped one directory away, so every tab *papio*
   opened for a paper behind your library rendered the browser's own *"Your

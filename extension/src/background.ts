@@ -3812,10 +3812,23 @@ export class Bridge {
     }
     const originDigest =
       typeof tab.url === "string" ? await originDigestOf(tab.url) : undefined;
+    // Captured before the transaction's await boundary, from the grant that
+    // is live exactly now: a worker restart erases claimGrants, and an owner
+    // that closes afterwards can only report owner_closed from this record.
+    const claim = jobID === undefined ? undefined : this.durableClaimIdentity(jobID);
     await this.runTabLedgerTransaction(async (ledger) => {
       const key = String(tabID);
-      if (ledger[key] !== undefined)
-        return { value: undefined, changed: false };
+      const existing = ledger[key];
+      if (existing !== undefined) {
+        // Additive only: an existing record is never re-dated or re-bound
+        // (that is the reuse guard above), but a surface that was ledgered
+        // before its claim was granted still needs the identity to survive
+        // a restart.
+        if (claim === undefined || existing.claim !== undefined)
+          return { value: undefined, changed: false };
+        existing.claim = claim;
+        return { value: undefined, changed: true };
+      }
       ledger[key] = {
         binding_id: bindingID ?? this.deps.randomUUID(),
         tab_hint: tabID,
@@ -3825,9 +3838,29 @@ export class Bridge {
         created_at: this.deps.now(),
         ...(originDigest === undefined ? {} : { origin_digest: originDigest }),
         ...(jobID === undefined ? {} : { job_id: jobID }),
+        ...(claim === undefined ? {} : { claim }),
       };
       return { value: undefined, changed: true };
     });
+  }
+
+  /** The durable mirror of a live worker-memory claim grant. Undefined when
+   * this job holds no grant, or when no holder generation has been observed
+   * yet — an observation carrying a guessed generation is worse than one
+   * that is never sent, because the daemon would apply it under the wrong
+   * holder. */
+  private durableClaimIdentity(
+    jobID: string,
+  ): SurfaceBirthRecord["claim"] | undefined {
+    const grant = this.claimGrants.get(jobID);
+    if (grant === undefined) return undefined;
+    const generation = this.lastKnownBrowserHolderGeneration;
+    if (generation === undefined) return undefined;
+    return {
+      authentication_claim_id: grant.authenticationClaimID,
+      gate_occurrence_id: grant.gateOccurrenceID,
+      browser_holder_generation: generation,
+    };
   }
   private async forgetLedgeredTab(tabID: number): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
@@ -4244,8 +4277,9 @@ export class Bridge {
         typeof entry.gate_occurrence_id === "string" &&
         typeof entry.browser_holder_generation === "number"
       ) {
-        this.enqueueRestartRecoveredNavigationError(
+        this.enqueueRestartRecoveredObservation(
           entry as Required<NavigationErrorMarkerEntry>,
+          "navigation_error",
         );
       } else {
         // Occurrence unknown at error time: nothing here can synthesize
@@ -4261,14 +4295,24 @@ export class Bridge {
     this.persistNavigationErrorMarkers();
   }
 
-  /** Fold a fully-identified durable marker directly into the
+  /** Fold a fully-identified durable observation directly into the
    * claim_observation outbox, mirroring enqueueClaimObservation but without
    * needing a live claimGrants entry (gone on restart). Ordinal is computed
    * the same way consultAuthenticationClaim seeds a fresh grant's own
    * counter: the lowest value strictly greater than every already-queued
    * ordinal for this occurrence. */
-  private enqueueRestartRecoveredNavigationError(
-    entry: Required<NavigationErrorMarkerEntry>,
+  private enqueueRestartRecoveredObservation(
+    entry: {
+      job_id: string;
+      authentication_claim_id: string;
+      binding_id: string;
+      browser_holder_generation: number;
+      gate_occurrence_id: string;
+    },
+    eventKind: Extract<
+      ClaimObservationPayload["event_kind"],
+      "navigation_error" | "owner_closed"
+    >,
   ): void {
     let ordinal = 0;
     for (const existing of this.claimObservationOutboxEntries.values()) {
@@ -4287,13 +4331,17 @@ export class Bridge {
       browser_holder_generation: entry.browser_holder_generation,
       gate_occurrence_id: entry.gate_occurrence_id,
       event_ordinal: ordinal,
-      event_kind: "navigation_error",
+      event_kind: eventKind,
     };
     this.claimObservationOutboxEntries.set(
       observationEntry.observation_id,
       observationEntry,
     );
     this.persistClaimObservationOutbox();
+    // Same tail as enqueueClaimObservation: persisting alone leaves the
+    // observation sitting until some unrelated event happens to drain it,
+    // and owner_closed is the frame that frees the institution's login slot.
+    this.scheduleObservationOutboxDrain();
   }
 
   /** The generic Slice 2b close transaction: request a one-use daemon
@@ -17859,6 +17907,11 @@ export class Bridge {
     const authorizedClose =
       this.tabLedgerCache?.[String(tabID)]?.pending_close !== undefined;
     const ownerBindingID = this.tabLedgerCache?.[String(tabID)]?.binding_id;
+    // Read before forgetLedgeredTab erases the record: after a worker
+    // restart this is the ONLY surviving proof of which claim this surface
+    // owned, and MV3 sleeps the worker after ~30s idle, so a sign-in tab
+    // abandoned minutes later is the common case, not the edge one.
+    const durableClaim = this.tabLedgerCache?.[String(tabID)]?.claim;
     void this.forgetLedgeredTab(tabID);
     const job = findByTab(this.store, tabID);
     if (!job) return;
@@ -17870,22 +17923,42 @@ export class Bridge {
     if (
       !authorizedClose &&
       ownerBindingID !== undefined &&
-      job.status !== "awaiting_download" &&
-      this.claimGrants.has(job.job_id)
+      job.status !== "awaiting_download"
     ) {
-      const gateOccurrenceID = this.claimGrants.get(
-        job.job_id,
-      )?.gateOccurrenceID;
-      this.enqueueClaimObservation(job.job_id, ownerBindingID, "owner_closed");
-      // §2.2.1's owner_closed reducer counterpart: authorize the now-gone
-      // surface's abandonment. The tab is already gone, so there is nothing
-      // to tombstone locally — either outcome (authorized or not_eligible)
-      // leaves this job's state exactly as clearClaimGrant below sets it.
-      void this.requestCloseAuthorization(
-        ownerBindingID,
-        "claim_abandoned",
-        gateOccurrenceID,
-      );
+      const grant = this.claimGrants.get(job.job_id);
+      if (grant !== undefined) {
+        this.enqueueClaimObservation(job.job_id, ownerBindingID, "owner_closed");
+        // §2.2.1's owner_closed reducer counterpart: authorize the now-gone
+        // surface's abandonment. The tab is already gone, so there is nothing
+        // to tombstone locally — either outcome (authorized or not_eligible)
+        // leaves this job's state exactly as clearClaimGrant below sets it.
+        void this.requestCloseAuthorization(
+          ownerBindingID,
+          "claim_abandoned",
+          grant.gateOccurrenceID,
+        );
+      } else if (durableClaim !== undefined) {
+        // Restart-recovered: the grant died with its worker, so the identity
+        // comes from the birth record instead. Without this the claim keeps
+        // the institution's one login slot until the daemon's lease expires,
+        // and every sibling parks tablessly in the meantime — the stranded
+        // sign-in this whole effort exists to prevent.
+        this.enqueueRestartRecoveredObservation(
+          {
+            job_id: job.job_id,
+            authentication_claim_id: durableClaim.authentication_claim_id,
+            binding_id: ownerBindingID,
+            browser_holder_generation: durableClaim.browser_holder_generation,
+            gate_occurrence_id: durableClaim.gate_occurrence_id,
+          },
+          "owner_closed",
+        );
+        void this.requestCloseAuthorization(
+          ownerBindingID,
+          "claim_abandoned",
+          durableClaim.gate_occurrence_id,
+        );
+      }
     }
     this.clearClaimGrant(job.job_id);
     if (authorizedClose) {

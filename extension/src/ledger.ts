@@ -42,6 +42,18 @@ export interface SurfaceBirthRecord {
   origin_digest?: string;
   /** Daemon job this surface currently serves, when known. */
   job_id?: string;
+  /** Daemon-issued authentication-claim identity this surface owns, when it
+   * owns one. Persisted because the worker-memory grant it mirrors is gone
+   * after any MV3 restart, and an owner that closes without it can no longer
+   * report `owner_closed` — leaving the institution's single login slot held
+   * until the daemon's lease expires while every sibling parks. Opaque
+   * daemon identifiers only; same digest-only contract as the rest of this
+   * record. */
+  claim?: {
+    authentication_claim_id: string;
+    gate_occurrence_id: string;
+    browser_holder_generation: number;
+  };
   /** Set once the surface is ceded to the operator: the binding is
    * detached, the record is retained for accounting, and it no longer
    * authorizes automation. */
@@ -108,6 +120,26 @@ export function isSurfaceBirthRecord(value: unknown): value is SurfaceBirthRecor
   if (value.job_id !== undefined && typeof value.job_id !== "string") return false;
   if (value.ceded !== undefined && typeof value.ceded !== "boolean") return false;
   if (value.legacy !== undefined && value.legacy !== true) return false;
+  if (value.claim !== undefined) {
+    if (!isPlainRecord(value.claim)) return false;
+    const claim = value.claim;
+    if (
+      typeof claim.authentication_claim_id !== "string" ||
+      claim.authentication_claim_id.length === 0
+    )
+      return false;
+    if (
+      typeof claim.gate_occurrence_id !== "string" ||
+      claim.gate_occurrence_id.length === 0
+    )
+      return false;
+    if (
+      typeof claim.browser_holder_generation !== "number" ||
+      !Number.isInteger(claim.browser_holder_generation) ||
+      claim.browser_holder_generation < 0
+    )
+      return false;
+  }
   if (value.pending_close !== undefined) {
     if (!isPlainRecord(value.pending_close)) return false;
     const pending = value.pending_close;

@@ -16,7 +16,7 @@ import {
   type PageCapturePayload,
   type PdfGrabRefusalReason,
 } from "../src/protocol";
-import { type SurfaceBirthRecord } from "../src/ledger";
+import { isSurfaceBirthRecord, type SurfaceBirthRecord } from "../src/ledger";
 import {
   emptyStore,
   findByJob,
@@ -3573,6 +3573,84 @@ test("Slice 3: an owner tab closed without success emits owner_closed with the c
     h.backend.store.activeJobs.find((job) => job.job_id === jobB),
   ).toEqual(dependentSnapshot);
   expect(h.tabs.created).toHaveLength(1);
+});
+
+// Live-smoke regression (2026-08-19): reproduced on the operator's own
+// browser. The grant that authorizes owner_closed is worker memory, and MV3
+// sleeps the worker after ~30s idle, so a sign-in tab abandoned minutes later
+// emitted NOTHING: the daemon kept the claim in `navigated` until its 30-minute
+// lease expired, and every sibling paper at that institution parked tablessly
+// and silently in the meantime (verified against the live store:
+// materialization_claims held a claim whose tab_id no longer existed, while
+// claim_observation_journal was empty). The birth record is the durable proof
+// that survives, so it now carries the claim identity.
+test("Slice 3 (live smoke): an owner tab closed after a worker restart still reports owner_closed from its birth record", async () => {
+  const jobA = "job_claim_owner_restart";
+  const candidateA = "cand_owner_restart";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobA)],
+  });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobA, candidateA);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobA,
+    candidateA,
+    `https://${PROVIDER_HOST}/fresh?owner=restart`,
+  );
+  const born = ledger.current()[String(tabID)];
+  expect(isSurfaceBirthRecord(born)).toBe(true);
+  const bindingID = isSurfaceBirthRecord(born) ? born.binding_id : "";
+  expect(bindingID).not.toBe("");
+  // The identity the restart will depend on is durable, not worker memory.
+  expect(isSurfaceBirthRecord(born) ? born.claim : undefined).toMatchObject({
+    authentication_claim_id: `claim_${candidateA}`,
+    gate_occurrence_id: `occ_${candidateA}`,
+    browser_holder_generation: 1,
+  });
+
+  // The worker dies. Durable storage and the tab both survive; claimGrants
+  // does not.
+  const restarted = restartWorker(h);
+  await restarted.bridge.start();
+  // A real daemon's ack carries its live holder generation (the oracle
+  // round's P0), which is what re-arms the close-authorization path after a
+  // restart. The observation above does not depend on it — the birth record
+  // carries the generation the claim was granted under.
+  await restarted.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+
+  const framesBefore = restarted.port.posted.length;
+  await restarted.tabs.userClose(tabID);
+  const closed = await restarted.port.waitForFrame(
+    "claim_observation",
+    framesBefore,
+  );
+  expect(closed.payload["event_kind"]).toBe("owner_closed");
+  // Identity comes from the birth record, not a guess: the same claim and
+  // gate occurrence the daemon granted before the restart.
+  expect(closed.payload["authentication_claim_id"]).toBe(`claim_${candidateA}`);
+  expect(closed.payload["gate_occurrence_id"]).toBe(`occ_${candidateA}`);
+  expect(closed.payload["binding_id"]).toBe(bindingID);
+  expect(closed.payload["browser_holder_generation"]).toBe(1);
+
+  // And the abandonment is authorized under its own disposition, so the
+  // daemon can retire the claim now instead of waiting out the lease.
+  const closeRequest = restarted
+    .frames()
+    .find(
+      (frame) =>
+        frame.type === "surface_close_request" &&
+        frame.payload["binding_id"] === bindingID,
+    );
+  expect(closeRequest?.payload["disposition"]).toBe("claim_abandoned");
 });
 
 test("Slice 3 (oracle finding 4): an ack's fresh gate_occurrence_id rotates the SAME still-owned job's grant in place — a later wall_observed for the new occurrence is not suppressed by the prior occurrence's latch", async () => {
