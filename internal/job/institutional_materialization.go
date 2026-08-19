@@ -806,6 +806,63 @@ func (js *Store) CandidateForAttempt(ctx context.Context, jobID string, jobAttem
 	return js.GetBrowserCandidate(ctx, id)
 }
 
+// ReleaseUnconsumedMaterializationClaim gives a claim back when the daemon
+// itself refuses to let that job open a sign-in surface. Claiming a candidate
+// and arbitrating the institution's authentication entry are two round trips,
+// and the claim comes first: it flips the candidate to 'claimed', which is
+// exactly the state the scheduler treats as "someone is working on this". So a
+// consult answered `park`/`focus_owner` left a claim with no surface — tab 0, no
+// route, no effect — holding its candidate out of the scheduler's reach for the
+// claim's full lease, with nothing to retire it and nothing to retry. Observed
+// live 2026-08-19: claim_009d4edb minted 05:35:26Z for
+// job_eb16f955653ac52f89355d19bd, park one second later, still 'claimed' with
+// tab 0 half an hour on while its paper reported itself as waiting for the
+// operator.
+//
+// Returns whether anything was released. Only an unconsumed claim qualifies
+// (phase 'claimed', tab 0, both ordinals 0, no effect permit), so a claim that
+// already produced a surface or an irreversible provider effect is untouched —
+// and the candidate is returned to 'eligible' under the same artifact_winners
+// anti-join every other release here carries, so a winner-bearing candidate is
+// never re-armed for a second route issuance.
+func (js *Store) ReleaseUnconsumedMaterializationClaim(ctx context.Context, candidateID string) (bool, error) {
+	if strings.TrimSpace(candidateID) == "" {
+		return false, errors.New("materialization claim release requires a candidate")
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	res, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=?
+		WHERE candidate_id=? AND phase='claimed' AND tab_id=0
+		  AND route_issuance_ordinal=0 AND effect_ordinal=0
+		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id)`,
+		now, candidateID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates SET status='eligible', updated_at=?
+		WHERE id=? AND status='claimed'
+		  AND NOT EXISTS (SELECT 1 FROM materialization_claims
+		    WHERE candidate_id=? AND phase IN ('claimed','bound','route_issued','navigated'))
+		  AND NOT EXISTS (SELECT 1 FROM artifact_winners
+		    WHERE candidate_id=browser_candidates.id
+		      AND job_attempt_revision=browser_candidates.job_attempt_revision)`,
+		now, candidateID, candidateID); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // BindMaterialization acknowledges the physical resource for a claim. Binding
 // IDs are minted at claim creation. A live claim may replace its tab while
 // bound or route_issued; navigated and settled tab fences are immutable.

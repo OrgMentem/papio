@@ -176,6 +176,21 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
+- **A paper that is turned away now gets back in the queue instead of sitting
+  out.** Only one paper at a time may sign in to a given institution, so the
+  others are told to wait — but a paper reserves its place a moment *before* it
+  asks, and being turned away did not give that place back. It looked busy to
+  *papio* for the next half hour: it could not try again, and it was skipped when
+  the sign-in it was waiting for finished. Turned-away papers now hand their
+  place straight back, and are picked up as soon as the way is clear. A paper
+  that already has a window open, or has already asked the publisher for the
+  file, keeps its place as before.
+- **One unopened sign-in no longer blocks a library for half an hour.** *papio*
+  asks for permission to open one sign-in per institution at a time. Permission
+  that was granted and then never used was held as long as a real sign-in — so a
+  single paper that stopped short could keep every other paper on that library
+  waiting, with nothing to say why. Unused permission now lapses in about two
+  minutes, while a sign-in you are actually working through keeps its full time.
 - **Your library sign-in now survives *papio* going briefly idle mid-login.** A
   browser puts an extension to sleep after about thirty seconds of quiet, so it
   wakes up as a new session — which routinely happens while you are still typing

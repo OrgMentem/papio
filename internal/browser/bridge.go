@@ -2246,6 +2246,19 @@ func (b *Bridge) authenticationClaim(ctx context.Context, jobID string, p *proto
 		if occErr != nil {
 			return response("error", "gate occurrence state is unavailable")
 		}
+		// This job is not getting a surface of its own, so give back what it
+		// took to ask. Claiming the candidate precedes this arbitration and
+		// flips it to 'claimed' — the state the scheduler reads as "in
+		// progress" — so a refusal used to strand an unconsumed claim (tab 0,
+		// no route, no effect) until its lease expired: the paper could not
+		// retry, the scheduler could not re-offer it when the entry freed, and
+		// nothing said so. Only an unconsumed claim is released; a surface or an
+		// irreversible provider effect keeps it.
+		if released, releaseErr := b.jobs.ReleaseUnconsumedMaterializationClaim(ctx, p.CandidateID); releaseErr != nil {
+			log.Printf("papio: unconsumed materialization claim for %s could not be released: %v", jobID, releaseErr)
+		} else if released {
+			b.materializationScheduleVersion++
+		}
 		// focus_owner requires a real surface to focus (owner_binding_id is
 		// wire-required on it); a busy lease whose owner has not bound a
 		// surface yet (a race between its own open_new grant and its

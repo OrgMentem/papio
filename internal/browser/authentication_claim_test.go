@@ -183,6 +183,76 @@ func TestAuthenticationClaimBusyGrantsFocusOwnerExplicitAndParksAutomatic(t *tes
 	}
 }
 
+// TestAuthenticationClaimParkReleasesTheUnconsumedClaim pins that a refusal
+// gives back what the job took to ask. Claiming a candidate and arbitrating the
+// institution's entry are two round trips and the claim comes first, flipping
+// the candidate to 'claimed' — the state the scheduler reads as "in progress".
+// A park therefore used to strand an unconsumed claim (tab 0, no route, no
+// effect) for its whole lease: the paper could not retry and the scheduler could
+// not re-offer it when the entry freed. Measured live 2026-08-19:
+// claim_009d4edb minted 05:35:26Z, parked one second later, still 'claimed'
+// with tab 0 half an hour on while its paper reported waiting for the operator.
+func TestAuthenticationClaimParkReleasesTheUnconsumedClaim(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	ownerJob := parkInstitutional(t, jobs, "wr_auth_park_release_owner", handoffWork(), "")
+	rivalWork := handoffWork()
+	rivalWork.DOI = "10.1002/example.77"
+	rivalJob := parkInstitutional(t, jobs, "wr_auth_park_release_rival", rivalWork, "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auth-park-release")
+	ownerCandidate := explicitMaterializationCandidate(t, jobs, ownerJob, "domain-park-release-owner")
+	rivalCandidate := explicitMaterializationCandidate(t, jobs, rivalJob, "domain-park-release-rival")
+
+	runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, ownerJob,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auth-park-release-owner-req", CandidateID: ownerCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	bindCandidate(t, b, ownerJob, ownerCandidate, "auth-park-release-owner", 31)
+
+	// The rival claims its candidate, then loses the arbitration.
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, rivalJob,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "auth-park-release-rival-claim", CandidateID: rivalCandidate,
+			MaterializationKind: "browser_tab",
+		}))
+	claimResp := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if claimResp == nil {
+		t.Fatalf("institutional_claim_response missing: %v", claimed)
+	}
+	claimPayload := claimResp.Payload.(*protocol.InstitutionalClaimResponsePayload)
+	if claimPayload.Outcome != "claimed" {
+		t.Fatalf("rival claim outcome = %s, want claimed: %+v", claimPayload.Outcome, claimPayload)
+	}
+	if candidate, err := jobs.GetBrowserCandidate(ctx, rivalCandidate); err != nil || candidate == nil || candidate.Status != "claimed" {
+		t.Fatalf("candidate before the park = %+v err=%v, want claimed", candidate, err)
+	}
+
+	parked, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, rivalJob,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auth-park-release-rival-consult", CandidateID: rivalCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	if park := authClaimResponse(t, parked); park.Outcome != "park" {
+		t.Fatalf("rival outcome = %s, want park: %+v", park.Outcome, park)
+	}
+	candidate, err := jobs.GetBrowserCandidate(ctx, rivalCandidate)
+	if err != nil || candidate == nil {
+		t.Fatalf("candidate after the park: %+v err=%v", candidate, err)
+	}
+	if candidate.Status != "eligible" {
+		t.Fatalf("candidate after the park = %q, want eligible so the scheduler can re-offer it", candidate.Status)
+	}
+	claim, err := jobs.MaterializationClaimByBindingID(ctx, claimPayload.BindingID)
+	if err != nil {
+		t.Fatalf("claim read after the park: %v", err)
+	}
+	if claim != nil && claim.Phase != "abandoned" {
+		t.Fatalf("claim after the park = %q, want abandoned (no surface was ever created)", claim.Phase)
+	}
+}
+
 // TestAuthenticationClaimBusyWithoutBindingParksEvenExplicit pins the
 // no-surface-to-focus fallback: a busy lease whose owner has not yet bound
 // a surface has nothing for focus_owner to name, so even an explicit
