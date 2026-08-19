@@ -2343,13 +2343,15 @@ func TestInstitutionalCandidateOfferReoffersUntilClaim(t *testing.T) {
 }
 
 // TestFocusedOfferSurvivesACancelledSiblingOnTheSameDomain pins the operator's own
-// request against starvation by a corpse, through the whole chain: the real
-// scheduler, the bridge's one-candidate-per-safety-domain admission, and the
-// offer frame. Nothing retires a candidate row when its job is cancelled, so the
-// dead paper kept winning its domain's single admission slot and the focused live
-// paper was never offered - no frame, no tab, and (because focusPending is
-// retained) every retry reported as a refusal. Observed live 2026-08-19 with
-// job_673c22adda606ce0959b4034df behind two cancelled siblings.
+// request against delay by a corpse, through the whole chain: the real scheduler,
+// the bridge's one-candidate-per-safety-domain admission, and the offer frame.
+// Nothing retires a candidate row when its job is cancelled, so the dead paper
+// kept taking turns at its domain's single admission slot and the focused live
+// paper was not offered on the polls it lost. The rotation is fair, so this is
+// delay rather than deadlock - measured live 2026-08-19 as seven minutes of
+// silence after an explicit open on job_673c22adda606ce0959b4034df behind two
+// cancelled siblings. An explicit request must be served on the next poll, which
+// is what this asserts.
 func TestFocusedOfferSurvivesACancelledSiblingOnTheSameDomain(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()

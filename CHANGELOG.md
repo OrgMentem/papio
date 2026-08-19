@@ -176,14 +176,15 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
-- **A cancelled paper no longer blocks a live one from reaching your library.**
-  *papio* works one paper at a time per provider, so it never has two
-  institutional sign-ins racing on the same site. Deciding whose turn it is
-  looked at every paper that had ever been queued for that provider — including
-  papers you had cancelled, or that had already arrived. Those keep their place
-  in the queue forever, so a live paper could sit behind them and never get a
-  turn: you asked *papio* to open it, and nothing happened, with nothing said.
-  Finished and cancelled papers now give up their place.
+- **A paper you cancelled no longer makes a live one wait its turn.** *papio*
+  works one paper at a time per provider, so it never has two institutional
+  sign-ins racing on the same site. Deciding whose turn it is looked at every
+  paper ever queued for that provider — including papers you had cancelled and
+  papers that had already arrived, which keep their place in the queue forever.
+  Each one costs a live paper another wait, and nothing says so: measured here,
+  a paper sitting behind two cancelled ones took seven minutes to open after
+  being asked for, with no tab and no message in between. Finished and cancelled
+  papers now give up their place.
 - **Asking again for a paper *papio* is already working on no longer reports a
   refusal.** `papio actions open` on a paper whose sign-in was already queued
   said the paper's access mode did not permit an institutional handoff — a

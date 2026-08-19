@@ -560,18 +560,32 @@ race below for why a fresh live open could not be driven afterwards.
 
 ## Still open, with evidence (2026-08-19)
 
-1. **A focus frame that wins the race against its own candidate offer burns the
-   paper's one-use institutional authorization and produces nothing.**
-   `job_673c22adda606ce0959b4034df`, opened 04:30:11Z: candidate
-   `38b00e5e6a1013` created `eligible`, zero claims, zero tabs, no surface. The
-   second attempt at 04:34:01Z was refused outright — "the job's access mode
-   does not permit an institutional handoff" — so the operator cannot retry. The
-   extension is right to refuse minting with no candidate correlation (Slice 0
-   containment, `background.ts` "No live institutional candidate ever ran for
-   this job"), and the daemon queues focus and candidate offer with no ordering
-   guarantee; nothing re-drives the request when focus loses. The 04:07 run on
-   the same build family won the race and completed, which is what makes this an
-   ordering defect rather than a capability one.
+1. **FIXED, and the first diagnosis here was wrong.** This was recorded as "a
+   focus frame that wins the race against its own candidate offer burns the
+   paper's one-use institutional authorization and produces nothing", on the
+   evidence that `job_673c22adda606ce0959b4034df` opened at 04:30:11Z with a
+   candidate `eligible`, zero claims and zero tabs, and that a second attempt at
+   04:34:01Z printed "the job's access mode does not permit an institutional
+   handoff". Both halves were misread.
+
+   No authorization is consumed and there is no ordering race. The second open
+   *was* accepted — `handoff.opened` is recorded at 04:34:01Z — and the surface
+   arrived at 04:37:33Z, seven minutes after the first ask. Two real defects
+   produced that appearance, and both are now fixed (`1508f71`):
+   `ScheduleEligibleBrowserCandidates` had no predicate on the job's state, so
+   the two cancelled jobs' `eligible` candidates kept taking turns at the
+   institution domain's single per-poll admission slot, and the rotation being
+   fair made this a delay of one pass per corpse rather than a deadlock; and
+   `FocusHandoffs` skipped a job that already had a focus owed without counting
+   it, which the CLI renders as an access-mode refusal — `focusPending` is a
+   sticky priority marker that deliberately outlives the poll delivering the
+   first frame, so *every* later explicit open on any institutional paper
+   reported a refusal that had not happened. The message no longer asserts a
+   cause it did not verify.
+
+   Recorded because the wrong version of this entry was committed first, and the
+   reasoning that produced it - reading "the CLI said access mode" as evidence
+   about access mode - is the trap worth remembering.
 2. **Claim observations never reach the journal.**
    `claim_observation_journal` is empty for every run today, including one whose
    job events show `browser.auth_returned` — so the timing-only frame landed
@@ -581,11 +595,16 @@ race below for why a fresh live open could not be driven afterwards.
    after a ~30s MV3 sleep) and `tabLedgerCache[tabID].binding_id`; a daemon-side
    rejection would also leave the journal empty and is not recorded anywhere.
    Distinguishing them needs the ack outcome, which nothing persists.
-3. **Dead candidates and expired claims are never reaped, and they hold
-   institutional state.** Live: candidates `claimed` for jobs whose claims'
-   leases expired hours earlier (`99b301abba` lease 02:37Z, `19e6b3aa4c` lease
-   03:07Z, both still phase `navigated` pointing at tab ids deleted by hand),
-   plus two `eligible` candidates belonging to **cancelled** jobs
-   (`7246c11621`, `39fd95207c`). `maxOutstandingOffers` is 4
-   (`bridge.go:152`), so enough corpses can starve every new institutional
-   offer; the daemon's in-memory offer map hides this until a restart clears it.
+3. **Dead candidate rows are never retired — the scheduling half is FIXED, the
+   retirement half is not.** Live: two `eligible` candidates belonging to
+   **cancelled** jobs (`7246c11621`, `39fd95207c`), plus candidates still
+   `claimed` for jobs whose claim leases expired hours earlier (`99b301abba`
+   02:37Z, `19e6b3aa4c` 03:07Z, both phase `navigated` pointing at tab ids
+   deleted by hand). `1508f71` stops the scheduler handing out a terminal job's
+   candidate, which is what made them cost a live paper its turn (item 1). The
+   expired-lease rows were already harmless to scheduling — every clause in
+   `scheduleEligibleKeysetPage` that consults a claim also requires
+   `lease_until > now` — so what remains is hygiene rather than a defect: no
+   pass marks a candidate `abandoned` when its job goes terminal, so the rows
+   accumulate, and `papio doctor` has nothing to say about them. Worth a reaper
+   on the maintenance sweep; not worth a migration on its own.

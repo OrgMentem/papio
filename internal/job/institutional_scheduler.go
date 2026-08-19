@@ -111,13 +111,15 @@ const candidateSchedulePageSize = 128
 //
 // A candidate whose job has reached a terminal state is never scheduled.
 // Nothing retires a candidate row when its job is cancelled, fails, or is
-// delivered, so those papers otherwise keep an `eligible` candidate forever -
-// and since the bridge admits at most ONE candidate per safety domain per poll,
-// the corpses consume a live paper's turns on that domain indefinitely. Both
-// consumer loops already skip a job that is no longer awaiting a human, so
-// scheduling one could only ever produce work nobody would take. Observed live
-// 2026-08-19: two cancelled jobs still holding `eligible` candidates on the
-// operator's own institution domain, while a freshly focused paper waited.
+// delivered, so those papers otherwise keep an `eligible` candidate forever.
+// The rotation above is fair, so a corpse does not block a live paper outright -
+// it takes turns the live paper needs, and since the bridge admits at most ONE
+// candidate per safety domain per poll, each one costs a rotation pass. Measured
+// live 2026-08-19: an explicit open on the operator's institution domain, behind
+// two cancelled candidates, went seven minutes with no surface and nothing said
+// before its turn came round. Both consumer loops already skip a job that is no
+// longer awaiting a human, so scheduling one could only ever produce work nobody
+// would take.
 func (js *Store) ScheduleEligibleBrowserCandidates(ctx context.Context, limit int, cursor CandidateScheduleCursor) (CandidateSchedulePage, error) {
 	if js == nil || js.S == nil {
 		return CandidateSchedulePage{}, errors.New("candidate scheduler requires a store")
