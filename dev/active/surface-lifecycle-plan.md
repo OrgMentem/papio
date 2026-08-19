@@ -506,3 +506,86 @@ wall. Two consequences worth separating:
 
 Both papers were recovered with `papio acquire`: the PLOS ONE one went straight
 to `imported` (open access, no browser), the T&F one is the live subject above.
+
+## The duplicate surface, chased (2026-08-19) — three defects fixed
+
+The "unfinished business" above turned out to be three separate defects. Each
+was reproduced in `extension/test/background.test.ts` before being fixed, and
+each test was verified to fail on pre-fix source.
+
+1. **A candidate re-offer disowned a live surface.**
+   `onInstitutionalCandidateOffer` reset the job record's `tab_id` to `-1` on
+   every offer, including a re-offer of the same candidate whose correlation
+   already held a bound tab. `reduceMaterialization` (`state.ts`) already
+   applied the right rule to the correlation — a same-candidate re-offer
+   refreshes the lease and only restarts materialization when no binding was
+   ever established — and the job record contradicted it. The daemon pins a
+   re-offered candidate's expiry in memory (`bridge.go:10181-10183`), so a
+   daemon restart or its own lapse check (`10174`) re-offers with a fresh
+   expiry: the live trigger. Consequences were exactly the reported symptoms —
+   every observation keyed on `job.tab_id` (challenge, mfa, auth_returned,
+   entitled_landing) went silent, and the next open could not find the tab to
+   reuse.
+2. **Reconcile adopted a leftover placeholder as the paper's surface.**
+   `reconcileMaterializationTabs` matched surfaces by scaffold URL, so a
+   *navigated* surface could never be among its candidates — it has left that
+   URL by design — while a leftover scaffold for the same binding could.
+   `candidates.find(...) ?? candidates[0]` therefore chose the placeholder,
+   repointed the correlation at it, and submitted **it** to the daemon as the
+   job's surface. A navigated correlation now keeps its own tab and every
+   scaffold-URL tab for that binding is retired.
+3. **An explicit open raced the pipeline building its surface.** `FocusHandoffs`
+   queues both a candidate offer (`serviceMaterializationCandidate`) and a
+   `handoff_focus`; the extension routes the focus to `focusDaemonHandoff`,
+   which for a URL-free candidate falls through to `openHandoff`, whose
+   `engagement_required` branch called `openFreshHandoff("explicit")`. That
+   function applied the architecture ruling "the extension never self-mints a
+   materialization binding" to the *automatic* trigger only. The focus arrives
+   while the correlation is pre-bind — exactly when `tab_id` is legitimately
+   `-1` and the daemon's consult therefore answers `open_new` (§2.1.1 case 3) —
+   so neither side could see the collision. The ruling now covers both triggers
+   whenever the pipeline is actually driving the job. It deliberately does not
+   cover a correlation nothing is driving: fourteen Slice 3 tests pin that
+   state, and `seedClaimCandidate`'s own comment says it seeds a candidate
+   *without* negotiating the feature "which would drive the unrelated
+   daemon-orchestrated materialization workflow".
+
+**Live verification** (operator's own Chrome, `7068539` then `1d9581d`): the
+stale placeholder was retired on the post-update pass while the operator's
+sign-in tab was kept, twice, for two different bindings — with
+`close_authorizations` empty and no `provider_outcome`, so this morning's
+deliberate-removal marker kept papio's own housekeeping from reading as
+cancellation. Defect 3's fix is verified in the harness only; see the ordering
+race below for why a fresh live open could not be driven afterwards.
+
+## Still open, with evidence (2026-08-19)
+
+1. **A focus frame that wins the race against its own candidate offer burns the
+   paper's one-use institutional authorization and produces nothing.**
+   `job_673c22adda606ce0959b4034df`, opened 04:30:11Z: candidate
+   `38b00e5e6a1013` created `eligible`, zero claims, zero tabs, no surface. The
+   second attempt at 04:34:01Z was refused outright — "the job's access mode
+   does not permit an institutional handoff" — so the operator cannot retry. The
+   extension is right to refuse minting with no candidate correlation (Slice 0
+   containment, `background.ts` "No live institutional candidate ever ran for
+   this job"), and the daemon queues focus and candidate offer with no ordering
+   guarantee; nothing re-drives the request when focus loses. The 04:07 run on
+   the same build family won the race and completed, which is what makes this an
+   ordering defect rather than a capability one.
+2. **Claim observations never reach the journal.**
+   `claim_observation_journal` is empty for every run today, including one whose
+   job events show `browser.auth_returned` — so the timing-only frame landed
+   while the observation did not. Defect 1 above explains the earlier runs
+   (job-keyed emitters had no tab), but not this one. Ranked candidates from the
+   read: emission requires both a live `claimGrants` entry (worker memory, gone
+   after a ~30s MV3 sleep) and `tabLedgerCache[tabID].binding_id`; a daemon-side
+   rejection would also leave the journal empty and is not recorded anywhere.
+   Distinguishing them needs the ack outcome, which nothing persists.
+3. **Dead candidates and expired claims are never reaped, and they hold
+   institutional state.** Live: candidates `claimed` for jobs whose claims'
+   leases expired hours earlier (`99b301abba` lease 02:37Z, `19e6b3aa4c` lease
+   03:07Z, both still phase `navigated` pointing at tab ids deleted by hand),
+   plus two `eligible` candidates belonging to **cancelled** jobs
+   (`7246c11621`, `39fd95207c`). `maxOutstandingOffers` is 4
+   (`bridge.go:152`), so enough corpses can starve every new institutional
+   offer; the daemon's in-memory offer map hides this until a restart clears it.
