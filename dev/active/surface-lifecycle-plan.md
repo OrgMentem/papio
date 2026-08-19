@@ -633,42 +633,51 @@ race below for why a fresh live open could not be driven afterwards.
    pass marks a candidate `abandoned` when its job goes terminal, so the rows
    accumulate, and `papio doctor` has nothing to say about them. Worth a reaper
    on the maintenance sweep; not worth a migration on its own.
-4. **A paper may bind a surface while a different job owns its institution's
-   entry, and is then stuck with a claim that can never issue a route — while
-   reporting itself as waiting for the human.** This is the live blocker now,
-   and it is the shape of the operator's original complaint seen from the other
-   side: not too many tabs, but a paper that says it is waiting for a sign-in
-   while it has no surface at all and is really waiting for its own lease.
+4. **The stall is extension-side, between the claim response and creating a
+   surface — and the daemon-side half of it is FIXED (`7b3d235`).** This entry
+   first said the paper had *bound* a surface while another job owned the entry,
+   and blamed `setAuthenticationEntryLeaseOwnerBindingTx`'s fence. That was
+   wrong twice over: the bind's guard is complete (a fence miss against an
+   existing lease row returns `ErrMaterializationStale` and rolls the whole bind
+   back, `institutional_materialization.go:849-869`), and no bind ever happened —
+   `materialization_claims` rows are minted at CLAIM time with `tab_id 0`
+   (`institutional_materialization.go:689`), so a row in phase `claimed` with tab
+   0 is a claim nobody has bound, not a bound surface.
 
-   Measured live 2026-08-19 on `job_eb16f955653ac52f89355d19bd`:
-   `handoff.opened` 05:27:00Z; claim `claim_009d4edb` created 05:35:26Z with a
-   minted binding but `tab_id 0`, `route_issuance_ordinal 0`,
-   `effect_ordinal 0`, claim lease to 06:05:27Z; `browser.auth_pending` 05:35:27Z.
-   At that moment the institution's entry was owned by the stale
-   `job_9f8bec30da97267aa9a7d89462` (item 3's shape: no candidate, no claim, no
-   binding). The bind's own lease-owner update
-   (`setAuthenticationEntryLeaseOwnerBindingTx`) fences on
-   `owner_id`+`browser_holder_generation`+state, so it silently no-ops in that
-   situation, and its call site is guarded by `if authenticationClaimID != ""`
-   (`institutional_materialization.go:844`) — so the bind completed anyway,
-   contradicting that function's own doc comment ("a fenced no-op here fails the
-   whole bind instead of leaving a bound scaffold with no recorded lease
-   owner").
+   What is measured, on `job_eb16f955653ac52f89355d19bd`: `handoff.opened`
+   05:27:00Z; claim `claim_009d4edb` minted 05:35:26Z (tab 0, no route, no
+   effect); `browser.auth_pending` 05:35:27Z. The daemon-side consequence — a
+   refused consult leaving that claim to hold its candidate out of the
+   scheduler's reach for the full lease — is fixed: `7b3d235` retires an
+   unconsumed claim and returns the candidate to `eligible`. Verified live: at
+   05:56:12Z the paper claimed again (`claim_e04254`) after `claim_009d4edb` was
+   retired, instead of sitting out its 30 minutes.
 
-   After `cfe9145` the entry now churns instead of blocking for 30 minutes:
-   observed 05:44:15Z the stale entry lapse, `job_fb8713b63b8960` take it
-   immediately with `lease_until 05:46:27Z` (the 2-minute bind deadline, live
-   proof of that fix), and lapse again unconsumed. Papers are taking turns at a
-   permission none of them converts into a surface.
+   The remaining stall is above the daemon. At 06:00:02Z: Chrome running, the
+   extension connected and holding (`papio doctor`: `extension connected
+   (v0.14.0)`, session synced 1s earlier), `claim_e04254` four minutes old with
+   `tab_id 0`, and `authentication_entry_leases.updated_at` still 05:44:27Z —
+   so after claiming, the extension neither created a surface nor consulted the
+   authentication entry at all. Exactly two claims exist for that paper today,
+   so this is a stall, not a retry loop.
 
-   Diagnose from the bind, not the lease: either the bind must fail when it
-   cannot record itself as the entry's owner (what its comment already claims),
-   or it must be sequenced after acquiring the entry. Do not paper over it by
-   letting the route issue without the entry — that is the "two sign-in tabs on
-   one institution" failure the whole arbitration exists to prevent.
+   Next instrument is extension-side, because nothing in this path reports to
+   the daemon: what happens in `openFreshHandoff`/the materialization pipeline
+   between `institutional_claim_response` and `tabs.create`. Note the
+   scaffold-page 404 fixed earlier today (`d2f4474`) lived exactly here, and its
+   rollback path (`fresh-materialization-rollback`) closes the tab and deletes
+   the claim — so a silently failing surface creation is the first hypothesis,
+   and the second is that no candidate offer/focus frame ever reached the
+   extension for this claim. Do not relax the entry arbitration to route around
+   it: two sign-in tabs on one institution is what that arbitration exists to
+   prevent.
 5. **`auth_pending` is reported for a state the human cannot act on.** Same run:
-   the extension sent `auth_pending` one second after binding, with no tab and
-   no route. `papio actions` then advertises a paper as awaiting the operator's
-   sign-in when there is nothing to sign in to. A park is the correct behaviour;
-   naming it a human-action wait is not. Worth a distinct disposition so
-   `papio jobs`/`actions` can say "waiting for papio", not "waiting for you".
+   the extension sent `auth_pending` one second after CLAIMING (not binding —
+   see item 4), with no tab and no route. `papio actions` then advertises a paper
+   as awaiting the operator's sign-in when there is nothing to sign in to, which
+   is how a stall this obvious stayed invisible: the state papio reports for
+   "blocked on myself" and for "blocked on you" is the same state. A park is
+   correct behaviour; naming it a human-action wait is not. Worth a distinct
+   disposition so `papio jobs`/`actions` can say "waiting for papio", not
+   "waiting for you" — and it is the cheapest way to make item 4's class of
+   stall self-reporting rather than found by hand.
