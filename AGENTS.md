@@ -553,8 +553,10 @@ There is also a link check, because `zensical build` prints a broken link as an
   button above), so a whole smoke run can be spent measuring a stale build while
   believing the fix is loaded — including "adoption survived a reload" conclusions
   drawn from a reload that never occurred. A page whose URL lacks the `dist/` prefix
-  is the other tell that the running bundle predates the page-path fix. Reload from
-  the browser UI yourself, then confirm the id changed before trusting anything.
+  is the other tell that the running bundle predates the page-path fix. What does
+  work is a real pointer **click** at the Reload icon's screenshot coordinates
+  (`window.click(x, y)`) — the disconnect appears in `daemon.log` within seconds
+  and the session id changes. Confirm that before trusting a single observation.
 
 ### Automation detection (this is load-bearing — papio's whole value is "real human browser")
 - **Never drive the user's browser via WebDriver/BiDi for real work.** Firefox BiDi sets
