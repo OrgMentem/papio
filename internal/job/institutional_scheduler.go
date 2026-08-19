@@ -108,6 +108,16 @@ const candidateSchedulePageSize = 128
 // domain until the claim settles or is fenced. Current job attempt and exact
 // institution-profile revision are checked in SQL, as are active suppressions
 // and live claims.
+//
+// A candidate whose job has reached a terminal state is never scheduled.
+// Nothing retires a candidate row when its job is cancelled, fails, or is
+// delivered, so those papers otherwise keep an `eligible` candidate forever -
+// and since the bridge admits at most ONE candidate per safety domain per poll,
+// the corpses consume a live paper's turns on that domain indefinitely. Both
+// consumer loops already skip a job that is no longer awaiting a human, so
+// scheduling one could only ever produce work nobody would take. Observed live
+// 2026-08-19: two cancelled jobs still holding `eligible` candidates on the
+// operator's own institution domain, while a freshly focused paper waited.
 func (js *Store) ScheduleEligibleBrowserCandidates(ctx context.Context, limit int, cursor CandidateScheduleCursor) (CandidateSchedulePage, error) {
 	if js == nil || js.S == nil {
 		return CandidateSchedulePage{}, errors.New("candidate scheduler requires a store")
@@ -294,6 +304,11 @@ func (js *Store) scheduleEligibleKeysetPage(ctx context.Context, after Candidate
 		WHERE c.status='eligible'
 		  AND p.tombstoned_at IS NULL
 		  AND p.revision=c.institution_profile_revision
+		  AND NOT EXISTS (
+			SELECT 1 FROM jobs j
+			 WHERE j.id=c.job_id
+			   AND j.state IN ('cancelled','failed','imported','ready')
+		  )
 		  AND c.job_attempt_revision = 1 + (
 			SELECT COUNT(*) FROM events e
 			 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'

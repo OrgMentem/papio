@@ -176,6 +176,21 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
+- **A cancelled paper no longer blocks a live one from reaching your library.**
+  *papio* works one paper at a time per provider, so it never has two
+  institutional sign-ins racing on the same site. Deciding whose turn it is
+  looked at every paper that had ever been queued for that provider — including
+  papers you had cancelled, or that had already arrived. Those keep their place
+  in the queue forever, so a live paper could sit behind them and never get a
+  turn: you asked *papio* to open it, and nothing happened, with nothing said.
+  Finished and cancelled papers now give up their place.
+- **Asking again for a paper *papio* is already working on no longer reports a
+  refusal.** `papio actions open` on a paper whose sign-in was already queued
+  said the paper's access mode did not permit an institutional handoff — a
+  different, alarming thing that was not true. Retrying is now reported for what
+  it is, and when *papio* genuinely has nothing it can offer, the message no
+  longer name-checks a cause it did not verify: several unrelated conditions
+  produce it, and access mode was only one of them.
 - **A browser-authorized tab close that raced an extension restart now
   completes instead of stranding the tab.** The daemon's handshake
   acknowledgement to a holder session now carries its live holder

@@ -687,7 +687,18 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 		}
 	}
 	for _, jobID := range jobIDs {
-		if jobID == "" || b.focusPending[jobID] || !handoff[jobID] {
+		if jobID == "" || !handoff[jobID] {
+			continue
+		}
+		if b.focusPending[jobID] {
+			// A focus already owed is not a refusal. The flag is a sticky
+			// priority marker - it overrides the automatic admission gate in the
+			// offer loop - so it deliberately outlives the poll that delivered
+			// the first frame. Skipping it silently made every later explicit
+			// open on the same paper report the CLI's access-mode refusal and do
+			// nothing, which is precisely what an operator retrying a stalled
+			// sign-in does.
+			queued++
 			continue
 		}
 		row, getErr := b.jobs.Get(ctx, jobID)
@@ -10107,6 +10118,16 @@ func (b *Bridge) serviceMaterializationCandidate(
 			}
 			candidateOK = candidate.CandidateID != ""
 		case "eligible":
+			// An eligible row the scheduler did not hand us is not ours to offer,
+			// and in-memory tracking is the proof it did. This holds for an
+			// explicitly focused job too: the scheduler is the authority that
+			// admits at most one candidate per safety domain, so offering a
+			// durable row behind its back can put two institutional surfaces on
+			// one provider - the invariant
+			// TestMaterializationSchedulerKeepsOneSafetyDomainScaffold and
+			// TestMaterializationSchedulerErrorRetainsFocusUntilRecovery pin.
+			// A focused candidate that never reaches a schedule page is starvation
+			// upstream, in ScheduleEligibleBrowserCandidates, and is fixed there.
 			trackedOffer, tracked := b.materializationOffered[id]
 			if !tracked || trackedOffer.CandidateID != durable.ID {
 				return nil, nil

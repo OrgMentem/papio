@@ -2113,8 +2113,13 @@ func TestFocusHandoffsEmitsOnceAtAndAboveExtensionFloor(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !sessionLive || queued != 0 {
-				t.Fatalf("duplicate focus result = queued:%d live:%t, want 0,true", queued, sessionLive)
+			// A focus still owed counts as queued: the request IS pending. It used
+			// to count 0, which the CLI renders as a refusal ("handoffs were not
+			// opened"), so an operator retrying a stalled sign-in was told papio
+			// would not act on a paper it was already holding a focus for. The
+			// frame count below is what pins "emits once".
+			if !sessionLive || queued != 1 {
+				t.Fatalf("duplicate focus result = queued:%d live:%t, want 1,true", queued, sessionLive)
 			}
 
 			msgs, _ := runSync(t, b)
@@ -2334,6 +2339,46 @@ func TestInstitutionalCandidateOfferReoffersUntilClaim(t *testing.T) {
 	cancelled, _ := runSync(t, b)
 	if firstOfType(cancelled, protocol.MsgCancel) == nil {
 		t.Fatalf("cancel after bind did not emit cancel: %v", cancelled)
+	}
+}
+
+// TestFocusedOfferSurvivesACancelledSiblingOnTheSameDomain pins the operator's own
+// request against starvation by a corpse, through the whole chain: the real
+// scheduler, the bridge's one-candidate-per-safety-domain admission, and the
+// offer frame. Nothing retires a candidate row when its job is cancelled, so the
+// dead paper kept winning its domain's single admission slot and the focused live
+// paper was never offered - no frame, no tab, and (because focusPending is
+// retained) every retry reported as a refusal. Observed live 2026-08-19 with
+// job_673c22adda606ce0959b4034df behind two cancelled siblings.
+func TestFocusedOfferSurvivesACancelledSiblingOnTheSameDomain(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	dead := parkInstitutional(t, jobs, "materialization-starve-dead", handoffWork(), "")
+	liveWork := handoffWork()
+	liveWork.DOI = "10.1002/example.43"
+	live := parkInstitutional(t, jobs, "materialization-starve-live", liveWork, "")
+	runSync(t, b, materializationHello(t))
+	// One safety domain, so only one of the two can ever be admitted per poll.
+	explicitMaterializationCandidate(t, jobs, dead, "domain-starve")
+	liveCandidate := explicitMaterializationCandidate(t, jobs, live, "domain-starve")
+	if err := jobs.Cancel(ctx, dead, job.TerminalReasonBrowserCancelled); err != nil {
+		t.Fatalf("cancel the sibling: %v", err)
+	}
+
+	if queued, sessionLive, err := b.FocusHandoffs(ctx, []string{live}); err != nil || !sessionLive || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, sessionLive, err)
+	}
+	msgs, _ := runSync(t, b)
+	offer := firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil {
+		t.Fatalf("focused live paper was never offered behind a cancelled sibling: %v", msgs)
+	}
+	payload, ok := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload)
+	if !ok {
+		t.Fatalf("offer payload = %T, want *protocol.InstitutionalCandidateOfferPayload", offer.Payload)
+	}
+	if offer.JobID != live || payload.CandidateID != liveCandidate {
+		t.Fatalf("offered job %q candidate %q, want %q/%q", offer.JobID, payload.CandidateID, live, liveCandidate)
 	}
 }
 

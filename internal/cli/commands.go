@@ -911,14 +911,18 @@ func focusOrOpenActionURLs(ctx context.Context, urls, untrackedURLs, jobIDs []st
 	}
 	result, err := focus(ctx, jobIDs)
 	if err == nil && result.SessionLive {
-		// The daemon skips a parked job whose access mode cannot be expressed
-		// as a handoff offer. Falling back to the OS browser for those would
-		// open exactly the institutional access the mode forbids, so they are
-		// reported instead. Silently opening nothing was the prior behaviour
-		// and it told the user papio had acted when it had not.
+		// The daemon skips a parked job it cannot express as a handoff offer.
+		// Falling back to the OS browser for those would open exactly the
+		// institutional access the mode forbids, so they are reported instead.
+		// Silently opening nothing was the prior behaviour and it told the user
+		// papio had acted when it had not. The shortfall does not name one cause:
+		// the daemon also skips a job that is no longer awaiting a human, one
+		// whose download already settled, and one held by a safety latch. Naming
+		// access mode as the reason sent a reader chasing a consumed
+		// authorization that did not exist.
 		if skipped := len(jobIDs) - result.Queued; skipped > 0 {
 			if _, err := fmt.Fprintf(out,
-				"%d of %d handoffs were not opened: the job's access mode does not permit an institutional handoff\n",
+				"%d of %d handoffs were not opened: papio holds no institutional handoff it can offer for them right now - see papio jobs show <id> and papio doctor\n",
 				skipped, len(jobIDs)); err != nil {
 				return err
 			}

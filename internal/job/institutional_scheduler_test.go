@@ -184,6 +184,38 @@ func TestScheduleEligibleBrowserCandidatesExcludesStaleAndParkedRows(t *testing.
 	}
 }
 
+// TestScheduleEligibleBrowserCandidatesExcludesTerminalJobs pins the corpse case.
+// Nothing retires a candidate row when its job reaches a terminal state, and the
+// bridge admits at most one candidate per safety domain per poll, so a cancelled
+// paper's `eligible` candidate consumed a live paper's turns on that domain
+// forever. Observed live 2026-08-19 on the operator's own institution domain.
+func TestScheduleEligibleBrowserCandidatesExcludesTerminalJobs(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	profile := institutionalProfile(t, js, "scheduler-terminal", "digest-terminal", "auth-terminal")
+	deadJob := schedulerJob(t, js, "scheduler-terminal-dead")
+	liveJob := schedulerJob(t, js, "scheduler-terminal-live")
+	// Same safety domain: the dead one is the only reason the live one waits.
+	insertSchedulerCandidateKeys(t, js, "scheduler-terminal-dead-candidate", deadJob, profile,
+		"pre-route-dead", "shared-domain", "eligible", "2026-08-01T00:00:00Z")
+	insertSchedulerCandidateKeys(t, js, "scheduler-terminal-live-candidate", liveJob, profile,
+		"pre-route-live", "shared-domain", "eligible", "2026-08-01T00:00:01Z")
+	if err := js.Cancel(ctx, deadJob, TerminalReasonBrowserCancelled); err != nil {
+		t.Fatalf("cancel the dead job: %v", err)
+	}
+
+	page, err := js.ScheduleEligibleBrowserCandidates(ctx, 20, CandidateScheduleCursor{})
+	if err != nil {
+		t.Fatalf("schedule after cancellation: %v", err)
+	}
+	if len(page.Candidates) != 1 {
+		t.Fatalf("scheduled %+v, want only the live job's candidate", page.Candidates)
+	}
+	if page.Candidates[0].CandidateID != "scheduler-terminal-live-candidate" {
+		t.Fatalf("scheduled %q, want the live job's candidate", page.Candidates[0].CandidateID)
+	}
+}
+
 func TestScheduleEligibleBrowserCandidatesDedupesLandedDomainAcrossPreRoutes(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
