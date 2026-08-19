@@ -586,15 +586,40 @@ race below for why a fresh live open could not be driven afterwards.
    Recorded because the wrong version of this entry was committed first, and the
    reasoning that produced it - reading "the CLI said access mode" as evidence
    about access mode - is the trap worth remembering.
-2. **Claim observations never reach the journal.**
-   `claim_observation_journal` is empty for every run today, including one whose
-   job events show `browser.auth_returned` — so the timing-only frame landed
-   while the observation did not. Defect 1 above explains the earlier runs
-   (job-keyed emitters had no tab), but not this one. Ranked candidates from the
-   read: emission requires both a live `claimGrants` entry (worker memory, gone
-   after a ~30s MV3 sleep) and `tabLedgerCache[tabID].binding_id`; a daemon-side
-   rejection would also leave the journal empty and is not recorded anywhere.
-   Distinguishing them needs the ack outcome, which nothing persists.
+2. **Claim observations never reached the journal — CAUSE FOUND AND FIXED
+   (`2d4eec3`), and it was two layers of the same mistake.**
+   `claim_observation_journal` held zero rows across weeks of real sign-ins.
+   Both layers keyed on the browser holder generation:
+
+   - `ApplyClaimObservation` required the entry lease's OWN recorded generation
+     to equal the daemon's current epoch, on `wall_observed`/`login_started`/
+     `mfa`/`challenge`, `auth_returned` and `entitled_landing`. The sender's
+     staleness is already fenced above it (`FrameGeneration != Generation` ->
+     `stale`), so that clause said nothing about the sender: it demanded the
+     lease have been *reserved in the current epoch*.
+   - `reserveAuthenticationEntryLeaseTx`'s renewal branch required lease-id AND
+     generation equality, and its `UPDATE` never carried the generation
+     forward, so a reserved entry was bound for life to the session that
+     arbitrated it.
+
+   MV3 sleeps a worker after ~30s idle, so a reconnect mid-login is the common
+   case, and §4.5 chose human-paced renewal precisely because a login/MFA
+   prompt outlives any fixed window. After any reconnect the institution's only
+   entry was neither renewable nor re-reservable — not even by its own owner
+   re-consulting, whose lease id is derived from the epoch — until the timer
+   expired, and every observation meanwhile was refused "the entry is owned
+   elsewhere". A reserved entry now keys on the owner job alone and carries the
+   new lease id and generation forward. A settled HUMAN lease still treats
+   generation churn as revocation, and a stranger still cannot take a live
+   reserved entry.
+
+   The earlier ranked candidates in this entry (worker-memory `claimGrants`,
+   `tabLedgerCache` binding) were both wrong, and the entry itself named why
+   they could not be distinguished: nothing persisted the ack outcome. That is
+   also fixed — the daemon now logs any non-applied observation with its event
+   kind and reason, out of band rather than widened into the ack. Note the
+   journal is still empty *as of writing*: no sign-in has completed on the
+   fixed build, because of item 4.
 3. **Dead candidate rows are never retired — the scheduling half is FIXED, the
    retirement half is not.** Live: two `eligible` candidates belonging to
    **cancelled** jobs (`7246c11621`, `39fd95207c`), plus candidates still
@@ -608,3 +633,42 @@ race below for why a fresh live open could not be driven afterwards.
    pass marks a candidate `abandoned` when its job goes terminal, so the rows
    accumulate, and `papio doctor` has nothing to say about them. Worth a reaper
    on the maintenance sweep; not worth a migration on its own.
+4. **A paper may bind a surface while a different job owns its institution's
+   entry, and is then stuck with a claim that can never issue a route — while
+   reporting itself as waiting for the human.** This is the live blocker now,
+   and it is the shape of the operator's original complaint seen from the other
+   side: not too many tabs, but a paper that says it is waiting for a sign-in
+   while it has no surface at all and is really waiting for its own lease.
+
+   Measured live 2026-08-19 on `job_eb16f955653ac52f89355d19bd`:
+   `handoff.opened` 05:27:00Z; claim `claim_009d4edb` created 05:35:26Z with a
+   minted binding but `tab_id 0`, `route_issuance_ordinal 0`,
+   `effect_ordinal 0`, claim lease to 06:05:27Z; `browser.auth_pending` 05:35:27Z.
+   At that moment the institution's entry was owned by the stale
+   `job_9f8bec30da97267aa9a7d89462` (item 3's shape: no candidate, no claim, no
+   binding). The bind's own lease-owner update
+   (`setAuthenticationEntryLeaseOwnerBindingTx`) fences on
+   `owner_id`+`browser_holder_generation`+state, so it silently no-ops in that
+   situation, and its call site is guarded by `if authenticationClaimID != ""`
+   (`institutional_materialization.go:844`) — so the bind completed anyway,
+   contradicting that function's own doc comment ("a fenced no-op here fails the
+   whole bind instead of leaving a bound scaffold with no recorded lease
+   owner").
+
+   After `cfe9145` the entry now churns instead of blocking for 30 minutes:
+   observed 05:44:15Z the stale entry lapse, `job_fb8713b63b8960` take it
+   immediately with `lease_until 05:46:27Z` (the 2-minute bind deadline, live
+   proof of that fix), and lapse again unconsumed. Papers are taking turns at a
+   permission none of them converts into a surface.
+
+   Diagnose from the bind, not the lease: either the bind must fail when it
+   cannot record itself as the entry's owner (what its comment already claims),
+   or it must be sequenced after acquiring the entry. Do not paper over it by
+   letting the route issue without the entry — that is the "two sign-in tabs on
+   one institution" failure the whole arbitration exists to prevent.
+5. **`auth_pending` is reported for a state the human cannot act on.** Same run:
+   the extension sent `auth_pending` one second after binding, with no tab and
+   no route. `papio actions` then advertises a paper as awaiting the operator's
+   sign-in when there is nothing to sign in to. A park is the correct behaviour;
+   naming it a human-action wait is not. Worth a distinct disposition so
+   `papio jobs`/`actions` can say "waiting for papio", not "waiting for you".
