@@ -2358,6 +2358,18 @@ func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol
 			log.Printf("papio: claim observation entitled_landing reoffer unavailable: %v", err)
 		}
 	}
+	// An observation the daemon declines is otherwise invisible on both sides:
+	// the extension's outbox drain retires the entry on `rejected`/`stale`
+	// (its own comment says a rejection "is still logged server-side", which
+	// until now it was not), and nothing persists the ack outcome. So a
+	// permanently refused login journal — measured live 2026-08-19, zero rows
+	// across weeks of real sign-ins — looked exactly like a login nobody had
+	// ever attempted. Log the disposition out of band rather than widening the
+	// ack: the IPC result shape is fail-closed for older peers (AGENTS.md).
+	if applied.Outcome != "applied" {
+		log.Printf("papio: claim observation %s for %s not applied: %s (%s)",
+			p.EventKind, jobID, applied.Outcome, applied.Detail)
+	}
 	return b.claimObservationAck(jobID, protocol.ClaimObservationAckPayload{
 		RequestID: p.RequestID, Outcome: applied.Outcome, Detail: applied.Detail,
 		GateOccurrenceID: applied.GateOccurrenceID, BrowserHolderGeneration: generation,

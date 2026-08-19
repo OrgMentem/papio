@@ -146,10 +146,25 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 	}
 
 	nowText := in.Now.UTC().Format(time.RFC3339Nano)
+	// The lease's OWN BrowserHolderGeneration is deliberately not compared
+	// against in.Generation on any path below. The sender's staleness is
+	// already fenced above (in.FrameGeneration != in.Generation -> stale), so
+	// by here the observing holder is proven current; the lease's field only
+	// records the generation it was last reserved under, and every renewal
+	// and promotion below carries in.Generation forward into it. Requiring
+	// equality as a precondition forbade exactly that carry-forward: a
+	// browser reconnect between arbitration and the human's sign-in bumps the
+	// epoch, and every later observation for that login was then rejected for
+	// good. §4.5's own rationale for human-paced renewal ("a login/MFA/
+	// challenge prompt routinely outlives the arbitrary action-expiry window")
+	// is precisely the case that outlives a reconnect. Measured live
+	// 2026-08-19: claim_observation_journal held zero rows across weeks of
+	// real sign-ins on the operator's own library, with nothing on either
+	// side reporting why.
 	switch in.EventKind {
 	case "wall_observed", "login_started", "mfa", "challenge":
 		if !leaseFound || lease.State != AuthenticationEntryLeaseReserved ||
-			lease.OwnerID != ownerJobID || lease.BrowserHolderGeneration != in.Generation {
+			lease.OwnerID != ownerJobID {
 			return fail("rejected", "no live reserved entry for this owner")
 		}
 		renewed, err := reserveAuthenticationEntryLeaseTx(ctx, tx, AuthenticationEntryLeaseInput{
@@ -165,7 +180,7 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 		result.LeaseUntil = renewed.LeaseUntil
 	case "auth_returned":
 		if !leaseFound || lease.State != AuthenticationEntryLeaseReserved ||
-			lease.OwnerID != ownerJobID || lease.BrowserHolderGeneration != in.Generation {
+			lease.OwnerID != ownerJobID {
 			return fail("rejected", "no live reserved entry for this owner")
 		}
 		if candidate == nil {
@@ -197,7 +212,7 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 		}
 	case "entitled_landing":
 		if !leaseFound || lease.State != AuthenticationEntryLeaseHuman ||
-			lease.HumanOwnerID != ownerJobID || lease.BrowserHolderGeneration != in.Generation {
+			lease.HumanOwnerID != ownerJobID {
 			return fail("rejected", "entry is not a settled human sign-in for this owner")
 		}
 		if err := markAuthenticationEntryLeaseEntitledTx(ctx, tx, in.AuthenticationClaimID, lease.LeaseID, ownerJobID, in.Generation, nowText); err != nil {

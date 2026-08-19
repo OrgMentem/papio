@@ -1178,12 +1178,40 @@ func reserveAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, in Authentic
 		}
 		expired := current.State == AuthenticationEntryLeaseExpired || humanRevoked || reservedExpired
 		if !expired {
+			// A reserved entry belongs to the JOB that is signing in, not to the
+			// browser session that happened to arbitrate for it. Renewal
+			// therefore keys on the owner job alone and carries the new lease id
+			// and holder generation forward, so the sign-in survives a service
+			// worker restart: §4.5 requires human-paced renewal precisely
+			// because "a login/MFA/challenge prompt routinely outlives the
+			// arbitrary action-expiry window", and MV3 sleeps a worker after
+			// ~30s idle, so a reconnect mid-login is the common case rather than
+			// the edge one. Requiring lease-id and generation equality here made
+			// a reconnect leave the institution's only entry neither renewable
+			// nor re-reservable — not even by its own owner re-consulting under
+			// the new generation, whose lease id is derived from the epoch —
+			// until the 30-minute timer expired. Every claim_observation for
+			// that login was refused as "the entry is owned elsewhere" in the
+			// meantime, which is why the journal held zero rows across weeks of
+			// real sign-ins (measured live 2026-08-19).
+			//
+			// A settled HUMAN sign-in is deliberately NOT renewable this way:
+			// humanRevoked above still treats generation churn as revocation,
+			// because papio cannot verify a human session survived a browser
+			// restart without fresh evidence. Only the reserved (pre-sign-in)
+			// phase is holder-agnostic; the sender is separately fenced as the
+			// current holder before any of this runs.
 			if current.State == AuthenticationEntryLeaseReserved &&
-				current.LeaseID == in.LeaseID && current.OwnerID == in.OwnerID &&
-				current.BrowserHolderGeneration == in.BrowserHolderGeneration {
-				if _, err := q.ExecContext(ctx, `UPDATE authentication_entry_leases SET lease_until=?, updated_at=? WHERE authentication_claim_id=?`, untilText, nowText, in.AuthenticationClaimID); err != nil {
+				current.OwnerID == in.OwnerID {
+				if _, err := q.ExecContext(ctx, `
+					UPDATE authentication_entry_leases
+					   SET lease_id=?, browser_holder_generation=?, lease_until=?, updated_at=?
+					 WHERE authentication_claim_id=?`,
+					in.LeaseID, in.BrowserHolderGeneration, untilText, nowText,
+					in.AuthenticationClaimID); err != nil {
 					return nil, err
 				}
+				current.LeaseID, current.BrowserHolderGeneration = in.LeaseID, in.BrowserHolderGeneration
 				current.LeaseUntil, current.UpdatedAt = untilText, nowText
 				return &current, nil
 			}

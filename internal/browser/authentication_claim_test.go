@@ -419,6 +419,64 @@ func TestClaimObservationAuthReturnedPromotesLeaseToHuman(t *testing.T) {
 	}
 }
 
+// TestClaimObservationSurvivesAReconnectSinceArbitration pins the operator's
+// login journal against generation churn. The entry lease records the holder
+// generation it was reserved under; a browser reconnect between arbitration and
+// the human finishing sign-in promotes a new holder and bumps that generation.
+// The reducer used to require the lease's own generation to equal the current
+// one, so every observation for such a login was rejected for good, and since
+// nothing logged or persisted the ack outcome, a permanently refused journal was
+// indistinguishable from a login nobody attempted: measured live 2026-08-19,
+// claim_observation_journal held zero rows across weeks of real sign-ins. The
+// sender's own staleness is fenced separately (FrameGeneration != Generation ->
+// stale), which TestClaimObservationStaleGenerationMutatesNothing pins.
+func TestClaimObservationSurvivesAReconnectSinceArbitration(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	jobID := parkInstitutional(t, jobs, "wr_observation_reconnect", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auth-observation-reconnect")
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-reconnect")
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, jobID,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auth-observation-reconnect-req", CandidateID: candidateID,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-reconnect", 5)
+	reservedUnder := b.epoch
+
+	// The service worker dies mid-login and reconnects as a new session: the
+	// port closes (goodbye), then the fresh worker says hello and is promoted,
+	// which is what advances the holder generation live.
+	if _, err := b.Sync(ctx, testSessionID, true, nil); err != nil {
+		t.Fatalf("goodbye for the dying worker: %v", err)
+	}
+	runSyncAs(t, b, "session-after-reconnect", authClaimHello(t))
+	if b.epoch == reservedUnder {
+		t.Fatalf("reconnect did not advance the holder generation (still %d)", b.epoch)
+	}
+
+	msgs, _ := runSyncAs(t, b, "session-after-reconnect",
+		claimObservationFrame(t, jobID, "obs-reconnect-req", "auth-observation-reconnect",
+			bindingID, grant.GateOccurrenceID, "observation-reconnect", b.epoch, 0, "wall_observed"))
+	ack := claimObservationAckPayload(t, msgs)
+	if ack.Outcome != "applied" {
+		t.Fatalf("wall_observed after a reconnect = %+v, want applied", ack)
+	}
+	lease, found, err := jobs.GetAuthenticationEntryLease(ctx, "auth-observation-reconnect")
+	if err != nil || !found {
+		t.Fatalf("lease read after renewal: found=%v err=%v", found, err)
+	}
+	if lease.BrowserHolderGeneration != b.epoch {
+		t.Fatalf("renewal left generation %d, want it carried forward to %d",
+			lease.BrowserHolderGeneration, b.epoch)
+	}
+	if lease.State != job.AuthenticationEntryLeaseReserved || lease.OwnerID != jobID {
+		t.Fatalf("lease after renewal = %+v, want reserved and owned by %s", lease, jobID)
+	}
+}
+
 // TestClaimObservationDuplicateStaleRejectedNeverTouchLeaseOrEvidence pins
 // §3's no-op guarantee (claim_observation_apply.go's ApplyClaimObservation
 // doc comment: "a duplicate, stale, or rejected observation is a true no-op

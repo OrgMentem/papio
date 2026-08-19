@@ -176,6 +176,23 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
+- **Your library sign-in now survives *papio* going briefly idle mid-login.** A
+  browser puts an extension to sleep after about thirty seconds of quiet, so it
+  wakes up as a new session — which routinely happens while you are still typing
+  a password or approving a push notification. *papio* had tied your
+  institution's one sign-in slot to the session that opened it, so waking up
+  stranded that slot for the next half hour: it could not be extended, and could
+  not be re-taken even by the very paper waiting on it, while every note *papio*
+  tried to make about your sign-in was refused. Signing in was still possible,
+  but *papio* learned nothing from it and could not start the papers waiting
+  behind it. The slot now belongs to the paper, not to the session, so it is
+  extended when *papio* wakes and picks up exactly where it left off. One
+  sign-in per institution at a time is unchanged, and a finished sign-in still
+  needs fresh proof after a browser restart.
+- **When *papio* refuses one of its own notes about your sign-in, it now says
+  so.** Those refusals were silent on both sides, so a login *papio* could never
+  record looked identical to one nobody had ever attempted — which is how the
+  fault above went unnoticed for weeks. The reason is now written to the log.
 - **A paper you cancelled no longer makes a live one wait its turn.** *papio*
   works one paper at a time per provider, so it never has two institutional
   sign-ins racing on the same site. Deciding whose turn it is looked at every

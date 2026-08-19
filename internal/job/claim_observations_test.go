@@ -248,6 +248,53 @@ func TestAuthenticationEntryLeaseReassignmentClearsPriorOwnerBinding(t *testing.
 	}
 }
 
+// TestAuthenticationEntryLeaseOwnerReReservesAcrossGenerations pins whose lease
+// this is. A reserved entry belongs to the job signing in, not to the browser
+// session that arbitrated for it, so its own owner may re-reserve under a new
+// holder generation with a fresh lease id — the shape a service-worker restart
+// mid-login produces, since the lease id is derived from the epoch. Requiring
+// lease-id and generation equality stranded the institution's only entry for
+// the full action-expiry window after every reconnect: unrenewable, and
+// un-re-reservable even by its owner, while every claim_observation for that
+// login was refused as "owned elsewhere". The live sign-in surface stays put
+// across the renewal (nothing about the paper changed), which is what
+// distinguishes this from the reassignment above.
+func TestAuthenticationEntryLeaseOwnerReReservesAcrossGenerations(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-regen", LeaseID: "lease-gen-1", OwnerID: "job-regen",
+		BrowserHolderGeneration: 1, LeaseUntil: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx, "claim-regen", "job-regen", 1, "binding-regen", 9); err != nil {
+		t.Fatal(err)
+	}
+	renewed, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-regen", LeaseID: "lease-gen-2", OwnerID: "job-regen",
+		BrowserHolderGeneration: 2, LeaseUntil: now.Add(2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("owner re-reserving under a new generation: %v", err)
+	}
+	if renewed.BrowserHolderGeneration != 2 || renewed.LeaseID != "lease-gen-2" {
+		t.Fatalf("renewal did not carry the new holder identity forward: %+v", renewed)
+	}
+	if renewed.OwnerBindingID != "binding-regen" || renewed.OwnerTabHint == nil || *renewed.OwnerTabHint != 9 {
+		t.Fatalf("renewal disturbed the live sign-in surface: %+v", renewed)
+	}
+	// A different job still cannot take a live reserved entry: one sign-in per
+	// institution is the invariant the generation fence was mistaken for.
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-regen", LeaseID: "lease-gen-3", OwnerID: "job-stranger",
+		BrowserHolderGeneration: 2, LeaseUntil: now.Add(3 * time.Minute),
+	}); !errors.Is(err, ErrAuthenticationEntryLeaseBusy) {
+		t.Fatalf("stranger reserving a live entry = %v, want ErrAuthenticationEntryLeaseBusy", err)
+	}
+}
+
 // TestAuthenticationEntryLeaseExpiryRefusedWhileEffectPermitHeld pins §4.5:
 // expiry alone never authorizes a replacement while an effect permit is
 // unresolved for the lease's own occupying binding.
