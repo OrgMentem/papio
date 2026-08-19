@@ -430,7 +430,7 @@ Attempt five's carry over verbatim. Additionally: any slice that requires
 widening `Response`/IPC shapes or the timing-only auth frames (fail-closed
 skew, see AGENTS.md) stops and redesigns behind a new method/feature.
 
-## Open defect from the live smoke run (2026-08-19) — blocks calling this done
+## Live smoke run defect (2026-08-19) — FIXED, with one open question
 
 **An internal scaffold removal is reported to the daemon as operator
 cancellation, and the daemon cancels the paper.** Reproduced twice on the
@@ -456,9 +456,29 @@ or papio reads its own housekeeping as the operator giving up. Slice 2b built
 exactly that transaction for authorized closes; the defect is the path that
 removes a surface *without* using it.
 
-Next step is diagnosis, not a patch: instrument which caller removes the tab
-(reconcile dedupe, `materialization-reconcile` bypass, or a work-window
-teardown), then either route it through the authorized close transaction or
-give it an explicit non-cancellation disposition. Do not re-run institutional
-opens on a real library until this is closed — each one can cancel a paper.
-Both papers above are recoverable with `papio acquire <doi>` once it is.
+**Fixed** by an explicit intent marker (`deliberateRemovals`), consumed once in
+`onTabRemoved`: a removal this worker initiated retires the surface, detaches
+the job, and reports nothing — no `provider_outcome`, no cancellation, no
+`owner_closed`. The marker is set in `removeMaterializationTab`, the single
+chokepoint all fourteen internal removal sites share, and dropped again when
+`closeOwnedTab` refuses (the tab survives, so a genuine operator close later is
+still a real cancellation). Worker-memory is the correct tier here, unlike the
+durable claim identity beside it: the `onRemoved` event for a removal we
+initiate always arrives in the same worker lifetime.
+
+Two tests pin the distinction, both verified against the pre-fix source: an
+internal removal of a job-owned surface reports nothing, and an operator close
+of the same surface still cancels. They drive the chokepoint directly because
+every existing materialization test used `materializationActiveJob`, whose
+`tab_id: -1` made `findByTab` miss and left the whole cancellation branch
+unreachable — which is why 1,212 green tests coexisted with cancelled papers.
+
+**Open question, deliberately not guessed:** which of the fourteen callers fired
+in the two traces above. The fix holds regardless (it is at the seam they all
+share), but the trigger itself — two `provider_outcome` frames, and an
+`auth_pending` arriving 122ms *after* the cancellation — suggests a removal
+racing an in-flight authentication, which may be its own ordering bug. Pinning
+it needs instrumentation on a live institutional open, which was stopped to
+avoid cancelling more papers.
+
+Both papers above are recoverable with `papio acquire <doi>`.

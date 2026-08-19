@@ -2655,6 +2655,20 @@ export class Bridge {
   /** Broker-tab ids whose auth attempt is already counted, so the SSO redirect
    * dance within one drive increments the budget only once. Worker-local. */
   private readonly authCountedTabs = new Set<number>();
+  /** Tabs this worker is removing as its OWN housekeeping — reconcile dedupe,
+   * a superseded correlation, a non-chosen candidate. `onTabRemoved` consumes
+   * the marker and treats the removal as deliberate: no `provider_outcome`,
+   * no daemon-side cancellation, no `owner_closed`. Without it papio reads its
+   * own tidy-up as the operator giving up and cancels the paper — measured
+   * twice on a real library (see the open-defect table in
+   * dev/active/surface-lifecycle-plan.md), which is why reviewers asked for
+   * this marker rather than a rewrite of onTabRemoved.
+   *
+   * Worker-memory is the RIGHT tier here, unlike the durable claim identity
+   * beside it: the `onRemoved` event for a removal we initiate always arrives
+   * in the same worker lifetime, and a worker that dies first loses the event
+   * entirely, so there is nothing for a persisted marker to answer. */
+  private readonly deliberateRemovals = new Set<number>();
   private readonly pageBulkRecovery: PageBulkCohortRecovery;
   private managedTabChain: Promise<unknown> = Promise.resolve();
   /** Coalesce concurrent inbox clicks for one job so one request owns the
@@ -8101,8 +8115,20 @@ export class Bridge {
     return { byBinding, reliable: true };
   }
 
+  /** Every internal removal of a materialization surface routes through here,
+   * so this is the one place that has to declare the removal papio's own. */
   private async removeMaterializationTab(tabID: number): Promise<void> {
-    await this.closeOwnedTab(tabID, "materialization-reconcile");
+    this.deliberateRemovals.add(tabID);
+    let removed = false;
+    try {
+      removed = await this.closeOwnedTab(tabID, "materialization-reconcile");
+    } finally {
+      // closeOwnedTab refuses a tab the operator has claimed (active, pinned,
+      // navigated away, foreign window). The tab survives, so the marker must
+      // not: a genuine operator close later is a real cancellation and has to
+      // be reported as one.
+      if (!removed) this.deliberateRemovals.delete(tabID);
+    }
   }
 
   private materializationResponseMatches(
@@ -17906,6 +17932,9 @@ export class Bridge {
     this.authCountedTabs.delete(tabID);
     const authorizedClose =
       this.tabLedgerCache?.[String(tabID)]?.pending_close !== undefined;
+    // Consumed exactly once, whatever happens below: this worker removed the
+    // tab itself as housekeeping, so the removal is not the operator giving up.
+    const deliberate = this.deliberateRemovals.delete(tabID);
     const ownerBindingID = this.tabLedgerCache?.[String(tabID)]?.binding_id;
     // Read before forgetLedgeredTab erases the record: after a worker
     // restart this is the ONLY surviving proof of which claim this surface
@@ -17922,6 +17951,7 @@ export class Bridge {
     // claim-owned tab is exactly the observation §2.2.1 defines.
     if (
       !authorizedClose &&
+      !deliberate &&
       ownerBindingID !== undefined &&
       job.status !== "awaiting_download"
     ) {
@@ -17961,10 +17991,12 @@ export class Bridge {
       }
     }
     this.clearClaimGrant(job.job_id);
-    if (authorizedClose) {
-      // A deliberate, daemon-authorized close (closeOwnedSurface), not an
-      // operator cancel: detach the job from its now-gone tab without
-      // emitting provider_outcome/cancellation or tearing the job down.
+    if (authorizedClose || deliberate) {
+      // Deliberate: either a daemon-authorized close (closeOwnedSurface) or
+      // this worker's own reconcile removal. Detach the job from its now-gone
+      // tab without emitting provider_outcome/cancellation or tearing the job
+      // down — the daemon learns the true set of live surfaces from the
+      // reconcile round trip, not from a cancellation it never asked for.
       await this.update((s) => patchJob(s, job.job_id, { tab_id: -1 }));
       return;
     }

@@ -135,6 +135,15 @@ for the full pre-split extension history.
   older daemon's short feature list still negotiates exactly as before.
 
 ### Fixed
+- **papio no longer cancels a paper by tidying up after itself.** When *papio*
+  closed one of its own working tabs — a duplicate it had just replaced, or a
+  placeholder it was finished with — it then told the daemon the tab had
+  closed, and the daemon read that the only way it could: as you giving up on
+  the paper. The paper was cancelled, seconds after you asked for it, with
+  nothing on screen to explain why. Two papers were lost this way while
+  testing on a real library. *papio*'s own closes are now marked as its own, so
+  they retire the tab and keep the paper; closing a *papio* tab **yourself**
+  still cancels the paper, exactly as before.
 - **Closing an abandoned sign-in tab frees the other papers immediately, even
   hours later.** Giving up on a library sign-in released that institution's
   single sign-in slot only while *papio*'s background worker happened to still

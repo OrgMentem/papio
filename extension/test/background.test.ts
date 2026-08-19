@@ -16832,6 +16832,99 @@ test("new institutional candidate supersedes old correlation and closes its scaf
   expect(h.tabs.removed).toContain(901);
 });
 
+// Live-smoke regression (2026-08-19): two papers were cancelled on the
+// operator's own library by papio's own housekeeping. A reconcile removal of a
+// surface the job still pointed at fell through onTabRemoved to the operator-
+// cancel branch: `provider_outcome {outcome:"cancelled"}` + removeJobWithOffer,
+// and the daemon cancelled the paper (traces in the open-defect table in
+// dev/active/surface-lifecycle-plan.md). Every existing materialization test
+// missed it because `materializationActiveJob` sets `tab_id: -1`, so
+// `findByTab` never matched and the branch was unreachable. These two pin the
+// distinction the marker draws: papio's own removal is silent, the operator's
+// is still a cancellation.
+test("live smoke regression: an internal removal of a surface the job still owns never reports cancellation", async () => {
+  const jobID = "job_mat_no_self_cancel";
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
+  // Driven at the chokepoint every internal removal shares (fourteen callers:
+  // reconcile dedupe, superseded correlation, response-loss cleanup, …) rather
+  // than through one caller. Some callers detach the job before removing and
+  // are safe by accident; the invariant belongs to the removal itself, and
+  // this is the seam that decides it for all of them.
+  const internals = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+    removeMaterializationTab: (tabID: number) => Promise<void>;
+  };
+  h.tabs.seed({
+    id: 901,
+    url: "chrome-extension://test/dist/materialize.html#bind_0001",
+    active: false,
+    windowId: 500,
+  });
+  await internals.update.call(h.bridge, (store) => ({
+    ...store,
+    // The production state the existing tests could not reach:
+    // materializationActiveJob sets tab_id -1, so findByTab never matched and
+    // onTabRemoved's job-bearing branches were unreachable from any of them.
+    activeJobs: [{ ...materializationActiveJob(jobID), tab_id: 901 }],
+    workWindowID: 500,
+  }));
+  const framesBefore = h.port.posted.length;
+  await internals.removeMaterializationTab.call(h.bridge, 901);
+  expect(h.tabs.removed).toContain(901);
+
+  // Papio removed it, so nothing is reported as an outcome and the paper lives.
+  expect(
+    h
+      .frames()
+      .slice(framesBefore)
+      .filter((frame) => frame.type === "provider_outcome"),
+  ).toEqual([]);
+  const job = h.backend.store.activeJobs.find(
+    (candidate) => candidate.job_id === jobID,
+  );
+  expect(job).toBeDefined();
+  // Detached from the dead tab, retained for the reconcile round trip.
+  expect(job?.tab_id).toBe(-1);
+});
+
+test("live smoke regression: the operator closing that same surface IS still a cancellation", async () => {
+  const jobID = "job_mat_operator_cancel";
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
+  const internals = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+  };
+  h.tabs.seed({
+    id: 902,
+    url: "chrome-extension://test/dist/materialize.html#bind_0002",
+    active: false,
+    windowId: 500,
+  });
+  await internals.update.call(h.bridge, (store) => ({
+    ...store,
+    activeJobs: [{ ...materializationActiveJob(jobID), tab_id: 902 }],
+    workWindowID: 500,
+  }));
+  const framesBefore = h.port.posted.length;
+  await h.tabs.userClose(902);
+  const outcome = await h.port.waitForFrame("provider_outcome", framesBefore);
+  expect(outcome.payload["outcome"]).toBe("cancelled");
+  expect(
+    h.backend.store.activeJobs.find((candidate) => candidate.job_id === jobID),
+  ).toBeUndefined();
+});
+
 test("route update loss removes dead scaffold and next run rebinds a replacement", async () => {
   const h = makeHarness();
   await h.bridge.start();
