@@ -429,3 +429,36 @@ fallback) was reviewed as unsafe and is retracted.
 Attempt five's carry over verbatim. Additionally: any slice that requires
 widening `Response`/IPC shapes or the timing-only auth frames (fail-closed
 skew, see AGENTS.md) stops and redesigns behind a new method/feature.
+
+## Open defect from the live smoke run (2026-08-19) — blocks calling this done
+
+**An internal scaffold removal is reported to the daemon as operator
+cancellation, and the daemon cancels the paper.** Reproduced twice on the
+operator's own browser, on both sides of the page-path fix, so it is neither
+caused by nor fixed by today's commits:
+
+| job | build | trace |
+| --- | --- | --- |
+| `job_7246c11621dacc4a01e6929aea` (`doi:10.1207/s15327043hup1101_3`) | pre-`d2f4474` | `browser.auth_pending` 02:37:09Z → `browser.provider_outcome` 02:39:17.822Z → `job.transition` 02:39:17.823Z → **cancelled** |
+| `job_39fd95207c8880a4b079cf8297` (`doi:10.1371/journal.pone.0173664`) | HEAD (`0ef7b4b`) | `handoff.opened` 03:09:33Z → `provider_outcome` + `job.latch` + `provider_outcome` → `job.transition` 03:09:41.799Z → **cancelled**, then `browser.auth_pending` 03:09:41.921Z *after* the cancellation |
+
+Neither had any operator interaction: the first happened while the machine was
+asleep and locked, the second 8s after a `papio actions open` with the tab
+never touched. `close_authorizations` is empty for both, so no authorized close
+ran — the removal came from a browser-local path that leaves
+`onTabRemoved`'s `authorizedClose` false, which falls through to the ordinary
+cancellation branch (`provider_outcome` → daemon cancel). The late
+`auth_pending` shows the surface was still mid-authentication when it went.
+
+This is the hazard already named in the tab-lifecycle notes: a deliberate
+internal close must first detach or settle its job and carry an intent marker,
+or papio reads its own housekeeping as the operator giving up. Slice 2b built
+exactly that transaction for authorized closes; the defect is the path that
+removes a surface *without* using it.
+
+Next step is diagnosis, not a patch: instrument which caller removes the tab
+(reconcile dedupe, `materialization-reconcile` bypass, or a work-window
+teardown), then either route it through the authorized close transaction or
+give it an explicit non-cancellation disposition. Do not re-run institutional
+opens on a real library until this is closed — each one can cancel a paper.
+Both papers above are recoverable with `papio acquire <doi>` once it is.
