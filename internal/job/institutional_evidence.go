@@ -1007,6 +1007,15 @@ const (
 	AuthenticationEntryLeaseExpired  AuthenticationEntryLeaseState = "expired"
 )
 
+// AuthenticationEntryBindDeadline bounds how long an entry reservation with no
+// bound surface may hold its institution. It covers a grant -> open -> bind
+// round trip (one browser poll plus a tab creation, ~2s in practice) with two
+// orders of magnitude to spare, and nothing else: a reservation nobody binds is
+// a permission that was never used, and it otherwise blocks every other paper's
+// consult on that institution for the whole action-expiry window. A bound
+// sign-in is extended in full by §4.5's human-paced renewals instead.
+const AuthenticationEntryBindDeadline = 2 * time.Minute
+
 var (
 	ErrAuthenticationEntryLeaseBusy   = errors.New("authentication entry lease busy")
 	ErrAuthenticationEntryLeaseStale  = errors.New("authentication entry lease stale")
@@ -1123,6 +1132,23 @@ func reserveAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, in Authentic
 	now := time.Now().UTC()
 	nowText := now.Format(time.RFC3339Nano)
 	untilText := in.LeaseUntil.UTC().Format(time.RFC3339Nano)
+	// An entry nobody has bound a surface to yet is not a sign-in in progress:
+	// it is a permission to open one, and it only has to outlive the
+	// grant -> open -> bind round trip (one browser poll plus a tab creation).
+	// Giving it the full human-paced window instead let one unconsumed grant
+	// hold its institution's ONLY entry for the whole window, answering every
+	// other paper's consult "authentication entry lease is unavailable" — and
+	// nothing could retire it early, because the owner-close retirement fences
+	// on owner_binding_id, which such an entry does not have. Observed live
+	// 2026-08-19: an entry owned by a paper with zero candidates, zero claims
+	// and no binding held the operator's institution from 05:14:15Z to
+	// 05:44:15Z. Once a surface IS bound, §4.5's human-paced renewals extend
+	// it in full on every wall/login/mfa/challenge observation, so a real
+	// sign-in is never cut short by this.
+	unboundUntil := untilText
+	if deadline := now.Add(AuthenticationEntryBindDeadline); in.LeaseUntil.After(deadline) {
+		unboundUntil = deadline.Format(time.RFC3339Nano)
+	}
 	row := q.QueryRowContext(ctx, authenticationEntryLeaseSelect+` WHERE authentication_claim_id = ?`, in.AuthenticationClaimID)
 	current, err := scanAuthenticationEntryLease(row.Scan)
 	if err == nil {
@@ -1203,16 +1229,20 @@ func reserveAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, in Authentic
 			// current holder before any of this runs.
 			if current.State == AuthenticationEntryLeaseReserved &&
 				current.OwnerID == in.OwnerID {
+				renewedUntil := untilText
+				if current.OwnerBindingID == "" {
+					renewedUntil = unboundUntil
+				}
 				if _, err := q.ExecContext(ctx, `
 					UPDATE authentication_entry_leases
 					   SET lease_id=?, browser_holder_generation=?, lease_until=?, updated_at=?
 					 WHERE authentication_claim_id=?`,
-					in.LeaseID, in.BrowserHolderGeneration, untilText, nowText,
+					in.LeaseID, in.BrowserHolderGeneration, renewedUntil, nowText,
 					in.AuthenticationClaimID); err != nil {
 					return nil, err
 				}
 				current.LeaseID, current.BrowserHolderGeneration = in.LeaseID, in.BrowserHolderGeneration
-				current.LeaseUntil, current.UpdatedAt = untilText, nowText
+				current.LeaseUntil, current.UpdatedAt = renewedUntil, nowText
 				return &current, nil
 			}
 			return nil, ErrAuthenticationEntryLeaseBusy
@@ -1224,7 +1254,7 @@ func reserveAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, in Authentic
 			       owner_binding_id=NULL, owner_tab_hint=NULL, entitled_at=NULL,
 			       updated_at=?
 			 WHERE authentication_claim_id=?`,
-			in.LeaseID, in.OwnerID, in.BrowserHolderGeneration, untilText, nowText,
+			in.LeaseID, in.OwnerID, in.BrowserHolderGeneration, unboundUntil, nowText,
 			in.AuthenticationClaimID); err != nil {
 			return nil, err
 		}
@@ -1237,7 +1267,7 @@ func reserveAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, in Authentic
 			   state, lease_until, created_at, updated_at)
 			VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?)`,
 			in.AuthenticationClaimID, in.LeaseID, in.OwnerID, in.BrowserHolderGeneration,
-			untilText, nowText, nowText); err != nil {
+			unboundUntil, nowText, nowText); err != nil {
 			return nil, err
 		}
 	}

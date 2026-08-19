@@ -295,6 +295,55 @@ func TestAuthenticationEntryLeaseOwnerReReservesAcrossGenerations(t *testing.T) 
 	}
 }
 
+// TestAuthenticationEntryUnboundReservationYieldsAtTheBindDeadline pins what an
+// unconsumed grant costs. A reservation with no bound surface is a permission to
+// open one, not a sign-in in progress, so it may only hold its institution long
+// enough to bind. It used to get the caller's full human-paced window, and
+// nothing could retire it early — the owner-close retirement fences on
+// owner_binding_id, which it does not have — so one paper that never bound held
+// the operator's institution for thirty minutes while every other consult was
+// answered "authentication entry lease is unavailable" (observed live
+// 2026-08-19). A BOUND entry keeps the full window, which is the other half of
+// the rule and what stops a real sign-in being cut short.
+func TestAuthenticationEntryUnboundReservationYieldsAtTheBindDeadline(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	full := now.Add(30 * time.Minute)
+
+	unbound, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-bind-deadline", LeaseID: "lease-unbound", OwnerID: "job-unbound",
+		BrowserHolderGeneration: 3, LeaseUntil: full,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	until, err := time.Parse(time.RFC3339Nano, unbound.LeaseUntil)
+	if err != nil {
+		t.Fatalf("lease_until %q: %v", unbound.LeaseUntil, err)
+	}
+	if until.After(now.Add(AuthenticationEntryBindDeadline + time.Second)) {
+		t.Fatalf("unbound reservation holds until %s, want no later than the bind deadline (%s)",
+			until, now.Add(AuthenticationEntryBindDeadline))
+	}
+
+	// Binding a surface earns the full window on the next renewal.
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx, "claim-bind-deadline", "job-unbound", 3, "binding-bound", 4); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-bind-deadline", LeaseID: "lease-bound", OwnerID: "job-unbound",
+		BrowserHolderGeneration: 3, LeaseUntil: full,
+	})
+	if err != nil {
+		t.Fatalf("renewing a bound entry: %v", err)
+	}
+	if bound.LeaseUntil != full.Format(time.RFC3339Nano) {
+		t.Fatalf("bound renewal holds until %s, want the caller's full window %s",
+			bound.LeaseUntil, full.Format(time.RFC3339Nano))
+	}
+}
+
 // TestAuthenticationEntryLeaseExpiryRefusedWhileEffectPermitHeld pins §4.5:
 // expiry alone never authorizes a replacement while an effect permit is
 // unresolved for the lease's own occupying binding.
