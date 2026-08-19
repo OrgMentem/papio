@@ -3281,7 +3281,7 @@ test("Scenario 3 upgrade: siblings resumed after entitled_landing arrive as fres
     const scaffoldCreated = h.tabs.created[tabsCreatedBefore];
     expect(scaffoldCreated?.active).toBe(false);
     expect(scaffoldCreated?.url).toBe(
-      `chrome-extension://test/materialize.html#${bindingID}`,
+      `chrome-extension://test/dist/materialize.html#${bindingID}`,
     );
     await h.port.inbound({
       protocol: "papio-browser/1",
@@ -4374,7 +4374,7 @@ test("Scenario 7 continued: institutional materialization survives a worker rest
       .list()
       .filter(
         (tab) =>
-          tab.url === `chrome-extension://test/materialize.html#${bindingID}`,
+          tab.url === `chrome-extension://test/dist/materialize.html#${bindingID}`,
       );
     expect(scaffoldMatches).toHaveLength(1);
     const scaffoldTabID = scaffoldMatches[0]!.id!;
@@ -16326,7 +16326,7 @@ test("persisted materialization waits for capability negotiation and clears on d
   });
   h.tabs.seed({
     id: 902,
-    url: "chrome-extension://test/materialize.html#bind_0001",
+    url: "chrome-extension://test/dist/materialize.html#bind_0001",
     active: false,
     windowId: 500,
   });
@@ -16718,7 +16718,7 @@ test("new institutional candidate supersedes old correlation and closes its scaf
   };
   h.tabs.seed({
     id: 901,
-    url: "chrome-extension://test/materialize.html#bind_0001",
+    url: "chrome-extension://test/dist/materialize.html#bind_0001",
     active: false,
     windowId: 500,
   });
@@ -16780,7 +16780,7 @@ test("route update loss removes dead scaffold and next run rebinds a replacement
   };
   h.tabs.seed({
     id: 903,
-    url: "chrome-extension://test/materialize.html#bind_0001",
+    url: "chrome-extension://test/dist/materialize.html#bind_0001",
     active: false,
     windowId: 500,
   });
@@ -17019,7 +17019,7 @@ test("cancelling materialization removes scaffold, retry timer, and correlation"
   });
   h.tabs.seed({
     id: 902,
-    url: "chrome-extension://test/materialize.html#bind_0001",
+    url: "chrome-extension://test/dist/materialize.html#bind_0001",
     active: false,
     windowId: 500,
   });
@@ -17057,7 +17057,7 @@ test("deferred route response from superseded candidate cannot navigate replacem
   });
   h.tabs.seed({
     id: 904,
-    url: "chrome-extension://test/materialize.html#bind_0001",
+    url: "chrome-extension://test/dist/materialize.html#bind_0001",
     active: false,
     windowId: 500,
   });
@@ -17606,7 +17606,7 @@ describe("effect_permit reconcile inbound", () => {
     });
     h.tabs.seed({
       id: 301,
-      url: "chrome-extension://test/materialize.html#bind_0001",
+      url: "chrome-extension://test/dist/materialize.html#bind_0001",
       active: false,
       windowId: 500,
     });
@@ -17712,7 +17712,7 @@ describe("effect_permit reconcile inbound", () => {
     });
     h.tabs.seed({
       id: 311,
-      url: "chrome-extension://test/materialize.html#bind",
+      url: "chrome-extension://test/dist/materialize.html#bind",
       active: false,
       windowId: 500,
     });
@@ -18646,7 +18646,7 @@ test("Scenario 2: a live institutional materialize.html scaffold survives simula
     .list()
     .find(
       (tab) =>
-        tab.url === `chrome-extension://test/materialize.html#${bindingID}`,
+        tab.url === `chrome-extension://test/dist/materialize.html#${bindingID}`,
     );
   expect(scaffoldTab).toBeDefined();
   const scaffoldTabID = scaffoldTab!.id!;
@@ -18705,7 +18705,7 @@ test("Scenario 2: a live institutional materialize.html scaffold survives simula
     .list()
     .filter(
       (tab) =>
-        tab.url === `chrome-extension://test/materialize.html#${bindingID}`,
+        tab.url === `chrome-extension://test/dist/materialize.html#${bindingID}`,
     );
   expect(liveScaffoldsForBinding).toHaveLength(1);
 });
@@ -18721,7 +18721,7 @@ test("Review round finding 1: reconciliation facing an operator-active scaffold 
   await h.port.inbound(
     helloAck({ features: ["institutional_materialization_v1"] }),
   );
-  const scaffoldURL = `chrome-extension://test/materialize.html#${bindingID}`;
+  const scaffoldURL = `chrome-extension://test/dist/materialize.html#${bindingID}`;
   // The active scaffold is papio's own prior work (ledgered, under this
   // exact binding and browser epoch) that the operator has since claimed
   // by activating it. The duplicate is a second live tab that merely
@@ -18779,4 +18779,65 @@ test("Review round finding 1: reconciliation facing an operator-active scaffold 
   // (which needs no birth record at all) just because its URL matches.
   expect(h.tabs.removed).not.toContain(duplicateTab.id);
   expect(h.tabs.snapshot(duplicateTab.id!)).toBeDefined();
+});
+
+// Live-smoke regression (2026-08-19): the scaffold path was a root-relative
+// "materialize.html" while every shipped manifest declares pages under dist/,
+// so every automatically-owned institutional tab navigated to a page that
+// exists nowhere and rendered Chrome's ERR_FILE_NOT_FOUND. The old literal
+// assertions could not catch it: they pinned the same wrong string the source
+// built. This one is anchored to the shipped manifest instead, so the scaffold
+// URL and the declared page layout cannot drift apart again.
+test("the scaffold tab navigates to a page where the shipped manifest declares pages live", async () => {
+  const jobID = "job_scaffold_page_layout";
+  const candidateID = "cand_scaffold_layout";
+  const bindingID = "bind_scaffold_layout";
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["institutional_materialization_v1"] }),
+  );
+  await h.port.inbound(candidateOffer(jobID, candidateID));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_claim_response",
+    msg_id: `claim_response_${bindingID}`,
+    job_id: jobID,
+    seq: 3,
+    payload: {
+      request_id: claim.payload["request_id"],
+      outcome: "claimed",
+      candidate_id: candidateID,
+      claim_id: `claim_${bindingID}`,
+      binding_id: bindingID,
+      browser_holder_generation: 1,
+      lease_until: "2030-01-01T00:05:00Z",
+    },
+  });
+  await h.port.waitForFrame("institutional_bind_request");
+  const scaffoldURL = h.tabs.created.at(0)?.url;
+  expect(scaffoldURL).toBeDefined();
+
+  // The extension root is whatever directory holds the manifest; pages are
+  // wherever the manifest says the popup is. Both shipped manifests
+  // (Chrome's hand-authored one and the generated Firefox one) declare
+  // dist/, and dev-unpacked/ mirrors it.
+  const manifest = JSON.parse(
+    readFileSync(new URL("../manifest.json", import.meta.url), "utf8"),
+  ) as { action?: { default_popup?: string } };
+  const declaredPopup = manifest.action?.default_popup;
+  expect(declaredPopup).toBeDefined();
+  const pageDir = declaredPopup!.replace(/[^/]*$/, "");
+  expect(pageDir).not.toBe("");
+
+  const scaffoldPath = new URL(scaffoldURL!).pathname.replace(/^\//, "");
+  expect(scaffoldPath).toBe(`${pageDir}materialize.html`);
+  // Build-independent existence proof: the page ships from src/, and the
+  // bundler emits it into pageDir under its own name.
+  const shell = readFileSync(
+    new URL("../src/materialize.html", import.meta.url),
+    "utf8",
+  );
+  expect(shell).toContain("<html");
 });

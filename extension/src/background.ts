@@ -307,7 +307,6 @@ const PAGE_BULK_ACQUIRE_FEATURE = "page_bulk_acquire_v1";
 const PAGE_BULK_COHORT_V2_FEATURE = "page_bulk_cohort_v2";
 const INSTITUTIONAL_MATERIALIZATION_FEATURE =
   "institutional_materialization_v1";
-const MATERIALIZE_PAGE_PATH = "materialize.html";
 const MATERIALIZATION_ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/u;
 const MATERIALIZATION_RFC3339_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
@@ -396,6 +395,16 @@ const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
 ]);
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
 const POPUP_PAGE_PATH = "dist/popup.html";
+/** Derived, never hardcoded: extension pages ship beside the declared popup
+ * (`dist/` in every manifest — Chrome, generated Firefox, and dev-unpacked),
+ * so a root-relative "materialize.html" resolves to nothing and every
+ * automatically-owned institutional tab lands on ERR_FILE_NOT_FOUND. Same
+ * rule as the authorized page URLs derived in realDeps(); see popup.ts's
+ * historyPagePath(). */
+const MATERIALIZE_PAGE_PATH = POPUP_PAGE_PATH.replace(
+  /[^/]*$/,
+  "materialize.html",
+);
 /** Stable base title for papio's handoff group. A surfaced paper temporarily
  * appends its identity, but always returns to this title so a later worker can
  * rediscover the group without retaining page state. */

@@ -135,6 +135,13 @@ for the full pre-split extension history.
   older daemon's short feature list still negotiates exactly as before.
 
 ### Fixed
+- **The placeholder page *papio* opens for institutional work now loads.** It
+  was pointed at a file that shipped one directory away, so every tab *papio*
+  opened for a paper behind your library rendered the browser's own *"Your
+  file couldn't be accessed"* error instead of the placeholder — visible in
+  the *papio* tab group, and alarming for something that is meant to be
+  invisible plumbing. The page's location is now derived from the extension's
+  own manifest, the way every other *papio* page already was.
 - **A tab you are looking at is never pulled back under papio's control.**
   An independent review of the ownership work above found the one remaining
   path that could: rediscovering an existing placeholder page could flip it
