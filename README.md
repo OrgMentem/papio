@@ -71,7 +71,7 @@
 brew install orgmentem/tap/papio                          # or grab a signed binary from Releases
 papio init                                                # guided setup: config, data folder, database, browser connector, health check
 papio doctor                                              # checks the whole chain, including the browser extension and zotio
-papio search "appropriate reliance on AI" --limit 20 --year-from 2023
+papio search "appropriate reliance on AI" --limit 20 --year-from 2026
 papio acquire 10.1371/journal.pone.0262026 --auto-import --wait
 papio acquire --batch refs.bib                            # or RIS, CSL-JSON, NBIB — start from the library you already have
 papio status --follow                                     # working / awaiting-human / needs-review / ready / failed

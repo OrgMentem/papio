@@ -9052,6 +9052,30 @@ export class Bridge {
       }
       seenBindings.add(bindingID);
       const candidates = byBinding.get(bindingID) ?? [];
+      // Once the route has been navigated, the surface is deliberately no
+      // longer at the scaffold URL, so it can never appear among these
+      // candidates - the operator's own login wall is that tab now. Anything
+      // still sitting at this binding's scaffold page is therefore a leftover
+      // papio minted and failed to retire, and choosing one would repoint both
+      // the correlation and (below) the daemon at a dead placeholder while the
+      // paper waits on a sign-in nobody is watching.
+      if (correlation.phase === "navigating" || correlation.phase === "navigated") {
+        for (const candidate of candidates) {
+          if (candidate.id === undefined) continue;
+          if (!stillCurrent(jobID, candidateID, bindingID)) break;
+          await this.removeMaterializationTab(candidate.id);
+        }
+        if (correlation.tab_id >= 0) {
+          retained.add(correlation.tab_id);
+          bindings.push({
+            binding_id: bindingID,
+            tab_id: correlation.tab_id,
+            job_id: jobID,
+            candidate_id: candidateID,
+          });
+        }
+        continue;
+      }
       const chosen =
         candidates.find((tab) => tab.id === correlation.tab_id) ??
         candidates[0];
@@ -9280,8 +9304,24 @@ export class Bridge {
           }
         : undefined;
     const existingJob = findByJob(this.store, jobID);
+    const existing = this.materializationCorrelation(jobID);
     const now = this.deps.now();
     const expiresMs = Date.parse(expiresAt);
+    // A re-offer of the SAME candidate refreshes the daemon's lease; it does
+    // not restart materialization once a binding exists. reduceMaterialization
+    // (state.ts) applies exactly that rule to the correlation, and this record
+    // has to agree with it: a daemon restart re-offers with a fresh expiry, and
+    // resetting tab_id here would orphan a live surface - the operator's own
+    // sign-in tab - from its job. That silently stops every observation keyed
+    // on job.tab_id (challenge, mfa, auth_returned, entitled_landing) and lets
+    // the next open mint a second surface beside the one already on the wall.
+    const boundSurfaceTabID =
+      existing !== undefined &&
+      existing.candidate_id === candidateID &&
+      existing.binding_id !== undefined &&
+      existing.tab_id >= 0
+        ? existing.tab_id
+        : -1;
     const candidateJob: ActiveJob = {
       ...(existingJob ?? {
         job_id: jobID,
@@ -9291,9 +9331,10 @@ export class Bridge {
         status: accessMode === "assisted" ? "queued" : "accepted",
         provider_hosts: providerHosts,
       }),
-      // Candidate offers are URL-free and have no scaffold tab yet. Binding
-      // later changes only tab_id; this record is the classifier's authority.
-      tab_id: -1,
+      // A fresh candidate offer is URL-free and has no scaffold tab yet;
+      // binding later changes only tab_id. This record is the classifier's
+      // authority, so it keeps a bound surface across a same-candidate re-offer.
+      tab_id: boundSurfaceTabID,
       offered_at: existingJob?.offered_at ?? now,
       expires_at: expiresMs,
       provider_hosts: providerHosts,
@@ -9311,7 +9352,8 @@ export class Bridge {
       this.loginEntityIDs.set(jobID, loginEntityID);
     if (proquestAccountID !== undefined && proquestAccountID.length > 0)
       this.proquestAccountIDs.set(jobID, proquestAccountID);
-    const existing = this.materializationCorrelation(jobID);
+    // `existing` is read above, before the job upsert, which never touches
+    // materializations.
     const sameCandidateRefresh =
       existing?.candidate_id === candidateID &&
       Date.parse(expiresAt) > Date.parse(existing.candidate_expires_at);

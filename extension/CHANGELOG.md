@@ -135,6 +135,23 @@ for the full pre-split extension history.
   older daemon's short feature list still negotiates exactly as before.
 
 ### Fixed
+- **papio no longer loses track of which tab your sign-in is on.** The daemon
+  re-offers a paper's institutional work whenever it reconnects — after a
+  restart, say — and *papio* treated that as "no tab yet", even when your
+  library login was already open in front of you. The paper let go of its own
+  tab: your sign-in was left stranded, nothing you did on that page was
+  noticed, and the next attempt opened a *second* tab for the same paper
+  instead of using the one you were looking at. A re-offer now refreshes the
+  paper's claim without disowning its tab.
+- **A leftover *papio* placeholder is cleaned up instead of becoming the
+  paper's tab.** Every institutional paper starts on a blank *papio* page that
+  is then sent to your library. If a second blank page was ever left behind,
+  the next tidy-up pass mistook it for the paper's real tab — because the real
+  one had, correctly, moved on to your library's sign-in — and told the daemon
+  that the empty placeholder was where the work was happening. The paper then
+  waited forever on a page nobody was looking at, while the sign-in tab you
+  were actually using went unwatched. Leftover placeholders are now retired,
+  and the tab holding your sign-in stays the paper's tab.
 - **papio no longer cancels a paper by tidying up after itself.** When *papio*
   closed one of its own working tabs — a duplicate it had just replaced, or a
   placeholder it was finished with — it then told the daemon the tab had

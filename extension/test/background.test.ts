@@ -650,7 +650,11 @@ function jobOffer(
     },
   };
 }
-function candidateOffer(jobID: string, candidateID = "cand_0001"): unknown {
+function candidateOffer(
+  jobID: string,
+  candidateID = "cand_0001",
+  expiresAt = "2030-01-01T00:00:00Z",
+): unknown {
   return {
     protocol: "papio-browser/1",
     type: "institutional_candidate_offer",
@@ -660,7 +664,7 @@ function candidateOffer(jobID: string, candidateID = "cand_0001"): unknown {
     payload: {
       candidate_id: candidateID,
       materialization_kind: "browser_tab",
-      expires_at: "2030-01-01T00:00:00Z",
+      expires_at: expiresAt,
       provider_hosts: [PROVIDER_HOST],
       expected: { doi: "10.1234/example", title: "Example work" },
       access_mode: "delegated",
@@ -16830,6 +16834,147 @@ test("new institutional candidate supersedes old correlation and closes its scaf
     },
   );
   expect(h.tabs.removed).toContain(901);
+});
+
+// Live-smoke reproduction (2026-08-19): one institutional open left TWO papio
+// surfaces for one job - the navigated tab sitting on the operator's login
+// wall, plus a second scaffold announcing "Materialization binding ready" that
+// could never bind. The daemon pins a re-offered candidate's expiry in memory
+// (internal/browser/bridge.go:10181-10183), so a daemon restart - or its own
+// lapse check at 10174 - re-offers the SAME candidate with a FRESH expiry.
+// That is `sameCandidateRefresh`, which resets the correlation to
+// `offered`/`tab_id: -1` and re-runs materialization against a live, already
+// navigated surface: the navigated tab no longer looks like a scaffold, so a
+// replacement is minted and the operator's real sign-in tab is orphaned from
+// its job.
+test("a re-offer of the same candidate never mints a second surface for a navigated claim", async () => {
+  const jobID = "job_mat_reoffer_navigated";
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
+  const internals = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+  };
+  // The state after a successful open: the scaffold was navigated to the route,
+  // so this tab is the operator's login wall, not a materialize.html page.
+  h.tabs.seed({
+    id: 950,
+    url: `https://${PROVIDER_HOST}/idp/profile/SAML2/Redirect/SSO?x=1`,
+    active: false,
+    windowId: 500,
+  });
+  await internals.update.call(h.bridge, (store) => ({
+    ...store,
+    activeJobs: [{ ...materializationActiveJob(jobID), tab_id: 950 }],
+    workWindowID: 500,
+    materializations: {
+      [jobID]: {
+        job_id: jobID,
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim_0001",
+        binding_id: "bind_0001",
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+        phase: "navigated",
+        tab_id: 950,
+        route_issuance_ordinal: 1,
+        effect_ordinal: 1,
+      },
+    },
+  }));
+  const createdBefore = h.tabs.created.length;
+
+  // Same candidate, fresher expiry - what a restarted daemon sends.
+  await h.port.inbound(
+    candidateOffer(jobID, "cand_0001", "2030-06-01T00:00:00Z"),
+  );
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+
+  // No second surface, and the live one is still owned by its job.
+  expect(h.tabs.created.length).toBe(createdBefore);
+  expect(
+    h.frames().filter((frame) => frame.type === "institutional_claim_request"),
+  ).toEqual([]);
+  expect(h.backend.store.materializations?.[jobID]).toMatchObject({
+    phase: "navigated",
+    tab_id: 950,
+    binding_id: "bind_0001",
+  });
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id,
+  ).toBe(950);
+});
+
+// Live-smoke reproduction (2026-08-19), the other half: a leftover scaffold for
+// a binding whose surface has already been navigated. reconcileMaterializationTabs
+// only sees tabs still sitting at `materialize.html#<binding>`, so the real
+// surface - the operator's login wall - is never among its candidates, while the
+// leftover is. `candidates.find(...) ?? candidates[0]` therefore chose the
+// placeholder, repointed the correlation at it, and reported IT to the daemon as
+// the job's surface, orphaning the tab the operator actually has to sign in on.
+test("startup reconcile keeps the navigated surface and retires a leftover scaffold", async () => {
+  const jobID = "job_mat_leftover_scaffold";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [{ ...materializationActiveJob(jobID), tab_id: 950 }],
+    workWindowID: 500,
+    materializations: {
+      [jobID]: {
+        job_id: jobID,
+        candidate_id: "cand_0001",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        claim_id: "claim_0001",
+        binding_id: "bind_0001",
+        browser_holder_generation: 1,
+        lease_until: "2030-01-01T00:05:00Z",
+        phase: "navigated",
+        tab_id: 950,
+        route_issuance_ordinal: 1,
+        effect_ordinal: 1,
+      },
+    },
+  });
+  // The navigated surface: the operator's institutional login wall.
+  h.tabs.seed({
+    id: 950,
+    url: `https://${PROVIDER_HOST}/idp/profile/SAML2/Redirect/SSO`,
+    active: false,
+    windowId: 500,
+  });
+  // The leftover papio minted for the same binding and never retired.
+  h.tabs.seed({
+    id: 951,
+    url: "chrome-extension://test/dist/materialize.html#bind_0001",
+    active: false,
+    windowId: 500,
+  });
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+
+  expect(h.tabs.removed).toContain(951);
+  expect(h.tabs.removed).not.toContain(950);
+  expect(h.backend.store.materializations?.[jobID]).toMatchObject({
+    phase: "navigated",
+    tab_id: 950,
+  });
+  const request = h
+    .frames()
+    .find((frame) => frame.type === "institutional_reconcile_request");
+  expect(request?.payload["bindings"]).toEqual([
+    { binding_id: "bind_0001", tab_id: 950 },
+  ]);
 });
 
 // Live-smoke regression (2026-08-19): two papers were cancelled on the
