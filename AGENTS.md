@@ -500,6 +500,62 @@ There is also a link check, because `zensical build` prints a broken link as an
   are expected (static analysis can't see the runtime guard), lint still exits 0
   (0 errors), and bumping would drop every ESR user to no tab-group handoff.
 
+### Extension page paths & MV3 worker memory
+- **Every extension page ships under `dist/`, so a page path must be DERIVED, never
+  written root-relative.** All three manifests declare `dist/popup.html` /
+  `dist/options.html` — the hand-authored `extension/manifest.json`, the generated
+  `firefox/manifest.json`, and `dev-unpacked/manifest.json` (whose `dist` is a symlink
+  to `../dist`). So `chrome.runtime.getURL("materialize.html")` resolves to a file that
+  exists in **no** deployment, and the tab renders Chrome's `ERR_FILE_NOT_FOUND`.
+  `realDeps()` already derives inbox/history/options/page-bulk from the manifest's
+  declared popup for exactly this reason ("so the authorized URLs can never drift from
+  the shipped page layout again"); `MATERIALIZE_PAGE_PATH` was added later as a bare
+  literal and made *every* automatically-owned institutional tab a browser error page —
+  the entry point of the whole Slice 4 automatic path. Derive from `POPUP_PAGE_PATH`
+  (or `getManifest().action.default_popup`, like `popup.ts`'s `historyPagePath()`).
+  Unit tests do **not** catch this class on their own: the fake `runtimeGetURL` resolves
+  any string, so 13 assertions pinned the same wrong literal the source built. The
+  regression test therefore anchors the scaffold URL to the shipped manifest's declared
+  page directory, not to a literal.
+- **Anything gated on a worker-memory `Map` silently stops working ~30s after the last
+  event, because MV3 sleeps the service worker.** `claimGrants` is the load-bearing
+  example: `owner_closed` was gated on `claimGrants.has(job_id)`, so an institutional
+  sign-in tab abandoned *after* the worker slept — the common case, not the edge —
+  reported nothing. The daemon then held the claim in phase `navigated` until its
+  30-minute lease expired, and every sibling job at that institution parked tablessly
+  and silently (`handoff.opened` recorded, no surface, no message): the stranded
+  sign-in the surface-lifecycle work exists to prevent, arriving by a different route.
+  The durable `SurfaceBirthRecord` ledger entry is the state that survives a worker
+  death (and a browser restart), so claim identity lives there and `onTabRemoved`
+  falls back to it. When adding a new observation or effect, ask which side of that
+  boundary its identity lives on; `navigation_error`'s durable-marker path and
+  `enqueueRestartRecoveredObservation` are the shape to copy. Note the daemon makes
+  this safe on purpose: `claim_observation_apply.go`'s `owner_closed` case deliberately
+  omits the lease-generation equality check that `wall_observed`/`auth_returned`/
+  `entitled_landing` enforce, so a restart-recovered loss report is applied rather than
+  rejected as stale — do not "fix" that asymmetry into symmetry.
+- **A live smoke run is not optional for this subsystem, and synthetic input cannot do
+  it.** Both defects above passed a green 1,211-test suite and were found in one pass
+  against a real browser. But an OS-level accessibility `press()` on the popup's own
+  **Open** button produces no tab and no state change — extension gesture tracking does
+  not accept synthesized activation, the same fact already recorded for CDP's
+  `userGesture`. Drive handoffs from the trusted operator surface instead:
+  `papio actions open --job <id>` (`--dry-run` first to see the route), and read ground
+  truth from the store — `sqlite3 <data-dir>/papio.db` on `materialization_claims`
+  (phase, `tab_id`, `lease_until`) and `claim_observation_journal`. A claim whose
+  `tab_id` no longer exists, beside an empty journal, is this section's second footgun.
+  `papio jobs show <id>` timestamps the daemon's side of the same story.
+- **Verify an extension reload actually happened — `papio browser sessions` must show a
+  NEW session id.** A reload tears down the native port, so the daemon logs
+  `browser session <id> disconnected` and the next id differs. This is not pedantry:
+  an accessibility `press()` on chrome://extensions' own **Reload** button reports
+  success and silently does nothing (same synthesized-activation limit as the popup
+  button above), so a whole smoke run can be spent measuring a stale build while
+  believing the fix is loaded — including "adoption survived a reload" conclusions
+  drawn from a reload that never occurred. A page whose URL lacks the `dist/` prefix
+  is the other tell that the running bundle predates the page-path fix. Reload from
+  the browser UI yourself, then confirm the id changed before trusting anything.
+
 ### Automation detection (this is load-bearing — papio's whole value is "real human browser")
 - **Never drive the user's browser via WebDriver/BiDi for real work.** Firefox BiDi sets
   `navigator.webdriver = true` → Cloudflare/Turnstile hardens and often becomes unpassable.
