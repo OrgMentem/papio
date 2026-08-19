@@ -135,6 +135,14 @@ for the full pre-split extension history.
   older daemon's short feature list still negotiates exactly as before.
 
 ### Fixed
+- **Asking for a paper's sign-in no longer opens two tabs for it.** *papio* was
+  racing itself: the daemon answers a request to open a paper by both starting
+  the paper's own working page *and* telling the extension to bring that paper
+  to the front — and the extension answered the second half by minting a
+  *separate* sign-in tab of its own. You got two *papio* tabs for one paper,
+  one of them stranded on an internal placeholder page while your library
+  sign-in loaded in the other, and papio watching the wrong one. It now waits
+  for the single page it is already building.
 - **papio no longer loses track of which tab your sign-in is on.** The daemon
   re-offers a paper's institutional work whenever it reconnects — after a
   restart, say — and *papio* treated that as "no tab yet", even when your

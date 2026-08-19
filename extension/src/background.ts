@@ -7032,11 +7032,44 @@ export class Bridge {
         }
         // consult.kind === "open_new": the authentication claim is
         // granted for this job's candidate.
-        if (trigger === "automatic") {
-          // Architecture ruling: the extension never self-mints a
-          // materialization binding. Stay tabless and let the daemon's
-          // own Slice 4 pipeline drive the real scaffold once its fresh
-          // candidate offer arrives.
+        //
+        // Architecture ruling: the extension never self-mints a
+        // materialization binding. That holds for an EXPLICIT operator open
+        // too, and used not to. The daemon's explicit open queues a candidate
+        // offer AND a handoff_focus (bridge.go's serviceMaterializationCandidate
+        // beside its focus frame), and the focus arrives while the correlation
+        // is still pre-bind - exactly when tab_id is legitimately -1 and the
+        // consult therefore answers open_new (§2.1.1 case 3, no owner surface
+        // to navigate yet). Minting here raced the very scaffold that offer was
+        // building and left TWO papio tabs for one paper: verified live twice,
+        // one stranded at materialize.html for the same binding the daemon had
+        // already navigated. The trigger decides whether someone is waiting for
+        // the surface, never who is allowed to create it.
+        //
+        // Two conditions, both necessary. The daemon must have negotiated
+        // institutional_materialization_v1 - the same gate it uses itself
+        // (institutionalMaterializationAvailable); without it no candidate offer
+        // can arrive, no scaffold can be built, and an explicit engagement is the
+        // only surface path there is. And the pipeline must actually be driving
+        // THIS job right now: a run in flight, a rerun queued, or one waiting on
+        // the effect governor or a retry timer. A correlation nothing is driving
+        // (hydrated but unscheduled, failed, or its candidate expired) will not
+        // produce a surface, so the mint below stays the fallback it was before
+        // Slice 3. A finished run needs no branch here: it left a tab, and the
+        // tab_id check above focuses it.
+        const materializing = this.materializationCorrelation(jobID);
+        const pipelineOwnsSurface =
+          (this.store.daemonFeatures ?? []).includes(
+            INSTITUTIONAL_MATERIALIZATION_FEATURE,
+          ) &&
+          materializing !== undefined &&
+          materializing.phase !== "failed" &&
+          Date.parse(materializing.candidate_expires_at) > this.deps.now() &&
+          (this.materializationRuns.has(jobID) ||
+            this.materializationReruns.has(jobID) ||
+            this.pendingMaterializationEffects.has(jobID) ||
+            this.materializationRetryTimers.has(jobID));
+        if (trigger === "automatic" || pipelineOwnsSurface) {
           await this.parkOnClaim(jobID);
           return failure(
             "handoff_pending",

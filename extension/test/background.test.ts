@@ -16977,6 +16977,93 @@ test("startup reconcile keeps the navigated surface and retires a leftover scaff
   ]);
 });
 
+// Live-smoke reproduction (2026-08-19), the creator: the daemon's explicit open
+// queues BOTH a materialization candidate offer (bridge.go:9866-9871) and a
+// handoff_focus (bridge.go:9911). focusDaemonHandoff falls through to
+// openHandoff for a URL-free candidate, and openHandoffUnlocked's
+// engagement_required branch mints a LEGACY fresh handoff link - a second tab
+// for the same paper, racing the scaffold materialization is already building.
+// The focus frame arrives while the correlation is still pre-bind, exactly when
+// job.tab_id is legitimately -1, so neither path can see the other. Verified
+// live twice: one open, two papio tabs, one of them stranded at
+// materialize.html for the same binding the daemon had already navigated.
+test("an explicit focus never mints a legacy handoff beside an in-flight materialization", async () => {
+  const jobID = "job_mat_focus_no_duplicate";
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      // The live daemon's set: the legacy fresh-link mint and the claim
+      // consult are both feature-gated, so a narrower list would gate the
+      // very collision under test out of existence.
+      features: [
+        "institutional_materialization_v1",
+        "effect_permit_v1",
+        "handoff_link_v1",
+        AUTH_CLAIM,
+      ],
+    }),
+  );
+  const internals = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+  };
+  await internals.update.call(h.bridge, (store) => ({
+    ...store,
+    // A parked institutional job: engagement_required, no surface yet.
+    activeJobs: [
+      {
+        ...materializationActiveJob(jobID),
+        tab_id: -1,
+        requires_auth: true,
+        engagement_required: true,
+      },
+    ],
+    workWindowID: 500,
+  }));
+  // The daemon's explicit open queues a candidate offer AND a focus frame. The
+  // offer arrives first and starts the pipeline for real - hand-seeding a
+  // correlation instead would leave nothing actually driving the job, which is
+  // the one state where an explicit mint is still the only way to a surface.
+  await h.port.inbound(candidateOffer(jobID, "cand_0001"));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  expect(claim.payload["candidate_id"]).toBe("cand_0001");
+  const createdBefore = h.tabs.created.length;
+
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "handoff_focus",
+    msg_id: "focus_dup_0001",
+    job_id: jobID,
+    seq: 3,
+    payload: {},
+  });
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+
+  // The daemon grants the claim: its own materialization is pre-bind, so no
+  // owner surface exists to navigate yet (bridge.go's §2.1.1 case 3).
+  const consult = h
+    .frames()
+    .find((frame) => frame.type === "authentication_claim_request");
+  expect(consult).toBeDefined();
+  await h.port.inbound(
+    claimResponse(jobID, consult?.payload["request_id"], {
+      outcome: "open_new",
+      authentication_claim_id: "auth_claim_dup_0001",
+      gate_occurrence_id: "occ_dup_0001",
+      browser_holder_generation: 1,
+      lease_until: "2030-01-01T00:05:00Z",
+    }),
+  );
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+
+  // Granted or not, surface creation belongs to the materialization pipeline
+  // the same candidate is already driving: no legacy mint, no second tab.
+  expect(
+    h.frames().filter((frame) => frame.type === "handoff_link_request"),
+  ).toEqual([]);
+  expect(h.tabs.created.length).toBe(createdBefore);
+});
+
 // Live-smoke regression (2026-08-19): two papers were cancelled on the
 // operator's own library by papio's own housekeeping. A reconcile removal of a
 // surface the job still pointed at fell through onTabRemoved to the operator-
