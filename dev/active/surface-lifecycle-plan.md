@@ -473,12 +473,36 @@ every existing materialization test used `materializationActiveJob`, whose
 `tab_id: -1` made `findByTab` miss and left the whole cancellation branch
 unreachable — which is why 1,212 green tests coexisted with cancelled papers.
 
-**Open question, deliberately not guessed:** which of the fourteen callers fired
-in the two traces above. The fix holds regardless (it is at the seam they all
-share), but the trigger itself — two `provider_outcome` frames, and an
-`auth_pending` arriving 122ms *after* the cancellation — suggests a removal
-racing an in-flight authentication, which may be its own ordering bug. Pinning
-it needs instrumentation on a live institutional open, which was stopped to
-avoid cancelling more papers.
+**Verified live after the fix** (2026-08-19, `b626966` loaded, session
+`d4c171523c0e`): one institutional open on the recovered T&F paper
+(`job_abecef3df2b89b92dcbcc473c5`) stayed `awaiting_human` for 3.5 minutes —
+past both windows that killed papers before (+8s and +2m08s) — with
+`auth_pending` → `institutional_effect_authorized` →
+`institutional_effect_result` and no `provider_outcome` at all. Its claim
+reached `navigated` with a real `tab_id`, the full claim→bind→route→navigate
+sequence that never completed on the broken build (it stalled at
+`claimed`/`tab_id 0`), and the previously stuck claim was retired to
+`abandoned` by reconciliation. `dist/materialize.html` rendered
+"Materialization binding ready" in the extension's own code path, not just a
+hand-typed probe.
 
-Both papers above are recoverable with `papio acquire <doi>`.
+**Residual, now with better evidence than the earlier guess:** that open left
+TWO papio surfaces for one job — the explicit path's own minted
+`session-signin` tab (which is where the UNE login actually landed) beside the
+materialization binding's scaffold. Claim observations are attributed to the
+binding's tab, so `wall_observed`/`login_started`/`auth_returned` never fire on
+the explicit path: `claim_observation_journal` stayed empty through a live login
+wall. Two consequences worth separating:
+
+1. *Not destructive now* — the job is healthy and the operator can sign in; the
+   daemon still learns the state through `auth_pending`/effect results.
+2. *But it is the likely trigger of the cancellation above*: two surfaces for
+   one job means one of them is surplus, and whichever removal tidies the
+   surplus one was hitting `onTabRemoved` while the job still pointed at it.
+   That also explains the two `provider_outcome` frames. The marker makes every
+   ordering safe, which is why the run above is clean, but the duplicate
+   surface itself is unfinished business: the explicit path should either bind
+   its minted tab as the materialization surface or not mint one.
+
+Both papers were recovered with `papio acquire`: the PLOS ONE one went straight
+to `imported` (open access, no browser), the T&F one is the live subject above.
