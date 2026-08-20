@@ -878,6 +878,19 @@ invariant already written here.
    their bind deadline; a per-poll sweep frees the same predicate, which also
    heals rows already written with a NULL deadline.
 
+6. **FIXED — the badge counted papio's own queue as a human ask.**
+   `signInBlockerCount` counted `queued && requires_auth` beside
+   `auth_pending`, so every paper waiting its turn at an institution served by
+   one sign-in was reported as waiting on the operator: the badge read 13 while
+   exactly one could proceed, and a twenty-hour internal stall looked like
+   patience. The count is now `auth_pending` alone — a paper whose own surface
+   is at a login page — and the queue is named as papio's work in a qualifying
+   clause ("· N more queued for your library") carried on the sign-in *and*
+   connected tooltips, so the disabled-keepalive signal the old behaviour was
+   protecting survives without the false ask. The popup needed no change: its
+   list was already `auth_pending || engagement_required`, which is what made
+   the badge the only liar.
+
 Live verification after the operator's reload (2026-08-20 16:06–16:20):
 
 - extension reload real — session `6543494d25e1` → `6ca0ac10c02d`
@@ -895,10 +908,8 @@ Live verification after the operator's reload (2026-08-20 16:06–16:20):
 - surfaces created across the whole run: **one**, for the paper explicitly
   opened. No new litter, no new group.
 
-Still not live-verified: the causal-cession retirement path (an owned surface
-retiring when the operator moves away). It is suite-covered but needs a paper
-that reaches a terminal state while its tab is foregrounded, which this run did
-not produce.
+The second-*papio*-group observation is explained and closed: startup reconcile
+folded it on the next worker.
 
 Also proposed and **dropped as plan-banned**: adopting prior-epoch tabs after
 a browser restart by matching `origin_digest` plus *papio*-group membership.
@@ -906,8 +917,7 @@ Line 331 bans inference from group/window/title and line 151 keeps automatic
 remapping to self-identifying scaffolds. Those tabs stay in the
 `orphanTabStatus` operator-review path by design, not by omission.
 
-Still open after this round: the `auth_pending` vocabulary, which is why the
-badge could read "13 papers waiting on your institution sign-in" while exactly
-one could proceed — it counts every queued sibling as needing a human, not one
-per genuinely blocked surface. The second-*papio*-group observation is now
-explained and closed: startup reconcile folded it on the next worker.
+Nothing from this round is left open. What remains in the plan overall is the
+pre-v2/restarted/ceded tab population (deliberately operator-review, line 808)
+and the causal-cession retirement path, which is suite-covered but has not yet
+met a live paper that went terminal while its tab was foregrounded.
