@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"papio/internal/job"
 	"papio/internal/protocol"
@@ -131,6 +132,108 @@ func TestAuthenticationClaimOpenNewThenNavigateExistingAfterBind(t *testing.T) {
 	}
 	if navigateExisting.GateOccurrenceID != openNew.GateOccurrenceID {
 		t.Fatalf("gate occurrence rolled over without a reopen: first=%s second=%s", openNew.GateOccurrenceID, navigateExisting.GateOccurrenceID)
+	}
+}
+
+// TestInstitutionalBindAcquiresTheInstitutionEntry pins the live stall found on
+// 2026-08-20: the daemon-orchestrated pipeline (candidate offer -> claim ->
+// scaffold -> bind) has no consult in it, so a paper reached bind without ever
+// reserving the institution's authentication entry. The bind records itself as
+// the entry's owner-binding and fails closed when that write does not
+// fence-match, so an entry row left by any other job made every bind answer
+// "stale" forever - measured live at ~2s per attempt, minting and removing a
+// scaffold each pass. The bind must acquire the slot through the same
+// arbitration the consult uses.
+func TestInstitutionalBindAcquiresTheInstitutionEntry(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	strandedJob := parkInstitutional(t, jobs, "wr_bind_acquire_stranded", handoffWork(), "")
+	jobID := parkInstitutional(t, jobs, "wr_bind_acquire", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auth-claim-bind-acquire")
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-bind-acquire")
+
+	// Another job's reservation, already lapsed - exactly the row the live
+	// institution carried for twenty hours.
+	if _, err := jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "auth-claim-bind-acquire", LeaseID: "lease-stranded",
+		OwnerID: strandedJob, BrowserHolderGeneration: 1,
+		LeaseUntil: b.now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No authentication_claim_request anywhere: straight to claim and bind.
+	bindingID := bindCandidate(t, b, jobID, candidateID, "bind-acquire", 31)
+
+	lease, ok, err := jobs.GetAuthenticationEntryLease(ctx, "auth-claim-bind-acquire")
+	if err != nil || !ok {
+		t.Fatalf("entry lease after the bind: ok=%v err=%v", ok, err)
+	}
+	if lease.OwnerID != jobID {
+		t.Fatalf("entry owner = %q, want the binding job %q", lease.OwnerID, jobID)
+	}
+	if lease.OwnerBindingID != bindingID {
+		t.Fatalf("owner_binding_id = %q, want %q - the bind must record its own surface", lease.OwnerBindingID, bindingID)
+	}
+}
+
+// TestInstitutionalBindRefusedWhileAnotherSignInIsLive pins the other half: the
+// acquisition above is the arbitration, not a bypass of it. One sign-in surface
+// per institution still holds, and the refusal must be the outcome the
+// extension answers by retiring the scaffold rather than retrying forever.
+func TestInstitutionalBindRefusedWhileAnotherSignInIsLive(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	ownerJob := parkInstitutional(t, jobs, "wr_bind_live_owner", handoffWork(), "")
+	rivalJob := parkInstitutional(t, jobs, "wr_bind_live_rival", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auth-claim-bind-live")
+	ownerCandidate := explicitMaterializationCandidate(t, jobs, ownerJob, "domain-bind-live-owner")
+	rivalCandidate := explicitMaterializationCandidate(t, jobs, rivalJob, "domain-bind-live-rival")
+
+	runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, ownerJob,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "bind-live-owner-consult", CandidateID: ownerCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	bindCandidate(t, b, ownerJob, ownerCandidate, "bind-live-owner", 41)
+
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, rivalJob,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "bind-live-rival-claim", CandidateID: rivalCandidate,
+			MaterializationKind: "browser_tab",
+		}))
+	claimResp := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if claimResp == nil {
+		t.Fatalf("institutional_claim_response missing: %v", claimed)
+	}
+	claimPayload := claimResp.Payload.(*protocol.InstitutionalClaimResponsePayload)
+	if claimPayload.Outcome != "claimed" {
+		t.Fatalf("rival claim outcome = %s, want claimed: %+v", claimPayload.Outcome, claimPayload)
+	}
+	bound, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalBindRequest, rivalJob,
+		protocol.InstitutionalBindRequestPayload{
+			RequestID: "bind-live-rival-bind", ClaimID: claimPayload.ClaimID,
+			BindingID: claimPayload.BindingID, TabID: 42,
+		}))
+	bindResp := firstOfType(bound, protocol.MsgInstitutionalBindResponse)
+	if bindResp == nil {
+		t.Fatalf("institutional_bind_response missing: %v", bound)
+	}
+	payload := bindResp.Payload.(*protocol.InstitutionalBindResponsePayload)
+	if payload.Outcome != "not_eligible" {
+		t.Fatalf("rival bind outcome = %s, want not_eligible so the scaffold is retired: %+v", payload.Outcome, payload)
+	}
+	if payload.Detail == "" {
+		t.Fatalf("refusal must name itself: %+v", payload)
+	}
+	lease, ok, err := jobs.GetAuthenticationEntryLease(ctx, "auth-claim-bind-live")
+	if err != nil || !ok {
+		t.Fatalf("entry lease after the refusal: ok=%v err=%v", ok, err)
+	}
+	if lease.OwnerID != ownerJob {
+		t.Fatalf("entry owner = %q, want the live owner %q - a refused bind must not steal the slot", lease.OwnerID, ownerJob)
 	}
 }
 

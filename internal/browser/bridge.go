@@ -1560,7 +1560,21 @@ func liveMaterializationClaim(c *job.MaterializationClaim, now time.Time) bool {
 	return err == nil && expires.After(now)
 }
 
+// logMaterializationRefusal records a materialization frame the daemon did not
+// grant. Every refusal in this pipeline is otherwise invisible from the daemon
+// side: the extension either retries locally with backoff or stalls, so a paper
+// that never reaches a surface leaves no trace at all beyond a claim row that
+// sits at its birth phase. Same gap the claim-observation ack had, and the same
+// remedy - out of band in the log, never widened into a wire result.
+func logMaterializationRefusal(frameType, jobID, outcome, detail string) {
+	log.Printf("papio: materialization %s for %s not granted: %s (%s)",
+		frameType, jobID, outcome, detail)
+}
+
 func (b *Bridge) materializationClaimResponse(jobID string, p protocol.InstitutionalClaimResponsePayload) ([]json.RawMessage, error) {
+	if p.Outcome != "claimed" {
+		logMaterializationRefusal(protocol.MsgInstitutionalClaimResponse, jobID, p.Outcome, p.Detail)
+	}
 	frame, err := b.frame(protocol.MsgInstitutionalClaimResponse, jobID, p)
 	if err != nil {
 		return nil, err
@@ -1681,10 +1695,46 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 	} else if profile != nil {
 		authenticationClaimID = profile.AuthenticationClaimID
 	}
+	// The bind records this job as the entry's owner-binding (§4.1) and fails
+	// closed when that write does not fence-match, so a paper that never
+	// reserved the entry can never bind. That is reachable and was live: the
+	// daemon-orchestrated pipeline (candidate offer -> claim -> scaffold ->
+	// bind) has no consult in it, so any paper whose institution carried
+	// another job's lease row hammered bind every ~2s forever, minting and
+	// removing a scaffold each pass. Acquire the slot here through the same
+	// arbitration the consult uses - it is the single gate, so one sign-in per
+	// institution still holds - and refuse quietly when a live owner holds it.
+	if authenticationClaimID != "" {
+		leaseID := evidenceObservationID("authentication_claim_lease", authenticationClaimID, jobID, strconv.FormatInt(b.epoch, 10))
+		if _, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+			AuthenticationClaimID: authenticationClaimID, LeaseID: leaseID, OwnerID: jobID,
+			BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
+		}); reserveErr != nil {
+			if !errors.Is(reserveErr, job.ErrAuthenticationEntryLeaseBusy) {
+				result.Outcome, result.Detail = "error", "authentication entry lease is unavailable"
+				return b.frameInstitutionalBind(jobID, result)
+			}
+			// not_eligible is the outcome the extension answers by retiring
+			// the scaffold and clearing the workflow, which is exactly right
+			// here: no surface, no retry storm, and the scheduler re-offers
+			// this candidate once the institution is free.
+			result.Outcome, result.Detail = "not_eligible", "another sign-in for this institution is in progress"
+			return b.frameInstitutionalBind(jobID, result)
+		}
+	}
 	err = b.jobs.BindMaterializationWithLeaseOwner(ctx, claim.ID, p.BindingID, b.epoch,
 		candidate.InstitutionProfileRevision, p.TabID, authenticationClaimID, jobID)
 	if err != nil {
-		result.Outcome = "stale"
+		// Every other refusal here names itself; this one answered a bare
+		// "stale" with no detail, which is what made a live stall
+		// undiagnosable from the daemon side. The lease-owner side channel
+		// (claim-observation-protocol.md §4.1) is the likely half: the bind
+		// records this job as the institution entry's owner-binding and
+		// fails closed when that write is a fenced no-op, which is exactly
+		// what happens when the job never reserved the entry in the first
+		// place.
+		result.Outcome, result.Detail = "stale",
+			"the claim fence or the institution's sign-in slot was lost"
 		if !errors.Is(err, job.ErrMaterializationStale) && !errors.Is(err, job.ErrMaterializationConflict) {
 			result.Outcome, result.Detail = "error", "binding could not be recorded"
 		}
@@ -1696,6 +1746,9 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 }
 
 func (b *Bridge) frameInstitutionalBind(jobID string, p protocol.InstitutionalBindResponsePayload) ([]json.RawMessage, error) {
+	if p.Outcome != "bound" {
+		logMaterializationRefusal(protocol.MsgInstitutionalBindResponse, jobID, p.Outcome, p.Detail)
+	}
 	frame, err := b.frame(protocol.MsgInstitutionalBindResponse, jobID, p)
 	if err != nil {
 		return nil, err
@@ -1822,6 +1875,9 @@ func (b *Bridge) institutionalRoute(ctx context.Context, jobID string, p *protoc
 }
 
 func (b *Bridge) frameInstitutionalRoute(jobID string, p protocol.InstitutionalRouteResponsePayload) ([]json.RawMessage, error) {
+	if p.Outcome != "issued" {
+		logMaterializationRefusal(protocol.MsgInstitutionalRouteResponse, jobID, p.Outcome, p.Detail)
+	}
 	frame, err := b.frame(protocol.MsgInstitutionalRouteResponse, jobID, p)
 	if err != nil {
 		return nil, err
@@ -1937,6 +1993,9 @@ func (b *Bridge) institutionalNavigatedForSession(ctx context.Context, jobID str
 }
 
 func (b *Bridge) frameInstitutionalNavigated(jobID string, p protocol.InstitutionalNavigatedResponsePayload) ([]json.RawMessage, error) {
+	if p.Outcome != "acknowledged" {
+		logMaterializationRefusal(protocol.MsgInstitutionalNavigatedResponse, jobID, p.Outcome, p.Detail)
+	}
 	frame, err := b.frame(protocol.MsgInstitutionalNavigatedResponse, jobID, p)
 	if err != nil {
 		return nil, err
@@ -2183,6 +2242,9 @@ func (b *Bridge) ensureAuthenticationClaimGateOccurrence(ctx context.Context, pr
 }
 
 func (b *Bridge) authenticationClaimResponse(jobID string, p protocol.AuthenticationClaimResponsePayload) ([]json.RawMessage, error) {
+	if p.Outcome != "open_new" && p.Outcome != "navigate_existing" {
+		logMaterializationRefusal(protocol.MsgAuthenticationClaimResponse, jobID, p.Outcome, p.Detail)
+	}
 	frame, err := b.frame(protocol.MsgAuthenticationClaimResponse, jobID, p)
 	if err != nil {
 		return nil, err

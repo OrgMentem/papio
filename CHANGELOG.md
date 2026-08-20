@@ -176,6 +176,21 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
+- **Papers that could never open now open — and *papio* stops opening and closing
+  a blank tab every two seconds.** When *papio* prepares a paper's library
+  sign-in it also records which paper holds that library's single sign-in slot.
+  If the slot still had another paper's name on it — including a paper that had
+  long since finished or been cancelled — the preparation was refused, and
+  *papio* simply kept trying: a fresh blank tab made and thrown away every two
+  seconds, for as long as the browser stayed open, with the paper reporting that
+  it was waiting for *you* the whole time. Preparing a paper now takes the slot
+  when it is genuinely free, and stands down quietly when another sign-in is
+  really in progress — one sign-in per library, as before, without the churn.
+- **When *papio* cannot go ahead, the log now says so.** Refusals along the
+  path from "found a copy" to "tab open on your library" were silent: a paper
+  could stall for a day with nothing written down anywhere. Each refusal is now
+  logged with its reason, and one of them — the refusal above — had no reason
+  attached at all.
 - **A paper that is turned away now gets back in the queue instead of sitting
   out.** Only one paper at a time may sign in to a given institution, so the
   others are told to wait — but a paper reserves its place a moment *before* it
