@@ -13523,7 +13523,7 @@ test("startup reconciliation retires a modern same-epoch inactive orphan through
   expect(h.tabs.snapshot(tabID)).toBeUndefined();
 });
 
-test("startup reconciliation cedes an active orphan instead of asking to close it", async () => {
+test("startup reconciliation retains an active orphan rather than ceding or closing it", async () => {
   const h = makeHarness(undefined, { windows: true });
   await h.bridge.start();
   const { tabID, bindingID } = await seedOwnedScaffold(h);
@@ -13539,10 +13539,57 @@ test("startup reconciliation cedes an active orphan instead of asking to close i
 
   await expect(h.bridge.reconcileOwnedTabs()).resolves.toEqual({ closed: 0 });
   expect(h.tabs.removed).not.toContain(tabID);
-  expect(internals.tabLedgerCache[String(tabID)]?.ceded).toBe(true);
   expect(
     h.frames().filter((frame) => frame.type === "surface_close_request"),
   ).toHaveLength(0);
+  // Retained, NOT ceded: papio focuses its own surfaces, so an active tab of
+  // unknown cause is ambiguous and ambiguity retains. Ceding here made every
+  // tab papio opened permanently unretirable.
+  expect(internals.tabLedgerCache[String(tabID)]?.ceded).toBeUndefined();
+});
+
+// The retry that makes retaining safe: a surface retained because it was the
+// foreground tab retires the moment it stops being one. Without it, "retain
+// instead of cede" would simply postpone the litter forever, since nothing
+// else revisits an owned tab between worker starts.
+test("an owned surface papio focused retires when the operator moves to another tab", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    focusOwnedTab: (tabID: number) => Promise<void>;
+  };
+  internals.tabLedgerCache[String(tabID)] = {
+    ...internals.tabLedgerCache[String(tabID)]!,
+    binding_id: bindingID,
+    job_id: "job_focused_then_left_0001",
+  };
+  await internals.focusOwnedTab(tabID);
+  expect(internals.tabLedgerCache[String(tabID)]?.ceded).toBeUndefined();
+
+  const otherTabID = await h.tabs.create({
+    url: "https://example.edu/reading",
+    active: false,
+  });
+  const framesBefore = h.port.posted.length;
+  const switching = h.tabs.userActivate(otherTabID.id ?? -1);
+  const request = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(request.payload).toMatchObject({
+    binding_id: bindingID,
+    disposition: "job_inactive",
+  });
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-deactivated",
+      nonce: "nonce-deactivated",
+      browser_holder_generation: 1,
+    }),
+  );
+  await switching;
+  expect(h.tabs.removed).toContain(tabID);
 });
 
 test("created broker tabs are ledgered durably and forgotten once they close", async () => {
@@ -18745,28 +18792,25 @@ test("Slice 2b: a non-authorized outcome retains the surface", async () => {
   expect(h.tabs.snapshot(tabID)).toBeDefined();
 });
 
-test("Slice 2b: an operator-active tab is ceded and detached rather than closed", async () => {
+test("Slice 2b: an operator activation cedes the surface before any close is requested", async () => {
   const h = makeHarness(undefined, { windows: true });
   await h.bridge.start();
   const { tabID, bindingID } = await seedOwnedScaffold(h);
   await h.tabs.userActivate(tabID);
-  const closing = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
-  const request = await h.port.waitForFrame("surface_close_request");
-  await h.port.inbound(
-    nativeResult("surface_close_response", {
-      request_id: request.payload["request_id"],
-      outcome: "authorized",
-      close_authorization_id: "auth-0002",
-      nonce: "nonce-0002",
-      browser_holder_generation: 1,
-    }),
-  );
-  await expect(closing).resolves.toEqual({ closed: false });
-  expect(h.tabs.removed).not.toContain(tabID);
+  // Causal cession: the takeover is recorded at the activation papio did not
+  // cause, so the close is refused locally and no one-use authorization is
+  // spent proving what the extension already knows.
   const record = closeInternals(h).tabLedgerCache[String(tabID)];
   expect(record?.ceded).toBe(true);
   expect(record?.binding_id).toBe(bindingID);
   expect(record?.pending_close).toBeUndefined();
+  await expect(
+    closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle"),
+  ).resolves.toEqual({ closed: false });
+  expect(
+    h.frames().filter((frame) => frame.type === "surface_close_request"),
+  ).toHaveLength(0);
+  expect(h.tabs.removed).not.toContain(tabID);
 });
 
 test("Review round finding 3: an operator activation landing inside the close window (after consumeCloseTombstone's own check, strictly before tabs.remove is issued) cedes instead of closing", async () => {
@@ -18893,32 +18937,50 @@ test("Scenario 6: papio's own focus_owner activation leaves no cession trace, bu
   const ledgerAfterFocus = await internals.snapshotTabLedger();
   expect(ledgerAfterFocus[String(ownerTabID)]?.ceded).toBeUndefined();
 
-  // Part (b): a genuine operator activation (h.tabs.userActivate) cedes,
-  // and that cede survives a worker restart — no further close is ever
-  // attempted, and closeOwnedSurface's own ledger-entry gate refuses it
-  // before even sending a request.
+  // Part (b): papio's own focus leaves the surface retirable, which is the
+  // half the discriminator gap used to forfeit — the cession it wrote made
+  // every tab papio focused permanently unretirable. A fresh harness with no
+  // live job owns the surface, so the close can reach the wire.
+  const h1 = makeHarness(undefined, { windows: true });
+  await h1.bridge.start();
+  const { tabID: focusedTabID } = await seedOwnedScaffold(h1);
+  const focusInternals = h1.bridge as unknown as {
+    focusOwnedTab: (tabID: number) => Promise<void>;
+  };
+  await focusInternals.focusOwnedTab(focusedTabID);
+  expect(
+    closeInternals(h1).tabLedgerCache[String(focusedTabID)]?.ceded,
+  ).toBeUndefined();
+  h1.tabs.patch(focusedTabID, { active: false });
+  const retiring = closeInternals(h1).closeOwnedSurface(
+    focusedTabID,
+    "scaffold_idle",
+  );
+  const ownerRequest = await h1.port.waitForFrame("surface_close_request");
+  await h1.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: ownerRequest.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-s6-owner",
+      nonce: "nonce-s6-owner",
+      browser_holder_generation: 1,
+    }),
+  );
+  await expect(retiring).resolves.toEqual({ closed: true });
+  expect(h1.tabs.removed).toContain(focusedTabID);
+
+  // Part (c): a genuine operator activation cedes at the activation itself,
+  // and that cession survives a worker restart — no close is ever attempted.
   const h2 = makeHarness(undefined, { windows: true });
   await h2.bridge.start();
   const { tabID: scaffoldTabID } = await seedOwnedScaffold(h2);
   await h2.tabs.userActivate(scaffoldTabID);
-  const closing2 = closeInternals(h2).closeOwnedSurface(
-    scaffoldTabID,
-    "scaffold_idle",
-  );
-  const request2 = await h2.port.waitForFrame("surface_close_request");
-  await h2.port.inbound(
-    nativeResult("surface_close_response", {
-      request_id: request2.payload["request_id"],
-      outcome: "authorized",
-      close_authorization_id: "auth-s6-op",
-      nonce: "nonce-s6-op",
-      browser_holder_generation: 1,
-    }),
-  );
-  await expect(closing2).resolves.toEqual({ closed: false });
-  expect(h2.tabs.removed).not.toContain(scaffoldTabID);
   const ledgerBeforeRestart = closeInternals(h2).tabLedgerCache;
   expect(ledgerBeforeRestart[String(scaffoldTabID)]?.ceded).toBe(true);
+  await expect(
+    closeInternals(h2).closeOwnedSurface(scaffoldTabID, "scaffold_idle"),
+  ).resolves.toEqual({ closed: false });
+  expect(h2.tabs.removed).not.toContain(scaffoldTabID);
 
   const restarted = restartWorker(h2);
   await restarted.bridge.start();

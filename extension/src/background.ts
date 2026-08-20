@@ -2381,6 +2381,20 @@ export class Bridge {
    * intervening await, so a touch that happens (and even reverts) during a
    * close attempt is never invisible to a single before/after tabs.get. */
   private readonly tabTouchEpoch = new Map<number, number>();
+  /** papio-issued focus action tokens (surface-lifecycle-plan.md Slice 2,
+   * "Causal operator cession"): one pending token per tab that papio itself
+   * is about to activate. The matching onActivated event consumes the token
+   * and is therefore NOT operator takeover; an activation with no token is.
+   *
+   * Worker memory is the correct tier for the same reason deliberateRemovals
+   * is: the activation event for a focus this worker requests always arrives
+   * in the same worker lifetime. A token that is somehow never consumed
+   * decays into ambiguity, and ambiguity retains rather than cedes. */
+  private readonly papioFocusTokens = new Map<number, number>();
+  /** Last tab observed active per window. An activation makes the previous
+   * tab in that window inactive, which is the event-driven moment a retained
+   * surface becomes retirable. */
+  private readonly lastActiveTabByWindow = new Map<number, number>();
   /** Pre-cutover ledger entries retained for one-time manual review because
    * their provenance could not be re-verified at migration (no jobID to
    * correlate against). Recomputed by the same migration pass every worker
@@ -3716,6 +3730,32 @@ export class Bridge {
     await this.deps.tabs.remove(tabID).catch(() => undefined);
     return true;
   }
+  /** Activate a tab papio owns, minting the focus token first so the
+   * resulting onActivated event is recognizable as papio's own act rather
+   * than the operator taking the surface over. Every papio-initiated
+   * activation of an owned surface MUST go through here; a bare
+   * tabs.update({active:true}) is indistinguishable from a click. */
+  private async focusOwnedTab(tabID: number): Promise<void> {
+    this.papioFocusTokens.set(tabID, (this.papioFocusTokens.get(tabID) ?? 0) + 1);
+    try {
+      await this.deps.tabs.update?.(tabID, { active: true });
+    } catch (e) {
+      const pending = (this.papioFocusTokens.get(tabID) ?? 0) - 1;
+      if (pending > 0) this.papioFocusTokens.set(tabID, pending);
+      else this.papioFocusTokens.delete(tabID);
+      throw e;
+    }
+  }
+
+  /** True when this activation was papio's own, consuming one token. */
+  private consumePapioFocusToken(tabID: number): boolean {
+    const pending = this.papioFocusTokens.get(tabID) ?? 0;
+    if (pending <= 0) return false;
+    if (pending === 1) this.papioFocusTokens.delete(tabID);
+    else this.papioFocusTokens.set(tabID, pending - 1);
+    return true;
+  }
+
   /** Detach a surface from automation without removing it: ceded permanently
    * per the retained-forever contract, its pending tombstone and job binding
    * cleared so nothing (a replay, a later reconcile pass) acts on it again.
@@ -4048,12 +4088,23 @@ export class Bridge {
         tab.groupId >= 0 &&
         (await this.knownHandoffGroup(tab.groupId, tab.windowId)) !== undefined;
       if (
-        tab.active === true ||
         tab.pinned === true ||
         (tab.url !== undefined && isPDFPage(tab.url)) ||
         (!inWorkWindow && !inPapioGroup)
       ) {
+        // Pinning, a PDF viewer, and moving a tab out of papio's container
+        // are operator acts on the surface itself: positive takeover.
         await this.cedeOwnedTab(tabID, entry.binding_id);
+        continue;
+      }
+      if (tab.active === true) {
+        // Ambiguity retains, it does not cede (plan: "never for
+        // engaged/active/PDF/adopted content. Unknown engagement => retain").
+        // papio focuses its own surfaces - explicit Open, a work-window
+        // raise - so treating active as takeover ceded papio's own tabs the
+        // instant it opened them, permanently, and the record could never be
+        // retired again. Operator activation is recorded where it happens,
+        // in onTabActivated, against a papio-issued focus token.
         continue;
       }
       const result = await this.closeOwnedSurface(tabID, "job_inactive");
@@ -4537,8 +4588,16 @@ export class Bridge {
       // Already gone — nothing left to remove or cede.
       return { closed: true };
     }
-    if (tab.active === true || tab.pinned === true || (tab.url !== undefined && isPDFPage(tab.url))) {
+    if (tab.pinned === true || (tab.url !== undefined && isPDFPage(tab.url))) {
       await this.cedeOwnedTab(tabID, bindingID);
+      return { closed: false };
+    }
+    if (tab.active === true) {
+      // Retain, do not cede: papio's own focus is not takeover, and this
+      // tombstone stays replayable so the surface retires once it is no
+      // longer the foreground tab. Ceding here burned the one-use
+      // authorization AND detached the binding, which is how an explicitly
+      // opened sign-in tab became permanently unretirable (live 2026-08-20).
       return { closed: false };
     }
     const removed = await this.closeOwnedTab(tabID, "authorized-close");
@@ -4710,7 +4769,7 @@ export class Bridge {
   ): Promise<void> {
     const tab = knownTab ?? (await this.deps.tabs.get(tabID));
     await this.reduceHandoffGroupState(tabID);
-    await this.deps.tabs.update?.(tabID, { active: true });
+    await this.focusOwnedTab(tabID);
     if (tab.windowId !== undefined && this.deps.windows !== undefined) {
       try {
         const win = await this.deps.windows.get(tab.windowId);
@@ -5120,7 +5179,7 @@ export class Bridge {
     if (groupID !== undefined && this.deps.tabGroups !== undefined) {
       await this.reduceHandoffGroupState(tabID);
       try {
-        await this.deps.tabs.update?.(tabID, { active: true });
+        await this.focusOwnedTab(tabID);
       } catch {
         // The tab may already be gone; the badge/notification remain the signal.
       }
@@ -5130,7 +5189,7 @@ export class Bridge {
     const windows = this.deps.windows;
     if (windowID === undefined || windows === undefined) return;
     try {
-      await this.deps.tabs.update?.(tabID, { active: true });
+      await this.focusOwnedTab(tabID);
     } catch {
       // The tab may already be gone; window focus below still helps.
     }
@@ -6943,7 +7002,7 @@ export class Bridge {
       const existing = (await this.deps.tabs.query?.({ url: inboxURL })) ?? [];
       const tab = existing.find((candidate) => candidate.id !== undefined);
       if (tab?.id !== undefined) {
-        await this.deps.tabs.update?.(tab.id, { active: true });
+        await this.focusOwnedTab(tab.id);
         if (tab.windowId !== undefined && this.deps.windows !== undefined) {
           await this.deps.windows.update(tab.windowId, { focused: true });
         }
@@ -7828,7 +7887,7 @@ export class Bridge {
       return false;
     }
     try {
-      await this.deps.tabs.update?.(ownerTabHint, { active: true });
+      await this.focusOwnedTab(ownerTabHint);
     } catch {
       return false;
     }
@@ -18057,13 +18116,58 @@ export class Bridge {
    * up rather than trust the event payload. A tab that vanished between the
    * event and the lookup is not evidence of anything — swallow and drop. */
   private async onTabActivated(tabID: number): Promise<void> {
-    let url: string | undefined;
+    const papioFocused = this.consumePapioFocusToken(tabID);
+    let tab: TabInfo;
     try {
-      url = (await this.deps.tabs.get(tabID)).url;
+      tab = await this.deps.tabs.get(tabID);
     } catch {
       return;
     }
-    this.keepaliveManager?.noteResolverActivated(tabID, url);
+    this.keepaliveManager?.noteResolverActivated(tabID, tab.url);
+    if (!papioFocused) {
+      // Positive operator takeover, recorded where it happens rather than
+      // inferred later from tab.active - which papio itself sets.
+      await this.cedeOwnedTabIfOwned(tabID);
+    }
+    if (tab.windowId === undefined) return;
+    const previous = this.lastActiveTabByWindow.get(tab.windowId);
+    this.lastActiveTabByWindow.set(tab.windowId, tabID);
+    if (previous !== undefined && previous !== tabID) {
+      // The surface that just lost the foreground is the event-driven moment
+      // a retained-because-active owned tab becomes retirable.
+      await this.retireDeactivatedSurface(previous);
+    }
+  }
+
+  /** Mark an owned, unceded, current-epoch record as taken over. A tab papio
+   * does not own is not touched. */
+  private async cedeOwnedTabIfOwned(tabID: number): Promise<void> {
+    const ledger = await this.snapshotTabLedger();
+    const record = ledger[String(tabID)];
+    if (
+      record === undefined ||
+      record.ceded === true ||
+      record.browser_epoch !== this.browserEpoch
+    )
+      return;
+    await this.cedeOwnedTab(tabID, record.binding_id);
+  }
+
+  /** Retire one owned surface whose job papio no longer tracks, now that it
+   * is no longer the foreground tab. Same predicate reconcileOwnedTabs uses;
+   * the daemon still authorizes (or refuses) the close, one use per attempt. */
+  private async retireDeactivatedSurface(tabID: number): Promise<void> {
+    const ledger = await this.snapshotTabLedger();
+    const record = ledger[String(tabID)];
+    if (
+      record === undefined ||
+      record.ceded === true ||
+      record.job_id === undefined ||
+      record.browser_epoch !== this.browserEpoch ||
+      findByJob(this.store, record.job_id) !== undefined
+    )
+      return;
+    await this.closeOwnedSurface(tabID, "job_inactive");
   }
 
   private async onTabRemoved(tabID: number): Promise<void> {

@@ -187,9 +187,20 @@ execution records kept during the initial build.
   provided no provider effect is still in flight. The extension can act from
   either live job state or the same-browser-epoch birth ledger; after the
   physical close it reports `owner_closed`, consuming the one-use token and
-  freeing the institution's sign-in slot. It still refuses active, pinned, PDF,
-  touched, ceded, foreign-window, and browser-restarted tabs — those belong to
-  you, not cleanup.
+  freeing the institution's sign-in slot. It still refuses pinned, PDF, ceded,
+  foreign-window, and browser-restarted tabs, and never closes the tab you are
+  looking at — those belong to you, not cleanup.
+- **Signing in at your library now releases the papers waiting for it, even
+  when that library is configured twice.** Naming your own institution under
+  `[browser.resolvers.<name>]` while it is also the top-level default is
+  ordinary configuration, and it had two silent consequences: one library held
+  *two* sign-in slots, and every sign-in *papio* observed at that library's own
+  address was discarded as ambiguous — no record, and no paper released.
+  Measured on a real sign-in: two observations arrived, nothing was stored, 132
+  papers kept waiting. A library is now identified by the sign-in it actually
+  uses, and one address's sign-in counts for every profile that shares that
+  same sign-in. Two genuinely different logins behind one address are still
+  kept apart.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route

@@ -3022,6 +3022,143 @@ func TestSessionEvidenceOriginScopesReoffersToMatchingProfile(t *testing.T) {
 	_ = sourceAlpha
 }
 
+// The operator's own institution is configured twice - top level as the
+// default, and named so a job can request it - so both entries carry one
+// openurl_base_url and that origin serves two profiles. Resolving the hint to
+// a single profile treated it as ambiguous and dropped the frame: no evidence
+// row, no release. Live 2026-08-20, two session_evidence frames arrived the
+// moment a real library sign-in completed and nothing moved, while 132 papers
+// waited on that institution.
+func TestSessionEvidenceSharedOriginReleasesEveryProfileItServes(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	b.cfg.Browser.OpenURLBase = "https://shared.example.edu/openurl"
+	b.cfg.Browser.Resolvers = map[string]config.Institution{
+		"named": {OpenURLBase: "https://shared.example.edu/openurl"},
+		"other": {OpenURLBase: "https://other.example.edu/openurl"},
+	}
+	sourceDefault := parkInstitutional(t, jobs, "wr_shared_default_source", handoffWork(), "")
+	siblingDefault := parkInstitutional(t, jobs, "wr_shared_default_sibling", handoffWork(), "")
+	sourceNamed := parkInstitutional(t, jobs, "wr_shared_named_source", handoffWork(), "named")
+	siblingNamed := parkInstitutional(t, jobs, "wr_shared_named_sibling", handoffWork(), "named")
+	sourceOther := parkInstitutional(t, jobs, "wr_shared_other_source", handoffWork(), "other")
+	siblingOther := parkInstitutional(t, jobs, "wr_shared_other_sibling", handoffWork(), "other")
+	runSync(t, b, hello())
+	b.mu.Lock()
+	b.offered = map[string]bool{sourceDefault: true, sourceNamed: true, sourceOther: true}
+	b.cancelSent = map[string]bool{}
+	b.reofferPending = map[string]bool{}
+	b.reofferSourceJobID = map[string]string{}
+	b.mu.Unlock()
+
+	runSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "", map[string]any{
+		"evidence":    "warm_verified",
+		"origin_hint": "https://shared.example.edu",
+		"at":          "2026-08-03T12:00:00Z",
+	}))
+	reoffered := func(jobID string) bool {
+		t.Helper()
+		events, err := jobs.Events(context.Background(), jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event["kind"] == "browser.handoff_reoffered" {
+				return true
+			}
+		}
+		return false
+	}
+	if !reoffered(siblingDefault) {
+		t.Fatal("the default profile was not released by its own origin's sign-in")
+	}
+	if !reoffered(siblingNamed) {
+		t.Fatal("the named profile sharing that origin was not released")
+	}
+	if reoffered(siblingOther) {
+		t.Fatal("a profile on a different origin was released")
+	}
+}
+
+// The claim is the boundary, not the origin. Two federated entities behind one
+// resolver origin are two human sign-in entries, so one entry's session proves
+// nothing about the other and the frame must stay unattributable - the
+// corrected cardinality rule's other half ("resolving a claim never
+// auto-asserts entitled session evidence for every profile grouped under it").
+func TestSessionEvidenceSharedOriginAcrossTwoClaimsStaysFailClosed(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	b.cfg.Browser.OpenURLBase = "https://shared.example.edu/openurl"
+	b.cfg.Browser.ShibbolethEntityID = "https://idp-a.example.edu/entity"
+	b.cfg.Browser.Resolvers = map[string]config.Institution{
+		"tenant": {
+			OpenURLBase:        "https://shared.example.edu/openurl",
+			ShibbolethEntityID: "https://idp-b.example.edu/entity",
+		},
+	}
+	sourceDefault := parkInstitutional(t, jobs, "wr_two_claim_source", handoffWork(), "")
+	siblingDefault := parkInstitutional(t, jobs, "wr_two_claim_sibling", handoffWork(), "")
+	sourceTenant := parkInstitutional(t, jobs, "wr_two_claim_tenant_source", handoffWork(), "tenant")
+	siblingTenant := parkInstitutional(t, jobs, "wr_two_claim_tenant_sibling", handoffWork(), "tenant")
+	runSync(t, b, hello())
+	b.mu.Lock()
+	b.offered = map[string]bool{sourceDefault: true, sourceTenant: true}
+	b.cancelSent = map[string]bool{}
+	b.reofferPending = map[string]bool{}
+	b.reofferSourceJobID = map[string]string{}
+	b.mu.Unlock()
+
+	runSync(t, b, inFrame(t, protocol.MsgSessionEvidence, "", map[string]any{
+		"evidence":    "warm_verified",
+		"origin_hint": "https://shared.example.edu",
+		"at":          "2026-08-03T12:00:00Z",
+	}))
+	for _, jobID := range []string{siblingDefault, siblingTenant} {
+		events, err := jobs.Events(context.Background(), jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event["kind"] == "browser.handoff_reoffered" {
+				t.Fatalf("two human entries behind one origin released %s", jobID)
+			}
+		}
+	}
+}
+
+// One library named twice is one sign-in entry. The claim id used to key on
+// the config name whenever a profile declared no entity of its own, so naming
+// your default institution minted a second claim for it: two sign-in slots
+// where the cardinality invariant promises one.
+func TestAuthenticationClaimGroupsProfilesSharingOneHumanEntry(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	b.cfg.Browser.OpenURLBase = "https://library.example.edu/openurl"
+	b.cfg.Browser.ShibbolethEntityID = "https://idp.example.edu/entity"
+	b.cfg.Browser.Resolvers = map[string]config.Institution{
+		// The operator's own shape: the same resolver, named, with no entity
+		// repeated.
+		"named": {OpenURLBase: "https://library.example.edu/openurl"},
+		// A different library, no federated entity at all: its own origin is
+		// its entry, never the config name.
+		"elsewhere": {OpenURLBase: "https://other.example.edu/openurl"},
+	}
+	runSync(t, b, hello())
+
+	claimOf := func(name string) string {
+		t.Helper()
+		profile, err := jobs.InstitutionProfileByConfiguredName(ctx, name)
+		if err != nil || profile == nil {
+			t.Fatalf("profile %s: %+v %v", name, profile, err)
+		}
+		return profile.AuthenticationClaimID
+	}
+	if claimOf("default") != claimOf("named") {
+		t.Fatal("one library configured twice holds two sign-in slots")
+	}
+	if claimOf("elsewhere") == claimOf("default") {
+		t.Fatal("two libraries were merged into one sign-in slot")
+	}
+}
+
 func TestSessionEvidenceProfilesDrainIndependentlyInOneSync(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	b.cfg.Browser.Resolvers = map[string]config.Institution{

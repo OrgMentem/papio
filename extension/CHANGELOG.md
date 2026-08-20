@@ -144,8 +144,18 @@ for the full pre-split extension history.
   one-use, binding-scoped `job_inactive` authorization, and closes only an
   inactive tab still inside *papio*'s work window or tab group. After removal,
   its durable claim identity reports `owner_closed` so the daemon can consume
-  the token and free the institution's sign-in slot. Active, pinned, PDF,
-  touched, ceded, and browser-restarted tabs remain yours.
+  the token and free the institution's sign-in slot. Pinned tabs, PDFs, tabs
+  you moved elsewhere, tabs you took over, and browser-restarted tabs remain
+  yours.
+- ***papio* no longer mistakes its own focus for you taking a tab over.**
+  Opening a paper brings its tab to the front — and *papio* read that exact
+  activation as "the human is using this now", permanently, so every tab it
+  opened became one it could never tidy up again. That is why finished papers
+  piled up in the group even after cleanup shipped. *papio* now marks its own
+  focus before it happens, so only an activation it did not cause counts as
+  yours; it never closes the tab you are looking at, and when you move to
+  another tab, the working tab you left behind retires itself if its paper is
+  over.
 - **Chrome's network-error page no longer stays in the *papio* group.** Once
   the daemon acknowledges that exact navigation failure, the extension closes
   the abandoned surface through the same one-use transaction. It does not

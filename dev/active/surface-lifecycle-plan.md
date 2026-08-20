@@ -762,16 +762,24 @@ library.
    entry. Nothing releases at authorization time, so a sibling cannot overlap a
    surface that has not closed.
 
-   Live evidence distinguishes the two policy branches. A controlled inactive
-   attempt (`binding_270f0b3f3b829a…`) minted `job_inactive` and returned the
-   papio group to its pre-open count. After the operator reloaded the final
-   bundle, explicit Open on `job_54373b66fa7b4f9112e9a027a4` produced an active
-   institution-login tab; cancellation minted `job_inactive` but deliberately
-   did not remove it — explicit Open is the operator taking control, so the
-   active guard ceded it. That is the requested ownership boundary, not a close
-   failure. Harnesses drive inactive cancel and ledger-only restart cancel
-   through request → authorize → tombstone → remove → `owner_closed` → applied
-   ack, and pin active cession separately.
+   Live evidence, corrected. A controlled inactive attempt
+   (`binding_270f0b3f3b829a…`) minted `job_inactive` and returned the papio
+   group to its pre-open count. Explicit Open on
+   `job_54373b66fa7b4f9112e9a027a4` then produced an active institution-login
+   tab whose cancellation minted `job_inactive` and did **not** remove it.
+   That was first recorded here as "the requested ownership boundary". **That
+   reading was wrong**, and re-reading this plan is what corrected it: the
+   design invariant at line 207 ("Causal operator cession … *papio*-issued
+   focus/navigation action tokens … matching events consume the token and do
+   not count as takeover") had never been implemented, and the amendment at
+   line 167 permits closure "never for engaged/active/PDF/adopted content.
+   Unknown engagement ⇒ retain" — retain, not cede. The shipped code ceded
+   **permanently** on `tab.active`, and papio focuses its own surfaces
+   (explicit Open, `focus_owner`, a work-window raise), so every tab papio
+   opened was ceded the instant it opened it, its binding detached and its
+   one-use authorization spent. Scenario 6's own test said so out loud: "the
+   structural discriminator gap … indistinguishable at that later check — out
+   of scope here". Fixed below.
 
 2. **FIXED — terminal claims no longer keep the whole institution queued.**
    The scheduler's one-parked-surface domain fence counted a terminal job's
@@ -802,3 +810,63 @@ library.
    already took control. The new code must not close them to make the group look
    tidy; the popup's orphan review/explicit operator close is the safe cleanup
    boundary. New lifecycle exits do not create more of them.
+
+## Second field round (2026-08-20 evening) — read against this plan, not around it
+
+The operator returned to one stale UNE sign-in tab, could not sign in through
+it, closed it, and saw the *papio* group expand to a pile of older tabs; the
+popup offered **Sign in** ("papio couldn't read the library page"), a fresh
+library tab opened, the sign-in succeeded — and nothing moved. Three distinct
+defects, each verified against live state and each measured against an
+invariant already written here.
+
+1. **A library configured twice held two sign-in slots.** The claim id keyed
+   on the federated entity ID and fell back to the **config name**
+   (`bridge.go:reconcileMaterializationProfiles`), so the operator's
+   `[browser.resolvers.une]` — same resolver as the top-level default, entity
+   declared only at the top level — minted a *second* authentication claim for
+   one library. Live: `profile_4e64…`/`default` and `profile_7bce…`/`une`
+   carried different `authentication_claim_id`s. That breaks the corrected
+   cardinality rule at line 134 in the direction nobody checks: not two
+   surfaces for one claim, but two claims for one human entry. Fixed by
+   deriving the entry identity from what the human actually signs into — the
+   declared entity, else the entity uniquely declared by another profile on the
+   same resolver origin, else that origin — never the config key.
+
+2. **Sign-in evidence for the operator's own library was unattributable, so
+   signing in released nothing.** `Config.ResolverProfileForOrigin` failed
+   closed whenever an origin served two profiles, which the config format
+   invites (see 1). Live at 15:03:23Z: two `browser.session_evidence` events
+   landed the moment the sign-in completed, `profile_evidence` gained **no**
+   row, and `reofferInstitutionalSiblingsForEvidence` never ran. Fixed
+   *within* line 140's limit ("resolving a claim never auto-asserts entitled
+   session evidence for every profile grouped under it"): attribution now
+   spans the profiles an origin serves **only while they share one
+   authentication claim** — one claim is one human entry — and two claims
+   behind one origin remain unattributable, fail-closed.
+
+3. **`tab.active` was read as operator takeover, permanently.** The mechanism
+   and its correction are in item 1 of the previous section. Shipped now:
+   *papio*-issued focus tokens (`focusOwnedTab`/`consumePapioFocusToken`,
+   worker-memory for the same reason `deliberateRemovals` is — the activation
+   event for a focus this worker requests arrives in this worker's lifetime);
+   cession recorded at the **untokened** activation, where the takeover
+   actually happens, instead of inferred later; `tab.active` now **retains**
+   (pinned, PDF, and moved-out-of-container still cede, all three being
+   operator acts on the surface itself); and a deactivation retry so retaining
+   is not a slower way of leaking — when the foreground moves on, an owned
+   surface whose job papio no longer tracks retires through the same
+   authorized close.
+
+Also proposed and **dropped as plan-banned**: adopting prior-epoch tabs after
+a browser restart by matching `origin_digest` plus *papio*-group membership.
+Line 331 bans inference from group/window/title and line 151 keeps automatic
+remapping to self-identifying scaffolds. Those tabs stay in the bounded
+operator-review path (item 5 above) by design, not by omission.
+
+Still open after this round: the `auth_pending` vocabulary (item 4 above),
+which is why the badge could read "13 papers waiting on your institution
+sign-in" while exactly one could proceed; and one observation not yet
+explained — a **second** *papio*-titled group in the same window (line 73
+documents multiple groups across windows as a supported steady state, which
+this is not).

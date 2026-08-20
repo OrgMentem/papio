@@ -1360,6 +1360,66 @@ func materializationRevision(key []byte, values ...string) int64 {
 	return n
 }
 
+// authenticationEntryIdentity derives the human sign-in entry each configured
+// profile shares, which is what an authentication claim is (ADR-0022; the
+// plan's corrected cardinality rule: "a claim may group profiles sharing one
+// human entry"). The federated entity ID names that entry when it is
+// declared. When it is not, the resolver ORIGIN names it - a library with no
+// federated entity is still signed into at one origin - and a profile sharing
+// that origin with exactly one declared entity adopts it.
+//
+// The config name is never the entry identity, which is what this replaces.
+// Naming your own institution under [browser.resolvers.<name>] while the same
+// resolver is already the top-level default is ordinary configuration, and it
+// minted a SECOND claim for one library: two sign-in slots where the
+// cardinality invariant promises one, and evidence for one that proves
+// nothing for the other. Measured live 2026-08-20 on the operator's own
+// config: `default` keyed on its entity, `une` keyed on the string "une".
+func authenticationEntryIdentity(cfg *config.Config, name string, inst config.Institution) string {
+	if inst.ShibbolethEntityID != "" {
+		return inst.ShibbolethEntityID
+	}
+	origins := cfg.ResolverProfilesForOrigin(resolverOrigin(inst.OpenURLBase))
+	declared := ""
+	for _, peer := range origins {
+		peerInst, ok := cfg.InstitutionFor(peer)
+		if !ok || peerInst.ShibbolethEntityID == "" {
+			continue
+		}
+		if declared != "" && declared != peerInst.ShibbolethEntityID {
+			// Two federated entities behind one origin are two entries; an
+			// entity-less profile cannot be assigned to either.
+			declared = ""
+			break
+		}
+		declared = peerInst.ShibbolethEntityID
+	}
+	if declared != "" {
+		return declared
+	}
+	if origin := resolverOrigin(inst.OpenURLBase); origin != "" {
+		return origin
+	}
+	return name
+}
+
+// resolverOrigin reduces a configured OpenURL base to its bare https origin,
+// the form ResolverProfilesForOrigin accepts.
+func resolverOrigin(base string) string {
+	if base == "" {
+		return ""
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+		return ""
+	}
+	origin := "https://" + strings.ToLower(u.Hostname())
+	if port := u.Port(); port != "" && port != "443" {
+		origin += ":" + port
+	}
+	return origin
+}
+
 func (b *Bridge) reconcileMaterializationProfiles(ctx context.Context, key []byte) error {
 	specs := make([]job.InstitutionProfileSpec, 0, len(b.cfg.ResolverNames()))
 	for _, name := range b.cfg.ResolverNames() {
@@ -1368,16 +1428,13 @@ func (b *Bridge) reconcileMaterializationProfiles(ctx context.Context, key []byt
 			continue
 		}
 		name = resolverProfileKey(name)
-		authIdentity := inst.ShibbolethEntityID
-		if authIdentity == "" {
-			authIdentity = name
-		}
 		specs = append(specs, job.InstitutionProfileSpec{
 			ConfiguredName: name,
 			AuthorityDigest: materializationMAC(key, "profile_authority", name,
 				inst.OpenURLBase, inst.ShibbolethEntityID, inst.ProquestAccountID,
 				inst.LibKeyMode, strconv.FormatInt(inst.LibKeyLibraryID, 10)),
-			AuthenticationClaimID: materializationMAC(key, "authentication_claim", authIdentity),
+			AuthenticationClaimID: materializationMAC(key, "authentication_claim",
+				authenticationEntryIdentity(&b.cfg, name, inst)),
 		})
 	}
 	_, err := b.jobs.ReconcileInstitutionProfiles(ctx, specs)
@@ -6588,9 +6645,53 @@ func evidenceObservationID(parts ...string) string {
 // recordAuth appends a timing-only auth event. The AuthPayload structurally
 // cannot carry a URL, host, title, query, or fragment, so an identity-provider
 // address cannot enter the event stream through this path.
+// profilesSharingOneClaim keeps the origin-scoped attribution set only when
+// every configured profile on that origin belongs to the SAME authentication
+// claim. One claim is one human sign-in entry, so a session observed at that
+// origin is a fact about that entry and holds for each profile grouped under
+// it. Two claims behind one origin are two entries, and evidence for one is
+// never evidence for the other: that case returns nothing and the caller
+// fails closed. A profile with no live (untombstoned) row is dropped rather
+// than treated as a second claim.
+func (b *Bridge) profilesSharingOneClaim(ctx context.Context, names []string) ([]string, error) {
+	claim := ""
+	var profiles []string
+	for _, name := range names {
+		key := resolverProfileKey(name)
+		profile, err := b.jobs.InstitutionProfileByConfiguredName(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if profile == nil || profile.TombstonedAt != "" || profile.AuthenticationClaimID == "" {
+			continue
+		}
+		if claim == "" {
+			claim = profile.AuthenticationClaimID
+		} else if claim != profile.AuthenticationClaimID {
+			return nil, nil
+		}
+		profiles = append(profiles, key)
+	}
+	return profiles, nil
+}
+
 // sessionEvidence records the first attributable profile observation within
 // each throttle window, then applies activity/reoffer side effects. Distinct
 // profiles remain independently attributable within one sync.
+//
+// An origin hint attributes to every profile that origin serves, but ONLY
+// while those profiles share one authentication claim - the daemon's identity
+// for one human sign-in entry (surface-lifecycle-plan.md's corrected
+// cardinality rule: "a claim may group profiles sharing one human entry",
+// and resolving one claim never asserts evidence for another). Two distinct
+// claims behind one origin are two human entries, so that frame stays
+// unattributable and fails closed exactly as before.
+//
+// Resolving the hint to a single profile instead made a shared origin
+// ambiguous, and the operator's own institution is routinely configured twice
+// - once at the top level, once named so a job can request it - so every
+// uncorrelated frame for their own library was dropped: a real sign-in
+// recorded nothing and released nothing (measured live 2026-08-20).
 func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidencePayload, msgIDs ...string) error {
 	if b.lastSessionEvidenceAt == nil {
 		b.lastSessionEvidenceAt = map[string]time.Time{}
@@ -6598,70 +6699,68 @@ func (b *Bridge) sessionEvidence(ctx context.Context, p *protocol.SessionEvidenc
 	if b.reofferRanThisSync == nil {
 		b.reofferRanThisSync = map[string]bool{}
 	}
-	wantedProfile := resolverProfileKey("")
-	attributable := true
-	if strings.TrimSpace(p.OriginHint) != "" {
-		profile, ok := b.cfg.ResolverProfileForOrigin(p.OriginHint)
-		if !ok {
-			attributable = false
-		} else {
-			wantedProfile = resolverProfileKey(profile)
+	hinted := strings.TrimSpace(p.OriginHint) != ""
+	wantedProfiles := []string{resolverProfileKey("")}
+	if hinted {
+		profiles, err := b.profilesSharingOneClaim(ctx, b.cfg.ResolverProfilesForOrigin(p.OriginHint))
+		if err != nil {
+			return err
 		}
+		wantedProfiles = profiles
 	}
 	now := b.now()
-	if attributable {
-		if last := b.lastSessionEvidenceAt[wantedProfile]; !last.IsZero() {
+	msgID := ""
+	if len(msgIDs) > 0 {
+		msgID = msgIDs[0]
+	}
+	// Recorded profiles drive the side effects. A throttled or unprovable
+	// profile is not an error and does not veto its siblings: each profile
+	// carries its own evidence row, throttle window and reoffer pin.
+	var recorded []string
+	for _, profile := range wantedProfiles {
+		if last := b.lastSessionEvidenceAt[profile]; !last.IsZero() {
 			age := now.Sub(last)
 			if age >= 0 && age < sessionEvidenceThrottle {
-				return nil
+				continue
 			}
 		}
-	}
-	if attributable {
-		msgID := ""
-		if len(msgIDs) > 0 {
-			msgID = msgIDs[0]
-		}
-		obsID := evidenceObservationID("session_evidence", msgID, wantedProfile, p.Evidence, p.At)
-		accepted, _, err := b.recordProfileEvidence(ctx, obsID, wantedProfile, "", evidenceVerdict(p.Evidence), job.ProfileEvidenceProbe, p.At)
+		obsID := evidenceObservationID("session_evidence", msgID, profile, p.Evidence, p.At)
+		accepted, _, err := b.recordProfileEvidence(ctx, obsID, profile, "", evidenceVerdict(p.Evidence), job.ProfileEvidenceProbe, p.At)
 		if err != nil {
 			return err
 		}
 		if !accepted {
 			// Uncorrelated and unprovable against the current revision. It is
 			// not recorded, so it must not release parked work either.
-			return nil
+			continue
 		}
-		b.lastSessionEvidenceAt[wantedProfile] = now
+		b.lastSessionEvidenceAt[profile] = now
+		recorded = append(recorded, profile)
+	}
+	if len(recorded) == 0 {
+		return nil
 	}
 	if err := b.jobs.S.AppendEvent(ctx, "", "browser.session_evidence", nil); err != nil {
 		return err
 	}
-	if !attributable || b.reofferRanThisSync[wantedProfile] {
-		return nil
+	for _, profile := range recorded {
+		if b.reofferRanThisSync[profile] {
+			continue
+		}
+		if err := b.reofferInstitutionalSiblingsForEvidence(ctx, profile, hinted); err != nil {
+			return err
+		}
+		b.reofferRanThisSync[profile] = true
 	}
-	if err := b.reofferInstitutionalSiblingsForEvidence(ctx, p.OriginHint); err != nil {
-		return err
-	}
-	b.reofferRanThisSync[wantedProfile] = true
 	return nil
 }
 
 // reofferInstitutionalSiblingsForEvidence chooses an open institutional
-// handoff as the source for the existing sibling reoffer routine. When the
-// extension supplies an origin hint, both the source and every candidate must
-// belong to the matching configured resolver profile; an unknown hint fails
-// closed.
-func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, originHint string) error {
-	hinted := strings.TrimSpace(originHint) != ""
-	wantedProfile := resolverProfileKey("")
-	if hinted {
-		profile, ok := b.cfg.ResolverProfileForOrigin(originHint)
-		if !ok {
-			return nil
-		}
-		wantedProfile = resolverProfileKey(profile)
-	}
+// handoff as the source for the existing sibling reoffer routine. The caller
+// has already attributed the observation, so this takes the resolved profile
+// key: both the source and every candidate must belong to it. An origin-less
+// frame keeps its narrower authority below.
+func (b *Bridge) reofferInstitutionalSiblingsForEvidence(ctx context.Context, wantedProfile string, hinted bool) error {
 	if !hinted {
 		for profile, sourceJobID := range b.reofferSourceJobID {
 			if profile != resolverProfileKey("") && sourceJobID != "" {

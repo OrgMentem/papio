@@ -1437,21 +1437,39 @@ func (c *Config) ResolverOrigins() []string {
 	return origins
 }
 
-// ResolverProfileForOrigin maps a validated resolver origin to its configured
-// profile. Matching includes the effective HTTPS port because two profiles on
-// the same hostname may legitimately use different resolver listeners. An
-// origin shared by multiple profiles is ambiguous and fails closed.
-func (c *Config) ResolverProfileForOrigin(origin string) (string, bool) {
+// ResolverProfilesForOrigin returns every configured profile served by one
+// resolver origin, in stable order. Matching includes the effective HTTPS port
+// because two profiles on the same hostname may legitimately use different
+// resolver listeners.
+//
+// It returns the whole set rather than failing closed on a shared origin
+// because that decision does not belong here: whether those profiles may
+// share one observation depends on whether they share one human sign-in
+// entry, which is the daemon's authentication claim, not a config fact. The
+// caller resolves the set against that claim
+// (browser.Bridge.profilesSharingOneClaim) and fails closed across claims.
+//
+// The single-profile form used to answer "ambiguous" here, and the config
+// format invites exactly the ambiguity it refused: the operator's primary
+// institution is configured at the top level AND named under
+// [browser.resolvers.<name>] so a job can request it explicitly, both
+// entries carrying one openurl_base_url. Every uncorrelated
+// session_evidence frame for their own library was therefore dropped, with
+// no profile evidence row and no sibling re-offer. Measured live 2026-08-20:
+// two browser.session_evidence events landed the moment a real library
+// sign-in completed, and nothing was recorded or released.
+func (c *Config) ResolverProfilesForOrigin(origin string) []string {
 	u, err := url.Parse(strings.TrimSpace(origin))
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
-		return "", false
+		return nil
 	}
 	originHost := strings.ToLower(u.Hostname())
 	originPort := u.Port()
 	if originPort == "" {
 		originPort = "443"
 	}
-	match := ""
+	var matches []string
+	seen := make(map[string]struct{})
 	for _, name := range c.ResolverNames() {
 		inst, ok := c.InstitutionFor(name)
 		if !ok || inst.OpenURLBase == "" {
@@ -1468,12 +1486,15 @@ func (c *Config) ResolverProfileForOrigin(origin string) (string, bool) {
 		if !strings.EqualFold(base.Hostname(), originHost) || basePort != originPort {
 			continue
 		}
-		if match != "" && match != name {
-			return "", false
+		canonical := resolverProfileName(name)
+		if _, dup := seen[canonical]; dup {
+			continue
 		}
-		match = resolverProfileName(name)
+		seen[canonical] = struct{}{}
+		matches = append(matches, canonical)
 	}
-	return match, match != ""
+	slices.Sort(matches)
+	return matches
 }
 
 func resolverProfileName(name string) string {

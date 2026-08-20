@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -503,11 +504,54 @@ openurl_base_url = "https://onesearch.library.example-college.edu/discovery/open
 	if cfg.Browser.DefaultResolver != "college" {
 		t.Fatalf("default_resolver = %q, want college", cfg.Browser.DefaultResolver)
 	}
-	if profile, ok := cfg.ResolverProfileForOrigin("https://onesearch.library.example-college.edu"); !ok || profile != "college" {
-		t.Fatalf("origin profile = %q, %t, want college", profile, ok)
+	if got := cfg.ResolverProfilesForOrigin("https://onesearch.library.example-college.edu"); !slices.Equal(got, []string{"college"}) {
+		t.Fatalf("origin profiles = %v, want [college]", got)
 	}
-	if profile, ok := cfg.ResolverProfileForOrigin("https://example.primo.exlibrisgroup.com"); !ok || profile != "default" {
-		t.Fatalf("default origin profile = %q, %t, want default", profile, ok)
+	if got := cfg.ResolverProfilesForOrigin("https://example.primo.exlibrisgroup.com"); !slices.Equal(got, []string{"default"}) {
+		t.Fatalf("default origin profiles = %v, want [default]", got)
+	}
+	if got := cfg.ResolverProfilesForOrigin("https://unconfigured.example.edu"); len(got) != 0 {
+		t.Fatalf("unconfigured origin profiles = %v, want none", got)
+	}
+}
+
+// The operator's own institution is routinely configured twice: once at the
+// top level as the default, once named so a job can request it explicitly.
+// Both entries carry one openurl_base_url, so this origin serves two profiles.
+// Resolving it to a single profile treated that as ambiguous and dropped every
+// uncorrelated session_evidence frame for the operator's own library, which is
+// how a real sign-in came to release nothing (measured live 2026-08-20).
+func TestResolverProfilesForSharedOriginAttributeToEveryProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte(`access_mode = "conservative"
+[browser]
+openurl_base_url = "https://example.primo.exlibrisgroup.com/nde/openurl?institution=EX"
+
+[browser.resolvers.example]
+openurl_base_url = "https://example.primo.exlibrisgroup.com/nde/openurl?institution=EX"
+
+[browser.resolvers.other]
+openurl_base_url = "https://onesearch.library.example-college.edu/discovery/openurl"
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.ResolverProfilesForOrigin("https://example.primo.exlibrisgroup.com"); !slices.Equal(got, []string{"default", "example"}) {
+		t.Fatalf("shared origin profiles = %v, want [default example]", got)
+	}
+	if got := cfg.ResolverProfilesForOrigin("https://onesearch.library.example-college.edu"); !slices.Equal(got, []string{"other"}) {
+		t.Fatalf("distinct origin profiles = %v, want [other]", got)
+	}
+	// One origin, one host permission: the request set stays deduplicated.
+	if got := cfg.ResolverOrigins(); !slices.Equal(got, []string{
+		"https://example.primo.exlibrisgroup.com",
+		"https://onesearch.library.example-college.edu",
+	}) {
+		t.Fatalf("resolver origins = %v", got)
 	}
 }
 
