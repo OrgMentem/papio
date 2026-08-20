@@ -18664,6 +18664,14 @@ test("a durable cancel retires a ledger-only surface after browser-local job sta
   const h = makeHarness(undefined, { windows: true });
   await h.bridge.start();
   const { tabID, bindingID } = await seedOwnedScaffold(h);
+  await h.port.inbound(
+    helloAck({
+      features: [
+        "surface_close_v1",
+        "institutional_authentication_claim_v1",
+      ],
+    }),
+  );
   const internals = h.bridge as unknown as {
     tabLedgerCache: Record<string, SurfaceBirthRecord>;
   };
@@ -18671,6 +18679,11 @@ test("a durable cancel retires a ledger-only surface after browser-local job sta
     ...internals.tabLedgerCache[String(tabID)]!,
     binding_id: bindingID,
     job_id: jobID,
+    claim: {
+      authentication_claim_id: "auth-claim-ledger-only-0001",
+      gate_occurrence_id: "gate-occ-ledger-only-0001",
+      browser_holder_generation: 1,
+    },
   };
   expect(findByJob(h.backend.store, jobID)).toBeUndefined();
 
@@ -18696,7 +18709,20 @@ test("a durable cancel retires a ledger-only surface after browser-local job sta
       browser_holder_generation: 1,
     }),
   );
-  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const observation = await h.port.waitForFrame("claim_observation");
+  expect(observation.job_id).toBe(jobID);
+  expect(observation.payload).toMatchObject({
+    binding_id: bindingID,
+    event_kind: "owner_closed",
+  });
+  await h.port.inbound(
+    observationAck(jobID, observation.payload["request_id"], {
+      outcome: "applied",
+      gate_occurrence_id: "gate-occ-ledger-only-0001",
+      browser_holder_generation: 1,
+      lease_until: "2026-08-20T04:30:00Z",
+    }),
+  );
   expect(h.tabs.removed).toContain(tabID);
   expect(h.tabs.snapshot(tabID)).toBeUndefined();
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);

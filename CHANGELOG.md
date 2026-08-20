@@ -185,9 +185,18 @@ execution records kept during the initial build.
   from durable claims instead of worker memory, and can authorize one exact
   binding to close when its job is terminal or has no open browser handoff,
   provided no provider effect is still in flight. The extension can act from
-  either live job state or the same-browser-epoch birth ledger. It still
-  refuses active, pinned, PDF, touched, ceded, foreign-window, and
-  browser-restarted tabs — those belong to you, not cleanup.
+  either live job state or the same-browser-epoch birth ledger; after the
+  physical close it reports `owner_closed`, consuming the one-use token and
+  freeing the institution's sign-in slot. It still refuses active, pinned, PDF,
+  touched, ceded, foreign-window, and browser-restarted tabs — those belong to
+  you, not cleanup.
+- **A network failure no longer leaves a dead browser tab behind or retries
+  into an offline network.** The extension already asked to close a route after
+  Chrome reported a navigation error, but the daemon never marked that route
+  abandoned, so it refused its own closing request. The observation now
+  abandons and expires that exact claim, authorizes closing the dead surface,
+  and keeps the candidate owned. Nothing retries automatically; choosing Open
+  later records the new attempt.
 - **A paper whose library sign-in you never finished can be opened again.** Once
   *papio* has sent a paper to your library it will not send it a second time on
   its own — that is deliberate, so one request to a publisher never becomes two.

@@ -18083,20 +18083,47 @@ export class Bridge {
     const pageCaptureWaiter = this.pageCaptureLoadWaiters.get(tabID);
     if (pageCaptureWaiter !== undefined) pageCaptureWaiter(false);
     this.authCountedTabs.delete(tabID);
-    const authorizedClose =
-      this.tabLedgerCache?.[String(tabID)]?.pending_close !== undefined;
+    const ledgerRecord = this.tabLedgerCache?.[String(tabID)];
+    const pendingClose = ledgerRecord?.pending_close;
+    const authorizedClose = pendingClose !== undefined;
     // Consumed exactly once, whatever happens below: this worker removed the
     // tab itself as housekeeping, so the removal is not the operator giving up.
     const deliberate = this.deliberateRemovals.delete(tabID);
-    const ownerBindingID = this.tabLedgerCache?.[String(tabID)]?.binding_id;
+    const ownerBindingID = ledgerRecord?.binding_id;
+    const ledgerJobID = ledgerRecord?.job_id;
     // Read before forgetLedgeredTab erases the record: after a worker
     // restart this is the ONLY surviving proof of which claim this surface
     // owned, and MV3 sleeps the worker after ~30s idle, so a sign-in tab
     // abandoned minutes later is the common case, not the edge one.
-    const durableClaim = this.tabLedgerCache?.[String(tabID)]?.claim;
+    const durableClaim = ledgerRecord?.claim;
     void this.forgetLedgeredTab(tabID);
     const job = findByTab(this.store, tabID);
-    if (!job) return;
+    if (!job) {
+      // job_inactive detaches browser-local job state BEFORE asking to close.
+      // The tab is gone now: this is the physical evidence owner_closed
+      // represents, so report it from the ledger identity instead of
+      // returning early. The reducer consumes the one-use token and retires
+      // the exact authentication-entry binding; releasing it at authorization
+      // time would let a sibling open before this surface actually closed.
+      if (
+        pendingClose?.disposition === "job_inactive" &&
+        ledgerJobID !== undefined &&
+        ownerBindingID !== undefined &&
+        durableClaim !== undefined
+      ) {
+        this.enqueueRestartRecoveredObservation(
+          {
+            job_id: ledgerJobID,
+            authentication_claim_id: durableClaim.authentication_claim_id,
+            binding_id: ownerBindingID,
+            browser_holder_generation: durableClaim.browser_holder_generation,
+            gate_occurrence_id: durableClaim.gate_occurrence_id,
+          },
+          "owner_closed",
+        );
+      }
+      return;
+    }
     // Slice 3 owner_closed: the owning surface closed without success — a
     // deliberate daemon-authorized close (surface_close_request already told
     // the daemon under its own disposition) and a job that already reached

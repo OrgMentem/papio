@@ -141,9 +141,15 @@ for the full pre-split extension history.
   had no authorized closing reason, and both the daemon's cancel index and the
   extension's job lookup were worker-local. Cleanup now acts from either live
   job state or a modern same-browser-epoch birth record, asks the daemon for a
-  one-use, binding-scoped `job_inactive` authorization, then closes only an
-  inactive tab still inside *papio*'s work window or tab group. Active, pinned,
-  PDF, touched, ceded, and browser-restarted tabs remain yours.
+  one-use, binding-scoped `job_inactive` authorization, and closes only an
+  inactive tab still inside *papio*'s work window or tab group. After removal,
+  its durable claim identity reports `owner_closed` so the daemon can consume
+  the token and free the institution's sign-in slot. Active, pinned, PDF,
+  touched, ceded, and browser-restarted tabs remain yours.
+- **Chrome's network-error page no longer stays in the *papio* group.** Once
+  the daemon acknowledges that exact navigation failure, the extension closes
+  the abandoned surface through the same one-use transaction. It does not
+  retry automatically while the network may still be unavailable.
 - **Asking for a paper's sign-in no longer opens two tabs for it.** *papio* was
   racing itself: the daemon answers a request to open a paper by both starting
   the paper's own working page *and* telling the extension to bring that paper
