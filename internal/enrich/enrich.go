@@ -52,11 +52,6 @@ type Enricher struct {
 	maxBody int64
 }
 
-// New constructs an enricher with default options.
-func New(client HTTPClient) *Enricher {
-	return NewWithOptions(Options{Client: client})
-}
-
 // NewWithOptions constructs an enricher with injectable dependencies.
 func NewWithOptions(opts Options) *Enricher {
 	if opts.Client == nil {

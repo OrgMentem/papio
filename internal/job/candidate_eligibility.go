@@ -142,21 +142,6 @@ func (js *Store) CandidateEligible(ctx context.Context, jobID string) (bool, err
 	return true, nil
 }
 
-// CandidateEligibleTx is the transaction-scoped variant.
-func CandidateEligibleTx(ctx context.Context, tx *sql.Tx, jobID string) (bool, error) {
-	var dummy int
-	err := tx.QueryRowContext(ctx,
-		`SELECT 1 FROM jobs j WHERE j.id = ? AND j.state = ? AND EXISTS (SELECT 1 FROM human_actions a WHERE a.job_id = j.id AND a.status = ? AND a.kind = ?) LIMIT 1`,
-		jobID, StateAwaitingHuman, CandidateEligibleStatus, CandidateEligibleKind).Scan(&dummy)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // CandidateEligibleJob is a job that inbound PDF bytes may be correlated with:
 // live, awaiting a human download, and still carrying an open manual_download
 // action.

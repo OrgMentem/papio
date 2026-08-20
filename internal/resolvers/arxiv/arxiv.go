@@ -58,11 +58,6 @@ type Resolver struct {
 
 var _ resolver.Resolver = (*Resolver)(nil)
 
-// New constructs a resolver with the official export.arxiv.org endpoint.
-func New(client HTTPClient) *Resolver {
-	return NewWithOptions(Options{Client: client})
-}
-
 // NewWithOptions constructs a resolver with injected dependencies.
 func NewWithOptions(opts Options) *Resolver {
 	baseURL := strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/")

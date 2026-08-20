@@ -38,11 +38,6 @@ type OpenAlexEnricher struct {
 	maxBody int64
 }
 
-// NewOpenAlex constructs an OpenAlex metadata enricher with default options.
-func NewOpenAlex(client HTTPClient, contactEmail string) *OpenAlexEnricher {
-	return NewOpenAlexWithOptions(OpenAlexOptions{Client: client, ContactEmail: contactEmail})
-}
-
 // NewOpenAlexWithOptions constructs an OpenAlex metadata enricher with
 // injectable dependencies.
 func NewOpenAlexWithOptions(opts OpenAlexOptions) *OpenAlexEnricher {

@@ -127,11 +127,6 @@ func ParseInstitutionCutoverDecision(detail map[string]any) (InstitutionCutoverD
 	return decision, true
 }
 
-// ParseCutoverDecision is the concise alias used by diagnosis projections.
-func ParseCutoverDecision(detail map[string]any) (InstitutionCutoverDecision, bool) {
-	return ParseInstitutionCutoverDecision(detail)
-}
-
 // LatestInstitutionCutoverDecision returns the decision on the newest
 // relevant event: job.transition or job.retry_requested. A retry request
 // starts a new decision epoch, so it deliberately clears an older transition

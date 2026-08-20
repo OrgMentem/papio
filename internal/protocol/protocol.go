@@ -1944,11 +1944,6 @@ var triageRouteClasses = []string{
 // bridge consults it to keep snapshots legal: an action kind outside this
 // list cannot be represented on a v3 frame and must be omitted, never
 // emitted invalid (the vocabulary grows only with a schema revision).
-// TriageRouteClassesV4 returns schema 4's vocabulary. The v3 function above
-// remains frozen so its omit guard continues to exclude pdf_identifier_needed.
-func TriageRouteClassesV4() []string {
-	return append(slices.Clone(triageRouteClasses), "pdf_identifier_needed")
-}
 func TriageRouteClasses() []string {
 	return slices.Clone(triageRouteClasses)
 }

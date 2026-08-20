@@ -166,9 +166,6 @@ func ResolvePolicy(cfg config.Notify) (Policy, error) {
 	return Policy{Preset: preset, Categories: categories, Sources: sources, MaxPerHour: cfg.MaxPerHour, QuietHours: quiet, QuietMode: cfg.QuietMode, DigestEvery: digest, CompletionQuiet: completionQuiet, CompletionMaxHold: completionMax, StallAfter: stall}, nil
 }
 
-func NewPolicy(cfg config.Notify) (Policy, error)        { return ResolvePolicy(cfg) }
-func PolicyFromConfig(cfg config.Notify) (Policy, error) { return ResolvePolicy(cfg) }
-
 func (p Policy) For(category Category) CategoryPolicy {
 	if value, ok := p.Categories[category]; ok {
 		return value

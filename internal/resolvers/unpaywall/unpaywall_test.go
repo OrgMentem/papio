@@ -113,7 +113,10 @@ func TestResolveVectors(t *testing.T) {
 }
 
 func TestResolveNetworkFailureIsTemporary(t *testing.T) {
-	r := New(clientFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("network down") }), "contact@example.org")
+	r := NewWithOptions(Options{
+		Client:       clientFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("network down") }),
+		ContactEmail: "contact@example.org",
+	})
 	_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/example"})
 	if _, ok := resolver.Temporary(err); !ok {
 		t.Fatalf("error %v is not temporary", err)
@@ -130,9 +133,9 @@ func TestResolveOversizedJSONFailsClosed(t *testing.T) {
 }
 
 func TestResolveIncludesDiscoveredWork(t *testing.T) {
-	r := New(clientFunc(func(*http.Request) (*http.Response, error) {
+	r := NewWithOptions(Options{Client: clientFunc(func(*http.Request) (*http.Response, error) {
 		return responseFor(http.StatusOK, `{"doi":"10.1000/EXAMPLE","is_oa":true,"title":" Source title ","year":2024,"publication_year":1999,"z_authors":[{"given":" A.","family":"Author "},{"raw_author_name":"B. Author"}],"best_oa_location":{"url_for_pdf":"https://files.example/article.pdf"}}`, nil), nil
-	}), "contact@example.org")
+	}), ContactEmail: "contact@example.org"})
 
 	candidates, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/example"})
 	if err != nil || len(candidates) != 1 {
@@ -158,9 +161,9 @@ func TestResolveRequiresMatchingDOI(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := New(clientFunc(func(*http.Request) (*http.Response, error) {
+			r := NewWithOptions(Options{Client: clientFunc(func(*http.Request) (*http.Response, error) {
 				return responseFor(http.StatusOK, tc.body, nil), nil
-			}), "contact@example.org")
+			}), ContactEmail: "contact@example.org"})
 			candidates, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/example"})
 			if err != nil {
 				t.Fatal(err)

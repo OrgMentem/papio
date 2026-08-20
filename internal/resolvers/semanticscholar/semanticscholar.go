@@ -59,11 +59,6 @@ type Resolver struct {
 
 var _ resolver.Resolver = (*Resolver)(nil)
 
-// New constructs a resolver with the official Graph API endpoint.
-func New(client HTTPClient, apiKey string) *Resolver {
-	return NewWithOptions(Options{Client: client, APIKey: apiKey})
-}
-
 // NewWithOptions constructs a resolver with injected dependencies.
 func NewWithOptions(opts Options) *Resolver {
 	baseURL := strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/")

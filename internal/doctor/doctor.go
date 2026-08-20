@@ -1448,16 +1448,6 @@ func discoveryBackendCount(cfg config.Config) int {
 	return len(cfg.Discovery.Sources)
 }
 
-// DefaultWorkerPath resolves the current executable for pdf worker re-exec.
-func DefaultWorkerPath() string {
-	path, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-	path, _ = filepath.Abs(path)
-	return path
-}
-
 // DaemonStatus is the daemon information returned by the ping status RPC.
 // It must accept every field ping can emit: the CLI decodes strictly, and a
 // missing field here turns an optional ping addition (update availability)

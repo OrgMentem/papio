@@ -48,11 +48,6 @@ type Resolver struct {
 
 var _ resolver.Resolver = (*Resolver)(nil)
 
-// New constructs a resolver with the official v2 endpoint.
-func New(client HTTPClient, contactEmail string) *Resolver {
-	return NewWithOptions(Options{Client: client, ContactEmail: contactEmail})
-}
-
 // NewWithOptions constructs a resolver with injected dependencies.
 func NewWithOptions(opts Options) *Resolver {
 	baseURL := strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/")
