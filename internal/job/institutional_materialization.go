@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -494,6 +495,119 @@ func (js *Store) MaterializationAttemptRevision(ctx context.Context, jobID strin
 		return 0, err
 	}
 	return retries + 1, nil
+}
+
+// StartNextMaterializationAttemptForSpentCandidate records the explicit retry
+// decision for a job whose CURRENT attempt is provably finished and
+// undelivered, so the next candidate can mint. It exists because the
+// one-navigation-per-attempt invariant above has an escape hatch nothing could
+// reach.
+//
+// A candidate whose claim navigated keeps the candidate owned until an artifact
+// winner closes it (ReconcileMaterializationClaims' comment states this
+// deliberately, and TestSettledInstitutionalPermitKeepsExpiredClaimOwnedUntilWinner
+// pins it) - the guard against repeating an irreversible provider navigation.
+// The other way out is a new attempt, since MaterializationAttemptRevision
+// counts job.retry_requested events. But Retry only accepts retry_wait/failed/
+// unavailable and RepairAwaitingHuman requires no open actions, so a paper
+// parked awaiting a sign-in that never completed could reach neither: measured
+// live 2026-08-20, three papers pinned by navigated claims from dead holder
+// generations, re-offered every poll and answered 'busy' about once a second,
+// with `papio actions open` unable to produce a surface ever again.
+//
+// The operator asking again IS the retry decision, so the explicit-open path
+// records it here rather than inventing a second retirement rule for spent
+// claims. Every fence stays: an unsettled permit (an effect possibly in
+// flight), a live claim on a fresh attempt, or an artifact winner all make this
+// a no-op, and the decision lands in the event log where an attempt bump
+// belongs.
+func (js *Store) StartNextMaterializationAttemptForSpentCandidate(ctx context.Context, jobID string) (bool, error) {
+	if strings.TrimSpace(jobID) == "" {
+		return false, nil
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	var attempt int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT 1 + COUNT(*) FROM events WHERE job_id=? AND kind='job.retry_requested'`,
+		jobID).Scan(&attempt); err != nil {
+		return false, err
+	}
+	spent, err := spentMaterializationCandidateTx(ctx, tx, jobID, attempt, now)
+	if err != nil {
+		return false, err
+	}
+	if !spent {
+		return false, tx.Commit()
+	}
+	detail, _ := json.Marshal(map[string]any{"reason": "explicit_open_spent_attempt", "attempt": attempt})
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events(job_id, at, kind, detail_json) VALUES(?, ?, 'job.retry_requested', ?)`,
+		jobID, now, string(detail)); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// SpentMaterializationCandidate reports whether a job's current attempt has a
+// candidate that is owned but finished: its claim navigated (or issued a route)
+// with no unsettled effect, its diagnostic lease is over, and no artifact
+// winner ever closed it. Nothing the extension can be offered will advance such
+// a candidate - a claim request against it can only answer busy - so the offer
+// loop stops offering it, and only an explicit operator ask starts the next
+// attempt.
+func (js *Store) SpentMaterializationCandidate(ctx context.Context, jobID string) (bool, error) {
+	if strings.TrimSpace(jobID) == "" {
+		return false, nil
+	}
+	attempt, err := js.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	return spentMaterializationCandidateTx(ctx, js.S.DB(), jobID, attempt, store.Now())
+}
+
+func spentMaterializationCandidateTx(ctx context.Context, q dbtx, jobID string, attempt int64, now string) (bool, error) {
+	var spent int
+	// The subquery mirrors CurrentBrowserCandidateForJob's selection exactly,
+	// because the question is whether the candidate the offer loop WOULD hand
+	// out is spent. Asking it of any candidate on the attempt is wrong: a
+	// second row for the same attempt (a legacy or seeded one) would let a
+	// finished sibling suppress a live candidate's offers.
+	err := q.QueryRowContext(ctx, `SELECT 1 FROM (
+		SELECT c.id AS candidate_id, c.status AS status, c.job_attempt_revision AS attempt
+		  FROM browser_candidates c
+		  JOIN institution_profiles p ON p.id=c.institution_profile_id
+		 WHERE c.job_id=? AND c.job_attempt_revision=?
+		   AND c.status IN ('eligible','claimed','materializing')
+		   AND p.tombstoned_at IS NULL
+		   AND p.revision=c.institution_profile_revision
+		 ORDER BY c.created_at, c.id LIMIT 1) cur
+		WHERE cur.status IN ('claimed','materializing')
+		  AND EXISTS (SELECT 1 FROM materialization_claims m
+		    WHERE m.candidate_id=cur.candidate_id
+		      AND m.phase IN ('route_issued','navigated','settled')
+		      AND m.lease_until IS NOT NULL AND m.lease_until <= ?
+		      AND NOT EXISTS (SELECT 1 FROM effect_permits p
+		        WHERE p.claim_id=m.id AND p.status IN ('held','unknown_completion')))
+		  AND NOT EXISTS (SELECT 1 FROM materialization_claims live
+		    WHERE live.candidate_id=cur.candidate_id
+		      AND live.phase IN ('claimed','bound','route_issued','navigated')
+		      AND (live.lease_until IS NULL OR live.lease_until > ?))
+		  AND NOT EXISTS (SELECT 1 FROM artifact_winners w
+		    WHERE w.candidate_id=cur.candidate_id AND w.job_attempt_revision=cur.attempt)`,
+		jobID, attempt, now, now).Scan(&spent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SetBrowserCandidateStatus performs a status CAS; immutable authority columns

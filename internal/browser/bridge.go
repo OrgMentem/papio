@@ -690,17 +690,13 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 		if jobID == "" || !handoff[jobID] {
 			continue
 		}
-		if b.focusPending[jobID] {
-			// A focus already owed is not a refusal. The flag is a sticky
-			// priority marker - it overrides the automatic admission gate in the
-			// offer loop - so it deliberately outlives the poll that delivered
-			// the first frame. Skipping it silently made every later explicit
-			// open on the same paper report the CLI's access-mode refusal and do
-			// nothing, which is precisely what an operator retrying a stalled
-			// sign-in does.
-			queued++
-			continue
-		}
+		// A focus already owed is not a refusal, and it must not skip the work
+		// either: the marker is a sticky priority flag that outlives the poll
+		// which delivered its frame, so short-circuiting on it meant an
+		// operator asking again never reached the attempt decision below - the
+		// exact case of a paper whose sign-in stalled. Re-marking an owed job
+		// is idempotent; the paths that bail out below now decline to count a
+		// focus that will not happen, which is what the count is for.
 		row, getErr := b.jobs.Get(ctx, jobID)
 		switch {
 		case errors.Is(getErr, sql.ErrNoRows):
@@ -720,6 +716,17 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 		if b.institutionalMaterializationAvailable() {
 			epoch := b.epoch
 			b.mu.Unlock()
+			// An operator asking again for a paper whose attempt already
+			// navigated and never delivered is the retry decision the
+			// one-navigation-per-attempt invariant waits for; without it
+			// prepareMaterializationCandidate below returns the same pinned
+			// candidate forever and every claim answers 'busy'. A no-op unless
+			// that attempt is provably spent.
+			if started, startErr := b.jobs.StartNextMaterializationAttemptForSpentCandidate(ctx, row.ID); startErr != nil {
+				log.Printf("papio: starting the next materialization attempt for %s: %v", row.ID, startErr)
+			} else if started {
+				log.Printf("papio: %s asked again for a spent institutional attempt; starting the next one", row.ID)
+			}
 			candidate, candidateErr := b.prepareMaterializationCandidate(ctx, *row)
 			b.mu.Lock()
 			if b.epoch != epoch || b.holder == nil || b.holder.ID != holderID {
@@ -10267,6 +10274,24 @@ func (b *Bridge) serviceMaterializationCandidate(
 		(candidate.Status == "eligible" && current.Status != "eligible") ||
 		(candidate.Status != "eligible" && current.Status != "claimed" && current.Status != "materializing") {
 		return nil, nil
+	}
+	// A candidate owned by a finished attempt cannot be advanced by any offer:
+	// its claim's holder generation is gone, its lease is over, and a claim
+	// request against it can only answer busy. Offering it every poll is what
+	// produced a sustained claim/busy round trip about once a second per stuck
+	// paper, measured live 2026-08-20 on four of them, indefinitely. Checked
+	// here rather than in the durable branch above because the scheduler
+	// snapshot is cached and can still describe the candidate as eligible.
+	// Only an explicit operator ask starts the next attempt
+	// (StartNextMaterializationAttemptForSpentCandidate).
+	if current.Status != "eligible" {
+		if spent, spentErr := b.jobs.SpentMaterializationCandidate(ctx, id); spentErr != nil {
+			log.Printf("papio: reading spent materialization attempt for %s: %v", id, spentErr)
+		} else if spent {
+			b.clearMaterializationTracking(id)
+			delete(b.focusPending, id)
+			return nil, nil
+		}
 	}
 	now := b.now()
 	offerState, tracked := b.materializationOffered[id]

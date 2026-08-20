@@ -10605,6 +10605,138 @@ func TestMaterializationSchedulerKeepsOneSafetyDomainScaffold(t *testing.T) {
 	}
 }
 
+// TestFocusHandoffStartsTheNextAttemptForASpentCandidate pins the operator's
+// second ask. A paper whose institutional navigation completed but delivered
+// nothing keeps its candidate owned (the one-navigation-per-attempt guard), and
+// the only way out is a new attempt. The focus marker is sticky, so the second
+// ask used to short-circuit on it and never reach that decision: measured live
+// 2026-08-20, `papio actions open` on such a paper produced nothing at all
+// while the daemon answered its claims 'busy' about once a second.
+func TestFocusHandoffStartsTheNextAttemptForASpentCandidate(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "focus-spent-attempt", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "spent-domain")
+
+	// First ask: ordinary, and it leaves the sticky focus marker behind.
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("first focus = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	before, err := jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Spend the attempt: navigated, effect settled, diagnostic lease gone.
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: candidateID, JobAttemptRevision: before,
+		InstitutionProfileRevision: 1, RouteRevision: 1,
+		MaterializationKind: "browser_tab", BrowserHolderGeneration: b.epoch,
+		LeaseUntil: b.now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='navigated', lease_until=? WHERE id=?`,
+		b.now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("second focus = queued %d live %v err %v, want the ask to be honoured", queued, live, err)
+	}
+	after, err := jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before+1 {
+		t.Fatalf("attempt revision %d -> %d, want the second ask to start the next attempt", before, after)
+	}
+	fresh, err := jobs.CurrentBrowserCandidateForJob(ctx, jobID, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh == nil || fresh.ID == candidateID {
+		t.Fatalf("candidate after the second ask = %+v, want a fresh one for the new attempt", fresh)
+	}
+}
+
+// TestSpentCandidateStopsBeingOffered pins the churn's source. A candidate owned
+// by a finished attempt was re-offered every poll, and each offer could only
+// end in a claim answered 'busy' - measured live 2026-08-20 as a sustained
+// round trip about once a second, per stuck paper, indefinitely.
+func TestSpentCandidateStopsBeingOffered(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "spent-offer-suppressed", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	// No seeded candidate: the daemon mints its own during the focus, so the
+	// attempt has exactly one, as it does live. A seeded sibling would leave an
+	// older eligible row that the offer loop keeps handing out.
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	if offers, _ := runSync(t, b); firstOfType(offers, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("first poll offered no candidate: %v", offers)
+	}
+
+	// Spend the candidate the offer loop will reach for next - the same
+	// selection it uses - the way the live papers were spent: claimed, its
+	// claim navigated, the diagnostic lease over, no artifact winner.
+	attempt, err := jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := jobs.CurrentBrowserCandidateForJob(ctx, jobID, attempt)
+	if err != nil || current == nil {
+		t.Fatalf("current candidate: %+v err=%v", current, err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: current.ID, JobAttemptRevision: current.JobAttemptRevision,
+		InstitutionProfileRevision: current.InstitutionProfileRevision,
+		RouteRevision:              current.RouteRevision,
+		MaterializationKind:        "browser_tab", BrowserHolderGeneration: b.epoch,
+		LeaseUntil: b.now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, current.InstitutionProfileRevision, 9); err != nil {
+		t.Fatal(err)
+	}
+	// The settled institutional effect is what keeps the candidate owned past
+	// its lease - without it reconciliation would simply re-arm the candidate,
+	// which is not the live state at all.
+	if _, outcome, err := jobs.AcquireInstitutionalEffectPermit(ctx, job.InstitutionalEffectPermitAcquireInput{
+		JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+		SafetyDomainID: current.SafetyDomainID, InstitutionalRequestID: "spent-offer-request",
+		JobAttemptRevision: current.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+		ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
+		Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
+	}); err != nil || outcome != job.EffectPermitAcquired {
+		t.Fatalf("acquire institutional permit outcome=%v err=%v", outcome, err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE effect_permits SET status='settled' WHERE claim_id=?`, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='navigated', lease_until=? WHERE id=?`,
+		b.now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if spent, err := jobs.SpentMaterializationCandidate(ctx, jobID); err != nil || !spent {
+		t.Fatalf("attempt not spent after navigating its claim: spent=%v err=%v", spent, err)
+	}
+
+	after, _ := runSync(t, b)
+	if got := countType(after, protocol.MsgInstitutionalCandidateOffer); got != 0 {
+		t.Fatalf("spent candidate was offered %d times, want none", got)
+	}
+}
+
 func TestMaterializationSchedulerErrorRetainsFocusUntilRecovery(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()

@@ -176,6 +176,17 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
+- **A paper whose library sign-in you never finished can be opened again.** Once
+  *papio* has sent a paper to your library it will not send it a second time on
+  its own — that is deliberate, so one request to a publisher never becomes two.
+  But if the sign-in was never completed, nothing released the paper either: it
+  kept its place forever, "Open" did nothing at all, and no command could free
+  it. Asking for it again now starts a fresh attempt, recorded as your decision,
+  while a paper that already arrived is still never sent twice.
+- **A paper that is finished waiting no longer talks to your browser about it.**
+  Those same stuck papers were re-offered to the browser about once a second,
+  each time to be turned down — invisible, endless, and for nothing. *papio* now
+  stops offering a paper whose attempt is over and waits for you to ask again.
 - **Papers that could never open now open — and *papio* stops opening and closing
   a blank tab every two seconds.** When *papio* prepares a paper's library
   sign-in it also records which paper holds that library's single sign-in slot.

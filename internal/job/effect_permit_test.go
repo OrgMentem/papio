@@ -1566,3 +1566,117 @@ func TestAcquireInstitutionalEffectPermitSettledLegacyTombstoneNeverAuthorizes(t
 		t.Fatalf("settled institutional tombstone mutated claim=%+v", current)
 	}
 }
+
+// spentInstitutionalAttempt drives one candidate to the state the live stall
+// left behind: navigated, its institutional permit settled, its diagnostic
+// lease expired, and no artifact winner - a finished attempt that delivered
+// nothing.
+func spentInstitutionalAttempt(t *testing.T, js *Store, prefix string) (jobID, candidateID, claimID string) {
+	t.Helper()
+	ctx := context.Background()
+	jobID, candidateID = permitInstitutionalJob(t, js, prefix)
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1,
+		MaterializationKind: "browser_tab", BrowserHolderGeneration: 3,
+		LeaseUntil: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.BindMaterialization(ctx, claim.ID, claim.BindingID, 3, 1, 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome, err := js.AcquireInstitutionalEffectPermit(ctx, InstitutionalEffectPermitAcquireInput{
+		JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+		SafetyDomainID: "domain", InstitutionalRequestID: prefix + "-request",
+		JobAttemptRevision: 1, BrowserHolderGeneration: 3,
+		ExpectedEffectOrdinal: 0, LeaseUntil: time.Now().Add(time.Minute),
+		Authorization: EffectPermitEvent{Kind: "institutional.authorized"},
+	}); err != nil || outcome != EffectPermitAcquired {
+		t.Fatalf("acquire outcome=%v err=%v", outcome, err)
+	}
+	// Navigated, effect settled, and the diagnostic lease long gone.
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE effect_permits SET status='settled' WHERE claim_id=?`, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='navigated', lease_until=? WHERE id=?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	return jobID, candidateID, claim.ID
+}
+
+// TestStartNextMaterializationAttemptForSpentCandidate pins the reachable
+// escape hatch. Nothing retires a navigated claim before its artifact winner,
+// and Retry refuses an awaiting-human job, so without this a paper whose
+// sign-in the human never finished owns its candidate forever and every claim
+// request answers busy - measured live on three papers, about once a second.
+func TestStartNextMaterializationAttemptForSpentCandidate(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, _, _ := spentInstitutionalAttempt(t, js, "spent-attempt")
+
+	before, err := js.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := js.StartNextMaterializationAttemptForSpentCandidate(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatalf("spent attempt was not restarted")
+	}
+	after, err := js.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before+1 {
+		t.Fatalf("attempt revision %d -> %d, want +1 so a fresh candidate can mint", before, after)
+	}
+}
+
+// TestStartNextMaterializationAttemptRefusesUnsettledEffect pins the fence that
+// matters: an effect that may still be in flight must never be re-armed, since
+// a second route issuance is a second irreversible provider navigation.
+func TestStartNextMaterializationAttemptRefusesUnsettledEffect(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, _, claimID := spentInstitutionalAttempt(t, js, "spent-held")
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE effect_permits SET status='held' WHERE claim_id=?`, claimID); err != nil {
+		t.Fatal(err)
+	}
+	started, err := js.StartNextMaterializationAttemptForSpentCandidate(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started {
+		t.Fatalf("a held institutional permit must not start the next attempt")
+	}
+}
+
+// TestStartNextMaterializationAttemptRefusesDeliveredCandidate pins the other
+// fence: a candidate that already produced its artifact is never re-armed.
+func TestStartNextMaterializationAttemptRefusesDeliveredCandidate(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID, _ := spentInstitutionalAttempt(t, js, "spent-delivered")
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO artifact_winners
+		  (candidate_id, job_id, job_attempt_revision, browser_holder_generation, sha256, created_at)
+		VALUES (?, ?, 1, 3, 'sha-spent-delivered', ?)`,
+		candidateID, jobID, store.Now()); err != nil {
+		t.Fatal(err)
+	}
+	started, err := js.StartNextMaterializationAttemptForSpentCandidate(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started {
+		t.Fatalf("a delivered candidate must not start the next attempt")
+	}
+}
