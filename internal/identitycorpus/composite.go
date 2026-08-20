@@ -697,7 +697,9 @@ func auditSample(sorted []Document, flagged map[string]bool, weak map[string][]C
 // second PCG word is a fixed constant rather than time or entropy for the same
 // reason.
 func seededRand(seed int64) *rand.Rand {
-	return rand.New(rand.NewPCG(uint64(seed), 0x9E3779B97F4A7C15))
+	// Deliberately not crypto/rand: a report that cannot be reproduced from
+	// its seed is not a measurement (see the comment above).
+	return rand.New(rand.NewPCG(uint64(seed), 0x9E3779B97F4A7C15)) //nolint:gosec // reproducible audit sampling, not security
 }
 
 func dedupeSorted(in []string) []string {

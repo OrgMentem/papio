@@ -164,11 +164,9 @@ func (c *ClientCredentials) exchange(ctx context.Context) (string, time.Duration
 	if resp.Body != nil {
 		defer func() { _ = resp.Body.Close() }()
 	}
-	switch {
-	case resp.StatusCode == http.StatusOK:
-	case resp.StatusCode == http.StatusBadRequest,
-		resp.StatusCode == http.StatusUnauthorized,
-		resp.StatusCode == http.StatusForbidden:
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
 		// Never echo the response body: it is an auth failure on a
 		// credential pair, and papio does not put secrets in errors.
 		return "", 0, fmt.Errorf("openaire: registered service credentials were rejected (HTTP %d); check client_id and client_secret at https://develop.openaire.eu/apis", resp.StatusCode)

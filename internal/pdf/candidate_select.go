@@ -294,7 +294,7 @@ func QualifyCandidate(doc BindDocument, candidate BindCandidate) CandidateQualif
 			authorEvidence = append(authorEvidence, "author family name matched with an affiliation marker: "+family)
 		}
 	}
-	if !(exact > 0 || prefixed >= 2) {
+	if exact == 0 && prefixed < 2 {
 		q.Reason = "author_evidence_required: no exact surname and fewer than two marked surnames"
 		// Keep any partial author evidence for audit, but the verdict is fail.
 		q.Evidence = authorEvidence
@@ -519,7 +519,6 @@ func findCandidateTitleRange(segments []titleSegment, phrase string) (startSeg, 
 						return start, i, true
 					default:
 						matched = -1
-						break
 					}
 					if matched == -1 {
 						break
@@ -661,10 +660,8 @@ func candidateTitlePrintedAsLine(segments []titleSegment, phrase string) bool {
 					case strings.HasPrefix(word, phrase[matched:]) && isASCIIDigits(word[len(phrase)-matched:]):
 						absEnd = i
 						matched = len(phrase)
-						break
 					default:
 						matched = -1
-						break
 					}
 					if matched == -1 {
 						break

@@ -2,6 +2,7 @@
 package zotio
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -71,6 +72,6 @@ func importStagingBasename(w work.Work) (string, error) {
 		if isbn := normalizedISBN(w.ISBN); isbn != "" {
 			return "isbn-" + isbn + ".pdf", nil
 		}
-		return "", fmt.Errorf(newItemRoutingRefusal)
+		return "", errors.New(newItemRoutingRefusal)
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"papio/internal/agentjson"
-	"papio/internal/job"
 )
 
 const (
@@ -407,7 +406,7 @@ func (s *Service) classifyImportBackfillJob(ctx context.Context, jobID string, o
 	}
 	if strings.TrimSpace(row.ZotioItemKey) == "" {
 		if !hasNewItemRoutingIdentifier(row.Work) {
-			info := ErrorInfoFrom(WithErrorInfo(fmt.Errorf(newItemRoutingRefusal)))
+			info := ErrorInfoFrom(WithErrorInfo(errors.New(newItemRoutingRefusal)))
 			return importBackfillExpectedFail, info.Hint, "", nil
 		}
 	}
@@ -469,21 +468,6 @@ func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates
 		return nil, false
 	}
 	return ownedParents, true
-}
-
-func (s *Service) peekOwnedReadyImport(ctx context.Context, row job.Row) (parentKey string, owned bool) {
-	if s == nil || s.CLI == nil || strings.TrimSpace(row.ZotioItemKey) != "" {
-		return "", false
-	}
-	lookup := LookupWork{DOI: row.Work.DOI, ArXiv: row.Work.ArXiv, PMID: row.Work.PMID}
-	if lookup.DOI == "" && lookup.ArXiv == "" && lookup.PMID == "" {
-		return "", false
-	}
-	result, err := s.LookupWorks(ctx, LookupWorksRequest{Works: []LookupWork{lookup}})
-	if err != nil || len(result.Works) != 1 || result.Works[0].Status != OwnershipOwnedWithPDF {
-		return "", false
-	}
-	return result.Works[0].ItemKey, true
 }
 
 func importBackfillStatusAlreadyInLibrary(status string) bool {

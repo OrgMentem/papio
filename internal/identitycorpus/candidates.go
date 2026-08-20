@@ -776,7 +776,10 @@ func poolRand(seed int64, arm Arm, size int, absent bool, docKey string) *rand.R
 	lo := h.Sum64()
 	fmt.Fprint(h, "\x00hi")
 	hi := h.Sum64()
-	return rand.New(rand.NewPCG(lo, hi))
+	// Determinism IS the requirement here: the seed and cell coordinates must
+	// reproduce a cell's draws exactly, so a cryptographic source would defeat
+	// the property this function exists to provide.
+	return rand.New(rand.NewPCG(lo, hi)) //nolint:gosec // reproducible corpus sampling, not security
 }
 
 // sample draws k documents from a key-sorted slice. It reports false rather than

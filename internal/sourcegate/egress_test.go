@@ -197,7 +197,7 @@ func TestGuardedClientAttributesEgressToTheContextJob(t *testing.T) {
 	// nothing and the share can never bind.
 	req := guardedRequest(t, "https://api.openalex.org/works/W1?api_key=key-a")
 	req = req.WithContext(budget.WithJobID(req.Context(), "job-abc"))
-	if _, err := g.Do(req); err != nil {
+	if err := doAndClose(g, req); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
 	if authority.last.JobID != "job-abc" {
@@ -207,7 +207,7 @@ func TestGuardedClientAttributesEgressToTheContextJob(t *testing.T) {
 	// An unattributed request must carry no job rather than inherit the last
 	// one seen.
 	plain := guardedRequest(t, "https://api.openalex.org/works/W2?api_key=key-a")
-	if _, err := g.Do(plain); err != nil {
+	if err := doAndClose(g, plain); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
 	if authority.last.JobID != "" {

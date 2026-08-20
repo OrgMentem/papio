@@ -143,34 +143,6 @@ func validateForExcerpt(excerpt string) func(context.Context, string, string, wo
 		}, nil
 	}
 }
-func writeLargeFixturePDF(t *testing.T, path string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if _, err := f.Write([]byte("%PDF-1.4\nadopted\n")); err != nil {
-		t.Fatal(err)
-	}
-	// ~32 MiB widens the copy window so the concurrent resolver reliably
-	// lands between the decision (outside tx) and the fence (inside tx).
-	chunk := make([]byte, 1<<20)
-	for i := range chunk {
-		chunk[i] = 'x'
-	}
-	for i := 0; i < 32; i++ {
-		if _, err := f.Write(chunk); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.Write([]byte("\n%%EOF")); err != nil {
-		t.Fatal(err)
-	}
-}
 
 // enableAutoBindDecision and disableAutoBindDecision pin the autonomous
 // candidate-binding decision for one test in each direction.

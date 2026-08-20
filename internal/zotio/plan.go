@@ -216,7 +216,7 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		plan.ApplyArgs = []string{"--agent", "--yes", "attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
 	} else {
 		if !hasNewItemRoutingIdentifier(row.Work) {
-			return nil, fmt.Errorf(newItemRoutingRefusal)
+			return nil, errors.New(newItemRoutingRefusal)
 		}
 		if err := s.CLI.Sync(ctx); err != nil {
 			return nil, fmt.Errorf("refreshing Zotio library before deduplication: %w", err)

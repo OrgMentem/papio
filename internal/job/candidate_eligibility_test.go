@@ -4,6 +4,7 @@ package job
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -519,5 +520,5 @@ func TestSubmittedIdentityTxSeesOwnTransaction(t *testing.T) {
 }
 
 func isNoRows(err error) bool {
-	return err != nil && (err == sql.ErrNoRows || strings.Contains(err.Error(), "no rows"))
+	return err != nil && (errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows"))
 }

@@ -140,8 +140,8 @@ func TestImportBackfillSelectionOldestFirstAndGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(more) != 1 || more[0].JobID != "job_new_requested" {
-		t.Fatalf("cursor continuation = %#v", more)
+	if len(more) != 1 || more[0].JobID != "job_new_requested" || truncated {
+		t.Fatalf("cursor continuation = %#v truncated=%t, want the final page and no truncation", more, truncated)
 	}
 	excluded, err := service.countImportBackfillExcluded(ctx, false)
 	if err != nil {

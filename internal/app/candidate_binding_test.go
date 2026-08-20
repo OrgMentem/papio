@@ -83,7 +83,7 @@ func seedTitleOnlyValidatingCandidate(t *testing.T, svc *Service, jobs *job.Stor
 // FrontMatterDOIs (1 KiB blind window) sees it.
 func foreignDOIFrontMatter(foreignDOI string, w work.Work) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("DOI: %s\n", foreignDOI))
+	fmt.Fprintf(&b, "DOI: %s\n", foreignDOI)
 	b.WriteString(w.Title + "\n")
 	b.WriteString(strings.Join(w.Authors, ", ") + "\n")
 	// Different year so the year predicate does not mask the DOI check.

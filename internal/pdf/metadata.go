@@ -4,7 +4,6 @@ package pdf
 import (
 	"context"
 	"encoding/xml"
-	"io"
 	"sort"
 	"strings"
 
@@ -164,9 +163,8 @@ func parseXMP(packet string) MetadataFields {
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
+			// Any error ends the packet: EOF is the ordinary end, and a
+			// mid-element cut is why parsing keeps what it already has.
 			break
 		}
 		switch t := tok.(type) {

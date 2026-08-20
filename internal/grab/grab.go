@@ -462,13 +462,6 @@ func (p BindProvenance) recorded() bool {
 		len(p.Candidates) != 0 || p.ExcerptSHA256 != ""
 }
 
-func nullable(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
-}
-
 // BindRecord names one grab an automatic candidate bind filed: the grab that
 // captured it, the job it was filed under, when the bind committed, and the
 // full BindProvenance that justified the decision. It exists because a
