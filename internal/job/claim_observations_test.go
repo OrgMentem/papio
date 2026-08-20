@@ -404,3 +404,73 @@ func TestAuthenticationEntryLeaseExpiryRefusedWhileEffectPermitHeld(t *testing.T
 		t.Fatalf("reserve after permit settled = %+v, %v; want fresh reservation for job-other", lease, err)
 	}
 }
+
+// A dead paper must not keep its institution's only sign-in slot. Reservation
+// already treats a terminal owner as expired, but nothing forced that
+// evaluation: measured live 2026-08-20, a cancelled paper held the operator's
+// entry in state `human` for over ten hours because no other candidate existed
+// to contend for it, while every report of that institution read as a sign-in
+// in progress.
+func TestRetireTerminalAuthenticationEntryLeasesFreesADeadOwnersSlot(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID := seedJobAndCandidate(t, js, "terminal-slot")
+	authorizeEffectPermitJob(t, js, jobID)
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 4, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-terminal-slot", LeaseID: "lease-terminal-slot", OwnerID: jobID,
+		BrowserHolderGeneration: 4, LeaseUntil: time.Now().UTC().Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx, "claim-terminal-slot", jobID, 4, claim.BindingID, 1); err != nil {
+		t.Fatal(err)
+	}
+	// A live owner's slot is never swept, however long its lease runs.
+	if retired, err := js.RetireTerminalAuthenticationEntryLeases(ctx, time.Now().UTC()); err != nil || retired != 0 {
+		t.Fatalf("swept a live owner's slot: retired=%d err=%v", retired, err)
+	}
+	if err := js.Cancel(ctx, jobID, TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+	// §4.5 still holds: an unresolved institutional effect keeps occupying.
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO effect_permits
+		  (id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind,
+		   claim_id, binding_id, effect_ordinal, institutional_request_id, status, lease_until, created_at, updated_at)
+		VALUES ('permit-terminal-slot', ?, 1, 4, 'domain-terminal-slot', 'institutional',
+		        ?, ?, 1, 'institutional-request-terminal-slot', 'held', ?, ?, ?)`,
+		jobID, claim.ID, claim.BindingID, time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano),
+		time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := js.RetireTerminalAuthenticationEntryLeases(ctx, time.Now().UTC()); err != nil || retired != 0 {
+		t.Fatalf("swept a slot whose institutional effect is unresolved: retired=%d err=%v", retired, err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE effect_permits SET status='settled' WHERE id='permit-terminal-slot'`); err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := js.RetireTerminalAuthenticationEntryLeases(ctx, time.Now().UTC()); err != nil || retired != 1 {
+		t.Fatalf("terminal owner's settled slot: retired=%d err=%v, want 1", retired, err)
+	}
+	// Freed, so the next paper takes the institution without contending with a
+	// corpse - and the sweep is idempotent.
+	lease, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-terminal-slot", LeaseID: "lease-terminal-next", OwnerID: "job-next",
+		BrowserHolderGeneration: 4, LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil || lease.OwnerID != "job-next" {
+		t.Fatalf("reserve after retirement = %+v, %v", lease, err)
+	}
+	if retired, err := js.RetireTerminalAuthenticationEntryLeases(ctx, time.Now().UTC()); err != nil || retired != 0 {
+		t.Fatalf("sweep is not idempotent: retired=%d err=%v", retired, err)
+	}
+}

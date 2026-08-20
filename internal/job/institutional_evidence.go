@@ -1586,3 +1586,47 @@ func retireAuthenticationEntryLeaseAfterOwnerCloseTx(ctx context.Context, q dbtx
 		now.UTC().Format(time.RFC3339Nano), authenticationClaimID, bindingID)
 	return err
 }
+
+// RetireTerminalAuthenticationEntryLeases releases every institution sign-in
+// slot whose owning job is terminal and whose owner binding holds no
+// unresolved institutional effect permit. It returns how many it retired.
+//
+// ReserveAuthenticationEntryLease already treats a terminal owner as expired,
+// so this changes no arbitration rule - it applies the same predicate
+// proactively instead of waiting for the next reservation attempt. That wait
+// is unbounded in practice: a cancelled paper's slot stayed `human` for over
+// ten hours on the operator's own machine because no candidate existed to
+// contend for it, while every surface that reported state read as "waiting on
+// your institution sign-in".
+//
+// The effect-permit condition is claim-observation-protocol.md §4.5's, kept
+// verbatim: an unresolved browser-local effect must keep occupying the entry
+// even past a timer, so a navigation genuinely in flight is never retired out
+// from under itself.
+func (js *Store) RetireTerminalAuthenticationEntryLeases(ctx context.Context, now time.Time) (int, error) {
+	result, err := js.S.DB().ExecContext(ctx, `
+		UPDATE authentication_entry_leases
+		   SET state='expired', lease_until=NULL, owner_binding_id=NULL,
+		       owner_tab_hint=NULL, entitled_at=NULL, updated_at=?
+		 WHERE state IN ('reserved','human')
+		   AND EXISTS (
+		     SELECT 1 FROM jobs j
+		      WHERE j.id = authentication_entry_leases.owner_id
+		        AND j.state IN ('cancelled','failed','imported','ready','unavailable')
+		   )
+		   AND NOT EXISTS (
+		     SELECT 1 FROM effect_permits p
+		      WHERE p.binding_id = COALESCE(authentication_entry_leases.owner_binding_id,'')
+		        AND p.effect_kind='institutional'
+		        AND p.status IN ('held','unknown_completion')
+		   )`,
+		now.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(affected), nil
+}

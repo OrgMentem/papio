@@ -9563,6 +9563,16 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		if _, err := b.jobs.ExpireCloseAuthorizations(ctx, b.now().Add(-b.actionExpiry())); err != nil {
 			log.Printf("papio: expiring stale close authorizations: %v", err)
 		}
+		// §4.5: a terminal owner already counts as an expired lease at
+		// reservation time, but nothing forced that evaluation, so a dead
+		// paper's institution slot stayed held until some other candidate
+		// happened to contend for it — over ten hours on the operator's own
+		// machine, with every read of that institution reporting a sign-in in
+		// progress. Best-effort like the passes above; an unresolved
+		// institutional effect permit still keeps its entry occupied.
+		if _, err := b.jobs.RetireTerminalAuthenticationEntryLeases(ctx, b.now()); err != nil {
+			log.Printf("papio: retiring terminal authentication entry leases: %v", err)
+		}
 	}
 	if b.materializationRecoveryPending {
 		if err := b.recoverMaterializationFocus(ctx); err != nil {
