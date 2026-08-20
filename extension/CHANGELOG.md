@@ -49,6 +49,24 @@ for the full pre-split extension history.
   Measured live: closing *papio*'s tab group during a reload did exactly that.
   The loss is now reported from the same durable record, using the same
   one-time closing vocabulary an observed close uses.
+- **A paper's sign-in progress is no longer thrown away when the browser
+  reconnects.** Every queued sign-in observation was stamped with the browser
+  session it was made in, and the daemon answers anything from an older session
+  "stale" — so a reconnect between making an observation and sending it
+  discarded the whole backlog the reload path exists to preserve, silently.
+  Observations now carry the session they are *sent* from; which paper and
+  which sign-in they describe was never in that field.
+- **Closing every *papio* tab and then reloading no longer hides the closures.**
+  The reload could only recognise its own tabs by finding one still open, so
+  closing all of them made it look like a browser restart, and every tab it
+  should have reported became unrecognised. A tab that is *gone* can't be
+  confused with anyone else's, so its closure is now reported regardless.
+- **A paper you ask for is no longer sent to a sign-in page that isn't there.**
+  When *papio* points a paper at another paper's live sign-in and that page
+  turns out to be gone, the extension now says so instead of just failing the
+  click — so the next click gets a real page. This is the recovery that needs
+  no memory of the tab at all: a library slot held by a paper whose page
+  vanished before this release could otherwise stay held forever.
 - ***papio* no longer opens institutional sign-in tabs on its own.** Every
   autonomous path that used to create a `requires_auth` surface — a warm
   session admitting a queued offer, the 45-second fallback timer, a daemon

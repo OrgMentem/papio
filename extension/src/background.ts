@@ -4084,9 +4084,21 @@ export class Bridge {
           // reports from this record. The enqueue only touches the observation
           // outbox and schedules its drain, so it is safe inside this ledger
           // transaction.
+          // Deliberately NOT gated on browser_epoch equality, unlike every
+          // live-tab path below. Epoch equality exists to protect TAB-ID
+          // AUTHORITY: after a browser restart a stale id may name someone
+          // else's tab. Absence removes that hazard entirely - there is no
+          // tab to misidentify - and what is left is the record's own
+          // self-identifying claim material (plan line 151). The gate made
+          // this report unreachable in the exact case it exists for:
+          // epochStillLive re-proves an epoch by resolving SOME ledgered
+          // tab_hint, so an operator who closes ALL of papio's tabs and then
+          // reloads has no live record left to prove with, the reload is
+          // classified as a browser restart, and every record it should have
+          // reported became prior-epoch. Measured live 2026-08-21: reported
+          // nothing, and the library stayed held.
           if (
             entry.ceded !== true &&
-            entry.browser_epoch === this.browserEpoch &&
             entry.job_id !== undefined &&
             entry.binding_id !== undefined &&
             entry.claim !== undefined
@@ -7216,6 +7228,7 @@ export class Bridge {
         if (consult.kind === "navigate_existing") {
           const focused = await this.focusClaimOwnerTab(consult.ownerTabHint);
           if (!focused || consult.ownerTabHint === undefined) {
+            this.reportDeadClaimSurface(jobID, consult.ownerBindingID);
             await this.parkForEngagement(jobID);
             return failure(
               "handoff_unavailable",
@@ -7233,7 +7246,16 @@ export class Bridge {
           return { ok: true, opened: true };
         }
         if (consult.kind === "focus_owner") {
-          await this.focusClaimOwnerTab(consult.ownerTabHint);
+          // Same proof, other branch: the sibling this job was told to wait
+          // behind has no surface, so waiting is waiting for nothing.
+          if (!(await this.focusClaimOwnerTab(consult.ownerTabHint))) {
+            this.reportDeadClaimSurface(jobID, consult.ownerBindingID);
+            await this.parkForEngagement(jobID);
+            return failure(
+              "handoff_unavailable",
+              "The claimed sign-in surface is no longer live",
+            );
+          }
           await this.parkOnClaim(jobID);
           return { ok: true, opened: true };
         }
@@ -7974,6 +7996,32 @@ export class Bridge {
     return { kind: "refuse" };
   }
 
+  /** The daemon just directed this job at another surface for the same
+   * institution and that surface does not exist. That is first-hand proof the
+   * claim behind it is dead - and it needs no durable ledger record, which is
+   * what makes it the recovery of last resort: a record lost to a pre-fix
+   * prune, a cleared profile, or a browser restart leaves the claim otherwise
+   * immortal (its institutional effect permit is settled, so claim expiry
+   * deliberately never retires it) and its institution held forever. Report
+   * the loss with the same vocabulary an observed close uses; the reducer
+   * abandons the claim and frees the entry, so the operator's NEXT click gets
+   * a real surface. Measured live 2026-08-21: one such claim refused 273
+   * sibling binds. */
+  private reportDeadClaimSurface(jobID: string, ownerBindingID: string): void {
+    const grant = this.claimGrants.get(jobID);
+    if (grant === undefined) return;
+    this.enqueueRestartRecoveredObservation(
+      {
+        job_id: jobID,
+        authentication_claim_id: grant.authenticationClaimID,
+        binding_id: ownerBindingID,
+        browser_holder_generation: this.lastKnownBrowserHolderGeneration ?? 0,
+        gate_occurrence_id: grant.gateOccurrenceID,
+      },
+      "owner_closed",
+    );
+  }
+
   /** navigate_existing/focus_owner both point at a claim's already-live
    * owner tab. Re-proves `ownerTabHint` live before touching it — the
    * shipped renavigation fence (plan lines 175-184) — a stale hint is never
@@ -8208,9 +8256,26 @@ export class Bridge {
       .slice(0, 32);
     for (const entry of entries) {
       const { job_id: jobID, ...payload } = entry;
+      // The generation on the wire is the SENDER's, not the subject's. The
+      // daemon's fence is `FrameGeneration != Generation -> stale`, where
+      // Generation is its own current holder epoch, so an entry stamped at
+      // enqueue time is rejected the moment a reconnect intervenes - and a
+      // `stale` ack is terminal below, so the whole replayed backlog was
+      // silently discarded by exactly the reconnect §4.5 exists to survive.
+      // A restart-recovered owner_closed could never apply at all: its
+      // subject generation is historical by construction. The observation's
+      // subject stays exactly identified by binding_id + occurrence +
+      // ordinal, which this does not touch; carrying the current generation
+      // forward into the lease is what the reducer already documents wanting.
+      // An older daemon's hello_ack carries no generation, so a fresh worker
+      // can reach here never having learned one. Send the entry's own rather
+      // than stalling the queue: that is exactly today's behaviour, and the
+      // daemon fences a stale value as harmlessly as it always has.
+      const generation =
+        this.lastKnownBrowserHolderGeneration ?? payload.browser_holder_generation;
       const result = await this.requestNative(
         "claim_observation",
-        { ...payload },
+        { ...payload, browser_holder_generation: generation },
         "claim_observation_ack",
         AUTHENTICATION_CLAIM_FEATURE,
         true,

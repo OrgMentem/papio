@@ -19619,3 +19619,141 @@ test("startup reconciliation reports a vanished owned surface instead of pruning
   // Reported once, then forgotten: a second pass must not re-report.
   expect(Object.keys(ledger.current())).not.toContain(String(tabID));
 });
+
+// A reconnect between enqueue and drain used to make the daemon answer `stale`
+// (its fence compares the frame's generation to its own CURRENT one), and a
+// stale ack is terminal - so the replayed backlog §4.5 exists to preserve was
+// silently discarded, and a restart-recovered report, whose subject generation
+// is historical by construction, could never apply at all.
+test("a queued observation is sent under the CURRENT holder generation", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM],
+      browser_holder_generation: 9,
+    }),
+  );
+  const internals = h.bridge as unknown as {
+    enqueueRestartRecoveredObservation(
+      entry: {
+        job_id: string;
+        authentication_claim_id: string;
+        binding_id: string;
+        browser_holder_generation: number;
+        gate_occurrence_id: string;
+      },
+      eventKind: string,
+    ): void;
+  };
+  // Minted under a long-dead generation, which is the only one a lost surface
+  // can ever name.
+  internals.enqueueRestartRecoveredObservation(
+    {
+      job_id: "job_gen_0001",
+      authentication_claim_id: "claim-gen",
+      binding_id: "binding-gen-0001",
+      browser_holder_generation: 2,
+      gate_occurrence_id: "gate-gen",
+    },
+    "owner_closed",
+  );
+  const frame = await h.port.waitForFrame("claim_observation");
+  expect(frame.payload["browser_holder_generation"]).toBe(9);
+  expect(frame.payload["binding_id"]).toBe("binding-gen-0001");
+});
+
+// epochStillLive re-proves an epoch by resolving SOME ledgered tab. An operator
+// who closes every papio tab and then reloads leaves nothing to prove with, so
+// the reload is classified as a browser restart and every record it should have
+// reported becomes prior-epoch. Gating the loss report on epoch equality made
+// it unreachable in exactly the case it exists for.
+test("a vanished surface is reported even when its record predates this epoch", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  // seedOwnedScaffold negotiates its own ack, so the claim family and the
+  // current generation must be negotiated after it, not before.
+  await h.port.inbound(
+    helloAck({
+      features: ["surface_close_v1", AUTH_CLAIM],
+      browser_holder_generation: 4,
+    }),
+  );
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  const record = fakeBirthRecord({
+    ...internals.tabLedgerCache[String(tabID)],
+    binding_id: bindingID,
+    job_id: "job_prior_epoch_0001",
+    browser_epoch: "an-epoch-that-no-longer-exists",
+    claim: {
+      authentication_claim_id: "claim-prior-epoch",
+      browser_holder_generation: 1,
+      gate_occurrence_id: "gate-prior-epoch",
+    },
+  });
+  internals.tabLedgerCache = { [String(tabID)]: record };
+  await h.deps.tabLedger?.save({ [String(tabID)]: record });
+  h.tabs.forget(tabID);
+
+  await h.bridge.reconcileOwnedTabs();
+  const observation = await h.port.waitForFrame("claim_observation");
+  expect(observation.payload["event_kind"]).toBe("owner_closed");
+  expect(observation.payload["binding_id"]).toBe(bindingID);
+  // Under the CURRENT generation, not the record's dead one.
+  expect(observation.payload["browser_holder_generation"]).toBe(4);
+});
+
+// The recovery of last resort: no durable record is involved at all. When the
+// daemon points a job at another surface for the same institution and that
+// surface does not exist, the extension has first-hand proof the claim behind
+// it is dead. Without this, a claim whose ledger record was lost - a pre-fix
+// prune, a cleared profile - is immortal (its settled effect permit means
+// claim expiry deliberately never retires it) and holds its institution
+// forever. Measured live 2026-08-21: 273 refused sibling binds.
+test("a consult pointed at a dead surface reports the claim's loss", async () => {
+  const jobID = "job_dead_consult_0001";
+  const candidateID = "cand_dead_consult01";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobID)],
+  });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM],
+      browser_holder_generation: 7,
+    }),
+  );
+  await seedClaimCandidate(h, jobID, candidateID);
+
+  const opened = h.bridge.openHandoff(jobID);
+  const consult = await h.port.waitForFrame("authentication_claim_request");
+  // The owner tab named here never existed in this browser.
+  await h.port.inbound(
+    claimResponse(jobID, consult.payload["request_id"], {
+      outcome: "navigate_existing",
+      authentication_claim_id: "claim-dead-consult",
+      gate_occurrence_id: "gate-dead-consult",
+      browser_holder_generation: 7,
+      lease_until: new Date(Date.now() + 60_000).toISOString(),
+      owner_binding_id: "binding-dead-consult",
+      owner_tab_hint: 987654321,
+    }),
+  );
+  const reply = await opened;
+  expect(reply.ok).toBe(false);
+
+  const observation = await h.port.waitForFrame("claim_observation");
+  expect(observation.payload["event_kind"]).toBe("owner_closed");
+  expect(observation.payload["binding_id"]).toBe("binding-dead-consult");
+  expect(observation.payload["authentication_claim_id"]).toBe(
+    "claim-dead-consult",
+  );
+  // No tab was opened for the paper: the report is the whole action.
+  expect(h.tabs.created).toEqual([]);
+});

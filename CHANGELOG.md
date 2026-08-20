@@ -231,6 +231,18 @@ execution records kept during the initial build.
   paper whose page is retired releases the library slot it was occupying. A
   sign-in still survives a browser reconnect untouched — that is a new session,
   not a lost page.
+- **A library slot held by a paper whose page vanished now frees itself three
+  ways.** The first release of this fix could only report a vanished tab when
+  the extension still recognised its own record of it — and reloading after you
+  close every *papio* tab is exactly when it does not, because it recognises
+  its tabs by finding one still open. Two further paths close that: a report of
+  a *gone* tab no longer needs that recognition (a tab that does not exist
+  cannot be mistaken for someone else's), and when *papio* points a paper at
+  another paper's sign-in page that turns out to be missing, the extension
+  reports the loss instead of only failing the click — which needs no memory of
+  the tab at all, so even a slot stranded by an older version frees itself the
+  next time you ask for a paper. Relatedly, queued sign-in progress is no
+  longer discarded when the browser reconnects.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route
