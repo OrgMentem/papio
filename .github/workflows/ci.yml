@@ -101,6 +101,21 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: '1.26.6'
+      # internal/pdf's sentinel gate FAILS rather than skips when pdftotext is
+      # absent (candidate_gate_test.go: "the release path must therefore have
+      # the extractor"), because those nine sentinels are the suite's only
+      # contact with real extraction. Neither runner image ships poppler, so
+      # without this step every push to main is red on that one test.
+      - name: Install poppler (pdftotext)
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install poppler
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends poppler-utils
+          fi
+          pdftotext -v
       - name: Build
         run: go build ./...
       - name: Test
