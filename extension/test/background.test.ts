@@ -19526,3 +19526,49 @@ test("the scaffold tab navigates to a page where the shipped manifest declares p
   );
   expect(shell).toContain("<html");
 });
+
+// An extension reload wipes chrome.storage.session, so a paper mid-sign-in
+// loses its auth_pending status - and the daemon cannot re-offer it, because a
+// job owning a live claim is not a scheduler-eligible candidate. Measured live
+// 2026-08-20: right after a reload the badge read "papio: connected" while a
+// real login page sat in papio's own tab group, so the one paper the operator
+// could finish was the one paper papio stopped mentioning. The durable birth
+// ledger survives the wipe and is the recovery path.
+test("a reload keeps reporting a paper stopped at a login page", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  // Persist the birth certificate the way a real mint does, so it is present
+  // in storage.local (not just worker memory) across the reload.
+  const internals = h.bridge as unknown as {
+    browserEpoch: string | undefined;
+  };
+  await h.deps.tabLedger?.save({
+    [String(tabID)]: fakeBirthRecord({
+      binding_id: bindingID,
+      tab_hint: tabID,
+      browser_epoch: internals.browserEpoch ?? "test-epoch",
+    }),
+  });
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+
+  const reloaded = simulateExtensionUpdate(h);
+  await reloaded.bridge.start();
+  await reloaded.port.inbound(helloAck({ features: ["surface_close_v1"] }));
+  // The reload really did lose the job, and the ledger really did survive.
+  expect(reloaded.backend.store.activeJobs).toHaveLength(0);
+  expect(Object.keys(ledger.current())).toContain(String(tabID));
+
+  await reloaded.bridge.syncConnectionBadge();
+  expect(reloaded.action.texts.at(-1)).toBe("1");
+  expect(reloaded.action.backgroundColors.at(-1)).toBe("#b06000");
+  expect(reloaded.action.titles.at(-1)).toBe(
+    "papio: 1 paper needs your institution sign-in",
+  );
+
+  // Off the wall, no ask: the same surface on a provider page reports nothing.
+  await reloaded.tabs.userNavigate(tabID, `https://${PROVIDER_HOST}/article`);
+  await reloaded.bridge.syncConnectionBadge();
+  expect(reloaded.action.titles.at(-1)).not.toContain("sign-in");
+});

@@ -32,6 +32,15 @@ for the full pre-split extension history.
   your library". Nothing is hidden: the queued clause also appears when the ask
   count is zero, so institutional work in flight is still visible with no
   session evidence and keepalive off.
+- **A *papio* reload no longer forgets the paper you were signing in for.**
+  Reloading or updating the extension wipes its working state, and the daemon
+  cannot re-announce a paper that already owns a live page — so a paper stopped
+  at a login screen went unmentioned, and the badge read "connected" while the
+  one paper you could actually finish sat there. The ask is now recovered from
+  the durable record of the tabs *papio* opened: same browser session, not
+  yours, still live, still on a login page. It only ever reports — it cannot
+  revive work or open anything, and a *papio* tab that has moved past its login
+  page reports nothing.
 - ***papio* no longer opens institutional sign-in tabs on its own.** Every
   autonomous path that used to create a `requires_auth` surface — a warm
   session admitting a queued offer, the 45-second fallback timer, a daemon

@@ -3318,6 +3318,44 @@ export class Bridge {
       .length;
   }
 
+  /** Papers with a login page in front of the operator that `activeJobs`
+   * cannot see. `chrome.storage.session` is wiped on every extension
+   * reload/update, so a paper mid-sign-in loses its `auth_pending` status
+   * while its tab stays live — and the daemon cannot re-offer it, because a
+   * job owning a live claim is not a scheduler-eligible candidate. Measured
+   * live 2026-08-20: right after a reload the badge read "connected" while a
+   * real login page sat in papio's own group, so the one paper the operator
+   * could actually finish was the one paper papio stopped mentioning.
+   *
+   * The durable birth ledger (`storage.local`) survives that wipe, so the ask
+   * is recovered from it: same browser epoch, not ceded, tab still live, and
+   * its CURRENT url is an authentication URL. This only ever REPORTS - it
+   * never revives a job (ADR-0022 Decision 1: the extension is never a
+   * durable queue), and it cannot invent an ask, because it requires a live
+   * papio-owned tab actually sitting at a wall. Returns tab ids so the caller
+   * can union them with jobs it already knows about rather than counting one
+   * paper twice. */
+  private async authWallSurfaceTabs(): Promise<Set<number>> {
+    const walls = new Set<number>();
+    const ledger = await this.snapshotTabLedger();
+    for (const [key, record] of Object.entries(ledger)) {
+      if (record.ceded === true) continue;
+      // A prior-epoch record cannot prove this tab is still papio's (plan
+      // line 151); those stay in the operator-review path.
+      if (record.browser_epoch !== this.browserEpoch) continue;
+      const tabID = Number(key);
+      if (!Number.isInteger(tabID) || tabID < 0) continue;
+      try {
+        const tab = await this.deps.tabs.get(tabID);
+        if (typeof tab.url === "string" && isAuthenticationURL(tab.url))
+          walls.add(tabID);
+      } catch {
+        // Gone: nothing to report, and reconcile forgets the record.
+      }
+    }
+    return walls;
+  }
+
   private currentBlockedProviderHosts(): string[] {
     return [...new Set(this.store.blockedProviderHosts ?? [])];
   }
@@ -5637,11 +5675,21 @@ export class Bridge {
   ): Promise<void> {
     try {
       const blockedProviderHosts = this.currentBlockedProviderHosts();
-      const signInBlockersBeforePermissions = this.signInBlockerCount();
+      // Union by tab so a paper this worker still knows about is not counted
+      // twice, and add back the ones parked without a tab - a detached
+      // auth_pending paper still needs the human to finish that sign-in.
+      const wallTabs = await this.authWallSurfaceTabs();
+      const pendingAuthJobs = this.store.activeJobs.filter(
+        (job) => job.status === "auth_pending",
+      );
+      for (const job of pendingAuthJobs)
+        if (job.tab_id >= 0) wallTabs.add(job.tab_id);
+      const signInBlockers =
+        wallTabs.size + pendingAuthJobs.filter((job) => job.tab_id < 0).length;
       let ungrantedResolverOrigins = 0;
       if (
         status === "connected" &&
-        signInBlockersBeforePermissions === 0 &&
+        signInBlockers === 0 &&
         blockedProviderHosts.length === 0
       ) {
         for (const origin of this.store.resolverOrigins ?? []) {
@@ -5674,7 +5722,7 @@ export class Bridge {
       const badge = computeBadge({
         connectionStatus: status,
         reauthNeeded: this.keepaliveReauthNeeded,
-        authBlockers: this.signInBlockerCount(),
+        authBlockers: signInBlockers,
         queuedAuth: this.queuedAuthJobCount(),
         challengeBlocked: this.challengeBlockedJobCount(),
         blockedHosts: blockedProviderHosts,
