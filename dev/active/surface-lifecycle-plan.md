@@ -681,3 +681,84 @@ race below for why a fresh live open could not be driven afterwards.
    disposition so `papio jobs`/`actions` can say "waiting for papio", not
    "waiting for you" — and it is the cheapest way to make item 4's class of
    stall self-reporting rather than found by hand.
+
+## The stall, chased end to end (2026-08-20) — four defects fixed live
+
+Item 4 above named the boundary correctly: the stall was above the daemon,
+between the claim response and a working surface. Driving it live found the
+cause and three more defects behind it. Every one was reproduced in a test that
+fails on pre-fix source, and each fix was verified on the operator's own
+library.
+
+1. **The pipeline could never bind, so it churned a blank tab every two
+   seconds.** `institutionalBind` records the job as the institution entry's
+   owner-binding (§4.1) and fails closed when that write does not fence-match,
+   but the daemon-orchestrated pipeline (candidate offer → claim → scaffold →
+   bind) contains no authentication-claim consult: nothing ever reserved the
+   entry for the paper. Any paper whose institution carried another job's lease
+   row - including a lapsed one - was refused forever. Measured: 137 consecutive
+   `institutional_bind_response` refusals, one every ~2s, and **zero**
+   `authentication_claim_response` frames for that job. Each `stale` makes the
+   extension retire its scaffold and start over, which is the tab churn the
+   operator reported. Fixed in `882ba94`: the bind acquires the slot through the
+   same `ReserveAuthenticationEntryLease` arbitration the consult uses, so one
+   sign-in per institution still holds and a real conflict answers
+   `not_eligible` with a reason. Verified live: the paper stalled since the
+   previous day ran claim → bind → route → navigate in one pass, and the entry
+   ended owned by that paper.
+2. **The whole pipeline was silent on refusal.** Every refusal along claim →
+   bind → route → navigated, and every authentication-claim outcome, is now
+   logged with outcome and detail; the bind's lease-fence refusal, the only one
+   that named nothing, names itself. This is what made item 1 findable in
+   minutes after a day of guessing, and it is the same remedy the claim
+   observation ack got.
+3. **A paper whose sign-in the human never finished could never be opened
+   again.** A navigated claim keeps its candidate owned until an artifact winner
+   closes it - deliberate, and pinned by
+   `TestSettledInstitutionalPermitKeepsExpiredClaimOwnedUntilWinner`, because
+   retiring it could repeat an irreversible provider navigation. The documented
+   way out is a new attempt (`MaterializationAttemptRevision` counts
+   `job.retry_requested`), but `Retry` accepts only retry_wait/failed/unavailable
+   and `RepairAwaitingHuman` requires no open actions, so a parked paper could
+   reach neither. Measured: four papers pinned by claims from dead holder
+   generations 151/157, leases expired the previous day, `papio actions open`
+   producing nothing at all. Fixed in `68c169d`: the operator asking again *is*
+   the retry decision, recorded when the attempt is provably spent (no
+   held/unknown_completion permit, lease over, no winner). The sticky
+   `focusPending` marker no longer short-circuits the loop before that decision -
+   that is why the second ask reached nothing.
+4. **The refusal loop had two engines, and both are off.** The daemon re-offered
+   a spent candidate every poll (`SpentMaterializationCandidate` now suppresses
+   it), and `busy` reads to the extension as "try again shortly", so it kept the
+   correlation and re-drove its bounded claim ladder on every keepalive tick - a
+   conflict that never clears. `institutionalClaim` now answers `stale` with a
+   reason for a spent attempt, the outcome the extension answers by dropping the
+   workflow. Measured live: ~1 refusal/second before, bursts of four every ~60s
+   after the offer fix, and **zero refusals in 180 seconds** after both, with
+   each paper receiving exactly one final `stale`.
+
+### What is left, with evidence (2026-08-20)
+
+1. **Nothing retires a papio-owned surface whose work is over.** The operator's
+   group holds ten tabs: two orphaned scaffolds retired themselves during this
+   round, but a cancelled job's navigated tab, two duplicate provider tabs from
+   the previous day, a Cloudflare interstitial, and a fresh
+   `ezproxy.une.edu.au – Network error` tab all remain. `surfaceClose` only
+   authorizes a close for a claim in phase `settled`, `abandoned`, or a
+   `scaffold_idle` claimed/bound - so a `navigated` claim has **no disposition at
+   all**, and a spent or cancelled attempt's surface can never be authorized for
+   closure. `job_f40cbcc70b258fefb8` is the clean case: cancelled 2026-08-19
+   05:11, its claim still `navigated` a day later. This is the remaining half of
+   "papio owns every surface it creates" - creation is now owned end to end,
+   retirement is not. Design decision needed on which disposition covers a
+   finished-but-not-delivered surface, and on the mid-sign-in exemption (the
+   extension's active/engagement guards already exist and must keep authority).
+2. **`auth_pending` still reports "waiting for you" for a paper waiting on
+   papio** (item 5 above). Nothing in this round changed it, and it is why a
+   twenty-hour stall looked like a paper politely waiting for its human. The
+   badge currently reads "13 papers waiting on your institution sign-in" while
+   exactly one can proceed at a time.
+3. **A network-error surface is left open and its paper parked** - the
+   `Network error` tab above arrived during this round's last open. `§2.2.1
+   navigation_error` is a daemon-committed park with no auth charge, which is
+   right, but the surface it leaves behind is nobody's to close (item 1).
