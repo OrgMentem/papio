@@ -481,6 +481,38 @@ func (js *Store) CurrentBrowserCandidateForJob(ctx context.Context, jobID string
 	return c, err
 }
 
+// TerminalMaterializationJobIDs returns terminal jobs which still own a live
+// browser materialization claim. Bridge poll uses this durable set to emit
+// cancel after a daemon restart: the in-memory offered/materializationTracked
+// maps are gone, but the extension may still hold the tab and its browser-local
+// job state.
+func (js *Store) TerminalMaterializationJobIDs(ctx context.Context) ([]string, error) {
+	rows, err := js.S.DB().QueryContext(ctx, `
+		SELECT DISTINCT c.job_id
+		  FROM materialization_claims m
+		  JOIN browser_candidates c ON c.id=m.candidate_id
+		  JOIN jobs j ON j.id=c.job_id
+		 WHERE j.state IN ('ready','imported','unavailable','failed','cancelled')
+		   AND m.phase IN ('claimed','bound','route_issued','navigated')
+		 ORDER BY c.job_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 // MaterializationAttemptRevision returns the explicit retry decision epoch
 // for a job. A retry_requested event starts the next materialization attempt;
 // ordinary transitions do not.

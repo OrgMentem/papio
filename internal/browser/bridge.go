@@ -9868,9 +9868,11 @@ jobLoop:
 		delete(b.reofferPending, row.ID)
 		slots--
 	}
-	// Announce cancellation for both legacy handoff offers and
-	// materialization-only candidate offers. The latter has no b.offered entry,
-	// but the extension still needs to tear down any scaffold it prepared.
+	// Announce cancellation for legacy handoff offers, materialization-only
+	// candidate offers, and terminal jobs which still own a durable live claim.
+	// The first two are worker-memory indexes; the third repairs their loss
+	// across a daemon restart, when the extension can still hold both its local
+	// job state and the tab but no in-memory map names either.
 	cancelIDs := make(map[string]bool, len(b.offered)+len(b.materializationOffered)+len(b.materializationTracked))
 	for id := range b.offered {
 		cancelIDs[id] = true
@@ -9880,6 +9882,13 @@ jobLoop:
 	}
 	for id := range b.materializationTracked {
 		cancelIDs[id] = true
+	}
+	if terminalIDs, terminalErr := b.jobs.TerminalMaterializationJobIDs(ctx); terminalErr != nil {
+		log.Printf("papio: reading terminal materialization jobs for browser cancellation: %v", terminalErr)
+	} else {
+		for _, id := range terminalIDs {
+			cancelIDs[id] = true
+		}
 	}
 	for id := range cancelIDs {
 		row, err := b.jobs.Get(ctx, id)

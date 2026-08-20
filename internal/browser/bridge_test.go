@@ -5904,6 +5904,33 @@ func TestSurfaceCloseJobInactiveAuthorizesTerminalNavigatedBinding(t *testing.T)
 	}
 }
 
+// A daemon restart clears offered/materializationTracked, but the durable
+// claim and terminal job remain. Poll must still emit cancel so a restarted
+// daemon cannot strand the extension's browser-local job and tab forever.
+func TestPollCancelsTerminalMaterializationWithoutMemoryTracking(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "cancel-after-restart", "navigated")
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("binding candidate = %+v, err=%v", candidate, err)
+	}
+	if err := jobs.Cancel(ctx, candidate.JobID, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.offered) != 0 || len(b.materializationOffered) != 0 || len(b.materializationTracked) != 0 {
+		t.Fatalf("fixture unexpectedly has worker-memory tracking: offered=%v materialization=%v tracked=%v",
+			b.offered, b.materializationOffered, b.materializationTracked)
+	}
+
+	msgs, _ := runSync(t, b)
+	cancel := firstOfType(msgs, protocol.MsgCancel)
+	if cancel == nil || cancel.JobID != candidate.JobID {
+		t.Fatalf("poll cancel = %+v, want terminal job %s: %v", cancel, candidate.JobID, msgs)
+	}
+}
+
 // Looking old is not enough: a nonterminal job with an open browser handoff
 // still owns its navigated surface, so job_inactive must fail closed.
 func TestSurfaceCloseJobInactiveRefusesLiveHandoff(t *testing.T) {
