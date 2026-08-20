@@ -10737,6 +10737,79 @@ func TestSpentCandidateStopsBeingOffered(t *testing.T) {
 	}
 }
 
+// TestSpentCandidateClaimAnswersStaleNotBusy pins the other half of the churn.
+// The extension treats 'busy' as "try again shortly": it keeps the correlation
+// and re-drives its bounded claim ladder on every keepalive tick, so a conflict
+// that will never clear became a permanent retry loop - measured live
+// 2026-08-20 as bursts of four attempts every ~60s, per paper, for twenty
+// hours. A finished attempt must read as stale so the workflow is dropped.
+func TestSpentCandidateClaimAnswersStaleNotBusy(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "spent-claim-stale", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	if offers, _ := runSync(t, b); firstOfType(offers, protocol.MsgInstitutionalCandidateOffer) == nil {
+		t.Fatalf("first poll offered no candidate: %v", offers)
+	}
+	attempt, err := jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := jobs.CurrentBrowserCandidateForJob(ctx, jobID, attempt)
+	if err != nil || current == nil {
+		t.Fatalf("current candidate: %+v err=%v", current, err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: current.ID, JobAttemptRevision: current.JobAttemptRevision,
+		InstitutionProfileRevision: current.InstitutionProfileRevision,
+		RouteRevision:              current.RouteRevision,
+		MaterializationKind:        "browser_tab", BrowserHolderGeneration: b.epoch,
+		LeaseUntil: b.now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, current.InstitutionProfileRevision, 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome, err := jobs.AcquireInstitutionalEffectPermit(ctx, job.InstitutionalEffectPermitAcquireInput{
+		JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+		SafetyDomainID: current.SafetyDomainID, InstitutionalRequestID: "spent-claim-request",
+		JobAttemptRevision: current.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+		ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
+		Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
+	}); err != nil || outcome != job.EffectPermitAcquired {
+		t.Fatalf("acquire institutional permit outcome=%v err=%v", outcome, err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE effect_permits SET status='settled' WHERE claim_id=?`, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='navigated', lease_until=? WHERE id=?`,
+		b.now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The extension re-drives the correlation it still holds.
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, jobID,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "spent-claim-redrive", CandidateID: current.ID,
+			MaterializationKind: "browser_tab",
+		}))
+	resp := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if resp == nil {
+		t.Fatalf("institutional_claim_response missing: %v", claimed)
+	}
+	payload := resp.Payload.(*protocol.InstitutionalClaimResponsePayload)
+	if payload.Outcome != "stale" {
+		t.Fatalf("claim on a spent attempt = %s, want stale so the workflow is dropped: %+v", payload.Outcome, payload)
+	}
+}
+
 func TestMaterializationSchedulerErrorRetainsFocusUntilRecovery(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()

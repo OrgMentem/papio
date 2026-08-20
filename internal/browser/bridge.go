@@ -1642,6 +1642,18 @@ func (b *Bridge) institutionalClaim(ctx context.Context, jobID string, p *protoc
 			outcome = "stale"
 		case errors.Is(err, job.ErrMaterializationBusy), errors.Is(err, job.ErrMaterializationConflict):
 			outcome = "busy"
+			// "busy" means try again shortly, and the extension believes it:
+			// it keeps the correlation and re-drives its bounded claim ladder
+			// on every keepalive tick. When the conflict is the candidate's own
+			// finished attempt that is never going to clear, so the honest
+			// answer is that the candidate is stale - the outcome the extension
+			// answers by dropping the workflow. Measured live 2026-08-20: three
+			// papers burning a four-attempt ladder every ~60s indefinitely.
+			if spent, spentErr := b.jobs.SpentMaterializationCandidate(ctx, jobID); spentErr != nil {
+				log.Printf("papio: reading spent materialization attempt for %s: %v", jobID, spentErr)
+			} else if spent {
+				return response("stale", "this attempt is finished; ask again to start another")
+			}
 		}
 		return response(outcome, "candidate claim was not accepted")
 	}
