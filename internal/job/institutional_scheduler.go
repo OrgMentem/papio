@@ -309,7 +309,7 @@ func (js *Store) scheduleEligibleKeysetPage(ctx context.Context, after Candidate
 		  AND NOT EXISTS (
 			SELECT 1 FROM jobs j
 			 WHERE j.id=c.job_id
-			   AND j.state IN ('cancelled','failed','imported','ready')
+			   AND j.state IN ('cancelled','failed','imported','ready','unavailable')
 		  )
 		  AND c.job_attempt_revision = 1 + (
 			SELECT COUNT(*) FROM events e
@@ -337,9 +337,18 @@ func (js *Store) scheduleEligibleKeysetPage(ctx context.Context, after Candidate
 			SELECT 1
 			  FROM materialization_claims parked
 			  JOIN browser_candidates sibling ON sibling.id=parked.candidate_id
+			  JOIN jobs parked_job ON parked_job.id=sibling.job_id
 			 WHERE sibling.safety_domain_id=c.safety_domain_id
 			   AND parked.phase IN ('bound','route_issued','navigated')
 			   AND (parked.lease_until IS NULL OR parked.lease_until > ?)
+			   AND (
+			     parked_job.state NOT IN ('cancelled','failed','imported','ready','unavailable')
+			     OR EXISTS (
+			       SELECT 1 FROM effect_permits p
+			        WHERE p.claim_id=parked.id
+			          AND p.status IN ('held','unknown_completion')
+			     )
+			   )
 		  )`
 	args := []any{now, now}
 	if after.CreatedAt != "" || after.CandidateID != "" {

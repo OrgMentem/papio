@@ -216,6 +216,102 @@ func TestScheduleEligibleBrowserCandidatesExcludesTerminalJobs(t *testing.T) {
 	}
 }
 
+// A terminal job's durable bound/navigated claim is cleanup work, not a
+// scheduler owner. It may keep a future diagnostic lease after a lost
+// owner_closed ack, but once no provider effect is unsettled it must not block
+// every live paper on the same institution domain until that timer expires.
+func TestScheduleEligibleBrowserCandidatesIgnoresTerminalParkedClaimAfterEffectSettles(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	profile := institutionalProfile(t, js, "scheduler-terminal-park", "digest-terminal-park", "auth-terminal-park")
+	deadJob := schedulerJob(t, js, "scheduler-terminal-park-dead")
+	liveJob := schedulerJob(t, js, "scheduler-terminal-park-live")
+	insertSchedulerCandidateKeys(t, js, "scheduler-terminal-park-dead-candidate", deadJob, profile,
+		"pre-route-dead", "shared-terminal-park-domain", "eligible", "2026-08-01T00:00:00Z")
+	insertSchedulerCandidateKeys(t, js, "scheduler-terminal-park-live-candidate", liveJob, profile,
+		"pre-route-live", "shared-terminal-park-domain", "eligible", "2026-08-01T00:00:01Z")
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID:             "scheduler-terminal-park-dead-candidate",
+		BrowserHolderGeneration: 7, JobAttemptRevision: 1,
+		InstitutionProfileRevision: profile.Revision, RouteRevision: 1,
+		MaterializationKind: "browser_tab", LeaseUntil: time.Now().UTC().Add(30 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.BindMaterialization(ctx, claim.ID, claim.BindingID, 7, profile.Revision, 42); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Cancel(ctx, deadJob, TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := js.ScheduleEligibleBrowserCandidates(ctx, 20, CandidateScheduleCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Candidates) != 1 || page.Candidates[0].CandidateID != "scheduler-terminal-park-live-candidate" {
+		t.Fatalf("scheduled %+v, want live sibling despite terminal parked claim", page.Candidates)
+	}
+}
+
+// Terminal does not override an effect that may still be in flight. Until its
+// permit settles, the old domain fence remains the only safe answer.
+func TestScheduleEligibleBrowserCandidatesTerminalParkStillBlocksUnsettledEffect(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	profile := institutionalProfile(t, js, "scheduler-terminal-held", "digest-terminal-held", "auth-terminal-held")
+	deadJob := schedulerJob(t, js, "scheduler-terminal-held-dead")
+	liveJob := schedulerJob(t, js, "scheduler-terminal-held-live")
+	for _, edge := range [][2]string{{StateQueued, StateResolving}, {StateResolving, StateAwaitingHuman}} {
+		if err := js.Transition(ctx, deadJob, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := js.OpenHumanAction(ctx, deadJob, "openurl_handoff", "held provider effect",
+		Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	insertSchedulerCandidateKeys(t, js, "scheduler-terminal-held-dead-candidate", deadJob, profile,
+		"pre-route-dead", "shared-terminal-held-domain", "eligible", "2026-08-01T00:00:00Z")
+	insertSchedulerCandidateKeys(t, js, "scheduler-terminal-held-live-candidate", liveJob, profile,
+		"pre-route-live", "shared-terminal-held-domain", "eligible", "2026-08-01T00:00:01Z")
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID:             "scheduler-terminal-held-dead-candidate",
+		BrowserHolderGeneration: 7, JobAttemptRevision: 1,
+		InstitutionProfileRevision: profile.Revision, RouteRevision: 1,
+		MaterializationKind: "browser_tab", LeaseUntil: time.Now().UTC().Add(30 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.BindMaterialization(ctx, claim.ID, claim.BindingID, 7, profile.Revision, 42); err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome, err := js.AcquireInstitutionalEffectPermit(ctx, InstitutionalEffectPermitAcquireInput{
+		JobID: deadJob, ClaimID: claim.ID, BindingID: claim.BindingID,
+		SafetyDomainID: "shared-terminal-held-domain", InstitutionalRequestID: "terminal-held-request",
+		JobAttemptRevision: 1, BrowserHolderGeneration: 7,
+		ExpectedEffectOrdinal: 0, LeaseUntil: time.Now().UTC().Add(time.Minute),
+		Authorization: EffectPermitEvent{Kind: "institutional.authorized"},
+	}); err != nil || outcome != EffectPermitAcquired {
+		t.Fatalf("effect permit outcome=%v err=%v", outcome, err)
+	}
+	if err := js.Cancel(ctx, deadJob, TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := js.ScheduleEligibleBrowserCandidates(ctx, 20, CandidateScheduleCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range page.Candidates {
+		if candidate.CandidateID == "scheduler-terminal-held-live-candidate" {
+			t.Fatalf("live sibling scheduled while terminal owner's effect is still unsettled: %+v", page.Candidates)
+		}
+	}
+}
+
 func TestScheduleEligibleBrowserCandidatesDedupesLandedDomainAcrossPreRoutes(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
