@@ -20,13 +20,14 @@ import (
 	"papio/internal/cli"
 	"papio/internal/config"
 	"papio/internal/mcpserver"
+	"papio/internal/store/storetest"
 )
 
 func newFacadeClient(t *testing.T) *client.Client {
 	t.Helper()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	// config.Default() names the zotio executable, so `papio status` — which
 	// reads the library-completeness line through zotio.missing_count — shells
 	// out to whatever zotio is installed and queries the developer's own

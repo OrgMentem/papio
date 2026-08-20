@@ -858,6 +858,29 @@ invariant already written here.
    surface whose job papio no longer tracks retires through the same
    authorized close.
 
+4. **A dead paper held the institution's sign-in slot for ten hours.**
+   `ReserveAuthenticationEntryLease` already counts a terminal owner as
+   expired (§4.5), but nothing forced that evaluation, so the entry stayed
+   `human` until some other candidate contended for it — and with no candidate
+   in existence, that was never. Live: cancelled 05:03, still owned at 15:45.
+   Swept each poll on §4.5's own predicate (terminal owner AND no
+   held/unknown institutional permit for the owning binding). Live after
+   deploy: `expired` at 15:52:10, binding cleared.
+
+Live verification status. Daemon-side, all three daemon fixes are confirmed
+against the operator's own store: `une` moved to revision 2 carrying
+`default`'s `authentication_claim_id` (one library, one slot), and the stale
+entry released on the first poll. The extension-side causal-cession work is
+covered by the suite (1,222 tests; five new/changed tests each verified to
+fail without their fix) but is NOT yet live-verified: it needs the extension
+reload `make dev-deploy` asks for, and this session's attempts to drive that
+reload found the `chrome://extensions` details page rendering blank — the
+documented reload trap (a click that reports success and does nothing) makes
+a blind click worse than none, so the reload stays with the operator.
+Attribution's live proof also waits on that reload: a fresh worker probes
+without a throttle, and the frames that would have proven it (15:00:32Z,
+15:03:23Z) predate the fix.
+
 Also proposed and **dropped as plan-banned**: adopting prior-epoch tabs after
 a browser restart by matching `origin_digest` plus *papio*-group membership.
 Line 331 bans inference from group/window/title and line 151 keeps automatic

@@ -29,6 +29,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/ownership"
 	"papio/internal/protocol"
+	"papio/internal/store/storetest"
 	"papio/internal/triage"
 	"papio/internal/update"
 	"papio/internal/watch"
@@ -40,7 +41,7 @@ func testSystem(t *testing.T) *bootstrap.System {
 	t.Helper()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	// Adoption is a filesystem contract: pin the root to this test's data
 	// dir so nothing here ever reaches the real <downloads>/papio default.
 	cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")
@@ -676,7 +677,7 @@ func TestRouterActionsOpenQueuesCompatibleHandoff(t *testing.T) {
 	ctx := context.Background()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeDelegated
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	// Adoption is a filesystem contract: pin the root to this test's data
 	// dir so nothing here ever reaches the real <downloads>/papio default.
 	cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")

@@ -12,6 +12,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/delivery"
 	"papio/internal/job"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 )
 
@@ -23,7 +24,7 @@ func deliveryTestSystem(t *testing.T) *bootstrap.System {
 	t.Helper()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeDelegated
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	// Adoption is a filesystem contract: pin the root to this test's data
 	// dir so nothing here ever reaches the real <downloads>/papio default.
 	cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")

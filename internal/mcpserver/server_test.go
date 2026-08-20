@@ -24,6 +24,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 	"papio/internal/zotio"
 )
@@ -54,7 +55,7 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 func TestAcquireBatchCreatesReportableCLICompatibleManifest(t *testing.T) {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	system, err := bootstrap.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -334,7 +335,7 @@ func TestExportsResourceEnvelope(t *testing.T) {
 func newResourceTestSystem(t *testing.T) *bootstrap.System {
 	t.Helper()
 	cfg := config.Default()
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	system, err := bootstrap.New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
