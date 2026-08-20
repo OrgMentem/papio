@@ -921,3 +921,57 @@ Nothing from this round is left open. What remains in the plan overall is the
 pre-v2/restarted/ceded tab population (deliberately operator-review, line 808)
 and the causal-cession retirement path, which is suite-covered but has not yet
 met a live paper that went terminal while its tab was foregrounded.
+
+## Third field round (2026-08-21 early) — the report that could not fire
+
+`f901139` made a vanished owned surface report `owner_closed` instead of being
+pruned in silence. It shipped green and then did nothing against the live
+stall. Three defects, all in the report's own preconditions:
+
+1. **FIXED — an observation was stamped with the generation it was ENQUEUED
+   under.** The daemon's fence is `FrameGeneration != Generation -> stale`
+   against its *current* epoch, and a stale ack is terminal
+   (`claim_observation_apply.go:112`). So any reconnect between enqueue and
+   drain discarded the entire replayed backlog §4.5 exists to preserve, and a
+   restart-recovered `owner_closed` — whose subject generation is historical by
+   construction — could **never** apply. The wire field is the *sender's*
+   generation; the subject is identified by `binding_id` + occurrence +
+   ordinal. Stamped at drain time now, which is what the reducer's own comment
+   says it wants. This is why `claim_observation_journal` had zero rows.
+2. **FIXED — the loss report was gated on `browser_epoch` equality.**
+   `epochStillLive` re-proves an epoch by resolving *some* ledgered `tab_hint`,
+   so an operator who closes every *papio* tab and then reloads has nothing
+   left to prove with: the reload is classified as a browser restart and every
+   record it should have reported becomes prior-epoch — unreachable in exactly
+   the case it exists for. Epoch equality protects **tab-id authority**; an
+   absent tab cannot be misidentified, so the absent-tab branch no longer
+   requires it. The live-tab branch keeps the gate.
+3. **FIXED — a claim whose record is already lost was immortal.** Its settled
+   institutional effect permit means claim expiry deliberately never retires it
+   (`institutional_materialization.go:1489`), and no durable record remained to
+   report from. So a consult answering `navigate_existing`/`focus_owner` whose
+   surface does not resolve now reports `owner_closed` for the named binding:
+   first-hand proof, no durable record needed, healing on the operator's next
+   click. This is the recovery of last resort and the only one that can free a
+   slot stranded by an older build.
+
+Live verification after the operator's reload (2026-08-21 07:39–07:42):
+
+- extension reload real — session `f87eb69c7624` → `e18384114fe2`
+- the stranded row healed: `binding_69b0cb22…`'s hold is **gone** (zero rows),
+  the fresh attempt bound `binding_1eff95e4…` on tab 1421085851 with a real
+  30-minute lease, and refusals since are **zero** (from 273)
+- the mechanism that freed it was the **spent-attempt stale answer** (`5`
+  served), not fix 3 — the daemon started the next attempt, which retired the
+  dead claim's binding. Fix 3 remains the path for a slot with no live job to
+  retry, and is suite-covered but not yet field-proven.
+- surfaces after the heal: **one** *papio* group, **one** tab, on the provider
+  page for the paper explicitly opened; 134 `awaiting_human` papers minted
+  nothing
+- `claim_observation_journal` is still empty: no restart-recovered report has
+  fired since the fix, because the ledger record for the stranded tab had
+  already been pruned by the pre-fix build. The three fixes are verified by
+  test and by the healed slot, **not** by an applied journal row.
+
+Open after this round: an applied `claim_observation` row on live data. Until
+one exists, the restart-recovery family's field behaviour rests on the suite.
