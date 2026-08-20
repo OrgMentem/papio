@@ -867,29 +867,47 @@ invariant already written here.
    held/unknown institutional permit for the owning binding). Live after
    deploy: `expired` at 15:52:10, binding cleared.
 
-Live verification status. Daemon-side, all three daemon fixes are confirmed
-against the operator's own store: `une` moved to revision 2 carrying
-`default`'s `authentication_claim_id` (one library, one slot), and the stale
-entry released on the first poll. The extension-side causal-cession work is
-covered by the suite (1,222 tests; five new/changed tests each verified to
-fail without their fix) but is NOT yet live-verified: it needs the extension
-reload `make dev-deploy` asks for, and this session's attempts to drive that
-reload found the `chrome://extensions` details page rendering blank — the
-documented reload trap (a click that reports success and does nothing) makes
-a blind click worse than none, so the reload stays with the operator.
-Attribution's live proof also waits on that reload: a fresh worker probes
-without a throttle, and the frames that would have proven it (15:00:32Z,
-15:03:23Z) predate the fix.
+5. **A sign-in with nothing to sign in on held the library forever.**
+   `ConvertAuthenticationEntryLeaseToHuman` cleared `lease_until`
+   unconditionally, and NULL means never-expires — §4.5's window for a *bound*
+   surface, while line 1010 already ruled that "a reservation nobody binds is a
+   stalled institution". An `auth_returned` arriving before any bind therefore
+   made the entry immortal. Live: one unbound `human` entry whose owner had no
+   candidate refused **71** institutional binds, every one logged "another
+   sign-in for this institution is in progress". Unbound conversions now keep
+   their bind deadline; a per-poll sweep frees the same predicate, which also
+   heals rows already written with a NULL deadline.
+
+Live verification after the operator's reload (2026-08-20 16:06–16:20):
+
+- extension reload real — session `6543494d25e1` → `6ca0ac10c02d`
+- the **duplicate *papio* group folded itself** at startup reconcile, which
+  answers the round's one unexplained observation: one group of 12, not two
+- one sign-in → **one** `session_evidence` frame → `profile_evidence` for
+  **both** `default` and `une` from that single observation (`warm_verified`,
+  16:06:21.316969Z / .317238Z), the claim-scoped attribution fix proven; two
+  `handoff_reoffered` 49 ms later
+- the immortal entry then blocked everything, was found, fixed, deployed, and
+  swept on the first poll; the paper opened next **bound** a surface and
+  navigated (`binding_69b0cb22…`, tab 1421085817)
+- four siblings accepted at 16:17:39 and minted **no** surfaces — cold offers
+  still wait for explicit engagement
+- surfaces created across the whole run: **one**, for the paper explicitly
+  opened. No new litter, no new group.
+
+Still not live-verified: the causal-cession retirement path (an owned surface
+retiring when the operator moves away). It is suite-covered but needs a paper
+that reaches a terminal state while its tab is foregrounded, which this run did
+not produce.
 
 Also proposed and **dropped as plan-banned**: adopting prior-epoch tabs after
 a browser restart by matching `origin_digest` plus *papio*-group membership.
 Line 331 bans inference from group/window/title and line 151 keeps automatic
-remapping to self-identifying scaffolds. Those tabs stay in the bounded
-operator-review path (item 5 above) by design, not by omission.
+remapping to self-identifying scaffolds. Those tabs stay in the
+`orphanTabStatus` operator-review path by design, not by omission.
 
-Still open after this round: the `auth_pending` vocabulary (item 4 above),
-which is why the badge could read "13 papers waiting on your institution
-sign-in" while exactly one could proceed; and one observation not yet
-explained — a **second** *papio*-titled group in the same window (line 73
-documents multiple groups across windows as a supported steady state, which
-this is not).
+Still open after this round: the `auth_pending` vocabulary, which is why the
+badge could read "13 papers waiting on your institution sign-in" while exactly
+one could proceed — it counts every queued sibling as needing a human, not one
+per genuinely blocked surface. The second-*papio*-group observation is now
+explained and closed: startup reconcile folded it on the next worker.

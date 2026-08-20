@@ -210,6 +210,15 @@ execution records kept during the initial build.
   uses, and one address's sign-in counts for every profile that shares that
   same sign-in. Two genuinely different logins behind one address are still
   kept apart.
+- **Signing in for one paper no longer strands every other paper at that
+  library.** A sign-in that completed before *papio* had a page to sign in on
+  claimed the library's single sign-in slot with no expiry at all, so it held
+  that library forever: every other paper was refused with "another sign-in for
+  this institution is in progress" while nothing was in progress. Measured live
+  — one such hold refused 71 attempts across the whole queue. A sign-in with no
+  page attached now keeps the short deadline it was granted, a real sign-in in
+  progress still runs as long as you need, and an abandoned one is released
+  automatically instead of waiting for another paper to collide with it.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route
