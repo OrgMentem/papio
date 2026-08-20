@@ -176,6 +176,15 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
+- **Search results no longer call a PubMed paper "not in your library" when it
+  is.** Discovery asked Zotero about each result using only its DOI and arXiv
+  id, so a paper identified by PMID alone — ordinary for PubMed-sourced results
+  — was never matched against your library and showed as unowned, inviting you
+  to fetch a paper you already have. Books identified only by ISBN had the same
+  hole. The cause was a second, hand-built copy of the lookup shape rather than
+  a missing field, so the duplicate is gone: discovery now asks through the same
+  converter the import and filing paths use, and a future identifier cannot
+  reach one of them and miss the other.
 - ***papio* now retires a working tab when its paper is over — including after
   either side restarts.** A tab that had reached a library or publisher page
   could never be closed by *papio*: only an untouched placeholder, a paper that
