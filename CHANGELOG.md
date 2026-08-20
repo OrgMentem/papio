@@ -197,6 +197,12 @@ execution records kept during the initial build.
   abandons and expires that exact claim, authorizes closing the dead surface,
   and keeps the candidate owned. Nothing retries automatically; choosing Open
   later records the new attempt.
+- **A cancelled paper no longer holds every other paper at the institution
+  gate until its old timer expires.** The scheduler's one-surface-per-library
+  fence counted a terminal paper's parked route even after its provider effect
+  had settled, so direct Open requests stayed queued behind work that could
+  never resume. Terminal routes now leave the domain fence once their effect is
+  settled; an effect still in flight continues to block.
 - **A paper whose library sign-in you never finished can be opened again.** Once
   *papio* has sent a paper to your library it will not send it a second time on
   its own — that is deliberate, so one request to a publisher never becomes two.

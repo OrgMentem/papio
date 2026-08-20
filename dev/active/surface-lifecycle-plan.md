@@ -737,28 +737,68 @@ library.
    after the offer fix, and **zero refusals in 180 seconds** after both, with
    each paper receiving exactly one final `stale`.
 
-### What is left, with evidence (2026-08-20)
+### Retirement closed; what remains (2026-08-20)
 
-1. **Nothing retires a papio-owned surface whose work is over.** The operator's
-   group holds ten tabs: two orphaned scaffolds retired themselves during this
-   round, but a cancelled job's navigated tab, two duplicate provider tabs from
-   the previous day, a Cloudflare interstitial, and a fresh
-   `ezproxy.une.edu.au – Network error` tab all remain. `surfaceClose` only
-   authorizes a close for a claim in phase `settled`, `abandoned`, or a
-   `scaffold_idle` claimed/bound - so a `navigated` claim has **no disposition at
-   all**, and a spent or cancelled attempt's surface can never be authorized for
-   closure. `job_f40cbcc70b258fefb8` is the clean case: cancelled 2026-08-19
-   05:11, its claim still `navigated` a day later. This is the remaining half of
-   "papio owns every surface it creates" - creation is now owned end to end,
-   retirement is not. Design decision needed on which disposition covers a
-   finished-but-not-delivered surface, and on the mid-sign-in exemption (the
-   extension's active/engagement guards already exist and must keep authority).
-2. **`auth_pending` still reports "waiting for you" for a paper waiting on
-   papio** (item 5 above). Nothing in this round changed it, and it is why a
-   twenty-hour stall looked like a paper politely waiting for its human. The
-   badge currently reads "13 papers waiting on your institution sign-in" while
-   exactly one can proceed at a time.
-3. **A network-error surface is left open and its paper parked** - the
-   `Network error` tab above arrived during this round's last open. `§2.2.1
-   navigation_error` is a daemon-committed park with no auth charge, which is
-   right, but the surface it leaves behind is nobody's to close (item 1).
+1. **FIXED — an inactive papio-owned surface now retires when its handoff
+   ends, across either worker restarting.** `job_inactive` is the fourth closed
+   surface-close disposition (Go + exhaustive TS parser + JSON schema +
+   migration `0044_close_authorizations_job_inactive.sql`). It is not an age or
+   URL heuristic: the daemon resolves binding → candidate → job, proves the job
+   terminal or its `openurl_handoff` absent, and refuses while that exact
+   claim's effect is held/unknown. The extension detaches the job, requests the
+   one-use token off the inbound FIFO, then re-proves same browser epoch,
+   inactive/non-pinned/non-PDF content, and current papio group/work-window
+   membership before removal. Active, pinned, PDF, ceded, user-moved,
+   legacy/pre-v2, and browser-restarted records remain untouched or are ceded.
+   `reconcileOwnedTabs` applies the same transaction to modern same-epoch
+   orphans from earlier workers.
+
+   Both restart seams are closed: daemon poll derives terminal cancel IDs from
+   durable live claims rather than only `offered`/`materializationTracked`;
+   `onCancel` can act from a matching ledger record after browser-local
+   `activeJobs` is gone. After the physical remove, `onTabRemoved` emits the
+   durable `owner_closed` observation even though the job was already detached;
+   only then does the daemon consume the token and retire the authentication
+   entry. Nothing releases at authorization time, so a sibling cannot overlap a
+   surface that has not closed.
+
+   Live evidence distinguishes the two policy branches. A controlled inactive
+   attempt (`binding_270f0b3f3b829a…`) minted `job_inactive` and returned the
+   papio group to its pre-open count. After the operator reloaded the final
+   bundle, explicit Open on `job_54373b66fa7b4f9112e9a027a4` produced an active
+   institution-login tab; cancellation minted `job_inactive` but deliberately
+   did not remove it — explicit Open is the operator taking control, so the
+   active guard ceded it. That is the requested ownership boundary, not a close
+   failure. Harnesses drive inactive cancel and ledger-only restart cancel
+   through request → authorize → tombstone → remove → `owner_closed` → applied
+   ack, and pin active cession separately.
+
+2. **FIXED — terminal claims no longer keep the whole institution queued.**
+   The scheduler's one-parked-surface domain fence counted a terminal job's
+   future diagnostic lease even after its provider effect settled. Live:
+   cancelled `job_abecef…` held the domain until 05:13 and two directly-opened
+   candidates remained `eligible`/unoffered. Terminal parked claims now block
+   only while a held/unknown effect may still be in flight; `unavailable` is
+   also excluded from direct candidate admission. Immediately after deploy,
+   `job_54373…` went eligible → claimed → navigated and took the entry.
+
+3. **FIXED — a network-error surface has a real retirement path without an
+   automatic retry.** The extension already asked for `claim_abandoned` after
+   an applied `navigation_error`; the reducer never abandoned the claim, so the
+   daemon refused its own close request. The observation now atomically
+   abandons/expires that binding's claim. The candidate remains owned, so papio
+   does not spawn another tab while the network may still be offline; a later
+   explicit Open records the new-attempt decision.
+
+4. **Still open — `auth_pending` conflates “waiting for papio” with “waiting
+   for you.”** Nothing in the ownership fixes changes that product vocabulary.
+   It is why a twenty-hour internal stall looked like polite human-action wait,
+   and why the badge can count every queued sibling as needing institution
+   sign-in while exactly one can proceed. This needs a distinct durable
+   disposition/state, not another tab heuristic.
+
+5. **Old pre-v2/restarted/ceded tabs are deliberately review-only.** Their
+   durable record cannot prove current physical ownership, or the operator
+   already took control. The new code must not close them to make the group look
+   tidy; the popup's orphan review/explicit operator close is the safe cleanup
+   boundary. New lifecycle exits do not create more of them.
