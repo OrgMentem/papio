@@ -41,6 +41,14 @@ for the full pre-split extension history.
   yours, still live, still on a login page. It only ever reports — it cannot
   revive work or open anything, and a *papio* tab that has moved past its login
   page reports nothing.
+- **A *papio* tab you close while nothing is watching is now reported, not just
+  forgotten.** Startup repair used to drop its record of a vanished tab in
+  silence, so the daemon never learned the page was gone — and because that
+  paper had already been granted its navigation, its claim is never expired on
+  a timer, leaving the library's sign-in slot held by a paper with no page.
+  Measured live: closing *papio*'s tab group during a reload did exactly that.
+  The loss is now reported from the same durable record, using the same
+  one-time closing vocabulary an observed close uses.
 - ***papio* no longer opens institutional sign-in tabs on its own.** Every
   autonomous path that used to create a `requires_auth` surface — a warm
   session admitting a queued offer, the 45-second fallback timer, a daemon

@@ -19572,3 +19572,50 @@ test("a reload keeps reporting a paper stopped at a login page", async () => {
   await reloaded.bridge.syncConnectionBadge();
   expect(reloaded.action.titles.at(-1)).not.toContain("sign-in");
 });
+
+// A tab closed while no listener was alive (extension reload, browser crash)
+// used to be pruned from the ledger in silence. The claim behind it has a
+// settled effect permit, which reconcile deliberately never expires, so the
+// institution's sign-in slot stayed held by a paper with no page. Measured
+// live 2026-08-20 on the operator's own machine.
+test("startup reconciliation reports a vanished owned surface instead of pruning it", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    browserEpoch: string | undefined;
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  const record = fakeBirthRecord({
+    binding_id: bindingID,
+    tab_hint: tabID,
+    browser_epoch: internals.browserEpoch ?? "test-epoch",
+    job_id: "job_vanished_0001",
+    claim: {
+      authentication_claim_id: "auth-vanished",
+      browser_holder_generation: 1,
+      gate_occurrence_id: "gate-vanished",
+    },
+  });
+  internals.tabLedgerCache = { [String(tabID)]: record };
+  await h.deps.tabLedger?.save({ [String(tabID)]: record });
+  // The claim-observation family is feature-gated; negotiate it like the other
+  // observation tests do.
+  await h.port.inbound(
+    helloAck({
+      features: ["surface_close_v1", "institutional_authentication_claim_v1"],
+    }),
+  );
+
+  // The operator closes it with nothing listening.
+  h.tabs.forget(tabID);
+
+  await h.bridge.reconcileOwnedTabs();
+  const observation = await h.port.waitForFrame("claim_observation");
+  expect(observation.payload["event_kind"]).toBe("owner_closed");
+  expect(observation.payload["binding_id"]).toBe(bindingID);
+  expect(observation.job_id).toBe("job_vanished_0001");
+  // Reported once, then forgotten: a second pass must not re-report.
+  expect(Object.keys(ledger.current())).not.toContain(String(tabID));
+});

@@ -1603,6 +1603,42 @@ func retireAuthenticationEntryLeaseAfterOwnerCloseTx(ctx context.Context, q dbtx
 	return err
 }
 
+// releaseAuthenticationEntryLeasesForBindingsTx frees every institution slot
+// whose occupying binding has just been retired. Binding ids are minted per
+// claim and globally unique, so a binding alone is an exact fence.
+//
+// A retired claim's surface is gone by definition, and §4.5's unbounded
+// human-paced window is earned by a BOUND surface - so without this, a claim
+// that dies unobserved (its tab closed while the extension was reloading, a
+// browser crash, a kill -9) leaves the entry `human` with a NULL deadline
+// naming a dead tab: held forever, blocking every sibling, with nothing left
+// alive to report the loss. Measured live 2026-08-20: the operator closed
+// papio's tab group during an extension reload, no listener survived to report
+// it, and the claim's own expiry left the library slot occupied.
+//
+// Callers must only pass bindings whose claims carry no unsettled
+// institutional effect permit; the expiry path already excludes those, which is
+// what keeps a navigation genuinely in flight from being retired underneath
+// itself. Claim EXPIRY is the only caller: a generation fence must not release
+// an entry, because §4.5 keys a reserved entry on the owner job so a human
+// sign-in survives a reconnect (see AbandonStaleMaterializations).
+func releaseAuthenticationEntryLeasesForBindingsTx(ctx context.Context, q dbtx, bindings []string, nowText string) error {
+	for _, binding := range bindings {
+		if strings.TrimSpace(binding) == "" {
+			continue
+		}
+		if _, err := q.ExecContext(ctx, `
+			UPDATE authentication_entry_leases
+			   SET state='expired', lease_until=NULL, owner_binding_id=NULL,
+			       owner_tab_hint=NULL, entitled_at=NULL, updated_at=?
+			 WHERE owner_binding_id=? AND state IN ('reserved','human')`,
+			nowText, binding); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RetireTerminalAuthenticationEntryLeases releases every institution sign-in
 // slot whose owning job is terminal and whose owner binding holds no
 // unresolved institutional effect permit. It returns how many it retired.

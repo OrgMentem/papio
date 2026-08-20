@@ -474,3 +474,68 @@ func TestRetireTerminalAuthenticationEntryLeasesFreesADeadOwnersSlot(t *testing.
 		t.Fatalf("sweep is not idempotent: retired=%d err=%v", retired, err)
 	}
 }
+
+// A retired claim's surface is gone by definition, so the institution slot its
+// binding occupied must go with it. Without this, a claim that dies unobserved
+// (its tab closed while the extension was reloading, a browser crash) leaves
+// the entry `human` with a NULL deadline naming a dead tab - held forever,
+// blocking every sibling. Measured live 2026-08-20.
+func TestReconcileMaterializationClaimsReleasesTheEntryItOccupied(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID := seedJobAndCandidate(t, js, "orphan-surface")
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 6, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-orphan-surface", LeaseID: "lease-orphan", OwnerID: jobID,
+		BrowserHolderGeneration: 6, LeaseUntil: time.Now().UTC().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx,
+		"claim-orphan-surface", jobID, 6, claim.BindingID, 1); err != nil {
+		t.Fatal(err)
+	}
+	// Bound and human-paced: exactly the live shape, with no deadline at all.
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET state='human', human_owner_id=?, lease_until=NULL
+		  WHERE authentication_claim_id='claim-orphan-surface'`, jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	// An unexpired claim keeps its institution.
+	if _, err := js.ReconcileMaterializationClaims(ctx, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	lease, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-orphan-surface")
+	if err != nil || !ok || lease.State != AuthenticationEntryLeaseHuman {
+		t.Fatalf("live claim's entry = %+v ok=%v err=%v, want still held", lease, ok, err)
+	}
+
+	// Its lease expires with nothing left alive to report the loss.
+	retired, err := js.ReconcileMaterializationClaims(ctx, time.Now().UTC().Add(2*time.Minute))
+	if err != nil || len(retired) != 1 {
+		t.Fatalf("reconcile retired %d claims, err=%v, want 1", len(retired), err)
+	}
+	freed, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-orphan-surface")
+	if err != nil || !ok {
+		t.Fatalf("entry after reconcile = %+v ok=%v err=%v", freed, ok, err)
+	}
+	if freed.State == AuthenticationEntryLeaseHuman {
+		t.Fatal("a retired claim left its institution held by a paper with no surface")
+	}
+	// Freed for real: the next paper takes the library.
+	next, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-orphan-surface", LeaseID: "lease-after", OwnerID: "job-after",
+		BrowserHolderGeneration: 6, LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil || next.OwnerID != "job-after" {
+		t.Fatalf("reserve after release = %+v, %v", next, err)
+	}
+}

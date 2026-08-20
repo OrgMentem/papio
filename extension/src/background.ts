@@ -4071,6 +4071,38 @@ export class Bridge {
         try {
           tab = await this.deps.tabs.get(tabID);
         } catch {
+          // The surface is GONE and this record is the only proof it existed.
+          // Deleting it in silence stranded the claim behind it: a tab closed
+          // with no listener alive (an extension reload, a browser crash)
+          // leaves a claim whose institutional effect permit has settled,
+          // which reconcile deliberately never expires - so the institution's
+          // sign-in slot stayed held, with no deadline, by a paper that has no
+          // page. Measured live 2026-08-20: papio's own tab group was closed
+          // during an extension reload and the library stayed occupied.
+          //
+          // Report the same restart-recovered owner_closed that onTabRemoved
+          // reports from this record. The enqueue only touches the observation
+          // outbox and schedules its drain, so it is safe inside this ledger
+          // transaction.
+          if (
+            entry.ceded !== true &&
+            entry.browser_epoch === this.browserEpoch &&
+            entry.job_id !== undefined &&
+            entry.binding_id !== undefined &&
+            entry.claim !== undefined
+          ) {
+            this.enqueueRestartRecoveredObservation(
+              {
+                job_id: entry.job_id,
+                authentication_claim_id: entry.claim.authentication_claim_id,
+                binding_id: entry.binding_id,
+                browser_holder_generation:
+                  entry.claim.browser_holder_generation,
+                gate_occurrence_id: entry.claim.gate_occurrence_id,
+              },
+              "owner_closed",
+            );
+          }
           delete ledger[key];
           changed = true;
           continue;
@@ -4145,6 +4177,9 @@ export class Bridge {
       try {
         tab = await this.deps.tabs.get(tabID);
       } catch {
+        // Unreachable in practice: classifyLedgeredTabs above already prunes
+        // and REPORTS a vanished record. Kept as a plain guard so a future
+        // caller ordering cannot crash this loop.
         continue;
       }
       const inWorkWindow =

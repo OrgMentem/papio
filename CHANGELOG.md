@@ -219,6 +219,18 @@ execution records kept during the initial build.
   page attached now keeps the short deadline it was granted, a real sign-in in
   progress still runs as long as you need, and an abandoned one is released
   automatically instead of waiting for another paper to collide with it.
+- **Closing *papio*'s tabs yourself no longer strands your library.** If a
+  *papio* tab disappears while nothing is watching — you close it during an
+  extension reload, or the browser crashes — the paper behind it had already
+  been granted its one navigation, and a granted paper's page is deliberately
+  never expired on a timer. So the library's single sign-in slot stayed held by
+  a paper with no page at all, and every other paper queued behind it forever.
+  Measured live: the tab group was closed during a reload and the slot was
+  still held ten minutes later with no expiry set. The extension now reports
+  that exact loss from its own durable record of the tabs it opened, and a
+  paper whose page is retired releases the library slot it was occupying. A
+  sign-in still survives a browser reconnect untouched — that is a new session,
+  not a lost page.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route

@@ -1427,6 +1427,10 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 	if err := consumeCloseAuthorizationsTx(ctx, tx, retiredBindings, stamp); err != nil {
 		return nil, err
 	}
+	// A retired binding's surface is gone; its institution must not stay held.
+	if err := releaseAuthenticationEntryLeasesForBindingsTx(ctx, tx, retiredBindings, stamp); err != nil {
+		return nil, err
+	}
 	// Claims protected by any authorized institutional effect remain live
 	// after its permit settles and after their diagnostic lease expires. The
 	// candidate stays owned until the artifact winner closes the claim.
@@ -1497,6 +1501,14 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 	if err := consumeCloseAuthorizationsTx(ctx, tx, retiredBindings, now); err != nil {
 		return 0, err
 	}
+	// The entry lease is deliberately NOT released here, and the asymmetry with
+	// the expiry path is the point. A generation fence means the browser
+	// session changed, not that the sign-in died: §4.5 keys a reserved entry on
+	// the owner JOB precisely so a human sign-in survives a service-worker
+	// restart or a reconnect. Releasing it here cut off exactly that case -
+	// TestClaimObservationSurvivesAReconnectSinceArbitration caught it. Expiry
+	// is different: no renewal arrived for the claim's own lease, which is real
+	// death of the surface.
 	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates
 		SET status='eligible', updated_at=?
 		WHERE status IN ('claimed','materializing')
