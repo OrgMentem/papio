@@ -176,15 +176,18 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
-- ***papio* now retires a working tab when its paper is over.** A tab that had
- reached a library or publisher page could never be closed by *papio*: only an
- untouched placeholder, a paper that had arrived, or an abandoned sign-in had
- a permitted closing reason. Cancelled and otherwise-finished papers therefore
- accumulated in the *papio* group indefinitely. The daemon can now authorize
- one exact binding to close when its job is terminal or has no open browser
- handoff, provided no provider effect is still in flight. The extension still
- refuses active, pinned, PDF, touched, ceded, foreign-window, and
- browser-restarted tabs — those belong to you, not cleanup.
+- ***papio* now retires a working tab when its paper is over — including after
+  either side restarts.** A tab that had reached a library or publisher page
+  could never be closed by *papio*: only an untouched placeholder, a paper that
+  had arrived, or an abandoned sign-in had a permitted closing reason.
+  Cancelled and otherwise-finished papers therefore accumulated in the *papio*
+  group indefinitely. The daemon now derives terminal browser cancellations
+  from durable claims instead of worker memory, and can authorize one exact
+  binding to close when its job is terminal or has no open browser handoff,
+  provided no provider effect is still in flight. The extension can act from
+  either live job state or the same-browser-epoch birth ledger. It still
+  refuses active, pinned, PDF, touched, ceded, foreign-window, and
+  browser-restarted tabs — those belong to you, not cleanup.
 - **A paper whose library sign-in you never finished can be opened again.** Once
   *papio* has sent a paper to your library it will not send it a second time on
   its own — that is deliberate, so one request to a publisher never becomes two.

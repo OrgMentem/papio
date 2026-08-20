@@ -15350,10 +15350,30 @@ export class Bridge {
   private async onCancel(msg: BrowserMessage): Promise<void> {
     const jobID = msg.job_id;
     if (jobID === undefined) return;
-    const job = findByJob(this.store, jobID);
-    if (!job) return;
     this.downloads.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
+    const job = findByJob(this.store, jobID);
+    if (!job) {
+      // A daemon/worker restart can lose browser-local activeJobs before the
+      // durable terminal-claim poll emits cancel. The URL-free birth ledger
+      // still names every same-epoch surface by job and binding; that is
+      // enough to ASK the daemon, never enough to close on its own. Launch
+      // off-chain for the same inbound-FIFO reason as removeJobWithOffer.
+      const ledger = await this.snapshotTabLedger();
+      for (const [key, entry] of Object.entries(ledger)) {
+        const tabID = Number(key);
+        if (
+          !Number.isInteger(tabID) ||
+          tabID < 0 ||
+          entry.job_id !== jobID ||
+          entry.ceded === true ||
+          entry.browser_epoch !== this.browserEpoch
+        )
+          continue;
+        void this.closeOwnedSurface(tabID, "job_inactive");
+      }
+      return;
+    }
     await this.removeJobWithOffer(jobID);
   }
 

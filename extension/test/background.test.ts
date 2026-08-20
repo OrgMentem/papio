@@ -18659,6 +18659,49 @@ test("job removal retires its inactive owned surface through daemon authorizatio
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
 });
 
+test("a durable cancel retires a ledger-only surface after browser-local job state is gone", async () => {
+  const jobID = "job_ledger_only_cancel_0001";
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  internals.tabLedgerCache[String(tabID)] = {
+    ...internals.tabLedgerCache[String(tabID)]!,
+    binding_id: bindingID,
+    job_id: jobID,
+  };
+  expect(findByJob(h.backend.store, jobID)).toBeUndefined();
+
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "cancel",
+    msg_id: "cancel-ledger-only-0001",
+    job_id: jobID,
+    seq: 11,
+    payload: {},
+  });
+  const request = await h.port.waitForFrame("surface_close_request");
+  expect(request.payload).toMatchObject({
+    binding_id: bindingID,
+    disposition: "job_inactive",
+  });
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-ledger-only-0001",
+      nonce: "nonce-ledger-only-0001",
+      browser_holder_generation: 1,
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(h.tabs.removed).toContain(tabID);
+  expect(h.tabs.snapshot(tabID)).toBeUndefined();
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+});
+
 test("Slice 2b: a non-authorized outcome retains the surface", async () => {
   const h = makeHarness(undefined, { windows: true });
   await h.bridge.start();

@@ -136,10 +136,12 @@ for the full pre-split extension history.
 
 ### Fixed
 - ***papio* now closes its own inactive working tab when the daemon retires the
-  handoff.** Provider pages used to outlive cancelled and finished papers
-  forever because a navigated materialization had no authorized closing
-  reason. Cleanup now asks the daemon for a one-use, binding-scoped
-  `job_inactive` authorization after detaching the job, then closes only an
+  handoff — even after either side restarts.** Provider pages used to outlive
+  cancelled and finished papers forever because a navigated materialization
+  had no authorized closing reason, and both the daemon's cancel index and the
+  extension's job lookup were worker-local. Cleanup now acts from either live
+  job state or a modern same-browser-epoch birth record, asks the daemon for a
+  one-use, binding-scoped `job_inactive` authorization, then closes only an
   inactive tab still inside *papio*'s work window or tab group. Active, pinned,
   PDF, touched, ceded, and browser-restarted tabs remain yours.
 - **Asking for a paper's sign-in no longer opens two tabs for it.** *papio* was
