@@ -4249,7 +4249,7 @@ type unavailableLogState struct {
 	suppressed int
 }
 
-const unavailableLogKeySep = ""
+const unavailableLogKeySep = "\x1e"
 
 func unavailableLogKey(surface string, cause error) string {
 	if cause == nil {
@@ -7958,7 +7958,6 @@ func (b *Bridge) recoverDeferredAutoBind(ctx context.Context, grabID, jobID stri
 				return nil
 			}
 		}
-		staged = dest
 		target = filepath.Base(dest)
 	}
 	if _, err := b.ingestAdoptedFile(ctx, jobID, target, nil, nil); err != nil {
