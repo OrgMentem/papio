@@ -423,7 +423,15 @@ export type { ToolbarCountMode };
 export interface BadgeState {
   connectionStatus: StoreShape["connectionStatus"] | undefined;
   reauthNeeded: boolean;
+  /** Papers whose own surface is at a login page: exactly the set a human can
+   * act on. */
   authBlockers: number;
+  /** Papers with no surface at all, waiting their turn at an institution one
+   * sign-in serves. papio owes them nothing from the operator, so they never
+   * escalate the badge - they only qualify a tooltip, because reporting them
+   * as "waiting on your sign-in" turned an internal queue into a false human
+   * ask (the badge read 13 while exactly one paper could proceed). */
+  queuedAuth?: number | undefined;
   /** Number of active jobs left on a provider security check/dead-end page. */
   challengeBlocked?: number | undefined;
   blockedHosts: number | readonly string[];
@@ -477,8 +485,16 @@ export function computeBadge(state: BadgeState): BadgeResult {
     requiredCount !== undefined;
   const watchHits = Math.max(0, Math.trunc(state.watchHits ?? 0));
   const retractions = Math.max(0, Math.trunc(state.retractions ?? 0));
+  const queuedAuthCount = Math.max(0, Math.trunc(state.queuedAuth ?? 0));
+  // Named as papio's own work, never as an ask: these papers are waiting for
+  // papio to reach them, which is why they qualify every sign-in tooltip
+  // instead of being counted into one.
+  const queuedClause =
+    queuedAuthCount > 0
+      ? ` · ${queuedAuthCount} more queued for your library`
+      : "";
   const breakdown = (need: number): string =>
-    `papio: ${need} need you · ${watchHits} watch hit${watchHits === 1 ? "" : "s"} · ${retractions} retraction notice${retractions === 1 ? "" : "s"}`;
+    `papio: ${need} need you · ${watchHits} watch hit${watchHits === 1 ? "" : "s"} · ${retractions} retraction notice${retractions === 1 ? "" : "s"}${queuedClause}`;
   if (state.connectionStatus === "session_elsewhere") {
     // Reachable daemon, wrong browser: the remedy is switching the session,
     // not diagnosing the daemon.
@@ -499,14 +515,14 @@ export function computeBadge(state: BadgeState): BadgeResult {
     return {
       text: "!",
       color: "#b06000",
-      tooltip: "papio: institution sign-in needed",
+      tooltip: `papio: institution sign-in needed${queuedClause}`,
     };
   }
   if (authBlockerCount > 0) {
     return {
       text: String(authBlockerCount),
       color: "#b06000",
-      tooltip: `papio: ${authBlockerCount} paper${authBlockerCount === 1 ? "" : "s"} waiting on your institution sign-in`,
+      tooltip: `papio: ${authBlockerCount} paper${authBlockerCount === 1 ? "" : "s"} need${authBlockerCount === 1 ? "s" : ""} your institution sign-in${queuedClause}`,
     };
   }
   if (challengeBlockedCount > 0) {
@@ -541,16 +557,16 @@ export function computeBadge(state: BadgeState): BadgeResult {
       return {
         text: String(pendingCount),
         color: "#1a73e8",
-        tooltip: `papio: ${pendingCount} pending item${pendingCount === 1 ? "" : "s"}`,
+        tooltip: `papio: ${pendingCount} pending item${pendingCount === 1 ? "" : "s"}${queuedClause}`,
       };
     }
     return {
       text: "",
       color: "#1a73e8",
       tooltip:
-        pendingCount === 0
+        (pendingCount === 0
           ? "papio: no pending items"
-          : "papio: pending items unavailable",
+          : "papio: pending items unavailable") + queuedClause,
     };
   }
   if (state.countsSchemaV3 !== true) {
@@ -558,13 +574,17 @@ export function computeBadge(state: BadgeState): BadgeResult {
       return {
         text: String(pendingCount),
         color: "#1a73e8",
-        tooltip: `papio: ${pendingCount} pending item${pendingCount === 1 ? "" : "s"}`,
+        tooltip: `papio: ${pendingCount} pending item${pendingCount === 1 ? "" : "s"}${queuedClause}`,
       };
     }
+    // The disabled-keepalive path: no evidence, no required-turn projection.
+    // The queued clause is the whole signal that papio has institutional work
+    // in flight, so it must survive here - this is the case the old
+    // count-them-as-blockers behaviour was protecting, minus the false ask.
     return {
       text: "",
       color: "#1a73e8",
-      tooltip: "papio: connected",
+      tooltip: `papio: connected${queuedClause}`,
     };
   }
   if (!v3Complete) {
@@ -3278,16 +3298,24 @@ export class Bridge {
     this.wakeEffectGovernor();
     return { ok: true, opened: true };
   }
-  /** A cold preflight has no tab yet; excluding it would hide the only sign-in
-   * signal when keepalive is disabled. `waiting_for_session` is retired
-   * (Slice 3: sibling parks are daemon-side now) but the field stays
-   * migration-tolerant, hence the guard below. */
+  /** Papers a human can actually act on: `auth_pending` is set exactly when a
+   * paper's own surface reaches a login page, so this is the set with a page
+   * in front of the operator (including one parked after its drive budget,
+   * which still needs the human to finish that sign-in).
+   *
+   * It deliberately EXCLUDES `queued && requires_auth`. Those papers have no
+   * surface: an institution is served by one sign-in at a time, so they wait
+   * for papio, not for the operator. Counting them reported the queue back as
+   * a human ask - the badge read "13 papers waiting on your institution
+   * sign-in" while exactly one could proceed, and a twenty-hour internal
+   * stall looked like a polite wait on the operator (measured live
+   * 2026-08-20). queuedAuthJobCount() reports them as papio's own work
+   * instead. The old rationale here - that a cold preflight with no tab would
+   * otherwise hide the sign-in signal - is served by `reauthNeeded`, which
+   * states "your library needs a sign-in" without miscounting papers. */
   private signInBlockerCount(): number {
-    return this.store.activeJobs.filter(
-      (job) =>
-        job.status === "auth_pending" ||
-        (job.status === "queued" && job.requires_auth === true),
-    ).length;
+    return this.store.activeJobs.filter((job) => job.status === "auth_pending")
+      .length;
   }
 
   private currentBlockedProviderHosts(): string[] {
@@ -5647,6 +5675,7 @@ export class Bridge {
         connectionStatus: status,
         reauthNeeded: this.keepaliveReauthNeeded,
         authBlockers: this.signInBlockerCount(),
+        queuedAuth: this.queuedAuthJobCount(),
         challengeBlocked: this.challengeBlockedJobCount(),
         blockedHosts: blockedProviderHosts,
         ungrantedResolvers: ungrantedResolverOrigins,

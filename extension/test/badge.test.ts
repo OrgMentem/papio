@@ -41,6 +41,44 @@ test("computeBadge separates a refused session from an unreachable daemon", () =
   );
 });
 
+// Papers queued behind an institution's one sign-in are papio's work, not the
+// operator's. Counting them as blockers made the badge read "13 papers waiting
+// on your institution sign-in" while exactly one could proceed (live
+// 2026-08-20), so a queue looked like a human ask and a long internal stall
+// looked like patience.
+test("computeBadge never turns a queue into a human ask", () => {
+  const queuedOnly = computeBadge({ ...base, queuedAuth: 12 });
+  expect(queuedOnly.text, "a queue must not put a count on the badge").toBe("");
+  expect(queuedOnly.color, "a queue must not raise the ask colour").toBe("#1a73e8");
+  expect(queuedOnly.tooltip).toBe("papio: connected · 12 more queued for your library");
+
+  // One paper genuinely at a login page, twelve behind it: the count is the
+  // one the operator can act on, and the rest are named as papio's own work.
+  const blocked = computeBadge({ ...base, authBlockers: 1, queuedAuth: 12 });
+  expect(blocked).toMatchObject({ text: "1", color: "#b06000" });
+  expect(blocked.tooltip).toBe(
+    "papio: 1 paper needs your institution sign-in · 12 more queued for your library",
+  );
+
+  // Plural on the ask, and no clause at all when nothing is queued.
+  expect(computeBadge({ ...base, authBlockers: 2 }).tooltip).toBe(
+    "papio: 2 papers need your institution sign-in",
+  );
+
+  // A required-turn projection still reports the queue beside it.
+  expect(
+    computeBadge({
+      ...base,
+      countsSchemaV3: true,
+      requiredTurnsComplete: true,
+      requiredTurnCount: 0,
+      queuedAuth: 3,
+    }).tooltip,
+  ).toBe(
+    "papio: 0 need you · 0 watch hits · 0 retraction notices · 3 more queued for your library",
+  );
+});
+
 test("computeBadge uses required turns only for a complete counts v3 projection", () => {
   const legacy = computeBadge({ ...base, triageCount: 4 });
   expect(legacy).toMatchObject({ text: "4", color: "#1a73e8", tooltip: "papio: 4 pending items" });

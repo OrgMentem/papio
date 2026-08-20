@@ -20,6 +20,18 @@ for the full pre-split extension history.
 - **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
 
 ### Changed
+- **The toolbar badge no longer reports *papio*'s own queue as papers waiting
+  on you.** A library is served by one sign-in at a time, so most institutional
+  papers are waiting for *papio* to reach them, not for you to do anything —
+  yet every one of them was counted into "N papers waiting on your institution
+  sign-in". Live, the badge read 13 while exactly one paper could proceed, and
+  a twenty-hour internal stall looked like *papio* patiently waiting on the
+  operator. The count is now exactly the papers whose own page is sitting at a
+  login screen — the ones you can actually finish — and the rest are named as
+  *papio*'s work: "1 paper needs your institution sign-in · 12 more queued for
+  your library". Nothing is hidden: the queued clause also appears when the ask
+  count is zero, so institutional work in flight is still visible with no
+  session evidence and keepalive off.
 - ***papio* no longer opens institutional sign-in tabs on its own.** Every
   autonomous path that used to create a `requires_auth` surface — a warm
   session admitting a queued offer, the 45-second fallback timer, a daemon

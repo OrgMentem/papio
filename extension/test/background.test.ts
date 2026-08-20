@@ -2205,8 +2205,12 @@ test("a cold requires-auth handoff is signalled while queued and opens after its
     status: "queued",
     requires_auth: true,
   });
-  expect(h.action.texts.at(-1)).toBe("1");
-  expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
+  // Queued is papio's own work, not an ask: no count, no amber. (This harness
+  // paints in the operator's quiet `off` count mode, so the queued clause
+  // itself is pinned in badge.test.ts, where the mode is explicit.)
+  expect(h.action.texts.at(-1)).toBe("");
+  expect(h.action.backgroundColors.at(-1)).toBe("#1a73e8");
+  expect(h.action.titles.at(-1)).not.toContain("sign-in");
 
   // Treat the worker-local timer as lost with MV3 worker suspension. The
   // periodic wake must use the durable offer time to release the cold queue.
@@ -2225,6 +2229,12 @@ test("a cold requires-auth handoff is signalled while queued and opens after its
   await h.tabs.userNavigate(tabID, idpURL);
   expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
   expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(true);
+  // Now there is a login page in front of the operator: escalate.
+  expect(h.action.texts.at(-1)).toBe("1");
+  expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
+  expect(h.action.titles.at(-1)).toBe(
+    "papio: 1 paper needs your institution sign-in",
+  );
 });
 
 test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement", async () => {
@@ -11294,7 +11304,7 @@ test("heartbeat counts obey disconnected, sign-in, permission, then pending badg
   expect(h.action.texts.at(-1)).toBe("1");
   expect(h.action.backgroundColors.at(-1)).toBe("#b06000");
   expect(h.action.titles.at(-1)).toBe(
-    "papio: 1 paper waiting on your institution sign-in",
+    "papio: 1 paper needs your institution sign-in",
   );
 
   const refresh = h.alarms.onAlarm.emit({ name: "papio-keepalive" });
@@ -11316,14 +11326,14 @@ test("heartbeat counts obey disconnected, sign-in, permission, then pending badg
   await refresh;
   expect(h.action.texts.at(-1)).toBe("1");
   expect(h.action.titles.at(-1)).toBe(
-    "papio: 1 paper waiting on your institution sign-in",
+    "papio: 1 paper needs your institution sign-in",
   );
 
   h.deps.permissions.contains = async () => false;
   await h.bridge.syncConnectionBadge();
   expect(h.action.texts.at(-1)).toBe("1");
   expect(h.action.titles.at(-1)).toBe(
-    "papio: 1 paper waiting on your institution sign-in",
+    "papio: 1 paper needs your institution sign-in",
   );
 
   h.deps.permissions.contains = async () => true;
