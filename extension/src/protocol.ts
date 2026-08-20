@@ -1210,7 +1210,8 @@ export interface SurfaceCloseRequestPayload {
   disposition:
     | "scaffold_idle"
     | "materialization_settled"
-    | "claim_abandoned";
+    | "claim_abandoned"
+    | "job_inactive";
   /** Permitted only when disposition is claim_abandoned. */
   gate_occurrence_id?: string;
 }
@@ -6134,7 +6135,8 @@ function validatePayload(
       if (
         disposition !== "scaffold_idle" &&
         disposition !== "materialization_settled" &&
-        disposition !== "claim_abandoned"
+        disposition !== "claim_abandoned" &&
+        disposition !== "job_inactive"
       )
         fail(`${type}.disposition is invalid`);
       if (disposition !== "claim_abandoned") {

@@ -784,20 +784,23 @@ const PRIVATE_SURFACE_PURPOSE = "federated-login";
 const RESTART_LIVENESS_SCAN_LIMIT = 25;
 const BROWSER_EPOCH_LOCAL_KEY = "papio_browser_epoch_v1";
 const BROWSER_EPOCH_SESSION_KEY = "papio_browser_epoch_session_v1";
-/** The three closed-permitted disposition reasons (claim-observation
+/** The four closed-permitted disposition reasons (claim-observation
  * protocol design §2.3): idle scaffold never engaged, settled after
- * artifact win, or an authentication claim's abandonment. */
+ * artifact win, an authentication claim's abandonment, or a binding whose
+ * daemon handoff is no longer active. */
 type SurfaceCloseDisposition =
   | "scaffold_idle"
   | "materialization_settled"
-  | "claim_abandoned";
+  | "claim_abandoned"
+  | "job_inactive";
 function isSurfaceCloseDisposition(
   value: string | undefined,
 ): value is SurfaceCloseDisposition {
   return (
     value === "scaffold_idle" ||
     value === "materialization_settled" ||
-    value === "claim_abandoned"
+    value === "claim_abandoned" ||
+    value === "job_inactive"
   );
 }
 export interface OpenManagedTabOptions {
@@ -12104,8 +12107,16 @@ export class Bridge {
       // otherwise queued work waits for an unrelated timer despite capacity.
       if (!this.drainingQueuedHandoffs) await this.releaseQueuedHandoffs();
     }
-    if (tabID !== undefined && tabID >= 0)
-      void this.closeOwnedTab(tabID, "job-removed");
+    // `cancel` is itself an inbound native frame. Never await this correlated
+    // request here: its surface_close_response can only arrive through the
+    // same serialized inbound FIFO. Run the one-use authorization transaction
+    // off-chain after the job is detached, so closeOwnedTab's tracked-job gate
+    // no longer blocks it. The daemon decides whether the handoff is actually
+    // inactive; every non-authorized outcome leaves the surface alone.
+    const closeTabID =
+      tabID !== undefined && tabID >= 0 ? tabID : materializationTabID;
+    if (closeTabID !== undefined && closeTabID >= 0)
+      void this.closeOwnedSurface(closeTabID, "job_inactive");
   }
 
   /** A keepalive tab can outlive a cancellation, so clear its removed paper's

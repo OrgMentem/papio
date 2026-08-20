@@ -5450,7 +5450,7 @@ func (p *SurfaceCloseRequestPayload) validate() error {
 		return err
 	}
 	if err := enumRequired("surface_close_request.disposition", p.Disposition,
-		"scaffold_idle", "materialization_settled", "claim_abandoned"); err != nil {
+		"scaffold_idle", "materialization_settled", "claim_abandoned", "job_inactive"); err != nil {
 		return err
 	}
 	if p.Disposition == "claim_abandoned" {

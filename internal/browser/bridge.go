@@ -2160,9 +2160,53 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 			}
 			eligible = permit == nil || permit.ClaimID != claim.ID
 		}
+	case "job_inactive":
+		// A navigated surface is not closable merely because it looks old.
+		// The daemon must prove the browser handoff itself is no longer live:
+		// terminal job, or no open openurl_handoff action after the same direct
+		// lookup poll() uses before emitting cancel. The binding remains the
+		// resource identity, and an unsettled effect for this exact claim still
+		// vetoes closure.
+		candidate, candidateErr := b.jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+		if candidateErr != nil || candidate == nil {
+			result.Outcome, result.Detail = "error", "binding candidate state is unavailable"
+			return frame()
+		}
+		row, jobErr := b.jobs.Get(ctx, candidate.JobID)
+		if jobErr != nil || row == nil {
+			result.Outcome, result.Detail = "error", "binding job state is unavailable"
+			return frame()
+		}
+		inactive := job.Terminal(row.State)
+		if !inactive {
+			_, actionErr := b.openHandoffForJob(ctx, row.ID)
+			switch {
+			case errors.Is(actionErr, sql.ErrNoRows):
+				inactive = true
+			case actionErr != nil:
+				result.Outcome, result.Detail = "error", "browser handoff state is unavailable"
+				return frame()
+			}
+		}
+		if inactive {
+			permit, permitErr := b.jobs.LiveEffectPermit(ctx)
+			if permitErr != nil {
+				result.Outcome, result.Detail = "error", "effect permit state is unavailable"
+				return frame()
+			}
+			eligible = permit == nil || permit.ClaimID != claim.ID
+			if !eligible {
+				result.Detail = "the binding's provider effect is not settled"
+			}
+		} else {
+			result.Detail = "the binding still has an active browser handoff"
+		}
 	}
 	if !eligible {
-		result.Outcome, result.Detail = "not_eligible", "disposition does not match the binding's current phase"
+		result.Outcome = "not_eligible"
+		if result.Detail == "" {
+			result.Detail = "disposition does not match the binding's current phase"
+		}
 		return frame()
 	}
 	id, nonce, issueErr := b.jobs.IssueCloseAuthorization(ctx, p.BindingID, p.BrowserHolderGeneration, p.Disposition, b.now())

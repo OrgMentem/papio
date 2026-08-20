@@ -6230,7 +6230,8 @@
                 "enum": [
                   "scaffold_idle",
                   "materialization_settled",
-                  "claim_abandoned"
+                  "claim_abandoned",
+                  "job_inactive"
                 ]
               },
               "gate_occurrence_id": {

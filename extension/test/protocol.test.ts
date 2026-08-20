@@ -3285,6 +3285,7 @@ test("surface_close_request/response round-trip and enforce §2.3 field rules", 
   for (const disposition of [
     "scaffold_idle",
     "materialization_settled",
+    "job_inactive",
   ] as const) {
     const msg = parseBrowserMessage(
       frame("surface_close_request", {
@@ -3331,6 +3332,7 @@ test("surface_close_request/response round-trip and enforce §2.3 field rules", 
   for (const disposition of [
     "scaffold_idle",
     "materialization_settled",
+    "job_inactive",
   ] as const) {
     expect(() =>
       parseBrowserMessage(
@@ -3351,6 +3353,7 @@ test("surface_close_request/response round-trip and enforce §2.3 field rules", 
   for (const disposition of [
     "scaffold_idle",
     "materialization_settled",
+    "job_inactive",
   ] as const) {
     expect(
       parseBrowserMessage(

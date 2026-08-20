@@ -13552,23 +13552,40 @@ test("close gate leaves an active managed tab open", async () => {
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
 });
 test("cancellation removes an inactive ledgered scaffold tab", async () => {
+  const jobID = "job_close_positive";
   const h = makeHarness(undefined, {
     windows: true,
     handoffSurface: "work-window",
   });
-  let ledger: Record<string, unknown> = {};
-  h.deps.tabLedger = {
-    load: async () => ({ ...ledger }),
-    save: async (entries) => {
-      ledger = { ...entries };
-    },
-  };
   await h.bridge.start();
-  await h.port.inbound(jobOffer("job_close_positive"));
-  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  const tab = h.tabs.snapshot(tabID);
-  if (tab !== undefined) h.tabs.patch(tabID, { active: false });
-  await h.bridge.requestCancel("job_close_positive");
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
+  };
+  internals.tabLedgerCache[String(tabID)] = {
+    ...internals.tabLedgerCache[String(tabID)]!,
+    binding_id: bindingID,
+    job_id: jobID,
+  };
+  await internals.update((store) => ({
+    ...store,
+    activeJobs: [{ ...materializationActiveJob(jobID), tab_id: tabID }],
+  }));
+
+  await h.bridge.requestCancel(jobID);
+  const request = await h.port.waitForFrame("surface_close_request");
+  expect(request.payload["disposition"]).toBe("job_inactive");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-cancel-inactive",
+      nonce: "nonce-cancel-inactive",
+      browser_holder_generation: 1,
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
   expect(h.tabs.removed).toContain(tabID);
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(false);
 });
@@ -18467,7 +18484,11 @@ async function seedOwnedScaffold(
     update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
     closeOwnedSurface: (
       tabID: number,
-      disposition: "scaffold_idle" | "materialization_settled" | "claim_abandoned",
+      disposition:
+        | "scaffold_idle"
+        | "materialization_settled"
+        | "claim_abandoned"
+        | "job_inactive",
     ) => Promise<{ closed: boolean }>;
   };
   const bindingID = "binding-owned-0001";
@@ -18485,14 +18506,22 @@ async function seedOwnedScaffold(
 function closeInternals(h: Harness): {
   closeOwnedSurface: (
     tabID: number,
-    disposition: "scaffold_idle" | "materialization_settled" | "claim_abandoned",
+    disposition:
+      | "scaffold_idle"
+      | "materialization_settled"
+      | "claim_abandoned"
+      | "job_inactive",
   ) => Promise<{ closed: boolean }>;
   tabLedgerCache: Record<string, SurfaceBirthRecord>;
 } {
   return h.bridge as unknown as {
     closeOwnedSurface: (
       tabID: number,
-      disposition: "scaffold_idle" | "materialization_settled" | "claim_abandoned",
+      disposition:
+        | "scaffold_idle"
+        | "materialization_settled"
+        | "claim_abandoned"
+        | "job_inactive",
     ) => Promise<{ closed: boolean }>;
     tabLedgerCache: Record<string, SurfaceBirthRecord>;
   };
@@ -18519,6 +18548,59 @@ test("Slice 2b: close transaction happy path authorizes, tombstones, removes, an
   expect(h.tabs.removed).toContain(tabID);
   expect(h.tabs.snapshot(tabID)).toBeUndefined();
   // A daemon-authorized close is not an operator cancel: no provider_outcome.
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+});
+
+test("job removal retires its inactive owned surface through daemon authorization", async () => {
+  const jobID = "job_inactive_close_0001";
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
+  };
+  internals.tabLedgerCache[String(tabID)] = {
+    ...internals.tabLedgerCache[String(tabID)]!,
+    binding_id: bindingID,
+    job_id: jobID,
+  };
+  await internals.update((store) => ({
+    ...store,
+    activeJobs: [{ ...materializationActiveJob(jobID), tab_id: tabID }],
+  }));
+
+  // `cancel` is an inbound native frame. The close request must be launched
+  // off-chain: awaiting its response inside this handler would deadlock the
+  // serialized inbound FIFO against the response itself.
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "cancel",
+    msg_id: "cancel-inactive-0001",
+    job_id: jobID,
+    seq: 10,
+    payload: {},
+  });
+  expect(findByJob(h.backend.store, jobID)).toBeUndefined();
+  const request = await h.port.waitForFrame("surface_close_request");
+  expect(request.payload).toMatchObject({
+    binding_id: bindingID,
+    disposition: "job_inactive",
+  });
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-job-inactive-0001",
+      nonce: "nonce-job-inactive-0001",
+      browser_holder_generation: 1,
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+
+  expect(h.tabs.removed).toContain(tabID);
+  expect(h.tabs.snapshot(tabID)).toBeUndefined();
+  // Papio retired it; this is not the operator cancelling the paper.
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
 });
 
@@ -18676,7 +18758,11 @@ test("Scenario 6: papio's own focus_owner activation leaves no cession trace, bu
   const internals = h.bridge as unknown as {
     closeOwnedSurface: (
       tabID: number,
-      disposition: "scaffold_idle" | "materialization_settled" | "claim_abandoned",
+      disposition:
+        | "scaffold_idle"
+        | "materialization_settled"
+        | "claim_abandoned"
+        | "job_inactive",
     ) => Promise<{ closed: boolean }>;
     snapshotTabLedger: () => Promise<Record<string, SurfaceBirthRecord>>;
   };

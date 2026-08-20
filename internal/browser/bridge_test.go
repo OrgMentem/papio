@@ -5866,6 +5866,111 @@ func TestSurfaceCloseAuthorizedHappyPath(t *testing.T) {
 	}
 }
 
+// A terminal job has no acquisition lifecycle left to own its browser
+// surface. job_inactive authorizes that exact binding even when its claim is
+// still navigated - the phase that had no close disposition before this fix.
+func TestSurfaceCloseJobInactiveAuthorizesTerminalNavigatedBinding(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-job-inactive", "navigated")
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("binding candidate = %+v, err=%v", candidate, err)
+	}
+	if err := jobs.Cancel(ctx, candidate.JobID, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+
+	frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-job-inactive", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "job_inactive",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeSurfaceCloseResponse(t, frames)
+	if got.Outcome != "authorized" {
+		t.Fatalf("outcome = %q, want authorized for terminal job (detail=%q)", got.Outcome, got.Detail)
+	}
+	var disposition string
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT disposition FROM close_authorizations WHERE id=?`,
+		got.CloseAuthorizationID).Scan(&disposition); err != nil {
+		t.Fatal(err)
+	}
+	if disposition != "job_inactive" {
+		t.Fatalf("stored disposition = %q, want job_inactive", disposition)
+	}
+}
+
+// Looking old is not enough: a nonterminal job with an open browser handoff
+// still owns its navigated surface, so job_inactive must fail closed.
+func TestSurfaceCloseJobInactiveRefusesLiveHandoff(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-job-live", "navigated")
+
+	frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-job-live", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "job_inactive",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeSurfaceCloseResponse(t, frames)
+	if got.Outcome != "not_eligible" {
+		t.Fatalf("outcome = %q, want not_eligible for live handoff: %+v", got.Outcome, got)
+	}
+	if got.Detail == "" {
+		t.Fatalf("live-handoff refusal must name itself: %+v", got)
+	}
+}
+
+// Job termination is not permission to interrupt an irreversible provider
+// effect. A held permit for this exact claim vetoes job_inactive until the
+// effect settles.
+func TestSurfaceCloseJobInactiveRefusesUnsettledEffect(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-job-effect", "claimed")
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("binding candidate = %+v, err=%v", candidate, err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch,
+		candidate.InstitutionProfileRevision, 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome, err := jobs.AcquireInstitutionalEffectPermit(ctx,
+		job.InstitutionalEffectPermitAcquireInput{
+			JobID: candidate.JobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+			SafetyDomainID: candidate.SafetyDomainID, InstitutionalRequestID: "close-effect-request",
+			JobAttemptRevision: candidate.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+			ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
+			Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
+		}); err != nil || outcome != job.EffectPermitAcquired {
+		t.Fatalf("effect permit outcome=%v err=%v", outcome, err)
+	}
+	if err := jobs.Cancel(ctx, candidate.JobID, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+
+	frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-job-effect", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "job_inactive",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeSurfaceCloseResponse(t, frames)
+	if got.Outcome != "not_eligible" || got.Detail == "" {
+		t.Fatalf("unsettled effect outcome = %+v, want named not_eligible", got)
+	}
+}
+
 // A repeated authorized request for the same live binding must return the
 // exact same token rather than minting (or refusing to mint) a second one.
 func TestSurfaceCloseAuthorizedRepeatIsIdempotent(t *testing.T) {

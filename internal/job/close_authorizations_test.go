@@ -43,6 +43,29 @@ func TestIssueCloseAuthorizationIsIdempotentPerBinding(t *testing.T) {
 	}
 }
 
+// TestIssueCloseAuthorizationAcceptsJobInactive pins both copies of the
+// closed vocabulary: the Go admission map and migration 0044's SQLite CHECK.
+func TestIssueCloseAuthorizationAcceptsJobInactive(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, nonce, err := js.IssueCloseAuthorization(ctx, "binding-job-inactive", 7, "job_inactive", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == "" || nonce == "" {
+		t.Fatalf("job_inactive issue returned empty id/nonce: %q %q", id, nonce)
+	}
+	var disposition string
+	if err := js.S.DB().QueryRowContext(ctx,
+		`SELECT disposition FROM close_authorizations WHERE id=?`, id,
+	).Scan(&disposition); err != nil {
+		t.Fatal(err)
+	}
+	if disposition != "job_inactive" {
+		t.Fatalf("stored disposition = %q, want job_inactive", disposition)
+	}
+}
+
 func TestIssueCloseAuthorizationRejectsDispositionConflict(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

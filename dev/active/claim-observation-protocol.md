@@ -352,7 +352,7 @@ abandoned claim's scaffold after `owner_closed`), so this pair carries **no**
 | `request_id` | string | required |
 | `binding_id` | string | required |
 | `browser_holder_generation` | int64 | required |
-| `disposition` | enum | required — `"scaffold_idle" \| "materialization_settled" \| "claim_abandoned"`, the three closed-permitted reasons from the plan's re-permitted-narrowly amendment (lines 148-150): idle scaffold never engaged, settled after artifact win, or an authentication claim's abandonment (`owner_closed` reducer above) |
+| `disposition` | enum | required — `"scaffold_idle" \| "materialization_settled" \| "claim_abandoned" \| "job_inactive"`. The original three closed-permitted reasons from the plan's re-permitted-narrowly amendment (lines 148-150) are idle scaffold never engaged, settled after artifact win, and authentication-claim abandonment (`owner_closed` reducer above). `job_inactive` is the fourth, added after the 2026-08-20 live lifecycle run proved a `navigated` claim had no retirement disposition at all: the daemon authorizes it only when the binding's job is terminal or has no open browser handoff, and an unsettled effect for that exact claim still vetoes closure. It is never an age or URL inference. |
 | `gate_occurrence_id` | string | optional — populated only when `disposition = "claim_abandoned"`, echoing the occurrence that closed |
 
 **`surface_close_response`** (daemon → extension):
@@ -545,7 +545,7 @@ CREATE TABLE close_authorizations (
   browser_holder_generation   INTEGER NOT NULL CHECK (browser_holder_generation >= 0),
   nonce                       TEXT NOT NULL CHECK (length(nonce) BETWEEN 1 AND 128),
   disposition                 TEXT NOT NULL CHECK (disposition IN
-    ('scaffold_idle','materialization_settled','claim_abandoned')),
+    ('scaffold_idle','materialization_settled','claim_abandoned','job_inactive')),
   status                      TEXT NOT NULL CHECK (status IN
     ('issued','consumed','expired')),
   issued_at                   TEXT NOT NULL,
@@ -556,6 +556,11 @@ CREATE UNIQUE INDEX close_authorizations_live_binding
   WHERE status = 'issued';
 CREATE INDEX close_authorizations_by_status ON close_authorizations(status);
 ```
+
+Migration `0041_close_authorizations.sql` created the original three-value
+constraint. Migration `0044_close_authorizations_job_inactive.sql` rebuilds the
+table to admit `job_inactive` while preserving every existing token and both
+indexes; applied migration 0041 is deliberately unchanged.
 
 The partial unique index enforces "at most one live authorization per
 binding" the same way `materialization_claims_live_candidate`
