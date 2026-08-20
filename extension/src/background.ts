@@ -4008,11 +4008,58 @@ export class Bridge {
     return { count: ask.length + legacyCount, tab_ids: ask };
   }
 
-  /** papio owns its surfaces but never closes them; startup reconciliation
-   * only classifies the tabs so an operator can review them in the browser. */
+  /** Reconcile modern, same-browser-epoch birth records whose jobs are no
+   * longer present in browser state. This is the restart/update repair half of
+   * job_inactive: future cancel/job-removal frames close through
+   * removeJobWithOffer, but tabs orphaned before that disposition shipped must
+   * get the same daemon decision.
+   *
+   * Never infer from age, title, or URL. The opaque daemon binding plus the
+   * same browser epoch proves the record; a fresh tabs.get plus papio
+   * work-window/group membership proves the physical surface. Pre-v2 records,
+   * browser-restart epochs, still-tracked jobs, and ceded tabs remain
+   * review-only. A surface the operator made active/pinned, opened as a PDF, or
+   * moved out of papio's container is ceded permanently rather than closed. */
   async reconcileOwnedTabs(): Promise<{ closed: number }> {
     await this.classifyLedgeredTabs();
-    return { closed: 0 };
+    const ledger = await this.snapshotTabLedger();
+    let closed = 0;
+    for (const [key, entry] of Object.entries(ledger)) {
+      const tabID = Number(key);
+      if (
+        !Number.isInteger(tabID) ||
+        tabID < 0 ||
+        entry.ceded === true ||
+        entry.job_id === undefined ||
+        entry.browser_epoch !== this.browserEpoch ||
+        findByJob(this.store, entry.job_id) !== undefined
+      )
+        continue;
+      let tab: TabInfo;
+      try {
+        tab = await this.deps.tabs.get(tabID);
+      } catch {
+        continue;
+      }
+      const inWorkWindow =
+        tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
+      const inPapioGroup =
+        tab.groupId !== undefined &&
+        tab.groupId >= 0 &&
+        (await this.knownHandoffGroup(tab.groupId, tab.windowId)) !== undefined;
+      if (
+        tab.active === true ||
+        tab.pinned === true ||
+        (tab.url !== undefined && isPDFPage(tab.url)) ||
+        (!inWorkWindow && !inPapioGroup)
+      ) {
+        await this.cedeOwnedTab(tabID, entry.binding_id);
+        continue;
+      }
+      const result = await this.closeOwnedSurface(tabID, "job_inactive");
+      if (result.closed) closed += 1;
+    }
+    return { closed };
   }
 
   /** Operator-initiated review focuses one bounded orphan surface; the

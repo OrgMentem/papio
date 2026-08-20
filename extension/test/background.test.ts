@@ -13490,6 +13490,61 @@ test("papio classifies its own surfaces and asks only about strays without closi
   expect(h.frames().filter((frame) => frame.type === "cancel")).toHaveLength(0);
 });
 
+test("startup reconciliation retires a modern same-epoch inactive orphan through job_inactive", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  internals.tabLedgerCache[String(tabID)] = {
+    ...internals.tabLedgerCache[String(tabID)]!,
+    binding_id: bindingID,
+    job_id: "job_already_removed_0001",
+  };
+
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  const request = await h.port.waitForFrame("surface_close_request");
+  expect(request.payload).toMatchObject({
+    binding_id: bindingID,
+    disposition: "job_inactive",
+  });
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-reconcile-inactive",
+      nonce: "nonce-reconcile-inactive",
+      browser_holder_generation: 1,
+    }),
+  );
+  await expect(reconciling).resolves.toEqual({ closed: 1 });
+  expect(h.tabs.removed).toContain(tabID);
+  expect(h.tabs.snapshot(tabID)).toBeUndefined();
+});
+
+test("startup reconciliation cedes an active orphan instead of asking to close it", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  internals.tabLedgerCache[String(tabID)] = {
+    ...internals.tabLedgerCache[String(tabID)]!,
+    binding_id: bindingID,
+    job_id: "job_active_orphan_0001",
+  };
+  h.tabs.patch(tabID, { active: true });
+
+  await expect(h.bridge.reconcileOwnedTabs()).resolves.toEqual({ closed: 0 });
+  expect(h.tabs.removed).not.toContain(tabID);
+  expect(internals.tabLedgerCache[String(tabID)]?.ceded).toBe(true);
+  expect(
+    h.frames().filter((frame) => frame.type === "surface_close_request"),
+  ).toHaveLength(0);
+});
+
 test("created broker tabs are ledgered durably and forgotten once they close", async () => {
   const h = makeHarness();
   let ledger: Record<string, unknown> = {};
