@@ -875,6 +875,22 @@ func TestClaimObservationNavigationErrorParksWithoutMutatingLease(t *testing.T) 
 		t.Fatalf("navigation_error ack carried lease_until, forbidden: %+v", ack)
 	}
 
+	afterClaim, err := jobs.MaterializationClaimByBindingID(context.Background(), bindingID)
+	if err != nil || afterClaim == nil || afterClaim.Phase != "abandoned" {
+		t.Fatalf("materialization claim after navigation_error = %+v, %v; want abandoned", afterClaim, err)
+	}
+	closed, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
+		RequestID: "close-naverror-request", BindingID: bindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "claim_abandoned",
+		GateOccurrenceID: grant.GateOccurrenceID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeResp := decodeSurfaceCloseResponse(t, closed); closeResp.Outcome != "authorized" {
+		t.Fatalf("navigation_error close outcome = %+v, want authorized", closeResp)
+	}
+
 	after, foundAfter, err := jobs.GetAuthenticationEntryLease(context.Background(), "auth-observation-naverror")
 	if err != nil || !foundAfter {
 		t.Fatalf("lease after navigation_error: %+v %v", after, err)

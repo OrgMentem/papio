@@ -231,11 +231,16 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 		}
 	case "navigation_error":
 		// Daemon-committed park with no auth-attempt charge, no cooldown,
-		// and the lease is never touched (plan Slice 1/3 invariant, "every
-		// dead end has a daemon-side disposition"). No daemon-side
-		// auth-attempt counter exists to avoid charging — the journal write
-		// below is this event's only durable effect; the candidate stays
-		// 'eligible' and the existing scheduler decides whether to retry.
+		// and the authentication-entry lease is never touched. The physical
+		// route is exhausted, though: abandon/expire this materialization
+		// claim so the extension's existing claim_abandoned close transaction
+		// can retire the dead network-error surface. The candidate stays owned
+		// - no automatic retry into a network which may still be offline. A
+		// later explicit Open records the next-attempt decision.
+		if err := abandonMaterializationClaimByBindingTx(ctx, tx, in.BindingID, nowText); err != nil {
+			return fail("error", "materialization claim could not be abandoned")
+		}
+
 	}
 
 	if err := recordClaimObservationTx(ctx, tx, ClaimObservationRecord{

@@ -1610,14 +1610,19 @@ func spentInstitutionalAttempt(t *testing.T, js *Store, prefix string) (jobID, c
 }
 
 // TestStartNextMaterializationAttemptForSpentCandidate pins the reachable
-// escape hatch. Nothing retires a navigated claim before its artifact winner,
-// and Retry refuses an awaiting-human job, so without this a paper whose
-// sign-in the human never finished owns its candidate forever and every claim
-// request answers busy - measured live on three papers, about once a second.
+// escape hatch. A navigated claim stays pinned until the route is either
+// delivered or explicitly abandoned; navigation_error abandons it so the dead
+// surface can close, but Retry still refuses an awaiting-human job. The
+// operator's next Open must therefore start a fresh attempt from that abandoned
+// spent claim.
 func TestStartNextMaterializationAttemptForSpentCandidate(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
-	jobID, _, _ := spentInstitutionalAttempt(t, js, "spent-attempt")
+	jobID, _, claimID := spentInstitutionalAttempt(t, js, "spent-attempt")
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='abandoned' WHERE id=?`, claimID); err != nil {
+		t.Fatal(err)
+	}
 
 	before, err := js.MaterializationAttemptRevision(ctx, jobID)
 	if err != nil {

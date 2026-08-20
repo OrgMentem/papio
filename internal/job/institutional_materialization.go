@@ -622,7 +622,7 @@ func spentMaterializationCandidateTx(ctx context.Context, q dbtx, jobID string, 
 		WHERE cur.status IN ('claimed','materializing')
 		  AND EXISTS (SELECT 1 FROM materialization_claims m
 		    WHERE m.candidate_id=cur.candidate_id
-		      AND m.phase IN ('route_issued','navigated','settled')
+		      AND m.phase IN ('route_issued','navigated','settled','abandoned')
 		      AND m.lease_until IS NOT NULL AND m.lease_until <= ?
 		      AND NOT EXISTS (SELECT 1 FROM effect_permits p
 		        WHERE p.claim_id=m.id AND p.status IN ('held','unknown_completion')))

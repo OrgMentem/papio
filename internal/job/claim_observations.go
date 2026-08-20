@@ -162,9 +162,10 @@ func abandonMaterializationClaimByBindingTx(ctx context.Context, q dbtx, binding
 		return errors.New("binding is required")
 	}
 	_, err := q.ExecContext(ctx, `
-		UPDATE materialization_claims SET phase='abandoned', updated_at=?
+		UPDATE materialization_claims
+		   SET phase='abandoned', lease_until=?, updated_at=?
 		 WHERE binding_id=? AND phase IN ('claimed','bound','route_issued','navigated')`,
-		now, bindingID)
+		now, now, bindingID)
 	return err
 }
 
