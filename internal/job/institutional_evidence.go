@@ -1438,14 +1438,30 @@ func convertAuthenticationEntryLeaseToHumanTx(ctx context.Context, q dbtx, authe
 	if currentObservationID != observed.ObservationID {
 		return ErrAuthenticationEntryLeaseDenied
 	}
+	// `lease_until=NULL` means "never expires", and §4.5 earns that only for a
+	// lease whose surface is BOUND - line 1010's rule exactly: "a reservation
+	// nobody binds is a stalled institution, not a sign-in in progress".
+	// Clearing it unconditionally made an unbound entry immortal, so an
+	// auth_returned that arrived before any bind held the institution's only
+	// slot forever. Measured live 2026-08-20: one such entry refused 71
+	// institutional binds across every other paper at that library, each
+	// logged "another sign-in for this institution is in progress" while
+	// nothing was in progress at all - its owner had no candidate to bind.
+	// An unbound conversion therefore keeps the bind deadline it was
+	// reserved under; binding earns the unbounded human window.
 	res, err := q.ExecContext(ctx, `
 		UPDATE authentication_entry_leases
 		   SET state='human', human_owner_id=?, evidence_observation_id=?,
-		       lease_until=NULL, entitled_at=NULL, updated_at=?
+		       lease_until=CASE
+		         WHEN owner_binding_id IS NULL OR owner_binding_id='' THEN ?
+		         ELSE NULL END,
+		       entitled_at=NULL, updated_at=?
 		 WHERE authentication_claim_id=? AND lease_id=? AND owner_id=?
 		   AND browser_holder_generation=? AND state='reserved'
 		   AND (lease_until IS NULL OR lease_until > ?)`,
-		ownerID, observed.ObservationID, now, authenticationClaimID, leaseID, ownerID,
+		ownerID, observed.ObservationID,
+		time.Now().UTC().Add(AuthenticationEntryBindDeadline).Format(time.RFC3339Nano),
+		now, authenticationClaimID, leaseID, ownerID,
 		holderGeneration, now)
 	if err != nil {
 		return err
@@ -1621,6 +1637,41 @@ func (js *Store) RetireTerminalAuthenticationEntryLeases(ctx context.Context, no
 		        AND p.status IN ('held','unknown_completion')
 		   )`,
 		now.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(affected), nil
+}
+
+// ExpireUnboundAuthenticationEntryLeases releases every institution slot held
+// by an entry that never bound a surface and is past its bind deadline. It
+// returns how many it released.
+//
+// This is line 1010's rule applied on a timer instead of only at the next
+// reservation: an entry with no bound surface is a stalled institution, and
+// nothing can be signing in on a surface that does not exist. It heals two
+// populations - rows written before the conversion above kept the deadline
+// (their `lease_until` is NULL, so no reservation attempt could ever find
+// them expired), and any unbound entry whose deadline simply passed.
+//
+// The `updated_at` bound gives a NULL-lease legacy row the same window a fresh
+// reservation gets, rather than retiring it the instant the daemon starts.
+func (js *Store) ExpireUnboundAuthenticationEntryLeases(ctx context.Context, now time.Time) (int, error) {
+	nowText := now.UTC().Format(time.RFC3339Nano)
+	result, err := js.S.DB().ExecContext(ctx, `
+		UPDATE authentication_entry_leases
+		   SET state='expired', lease_until=NULL, owner_tab_hint=NULL,
+		       entitled_at=NULL, updated_at=?
+		 WHERE state IN ('reserved','human')
+		   AND (owner_binding_id IS NULL OR owner_binding_id='')
+		   AND (lease_until IS NULL OR lease_until <= ?)
+		   AND updated_at <= ?`,
+		nowText, nowText,
+		now.UTC().Add(-AuthenticationEntryBindDeadline).Format(time.RFC3339Nano))
 	if err != nil {
 		return 0, err
 	}

@@ -223,6 +223,133 @@ func TestAuthenticationEntryLeaseReserveExpiryConversionAndRestart(t *testing.T)
 	}
 }
 
+// An auth_returned that lands before any surface is bound must not make the
+// entry immortal. Measured live 2026-08-20: one unbound `human` entry with a
+// NULL lease_until refused 71 institutional binds for every other paper at the
+// operator's library, each logged "another sign-in for this institution is in
+// progress" while its owner had no candidate to bind at all.
+func TestUnboundHumanConversionKeepsTheBindDeadline(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	seedInstitutionProfile(t, js, "profile-unbound")
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE institution_profiles SET authentication_claim_id='claim-unbound' WHERE id='profile-unbound'`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	evidence := ProfileEvidenceObservation{
+		ObservationID: "unbound-evidence", BrowserHolderGeneration: 5,
+		InstitutionProfileID: "profile-unbound", InstitutionProfileRevision: 1,
+		Verdict: ProfileEvidenceAuthReturned, Source: ProfileEvidenceAuthReturn,
+		ProducerObservedAt: now.Add(-time.Second).Format(time.RFC3339Nano),
+		DaemonReceivedAt:   now.Format(time.RFC3339Nano),
+	}
+	if err := js.RecordProfileEvidence(ctx, evidence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-unbound", LeaseID: "lease-unbound", OwnerID: "job-unbound",
+		BrowserHolderGeneration: 5, LeaseUntil: now.Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.ConvertAuthenticationEntryLeaseToHuman(ctx,
+		"claim-unbound", "lease-unbound", "job-unbound", 5, evidence); err != nil {
+		t.Fatal(err)
+	}
+	current, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-unbound")
+	if err != nil || !ok {
+		t.Fatalf("lease = %+v ok=%v err=%v", current, ok, err)
+	}
+	if current.LeaseUntil == "" {
+		t.Fatal("unbound human lease has no deadline: it can never expire, and its institution is held forever")
+	}
+	until, err := time.Parse(time.RFC3339Nano, current.LeaseUntil)
+	if err != nil {
+		t.Fatalf("lease_until %q: %v", current.LeaseUntil, err)
+	}
+	if until.After(now.Add(AuthenticationEntryBindDeadline + 5*time.Second)) {
+		t.Fatalf("unbound human lease holds until %s, want no later than the bind deadline %s",
+			until, now.Add(AuthenticationEntryBindDeadline))
+	}
+
+	// The other half of the rule: a BOUND surface earns the unbounded
+	// human-paced window, so a real sign-in is never cut short.
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx,
+		"claim-unbound", "job-unbound", 5, "binding-unbound", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET state='reserved' WHERE authentication_claim_id='claim-unbound'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.ConvertAuthenticationEntryLeaseToHuman(ctx,
+		"claim-unbound", "lease-unbound", "job-unbound", 5, evidence); err != nil {
+		t.Fatal(err)
+	}
+	bound, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-unbound")
+	if err != nil || !ok {
+		t.Fatalf("bound lease = %+v ok=%v err=%v", bound, ok, err)
+	}
+	if bound.LeaseUntil != "" {
+		t.Fatalf("bound human lease capped at %s, want the unbounded human window", bound.LeaseUntil)
+	}
+}
+
+// The sweep heals a row written before the conversion above kept the deadline:
+// its lease_until is NULL, so no reservation attempt can ever find it expired.
+func TestExpireUnboundAuthenticationEntryLeasesFreesAnImmortalEntry(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	now := time.Now().UTC()
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-immortal", LeaseID: "lease-immortal", OwnerID: "job-immortal",
+		BrowserHolderGeneration: 2, LeaseUntil: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Exactly the live shape: human, unbound, no deadline.
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET state='human', human_owner_id='job-immortal', lease_until=NULL
+		  WHERE authentication_claim_id='claim-immortal'`); err != nil {
+		t.Fatal(err)
+	}
+	// Inside its bind window it is left alone - a bind may still be in flight.
+	if freed, err := js.ExpireUnboundAuthenticationEntryLeases(ctx, now); err != nil || freed != 0 {
+		t.Fatalf("swept an entry inside its bind window: freed=%d err=%v", freed, err)
+	}
+	// A bound entry is never swept, however long it holds.
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx,
+		"claim-immortal", "job-immortal", 2, "binding-immortal", 1); err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(AuthenticationEntryBindDeadline + time.Minute)
+	if freed, err := js.ExpireUnboundAuthenticationEntryLeases(ctx, later); err != nil || freed != 0 {
+		t.Fatalf("swept a bound sign-in: freed=%d err=%v", freed, err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET owner_binding_id=NULL WHERE authentication_claim_id='claim-immortal'`); err != nil {
+		t.Fatal(err)
+	}
+	if freed, err := js.ExpireUnboundAuthenticationEntryLeases(ctx, later); err != nil || freed != 1 {
+		t.Fatalf("unbound entry past its deadline: freed=%d err=%v, want 1", freed, err)
+	}
+	// Freed, so the next paper takes the institution. The fresh reservation is
+	// stamped by the store's own clock, so this asserts against that clock
+	// rather than the synthetic `later` used above: a just-made reservation is
+	// inside its bind window and must survive the sweep.
+	next, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-immortal", LeaseID: "lease-next", OwnerID: "job-next",
+		BrowserHolderGeneration: 2, LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil || next.OwnerID != "job-next" {
+		t.Fatalf("reserve after sweep = %+v, %v", next, err)
+	}
+	if freed, err := js.ExpireUnboundAuthenticationEntryLeases(ctx, time.Now().UTC()); err != nil || freed != 0 {
+		t.Fatalf("swept a just-made reservation: freed=%d err=%v", freed, err)
+	}
+}
+
 func TestAuthenticationEntryLeaseExpiryAllowsNewOwner(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

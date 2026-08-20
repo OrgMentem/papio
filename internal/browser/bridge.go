@@ -9611,6 +9611,12 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		if _, err := b.jobs.RetireTerminalAuthenticationEntryLeases(ctx, b.now()); err != nil {
 			log.Printf("papio: retiring terminal authentication entry leases: %v", err)
 		}
+		// Same class, other half: an entry that never bound a surface cannot
+		// be a sign-in in progress, and one such entry refused 71 binds on
+		// the operator's own machine while reporting exactly that.
+		if _, err := b.jobs.ExpireUnboundAuthenticationEntryLeases(ctx, b.now()); err != nil {
+			log.Printf("papio: expiring unbound authentication entry leases: %v", err)
+		}
 	}
 	if b.materializationRecoveryPending {
 		if err := b.recoverMaterializationFocus(ctx); err != nil {
