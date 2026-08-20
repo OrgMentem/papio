@@ -260,6 +260,40 @@ func TestClassifyOwnershipDegradesWhenLookupFails(t *testing.T) {
 	}
 }
 
+// A discovered work is asked about with every identifier that names it, not
+// just the two a hand-built LookupWork happened to carry. PMID-only records are
+// ordinary in PubMed-sourced discovery, and classifying one as unowned when the
+// library already holds it invites a duplicate acquisition — the outcome
+// ownership classification exists to prevent.
+func TestClassifyOwnershipForwardsEveryIdentifier(t *testing.T) {
+	works := []DiscoveredWork{
+		{Work: work.Work{PMID: "31452104"}},
+		{Work: work.Work{ISBN: "978-0-306-40615-7"}},
+		{Work: work.Work{ArXiv: "2301.08745v2", DOI: "10.1000/both"}},
+	}
+	lookup := &fakeOwnershipLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+		{Status: zotio.OwnershipOwnedWithPDF, ItemKey: "PMID0001"},
+		{Status: zotio.OwnershipOwnedMissingPDF, ItemKey: "ISBN0001"},
+		{Status: zotio.OwnershipNotOwned},
+	}}}
+
+	if warning := ClassifyOwnership(context.Background(), works, lookup); warning != "" {
+		t.Fatalf("warning = %q", warning)
+	}
+	if got := lookup.request.Works[0].PMID; got != "31452104" {
+		t.Fatalf("PMID forwarded = %q, want 31452104", got)
+	}
+	if got := lookup.request.Works[1].ISBN; got != "9780306406157" {
+		t.Fatalf("ISBN forwarded = %q, want the normalized digits", got)
+	}
+	if got := lookup.request.Works[2]; got.ArXiv != "2301.08745v2" || got.DOI != "10.1000/both" {
+		t.Fatalf("third lookup work = %+v", got)
+	}
+	if !works[0].Owned || works[0].OwnedItemKey != "PMID0001" || !works[1].Owned || works[2].Owned {
+		t.Fatalf("classified works = %+v", works)
+	}
+}
+
 func TestSearchClampsLimitsAndRequiresQueryWithoutSnowball(t *testing.T) {
 	var limits []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

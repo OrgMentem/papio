@@ -32,10 +32,16 @@ func planIdempotencyKey(jobID, artifactSHA256, attachmentMode, collection, route
 	return "zotio_plan:" + jobID + ":" + artifactSHA256 + ":" + attachmentMode + ":" + collection + ":" + route
 }
 
-// lookupWorkFrom copies the stable identifiers papio uses for new-item Zotio
+// LookupWorkFrom copies the stable identifiers papio uses for new-item Zotio
 // routing and library ownership checks. Title is deliberately excluded: it
 // describes works rather than asserting identity (ADR-0019).
-func lookupWorkFrom(w work.Work) LookupWork {
+//
+// It is exported because discovery asks the same ownership question about its
+// own results, and it must ask it with the same identifiers. A second hand-built
+// LookupWork in internal/discovery carried only DOI and ArXiv, so a PubMed-only
+// paper already in the library reported as unowned and invited a duplicate
+// acquisition. One converter, one answer.
+func LookupWorkFrom(w work.Work) LookupWork {
 	lw := LookupWork{DOI: w.DOI, ArXiv: w.ArXiv, PMID: w.PMID}
 	if isbn := normalizedISBN(w.ISBN); isbn != "" {
 		lw.ISBN = isbn
@@ -44,7 +50,7 @@ func lookupWorkFrom(w work.Work) LookupWork {
 }
 
 func hasNewItemRoutingIdentifier(w work.Work) bool {
-	lw := lookupWorkFrom(w)
+	lw := LookupWorkFrom(w)
 	return lw.DOI != "" || lw.ArXiv != "" || lw.PMID != "" || lw.ISBN != ""
 }
 

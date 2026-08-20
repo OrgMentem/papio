@@ -33,10 +33,7 @@ func ClassifyOwnership(ctx context.Context, works []DiscoveredWork, lookup Owner
 
 	request := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(works))}
 	for index, discovered := range works {
-		request.Works[index] = zotio.LookupWork{
-			DOI:   discovered.Work.DOI,
-			ArXiv: discovered.Work.ArXiv,
-		}
+		request.Works[index] = zotio.LookupWorkFrom(discovered.Work)
 	}
 	result, err := lookup.LookupWorks(ctx, request)
 	if err != nil {

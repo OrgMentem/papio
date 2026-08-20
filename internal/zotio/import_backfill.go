@@ -457,7 +457,7 @@ func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates
 			continue
 		}
 		batchJobs = append(batchJobs, candidate.JobID)
-		batchWorks = append(batchWorks, lookupWorkFrom(row.Work))
+		batchWorks = append(batchWorks, LookupWorkFrom(row.Work))
 		if len(batchWorks) == batchSize {
 			if !flush() {
 				return nil, false

@@ -534,7 +534,7 @@ func (s *Service) skipOwnedReadyImport(ctx context.Context, jobID string) (statu
 	if strings.TrimSpace(row.ZotioItemKey) != "" {
 		return "", "", false, nil
 	}
-	lookupWork := lookupWorkFrom(row.Work)
+	lookupWork := LookupWorkFrom(row.Work)
 	if lookupWork.DOI == "" && lookupWork.ArXiv == "" && lookupWork.PMID == "" && lookupWork.ISBN == "" {
 		return "", "", false, nil
 	}
