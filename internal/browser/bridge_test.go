@@ -908,6 +908,42 @@ func TestTriageSnapshotReducesMaximalPageToFrameCap(t *testing.T) {
 	t.Fatal("triage snapshot response missing")
 }
 
+// nextSnapshotLimit only decides how fast the search for a fitting page
+// converges, so the properties that matter are that it always makes progress
+// (or the loop spins forever) and never proposes a page as large as the one
+// that just overflowed (same). Landing near the right size is the performance
+// claim; the caller re-measures, so overshooting is merely another pass.
+func TestNextSnapshotLimitAlwaysMakesProgress(t *testing.T) {
+	cap := protocol.MaxBrowserMessageBytes
+	for _, tc := range []struct {
+		name  string
+		items int
+		size  int
+		want  int
+	}{
+		{"barely over the cap steps down by one", 100, cap + 1, 99},
+		{"three times over lands near a third", 99, cap * 3, 33},
+		{"ten times over lands near a tenth", 100, cap * 10, 10},
+		{"a page that fits is still forced downward", 100, cap - 1, 99},
+		{"two items cannot propose two", 2, cap * 9, 1},
+		{"one item is already the floor", 1, cap * 9, 1},
+		{"an unmeasurable frame falls back to the floor", 50, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := nextSnapshotLimit(tc.items, tc.size)
+			if got != tc.want {
+				t.Fatalf("nextSnapshotLimit(%d, %d) = %d, want %d", tc.items, tc.size, got, tc.want)
+			}
+			if got >= tc.items && tc.items > 1 {
+				t.Fatalf("no progress: %d proposed for %d items", got, tc.items)
+			}
+			if got < 1 {
+				t.Fatalf("proposed an empty page: %d", got)
+			}
+		})
+	}
+}
+
 func TestTriageSnapshotNegotiatesSchema2AccessClassification(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := park(t, jobs, "wr_snapshot_schema", handoffWork())
@@ -2144,17 +2180,27 @@ func TestFocusHandoffsEmitsOnceAtAndAboveExtensionFloor(t *testing.T) {
 func TestFocusHandoffsOffersTargetOutsidePollPage(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
+	// The premise this test's name claims: the target lies beyond the page the
+	// ordinary pass would offer. That pass takes oldest-first and stops at
+	// maxOutstandingOffers, so a page's worth of OLDER papers puts a freshly
+	// parked target out of reach — and the premise is now asserted below
+	// instead of tolerated. It used to age the target 48h *older*, which put it
+	// first in line, then accept either outcome; 200 filler papers bought
+	// nothing (the assertions passed with three) while costing ~7s of the
+	// package under -race.
+	for i := range maxOutstandingOffers + 1 {
+		id := park(t, jobs, job.NewID("wr_focus_poll_page"), handoffWork())
+		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
+			time.Now().UTC().Add(-time.Duration(48+i)*time.Hour).Format(time.RFC3339Nano), id); err != nil {
+			t.Fatal(err)
+		}
+	}
 	target := park(t, jobs, "wr_focus_outside_poll_page", handoffWork())
-	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
-		time.Now().UTC().Add(-48*time.Hour).Format(time.RFC3339Nano), target); err != nil {
-		t.Fatal(err)
-	}
-	for range 200 {
-		park(t, jobs, job.NewID("wr_focus_poll_page"), handoffWork())
-	}
 
 	runSync(t, b, hello())
-	targetInitiallyOffered := b.offered[target]
+	if b.offered[target] {
+		t.Fatal("the ordinary pass offered the target, so nothing here exercises a focus request reaching past the page")
+	}
 	queued, sessionLive, err := b.FocusHandoffs(ctx, []string{target})
 	if err != nil {
 		t.Fatal(err)
@@ -2162,8 +2208,9 @@ func TestFocusHandoffsOffersTargetOutsidePollPage(t *testing.T) {
 	if !sessionLive || queued != 1 {
 		t.Fatalf("focus result = queued:%d live:%t, want 1,true", queued, sessionLive)
 	}
-	// If the oldest-first ordinary pass already offered the target, preserve
-	// that offer while freeing a different slot for the focus request.
+	// The ordinary pass filled every slot with the older papers, so free one:
+	// a focus request is a priority claim on a slot, not a way to exceed the
+	// transport budget.
 	b.mu.Lock()
 	for id := range b.offered {
 		if id == target {
@@ -2187,8 +2234,8 @@ func TestFocusHandoffsOffersTargetOutsidePollPage(t *testing.T) {
 			focused = true
 		}
 	}
-	if !focused || (!targetInitiallyOffered && !offered) {
-		t.Fatalf("focus frames initially_offered:%t offered:%t focused:%t", targetInitiallyOffered, offered, focused)
+	if !focused || !offered {
+		t.Fatalf("focus frames offered:%t focused:%t, want both", offered, focused)
 	}
 }
 
@@ -12055,13 +12102,30 @@ func TestSurfacePresenceLeaseContract(t *testing.T) {
 
 	bounded, _, _, _ := newBridge(t)
 	runSync(t, bounded, hello())
-	for i := range maxPresenceLeases + 20 {
-		id := fmt.Sprintf("bounded-%03d", i)
-		msgs, _ := runSync(t, bounded, inFrame(t, protocol.MsgSurfacePresence, "", protocol.SurfacePresencePayload{
-			RequestID: "presence-" + id, InstanceID: id, Surface: "popup", Focused: false, At: "2026-08-12T10:02:00Z",
-		}))
-		if firstOfType(msgs, protocol.MsgSurfacePresenceAck) == nil {
-			t.Fatalf("bounded presence ack missing: %v", msgs)
+	// The cap is per-frame bookkeeping, not per-Sync, and none of these frames
+	// depends on the clock moving between them — so they ride in batches. One
+	// Sync per frame cost ~280 round trips here (and ~1,000 across this test,
+	// 18s of the package under -race) to make a claim about 256 leases. Batches
+	// stay small because one response must still fit ipc.MaxResultBytes.
+	const presenceBatch = 32
+	overCap := maxPresenceLeases + 20
+	for start := 0; start < overCap; start += presenceBatch {
+		frames := make([]json.RawMessage, 0, presenceBatch)
+		for i := start; i < min(start+presenceBatch, overCap); i++ {
+			frames = append(frames, inFrame(t, protocol.MsgSurfacePresence, "", protocol.SurfacePresencePayload{
+				RequestID: fmt.Sprintf("presence-bounded-%03d", i), InstanceID: fmt.Sprintf("bounded-%03d", i),
+				Surface: "popup", Focused: false, At: "2026-08-12T10:02:00Z",
+			}))
+		}
+		msgs, _ := runSync(t, bounded, frames...)
+		acks := 0
+		for _, msg := range msgs {
+			if msg.Type == protocol.MsgSurfacePresenceAck {
+				acks++
+			}
+		}
+		if acks != len(frames) {
+			t.Fatalf("bounded presence acks = %d for %d frames: %v", acks, len(frames), msgs)
 		}
 	}
 	bounded.mu.Lock()
@@ -12074,7 +12138,12 @@ func TestSurfacePresenceLeaseContract(t *testing.T) {
 	churn, _, _, _ := newBridge(t)
 	churnAdvance := settableClock(churn)
 	runSync(t, churn, hello())
-	for i := range maxPresenceLeases * 3 {
+	// This loop cannot batch: expiring each lease before the next arrives is
+	// the whole claim, and one Sync reads the clock once. It does not need
+	// three times the cap to make that claim either — an implementation that
+	// failed to prune would be caught on the second pass, and exceeding the cap
+	// covers any interaction with eviction.
+	for i := range maxPresenceLeases + 8 {
 		id := fmt.Sprintf("churn-%03d", i)
 		msgs, _ := runSync(t, churn, inFrame(t, protocol.MsgSurfacePresence, "", protocol.SurfacePresencePayload{
 			RequestID: "presence-" + id, InstanceID: id, Surface: "popup", Focused: false, At: "2026-08-12T10:02:00Z",

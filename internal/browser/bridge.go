@@ -3887,7 +3887,8 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 			return b.unavailable(request.RequestID, "triage_unavailable", "the triage inbox is temporarily unavailable", "triage snapshot", err)
 		}
 		payload := b.triageSnapshotPayload(ctx, request.RequestID, request.SchemaVersions[0], snapshot)
-		if b.frameFits(protocol.MsgTriageSnapshotResponse, payload) {
+		size, fits := b.frameSize(protocol.MsgTriageSnapshotResponse, payload)
+		if fits {
 			frame, err := b.frame(protocol.MsgTriageSnapshotResponse, "", payload)
 			if err != nil {
 				return nil, err
@@ -3898,8 +3899,34 @@ func (b *Bridge) triageSnapshot(ctx context.Context, request *protocol.TriageSna
 			return b.unavailable(request.RequestID, "triage_snapshot_too_large", "the triage inbox item is too large to display", "triage snapshot",
 				fmt.Errorf("triage snapshot item exceeds browser frame cap %d", protocol.MaxBrowserMessageBytes))
 		}
-		limit = int64(len(snapshot.Items) - 1)
+		limit = int64(nextSnapshotLimit(len(snapshot.Items), size))
 	}
+}
+
+// nextSnapshotLimit proposes the page size to retry an overflowing snapshot
+// with. Retiring one item per pass is what this replaces, and it was quadratic
+// in the worst case: every pass re-queries the service AND re-validates every
+// surviving item through a full protocol round trip, so a page three times over
+// the cap paid ~2/3 of len(items)^2 validations to walk down one item at a time.
+// Scaling by the observed overage lands on a fitting page in a pass or two.
+//
+// This changes only how fast the search converges, never what ships: the caller
+// still asks the service for a real page at the proposed size and still
+// re-validates and re-measures it, so an estimate that is too generous simply
+// costs one more pass. The floor of one guarantees progress, and the caller
+// refuses a single item that cannot fit on its own.
+func nextSnapshotLimit(items, size int) int {
+	if items <= 1 || size <= 0 {
+		return 1
+	}
+	scaled := items * protocol.MaxBrowserMessageBytes / size
+	if scaled >= items {
+		scaled = items - 1
+	}
+	if scaled < 1 {
+		scaled = 1
+	}
+	return scaled
 }
 
 // triageSnapshotPayload builds one schema's wire shape from a triage
@@ -4976,7 +5003,10 @@ func (b *Bridge) reviewPreviewError(requestID, detail string) ([]json.RawMessage
 	return []json.RawMessage{frame}, nil
 }
 
-func (b *Bridge) frameFits(msgType string, payload any) bool {
+// frameSize reports the encoded size of one outbound frame and whether it fits
+// the native-messaging cap. The size is what lets an overflowing page be
+// resized in proportion to its overage instead of one item at a time.
+func (b *Bridge) frameSize(msgType string, payload any) (int, bool) {
 	raw, err := json.Marshal(map[string]any{
 		"protocol": protocol.BrowserProtocolVersion,
 		"type":     msgType,
@@ -4984,7 +5014,15 @@ func (b *Bridge) frameFits(msgType string, payload any) bool {
 		"seq":      b.seq + 1,
 		"payload":  payload,
 	})
-	return err == nil && len(raw) <= protocol.MaxBrowserMessageBytes
+	if err != nil {
+		return 0, false
+	}
+	return len(raw), len(raw) <= protocol.MaxBrowserMessageBytes
+}
+
+func (b *Bridge) frameFits(msgType string, payload any) bool {
+	_, fits := b.frameSize(msgType, payload)
+	return fits
 }
 func (b *Bridge) pageAcquire(ctx context.Context, payload *protocol.PageAcquirePayload) ([]json.RawMessage, error) {
 	request, err := pageAcquireRequest(payload)
