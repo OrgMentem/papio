@@ -1315,23 +1315,48 @@ reserved entry on the owner JOB exactly so a sign-in survives a worker restart,
 and `TestClaimObservationSurvivesAReconnectSinceArbitration` caught that
 mistake once already. A lease outliving its binding's claim is correct.
 
-### Open: the legacy offer loop has no institution serialization
+12. **`aeb3783` — one sign-in per institution, at the offer.** The churn was
+    entirely daemon-side and needed no timer. A bind refused with "another
+    sign-in for this institution is in progress" clears the daemon's
+    materialization tracking, so the very next poll re-offers the same
+    candidate, and the extension polls several times a second. Each offer built
+    a scaffold tab and tore it down again. The gate now sits at the single
+    chokepoint both offer loops share, `serviceMaterializationCandidate`,
+    immediately before the frame is built.
 
-`d95ccbd` did NOT stop the live churn — still 108 refusals per 40s after
-deploying and reloading. Measured cause: only bind refusals appear in the log,
-never claim requests, and both jobs' candidates carry the same
-`authentication_claim_id` and matching profile revisions as the slot holder. So
-the claim-paced gate never sees these candidates — they are not in its
-`scheduled` page — and the offers come from the legacy loop, which has no
-institution-slot awareness of any kind. The extension then re-enters
-materialization from its existing claim and re-binds.
+**Measured, live, on the operator's machine.** Before: 549 candidate offers in
+30 seconds (18/s) across three papers at one institution, 108 bind refusals per
+40s, three `papio — materialization` scaffold tabs churning. After: **0 refusals
+in 40s, 0 in the following 60s, 0 new claims, and no scaffold tabs at all.** One
+paper works through its provider; the sign-in landed (`entitled_at` set) and the
+other 20 eligible candidates queue behind the one-drive-at-a-time limit, which
+is intended pacing, not a stall.
 
-The fix is therefore not another park hand-off: **the legacy offer loop needs
-the same institution gate the claim-paced path has.** Do that next and
-re-measure the 40s refusal count against 108 — a good instrument, unlike the
-journal count, because it moves continuously.
+### How the diagnosis went wrong twice, and what fixed it
 
-The churn self-limits when the slot holder's lease expires (30 minutes), so it
-is bounded per institution rather than unbounded. It is still 2.7 browser tabs
-built and destroyed per second while it lasts, which is the operator's original
-complaint in its purest measured form.
+Round 11 blamed the legacy offer loop and shipped a park hand-off to it. That
+was necessary but not the cause, and the reasoning failure is worth keeping:
+**offers are not logged, so their absence from the log was read as their
+absence.** Two rounds of inference followed from that — "no offers, therefore
+the extension self-restarts" — and both were wrong. One temporary `log.Printf`
+at the emission site answered the question in 30 seconds. When a subsystem's
+behaviour is disputed, instrument the disputed edge before building on either
+story.
+
+Second trap, in the test rather than the code: `poll` rewrites a profile's
+`authentication_claim_id` when it reconciles institution profiles, and it
+reconciles only on the candidate-preparation path. So a lease reserved before
+the first poll that carries a candidate is reserved under a name the gate never
+looks up, and **three successive versions of the regression test were green
+against a lease nobody could see.** The shipped test forces one poll with a
+candidate present, then reads the settled claim id, then reserves — and it fails
+with the gate removed.
+
+### Open (low priority, not a loop)
+
+Two `claim observation challenge ... not applied: rejected (no live reserved
+entry for this owner)` lines appear when a `challenge` observation arrives after
+the entry lease has already transitioned to `human`
+(`claim_observation_apply.go:165-168` requires `reserved`). Exactly two lines,
+not a spin, but it means a provider challenge seen on a landed sign-in is
+dropped rather than recorded.
