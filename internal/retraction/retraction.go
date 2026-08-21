@@ -54,6 +54,7 @@ type Finding struct {
 	Nature    Nature    `json:"nature"`
 	NoticedAt time.Time `json:"noticed_at"`
 	NoticeDOI string    `json:"notice_doi,omitempty"`
+	Title     string    `json:"title,omitempty"`
 }
 
 // HTTPClient is the injected dependency used for Crossref metadata requests.
@@ -146,7 +147,7 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		return nil
 	}
 
-	dois, err := s.readyDOIs(ctx)
+	readyWorks, err := s.readyWorks(ctx)
 	if err != nil {
 		return err
 	}
@@ -159,7 +160,8 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	}
 	var firstLookupErr error
 	failedLookups := 0
-	for _, doi := range dois {
+	for _, ready := range readyWorks {
+		doi := ready.DOI
 		if err := s.budgets.Acquire(ctx, config.SourceRetractionWatch, s.policy, 0); err != nil {
 			return fmt.Errorf("retraction: acquire Crossref budget: %w", err)
 		}
@@ -177,19 +179,28 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 			continue
 		}
 		for _, update := range updates {
-			finding := Finding{DOI: doi, Nature: update.Nature, NoticeDOI: update.NoticeDOI}
+			title := ready.Title
+			if title == "" {
+				title = update.Title
+			}
+			finding := Finding{DOI: doi, Nature: update.Nature, NoticeDOI: update.NoticeDOI, Title: title}
 			key := findingKey(finding)
 			if old, exists := previous[key]; exists {
 				finding.NoticedAt = old.NoticedAt
+				if finding.Title == "" {
+					finding.Title = old.Title
+				}
 			} else {
 				finding.NoticedAt = now
 			}
 			addCurrent(finding)
 		}
 	}
-	if len(dois) > 0 && failedLookups == len(dois) {
+	if len(readyWorks) > 0 && failedLookups == len(readyWorks) {
 		return firstLookupErr
 	}
+	// The rest of the sweep commits the current notices and preserves their
+	// first-seen timestamps exactly as before.
 
 	findings := make([]Finding, 0, len(current))
 	for _, finding := range current {
@@ -289,10 +300,14 @@ func (s *Sentinel) SnapshotItems(ctx context.Context, tx *sql.Tx) ([]triage.Item
 			continue
 		}
 		seenNotices[noticeKey(finding)] = true
+		title := strings.TrimSpace(finding.Title)
+		if title == "" {
+			title = "Library update notice"
+		}
 		items = append(items, triage.Item{
 			Kind:  triage.KindRetraction,
 			ID:    triage.RetractionIDPrefix + finding.DOI,
-			Title: "Library update notice",
+			Title: title,
 			Facts: []triage.Fact{{Label: "Nature", Text: string(finding.Nature)}},
 			Links: []triage.Link{{Rel: "doi", URL: "https://doi.org/" + finding.DOI}},
 			Ops:   []string{"dismiss", "open"},
@@ -410,45 +425,60 @@ func (s *Sentinel) pruneAcks(ctx context.Context, current map[string]Finding) er
 	return nil
 }
 
-func (s *Sentinel) readyDOIs(ctx context.Context) ([]string, error) {
+type readyWork struct {
+	DOI   string
+	Title string
+}
+
+func (s *Sentinel) readyWorks(ctx context.Context) ([]readyWork, error) {
 	rows, err := s.store.DB().QueryContext(ctx, `
-		SELECT DISTINCT i.value
+		SELECT i.value, COALESCE(w.title, '')
 		  FROM jobs j
+		  JOIN work_requests w ON w.id = j.work_request_id
 		  JOIN identifiers i ON i.work_request_id = j.work_request_id
 		  JOIN artifacts a ON a.sha256 = j.artifact_sha256
 		 WHERE j.state IN ('ready','imported') AND i.kind = 'doi'
-		 ORDER BY i.value`)
+		 ORDER BY i.value, w.title`)
 	if err != nil {
 		return nil, fmt.Errorf("retraction: query ready library DOIs: %w", err)
 	}
 	defer rows.Close()
-	seen := make(map[string]bool)
-	var dois []string
+	byDOI := make(map[string]readyWork)
 	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		var raw, title string
+		if err := rows.Scan(&raw, &title); err != nil {
 			return nil, err
 		}
 		doi, err := work.NormalizeDOI(raw)
-		if err == nil && !seen[doi] {
-			seen[doi] = true
-			dois = append(dois, doi)
+		if err != nil {
+			continue
+		}
+		title = strings.TrimSpace(title)
+		ready, exists := byDOI[doi]
+		if !exists || (ready.Title == "" && title != "") {
+			byDOI[doi] = readyWork{DOI: doi, Title: title}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	sort.Strings(dois)
-	return dois, nil
+	works := make([]readyWork, 0, len(byDOI))
+	for _, ready := range byDOI {
+		works = append(works, ready)
+	}
+	sort.Slice(works, func(i, j int) bool { return works[i].DOI < works[j].DOI })
+	return works, nil
 }
 
 type update struct {
 	Nature    Nature
 	NoticeDOI string
+	Title     string
 }
 
 type response struct {
 	Message struct {
+		Title    []string `json:"title"`
 		UpdateTo []struct {
 			DOI     string `json:"DOI"`
 			Updated string `json:"updated"`
@@ -497,8 +527,15 @@ func (s *Sentinel) lookup(ctx context.Context, doi string) ([]update, error) {
 	if err := decodeBoundedJSON(resp.Body, s.maxBody, &payload); err != nil {
 		return nil, fmt.Errorf("retraction: invalid Crossref response: %w", err)
 	}
+	title := ""
+	for _, candidate := range payload.Message.Title {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			title = candidate
+			break
+		}
+	}
 	updates := make([]update, 0, len(payload.Message.UpdateTo))
-	seen := make(map[string]bool, len(payload.Message.UpdateTo))
+	seen := make(map[string]bool)
 	for _, record := range payload.Message.UpdateTo {
 		nature, ok := parseNature(record.Updated)
 		if !ok {
@@ -516,7 +553,7 @@ func (s *Sentinel) lookup(ctx context.Context, doi string) ([]update, error) {
 			continue
 		}
 		seen[key] = true
-		updates = append(updates, update{Nature: nature, NoticeDOI: noticeDOI})
+		updates = append(updates, update{Nature: nature, NoticeDOI: noticeDOI, Title: title})
 	}
 	return updates, nil
 }

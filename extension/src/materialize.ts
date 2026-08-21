@@ -11,9 +11,9 @@ const fragment = location.hash.startsWith("#") ? location.hash.slice(1) : "";
 if (BINDING_ID.test(fragment)) {
   statusMarker.dataset.state = "valid";
   statusMarker.dataset.bindingId = fragment;
-  statusMarker.textContent = "Materialization binding ready";
+  statusMarker.textContent = "This papio access tab is ready — return to your paper.";
 } else {
   statusMarker.dataset.state = "invalid";
   statusMarker.removeAttribute("data-binding-id");
-  statusMarker.textContent = "Invalid materialization binding";
+  statusMarker.textContent = "This access tab is no longer valid — you can close it.";
 }

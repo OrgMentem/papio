@@ -633,7 +633,7 @@ export function computeBadge(state: BadgeState): BadgeResult {
     return {
       text: "",
       color: "#1a73e8",
-      tooltip: "Many decisions waiting — open inbox",
+      tooltip: "papio: Many decisions waiting — open inbox",
     };
   }
   if (requiredCount > 0) {

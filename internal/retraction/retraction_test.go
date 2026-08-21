@@ -110,6 +110,9 @@ func TestSweepExposesRecognizedNotices(t *testing.T) {
 				t.Fatalf("items = %#v, want one", items)
 			}
 			item := items[0]
+			if item.Title != "Library work" {
+				t.Fatalf("item title = %q, want local library title", item.Title)
+			}
 			if item.ID != "retraction:10.1234/original" || item.Kind != "retraction" || item.Retraction == nil {
 				t.Fatalf("item core = %+v", item)
 			}
@@ -123,6 +126,55 @@ func TestSweepExposesRecognizedNotices(t *testing.T) {
 				t.Fatalf("budget acquires = %d, want 1", budget.acquires)
 			}
 		})
+	}
+}
+
+func TestSweepUsesCrossrefTitleWhenLibraryTitleUnknown(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/untitled", 1)
+	if _, err := jobs.DB().ExecContext(ctx, `UPDATE work_requests SET title = NULL WHERE id = ?`, "wr_retraction_01"); err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`{"message":{"title":["Crossref paper title"],"update-to":[{"DOI":"10.2000/notice","updated":"retraction"}]}}`))
+	}))
+	defer server.Close()
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(),
+	})
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("items = %#v, err = %v", items, err)
+	}
+	if items[0].Title != "Crossref paper title" || requests != 1 {
+		t.Fatalf("title/requests = %q/%d, want Crossref title and one lookup", items[0].Title, requests)
+	}
+}
+
+func TestSnapshotFallsBackForOldCacheWithoutTitle(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	sentinel := New(Options{Store: jobs, DataDir: t.TempDir()})
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	finding := Finding{DOI: "10.1234/old", Nature: NatureRetraction, NoticeDOI: "10.2000/notice", NoticedAt: now}
+	sentinel.mu.Lock()
+	err := sentinel.writeCache(cache{
+		Version: cacheVersion, CheckedAt: now, Notices: map[string]Finding{findingKey(finding): finding},
+	})
+	sentinel.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 || items[0].Title != "Library update notice" {
+		t.Fatalf("items = %#v, err = %v", items, err)
 	}
 }
 
@@ -284,7 +336,7 @@ func TestSweepCommitsPartialResultsAndRetainsFailedDOI(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	previous := Finding{
 		DOI: "10.1234/failing", Nature: NatureRetraction, NoticeDOI: "10.2000/previous",
-		NoticedAt: now.Add(-48 * time.Hour),
+		Title: "Previously known paper", NoticedAt: now.Add(-48 * time.Hour),
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/10.1234/failing" {
@@ -324,7 +376,7 @@ func TestSweepCommitsPartialResultsAndRetainsFailedDOI(t *testing.T) {
 	if got := persisted.Notices[findingKey(previous)]; got != previous {
 		t.Fatalf("carried finding = %#v, want %#v", got, previous)
 	}
-	fresh := Finding{DOI: "10.1234/fresh", Nature: NatureCorrection, NoticeDOI: "10.2000/fresh", NoticedAt: now}
+	fresh := Finding{DOI: "10.1234/fresh", Nature: NatureCorrection, NoticeDOI: "10.2000/fresh", Title: "Library work", NoticedAt: now}
 	if got := persisted.Notices[findingKey(fresh)]; got != fresh {
 		t.Fatalf("fresh finding = %#v, want %#v", got, fresh)
 	}

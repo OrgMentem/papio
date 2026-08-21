@@ -159,7 +159,7 @@ func TestInboxRetractionRowStripsTerminalControlBytes(t *testing.T) {
 				Counts: triage.Counts{PendingTotal: 1},
 				Items: []triage.Item{{
 					Kind: triage.KindRetraction, ID: "retraction:1:" + tc.doi, Rank: 3_000_000,
-					Title: "Library update notice", Facts: []triage.Fact{}, Ops: []string{"dismiss"},
+					Title: "Retracted work", Facts: []triage.Fact{}, Ops: []string{"dismiss"},
 					Retraction: &triage.Retraction{DOI: tc.doi, Nature: "retraction", NoticedAt: now},
 				}},
 			}

@@ -196,6 +196,46 @@ test("renders an ungranted switch for every registered adapter host", async () =
   }
 });
 
+test("a permission row spends one visible line and keeps the exact pattern reachable", async () => {
+  const page = await optionsDocument();
+  const origin = "https://*.journals.sagepub.com/*";
+  const row = sourceRow(page.document, "sources", origin);
+  expect(row).toBeDefined();
+
+  // Hover and keyboard focus both read the pattern off the row itself.
+  expect(row?.getAttribute("data-tip")).toBe(origin);
+
+  // The friendly label is the only line that costs pixels.
+  const label = row?.querySelector(".source-label") as HTMLElement;
+  expect(label.textContent).toBe("SAGE Journals");
+  const host = row?.querySelector(".source-host") as HTMLElement;
+  expect(host.textContent).toBe(origin);
+  const hostStyle = page.document.defaultView!.getComputedStyle(host);
+  expect(hostStyle.position).toBe("absolute");
+  expect(hostStyle.height).toBe("1px");
+  expect(hostStyle.clipPath).toBe("inset(50%)");
+
+  // Off-screen, never out of the accessibility tree.
+  expect(host.getAttribute("aria-hidden")).toBeNull();
+  expect(host.hidden).toBe(false);
+
+  // The switch's accessible name still carries friendly name and pattern.
+  const name = row?.querySelector("button[role='switch']")?.getAttribute("aria-label");
+  expect(name).toBe(`Access to SAGE Journals (${origin})`);
+});
+
+test("a row with no switch still exposes its pattern to hover and assistive tech", async () => {
+  const page = await optionsDocument({ origins: [ALL_SITES_ORIGIN] });
+  const origin = "https://*.journals.sagepub.com/*";
+  const row = sourceRow(page.document, "sources", origin);
+
+  expect(row?.querySelector("button[role='switch']")).toBeNull();
+  expect(row?.getAttribute("data-tip")).toBe(origin);
+  expect(row?.querySelector(".source-host")?.getAttribute("aria-hidden")).toBeNull();
+  // The consequence copy is not a pattern restatement, so it stays visible.
+  expect(row?.querySelector(".hint")?.textContent).toContain("Covered by all-sites access");
+});
+
 test("derives unique origins and retains every PsycNet host", async () => {
   const page = await optionsDocument();
 
@@ -351,6 +391,20 @@ test("scanner allowlist lists each origin with its own Stop allowing control", a
   expect(row).toBeDefined();
   const button = row?.querySelector("button");
   expect(button?.textContent).toBe("Stop allowing");
+});
+
+test("a scanner allowlist row shows the host once and keeps the exact origin reachable", async () => {
+  const origin = "https://journals.example";
+  const page = await optionsDocument({ scannerAllowlistOrigins: [origin] });
+  const row = scannerRow(page.document, origin);
+
+  expect(row?.querySelector(".source-label")?.textContent).toBe("journals.example");
+  expect(row?.getAttribute("data-tip")).toBe(origin);
+  expect(row?.querySelector(".source-host")?.textContent).toBe(origin);
+  expect(row?.querySelector(".source-host")?.getAttribute("aria-hidden")).toBeNull();
+  expect(row?.querySelector("button")?.getAttribute("aria-label")).toBe(
+    `Stop allowing page scanning on ${origin}`,
+  );
 });
 
 test("successful scanner revocation removes only that row", async () => {

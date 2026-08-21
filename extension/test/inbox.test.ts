@@ -304,7 +304,7 @@ function flush(window: Window): void {
   window.dispatchEvent(new window.Event("pagehide"));
 }
 
-test("keeps inventory on the counts line and liveness on the pulse line", async () => {
+test("keeps the turn count on the counts line, inventory on the tabs, and liveness on the pulse line", async () => {
   const fixture = snapshot([], {
     counts: counts({ pending_total: 116, turns_required: 34, actions: 0, jobs_working: 116, watch_hits: 0, retractions: 0 }),
   });
@@ -331,8 +331,10 @@ test("keeps inventory on the counts line and liveness on the pulse line", async 
     return snapshotReply(fixture, message);
   });
   const idleCounts = idlePage.document.getElementById("inbox-counts")?.textContent ?? "";
-  expect(idleCounts).toContain("116 open");
-  expect(idleCounts).toContain("34 need you");
+  // The tabs already carry pending inventory, so the header must not repeat it.
+  expect(idleCounts).toBe("34 need you");
+  expect(idleCounts).not.toContain("116");
+  expect(idleCounts).not.toMatch(/open|for reference/);
   expect(idleCounts).not.toMatch(/working on|working through/);
   expect(idlePage.document.getElementById("inbox-pulse")?.hidden).toBe(true);
 
@@ -343,6 +345,52 @@ test("keeps inventory on the counts line and liveness on the pulse line", async 
   expect(movingPage.document.getElementById("inbox-counts")?.textContent).not.toContain("working on");
   expect(movingPage.document.getElementById("inbox-pulse")?.textContent).toContain("papio is working on 7");
   expect(movingPage.document.getElementById("inbox-pulse")?.textContent).not.toContain("116");
+});
+
+// The counts line is the only place the effective turn total appears, so every
+// way the daemon can withhold or qualify it has to reach the operator intact.
+test("names an unreported turn total instead of rendering it as zero", async () => {
+  // A daemon that never negotiated counts-v3 sends inventory without
+  // turns_required. There are five open actions; "Nothing needs you" would be
+  // a lie and "0 need you" would be an invented number.
+  const fixture = snapshot([], {
+    counts: counts({ pending_total: 5, actions: 5, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const line = page.document.getElementById("inbox-counts")?.textContent ?? "";
+  expect(line).toBe("papio hasn't reported how many need you");
+  expect(line).not.toMatch(/\d/);
+  // The inventory the daemon did send still reaches the operator on the tabs.
+  expect(page.document.getElementById("actions-tab")?.textContent).toBe("Actions (5)");
+});
+
+test("keeps the exact turn total when the daemon omits the per-turn projection", async () => {
+  // required_turns_complete=false drops the item-level list only; the daemon
+  // keeps the attention count exact (internal/triage/triage.go). Only the
+  // toolbar badge suppresses the number there, and for its own reason.
+  const fixture = snapshot([], {
+    counts: counts({
+      pending_total: 1300,
+      turns_required: 1290,
+      required_turns_complete: false,
+      actions: 1300,
+      watch_hits: 0,
+      retractions: 0,
+    }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  expect(page.document.getElementById("inbox-counts")?.textContent).toBe("1290 need you");
+});
+
+test("says nothing needs you when the daemon reports zero turns beside open references", async () => {
+  // Zero turns is not an empty inbox: four watch hits stay on their tab. The
+  // old "No open items" line claimed the whole inventory was clear.
+  const fixture = snapshot([], {
+    counts: counts({ pending_total: 4, turns_required: 0, actions: 0, watch_hits: 4, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  expect(page.document.getElementById("inbox-counts")?.textContent).toBe("Nothing needs you");
+  expect(page.document.getElementById("watch-tab")?.textContent).toBe("Watch hits (4)");
 });
 
 test("renders rank-ordered bands, label:text facts, and only safe HTTPS links", async () => {
@@ -532,10 +580,11 @@ test("hoists one byte-identical family instruction above its ranked rows", async
 });
 
 // Reproduces the live defect: a two-row family followed by two singleton
-// families. A singleton hoists no heading, so keying card edges on sibling type
-// swept the headingless rows into the family's card, where a heading reading
-// "2 papers" sat above four rows of three different kinds.
-test("a singleton family starts its own card instead of joining the block above", async () => {
+// families. Keying card edges on sibling type swept the singletons into the
+// pair's card, where a heading reading "2 papers" sat above four rows of three
+// different kinds. Each block now heads its own card, singleton or not, so the
+// count above a card is always the count of that card.
+test("a singleton family starts its own card under its own heading", async () => {
   const family = [1, 2].map((rank) => {
     const item = manualAction(`action:pair-${rank}`, rank, `Paired paper ${rank}`);
     item.run_key = "run_pair";
@@ -583,11 +632,21 @@ test("a singleton family starts its own card instead of joining the block above"
 
   const rows = Array.from(page.document.querySelectorAll<HTMLElement>("[data-triage-item-id]"));
   expect(rows).toHaveLength(4);
-  // The pair shares one card; each singleton is its own.
+  // Each block is one card, and each card is headed by its own count.
   expect(rows.map((row) => row.dataset.cardStart ?? "")).toEqual(["true", "", "true", "true"]);
   expect(rows.map((row) => row.dataset.cardEnd ?? "")).toEqual(["", "true", "true", "true"]);
-  // Exactly one heading, and it must not sit above the singletons.
-  expect(page.document.querySelectorAll(".family-heading")).toHaveLength(1);
+  expect(Array.from(page.document.querySelectorAll(".family-heading"), (node) => node.textContent)).toEqual([
+    "Manual downloads · 2 papers",
+    "Manual downloads · 1 paper",
+    "Manual downloads · 1 paper",
+  ]);
+  // No heading may claim rows that belong to the block below it: every header
+  // is immediately followed by the first row of its own card.
+  for (const header of Array.from(page.document.querySelectorAll(".family-header"))) {
+    let sibling = header.nextElementSibling;
+    while (sibling !== null && !sibling.classList.contains("triage-item")) sibling = sibling.nextElementSibling;
+    expect((sibling as HTMLElement | null)?.dataset.cardStart).toBe("true");
+  }
 });
 
 type GuidanceVariant = NonNullable<TriageSnapshotItem["guidance_variant"]>;
@@ -700,14 +759,70 @@ test("a rejected file cannot be mistaken for an ordinary manual download", async
   expect(copy).not.toContain("papio takes it from there");
 });
 
-test("a lone rejected-file row keeps its own imperative without a family", async () => {
+// A lone gate row used to arrive with no instruction at all: the per-row path
+// has no case for a security check, publisher terms or an institution sign-in,
+// and the block path refused to render under two rows. The header now renders
+// at any count, and its one-row wording never claims a plural.
+test("a lone family row is headed and instructed at one paper", async () => {
   const page = await inboxDocument((message) =>
     snapshotReply(manualFamilyFixture("manual_download_rejected_file", [null]), message));
 
-  expect(page.document.querySelectorAll(".family-heading")).toHaveLength(0);
-  expect(page.document.querySelector(".item-guidance")?.firstChild?.textContent).toBe(
+  expect(page.document.querySelector(".family-heading")?.textContent).toBe("Replace rejected files · 1 paper");
+  expect(page.document.querySelector(".family-guidance")?.textContent).toBe(
     "The file papio adopted was not the paper. Download a different PDF.",
   );
+  // One instruction, hoisted — the row does not restate it.
+  expect(page.document.querySelectorAll(".item-guidance")).toHaveLength(1);
+  expect(page.document.querySelector(".triage-item .item-guidance")).toBeNull();
+});
+
+// The three kinds the review named: a lone one of each reaches the operator
+// with a route, where before it reached them with a title and nothing else.
+test("a lone security check, terms gate and institution sign-in each carry an instruction", async () => {
+  const cases: ReadonlyArray<[GuidanceVariant, string, string]> = [
+    ["security_challenge", "Security checks · 1 paper", "Solve each security check in its tab."],
+    ["terms_acceptance", "Publisher terms · 1 paper", "Review and accept the publisher terms for each source."],
+    [
+      "institution_sign_in",
+      "Institution sign-in · 1 paper",
+      "Sign in to your institution once — papio continues the waiting papers.",
+    ],
+  ];
+  for (const [variant, heading, instruction] of cases) {
+    const item = handoffAction(`action:${variant}`, 1, true);
+    item.run_key = `run_${variant}`;
+    item.next_actor = "researcher";
+    item.guidance_variant = variant;
+    item.operation_variant = "open_and_dismiss";
+    const fixture = snapshot([item], {
+      schema: 5,
+      counts: counts({
+        pending_total: 1,
+        actions: 1,
+        watch_hits: 0,
+        retractions: 0,
+        turns_required: 1,
+        turns_working: 0,
+        family_breakdown_complete: true,
+        family_runs: [{
+          run_key: `run_${variant}`,
+          first_rank: 1,
+          route_class: "openurl_handoff",
+          action_kind: "openurl_handoff",
+          next_actor: "researcher",
+          guidance_variant: variant,
+          operation_variant: "open_and_dismiss",
+          count: 1,
+        }],
+      }),
+    });
+    const page = await inboxDocument((message) => snapshotReply(fixture, message));
+    expect(page.document.querySelector(".family-heading")?.textContent).toBe(heading);
+    expect(page.document.querySelector(".family-guidance")?.textContent).toBe(instruction);
+    // The instruction is the block's, and the row's controls name it.
+    const described = page.document.querySelector("button[data-operation]")?.getAttribute("aria-describedby") ?? "";
+    expect(described.split(" ")).toContain(page.document.querySelector(".family-guidance")?.id ?? "");
+  }
 });
 
 test("a row whose reason differs from its family's shows one bounded reason line", async () => {
@@ -793,6 +908,172 @@ test("the manual-download route is honest on each platform and names no path", a
     expect(text).not.toContain("Downloads/papio");
     expect(text).not.toContain("<job>");
     expect(text).not.toMatch(/papio\/[a-z<]/);
+  }
+});
+
+// The daemon's own manual-download details, verbatim from
+// internal/browser/bridge.go. Each one restates, in the daemon's words, the
+// exact fact this page's family copy already hoists — and a literal comparison
+// caught none of them, so every live manual-download family printed its reason
+// twice.
+const DAEMON_MANUAL_DETAILS: ReadonlyArray<[GuidanceVariant, string]> = [
+  ["manual_download_wrong_work", "papio reached a different work; find and download the requested PDF yourself"],
+  [
+    "manual_download_page_undriveable",
+    "papio could not drive the provider page; download the PDF yourself and papio will adopt it",
+  ],
+  ["manual_download_adapter_missing", "papio has no adapter for this provider yet; download the PDF yourself for now"],
+];
+
+test("a reason the hoisted instruction already states in other words prints once", async () => {
+  for (const [variant, detail] of DAEMON_MANUAL_DETAILS) {
+    const page = await inboxDocument((message) =>
+      snapshotReply(manualFamilyFixture(variant, [detail, detail, detail]), message));
+
+    expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(3);
+    expect(page.document.querySelectorAll(".family-guidance")).toHaveLength(1);
+    expect(page.document.querySelectorAll(".item-reason")).toHaveLength(0);
+    // Still recoverable in the row's disclosure; only the second visible copy
+    // is gone.
+    expect(page.document.querySelector(".item-debug")?.textContent).toContain(detail.split(";")[0]);
+  }
+});
+
+// The suppression is a closed table of known equivalences, not a similarity
+// score: a reason the block does not already state must survive it.
+test("a reason the block does not state survives the equivalence table", async () => {
+  const page = await inboxDocument((message) =>
+    snapshotReply(
+      manualFamilyFixture("manual_download_wrong_work", [
+        "papio reached a different work; find and download the requested PDF yourself",
+        "the resolver returned a preprint of another paper",
+      ]),
+      message,
+    ));
+
+  expect(Array.from(page.document.querySelectorAll(".item-reason"), (node) => node.textContent)).toEqual([
+    "the resolver returned a preprint of another paper",
+  ]);
+});
+
+// The cliff risk 4 named: one action the daemon could not map anywhere in the
+// snapshot makes it report its family breakdown incomplete. The surface used to
+// answer that by dropping every block header and printing one instruction per
+// row. Blocks are derived from the loaded rows now, so only the run's total
+// count depends on the daemon's breakdown.
+test("an incomplete family breakdown keeps the header and prints the instruction once", async () => {
+  const fixture = manualFamilyFixture("manual_download_page_undriveable", [null, null, null, null, null]);
+  const page = await inboxDocument((message) =>
+    snapshotReply({ ...fixture, counts: { ...fixture.counts, family_breakdown_complete: false, family_runs: [] } }, message));
+  const list = page.document.getElementById("item-list");
+
+  expect(page.document.querySelectorAll("[data-triage-item-id]")).toHaveLength(5);
+  expect(page.document.querySelector(".family-heading")?.textContent).toBe("Manual downloads · page changed · 5 papers");
+  expect(page.document.querySelectorAll(".family-guidance")).toHaveLength(1);
+  expect(page.document.querySelectorAll(".triage-item .item-guidance")).toHaveLength(0);
+  expect((list?.textContent ?? "").split("papio could not drive these provider pages")).toHaveLength(2);
+});
+
+// An older daemon ships no guidance quartet at all, so no authored copy exists
+// for these rows. The row's own imperative is hoisted verbatim under the
+// heading its action kind earns, instead of being repeated five times.
+test("rows with no guidance variant hoist their own imperative under a kind heading", async () => {
+  const items = [1, 2, 3, 4, 5].map((rank) => manualAction(`action:legacy-${rank}`, rank, `Legacy paper ${rank}`));
+  const fixture = snapshot(items, {
+    counts: counts({ pending_total: 5, actions: 5, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const list = page.document.getElementById("item-list");
+
+  expect(page.document.querySelector(".family-heading")?.textContent).toBe("Manual downloads · 5 papers");
+  expect(page.document.querySelector(".family-guidance")?.textContent).toBe("Download the PDF yourself - papio adopts it");
+  expect(page.document.querySelectorAll(".triage-item .item-guidance")).toHaveLength(0);
+  expect((list?.textContent ?? "").split("Download the PDF yourself - papio adopts it")).toHaveLength(2);
+  // The Firefox caveat still reaches this block, once and unshortened.
+  expect(Array.from(page.document.querySelectorAll(".family-mechanism"), (node) => node.textContent)).toEqual([
+    "This browser cannot pass a saved download to papio. Open the PDF and use Send PDF in the papio toolbar popup instead.",
+  ]);
+});
+
+// A lone row with no authored copy has nothing to repeat, so a header would
+// only cost it a line: it keeps its instruction inline.
+test("a lone row with no guidance variant keeps its instruction inline", async () => {
+  const fixture = snapshot([manualAction("action:legacy", 1, "Legacy paper")], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  expect(page.document.querySelectorAll(".family-heading")).toHaveLength(0);
+  expect(page.document.querySelector(".triage-item .item-guidance")?.firstChild?.textContent)
+    .toBe("Download the PDF yourself - papio adopts it");
+});
+
+// A sign-in already open in another tab is the browser's own knowledge, which
+// the block's copy cannot describe. That row says so for itself and stays in
+// the block, so one waiting row can no longer collapse a whole block back into
+// an instruction per row.
+test("a waiting row keeps its own line inside the block it still belongs to", async () => {
+  vi.useFakeTimers();
+  try {
+    const items = [1, 2, 3].map((rank) => {
+      const item = handoffAction(`action:waiting-${rank}`, rank, true);
+      item.job_id = `job_waiting_${rank}`;
+      item.attention = "required";
+      item.run_key = "run_sign_in";
+      item.next_actor = "researcher";
+      item.guidance_variant = "institution_sign_in";
+      item.operation_variant = "open_and_dismiss";
+      item.ops = ["open", "dismiss"];
+      return item;
+    });
+    const fixture = snapshot(items, {
+      schema: 5,
+      counts: counts({
+        pending_total: 3,
+        actions: 3,
+        watch_hits: 0,
+        retractions: 0,
+        turns_required: 3,
+        turns_working: 0,
+        family_breakdown_complete: true,
+        family_runs: [{
+          run_key: "run_sign_in",
+          first_rank: 1,
+          route_class: "openurl_handoff",
+          action_kind: "openurl_handoff",
+          next_actor: "researcher",
+          guidance_variant: "institution_sign_in",
+          operation_variant: "open_and_dismiss",
+          count: 3,
+        }],
+      }),
+    });
+    const page = await inboxDocument((message) => {
+      if (message.type === "papio.triage.waiting") {
+        return { ok: true, waiting_jobs: [{ job_id: "job_waiting_2", deadline: Date.now() + 60_000 }] };
+      }
+      return snapshotReply(fixture, message);
+    });
+
+    expect(page.document.querySelector(".family-heading")?.textContent).toBe("Institution sign-in · 3 papers");
+    expect(page.document.querySelectorAll(".family-guidance")).toHaveLength(1);
+    expect(Array.from(page.document.querySelectorAll(".triage-item .item-guidance"), (node) => node.textContent)).toEqual([
+      "papio is continuing — waiting for the institution sign-in already open in another tab",
+    ]);
+    // One card, three rows: the block is not split by the row that differs.
+    const rows = Array.from(page.document.querySelectorAll<HTMLElement>("[data-triage-item-id]"));
+    expect(rows.map((row) => row.dataset.cardStart ?? "")).toEqual(["true", "", ""]);
+    expect(rows.map((row) => row.dataset.cardEnd ?? "")).toEqual(["", "", "true"]);
+    // The waiting row owns no decision, so it exposes no control; its line is
+    // still addressable, and its siblings' controls still name the block.
+    const waitingRow = page.document.querySelector("[data-triage-item-id='action:waiting-2']");
+    expect(waitingRow?.querySelector("button[data-operation]")).toBeNull();
+    expect(waitingRow?.querySelector(".item-guidance")?.id).not.toBe("");
+    const sibling = page.document.querySelector("[data-triage-item-id='action:waiting-1']");
+    const described = sibling?.querySelector("button[data-operation]")?.getAttribute("aria-describedby") ?? "";
+    expect(described.split(" ")).toContain(page.document.querySelector(".family-guidance")?.id ?? "");
+  } finally {
+    vi.useRealTimers();
   }
 });
 
@@ -1071,8 +1352,10 @@ test("a dismissal removes the row at once, holds the daemon call, and undo puts 
   // Dismissal is deferred rather than confirmed: the modal protected nothing
   // (the daemon cannot un-cancel a job) while costing a click per row, so the
   // undo window is the safety net and no dialog may appear.
-  const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
-    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  const action = manualAction("action:manual", 1, "Manual action");
+  action.attention = "required";
+  const fixture = snapshot([action], {
+    counts: counts({ pending_total: 1, turns_required: 1, actions: 1, watch_hits: 0, retractions: 0 }),
   });
   const page = await inboxDocument((message) => {
     if (message.type === "papio.action.resolve") return { ok: true, outcome: "applied" };
@@ -1083,14 +1366,15 @@ test("a dismissal removes the row at once, holds the daemon call, and undo puts 
   expect(page.document.getElementById("confirm-dialog")?.hidden).toBe(true);
   expect(page.document.querySelector("[data-triage-item-id='action:manual']")).toBeNull();
   expect(page.document.getElementById("undo-bar")?.hidden).toBe(false);
-  expect(page.document.getElementById("inbox-counts")?.textContent).toBe("No open items");
+  // The header carries turns_required alone, so a local removal has to move it.
+  expect(page.document.getElementById("inbox-counts")?.textContent).toBe("Nothing needs you");
   expect(page.requests.filter((request) => request.type === "papio.action.resolve")).toHaveLength(0);
 
   page.document.getElementById("undo-dismiss")?.dispatchEvent(new Event("click", { bubbles: true }));
   await settle();
   expect(page.document.querySelector("[data-triage-item-id='action:manual']")).not.toBeNull();
   expect(page.document.getElementById("undo-bar")?.hidden).toBe(true);
-  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("1 open");
+  expect(page.document.getElementById("inbox-counts")?.textContent).toBe("1 needs you");
   expect(page.requests.filter((request) => request.type === "papio.action.resolve")).toHaveLength(0);
 });
 
@@ -1300,7 +1584,7 @@ test("the filter narrows visible items, keeps counts intact, and reports a disti
   const fixture = snapshot([
     watchHit("hit:one", 1, "Attention and memory"),
     manualAction("action:manual", 2, "Cognitive load review"),
-  ], { counts: counts({ pending_total: 2, actions: 1, watch_hits: 1, retractions: 0 }) });
+  ], { counts: counts({ pending_total: 2, turns_required: 1, actions: 1, watch_hits: 1, retractions: 0 }) });
   const page = await inboxDocument((message) => snapshotReply(fixture, message));
   const filterInput = page.document.getElementById("item-filter") as HTMLInputElement;
 
@@ -1308,7 +1592,11 @@ test("the filter narrows visible items, keeps counts intact, and reports a disti
   filterInput.dispatchEvent(new Event("input", { bubbles: true }));
   await settle();
   expect(Array.from(page.document.querySelectorAll("[data-triage-item-id]"), (row) => row.getAttribute("data-triage-item-id"))).toEqual(["hit:one"]);
-  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("2 open");
+  // Filtering narrows the view only: the daemon's turn count and the tab
+  // labels that own inventory both stay whole.
+  expect(page.document.getElementById("inbox-counts")?.textContent).toBe("1 needs you");
+  expect(page.document.getElementById("actions-tab")?.textContent).toBe("Actions (1)");
+  expect(page.document.getElementById("watch-tab")?.textContent).toBe("Watch hits (1)");
 
 
   filterInput.value = "no such paper exists";
@@ -1534,6 +1822,26 @@ test("without the daemon's pdf_grab_suggest_v1 feature, provide_identifier keeps
   );
 });
 
+// Every other kind hoists one instruction for its whole block. A grab cannot:
+// its imperative names its own grab id, so a block sentence would replace two
+// distinct routes with one summary that acts on neither.
+test("pdf grabs keep their own identify command instead of hoisting a summary", async () => {
+  const grabs = [pdfGrab("grab_test_1", "Reading copy"), pdfGrab("grab_test_2", "Second copy")];
+  for (const grab of grabs) grab.guidance_variant = "pdf_identifier";
+  const fixture = snapshot(grabs, {
+    schema: 5,
+    counts: counts({ pending_total: 2, actions: 0, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+
+  expect(page.document.querySelectorAll(".family-heading")).toHaveLength(0);
+  expect(page.document.querySelector(".triage-group-pdf_grab > h2")?.textContent).toBe("PDF grabs (2)");
+  expect(Array.from(page.document.querySelectorAll(".triage-item .item-guidance"), (node) => node.textContent)).toEqual([
+    "Provide an identifier: papio grabs identify grab_test_1 --doi <value> (or --pmid/--arxiv <value>)",
+    "Provide an identifier: papio grabs identify grab_test_2 --doi <value> (or --pmid/--arxiv <value>)",
+  ]);
+});
+
 test("the action kind renders as a status glyph with an accessible label, not a fact row", async () => {
   const fixture = snapshot([manualAction("action:manual", 1, "Manual action")], {
     counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
@@ -1563,10 +1871,14 @@ test("expandable details carry mechanism copy and backend identifiers", async ()
   const page = await inboxDocument((message) => snapshotReply(fixture, message));
   const row = page.document.querySelector<HTMLElement>("[data-triage-item-id='action:manual']");
 
-  // APA (default): inverted initials, parenthesized year, DOI URL as the link.
+  // APA (default): inverted initials, parenthesized year, and the link shown
+  // as the host it names with the full URL demoted onto the anchor.
   const citation = row?.querySelector(".item-citation");
-  expect(citation?.textContent).toBe("LeCun, Y., Bengio, Y., & Hinton, G. (2015). https://doi.org/10.1038/nature14539");
-  expect(citation?.querySelector("a")?.href).toBe("https://doi.org/10.1038/nature14539");
+  expect(citation?.textContent).toBe("LeCun, Y., Bengio, Y., & Hinton, G. (2015). doi.org");
+  const anchor = citation?.querySelector("a");
+  expect(anchor?.href).toBe("https://doi.org/10.1038/nature14539");
+  expect(anchor?.title).toBe("https://doi.org/10.1038/nature14539");
+  expect(anchor?.getAttribute("aria-label")).toBe("DOI: https://doi.org/10.1038/nature14539");
 
   const debug = row?.querySelector<HTMLDListElement>(".item-debug");
   const debugToggle = row?.querySelector<HTMLButtonElement>(".item-guidance .item-debug-toggle");
@@ -1602,8 +1914,22 @@ test("expandable details carry mechanism copy and backend identifiers", async ()
   select.dispatchEvent(new Event("change", { bubbles: true }));
   await settle();
   expect(page.document.querySelector("[data-triage-item-id='action:manual'] .item-citation")?.textContent).toBe(
-    "LeCun, Yann, et al. 2015, doi.org/10.1038/nature14539.",
+    "LeCun, Yann, et al. 2015, doi.org",
   );
+});
+
+// The host is a compression of an already-identified row, never a substitute
+// for identity. A retraction notice carries no author and no year, so a bare
+// `doi.org` would name every paper in the library equally.
+test("a row with no author or year keeps its link's locator, not just its host", async () => {
+  const fixture = snapshot([retraction("retraction:doi", 1, "Library update notice")], {
+    counts: counts({ pending_total: 1, actions: 0, watch_hits: 0, retractions: 1 }),
+  });
+  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const citation = page.document.querySelector("[data-triage-item-id='retraction:doi'] .item-citation");
+
+  expect(citation?.textContent).toBe("doi.org/10.1/retracted");
+  expect(citation?.querySelector("a")?.getAttribute("aria-label")).toBe("DOI: https://doi.org/10.1/retracted");
 });
 
 test("a missing adapter is named and its local diagnostic is explained", async () => {
@@ -2079,7 +2405,7 @@ test("hides waiting-on-you pulse while counts own the turn and deduplicates conn
     if (message.type === "papio.work.pulse") return pulse;
     return snapshotReply(fixture, message);
   });
-  expect(page.document.getElementById("inbox-counts")?.textContent).toContain("1 need you");
+  expect(page.document.getElementById("inbox-counts")?.textContent).toBe("1 needs you");
   expect(page.document.getElementById("inbox-pulse")?.hidden).toBe(true);
   expect(page.document.getElementById("connection-status")?.hidden).toBe(true);
 });

@@ -46,7 +46,7 @@ test("valid fragment renders one inert binding marker", async () => {
   expect(status?.getAttribute("role")).toBe("status");
   expect(status?.getAttribute("data-state")).toBe("valid");
   expect(status?.getAttribute("data-binding-id")).toBe(binding);
-  expect(status?.textContent).toBe("Materialization binding ready");
+  expect(status?.textContent).toBe("This papio access tab is ready — return to your paper.");
   expect(document.querySelectorAll("a,button,input,select,textarea,form")).toHaveLength(0);
 });
 
@@ -62,7 +62,7 @@ test.each([
 
   expect(status?.getAttribute("data-state")).toBe("invalid");
   expect(status?.hasAttribute("data-binding-id")).toBe(false);
-  expect(status?.textContent).toBe("Invalid materialization binding");
+  expect(status?.textContent).toBe("This access tab is no longer valid — you can close it.");
 });
 
 test("shell and script expose no query data or active work", () => {

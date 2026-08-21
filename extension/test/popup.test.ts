@@ -304,7 +304,7 @@ test("the popup paints no pulse line before it has state", () => {
   expect(doc.getElementById("popup-pulse-primary")?.textContent).toBe("");
 });
 
-test("renders active batch companion facts and disconnected copy", () => {
+test("the latest cohort keeps its facts without keeping a line", () => {
   const doc = popupDocument();
   renderWorkPulse(doc, pulseCache({
     in_flight: 1,
@@ -319,7 +319,22 @@ test("renders active batch companion facts and disconnected copy", () => {
     },
   }));
   expect(doc.getElementById("popup-pulse-primary")?.textContent).toContain("Moving");
-  expect(doc.getElementById("popup-pulse-batch")?.textContent).toContain("2 papers");
+  // The cohort is not drawn. It is one hover away, and — because a bare title
+  // is not an accessibility path — it is also this section's description.
+  const section = doc.getElementById("popup-pulse") as HTMLElement;
+  const detail = doc.getElementById("popup-pulse-detail") as HTMLElement;
+  expect(section.getAttribute("aria-describedby")).toBe("popup-pulse-detail");
+  expect(section.getAttribute("title")).toContain("Last submission: 2 papers");
+  expect(detail.textContent).toContain("Last submission: 2 papers");
+  // Never drawn and never in the reading order twice: aria-describedby reads a
+  // display:none target, so the description is the only place it is spoken.
+  expect(detail.hidden).toBe(true);
+  const drawn = [
+    doc.getElementById("popup-pulse-primary"),
+    doc.getElementById("popup-pulse-next"),
+    doc.getElementById("popup-pulse-capacity"),
+  ].filter((node): node is HTMLElement => node instanceof HTMLElement && !node.hidden);
+  expect(drawn.map((node) => node.textContent).join(" ")).not.toContain("Last submission");
   renderWorkPulse(doc, undefined, "disconnected");
   expect(doc.getElementById("popup-pulse-primary")?.textContent).toBe("Progress unknown — the papio daemon isn't answering");
 });
@@ -801,15 +816,22 @@ test("renders a live, honest status card for a local in-flight acquisition", () 
     },
   );
 
+  // No dead control beside the live card: it stated this same job's standing,
+  // less precisely, in a button nobody could press.
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
-  expect(button.hidden).toBe(false);
+  expect(button.hidden).toBe(true);
   expect(button.disabled).toBe(true);
   expect(button.getAttribute("aria-disabled")).toBe("true");
   expect(doc.getElementById("page-acquire")?.hidden).toBe(false);
   expect(doc.getElementById("page-acquire-live")?.hidden).toBe(false);
   expect(doc.getElementById("page-acquire-live-title")?.textContent).toBe("A paper in progress");
-  expect(doc.getElementById("page-acquire-live-status")?.textContent).toContain("No progress for 11m");
-  expect(doc.getElementById("page-acquire-live-status")?.textContent).toContain("Institution access handoff offered");
+  const live = doc.getElementById("page-acquire-live-status") as HTMLElement;
+  // The stall warning stays visible; the event that has not moved does not.
+  expect(live.firstChild?.textContent).toBe("No progress for 11m · Waiting on you to sign in · 11m ago");
+  expect(live.getAttribute("title")).toContain("last: Institution access handoff offered");
+  expect(live.querySelector(".visually-hidden")?.textContent).toBe(
+    " · last: Institution access handoff offered",
+  );
   const inbox = doc.getElementById("page-acquire-open-inbox") as HTMLButtonElement;
   const tab = doc.getElementById("page-acquire-go-tab") as HTMLButtonElement;
   expect(tab.hidden).toBe(false);
@@ -817,6 +839,29 @@ test("renders a live, honest status card for a local in-flight acquisition", () 
   tab.click();
   expect(openedInbox).toBe(1);
   expect(openedTab).toBe(1);
+});
+
+// The rail is 330px wide and a DOI is 25 characters of punctuation. The label
+// has always gone through shortAcquireLabel, which truncates it; this pins the
+// contract, so a future label built without setAcquireButton cannot quietly put
+// an identifier back on the surface, and no future shortening can take the DOI
+// out of the accessible name while it is the thing the button acts on.
+test("the rail never draws a DOI and never drops it from the accessible name", () => {
+  const doc = popupDocument();
+  const doi = "10.1177/15480518221144895";
+  renderPageContext(
+    doc,
+    { url: `https://doi.org/${doi}`, doi, tab_id: 1, tab_url: `https://doi.org/${doi}` },
+    [],
+  );
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  expect(button.hidden).toBe(false);
+  expect(button.disabled).toBe(false);
+  expect(button.textContent).toBe("Acquire");
+  expect(doc.getElementById("current-page-actions")?.textContent).not.toContain(doi);
+  // One hover and one accessible name away, in full.
+  expect(button.getAttribute("title")).toBe(`Acquire this page · ${doi}`);
+  expect(button.getAttribute("aria-label")).toBe(`Acquire this page · ${doi}`);
 });
 test("scopes live auth-pending warmth to its demanded resolver origin", () => {
   const now = Date.now();
@@ -1019,9 +1064,9 @@ test("merges auth-pending paper rows into the institution session card", async (
   const waiting = doc.getElementById("institution-session-waiting");
   expect(session?.hidden).toBe(false);
   expect(waiting?.hidden).toBe(false);
-  expect(doc.getElementById("institution-session-waiting-heading")?.textContent).toBe(
-    "Waiting on your sign-in",
-  );
+  // One row states itself: its own button says Focus and the card heading
+  // already says Institution session.
+  expect(doc.getElementById("institution-session-waiting-heading")?.hidden).toBe(true);
   expect(waiting?.querySelector(".institution-session-waiting-title")?.textContent).toBe(
     "A paper awaiting institutional access",
   );
@@ -1061,9 +1106,10 @@ test("a cold institutional handoff renders an explicit Open action", async () =>
 
   const waiting = doc.getElementById("institution-session-waiting");
   expect(waiting?.hidden).toBe(false);
-  expect(doc.getElementById("institution-session-waiting-heading")?.textContent).toBe(
-    "Open institutional access",
-  );
+  // A sub-heading above a single row whose button says Open restates the row.
+  const heading = doc.getElementById("institution-session-waiting-heading");
+  expect(heading?.hidden).toBe(true);
+  expect(heading?.textContent).toBe("Open institutional access");
   const button = waiting?.querySelector("button") as HTMLButtonElement;
   expect(button.textContent).toBe("Open");
   button.click();
@@ -1137,6 +1183,10 @@ test("a waiting_for_session paper renders no Focus action and distinct copy, unl
 
   const rows = doc.querySelectorAll(".institution-session-waiting-row");
   expect(rows).toHaveLength(2);
+  // Two rows are a group, so the sub-heading earns its line back.
+  const groupHeading = doc.getElementById("institution-session-waiting-heading");
+  expect(groupHeading?.hidden).toBe(false);
+  expect(groupHeading?.textContent).toBe("Waiting on your sign-in");
 
   const ownRow = rows[0] as HTMLElement;
   expect(ownRow.querySelector(".institution-session-waiting-title")?.textContent).toBe(
@@ -1192,12 +1242,27 @@ test("surfaces a blocked security check with a go-to-tab action", async () => {
   const section = doc.getElementById("needs-you-section");
   expect(section?.hidden).toBe(false);
   expect(doc.getElementById("institution-session-waiting")?.hidden).toBe(true);
-  // One heading, always: a per-kind heading read as a different section.
-  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Needs you");
+  // The heading names where these blockers live and never renames itself per
+  // kind; ADR-0023 keeps "Needs you" for the daemon's own turns.
+  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Do this in the browser");
   expect(section?.querySelector(".needs-you-paper")?.textContent).toBe(
     "Security check — sciencedirect.com",
   );
-  const button = section?.querySelector("button") as HTMLButtonElement;
+  // One ask = one row: the reason is NOT restated on the row. It is the one
+  // reassurance that stops someone closing the tab early, so it stays visible
+  // exactly once, as the section message, and the control describes itself from
+  // there instead of repeating it on hover.
+  const message = doc.getElementById("needs-you-message") as HTMLElement;
+  expect(message.hidden).toBe(false);
+  expect(message.textContent).toBe("Solve the check in the open tab — papio resumes on its own.");
+  expect(
+    Array.from(section?.querySelectorAll(".needs-you-item p") ?? [])
+      .filter((node): node is HTMLElement => node instanceof HTMLElement && !node.hidden)
+      .map((node) => node.textContent),
+  ).toEqual(["Security check — sciencedirect.com"]);
+  const button = section?.querySelector("#needs-you-list button") as HTMLButtonElement;
+  expect(button.getAttribute("aria-describedby")).toBe("needs-you-message");
+  expect(button.getAttribute("title")).toBeNull();
   expect(button.textContent).toBe("Open tab");
   button.click();
   await Promise.resolve();
@@ -1214,7 +1279,6 @@ test("surfaces each blocked provider host once with a one-click grant", async ()
     [],
     ["journals.sagepub.com", "JOURNALS.SAGEPUB.COM", "www.sciencedirect.com"],
     async () => {},
-    async () => {},
     [],
     async () => {},
     async (host) => {
@@ -1225,8 +1289,12 @@ test("surfaces each blocked provider host once with a one-click grant", async ()
 
   const section = doc.getElementById("needs-you-section");
   expect(section?.hidden).toBe(false);
-  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Needs you");
-  expect(doc.getElementById("needs-you-message")?.textContent).toContain("Allow the blocked source here");
+  expect(doc.getElementById("needs-you-heading")?.textContent).toBe("Do this in the browser");
+  // Two rows of possibly different kinds: the message summarises, it does not
+  // instruct, and it no longer names a Settings route this section never
+  // carried — the header's Settings control is that route.
+  expect(doc.getElementById("needs-you-message")?.textContent).toBe("2 things to clear here");
+  expect(doc.getElementById("needs-you-section")?.textContent).not.toContain("Settings");
   expect(Array.from(section?.querySelectorAll(".needs-you-paper") ?? []).map((item) => item.textContent)).toEqual([
     "journals.sagepub.com",
     "www.sciencedirect.com",
@@ -1245,6 +1313,46 @@ test("surfaces each blocked provider host once with a one-click grant", async ()
   expect(result?.dataset.tone).toBe("success");
   expect(result?.getAttribute("aria-live")).toBeNull();
   expect(doc.getElementById("popup-operation-status")?.textContent).toBe("Allowed");
+});
+
+// One ask = one row. A lone row is fully stated by its own title and its own
+// button, so a section message above it can only restate it. The explanation
+// moves onto the control it explains — on hover, and, because a bare `title` is
+// neither a keyboard nor a screen-reader path, as a description that is in the
+// accessibility tree and not in the layout.
+test("a lone blocked source drops the section message and describes its own control", () => {
+  const doc = popupDocument();
+  renderNeedsAttention(
+    doc,
+    [],
+    ["journals.sagepub.com"],
+    async () => {},
+    [],
+    async () => {},
+    async () => true,
+  );
+  const message = doc.getElementById("needs-you-message") as HTMLElement;
+  expect(message.hidden).toBe(true);
+  expect(message.textContent).toBe("");
+  const rows = Array.from(doc.querySelectorAll("#needs-you-list .needs-you-item"));
+  expect(rows).toHaveLength(1);
+  const row = rows[0] as HTMLElement;
+  expect(row.querySelector(".needs-you-paper")?.textContent).toBe("journals.sagepub.com");
+  // The row draws exactly one line of prose: its own title.
+  expect(
+    Array.from(row.querySelectorAll("p"))
+      .filter((node) => !node.hidden)
+      .map((node) => node.textContent),
+  ).toEqual(["journals.sagepub.com"]);
+  const reason = "papio needs your permission to reach this source.";
+  const button = row.querySelector("button") as HTMLButtonElement;
+  expect(button.textContent).toBe("Allow");
+  expect(button.getAttribute("title")).toBe(reason);
+  const described = doc.getElementById(button.getAttribute("aria-describedby") ?? "");
+  expect(described?.textContent).toBe(reason);
+  // Read once, as the description; display:none keeps it out of the layout and
+  // out of the reading order.
+  expect(described?.hidden).toBe(true);
 });
 
 test("provider grant requests the exact normalized https origin and rejects paths", async () => {
@@ -2189,7 +2297,6 @@ test("binds waiting demand to its warm origin instead of a stale secondary row",
     [waitingJob],
     [],
     async () => {},
-    async () => {},
     [],
     async () => {},
     async () => true,
@@ -2312,7 +2419,6 @@ test("waiting demand for origin B cannot display origin A as its blocker", () =>
     [waitingJob],
     [],
     async () => {},
-    async () => {},
     [],
     async () => {},
     async () => true,
@@ -2414,6 +2520,19 @@ test("leftover-tabs card stays hidden at zero and renders a pluralized count", (
 
   renderLeftoverTabs(doc, 1, async () => 1);
   expect(doc.getElementById("leftover-tabs-message")?.textContent).toContain("1 papio tab");
+});
+
+// popup.html shipped "Close them" on this control, and renderLeftoverTabs
+// overwrote it with "Review in browser" before the card could ever be shown:
+// a string readable only in the source, promising an action papio does not
+// take (it focuses one tab; the operator closes it).
+test("the leftover-tabs control ships the label it renders", () => {
+  const doc = popupDocument();
+  const button = doc.getElementById("leftover-tabs-cleanup") as HTMLButtonElement;
+  expect(button.textContent).toBe("Review in browser");
+  renderLeftoverTabs(doc, 2, async () => 0);
+  expect(button.textContent).toBe("Review in browser");
+  expect(doc.getElementById("leftover-tabs")?.textContent).not.toContain("Close them");
 });
 
 test("leftover-tabs cleanup uses the latest callback after a rerender", async () => {
@@ -3535,7 +3654,7 @@ test("the pulse companion names simultaneous work the primary line does not", ()
   expect(noCounts.companion).toBe("");
 });
 
-test("the popup pulse renders at most three lines and hides while disconnected", () => {
+test("the popup pulse draws no cohort line and hides while disconnected", () => {
   const doc = popupDocument();
   renderWorkPulse(
     doc,
@@ -3554,20 +3673,21 @@ test("the popup pulse renders at most three lines and hides while disconnected",
     doc.getElementById("popup-pulse-primary"),
     doc.getElementById("popup-pulse-next"),
     doc.getElementById("popup-pulse-capacity"),
-    doc.getElementById("popup-pulse-batch"),
   ].filter((node): node is HTMLElement => node instanceof HTMLElement && !node.hidden);
-  expect(visible.length).toBeLessThanOrEqual(3);
+  // Three drawn lines is the ceiling and the cohort is not one of them: with
+  // capacity actually constraining, this is the widest the pulse ever gets.
+  expect(visible.length).toBe(3);
   expect(visible[0]?.textContent).toBe("Moving · 1 paper · 2 decisions waiting");
-  // Capacity is constraining, so the third line is capacity, not the batch.
   expect(doc.getElementById("popup-pulse-capacity")?.hidden).toBe(false);
-  expect(doc.getElementById("popup-pulse-batch")?.hidden).toBe(true);
+  expect(doc.getElementById("popup-pulse-batch")).toBeNull();
+  expect(visible.map((node) => node.textContent).join(" ")).not.toContain("Last submission");
 
   // Disconnected belongs to the daemon band alone.
   renderWorkPulse(doc, undefined, "disconnected");
   expect(doc.getElementById("popup-pulse")?.hidden).toBe(true);
 });
 
-test("Needs you keeps its three row classes in order and invents no Downloads row", () => {
+test("browser blockers keep their three row classes in order and invent no Downloads row", () => {
   const doc = popupDocument();
   renderNeedsAttention(
     doc,
@@ -3576,7 +3696,6 @@ test("Needs you keeps its three row classes in order and invents no Downloads ro
       job({ job_id: "job-stalled", tab_id: 4 }),
     ],
     ["a.example.edu", "b.example.edu", "c.example.edu"],
-    async () => {},
     async () => {},
     ["job-stalled"],
     async () => {},
@@ -3588,7 +3707,15 @@ test("Needs you keeps its three row classes in order and invents no Downloads ro
   expect(rows[0]?.querySelector(".needs-you-paper")?.textContent).toBe("Security check — sciencedirect.com");
   expect(rows[1]?.querySelector("button")?.textContent).toBe("Retry now");
   expect(rows[2]?.querySelector(".needs-you-paper")?.textContent).toBe("a.example.edu");
-  expect(doc.getElementById("needs-you-message")?.textContent).toContain("2 more in inbox");
+  // Three rows of three different kinds: one instruction cannot honestly
+  // describe them, so the message counts instead of instructing.
+  expect(doc.getElementById("needs-you-message")?.textContent).toBe("3 things to clear here");
+  // The overflow route is stated once, by the control that carries it.
+  const overflow = Array.from(doc.querySelectorAll("#needs-you-list button")).filter(
+    (node) => node.textContent === "2 more in inbox",
+  );
+  expect(overflow).toHaveLength(1);
+  expect(doc.getElementById("needs-you-message")?.textContent).not.toContain("more in inbox");
   // No Downloads projection exists in the store, so no Downloads row may appear.
   expect(doc.getElementById("needs-you-section")?.textContent).not.toMatch(/download/i);
 });
@@ -3601,7 +3728,6 @@ test("a blocker's pending state survives a rerender instead of reverting", async
       doc,
       [],
       ["a.example.edu"],
-      async () => {},
       async () => {},
       [],
       async () => {},
@@ -4141,7 +4267,12 @@ test("the decision count offers the route to the decisions", () => {
   const review = doc.getElementById("popup-pulse-review");
   expect(review).toBeInstanceOf(doc.defaultView!.HTMLButtonElement);
   expect(review!.hidden).toBe(false);
-  expect(review!.textContent).toBe("Review 35 decisions");
+  // The line directly above already says 35. The control says the verb once,
+  // and keeps the whole phrase as its accessible name and on hover.
+  expect(review!.textContent).toBe("Review");
+  expect(review!.getAttribute("aria-label")).toBe("Review 35 decisions");
+  expect(review!.getAttribute("title")).toBe("Review 35 decisions");
+  expect(doc.getElementById("popup-pulse-primary")?.textContent).toContain("35 decisions");
 
   // Same route as the header icon, wired by the same function.
   let opened = 0;
@@ -4151,9 +4282,10 @@ test("the decision count offers the route to the decisions", () => {
   (review as HTMLButtonElement).click();
   expect(opened).toBe(1);
 
-  // One decision is not "1 decisions".
+  // One decision is not "1 decisions", in the accessible name either.
   renderWorkPulse(doc, cache, "connected", Date.now(), { pending_total: 1, turns_required: 1 });
-  expect(doc.getElementById("popup-pulse-review")?.textContent).toBe("Review 1 decision");
+  expect(doc.getElementById("popup-pulse-review")?.textContent).toBe("Review");
+  expect(doc.getElementById("popup-pulse-review")?.getAttribute("aria-label")).toBe("Review 1 decision");
 });
 
 // An offer to review nothing is worse than no offer, and papio being the one
@@ -4203,8 +4335,9 @@ test("the batch line says which papers it is counting", () => {
 // "Institution login returned" is right in a history and reads as an
 // unexplained instruction on a status line - measured on the operator's own
 // screen, where it sat under a paper title with no statement of what papio
-// wanted next. It is a record; it must say so.
-test("a bare timeline echo states where the paper stands, and an ask is untouched", () => {
+// wanted next. It is a record; it stays a record, and it stays off the one line
+// that says where the paper is now.
+test("the live status draws one standing line and demotes the past event", () => {
   const now = Date.now();
   const render = (doc: Document, status: JobStatus, kind: string, text: string) =>
     renderPageContext(
@@ -4218,9 +4351,19 @@ test("a bare timeline echo states where the paper stands, and an ask is untouche
 
   const echo = popupDocument();
   render(echo, "accepted", "browser.auth_returned", "Institution login returned");
-  const echoText = echo.getElementById("page-acquire-live-status")?.textContent ?? "";
-  // The standing first, the past event demoted and dated.
-  expect(echoText).toContain("Acquisition accepted · last: Institution login returned");
+  const status = echo.getElementById("page-acquire-live-status") as HTMLElement;
+  // One drawn line, and it is the standing — dated, not narrated.
+  const drawn = status.firstChild?.textContent ?? "";
+  expect(drawn).toBe("Acquisition accepted · 3m ago");
+  expect(drawn).not.toContain("Institution login returned");
+  // The event rides the line it explains: on hover, and in the accessibility
+  // tree through a companion the layout does not draw.
+  expect(status.getAttribute("title")).toBe(
+    "Acquisition accepted · 3m ago · last: Institution login returned",
+  );
+  expect(status.querySelector(".visually-hidden")?.textContent).toBe(
+    " · last: Institution login returned",
+  );
 
   // An explicit ask already states what is wanted; prefixing it would bury the
   // one line that is not a record.
@@ -4228,9 +4371,11 @@ test("a bare timeline echo states where the paper stands, and an ask is untouche
   // values, and the daemon's own awaiting_human arrives inside the text.
   const ask = popupDocument();
   render(ask, "auth_pending", "browser.auth_pending", "Still waiting on you at the publisher");
-  const askText = ask.getElementById("page-acquire-live-status")?.textContent ?? "";
-  expect(askText.toLowerCase()).toContain("waiting on you");
-  expect(askText).not.toContain("· last:");
+  const askStatus = ask.getElementById("page-acquire-live-status") as HTMLElement;
+  expect(askStatus.textContent?.toLowerCase()).toContain("waiting on you");
+  expect(askStatus.textContent).not.toContain("· last:");
+  expect(askStatus.querySelector(".visually-hidden")).toBeNull();
+  expect(askStatus.getAttribute("title")).toBeNull();
 });
 
 // The `checking` branch returns earlier in the same function, so reaching the

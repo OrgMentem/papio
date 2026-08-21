@@ -1882,6 +1882,10 @@ function renderWaitingOnSignIn(
   list.replaceChildren();
   const heading = doc.getElementById("institution-session-waiting-heading");
   if (heading instanceof HTMLElement) {
+    // A sub-heading earns its line by labelling a group. Above one row whose
+    // own button already says Open — and whose card heading already says
+    // Institution session — it only restates what is directly below it.
+    heading.hidden = jobs.length < 2;
     heading.textContent = jobs.some(
       (job) => job.engagement_required === true && job.tab_id < 0,
     )
@@ -1978,7 +1982,15 @@ function appendBlockerRow(
     operationKey: string;
     ownerKey: string;
     title: string;
+    /** Why this row exists. It rides the control it explains — `title` for
+     * hover, a drawn-nowhere companion for `aria-describedby` so keyboard and
+     * screen-reader users are not left with hover-only meaning — instead of
+     * spending a visible line restating the ask above it. */
     reason?: string;
+    /** An element that already states this row's reason where the reader can
+     * see it (the section message, when one row owns the whole section). The
+     * control describes itself from there rather than saying it twice. */
+    reasonElementID?: string;
     idleLabel: string;
     pendingLabel: string;
     run: () => Promise<{ text: string; tone: PopupFeedbackTone } | null>;
@@ -1992,18 +2004,27 @@ function appendBlockerRow(
   title.className = "needs-you-paper";
   title.textContent = spec.title;
   copy.append(title);
-  if (spec.reason !== undefined) {
-    const reason = doc.createElement("p");
-    reason.className = "needs-you-reason";
-    reason.textContent = spec.reason;
-    copy.append(reason);
-  }
   const result = doc.createElement("p");
   result.className = "popup-result";
   result.hidden = true;
   const button = doc.createElement("button");
   button.className = "ghost";
   button.type = "button";
+  if (spec.reasonElementID !== undefined) {
+    button.setAttribute("aria-describedby", spec.reasonElementID);
+  } else if (spec.reason !== undefined) {
+    // `hidden`, not `.visually-hidden`: aria-describedby reads a display:none
+    // target, so the reason reaches keyboard and screen-reader users exactly
+    // once, as the control's description, and never as a stray line of prose
+    // between the row title and the button.
+    const reason = doc.createElement("p");
+    reason.hidden = true;
+    reason.id = `needs-you-reason-${spec.operationKey.replace(/[^A-Za-z0-9_-]+/g, "-")}`;
+    reason.textContent = spec.reason;
+    copy.append(reason);
+    button.title = spec.reason;
+    button.setAttribute("aria-describedby", reason.id);
+  }
 
   const paint = (): void => {
     const state = popupOperation(doc, spec.operationKey);
@@ -2043,6 +2064,13 @@ function appendBlockerRow(
   list.append(row);
 }
 
+/** The one blocker line that prevents a wrong action instead of explaining
+ * one: without it a researcher solves the check, closes the tab, and leaves
+ * papio nothing to resume in. So it is stated exactly once — as the section
+ * message while a single ask owns the section, and otherwise on the control it
+ * belongs to, never in both places. */
+const CHALLENGE_REASSURANCE = "Solve the check in the open tab — papio resumes on its own.";
+
 /** Render durable browser actions that need a user gesture: a security check,
  * provider permission grants, and one auth retry.
  *
@@ -2050,13 +2078,18 @@ function appendBlockerRow(
  * overflow link. There is deliberately no Downloads row: no browser-local
  * Downloads projection exists in `StoreShape`, and inferring one from daemon
  * prose would put a control here that cannot act. Downloads actions stay in the
- * durable inbox. */
+ * durable inbox.
+ *
+ * One ask renders as one row: the row's title and its button already say what
+ * is wanted and where, so a section message above a lone row can only restate
+ * it. Settings is not named here either — the header's own Settings control is
+ * the route, and copy that named a route this section does not carry was the
+ * inversion of the rule it was written under. */
 export function renderNeedsAttention(
   doc: Document,
   jobs: ActiveJob[],
   blockedProviderHosts: readonly string[] = [],
   onFocus: (jobID: string) => Promise<void> = openHandoff,
-  onOpenOptions: () => Promise<void> = openOptions,
   authStalledJobs: readonly string[] = [],
   onRetry: (jobID: string) => Promise<void> = retryAuthStalled,
   onGrantProvider: (host: string) => Promise<boolean> = grantProviderAccess,
@@ -2074,7 +2107,6 @@ export function renderNeedsAttention(
   ) {
     return;
   }
-  void onOpenOptions;
   const pending = jobs.filter(
     (job) =>
       (job.status === "auth_pending" || job.engagement_required === true) &&
@@ -2108,19 +2140,23 @@ export function renderNeedsAttention(
   list.replaceChildren();
   if (section.hidden) return;
 
-  // One heading, always. A heading that renamed itself per blocker kind read as
-  // a different section appearing rather than the same one gaining a row.
-  heading.textContent = "Needs you";
-  if (challengeJobs.length > 0) {
-    message.textContent = "Solve the check in the open tab — papio resumes on its own.";
-  } else if (stalled.length > 0 && blocked.length > 0) {
-    message.textContent = "Sign in again, and allow the blocked source below.";
-  } else if (stalled.length > 0) {
-    message.textContent = "Sign-in didn't stick — retry these papers.";
-  } else {
-    message.textContent = "Allow the blocked source here, or manage all sources in Settings.";
-  }
-  if (overflowCount > 0) message.textContent += ` · ${overflowCount} more in inbox`;
+  // The heading never renames itself per blocker kind — that read as a
+  // different section appearing rather than the same one gaining a row — and
+  // it no longer borrows "Needs you", which ADR-0023 reserves for the daemon's
+  // turns_required and the pulse above already spends its primary line on.
+  heading.textContent = "Do this in the browser";
+  const rowCount = visibleChallenges.length + visibleStalled.length + visibleBlocked.length;
+  // A lone security check keeps its reassurance visible; every other lone ask
+  // is fully stated by its own row. Two or more rows can be of different kinds,
+  // and one instruction cannot honestly describe both, so the message
+  // summarises rather than instructs. The overflow count is not appended here:
+  // it is a route, and it is rendered once, as the control that carries it.
+  const reassure = rowCount === 1 && visibleChallenges.length === 1;
+  message.textContent = reassure
+    ? CHALLENGE_REASSURANCE
+    : rowCount > 1
+      ? `${rowCount} things to clear here`
+      : "";
   message.hidden = message.textContent === "";
 
   for (const job of visibleChallenges) {
@@ -2129,7 +2165,7 @@ export function renderNeedsAttention(
       operationKey: `challenge:${job.job_id}`,
       ownerKey: job.job_id,
       title: `Security check — ${host}`,
-      reason: "Complete it in the open tab; papio resumes without retrying the provider.",
+      ...(reassure ? { reasonElementID: message.id } : { reason: CHALLENGE_REASSURANCE }),
       idleLabel: "Open tab",
       pendingLabel: "Opening…",
       run: async () => {
@@ -2335,6 +2371,9 @@ export interface PulseDisplay {
   companion: string;
   next: string;
   capacity: string;
+  /** The latest submission's own totals. Same standing as `buckets` now: the
+   * inbox still renders it, and the popup keeps it on hover and in its
+   * accessible description rather than on the one status line it has. */
   batch: string;
   asOf?: string;
 }
@@ -2606,11 +2645,13 @@ export function derivePulseDisplay(
   return { primary, primaryText, buckets: bucketParts.join(" · "), companion, next, capacity, batch };
 }
 
-/** Three lines at most: what is happening (plus whatever else is happening),
- * the one authoritative next action, and either constrained capacity or the
- * latest cohort. The five-bucket string stays available through `title` and
- * through `derivePulseDisplay` for the inbox, but printing it here turned a
- * status into an inventory the researcher had to add up. */
+/** Three lines at most, and usually one: what is happening (plus whatever else
+ * is happening), the one authoritative next action, and capacity while it is
+ * actually holding work back. The five-bucket breakdown and the latest cohort
+ * stay available through `derivePulseDisplay` for the inbox and through this
+ * section's hover and description here — printing them turned a status into an
+ * inventory the researcher had to add up, and the cohort line was the last one
+ * still doing it. */
 export function renderWorkPulse(
   doc: Document,
   cache: PopupPulseCache | undefined,
@@ -2622,37 +2663,48 @@ export function renderWorkPulse(
   const primary = doc.getElementById("popup-pulse-primary");
   const next = doc.getElementById("popup-pulse-next");
   const capacity = doc.getElementById("popup-pulse-capacity");
-  const batch = doc.getElementById("popup-pulse-batch");
   if (!(section instanceof HTMLElement) || !(primary instanceof HTMLElement) ||
-      !(next instanceof HTMLElement) || !(capacity instanceof HTMLElement) || !(batch instanceof HTMLElement)) return;
+      !(next instanceof HTMLElement) || !(capacity instanceof HTMLElement)) return;
   const display = derivePulseDisplay(cache, connectionStatus, now, 15_000, counts);
   primary.textContent = display.companion === ""
     ? display.primaryText
     : `${display.primaryText} · ${display.companion}`;
   next.textContent = display.next;
-  // Capacity only while it is actually constraining something; otherwise the
-  // third line is better spent on the latest cohort.
-  const constrained =
-    display.capacity !== "" && (display.primary === "Waiting on you" || display.primary === "Moving");
-  capacity.textContent = constrained ? display.capacity : "";
-  batch.textContent = constrained ? "" : display.batch;
-  for (const node of [next, capacity, batch]) node.hidden = node.textContent === "";
+  // Capacity only while it is actually constraining something: a configured
+  // limit that is holding nothing back is not news.
+  capacity.textContent =
+    display.capacity !== "" && (display.primary === "Waiting on you" || display.primary === "Moving")
+      ? display.capacity
+      : "";
+  for (const node of [next, capacity]) node.hidden = node.textContent === "";
   // Optional by design: the button is absent from any DOM a caller assembles
   // by hand, and its absence must degrade to today's text-only pulse rather
   // than abandoning the whole render.
   const review = doc.getElementById("popup-pulse-review");
   if (review instanceof HTMLButtonElement) {
     const turns = counts?.turns_required ?? 0;
-    review.textContent = `Review ${turns} ${turns === 1 ? "decision" : "decisions"}`;
+    // The line directly above already carries the count, so the control needs
+    // only the verb. The number stays in the accessible name and on hover, so
+    // nothing reached by keyboard or screen reader is offered an unqualified
+    // "Review".
+    const full = `Review ${turns} ${turns === 1 ? "decision" : "decisions"}`;
+    review.textContent = "Review";
+    review.title = full;
+    review.setAttribute("aria-label", full);
     // Only when the pulse itself says the researcher is the blocker AND the
     // turn authority counts real turns. An offer to review nothing is worse
     // than no offer.
     review.hidden = !(display.primary === "Waiting on you" && turns > 0);
   }
-  // Full validated measurements stay reachable without occupying a line.
-  section.title = [display.primaryText, display.buckets, display.capacity, display.batch]
+  // Full validated measurements stay reachable without occupying a line: on
+  // hover, and — because a bare `title` is not an accessibility path — as this
+  // section's description.
+  const detail = [display.primaryText, display.buckets, display.capacity, display.batch]
     .filter((part) => part !== "")
     .join(" · ");
+  section.title = detail;
+  const description = doc.getElementById("popup-pulse-detail");
+  if (description instanceof HTMLElement) description.textContent = detail;
   section.dataset.state = display.primary;
   // Disconnected is the daemon band's story, not the pulse's, and an unmeasured
   // pulse says nothing worth a line.
@@ -2829,11 +2881,16 @@ function fallbackJobStatus(job: ActiveJob): string {
   }
 }
 
+/** The one visible standing line for a live acquisition, plus whatever this
+ * function decided the line should not spend its width on.
+ *
+ * `detail` is the prior EVENT, already demoted: the caller shows it on hover
+ * and in the accessibility tree, never on the line. */
 function liveStatusText(
   job: ActiveJob,
   activity: ActivityEntryPayload | undefined,
   pendingDelivery: PendingDelivery | undefined,
-): { text: string; timestamp: number; stale: boolean } {
+): { text: string; detail: string; timestamp: number; stale: boolean } {
   const now = Date.now();
   const activityTimestamp = activity === undefined ? NaN : Date.parse(activity.at);
   const fallbackTimestamp = Number.isFinite(job.offered_at) && job.offered_at > 0 ? job.offered_at : now;
@@ -2870,11 +2927,14 @@ function liveStatusText(
   // which names a past EVENT and nothing about now: "Institution login
   // returned - 2m ago" was read on the operator's own screen as an instruction
   // nobody could act on, and labelling it "Last activity:" dated the record
-  // without ever saying where the paper stands. So lead with the standing,
-  // which fallbackJobStatus already words plainly, and demote the event to the
-  // last thing that happened - which the age suffix below already dates.
-  else if (activity !== undefined && text === activity.text.trim()) {
-    text = `${fallbackJobStatus(job)} · last: ${text}`;
+  // without ever saying where the paper stands. So say the standing, which
+  // fallbackJobStatus already words plainly, and demote the event off the line
+  // entirely: at 380px it wrapped this status onto a second and third row to
+  // date a record nobody can act on.
+  let detail = "";
+  if (!waitingOnOperator && activity !== undefined && text === activity.text.trim()) {
+    detail = `last: ${text}`;
+    text = fallbackJobStatus(job);
   }
   const age = relativeAgeParts(timestamp, now);
   const activityAge = Number.isFinite(activityTimestamp) ? relativeAgeParts(activityTimestamp, now) : undefined;
@@ -2884,6 +2944,7 @@ function liveStatusText(
     // A fresh line needs no age: "just now" is what every line says the moment
     // it is written, so it carries no information the reader can act on.
     text: `${stalled ? `No progress for ${stallAge} · ` : ""}${text}${age.display === "just now" ? "" : ` · ${age.display}`}`,
+    detail,
     timestamp,
     stale: stalled,
   };
@@ -2961,12 +3022,28 @@ function renderLiveAcquisition(
   const live = liveStatusText(job, latest, delivery);
   // A verified-warm session outranks a stale auth_pending echo, and the user
   // standing ON the job's tab needs page truth, not a Go-to-tab loop.
-  status.textContent =
+  const warm =
     sessionWarm && latest?.kind === "browser.auth_pending"
       ? onJobTab
         ? "Signed in — a download from this tab is adopted automatically"
         : "Signed in — papio retries this shortly"
-      : live.text;
+      : undefined;
+  const standing = warm ?? live.text;
+  status.textContent = standing;
+  // One visible line: where the paper stands. The prior event rides the line
+  // it explains — on hover, and in the accessibility tree through a companion
+  // the layout does not draw, so a keyboard or screen-reader user is not left
+  // with hover-only meaning.
+  const demoted = warm === undefined ? live.detail : "";
+  if (demoted === "") {
+    status.removeAttribute("title");
+  } else {
+    status.title = `${standing} · ${demoted}`;
+    const spoken = doc.createElement("span");
+    spoken.className = "visually-hidden";
+    spoken.textContent = ` · ${demoted}`;
+    status.append(spoken);
+  }
   status.dataset.stalled = live.stale ? "true" : "false";
   card.hidden = false;
 
@@ -3660,7 +3737,13 @@ export function renderPageContext(
     if (knownJob !== undefined) {
       clearDeliveryChoice(doc);
       // The live card keeps its richer copy and its own Open inbox / Open tab
-      // authority; the rail does not flatten an in-progress acquisition.
+      // authority; the rail does not flatten an in-progress acquisition. And
+      // once the card owns this job's standing, a rail control that can never
+      // be clicked is a second, deader statement of the same fact — the no-DOI
+      // path already refuses to draw one on the principle that a permanently
+      // dead control teaches nothing. A pending click of the researcher's own
+      // is not that: restorePendingRailState re-shows it as "Sending…".
+      if (button.disabled) setAcquireButton(button, "Send this PDF to papio", true, true);
       renderLiveAcquisition(
         doc,
         knownJob,
@@ -3729,7 +3812,12 @@ export function renderPageContext(
     return;
   }
 
-  setAcquireButton(button, `Acquisition in progress · ${normalizedDOI}`, true);
+  // Hidden, not merely disabled: the live card directly below states this same
+  // job's standing precisely, and a dead "Acquisition…" above it was the
+  // popup's clearest case of saying one thing twice, the second time in a
+  // control nobody can use. Its label still exists for the pending path, which
+  // restorePendingRailState re-shows.
+  setAcquireButton(button, `Acquisition in progress · ${normalizedDOI}`, true, true);
   renderLiveAcquisition(
     doc,
     inFlightJob,
@@ -3896,8 +3984,8 @@ export async function refresh(): Promise<void> {
   refreshCaptureOptions(document, store.daemonFeatures);
   // Wave 2: every slow input is gathered in parallel and painted in ONE
   // synchronous pass. Sections revealing one by one over the next seconds
-  // shift later cards mid-aim — a live mis-click hit "Focus" where
-  // "Close them" had been a moment earlier.
+  // shift later cards mid-aim — a live mis-click hit "Focus" where the
+  // leftover-tabs control had been a moment earlier.
   const [freshActivity, _pulse, freshCounts, delivery, pageMetadata, session, orphanCount, consent, ungranted] =
     await Promise.all([
       readPopupActivity(),
@@ -3969,7 +4057,6 @@ export async function refresh(): Promise<void> {
     store.activeJobs,
     store.blockedProviderHosts,
     openHandoff,
-    openOptions,
     session?.stalledAuthJobs ?? [],
     retryAuthStalled,
     async (host) => {

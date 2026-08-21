@@ -57,7 +57,6 @@
         --focus-offset: 2px;
         --page-max-width: 72rem;
         --dialog-max-width: 32rem;
-        --content-measure: 60rem;
         --radius-pill: 999px;
         --motion-hover: 120ms;
         --motion-state: 160ms;
@@ -796,12 +795,32 @@
         overflow-wrap: anywhere;
       }
 
-      .family-heading {
-        margin-top: var(--space-6);
+      /* Kind, count and the block's single instruction share one header line:
+         the instruction is what the heading is for, and two stacked lines said
+         it twice as far as the eye is concerned. It wraps to a second line only
+         when the sentence genuinely does not fit beside the kind. */
+      .family-header {
+        align-items: baseline;
+        column-gap: var(--space-2);
+        display: flex;
+        flex-wrap: wrap;
+        margin: var(--space-6) 0 var(--space-2);
       }
 
+      /* Sentence case, not the tracked uppercase of a bare kind label: once the
+         heading carries an instruction beside it, uppercase reads as shouting. */
+      .family-heading {
+        color: var(--color-ink);
+        font-size: var(--font-size-small);
+        font-weight: 700;
+      }
+
+      /* `overflow-wrap: anywhere` (inherited from .item-instruction) would make
+         this flex item one character wide and stack the header into a skinny
+         column. `break-word` still breaks an unbreakable string but leaves the
+         intrinsic width intact. */
       .family-guidance {
-        margin: var(--space-2) 0 var(--space-3);
+        overflow-wrap: break-word;
       }
 
       /* Printed only where papio cannot take the download itself, so it sits
@@ -809,7 +828,7 @@
       .family-mechanism {
         color: var(--color-muted);
         font-size: var(--font-size-small);
-        margin: calc(-1 * var(--space-2)) 0 var(--space-3);
+        margin: calc(-1 * var(--space-1)) 0 var(--space-2);
       }
 
       .item-guidance {
@@ -1344,6 +1363,8 @@
       <p id="connection-status" role="status" aria-live="polite" hidden></p>
       <!-- Empty and hidden until renderPulse has measured state; see popup.html. -->
       <p id="inbox-pulse" role="status" aria-live="polite" hidden></p>
+      <!-- Turn authority only: the tab labels below own the inventory totals,
+           so nothing that restates them belongs here. See renderCounts(). -->
       <p id="inbox-counts">Counts unavailable</p>
       <div class="toolbar" aria-label="Inbox controls">
         <input id="item-filter" type="search" placeholder="Filter by title, DOI, or detail…" aria-label="Filter inbox items" />

@@ -102,7 +102,7 @@ test("computeBadge uses required turns only for a complete counts v3 projection"
   expect(incompleteV3).toMatchObject({
     text: "",
     color: "#1a73e8",
-    tooltip: "Many decisions waiting — open inbox",
+    tooltip: "papio: Many decisions waiting — open inbox",
   });
 });
 test("toolbar count modes select the configured numeric tier without masking blockers", () => {

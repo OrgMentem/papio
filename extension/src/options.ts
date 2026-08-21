@@ -105,6 +105,10 @@ function render(
   list.replaceChildren();
   for (const source of sources) {
     const item = document.createElement("li");
+    // One visible line: the friendly label. The exact pattern stays in the DOM
+    // for assistive tech, in the switch's accessible name, and returns on
+    // screen through the row tooltip on hover or keyboard focus.
+    item.setAttribute("data-tip", source.origin);
 
     const meta = document.createElement("div");
     const label = document.createElement("div");
@@ -709,6 +713,9 @@ async function renderScannerAllowlist(options?: { keepNotice?: boolean }): Promi
 
   for (const origin of origins) {
     const item = document.createElement("li");
+    // Same rule as the permission rows: the scheme-stripped host is the one
+    // visible line, the exact origin rides the tooltip and the accessible name.
+    item.setAttribute("data-tip", origin);
 
     const meta = document.createElement("div");
     const label = document.createElement("div");

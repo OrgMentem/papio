@@ -298,8 +298,11 @@
 
       /* Compact and start-aligned, deliberately not a full-width primary: the
          line above it is already the loudest thing in the lens, and a 356px
-         block button would make the route louder than the fact. */
+         block button would make the route louder than the fact. `width: auto`
+         alone never delivered that — a grid item stretches to its column — and
+         it showed the moment the label stopped being a sentence. */
       .popup-pulse-review {
+        justify-self: start;
         margin-top: var(--space-2);
         width: auto;
       }
@@ -601,8 +604,12 @@
         justify-content: space-between;
       }
 
+      /* Secondary, like every other explanatory line in this popup. At body
+         size it was the one 14px status here, and it wrapped nine of the
+         session states onto a second line. */
       .institution-session-status {
         color: var(--color-context);
+        font-size: var(--font-size-small);
         font-weight: 700;
         flex: 1;
         min-width: 0;
@@ -787,12 +794,6 @@
         min-width: 0;
       }
 
-      .needs-you-reason {
-        color: var(--color-primary);
-        font-size: var(--font-size-small);
-        overflow-wrap: anywhere;
-      }
-
       .needs-you-item > button {
         border-color: var(--color-primary-border);
         color: var(--color-primary);
@@ -951,11 +952,19 @@
     <!-- Hidden and empty until renderWorkPulse has real state: a default line
          here is painted before the first read returns, so every popup opened
          with a flash of a status nobody had measured yet. -->
-    <section id="popup-pulse" class="popup-pulse" aria-labelledby="popup-pulse-primary" hidden>
+    <section id="popup-pulse" class="popup-pulse" aria-labelledby="popup-pulse-primary" aria-describedby="popup-pulse-detail" hidden>
       <div id="popup-pulse-primary" class="popup-pulse-primary" role="status" aria-live="polite"></div>
       <div id="popup-pulse-next" class="popup-pulse-detail" hidden></div>
       <div id="popup-pulse-capacity" class="popup-pulse-detail" hidden></div>
-      <div id="popup-pulse-batch" class="popup-pulse-detail" hidden></div>
+      <!-- Every validated measurement, including the latest submission's own
+           breakdown, which no longer spends a visible line: five counts in a
+           380px lens is an inventory the reader has to add up. It stays on the
+           section's `title` for hover and here as the section's description,
+           because a bare `title` is not a keyboard or screen-reader path.
+           `hidden`, not `.visually-hidden`: a description target referenced by
+           aria-describedby is read for the description even while display:none
+           keeps it out of the reading order, so nobody hears it twice. -->
+      <div id="popup-pulse-detail" hidden></div>
       <!-- The count is the most important fact in this popup and it used to be
            inert text: the popup told the researcher they were the blocker and
            then offered them nothing but the current page's two buttons. Same
@@ -1017,7 +1026,10 @@
       </section>
 
       <section id="needs-you-section" class="needs-you" hidden aria-labelledby="needs-you-heading">
-        <h2 id="needs-you-heading">Needs you</h2>
+        <!-- ADR-0023 reserves "Needs you" for the daemon's turns_required,
+             which the pulse above already spends its primary line on. This
+             section is browser-local blockers only, so it says where they are. -->
+        <h2 id="needs-you-heading">Do this in the browser</h2>
         <p id="needs-you-message"></p>
         <div id="needs-you-list" class="needs-you-list"></div>
       </section>
@@ -1033,7 +1045,10 @@
         </div>
         <div id="institution-session-rows" class="institution-session-rows" hidden></div>
         <div id="institution-session-waiting" class="institution-session-waiting" hidden>
-          <p id="institution-session-waiting-heading" class="institution-session-waiting-heading">Waiting on your sign-in</p>
+          <!-- Filled and shown by renderWaitingOnSignIn only once it is
+               labelling two or more rows: above a single row whose own button
+               says Open, a sub-heading restates the row. -->
+          <p id="institution-session-waiting-heading" class="institution-session-waiting-heading" hidden></p>
           <div id="institution-session-waiting-list" class="institution-session-waiting-list"></div>
         </div>
         <!-- Keeps its own live role: this announces a daemon-side release the
@@ -1046,7 +1061,7 @@
         <h2 id="leftover-tabs-heading">Leftover papio tabs</h2>
         <div class="action-row">
           <p id="leftover-tabs-message" class="leftover-tabs-message"></p>
-          <button id="leftover-tabs-cleanup" type="button">Close them</button>
+          <button id="leftover-tabs-cleanup" type="button">Review in browser</button>
         </div>
       </section>
 

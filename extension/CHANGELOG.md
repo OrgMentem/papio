@@ -71,6 +71,41 @@ for the full pre-split extension history.
   instant as it, so even a click that lands mid-close is caught.
 
 ### Changed
+- **The popup spends its space on the action, not the explanation twice.**
+  A single browser blocker now occupies one compact row under **Do this in the
+  browser**; its explanation stays on the control for hover and assistive
+  technology instead of being printed again below the same heading. The
+  decision count is no longer repeated in both the pulse and its button, the
+  batch summary remains available in the pulse's accessible detail rather than
+  taking another line, a live paper no longer sits below a disabled copy of its
+  own Acquire control, and a one-paper institutional wait no longer gets a
+  group heading. The prior event behind a paper's current standing also moves
+  to its detail while `No progress for …` remains visible. On the measured
+  worst-case popup this removes 101.5px; one lone security check falls from six
+  lines plus a control to two lines plus a control.
+- **The inbox states a shared instruction once per group.** Security checks,
+  terms, sign-ins and same-kind manual-download rows now carry one
+  sentence-case heading and instruction even when there is only one row,
+  instead of repeating the instruction under every paper — or, on the old
+  incomplete-family path, omitting the heading entirely. A row keeps its title
+  and one identifying fact; citation links collapse to their host only when an
+  author or year already identifies the paper, while the full destination
+  remains available on hover and to assistive technology. The Firefox
+  manual-download caveat remains visible once per group. The page header now
+  keeps only the unique turn count (`N need you`); the Actions and Watch hits
+  tabs remain the inventory authority instead of the same totals being added
+  together and printed again above them.
+- **Permission rows keep the publisher, and move the raw match pattern to
+  detail.** Options no longer spends a second visible line on
+  `https://*.publisher.example/*` beneath every friendly publisher name. Hover
+  the row or focus its switch to see the exact pattern immediately; it remains
+  in the switch's accessible name as well. Twelve ordinary provider rows lose
+  180px while distinct permission, credential, MFA and legal consequences stay
+  visible.
+- **The small labels now say what they mean.** The toolbar's uncapped fallback
+  tooltip has the same `papio:` prefix as every sibling state, and the access
+  landing page now says to return to the paper — or that the tab is no longer
+  valid — instead of exposing the internal phrase `materialization binding`.
 - **The popup says what is happening, and offers the way to act on it.**
   "Waiting on you · 125 decisions" was plain text: the popup named you as the
   hold-up and then offered nothing but the two buttons for the page you happened

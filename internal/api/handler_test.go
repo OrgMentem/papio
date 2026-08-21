@@ -219,7 +219,7 @@ func TestTriageDecideAcknowledgesRetractionNotice(t *testing.T) {
 	system := testSystem(t)
 	source := &stubRetractionSource{item: triage.Item{
 		Kind: triage.KindRetraction, ID: triage.RetractionIDPrefix + "10.1000/retracted",
-		Title: "Library update notice", Ops: []string{"dismiss", "open"},
+		Title: "Retracted work", Ops: []string{"dismiss", "open"},
 		Retraction: &triage.Retraction{DOI: "10.1000/retracted", Nature: "retraction", NoticedAt: time.Now().UTC()},
 	}, applied: true}
 	system.Triage.RegisterSource(source)

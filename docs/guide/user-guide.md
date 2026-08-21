@@ -338,11 +338,13 @@ Then open the current handoff URLs:
 papio actions open
 ```
 
-The extension popup groups jobs into **needs you**, in-flight, and completed
-sections. Use its Focus control only when authentication or a provider-owned
-decision is required. `papio actions open` asks a compatible extension to use
-the browser where its tracked session lives; without one, it opens the resolver
-URLs normally.
+The extension popup keeps daemon-owned decisions in its pulse and browser-local
+work under **Do this in the browser**. A shared explanation appears once rather
+than under every paper; hover or focus a compact control for its secondary
+detail. Use **Focus** only when authentication or a provider-owned decision is
+required. `papio actions open` asks a compatible extension to use the browser
+where its tracked session lives; without one, it opens the resolver URLs
+normally.
 
 The inbox keeps itself current without a manual refresh: it updates as soon
 as you return to the tab, and checks in on its own every so often while the
@@ -350,6 +352,14 @@ tab stays open, so a new or resolved job doesn't wait for you to notice. The
 toolbar badge keeps pace on the extension's own wake cycle — its existing
 one-minute keepalive alarm — whether or not a *papio* tab is open, since the
 browser decides how often a sleeping extension is woken.
+
+The inbox follows the same rule: one sentence-case heading and instruction per
+same-kind block, with each paper reduced to its title and one identifying fact.
+A one-paper security check, terms page, or institutional sign-in still keeps its
+instruction; shared copy is never hidden merely because there is only one row.
+The summary line carries only the exact effective turn count (`N need you`);
+Actions and Watch hits keep their own inventory counts in the tabs instead of
+those totals being repeated and added together above them.
 
 The popup also reports the background service's health: it shows a version line
 when all is well, and clear warnings when the service is unreachable or the two sides are out of date.
@@ -376,6 +386,9 @@ institutional-login loop again. An empty or still-loading resolver page remains
 assisted rather than being treated as proof of no access.
 
 Grant optional extension host permissions only for publisher sites you use.
+The friendly publisher name is the only visible row label; hover the row or
+focus its switch to reveal the exact host pattern being granted. The full
+pattern remains in the control's accessible name.
 While handoff jobs are still open, the extension keeps one pinned, muted tab and
 reloads it now and then to keep your session alive. If it detects that your
 institution's login page has taken over, it stops reloading, brings the tab

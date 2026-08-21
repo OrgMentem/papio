@@ -456,10 +456,13 @@ function orderedItems(): TriageSnapshotItem[] {
     .sort((left, right) => classRank[left.kind] - classRank[right.kind] || left.rank - right.rank);
 }
 
-function safeExternalURL(value: string): string | null {
+/** An https link and the host it names. The host is read off the daemon's own
+ * URL and is never inferred: the inbox has no `challenge_host` and must not
+ * imply it knows one. Display drops only a leading `www.`. */
+function safeExternalLink(value: string): { url: string; host: string } | null {
   try {
     const url = new URL(value);
-    return url.protocol === "https:" ? url.href : null;
+    return url.protocol === "https:" ? { url: url.href, host: url.hostname.replace(/^www\./u, "") } : null;
   } catch {
     return null;
   }
@@ -488,8 +491,8 @@ function safePreviewURL(value: string): string | null {
 
 function firstSafeLink(item: TriageSnapshotItem): string | null {
   for (const link of item.links) {
-    const url = safeExternalURL(link.url);
-    if (url !== null) return url;
+    const safe = safeExternalLink(link.url);
+    if (safe !== null) return safe.url;
   }
   return null;
 }
@@ -1012,7 +1015,7 @@ function selectItem(itemID: string, focus: boolean): void {
   if (focus) rowForItem(itemID)?.focus();
 }
 
-const LINK_LABELS: Record<string, string> = { arxiv: "arXiv", openalex: "OpenAlex", landing: "landing page" };
+const LINK_LABELS: Record<string, string> = { doi: "DOI", arxiv: "arXiv", openalex: "OpenAlex", landing: "landing page" };
 
 function factText(item: TriageSnapshotItem, label: string): string | null {
   const fact = item.facts.find((candidate) => candidate.label === label);
@@ -1077,18 +1080,23 @@ function citationAnchor(url: string, text: string): HTMLAnchorElement {
   return anchor;
 }
 
-// One reference-style line per item: authors and year in the selected
-// citation style, with the DOI hyperlinked as its own URL — the link IS the
-// citation's locator, replacing a separate "Open DOI" row. Non-DOI links
-// follow as short labeled anchors. A row whose displayed title is already
-// the DOI (placeholder fallback) does not repeat that link here.
+/** One short reference line per item: author and year in the selected citation
+ * style, then the links. Where an author or a year already identifies the
+ * paper, each link shrinks to the host it names and the full URL moves onto
+ * the anchor as `title` plus an `aria-label` that keeps the link's relation —
+ * the demotion `setAcquireButton` already ships in the popup, so nothing
+ * leaves the surface and the screen-reader path stays whole. Where neither
+ * fact exists the link IS the row's identity (a retraction notice, a
+ * title-less job), so it keeps its locator: a bare `doi.org` would name every
+ * paper equally. A row whose displayed title is already the DOI (placeholder
+ * fallback) does not repeat that link here. */
 function renderCitation(item: TriageSnapshotItem, placeholderURL: string | null): HTMLElement | null {
   const authorsText = factText(item, "Authors");
   const year = factText(item, "Year");
-  const safe: Array<{ rel: string; url: string }> = [];
+  const safe: Array<{ rel: string; url: string; host: string }> = [];
   for (const link of item.links) {
-    const url = safeExternalURL(link.url);
-    if (url !== null) safe.push({ rel: link.rel, url });
+    const parsed = safeExternalLink(link.url);
+    if (parsed !== null) safe.push({ rel: link.rel, ...parsed });
   }
   const doi = safe.find((link) => link.rel === "doi");
   const extras = safe.filter((link) => link !== doi);
@@ -1116,13 +1124,14 @@ function renderCitation(item: TriageSnapshotItem, placeholderURL: string | null)
   citation.className = "item-citation";
   if (prefix !== "") citation.append(document.createTextNode(`${prefix} `));
   const doiShown = doi !== undefined && placeholderURL !== null && doi.url.replace(/^https:\/\//, "") === placeholderURL;
-  if (doi !== undefined && !doiShown) {
-    citation.append(citationAnchor(doi.url, style === "apa" ? doi.url : doi.url.replace(/^https:\/\//, "")));
-    if (style !== "apa") citation.append(document.createTextNode("."));
-  }
-  for (const link of extras) {
-    if (citation.childNodes.length > 0) citation.append(document.createTextNode(" · "));
-    citation.append(citationAnchor(link.url, LINK_LABELS[link.rel] ?? link.rel));
+  const links = doi === undefined || doiShown ? extras : [doi, ...extras];
+  const identified = prefix !== "";
+  for (const link of links) {
+    if (link !== links[0]) citation.append(document.createTextNode(" · "));
+    const anchor = citationAnchor(link.url, identified ? link.host : link.url.replace(/^https:\/\//, ""));
+    anchor.title = link.url;
+    anchor.setAttribute("aria-label", `${LINK_LABELS[link.rel] ?? link.rel}: ${link.url}`);
+    citation.append(anchor);
   }
   return citation.childNodes.length > 0 ? citation : null;
 }
@@ -1319,12 +1328,15 @@ function missingAdapter(item: TriageSnapshotItem): boolean {
 }
 
 interface ManualDownloadCopy {
-  /** Hoisted family heading; the block appends its exact paper count. */
+  /** Hoisted block heading; the block appends its exact paper count. */
   heading: string;
-  /** Hoisted family instruction, printed once per block. */
+  /** Hoisted instruction, printed once per block. */
   instruction: string;
-  /** The same imperative for a row that hoists no heading. */
-  row: string;
+  /** The same imperative where the block holds exactly one paper. Only these
+   * five sentences need it: they are the only family copy that counts
+   * providers rather than papers, and "these providers" cannot stand above a
+   * single row. */
+  one: string;
   glyph: string;
   statusLabel: string;
 }
@@ -1337,35 +1349,35 @@ const MANUAL_DOWNLOAD_COPY: Partial<Record<NonNullable<TriageSnapshotItem["guida
   manual_download: {
     heading: "Manual downloads",
     instruction: "Download each PDF — papio takes it from there.",
-    row: "Download the PDF — papio takes it from there.",
+    one: "Download the PDF — papio takes it from there.",
     glyph: "↓",
     statusLabel: "Manual download needed",
   },
   manual_download_adapter_missing: {
     heading: "Manual downloads · no adapter yet",
     instruction: "papio has no adapter for these providers yet. Download each PDF — papio takes it from there.",
-    row: "papio has no adapter for this provider yet. Download the PDF — papio takes it from there.",
+    one: "papio has no adapter for this provider yet. Download the PDF — papio takes it from there.",
     glyph: "↓",
     statusLabel: "Manual download needed — no adapter for this provider yet",
   },
   manual_download_page_undriveable: {
     heading: "Manual downloads · page changed",
     instruction: "papio could not drive these provider pages. Download each PDF — papio takes it from there.",
-    row: "papio could not drive this provider page. Download the PDF — papio takes it from there.",
+    one: "papio could not drive this provider page. Download the PDF — papio takes it from there.",
     glyph: "↓",
     statusLabel: "Manual download needed — papio could not drive the page",
   },
   manual_download_rejected_file: {
     heading: "Replace rejected files",
     instruction: "The file papio adopted was not the paper. Download a different PDF for each.",
-    row: "The file papio adopted was not the paper. Download a different PDF.",
+    one: "The file papio adopted was not the paper. Download a different PDF.",
     glyph: "↺",
     statusLabel: "Rejected file — download a different PDF",
   },
   manual_download_wrong_work: {
     heading: "Wrong paper reached",
     instruction: "papio landed on a different work. Find and download the requested PDF.",
-    row: "papio landed on a different work. Find and download the requested PDF.",
+    one: "papio landed on a different work. Find and download the requested PDF.",
     glyph: "≠",
     statusLabel: "Wrong paper reached — find the requested PDF",
   },
@@ -1387,14 +1399,12 @@ function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): st
   if (item.kind !== "human_action") return null;
   if (blockedByChallenge) return "Solve the security check in its tab";
   switch (item.action_kind) {
-    case "manual_download": {
-      const manual = manualDownloadCopy(item);
-      if (manual !== null) return manual.row;
-      // A daemon older than the closed manual-download variants ships no
-      // structured discriminator at all; its detail prose is the only signal
-      // there is. Never consulted once a variant is present.
+    // A daemon older than the closed manual-download variants ships no
+    // structured discriminator at all; its detail prose is the only signal
+    // there is. Every mapped variant is answered by its block copy instead,
+    // which is why this legacy pair is only ever reached without one.
+    case "manual_download":
       return missingAdapter(item) ? "No adapter yet - download this PDF manually" : "Download the PDF yourself - papio adopts it";
-    }
     case "openurl_handoff":
       return item.requires_auth === true ? "Sign in to your institution" : "Open the page";
     case "verify_identity":
@@ -1409,15 +1419,32 @@ function guidanceText(item: TriageSnapshotItem, blockedByChallenge: boolean): st
       return null;
   }
 }
-function locallyRenderedGuidance(item: TriageSnapshotItem): string | null {
-  if (waitingSibling(item)) return "papio is continuing — waiting for the institution sign-in already open in another tab";
-  const blocked = challengeBlocked(item);
-  if (blocked) return renderInstruction(item, true, item.attention === "working")?.textContent ?? null;
-  const family = familyCopy(item);
-  if (family !== null) return family.instruction;
+/** Two states are the browser's own rather than the daemon's: an institution
+ * sign-in already open in another tab, and a tab a security check has
+ * blocked. Copy written for a whole block can describe neither, so such a row
+ * keeps its own instruction line inside the block it still belongs to. */
+function rowStateOverridesBlock(item: TriageSnapshotItem): boolean {
+  return waitingSibling(item) || challengeBlocked(item);
+}
+
+/** The imperative a row would print for itself. This is what gets hoisted
+ * where the daemon shipped no guidance variant for the page to author copy
+ * from. Null for a row whose own state overrides the block, and for a row
+ * with no imperative at all. */
+function hoistableGuidance(item: TriageSnapshotItem): string | null {
+  if (rowStateOverridesBlock(item)) return null;
   const guidance = guidanceText(item, false);
   if (guidance === null || guidance.trim() === "") return null;
   return item.attention === "working" ? `papio is continuing — ${guidance.charAt(0).toLowerCase()}${guidance.slice(1)}` : guidance;
+}
+
+interface FamilyCopy {
+  /** Sentence-case kind; the block appends its exact paper count. */
+  heading: string;
+  /** The one instruction printed above the block's rows. */
+  instruction: string;
+  /** The same imperative where the block holds exactly one paper. */
+  one: string;
 }
 
 interface FamilyRender {
@@ -1426,63 +1453,191 @@ interface FamilyRender {
   descriptionID: string;
   total: number;
   shown: number;
-  /** The loaded rows of this run do not share one reason, so each carries its
-   * own summary line. When they do share it, printing it per row would be the
-   * exact repetition hoisting exists to remove. */
-  varyingReasons: boolean;
+  /** Print each row's own reason line. False only where several loaded rows
+   * share one reason — the exact repetition hoisting exists to remove. One
+   * row's reason repeats nothing, so a lone row keeps it. */
+  rowReasons: boolean;
   /** The honest download route on this browser, printed once per block where
    * the hoisted instruction alone would over-promise. Null where papio can
    * take the download itself. */
   platformRoute: string | null;
 }
 
-function familyCopy(item: TriageSnapshotItem): { heading: string; instruction: string } | null {
+// Eight of these read correctly above one row and above twenty: they name
+// papers, checks or pages, never a count of providers. The five manual
+// downloads do count providers, so each carries its own one-row form. The
+// pdf_identifier variant is deliberately absent — see blockCopy.
+function familyCopy(item: TriageSnapshotItem): FamilyCopy | null {
   const manual = manualDownloadCopy(item);
-  if (manual !== null) return { heading: manual.heading, instruction: manual.instruction };
+  if (manual !== null) return { heading: manual.heading, instruction: manual.instruction, one: manual.one };
+  const copy = (heading: string, instruction: string): FamilyCopy => ({ heading, instruction, one: instruction });
   switch (item.guidance_variant) {
-    case "institution_sign_in": return { heading: "Institution sign-in", instruction: "Sign in to your institution once — papio continues the waiting papers." };
-    case "open_page": return { heading: "Pages to open", instruction: "Open each source page so papio can continue." };
-    case "verify_identity": return { heading: "PDF identity review", instruction: "Review each PDF, then accept or reject it." };
-    case "document_delivery": return { heading: "Document delivery", instruction: "Confirm what the library has on file for each request." };
-    case "downloads_access": return { heading: "Downloads access", instruction: "Grant Downloads access so papio can adopt the pending files." };
-    case "terms_acceptance": return { heading: "Publisher terms", instruction: "Review and accept the publisher terms for each source." };
-    case "security_challenge": return { heading: "Security checks", instruction: "Solve each security check in its tab." };
-    case "pdf_identifier": return { heading: "PDF identifiers", instruction: "Provide an identifier for each captured PDF." };
-    case "papio_continuing": return { heading: "papio continuing", instruction: "papio is continuing automatically — no decision is needed." };
+    case "institution_sign_in": return copy("Institution sign-in", "Sign in to your institution once — papio continues the waiting papers.");
+    case "open_page": return copy("Pages to open", "Open each source page so papio can continue.");
+    case "verify_identity": return copy("PDF identity review", "Review each PDF, then accept or reject it.");
+    case "document_delivery": return copy("Document delivery", "Confirm what the library has on file for each request.");
+    case "downloads_access": return copy("Downloads access", "Grant Downloads access so papio can adopt the pending files.");
+    case "terms_acceptance": return copy("Publisher terms", "Review and accept the publisher terms for each source.");
+    case "security_challenge": return copy("Security checks", "Solve each security check in its tab.");
+    // pdf_identifier: see blockCopy. A grab's imperative names its own id.
+    case "papio_continuing": return copy("papio continuing", "papio is continuing automatically — no decision is needed.");
     default: return null;
   }
 }
 
-function familyForItem(item: TriageSnapshotItem, items: readonly TriageSnapshotItem[]): FamilyRender | null {
-  if (state.snapshot?.schema !== 5 || item.run_key === undefined || item.next_actor === undefined ||
-      item.guidance_variant === undefined || item.operation_variant === undefined) return null;
-  const copy = familyCopy(item);
-  const run = state.counts?.family_runs?.find((candidate) =>
-    candidate.run_key === item.run_key &&
-    candidate.guidance_variant === item.guidance_variant &&
-    candidate.operation_variant === item.operation_variant &&
-    candidate.next_actor === item.next_actor);
-  if (copy === null || state.counts?.family_breakdown_complete !== true || run === undefined || run.count < 2) return null;
-  const runItems = items.filter((candidate) => candidate.run_key === item.run_key);
-  if (runItems.length < 2) return null;
-  const first = items.findIndex((candidate) => candidate.run_key === item.run_key);
-  const last = items.length - 1 - [...items].reverse().findIndex((candidate) => candidate.run_key === item.run_key);
-  if (first < 0 || last < first || items.slice(first, last + 1).some((candidate) => candidate.run_key !== item.run_key)) return null;
-  const guidance = locallyRenderedGuidance(item);
-  if (guidance === null || runItems.some((candidate) =>
-    candidate.next_actor !== item.next_actor ||
-    candidate.guidance_variant !== item.guidance_variant ||
-    candidate.operation_variant !== item.operation_variant ||
-    locallyRenderedGuidance(candidate) !== guidance
-  )) return null;
-  const descriptionID = `family-guidance-${item.run_key.replace(/[^A-Za-z0-9_-]/g, "_")}`;
-  const ownReason = reasonSummary(item, copy.instruction);
-  const varyingReasons = runItems.some((candidate) => reasonSummary(candidate, copy.instruction) !== ownReason);
-  const platformRoute = manualDownloadCopy(item) !== null && !downloadSteeringAvailable() ? NO_STEERING_ROUTE : null;
-  return { ...copy, descriptionID, total: run.count, shown: runItems.length, varyingReasons, platformRoute };
+/** The heading a block keeps when the daemon shipped no guidance variant, or
+ * shipped one this extension does not know. The action kind is still
+ * trustworthy, so such a block never loses its header and its rows never
+ * repeat one instruction N times. A kind absent here has no honest block name
+ * and its rows stay standalone. */
+const ACTION_KIND_HEADINGS: Record<string, string> = {
+  manual_download: "Manual downloads",
+  openurl_handoff: "Pages to open",
+  verify_identity: "PDF identity review",
+  document_delivery: "Document delivery",
+  downloads_access_required: "Downloads access",
+  unsafe_pdf: "Held files",
+};
+
+/** The copy a block prints above its rows. Authored family copy wins wherever
+ * the daemon named a guidance variant: it is the only path that can name the
+ * kind, and it renders at any count — which is what finally gives a lone
+ * security check, terms gate or institution sign-in the instruction the
+ * per-row path has no case for. Without a variant the row's own imperative is
+ * hoisted verbatim under an action-kind heading; that form earns its header
+ * only by removing repetition, so a lone row keeps its instruction inline. */
+function blockCopy(item: TriageSnapshotItem): { copy: FamilyCopy; needsSiblings: boolean } | null {
+  // A grab's imperative is its own `papio grabs identify <id>` command, which
+  // no block sentence can stand in for: hoisting one summary would delete as
+  // many distinct routes as there are rows. Grabs stay standalone under the
+  // group's own kind label.
+  if (item.kind === "pdf_grab") return null;
+  const authored = familyCopy(item);
+  if (authored !== null) return { copy: authored, needsSiblings: false };
+  if (item.kind !== "human_action") return null;
+  const heading = ACTION_KIND_HEADINGS[item.action_kind ?? ""];
+  const instruction = hoistableGuidance(item);
+  if (heading === undefined || instruction === null) return null;
+  return { copy: { heading, instruction, one: instruction }, needsSiblings: true };
 }
 
-/** The row's own durable reason, reduced to the leading clause the family
+/** Rows share a block when the daemon puts them in one run and they carry the
+ * same copy. Run identity stays in the key because a run is a batch: two
+ * adjacent lone rows that happen to read alike are still two batches, and one
+ * heading claiming a single count for both would be false. Rows with no run
+ * key group on their copy alone, which is all an older daemon supplies. */
+function blockKey(item: TriageSnapshotItem, copy: FamilyCopy): string {
+  return [
+    item.run_key ?? "",
+    item.guidance_variant ?? "",
+    item.operation_variant ?? "",
+    item.next_actor ?? "",
+    copy.heading,
+    copy.instruction,
+  ].join("\u0000");
+}
+
+function blockRender(
+  items: readonly TriageSnapshotItem[],
+  runSizes: ReadonlyMap<string, number>,
+  start: number,
+  shown: number,
+  copy: FamilyCopy,
+): FamilyRender {
+  const first = items[start]!;
+  const counts = state.counts;
+  const run = counts?.family_breakdown_complete === true
+    ? counts.family_runs?.find((candidate) =>
+      candidate.run_key === first.run_key &&
+      candidate.guidance_variant === first.guidance_variant &&
+      candidate.operation_variant === first.operation_variant &&
+      candidate.next_actor === first.next_actor)
+    : undefined;
+  // The daemon counts a whole run. That count can only stand above this block
+  // where the block holds every loaded row of the run; a run the list has
+  // split is counted by what is actually under the heading.
+  const holdsWholeRun = first.run_key !== undefined && runSizes.get(first.run_key) === shown;
+  const total = run !== undefined && holdsWholeRun ? run.count : shown;
+  const instruction = total === 1 ? copy.one : copy.instruction;
+  const ownReason = reasonSummary(first, instruction);
+  let rowReasons = shown === 1;
+  for (let at = start + 1; !rowReasons && at < start + shown; at += 1) {
+    rowReasons = reasonSummary(items[at]!, instruction) !== ownReason;
+  }
+  return {
+    heading: copy.heading,
+    instruction,
+    descriptionID: `family-guidance-${first.id.replace(/[^A-Za-z0-9_-]/g, "_")}`,
+    total,
+    shown,
+    rowReasons,
+    // Once per block, never per row: the hoisted imperative reads the same on
+    // every browser, but how a saved file reaches papio does not.
+    platformRoute: first.action_kind === "manual_download" && !downloadSteeringAvailable() ? NO_STEERING_ROUTE : null,
+  };
+}
+
+/** One entry per row: the block that row sits under, or null where it stands
+ * alone. Blocks are derived from the loaded rows themselves, so a single
+ * unmapped guidance flag anywhere in the snapshot can no longer flip the whole
+ * surface back to one repeated instruction per row with no header at all — the
+ * daemon's run breakdown is consulted only for how many papers a run holds. */
+function familyBlocks(items: readonly TriageSnapshotItem[]): Array<FamilyRender | null> {
+  const copies = items.map((item) => blockCopy(item));
+  const keys = copies.map((block, index) => block === null ? null : blockKey(items[index]!, block.copy));
+  const runSizes = new Map<string, number>();
+  for (const item of items) {
+    if (item.run_key === undefined) continue;
+    runSizes.set(item.run_key, (runSizes.get(item.run_key) ?? 0) + 1);
+  }
+  const blocks: Array<FamilyRender | null> = items.map(() => null);
+  let index = 0;
+  while (index < items.length) {
+    const block = copies[index];
+    if (block === null || block === undefined) {
+      index += 1;
+      continue;
+    }
+    let end = index + 1;
+    while (end < items.length && keys[end] === keys[index]) end += 1;
+    const shown = end - index;
+    if (block.needsSiblings && shown < 2) {
+      index += 1;
+      continue;
+    }
+    blocks.fill(blockRender(items, runSizes, index, shown, block.copy), index, end);
+    index = end;
+  }
+  return blocks;
+}
+
+/** The daemon's reason prose and this page's own hoisted copy name the same
+ * situation in different words — "reached" for "landed on", one provider for
+ * many — so comparing them literally printed the identical fact twice on every
+ * live manual-download family: once hoisted, once per row. Each entry is a
+ * closed pair of the exact sentences the two sides ship (the details minted in
+ * internal/browser/bridge.go's manual-download branch, against
+ * MANUAL_DOWNLOAD_COPY above), matched after the same alphanumeric collapsing
+ * both sides already get. A lookup table, never a fuzzy matcher: a reason that
+ * is not listed here still prints. */
+const EQUIVALENT_REASONS: ReadonlyArray<readonly string[]> = [
+  ["papio reached a different work", "papio landed on a different work"],
+  ["papio could not drive the provider page", "papio could not drive these provider pages"],
+  ["papio has no adapter for this provider yet", "papio has no adapter for these providers yet"],
+];
+
+// Collapsing leaves only lowercase alphanumerics and single spaces, so a NUL
+// stands in for an equivalence class without any chance of colliding with
+// prose.
+function canonicalReason(collapsed: string): string {
+  let text = collapsed;
+  for (const [index, phrases] of EQUIVALENT_REASONS.entries()) {
+    for (const phrase of phrases) text = text.replaceAll(phrase, `\u0000${index}`);
+  }
+  return text;
+}
+
+/** The row's own durable reason, reduced to the leading clause the block
  * heading cannot carry. Daemon detail prose habitually appends the very
  * instruction that is already hoisted ("…; download the requested PDF
  * yourself"), so only the reason itself survives, bounded like every other
@@ -1494,9 +1649,11 @@ function reasonSummary(item: TriageSnapshotItem, instruction: string): string | 
   const lead = detail.split(/[;.]\s+/u)[0] ?? detail;
   const reason = boundedProse(lead.replace(/[.;,]+$/u, ""), 120);
   if (reason === "") return null;
-  const compact = reason.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  const said = instruction.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  return compact === "" || said.includes(compact) || compact.includes(said) ? null : reason;
+  const collapsed = reason.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  if (collapsed === "") return null;
+  const compact = canonicalReason(collapsed);
+  const said = canonicalReason(instruction.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim());
+  return said.includes(compact) || compact.includes(said) ? null : reason;
 }
 
 /** Chrome exposes chrome.downloads.onDeterminingFilename and can therefore
@@ -1827,21 +1984,25 @@ function renderItem(item: TriageSnapshotItem, family: FamilyRender | null = null
   const debug = renderDebug(item, blockedByChallenge);
   body.append(headingText);
   if (citation !== null) body.append(citation);
-  const instruction: HTMLElement | null = family === null
-    ? waiting
+  // A row prints an instruction where no block speaks for it, and where its
+  // own browser-local state — a sign-in open elsewhere, a challenge-blocked
+  // tab — says something the block's copy cannot.
+  const speaksForItself = family === null || waiting || blockedByChallenge;
+  const instruction: HTMLElement | null = !speaksForItself
+    ? null
+    : waiting
       ? (() => {
         const waitingInstruction = element("p", "papio is continuing — waiting for the institution sign-in already open in another tab");
         waitingInstruction.className = "item-instruction item-guidance";
         waitingInstruction.id = itemGuidanceID(item);
         return waitingInstruction;
       })()
-      : renderInstruction(item, blockedByChallenge, working)
-    : null;
+      : renderInstruction(item, blockedByChallenge, working);
   if (instruction !== null) body.append(instruction);
   // The hoisted instruction says what to do for the whole block; a row prints
   // its own reason only where that reason differs from its siblings', so the
   // block never degenerates back into one repeated sentence per row.
-  const reasonText = family !== null && family.varyingReasons && !working && !blockedByChallenge
+  const reasonText = family !== null && family.rowReasons && !working && !blockedByChallenge
     ? reasonSummary(item, family.instruction)
     : null;
   const reason = reasonText === null ? null : element("p", reasonText);
@@ -1912,7 +2073,7 @@ function renderItem(item: TriageSnapshotItem, family: FamilyRender | null = null
     // row's own reason are all part of what each control does, so each control
     // names every one of them that exists.
     const routeID = family?.platformRoute === null || family === null ? undefined : `${family.descriptionID}-route`;
-    const describedBy = [family?.descriptionID ?? instruction?.id, routeID, reason?.id]
+    const describedBy = [family?.descriptionID, instruction?.id, routeID, reason?.id]
       .filter((id): id is string => id !== undefined).join(" ");
     if (describedBy !== "") {
       for (const control of Array.from(controls.querySelectorAll<HTMLButtonElement>("button"))) {
@@ -1928,43 +2089,54 @@ function renderGroup(kind: TriageSnapshotItem["kind"], heading: string | null, i
   if (items.length === 0) return null;
   const section = element("section");
   section.className = `triage-group triage-group-${kind}`;
-  if (heading !== null) section.append(element("h2", `${heading} (${items.length})`));
-  // A card is one family block. A singleton family hoists no heading (that needs
-  // two adjacent rows), so keying card edges on "the sibling is not a row" put a
-  // headingless row inside the preceding family's card, where it visually
-  // inherited that family's heading and count — a card headed "2 papers" held
-  // four rows of three different kinds. Card edges therefore follow family
-  // identity, and a row with no family is its own card.
-  const families = items.map((item) => familyForItem(item, items));
+  // A card is one block. A singleton block hoists its own heading, so keying
+  // card edges on "the sibling is not a row" put a headingless row inside the
+  // preceding block's card, where it visually inherited that block's heading
+  // and count — a card headed "2 papers" held four rows of three different
+  // kinds. Card edges therefore follow block identity, and a row with no
+  // block is its own card.
+  const families = familyBlocks(items);
+  // The kind label names rows nothing else names. Where every row already sits
+  // under a block header carrying its kind and its count, printing the kind
+  // again would state one fact twice.
+  if (heading !== null && families.some((family) => family === null)) {
+    section.append(element("h2", `${heading} (${items.length})`));
+  }
   const cardKeys = families.map((family, index) => family?.descriptionID ?? `standalone:${items[index]!.id}`);
 
-  let previousRun: string | undefined;
+  let previousBlock: string | undefined;
   for (const [index, item] of items.entries()) {
     const family = families[index]!;
-    if (family !== null && family.descriptionID !== previousRun) {
+    if (family !== null && family.descriptionID !== previousBlock) {
+      // Kind, count and the single instruction share one header line: the
+      // instruction is what the heading is for, and two stacked lines said it
+      // twice as far as the eye is concerned.
+      const header = element("div");
+      header.className = "family-header";
       const familyHeading = element("h2", `${family.heading} · ${family.total} paper${family.total === 1 ? "" : "s"}`);
       familyHeading.className = "family-heading";
       familyHeading.id = `${family.descriptionID}-heading`;
       if (state.filterQuery.trim() !== "" && family.shown !== family.total) {
         familyHeading.append(element("span", ` (${family.shown} of ${family.total} shown)`));
       }
-      section.append(familyHeading);
+      header.append(familyHeading);
       const familyInstruction = element("p", family.instruction);
       familyInstruction.className = "item-instruction item-guidance family-guidance";
       familyInstruction.id = family.descriptionID;
       familyInstruction.setAttribute("aria-labelledby", familyHeading.id);
-      section.append(familyInstruction);
+      header.append(familyInstruction);
+      section.append(header);
       if (family.platformRoute !== null) {
-        // Once per block, never per row: the hoisted imperative is the same on
-        // every browser, but how the file reaches papio is not.
+        // Once per block, never per row, and never shortened: this is the only
+        // place a Firefox operator learns a saved download cannot reach papio.
         const route = element("p", family.platformRoute);
         route.className = "item-instruction family-mechanism";
         route.id = `${family.descriptionID}-route`;
         section.append(route);
       }
-      previousRun = family.descriptionID;
+      previousBlock = family.descriptionID;
     } else if (family === null) {
-      previousRun = undefined;
+      previousBlock = undefined;
     }
     const row = renderItem(item, family);
     if (cardKeys[index] !== cardKeys[index - 1]) row.dataset.cardStart = "true";
@@ -2050,6 +2222,11 @@ function renderPulse(): void {
 }
 
 
+// The tab labels below are the inventory authority ("Actions (N)",
+// "Watch hits (N)"). This line carries only the one fact they cannot: the
+// daemon's effective count of researcher-owned turns. `pending_total` does not
+// belong here: adding it beside those tabs repeats the inventory and makes the
+// larger overlapping total look like a third category.
 function renderCounts(): void {
   if (elements === null) return;
   const counts = state.counts ?? state.snapshot?.counts;
@@ -2058,16 +2235,20 @@ function renderCounts(): void {
     return;
   }
   const required = counts.turns_required;
-  const reference = counts.watch_hits + counts.retractions;
-  const turns = typeof required === "number" ? required : 0;
-  if (counts.pending_total === 0 && reference === 0 && turns === 0) {
-    elements.counts.textContent = "No open items";
+  if (typeof required !== "number" || !Number.isFinite(required)) {
+    // Counts v3 was not negotiated, so the turn total is genuinely unknown.
+    // Falling through to a zero would tell an operator with a full queue that
+    // nothing needs them; the tabs still carry the inventory either way.
+    elements.counts.textContent = "papio hasn't reported how many need you";
     return;
   }
-  const parts = [`${counts.pending_total} open`];
-  if (typeof required === "number" && required > 0) parts.push(`${required} need you`);
-  if (reference > 0) parts.push(`${reference} for reference`);
-  elements.counts.textContent = parts.join(" · ");
+  // turns_required stays exact when required_turns_complete is false: the
+  // daemon drops the per-item projection and keeps the count ("Keep the exact
+  // attention count" in internal/triage/triage.go). Only the badge suppresses
+  // the number there, because a toolbar square cannot show a four-digit one.
+  const turns = Math.max(0, Math.trunc(required));
+  elements.counts.textContent =
+    turns === 0 ? "Nothing needs you" : `${turns} need${turns === 1 ? "s" : ""} you`;
 }
 
 function renderDialog(): void {
@@ -2223,13 +2404,22 @@ function adjustCounts(item: TriageSnapshotItem, delta: number): void {
   const counts = state.counts;
   if (counts === null) return;
   const shift = (value: number): number => Math.max(0, value + delta);
-  state.counts = {
+  const next: TriageCounts = {
     ...counts,
     pending_total: shift(counts.pending_total),
     watch_hits: item.kind === "watch_hit" ? shift(counts.watch_hits) : counts.watch_hits,
     actions: item.kind === "human_action" ? shift(counts.actions) : counts.actions,
     retractions: item.kind === "retraction" ? shift(counts.retractions) : counts.retractions,
   };
+  // The header line is turns_required alone, so it has to move with a local
+  // removal the way the inventory counts already do. Only a row the daemon
+  // marked "required" is a turn; "working" and "advisory" rows are not, and a
+  // row with no attention at all leaves the total alone rather than guessing.
+  const required = counts.turns_required;
+  if (typeof required === "number" && item.attention === "required") {
+    next.turns_required = shift(required);
+  }
+  state.counts = next;
 }
 
 function removeItem(itemID: string): void {
@@ -2366,7 +2556,9 @@ async function refreshInbox(append = false): Promise<void> {
       : snapshot;
     state.counts = snapshot.counts;
     state.generatedAt = snapshot.generated_at;
-    setConnection(true, "Connected to daemon.");
+    // The banner is hidden the moment the daemon answers, so a "connected"
+    // sentence has nowhere to render; only the failure message is read back.
+    setConnection(true, "");
   } else {
     setConnection(false, snapshotResult.message, snapshotResult.code);
   }

@@ -175,6 +175,15 @@ execution records kept during the initial build.
   negotiated `surface_close_v1` keeps its existing closing behavior
   unchanged.
 
+### Changed
+- **Retraction notices now name the affected paper.** The inbox used the same
+  `Library update notice` title for every retraction and correction, so a list
+  of five notices spent almost half its visible text repeating a label that did
+  not identify any of them. It now uses the paper title already held by the
+  library record, or the title returned by the existing Crossref lookup when
+  the local record has none. No additional request is made; old cached notices
+  without a title keep the generic fallback until refreshed.
+
 ### Fixed
 - **A paper waiting for you no longer holds a browser tab as well.** After the
   fix below, one refusal was left standing: a paper that has asked you for

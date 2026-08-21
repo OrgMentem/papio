@@ -193,6 +193,7 @@
         gap: var(--space-4);
         justify-content: space-between;
         padding: var(--space-3) var(--space-4);
+        position: relative;
       }
 
       ul.rows li + li {
@@ -208,11 +209,19 @@
         font-weight: 600;
       }
 
+      /* The exact match pattern no longer spends a second visible line per row.
+         It stays in the accessibility tree (read as row text, and repeated in
+         the switch's accessible name) and comes back on screen through the
+         row's [data-tip] tooltip on hover or keyboard focus. */
       .source-host {
-        color: var(--color-muted);
-        display: block;
-        font-size: var(--font-size-small);
-        overflow-wrap: anywhere;
+        border: 0;
+        clip-path: inset(50%);
+        height: 1px;
+        overflow: hidden;
+        padding: 0;
+        position: absolute;
+        white-space: nowrap;
+        width: 1px;
       }
 
       .hint {
@@ -421,8 +430,11 @@
         z-index: 1;
       }
 
+      /* `:has(:focus-visible)` so a row that only *contains* the control still
+         reveals its pattern when that control is reached by keyboard. */
       [data-tip]:hover::after,
-      [data-tip]:focus-visible::after {
+      [data-tip]:focus-visible::after,
+      [data-tip]:has(:focus-visible)::after {
         opacity: 1;
       }
 
