@@ -1007,6 +1007,89 @@ func TestAutomaticCandidateOfferParksDependentUntilEntitledLanding(t *testing.T)
 	}
 }
 
+// TestEntitledDependentBindsWithoutTakingTheSignInSlot carries the test above
+// one step further, which is exactly where sharing was broken: the dependent
+// received its offer and then could not BIND. institutionalBind reserved the
+// entry unconditionally, so at the same generation with fresh evidence Reserve
+// answered busy, bind answered not_eligible, and the extension retired the
+// scaffold it had just built - the operator's "I log in on one tab and the
+// others stay stranded", one layer below the offer side it was attributed to.
+//
+// The dependent must bind AND must not become the entry's owner-binding: that
+// names the surface whose close retires the institution's sign-in, so a sibling
+// closing its reading tab must not end everyone's session.
+func TestEntitledDependentBindsWithoutTakingTheSignInSlot(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	owner := parkInstitutional(t, jobs, "share-bind-owner", handoffWork(), "")
+	dependent := parkInstitutional(t, jobs, "share-bind-dependent", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "share-bind-shared")
+	ownerCandidate := explicitMaterializationCandidate(t, jobs, owner, "domain-share-owner")
+	dependentCandidate := explicitMaterializationCandidate(t, jobs, dependent, "domain-share-dependent")
+
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, owner,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "share-bind-req", CandidateID: ownerCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	if grant.Outcome != "open_new" {
+		t.Fatalf("owner grant outcome = %s, want open_new", grant.Outcome)
+	}
+	ownerBinding := bindCandidate(t, b, owner, ownerCandidate, "share-bind", 4)
+	runSync(t, b, claimObservationFrame(t, owner, "share-bind-obs-returned", "share-bind-shared",
+		ownerBinding, grant.GateOccurrenceID, "share-bind-observation-returned", b.epoch, 0, "auth_returned"))
+	landed, _ := runSync(t, b, claimObservationFrame(t, owner, "share-bind-obs-landing", "share-bind-shared",
+		ownerBinding, grant.GateOccurrenceID, "share-bind-observation-landing", b.epoch, 1, "entitled_landing"))
+	if ack := claimObservationAckPayload(t, landed); ack.Outcome != "applied" {
+		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
+	}
+
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, dependent,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "share-bind-dep-claim", CandidateID: dependentCandidate,
+			MaterializationKind: "browser_tab",
+		}))
+	claimResp := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if claimResp == nil {
+		t.Fatalf("institutional_claim_response missing: %v", claimed)
+	}
+	claimPayload := claimResp.Payload.(*protocol.InstitutionalClaimResponsePayload)
+	if claimPayload.Outcome != "claimed" {
+		t.Fatalf("dependent claim outcome = %s, want claimed: %+v", claimPayload.Outcome, claimPayload)
+	}
+	bound, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalBindRequest, dependent,
+		protocol.InstitutionalBindRequestPayload{
+			RequestID: "share-bind-dep-bind", ClaimID: claimPayload.ClaimID,
+			BindingID: claimPayload.BindingID, TabID: 9,
+		}))
+	bindResp := firstOfType(bound, protocol.MsgInstitutionalBindResponse)
+	if bindResp == nil {
+		t.Fatalf("institutional_bind_response missing: %v", bound)
+	}
+	payload := bindResp.Payload.(*protocol.InstitutionalBindResponsePayload)
+	if payload.Outcome != "bound" {
+		t.Fatalf("dependent bind outcome = %s (%s), want bound - an entitled sign-in is shared",
+			payload.Outcome, payload.Detail)
+	}
+	if payload.AuthenticationClaimID != "share-bind-shared" || payload.GateOccurrenceID == "" {
+		t.Fatalf("a bound dependent still needs its observation identity: %+v", payload)
+	}
+
+	lease, ok, err := jobs.GetAuthenticationEntryLease(ctx, "share-bind-shared")
+	if err != nil || !ok {
+		t.Fatalf("entry lease after the shared bind: ok=%v err=%v", ok, err)
+	}
+	if lease.State != job.AuthenticationEntryLeaseHuman || lease.HumanOwnerID != owner {
+		t.Fatalf("the shared bind must leave the sign-in with its human owner: %+v", lease)
+	}
+	if lease.OwnerBindingID != ownerBinding {
+		t.Fatalf("dependent took the owner-binding (%q, want the owner's %q) - closing its reading tab would retire everyone's sign-in",
+			lease.OwnerBindingID, ownerBinding)
+	}
+}
+
 // A provider challenge observed AFTER the sign-in has landed is REJECTED, and
 // that is deliberate rather than a gap. claim_observation_apply.go's
 // wall_observed/login_started/mfa/challenge branch requires a live RESERVED

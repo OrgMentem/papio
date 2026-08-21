@@ -1798,22 +1798,51 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 	// removing a scaffold each pass. Acquire the slot here through the same
 	// arbitration the consult uses - it is the single gate, so one sign-in per
 	// institution still holds - and refuse quietly when a live owner holds it.
+	//
+	// EXCEPT once the sign-in has landed and is entitled, which is the whole
+	// point of sharing it. admitAutomaticMaterializationCandidates admits every
+	// dependent on exactly this predicate, and then this reservation refused
+	// them: at the same generation with fresh evidence nothing is revoked, so
+	// Reserve answered busy, bind answered not_eligible, and the extension
+	// retired the scaffold it had just built. That is the operator's "I log in
+	// on one tab and the others stay stranded", one step further down than the
+	// offer side it was blamed on - the dependents WERE offered, and could not
+	// bind. An entitled entry is not a sign-in in progress; a sibling reading a
+	// paper behind a completed sign-in is not arbitrating for anything.
+	//
+	// A dependent must still never take the owner-binding side channel: that
+	// names the surface whose close retires the institution's sign-in, and a
+	// sibling closing its reading tab must not end everyone's session.
+	leaseOwnerClaimID := authenticationClaimID
 	if authenticationClaimID != "" {
-		leaseID := evidenceObservationID("authentication_claim_lease", authenticationClaimID, jobID, strconv.FormatInt(b.epoch, 10))
-		if _, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
-			AuthenticationClaimID: authenticationClaimID, LeaseID: leaseID, OwnerID: jobID,
-			BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
-		}); reserveErr != nil {
-			if !errors.Is(reserveErr, job.ErrAuthenticationEntryLeaseBusy) {
-				result.Outcome, result.Detail = "error", "authentication entry lease is unavailable"
+		lease, found, leaseErr := b.jobs.GetAuthenticationEntryLease(ctx, authenticationClaimID)
+		if leaseErr != nil {
+			result.Outcome, result.Detail = "error", "authentication entry lease is unavailable"
+			return b.frameInstitutionalBind(jobID, result)
+		}
+		shared := found && lease.State == job.AuthenticationEntryLeaseHuman && lease.EntitledAt != ""
+		ownsEntry := found && (lease.OwnerID == jobID || lease.HumanOwnerID == jobID)
+		if !shared {
+			leaseID := evidenceObservationID("authentication_claim_lease", authenticationClaimID, jobID, strconv.FormatInt(b.epoch, 10))
+			if _, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+				AuthenticationClaimID: authenticationClaimID, LeaseID: leaseID, OwnerID: jobID,
+				BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
+			}); reserveErr != nil {
+				if !errors.Is(reserveErr, job.ErrAuthenticationEntryLeaseBusy) {
+					result.Outcome, result.Detail = "error", "authentication entry lease is unavailable"
+					return b.frameInstitutionalBind(jobID, result)
+				}
+				// not_eligible is the outcome the extension answers by retiring
+				// the scaffold and clearing the workflow, which is exactly right
+				// here: no surface, no retry storm, and the scheduler re-offers
+				// this candidate once the institution is free.
+				result.Outcome, result.Detail = "not_eligible", "another sign-in for this institution is in progress"
 				return b.frameInstitutionalBind(jobID, result)
 			}
-			// not_eligible is the outcome the extension answers by retiring
-			// the scaffold and clearing the workflow, which is exactly right
-			// here: no surface, no retry storm, and the scheduler re-offers
-			// this candidate once the institution is free.
-			result.Outcome, result.Detail = "not_eligible", "another sign-in for this institution is in progress"
-			return b.frameInstitutionalBind(jobID, result)
+			ownsEntry = true
+		}
+		if !ownsEntry {
+			leaseOwnerClaimID = ""
 		}
 	}
 	// A successfully bound surface must always hand the extension the
@@ -1832,7 +1861,7 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 		}
 	}
 	err = b.jobs.BindMaterializationWithLeaseOwner(ctx, claim.ID, p.BindingID, b.epoch,
-		candidate.InstitutionProfileRevision, p.TabID, authenticationClaimID, jobID)
+		candidate.InstitutionProfileRevision, p.TabID, leaseOwnerClaimID, jobID)
 	if err != nil {
 		// Every other refusal here names itself; this one answered a bare
 		// "stale" with no detail, which is what made a live stall
