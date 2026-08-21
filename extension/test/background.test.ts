@@ -16875,6 +16875,45 @@ test("an offline browser builds no institutional scaffold, and resumes when the 
   const claim = await h.port.waitForFrame("institutional_claim_request");
   expect(claim.job_id).toBe("job_mat_offline");
 });
+
+// The reviewer's path, which the test above does NOT cover: the daemon's
+// scheduler only re-offers candidates it still sees as `eligible`, so once a
+// claim is committed the paper has no daemon-side re-drive at all. Both local
+// triggers consume themselves before reaching the online guard —
+// scheduleMaterializationRetry's timer callback and runMaterialization's rerun
+// in `finally` — so returning bare left the paper claimed and tabless forever,
+// even after the network came back. The revival must therefore work with NO
+// re-offer whatsoever, and it must live outside materializationRetryTimers,
+// which doubles as the "do not drive now" guard.
+test("an offline materialization revives itself when the network returns, with no daemon re-offer", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
+  let online = false;
+  h.deps.online = () => online;
+
+  const timersBefore = h.timers.length;
+  await h.port.inbound(candidateOffer("job_mat_revive"));
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(
+    h.frames().some((frame) => frame.type === "institutional_claim_request"),
+  ).toBe(false);
+
+  // A revival is armed, not dropped.
+  const revival = h.timers.slice(timersBefore).find((timer) => timer.ms === 15_000);
+  expect(revival).toBeDefined();
+
+  // The network returns. Firing the revival alone must drive the paper — no
+  // second offer, no operator action.
+  online = true;
+  await revival!.fn();
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  expect(claim.job_id).toBe("job_mat_revive");
+});
 test("institutional candidate offer dispatches claim without awaiting the correlated response", async () => {
   const h = makeHarness();
   await h.bridge.start();

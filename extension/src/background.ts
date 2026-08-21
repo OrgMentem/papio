@@ -2821,6 +2821,14 @@ export class Bridge {
   >();
   /** One detached response-loss retry timer per materialization job. */
   private readonly materializationRetryTimers = new Map<string, object>();
+  /** One offline-revival timer per materialization job, deliberately SEPARATE
+   * from materializationRetryTimers. That map doubles as the "a retry is
+   * already pending, do not drive now" guard, so parking an offline recheck in
+   * it makes a fresh online offer wait for the timer instead of driving — the
+   * first attempt at this fix deadlocked its own test that way. This map is
+   * consulted by nobody else, so it can keep a paper alive across an outage
+   * without shadowing any drive. */
+  private readonly materializationOfflineTimers = new Map<string, object>();
   /** Typed pulse cache is worker-local; receipt time is browser time and never
    * replaced with daemon generated_at. A fresh worker starts with no trusted
    * reading, so callers render Unknown until the next validated response. */
@@ -8555,6 +8563,7 @@ export class Bridge {
     this.materializationReruns.delete(jobID);
     this.pendingMaterializationEffects.delete(jobID);
     this.materializationRetryTimers.delete(jobID);
+    this.materializationOfflineTimers.delete(jobID);
     this.materializationRuns.delete(jobID);
     const pending = this.pendingMaterializationRequests.filter(
       (request) => request.jobID === jobID,
@@ -9485,10 +9494,34 @@ export class Bridge {
     // gate never reached. institutionalAuthGateOpen()'s last clause is
     // `online`; this path checked only holdership, so a woken worker with no
     // network claimed, built a scaffold tab, and navigated it straight into a
-    // DNS failure — "spawns new tabs before the internet is ready". Returning
-    // here drops nothing: the daemon re-offers this candidate every poll, so
-    // the first offer after the network returns proceeds normally.
-    if (this.deps.online?.() === false) return;
+    // DNS failure — "spawns new tabs before the internet is ready".
+    //
+    // Park a revival rather than returning bare. A reviewer falsified the
+    // earlier claim that "the daemon re-offers every poll, so nothing is
+    // dropped": the scheduler only re-offers candidates it still sees as
+    // `eligible`, so a candidate already `claimed` or `bound` has NO
+    // daemon-side re-drive, and both local triggers consume themselves before
+    // reaching here — scheduleMaterializationRetry's timer callback and
+    // runMaterialization's rerun in `finally`. Without this the paper stayed
+    // claimed and tabless forever, even after the network came back.
+    //
+    // The revival lives in its own map on purpose: materializationRetryTimers
+    // doubles as the "a retry is already pending, do not drive now" guard, so
+    // parking this there made a fresh online offer wait for the timer instead
+    // of driving, which deadlocked the first version of this fix.
+    if (this.deps.online?.() === false) {
+      if (!this.materializationOfflineTimers.has(jobID)) {
+        const marker = {};
+        this.materializationOfflineTimers.set(jobID, marker);
+        this.deps.setTimeout(() => {
+          if (this.materializationOfflineTimers.get(jobID) !== marker) return;
+          this.materializationOfflineTimers.delete(jobID);
+          this.scheduleMaterialization(jobID, true);
+        }, MATERIALIZATION_RETRY_MAX_MS);
+      }
+      return;
+    }
+    this.materializationOfflineTimers.delete(jobID);
     if (this.materializationRuns.has(jobID)) {
       this.materializationReruns.add(jobID);
       return;
@@ -18613,7 +18646,17 @@ export class Bridge {
     if (pageCaptureWaiter !== undefined) pageCaptureWaiter(false);
     this.authCountedTabs.delete(tabID);
     const wasBadgedAuthWall = this.lastBadgedAuthWallTabs.delete(tabID);
-    const ledgerRecord = this.tabLedgerCache?.[String(tabID)];
+    // Serialize against any bind-response `persistClaimIdentity` already
+    // queued on the ledger chain. Reading tabLedgerCache directly here can
+    // race that write: a tab may close between the bind response and the
+    // awaited persistence, and the job-inactive recovery branch would then
+    // miss the only durable claim identity before `forgetLedgeredTab` queues
+    // behind it. snapshotTabLedger waits for earlier ledger transactions and
+    // still falls back to the cache when durable ledger support is absent.
+    const ledgerSnapshot = await this.snapshotTabLedger();
+    const ledgerRecord =
+      ledgerSnapshot[String(tabID)] ??
+      this.tabLedgerCache?.[String(tabID)];
     const pendingClose = ledgerRecord?.pending_close;
     const authorizedClose = pendingClose !== undefined;
     // Consumed exactly once, whatever happens below: this worker removed the
