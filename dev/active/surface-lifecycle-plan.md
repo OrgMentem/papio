@@ -1095,3 +1095,60 @@ Open after this round, measured not guessed:
   Design that contract before writing the sweep.
 - The four remaining live claims are all on `awaiting_human` papers; three point
   at pre-fix dead tabs and heal via the consult self-heal on next drive.
+
+## Fifth field round (2026-08-21) — the surface papio never offered at all
+
+Chasing the four surviving claims found a defect one layer out from lifecycle:
+not a surface papio failed to close, but a surface it failed to **open**.
+
+Both remaining dead-tab claims belonged to `manual_download` actions, and
+`papio actions open --job` answered *"none openable from here"*. Measured on
+the live store: **144 open human actions, 88 resolvable URLs — exactly the
+`openurl_handoff` rows.** The 34 `manual_download` rows resolved nothing, 32
+of them requiring an institution sign-in, while `papio actions list` told each
+one "sign in to your institution, then download the PDF yourself".
+
+6. **FIXED — a manual download needs the page it happens on.**
+   `manual_download` carried an `Instruction` and no `Command`
+   (`internal/app/action_guidance.go`), so `ResolveHumanActionURL` returned
+   false and every surface dead-ended: the CLI refused the row, the inbox's
+   "Open link" opened the canonical DOI unauthenticated (paywalling all 32),
+   and the reminder named no command for either download class. The asymmetry
+   is the bug — `internal/app/browser_adopt.go` already adopts a download
+   against a `manual_download` action, so papio expects the file to arrive; it
+   simply would not open the tab you could get it from.
+   Verified live: openable queue **88 → 122**, and the resolved route is the
+   library's (`une.primo.exlibrisgroup.com/…/openurl?institution=…`) where the
+   inbox would have sent you to `doi.org` → IEEE paywall.
+
+**This is the sanctioned cede, and the command is operator-only on purpose.**
+`handoffActionKind` stays `openurl_handoff` at all three bridge sites
+(`recoverMaterializationFocus`, the provider-drive authorization,
+`openHandoffForJob`): a manual download exists **because** automation already
+failed that route, so entering it into the auto-offer engine would re-drive a
+known-dead path — the same mistake as re-driving a spent claim. The directive's
+own carve-out covers the tab: papio *has* asked for user action here, so the
+surface is the human's, and adoption closes the loop when the file lands.
+
+**A prior round tried this and hid it instead.** `commands_test.go` carries the
+note that naming this command in the hint, while `actionURL` still rejected the
+kind, "silently did nothing for eight rows on one machine" — so the mention was
+removed rather than the cause. `errcat_guidance_test.go`'s applicability check
+(every action whose command is `papio actions open` MUST resolve a URL) now
+makes that half-fix impossible. Generalising its rule — the hint names the
+command iff the action has one — immediately exposed a second gap one kind
+over: an open-access `openurl_handoff` read "open access — no login needed" and
+never named the command that fetches it.
+
+Open after this round:
+
+- **The inbox still opens the canonical link for a manual download.**
+  `internal/triage` has zero `config.` references by design, so a resolver
+  route cannot travel to the extension as an item link — and it should not,
+  since routes are minted fresh per gesture and never persisted browser-side.
+  The fix therefore mirrors `requestHandoffOpen`: a daemon RPC that mints the
+  route and opens a papio-owned tab, replacing `requestManualDownloadOpen`'s
+  `firstSafeLink` + `openNewTab`. Note `inbox.ts`'s `manualDownloadJobID` is
+  already defined and never called — the seam for exactly that RPC, left
+  behind by whoever last stopped short here. Until it lands, the inbox's
+  "Open link" is correct only for the two open-access rows of the 34.
