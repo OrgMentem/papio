@@ -355,9 +355,14 @@ type Bridge struct {
 	// b.mu mid-flight (adoption windows inside poll) re-checks it afterwards:
 	// a concurrent claim/takeover must not let a resumed poll send offers to a
 	// demoted session or pollute the new holder's bookkeeping.
-	epoch      int64
-	offered    map[string]bool // handoff jobs offered to the current holder
-	cancelSent map[string]bool // jobs a daemon-side cancel frame need not be emitted for
+	epoch   int64
+	offered map[string]bool // handoff jobs offered to the current holder
+	// queuedOffers are jobs whose most recent browser.job_accept carried
+	// disposition "queued" — the extension saying it took the offer into its
+	// own queue and is NOT driving it. They are still offered; they are just
+	// not in flight, so they must not consume the outstanding-offer budget.
+	queuedOffers map[string]bool
+	cancelSent   map[string]bool // jobs a daemon-side cancel frame need not be emitted for
 	// cancelAnnounced is the strictly narrower fact that AUTHORIZES retiring a
 	// terminal job's materialization claim: the browser either received this
 	// session's cancel frame, or reported the closure itself. cancelSent is not
@@ -872,6 +877,7 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	// upgrade repairs when it becomes the live holder.
 	b.holder = session
 	b.offered = map[string]bool{}
+	b.queuedOffers = map[string]bool{}
 	b.cancelSent = map[string]bool{}
 	b.cancelAnnounced = map[string]bool{}
 	b.authReleased = map[int64]bool{}
@@ -2907,8 +2913,25 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		// older extension's rows keep their existing shape and read as
 		// driving — which is what its acks have always meant.
 		var detail map[string]any
+		queued := false
 		if p, ok := msg.Payload.(*protocol.JobAcceptPayload); ok && p.Disposition != "" {
 			detail = map[string]any{"disposition": p.Disposition}
+			queued = p.Disposition == protocol.JobAcceptDispositionQueued
+		}
+		// The same signal the fruitless-epoch fold already respects, applied to
+		// the transport budget it never reached. Measured on the operator's
+		// machine 2026-08-21: 626 queued acks against 262 driving ones in a
+		// single day, and the four papers holding the ENTIRE budget were
+		// answering "queued" while 128 papers waited behind them. Charging a
+		// paper for waiting its turn is the mistake job.HandoffAcceptedLease's
+		// comment already names one layer down.
+		if queued {
+			if b.queuedOffers == nil {
+				b.queuedOffers = map[string]bool{}
+			}
+			b.queuedOffers[msg.JobID] = true
+		} else {
+			delete(b.queuedOffers, msg.JobID)
 		}
 		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", detail); err != nil {
 			log.Printf("papio: recording browser.job_accept: %v", err)
@@ -3888,6 +3911,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	b.materializationRecoveryPending = true
 	b.holder = session
 	b.offered = map[string]bool{}
+	b.queuedOffers = map[string]bool{}
 	b.cancelSent = map[string]bool{}
 	b.cancelAnnounced = map[string]bool{}
 	b.materializationTracked = map[string]bool{}
@@ -7261,7 +7285,7 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		rows[item.Row.ID] = item.Row
 	}
 
-	outstanding := outstandingOfferCount(b.offered, handoff, rows, b.pendingDownloads)
+	outstanding := outstandingOfferCount(b.offered, b.queuedOffers, handoff, rows, b.pendingDownloads)
 	available := maxOutstandingOffers - outstanding
 	if available < 0 {
 		available = 0
@@ -7335,6 +7359,7 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		}
 		if wasOffered {
 			delete(b.offered, candidate.row.ID)
+			delete(b.queuedOffers, candidate.row.ID)
 			delete(b.cancelSent, candidate.row.ID)
 			delete(b.cancelAnnounced, candidate.row.ID)
 		} else {
@@ -7347,8 +7372,21 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 	return nil
 }
 
+// outstandingOfferCount is how many handoff offers are IN FLIGHT — not how
+// many have been sent. maxOutstandingOffers bounds the browser surfaces papio
+// is driving concurrently, so a paper the extension has parked in its own
+// queue, or one waiting on a human, is not what that bound is for.
+//
+// Counting sent offers instead deadlocked the operator's whole queue: four
+// papers with zero browser candidates held all four slots, answering "queued"
+// while they waited behind a single library sign-in, and 128 papers - one of
+// them an explicit focus request - could not be offered at all. Concurrency is
+// still bounded twice over without them: the extension enforces its own
+// HANDOFF_DRIVE_LIMIT, and one sign-in per institution is arbitrated by the
+// authentication entry lease.
 func outstandingOfferCount(
 	offered map[string]bool,
+	queued map[string]bool,
 	actions map[string]job.HumanAction,
 	rows map[string]job.Row,
 	settled map[browserDownloadKey]pendingBrowserDownload,
@@ -7357,6 +7395,10 @@ func outstandingOfferCount(
 	for jobID := range offered {
 		action, ok := actions[jobID]
 		if !ok || action.Kind != handoffActionKind || hasSettledDownload(settled, jobID) {
+			continue
+		}
+		// The extension said it is holding this one, not driving it.
+		if queued[jobID] {
 			continue
 		}
 		row, ok := rows[jobID]
@@ -9871,6 +9913,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 					log.Printf("papio: recording adoption safety latch: %v", latchErr)
 				}
 				delete(b.offered, row.ID)
+				delete(b.queuedOffers, row.ID)
 				delete(b.reofferPending, row.ID)
 				delete(handoff, row.ID)
 				continue // adopted; the job has left awaiting_human
@@ -9927,7 +9970,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		}
 		return candidateIDs[i] < candidateIDs[j]
 	})
-	outstanding := outstandingOfferCount(b.offered, handoff, rows, b.pendingDownloads)
+	outstanding := outstandingOfferCount(b.offered, b.queuedOffers, handoff, rows, b.pendingDownloads)
 	slots := maxOutstandingOffers - outstanding
 	if slots < 0 {
 		slots = 0
@@ -10196,6 +10239,7 @@ jobLoop:
 		row, err := b.jobs.Get(ctx, id)
 		if errors.Is(err, sql.ErrNoRows) {
 			delete(b.offered, id)
+			delete(b.queuedOffers, id)
 			b.clearMaterializationTracking(id)
 			continue
 		}
@@ -11939,6 +11983,7 @@ func (b *Bridge) fallbackOAHandoff(ctx context.Context, jobID, failure string) (
 			return false, err
 		}
 		delete(b.offered, jobID)
+		delete(b.queuedOffers, jobID)
 		return true, nil
 	}
 	return false, nil

@@ -14113,6 +14113,66 @@ func TestQueuedAcceptsAreNotFruitlessDrives(t *testing.T) {
 	}
 }
 
+// TestQueuedOffersDoNotConsumeTheInFlightBudget is the transport-budget half of
+// the accounting fixed in TestQueuedAcceptsAreNotFruitlessDrives above: the
+// same "queued" signal, applied to the limit that actually gates new work.
+//
+// maxOutstandingOffers bounds the surfaces papio drives at once. Counting SENT
+// offers instead of driven ones deadlocked the operator's queue: four papers
+// with no browser candidates held all four slots while answering "queued",
+// waiting behind one library sign-in they could never complete, and 128 papers
+// behind them - including a paper the operator had explicitly clicked Open on -
+// could not be offered at all. Measured 2026-08-21: 626 queued acks against
+// 262 driving ones in one day.
+func TestQueuedOffersDoNotConsumeTheInFlightBudget(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, hello())
+
+	saturating := make([]string, 0, maxOutstandingOffers)
+	for i := range maxOutstandingOffers {
+		id := park(t, jobs, fmt.Sprintf("wr_budget_queued_%d", i), handoffWork())
+		openHandoffAction(t, jobs, id)
+		saturating = append(saturating, id)
+	}
+
+	// Drain offers until every one of them has been offered, then have the
+	// extension answer exactly what it answers live: "I have queued it."
+	offeredIDs := map[string]bool{}
+	for range 8 {
+		msgs, _ := runSync(t, b)
+		for _, m := range msgs {
+			if m.Type == protocol.MsgJobOffer {
+				offeredIDs[m.JobID] = true
+			}
+		}
+		if len(offeredIDs) >= len(saturating) {
+			break
+		}
+	}
+	if len(offeredIDs) < len(saturating) {
+		t.Fatalf("setup: only %d of %d papers were offered", len(offeredIDs), len(saturating))
+	}
+	for id := range offeredIDs {
+		runSync(t, b, inFrame(t, protocol.MsgJobAccept, id,
+			protocol.JobAcceptPayload{Disposition: job.JobAcceptDispositionQueued}))
+	}
+
+	// Every slot is nominally spent, and nothing is being driven. A paper that
+	// arrives now must still be offered.
+	fresh := park(t, jobs, "wr_budget_fresh", handoffWork())
+	openHandoffAction(t, jobs, fresh)
+	for range 8 {
+		msgs, _ := runSync(t, b)
+		for _, m := range msgs {
+			if m.Type == protocol.MsgJobOffer && m.JobID == fresh {
+				return
+			}
+		}
+	}
+	t.Fatalf("a paper was starved by %d offers the extension said it had only QUEUED - this is the deadlock",
+		len(offeredIDs))
+}
+
 // TestHandoffEpochsResetRepairsAStreak pins the repair path migration 0045
 // uses. The verdict is derived from history, so correcting the rule cannot
 // un-charge accepts already recorded without a disposition; the reset says so
