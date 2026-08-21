@@ -1041,3 +1041,57 @@ sign-in, so 38 papers take ~10 sign-ins. That is now a throttle rather than a
 wall, and every release reaches a paper that can move — but whether 4 is the
 right number has never been measured, and raising it does not reduce clicks,
 only how many papers papio volunteers at once. Measure before tuning.
+
+### Same round, after the reload — the claims papio never closed its book on
+
+Verifying the accounting fix on live data surfaced the next one. Fifteen
+materialization claims sat `navigated`, tab ids from 19–20 Aug long dead,
+**eleven owned by cancelled jobs**. The daemon knew about every one:
+`TerminalMaterializationJobIDs` names them on every poll and re-sends their
+cancel on every restart, while never retiring its own row.
+
+5. **FIXED — a finished paper's claim is not an effect in flight.** Both sweeps
+   decline to touch a claim with ANY `effect_permits` row, which for a live job
+   correctly stops an authorized provider effect being yanked mid-flight. For a
+   terminal job it protects nothing and makes the row immortal — lease expires,
+   tab closes, browser restarts, claim stays live forever.
+   `RetireTerminalAuthenticationEntryLeases` already had this right for the
+   institution's sign-in slot: it defers only on `held`/`unknown_completion`,
+   because a `settled` permit means the effect is **over**. The asymmetry
+   between the two guards was the whole bug.
+   `AbandonTerminalMaterializations` mirrors the narrower guard and releases the
+   binding's entry lease and close authorizations like the expiry path.
+   Candidates are deliberately left alone: re-eligibling a terminal job's
+   candidate would offer work for a paper that is done.
+
+**Ordering is load-bearing, and a red test taught it.** The cancel frame is
+emitted *because* a terminal job still owns a live claim, so retiring the row in
+the same pass deletes the notice that tells the extension to close the tab —
+`TestPollCancelsTerminalMaterializationWithoutMemoryTracking` caught exactly
+that. Retirement now runs after the cancel loop, and only for jobs whose cancel
+this session already delivered: if the session survived to poll again, the frame
+landed. Worst case the row lives one poll longer. A same-poll retirement is the
+*stranded surface* this whole document exists to prevent, arriving from the one
+direction nobody had guarded — papio's own cleanup.
+
+Live after deploy (`0.21.1-dev.a607b1a`): all **11** drained two polls later,
+institutions held **0**, releasable `requires_auth` handoffs **32**, and offers
+flowing again (12 offers / 12 accepts / 3 papers reaching a sign-in page in 20
+minutes, three of those accepts saying `queued` on the wire).
+
+Open after this round, measured not guessed:
+
+- **A live job on a superseded attempt keeps its old claim.** `job_9e50`'s
+  revision-1 claim is still `navigated` while the job is on attempt 2 — dead by
+  construction, since a candidate owned by a finished attempt can no longer be
+  advanced by any offer. The same settled-permit asymmetry, one axis over:
+  "attempt superseded" instead of "job terminal". It is **1 claim on 1 paper out
+  of 282 papers that have ever retried**, so it is rare rather than systemic,
+  and it heals when that paper is next driven. Not fixed here because retiring
+  it needs a browser-side teardown contract for the old attempt's tab — the
+  retry path re-offers with a fresh URL and the extension may create a second
+  tab rather than reuse (`background.ts:3308-3319`), so a daemon-side retirement
+  without a delivered teardown would strand exactly the tab this plan is about.
+  Design that contract before writing the sweep.
+- The four remaining live claims are all on `awaiting_human` papers; three point
+  at pre-fix dead tabs and heal via the consult self-heal on next drive.
