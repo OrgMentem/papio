@@ -5080,6 +5080,14 @@
               "binding_id": {
                 "type": "string",
                 "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "authentication_claim_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "gate_occurrence_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
               }
             },
             "allOf": [

@@ -1781,10 +1781,12 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 	// so a lookup failure fails closed instead of leaving a bound scaffold
 	// whose lease ownership was never even attempted.
 	authenticationClaimID := ""
-	if profile, profileErr := b.jobs.GetInstitutionProfile(ctx, candidate.InstitutionProfileID); profileErr != nil {
+	profile, profileErr := b.jobs.GetInstitutionProfile(ctx, candidate.InstitutionProfileID)
+	if profileErr != nil {
 		result.Outcome, result.Detail = "error", "institution profile state is unavailable"
 		return b.frameInstitutionalBind(jobID, result)
-	} else if profile != nil {
+	}
+	if profile != nil {
 		authenticationClaimID = profile.AuthenticationClaimID
 	}
 	// The bind records this job as the entry's owner-binding (§4.1) and fails
@@ -1834,6 +1836,20 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 	}
 	result.Outcome = "bound"
 	result.ClaimID, result.BindingID = claim.ID, p.BindingID
+	// Hand back the identity the browser needs to report this surface's loss.
+	// This pipeline has no consult, so nothing else ever tells it, and without
+	// it a pipeline-created surface can only be retired by a daemon-side sweep.
+	// Best-effort: a failure here must not fail a bind that already succeeded —
+	// the sweeps remain the backstop, exactly as before this field existed.
+	if authenticationClaimID != "" && profile != nil {
+		occurrenceID, occErr := b.ensureAuthenticationClaimGateOccurrence(ctx, profile, authenticationClaimID, jobID, p.RequestID)
+		if occErr != nil {
+			log.Printf("papio: bind gate occurrence for %s unavailable: %v", jobID, occErr)
+		} else if occurrenceID != "" {
+			result.AuthenticationClaimID = authenticationClaimID
+			result.GateOccurrenceID = occurrenceID
+		}
+	}
 	return b.frameInstitutionalBind(jobID, result)
 }
 

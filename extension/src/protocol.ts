@@ -1097,6 +1097,11 @@ export interface InstitutionalBindResponsePayload {
   detail?: string;
   claim_id?: string;
   binding_id?: string;
+  /** The identity that lets this browser report the bound surface's loss.
+   * This pipeline has no consult, so the bind is the only frame that carries
+   * it; the pair travels together or not at all. */
+  authentication_claim_id?: string;
+  gate_occurrence_id?: string;
 }
 export interface InstitutionalRouteRequestPayload {
   request_id: string;
@@ -5284,6 +5289,8 @@ function validatePayload(
         detail: "optional",
         claim_id: "optional",
         binding_id: "optional",
+        authentication_claim_id: "optional",
+        gate_occurrence_id: "optional",
       });
       const outcome = institutionalOutcome(p, type);
       institutionalID(p, "request_id", type);
@@ -5298,8 +5305,24 @@ function validatePayload(
         institutionalID(p, "claim_id", type);
         institutionalID(p, "binding_id", type);
         if ("detail" in p) fail(`${type}.bound must not carry detail`);
+        // Half an identity cannot key an observation, so a partial pair is
+        // rejected rather than left for the caller to reason about.
+        const hasClaim = "authentication_claim_id" in p;
+        if (hasClaim !== "gate_occurrence_id" in p)
+          fail(
+            `${type}.bound requires authentication_claim_id and gate_occurrence_id together`,
+          );
+        if (hasClaim) {
+          institutionalID(p, "authentication_claim_id", type);
+          institutionalID(p, "gate_occurrence_id", type);
+        }
       } else {
-        if ("claim_id" in p || "binding_id" in p)
+        if (
+          "claim_id" in p ||
+          "binding_id" in p ||
+          "authentication_claim_id" in p ||
+          "gate_occurrence_id" in p
+        )
           fail(`${type}.${outcome} must not carry claim_id or binding_id`);
         institutionalFailure(p, type, outcome, "bound");
       }

@@ -4161,6 +4161,58 @@ test("a claim granted over an existing surface is mirrored into its ledger recor
   });
 });
 
+// The pipeline's bind is the only frame carrying claim identity, so this is the
+// whole chain it unlocks: identity -> grant -> durable mirror -> a report when
+// the surface is lost. Before it, a pipeline-created surface could produce no
+// observation at all, which is why the operator's journal was empty.
+test("a bind's claim identity survives to report the surface's loss", async () => {
+  const jobID = "job_bind_identity";
+  const h = makeHarness();
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM],
+      browser_holder_generation: 5,
+    }),
+  );
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  const internals = h.bridge as unknown as {
+    registerClaimGrantFromBind(
+      jobID: string,
+      payload: Record<string, unknown>,
+    ): void;
+    persistClaimIdentity(jobID: string, tabID: number): Promise<void>;
+  };
+  internals.registerClaimGrantFromBind(jobID, {
+    outcome: "bound",
+    claim_id: "claim-bind-live",
+    binding_id: "binding-bind-live",
+    authentication_claim_id: "claim-auth-live",
+    gate_occurrence_id: "gate-occ-live",
+  });
+  await internals.persistClaimIdentity(jobID, tabID);
+  const record = ledger.current()[String(tabID)] as
+    | SurfaceBirthRecord
+    | undefined;
+  expect(record?.claim).toEqual({
+    authentication_claim_id: "claim-auth-live",
+    gate_occurrence_id: "gate-occ-live",
+    browser_holder_generation: 5,
+  });
+
+  // The operator closes the surface: papio must say so, naming the binding the
+  // ledger recorded rather than anything held in worker memory.
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  const observation = await h.port.waitForFrame("claim_observation");
+  expect(observation.payload["event_kind"]).toBe("owner_closed");
+  expect(observation.payload["authentication_claim_id"]).toBe("claim-auth-live");
+  expect(observation.payload["gate_occurrence_id"]).toBe("gate-occ-live");
+});
+
 test("claim-observation outbox hydration keeps valid entries beside malformed storage data", async () => {
   const valid: ClaimObservationOutboxEntry = {
     observation_id: "obs_hydrate_valid",

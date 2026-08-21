@@ -8076,6 +8076,7 @@ export class Bridge {
     const p = result.payload as Partial<AuthenticationClaimResponsePayload>;
     if (typeof p.browser_holder_generation === "number")
       this.lastKnownBrowserHolderGeneration = p.browser_holder_generation;
+
     if (
       (p.outcome === "open_new" ||
         p.outcome === "navigate_existing" ||
@@ -8084,25 +8085,7 @@ export class Bridge {
       typeof p.gate_occurrence_id === "string"
     ) {
       const gateOccurrenceID = p.gate_occurrence_id;
-      // §5: ordinal is monotonic per gate_occurrence_id, never per grant —
-      // a fresh grant on the SAME occurrence (a restart re-consulting
-      // before its own prior observations drained) must never restart at
-      // 0 while those entries still queue; the daemon's unique
-      // (occurrence, ordinal) index would reject the collision as stale.
-      let nextOrdinal = 0;
-      for (const entry of this.claimObservationOutboxEntries.values()) {
-        if (
-          entry.gate_occurrence_id === gateOccurrenceID &&
-          entry.event_ordinal >= nextOrdinal
-        ) {
-          nextOrdinal = entry.event_ordinal + 1;
-        }
-      }
-      this.claimGrants.set(jobID, {
-        authenticationClaimID: p.authentication_claim_id,
-        gateOccurrenceID,
-        nextOrdinal,
-      });
+      this.registerClaimGrant(jobID, p.authentication_claim_id, gateOccurrenceID);
       if (p.outcome === "open_new") return { kind: "open_new" };
       if (typeof p.owner_binding_id === "string") {
         const ownerBindingID = p.owner_binding_id;
@@ -8120,6 +8103,52 @@ export class Bridge {
       return { kind: "park", dependentCount };
     }
     return { kind: "refuse" };
+  }
+  /** Record the claim identity governing this job's surface.
+   *
+   * §5: the ordinal is monotonic per gate_occurrence_id, never per grant — a
+   * fresh grant on the SAME occurrence (a restart re-consulting before its own
+   * prior observations drained) must never restart at 0 while those entries
+   * still queue; the daemon's unique (occurrence, ordinal) index would reject
+   * the collision as stale.
+   */
+  private registerClaimGrant(
+    jobID: string,
+    authenticationClaimID: string,
+    gateOccurrenceID: string,
+  ): void {
+    let nextOrdinal = 0;
+    for (const entry of this.claimObservationOutboxEntries.values()) {
+      if (
+        entry.gate_occurrence_id === gateOccurrenceID &&
+        entry.event_ordinal >= nextOrdinal
+      ) {
+        nextOrdinal = entry.event_ordinal + 1;
+      }
+    }
+    this.claimGrants.set(jobID, {
+      authenticationClaimID,
+      gateOccurrenceID,
+      nextOrdinal,
+    });
+  }
+
+  /** The daemon-orchestrated pipeline's only source of claim identity. Shares
+   * `registerClaimGrant` with the consult deliberately: two copies of the
+   * ordinal rule would drift, and a wrong ordinal is silently rejected as
+   * stale by the daemon rather than failing loudly. */
+  private registerClaimGrantFromBind(
+    jobID: string,
+    payload: Record<string, unknown>,
+  ): void {
+    const authenticationClaimID = payload["authentication_claim_id"];
+    const gateOccurrenceID = payload["gate_occurrence_id"];
+    if (
+      typeof authenticationClaimID !== "string" ||
+      typeof gateOccurrenceID !== "string"
+    )
+      return;
+    this.registerClaimGrant(jobID, authenticationClaimID, gateOccurrenceID);
   }
 
   /** The daemon just directed this job at another surface for the same
@@ -9112,7 +9141,16 @@ export class Bridge {
         }
         return;
       }
+      // The bind is this pipeline's ONLY source of claim identity — it has no
+      // consult — so register the grant here exactly as the consult does.
+      // Without it `onTabRemoved` has nothing to report from and the surface's
+      // loss is invisible: measured on the operator's own machine, zero
+      // observations had ever been produced for a pipeline-created surface.
+      this.registerClaimGrantFromBind(jobID, bindResponse.payload);
       await this.applyMaterialization(jobID, { type: "bound" });
+      // Ownership is already recorded, so mirror the identity onto the
+      // scaffold's durable record now rather than waiting for a drive.
+      await this.persistClaimIdentity(jobID, tabID);
     }
     correlation = this.materializationCorrelation(jobID);
     if (

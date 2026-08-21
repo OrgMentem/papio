@@ -1048,7 +1048,18 @@ type InstitutionalBindResponsePayload struct {
 	Outcome   string `json:"outcome"`
 	ClaimID   string `json:"claim_id,omitempty"`
 	BindingID string `json:"binding_id,omitempty"`
-	Detail    string `json:"detail,omitempty"`
+	// The daemon-orchestrated pipeline (candidate offer -> claim -> scaffold ->
+	// bind) has no consult in it, so the bind is the ONLY point at which the
+	// browser can learn the authentication-claim identity governing the surface
+	// it just bound. Without these two fields the extension can never construct
+	// a claim observation for a pipeline-created surface: measured on the
+	// operator's own machine 2026-08-21, zero `claim_abandoned` close
+	// authorizations had ever been issued and `claim_observation_journal` held
+	// zero rows across weeks of real sign-ins, because every surface the field
+	// actually creates arrives through this path.
+	AuthenticationClaimID string `json:"authentication_claim_id,omitempty"`
+	GateOccurrenceID      string `json:"gate_occurrence_id,omitempty"`
+	Detail                string `json:"detail,omitempty"`
 }
 type InstitutionalRouteRequestPayload struct {
 	RequestID              string `json:"request_id"`
@@ -5280,9 +5291,26 @@ func (p *InstitutionalBindResponsePayload) validate() error {
 		if err := institutionalID("institutional_bind_response.claim_id", p.ClaimID); err != nil {
 			return err
 		}
-		return institutionalID("institutional_bind_response.binding_id", p.BindingID)
+		if err := institutionalID("institutional_bind_response.binding_id", p.BindingID); err != nil {
+			return err
+		}
+		// Both identity fields are optional and travel together: an institution
+		// with no authentication claim has neither, and half an identity cannot
+		// key an observation, so a partial pair is a fail-closed error rather
+		// than something the extension has to reason about.
+		if (p.AuthenticationClaimID == "") != (p.GateOccurrenceID == "") {
+			return fmt.Errorf("institutional_bind_response.bound requires authentication_claim_id and gate_occurrence_id together")
+		}
+		if p.AuthenticationClaimID == "" {
+			return nil
+		}
+		if err := institutionalID("institutional_bind_response.authentication_claim_id", p.AuthenticationClaimID); err != nil {
+			return err
+		}
+		return institutionalID("institutional_bind_response.gate_occurrence_id", p.GateOccurrenceID)
 	}
-	if p.ClaimID != "" || p.BindingID != "" {
+	if p.ClaimID != "" || p.BindingID != "" || p.AuthenticationClaimID != "" ||
+		p.GateOccurrenceID != "" {
 		return fmt.Errorf("institutional_bind_response.%s forbids claim fields", p.Outcome)
 	}
 	return nil

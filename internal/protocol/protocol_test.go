@@ -2486,6 +2486,37 @@ func expectProtocolReject(t *testing.T, typ string, payload any) {
 	}
 }
 
+// jobScopedFrame stamps the job_id a job-scoped message type requires, so a
+// payload assertion cannot pass for the wrong reason (a missing job_id is
+// rejected before any payload rule runs).
+func jobScopedFrame(t *testing.T, typ string, payload any, jobID string) []byte {
+	t.Helper()
+	var frame map[string]any
+	if err := json.Unmarshal(protocolTestFrame(t, typ, payload), &frame); err != nil {
+		t.Fatal(err)
+	}
+	frame["job_id"] = jobID
+	data, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func expectFrameAccepted(t *testing.T, frame []byte, what string) {
+	t.Helper()
+	if _, err := DecodeBrowserMessage(frame); err != nil {
+		t.Fatalf("%s was rejected: %v", what, err)
+	}
+}
+
+func expectFrameRejected(t *testing.T, frame []byte, what string) {
+	t.Helper()
+	if _, err := DecodeBrowserMessage(frame); err == nil {
+		t.Fatalf("%s was accepted", what)
+	}
+}
+
 func int64Ptr(v int64) *int64 { return &v }
 func boolPtr(v bool) *bool    { return &v }
 
@@ -3120,4 +3151,47 @@ func TestTriageSnapshotQuartetForbiddenForWatchAndRetractionAcrossSchemas(t *tes
 			})
 		}
 	}
+}
+
+// The daemon-orchestrated pipeline has no consult, so the bind is the only
+// frame that can carry the identity a browser needs to report its surface's
+// loss. Half an identity cannot key an observation, so the pair is all-or-
+// nothing rather than something the extension has to reason about.
+func TestInstitutionalBindResponseCarriesClaimIdentityAsAPair(t *testing.T) {
+	base := func() map[string]any {
+		return map[string]any{
+			"request_id": "bind-request-0001",
+			"outcome":    "bound",
+			"claim_id":   "claim-bind-0001",
+			"binding_id": "binding-bind-0001",
+		}
+	}
+	frame := func(p map[string]any) []byte {
+		return jobScopedFrame(t, MsgInstitutionalBindResponse, p, "job-bind-identity")
+	}
+	t.Run("absent is accepted", func(t *testing.T) {
+		expectFrameAccepted(t, frame(base()), "bound without identity")
+	})
+	t.Run("both accepted", func(t *testing.T) {
+		p := base()
+		p["authentication_claim_id"] = "claim-auth-0001"
+		p["gate_occurrence_id"] = "gate-occ-0001"
+		expectFrameAccepted(t, frame(p), "bound with the identity pair")
+	})
+	for _, half := range []string{"authentication_claim_id", "gate_occurrence_id"} {
+		t.Run("half rejected/"+half, func(t *testing.T) {
+			p := base()
+			p[half] = "identity-half-0001"
+			expectFrameRejected(t, frame(p), "bound with only "+half)
+		})
+	}
+	t.Run("forbidden on a refusal", func(t *testing.T) {
+		expectFrameRejected(t, frame(map[string]any{
+			"request_id":              "bind-request-0002",
+			"outcome":                 "not_eligible",
+			"detail":                  "another sign-in for this institution is in progress",
+			"authentication_claim_id": "claim-auth-0002",
+			"gate_occurrence_id":      "gate-occ-0002",
+		}), "a refusal carrying the identity pair")
+	})
 }
