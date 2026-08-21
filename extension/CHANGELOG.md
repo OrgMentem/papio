@@ -71,6 +71,16 @@ for the full pre-split extension history.
   instant as it, so even a click that lands mid-close is caught.
 
 ### Changed
+- **Acquiring the page you are on is a `+` in the popup's header.** It appears
+  beside the inbox and settings icons whenever the current tab has a paper to
+  add and nothing already running for it, carries the accent it had as a button,
+  and names the exact target — DOI included — on hover, on keyboard focus, and
+  to assistive technology. The bordered card it used to live in cost 58px to
+  hold one control saying almost nothing, and now appears only when there is
+  something to report: a refusal and its remedy, a *which paper is this?*
+  choice, or an acquisition in progress. Clicking the icon hands the action
+  straight back to that card, so the two are never both live. `Enter` still
+  activates it, and **Select papers on this page** keeps its full label.
 - **The popup spends its space on the action, not the explanation twice.**
   A single browser blocker now occupies one compact row under **Do this in the
   browser**; its explanation stays on the control for hover and assistive

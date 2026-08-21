@@ -343,13 +343,16 @@ test("puts every current-page action in one rail, in the accepted hierarchy", ()
   const doc = popupDocument();
 
   expect(doc.querySelector("h1")).toBeNull();
-  // Acquire is no longer a header utility: the header owns only inbox and
-  // settings, and both page actions are siblings in the rail.
+  // The header offers the idle acquire action and nothing else: every acquire
+  // STATE element stays in the rail, so a hoisted icon can never be the thing
+  // that reports a refusal, a chooser, or an in-flight DOI.
   const headerActions = doc.querySelector(".header-actions");
   expect(Array.from(headerActions?.children ?? []).map((child) => child.id)).toEqual([
+    "header-acquire-btn",
     "open-inbox-btn",
     "settings-btn",
   ]);
+  expect(doc.getElementById("header-acquire-btn")?.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-btn")?.closest("header")).toBeNull();
   const rail = doc.getElementById("current-page-actions");
   expect(doc.getElementById("page-acquire-btn")?.closest("#current-page-actions")).toBe(rail);
@@ -624,9 +627,14 @@ test("shows the DOI acquire icon with its tooltip even without a negotiated daem
 
   const section = doc.getElementById("page-acquire");
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
   expect(section?.hidden).toBe(true);
   expect(button.disabled).toBe(false);
-  expect(button.hidden).toBe(false);
+  // Idle and unary, so the offer is hoisted and the rail collapses.
+  expect(button.hidden).toBe(true);
+  expect(header.hidden).toBe(false);
+  expect(header.title).toBe("Acquire this page · 10.1000/example");
+  expect(header.getAttribute("aria-label")).toBe("Acquire this page · 10.1000/example");
   expect(button.title).toBe("Acquire this page · 10.1000/example");
   expect(button.getAttribute("aria-label")).toBe("Acquire this page · 10.1000/example");
   expect(button.getAttribute("aria-disabled")).toBe("false");
@@ -674,6 +682,7 @@ test("hides the header acquire action when the current page has no paper", () =>
   expect(button.hidden).toBe(true);
   expect(button.getAttribute("aria-disabled")).toBe("true");
   expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
+  expect(doc.getElementById("header-acquire-btn")?.hidden).toBe(true);
   button.click();
   expect(calls).toBe(0);
 });
@@ -687,7 +696,12 @@ test("shows the PDF acquire icon with the PDF tooltip", () => {
     [job({ job_id: "job_1234567890abcdef", tab_id: 17 })],
   );
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
-  expect(button.hidden).toBe(false);
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  // A live delivery job owns the rail's card; the offer itself is still one
+  // clickable verb, so it is hoisted.
+  expect(button.hidden).toBe(true);
+  expect(header.hidden).toBe(false);
+  expect(header.title).toBe("Send this PDF to papio");
   expect(button.title).toBe("Send this PDF to papio");
   expect(button.getAttribute("aria-label")).toBe("Send this PDF to papio");
   expect(button.textContent).toBe("Send PDF");
@@ -845,8 +859,10 @@ test("renders a live, honest status card for a local in-flight acquisition", () 
 // has always gone through shortAcquireLabel, which truncates it; this pins the
 // contract, so a future label built without setAcquireButton cannot quietly put
 // an identifier back on the surface, and no future shortening can take the DOI
-// out of the accessible name while it is the thing the button acts on.
-test("the rail never draws a DOI and never drops it from the accessible name", () => {
+// out of the accessible name while it is the thing the button acts on. It holds
+// for the hoisted control too: an icon's accessible name is the only place the
+// researcher can still learn what the click will act on.
+test("no surface draws a DOI and neither control drops it from the accessible name", () => {
   const doc = popupDocument();
   const doi = "10.1177/15480518221144895";
   renderPageContext(
@@ -855,13 +871,18 @@ test("the rail never draws a DOI and never drops it from the accessible name", (
     [],
   );
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
-  expect(button.hidden).toBe(false);
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  expect(header.hidden).toBe(false);
+  expect(button.hidden).toBe(true);
   expect(button.disabled).toBe(false);
   expect(button.textContent).toBe("Acquire");
   expect(doc.getElementById("current-page-actions")?.textContent).not.toContain(doi);
-  // One hover and one accessible name away, in full.
-  expect(button.getAttribute("title")).toBe(`Acquire this page · ${doi}`);
-  expect(button.getAttribute("aria-label")).toBe(`Acquire this page · ${doi}`);
+  expect(header.textContent).not.toContain(doi);
+  // One hover and one accessible name away, in full, on both.
+  for (const el of [button, header]) {
+    expect(el.getAttribute("title")).toBe(`Acquire this page · ${doi}`);
+    expect(el.getAttribute("aria-label")).toBe(`Acquire this page · ${doi}`);
+  }
 });
 test("scopes live auth-pending warmth to its demanded resolver origin", () => {
   const now = Date.now();
@@ -3049,25 +3070,31 @@ function tabChrome(
   return { sent, injections };
 }
 
-test("a DOI landing page offers solid Acquire beside outlined bulk selection", () => {
+test("an idle DOI page hoists the accented Acquire, leaving bulk selection labelled", () => {
   const doc = popupDocument();
   renderPageContext(doc, binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }), []);
 
   const acquire = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
   const scan = doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement;
-  expect(acquire.hidden).toBe(false);
+  expect(header.hidden).toBe(false);
+  // Accented, not a third grey glyph beside inbox and settings.
+  expect(header.classList.contains("header-acquire")).toBe(true);
+  expect(acquire.hidden).toBe(true);
   expect(acquire.classList.contains("primary")).toBe(true);
+  // Bulk selection is consequential and multi-step, so it keeps its label.
   expect(scan.hidden).toBe(false);
   expect(scan.classList.contains("ghost")).toBe(true);
   // ADR-0019's exact visible label.
   expect(scan.textContent).toBe("Select papers on this page");
   expect(doc.getElementById("current-page-actions")?.hidden).toBe(false);
-  // With two actions, Enter means the specific one.
-  expect(acquire.dataset.primaryAction).toBe("true");
+  // With two actions, Enter means the specific one, wherever it now lives.
+  expect(header.dataset.primaryAction).toBe("true");
+  expect(acquire.dataset.primaryAction).toBeUndefined();
   expect(scan.dataset.primaryAction).toBeUndefined();
 });
 
-test("a PDF page offers Send PDF beside bulk selection, preserving the PDF-grab entry", () => {
+test("a PDF page hoists Send PDF beside bulk selection, preserving the PDF-grab entry", () => {
   const doc = popupDocument();
   renderPageContext(
     doc,
@@ -3075,11 +3102,14 @@ test("a PDF page offers Send PDF beside bulk selection, preserving the PDF-grab 
     [],
   );
   const acquire = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
   const scan = doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement;
-  expect(acquire.hidden).toBe(false);
+  expect(acquire.hidden).toBe(true);
+  expect(header.hidden).toBe(false);
+  expect(header.title).toBe("Send this PDF to papio");
   expect(acquire.title).toBe("Send this PDF to papio");
   expect(scan.hidden).toBe(false);
-  expect(acquire.dataset.primaryAction).toBe("true");
+  expect(header.dataset.primaryAction).toBe("true");
 });
 
 /** The PDF page every Send-PDF state test renders against: no live job, no page
@@ -3112,12 +3142,15 @@ test("a pending session with the grab features renders Send PDF enabled and send
   });
 
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
   expect(button.disabled).toBe(false);
   expect(button.dataset.sendPdf).toBe("ready");
-  expect(button.title).toBe("Send this PDF to papio");
-  expect(button.dataset.primaryAction).toBe("true");
+  expect(header.title).toBe("Send this PDF to papio");
+  expect(header.dataset.primaryAction).toBe("true");
 
-  button.click();
+  // The live path now: the header control forwards a real click to the rail's
+  // own handler, which remains the only holder of the binding and the mode.
+  header.click();
   await flushMicrotasks();
   expect(sent).toEqual(["https://papers.example.edu/a.pdf"]);
 });
@@ -3144,6 +3177,10 @@ test("a daemon without the grab features renders Send PDF disabled carrying its 
   expect(button.disabled).toBe(true);
   expect(button.getAttribute("aria-disabled")).toBe("true");
   expect(button.dataset.sendPdf).toBe("refused");
+  // A refusal carries a remedy, so it stays where it can be read without
+  // hovering; the header offers nothing while the rail is refusing.
+  expect(button.hidden).toBe(false);
+  expect((doc.getElementById("header-acquire-btn") as HTMLButtonElement).hidden).toBe(true);
   expect(button.title).toBe(remedy);
   expect(button.getAttribute("aria-label")).toBe(
     `Send this PDF to papio — ${remedy}`,
@@ -3159,6 +3196,60 @@ test("a daemon without the grab features renders Send PDF disabled carrying its 
   );
   await flushMicrotasks();
   expect(clicks).toBe(0);
+});
+
+// The hoist is derived from the control's settled state rather than decided per
+// branch, so the cases that must NOT reach the header are the contract. A
+// pending click is the one that would otherwise leave two live controls for the
+// same action: the researcher's own click has to be answered where the answer
+// will appear.
+test("a click hands the action back to the rail and clears the header offer", async () => {
+  const doc = popupDocument();
+  const acquisition = Promise.withResolvers<{ job_id: string }>();
+  renderPageAcquire(doc, () => acquisition.promise);
+  renderPageContext(doc, binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }), []);
+
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  expect(header.hidden).toBe(false);
+
+  header.click();
+  await flushMicrotasks();
+  expect(header.hidden).toBe(true);
+  expect(button.hidden).toBe(false);
+  expect(button.disabled).toBe(true);
+  expect(button.textContent).toBe("Acquiring…");
+
+  // And the answer is a state, so it stays in the rail too.
+  acquisition.resolve({ job_id: "job_page_acquire_001" });
+  await flushMicrotasks();
+  expect(header.hidden).toBe(true);
+  expect(button.hidden).toBe(false);
+  expect(button.title).toBe("Added to papio");
+});
+
+test("an in-flight acquisition offers neither control, leaving the live card to speak", () => {
+  const doc = popupDocument();
+  renderPageContext(
+    doc,
+    binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }),
+    [job({ expected: { doi: "10.1000/x", title: "Paper" } })],
+  );
+  const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  expect(button.hidden).toBe(true);
+  expect(header.hidden).toBe(true);
+  expect(doc.getElementById("page-acquire-live")?.hidden).toBe(false);
+});
+
+// `.settings-btn` declares its own `display`, which outranks the user-agent
+// `[hidden]` rule. Without an explicit override the hoisted control would stay
+// on screen through every state that belongs to the rail - and `hidden` is the
+// only thing hoistIdleAcquire sets, so no DOM test can see the difference.
+test("the hoisted control's hidden state is not defeated by its own display rule", () => {
+  const html = readFileSync(new URL("../src/popup.html", import.meta.url), "utf8");
+  const styles = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((m) => m[1]).join("\n");
+  expect(styles).toMatch(/\.header-acquire\[hidden\]\s*\{[^}]*display:\s*none/);
 });
 
 test("an extension the daemon will not talk to names its own remedy, DOI or not", () => {

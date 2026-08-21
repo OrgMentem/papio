@@ -346,6 +346,15 @@ required. `papio actions open` asks a compatible extension to use the browser
 where its tracked session lives; without one, it opens the resolver URLs
 normally.
 
+The acquire action itself sits in the popup's header: an accented **+** beside
+the inbox and settings icons, offered only when the current tab has a paper to
+add and nothing already running for it. Hover or focus it to read exactly what
+it will act on, DOI included. Everything else about that action — a refusal and
+its remedy, a *which paper is this?* choice, an acquisition already in
+progress — appears in the card below instead, so the icon is never the thing
+reporting a problem. **Select papers on this page** keeps its full label there:
+it is a different, multi-step action with its own consent step.
+
 The inbox keeps itself current without a manual refresh: it updates as soon
 as you return to the tab, and checks in on its own every so often while the
 tab stays open, so a new or resolved job doesn't wait for you to notice. The
@@ -439,8 +448,8 @@ because nothing errors, files simply never get adopted.
 The download path is deliberate: do not rename a file into another job's
 directory. If validation rejects the PDF, the job remains actionable so you can
 provide a different file. If the current tab is only a DOI or provider landing
-page, use **Acquire this page** or the browser handoff first; **Send PDF to
-papio** is for a PDF page.
+page, use the header's **+** (**Acquire this page**) or the browser handoff
+first; **Send PDF to papio** is for a PDF page.
 
 Firefox does not expose Chrome's `downloads.onDeterminingFilename` hook. The
 popup's direct **Send PDF to papio** download still uses its job-scoped

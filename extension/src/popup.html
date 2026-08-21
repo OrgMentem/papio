@@ -251,6 +251,28 @@
         width: var(--settings-mark-size);
       }
 
+      /* The one action among two navigations. It keeps the primary accent it
+         carried in the rail: hoisted into a row of grey glyphs, the popup's
+         whole reason to exist would read as tertiary. */
+      .header-acquire {
+        background: var(--color-primary-solid);
+        border-color: var(--color-primary-solid);
+        color: var(--color-on-primary);
+      }
+
+      .header-acquire:hover:not(:disabled) {
+        background: var(--color-primary-solid-hover);
+        border-color: var(--color-primary-solid-hover);
+        color: var(--color-on-primary);
+      }
+
+      /* `.settings-btn` sets its own `display`, which beats the user-agent
+         [hidden] rule; without this the hoisted control would stay on screen
+         through every state that belongs to the rail. */
+      .header-acquire[hidden] {
+        display: none;
+      }
+
       main {
         display: grid;
         gap: var(--space-2);
@@ -930,6 +952,16 @@
         <span class="brand-name"><em>papio</em></span>
       </div>
       <div class="header-actions">
+        <!-- Hoisted out of the rail by hoistIdleAcquire for the one state an
+             icon can carry without loss: one verb, nothing to disambiguate,
+             nothing in flight. Its accessible name is replaced there with the
+             rail control's own full label, DOI included. -->
+        <button id="header-acquire-btn" class="settings-btn header-acquire" type="button" title="Acquire this page" aria-label="Acquire this page" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="12" y1="5" x2="12" y2="19"/>
+            <line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+        </button>
         <button id="open-inbox-btn" class="settings-btn" type="button" title="Open inbox" aria-label="Open inbox" aria-describedby="open-inbox-status">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/>

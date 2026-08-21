@@ -3169,6 +3169,32 @@ function shortAcquireLabel(label: string): string {
   return label.length > 12 ? `${label.slice(0, 11)}…` : label;
 }
 
+/** The rail owns every acquire state; the header owns only the idle offer.
+ *
+ * A visible, enabled rail control is the one state an icon can carry without
+ * loss — one verb, nothing to disambiguate, nothing in flight — and it is also
+ * the state that spends a whole bordered card to say almost nothing. Every
+ * other state keeps the rail: a refusal's remedy, a pending click, an in-flight
+ * DOI, a chooser. Deriving the hoist from the control's own settled state
+ * rather than from renderPageContext's branches means a state added later
+ * cannot forget to decide, and the two controls can never both be live.
+ *
+ * The header button is a remote control, never a second implementation: the
+ * rail button remains the only holder of the bound page, the mode, and the
+ * handler. */
+function hoistIdleAcquire(button: HTMLButtonElement): void {
+  const header = button.ownerDocument.getElementById("header-acquire-btn");
+  if (!(header instanceof HTMLButtonElement)) return;
+  const hoistable = !button.hidden && !button.disabled;
+  header.hidden = !hoistable;
+  if (!hoistable) return;
+  // The full label, DOI and all: an icon's accessible name is the only place
+  // the researcher can still learn what this click will act on.
+  header.title = button.title;
+  header.setAttribute("aria-label", button.title);
+  button.hidden = true;
+}
+
 function setAcquireButton(
   button: HTMLButtonElement,
   label: string,
@@ -3181,6 +3207,7 @@ function setAcquireButton(
   button.setAttribute("aria-disabled", String(disabled));
   button.disabled = disabled;
   button.hidden = hidden;
+  hoistIdleAcquire(button);
 }
 
 /** One visible, non-live result element per rail action. `section` collapses
@@ -3475,6 +3502,14 @@ export function renderPageAcquire(
   ) {
     return;
   }
+  const header = doc.getElementById("header-acquire-btn");
+  if (header instanceof HTMLButtonElement && header.dataset.wired === undefined) {
+    header.dataset.wired = "1";
+    // Forwarded synchronously, so this stays the researcher's own gesture and
+    // the rail control keeps sole authority over what a click means. A hoisted
+    // rail button is hidden but never disabled, so the click always dispatches.
+    header.addEventListener("click", () => button.click());
+  }
   if (button.dataset.wired) return;
   button.dataset.wired = "1";
   button.addEventListener("click", () => {
@@ -3609,18 +3644,24 @@ export function isBulkScannablePage(binding: PageActionBinding | undefined): boo
   return binding !== undefined && scannerOriginForBinding(binding) !== null;
 }
 
-/** Mark exactly one visible, enabled rail button as the Enter target. With both
- * actions present, Acquire/Send PDF wins because it is the specific one. */
+/** Mark exactly one visible, enabled control as the Enter target. With both rail
+ * actions present, Acquire/Send PDF wins because it is the specific one; when it
+ * is hoisted, the mark travels to the header control that now offers it. */
 function markPrimaryRailAction(
   acquire: HTMLButtonElement,
   scan: HTMLButtonElement | undefined,
 ): void {
-  const acquirePrimary = !acquire.hidden;
-  if (acquirePrimary) acquire.dataset.primaryAction = "true";
+  const header = acquire.ownerDocument.getElementById("header-acquire-btn");
+  const hoisted = header instanceof HTMLButtonElement && !header.hidden;
+  if (header instanceof HTMLButtonElement) {
+    if (hoisted) header.dataset.primaryAction = "true";
+    else delete header.dataset.primaryAction;
+  }
+  if (!acquire.hidden) acquire.dataset.primaryAction = "true";
   else delete acquire.dataset.primaryAction;
   if (scan === undefined) return;
-  if (!acquirePrimary && !scan.hidden) scan.dataset.primaryAction = "true";
-  else delete scan.dataset.primaryAction;
+  if (!acquire.hidden || hoisted || scan.hidden) delete scan.dataset.primaryAction;
+  else scan.dataset.primaryAction = "true";
 }
 
 /** `daemon` is the store's own record of the last hello_ack. It is optional and
@@ -3922,10 +3963,14 @@ export function wirePrimaryShortcut(doc: Document = document): void {
     if (event.key !== "Enter" || event.defaultPrevented) return;
     const target = event.target;
     if (target instanceof HTMLElement && target.closest("button, input, select, textarea, a")) return;
-    // Whichever rail action renderPageContext marked, not a hardcoded id: on an
-    // ordinary HTTPS page Acquire is hidden and bulk selection is the only thing
-    // Enter could sensibly mean.
-    const primary = doc.querySelector('#current-page-actions button[data-primary-action="true"]');
+    // Whichever control renderPageContext marked, not a hardcoded id: on an
+    // ordinary HTTPS page Acquire is not offered at all and bulk selection is
+    // the only thing Enter could sensibly mean. The mark follows the acquire
+    // action into the header when it is hoisted, so Enter keeps meaning "the
+    // paper in front of me" rather than the scan behind it.
+    const primary = doc.querySelector(
+      '#current-page-actions button[data-primary-action="true"], .header-actions button[data-primary-action="true"]',
+    );
     if (primary instanceof HTMLButtonElement && !primary.hidden && !primary.disabled) {
       event.preventDefault();
       primary.click();
