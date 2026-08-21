@@ -103,16 +103,16 @@ previous, and the last two found only because the third made refusals visible.
    permit, so the daemon has no stake and says so. Verified live: **9
    `unclaimed` closes in one evening**, at exact 3-minute drive-timeout
    intervals.
-2. `abd6aa2` — **reconcile asked whether the paper still existed**, not whether
+2. `3630b9b` — **reconcile asked whether the paper still existed**, not whether
    anything still pointed at the surface. The legacy timeout deliberately
    detaches the job (`tab_id: -1`) and leaves it alive, so a tabless paper
    shielded its own abandoned tab from the only retry path there is.
-3. `handoff_parked` — **a paper waiting for a human keeps its handoff action
+3. `24d365b` — `handoff_parked`: **a paper waiting for a human keeps its handoff action
    open**, so `job_inactive` is false for it and was refused every pass ("the
    binding still has an active browser handoff"). True, and never a reason to
    hold a tab. Asking a human is a request, not a lease on their browser.
    Storage vocabulary is a second gate and a DB CHECK: migration `0047`.
-4. The **fresh-link park keeps its tab on purpose** — "detaching it would leave
+4. `eecba8d` — the **fresh-link park keeps its tab on purpose** — "detaching it would leave
    the job with neither a reusable URL nor a way back to the operator's page".
    The second half stopped being true when engagement began minting fresh
    routes, so the preserved page is a spent single-use link. Retirement is gated
