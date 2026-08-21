@@ -4051,6 +4051,43 @@ export class Bridge {
       browser_holder_generation: generation,
     };
   }
+  /** Mirror a just-granted claim onto the surface it governs.
+   *
+   * `ledgerManagedTab` captures the identity at BIRTH, and it was the only
+   * writer — but a grant almost always post-dates its surface. The consult
+   * follows the open (`navigate_existing`/`focus_owner` act on a tab that
+   * already exists), and the daemon-driven materialization pipeline claims,
+   * binds and routes a tab that is already born. So the durable mirror was
+   * written only on the `open_new` ordering, and every other surface kept its
+   * claim identity in worker memory alone. MV3 sleeps the worker ~30s after
+   * the last event, and a human signing in takes minutes, so by the time the
+   * tab closed the grant was gone and `onTabRemoved` had nothing to report
+   * from: measured on the operator's own machine 2026-08-21, one entry lease
+   * had ever been reserved, zero `claim_abandoned` close authorizations had
+   * ever been issued, and `claim_observation_journal` held zero rows across
+   * weeks of real sign-ins. The additive branch in `ledgerManagedTab` existed
+   * for exactly this and nothing ever invoked it.
+   */
+  private async persistClaimIdentity(
+    jobID: string,
+    tabID: number,
+  ): Promise<void> {
+    if (this.deps.tabLedger === undefined) return;
+    const claim = this.durableClaimIdentity(jobID);
+    if (claim === undefined || tabID < 0) return;
+    // Strictly additive against an EXISTING record: this must never mint a
+    // birth certificate, which only `ledgerManagedTab` may do at the moment
+    // papio actually creates the surface. A tab papio did not create has no
+    // record here and must not acquire one.
+    await this.runTabLedgerTransaction(async (ledger) => {
+      const existing = ledger[String(tabID)];
+      if (existing === undefined || existing.claim !== undefined)
+        return { value: undefined, changed: false };
+      existing.claim = claim;
+      return { value: undefined, changed: true };
+    });
+  }
+
   private async forgetLedgeredTab(tabID: number): Promise<void> {
     if (this.deps.tabLedger === undefined) return;
     await this.runTabLedgerTransaction(async (ledger) => {
@@ -5455,6 +5492,11 @@ export class Bridge {
   }
 
   private registerHandoffDrive(jobID: string, tabID: number): void {
+    // Ownership of a tab is exactly when a claim's identity must become
+    // durable, and this is the one place every path announces it. Placed
+    // before the bookkeeping returns below: the surface is owned regardless of
+    // whether a drive slot is free.
+    void this.persistClaimIdentity(jobID, tabID);
     if (this.handoffDrives.has(jobID)) return;
     // A caller's own `handoffDrives.size >= HANDOFF_DRIVE_LIMIT` check and this
     // call are separated by awaits (openManagedTab, upsertJobWithOffer/patchJob),

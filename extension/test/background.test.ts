@@ -4098,6 +4098,69 @@ test("claim-observation outbox persistence serializes an enqueue snapshot before
   expect(stored).toEqual({});
 });
 
+// The grant almost always post-dates its surface: navigate_existing and
+// focus_owner govern a tab that already exists, and MV3 sleeps the worker ~30s
+// after the last event while a human sign-in takes minutes. Without a durable
+// mirror written at grant time, the identity is gone by the time the tab
+// closes and the loss can never be reported — measured on the operator's own
+// machine, zero claim_abandoned close authorizations and zero journal rows
+// across weeks of real sign-ins.
+test("a claim granted over an existing surface is mirrored into its ledger record", async () => {
+  const ownerJob = "job_mirror_owner";
+  const waiterJob = "job_mirror_waiter";
+  const candidateID = "cand_mirror_wait01";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(waiterJob)],
+  });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM],
+      browser_holder_generation: 7,
+    }),
+  );
+  // A live papio surface, born for an ordinary offer and therefore ledgered
+  // with no claim of its own.
+  await h.port.inbound(jobOffer(ownerJob));
+  const ownerTab = h.backend.store.activeJobs.find(
+    (j) => j.job_id === ownerJob,
+  )?.tab_id;
+  expect(ownerTab).toBeGreaterThanOrEqual(0);
+  const recordFor = (id: number) =>
+    ledger.current()[String(id)] as SurfaceBirthRecord | undefined;
+  expect(recordFor(ownerTab as number)?.claim).toBeUndefined();
+
+  // The waiter consults and is sent to that already-live surface: the grant
+  // post-dates the surface, which is the ordering the durable mirror exists
+  // for.
+  await seedClaimCandidate(h, waiterJob, candidateID);
+  const opened = h.bridge.openHandoff(waiterJob);
+  const consult = await h.port.waitForFrame("authentication_claim_request");
+  await h.port.inbound(
+    claimResponse(waiterJob, consult.payload["request_id"], {
+      outcome: "navigate_existing",
+      authentication_claim_id: "claim-mirror-live",
+      gate_occurrence_id: "gate-mirror-live",
+      browser_holder_generation: 7,
+      lease_until: new Date(Date.now() + 60_000).toISOString(),
+      owner_binding_id: "binding-mirror-live",
+      owner_tab_hint: ownerTab,
+    }),
+  );
+  expect((await opened).ok).toBe(true);
+
+  // Without this the identity lives only in worker memory, and MV3 sleeps the
+  // worker ~30s after the last event while a sign-in takes minutes — so the
+  // tab's eventual close could report nothing at all.
+  expect(recordFor(ownerTab as number)?.claim).toEqual({
+    authentication_claim_id: "claim-mirror-live",
+    gate_occurrence_id: "gate-mirror-live",
+    browser_holder_generation: 7,
+  });
+});
+
 test("claim-observation outbox hydration keeps valid entries beside malformed storage data", async () => {
   const valid: ClaimObservationOutboxEntry = {
     observation_id: "obs_hydrate_valid",
