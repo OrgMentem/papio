@@ -50,6 +50,44 @@ raised earlier as "87 papers can only go the legacy path" — and it is
 deliberately NOT taken here. Slice 1's fixes are prerequisites for it either
 way: without them the winning path would still deadlock on cleanup.
 
+## The in-flight limit, fixed and verified live
+
+`maxOutstandingOffers` counted offers SENT, not surfaces driven. The four
+papers holding all four slots were answering `job_accept` with disposition
+`queued` — the extension saying it had parked the offer and was **not** driving
+it. The fruitless-epoch fold already respects that signal, and
+`job.HandoffAcceptedLease`'s own comment already names the mistake ("charging a
+job for waiting its turn … the same mistake as counting raw offers, one layer
+down"). This was that layer. Queued papers no longer consume the budget.
+
+Measured before and after on the operator's machine:
+
+| | before | after |
+| --- | --- | --- |
+| distinct papers offered per 5 min | 4, rotating | **21** |
+| accepts: driving vs queued | 4 driving | **1 driving, 20 queued** |
+| papio group tabs, over 150s | grew ~1 per 2s during churn | **15 → 15 → 15** |
+
+The tab count is the load-bearing one: freeing the budget did NOT produce a tab
+storm, because concurrency was never the budget's to bound — the extension's
+`HANDOFF_DRIVE_LIMIT` and the one-sign-in-per-institution lease do that, and
+both still hold. One paper drives, twenty wait in the extension's queue.
+
+Two honest notes. A first pass at this reached for `QuiesceAfter` (7 days) and
+then drive-recency (10 min); **both were falsified by measurement** — the slot
+holders were 6.41 days old and had drive evidence 0.7 minutes old, so neither
+rule would have freed anything. The disposition the extension was already
+reporting was the only signal that actually separated waiting from working. And
+a claim-churn alarm during verification was **my own measurement bug**: an ISO
+`T` timestamp compared against SQLite's space-separated `datetime('now')` makes
+every historical row look current.
+
+Still open, and now cleanly isolated: those 15 tabs are debris no code will
+close. `cleanupOrphanTabs` classifies and closes nothing, and
+`reconcileHandoffGroups` is deliberately non-destructive, so every tab from the
+churn era survives. That is the operator's "doesn't clean up after itself",
+and it is now the only part of that complaint still standing.
+
 Measured on the operator's machine 2026-08-21: 129 papers awaiting a human, 21
 eligible browser candidates, **zero** live claims, and one
 `authentication_entry_leases` row in state `expired`. No churn, no errors,
