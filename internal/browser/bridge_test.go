@@ -14049,3 +14049,154 @@ func TestHandoffEpochsResetRepairsAStreak(t *testing.T) {
 		t.Fatal("a repaired paper that then burned its budget again must re-quiesce")
 	}
 }
+
+// TestTerminalClaimRetiresOnlyAfterItsCancelIsDelivered pins both halves of the
+// immortal-claim repair. Both reconcile paths skip a claim carrying ANY
+// effect_permits row, so a terminal job's claim outlived its lease, its tab and
+// the browser itself: measured live 2026-08-21, eleven claims on cancelled jobs
+// sat `navigated` with tab ids days dead, each with a settled permit, while
+// poll re-sent their cancel on every daemon restart.
+//
+// The ordering is the load-bearing part. The cancel frame is emitted BECAUSE a
+// terminal job still owns a live claim, so retiring the row in the same pass
+// deletes the notice that tells the extension to close the tab - a stranded
+// surface, which is the exact failure this subsystem exists to prevent.
+func TestTerminalClaimRetiresOnlyAfterItsCancelIsDelivered(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	// Any live phase qualifies; the live rows were `navigated`, and this seed is
+	// the one the permit APIs can still bind.
+	claim := seedSurfaceCloseClaim(t, b, jobs, "terminal-immortal", "claimed")
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("binding candidate = %+v, err=%v", candidate, err)
+	}
+	// A SETTLED permit is what made the row immortal: the effect is over, so it
+	// protects nothing, yet the permit's mere existence vetoed both sweeps.
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch,
+		candidate.InstitutionProfileRevision, 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome, err := jobs.AcquireInstitutionalEffectPermit(ctx,
+		job.InstitutionalEffectPermitAcquireInput{
+			JobID: candidate.JobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+			SafetyDomainID: candidate.SafetyDomainID, InstitutionalRequestID: "immortal-request",
+			JobAttemptRevision: candidate.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+			ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
+			Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
+		}); err != nil || outcome != job.EffectPermitAcquired {
+		t.Fatalf("effect permit outcome=%v err=%v", outcome, err)
+	}
+	if err := jobs.Cancel(ctx, candidate.JobID, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+
+	// An IN-FLIGHT permit is a real veto: the provider effect may still be
+	// running, and job termination is not permission to interrupt it.
+	msgs, _ := runSync(t, b)
+	if cancel := firstOfType(msgs, protocol.MsgCancel); cancel == nil {
+		t.Fatalf("first poll must still announce the cancel: %v", msgs)
+	}
+	runSync(t, b)
+	held, err := jobs.MaterializationClaimByBindingID(ctx, claim.BindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held == nil || held.Phase == "abandoned" {
+		t.Fatalf("a held permit must veto retirement, got %+v", held)
+	}
+
+	if _, outcome, err := jobs.SettleEffectPermit(ctx, job.EffectPermitSettleInput{
+		Identity: job.EffectPermitIdentity{
+			JobID: candidate.JobID, Kind: job.Institutional, ClaimID: claim.ID,
+			BindingID: claim.BindingID, EffectOrdinal: 1, InstitutionalRequestID: "immortal-request",
+		},
+		RequiredEvents: []job.EffectPermitEvent{{Kind: "browser.institutional_effect_result", Detail: map[string]any{
+			"claim_id": claim.ID, "binding_id": claim.BindingID, "effect_ordinal": 1,
+			"institutional_request_id": "immortal-request",
+		}}},
+	}); err != nil || outcome != job.EffectPermitApplied {
+		t.Fatalf("settle outcome=%v err=%v", outcome, err)
+	}
+	// Settled now, and this session already delivered the cancel above, so the
+	// next poll is the first one allowed to retire the row.
+	runSync(t, b)
+	retired, err := jobs.MaterializationClaimByBindingID(ctx, claim.BindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired == nil || retired.Phase != "abandoned" {
+		t.Fatalf("settled permit on a terminal job must retire the claim, got %+v", retired)
+	}
+}
+
+// TestTerminalClaimSurvivesThePollThatAnnouncesIt pins the delivery gate. The
+// cancel frame is emitted BECAUSE a terminal job still owns a live claim, so a
+// same-poll retirement would let the frame be lost in transport with the row
+// already gone - papio would have forgotten a surface it never proved the
+// browser was told about, and the tab would outlive it. Retirement therefore
+// waits for a poll after the one that queued the frame: if the session survived
+// to poll again, the frame was delivered.
+func TestTerminalClaimSurvivesThePollThatAnnouncesIt(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "terminal-announce", "claimed")
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("binding candidate = %+v, err=%v", candidate, err)
+	}
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch,
+		candidate.InstitutionProfileRevision, 11); err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome, err := jobs.AcquireInstitutionalEffectPermit(ctx,
+		job.InstitutionalEffectPermitAcquireInput{
+			JobID: candidate.JobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+			SafetyDomainID: candidate.SafetyDomainID, InstitutionalRequestID: "announce-request",
+			JobAttemptRevision: candidate.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+			ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
+			Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
+		}); err != nil || outcome != job.EffectPermitAcquired {
+		t.Fatalf("effect permit outcome=%v err=%v", outcome, err)
+	}
+	// Settled BEFORE the first poll, so nothing but the delivery gate can hold
+	// the row through it.
+	if _, outcome, err := jobs.SettleEffectPermit(ctx, job.EffectPermitSettleInput{
+		Identity: job.EffectPermitIdentity{
+			JobID: candidate.JobID, Kind: job.Institutional, ClaimID: claim.ID,
+			BindingID: claim.BindingID, EffectOrdinal: 1, InstitutionalRequestID: "announce-request",
+		},
+		RequiredEvents: []job.EffectPermitEvent{{Kind: "browser.institutional_effect_result", Detail: map[string]any{
+			"claim_id": claim.ID, "binding_id": claim.BindingID, "effect_ordinal": 1,
+			"institutional_request_id": "announce-request",
+		}}},
+	}); err != nil || outcome != job.EffectPermitApplied {
+		t.Fatalf("settle outcome=%v err=%v", outcome, err)
+	}
+	if err := jobs.Cancel(ctx, candidate.JobID, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := runSync(t, b)
+	if cancel := firstOfType(msgs, protocol.MsgCancel); cancel == nil {
+		t.Fatalf("the announcing poll must emit the cancel: %v", msgs)
+	}
+	announced, err := jobs.MaterializationClaimByBindingID(ctx, claim.BindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if announced == nil || announced.Phase == "abandoned" {
+		t.Fatalf("the row must outlive the poll that announces it, got %+v", announced)
+	}
+
+	runSync(t, b)
+	retired, err := jobs.MaterializationClaimByBindingID(ctx, claim.BindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired == nil || retired.Phase != "abandoned" {
+		t.Fatalf("the poll after delivery must retire the row, got %+v", retired)
+	}
+}

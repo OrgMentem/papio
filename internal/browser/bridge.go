@@ -10081,10 +10081,17 @@ jobLoop:
 	for id := range b.materializationTracked {
 		cancelIDs[id] = true
 	}
+	// Terminal jobs whose cancel this session has ALREADY delivered. Read before
+	// the loop below sets cancelSent, so a job appears here one poll after it was
+	// told — never in the same poll that emits its frame.
+	var terminalCancelled []string
 	if terminalIDs, terminalErr := b.jobs.TerminalMaterializationJobIDs(ctx); terminalErr != nil {
 		log.Printf("papio: reading terminal materialization jobs for browser cancellation: %v", terminalErr)
 	} else {
 		for _, id := range terminalIDs {
+			if b.cancelSent[id] {
+				terminalCancelled = append(terminalCancelled, id)
+			}
 			cancelIDs[id] = true
 		}
 	}
@@ -10142,6 +10149,18 @@ jobLoop:
 			b.cancelSent[id] = true
 		}
 		b.clearMaterializationTracking(id)
+	}
+	// The row itself, last. Both reconcile paths decline to touch a claim
+	// carrying any effect permit, which for a terminal job protects nothing and
+	// makes the row immortal: eleven claims on cancelled jobs, tab ids days
+	// dead, sat `navigated` on the operator's machine while this very loop
+	// re-sent their cancel on every daemon restart. Retiring only what was
+	// already told keeps the frame above as the browser's notice, and keeps this
+	// best-effort like the reconcile passes: a failure must never block polling.
+	if len(terminalCancelled) > 0 {
+		if _, err := b.jobs.AbandonTerminalMaterializations(ctx, b.now(), terminalCancelled); err != nil {
+			log.Printf("papio: abandoning terminal materialization claims: %v", err)
+		}
 	}
 	if b.epoch != epoch {
 		return out, nil

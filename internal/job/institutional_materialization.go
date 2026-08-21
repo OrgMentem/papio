@@ -1449,6 +1449,114 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 	return expired, nil
 }
 
+// AbandonTerminalMaterializations retires the live claims of jobs the caller
+// has ALREADY told the browser to tear down, and returns the rows it retired.
+//
+// The job-id argument is the ordering invariant, not a convenience. The poll's
+// cancel frame is emitted because a terminal job still owns a live claim
+// (TerminalMaterializationJobIDs), so retiring the row first deletes the very
+// evidence that tells the extension to close the tab — the surface would then
+// outlive papio's knowledge of it, which is the litter this whole subsystem
+// exists to prevent. The caller therefore passes only jobs whose cancel it has
+// already delivered in this session, which costs one extra poll and makes the
+// worst case "the row lives 2s longer".
+//
+// ReconcileMaterializationClaims and AbandonStaleMaterializations both decline
+// to touch a claim that has ANY effect_permits row, which keeps an authorized
+// institutional effect from being yanked mid-flight. For a terminal job that
+// guard has nothing left to protect and makes the claim immortal: the lease can
+// expire, the tab can be closed, the browser can restart, and the row stays
+// `navigated` forever. Measured live on 2026-08-21: eleven claims on cancelled
+// jobs, tab ids days dead, every one carrying a settled permit. The daemon even
+// knew — TerminalMaterializationJobIDs names them on every poll and re-sends
+// cancel to the extension — while never retiring its own row.
+//
+// So the permit guard here is the one RetireTerminalAuthenticationEntryLeases
+// already uses for the institution's sign-in slot: only an IN-FLIGHT permit
+// (`held`, `unknown_completion`) defers retirement. A `settled` permit means the
+// effect is finished, and a job that has reached ready/imported/failed/
+// unavailable/cancelled will never be driven again, so nothing can start.
+//
+// The candidate rows are deliberately left alone. Re-eligibling a candidate
+// belonging to a terminal job would offer work for a paper that is done.
+func (js *Store) AbandonTerminalMaterializations(ctx context.Context, now time.Time, jobIDs []string) ([]MaterializationClaim, error) {
+	if len(jobIDs) == 0 {
+		return nil, nil
+	}
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	// One id per statement, like consumeCloseAuthorizationsTx: this package has
+	// no IN-clause idiom and the set is bounded by terminal jobs still holding a
+	// claim, so a built placeholder list would buy nothing.
+	const terminalClaimPredicate = ` phase IN ('claimed','bound','route_issued','navigated')
+		AND EXISTS (
+		  SELECT 1 FROM browser_candidates c
+		    JOIN jobs j ON j.id=c.job_id
+		   WHERE c.id=materialization_claims.candidate_id
+		     AND c.job_id=?
+		     AND j.state IN ('cancelled','failed','imported','ready','unavailable'))
+		AND NOT EXISTS (
+		  SELECT 1 FROM effect_permits p
+		   WHERE p.binding_id=materialization_claims.binding_id
+		     AND p.effect_kind='institutional'
+		     AND p.status IN ('held','unknown_completion'))`
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var retired []MaterializationClaim
+	for _, jobID := range jobIDs {
+		if strings.TrimSpace(jobID) == "" {
+			continue
+		}
+		rows, err := tx.QueryContext(ctx, claimSelect+` WHERE`+terminalClaimPredicate+` ORDER BY id`, jobID)
+		if err != nil {
+			return nil, err
+		}
+		before := len(retired)
+		for rows.Next() {
+			var c MaterializationClaim
+			if err := rows.Scan(&c.ID, &c.CandidateID, &c.BrowserHolderGeneration, &c.MaterializationKind,
+				&c.BindingID, &c.TabID, &c.Phase, &c.RouteIssuanceOrdinal, &c.EffectOrdinal, &c.LeaseUntil, &c.CreatedAt, &c.UpdatedAt); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			retired = append(retired, c)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+		if len(retired) == before {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=?
+			WHERE`+terminalClaimPredicate, stamp, jobID); err != nil {
+			return nil, err
+		}
+	}
+	if len(retired) == 0 {
+		return nil, tx.Commit()
+	}
+	retiredBindings := make([]string, len(retired))
+	for i, c := range retired {
+		retiredBindings[i] = c.BindingID
+	}
+	if err := consumeCloseAuthorizationsTx(ctx, tx, retiredBindings, stamp); err != nil {
+		return nil, err
+	}
+	// Same reason as the expiry path: a retired binding's surface is gone, so
+	// its institution must not stay held.
+	if err := releaseAuthenticationEntryLeasesForBindingsTx(ctx, tx, retiredBindings, stamp); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return retired, nil
+}
+
 // AbandonStaleMaterializations transactionally fences every live claim issued
 // by an older browser holder generation. Claims from the current generation
 // remain untouched. Candidates are made eligible again only when no other live

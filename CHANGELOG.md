@@ -268,6 +268,17 @@ execution records kept during the initial build.
   restored on upgrade — a one-off repair, recorded per paper, that makes no
   claim about any attempt: a paper that really is dead simply goes quiet again
   after its next three real attempts.
+- **A cancelled paper no longer keeps its browser surface on the books
+  forever.** The two sweeps that retire browser claims both refuse to touch one
+  carrying any provider-effect record, so an irreversible provider action is
+  never interrupted mid-flight. For a paper that has already finished there is
+  nothing left to interrupt, and the record made the claim immortal: eleven
+  claims on cancelled papers were sitting live with tab ids days dead, and
+  *papio* re-announced their teardown on every restart while never closing its
+  own book on them. A finished paper's claim is now retired, guarded the same
+  way the institution's sign-in slot already was — only an effect still in
+  flight defers it — and only after the teardown was actually delivered to the
+  browser, so the tab can never outlive *papio*'s knowledge of it.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route
