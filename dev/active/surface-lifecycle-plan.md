@@ -975,3 +975,69 @@ Live verification after the operator's reload (2026-08-21 07:39–07:42):
 
 Open after this round: an applied `claim_observation` row on live data. Until
 one exists, the restart-recovery family's field behaviour rests on the suite.
+
+## Fourth field round (2026-08-21 morning) — "why is nothing else happening"
+
+The stall was fixed and the queue still did not move. It was not waiting: papio
+had **given up on the entire institutional backlog**, and had retired it for
+waiting in line. Every link measured on the live store:
+
+```
+one immortal claim held the institution's sign-in slot   (fixed this morning)
+  -> 273 sibling binds refused
+  -> the extension's single drive slot never freed        (HANDOFF_DRIVE_LIMIT=1)
+  -> 438 handoffs offered, acked, dropped at QUEUED_HANDOFF_RELEASE_MS
+  -> every ack charged as a fruitless drive epoch
+  -> 3 strikes -> 78 papers permanently retired
+     of which 77 had NO browser_candidates row: no tab ever existed
+```
+
+1. **FIXED — the sign-in release honoured age but overrode fruitlessness.**
+   `reofferPending` acts as an override at the ordinary drain's gate on the
+   strength of a comment claiming "reofferPending was already filtered when it
+   was set"; that filter checked `HumanAction.Quiesced` — age only. So four
+   already-quiesced papers held the whole four-slot budget across **424**
+   releases while 58 age-live papers were never volunteered once. Both notions
+   now come from `handoffQuiescedByEvidence`, called by both paths.
+2. **FIXED — `browser.handoff_offered` opened an epoch by itself**, charging a
+   paper for being *asked*. An unacked offer is a transport or attention
+   failure, which this fence already declined to charge.
+3. **FIXED — `job_accept` meant both "driving" and "queued behind my one drive
+   slot".** `HandoffAcceptedLease`'s own comment names this hazard and fixed
+   only the lease-length half. The ack now carries a disposition; only a
+   driving ack opens an epoch. Absent means driving, so a shipped peer is
+   unchanged. **Protocol change** (`protocol.go`, `protocol.ts`,
+   `browser-v1.schema.json`, one commit; AMO `average_daily_users` = 0 today).
+   The extension routes all 17 accept sites through one `sendJobAccept` that
+   derives the disposition from the job's own status — an unknown status omits
+   the field and reads as driving, so a mis-ordered write is never worse than
+   today.
+4. **FIXED — the 78 were repaired** (migration 0045). The verdict is *derived*
+   from history, so correcting the rule cannot un-charge acks already recorded
+   without a disposition. One `browser.handoff_epochs_reset` per affected job
+   zeroes the streak and claims nothing about any drive; a genuinely dead paper
+   re-quiesces on its next three real drives, and the quiesce audit now
+   re-fires after a repair instead of staying silent forever.
+
+**A daemon-side heuristic was ruled out with evidence, not taste.** The
+incident this fence exists for is recorded as `handoff_offered` + `job_accept`
+with nothing else (`bridge_test.go:7083-7089`) — byte-identical to queue churn.
+The daemon provably cannot tell them apart, which is why the extension has to
+say, and why this is a protocol change rather than a projection tweak.
+
+Live result after deploy (`0.21.1-dev.2d70fbc`, schema 44 -> 45):
+
+- **104 papers repaired** — 86 `openurl_handoff`, 13 `manual_download`,
+  5 `document_delivery`
+- releasable `requires_auth` handoffs: **0 -> 38**; fruitless-quiesced among
+  the age-live set: **62 -> 0**
+- 42 remain age-quiesced past `QuiesceAfter`, which is the deliberate rule and
+  not this bug; `papio actions open` drives any of them
+- both parsers agree on the new frame in isolation — queued/driving/bare accept,
+  and fail-closed on a bogus value or the old `driving` field name
+
+Open after this round: the queue drains at `maxInstitutionalReoffers` = 4 per
+sign-in, so 38 papers take ~10 sign-ins. That is now a throttle rather than a
+wall, and every release reaches a paper that can move — but whether 4 is the
+right number has never been measured, and raising it does not reduce clicks,
+only how many papers papio volunteers at once. Measure before tuning.
