@@ -20,6 +20,15 @@ for the full pre-split extension history.
 - **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
 
 ### Fixed
+- **A security check you have already solved stops nagging.** Clearing that ask
+  depended on catching a single browser event for that exact tab. Chrome puts
+  extensions to sleep after about thirty seconds idle, and solving a CAPTCHA
+  takes longer than that — so the event that was supposed to retire the ask
+  could simply never arrive, and the **Needs you · Security check** card then
+  asked forever for work already finished. *papio* now re-checks the page itself
+  once a minute, on the one timer that survives being put to sleep, and the card
+  retires within a minute of you finishing. It also retires when the tab it was
+  asking about is gone, since nobody can answer that ask any more.
 - **The popup no longer resizes itself over and over.** Opened, and sometimes
   after a click and a mouse-off, it flickered between two widths as fast as the
   screen could draw. A browser popup has no window size of its own — Chrome

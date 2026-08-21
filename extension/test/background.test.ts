@@ -20512,3 +20512,63 @@ test("a consult pointed at a dead surface reports the claim's loss", async () =>
   // No tab was opened for the paper: the report is the whole action.
   expect(h.tabs.created).toEqual([]);
 });
+
+// The clear above depends on a tabs.onUpdated event for that exact tab. MV3
+// sleeps the service worker after ~30s idle and solving a CAPTCHA takes longer
+// than that, so the one trigger can simply never arrive - and then the popup's
+// "Needs you · Security check" card asks forever for work already finished.
+// Reported live 2026-08-21: "I already clicked Open tab and solved the capture,
+// but it still nags", with the job's last recorded event being the block. The
+// one-minute keepalive alarm is the wake that survives a worker death, and
+// challenge_blocked is persisted state, so the sweep can always find it.
+test("a challenge solved while the worker slept still retires its own ask", async () => {
+  let challenge = true;
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => challenge);
+  const tabID = await classifyProviderUnknown(h, "job_challenge_slept");
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBe(true);
+
+  // Solved. Deliberately NO navigation event: this is the missed-event case.
+  challenge = false;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  for (let step = 0; step < 40; step += 1) await Promise.resolve();
+
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+  expect(h.backend.store.challengeCooldowns).toEqual({});
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+});
+
+// An ask about a surface that no longer exists cannot be answered by anyone,
+// and this state is reachable: a challenge block parks WITH its tab, and the
+// cold-park reconciliation detaches that job (tab_id -1) before retiring the
+// surface - which leaves the block behind, because the tab-removal path can no
+// longer find the job it belonged to. Closing a tracked tab retires the whole
+// job mirror, so that case needs no help; this one does.
+test("a challenge whose surface is already gone retires instead of asking about nothing", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: "job_challenge_detached",
+        status: "auth_pending",
+        tab_id: -1,
+        requires_auth: true,
+        offered_at: Date.now() - 60_000,
+        expires_at: Date.now() + 600_000,
+        provider_hosts: [PROVIDER_HOST],
+        challenge_blocked: true,
+        challenge_host: PROVIDER_HOST,
+        parked_with_tab: true,
+      },
+    ],
+  });
+  await h.bridge.start();
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBe(true);
+
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  for (let step = 0; step < 40; step += 1) await Promise.resolve();
+
+  const job = h.backend.store.activeJobs.find((j) => j.job_id === "job_challenge_detached");
+  expect(job).toBeDefined();
+  expect(job?.challenge_blocked).toBeUndefined();
+});

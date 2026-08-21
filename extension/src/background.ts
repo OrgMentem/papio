@@ -188,6 +188,11 @@ const PROVIDER_DRAIN_LEASE_MS = 24 * CLASSIFY_RETRY_MS;
 /** Security checks and redirect-loop dead ends cool a provider for ten minutes
  * so an automated re-offer cannot immediately trip the same hardening again. */
 const CHALLENGE_COOLDOWN_MS = 10 * 60_000;
+/** How many challenge-blocked tabs one keepalive wake may re-probe. A solved
+ * check must retire its own ask without waiting for a tab event that may never
+ * arrive, and each probe is a scripting call into a live tab — so the sweep is
+ * bounded rather than proportional to the backlog. */
+const CHALLENGE_RECHECK_LIMIT = 3;
 /** A title-only OpenAthens error update can precede its body render. Recheck
  * exactly once, late enough for the bounded DOM marker probe to see it. */
 const OPENATHENS_ERROR_RECHECK_MS = 1_500;
@@ -12367,6 +12372,43 @@ export class Bridge {
     }
   }
 
+  /** Re-assess every challenge-blocked job's own tab, and clear the block when
+   * the page is no longer a challenge — or when the tab it referred to is gone,
+   * since an ask about a surface that no longer exists cannot be answered.
+   *
+   * Navigates nothing and probes at most CHALLENGE_RECHECK_LIMIT tabs per wake:
+   * this runs on the one-minute keepalive alarm, so the ask retires within a
+   * minute of the operator finishing rather than waiting for a tab event that
+   * may never come. assessTrackedDrivenPage owns the verdict and the resume. */
+  private async recheckChallengeBlocks(): Promise<void> {
+    const blocked = this.store.activeJobs
+      .filter((job) => job.challenge_blocked === true)
+      .slice(0, CHALLENGE_RECHECK_LIMIT);
+    for (const job of blocked) {
+      if (job.tab_id < 0) {
+        // Parked without a surface: there is nothing for the operator to solve
+        // and nothing to probe, so the ask has no referent.
+        await this.clearChallengeBlock(job);
+        continue;
+      }
+      let tab: TabInfo;
+      try {
+        tab = await this.deps.tabs.get(job.tab_id);
+      } catch {
+        await this.clearChallengeBlock(job);
+        continue;
+      }
+      if (tab.url === undefined) continue;
+      let host: string;
+      try {
+        host = new URL(tab.url).hostname.toLowerCase();
+      } catch {
+        continue;
+      }
+      await this.assessTrackedDrivenPage(job, host, tab.url);
+    }
+  }
+
   private async runKeepaliveAlarm(): Promise<void> {
     await this.ready;
     // Recovery runs FIRST and unconditionally on this wake, independent of
@@ -12390,6 +12432,25 @@ export class Bridge {
     // ordering that drove tabs into dead networks.
     if (this.deps.online?.() ?? true)
       await this.releaseExpiredQueuedHandoffs();
+    // A solved challenge must retire its own ask. Clearing it depends on
+    // assessing the tab again, and until now the ONLY trigger was a single
+    // tabs.onUpdated event for that exact tab - so if the worker was asleep
+    // when the operator finished (MV3 sleeps it after ~30s idle, and solving a
+    // CAPTCHA takes longer than that), or the event carried no title change on
+    // a provider page, nothing ever re-checked and the card asked forever for
+    // work already done. Reported live 2026-08-21: "I already clicked Open tab
+    // and solved the capture, but it still nags", with the job's last recorded
+    // event being the block itself. `challenge_blocked` is persisted state, so
+    // this wake can find it after any restart - the class of bug the
+    // claim-grant work already paid for once.
+    //
+    // NOT awaited, for the reason stated at the top of this method: the triage
+    // and pulse reads below are the latency-sensitive part of this wake, and a
+    // scripting probe into a live tab is seconds of browser API work that
+    // nothing here depends on.
+    void this.recheckChallengeBlocks().catch((e: unknown) => {
+      console.error("papio: challenge recheck failed", e);
+    });
     if (
       this.hasCurrentHello() &&
       (this.store.daemonFeatures ?? []).includes(TRIAGE_SNAPSHOT_FEATURE)
