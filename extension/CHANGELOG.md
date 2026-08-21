@@ -20,15 +20,20 @@ for the full pre-split extension history.
 - **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
 
 ### Fixed
-- **A security check you have already solved stops nagging.** Clearing that ask
-  depended on catching a single browser event for that exact tab. Chrome puts
-  extensions to sleep after about thirty seconds idle, and solving a CAPTCHA
-  takes longer than that — so the event that was supposed to retire the ask
-  could simply never arrive, and the **Needs you · Security check** card then
-  asked forever for work already finished. *papio* now re-checks the page itself
-  once a minute, on the one timer that survives being put to sleep, and the card
-  retires within a minute of you finishing. It also retires when the tab it was
-  asking about is gone, since nobody can answer that ask any more.
+- **A security check you have already solved stops nagging.** That ask only ever
+  went away if *papio* caught one specific browser event for that exact tab.
+  Chrome puts extensions to sleep after about thirty seconds idle and solving a
+  CAPTCHA takes longer than that, so the event could simply never arrive — and
+  then the **Needs you · Security check** card asked forever for work already
+  done. Measured on the author's machine: both of *papio*'s tabs sitting on the
+  article, no check anywhere, the card still asking an hour later.
+
+  *papio* now re-reads the page itself every minute, on the one timer that
+  survives being put to sleep, and keeps the ask **only** while it can actually
+  see a check on that tab. If the tab is gone, or the page reads normally, or
+  *papio* cannot read the page at all, the ask retires — because an ask it
+  cannot justify should not outlive the reason it was made. If the wall really
+  is still there, the next attempt runs into it and says so again.
 - **The popup no longer resizes itself over and over.** Opened, and sometimes
   after a click and a mouse-off, it flickered between two widths as fast as the
   screen could draw. A browser popup has no window size of its own — Chrome

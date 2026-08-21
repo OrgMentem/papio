@@ -20572,3 +20572,43 @@ test("a challenge whose surface is already gone retires instead of asking about 
   expect(job).toBeDefined();
   expect(job?.challenge_blocked).toBeUndefined();
 });
+
+// The ask exists to send the operator to a page with a check on it. If papio
+// cannot read that page at all - probe rejected, host access withheld, tab
+// unreadable - it cannot say the check is still there, and an ask papio cannot
+// justify must not survive on the strength of having once been justified.
+// Failing closed here is what produced an ask that outlived its challenge by
+// over an hour on the operator's own screen, with both tabs sitting on the
+// article.
+test("an unreadable page retires the challenge ask instead of making it immortal", async () => {
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => true);
+  const tabID = await classifyProviderUnknown(h, "job_challenge_unreadable");
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBe(true);
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  // Whatever the reason, the probe no longer answers.
+  h.deps.scripting.executeScript = async () => {
+    throw new Error("Cannot access contents of the page");
+  };
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  for (let step = 0; step < 40; step += 1) await Promise.resolve();
+
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+});
+
+// The other half: a check that IS still there keeps its ask. Retiring on every
+// sweep would turn the fix into a different lie.
+test("a challenge still on the page keeps asking", async () => {
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => true);
+  await classifyProviderUnknown(h, "job_challenge_live");
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBe(true);
+
+  for (let tick = 0; tick < 3; tick += 1) {
+    await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+    for (let step = 0; step < 20; step += 1) await Promise.resolve();
+  }
+
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBe(true);
+});

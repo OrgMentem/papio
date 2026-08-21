@@ -79,11 +79,9 @@ topic, because completed build plans otherwise pile up and drift back into `docs
   `archive/`, which is only ever where stale docs rot while still looking
   authoritative.
   Two rules make that deletion safe, and both were learned by nearly breaking them.
-  **An ADR must never depend on a `dev/active/` file for normative content** — the
-  active file is deleted when the work ships, so the ADR is left pointing at nothing.
-  `dev/adr/0021-packaged-behaviour-and-restrictive-control.md` says its acceptance
-  tests "live in `dev/active/adapter-release-latency-plan.md`", which is exactly this
-  hazard: that plan cannot be deleted until the tests move into the ADR. And **every
+  An ADR must never depend on a `dev/active/` file for normative content — the active
+  file is deleted when the work ships, so the ADR is left pointing at nothing; guarded
+  by `rule://adr-no-dev-active-citation`, which fires when you write one. And **every
   `file:symbol` citation in a plan must actually resolve**, because a citation that
   does not reads as verified evidence. An audit pass caught nine fabricated ones
   (`TestActionKindCoverage` for `TestActionKindDispositionIsExhaustive`,
@@ -150,10 +148,9 @@ There is also a link check, because `zensical build` prints a broken link as an
   install`. On a dev box, prefer a single papio: put `~/.local/bin` ahead of
   `/opt/homebrew/bin` in PATH (bare `papio` = your dev build; autostart is then
   unambiguous) and/or `brew pin papio` so it can't silently upgrade mid-session.
-- **Never `cp` over an existing papio binary on macOS** — overwriting the inode of a
-  previously-executed signed binary poisons the kernel's signature cache and the next
-  exec dies with SIGKILL (exit 137). Use `mv` or `rm` first so the copy gets a fresh
-  inode.
+- **Never `cp` over an existing papio binary on macOS** — reusing the inode of a
+  previously-executed signed binary poisons the kernel signature cache and the next
+  exec dies with SIGKILL (137). Guarded by `rule://no-cp-over-papio-binary`.
 - **A new store migration bumps `user_version`, and FOUR test files pin the
   latest number** — plus two historical fixtures that must NOT be bumped, which is
   where this goes wrong. Bump: `internal/cli/clean_install_test.go` ("schema
@@ -171,19 +168,11 @@ There is also a link check, because `zensical build` prints a broken link as an
   bound stays 33 and a new migration needs no entry there. `go test ./...` fails
   after adding `internal/store/migrations/NNNN_*.sql` until the four latest-version
   assertions are bumped.
-- **NEVER edit an applied migration in place.** `0025_pdf_grabs.sql` shipped
-  without `'abandoned'` in its `state` CHECK and was later edited to add it
-  (`28fbc97` -> `70055e7`). Every database migrated in between kept the original
-  constraint, no schema version records the difference, and every test migrates a
-  fresh database and therefore sees the corrected one. The result was silent and
-  total: no grab abandonment could be written on the dev box at all — the CHECK
-  violation surfaced as `outcome: "conflict"`, so a capture stuck in
-  `awaiting_file` forever, its tab answered `existing` for good (allocation is
-  idempotent per host and title), and even `AbandonStaleAwaiting` could not retire it. It
-  cost most of a session to find, because the daemon, the extension and every
-  suite were all correct. `0038_pdf_grabs_abandoned_state.sql` repairs it by
-  rebuilding the table; a constraint or column change needs a *new* migration,
-  even when the old one is "obviously wrong".
+- **NEVER edit an applied migration in place.** A constraint or column change needs a
+  *new* migration, even when the old one is "obviously wrong" — no schema version
+  records an in-place edit, and every test migrates a fresh database and so never sees
+  the drift. Guarded by `rule://applied-migration-immutable` and
+  `rule://no-inplace-migration-rewrite`, which carry the `0025_pdf_grabs.sql` incident.
 - **Adding a `job.TerminalReason` is three edits, and the third is the one you
   forget**: the const block and `NormalizeTerminalReason`'s switch (both
   `internal/job/job.go`), plus `terminalReasonWriters` in
@@ -248,10 +237,9 @@ There is also a link check, because `zensical build` prints a broken link as an
   ten digits). `ownership.normalize*` (unexported) serves **"is this the same work?"** and is
   version-**collapsing** and lenient (ADR-0008; `ownership.go`'s comment "a version suffix
   names the same work, so v2 must match v1", pinned by `ownershipsnapshot`'s "matched across
-  a version suffix" test). A dead-code or DRY pass will look like two divergent copies of one
-  function — consolidating them is a **bug**: routing acquisition through the collapsing form
-  fetches the wrong version, and routing ownership through the preserving form stops `v2`
-  matching `v1` and silently breaks holdings deduplication.
+  a version suffix" test). A dead-code or DRY pass will look like two divergent copies of
+  one function; consolidating them is a **bug** in both directions, and
+  `rule://ownership-work-normalizers-separate` fires on the import that starts it.
 - **The version axis is the ONLY axis. Both normalizers preserve slash runs, and
   a repeated slash is not a typo.** `10.48612//monograph-2025-2` and
   `10.48612/monograph-2025-2` are two separately registered DataCite works with
@@ -501,22 +489,11 @@ There is also a link check, because `zensical build` prints a broken link as an
   (0 errors), and bumping would drop every ESR user to no tab-group handoff.
 
 ### Extension page paths & MV3 worker memory
-- **Every extension page ships under `dist/`, so a page path must be DERIVED, never
-  written root-relative.** All three manifests declare `dist/popup.html` /
-  `dist/options.html` — the hand-authored `extension/manifest.json`, the generated
-  `firefox/manifest.json`, and `dev-unpacked/manifest.json` (whose `dist` is a symlink
-  to `../dist`). So `chrome.runtime.getURL("materialize.html")` resolves to a file that
-  exists in **no** deployment, and the tab renders Chrome's `ERR_FILE_NOT_FOUND`.
-  `realDeps()` already derives inbox/history/options/page-bulk from the manifest's
-  declared popup for exactly this reason ("so the authorized URLs can never drift from
-  the shipped page layout again"); `MATERIALIZE_PAGE_PATH` was added later as a bare
-  literal and made *every* automatically-owned institutional tab a browser error page —
-  the entry point of the whole Slice 4 automatic path. Derive from `POPUP_PAGE_PATH`
-  (or `getManifest().action.default_popup`, like `popup.ts`'s `historyPagePath()`).
-  Unit tests do **not** catch this class on their own: the fake `runtimeGetURL` resolves
-  any string, so 13 assertions pinned the same wrong literal the source built. The
-  regression test therefore anchors the scaffold URL to the shipped manifest's declared
-  page directory, not to a literal.
+- **Every extension page ships under `dist/`, so a page path must be DERIVED from the
+  manifest's declared popup, never written root-relative** — a bare
+  `getURL("materialize.html")` renders `ERR_FILE_NOT_FOUND` in every deployment, and
+  unit tests cannot catch it (the fake `runtimeGetURL` resolves any string). Guarded by
+  `rule://extension-page-path-derived`.
 - **Anything gated on a worker-memory `Map` silently stops working ~30s after the last
   event, because MV3 sleeps the service worker.** `claimGrants` is the load-bearing
   example: `owner_closed` was gated on `claimGrants.has(job_id)`, so an institutional
@@ -605,11 +582,10 @@ There is also a link check, because `zensical build` prints a broken link as an
   Chrome's dialog — a separate ~448×196 window whose screenshot renders the **parent**
   window, so pixel clicks miss. Resolve its buttons with `desktop.elementAt(x, y)` and
   `press()` the rightmost one.
-- **A `_`-prefixed file anywhere in an unpacked extension directory breaks the whole load**
-  (`Cannot load extension with file or directory name _reload.html. Filenames starting with
-  "_" are reserved`). Chrome refuses the manifest, so one leftover scratch file in
-  `extension/` or `extension/dev-unpacked/` bricks an extension reload — including the
-  user's daily browser — with nothing pointing at the temp file as the cause.
+- **A `_`-prefixed file anywhere in an unpacked extension directory breaks the whole
+  load** — one leftover scratch file in `extension/` bricks an extension reload,
+  including the user's daily browser. Guarded by
+  `rule://no-underscore-file-in-extension`.
 
 ### Adapters & fixtures
 - An adapter **cannot** enter `extension/src/adapters/types.ts` without captured fixtures —

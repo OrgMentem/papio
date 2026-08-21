@@ -12372,40 +12372,68 @@ export class Bridge {
     }
   }
 
-  /** Re-assess every challenge-blocked job's own tab, and clear the block when
-   * the page is no longer a challenge — or when the tab it referred to is gone,
-   * since an ask about a surface that no longer exists cannot be answered.
+  /** Keep a challenge ask alive only while papio can CONFIRM a challenge is
+   * still on that tab, and retire it otherwise.
    *
-   * Navigates nothing and probes at most CHALLENGE_RECHECK_LIMIT tabs per wake:
-   * this runs on the one-minute keepalive alarm, so the ask retires within a
-   * minute of the operator finishing rather than waiting for a tab event that
-   * may never come. assessTrackedDrivenPage owns the verdict and the resume. */
+   * The ask exists to send the operator to a page with a check on it. Every
+   * other outcome — the tab is gone, its URL is unreadable, the probe cannot
+   * run, the page assesses normally — means papio cannot say that is still
+   * true, and an ask papio cannot justify must not survive on the strength of
+   * having once been justified. Measured live 2026-08-21: both of papio's tabs
+   * were sitting on the article, no challenge anywhere, and the card had been
+   * asking for over an hour.
+   *
+   * Clearing wrongly is cheap and self-correcting: the drive resumes, and if
+   * the wall is really still there the next classification re-detects it and
+   * blocks again — which is demonstrably live, since that is how each of these
+   * blocks was created. Failing closed is what produced a permanent false ask,
+   * and it is the same trap `waitForBotChallenge`'s own probe-failure path
+   * already refuses ("a failed probe must retain the existing stale-adapter
+   * path rather than silently make an unreadable provider page immortal").
+   *
+   * Navigates nothing and probes at most CHALLENGE_RECHECK_LIMIT tabs per wake.
+   * Runs on the one-minute keepalive alarm, the wake that survives a worker
+   * death, so the ask retires within a minute rather than waiting for a tab
+   * event that may never arrive. */
   private async recheckChallengeBlocks(): Promise<void> {
     const blocked = this.store.activeJobs
       .filter((job) => job.challenge_blocked === true)
       .slice(0, CHALLENGE_RECHECK_LIMIT);
     for (const job of blocked) {
-      if (job.tab_id < 0) {
-        // Parked without a surface: there is nothing for the operator to solve
-        // and nothing to probe, so the ask has no referent.
+      if (!(await this.challengeStillPresent(job))) {
         await this.clearChallengeBlock(job);
-        continue;
       }
-      let tab: TabInfo;
-      try {
-        tab = await this.deps.tabs.get(job.tab_id);
-      } catch {
-        await this.clearChallengeBlock(job);
-        continue;
-      }
-      if (tab.url === undefined) continue;
-      let host: string;
-      try {
-        host = new URL(tab.url).hostname.toLowerCase();
-      } catch {
-        continue;
-      }
-      await this.assessTrackedDrivenPage(job, host, tab.url);
+    }
+  }
+
+  /** True only on a positive, current reading of a live challenge on the job's
+   * own tab. Every failure to read is a false: see recheckChallengeBlocks. */
+  private async challengeStillPresent(job: ActiveJob): Promise<boolean> {
+    if (job.tab_id < 0) return false;
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(job.tab_id);
+    } catch {
+      return false;
+    }
+    if (tab.url === undefined) return false;
+    let host: string;
+    try {
+      host = new URL(tab.url).hostname.toLowerCase();
+    } catch {
+      return false;
+    }
+    try {
+      const results = await this.deps.scripting.executeScript({
+        target: { tabId: job.tab_id },
+        func: assessDrivenPage,
+        args: [null, host === OPENATHENS_LOGIN_HOST],
+      });
+      const assessment = results[0]?.result as DrivenPageAssessment | undefined;
+      return assessment?.kind === "challenge" || assessment?.kind === "redirect_loop";
+    } catch (e) {
+      console.error("papio: challenge recheck could not read the page", e);
+      return false;
     }
   }
 
