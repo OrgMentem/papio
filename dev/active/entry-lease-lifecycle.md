@@ -88,6 +88,76 @@ close. `cleanupOrphanTabs` classifies and closes nothing, and
 churn era survives. That is the operator's "doesn't clean up after itself",
 and it is now the only part of that complaint still standing.
 
+## Surface lifecycle: why nothing could close a tab, 2026-08-21
+
+Four defects, in the order they were uncovered — each one hidden behind the
+previous, and the last two found only because the third made refusals visible.
+
+1. `f078270` — **every close route is claim-scoped.** `surface_close_request`
+   looks up a materialization claim by binding id and answered `not_eligible`
+   when it found none. An ordinary URL-bearing handoff has no candidate, so no
+   claim, so it took that branch every time — and `not_eligible` reads as a
+   refusal the extension must obey. The handoff-drive timeout has always
+   intended to retire that tab; the intent was refused on every paper, forever.
+   Now answered `unclaimed`: no claim means no candidate, no route and no
+   permit, so the daemon has no stake and says so. Verified live: **9
+   `unclaimed` closes in one evening**, at exact 3-minute drive-timeout
+   intervals.
+2. `abd6aa2` — **reconcile asked whether the paper still existed**, not whether
+   anything still pointed at the surface. The legacy timeout deliberately
+   detaches the job (`tab_id: -1`) and leaves it alive, so a tabless paper
+   shielded its own abandoned tab from the only retry path there is.
+3. `handoff_parked` — **a paper waiting for a human keeps its handoff action
+   open**, so `job_inactive` is false for it and was refused every pass ("the
+   binding still has an active browser handoff"). True, and never a reason to
+   hold a tab. Asking a human is a request, not a lease on their browser.
+   Storage vocabulary is a second gate and a DB CHECK: migration `0047`.
+4. The **fresh-link park keeps its tab on purpose** — "detaching it would leave
+   the job with neither a reusable URL nor a way back to the operator's page".
+   The second half stopped being true when engagement began minting fresh
+   routes, so the preserved page is a spent single-use link. Retirement is gated
+   on measured coldness: 674 recorded returns from a wall, p50 1.2s, p90 5.5s,
+   p99 603s, 671 of 674 inside thirty minutes; the threshold is 3x p99.
+
+Also shipped, and the reason 3 and 4 were found at all: **every non-authorized
+close now logs its outcome and reason.** A refused close was the one event in
+this subsystem with no trace anywhere — the extension asks once and retains the
+surface in silence — which is exactly how a blanket refusal of every ordinary
+handoff tab survived months of review. The log line found the next two defects
+in ninety seconds.
+
+### What is still on the operator's screen, and why
+
+Measured after all four fixes: 22 tabs in the papio group — 12 identical
+resolver relics, 8 of the operator's own PDFs, 1 keepalive session anchor, 1
+live provider challenge.
+
+The PDFs, the anchor and the challenge are all correct. The **12 relics are not
+in the ledger at all**: the popup reports zero reviewable strays, and reconcile
+never asks about them. papio has no birth certificate for them, and
+`ledgerManagedTab`'s own rule is that it must never earn close authority over a
+tab it did not open. They predate the birth-record cutover, so they are inert
+and permanently unmanaged.
+
+That leaves one genuine product decision, deliberately not taken here: may
+papio close an UNLEDGERED tab sitting inside its own tab group, on an explicit
+operator request? Group membership is live positive proof that papio created it
+(reuse never folds a tab into the group), and the operator asking is the
+consent this whole design reserves. The counter-argument is that "I cannot
+prove I opened this" is exactly when a wrong close costs the most. Until it is
+decided, the operator's one-gesture answer is to close the tab group by hand.
+
+### The constraint that replaced the frozen queue
+
+Freeing the transport budget let papers move, and 16 of them moved **down**:
+`unavailable / browser_rejected`, in one burst at 18:09-18:12 local, nothing in
+the 100 minutes since. Each had reached a wall and burned its attempt budget
+against a library sign-in nobody has completed. The fruitless-drive rule fired
+as designed — it exists to stop exactly the churn this session removed — but the
+papers deserved a shared sign-in, not retirement. That is
+`institutional-signin-sharing.md`'s Slice 1, now the binding constraint on
+throughput, and it needs one real sign-in to measure against.
+
 Measured on the operator's machine 2026-08-21: 129 papers awaiting a human, 21
 eligible browser candidates, **zero** live claims, and one
 `authentication_entry_leases` row in state `expired`. No churn, no errors,
