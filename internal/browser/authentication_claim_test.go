@@ -1007,6 +1007,84 @@ func TestAutomaticCandidateOfferParksDependentUntilEntitledLanding(t *testing.T)
 	}
 }
 
+// A provider challenge observed AFTER the sign-in has landed is REJECTED, and
+// that is deliberate rather than a gap. claim_observation_apply.go's
+// wall_observed/login_started/mfa/challenge branch requires a live RESERVED
+// entry owned by the reporter; entitled_landing settles the entry to 'human',
+// so a later challenge — a provider hardening check on an already-entitled
+// session, which is a real thing to see — no longer matches.
+//
+// Two of these appeared in the operator's daemon log on 2026-08-21. The value
+// pinned here is that the rejection is INERT: it must not advance or disturb
+// the settled entry, must not retract the entitlement that dependents are
+// riding on, and must be answered as an ordinary application outcome rather
+// than tearing the browser session down (AGENTS.md's bridge-handler rule). If
+// this disposition is ever changed to 'applied', it must be because the
+// accept-set was widened deliberately, not because a challenge looked harmless.
+//
+// Measured while writing this: the rejection is defended TWICE. Removing the
+// reserved-state check above does not make it apply — reserveAuthenticationEntry
+// LeaseTx then refuses the settled entry itself ("the entry is owned
+// elsewhere"). So this test pins the DISPOSITION and its inertness, not any one
+// guard, and a single-guard mutation will not turn it red.
+func TestChallengeAfterEntitledLandingIsRejectedAndInert(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	owner := parkInstitutional(t, jobs, "challenge-after-landing-owner", handoffWork(), "")
+	dependent := parkInstitutional(t, jobs, "challenge-after-landing-dep", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "challenge-after-landing")
+	ownerCandidate := explicitMaterializationCandidate(t, jobs, owner, "domain-challenge-owner")
+	dependentCandidate := explicitMaterializationCandidate(t, jobs, dependent, "domain-challenge-dep")
+
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, owner,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "challenge-after-landing-req", CandidateID: ownerCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	bindingID := bindCandidate(t, b, owner, ownerCandidate, "challenge-after-landing", 4)
+	runSync(t, b, claimObservationFrame(t, owner, "challenge-after-landing-returned", "challenge-after-landing",
+		bindingID, grant.GateOccurrenceID, "challenge-after-landing-ev-returned", b.epoch, 0, "auth_returned"))
+	landed, _ := runSync(t, b, claimObservationFrame(t, owner, "challenge-after-landing-landing", "challenge-after-landing",
+		bindingID, grant.GateOccurrenceID, "challenge-after-landing-ev-landing", b.epoch, 1, "entitled_landing"))
+	if ack := claimObservationAckPayload(t, landed); ack.Outcome != "applied" {
+		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
+	}
+	claimID := settleInstitutionProfiles(t, b, jobs)
+	before, found, err := jobs.GetAuthenticationEntryLease(ctx, claimID)
+	if err != nil || !found {
+		t.Fatalf("landed entry lease: err=%v found=%v", err, found)
+	}
+
+	challenged, _ := runSync(t, b, claimObservationFrame(t, owner, "challenge-after-landing-challenge", "challenge-after-landing",
+		bindingID, grant.GateOccurrenceID, "challenge-after-landing-ev-challenge", b.epoch, 2, "challenge"))
+	ack := claimObservationAckPayload(t, challenged)
+	if ack.Outcome != "rejected" {
+		t.Fatalf("challenge after entitled_landing outcome = %+v, want rejected", ack)
+	}
+
+	// Inert: the settled entry is byte-identical, so the entitlement the
+	// dependent rides on is untouched.
+	after, found, err := jobs.GetAuthenticationEntryLease(ctx, claimID)
+	if err != nil || !found {
+		t.Fatalf("entry lease after the rejected challenge: err=%v found=%v", err, found)
+	}
+	if after.State != before.State || after.EntitledAt != before.EntitledAt || after.HumanOwnerID != before.HumanOwnerID {
+		t.Fatalf("a rejected challenge disturbed the settled entry: before=%+v after=%+v", before, after)
+	}
+
+	// And the dependent still gets its turn, on the entitlement that survived.
+	resumed, _ := runSync(t, b)
+	offer := firstOfType(resumed, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil || offer.JobID != dependent {
+		t.Fatalf("a rejected challenge cost the dependent its resumption: %v", resumed)
+	}
+	if got := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID; got != dependentCandidate {
+		t.Fatalf("resumed dependent offer candidate_id = %s, want %s", got, dependentCandidate)
+	}
+}
+
 // TestAutomaticCandidateOfferSuppressedByLiveOwnerBinding proves the
 // one-bound-scaffold-per-institution pacing: once the claim owner's lease
 // carries a live owner_binding_id (a real bound scaffold), a sibling under
@@ -1176,16 +1254,9 @@ func TestFocusedCandidateWaitsWhileAnotherJobHoldsTheSignIn(t *testing.T) {
 		t.Fatalf("focus: %v", err)
 	}
 
-	// One poll with a candidate present settles the institution profile: poll
-	// reconciles profiles only on the candidate-preparation path, and that
-	// rewrites the authentication claim id. A slot reserved before this would be
-	// reserved under a name the gate never looks up.
-	runSync(t, b)
-	profiles, profileErr := jobs.ListInstitutionProfiles(ctx, false)
-	if profileErr != nil || len(profiles) == 0 {
-		t.Fatalf("list institution profiles: %v (%d)", profileErr, len(profiles))
-	}
-	claimID := profiles[0].AuthenticationClaimID
+	// poll reconciles institution profiles only on the candidate-preparation
+	// path, and REWRITES the authentication claim id when it does.
+	claimID := settleInstitutionProfiles(t, b, jobs)
 
 	// A third paper now holds this institution's single sign-in slot. It owns no
 	// candidate, so the slot is the only signal available.
@@ -1199,9 +1270,15 @@ func TestFocusedCandidateWaitsWhileAnotherJobHoldsTheSignIn(t *testing.T) {
 		t.Fatalf("reserve the slot for a third paper: %v", err)
 	}
 
-	held, _ := runSync(t, b)
-	if got := offersForJob(held, sibling); got != 0 {
-		t.Fatalf("offers for the sibling = %d, want 0 while another paper holds the sign-in: %v", got, held)
+	// Ten polls, not one. The live defect was a PER-POLL leak: correct on any
+	// single poll and 18 offers a second across three papers in practice, so a
+	// one-poll assertion is exactly the shape that would have passed while the
+	// operator's browser churned.
+	for poll := range 10 {
+		held, _ := runSync(t, b)
+		if got := offersForJob(held, sibling); got != 0 {
+			t.Fatalf("poll %d: offers for the sibling = %d, want 0 while another paper holds the sign-in: %v", poll, got, held)
+		}
 	}
 
 	// A wait, not a stall: freeing the slot releases the same focus with no new
@@ -1228,6 +1305,25 @@ func offersForJob(msgs []*protocol.BrowserMessage, jobID string) int {
 		}
 	}
 	return n
+}
+
+// settleInstitutionProfiles runs one poll so the daemon reconciles institution
+// profiles, then returns the authentication claim id that survived it.
+//
+// It exists because that reconcile REWRITES the claim id, and runs only on the
+// candidate-preparation path — so a lease reserved against the id a profile
+// carries before the first poll with a candidate is reserved under a name no
+// gate ever looks up. Three green-but-vacuous versions of the test above were
+// written before that was understood; anything seeding an entry lease should
+// take its claim id from here, after at least one candidate exists.
+func settleInstitutionProfiles(t *testing.T, b *Bridge, jobs *job.Store) string {
+	t.Helper()
+	runSync(t, b)
+	profiles, err := jobs.ListInstitutionProfiles(context.Background(), false)
+	if err != nil || len(profiles) == 0 {
+		t.Fatalf("list institution profiles: %v (%d)", err, len(profiles))
+	}
+	return profiles[0].AuthenticationClaimID
 }
 
 // TestLegacySessionAutomaticPathStaysDarkWithoutMaterializationFeature pins
