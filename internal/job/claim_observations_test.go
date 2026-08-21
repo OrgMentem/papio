@@ -405,6 +405,109 @@ func TestAuthenticationEntryLeaseExpiryRefusedWhileEffectPermitHeld(t *testing.T
 	}
 }
 
+// TestAuthenticationEntryLeaseHumanRevocationRefusedWhileEffectPermitHeld pins
+// the other half of §4.5, which the expiry test above did NOT cover: a bound
+// HUMAN entry with an unresolved institutional permit is not replaceable by a
+// generation change either. The permit veto used to guard only the expired
+// reservation path, so browser-session churn — an MV3 worker restart is the
+// common case, not the edge one — reset a live sign-in, cleared its binding,
+// and handed the institution's single entry to a second paper while an
+// irreversible provider action was still in flight on the first.
+func TestAuthenticationEntryLeaseHumanRevocationRefusedWhileEffectPermitHeld(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID := seedJobAndCandidate(t, js, "human-permit")
+	authorizeEffectPermitJob(t, js, jobID)
+	seedInstitutionProfile(t, js, "profile-human-permit")
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE institution_profiles SET authentication_claim_id='claim-human-permit' WHERE id='profile-human-permit'`); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 3, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	evidence := ProfileEvidenceObservation{
+		ObservationID: "human-permit-evidence", BrowserHolderGeneration: 3,
+		InstitutionProfileID: "profile-human-permit", InstitutionProfileRevision: 1,
+		Verdict: ProfileEvidenceAuthReturned, Source: ProfileEvidenceAuthReturn,
+		ProducerObservedAt: now.Add(-time.Second).Format(time.RFC3339Nano),
+		DaemonReceivedAt:   now.Format(time.RFC3339Nano),
+	}
+	if err := js.RecordProfileEvidence(ctx, evidence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-human-permit", LeaseID: "lease-human-permit", OwnerID: jobID,
+		BrowserHolderGeneration: 3, LeaseUntil: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx,
+		"claim-human-permit", jobID, 3, claim.BindingID, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.ConvertAuthenticationEntryLeaseToHuman(ctx,
+		"claim-human-permit", "lease-human-permit", jobID, 3, evidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.MarkAuthenticationEntryLeaseEntitled(ctx,
+		"claim-human-permit", "lease-human-permit", jobID, 3,
+		now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO effect_permits
+		  (id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind,
+		   claim_id, binding_id, effect_ordinal, institutional_request_id, status, lease_until, created_at, updated_at)
+		VALUES ('permit-human-1', ?, 1, 3, 'domain-human-permit', 'institutional',
+		        ?, ?, 1, 'institutional-request-human-permit', 'held', ?, ?, ?)`,
+		jobID, claim.ID, claim.BindingID,
+		now.Add(time.Minute).Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	// A NEW browser generation is exactly what humanRevoked treats as
+	// revocation. While the permit is unresolved it must not.
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-human-permit", LeaseID: "lease-human-permit-new",
+		OwnerID: "job-other", BrowserHolderGeneration: 4, LeaseUntil: now.Add(time.Minute),
+	}); !errors.Is(err, ErrAuthenticationEntryLeaseBusy) {
+		t.Fatalf("reserve across a generation change while a permit is held err=%v, want ErrAuthenticationEntryLeaseBusy", err)
+	}
+	held, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-human-permit")
+	if err != nil || !ok {
+		t.Fatalf("lease after refused takeover ok=%v err=%v", ok, err)
+	}
+	// The refusal must leave the sign-in whole, not merely refuse the caller:
+	// the reset that used to happen here cleared exactly these fields.
+	if held.State != AuthenticationEntryLeaseHuman || held.HumanOwnerID != jobID ||
+		held.OwnerBindingID != claim.BindingID || held.EntitledAt == "" {
+		t.Fatalf("refused takeover damaged the sign-in: %+v", held)
+	}
+
+	// Non-vacuity: the permit is the only thing holding the slot. Settle it
+	// and the same generation change revokes as designed.
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE effect_permits SET status='settled' WHERE id='permit-human-1'`); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-human-permit", LeaseID: "lease-human-permit-new",
+		OwnerID: "job-other", BrowserHolderGeneration: 4, LeaseUntil: now.Add(time.Minute),
+	})
+	if err != nil || taken.OwnerID != "job-other" ||
+		taken.State != AuthenticationEntryLeaseReserved || taken.OwnerBindingID != "" {
+		t.Fatalf("settled permit must release the slot, got %+v err=%v", taken, err)
+	}
+}
+
 // A dead paper must not keep its institution's only sign-in slot. Reservation
 // already treats a terminal owner as expired, but nothing forced that
 // evaluation: measured live 2026-08-20, a cancelled paper held the operator's

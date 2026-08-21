@@ -1186,23 +1186,39 @@ func reserveAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, in Authentic
 		}
 		reservedExpired := current.State == AuthenticationEntryLeaseReserved &&
 			(ownerTerminal || current.LeaseUntil != "" && current.LeaseUntil <= nowText)
-		// claim-observation-protocol.md §4.5: expiry alone never authorizes a
-		// replacement while an effect permit is unresolved. An in-flight
-		// browser-local navigation on the lease's own occupying surface must
-		// keep occupying even past a timer.
-		if reservedExpired && current.OwnerBindingID != "" {
-			var occupied int
-			if err := q.QueryRowContext(ctx, `
-				SELECT COUNT(*) FROM effect_permits
-				WHERE binding_id=? AND effect_kind='institutional' AND status IN ('held','unknown_completion')`,
-				current.OwnerBindingID).Scan(&occupied); err != nil {
+		expired := current.State == AuthenticationEntryLeaseExpired || humanRevoked || reservedExpired
+		// claim-observation-protocol.md §4.5: NO replacement reason authorizes
+		// taking a lease whose own occupying surface still holds an unresolved
+		// institutional effect permit. An in-flight browser-local navigation
+		// keeps occupying past any timer, revocation or tombstone.
+		//
+		// This veto used to guard only reservedExpired, which left the two
+		// paths that matter most unfenced. A bound HUMAN row was reset — its
+		// binding cleared — whenever the holder generation changed, its owner
+		// went terminal, or its evidence aged out; and an `expired` row keeps
+		// its owner_binding_id, because the exact expiry writes only
+		// state/lease_until. Either shape handed the institution's single entry
+		// to a second paper while an irreversible provider action was still in
+		// flight on the first one, which is the one outcome this subsystem
+		// exists to prevent. The permit decides, not the reason for replacing.
+		//
+		// Vetoing here cannot strand the institution: Reserve is re-attempted
+		// on every poll, and migration 0034's effect_permits_live_slot index
+		// admits at most ONE unresolved permit process-wide, so a permit that
+		// never resolves has already stopped all institutional work and has an
+		// operator resolution path (ResolveUnknownEffectPermit). A retirement
+		// writer cannot borrow this argument — vetoing an owner-close
+		// retirement WOULD strand a bound row, because the terminal sweep
+		// requires a terminal owner.
+		if expired && current.OwnerBindingID != "" {
+			occupied, err := institutionalEffectInFlightTx(ctx, q, current.OwnerBindingID)
+			if err != nil {
 				return nil, err
 			}
-			if occupied > 0 {
-				reservedExpired = false
+			if occupied {
+				expired = false
 			}
 		}
-		expired := current.State == AuthenticationEntryLeaseExpired || humanRevoked || reservedExpired
 		if !expired {
 			// A reserved entry belongs to the JOB that is signing in, not to the
 			// browser session that happened to arbitrate for it. Renewal
@@ -1286,6 +1302,29 @@ func (js *Store) GetAuthenticationEntryLease(ctx context.Context, authentication
 	return getAuthenticationEntryLeaseTx(ctx, js.S.DB(), authenticationClaimID)
 }
 
+// institutionalEffectInFlightTx reports whether a surface still holds an
+// unresolved institutional effect permit, which vetoes every replacement of
+// the entry lease that surface occupies. `settled` means the provider effect
+// is over and replacement loses nothing; `held` and `unknown_completion` mean
+// something may be happening at the provider right now. An empty binding
+// cannot occupy anything.
+//
+// One definition, because two callers previously carried their own copy of
+// this predicate and only one of them fenced every path through it.
+func institutionalEffectInFlightTx(ctx context.Context, q dbtx, bindingID string) (bool, error) {
+	if strings.TrimSpace(bindingID) == "" {
+		return false, nil
+	}
+	var n int
+	if err := q.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM effect_permits
+		WHERE binding_id=? AND effect_kind='institutional' AND status IN ('held','unknown_completion')`,
+		bindingID).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // getAuthenticationEntryLeaseTx is GetAuthenticationEntryLease's core.
 // ApplyClaimObservation (claim_observation_apply.go) runs it against its own
 // transaction so the dedup/ordering check that must precede any lease
@@ -1304,16 +1343,9 @@ func getAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, authenticationCl
 		return nil, false, err
 	}
 	if l.State == AuthenticationEntryLeaseReserved && l.LeaseUntil != "" && l.LeaseUntil <= store.Now() {
-		occupied := false
-		if l.OwnerBindingID != "" {
-			var n int
-			if err := q.QueryRowContext(ctx, `
-				SELECT COUNT(*) FROM effect_permits
-				WHERE binding_id=? AND effect_kind='institutional' AND status IN ('held','unknown_completion')`,
-				l.OwnerBindingID).Scan(&n); err != nil {
-				return nil, false, err
-			}
-			occupied = n > 0
+		occupied, err := institutionalEffectInFlightTx(ctx, q, l.OwnerBindingID)
+		if err != nil {
+			return nil, false, err
 		}
 		if occupied {
 			return &l, true, nil

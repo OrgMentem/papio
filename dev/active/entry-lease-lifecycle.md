@@ -60,7 +60,27 @@ These are older than this plan and must not be folded into a slice.
    whose binding holds a `held`/`unknown_completion` permit is reset to
    `reserved` and its binding cleared when a new generation arrives, the owner
    goes terminal, or evidence is absent. That permits a second irreversible
-   provider action on one paper. The veto belongs on each transition.
+   provider action on one paper.
+
+   **SHIPPED, scoped to the replacement paths.** The veto now gates every
+   reason Reserve replaces a row — `expired`, `humanRevoked`, `reservedExpired`
+   — through one extracted `institutionalEffectInFlightTx`, replacing two
+   divergent inline copies of the predicate. Pinned by
+   `TestAuthenticationEntryLeaseHumanRevocationRefusedWhileEffectPermitHeld`,
+   which asserts the refusal leaves the human owner, binding and entitlement
+   intact, and that settling the permit lets the same takeover through.
+   Mutation-verified: restoring the narrow guard turns it red.
+
+   The three retirement writers are **deliberately left alone**, reversing this
+   plan's own "the veto belongs on each transition". Vetoing an owner-close
+   retirement would create a FIFTH dead end: nothing else retires a bound row
+   whose owner is still `awaiting_human`, since the terminal sweep requires a
+   terminal owner. Retirement-under-unresolved-permit needs a disposition, not
+   an indefinite hold, so it belongs to Slice 2. Reserve is safe to veto
+   because it is retried every poll and migration 0034's
+   `effect_permits_live_slot` index admits at most one unresolved permit
+   process-wide — a permit that never resolves has already stopped all
+   institutional work and has an operator resolution path.
 2. **A dependent that is admitted cannot bind.** The `human`+entitled admission
    case proceeds every dependent, but `institutionalBind` then calls Reserve for
    it; at the same generation with fresh evidence `humanRevoked` is false, so
