@@ -390,6 +390,10 @@ const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
 const PAGE_CAPTURE_NAV_TIMEOUT_MS = 30_000;
 const TRIAGE_COUNTS_FRESH_MS = 3 * KEEPALIVE_ALARM_MINUTES * 60_000;
 const SESSION_EVIDENCE_THROTTLE_MS = 60_000;
+/** How long a parked handoff surface the operator has never engaged may sit
+ * before papio retires it. See surfaceIsCold for the measurement this comes
+ * from; 3x the measured p99 operator-return latency. */
+const PARKED_SURFACE_COLD_MS = 30 * 60_000;
 /** Daemon replies that settle a correlated `requestNative` call. `requestNative`
  * rejects any type outside this set before registering a wait, so wrappers and
  * variables cannot create a request that only fails later by timing out. */
@@ -4282,6 +4286,23 @@ export class Bridge {
     return { count: ask.length + legacyCount, tab_ids: ask };
   }
 
+  /** Has this surface outlived any plausible operator return?
+   *
+   * Measured on the operator's own store 2026-08-21, across all 674 recorded
+   * returns from an authentication wall: p50 1.2s, p90 5.5s, p99 603s, and 671
+   * of 674 inside thirty minutes. A return that is going to happen happens
+   * fast, so the threshold sits 3x beyond the measured p99 and still covers
+   * 99.6% of them.
+   *
+   * created_at is the durable birth timestamp, which is the point: an MV3
+   * worker death wipes tabTouchEpoch, so age is the only engagement signal
+   * that survives a restart. This is a floor on retirement and never
+   * authority to remove - every guard below still runs, twice.
+   */
+  private surfaceIsCold(entry: SurfaceBirthRecord): boolean {
+    return this.deps.now() - entry.created_at >= PARKED_SURFACE_COLD_MS;
+  }
+
   /** Reconcile modern, same-browser-epoch birth records that no live job still
    * points at. This is the restart/update repair half of job_inactive: future
    * cancel/job-removal frames close through removeJobWithOffer, but a surface
@@ -4321,8 +4342,23 @@ export class Bridge {
         // Testing job existence skipped every one of those forever - and since
         // the timeout's own close attempt happens once, nothing ever retried
         // it. Measured live 2026-08-21: eighteen such tabs, none reachable by
-        // any close path. A job pointing at THIS tab is still a live surface.
-        owner?.tab_id === tabID
+        // any close path.
+        //
+        // A job pointing at THIS tab is still a live surface - UNLESS it has
+        // parked with it. A fresh-link park deliberately keeps its tab (see
+        // registerHandoffDrive's timeout) on the reasoning that detaching
+        // leaves the paper with no reusable URL and no way back to the
+        // operator's page. The first half is true and the second is no longer:
+        // engagement mints a fresh route, so the preserved page is a spent
+        // single-use link with no residual value - while the tab it occupies
+        // is real, and twelve of them were live on the operator's screen.
+        //
+        // Cold only, and cold is measured, not guessed: the surface must have
+        // outlived PARKED_SURFACE_COLD_MS, so a park whose page the operator
+        // may still act on (a live provider challenge is the case that
+        // matters) is never taken out from under them.
+        (owner?.tab_id === tabID &&
+          !(owner.parked_with_tab === true && this.surfaceIsCold(entry)))
       )
         continue;
       let tab: TabInfo;
@@ -4365,6 +4401,17 @@ export class Bridge {
       // asserting job_inactive for it is simply false, and the daemon rightly
       // refused it on every pass ("the binding still has an active browser
       // handoff") - which is how a parked ask kept a tab for days.
+      if (owner?.tab_id === tabID) {
+        // closeOwnedTab refuses a tab any live job still tracks, so a cold
+        // park has to be detached first - the same detach-then-close order the
+        // legacy timeout and the terminal-cleanup sites use. parked_with_tab
+        // deliberately STAYS set: the paper is still waiting for the operator,
+        // it just no longer holds a surface while it waits, and a re-offer
+        // must not silently re-drive it. Engagement (`papio actions open`, the
+        // inbox) clears the marker and mints a fresh route when the operator
+        // is actually ready.
+        await this.update((s) => patchJob(s, owner.job_id, { tab_id: -1 }));
+      }
       const result = await this.closeOwnedSurface(
         tabID,
         owner === undefined ? "job_inactive" : "handoff_parked",

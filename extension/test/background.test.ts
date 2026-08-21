@@ -2066,6 +2066,76 @@ test("a surface whose one close attempt was refused is retried by reconciliation
   expect(h.tabs.removed).toContain(tabID!);
 });
 
+// A fresh-link park keeps its tab on purpose, so its paper still points at the
+// surface - which used to make it permanently unreachable. Retiring it is
+// gated on the measured return-latency distribution rather than a guess: 674
+// recorded returns from a wall, p99 603s. A park the operator might still act
+// on (a live provider challenge) must survive; one nobody has come back to in
+// 3x that must not.
+test("a parked surface is retired once cold, and never while it is warm", async () => {
+  for (const cold of [false, true]) {
+    const h = makeHarness(undefined, { windows: true });
+    installManagedTabLedger(h, {});
+    await h.bridge.start();
+    await h.port.inbound(
+      helloAck({
+        features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
+        browser_holder_generation: 1,
+      }),
+    );
+    await h.port.inbound(jobOffer("job_parked_cold"));
+    const tabID = h.tabs
+      .list()
+      .map((tab) => tab.id)
+      .find((id) => id !== undefined);
+    expect(tabID).toBeDefined();
+
+    // Park WITH the tab, the fresh-link disposition: the paper keeps pointing
+    // at its surface, which is what made this case unreachable.
+    const internals = h.bridge as unknown as {
+      parkHandoffForManual: (jobID: string) => Promise<void>;
+    };
+    await internals.parkHandoffForManual("job_parked_cold");
+    expect(
+      h.backend.store.activeJobs.find(
+        (job) => job.job_id === "job_parked_cold",
+      ),
+    ).toMatchObject({ parked_with_tab: true, tab_id: tabID! });
+
+    // 30 minutes is PARKED_SURFACE_COLD_MS; one second short of it is warm.
+    h.clock.now += cold ? 30 * 60_000 : 30 * 60_000 - 1_000;
+
+    const framesBefore = h.frames().length;
+    const reconciling = h.bridge.reconcileOwnedTabs();
+    if (!cold) {
+      for (let i = 0; i < 200; i += 1) await Promise.resolve();
+      expect(await reconciling).toEqual({ closed: 0 });
+      expect(h.tabs.removed).not.toContain(tabID!);
+      expect(
+        h.frames().slice(framesBefore).map((frame) => frame.type),
+      ).not.toContain("surface_close_request");
+      continue;
+    }
+    const request = await h.port.waitForFrame(
+      "surface_close_request",
+      framesBefore,
+    );
+    expect(request.payload["disposition"]).toBe("handoff_parked");
+    await h.port.inbound(
+      nativeResult("surface_close_response", {
+        request_id: request.payload["request_id"],
+        outcome: "authorized",
+        close_authorization_id: "auth_parked_cold",
+        nonce: "nonce_parked_cold",
+        browser_holder_generation: 1,
+      }),
+    );
+    for (let i = 0; i < 200; i += 1) await Promise.resolve();
+    expect(await reconciling).toEqual({ closed: 1 });
+    expect(h.tabs.removed).toContain(tabID!);
+  }
+});
+
 // A drive says so, and a paper parked behind the single drive slot says the
 // opposite. The daemon charges a fruitless drive epoch per DRIVING accept and
 // retires a paper after three, so a queued accept reported as a drive retires
