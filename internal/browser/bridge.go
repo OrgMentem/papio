@@ -10904,9 +10904,41 @@ func (b *Bridge) institutionSignInHeldElsewhere(ctx context.Context, candidate j
 	case job.AuthenticationEntryLeaseHuman:
 		return lease.EntitledAt == ""
 	case job.AuthenticationEntryLeaseReserved:
-		return true
+		// A reserved lease is renewed on EVERY same-owner reserve call, so its
+		// deadline is rolling, not absolute: an owner that re-reserves inside
+		// the bind deadline holds the institution forever and never reaches the
+		// getter's expiry path. Honouring that unconditionally is a starvation,
+		// and it was live on the operator's machine — a job with no
+		// browser_candidates row at all re-took the slot every two minutes
+		// while 21 papers that could finish were withheld behind it.
+		//
+		// So require the holder to be capable of converting the slot it holds.
+		// A job with no live candidate can never bind, so its reservation can
+		// never become a sign-in; a job that HAS one still blocks correctly,
+		// which is what keeps two sign-in surfaces off one institution.
+		return b.leaseHolderCanConvert(ctx, lease.OwnerID)
 	}
 	return false
+}
+
+// leaseHolderCanConvert reports whether the job holding an institution's entry
+// slot has a live browser candidate — the only thing that can turn a
+// reservation into a bound sign-in. Read failures answer true: an unreadable
+// holder must keep its slot, because wrongly declaring it free is how two
+// sign-in surfaces end up on one institution.
+func (b *Bridge) leaseHolderCanConvert(ctx context.Context, ownerJobID string) bool {
+	if ownerJobID == "" {
+		return false
+	}
+	attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, ownerJobID)
+	if attemptErr != nil {
+		return true
+	}
+	candidate, candidateErr := b.jobs.CurrentBrowserCandidateForJob(ctx, ownerJobID, attempt)
+	if candidateErr != nil {
+		return true
+	}
+	return candidate != nil
 }
 func (b *Bridge) providerDirectGetAvailable() bool {
 	if b == nil || b.holder == nil || !slices.Contains(b.Features, providerDirectGetV1Feature) {

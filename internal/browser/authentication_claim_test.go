@@ -1258,12 +1258,16 @@ func TestFocusedCandidateWaitsWhileAnotherJobHoldsTheSignIn(t *testing.T) {
 	// path, and REWRITES the authentication claim id when it does.
 	claimID := settleInstitutionProfiles(t, b, jobs)
 
-	// A third paper now holds this institution's single sign-in slot. It owns no
-	// candidate, so the slot is the only signal available.
+	// A third paper now holds this institution's single sign-in slot. It must be
+	// a REAL paper with its own candidate: a holder that owns no candidate can
+	// never bind, so honouring its reservation is the starvation closed by
+	// leaseHolderCanConvert — pinned separately below.
+	holder := parkInstitutional(t, jobs, "focus-slot-holder", handoffWork(), "")
+	explicitMaterializationCandidate(t, jobs, holder, "domain-focus-holder")
 	if _, err := jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
 		AuthenticationClaimID:   claimID,
 		LeaseID:                 "lease-focus-holder",
-		OwnerID:                 "job_focus_slot_holder",
+		OwnerID:                 holder,
 		BrowserHolderGeneration: 1,
 		LeaseUntil:              b.now().Add(30 * time.Minute),
 	}); err != nil {
@@ -1293,6 +1297,64 @@ func TestFocusedCandidateWaitsWhileAnotherJobHoldsTheSignIn(t *testing.T) {
 	freed, _ := runSync(t, b)
 	if got := offersForJob(freed, sibling); got != 1 {
 		t.Fatalf("offers for the sibling after the slot freed = %d, want 1: %v", got, freed)
+	}
+}
+
+// A reserved entry lease is renewed on EVERY same-owner reserve call, so its
+// deadline is rolling rather than absolute: an owner that keeps re-reserving
+// never reaches the getter's expiry path and holds the institution forever.
+// Honouring that unconditionally starved the queue, and it was live on the
+// operator's machine 2026-08-21 — a job with no browser_candidates row at all
+// re-took the slot every two minutes while 21 papers that could actually finish
+// were withheld behind it. A reviewer found the renewal mechanism; this pins the
+// consequence.
+//
+// A holder with no candidate can never bind, so its reservation can never become
+// a sign-in. It must not withhold work. The sibling test above pins the other
+// half: a holder that DOES own a candidate still blocks, which is what keeps two
+// sign-in surfaces off one institution.
+func TestPhantomSlotHolderDoesNotWithholdWork(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "phantom-claim-shared")
+
+	waiting := parkInstitutional(t, jobs, "phantom-waits", handoffWork(), "")
+	explicitMaterializationCandidate(t, jobs, waiting, "domain-phantom-waits")
+	if _, _, err := b.FocusHandoffs(ctx, []string{waiting}); err != nil {
+		t.Fatalf("focus: %v", err)
+	}
+	claimID := settleInstitutionProfiles(t, b, jobs)
+
+	// A job that exists but owns no browser candidate takes the slot, and keeps
+	// it renewed so expiry can never rescue the queue.
+	phantom := parkInstitutional(t, jobs, "phantom-holder", handoffWork(), "")
+	for range 3 {
+		if _, err := jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+			AuthenticationClaimID:   claimID,
+			LeaseID:                 "lease-phantom-holder",
+			OwnerID:                 phantom,
+			BrowserHolderGeneration: 1,
+			LeaseUntil:              b.now().Add(30 * time.Minute),
+		}); err != nil {
+			t.Fatalf("phantom reserve: %v", err)
+		}
+	}
+	if lease, found, err := jobs.GetAuthenticationEntryLease(ctx, claimID); err != nil || !found ||
+		lease.State != job.AuthenticationEntryLeaseReserved || lease.OwnerID != phantom {
+		t.Fatalf("phantom did not hold a live reserved slot: %+v found=%v err=%v", lease, found, err)
+	}
+
+	offered := false
+	for range 10 {
+		msgs, _ := runSync(t, b)
+		if offersForJob(msgs, waiting) > 0 {
+			offered = true
+			break
+		}
+	}
+	if !offered {
+		t.Fatal("a holder that owns no candidate withheld the queue — the starvation is back")
 	}
 }
 
