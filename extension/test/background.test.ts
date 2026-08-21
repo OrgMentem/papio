@@ -16837,6 +16837,44 @@ test("generic exact-ID interruption settles once and missing exact ID remains un
   expect(missing.backend.store.activeJobs[0]?.download_initiated).toBe(true);
   expect(missing.backend.store.activeJobs[0]?.generic_terminal).not.toBe(true);
 });
+// Slice 0 containment reaches nine legacy/drive paths through
+// institutionalAuthGateOpen(), whose last clause is `online`. The
+// materialization pipeline never consulted it: scheduleMaterialization checks
+// only holder role, so a daemon re-offer arriving on a woken worker with no
+// network claimed, built a scaffold tab, and navigated it into a DNS failure.
+// That is "spawns new tabs before the internet is ready", reported from the
+// field 2026-08-18, on the same path as the 2026-08-21 offer churn.
+test("an offline browser builds no institutional scaffold, and resumes when the network returns", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
+  let online = false;
+  h.deps.online = () => online;
+
+  await h.port.inbound(candidateOffer("job_mat_offline"));
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(
+    h.frames().some((frame) => frame.type === "institutional_claim_request"),
+  ).toBe(false);
+  expect(h.tabs.created).toHaveLength(0);
+
+  // A wait, not a drop: the daemon re-offers every poll, so the network
+  // returning is enough on its own — no operator action, no lost candidate.
+  online = true;
+  const reoffer = candidateOffer("job_mat_offline") as {
+    msg_id: string;
+    seq: number;
+  };
+  reoffer.msg_id = "candidate_offer_000002";
+  reoffer.seq = 3;
+  await h.port.inbound(reoffer);
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  expect(claim.job_id).toBe("job_mat_offline");
+});
 test("institutional candidate offer dispatches claim without awaiting the correlated response", async () => {
   const h = makeHarness();
   await h.bridge.start();
@@ -18870,6 +18908,42 @@ test("Slice 1: simulateExtensionUpdate reproduces the session-storage-clears tab
   expect(h.tabGroups?.live.get(groupID!)?.title).toBe(
     "papio — A paper still awaiting institutional access",
   );
+});
+
+// A tab group survives an update discoverably: reconcileHandoffGroups queries
+// chrome.tabGroups by title, which is why the test above passes. A work WINDOW
+// has no title and no query, so the only thing that can point at it after
+// chrome.storage.session is wiped is the durable managed-tab ledger in
+// chrome.storage.local. Without that, papio opens a second work window and
+// strands every tab in the first one — "creates new papio windows between
+// updates", reported from the field 2026-08-18.
+test("an extension update adopts the surviving work window instead of opening a second", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ww_pre_update"));
+  const survivingTab = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const workWindowID = h.backend.store.workWindowID;
+  expect(workWindowID).toBeDefined();
+  expect(h.windows?.created).toHaveLength(1);
+  expect(h.tabs.snapshot(survivingTab)?.windowId).toBe(workWindowID);
+
+  const updated = simulateExtensionUpdate(h);
+  await updated.bridge.start();
+  await updated.port.inbound(helloAck());
+  await updated.port.inbound(jobOffer("job_ww_post_update"));
+
+  // The first window and its tab are still there, untouched by the update.
+  expect(updated.tabs.snapshot(survivingTab)?.windowId).toBe(workWindowID);
+  // So the next handoff belongs in it, not in a second one.
+  expect(updated.windows?.created).toHaveLength(1);
+  expect(updated.backend.store.workWindowID).toBe(workWindowID);
+  // Not vacuous: the post-update handoff really did open a tab, and it landed
+  // beside the survivor rather than in a window of its own.
+  const postUpdateTab = updated.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(postUpdateTab).toBeGreaterThanOrEqual(0);
+  expect(postUpdateTab).not.toBe(survivingTab);
+  expect(updated.tabs.snapshot(postUpdateTab)?.windowId).toBe(workWindowID);
 });
 
 test("Slice 1: restartWorker detaches the dead bridge's own listeners — a tab event after restart is handled by the new bridge only", async () => {

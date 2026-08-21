@@ -9481,6 +9481,14 @@ export class Bridge {
     // a real browser tab to bind, and a pending session that cannot claim would
     // leave that tab orphaned with nothing to attach it to.
     if (!this.holderRole()) return;
+    // Slice 0 containment, on the one pipeline the nine legacy paths' shared
+    // gate never reached. institutionalAuthGateOpen()'s last clause is
+    // `online`; this path checked only holdership, so a woken worker with no
+    // network claimed, built a scaffold tab, and navigated it straight into a
+    // DNS failure — "spawns new tabs before the internet is ready". Returning
+    // here drops nothing: the daemon re-offers this candidate every poll, so
+    // the first offer after the network returns proceeds normally.
+    if (this.deps.online?.() === false) return;
     if (this.materializationRuns.has(jobID)) {
       this.materializationReruns.add(jobID);
       return;
