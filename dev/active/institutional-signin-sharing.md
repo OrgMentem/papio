@@ -128,3 +128,69 @@ class first and re-measure before touching the second.
 3. Slice 0 cannot attribute more than 80% of attempts.
 4. A slice exceeds roughly 400 changed lines outside tests.
 5. Two consecutive rounds fail to move the live entitlement count.
+
+## Review round, 2026-08-21 — four reviewers on the day's shipped work
+
+Run because the day's production diff was +1442/-242 across 26 files including a
+protocol change, two migrations, and the claim/permit/lease core — and because
+the author had self-corrected five times in that subsystem in one day. One P0 and
+six P1s came back, **every one of them in code shipped that same day**. Fixed in
+`315a477`, `6fbeee2`, `6686f69`.
+
+### Fixed
+
+- **P0, live.** An entry lease is renewed on every same-owner reserve call, so
+  its deadline is rolling, not absolute: a holder re-reserving inside the bind
+  deadline never reaches the getter's expiry and holds its institution forever.
+  The new offer gate honoured that, converting a morning spin into an afternoon
+  starvation. The slot is now RETIRED (fenced; a stale error reads as
+  still-held, because the slot changed hands rather than freeing), a holder with
+  a binding still blocks, and a spent candidate no longer counts as capability.
+- **P1.** The automatic admission branch parked unconditionally, so a dependent
+  behind a candidate-less owner never reached the gate that frees it — the
+  starvation survived its own fix.
+- **P1.** The offline gate returned bare on a false premise; a claimed candidate
+  has no daemon-side re-drive and both local triggers self-consume. Papers now
+  park a revival in a dedicated map.
+- **P1.** `institutionalBind` could emit `bound` without the identity pair when
+  a best-effort occurrence lookup failed, stranding a surface that could never
+  report its own loss. The occurrence is now established BEFORE the bind and
+  refused with a structured outcome.
+- **P1.** `onTabRemoved` raced a queued durable claim write; it now awaits the
+  serialized ledger snapshot.
+- **P1.** Protocol: the identity pair is presence-checked rather than
+  value-checked (Go accepted an explicitly empty pair that TypeScript rejected),
+  and the published schema's bound/refusal branches now match both parsers.
+
+### Deliberately NOT fixed — residuals, with reasons
+
+1. **A `human` lease that never became entitled has no expiry path.** A bound
+   surface converts reserved→human with a null deadline; if its tab dies without
+   `owner_closed`, the stale sweep retires the claim but deliberately does not
+   release the lease (reconnect survival), and the unbound sweep excludes it
+   because `owner_binding_id` is set. Dependents then gate forever. This is the
+   same immortality class fixed twice for claims, now in the lease. **Most
+   likely next defect; no fix attempted.**
+2. **Capability is still approximated.** `leaseHolderCanConvert` excludes spent
+   candidates but a candidate that exists and is permanently unschedulable
+   (route-suppressed, non-awaiting) still blocks dependents. Tightening to "live
+   claim OR eligible candidate" needs a proven path first.
+3. **Accounting cannot end an always-queued loop.** Confirmed: a queued accept
+   correctly opens no epoch, so `FruitlessEpochs` stays 0 forever and only the
+   independent seven-day age fence can silence it. An offer-side suppression was
+   written and reverted the same day because its test could not be made to fail
+   — the harness quiesces the action once the clock advances. Needs a harness
+   capability before a fix.
+4. **`0046` mistakes a missing candidate row for "no surface ever existed".**
+   Legacy URL offers open real tabs without creating that row, so up to all 85
+   survivors may have had legitimate attempts reset. Self-healing — they
+   re-quiesce after three real drives — and a third migration would need the
+   same unprovable predicate.
+5. **`evictLostSurfaceClaimTx` proves "gone" by generation, not by absence.**
+   Structurally unreachable in production (every generation bump runs the stale
+   sweep first, and a failed sweep disables the claim path), so P2: a
+   dev-harness or direct Store caller can still abandon a live tab.
+6. **The zero-install exception is stale.** AMO verified at zero daily users
+   today, but the Chrome Web Store listing no longer exposes a count, and
+   `AGENTS.md` still records 2026-08-06. The protocol break shipped under an
+   exception that cannot currently be fully re-verified.
