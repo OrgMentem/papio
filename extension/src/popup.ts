@@ -1317,18 +1317,32 @@ export function resolverHost(origin: string | null): string {
   }
 }
 
-function sessionEvidenceDetail(state: PopupSessionState): string {
-  const source =
-    state.probeSource === "live_tab"
-      ? "via your library tab"
-      : state.probeSource === "keepalive_tab"
-        ? "via keepalive tab"
-        : "no probe evidence";
+/** Where the verdict came from, with no age attached. */
+function sessionEvidenceSource(state: PopupSessionState): string {
+  return state.probeSource === "live_tab"
+    ? "via your library tab"
+    : state.probeSource === "keepalive_tab"
+      ? "via keepalive tab"
+      : "no probe evidence";
+}
+
+/** How long ago the verdict was confirmed, as a bare phrase. */
+function sessionVerdictAge(state: PopupSessionState): string {
   const rawTimestamp = state.lastVerdictAt;
-  if (typeof rawTimestamp !== "number" || !Number.isFinite(rawTimestamp)) {
-    return source;
-  }
-  const age = formatAgo(rawTimestamp);
+  if (typeof rawTimestamp !== "number" || !Number.isFinite(rawTimestamp)) return "";
+  return formatAgo(rawTimestamp);
+}
+
+/** Source and age together, for the states where ONE fact owns both: a plain
+ * "Signed in · via your library tab · 3m ago" cannot be misread. A state that
+ * reports two different times - a verdict confirmed an hour ago AND a recheck
+ * running now - must not use this: chaining them produced "Signed in -
+ * rechecking now · via your library tab · 1h ago" on the operator's screen,
+ * where the age reads as the age of the recheck. Those states bind the age
+ * into the label beside the fact it measures. */
+function sessionEvidenceDetail(state: PopupSessionState): string {
+  const source = sessionEvidenceSource(state);
+  const age = sessionVerdictAge(state);
   return age === "" ? source : `${source} · ${age}`;
 }
 
@@ -1435,17 +1449,21 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   const aged = verdictAge !== undefined && verdictAge > SESSION_STALE_MS;
   const stale = verdictAge === undefined || verdictAge < 0 || aged;
   if (stale) {
+    // Two different times in one card: when the verdict was confirmed, and the
+    // recheck happening now. The age belongs beside the verdict it measures.
+    const confirmed = sessionVerdictAge(state);
+    const since = confirmed === "" ? "" : ` ${confirmed}`;
     if (aged && verdict === "in" && state.authenticated) {
       return {
-        label: "Signed in — rechecking now",
-        detail,
+        label: `Signed in${since} — rechecking now`,
+        detail: sessionEvidenceSource(state),
         action: "none",
       };
     }
     if (aged && verdict === "out" && !state.authenticated) {
       return {
-        label: "Signed out — rechecking now",
-        detail,
+        label: `Signed out${since} — rechecking now`,
+        detail: sessionEvidenceSource(state),
         action: "signin",
       };
     }
@@ -1749,10 +1767,12 @@ export function renderInstitutionSession(
   } else if (rows.length === 0) {
     // Only the waiting list or a release notice justifies the card — and a
     // card with a bare heading reads as broken, so say WHY it is quiet:
-    // rows only filter out when every session is warm and fresh.
+    // rows only filter out when every session is signed in and freshly
+    // verified. Same words as the row labels above — "warm" is the internal
+    // evidence tier (ADR-0018), never the reader's word for it.
     if (legacyRow instanceof HTMLElement) legacyRow.hidden = false;
     origin.textContent = "";
-    status.textContent = "All sessions warm";
+    status.textContent = "All institutions signed in";
     signIn.hidden = true;
     signIn.disabled = true;
     if (rowsContainer instanceof HTMLElement) {
@@ -2838,12 +2858,14 @@ function liveStatusText(
   }
   // An ask states what is wanted; a delivery states what is happening. What is
   // left is the timeline's own vocabulary (internal/store/activitytext.go),
-  // which names a past EVENT - "Institution login returned" is right in a
-  // history and reads as an unexplained instruction on a status line, which is
-  // exactly how it read under a paper title on the operator's own screen. It is
-  // a record, so it says so, and the card's button stays the route.
+  // which names a past EVENT and nothing about now: "Institution login
+  // returned - 2m ago" was read on the operator's own screen as an instruction
+  // nobody could act on, and labelling it "Last activity:" dated the record
+  // without ever saying where the paper stands. So lead with the standing,
+  // which fallbackJobStatus already words plainly, and demote the event to the
+  // last thing that happened - which the age suffix below already dates.
   else if (activity !== undefined && text === activity.text.trim()) {
-    text = `Last activity: ${text}`;
+    text = `${fallbackJobStatus(job)} · last: ${text}`;
   }
   const age = relativeAgeParts(timestamp, now);
   const activityAge = Number.isFinite(activityTimestamp) ? relativeAgeParts(activityTimestamp, now) : undefined;

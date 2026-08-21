@@ -176,6 +176,15 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
+- **A paper waiting for you no longer holds a browser tab as well.** After the
+  fix below, one refusal was left standing: a paper that has asked you for
+  something keeps that request open by definition, so the daemon read every
+  attempt to retire its tab as an attempt to discard live work and refused it —
+  truthfully, and for days at a time. Waiting for a person is a request, not a
+  claim on their browser. The browser may now say a paper has parked, the daemon
+  authorizes that closure, and the request stays open and waiting in your inbox
+  with the tab gone. An unfinished job at the publisher still vetoes it. Adds
+  database schema version 47.
 - **A tab *papio* opened for a paper it never finished is no longer kept open
   forever.** The extension has always asked the daemon before closing a tab,
   and the daemon answered "not eligible" for every ordinary sign-in tab —

@@ -33,7 +33,12 @@ flowchart LR
 The extension tracks only its own tabs. It runs provider-specific code only on
 sites you grant, notices when you return from your institution's login page
 without recording that page's address or title, matches up the job's download,
-and closes only its own tabs when a job finishes or is cancelled. The extension
+and retires a tab it opened once that tab has nothing left to do — when the job
+finishes or is cancelled, and also when a paper parks waiting for you, once
+*papio* has confirmed it holds nothing live in that surface. It never closes a
+tab you have touched: making one active, pinning it, opening a PDF in it, or
+moving it out of *papio*'s window or tab group hands it to you permanently. A
+tab *papio* has no record of opening is never closed at all. The extension
 can restart at any time; it keeps only a minimal tab-to-job mapping and asks
 *papio* for the authoritative state.
 

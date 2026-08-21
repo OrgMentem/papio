@@ -352,7 +352,7 @@ abandoned claim's scaffold after `owner_closed`), so this pair carries **no**
 | `request_id` | string | required |
 | `binding_id` | string | required |
 | `browser_holder_generation` | int64 | required |
-| `disposition` | enum | required — `"scaffold_idle" \| "materialization_settled" \| "claim_abandoned" \| "job_inactive"`. The original three closed-permitted reasons from the plan's re-permitted-narrowly amendment (lines 148-150) are idle scaffold never engaged, settled after artifact win, and authentication-claim abandonment (`owner_closed` reducer above). `job_inactive` is the fourth, added after the 2026-08-20 live lifecycle run proved a `navigated` claim had no retirement disposition at all: the daemon authorizes it only when the binding's job is terminal or has no open browser handoff, and an unsettled effect for that exact claim still vetoes closure. It is never an age or URL inference. |
+| `disposition` | enum | required — `"scaffold_idle" \| "materialization_settled" \| "claim_abandoned" \| "job_inactive" \| "handoff_parked"`. The original three closed-permitted reasons from the plan's re-permitted-narrowly amendment (lines 148-150) are idle scaffold never engaged, settled after artifact win, and authentication-claim abandonment (`owner_closed` reducer above). `job_inactive` is the fourth, added after the 2026-08-20 live lifecycle run proved a `navigated` claim had no retirement disposition at all: the daemon authorizes it only when the binding's job is terminal or has no open browser handoff, and an unsettled effect for that exact claim still vetoes closure. `handoff_parked` is the fifth, added 2026-08-21 (`24d365b`, store migration `0047` widening the `close_authorizations` CHECK) because a paper waiting for a human keeps its handoff action OPEN by definition, so `job_inactive` is false for it and the daemon refused every close request it ever made — measured live against four surfaces the operator had not touched in days. The browser asserts only what it can know, that it has parked; the daemon still vetoes on an in-flight provider effect for that claim. It is never an age or URL inference. |
 | `gate_occurrence_id` | string | optional — populated only when `disposition = "claim_abandoned"`, echoing the occurrence that closed |
 
 **`surface_close_response`** (daemon → extension):
@@ -360,7 +360,7 @@ abandoned claim's scaffold after `owner_closed`), so this pair carries **no**
 | field | type | disposition |
 |---|---|---|
 | `request_id` | string | required |
-| `outcome` | enum | required — `"authorized" \| "stale" \| "not_eligible" \| "busy" \| "error"` |
+| `outcome` | enum | required — `"authorized" \| "unclaimed" \| "stale" \| "not_eligible" \| "busy" \| "error"`. `unclaimed` was added 2026-08-21 (`f078270`) and is NOT a refusal: an ordinary URL-bearing handoff tab has no candidate, therefore no materialization claim, so the daemon has no route, no permit and no stake in that surface, and `not_eligible` was read — correctly — by the extension as an instruction to keep the tab. Every close route in this architecture is claim-scoped, so this branch was taken by every ordinary handoff tab papio has ever opened. The extension routes `unclaimed` to its own browser-local guards (`AGENTS.md`: "say so, and let the browser's own guards decide"). |
 | `close_authorization_id` | string | required on `authorized`; forbidden otherwise |
 | `nonce` | string | required on `authorized`; forbidden otherwise |
 | `browser_holder_generation` | int64 | required on `authorized`; forbidden otherwise |

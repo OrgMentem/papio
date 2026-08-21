@@ -1888,7 +1888,13 @@ test("session card matrix propagates probe outcomes without hijacking a decided 
     lastProbeOutcome: "markers",
     lastVerdictAt: now - 20 * 60_000,
   });
-  expect(aged.detail).toBe("via your library tab · 20m ago");
+  // Two times, two homes. This state reports a verdict confirmed 20m ago AND a
+  // recheck running now, so the age binds into the label beside the verdict it
+  // measures; leaving it on the end of the detail chain produced "Signed in —
+  // rechecking now · via your library tab · 1h ago", where the age reads as
+  // the age of the recheck.
+  expect(aged.label).toBe("Signed in 20m ago — rechecking now");
+  expect(aged.detail).toBe("via your library tab");
   // A warm session offers no sign-in action — the button is hidden, not dead.
   expect(warm.action).toBe("none");
 
@@ -1962,7 +1968,7 @@ test("an origin that never landed a decisive verdict resolves to its honest prob
     lastProbeOutcome: "markers",
     lastVerdictAt: now - (SESSION_STALE_MS + 1),
   });
-  expect(agedWarm.label).toBe("Signed in — rechecking now");
+  expect(agedWarm.label).toBe("Signed in 2m ago — rechecking now");
   expect(agedWarm.action).toBe("none");
   expect(agedWarm.label).not.toContain("unknown");
 });
@@ -2493,7 +2499,7 @@ test("a release notice keeps the card with a warm summary, never a bare heading"
     }],
   });
   expect(doc.getElementById("institution-session")?.hidden).toBe(false);
-  expect(doc.getElementById("institution-session-status")?.textContent).toBe("All sessions warm");
+  expect(doc.getElementById("institution-session-status")?.textContent).toBe("All institutions signed in");
   expect(doc.getElementById("institution-session-unblocked")?.textContent).toContain(
     "Sign-in unblocked 1 item",
   );
@@ -4198,7 +4204,7 @@ test("the batch line says which papers it is counting", () => {
 // unexplained instruction on a status line - measured on the operator's own
 // screen, where it sat under a paper title with no statement of what papio
 // wanted next. It is a record; it must say so.
-test("a bare timeline echo is labelled as history, and a real ask is not", () => {
+test("a bare timeline echo states where the paper stands, and an ask is untouched", () => {
   const now = Date.now();
   const render = (doc: Document, status: JobStatus, kind: string, text: string) =>
     renderPageContext(
@@ -4213,7 +4219,8 @@ test("a bare timeline echo is labelled as history, and a real ask is not", () =>
   const echo = popupDocument();
   render(echo, "accepted", "browser.auth_returned", "Institution login returned");
   const echoText = echo.getElementById("page-acquire-live-status")?.textContent ?? "";
-  expect(echoText).toContain("Last activity: Institution login returned");
+  // The standing first, the past event demoted and dated.
+  expect(echoText).toContain("Acquisition accepted · last: Institution login returned");
 
   // An explicit ask already states what is wanted; prefixing it would bury the
   // one line that is not a record.
@@ -4223,5 +4230,5 @@ test("a bare timeline echo is labelled as history, and a real ask is not", () =>
   render(ask, "auth_pending", "browser.auth_pending", "Still waiting on you at the publisher");
   const askText = ask.getElementById("page-acquire-live-status")?.textContent ?? "";
   expect(askText.toLowerCase()).toContain("waiting on you");
-  expect(askText).not.toContain("Last activity:");
+  expect(askText).not.toContain("· last:");
 });

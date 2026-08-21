@@ -386,8 +386,10 @@ it does not automate your credentials.
 ### Watch the institution session
 
 The popup's **Institution session** card reports the browser-local resolver
-state: **Session warm**, **Signed out or expired**, **Sign-in needed - papio
-paused**, or **Keep-warm off**. **Sign in now** focuses the ordinary resolver
+state: **Signed in**, **Signed in <age> - rechecking now**, **Signed out or
+expired**, **Sign-in needed - papio paused**, or **Keep-warm off**. When every
+configured institution is signed in and freshly verified, the card says **All
+institutions signed in**. **Sign in now** focuses the ordinary resolver
 tab when a library route is configured. Sign in, complete any MFA or other
 institution step yourself, and return to the provider page; *papio* never fills
 credentials or copies cookies.

@@ -20,6 +20,16 @@ for the full pre-split extension history.
 - **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
 
 ### Fixed
+- **The popup no longer resizes itself over and over.** Opened, and sometimes
+  after a click and a mouse-off, it flickered between two widths as fast as the
+  screen could draw. A browser popup has no window size of its own — Chrome
+  measures the page and sizes the window to fit — so the stylesheet asking for
+  "380px, or the window's width, whichever is smaller" was asking for a width
+  defined by itself. There is no answer to that question, and the browser kept
+  trying: measured on the author's machine, 394px and 364px, alternating,
+  forever, with nobody touching it. The width is now simply 380px, and the
+  scrollbar's space is always reserved so a line of text appearing cannot start
+  the same argument about height.
 - **Tabs *papio* opened for a paper it never finished are now cleaned up.**
   When a paper reached your library's sign-in and *papio* ran out of time
   waiting, it always meant to close that tab — but every one of those closures
@@ -34,6 +44,23 @@ for the full pre-split extension history.
   instant as it, so even a click that lands mid-close is caught.
 
 ### Changed
+- **The popup says what is happening, and offers the way to act on it.**
+  "Waiting on you · 125 decisions" was plain text: the popup named you as the
+  hold-up and then offered nothing but the two buttons for the page you happened
+  to be on. That count is now the button. Four other lines were rewritten
+  because they read as riddles on the author's own screen. The line under it is
+  one submission, not your whole library, and now says so — "Last submission:
+  199 papers · 127 settled · 72 still open", where "72 remaining" used to sit
+  under a different total and look like a contradiction. The session card no
+  longer chains two different times into one sentence: "Signed in — rechecking
+  now · via your library tab · 1h ago" could not tell you whether the check was
+  an hour old or happening now, and now reads "Signed in 1h ago — rechecking
+  now". "Session warm" is now "Signed in", and "All sessions warm" is "All
+  institutions signed in" — *warm* was *papio*'s word for how fresh its
+  evidence is, never yours. And a paper's card no longer prints a bare line
+  from the activity log where its status belongs: "Institution login returned ·
+  2m ago" said what once happened and nothing about where the paper stands, so
+  the standing comes first now, with the event kept and dated after it.
 - **The toolbar badge no longer reports *papio*'s own queue as papers waiting
   on you.** A library is served by one sign-in at a time, so most institutional
   papers are waiting for *papio* to reach them, not for you to do anything —
