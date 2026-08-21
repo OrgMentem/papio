@@ -7066,6 +7066,44 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 	return nil
 }
 
+// handoffQuiescedByEvidence reads what each accepted drive of this action
+// actually did and reports whether it has burned its fruitless-epoch budget,
+// appending the one audit event that makes the decision visible.
+//
+// Both the ordinary offer drain and the institutional reoffer release MUST
+// consult this, not `HumanAction.Quiesced` alone. Age and fruitlessness are
+// different failures: the verified field incident aged only 3.07 days into
+// QuiesceAfter's seven-day fence while being offered 38 times with zero
+// terminal outcomes. A path that filters on age and then overrides the
+// fruitless gate launders a permanently-dead action past it — measured live
+// 2026-08-21, where four already-quiesced papers held the entire four-slot
+// reoffer budget across 424 releases while 58 healthy papers behind them were
+// never volunteered once.
+func (b *Bridge) handoffQuiescedByEvidence(
+	ctx context.Context,
+	id string,
+	action job.HumanAction,
+) (bool, int, error) {
+	events, err := b.jobs.Events(ctx, id)
+	if err != nil {
+		return false, 0, err
+	}
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, b.now())
+	if !state.Quiesced {
+		return false, state.FruitlessEpochs, nil
+	}
+	for _, ev := range events {
+		if kind, _ := ev["kind"].(string); kind == "browser.handoff_quiesced" {
+			return true, state.FruitlessEpochs, nil
+		}
+	}
+	if err := b.jobs.S.AppendEvent(ctx, id, "browser.handoff_quiesced",
+		map[string]any{"reason": "fruitless_drive_limit", "drive_epochs": state.FruitlessEpochs}); err != nil {
+		return false, state.FruitlessEpochs, err
+	}
+	return true, state.FruitlessEpochs, nil
+}
+
 // reofferInstitutionalSiblings lets poll reopen only the handoffs that a
 // returned institutional session can actually unlock. The caller holds b.mu.
 func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID string) error {
@@ -7141,6 +7179,7 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 	if available < 0 {
 		available = 0
 	}
+
 	type candidate struct {
 		action job.HumanAction
 		row    job.Row
@@ -7149,8 +7188,10 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 	for _, item := range handoffJobs {
 		action := item.Action
 		// Quiesced siblings are excluded for the same reason the seed is: a
-		// fresh institutional login must not resurrect a week-old handoff
-		// nobody has completed. An explicit `papio actions open` still does.
+		// fresh institutional login must not resurrect a handoff nobody has
+		// completed. An explicit `papio actions open` still does. Both
+		// quiescence rules apply — the cheap age one here, the evidence one
+		// below once the cheap filters have narrowed the set.
 		if item.Row.ID == sourceJobID ||
 			!action.RequiresAuth ||
 			action.Quiesced(b.now()) ||
@@ -7172,6 +7213,14 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 			return err
 		}
 		if requeued {
+			continue
+		}
+		quiesced, _, err := b.handoffQuiescedByEvidence(ctx, row.ID, action)
+		if err != nil {
+			return err
+		}
+		if quiesced {
+			delete(b.reofferPending, row.ID)
 			continue
 		}
 		candidates = append(candidates, candidate{action: action, row: row})
@@ -9829,38 +9878,18 @@ jobLoop:
 		quiescedByEvidence := false
 		action := handoff[id]
 		// The main auto-offer gate. focusPending is an explicit
-		// `papio actions open`, and reofferPending was already filtered when it
-		// was set, so both are honoured; a plain session-live tick is not.
+		// `papio actions open`; reofferPending has already been through the
+		// SAME evidence check in reofferInstitutionalSiblings, so both are
+		// honoured here. A plain session-live tick is not.
 		//
-		// Age alone is not enough: the verified field incident aged only 3.07
-		// days into QuiesceAfter's seven-day fence while being offered 38
-		// times with zero terminal outcomes. ProjectHandoffOfferState reads
-		// what each accepted drive actually did and quiesces on fruitless
-		// epochs regardless of how young the action still is.
+		// Age alone is not enough — see handoffQuiescedByEvidence.
 		if !overridden {
-			events, err := b.jobs.Events(ctx, id)
+			quiesced, _, err := b.handoffQuiescedByEvidence(ctx, id, action)
 			if err != nil {
 				log.Printf("papio: reading handoff history for %s: %v", id, err)
 				continue
 			}
-			state := job.ProjectHandoffOfferState(events, action.CreatedAt, b.now())
-			quiescedByEvidence = state.Quiesced
-			if quiescedByEvidence {
-				audited := false
-				for _, ev := range events {
-					if kind, _ := ev["kind"].(string); kind == "browser.handoff_quiesced" {
-						audited = true
-						break
-					}
-				}
-				if !audited {
-					if err := b.jobs.S.AppendEvent(ctx, id, "browser.handoff_quiesced",
-						map[string]any{"reason": "fruitless_drive_limit", "drive_epochs": state.FruitlessEpochs}); err != nil {
-						log.Printf("papio: recording handoff quiescence for %s: %v", id, err)
-						continue
-					}
-				}
-			}
+			quiescedByEvidence = quiesced
 		}
 		if (action.Quiesced(b.now()) || quiescedByEvidence) && !overridden {
 			continue

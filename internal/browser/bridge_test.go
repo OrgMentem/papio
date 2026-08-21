@@ -13839,3 +13839,85 @@ func TestLegacyInstitutionalPeerRejectsCurrentPermitTuple(t *testing.T) {
 		t.Fatalf("legacy peer current-shaped result err=%v, want invalid frame", err)
 	}
 }
+
+// TestInstitutionalReofferSkipsFruitlessSiblings pins the head-of-line block
+// measured live on 2026-08-21: the reoffer release budget is four slots, its
+// candidate filter checked AGE only, and `reofferPending` then overrides the
+// fruitless-epoch gate in the ordinary drain — on the claim that the reoffer
+// path "was already filtered when it was set". It was not. Four papers that
+// had each burned their fruitless budget (permanently excluded from ordinary
+// offering, `browser.handoff_quiesced` already recorded) consumed the whole
+// budget on every single sign-in, 424 releases deep, while 58 healthy papers
+// behind them were never volunteered once.
+//
+// Age here is deliberately young for both siblings, so age-quiescence cannot
+// account for the result: the only difference is drive evidence.
+func TestInstitutionalReofferSkipsFruitlessSiblings(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+
+	source := parkInstitutional(t, jobs, "wr_reoffer_source", handoffWork(), "")
+	fruitless := parkInstitutional(t, jobs, "wr_reoffer_fruitless", handoffWork(), "")
+	healthy := parkInstitutional(t, jobs, "wr_reoffer_healthy", handoffWork(), "")
+
+	action := openHandoffAction(t, jobs, fruitless)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three drives, each accepted, none ever reporting an outcome.
+	last := created
+	for range job.MaxAutomaticHandoffEpochs {
+		last = last.Add(job.HandoffAcceptedLease + 10*time.Second)
+		appendEventAt(t, jobs, fruitless, "browser.handoff_offered",
+			map[string]any{"requires_auth": true}, last)
+		appendEventAt(t, jobs, fruitless, "browser.job_accept", nil, last.Add(time.Second))
+	}
+	now := last.Add(job.HandoffAcceptedLease + time.Second)
+	b.now = func() time.Time { return now }
+	runSync(t, b, hello())
+
+	// The fruitless sibling is already suppressed by the ordinary gate here;
+	// what follows measures whether the sign-in release resurrects it.
+	msgs, _ := runSync(t, b,
+		inFrame(t, protocol.MsgAuthReturned, source, map[string]any{"elapsed_ms": 10}))
+
+	reoffered := func(id string) int {
+		events, err := jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, event := range events {
+			if event["kind"] == "browser.handoff_reoffered" {
+				n++
+			}
+		}
+		return n
+	}
+	if got := reoffered(fruitless); got != 0 {
+		t.Fatalf("fruitless sibling re-offers = %d, want 0 (it holds the budget forever)", got)
+	}
+	if got := reoffered(healthy); got != 1 {
+		t.Fatalf("healthy sibling re-offers = %d, want 1 (the budget must reach it)", got)
+	}
+	if b.reofferPending[fruitless] {
+		t.Fatal("fruitless sibling was marked for re-offer, overriding its own quiesce gate")
+	}
+	// And the release reaches the wire for the healthy paper, never the dead one.
+	sawHealthy := false
+	for _, frame := range msgs {
+		if frame == nil || frame.Type != protocol.MsgJobOffer {
+			continue
+		}
+		if frame.JobID == fruitless {
+			t.Fatal("fruitless sibling reached the wire after a sign-in")
+		}
+		if frame.JobID == healthy {
+			sawHealthy = true
+		}
+	}
+	if !sawHealthy {
+		t.Fatal("healthy sibling never reached the wire after a sign-in")
+	}
+}

@@ -243,6 +243,18 @@ execution records kept during the initial build.
   the tab at all, so even a slot stranded by an older version frees itself the
   next time you ask for a paper. Relatedly, queued sign-in progress is no
   longer discarded when the browser reconnects.
+- **Signing in no longer releases the same four dead papers every time.** When
+  an institutional sign-in returns, *papio* releases a few of the papers that
+  were waiting on it. Four papers it had already given up on — each having been
+  handed to the browser three times without ever reporting an outcome, and so
+  permanently retired from being offered — were still first in that queue, and
+  took every slot, on every sign-in. Measured on a real library: 424 releases
+  spent on those four while 58 papers that could still be fetched were never
+  offered once. The release now applies the same "papio has stopped
+  volunteering this one" rule the ordinary path already applied, so the slots
+  go to papers that can still move. Nothing is dismissed or hidden: `papio
+  actions open` still drives any of them on demand, and `papio doctor` still
+  reports the count that has gone quiet.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route
