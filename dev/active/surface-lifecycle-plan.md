@@ -1360,3 +1360,78 @@ the entry lease has already transitioned to `human`
 (`claim_observation_apply.go:165-168` requires `reserved`). Exactly two lines,
 not a spin, but it means a provider challenge seen on a landed sign-in is
 dropped rather than recorded.
+
+## Eighth round (2026-08-21) — reviewing the coverage, not the code
+
+No new failure prompted this. The question was "which of the four reported
+symptoms actually has a test", and asking it found **two production defects**
+that all six previous rounds had missed.
+
+13. **`d6ef1df` — an in-flight provider effect is not a free sign-in slot.** The
+    gate shipped one round earlier carried a lapse check. Mutation-testing found
+    no test that cared, which is how the real problem surfaced: it was not dead
+    code, it was *wrong* code. `getAuthenticationEntryLeaseTx`
+    (`institutional_evidence.go:1306`) already expires a past-deadline reserved
+    lease in place, so a genuinely lapsed slot arrives as `expired` with no help
+    needed. The one case where it deliberately returns a past-deadline lease
+    still marked `reserved` is when that binding's institutional effect permit
+    is `held`/`unknown_completion` — an irreversible provider action may be in
+    flight *right now*. The lapse check read exactly that as "free" and would
+    have offered a second paper a sign-in at the same institution. Removed, with
+    the reasoning left in place so it is not reintroduced as an "obvious"
+    freshness guard.
+14. **`f196ded` — no institutional scaffold while the network is down.** Slice 0
+    containment reaches nine legacy/drive paths through
+    `institutionalAuthGateOpen()`, whose last clause is `online`. The
+    materialization pipeline never consulted it — `scheduleMaterialization`
+    checked holder role and nothing else — so a re-offer on a woken worker with
+    no network claimed, built a scaffold, and navigated it into a DNS failure.
+    That is the operator's second field complaint, on the same path as the offer
+    churn. Gated at the chokepoint every drive already funnels through; the
+    daemon re-offers every poll, so nothing is dropped.
+
+### The stale blocker list was itself a blocker
+
+Worth recording plainly, because it bears on "why hasn't this landed". This
+plan's own harness-gap list (§"Harness", and the abort criteria's "build these
+first") named four things as missing. **Three had already shipped:**
+
+- the `online`/offline seam — `BridgeDeps.online` exists, `h.deps.online` is
+  drivable, and two tests already pin offline-wake behaviour for the legacy
+  release paths;
+- navigation-error events — `FakeWebNavigation.onErrorOccurred` exists;
+- an update-simulation helper — `test/lifecycle.ts`'s `simulateExtensionUpdate`
+  exists and is used by a dozen tests.
+
+So a document that was being cited as the reason work could not proceed was
+describing a tree from several rounds earlier. Anything in a plan that gates
+work must be re-verified against the tree before it is honoured, which is the
+same discipline the 2026-08-16 audit applied to the *claims* in this file and
+never extended to its *blockers*.
+
+### New coverage
+
+- **Work-window adoption across an update.** The tab-group half was already
+  covered (`reconcileHandoffGroups` queries by title). The WINDOW half never
+  was: a window has no title to query, only the durable ledger can point at it,
+  and every existing test used `restartWorker`, where `workWindowID` survives.
+  `adoptWorkWindowFromOwnedMembers` was already correct; the new test turns red
+  when its adoption line is removed.
+- **A rate invariant, not a single-poll one.** The slot-held assertion now runs
+  ten polls. The churn was a per-poll leak, so a one-poll test is exactly the
+  shape that stays green while the browser churns.
+- **`settleInstitutionProfiles`** extracts the trap that produced three
+  green-but-vacuous tests: poll rewrites a profile's authentication claim id,
+  only on the candidate-preparation path.
+- **The challenge dead end is pinned as inert**, and the mutation round found it
+  is defended *twice* — removing the reserved-state check does not make it
+  apply, because the reserve then refuses the settled entry. A single-guard
+  mutation cannot turn that test red, which is worth knowing before someone
+  tries.
+
+### Still not covered, deliberately
+
+Live-only behaviour, per `AGENTS.md`: synthesized activation is refused by
+extension gesture tracking, so handoff smoke runs need the operator surface
+(`papio actions open`) and a real pointer click for an extension reload. No
+suite substitutes for that.
