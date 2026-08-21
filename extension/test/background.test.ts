@@ -20612,3 +20612,50 @@ test("a challenge still on the page keeps asking", async () => {
 
   expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBe(true);
 });
+
+// Measured on the operator's own browser 2026-08-21, via the service worker's
+// own scripting probe against the tab papio was blocking:
+//
+//   {"cf":true,"chl":false,"tz":false,"vh":false,
+//    "t":"“When there's collective leadership, there's"}
+//
+// `/cdn-cgi/challenge-platform/` serves Cloudflare's JS Detections script,
+// which is injected into ORDINARY responses on JSD-enabled sites. Keying on it
+// classified a fully loaded article the researcher was reading as a bot
+// challenge - permanently, because that script never goes away. That is what
+// kept the "Needs you · Security check" card asking about a check that had
+// already been solved. Fixtures could not catch it: their captures predate JSD
+// on those hosts, and every committed success.html carries zero markers.
+test("Cloudflare's JS-detections script on a normal page is not a challenge", () => {
+  const jsdArticle = sanitizedObservedChallenge(`
+    <html><head>
+      <title>“When there's collective leadership, there's the power to make changes”</title>
+      <script src="/cdn-cgi/challenge-platform/h/b/jsd/r/0.123:1755000000:TOKEN/main.js">discarded body</script>
+    </head><body><article><h1>Abstract</h1><p>There is accumulating evidence.</p></article></body></html>
+  `);
+  expect(isBotChallenge(jsdArticle)).toBe(false);
+  expect(assessDrivenPage(jsdArticle).kind).toBe("normal");
+});
+
+// The other half, from the live 403 interstitial the same day: Cloudflare
+// serves "Just a moment…" as the title and NO widget markers at all in the
+// HTML - it injects the widget and its text at runtime. So the title and the
+// runtime text both have to count, or the real wall becomes invisible.
+test("the real Cloudflare interstitial is still a challenge, title or text", () => {
+  const servedInterstitial = sanitizedObservedChallenge(`
+    <html><head><title>Just a moment...</title>
+      <script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1">discarded body</script>
+    </head><body><div class="main-content"></div></body></html>
+  `);
+  expect(isBotChallenge(servedInterstitial)).toBe(true);
+  expect(assessDrivenPage(servedInterstitial).kind).toBe("challenge");
+
+  // Once the challenge script runs, this is what the operator actually sees.
+  const renderedInterstitial = sanitizedObservedChallenge(`
+    <html><head><title>journals.sagepub.com</title></head><body>
+      <h2>Verifying you are human. This may take a few seconds.</h2>
+    </body></html>
+  `);
+  expect(isBotChallenge(renderedInterstitial)).toBe(true);
+  expect(assessDrivenPage(renderedInterstitial).kind).toBe("challenge");
+});

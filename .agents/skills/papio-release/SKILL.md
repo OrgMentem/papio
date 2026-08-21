@@ -76,12 +76,14 @@ Commits never need to be cleanly one-sided; changelogs are written by hand,
 not derived from `git log`. Both accumulate under `## [Unreleased]` and are
 finalized to `## [x.y.z] - date` at tag time.
 
-Both changelogs are published on the docs site (`docs/changelog/*.md` are
-snippet includes of the real files — edit the real files, never the docs
-mirrors). This is the only changelog CWS users get (CWS has no version-history
-UI). AMO *does* have a public per-version "Release Notes" field — paste the
-extension changelog entry into the AMO Developer Hub after each upload
-(`web-ext sign` cannot set it).
+Neither changelog is published on the docs site — `CHANGELOG.md` and
+`extension/CHANGELOG.md` are read on GitHub, which is the canonical public
+surface. Consequence for store users: **CWS has no version-history UI**, so the
+Chrome Web Store listing description must carry a link to
+`https://github.com/OrgMentem/papio/blob/main/extension/CHANGELOG.md` or CWS
+users get no changelog at all. AMO *does* have a public per-version "Release
+Notes" field — paste the extension changelog entry into the AMO Developer Hub
+after each upload (`web-ext sign` cannot set it).
 
 **No private-tool names in public prose.** Changelogs, README, and `docs/`
 are published; never name internal tooling (glean, beads, run IDs) in them —

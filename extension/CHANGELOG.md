@@ -20,6 +20,19 @@ for the full pre-split extension history.
 - **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
 
 ### Fixed
+- **Pages behind Cloudflare are no longer all read as security checks.**
+  *papio* treated the presence of one Cloudflare script as proof of a bot
+  check. That script is injected into ORDINARY pages on sites that enable
+  Cloudflare's JS detections, so on those publishers every page — including the
+  article you are reading — looked like a check, and looked like one forever,
+  because the script never goes away. Measured on the author's own browser: on
+  a fully loaded SAGE article, that script present, no check widget, no check
+  text, real article title. *papio* now looks for what actually distinguishes
+  Cloudflare's wait page — its title, its text, and a real widget — verified
+  against both the live wait page and the live article.
+
+  This was the reason a solved check kept nagging, and it also means fewer
+  papers get parked and fewer publishers get cooled off for no reason.
 - **A security check you have already solved stops nagging.** That ask only ever
   went away if *papio* caught one specific browser event for that exact tab.
   Chrome puts extensions to sleep after about thirty seconds idle and solving a

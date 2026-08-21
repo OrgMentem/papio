@@ -674,6 +674,21 @@ export interface DrivenPageAssessment {
  * chrome.scripting serializes it into the provider page's isolated world.
  * Only bounded structural markers and page-authored text are inspected; no
  * page text is returned to the extension.
+ *
+ * `/cdn-cgi/challenge-platform/` is deliberately NOT a marker. That path serves
+ * Cloudflare's JS Detections script, which is injected into ORDINARY responses
+ * on JSD-enabled sites, so keying on it classified every page on such a
+ * provider as a bot challenge - permanently, since the marker never goes away.
+ * Measured on the operator's own browser 2026-08-21, on a fully loaded SAGE
+ * article they were reading: that script present, `#challenge-form` absent,
+ * turnstile absent, challenge text absent, real article title. The committed
+ * fixtures do not show this (their captures predate JSD on those hosts), which
+ * is why this was settled against a live tab rather than against a fixture.
+ *
+ * What distinguishes the interstitial is its own title and text plus a real
+ * widget. Verified against the live 403 interstitial the same day: "Just a
+ * moment…" in the title, and NO widget markers in the served HTML at all -
+ * Cloudflare injects those at runtime.
  */
 export function isBotChallenge(doc: Document | null): boolean {
   const root: Document = doc ?? document;
@@ -681,16 +696,19 @@ export function isBotChallenge(doc: Document | null): boolean {
   const text = (root.body?.textContent ?? "").slice(0, 40_000);
   const structural =
     root.querySelector(
-      'script[src*="/cdn-cgi/challenge-platform/"], ' +
-        'script[src*="challenges.cloudflare.com/turnstile/"], ' +
+      'script[src*="challenges.cloudflare.com/turnstile/"], ' +
         'input[name="cf-turnstile-response"], ' +
-        '#challenge-form, .cf-turnstile, [id*="cf-chl-"], [class*="cf-chl-"], ' +
+        '#challenge-form, #challenge-running, .cf-turnstile, ' +
+        '[id*="cf-chl-"], [class*="cf-chl-"], ' +
         '#captcha-box .main-wrapper[role="main"]',
     ) !== null;
   return (
     structural ||
+    /^just a moment/i.test(title) ||
     /are\s+you\s+a\s+robot\??/i.test(title) ||
-    /verify\s+you\s+are\s+human/i.test(`${title}\n${text}`)
+    /verif(?:y|ying)\s+you\s+are\s+human|checking\s+your\s+browser|needs\s+to\s+review\s+the\s+security\s+of\s+your\s+connection/i.test(
+      `${title}\n${text}`,
+    )
   );
 }
 
@@ -730,18 +748,27 @@ export function assessDrivenPage(
   const root: Document = doc ?? document;
   const title = (root.title ?? "").trim().slice(0, 256);
   const text = (root.body?.textContent ?? "").slice(0, 40_000);
+  // Same marker set as isBotChallenge, and same deliberate omission of
+  // `/cdn-cgi/challenge-platform/` — see that function for the live
+  // measurement. These two lists MUST agree: one decides whether to raise the
+  // block, the other whether it may be retired, so a marker in only one of
+  // them creates an ask that can be raised and never cleared. That is exactly
+  // the shape of the defect this fixes.
   const structural =
     root.querySelector(
-      'script[src*="/cdn-cgi/challenge-platform/"], ' +
-        'script[src*="challenges.cloudflare.com/turnstile/"], ' +
+      'script[src*="challenges.cloudflare.com/turnstile/"], ' +
         'input[name="cf-turnstile-response"], ' +
-        '#challenge-form, .cf-turnstile, [id*="cf-chl-"], [class*="cf-chl-"], ' +
+        '#challenge-form, #challenge-running, .cf-turnstile, ' +
+        '[id*="cf-chl-"], [class*="cf-chl-"], ' +
         '#captcha-box .main-wrapper[role="main"]',
     ) !== null;
   if (
     structural ||
+    /^just a moment/i.test(title) ||
     /are\s+you\s+a\s+robot\??/i.test(title) ||
-    /verify\s+you\s+are\s+human/i.test(`${title}\n${text}`)
+    /verif(?:y|ying)\s+you\s+are\s+human|checking\s+your\s+browser|needs\s+to\s+review\s+the\s+security\s+of\s+your\s+connection/i.test(
+      `${title}\n${text}`,
+    )
   ) {
     return { kind: "challenge" };
   }
