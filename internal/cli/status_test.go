@@ -94,13 +94,10 @@ func TestBuildStatusSnapshotUsesCurrentOpenActionGuidance(t *testing.T) {
 	if item.Category != "manual_download" {
 		t.Fatalf("category = %q, want manual_download", item.Category)
 	}
-	for _, want := range []string{"Sign in at your institution", "download the PDF yourself"} {
+	for _, want := range []string{"Sign in at your institution", "`papio actions open`", "download the PDF yourself"} {
 		if !strings.Contains(item.Guidance, want) {
 			t.Fatalf("guidance = %q, want %q", item.Guidance, want)
 		}
-	}
-	if strings.Contains(item.Guidance, "papio actions open") {
-		t.Fatalf("guidance names an inapplicable handoff command: %q", item.Guidance)
 	}
 }
 

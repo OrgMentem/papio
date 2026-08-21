@@ -481,6 +481,12 @@ func (js *Store) CurrentBrowserCandidateForJob(ctx context.Context, jobID string
 	return c, err
 }
 
+// TerminalMaterializationJobIDLimit bounds one poll's durable cancel batch so
+// a terminal-claim backlog cannot make browser.sync exceed ipc.MaxResultBytes
+// and fail the native transport. The stable job-id order means retiring the
+// first page makes the next poll advance monotonically through the backlog.
+const TerminalMaterializationJobIDLimit = 32
+
 // TerminalMaterializationJobIDs returns terminal jobs which still own a live
 // browser materialization claim. Bridge poll uses this durable set to emit
 // cancel after a daemon restart: the in-memory offered/materializationTracked
@@ -494,7 +500,8 @@ func (js *Store) TerminalMaterializationJobIDs(ctx context.Context) ([]string, e
 		  JOIN jobs j ON j.id=c.job_id
 		 WHERE j.state IN ('ready','imported','unavailable','failed','cancelled')
 		   AND m.phase IN ('claimed','bound','route_issued','navigated')
-		 ORDER BY c.job_id`)
+		 ORDER BY c.job_id
+		 LIMIT ?`, TerminalMaterializationJobIDLimit)
 	if err != nil {
 		return nil, err
 	}

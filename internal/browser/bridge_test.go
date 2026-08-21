@@ -6115,6 +6115,125 @@ func TestPollCancelsTerminalMaterializationWithoutMemoryTracking(t *testing.T) {
 	}
 }
 
+// Durable terminal claims must still be cancelled after a daemon restart even
+// when the terminal state is not cancelled. The durable query covers every
+// terminal job state, so the poll cannot rely on worker-memory tracking to
+// decide whether the browser surface needs its teardown frame.
+func TestPollCancelsFailedMaterializationWithoutMemoryTrackingAndRetiresClaim(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "cancel-failed-after-restart", "navigated")
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("binding candidate = %+v, err=%v", candidate, err)
+	}
+	if err := jobs.Transition(ctx, candidate.JobID, job.StateAwaitingHuman, job.StateFailed, nil,
+		job.WithTerminalReason("failed while materializing")); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.offered) != 0 || len(b.materializationOffered) != 0 || len(b.materializationTracked) != 0 {
+		t.Fatalf("fixture unexpectedly has worker-memory tracking: offered=%v materialization=%v tracked=%v",
+			b.offered, b.materializationOffered, b.materializationTracked)
+	}
+
+	msgs, _ := runSync(t, b)
+	cancel := firstOfType(msgs, protocol.MsgCancel)
+	if cancel == nil || cancel.JobID != candidate.JobID {
+		t.Fatalf("poll cancel = %+v, want failed terminal job %s: %v", cancel, candidate.JobID, msgs)
+	}
+	if got, err := jobs.MaterializationClaimByBindingID(ctx, claim.BindingID); err != nil {
+		t.Fatal(err)
+	} else if got == nil || got.Phase == "abandoned" {
+		t.Fatalf("claim retired in the poll that announced cancel: %+v", got)
+	}
+
+	runSync(t, b)
+	retired, err := jobs.MaterializationClaimByBindingID(ctx, claim.BindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired == nil || retired.Phase != "abandoned" {
+		t.Fatalf("failed terminal claim must retire after cancel delivery, got %+v", retired)
+	}
+}
+
+// A durable terminal-claim backlog is a transport concern as well as a
+// cleanup concern: emitting every cancel in one poll can exceed the native
+// host's fatal result cap before any frame reaches the extension. The query
+// page must therefore emit a bounded prefix while leaving later claims live
+// for subsequent polls.
+func TestTerminalCancelBatchStaysWithinResultCapAndLeavesRemainder(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+
+	profiles, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
+		ConfiguredName: "terminal-cancel-batch", AuthorityDigest: "terminal-cancel-batch-authority",
+		AuthenticationClaimID: "terminal-cancel-batch-auth",
+	}})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("reconcile terminal-cancel profile: %v (%d)", err, len(profiles))
+	}
+	profile := profiles[0]
+	total := maxTerminalCancelsPerPoll + 1
+	for i := range total {
+		jobID := parkInstitutional(t, jobs, fmt.Sprintf("terminal-cancel-batch-%02d", i), handoffWork(), "")
+		candidateID := fmt.Sprintf("terminal-cancel-batch-candidate-%02d", i)
+		candidate, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+			ID: candidateID, JobID: jobID, JobAttemptRevision: 1,
+			InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+			RouteRevision: 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+			PreRouteSafetyKey: fmt.Sprintf("terminal-cancel-batch-pre-route-%02d", i),
+			SafetyDomainID:    fmt.Sprintf("terminal-cancel-batch-domain-%02d", i),
+			AdapterRevision:   "terminal-cancel-batch-adapter", EffectContractID: "terminal-cancel-batch-effect",
+			Status: "eligible",
+		})
+		if err != nil {
+			t.Fatalf("create candidate %d: %v", i, err)
+		}
+		claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+			CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
+			JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
+			RouteRevision: 1, MaterializationKind: "browser_tab",
+			LeaseUntil: time.Now().UTC().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("claim candidate %d: %v", i, err)
+		}
+		if _, err := jobs.S.DB().ExecContext(ctx,
+			`UPDATE materialization_claims SET phase='navigated' WHERE id=?`, claim.ID); err != nil {
+			t.Fatalf("mark claim %d navigated: %v", i, err)
+		}
+		if err := jobs.Cancel(ctx, jobID, job.TerminalReasonCancelledByUser); err != nil {
+			t.Fatalf("cancel job %d: %v", i, err)
+		}
+	}
+
+	msgs, raw := runSync(t, b)
+	cancelled := countType(msgs, protocol.MsgCancel)
+	if cancelled != maxTerminalCancelsPerPoll {
+		t.Fatalf("terminal cancel frames = %d, want bounded page %d", cancelled, maxTerminalCancelsPerPoll)
+	}
+	response, err := json.Marshal(map[string]any{"outbound": raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response) >= ipc.MaxResultBytes {
+		t.Fatalf("bounded terminal-cancel response = %d bytes, want < ipc.MaxResultBytes %d",
+			len(response), ipc.MaxResultBytes)
+	}
+	var liveClaims int
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM materialization_claims WHERE phase='navigated'`).Scan(&liveClaims); err != nil {
+		t.Fatal(err)
+	}
+	if liveClaims <= cancelled {
+		t.Fatalf("terminal-cancel poll emitted %d frames but left only %d live claims; remainder was not preserved",
+			cancelled, liveClaims)
+	}
+}
+
 // Looking old is not enough: a nonterminal job with an open browser handoff
 // still owns its navigated surface, so job_inactive must fail closed.
 func TestSurfaceCloseJobInactiveRefusesLiveHandoff(t *testing.T) {
@@ -6967,12 +7086,13 @@ func TestFocusHandoffsRefusesAnUnofferableJob(t *testing.T) {
 // through the strict decoder, so no single frame exceeds
 // protocol.MaxBrowserMessageBytes, (b) at most one max-size solicited
 // response rides one poll (job_offer/handoff-type replies are one-at-a-time
-// correlated calls), and (c) every batch the daemon can otherwise grow
-// unboundedly is capped: the offer and focus batches by
-// maxOutstandingOffers/maxFocusFramesPerPoll, and the claim_observation_ack
-// batch by maxClaimObservationsPerPoll (the extension MUST send at most
-// this many queued claim_observation frames per poll,
-// dev/active/claim-observation-protocol.md §5). Loosening any of those
+// correlated calls), and
+// (c) every batch the daemon can otherwise grow unboundedly is capped: the
+// offer, focus, and durable terminal-cancel batches by
+// maxOutstandingOffers/maxFocusFramesPerPoll/maxTerminalCancelsPerPoll, and
+// the claim_observation_ack batch by maxClaimObservationsPerPoll (the
+// extension MUST send at most this many queued claim_observation frames per
+// poll, dev/active/claim-observation-protocol.md §5). Loosening any of those
 // trips this test.
 func TestSyncResponseFitsResultCap(t *testing.T) {
 	b := &Bridge{}
@@ -7013,11 +7133,14 @@ func TestSyncResponseFitsResultCap(t *testing.T) {
 	}
 	// Cancel and focus frames carry only a job id and an empty payload, so
 	// sizing every batched frame as a maximal offer is deliberately pessimistic.
-	batched := (maxOutstandingOffers+maxFocusFramesPerPoll)*len(offer) + maxClaimObservationsPerPoll*len(ack)
+	batched := (maxOutstandingOffers+maxFocusFramesPerPoll+maxTerminalCancelsPerPoll)*len(offer) +
+		maxClaimObservationsPerPoll*len(ack)
 	worst := protocol.MaxBrowserMessageBytes + batched
 	if worst > ipc.MaxResultBytes {
-		t.Fatalf("worst-case sync response %d bytes exceeds ipc.MaxResultBytes %d: one max-size solicited response (%d) + %d offer/focus frames of %d bytes + %d claim_observation_ack frames of %d bytes",
-			worst, ipc.MaxResultBytes, protocol.MaxBrowserMessageBytes, maxOutstandingOffers+maxFocusFramesPerPoll, len(offer), maxClaimObservationsPerPoll, len(ack))
+		t.Fatalf("worst-case sync response %d bytes exceeds ipc.MaxResultBytes %d: one max-size solicited response (%d) + %d offer/focus/cancel frames of %d bytes + %d claim_observation_ack frames of %d bytes",
+			worst, ipc.MaxResultBytes, protocol.MaxBrowserMessageBytes,
+			maxOutstandingOffers+maxFocusFramesPerPoll+maxTerminalCancelsPerPoll, len(offer),
+			maxClaimObservationsPerPoll, len(ack))
 	}
 }
 
@@ -14198,5 +14321,45 @@ func TestTerminalClaimSurvivesThePollThatAnnouncesIt(t *testing.T) {
 	}
 	if retired == nil || retired.Phase != "abandoned" {
 		t.Fatalf("the poll after delivery must retire the row, got %+v", retired)
+	}
+}
+
+// A browser-reported cancellation suppresses the daemon's redundant cancel
+// frame, but suppression is not delivery: the extension sends
+// `provider_outcome: cancelled` BEFORE its own asynchronous close, and that
+// close can be refused while an institutional effect permit vetoes teardown.
+// Retiring on the wider marker abandoned the claim behind a tab papio had
+// never told anyone to close — the litter this mechanism exists to prevent,
+// reached from the opposite direction.
+func TestSuppressedCancelDoesNotAuthorizeRetirement(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "suppressed-cancel", "navigated")
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("binding candidate = %+v, err=%v", candidate, err)
+	}
+	if err := jobs.Cancel(ctx, candidate.JobID, job.TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+	// Exactly what the provider_outcome path leaves behind: no frame owed, and
+	// no proof the browser ever heard anything.
+	b.mu.Lock()
+	b.cancelSent[candidate.JobID] = true
+	b.mu.Unlock()
+
+	for i := range 2 {
+		msgs, _ := runSync(t, b)
+		if cancel := firstOfType(msgs, protocol.MsgCancel); cancel != nil {
+			t.Fatalf("poll %d re-emitted a suppressed cancel: %v", i, msgs)
+		}
+	}
+	held, err := jobs.MaterializationClaimByBindingID(ctx, claim.BindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held == nil || held.Phase == "abandoned" {
+		t.Fatalf("a claim whose browser was never told must not be retired, got %+v", held)
 	}
 }

@@ -817,11 +817,16 @@ func newActionsCommand(opt *options) *cobra.Command {
 //
 // It uses app.HumanActionNextStepFor so a replacement manual-download action
 // cannot inherit its old handoff's command just because both require a login.
+// The live database measured all 34 currently-open manual_download rows with a
+// non-empty blocker (29 landing_page, 4 paywall, 1 anti_bot) on 2026-08-21, so
+// this gap is not currently firing in the field. Keep the guard below
+// defensive anyway: producers such as browser adoption can create an
+// unblocked action, and a real next step must not disappear.
 func accessHint(action job.HumanAction) string {
-	if action.BlockedBy == "" {
+	next := app.HumanActionNextStepFor(action)
+	if action.BlockedBy == "" && next.Instruction == "" && next.Command == "" {
 		return ""
 	}
-	next := app.HumanActionNextStepFor(action)
 	switch {
 	case next.Instruction != "" && next.Command != "" && next.RequiresInstitutionalLogin:
 		return "\t'" + next.Command + "', sign in to your institution, then " + next.Instruction

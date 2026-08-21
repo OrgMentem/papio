@@ -105,18 +105,17 @@ func TestExplainWithOpenActionUsesReplacementManualDownload(t *testing.T) {
 	if got.Category != "manual_download" {
 		t.Fatalf("category = %q, want manual_download", got.Category)
 	}
-	for _, want := range []string{"Sign in at your institution", "download the PDF yourself"} {
+	for _, want := range []string{"Sign in at your institution", "`papio actions open`", "download the PDF yourself"} {
 		if !strings.Contains(got.Guidance, want) {
 			t.Fatalf("guidance = %q, want %q", got.Guidance, want)
 		}
 	}
-	if strings.Contains(got.Guidance, "papio actions open") {
-		t.Fatalf("manual-download guidance names an inapplicable command: %q", got.Guidance)
-	}
 
 	wait := WaitGuidanceWithOpenAction("awaiting_human", "login_required", "", config.ModeDelegated, actions, cfg)
-	if !strings.Contains(wait, "[manual_download]") || strings.Contains(wait, "papio actions open") {
-		t.Fatalf("wait guidance = %q", wait)
+	for _, want := range []string{"[manual_download]", "`papio actions open`", "download the PDF yourself"} {
+		if !strings.Contains(wait, want) {
+			t.Fatalf("wait guidance = %q, want %q", wait, want)
+		}
 	}
 }
 

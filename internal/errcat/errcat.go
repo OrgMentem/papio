@@ -133,8 +133,16 @@ func explainOpenAction(action job.HumanAction) Explanation {
 			break
 		}
 		if next.RequiresInstitutionalLogin {
+			if next.Command != "" {
+				return Explanation{"manual_download",
+					"Sign in at your institution in the browser, then run `" + next.Command + "` to " + next.Instruction + "."}
+			}
 			return Explanation{"manual_download",
 				"Sign in at your institution in the browser, then " + next.Instruction + "."}
+		}
+		if next.Command != "" {
+			return Explanation{"manual_download",
+				"Run `" + next.Command + "` to " + next.Instruction + ". No login is required."}
 		}
 		return Explanation{"manual_download", "You need to " + next.Instruction + ". No login is required."}
 	case "validation_error":

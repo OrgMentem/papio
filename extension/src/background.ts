@@ -343,6 +343,39 @@ const CLAIM_OBSERVATION_EVENT_KINDS: Record<
   owner_closed: true,
   navigation_error: true,
 };
+/** Defensive container check for the value returned by chrome.storage.session.
+ * Entry validation stays per-record so one torn or foreign entry cannot erase
+ * valid observations that were persisted beside it. */
+function isClaimObservationOutboxRecord(
+  value: unknown,
+): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isClaimObservationOutboxEntry(
+  observationID: string,
+  value: unknown,
+): value is ClaimObservationOutboxEntry {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return false;
+  const entry = value as Partial<ClaimObservationOutboxEntry>;
+  return (
+    entry.observation_id === observationID &&
+    typeof entry.job_id === "string" &&
+    typeof entry.authentication_claim_id === "string" &&
+    typeof entry.binding_id === "string" &&
+    typeof entry.browser_holder_generation === "number" &&
+    Number.isFinite(entry.browser_holder_generation) &&
+    typeof entry.gate_occurrence_id === "string" &&
+    typeof entry.event_ordinal === "number" &&
+    Number.isFinite(entry.event_ordinal) &&
+    typeof entry.event_kind === "string" &&
+    CLAIM_OBSERVATION_EVENT_KINDS[
+      entry.event_kind as ClaimObservationPayload["event_kind"]
+    ] === true
+  );
+}
+
 /** States this worker writes into a live correlation record. Anything else in
  * storage is stale or hostile and must be dropped — repairing it could steer
  * bytes into a grab this session no longer owns. */
@@ -902,6 +935,29 @@ function isCleanNonBrowserMime(mime: string | undefined): boolean {
     mime === "application/zip" ||
     mime === "application/x-7z-compressed" ||
     mime === "application/gzip"
+  );
+}
+
+/** True only when a `tabs.get` rejection PROVES the tab is gone.
+ *
+ * Every other rejection — an invalidated extension context, a torn-down
+ * window mid-call, a browser shutting down — means "unknown", and unknown must
+ * never be spent as evidence. Absence is what authorizes reporting a claim's
+ * surface dead and deleting its ledger record, and that record is the only
+ * proof the surface ever existed: mistaking a transient failure for absence
+ * frees an institution's sign-in slot out from under a live tab and destroys
+ * the evidence needed to notice. Chrome and Firefox word the same condition
+ * differently, and papio ships both.
+ */
+function isTabAbsenceRejection(reason: unknown): boolean {
+  const message =
+    reason instanceof Error
+      ? reason.message
+      : typeof reason === "string"
+        ? reason
+        : "";
+  return (
+    /no tab with id/iu.test(message) || /invalid tab id/iu.test(message)
   );
 }
 export interface PdfGrabCorrelation {
@@ -2394,6 +2450,12 @@ export class Bridge {
   /** Lazily-loaded durable ledger of broker tabs papio created, migrated to
    * URL-free birth certificates on first touch (Slice 2b). */
   private tabLedgerCache: Record<string, SurfaceBirthRecord> | undefined;
+  /** IDs most recently counted from the durable ledger. A worker restart
+   * recovers this set during the first badge paint; it lets navigation/removal
+   * repaint only when a surface that actually contributed a human sign-in
+   * count stops being a wall, rather than turning every tab event into a
+   * storage scan. */
+  private readonly lastBadgedAuthWallTabs = new Set<number>();
   /** Bumped synchronously (before any async work) by the onActivated/
    * onUpdated listeners whenever Chrome reports a tab change — activation,
    * pin, or navigation alike. closeOwnedTab captures this per-tab counter
@@ -2482,6 +2544,10 @@ export class Bridge {
     string,
     ClaimObservationOutboxEntry
   >();
+  /** Chrome storage writes have no ordering guarantee; serialize snapshots so
+   * a late older write cannot resurrect a deleted observation. */
+  private claimObservationOutboxSaveChain: Promise<void> = Promise.resolve();
+
   /** Resolves once managed-state load, ledger migration, group/window
    * adoption, and close-tombstone replay have all completed (Slice 2b's
    * `surfaceReady` barrier). Awaited by native job offers, runtime opens,
@@ -4070,7 +4136,15 @@ export class Bridge {
         let tab: TabInfo;
         try {
           tab = await this.deps.tabs.get(tabID);
-        } catch {
+        } catch (e) {
+          if (!isTabAbsenceRejection(e)) {
+            // Unknown, not gone. Spending a transient rejection as proof of
+            // death would free the institution's slot out from under a live
+            // tab AND delete the only record of it, so nothing could notice.
+            // Leaving the entry intact costs one more pass; it is re-evaluated
+            // on the next reconcile.
+            continue;
+          }
           // The surface is GONE and this record is the only proof it existed.
           // Deleting it in silence stranded the claim behind it: a tab closed
           // with no listener alive (an extension reload, a browser crash)
@@ -4413,12 +4487,11 @@ export class Bridge {
     // every caller of consultAuthenticationClaim/emitClaimObservation
     // awaits surfaceReady, and so does onJobOffer for unrelated reasons;
     // a job_offer delivered after hello_ack but before the replay's own
-    // correlated ack would block behind this barrier while that ack
-    // queues behind the job_offer on the SAME serialized chain. Schedule
-    // the drain after the barrier resolves instead — surfaceReady is free
-    // immediately, and outboxReplayed (awaited only by lease-renewing
-    // observation emission, never job offers or reads) tracks the replay
-    // separately.
+    // correlated ack would block behind this barrier while that ack queues
+    // behind the job_offer on the SAME serialized chain. Schedule the drain
+    // after the barrier resolves instead — surfaceReady is free immediately,
+    // and outboxReplayed (awaited only by lease-renewing observation emission,
+    // never job offers or reads) tracks the replay separately.
     this.scheduleObservationOutboxDrain();
   }
 
@@ -4427,28 +4500,17 @@ export class Bridge {
    * hand-edited value is dropped rather than trusted, matching the other
    * `deps.*Correlations`-style hydration paths in this file. */
   private async hydrateClaimObservationOutbox(): Promise<void> {
-    if (this.deps.claimObservationOutbox === undefined) return;
-    let stored: Record<string, ClaimObservationOutboxEntry>;
+    const outbox = this.deps.claimObservationOutbox;
+    if (outbox === undefined) return;
+    let stored: unknown;
     try {
-      stored = await this.deps.claimObservationOutbox.get();
+      stored = await outbox.get();
     } catch {
       return;
     }
+    if (!isClaimObservationOutboxRecord(stored)) return;
     for (const [observationID, entry] of Object.entries(stored)) {
-      if (
-        typeof entry !== "object" ||
-        entry === null ||
-        entry.observation_id !== observationID ||
-        typeof entry.job_id !== "string" ||
-        typeof entry.authentication_claim_id !== "string" ||
-        typeof entry.binding_id !== "string" ||
-        typeof entry.browser_holder_generation !== "number" ||
-        typeof entry.gate_occurrence_id !== "string" ||
-        typeof entry.event_ordinal !== "number" ||
-        CLAIM_OBSERVATION_EVENT_KINDS[entry.event_kind] !== true
-      ) {
-        continue;
-      }
+      if (!isClaimObservationOutboxEntry(observationID, entry)) continue;
       this.claimObservationOutboxEntries.set(observationID, entry);
     }
   }
@@ -5612,7 +5674,16 @@ export class Bridge {
           unknown_count: 0,
         }),
       );
+      // Announce the drive the moment it actually starts. The queued accept
+      // above declared `queued`, which opens no epoch, so without this the
+      // daemon would never charge a drive that began here — and under
+      // HANDOFF_DRIVE_LIMIT=1 the queue is the NORMAL route to a drive, not an
+      // edge. Trading over-charging for under-charging would leave a genuinely
+      // runaway paper immortal instead of retiring a healthy one. A repeat
+      // accept is safe by construction: the daemon folds an acknowledgement
+      // into an already-open epoch within lease rather than opening a second.
       this.registerHandoffDrive(request.jobID, tabID);
+      this.sendJobAccept(request.jobID);
       if (request.surfaceFallback === true) await this.surfaceWorkTab(tabID);
       this.wakeEffectGovernor();
     }
@@ -5726,6 +5797,8 @@ export class Bridge {
       // twice, and add back the ones parked without a tab - a detached
       // auth_pending paper still needs the human to finish that sign-in.
       const wallTabs = await this.authWallSurfaceTabs();
+      this.lastBadgedAuthWallTabs.clear();
+      for (const tabID of wallTabs) this.lastBadgedAuthWallTabs.add(tabID);
       const pendingAuthJobs = this.store.activeJobs.filter(
         (job) => job.status === "auth_pending",
       );
@@ -7226,9 +7299,18 @@ export class Bridge {
           trigger,
         );
         if (consult.kind === "navigate_existing") {
-          const focused = await this.focusClaimOwnerTab(consult.ownerTabHint);
-          if (!focused || consult.ownerTabHint === undefined) {
-            this.reportDeadClaimSurface(jobID, consult.ownerBindingID);
+          const ownerTabHint = consult.ownerTabHint;
+          const focused =
+            ownerTabHint !== undefined &&
+            (await this.focusClaimOwnerTab(ownerTabHint));
+          if (!focused) {
+            // Only a proven-absent owner tab authorizes retiring the claim.
+            // An unproven failure still parks this job — it cannot proceed
+            // without the surface — but it reports nothing, because a false
+            // loss report frees the institution and invites the duplicate
+            // sign-in tab this mechanism exists to prevent.
+            if (await this.claimOwnerSurfaceGone(consult.ownerTabHint))
+              this.reportDeadClaimSurface(jobID, consult.ownerBindingID);
             await this.parkForEngagement(jobID);
             return failure(
               "handoff_unavailable",
@@ -7237,19 +7319,21 @@ export class Bridge {
           }
           await this.update((s) =>
             patchJob(s, jobID, {
-              tab_id: consult.ownerTabHint as number,
+              tab_id: ownerTabHint,
               status: "auth_pending",
               engagement_required: false,
             }),
           );
-          this.registerHandoffDrive(jobID, consult.ownerTabHint);
+          this.registerHandoffDrive(jobID, ownerTabHint);
           return { ok: true, opened: true };
         }
         if (consult.kind === "focus_owner") {
           // Same proof, other branch: the sibling this job was told to wait
           // behind has no surface, so waiting is waiting for nothing.
           if (!(await this.focusClaimOwnerTab(consult.ownerTabHint))) {
-            this.reportDeadClaimSurface(jobID, consult.ownerBindingID);
+            // Same proof requirement, other branch.
+            if (await this.claimOwnerSurfaceGone(consult.ownerTabHint))
+              this.reportDeadClaimSurface(jobID, consult.ownerBindingID);
             await this.parkForEngagement(jobID);
             return failure(
               "handoff_unavailable",
@@ -8022,6 +8106,29 @@ export class Bridge {
     );
   }
 
+  /** True only when a claim's owner tab is PROVEN not to exist.
+   *
+   * `focusClaimOwnerTab` answers "did I focus it", which is a different
+   * question: it returns false for a missing `owner_tab_hint` (the field is
+   * optional in the protocol), for a transient `tabs.get` rejection, and for a
+   * focus that simply failed. Reporting `owner_closed` on that answer abandons
+   * a live binding and frees its institution for a duplicate sign-in surface —
+   * the exact duplication this whole mechanism exists to prevent, arriving
+   * through the repair path. Absence, or a hint that resolves to some other
+   * tab, is proof; everything else is unknown and reports nothing.
+   */
+  private async claimOwnerSurfaceGone(
+    ownerTabHint: number | undefined,
+  ): Promise<boolean> {
+    if (ownerTabHint === undefined) return false;
+    try {
+      const tab = await this.deps.tabs.get(ownerTabHint);
+      return tab.id !== ownerTabHint;
+    } catch (e) {
+      return isTabAbsenceRejection(e);
+    }
+  }
+
   /** navigate_existing/focus_owner both point at a claim's already-live
    * owner tab. Re-proves `ownerTabHint` live before touching it — the
    * shipped renavigation fence (plan lines 175-184) — a stale hint is never
@@ -8090,11 +8197,18 @@ export class Bridge {
     );
   }
 
-  private persistClaimObservationOutbox(): void {
-    if (this.deps.claimObservationOutbox === undefined) return;
-    void this.deps.claimObservationOutbox
-      .set(Object.fromEntries(this.claimObservationOutboxEntries))
-      .catch(() => {});
+  /** Persist the mutation-time snapshot after all earlier snapshots settle.
+   * Callers that require durability may await the returned promise; the
+   * best-effort mutation sites intentionally ignore a failed storage write. */
+  private persistClaimObservationOutbox(): Promise<void> {
+    const outbox = this.deps.claimObservationOutbox;
+    if (outbox === undefined) return Promise.resolve();
+    const snapshot = Object.fromEntries(this.claimObservationOutboxEntries);
+    const save = this.claimObservationOutboxSaveChain.then(() =>
+      outbox.set(snapshot),
+    );
+    this.claimObservationOutboxSaveChain = save.catch(() => {});
+    return save.catch(() => {});
   }
 
   /** §2.2/§5: append one claim_observation to the durable outbox and
@@ -8254,6 +8368,20 @@ export class Bridge {
             : 1,
       )
       .slice(0, 32);
+    if (entries.length === 0) return;
+    // Negotiate BEFORE reading a generation off any entry. `requestNative`
+    // establishes the port and waits for `hello_ack` itself, so reading
+    // `lastKnownBrowserHolderGeneration` above that call captured whatever a
+    // fresh worker happened to have — a rehydrated stale value, or nothing at
+    // all, falling back to the entry's own historical generation. The daemon
+    // then answered `stale` and the branch below discarded the entry as
+    // terminal. `bootstrapSurfaceLifecycle` schedules this drain before the
+    // first ack lands, so that race WAS the startup path, which is why
+    // `claim_observation_journal` stayed empty through every restart this was
+    // built to survive. Stamping at drain instead of enqueue was necessary and
+    // not sufficient: drain has to happen after the handshake it stamps from.
+    // A failure here leaves the whole backlog queued for the next drain.
+    if (!(await this.ensureConnected())) return;
     for (const entry of entries) {
       const { job_id: jobID, ...payload } = entry;
       // The generation on the wire is the SENDER's, not the subject's. The
@@ -13986,25 +14114,21 @@ export class Bridge {
   /** Acknowledge one offer, telling the daemon whether this is a DRIVE or a
    * place in this worker's queue.
    *
-   * The disposition is read from the job's own status rather than passed per
-   * call site, because that status IS the answer and there are seventeen call
-   * sites: a boolean argument would drift at the first one somebody forgot.
-   * `queued` is exactly the state HANDOFF_DRIVE_LIMIT produces when a paper
-   * waits behind another paper's drive, and releasing that queue without
-   * driving is what QUEUED_HANDOFF_RELEASE_MS does.
-   *
-   * The daemon charges a fruitless drive epoch per driving accept and quiesces
-   * a paper after three, so a queued accept counted as a drive retires a paper
-   * for waiting its turn — 78 of them, measured live on 2026-08-21. An unknown
-   * or not-yet-written status omits the field, which the daemon reads as
-   * driving: the pre-existing behaviour, so a mis-ordered write can only ever
-   * be as wrong as today, never worse.
+   * The authority is `handoffDrives` — the registry of slots this worker
+   * actually holds — and never the job's persisted status. `status` is a proxy
+   * that reads backwards on the path that matters: the governor queue behind
+   * `HANDOFF_DRIVE_LIMIT` persists "accepted" (it *will* be driven) while
+   * `enqueueHandoffDrive` has only queued it, so a status-derived disposition
+   * reported the drive-slot wait — the exact wait that burned 438 accepts
+   * across 62 papers — as a drive. Every caller either registers a drive
+   * immediately before acking or enqueues one, so the registry answers
+   * correctly at every site by construction.
    */
   private sendJobAccept(jobID: string): boolean {
-    const queued = findByJob(this.store, jobID)?.status === "queued";
+    const driving = this.handoffDrives.has(jobID);
     return this.send(
       "job_accept",
-      queued ? { disposition: "queued" } : {},
+      driving ? {} : { disposition: "queued" },
       jobID,
     );
   }
@@ -15807,6 +15931,16 @@ export class Bridge {
           change.url ?? tab.url,
           tab.openerTabId,
         );
+      // After a worker restart this tab has no job mirror, so only the durable
+      // wall-count cache can tell us that this navigation may clear a badge
+      // the operator is looking at.
+      if (
+        this.lastBadgedAuthWallTabs.has(tabID) &&
+        (change.url !== undefined || change.status === "complete") &&
+        !isAuthenticationURL(change.url ?? tab.url ?? "")
+      ) {
+        await this.syncConnectionBadge();
+      }
       return;
     }
     const staleRecoveryNavigationInFlight =
@@ -18390,6 +18524,7 @@ export class Bridge {
     const pageCaptureWaiter = this.pageCaptureLoadWaiters.get(tabID);
     if (pageCaptureWaiter !== undefined) pageCaptureWaiter(false);
     this.authCountedTabs.delete(tabID);
+    const wasBadgedAuthWall = this.lastBadgedAuthWallTabs.delete(tabID);
     const ledgerRecord = this.tabLedgerCache?.[String(tabID)];
     const pendingClose = ledgerRecord?.pending_close;
     const authorizedClose = pendingClose !== undefined;
@@ -18403,7 +18538,6 @@ export class Bridge {
     // owned, and MV3 sleeps the worker after ~30s idle, so a sign-in tab
     // abandoned minutes later is the common case, not the edge one.
     const durableClaim = ledgerRecord?.claim;
-    void this.forgetLedgeredTab(tabID);
     const job = findByTab(this.store, tabID);
     if (!job) {
       // job_inactive detaches browser-local job state BEFORE asking to close.
@@ -18412,8 +18546,12 @@ export class Bridge {
       // returning early. The reducer consumes the one-use token and retires
       // the exact authentication-entry binding; releasing it at authorization
       // time would let a sibling open before this surface actually closed.
+      // A claim_abandoned tombstone already has its owner_closed counterpart
+      // in the outbox; only the job_inactive tombstone (or no tombstone) needs
+      // this physical-loss report.
       if (
-        pendingClose?.disposition === "job_inactive" &&
+        pendingClose?.disposition !== "claim_abandoned" &&
+        ledgerRecord?.ceded !== true &&
         ledgerJobID !== undefined &&
         ownerBindingID !== undefined &&
         durableClaim !== undefined
@@ -18429,8 +18567,14 @@ export class Bridge {
           "owner_closed",
         );
       }
+      // The observation MUST be enqueued before this deletion: after an
+      // extension update this birth record is the only durable proof of the
+      // claim, and a worker crash between the two must not lose the report.
+      void this.forgetLedgeredTab(tabID);
+      if (wasBadgedAuthWall) await this.syncConnectionBadge();
       return;
     }
+    void this.forgetLedgeredTab(tabID);
     // Slice 3 owner_closed: the owning surface closed without success — a
     // deliberate daemon-authorized close (surface_close_request already told
     // the daemon under its own disposition) and a job that already reached

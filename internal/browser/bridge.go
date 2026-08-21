@@ -159,6 +159,10 @@ const (
 	// The remainder stays queued for the next ordinary poll. Pinned by
 	// TestSyncResponseFitsResultCap.
 	maxFocusFramesPerPoll = 32
+	// maxTerminalCancelsPerPoll mirrors the durable query cap. A terminal-claim
+	// backlog must leave the remainder for a later poll rather than make the
+	// fail-fatal browser.sync transport exceed ipc.MaxResultBytes.
+	maxTerminalCancelsPerPoll = job.TerminalMaterializationJobIDLimit
 	// maxClaimObservationsPerPoll bounds how many queued claim_observation
 	// frames one Sync poll answers with acks, mirroring
 	// maxFocusFramesPerPoll's rationale: the extension MUST send at most
@@ -353,7 +357,17 @@ type Bridge struct {
 	// demoted session or pollute the new holder's bookkeeping.
 	epoch      int64
 	offered    map[string]bool // handoff jobs offered to the current holder
-	cancelSent map[string]bool // jobs a daemon-side cancel was already announced for
+	cancelSent map[string]bool // jobs a daemon-side cancel frame need not be emitted for
+	// cancelAnnounced is the strictly narrower fact that AUTHORIZES retiring a
+	// terminal job's materialization claim: the browser either received this
+	// session's cancel frame, or reported the closure itself. cancelSent is not
+	// that fact — `provider_outcome: cancelled` sets it to suppress a
+	// redundant frame while the extension's own close may still be refused
+	// (an institutional effect permit vetoes teardown mid-flight), leaving a
+	// live tab. Retiring on the wider marker abandoned the claim behind a tab
+	// papio had never told anyone to close, which is the litter this whole
+	// mechanism exists to prevent.
+	cancelAnnounced map[string]bool
 	// A replayed auth return must not make the same holder open duplicate tabs.
 	authReleased map[int64]bool
 	// reofferPending prioritizes jobs released by the institutional-session
@@ -630,6 +644,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		Features:               required,
 		offered:                map[string]bool{},
 		cancelSent:             map[string]bool{},
+		cancelAnnounced:        map[string]bool{},
 		pending:                map[string]*browserSession{},
 		authReleased:           map[int64]bool{},
 		reofferPending:         map[string]bool{},
@@ -858,6 +873,7 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	b.holder = session
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
+	b.cancelAnnounced = map[string]bool{}
 	b.authReleased = map[int64]bool{}
 	b.reofferPending = map[string]bool{}
 	b.materializationOffered = map[string]materializationOffer{}
@@ -2999,7 +3015,10 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			log.Printf("papio: resolving cancelled handoff: %v", err)
 			return nil, nil
 		}
-		b.cancelSent[msg.JobID] = true // we initiated nothing to echo back
+		// The browser closed the tab and told us, so there is nothing to echo
+		// back AND the surface is provably gone: both markers are earned.
+		b.cancelSent[msg.JobID] = true
+		b.cancelAnnounced[msg.JobID] = true
 		b.clearMaterializationTracking(msg.JobID)
 		if err := b.jobs.Cancel(ctx, msg.JobID, job.TerminalReasonBrowserCancelled); err != nil {
 			log.Printf("papio: cancelling browser job: %v", err)
@@ -3820,6 +3839,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	b.holder = session
 	b.offered = map[string]bool{}
 	b.cancelSent = map[string]bool{}
+	b.cancelAnnounced = map[string]bool{}
 	b.materializationTracked = map[string]bool{}
 	b.authReleased = map[int64]bool{}
 	b.reofferPending = map[string]bool{}
@@ -7266,6 +7286,7 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		if wasOffered {
 			delete(b.offered, candidate.row.ID)
 			delete(b.cancelSent, candidate.row.ID)
+			delete(b.cancelAnnounced, candidate.row.ID)
 		} else {
 			available--
 		}
@@ -9649,7 +9670,25 @@ func (b *Bridge) RunSweeper(ctx context.Context, interval time.Duration) error {
 
 // poll offers outstanding handoff jobs (once per hello-session), announces
 // daemon-side cancels, and drains focus requests for the current holder.
-func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescriptor, schedulingUnavailable bool) ([]json.RawMessage, error) {
+func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescriptor, schedulingUnavailable bool) (out []json.RawMessage, err error) {
+	// A cancel frame counts as announced only if this poll's response actually
+	// reaches the caller. Any later frame in this same poll can fail, and Sync
+	// then discards `out` entirely and returns the error — so marking the
+	// announcement inline left `cancelSent` true for a frame the browser never
+	// saw, suppressing every future re-emission, while `cancelAnnounced` let
+	// the claim retire behind a tab that is still open. Applying both markers
+	// only on the success path keeps the retirement gate honest by
+	// construction rather than by remembering to roll back at each return.
+	announced := map[string]bool{}
+	defer func() {
+		if err != nil {
+			return
+		}
+		for id := range announced {
+			b.cancelSent[id] = true
+			b.cancelAnnounced[id] = true
+		}
+	}()
 	if b.jobs != nil {
 		if _, err := b.jobs.ReconcileMaterializationClaims(ctx, b.now()); err != nil {
 			b.materializationClaimReconcileUnavailable = true
@@ -9708,7 +9747,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		b.reofferRanThisSync[profile] = true
 	}
 	var awaiting []job.Row
-	var err error
+	// err and out are the named results; poll's deferred cancel-announcement
 	if b.listAwaitingHuman != nil {
 		awaiting, err = b.listAwaitingHuman(ctx, 200)
 	} else {
@@ -9760,7 +9799,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	// that window must abort this poll — its offers would go to a demoted
 	// session and its bookkeeping would pollute the new holder's maps.
 	epoch := b.epoch
-	var out []json.RawMessage
+	// commit reads err, so neither may be shadowed here.
 	for i := range awaiting {
 		row := awaiting[i]
 		// Directory-scan adoption: a file the user (or a steered Chrome
@@ -10081,15 +10120,15 @@ jobLoop:
 	for id := range b.materializationTracked {
 		cancelIDs[id] = true
 	}
-	// Terminal jobs whose cancel this session has ALREADY delivered. Read before
-	// the loop below sets cancelSent, so a job appears here one poll after it was
-	// told — never in the same poll that emits its frame.
+	// Terminal jobs whose cancel the browser has ALREADY been told about, read
+	// before this poll records its own announcements, so a job appears here one
+	// poll after it was told — never in the same poll that emits its frame.
 	var terminalCancelled []string
 	if terminalIDs, terminalErr := b.jobs.TerminalMaterializationJobIDs(ctx); terminalErr != nil {
 		log.Printf("papio: reading terminal materialization jobs for browser cancellation: %v", terminalErr)
 	} else {
 		for _, id := range terminalIDs {
-			if b.cancelSent[id] {
+			if b.cancelAnnounced[id] {
 				terminalCancelled = append(terminalCancelled, id)
 			}
 			cancelIDs[id] = true
@@ -10122,14 +10161,14 @@ jobLoop:
 				continue
 			}
 		}
-		if trackedMaterialization && (row.State != job.StateAwaitingHuman || !actionPresent) {
-			if !b.cancelSent[id] {
+		if (trackedMaterialization || job.Terminal(row.State)) && (row.State != job.StateAwaitingHuman || !actionPresent) {
+			if !b.cancelSent[id] && !announced[id] {
 				frame, frameErr := b.frame(protocol.MsgCancel, id, protocol.EmptyPayload{})
 				if frameErr != nil {
 					return nil, frameErr
 				}
 				out = append(out, frame)
-				b.cancelSent[id] = true
+				announced[id] = true
 			}
 			b.clearMaterializationTracking(id)
 			continue
@@ -10140,13 +10179,13 @@ jobLoop:
 			}
 			continue
 		}
-		if !b.cancelSent[id] {
+		if !b.cancelSent[id] && !announced[id] {
 			frame, frameErr := b.frame(protocol.MsgCancel, id, protocol.EmptyPayload{})
 			if frameErr != nil {
 				return nil, frameErr
 			}
 			out = append(out, frame)
-			b.cancelSent[id] = true
+			announced[id] = true
 		}
 		b.clearMaterializationTracking(id)
 	}
@@ -10585,12 +10624,14 @@ func (b *Bridge) serviceMaterializationCandidate(
 	}
 	if newCandidate {
 		delete(b.cancelSent, id)
+		delete(b.cancelAnnounced, id)
 	}
 	if tracked && !offerState.ExpiresAt.IsZero() && !offerState.ExpiresAt.After(now) {
 		delete(b.materializationOffered, id)
 		delete(b.materializationTracked, id)
 		tracked = false
 		delete(b.cancelSent, id)
+		delete(b.cancelAnnounced, id)
 	}
 	expiresAt := now.Add(b.actionExpiry())
 	if tracked && !offerState.ExpiresAt.IsZero() {

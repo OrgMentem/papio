@@ -440,7 +440,7 @@ function makeHarness(
       const emptied = new Set<number>();
       for (const tabID of tabIds) {
         const tab = tabs.snapshot(tabID);
-        if (tab === undefined) throw new Error("no such tab");
+        if (tab === undefined) throw new Error(`No tab with id: ${tabID}.`);
         if (tab.groupId !== undefined && tab.groupId >= 0 && tab.groupId !== id)
           emptied.add(tab.groupId);
         tabs.patch(tabID, { groupId: id });
@@ -1912,6 +1912,58 @@ test("a driving accept omits the disposition and a queued one names it", async (
   expect(cold.backend.store.activeJobs[0]?.status).toBe("queued");
   const queued = cold.frames().find((f) => f.type === "job_accept");
   expect(queued?.payload).toEqual({ disposition: "queued" });
+});
+
+// The branch that actually produced the incident. Auth evidence for the
+// resolver origin makes the second offer `governorQueued`, which persists
+// status "accepted" — it WILL be driven — while `enqueueHandoffDrive` has only
+// queued it. Deriving the disposition from that status therefore reported the
+// drive-slot wait as a drive, and the drive-slot wait is precisely what
+// HANDOFF_DRIVE_LIMIT=1 manufactures: 438 accepts across 62 papers, 77 of them
+// never holding a browser surface at all. The drive registry is the authority.
+test("a paper queued behind the single drive slot says queued, not driving", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+
+  await h.port.inbound(jobOffer("job_drive_owner"));
+  expect(h.tabs.created).toHaveLength(1);
+  const driving = h
+    .frames()
+    .find((f) => f.type === "job_accept" && f.job_id === "job_drive_owner");
+  expect(driving?.payload).toEqual({});
+
+  await h.port.inbound(jobOffer("job_drive_waiter"));
+  // No second surface: the slot is taken. The job is "accepted" because it is
+  // in the drive queue, and that is exactly the status the old predicate read
+  // as a drive.
+  expect(h.tabs.created).toHaveLength(1);
+  expect(
+    h.backend.store.activeJobs.find((j) => j.job_id === "job_drive_waiter"),
+  ).toMatchObject({ status: "accepted", tab_id: -1 });
+  const waiter = h
+    .frames()
+    .find((f) => f.type === "job_accept" && f.job_id === "job_drive_waiter");
+  expect(waiter?.payload).toEqual({ disposition: "queued" });
+
+  // And the drive must still be charged when it actually begins. Reporting the
+  // wait honestly is only half of it: if the dequeued drive never announces
+  // itself, no epoch ever opens and a genuinely runaway paper becomes
+  // immortal — the same accounting failure with the sign flipped.
+  const ownerTab = h.backend.store.activeJobs.find(
+    (j) => j.job_id === "job_drive_owner",
+  )?.tab_id;
+  expect(ownerTab).toBeGreaterThanOrEqual(0);
+  await h.tabs.onRemoved.emit(ownerTab as number, { isWindowClosing: false });
+  expect(h.tabs.created).toHaveLength(2);
+  const drivingWaiter = h
+    .frames()
+    .filter((f) => f.type === "job_accept" && f.job_id === "job_drive_waiter")
+    .at(-1);
+  expect(drivingWaiter?.payload).toEqual({});
 });
 test("a re-offer after a simulated worker restart recovers the durable ledger tab", async () => {
   const h = makeHarness();
@@ -3692,6 +3744,51 @@ test("Slice 3 (live smoke): an owner tab closed after a worker restart still rep
   expect(closeRequest?.payload["disposition"]).toBe("claim_abandoned");
 });
 
+test("Slice 3: a live listener reports an update-surviving ledger claim when its untracked tab closes", async () => {
+  const jobID = "job_claim_owner_update";
+  const candidateID = "cand_owner_update";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobID)],
+  });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/fresh?owner=update`,
+  );
+  const born = ledger.current()[String(tabID)];
+  expect(isSurfaceBirthRecord(born)).toBe(true);
+  const bindingID = isSurfaceBirthRecord(born) ? born.binding_id : "";
+  expect(bindingID).not.toBe("");
+
+  // An extension update clears session-backed activeJobs but leaves the
+  // local birth certificate and browser tab alive. The new worker's live
+  // onRemoved listener therefore handles the later operator close.
+  const updated = simulateExtensionUpdate(h);
+  await updated.bridge.start();
+  await updated.port.inbound(
+    helloAck({
+      features: [AUTH_CLAIM],
+      browser_holder_generation: 1,
+    }),
+  );
+  expectLedgerRetains(ledger.current(), tabID);
+
+  const framesBefore = updated.port.posted.length;
+  await updated.tabs.userClose(tabID);
+  const closed = await updated.port.waitForFrame(
+    "claim_observation",
+    framesBefore,
+  );
+  expect(closed.payload["event_kind"]).toBe("owner_closed");
+  expect(closed.payload["binding_id"]).toBe(bindingID);
+});
+
 test("Slice 3 (oracle finding 4): an ack's fresh gate_occurrence_id rotates the SAME still-owned job's grant in place — a later wall_observed for the new occurrence is not suppressed by the prior occurrence's latch", async () => {
   const jobA = "job_claim_occ_rotate";
   const candidateA = "cand_occ_rotate01";
@@ -3916,6 +4013,124 @@ test("Slice 3: a job_offer delivered before the startup outbox replay's ack does
     restarted.claimObservationOutbox.current[observationID],
   ).toBeUndefined();
   await starting;
+});
+
+test("claim-observation outbox persistence serializes an enqueue snapshot before a delete snapshot", async () => {
+  const h = makeHarness();
+  const internals = h.bridge as unknown as {
+    claimGrants: Map<
+      string,
+      {
+        authenticationClaimID: string;
+        gateOccurrenceID: string;
+        nextOrdinal: number;
+      }
+    >;
+    claimObservationOutboxEntries: Map<
+      string,
+      ClaimObservationOutboxEntry
+    >;
+    lastKnownBrowserHolderGeneration: number | undefined;
+    enqueueClaimObservation(
+      jobID: string,
+      bindingID: string,
+      eventKind: ClaimObservationOutboxEntry["event_kind"],
+    ): void;
+    persistClaimObservationOutbox(): Promise<void>;
+  };
+  internals.claimGrants.set("job_outbox_order", {
+    authenticationClaimID: "claim_outbox_order",
+    gateOccurrenceID: "occ_outbox_order",
+    nextOrdinal: 0,
+  });
+  internals.lastKnownBrowserHolderGeneration = 1;
+
+  let stored: Record<string, ClaimObservationOutboxEntry> = {};
+  const pending: {
+    value: Record<string, ClaimObservationOutboxEntry>;
+    resolve(): void;
+  }[] = [];
+  h.deps.claimObservationOutbox!.set = async (value) =>
+    new Promise<void>((resolve) => {
+      pending.push({
+        value,
+        resolve: () => {
+          stored = value;
+          resolve();
+        },
+      });
+    });
+
+  internals.enqueueClaimObservation(
+    "job_outbox_order",
+    "binding_outbox_order",
+    "wall_observed",
+  );
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  const observationID = [...internals.claimObservationOutboxEntries.keys()][0];
+  if (observationID === undefined)
+    throw new Error("enqueue did not create an observation");
+
+  internals.claimObservationOutboxEntries.delete(observationID);
+  const deletion = internals.persistClaimObservationOutbox();
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  if (pending[0] === undefined)
+    throw new Error("enqueue snapshot never reached storage");
+
+  // An unchained implementation exposes both writes while the first is still
+  // pending. Resolve that mutation's delete first to model the storage race;
+  // the chained implementation only exposes the delete after this first
+  // snapshot settles, so release the first one and then the second.
+  const racedDelete = pending.at(1);
+  if (racedDelete !== undefined) {
+    racedDelete.resolve();
+    pending.at(0)?.resolve();
+  } else {
+    pending.at(0)?.resolve();
+    for (let i = 0; i < 20 && pending.at(1) === undefined; i += 1)
+      await Promise.resolve();
+    const chainedDelete = pending.at(1);
+    if (chainedDelete === undefined)
+      throw new Error("delete snapshot never reached storage");
+    chainedDelete.resolve();
+  }
+  await deletion;
+  expect(stored).toEqual({});
+});
+
+test("claim-observation outbox hydration keeps valid entries beside malformed storage data", async () => {
+  const valid: ClaimObservationOutboxEntry = {
+    observation_id: "obs_hydrate_valid",
+    job_id: "job_hydrate",
+    authentication_claim_id: "claim_hydrate",
+    binding_id: "binding_hydrate",
+    browser_holder_generation: 1,
+    gate_occurrence_id: "occ_hydrate",
+    event_ordinal: 0,
+    event_kind: "wall_observed",
+  };
+  const h = makeHarness();
+  h.deps.claimObservationOutbox!.get = async () =>
+    ({
+      [valid.observation_id]: valid,
+      obs_hydrate_torn: {
+        observation_id: "obs_hydrate_torn",
+        event_kind: "foreign_event",
+      },
+    }) as Record<string, ClaimObservationOutboxEntry>;
+  const internals = h.bridge as unknown as {
+    claimObservationOutboxEntries: Map<
+      string,
+      ClaimObservationOutboxEntry
+    >;
+    hydrateClaimObservationOutbox(): Promise<void>;
+  };
+
+  await internals.hydrateClaimObservationOutbox();
+
+  expect(internals.claimObservationOutboxEntries).toEqual(
+    new Map([[valid.observation_id, valid]]),
+  );
 });
 
 test("Slice 3: two concurrent automatic drives for the same job produce exactly one consult", async () => {
@@ -11389,6 +11604,46 @@ test("the sign-in badge clears when a handoff returns to its provider", async ()
 
   expect(h.action.texts.at(-1)).toBe("");
   expect(h.action.titles.at(-1)).toBe("papio: connected");
+});
+test("a simulated restart repaints a durable auth-wall badge when the wall navigates away", async () => {
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  h.deps.permissions.contains = async () => true;
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_badge_restart_wall"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.completeNavigation(tabID, "https://idp.example.edu/sso");
+  expect(h.action.texts.at(-1)).toBe("1");
+
+  const restarted = simulateExtensionUpdate(h);
+  await restarted.bridge.start();
+  await restarted.port.inbound(helloAck());
+  expect(restarted.action.texts.at(-1)).toBe("1");
+
+  await restarted.tabs.userNavigate(
+    tabID,
+    `https://${PROVIDER_HOST}/stable/restarted`,
+  );
+  expect(restarted.action.texts.at(-1)).toBe("");
+});
+test("a simulated restart clears a durable auth-wall badge when the wall closes", async () => {
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  h.deps.permissions.contains = async () => true;
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_badge_restart_close"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.completeNavigation(tabID, "https://idp.example.edu/sso");
+
+  const restarted = simulateExtensionUpdate(h);
+  await restarted.bridge.start();
+  await restarted.port.inbound(helloAck());
+  expect(restarted.action.texts.at(-1)).toBe("1");
+
+  await restarted.tabs.userClose(tabID);
+  expect(restarted.action.texts.at(-1)).toBe("");
 });
 
 test("inbound native handlers finish in receipt order across asynchronous awaits", async () => {

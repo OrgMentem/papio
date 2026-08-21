@@ -1647,6 +1647,60 @@ func TestBareRouteIsNeverLaxerThanThePublishedSchema(t *testing.T) {
 	}
 }
 
+func TestJobAcceptDispositionPresenceValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		present   bool
+		value     any
+		want      string
+		wantError bool
+	}{
+		{name: "absent", want: JobAcceptDispositionDriving},
+		{name: "driving", present: true, value: JobAcceptDispositionDriving, want: JobAcceptDispositionDriving},
+		{name: "queued", present: true, value: JobAcceptDispositionQueued, want: JobAcceptDispositionQueued},
+		{name: "empty", present: true, value: "", wantError: true},
+		{name: "null", present: true, value: nil, wantError: true},
+		{name: "bogus", present: true, value: "bogus", wantError: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := map[string]any{}
+			if tc.present {
+				payload["disposition"] = tc.value
+			}
+			frame := map[string]any{
+				"protocol": BrowserProtocolVersion,
+				"type":     MsgJobAccept,
+				"msg_id":   "msg_job_accept_disposition",
+				"job_id":   "job_job_accept_disposition",
+				"seq":      1,
+				"payload":  payload,
+			}
+			raw, err := json.Marshal(frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg, err := DecodeBrowserMessage(raw)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("accepted invalid disposition %v", tc.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("valid disposition rejected: %v", err)
+			}
+			got := msg.Payload.(*JobAcceptPayload).Disposition
+			if got == "" {
+				got = JobAcceptDispositionDriving
+			}
+			if got != tc.want {
+				t.Fatalf("disposition = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDownloadIDRejectsZero pins the fail-closed floor introduced for
 // download_id. Delivery provenance correlates on
 // browserDownloadKey{JobID, DownloadID} (internal/browser/bridge.go): two

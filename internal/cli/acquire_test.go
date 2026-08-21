@@ -274,13 +274,10 @@ func TestAcquireWaitUsesCurrentOpenActionGuidance(t *testing.T) {
 		t.Fatalf("acquire --wait: %v (%s)", err, errOut.String())
 	}
 	got := out.String()
-	for _, want := range []string{"[manual_download]", "Sign in at your institution", "download the PDF yourself"} {
+	for _, want := range []string{"[manual_download]", "Sign in at your institution", "`papio actions open`", "download the PDF yourself"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("output = %q, want %q", got, want)
 		}
-	}
-	if strings.Contains(got, "papio actions open") {
-		t.Fatalf("output names an inapplicable handoff command: %q", got)
 	}
 }
 

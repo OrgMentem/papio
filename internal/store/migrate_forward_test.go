@@ -220,8 +220,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 45 {
-		t.Fatalf("user_version = %d, %v; want 45", version, err)
+	if err != nil || version != 46 {
+		t.Fatalf("user_version = %d, %v; want 46", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -241,6 +241,73 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	if scopes != 0 {
 		t.Fatalf("migrated scope rows = %d, want 0", scopes)
+	}
+}
+
+// 0045 originally reset every open action on a quiesced job. 0046 must retain
+// only the structurally identifiable population that never had a browser
+// surface and still has an open handoff action; a candidate row proves the
+// opposite without guessing about historical acknowledgements.
+func TestHandoffEpochRepairNarrowing(t *testing.T) {
+	ctx := context.Background()
+	dataDir := schema33Fixture(t, `
+		INSERT INTO work_requests(id, created_at, desired_version)
+		VALUES ('repair-request-no-surface', '2026-08-21T00:00:00Z', 'any'),
+		       ('repair-request-with-surface', '2026-08-21T00:00:00Z', 'any');
+		INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at)
+		VALUES ('repair-job-no-surface', 'repair-request-no-surface', 'awaiting_human', '{}', '2026-08-21T00:00:00Z', '2026-08-21T00:00:00Z'),
+		       ('repair-job-with-surface', 'repair-request-with-surface', 'awaiting_human', '{}', '2026-08-21T00:00:00Z', '2026-08-21T00:00:00Z');
+		INSERT INTO human_actions(job_id, kind, status, detail, created_at)
+		VALUES ('repair-job-no-surface', 'openurl_handoff', 'open', 'institutional handoff', '2026-08-21T00:00:00Z'),
+		       ('repair-job-with-surface', 'openurl_handoff', 'open', 'institutional handoff', '2026-08-21T00:00:00Z');
+		INSERT INTO events(job_id, at, kind, detail_json)
+		VALUES ('repair-job-no-surface', '2026-08-21T00:00:01Z', 'browser.handoff_quiesced', '{"reason":"fruitless_drive_limit"}'),
+		       ('repair-job-with-surface', '2026-08-21T00:00:01Z', 'browser.handoff_quiesced', '{"reason":"fruitless_drive_limit"}');
+		INSERT INTO institution_profiles(
+		  id, configured_name, revision, authority_digest, authentication_claim_id, created_at, updated_at
+		)
+		VALUES ('repair-profile', 'repair profile', 1, 'repair-authority', 'repair-claim',
+		        '2026-08-21T00:00:00Z', '2026-08-21T00:00:00Z');
+		INSERT INTO browser_candidates(
+		  id, job_id, job_attempt_revision, institution_profile_id, institution_profile_revision,
+		  route_revision, route_class, identifier_strategy, pre_route_safety_key, safety_domain_id,
+		  adapter_revision, effect_contract_id, status, created_at, updated_at
+		)
+		VALUES ('repair-candidate', 'repair-job-with-surface', 1, 'repair-profile', 1,
+		        1, 'institutional', 'doi', 'repair-key', 'repair-domain',
+		        'repair-adapter', 'repair-effect', 'eligible',
+		        '2026-08-21T00:00:00Z', '2026-08-21T00:00:00Z');
+	`)
+	migrated, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatalf("roll fixture forward through handoff repairs: %v", err)
+	}
+	defer migrated.Close()
+
+	rows, err := migrated.DB().QueryContext(ctx, `
+		SELECT job_id
+		FROM events
+		WHERE kind = 'browser.handoff_epochs_reset'
+		  AND json_extract(detail_json, '$.migration') = '0045'
+		ORDER BY job_id
+	`)
+	if err != nil {
+		t.Fatalf("query retained reset markers: %v", err)
+	}
+	defer rows.Close()
+	var retained []string
+	for rows.Next() {
+		var jobID string
+		if err := rows.Scan(&jobID); err != nil {
+			t.Fatalf("scan retained reset marker: %v", err)
+		}
+		retained = append(retained, jobID)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate retained reset markers: %v", err)
+	}
+	if len(retained) != 1 || retained[0] != "repair-job-no-surface" {
+		t.Fatalf("retained reset markers = %v, want only no-surface handoff job", retained)
 	}
 }
 
@@ -293,8 +360,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 45 {
-		t.Fatalf("user_version = %d, %v; want 45", version, err)
+	if err != nil || version != 46 {
+		t.Fatalf("user_version = %d, %v; want 46", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)

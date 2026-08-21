@@ -221,7 +221,7 @@ export class ChromeTabsFake {
 
   async get(tabId: number): Promise<FakeTab> {
     const tab = this.live.get(tabId);
-    if (tab === undefined) throw new Error("no such tab");
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`);
     return cloneTab(tab);
   }
 
@@ -241,7 +241,7 @@ export class ChromeTabsFake {
   async update(tabId: number, properties: TabUpdateProperties): Promise<FakeTab> {
     this.updates.push({ id: tabId, properties: { ...properties } });
     const tab = this.live.get(tabId);
-    if (tab === undefined) throw new Error("no such tab");
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`);
     if (properties.url !== undefined) {
       this.navigations.push({ tabID: tabId, url: properties.url });
       tab.url = properties.url;
@@ -264,7 +264,7 @@ export class ChromeTabsFake {
 
   async completeNavigation(tabId: number, finalURL?: string): Promise<FakeTab> {
     const tab = this.live.get(tabId);
-    if (tab === undefined) throw new Error("no such tab");
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`);
     if (finalURL !== undefined) tab.url = finalURL;
     tab.status = "complete";
     await this.onUpdated.emit(
@@ -281,7 +281,7 @@ export class ChromeTabsFake {
 
   async userActivate(tabId: number): Promise<void> {
     const tab = this.live.get(tabId);
-    if (tab === undefined) throw new Error("no such tab");
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`);
     await this.activate(tabId, tab.windowId ?? this.currentWindowID);
   }
 
@@ -299,7 +299,7 @@ export class ChromeTabsFake {
 
   async reload(tabId: number): Promise<void> {
     const tab = this.live.get(tabId);
-    if (tab === undefined) throw new Error("no such tab");
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`);
     this.reloaded.push(tabId);
     if (this.nextURL !== undefined) tab.url = this.nextURL;
   }
@@ -307,7 +307,7 @@ export class ChromeTabsFake {
   /** Test-only setup mutation for metadata such as openerTabId/groupId. */
   patch(tabId: number, changes: Partial<FakeTab>): void {
     const tab = this.live.get(tabId);
-    if (tab === undefined) throw new Error("no such tab");
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`);
     Object.assign(tab, changes);
   }
 
@@ -321,7 +321,7 @@ export class ChromeTabsFake {
   }
   private async navigate(tabId: number, requestedURL: string): Promise<FakeTab> {
     const tab = this.live.get(tabId);
-    if (tab === undefined) throw new Error("no such tab");
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`);
     this.navigations.push({ tabID: tabId, url: requestedURL });
     tab.url = requestedURL;
     tab.status = "loading";
@@ -338,7 +338,7 @@ export class ChromeTabsFake {
 
   private async activate(tabId: number, windowId: number): Promise<void> {
     const tab = this.live.get(tabId);
-    if (tab === undefined) throw new Error("no such tab");
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`);
     const changed = tab.active !== true;
     this.activateState(tabId, windowId);
     if (!changed) return;
@@ -348,7 +348,7 @@ export class ChromeTabsFake {
 
   private async removeInternal(tabId: number, isWindowClosing: boolean): Promise<void> {
     const tab = this.live.get(tabId);
-    if (tab === undefined) throw new Error("no such tab");
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`);
     const wasActive = tab.active === true;
     const windowId = tab.windowId;
     this.live.delete(tabId);

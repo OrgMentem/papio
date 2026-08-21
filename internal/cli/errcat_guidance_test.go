@@ -148,6 +148,22 @@ func TestActionGuidanceCommandsApplyToEveryActionKind(t *testing.T) {
 		"openurl_available",
 		"downloads_access_required",
 	}
+	// Keep the two actions that are supposed to open a browser route explicit.
+	// Deriving the expectation solely from next.Command would make this
+	// generalized test pass vacuously if a command assignment disappeared.
+	for _, kind := range []string{"manual_download", "openurl_handoff"} {
+		t.Run(kind+"/requires_open_command_and_url", func(t *testing.T) {
+			action := job.HumanAction{Kind: kind}
+			next := app.HumanActionNextStepFor(action)
+			if next.Command != "papio actions open" {
+				t.Fatalf("%s command = %q, want %q", kind, next.Command, "papio actions open")
+			}
+			if target, ok := actionURL(action, row, instFor); !ok || !strings.HasPrefix(target, "https://") {
+				t.Fatalf("%s does not resolve an HTTPS URL: %q (ok=%t)", kind, target, ok)
+			}
+		})
+	}
+
 	for _, kind := range kinds {
 		for _, requiresAuth := range []bool{false, true} {
 			authName := "false"
@@ -220,7 +236,7 @@ func TestCurrentErrcatGuidanceCommandsApplyToActions(t *testing.T) {
 				ID: 228, Kind: "manual_download", Status: "open", RequiresAuth: true, BlockedBy: "landing_page",
 			}},
 			action:   job.HumanAction{Kind: "manual_download", RequiresAuth: true},
-			wantOpen: false,
+			wantOpen: true,
 		},
 	}
 	for _, test := range cases {

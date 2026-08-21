@@ -1749,7 +1749,7 @@ type JobAcceptPayload struct {
 
 func (p *JobAcceptPayload) validate() error {
 	switch p.Disposition {
-	case "", JobAcceptDispositionDriving, JobAcceptDispositionQueued:
+	case JobAcceptDispositionDriving, JobAcceptDispositionQueued:
 		return nil
 	}
 	return fmt.Errorf("job_accept disposition %q is not recognised (fail closed)", p.Disposition)
@@ -3602,9 +3602,14 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		msg.Payload = p
 	case MsgJobAccept:
 		p := &JobAcceptPayload{}
-		err = strictDecode(env.Payload, p)
+		err = browserRejectNoncanonicalFields(payloadFields, "disposition")
 		if err == nil {
-			err = p.validate()
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			if _, present := payloadFields["disposition"]; present {
+				err = p.validate()
+			}
 		}
 		msg.Payload = p
 	case MsgAck, MsgJobReject, MsgCancel, MsgHandoffFocus:

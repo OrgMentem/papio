@@ -289,6 +289,32 @@ execution records kept during the initial build.
 - **An open-access paper's listing names the command that fetches it.** A row
   needing no login read "open access — no login needed" and stopped, which says
   nothing about how to get the paper.
+- **A paper waiting behind another paper's sign-in is no longer charged for
+  waiting.** *papio* drives one handoff at a time; the papers behind it queue.
+  The queue wait was reported as a drive, so three turns in line retired a
+  paper — and the drive that eventually started was never reported at all,
+  which would have left a genuinely stuck paper running forever. Both halves
+  now say what they are.
+- **A cancelled paper's tab is only forgotten once the browser has been told
+  about it.** A cancellation the browser reported itself stopped *papio* from
+  sending a redundant message, and that silence was misread as the browser
+  having been told — so the paper's place at the library could be released
+  while its page was still open.
+- **A sign-in page that cannot be reached is no longer assumed closed.** When a
+  momentary browser error hid a live page, *papio* concluded the page was gone,
+  released the library slot, and destroyed the record it needed to notice.
+  Absence is now proven before anything is released.
+- **Closing a paper's page after an extension update is noticed again.** An
+  update clears *papio*'s memory of which papers are in flight while the pages
+  stay open; closing one then freed nothing, and permanently, because the
+  record that could have recovered it was discarded in the same breath.
+- **A stuck sign-in no longer hides behind an out-of-date badge.** After an
+  update the toolbar counted a sign-in page that had already been finished or
+  closed, and nothing repainted it.
+- **Papers retired for waiting are only revived where the waiting is
+  provable.** The repair released every paper that had ever been retired; it
+  now releases only those that never reached a page at all, so a paper that
+  genuinely failed stays retired.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route

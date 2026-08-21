@@ -55,6 +55,11 @@ func TestAccessHintClassifiesOpenAndInstitutionalAccess(t *testing.T) {
 			want:   "\t'papio actions open', then download the PDF yourself — papio will adopt it; no login needed",
 		},
 		{
+			name:   "manual download without blocker",
+			action: job.HumanAction{Kind: "manual_download", RequiresAuth: false},
+			want:   "\t'papio actions open', then download the PDF yourself — papio will adopt it; no login needed",
+		},
+		{
 			name: "unclassified",
 			want: "",
 		},
