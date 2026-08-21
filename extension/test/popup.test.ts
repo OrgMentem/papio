@@ -60,7 +60,7 @@ import {
   SESSION_PROBE_MESSAGE,
   SESSION_STATE_MESSAGE,
 } from "../src/popup";
-import type { ActiveJob } from "../src/state";
+import type { ActiveJob, JobStatus } from "../src/state";
 import {
   PDF_GRAB_REFUSAL_REASONS,
   type WorkPulseResponsePayload,
@@ -1876,7 +1876,7 @@ test("session card matrix propagates probe outcomes without hijacking a decided 
     lastProbeOutcome: "markers",
     lastVerdictAt: now,
   });
-  expect(warm.label).toContain("Session warm");
+  expect(warm.label).toContain("Signed in");
   // A fresh verdict prints no age: "just now" is true of every line the moment
   // it renders, so it spent a line saying nothing.
   expect(warm.detail).toBe("via your library tab");
@@ -1904,7 +1904,7 @@ test("session card matrix propagates probe outcomes without hijacking a decided 
     lastProbeOutcome: "no_tab",
     lastVerdictAt: now,
   });
-  expect(warmDespiteStaleOutcome.label).toContain("Session warm");
+  expect(warmDespiteStaleOutcome.label).toContain("Signed in");
 });
 
 test("an origin that never landed a decisive verdict resolves to its honest probe outcome, not an eternal spinner", () => {
@@ -1962,7 +1962,7 @@ test("an origin that never landed a decisive verdict resolves to its honest prob
     lastProbeOutcome: "markers",
     lastVerdictAt: now - (SESSION_STALE_MS + 1),
   });
-  expect(agedWarm.label).toBe("Last verified signed in — rechecking");
+  expect(agedWarm.label).toBe("Signed in — rechecking now");
   expect(agedWarm.action).toBe("none");
   expect(agedWarm.label).not.toContain("unknown");
 });
@@ -2174,7 +2174,7 @@ test("binds waiting demand to its warm origin instead of a stale secondary row",
     ],
   };
   expect(deriveSessionRows(state)).toEqual([
-    expect.objectContaining({ origin: originA, label: "Session warm" }),
+    expect.objectContaining({ origin: originA, label: "Signed in" }),
   ]);
   const doc = popupDocument();
   renderInstitutionSession(doc, state);
@@ -4100,4 +4100,128 @@ test("dismissing the chooser hides it without sending", async () => {
   expect(choice.hidden).toBe(true);
   expect(choice.children).toHaveLength(0);
   expect(sends).toBe(1);
+});
+
+// A browser-action popup has no independent viewport: Chrome derives the popup
+// window's size from this document's own layout, so a viewport-relative length
+// defines the width in terms of itself. The fixed point is not guaranteed to
+// exist, and on the operator's browser it did not - the popup oscillated
+// between 364px and 394px at frame rate, indefinitely, with nobody touching
+// it. Nothing about that is visible to a DOM test, which is why this one reads
+// the stylesheet as text: the rule is "no viewport units in the popup", and it
+// is the only place in the extension where that rule holds (inbox.html is a
+// real tab and uses them correctly).
+test("the popup stylesheet declares no viewport-relative length", () => {
+  const html = readFileSync(new URL("../src/popup.html", import.meta.url), "utf8");
+  const styles = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((m) => m[1]);
+  expect(styles.length).toBeGreaterThan(0);
+  const declarations = styles
+    .join("\n")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n");
+  const offenders = declarations.filter((line) =>
+    /(?:^|[\s:(,])-?\d*\.?\d+(?:vw|vh|vmin|vmax|dvw|dvh|svw|svh|lvw|lvh)\b/.test(line),
+  );
+  expect(offenders).toEqual([]);
+});
+
+// "Waiting on you · 125 decisions" named the researcher as the blocker and then
+// offered nothing: the only buttons in the popup were about the current page.
+// The count is the most important fact in the lens, so it carries the route.
+test("the decision count offers the route to the decisions", () => {
+  const cache = pulseCache({ waiting_required: 34, nonterminal_total: 116 });
+  const doc = popupDocument();
+  renderWorkPulse(doc, cache, "connected", Date.now(), { pending_total: 35, turns_required: 35 });
+  const review = doc.getElementById("popup-pulse-review");
+  expect(review).toBeInstanceOf(doc.defaultView!.HTMLButtonElement);
+  expect(review!.hidden).toBe(false);
+  expect(review!.textContent).toBe("Review 35 decisions");
+
+  // Same route as the header icon, wired by the same function.
+  let opened = 0;
+  wireInboxLauncher(doc, async () => {
+    opened += 1;
+  });
+  (review as HTMLButtonElement).click();
+  expect(opened).toBe(1);
+
+  // One decision is not "1 decisions".
+  renderWorkPulse(doc, cache, "connected", Date.now(), { pending_total: 1, turns_required: 1 });
+  expect(doc.getElementById("popup-pulse-review")?.textContent).toBe("Review 1 decision");
+});
+
+// An offer to review nothing is worse than no offer, and papio being the one
+// working is not the researcher's turn.
+test("no route is offered when nothing is actually waiting on the reader", () => {
+  const doc = popupDocument();
+  renderWorkPulse(doc, pulseCache({ waiting_required: 3, nonterminal_total: 3 }), "connected", Date.now(), {
+    pending_total: 0,
+    turns_required: 0,
+  });
+  expect(doc.getElementById("popup-pulse-review")?.hidden).toBe(true);
+  renderWorkPulse(doc, pulseCache({ in_flight: 2, nonterminal_total: 2 }), "connected", Date.now(), {
+    pending_total: 9,
+    turns_required: 9,
+  });
+  expect(doc.getElementById("popup-pulse-primary")?.textContent).toContain("Moving");
+  expect(doc.getElementById("popup-pulse-review")?.hidden).toBe(true);
+});
+
+// Unlabelled, this line read as papio's whole library sitting beside a
+// different total on the line directly above it, and "remaining" read as more
+// things being asked of the reader.
+test("the batch line says which papers it is counting", () => {
+  const display = derivePulseDisplay(
+    pulseCache({
+      waiting_required: 1,
+      nonterminal_total: 72,
+      latest_batch: {
+        batch_id: "batch-1",
+        started_at: new Date(Date.now() - 3_600_000).toISOString(),
+        membership: "complete",
+        total: 199,
+        settled: 127,
+        nonterminal_total: 72,
+      },
+    }),
+    "connected",
+    Date.now(),
+    15_000,
+    { pending_total: 125, turns_required: 125 },
+  );
+  expect(display.batch).toBe("Last submission: 199 papers · 127 settled · 72 still open");
+  expect(display.batch).not.toContain("remaining");
+});
+
+// The timeline's vocabulary (internal/store/activitytext.go) names past EVENTS.
+// "Institution login returned" is right in a history and reads as an
+// unexplained instruction on a status line - measured on the operator's own
+// screen, where it sat under a paper title with no statement of what papio
+// wanted next. It is a record; it must say so.
+test("a bare timeline echo is labelled as history, and a real ask is not", () => {
+  const now = Date.now();
+  const render = (doc: Document, status: JobStatus, kind: string, text: string) =>
+    renderPageContext(
+      doc,
+      { url: "https://doi.org/10.1000/echo", doi: "10.1000/echo", tab_id: 1, tab_url: "https://doi.org/10.1000/echo" },
+      [job({ expected: { title: "An echoed paper", doi: "doi:10.1000/echo" }, status })],
+      undefined,
+      [{ seq: 2, at: new Date(now - 3 * 60_000).toISOString(), job_id: "job-1", kind, text, title: "An echoed paper" }],
+      { openInbox: async () => {}, goToTab: async () => {} },
+    );
+
+  const echo = popupDocument();
+  render(echo, "accepted", "browser.auth_returned", "Institution login returned");
+  const echoText = echo.getElementById("page-acquire-live-status")?.textContent ?? "";
+  expect(echoText).toContain("Last activity: Institution login returned");
+
+  // An explicit ask already states what is wanted; prefixing it would bury the
+  // one line that is not a record.
+  // The live ask path is text-driven: JobStatus carries only browser-side
+  // values, and the daemon's own awaiting_human arrives inside the text.
+  const ask = popupDocument();
+  render(ask, "auth_pending", "browser.auth_pending", "Still waiting on you at the publisher");
+  const askText = ask.getElementById("page-acquire-live-status")?.textContent ?? "";
+  expect(askText.toLowerCase()).toContain("waiting on you");
+  expect(askText).not.toContain("Last activity:");
 });

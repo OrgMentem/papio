@@ -116,8 +116,19 @@
         display: none !important;
       }
 
+      /* A browser-action popup has NO independent viewport: Chrome derives the
+         popup's width from this document's layout, so every viewport-relative
+         length here is circular. `width: min(380px, 100vw)` therefore defines
+         width in terms of itself, and the fixed point need not exist - measured
+         on the operator's browser 2026-08-21 it did not, and the popup window
+         oscillated between 364px and 394px continuously, at frame rate, with no
+         interaction at all. Width must be a constant, and the scrollbar gutter
+         must be reserved so a result line appearing cannot re-wrap the text,
+         change the height, toggle the scrollbar and start the same loop on the
+         other axis. Every child already caps itself with min-width. */
       html {
         background: var(--color-page);
+        scrollbar-gutter: stable;
       }
 
       body {
@@ -126,10 +137,8 @@
         font-size: var(--font-size-body);
         line-height: 1.45;
         margin: 0;
-        max-width: 100vw;
-        min-width: 320px;
         padding: var(--space-3);
-        width: min(var(--popup-width), 100vw);
+        width: var(--popup-width);
       }
 
       header {
@@ -285,6 +294,14 @@
         color: var(--color-muted);
         font-size: var(--font-size-small);
         overflow-wrap: anywhere;
+      }
+
+      /* Compact and start-aligned, deliberately not a full-width primary: the
+         line above it is already the loudest thing in the lens, and a 356px
+         block button would make the route louder than the fact. */
+      .popup-pulse-review {
+        margin-top: var(--space-2);
+        width: auto;
       }
 
       .launcher {
@@ -939,6 +956,11 @@
       <div id="popup-pulse-next" class="popup-pulse-detail" hidden></div>
       <div id="popup-pulse-capacity" class="popup-pulse-detail" hidden></div>
       <div id="popup-pulse-batch" class="popup-pulse-detail" hidden></div>
+      <!-- The count is the most important fact in this popup and it used to be
+           inert text: the popup told the researcher they were the blocker and
+           then offered them nothing but the current page's two buttons. Same
+           route as the header icon, wired by the same function. -->
+      <button id="popup-pulse-review" class="ghost popup-pulse-review" type="button" hidden></button>
     </section>
     <main>
       <!-- One stable announcer for locally initiated operations. Local result

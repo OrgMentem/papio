@@ -1437,20 +1437,20 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   if (stale) {
     if (aged && verdict === "in" && state.authenticated) {
       return {
-        label: "Last verified signed in — rechecking",
+        label: "Signed in — rechecking now",
         detail,
         action: "none",
       };
     }
     if (aged && verdict === "out" && !state.authenticated) {
       return {
-        label: "Last verified signed out — rechecking",
+        label: "Signed out — rechecking now",
         detail,
         action: "signin",
       };
     }
     return {
-      label: "Session state unknown — recheck",
+      label: "Can't tell yet — open your library page",
       detail,
       action: "signin",
     };
@@ -1464,7 +1464,7 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   }
   if (verdict === "in" && state.authenticated) {
     return {
-      label: "Session warm",
+      label: "Signed in",
       detail,
       action: "none",
     };
@@ -2159,25 +2159,30 @@ export function wireInboxLauncher(
   doc: Document = document,
   onOpen: () => Promise<void> = openInbox,
 ): void {
-  const button = doc.getElementById("open-inbox-btn");
   const status = doc.getElementById("open-inbox-status");
-  if (!(button instanceof HTMLButtonElement) || button.dataset.wired) return;
-  button.dataset.wired = "1";
-  button.addEventListener("click", () => {
-    button.disabled = true;
-    if (status) status.textContent = "Opening inbox…";
-    void onOpen()
-
-      .then(() => {
-        // Chrome dismisses the popup when the new tab takes focus; Firefox
-        // keeps it open, so close it explicitly once the inbox is open.
-        window.close();
-      })
-      .catch((error: unknown) => {
-        if (status) status.textContent = error instanceof Error ? error.message : "Could not open inbox";
-        button.disabled = false;
-      });
-  });
+  // Two entry points, one route. The header icon is the durable affordance; the
+  // pulse's review button is the one the count itself offers, because "Waiting
+  // on you - 125 decisions" was inert text. The popup named the researcher as
+  // the blocker and then gave them nowhere to go.
+  for (const id of ["open-inbox-btn", "popup-pulse-review"]) {
+    const button = doc.getElementById(id);
+    if (!(button instanceof HTMLButtonElement) || button.dataset.wired) continue;
+    button.dataset.wired = "1";
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      if (status) status.textContent = "Opening inbox…";
+      void onOpen()
+        .then(() => {
+          // Chrome dismisses the popup when the new tab takes focus; Firefox
+          // keeps it open, so close it explicitly once the inbox is open.
+          window.close();
+        })
+        .catch((error: unknown) => {
+          if (status) status.textContent = error instanceof Error ? error.message : "Could not open inbox";
+          button.disabled = false;
+        });
+    });
+  }
 }
 
 /**
@@ -2527,8 +2532,12 @@ export function derivePulseDisplay(
   const latest = pulse.latest_batch;
   if (latest?.membership === "partial") batch = "Recent browser submissions";
   else if (latest?.membership === "complete" && latest.total !== undefined && latest.settled !== undefined) {
-    const active = latest.nonterminal_total === undefined ? "" : ` · ${latest.nonterminal_total} remaining`;
-    batch = `${latest.total} papers · ${latest.settled} settled${active}`;
+    // Both halves were misread on the operator's own screen: unlabelled, the
+    // line reads as papio's whole library sitting beside a different total on
+    // the line above it, and "remaining" reads as more things asked of the
+    // reader. It is one submission, and its open papers are not all asks.
+    const active = latest.nonterminal_total === undefined ? "" : ` · ${latest.nonterminal_total} still open`;
+    batch = `Last submission: ${latest.total} papers · ${latest.settled} settled${active}`;
   }
   // Companion: the exact non-primary work happening at the same time. Only
   // measurements the daemon actually supplied contribute, and the class already
@@ -2599,6 +2608,18 @@ export function renderWorkPulse(
   capacity.textContent = constrained ? display.capacity : "";
   batch.textContent = constrained ? "" : display.batch;
   for (const node of [next, capacity, batch]) node.hidden = node.textContent === "";
+  // Optional by design: the button is absent from any DOM a caller assembles
+  // by hand, and its absence must degrade to today's text-only pulse rather
+  // than abandoning the whole render.
+  const review = doc.getElementById("popup-pulse-review");
+  if (review instanceof HTMLButtonElement) {
+    const turns = counts?.turns_required ?? 0;
+    review.textContent = `Review ${turns} ${turns === 1 ? "decision" : "decisions"}`;
+    // Only when the pulse itself says the researcher is the blocker AND the
+    // turn authority counts real turns. An offer to review nothing is worse
+    // than no offer.
+    review.hidden = !(display.primary === "Waiting on you" && turns > 0);
+  }
   // Full validated measurements stay reachable without occupying a line.
   section.title = [display.primaryText, display.buckets, display.capacity, display.batch]
     .filter((part) => part !== "")
@@ -2812,8 +2833,17 @@ function liveStatusText(
 
   const waitingOnOperator = String(job.status) === "awaiting_human" ||
     /awaiting[_ ]human|waiting on (the )?operator|still waiting on you/i.test(text);
-  if (waitingOnOperator && !/waiting on you|waiting for your/i.test(text)) {
-    text = `Waiting on you · ${text}`;
+  if (waitingOnOperator) {
+    if (!/waiting on you|waiting for your/i.test(text)) text = `Waiting on you · ${text}`;
+  }
+  // An ask states what is wanted; a delivery states what is happening. What is
+  // left is the timeline's own vocabulary (internal/store/activitytext.go),
+  // which names a past EVENT - "Institution login returned" is right in a
+  // history and reads as an unexplained instruction on a status line, which is
+  // exactly how it read under a paper title on the operator's own screen. It is
+  // a record, so it says so, and the card's button stays the route.
+  else if (activity !== undefined && text === activity.text.trim()) {
+    text = `Last activity: ${text}`;
   }
   const age = relativeAgeParts(timestamp, now);
   const activityAge = Number.isFinite(activityTimestamp) ? relativeAgeParts(activityTimestamp, now) : undefined;
