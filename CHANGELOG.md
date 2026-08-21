@@ -279,6 +279,16 @@ execution records kept during the initial build.
   way the institution's sign-in slot already was — only an effect still in
   flight defers it — and only after the teardown was actually delivered to the
   browser, so the tab can never outlive *papio*'s knowledge of it.
+- **A paper that needs you to download it by hand now hands you the page.**
+  *papio* asks for a manual download when its own attempt could not produce the
+  file — then had no way to take you where the file is. `papio actions open`
+  refused those rows outright, the inbox's link went to the publisher's
+  canonical page rather than through your library, and the listing still told
+  you to sign in and download it. It now resolves the same library route a
+  handoff gets, and the reminder and listing name the command that opens it.
+- **An open-access paper's listing names the command that fetches it.** A row
+  needing no login read "open access — no login needed" and stopped, which says
+  nothing about how to get the paper.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route

@@ -39,17 +39,20 @@ func TestAccessHintClassifiesOpenAndInstitutionalAccess(t *testing.T) {
 			want:   "\tsign in to your institution first, then 'papio actions open'",
 		},
 		{
-			// `papio actions open` cannot open a manual_download — actionURL
-			// rejects the kind — so naming it here sent the user to a command
-			// that silently did nothing for eight rows on one machine.
+			// An earlier round named the command here while actionURL still
+			// rejected the kind, so the command silently did nothing for eight
+			// rows on one machine and the mention was removed. actionURL now
+			// resolves a manual download's institutional route, so naming it is
+			// true again — and it is the only way to reach the page the
+			// instruction talks about.
 			name:   "manual download behind a paywall",
 			action: job.HumanAction{Kind: "manual_download", RequiresAuth: true, BlockedBy: "paywall"},
-			want:   "\tsign in to your institution, then download the PDF yourself — papio will adopt it",
+			want:   "\t'papio actions open', sign in to your institution, then download the PDF yourself — papio will adopt it",
 		},
 		{
 			name:   "manual download, open access",
 			action: job.HumanAction{Kind: "manual_download", RequiresAuth: false, BlockedBy: "landing_page"},
-			want:   "\tdownload the PDF yourself — papio will adopt it; no login needed",
+			want:   "\t'papio actions open', then download the PDF yourself — papio will adopt it; no login needed",
 		},
 		{
 			name: "unclassified",
@@ -99,9 +102,12 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 		{ID: 1, JobID: "manual", Kind: "manual_download", Status: "open", Detail: "choose a file"},
 	}
 
+	// The manual download resolves its institution's route too: papio asked the
+	// human for the file, so it must hand over the page the file is on.
 	want := []string{
 		"https://libkey.io/libraries/1234/10.1000/libkey",
 		browser.OpenURL(instituteBase, rows[4].Work), oaURL, browser.OpenURL(base, rows[1].Work),
+		browser.OpenURL(base, rows[3].Work),
 	}
 	got, dropped := actionURLs(actions, rows, instFor, 0)
 	if !reflect.DeepEqual(got, want) {

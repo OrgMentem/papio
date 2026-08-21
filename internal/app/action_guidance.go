@@ -34,6 +34,13 @@ func HumanActionNextStepFor(action job.HumanAction) HumanActionNextStep {
 	case "openurl_handoff":
 		next.Command = actionsOpenCommand
 	case "manual_download":
+		// papio asked the human to fetch this file, so the human needs the page
+		// it lives on. The route is the institution's, not the bare DOI: 32 of
+		// the 34 open manual downloads measured on 2026-08-21 require auth, and
+		// a canonical publisher link paywalls every one of them. `actions open`
+		// resolves the same fresh route a handoff gets; the instruction says
+		// what to do once there.
+		next.Command = actionsOpenCommand
 		next.Instruction = "download the PDF yourself — papio will adopt it"
 	default:
 		if _, ok := actionGuidanceDefaultOK[action.Kind]; !ok {

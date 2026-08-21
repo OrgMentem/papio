@@ -329,9 +329,12 @@ func (b actionReminderBatch) message(class actionReminderClass) string {
 			recovery = "for you to open them"
 		}
 	case manualDownloadAfterLoginReminder:
-		recovery, command = manualDownloadReminderRecovery(count, true), ""
+		// A manual download now has a route of its own, so the reminder names
+		// the command that opens it. Before, these two classes were the only
+		// due reminders that named no recovery at all.
+		recovery, command = manualDownloadReminderRecovery(count, true), actionsOpenCommand
 	case manualDownloadReminder:
-		recovery, command = manualDownloadReminderRecovery(count, false), ""
+		recovery, command = manualDownloadReminderRecovery(count, false), actionsOpenCommand
 	case loginReminder:
 		recovery, command = "for you to sign in to your institution", ""
 	}

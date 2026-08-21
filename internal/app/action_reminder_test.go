@@ -109,7 +109,9 @@ func TestActionReminderManualDownloadNamesManualStep(t *testing.T) {
 	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := "1 paper has been waiting 30m for you to sign in to your institution, then download the PDF yourself — papio will adopt it"
+	// The manual step is still named, and now so is the command that reaches
+	// the page it happens on.
+	want := "1 paper has been waiting 30m for you to sign in to your institution, then download the PDF yourself — papio will adopt it — run: papio actions open"
 	if len(sink.reminders) != 1 || sink.reminders[0] != want {
 		t.Fatalf("reminders = %q, want %q", sink.reminders, want)
 	}

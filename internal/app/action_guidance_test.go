@@ -15,7 +15,7 @@ func TestHumanActionNextStepFor(t *testing.T) {
 		instruction string
 	}{
 		{kind: "openurl_handoff", command: actionsOpenCommand},
-		{kind: "manual_download", instruction: "download the PDF yourself — papio will adopt it"},
+		{kind: "manual_download", command: actionsOpenCommand, instruction: "download the PDF yourself — papio will adopt it"},
 		{kind: "verify_identity"},
 		{kind: "human_auth_required", forcesLogin: true},
 		{kind: "terms_acceptance_required"},

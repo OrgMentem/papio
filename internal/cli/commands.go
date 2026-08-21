@@ -823,6 +823,10 @@ func accessHint(action job.HumanAction) string {
 	}
 	next := app.HumanActionNextStepFor(action)
 	switch {
+	case next.Instruction != "" && next.Command != "" && next.RequiresInstitutionalLogin:
+		return "\t'" + next.Command + "', sign in to your institution, then " + next.Instruction
+	case next.Instruction != "" && next.Command != "":
+		return "\t'" + next.Command + "', then " + next.Instruction + "; no login needed"
 	case next.Instruction != "" && next.RequiresInstitutionalLogin:
 		return "\tsign in to your institution, then " + next.Instruction
 	case next.Instruction != "":
@@ -831,6 +835,11 @@ func accessHint(action job.HumanAction) string {
 		return "\tsign in to your institution first, then '" + next.Command + "'"
 	case next.RequiresInstitutionalLogin:
 		return "\tsign in to your institution first"
+	case next.Command != "":
+		// An open-access row with a command still needs the command named. It
+		// used to read "open access — no login needed" and stop there, which
+		// tells the reader nothing about how to fetch the paper.
+		return "\topen access — no login needed; run '" + next.Command + "'"
 	default:
 		return "\topen access — no login needed"
 	}

@@ -159,7 +159,10 @@ func TestActionGuidanceCommandsApplyToEveryActionKind(t *testing.T) {
 				next := app.HumanActionNextStepFor(action)
 				hintAction := action
 				hintAction.BlockedBy = "paywall"
-				if got, want := strings.Contains(accessHint(hintAction), "papio actions open"), next.RequiresInstitutionalLogin && next.Command == "papio actions open"; got != want {
+				// The hint names the command exactly when the action has one.
+				// Login state no longer selects it: a manual download needs the
+				// route whether or not the provider walls it.
+				if got, want := strings.Contains(accessHint(hintAction), "papio actions open"), next.Command == "papio actions open"; got != want {
 					t.Fatalf("access hint names `papio actions open` = %t, want %t", got, want)
 				}
 				switch command := next.Command; command {
