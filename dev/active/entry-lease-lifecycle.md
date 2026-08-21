@@ -1,169 +1,229 @@
-# The institution entry lease has states with no exit
+# The institution entry lease: one expired row froze a library
 
-One expired row froze an entire library. Measured on the operator's machine
-2026-08-21: 129 papers awaiting a human, 21 eligible browser candidates, **zero**
-live claims, and one `authentication_entry_leases` row in state `expired`. No
-churn, no starvation warning, nothing in the log — and nothing moving.
+Measured on the operator's machine 2026-08-21: 129 papers awaiting a human, 21
+eligible browser candidates, **zero** live claims, and one
+`authentication_entry_leases` row in state `expired`. No churn, no errors,
+nothing in the log — and nothing moving.
 
-This is not the offer-churn bug (fixed, `aeb3783`), the rolling-renewal
-starvation (fixed, `6fbeee2`), or the sign-in sharing gap (planned,
-`institutional-signin-sharing.md`). It is the layer under all three: the entry
-lease is a state machine whose states do not all have exits.
+Reviewed by three reviewers before any code was written. The first draft was
+**wrong in its central premise, wrong in one stated invariant, and its
+recommendation carried four P0s.** This is the corrected plan; the corrections
+are recorded rather than quietly folded in, because the same mistakes are easy to
+repeat.
 
-## The state machine as it exists
+## What is actually broken: the reader
 
-Writers, all in `internal/job/institutional_evidence.go`:
+The draft said "nothing can leave `expired`". **False.**
+`reserveAuthenticationEntryLeaseTx` treats `expired` as replaceable and resets
+it to `reserved`, clearing the old owner and binding. The exit exists and is
+fenced. What is broken is that **`admitAutomaticMaterializationCandidates` never
+asks for it**: its switch matches an absent row, a `human` row that is also
+entitled, and a `reserved` row this job already owns, then parks everything else.
+An `expired` row parks forever because no reader ever offers it to Reserve.
 
-| transition | function | fence |
+One reader, one missing case. That removes the migration, the new state, the
+delete, and the new event kind the draft proposed.
+
+## Corrected state table
+
+Writers, all `internal/job/institutional_evidence.go` unless noted:
+
+| transition | writer | fence |
 | --- | --- | --- |
-| absent → `reserved` | `reserveAuthenticationEntryLeaseTx` | inserts, or replaces a non-live row |
-| `reserved` → `reserved` | same function | same owner: renews `lease_id`/deadline |
-| `reserved` → `human` | `convertAuthenticationEntryLeaseToHumanTx` | claim+lease+owner+generation, live deadline |
+| absent → `reserved` | `reserveAuthenticationEntryLeaseTx` | INSERT |
+| `expired` → `reserved` | same | replaces; clears owner/binding/entitlement |
+| `human` → `reserved` | same, via `humanRevoked` | generation differs, owner terminal, evidence absent, or `signed_out` |
+| `reserved` → `reserved` | same | same owner: renews lease id and deadline |
+| `reserved` → `human` | `convertAuthenticationEntryLeaseToHumanTx` | claim+lease+owner+generation, live deadline; sets a deadline ONLY if unbound |
 | `human` → entitled | `markAuthenticationEntryLeaseEntitledTx` | sets `entitled_at`; state stays `human` |
-| `reserved`/`human` → `expired` | `expireAuthenticationEntryLeaseTx` | exact claim+lease+generation, `reserved` only |
-| `reserved`/`human` → `expired` | `RetireAuthenticationEntryLeaseAfterOwnerClose` | by owner binding |
+| `reserved` → `expired` | `expireAuthenticationEntryLeaseTx` | exact claim+lease+generation, **`state='reserved'` only — it can never retire `human`** |
+| `reserved`/`human` → `expired` | `RetireAuthenticationEntryLeaseAfterOwnerClose` | claim + owner binding |
 | `reserved`/`human` → `expired` | `releaseAuthenticationEntryLeasesForBindingsTx` | by retired binding |
-| `reserved`/`human` → `expired` | `RetireTerminalAuthenticationEntryLeases` | owner job terminal |
-| `reserved`/`human` → `expired` | `ExpireUnboundAuthenticationEntryLeases` | **no binding** + deadline passed |
+| `reserved`/`human` → `expired` | `RetireTerminalAuthenticationEntryLeases` | owner terminal, no `held`/`unknown_completion` permit |
+| `reserved`/`human` → `expired` | `ExpireUnboundAuthenticationEntryLeases` | unbound + deadline null/past + `updated_at` older than the bind window |
 | `reserved` → `expired` | `getAuthenticationEntryLeaseTx` normalization | past deadline, unless an institutional permit is `held`/`unknown_completion` |
 
-Readers that gate work: `admitAutomaticMaterializationCandidates` and
-`institutionSignInHeldElsewhere` (`internal/browser/bridge.go`), and the
-observation guards in `internal/job/claim_observation_apply.go`.
+`+` the exact expiry sets only `state`/`lease_until`, so an `expired` row can
+**retain** `owner_binding_id` and `owner_tab_hint` while other retirement writers
+clear them. Expired rows are not all the same shape.
 
-## Dead end 1 — `expired` is terminal, and it parks everything
+## P0s in existing code — fix these first, each on its own
 
-Nothing deletes an expired row, and the admission switch has cases for exactly
-three shapes: absent, `human` **and** entitled, and `reserved` owned by the
-asking job. An `expired` row matches none, so it falls to `default` and every
-candidate at that institution is parked — permanently, because no later
-transition can leave `expired`.
+These are older than this plan and must not be folded into a slice.
 
-Consequence: an institution works until its first expiry, then never again. That
-matches the live measurement exactly, and it explains a throughput of 1–2 papers
-a day against a 129-paper backlog: only the legacy URL path, which does not
-consult this lease, was still moving.
+1. **The permit veto is caller discipline, not a fence.**
+   `retireAuthenticationEntryLeaseAfterOwnerCloseTx` matches only claim and
+   binding; `expireAuthenticationEntryLeaseTx` and
+   `releaseAuthenticationEntryLeasesForBindingsTx` have no permit predicate at
+   all. Worse, `reserveAuthenticationEntryLeaseTx` checks permits only on its
+   `reservedExpired` path and **not** on `humanRevoked` — so a bound `human` row
+   whose binding holds a `held`/`unknown_completion` permit is reset to
+   `reserved` and its binding cleared when a new generation arrives, the owner
+   goes terminal, or evidence is absent. That permits a second irreversible
+   provider action on one paper. The veto belongs on each transition.
+2. **A dependent that is admitted cannot bind.** The `human`+entitled admission
+   case proceeds every dependent, but `institutionalBind` then calls Reserve for
+   it; at the same generation with fresh evidence `humanRevoked` is false, so
+   Reserve answers busy, the bind returns `not_eligible`, and the scaffold is
+   torn down. The existing test asserts only that the dependent receives an
+   OFFER. So the entitled case is not an end-to-end usable state, and this — not
+   the offer side — is the better explanation of "I log in on one tab and the
+   others stay stranded". It falsifies the boundary
+   `institutional-signin-sharing.md` was about to measure.
 
-## Dead end 2 — a `human` lease with a binding never expires at all
+## Dead ends, with the sweeps stated precisely
 
-`convertAuthenticationEntryLeaseToHumanTx` sets
-`lease_until = CASE WHEN owner_binding_id IS NULL OR '' THEN <now+bind deadline>
-ELSE NULL END`. So a sign-in that reached a bound surface has **no deadline by
-design**. Every sweep then declines it:
+The draft claimed "every sweep declines" a bound `human` lease. Too strong. A
+bound `human` row IS released by `releaseAuthenticationEntryLeasesForBindingsTx`
+when `ReconcileMaterializationClaims` retires a lapsed claim with no permit row,
+when `AbandonTerminalMaterializations` retires a terminal owner's claim, or when
+`evictLostSurfaceClaimTx` evicts a lapsed claim for a newer holder; and by
+`RetireTerminalAuthenticationEntryLeases` once the owner is terminal with no
+`held`/`unknown_completion` permit.
 
-- `ExpireUnboundAuthenticationEntryLeases` — excluded, the binding is non-empty.
-- `RetireTerminalAuthenticationEntryLeases` — excluded, the owner sits
-  `awaiting_human` indefinitely.
-- `RetireAuthenticationEntryLeaseAfterOwnerClose` — needs an `owner_closed`
-  report that a dead worker never sent.
-- `AbandonStaleMaterializations` — retires the CLAIM and deliberately does not
-  touch the lease (reconnect survival, pinned by
-  `TestClaimObservationSurvivesAReconnectSinceArbitration`).
+What genuinely has no exit:
 
-So a tab that dies without reporting leaves its institution held forever, and
-`institutionSignInHeldElsewhere` returns held for a `human` lease with no
-`entitled_at`. Same freeze, different door.
+1. **`expired`, any binding** — Reserve can take it, no reader asks. This is the
+   live freeze.
+2. **`human`, bound, NULL deadline, owner alive, no `owner_closed`, and either no
+   claim or a claim holding a settled permit.** Nothing reaches it.
+3. **`human`, bound, NON-NULL deadline.** A legal sequence produces it: convert
+   sees no binding so it sets the bind deadline, then `SetAuthenticationEntryLease
+   OwnerBinding` fills the binding without clearing or extending that deadline.
+   Past the deadline, the getter normalizes only `reserved` rows and
+   `ExpireUnbound` excludes non-empty bindings. Adding a deadline to bound humans
+   does not fix this one.
+4. **`navigation_error`, an ordinary path.** `applyClaimObservationTx` abandons
+   the binding and deliberately never touches the lease; the extension's
+   authorized `claim_abandoned` close then SUPPRESSES `owner_closed`. An active
+   owner's bound `human` row is left with no claim for any release helper to
+   find. Outages and DNS failures make this common, not exotic.
 
-## Three constraints, all verified by making them fail
+## Why "delete the row on retirement" was rejected
 
-A one-line "treat `expired` as free" was written and reverted. Each failure is a
-real constraint, not a fixture artifact:
+1. **It breaks the same-poll fence.** `admitAutomaticMaterializationCandidates`
+   reads the lease per descriptor with no transaction across the loop, so
+   candidate A's retirement is immediately visible and candidate B reserves in
+   the same poll. An `owner_closed` frame is handled before `poll()` within one
+   `Sync`, so deleting its row lets a dependent be admitted in that same
+   response — which also breaks the owner-close constraint. The draft's claim
+   that the delete "lands in a transaction the poll has read past" was false;
+   there is no such transaction.
+2. **It would not have unfrozen the live queue.** Changing future retirements to
+   DELETE leaves the existing `expired` row untouched and unreadable, so Slice 1
+   would have failed its own acceptance on the very institution that motivated
+   it.
+3. **It opens a TOCTOU at bind.** `BindMaterializationWithLeaseOwner`'s raw
+   SELECT treats a missing lease row as a benign no-fence case. Reserve and Bind
+   are separate transactions, so a retirement between them makes
+   `setAuthenticationEntryLeaseOwnerBindingTx` affect zero rows while the
+   existence fallback lets the claim bind anyway — **a live sign-in surface with
+   no lease**, which defeats one-entry arbitration entirely.
 
-1. **After `owner_closed`, dependents must not resume.**
-   `TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim`.
-   Owner-close retirement sets `expired`; treating that as free let a dependent
-   ride an entitlement whose surface is gone.
-2. **An explicitly focused paper must win a freed slot.**
-   `TestFocusedCandidateWaitsWhileAnotherJobHoldsTheSignIn`. The admission loop
-   skips `focusPending` jobs, so making `expired` takeable let an automatic
-   candidate reserve the slot the focused paper was waiting for.
-3. **A slot retired mid-poll must not be taken in that same poll.**
-   `TestCandidateParkedByAnotherJobsSignInIsNotOfferedAnyway`. Attributed by
-   trace: candidate A's gate retires a phantom holder, then candidate B, later
-   in the same loop, finds it free and takes it. Today's shipped code parks A
-   and defers to the next poll, which is why it passes.
+Also: absence is NOT uniformly "free". `ApplyClaimObservation` deliberately
+rejects an absent lease for `wall_observed`, `auth_returned`, and
+`entitled_landing`. Cardinality was never the risk — `PK(authentication_claim_id)`,
+no inbound foreign keys, one SQLite writer.
 
-Constraint 3 is the general form of the other two: **a freed slot must be
-arbitrated, not raced.**
+## Recommendation: teach the reader, gated by age
 
-## Options
+Give the admission switch a fourth case: an `expired` row may be taken over
+through the ordinary Reserve reset that already exists, but only once its
+`updated_at` is older than a cooling interval. The tombstone is load-bearing — it
+is what defers a mid-poll retirement to a later poll, satisfying the same-poll
+fence by construction instead of by a poll-local set every future caller must
+remember.
 
-**A. An explicit `free` state, reached only by arbitration.**
-Add a state meaning "retired and available", set by every retirement path.
-Admission may take a `free` row exactly as it takes an absent one, but only on a
-later poll than the retirement (constraint 3), and focus-first (constraint 2).
-Honest, but it is a schema migration plus every writer and reader touched, and
-`expired` versus `free` is a distinction a reader can get wrong in the same way
-`absent` versus `expired` is wrong today.
-
-**B. Delete the row on retirement.**
-Absent already means free and every reader handles it. Retirement becomes
-`DELETE`, so dead end 1 disappears without a new state, and constraint 3 is
-satisfied because the delete lands in a transaction the current poll has already
-read past. Cost: the row currently carries the audit trail of who held the slot
-and when, so deleting it loses evidence unless the retirement is evented first.
-Also needs care that a fenced delete cannot race a reservation.
-
-**C. Keep `expired` and give admission a fourth case, deadline-gated.**
-Smallest diff: `expired` becomes takeable only when `updated_at` is older than a
-cooling interval, which satisfies constraint 3 by construction and leaves the
-audit row in place. Cost: a new interval to justify (and this project's rule is
-to plot distributions before choosing one), and it does nothing for dead end 2.
-
-## Recommendation
-
-**B for dead end 1, plus a deadline for dead end 2.** Retirement should delete
-the row — with the retirement recorded as an event first, so evidence survives
-the row — because "absent means free" is a rule every reader already implements
-correctly, and adding a fourth state to a machine that just froze a library for
-having three is the wrong direction. Dead end 2 is separate and simpler: a
-`human` lease whose owner has no live claim and no in-flight permit has nothing
-to protect, so it needs a deadline like every other state, and the reconnect
-rationale must be re-expressed as "a generation change does not release" rather
-than "no deadline exists".
-
-Sequenced deliberately: dead end 1 alone unfreezes the live queue and is
-measurable within minutes. Do not bundle them.
+Properties: no migration, no new state, no delete, no new event kind, the audit
+row survives, no bind TOCTOU, and the legacy frozen row is picked up once aged.
+Costs: the interval must come from measurement, and the admission switch and
+`institutionSignInHeldElsewhere` must agree for every shape in the table — a
+disagreement between those two readers is exactly today's class of bug.
 
 ## Slices
 
-**Slice 1 — unfreeze.** Record a retirement event, then delete the row, in one
-transaction, in every retirement path. Admission and the gate keep their
-existing "absent means free" semantics untouched. Focus-first ordering is
-verified, not assumed.
+**Slice 0 — the two P0s above**, separately, each with its own test. The permit
+veto moves onto the transitions; the entitled-dependent bind path is decided
+(special-case entitled sharing at bind, or move lease authority). Nothing else
+ships until these do, because Slice 1 increases traffic through both.
 
-**Slice 2 — dead end 2.** Give a bound `human` lease a deadline, and make the
-reconnect-survival rule explicit at the sweep that must honour it. Requires a
-distribution first: how long does a real human sign-in take, measured from
-`auth_pending` to `auth_returned` on this store, p50/p90/p99 — the bind deadline
-is 2 minutes and a human sign-in is plainly longer than that.
+**Slice 1 — unfreeze the reader.** The fourth case, the cooling interval, and
+reader parity. Realistic size **350–450 lines including tests**, across six
+touchpoints; the draft's 300 was wrong.
 
-## Invariants that must survive
+**Slice 2 — the three remaining dead ends.** Shapes 2, 3 and 4 above. Needs a
+distribution first, and the draft named the wrong metric: `auth_pending` →
+`auth_returned` measures how long a human takes, which is not the question. The
+quantity is the **post-auth dead-tab TTL** — after a sign-in lands, how long
+before a surface that will never report `owner_closed` may be declared gone.
+
+Do NOT ship Slice 1 alone: unfreezing sends more papers into the bound-`human`
+shapes that have no exit. It ships with a guard or a monitor and a rollback.
+
+## Invariants — with one correction
 
 - An institutional effect permit that is `held` or `unknown_completion` vetoes
-  every retirement, in every path.
+  every retirement, takeover, and human replacement, **on the transition itself**.
 - One sign-in surface per institution at a time.
-- A generation change means the browser session changed, not that the human's
-  sign-in died; it must never by itself release a lease.
 - `auth_returned` alone is not entitlement.
-- An explicitly focused paper outranks an automatic candidate for a free slot.
-- A freed slot is arbitrated on a later poll, never raced within one.
+- A slot retired mid-poll is arbitrated on a later poll, never raced within one —
+  including retirements caused by a frame handled earlier in the same `Sync`.
+- Every takeover keeps its exact `(claim, lease_id, generation)` or exact-binding
+  fence, so a stale callback cannot retire a SUCCESSOR row.
+- `navigation_error` must never mutate the lease.
+- **Corrected:** the draft asserted "a generation change must never release a
+  human sign-in". The code deliberately does the opposite —
+  `reserveAuthenticationEntryLeaseTx` computes `humanRevoked` on a generation
+  difference and overwrites the human row, clearing owner, evidence, binding and
+  entitlement, and a new-generation claim request or bind can trigger it
+  directly. Either that revocation is intended, in which case the reconnect-
+  survival rationale applies only to the sweeps and must be written that way, or
+  the replacement fence is wrong. **Decide this before Slice 2** — it is listed
+  below as an open question, not as an invariant.
 
 ## Acceptance
 
-- Live, Slice 1: the frozen queue moves. Baseline to beat is today's — 129
-  awaiting, 21 eligible, 0 live claims, 0 admissions per poll. Success is a
-  non-zero admission rate and the backlog falling.
-- Unit: a retirement leaves no row; a candidate admitted after a retirement is
-  admitted on a later poll than the retirement; a focused paper beats an
-  automatic one to a freed slot; a permit in flight blocks every retirement path.
-- The three constraint tests above must pass unmodified. If a slice needs one of
-  them edited, that is a design error, not a test error.
+"The backlog moves" is insufficient: it can be satisfied by the legacy URL path,
+which never touches this lease, or by an unrelated institution. The live check is
+a bounded soak recording, for every admitted candidate, its claim, lease owner
+and binding, asserting:
+
+- **liveness** — institutional candidate offers per poll rise from zero, claims
+  reach `bound` with a lease owner, and the 129-paper backlog falls;
+- **safety, all exactly zero** — more than one live sign-in binding per
+  authentication claim at any instant; any retirement, takeover or human
+  replacement affecting a binding with an unresolved permit; any bound surface
+  whose lease row is absent.
+
+Unit acceptance: a takeover is refused while a permit is unresolved; refused
+inside the cooling interval and allowed after it; refused when it would replace a
+successor row; and the admission switch and the gate return the same verdict for
+every shape in the corrected table. Any retirement assertion is scoped to the
+no-permit case.
+
+`TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim` must
+pass unmodified. Needing to edit it is a design error, not a test error.
+
+Add regardless: a two-candidate test on ONE claim — one focused, one automatic,
+at a free slot — asserting which owns the lease afterwards. Nothing pins it
+today.
+
+## Open questions, deliberately not constraints
+
+1. **Does a focused paper outrank an automatic candidate for a free slot?**
+   Today automatic admission runs before the focus loop in `Sync`, so it does
+   not. `TestFocusedCandidateWaitsWhileAnotherJobHoldsTheSignIn` does not pin
+   this — the draft mistook an ordering accident for an invariant.
+2. **Is `humanRevoked` on a generation change intended?** See the corrected
+   invariant above.
 
 ## Abort criteria
 
-1. A slice needs an in-flight permit veto relaxed.
-2. A slice needs one of the three constraint tests rewritten.
-3. Slice 1 exceeds roughly 300 changed lines outside tests.
-4. Slice 2 is attempted before its distribution is plotted.
-5. The live admission rate does not move after Slice 1 deploys.
+1. A slice needs a permit veto relaxed.
+2. A slice needs `TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim`
+   rewritten.
+3. Slice 1 exceeds 450 lines outside tests.
+4. Slice 2 starts before the post-auth dead-tab TTL is plotted.
+5. Slice 1 deploys and the institutional offer/claim counters stay at zero.
+6. The cooling interval becomes a guessed number rather than a measured one.
+7. Either open question above is still open when Slice 2 starts.
