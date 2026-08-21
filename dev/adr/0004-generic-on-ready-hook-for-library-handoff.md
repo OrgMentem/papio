@@ -46,8 +46,12 @@ tooling, but a human should not have to run an export per acquisition.
 Option B.
 
 - **The env-var contract is public API.** `PAPIO_JOB_ID`, `PAPIO_REQUEST_ID`,
-  `PAPIO_DOI`, `PAPIO_ARXIV`, `PAPIO_TITLE`, `PAPIO_SHA256`, `PAPIO_PDF`,
-  `PAPIO_STATE` are frozen names; additions are allowed, renames are not.
+  `PAPIO_DOI`, `PAPIO_ARXIV`, `PAPIO_PMID`, `PAPIO_TITLE`, `PAPIO_SHA256`,
+  `PAPIO_PDF`, `PAPIO_STATE` are frozen names; additions are allowed, renames
+  are not. `PAPIO_PMID` was added after this ADR shipped, which is exactly the
+  permitted direction; the list is pinned to `runReadyHook` and to
+  `docs/guide/hooks.md` by `TestReadyHookEnvContractIsPinned`, so a later
+  addition cannot leave this list stale and a rename fails the build.
 - **Hooks are fire-and-forget.** One run per ready transition, bounded by
   `hooks.timeout_seconds`, never retried, never able to fail or block the
   job. The durable `hook.on_ready` job event (`status`, `exit_code`,

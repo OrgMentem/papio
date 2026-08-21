@@ -161,6 +161,75 @@ func TestJobStatesAreDocumented(t *testing.T) {
 	}
 }
 
+// TestReadyHookEnvContractIsPinned holds the three copies of the on_ready
+// environment contract to each other: the map runReadyHook builds, the table
+// users read, and the frozen list ADR-0004 declares public API. The names are
+// frozen — additions are allowed, renames are not — and a rename is invisible
+// to every other test: internal/app/app_test.go asserts five of the names by
+// hand, so PAPIO_REQUEST_ID, PAPIO_ARXIV, PAPIO_PMID and PAPIO_TITLE could all
+// be renamed with a green suite while every user's hook script silently began
+// reading empty strings. The drift is not hypothetical: PAPIO_PMID reached both
+// code and the docs table while ADR-0004's frozen list still named eight.
+func TestReadyHookEnvContractIsPinned(t *testing.T) {
+	src := mustRead(t, "internal/app/app.go")
+	hook := regexp.MustCompile(`(?s)func \(s \*Service\) runReadyHook\(.*?\n}`).FindString(src)
+	if hook == "" {
+		t.Fatal("could not locate runReadyHook in internal/app/app.go")
+	}
+	emitted := map[string]bool{}
+	for _, m := range regexp.MustCompile(`"(PAPIO_[A-Z0-9_]+)":`).FindAllStringSubmatch(hook, -1) {
+		emitted[m[1]] = true
+	}
+	if len(emitted) == 0 {
+		t.Fatal("parsed no PAPIO_* env keys from runReadyHook")
+	}
+
+	const (
+		page = "docs/guide/hooks.md"
+		adr  = "dev/adr/0004-generic-on-ready-hook-for-library-handoff.md"
+	)
+	documented := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^\| `+"`"+`(PAPIO_[A-Z0-9_]+)`+"`"+` \|`).
+		FindAllStringSubmatch(mustRead(t, page), -1) {
+		documented[m[1]] = true
+	}
+	// The frozen list is one bullet; read to the next bullet so a later
+	// PAPIO_* mention elsewhere in the ADR cannot stand in for membership.
+	frozenBullet := regexp.MustCompile(`(?s)- \*\*The env-var contract is public API\.\*\*(.*?)\n- \*\*`).
+		FindStringSubmatch(mustRead(t, adr))
+	if frozenBullet == nil {
+		t.Fatalf("could not locate the frozen env-var bullet in %s", adr)
+	}
+	frozen := map[string]bool{}
+	for _, m := range regexp.MustCompile(`PAPIO_[A-Z0-9_]+`).FindAllString(frozenBullet[1], -1) {
+		frozen[m] = true
+	}
+
+	for name := range emitted {
+		if !documented[name] {
+			t.Errorf("runReadyHook sets %s but %s does not list it; a hook variable "+
+				"users cannot discover may as well not exist.", name, page)
+		}
+		if !frozen[name] {
+			t.Errorf("runReadyHook sets %s but ADR-0004's frozen list omits it. Additions "+
+				"are allowed, so add the name to %s — the list is what makes the contract "+
+				"public API rather than an implementation detail.", name, adr)
+		}
+	}
+	for name := range frozen {
+		if !emitted[name] {
+			t.Errorf("ADR-0004 freezes %s but runReadyHook no longer sets it. Renames are "+
+				"forbidden: every existing on_ready script reading it would silently see "+
+				"an empty value.", name)
+		}
+	}
+	for name := range documented {
+		if !emitted[name] {
+			t.Errorf("%s documents %s but runReadyHook does not set it.", page, name)
+		}
+	}
+}
+
 // TestConfigFieldsAreDocumented pins the hand-authored config reference to the
 // struct tags. Config is strict-mode, so an undocumented field is one a user
 // cannot discover but which will reject their file if misspelled.
