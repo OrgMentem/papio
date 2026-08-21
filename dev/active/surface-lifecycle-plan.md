@@ -1277,3 +1277,61 @@ preference order:
 Do not implement either without the operator's call: both retire a claim that
 carries evidence of an irreversible provider effect, which is the one thing
 this subsystem is built to never do casually.
+
+## Seventh round (2026-08-21) — the deadlock broken, and what it revealed
+
+Operator chose "believe the browser" over a winner deadline. Shipped, with the
+live sequence recorded because two of the three steps were wrong first:
+
+9. **`5413810` — evict on the browser's own request.** Correct, three guards
+   (lapsed lease, strictly newer holder generation, no in-flight permit), each
+   mutation-verified. **Unreachable.** Measured immediately after deploying:
+   all five stranded candidates read `claimed`, so the scheduler never offers
+   their jobs and the browser never makes the request the eviction keys on. A
+   fix that fires only when someone asks cannot free a claim whose entire
+   problem is that nobody asks. Placing it in the live-lease branch first broke
+   `TestMaterializationConcurrentClaimHasOneWinner`, which is how the
+   lapsed-lease seam was found — keep it there, it is the guard that stops a
+   reconnect or a dev harness evicting a live surface.
+10. **`7abaf37` — the reachable form.** The daemon already computes the signal
+    every poll and hands it to a sweep: the claim's browser holder generation.
+    A mismatch means the session that created the surface is gone, so nobody is
+    left to sign in and, for a settled effect, nobody is left to produce a
+    winner. `AbandonStaleMaterializations` was that sweep and missed the five
+    for two reasons, both removed: it required a LIVE lease (so a lapsed claim
+    was invisible and fell to the expiry path, where a settled permit correctly
+    vetoes) and it vetoed on ANY permit. **All five drained in one transaction,
+    verified live.** The in-flight veto stays absolute in both sweeps.
+11. **`d95ccbd` — a parked paper must stay parked.** Freeing the claims exposed
+    the churn beneath: two papers at one institution cycling claim -> build a
+    scaffold TAB -> refused at bind -> tear the tab down, 2.7×/second. The
+    claim-paced gate parked them correctly and returned only its admissions, so
+    the legacy loop offered them anyway. It now returns the parked set too.
+
+**Learned and deliberately left alone:** `AbandonStaleMaterializations` must
+NOT release the authentication entry lease. A generation change means the
+browser session changed, not that the human's sign-in died; §4.5 keys the
+reserved entry on the owner JOB exactly so a sign-in survives a worker restart,
+and `TestClaimObservationSurvivesAReconnectSinceArbitration` caught that
+mistake once already. A lease outliving its binding's claim is correct.
+
+### Open: the legacy offer loop has no institution serialization
+
+`d95ccbd` did NOT stop the live churn — still 108 refusals per 40s after
+deploying and reloading. Measured cause: only bind refusals appear in the log,
+never claim requests, and both jobs' candidates carry the same
+`authentication_claim_id` and matching profile revisions as the slot holder. So
+the claim-paced gate never sees these candidates — they are not in its
+`scheduled` page — and the offers come from the legacy loop, which has no
+institution-slot awareness of any kind. The extension then re-enters
+materialization from its existing claim and re-binds.
+
+The fix is therefore not another park hand-off: **the legacy offer loop needs
+the same institution gate the claim-paced path has.** Do that next and
+re-measure the 40s refusal count against 108 — a good instrument, unlike the
+journal count, because it moves continuously.
+
+The churn self-limits when the slot holder's lease expires (30 minutes), so it
+is bounded per institution rather than unbounded. It is still 2.7 browser tabs
+built and destroyed per second while it lasts, which is the operator's original
+complaint in its purest measured form.
