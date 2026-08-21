@@ -1152,3 +1152,72 @@ Open after this round:
   already defined and never called — the seam for exactly that RPC, left
   behind by whoever last stopped short here. Until it lands, the inbox's
   "Open link" is correct only for the two open-access rows of the 34.
+
+## Sixth round (2026-08-21) — four reviewers, and the empty journal named
+
+Four adversarial reviewers audited this session's own commits. Eleven findings,
+all fixed and each pinned by a mutation-verified test; `34c4ddb`, `08f4ea4`,
+`4464995`. The two that matter most for this plan:
+
+7. **FIXED — the accept accounting missed its own primary path.** `2d70fbc`
+   derived `job_accept`'s disposition from the job's persisted status, but the
+   queue behind `HANDOFF_DRIVE_LIMIT=1` persists `"accepted"` (it *will* be
+   driven) while only `enqueueHandoffDrive` has run. So the drive-slot wait —
+   the exact wait that burned 438 accepts across 62 papers — still reported a
+   drive. The authority is now `handoffDrives`, the registry of slots this
+   worker holds. Fixing only that would have traded over-charging for
+   under-charging (the drain registered a drive and announced nothing, so no
+   epoch would ever open and a runaway paper would be immortal); the drain now
+   announces the drive when it starts. **Verified live after reload: 29
+   `queued` accepts against 7 driving.** Before, all 36 were drives.
+8. **FIXED — claims retired on the wrong marker.** `cancelSent` is also set by
+   `provider_outcome: cancelled`, which suppresses a redundant frame while the
+   extension's own close may still be refused by a permit veto. The narrower
+   `cancelAnnounced` now authorizes retirement, and both markers commit only
+   when the poll's response actually returns.
+
+### The empty journal, chased to ground truth
+
+`claim_observation_journal` has never held a row. This round found why, and it
+is not the three fences the earlier rounds removed:
+
+- **Measured**: zero `claim_abandoned` close authorizations have EVER been
+  issued; one authentication entry lease had ever been reserved; the journal is
+  empty — while daemon-side claim phases advance normally. So every claim
+  retirement to date has come from a daemon-side sweep. **That is why this
+  session kept having to add sweeps, and why they are what actually freed the
+  library.**
+- **Cause 1 (FIXED, `08f4ea4`)**: `durableClaimIdentity` mirrors the grant into
+  the durable birth record, and its only caller was `ledgerManagedTab` — which
+  runs at BIRTH. A grant almost always post-dates its surface, so only the
+  `open_new` ordering ever captured it. `ledgerManagedTab`'s additive branch
+  was written for this and nothing invoked it. The mirror now happens at
+  `registerHandoffDrive`, where a job takes ownership of a tab.
+- **Cause 2 (FIXED, `4464995`)**: the identity never arrived at all on the
+  dominant path. `institutionalBind`'s own comment says it: "the
+  daemon-orchestrated pipeline (candidate offer -> claim -> scaffold -> bind)
+  has no consult in it". An observation is keyed on
+  `authentication_claim_id` + `gate_occurrence_id`, and only the consult
+  response has ever carried them. The bind already resolves the profile and
+  reserves the entry lease, so it holds the identity; it now returns it, and
+  the extension registers the grant through one shared `registerClaimGrant`.
+
+**Still open, and narrowed to one link.** After deploying and reloading, an
+entry lease is HELD for the first time (previously zero, ever) — so the
+identity now reaches the browser. But closing a papio-owned surface still emits
+no `claim_observation`, and the journal is still empty. Verified by hand twice:
+a provider tab on a live claim, and a `materialize.html` scaffold. So a gate in
+`onTabRemoved` after the grant is still refusing. The candidates, in order of
+suspicion, are `authorizedClose` (a `pending_close` already recorded),
+`deliberateRemovals` (papio's own housekeeping close racing the operator's),
+`job.status === "awaiting_download"`, and a `ceded` record. Instrument those
+four gates for a scaffold close before writing any more code — this round
+twice guessed a cause that measurement then falsified, and the measurement
+each time cost one query.
+
+Note the lease promotion that DID happen went through the older `auth_returned`
+frame family (`convertAuthenticationEntryLeaseToHumanTx`), not
+`ApplyClaimObservation`. Two parallel mechanisms describe the same lifecycle;
+the older one works and the newer one has never fired. Deciding whether the
+observation family should subsume it, or be scoped to what only it can express,
+belongs in an ADR rather than another patch.
