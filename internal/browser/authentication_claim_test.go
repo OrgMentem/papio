@@ -1154,6 +1154,82 @@ func TestCandidateParkedByAnotherJobsSignInIsNotOfferedAnyway(t *testing.T) {
 	}
 }
 
+// The focus loop is the path the live churn actually took: the claim-paced gate
+// deliberately skips focusPending jobs, so its park never applied to them and
+// every poll re-offered the candidate. Because the refusal at bind clears the
+// daemon's tracking, the next poll re-offered again — measured live 2026-08-21
+// at 18 offers per second across three papers at one institution. The gate now
+// lives at the single chokepoint both loops share, and this pins both halves:
+// it waits while the slot is held, and it resumes the moment the slot frees.
+func TestFocusedCandidateWaitsWhileAnotherJobHoldsTheSignIn(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "focus-claim-shared")
+
+	// The paper under test, focused explicitly. The claim-paced admission gate
+	// deliberately skips focusPending jobs, so its park never applied here and
+	// every poll re-offered this candidate.
+	sibling := parkInstitutional(t, jobs, "focus-waits", handoffWork(), "")
+	explicitMaterializationCandidate(t, jobs, sibling, "domain-focus-waits")
+	if _, _, err := b.FocusHandoffs(ctx, []string{sibling}); err != nil {
+		t.Fatalf("focus: %v", err)
+	}
+
+	// One poll with a candidate present settles the institution profile: poll
+	// reconciles profiles only on the candidate-preparation path, and that
+	// rewrites the authentication claim id. A slot reserved before this would be
+	// reserved under a name the gate never looks up.
+	runSync(t, b)
+	profiles, profileErr := jobs.ListInstitutionProfiles(ctx, false)
+	if profileErr != nil || len(profiles) == 0 {
+		t.Fatalf("list institution profiles: %v (%d)", profileErr, len(profiles))
+	}
+	claimID := profiles[0].AuthenticationClaimID
+
+	// A third paper now holds this institution's single sign-in slot. It owns no
+	// candidate, so the slot is the only signal available.
+	if _, err := jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+		AuthenticationClaimID:   claimID,
+		LeaseID:                 "lease-focus-holder",
+		OwnerID:                 "job_focus_slot_holder",
+		BrowserHolderGeneration: 1,
+		LeaseUntil:              b.now().Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatalf("reserve the slot for a third paper: %v", err)
+	}
+
+	held, _ := runSync(t, b)
+	if got := offersForJob(held, sibling); got != 0 {
+		t.Fatalf("offers for the sibling = %d, want 0 while another paper holds the sign-in: %v", got, held)
+	}
+
+	// A wait, not a stall: freeing the slot releases the same focus with no new
+	// request from the operator.
+	lease, found, leaseErr := jobs.GetAuthenticationEntryLease(ctx, claimID)
+	if leaseErr != nil || !found {
+		t.Fatalf("the holder's slot was never reserved: err=%v found=%v", leaseErr, found)
+	}
+	if err := jobs.ExpireAuthenticationEntryLease(ctx, claimID, lease.BrowserHolderGeneration, lease.LeaseID); err != nil {
+		t.Fatalf("free the slot: %v", err)
+	}
+	freed, _ := runSync(t, b)
+	if got := offersForJob(freed, sibling); got != 1 {
+		t.Fatalf("offers for the sibling after the slot freed = %d, want 1: %v", got, freed)
+	}
+}
+
+// offersForJob counts candidate offers addressed to one job.
+func offersForJob(msgs []*protocol.BrowserMessage, jobID string) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Type == protocol.MsgInstitutionalCandidateOffer && m.JobID == jobID {
+			n++
+		}
+	}
+	return n
+}
+
 // TestLegacySessionAutomaticPathStaysDarkWithoutMaterializationFeature pins
 // the compatibility boundary: a session that never negotiated
 // institutional_materialization_v1 gets exactly today's legacy behavior —

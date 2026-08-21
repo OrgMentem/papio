@@ -10638,6 +10638,20 @@ func (b *Bridge) serviceMaterializationCandidate(
 			return nil, nil
 		}
 	}
+	// One sign-in per institution. While another job holds this institution's
+	// entry slot, offering this candidate can only produce a scaffold tab that
+	// is refused at bind ("another sign-in for this institution is in
+	// progress") and torn down again — and the refusal clears the daemon's
+	// tracking, so the very next poll re-offers it. The extension polls several
+	// times a second, so that is not a retry, it is a spin: measured live
+	// 2026-08-21, 18 offers per second across three papers at one institution
+	// and 2.7 browser tabs built and destroyed per second, for as long as the
+	// holder's 30-minute lease lasted. The refusal's own comment claimed "the
+	// scheduler re-offers this candidate once the institution is free"; that is
+	// only true if the offer waits for it, which is what this does.
+	if action.RequiresAuth && b.institutionSignInHeldElsewhere(ctx, candidate) {
+		return nil, nil
+	}
 	now := b.now()
 	offerState, tracked := b.materializationOffered[id]
 	newCandidate := !tracked
@@ -10852,6 +10866,43 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 		admitted[descriptor.JobID] = true
 	}
 	return admitted, parked
+}
+
+// institutionSignInHeldElsewhere reports whether this candidate's institution
+// has a live entry slot held by a DIFFERENT job, so a sign-in surface for this
+// candidate would be refused at bind. It is the read-only half of the switch in
+// admitAutomaticMaterializationCandidates above and must keep the same three
+// answers: a landed AND entitled sign-in is shared (every dependent proceeds on
+// its own binding), the slot's own owner always proceeds, and an unheld or
+// lapsed slot is free. A read error is never a reason to withhold work — this
+// gate exists to stop a spin, not to become a new way for papers to stall.
+func (b *Bridge) institutionSignInHeldElsewhere(ctx context.Context, candidate job.BrowserCandidateDescriptor) bool {
+	if b.jobs == nil || candidate.JobID == "" {
+		return false
+	}
+	profile, err := b.jobs.GetInstitutionProfile(ctx, candidate.InstitutionProfileID)
+	if err != nil || profile == nil || profile.AuthenticationClaimID == "" {
+		return false
+	}
+	lease, found, leaseErr := b.jobs.GetAuthenticationEntryLease(ctx, profile.AuthenticationClaimID)
+	if leaseErr != nil || !found {
+		return false
+	}
+	if lease.OwnerID == candidate.JobID || lease.HumanOwnerID == candidate.JobID {
+		return false
+	}
+	// A lapsed slot is free. The store's own replacement path compares this
+	// deadline as text against its clock, so this must not disagree with it.
+	if lease.LeaseUntil != "" && lease.LeaseUntil <= b.now().UTC().Format(time.RFC3339Nano) {
+		return false
+	}
+	switch lease.State {
+	case job.AuthenticationEntryLeaseHuman:
+		return lease.EntitledAt == ""
+	case job.AuthenticationEntryLeaseReserved:
+		return true
+	}
+	return false
 }
 func (b *Bridge) providerDirectGetAvailable() bool {
 	if b == nil || b.holder == nil || !slices.Contains(b.Features, providerDirectGetV1Feature) {
