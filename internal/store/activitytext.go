@@ -53,6 +53,8 @@ func ActivityText(kind string, detail map[string]any) string {
 			return clampActivityText(fmt.Sprintf("Institution handoff failed (%s)", outcome))
 		}
 		return "Institution handoff failed"
+	case "browser.handoff_epochs_reset":
+		return "Drive attempt count reset by repair"
 	case "browser.job_accept":
 		return "Job accepted"
 	case "browser.job_reject":

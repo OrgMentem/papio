@@ -2837,7 +2837,14 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return nil, nil
 
 	case protocol.MsgJobAccept:
-		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", nil); err != nil {
+		// The disposition is recorded only when the peer named one, so an
+		// older extension's rows keep their existing shape and read as
+		// driving — which is what its acks have always meant.
+		var detail map[string]any
+		if p, ok := msg.Payload.(*protocol.JobAcceptPayload); ok && p.Disposition != "" {
+			detail = map[string]any{"disposition": p.Disposition}
+		}
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_accept", detail); err != nil {
 			log.Printf("papio: recording browser.job_accept: %v", err)
 		}
 		return nil, nil
@@ -7092,10 +7099,20 @@ func (b *Bridge) handoffQuiescedByEvidence(
 	if !state.Quiesced {
 		return false, state.FruitlessEpochs, nil
 	}
+	// Only an audit newer than the last repair counts as already-recorded: a
+	// paper whose streak was reset and then genuinely re-quiesced must say so
+	// again, or the repair would silence every future verdict for it.
+	audited := false
 	for _, ev := range events {
-		if kind, _ := ev["kind"].(string); kind == "browser.handoff_quiesced" {
-			return true, state.FruitlessEpochs, nil
+		switch kind, _ := ev["kind"].(string); kind {
+		case job.HandoffEpochsResetEvent:
+			audited = false
+		case "browser.handoff_quiesced":
+			audited = true
 		}
+	}
+	if audited {
+		return true, state.FruitlessEpochs, nil
 	}
 	if err := b.jobs.S.AppendEvent(ctx, id, "browser.handoff_quiesced",
 		map[string]any{"reason": "fruitless_drive_limit", "drive_epochs": state.FruitlessEpochs}); err != nil {

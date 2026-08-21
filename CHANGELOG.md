@@ -255,6 +255,19 @@ execution records kept during the initial build.
   go to papers that can still move. Nothing is dismissed or hidden: `papio
   actions open` still drives any of them on demand, and `papio doctor` still
   reports the count that has gone quiet.
+- **Papers no longer get retired for waiting their turn.** The extension drives
+  one paper at a time; the rest queue behind it. But its acknowledgement said
+  only "got it", never whether it was *driving* that paper or *queueing* it —
+  and *papio* counted every acknowledgement as a drive that produced nothing,
+  giving up on a paper after three. So one stuck sign-in, holding the only
+  drive slot, could retire the whole queue behind it without a single browser
+  tab ever opening. Measured on a real library: **78 papers** permanently
+  retired across 438 acknowledgements, and **77 of those papers had never had a
+  tab at all**. The acknowledgement now says which it is, only a real drive
+  counts, and being asked about a paper costs it nothing. Those 78 papers are
+  restored on upgrade — a one-off repair, recorded per paper, that makes no
+  claim about any attempt: a paper that really is dead simply goes quiet again
+  after its next three real attempts.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route

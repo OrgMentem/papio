@@ -3182,6 +3182,36 @@ func terminalHandoffEvent(kind string, event map[string]any) bool {
 	return false
 }
 
+// JobAcceptDispositionQueued marks a browser.job_accept the extension sent
+// while taking the offer into its own queue rather than driving it. Only a
+// driving accept opens a drive epoch, so a paper waiting its turn behind the
+// extension's single drive slot is never charged for the wait.
+const JobAcceptDispositionQueued = "queued"
+
+// acceptedDrive reports whether a browser.job_accept event represents a drive
+// actually starting. An absent disposition means driving: an older extension
+// cannot say, and every ack it sends has always been counted as one.
+func acceptedDrive(event map[string]any) bool {
+	detail, ok := event["detail"].(map[string]any)
+	if !ok {
+		return true
+	}
+	disposition, _ := detail["disposition"].(string)
+	return disposition != JobAcceptDispositionQueued
+}
+
+// HandoffEpochsResetEvent restarts a job's fruitless-drive streak from zero.
+//
+// It exists because the verdict is DERIVED from history, not stored: correcting
+// the rule that mis-charged an epoch does not un-charge the accepts already on
+// the stream, since a pre-fix `browser.job_accept` carries no disposition and
+// therefore reads as a drive. A repair must say so explicitly rather than
+// guess retrospectively which historical acks were really queue waits.
+//
+// Emitted only by a migration or an operator repair — never by a live path,
+// which would give any caller a way to make a genuinely dead handoff immortal.
+const HandoffEpochsResetEvent = "browser.handoff_epochs_reset"
+
 // ProjectHandoffOfferState folds a job's event history into the automatic-offer
 // decision. events are the `[]map[string]any` rows returned by the store, oldest
 // first; each has a "kind" string and a "detail" map. actionCreatedAt scopes the
@@ -3235,13 +3265,34 @@ func ProjectHandoffOfferState(events []map[string]any, actionCreatedAt string, n
 			closeEpoch(true) // lease elapsed before anything terminal arrived
 		}
 		switch {
-		case kind == "browser.handoff_offered" || kind == "browser.job_accept":
+		case kind == HandoffEpochsResetEvent:
+			// A repair, not an outcome: it makes no claim about what any drive
+			// did, only that the streak before it was mis-counted.
+			open = false
+			fruitless = 0
+		case kind == "browser.handoff_offered":
+			// An offer is papio's own act, not a drive. Opening an epoch here
+			// charged a paper for being ASKED — so a queue that never reached
+			// it still burned its budget. Measured live 2026-08-21: 78 papers
+			// permanently quiesced on 438 accepted handoffs of which 77 papers
+			// never had a single surface (`browser_candidates` empty), because
+			// one stuck sign-in held the extension's only drive slot and every
+			// sibling was queued, acked, and dropped at
+			// QUEUED_HANDOFF_RELEASE_MS. An unacked offer is a transport or
+			// attention failure, which this fence already declines to charge.
+		case kind == "browser.job_accept":
 			// Reconnect re-acknowledgements land here too; if an epoch is
 			// already open and still within lease, this is the SAME epoch —
-			// counting raw offers would turn one stuck drive into dozens.
+			// counting raw acks would turn one stuck drive into dozens.
 			// browser.job_reject and send failures are transport problems,
 			// not a fruitless drive: they match nothing here and fall through.
-			if !open {
+			//
+			// A `queued` disposition is the extension saying it took the offer
+			// into its queue and is NOT driving it. Absent means driving: an
+			// older extension cannot say, and its acks have always meant a
+			// drive, so the silent-drive incident this fence exists for stays
+			// caught.
+			if acceptedDrive(event) && !open {
 				epochStart = at
 				open = true
 			}

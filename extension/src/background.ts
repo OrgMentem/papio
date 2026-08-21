@@ -3234,7 +3234,7 @@ export class Bridge {
       });
       this.authStalledReported.delete(jobID);
       this.stalledAuthHandoffs.delete(jobID);
-      this.send("job_accept", {}, jobID);
+      this.sendJobAccept(jobID);
       await this.drainHandoffDriveQueue();
       return { ok: true, opened: true };
     }
@@ -3288,7 +3288,7 @@ export class Bridge {
       );
       this.registerHandoffDrive(jobID, tabID);
       this.stalledAuthHandoffs.delete(jobID);
-      this.send("job_accept", {}, jobID);
+      this.sendJobAccept(jobID);
     } catch (error) {
       this.releaseEffectGovernor(jobID, effectToken, false);
       this.wakeEffectGovernor();
@@ -13067,7 +13067,7 @@ export class Bridge {
         job.handoffAckPending === true,
     );
     for (const job of pending) {
-      if (!this.send("job_accept", {}, job.job_id)) return false;
+      if (!this.sendJobAccept(job.job_id)) return false;
     }
     if (pending.length === 0) return true;
     const acknowledged = new Set(pending.map((job) => job.job_id));
@@ -13981,6 +13981,32 @@ export class Bridge {
       if (tabID !== undefined) void this.closeOwnedTab(tabID, "page-capture");
       this.pageCaptureDriving = false;
     }
+  }
+
+  /** Acknowledge one offer, telling the daemon whether this is a DRIVE or a
+   * place in this worker's queue.
+   *
+   * The disposition is read from the job's own status rather than passed per
+   * call site, because that status IS the answer and there are seventeen call
+   * sites: a boolean argument would drift at the first one somebody forgot.
+   * `queued` is exactly the state HANDOFF_DRIVE_LIMIT produces when a paper
+   * waits behind another paper's drive, and releasing that queue without
+   * driving is what QUEUED_HANDOFF_RELEASE_MS does.
+   *
+   * The daemon charges a fruitless drive epoch per driving accept and quiesces
+   * a paper after three, so a queued accept counted as a drive retires a paper
+   * for waiting its turn — 78 of them, measured live on 2026-08-21. An unknown
+   * or not-yet-written status omits the field, which the daemon reads as
+   * driving: the pre-existing behaviour, so a mis-ordered write can only ever
+   * be as wrong as today, never worse.
+   */
+  private sendJobAccept(jobID: string): boolean {
+    const queued = findByJob(this.store, jobID)?.status === "queued";
+    return this.send(
+      "job_accept",
+      queued ? { disposition: "queued" } : {},
+      jobID,
+    );
   }
 
   /** Build, self-validate, and post one outbound frame. Validation is a safety
@@ -15007,7 +15033,7 @@ export class Bridge {
         },
         openurl,
       );
-      this.send("job_accept", {}, jobID);
+      this.sendJobAccept(jobID);
       return;
     }
     const authorityMode = effectiveAccessMode;
@@ -15036,7 +15062,7 @@ export class Bridge {
       if (expected === undefined) delete parked.expected;
       if (requiresAuth === undefined) delete parked.requires_auth;
       await this.upsertJobWithOffer(parked, openurl);
-      this.send("job_accept", {}, jobID);
+      this.sendJobAccept(jobID);
       return;
     }
     const freshLinks = this.supportsFreshHandoffLinks();
@@ -15128,7 +15154,7 @@ export class Bridge {
       this.queuedHandoffTimers.delete(jobID);
       this.pendingForcedReleases.delete(jobID);
       await this.upsertJobWithoutOffer(coldJob);
-      this.send("job_accept", {}, jobID);
+      this.sendJobAccept(jobID);
       return;
     }
     if (freshLinks && requiresAuth === true && existing !== undefined) {
@@ -15171,7 +15197,7 @@ export class Bridge {
             if (!(await this.acknowledgePendingProviderHandoffs(providerKey)))
               return;
           } else {
-            this.send("job_accept", {}, jobID);
+            this.sendJobAccept(jobID);
           }
           if (existing.status === "queued") {
             this.scheduleQueuedHandoffRelease(jobID);
@@ -15211,7 +15237,7 @@ export class Bridge {
               },
               openurl,
             );
-            this.send("job_accept", {}, jobID);
+            this.sendJobAccept(jobID);
             return;
           }
           const recoveredTabID = await this.openManagedTab({
@@ -15258,7 +15284,7 @@ export class Bridge {
           if (existing.handoffAckPending === true) {
             await this.acknowledgePendingProviderHandoffs(providerKey);
           } else {
-            this.send("job_accept", {}, jobID);
+            this.sendJobAccept(jobID);
           }
           if (
             freshLinks &&
@@ -15320,7 +15346,7 @@ export class Bridge {
             if (existing.handoffAckPending === true) {
               await this.acknowledgePendingProviderHandoffs(providerKey);
             } else {
-              this.send("job_accept", {}, jobID);
+              this.sendJobAccept(jobID);
             }
             return;
           }
@@ -15341,7 +15367,7 @@ export class Bridge {
               purpose: "reoffer",
               focusExisting: false,
             });
-            this.send("job_accept", {}, jobID);
+            this.sendJobAccept(jobID);
             await this.drainHandoffDriveQueue();
             return;
           }
@@ -15389,7 +15415,7 @@ export class Bridge {
           if (existing.handoffAckPending === true) {
             await this.acknowledgePendingProviderHandoffs(providerKey);
           } else {
-            this.send("job_accept", {}, jobID);
+            this.sendJobAccept(jobID);
           }
           this.wakeEffectGovernor();
           return;
@@ -15451,7 +15477,7 @@ export class Bridge {
         { ...makeJob(-1, "queued"), engagement_required: true },
         openurl,
       );
-      this.send("job_accept", {}, jobID);
+      this.sendJobAccept(jobID);
       return;
     }
 
@@ -15481,12 +15507,12 @@ export class Bridge {
       );
       if (governorQueued) {
         this.enqueueHandoffDrive({ jobID, purpose: "handoff" });
-        this.send("job_accept", {}, jobID);
+        this.sendJobAccept(jobID);
         await this.drainHandoffDriveQueue();
       } else {
         this.scheduleQueuedHandoffRelease(jobID);
         if (!providerParked && !challengeCooldown)
-          this.send("job_accept", {}, jobID);
+          this.sendJobAccept(jobID);
       }
       return;
     }
@@ -15499,7 +15525,7 @@ export class Bridge {
       const queued = makeJob(-1, "accepted");
       await this.upsertJobWithOffer(queued, openurl);
       this.enqueueHandoffDrive({ jobID, purpose: "handoff" });
-      this.send("job_accept", {}, jobID);
+      this.sendJobAccept(jobID);
       await this.drainHandoffDriveQueue();
       return;
     }
@@ -15525,7 +15551,7 @@ export class Bridge {
     this.beginProviderDrive(jobID);
     await this.upsertJobWithOffer(makeJob(tabID), openurl);
     this.registerHandoffDrive(jobID, tabID);
-    this.send("job_accept", {}, jobID);
+    this.sendJobAccept(jobID);
     this.wakeEffectGovernor();
   }
   private async failDelivery(

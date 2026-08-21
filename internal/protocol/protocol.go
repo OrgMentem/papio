@@ -1729,6 +1729,32 @@ type ErrorPayload struct {
 // job_reject, cancel, handoff_focus).
 type EmptyPayload struct{}
 
+// JobAcceptDisposition* name what an extension is doing with an offer it has
+// just acknowledged. The distinction exists because `job_accept` used to mean
+// both "I am driving this" and "I have it queued behind my one drive slot",
+// and nothing on the wire could tell them apart — so the daemon charged a
+// fruitless drive epoch for a paper that was only ever waiting its turn, and
+// quiesced a healthy backlog three waits later.
+const (
+	JobAcceptDispositionDriving = "driving"
+	JobAcceptDispositionQueued  = "queued"
+)
+
+// JobAcceptPayload acknowledges one offer. An absent disposition means
+// driving: an older extension cannot say, and its acks have always been
+// counted as drives, so the accounting for a shipped peer is unchanged.
+type JobAcceptPayload struct {
+	Disposition string `json:"disposition,omitempty"`
+}
+
+func (p *JobAcceptPayload) validate() error {
+	switch p.Disposition {
+	case "", JobAcceptDispositionDriving, JobAcceptDispositionQueued:
+		return nil
+	}
+	return fmt.Errorf("job_accept disposition %q is not recognised (fail closed)", p.Disposition)
+}
+
 // TriageSnapshotRequestPayload requests one immutable inbox page. Schema
 // versions are negotiated explicitly because a future snapshot schema cannot
 // safely add fields to this locked browser message family.
@@ -3574,7 +3600,14 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			err = p.validate()
 		}
 		msg.Payload = p
-	case MsgAck, MsgJobAccept, MsgJobReject, MsgCancel, MsgHandoffFocus:
+	case MsgJobAccept:
+		p := &JobAcceptPayload{}
+		err = strictDecode(env.Payload, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgAck, MsgJobReject, MsgCancel, MsgHandoffFocus:
 		p := &EmptyPayload{}
 		err = strictDecode(env.Payload, p)
 		msg.Payload = p

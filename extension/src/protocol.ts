@@ -968,6 +968,14 @@ export interface PdfGrabRequestPayload {
   title?: string;
 }
 
+/** One offer acknowledgement. `queued` says this extension took the offer into
+ * its own queue behind its single drive slot and is NOT driving it, so the
+ * daemon must not charge the paper a drive epoch for waiting. Absent means
+ * driving, which is what every ack meant before this field existed. */
+export interface JobAcceptPayload {
+  disposition?: "driving" | "queued";
+}
+
 export interface PdfGrabStatusRequestPayload {
   request_id: string;
   grab_id: string;
@@ -5491,8 +5499,18 @@ function validatePayload(
       }
       break;
     }
+    case "job_accept": {
+      requireFields<JobAcceptPayload>(p, "job_accept", {
+        disposition: "optional",
+      });
+      if ("disposition" in p) {
+        const disposition = str(p, "disposition", type, 16);
+        if (disposition !== "driving" && disposition !== "queued")
+          fail(`${type}.disposition is invalid`);
+      }
+      break;
+    }
     case "ack":
-    case "job_accept":
     case "job_reject":
     case "cancel":
     case "handoff_focus": {

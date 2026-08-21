@@ -13921,3 +13921,131 @@ func TestInstitutionalReofferSkipsFruitlessSiblings(t *testing.T) {
 		t.Fatal("healthy sibling never reached the wire after a sign-in")
 	}
 }
+
+// TestQueuedAcceptsAreNotFruitlessDrives pins the accounting bug that retired
+// a whole backlog. `job_accept` used to mean both "driving" and "queued behind
+// my one drive slot", and an OFFER opened an epoch by itself — so a paper that
+// papio merely asked about, and that the extension never drove, was charged a
+// fruitless drive. Measured live 2026-08-21: 78 papers permanently quiesced on
+// 438 accepted handoffs, 77 of those papers having no `browser_candidates` row
+// at all.
+func TestQueuedAcceptsAreNotFruitlessDrives(t *testing.T) {
+	_, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_queued_accounting", handoffWork())
+	action := openHandoffAction(t, jobs, id)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Six offer/queued-accept cycles, each a full lease apart: the shape of a
+	// paper waiting behind another paper's sign-in, twice over the budget.
+	at := created
+	for range 2 * job.MaxAutomaticHandoffEpochs {
+		at = at.Add(job.HandoffAcceptedLease + 10*time.Second)
+		appendEventAt(t, jobs, id, "browser.handoff_offered",
+			map[string]any{"requires_auth": true}, at)
+		appendEventAt(t, jobs, id, "browser.job_accept",
+			map[string]any{"disposition": job.JobAcceptDispositionQueued}, at.Add(time.Second))
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := at.Add(job.HandoffAcceptedLease + time.Second)
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, now)
+	if state.FruitlessEpochs != 0 {
+		t.Fatalf("fruitless epochs after %d queue waits = %d, want 0",
+			2*job.MaxAutomaticHandoffEpochs, state.FruitlessEpochs)
+	}
+	if state.Quiesced {
+		t.Fatal("quiesced by waiting its turn, which is papio's own queue and not the paper's failure")
+	}
+
+	// An ack with no disposition is an older extension, whose acks have always
+	// meant a drive: the silent-drive incident must still be caught.
+	silent := park(t, jobs, "wr_silent_drive", handoffWork())
+	silentAction := openHandoffAction(t, jobs, silent)
+	silentCreated, err := time.Parse(time.RFC3339Nano, silentAction.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at = silentCreated
+	for range job.MaxAutomaticHandoffEpochs {
+		at = at.Add(job.HandoffAcceptedLease + 10*time.Second)
+		appendEventAt(t, jobs, silent, "browser.handoff_offered",
+			map[string]any{"requires_auth": true}, at)
+		appendEventAt(t, jobs, silent, "browser.job_accept", nil, at.Add(time.Second))
+	}
+	events, err = jobs.Events(ctx, silent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = job.ProjectHandoffOfferState(events, silentAction.CreatedAt,
+		at.Add(job.HandoffAcceptedLease+time.Second))
+	if !state.Quiesced {
+		t.Fatalf("dispositionless acks did not quiesce (epochs=%d); an older extension's ack means a drive",
+			state.FruitlessEpochs)
+	}
+}
+
+// TestHandoffEpochsResetRepairsAStreak pins the repair path migration 0045
+// uses. The verdict is derived from history, so correcting the rule cannot
+// un-charge accepts already recorded without a disposition; the reset says so
+// explicitly instead of guessing which historical acks were queue waits.
+func TestHandoffEpochsResetRepairsAStreak(t *testing.T) {
+	_, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_epoch_repair", handoffWork())
+	action := openHandoffAction(t, jobs, id)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := created
+	for range job.MaxAutomaticHandoffEpochs {
+		at = at.Add(job.HandoffAcceptedLease + 10*time.Second)
+		appendEventAt(t, jobs, id, "browser.handoff_offered",
+			map[string]any{"requires_auth": true}, at)
+		appendEventAt(t, jobs, id, "browser.job_accept", nil, at.Add(time.Second))
+	}
+	now := at.Add(job.HandoffAcceptedLease + time.Second)
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !job.ProjectHandoffOfferState(events, action.CreatedAt, now).Quiesced {
+		t.Fatal("precondition: the streak must be quiesced before repair")
+	}
+
+	appendEventAt(t, jobs, id, job.HandoffEpochsResetEvent,
+		map[string]any{"reason": "queued_accepts_charged_as_drives"}, now)
+	events, err = jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, now.Add(time.Second))
+	if state.Quiesced || state.FruitlessEpochs != 0 {
+		t.Fatalf("after repair: quiesced=%v epochs=%d, want false/0",
+			state.Quiesced, state.FruitlessEpochs)
+	}
+
+	// A genuinely dead paper re-quiesces on its next three real drives; the
+	// repair is not an exemption.
+	at = now
+	for range job.MaxAutomaticHandoffEpochs {
+		at = at.Add(job.HandoffAcceptedLease + 10*time.Second)
+		appendEventAt(t, jobs, id, "browser.handoff_offered",
+			map[string]any{"requires_auth": true}, at)
+		appendEventAt(t, jobs, id, "browser.job_accept", nil, at.Add(time.Second))
+	}
+	events, err = jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !job.ProjectHandoffOfferState(events, action.CreatedAt,
+		at.Add(job.HandoffAcceptedLease+time.Second)).Quiesced {
+		t.Fatal("a repaired paper that then burned its budget again must re-quiesce")
+	}
+}

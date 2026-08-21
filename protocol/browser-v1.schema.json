@@ -1967,7 +1967,6 @@
           "type": {
             "enum": [
               "ack",
-              "job_accept",
               "job_reject",
               "cancel",
               "handoff_focus"
@@ -1980,6 +1979,20 @@
           "payload": {
             "type": "object",
             "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "job_accept" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "disposition": { "enum": ["driving", "queued"] }
+            }
           }
         }
       }

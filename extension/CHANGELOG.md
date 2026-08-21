@@ -32,6 +32,15 @@ for the full pre-split extension history.
   your library". Nothing is hidden: the queued clause also appears when the ask
   count is zero, so institutional work in flight is still visible with no
   session evidence and keepalive off.
+- **An acknowledgement now says whether *papio* is driving a paper or queueing
+  it.** The extension drives one paper at a time and queues the rest, but both
+  cases sent the same bare "got it" — so the app counted a paper's turn in the
+  queue as a browser attempt that produced nothing, and gave up on it after
+  three. One stuck sign-in holding the only drive slot could therefore retire
+  every paper behind it without any of them ever opening a tab. The queued case
+  is now named on the wire, and the disposition is read from the paper's own
+  status so seventeen call sites cannot drift apart. Papers already retired
+  this way are restored by the app on upgrade.
 - **A *papio* reload no longer forgets the paper you were signing in for.**
   Reloading or updating the extension wipes its working state, and the daemon
   cannot re-announce a paper that already owns a live page — so a paper stopped

@@ -1888,6 +1888,31 @@ test("job_offer opens exactly one tab and replies job_accept", async () => {
   expect(accept?.job_id).toBe("job_0001_tyler");
   expect(h.backend.store.activeJobs.length).toBe(1);
 });
+
+// A drive says so, and a paper parked behind the single drive slot says the
+// opposite. The daemon charges a fruitless drive epoch per DRIVING accept and
+// retires a paper after three, so a queued accept reported as a drive retires
+// a paper for waiting its turn — 78 of them, measured live on 2026-08-21.
+test("a driving accept omits the disposition and a queued one names it", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0001_tyler"));
+  const driving = h.frames().find((f) => f.type === "job_accept");
+  expect(driving?.payload).toEqual({});
+
+  // The cold institutional park: no surface is created, the job is queued for
+  // explicit engagement, and the accept must not read as a drive.
+  const cold = makeHarness();
+  await cold.bridge.start();
+  await cold.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  const offer = jobOffer("job_0002_cold") as Record<string, unknown>;
+  (offer.payload as Record<string, unknown>)["requires_auth"] = true;
+  await cold.port.inbound(offer);
+  expect(cold.tabs.created).toEqual([]);
+  expect(cold.backend.store.activeJobs[0]?.status).toBe("queued");
+  const queued = cold.frames().find((f) => f.type === "job_accept");
+  expect(queued?.payload).toEqual({ disposition: "queued" });
+});
 test("a re-offer after a simulated worker restart recovers the durable ledger tab", async () => {
   const h = makeHarness();
   installManagedTabLedger(h, {});
