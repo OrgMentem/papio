@@ -708,6 +708,75 @@ const claimSelect = `SELECT id, candidate_id, browser_holder_generation, materia
 	COALESCE(binding_id,''), tab_id, phase, route_issuance_ordinal, effect_ordinal,
 	COALESCE(lease_until,''), created_at, updated_at FROM materialization_claims`
 
+// evictLostSurfaceClaimTx retires a lapsed claim whose surface the browser has
+// just proved it no longer holds, and reports whether it did.
+//
+// The proof is the request itself: the browser in charge does not ask papio to
+// mint a fresh surface for a paper it still has one for. That is the consult
+// self-heal's first-hand reasoning inverted — there the daemon directs a job at
+// a surface that turns out not to exist; here the browser asks for a surface it
+// would already have.
+//
+// Three guards make the evidence trustworthy, and each is load-bearing:
+//
+//   - The claim's LEASE HAS ALREADY LAPSED. The caller reaches this only after
+//     the live-lease select above found nothing, so a claim whose holder was
+//     recently active is never touched. This is what stops a concurrent request
+//     from another generation — a reconnect racing an in-flight claim, a dev
+//     harness beside the operator's browser — from evicting a surface that
+//     really exists.
+//   - Only a STRICTLY NEWER holder generation counts. An older generation is a
+//     stale straggler and says nothing about the current surface.
+//   - An IN-FLIGHT institutional permit vetoes eviction outright. `settled`
+//     means the provider effect is over, so retiring loses nothing; `held` or
+//     `unknown_completion` means something may be happening at the provider
+//     right now, and papio must never start a second attempt across an
+//     irreversible effect. A request is evidence about a surface, never
+//     permission to interrupt one.
+//
+// Without this, a settled effect whose page died was unretirable in principle:
+// the claim is held until an artifact winner is decided, no winner can arrive
+// once the page is gone, and the loss report that would retire it needs an
+// identity only a later bind provides — which the held claim itself refuses.
+// Measured live 2026-08-21: five claims stranded exactly so, one job re-asking
+// roughly once a second, 925 refusals and climbing.
+func evictLostSurfaceClaimTx(ctx context.Context, tx *sql.Tx,
+	in MaterializationClaimInput, stamp string) (bool, error) {
+	lapsed, err := claimScan(tx.QueryRowContext(ctx, claimSelect+` WHERE candidate_id=?
+		AND phase IN ('claimed','bound','route_issued','navigated')
+		AND browser_holder_generation < ?
+		AND NOT EXISTS (
+		  SELECT 1 FROM effect_permits p
+		   WHERE p.binding_id=materialization_claims.binding_id
+		     AND p.effect_kind='institutional'
+		     AND p.status IN ('held','unknown_completion'))
+		ORDER BY id LIMIT 1`, in.CandidateID, in.BrowserHolderGeneration))
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE materialization_claims SET phase='abandoned', updated_at=?
+		WHERE id=?`, stamp, lapsed.ID); err != nil {
+		return false, err
+	}
+	bindings := []string{lapsed.BindingID}
+	if err := consumeCloseAuthorizationsTx(ctx, tx, bindings, stamp); err != nil {
+		return false, err
+	}
+	// The surface is gone, so its institution must not stay held — the same
+	// reason the expiry and terminal paths release it.
+	if err := releaseAuthenticationEntryLeasesForBindingsTx(ctx, tx, bindings, stamp); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates SET status='eligible', updated_at=?
+		WHERE id=?`, stamp, in.CandidateID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationClaimInput) (*MaterializationClaim, error) {
 	if in.CandidateID == "" || in.MaterializationKind == "" || in.LeaseUntil.IsZero() {
 		return nil, errors.New("materialization claim requires candidate, kind, and lease")
@@ -816,6 +885,12 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 	// A caller may have lost the response after the insert committed. Return
 	// that exact live claim (including its durable binding) instead of making a
 	// retry look busy. Authority and revision fences above make this safe.
+	//
+	// This select only ever finds claims whose lease is still LIVE, so a
+	// nonmatching holder is refused here unconditionally: a live lease means the
+	// holder of record was recently active, and a concurrent request from
+	// another generation is a race, never evidence. Eviction belongs below,
+	// where the lease has already lapsed.
 	existing, err := claimScan(tx.QueryRowContext(ctx, claimSelect+` WHERE candidate_id=?
 		AND phase IN ('claimed','bound','route_issued','navigated')
 		AND (lease_until IS NULL OR lease_until > ?) ORDER BY id LIMIT 1`, in.CandidateID, now))
@@ -835,9 +910,21 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 
 	if candidateStatus != "eligible" {
 		if candidateStatus == "claimed" || candidateStatus == "materializing" {
-			return nil, ErrMaterializationBusy
+			// The candidate is held but no LIVE-leased claim holds it, so the
+			// holder of record has lapsed. If the browser now in charge is
+			// asking for a fresh surface, that is first-hand proof the lapsed
+			// one is gone, and this is the only signal that can retire a claim
+			// whose settled provider effect will never produce a winner.
+			evicted, evictErr := evictLostSurfaceClaimTx(ctx, tx, in, now)
+			if evictErr != nil {
+				return nil, evictErr
+			}
+			if !evicted {
+				return nil, ErrMaterializationBusy
+			}
+		} else {
+			return nil, ErrMaterializationConflict
 		}
-		return nil, ErrMaterializationConflict
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO materialization_claims
 		(id, candidate_id, browser_holder_generation, materialization_kind, binding_id, tab_id, phase,

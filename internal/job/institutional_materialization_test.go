@@ -132,10 +132,86 @@ func TestMaterializationClaimExactRetryRecoversBinding(t *testing.T) {
 	if retry.ID != first.ID || retry.BindingID != first.BindingID || retry.Phase != first.Phase {
 		t.Fatalf("retry = %+v, first = %+v", retry, first)
 	}
-	nonmatching := input
-	nonmatching.BrowserHolderGeneration++
-	if _, err := js.ClaimMaterialization(ctx, nonmatching); !errors.Is(err, ErrMaterializationBusy) {
-		t.Fatalf("nonmatching holder retry = %v, want busy", err)
+	// A live lease is never evictable, whoever asks: the holder of record was
+	// recently active, so a request from another generation is a race.
+	takeover := input
+	takeover.BrowserHolderGeneration++
+	if _, err := js.ClaimMaterialization(ctx, takeover); !errors.Is(err, ErrMaterializationBusy) {
+		t.Fatalf("takeover across a live lease = %v, want busy", err)
+	}
+	// Once the lease lapses, a STRICTLY NEWER holder asking for this candidate
+	// is the browser telling papio it has no surface for the paper any more, so
+	// it takes the candidate over and the stranded claim is retired. Chosen
+	// 2026-08-21: a settled effect whose page is gone was otherwise unretirable
+	// in principle, and one job re-asked 925 times against its own corpse.
+	if _, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims SET lease_until=?
+		WHERE id=?`, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	next, err := js.ClaimMaterialization(ctx, takeover)
+	if err != nil {
+		t.Fatalf("newer holder takeover: %v", err)
+	}
+	if next.ID == first.ID {
+		t.Fatalf("takeover reused the stranded claim %s", first.ID)
+	}
+	stranded, err := js.GetMaterializationClaim(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stranded.Phase != "abandoned" {
+		t.Fatalf("stranded claim = %q, want abandoned", stranded.Phase)
+	}
+}
+
+// The eviction's safety guard. `settled` means the provider effect is over, so
+// retiring the claim loses nothing; a permit still HELD means something may be
+// happening at the provider right now, and papio must never let a second
+// attempt start across an irreversible effect. A newer holder's request is
+// evidence about a surface, never permission to interrupt one.
+func TestNewerHolderCannotEvictAClaimWithAnEffectInFlight(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID := permitInstitutionalJob(t, js, "permit-inflight-claim")
+	input := MaterializationClaimInput{
+		CandidateID: candidateID, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1,
+		MaterializationKind: "browser_tab", BrowserHolderGeneration: 3,
+		LeaseUntil: time.Now().Add(time.Minute),
+	}
+	claim, err := js.ClaimMaterialization(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.BindMaterialization(ctx, claim.ID, claim.BindingID, 3, 1, 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome, err := js.AcquireInstitutionalEffectPermit(ctx, InstitutionalEffectPermitAcquireInput{
+		JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+		SafetyDomainID: "domain", InstitutionalRequestID: "request-inflight-claim",
+		JobAttemptRevision: 1, BrowserHolderGeneration: 3,
+		ExpectedEffectOrdinal: 0, LeaseUntil: time.Now().Add(time.Minute),
+		Authorization: EffectPermitEvent{Kind: "institutional.authorized"},
+	}); err != nil || outcome != EffectPermitAcquired {
+		t.Fatalf("acquire outcome=%v err=%v", outcome, err)
+	}
+	// Lapse the lease so the ONLY thing standing between the newer holder and
+	// this claim is the in-flight permit.
+	if _, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims SET lease_until=?
+		WHERE id=?`, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	takeover := input
+	takeover.BrowserHolderGeneration++
+	if _, err := js.ClaimMaterialization(ctx, takeover); !errors.Is(err, ErrMaterializationBusy) {
+		t.Fatalf("takeover across a held permit = %v, want busy", err)
+	}
+	held, err := js.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Phase == "abandoned" {
+		t.Fatal("a claim with an effect in flight must never be evicted")
 	}
 }
 

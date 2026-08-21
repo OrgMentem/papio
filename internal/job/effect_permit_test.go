@@ -744,7 +744,10 @@ func TestOccupyingInstitutionalPermitBlocksClaimRetirement(t *testing.T) {
 	}
 }
 
-func TestSettledInstitutionalPermitKeepsExpiredClaimOwnedUntilWinner(t *testing.T) {
+// A settled effect's claim survives every sweep — no timer may retire it,
+// because the effect really happened and its artifact winner is undecided. Only
+// the browser reporting that the surface is gone releases it.
+func TestSettledInstitutionalPermitSurvivesSweepsButNotBrowserEvidence(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
 	jobID, candidateID := permitInstitutionalJob(t, js, "permit-settled-claim")
@@ -797,13 +800,31 @@ func TestSettledInstitutionalPermitKeepsExpiredClaimOwnedUntilWinner(t *testing.
 	if err != nil || candidate == nil || candidate.Status != "claimed" {
 		t.Fatalf("candidate=%+v err=%v, want claimed", candidate, err)
 	}
-	if _, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+	// The sweep must still keep its hands off — that is what the assertions
+	// above pin, and it is why a settled effect cannot be retired on a timer.
+	// But a STRICTLY NEWER holder asking for this candidate is the browser
+	// reporting first-hand that the surface is gone, and that does retire it.
+	// Chosen 2026-08-21: otherwise a settled effect whose page died was
+	// unretirable in principle — no artifact winner can arrive once the page is
+	// gone — and one job re-asked 925 times against its own corpse.
+	replacement, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
 		CandidateID: candidateID, JobAttemptRevision: 1,
 		InstitutionProfileRevision: 1, RouteRevision: 1,
 		MaterializationKind: "browser_tab", BrowserHolderGeneration: 4,
 		LeaseUntil: time.Now().Add(time.Minute),
-	}); !errors.Is(err, ErrMaterializationBusy) {
-		t.Fatalf("replacement claim err=%v, want busy", err)
+	})
+	if err != nil {
+		t.Fatalf("newer holder replacement: %v", err)
+	}
+	if replacement.ID == claim.ID {
+		t.Fatalf("replacement reused the stranded claim %s", claim.ID)
+	}
+	retired, err := js.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired.Phase != "abandoned" {
+		t.Fatalf("stranded claim = %q, want abandoned", retired.Phase)
 	}
 }
 
