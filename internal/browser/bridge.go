@@ -10891,11 +10891,15 @@ func (b *Bridge) institutionSignInHeldElsewhere(ctx context.Context, candidate j
 	if lease.OwnerID == candidate.JobID || lease.HumanOwnerID == candidate.JobID {
 		return false
 	}
-	// A lapsed slot is free. The store's own replacement path compares this
-	// deadline as text against its clock, so this must not disagree with it.
-	if lease.LeaseUntil != "" && lease.LeaseUntil <= b.now().UTC().Format(time.RFC3339Nano) {
-		return false
-	}
+	// Deliberately NO lapse check here. getAuthenticationEntryLeaseTx already
+	// expires a past-deadline reserved lease in place and re-reads authority,
+	// so a lapsed slot arrives here as state 'expired' and falls through as
+	// free. The one case where it hands back a past-deadline lease still
+	// marked 'reserved' is when an institutional effect permit for that
+	// binding is 'held'/'unknown_completion' — an irreversible provider action
+	// may be in flight. Reading that as a free slot inverted the invariant
+	// this whole subsystem exists to protect, and a deadline comparison here
+	// did exactly that until it was removed.
 	switch lease.State {
 	case job.AuthenticationEntryLeaseHuman:
 		return lease.EntitledAt == ""
