@@ -9908,6 +9908,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	// leaves the legacy loop room instead of a same-poll flood of distinct
 	// automatic claims spending the whole transport budget.
 	automaticAdmitted := map[string]bool{}
+	automaticParked := map[string]bool{}
 	if b.claimBoundAutomaticMaterializationEnabled() {
 		automaticCap := maxOutstandingOffers / 2
 		if automaticCap < 1 {
@@ -9916,7 +9917,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		if automaticCap > slots {
 			automaticCap = slots
 		}
-		automaticAdmitted = b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, automaticCap)
+		automaticAdmitted, automaticParked = b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, automaticCap)
 		slots -= len(automaticAdmitted)
 		if slots < 0 {
 			slots = 0
@@ -9934,6 +9935,13 @@ jobLoop:
 			// Serviced by the claim-paced materialization path below; a
 			// capable holder must never fall back to a URL-bearing legacy
 			// offer for it.
+			continue
+		}
+		if automaticParked[id] {
+			// The claim-paced gate parked this one because its institution's
+			// sign-in slot belongs to another job. Offering it here anyway is
+			// what produced a scaffold tab built and torn down 2.7 times a
+			// second while a sibling held the slot.
 			continue
 		}
 		if b.materializationTracked[id] && !b.focusPending[id] && b.institutionalMaterializationAvailable() {
@@ -10767,13 +10775,25 @@ func (b *Bridge) claimBoundAutomaticMaterializationEnabled() bool {
 //
 // limit bounds total admissions to the remaining maxOutstandingOffers
 // budget shared with legacy/direct-route offers. The caller holds b.mu.
+// It returns both the candidates it admitted and the ones it deliberately
+// PARKED because their institution's sign-in slot is held by another job. The
+// parked set is load-bearing: without it the legacy loop below picks the
+// candidate up and offers it anyway, discarding this gate's decision, and the
+// paper then claims, builds a scaffold tab, is refused at bind with
+// "another sign-in for this institution is in progress", tears the tab down,
+// and repeats. Measured live 2026-08-21: two siblings at one institution cycled
+// that way 2.7 times a second for as long as a third job held the slot —
+// creating and destroying a browser tab each time. The bind refusal's own
+// comment claimed "the scheduler re-offers this candidate once the institution
+// is free"; it did not, because the park never reached the scheduler.
 func (b *Bridge) admitAutomaticMaterializationCandidates(
 	ctx context.Context, scheduled []job.BrowserCandidateDescriptor,
 	handoff map[string]job.HumanAction, limit int,
-) map[string]bool {
+) (map[string]bool, map[string]bool) {
 	admitted := map[string]bool{}
+	parked := map[string]bool{}
 	if limit <= 0 {
-		return admitted
+		return admitted, parked
 	}
 	claimSlotUsed := map[string]bool{}
 	for _, descriptor := range scheduled {
@@ -10823,13 +10843,15 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 			}
 			claimSlotUsed[claimID] = true
 		default:
-			// Reserved by a different job, human-but-not-entitled, expired,
-			// or unknown state: parked.
+			// Reserved by a different job, human-but-not-entitled, expired, or
+			// unknown state: parked. Record it so the legacy loop cannot
+			// undo this decision by offering the candidate anyway.
+			parked[descriptor.JobID] = true
 			continue
 		}
 		admitted[descriptor.JobID] = true
 	}
-	return admitted
+	return admitted, parked
 }
 func (b *Bridge) providerDirectGetAvailable() bool {
 	if b == nil || b.holder == nil || !slices.Contains(b.Features, providerDirectGetV1Feature) {

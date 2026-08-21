@@ -1115,6 +1115,45 @@ func TestAutomaticCandidateOfferWakeFloodPacesToOneClaimOwner(t *testing.T) {
 	}
 }
 
+// The claim-paced gate parks a candidate whose institution slot belongs to
+// another job, and that park must reach the scheduler. It did not: the legacy
+// loop picked the candidate up and offered it anyway, so the paper claimed,
+// built a scaffold tab, was refused at bind with "another sign-in for this
+// institution is in progress", tore the tab down, and repeated — measured live
+// 2026-08-21 at 2.7 cycles a second, each one creating and destroying a browser
+// tab, for as long as the third job held the slot. The slot holder here owns no
+// candidate in this poll, which is what makes the park the only signal.
+func TestCandidateParkedByAnotherJobsSignInIsNotOfferedAnyway(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, authClaimHello(t))
+	const claimID = "auto-claim-park-shared"
+	seedAuthenticationClaimProfile(t, jobs, claimID)
+	// A third job holds the institution's sign-in slot and is not itself
+	// scheduled in this poll.
+	if _, err := jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+		AuthenticationClaimID:   claimID,
+		LeaseID:                 "lease-park-holder",
+		OwnerID:                 "job_park_slot_holder",
+		BrowserHolderGeneration: 1,
+		LeaseUntil:              time.Now().Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatalf("reserve the slot for a third job: %v", err)
+	}
+	for i := range 2 {
+		jobID := parkInstitutional(t, jobs, fmt.Sprintf("auto-claim-park-%d", i), handoffWork(), "")
+		explicitMaterializationCandidate(t, jobs, jobID, fmt.Sprintf("domain-park-%d", i))
+	}
+
+	msgs, _ := runSync(t, b)
+	if got := countType(msgs, protocol.MsgInstitutionalCandidateOffer); got != 0 {
+		t.Fatalf("candidate offers = %d, want 0 while another job holds the sign-in: %v", got, msgs)
+	}
+	if got := countType(msgs, protocol.MsgJobOffer); got != 0 {
+		t.Fatalf("legacy job offers = %d, want 0 — a parked candidate must not fall back to a URL-bearing offer: %v", got, msgs)
+	}
+}
+
 // TestLegacySessionAutomaticPathStaysDarkWithoutMaterializationFeature pins
 // the compatibility boundary: a session that never negotiated
 // institutional_materialization_v1 gets exactly today's legacy behavior —
