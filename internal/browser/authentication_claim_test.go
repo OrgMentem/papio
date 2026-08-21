@@ -1441,6 +1441,88 @@ func TestPhantomSlotHolderDoesNotWithholdWork(t *testing.T) {
 	}
 }
 
+// TestSlotArbitrationRunsWithNoOfferBudget pins the deadlock that kept 129
+// papers waiting a week on the operator's machine.
+//
+// maxOutstandingOffers is 4. Four legacy offers on papers parked at an
+// authentication wall saturate it indefinitely, so the automatic admission
+// loop was entered with limit 0 - measured on 32 of 34 consecutive live polls.
+// It returned immediately, and it is the ONLY code that retires an institution
+// slot held by a job which can never bind. The papers behind the dead slot
+// therefore kept their offers, the offers kept the budget full, and the full
+// budget kept the cleanup from running.
+//
+// Reading a lease and retiring a dead one send no frame and cost no slot, so
+// they must not be priced as offers. Only reserving and admitting are.
+func TestSlotArbitrationRunsWithNoOfferBudget(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "no-budget-shared")
+
+	waiting := parkInstitutional(t, jobs, "no-budget-waits", handoffWork(), "")
+	waitingCandidate := explicitMaterializationCandidate(t, jobs, waiting, "domain-no-budget")
+	claimID := settleInstitutionProfiles(t, b, jobs)
+
+	// The settling poll may legitimately have reserved the slot for the waiting
+	// paper; this test needs the phantom holding it.
+	if lease, found, err := jobs.GetAuthenticationEntryLease(ctx, claimID); err != nil {
+		t.Fatalf("read lease: %v", err)
+	} else if found {
+		if err := jobs.ExpireAuthenticationEntryLease(ctx, claimID,
+			lease.BrowserHolderGeneration, lease.LeaseID); err != nil {
+			t.Fatalf("free the slot: %v", err)
+		}
+	}
+	phantom := parkInstitutional(t, jobs, "no-budget-phantom", handoffWork(), "")
+	if _, err := jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: claimID, LeaseID: "lease-no-budget-phantom",
+		OwnerID: phantom, BrowserHolderGeneration: 1, LeaseUntil: b.now().Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatalf("phantom reserve: %v", err)
+	}
+
+	candidate, err := jobs.GetBrowserCandidate(ctx, waitingCandidate)
+	if err != nil || candidate == nil {
+		t.Fatalf("candidate: %+v err=%v", candidate, err)
+	}
+	scheduled := []job.BrowserCandidateDescriptor{{
+		CandidateID: candidate.ID, JobID: candidate.JobID,
+		JobAttemptRevision:         candidate.JobAttemptRevision,
+		InstitutionProfileID:       candidate.InstitutionProfileID,
+		InstitutionProfileRevision: candidate.InstitutionProfileRevision,
+		RouteRevision:              candidate.RouteRevision,
+		SafetyDomainID:             candidate.SafetyDomainID,
+		Status:                     candidate.Status,
+	}}
+	handoff := map[string]job.HumanAction{waiting: {
+		JobID: waiting, Kind: "openurl_handoff", Status: "open", RequiresAuth: true,
+	}}
+
+	b.mu.Lock()
+	// This test isolates the budget gate: the focus and live-legacy-offer skips
+	// are separate decisions with their own tests, and the settling poll above
+	// may have set either.
+	delete(b.focusPending, waiting)
+	delete(b.offered, waiting)
+	admitted, _ := b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, 0)
+	b.mu.Unlock()
+	if len(admitted) != 0 {
+		t.Fatalf("a spent offer budget must admit nobody, got %v", admitted)
+	}
+
+	// The point of the pass: with nothing left to offer, the dead slot is still
+	// retired, so the very next poll with budget can arbitrate it.
+	lease, found, err := jobs.GetAuthenticationEntryLease(ctx, claimID)
+	if err != nil || !found {
+		t.Fatalf("lease after a zero-budget pass: found=%v err=%v", found, err)
+	}
+	if lease.State != job.AuthenticationEntryLeaseExpired {
+		t.Fatalf("a phantom slot survived a zero-budget poll as %q - this is the deadlock: cleanup priced as an offer",
+			lease.State)
+	}
+}
+
 // offersForJob counts candidate offers addressed to one job.
 func offersForJob(msgs []*protocol.BrowserMessage, jobID string) int {
 	n := 0

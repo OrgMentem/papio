@@ -10840,14 +10840,25 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 ) (map[string]bool, map[string]bool) {
 	admitted := map[string]bool{}
 	parked := map[string]bool{}
-	if limit <= 0 {
-		return admitted, parked
-	}
+	// Arbitration is NOT gated on the offer budget, and that distinction was a
+	// live deadlock. maxOutstandingOffers is 4; four legacy offers on papers
+	// parked at an authentication wall saturate it indefinitely, so `limit`
+	// arrived here as 0 on 32 of 34 consecutive polls (measured on the
+	// operator's machine 2026-08-21 with one temporary log line). The loop
+	// returned immediately - and this loop is the ONLY path that retires an
+	// institution slot held by a job which can never bind. So: a phantom
+	// holder kept the library's single sign-in entry, the papers behind it
+	// could never complete, their offers kept the budget full, and the budget
+	// kept the cleanup from running. 129 papers waited a week at 1-2 a day.
+	//
+	// Reading a lease, retiring a dead one and parking a dependent are
+	// maintenance, not transport: they send no frame and cost no slot. Only
+	// RESERVING and ADMITTING spend the budget, so only those are capped.
+	// Never reserve a slot this poll cannot also offer - that would mint the
+	// very phantom this function exists to retire.
 	claimSlotUsed := map[string]bool{}
 	for _, descriptor := range scheduled {
-		if len(admitted) >= limit {
-			break
-		}
+		canAdmit := len(admitted) < limit
 		if descriptor.JobID == "" || b.focusPending[descriptor.JobID] || b.offered[descriptor.JobID] {
 			continue
 		}
@@ -10871,7 +10882,32 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 		}
 		switch {
 		case !found:
-			if claimSlotUsed[claimID] {
+			if claimSlotUsed[claimID] || !canAdmit {
+				continue
+			}
+			leaseID := evidenceObservationID("authentication_claim_lease", claimID, descriptor.JobID, strconv.FormatInt(b.epoch, 10))
+			if _, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+				AuthenticationClaimID: claimID, LeaseID: leaseID, OwnerID: descriptor.JobID,
+				BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
+			}); reserveErr != nil {
+				continue
+			}
+			claimSlotUsed[claimID] = true
+		case lease.State == job.AuthenticationEntryLeaseExpired && b.retiredSlotIsCold(lease):
+			// A COLD retired slot is free. Nothing offered an `expired` row to
+			// Reserve, so an institution froze the moment one appeared - 129
+			// papers behind a single retired row, measured 2026-08-21. Reserve
+			// already replaces an expired row through a fenced reset, so the
+			// whole fix is asking it to.
+			//
+			// Cold, not merely expired: a freshly retired row must NOT be
+			// admissible, and that is not a timer for its own sake.
+			// TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim
+			// pins it - after owner_closed, a dependent must wait for fresh
+			// arbitration instead of riding the entitlement that just ended. It
+			// caught this exact change taking the row immediately, which is why
+			// the row's age carries the decision.
+			if claimSlotUsed[claimID] || !canAdmit {
 				continue
 			}
 			leaseID := evidenceObservationID("authentication_claim_lease", claimID, descriptor.JobID, strconv.FormatInt(b.epoch, 10))
@@ -10891,9 +10927,9 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 			}
 			claimSlotUsed[claimID] = true
 		default:
-			// Reserved by a different job, human-but-not-entitled, expired, or
-			// unknown: parked. Record it so the legacy loop cannot undo this
-			// decision by offering the candidate anyway.
+			// Reserved by a different job, or human-but-not-entitled: parked.
+			// Record it so the legacy loop cannot undo this decision by
+			// offering the candidate anyway.
 			//
 			// Consulting the shared gate here is not cosmetic: it is what
 			// RETIRES a slot whose holder can never convert it. A reviewer
@@ -10904,14 +10940,56 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 			// reserve path, never admitted straight off a stale entitlement,
 			// which is what
 			// TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim
-			// pins. The next poll sees no live lease and reserves properly.
+			// pins.
+			//
+			// Claiming the slot for the rest of this poll is what makes that
+			// deferral true rather than merely intended. The gate may RETIRE
+			// the row it just read, and without this marker the next
+			// descriptor in the same loop sees an absent-or-expired lease and
+			// reserves it immediately - a plan reviewer named this exact
+			// same-poll race, which no outer transaction prevents because each
+			// descriptor reads the lease on its own.
+			// Whichever answer it gives - still held, or retired underneath us
+			// - this claim is spoken for until the next poll.
 			b.institutionSignInHeldElsewhere(ctx, descriptor)
+			claimSlotUsed[claimID] = true
 			parked[descriptor.JobID] = true
+			continue
+		}
+		if !canAdmit {
 			continue
 		}
 		admitted[descriptor.JobID] = true
 	}
 	return admitted, parked
+}
+
+// retiredSlotIsCold reports whether an `expired` entry-lease row has sat
+// untouched long enough that nothing can still be waiting for it, so an
+// ordinary Reserve may replace it.
+//
+// The threshold is job.AuthenticationEntryBindDeadline - the SAME window that
+// already bounds "a reservation that has not become a bound sign-in" - rather
+// than a new tunable. A retired row older than the interval in which a
+// legitimate fresh arbitration would have claimed it is not deferring to
+// anyone. This deliberately does NOT distinguish why the row was retired: an
+// owner_closed retirement and a phantom-holder retirement produce the same
+// shape (the plan's "expired rows are not all the same shape" is about the
+// binding column, which neither path can be relied on to set), so age is the
+// only honest discriminator.
+//
+// An unparseable or empty timestamp answers false: a row papio cannot date is
+// never declared cold, because wrongly reusing a live institution's entry is
+// the outcome this subsystem exists to prevent.
+func (b *Bridge) retiredSlotIsCold(lease *job.AuthenticationEntryLease) bool {
+	if lease == nil || strings.TrimSpace(lease.UpdatedAt) == "" {
+		return false
+	}
+	updated, err := time.Parse(time.RFC3339Nano, lease.UpdatedAt)
+	if err != nil {
+		return false
+	}
+	return b.now().UTC().Sub(updated.UTC()) >= job.AuthenticationEntryBindDeadline
 }
 
 // institutionSignInHeldElsewhere reports whether this candidate's institution
