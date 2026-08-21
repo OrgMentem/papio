@@ -5098,7 +5098,11 @@
                 },
                 "then": {
                   "required": ["claim_id", "binding_id"],
-                  "not": { "required": ["detail"] }
+                  "not": { "required": ["detail"] },
+                  "dependentRequired": {
+                    "authentication_claim_id": ["gate_occurrence_id"],
+                    "gate_occurrence_id": ["authentication_claim_id"]
+                  }
                 }
               },
               {
@@ -5119,7 +5123,9 @@
                   "not": {
                     "anyOf": [
                       { "required": ["claim_id"] },
-                      { "required": ["binding_id"] }
+                      { "required": ["binding_id"] },
+                      { "required": ["authentication_claim_id"] },
+                      { "required": ["gate_occurrence_id"] }
                     ]
                   }
                 }

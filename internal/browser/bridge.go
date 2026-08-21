@@ -1816,6 +1816,21 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 			return b.frameInstitutionalBind(jobID, result)
 		}
 	}
+	// A successfully bound surface must always hand the extension the
+	// authentication identity and the current login-gate occurrence. Without
+	// this pair, the extension cannot emit claim_observation/owner_closed for
+	// a pipeline-created surface and the daemon has no reliable close path.
+	// Establish the occurrence BEFORE committing the materialization bind:
+	// returning "bound" after a best-effort lookup failure strands a surface
+	// with no observation identity (ExtensionLifecycle review, 2026-08-21).
+	var gateOccurrenceID string
+	if authenticationClaimID != "" && profile != nil {
+		gateOccurrenceID, err = b.ensureAuthenticationClaimGateOccurrence(ctx, profile, authenticationClaimID, jobID, p.RequestID)
+		if err != nil || gateOccurrenceID == "" {
+			result.Outcome, result.Detail = "error", "authentication claim gate occurrence is unavailable"
+			return b.frameInstitutionalBind(jobID, result)
+		}
+	}
 	err = b.jobs.BindMaterializationWithLeaseOwner(ctx, claim.ID, p.BindingID, b.epoch,
 		candidate.InstitutionProfileRevision, p.TabID, authenticationClaimID, jobID)
 	if err != nil {
@@ -1836,19 +1851,9 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 	}
 	result.Outcome = "bound"
 	result.ClaimID, result.BindingID = claim.ID, p.BindingID
-	// Hand back the identity the browser needs to report this surface's loss.
-	// This pipeline has no consult, so nothing else ever tells it, and without
-	// it a pipeline-created surface can only be retired by a daemon-side sweep.
-	// Best-effort: a failure here must not fail a bind that already succeeded —
-	// the sweeps remain the backstop, exactly as before this field existed.
-	if authenticationClaimID != "" && profile != nil {
-		occurrenceID, occErr := b.ensureAuthenticationClaimGateOccurrence(ctx, profile, authenticationClaimID, jobID, p.RequestID)
-		if occErr != nil {
-			log.Printf("papio: bind gate occurrence for %s unavailable: %v", jobID, occErr)
-		} else if occurrenceID != "" {
-			result.AuthenticationClaimID = authenticationClaimID
-			result.GateOccurrenceID = occurrenceID
-		}
+	if authenticationClaimID != "" {
+		result.AuthenticationClaimID = authenticationClaimID
+		result.GateOccurrenceID = gateOccurrenceID
 	}
 	return b.frameInstitutionalBind(jobID, result)
 }
@@ -10858,8 +10863,20 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 			claimSlotUsed[claimID] = true
 		default:
 			// Reserved by a different job, human-but-not-entitled, expired, or
-			// unknown state: parked. Record it so the legacy loop cannot
-			// undo this decision by offering the candidate anyway.
+			// unknown: parked. Record it so the legacy loop cannot undo this
+			// decision by offering the candidate anyway.
+			//
+			// Consulting the shared gate here is not cosmetic: it is what
+			// RETIRES a slot whose holder can never convert it. A reviewer
+			// found this branch parking unconditionally, so a dependent behind
+			// a candidate-less owner never reached the gate that frees it and
+			// the starvation survived its own fix. Park anyway on this poll —
+			// a released slot must be re-arbitrated through the ordinary
+			// reserve path, never admitted straight off a stale entitlement,
+			// which is what
+			// TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim
+			// pins. The next poll sees no live lease and reserves properly.
+			b.institutionSignInHeldElsewhere(ctx, descriptor)
 			parked[descriptor.JobID] = true
 			continue
 		}
@@ -10911,23 +10928,58 @@ func (b *Bridge) institutionSignInHeldElsewhere(ctx context.Context, candidate j
 		// and it was live on the operator's machine — a job with no
 		// browser_candidates row at all re-took the slot every two minutes
 		// while 21 papers that could finish were withheld behind it.
-		//
-		// So require the holder to be capable of converting the slot it holds.
-		// A job with no live candidate can never bind, so its reservation can
-		// never become a sign-in; a job that HAS one still blocks correctly,
-		// which is what keeps two sign-in surfaces off one institution.
-		return b.leaseHolderCanConvert(ctx, lease.OwnerID)
+		if b.leaseHolderCanConvert(ctx, lease.OwnerID) {
+			return true
+		}
+		// A binding means a real surface existed, and permits are keyed by
+		// binding — so this may be protecting a provider effect in flight even
+		// though the candidate row is gone. Keep blocking; never trade the
+		// cardinal rule for throughput.
+		if lease.OwnerBindingID != "" {
+			return true
+		}
+		// The holder can never bind and has no surface to protect. RETIRE the
+		// reservation rather than merely ignoring it: a reviewer pointed out
+		// that answering "free" while the row survives sends the dependent to
+		// a claim that ReserveAuthenticationEntryLease still refuses as busy,
+		// which is this morning's offer/teardown churn rebuilt from the other
+		// side. The expiry is fenced on holder and lease id, so it cannot
+		// disturb a slot that changed hands under us.
+		if expireErr := b.jobs.ExpireAuthenticationEntryLease(
+			ctx, profile.AuthenticationClaimID, lease.BrowserHolderGeneration, lease.LeaseID,
+		); expireErr != nil {
+			// A stale error means the slot changed hands between our read and
+			// this expiry — so it is HELD by someone new, not free. Answering
+			// free here would admit a dependent whose claim the new holder's
+			// reservation then refuses as busy, rebuilding the offer/teardown
+			// churn from the other side.
+			if !errors.Is(expireErr, job.ErrAuthenticationEntryLeaseStale) {
+				log.Printf("papio: retiring an unconvertible institution slot held by %s: %v", lease.OwnerID, expireErr)
+			}
+			return true
+		}
+		return false
 	}
 	return false
 }
 
 // leaseHolderCanConvert reports whether the job holding an institution's entry
-// slot has a live browser candidate — the only thing that can turn a
-// reservation into a bound sign-in. Read failures answer true: an unreadable
-// holder must keep its slot, because wrongly declaring it free is how two
-// sign-in surfaces end up on one institution.
+// slot could still turn that slot into a bound sign-in. Read failures answer
+// true: an unreadable holder must keep its slot, because wrongly declaring one
+// free is how two sign-in surfaces end up on one institution.
+//
+// "Has a candidate row" is NOT the same as "can convert", and a reviewer named
+// the provable gap: CurrentBrowserCandidateForJob returns claimed/materializing
+// rows even after the attempt is SPENT, and the offer loop itself treats a spent
+// candidate as unofferable. A spent holder can never bind, so counting it as
+// capable parks every dependent forever.
 func (b *Bridge) leaseHolderCanConvert(ctx context.Context, ownerJobID string) bool {
 	if ownerJobID == "" {
+		return false
+	}
+	if spent, spentErr := b.jobs.SpentMaterializationCandidate(ctx, ownerJobID); spentErr != nil {
+		return true
+	} else if spent {
 		return false
 	}
 	attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, ownerJobID)

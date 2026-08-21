@@ -3082,10 +3082,28 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		}
 		if err == nil {
 			fields := []string{"claim_id", "binding_id"}
+			// The identity pair is presence-checked, not value-checked. validate()
+			// compares strings, so an explicitly empty pair read as "absent" and
+			// was accepted here while extension/src/protocol.ts rejected the same
+			// frame for having the keys at all — the two parsers disagreed, which
+			// is the one thing a dual-validated protocol may never do.
+			identity := []string{"authentication_claim_id", "gate_occurrence_id"}
 			if p.Outcome == "bound" {
 				err = institutionalRequirePresence(payloadFields, "institutional_bind_response", fields...)
+				if err == nil {
+					_, hasClaim := payloadFields[identity[0]]
+					_, hasGate := payloadFields[identity[1]]
+					switch {
+					case hasClaim != hasGate:
+						err = fmt.Errorf("institutional_bind_response.%s and %s must be present together",
+							identity[0], identity[1])
+					case hasClaim && (p.AuthenticationClaimID == "" || p.GateOccurrenceID == ""):
+						err = fmt.Errorf("institutional_bind_response identity fields must not be empty when present")
+					}
+				}
 			} else {
-				err = institutionalRejectPresence(payloadFields, "institutional_bind_response", fields...)
+				err = institutionalRejectPresence(payloadFields, "institutional_bind_response",
+					append(fields, identity...)...)
 			}
 		}
 		msg.Payload = p
