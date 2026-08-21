@@ -390,30 +390,6 @@ const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
 const PAGE_CAPTURE_NAV_TIMEOUT_MS = 30_000;
 const TRIAGE_COUNTS_FRESH_MS = 3 * KEEPALIVE_ALARM_MINUTES * 60_000;
 const SESSION_EVIDENCE_THROTTLE_MS = 60_000;
-/** How long a parked handoff surface the operator has never engaged may sit
- * before papio retires it.
- *
- * A paper that reaches an authentication wall parks WITH its tab (see
- * `parked_with_tab` in state.ts): the surface is the operator's way back in,
- * and a parked paper deliberately ignores re-offers, so nothing else ever
- * retires it. Nothing closed it either — every close route in the Slice 2b
- * architecture is claim-scoped (`closeOwnedSurface` -> `surface_close_request`
- * -> "binding has no live materialization claim"), and a legacy URL-bearing
- * handoff has no candidate and therefore no claim. So one dead surface
- * accumulated per paper that ever reached a wall, which is how fifteen
- * identical resolver tabs outlived the papers that opened them.
- *
- * Measured on the operator's store 2026-08-21, across all 674 recorded
- * returns from a wall: p50 1.2s, p90 5.5s, p99 603s, and 671 of 674 inside
- * thirty minutes. A return that is going to happen happens fast, so a surface
- * nobody has come back to in this window is not a pending human action - it
- * is litter. The threshold therefore sits 3x beyond the measured p99.
- *
- * This is a floor on retirement, never authority to remove: closeOwnedTab
- * re-derives active/pinned/PDF/container membership off a fresh get and
- * compares the touch epoch immediately before removal, so a surface the
- * operator has touched at all survives regardless of age. */
-const PARKED_SURFACE_COLD_MS = 30 * 60_000;
 /** Daemon replies that settle a correlated `requestNative` call. `requestNative`
  * rejects any type outside this set before registering a wait, so wrappers and
  * variables cannot create a request that only fails later by timing out. */
@@ -4301,31 +4277,47 @@ export class Bridge {
     return { count: ask.length + legacyCount, tab_ids: ask };
   }
 
-  /** Reconcile modern, same-browser-epoch birth records whose jobs are no
-   * longer present in browser state. This is the restart/update repair half of
-   * job_inactive: future cancel/job-removal frames close through
-   * removeJobWithOffer, but tabs orphaned before that disposition shipped must
-   * get the same daemon decision.
+  /** Reconcile modern, same-browser-epoch birth records that no live job still
+   * points at. This is the restart/update repair half of job_inactive: future
+   * cancel/job-removal frames close through removeJobWithOffer, but a surface
+   * already orphaned needs the same disposition applied after the fact.
+   *
+   * Safe against a tab being born under it because ledgerManagedTab runs
+   * AFTER recordManagedTab (openManagedTab), so a birth record never exists
+   * while its job is still pointing at -1.
    *
    * Never infer from age, title, or URL. The opaque daemon binding plus the
    * same browser epoch proves the record; a fresh tabs.get plus papio
    * work-window/group membership proves the physical surface. Pre-v2 records,
-   * browser-restart epochs, still-tracked jobs, and ceded tabs remain
-   * review-only. A surface the operator made active/pinned, opened as a PDF, or
-   * moved out of papio's container is ceded permanently rather than closed. */
+   * browser-restart epochs, surfaces a live job still points at, and ceded
+   * tabs remain review-only. A surface the operator made active/pinned, opened
+   * as a PDF, or moved out of papio's container is ceded, never closed. */
   async reconcileOwnedTabs(): Promise<{ closed: number }> {
     await this.classifyLedgeredTabs();
     const ledger = await this.snapshotTabLedger();
     let closed = 0;
     for (const [key, entry] of Object.entries(ledger)) {
       const tabID = Number(key);
+      const owner =
+        entry.job_id === undefined
+          ? undefined
+          : findByJob(this.store, entry.job_id);
       if (
         !Number.isInteger(tabID) ||
         tabID < 0 ||
         entry.ceded === true ||
         entry.job_id === undefined ||
         entry.browser_epoch !== this.browserEpoch ||
-        findByJob(this.store, entry.job_id) !== undefined
+        // The question is whether anything still POINTS AT this surface, not
+        // whether the paper that opened it still exists. Those differ exactly
+        // where the pile came from: the handoff-drive timeout deliberately
+        // detaches a legacy job from its tab (tab_id: -1) and then asks to
+        // close it, so the job is alive and tabless while the tab is orphaned.
+        // Testing job existence skipped every one of those forever - and since
+        // the timeout's own close attempt happens once, nothing ever retried
+        // it. Measured live 2026-08-21: eighteen such tabs, none reachable by
+        // any close path. A job pointing at THIS tab is still a live surface.
+        owner?.tab_id === tabID
       )
         continue;
       let tab: TabInfo;

@@ -1995,6 +1995,73 @@ test("an unclaimed surface the operator is looking at survives", async () => {
   expect(h.tabs.snapshot(tabID!)).toBeDefined();
 });
 
+// The eighteen tabs already on the operator's screen, in miniature. Their one
+// close attempt happened at the drive timeout and was refused; nothing ever
+// retried it, because reconcileOwnedTabs asked whether the birth record's JOB
+// still existed rather than whether any live job still pointed AT the tab -
+// and the legacy timeout deliberately detaches the job (tab_id: -1) and leaves
+// it alive. So a tabless paper shielded its own abandoned surface forever.
+test("a surface whose one close attempt was refused is retried by reconciliation", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  await h.port.inbound(jobOffer("job_refused_once"));
+  const tabID = h.tabs
+    .list()
+    .map((tab) => tab.id)
+    .find((id) => id !== undefined);
+  expect(tabID).toBeDefined();
+
+  // The wall, answered the way the daemon answered it for months.
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  h.clock.now += 180_000;
+  const timedOut = driveTimeout!.fn();
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+  const refusedRequest = h
+    .frames()
+    .find((frame) => frame.type === "surface_close_request");
+  expect(refusedRequest).toBeDefined();
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: refusedRequest!.payload["request_id"],
+      outcome: "not_eligible",
+      detail: "binding has no live materialization claim",
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  await timedOut;
+
+  // Exactly the live state: tab alive, paper alive, paper tabless.
+  expect(h.tabs.snapshot(tabID!)).toBeDefined();
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_refused_once"),
+  ).toMatchObject({ tab_id: -1 });
+
+  const framesBefore = h.frames().length;
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  // Wait for the request rather than a fixed number of microtasks: the
+  // reconcile walks a ledger transaction before it reaches the close, and a
+  // guessed flush count made this read as "no retry was ever attempted".
+  const retry = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(retry).toBeDefined();
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: retry!.payload["request_id"],
+      outcome: "unclaimed",
+      detail: "binding has no live materialization claim",
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(await reconciling).toEqual({ closed: 1 });
+  expect(h.tabs.removed).toContain(tabID!);
+});
+
 // A drive says so, and a paper parked behind the single drive slot says the
 // opposite. The daemon charges a fruitless drive epoch per DRIVING accept and
 // retires a paper after three, so a queued accept reported as a drive retires
