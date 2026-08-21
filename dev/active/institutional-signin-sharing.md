@@ -194,3 +194,37 @@ six P1s came back, **every one of them in code shipped that same day**. Fixed in
    today, but the Chrome Web Store listing no longer exposes a count, and
    `AGENTS.md` still records 2026-08-06. The protocol break shipped under an
    exception that cannot currently be fully re-verified.
+
+## Live after the review fixes, 2026-08-21 — no churn, no starvation, no work
+
+Deployed and reloaded. The good news is negative: zero bind refusals, zero
+phantom retirements needed, no live claim held by anything. The bad news is also
+negative: **zero live claims with 21 eligible candidates and 129 papers
+waiting.** Nothing is blocked and nothing is moving.
+
+Measured cause, and it is the next defect to fix: the automatic admission
+switch has cases for an ABSENT lease, a landed-and-entitled lease, and a lease
+this job already owns. It has **no case for `expired`** — and nothing ever
+deletes an expired row. Both `ExpireUnboundAuthenticationEntryLeases` and the
+getter's own normalization leave `state='expired'` behind, so from the first
+expiry onward every candidate at that institution falls to `default` and is
+parked forever.
+
+**A one-line "treat expired as free" is wrong, and three pinned tests say so.**
+It was tried and reverted:
+
+- `TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim` —
+  after `owner_closed`, dependents must wait for fresh arbitration, and an
+  expired row is not that.
+- `TestFocusedCandidateWaitsWhileAnotherJobHoldsTheSignIn` — the admission loop
+  would reserve the freed slot for some other candidate, stealing it from the
+  explicitly focused paper.
+- `TestCandidateParkedByAnotherJobsSignInIsNotOfferedAnyway` — a holder whose
+  deadline lapsed under the bridge clock would stop blocking.
+
+So the question is a design one, not a predicate one: **what retires an expired
+entry-lease row, and who is allowed to take the slot next?** Absent-versus-
+expired is currently a meaningful distinction the admission path honours in one
+direction only. Answer that before touching the switch, and expect it to
+interact with residual 1 above (a `human` lease that never became entitled has
+no expiry path at all).
