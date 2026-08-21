@@ -1889,6 +1889,112 @@ test("job_offer opens exactly one tab and replies job_accept", async () => {
   expect(h.backend.store.activeJobs.length).toBe(1);
 });
 
+// The tab pile, at its source. An ordinary URL-bearing handoff has no browser
+// candidate, so the daemon can never hold a materialization claim for its
+// surface, so `surface_close_request` used to come back `not_eligible` — a
+// refusal the extension correctly obeyed. The handoff-drive timeout has always
+// INTENDED to retire that tab (registerHandoffDrive's timeout calls
+// closeOwnedSurface); the intent was refused every single time, so one dead
+// surface accumulated for every paper that ever reached an authentication wall.
+// Measured live 2026-08-21: fifteen surviving resolver tabs, thirteen identical.
+test("a walled handoff tab the daemon has no claim on is retired, not kept forever", async () => {
+  // { windows: true } is the surface production actually runs: the handoff tab
+  // lands in the dedicated work window, inactive, exactly as the fifteen live
+  // resolver tabs did. Without it the harness degrades to a bare in-window
+  // ACTIVE tab, which every close guard correctly refuses - so this test would
+  // pass vacuously against the wrong surface.
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const before = new Set(h.tabs.list().map((tab) => tab.id));
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  await h.port.inbound(jobOffer("job_legacy_wall"));
+  const tabID = h.tabs
+    .list()
+    .map((tab) => tab.id)
+    .find((id) => id !== undefined && !before.has(id));
+  expect(tabID).toBeDefined();
+  const framesBefore = h.frames().length;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(driveTimeout).toBeDefined();
+  h.clock.now += 180_000;
+  // The callback awaits the daemon's close answer, so it cannot be awaited
+  // before that answer is delivered - it is the same request/response
+  // interleaving the real port has.
+  const timedOut = driveTimeout!.fn();
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+
+  const closeRequest = h
+    .frames()
+    .slice(framesBefore)
+    .find((frame) => frame.type === "surface_close_request");
+  expect(closeRequest).toBeDefined();
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: closeRequest!.payload["request_id"],
+      outcome: "unclaimed",
+      detail: "binding has no live materialization claim",
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  await timedOut;
+
+  expect(h.tabs.removed).toContain(tabID!);
+  expect(h.tabs.snapshot(tabID!)).toBeUndefined();
+});
+
+// The other half: "the daemon has no stake" is not "papio may take your tab".
+// Every guard that governs an authorized close governs an unclaimed one,
+// because in the unclaimed case those guards are the whole of the decision.
+test("an unclaimed surface the operator is looking at survives", async () => {
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const before = new Set(h.tabs.list().map((tab) => tab.id));
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  await h.port.inbound(jobOffer("job_legacy_wall_active"));
+  const tabID = h.tabs
+    .list()
+    .map((tab) => tab.id)
+    .find((id) => id !== undefined && !before.has(id));
+  expect(tabID).toBeDefined();
+  // The operator is reading it when the drive timeout fires.
+  h.tabs.focusedTab = h.tabs.snapshot(tabID!);
+  const framesBefore = h.frames().length;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  h.clock.now += 180_000;
+  const timedOut = driveTimeout!.fn();
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+
+  const closeRequest = h
+    .frames()
+    .slice(framesBefore)
+    .find((frame) => frame.type === "surface_close_request");
+  if (closeRequest !== undefined) {
+    await h.port.inbound(
+      nativeResult("surface_close_response", {
+        request_id: closeRequest.payload["request_id"],
+        outcome: "unclaimed",
+        detail: "binding has no live materialization claim",
+      }),
+    );
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  }
+  await timedOut;
+  expect(h.tabs.removed).not.toContain(tabID);
+  expect(h.tabs.snapshot(tabID!)).toBeDefined();
+});
+
 // A drive says so, and a paper parked behind the single drive slot says the
 // opposite. The daemon charges a fruitless drive epoch per DRIVING accept and
 // retires a paper after three, so a queued accept reported as a drive retires

@@ -2267,7 +2267,17 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 		return frame()
 	}
 	if claim == nil {
-		result.Outcome, result.Detail = "not_eligible", "binding has no live materialization claim"
+		// No live claim means no candidate, no route, and no effect permit can
+		// exist for this binding - every one of those is claim-scoped - so the
+		// daemon has no stake in the surface and nothing to withhold. Answering
+		// "not_eligible" here read as a refusal the extension had to obey, and
+		// it was returned for EVERY ordinary URL-bearing handoff tab, which by
+		// construction never has a candidate. The extension's own close intent
+		// at the handoff-drive timeout was therefore refused every time, and a
+		// dead surface accumulated for every paper that ever reached an
+		// authentication wall. Ordinary handoff closure is browser-local
+		// (AGENTS.md); say so, and let the browser's own guards decide.
+		result.Outcome, result.Detail = "unclaimed", "binding has no live materialization claim"
 		return frame()
 	}
 	if p.BrowserHolderGeneration != b.epoch {

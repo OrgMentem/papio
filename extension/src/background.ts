@@ -390,6 +390,30 @@ const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
 const PAGE_CAPTURE_NAV_TIMEOUT_MS = 30_000;
 const TRIAGE_COUNTS_FRESH_MS = 3 * KEEPALIVE_ALARM_MINUTES * 60_000;
 const SESSION_EVIDENCE_THROTTLE_MS = 60_000;
+/** How long a parked handoff surface the operator has never engaged may sit
+ * before papio retires it.
+ *
+ * A paper that reaches an authentication wall parks WITH its tab (see
+ * `parked_with_tab` in state.ts): the surface is the operator's way back in,
+ * and a parked paper deliberately ignores re-offers, so nothing else ever
+ * retires it. Nothing closed it either — every close route in the Slice 2b
+ * architecture is claim-scoped (`closeOwnedSurface` -> `surface_close_request`
+ * -> "binding has no live materialization claim"), and a legacy URL-bearing
+ * handoff has no candidate and therefore no claim. So one dead surface
+ * accumulated per paper that ever reached a wall, which is how fifteen
+ * identical resolver tabs outlived the papers that opened them.
+ *
+ * Measured on the operator's store 2026-08-21, across all 674 recorded
+ * returns from a wall: p50 1.2s, p90 5.5s, p99 603s, and 671 of 674 inside
+ * thirty minutes. A return that is going to happen happens fast, so a surface
+ * nobody has come back to in this window is not a pending human action - it
+ * is litter. The threshold therefore sits 3x beyond the measured p99.
+ *
+ * This is a floor on retirement, never authority to remove: closeOwnedTab
+ * re-derives active/pinned/PDF/container membership off a fresh get and
+ * compares the touch epoch immediately before removal, so a surface the
+ * operator has touched at all survives regardless of age. */
+const PARKED_SURFACE_COLD_MS = 30 * 60_000;
 /** Daemon replies that settle a correlated `requestNative` call. `requestNative`
  * rejects any type outside this set before registering a wait, so wrappers and
  * variables cannot create a request that only fails later by timing out. */
@@ -4714,7 +4738,7 @@ export class Bridge {
         nonce: string;
         generation: number;
       }
-    | { authorized: false }
+    | { authorized: false; unclaimed?: true }
   > {
     const generation = this.lastKnownBrowserHolderGeneration;
     if (generation === undefined) return { authorized: false };
@@ -4734,6 +4758,12 @@ export class Bridge {
     );
     if (result.kind !== "response" || result.payload === undefined)
       return { authorized: false };
+    // The daemon distinguishing "I have no stake in this surface" from "I am
+    // withholding it". Only a refusal binds the extension; an unclaimed
+    // binding falls back to the browser-local authority that owns ordinary
+    // handoff tabs, still subject to every guard below.
+    if (result.payload["outcome"] === "unclaimed")
+      return { authorized: false, unclaimed: true };
     if (result.payload["outcome"] !== "authorized") return { authorized: false };
     const authorizationID = result.payload["close_authorization_id"];
     const nonce = result.payload["nonce"];
@@ -4764,7 +4794,17 @@ export class Bridge {
       disposition,
       gateOccurrenceID,
     );
-    if (!authorization.authorized) return { closed: false };
+    if (!authorization.authorized) {
+      // A binding the daemon has no claim on is an ordinary handoff surface:
+      // there is no authorization to tombstone because there is nothing
+      // daemon-side to consume, and papio's own guards are the whole of the
+      // decision. Retiring it is browser-local, exactly as the handoff-drive
+      // timeout has always intended - that intent was simply refused every
+      // time before the daemon could say which kind of "no" it meant.
+      if (authorization.unclaimed === true)
+        return this.retireOwnedSurface(tabID, record.binding_id, "unclaimed");
+      return { closed: false };
+    }
     const bindingID = record.binding_id;
     const tombstoned = await this.runTabLedgerTransaction((ledger) => {
       const current = ledger[String(tabID)];
@@ -4783,10 +4823,15 @@ export class Bridge {
       return { value: true, changed: true };
     });
     if (!tombstoned) return { closed: false };
-    return this.consumeCloseTombstone(tabID, bindingID);
+    return this.retireOwnedSurface(tabID, bindingID, "authorized");
   }
 
-  /** The one fresh tabs.get the plan requires before the awaited removal.
+  /** The one fresh tabs.get the plan requires before the awaited removal,
+   * shared by both close authorities: a daemon-authorized claim surface
+   * consuming its tombstone, and an unclaimed ordinary handoff surface the
+   * daemon has no stake in. The guards are identical because they are the
+   * whole of the decision in the unclaimed case, so they must never diverge.
+   *
    * A tab that became active, pinned, or navigated to content papio must
    * never auto-close (a PDF viewer — closeOwnedTab's own group/window gate
    * covers "not adopted-content") is ceded and detached instead of
@@ -4797,9 +4842,10 @@ export class Bridge {
    * get, and additionally compares the touch epoch, so a touch landing
    * anywhere between this get and the eventual tabs.remove is still caught
    * even when it is invisible to this particular snapshot. */
-  private async consumeCloseTombstone(
+  private async retireOwnedSurface(
     tabID: number,
     bindingID: string,
+    authority: "authorized" | "unclaimed",
   ): Promise<{ closed: boolean }> {
     let tab: TabInfo;
     try {
@@ -4820,7 +4866,10 @@ export class Bridge {
       // opened sign-in tab became permanently unretirable (live 2026-08-20).
       return { closed: false };
     }
-    const removed = await this.closeOwnedTab(tabID, "authorized-close");
+    const removed = await this.closeOwnedTab(
+      tabID,
+      authority === "unclaimed" ? "unclaimed-close" : "authorized-close",
+    );
     return { closed: removed };
   }
 

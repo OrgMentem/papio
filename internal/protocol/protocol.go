@@ -5547,8 +5547,14 @@ func (p *SurfaceCloseResponsePayload) validate() error {
 	if err := institutionalRequestID("surface_close_response.request_id", p.RequestID); err != nil {
 		return err
 	}
+	// "unclaimed" is the daemon reporting that it holds no live materialization
+	// claim for this binding, and therefore no stake in the surface at all: an
+	// ordinary URL-bearing handoff tab has no candidate and so can never have
+	// one. It is deliberately NOT a refusal - a refusal (not_eligible/busy)
+	// means the daemon has a stake and is withholding, which the extension
+	// must obey. See AGENTS.md: ordinary handoff tab closure is browser-local.
 	if err := institutionalOutcome("surface_close_response.outcome", p.Outcome,
-		"authorized", "stale", "not_eligible", "busy", "error"); err != nil {
+		"authorized", "unclaimed", "stale", "not_eligible", "busy", "error"); err != nil {
 		return err
 	}
 	if err := validateTriageText("surface_close_response.detail", p.Detail, 1000); err != nil {

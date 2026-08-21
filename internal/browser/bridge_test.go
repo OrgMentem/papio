@@ -6336,8 +6336,12 @@ func TestSurfaceCloseAuthorizedRepeatIsIdempotent(t *testing.T) {
 
 // A binding_id with no materialization_claims row at all — an unknown
 // binding, or an extension-minted pre-cutover scaffold — is never
-// daemon-closable.
-func TestSurfaceCloseUnknownBindingIsNotEligible(t *testing.T) {
+// daemon-AUTHORIZED, and is now reported as "unclaimed" rather than
+// "not_eligible". The distinction is the whole point: this test used to
+// assert the daemon refuses, and the extension dutifully obeyed that refusal
+// for every ordinary handoff tab in existence. The daemon still never issues
+// an authorization here; it just no longer claims a stake it does not have.
+func TestSurfaceCloseUnknownBindingIsUnclaimed(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	runSync(t, b, materializationHello(t))
 
@@ -6349,11 +6353,14 @@ func TestSurfaceCloseUnknownBindingIsNotEligible(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := decodeSurfaceCloseResponse(t, frames)
-	if got.Outcome != "not_eligible" {
-		t.Fatalf("outcome = %q, want not_eligible", got.Outcome)
+	if got.Outcome != "unclaimed" {
+		t.Fatalf("outcome = %q, want unclaimed", got.Outcome)
+	}
+	if got.Outcome == "authorized" {
+		t.Fatal("an unknown binding must never be authorized")
 	}
 	if got.CloseAuthorizationID != "" || got.Nonce != "" || got.BrowserHolderGeneration != nil {
-		t.Fatalf("not_eligible response carries authorization fields: %+v", got)
+		t.Fatalf("unclaimed response carries authorization fields: %+v", got)
 	}
 }
 
@@ -6424,6 +6431,59 @@ func TestSurfaceCloseRequestDispatchedThroughSyncAuthorizes(t *testing.T) {
 	got := resp.Payload.(*protocol.SurfaceCloseResponsePayload)
 	if got.Outcome != "authorized" || got.CloseAuthorizationID == "" || got.Nonce == "" {
 		t.Fatalf("dispatched outcome = %+v, want authorized with id/nonce", got)
+	}
+}
+
+// TestSurfaceCloseOfUnclaimedBindingIsNotARefusal pins the distinction the
+// extension acts on. An ordinary URL-bearing handoff tab has no browser
+// candidate, so it can never have a materialization claim, so this branch is
+// the one EVERY such tab takes. It used to answer "not_eligible", which the
+// extension correctly obeyed as a refusal - and since the handoff-drive
+// timeout's close intent runs through exactly this request, every tab papio
+// opened for a paper that reached an authentication wall was retained forever.
+// Measured live 2026-08-21: fifteen surviving resolver tabs, thirteen of them
+// identical, outliving the papers that opened them by days.
+//
+// "unclaimed" says the daemon has no stake: no claim means no candidate, no
+// route, and no effect permit, because all three are claim-scoped. A refusal
+// must still be a refusal, which the sibling assertion below pins.
+func TestSurfaceCloseOfUnclaimedBindingIsNotARefusal(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
+
+	frame := inFrame(t, protocol.MsgSurfaceCloseRequest, "", protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-unclaimed", BindingID: "binding-with-no-claim",
+		BrowserHolderGeneration: b.epoch, Disposition: "job_inactive",
+	})
+	msgs, _ := runSync(t, b, frame)
+	resp := firstOfType(msgs, protocol.MsgSurfaceCloseResponse)
+	if resp == nil {
+		t.Fatalf("no surface_close_response for an unclaimed binding: %v", msgs)
+	}
+	got := resp.Payload.(*protocol.SurfaceCloseResponsePayload)
+	if got.Outcome != "unclaimed" {
+		t.Fatalf("unclaimed binding outcome = %q, want \"unclaimed\" - %q reads as a refusal the extension must obey, which strands the surface",
+			got.Outcome, got.Outcome)
+	}
+	if got.CloseAuthorizationID != "" || got.Nonce != "" {
+		t.Fatalf("unclaimed answer carried authorization fields: %+v", got)
+	}
+
+	// A claim whose phase does not permit closure is still a real refusal: the
+	// daemon has a stake there, and the extension must not fall back to its
+	// own authority. Same request shape, one difference - a live claim exists.
+	held := seedSurfaceCloseClaim(t, b, jobs, "close-unclaimed-sibling", "claimed")
+	refused := inFrame(t, protocol.MsgSurfaceCloseRequest, "", protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-refused", BindingID: held.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+	})
+	refusedMsgs, _ := runSync(t, b, refused)
+	refusedResp := firstOfType(refusedMsgs, protocol.MsgSurfaceCloseResponse)
+	if refusedResp == nil {
+		t.Fatalf("no surface_close_response for a live claim: %v", refusedMsgs)
+	}
+	if out := refusedResp.Payload.(*protocol.SurfaceCloseResponsePayload).Outcome; out == "unclaimed" {
+		t.Fatal("a live claim answered \"unclaimed\": the extension would close a surface the daemon still has a stake in")
 	}
 }
 

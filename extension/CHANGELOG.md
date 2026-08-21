@@ -19,6 +19,20 @@ for the full pre-split extension history.
 ### Added
 - **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
 
+### Fixed
+- **Tabs *papio* opened for a paper it never finished are now cleaned up.**
+  When a paper reached your library's sign-in and *papio* ran out of time
+  waiting, it always meant to close that tab — but every one of those closures
+  was silently refused, so the tab stayed open forever, and a new one appeared
+  for the next paper. Live on the author's machine: fifteen surviving tabs,
+  thirteen of them the same resolver page, outliving the papers that opened
+  them by days. *papio* now retires those surfaces.
+
+  A tab you have touched is never taken: activating it, pinning it, opening a
+  PDF in it, or dragging it out of *papio*'s window all make it yours
+  permanently, checked twice — once before the close and once in the same
+  instant as it, so even a click that lands mid-close is caught.
+
 ### Changed
 - **The toolbar badge no longer reports *papio*'s own queue as papers waiting
   on you.** A library is served by one sign-in at a time, so most institutional

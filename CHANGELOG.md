@@ -176,6 +176,16 @@ execution records kept during the initial build.
   unchanged.
 
 ### Fixed
+- **A tab *papio* opened for a paper it never finished is no longer kept open
+  forever.** The extension has always asked the daemon before closing a tab,
+  and the daemon answered "not eligible" for every ordinary sign-in tab —
+  wording the extension correctly obeyed as a refusal. But the daemon was not
+  withholding anything: it simply had no record to consult, because that kind
+  of tab never creates one. So every paper that reached your library's sign-in
+  and ran out of time left a tab behind, and the next paper opened another.
+  Live on the author's machine: fifteen tabs, thirteen of them the same page,
+  days old. The daemon now distinguishes "I am holding this one" from "this is
+  not mine to hold", and only the first is a refusal.
 - **Search results no longer call a PubMed paper "not in your library" when it
   is.** Discovery asked Zotero about each result using only its DOI and arXiv
   id, so a paper identified by PMID alone — ordinary for PubMed-sourced results

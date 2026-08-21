@@ -6199,9 +6199,14 @@ function validatePayload(
       institutionalID(p, "request_id", type);
       const outcome = str(p, "outcome", type, 20);
       if (
-        !["authorized", "stale", "not_eligible", "busy", "error"].includes(
-          outcome,
-        )
+        ![
+          "authorized",
+          "unclaimed",
+          "stale",
+          "not_eligible",
+          "busy",
+          "error",
+        ].includes(outcome)
       )
         fail(`${type}.outcome is invalid`);
       if (outcome === "authorized") {

@@ -6299,7 +6299,7 @@
                 "pattern": "^[A-Za-z0-9_-]{8,128}$"
               },
               "outcome": {
-                "enum": ["authorized", "stale", "not_eligible", "busy", "error"]
+                "enum": ["authorized", "unclaimed", "stale", "not_eligible", "busy", "error"]
               },
               "close_authorization_id": {
                 "type": "string",
