@@ -1221,3 +1221,59 @@ frame family (`convertAuthenticationEntryLeaseToHumanTx`), not
 the older one works and the newer one has never fired. Deciding whether the
 observation family should subsume it, or be scoped to what only it can express,
 belongs in an ADR rather than another patch.
+
+### The deadlock behind the empty journal (2026-08-21, measured)
+
+Chasing the last link found a circular dependency, not a missing branch. It is
+live on the operator's machine right now, **925 refusals deep**:
+
+```
+papio: materialization institutional_claim_response for job_012f55be… not
+granted: busy (candidate claim was not accepted)      × 925, ~1/second
+```
+
+1. Five claims sit `navigated` on tabs the operator has closed, each carrying a
+   **settled** institutional effect permit.
+2. A settled permit deliberately keeps its claim owned past lease expiry —
+   `TestSettledInstitutionalPermitKeepsExpiredClaimOwnedUntilWinner` pins
+   exactly that, including the `ErrMaterializationBusy` a fresh attempt gets.
+   The reason is sound: a settled institutional effect means a provider effect
+   really fired, so retiring early would let a second attempt run against it.
+   **Narrowing that guard to in-flight permits was tried here and reverted** —
+   it breaks a deliberate invariant, and the two tests that failed are the
+   invariant, not an oversight.
+3. The retirement condition is therefore an artifact **winner**, not a lease.
+   No winner will ever arrive: the surface is gone and no download is coming.
+4. The only mechanism that retires such a claim is an `owner_closed`
+   observation.
+5. On this pipeline an observation needs the identity only the **bind** returns
+   (fixed in `4464995`).
+6. The job can never reach bind, because its **claim** step is refused `busy` —
+   by the very claim that needs retiring.
+
+So `4464995` prevents new instances (a fresh job reaches bind, receives the
+identity, mirrors it durably, and can report its loss) but cannot break an
+existing one. It has not yet been proven live for that reason: the only
+pipeline job currently running is the deadlocked one.
+
+**The stranded population needs a disposition, and it is a product decision.**
+A settled effect whose surface is unreachable and whose artifact never arrived
+is finished-with-nothing, but the daemon cannot see tabs. Two shapes, in
+preference order:
+
+- **Browser evidence (preferred, non-heuristic).** An
+  `institutional_claim_request` for a candidate whose claim the SAME job
+  already holds is first-hand proof the browser has no live surface for it —
+  it would not be asking otherwise. This is the consult self-heal's reasoning
+  inverted, and it fires exactly where the deadlock manifests. Needs a guard
+  against a legitimate race (a demoted holder, two workers) before it can
+  retire anything carrying a settled permit.
+- **A winner deadline.** Bound how long a settled effect may wait for an
+  artifact winner. Rejected as the first move: AGENTS.md's own measurement
+  discipline applies, and the healthy and pathological distributions here have
+  not been plotted. A count or a timeout chosen without that is the wrong
+  instrument, not the wrong number.
+
+Do not implement either without the operator's call: both retire a claim that
+carries evidence of an irreversible provider effect, which is the one thing
+this subsystem is built to never do casually.
