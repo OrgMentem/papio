@@ -1,5 +1,55 @@
 # The institution entry lease: one expired row froze a library
 
+## Shipped and measured, 2026-08-21
+
+Three defects fixed, each mutation-verified, each committed on its own:
+
+1. `18e3db6` — the permit veto covered only the expired-reservation path, so
+   browser churn alone could replace a live sign-in holding an unresolved
+   provider permit. Slice 0, item 1.
+2. `7fa0908` — an entitled sign-in was shared at the offer and refused at the
+   BIND. Measured in the operator's own log: **5,562 refusals**, the worst storm
+   4,872 in 41 minutes at ~2/s, each one a scaffold tab built and torn down.
+   That is the reported tab/group churn and the stranded siblings, one bug.
+   Slice 0, item 2.
+3. `3998bb5` — slot arbitration was priced as an offer. `limit` arrived as 0 on
+   32 of 34 consecutive polls, and that loop is the only code that retires a
+   dead slot. Plus the cold-`expired` reader, gated on the existing bind
+   deadline rather than a new tunable. Slice 1.
+
+A correction worth keeping: earlier in the session the refusal counter was flat
+at 5,561 and I read that as "the churn is dead". It was flat because the freeze
+had **starved** the storm — no claims to refuse. A counter that stops moving
+because its input stopped is not a counter that reports success.
+
+## The queue still does not move, and the reason is not this lease
+
+Measured after deploying all three: 128 awaiting, 0 live claims, and the entry
+lease sitting `expired` and cold with nothing taking it. One diagnostic pass
+named the reason per descriptor instead of inferring it:
+
+- three of the four schedulable candidates are skipped `no-handoff-action` —
+  their jobs hold only a `manual_download` action, which the automatic path
+  does not read;
+- the fourth is skipped `focus=true` — an **explicit operator focus request**,
+  which the automatic loop defers to the focus path;
+- every line carried `canAdmit=false`.
+
+And the four offers holding the entire `maxOutstandingOffers` budget belong to
+papers with **zero browser candidates** — legacy-path papers that reported 1, 3,
+7 and 15 authentication walls, cannot bind because binding needs a candidate,
+and therefore hold their offer until a human finishes the download by hand. They
+rotate the budget among a pool of 73 such papers. The paper that HAS a candidate
+and a landed sign-in is starved behind them.
+
+So the transport budget is doing two jobs at once: bounding how many browser
+surfaces exist, and bounding how many papers may be in flight. A paper parked at
+a wall consumes it indefinitely, and the legacy path wins by arriving first.
+That is a design decision about which path owns a paper — the same question
+raised earlier as "87 papers can only go the legacy path" — and it is
+deliberately NOT taken here. Slice 1's fixes are prerequisites for it either
+way: without them the winning path would still deadlock on cleanup.
+
 Measured on the operator's machine 2026-08-21: 129 papers awaiting a human, 21
 eligible browser candidates, **zero** live claims, and one
 `authentication_entry_leases` row in state `expired`. No churn, no errors,
