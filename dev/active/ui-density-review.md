@@ -31,22 +31,29 @@ under the proposal below. Six rows fit above the fold today; ten would.
 
 Say go and these go, no design decision required.
 
-1. **The current-page rail paints 10.1px outside its own card.** `#page-acquire-btn`
-   renders `Acquisition in progress · 10.1177/15480518221144895` (51 chars) with
-   `white-space: nowrap` (`extension/src/popup.html`, base `button` rule) and
-   `min-width: max-content` (`.current-page-controls > button`). 51 chars of
-   12px/700 need 353.1px inside a 330px card box, and because the rail is a grid
-   the whole column widens — the scan button, paper title, status line and
-   `Open inbox item` all bleed past the card border. **Any label over 48
-   characters does this.** Verified from source. Fix: keep the DOI out of button
-   labels (put it in `title`/`aria-label`, as the refused-Send-PDF path already
-   does).
+1. ~~**The current-page rail paints 10.1px outside its own card.**~~
+   **FALSIFIED 2026-08-22, by source and by the operator's live popup.** The
+   audit measured `Acquisition in progress · 10.1177/15480518221144895` as
+   *visible* text. It is not: `setAcquireButton` (`extension/src/popup.ts`)
+   already renders `button.textContent = shortAcquireLabel(label)` — which
+   truncates anything over 12 characters — and puts the full string in **both**
+   `title` and `aria-label`. The live popup renders `Acquisition…` at a measured
+   121px inside a 330px card. No overflow, and the fix the audit proposed is
+   already the shipped behaviour.
+
+   What survives is a **latent** hazard, not a live defect: `white-space: nowrap`
+   (base `button` rule) plus `min-width: max-content`
+   (`.current-page-controls > button`) means a single button label wider than the
+   card cannot shrink or wrap. Today nothing reaches it — the acquire label is
+   truncated by construction and `Select papers on this page` measures 201px.
+   Worth a `min-width: 0` + ellipsis only if a future label is built without
+   going through `setAcquireButton`.
 2. **A dead disabled control restates the live card 40px below it.**
-   `Acquisition in progress · <doi>` is a permanently disabled button while
-   `renderLiveAcquisition` prints the same job's actual standing, more precisely
-   and clickably. The no-DOI path already hides its button on the stated
-   principle that "a permanently dead control teaches nothing"; this path does
-   not. Costs 40px.
+   Confirmed on the live popup: a disabled `Acquisition…` sits directly above
+   `No progress for 1h · Waiting on you to sign in · last: Job accepted · 1h ago`,
+   which is the same job's standing, stated precisely, in a card that is not
+   dead. The no-DOI path already hides its button on the stated principle that
+   "a permanently dead control teaches nothing"; this path does not. Costs 40px.
 3. **A route named in copy that the card does not carry.** The blocked-source
    message says `or manage all sources in Settings`, but `renderNeedsAttention`
    discards the handler (`void onOpenOptions;`) and the section has no Settings
@@ -67,6 +74,64 @@ Say go and these go, no design decision required.
    return to your paper.` and `This access tab is no longer valid — you can
    close it.`
 
+## Hover text — the operator's question, answered
+
+**Yes, and more than expected: two different mechanisms are already live, and
+the popup's own most recently designed control is already exactly the pattern
+the L1 proposals above ask for.**
+
+`setAcquireButton` (`extension/src/popup.ts`) renders a ≤12-character visible
+label through `shortAcquireLabel`, then sets the full string on **both**
+`title` and `aria-label`. That is demotion-to-hover, with the screen-reader
+path kept whole, shipped and running on the operator's machine tonight
+(`Acquisition…`, 121px, full DOI on hover). So the L1 tier is not a new idea
+here — it is the house pattern, applied unevenly.
+
+### The two mechanisms, and which is which
+
+| | native `title` | the instant CSS tooltip |
+|---|---|---|
+| where | `popup.html` ×3 static, and 8 TS sites: `popup.ts` (acquire label, send message, **the whole pulse breakdown** on `section.title`), `inbox.ts` (pulse detail, truncated values, citation parts, a preview warning), `history.ts` (chart columns) | `inbox.html`, `content: attr(data-label)` on `.item-status` glyphs and `.item-debug-toggle` |
+| delay | ~1s — and the CSS comment says so in as many words: it exists to show meaning *"without the native title delay"* | none |
+| keyboard | **nothing on focus** | `:focus-visible` is handled |
+| escapes the popup window | yes (browser-drawn) | **no** — it is a DOM child of a document Chrome clips to the popup window [inference, not measured] |
+| wrapping | browser wraps long strings | `white-space: nowrap` — built for short glyph labels, would run off-panel with a sentence |
+
+### So: is hover a good instrument for the density problem?
+
+**For demoted secondary detail beside a visible short label — yes, and it is
+already how this codebase does it.** Items 1, 9 and the inbox row-reason
+deletion are all this shape: the fact is not deleted, it moves onto the control
+it explains, and `aria-describedby` keeps it in the accessibility tree rather
+than merely in a `title` a screen reader may ignore.
+
+**For anything the operator must act on — no.** Three reasons, all already
+recorded in this tree:
+
+1. **Hover is not discoverable.** Nothing on the surface says a tooltip exists.
+   That is fine for "what does this glyph mean" and wrong for "solving this in
+   the open tab is enough" — the reassurance that stops someone closing the tab
+   early. This is risk 2 in the risks section, unchanged.
+2. **Keyboard users get nothing from `title`.** A sighted keyboard operator
+   tabbing to `Open tab` sees no explanation at all. If a reason moves to hover
+   it must move as `aria-describedby` *and*, if it is load-bearing, use the
+   inbox's `:focus-visible` tooltip rather than `title`.
+3. **There is no touch path**, and the popup is the surface most likely to be
+   driven from a trackpad tap.
+
+**Net effect on the recommended package: it gets cheaper, not bigger.** Item 6
+is already done. Item 9's demoted event has a precedent two lines away. And
+`popup.ts` already puts the full pulse breakdown on `section.title`, which means
+**the batch line's content is already recoverable on hover today** — so dropping
+that line is a smaller loss than the L2 tier claims. If you want the popup under
+600px, that is the cheapest L2 item to take, and it is the one I would take
+first.
+
+**What hover cannot buy:** the 261.5px of overflow is mostly *headings,
+sub-headings, wrapped 14px status lines and a dead disabled button* — structure,
+not explanation. Hover addresses roughly 84px of the 171.5px the recommended
+package saves. The rest has to come from not drawing things.
+
 ## Popup — ranked, with the recommended package
 
 Loss tiers: **L0** nothing leaves the surface · **L1** the fact moves onto the
@@ -80,7 +145,7 @@ keep it) · **L2** the fact leaves the popup.
 | 3 | **Institution status 14px → 12px**, matching every other secondary line | −23.2 | **L0** — nothing reworded; also unwraps 9 other session states |
 | 4 | **Waiting sub-heading only at 2+ rows** — `Open institutional access` above a single row whose button says `Open` | −23.9 | L0 |
 | 5 | **Count once in the pulse**: `Review 125 decisions` → `Review` (the line above already says 125) | 0 | **L0** |
-| 6 | **DOI out of button labels** (defect 1) | 0, fixes the overflow | L1 |
+| 6 | ~~DOI out of button labels~~ — **already shipped**, see defect 1 | 0 | — |
 | 7 | **Overflow string once**: it is both appended to the message and set as a full-width button | 0…−20.3 | L0 |
 | 8 | **Rename the blocker heading.** `Needs you` is browser-local blockers, but ADR-0023 reserves that phrase for the daemon's `turns_required` — which the pulse 245px above is already using. Proposed `Do this in the browser` | 0 | L0, returns the reserved phrase |
 | 9 | Live status one line; demoted event to `title` | −17.4 | L1 — **must keep the `No progress for 12m` prefix visible** |
