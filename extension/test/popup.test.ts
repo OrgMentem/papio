@@ -1893,7 +1893,7 @@ test("session card matrix propagates probe outcomes without hijacking a decided 
   // measures; leaving it on the end of the detail chain produced "Signed in —
   // rechecking now · via your library tab · 1h ago", where the age reads as
   // the age of the recheck.
-  expect(aged.label).toBe("Signed in 20m ago — rechecking now");
+  expect(aged.label).toBe("Signed in 20m ago — due a recheck");
   expect(aged.detail).toBe("via your library tab");
   // A warm session offers no sign-in action — the button is hidden, not dead.
   expect(warm.action).toBe("none");
@@ -1968,7 +1968,7 @@ test("an origin that never landed a decisive verdict resolves to its honest prob
     lastProbeOutcome: "markers",
     lastVerdictAt: now - (SESSION_STALE_MS + 1),
   });
-  expect(agedWarm.label).toBe("Signed in 2m ago — rechecking now");
+  expect(agedWarm.label).toBe("Signed in 2m ago — due a recheck");
   expect(agedWarm.action).toBe("none");
   expect(agedWarm.label).not.toContain("unknown");
 });
@@ -4231,4 +4231,40 @@ test("a bare timeline echo states where the paper stands, and an ask is untouche
   const askText = ask.getElementById("page-acquire-live-status")?.textContent ?? "";
   expect(askText.toLowerCase()).toContain("waiting on you");
   expect(askText).not.toContain("· last:");
+});
+
+// The `checking` branch returns earlier in the same function, so reaching the
+// aged branches PROVES no probe is in flight. "rechecking now" was therefore
+// unassertable there - a claim about an activity papio had already ruled out -
+// while "due a recheck" is a fact about the schedule: keep-warm is on and the
+// verdict has aged past its window.
+test("an aged verdict never claims a check that is not running", () => {
+  const base = {
+    enabled: true,
+    intervalMinutes: 5,
+    pausedForReauth: false,
+    lastProbeAt: Date.now(),
+    resolverOrigin: "https://resolver.example.edu",
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+  };
+  const aged = deriveSessionCardState({
+    ...base,
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    lastProbeOutcome: "markers",
+    lastVerdictAt: Date.now() - 60 * 60_000,
+    checking: false,
+  });
+  expect(aged.label).toBe("Signed in 1h ago — due a recheck");
+  expect(aged.label).not.toContain("now");
+
+  // A probe that IS in flight owns the other wording, and never carries an age
+  // for a verdict it has not reached yet.
+  const live = deriveSessionCardState({ ...base, authenticated: true, verdict: "in", checking: true });
+  expect(live.label).toBe("Checking session…");
+  expect(live.label).not.toContain("due a recheck");
 });

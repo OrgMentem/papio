@@ -1449,20 +1449,29 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
   const aged = verdictAge !== undefined && verdictAge > SESSION_STALE_MS;
   const stale = verdictAge === undefined || verdictAge < 0 || aged;
   if (stale) {
-    // Two different times in one card: when the verdict was confirmed, and the
-    // recheck happening now. The age belongs beside the verdict it measures.
+    // Two different times in one card: when the verdict was confirmed, and
+    // whatever is true about it now. The age belongs beside the verdict it
+    // measures - trailing it off the detail chain produced "Signed in —
+    // rechecking now · via your library tab · 1h ago", where the age reads as
+    // the age of the recheck.
+    //
+    // And the second clause may NOT claim a check is running: the `checking`
+    // branch above returns first, so reaching here proves no probe is in
+    // flight. Keep-warm is on (the !enabled branch returned too) and the
+    // verdict has aged past its window, so a recheck is DUE - which is a fact
+    // about the schedule, not an activity papio cannot see.
     const confirmed = sessionVerdictAge(state);
     const since = confirmed === "" ? "" : ` ${confirmed}`;
     if (aged && verdict === "in" && state.authenticated) {
       return {
-        label: `Signed in${since} — rechecking now`,
+        label: `Signed in${since} — due a recheck`,
         detail: sessionEvidenceSource(state),
         action: "none",
       };
     }
     if (aged && verdict === "out" && !state.authenticated) {
       return {
-        label: `Signed out${since} — rechecking now`,
+        label: `Signed out${since} — due a recheck`,
         detail: sessionEvidenceSource(state),
         action: "signin",
       };

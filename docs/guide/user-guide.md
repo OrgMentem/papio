@@ -386,7 +386,7 @@ it does not automate your credentials.
 ### Watch the institution session
 
 The popup's **Institution session** card reports the browser-local resolver
-state: **Signed in**, **Signed in <age> - rechecking now**, **Signed out or
+state: **Signed in**, **Signed in <age> - due a recheck**, **Signed out or
 expired**, **Sign-in needed - papio paused**, or **Keep-warm off**. When every
 configured institution is signed in and freshly verified, the card says **All
 institutions signed in**. **Sign in now** focuses the ordinary resolver

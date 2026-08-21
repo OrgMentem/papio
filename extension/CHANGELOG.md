@@ -54,8 +54,9 @@ for the full pre-split extension history.
   under a different total and look like a contradiction. The session card no
   longer chains two different times into one sentence: "Signed in — rechecking
   now · via your library tab · 1h ago" could not tell you whether the check was
-  an hour old or happening now, and now reads "Signed in 1h ago — rechecking
-  now". "Session warm" is now "Signed in", and "All sessions warm" is "All
+  an hour old or happening now, and now reads "Signed in 1h ago — due a
+  recheck" — which is also the honest claim, since *papio* only reaches that
+  wording when no check is actually running. "Session warm" is now "Signed in", and "All sessions warm" is "All
   institutions signed in" — *warm* was *papio*'s word for how fresh its
   evidence is, never yours. And a paper's card no longer prints a bare line
   from the activity log where its status belongs: "Institution login returned ·
