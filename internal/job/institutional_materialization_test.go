@@ -215,6 +215,82 @@ func TestNewerHolderCannotEvictAClaimWithAnEffectInFlight(t *testing.T) {
 	}
 }
 
+// The stale sweep is the only mechanism that can reach a claim whose browser
+// session is gone: its candidate reads `claimed`, so the scheduler never offers
+// it and the browser never asks, and its lease has lapsed, so the
+// generation-blind expiry path is its only other hope — and there a settled
+// permit vetoes. Five claims sat stranded in exactly that gap on the operator's
+// machine, generations 155-206 against a holder at 366.
+func TestStaleSweepRetiresALapsedSettledClaimButNotAnInFlightOne(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		settle   bool
+		wantGone bool
+	}{
+		{name: "settled effect is over", settle: true, wantGone: true},
+		{name: "effect still in flight", settle: false, wantGone: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			js := testStore(t)
+			ctx := context.Background()
+			jobID, candidateID := permitInstitutionalJob(t, js, "stale-sweep-"+tc.name)
+			claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+				CandidateID: candidateID, JobAttemptRevision: 1,
+				InstitutionProfileRevision: 1, RouteRevision: 1,
+				MaterializationKind: "browser_tab", BrowserHolderGeneration: 3,
+				LeaseUntil: time.Now().Add(time.Minute),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := js.BindMaterialization(ctx, claim.ID, claim.BindingID, 3, 1, 9); err != nil {
+				t.Fatal(err)
+			}
+			const requestID = "request-stale-sweep"
+			if _, outcome, err := js.AcquireInstitutionalEffectPermit(ctx, InstitutionalEffectPermitAcquireInput{
+				JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
+				SafetyDomainID: "domain", InstitutionalRequestID: requestID,
+				JobAttemptRevision: 1, BrowserHolderGeneration: 3,
+				ExpectedEffectOrdinal: 0, LeaseUntil: time.Now().Add(time.Minute),
+				Authorization: EffectPermitEvent{Kind: "institutional.authorized"},
+			}); err != nil || outcome != EffectPermitAcquired {
+				t.Fatalf("acquire outcome=%v err=%v", outcome, err)
+			}
+			if tc.settle {
+				if _, outcome, err := js.SettleEffectPermit(ctx, EffectPermitSettleInput{
+					Identity: EffectPermitIdentity{
+						JobID: jobID, Kind: Institutional, ClaimID: claim.ID, BindingID: claim.BindingID,
+						EffectOrdinal: 1, InstitutionalRequestID: requestID,
+					},
+					RequiredEvents: []EffectPermitEvent{{Kind: "browser.institutional_effect_result", Detail: map[string]any{
+						"claim_id": claim.ID, "binding_id": claim.BindingID, "effect_ordinal": 1,
+						"institutional_request_id": requestID,
+					}}},
+				}); err != nil || outcome != EffectPermitApplied {
+					t.Fatalf("settle outcome=%v err=%v", outcome, err)
+				}
+			}
+			// Lapse the lease: invisible to the sweep's old live-lease-only
+			// predicate, and to nothing else.
+			if _, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims SET lease_until=?
+				WHERE id=?`, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), claim.ID); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := js.AbandonStaleMaterializations(ctx, 4); err != nil {
+				t.Fatal(err)
+			}
+			swept, err := js.GetMaterializationClaim(ctx, claim.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gone := swept.Phase == "abandoned"; gone != tc.wantGone {
+				t.Fatalf("claim abandoned = %t, want %t (phase %q)", gone, tc.wantGone, swept.Phase)
+			}
+		})
+	}
+}
+
 func TestMaterializationExpiredBindReplayIsStaleAndCandidateEligible(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

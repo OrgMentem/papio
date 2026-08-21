@@ -1655,6 +1655,23 @@ func (js *Store) AbandonTerminalMaterializations(ctx context.Context, now time.T
 // by an older browser holder generation. Claims from the current generation
 // remain untouched. Candidates are made eligible again only when no other live
 // claim still owns them; terminal candidate states are never rewritten.
+//
+// The generation mismatch IS the evidence: the browser session that created
+// that surface no longer exists, so nobody is left to sign in on it, and for a
+// settled institutional effect nobody is left to produce an artifact winner
+// either. That is why this sweep — unlike the lease-driven expiry path, whose
+// permit veto deliberately protects a claim whose own session is still alive —
+// covers a lapsed lease too, and vetoes only on an IN-FLIGHT permit. Something
+// may still be happening at the provider under `held` or
+// `unknown_completion`, and papio must never start a second attempt across an
+// irreversible effect; `settled` means it is over.
+//
+// Measured live 2026-08-21: five claims sat `navigated` on closed tabs from
+// generations 155-206 while the holder had reached 366, each carrying a settled
+// permit, and every one of them fell through BOTH sweeps — this one because its
+// lease had lapsed, the expiry one because a settled permit vetoed it. They
+// were unreachable from the browser too: their candidates read `claimed`, so
+// the scheduler never offered them and no claim request was ever made.
 func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGeneration int64) (int64, error) {
 	now := store.Now()
 	tx, err := js.S.DB().BeginTx(ctx, nil)
@@ -1667,9 +1684,9 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 	staleRows, err := tx.QueryContext(ctx, `SELECT binding_id FROM materialization_claims
 		WHERE browser_holder_generation<>?
 		  AND phase IN ('claimed','bound','route_issued','navigated')
-		  AND (lease_until IS NULL OR lease_until > ?)
-		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id)`,
-		currentGeneration, now)
+		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id
+			  AND p.status IN ('held','unknown_completion'))`,
+		currentGeneration)
 	if err != nil {
 		return 0, err
 	}
@@ -1690,9 +1707,9 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 		SET phase='abandoned', updated_at=?
 		WHERE browser_holder_generation<>?
 		  AND phase IN ('claimed','bound','route_issued','navigated')
-		  AND (lease_until IS NULL OR lease_until > ?)
-		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id)`,
-		now, currentGeneration, now)
+		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id
+			  AND p.status IN ('held','unknown_completion'))`,
+		now, currentGeneration)
 	if err != nil {
 		return 0, err
 	}
