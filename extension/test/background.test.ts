@@ -2050,6 +2050,10 @@ test("a surface whose one close attempt was refused is retried by reconciliation
   // guessed flush count made this read as "no retry was ever attempted".
   const retry = await h.port.waitForFrame("surface_close_request", framesBefore);
   expect(retry).toBeDefined();
+  // The disposition must name the truth about the paper, not just any close:
+  // this paper is alive and still asking for a human, so job_inactive is false
+  // for it and the daemon refuses it - which is what kept these tabs for days.
+  expect(retry.payload["disposition"]).toBe("handoff_parked");
   await h.port.inbound(
     nativeResult("surface_close_response", {
       request_id: retry!.payload["request_id"],

@@ -6487,6 +6487,51 @@ func TestSurfaceCloseOfUnclaimedBindingIsNotARefusal(t *testing.T) {
 	}
 }
 
+// TestSurfaceCloseHandoffParkedAuthorizesAnUntouchedAsk pins the disposition
+// that job_inactive could not express. A paper waiting for the operator keeps
+// its handoff action OPEN by definition, so job_inactive is false for it and
+// was refused on every reconcile pass - "the binding still has an active
+// browser handoff", measured live 2026-08-21 against four surfaces the
+// operator had not touched in days. Waiting is not a reason to hold a tab: the
+// paper keeps its action and its place, and `papio actions open` mints a fresh
+// surface when the operator actually wants one.
+//
+// papio's only stake in a surface is an in-flight provider effect, so that
+// permit is the one veto - pinned by the second half below.
+func TestSurfaceCloseHandoffParkedAuthorizesAnUntouchedAsk(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, materializationHello(t))
+	claim := seedSurfaceCloseClaim(t, b, jobs, "close-parked", "navigated")
+
+	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-parked", BindingID: claim.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "handoff_parked",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeSurfaceCloseResponse(t, frames)
+	if got.Outcome != "authorized" {
+		t.Fatalf("parked handoff outcome = %q (%s), want authorized: a paper waiting for a human must not hold a tab it is not using",
+			got.Outcome, got.Detail)
+	}
+
+	// The same request while a provider effect for this exact claim is in
+	// flight must be refused: that is the one thing papio still has at stake.
+	held := seedSurfaceCloseClaim(t, b, jobs, "close-parked-inflight", "navigated")
+	seedLiveEffectPermitForClaim(t, jobs, held, "permit-parked-inflight")
+	inflight, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
+		RequestID: "req-close-parked-inflight", BindingID: held.BindingID,
+		BrowserHolderGeneration: b.epoch, Disposition: "handoff_parked",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := decodeSurfaceCloseResponse(t, inflight).Outcome; out == "authorized" {
+		t.Fatal("authorized a close while this binding's provider effect was in flight")
+	}
+}
+
 // TestSurfaceCloseRequestFromNonHolderSessionIsRefused pins the holder gate
 // ahead of the MsgSurfaceCloseRequest dispatch case in handle() — the same
 // class of gate TestHandoffLinkRoutineOutcomesAndFreshResolution pins for

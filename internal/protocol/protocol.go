@@ -5528,8 +5528,15 @@ func (p *SurfaceCloseRequestPayload) validate() error {
 	if err := institutionalOrdinal("surface_close_request.browser_holder_generation", p.BrowserHolderGeneration); err != nil {
 		return err
 	}
+	// handoff_parked: the job still has an open handoff action - it is still
+	// officially waiting for the operator - but the browser has parked it and
+	// is driving nothing through this surface. job_inactive cannot express that
+	// (the job is very much active), so a parked ask used to immortalize its
+	// tab: refused as "the binding still has an active browser handoff" on
+	// every reconcile pass, forever. Measured live 2026-08-21.
 	if err := enumRequired("surface_close_request.disposition", p.Disposition,
-		"scaffold_idle", "materialization_settled", "claim_abandoned", "job_inactive"); err != nil {
+		"scaffold_idle", "materialization_settled", "claim_abandoned", "job_inactive",
+		"handoff_parked"); err != nil {
 		return err
 	}
 	if p.Disposition == "claim_abandoned" {

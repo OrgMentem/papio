@@ -28,6 +28,7 @@ var closeAuthorizationDispositions = map[string]bool{
 	"materialization_settled": true,
 	"claim_abandoned":         true,
 	"job_inactive":            true,
+	"handoff_parked":          true,
 }
 
 // IssueCloseAuthorization mints, or idempotently re-issues, a one-use close

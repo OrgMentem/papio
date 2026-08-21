@@ -6258,7 +6258,7 @@
                   "scaffold_idle",
                   "materialization_settled",
                   "claim_abandoned",
-                  "job_inactive"
+                  "job_inactive", "handoff_parked"
                 ]
               },
               "gate_occurrence_id": {

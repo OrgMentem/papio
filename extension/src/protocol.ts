@@ -6177,7 +6177,8 @@ function validatePayload(
         disposition !== "scaffold_idle" &&
         disposition !== "materialization_settled" &&
         disposition !== "claim_abandoned" &&
-        disposition !== "job_inactive"
+        disposition !== "job_inactive" &&
+        disposition !== "handoff_parked"
       )
         fail(`${type}.disposition is invalid`);
       if (disposition !== "claim_abandoned") {

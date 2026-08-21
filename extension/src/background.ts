@@ -845,7 +845,12 @@ type SurfaceCloseDisposition =
   | "scaffold_idle"
   | "materialization_settled"
   | "claim_abandoned"
-  | "job_inactive";
+  | "job_inactive"
+  /** The job still has an open handoff action - papio is still asking the
+   * operator for something - but this browser has parked it and drives
+   * nothing through this surface. Distinct from job_inactive, which asserts
+   * the opposite about the job and is refused for a parked ask. */
+  | "handoff_parked";
 function isSurfaceCloseDisposition(
   value: string | undefined,
 ): value is SurfaceCloseDisposition {
@@ -4355,7 +4360,15 @@ export class Bridge {
         // in onTabActivated, against a papio-issued focus token.
         continue;
       }
-      const result = await this.closeOwnedSurface(tabID, "job_inactive");
+      // Two different facts, two different dispositions. The paper being GONE
+      // is job_inactive. The paper being alive but tabless is a parked ask:
+      // asserting job_inactive for it is simply false, and the daemon rightly
+      // refused it on every pass ("the binding still has an active browser
+      // handoff") - which is how a parked ask kept a tab for days.
+      const result = await this.closeOwnedSurface(
+        tabID,
+        owner === undefined ? "job_inactive" : "handoff_parked",
+      );
       if (result.closed) closed += 1;
     }
     return { closed };

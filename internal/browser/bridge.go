@@ -2246,11 +2246,23 @@ func (b *Bridge) institutionalReconcile(ctx context.Context, p *protocol.Institu
 // bounded operator review rather than daemon inference.
 func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseRequestPayload) ([]json.RawMessage, error) {
 	requestID := ""
+	bindingID := ""
 	if p != nil {
 		requestID = p.RequestID
+		bindingID = p.BindingID
 	}
 	result := protocol.SurfaceCloseResponsePayload{RequestID: requestID}
 	frame := func() ([]json.RawMessage, error) {
+		// A close papio declines is the one event in this subsystem with no
+		// other trace: the extension asks once, retains the surface on any
+		// answer but "authorized", and says nothing. So a blanket refusal of
+		// every ordinary handoff tab went unnoticed for months while tabs piled
+		// up in the operator's browser. Log every non-authorization with its
+		// reason - opaque binding id only, no URL, no title.
+		if result.Outcome != "authorized" {
+			log.Printf("papio: surface close %s for binding %s: %s",
+				result.Outcome, bindingID, result.Detail)
+		}
 		f, err := b.frame(protocol.MsgSurfaceCloseResponse, "", result)
 		if err != nil {
 			return nil, err
@@ -2290,6 +2302,29 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 		eligible = claim.Phase == "settled"
 	case "claim_abandoned":
 		eligible = claim.Phase == "abandoned"
+	case "handoff_parked":
+		// The browser is asserting a fact only it can know: it has parked this
+		// handoff and is driving nothing through the surface. papio's own stake
+		// in a surface is an in-flight provider effect, and nothing else - so
+		// that permit is the only legitimate veto here, exactly as it is for
+		// scaffold_idle. The job keeps its open handoff action either way: the
+		// paper is still waiting for the operator, it just no longer holds a
+		// browser tab hostage while it waits. `papio actions open` and the
+		// inbox mint a fresh surface the moment the operator wants one.
+		//
+		// Measured live 2026-08-21: four surfaces refused on every reconcile
+		// pass as "the binding still has an active browser handoff", which is
+		// true and was never a reason to keep a tab the operator had not
+		// touched in days.
+		permit, permitErr := b.jobs.LiveEffectPermit(ctx)
+		if permitErr != nil {
+			result.Outcome, result.Detail = "error", "effect permit state is unavailable"
+			return frame()
+		}
+		eligible = permit == nil || permit.ClaimID != claim.ID
+		if !eligible {
+			result.Detail = "the binding's provider effect is still in flight"
+		}
 	case "scaffold_idle":
 		if claim.Phase == "claimed" || claim.Phase == "bound" {
 			permit, permitErr := b.jobs.LiveEffectPermit(ctx)
