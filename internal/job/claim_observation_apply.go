@@ -105,7 +105,14 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 	// would let a queued or retried old-cycle event — most dangerously a
 	// delayed auth_returned — renew or promote the current cycle's lease.
 	// Answer stale instead: never applied, never journaled.
-	if occFound && in.GateOccurrenceID != "" && in.GateOccurrenceID != currentOccurrenceID {
+	//
+	// The unordered kinds are exempt, and for the same reason the lease
+	// generation check inside the switch already exempts owner_closed: a
+	// physical-loss report renews and promotes nothing, and every effect it
+	// authorizes is fenced on its own binding id. See
+	// claimObservationIsOrdered.
+	ordered := claimObservationIsOrdered(in.EventKind)
+	if ordered && occFound && in.GateOccurrenceID != "" && in.GateOccurrenceID != currentOccurrenceID {
 		return fail("stale", "gate occurrence has rolled over; adopt the current occurrence id")
 	}
 
@@ -131,13 +138,24 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 
 	// §3: the dedup/ordering check runs before any state read that can
 	// mutate — see this function's doc comment.
-	journalOutcome, err := checkClaimObservationJournalTx(ctx, tx, in.ObservationID, result.GateOccurrenceID, in.EventOrdinal)
+	eventOrdinal := in.EventOrdinal
+	var journalOutcome string
+	if ordered {
+		journalOutcome, err = checkClaimObservationJournalTx(ctx, tx, in.ObservationID, result.GateOccurrenceID, in.EventOrdinal)
+	} else {
+		journalOutcome, err = checkClaimObservationReplayTx(ctx, tx, in.ObservationID)
+	}
 	if err != nil {
 		return fail("error", "claim observation journal state is unavailable")
 	}
 	if journalOutcome != "" {
 		result.Outcome = journalOutcome
 		return result, nil
+	}
+	if !ordered {
+		if eventOrdinal, err = nextClaimObservationOrdinalTx(ctx, tx, result.GateOccurrenceID); err != nil {
+			return fail("error", "claim observation journal state is unavailable")
+		}
 	}
 
 	lease, leaseFound, err := getAuthenticationEntryLeaseTx(ctx, tx, in.AuthenticationClaimID)
@@ -246,7 +264,7 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 	if err := recordClaimObservationTx(ctx, tx, ClaimObservationRecord{
 		ObservationID: in.ObservationID, GateOccurrenceID: result.GateOccurrenceID,
 		AuthenticationClaimID: in.AuthenticationClaimID, BindingID: in.BindingID,
-		BrowserHolderGeneration: in.Generation, EventKind: in.EventKind, EventOrdinal: in.EventOrdinal,
+		BrowserHolderGeneration: in.Generation, EventKind: in.EventKind, EventOrdinal: eventOrdinal,
 	}); err != nil {
 		return fail("error", "claim observation could not be recorded")
 	}

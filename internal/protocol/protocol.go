@@ -827,6 +827,7 @@ const (
 	MsgJobReject                       = "job_reject"
 	MsgAuthPending                     = "auth_pending"
 	MsgAuthReturned                    = "auth_returned"
+	MsgChallengeCleared                = "challenge_cleared"
 	MsgSessionEvidence                 = "session_evidence"
 	MsgDownloadStarted                 = "download_started"
 	MsgDownloadComplete                = "download_complete"
@@ -2813,7 +2814,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			err = p.validate()
 		}
 		msg.Payload = p
-	case MsgAuthPending, MsgAuthReturned:
+	case MsgAuthPending, MsgAuthReturned, MsgChallengeCleared:
 		p := &AuthPayload{}
 		err = browserRejectNullFields(payloadFields, "elapsed_ms")
 		if err == nil {

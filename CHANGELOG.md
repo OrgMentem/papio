@@ -185,6 +185,32 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **One parked capture no longer hides your whole inbox.** `papio inbox` failed
+  outright with `unsupported triage item kind "pdf_grab"` the moment a captured
+  PDF was waiting to be identified — the very row the new picker above exists to
+  answer. It printed nothing at all, so every other pending paper vanished with
+  it. The capture now prints as its own row, with its state and label.
+- **Solving a security check no longer counts against the paper.** *papio*
+  stops driving a paper on its own after three attempts that achieved nothing —
+  the rule that stops it hammering a publisher forever. A provider CAPTCHA
+  counted as one of those attempts, even when you went and solved it: the
+  daemon could not see security checks at all, so the attempt simply looked
+  silent and expired. Measured on the author's own machine: a paper retired
+  after three attempts, every one of them interrupted by a check that had been
+  solved. The browser now reports when a check it drove into is gone, and that
+  attempt is neither counted against the paper nor credited to it. A check
+  nobody clears still expires and still counts, so a paper stuck behind a wall
+  is still retired rather than retried forever. Timing only crosses the
+  channel — the publisher that showed the check does not.
+- **A tab you closed is now recorded as closed even if you signed in again
+  since.** When the browser reported that one of *papio*'s tabs was gone,
+  *papio* rejected the report if your institution sign-in had cycled in the
+  meantime — and then went on holding that tab's slot, for a tab that no longer
+  existed, which is one of the ways a leftover tab became impossible to clean
+  up. Measured on the author's own machine: 36 rejected reports. A closed tab
+  cannot un-close because you signed in again, so the report is now accepted on
+  its own terms. Reports that *can* affect a live sign-in are still rejected
+  when they belong to a finished one.
 - **A paper waiting for you no longer holds a browser tab as well.** After the
   fix below, one refusal was left standing: a paper that has asked you for
   something keeps that request open by definition, so the daemon read every

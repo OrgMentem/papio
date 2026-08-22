@@ -3182,6 +3182,33 @@ func terminalHandoffEvent(kind string, event map[string]any) bool {
 	return false
 }
 
+// ChallengeClearedEvent records that a provider security check papio drove
+// into is gone, observed first-hand on papio's own tab (protocol
+// MsgChallengeCleared). It closes the epoch it lands in WITHOUT charging it
+// and WITHOUT clearing the streak — the only event that does neither.
+//
+// Both halves are load-bearing. Not charging it: the operator solved a
+// captcha papio asked them to solve, and the fold's own rule is that the
+// lease bounds SILENCE — a drive that reported a human gate, and then
+// reported the gate cleared, was never silent. Charging it retired papers
+// whose check the operator had already passed; measured live 2026-08-22 on
+// job_012f55be2bbfe0abd0ce456e36, quiesced at three epochs, every one of them
+// interrupted by a challenge that was subsequently cleared.
+//
+// And not clearing the streak: a cleared check is not evidence the drive can
+// now succeed, only that this particular obstacle is gone. Treating it as a
+// terminal outcome would zero the count, so a provider that challenges on
+// every attempt would refill the budget forever and MaxAutomaticHandoffEpochs
+// could never fire — the immortal-handoff hazard HandoffEpochsResetEvent's own
+// comment refuses to open. A check that is never cleared still ages out and is
+// still charged, so a genuinely walled paper still quiesces after three.
+//
+// This is deliberately NOT a budget reset (ADR-0013: a fresh browser-local
+// verdict "does not reset authentication-attempt budgets, and it does not
+// open, resolve, or retry an auth-stalled human action"). It neither credits
+// nor debits, and it resolves nothing.
+const ChallengeClearedEvent = "browser.challenge_cleared"
+
 // JobAcceptDispositionQueued marks a browser.job_accept the extension sent
 // while taking the offer into its own queue rather than driving it. Only a
 // driving accept opens a drive epoch, so a paper waiting its turn behind the
@@ -3231,15 +3258,26 @@ func ProjectHandoffOfferState(events []map[string]any, actionCreatedAt string, n
 	var epochStart time.Time
 	open := false
 	fruitless := 0
-	closeEpoch := func(fruitlessClose bool) {
+	// mode: charge a fruitless drive, clear the streak, or neither. "Neither"
+	// exists for ChallengeClearedEvent alone — see its doc comment for why a
+	// cleared security check must not be charged and must not credit either.
+	type epochClose int
+	const (
+		chargeFruitless epochClose = iota
+		clearStreak
+		neither
+	)
+	closeEpoch := func(mode epochClose) {
 		if !open {
 			return
 		}
 		open = false
-		if fruitlessClose {
+		switch mode {
+		case chargeFruitless:
 			fruitless++
-		} else {
+		case clearStreak:
 			fruitless = 0
+		case neither:
 		}
 	}
 
@@ -3261,8 +3299,14 @@ func ProjectHandoffOfferState(events []map[string]any, actionCreatedAt string, n
 		// shut. Three slow-but-successful drives would then quiesce a healthy
 		// job — the false-quiescing this fence exists to prevent.
 		kind, _ := event["kind"].(string)
-		if open && !terminalHandoffEvent(kind, event) && at.Sub(epochStart) >= HandoffAcceptedLease {
-			closeEpoch(true) // lease elapsed before anything terminal arrived
+		// A cleared challenge is exempt from the boundary for the same reason
+		// a terminal signal is: it is a report, not silence. Without this the
+		// boundary force-closes the epoch as fruitless first and the exemption
+		// below no-ops on an already-shut epoch — the exact swallowing bug the
+		// comment above records for terminal events.
+		if open && !terminalHandoffEvent(kind, event) && kind != ChallengeClearedEvent &&
+			at.Sub(epochStart) >= HandoffAcceptedLease {
+			closeEpoch(chargeFruitless) // lease elapsed before anything terminal arrived
 		}
 		switch {
 		case kind == HandoffEpochsResetEvent:
@@ -3296,12 +3340,16 @@ func ProjectHandoffOfferState(events []map[string]any, actionCreatedAt string, n
 				epochStart = at
 				open = true
 			}
+		case kind == ChallengeClearedEvent:
+			// Neither charged nor credited. Ordered after job_accept so a clear
+			// arriving before any drive opened is simply inert.
+			closeEpoch(neither)
 		case terminalHandoffEvent(kind, event):
-			closeEpoch(false)
+			closeEpoch(clearStreak)
 		}
 	}
 	if open && now.Sub(epochStart) >= HandoffAcceptedLease {
-		closeEpoch(true)
+		closeEpoch(chargeFruitless)
 	}
 	return HandoffOfferState{
 		FruitlessEpochs: fruitless,

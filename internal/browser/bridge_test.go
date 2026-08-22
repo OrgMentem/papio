@@ -7435,6 +7435,122 @@ func TestProjectHandoffOfferStateProviderOutcomeResetsFruitlessCount(t *testing.
 	}
 }
 
+// A drive interrupted by a security check the operator then SOLVED must be
+// charged nothing — and must credit nothing either. Measured live 2026-08-22:
+// job_012f55be2bbfe0abd0ce456e36 quiesced at three epochs, every one of them
+// interrupted by a Cloudflare check that was subsequently cleared, so the
+// operator solved captchas and the paper was retired for it. The daemon could
+// not see any of that: it only ever received `browser.error
+// {challenge_blocked}`, which is neither terminal nor progress.
+func TestProjectHandoffOfferStateClearedChallengeIsNeitherChargedNorCredited(t *testing.T) {
+	_, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_challenge_cleared", handoffWork())
+	action := openHandoffAction(t, jobs, id)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// One genuinely fruitless epoch, so the streak is non-zero and a wrongly
+	// credited clear would be visible as a reset to 0.
+	epoch1 := created.Add(time.Second)
+	appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epoch1)
+	appendEventAt(t, jobs, id, "browser.job_accept", nil, epoch1.Add(time.Second))
+
+	// A second epoch that hits a check and has it cleared, deliberately AFTER
+	// the lease has elapsed: solving a captcha routinely outruns ten minutes,
+	// which is exactly when the boundary would otherwise charge it first.
+	epoch2 := epoch1.Add(job.HandoffAcceptedLease + 10*time.Second)
+	appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epoch2)
+	appendEventAt(t, jobs, id, "browser.job_accept", nil, epoch2.Add(time.Second))
+	appendEventAt(t, jobs, id, "browser.error", map[string]any{"code": "challenge_blocked"}, epoch2.Add(2*time.Second))
+	appendEventAt(t, jobs, id, job.ChallengeClearedEvent, nil, epoch2.Add(job.HandoffAcceptedLease+5*time.Minute))
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := epoch2.Add(2 * job.HandoffAcceptedLease)
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, now)
+	if state.FruitlessEpochs != 1 {
+		t.Fatalf("fruitless epochs after a cleared challenge = %d, want 1: the interrupted drive must be neither charged (2) nor credited (0)", state.FruitlessEpochs)
+	}
+	if state.Quiesced {
+		t.Fatal("quiesced on one fruitless epoch")
+	}
+}
+
+// The other half, and the reason a cleared check must not credit: a provider
+// that challenges on every single attempt would otherwise refill the budget
+// forever and MaxAutomaticHandoffEpochs could never fire. That is the
+// immortal-handoff hazard HandoffEpochsResetEvent's own comment refuses to
+// open, so it must not be opened here by the back door.
+func TestProjectHandoffOfferStateClearedChallengesCannotMakeAHandoffImmortal(t *testing.T) {
+	_, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_challenge_immortal", handoffWork())
+	action := openHandoffAction(t, jobs, id)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Three drives, each interrupted by a check that was cleared, and each
+	// then going silent for its whole lease afterwards. The clear closes its
+	// own epoch uncounted; the SILENCE that follows in the next epoch is what
+	// still gets charged, so the budget still runs out.
+	start := created.Add(time.Second)
+	for i := range 4 {
+		epoch := start.Add(time.Duration(i) * (job.HandoffAcceptedLease + time.Minute))
+		appendEventAt(t, jobs, id, "browser.handoff_offered", map[string]any{"requires_auth": false}, epoch)
+		appendEventAt(t, jobs, id, "browser.job_accept", nil, epoch.Add(time.Second))
+		appendEventAt(t, jobs, id, job.ChallengeClearedEvent, nil, epoch.Add(2*time.Second))
+		// Same epoch window, a second accept after the clear: this is the
+		// resumed drive, and it reports nothing at all.
+		appendEventAt(t, jobs, id, "browser.job_accept", nil, epoch.Add(3*time.Second))
+	}
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := start.Add(5 * (job.HandoffAcceptedLease + time.Minute))
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, now)
+	if state.FruitlessEpochs < job.MaxAutomaticHandoffEpochs {
+		t.Fatalf("fruitless epochs after four cleared-then-silent drives = %d, want >= %d: a cleared check must not refill the budget",
+			state.FruitlessEpochs, job.MaxAutomaticHandoffEpochs)
+	}
+	if !state.Quiesced {
+		t.Fatal("a paper whose every drive went silent after its check cleared must still quiesce")
+	}
+}
+
+// The wire half: the frame the extension sends on a positive re-assessment of
+// its own tab lands on the event stream the fold reads. Timing-only payload —
+// the provider host never crosses this channel.
+func TestChallengeClearedFrameRecordsTheFoldsEvent(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_challenge_frame", handoffWork())
+	runSync(t, b, hello())
+	runSync(t, b, inFrame(t, protocol.MsgChallengeCleared, id, map[string]any{"elapsed_ms": 91_000}))
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind == job.ChallengeClearedEvent {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("challenge_cleared frame recorded no %s event", job.ChallengeClearedEvent)
+	}
+}
+
 // TestProjectHandoffOfferStateLateTerminalEventResetsInsteadOfCharging pins
 // the P1 boundary bug terminalHandoffEvent fixes: a signal that proves the
 // drive did something can land AFTER the lease already elapsed — a slow SSO

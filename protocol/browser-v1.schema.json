@@ -25,6 +25,7 @@
         "job_reject",
         "auth_pending",
         "auth_returned",
+        "challenge_cleared",
         "session_evidence",
         "download_started",
         "download_complete",
@@ -1893,6 +1894,7 @@
               "job_reject",
               "auth_pending",
               "auth_returned",
+              "challenge_cleared",
               "download_started",
               "download_complete",
               "delivery_context",
@@ -2432,7 +2434,11 @@
     },
     {
       "if": {
-        "properties": { "type": { "enum": ["auth_pending", "auth_returned"] } }
+        "properties": {
+          "type": {
+            "enum": ["auth_pending", "auth_returned", "challenge_cleared"]
+          }
+        }
       },
       "then": {
         "properties": {

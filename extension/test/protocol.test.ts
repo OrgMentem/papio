@@ -1058,6 +1058,29 @@ test("auth payloads structurally reject URLs", () => {
   ).toThrow(/unknown field "url"/);
 });
 
+test("challenge_cleared carries timing only, and is job-scoped", () => {
+  const frame = {
+    protocol: "papio-browser/1",
+    type: "challenge_cleared",
+    msg_id: "m_chal_clr01",
+    job_id: "job_0002_tyler",
+    seq: 6,
+    payload: { elapsed_ms: 91_000 },
+  };
+  expect(parseBrowserMessage(frame).type).toBe("challenge_cleared");
+  // Same structural privacy invariant as the auth pair above: the provider
+  // host that showed the check must not be expressible on this channel.
+  expect(() =>
+    parseBrowserMessage({
+      ...frame,
+      payload: { elapsed_ms: 1, challenge_host: "journals.sagepub.com" },
+    }),
+  ).toThrow(/unknown field "challenge_host"/);
+  // An unattributable clear would exempt an epoch the fold cannot identify.
+  const { job_id: _dropped, ...jobless } = frame;
+  expect(() => parseBrowserMessage(jobless)).toThrow(ProtocolError);
+});
+
 test("oversized frames are rejected before parsing", () => {
   const pad = " ".repeat(MAX_BROWSER_MESSAGE_BYTES);
   expect(() =>

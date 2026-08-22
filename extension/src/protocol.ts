@@ -31,6 +31,7 @@ export type BrowserMessageType =
   | "job_reject"
   | "auth_pending"
   | "auth_returned"
+  | "challenge_cleared"
   | "session_evidence"
   | "download_started"
   | "download_complete"
@@ -1441,6 +1442,7 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   job_reject: true,
   auth_pending: true,
   auth_returned: true,
+  challenge_cleared: true,
   session_evidence: true,
   download_started: true,
   download_complete: true,
@@ -1528,6 +1530,7 @@ const JOB_SCOPED: Record<string, true> = {
   job_reject: true,
   auth_pending: true,
   auth_returned: true,
+  challenge_cleared: true,
   download_started: true,
   download_complete: true,
   delivery_context: true,
@@ -3467,7 +3470,11 @@ function validatePayload(
       break;
     }
     case "auth_pending":
-    case "auth_returned": {
+    case "auth_returned":
+    // Same timing-only payload and the same structural privacy invariant: the
+    // provider host that showed the check never crosses this channel, only
+    // the fact that the check is gone. The daemon needs no more than that.
+    case "challenge_cleared": {
       // Structural privacy invariant: timing only.
       requireFields<AuthPayload>(p, type, { elapsed_ms: "optional" });
       if ("elapsed_ms" in p) int(p, "elapsed_ms", type, 0);

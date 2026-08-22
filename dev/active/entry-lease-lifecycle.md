@@ -169,6 +169,185 @@ recommendation carried four P0s.** This is the corrected plan; the corrections
 are recorded rather than quietly folded in, because the same mistakes are easy to
 repeat.
 
+## The three that survived all four, 2026-08-22
+
+The operator reported three tabs for one paper, `job_012f55be2bbfe0abd0ce456e36`
+(`10.1177/15480518221144895`), after all four fixes above had shipped. Each
+tab was one drive epoch, and the daemon log named the cause outright — the
+logging from the previous round doing its job:
+
+```
+11:34:01 surface close not_eligible for binding binding_1b006765…:
+         disposition does not match the binding's current phase
+```
+
+Fourteen of those, every one at an exact 3-minute drive-timeout interval.
+
+5. **The drive timeout asserted `scaffold_idle`, then parked the handoff on the
+   very next line.** `scaffold_idle` claims the claim is in phase
+   `claimed`/`bound`; a drive that has already opened and navigated a tab is in
+   `route_issued`/`navigated`. So the one close attempt this path makes was
+   structurally refused whenever a claim existed — and the disposition that
+   fits, `handoff_parked`, was already in the vocabulary, already sent by
+   reconcile for exactly this state, and defect 3 above had added it a day
+   earlier. Claimless handoffs short-circuit to `unclaimed` before the phase
+   switch, which is why the previous round's 9 verified closes all passed: they
+   were the claimless kind, and they hid this from view.
+6. **`isSurfaceCloseDisposition` omitted `handoff_parked`** while the union
+   feeding it declared it, so `replayPendingCloseTombstones`' fallback
+   downgraded a persisted `handoff_parked` tombstone to `scaffold_idle` — the
+   one disposition a navigated claim can never satisfy. A worker death between
+   tombstone persistence and `tabs.remove` therefore converted a close the
+   daemon would authorize into one it must refuse, permanently. The type is now
+   exported and the three hand-maintained copies in `background.test.ts`, all
+   of which omitted the same value, bind to it.
+7. **The repair pass ran before the damage it repairs.** `reconcileOwnedTabs`
+   is the only path that sends a disposition a navigated claim can satisfy, and
+   it ran solely from `start()`, at 12s and 90s. The failure it repairs happens
+   at 180s. So every startup ran the repair, found nothing, and slept; the
+   stranded surface then survived until the next extension restart, which
+   restarts the same race. It now also runs on the one-minute keepalive wake,
+   rate-limited to `OWNED_TAB_RECONCILE_INTERVAL_MS` (5 min) — the same
+   argument `recheckChallengeBlocks` won a day earlier, for the same reason:
+   that wake is the one that survives a worker death.
+
+The durable lesson is narrower than "another close bug". Defects 5 and 6 are
+both papio asserting a fact about its own state that was **false**, in a
+protocol whose whole design is that the daemon checks the assertion and refuses
+when it does not hold. The mechanism worked perfectly; it was fed the wrong
+claim. A close disposition is a claim about phase, so any new close site must
+name the phase it believes it is in, and any new disposition must be added to
+the exported type — never to a second copy of the list.
+
+### What this says about the conservatism
+
+Nothing here was too conservative. The retain-by-default rules — cold-park
+gating, `active` retains, PDF/pinned/out-of-container cedes, positive evidence
+closes — all behaved as designed, and the cold gate is what kept the operator's
+live provider challenge on screen while this was going wrong. The apparent
+conservatism was three wiring defects wearing its clothes: a wrong assertion, a
+silent downgrade of a right one, and a repair pass scheduled where it could
+never see the failure. Loosening any guard would have hidden all three.
+
+## A solved captcha is not a fruitless drive, 2026-08-22
+
+The same paper exposed a second, independent defect, and this one had already
+retired it. `ProjectHandoffOfferState` counted only
+`browser.provider_outcome`, `browser.download_started`,
+`browser.download_complete` and a transition out of `awaiting_human` as proof a
+drive did anything. A provider security check is none of those — the daemon
+received `browser.error {code: challenge_blocked}`, which is neither terminal
+nor progress — so the epoch ran out `HandoffAcceptedLease` and was charged as
+**silence**. Three of those and `MaxAutomaticHandoffEpochs` fires. That is
+exactly this job's history: `browser.handoff_quiesced {"reason":
+"fruitless_drive_limit","drive_epochs":3}`, every one of the three interrupted
+by a Cloudflare check the operator had gone on to solve. The operator solved
+captchas and the paper was retired for it.
+
+The extension already knew. `clearChallengeBlock` retires the ask on a
+positive, current re-assessment of papio's own tab and resumes the drive — that
+path works, and has four tests. It just told nobody.
+
+New frame `challenge_cleared` (`MsgChallengeCleared`), the same timing-only
+`AuthPayload` as `auth_pending`/`auth_returned` and bound by the same
+structural privacy invariant: the provider host that showed the check never
+crosses the channel, only the fact that it is gone. The daemon records
+`job.ChallengeClearedEvent`, and the fold gains a **third** epoch-close mode.
+
+Three modes, and the third is the point:
+
+| close | streak | used by |
+| --- | --- | --- |
+| `chargeFruitless` | `+1` | lease elapsed with nothing reported |
+| `clearStreak` | `0` | a terminal outcome |
+| `neither` | unchanged | `browser.challenge_cleared` |
+
+Both halves of `neither` are load-bearing, and the second is what keeps this
+inside the existing decisions:
+
+- **Not charged**, because the fold's own rule is that the lease bounds
+  SILENCE, and a drive that reported a human gate and then reported the gate
+  cleared was never silent. This is the same argument `2d70fbc` made one layer
+  up when it stopped charging a queue wait as a drive.
+- **Not credited**, because a cleared check is not evidence the drive can now
+  succeed — only that this obstacle is gone. Crediting it would zero the
+  count, so a provider that challenges on every attempt would refill the budget
+  forever and the three-strike rule could never fire. That is the immortal
+  handoff `HandoffEpochsResetEvent`'s own comment refuses to open ("never by a
+  live path"), and it is not opened here. Pinned by
+  `bridge_test.go:TestProjectHandoffOfferStateClearedChallengesCannotMakeAHandoffImmortal`:
+  four drives, each cleared and then silent, still quiesce.
+
+This is deliberately not a budget reset, so ADR-0013's boundary holds verbatim
+— "does not reset authentication-attempt budgets, and it does not open,
+resolve, or retry an auth-stalled human action". It neither credits nor debits,
+and it resolves nothing. A check that is never cleared still ages out and is
+still charged.
+
+Wire cost: a breaking `papio-browser/1` change, taken under the verified
+zero-install floor — AMO `average_daily_users` **0** and the Chrome Web Store
+listing showing no user count and no ratings, both re-checked 2026-08-22, not
+assumed from the earlier reading. All three validators
+(`internal/protocol/protocol.go`, `extension/src/protocol.ts`,
+`protocol/browser-v1.schema.json`) land in one commit, and no `hello_ack`
+feature gates it because the daemon's emitted feature list is fail-closed at
+exactly 32 and slot 32 is taken. The first real install ends that exception; at
+that point this frame needs a feature flag and the emitted cap needs the
+accept-side widening that is already shipped in the extension.
+
+## A closed tab cannot un-close, 2026-08-22
+
+The eighth defect in this family, and the one the previous three left visible
+in the log: 36 rejections reading
+
+```
+claim observation owner_closed for <job> not applied:
+  stale (gate occurrence has rolled over; adopt the current occurrence id)
+```
+
+Each one left a `materialization_claims` row in a non-terminal phase for a tab
+that no longer existed — the unclosable surface, arrived at from the other
+direction. Two gates, both over-broad, and the second is the one that would
+have survived fixing only the first.
+
+**The occurrence fence.** `applyClaimObservationTx` rejects any frame naming a
+superseded login occurrence, and its stated reason is exact: an old-cycle
+event applied under the current cycle's numbering "would let a queued or
+retried old-cycle event — most dangerously a delayed `auth_returned` — renew or
+promote the current cycle's lease." True of every kind that touches a lease.
+Not true of `owner_closed`, which renews and promotes nothing: it abandons the
+claim by binding, retires the entry lease whose `owner_binding_id` is exactly
+that binding, and consumes that binding's close authorization. Binding ids are
+minted per claim and globally unique — "a binding alone is an exact fence" —
+so the report can only ever retire the surface it names. And a rollover means
+the human signed out and back in, which makes the old tab *more* certainly
+gone, not less. This is the same exemption the lease-generation check inside
+the switch already makes for this same kind, one gate up.
+
+**The ordinal.** Lifting the fence alone would not have worked, which is worth
+recording because it looked like it would. `owner_closed` also has to pass §3's
+ordering rule — a new observation's `event_ordinal` must exceed the highest
+applied under that occurrence — and it cannot: it fires from a worker that may
+have just died and been recovered, so the extension's counter is gone exactly
+when this event is generated. It sends 0, and any occurrence with a single
+event already applied rejects that as stale. So `owner_closed` now takes no
+position in the ordinal sequence at all, because it is not a step in the login
+narrative: it is the end of a surface. The daemon assigns its journal ordinal
+(`nextClaimObservationOrdinalTx`, after everything applied so far), which also
+keeps the schema's `UNIQUE (gate_occurrence_id, event_ordinal)` index satisfied
+without a migration.
+
+Idempotency is unchanged in substance and simpler in mechanism: the journal's
+own primary key. One observation id applies exactly once, and a replay answers
+`duplicate`. The ordered path's `rejected` outcome — recorded ordinal disagrees
+with the replayed frame's — is meaningless for a kind whose ordinal the daemon
+assigns, so `checkClaimObservationReplayTx` does not compute it; keeping it
+would have reported a conflict for every honest retry.
+
+`TestClaimObservationRolledOverAuthReturnedIsStillStale` pins the other half:
+the fence still rejects a delayed `auth_returned` from a closed-out cycle,
+which is the case it exists for.
+
 ## What is actually broken: the reader
 
 The draft said "nothing can leave `expired`". **False.**

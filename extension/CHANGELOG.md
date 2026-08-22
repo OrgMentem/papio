@@ -20,6 +20,34 @@ for the full pre-split extension history.
 - **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
 
 ### Fixed
+- **A paper no longer collects one leftover tab per attempt.** When a handoff
+  drive timed out, *papio* asked to close its tab while claiming the tab was an
+  idle scaffold it had never navigated. That claim is false for any tab a drive
+  has actually opened and steered, so the daemon correctly refused the close and
+  the tab stayed — one stranded tab per attempt, three on screen for a single
+  paper. *papio* now states the fact that is true (it has parked this handoff
+  and is driving nothing through the tab), which is the same thing its own
+  repair pass already said, so the tab is retired on the first ask. Verified
+  against the live daemon: the refusals stopped and the close was authorized at
+  the exact moment the previous build was refused.
+- **A close interrupted by the browser suspending *papio* keeps its own
+  reason.** A close already agreed with the daemon but not yet carried out is
+  retried when *papio* wakes; that retry silently downgraded its reason to the
+  one reason the daemon must refuse, so an interrupted close could never
+  complete.
+- **Leftover tabs are now cleaned up while *papio* runs, not only just after it
+  starts.** The cleanup pass ran twice, both within ninety seconds of startup —
+  always before the three-minute timeout whose leftovers it exists to collect.
+  It now also runs on the one-minute upkeep wake, at most every five minutes, so
+  a tab nothing points at is retired within minutes instead of surviving until
+  the next time you reload the extension.
+- **A security check you solve is reported, so it stops counting against the
+  paper.** *papio* already noticed when a check it drove into was gone and
+  resumed on its own — but it told the app nothing, and the app stops driving a
+  paper after three attempts that achieved nothing. A check counted as one of
+  those attempts even after you solved it, so three solved checks retired the
+  paper. The extension now reports the check clearing. Timing only: the
+  publisher that showed the check never crosses the channel.
 - **Pages behind Cloudflare are no longer all read as security checks.**
   *papio* treated the presence of one Cloudflare script as proof of a bot
   check. That script is injected into ORDINARY pages on sites that enable

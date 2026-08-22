@@ -96,6 +96,78 @@ func checkClaimObservationJournalTx(ctx context.Context, q dbtx, observationID, 
 	return "", nil
 }
 
+// claimObservationIsOrdered reports whether an event kind takes a position in
+// its login cycle's ordinal sequence.
+//
+// Every kind does except `owner_closed`, which is not a step in the login
+// narrative at all: it reports the PHYSICAL loss of one surface, keyed by a
+// binding id that is minted per claim and globally unique. Its three effects
+// (abandon the claim by binding, retire the entry lease whose
+// `owner_binding_id` is exactly that binding, consume that binding's close
+// authorization) are each fenced on the binding alone, so they can only ever
+// retire the surface the report names — the surface that is, by the report's
+// own content, already gone.
+//
+// Ordering it was wrong in both of the ways ordering can be wrong. The
+// extension cannot know the current ordinal when this fires: the case that
+// matters is a report recovered after an MV3 worker death, which is precisely
+// when its counter is gone. And the occurrence fence rejected it outright
+// whenever the human had signed out and back in since — a rollover makes the
+// old tab MORE certainly gone, not less. Measured live 2026-08-22: 36
+// rejections reading "gate occurrence has rolled over", each one leaving a
+// materialization claim in a non-terminal phase for a tab that no longer
+// existed, which is the stranded-surface family entry-lease-lifecycle.md
+// documents.
+func claimObservationIsOrdered(eventKind string) bool {
+	return eventKind != "owner_closed"
+}
+
+// checkClaimObservationReplayTx is §3's idempotency rule WITHOUT its ordering
+// rule, for the unordered kinds above. Idempotency still comes from the
+// journal's own primary key: one observation id is applied exactly once. The
+// ordered path's "rejected" outcome has no meaning here — an unordered
+// observation's recorded ordinal is assigned by the daemon
+// (nextClaimObservationOrdinalTx), not carried on the frame, so comparing a
+// replay's ordinal against it would report a conflict for every honest retry.
+func checkClaimObservationReplayTx(ctx context.Context, q dbtx, observationID string) (string, error) {
+	if strings.TrimSpace(observationID) == "" {
+		return "", errors.New("claim observation replay check requires an observation id")
+	}
+	var recorded string
+	err := q.QueryRowContext(ctx,
+		`SELECT observation_id FROM claim_observation_journal WHERE observation_id=?`,
+		observationID).Scan(&recorded)
+	switch {
+	case err == nil:
+		return "duplicate", nil
+	case errors.Is(err, sql.ErrNoRows):
+		return "", nil
+	default:
+		return "", err
+	}
+}
+
+// nextClaimObservationOrdinalTx assigns an unordered observation its journal
+// position: after everything already applied under this gate occurrence. The
+// daemon assigns it because the daemon is the only party that knows it, and
+// because the schema's UNIQUE (gate_occurrence_id, event_ordinal) index would
+// otherwise reject a frame-supplied ordinal that a live cycle has already used.
+func nextClaimObservationOrdinalTx(ctx context.Context, q dbtx, gateOccurrenceID string) (int64, error) {
+	if strings.TrimSpace(gateOccurrenceID) == "" {
+		return 0, errors.New("claim observation ordinal assignment requires an occurrence id")
+	}
+	var maxOrdinal sql.NullInt64
+	if err := q.QueryRowContext(ctx,
+		`SELECT MAX(event_ordinal) FROM claim_observation_journal WHERE gate_occurrence_id=?`,
+		gateOccurrenceID).Scan(&maxOrdinal); err != nil {
+		return 0, err
+	}
+	if !maxOrdinal.Valid {
+		return 0, nil
+	}
+	return maxOrdinal.Int64 + 1, nil
+}
+
 // RecordClaimObservation durably appends one applied observation to the
 // journal. Callers MUST call this only after CheckClaimObservationJournal
 // reported "" (genuinely new) and after the corresponding side effect

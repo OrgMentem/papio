@@ -846,6 +846,106 @@ func TestClaimObservationOwnerClosedAbandonsClaimConsumesTokenAndLeavesDependent
 	}
 }
 
+// A tab that is gone stays gone across a sign-out/sign-in. The occurrence
+// fence exists so a delayed old-cycle event cannot renew or promote the
+// CURRENT cycle's lease — but owner_closed renews and promotes nothing, and
+// each of its three effects is fenced on the binding id it names. Rejecting it
+// left a materialization claim in a non-terminal phase for a surface that no
+// longer existed, which is exactly how a tab becomes unclosable. Measured live
+// 2026-08-22: 36 rejections reading "gate occurrence has rolled over".
+//
+// The ordinal is the second half of the same defect. owner_closed fires from a
+// worker that may have just died and been recovered, so the extension cannot
+// know the cycle's current ordinal; the daemon assigns it instead. Here the
+// occurrence has already applied an event at ordinal 0, so a frame-supplied 0
+// would have been rejected as stale even with the fence lifted.
+func TestClaimObservationOwnerClosedAppliesAcrossAGateRollover(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "wr_observation_rollover", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auth-observation-rollover")
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-rollover")
+
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, jobID,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auth-observation-rollover-req", CandidateID: candidateID,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-rollover", 9)
+	claim, err := jobs.MaterializationClaimByBindingID(ctx, bindingID)
+	if err != nil || claim == nil {
+		t.Fatalf("materialization claim for binding: %v %v", claim, err)
+	}
+	closeID, _, err := jobs.IssueCloseAuthorization(ctx, bindingID, b.epoch, "handoff_parked", b.now())
+	if err != nil {
+		t.Fatalf("issue close authorization: %v", err)
+	}
+
+	// One ordered event under the live occurrence, so ordinal 0 is taken.
+	if ack := claimObservationAckPayload(t, mustSync(t, b, claimObservationFrame(t, jobID,
+		"obs-rollover-wall", "auth-observation-rollover", bindingID, grant.GateOccurrenceID,
+		"observation-rollover-wall", b.epoch, 0, "wall_observed"))); ack.Outcome != "applied" {
+		t.Fatalf("wall_observed outcome = %+v, want applied", ack)
+	}
+
+	// The tab dies, and the report names the occurrence the extension last
+	// heard about — which is no longer the current one.
+	msgs, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-rollover-closed",
+		"auth-observation-rollover", bindingID, "gate-occurrence-that-has-rolled-over",
+		"observation-rollover-closed", b.epoch, 0, "owner_closed"))
+	ack := claimObservationAckPayload(t, msgs)
+	if ack.Outcome != "applied" {
+		t.Fatalf("owner_closed across a rollover = %+v, want applied: a closed tab cannot un-close because the human signed in again", ack)
+	}
+
+	afterClaim, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil || afterClaim == nil || afterClaim.Phase != "abandoned" {
+		t.Fatalf("materialization claim after a rolled-over owner_closed = %+v, %v; want phase abandoned", afterClaim, err)
+	}
+	var tokenStatus string
+	if err := jobs.S.DB().QueryRowContext(ctx, `SELECT status FROM close_authorizations WHERE id=?`, closeID).Scan(&tokenStatus); err != nil {
+		t.Fatal(err)
+	}
+	if tokenStatus != "consumed" {
+		t.Fatalf("close authorization status = %q, want consumed", tokenStatus)
+	}
+
+	// Idempotency survives the exemption: the same observation id replayed is a
+	// duplicate, not a second apply and not a spurious ordinal conflict.
+	replay, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-rollover-closed-replay",
+		"auth-observation-rollover", bindingID, "gate-occurrence-that-has-rolled-over",
+		"observation-rollover-closed", b.epoch, 0, "owner_closed"))
+	if got := claimObservationAckPayload(t, replay); got.Outcome != "duplicate" {
+		t.Fatalf("replayed owner_closed = %+v, want duplicate", got)
+	}
+}
+
+// The fence still holds for everything that can renew or promote a lease: a
+// delayed auth_returned from a closed-out login cycle is the case it exists
+// for, and lifting it for owner_closed must not lift it here.
+func TestClaimObservationRolledOverAuthReturnedIsStillStale(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	jobID := parkInstitutional(t, jobs, "wr_observation_rollover_auth", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auth-observation-rollover-auth")
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-rollover-auth")
+	runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, jobID,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auth-observation-rollover-auth-req", CandidateID: candidateID,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-rollover-auth", 10)
+
+	msgs, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-rollover-auth",
+		"auth-observation-rollover-auth", bindingID, "gate-occurrence-that-has-rolled-over",
+		"observation-rollover-auth", b.epoch, 0, "auth_returned"))
+	if got := claimObservationAckPayload(t, msgs); got.Outcome != "stale" {
+		t.Fatalf("rolled-over auth_returned = %+v, want stale", got)
+	}
+}
+
 func TestClaimObservationNavigationErrorParksWithoutMutatingLease(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	jobID := parkInstitutional(t, jobs, "wr_observation_naverror", handoffWork(), "")

@@ -163,6 +163,15 @@ func printInboxItem(opt *options, item triage.Item) error {
 		// escapes into `papio inbox`.
 		_, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\n", item.Rank, item.Retraction.Nature, store.StripTerminalControls(item.Retraction.DOI))
 		return err
+	case triage.KindPdfGrab:
+		// item.Title is the grab's label, which is derived from the captured
+		// file's own name — attacker-influenced in exactly the way the watch-hit
+		// and retraction rows above document, so it takes the same choke point.
+		// Printing a bare error for this kind made ONE parked grab fail the
+		// whole `papio inbox` render, hiding every other pending item.
+		_, err := fmt.Fprintf(opt.out, "%d\tpdf grab\t%s\t%s\t%s\n", item.Rank,
+			item.PdfGrab.GrabID, item.PdfGrab.State, store.StripTerminalControls(item.Title))
+		return err
 	default:
 		return fmt.Errorf("unsupported triage item kind %q", item.Kind)
 	}

@@ -3014,6 +3014,17 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			log.Printf("papio: recording browser auth event: %v", err)
 		}
 		return nil, nil
+	case protocol.MsgChallengeCleared:
+		// A drive that hit a human gate and had it cleared is neither silence
+		// nor an outcome, and the fold needs to hear about it: see
+		// job.ChallengeClearedEvent. Recording it is the whole handler — there
+		// is no reply, and a failure to append is logged like recordAuth's,
+		// never fatal, because a lost accounting hint must not tear down a
+		// live session.
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, job.ChallengeClearedEvent, nil); err != nil {
+			log.Printf("papio: recording browser challenge_cleared: %v", err)
+		}
+		return nil, nil
 
 	case protocol.MsgSessionEvidence:
 		if err := b.sessionEvidence(ctx, msg.Payload.(*protocol.SessionEvidencePayload), msg.MsgID); err != nil {

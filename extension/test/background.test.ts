@@ -76,6 +76,7 @@ import {
   type DownloadDeltaLike,
   type DownloadItemLike,
   type NativePort,
+  type SurfaceCloseDisposition,
   type NavigationErrorMarkerEntry,
   type PageBulkSnapshotView,
   type PdfGrabCorrelation,
@@ -19351,11 +19352,7 @@ async function seedOwnedScaffold(
     update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
     closeOwnedSurface: (
       tabID: number,
-      disposition:
-        | "scaffold_idle"
-        | "materialization_settled"
-        | "claim_abandoned"
-        | "job_inactive",
+      disposition: SurfaceCloseDisposition,
     ) => Promise<{ closed: boolean }>;
   };
   const bindingID = "binding-owned-0001";
@@ -19373,22 +19370,14 @@ async function seedOwnedScaffold(
 function closeInternals(h: Harness): {
   closeOwnedSurface: (
     tabID: number,
-    disposition:
-      | "scaffold_idle"
-      | "materialization_settled"
-      | "claim_abandoned"
-      | "job_inactive",
+    disposition: SurfaceCloseDisposition,
   ) => Promise<{ closed: boolean }>;
   tabLedgerCache: Record<string, SurfaceBirthRecord>;
 } {
   return h.bridge as unknown as {
     closeOwnedSurface: (
       tabID: number,
-      disposition:
-        | "scaffold_idle"
-        | "materialization_settled"
-        | "claim_abandoned"
-        | "job_inactive",
+      disposition: SurfaceCloseDisposition,
     ) => Promise<{ closed: boolean }>;
     tabLedgerCache: Record<string, SurfaceBirthRecord>;
   };
@@ -19813,6 +19802,221 @@ test("Slice 2b: a failed remove leaves the tombstone; startup replay completes i
   await startPromise;
   expect(h.tabs.snapshot(tabID)).toBeUndefined();
 });
+
+// The drive timeout asserted `scaffold_idle`, and then parked the handoff on
+// the very next line. scaffold_idle claims the daemon's claim is still in phase
+// `claimed`/`bound`; a drive that has already opened and navigated a tab is in
+// `route_issued`/`navigated`, which NO disposition covered, so the daemon
+// answered "disposition does not match the binding's current phase" and the
+// extension correctly obeyed. Measured live 2026-08-22: 14 refusals, all with
+// that detail, at exact 3-minute drive-timeout intervals — one stranded tab per
+// drive, three of them for a single paper. handoff_parked is the fact papio is
+// actually entitled to assert here, and it is the disposition the reconcile
+// path already sends for the same state.
+test("the drive timeout asks to close with the disposition its own park makes true", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const before = new Set(h.tabs.list().map((tab) => tab.id));
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  await h.port.inbound(jobOffer("job_timeout_disposition"));
+  const tabID = h.tabs
+    .list()
+    .map((tab) => tab.id)
+    .find((id) => id !== undefined && !before.has(id));
+  expect(tabID).toBeDefined();
+
+  const framesBefore = h.frames().length;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(driveTimeout).toBeDefined();
+  h.clock.now += 180_000;
+  const timedOut = driveTimeout!.fn();
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+
+  const closeRequest = h
+    .frames()
+    .slice(framesBefore)
+    .find((frame) => frame.type === "surface_close_request");
+  expect(closeRequest).toBeDefined();
+  expect(closeRequest!.payload["disposition"]).toBe("handoff_parked");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: closeRequest!.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-timeout-0001",
+      nonce: "nonce-timeout-0001",
+      browser_holder_generation: 1,
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  await timedOut;
+  expect(h.tabs.removed).toContain(tabID!);
+});
+
+// isSurfaceCloseDisposition omitted handoff_parked while the union that feeds
+// it declared it, so replayPendingCloseTombstones' fallback silently DOWNGRADED
+// a persisted handoff_parked tombstone to scaffold_idle — the one disposition a
+// navigated claim can never satisfy. A worker death between tombstone
+// persistence and tabs.remove therefore converted a close the daemon would
+// authorize into one it must refuse, permanently.
+test("Slice 2b: a replayed tombstone keeps its own disposition instead of decaying to scaffold_idle", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID } = await seedOwnedScaffold(h);
+  h.deps.tabs.remove = async () => {
+    throw new Error("remove failed");
+  };
+  const closing = closeInternals(h).closeOwnedSurface(tabID, "handoff_parked");
+  const request = await h.port.waitForFrame("surface_close_request");
+  expect(request.payload["disposition"]).toBe("handoff_parked");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-parked-0001",
+      nonce: "nonce-parked-0001",
+      browser_holder_generation: 1,
+    }),
+  );
+  await closing;
+  expect(closeInternals(h).tabLedgerCache[String(tabID)]?.pending_close).toBeDefined();
+
+  const restarted = restartWorker(h);
+  // Worker-memory only, so a restart wipes it; the sibling replay test seeds
+  // it the same way. Private field on a concrete class: no runtime check is
+  // possible or meaningful here.
+  const restartedInternals = restarted.bridge as unknown as {
+    lastKnownBrowserHolderGeneration: number;
+  };
+  restartedInternals.lastKnownBrowserHolderGeneration = 1;
+  const startPromise = restarted.bridge.start();
+  await restarted.port.inbound(helloAck({ features: ["surface_close_v1"] }));
+  const replay = await restarted.port.waitForFrame("surface_close_request");
+  expect(replay.payload["disposition"]).toBe("handoff_parked");
+  restarted.deps.tabs.remove = async (id) => {
+    h.tabs.live.delete(id);
+  };
+  await restarted.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: replay.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-parked-0002",
+      nonce: "nonce-parked-0002",
+      browser_holder_generation: 1,
+    }),
+  );
+  await startPromise;
+  expect(h.tabs.snapshot(tabID)).toBeUndefined();
+});
+
+// reconcileOwnedTabs is the ONLY path that sends a disposition a navigated
+// claim can satisfy, and it ran solely from start(), at 12s and 90s. The
+// failure it repairs — a refused drive-timeout close — happens at 180s. So the
+// repair systematically ran BEFORE the damage, the MV3 worker then slept, and
+// the stranded surface survived until the next extension restart, which
+// restarts the same race. Measured live 2026-08-22: three tabs for one paper.
+// The one-minute keepalive alarm is the wake that survives a worker death, the
+// same argument recheckChallengeBlocks already won.
+test("the keepalive wake repairs a stranded surface the startup passes ran too early to see", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const before = new Set(h.tabs.list().map((tab) => tab.id));
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  await h.port.inbound(jobOffer("job_keepalive_repair"));
+  const tabID = h.tabs
+    .list()
+    .map((tab) => tab.id)
+    .find((id) => id !== undefined && !before.has(id));
+  expect(tabID).toBeDefined();
+
+  // Both startup passes run and find nothing to do: the drive is still live.
+  for (const delay of [12_000, 90_000]) {
+    const pass = h.timers.find((timer) => timer.ms === delay);
+    expect(pass).toBeDefined();
+    await pass!.fn();
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  }
+
+  // Now the damage: the drive times out and its close is refused, exactly as
+  // the daemon refused it live.
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  h.clock.now += 180_000;
+  const timedOut = driveTimeout!.fn();
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+  const refused = h.frames().find((frame) => frame.type === "surface_close_request");
+  expect(refused).toBeDefined();
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: refused!.payload["request_id"],
+      outcome: "not_eligible",
+      detail: "disposition does not match the binding's current phase",
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  await timedOut;
+  expect(h.tabs.snapshot(tabID!)).toBeDefined();
+
+  // Pre-fix this surface was unreachable by every close path until the next
+  // extension restart. The wake must retry it, and the retry must survive the
+  // rate limit's first refusal.
+  const framesBefore = h.frames().length;
+  h.clock.now += 5 * 60_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  const retry = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(retry.payload["disposition"]).toBe("handoff_parked");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: retry.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-wake-0001",
+      nonce: "nonce-wake-0001",
+      browser_holder_generation: 1,
+    }),
+  );
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+  expect(h.tabs.removed).toContain(tabID!);
+});
+
+// The pass is a ledger walk plus a tabs.get per record. Running it on every
+// one-minute wake would be the opposite mistake to the one above.
+test("the keepalive wake rate-limits the repair pass", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  let passes = 0;
+  const bridgeReconcile = h.bridge as unknown as {
+    reconcileOwnedTabs: () => Promise<{ closed: number }>;
+  };
+  bridgeReconcile.reconcileOwnedTabs = async () => {
+    passes += 1;
+    return { closed: 0 };
+  };
+
+  // First wake runs it; the next two, inside the interval, must not.
+  for (let tick = 0; tick < 3; tick += 1) {
+    h.clock.now += 60_000;
+    await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+    for (let i = 0; i < 40; i += 1) await Promise.resolve();
+  }
+  expect(passes).toBe(1);
+
+  h.clock.now += 5 * 60_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+  expect(passes).toBe(2);
+});
+
 
 test("P0 (oracle finding 2): a persisted close tombstone survives a hello_ack race — local bootstrap alone cannot replay it, but the SAME holder ack that finally supplies browser_holder_generation closes the tab in the SAME worker lifetime", async () => {
   const h = makeHarness(undefined, { windows: true });
@@ -20658,4 +20862,58 @@ test("the real Cloudflare interstitial is still a challenge, title or text", () 
   `);
   expect(isBotChallenge(renderedInterstitial)).toBe(true);
   expect(assessDrivenPage(renderedInterstitial).kind).toBe("challenge");
+});
+
+// The daemon's fruitless-drive accounting could not see a security check at
+// all: it only ever received the `challenge_blocked` error, which is neither
+// terminal nor progress, so the epoch aged out and was charged as silence —
+// and three of those retire the paper. Measured live 2026-08-22: a paper
+// quiesced at three epochs, every one interrupted by a check the operator had
+// gone on to solve. Retiring the ask locally is not enough; the daemon has to
+// hear that the check is gone.
+test("retiring a solved security check tells the daemon, timing only", async () => {
+  let challenge = true;
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => challenge);
+  await classifyProviderUnknown(h, "job_challenge_reported");
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBe(true);
+
+  const framesBefore = h.frames().length;
+  challenge = false;
+  h.clock.now += 91_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  for (let step = 0; step < 40; step += 1) await Promise.resolve();
+
+  const cleared = h
+    .frames()
+    .slice(framesBefore)
+    .find((frame) => frame.type === "challenge_cleared");
+  expect(cleared).toBeDefined();
+  expect(cleared!.job_id).toBe("job_challenge_reported");
+  // Structural privacy invariant, same as auth_pending/auth_returned: the
+  // provider host that showed the check never crosses this channel.
+  expect(Object.keys(cleared!.payload).sort()).toEqual(["elapsed_ms"]);
+  expect(cleared!.payload["elapsed_ms"]).toBe(91_000);
+});
+
+// A check that is still on the page keeps its ask, so it must report nothing:
+// a clear the daemon hears about while the wall is still up would exempt a
+// drive that never got past it.
+test("a challenge still on the page reports no clear", async () => {
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => true);
+  await classifyProviderUnknown(h, "job_challenge_still_up");
+  const framesBefore = h.frames().length;
+
+  for (let tick = 0; tick < 3; tick += 1) {
+    await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+    for (let step = 0; step < 20; step += 1) await Promise.resolve();
+  }
+
+  expect(
+    h
+      .frames()
+      .slice(framesBefore)
+      .some((frame) => frame.type === "challenge_cleared"),
+  ).toBe(false);
 });

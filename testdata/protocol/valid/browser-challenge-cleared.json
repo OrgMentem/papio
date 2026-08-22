@@ -1,0 +1,10 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "challenge_cleared",
+  "msg_id": "m_chal_clr01",
+  "job_id": "job_0002_tyler",
+  "seq": 6,
+  "payload": {
+    "elapsed_ms": 91000
+  }
+}

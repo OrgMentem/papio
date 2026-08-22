@@ -399,6 +399,12 @@ const SESSION_EVIDENCE_THROTTLE_MS = 60_000;
  * before papio retires it. See surfaceIsCold for the measurement this comes
  * from; 3x the measured p99 operator-return latency. */
 const PARKED_SURFACE_COLD_MS = 30 * 60_000;
+/** How often the keepalive wake may re-run the owned-surface repair pass. It
+ * only has to be short relative to the 3-minute drive timeout whose refused
+ * closes it repairs, and to PARKED_SURFACE_COLD_MS; five minutes repairs a
+ * stranded surface within one cold window instead of never, at one ledger walk
+ * per five wakes. */
+const OWNED_TAB_RECONCILE_INTERVAL_MS = 5 * 60_000;
 /** Daemon replies that settle a correlated `requestNative` call. `requestNative`
  * rejects any type outside this set before registering a wait, so wrappers and
  * variables cannot create a request that only fails later by timing out. */
@@ -873,11 +879,13 @@ const PRIVATE_SURFACE_PURPOSE = "federated-login";
 const RESTART_LIVENESS_SCAN_LIMIT = 25;
 const BROWSER_EPOCH_LOCAL_KEY = "papio_browser_epoch_v1";
 const BROWSER_EPOCH_SESSION_KEY = "papio_browser_epoch_session_v1";
-/** The four closed-permitted disposition reasons (claim-observation
- * protocol design §2.3): idle scaffold never engaged, settled after
- * artifact win, an authentication claim's abandonment, or a binding whose
- * daemon handoff is no longer active. */
-type SurfaceCloseDisposition =
+/** The disposition reasons a close may assert (claim-observation protocol
+ * design §2.3): idle scaffold never engaged, settled after artifact win, an
+ * authentication claim's abandonment, a binding whose daemon handoff is no
+ * longer active, or a handoff this browser has parked. Exported so tests bind
+ * to this list rather than re-declaring it: three hand-maintained copies in
+ * background.test.ts all silently omitted `handoff_parked`. */
+export type SurfaceCloseDisposition =
   | "scaffold_idle"
   | "materialization_settled"
   | "claim_abandoned"
@@ -894,7 +902,13 @@ function isSurfaceCloseDisposition(
     value === "scaffold_idle" ||
     value === "materialization_settled" ||
     value === "claim_abandoned" ||
-    value === "job_inactive"
+    value === "job_inactive" ||
+    // Omitting handoff_parked here silently DOWNGRADED a replayed tombstone
+    // (replayPendingCloseTombstones' fallback) to scaffold_idle — the one
+    // disposition a navigated claim can never satisfy. A worker death between
+    // tombstone persistence and tabs.remove therefore converted the correct
+    // close into a permanently refused one.
+    value === "handoff_parked"
   );
 }
 export interface OpenManagedTabOptions {
@@ -4335,6 +4349,24 @@ export class Bridge {
     return this.deps.now() - entry.created_at >= PARKED_SURFACE_COLD_MS;
   }
 
+  /** How often the keepalive wake may run the surface-repair pass. One pass is
+   * a ledger walk plus a tabs.get per record, so it is rate-limited rather
+   * than run on every one-minute wake; the interval only has to be short
+   * relative to PARKED_SURFACE_COLD_MS and to the 3-minute drive timeout
+   * whose refused closes it repairs. */
+  private ownedTabReconcileDueAt = 0;
+
+  /** Rate-limited reconcileOwnedTabs for the keepalive wake. The stamp is
+   * advanced BEFORE the walk so two overlapping wakes cannot both run it; a
+   * failed pass simply waits for the next interval, exactly as a failed
+   * challenge recheck does. */
+  private async reconcileOwnedTabsIfDue(): Promise<void> {
+    const now = this.deps.now();
+    if (now < this.ownedTabReconcileDueAt) return;
+    this.ownedTabReconcileDueAt = now + OWNED_TAB_RECONCILE_INTERVAL_MS;
+    await this.reconcileOwnedTabs();
+  }
+
   /** Reconcile modern, same-browser-epoch birth records that no live job still
    * points at. This is the restart/update repair half of job_inactive: future
    * cancel/job-removal frames close through removeJobWithOffer, but a surface
@@ -5688,7 +5720,17 @@ export class Bridge {
         // detach semantics.
         await this.update((s) => patchJob(s, jobID, { tab_id: -1 }));
       }
-      await this.closeOwnedSurface(tabID, "scaffold_idle");
+      // handoff_parked, never scaffold_idle. The next line parks this handoff,
+      // so that is the fact papio is entitled to assert; scaffold_idle asserts
+      // a claim phase of `claimed`/`bound`, which a drive that has already
+      // opened and navigated a tab cannot be in. When a claim exists the
+      // daemon therefore refused this close structurally - 14 live refusals
+      // on 2026-08-21/22, every one "disposition does not match the binding's
+      // current phase", at exact 3-minute drive-timeout intervals, stranding
+      // one tab per drive. Claimless handoffs short-circuit to `unclaimed`
+      // before the phase switch, so this is strictly wider: nothing that
+      // closed before stops closing.
+      await this.closeOwnedSurface(tabID, "handoff_parked");
       await this.parkHandoffForManual(jobID);
     }, HANDOFF_DRIVE_TIMEOUT_MS);
   }
@@ -12506,6 +12548,21 @@ export class Bridge {
     void this.recheckChallengeBlocks().catch((e: unknown) => {
       console.error("papio: challenge recheck failed", e);
     });
+    // The surface-repair pass on the wake that survives a worker death, for
+    // exactly the reason stated for the challenge recheck above. Until now
+    // reconcileOwnedTabs ran ONLY from start(), at 12s and 90s — both of
+    // which elapse BEFORE the 3-minute drive timeout whose refused close is
+    // the failure this pass exists to repair. So the repair systematically
+    // ran before the damage, the worker then slept, and a stranded surface
+    // survived until the next extension restart, which restarts the same
+    // race. Measured live 2026-08-22: three tabs for one paper, each from a
+    // drive-timeout close refused minutes after the last reconcile pass.
+    //
+    // Rate-limited rather than run every wake: one pass is a ledger walk plus
+    // a tabs.get per record, and nothing here depends on its result.
+    void this.reconcileOwnedTabsIfDue().catch((e: unknown) => {
+      console.error("papio: owned-tab reconcile failed", e);
+    });
     if (
       this.hasCurrentHello() &&
       (this.store.daemonFeatures ?? []).includes(TRIAGE_SNAPSHOT_FEATURE)
@@ -13191,6 +13248,21 @@ export class Bridge {
     if (providerHost !== undefined)
       this.challengeCooldownTimers.delete(providerHost);
     this.challengeBlockedOutcomeSent.delete(`${job.job_id}:challenge_blocked`);
+    // Tell the daemon, once per block. Its fruitless-drive accounting cannot
+    // see a security check at all: it only ever received the `challenge_blocked`
+    // error, which is neither terminal nor progress, so the epoch aged out and
+    // was charged as silence — and three of those retire the paper. Measured
+    // live 2026-08-22: a paper quiesced at three epochs, every one of them
+    // interrupted by a check the operator had gone on to solve. Timing-only
+    // payload: the provider host stays in the browser.
+    const blockedAt = job.challenge_blocked_at;
+    this.send(
+      "challenge_cleared",
+      blockedAt === undefined
+        ? {}
+        : { elapsed_ms: Math.max(0, this.deps.now() - blockedAt) },
+      job.job_id,
+    );
     await this.clearProviderDrainPark(this.providerKeyForJob(job));
     const resumed = await this.resumeHandoffAfterManual(job.job_id);
     await this.releaseQueuedHandoffs();
