@@ -17,9 +17,17 @@ import (
 
 func seedFailedZotioApply(t *testing.T, ctx context.Context, db *store.Store, jobID, createdAt string, zotioEnvelope map[string]any) {
 	t.Helper()
+	seedFailedZotioApplyError(t, ctx, db, jobID, createdAt, "Zotero file storage refused upload (HTTP 413)", zotioEnvelope)
+}
+
+// seedFailedZotioApplyError carries the error text too, because the routing
+// refusal is identified by its structured precondition and the ABSENCE of an
+// HTTP status - a fixture that always says "HTTP 413" cannot express it.
+func seedFailedZotioApplyError(t *testing.T, ctx context.Context, db *store.Store, jobID, createdAt, errText string, zotioEnvelope map[string]any) {
+	t.Helper()
 	result := map[string]any{
 		"status": "failed",
-		"error":  "Zotero file storage refused upload (HTTP 413)",
+		"error":  errText,
 		"zotio":  zotioEnvelope,
 	}
 	raw, err := json.Marshal(result)
@@ -205,10 +213,92 @@ func TestZoteroFileStorageRefusedDatesTheQuotaReading(t *testing.T) {
 	if !strings.Contains(got.Detail, "as measured "+stale.Format("2006-01-02")) {
 		t.Fatalf("detail = %q, want the quota figures dated", got.Detail)
 	}
-	if !strings.Contains(got.Detail, "1 of them were refused for another reason") {
+	if !strings.Contains(got.Detail, "1 of them was refused for another reason") {
 		t.Fatalf("detail = %q, want the non-quota refusals distinguished", got.Detail)
 	}
 	if !strings.Contains(got.Detail, "last "+time.Now().UTC().Format("2006-01-02")) {
 		t.Fatalf("detail = %q, want the newest refusal dated", got.Detail)
+	}
+}
+
+// The routing refusal - zotio declining a stored upload because the library
+// keeps its files on the operator's own file store - is a different fact from a
+// full storage plan, and the quota advice is wrong for it in both directions:
+// freeing space changes nothing, and no retry can succeed. Reported as HTTP 413
+// it sent a diagnosis looking for a status code Zotero never sent, and folded
+// into "another reason" behind a five-day-old quota figure it was invisible.
+const routingRefusalError = `zotio: attachments add refused: {"outcome":"precondition_unmet",` +
+	`"capability":"attachments add","precondition":"zotero_file_storage",` +
+	`"detail":"Zotero desktop keeps personal-library attachment files on your own file store, ` +
+	`but a stored attachment uploaded through the Zotero Web API always lands in Zotero's own cloud storage"}`
+
+func TestZoteroFileStorageRefusedNamesTheRoutingRefusal(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	seedFailedZotioApplyError(t, ctx, db, "job_routing", time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano),
+		routingRefusalError, map[string]any{"ok": false})
+
+	got := zoteroFileStorageRefusedCheck(t, ctx, db)
+	if got.Status != Warn {
+		t.Fatalf("status = %q, want warn: %+v", got.Status, got)
+	}
+	if strings.Contains(got.Detail, "413") {
+		t.Fatalf("detail = %q, must not claim an HTTP status Zotero never sent", got.Detail)
+	}
+	if !strings.Contains(got.Detail, "no route to the file store") {
+		t.Fatalf("detail = %q, want the routing refusal named", got.Detail)
+	}
+	for _, want := range []string{"nothing to retry", "freeing space will not help", "unsupported for now"} {
+		if !strings.Contains(got.Remediation, want) {
+			t.Fatalf("remediation = %q, missing %q", got.Remediation, want)
+		}
+	}
+	if strings.Contains(got.Remediation, "free space in Zotero") {
+		t.Fatalf("remediation = %q, must not offer quota advice for a refusal freeing space cannot fix", got.Remediation)
+	}
+	if strings.Contains(got.Remediation, "Papio retries once uploads are accepted") {
+		t.Fatalf("remediation = %q, must not promise a retry that cannot succeed", got.Remediation)
+	}
+}
+
+// A stale quota reading must not swallow the one live cause: this is the exact
+// shape of the operator's machine on 2026-08-22, where ten quota failures from
+// five days earlier were the headline and the single routing refusal from that
+// morning was a footnote whose remediation addressed the resolved cause.
+func TestZoteroFileStorageRefusedReportsBothCauses(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	stale := time.Now().UTC().Add(-5 * 24 * time.Hour)
+	seedFailedZotioApply(t, ctx, db, "job_quota_stale", stale.Format(time.RFC3339Nano), map[string]any{
+		"ok": false, "error": map[string]any{"http_status": 413, "message": "File would exceed quota (300.4 > 300)"},
+	})
+	live := time.Now().UTC().Add(-time.Hour)
+	seedFailedZotioApplyError(t, ctx, db, "job_routing_live", live.Format(time.RFC3339Nano),
+		routingRefusalError, map[string]any{"ok": false})
+
+	got := zoteroFileStorageRefusedCheck(t, ctx, db)
+	if !strings.Contains(got.Detail, "as measured "+stale.Format("2006-01-02")) {
+		t.Fatalf("detail = %q, want the quota figures dated", got.Detail)
+	}
+	if !strings.Contains(got.Detail, "1 had no route to the file store (last "+live.Format("2006-01-02")+")") {
+		t.Fatalf("detail = %q, want the routing refusal counted and dated, not folded into 'another reason'", got.Detail)
+	}
+	if strings.Contains(got.Detail, "refused for another reason") {
+		t.Fatalf("detail = %q, the routing refusal is a named cause, not an anonymous remainder", got.Detail)
+	}
+	for _, want := range []string{"free space in Zotero", "nothing to retry"} {
+		if !strings.Contains(got.Remediation, want) {
+			t.Fatalf("remediation = %q, missing %q - both causes are present so both need advice", got.Remediation, want)
+		}
 	}
 }

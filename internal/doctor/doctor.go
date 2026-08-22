@@ -266,7 +266,8 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 			add("zotero_file_storage_refused", Pass, "no recent Zotero apply failed with HTTP 413 file-storage refusal", "")
 		default:
 			var detail string
-			if summary.quota > 0 {
+			switch {
+			case summary.quota > 0:
 				detail = fmt.Sprintf("%d recent Zotero apply %s could not upload the file",
 					summary.count, plural(summary.count, "failure", "failures"))
 				reading := "Zotero storage plan is full"
@@ -280,12 +281,27 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 					reading += fmt.Sprintf(" (as measured %s)", summary.quotaAt.UTC().Format("2006-01-02"))
 				}
 				detail += ": " + reading
-				if summary.quota < summary.count {
-					detail += fmt.Sprintf("; %d of them were refused for another reason", summary.count-summary.quota)
-				}
-			} else {
+			case summary.routing == summary.count:
+				// Every refusal is the routing one, so lead with it. Reporting
+				// these as HTTP 413 sent a diagnosis looking for a status code
+				// Zotero never sent.
+				detail = fmt.Sprintf("%d recent Zotero apply %s had no route to the file store: papio holds the PDF, and Zotero cannot attach a file to an item that already exists",
+					summary.count, plural(summary.count, "failure", "failures"))
+			default:
 				detail = fmt.Sprintf("%d recent Zotero apply %s returned HTTP 413 (file storage refused the upload)",
 					summary.count, plural(summary.count, "failure", "failures"))
+			}
+			// Name the routing refusal rather than folding it into "another
+			// reason": it is the one cause here that no retry and no storage
+			// change can clear, so it must not hide behind a quota headline.
+			if summary.routing > 0 && summary.routing != summary.count {
+				detail += fmt.Sprintf("; %d had no route to the file store", summary.routing)
+				if !summary.routingAt.IsZero() {
+					detail += fmt.Sprintf(" (last %s)", summary.routingAt.UTC().Format("2006-01-02"))
+				}
+			}
+			if other := summary.count - summary.quota - summary.routing; other > 0 {
+				detail += fmt.Sprintf("; %d of them %s refused for another reason", other, plural(other, "was", "were"))
 			}
 			if !summary.first.IsZero() {
 				detail += fmt.Sprintf("; first seen %s", summary.first.UTC().Format("2006-01-02"))
@@ -293,7 +309,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 			if !summary.latest.IsZero() && !summary.latest.Equal(summary.first) {
 				detail += fmt.Sprintf(", last %s", summary.latest.UTC().Format("2006-01-02"))
 			}
-			add("zotero_file_storage_refused", Warn, detail, zoteroFileStorageRefusedRemediation(summary.quota > 0))
+			add("zotero_file_storage_refused", Warn, detail, zoteroFileStorageRefusedRemediation(summary.quota > 0, summary.routing > 0))
 		}
 	}
 
@@ -577,6 +593,20 @@ type zoteroFileStorageRefusedSummary struct {
 	// refusals were real; their stated cause was stale.
 	latest  time.Time
 	quotaAt time.Time
+	// routing counts the subset zotio refused with a structured precondition
+	// and NO HTTP status: the library keeps its files on the operator's own
+	// file store, so a stored upload through the Web API has no route. It is
+	// tracked apart from the quota subset because the two need opposite
+	// advice. Freeing space cannot fix it and no retry can succeed — zotio
+	// verified against Zotero's server source that attaching to an item which
+	// already exists is a missing feature, not an impossibility, so papio
+	// must report it as unsupported-for-now rather than as either a permanent
+	// property or a transient upload failure. Merged into one count, a
+	// resolved quota reading from five days earlier became the headline while
+	// the only live cause was a footnote whose remediation addressed the
+	// resolved one.
+	routing   int
+	routingAt time.Time
 }
 
 // recentZoteroFileStorageRefusedApplies scans failed zotio_apply rows in the exports
@@ -610,10 +640,16 @@ func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store)
 		}
 		info := zotio.ClassifyError(errors.New(recorded.Error), recorded.Zotio)
 		isQuota := info.Class == zotio.ErrorClassZoteroStorageQuota
+		// A file-storage refusal carrying no HTTP status is the routing
+		// refusal; the 413 branch of the classifier always sets one.
+		isRouting := info.Class == zotio.ErrorClassZoteroFileStorageRefused && info.HTTPStatus == 0
 		switch info.Class {
 		case zotio.ErrorClassZoteroStorageQuota:
 			summary.quota++
 		case zotio.ErrorClassZoteroFileStorageRefused:
+			if isRouting {
+				summary.routing++
+			}
 		default:
 			continue
 		}
@@ -634,6 +670,9 @@ func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store)
 			summary.quotaAt = parsed
 			summary.hint = info.Hint
 		}
+		if isRouting && parsed.After(summary.routingAt) {
+			summary.routingAt = parsed
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -644,11 +683,26 @@ func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store)
 	return summary, nil
 }
 
-func zoteroFileStorageRefusedRemediation(quota bool) string {
+// zoteroFileStorageRefusedRemediation answers the causes actually present. The
+// routing refusal gets its own sentence because the quota advice is wrong for
+// it in both directions: freeing space changes nothing, and papio must not
+// promise a retry that cannot succeed. zotio verified against Zotero's own
+// server source that re-parenting an attachment is permitted and moves no
+// bytes, so this is a missing feature rather than a permanent property —
+// stating it as permanent would record a wrong fact just as durably.
+func zoteroFileStorageRefusedRemediation(quota, routing bool) string {
+	const linkedFile = `set attachment_mode = "linked-file" under [zotio] so papio links PDFs from its own artifact store and needs no Zotero storage at all — linked files do not sync to other devices and break if the file moves`
+	var parts []string
 	if quota {
-		return `free space in Zotero by deleting large attachments you no longer need, or raise the storage plan; or set attachment_mode = "linked-file" under [zotio] so papio links PDFs from its own artifact store and needs no Zotero storage at all — linked files do not sync to other devices and break if the file moves. This is Zotero's own file storage, not a WebDAV target in Zotero's sync settings. Papio retries once uploads are accepted again`
+		parts = append(parts, `for the papers Zotero refused on storage: free space in Zotero by deleting large attachments you no longer need, or raise the storage plan; or `+linkedFile+`. This is Zotero's own file storage, not a WebDAV target in Zotero's sync settings. Papio retries once uploads are accepted again`)
 	}
-	return `check whether Zotero's own Sync pane reports the same HTTP 413 — if it does, the problem is upstream of papio; or set attachment_mode = "linked-file" under [zotio] so papio links PDFs from its artifact store with no upload — linked files do not sync to other devices and break if the file moves. Papio retries once uploads are accepted again`
+	if routing {
+		parts = append(parts, `for the papers with no route: their Zotero item already exists, and a stored upload through the Web API would bill the bytes to Zotero's own plan rather than your file store, so there is nothing to retry and freeing space will not help. Either `+linkedFile+`, or attach the PDF yourself in Zotero (right-click the item, Add Attachment, Attach Stored Copy of File) and run 'papio zotio import-backfill --include-not-requested --apply' — papio then recognises the held PDF and files the paper with no upload attempted. Attaching to an item that already exists is unsupported for now, not impossible; it needs zotio support that does not exist yet`)
+	}
+	if len(parts) == 0 {
+		return `check whether Zotero's own Sync pane reports the same HTTP 413 — if it does, the problem is upstream of papio; or ` + linkedFile + `. Papio retries once uploads are accepted again`
+	}
+	return strings.Join(parts, "; ")
 }
 
 func unresolvedEffectPermit(ctx context.Context, db *store.Store, now time.Time) (*unresolvedPermit, error) {
