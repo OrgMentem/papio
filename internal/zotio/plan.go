@@ -395,11 +395,14 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	}
 	if plan.Route != "manifest_duplicate" && result.ParentKey == "" {
 		applyErr := errors.New("Zotio apply succeeded without returning a parent item key")
+		if envelope.Result.Summary.Applied > 0 {
+			return nil, s.recordFailedApplyKeepingPlan(ctx, idempotencyKey, plan, out, applyErr)
+		}
 		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
 	if envelope.Result.Summary.Applied > 0 && result.AttachmentKey == "" {
 		applyErr := errors.New("Zotio apply succeeded without returning an attachment key")
-		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
+		return nil, s.recordFailedApplyKeepingPlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
 	if err := s.recordApply(ctx, idempotencyKey, result); err != nil {
 		return nil, err
@@ -882,25 +885,45 @@ func (s *Service) recordPlan(ctx context.Context, key, path string, plan *Plan) 
 	return recorded, nil
 }
 
-func (s *Service) recordFailedApplyAndInvalidatePlan(ctx context.Context, key string, plan *Plan, zotio json.RawMessage, applyErr error) error {
-	info := ClassifyError(applyErr, zotio)
-	result := &ApplyResult{
-		PlanID:    plan.ID,
-		JobID:     plan.JobID,
-		Status:    "failed",
-		ParentKey: plan.ExpectedParentKey,
-		AppliedAt: s.now().UTC().Format(time.RFC3339),
-		Error:     info.Hint,
-		Zotio:     zotio,
+// recordFailedApplyKeepingPlan records a replayable failure and deliberately
+// leaves the cached plan in place. It exists for a failure that arrives AFTER
+// zotio reports the mutation applied: the library already changed, so the only
+// safe retry is a replay of the identical mutation, which zotio recognises and
+// answers as a no-op. Invalidating here would let PlanJobs derive a fresh
+// manifest and issue a second create, and zotio's own de-duplication would be
+// the only thing standing between the operator and a duplicate paper.
+//
+// Measured live 2026-08-22: six connector-route creates each reported
+// "applied": 1 with an empty item key, and each replay answered no_op carrying
+// the key, so the retry converges without a second mutation.
+func (s *Service) recordFailedApplyKeepingPlan(ctx context.Context, key string, plan *Plan, zotio json.RawMessage, applyErr error) error {
+	if err := s.recordApply(context.WithoutCancel(ctx), key, failedApplyResult(s, plan, zotio, applyErr)); err != nil {
+		return WithErrorInfo(fmt.Errorf("recording failed Zotio apply: %w", applyErr), zotio)
 	}
+	return WithErrorInfo(applyErr, zotio)
+}
+
+func (s *Service) recordFailedApplyAndInvalidatePlan(ctx context.Context, key string, plan *Plan, zotio json.RawMessage, applyErr error) error {
 	durableCtx := context.WithoutCancel(ctx)
-	if err := s.recordApply(durableCtx, key, result); err != nil {
+	if err := s.recordApply(durableCtx, key, failedApplyResult(s, plan, zotio, applyErr)); err != nil {
 		return WithErrorInfo(fmt.Errorf("recording failed Zotio apply: %w", applyErr), zotio)
 	}
 	if err := s.invalidatePlan(durableCtx, plan); err != nil {
 		return WithErrorInfo(fmt.Errorf("%w (invalidating cached Zotio plan: %w)", applyErr, err), zotio)
 	}
 	return WithErrorInfo(applyErr, zotio)
+}
+
+func failedApplyResult(s *Service, plan *Plan, zotio json.RawMessage, applyErr error) *ApplyResult {
+	return &ApplyResult{
+		PlanID:    plan.ID,
+		JobID:     plan.JobID,
+		Status:    "failed",
+		ParentKey: plan.ExpectedParentKey,
+		AppliedAt: s.now().UTC().Format(time.RFC3339),
+		Error:     ClassifyError(applyErr, zotio).Hint,
+		Zotio:     zotio,
+	}
 }
 
 func (s *Service) recordAmbiguousApply(ctx context.Context, key string, plan *Plan, zotio json.RawMessage, applyErr error) error {

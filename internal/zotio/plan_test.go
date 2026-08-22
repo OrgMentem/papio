@@ -1396,3 +1396,62 @@ func TestPlanIdempotencyKeyDistinguishesTheExistingItemRoute(t *testing.T) {
 		t.Fatalf("linked-file route = %q, want no --via", existingItemRoute("linked-file"))
 	}
 }
+
+// A failure that arrives after zotio reports the mutation applied must not
+// invalidate the plan. Measured live 2026-08-22: every connector-route create
+// returned "applied": 1 with an empty item key, and invalidating let PlanJobs
+// derive a fresh manifest whose second create was caught only by zotio's own
+// de-duplication - one missed match away from a duplicate paper in the
+// operator's library. The replay of the identical mutation is the safe retry.
+func TestAppliedWithoutKeyKeepsPlanForReplay(t *testing.T) {
+	const manifest = `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper","DOI":"10.1002/example"}}]}`
+	for _, tc := range []struct {
+		name    string
+		apply   string
+		wantSam bool
+	}{
+		{
+			name:    "applied without a key keeps the plan",
+			apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"","status":"applied","reason":{"via":"connector"}}]}}`,
+			wantSam: true,
+		},
+		{
+			name:    "nothing applied without a key invalidates it",
+			apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":0,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"","status":"skipped","reason":{"via":"connector"}}]}}`,
+			wantSam: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cli := &planCLI{
+				manifest: manifest,
+				preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+				apply:    tc.apply,
+			}
+			service, jobID := readyPlanService(t, "", cli)
+			plans, err := service.PlanJobs(context.Background(), []string{jobID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := plans[0]
+			if _, err := service.Apply(context.Background(), first.ID, first.ConfirmationSHA256); err == nil {
+				t.Fatal("apply without a parent key must fail")
+			}
+			planPath := filepath.Join(service.DataDir, "zotio", "plans", first.ID+".json")
+			_, statErr := os.Stat(planPath)
+			if tc.wantSam && statErr != nil {
+				t.Fatalf("plan file removed after an applied mutation: %v", statErr)
+			}
+			if !tc.wantSam && statErr == nil {
+				t.Fatal("plan file survived a mutation that never applied")
+			}
+			replanned, err := service.PlanJobs(context.Background(), []string{jobID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			same := replanned[0].ID == first.ID
+			if same != tc.wantSam {
+				t.Fatalf("replanned id = %q, first = %q, want same = %v", replanned[0].ID, first.ID, tc.wantSam)
+			}
+		})
+	}
+}
