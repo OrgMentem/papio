@@ -35,6 +35,16 @@ for the full pre-split extension history.
   retried when *papio* wakes; that retry silently downgraded its reason to the
   one reason the daemon must refuse, so an interrupted close could never
   complete.
+- ***papio* now actually downloads the paper it has identified.** The single
+  defect behind "the PDF button is right there and nothing happens": the
+  download plan is handed from the page to *papio* and back again, and that
+  handoff silently discards any field set to "nothing". The final safety check
+  then compared those fields against "nothing" exactly, found them missing
+  rather than empty, and refused — every time, for every publisher whose
+  download link needs no special handling. The paper was correctly recognised
+  fifteen times over, and a CAPTCHA solved for it, without one download being
+  attempted. Nothing in the test suite could see this: tests hand the plan over
+  directly, with the fields intact.
 - **A paper whose sign-in resolves is no longer left standing on the article
   doing nothing.** When *papio* re-opened its own tab to finish a library
   round-trip, it assumed the resulting page load would arrive as a fresh event

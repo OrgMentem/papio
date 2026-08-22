@@ -5,6 +5,7 @@
 // (permission gate, unknown debounce, single-download latch, hello versions).
 
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
 import {
   adapters,
@@ -28,7 +29,7 @@ import {
   type DownloadItemLike,
   type NativePort,
 } from "../src/background";
-import { fixtureExists, loadFixture, parseHTML } from "./harness";
+import { fixtureExists, fixturePath, loadFixture, parseHTML } from "./harness";
 import { ChromeTabsFake, FakeWebNavigation } from "./fake-tabs";
 import { Window } from "happy-dom";
 
@@ -462,6 +463,119 @@ test.skipIf(sageArticle === null)(
       expect(
         await resolveDownloadURL(rule.selector, rule.idPattern ?? null, rule.urlTemplate ?? null, null),
       ).toBe("https://journals.sagepub.com/doi/pdf/10.1177/0018720814547570?download=true");
+    } finally {
+      Object.assign(globalThis, prev);
+    }
+  },
+);
+
+// An adapter declares ONE work-evidence contract, so a plan carries evidence
+// for the DOI or the title and null for the other. The effect executor used to
+// demand that EVERY requested identity re-validate, and its validator answers
+// false for absent evidence — so a DOI-binding adapter driving a job that also
+// carried a title refused its own download, silently, forever. Titles are the
+// normal case (the resolver fills them in), and SAGE is DOI-binding, which is
+// how job_012f55be2bbfe0abd0ce456e36 reached fifteen `entitled_landing`
+// observations and an operator-solved CAPTCHA without one download attempt.
+test.skipIf(!fixtureExists("sage", "success"))(
+  "a DOI-binding adapter still downloads for a job that also carries a title",
+  async () => {
+    const href =
+      "https://journals.sagepub.com/doi/10.1177/0018720814547570";
+    const doc = parseHTML(
+      readFileSync(fixturePath("sage", "success"), "utf8"),
+      href,
+    );
+    const spec = adapters.find((a) => a.id === "sage") as AdapterSpec;
+    const plan = planExecution(
+      doc,
+      spec,
+      { doi: "10.1177/0018720814547570", title: "Trust in Automation" },
+      { access_mode: "delegated" },
+    ) as Plan;
+    expect("assisted" in plan).toBe(false);
+    expect(plan.verdict.kind).toBe("article");
+    // The adapter binds the DOI only; the title is requested but unbound.
+    expect(plan.expected_work.doi).not.toBeNull();
+    expect(plan.expected_work.title).toBeNull();
+    expect(plan.expected_work.requested_title).not.toBeNull();
+
+    const prev = { document: globalThis.document, location: globalThis.location };
+    Object.assign(globalThis, {
+      document: doc,
+      location: { href, origin: "https://journals.sagepub.com" },
+    });
+    try {
+      expect(
+        await executePlannedPageEffect(plan, spec.download as DownloadRule),
+      ).toEqual({
+        ok: true,
+        url: "https://journals.sagepub.com/doi/pdf/10.1177/0018720814547570?download=true",
+      });
+    } finally {
+      Object.assign(globalThis, prev);
+    }
+  },
+);
+
+// THE defect behind "papio sees the article and never downloads it".
+//
+// `planExecution` runs in the page, its result is serialized back to the
+// worker, and the worker serializes it into the effect injection.
+// chrome.scripting's serialization DROPS null-valued properties, so a field the
+// planner set to `null` reaches the executor ABSENT. Measured live 2026-08-22:
+// the planner emits `{selector, shadow_selector: null, fingerprint,
+// work_binding}` and the executor received `[fingerprint,selector,
+// work_binding]`. Its authority checks compared against `null` exactly, so
+// SAGE — whose target has no shadow selector, hence always null, hence always
+// absent — was refused every single time.
+//
+// Nothing in-process could catch it: the harness and every other test build
+// plan objects directly, where the nulls are still there. So this test models
+// the boundary itself, the only way the defect is visible.
+test.skipIf(!fixtureExists("sage", "success"))(
+  "a plan that crossed a serialization boundary that dropped its nulls still downloads",
+  async () => {
+    const href = "https://journals.sagepub.com/doi/10.1177/0018720814547570";
+    const doc = parseHTML(
+      readFileSync(fixturePath("sage", "success"), "utf8"),
+      href,
+    );
+    const spec = adapters.find((a) => a.id === "sage") as AdapterSpec;
+    const planned = planExecution(
+      doc,
+      spec,
+      { doi: "10.1177/0018720814547570", title: "Trust in Automation" },
+      { access_mode: "delegated" },
+    ) as Plan;
+    expect(planned.effect_graph.primary_target?.shadow_selector).toBeNull();
+
+    // Exactly what chrome.scripting does to it, twice over.
+    const acrossTheBoundary = JSON.parse(
+      JSON.stringify(planned, (_key, value) =>
+        value === null ? undefined : value,
+      ),
+    ) as Plan;
+    expect(
+      "shadow_selector" in
+        (acrossTheBoundary.effect_graph.primary_target ?? {}),
+    ).toBe(false);
+
+    const prev = { document: globalThis.document, location: globalThis.location };
+    Object.assign(globalThis, {
+      document: doc,
+      location: { href, origin: "https://journals.sagepub.com" },
+    });
+    try {
+      expect(
+        await executePlannedPageEffect(
+          acrossTheBoundary,
+          spec.download as DownloadRule,
+        ),
+      ).toEqual({
+        ok: true,
+        url: "https://journals.sagepub.com/doi/pdf/10.1177/0018720814547570?download=true",
+      });
     } finally {
       Object.assign(globalThis, prev);
     }

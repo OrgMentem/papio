@@ -1907,7 +1907,27 @@ export async function executePlannedPageEffect(
     postClickTimeoutMs?: number;
     allowedDestinations?: { origin: string; pathPrefix: string }[];
   },
-): Promise<{ ok: boolean; url?: string }> {
+): Promise<{ ok: boolean; url?: string; why?: string }> {
+  // Every refusal below is a decision not to download a paper the classifier
+  // has already positively identified, so each one names itself. The caller
+  // logs it. Diagnosing this from the outside cost a full session twice.
+  const no = (why: string): { ok: false; why: string } => ({ ok: false, why });
+  // THE PLAN ARRIVES ACROSS chrome.scripting's SERIALIZATION, WHICH DROPS
+  // null-VALUED PROPERTIES. `planExecution` runs in the page and its result is
+  // serialized back to the worker, which then serializes it into this
+  // injection: a field the planner set to `null` arrives ABSENT. Measured live
+  // 2026-08-22 — the planner emits
+  // `{selector, shadow_selector: null, fingerprint, work_binding}` and this
+  // function received `[fingerprint,selector,work_binding]`.
+  //
+  // So every authority check here MUST read "absent" and "null" as the same
+  // thing. Distinguishing them refuses plans that are perfectly well formed,
+  // and it refused every single one: SAGE's target has no shadow selector, so
+  // `shadow_selector` was always null, so it was always absent, so this
+  // function always answered no. That is why the paper was identified fifteen
+  // times and never once downloaded. No unit test could see it — the harness
+  // builds plan objects in-process, where the nulls are still there.
+  const orNull = <T>(value: T | null | undefined): T | null => value ?? null;
   // The injected function is the final authority boundary. Never infer a
   // missing field from the adapter or from the current DOM.
   if (
@@ -1923,19 +1943,21 @@ export async function executePlannedPageEffect(
     typeof plan.revalidation.max_selector_length !== "number" ||
     typeof plan.revalidation.max_wait_ms !== "number"
   )
-    return { ok: false };
+    return no("the plan is structurally incomplete");
   const graph = plan.effect_graph;
   const primary = graph.primary_target ?? graph.terms_target;
   const expectedWork = plan.expected_work as typeof plan.expected_work & {
     requested_doi?: unknown;
     requested_title?: unknown;
   };
-  if (primary === null || primary === undefined) return { ok: false };
-  if (
-    typeof plan.route_origin !== "string" ||
-    plan.route_origin !== location.origin
-  )
-    return { ok: false };
+  if (primary === null || primary === undefined)
+    return no("the plan names no primary or terms target");
+  if (typeof plan.route_origin !== "string")
+    return no("the plan carries no route origin");
+  if (plan.route_origin !== location.origin)
+    return no(
+      `route origin ${plan.route_origin} is not this page's ${location.origin}`,
+    );
   const primarySelector = primary.selector;
   if (
     typeof primarySelector !== "string" ||
@@ -1943,13 +1965,13 @@ export async function executePlannedPageEffect(
     primarySelector.length > plan.revalidation.max_selector_length ||
     typeof primary.fingerprint !== "string"
   )
-    return { ok: false };
-  const primaryShadowSelector = primary.shadow_selector;
+    return no("the primary target's selector or fingerprint is unusable");
+  const primaryShadowSelector = orNull(primary.shadow_selector);
   if (
     primaryShadowSelector !== null &&
     typeof primaryShadowSelector !== "string"
   )
-    return { ok: false };
+    return no("the primary target's shadow selector is malformed");
   const normalize = (raw: string): string => {
     let value = raw.trim().toLowerCase();
     for (let pass = 0; pass < 2; pass += 1) {
@@ -1993,12 +2015,13 @@ export async function executePlannedPageEffect(
     if (typeof ref.fingerprint !== "string") return false;
     const [hostFingerprint, shadowFingerprint] = ref.fingerprint.split(">>");
     if (fingerprint(target) !== hostFingerprint) return false;
-    if (ref.shadow_selector === null) return shadowFingerprint === undefined;
-    if (typeof ref.shadow_selector !== "string") return false;
+    const refShadowSelector = orNull(ref.shadow_selector);
+    if (refShadowSelector === null) return shadowFingerprint === undefined;
+    if (typeof refShadowSelector !== "string") return false;
     const shadow = (target as HTMLElement & { shadowRoot?: ShadowRoot | null })
       .shadowRoot;
     if (shadow === null || shadow === undefined) return false;
-    const inner = shadow.querySelector(ref.shadow_selector);
+    const inner = shadow.querySelector(refShadowSelector);
     return (
       inner !== null &&
       shadowFingerprint !== undefined &&
@@ -2014,32 +2037,39 @@ export async function executePlannedPageEffect(
     }
   };
   const target = findExactlyOne(primarySelector);
-  if (target === null || !matchesTarget(target, primary)) return { ok: false };
+  if (target === null)
+    return no(
+      `selector ${primarySelector} did not match exactly one element on the live page`,
+    );
+  if (!matchesTarget(target, primary))
+    return no(
+      "the live element no longer matches the planned fingerprint (the page moved under the plan)",
+    );
   if (
     rule.method === "meta" &&
     (target.tagName.toUpperCase() !== "META" ||
       target.getAttribute("name") !== (rule.metaName ?? "citation_pdf_url"))
   ) {
-    return { ok: false };
+    return no("the meta target is not the declared meta element");
   }
-  if (
-    !("requested_doi" in expectedWork) ||
-    !("requested_title" in expectedWork)
-  )
-    return { ok: false };
-  const requestedDOI = expectedWork.requested_doi;
-  const requestedTitle = expectedWork.requested_title;
+  // No `in` test here: a null field arrives absent across the injection
+  // boundary, so presence cannot be distinguished from "the planner set null".
+  // The type checks below are the real contract.
+  const requestedDOI = orNull(expectedWork.requested_doi);
+  const requestedTitle = orNull(expectedWork.requested_title);
   if (
     (requestedDOI !== null && typeof requestedDOI !== "string") ||
     (requestedTitle !== null && typeof requestedTitle !== "string")
   ) {
-    return { ok: false };
+    return no("the requested work fields are not strings");
   }
-  const workBinding = (
-    primary as typeof primary & {
-      work_binding?: unknown;
-    }
-  ).work_binding;
+  const workBinding = orNull(
+    (
+      primary as typeof primary & {
+        work_binding?: unknown;
+      }
+    ).work_binding,
+  );
   if (
     plan.verdict.kind === "article" &&
     (requestedDOI !== null || requestedTitle !== null)
@@ -2049,7 +2079,7 @@ export async function executePlannedPageEffect(
       typeof workBinding !== "object" ||
       Array.isArray(workBinding)
     )
-      return { ok: false };
+      return no("an article verdict carries no work binding");
     const binding = workBinding as {
       kind?: unknown;
       selector?: unknown;
@@ -2065,62 +2095,74 @@ export async function executePlannedPageEffect(
       typeof binding.fingerprint !== "string" ||
       binding.fingerprint === ""
     )
-      return { ok: false };
+      return no("the work binding is malformed");
     const bindingTarget = findExactlyOne(binding.selector);
-    if (
-      bindingTarget === null ||
-      fingerprint(bindingTarget) !== binding.fingerprint
-    )
-      return { ok: false };
+    if (bindingTarget === null)
+      return no(
+        `the work binding's selector ${String(binding.selector)} did not match exactly one element`,
+      );
+    if (fingerprint(bindingTarget) !== binding.fingerprint)
+      return no(
+        "the work binding's element no longer matches its planned fingerprint",
+      );
+    const bindingAttribute = orNull(binding.attribute);
+    const bindingNormalized = orNull(binding.normalized);
+    const bindingPattern = orNull(binding.pattern);
     if (binding.kind === "opaque") {
       if (
-        binding.attribute !== null ||
-        binding.normalized !== null ||
-        binding.pattern !== null
+        bindingAttribute !== null ||
+        bindingNormalized !== null ||
+        bindingPattern !== null
       )
-        return { ok: false };
+        return no("an opaque work binding carries extraction fields");
     } else {
       if (
         requestedDOI === null ||
-        typeof binding.attribute !== "string" ||
-        binding.attribute.length === 0 ||
-        typeof binding.normalized !== "string" ||
-        binding.normalized !== normalize(requestedDOI) ||
-        (binding.pattern !== null && typeof binding.pattern !== "string")
+        typeof bindingAttribute !== "string" ||
+        bindingAttribute.length === 0 ||
+        typeof bindingNormalized !== "string" ||
+        bindingNormalized !== normalize(requestedDOI) ||
+        (bindingPattern !== null && typeof bindingPattern !== "string")
       )
-        return { ok: false };
-      const raw = bindingTarget.getAttribute(binding.attribute)?.trim() ?? "";
-      if (raw === "") return { ok: false };
+        return no("the doi work binding is malformed or names another work");
+      const raw = bindingTarget.getAttribute(bindingAttribute)?.trim() ?? "";
+      if (raw === "") return no("the work binding's attribute is empty");
       let extracted = raw;
-      if (binding.pattern !== null) {
+      if (bindingPattern !== null) {
         let match: RegExpMatchArray | null;
         try {
-          match = raw.match(new RegExp(binding.pattern));
+          match = raw.match(new RegExp(bindingPattern));
         } catch {
-          return { ok: false };
+          return no("the work binding's pattern is invalid");
         }
-        if (!match || typeof match[1] !== "string") return { ok: false };
+        if (!match || typeof match[1] !== "string")
+          return no("the work binding's pattern did not match");
         extracted = match[1];
       }
-      if (normalize(extracted) !== binding.normalized) return { ok: false };
+      if (normalize(extracted) !== bindingNormalized)
+        return no("the page's doi is not the requested work");
     }
   } else if (plan.verdict.kind === "article" && workBinding !== null) {
-    return { ok: false };
+    return no("a work binding is present but no identity was requested");
   }
-  const doiEvidence = expectedWork.doi as {
-    normalized?: unknown;
-    fingerprint?: unknown;
-    selector?: unknown;
-    attribute?: unknown;
-    pattern?: unknown;
-  } | null;
-  const titleEvidence = expectedWork.title as {
-    normalized?: unknown;
-    fingerprint?: unknown;
-    selector?: unknown;
-    attribute?: unknown;
-    pattern?: unknown;
-  } | null;
+  const doiEvidence = orNull(
+    expectedWork.doi as {
+      normalized?: unknown;
+      fingerprint?: unknown;
+      selector?: unknown;
+      attribute?: unknown;
+      pattern?: unknown;
+    } | null,
+  );
+  const titleEvidence = orNull(
+    expectedWork.title as {
+      normalized?: unknown;
+      fingerprint?: unknown;
+      selector?: unknown;
+      attribute?: unknown;
+      pattern?: unknown;
+    } | null,
+  );
   const validatesEvidence = (
     entry: typeof doiEvidence | typeof titleEvidence,
     requested: string,
@@ -2135,7 +2177,8 @@ export async function executePlannedPageEffect(
       entry.selector.length === 0 ||
       typeof entry.attribute !== "string" ||
       entry.attribute.length === 0 ||
-      (entry.pattern !== null && typeof entry.pattern !== "string")
+      (orNull(entry.pattern) !== null &&
+        typeof orNull(entry.pattern) !== "string")
     )
       return false;
     const source = findExactlyOne(entry.selector);
@@ -2144,10 +2187,11 @@ export async function executePlannedPageEffect(
     const raw = source.getAttribute(entry.attribute)?.trim() ?? "";
     if (raw === "") return false;
     let extracted = raw;
-    if (entry.pattern !== null) {
+    const entryPattern = orNull(entry.pattern);
+    if (entryPattern !== null) {
       let match: RegExpMatchArray | null;
       try {
-        match = raw.match(new RegExp(entry.pattern));
+        match = raw.match(new RegExp(String(entryPattern)));
       } catch {
         return false;
       }
@@ -2168,17 +2212,41 @@ export async function executePlannedPageEffect(
   };
   const evidenceVerdict =
     plan.verdict.kind === "article" || plan.verdict.kind === "terms";
-  if (evidenceVerdict && requestedDOI !== null) {
-    if (!validatesEvidence(doiEvidence, requestedDOI, "doi"))
-      return { ok: false };
-  } else if (evidenceVerdict && doiEvidence !== null) {
-    return { ok: false };
-  }
-  if (evidenceVerdict && requestedTitle !== null) {
-    if (!validatesEvidence(titleEvidence, requestedTitle, "title"))
-      return { ok: false };
-  } else if (evidenceVerdict && titleEvidence !== null) {
-    return { ok: false };
+  if (evidenceVerdict) {
+    // An adapter declares ONE `workEvidence` contract, so `workEvidenceFor`
+    // (plan.ts) emits exactly one of these and null for the other — and it has
+    // already refused the plan outright unless that one kind binds an identity
+    // the job actually requested, and matches it.
+    //
+    // This used to demand BOTH: any requested identity had to re-validate here,
+    // and `validatesEvidence(null, …)` is false by its first guard. So a
+    // DOI-binding adapter driving a job that carried a title as well — which is
+    // the normal case, since the resolver fills titles in — refused its own
+    // download forever, reporting nothing. Measured live 2026-08-22 on
+    // job_012f55be2bbfe0abd0ce456e36: fifteen `entitled_landing` observations,
+    // an operator-solved CAPTCHA, and not one download attempt. The guard read
+    // as "prove the work" and meant "never act", the same unsatisfiable shape
+    // the surface-close dispositions had.
+    //
+    // What must still hold: the identity the adapter DID bind re-validates on
+    // the page under the effect, evidence is never accepted for something the
+    // job did not ask for, and an article/terms verdict never acts with no
+    // identity bound at all when one was requested.
+    if (doiEvidence !== null && titleEvidence !== null)
+      return no("the plan carries two work-evidence bindings");
+    if (doiEvidence !== null) {
+      if (requestedDOI === null)
+        return no("doi evidence is bound but no doi was requested");
+      if (!validatesEvidence(doiEvidence, requestedDOI, "doi"))
+        return no("the page's doi evidence does not re-validate");
+    } else if (titleEvidence !== null) {
+      if (requestedTitle === null)
+        return no("title evidence is bound but no title was requested");
+      if (!validatesEvidence(titleEvidence, requestedTitle, "title"))
+        return no("the page's title evidence does not re-validate");
+    } else if (requestedDOI !== null || requestedTitle !== null) {
+      return no("an identity was requested but the plan bound none");
+    }
   }
   if (rule.method === "click") {
     const termsTarget =
@@ -2370,13 +2438,18 @@ export async function executePlannedPageEffect(
     }
   }
   if (rule.method === "url") {
-    return plan.url !== null && plan.required_consequence === "download"
-      ? { ok: true, url: plan.url }
-      : { ok: false };
+    const downloadURL = orNull(plan.url);
+    if (downloadURL === null)
+      return no("the plan derived no download url");
+    if (plan.required_consequence !== "download")
+      return no(
+        `the plan's required consequence is ${String(plan.required_consequence)}, not download`,
+      );
+    return { ok: true, url: downloadURL };
   }
   const raw =
     target.getAttribute(rule.method === "meta" ? "content" : "href") ?? "";
-  if (plan.url === null || plan.required_consequence !== "download")
+  if (orNull(plan.url) === null || plan.required_consequence !== "download")
     return { ok: false };
   try {
     const resolved = new URL(raw.trim(), location.href);
@@ -18745,14 +18818,16 @@ export class Bridge {
               args: [freshPlan, dl],
             });
             const effect = result[0]?.result as
-              { ok?: boolean; url?: string } | undefined;
+              { ok?: boolean; url?: string; why?: string } | undefined;
             if (effect?.ok !== true) {
               if (claimedDownload) {
                 await this.update((s) =>
                   patchJob(s, jobID, { download_initiated: false }),
                 );
               }
-              declineDownload("the page-side effect did not report success");
+              declineDownload(
+                `the page-side effect refused: ${effect?.why ?? "no reason reported"}`,
+              );
               return;
             }
             if (dl.method === "click") {
