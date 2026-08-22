@@ -135,6 +135,16 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 		}
 		return safeErrorInfo(ErrorClassZoteroHTTP4xx, "Zotero HTTP "+strconv.Itoa(status), status)
 	}
+	// zotio refuses a stored upload with a structured precondition rather than
+	// an HTTP status when the library keeps its files on WebDAV: the Web API
+	// would bill the bytes to Zotero's own plan, and Zotero's connector cannot
+	// attach to an item that already exists, so the upload has no local route.
+	// That refusal carries no HTTP status, so the 413 branch above never sees
+	// it and it used to fall through to `unknown` with a hint cut mid-word,
+	// leaving the operator no explanation and doctor no check for six papers.
+	if strings.Contains(lower, "precondition_unmet") && strings.Contains(lower, "zotero_file_storage") {
+		return safeErrorInfo(ErrorClassZoteroFileStorageRefused, "Zotero refused a stored upload: library files live on your own file store", 0)
+	}
 	if strings.Contains(lower, "unknown item field") {
 		return safeErrorInfo(ErrorClassZoteroFieldValidation, "unknown item field", 0)
 	}
@@ -377,8 +387,16 @@ func SanitizeErrorHint(value string) string {
 	if strings.ContainsAny(value, "/\\") {
 		return ""
 	}
-	for len(value) > maxErrorHintBytes {
-		value = value[:len(value)-1]
+	// Cut on a word boundary and say so. A byte-exact cut produced hints like
+	// "attachments add requir", which reads as corruption rather than elision
+	// and cost a session's diagnosis time on a refusal zotio had explained in
+	// full. The bound itself is the privacy contract and does not move.
+	if len(value) > maxErrorHintBytes {
+		value = value[:maxErrorHintBytes-3]
+		if cut := strings.LastIndexByte(value, ' '); cut > maxErrorHintBytes/2 {
+			value = value[:cut]
+		}
+		value = strings.TrimRight(value, " ,;:.") + "..."
 	}
 	for !utf8.ValidString(value) {
 		value = value[:len(value)-1]

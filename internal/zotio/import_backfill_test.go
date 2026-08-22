@@ -524,3 +524,108 @@ func TestImportBackfillOffersRepairBeforeClassifying(t *testing.T) {
 		t.Fatalf("dry-run repaired = %v, want none: a preview must not write", preview.repaired)
 	}
 }
+
+// queueCLI reports zotio's missing-PDF queue. It deliberately does not
+// implement MissingPDFKeys, so this exercises the whole-queue fallback.
+type queueCLI struct {
+	planCLI
+	missing []MissingPDFItem
+}
+
+func (c *queueCLI) MissingPDF(context.Context, string, int) ([]MissingPDFItem, error) {
+	return c.missing, nil
+}
+
+func seedItemKey(t *testing.T, ctx context.Context, db *store.Store, jobID, itemKey string) {
+	t.Helper()
+	if _, err := db.DB().ExecContext(ctx,
+		`UPDATE work_requests SET zotio_item_key = ? WHERE id = ?`, itemKey, "wr_"+jobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A job whose Zotero item already holds a PDF is finished, and must be reported
+// as already owned rather than sent down the existing-item attach route. On a
+// library whose files live on the operator's own file store that attach can
+// never succeed, so papio retried it on every pass forever.
+func TestImportBackfillOwnsKeyedItemHoldingPDF(t *testing.T) {
+	ctx := context.Background()
+	dataDir := storetest.DataDir(t)
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	created := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
+	seedImportBackfillJob(t, ctx, db, "job_keyed_holds_pdf", created, true, "pass", "")
+	seedItemKey(t, ctx, db, "job_keyed_holds_pdf", "ITEMHOLD1")
+
+	// The queue names another item, so this one holds its PDF.
+	held := importBackfillService(t, dataDir, db, &queueCLI{missing: []MissingPDFItem{{Key: "OTHERKEY"}}})
+	result, err := held.ImportBackfill(ctx, ImportBackfillRequest{Limit: 10}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.WouldImport != 0 {
+		t.Fatalf("would_import = %d, want 0: the item already holds the PDF", result.Summary.WouldImport)
+	}
+	if result.Summary.AlreadyOwned == nil || *result.Summary.AlreadyOwned != 1 {
+		t.Fatalf("already_owned = %v, want 1", result.Summary.AlreadyOwned)
+	}
+	if len(result.AlreadyOwned) != 1 || result.AlreadyOwned[0].ParentKey != "ITEMHOLD1" {
+		t.Fatalf("already owned items = %#v, want the known item key", result.AlreadyOwned)
+	}
+
+	// The same job stays importable while zotio still reports the item as
+	// missing its PDF: the attach is the whole point of that route.
+	missing := importBackfillService(t, dataDir, db, &queueCLI{missing: []MissingPDFItem{{Key: "ITEMHOLD1"}}})
+	result, err = missing.ImportBackfill(ctx, ImportBackfillRequest{Limit: 10}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.AlreadyOwned == nil || *result.Summary.AlreadyOwned != 0 {
+		t.Fatalf("already_owned = %v, want 0 while the item still lacks a PDF", result.Summary.AlreadyOwned)
+	}
+	if len(result.AlreadyOwned) != 0 {
+		t.Fatalf("already owned items = %#v, want none: the attach is still owed", result.AlreadyOwned)
+	}
+}
+
+// PlanAndApply must not attempt an attach for a job whose Zotero item already
+// holds the PDF: on a library whose files live on the operator's own file store
+// that upload is refused every time, and ready is terminal, so the job retries
+// forever. The job is recorded as a duplicate and advances to imported.
+func TestPlanAndApplySkipsKeyedItemHoldingPDF(t *testing.T) {
+	ctx := context.Background()
+	dataDir := storetest.DataDir(t)
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	created := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
+	seedImportBackfillJob(t, ctx, db, "job_keyed_skip", created, true, "pass", "")
+	seedItemKey(t, ctx, db, "job_keyed_skip", "ITEMSKIP1")
+
+	cli := &queueCLI{missing: []MissingPDFItem{{Key: "OTHERKEY"}}}
+	service := importBackfillService(t, dataDir, db, cli)
+	status, parentKey, attachmentKey, err := service.PlanAndApply(ctx, "job_keyed_skip")
+	if err != nil {
+		t.Fatalf("PlanAndApply = %v, want the owned item to short-circuit", err)
+	}
+	if status != "duplicate" || parentKey != "ITEMSKIP1" || attachmentKey != "" {
+		t.Fatalf("status=%q parent=%q attachment=%q, want duplicate on the known item", status, parentKey, attachmentKey)
+	}
+	if cli.previewCalls != 0 || cli.applyCalls != 0 {
+		t.Fatalf("preview=%d apply=%d, want no Zotero mutation attempted", cli.previewCalls, cli.applyCalls)
+	}
+	row, err := (&job.Store{S: db}).Get(ctx, "job_keyed_skip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateImported {
+		t.Fatalf("state = %q, want %q", row.State, job.StateImported)
+	}
+}

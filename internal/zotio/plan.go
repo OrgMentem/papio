@@ -531,8 +531,25 @@ func (s *Service) skipOwnedReadyImport(ctx context.Context, jobID string) (statu
 	if err != nil {
 		return "", "", false, err
 	}
-	if strings.TrimSpace(row.ZotioItemKey) != "" {
-		return "", "", false, nil
+	// A job that already names a Zotero item was excluded here, on the reading
+	// that the existing-item route would settle it. That route is exactly what
+	// cannot settle it: "zotio attachments add" is Web-API-only, so on a
+	// library whose files live on the operator's own file store Zotero refuses
+	// every stored upload, and an item that ALREADY holds the paper's PDF has
+	// nothing to upload in the first place. Measured on the operator's library:
+	// papers whose item carried papio's own artifact — the attachment filename
+	// byte-equal to the job's artifact SHA-256 — were re-attached and refused
+	// on every pass, indefinitely, because ready is terminal.
+	if key := strings.TrimSpace(row.ZotioItemKey); key != "" {
+		holding, known := s.itemsHoldingPDF(ctx, []string{key})
+		if !known || !holding[key] {
+			return "", "", false, nil
+		}
+		result := &ApplyResult{JobID: jobID, Status: "duplicate", ParentKey: key}
+		if err := s.markImported(ctx, result); err != nil {
+			return "", key, false, err
+		}
+		return "duplicate", key, true, nil
 	}
 	lookupWork := LookupWorkFrom(row.Work)
 	if lookupWork.DOI == "" && lookupWork.ArXiv == "" && lookupWork.PMID == "" && lookupWork.ISBN == "" {

@@ -447,6 +447,16 @@ func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates
 		return nil, false
 	}
 	ownedParents := make(map[string]string, len(candidates))
+	// Jobs that already carry a Zotero item key used to be dropped here, on the
+	// reasoning that they take the existing-item route and so need no ownership
+	// answer. The opposite is true: when that item ALREADY holds the paper's
+	// PDF the job is finished, and skipping the check is what made papio retry
+	// an upload forever. Measured on the operator's library: three papers whose
+	// item carried papio's own artifact — filename byte-equal to the job's
+	// artifact SHA-256 — were re-attached on every pass, and Zotero refused
+	// every time because a library whose files live on the operator's own file
+	// store has no route for adding a stored file to an item that exists.
+	keyedJobs := make(map[string]string, len(candidates))
 	const batchSize = 50
 	batchJobs := make([]string, 0, batchSize)
 	batchWorks := make([]LookupWork, 0, batchSize)
@@ -475,7 +485,8 @@ func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates
 		if err != nil {
 			return nil, false
 		}
-		if strings.TrimSpace(row.ZotioItemKey) != "" {
+		if key := strings.TrimSpace(row.ZotioItemKey); key != "" {
+			keyedJobs[candidate.JobID] = key
 			continue
 		}
 		if !hasNewItemRoutingIdentifier(row.Work) {
@@ -492,7 +503,34 @@ func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates
 	if !flush() {
 		return nil, false
 	}
+	if !s.markKeyedItemsHoldingPDF(ctx, keyedJobs, ownedParents) {
+		return nil, false
+	}
 	return ownedParents, true
+}
+
+// markKeyedItemsHoldingPDF answers ownership for jobs whose Zotero item is
+// already known. It shares one definition of "holds a PDF" with the
+// auto-import skip so the dry-run's prediction and apply's behaviour cannot
+// diverge — they were two separate exclusions of the same jobs before.
+func (s *Service) markKeyedItemsHoldingPDF(ctx context.Context, keyedJobs, ownedParents map[string]string) bool {
+	if len(keyedJobs) == 0 {
+		return true
+	}
+	keys := make([]string, 0, len(keyedJobs))
+	for _, key := range keyedJobs {
+		keys = append(keys, key)
+	}
+	holding, known := s.itemsHoldingPDF(ctx, keys)
+	if !known {
+		return false
+	}
+	for jobID, key := range keyedJobs {
+		if holding[key] {
+			ownedParents[jobID] = key
+		}
+	}
+	return true
 }
 
 func importBackfillStatusAlreadyInLibrary(status string) bool {

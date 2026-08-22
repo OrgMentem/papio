@@ -143,3 +143,33 @@ func TestWithErrorInfoPreservesSafeClassification(t *testing.T) {
 		t.Fatalf("ErrorInfoFrom() = %+v", info)
 	}
 }
+
+// zotio refuses a stored upload with a structured precondition and no HTTP
+// status when the library keeps its files on the operator's own file store.
+// That refusal used to fall through to `unknown`, which no doctor check reads.
+func TestClassifyZotioFileStoragePreconditionRefusal(t *testing.T) {
+	err := errors.New(`zotio attachments: {"kind":"precondition_unmet","capability":"attachments add","precondition":"zotero_file_storage","detail":"Zotero desktop keeps personal-library attachment files on WebDAV"}`)
+	info := ClassifyError(err)
+	if info.Class != ErrorClassZoteroFileStorageRefused {
+		t.Fatalf("class = %q, want %q", info.Class, ErrorClassZoteroFileStorageRefused)
+	}
+	if info.Hint == "" || strings.Contains(info.Hint, "webdav") {
+		t.Fatalf("hint = %q, want a non-empty hint that names no host", info.Hint)
+	}
+}
+
+// A byte-exact cut produced hints like "attachments add requir", which reads as
+// corruption rather than elision.
+func TestSanitizeErrorHintCutsOnWordBoundary(t *testing.T) {
+	hint := SanitizeErrorHint(strings.Repeat("attachments add requires a live library ", 6))
+	if len(hint) > maxErrorHintBytes {
+		t.Fatalf("hint is %d bytes, want at most %d", len(hint), maxErrorHintBytes)
+	}
+	if !strings.HasSuffix(hint, "...") {
+		t.Fatalf("hint = %q, want a trailing ellipsis marking the elision", hint)
+	}
+	trimmed := strings.TrimSuffix(hint, "...")
+	if strings.HasSuffix(trimmed, " ") || strings.HasSuffix(trimmed, "requir") {
+		t.Fatalf("hint = %q, want a cut on a word boundary", hint)
+	}
+}

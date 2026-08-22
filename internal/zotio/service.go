@@ -234,6 +234,49 @@ func (s *Service) LookupWorks(ctx context.Context, request LookupWorksRequest) (
 	return result, nil
 }
 
+// itemsHoldingPDF reports which of the given Zotero items already hold a PDF,
+// using the signal LookupWorks trusts: an item absent from zotio's missing-PDF
+// queue holds one. The second result is false when zotio could not answer, so
+// callers can distinguish "does not hold a PDF" from "not known".
+func (s *Service) itemsHoldingPDF(ctx context.Context, keys []string) (map[string]bool, bool) {
+	if s == nil || s.CLI == nil || len(keys) == 0 {
+		return nil, false
+	}
+	wanted := make(map[string]bool, len(keys))
+	unique := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key == "" || wanted[key] {
+			continue
+		}
+		wanted[key] = true
+		unique = append(unique, key)
+	}
+	if len(unique) == 0 {
+		return nil, false
+	}
+	sort.Strings(unique)
+	var missing []MissingPDFItem
+	var err error
+	if keyed, ok := s.CLI.(interface {
+		MissingPDFKeys(context.Context, []string) ([]MissingPDFItem, error)
+	}); ok {
+		missing, err = keyed.MissingPDFKeys(ctx, unique)
+	} else {
+		missing, err = s.CLI.MissingPDF(ctx, "", 500)
+	}
+	if err != nil {
+		return nil, false
+	}
+	holding := make(map[string]bool, len(unique))
+	for _, key := range unique {
+		holding[key] = true
+	}
+	for _, item := range missing {
+		delete(holding, item.Key)
+	}
+	return holding, true
+}
+
 type lookupIdentifier struct {
 	kind  string
 	value string
