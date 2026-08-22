@@ -269,10 +269,19 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 			if summary.quota > 0 {
 				detail = fmt.Sprintf("%d recent Zotero apply %s could not upload the file",
 					summary.count, plural(summary.count, "failure", "failures"))
+				reading := "Zotero storage plan is full"
 				if summary.hint != "" {
-					detail += ": " + summary.hint
-				} else {
-					detail += ": Zotero storage plan is full"
+					reading = summary.hint
+				}
+				// Date the figures. Zotero's quota reading is a measurement, and
+				// stating an old one in the present tense makes a cleared plan
+				// look like a live blocker.
+				if !summary.quotaAt.IsZero() {
+					reading += fmt.Sprintf(" (as measured %s)", summary.quotaAt.UTC().Format("2006-01-02"))
+				}
+				detail += ": " + reading
+				if summary.quota < summary.count {
+					detail += fmt.Sprintf("; %d of them were refused for another reason", summary.count-summary.quota)
 				}
 			} else {
 				detail = fmt.Sprintf("%d recent Zotero apply %s returned HTTP 413 (file storage refused the upload)",
@@ -280,6 +289,9 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 			}
 			if !summary.first.IsZero() {
 				detail += fmt.Sprintf("; first seen %s", summary.first.UTC().Format("2006-01-02"))
+			}
+			if !summary.latest.IsZero() && !summary.latest.Equal(summary.first) {
+				detail += fmt.Sprintf(", last %s", summary.latest.UTC().Format("2006-01-02"))
 			}
 			add("zotero_file_storage_refused", Warn, detail, zoteroFileStorageRefusedRemediation(summary.quota > 0))
 		}
@@ -557,6 +569,14 @@ type zoteroFileStorageRefusedSummary struct {
 	quota int
 	hint  string
 	first time.Time
+	// latest and quotaAt date the claim. Only `first` was recorded, so a quota
+	// figure Zotero reported days ago was stated in the present tense: this
+	// check reported "Zotero storage plan is full (300.4 of 300 MB)" for five
+	// days after the operator had cleared the plan to 20 MB, and that sentence
+	// sent a diagnosis of live refusals down the wrong path entirely. The
+	// refusals were real; their stated cause was stale.
+	latest  time.Time
+	quotaAt time.Time
 }
 
 // recentZoteroFileStorageRefusedApplies scans failed zotio_apply rows in the exports
@@ -589,12 +609,10 @@ func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store)
 			continue
 		}
 		info := zotio.ClassifyError(errors.New(recorded.Error), recorded.Zotio)
+		isQuota := info.Class == zotio.ErrorClassZoteroStorageQuota
 		switch info.Class {
 		case zotio.ErrorClassZoteroStorageQuota:
 			summary.quota++
-			if summary.hint == "" {
-				summary.hint = info.Hint
-			}
 		case zotio.ErrorClassZoteroFileStorageRefused:
 		default:
 			continue
@@ -606,6 +624,15 @@ func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store)
 		}
 		if summary.first.IsZero() || parsed.Before(summary.first) {
 			summary.first = parsed
+		}
+		if parsed.After(summary.latest) {
+			summary.latest = parsed
+		}
+		// Keep the NEWEST quota reading and its date, not the oldest: the
+		// figures are a measurement with a timestamp, not a standing fact.
+		if isQuota && parsed.After(summary.quotaAt) {
+			summary.quotaAt = parsed
+			summary.hint = info.Hint
 		}
 	}
 	if err := rows.Err(); err != nil {

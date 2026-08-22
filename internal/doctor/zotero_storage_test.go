@@ -176,3 +176,39 @@ func TestRunPassesWhenNoFileStorageRefusedFailures(t *testing.T) {
 		t.Fatalf("status = %q, want pass for non-413 failures: %+v", got.Status, got)
 	}
 }
+
+// A quota reading is a measurement with a timestamp. Stating an old one in the
+// present tense made a plan the operator had already cleared look like a live
+// blocker, and sent a diagnosis of genuinely live refusals down the wrong path.
+func TestZoteroFileStorageRefusedDatesTheQuotaReading(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	stale := time.Now().UTC().Add(-5 * 24 * time.Hour)
+	seedFailedZotioApply(t, ctx, db, "job_quota_old", stale.Format(time.RFC3339Nano), map[string]any{
+		"ok": false, "error": map[string]any{"http_status": 413, "message": "File would exceed quota (300.4 > 300)"},
+	})
+	// A newer refusal that is NOT a quota failure: the operator is still being
+	// refused, for a different reason.
+	seedFailedZotioApply(t, ctx, db, "job_other_new", time.Now().UTC().Add(-1*time.Hour).Format(time.RFC3339Nano), map[string]any{
+		"ok": false, "error": map[string]any{"http_status": 413},
+	})
+
+	got := zoteroFileStorageRefusedCheck(t, ctx, db)
+	if got.Status != Warn {
+		t.Fatalf("status = %q, want warn: %+v", got.Status, got)
+	}
+	if !strings.Contains(got.Detail, "as measured "+stale.Format("2006-01-02")) {
+		t.Fatalf("detail = %q, want the quota figures dated", got.Detail)
+	}
+	if !strings.Contains(got.Detail, "1 of them were refused for another reason") {
+		t.Fatalf("detail = %q, want the non-quota refusals distinguished", got.Detail)
+	}
+	if !strings.Contains(got.Detail, "last "+time.Now().UTC().Format("2006-01-02")) {
+		t.Fatalf("detail = %q, want the newest refusal dated", got.Detail)
+	}
+}
