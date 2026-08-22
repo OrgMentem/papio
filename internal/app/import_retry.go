@@ -21,6 +21,24 @@ const maxImportAttempts = 5
 // the bounded retry window admits.
 const readyImportScanLimit = 200
 
+// maxImportsPerPass bounds how many imports one maintenance pass performs.
+//
+// Two reasons, and the second is the one that bites. Each import drives Zotero's
+// desktop connector, which leaks a progress window per invocation (see
+// bootstrap.autoImportMinInterval), so an unbounded pass can wedge the
+// operator's library application. And every maintenance runner shares ONE
+// goroutine on a one-minute ticker (daemon.MaintenanceRunners.RunDue), so a long
+// import pass starves its siblings — action reminders, handoff repair, offered
+// recovery. That starvation predates the pacing: at readyImportScanLimit and the
+// ~3.5s an apply measured on the operator's machine, a saturated pass already ran
+// ~12 minutes inside a 60-second cadence. This bound is what makes the pass fit
+// its cadence instead of merely being shorter than it was.
+//
+// Draining is not the goal of any single pass; the queue is durable and the next
+// tick continues it. Three keeps a saturated pass near half its cadence even with
+// the pacing floor applied between applies.
+const maxImportsPerPass = 3
+
 // ImportRetrier re-drives auto-import for ready jobs whose Zotero import has not
 // succeeded. It exists because ready is a terminal state: the scheduler never
 // revisits a ready job, so a transient Zotio outage during the inline import
@@ -51,6 +69,7 @@ func (s *Service) retryPendingImports(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	applied := 0
 	for _, row := range rows {
 		if ctx.Err() != nil {
 			return nil
@@ -66,6 +85,10 @@ func (s *Service) retryPendingImports(ctx context.Context) error {
 			continue
 		}
 		s.autoImportReady(ctx, &row)
+		applied++
+		if applied >= maxImportsPerPass {
+			return nil
+		}
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -296,4 +297,41 @@ func TestImportRetrierRunDueRespectsAutoImportPolicy(t *testing.T) {
 	if len(eventsAfter) != len(eventsBefore) {
 		t.Fatalf("non-auto-import events: before %d after %d, want untouched", len(eventsBefore), len(eventsAfter))
 	}
+}
+
+// One maintenance pass must not drain the whole queue: every runner shares one
+// goroutine on a one-minute ticker, and each import drives Zotero's desktop
+// connector. An unbounded pass starved its siblings and wedged the operator's
+// library application; the next tick continues from where this one stopped.
+func TestImportRetrierRunDueStopsAtPerPassCap(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+
+	// Seed strictly more due jobs than one pass may import.
+	due := make([]string, 0, maxImportsPerPass+2)
+	for i := range maxImportsPerPass + 2 {
+		svc.AutoImporter = &fakeAutoImporter{err: zotio.WithErrorInfo(errors.New("transient"))}
+		due = append(due, seedReadyJobWithImportResult(t, svc, jobs, fmt.Sprintf("wr_import_cap_%03d", i)))
+	}
+
+	capt := &selectiveImporter{status: "applied"}
+	svc.AutoImporter = capt
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatalf("RunDue = %v, want nil", err)
+	}
+	if n := capt.callCount(); n != maxImportsPerPass {
+		t.Fatalf("PlanAndApply calls = %d, want %d (per-pass cap)", n, maxImportsPerPass)
+	}
+
+	// The work is not dropped: a second pass picks up jobs the first left.
+	before := capt.callCount()
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatalf("second RunDue = %v, want nil", err)
+	}
+	if capt.callCount() <= before {
+		t.Fatalf("second pass imported nothing; calls still %d, so the remainder was stranded", before)
+	}
+	_ = due
 }

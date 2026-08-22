@@ -90,21 +90,64 @@ type System struct {
 
 const autoImportRetryBackoff = 2 * time.Second
 
+// autoImportMinInterval spaces successive imports so papio does not drive a
+// human-facing desktop application at machine speed.
+//
+// Measured 2026-08-22 on the operator's machine: an import-backfill run of ~78
+// consecutive applies through `zotio import apply --via connector` left Zotero
+// holding 44+ stacked windows titled "Progress" — one leaked per invocation —
+// and blocked its main thread. It sat at 0.1% CPU and could answer neither an
+// accessibility query nor a screen capture, which is what distinguishes a
+// blocked app from a busy one. Roughly half the windows had been reclaimed by
+// the end of the run, so Zotero does shed them; papio was simply issuing work
+// faster than it could.
+//
+// This value is deliberately conservative and is NOT a measured optimum. The
+// applies in that run already took ~3.5s each and that spacing was still too
+// fast, so the floor has to sit well above it; the dismissal rate itself was
+// never measured. The window lifecycle belongs to zotio/Zotero and is reported
+// upstream — until it is bounded there, papio's own guard is to stay slower
+// than the app can shed surfaces. Lower this only with a measurement of that
+// rate, not by timing a run that happens not to wedge.
+const autoImportMinInterval = 10 * time.Second
+
 // serialAutoImporter prevents concurrent mutations through a single zotio
-// mirror. The exports ledger makes the one retry safe to replay.
+// mirror, and paces successive imports. The exports ledger makes the one retry
+// safe to replay.
 type serialAutoImporter struct {
-	importer app.AutoImporter
-	mu       sync.Mutex
-	backoff  time.Duration
+	importer    app.AutoImporter
+	mu          sync.Mutex
+	backoff     time.Duration
+	minInterval time.Duration
+	// lastApplyAt guards the interval; it is read and written only under mu.
+	lastApplyAt time.Time
 }
 
-func newSerialAutoImporter(importer app.AutoImporter) *serialAutoImporter {
-	return &serialAutoImporter{importer: importer, backoff: autoImportRetryBackoff}
+func newSerialAutoImporter(importer app.AutoImporter, minInterval time.Duration) *serialAutoImporter {
+	return &serialAutoImporter{importer: importer, backoff: autoImportRetryBackoff, minInterval: minInterval}
+}
+
+// applyPaced runs one import, waiting out any remaining interval first. The
+// caller holds mu, so the wait also holds the serialization slot: a queued
+// sibling must not slip in and issue the very work this pause exists to space.
+func (s *serialAutoImporter) applyPaced(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, err error) {
+	if !s.lastApplyAt.IsZero() && s.minInterval > 0 {
+		if remaining := s.minInterval - time.Since(s.lastApplyAt); remaining > 0 {
+			if err := waitAutoImportRetry(ctx, remaining); err != nil {
+				return "failed", "", "", err
+			}
+		}
+	}
+	// Stamped on return, not on entry: the interval is a gap between one apply
+	// finishing and the next starting, because the leaked surface appears while
+	// the apply runs.
+	defer func() { s.lastApplyAt = time.Now() }()
+	return s.importer.PlanAndApply(ctx, jobID)
 }
 
 func (s *serialAutoImporter) PlanAndApply(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, err error) {
 	s.mu.Lock()
-	status, parentKey, attachmentKey, err = s.importer.PlanAndApply(ctx, jobID)
+	status, parentKey, attachmentKey, err = s.applyPaced(ctx, jobID)
 	s.mu.Unlock()
 	if err == nil {
 		return status, parentKey, attachmentKey, nil
@@ -123,7 +166,7 @@ func (s *serialAutoImporter) PlanAndApply(ctx context.Context, jobID string) (st
 	if err := ctx.Err(); err != nil {
 		return "failed", "", "", zotio.WithErrorInfo(err)
 	}
-	status, parentKey, attachmentKey, err = s.importer.PlanAndApply(ctx, jobID)
+	status, parentKey, attachmentKey, err = s.applyPaced(ctx, jobID)
 	if err != nil && ctx.Err() != nil {
 		return "failed", "", "", zotio.WithErrorInfo(ctx.Err())
 	}
@@ -366,7 +409,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		// generic hand-off seam.
 		zotioService.CLI = zotio.New(cfg.Zotio)
 		browserZotio = zotioService
-		service.AutoImporter = newSerialAutoImporter(zotioService)
+		service.AutoImporter = newSerialAutoImporter(zotioService, autoImportMinInterval)
 	} else {
 		// Generic holdings sources answer ownership only when zotio is absent.
 		// Mixing them is deliberately out of scope (ADR-0008): "make this Zotero

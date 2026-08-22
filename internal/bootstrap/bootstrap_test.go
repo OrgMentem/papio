@@ -293,7 +293,7 @@ func TestSerialAutoImporterSerializesConcurrentCalls(t *testing.T) {
 		}
 		return "attached", "parent", "attachment", nil
 	})
-	serial := newSerialAutoImporter(importer)
+	serial := newSerialAutoImporter(importer, 0)
 
 	const workers = 20
 	start := make(chan struct{})
@@ -336,7 +336,7 @@ func TestSerialAutoImporterRetriesOnce(t *testing.T) {
 		}
 		return "attached", "parent", "attachment", nil
 	})
-	serial := newSerialAutoImporter(importer)
+	serial := newSerialAutoImporter(importer, 0)
 	serial.backoff = time.Millisecond
 
 	status, parentKey, attachmentKey, err := serial.PlanAndApply(context.Background(), "job")
@@ -367,7 +367,7 @@ func TestSerialAutoImporterReleasesLockDuringRetryBackoff(t *testing.T) {
 			return "", "", "", nil
 		}
 	})
-	serial := newSerialAutoImporter(importer)
+	serial := newSerialAutoImporter(importer, 0)
 	serial.backoff = time.Second
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -401,7 +401,7 @@ func TestSerialAutoImporterClassifiesFinalError(t *testing.T) {
 	importer := autoImporterFunc(func(context.Context, string) (string, string, string, error) {
 		return "failed", "", "", errors.New("zotio stderr: unknown item field at /Users/reader/private.json")
 	})
-	serial := newSerialAutoImporter(importer)
+	serial := newSerialAutoImporter(importer, 0)
 	serial.backoff = time.Millisecond
 
 	_, _, _, err := serial.PlanAndApply(context.Background(), "job")
@@ -420,7 +420,7 @@ func TestSerialAutoImporterStopsRetryWhenContextCancelled(t *testing.T) {
 		startedOnce.Do(func() { close(started) })
 		return "failed", "", "", errors.New("temporary failure")
 	})
-	serial := newSerialAutoImporter(importer)
+	serial := newSerialAutoImporter(importer, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan error, 1)
@@ -441,5 +441,59 @@ func TestSerialAutoImporterStopsRetryWhenContextCancelled(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("calls = %d, want 1", got)
+	}
+}
+
+// papio drives Zotero's desktop connector, which leaks one "Progress" window
+// per invocation; ~78 back-to-back applies left 44+ stacked and blocked its main
+// thread. The spacing is the guard, so it must hold between CONSECUTIVE applies
+// and not merely delay the first.
+func TestSerialAutoImporterPacesConsecutiveApplies(t *testing.T) {
+	const interval = 40 * time.Millisecond
+	var mu sync.Mutex
+	var starts []time.Time
+	importer := autoImporterFunc(func(context.Context, string) (string, string, string, error) {
+		mu.Lock()
+		starts = append(starts, time.Now())
+		mu.Unlock()
+		return "attached", "parent", "attachment", nil
+	})
+	serial := newSerialAutoImporter(importer, interval)
+
+	for range 3 {
+		if _, _, _, err := serial.PlanAndApply(context.Background(), "job"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(starts) != 3 {
+		t.Fatalf("applies = %d, want 3", len(starts))
+	}
+	// The first apply is never delayed: a single import must not pay the price
+	// that exists only to stop a batch from outrunning the app.
+	for i := 1; i < len(starts); i++ {
+		if gap := starts[i].Sub(starts[i-1]); gap < interval {
+			t.Fatalf("gap between apply %d and %d = %v, want >= %v", i-1, i, gap, interval)
+		}
+	}
+}
+
+// A cancelled context must abandon the pause rather than serve out the full
+// interval; an operator interrupting a wedging batch is the reason this exists.
+func TestSerialAutoImporterPacingHonorsCancellation(t *testing.T) {
+	importer := autoImporterFunc(func(context.Context, string) (string, string, string, error) {
+		return "attached", "parent", "attachment", nil
+	})
+	serial := newSerialAutoImporter(importer, time.Hour)
+	if _, _, _, err := serial.PlanAndApply(context.Background(), "job"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if _, _, _, err := serial.PlanAndApply(ctx, "job"); err == nil {
+		t.Fatal("second apply returned nil error, want cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("cancelled pace waited %v", elapsed)
 	}
 }
