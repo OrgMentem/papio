@@ -253,7 +253,7 @@ func TestZoteroFileStorageRefusedNamesTheRoutingRefusal(t *testing.T) {
 	if !strings.Contains(got.Detail, "no route to the file store") {
 		t.Fatalf("detail = %q, want the routing refusal named", got.Detail)
 	}
-	for _, want := range []string{"nothing to retry", "freeing space will not help", "unsupported for now"} {
+	for _, want := range []string{"freeing space will not help", "--via connector", "Upgrade zotio"} {
 		if !strings.Contains(got.Remediation, want) {
 			t.Fatalf("remediation = %q, missing %q", got.Remediation, want)
 		}
@@ -296,7 +296,7 @@ func TestZoteroFileStorageRefusedReportsBothCauses(t *testing.T) {
 	if strings.Contains(got.Detail, "refused for another reason") {
 		t.Fatalf("detail = %q, the routing refusal is a named cause, not an anonymous remainder", got.Detail)
 	}
-	for _, want := range []string{"free space in Zotero", "nothing to retry"} {
+	for _, want := range []string{"free space in Zotero", "--via connector"} {
 		if !strings.Contains(got.Remediation, want) {
 			t.Fatalf("remediation = %q, missing %q - both causes are present so both need advice", got.Remediation, want)
 		}

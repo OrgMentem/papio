@@ -23,6 +23,27 @@ const newItemRoutingRefusal = "new-item Zotio routing requires a DOI, PMID, arXi
 // Handing the file to the desktop lets Zotero honour its own configuration.
 const newItemRoute = "auto"
 
+// existingItemRoute names the route papio asks for when the Zotero item already
+// exists and only its file is missing. "connector" creates a throwaway parent
+// plus the file in one Zotero desktop session, moves the attachment onto the
+// real item, and trashes the throwaway, so the bytes reach whatever file storage
+// the operator configured in Zotero.
+//
+// It applies to "stored" mode only. A linked-file attachment uploads nothing, so
+// there is no route to choose, and zotio ignores "--via" there silently rather
+// than refusing — asking for it anyway would hide a mode mistake instead of
+// surfacing it.
+//
+// The empty answer means "send no --via at all", which is why this returns a
+// route rather than a bool: planIdempotencyKey records it, so a cached plan can
+// never replay an argv the route has since changed.
+func existingItemRoute(attachmentMode string) string {
+	if attachmentMode == "stored" {
+		return "connector"
+	}
+	return ""
+}
+
 // planIdempotencyKey identifies a cached zotio plan. Every input that changes
 // the mutation papio would perform belongs in it, because a cached plan is
 // replayed verbatim: the route is here for the same reason the attachment mode

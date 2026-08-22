@@ -686,10 +686,13 @@ func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store)
 // zoteroFileStorageRefusedRemediation answers the causes actually present. The
 // routing refusal gets its own sentence because the quota advice is wrong for
 // it in both directions: freeing space changes nothing, and papio must not
-// promise a retry that cannot succeed. zotio verified against Zotero's own
-// server source that re-parenting an attachment is permitted and moves no
-// bytes, so this is a missing feature rather than a permanent property —
-// stating it as permanent would record a wrong fact just as durably.
+// promise a retry that cannot succeed.
+//
+// The routing answer names an upgrade rather than a version, because papio
+// cannot detect the flag: an older zotio ignores an unknown "--via" on
+// "attachments add" and returns its ordinary refusal with exit 0. Papio
+// therefore keeps asking for the connector route and fails closed on an old
+// install, and the operator needs to know an upgrade is what unblocks it.
 func zoteroFileStorageRefusedRemediation(quota, routing bool) string {
 	const linkedFile = `set attachment_mode = "linked-file" under [zotio] so papio links PDFs from its own artifact store and needs no Zotero storage at all — linked files do not sync to other devices and break if the file moves`
 	var parts []string
@@ -697,7 +700,7 @@ func zoteroFileStorageRefusedRemediation(quota, routing bool) string {
 		parts = append(parts, `for the papers Zotero refused on storage: free space in Zotero by deleting large attachments you no longer need, or raise the storage plan; or `+linkedFile+`. This is Zotero's own file storage, not a WebDAV target in Zotero's sync settings. Papio retries once uploads are accepted again`)
 	}
 	if routing {
-		parts = append(parts, `for the papers with no route: their Zotero item already exists, and a stored upload through the Web API would bill the bytes to Zotero's own plan rather than your file store, so there is nothing to retry and freeing space will not help. Either `+linkedFile+`, or attach the PDF yourself in Zotero (right-click the item, Add Attachment, Attach Stored Copy of File) and run 'papio zotio import-backfill --include-not-requested --apply' — papio then recognises the held PDF and files the paper with no upload attempted. Attaching to an item that already exists is unsupported for now, not impossible; it needs zotio support that does not exist yet`)
+		parts = append(parts, `for the papers with no route: their Zotero item already exists, and a stored upload through the Web API would bill the bytes to Zotero's own plan rather than your file store, so freeing space will not help. Upgrade zotio to a release whose 'attachments add' accepts '--via connector' — that hands the bytes to Zotero desktop, so they land in your own file store — then run 'papio zotio import-backfill --include-not-requested --apply'. Papio already asks for that route and an older zotio ignores the request, so these papers wait for the upgrade. Otherwise `+linkedFile+`, or attach the PDF yourself in Zotero (right-click the item, Add Attachment, Attach Stored Copy of File) and run the same backfill command — papio then recognises the held PDF and files the paper with no upload attempted`)
 	}
 	if len(parts) == 0 {
 		return `check whether Zotero's own Sync pane reports the same HTTP 413 — if it does, the problem is upstream of papio; or ` + linkedFile + `. Papio retries once uploads are accepted again`

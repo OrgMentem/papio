@@ -156,7 +156,13 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 	artifactPath := filepath.Join(filepath.Dir(bundlePath), filepath.FromSlash(acquisition.Artifact.Path))
 	attachmentMode := s.attachmentMode()
 	collection := strings.TrimSpace(row.Policy.Collection)
-	idempotencyKey := planIdempotencyKey(jobID, acquisition.Artifact.SHA256, attachmentMode, collection, newItemRoute)
+	// The route belongs in the key, and the two branches below ask for different
+	// ones, so it is resolved before the lookup rather than inside them.
+	planRoute := newItemRoute
+	if acquisition.ZotioItemKey != "" {
+		planRoute = existingItemRoute(attachmentMode)
+	}
+	idempotencyKey := planIdempotencyKey(jobID, acquisition.Artifact.SHA256, attachmentMode, collection, planRoute)
 	if existing, err := s.recordedPlan(ctx, idempotencyKey); err != nil {
 		return nil, err
 	} else if existing != nil {
@@ -204,16 +210,23 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		plan.CollectionIsKey = keyRE.MatchString(collection)
 		plan.Route = "existing_item"
 		plan.ExpectedParentKey = acquisition.ZotioItemKey
-		// This path has no desktop route to choose: "zotio attachments add"
-		// works only through the Zotero Web API, so in "stored" mode it always
-		// uploads into Zotero's own file storage and consumes that plan,
-		// whatever file storage the operator configured in Zotero. Only
-		// "linked-file" avoids it here. The route fix below therefore covers
-		// item creation, not this branch — 13 of 161 plans on the machine where
-		// this was measured. Closing the gap needs an upstream desktop route
-		// for attaching to an item that already exists.
-		plan.PreviewArgs = []string{"--agent", "attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
-		plan.ApplyArgs = []string{"--agent", "--yes", "attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
+		// "stored" mode here used to have no route to choose: attaching to an
+		// item that already exists went through the Zotero Web API, which
+		// uploads into Zotero's own file storage and consumes that plan whatever
+		// the operator configured inside Zotero. On a WebDAV library zotio
+		// refused it outright, so 13 of 161 plans on the machine where this was
+		// measured had nowhere to go. The connector route closes that: zotio
+		// creates a throwaway parent plus the file in one desktop session, moves
+		// the attachment onto this item, and trashes the throwaway.
+		//
+		// A preview creates nothing and needs no running connector, so the
+		// two-phase plan shape is unchanged; the apply needs Zotero desktop.
+		attach := []string{"attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
+		if planRoute != "" {
+			attach = append(attach, "--via", planRoute)
+		}
+		plan.PreviewArgs = append([]string{"--agent"}, attach...)
+		plan.ApplyArgs = append([]string{"--agent", "--yes"}, attach...)
 	} else {
 		if !hasNewItemRoutingIdentifier(row.Work) {
 			return nil, errors.New(newItemRoutingRefusal)

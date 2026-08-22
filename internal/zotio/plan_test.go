@@ -1333,3 +1333,66 @@ func TestAmbiguousApplyDoesNotInvalidateCachedPlan(t *testing.T) {
 		t.Fatalf("ambiguous apply triggered re-resolve: resolveCalls=%d", cli.resolveCalls)
 	}
 }
+
+// Papio must ask for the connector route when the Zotero item already exists.
+// The Web API route uploads into Zotero's own file storage and consumes that
+// plan whatever the operator configured inside Zotero, and on a WebDAV library
+// zotio refuses it outright, which left these papers with nowhere to go.
+//
+// "linked-file" uploads nothing, so there is no route to choose, and zotio
+// ignores "--via" there silently rather than refusing. Sending it anyway would
+// hide a mode mistake instead of surfacing it.
+func TestExistingItemPlanAsksForConnectorInStoredModeOnly(t *testing.T) {
+	for _, tc := range []struct {
+		mode    string
+		wantVia bool
+	}{{mode: "stored", wantVia: true}, {mode: "linked-file", wantVia: false}} {
+		t.Run(tc.mode, func(t *testing.T) {
+			cli := &planCLI{preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`}
+			service, jobID := readyPlanService(t, "AB12CD34", cli)
+			service.AttachmentMode = tc.mode
+			plans, err := service.PlanJobs(context.Background(), []string{jobID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plans) != 1 || plans[0].Route != "existing_item" {
+				t.Fatalf("plans = %+v, want one existing_item plan", plans)
+			}
+			for name, args := range map[string][]string{"preview": plans[0].PreviewArgs, "apply": plans[0].ApplyArgs} {
+				via := slices.Index(args, "--via")
+				if tc.wantVia != (via >= 0) {
+					t.Fatalf("%s args = %v, --via present = %v, want %v", name, args, via >= 0, tc.wantVia)
+				}
+				if tc.wantVia && (via+1 >= len(args) || args[via+1] != "connector") {
+					t.Fatalf("%s args = %v, want --via connector", name, args)
+				}
+				if mode := slices.Index(args, "--mode"); mode < 0 || args[mode+1] != tc.mode {
+					t.Fatalf("%s args = %v, want --mode %s", name, args, tc.mode)
+				}
+			}
+			// A preview must create nothing, so it must never carry --yes.
+			if slices.Contains(plans[0].PreviewArgs, "--yes") || !slices.Contains(plans[0].ApplyArgs, "--yes") {
+				t.Fatalf("preview = %v, apply = %v, want --yes on the apply only", plans[0].PreviewArgs, plans[0].ApplyArgs)
+			}
+		})
+	}
+}
+
+// A cached plan is replayed verbatim, so a route change must produce a new key.
+// Before the connector route existed, every plan was keyed with the item-creation
+// route, so reusing that key would replay the refused Web API argv forever.
+func TestPlanIdempotencyKeyDistinguishesTheExistingItemRoute(t *testing.T) {
+	const job, sha = "job_1", "sha256:abc"
+	stored := planIdempotencyKey(job, sha, "stored", "", existingItemRoute("stored"))
+	linked := planIdempotencyKey(job, sha, "linked-file", "", existingItemRoute("linked-file"))
+	preChange := planIdempotencyKey(job, sha, "stored", "", newItemRoute)
+	if stored == preChange {
+		t.Fatalf("key = %q, want the connector route to invalidate the pre-change plan", stored)
+	}
+	if stored == linked {
+		t.Fatalf("stored and linked-file keys both %q, want distinct plans", stored)
+	}
+	if existingItemRoute("linked-file") != "" {
+		t.Fatalf("linked-file route = %q, want no --via", existingItemRoute("linked-file"))
+	}
+}
