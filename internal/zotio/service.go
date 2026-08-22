@@ -2,6 +2,7 @@
 package zotio
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -275,13 +276,8 @@ func (s *Service) findParentItemKeys(ctx context.Context, identifier lookupIdent
 	if err != nil {
 		return nil, fmt.Errorf("looking up Zotio %s %q: %w", identifier.kind, identifier.value, err)
 	}
-	var items []struct {
-		Key  string `json:"key"`
-		Data struct {
-			ParentItem string `json:"parentItem"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &items); err != nil {
+	items, err := decodeFoundItems(raw)
+	if err != nil {
 		return nil, fmt.Errorf("decoding Zotio %s lookup: %w", identifier.kind, err)
 	}
 	seen := make(map[string]bool, len(items))
@@ -297,6 +293,50 @@ func (s *Service) findParentItemKeys(ctx context.Context, identifier lookupIdent
 	}
 	sort.Strings(keys)
 	return keys, nil
+}
+
+// foundItem is one row of "zotio items find". A row with a parentItem is an
+// attachment or note; only a parentless row is a citable parent.
+type foundItem struct {
+	Key  string `json:"key"`
+	Data struct {
+		ParentItem string `json:"parentItem"`
+	} `json:"data"`
+}
+
+// decodeFoundItems reads "zotio items find" output, which is not framed the
+// same way as every other list zotio prints. Measured against zotio 0.19.0 on
+// the same binary and in the same invocation style: "items missing-pdf" answers
+// a bare JSON array, while "items find" answers {"meta":…,"results":[…]}.
+// papio decoded only the bare array, so EVERY ownership lookup failed with
+// "cannot unmarshal object into Go value of type []struct" and papio concluded
+// it owned nothing.
+//
+// The failure was invisible because no caller logs it and
+// resolveImportBackfillOwnership converts any lookup error into "ownership
+// undetermined" for the whole batch, which classifyImportBackfillJob then
+// reports as would-import. The visible symptom was an import-backfill dry-run
+// promising 43 new imports where the apply filed 0 and found 40 papers already
+// in the library. Accept both shapes rather than pin one: the envelope is
+// zotio's documented convention (see itemEnvelope) and the bare array is what
+// this command actually emitted when the original code was written, so a
+// version that changes back must not silently blind ownership again.
+func decodeFoundItems(raw json.RawMessage) ([]foundItem, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var items []foundItem
+		if err := json.Unmarshal(trimmed, &items); err != nil {
+			return nil, err
+		}
+		return items, nil
+	}
+	var envelope struct {
+		Results []foundItem `json:"results"`
+	}
+	if err := json.Unmarshal(trimmed, &envelope); err != nil {
+		return nil, err
+	}
+	return envelope.Results, nil
 }
 
 // MissingPDFCount reports how many library items (optionally within one

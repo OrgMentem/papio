@@ -276,6 +276,43 @@ func TestLookupWorksClassifiesOwnedPDFMissingPDFAndNewWork(t *testing.T) {
 	}
 }
 
+// "zotio items find" frames its rows in a {meta,results} envelope, unlike
+// "items missing-pdf", which answers a bare array. Every fixture in this file
+// used the bare array, so the suite proved a shape this command does not emit
+// and papio shipped believing it owned nothing. Captured live from zotio
+// 0.19.0: meta carries reason/resource_type/source/synced_at, each result
+// carries a top-level key and a data object whose parentItem is absent for a
+// parent item.
+func TestLookupWorksReadsItemsFindResultEnvelope(t *testing.T) {
+	cli := &fakeCLI{
+		items: []MissingPDFItem{{Key: "MISS0001"}},
+		find: map[string]json.RawMessage{
+			"doi:10.1518/hfes.46.1.50_30392": json.RawMessage(`{"meta":{"reason":"local_only","resource_type":"items","source":"local","synced_at":"2026-08-22T09:12:05Z"},"results":[{"data":{"DOI":"10.1518/hfes.46.1.50_30392","citationKey":"leeTrustAutomationDesigning2004a"},"key":"PIXMRSZG"}]}`),
+			"doi:10.1000/missing":            json.RawMessage(`{"results":[{"key":"MISS0001","data":{}}]}`),
+			"doi:10.1000/attachment-only":    json.RawMessage(`{"results":[{"key":"ATTACH01","data":{"parentItem":"PARENT01"}}]}`),
+		},
+	}
+	result, err := (&Service{CLI: cli}).LookupWorks(context.Background(), LookupWorksRequest{Works: []LookupWork{
+		{DOI: "10.1518/hfes.46.1.50_30392"},
+		{DOI: "10.1000/missing"},
+		{DOI: "10.1000/attachment-only"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []WorkOwnership{
+		{Status: OwnershipOwnedWithPDF, ItemKey: "PIXMRSZG"},
+		{Status: OwnershipOwnedMissingPDF, ItemKey: "MISS0001"},
+		// A row that is only an attachment names no parent this work owns.
+		{Status: OwnershipNotOwned},
+	}
+	for i := range want {
+		if result.Works[i] != want[i] {
+			t.Fatalf("work %d = %+v, want %+v", i, result.Works[i], want[i])
+		}
+	}
+}
+
 // PMID plumbs through the items-find subprocess path exactly like DOI/arXiv:
 // same --agent items find <flag> <value> shape, same ownership classification.
 func TestLookupWorksClassifiesOwnedByPMID(t *testing.T) {
