@@ -22,6 +22,7 @@ import {
   findByJob,
   jobDownloadFilename,
   migrateManagedState,
+  patchJob,
   startPendingDelivery,
   type ActiveJob,
   type MaterializationCorrelation,
@@ -6884,6 +6885,79 @@ test("IdP navigation emits auth_pending once and never leaks the URL/host", asyn
   const authReturned = h.frames().find((f) => f.type === "auth_returned");
   expect(authReturned?.payload["elapsed_ms"]).toBe(4200);
   expect(Object.keys(authReturned?.payload ?? {})).toEqual(["elapsed_ms"]);
+});
+
+// Reported live 2026-08-22 and reproduced here: an open-access SAGE article,
+// papio's own tab sitting on it, the PDF link right there on screen, and papio
+// doing nothing at all for the full three minutes until the drive timeout
+// parked it. Nothing on the wire but `auth_returned` — no download, no
+// provider_outcome, no error.
+//
+// The landing that resolves an institutional route arrives as ONE tab-update
+// event, and `finalizeAuthReturn` consumes it. Its last act is the classify
+// that grabs the PDF (`maybeClassify`) — unless the federated redrive branch
+// fires first, which it does whenever a route was issued and the landing
+// completed. That branch re-navigates the SAME tab to the offer URL and
+// returns, betting the resulting navigation will classify. When the offer URL
+// resolves to the page the tab is already displaying, Chrome fires no
+// tab-update at all, so the bet is lost silently and the drive is left
+// standing on a fully-rendered article until it times out.
+test("a provider landing that completes an institutional route still classifies when the redrive is a no-op navigation", async () => {
+  const h = makeHarness();
+  const jobID = "job_redrive_classify";
+  const landing = `https://${PROVIDER_HOST}/doi/10.1177/15480518221144895`;
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  const planned: (number | undefined)[] = [];
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution) {
+      planned.push(injection.target.tabId);
+      return plannerResult(injection, {
+        kind: "article",
+        adapter_id: "provider",
+        adapter_version: "1.0.0",
+        evidence: ["rule:article matched"],
+      });
+    }
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer(jobID, landing));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThan(0);
+
+  // papio issued a federated route for this job and the operator signed in:
+  // exactly the state the live job was in when it went silent.
+  const internals = h.bridge as unknown as {
+    federatedLoginRouted: Set<string>;
+    federatedLoginOperatorNavigated: Set<string>;
+  };
+  internals.federatedLoginRouted.add(jobID);
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso?x=1");
+  await h.tabs.completeNavigation(tabID, "https://idp.example.edu/sso?x=1");
+
+  // The provider landing. The tab is ALREADY on this URL, so re-navigating it
+  // to the offer URL produces no further tab-update event.
+  h.tabs.seed({ id: tabID, url: landing });
+  await h.tabs.completeNavigation(tabID, landing);
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+
+  // The redrive's own navigation never arrives (the tab is already showing the
+  // page the offer URL resolves to), so only the safety net can classify.
+  const net = h.timers.find((timer) => timer.ms === 2_500);
+  expect(net).toBeDefined();
+  h.clock.now += 2_500;
+  void net!.fn();
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+
+  expect(h.frames().some((f) => f.type === "auth_returned")).toBe(true);
+  // The contract: this landing may not be consumed without the adapter being
+  // run against the tab that is standing on the article. Before the fix
+  // `planned` was empty — papio had sent `auth_returned` and then done nothing
+  // at all until the drive timeout.
+  expect(planned).toContain(tabID);
 });
 
 test("session evidence sends the exact origin observed for that evidence", async () => {

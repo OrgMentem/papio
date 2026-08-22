@@ -35,6 +35,24 @@ for the full pre-split extension history.
   retried when *papio* wakes; that retry silently downgraded its reason to the
   one reason the daemon must refuse, so an interrupted close could never
   complete.
+- **A paper whose sign-in resolves is no longer left standing on the article
+  doing nothing.** When *papio* re-opened its own tab to finish a library
+  round-trip, it assumed the resulting page load would arrive as a fresh event
+  and grab the PDF there. If that navigation resolved back to the page the tab
+  was already showing, no event ever came, and the one event that could have
+  grabbed the paper had already been spent — so *papio* sat on a fully loaded
+  article, PDF link on screen, until the attempt timed out. It now re-checks
+  the tab where it stands.
+- **A sign-in finished by one event is no longer thrown away by the next.**
+  Several browser notifications describe one page load, and whichever one
+  finished the sign-in left the others holding stale information. Those were
+  discarded outright, including the notification that would have fetched the
+  paper.
+- **When *papio* decides not to download a paper it can see, it now says why.**
+  Every reason for declining — not delegated, a download already latched, the
+  page moving under the plan, no usable link — was silent, in the console and
+  on the wire both. That silence is why a paper could sit correctly identified
+  and never fetched with nothing to read anywhere.
 - **Leftover tabs are now cleaned up while *papio* runs, not only just after it
   starts.** The cleanup pass ran twice, both within ninety seconds of startup —
   always before the three-minute timeout whose leftovers it exists to collect.

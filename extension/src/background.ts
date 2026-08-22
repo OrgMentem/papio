@@ -16583,14 +16583,28 @@ export class Bridge {
       }
       currentFederatedClassification = true;
     }
-    if (job.status === "auth_pending") {
-      await this.finalizeAuthReturn(
+    // `job` is a snapshot taken many awaits ago, so "status is auth_pending"
+    // can already be false by the time this runs — a sibling tab-update for
+    // this same navigation (loading/title/complete all reach here) may have
+    // finalized the return first. finalizeAuthReturn re-reads and DECLINES in
+    // that case, and this branch used to `return` regardless: the completion
+    // event that would have classified the article was swallowed by a stale
+    // read of a job another handler had already advanced. Fall through
+    // instead. Every false it returns is a state where classifying the page
+    // this tab is standing on is the right next act — either another handler
+    // owns the return (classify is idempotent and bails on
+    // download_initiated), or a redrive was blocked and its retry is already
+    // scheduled.
+    if (
+      job.status === "auth_pending" &&
+      (await this.finalizeAuthReturn(
         job.job_id,
         tabID,
         url,
         host,
         currentFederatedClassification,
-      );
+      ))
+    ) {
       return;
     }
 
@@ -16610,7 +16624,14 @@ export class Bridge {
       if (this.resolverRedriveRetryTimers.get(jobID) !== marker) return;
       this.resolverRedriveRetryTimers.delete(jobID);
       const job = findByJob(this.store, jobID as string);
-      const openurl = this.offerURLs.get(jobID);
+      // A spent redrive must not fire a second one (`federatedReDriven` is the
+      // "still-walled page doesn't loop" marker). Fall into the classify branch
+      // below instead: by then the tab is standing on whatever the redrive
+      // produced, and classifying it where it stands is the whole point of
+      // this net.
+      const openurl = this.federatedReDriven.has(jobID)
+        ? undefined
+        : this.offerURLs.get(jobID);
       if (job === undefined || job.status !== "awaiting_download") return;
       if (openurl === undefined) {
         try {
@@ -16717,6 +16738,19 @@ export class Bridge {
           await this.deps.tabs.update(tabID, { url: openurl });
           this.federatedLoginOperatorNavigated.delete(jobID);
           this.federatedReDriven.add(jobID);
+          // A redrive is a BET that the navigation it starts will come back as
+          // a tab update and classify there. The bet is lost silently whenever
+          // it does not: a resolver URL that redirects straight back to the
+          // page this tab already shows produces no state change for Chrome to
+          // report, and this branch has already consumed the one landing event
+          // that would otherwise have classified. Measured live 2026-08-22 on
+          // job_012f55be2bbfe0abd0ce456e36: `auth_returned`, then three minutes
+          // of silence on a fully-rendered open-access article with its PDF
+          // link on screen, then the drive timeout — and across 48 recorded
+          // institutional permits, never one download effect. So net it: the
+          // marker above makes this retry classify the tab where it stands
+          // rather than redrive again.
+          this.scheduleResolverRedriveRetry(jobID, tabID);
           return true;
         }
         if (openurl !== undefined) {
@@ -16732,6 +16766,7 @@ export class Bridge {
           }
           this.federatedLoginOperatorNavigated.delete(jobID);
           this.federatedReDriven.add(jobID);
+          this.scheduleResolverRedriveRetry(jobID, opened);
           return true;
         }
       } catch {
@@ -18513,20 +18548,60 @@ export class Bridge {
         // hear it once per grant.
         void this.emitClaimObservation(jobID, job.tab_id, "entitled_landing", true);
         const dl = spec.download;
-        if (!this.hasDelegatedAuthority(job) && dl !== undefined) return;
+        // A decisive `article` verdict on a page whose adapter declares a
+        // download is papio's whole job. Every way of declining it below was
+        // silent, which is how a fully-rendered open-access article sat on
+        // screen for days, correctly identified 15 times over, while papio
+        // reported nothing to the daemon, the popup, or the console. Naming the
+        // reason costs nothing on the wire and is the difference between a
+        // diagnosable decline and an invisible one.
+        const declineDownload = (reason: string): void => {
+          console.error(
+            `papio: adapter download declined for ${jobID} on ${host}: ${reason}`,
+          );
+        };
+        if (!this.hasDelegatedAuthority(job) && dl !== undefined) {
+          declineDownload(
+            `job is not delegated (access_mode=${String(job.access_mode)})`,
+          );
+          return;
+        }
         // Assisted jobs may classify and capture, but no adapter-declared
         // control or derived URL may cause a browser download.
-        if (job.access_mode === "assisted" && dl !== undefined) return;
+        if (job.access_mode === "assisted" && dl !== undefined) {
+          declineDownload("assisted jobs never cause a browser download");
+          return;
+        }
+        if (dl === undefined) return;
+        if (plan.method !== dl.method) {
+          declineDownload(
+            `plan method ${String(plan.method)} does not match the adapter's ${dl.method}`,
+          );
+          return;
+        }
+        if (plan.target_ref === null) {
+          declineDownload("plan resolved no download target");
+          return;
+        }
+        if (job.download_initiated === true) {
+          // The latch is persisted while `this.downloads` is worker memory, so
+          // a download that was claimed and then lost with its worker leaves
+          // this true forever and every later classify skips the grab in
+          // silence. Only an adapter with a terms gate had a path back
+          // (maybeClassify's awaitingTermsGate); everything else was stuck.
+          declineDownload(
+            `a download is already latched (in flight locally: ${String(this.downloads.has(jobID))})`,
+          );
+          return;
+        }
         if (
-          dl &&
-          plan.method === dl.method &&
-          plan.target_ref !== null &&
-          job.download_initiated !== true &&
-          !(
-            dl.method === "click" &&
-            this.deps.downloads.onDeterminingFilename === undefined
-          )
+          dl.method === "click" &&
+          this.deps.downloads.onDeterminingFilename === undefined
         ) {
+          declineDownload("click downloads need onDeterminingFilename");
+          return;
+        }
+        {
           if (
             (dl.method === "url" ||
               dl.method === "api" ||
@@ -18587,35 +18662,61 @@ export class Bridge {
             );
             return;
           }
-          if (
-            freshPlan === undefined ||
-            freshPlan.verdict.kind !== plan.verdict.kind ||
-            freshPlan.decisive_rule !== plan.decisive_rule ||
-            freshPlan.method !== plan.method ||
-            freshPlan.url !== plan.url ||
-            JSON.stringify(freshPlan.target_ref) !==
-              JSON.stringify(plan.target_ref) ||
-            JSON.stringify(freshPlan.expected_work) !==
-              JSON.stringify(plan.expected_work) ||
-            JSON.stringify(freshPlan.effect_graph) !==
-              JSON.stringify(plan.effect_graph) ||
-            freshPlan.route_origin !== plan.route_origin ||
-            freshPlan.access_mode !== plan.access_mode ||
-            JSON.stringify(freshPlan.revalidation) !==
-              JSON.stringify(plan.revalidation)
-          ) {
+          if (freshPlan === undefined) {
+            declineDownload("the page no longer plans");
+            return;
+          }
+          const revalidated = freshPlan;
+          const drift =
+            revalidated.verdict.kind !== plan.verdict.kind
+              ? "verdict"
+              : revalidated.decisive_rule !== plan.decisive_rule
+                ? "decisive rule"
+                : revalidated.method !== plan.method
+                  ? "method"
+                  : revalidated.url !== plan.url
+                    ? "url"
+                    : JSON.stringify(revalidated.target_ref) !==
+                        JSON.stringify(plan.target_ref)
+                      ? "target"
+                      : JSON.stringify(revalidated.expected_work) !==
+                          JSON.stringify(plan.expected_work)
+                        ? "work evidence"
+                        : JSON.stringify(revalidated.effect_graph) !==
+                            JSON.stringify(plan.effect_graph)
+                          ? "effect graph"
+                          : revalidated.route_origin !== plan.route_origin
+                            ? "route origin"
+                            : revalidated.access_mode !== plan.access_mode
+                              ? "access mode"
+                              : JSON.stringify(revalidated.revalidation) !==
+                                  JSON.stringify(plan.revalidation)
+                                ? "revalidation limits"
+                                : undefined;
+          if (drift !== undefined) {
+            // The re-plan runs one injection round trip after the first, so a
+            // page still settling can move a positional fingerprint under it.
+            // Losing authority is correct; losing it silently is not.
+            declineDownload(`plan revalidation drifted: ${drift}`);
             return;
           }
           if (
             (dl.method === "click" || dl.method === "api") &&
             freshPlan.target_ref === null
           ) {
+            declineDownload("revalidated plan lost its target");
             return;
           }
           const currentAuthority = findByJob(this.store, jobID);
-          if (!this.hasDelegatedAuthority(currentAuthority)) return;
+          if (!this.hasDelegatedAuthority(currentAuthority)) {
+            declineDownload("job stopped being delegated during revalidation");
+            return;
+          }
           const freshTarget = freshPlan.target_ref;
-          if (freshTarget === null) return;
+          if (freshTarget === null) {
+            declineDownload("revalidated plan has no target");
+            return;
+          }
           const effectToken = this.claimEffectGovernor(jobID);
           if (effectToken === undefined) {
             // Another page mutation or download owns the one-effect slot.
@@ -18633,7 +18734,10 @@ export class Bridge {
           try {
             if (dl.method === "click") {
               claimedDownload = await this.claimDownloadInitiated(jobID);
-              if (!claimedDownload) return;
+              if (!claimedDownload) {
+                declineDownload("another path already claimed the download");
+                return;
+              }
             }
             const result = await this.deps.scripting.executeScript({
               target: { tabId: job.tab_id },
@@ -18648,6 +18752,7 @@ export class Bridge {
                   patchJob(s, jobID, { download_initiated: false }),
                 );
               }
+              declineDownload("the page-side effect did not report success");
               return;
             }
             if (dl.method === "click") {
@@ -18665,9 +18770,17 @@ export class Bridge {
               return;
             }
             const url = effect.url;
-            if (typeof url !== "string" || !url.startsWith("https://")) return;
+            if (typeof url !== "string" || !url.startsWith("https://")) {
+              declineDownload(
+                `the effect returned no https url (${typeof url})`,
+              );
+              return;
+            }
             claimedDownload = await this.claimDownloadInitiated(jobID);
-            if (!claimedDownload) return;
+            if (!claimedDownload) {
+              declineDownload("the download latch was taken concurrently");
+              return;
+            }
             this.pendingDownloadURLs.set(url, jobID);
             try {
               const id = await this.deps.downloads.download({
