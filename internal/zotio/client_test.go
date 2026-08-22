@@ -428,3 +428,53 @@ func TestMissingPDFValidatesRowsInsideEnvelope(t *testing.T) {
 		t.Fatalf("enveloped invalid key error = %v, want row validation to still apply", err)
 	}
 }
+
+// "attachments add" has two routes now: the Web API, and the desktop connector
+// papio asks for when the Zotero item already exists. zotio 0.20.0 still reports
+// "web_api" here on purpose — the field names the default route — so no shipped
+// release breaks the old single-value check. This pins tolerance rather than a
+// fix: preflight refuses an entire installation over this field, which is too
+// much weight for a value papio only reads, and the registry may yet name the
+// routes it offers. An unrecognised target must still fail, because it means the
+// bytes travel somewhere papio has not reasoned about.
+func TestPreflightAcceptsEveryWriteTargetPapioUnderstands(t *testing.T) {
+	for _, tc := range []struct {
+		target  string
+		wantErr bool
+	}{
+		{target: "web_api"},
+		{target: "connector"},
+		{target: "local_sqlite", wantErr: true},
+		{target: "", wantErr: true},
+	} {
+		t.Run("target="+tc.target, func(t *testing.T) {
+			client := &Client{Executable: "zotio"}
+			client.Exec = func(_ context.Context, args ...string) ([]byte, error) {
+				switch strings.Join(args, " ") {
+				case "version --agent":
+					return []byte("zotio 0.20.0\n"), nil
+				case "capabilities":
+					capabilities := make([]Capability, 0, len(RequiredCapabilities))
+					for path, operation := range RequiredCapabilities {
+						capability := Capability{Path: path, Operation: operation}
+						if path == "attachments add" {
+							capability.WriteTarget = tc.target
+						}
+						capabilities = append(capabilities, capability)
+					}
+					return json.Marshal(capabilities)
+				default:
+					t.Fatalf("unexpected argv %q", args)
+					return nil, nil
+				}
+			}
+			_, err := client.Preflight(context.Background())
+			if tc.wantErr && err == nil {
+				t.Fatalf("write target %q must be refused", tc.target)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("write target %q must be accepted: %v", tc.target, err)
+			}
+		})
+	}
+}

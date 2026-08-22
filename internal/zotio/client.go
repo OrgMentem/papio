@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +78,20 @@ var RequiredCapabilities = map[string]string{
 	"items add-to-collection": "write",
 	"sync":                    "sync",
 }
+
+// attachmentWriteTargets are the routes papio has reasoned about for
+// "attachments add": the Zotero Web API, and the desktop connector papio asks
+// for with "--via connector" when the item already exists and a Web API upload
+// would bill the bytes to Zotero's own storage plan rather than the operator's
+// file store.
+//
+// zotio 0.20.0 reports "web_api" here even though both routes work, and that is
+// deliberate on its side: the field names the DEFAULT route, and a route that
+// depends on a flag would need a conditional vocabulary the registry does not
+// have. So "connector" is accepted here for tolerance, not because any shipped
+// zotio emits it. The value of listing it is that papio no longer refuses a
+// whole installation over an additive change to a field it only reads.
+var attachmentWriteTargets = []string{"web_api", "connector"}
 
 // ExecFunc is injected by tests. Production uses an argv-only os/exec call;
 // papio never constructs a shell command.
@@ -199,8 +214,14 @@ func (c *Client) Preflight(ctx context.Context) (*PreflightResult, error) {
 			return nil, fmt.Errorf("zotio %s at %s reports operation %q for capability %q, but papio requires %q — update zotio at %s, then retry", version, c.Executable, capability.Operation, path, operation, c.Executable)
 		}
 	}
-	if capability := seen["attachments add"]; capability.WriteTarget != "web_api" {
-		return nil, fmt.Errorf("zotio %s at %s reports write target %q for capability %q, but papio requires %q — update zotio at %s, then retry", version, c.Executable, capability.WriteTarget, capability.Path, "web_api", c.Executable)
+	// "attachments add" has two write targets now: the Web API, and the desktop
+	// connector that papio asks for with "--via connector" when the Zotero item
+	// already exists. Pinning the single value "web_api" made papio refuse the
+	// whole installation the moment zotio advertised the second route, so the
+	// check names the routes papio understands instead. An unknown target still
+	// fails: it means the bytes travel somewhere papio has not reasoned about.
+	if capability := seen["attachments add"]; !slices.Contains(attachmentWriteTargets, capability.WriteTarget) {
+		return nil, fmt.Errorf("zotio %s at %s reports write target %q for capability %q, but papio understands only %s — update papio, then retry", version, c.Executable, capability.WriteTarget, capability.Path, strings.Join(attachmentWriteTargets, " or "))
 	}
 
 	return &PreflightResult{
