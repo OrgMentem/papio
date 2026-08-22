@@ -221,7 +221,16 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		//
 		// A preview creates nothing and needs no running connector, so the
 		// two-phase plan shape is unchanged; the apply needs Zotero desktop.
-		attach := []string{"attachments", "add", acquisition.ZotioItemKey, artifactPath, "--mode", attachmentMode}
+		// zotio titles the attachment from the filename it is handed, so papio
+		// stages a readable copy rather than passing its own content-addressed
+		// path. A cached plan keeps whatever path it recorded: the argv is the
+		// mutation, and re-deriving one that zotio may already have applied is
+		// the duplicate-paper risk this file guards everywhere else.
+		staged, err := s.stageAttachment(plan, row.Work)
+		if err != nil {
+			return nil, err
+		}
+		attach := []string{"attachments", "add", acquisition.ZotioItemKey, staged, "--mode", attachmentMode}
 		if planRoute != "" {
 			attach = append(attach, "--via", planRoute)
 		}
@@ -611,6 +620,26 @@ func (s *Service) LoadPlan(planID string) (*Plan, error) {
 		return nil, fmt.Errorf("Zotio plan confirmation digest mismatch")
 	}
 	return &plan, nil
+}
+
+// stageAttachment materializes the artifact under a readable basename for the
+// attach route. The import route stages into a DIRECTORY zotio resolves, so it
+// must hold exactly one file; this route names a single file, so it stages
+// beside it under "attach" and cannot disturb a manifest resolution.
+func (s *Service) stageAttachment(plan *Plan, w work.Work) (string, error) {
+	name, err := attachStagingBasename(w)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(s.DataDir, "zotio", "staging", plan.JobID, plan.ArtifactSHA256, "attach")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	staged := filepath.Join(dir, name)
+	if err := materializePrivateFile(plan.ArtifactPath, staged, plan.ArtifactSHA256); err != nil {
+		return "", err
+	}
+	return staged, nil
 }
 
 func (s *Service) resolveManifest(ctx context.Context, plan *Plan, w work.Work) (string, importManifest, error) {

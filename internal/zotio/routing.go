@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	"papio/internal/work"
 )
@@ -101,4 +102,53 @@ func importStagingBasename(w work.Work) (string, error) {
 		}
 		return "", errors.New(newItemRoutingRefusal)
 	}
+}
+
+// attachStagingBasename names the file papio hands to "attachments add". The
+// import route's name is parsed by zotio's resolver and so must be identifier
+// shaped; this one is not parsed at all, it becomes the attachment's TITLE in
+// Zotero. Passing papio's artifact-store path directly made that title a
+// 64-character SHA-256, visible in the operator's library beside siblings the
+// import route titled readably. So the work's title is the name, and the
+// identifier basename is the fallback for a work with no title.
+//
+// The cap is a filesystem limit, not taste: most filesystems bound a single
+// component at 255 bytes and a paper title can exceed it.
+func attachStagingBasename(w work.Work) (string, error) {
+	if name := sanitizedTitleBasename(w.Title); name != "" {
+		return name + ".pdf", nil
+	}
+	return importStagingBasename(w)
+}
+
+// attachTitleMaxBytes leaves room for the ".pdf" suffix inside a 255-byte
+// component while staying well clear of any path length papio builds.
+const attachTitleMaxBytes = 180
+
+// sanitizedTitleBasename reduces a paper title to one safe path component, or
+// returns "" when nothing usable survives. It removes the separators and the
+// control bytes a title can carry - a title is third-party metadata, so it is
+// attacker-influenced in exactly the way a captured filename is.
+func sanitizedTitleBasename(title string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case r == '/' || r == '\\' || r == ':':
+			return '-'
+		case r < 0x20 || r == 0x7f:
+			return ' '
+		}
+		return r
+	}, title)
+	cleaned = strings.Join(strings.Fields(cleaned), " ")
+	cleaned = strings.Trim(cleaned, " .")
+	if cleaned == "" {
+		return ""
+	}
+	for len(cleaned) > attachTitleMaxBytes {
+		cleaned = cleaned[:len(cleaned)-1]
+	}
+	for !utf8.ValidString(cleaned) {
+		cleaned = cleaned[:len(cleaned)-1]
+	}
+	return strings.Trim(cleaned, " .")
 }

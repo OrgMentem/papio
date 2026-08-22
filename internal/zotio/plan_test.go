@@ -4,6 +4,7 @@ package zotio
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1451,6 +1452,63 @@ func TestAppliedWithoutKeyKeepsPlanForReplay(t *testing.T) {
 			same := replanned[0].ID == first.ID
 			if same != tc.wantSam {
 				t.Fatalf("replanned id = %q, first = %q, want same = %v", replanned[0].ID, first.ID, tc.wantSam)
+			}
+		})
+	}
+}
+
+// zotio titles an attachment from the filename it is handed, so papio's own
+// artifact path made the visible title a 64-character SHA-256 - measured live
+// 2026-08-22 on item Y2X7SALM, beside siblings the import route titled
+// "Full Text PDF". The attach route therefore stages a readable copy, and a
+// work with no title falls back to the identifier name the import route uses.
+func TestExistingItemPlanStagesReadableAttachmentName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		work work.Work
+		want string
+	}{
+		{
+			name: "titled",
+			work: work.Work{DOI: "10.1108/jhom-12-2019-0353", Title: "Exploring the potential for collective leadership"},
+			want: "Exploring the potential for collective leadership.pdf",
+		},
+		{
+			name: "titleless",
+			work: work.Work{DOI: "10.1108/jhom-12-2019-0353"},
+			want: "10.1108%2Fjhom-12-2019-0353.pdf",
+		},
+		{
+			name: "separators in the title never escape one path component",
+			work: work.Work{DOI: "10.1108/jhom-12-2019-0353", Title: "a/b\\c:d\ne"},
+			want: "a-b-c-d e.pdf",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cli := &planCLI{preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`}
+			service, jobID := readyPlanServiceWork(t, "AB12CD34", cli, tc.work)
+			plans, err := service.PlanJobs(context.Background(), []string{jobID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plans) != 1 || plans[0].Route != "existing_item" {
+				t.Fatalf("plans = %+v, want one existing_item plan", plans)
+			}
+			staged := plans[0].ApplyArgs[slices.Index(plans[0].ApplyArgs, "add")+2]
+			if filepath.Base(staged) != tc.want {
+				t.Fatalf("staged basename = %q, want %q (argv %v)", filepath.Base(staged), tc.want, plans[0].ApplyArgs)
+			}
+			// The staged file must exist and hold the artifact bytes: apply runs
+			// in a later process than preview.
+			body, err := os.ReadFile(staged)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sha := sha256.Sum256(body); hex.EncodeToString(sha[:]) != plans[0].ArtifactSHA256 {
+				t.Fatalf("staged bytes do not match the artifact digest")
+			}
+			if strings.Contains(filepath.Base(staged), plans[0].ArtifactSHA256) {
+				t.Fatalf("staged basename still carries the content hash: %q", staged)
 			}
 		})
 	}
