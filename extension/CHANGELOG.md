@@ -35,6 +35,19 @@ for the full pre-split extension history.
   retried when *papio* wakes; that retry silently downgraded its reason to the
   one reason the daemon must refuse, so an interrupted close could never
   complete.
+- **A sign-in that returns to the page you are already on no longer reloads
+  it.** Finishing a library round-trip sent the tab to the resolver link again
+  even when the tab was already showing exactly that page. Asking a browser to
+  go where it already is is never free: it throws away the rendered article,
+  and at publishers who screen automated traffic it summons a fresh "prove
+  you're human" check — one *papio* caused and then handed to you to solve.
+  Measured on a live paper: the check appeared 311 ms after the sign-in
+  returned, on an article whose own page *papio* had twice judged perfectly
+  ordinary. It now navigates only when that would actually move the tab.
+- **The tab group is named "papio", and nothing else.** It used to append the
+  title of whichever paper was on screen. With more than one paper in the group
+  that label named an arbitrary one of them, the tab strip already shows every
+  title, and a group is a place, not a status line.
 - ***papio* now actually downloads the paper it has identified.** The single
   defect behind "the PDF button is right there and nothing happens": the
   download plan is handed from the page to *papio* and back again, and that

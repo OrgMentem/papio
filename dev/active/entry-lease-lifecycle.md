@@ -584,3 +584,48 @@ today.
 5. Slice 1 deploys and the institutional offer/claim counters stay at zero.
 6. The cooling interval becomes a guessed number rather than a measured one.
 7. Either open question above is still open when Slice 2 starts.
+
+## Two tab-accumulation models, both disproved (2026-08-22)
+
+"Why do I have multiple tabs with the same paper" was investigated after the
+download fix landed, and the first two explanations were both wrong. Recording
+them because each one is a plausible reading of this code that a future pass
+will reach for again.
+
+**Model 1: `recordManagedTab` orphans the outgoing tab.** It does overwrite
+`job.tab_id` without retiring anything (`extension/src/background.ts`,
+`recordManagedTab`). But by the time a later cycle mints a replacement, the
+drive timeout has already detached the job (`tab_id: -1`, in
+`registerHandoffDrive`'s timeout), so a retirement keyed on the job's own
+outgoing `tab_id` is dead code. A fix built on this model was written and
+reverted.
+
+**Model 2: the sweep cannot see the orphan.** Also wrong, in the useful
+direction: `reconcileOwnedTabs` skips a ledgered surface only when
+`owner?.tab_id === tabID` and it is not a cold park, so an orphan whose owner
+names a different tab is *already* eligible. Making the sweep run promptly on
+replacement was written and reverted too, because the replacement never
+happens: reuse keys on the ledger as well as on `job.tab_id`
+(`findManagedTab`'s tracked-id match, fed by `ledgerOwnedTabID`), so a
+detached-but-ledgered surface is recovered rather than replaced. That is now
+pinned by `a re-offer for a job detached from its live tab reuses that surface`
+in `extension/test/background.test.ts`.
+
+**What was actually true.** Measured live: fifteen drive cycles for one paper
+across one morning left TWO tabs in the group, not fifteen. The accumulation
+the report described was one tab per *failed* cycle, and the cycles repeated
+only because the paper could never complete — the null-erasing serialization
+boundary in the effect executor. Fixing that removed the repetition, and with
+it the pile. The lesson is the ordering one: a symptom counted per-cycle is a
+symptom of the cycle repeating, so establish why it repeats before building
+machinery to clean up after it.
+
+**Residue, not yet addressed.** A settled institutional scaffold tab can
+survive: `closeOwnedTab` refuses a tab that is `active`, deliberately, and the
+scaffold is often the focused tab at exactly the moment its claim settles.
+`reconcileOwnedTabs`' own rule for an active tab is "ambiguity retains, it does
+not cede". So the spent scaffold is retained indefinitely rather than closed,
+and the designed answer for a surface papio will not close on its own is
+`orphanTabStatus`/`cleanupOrphanTabs` — whether a spent scaffold should reach
+that surface, or be navigated to the paper it was minted for, is a product
+decision and is deliberately left open here.

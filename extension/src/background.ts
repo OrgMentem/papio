@@ -453,13 +453,15 @@ const MATERIALIZE_PAGE_PATH = POPUP_PAGE_PATH.replace(
   /[^/]*$/,
   "materialize.html",
 );
-/** Stable base title for papio's handoff group. A surfaced paper temporarily
- * appends its identity, but always returns to this title so a later worker can
- * rediscover the group without retaining page state. */
+/** The handoff group's title. Constant: it is an ownership marker, not a
+ * status line. It briefly carried the surfaced paper's own title, which read
+ * as information and was not — with more than one tab in the group the label
+ * names an arbitrary one of them, and the tab strip already shows every title.
+ *
+ * `isHandoffGroupTitle` still accepts the old `papio — <paper>` form so a
+ * reloaded worker rediscovers a group that an earlier build had renamed,
+ * instead of orphaning it and opening a second papio group beside it. */
 const HANDOFF_GROUP_TITLE = "papio";
-const HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH = 72;
-/** Paper labels are transient; the stable prefix is the ownership marker that
- * lets a reloaded worker find the physical group again. */
 function isHandoffGroupTitle(title: string | undefined): boolean {
   return (
     title === HANDOFF_GROUP_TITLE ||
@@ -4439,7 +4441,6 @@ export class Bridge {
     this.ownedTabReconcileDueAt = now + OWNED_TAB_RECONCILE_INTERVAL_MS;
     await this.reconcileOwnedTabs();
   }
-
   /** Reconcile modern, same-browser-epoch birth records that no live job still
    * points at. This is the restart/update repair half of job_inactive: future
    * cancel/job-removal frames close through removeJobWithOffer, but a surface
@@ -5206,10 +5207,7 @@ export class Bridge {
     }
     try {
       await tabGroups.update(groupID, {
-        title:
-          desiredExpanded && tabID !== undefined
-            ? this.handoffGroupTitle(tabID)
-            : HANDOFF_GROUP_TITLE,
+        title: HANDOFF_GROUP_TITLE,
         collapsed: desiredCollapsed,
       });
       this.handoffGroupLastStateChangeAt = this.deps.now();
@@ -5570,19 +5568,6 @@ export class Bridge {
     } catch {
       // The handoff continues assisted if the dedicated window disappeared.
     }
-  }
-
-  private handoffGroupTitle(tabID: number): string {
-    const jobs = this.store.activeJobs;
-    if (jobs.length !== 1 || jobs[0]?.tab_id !== tabID)
-      return HANDOFF_GROUP_TITLE;
-    const title = jobs[0].expected?.title?.replace(/\s+/g, " ").trim();
-    if (!title) return HANDOFF_GROUP_TITLE;
-    const shortTitle =
-      title.length <= HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH
-        ? title
-        : `${title.slice(0, HANDOFF_GROUP_TITLE_MAX_TITLE_LENGTH - 1).trimEnd()}…`;
-    return `${HANDOFF_GROUP_TITLE} — ${shortTitle}`;
   }
 
   /** The persisted singleton can name another window, so Chrome's membership
@@ -16808,7 +16793,25 @@ export class Bridge {
         ) {
           // The successful sign-in is still driving this exact tab. Reuse it
           // for the resolver return instead of creating a second effectful tab.
-          await this.deps.tabs.update(tabID, { url: openurl });
+          //
+          // Only navigate if that would actually move the tab. chrome.tabs.update
+          // with a url ALWAYS navigates, even to the identical one, so a resolver
+          // URL that resolves back to the page this tab already shows costs a
+          // discarded render for nothing — and on a Cloudflare-fronted provider
+          // it re-arms the check against a fresh automated navigation. Measured
+          // live 2026-08-22 on job_012f55be2bbfe0abd0ce456e36: route issued,
+          // `auth_returned` 311 ms later, `challenge_blocked` immediately after,
+          // on a page whose own assessment scored `normal` on two captures. The
+          // human then had to solve a check that this navigation had summoned.
+          const currentURL = (await this.deps.tabs
+            .get(tabID)
+            .catch(() => undefined))?.url;
+          if (
+            currentURL === undefined ||
+            normalizeManagedTabURL(currentURL) !== normalizeManagedTabURL(openurl)
+          ) {
+            await this.deps.tabs.update(tabID, { url: openurl });
+          }
           this.federatedLoginOperatorNavigated.delete(jobID);
           this.federatedReDriven.add(jobID);
           // A redrive is a BET that the navigation it starts will come back as

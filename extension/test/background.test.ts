@@ -2283,6 +2283,87 @@ test("repeated reoffers reuse one ledger tab without growing the browser surface
   expect(h.tabs.created).toHaveLength(1);
   expect(h.backend.store.activeJobs[0]?.tab_id).toBe(100);
 });
+// "Why do I have multiple tabs with the same paper." The shape that produced
+// them: registerHandoffDrive's timeout detaches a still-live job from its tab
+// (`tab_id: -1`, extension/src/background.ts:5794) and deliberately leaves the
+// tab open, so the NEXT offer for that same paper has a job pointing at
+// nothing and a real surface sitting in the papio group. If reuse keyed on the
+// job's own `tab_id` alone it would mint a second tab for the same paper on
+// every cycle. It keys on the ledger too, which is what makes the surface
+// recoverable across the detach — and across an MV3 worker death, since the
+// ledger is durable and `tab_id` is not.
+//
+// Verified live 2026-08-22: fifteen drive cycles for one paper across one
+// morning left TWO tabs in the group, not fifteen.
+test("a re-offer for a job detached from its live tab reuses that surface", async () => {
+  const jobID = "job_detached_reuse";
+  const offerURL = "https://resolver.example.edu/openurl?detached=1";
+  const replacementURL = "https://resolver.example.edu/openurl?detached=2";
+  const h = makeHarness(undefined, { windows: true });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(jobOffer(jobID, offerURL));
+  const tabID =
+    h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThan(0);
+  expect(ledger.current()[String(tabID)]).toBeDefined();
+  expect(h.tabs.created).toHaveLength(1);
+
+  // Detach exactly as the drive timeout leaves a legacy job: tab_id -1 while
+  // the tab itself deliberately stays open.
+  const detach = h.bridge as unknown as {
+    update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
+  };
+  await detach.update((s) => ({
+    ...s,
+    activeJobs: s.activeJobs.map((job) =>
+      job.job_id === jobID ? { ...job, tab_id: -1 } : job,
+    ),
+  }));
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+
+  await h.port.inbound(jobOffer(jobID, replacementURL));
+
+  // The same surface, recovered through the ledger: one tab ever created, and
+  // the job points back at it.
+  expect(h.tabs.created).toHaveLength(1);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id,
+  ).toBe(tabID);
+  expect(h.tabs.list()).toHaveLength(1);
+});
+
+test("a warm parked surface the operator may still be acting on survives the sweep", async () => {
+  // The operator may still be acting on that page — a live provider challenge
+  // is the case that matters (extension/src/background.ts:4502-4507) — so
+  // promptness must never cost this.
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  await h.port.inbound(jobOffer("job_warm_park", "https://resolver.example.edu/openurl?park=warm"));
+  const tabID = h.backend.store.activeJobs.find((job) => job.job_id === "job_warm_park")?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThan(0);
+  const internals = h.bridge as unknown as {
+    parkHandoffForManual: (jobID: string) => Promise<void>;
+  };
+  await internals.parkHandoffForManual("job_warm_park");
+  const job = h.backend.store.activeJobs.find((job) => job.job_id === "job_warm_park");
+  expect(job).toMatchObject({ tab_id: tabID, parked_with_tab: true });
+  // Not yet cold: created_at is now, so surfaceIsCold (PARKED_SURFACE_COLD_MS = 30min) is false.
+  const result = await h.bridge.reconcileOwnedTabs();
+  expect(result.closed).toBe(0);
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+  expect(h.tabs.removed).not.toContain(tabID);
+});
+
+
+
 test("assisted direct-file offers stay parked for either auth requirement", async () => {
   for (const requiresAuth of [false, true]) {
     const h = makeHarness();
@@ -6960,6 +7041,67 @@ test("a provider landing that completes an institutional route still classifies 
   expect(planned).toContain(tabID);
 });
 
+test("a redrive whose tab already shows the target does not re-navigate, and still classifies", async () => {
+  // chrome.tabs.update with a url always navigates even to the identical URL,
+  // destroying page state and re-arming Cloudflare on SAGE.
+  const h = makeHarness();
+  const jobID = "job_redrive_noop_target";
+  const targetURL = `https://${PROVIDER_HOST}/doi/10.1177/15480518221144895`;
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  const planned: (number | undefined)[] = [];
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution) {
+      planned.push(injection.target.tabId);
+      return plannerResult(injection, {
+        kind: "article",
+        adapter_id: "provider",
+        adapter_version: "1.0.0",
+        evidence: ["rule:article matched"],
+      });
+    }
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer(jobID, targetURL));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThan(0);
+  h.tabs.updates.splice(0);
+  planned.splice(0);
+
+  const internals = h.bridge as unknown as {
+    federatedLoginRouted: Set<string>;
+    federatedLoginOperatorNavigated: Set<string>;
+  };
+  internals.federatedLoginRouted.add(jobID);
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso?x=1");
+  await h.tabs.completeNavigation(tabID, "https://idp.example.edu/sso?x=1");
+
+  // The provider landing is already the target — re-navigating would destroy
+  // state and re-arm Cloudflare.
+  h.tabs.seed({ id: tabID, url: targetURL });
+  h.tabs.updates.splice(0);
+  await h.tabs.completeNavigation(tabID, targetURL);
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+
+  expect(
+    h.tabs.updates.some(
+      (update) => update.id === tabID && update.properties.url === targetURL,
+    ),
+  ).toBe(false);
+
+  const net = h.timers.find((timer) => timer.ms === 2_500);
+  expect(net).toBeDefined();
+  h.clock.now += 2_500;
+  void net!.fn();
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+
+  expect(planned).toContain(tabID);
+});
+
+
 test("session evidence sends the exact origin observed for that evidence", async () => {
   const h = makeHarness();
   await h.bridge.start();
@@ -8989,9 +9131,11 @@ test("IdP auth expands the papio group and re-collapses when auth returns", asyn
   expect(h.frames().some((f) => f.type === "auth_pending")).toBe(true);
   expect(h.tabs.activated).toEqual([tabID]);
   expect(h.tabGroups?.live.get(groupID)?.collapsed).toBe(false);
-  expect(h.tabGroups?.live.get(groupID)?.title).toBe(
-    "papio — A paper awaiting institutional access",
-  );
+  // The group's title is an ownership marker, never a status line: expanding it
+  // for an IdP hand-off does not rename it after the paper. The tab strip
+  // already shows every title, and with more than one tab in the group the
+  // label named an arbitrary one of them.
+  expect(h.tabGroups?.live.get(groupID)?.title).toBe("papio");
 
   // Auth returns to a provider host: the job advances and the group folds away.
   const providerURL = `https://${PROVIDER_HOST}/stable/123`;
@@ -9071,9 +9215,12 @@ test("a live papio group keeps its generic collapsed title when the last handoff
 
   const idpURL = "https://idp.example.edu/sso?SAMLRequest=x";
   await h.tabs.userNavigate(tabID, idpURL);
+  // Stronger than it used to be: the group is expanded for the IdP hand-off and
+  // STILL carries no paper metadata, so there is no cancellation window in
+  // which a title could leak. It never carries any.
   expect(h.tabGroups?.live.get(groupID)).toMatchObject({
     collapsed: false,
-    title: "papio — Paper metadata must disappear on cancellation",
+    title: "papio",
   });
 
   // The group still exists because a keepalive tab remains folded into it.

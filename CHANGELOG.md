@@ -190,6 +190,16 @@ execution records kept during the initial build.
   PDF was waiting to be identified — the very row the new picker above exists to
   answer. It printed nothing at all, so every other pending paper vanished with
   it. The capture now prints as its own row, with its state and label.
+- **A sign-in that lands you back where you already were no longer reloads the
+  page, or summons a security check.** After finishing a library round-trip
+  *papio* sent the tab to the resolver link a second time even when the tab was
+  already showing that exact page. Asking a browser to go where it already is
+  discards the rendered article for nothing, and at publishers who screen
+  automated traffic it provokes a fresh "prove you're human" check — one
+  *papio* caused and then asked you to solve. Measured on a live paper: the
+  check appeared 311 ms after the sign-in returned, on an article *papio* had
+  twice judged perfectly ordinary. It now navigates only when doing so would
+  actually move the tab.
 - **Solving a security check no longer counts against the paper.** *papio*
   stops driving a paper on its own after three attempts that achieved nothing —
   the rule that stops it hammering a publisher forever. A provider CAPTCHA
