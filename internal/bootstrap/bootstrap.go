@@ -173,6 +173,30 @@ func (s *serialAutoImporter) PlanAndApply(ctx context.Context, jobID string) (st
 	return status, parentKey, attachmentKey, zotio.WithErrorInfo(err)
 }
 
+// citationEnrichingImporter fills a job's missing citation identity before the
+// import runs. It wraps OUTSIDE the pacing serializer on purpose: the lookup is
+// a network request, and holding the one import slot across it would make the
+// pacing interval pay for enrichment latency it does not own.
+//
+// See app.Service.EnsureCitationMetadata for why this sits on the shared
+// importer seam rather than inside the retry pass.
+type citationEnrichingImporter struct {
+	next app.AutoImporter
+	svc  *app.Service
+}
+
+func (c citationEnrichingImporter) PlanAndApply(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, err error) {
+	c.svc.EnsureCitationMetadata(ctx, jobID)
+	return c.next.PlanAndApply(ctx, jobID)
+}
+
+// EnsureCitationMetadata satisfies zotio's optional citationRepairer, which the
+// import backfill uses to close a metadata gap BEFORE it classifies a job as an
+// expected failure and skips the importer entirely.
+func (c citationEnrichingImporter) EnsureCitationMetadata(ctx context.Context, jobID string) {
+	c.svc.EnsureCitationMetadata(ctx, jobID)
+}
+
 func waitAutoImportRetry(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -409,7 +433,10 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		// generic hand-off seam.
 		zotioService.CLI = zotio.New(cfg.Zotio)
 		browserZotio = zotioService
-		service.AutoImporter = newSerialAutoImporter(zotioService, autoImportMinInterval)
+		service.AutoImporter = citationEnrichingImporter{
+			next: newSerialAutoImporter(zotioService, autoImportMinInterval),
+			svc:  service,
+		}
 	} else {
 		// Generic holdings sources answer ownership only when zotio is absent.
 		// Mixing them is deliberately out of scope (ADR-0008): "make this Zotero

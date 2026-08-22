@@ -105,6 +105,14 @@ type ImportBackfillImporter interface {
 	PlanAndApply(context.Context, string) (status, parentKey, attachmentKey string, err error)
 }
 
+// citationRepairer is the optional half of ImportBackfillImporter: an importer
+// that can also close a job's citation-metadata gap before it is judged. It is
+// deliberately not part of ImportBackfillImporter — a plain importer stays a
+// valid caller, and this package never learns what a metadata source is.
+type citationRepairer interface {
+	EnsureCitationMetadata(ctx context.Context, jobID string)
+}
+
 // ImportBackfill selects stranded ready jobs oldest-first, classifies them, and
 // optionally imports them through PlanAndApply. Dry-run is the default: no
 // Zotero writes and no durable auto-import events unless Apply is true.
@@ -169,6 +177,23 @@ func (s *Service) ImportBackfill(ctx context.Context, req ImportBackfillRequest,
 	for _, candidate := range candidates {
 		if ctx.Err() != nil {
 			return result, ctx.Err()
+		}
+		// Repair a closeable metadata gap BEFORE classifying, because
+		// classification is what decides never to call the importer at all.
+		// A ready job with no citation title is classified expectedFail and
+		// skipped at the switch below, so a repair that lives on the importer
+		// can never run for the one class of job that needs it — the papers
+		// that already exhausted their retry budget and are reachable only
+		// through this operator-driven path.
+		//
+		// The repairer rides the importer papio already passes here rather than
+		// arriving as a new parameter or service field: discovery stays out of
+		// this package, and a caller that supplies no repairer keeps the old
+		// behaviour exactly.
+		if req.Apply {
+			if repairer, ok := importer.(citationRepairer); ok {
+				repairer.EnsureCitationMetadata(ctx, candidate.JobID)
+			}
 		}
 		class, reason, parentKey, classifyErr := s.classifyImportBackfillJob(ctx, candidate.JobID, ownedParents, ownershipKnown)
 		if classifyErr != nil {

@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
+	"papio/internal/discovery"
 	"papio/internal/job"
+	"papio/internal/work"
 	"papio/internal/zotio"
 )
 
@@ -334,4 +337,57 @@ func TestImportRetrierRunDueStopsAtPerPassCap(t *testing.T) {
 		t.Fatalf("second pass imported nothing; calls still %d, so the remainder was stranded", before)
 	}
 	_ = due
+}
+
+// A ready job whose citation title and authors are empty fails zotio's bundle
+// validation every time, and ready is terminal: the resolve-time enrichment that
+// fills those fields can never run again, so the job holds a validated PDF that
+// papio will never file. Measured on the operator's machine 2026-08-22: 21 of 72
+// ready jobs, 16 of them already at the retry cap, while the configured
+// discovery backend answered their DOIs on demand.
+func TestEnsureCitationMetadataFillsTitlelessReadyJob(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	svc.AutoImporter = &fakeAutoImporter{status: "applied"}
+	jobID := seedReadyJobWithImportResult(t, svc, jobs, "wr_enrich_gap_001")
+
+	if _, err := jobs.FillWorkMetadata(ctx, jobID, work.Work{}); err != nil {
+		t.Fatalf("clearing metadata: %v", err)
+	}
+	row, err := jobs.Get(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(row.Work.Title) != "" {
+		t.Fatalf("precondition: title = %q, want empty", row.Work.Title)
+	}
+
+	lookup := &fakeWorkLookup{result: discovery.DiscoveredWork{Work: work.Work{
+		Title:   "Recovered Citation Title",
+		Authors: []string{"Adams, A."},
+		Year:    2026,
+	}}}
+	svc.Discovery = lookup
+
+	svc.EnsureCitationMetadata(ctx, jobID)
+
+	after, err := jobs.Get(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Work.Title != "Recovered Citation Title" {
+		t.Fatalf("title = %q, want the looked-up citation title", after.Work.Title)
+	}
+	if len(after.Work.Authors) == 0 {
+		t.Fatalf("authors = %v, want the looked-up authors", after.Work.Authors)
+	}
+
+	// A job that already has a citation must not spend a provider request.
+	before := lookup.calls
+	svc.EnsureCitationMetadata(ctx, jobID)
+	if lookup.calls != before {
+		t.Fatalf("lookup calls = %d, want %d: a job with a title must not be looked up again", lookup.calls, before)
+	}
 }

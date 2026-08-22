@@ -4,6 +4,8 @@ package app
 
 import (
 	"context"
+	"log"
+	"strings"
 
 	"papio/internal/job"
 )
@@ -38,6 +40,52 @@ const readyImportScanLimit = 200
 // tick continues it. Three keeps a saturated pass near half its cadence even with
 // the pacing floor applied between applies.
 const maxImportsPerPass = 3
+
+// EnsureCitationMetadata fills a ready job's citation identity from its DOI
+// before an import is attempted, and is why an import can recover from a gap
+// that used to be permanent.
+//
+// zotio's bundle validation requires a citation title and authors. A ready job
+// that has neither fails it every time with "no citation record for this paper",
+// and ready is TERMINAL: the scheduler never processes the job again, so the
+// only code that fills those fields (enrichDOIWork, during resolve) can never
+// run for it. The job then exhausts maxImportAttempts and importNeedsRetry
+// stops selecting it, so it holds a validated PDF that papio will never file,
+// with no operator-reachable way to fix it.
+//
+// Measured on the operator's machine 2026-08-22: 21 of 72 ready jobs had no
+// citation title, 16 of them already at exactly 5 failed attempts, while papio's
+// own configured discovery backend returned a title and authors for their DOIs
+// on demand. The metadata was always available; nothing ever asked again.
+//
+// This runs on the shared import seam rather than inside the retry pass because
+// the operator-driven backfill reaches the importer without passing through it,
+// and the already-capped jobs are reachable ONLY through the backfill.
+//
+// Best-effort by construction: enrichment must never fail an import that could
+// otherwise succeed, and enrichDOIWork already absorbs budget refusals and
+// post-wire failures. It logs when the gap survives the attempt, because a
+// paper that stays unfilable needs a reason the operator can read.
+func (s *Service) EnsureCitationMetadata(ctx context.Context, jobID string) {
+	if s == nil || s.Discovery == nil || s.Jobs == nil {
+		return
+	}
+	row, err := s.Jobs.Get(ctx, jobID)
+	if err != nil || row == nil {
+		return
+	}
+	if strings.TrimSpace(row.Work.Title) != "" || strings.TrimSpace(row.Work.DOI) == "" {
+		return
+	}
+	if _, err := s.enrichDOIWork(ctx, row); err != nil {
+		log.Printf("papio: citation enrichment for job %s failed: %v", jobID, err)
+		return
+	}
+	if strings.TrimSpace(row.Work.Title) == "" {
+		log.Printf("papio: no citation metadata available for job %s (doi %s); import will fail bundle validation",
+			jobID, row.Work.DOI)
+	}
+}
 
 // ImportRetrier re-drives auto-import for ready jobs whose Zotero import has not
 // succeeded. It exists because ready is a terminal state: the scheduler never

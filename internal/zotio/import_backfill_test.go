@@ -457,3 +457,70 @@ func TestImportBackfillMarshalJSONNormalizesNullSlices(t *testing.T) {
 		}
 	}
 }
+
+// repairingImporter is an importer that can also close a citation gap, which is
+// what the daemon wires in production (bootstrap.citationEnrichingImporter).
+type repairingImporter struct {
+	trackingImporter
+	repaired []string
+	repair   func(jobID string)
+}
+
+func (r *repairingImporter) EnsureCitationMetadata(_ context.Context, jobID string) {
+	r.repaired = append(r.repaired, jobID)
+	if r.repair != nil {
+		r.repair(jobID)
+	}
+}
+
+// A ready job whose classification will refuse it (here: no exportable bundle)
+// never reaches the importer — the switch records the reason and skips it. That
+// ordering is why a repair hung on the importer alone never ran for the only
+// class of job that needed it: papers already past their retry budget, reachable
+// only through this operator-driven path. So the repair must be offered BEFORE
+// the job is judged, and this pins exactly that: the repairer is consulted for a
+// candidate the importer is never asked about.
+//
+// The end-to-end effect (a closed citation gap turning expected_fail into an
+// import) was proved live against the operator's store and a real zotio, where
+// expected_fail went 4 -> 0 and four titles were filled; this fixture's jobs
+// cannot reach that classification because their artifacts are not real PDFs.
+func TestImportBackfillOffersRepairBeforeClassifying(t *testing.T) {
+	ctx := context.Background()
+	dataDir := storetest.DataDir(t)
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	when := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
+	seedImportBackfillJob(t, ctx, db, "job_needs_repair", when, true, "pass", "")
+	service := importBackfillService(t, dataDir, db, &planCLI{})
+
+	repairing := &repairingImporter{}
+	result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, IncludeNotRequested: true, Limit: 5}, repairing)
+	if err != nil {
+		t.Fatalf("ImportBackfill = %v", err)
+	}
+	if result.Summary.ExpectedFail != 1 {
+		t.Fatalf("expected_fail = %d, want 1 for this fixture", result.Summary.ExpectedFail)
+	}
+	if len(repairing.calls) != 0 {
+		t.Fatalf("importer calls = %v, want none: classification skips an expected failure", repairing.calls)
+	}
+	// The load-bearing assertion: repaired despite the importer never being
+	// asked. A repair reachable only through PlanAndApply could not do this.
+	if len(repairing.repaired) != 1 || repairing.repaired[0] != "job_needs_repair" {
+		t.Fatalf("repaired = %v, want the skipped candidate repaired before classification", repairing.repaired)
+	}
+
+	// A dry run previews; it must not mutate a paper's metadata.
+	preview := &repairingImporter{}
+	if _, err := service.ImportBackfill(ctx, ImportBackfillRequest{IncludeNotRequested: true, Limit: 5}, preview); err != nil {
+		t.Fatalf("dry-run ImportBackfill = %v", err)
+	}
+	if len(preview.repaired) != 0 {
+		t.Fatalf("dry-run repaired = %v, want none: a preview must not write", preview.repaired)
+	}
+}
