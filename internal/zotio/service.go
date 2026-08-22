@@ -2,7 +2,6 @@
 package zotio
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -322,21 +321,7 @@ type foundItem struct {
 // this command actually emitted when the original code was written, so a
 // version that changes back must not silently blind ownership again.
 func decodeFoundItems(raw json.RawMessage) ([]foundItem, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) > 0 && trimmed[0] == '[' {
-		var items []foundItem
-		if err := json.Unmarshal(trimmed, &items); err != nil {
-			return nil, err
-		}
-		return items, nil
-	}
-	var envelope struct {
-		Results []foundItem `json:"results"`
-	}
-	if err := json.Unmarshal(trimmed, &envelope); err != nil {
-		return nil, err
-	}
-	return envelope.Results, nil
+	return decodeRows[foundItem](raw)
 }
 
 // MissingPDFCount reports how many library items (optionally within one

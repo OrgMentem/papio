@@ -31,6 +31,39 @@ var (
 	keyRE     = regexp.MustCompile(`^[A-Z0-9]{8}$`)
 )
 
+// decodeRows reads a zotio list result that may arrive either as a bare JSON
+// array or inside zotio's {"meta":…,"results":[…]} read envelope, and is the one
+// place in papio that knows a list can wear two shapes.
+//
+// zotio is migrating every record read onto the envelope; the rollout is
+// incremental, so which shape a given command answers is a property of the
+// installed binary rather than of the command. Measured on this machine
+// 2026-08-22: zotio 0.19.0-1-g17b8776 answers "items missing-pdf" with a bare
+// array, while its own HEAD answers the envelope for the identical invocation.
+// The rows are byte-identical in both; only the wrapper differs.
+//
+// So papio must not pin either shape. Pinning the array is what silently blinded
+// every ownership lookup once already (see decodeFoundItems), and pinning the
+// envelope would break papio for anyone still on a released zotio. A tolerant
+// read costs one byte comparison and removes the whole class.
+func decodeRows[T any](raw []byte) ([]T, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var rows []T
+		if err := json.Unmarshal(trimmed, &rows); err != nil {
+			return nil, err
+		}
+		return rows, nil
+	}
+	var envelope struct {
+		Results []T `json:"results"`
+	}
+	if err := json.Unmarshal(trimmed, &envelope); err != nil {
+		return nil, err
+	}
+	return envelope.Results, nil
+}
+
 // RequiredCapabilities is the exact public Zotio surface Phase 4 consumes.
 // Preflight fails before acquisition or mutation when an installed Zotio is old
 // or missing one of these commands.
@@ -213,8 +246,8 @@ func (c *Client) MissingPDF(ctx context.Context, collection string, limit int) (
 	if err != nil {
 		return nil, fmt.Errorf("reading Zotio missing-PDF queue: %w", err)
 	}
-	var items []MissingPDFItem
-	if err := json.Unmarshal(out, &items); err != nil {
+	items, err := decodeRows[MissingPDFItem](out)
+	if err != nil {
 		return nil, fmt.Errorf("decoding Zotio missing-PDF queue: %w", err)
 	}
 	for i := range items {
@@ -246,8 +279,8 @@ func (c *Client) MissingPDFKeys(ctx context.Context, keys []string) ([]MissingPD
 	if err != nil {
 		return nil, fmt.Errorf("reading Zotio missing-PDF queue: %w", err)
 	}
-	var items []MissingPDFItem
-	if err := json.Unmarshal(out, &items); err != nil {
+	items, err := decodeRows[MissingPDFItem](out)
+	if err != nil {
 		return nil, fmt.Errorf("decoding Zotio missing-PDF queue: %w", err)
 	}
 	for i := range items {

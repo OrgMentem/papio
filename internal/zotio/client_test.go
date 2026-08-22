@@ -376,3 +376,55 @@ func TestCommandLabelSurvivesPreflightWrapper(t *testing.T) {
 		t.Fatalf("Preflight err=%q, want to contain %q", err.Error(), want)
 	}
 }
+
+// zotio is migrating every record read onto its {"meta":…,"results":[…]}
+// envelope, one command at a time, so the shape "items missing-pdf" answers is a
+// property of the installed binary. Measured 2026-08-22: the installed
+// 0.19.0-1-g17b8776 answers a bare array and zotio's own HEAD answers the
+// envelope for the identical invocation, with byte-identical rows.
+//
+// Both papio call sites decoded only the bare array, so an ordinary zotio
+// upgrade would have broken the Zotero-sourced acquisition queue and the
+// owned-key ownership check. The envelope below is captured verbatim from that
+// HEAD binary, meta keys and JSON null included, because every pre-existing
+// fixture in this file is a bare array and that is exactly why the first
+// instance of this bug reached the operator.
+func TestMissingPDFReadsRowsFromEitherShape(t *testing.T) {
+	const envelope = `{"meta":{"reason":"local_only","resource_type":"items","source":"local","synced_at":"2026-08-22T09:29:53Z"},` +
+		`"results":[{"key":"DQELN7CQ","title":"x","doi":null,"item_type":"book","date_added":"2026-08-18T01:58:36Z"}]}`
+	const bare = `[{"key":"DQELN7CQ","title":"x","doi":null,"item_type":"book","date_added":"2026-08-18T01:58:36Z"}]`
+
+	for name, payload := range map[string]string{"envelope": envelope, "bare_array": bare} {
+		t.Run(name, func(t *testing.T) {
+			client := &Client{Executable: "zotio", Exec: func(_ context.Context, _ ...string) ([]byte, error) {
+				return []byte(payload), nil
+			}}
+			items, err := client.MissingPDF(context.Background(), "", 0)
+			if err != nil {
+				t.Fatalf("MissingPDF = %v", err)
+			}
+			if len(items) != 1 || items[0].Key != "DQELN7CQ" {
+				t.Fatalf("MissingPDF items = %+v, want one row keyed DQELN7CQ", items)
+			}
+			keyed, err := client.MissingPDFKeys(context.Background(), []string{"DQELN7CQ"})
+			if err != nil {
+				t.Fatalf("MissingPDFKeys = %v", err)
+			}
+			if len(keyed) != 1 || keyed[0].Key != "DQELN7CQ" {
+				t.Fatalf("MissingPDFKeys items = %+v, want one row keyed DQELN7CQ", keyed)
+			}
+		})
+	}
+}
+
+// Row validation is the reason this decode exists at all, so it must still reject
+// a bad key when the rows arrive wrapped rather than bare.
+func TestMissingPDFValidatesRowsInsideEnvelope(t *testing.T) {
+	client := &Client{Executable: "zotio", Exec: func(_ context.Context, _ ...string) ([]byte, error) {
+		return []byte(`{"meta":{"source":"local"},"results":[{"key":"../../bad","title":"Paper"}]}`), nil
+	}}
+	if _, err := client.MissingPDF(context.Background(), "", 1); err == nil ||
+		!strings.Contains(err.Error(), "Zotio queue row 0 has invalid item key") {
+		t.Fatalf("enveloped invalid key error = %v, want row validation to still apply", err)
+	}
+}
