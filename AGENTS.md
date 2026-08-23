@@ -440,6 +440,21 @@ There is also a link check, because `zensical build` prints a broken link as an
   the daemon log), and offers/captures route **only** to the holder, so a harness can
   silently steal the user's session. `papio browser use <id-prefix>` pins a chosen session
   (the demoted one stays pending and keeps polling); `papio browser sessions` lists them.
+- **`dev_reload` is the one disconnect that is not a departure, and the bridge reserves the
+  slot for it.** A reload tears down the native port, so `release` nils the holder and the
+  ordinary succession path (`Sync`, `previous holder disconnected`) would hand the slot to
+  whatever sibling browser is polling — measured at **4 of 5 reloads** with one idle sibling
+  connected. The reloaded extension's fresh hello is then *denied* against the now-live new
+  holder (`handleHello`'s `holderAlive && !sameSession` branch), so the browser you are
+  developing in ends up pending with `session_busy` (every feature-gated surface failing
+  closed, per the next bullet) and every later `papio browser reload` targets the **sibling**.
+  `devReloadReservation` (10s, set when the frame goes on the wire, cleared by any hello or
+  explicit `promote`) keeps the slot vacant for the browser that is coming back; the CLI
+  additionally fails when an already-known session id captures the slot, because "holder
+  changed" alone was reporting that theft as success. Two invariants to preserve if you touch
+  the succession path: an ordinary disconnect with no reload latched MUST still promote a
+  sibling immediately, and the reservation MUST stay bounded, or an extension that never
+  comes back strands the bridge forever.
 - **A refused hello is never acked, so a pending browser is negotiated for nothing —
   and `session_busy` is the extension's ONLY holdership signal.** `handleHello` answers a
   denied hello with one `session_busy` error frame and no `hello_ack`, so that session has

@@ -139,10 +139,11 @@ func newBrowserCommand(opt *options) *cobra.Command {
 				return err
 			}
 			var previous string
+			known := map[string]bool{}
 			for _, s := range before.Sessions {
+				known[s.ID] = true
 				if s.Holder {
 					previous = s.ID
-					break
 				}
 			}
 			if previous == "" {
@@ -182,6 +183,14 @@ func newBrowserCommand(opt *options) *cobra.Command {
 					}
 				}
 				if current != "" && current != previous {
+					// A reload is only proven by the reloaded extension coming
+					// back as a NEW session. A browser that was already
+					// connected taking the vacant slot means the reload landed
+					// somewhere the operator was not developing, so it must not
+					// read as success.
+					if known[current] {
+						return fmt.Errorf("browser session %s reloaded but the already-connected browser %s captured the papio session; the reloaded extension is pending and its papio surfaces fail closed - run `papio browser sessions` then `papio browser use <id>` to hand the session back", shortSessionID(previous), shortSessionID(current))
+					}
 					return opt.printResult(result, "browser session %s reloaded; %s now holds the papio session", shortSessionID(previous), shortSessionID(current))
 				}
 				select {

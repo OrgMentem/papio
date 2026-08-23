@@ -14823,3 +14823,199 @@ func TestDevReloadPendingSessionDoesNotReceiveHolderLatch(t *testing.T) {
 		t.Fatalf("holder reload_id = %q, want %q", got.Payload.(*protocol.DevReloadPayload).ReloadID, reloadID)
 	}
 }
+func TestDevReloadReservationHoldsSlotAgainstPendingSibling(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	_ = settableClock(b)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	msgs, _ := runSyncAs(t, b, sessB, helloAs("0.15.0"))
+	busy := firstOfType(msgs, protocol.MsgError)
+	if busy == nil || busy.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+		t.Fatalf("B hello must be denied with session_busy, got %+v", msgs)
+	}
+	if _, _, err := b.RequestDevReload(); err != nil {
+		t.Fatalf("RequestDevReload: %v", err)
+	}
+	msgs, _ = runSyncAs(t, b, sessA)
+	if firstOfType(msgs, protocol.MsgDevReload) == nil {
+		t.Fatalf("dev_reload not emitted on holder Sync, got %+v", msgs)
+	}
+	if _, err := b.Sync(context.Background(), sessA, true, nil); err != nil {
+		t.Fatalf("goodbye Sync: %v", err)
+	}
+	msgs, _ = runSyncAs(t, b, sessB)
+	b.mu.Lock()
+	holder := b.holder
+	_, stillPending := b.pending[sessB]
+	reserved := b.devReloadReserved(b.now())
+	b.mu.Unlock()
+	if holder != nil {
+		t.Fatalf("pending sibling stole the slot during reservation: holder=%+v", holder)
+	}
+	if !stillPending {
+		t.Fatalf("B must remain pending while reservation is live")
+	}
+	if !reserved {
+		t.Fatalf("reservation must still be live after holder goodbye")
+	}
+	if ack := firstOfType(msgs, protocol.MsgHelloAck); ack != nil {
+		t.Fatalf("B must not receive a holder hello_ack during reservation, got %+v", msgs)
+	}
+}
+
+func TestDevReloadFreshHelloReclaimsReservedSlot(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	_ = settableClock(b)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	runSyncAs(t, b, sessB, helloAs("0.15.0"))
+	if _, _, err := b.RequestDevReload(); err != nil {
+		t.Fatalf("RequestDevReload: %v", err)
+	}
+	msgs, _ := runSyncAs(t, b, sessA)
+	if firstOfType(msgs, protocol.MsgDevReload) == nil {
+		t.Fatalf("dev_reload not emitted, got %+v", msgs)
+	}
+	if _, err := b.Sync(context.Background(), sessA, true, nil); err != nil {
+		t.Fatalf("goodbye Sync: %v", err)
+	}
+	// Sibling polling while reserved must not take the slot.
+	if _, err := b.Sync(context.Background(), sessB, false, nil); err != nil {
+		t.Fatalf("B Sync: %v", err)
+	}
+	b.mu.Lock()
+	if b.holder != nil {
+		b.mu.Unlock()
+		t.Fatalf("holder must be nil before reloader returns, got %+v", b.holder)
+	}
+	b.mu.Unlock()
+	const sessC = "cccc3333cccc3333cccc3333cccc3333"
+	msgs, _ = runSyncAs(t, b, sessC, helloAs("0.15.0"))
+	ack := firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil || ack.Payload.(*protocol.HelloAckPayload).Role != sessionRoleHolder {
+		t.Fatalf("fresh reloader hello must be granted holder, got %+v", msgs)
+	}
+	b.mu.Lock()
+	holderID := ""
+	if b.holder != nil {
+		holderID = b.holder.ID
+	}
+	reserved := b.devReloadReserved(b.now())
+	b.mu.Unlock()
+	if holderID != sessC {
+		t.Fatalf("holder = %q, want %q", holderID, sessC)
+	}
+	if reserved {
+		t.Fatalf("reservation must be cleared after reloader reclaims slot")
+	}
+}
+
+func TestDevReloadReservationExpiryPromotesWaitingSibling(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	advance := settableClock(b)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	runSyncAs(t, b, sessB, helloAs("0.15.0"))
+	if _, _, err := b.RequestDevReload(); err != nil {
+		t.Fatalf("RequestDevReload: %v", err)
+	}
+	msgs, _ := runSyncAs(t, b, sessA)
+	if firstOfType(msgs, protocol.MsgDevReload) == nil {
+		t.Fatalf("dev_reload not emitted, got %+v", msgs)
+	}
+	if _, err := b.Sync(context.Background(), sessA, true, nil); err != nil {
+		t.Fatalf("goodbye Sync: %v", err)
+	}
+	advance(devReloadReservation + time.Second)
+	msgs, _ = runSyncAs(t, b, sessB)
+	b.mu.Lock()
+	holderID := ""
+	if b.holder != nil {
+		holderID = b.holder.ID
+	}
+	b.mu.Unlock()
+	if holderID != sessB {
+		t.Fatalf("after reservation expiry holder = %q, want %q (B must be promoted)", holderID, sessB)
+	}
+	ack := firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil || ack.Payload.(*protocol.HelloAckPayload).Role != sessionRoleHolder {
+		t.Fatalf("promoted sibling must receive holder hello_ack after expiry, got %+v", msgs)
+	}
+}
+
+func TestDevReloadOrdinaryGoodbyePromotesImmediatelyWithoutReservation(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	_ = settableClock(b)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	msgs, _ := runSyncAs(t, b, sessB, helloAs("0.15.0"))
+	if busy := firstOfType(msgs, protocol.MsgError); busy == nil || busy.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+		t.Fatalf("B hello must be denied, got %+v", msgs)
+	}
+	// No dev_reload latched — ordinary disconnect.
+	if _, err := b.Sync(context.Background(), sessA, true, nil); err != nil {
+		t.Fatalf("goodbye Sync: %v", err)
+	}
+	msgs, _ = runSyncAs(t, b, sessB)
+	b.mu.Lock()
+	holderID := ""
+	if b.holder != nil {
+		holderID = b.holder.ID
+	}
+	b.mu.Unlock()
+	if holderID != sessB {
+		t.Fatalf("ordinary goodbye must promote pending immediately, holder=%q want %q", holderID, sessB)
+	}
+	ack := firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil || ack.Payload.(*protocol.HelloAckPayload).Role != sessionRoleHolder {
+		t.Fatalf("promoted sibling must receive holder hello_ack on ordinary goodbye, got %+v", msgs)
+	}
+}
+
+func TestDevReloadExplicitClaimOverridesReservation(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	_ = settableClock(b)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	runSyncAs(t, b, sessB, helloAs("0.15.0"))
+	if _, _, err := b.RequestDevReload(); err != nil {
+		t.Fatalf("RequestDevReload: %v", err)
+	}
+	msgs, _ := runSyncAs(t, b, sessA)
+	if firstOfType(msgs, protocol.MsgDevReload) == nil {
+		t.Fatalf("dev_reload not emitted, got %+v", msgs)
+	}
+	if _, err := b.Sync(context.Background(), sessA, true, nil); err != nil {
+		t.Fatalf("goodbye Sync: %v", err)
+	}
+	b.mu.Lock()
+	if b.holder != nil {
+		b.mu.Unlock()
+		t.Fatalf("holder must be nil before explicit claim, got %+v", b.holder)
+	}
+	if !b.devReloadReserved(b.now()) {
+		b.mu.Unlock()
+		t.Fatalf("reservation must be live before Claim override")
+	}
+	b.mu.Unlock()
+	claimed, err := b.Claim(sessB)
+	if err != nil {
+		t.Fatalf("Claim(%q): %v", sessB, err)
+	}
+	if claimed != sessB {
+		t.Fatalf("Claim returned %q, want %q", claimed, sessB)
+	}
+	b.mu.Lock()
+	holderID := ""
+	if b.holder != nil {
+		holderID = b.holder.ID
+	}
+	reserved := b.devReloadReserved(b.now())
+	b.mu.Unlock()
+	if holderID != sessB {
+		t.Fatalf("explicit Claim must make B the holder, got %q", holderID)
+	}
+	if reserved {
+		t.Fatalf("reservation must be cleared after explicit Claim")
+	}
+	msgs, _ = runSyncAs(t, b, sessB)
+	ack := firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil || ack.Payload.(*protocol.HelloAckPayload).Role != sessionRoleHolder {
+		t.Fatalf("claimed holder must receive holder hello_ack, got %+v", msgs)
+	}
+}

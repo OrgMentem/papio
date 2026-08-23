@@ -392,6 +392,13 @@ type Bridge struct {
 	// per configured resolver profile across ordinary sync ticks, even after
 	// its source settles.
 	reofferSourceJobID map[string]string
+	// devReloadReservedFor is the session id whose dev_reload frame has been
+	// delivered and which is therefore expected back as a NEW session, and
+	// devReloadReservedUntil bounds that expectation. While the reservation
+	// is live the bridge slot is left vacant rather than handed to a pending
+	// sibling: see devReloadReservation.
+	devReloadReservedFor   string
+	devReloadReservedUntil time.Time
 	// Session evidence is timing-only and throttled per exact configured
 	// resolver profile.
 	lastSessionEvidenceAt map[string]time.Time
@@ -589,6 +596,19 @@ const legacySessionID = "legacy"
 // (nativehost.pollInterval); 5x that absorbs scheduling hiccups without
 // making crash recovery feel slow.
 const sessionStaleAfter = 10 * time.Second
+
+// devReloadReservation is how long the bridge slot is held vacant for a
+// browser that is restarting because of a dev_reload. A reload is the one
+// disconnect that is not a departure: the same browser is coming straight
+// back. Without the reservation an idle sibling browser's next poll takes
+// the slot (measured: 4 of 5 reloads), the reloaded extension's fresh hello
+// is then denied against the live new holder, and every later reload targets
+// the sibling instead - so the operator reloads a browser they are not
+// developing in while their dev browser sits pending and fails closed.
+// Bounded so a reload that never comes back (extension removed, worker
+// crash) still yields the slot: the measured restart is ~2s, and this is 5x
+// that, mirroring sessionStaleAfter's reasoning.
+const devReloadReservation = 10 * time.Second
 const (
 	surfacePresenceTTL = 120 * time.Second
 	maxPresenceLeases  = 256
@@ -899,6 +919,8 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	}
 	delete(b.pending, session.ID)
 	session.needsAck = true
+	// An explicit `papio browser use` claim overrides a reload reservation.
+	b.clearDevReloadReservation()
 	// A pending browser has not been allowed to offer work, so it must check
 	// upgrade repairs when it becomes the live holder.
 	b.holder = session
@@ -1023,7 +1045,11 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		// Succession: a silent or departed holder yields to the session that
 		// is demonstrably alive right now.
 		if b.holder == nil {
-			b.promote(session, "previous holder disconnected")
+			// A reload is not a departure: hold the slot for the browser that
+			// is restarting instead of handing it to an idle sibling.
+			if !b.devReloadReserved(now) {
+				b.promote(session, "previous holder disconnected")
+			}
 		} else if now.Sub(b.holder.LastSyncAt) > sessionStaleAfter {
 			stale := b.holder
 			delete(b.pending, stale.ID) // do not resurrect a silent holder
@@ -1073,6 +1099,10 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		if err != nil {
 			return nil, err
 		}
+		// Reserve the slot from the moment the command is on the wire, not
+		// from the latch: this is when the extension actually restarts.
+		b.devReloadReservedFor = sessionID
+		b.devReloadReservedUntil = now.Add(devReloadReservation)
 		out = append(out, frame)
 	}
 	for _, raw := range frames {
@@ -1297,6 +1327,19 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 		b.mu.Unlock()
 		return CaptureResult{RequestID: requestID, Outcome: "timeout", Detail: "browser page capture timed out"}
 	}
+}
+
+// devReloadReserved reports whether the bridge slot is currently being held
+// vacant for a browser restarting under dev_reload. The caller holds b.mu.
+func (b *Bridge) devReloadReserved(now time.Time) bool {
+	return b.devReloadReservedFor != "" && now.Before(b.devReloadReservedUntil)
+}
+
+// clearDevReloadReservation drops the reservation once it has been honoured
+// or is no longer wanted. The caller holds b.mu.
+func (b *Bridge) clearDevReloadReservation() {
+	b.devReloadReservedFor = ""
+	b.devReloadReservedUntil = time.Time{}
 }
 
 // release forgets a departing session. The caller holds b.mu.
@@ -4032,6 +4075,9 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 		b.materializationScheduleVersion++
 	}
 	b.materializationRecoveryPending = true
+	// A fresh hello is the reloaded extension arriving (or any browser
+	// claiming a vacant slot): the reservation has served its purpose.
+	b.clearDevReloadReservation()
 	b.holder = session
 	b.offered = map[string]bool{}
 	b.queuedOffers = map[string]bool{}

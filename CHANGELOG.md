@@ -33,7 +33,13 @@ execution records kept during the initial build.
   inside `--timeout` is reported as a failure, and the extension itself
   declines the command unless the browser reports it as an unpacked
   development load, so a store-installed *papio* is never restarted. `make
-  dev-deploy` now runs it for you.
+  dev-deploy` now runs it for you. A reload is also safe when you run two
+  browsers with *papio* installed: restarting the extension frees the browser
+  slot for a moment, and a second browser sitting idle used to take it, which
+  left the browser you were working in unable to reach *papio* and pointed
+  every later reload at the wrong browser. The slot is now held for the
+  browser that is coming back, and the command reports a failure — naming
+  `papio browser use` — if another browser takes it anyway.
 - **The inbox now answers "which paper is this?" itself, instead of telling you
   to go and type an identifier.** A captured PDF that *papio* could not file on
   its own parks in the inbox, and until now the button on that row printed a
