@@ -5953,6 +5953,125 @@ func TestSafetyDomainIsSharedAcrossJobsOnOneProfile(t *testing.T) {
 	}
 }
 
+// An open-access route leaves through doi.org, not the library's proxy, so it
+// must not carry the institution's provider fence. It did: every candidate was
+// minted with the institution's domain, and the scheduler's sibling anti-join
+// compares that value against claims parked in bound/route_issued/navigated -
+// so one open-access paper holding a browser tab suppressed every
+// institutional sibling at that library for its claim's lease. Measured live
+// 2026-08-23: an open-access ChemRxiv preprint held a navigated claim while 22
+// eligible candidates shared its domain.
+func TestOpenAccessCandidateDoesNotJoinTheInstitutionFence(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	library := parkInstitutional(t, jobs, "wr_fence_library", handoffWork(), "")
+	openAccess := parkOpenAccessHandoff(t, jobs, "wr_fence_oa", handoffWork(),
+		"https://doi.org/10.26434/chemrxiv-2025-x8h36")
+	libraryRow, err := jobs.Get(ctx, library)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openRow, err := jobs.Get(ctx, openAccess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	libraryCand, err := b.prepareMaterializationCandidate(ctx, *libraryRow)
+	if err != nil || libraryCand == nil {
+		t.Fatalf("library candidate: %+v %v", libraryCand, err)
+	}
+	openCand, err := b.prepareMaterializationCandidate(ctx, *openRow)
+	if err != nil || openCand == nil {
+		t.Fatalf("open-access candidate: %+v %v", openCand, err)
+	}
+	if openCand.SafetyDomainID == libraryCand.SafetyDomainID {
+		t.Fatalf("open-access candidate joined the institution fence (%q); a parked open-access claim would suppress every library sibling",
+			openCand.SafetyDomainID)
+	}
+	if openCand.SafetyDomainID != "oa:doi.org" {
+		t.Fatalf("open-access fence = %q, want oa:doi.org so the candidate and its effect permits agree on one domain",
+			openCand.SafetyDomainID)
+	}
+}
+
+// The eligible rows already in a long-running store were minted under the old
+// rule, so correcting the mint is not enough: this machine runs two papio
+// binaries and either can have written one. A candidate that has not been
+// claimed is retired and replaced, and one that owns a live browser surface is
+// left alone - its fence is corrected by the next attempt, not underneath the
+// operator's tab.
+func TestMisfencedOpenAccessCandidateIsRetiredAndReminted(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	id := parkInstitutional(t, jobs, "wr_refence", handoffWork(), "")
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := b.prepareMaterializationCandidate(ctx, *row)
+	if err != nil || stale == nil {
+		t.Fatalf("pre-fix candidate: %+v %v", stale, err)
+	}
+	// The job's route is open-access all along; only the recorded action says
+	// so, which is exactly the shape of the rows in the live store.
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET detail=? WHERE job_id=? AND status='open'`,
+		app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36", id); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := b.prepareMaterializationCandidate(ctx, *row)
+	if err != nil || repaired == nil {
+		t.Fatalf("repaired candidate: %+v %v", repaired, err)
+	}
+	if repaired.SafetyDomainID != "oa:doi.org" {
+		t.Fatalf("repaired fence = %q, want oa:doi.org; the stale row keeps the library fenced",
+			repaired.SafetyDomainID)
+	}
+	if repaired.ID == stale.ID {
+		t.Fatal("the replacement reused the retired candidate's id; the id must cover its fence")
+	}
+	retired, err := jobs.GetBrowserCandidate(ctx, stale.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired == nil || retired.Status != "abandoned" {
+		t.Fatalf("stale candidate status = %+v, want abandoned", retired)
+	}
+	// A claimed candidate owns a live browser surface, so a wrong fence on one
+	// must be left in place: retiring it would abandon the tab the operator can
+	// see. A second job reaches that state - misfenced AND claimed - because
+	// the first one's fence is already correct by now.
+	claimedID := parkInstitutional(t, jobs, "wr_refence_claimed", handoffWork(), "")
+	claimedRow, err := jobs.Get(ctx, claimedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inFlight, err := b.prepareMaterializationCandidate(ctx, *claimedRow)
+	if err != nil || inFlight == nil {
+		t.Fatalf("in-flight candidate: %+v %v", inFlight, err)
+	}
+	if err := jobs.SetBrowserCandidateStatus(ctx, inFlight.ID, "eligible", "claimed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET detail=? WHERE job_id=? AND status='open'`,
+		app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36", claimedID); err != nil {
+		t.Fatal(err)
+	}
+	held, err := b.prepareMaterializationCandidate(ctx, *claimedRow)
+	if err != nil || held == nil || held.ID != inFlight.ID {
+		t.Fatalf("a claimed candidate must be returned untouched: %+v %v", held, err)
+	}
+	stillClaimed, err := jobs.GetBrowserCandidate(ctx, inFlight.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stillClaimed == nil || stillClaimed.Status != "claimed" {
+		t.Fatalf("the repair retired a claimed candidate (%+v); its tab is live", stillClaimed)
+	}
+}
+
 // seedSurfaceCloseClaim creates a job, institution profile, browser
 // candidate, and materialization claim, then forces the claim to the given
 // phase via direct SQL — settled/abandoned are real handler outcomes with no

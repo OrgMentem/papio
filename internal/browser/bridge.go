@@ -1598,10 +1598,35 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 	if err != nil {
 		return nil, err
 	}
+	// The provider fence is decided BEFORE the existing lookup, because a
+	// candidate minted under a superseded fence must not be reused. An
+	// open-access route was minted with the institution's domain until this
+	// changed, so the eligible rows already in the store carry a fence they
+	// never earned; that is repaired here rather than by a migration, because
+	// this machine runs two papio binaries and either can have written one.
+	domain, err := b.candidateSafetyDomain(ctx, key, profile.ID, row.ID)
+	if err != nil {
+		return nil, err
+	}
 	if existing, getErr := b.jobs.CurrentBrowserCandidateForJob(ctx, row.ID, attempt); getErr != nil {
 		return nil, getErr
 	} else if existing != nil {
-		return existing, nil
+		// The repair is scoped to the ONE mismatch that is known wrong: this
+		// job's route is open-access and its stored candidate carries some
+		// other fence. Nothing in production rewrites a candidate's domain, so
+		// a general "any mismatch is stale" rule would be true today, but it
+		// is a wider claim than the defect needs and it would retire the
+		// candidates that tests and future callers legitimately pre-create.
+		// Only an unclaimed candidate can be retired: a claimed or
+		// materializing one owns a live browser surface, and its fence is
+		// corrected by the next attempt instead of underneath the tab.
+		misfenced := strings.HasPrefix(domain, "oa:") && existing.SafetyDomainID != domain
+		if !misfenced || existing.Status != "eligible" {
+			return existing, nil
+		}
+		if err := b.jobs.SetBrowserCandidateStatus(ctx, existing.ID, "eligible", "abandoned"); err != nil {
+			return nil, err
+		}
 	}
 	strategy := "title"
 	switch {
@@ -1618,7 +1643,7 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 	}
 	routeRevision := materializationRevision(key, profile.ID, strategy, row.ID, strconv.FormatInt(attempt, 10), row.Work.DOI, row.Work.PMID, row.Work.ArXiv, row.Work.ISBN, row.Work.OpenAlex)
 	input := job.BrowserCandidateInput{
-		ID:    materializationMAC(key, "browser_candidate", profile.ID, strconv.FormatInt(profile.Revision, 10), profile.AuthorityDigest, strconv.FormatInt(routeRevision, 10), strategy, row.ID, strconv.FormatInt(attempt, 10)),
+		ID:    materializationMAC(key, "browser_candidate", profile.ID, strconv.FormatInt(profile.Revision, 10), profile.AuthorityDigest, strconv.FormatInt(routeRevision, 10), strategy, row.ID, strconv.FormatInt(attempt, 10), domain),
 		JobID: row.ID, JobAttemptRevision: attempt,
 		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: routeRevision, RouteClass: "institutional", IdentifierStrategy: strategy,
@@ -1628,11 +1653,10 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 		// anti-join is the only thing serializing irreversible effects across
 		// jobs, and it compares this value. Mixing row.ID in gave every job a
 		// private domain, so that anti-join could never match a sibling and
-		// cross-job serialization silently did nothing. Pre-route, the honest
-		// shared axis is the institution profile: all of its traffic leaves
-		// through the same resolver and proxy. A landed provider domain, once
-		// there is one, is the stronger key and belongs here instead.
-		SafetyDomainID:   materializationMAC(key, "safety_domain", profile.ID),
+		// cross-job serialization silently did nothing. The shared axis is the
+		// route's own provider, which is the institution profile for a library
+		// route and doi.org for an open-access one - see candidateSafetyDomain.
+		SafetyDomainID:   domain,
 		AdapterRevision:  "packaged:institutional_materialization/1",
 		EffectContractID: "browser_tab:institutional_materialization/1", Status: "eligible",
 	}
@@ -12249,4 +12273,41 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// candidateSafetyDomain names the provider fence a job's browser route will
+// actually cross. Every candidate used to be minted with the institution's
+// domain, including the ones whose handoff reaches doi.org, and the scheduler's
+// sibling anti-join (institutional_scheduler.go) compares exactly this value
+// against claims parked in bound/route_issued/navigated. So an open-access
+// paper that reached a browser tab suppressed every institutional sibling at
+// that library for its claim's lease - measured live 2026-08-23: one
+// open-access ChemRxiv preprint held a navigated claim while 22 eligible
+// candidates shared its domain, and each fresh claim re-armed that hold.
+//
+// The open-access domain is the plaintext `oa:<host>` the effect side already
+// uses (actionSafetyDomain), so a candidate and its effect permits agree on one
+// fence per route instead of disagreeing across two value spaces.
+func (b *Bridge) candidateSafetyDomain(ctx context.Context, key []byte, profileID, jobID string) (string, error) {
+	institutional := materializationMAC(key, "safety_domain", profileID)
+	if b.jobs == nil {
+		return institutional, nil
+	}
+	actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+	if err != nil {
+		return "", err
+	}
+	for _, action := range actions {
+		if action.Kind != handoffActionKind {
+			continue
+		}
+		url, ok := app.OABrowserHandoffURL(action.Detail)
+		if !ok {
+			continue
+		}
+		if domain := hostSafetyDomain("oa", url); domain != "" {
+			return domain, nil
+		}
+	}
+	return institutional, nil
 }

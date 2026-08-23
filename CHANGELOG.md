@@ -215,6 +215,19 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **One open-access paper no longer freezes every other paper at your library.**
+  *papio* runs one browser route at a time per provider, so that two papers
+  cannot take an irreversible step at the same publisher at once. Every paper
+  was being filed under the library's name for that purpose — including papers
+  whose route goes to doi.org and never touches the library at all. So an
+  open-access paper that opened a tab held that lane for the life of its
+  attempt, and every paper genuinely waiting for the library was passed over
+  until it lapsed. Then the next attempt took the lane again. Measured on this
+  machine: one open-access preprint held it while 22 papers queued behind it,
+  each fresh attempt re-arming the hold. An open-access route is now filed
+  under the site it actually visits, and the papers already recorded the old
+  way are corrected the next time *papio* looks at them — except while one is
+  driving a tab you can see, which is left alone until it finishes.
 - **`papio doctor` no longer counts open-access papers as blocked by a sign-in.**
   The line that names which paper holds your library's sign-in slot also counts
   the papers waiting on it, and it was counting every waiting paper — including
