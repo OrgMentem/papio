@@ -480,6 +480,37 @@ func TestDeliveryConfirmRequestAbsentRepairsBeforeSubmitAndReopensAction(t *test
 	if jobRow.State != job.StateAwaitingHuman {
 		t.Fatalf("job state after absent = %s, want awaiting_human (the reconciliation park after a legal repair-then-submit)", jobRow.State)
 	}
+	// The real discriminator, and the one the state check cannot be: the
+	// repair transition must have happened. Under cancel-submit-repair the
+	// submit fails first and RepairAwaitingHuman never runs, so this event
+	// does not exist at all.
+	events, err := system.Jobs.Events(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairSeen, parkedAfterRepair := false, false
+	for _, e := range events {
+		if e["kind"] != "job.transition" {
+			continue
+		}
+		detail, ok := e["detail"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if detail["reason"] == "document_delivery_confirmed_absent" {
+			repairSeen = true
+			continue
+		}
+		if repairSeen && detail["to"] == job.StateAwaitingHuman {
+			parkedAfterRepair = true
+		}
+	}
+	if !repairSeen {
+		t.Fatalf("no job.transition carrying the confirmed-absent repair; events = %v", events)
+	}
+	if !parkedAfterRepair {
+		t.Fatalf("no park back to awaiting_human after the repair transition; events = %v", events)
+	}
 	actions, err := system.Jobs.ListHumanActionsForJob(context.Background(), jobID)
 	if err != nil {
 		t.Fatal(err)
