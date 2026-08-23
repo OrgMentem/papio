@@ -30,6 +30,17 @@ for the full pre-split extension history.
   signing in changes.
 
 ### Fixed
+- **A paper waiting for another paper's sign-in now really does retry.** The
+  wait that was added to stop *papio* hammering the daemon was armed correctly
+  and then fired into nothing: *papio* had already thrown away the record of
+  what it was retrying, so the timer woke up, found no paper, and did nothing.
+  Because the daemon considers such a paper already taken, nothing else woke it
+  either, and it sat for the half hour it takes that claim to lapse — or until
+  the extension was reloaded. *papio* now keeps the record, and the retry
+  resumes against the sign-in slot it already holds instead of asking for a new
+  one. Found by review, not in the wild: the test that was meant to cover this
+  handed the retry a fresh offer of its own, which is exactly the help the real
+  path never gets.
 - **A paper waiting for another paper's sign-in stops hammering the daemon.**
   *papio* signs in to one institution at a time, so while one paper is signing
   in the rest are told the slot is busy. Each of those refusals arrived on the

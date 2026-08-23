@@ -17494,12 +17494,20 @@ test("institutional bind busy refusal backs off and wakes from its durable alarm
     h.frames().filter((frame) => frame.type === "institutional_claim_request"),
   ).toHaveLength(claimsBeforeRefresh);
 
+  // The alarm is the ONLY wake-up on this path: the daemon leaves the
+  // candidate `claimed` and its scheduler re-offers only `eligible` ones, so
+  // clearing the correlation here made the alarm fire into a silent no-op and
+  // deferred the retry to the claim's ~30-minute reconciliation. Resuming
+  // re-binds against the claim papio still holds - it does not re-claim.
   const retry = h.port.waitForFrame(
-    "institutional_claim_request",
+    "institutional_bind_request",
     h.port.posted.length,
   );
   await h.alarms.fire(alarm!.name);
   expect((await retry).job_id).toBe(jobID);
+  expect(
+    h.frames().filter((frame) => frame.type === "institutional_claim_request"),
+  ).toHaveLength(claimsBeforeRefresh);
 });
 
 test("institutional candidate offer dispatches claim without awaiting the correlated response", async () => {

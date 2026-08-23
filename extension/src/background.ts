@@ -9464,17 +9464,26 @@ export class Bridge {
           bindOutcome === "not_eligible" ||
           bindOutcome === "feature_disabled"
         ) {
-          await this.removeMaterializationTab(tabID);
-          await this.clearMaterializationWorkflow(jobID);
-          // Keep the refusal meaning: this scaffold is retired and the
-          // workflow is cleared. Only the next attempt moves to a durable,
-          // slow alarm instead of the daemon's 2s poll cadence.
-          if (
+          const institutionBusy =
             bindOutcome === "not_eligible" &&
             bindResponse.payload["detail"] ===
-              "another sign-in for this institution is in progress"
-          ) {
+              "another sign-in for this institution is in progress";
+          await this.removeMaterializationTab(tabID);
+          if (institutionBusy) {
+            // Retire the scaffold - holding a tab open while another paper
+            // signs in is the whole point of this refusal - but KEEP the
+            // correlation. The daemon leaves this candidate `claimed`, and its
+            // scheduler only re-offers an `eligible` one, so no daemon poll
+            // re-drives this paper. The durable alarm is the only wake-up, and
+            // it resumes through scheduleMaterialization, which returns
+            // silently when the correlation is gone - so clearing here made
+            // the alarm decorative and deferred every retry to the claim's
+            // ~30-minute reconciliation. The kept phase is `claimed`, which
+            // materializeScaffold re-enters by scanning for the binding
+            // rather than trusting the removed tab id.
             this.scheduleInstitutionalBindRetry(jobID);
+          } else {
+            await this.clearMaterializationWorkflow(jobID);
           }
         } else {
           await this.retryMaterializationAfterResponseLoss(jobID, "bind");

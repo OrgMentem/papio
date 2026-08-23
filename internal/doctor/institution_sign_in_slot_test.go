@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"papio/internal/app"
 	"papio/internal/store"
 	"papio/internal/store/storetest"
 )
@@ -80,7 +81,7 @@ func TestSignInSlotHeldWithNoDeadlineIsNamedWithWaitingPapers(t *testing.T) {
 	if !strings.Contains(checks[0].Detail, "job_holder_paper") {
 		t.Fatalf("detail must name the holder: %q", checks[0].Detail)
 	}
-	if !strings.Contains(checks[0].Detail, "2 other papers are waiting") {
+	if !strings.Contains(checks[0].Detail, "2 other papers are also waiting for an institutional sign-in") {
 		t.Fatalf("detail must count the papers waiting behind it: %q", checks[0].Detail)
 	}
 	if !strings.Contains(checks[0].Remediation, "papio actions open --job job_holder_paper") {
@@ -114,5 +115,31 @@ func TestSignInSlotStaysQuietForSharedBoundedAndUnboundLeases(t *testing.T) {
 				t.Fatalf("checks = %+v, want silence", checks)
 			}
 		})
+	}
+}
+
+// An open-access handoff reaches doi.org, not the library, so after the bind
+// blanks its authentication claim it never arbitrates for this slot. Counting
+// it would tell the operator that papers are blocked which are not, inflating
+// the one number this check exists to make trustworthy.
+func TestSignInSlotDoesNotCountOpenAccessPapersAsWaiting(t *testing.T) {
+	db := signInSlotStore(t)
+	seedLease(t, db, "human", "", "", "binding-live")
+	seedWaitingHandoff(t, db, "job_waiting_one")
+	if _, err := db.DB().ExecContext(context.Background(), `
+		INSERT INTO human_actions(job_id, kind, status, detail, created_at)
+		VALUES('job_open_access','openurl_handoff','open',?,'2026-08-23T00:00:00Z')`,
+		app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36"); err != nil {
+		t.Fatal(err)
+	}
+
+	checks := collectChecks(t, func(add func(string, string, string, string)) {
+		checkInstitutionSignInSlot(context.Background(), db, add)
+	})
+	if len(checks) != 1 {
+		t.Fatalf("checks = %+v, want exactly one held-slot warning", checks)
+	}
+	if !strings.Contains(checks[0].Detail, "1 other paper is also waiting for an institutional sign-in") {
+		t.Fatalf("the open-access paper must not be counted as waiting: %q", checks[0].Detail)
 	}
 }

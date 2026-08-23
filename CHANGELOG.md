@@ -215,6 +215,14 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **`papio doctor` no longer counts open-access papers as blocked by a sign-in.**
+  The line that names which paper holds your library's sign-in slot also counts
+  the papers waiting on it, and it was counting every waiting paper — including
+  open-access ones, which do not need that sign-in and no longer wait for it.
+  The count is also honest about what it can prove now: with more than one
+  institution configured *papio* cannot yet attribute a waiting paper to a
+  particular library, so the line says those papers are *also* waiting for an
+  institutional sign-in rather than claiming they are stuck behind this one.
 - **A rate-limited open-access paper no longer gets sent to your library.** When
   every open-access source *papio* wanted to ask was temporarily gated — a rate
   limit, a spend cap, a provider cooldown — it spent its retry budget on the

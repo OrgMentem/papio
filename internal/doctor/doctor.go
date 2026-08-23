@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"papio/internal/app"
 	"papio/internal/browser"
 	"papio/internal/budget"
 	"papio/internal/config"
@@ -2043,11 +2044,16 @@ func checkInstitutionSignInSlot(ctx context.Context, db *store.Store, add func(s
 		SELECT COALESCE(NULLIF(l.human_owner_id, ''), l.owner_id), COALESCE(l.entitled_at, ''),
 		       (SELECT COUNT(*) FROM human_actions a
 		         WHERE a.status = 'open' AND a.kind = 'openurl_handoff'
-		           AND a.job_id <> COALESCE(NULLIF(l.human_owner_id, ''), l.owner_id))
+		           AND a.job_id <> COALESCE(NULLIF(l.human_owner_id, ''), l.owner_id)
+		           -- An open-access handoff reaches doi.org, not the library, so
+		           -- it never arbitrates for this slot and is not waiting behind
+		           -- it. Counting it overstated what a stalled sign-in blocks.
+		           AND a.detail NOT LIKE ?)
 		  FROM authentication_entry_leases l
 		 WHERE l.state = 'human' AND l.lease_until IS NULL
 		   AND (l.entitled_at IS NULL OR l.entitled_at = '')
-		   AND l.owner_binding_id IS NOT NULL AND l.owner_binding_id <> ''`)
+		   AND l.owner_binding_id IS NOT NULL AND l.owner_binding_id <> ''`,
+		app.OABrowserHandoffDetail+"%")
 	if err != nil {
 		add("institution_sign_in_slot", Warn,
 			"papio could not read which paper holds the institution's sign-in slot",
@@ -2061,10 +2067,18 @@ func checkInstitutionSignInSlot(ctx context.Context, db *store.Store, add func(s
 		if err := rows.Scan(&owner, &entitled, &waiting); err != nil {
 			continue
 		}
+		// The count is every other open institutional handoff, not only the ones
+		// behind THIS institution: a job's resolver lives inside policy_json and
+		// the profile key is a Go-side transform, so scoping it in SQL would
+		// duplicate that transform and drift from it. So the wording claims a
+		// coincidence ("also waiting") rather than causality ("waiting behind
+		// it"), which is true for one configured institution and still true for
+		// several. Scoping it properly needs the same route/profile
+		// discrimination as the RouteClass repair and lands with it.
 		add("institution_sign_in_slot", Warn,
-			fmt.Sprintf("%s holds the institution's only sign-in slot with no deadline, and %d other paper%s waiting behind it",
+			fmt.Sprintf("%s holds the institution's only sign-in slot with no deadline, and %d other paper%s also waiting for an institutional sign-in",
 				owner, waiting, plural(waiting, " is", "s are")),
-			fmt.Sprintf("run papio actions open --job %s and finish the sign-in in that tab, which releases the slot and shares the session with the papers behind it. If that tab is stranded, close it: papio releases the slot when its tab closes",
+			fmt.Sprintf("run papio actions open --job %s and finish the sign-in in that tab, which releases the slot and shares the session with the papers waiting on it. If that tab is stranded, close it: papio releases the slot when its tab closes",
 				owner))
 	}
 	if err := rows.Err(); err != nil {
