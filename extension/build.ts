@@ -168,15 +168,39 @@ async function requestExtensionReload(): Promise<void> {
 if (watching) {
   // Rebuild on source changes only; outputs (dist/, firefox/) are never watched,
   // so a rebuild cannot retrigger itself. Debounced to coalesce editor bursts.
+  // One build at a time. The 150ms debounce coalesces editor bursts, but it
+  // only clears the pending timer: once a build is running, the next change
+  // used to start a SECOND concurrent buildAll() over the same dist/ and
+  // firefox/ trees, so the outputs could interleave and --reload could then
+  // load a torn bundle. Changes arriving mid-build collapse into exactly one
+  // follow-up build, and the reload is skipped when another build is already
+  // queued, since that bundle is about to be replaced.
   let timer: Timer | undefined;
+  let building = false;
+  let queued = false;
+  const runBuild = async (): Promise<void> => {
+    if (building) {
+      queued = true;
+      return;
+    }
+    building = true;
+    try {
+      await buildAll();
+      if (reloading && !queued) await requestExtensionReload();
+    } catch (error) {
+      console.error(error);
+    } finally {
+      building = false;
+      if (queued) {
+        queued = false;
+        void runBuild();
+      }
+    }
+  };
   const schedule = (): void => {
     clearTimeout(timer);
     timer = setTimeout(() => {
-      void buildAll()
-        .then(() => {
-          if (reloading) void requestExtensionReload();
-        })
-        .catch((error) => console.error(error));
+      void runBuild();
     }, 150);
   };
   for (const target of ["src", "icons"]) {

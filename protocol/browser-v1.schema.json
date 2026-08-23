@@ -1947,6 +1947,14 @@
     {
       "if": {
         "properties": {
+          "type": { "const": "dev_reload" }
+        }
+      },
+      "then": { "not": { "required": ["job_id"] } }
+    },
+    {
+      "if": {
+        "properties": {
           "type": { "const": "effect_permit_reconcile_request" },
           "payload": {
             "properties": {

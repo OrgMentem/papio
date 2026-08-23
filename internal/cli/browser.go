@@ -128,10 +128,11 @@ func newBrowserCommand(opt *options) *cobra.Command {
 	permit.AddCommand(resolvePermit)
 	var reloadTimeout time.Duration
 	reload := &cobra.Command{
-		Use:   "reload",
-		Short: "Reload the connected development-mode extension from disk",
-		Long:  "Reload the connected development-mode extension from disk, replacing the manual chrome://extensions Reload click. It only affects an unpacked extension, because the extension refuses the command unless chrome.management.getSelf() reports installType \"development\". A new session id is the proof the new bundle is live.",
-		Args:  cobra.NoArgs,
+		Use:         "reload",
+		Short:       "Reload the connected development-mode extension from disk",
+		Long:        "Reload the connected development-mode extension from disk, replacing the manual chrome://extensions Reload click. It only affects an unpacked extension, because the extension refuses the command unless chrome.management.getSelf() reports installType \"development\". A new session id is the proof the new bundle is live.",
+		Annotations: map[string]string{"mcp:hidden": "true"},
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			var before browserSessionsResult
@@ -176,10 +177,11 @@ func newBrowserCommand(opt *options) *cobra.Command {
 					return err
 				}
 				var current string
+				live := map[string]bool{}
 				for _, s := range cur.Sessions {
+					live[s.ID] = true
 					if s.Holder {
 						current = s.ID
-						break
 					}
 				}
 				if current != "" && current != previous {
@@ -190,6 +192,17 @@ func newBrowserCommand(opt *options) *cobra.Command {
 					// read as success.
 					if known[current] {
 						return fmt.Errorf("browser session %s reloaded but the already-connected browser %s captured the papio session; the reloaded extension is pending and its papio surfaces fail closed - run `papio browser sessions` then `papio browser use <id>` to hand the session back", shortSessionID(previous), shortSessionID(current))
+					}
+					// A sibling browser whose own worker restarted inside the
+					// window also arrives as a new session id, so a new id is
+					// not by itself proof. That sibling necessarily LOST its
+					// old id, which is observable: if any session that was
+					// connected before the reload has vanished, the new holder
+					// cannot be attributed and must not read as success.
+					for id := range known {
+						if id != previous && !live[id] {
+							return fmt.Errorf("browser session %s reloaded, but browser %s reconnected during the same window, so the new holder %s cannot be attributed to the reload; run `papio browser sessions` and `papio browser use <id>` to put the session on the browser you are developing in", shortSessionID(previous), shortSessionID(id), shortSessionID(current))
+						}
 					}
 					return opt.printResult(result, "browser session %s reloaded; %s now holds the papio session", shortSessionID(previous), shortSessionID(current))
 				}

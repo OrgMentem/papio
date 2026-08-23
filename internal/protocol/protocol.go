@@ -2580,7 +2580,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			return nil, fmt.Errorf("browser message: type %q requires a valid job_id", env.Type)
 		}
 	}
-	if (env.Type == MsgInstitutionalReconcileRequest || env.Type == MsgInstitutionalReconcileResponse) && env.JobID != "" {
+	if (env.Type == MsgInstitutionalReconcileRequest || env.Type == MsgInstitutionalReconcileResponse || env.Type == MsgDevReload) && env.JobID != "" {
 		return nil, fmt.Errorf("browser message: type %q must not carry job_id", env.Type)
 	}
 

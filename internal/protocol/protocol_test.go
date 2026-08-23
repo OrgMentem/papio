@@ -3318,3 +3318,18 @@ func TestDevReloadIsNotJobScopedAndDecodesWithoutJobID(t *testing.T) {
 		t.Fatalf("type = %q, want %q", msg.Type, MsgDevReload)
 	}
 }
+
+func TestDevReloadWithJobIDRejected(t *testing.T) {
+	var frame map[string]any
+	if err := json.Unmarshal(protocolTestFrame(t, MsgDevReload, &DevReloadPayload{ReloadID: "reload_abcdefgh"}), &frame); err != nil {
+		t.Fatal(err)
+	}
+	frame["job_id"] = "job_reload_001"
+	data, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeBrowserMessage(data); err == nil {
+		t.Fatal("dev_reload with job_id was accepted")
+	}
+}

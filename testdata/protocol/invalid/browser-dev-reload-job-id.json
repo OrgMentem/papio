@@ -1,0 +1,10 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "dev_reload",
+  "msg_id": "m_dev_reload_02",
+  "seq": 10,
+  "job_id": "job_reload_001",
+  "payload": {
+    "reload_id": "reload_abcdefgh"
+  }
+}

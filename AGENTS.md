@@ -282,6 +282,21 @@ There is also a link check, because `zensical build` prints a broken link as an
   explicit `commandClassification` registry (envelope/structured/none); a
   runnable command missing from that registry fails the test, so a new
   command cannot silently skip the envelope contract.
+- **A new command joins the agent-facing MCP surface by DEFAULT, and the default is also
+  "mutating".** `internal/mcpserver/cobratree` mirrors the whole Cobra tree: a command opts
+  out with `mcp:hidden`, declares intent with `mcp:read-only`, and an **unannotated command
+  is visible and treated as mutating**, so `papio_command_search` lists it and
+  `papio_command_run` executes it. That default matters because papio's job is pulling
+  attacker-influenced text (page titles, abstracts, triage items) into an agent's context,
+  so every unannotated verb is reachable by prompt injection. `papio browser reload` shipped
+  that way and had to be hidden after review: it can terminate the extension process and
+  exists only for `make dev-deploy` and the `build.ts --reload` watcher, which invoke the CLI
+  directly and do not care about MCP. Developer plumbing (`daemon`, `init`, `mcp`,
+  `native-host`, `config`) is all hidden; copy that. The live tree is pinned by
+  `internal/mcpserver/facade_test.go`'s hidden list — **not** by `cobratree_test.go`, which
+  builds a synthetic tree and cannot see real commands. Hiding a command does NOT remove its
+  `commandClassification` entry: that registry pins `--json` shape and RPC reachability,
+  which a hidden command still has.
 - **The daemon IPC layer is fail-closed too, so nothing on the wire is additive.**
   `internal/ipc`'s `decodeStrict`/`decodeJSON` both call `DisallowUnknownFields()`, and that
   covers the `Response` **envelope**, not just method params. Adding a field to `Response`
@@ -451,10 +466,23 @@ There is also a link check, because `zensical build` prints a broken link as an
   `devReloadReservation` (10s, set when the frame goes on the wire, cleared by any hello or
   explicit `promote`) keeps the slot vacant for the browser that is coming back; the CLI
   additionally fails when an already-known session id captures the slot, because "holder
-  changed" alone was reporting that theft as success. Two invariants to preserve if you touch
-  the succession path: an ordinary disconnect with no reload latched MUST still promote a
-  sibling immediately, and the reservation MUST stay bounded, or an extension that never
-  comes back strands the bridge forever.
+  changed" alone was reporting that theft as success. Three invariants to preserve if you
+  touch this: an ordinary disconnect with no reload latched MUST still promote a sibling
+  immediately; the reservation MUST stay bounded, or an extension that never comes back
+  strands the bridge forever; and the latch MUST be dropped when its session stops holding
+  the bridge (`promote` clears it), or it fires on a later promotion and restarts a browser
+  long after its command was reported failed.
+  The reservation is keyed on **time, not identity**, and that is a known limit rather than
+  an oversight: a sibling whose own worker restarts inside the window arrives as a brand-new
+  session id too, and nothing on the wire distinguishes it from the extension coming back —
+  the reloaded extension would have to echo the `reload_id` on its `hello`, and `hello` is
+  the frame least worth breaking. The CLI closes the gap by observation instead: a sibling
+  that restarts necessarily **loses its old session id**, so a pre-reload session
+  disappearing means the new holder cannot be attributed, and the command says so rather
+  than claiming success. Note the consequence for `RequestDevReload`: it is idempotent while
+  a latch is un-emitted (the IPC server answers calls concurrently, and overwriting handed
+  the first caller a `reload_id` that was never delivered), but a request after the emit
+  mints a new one.
 - **A refused hello is never acked, so a pending browser is negotiated for nothing —
   and `session_busy` is the extension's ONLY holdership signal.** `handleHello` answers a
   denied hello with one `session_busy` error frame and no `hello_ack`, so that session has

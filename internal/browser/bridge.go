@@ -873,7 +873,11 @@ func (b *Bridge) Claim(sessionID string) (string, error) {
 }
 
 // RequestDevReload latches a one-shot dev_reload for the current holder.
-// Returns the session id it was latched for and the reload id.
+// Returns the session id it was latched for and the reload id. A latch that
+// has not been emitted yet is returned as-is rather than replaced: the IPC
+// server answers independent calls concurrently, so overwriting would hand
+// the first caller a reload_id that is never delivered, and that id is the
+// only thing making a reload auditable.
 func (b *Bridge) RequestDevReload() (sessionID string, reloadID string, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -882,6 +886,9 @@ func (b *Bridge) RequestDevReload() (sessionID string, reloadID string, err erro
 	}
 	if compareVersion(b.holder.ExtensionVersion, DevReloadMinExtensionVersion) < 0 {
 		return "", "", fmt.Errorf("browser extension v%s does not support dev_reload (needs v%s)", b.holder.ExtensionVersion, DevReloadMinExtensionVersion)
+	}
+	if b.holder.pendingDevReload != "" {
+		return b.holder.ID, b.holder.pendingDevReload, nil
 	}
 	reloadID = job.NewID("reload")
 	b.holder.pendingDevReload = reloadID
@@ -895,6 +902,11 @@ func (b *Bridge) RequestDevReload() (sessionID string, reloadID string, err erro
 func (b *Bridge) promote(session *browserSession, reason string) {
 	if b.holder != nil && b.holder.ID != session.ID {
 		b.holder.demotedNotice = true
+		// A latch is only meaningful while its session holds the bridge. Left
+		// in place it would fire whenever that session was promoted again,
+		// reloading a browser long after the command that asked for it was
+		// reported as failed.
+		b.holder.pendingDevReload = ""
 		b.pending[b.holder.ID] = b.holder
 		if capture := b.pendingCaptures[b.holder.ID]; capture != nil {
 			delete(b.pendingCaptures, b.holder.ID)

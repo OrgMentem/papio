@@ -15019,3 +15019,69 @@ func TestDevReloadExplicitClaimOverridesReservation(t *testing.T) {
 		t.Fatalf("claimed holder must receive holder hello_ack, got %+v", msgs)
 	}
 }
+
+// A latch belongs to the session it was created for. When that session stops
+// holding the bridge before the frame is emitted, the latch must be dropped:
+// left in place it fired on any later promotion, restarting a browser long
+// after the command that asked for it had been reported as failed.
+func TestDevReloadLatchDroppedWhenHolderIsDemoted(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	_ = settableClock(b)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	runSyncAs(t, b, sessB, helloAs("0.15.0"))
+	if _, _, err := b.RequestDevReload(); err != nil {
+		t.Fatalf("RequestDevReload: %v", err)
+	}
+	// Demote A before it ever polls, so the latch is still un-emitted.
+	if _, err := b.Claim(sessB); err != nil {
+		t.Fatalf("Claim(%q): %v", sessB, err)
+	}
+	// Hand the bridge back. A must not inherit the dropped latch.
+	if _, err := b.Claim(sessA); err != nil {
+		t.Fatalf("Claim(%q): %v", sessA, err)
+	}
+	msgs, _ := runSyncAs(t, b, sessA)
+	if frame := firstOfType(msgs, protocol.MsgDevReload); frame != nil {
+		t.Fatalf("re-promoted session inherited a stale latch: %+v", frame)
+	}
+}
+
+// The IPC server answers independent calls concurrently, so two dev_reload
+// requests can both land before the holder's next poll. Overwriting the first
+// would return the caller a reload_id that is never delivered, and that id is
+// the only thing making a reload auditable.
+func TestDevReloadRequestIsIdempotentUntilEmitted(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	_ = settableClock(b)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	firstSession, firstID, err := b.RequestDevReload()
+	if err != nil {
+		t.Fatalf("first RequestDevReload: %v", err)
+	}
+	secondSession, secondID, err := b.RequestDevReload()
+	if err != nil {
+		t.Fatalf("second RequestDevReload: %v", err)
+	}
+	if secondID != firstID {
+		t.Fatalf("second request minted %q, want the un-emitted %q", secondID, firstID)
+	}
+	if secondSession != firstSession {
+		t.Fatalf("second request named session %q, want %q", secondSession, firstSession)
+	}
+	msgs, _ := runSyncAs(t, b, sessA)
+	frame := firstOfType(msgs, protocol.MsgDevReload)
+	if frame == nil {
+		t.Fatalf("dev_reload not emitted, got %+v", msgs)
+	}
+	if got := frame.Payload.(*protocol.DevReloadPayload).ReloadID; got != firstID {
+		t.Fatalf("emitted reload_id %q, want the id both callers were given, %q", got, firstID)
+	}
+	// The latch is still one-shot: a third request after the emit mints a new id.
+	_, thirdID, err := b.RequestDevReload()
+	if err != nil {
+		t.Fatalf("third RequestDevReload: %v", err)
+	}
+	if thirdID == firstID {
+		t.Fatalf("request after emit reused %q; the latch must be one-shot", firstID)
+	}
+}

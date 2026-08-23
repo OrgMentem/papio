@@ -2607,7 +2607,8 @@ export function parseBrowserMessageWithLegacyInstitutionalNavigation(
   const payload = asRecord(env["payload"], "payload");
   if (
     (type === "institutional_reconcile_request" ||
-      type === "institutional_reconcile_response") &&
+      type === "institutional_reconcile_response" ||
+      type === "dev_reload") &&
     jobID !== undefined
   ) {
     fail(`type ${type} must not carry job_id`);

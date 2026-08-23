@@ -4192,3 +4192,12 @@ test("dev_reload frame with an unknown extra payload field throws", () => {
     ),
   ).toThrow(ProtocolError);
 });
+
+test("dev_reload frame with a job_id throws", () => {
+  expect(() =>
+    parseBrowserMessage({
+      ...protocolFrame("dev_reload", { reload_id: "reload-12345" }),
+      job_id: "job_reload_001",
+    }),
+  ).toThrow(ProtocolError);
+});
