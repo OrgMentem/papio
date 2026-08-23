@@ -1154,6 +1154,23 @@ Open after this round:
   Until it lands, the inbox's
   "Open link" is correct only for the two open-access rows of the 34.
 
+  **2026-08-23: this now contradicts a deliberate decision, so it needs one
+  before it needs code.** `cdffea2` moved manual-download binding to the popup
+  picker, and `Bridge.openManualDownload` records the result as intended
+  behaviour: "Plain tab open for manual-download rows: no delivery authority.
+  Inbox Open is now just a link; the picker owns binding." So "the inbox only
+  opens a link" is the current design, not an unfinished edge. The residue of
+  the older flow, the `papio.manual.open` runtime message, is still registered
+  and validated with no production sender at all — and it cannot be this RPC's
+  seam either, because it takes the URL from its caller.
+
+  The open question is not how to mint the route. It is whether a row that
+  needs an institutional route should be a `manual_download` action carrying
+  one, or an `openurl_handoff` — the action kind that already exists to put a
+  minted route in the browser, with `requestHandoffOpen` already wired to it.
+  Answer that first: the second option may need no new message at all, only a
+  daemon-side classification change.
+
 ## Sixth round (2026-08-21) — four reviewers, and the empty journal named
 
 Four adversarial reviewers audited this session's own commits. Eleven findings,
