@@ -3721,14 +3721,28 @@ export class Bridge {
   }
 
   /** Open a broker tab. Work-window tabs stay unfocused and minimized unless a
-   * directly matched adapter requires its SPA to render visibly; otherwise the
-   * legacy rule applies and `surfaceFallback` decides whether the tab takes
-   * focus. Never throws — returns undefined on failure, matching callers. */
+   * directly matched adapter needs a visible window; tab-group tabs land in the
+   * collapsed "papio" group; the fallback surface may take focus.
+   *
+   * Never throws, and — the invariant this enforces — never answers `undefined`
+   * for a tab it already reported through `onTabMaterialized`. Each branch does
+   * optional work after the tab exists (grouping, minimizing, remembering the
+   * work window), and a refusal there used to unwind past the report: the
+   * caller abandoned the drive while the tab stayed open, and the next drive
+   * epoch opened another. Measured live 2026-08-23 on the tab-group branch —
+   * Chrome refused 36 groupings in one worker session and the operator watched
+   * three tabs pile up on one paper. Enforced once here rather than in each
+   * branch, so a new surface cannot reintroduce it. */
   private async openBrokerTab(
     url: string,
     surfaceFallback: boolean,
     onTabMaterialized?: (tabID: number) => void,
   ): Promise<number | undefined> {
+    let materialized: number | undefined;
+    const report = (tabID: number): void => {
+      materialized = tabID;
+      onTabMaterialized?.(tabID);
+    };
     const surface = await this.handoffSurface();
     if (surface === "work-window") {
       let targetAdapter: AdapterSpec | undefined;
@@ -3741,41 +3755,37 @@ export class Bridge {
         // The browser will reject malformed handoff URLs through the normal path.
       }
       const opened = this.workTabChain.then(() =>
-        this.openWorkWindowTab(
-          url,
-          needsVisibleWindow(targetAdapter),
-          onTabMaterialized,
-        ),
+        this.openWorkWindowTab(url, needsVisibleWindow(targetAdapter), report),
       );
       this.workTabChain = opened.catch(() => undefined);
       try {
         return await opened;
       } catch (e) {
-        console.error("papio: work-window tab creation failed", e);
-        return undefined;
+        console.error("papio: work-window handoff incomplete", e);
+        return materialized;
       }
     }
     if (surface === "tab-group") {
       const opened = this.workTabChain.then(() =>
-        this.openTabGroupTab(url, onTabMaterialized),
+        this.openTabGroupTab(url, report),
       );
       this.workTabChain = opened.catch(() => undefined);
       try {
         return await opened;
       } catch (e) {
-        console.error("papio: tab-group creation failed", e);
-        return undefined;
+        console.error("papio: tab-group handoff incomplete", e);
+        return materialized;
       }
     }
     try {
       const tabID = (
         await this.deps.tabs.create({ url, active: surfaceFallback })
       ).id;
-      if (tabID !== undefined) onTabMaterialized?.(tabID);
+      if (tabID !== undefined) report(tabID);
       return tabID;
     } catch (e) {
       console.error("papio: tab creation failed", e);
-      return undefined;
+      return materialized;
     }
   }
 
@@ -5283,13 +5293,10 @@ export class Bridge {
     }
   }
   /** The group is papio's tab-strip tidiness and its post-restart rediscovery
-   * aid; it is NOT the drive. A refusal used to propagate out of here, and
-   * `openBrokerTab` turned it into `undefined` - so the caller believed no tab
-   * opened while this tab stayed open, already reported through
-   * `onTabMaterialized`. Every drive epoch then added one more. Measured live
-   * 2026-08-23: 36 refusals in one worker session, and the operator watching
-   * three tabs pile up on one paper whose PDF button was live the whole time.
-   * The durable identity is the daemon's SurfaceBirthRecord, not the group. */
+   * aid; it is NOT the drive, and the durable identity is the daemon's
+   * SurfaceBirthRecord. A refusal here still rejects, deliberately: the caller
+   * `openBrokerTab` owns the "never discard a reported tab" invariant, so the
+   * disposition lives in one place rather than being re-decided per surface. */
   private async openTabGroupTab(
     url: string,
     onTabMaterialized?: (tabID: number) => void,
@@ -5297,11 +5304,7 @@ export class Bridge {
     const tab = await this.deps.tabs.create({ url, active: false });
     if (tab.id === undefined) return undefined;
     onTabMaterialized?.(tab.id);
-    try {
-      await this.foldIntoHandoffGroup(tab.id, tab.windowId);
-    } catch (e) {
-      console.error("papio: handoff tab kept, grouping declined", e);
-    }
+    await this.foldIntoHandoffGroup(tab.id, tab.windowId);
     return tab.id;
   }
 
