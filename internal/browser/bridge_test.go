@@ -15173,3 +15173,32 @@ func TestProjectHandoffOfferStateInstitutionalDeliveryClearsStreak(t *testing.T)
 		t.Fatal("quiesced despite delivering the paper")
 	}
 }
+
+// parkOpenAccessHandoff parks a paper on the SAME action kind an institutional
+// handoff uses (openurl_handoff), differing only in the detail that
+// app.OABrowserHandoffURL reads. That is the live shape: the kind cannot
+// distinguish the two routes, so only the detail can.
+func parkOpenAccessHandoff(t *testing.T, jobs *job.Store, reqID string, w work.Work, url string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, reqID, w, "", "", job.Policy{
+		AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20,
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateAwaitingHuman},
+	} {
+		if err := jobs.Transition(ctx, id, step[0], step[1], map[string]any{"reason": "open_access_browser_handoff"}); err != nil {
+			t.Fatalf("%s->%s: %v", step[0], step[1], err)
+		}
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind,
+		app.OABrowserHandoffDetail+"\n"+url, job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}

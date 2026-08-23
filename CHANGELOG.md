@@ -23,6 +23,19 @@ execution records kept during the initial build.
   condition and leaves the choice to you, exactly as it does for a paper holding
   two captures. It falls silent once one of the two has finished, since a fresh
   attempt after a completed one is not a duplicate.
+- **`papio doctor` now tells you which paper is holding your library's sign-in
+  slot.** *papio* allows one institutional sign-in at a time, and a paper that
+  reaches the sign-in page with its tab still open holds that slot with no
+  deadline — deliberately, because a real person needs however long they need.
+  Nothing surfaced it, so every other paper at that library waited with no
+  explanation anywhere. Doctor now names the holder and counts the papers behind
+  it, and tells you the two ways out: finish the sign-in in that tab, which
+  shares the session with everything waiting, or close the tab, which releases
+  the slot. *papio* will not break the tie on a timer. A paper whose human is
+  genuinely working through an identity provider looks exactly like a stranded
+  one while it is happening, and cutting a live sign-in is the half of this that
+  cannot be undone. Doctor stays quiet once the sign-in has landed and is being
+  shared, and for a slot that already carries a deadline.
 - **`papio browser reload` reloads a development extension without a mouse
   click.** Working on the extension used to end with a click on Chrome's
   **Reload** button, which cannot be scripted and which reports success even
@@ -202,6 +215,31 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A rate-limited open-access paper no longer gets sent to your library.** When
+  every open-access source *papio* wanted to ask was temporarily gated — a rate
+  limit, a spend cap, a provider cooldown — it spent its retry budget on the
+  ordinary failures beside them and then treated the whole route as exhausted,
+  which opens a library sign-in. The paper was fetchable the whole time; nothing
+  had refused it, and no request had even been made. Measured on one paper: a
+  *JMIR AI* article, fully open access, took a library route and then held that
+  library's only sign-in slot for two and a half hours while 58 other papers
+  waited behind it. A pass that met only a closed gate and still has a live
+  open-access candidate now keeps waiting for the gate to open. A route that is
+  genuinely exhausted — no candidates, or a real refusal — still goes to a
+  handoff, and a gated route still cannot wait with no wake-up time.
+- **An open-access paper no longer takes your library's sign-in slot and blocks
+  every other paper behind it.** *papio* signs in to one institution at a time on
+  purpose: two logins at one library can invalidate each other's session, so
+  while one paper is signing in the rest are refused and wait. An open-access
+  paper reaches doi.org and needs no library at all, yet it was taking that slot
+  and holding it. The two were impossible to tell apart at the point it mattered,
+  because both arrive as the same kind of handoff and every route *papio* builds
+  for a browser is stamped institutional. Measured on one library: an open-access
+  ChemRxiv preprint held the slot while a waiting paper was refused about twice a
+  second, and 58 healthy papers sat behind it. An open-access handoff now stays
+  out of that arbitration entirely, and is also denied the side channel whose
+  close would end the whole library session — a paper you are only reading must
+  never be able to sign you out.
 - **One parked capture no longer hides your whole inbox.** `papio inbox` failed
   outright with `unsupported triage item kind "pdf_grab"` the moment a captured
   PDF was waiting to be identified — the very row the new picker above exists to

@@ -514,6 +514,54 @@ func TestChargedLoopSettlesAfterBudget(t *testing.T) {
 	}
 }
 
+// A gated OA candidate must remain in retry_wait after older temporary
+// retries spend the budget. It must not cross into an institutional handoff.
+func TestGatedOpenAccessRouteWaitsAfterRetryBudget(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	svc.Config.AccessMode = config.ModeAssisted
+	svc.Config.Browser.OpenURLBase = "https://resolver.example/openurl"
+	id, err := svc.Submit(ctx, cutoverRequest("cutover_gated_oa_wait", true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spendRetryBudget(t, svc, jobs, id)
+	if err := jobs.Transition(ctx, id, job.StateRetryWait, job.StateResolving,
+		map[string]any{"reason": "scheduler_dispatch"}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := svc.Now().UTC()
+	plan := retryPlan{
+		Gate:                 now.Add(-time.Minute),
+		LatestGate:           now.Add(-time.Minute),
+		ClosedSourceGates:    1,
+		OpenAccessCandidates: 1,
+	}
+	if err := svc.parkForRetry(ctx, row, job.StateResolving, plan,
+		map[string]any{"reason": "acquisition_inputs_temporarily_unavailable"},
+		job.TerminalReasonTemporarySourceFailuresDidNotClear, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateRetryWait {
+		t.Fatalf("state = %s, want retry_wait for a gated OA route", got.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("actions = %#v, want no institutional handoff", actions)
+	}
+}
+
 // The exhaustion boundary itself: with an institutional route configured and a
 // DOI to act on, a spent retry budget opens the OpenURL handoff rather than
 // settling the job.

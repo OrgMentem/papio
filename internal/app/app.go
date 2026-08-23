@@ -422,6 +422,18 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 		return nil
 	}
 	if len(live) == 0 {
+		if plan.ClosedSourceGates > 0 {
+			// A resolver can be gated before it recreates the candidate map.
+			// Preserve an existing OA row as evidence that this is a gated OA
+			// route, not an exhausted work.
+			oa, err := s.hasOpenAccessCandidate(ctx, row.ID)
+			if err != nil {
+				return err
+			}
+			if oa {
+				plan.OpenAccessCandidates = 1
+			}
+		}
 		if !plan.IsZero() {
 			return s.parkForRetry(ctx, row, job.StateResolving, plan,
 				map[string]any{"reason": "resolver_temporarily_unavailable"},
@@ -439,6 +451,19 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 		return err
 	}
 	return s.fetchCandidates(ctx, row, live, plan)
+}
+
+// hasOpenAccessCandidate reports whether this job already has a runnable OA
+// candidate row. Invalid and skipped rows are exhausted evidence, not a gate.
+func (s *Service) hasOpenAccessCandidate(ctx context.Context, jobID string) (bool, error) {
+	var found int
+	err := s.Jobs.S.DB().QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM candidates
+			WHERE job_id = ? AND access_basis = ?
+			  AND status IN ('pending', 'retryable', 'fetching')
+		)`, jobID, resolver.AccessOpen).Scan(&found)
+	return found != 0, err
 }
 
 // reuseAcceptedReview promotes the exact bytes a human accepted, rather than
@@ -1439,6 +1464,13 @@ func (s *Service) recoverOABrowserHint(ctx context.Context, jobID string, live m
 }
 
 func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan retryPlan) error {
+	// Keep this fact separate from the retry counters. A live OA candidate
+	// beside a source gate is a retryable OA route, not an exhausted work.
+	for _, candidate := range live {
+		if candidate.AccessBasis == resolver.AccessOpen {
+			plan.OpenAccessCandidates++
+		}
+	}
 	manual := false
 	manualRequiresAuth := false
 	// Candidate rows and events retain only redacted URLs. oaBrowserURL is
@@ -1723,35 +1755,36 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	return s.exhaustedCandidates(ctx, row, job.StateFetching, "candidates_exhausted", job.TerminalReasonCandidatesExhausted, oaBrowserURL)
 }
 
-// parkForRetry schedules the next attempt, or gives up. Two rules keep the
-// bounded retry budget honest:
+// parkForRetry schedules the next attempt, or gives up. A source gate alone
+// is not an exhaustion verdict: if the pass still has a live open-access
+// candidate, the existing retry path remains the destination even after older
+// temporary retries spent the bounded budget.
 //
-// A pass that only met closed source gates made no request, so it is recorded
-// as retryKindSourceGate and retryBudgetExhausted does not count it. Otherwise
-// a day-long provider gate alongside ordinary thirty-second gates spends all
-// eight attempts in minutes and settles the job with a "temporary failures did
-// not clear" reason naming a source that was never called.
-//
-// And when the budget really is spent, a pending gate buys the job exactly ONE
-// more wait, not an open-ended one. The rule exists so a source that never had
-// its one call still gets it — but a temporary failure also defers its own
-// source, so a job failing for real keeps manufacturing the very gate that
-// excuses it. Observed live at 41 temporary transitions against a bound of 8,
-// re-parking every thirty seconds indefinitely. One wait lets the gated source
-// answer; a second means the gate is being refreshed by the failures rather
-// than waited out, and the job settles.
+// This distinction records the measured JMIR AI incident on 2026-08-23:
+// DOI 10.2196/83927 held the institutional fence after 17 materialization
+// claims, 16 abandoned, while 58 healthy sibling papers waited. Its OA route
+// was gated, not exhausted.
 func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, plan retryPlan, detail map[string]any, exhaustedReason job.TerminalReason, oaBrowserURL string) error {
 	now := s.Now().UTC()
 	at := plan.At()
 	kind := plan.Kind()
 	if s.retryBudgetExhausted(ctx, row.ID) {
-		if !plan.GatePending(now) || s.alreadyWaitedPastExhaustion(ctx, row.ID) {
+		// A gated OA candidate remains retryable. Do not convert its
+		// source_gate_only observation into an institutional handoff after
+		// earlier temporary retries spent the budget.
+		gatedOA := kind == retryKindSourceGate && plan.OpenAccessCandidates > 0
+		if gatedOA {
+			// The floor below turns an elapsed or absent gate into the
+			// ordinary retry cadence, so this only has to name the gate.
+			at = plan.LatestGate
+		} else if !plan.GatePending(now) || s.alreadyWaitedPastExhaustion(ctx, row.ID) {
 			return s.exhaustedCandidates(ctx, row, from, "retry_budget_exhausted", exhaustedReason, oaBrowserURL)
+		} else {
+			// Only the gate still justifies waiting. Waking at the shorter
+			// temporary time would re-claim, find the budget still spent, and
+			// park again — a spin at the temporary interval until the gate opens.
+			at, kind = plan.LatestGate, retryKindExhaustedGate
 		}
-		// Only the gate still justifies waiting. Waking at the shorter
-		// temporary time would re-claim, find the budget still spent, and
-		// park again — a spin at the temporary interval until the gate opens.
-		at, kind = plan.LatestGate, retryKindExhaustedGate
 	}
 	if at.IsZero() || !at.After(now) {
 		// Either the gate elapsed while the rest of the pass ran, or nothing
@@ -1759,6 +1792,12 @@ func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, p
 		// time makes the scheduler re-claim instantly and spend another
 		// attempt on a wait that already happened; persisting the throttle's
 		// own sub-second time does the same thing at token-bucket speed.
+		//
+		// This floor applies to EVERY park, not just a budget-exhausted one.
+		// Folding it into the exhausted branch above left the ordinary path
+		// persisting the zero time, which parks a job in retry_wait with no
+		// retry time at all - a job that waits forever, which is strictly
+		// worse than the misrouting this function was being changed to fix.
 		at = now.Add(s.RetryDelay)
 	}
 	detail["retry_kind"] = kind
@@ -3441,8 +3480,11 @@ const (
 // failures did not clear" — a claim about a source that was never called.
 type retryPlan struct {
 	CandidateTemporary time.Time // a candidate fetch failed retryably
-	ResolverTemporary  time.Time // a resolver/sibling source failed retryably
-	Gate               time.Time // a durable source gate was closed; no request was made
+	// OpenAccessCandidates counts live OA observations this pass. It protects
+	// a gated OA route from crossing the institutional cutover boundary.
+	OpenAccessCandidates int
+	ResolverTemporary    time.Time // a resolver/sibling source failed retryably
+	Gate                 time.Time // a durable source gate was closed; no request was made
 	// LatestGate is the LATEST durable source gate observed this pass (Gate is
 	// the earliest, used for scheduling At()). When the retry budget is spent,
 	// the job gets exactly one more wait (parkForRetry, retryKindExhaustedGate)

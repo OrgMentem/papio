@@ -1865,7 +1865,7 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 		result.Outcome, result.Detail = "stale", "claim is fenced to another holder"
 		return b.frameInstitutionalBind(jobID, result)
 	}
-	_, _, eligibleNow, eligibilityErr := b.currentMaterializationEligibility(ctx, candidate)
+	_, action, eligibleNow, eligibilityErr := b.currentMaterializationEligibility(ctx, candidate)
 	if eligibilityErr != nil {
 		result.Outcome, result.Detail = "error", "handoff state is unavailable"
 		return b.frameInstitutionalBind(jobID, result)
@@ -1887,6 +1887,30 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 	}
 	if profile != nil {
 		authenticationClaimID = profile.AuthenticationClaimID
+	}
+	// An open-access handoff reaches doi.org, not the library, so it owes the
+	// institution nothing and must never arbitrate for its sign-in. Every
+	// candidate is minted institutional (prepareMaterializationCandidate's
+	// RouteClass literal - 25 of 25 store-wide) and FocusHandoffs selects on
+	// the action KIND, which is openurl_handoff for both routes, so the two
+	// were indistinguishable here and an OA paper took the fence.
+	//
+	// Measured live 2026-08-23: job_9f8bec30da97267aa9a7d89462, an open-access
+	// ChemRxiv preprint offered as oa:doi.org with requires_auth false, held a
+	// materialization claim at une.primo.exlibrisgroup.com while the daemon
+	// refused a waiting sibling roughly twice a second. actionSafetyDomain
+	// already trusts this exact predicate to answer "oa" instead of
+	// "institution"; the claim path simply never consulted it.
+	//
+	// Blanking the identity is the whole fix: arbitration, the gate occurrence,
+	// and the emitted pair are each already gated on it, and the wire calls a
+	// bind with neither field legal ("an institution with no authentication
+	// claim has neither"). It also correctly denies an OA tab the owner-binding
+	// side channel, whose close retires everyone's session.
+	if action != nil {
+		if _, openAccess := app.OABrowserHandoffURL(action.Detail); openAccess {
+			authenticationClaimID = ""
+		}
 	}
 	// The bind records this job as the entry's owner-binding (§4.1) and fails
 	// closed when that write does not fence-match, so a paper that never

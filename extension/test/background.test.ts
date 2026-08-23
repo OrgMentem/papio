@@ -346,19 +346,25 @@ class FakeTabGroups {
 
 class FakeAlarms {
   readonly onAlarm = new FakeEmitter<[{ name: string }]>();
-  readonly created: { name: string; info?: { periodInMinutes: number } }[] =
-    [];
+  readonly created: {
+    name: string;
+    info?: { periodInMinutes?: number; when?: number };
+  }[] = [];
   private readonly scheduled = new Set<string>();
-  create(name: string, info?: { periodInMinutes: number }): void {
+  create(
+    name: string,
+    info?: { periodInMinutes?: number; when?: number },
+  ): void {
     if (this.scheduled.has(name)) return;
     this.scheduled.add(name);
-    this.created.push({
-      name,
-      ...(info === undefined ? {} : { info }),
-    });
+    this.created.push({ name, ...(info === undefined ? {} : { info }) });
   }
   async get(name: string): Promise<{ name: string } | undefined> {
     return this.scheduled.has(name) ? { name } : undefined;
+  }
+  async fire(name: string): Promise<void> {
+    this.scheduled.delete(name);
+    await this.onAlarm.emit({ name });
   }
 }
 
@@ -17427,6 +17433,75 @@ test("an offline materialization revives itself when the network returns, with n
   const claim = await h.port.waitForFrame("institutional_claim_request");
   expect(claim.job_id).toBe("job_mat_revive");
 });
+test("institutional bind busy refusal backs off and wakes from its durable alarm", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "effect_permit_v1"],
+    }),
+  );
+  const jobID = "job_mat_bind_busy_backoff";
+  await h.port.inbound(candidateOffer(jobID));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_claim_response",
+    msg_id: "claim_busy_backoff_0001",
+    job_id: jobID,
+    seq: 3,
+    payload: {
+      request_id: claim.payload["request_id"],
+      outcome: "claimed",
+      candidate_id: "cand_0001",
+      claim_id: "claim_0001",
+      binding_id: "bind_0001",
+      browser_holder_generation: 1,
+      lease_until: "2030-01-01T00:00:00Z",
+    },
+  });
+  const bind = await h.port.waitForFrame("institutional_bind_request");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_bind_response",
+    msg_id: "bind_busy_backoff_0001",
+    job_id: jobID,
+    seq: 4,
+    payload: {
+      request_id: bind.payload["request_id"],
+      outcome: "not_eligible",
+      detail: "another sign-in for this institution is in progress",
+    },
+  });
+  for (let i = 0; i < 30; i += 1) await Promise.resolve();
+  const alarm = h.alarms.created.find((entry) =>
+    entry.name.startsWith("papio-institutional-bind-retry:"),
+  );
+  expect(alarm).toBeDefined();
+  expect(alarm?.info?.when).toBe(h.clock.now + 15_000);
+  const claimsBeforeRefresh = h.frames().filter(
+    (frame) => frame.type === "institutional_claim_request",
+  ).length;
+  const reoffer = candidateOffer(jobID) as {
+    msg_id: string;
+    seq: number;
+  };
+  reoffer.msg_id = "candidate_offer_busy_backoff_0002";
+  reoffer.seq = 5;
+  await h.port.inbound(reoffer);
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(
+    h.frames().filter((frame) => frame.type === "institutional_claim_request"),
+  ).toHaveLength(claimsBeforeRefresh);
+
+  const retry = h.port.waitForFrame(
+    "institutional_claim_request",
+    h.port.posted.length,
+  );
+  await h.alarms.fire(alarm!.name);
+  expect((await retry).job_id).toBe(jobID);
+});
+
 test("institutional candidate offer dispatches claim without awaiting the correlated response", async () => {
   const h = makeHarness();
   await h.bridge.start();

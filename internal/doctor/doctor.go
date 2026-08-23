@@ -105,6 +105,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	checkLegacyAdoptionRoot(ctx, cfg, db, add)
 	checkCreditSpend(ctx, cfg, db, add)
 	checkLegacyCandidateBind(ctx, db, add)
+	checkInstitutionSignInSlot(ctx, db, add)
 	if cfg.Path != "" {
 		if info, err := os.Stat(cfg.Path); err == nil {
 			if info.Mode().Perm()&0o077 != 0 {
@@ -2011,4 +2012,64 @@ func semverLess(a, b string) bool {
 		}
 	}
 	return false
+}
+
+// checkInstitutionSignInSlot names an institution whose one sign-in slot is
+// held by a paper that is not finishing it. papio serializes institutional
+// sign-ins on purpose: two concurrent logins at one library can invalidate
+// each other's session, so every sibling paper is refused with "another
+// sign-in for this institution is in progress" until the holder is done.
+//
+// A holder becomes permanent in exactly one shape. A lease reaches the human
+// window with a BOUND surface, which earns lease_until=NULL - the unbounded
+// window a real human needs (institutional_evidence.go's §4.5 rule). It is
+// released when that surface closes, or shared the moment the sign-in lands
+// and is marked entitled. A tab that stays open behind a sign-in nobody
+// completes satisfies neither, so the slot is held with no deadline.
+//
+// papio deliberately does not evict it on a timer. Measured live 2026-08-23:
+// a paper accrued 30 auth_pending and 13 auth_returned events while its drives
+// were being charged as fruitless, so a paper whose human IS bouncing through
+// the identity provider looks identical to a stranded one for as long as the
+// bouncing lasts. Releasing the slot under a live sign-in is the irreversible
+// half of this fence; leaving a stranded tab visible is the recoverable half.
+// So the operator gets the decision, with the papers that are waiting on it
+// named.
+func checkInstitutionSignInSlot(ctx context.Context, db *store.Store, add func(string, string, string, string)) {
+	if db == nil {
+		return
+	}
+	rows, err := db.DB().QueryContext(ctx, `
+		SELECT COALESCE(NULLIF(l.human_owner_id, ''), l.owner_id), COALESCE(l.entitled_at, ''),
+		       (SELECT COUNT(*) FROM human_actions a
+		         WHERE a.status = 'open' AND a.kind = 'openurl_handoff'
+		           AND a.job_id <> COALESCE(NULLIF(l.human_owner_id, ''), l.owner_id))
+		  FROM authentication_entry_leases l
+		 WHERE l.state = 'human' AND l.lease_until IS NULL
+		   AND (l.entitled_at IS NULL OR l.entitled_at = '')
+		   AND l.owner_binding_id IS NOT NULL AND l.owner_binding_id <> ''`)
+	if err != nil {
+		add("institution_sign_in_slot", Warn,
+			"papio could not read which paper holds the institution's sign-in slot",
+			"check the database is readable and run papio doctor again; until this reads cleanly papio cannot tell you whether a stalled sign-in is blocking your other papers")
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var owner, entitled string
+		var waiting int
+		if err := rows.Scan(&owner, &entitled, &waiting); err != nil {
+			continue
+		}
+		add("institution_sign_in_slot", Warn,
+			fmt.Sprintf("%s holds the institution's only sign-in slot with no deadline, and %d other paper%s waiting behind it",
+				owner, waiting, plural(waiting, " is", "s are")),
+			fmt.Sprintf("run papio actions open --job %s and finish the sign-in in that tab, which releases the slot and shares the session with the papers behind it. If that tab is stranded, close it: papio releases the slot when its tab closes",
+				owner))
+	}
+	if err := rows.Err(); err != nil {
+		add("institution_sign_in_slot", Warn,
+			"papio could not finish reading which paper holds the institution's sign-in slot",
+			"check the database is readable and run papio doctor again")
+	}
 }

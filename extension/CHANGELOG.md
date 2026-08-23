@@ -30,6 +30,19 @@ for the full pre-split extension history.
   signing in changes.
 
 ### Fixed
+- **A paper waiting for another paper's sign-in stops hammering the daemon.**
+  *papio* signs in to one institution at a time, so while one paper is signing
+  in the rest are told the slot is busy. Each of those refusals arrived on the
+  daemon's two-second poll, and *papio* answered every one by building a tab
+  scaffold and asking again — so a paper waiting behind a sign-in asked, was
+  refused, and tore its own scaffold down about thirty times a minute, for as
+  long as the sign-in took. It now backs off instead: fifteen seconds, then
+  thirty, a minute, two, four, settling at five minutes, and it wakes
+  immediately when the daemon says the institution is free. The wait is held in
+  a browser alarm rather than in *papio*'s memory, so it survives the browser
+  suspending the extension — the same lesson the stranded sign-in tab taught.
+  The refusal itself is unchanged: the scaffold is still retired at once, and
+  only a busy institution schedules the wait.
 - **A paper no longer collects one leftover tab per attempt.** When a handoff
   drive timed out, *papio* asked to close its tab while claiming the tab was an
   idle scaffold it had never navigated. That claim is false for any tab a drive

@@ -327,6 +327,13 @@ const INSTITUTIONAL_MATERIALIZATION_FEATURE =
 const MATERIALIZATION_ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/u;
 const MATERIALIZATION_RFC3339_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
+/** A bind refused because another institution sign-in owns the entry lease.
+ * The daemon re-offers on its 2s native-host poll, so this browser alarm is
+ * the pacing fence that stops each offer from rebuilding a real scaffold. */
+const INSTITUTIONAL_RETRY_ALARM_PREFIX = "papio-institutional-bind-retry:";
+const INSTITUTIONAL_RETRY_BASE_MS = 15_000;
+const INSTITUTIONAL_RETRY_MAX_MS = 5 * 60_000;
+const INSTITUTIONAL_RETRY_MAX_ATTEMPTS = 6;
 /** A lost claim/bind response is retried as the exact idempotent operation.
  * The daemon owns the durable claim; this budget bounds browser-side wakes. */
 const MATERIALIZATION_RETRY_BASE_MS = 1_000;
@@ -1363,10 +1370,12 @@ export interface BridgeDeps {
     setTitle?(details: { title: string }): Promise<void>;
   };
   /** chrome.alarms seam. An MV3 service worker sleeps after ~30s idle; a
-   * periodic alarm is the only thing that wakes it, so pending daemon offers
-   * reach an idle worker with no keepalive tab or user activity. */
+   * persistent one-shot alarm carries the bind backoff across that boundary. */
   alarms: {
-    create(name: string, info: { periodInMinutes: number }): void;
+    create(
+      name: string,
+      info: { periodInMinutes?: number; when?: number },
+    ): void;
     get?(name: string): Promise<{ name: string } | undefined>;
     onAlarm: Listenable<[{ name: string }]>;
   };
@@ -2984,6 +2993,10 @@ export class Bridge {
   private toolbarCountMode: ToolbarCountMode = "required";
   private lastBadgePaint: BadgeResult | undefined;
   private inboundChain: Promise<void> = Promise.resolve();
+  /** The durable alarm carries this backoff across MV3 worker sleep. This
+   * map only remembers the last rung while the worker remains alive; it never
+   * decides whether a retry is allowed. */
+  private readonly institutionalRetryAttempts = new Map<string, number>();
   /** One resolver per correlated native triage request. It is intentionally
    * worker-memory only; daemon state remains the authority after a restart. */
   private readonly pendingNativeRequests = new Map<
@@ -9453,6 +9466,16 @@ export class Bridge {
         ) {
           await this.removeMaterializationTab(tabID);
           await this.clearMaterializationWorkflow(jobID);
+          // Keep the refusal meaning: this scaffold is retired and the
+          // workflow is cleared. Only the next attempt moves to a durable,
+          // slow alarm instead of the daemon's 2s poll cadence.
+          if (
+            bindOutcome === "not_eligible" &&
+            bindResponse.payload["detail"] ===
+              "another sign-in for this institution is in progress"
+          ) {
+            this.scheduleInstitutionalBindRetry(jobID);
+          }
         } else {
           await this.retryMaterializationAfterResponseLoss(jobID, "bind");
         }
@@ -10181,6 +10204,11 @@ export class Bridge {
         : undefined;
     const existingJob = findByJob(this.store, jobID);
     const existing = this.materializationCorrelation(jobID);
+    // Candidate offers are the daemon's existing wake signal after an
+    // institution becomes free. While a durable retry alarm is pending, the
+    // daemon's ordinary 2s poll is only a refresh; it must not rebuild a tab.
+    const institutionalRetryPending =
+      await this.institutionalRetryAlarmPending(jobID);
     const now = this.deps.now();
     const expiresMs = Date.parse(expiresAt);
     // A re-offer of the SAME candidate refreshes the daemon's lease; it does
@@ -10247,7 +10275,8 @@ export class Bridge {
           tab_id: -1,
         },
       });
-      this.scheduleMaterialization(jobID, sameCandidateRefresh);
+      if (!institutionalRetryPending)
+        this.scheduleMaterialization(jobID, sameCandidateRefresh);
     };
     if (existing !== undefined && existing.candidate_id !== candidateID) {
       // A daemon re-offer is authoritative. Stop all browser-local work from
@@ -12534,9 +12563,77 @@ export class Bridge {
       });
     });
     this.deps.alarms.onAlarm.addListener((alarm) => {
-      if (alarm.name === KEEPALIVE_ALARM) return this.onKeepaliveAlarm();
+      if (alarm.name === KEEPALIVE_ALARM)
+        return this.onKeepaliveAlarm();
+      if (alarm.name.startsWith(INSTITUTIONAL_RETRY_ALARM_PREFIX))
+        return this.onInstitutionalRetryAlarm(alarm.name);
     });
   }
+  private institutionalRetryAlarmName(jobID: string, attempt: number): string {
+    return `${INSTITUTIONAL_RETRY_ALARM_PREFIX}${jobID}:${attempt}`;
+  }
+
+  private async institutionalRetryAlarmPending(jobID: string): Promise<boolean> {
+    const remembered = this.institutionalRetryAttempts.get(jobID);
+    if (remembered !== undefined) {
+      const name = this.institutionalRetryAlarmName(jobID, remembered);
+      if (this.deps.alarms.get === undefined) return true;
+      if ((await this.deps.alarms.get(name)) !== undefined) return true;
+    }
+    if (this.deps.alarms.get === undefined) return false;
+    for (let attempt = 1; attempt <= INSTITUTIONAL_RETRY_MAX_ATTEMPTS; attempt += 1) {
+      if (
+        (await this.deps.alarms.get(
+          this.institutionalRetryAlarmName(jobID, attempt),
+        )) !== undefined
+      )
+        return true;
+    }
+    return false;
+  }
+
+  private scheduleInstitutionalBindRetry(jobID: string): void {
+    const previous = this.institutionalRetryAttempts.get(jobID) ?? 0;
+    const attempt = Math.min(
+      INSTITUTIONAL_RETRY_MAX_ATTEMPTS,
+      previous + 1,
+    );
+    this.institutionalRetryAttempts.set(jobID, attempt);
+    const delay = Math.min(
+      INSTITUTIONAL_RETRY_MAX_MS,
+      INSTITUTIONAL_RETRY_BASE_MS * 2 ** (attempt - 1),
+    );
+    const name = this.institutionalRetryAlarmName(jobID, attempt);
+    const create = (): void => {
+      this.deps.alarms.create(name, { when: this.deps.now() + delay });
+    };
+    if (this.deps.alarms.get === undefined) {
+      create();
+      return;
+    }
+    void this.deps.alarms.get(name).then((existing) => {
+      if (existing === undefined) create();
+    });
+  }
+
+  private async onInstitutionalRetryAlarm(name: string): Promise<void> {
+    const suffix = name.slice(INSTITUTIONAL_RETRY_ALARM_PREFIX.length);
+    const separator = suffix.lastIndexOf(":");
+    if (separator <= 0) return;
+    const jobID = suffix.slice(0, separator);
+    const attempt = Number(suffix.slice(separator + 1));
+    if (
+      jobID === "" ||
+      !Number.isSafeInteger(attempt) ||
+      attempt < 1 ||
+      attempt > INSTITUTIONAL_RETRY_MAX_ATTEMPTS
+    )
+      return;
+    this.institutionalRetryAttempts.set(jobID, attempt);
+    await this.ready;
+    this.scheduleMaterialization(jobID, true);
+  }
+
 
   /** Register the MV3 keepalive alarm once. Chrome persists alarms across
    * worker termination; resetting an existing alarm on every start() is what
@@ -21788,7 +21885,13 @@ function realDeps(): BridgeDeps {
       setTitle: (details) => chrome.action.setTitle(details),
     },
     alarms: {
-      create: (name, info) => chrome.alarms?.create(name, info),
+      create: (name, info) => {
+        if (chrome.alarms !== undefined)
+          void chrome.alarms.create(
+            name,
+            info as chrome.alarms.AlarmCreateInfo,
+          );
+      },
       get: async (name) => {
         const alarm = await chrome.alarms?.get(name);
         return alarm?.name === name ? { name: alarm.name } : undefined;

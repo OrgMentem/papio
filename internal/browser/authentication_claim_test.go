@@ -1911,3 +1911,74 @@ func TestClaimObservationCloseFramesCarryNoRawMaterial(t *testing.T) {
 		}
 	}
 }
+
+// An open-access handoff reaches doi.org, not the library, so it must bind
+// while another paper is signing in. Measured live 2026-08-23:
+// job_9f8bec30da97267aa9a7d89462, an open-access ChemRxiv preprint offered as
+// oa:doi.org with requires_auth false, was refused
+// "another sign-in for this institution is in progress" roughly twice a second
+// while it held a claim at une.primo.exlibrisgroup.com. Every candidate is
+// minted institutional and FocusHandoffs selects on the action kind, which is
+// openurl_handoff for both routes, so the bind could not tell them apart.
+//
+// The bound response must also carry NO identity pair: the owner-binding side
+// channel names the surface whose close retires the institution's sign-in, and
+// an open-access reading tab must never be able to end it.
+func TestOpenAccessBindDoesNotArbitrateTheInstitution(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	ownerJob := parkInstitutional(t, jobs, "wr_oa_fence_owner", handoffWork(), "")
+	oaJob := parkOpenAccessHandoff(t, jobs, "wr_oa_fence_open", handoffWork(),
+		"https://doi.org/10.26434/chemrxiv-2025-x8h36")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auth-claim-oa-fence")
+	ownerCandidate := explicitMaterializationCandidate(t, jobs, ownerJob, "domain-oa-fence-owner")
+	oaCandidate := explicitMaterializationCandidate(t, jobs, oaJob, "domain-oa-fence-open")
+
+	runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, ownerJob,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "oa-fence-owner-consult", CandidateID: ownerCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	bindCandidate(t, b, ownerJob, ownerCandidate, "oa-fence-owner", 51)
+
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, oaJob,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "oa-fence-open-claim", CandidateID: oaCandidate,
+			MaterializationKind: "browser_tab",
+		}))
+	claimResp := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if claimResp == nil {
+		t.Fatalf("institutional_claim_response missing: %v", claimed)
+	}
+	claimPayload := claimResp.Payload.(*protocol.InstitutionalClaimResponsePayload)
+	if claimPayload.Outcome != "claimed" {
+		t.Fatalf("open-access claim outcome = %s, want claimed: %+v", claimPayload.Outcome, claimPayload)
+	}
+	bound, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalBindRequest, oaJob,
+		protocol.InstitutionalBindRequestPayload{
+			RequestID: "oa-fence-open-bind", ClaimID: claimPayload.ClaimID,
+			BindingID: claimPayload.BindingID, TabID: 52,
+		}))
+	bindResp := firstOfType(bound, protocol.MsgInstitutionalBindResponse)
+	if bindResp == nil {
+		t.Fatalf("institutional_bind_response missing: %v", bound)
+	}
+	payload := bindResp.Payload.(*protocol.InstitutionalBindResponsePayload)
+	if payload.Outcome != "bound" {
+		t.Fatalf("open-access bind outcome = %s (%q), want bound - an open-access handoff owes the library nothing",
+			payload.Outcome, payload.Detail)
+	}
+	if payload.AuthenticationClaimID != "" || payload.GateOccurrenceID != "" {
+		t.Fatalf("open-access bind carried institution identity %q/%q - its close must not retire the sign-in",
+			payload.AuthenticationClaimID, payload.GateOccurrenceID)
+	}
+	lease, ok, err := jobs.GetAuthenticationEntryLease(ctx, "auth-claim-oa-fence")
+	if err != nil || !ok {
+		t.Fatalf("entry lease after the open-access bind: ok=%v err=%v", ok, err)
+	}
+	if lease.OwnerID != ownerJob {
+		t.Fatalf("entry owner = %q, want the institutional owner %q - an open-access bind must not take the slot",
+			lease.OwnerID, ownerJob)
+	}
+}
