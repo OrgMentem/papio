@@ -1644,10 +1644,12 @@ type ActivityPageBrokerPayload = {
   new_count_since?: number;
   gap?: boolean;
 };
+/** A manual-download open carries a job id and nothing else. The route is
+ * minted by the daemon per gesture and never chosen browser-side: the page a
+ * hand-fetched paper lives on is behind the institution's sign-in, and the
+ * item's canonical link is the paywall for almost all of them. */
 interface ManualOpenPayload {
   job_id: string;
-  url: string;
-  title?: string;
 }
 
 export interface DeliveryChoice {
@@ -7610,12 +7612,18 @@ export class Bridge {
       this.wakeEffectGovernor();
     }
   }
-  /** Plain tab open for manual-download rows: no delivery authority.
-   * Inbox "Open" is now just a link; the picker owns binding. */
+
+  /** Open a hand-fetched paper on the page it actually lives on. The daemon
+   * mints the institution's route for this gesture — the same route a handoff
+   * gets — because the item's canonical link paywalls almost every one of
+   * these. No delivery authority is taken and the page is never driven: the
+   * researcher asked to fetch this one themselves. */
   async openManualDownload(
     payload: ManualOpenPayload,
   ): Promise<BrokerReply<{ opened: true }>> {
     await this.ready;
+    const minted = await this.requestFreshHandoffLink(payload.job_id);
+    if (minted.ok !== true) return minted;
     const effectToken = this.claimEffectGovernor(payload.job_id);
     if (effectToken === undefined) {
       return failure(
@@ -7624,7 +7632,7 @@ export class Bridge {
       );
     }
     try {
-      await this.deps.tabs.create({ url: payload.url, active: true });
+      await this.deps.tabs.create({ url: minted.url, active: true });
     } catch {
       return failure(
         "tab_unavailable",
@@ -20995,17 +21003,10 @@ function isSafeExternalHTTPSURL(value: unknown): value is string {
 function isManualOpenRuntimeRequest(
   value: unknown,
 ): value is ManualOpenPayload {
-  if (!isObjectRecord(value) || !hasOnlyKeys(value, ["job_id", "url", "title"]))
-    return false;
-  const title = value["title"];
   return (
-    isManualJobID(value["job_id"]) &&
-    isSafeExternalHTTPSURL(value["url"]) &&
-    (title === undefined ||
-      (typeof title === "string" &&
-        title.trim().length > 0 &&
-        title.length <= 2048 &&
-        !title.includes("\u0000")))
+    isObjectRecord(value) &&
+    hasOnlyKeys(value, ["job_id"]) &&
+    isManualJobID(value["job_id"])
   );
 }
 

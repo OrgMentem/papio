@@ -3395,16 +3395,56 @@ async function requestHandoffOpen(item: TriageSnapshotItem): Promise<void> {
   }
 }
 
+/** Open a hand-fetched paper through the institution, not at its canonical
+ * link. The daemon mints the route for this gesture; the canonical link is the
+ * fallback, and it is only correct for an open-access paper. */
 async function requestManualDownloadOpen(item: TriageSnapshotItem): Promise<void> {
-  const url = firstSafeLink(item);
-  if (url === null) {
-    openFailure(item, {
-      error: { message: "This manual download has no safe link to open." },
-    });
+  const jobID = item.job_id;
+  const fallback = firstSafeLink(item);
+  if (jobID === undefined) {
+    if (fallback === null) {
+      openFailure(item, {
+        error: { message: "This manual download has no safe link to open." },
+      });
+      return;
+    }
+    openNewTab(fallback);
+    announce("Opened the manual-download link in a new tab.");
     return;
   }
-  openNewTab(url);
-  announce("Opened the manual-download link in a new tab.");
+  if (state.pending.has(item.id)) return;
+  state.pending.add(item.id);
+  render();
+  try {
+    const response = await runtimeMessage("papio.manual.open", { job_id: jobID });
+    state.pending.delete(item.id);
+    if (isRecord(response) && response["ok"] === true && response["opened"] === true) {
+      announce("Opened the manual download through your institution.");
+      render();
+      return;
+    }
+    // The daemon could not mint a route — no institution configured for this
+    // job, or the action closed under us. The canonical link is better than
+    // nothing, and for an open-access paper it is the right page.
+    if (fallback === null) {
+      openFailure(item, response);
+      return;
+    }
+    openNewTab(fallback);
+    announce("Opened the manual-download link in a new tab.");
+    render();
+  } catch (error) {
+    state.pending.delete(item.id);
+    const message = error instanceof Error ? error.message : "The daemon is unavailable.";
+    if (fallback === null) {
+      setConnection(false, message);
+      openFailure(item, { error: { message } }, "offline");
+      return;
+    }
+    openNewTab(fallback);
+    announce("Opened the manual-download link in a new tab.");
+    render();
+  }
 }
 
 

@@ -1202,7 +1202,7 @@ test("a successful handoff retry clears the prior inline failure", async () => {
   expect(attempts).toBe(2);
 });
 
-test("manual Open is a plain tab open that binds nothing, while watch links stay direct", async () => {
+test("manual Open asks the daemon for the institution route and still binds nothing, while watch links stay direct", async () => {
   const manual = manualAction("action:manual-open", 1, "Manual link");
   manual.job_id = "job_manual_open_0001";
   manual.links = [{ rel: "landing", url: "https://example.test/manual" }];
@@ -1211,20 +1211,48 @@ test("manual Open is a plain tab open that binds nothing, while watch links stay
   const fixture = snapshot([manual, hit], {
     counts: counts({ pending_total: 2, actions: 1, watch_hits: 1, retractions: 0 }),
   });
-  const page = await inboxDocument((message) => snapshotReply(fixture, message));
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.manual.open") return { ok: true, opened: true };
+    return snapshotReply(fixture, message);
+  });
 
   page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:manual-open'] [data-operation='open']")?.click();
   await settle();
-  // The pre-pin is gone: Open no longer claims delivery authority for a job,
-  // so it sends no runtime message at all. The popup's own picker carries that
-  // intent at Send PDF time instead, where the researcher is actually looking
-  // at the PDF.
-  expect(page.requests.filter((request) => request.type === "papio.manual.open")).toEqual([]);
-  expect(page.opened).toContain("https://example.test/manual");
+  // The route is minted daemon-side per gesture: the item's own landing link is
+  // the paywall for almost every one of these. The pre-pin stays gone — Open
+  // claims no delivery authority, and the request carries a job id and nothing
+  // else, so the extension never chooses the URL.
+  expect(page.requests.filter((request) => request.type === "papio.manual.open")).toEqual([{
+    type: "papio.manual.open",
+    request: { job_id: "job_manual_open_0001" },
+  }]);
+  expect(page.opened).toEqual([]);
 
   page.document.querySelector<HTMLElement>("[data-triage-item-id='hit:open']")?.focus();
   key(page.document, "o");
-  expect(page.opened).toEqual(["https://example.test/manual", "https://doi.org/10.1234/watch"]);
+  expect(page.opened).toEqual(["https://doi.org/10.1234/watch"]);
+});
+
+test("manual Open falls back to the canonical link when the daemon cannot mint a route", async () => {
+  const manual = manualAction("action:manual-fallback", 1, "Manual link");
+  manual.job_id = "job_manual_fallback_0001";
+  manual.links = [{ rel: "landing", url: "https://example.test/manual" }];
+  manual.ops = ["open"];
+  const fixture = snapshot([manual], {
+    counts: counts({ pending_total: 1, actions: 1, watch_hits: 0, retractions: 0 }),
+  });
+  const page = await inboxDocument((message) => {
+    if (message.type === "papio.manual.open") {
+      return { ok: false, error: { code: "not_openurl", message: "The handoff has no resolver URL" } };
+    }
+    return snapshotReply(fixture, message);
+  });
+
+  page.document.querySelector<HTMLButtonElement>("[data-triage-item-id='action:manual-fallback'] [data-operation='open']")?.click();
+  await settle();
+  // No institution configured for this job is the open-access case, where the
+  // canonical link is the right page.
+  expect(page.opened).toEqual(["https://example.test/manual"]);
 });
 
 test("a conflict leaves an inline refresh result and re-requests the snapshot", async () => {

@@ -3956,7 +3956,10 @@ func (b *Bridge) handoffLink(ctx context.Context, request *protocol.HandoffLinkR
 	var authorized []json.RawMessage
 	var frameErr error
 	var frameOutcome, frameDetail, frameTarget string
-	err := b.jobs.WithOpenHandoffJob(ctx, request.JobID, func(open job.OpenHandoffJob) error {
+	// WithOpenRouteJob, not WithOpenHandoffJob: a manual download needs the
+	// same freshly minted route, and this mint is per-gesture and returns the
+	// URL to the caller rather than opening anything itself.
+	err := b.jobs.WithOpenRouteJob(ctx, request.JobID, func(open job.OpenHandoffJob) error {
 		setResult := func(outcome, detail, target string) error {
 			frameOutcome, frameDetail, frameTarget = outcome, detail, target
 			authorized, frameErr = result(outcome, detail, target)

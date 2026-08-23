@@ -9914,7 +9914,10 @@ func TestHandoffLinkRoutineOutcomesAndFreshResolution(t *testing.T) {
 				}
 			}
 		}
-		if _, err := jobs.OpenHumanAction(context.Background(), id, "manual_download", "download it yourself", job.Access(false, "")); err != nil {
+		// verify_identity, not manual_download: a manual download legitimately
+		// needs this route now, so it is no longer the wrong kind. A review
+		// action still is — there is no page to send anyone to.
+		if _, err := jobs.OpenHumanAction(context.Background(), id, "verify_identity", "review the identity", job.Access(false, "")); err != nil {
 			t.Fatal(err)
 		}
 		msgs, err := b.handoffLink(context.Background(), &protocol.HandoffLinkRequestPayload{JobID: id})
@@ -9976,6 +9979,39 @@ func TestHandoffLinkRoutineOutcomesAndFreshResolution(t *testing.T) {
 		}
 		if len(frames) != 0 {
 			t.Fatalf("handoffLink frames = %+v, want none on a self-validation failure", frames)
+		}
+	})
+
+	// A manual download reaches its page through the institution too, so the
+	// per-gesture mint must serve it. The split matters: the mint uses
+	// WithOpenRouteJob while the offer path keeps WithOpenHandoffJob, because
+	// an offer opens a tab by itself and papio must never do that for a paper
+	// it asked a human to fetch.
+	t.Run("mints for a manual download", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		ctx := context.Background()
+		id := parkManualDownload(t, jobs, "wr_handoff_manual_mint", handoffWork())
+		frames, err := b.handoffLink(ctx, &protocol.HandoffLinkRequestPayload{
+			RequestID: "request-manual-mint-001", JobID: id,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg, err := protocol.DecodeBrowserMessage(frames[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := msg.Payload.(*protocol.HandoffLinkResultPayload)
+		if payload.Outcome != "opened" || payload.URL == "" {
+			t.Fatalf("manual download mint = %+v, want opened with a URL", payload)
+		}
+		// The offer-path accessor must still refuse it, or the kind would enter
+		// automatic offering and papio would open tabs on its own.
+		if err := jobs.WithOpenHandoffJob(ctx, id, func(job.OpenHandoffJob) error {
+			t.Fatal("WithOpenHandoffJob accepted a manual download; the offer path would now open tabs for it")
+			return nil
+		}); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("WithOpenHandoffJob error = %v, want sql.ErrNoRows", err)
 		}
 	})
 }

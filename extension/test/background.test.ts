@@ -13327,11 +13327,12 @@ test("per-origin sign-in falls back to a managed tab when the manager declines",
 // The volatile one-shot DeliveryChoice nonce (interaction + candidates) supersedes it.
 // These tests cover the new mechanism: needs_choice offer, one-shot consumption,
 // page-identity revalidation, tab-close destruction, SW-surviving waiting_manual
-// continuation, and the remaining inbox Open (now a plain tab open with no pin).
+// continuation, and the inbox Open that now mints its route daemon-side.
 
-test("inbox Open is now a plain tab open with no pin side-effect", async () => {
+test("inbox Open mints the institution route daemon-side and still binds nothing", async () => {
   const h = makeHarness();
   await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
   const urls = {
     runtimeID: "papio-test-id",
     inboxURL: "chrome-extension://papio-test-id/inbox.html",
@@ -13340,25 +13341,74 @@ test("inbox Open is now a plain tab open with no pin side-effect", async () => {
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
-  const landingURL = "https://link.springer.com/article/10.1007/BF03392100";
+  const routeURL = "https://resolver.example.edu/openurl?rft_id=10.1007/BF03392100";
   const jobID = "job_open_plain_new_0001";
-  await ((h.bridge as unknown as { update: (fn: (s: unknown)=>unknown)=>Promise<void> }).update)((st: unknown)=>{
+  // The harness bridge exposes `update` for seeding; the public type does not
+  // declare it, and there is nothing to validate at an in-process test seam.
+  const seed = h.bridge as unknown as { update: (fn: (s: unknown) => unknown) => Promise<void> };
+  await seed.update((st: unknown)=>{
     const store = st as StoreShape;
     return { ...store, activeJobs: [{ job_id: jobID, tab_id: -1, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000, status: "awaiting_download" as const, provider_hosts: ["link.springer.com"] }] };
   });
-  const opened = await handleInboxRuntimeMessage(
+  const opening = handleInboxRuntimeMessage(
     h.bridge,
-    { type: "papio.manual.open", request: { job_id: jobID, url: landingURL } },
+    { type: "papio.manual.open", request: { job_id: jobID } },
     { id: urls.runtimeID, url: urls.inboxURL },
     urls,
   );
-  expect(opened).toEqual({ ok: true, opened: true });
-  expect(h.tabs.created).toEqual([{ url: landingURL, active: true }]);
-  expect((findByJob(h.backend.store, jobID) as unknown as Record<string, unknown>)?.["manual_delivery_target"]).toBeUndefined();
+  // The request carries a job id and nothing else; the URL is the daemon's.
+  const request = await h.port.waitForFrame("handoff_link_request");
+  expect(request.payload["job_id"]).toBe(jobID);
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "opened",
+      url: routeURL,
+    }),
+  );
+  await expect(opening).resolves.toEqual({ ok: true, opened: true });
+  expect(h.tabs.created).toEqual([{ url: routeURL, active: true }]);
+  // Still no delivery authority and no owned tab: the researcher fetches this
+  // one, and the popup picker carries the intent at Send PDF time.
+  const seeded = findByJob(h.backend.store, jobID);
+  expect(seeded !== undefined && "manual_delivery_target" in seeded).toBe(false);
   expect(findByJob(h.backend.store, jobID)?.tab_id).toBe(-1);
 });
 
-test("inbox Open remains inbox-only and HTTPS-only", async () => {
+test("inbox Open surfaces a refusal when the daemon cannot mint a route", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  const urls = {
+    runtimeID: "papio-test-id",
+    inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html",
+    historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html",
+    pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+  };
+  const jobID = "job_open_no_route_0001";
+  const opening = handleInboxRuntimeMessage(
+    h.bridge,
+    { type: "papio.manual.open", request: { job_id: jobID } },
+    { id: urls.runtimeID, url: urls.inboxURL },
+    urls,
+  );
+  const request = await h.port.waitForFrame("handoff_link_request");
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "not_openurl",
+      detail: "no usable handoff URL is configured for this job",
+    }),
+  );
+  await expect(opening).resolves.toMatchObject({ ok: false, error: { code: "not_openurl" } });
+  // No tab on a refusal: the inbox decides whether its canonical link is a
+  // reasonable fallback, and the broker never guesses one.
+  expect(h.tabs.created).toEqual([]);
+});
+
+test("inbox Open remains inbox-only and takes a job id alone", async () => {
   const h = makeHarness();
   await h.bridge.start();
   const urls = {
@@ -13369,16 +13419,15 @@ test("inbox Open remains inbox-only and HTTPS-only", async () => {
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
   };
-  const request = (jobID: string, url = "https://publisher.example.edu/article") => ({
-    type: "papio.manual.open",
-    request: { job_id: jobID, url, title: "Paper" },
-  });
   await expect(
-    handleInboxRuntimeMessage(h.bridge, request("job_manual_popup_forbidden"), { id: urls.runtimeID, url: urls.popupURL }, urls),
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.manual.open", request: { job_id: "job_manual_popup_forbidden" } }, { id: urls.runtimeID, url: urls.popupURL }, urls),
   ).resolves.toMatchObject({ ok: false, error: { code: "unauthorized" } });
+  // A caller-supplied URL is the shape this used to accept. It must be
+  // rejected now: the extension does not choose where a hand-fetch lands.
   await expect(
-    handleInboxRuntimeMessage(h.bridge, request("job_manual_http_forbidden", "http://publisher.example.edu/article"), { id: urls.runtimeID, url: urls.inboxURL }, urls),
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.manual.open", request: { job_id: "job_manual_url_forbidden", url: "https://publisher.example.edu/article" } }, { id: urls.runtimeID, url: urls.inboxURL }, urls),
   ).resolves.toMatchObject({ ok: false, error: { code: "invalid_request" } });
+  expect(h.tabs.created).toEqual([]);
 });
 
 function awaitingJob(jobID: string, offeredAt: number, title?: string): ActiveJob {

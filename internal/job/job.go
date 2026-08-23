@@ -3427,12 +3427,26 @@ func (js *Store) ListOpenHandoffJobsPage(ctx context.Context, limit int) ([]Open
 // and action resolution cannot interleave between the conditional read and
 // the caller constructing its response.
 func (js *Store) WithOpenHandoffJob(ctx context.Context, jobID string, fn func(OpenHandoffJob) error) error {
+	return js.withOpenActionJob(ctx, jobID, fn)
+}
+
+// WithOpenRouteJob is WithOpenHandoffJob widened to the kinds that legitimately
+// need a freshly minted institution route. A manual download is one: papio
+// asked the human to fetch the file, and the page it lives on is behind the
+// institution's sign-in, so the route is the same one a handoff gets. It is
+// deliberately NOT the accessor the offer path uses — an offer opens a tab by
+// itself, and papio must never do that for a paper it asked a human to fetch.
+func (js *Store) WithOpenRouteJob(ctx context.Context, jobID string, fn func(OpenHandoffJob) error) error {
+	return js.withOpenActionJob(ctx, jobID, fn, "openurl_handoff", "manual_download")
+}
+
+func (js *Store) withOpenActionJob(ctx context.Context, jobID string, fn func(OpenHandoffJob) error, kinds ...string) error {
 	tx, err := js.S.DB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, _, err := js.queryOpenHandoffJobs(ctx, tx, jobID, 1, false)
+	rows, _, err := js.queryOpenHandoffJobs(ctx, tx, jobID, 1, false, kinds...)
 	if err != nil {
 		return err
 	}
@@ -3453,7 +3467,7 @@ func (js *Store) listOpenHandoffJobs(ctx context.Context, jobID string, limit in
 	return js.queryOpenHandoffJobs(ctx, js.S.DB(), jobID, limit, probe)
 }
 
-func (js *Store) queryOpenHandoffJobs(ctx context.Context, queryer handoffQueryer, jobID string, limit int, probe bool) ([]OpenHandoffJob, bool, error) {
+func (js *Store) queryOpenHandoffJobs(ctx context.Context, queryer handoffQueryer, jobID string, limit int, probe bool, kinds ...string) ([]OpenHandoffJob, bool, error) {
 	fetch := limit
 	if probe && limit > 0 {
 		fetch++
@@ -3475,8 +3489,24 @@ func (js *Store) queryOpenHandoffJobs(ctx context.Context, queryer handoffQuerye
 		FROM human_actions ha
 		JOIN jobs j ON j.id = ha.job_id
 		JOIN work_requests w ON w.id = j.work_request_id
-		WHERE ha.status = 'open' AND ha.kind = 'openurl_handoff' AND j.state = 'awaiting_human'`
+		WHERE ha.status = 'open' AND j.state = 'awaiting_human'`
 	var args []any
+	// Auto-offer callers pass openurl_handoff alone. Only the fresh-link mint
+	// widens this: a manual download needs the same institution route, and
+	// letting it into the offer path instead would have papio opening tabs for
+	// papers it explicitly asked a human to fetch.
+	switch len(kinds) {
+	case 0:
+		query += ` AND ha.kind = 'openurl_handoff'`
+	case 1:
+		query += ` AND ha.kind = ?`
+		args = append(args, kinds[0])
+	default:
+		query += ` AND ha.kind IN (?` + strings.Repeat(",?", len(kinds)-1) + `)`
+		for _, kind := range kinds {
+			args = append(args, kind)
+		}
+	}
 	if jobID != "" {
 		query += ` AND j.id = ?`
 		args = append(args, jobID)
