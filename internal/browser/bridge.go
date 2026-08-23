@@ -2247,10 +2247,17 @@ func (b *Bridge) institutionalReconcile(ctx context.Context, p *protocol.Institu
 func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseRequestPayload) ([]json.RawMessage, error) {
 	requestID := ""
 	bindingID := ""
+	disposition := ""
 	if p != nil {
 		requestID = p.RequestID
 		bindingID = p.BindingID
+		disposition = p.Disposition
 	}
+	// The phase the refusal was measured against. Set once the claim is read,
+	// because "disposition does not match the binding's current phase" is
+	// unreadable without both halves: fifteen refused closes were logged that
+	// way and none of them named which disposition lost, or to what.
+	phase := ""
 	result := protocol.SurfaceCloseResponsePayload{RequestID: requestID}
 	frame := func() ([]json.RawMessage, error) {
 		// A close papio declines is the one event in this subsystem with no
@@ -2260,8 +2267,8 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 		// up in the operator's browser. Log every non-authorization with its
 		// reason - opaque binding id only, no URL, no title.
 		if result.Outcome != "authorized" {
-			log.Printf("papio: surface close %s for binding %s: %s",
-				result.Outcome, bindingID, result.Detail)
+			log.Printf("papio: surface close %s for binding %s: disposition %q, claim phase %q: %s",
+				result.Outcome, bindingID, disposition, phase, result.Detail)
 		}
 		f, err := b.frame(protocol.MsgSurfaceCloseResponse, "", result)
 		if err != nil {
@@ -2292,6 +2299,7 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 		result.Outcome, result.Detail = "unclaimed", "binding has no live materialization claim"
 		return frame()
 	}
+	phase = claim.Phase
 	if p.BrowserHolderGeneration != b.epoch {
 		result.Outcome, result.Detail = "stale", "browser holder generation is not current"
 		return frame()
@@ -2333,6 +2341,27 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 				return frame()
 			}
 			eligible = permit == nil || permit.ClaimID != claim.ID
+		}
+	case "surface_superseded":
+		// The one disposition the daemon can settle without reasoning about the
+		// job at all: the browser names a tab, and papio compares it to the tab
+		// it believes drives this claim. A different tab is provably not the
+		// drive, in any phase, so retiring it cannot interrupt anything papio
+		// has a stake in - which is why no permit check follows. The same tab is
+		// refused outright: that IS the drive, and the browser asking to close
+		// it means the two sides disagree about which surface is live.
+		//
+		// This exists because a duplicate could previously only be retired by
+		// asserting scaffold_idle, a binding-wide claim that a navigated claim
+		// structurally fails. The operator's browser accumulated three tabs on
+		// one paper that way (measured live 2026-08-22).
+		switch {
+		case p.SurfaceTabID == nil:
+			result.Detail = "surface_superseded requires the superseded tab"
+		case *p.SurfaceTabID == claim.TabID:
+			result.Detail = "the named surface is the binding's driven tab"
+		default:
+			eligible = true
 		}
 	case "job_inactive":
 		// A navigated surface is not closable merely because it looks old.

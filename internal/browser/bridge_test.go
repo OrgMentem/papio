@@ -14644,3 +14644,66 @@ func TestSuppressedCancelDoesNotAuthorizeRetirement(t *testing.T) {
 		t.Fatalf("a claim whose browser was never told must not be retired, got %+v", held)
 	}
 }
+
+// A binding can own several tabs, and before surface_superseded a duplicate
+// could only be retired by asserting scaffold_idle - a binding-wide claim that
+// any navigated claim structurally fails. So every duplicate survived, and the
+// operator's browser accumulated three tabs on one paper (measured live
+// 2026-08-22). The daemon does not take the browser's word: it authorizes only
+// after comparing the named tab to the tab it believes drives the claim.
+func TestSurfaceCloseSupersededAuthorizesOnlyANonDrivingTab(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		phase       string
+		tabOffset   int64
+		omitTab     bool
+		wantOutcome string
+		wantDetail  string
+	}{
+		{name: "duplicate of a navigated claim", phase: "navigated", tabOffset: 1, wantOutcome: "authorized"},
+		{name: "duplicate of a bound claim", phase: "bound", tabOffset: 7, wantOutcome: "authorized"},
+		{name: "the driving tab itself", phase: "navigated", tabOffset: 0,
+			wantOutcome: "not_eligible", wantDetail: "the named surface is the binding's driven tab"},
+		{name: "no tab named", phase: "navigated", omitTab: true,
+			wantOutcome: "not_eligible", wantDetail: "surface_superseded requires the superseded tab"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			ctx := context.Background()
+			runSync(t, b, materializationHello(t))
+			claim := seedSurfaceCloseClaim(t, b, jobs, "close-superseded", tc.phase)
+
+			req := &protocol.SurfaceCloseRequestPayload{
+				RequestID: "req-close-superseded", BindingID: claim.BindingID,
+				BrowserHolderGeneration: b.epoch, Disposition: "surface_superseded",
+			}
+			if !tc.omitTab {
+				tab := claim.TabID + tc.tabOffset
+				req.SurfaceTabID = &tab
+			}
+			frames, err := b.surfaceClose(ctx, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := decodeSurfaceCloseResponse(t, frames)
+			if got.Outcome != tc.wantOutcome {
+				t.Fatalf("outcome = %q (detail %q), want %q", got.Outcome, got.Detail, tc.wantOutcome)
+			}
+			if tc.wantDetail != "" && got.Detail != tc.wantDetail {
+				t.Fatalf("detail = %q, want %q", got.Detail, tc.wantDetail)
+			}
+			if tc.wantOutcome != "authorized" {
+				return
+			}
+			var disposition string
+			if err := jobs.S.DB().QueryRowContext(ctx,
+				`SELECT disposition FROM close_authorizations WHERE id=?`,
+				got.CloseAuthorizationID).Scan(&disposition); err != nil {
+				t.Fatal(err)
+			}
+			if disposition != "surface_superseded" {
+				t.Fatalf("stored disposition = %q, want surface_superseded", disposition)
+			}
+		})
+	}
+}

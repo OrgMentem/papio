@@ -1136,6 +1136,15 @@ type SurfaceCloseRequestPayload struct {
 	BrowserHolderGeneration int64  `json:"browser_holder_generation"`
 	Disposition             string `json:"disposition"`
 	GateOccurrenceID        string `json:"gate_occurrence_id,omitempty"`
+	// SurfaceTabID names WHICH surface this close is about. Every other field
+	// here is binding-scoped, and a binding can own several tabs: a duplicate
+	// scaffold, a restored window, a second drive. Without it the daemon can
+	// only reason about the binding, so it could never tell the tab it believes
+	// drives a claim from a redundant sibling - and answered "scaffold_idle"
+	// with a phase refusal for both. Required by surface_superseded, which is
+	// exactly the assertion that needs it; a pointer so tab id 0 is absent
+	// rather than zero.
+	SurfaceTabID *int64 `json:"surface_tab_id,omitempty"`
 }
 
 // SurfaceCloseResponsePayload reports the daemon's close-authorization
@@ -3195,6 +3204,11 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		}
 		if err == nil && p.Disposition != "claim_abandoned" {
 			err = institutionalRejectPresence(payloadFields, "surface_close_request", "gate_occurrence_id")
+		}
+		// A surface-scoped field on a binding-scoped assertion is a sender that
+		// means something papio cannot verify: reject it rather than ignore it.
+		if err == nil && p.Disposition != "surface_superseded" {
+			err = institutionalRejectPresence(payloadFields, "surface_close_request", "surface_tab_id")
 		}
 		msg.Payload = p
 	case MsgSurfaceCloseResponse:
@@ -5535,10 +5549,27 @@ func (p *SurfaceCloseRequestPayload) validate() error {
 	// (the job is very much active), so a parked ask used to immortalize its
 	// tab: refused as "the binding still has an active browser handoff" on
 	// every reconcile pass, forever. Measured live 2026-08-21.
+	//
+	// surface_superseded: this binding owns more than one tab and THIS one is
+	// not the tab the browser drives. Every other disposition is a claim about
+	// the binding, so a duplicate could only be retired by asserting something
+	// false about the whole binding - scaffold_idle, which a navigated claim
+	// structurally fails. That is why an operator ended up with three tabs open
+	// on one paper (measured live 2026-08-22). The browser's word is not enough
+	// here: the daemon authorizes only after checking the named tab against the
+	// tab it believes drives the claim, so surface_tab_id is required.
 	if err := enumRequired("surface_close_request.disposition", p.Disposition,
 		"scaffold_idle", "materialization_settled", "claim_abandoned", "job_inactive",
-		"handoff_parked"); err != nil {
+		"handoff_parked", "surface_superseded"); err != nil {
 		return err
+	}
+	if p.Disposition == "surface_superseded" {
+		if p.SurfaceTabID == nil {
+			return fmt.Errorf("surface_close_request.surface_superseded requires surface_tab_id")
+		}
+		if *p.SurfaceTabID < 0 {
+			return fmt.Errorf("surface_close_request.surface_tab_id must not be negative")
+		}
 	}
 	if p.Disposition == "claim_abandoned" {
 		if p.GateOccurrenceID != "" {

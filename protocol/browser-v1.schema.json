@@ -6264,12 +6264,17 @@
                   "scaffold_idle",
                   "materialization_settled",
                   "claim_abandoned",
-                  "job_inactive", "handoff_parked"
+                  "job_inactive", "handoff_parked", "surface_superseded"
                 ]
               },
               "gate_occurrence_id": {
                 "type": "string",
                 "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "surface_tab_id": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               }
             },
             "allOf": [
@@ -6283,6 +6288,16 @@
                   }
                 },
                 "then": { "not": { "required": ["gate_occurrence_id"] } }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "disposition": { "const": "surface_superseded" }
+                  },
+                  "required": ["disposition"]
+                },
+                "then": { "required": ["surface_tab_id"] },
+                "else": { "not": { "required": ["surface_tab_id"] } }
               }
             ]
           }

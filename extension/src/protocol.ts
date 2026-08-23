@@ -1225,9 +1225,18 @@ export interface SurfaceCloseRequestPayload {
     | "scaffold_idle"
     | "materialization_settled"
     | "claim_abandoned"
-    | "job_inactive";
+    | "job_inactive"
+    /** The browser has parked this handoff and drives nothing through the
+     * surface, while the job stays officially open. */
+    | "handoff_parked"
+    /** This binding owns more than one tab and this one is not the tab the
+     * browser drives. The daemon verifies that itself against the claim's tab,
+     * so surface_tab_id is required here and forbidden everywhere else. */
+    | "surface_superseded";
   /** Permitted only when disposition is claim_abandoned. */
   gate_occurrence_id?: string;
+  /** Required by, and only by, surface_superseded. */
+  surface_tab_id?: number;
 }
 export interface SurfaceCloseResponsePayload {
   request_id: string;
@@ -6175,6 +6184,7 @@ function validatePayload(
         browser_holder_generation: "required",
         disposition: "required",
         gate_occurrence_id: "optional",
+        surface_tab_id: "optional",
       });
       institutionalID(p, "request_id", type);
       institutionalID(p, "binding_id", type);
@@ -6185,13 +6195,21 @@ function validatePayload(
         disposition !== "materialization_settled" &&
         disposition !== "claim_abandoned" &&
         disposition !== "job_inactive" &&
-        disposition !== "handoff_parked"
+        disposition !== "handoff_parked" &&
+        disposition !== "surface_superseded"
       )
         fail(`${type}.disposition is invalid`);
       if (disposition !== "claim_abandoned") {
         forbiddenUnlessEmpty(p, "gate_occurrence_id", type);
       } else if ("gate_occurrence_id" in p && p["gate_occurrence_id"] !== "") {
         institutionalID(p, "gate_occurrence_id", type);
+      }
+      // Surface-scoped field, binding-scoped siblings: it is meaningful only
+      // for the one disposition the daemon verifies against a tab.
+      if (disposition === "surface_superseded") {
+        int(p, "surface_tab_id", type, 0);
+      } else if ("surface_tab_id" in p) {
+        fail(`${type}.${disposition} forbids surface_tab_id`);
       }
       break;
     }

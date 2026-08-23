@@ -3195,3 +3195,60 @@ func TestInstitutionalBindResponseCarriesClaimIdentityAsAPair(t *testing.T) {
 		}), "a refusal carrying the identity pair")
 	})
 }
+
+// surface_tab_id is the first surface-scoped field on a message whose every
+// other field is binding-scoped, so its presence is a promise about which
+// disposition is being asserted. Both directions are fail-closed: the one
+// disposition that needs it cannot omit it, and no other disposition may carry
+// it - a sender that does means something papio cannot verify.
+func TestSurfaceCloseSupersededRequiresItsTab(t *testing.T) {
+	frame := func(disposition string, extra string) []byte {
+		t.Helper()
+		payload := `{"request_id":"req-superseded-1","binding_id":"binding-superseded-1",` +
+			`"browser_holder_generation":3,"disposition":"` + disposition + `"` + extra + `}`
+		data, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     MsgSurfaceCloseRequest,
+			"msg_id":   "ext-superseded-001",
+			"seq":      1,
+			"payload":  json.RawMessage(payload),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	for _, tc := range []struct {
+		name    string
+		raw     []byte
+		wantErr string
+	}{
+		{name: "superseded with a tab decodes", raw: frame("surface_superseded", `,"surface_tab_id":41`)},
+		{name: "superseded without a tab is refused", raw: frame("surface_superseded", ""),
+			wantErr: "surface_close_request.surface_superseded requires surface_tab_id"},
+		{name: "another disposition may not carry a tab", raw: frame("handoff_parked", `,"surface_tab_id":41`),
+			wantErr: "surface_tab_id"},
+		{name: "a negative tab is refused", raw: frame("surface_superseded", `,"surface_tab_id":-1`),
+			wantErr: "surface_close_request.surface_tab_id must not be negative"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, err := DecodeBrowserMessage(tc.raw)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("decode error = %v, want containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, ok := msg.Payload.(*SurfaceCloseRequestPayload)
+			if !ok {
+				t.Fatalf("payload type = %T", msg.Payload)
+			}
+			if p.SurfaceTabID == nil || *p.SurfaceTabID != 41 {
+				t.Fatalf("surface_tab_id = %v, want 41", p.SurfaceTabID)
+			}
+		})
+	}
+}

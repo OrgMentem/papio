@@ -21138,3 +21138,106 @@ test("a challenge still on the page reports no clear", async () => {
       .some((frame) => frame.type === "challenge_cleared"),
   ).toBe(false);
 });
+
+test("a superseded duplicate names its own tab so the daemon can verify it is not the drive", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const closing = closeInternals(h).closeOwnedSurface(
+    tabID,
+    "surface_superseded",
+  );
+  const request = await h.port.waitForFrame("surface_close_request");
+  expect(request.payload["binding_id"]).toBe(bindingID);
+  expect(request.payload["disposition"]).toBe("surface_superseded");
+  // Every sibling field is binding-scoped and a binding can own several tabs,
+  // so without this the daemon cannot tell a duplicate from the driven tab -
+  // and refused both as a phase mismatch, stranding the duplicates.
+  expect(request.payload["surface_tab_id"]).toBe(tabID);
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-superseded-1",
+      nonce: "nonce-superseded-1",
+      browser_holder_generation: 1,
+    }),
+  );
+  await expect(closing).resolves.toEqual({ closed: true });
+  expect(h.tabs.removed).toContain(tabID);
+});
+
+test("a binding-scoped disposition never carries a surface tab", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const { tabID } = await seedOwnedScaffold(h);
+  void closeInternals(h).closeOwnedSurface(tabID, "handoff_parked");
+  const request = await h.port.waitForFrame("surface_close_request");
+  expect(request.payload["disposition"]).toBe("handoff_parked");
+  // The daemon rejects the whole frame when a binding-scoped assertion carries
+  // a surface-scoped field, so sending one would be fatal, not merely noisy.
+  expect("surface_tab_id" in request.payload).toBe(false);
+});
+
+// The opening defect of this work, measured live 2026-08-22: an operator with
+// three tabs open on one paper. Both duplicates were positively owned, so both
+// were asked to close - as scaffold_idle, which asserts a claim phase of
+// claimed/bound and which the daemon structurally refuses once the claim has
+// navigated. The duplicates therefore outlived every reconcile pass. The fact
+// reconciliation can actually assert is surface-scoped: papio drives another
+// tab for this binding, not this one.
+test("reconciliation retires a positively owned duplicate as superseded, naming the tab", async () => {
+  const jobID = "job_scenario_duplicate_superseded";
+  const candidateID = "cand_superseded_0001";
+  const bindingID = "bind_superseded_0001";
+  const claimID = "claim_superseded_0001";
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["institutional_materialization_v1", "surface_close_v1"],
+    }),
+  );
+  const scaffoldURL = `chrome-extension://test/dist/materialize.html#${bindingID}`;
+  const keptTab = await h.tabs.create({ url: scaffoldURL, active: false });
+  const duplicateTab = await h.tabs.create({
+    url: scaffoldURL,
+    active: false,
+  });
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    browserEpoch: string | undefined;
+  };
+  const epoch = internals.browserEpoch ?? "test-epoch";
+  // Both are papio's own, under this exact binding and epoch: the duplicate is
+  // eligible for retirement rather than merely retained.
+  internals.tabLedgerCache = {
+    ...internals.tabLedgerCache,
+    [String(keptTab.id)]: fakeBirthRecord({
+      binding_id: bindingID,
+      tab_hint: keptTab.id!,
+      browser_epoch: epoch,
+    }),
+    [String(duplicateTab.id)]: fakeBirthRecord({
+      binding_id: bindingID,
+      tab_hint: duplicateTab.id!,
+      browser_epoch: epoch,
+    }),
+  };
+
+  await h.port.inbound(candidateOffer(jobID, candidateID));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  const claimResponsePayload = institutionalClaimResponse(
+    jobID,
+    candidateID,
+    claimID,
+    bindingID,
+  ) as { payload: Record<string, unknown> };
+  claimResponsePayload.payload["request_id"] = claim.payload["request_id"];
+  await h.port.inbound(claimResponsePayload);
+  const close = await h.port.waitForFrame("surface_close_request");
+  expect(close.payload["binding_id"]).toBe(bindingID);
+  expect(close.payload["disposition"]).toBe("surface_superseded");
+  expect(close.payload["surface_tab_id"]).toBe(duplicateTab.id);
+});

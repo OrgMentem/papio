@@ -896,7 +896,14 @@ export type SurfaceCloseDisposition =
    * operator for something - but this browser has parked it and drives
    * nothing through this surface. Distinct from job_inactive, which asserts
    * the opposite about the job and is refused for a parked ask. */
-  | "handoff_parked";
+  | "handoff_parked"
+  /** This binding owns more than one tab and this is not the one papio
+   * drives. Every other disposition speaks about the binding, so a duplicate
+   * could only be retired by asserting scaffold_idle - which a navigated
+   * claim structurally fails - and the duplicates therefore survived. The
+   * daemon does not take this on trust: it compares the named tab against
+   * the tab it believes drives the claim, so the id travels with it. */
+  | "surface_superseded";
 function isSurfaceCloseDisposition(
   value: string | undefined,
 ): value is SurfaceCloseDisposition {
@@ -910,7 +917,8 @@ function isSurfaceCloseDisposition(
     // disposition a navigated claim can never satisfy. A worker death between
     // tombstone persistence and tabs.remove therefore converted the correct
     // close into a permanently refused one.
-    value === "handoff_parked"
+    value === "handoff_parked" ||
+    value === "surface_superseded"
   );
 }
 export interface OpenManagedTabOptions {
@@ -4921,6 +4929,11 @@ export class Bridge {
     bindingID: string,
     disposition: SurfaceCloseDisposition,
     gateOccurrenceID: string | undefined,
+    // Only surface_superseded names a tab, and it must: it is the one
+    // disposition the daemon settles by comparing this surface to the tab it
+    // believes drives the claim. The owner_closed counterpart has no tab left
+    // to name and never asserts it.
+    surfaceTabID?: number,
   ): Promise<
     | {
         authorized: true;
@@ -4932,6 +4945,8 @@ export class Bridge {
   > {
     const generation = this.lastKnownBrowserHolderGeneration;
     if (generation === undefined) return { authorized: false };
+    if (disposition === "surface_superseded" && surfaceTabID === undefined)
+      return { authorized: false };
     const result = await this.requestNative(
       "surface_close_request",
       {
@@ -4940,6 +4955,9 @@ export class Bridge {
         disposition,
         ...(disposition === "claim_abandoned" && gateOccurrenceID !== undefined
           ? { gate_occurrence_id: gateOccurrenceID }
+          : {}),
+        ...(disposition === "surface_superseded" && surfaceTabID !== undefined
+          ? { surface_tab_id: surfaceTabID }
           : {}),
       },
       "surface_close_response",
@@ -4983,6 +5001,7 @@ export class Bridge {
       record.binding_id,
       disposition,
       gateOccurrenceID,
+      tabID,
     );
     if (!authorization.authorized) {
       // A binding the daemon has no claim on is an ordinary handoff surface:
@@ -9086,7 +9105,13 @@ export class Bridge {
         continue;
       }
       if (positivelyOwned(candidate)) {
-        void this.closeOwnedSurface(candidate.id, "scaffold_idle");
+        // Every tab in this loop shares ONE binding with `chosen`, and papio
+        // drives `chosen`. So the true fact is that this surface is superseded,
+        // not that the scaffold is idle: scaffold_idle asserts a claim phase of
+        // claimed/bound, which any navigated claim structurally fails, and the
+        // daemon refused it - leaving the operator looking at three tabs on one
+        // paper (measured live 2026-08-22, the defect that opened this work).
+        void this.closeOwnedSurface(candidate.id, "surface_superseded");
       }
     }
     if (chosen?.id !== undefined) {
