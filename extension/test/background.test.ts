@@ -12799,9 +12799,14 @@ test("handoff governor keeps one drive, drains FIFO on settle and timeout", asyn
   await timeout?.fn();
   expect(h.tabs.list().length).toBe(3);
   expect(h.tabs.created).toHaveLength(3);
-  expect(
-    h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])?.status,
-  ).toBe("auth_pending");
+  // The timed-out paper hands its slot on and asks for the operator. It does
+  // not claim a sign-in: its tab never left the resolver page, so there is no
+  // wall to report (see the ordinary-provider-page test below).
+  const parked = h.backend.store.activeJobs.find(
+    (job) => job.job_id === jobIDs[1],
+  );
+  expect(parked?.status).toBe("queued");
+  expect(parked?.engagement_required).toBe(true);
 });
 
 test("a drive timing out on an authentication page leaves the tab open and frees the governor slot", async () => {
@@ -12860,7 +12865,19 @@ test("a drive timing out on an authentication page leaves the tab open and frees
   expect(second?.tab_id).toBeGreaterThanOrEqual(0);
 });
 
-test("a drive timing out on an ordinary provider page leaves the tab open and frees the governor slot", async () => {
+// A timeout is a fact about papio's own clock, never about the page. This test
+// used to assert the opposite - that a drive spent on an ordinary provider page
+// reports `auth_pending`, with its own comment noting no IdP navigation had
+// happened - and the daemon acts on that frame: it records auth-return profile
+// evidence, opens a HumanGateLogin, and reserves the institution's single
+// sign-in slot. Measured live 2026-08-23: an open-access ChemRxiv preprint
+// whose page carries a plain citation_pdf_url and no wall of any kind reported
+// auth_pending every three minutes for two days, holding that slot while 22
+// library papers queued behind it and the toolbar badge counted it as blocked
+// on the sign-in. The paper still needs the operator, so the honest state is
+// the drive governor's existing engagement park, which asks for a human
+// without claiming one is already signing in.
+test("a drive timing out on an ordinary provider page asks for the operator without claiming a sign-in", async () => {
   const h = makeHarness({
     ...emptyStore(),
     authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
@@ -12889,8 +12906,14 @@ test("a drive timing out on an ordinary provider page leaves the tab open and fr
   const after = h.backend.store.activeJobs.find(
     (job) => job.job_id === jobIDs[0],
   );
-  expect(after?.status).toBe("auth_pending");
+  expect(after?.status).toBe("queued");
+  expect(after?.engagement_required).toBe(true);
   expect(after?.tab_id).toBe(-1);
+  // No sign-in was asserted to the daemon, so nothing downstream reserves the
+  // institution's slot or opens a login gate for a page that has no wall.
+  expect(
+    h.frames().filter((frame) => frame.type === "auth_pending"),
+  ).toHaveLength(0);
   expect(h.tabs.created).toHaveLength(2);
 });
 

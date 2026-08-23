@@ -5843,13 +5843,58 @@ export class Bridge {
       this.handoffDriveTimeouts.delete(jobID);
       const current = findByJob(this.store, jobID);
       if (current !== undefined && current.tab_id === tabID) {
-        await this.update((s) =>
-          patchJob(s, jobID, {
-            status: "auth_pending",
-            auth_started_ms: this.deps.now(),
-          }),
-        );
-        this.send("auth_pending", {}, jobID);
+        // `auth_pending` asserts that this paper's surface reached a login page
+        // - signInBlockerCount's contract, and what the daemon acts on: it
+        // records auth-return profile evidence, opens a HumanGateLogin, and
+        // RESERVES the institution's single sign-in slot. A drive that merely
+        // ran out of time knows nothing about a login, so asserting one
+        // fabricates all three.
+        //
+        // The offer already carries the answer and this path never read it:
+        // `requires_auth` is the daemon's own statement that the route needs a
+        // human sign-in. An open-access route sets it false, so the claim is
+        // available exactly where it is true. A wall the paper reached anyway
+        // still counts - a route can meet one unannounced - so the page is
+        // consulted as well, and an unreadable tab simply adds nothing.
+        //
+        // Measured live 2026-08-23: an open-access ChemRxiv preprint, offered
+        // with requires_auth false and serving a plain citation_pdf_url behind
+        // no wall at all, reported auth_pending every three minutes for two
+        // days. It held the library's sign-in slot while 22 papers queued
+        // behind it, and the toolbar badge counted it as blocked on that
+        // sign-in.
+        let signInSurface = current.requires_auth === true;
+        if (!signInSurface) {
+          try {
+            const tab = await this.deps.tabs.get(tabID);
+            signInSurface =
+              typeof tab.url === "string" && isAuthenticationURL(tab.url);
+          } catch {
+            signInSurface = false;
+          }
+        }
+        if (signInSurface) {
+          await this.update((s) =>
+            patchJob(s, jobID, {
+              status: "auth_pending",
+              auth_started_ms: this.deps.now(),
+            }),
+          );
+          this.send("auth_pending", {}, jobID);
+        } else {
+          // A spent drive still needs the operator, so silence is not the
+          // alternative to the false claim - this is the same state the drive
+          // governor already parks an undrivable paper in, and the popup lists
+          // it with an Open button beside the sign-in asks. It says "take this
+          // over" without asserting anything about a login, so no auth
+          // evidence, no login gate, and no reservation of the one slot.
+          await this.update((s) =>
+            patchJob(s, jobID, {
+              status: "queued",
+              engagement_required: true,
+            }),
+          );
+        }
         if (current.fresh_handoff === true) {
           // A fresh link is deliberately gone after materialization. Preserve
           // the live tab as a manual park; detaching it would leave the job

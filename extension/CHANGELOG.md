@@ -30,6 +30,18 @@ for the full pre-split extension history.
   signing in changes.
 
 ### Fixed
+- **An open-access paper no longer reports that it is waiting for you to sign
+  in.** *papio* gives each paper three minutes on screen to finish. When that
+  time ran out it said the paper was waiting on your library sign-in, whatever
+  the page in front of it was — so a freely downloadable preprint, on a page
+  with a download link and no sign-in anywhere, said that every three minutes
+  for two days. It counted in the toolbar badge, and it took your library's
+  one sign-in slot from the papers that genuinely needed it. Running out of
+  time says nothing about a sign-in, so *papio* now only reports one when the
+  paper's route was announced as needing a sign-in, or the page it is on really
+  is a login page. A paper that simply ran out of time still asks for you — it
+  moves to the same waiting list, with the same **Open** button, and says it is
+  waiting on you to continue rather than to sign in.
 - **A paper waiting for another paper's sign-in now really does retry.** The
   wait that was added to stop *papio* hammering the daemon was armed correctly
   and then fired into nothing: *papio* had already thrown away the record of
