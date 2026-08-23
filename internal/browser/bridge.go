@@ -1617,14 +1617,30 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 		// a general "any mismatch is stale" rule would be true today, but it
 		// is a wider claim than the defect needs and it would retire the
 		// candidates that tests and future callers legitimately pre-create.
-		// Only an unclaimed candidate can be retired: a claimed or
-		// materializing one owns a live browser surface, and its fence is
-		// corrected by the next attempt instead of underneath the tab.
+		// What must not be retired is a candidate whose surface is LIVE, and
+		// the candidate's own status label does not say that: a lapsed claim is
+		// superseded inside the claim path, which returns the row to eligible
+		// and re-claims it in one transaction, so a paper cycling through
+		// claims is never observed `eligible` here. Gating on the label made
+		// this repair unreachable for exactly the paper that needed it -
+		// measured live 2026-08-23, the misfenced candidate stayed `claimed`
+		// against an abandoned claim across a drive. Claim liveness is the
+		// honest predicate, and it is already defined: an active phase in THIS
+		// holder generation, which a browser restart correctly ends.
 		misfenced := strings.HasPrefix(domain, "oa:") && existing.SafetyDomainID != domain
-		if !misfenced || existing.Status != "eligible" {
+		if !misfenced {
 			return existing, nil
 		}
-		if err := b.jobs.SetBrowserCandidateStatus(ctx, existing.ID, "eligible", "abandoned"); err != nil {
+		liveClaim, _, claimErr := b.jobs.LiveMaterializationClaimForJob(ctx, row.ID, attempt, b.epoch)
+		if claimErr != nil {
+			return nil, claimErr
+		}
+		if liveClaim != nil {
+			// The operator can see this tab; its fence is corrected by the
+			// next attempt rather than underneath them.
+			return existing, nil
+		}
+		if err := b.jobs.SetBrowserCandidateStatus(ctx, existing.ID, existing.Status, "abandoned"); err != nil {
 			return nil, err
 		}
 	}

@@ -6051,7 +6051,13 @@ func TestMisfencedOpenAccessCandidateIsRetiredAndReminted(t *testing.T) {
 	if err != nil || inFlight == nil {
 		t.Fatalf("in-flight candidate: %+v %v", inFlight, err)
 	}
-	if err := jobs.SetBrowserCandidateStatus(ctx, inFlight.ID, "eligible", "claimed"); err != nil {
+	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: inFlight.ID, BrowserHolderGeneration: b.epoch,
+		JobAttemptRevision:         inFlight.JobAttemptRevision,
+		InstitutionProfileRevision: inFlight.InstitutionProfileRevision,
+		RouteRevision:              inFlight.RouteRevision, MaterializationKind: "browser_tab",
+		LeaseUntil: b.now().UTC().Add(10 * time.Minute),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := jobs.S.DB().ExecContext(ctx,
@@ -6067,8 +6073,45 @@ func TestMisfencedOpenAccessCandidateIsRetiredAndReminted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stillClaimed == nil || stillClaimed.Status != "claimed" {
-		t.Fatalf("the repair retired a claimed candidate (%+v); its tab is live", stillClaimed)
+	if stillClaimed == nil || stillClaimed.Status == "abandoned" {
+		t.Fatalf("the repair retired a candidate holding a live claim (%+v); its tab is on screen", stillClaimed)
+	}
+
+	// The live shape that a status label cannot express: a claim made by a
+	// browser generation that is gone leaves the candidate labelled `claimed`
+	// with no surface behind it. Measured live 2026-08-23 - the misfenced
+	// candidate sat exactly here across a drive, so gating the repair on the
+	// label made it unreachable for the one paper that needed it.
+	orphanID := parkInstitutional(t, jobs, "wr_refence_orphan", handoffWork(), "")
+	orphanRow, err := jobs.Get(ctx, orphanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := b.prepareMaterializationCandidate(ctx, *orphanRow)
+	if err != nil || orphan == nil {
+		t.Fatalf("orphan candidate: %+v %v", orphan, err)
+	}
+	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: orphan.ID, BrowserHolderGeneration: b.epoch - 1,
+		JobAttemptRevision:         orphan.JobAttemptRevision,
+		InstitutionProfileRevision: orphan.InstitutionProfileRevision,
+		RouteRevision:              orphan.RouteRevision, MaterializationKind: "browser_tab",
+		LeaseUntil: b.now().UTC().Add(10 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET detail=? WHERE job_id=? AND status='open'`,
+		app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36", orphanID); err != nil {
+		t.Fatal(err)
+	}
+	refenced, err := b.prepareMaterializationCandidate(ctx, *orphanRow)
+	if err != nil || refenced == nil {
+		t.Fatalf("orphan repair: %+v %v", refenced, err)
+	}
+	if refenced.SafetyDomainID != "oa:doi.org" {
+		t.Fatalf("a candidate claimed by a dead browser generation kept its fence (%q); the label is not proof of a surface",
+			refenced.SafetyDomainID)
 	}
 }
 
