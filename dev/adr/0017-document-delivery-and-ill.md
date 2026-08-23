@@ -61,6 +61,33 @@ protects for holdings claims and ADR-0014 Decision 1 protects for job
 attribution — one durable row per (scope, identity) pair, not one per
 attempt.
 
+**Amendment 2026-08-23: the key alone does not enforce this, because work
+identity is mutable.** "Canonical work identity" was written as though it were
+fixed for the life of a job. It is not. `work.Work` is filled in as resolvers
+answer, `fillMissingFromCandidate` promotes a missing DOI out of a candidate,
+and `Work.Describe()` prefers a DOI over a PMID — so a PMID-only job that
+gains a DOI **changes key mid-flight**. Its earlier row keeps the old key, a
+lookup on the new key finds nothing, and the branch reports `evaluate_gate`:
+the gate may then send a second request to the library while the first row's
+outcome is still unknown. The `UNIQUE` constraint on `idempotency_key` cannot
+see this, because the two keys genuinely differ. Decision 4's confirm-absent
+route makes it reachable in ordinary operation, since it releases the job's
+lease before re-entering the gate and nothing holds a lock across that window.
+
+So the invariant this decision states — *one work produces at most one live
+subscription-provider request* — is now enforced **per job as well as per
+key**: when the computed key names no row, the branch falls back to the row
+the job already owns (`delivery.Service.BranchForJob`). That fallback is
+strictly more conservative than recomputing, because every branch it can
+reach is one the unchanged key would have reached anyway.
+
+This is containment, not a cure. The key is still derived from mutable state
+on every route. The durable repair is to **pin** it: persist the key on the
+row at creation and resolve by the stored value, which is also what the
+never-wired `jobs.delivery_request_id` column below was for. Anyone changing
+key derivation, or adding a caller that branches on a bare key, must keep the
+per-job fallback or replace it with pinning — not remove it.
+
 `internal/delivery` owns this table, the provider-specific status-poll budget
 (separate from `internal/budget`'s resolver/HTTP retry accounting — a delivery
 poll is not a resolver attempt), and the reconciliation routes in Decision 4.
