@@ -1151,7 +1151,16 @@ export interface BridgeDeps {
      * navigation event is still evidence the operator is looking at that
      * origin's resolver page. */
     onActivated: Listenable<[{ tabId: number; windowId: number }]>;
-    group?(opts: { tabIds: number[]; groupId?: number }): Promise<number>;
+    /** `createProperties.windowId` pins a NEW group to the tab's own window.
+     * Without it Chrome picks the window, and a tab whose window is not
+     * `normal` (a devtools or app window can be the focused one) is refused
+     * with "Tabs can only be moved to and from normal windows" - measured
+     * live 2026-08-23, 36 times in one service-worker session. */
+    group?(opts: {
+      tabIds: number[];
+      groupId?: number;
+      createProperties?: { windowId?: number };
+    }): Promise<number>;
   };
   webNavigation?: {
     onCommitted?: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
@@ -5273,6 +5282,14 @@ export class Bridge {
       }
     }
   }
+  /** The group is papio's tab-strip tidiness and its post-restart rediscovery
+   * aid; it is NOT the drive. A refusal used to propagate out of here, and
+   * `openBrokerTab` turned it into `undefined` - so the caller believed no tab
+   * opened while this tab stayed open, already reported through
+   * `onTabMaterialized`. Every drive epoch then added one more. Measured live
+   * 2026-08-23: 36 refusals in one worker session, and the operator watching
+   * three tabs pile up on one paper whose PDF button was live the whole time.
+   * The durable identity is the daemon's SurfaceBirthRecord, not the group. */
   private async openTabGroupTab(
     url: string,
     onTabMaterialized?: (tabID: number) => void,
@@ -5280,7 +5297,11 @@ export class Bridge {
     const tab = await this.deps.tabs.create({ url, active: false });
     if (tab.id === undefined) return undefined;
     onTabMaterialized?.(tab.id);
-    await this.foldIntoHandoffGroup(tab.id, tab.windowId);
+    try {
+      await this.foldIntoHandoffGroup(tab.id, tab.windowId);
+    } catch (e) {
+      console.error("papio: handoff tab kept, grouping declined", e);
+    }
     return tab.id;
   }
 
@@ -5455,7 +5476,10 @@ export class Bridge {
       await this.rememberHandoffGroup(reuse.id, windowID);
       return;
     }
-    const groupID = await tabs.group({ tabIds: [tabID] });
+    const groupID = await tabs.group({
+      tabIds: [tabID],
+      ...(windowID === undefined ? {} : { createProperties: { windowId: windowID } }),
+    });
     if (tabGroups !== undefined) {
       try {
         await tabGroups.update(groupID, {
@@ -21385,8 +21409,11 @@ function realDeps(): BridgeDeps {
       },
       ...(typeof chrome.tabs.group === "function"
         ? {
-            group: (opts: { tabIds: number[]; groupId?: number }) =>
-              chrome.tabs.group(opts as chrome.tabs.GroupOptions),
+            group: (opts: {
+              tabIds: number[];
+              groupId?: number;
+              createProperties?: { windowId?: number };
+            }) => chrome.tabs.group(opts as chrome.tabs.GroupOptions),
           }
         : {}),
     },

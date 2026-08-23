@@ -419,7 +419,7 @@ function makeHarness(
   const windows = opts?.windows === true ? new FakeWindows(tabs) : undefined;
   const tabGroups = opts?.tabGroups === true ? new FakeTabGroups() : undefined;
   if (tabGroups !== undefined) {
-    tabs.group = async ({ tabIds, groupId }) => {
+    tabs.group = async ({ tabIds, groupId, createProperties }) => {
       const id = groupId ?? tabGroups.nextID++;
       const target = tabGroups.live.get(id);
       const windowID = target?.windowId ?? tabs.snapshot(tabIds[0]!)?.windowId;
@@ -436,9 +436,11 @@ function makeHarness(
           ...(windowID === undefined ? {} : { windowId: windowID }),
         });
       }
-      tabs.grouped.push(
-        groupId === undefined ? { tabIds } : { tabIds, groupId },
-      );
+      tabs.grouped.push({
+        tabIds,
+        ...(groupId === undefined ? {} : { groupId }),
+        ...(createProperties === undefined ? {} : { createProperties }),
+      });
       const emptied = new Set<number>();
       for (const tabID of tabIds) {
         const tab = tabs.snapshot(tabID);
@@ -8947,7 +8949,9 @@ test("tab-group mode opens the handoff in a collapsed papio group in the current
 
   // The tab opens in the user's current window (no windowId), not a new window.
   expect(h.tabs.created).toEqual([{ url: OPENURL, active: false }]);
-  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }]);
+  expect(h.tabs.grouped).toEqual([
+    { tabIds: [100], createProperties: { windowId: 1 } },
+  ]);
   const groupID = h.backend.store.handoffGroupID;
   expect(groupID).toBeDefined();
   expect(h.tabGroups?.live.get(groupID!)?.collapsed).toBe(true);
@@ -8971,7 +8975,9 @@ test("tab-group handoff works on Firefox 139+ (no onDeterminingFilename)", async
   await h.port.inbound(jobOffer("job_tg_firefox"));
 
   expect(h.tabs.created).toEqual([{ url: OPENURL, active: false }]);
-  expect(h.tabs.grouped).toEqual([{ tabIds: [100] }]);
+  expect(h.tabs.grouped).toEqual([
+    { tabIds: [100], createProperties: { windowId: 1 } },
+  ]);
   const groupID = h.backend.store.handoffGroupID;
   expect(groupID).toBeDefined();
   expect(h.tabGroups?.live.get(groupID!)?.collapsed).toBe(true);
@@ -8996,7 +9002,7 @@ test("tab-group handoffs reuse one papio group", async () => {
   // The second handoff opens after the first releases and joins the same
   // papio group rather than creating another group.
   expect(h.tabs.grouped).toEqual([
-    { tabIds: [100] },
+    { tabIds: [100], createProperties: { windowId: 1 } },
     { tabIds: [101], groupId: groupID },
   ]);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
@@ -9025,7 +9031,7 @@ test("concurrent tab-group folds create exactly one papio group", async () => {
 
   expect(h.tabGroups?.live.size).toBe(1);
   expect(h.tabs.grouped).toEqual([
-    { tabIds: [100] },
+    { tabIds: [100], createProperties: { windowId: 1 } },
     { tabIds: [101], groupId: 700 },
   ]);
 });
@@ -9056,7 +9062,9 @@ test("tab-group folds do not reuse a stored group from another window", async ()
   expect(h.tabGroups?.live.size).toBe(2);
   expect(h.tabGroups?.live.get(700)?.windowId).toBe(1);
   expect(h.tabGroups?.live.get(701)?.windowId).toBe(2);
-  expect(h.tabs.grouped).toEqual([{ tabIds: [101] }]);
+  expect(h.tabs.grouped).toEqual([
+    { tabIds: [101], createProperties: { windowId: 2 } },
+  ]);
 });
 
 test("tab-group mode rediscovers a renamed papio group after session storage clears", async () => {
@@ -9085,7 +9093,7 @@ test("tab-group mode rediscovers a renamed papio group after session storage cle
   expect(h.tabGroups?.live.size).toBe(1);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
   expect(h.tabs.grouped).toEqual([
-    { tabIds: [100] },
+    { tabIds: [100], createProperties: { windowId: 1 } },
     { tabIds: [101], groupId: groupID! },
   ]);
   expect(h.tabGroups?.live.get(groupID!)?.title).toBe(
@@ -19428,7 +19436,7 @@ test("Slice 1: simulateExtensionUpdate reproduces the session-storage-clears tab
   expect(h.tabGroups?.live.size).toBe(1);
   expect(h.backend.store.handoffGroupID).toBe(groupID);
   expect(h.tabs.grouped).toEqual([
-    { tabIds: [100] },
+    { tabIds: [100], createProperties: { windowId: 1 } },
     { tabIds: [101], groupId: groupID! },
   ]);
   expect(h.tabGroups?.live.get(groupID!)?.title).toBe(
@@ -21378,4 +21386,42 @@ test("a title-only challenge update on a tracked page waits before asking", asyn
   expect(
     h.frames().some((f) => f.payload?.["code"] === "challenge_blocked"),
   ).toBe(false);
+});
+
+// The opening defect of this round, measured live 2026-08-23: Chrome refused
+// every new-group creation with "Tabs can only be moved to and from normal
+// windows" (36 times in one worker session). The refusal propagated out of
+// openTabGroupTab, openBrokerTab logged it and answered `undefined`, so the
+// drive was abandoned - while the tab it had already opened, and already
+// reported through onTabMaterialized, stayed open. Every drive epoch added one
+// more. That is the operator's three tabs on one paper whose PDF button was
+// live the whole time. The group is tidiness and a rediscovery aid; the
+// durable identity is the daemon's SurfaceBirthRecord.
+test("a refused tab group keeps the handoff tab and the drive", async () => {
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
+  const grouping = h.tabs.group!;
+  let refusals = 0;
+  h.tabs.group = async () => {
+    refusals += 1;
+    throw new Error("Tabs can only be moved to and from normal windows.");
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_group_refused"));
+
+  expect(refusals).toBe(1);
+  // The tab exists, is tracked as the drive's surface, and the job is live.
+  const job = h.backend.store.activeJobs.find(
+    (candidate) => candidate.job_id === "job_group_refused",
+  );
+  expect(job?.tab_id).toBe(100);
+  expect(h.tabs.snapshot(100)).toBeDefined();
+
+  // A second epoch reuses that surface instead of stranding it and opening
+  // another tab, which is how three tabs accumulated on one paper.
+  h.tabs.group = grouping;
+  await h.port.inbound(jobOffer("job_group_refused"));
+  expect(h.tabs.list().filter((tab) => tab.url === OPENURL).length).toBe(1);
 });

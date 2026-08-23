@@ -146,8 +146,16 @@ export class ChromeTabsFake {
   readonly onActivated = new FakeEmitter<[{ tabId: number; windowId: number }]>();
   readonly created: TabCreateProperties[] = [];
   readonly removed: number[] = [];
-  readonly grouped: { tabIds: number[]; groupId?: number }[] = [];
-  group?: (options: { tabIds: number[]; groupId?: number }) => Promise<number>;
+  readonly grouped: {
+    tabIds: number[];
+    groupId?: number;
+    createProperties?: { windowId?: number };
+  }[] = [];
+  group?: (options: {
+    tabIds: number[];
+    groupId?: number;
+    createProperties?: { windowId?: number };
+  }) => Promise<number>;
   readonly activated: number[] = [];
   readonly navigations: { tabID: number; url: string }[] = [];
   readonly reloaded: number[] = [];
