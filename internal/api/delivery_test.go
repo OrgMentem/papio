@@ -446,9 +446,14 @@ func TestDeliveryConfirmRequestAbsentRepairsBeforeSubmitAndReopensAction(t *test
 	// awaiting_human->resolving edge, so closing the action BEFORE the gate is
 	// what lets SubmitDelivery park the job again. The earlier
 	// Cancel -> Submit -> close order failed every call with an illegal
-	// awaiting_human->awaiting_human park, so a run that succeeds at all and
-	// lands back in awaiting_human with one open and one resolved action is
-	// only reachable under the current order.
+	// awaiting_human->awaiting_human park.
+	//
+	// What actually catches a return to that order is the RPC below
+	// succeeding at all: the old order made every call fail. Note what does
+	// NOT catch it — the end state is awaiting_human under both orders, since
+	// the fixture starts parked there and a failed submit leaves it parked.
+	// Assert the end state because it is the contract, not because it
+	// discriminates.
 	system := deliveryTestSystem(t)
 	router := Router(system)
 	jobID := deliveryTestJob(t, system, "req_absent_atomic", "10.1234/absent-atomic")
@@ -466,9 +471,8 @@ func TestDeliveryConfirmRequestAbsentRepairsBeforeSubmitAndReopensAction(t *test
 	if afterRow.State != delivery.StateCancelled {
 		t.Fatalf("after row state = %s, want cancelled", afterRow.State)
 	}
-	// The discriminating assertion: the job is parked again. Reaching
-	// awaiting_human at all requires the resolving->awaiting_human park, which
-	// only exists if the action was repaired before the gate ran.
+	// Contract, not discriminator (see above): the job is parked again rather
+	// than left mid-gate.
 	jobRow, err := system.Jobs.Get(context.Background(), jobID)
 	if err != nil {
 		t.Fatal(err)
