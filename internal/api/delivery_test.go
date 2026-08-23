@@ -440,11 +440,15 @@ func TestDeliveryConfirmRequestExistsAtomicityPerInjectionPoint(t *testing.T) {
 	}
 }
 
-func TestDeliveryConfirmRequestAbsentLeavesOpenActionOnOrderedFailure(t *testing.T) {
-	// The absent path uses validate-then-ordered-apply with action closed LAST:
-	// Cancel row -> SubmitDelivery -> close action. Prove the ordering by
-	// checking that a successful run leaves exactly one open and one resolved,
-	// which implies the old action was closed only after SubmitDelivery.
+func TestDeliveryConfirmRequestAbsentRepairsBeforeSubmitAndReopensAction(t *testing.T) {
+	// The absent path is Cancel row -> RepairAwaitingHuman -> SubmitDelivery,
+	// and that order is the whole point: RepairAwaitingHuman is the legal
+	// awaiting_human->resolving edge, so closing the action BEFORE the gate is
+	// what lets SubmitDelivery park the job again. The earlier
+	// Cancel -> Submit -> close order failed every call with an illegal
+	// awaiting_human->awaiting_human park, so a run that succeeds at all and
+	// lands back in awaiting_human with one open and one resolved action is
+	// only reachable under the current order.
 	system := deliveryTestSystem(t)
 	router := Router(system)
 	jobID := deliveryTestJob(t, system, "req_absent_atomic", "10.1234/absent-atomic")
@@ -462,6 +466,16 @@ func TestDeliveryConfirmRequestAbsentLeavesOpenActionOnOrderedFailure(t *testing
 	if afterRow.State != delivery.StateCancelled {
 		t.Fatalf("after row state = %s, want cancelled", afterRow.State)
 	}
+	// The discriminating assertion: the job is parked again. Reaching
+	// awaiting_human at all requires the resolving->awaiting_human park, which
+	// only exists if the action was repaired before the gate ran.
+	jobRow, err := system.Jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobRow.State != job.StateAwaitingHuman {
+		t.Fatalf("job state after absent = %s, want awaiting_human (the reconciliation park after a legal repair-then-submit)", jobRow.State)
+	}
 	actions, err := system.Jobs.ListHumanActionsForJob(context.Background(), jobID)
 	if err != nil {
 		t.Fatal(err)
@@ -476,6 +490,6 @@ func TestDeliveryConfirmRequestAbsentLeavesOpenActionOnOrderedFailure(t *testing
 		}
 	}
 	if open != 1 || resolved != 1 {
-		t.Fatalf("actions after absent = %d open %d resolved, want 1/1 (proves action closed only after SubmitDelivery)", open, resolved)
+		t.Fatalf("actions after absent = %d open %d resolved, want 1/1 (old action repaired, fresh reconciliation action opened)", open, resolved)
 	}
 }

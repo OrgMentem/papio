@@ -15535,7 +15535,15 @@ func TestDeliveryReconcileConfirmExistsConvergesDriftAndReplaysAsNoOp(t *testing
 	}
 }
 
-func TestDeliveryReconcileConfirmAbsentPinsNormalStateOrderingAndReplaysWithoutGrowth(t *testing.T) {
+// The bridge must reach the same end state as internal/api's
+// deliveryConfirmRequestAbsent, because both run the same Decision 4
+// operation: the stale row is cancelled and reused (never a second live
+// request for this idempotency key), the old action closes, and v1's
+// resubmission policy escalates a fresh reconciliation action rather than
+// resubmitting. Replaying must not grow the row count — that is the
+// invariant standing between a confused operator and a library receiving
+// the same request twice.
+func TestDeliveryReconcileConfirmAbsentCancelsReRunsGateAndReplaysWithoutRowGrowth(t *testing.T) {
 	b, jobs := newDeliveryBridge(t)
 	ctx := context.Background()
 	jobID := parkDocumentDeliveryForReconcile(t, jobs, b.svc, "wr_bridge_delivery_absent", work.Work{
@@ -15545,61 +15553,92 @@ func TestDeliveryReconcileConfirmAbsentPinsNormalStateOrderingAndReplaysWithoutG
 	if err != nil || before == nil {
 		t.Fatalf("delivery row before confirm absent = %#v, %v", before, err)
 	}
+	firstAction := openDocumentDeliveryActionForTest(t, jobs, jobID)
+	if firstAction == nil {
+		t.Fatal("missing document_delivery action before confirm absent")
+	}
 
 	request := protocol.DeliveryReconcilePayload{
 		RequestID: "request-bridge-delivery-absent",
 		JobID:     jobID, Operation: "confirm_request_absent",
 	}
 	first := deliveryReconcileResult(t, b, request)
-	if first.Outcome != "error" || first.Detail == "" {
-		t.Fatalf("first result = %+v, want structured ordering error", first)
-	}
-	if !strings.Contains(first.Detail, "awaiting_human -> awaiting_human") {
-		t.Fatalf("first result detail = %q, want the same-state park conflict", first.Detail)
+	if first.Outcome != "applied" || first.Detail != "" {
+		t.Fatalf("first result = %+v, want applied with no detail", first)
 	}
 
-	original, err := b.svc.Delivery.Get(ctx, before.ID)
-	if err != nil || original == nil {
-		t.Fatalf("original delivery row after confirm absent = %#v, %v", original, err)
+	after, err := b.svc.Delivery.GetByJobID(ctx, jobID)
+	if err != nil || after == nil {
+		t.Fatalf("delivery row after confirm absent = %#v, %v", after, err)
 	}
-	if original.State != delivery.StateCancelled {
-		t.Fatalf("original delivery row after confirm absent = %+v, want cancelled", original)
+	if after.ID != before.ID {
+		t.Fatalf("row identity changed from %d to %d — the resubmission policy reuses the row, it never opens a second one", before.ID, after.ID)
+	}
+	if after.State != delivery.StateCancelled {
+		t.Fatalf("delivery row after confirm absent = %+v, want cancelled", after)
 	}
 	jobRow, err := jobs.Get(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if jobRow.State != job.StateAwaitingHuman {
-		t.Fatalf("job after confirm absent = %s, want awaiting_human after ordering error", jobRow.State)
+		t.Fatalf("job after confirm absent = %s, want awaiting_human (v1 escalates a fresh resubmission-policy decision to reconciliation)", jobRow.State)
 	}
-	if action := openDocumentDeliveryActionForTest(t, jobs, jobID); action == nil {
-		t.Fatal("action after confirm absent = nil, want the still-open action after ordering error")
+	// The old action must be closed and a new one opened, so the operator
+	// keeps an affordance without inheriting the resolved one.
+	openCount, resolvedCount := deliveryActionCounts(t, jobs, jobID)
+	if openCount != 1 || resolvedCount != 1 {
+		t.Fatalf("actions after confirm absent = %d open, %d resolved, want exactly one of each (old closed, new opened)", openCount, resolvedCount)
+	}
+	reopened := openDocumentDeliveryActionForTest(t, jobs, jobID)
+	if reopened == nil {
+		t.Fatal("action after confirm absent = nil, want the freshly opened reconciliation action")
+	}
+	if reopened.ID == firstAction.ID {
+		t.Fatalf("action id after confirm absent = %d, want a new action rather than the reused original", reopened.ID)
 	}
 
-	var requestCount int
-	if err := b.svc.Delivery.DB().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM delivery_requests WHERE job_id = ?`, jobID).Scan(&requestCount); err != nil {
-		t.Fatal(err)
-	}
+	requestCount := deliveryRowCount(t, b, jobID)
 	if requestCount != 1 {
-		t.Fatalf("delivery request rows after confirm absent = %d, want one matching row", requestCount)
+		t.Fatalf("delivery request rows after confirm absent = %d, want one reused row", requestCount)
 	}
 
 	second := deliveryReconcileResult(t, b, request)
-	if second.Outcome != "error" || second.Detail == "" {
-		t.Fatalf("replayed absent result = %+v, want the same structured ordering error", second)
-	}
-	if !strings.Contains(second.Detail, "awaiting_human -> awaiting_human") {
-		t.Fatalf("replayed result detail = %q, want the same-state park conflict", second.Detail)
-	}
-	if err := b.svc.Delivery.DB().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM delivery_requests WHERE job_id = ?`, jobID).Scan(&requestCount); err != nil {
-		t.Fatal(err)
+	if second.Outcome != "applied" || second.Detail != "" {
+		t.Fatalf("replayed absent result = %+v, want applied with no detail", second)
 	}
 	// Re-query after the replay. A matching idempotency key must not create a row.
-	if requestCount != 1 {
+	if requestCount = deliveryRowCount(t, b, jobID); requestCount != 1 {
 		t.Fatalf("delivery request rows after absent replay = %d, want one", requestCount)
 	}
+}
+
+func deliveryActionCounts(t *testing.T, jobs *job.Store, jobID string) (int, int) {
+	t.Helper()
+	actions, err := jobs.ListHumanActionsForJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openCount, resolvedCount := 0, 0
+	for _, a := range actions {
+		switch a.Action.Status {
+		case "open":
+			openCount++
+		case "resolved":
+			resolvedCount++
+		}
+	}
+	return openCount, resolvedCount
+}
+
+func deliveryRowCount(t *testing.T, b *Bridge, jobID string) int {
+	t.Helper()
+	var count int
+	if err := b.svc.Delivery.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM delivery_requests WHERE job_id = ?`, jobID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
 }
 
 func TestDeliveryReconcileRoutineFailuresReturnStructuredResults(t *testing.T) {

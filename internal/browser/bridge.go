@@ -5251,14 +5251,35 @@ func (b *Bridge) deliveryConfirmRequestExists(ctx context.Context, request *prot
 // document_delivery action closes, and the job re-enters the shared
 // Branch/gate seam (app.Service.SubmitDelivery) — never a duplicated policy
 // implementation, and never a second live request for this idempotency key.
+//
+// The order is load-bearing, and it must stay identical to internal/api's:
+// RepairAwaitingHuman is the allowed awaiting_human->resolving edge, and
+// SubmitDelivery's reconciliation park is the allowed resolving->awaiting_human
+// one. Cancel->Submit->Repair looks safer, because a Submit failure leaves the
+// action open, but Submit then sees the job still in awaiting_human and
+// attempts awaiting_human->awaiting_human, which the state graph rejects: on a
+// normally parked job every confirm-absent failed with a job state conflict
+// after already cancelling the row. Cancel, Repair, Submit is the only legal
+// order. If Submit fails after Repair, re-open a reconciliation action so the
+// operator never loses the affordance — a cancelled row is a documented
+// recoverable state.
 func (b *Bridge) deliveryConfirmRequestAbsent(ctx context.Context, request *protocol.DeliveryReconcilePayload, action *job.HumanAction, row *delivery.Request) ([]json.RawMessage, error) {
 	if err := b.svc.Delivery.UpdateState(ctx, row.ID, delivery.StateCancelled); err != nil {
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
-	if _, err := b.svc.SubmitDelivery(ctx, request.JobID); err != nil {
+	if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID}, map[string]any{"reason": "document_delivery_confirmed_absent"}); err != nil {
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
-	if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID}, map[string]any{"reason": "document_delivery_confirmed_absent"}); err != nil {
+	if _, err := b.svc.SubmitDelivery(ctx, request.JobID); err != nil {
+		ref := row.ProviderReference
+		if ref == "" {
+			ref = "(no provider reference recorded)"
+		}
+		detail := fmt.Sprintf("a document-delivery request (provider %s, reference %s, state %s) needs reconciliation; run 'papio delivery get %s' for its history and resolve it by hand — papio never resubmits automatically",
+			row.Provider, ref, string(delivery.StateCancelled), request.JobID)
+		if _, openErr := b.jobs.OpenHumanAction(ctx, request.JobID, job.ActionKindDocumentDelivery, detail, job.Access(false, "")); openErr == nil {
+			_ = b.jobs.Transition(ctx, request.JobID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"})
+		}
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
 	return b.deliveryReconcileResult(request.RequestID, "applied", "")

@@ -215,6 +215,20 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **"Confirm absent" in the inbox now works at all.** When you check with your
+  library, find that no interlibrary-loan request was ever lodged, and tell
+  *papio* so from the extension, it cancelled the stale request and then failed
+  with a job state conflict — every time, on any normally parked paper. The
+  paper was left with a cancelled request and the same unresolved prompt, so
+  the one button that clears a phantom request cleared nothing. The equivalent
+  `papio delivery confirm-absent` on the command line was fixed in August; the
+  extension kept the old order, which closed the prompt only after re-running
+  the gate and so asked the paper to move from "waiting for you" to "waiting
+  for you" — a step the state graph refuses. Both paths now close the prompt
+  first, then re-run the gate, and both re-open a fresh prompt rather than
+  resubmitting: *papio* still never sends a second request while an earlier
+  one's outcome is unknown. Nothing about your existing papers changes, and no
+  request is resubmitted by upgrading.
 - **`document_delivery.allowed_hosts` now actually restricts where a request can
   go.** The setting has been documented since it shipped as controlling the
   hosts a prefilled request form or API base may reach, and the config
