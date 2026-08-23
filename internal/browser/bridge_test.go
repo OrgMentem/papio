@@ -2177,6 +2177,51 @@ func TestFocusHandoffsEmitsOnceAtAndAboveExtensionFloor(t *testing.T) {
 	}
 }
 
+// A manual download asks the human to fetch the file, and the page it lives on
+// is reached through the institution — internal/app's HumanActionNextStepFor
+// records that a canonical publisher link paywalls almost all of them. The CLI
+// already minted a route for both kinds while the browser path was
+// handoff-only, so the inbox opened the paywalled link instead. Focus now
+// covers the kind, and the offer it produces carries the institution's route
+// with NO drive authority: papio must not race the person it just asked to do
+// the work.
+func TestFocusHandoffsOffersAManualDownloadWithoutDriveAuthority(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := parkManualDownload(t, jobs, "wr_focus_manual", handoffWork())
+	runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{"extension_version": HandoffFocusMinExtensionVersion}))
+
+	queued, sessionLive, err := b.FocusHandoffs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sessionLive || queued != 1 {
+		t.Fatalf("focus result = queued:%d live:%t, want 1,true — a manual download is focusable", queued, sessionLive)
+	}
+
+	msgs, _ := runSync(t, b)
+	focus := firstOfType(msgs, protocol.MsgHandoffFocus)
+	if focus == nil || focus.JobID != id {
+		t.Fatalf("focus frame = %#v, want job %q", focus, id)
+	}
+	offer := firstOfType(msgs, protocol.MsgJobOffer)
+	if offer == nil || offer.JobID != id {
+		t.Fatalf("offer frame = %#v, want job %q", offer, id)
+	}
+	payload, ok := offer.Payload.(*protocol.JobOfferPayload)
+	if !ok {
+		t.Fatalf("offer payload = %T, want *protocol.JobOfferPayload", offer.Payload)
+	}
+	// The whole point of the change: a route, not the bare canonical link.
+	if payload.OpenURL == "" {
+		t.Fatal("offer carries no OpenURL, so the human is sent nowhere")
+	}
+	if payload.DriveAttemptID != "" || payload.DriveOrdinal != nil || payload.DriveStrategy != "" {
+		t.Fatalf("manual download offer carries drive authority (attempt %q ordinal %v strategy %q), want none",
+			payload.DriveAttemptID, payload.DriveOrdinal, payload.DriveStrategy)
+	}
+}
+
 func TestFocusHandoffsOffersTargetOutsidePollPage(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()

@@ -60,6 +60,10 @@ import (
 
 const (
 	handoffActionKind = "openurl_handoff"
+	// manualDownloadActionKind is focusable and offerable, but never driven:
+	// the offer hands the institution's route to the human, who fetches the
+	// file themselves and lets papio adopt it.
+	manualDownloadActionKind = "manual_download"
 	// MinExtensionVersion: 0.5.0 renamed the wire access mode to "delegated";
 	// older extensions fail-closed on offers carrying it.
 	MinExtensionVersion = "0.5.0"
@@ -729,14 +733,26 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 	if err != nil {
 		return 0, true, err
 	}
-	handoff := make(map[string]bool, len(actions))
+	// A manual download is focusable too. Its route is the institution's, not
+	// the bare DOI — internal/app's HumanActionNextStepFor records that 32 of
+	// 34 measured manual downloads need auth and a canonical publisher link
+	// paywalls every one — so the CLI already sends `papio actions open` for
+	// both kinds. Only the browser path was handoff-only, which left the
+	// extension opening the canonical link while the CLI minted a route.
+	//
+	// This widens the EXPLICIT focus path only. handoffJobs, which feeds the
+	// automatic offer gate, stays openurl_handoff: papio must not start
+	// offering manual downloads on its own, and nothing here changes what a
+	// plain session-live tick does.
+	focusable := make(map[string]string, len(actions))
 	for _, action := range actions {
-		if action.Kind == handoffActionKind {
-			handoff[action.JobID] = true
+		if action.Kind == handoffActionKind || action.Kind == manualDownloadActionKind {
+			focusable[action.JobID] = action.Kind
 		}
 	}
 	for _, jobID := range jobIDs {
-		if jobID == "" || !handoff[jobID] {
+		kind, ok := focusable[jobID]
+		if jobID == "" || !ok {
 			continue
 		}
 		// A focus already owed is not a refusal, and it must not skip the work
@@ -762,7 +778,10 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 		if _, offerable := b.offerableAccessMode(*row); !offerable {
 			continue
 		}
-		if b.institutionalMaterializationAvailable() {
+		// Materialization is papio driving the provider page. A manual
+		// download is the opposite instruction — the human fetches the file —
+		// so it takes the plain offer path below and never pins a candidate.
+		if kind == handoffActionKind && b.institutionalMaterializationAvailable() {
 			epoch := b.epoch
 			b.mu.Unlock()
 			// An operator asking again for a paper whose attempt already
@@ -1564,10 +1583,24 @@ func (b *Bridge) openHandoffForJob(ctx context.Context, jobID string) (*job.Huma
 	if err != nil {
 		return nil, err
 	}
+	// Prefer a handoff when a job somehow carries both: papio driving the page
+	// supersedes asking the human to fetch it.
+	var manual *job.HumanAction
 	for i := range actions {
-		if actions[i].JobID == jobID && actions[i].Kind == handoffActionKind && actions[i].Status == "open" {
-			return &actions[i], nil
+		if actions[i].JobID != jobID || actions[i].Status != "open" {
+			continue
 		}
+		switch actions[i].Kind {
+		case handoffActionKind:
+			return &actions[i], nil
+		case manualDownloadActionKind:
+			if manual == nil {
+				manual = &actions[i]
+			}
+		}
+	}
+	if manual != nil {
+		return manual, nil
 	}
 	return nil, sql.ErrNoRows
 }
@@ -11955,7 +11988,11 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 		RequiresAuth:  action.RequiresAuth,
 		ExpiresAt:     b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339),
 	}
-	driveAllowed := b.providerDriveEpochAvailable()
+	// A manual download is never driven. The action means the human fetches
+	// the file, so the offer exists only to put them on the institution's
+	// route; granting a drive epoch here would have papio racing the person
+	// it just asked to do the work.
+	driveAllowed := action.Kind != manualDownloadActionKind && b.providerDriveEpochAvailable()
 	if driveAllowed && b.jobs != nil {
 		if live, err := b.jobs.LiveEffectPermit(context.Background()); err != nil {
 			return nil, fmt.Errorf("read effect permit occupancy: %w", err)
