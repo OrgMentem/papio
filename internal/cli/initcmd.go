@@ -358,8 +358,6 @@ func initNextAction(input initOptions, report doctor.Report) string {
 		return `papio acquire "<doi>" --wait   (OA-only until browser integration is set up)`
 	case extension != "":
 		return "install the papio extension (see Browser setup above), then: papio doctor"
-	case input.skipBrowser:
-		return `papio acquire "<doi>" --wait   (OA-only until browser integration is set up)`
 	}
 	return `papio acquire "<doi>" --wait   (or: papio status)`
 }
