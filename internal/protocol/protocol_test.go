@@ -3252,3 +3252,69 @@ func TestSurfaceCloseSupersededRequiresItsTab(t *testing.T) {
 		})
 	}
 }
+
+func TestDevReloadRoundTrip(t *testing.T) {
+	reloadID := "reload_abcdefgh"
+	msg, err := DecodeBrowserMessage(protocolTestFrame(t, MsgDevReload, &DevReloadPayload{ReloadID: reloadID}))
+	if err != nil {
+		t.Fatalf("valid dev_reload rejected: %v", err)
+	}
+	if msg.Type != MsgDevReload {
+		t.Fatalf("type = %q, want %q", msg.Type, MsgDevReload)
+	}
+	got, ok := msg.Payload.(*DevReloadPayload)
+	if !ok {
+		t.Fatalf("payload type = %T, want *DevReloadPayload", msg.Payload)
+	}
+	if got.ReloadID != reloadID {
+		t.Fatalf("reload_id = %q, want %q", got.ReloadID, reloadID)
+	}
+}
+
+func TestDevReloadMissingReloadIDRejected(t *testing.T) {
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgDevReload, map[string]any{})); err == nil {
+		t.Fatal("dev_reload without reload_id was accepted")
+	}
+	// Explicit null must also be rejected.
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgDevReload, map[string]any{"reload_id": nil})); err == nil {
+		t.Fatal("dev_reload with null reload_id was accepted")
+	}
+}
+
+func TestDevReloadInvalidReloadIDRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   string
+	}{
+		{name: "too short", id: "short"},
+		{name: "illegal char", id: "bad!char"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgDevReload, map[string]any{"reload_id": tc.id})); err == nil {
+				t.Fatalf("dev_reload with reload_id %q was accepted", tc.id)
+			}
+		})
+	}
+}
+
+func TestDevReloadRejectsUnknownExtraField(t *testing.T) {
+	m := protocolPayloadMap(t, &DevReloadPayload{ReloadID: "reload_abcdefgh"})
+	m["unexpected"] = true
+	expectProtocolReject(t, MsgDevReload, m)
+}
+
+func TestDevReloadIsNotJobScopedAndDecodesWithoutJobID(t *testing.T) {
+	if jobScoped[MsgDevReload] {
+		t.Fatalf("dev_reload is job-scoped; the contract requires it to be job-free")
+	}
+	msg, err := DecodeBrowserMessage(protocolTestFrame(t, MsgDevReload, &DevReloadPayload{ReloadID: "reload_abcdefgh"}))
+	if err != nil {
+		t.Fatalf("dev_reload without job_id rejected: %v", err)
+	}
+	if msg.JobID != "" {
+		t.Fatalf("dev_reload job_id = %q, want empty", msg.JobID)
+	}
+	if msg.Type != MsgDevReload {
+		t.Fatalf("type = %q, want %q", msg.Type, MsgDevReload)
+	}
+}

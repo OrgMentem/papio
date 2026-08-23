@@ -1370,6 +1370,14 @@ export interface BridgeDeps {
     get?(name: string): Promise<{ name: string } | undefined>;
     onAlarm: Listenable<[{ name: string }]>;
   };
+  /** Development-mode self-reload seam (dev_reload). Optional so unit tests
+   * and any host without chrome.management simply never reload. */
+  devReload?: {
+    /** chrome.management.getSelf().installType. "development" means unpacked. */
+    installType(): Promise<string>;
+    /** chrome.runtime.reload(). Never returns: the worker dies with the call. */
+    reload(): void;
+  };
   /** navigator.onLine snapshot. Absent (older harnesses) reads as online.
    * False gates queued-handoff releases and the autonomous-auth surface
    * gate: a wake after sleep must not navigate work into a dead network. */
@@ -15337,6 +15345,35 @@ export class Bridge {
     );
   }
 
+  /** Reload this extension from disk on the daemon's command, replacing the
+   * manual chrome://extensions Reload click. Refused unless this is an
+   * unpacked development load: chrome.runtime.reload() on a store-installed
+   * extension re-reads nothing and only restarts the worker, so obeying it
+   * there would be pure disruption. The reload tears down the native port,
+   * so the daemon learns the outcome as a NEW session id rather than a reply.
+   */
+  private async onDevReload(msg: BrowserMessage): Promise<void> {
+    const reloadID = typeof msg.payload["reload_id"] === "string" ? msg.payload["reload_id"] : "";
+    const seam = this.deps.devReload;
+    if (seam === undefined) {
+      console.warn("papio: dev_reload has no seam in this build");
+      return;
+    }
+    let installType: string;
+    try {
+      installType = await seam.installType();
+    } catch (e) {
+      console.warn("papio: dev_reload installType check failed", e);
+      return;
+    }
+    if (installType !== "development") {
+      console.warn(`papio: refusing dev_reload for installType "${installType}": a store-installed extension is never restarted by dev_reload`);
+      return;
+    }
+    console.log(`papio: dev_reload ${reloadID}: reloading extension from disk`);
+    seam.reload();
+  }
+
   private async onInbound(raw: unknown): Promise<void> {
     let msg: BrowserMessage;
     try {
@@ -15400,6 +15437,9 @@ export class Bridge {
           // this FIFO; detach it so the correlated reply can be received.
           void this.focusDaemonHandoff(msg.job_id);
         }
+        return;
+      case "dev_reload":
+        await this.onDevReload(msg);
         return;
       case "hello_ack": {
         const version =
@@ -21756,6 +21796,10 @@ function realDeps(): BridgeDeps {
       onAlarm: {
         addListener: (cb) => chrome.alarms?.onAlarm?.addListener(cb),
       },
+    },
+    devReload: {
+      installType: async () => (await chrome.management?.getSelf())?.installType ?? "",
+      reload: () => chrome.runtime.reload(),
     },
   };
 }

@@ -18,6 +18,16 @@ for the full pre-split extension history.
 
 ### Added
 - **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
+- **A development build of *papio* can now reload itself from disk on the
+  daemon's command.** Building the extension used to end with a manual click on
+  Chrome's **Reload** button, and a click on that button reports success even
+  when it silently does nothing — so a whole test run could be spent measuring
+  a build that was never loaded. The daemon can now send one `dev_reload`
+  command over the connection *papio* already holds, and *papio* reloads
+  itself. A store-installed *papio* is never restarted this way: it refuses the
+  command unless the browser reports it as an unpacked development load, where
+  a reload genuinely re-reads the files. Nothing about browsing, acquiring, or
+  signing in changes.
 
 ### Fixed
 - **A paper no longer collects one leftover tab per attempt.** When a handoff

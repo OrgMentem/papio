@@ -1,6 +1,6 @@
 {
   "name": "papio-extension",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "private": true,
   "description": "papio MV3 extension workspace (browser plane; built out in Phase 2). Bun is package manager/scripts only — the shipped artifact is browser JavaScript.",
   "type": "module",
@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "dev:firefox": "web-ext run",
+    "dev:chrome": "bun run build.ts --watch --reload",
     "dev": "concurrently -k -n build,firefox -c blue,magenta \"bun run build:watch\" \"bun run dev:firefox\"",
     "capture:store": "bun run scripts/capture-store-assets.ts",
     "adapter:try": "bun run tools/adapter-try.ts",

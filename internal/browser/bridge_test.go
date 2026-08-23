@@ -14707,3 +14707,119 @@ func TestSurfaceCloseSupersededAuthorizesOnlyANonDrivingTab(t *testing.T) {
 		})
 	}
 }
+
+func TestRequestDevReloadRequiresHolder(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	_, _, err := b.RequestDevReload()
+	if err == nil || err.Error() != "no browser session holds the bridge" {
+		t.Fatalf("RequestDevReload without holder err = %v, want %q", err, "no browser session holds the bridge")
+	}
+}
+
+func TestRequestDevReloadRejectsOldExtensionVersionAndDoesNotLatch(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSyncAs(t, b, sessA, helloAs("0.14.0"))
+	_, _, err := b.RequestDevReload()
+	if err == nil {
+		t.Fatal("RequestDevReload against 0.14.0 extension was accepted")
+	}
+	if !strings.Contains(err.Error(), "0.14.0") || !strings.Contains(err.Error(), DevReloadMinExtensionVersion) {
+		t.Fatalf("error = %q, want both versions %q and %q named", err.Error(), "0.14.0", DevReloadMinExtensionVersion)
+	}
+	msgs, _ := runSyncAs(t, b, sessA)
+	if firstOfType(msgs, protocol.MsgDevReload) != nil {
+		t.Fatalf("rejected dev_reload was still latched: %v", msgs)
+	}
+	b.mu.Lock()
+	latched := b.holder != nil && b.holder.pendingDevReload != ""
+	b.mu.Unlock()
+	if latched {
+		t.Fatal("pendingDevReload is latched after a version-gated refusal")
+	}
+}
+
+func TestRequestDevReloadHappyPathEmitsOnNextSync(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	sid, reloadID, err := b.RequestDevReload()
+	if err != nil {
+		t.Fatalf("RequestDevReload: %v", err)
+	}
+	if sid != sessA {
+		t.Fatalf("session id = %q, want %q", sid, sessA)
+	}
+	if reloadID == "" {
+		t.Fatal("reload_id is empty")
+	}
+	msgs, _ := runSyncAs(t, b, sessA)
+	got := firstOfType(msgs, protocol.MsgDevReload)
+	if got == nil {
+		t.Fatalf("next Sync did not emit dev_reload, got %v", msgs)
+	}
+	payload, ok := got.Payload.(*protocol.DevReloadPayload)
+	if !ok {
+		t.Fatalf("payload type = %T, want *DevReloadPayload", got.Payload)
+	}
+	if payload.ReloadID != reloadID {
+		t.Fatalf("reload_id = %q, want %q", payload.ReloadID, reloadID)
+	}
+	if got.JobID != "" {
+		t.Fatalf("dev_reload job_id = %q, want empty (job-free)", got.JobID)
+	}
+}
+
+func TestDevReloadLatchIsOneShotStopsReloadLoop(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	_, reloadID, err := b.RequestDevReload()
+	if err != nil {
+		t.Fatalf("RequestDevReload: %v", err)
+	}
+	msgs, _ := runSyncAs(t, b, sessA)
+	if firstOfType(msgs, protocol.MsgDevReload) == nil {
+		t.Fatalf("first Sync after latch did not emit dev_reload")
+	}
+	msgs, _ = runSyncAs(t, b, sessA)
+	if second := firstOfType(msgs, protocol.MsgDevReload); second != nil {
+		t.Fatalf("second Sync re-emitted dev_reload %v with reload_id %q; latch must be one-shot to stop a reload loop", msgs, second.Payload.(*protocol.DevReloadPayload).ReloadID)
+	}
+	// A second latch must produce a fresh id, not replay the old one.
+	_, secondID, err := b.RequestDevReload()
+	if err != nil {
+		t.Fatalf("second RequestDevReload: %v", err)
+	}
+	if secondID == reloadID {
+		t.Fatalf("second reload_id %q equals first %q; each latch must be distinct", secondID, reloadID)
+	}
+	msgs, _ = runSyncAs(t, b, sessA)
+	got := firstOfType(msgs, protocol.MsgDevReload)
+	if got == nil || got.Payload.(*protocol.DevReloadPayload).ReloadID != secondID {
+		t.Fatalf("fresh latch not emitted: %v want %q", msgs, secondID)
+	}
+	msgs, _ = runSyncAs(t, b, sessA)
+	if firstOfType(msgs, protocol.MsgDevReload) != nil {
+		t.Fatalf("fresh latch was not one-shot: %v", msgs)
+	}
+}
+
+func TestDevReloadPendingSessionDoesNotReceiveHolderLatch(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	runSyncAs(t, b, sessB, helloAs("0.15.0"))
+	_, reloadID, err := b.RequestDevReload()
+	if err != nil {
+		t.Fatalf("RequestDevReload: %v", err)
+	}
+	msgs, _ := runSyncAs(t, b, sessB)
+	if got := firstOfType(msgs, protocol.MsgDevReload); got != nil {
+		t.Fatalf("pending session received holder's dev_reload %v", msgs)
+	}
+	msgs, _ = runSyncAs(t, b, sessA)
+	got := firstOfType(msgs, protocol.MsgDevReload)
+	if got == nil {
+		t.Fatalf("holder did not receive its own latched dev_reload")
+	}
+	if got.Payload.(*protocol.DevReloadPayload).ReloadID != reloadID {
+		t.Fatalf("holder reload_id = %q, want %q", got.Payload.(*protocol.DevReloadPayload).ReloadID, reloadID)
+	}
+}

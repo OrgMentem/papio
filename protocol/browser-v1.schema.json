@@ -101,7 +101,8 @@
         "authentication_claim_request",
         "authentication_claim_response",
         "claim_observation",
-        "claim_observation_ack"
+        "claim_observation_ack",
+        "dev_reload"
       ]
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
@@ -6721,6 +6722,26 @@
                 "then": { "not": { "required": ["lease_until"] } }
               }
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "dev_reload" } }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reload_id"],
+            "properties": {
+              "reload_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              }
+            }
           }
         }
       }

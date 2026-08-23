@@ -21443,3 +21443,84 @@ test("a refused tab group keeps the handoff tab and the drive", async () => {
   await h.port.inbound(jobOffer("job_group_refused"));
   expect(h.tabs.list().filter((tab) => tab.url === OPENURL).length).toBe(1);
 });
+test("dev_reload with installType development reloads the extension exactly once", async () => {
+  let reloaded = 0;
+  const installType = "development";
+  const devReload = {
+    installType: async () => installType,
+    reload: () => {
+      reloaded++;
+    },
+  };
+  const h = makeHarness();
+  (h.deps as BridgeDeps & { devReload: typeof devReload }).devReload = devReload;
+  await h.bridge.start();
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "dev_reload",
+    msg_id: "reload-msg-001",
+    seq: 1,
+    payload: { reload_id: "reload-12345" },
+  });
+  expect(reloaded).toBe(1);
+});
+
+test("dev_reload with installType normal does not reload — the guard that stops the daemon restarting a store-installed extension", async () => {
+  let reloaded = 0;
+  const installType = "normal";
+  const devReload = {
+    installType: async () => installType,
+    reload: () => {
+      reloaded++;
+    },
+  };
+  const h = makeHarness();
+  (h.deps as BridgeDeps & { devReload: typeof devReload }).devReload = devReload;
+  await h.bridge.start();
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "dev_reload",
+    msg_id: "reload-msg-002",
+    seq: 1,
+    payload: { reload_id: "reload-12345" },
+  });
+  expect(reloaded).toBe(0);
+});
+
+test("dev_reload with no seam does not throw and does not disconnect the bridge", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  expect(h.port.disconnected).toBe(false);
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "dev_reload",
+    msg_id: "reload-msg-003",
+    seq: 1,
+    payload: { reload_id: "reload-12345" },
+  });
+  expect(h.port.disconnected).toBe(false);
+});
+
+test("dev_reload when installType rejects is handled without throwing and without reloading", async () => {
+  let reloaded = 0;
+  const devReload = {
+    installType: async () => {
+      throw new Error("installType failed");
+    },
+    reload: () => {
+      reloaded++;
+    },
+  };
+  const h = makeHarness();
+  (h.deps as BridgeDeps & { devReload: typeof devReload }).devReload = devReload;
+  await h.bridge.start();
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "dev_reload",
+    msg_id: "reload-msg-004",
+    seq: 1,
+    payload: { reload_id: "reload-12345" },
+  });
+  expect(reloaded).toBe(0);
+  expect(h.port.disconnected).toBe(false);
+});

@@ -106,6 +106,8 @@ export type BrowserMessageType =
   | "terms_effect_result"
   | "surface_close_request"
   | "surface_close_response"
+  // daemon-to-extension development-mode reload command
+  | "dev_reload"
   | "authentication_claim_request"
   | "authentication_claim_response"
   | "claim_observation"
@@ -1247,6 +1249,14 @@ export interface SurfaceCloseResponsePayload {
   detail?: string;
 }
 
+/** Daemon-to-extension development-mode reload command. `reload_id` names
+ * one reload request so both sides can log the same identity, and so the
+ * daemon's one-shot latch is auditable. The frame is deliberately minimal —
+ * it carries no path, no version, and no URL. */
+export interface DevReloadPayload {
+  reload_id: string;
+}
+
 export interface InstitutionalBindingPair {
   binding_id: string;
   tab_id: number;
@@ -1526,6 +1536,7 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   terms_effect_result: true,
   surface_close_request: true,
   surface_close_response: true,
+  dev_reload: true,
   authentication_claim_request: true,
   authentication_claim_response: true,
   claim_observation: true,
@@ -6250,6 +6261,13 @@ function validatePayload(
         }
         if ("detail" in p) triageText(p, "detail", type, 1000);
       }
+      break;
+    }
+    case "dev_reload": {
+      requireFields<DevReloadPayload>(p, type, {
+        reload_id: "required",
+      });
+      institutionalID(p, "reload_id", type);
       break;
     }
     case "authentication_claim_request": {

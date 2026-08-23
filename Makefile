@@ -140,8 +140,10 @@ dev-deploy:
 	@$(DEV_BIN) jobs list --json >/dev/null
 	$(DEV_BIN) doctor
 	@echo "dev-deploy: $(DEV_VERSION) -> $(DEV_BIN) (host symlink repointed)"
-	@echo "dev-deploy: reload the extension now — Chrome: chrome://extensions -> Reload;" \
-	      "Firefox: about:debugging -> This Firefox -> Reload"
+	@# Used to need a manual click; a click on Chrome's Reload button reports success even when it silently does nothing — papio browser reload instead reports the NEW browser session id as proof the new bundle is live.
+	@# Prefixed with - so dev-deploy still succeeds with no browser connected or with a store-installed extension (the extension refuses dev_reload unless the browser reports it as an unpacked development load).
+	-$(DEV_BIN) browser reload
+	@echo "dev-deploy: manual fallback if reload was refused or no browser connected — Chrome: chrome://extensions -> Reload; Firefox: about:debugging -> This Firefox -> Reload"
 
 # Regenerate every Chrome Web Store visual asset (3 screenshots + 2 promo tiles)
 # from the real extension UI. Outputs to extension/web-ext-artifacts/store-assets/

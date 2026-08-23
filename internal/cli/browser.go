@@ -126,8 +126,75 @@ func newBrowserCommand(opt *options) *cobra.Command {
 		Short: "Recover daemon-owned browser effect permits",
 	}
 	permit.AddCommand(resolvePermit)
+	var reloadTimeout time.Duration
+	reload := &cobra.Command{
+		Use:   "reload",
+		Short: "Reload the connected development-mode extension from disk",
+		Long:  "Reload the connected development-mode extension from disk, replacing the manual chrome://extensions Reload click. It only affects an unpacked extension, because the extension refuses the command unless chrome.management.getSelf() reports installType \"development\". A new session id is the proof the new bundle is live.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			var before browserSessionsResult
+			if err := opt.call(ctx, "browser.sessions", map[string]any{}, &before); err != nil {
+				return err
+			}
+			var previous string
+			for _, s := range before.Sessions {
+				if s.Holder {
+					previous = s.ID
+					break
+				}
+			}
+			if previous == "" {
+				return errors.New("no browser session holds the bridge")
+			}
+			var result struct {
+				SessionID string `json:"session_id"`
+				ReloadID  string `json:"reload_id"`
+			}
+			if err := opt.call(ctx, "browser.dev_reload", map[string]any{}, &result); err != nil {
+				return err
+			}
+			if reloadTimeout == 0 {
+				return opt.printResult(result, "reload %s sent for browser session %s; not waiting for reconnect (--timeout=0)", result.ReloadID, shortSessionID(previous))
+			}
+			deadline := time.Now().Add(reloadTimeout)
+			ticker := time.NewTicker(250 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+				if time.Now().After(deadline) {
+					return fmt.Errorf("browser session %s did not reconnect within %s: the extension did not reconnect with a new session; a store-installed extension refuses dev_reload by design — this is the expected outcome when the loaded extension is not unpacked", shortSessionID(previous), reloadTimeout)
+				}
+				var cur browserSessionsResult
+				if err := opt.call(ctx, "browser.sessions", map[string]any{}, &cur); err != nil {
+					return err
+				}
+				var current string
+				for _, s := range cur.Sessions {
+					if s.Holder {
+						current = s.ID
+						break
+					}
+				}
+				if current != "" && current != previous {
+					return opt.printResult(result, "browser session %s reloaded; %s now holds the papio session", shortSessionID(previous), shortSessionID(current))
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-ticker.C:
+				}
+			}
+		},
+	}
+	reload.Flags().DurationVar(&reloadTimeout, "timeout", 15*time.Second, "how long to wait for the reloaded extension to reconnect (0 waits not at all)")
 
-	command.AddCommand(sessions, use, permit)
+	command.AddCommand(sessions, use, permit, reload)
 	return command
 }
 

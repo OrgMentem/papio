@@ -23,6 +23,17 @@ execution records kept during the initial build.
   condition and leaves the choice to you, exactly as it does for a paper holding
   two captures. It falls silent once one of the two has finished, since a fresh
   attempt after a completed one is not a duplicate.
+- **`papio browser reload` reloads a development extension without a mouse
+  click.** Working on the extension used to end with a click on Chrome's
+  **Reload** button, which cannot be scripted and which reports success even
+  when it does nothing. The new command sends one `dev_reload` command down the
+  connection the browser already holds, then waits for the extension to come
+  back and reports the new session id — the only proof that the new bundle is
+  the one running. It refuses to guess: a browser that does not reconnect
+  inside `--timeout` is reported as a failure, and the extension itself
+  declines the command unless the browser reports it as an unpacked
+  development load, so a store-installed *papio* is never restarted. `make
+  dev-deploy` now runs it for you.
 - **The inbox now answers "which paper is this?" itself, instead of telling you
   to go and type an identifier.** A captured PDF that *papio* could not file on
   its own parks in the inbox, and until now the button on that row printed a

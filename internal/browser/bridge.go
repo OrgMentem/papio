@@ -131,6 +131,9 @@ const (
 	// ProviderDirectGetMinExtensionVersion gates the additive frame away from
 	// released 0.13.x sessions whose strict parser cannot know this message.
 	ProviderDirectGetMinExtensionVersion = "0.14.0"
+	// DevReloadMinExtensionVersion gates dev_reload away from released 0.14.x
+	// sessions whose strict parser rejects the unknown type outright.
+	DevReloadMinExtensionVersion = "0.15.0"
 	// pageBulkConsumer is the sole daemon-assigned consumer for every job
 	// created through page_bulk_submit_request (ADR-0019 Decision 6). The
 	// extension never supplies it.
@@ -567,6 +570,12 @@ type browserSession struct {
 	// takeover needs no flag: it drops the previous holder outright, whose
 	// next poll is answered with expected_hello.
 	demotedNotice bool
+	// pendingDevReload holds one un-delivered dev_reload's reload_id ("" when
+	// none). It is cleared the moment the frame is emitted, and dropped with
+	// the session: a reload tears the native port down, so the reloaded
+	// extension arrives as a NEW session and must never inherit the command
+	// that killed its predecessor. That is what stops a reload loop.
+	pendingDevReload string
 }
 
 // legacySessionID stands in for native hosts older than the session_id field.
@@ -843,6 +852,23 @@ func (b *Bridge) Claim(sessionID string) (string, error) {
 	return b.holder.ID, nil
 }
 
+// RequestDevReload latches a one-shot dev_reload for the current holder.
+// Returns the session id it was latched for and the reload id.
+func (b *Bridge) RequestDevReload() (sessionID string, reloadID string, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.holder == nil {
+		return "", "", errors.New("no browser session holds the bridge")
+	}
+	if compareVersion(b.holder.ExtensionVersion, DevReloadMinExtensionVersion) < 0 {
+		return "", "", fmt.Errorf("browser extension v%s does not support dev_reload (needs v%s)", b.holder.ExtensionVersion, DevReloadMinExtensionVersion)
+	}
+	reloadID = job.NewID("reload")
+	b.holder.pendingDevReload = reloadID
+	log.Printf("papio: dev_reload %s latched for browser session %s", reloadID, shortSession(b.holder.ID))
+	return b.holder.ID, reloadID, nil
+}
+
 // promote makes session the holder. The caller holds b.mu. The previous
 // holder, when still present, is demoted to pending rather than dropped so an
 // explicit claim can be reversed with another claim.
@@ -1036,6 +1062,18 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 			return nil, err
 		}
 		out = append(out, busy...)
+	}
+	// A latched dev_reload leaves on the very next poll, ahead of any other
+	// work: the extension is about to restart, so nothing queued behind it
+	// would survive to be handled.
+	if b.holder != nil && b.holder.ID == sessionID && b.holder.pendingDevReload != "" {
+		reloadID := b.holder.pendingDevReload
+		b.holder.pendingDevReload = ""
+		frame, err := b.frame(protocol.MsgDevReload, "", protocol.DevReloadPayload{ReloadID: reloadID})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, frame)
 	}
 	for _, raw := range frames {
 		var msg *protocol.BrowserMessage

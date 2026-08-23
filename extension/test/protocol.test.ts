@@ -4155,3 +4155,40 @@ test("authentication_claim/claim_observation corpus fixtures parse when the sibl
     expect(() => parseBrowserMessageBytes(text), name).toThrow(ProtocolError);
   }
 });
+test("dev_reload frame parses and its reload_id survives", () => {
+  const reloadID = "reload-12345";
+  const msg = parseBrowserMessage(
+    protocolFrame("dev_reload", { reload_id: reloadID }),
+  );
+  expect(msg.type).toBe("dev_reload");
+  expect(msg.payload["reload_id"]).toBe(reloadID);
+  expect(msg.job_id).toBeUndefined();
+});
+
+test("dev_reload frame missing reload_id throws", () => {
+  expect(() => parseBrowserMessage(protocolFrame("dev_reload", {}))).toThrow(
+    ProtocolError,
+  );
+});
+
+test("dev_reload frame whose reload_id violates ^[A-Za-z0-9_-]{8,128}$ throws", () => {
+  // too-short: fewer than 8 characters
+  expect(() =>
+    parseBrowserMessage(protocolFrame("dev_reload", { reload_id: "short" })),
+  ).toThrow(ProtocolError);
+  // illegal character: '!' is not in A-Za-z0-9_-
+  expect(() =>
+    parseBrowserMessage(
+      protocolFrame("dev_reload", { reload_id: "bad!char-123" }),
+    ),
+  ).toThrow(ProtocolError);
+});
+
+test("dev_reload frame with an unknown extra payload field throws", () => {
+  // This fail-closed property is why the reload command is a new message type rather than a field on an existing one.
+  expect(() =>
+    parseBrowserMessage(
+      protocolFrame("dev_reload", { reload_id: "reload-12345", extra: true }),
+    ),
+  ).toThrow(ProtocolError);
+});

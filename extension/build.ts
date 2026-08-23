@@ -134,12 +134,35 @@ async function buildAll(): Promise<void> {
 }
 
 const watching = process.argv.includes("--watch");
+const reloading = process.argv.includes("--reload");
 
+let buildSucceeded = false;
 try {
   await buildAll();
+  buildSucceeded = true;
 } catch (error) {
   console.error(error);
   if (!watching) process.exit(1);
+}
+if (buildSucceeded && reloading) {
+  await requestExtensionReload();
+}
+
+/** Tell a connected development-mode extension to reload itself from disk.
+ * Replaces the manual chrome://extensions Reload click: the daemon relays one
+ * dev_reload command over the native-messaging connection the browser already
+ * holds, and the native host delivers it within its 2s poll. Never fatal — a
+ * watcher must survive a stopped daemon or a browser that is not connected. */
+async function requestExtensionReload(): Promise<void> {
+  try {
+    const proc = Bun.spawn(["papio", "browser", "reload"], { stderr: "inherit" });
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) {
+      console.error("papio browser reload failed — is the daemon running and a development extension connected?");
+    }
+  } catch {
+    console.error("papio browser reload spawn failed — is papio on PATH?");
+  }
 }
 
 if (watching) {
@@ -149,12 +172,20 @@ if (watching) {
   const schedule = (): void => {
     clearTimeout(timer);
     timer = setTimeout(() => {
-      void buildAll().catch((error) => console.error(error));
+      void buildAll()
+        .then(() => {
+          if (reloading) void requestExtensionReload();
+        })
+        .catch((error) => console.error(error));
     }, 150);
   };
   for (const target of ["src", "icons"]) {
     fsWatch(target, { recursive: true }, schedule);
   }
   fsWatch("manifest.json", schedule);
-  console.log("watching src/, icons/, manifest.json — rebuilding on change (Ctrl-C to stop)");
+  console.log(
+    reloading
+      ? "watching src/, icons/, manifest.json — rebuilding and reloading extension on change (Ctrl-C to stop)"
+      : "watching src/, icons/, manifest.json — rebuilding on change (Ctrl-C to stop)",
+  );
 }

@@ -344,6 +344,20 @@ papio browser permit resolve <permit-id> [flags]
 | --- | --- | --- | --- |
 | `--reason` | `string` |  | operator reason recorded in the durable audit event |
 
+### `papio browser reload`
+
+Reload the connected development-mode extension from disk
+
+Reload the connected development-mode extension from disk, replacing the manual chrome://extensions Reload click. It only affects an unpacked extension, because the extension refuses the command unless chrome.management.getSelf() reports installType "development". A new session id is the proof the new bundle is live.
+
+```
+papio browser reload [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--timeout` | `duration` | `15s` | how long to wait for the reloaded extension to reconnect (0 waits not at all) |
+
 ### `papio browser sessions`
 
 List browser sessions connected since daemon start

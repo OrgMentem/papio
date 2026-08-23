@@ -431,6 +431,7 @@ There is also a link check, because `zensical build` prints a broken link as an
   Go and TS validators had exonerated the frame. Same spirit: replay a suspect frame
   through the real parsers in isolation (`parseBrowserMessage` under bun,
   `protocol.DecodeBrowserMessage` in a throwaway Go main) before touching a browser.
+- **`dev_reload` is gated by `DevReloadMinExtensionVersion = "0.15.0"` in `internal/browser/bridge.go`, same mechanism as `ProviderDirectGetMinExtensionVersion`.** The frame is a NEW message type rather than a field on an existing one because both parsers reject unknown fields — a daemon that sent it to a 0.14.x extension would have the whole message rejected. Consequence: `papio browser reload` against an extension below 0.15.0 fails with a version message; rebuild and load the new bundle (the one reload you still have to do by hand) to fix it.
 
 ### Browser sessions & holder arbitration
 - **Only one connected browser holds the bridge; the rest poll as pending.** Two browsers
@@ -521,18 +522,7 @@ There is also a link check, because `zensical build` prints a broken link as an
   (phase, `tab_id`, `lease_until`) and `claim_observation_journal`. A claim whose
   `tab_id` no longer exists, beside an empty journal, is this section's second footgun.
   `papio jobs show <id>` timestamps the daemon's side of the same story.
-- **Verify an extension reload actually happened — `papio browser sessions` must show a
-  NEW session id.** A reload tears down the native port, so the daemon logs
-  `browser session <id> disconnected` and the next id differs. This is not pedantry:
-  an accessibility `press()` on chrome://extensions' own **Reload** button reports
-  success and silently does nothing (same synthesized-activation limit as the popup
-  button above), so a whole smoke run can be spent measuring a stale build while
-  believing the fix is loaded — including "adoption survived a reload" conclusions
-  drawn from a reload that never occurred. A page whose URL lacks the `dist/` prefix
-  is the other tell that the running bundle predates the page-path fix. What does
-  work is a real pointer **click** at the Reload icon's screenshot coordinates
-  (`window.click(x, y)`) — the disconnect appears in `daemon.log` within seconds
-  and the session id changes. Confirm that before trusting a single observation.
+- **Verify an extension reload actually happened — `papio browser sessions` must show a NEW session id.** A reload tears down the native port, so the daemon logs `browser session <id> disconnected` and the next id differs. This is not pedantry: an accessibility `press()` on chrome://extensions' own **Reload** button reports success and silently does nothing (same synthesized-activation limit as the popup button above), so a whole smoke run can be spent measuring a stale build while believing the fix is loaded — including "adoption survived a reload" conclusions drawn from a reload that never occurred. A page whose URL lacks the `dist/` prefix is the other tell that the running bundle predates the page-path fix. `papio browser reload` is the way to reload: it relays one `dev_reload` frame over the connection the browser already holds; the native host delivers it inside its 2-second poll (`internal/nativehost/host.go:46`); the extension calls `chrome.runtime.reload()`; and the command then WAITS and reports the new holder session id, so the verification is no longer a ritual a human can forget. A real pointer **click** at the Reload icon's screenshot coordinates (`window.click(x, y)`) remains the fallback when no daemon or no connected extension is available. By design the extension declines `dev_reload` unless `chrome.management.getSelf()` reports `installType === "development"` — `chrome.runtime.reload()` on a store-installed copy re-reads nothing and only restarts the worker.
 
 ### Automation detection (this is load-bearing — papio's whole value is "real human browser")
 - **Never drive the user's browser via WebDriver/BiDi for real work.** Firefox BiDi sets
@@ -560,8 +550,7 @@ There is also a link check, because `zensical build` prints a broken link as an
   devtools-RDP connection (shows the "robot" address-bar icon; does **not** set
   `navigator.webdriver`) — fine for iteration, but for real Cloudflare-walled providers load
   the built `firefox/` manually via `about:debugging` instead.
-- **MV3 SW lifecycle**: `chrome.runtime.reload()` from the SW leaves it **dormant** (not
-  re-registered as a target). Wake it by loading an extension page (`dist/options.html`).
+- **MV3 SW lifecycle**: `chrome.runtime.reload()` on an UNPACKED extension re-reads the files from disk — Chromium's `ExtensionRegistrar::DoReloadExtension` (`extensions/browser/extension_registrar.cc:1143-1223`) disables the loaded copy and then calls `LoadExtensionForReload(id, path)`. The docs state the same from outside: an unpacked reload "is treated as an update" and fires `chrome.runtime.onInstalled` with reason `"update"`, including via `chrome.runtime.reload()` (https://developer.chrome.com/docs/extensions/reference/api/runtime#unpacked). That `onInstalled` dispatch is what starts the worker, which is exactly why `extension/src/background.ts` registers a bodyless top-level `onInstalled` listener. The old "dormant" note described the CDP/DevTools target not being re-registered — a debugging artifact, not a dead worker. A genuinely sleeping worker still wakes when you load an extension page (`dist/options.html`).
 - A fresh dev-Chrome profile has the library **SSO** but **not per-publisher entitlements** —
   providers paywall unless reached via the resolver/proxy. `?accountid=<id>` is the exception
   for ProQuest (see below).

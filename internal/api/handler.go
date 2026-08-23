@@ -433,6 +433,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"browser.claim": func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserClaim(raw, system)
 		},
+		"browser.dev_reload": func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return browserDevReload(raw, system)
+		},
 		"browser.effect_permit.resolve": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserResolveEffectPermit(ctx, raw, system)
 		},
@@ -1674,6 +1677,22 @@ func browserClaim(raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.R
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "unknown browser session")}
 	}
 	return marshal(map[string]any{"claimed": true, "session_id": resolved})
+}
+
+// browserDevReload latches a one-shot dev_reload for the current holder so a
+// development-mode extension reloads itself from disk. It never restarts a
+// store-installed extension: the extension refuses the frame unless
+// chrome.management.getSelf() reports installType "development".
+func browserDevReload(raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	sessionID, reloadID, err := system.Browser.RequestDevReload()
+	if err != nil {
+		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "no browser session holds the bridge")}
+	}
+	return marshal(map[string]any{"session_id": sessionID, "reload_id": reloadID})
 }
 
 func browserResolveEffectPermit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

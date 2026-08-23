@@ -931,6 +931,13 @@ const (
 	MsgAuthenticationClaimResponse = "authentication_claim_response"
 	MsgClaimObservation            = "claim_observation"
 	MsgClaimObservationAck         = "claim_observation_ack"
+	// dev_reload asks a development-mode (unpacked) extension to reload itself
+	// from disk, replacing the manual chrome://extensions Reload click. It is
+	// daemon-to-extension only and job-free: it names one reload request and
+	// carries no path, version, or URL. The extension refuses it unless
+	// chrome.management.getSelf() reports installType "development", so a
+	// store-installed copy can never be restarted by this frame.
+	MsgDevReload = "dev_reload"
 )
 
 // EffectPermitFeature negotiates durable reconciliation before an irreversible
@@ -2481,6 +2488,15 @@ type PageBulkSubmitV2ResultPayload struct {
 	Invalid          int64  `json:"invalid"`
 }
 
+// DevReloadPayload names one dev_reload request. See MsgDevReload.
+type DevReloadPayload struct {
+	ReloadID string `json:"reload_id"`
+}
+
+func (p *DevReloadPayload) validate() error {
+	return institutionalID("dev_reload.reload_id", p.ReloadID)
+}
+
 // BrowserMessage is one decoded native-messaging envelope. Payload holds the
 // type-specific struct (e.g. *HelloPayload).
 type BrowserMessage struct {
@@ -3654,6 +3670,15 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			if _, present := payloadFields["disposition"]; present {
 				err = p.validate()
 			}
+		}
+		msg.Payload = p
+	case MsgDevReload:
+		p := &DevReloadPayload{}
+		if err = browserRequireFields(payloadFields, "reload_id"); err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgAck, MsgJobReject, MsgCancel, MsgHandoffFocus:
