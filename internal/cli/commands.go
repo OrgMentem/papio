@@ -898,16 +898,6 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor fun
 	return targets, droppedForMissingJob
 }
 
-// actionURLs preserves the URL-only helper used by dry-run and JSON rendering.
-func actionURLs(actions []job.HumanAction, rows []job.Row, instFor func(string) (config.Institution, bool), limit int) (urls []string, droppedForMissingJob int) {
-	targets, droppedForMissingJob := actionHandoffTargets(actions, rows, instFor, limit)
-	urls = make([]string, 0, len(targets))
-	for _, target := range targets {
-		urls = append(urls, target.URL)
-	}
-	return urls, droppedForMissingJob
-}
-
 func actionURL(action job.HumanAction, row job.Row, instFor func(string) (config.Institution, bool)) (string, bool) {
 	return app.ResolveHumanActionURL(action, row, instFor)
 }

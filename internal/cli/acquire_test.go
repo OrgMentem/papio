@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"papio/internal/api"
+	"papio/internal/batch"
 	"papio/internal/config"
 	"papio/internal/ipc"
 	"papio/internal/job"
@@ -41,7 +42,7 @@ func TestParseBatchAcceptsBareAndDiscoveredWork(t *testing.T) {
 	if requests[1].Identifiers == nil || requests[1].Identifiers.ArXiv != "2601.12345v2" || requests[1].DesiredVersion != "any" {
 		t.Fatalf("enveloped request = %+v", requests[1])
 	}
-	if !strings.HasPrefix(requests[0].RequestID, "batch-") || requests[0].RequestID != batchRequestID(requests[0].Identifiers, requests[0].Title, requests[0].Authors, requests[0].Year) {
+	if !strings.HasPrefix(requests[0].RequestID, "batch-") || requests[0].RequestID != batch.InitialRequestID(requests[0].Identifiers, requests[0].Title, requests[0].Authors, requests[0].Year) {
 		t.Fatalf("bare request ID = %q", requests[0].RequestID)
 	}
 }
@@ -84,7 +85,7 @@ func TestParseBatchInputRIS(t *testing.T) {
 		if requests[i].Identifiers == nil || requests[i].Identifiers.DOI != wantDOI {
 			t.Fatalf("request %d = %+v, want DOI %q", i, requests[i], wantDOI)
 		}
-		if wantID := batchRequestID(requests[i].Identifiers, requests[i].Title, requests[i].Authors, requests[i].Year); requests[i].RequestID != wantID {
+		if wantID := batch.InitialRequestID(requests[i].Identifiers, requests[i].Title, requests[i].Authors, requests[i].Year); requests[i].RequestID != wantID {
 			t.Fatalf("request %d ID = %q, want %q", i, requests[i].RequestID, wantID)
 		}
 	}
@@ -148,7 +149,7 @@ func TestApplyBatchOwnershipSkipsOwnedCopiesAndPinsMissingPDF(t *testing.T) {
 		{Status: zotio.OwnershipOwnedMissingPDF, ItemKey: "MISS0001"},
 	}}
 
-	pending, skipped, err := applyBatchOwnership(requests, ownership, " Reading ", false)
+	pending, skipped, err := batch.ApplyOwnership(requests, ownership, " Reading ", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +160,7 @@ func TestApplyBatchOwnershipSkipsOwnedCopiesAndPinsMissingPDF(t *testing.T) {
 		t.Fatalf("batch routes = %+v", pending)
 	}
 
-	included, skipped, err := applyBatchOwnership(requests, ownership, "Reading", true)
+	included, skipped, err := batch.ApplyOwnership(requests, ownership, "Reading", true)
 	if err != nil {
 		t.Fatal(err)
 	}

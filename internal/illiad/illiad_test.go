@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -232,6 +233,83 @@ func TestErrorClassification(t *testing.T) {
 			}
 			if test.wantWait != 0 && wait != test.wantWait {
 				t.Fatalf("retry wait = %v, want %v", wait, test.wantWait)
+			}
+		})
+	}
+}
+
+func TestFailureClassOfFailsClosed(t *testing.T) {
+	var nilFailure *FailureError
+	cause := errors.New("transport failed")
+
+	for _, test := range []struct {
+		name      string
+		err       error
+		wantClass FailureClass
+		wantOK    bool
+	}{
+		{name: "missing error fails closed", wantClass: FailureAmbiguous},
+		{name: "typed nil failure fails closed", err: nilFailure, wantClass: FailureAmbiguous},
+		{name: "pre-send stays replayable", err: &FailureError{Class: FailurePreSend, Err: cause}, wantClass: FailurePreSend, wantOK: true},
+		{name: "ambiguous stays non-replayable", err: &FailureError{Class: FailureAmbiguous, Err: cause}, wantClass: FailureAmbiguous, wantOK: true},
+		{name: "missing class stays ambiguous", err: &FailureError{Err: cause}, wantClass: FailureAmbiguous},
+		{name: "unknown class stays ambiguous", err: &FailureError{Class: FailureClass("unrecognised"), Err: cause}, wantClass: FailureAmbiguous},
+		{name: "empty class stays ambiguous", err: &FailureError{Class: "", Err: cause}, wantClass: FailureAmbiguous},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gotClass, gotOK := FailureClassOf(test.err)
+			if gotClass != test.wantClass || gotOK != test.wantOK {
+				t.Fatalf("FailureClassOf(%v) = (%q, %v), want (%q, %v)", test.err, gotClass, gotOK, test.wantClass, test.wantOK)
+			}
+		})
+	}
+}
+
+func TestFailureErrorPreservesCauseAndClassification(t *testing.T) {
+	cause := errors.New("transport failed")
+
+	for _, test := range []struct {
+		name      string
+		err       error
+		wantText  string
+		wantCause error
+		wantClass FailureClass
+	}{
+		{
+			name:      "nil cause explains trusted class",
+			err:       &FailureError{Class: FailurePreSend},
+			wantText:  "illiad: classified request failure (pre_send)",
+			wantClass: FailurePreSend,
+		},
+		{
+			name:      "cause text remains visible",
+			err:       &FailureError{Class: FailureAmbiguous, Err: cause},
+			wantText:  "transport failed",
+			wantCause: cause,
+			wantClass: FailureAmbiguous,
+		},
+		{
+			name:      "wrapped failure remains discoverable",
+			err:       fmt.Errorf("submit request: %w", &FailureError{Class: FailurePreSend, Err: cause}),
+			wantText:  "submit request: transport failed",
+			wantCause: cause,
+			wantClass: FailurePreSend,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.err.Error(); got != test.wantText {
+				t.Fatalf("Error() = %q, want %q", got, test.wantText)
+			}
+			if test.wantCause != nil && !errors.Is(test.err, test.wantCause) {
+				t.Fatalf("errors.Is(%v, cause) = false, want true", test.err)
+			}
+
+			var failure *FailureError
+			if !errors.As(test.err, &failure) {
+				t.Fatalf("errors.As(%v, *FailureError) = false, want true", test.err)
+			}
+			if failure.Class != test.wantClass {
+				t.Fatalf("FailureError.Class = %q, want %q", failure.Class, test.wantClass)
 			}
 		})
 	}

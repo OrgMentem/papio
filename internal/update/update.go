@@ -17,13 +17,11 @@ import (
 )
 
 const (
-	releasesURL          = "https://api.github.com/repos/orgmentem/papio/releases/latest"
-	ReleasesPageURL      = "https://github.com/orgmentem/papio/releases/latest"
-	ZotioReleasesURL     = "https://api.github.com/repos/OrgMentem/zotio/releases/latest"
-	ZotioReleasesPageURL = "https://github.com/OrgMentem/zotio/releases/latest"
-	cacheName            = "update-cache.json"
-	zotioCacheName       = "update-cache-zotio.json"
-	checkEvery           = 24 * time.Hour
+	releasesURL      = "https://api.github.com/repos/orgmentem/papio/releases/latest"
+	ZotioReleasesURL = "https://api.github.com/repos/OrgMentem/zotio/releases/latest"
+	cacheName        = "update-cache.json"
+	zotioCacheName   = "update-cache-zotio.json"
+	checkEvery       = 24 * time.Hour
 	// maxReleaseBody bounds the release payload the same way every resolver
 	// bounds an upstream response body.
 	maxReleaseBody = 1 << 20

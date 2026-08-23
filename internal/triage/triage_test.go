@@ -10,7 +10,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +28,181 @@ type staticSource struct{ items []Item }
 
 func (source staticSource) SnapshotItems(context.Context, *sql.Tx) ([]Item, error) {
 	return append([]Item(nil), source.items...), nil
+}
+
+func TestItemUnmarshalJSONValidKindsAndRoundTrips(t *testing.T) {
+	requiresAuth := true
+	cases := []struct {
+		name  string
+		input string
+		want  Item
+	}{
+		{
+			name:  "pdf grab",
+			input: `{"kind":"pdf_grab","label":"Needs DOI","grab":{"grab_id":"grab-1","state":"parked_no_identifier"},"route_class":"pdf_identifier_needed","blocked_by":"identifier_missing","attention":"required","ops":["provide_identifier","dismiss"]}`,
+			want: Item{
+				Kind: KindPdfGrab, Title: "Needs DOI",
+				Ops:     []string{"provide_identifier", "dismiss"},
+				PdfGrab: &PdfGrab{GrabID: "grab-1", State: "parked_no_identifier"},
+			},
+		},
+		{
+			name:  "watch hit",
+			input: `{"kind":"watch_hit","id":"watch:10.1000/example","rank":2000001,"title":"Example work","facts":[{"label":"Source","text":"Crossref"}],"links":[{"rel":"doi","url":"https://doi.org/10.1000/example"}],"ops":["open"],"work":{"doi":"10.1000/example","title":"Example work","authors":"Ada Lovelace","year":2026,"is_oa":true},"abstract":"A bounded abstract.","watches":[{"id":7,"label":"reading list"}],"first_seen_at":"2026-07-20T12:00:00Z"}`,
+			want: Item{
+				Kind: KindWatchHit, ID: "watch:10.1000/example", Rank: 2000001, Title: "Example work",
+				Facts: []Fact{{Label: "Source", Text: "Crossref"}},
+				Links: []Link{{Rel: "doi", URL: "https://doi.org/10.1000/example"}},
+				Ops:   []string{"open"},
+				WatchHit: &WatchHit{
+					Work:        Work{DOI: "10.1000/example", Title: "Example work", Authors: "Ada Lovelace", Year: 2026, IsOA: true},
+					Abstract:    "A bounded abstract.",
+					Watches:     []Watch{{ID: 7, Label: "reading list"}},
+					FirstSeenAt: "2026-07-20T12:00:00Z",
+				},
+			},
+		},
+		{
+			name:  "human action",
+			input: `{"kind":"human_action","id":"action:1","rank":1000001,"title":"Review example","facts":[],"links":[],"ops":["accept","reject"],"action_id":9,"job_id":"job-9","action_kind":"verify_identity","job_state":"needs_review","revision":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size_bytes":1234,"requires_auth":true,"blocked_by":"paywall"}`,
+			want: Item{
+				Kind: KindHumanAction, ID: "action:1", Rank: 1000001, Title: "Review example",
+				Facts: []Fact{}, Links: []Link{}, Ops: []string{"accept", "reject"},
+				HumanAction: &HumanAction{
+					ActionID: 9, JobID: "job-9", ActionKind: "verify_identity", JobState: "needs_review",
+					Revision: 2, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					SizeBytes: 1234, RequiresAuth: &requiresAuth, BlockedBy: "paywall",
+				},
+			},
+		},
+		{
+			name:  "retraction",
+			input: `{"kind":"retraction","id":"retraction:10.1000/example","rank":1,"title":"Retracted example","facts":[],"links":[],"ops":["acknowledge"],"doi":"10.1000/example","nature":"retraction","noticed_at":"2026-07-20T12:00:00Z","notice_doi":"10.1000/notice"}`,
+			want: Item{
+				Kind: KindRetraction, ID: "retraction:10.1000/example", Rank: 1, Title: "Retracted example",
+				Facts: []Fact{}, Links: []Link{}, Ops: []string{"acknowledge"},
+				Retraction: &Retraction{
+					DOI: "10.1000/example", Nature: "retraction",
+					NoticedAt: time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC),
+					NoticeDOI: "10.1000/notice",
+				},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got Item
+			if err := json.Unmarshal([]byte(tc.input), &got); err != nil {
+				t.Fatalf("unmarshal = %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("item = %+v, want %+v", got, tc.want)
+			}
+			// Count through bools, never []any: boxing a typed nil pointer
+			// yields a non-nil interface, so an []any of these fields counts
+			// every payload as set no matter what the decoder did.
+			set := 0
+			for _, isSet := range []bool{
+				got.WatchHit != nil, got.HumanAction != nil, got.Retraction != nil,
+				got.PdfGrab != nil, got.Family != nil,
+			} {
+				if isSet {
+					set++
+				}
+			}
+			if set != 1 {
+				t.Fatalf("set payload count = %d, want 1: %+v", set, got)
+			}
+			switch tc.want.Kind {
+			case KindPdfGrab:
+				if got.PdfGrab == nil || got.WatchHit != nil || got.HumanAction != nil || got.Retraction != nil || got.Family != nil {
+					t.Fatalf("payloads = %+v, want only PdfGrab", got)
+				}
+			case KindWatchHit:
+				if got.WatchHit == nil || got.PdfGrab != nil || got.HumanAction != nil || got.Retraction != nil || got.Family != nil {
+					t.Fatalf("payloads = %+v, want only WatchHit", got)
+				}
+			case KindHumanAction:
+				if got.HumanAction == nil || got.PdfGrab != nil || got.WatchHit != nil || got.Retraction != nil || got.Family != nil {
+					t.Fatalf("payloads = %+v, want only HumanAction", got)
+				}
+			case KindRetraction:
+				if got.Retraction == nil || got.PdfGrab != nil || got.WatchHit != nil || got.HumanAction != nil || got.Family != nil {
+					t.Fatalf("payloads = %+v, want only Retraction", got)
+				}
+			}
+
+			encoded, err := json.Marshal(tc.want)
+			if err != nil {
+				t.Fatalf("marshal = %v", err)
+			}
+			var roundTrip Item
+			if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+				t.Fatalf("round-trip unmarshal = %v", err)
+			}
+			if !reflect.DeepEqual(roundTrip, tc.want) {
+				t.Fatalf("round-trip item = %+v, want %+v", roundTrip, tc.want)
+			}
+		})
+	}
+}
+
+func TestItemUnmarshalJSONRejectsMalformedItems(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		message string
+	}{
+		{
+			name:    "unknown kind",
+			input:   `{"kind":"future_kind"}`,
+			message: "unsupported triage item kind",
+		},
+		{
+			name:    "unknown field",
+			input:   `{"kind":"future_kind","new_field":true}`,
+			message: `unknown field "new_field"`,
+		},
+		{
+			name:    "trailing data",
+			input:   `{"kind":"future_kind"} {}`,
+			message: "invalid character '{' after top-level value",
+		},
+		{
+			name:    "missing pdf grab field",
+			input:   `{"kind":"pdf_grab","label":"Needs DOI","route_class":"pdf_identifier_needed","blocked_by":"identifier_missing","attention":"required","ops":["provide_identifier","dismiss"]}`,
+			message: "invalid pdf grab item",
+		},
+		{
+			name:    "missing watch hit field",
+			input:   `{"kind":"watch_hit","work":{"doi":"10.1000/example","title":"Example work","authors":"Ada Lovelace","year":2026,"is_oa":true},"first_seen_at":"2026-07-20T12:00:00Z"}`,
+			message: "invalid watch hit item",
+		},
+		{
+			name:    "missing human action field",
+			input:   `{"kind":"human_action","action_id":9,"job_id":"job-9","action_kind":"verify_identity","job_state":"needs_review"}`,
+			message: "invalid human action item",
+		},
+		{
+			name:    "missing retraction field",
+			input:   `{"kind":"retraction","doi":"10.1000/example","nature":"retraction","notice_doi":"10.1000/notice"}`,
+			message: "invalid retraction item",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var item Item
+			err := json.Unmarshal([]byte(tc.input), &item)
+			if err == nil {
+				t.Fatal("unmarshal succeeded; want error")
+			}
+			if !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("error = %q, want substring %q", err, tc.message)
+			}
+		})
+	}
 }
 
 func triageTestService(t *testing.T) (*Service, *watch.Store, *job.Store) {

@@ -3,6 +3,7 @@ package ownership
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -54,6 +55,93 @@ func TestNormalizeIdentifier(t *testing.T) {
 				t.Fatalf("key = %q, want %q", got.Key(), tc.want)
 			}
 		})
+	}
+}
+
+func TestQueryFor(t *testing.T) {
+	tests := []struct {
+		name       string
+		doi        string
+		arxiv      string
+		pmid       string
+		version    string
+		entityKind string
+		want       Query
+	}{
+		{
+			name: "doi",
+			doi:  "https://doi.org/10.1234/ABC",
+			want: Query{Identifiers: []Identifier{{Kind: KindDOI, Value: "10.1234/abc"}}},
+		},
+		{
+			name:  "arxiv",
+			arxiv: "arXiv:2401.00001",
+			want:  Query{Identifiers: []Identifier{{Kind: KindArXiv, Value: "2401.00001"}}},
+		},
+		{
+			name: "pmid",
+			pmid: "0012345",
+			want: Query{Identifiers: []Identifier{{Kind: KindPMID, Value: "12345"}}},
+		},
+		{
+			name:       "all identifiers in canonical order",
+			doi:        "10.1234/DOI",
+			arxiv:      "2401.00001v2",
+			pmid:       "0012345",
+			version:    VersionPublished,
+			entityKind: EntityArticle,
+			want: Query{
+				Identifiers: []Identifier{
+					{Kind: KindDOI, Value: "10.1234/doi"},
+					{Kind: KindArXiv, Value: "2401.00001"},
+					{Kind: KindPMID, Value: "12345"},
+				},
+				DesiredVersion: VersionPublished,
+				EntityKind:     EntityArticle,
+			},
+		},
+		{
+			name: "all inputs empty",
+			want: Query{},
+		},
+		{
+			name:       "invalid and empty identifiers are dropped",
+			doi:        "not-a-doi",
+			arxiv:      " ",
+			pmid:       "PMC12345",
+			version:    VersionAny,
+			entityKind: EntityUnknown,
+			want: Query{
+				DesiredVersion: VersionAny,
+				EntityKind:     EntityUnknown,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := QueryFor(tt.doi, tt.arxiv, tt.pmid, tt.version, tt.entityKind); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("QueryFor() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+
+	// ADR-0008 makes ownership normalization version-collapsing: v3 names the
+	// same work as the unversioned arXiv identifier.
+	versioned := QueryFor("", "2401.00001v3", "", "", "")
+	unversioned := QueryFor("", "2401.00001", "", "", "")
+	if !reflect.DeepEqual(versioned, unversioned) {
+		t.Fatalf("versioned QueryFor() = %+v, unversioned = %+v", versioned, unversioned)
+	}
+
+	// ADR-0008 preserves repeated slash runs because these are separate
+	// registered works and must not collide.
+	doubledSlash := QueryFor("10.48612//monograph-2025-2", "", "", "", "")
+	singleSlash := QueryFor("10.48612/monograph-2025-2", "", "", "", "")
+	if doubledSlash.Identifiers[0].Value != "10.48612//monograph-2025-2" {
+		t.Fatalf("doubled slash = %+v, want the repeated slash preserved", doubledSlash)
+	}
+	if reflect.DeepEqual(doubledSlash, singleSlash) {
+		t.Fatalf("doubled and single slash queries collided: %+v", doubledSlash)
 	}
 }
 
@@ -190,6 +278,22 @@ func (s stubProvider) Name() string { return s.name }
 
 func (s stubProvider) Lookup(context.Context, []Query) ([][]Claim, SourceHealth) {
 	return s.claims, s.health
+}
+
+func TestRegistryNames(t *testing.T) {
+	registry := NewRegistry(
+		stubProvider{name: "zotero"},
+		stubProvider{name: "papis"},
+		stubProvider{name: "calibre"},
+	)
+	if got, want := registry.Names(), []string{"zotero", "papis", "calibre"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Names() = %v, want %v", got, want)
+	}
+
+	empty := NewRegistry()
+	if got := empty.Names(); got != nil {
+		t.Fatalf("Names() for an empty registry = %v, want nil", got)
+	}
 }
 
 func TestAggregateUnionsPositiveClaims(t *testing.T) {

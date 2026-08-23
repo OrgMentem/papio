@@ -357,18 +357,13 @@ func TestScheduleEligibleBrowserCandidatesKeysetContinuationIsDeterministic(t *t
 	if len(seen) != 8 {
 		t.Fatalf("continued keyset selected %d unique candidates, want 8", len(seen))
 	}
-	encoded, err := second.Cursor.Encode()
+	third, err := js.ScheduleEligibleBrowserCandidates(ctx, 4, second.Cursor)
 	if err != nil {
-		t.Fatalf("encode cursor: %v", err)
-	}
-	decoded := DecodeCandidateScheduleCursor(encoded)
-	third, err := js.ScheduleEligibleBrowserCandidates(ctx, 4, decoded)
-	if err != nil {
-		t.Fatalf("encoded keyset page: %v", err)
+		t.Fatalf("in-memory keyset page: %v", err)
 	}
 	for _, candidate := range third.Candidates {
 		if seen[candidate.CandidateID] {
-			t.Fatalf("encoded continuation repeated candidate %s", candidate.CandidateID)
+			t.Fatalf("in-memory continuation repeated candidate %s", candidate.CandidateID)
 		}
 	}
 }

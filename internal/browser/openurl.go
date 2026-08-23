@@ -12,11 +12,6 @@ import (
 
 const libKeyHost = "libkey.io"
 
-// OpenURL delegates to the shared application-layer resolver implementation.
-func OpenURL(base string, w work.Work) string {
-	return app.OpenURL(base, w)
-}
-
 // LibKeyURL delegates to the shared application-layer resolver implementation.
 func LibKeyURL(inst config.Institution, w work.Work) string {
 	return app.LibKeyURL(inst, w)

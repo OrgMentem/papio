@@ -67,7 +67,6 @@ import {
   INBOX_RUNTIME_MESSAGE_TYPES,
   needsVisibleWindow,
   normalizeManagedTabURL,
-  normalizeExpectedDOI,
   isBotChallenge,
   isRedirectLoopPage,
   executePlannedPageEffect,
@@ -15846,18 +15845,6 @@ test("assisted jobs still adopt a human-initiated download", async () => {
           frame.job_id === "job_assisted_human",
       ),
   ).toBe(true);
-});
-
-test("DOI normalization strips presentation prefixes but preserves repeated slashes", () => {
-  expect(normalizeExpectedDOI(" DOI: https://doi.org/10.1000//ABC ")).toBe(
-    "10.1000//abc",
-  );
-  expect(normalizeExpectedDOI("https://doi.org/10.1000//ABC")).toBe(
-    "10.1000//abc",
-  );
-  expect(normalizeExpectedDOI("10.1000/abc")).not.toBe(
-    normalizeExpectedDOI("10.1000//abc"),
-  );
 });
 
 describe("generic settled-unknown acquisition", () => {

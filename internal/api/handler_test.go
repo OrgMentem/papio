@@ -25,9 +25,11 @@ import (
 	"papio/internal/bootstrap"
 	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/grab"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/ownership"
+	"papio/internal/pdf"
 	"papio/internal/protocol"
 	"papio/internal/store/storetest"
 	"papio/internal/triage"
@@ -1475,5 +1477,280 @@ func TestLibraryLookupWorksBounds(t *testing.T) {
 		if _, rpcErr := libraryLookupWorks(context.Background(), raw, system); rpcErr == nil || rpcErr.Code != "invalid_argument" {
 			t.Fatalf("count %d: RPC error = %+v, want invalid_argument", count, rpcErr)
 		}
+	}
+}
+
+func seedAPIGrab(t *testing.T, system *bootstrap.System, name string) string {
+	t.Helper()
+	ctx := context.Background()
+	svc := grab.New(system.Store, nil)
+	g, err := svc.Allocate(ctx, "api-grab.example", "API grab "+name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(system.Config.DataDir, "api-grabs", g.ID, "paper.pdf")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("%PDF-1.7 api grab fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.MarkQuarantined(ctx, g.ID, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.MarkParkedNoIdentifier(ctx, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	return g.ID
+}
+
+func seedAPIEligibleJob(t *testing.T, system *bootstrap.System, requestID string, w work.Work) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := system.Jobs.CreateRequest(ctx, requestID, w, "", "",
+		job.Policy{AccessMode: config.ModeConservative, DesiredVersion: "any", FetchMaxBytes: 1 << 20},
+		nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateAwaitingHuman},
+	} {
+		if err := system.Jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := system.Jobs.OpenHumanAction(ctx, id, "manual_download", "API grab candidate", job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestRouterGrabIdentifyCoversWireValidationAndSuccess(t *testing.T) {
+	system := testSystem(t)
+	grabID := seedAPIGrab(t, system, "identify")
+	router := Router(system)
+
+	var result GrabIdentifyResult
+	if rpcErr := callMethod(t, router, "grabs.identify", map[string]any{
+		"grab_id": grabID, "kind": "doi", "value": "10.1234/api-identify",
+	}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if result.Outcome != "job_created" || result.JobID == "" || result.GrabID != grabID {
+		t.Fatalf("identify result = %+v, want the created job and grab", result)
+	}
+	row, err := grab.New(system.Store, nil).Get(context.Background(), grabID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row == nil || row.State != grab.StateJobCreated || row.JobID != result.JobID {
+		t.Fatalf("identified grab = %+v, want job_created bound to %q", row, result.JobID)
+	}
+
+	if rpcErr := callMethod(t, router, "grabs.identify", map[string]any{
+		"grab_id": grabID, "kind": "doi", "value": "10.1234/api-identify", "extra": true,
+	}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("malformed identify = %#v, want invalid_argument", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "grabs.identify", map[string]any{
+		"grab_id": grabID, "kind": "doi",
+	}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("missing identify value = %#v, want invalid_argument", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "grabs.identify", map[string]any{
+		"grab_id": "grab_missing_api", "kind": "doi", "value": "10.1234/api-missing",
+	}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	} else if result.Outcome != "unknown_grab" || result.Detail == "" {
+		t.Fatalf("missing grab result = %+v, want structured unknown_grab", result)
+	}
+}
+
+func TestRouterGrabSuggestionsCoversWireValidationAndLimits(t *testing.T) {
+	system := testSystem(t)
+	system.App.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text:       pdf.TextReport{Excerpt: "API suggestion fixture"},
+		}, nil
+	}
+	var wantJob string
+	for i := range 26 {
+		id := seedAPIEligibleJob(t, system, fmt.Sprintf("wr_api_grab_suggest_%02d", i), work.Work{
+			Title: fmt.Sprintf("API suggestion %02d", i), Authors: []string{"API Author"}, Year: 2026,
+			DOI: fmt.Sprintf("10.1234/api-suggestion-%02d", i),
+		})
+		if i == 0 {
+			wantJob = id
+		}
+	}
+	grabID := seedAPIGrab(t, system, "suggest")
+	router := Router(system)
+
+	var result GrabSuggestResult
+	if rpcErr := callMethod(t, router, "grabs.suggest", map[string]any{
+		"grab_id": grabID, "limit": 25,
+	}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if result.Outcome != "ok" || len(result.Suggestions) != 25 || !result.Truncated {
+		t.Fatalf("suggest result = %+v, want 25 rows and truncated=true", result)
+	}
+	found := false
+	for _, row := range result.Suggestions {
+		if row.JobID == wantJob && row.Title == "API suggestion 00" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("suggestions = %+v, want the candidate payload for %q", result.Suggestions, wantJob)
+	}
+	if rpcErr := callMethod(t, router, "grabs.suggest", map[string]any{
+		"grab_id": grabID, "limit": 999,
+	}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(result.Suggestions) != 25 || !result.Truncated {
+		t.Fatalf("oversized suggest limit = %d rows truncated=%v, want 25 true", len(result.Suggestions), result.Truncated)
+	}
+	if rpcErr := callMethod(t, router, "grabs.suggest", map[string]any{
+		"grab_id": grabID, "limit": "bad",
+	}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("malformed suggest = %#v, want invalid_argument", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "grabs.suggest", map[string]any{}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("missing suggest grab_id = %#v, want invalid_argument", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "grabs.suggest", map[string]any{
+		"grab_id": "grab_missing_api", "limit": 1,
+	}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	} else if result.Outcome != "unknown_grab" || result.Detail == "" {
+		t.Fatalf("missing suggestion grab = %+v, want structured unknown_grab", result)
+	}
+}
+
+func TestRouterGrabConfirmBindsChosenJobAndRefusesStaleCandidate(t *testing.T) {
+	system := testSystem(t)
+	system.App.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+		}, nil
+	}
+	jobID := seedAPIEligibleJob(t, system, "wr_api_grab_confirm", work.Work{
+		Title: "Chosen API paper", DOI: "10.1234/api-confirm",
+	})
+	grabID := seedAPIGrab(t, system, "confirm")
+	router := Router(system)
+	params := map[string]any{"grab_id": grabID, "job_id": jobID}
+
+	var result GrabConfirmResult
+	if rpcErr := callMethod(t, router, "grabs.confirm", params, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if result.Outcome != "job_created" || result.GrabID != grabID || result.JobID != jobID {
+		t.Fatalf("confirm result = %+v, want the chosen job", result)
+	}
+	row, err := grab.New(system.Store, nil).Get(context.Background(), grabID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row == nil || row.State != grab.StateJobCreated || row.JobID != jobID {
+		t.Fatalf("confirmed grab = %+v, want job_created bound to %q", row, jobID)
+	}
+
+	if rpcErr := callMethod(t, router, "grabs.confirm", params, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if result.Outcome != "wrong_state" || result.Detail == "" {
+		t.Fatalf("stale confirm result = %+v, want structured wrong_state refusal", result)
+	}
+	row, err = grab.New(system.Store, nil).Get(context.Background(), grabID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row == nil || row.JobID != jobID {
+		t.Fatalf("stale confirm rebound grab = %+v, want original job %q", row, jobID)
+	}
+
+	if rpcErr := callMethod(t, router, "grabs.confirm", map[string]any{
+		"grab_id": grabID, "job_id": jobID, "extra": true,
+	}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("malformed confirm = %#v, want invalid_argument", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "grabs.confirm", map[string]any{
+		"grab_id": grabID,
+	}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("missing confirm job_id = %#v, want invalid_argument", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "grabs.confirm", map[string]any{
+		"grab_id": "grab_missing_api", "job_id": jobID,
+	}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	} else if result.Outcome != "unknown_grab" || result.Detail == "" {
+		t.Fatalf("missing confirm grab = %+v, want structured unknown_grab", result)
+	}
+}
+
+func TestRouterGrabBindsUsesAgentJSONEnvelopeAndClampsLimit(t *testing.T) {
+	system := testSystem(t)
+	ctx := context.Background()
+	jobID := seedAPIEligibleJob(t, system, "wr_api_grab_binds", work.Work{Title: "Bind audit job"})
+	provenance := `{"method":"candidate_auto_bind","rule":"api-test-rule","winner":"` + jobID + `","candidates_considered":1}`
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for i := range 201 {
+		grabID := fmt.Sprintf("grab_api_bind_%03d", i)
+		if _, err := system.Store.DB().ExecContext(ctx, `
+			INSERT INTO pdf_grabs
+				(id, url_host, title, state, quarantine_path, job_id, outcome, detail,
+				 notified_at, created_at, updated_at, effect_request_id, bind_provenance)
+			VALUES (?, ?, ?, 'job_created', '', ?, 'job_created', '', NULL, ?, ?, '', ?)`,
+			grabID, "api-bind.example", grabID, jobID, now, now, provenance); err != nil {
+			t.Fatal(err)
+		}
+	}
+	router := Router(system)
+	var page struct {
+		Binds     []GrabBindRow `json:"binds"`
+		Truncated bool          `json:"truncated"`
+	}
+	if rpcErr := callMethod(t, router, "grabs.binds", map[string]any{"limit": 0}, &page); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(page.Binds) != 50 || !page.Truncated {
+		t.Fatalf("default binds page = %d rows truncated=%v, want 50 true", len(page.Binds), page.Truncated)
+	}
+	if page.Binds[0].JobID != jobID || page.Binds[0].Provenance.Method != "candidate_auto_bind" {
+		t.Fatalf("bind row = %+v, want job and provenance", page.Binds[0])
+	}
+	if rpcErr := callMethod(t, router, "grabs.binds", map[string]any{"limit": 200}, &page); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(page.Binds) != 200 || !page.Truncated {
+		t.Fatalf("boundary binds page = %d rows truncated=%v, want 200 true", len(page.Binds), page.Truncated)
+	}
+	if rpcErr := callMethod(t, router, "grabs.binds", map[string]any{"limit": 999}, &page); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(page.Binds) != 200 || !page.Truncated {
+		t.Fatalf("oversized binds page = %d rows truncated=%v, want 200 true", len(page.Binds), page.Truncated)
+	}
+	if rpcErr := callMethod(t, router, "grabs.binds", map[string]any{"limit": "bad"}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("malformed binds = %#v, want invalid_argument", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "grabs.binds", map[string]any{}, &page); rpcErr != nil {
+		t.Fatalf("empty binds params = %v, want valid default page", rpcErr)
+	}
+	system.Browser = nil
+	if rpcErr := callMethod(t, router, "grabs.binds", map[string]any{"limit": 1}, &page); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if page.Binds == nil || len(page.Binds) != 0 || page.Truncated {
+		t.Fatalf("unavailable binds page = %+v, want an empty non-truncated envelope", page)
 	}
 }

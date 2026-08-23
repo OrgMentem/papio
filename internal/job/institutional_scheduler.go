@@ -2,8 +2,6 @@ package job
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"sort"
 	"strings"
@@ -28,41 +26,6 @@ type CandidateScheduleCursor struct {
 	LastProfileID      string                          `json:"last_profile_id,omitempty"`
 	LastGroupByProfile map[string]string               `json:"last_group_by_profile,omitempty"`
 	Offsets            map[string]CandidateScheduleKey `json:"offsets,omitempty"`
-}
-
-// Encode returns an opaque, URL-safe cursor for a caller that needs to persist
-// scheduler continuation. Cursor contents are traversal metadata, not authority
-// and may safely be discarded; a discarded cursor merely restarts rotation.
-func (c CandidateScheduleCursor) Encode() (string, error) {
-	if c.Offsets == nil {
-		c.Offsets = map[string]CandidateScheduleKey{}
-	}
-	raw, err := json.Marshal(c)
-	if err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(raw), nil
-}
-
-// DecodeCandidateScheduleCursor decodes a previously returned cursor. Invalid
-// cursors fail closed to an empty rotation rather than becoming an eligibility
-// authority or causing a scheduler outage.
-func DecodeCandidateScheduleCursor(raw string) CandidateScheduleCursor {
-	if strings.TrimSpace(raw) == "" {
-		return CandidateScheduleCursor{}
-	}
-	decoded, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
-		return CandidateScheduleCursor{}
-	}
-	var c CandidateScheduleCursor
-	if json.Unmarshal(decoded, &c) != nil {
-		return CandidateScheduleCursor{}
-	}
-	if c.Offsets == nil {
-		c.Offsets = map[string]CandidateScheduleKey{}
-	}
-	return c
 }
 
 // BrowserCandidateDescriptor is the only object returned by the daemon

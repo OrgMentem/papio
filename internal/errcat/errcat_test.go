@@ -23,12 +23,20 @@ func TestExplainCategoriesAndGuidance(t *testing.T) {
 		accessMode   string
 		cfg          config.Config
 		wantCategory string
+		wantGuidance []string
 	}{
 		{name: "login required", state: "awaiting_human", reason: "institutional_handoff", wantCategory: "login_required"},
 		{name: "manual download", state: "awaiting_human", reason: "landing_page_only", wantCategory: "manual_download"},
 		{name: "identity review", state: "needs_review", reason: "semantic_or_identity_review", wantCategory: "identity_review"},
 		{name: "unsafe pdf", state: "needs_review", reason: "encrypted_or_active_content", wantCategory: "unsafe_pdf"},
 		{name: "retrying", state: "retry_wait", reason: "resolver_temporarily_unavailable", wantCategory: "retrying"},
+		{name: "open access browser handoff", state: "awaiting_human", reason: "open_access_browser_handoff", wantCategory: "browser_fetch_pending", wantGuidance: []string{"browser fetch", "`papio actions open`", "No login is required"}},
+		{name: "validation error", state: "needs_review", reason: "validation_error", wantCategory: "validation_incomplete", wantGuidance: []string{"inspect the quarantined file", "re-run or override"}},
+		{name: "doi not registered", state: "unavailable", reason: "doi_not_registered", wantCategory: "doi_not_registered", wantGuidance: []string{"DOI NOT FOUND", "Signing in will not help", "Check the DOI against the article's own page", "`papio acquire --doi <doi>`"}},
+		{name: "insufficient identity evidence", state: "needs_review", reason: "insufficient_identity_evidence", wantCategory: "insufficient_identity_evidence", wantGuidance: []string{"will not file a PDF on search evidence alone", "Re-submit with a DOI, PMID, or arXiv id", "human review"}},
+		{name: "document delivery pending", state: "awaiting_human", reason: "document_delivery_pending", wantCategory: "document_delivery_pending", wantGuidance: []string{"document-delivery request is lodged", "polling the provider", "No action needed"}},
+		{name: "candidate temporarily unavailable", state: "retry_wait", reason: "candidate_temporarily_unavailable", wantCategory: "retrying", wantGuidance: []string{"temporarily unavailable", "retry automatically", "No action needed"}},
+		{name: "acquisition inputs temporarily unavailable", state: "retry_wait", reason: "acquisition_inputs_temporarily_unavailable", wantCategory: "retrying", wantGuidance: []string{"temporarily unavailable", "retry automatically", "No action needed"}},
 		{
 			name: "no institution configured", state: "unavailable", reason: "no_legal_candidates",
 			accessMode: config.ModeDelegated, cfg: config.Config{AccessMode: config.ModeDelegated},
@@ -51,6 +59,11 @@ func TestExplainCategoriesAndGuidance(t *testing.T) {
 			got := Explain(test.state, test.reason, test.resolver, test.accessMode, test.cfg)
 			if got.Category != test.wantCategory {
 				t.Fatalf("category = %q, want %q", got.Category, test.wantCategory)
+			}
+			for _, want := range test.wantGuidance {
+				if !strings.Contains(got.Guidance, want) {
+					t.Fatalf("guidance = %q, want substring %q", got.Guidance, want)
+				}
 			}
 			if strings.TrimSpace(got.Guidance) == "" {
 				t.Fatalf("category %q has empty guidance", got.Category)
@@ -143,6 +156,60 @@ func TestExplainWithOpenActionNamesTheAdoptionRootForDownloadsAccess(t *testing.
 		if strings.Contains(got.Guidance, forbidden) {
 			t.Fatalf("guidance offers inapplicable remedy %q: %q", forbidden, got.Guidance)
 		}
+	}
+}
+
+func TestExplainWithOpenActionGuidance(t *testing.T) {
+	cfg := config.Config{AccessMode: config.ModeDelegated}
+	for _, test := range []struct {
+		name         string
+		kind         string
+		wantCategory string
+		wantGuidance []string
+	}{
+		{
+			name: "validation error", kind: "validation_error",
+			wantCategory: "validation_incomplete",
+			wantGuidance: []string{"inspect the quarantined file", "re-run or override"},
+		},
+		{
+			name: "unsafe pdf", kind: "unsafe_pdf",
+			wantCategory: "unsafe_pdf",
+			wantGuidance: []string{"encrypted or carries active/embedded content", "review it before adopting"},
+		},
+		{
+			name: "verify identity", kind: "verify_identity",
+			wantCategory: "identity_review",
+			wantGuidance: []string{"Confirm the downloaded PDF is the requested paper", "approve it to finish", "reject to try another source"},
+		},
+		{
+			name: "terms acceptance required", kind: "terms_acceptance_required",
+			wantCategory: "terms_acceptance_required",
+			wantGuidance: []string{"Review and accept the provider's terms in the browser", "retry the acquisition"},
+		},
+		{
+			name: "openurl available", kind: "openurl_available",
+			wantCategory: "openurl_available",
+			wantGuidance: []string{`set access_mode to "assisted" or "delegated"`, "retry the acquisition"},
+		},
+		{
+			name: "document delivery", kind: job.ActionKindDocumentDelivery,
+			wantCategory: "action_required",
+			wantGuidance: []string{"waiting on a human action", "`papio actions list`"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := ExplainWithOpenAction("awaiting_human", "", "", config.ModeDelegated,
+				[]job.HumanAction{{ID: 601, Kind: test.kind, Status: "open"}}, cfg)
+			if got.Category != test.wantCategory {
+				t.Fatalf("category = %q, want %q", got.Category, test.wantCategory)
+			}
+			for _, want := range test.wantGuidance {
+				if !strings.Contains(got.Guidance, want) {
+					t.Fatalf("guidance = %q, want substring %q", got.Guidance, want)
+				}
+			}
+		})
 	}
 }
 

@@ -1792,17 +1792,6 @@ function parseExpected(
     ...(doi !== undefined ? { doi } : {}),
   };
 }
-/** Normalize DOI presentation without changing DOI identity. Scheme/host and
- * the optional `doi:` label are case-insensitive; surrounding whitespace is
- * presentation, while repeated slashes in the DOI suffix remain significant. */
-export function normalizeExpectedDOI(value: string): string {
-  let normalized = value.trim().toLowerCase();
-  for (let pass = 0; pass < 2; pass += 1) {
-    normalized = normalized.replace(/^doi:\s*/i, "");
-    normalized = normalized.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "");
-  }
-  return normalized;
-}
 
 /** Compare only the stable, non-secret part of a provider download URL.
  * Chrome may normalize a signed query before onDeterminingFilename fires. */

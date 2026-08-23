@@ -326,10 +326,6 @@ export function popupOperation(doc: Document, operationKey: string): PopupOperat
   return popupOperations(doc).get(operationKey);
 }
 
-export function clearPopupOperation(doc: Document, operationKey: string): void {
-  popupOperations(doc).delete(operationKey);
-}
-
 /** Drop entries whose owner no longer exists. An error must persist until the
  * researcher retries it *or* its owner disappears — never merely because the
  * next poll happened. */
@@ -3616,6 +3612,15 @@ export function sessionWarmForJob(
     demandedOrigin.checking === false &&
     isFreshSessionTimestamp(demandedOrigin.lastVerdictAt);
 }
+/** Strip DOI presentation prefixes before comparison. URL wrappers add no identity, but repeated suffix slashes do. */
+function normalizeExpectedDOI(value: string): string {
+  let normalized = value.trim().toLowerCase();
+  for (let pass = 0; pass < 2; pass += 1) {
+    normalized = normalized.replace(/^doi:\s*/i, "");
+    normalized = normalized.replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "");
+  }
+  return normalized;
+}
 
 /** Tab, then unique expected DOI. */
 export function pageDeliveryJob(
@@ -3627,9 +3632,9 @@ export function pageDeliveryJob(
     if (byTab !== undefined) return byTab;
   }
   if (page.doi !== undefined && page.doi.trim() !== "") {
-    const normalized = page.doi.trim().toLowerCase().replace(/^doi:\s*/, "");
+    const normalized = normalizeExpectedDOI(page.doi);
     const byDOI = jobs.filter(
-      (job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === normalized,
+      (job) => job.expected?.doi !== undefined && normalizeExpectedDOI(job.expected.doi) === normalized,
     );
     if (byDOI.length === 1) return byDOI[0];
   }
@@ -3839,11 +3844,11 @@ export function renderPageContext(
     return;
   }
 
-  const normalizedDOI = page.doi.trim().toLowerCase().replace(/^doi:\s*/, "");
+  const normalizedDOI = normalizeExpectedDOI(page.doi);
   const idleLabel = `Acquire this page · ${normalizedDOI}`;
   button.dataset.idleLabel = idleLabel;
   const inFlightJob = jobs.find(
-    (job) => job.expected?.doi?.trim().toLowerCase().replace(/^doi:\s*/, "") === normalizedDOI,
+    (job) => job.expected?.doi !== undefined && normalizeExpectedDOI(job.expected.doi) === normalizedDOI,
   );
   if (inFlightJob === undefined) {
     setAcquireButton(button, idleLabel, false);

@@ -33,13 +33,6 @@ const (
 	// canonical fixture header is checked before bytes enter this store.
 	SanitizerProvenance = "papio.extension.sanitizer"
 	SanitizerVersion    = "1"
-
-	// Evidence labels are daemon-owned. A capture request may choose a scenario
-	// for display, but that label is not evidence that the page produced that
-	// outcome. UpdateJob marks captures only after a correlated provider
-	// outcome has been durably recorded.
-	EvidenceUntrusted   = "untrusted"
-	EvidenceIndependent = "independent"
 )
 
 var sanitizerFixtureHeader = regexp.MustCompile(`^<!-- papio-fixture provider="([^"]+)" scenario="([^"]+)" origin="([^"]+)" captured="([^"]+)" -->$`)

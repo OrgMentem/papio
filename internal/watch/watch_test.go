@@ -429,13 +429,13 @@ func discovered(doi, openAlex string) discovery.DiscoveredWork {
 }
 
 func TestOpenAlexOnlyDiscoveryRetainsIdentifier(t *testing.T) {
-	requests := requestsForDiscovered([]discovery.DiscoveredWork{
+	requestsWithWork := requestsForDiscoveredWithWork([]discovery.DiscoveredWork{
 		discovered("", "https://openalex.org/W2741809807"),
 	})
-	if len(requests) != 1 || requests[0].Identifiers == nil || requests[0].Identifiers.OpenAlex != "W2741809807" {
-		t.Fatalf("requests = %+v, want one request with its normalized OpenAlex identifier", requests)
+	if len(requestsWithWork) != 1 || requestsWithWork[0].Work.Identifiers == nil || requestsWithWork[0].Work.Identifiers.OpenAlex != "W2741809807" {
+		t.Fatalf("requests = %+v, want one request with its normalized OpenAlex identifier", requestsWithWork)
 	}
-	manifest := batch.NewManifest(requests, "watch: protocol", "", time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC))
+	manifest := batch.NewManifest([]protocol.WorkRequest{requestsWithWork[0].Work}, "watch: protocol", "", time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC))
 	if err := manifest.Works[0].Work.Validate(); err != nil {
 		t.Fatalf("OpenAlex-only discovery request is not protocol-valid: %v (%+v)", err, manifest.Works[0].Work)
 	}

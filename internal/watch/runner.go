@@ -579,15 +579,6 @@ type discoveredRequest struct {
 	Discovered discovery.DiscoveredWork
 }
 
-func requestsForDiscovered(works []discovery.DiscoveredWork) []protocol.WorkRequest {
-	requestsWithWork := requestsForDiscoveredWithWork(works)
-	requests := make([]protocol.WorkRequest, len(requestsWithWork))
-	for i, request := range requestsWithWork {
-		requests[i] = request.Work
-	}
-	return requests
-}
-
 func requestsForDiscoveredWithWork(works []discovery.DiscoveredWork) []discoveredRequest {
 	requests := make([]discoveredRequest, 0, len(works))
 	seen := make(map[string]struct{}, len(works))

@@ -4,6 +4,7 @@ package browser
 import (
 	"testing"
 
+	"papio/internal/app"
 	"papio/internal/config"
 	"papio/internal/work"
 )
@@ -77,7 +78,7 @@ func TestRouteURLFallsBackToOpenURL(t *testing.T) {
 	// …an ISBN-only work cannot, and must land on the plain resolver instead
 	// of dead-ending: LibKey augments institutional routing, never replaces it.
 	bookWork := work.Work{ISBN: "9780306406157", Title: "A book"}
-	if got, want := RouteURL(inst, bookWork), OpenURL(inst.OpenURLBase, bookWork); got != want {
+	if got, want := RouteURL(inst, bookWork), app.OpenURL(inst.OpenURLBase, bookWork); got != want {
 		t.Fatalf("RouteURL(book) = %q, want the OpenURL fallback %q", got, want)
 	}
 }

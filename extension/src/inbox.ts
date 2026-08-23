@@ -524,11 +524,6 @@ function handoffJobID(item: TriageSnapshotItem): string | null {
   if (item.kind !== "human_action" || item.action_kind !== "openurl_handoff" || typeof item.job_id !== "string") return null;
   return /^[A-Za-z0-9_-]{8,128}$/.test(item.job_id) ? item.job_id : null;
 }
-function manualDownloadJobID(item: TriageSnapshotItem): string | null {
-  if (item.kind !== "human_action" || item.action_kind !== "manual_download" || typeof item.job_id !== "string") return null;
-  return /^[A-Za-z0-9_-]{8,128}$/.test(item.job_id) ? item.job_id : null;
-}
-
 
 /** One-line bound for text papio did not author: collapse whitespace, cap the
  * length, and mark a truncation with an ellipsis. Every surface that prints

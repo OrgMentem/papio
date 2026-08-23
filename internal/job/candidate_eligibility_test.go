@@ -519,6 +519,270 @@ func TestSubmittedIdentityTxSeesOwnTransaction(t *testing.T) {
 	}
 }
 
+func seedAwaitingEligibilityJob(t *testing.T, js *Store, requestID string) string {
+	t.Helper()
+	ctx := context.Background()
+	jobID, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatalf("create %s: %v", requestID, err)
+	}
+	if err := js.Transition(ctx, jobID, StateQueued, StateResolving, nil); err != nil {
+		t.Fatalf("to resolving %s: %v", jobID, err)
+	}
+	if err := js.Transition(ctx, jobID, StateResolving, StateAwaitingHuman, nil); err != nil {
+		t.Fatalf("to awaiting_human %s: %v", jobID, err)
+	}
+	return jobID
+}
+
+func eligibilityJobState(t *testing.T, js *Store, jobID string) string {
+	t.Helper()
+	var state string
+	if err := js.S.DB().QueryRowContext(context.Background(), `SELECT state FROM jobs WHERE id = ?`, jobID).Scan(&state); err != nil {
+		t.Fatalf("read state %s: %v", jobID, err)
+	}
+	return state
+}
+
+func TestAdoptEligible(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+
+	eligibleID := seedAwaitingEligibilityJob(t, js, "wr_adopt_eligible")
+	if _, err := js.OpenHumanAction(ctx, eligibleID, ActionKindDocumentDelivery, "download", Access(false, "")); err != nil {
+		t.Fatalf("open broad adoption action: %v", err)
+	}
+	if got, err := js.AdoptEligible(ctx, eligibleID); err != nil || !got {
+		t.Fatalf("AdoptEligible eligible = %v, %v; want true, nil", got, err)
+	}
+
+	noActionID := seedAwaitingEligibilityJob(t, js, "wr_adopt_no_action")
+	if got, err := js.AdoptEligible(ctx, noActionID); err != nil || got {
+		t.Fatalf("AdoptEligible without action = %v, %v; want false, nil", got, err)
+	}
+
+	closedID := seedAwaitingEligibilityJob(t, js, "wr_adopt_closed")
+	actionID, err := js.OpenHumanAction(ctx, closedID, "manual_download", "download", Access(false, ""))
+	if err != nil {
+		t.Fatalf("open action to close: %v", err)
+	}
+	if err := js.ResolveHumanAction(ctx, actionID, "resolved"); err != nil {
+		t.Fatalf("resolve action: %v", err)
+	}
+	if got, err := js.AdoptEligible(ctx, closedID); err != nil || got {
+		t.Fatalf("AdoptEligible with closed action = %v, %v; want false, nil", got, err)
+	}
+
+	wrongStateID, err := js.CreateRequest(ctx, "wr_adopt_wrong_state", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatalf("create wrong-state job: %v", err)
+	}
+	if _, err := js.OpenHumanAction(ctx, wrongStateID, ActionKindDocumentDelivery, "download", Access(false, "")); err != nil {
+		t.Fatalf("open wrong-state action: %v", err)
+	}
+	if got, err := js.AdoptEligible(ctx, wrongStateID); err != nil || got {
+		t.Fatalf("AdoptEligible in wrong state = %v, %v; want false, nil", got, err)
+	}
+
+	if got, err := js.AdoptEligible(ctx, "missing-adopt-job"); err != nil || got {
+		t.Fatalf("AdoptEligible missing job = %v, %v; want false, nil", got, err)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if got, err := js.AdoptEligible(cancelled, eligibleID); !errors.Is(err, context.Canceled) || got {
+		t.Fatalf("AdoptEligible cancelled = %v, %v; want false, context.Canceled", got, err)
+	}
+}
+
+func TestAdoptEligibleTxSeesOwnTransaction(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const now = "2026-08-16T00:00:00Z"
+	insertJob := func(jobID, state, actionStatus string) {
+		t.Helper()
+		workRequestID := "wr_" + jobID
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO work_requests (id, created_at, requester, title, authors_json, year, desired_version, submitted_fields)
+			 VALUES (?, ?, 'cli', 'Tx Adoption', '["A"]', 2021, 'any', 'title')`, workRequestID, now); err != nil {
+			t.Fatalf("insert work_request %s: %v", jobID, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at) VALUES (?, ?, ?, '{}', ?, ?)`,
+			jobID, workRequestID, state, now, now); err != nil {
+			t.Fatalf("insert job %s: %v", jobID, err)
+		}
+		if actionStatus != "" {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO human_actions (job_id, kind, status, detail, requires_auth, blocked_by, revision, created_at)
+				 VALUES (?, 'document_delivery', ?, 'please', 0, '', 1, ?)`, jobID, actionStatus, now); err != nil {
+				t.Fatalf("insert action %s: %v", jobID, err)
+			}
+		}
+	}
+	insertJob("job_adopt_tx", StateAwaitingHuman, "open")
+	insertJob("job_adopt_tx_no_action", StateAwaitingHuman, "")
+	insertJob("job_adopt_tx_closed", StateAwaitingHuman, "resolved")
+	insertJob("job_adopt_tx_wrong_state", StateResolving, "open")
+
+	if got, err := AdoptEligibleTx(ctx, tx, "job_adopt_tx"); err != nil || !got {
+		t.Fatalf("AdoptEligibleTx own transaction = %v, %v; want true, nil", got, err)
+	}
+	for _, jobID := range []string{"job_adopt_tx_no_action", "job_adopt_tx_closed", "job_adopt_tx_wrong_state", "missing-adopt-tx-job"} {
+		if got, err := AdoptEligibleTx(ctx, tx, jobID); err != nil || got {
+			t.Fatalf("AdoptEligibleTx ineligible %s = %v, %v; want false, nil", jobID, err, got)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+func TestCandidateEligible(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+
+	manualID := seedAwaitingEligibilityJob(t, js, "wr_candidate_manual")
+	if _, err := js.OpenHumanAction(ctx, manualID, CandidateEligibleKind, "download", Access(false, "")); err != nil {
+		t.Fatalf("open manual action: %v", err)
+	}
+	if got, err := js.CandidateEligible(ctx, manualID); err != nil || !got {
+		t.Fatalf("CandidateEligible manual action = %v, %v; want true, nil", got, err)
+	}
+
+	broadOnlyID := seedAwaitingEligibilityJob(t, js, "wr_candidate_broad_only")
+	if _, err := js.OpenHumanAction(ctx, broadOnlyID, ActionKindDocumentDelivery, "delivery", Access(false, "")); err != nil {
+		t.Fatalf("open broad-only action: %v", err)
+	}
+	adoptGot, adoptErr := js.AdoptEligible(ctx, broadOnlyID)
+	candidateGot, candidateErr := js.CandidateEligible(ctx, broadOnlyID)
+	if adoptErr != nil || !adoptGot || candidateErr != nil || candidateGot {
+		t.Fatalf("broad versus candidate = AdoptEligible(%v, %v), CandidateEligible(%v, %v); want true, nil and false, nil", adoptGot, adoptErr, candidateGot, candidateErr)
+	}
+
+	noActionID := seedAwaitingEligibilityJob(t, js, "wr_candidate_no_action")
+	if got, err := js.CandidateEligible(ctx, noActionID); err != nil || got {
+		t.Fatalf("CandidateEligible without action = %v, %v; want false, nil", got, err)
+	}
+
+	wrongKindID := seedAwaitingEligibilityJob(t, js, "wr_candidate_wrong_kind")
+	if _, err := js.OpenHumanAction(ctx, wrongKindID, ActionKindDocumentDelivery, "delivery", Access(false, "")); err != nil {
+		t.Fatalf("open wrong-kind action: %v", err)
+	}
+	if got, err := js.CandidateEligible(ctx, wrongKindID); err != nil || got {
+		t.Fatalf("CandidateEligible wrong kind = %v, %v; want false, nil", got, err)
+	}
+
+	closedID := seedAwaitingEligibilityJob(t, js, "wr_candidate_closed")
+	actionID, err := js.OpenHumanAction(ctx, closedID, CandidateEligibleKind, "download", Access(false, ""))
+	if err != nil {
+		t.Fatalf("open action to close: %v", err)
+	}
+	if err := js.ResolveHumanAction(ctx, actionID, "resolved"); err != nil {
+		t.Fatalf("resolve candidate action: %v", err)
+	}
+	if got, err := js.CandidateEligible(ctx, closedID); err != nil || got {
+		t.Fatalf("CandidateEligible closed action = %v, %v; want false, nil", got, err)
+	}
+
+	wrongStateID, err := js.CreateRequest(ctx, "wr_candidate_wrong_state", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatalf("create candidate wrong-state job: %v", err)
+	}
+	if _, err := js.OpenHumanAction(ctx, wrongStateID, CandidateEligibleKind, "download", Access(false, "")); err != nil {
+		t.Fatalf("open candidate wrong-state action: %v", err)
+	}
+	if got, err := js.CandidateEligible(ctx, wrongStateID); err != nil || got {
+		t.Fatalf("CandidateEligible wrong state = %v, %v; want false, nil", got, err)
+	}
+
+	if got, err := js.CandidateEligible(ctx, "missing-candidate-job"); err != nil || got {
+		t.Fatalf("CandidateEligible missing job = %v, %v; want false, nil", got, err)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if got, err := js.CandidateEligible(cancelled, manualID); !errors.Is(err, context.Canceled) || got {
+		t.Fatalf("CandidateEligible cancelled = %v, %v; want false, context.Canceled", got, err)
+	}
+}
+
+func TestTransitionAwaitingToValidatingIfAdoptEligible(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+
+	eligibleID := seedAwaitingEligibilityJob(t, js, "wr_transition_eligible")
+	if _, err := js.OpenHumanAction(ctx, eligibleID, ActionKindDocumentDelivery, "download", Access(false, "")); err != nil {
+		t.Fatalf("open transition action: %v", err)
+	}
+	if err := js.TransitionAwaitingToValidatingIfAdoptEligible(ctx, eligibleID, 41); err != nil {
+		t.Fatalf("eligible transition: %v", err)
+	}
+	if state := eligibilityJobState(t, js, eligibleID); state != StateValidating {
+		t.Fatalf("state after eligible transition = %q, want %q", state, StateValidating)
+	}
+	var selected sql.NullInt64
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT selected_candidate_id FROM jobs WHERE id = ?`, eligibleID).Scan(&selected); err != nil {
+		t.Fatalf("read selected candidate: %v", err)
+	}
+	if !selected.Valid || selected.Int64 != 41 {
+		t.Fatalf("selected candidate after transition = %+v, want 41", selected)
+	}
+
+	err := js.TransitionAwaitingToValidatingIfAdoptEligible(ctx, eligibleID, 42)
+	if !errors.Is(err, ErrAdoptNotAwaiting) {
+		t.Fatalf("second eligible transition err = %v, want ErrAdoptNotAwaiting", err)
+	}
+	if state := eligibilityJobState(t, js, eligibleID); state != StateValidating {
+		t.Fatalf("state after second transition = %q, want %q", state, StateValidating)
+	}
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT selected_candidate_id FROM jobs WHERE id = ?`, eligibleID).Scan(&selected); err != nil {
+		t.Fatalf("read selected candidate after second transition: %v", err)
+	}
+	if !selected.Valid || selected.Int64 != 41 {
+		t.Fatalf("selected candidate after second transition = %+v, want unchanged 41", selected)
+	}
+
+	ineligibleID := seedAwaitingEligibilityJob(t, js, "wr_transition_ineligible")
+	err = js.TransitionAwaitingToValidatingIfAdoptEligible(ctx, ineligibleID, 51)
+	if !errors.Is(err, ErrAdoptNotAwaiting) {
+		t.Fatalf("ineligible transition err = %v, want ErrAdoptNotAwaiting", err)
+	}
+	if state := eligibilityJobState(t, js, ineligibleID); state != StateAwaitingHuman {
+		t.Fatalf("state after ineligible transition = %q, want %q", state, StateAwaitingHuman)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	err = js.TransitionAwaitingToValidatingIfAdoptEligible(cancelled, ineligibleID, 52)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled transition err = %v, want context.Canceled", err)
+	}
+	if state := eligibilityJobState(t, js, ineligibleID); state != StateAwaitingHuman {
+		t.Fatalf("state after cancelled transition = %q, want %q", state, StateAwaitingHuman)
+	}
+}
+
+func TestAdoptEligibleTxReturnsContextError(t *testing.T) {
+	js := testStore(t)
+	tx, err := js.S.DB().BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got, err := AdoptEligibleTx(cancelled, tx, "missing-adopt-tx-job"); !errors.Is(err, context.Canceled) || got {
+		t.Fatalf("AdoptEligibleTx cancelled = %v, %v; want false, context.Canceled", got, err)
+	}
+}
+
 func isNoRows(err error) bool {
 	return err != nil && (errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows"))
 }

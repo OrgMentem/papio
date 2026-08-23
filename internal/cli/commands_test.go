@@ -15,7 +15,6 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/app"
-	"papio/internal/browser"
 	"papio/internal/config"
 	"papio/internal/ipc"
 	"papio/internal/job"
@@ -111,17 +110,26 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 	// human for the file, so it must hand over the page the file is on.
 	want := []string{
 		"https://libkey.io/libraries/1234/10.1000/libkey",
-		browser.OpenURL(instituteBase, rows[4].Work), oaURL, browser.OpenURL(base, rows[1].Work),
-		browser.OpenURL(base, rows[3].Work),
+		app.OpenURL(instituteBase, rows[4].Work), oaURL, app.OpenURL(base, rows[1].Work),
+		app.OpenURL(base, rows[3].Work),
 	}
-	got, dropped := actionURLs(actions, rows, instFor, 0)
+	targets, dropped := actionHandoffTargets(actions, rows, instFor, 0)
+	got := make([]string, 0, len(targets))
+	for _, target := range targets {
+		got = append(got, target.URL)
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("URLs = %#v, want %#v", got, want)
 	}
 	if dropped != 0 {
 		t.Fatalf("dropped = %d, want 0 — every action's job id is present in rows", dropped)
 	}
-	if limited, limitedDropped := actionURLs(actions, rows, instFor, 1); !reflect.DeepEqual(limited, want[:1]) || limitedDropped != 0 {
+	limitedTargets, limitedDropped := actionHandoffTargets(actions, rows, instFor, 1)
+	limited := make([]string, 0, len(limitedTargets))
+	for _, target := range limitedTargets {
+		limited = append(limited, target.URL)
+	}
+	if !reflect.DeepEqual(limited, want[:1]) || limitedDropped != 0 {
 		t.Fatalf("limited URLs = %#v, dropped = %d, want %#v, 0", limited, limitedDropped, want[:1])
 	}
 
@@ -734,7 +742,7 @@ func TestActionsOpenFiltersJobsByStateAndFoldsDroppedRowsIntoTruncated(t *testin
 			gotJobsListParams = params.(map[string]any)
 			// old_job's action is still "open", but its job row is absent
 			// from this state-filtered page — exactly the omission
-			// actionURLs must now surface via droppedForMissingJob.
+			// actionHandoffTargets must now surface via droppedForMissingJob.
 			*result.(*api.JobsPage) = api.JobsPage{}
 			return nil
 		default:

@@ -504,9 +504,6 @@ func parseBatchInput(path string, reader io.Reader) ([]protocol.WorkRequest, err
 func parseBatchWork(data json.RawMessage) (protocol.WorkRequest, error) {
 	return batch.ParseWork(data)
 }
-func batchRequestID(ids *protocol.Identifiers, title string, authors []string, year int) string {
-	return batch.InitialRequestID(ids, title, authors, year)
-}
 
 // submitAcquire prefers the narrowest method that can carry the request.
 //
@@ -637,12 +634,6 @@ func acquireBatch(ctx context.Context, cmd *cobra.Command, opt *options, path st
 		}
 	}
 	return submitErr
-}
-
-// applyBatchOwnership preserves the CLI-local test seam for the shared batch
-// ownership policy.
-func applyBatchOwnership(requests []protocol.WorkRequest, ownership zotio.LookupWorksResult, collection string, includeOwned bool) ([]protocol.WorkRequest, int, error) {
-	return batch.ApplyOwnership(requests, ownership, collection, includeOwned)
 }
 
 // waitForJob polls until the job reaches a terminal or human-blocked state.
