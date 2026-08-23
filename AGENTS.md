@@ -308,6 +308,22 @@ There is also a link check, because `zensical build` prints a broken link as an
   the cheap one) or behind a new method name; do not widen an existing result.
 
 ### Protocol (dual Go/TS)
+- **Every document-delivery reconciliation operation is implemented TWICE on the daemon
+  side, and a fix to one does not reach the other.** `internal/api/delivery.go` serves the
+  CLI and RPC path; `internal/browser/bridge.go` serves the extension. They are separate
+  functions with the same names and "mirrors internal/api's …" comments, and the comment
+  is not enforcement: `confirm_request_absent` was fixed in the API (`9d95757`) and the
+  bridge sibling kept the broken order for eight days while still claiming to mirror it,
+  so the extension's "Confirm absent" failed on every normally parked job. The ordering is
+  the load-bearing part — `RepairAwaitingHuman` is the legal `awaiting_human -> resolving`
+  edge, so the action MUST close **before** `SubmitDelivery`, whose reconciliation park
+  supplies the `resolving -> awaiting_human` edge back. `Cancel -> Submit -> Repair` reads
+  as safer, because a submit failure leaves the action open, but Submit then attempts
+  `awaiting_human -> awaiting_human` and the state graph refuses it. Both sides' tests now
+  pin the same discriminating end state (job parked again, one open and one resolved
+  action, row reused not duplicated), which is what makes a one-sided change fail; keep it
+  that way, because a test asserting only "one open and one resolved" passes under **both**
+  orders and is how this shipped.
 - The protocol is validated **twice** — `internal/protocol/protocol.go` (emit + decode +
   `validate()`) and `extension/src/protocol.ts` (`parseBrowserMessage`). A new offer field
   must be added to **both**, plus `protocol/browser-v1.schema.json`. New fields should be
