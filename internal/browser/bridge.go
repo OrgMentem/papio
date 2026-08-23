@@ -5277,8 +5277,19 @@ func (b *Bridge) deliveryConfirmRequestAbsent(ctx context.Context, request *prot
 		}
 		detail := fmt.Sprintf("a document-delivery request (provider %s, reference %s, state %s) needs reconciliation; run 'papio delivery get %s' for its history and resolve it by hand — papio never resubmits automatically",
 			row.Provider, ref, string(delivery.StateCancelled), request.JobID)
-		if _, openErr := b.jobs.OpenHumanAction(ctx, request.JobID, job.ActionKindDocumentDelivery, detail, job.Access(false, "")); openErr == nil {
-			_ = b.jobs.Transition(ctx, request.JobID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"})
+		// Park first, then open the prompt. The reverse order — which this
+		// and internal/api both used — could commit the action and then fail
+		// the transition, leaving an open document_delivery prompt on a job
+		// still in resolving. Triage lists open actions without filtering on
+		// job state, so the inbox offered that prompt while acting on it
+		// failed: RepairAwaitingHuman only accepts awaiting_human. Parking
+		// first cannot produce that state. If the park fails no prompt is
+		// opened and the unleased resolving job is re-driven by the
+		// scheduler; if the park lands and the open fails, the job is parked
+		// with no action, which is the orphan state jobs.repair already
+		// names and recovers.
+		if parkErr := b.jobs.Transition(ctx, request.JobID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"}); parkErr == nil {
+			_, _ = b.jobs.OpenHumanAction(ctx, request.JobID, job.ActionKindDocumentDelivery, detail, job.Access(false, ""))
 		}
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}

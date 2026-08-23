@@ -481,8 +481,13 @@ func deliveryConfirmRequestAbsent(ctx context.Context, system *bootstrap.System,
 		}
 		detail := fmt.Sprintf("a document-delivery request (provider %s, reference %s, state %s) needs reconciliation; run 'papio delivery get %s' for its history and resolve it by hand — papio never resubmits automatically",
 			row.Provider, ref, string(delivery.StateCancelled), jobID)
-		if _, openErr := system.Jobs.OpenHumanAction(ctx, jobID, job.ActionKindDocumentDelivery, detail, job.Access(false, "")); openErr == nil {
-			_ = system.Jobs.Transition(ctx, jobID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"})
+		// Park first, then open the prompt — see the bridge sibling in
+		// internal/browser for the full reasoning. Opening first could commit
+		// the action and then fail the transition, leaving a document_delivery
+		// prompt visible on a job still in resolving that RepairAwaitingHuman
+		// refuses to act on.
+		if parkErr := system.Jobs.Transition(ctx, jobID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"}); parkErr == nil {
+			_, _ = system.Jobs.OpenHumanAction(ctx, jobID, job.ActionKindDocumentDelivery, detail, job.Access(false, ""))
 		}
 		return failure(submitErr)
 	}
