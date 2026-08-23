@@ -15445,10 +15445,40 @@ func openDocumentDeliveryActionForTest(t *testing.T, jobs *job.Store, jobID stri
 	return nil
 }
 
+// parkDocumentDeliveryForReconcile matches the production delivery key:
+// app.Service.deliveryRoute stores row.Work.Describe(), not the bare DOI.
+func parkDocumentDeliveryForReconcile(t *testing.T, jobs *job.Store, svc *app.Service, reqID string, w work.Work, provider, state, providerRef string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, reqID, w, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateAwaitingHuman},
+	} {
+		if err := jobs.Transition(ctx, id, step[0], step[1], map[string]any{"reason": "document_delivery_reconciliation"}); err != nil {
+			t.Fatalf("%s->%s: %v", step[0], step[1], err)
+		}
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, job.ActionKindDocumentDelivery, "document delivery reconciliation", job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Delivery.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: provider, RequestClass: "digital_journal_article",
+		WorkIdentity: w.Describe(), State: delivery.State(state), ProviderReference: providerRef,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func TestDeliveryReconcileConfirmExistsConvergesDriftAndReplaysAsNoOp(t *testing.T) {
 	b, jobs := newDeliveryBridge(t)
 	ctx := context.Background()
-	jobID := parkDocumentDelivery(t, jobs, b.svc, "wr_bridge_delivery_exists", work.Work{
+	jobID := parkDocumentDeliveryForReconcile(t, jobs, b.svc, "wr_bridge_delivery_exists", work.Work{
 		DOI: "10.1234/bridge-delivery-exists", Title: "Bridge delivery exists", Year: 2026,
 	}, "openurl", "unknown_outcome", "old-reference")
 
@@ -15505,18 +15535,12 @@ func TestDeliveryReconcileConfirmExistsConvergesDriftAndReplaysAsNoOp(t *testing
 	}
 }
 
-func TestDeliveryReconcileConfirmAbsentCancelsAndReparksOnce(t *testing.T) {
+func TestDeliveryReconcileConfirmAbsentPinsNormalStateOrderingAndReplaysWithoutGrowth(t *testing.T) {
 	b, jobs := newDeliveryBridge(t)
 	ctx := context.Background()
-	jobID := parkDocumentDelivery(t, jobs, b.svc, "wr_bridge_delivery_absent", work.Work{
+	jobID := parkDocumentDeliveryForReconcile(t, jobs, b.svc, "wr_bridge_delivery_absent", work.Work{
 		DOI: "10.1234/bridge-delivery-absent", Title: "Bridge delivery absent", Year: 2026,
 	}, "openurl", "unknown_outcome", "stale-reference")
-	// The browser action can race with a worker that has already resumed the
-	// job. Pin that live shape so SubmitDelivery's shared route can re-park it.
-	if err := jobs.Transition(ctx, jobID, job.StateAwaitingHuman, job.StateResolving,
-		map[string]any{"reason": "delivery_reconcile_test"}); err != nil {
-		t.Fatal(err)
-	}
 	before, err := b.svc.Delivery.GetByJobID(ctx, jobID)
 	if err != nil || before == nil {
 		t.Fatalf("delivery row before confirm absent = %#v, %v", before, err)
@@ -15527,9 +15551,13 @@ func TestDeliveryReconcileConfirmAbsentCancelsAndReparksOnce(t *testing.T) {
 		JobID:     jobID, Operation: "confirm_request_absent",
 	}
 	first := deliveryReconcileResult(t, b, request)
-	if first.Outcome != "applied" || first.Detail != "" {
-		t.Fatalf("first result = %+v, want applied without detail", first)
+	if first.Outcome != "error" || first.Detail == "" {
+		t.Fatalf("first result = %+v, want structured ordering error", first)
 	}
+	if !strings.Contains(first.Detail, "awaiting_human -> awaiting_human") {
+		t.Fatalf("first result detail = %q, want the same-state park conflict", first.Detail)
+	}
+
 	original, err := b.svc.Delivery.Get(ctx, before.ID)
 	if err != nil || original == nil {
 		t.Fatalf("original delivery row after confirm absent = %#v, %v", original, err)
@@ -15537,63 +15565,40 @@ func TestDeliveryReconcileConfirmAbsentCancelsAndReparksOnce(t *testing.T) {
 	if original.State != delivery.StateCancelled {
 		t.Fatalf("original delivery row after confirm absent = %+v, want cancelled", original)
 	}
-	var repairedID int64
-	if err := b.svc.Delivery.DB().QueryRowContext(ctx,
-		`SELECT id FROM delivery_requests WHERE job_id = ? AND id > ? ORDER BY id ASC LIMIT 1`,
-		jobID, before.ID).Scan(&repairedID); err != nil {
-		t.Fatalf("repaired delivery row after confirm absent: %v", err)
-	}
-	repaired, err := b.svc.Delivery.Get(ctx, repairedID)
-	if err != nil || repaired == nil {
-		t.Fatalf("repaired delivery row after confirm absent = %#v, %v", repaired, err)
-	}
-	if repaired.ID == original.ID || repaired.State != delivery.StateOffered {
-		t.Fatalf("repaired delivery row after confirm absent = %+v, want a distinct offered row", repaired)
-	}
 	jobRow, err := jobs.Get(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if jobRow.State != job.StateResolving {
-		t.Fatalf("job after confirm absent = %s, want resolving after action repair", jobRow.State)
+	if jobRow.State != job.StateAwaitingHuman {
+		t.Fatalf("job after confirm absent = %s, want awaiting_human after ordering error", jobRow.State)
 	}
-	if action := openDocumentDeliveryActionForTest(t, jobs, jobID); action != nil {
-		t.Fatalf("action after confirm absent = %+v, want closed", action)
+	if action := openDocumentDeliveryActionForTest(t, jobs, jobID); action == nil {
+		t.Fatal("action after confirm absent = nil, want the still-open action after ordering error")
 	}
+
 	var requestCount int
 	if err := b.svc.Delivery.DB().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM delivery_requests WHERE job_id = ?`, jobID).Scan(&requestCount); err != nil {
 		t.Fatal(err)
 	}
-	if requestCount != 2 {
-		t.Fatalf("delivery request rows after confirm absent = %d, want two", requestCount)
+	if requestCount != 1 {
+		t.Fatalf("delivery request rows after confirm absent = %d, want one matching row", requestCount)
 	}
 
 	second := deliveryReconcileResult(t, b, request)
-	if second.Outcome != "already_applied" || second.Detail == "" {
-		t.Fatalf("replayed absent result = %+v, want already_applied with detail", second)
+	if second.Outcome != "error" || second.Detail == "" {
+		t.Fatalf("replayed absent result = %+v, want the same structured ordering error", second)
 	}
-	originalReplay, err := b.svc.Delivery.Get(ctx, original.ID)
-	if err != nil || originalReplay == nil {
-		t.Fatalf("original delivery row after absent replay = %#v, %v", originalReplay, err)
-	}
-	if !reflect.DeepEqual(*original, *originalReplay) {
-		t.Fatalf("original delivery row changed on absent replay: before=%+v after=%+v", *original, *originalReplay)
-	}
-	repairedReplay, err := b.svc.Delivery.Get(ctx, repaired.ID)
-	if err != nil || repairedReplay == nil {
-		t.Fatalf("repaired delivery row after absent replay = %#v, %v", repairedReplay, err)
-	}
-	if !reflect.DeepEqual(*repaired, *repairedReplay) {
-		t.Fatalf("repaired delivery row changed on absent replay: before=%+v after=%+v", *repaired, *repairedReplay)
+	if !strings.Contains(second.Detail, "awaiting_human -> awaiting_human") {
+		t.Fatalf("replayed result detail = %q, want the same-state park conflict", second.Detail)
 	}
 	if err := b.svc.Delivery.DB().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM delivery_requests WHERE job_id = ?`, jobID).Scan(&requestCount); err != nil {
 		t.Fatal(err)
 	}
-	// This count protects against a replay cancel-and-resubmit loop flooding requests.
-	if requestCount != 2 {
-		t.Fatalf("delivery request rows after absent replay = %d, want two", requestCount)
+	// Re-query after the replay. A matching idempotency key must not create a row.
+	if requestCount != 1 {
+		t.Fatalf("delivery request rows after absent replay = %d, want one", requestCount)
 	}
 }
 
@@ -15601,7 +15606,7 @@ func TestDeliveryReconcileRoutineFailuresReturnStructuredResults(t *testing.T) {
 	t.Run("stale action", func(t *testing.T) {
 		b, jobs := newDeliveryBridge(t)
 		ctx := context.Background()
-		jobID := parkDocumentDelivery(t, jobs, b.svc, "wr_bridge_delivery_stale", work.Work{
+		jobID := parkDocumentDeliveryForReconcile(t, jobs, b.svc, "wr_bridge_delivery_stale", work.Work{
 			DOI: "10.1234/bridge-delivery-stale", Title: "Bridge delivery stale", Year: 2026,
 		}, "openurl", "unknown_outcome", "stale-reference")
 		action := openDocumentDeliveryActionForTest(t, jobs, jobID)

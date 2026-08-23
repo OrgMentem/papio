@@ -1148,9 +1148,10 @@ Open after this round:
   since routes are minted fresh per gesture and never persisted browser-side.
   The fix therefore mirrors `requestHandoffOpen`: a daemon RPC that mints the
   route and opens a papio-owned tab, replacing `requestManualDownloadOpen`'s
-  `firstSafeLink` + `openNewTab`. Note `inbox.ts`'s `manualDownloadJobID` is
-  already defined and never called — the seam for exactly that RPC, left
-  behind by whoever last stopped short here. Until it lands, the inbox's
+  `firstSafeLink` + `openNewTab`. The seam that used to sit here, `inbox.ts`'s
+  never-called `manualDownloadJobID`, was deleted as dead code once the pin
+  mechanism it belonged to was retired, so this RPC now starts from nothing.
+  Until it lands, the inbox's
   "Open link" is correct only for the two open-access rows of the 34.
 
 ## Sixth round (2026-08-21) — four reviewers, and the empty journal named

@@ -153,39 +153,46 @@ func TestItemUnmarshalJSONRejectsMalformedItems(t *testing.T) {
 		name    string
 		input   string
 		message string
+		direct  bool
 	}{
 		{
-			name:    "unknown kind",
+			name:    "unknown kind through encoding/json into papio decoder",
 			input:   `{"kind":"future_kind"}`,
 			message: "unsupported triage item kind",
 		},
 		{
-			name:    "unknown field",
+			name:    "unknown field through encoding/json into papio decoder",
 			input:   `{"kind":"future_kind","new_field":true}`,
 			message: `unknown field "new_field"`,
 		},
 		{
-			name:    "trailing data",
+			name:    "trailing data from papio decoder",
+			input:   `{"kind":"future_kind"} {}`,
+			message: "triage item has trailing data",
+			direct:  true,
+		},
+		{
+			name:    "trailing data rejected by encoding/json before papio decoder",
 			input:   `{"kind":"future_kind"} {}`,
 			message: "invalid character '{' after top-level value",
 		},
 		{
-			name:    "missing pdf grab field",
+			name:    "missing pdf grab field through encoding/json into papio decoder",
 			input:   `{"kind":"pdf_grab","label":"Needs DOI","route_class":"pdf_identifier_needed","blocked_by":"identifier_missing","attention":"required","ops":["provide_identifier","dismiss"]}`,
 			message: "invalid pdf grab item",
 		},
 		{
-			name:    "missing watch hit field",
+			name:    "missing watch hit field through encoding/json into papio decoder",
 			input:   `{"kind":"watch_hit","work":{"doi":"10.1000/example","title":"Example work","authors":"Ada Lovelace","year":2026,"is_oa":true},"first_seen_at":"2026-07-20T12:00:00Z"}`,
 			message: "invalid watch hit item",
 		},
 		{
-			name:    "missing human action field",
+			name:    "missing human action field through encoding/json into papio decoder",
 			input:   `{"kind":"human_action","action_id":9,"job_id":"job-9","action_kind":"verify_identity","job_state":"needs_review"}`,
 			message: "invalid human action item",
 		},
 		{
-			name:    "missing retraction field",
+			name:    "missing retraction field through encoding/json into papio decoder",
 			input:   `{"kind":"retraction","doi":"10.1000/example","nature":"retraction","notice_doi":"10.1000/notice"}`,
 			message: "invalid retraction item",
 		},
@@ -194,7 +201,12 @@ func TestItemUnmarshalJSONRejectsMalformedItems(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var item Item
-			err := json.Unmarshal([]byte(tc.input), &item)
+			var err error
+			if tc.direct {
+				err = item.UnmarshalJSON([]byte(tc.input))
+			} else {
+				err = json.Unmarshal([]byte(tc.input), &item)
+			}
 			if err == nil {
 				t.Fatal("unmarshal succeeded; want error")
 			}

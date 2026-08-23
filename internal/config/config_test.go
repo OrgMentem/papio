@@ -1161,6 +1161,39 @@ func TestDocumentDeliveryConfigValidationFailsClosed(t *testing.T) {
 			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://FORMS.Example.EDU/request\"\nallowed_hosts = [\"forms.example.edu\"]\n",
 		},
 		{
+			name: "punycode entry matches Unicode destination",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://bücher.example/request\"\nallowed_hosts = [\"xn--bcher-kva.example\"]\n",
+		},
+		{
+			name: "Unicode entry matches punycode destination",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://xn--bcher-kva.example/request\"\nallowed_hosts = [\"bücher.example\"]\n",
+		},
+		{
+			name: "trailing-dot destination matches plain entry",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu./request\"\nallowed_hosts = [\"forms.example.edu\"]\n",
+		},
+		{
+			name: "IPv4 destination is accepted",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://192.0.2.1/request\"\nallowed_hosts = [\"192.0.2.1\"]\n",
+		},
+		{
+			name: "bracketed IPv6 destination matches unbracketed entry",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://[2001:db8::1]/request\"\nallowed_hosts = [\"2001:db8::1\"]\n",
+		},
+		{
+			name: "equivalent IPv6 spellings match",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://[2001:db8::2]/request\"\nallowed_hosts = [\"2001:0db8:0:0:0:0:0:2\"]\n",
+		},
+		{
+			name: "portless IPv6 entry matches destination port",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://[2001:db8::3]:8443/request\"\nallowed_hosts = [\"2001:db8::3\"]\n",
+		},
+		{
+			name:    "allowlist checks each configured destination",
+			body:    "[browser.document_delivery]\nkind = \"illiad\"\nbase_url = \"https://forms.example.edu/request\"\npatron_web_base_url = \"https://unlisted.example.edu/illiad/illiad.dll\"\nallowed_hosts = [\"forms.example.edu\"]\n",
+			wantErr: "patron_web_base_url host \"unlisted.example.edu\" is not allowed by allowed_hosts",
+		},
+		{
 			name:    "patron web host outside the allowlist is rejected",
 			body:    "[browser.document_delivery]\nkind = \"illiad\"\nbase_url = \"https://illiad.example.edu/ILLiadWebPlatform\"\npatron_web_base_url = \"https://web.example.edu/illiad/illiad.dll\"\nallowed_hosts = [\"illiad.example.edu\"]\n",
 			wantErr: "patron_web_base_url host \"web.example.edu\" is not allowed by allowed_hosts",

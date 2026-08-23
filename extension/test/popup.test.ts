@@ -771,6 +771,49 @@ test("pageDeliveryJob prefers tab then DOI", () => {
   expect(pageDeliveryJob([doiJob], { tab_id: 99 })).toBeUndefined();
   expect(pageDeliveryJob([tabJob], { doi: "not-matching" })).toBeUndefined();
 });
+test("pageDeliveryJob normalizes DOI URL wrappers, labels, and case for routing", () => {
+  const cases = [
+    { page: "10.1000/url", expected: "https://doi.org/10.1000/url" },
+    { page: "https://doi.org/10.1000/reversed", expected: "10.1000/reversed" },
+    { page: "10.1000/dx", expected: "http://dx.doi.org/10.1000/dx" },
+    { page: "http://dx.doi.org/10.1000/dx-reversed", expected: "10.1000/dx-reversed" },
+    { page: "10.1000/labeled", expected: "  doi: 10.1000/labeled  " },
+    { page: "10.1000/case", expected: "10.1000/CASE" },
+  ];
+  for (const [index, candidate] of cases.entries()) {
+    const expected = job({
+      job_id: `job-normalized-${index}`,
+      expected: { doi: candidate.expected },
+    });
+    expect(pageDeliveryJob([expected], { doi: candidate.page })).toBe(expected);
+  }
+});
+
+test("pageDeliveryJob preserves repeated DOI suffix slashes in both routing directions", () => {
+  const doubledDOI = "10.48612//monograph-2025-2";
+  const singleDOI = "10.48612/monograph-2025-2";
+  const doubled = job({
+    job_id: "job-doubled",
+    expected: { doi: doubledDOI },
+  });
+  const single = job({
+    job_id: "job-single",
+    expected: { doi: singleDOI },
+  });
+
+  expect(pageDeliveryJob([doubled], { doi: doubledDOI })).toBe(doubled);
+  expect(pageDeliveryJob([doubled], { doi: singleDOI })).toBeUndefined();
+  expect(pageDeliveryJob([single], { doi: doubledDOI })).toBeUndefined();
+  expect(pageDeliveryJob([single], { doi: singleDOI })).toBe(single);
+});
+
+test("pageDeliveryJob rejects a genuinely different DOI", () => {
+  const expected = job({
+    expected: { doi: "10.1000/expected" },
+  });
+  expect(pageDeliveryJob([expected], { doi: "10.1000/different" })).toBeUndefined();
+});
+
 test("does not send a DOI-less scraped page to the daemon", async () => {
   popupDocument();
   let messages = 0;
@@ -3239,6 +3282,21 @@ test("an in-flight acquisition offers neither control, leaving the live card to 
   const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
   expect(button.hidden).toBe(true);
   expect(header.hidden).toBe(true);
+  expect(doc.getElementById("page-acquire-live")?.hidden).toBe(false);
+});
+
+test("renderPageContext recognizes a URL-form page DOI for a bare expected DOI", () => {
+  const doc = popupDocument();
+  renderPageContext(
+    doc,
+    binding({
+      url: "https://doi.org/10.1000/render",
+      doi: "https://doi.org/10.1000/render",
+      tab_url: "https://doi.org/10.1000/render",
+    }),
+    [job({ expected: { doi: "10.1000/render", title: "Paper" } })],
+  );
+  expect((doc.getElementById("page-acquire-btn") as HTMLButtonElement).hidden).toBe(true);
   expect(doc.getElementById("page-acquire-live")?.hidden).toBe(false);
 });
 

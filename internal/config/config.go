@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	"papio/internal/routes"
 
 	toml "github.com/pelletier/go-toml/v2"
+	"golang.org/x/net/idna"
 )
 
 // Access modes (stack plan "Access profiles").
@@ -293,8 +295,9 @@ type DocumentDelivery struct {
 	// openurl/custom and as the ILLiad Web Platform base for kind = illiad.
 	BaseURL string `toml:"base_url,omitempty"`
 	// AllowedHosts restricts which hosts a prefilled request form or API
-	// base may reach. An entry without a port matches its host on any port;
-	// an entry with a port must match both the destination host and port.
+	// base may reach. An entry is a bare hostname or IP literal, with an
+	// optional numeric port. An entry without a port matches its host on any
+	// port; an entry with a port must match both the destination host and port.
 	AllowedHosts []string `toml:"allowed_hosts,omitempty"`
 	// SubmitPolicy narrows how a request may be created: never (default,
 	// when empty) | prefill_only | auto_if_unconditional. It narrows what
@@ -1115,31 +1118,98 @@ func validateOpenURLBase(base string) error {
 
 var documentDeliveryHostRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
 
+// canonicalizeDocumentDeliveryHost returns the shared key used for both
+// allowed_hosts entries and destination URLs.
+func canonicalizeDocumentDeliveryHost(raw string) (string, error) {
+	host := strings.ToLower(raw)
+	if strings.HasSuffix(host, ".") {
+		host = strings.TrimSuffix(host, ".")
+	}
+	if host == "" {
+		return "", errors.New("empty host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String(), nil
+	}
+	// Use the Lookup profile, not Display, because this value is a DNS lookup
+	// key, not a presentation name. Lookup applies UTS #46 mapping and strict
+	// label validation.
+	host, err := idna.Lookup.ToASCII(host)
+	if err != nil {
+		return "", err
+	}
+	host = strings.ToLower(host)
+	if !documentDeliveryHostRE.MatchString(host) {
+		return "", errors.New("invalid host")
+	}
+	return host, nil
+}
+
 func parseDocumentDeliveryAllowedHost(raw string) (string, string, error) {
 	const reason = "must be a bare hostname with an optional numeric port"
 	if raw == "" || strings.TrimSpace(raw) != raw || strings.ContainsAny(raw, "/?#@\\") {
 		return "", "", errors.New(reason)
 	}
+	// Handle IP literals before url.Parse. url.Parse treats an unbracketed
+	// IPv6 literal as a malformed authority, and it has no unambiguous port.
+	if net.ParseIP(strings.TrimSuffix(raw, ".")) != nil {
+		host, err := canonicalizeDocumentDeliveryHost(raw)
+		if err != nil {
+			return "", "", errors.New(reason)
+		}
+		return host, "", nil
+	}
 	u, err := url.Parse("//" + raw)
 	if err != nil || u.Scheme != "" || u.Host == "" || u.User != nil || u.Path != "" || u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" {
 		return "", "", errors.New(reason)
 	}
-	rawHost := u.Hostname()
-	host := strings.ToLower(rawHost)
-	if !documentDeliveryHostRE.MatchString(host) {
-		return "", "", errors.New(reason)
-	}
-	port := strings.TrimPrefix(u.Host, rawHost)
-	if port != "" {
-		if !strings.HasPrefix(port, ":") || len(port[1:]) < 1 || len(port[1:]) > 5 {
+	hostPort := u.Host
+	host := ""
+	port := ""
+	switch {
+	case strings.HasPrefix(hostPort, "["):
+		host, port, err = net.SplitHostPort(hostPort)
+		if err != nil {
+			if !strings.HasSuffix(hostPort, "]") {
+				return "", "", errors.New(reason)
+			}
+			host, port, err = net.SplitHostPort(hostPort + ":")
+			if err != nil {
+				return "", "", errors.New(reason)
+			}
+		} else if port == "" {
 			return "", "", errors.New(reason)
 		}
-		for _, r := range port[1:] {
+	case strings.Count(hostPort, ":") == 0:
+		host = hostPort
+	case strings.Count(hostPort, ":") == 1:
+		host, port, err = net.SplitHostPort(hostPort)
+		if err != nil || port == "" {
+			return "", "", errors.New(reason)
+		}
+	default:
+		// An unbracketed IPv6 literal has no unambiguous port separator.
+		host = hostPort
+	}
+	host, err = canonicalizeDocumentDeliveryHost(host)
+	if err != nil {
+		return "", "", errors.New(reason)
+	}
+	if strings.HasPrefix(hostPort, "[") {
+		ip := net.ParseIP(host)
+		if ip == nil || ip.To4() != nil {
+			return "", "", errors.New(reason)
+		}
+	}
+	if port != "" {
+		if len(port) < 1 || len(port) > 5 {
+			return "", "", errors.New(reason)
+		}
+		for _, r := range port {
 			if r < '0' || r > '9' {
 				return "", "", errors.New(reason)
 			}
 		}
-		port = port[1:]
 	}
 	return host, port, nil
 }
@@ -1149,7 +1219,11 @@ func validateDocumentDeliveryDestination(prefix, field, raw string, allowed map[
 	host := ""
 	port := ""
 	if err == nil {
-		host = strings.ToLower(u.Hostname())
+		canonicalHost, hostErr := canonicalizeDocumentDeliveryHost(u.Hostname())
+		if hostErr == nil {
+			host = canonicalHost
+		}
+		// Keep host empty on conversion failure: it must fail closed.
 		port = u.Port()
 		if port == "" && u.Scheme == "https" {
 			port = "443"
