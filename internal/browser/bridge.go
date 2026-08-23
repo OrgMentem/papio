@@ -1635,7 +1635,15 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 		if claimErr != nil {
 			return nil, claimErr
 		}
-		if liveClaim != nil {
+		// LiveMaterializationClaimForJob asks about phase and generation, not
+		// the lease, so a claim stuck in `navigated` would block this repair
+		// for as long as the generation lasts - and a paper that re-claims
+		// every few minutes renews that block indefinitely, which is the
+		// paper doing the harm. A lapsed lease is already how papio decides a
+		// surface is no longer owned: the claim path supersedes exactly such a
+		// claim and returns its candidate to eligible. So the tab to protect
+		// is one whose lease has NOT run out.
+		if liveClaim != nil && claimLeaseHeld(liveClaim.LeaseUntil, b.now()) {
 			// The operator can see this tab; its fence is corrected by the
 			// next attempt rather than underneath them.
 			return existing, nil
@@ -12326,4 +12334,16 @@ func (b *Bridge) candidateSafetyDomain(ctx context.Context, key []byte, profileI
 		}
 	}
 	return institutional, nil
+}
+
+// claimLeaseHeld reports whether a materialization claim's lease still covers
+// its surface. An unparseable or empty lease is treated as held: the claim
+// record exists, and guessing "expired" from a value papio cannot read would
+// retire a candidate whose tab may be on screen.
+func claimLeaseHeld(leaseUntil string, now time.Time) bool {
+	at, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(leaseUntil))
+	if err != nil {
+		return true
+	}
+	return at.After(now)
 }

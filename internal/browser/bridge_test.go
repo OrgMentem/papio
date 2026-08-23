@@ -6113,6 +6113,50 @@ func TestMisfencedOpenAccessCandidateIsRetiredAndReminted(t *testing.T) {
 		t.Fatalf("a candidate claimed by a dead browser generation kept its fence (%q); the label is not proof of a surface",
 			refenced.SafetyDomainID)
 	}
+
+	// A claim stuck in an active phase whose lease has run out holds no
+	// surface, and it is in the CURRENT generation - so phase and generation
+	// alone would block the repair for as long as the browser lives, and a
+	// paper re-claiming every few minutes renews that block forever. Measured
+	// live 2026-08-23: job_9f8bec30da sat in `navigated` in the live
+	// generation while re-claiming across two reloads.
+	lapsedID := parkInstitutional(t, jobs, "wr_refence_lapsed", handoffWork(), "")
+	lapsedRow, err := jobs.Get(ctx, lapsedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lapsedCand, err := b.prepareMaterializationCandidate(ctx, *lapsedRow)
+	if err != nil || lapsedCand == nil {
+		t.Fatalf("lapsed candidate: %+v %v", lapsedCand, err)
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: lapsedCand.ID, BrowserHolderGeneration: b.epoch,
+		JobAttemptRevision:         lapsedCand.JobAttemptRevision,
+		InstitutionProfileRevision: lapsedCand.InstitutionProfileRevision,
+		RouteRevision:              lapsedCand.RouteRevision, MaterializationKind: "browser_tab",
+		LeaseUntil: b.now().UTC().Add(time.Minute),
+	})
+	if err != nil || claim == nil {
+		t.Fatalf("claim: %+v %v", claim, err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='navigated', lease_until=? WHERE id=?`,
+		b.now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE human_actions SET detail=? WHERE job_id=? AND status='open'`,
+		app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36", lapsedID); err != nil {
+		t.Fatal(err)
+	}
+	lapsedFixed, err := b.prepareMaterializationCandidate(ctx, *lapsedRow)
+	if err != nil || lapsedFixed == nil {
+		t.Fatalf("lapsed repair: %+v %v", lapsedFixed, err)
+	}
+	if lapsedFixed.SafetyDomainID != "oa:doi.org" {
+		t.Fatalf("a lapsed claim in the live generation blocked the repair (%q); it holds no surface",
+			lapsedFixed.SafetyDomainID)
+	}
 }
 
 // seedSurfaceCloseClaim creates a job, institution profile, browser
