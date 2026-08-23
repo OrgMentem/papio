@@ -747,14 +747,14 @@ func TestLosingArtifactWinnerProducerFailuresRollBack(t *testing.T) {
 				permit := acquireDrive(t, js, identity, "wrong-job-domain", time.Now().Add(time.Minute))
 				ordinal := int64(0)
 				return ArtifactProducerIdentity{
-						Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
-						Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
-					}, func(t *testing.T) {
-						got, err := js.GetEffectPermit(ctx, permit.ID)
-						if err != nil || got == nil || got.Status != Held {
-							t.Fatalf("wrong-job occupancy changed permit=%+v err=%v", got, err)
-						}
+					Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
+					Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
+				}, func(t *testing.T) {
+					got, err := js.GetEffectPermit(ctx, permit.ID)
+					if err != nil || got == nil || got.Status != Held {
+						t.Fatalf("wrong-job occupancy changed permit=%+v err=%v", got, err)
 					}
+				}
 			},
 		},
 		{
@@ -774,23 +774,23 @@ func TestLosingArtifactWinnerProducerFailuresRollBack(t *testing.T) {
 				}
 				ordinal := int64(0)
 				return ArtifactProducerIdentity{
-						Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
-						Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
-					}, func(t *testing.T) {
-						got, err := js.GetEffectPermit(ctx, permit.ID)
-						if err != nil || got == nil || got.Status != Held {
-							t.Fatalf("ambiguous permit changed=%+v err=%v", got, err)
-						}
-						var status string
-						if err := js.S.DB().QueryRowContext(ctx,
-							`SELECT status FROM legacy_effect_blockers WHERE id=?`,
-							"ambiguous-losing-blocker").Scan(&status); err != nil {
-							t.Fatal(err)
-						}
-						if status != string(LegacyEffectBlockerUnresolved) {
-							t.Fatalf("ambiguous blocker status=%q", status)
-						}
+					Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
+					Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
+				}, func(t *testing.T) {
+					got, err := js.GetEffectPermit(ctx, permit.ID)
+					if err != nil || got == nil || got.Status != Held {
+						t.Fatalf("ambiguous permit changed=%+v err=%v", got, err)
 					}
+					var status string
+					if err := js.S.DB().QueryRowContext(ctx,
+						`SELECT status FROM legacy_effect_blockers WHERE id=?`,
+						"ambiguous-losing-blocker").Scan(&status); err != nil {
+						t.Fatal(err)
+					}
+					if status != string(LegacyEffectBlockerUnresolved) {
+						t.Fatalf("ambiguous blocker status=%q", status)
+					}
+				}
 			},
 		},
 	}
