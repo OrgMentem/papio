@@ -15085,3 +15085,91 @@ func TestDevReloadRequestIsIdempotentUntilEmitted(t *testing.T) {
 		t.Fatalf("request after emit reused %q; the latch must be one-shot", firstID)
 	}
 }
+
+// An institutional materialization drive must be charged like an accepted
+// handoff, because a job driven through claims and effects emits no
+// browser.job_accept at all. Measured live 2026-08-23: 10.2196/83927 minted 17
+// claims between 02:10 and 04:40 behind 14 authorized effects, 30
+// browser.auth_pending and zero browser.job_accept, so this fence saw no drive
+// and never quiesced. It held its institution's provider fence throughout,
+// which starved 58 sibling handoffs: prepareMaterializationCandidate returned
+// nil for each, FocusHandoffs counted zero, and `papio actions open` printed a
+// link instead of driving. Reaching a sign-in wall repeatedly is exactly the
+// silence this lease bounds.
+func TestProjectHandoffOfferStateChargesInstitutionalDrives(t *testing.T) {
+	_, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_institutional_fruitless", handoffWork())
+	action := openHandoffAction(t, jobs, id)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The measured shape, three times over: authorize an effect, report the
+	// wall, return from it - and never deliver. No job_accept anywhere.
+	start := created.Add(time.Second)
+	for epoch := 0; epoch < job.MaxAutomaticHandoffEpochs; epoch++ {
+		at := start.Add(time.Duration(epoch) * (job.HandoffAcceptedLease + time.Minute))
+		appendEventAt(t, jobs, id, "browser.institutional_effect_authorized",
+			map[string]any{"binding_id": fmt.Sprintf("binding_%d", epoch)}, at)
+		appendEventAt(t, jobs, id, "browser.institutional_effect_result",
+			map[string]any{"outcome": "acknowledged"}, at.Add(time.Second))
+		appendEventAt(t, jobs, id, "browser.auth_pending", map[string]any{}, at.Add(2*time.Second))
+		appendEventAt(t, jobs, id, "browser.auth_returned",
+			map[string]any{"elapsed_ms": 824}, at.Add(3*time.Second))
+	}
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind == "browser.job_accept" {
+			t.Fatal("precondition: this path must emit no job_accept, or the test proves the old fence")
+		}
+	}
+	last := start.Add(time.Duration(job.MaxAutomaticHandoffEpochs-1) * (job.HandoffAcceptedLease + time.Minute))
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, last.Add(job.HandoffAcceptedLease+time.Minute))
+	if state.FruitlessEpochs != job.MaxAutomaticHandoffEpochs {
+		t.Fatalf("fruitless epochs after %d institutional drives into a sign-in wall = %d, want %d",
+			job.MaxAutomaticHandoffEpochs, state.FruitlessEpochs, job.MaxAutomaticHandoffEpochs)
+	}
+	if !state.Quiesced {
+		t.Fatal("an institutional drive that only ever reaches a wall must quiesce and release the provider fence")
+	}
+}
+
+// The same drive that DELIVERS must clear the streak, or capping the
+// institutional path would retire papers it is fetching correctly.
+func TestProjectHandoffOfferStateInstitutionalDeliveryClearsStreak(t *testing.T) {
+	_, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_institutional_delivers", handoffWork())
+	action := openHandoffAction(t, jobs, id)
+	created, err := time.Parse(time.RFC3339Nano, action.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := created.Add(time.Second)
+	appendEventAt(t, jobs, id, "browser.institutional_effect_authorized",
+		map[string]any{"binding_id": "binding_fruitless"}, start)
+	second := start.Add(job.HandoffAcceptedLease + time.Minute)
+	appendEventAt(t, jobs, id, "browser.institutional_effect_authorized",
+		map[string]any{"binding_id": "binding_delivers"}, second)
+	appendEventAt(t, jobs, id, "browser.download_started",
+		map[string]any{"bytes": 1}, second.Add(time.Minute))
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := job.ProjectHandoffOfferState(events, action.CreatedAt, second.Add(job.HandoffAcceptedLease+time.Minute))
+	if state.FruitlessEpochs != 0 {
+		t.Fatalf("fruitless epochs after an institutional drive that downloaded = %d, want 0", state.FruitlessEpochs)
+	}
+	if state.Quiesced {
+		t.Fatal("quiesced despite delivering the paper")
+	}
+}

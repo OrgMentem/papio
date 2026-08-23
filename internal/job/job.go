@@ -3357,6 +3357,31 @@ func ProjectHandoffOfferState(events []map[string]any, actionCreatedAt string, n
 				epochStart = at
 				open = true
 			}
+		case kind == "browser.institutional_effect_authorized":
+			// An institutional materialization drive. This fence used to see
+			// only `job_accept`, so a job driven through claims and effects
+			// could re-drive without bound: measured live 2026-08-23, one
+			// paper (10.2196/83927) minted 17 claims between 02:10 and 04:40
+			// behind 14 authorized effects, 30 `browser.auth_pending` and zero
+			// `browser.job_accept`, and held its institution's provider fence
+			// throughout. `FocusHandoffs` therefore prepared no candidate for
+			// any of 58 sibling handoffs and `papio actions open` degraded to
+			// printing a link for every one of them — the starvation the
+			// handoff_offered comment above records, one layer down and
+			// invisible to the same fence.
+			//
+			// Authorization is the drive: the daemon has handed the effect to
+			// the browser and expects a result, which is what `job_accept`
+			// means on the other path. Neither `auth_pending` nor
+			// `auth_returned` is terminal, so a job that only ever reaches a
+			// sign-in wall now charges one epoch per elapsed lease instead of
+			// driving forever; a delivery still clears the streak through
+			// terminalHandoffEvent. `!open` keeps a re-authorization inside a
+			// live epoch on that epoch, exactly as a reconnect ack does above.
+			if !open {
+				epochStart = at
+				open = true
+			}
 		case kind == ChallengeClearedEvent:
 			// Neither charged nor credited. Ordered after job_accept so a clear
 			// arriving before any drive opened is simply inert.
