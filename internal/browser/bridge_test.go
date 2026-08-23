@@ -2216,9 +2216,61 @@ func TestFocusHandoffsOffersAManualDownloadWithoutDriveAuthority(t *testing.T) {
 	if payload.OpenURL == "" {
 		t.Fatal("offer carries no OpenURL, so the human is sent nowhere")
 	}
-	if payload.DriveAttemptID != "" || payload.DriveOrdinal != nil || payload.DriveStrategy != "" {
-		t.Fatalf("manual download offer carries drive authority (attempt %q ordinal %v strategy %q), want none",
-			payload.DriveAttemptID, payload.DriveOrdinal, payload.DriveStrategy)
+}
+
+// The companion to the focus test: papio must never drive a page whose whole
+// point is that the human fetches the file. The handoff control is what makes
+// the manual-download assertion mean anything — without it the test passes on
+// a harness where no drive epoch was ever available, which is how the first
+// version of this assertion was vacuous.
+func TestOfferWithholdsDriveAuthorityFromAManualDownloadOnly(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	handoffID := park(t, jobs, "wr_drive_handoff", handoffWork())
+	manualID := parkManualDownload(t, jobs, "wr_drive_manual", handoffWork())
+
+	// The recipe that makes a drive epoch mintable at all.
+	effectPermitHolder(t, b)
+	runSync(t, b, helloAs("0.14.0"))
+	effectPermitHolder(t, b)
+
+	driveAttemptFor := func(jobID string) (string, string) {
+		t.Helper()
+		row, err := jobs.Get(ctx, jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(actions) != 1 {
+			t.Fatalf("open actions for %s = %d, want 1", jobID, len(actions))
+		}
+		raw, err := b.offer(*row, actions[0], config.ModeDelegated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg, err := protocol.DecodeBrowserMessage(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := msg.Payload.(*protocol.JobOfferPayload)
+		return payload.DriveAttemptID, payload.OpenURL
+	}
+
+	// Control: drive authority IS available here, so its absence below is a
+	// decision rather than an artifact of the harness.
+	if attempt, _ := driveAttemptFor(handoffID); attempt == "" {
+		t.Fatal("handoff offer minted no drive epoch, so this harness cannot prove anything about withholding one")
+	}
+	attempt, openURL := driveAttemptFor(manualID)
+	if attempt != "" {
+		t.Fatalf("manual download offer minted drive epoch %q, want none", attempt)
+	}
+	// It still has to send the human somewhere.
+	if openURL == "" {
+		t.Fatal("manual download offer carries no OpenURL")
 	}
 }
 

@@ -215,6 +215,17 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A paper you have to fetch yourself now opens through your library, not at
+  the paywall.** When *papio* asks you to download a PDF by hand, the page it
+  needs you to reach is almost always behind your institution's sign-in: of 34
+  such papers measured, 32 required auth and the publisher's own link paywalled
+  every one. `papio actions open` already knew this and worked out the library
+  route. The extension did not, so the inbox's Open sent you to the publisher
+  link instead — right for the two open-access papers, wrong for the other 32.
+  Both now use the same route. Two things deliberately do not change: *papio*
+  still never starts opening these papers on its own, only when you ask, and it
+  never tries to drive the page for you — you asked to fetch this one yourself,
+  so it opens the page and stays out of the way.
 - **One paper can no longer reach your library as two interlibrary-loan
   requests.** *papio* keeps at most one live request per paper by digesting a
   key from the paper's identity. That identity is not fixed: if a paper arrives
