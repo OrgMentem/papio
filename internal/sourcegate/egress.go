@@ -88,7 +88,9 @@ func NewGuarded(authority EgressAuthority, source string, keyed config.Source, c
 	return &GuardedClient{inner: inner, authority: authority, source: source, keyed: keyed, credits: credits}, nil
 }
 
-// MustGuarded panics on a wiring error, like bootstrap startup wiring.
+// MustGuarded panics on a wiring error. Every caller is a test constructing a
+// guarded client from literals it controls, where a wiring error is a bug in the
+// test rather than a condition to handle.
 func MustGuarded(authority EgressAuthority, source string, keyed config.Source, credits CreditCost, inner HTTPClient) *GuardedClient {
 	g, err := NewGuarded(authority, source, keyed, credits, inner)
 	if err != nil {

@@ -28,35 +28,6 @@ export interface ClassifyRule {
    * (compared lowercased). Static labels only — never page-derived text. */
   textAny?: string[];
 }
-/** Shared rule-readiness predicate used by synchronous classifier tests and by
- * the injected planner's equivalent. A rule is complete only when every
- * declared selector/text guard is satisfied; an empty rule never authorizes a
- * verdict. */
-export function isClassifyRuleReady(doc: Document, rule: ClassifyRule): boolean {
-  const hasAll = Array.isArray(rule.all) && rule.all.length > 0;
-  const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
-  const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
-  if (!hasAll && !hasAny && !hasText) return false;
-  if (hasAll && (rule.all as string[]).some((selector) => {
-    try {
-      return doc.querySelector(selector) === null;
-    } catch {
-      return true;
-    }
-  })) return false;
-  if (hasAny && !(rule.any as string[]).some((selector) => {
-    try {
-      return doc.querySelector(selector) !== null;
-    } catch {
-      return false;
-    }
-  })) return false;
-  if (hasText) {
-    const bodyText = (doc.body?.innerText ?? "").toLowerCase();
-    if (!(rule.textAny as string[]).some((needle) => bodyText.includes(needle.toLowerCase()))) return false;
-  }
-  return true;
-}
 
 export interface WorkEvidenceContract {
   /** Exact packaged page-side identity evidence for the requested work. */

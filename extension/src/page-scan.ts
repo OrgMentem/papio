@@ -45,11 +45,10 @@ export interface DetectedPaper {
  * never a guess. */
 export type ScanResult = { papers: DetectedPaper[]; truncated: boolean; renderedRecordCountHint: number | null };
 
-/** Raw-candidate cap before the scan stops walking the DOM (Decision 3). */
+/** Raw-candidate cap for one page scan's bulk collection. The test pins this exported value. */
 export const PAGE_BULK_RAW_CANDIDATE_CAP = 200;
 
 export function scanDocument(root: Document | Element | string = document, tabURL?: string): ScanResult {
-  const MAX_RAW = 200;
   const MAX_LABEL_CHARS = 240;
   const SKIP_TAGS: Record<string, true> = { SCRIPT: true, STYLE: true, NOSCRIPT: true, TEMPLATE: true };
   const CONTAINER_SELECTOR = "li, tr, p, article, [class*='result']";
@@ -501,7 +500,7 @@ export function scanDocument(root: Document | Element | string = document, tabUR
   let truncated = false;
 
   function addOccurrence(identifier: Identifier, startEl: Element): void {
-    if (raw >= MAX_RAW) {
+    if (raw >= PAGE_BULK_RAW_CANDIDATE_CAP) {
       truncated = true;
       return;
     }
@@ -511,12 +510,12 @@ export function scanDocument(root: Document | Element | string = document, tabUR
 
   function scanText(text: string, startEl: Element | null): void {
     if (startEl === null) return;
-    if (raw >= MAX_RAW) {
+    if (raw >= PAGE_BULK_RAW_CANDIDATE_CAP) {
       truncated = true;
       return;
     }
     for (const m of text.matchAll(DOI_TEXT_RE)) {
-      if (raw >= MAX_RAW) {
+      if (raw >= PAGE_BULK_RAW_CANDIDATE_CAP) {
         truncated = true;
         return;
       }
@@ -524,7 +523,7 @@ export function scanDocument(root: Document | Element | string = document, tabUR
       if (STRICT_DOI_RE.test(value)) addOccurrence({ kind: "doi", value }, startEl);
     }
     for (const m of text.matchAll(ARXIV_LABELED_RE)) {
-      if (raw >= MAX_RAW) {
+      if (raw >= PAGE_BULK_RAW_CANDIDATE_CAP) {
         truncated = true;
         return;
       }
@@ -532,7 +531,7 @@ export function scanDocument(root: Document | Element | string = document, tabUR
       if (value !== "") addOccurrence({ kind: "arxiv", value }, startEl);
     }
     for (const m of text.matchAll(PMID_LABELED_RE)) {
-      if (raw >= MAX_RAW) {
+      if (raw >= PAGE_BULK_RAW_CANDIDATE_CAP) {
         truncated = true;
         return;
       }
@@ -542,7 +541,7 @@ export function scanDocument(root: Document | Element | string = document, tabUR
   }
 
   function walk(node: Node): void {
-    if (raw >= MAX_RAW) {
+    if (raw >= PAGE_BULK_RAW_CANDIDATE_CAP) {
       truncated = true;
       return;
     }

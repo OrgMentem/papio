@@ -413,7 +413,6 @@ func windowsOf(doc Document) documentWindows {
 const (
 	windowFrontMatter = bucketFrontMatter
 	windowPageOne     = bucketPageOne
-	windowBeyond      = bucketLater
 )
 
 // foreignIdentifierSignals is the strongest signal available, and the one

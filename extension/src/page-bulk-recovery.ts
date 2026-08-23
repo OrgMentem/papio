@@ -252,7 +252,3 @@ export class PageBulkCohortRecovery {
     });
   }
 }
-export type PageBulkRecoveryStoreV1 = PageBulkCohortRecoveryStoreV1;
-export const PageBulkRecoveryStore = PageBulkCohortRecovery;
-
-export const PageBulkCohortRecoveryStore = PageBulkCohortRecovery;

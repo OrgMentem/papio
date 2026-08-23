@@ -203,13 +203,17 @@ func TestQueueMissingPDFDefaultsLimitAndDesiredVersion(t *testing.T) {
 		}
 	}
 	cli := &fakeCLI{items: items}
-	service := &Service{CLI: cli, Submitter: &fakeSubmitter{}}
+	submitter := &fakeSubmitter{}
+	service := &Service{CLI: cli, Submitter: submitter}
 	result, err := service.QueueMissingPDF(context.Background(), QueueOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cli.limit != 0 || len(result.Queued) != 25 || result.Preflight.Version != "1.0.0" {
 		t.Fatalf("limit=%d queued=%d preflight=%+v", cli.limit, len(result.Queued), result.Preflight)
+	}
+	if got := submitter.requests[0].DesiredVersion; got != "any" {
+		t.Errorf("desired version = %q, want %q", got, "any")
 	}
 }
 
