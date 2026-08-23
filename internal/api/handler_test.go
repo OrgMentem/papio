@@ -1577,15 +1577,19 @@ func TestRouterGrabSuggestionsCoversWireValidationAndLimits(t *testing.T) {
 			Text:       pdf.TextReport{Excerpt: "API suggestion fixture"},
 		}, nil
 	}
-	var wantJob string
+	// 26 seeded against a limit of 25 is what proves truncation, so exactly one
+	// row is dropped — and job ids are random, so WHICH one is dropped is too.
+	// Requiring a named job to survive made this fail for a correct
+	// implementation about one run in 26. Assert the payload contract against
+	// whatever survives instead: every row must be one of the seeded jobs, with
+	// the title, author, year, and DOI that job was seeded with.
+	wantTitles := map[string]string{}
 	for i := range 26 {
 		id := seedAPIEligibleJob(t, system, fmt.Sprintf("wr_api_grab_suggest_%02d", i), work.Work{
 			Title: fmt.Sprintf("API suggestion %02d", i), Authors: []string{"API Author"}, Year: 2026,
 			DOI: fmt.Sprintf("10.1234/api-suggestion-%02d", i),
 		})
-		if i == 0 {
-			wantJob = id
-		}
+		wantTitles[id] = fmt.Sprintf("API suggestion %02d", i)
 	}
 	grabID := seedAPIGrab(t, system, "suggest")
 	router := Router(system)
@@ -1599,15 +1603,23 @@ func TestRouterGrabSuggestionsCoversWireValidationAndLimits(t *testing.T) {
 	if result.Outcome != "ok" || len(result.Suggestions) != 25 || !result.Truncated {
 		t.Fatalf("suggest result = %+v, want 25 rows and truncated=true", result)
 	}
-	found := false
+	seen := map[string]bool{}
 	for _, row := range result.Suggestions {
-		if row.JobID == wantJob && row.Title == "API suggestion 00" {
-			found = true
-			break
+		wantTitle, ok := wantTitles[row.JobID]
+		if !ok {
+			t.Fatalf("suggestion names job %q, which was never seeded: %+v", row.JobID, row)
 		}
-	}
-	if !found {
-		t.Fatalf("suggestions = %+v, want the candidate payload for %q", result.Suggestions, wantJob)
+		if seen[row.JobID] {
+			t.Fatalf("suggestion repeats job %q", row.JobID)
+		}
+		seen[row.JobID] = true
+		if row.Title != wantTitle {
+			t.Fatalf("suggestion for %q = title %q, want %q", row.JobID, row.Title, wantTitle)
+		}
+		wantDOI := "10.1234/api-suggestion-" + strings.TrimPrefix(wantTitle, "API suggestion ")
+		if row.DOI != wantDOI || row.Year != 2026 || len(row.Authors) != 1 || row.Authors[0] != "API Author" {
+			t.Fatalf("suggestion for %q = %+v, want DOI %q with the seeded author and year", row.JobID, row, wantDOI)
+		}
 	}
 	if rpcErr := callMethod(t, router, "grabs.suggest", map[string]any{
 		"grab_id": grabID, "limit": 999,
