@@ -293,7 +293,8 @@ type DocumentDelivery struct {
 	// openurl/custom and as the ILLiad Web Platform base for kind = illiad.
 	BaseURL string `toml:"base_url,omitempty"`
 	// AllowedHosts restricts which hosts a prefilled request form or API
-	// base may reach.
+	// base may reach. An entry without a port matches its host on any port;
+	// an entry with a port must match both the destination host and port.
 	AllowedHosts []string `toml:"allowed_hosts,omitempty"`
 	// SubmitPolicy narrows how a request may be created: never (default,
 	// when empty) | prefill_only | auto_if_unconditional. It narrows what
@@ -1112,6 +1113,83 @@ func validateOpenURLBase(base string) error {
 	return nil
 }
 
+var documentDeliveryHostRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
+
+func parseDocumentDeliveryAllowedHost(raw string) (string, string, error) {
+	const reason = "must be a bare hostname with an optional numeric port"
+	if raw == "" || strings.TrimSpace(raw) != raw || strings.ContainsAny(raw, "/?#@\\") {
+		return "", "", errors.New(reason)
+	}
+	u, err := url.Parse("//" + raw)
+	if err != nil || u.Scheme != "" || u.Host == "" || u.User != nil || u.Path != "" || u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", "", errors.New(reason)
+	}
+	rawHost := u.Hostname()
+	host := strings.ToLower(rawHost)
+	if !documentDeliveryHostRE.MatchString(host) {
+		return "", "", errors.New(reason)
+	}
+	port := strings.TrimPrefix(u.Host, rawHost)
+	if port != "" {
+		if !strings.HasPrefix(port, ":") || len(port[1:]) < 1 || len(port[1:]) > 5 {
+			return "", "", errors.New(reason)
+		}
+		for _, r := range port[1:] {
+			if r < '0' || r > '9' {
+				return "", "", errors.New(reason)
+			}
+		}
+		port = port[1:]
+	}
+	return host, port, nil
+}
+
+func validateDocumentDeliveryDestination(prefix, field, raw string, allowed map[string][]string) error {
+	u, err := url.Parse(raw)
+	host := ""
+	port := ""
+	if err == nil {
+		host = strings.ToLower(u.Hostname())
+		port = u.Port()
+		if port == "" && u.Scheme == "https" {
+			port = "443"
+		}
+	}
+	for _, allowedPort := range allowed[host] {
+		if allowedPort == "" || allowedPort == port {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s%s host %q is not allowed by allowed_hosts", prefix, field, host)
+}
+
+// An allowlist entry without a port matches its host on any port; an entry
+// with a port must match both the destination host and its effective port.
+func validateDocumentDeliveryAllowedHosts(prefix string, d *DocumentDelivery) error {
+	if len(d.AllowedHosts) == 0 {
+		return nil
+	}
+	allowed := make(map[string][]string, len(d.AllowedHosts))
+	for _, raw := range d.AllowedHosts {
+		host, port, err := parseDocumentDeliveryAllowedHost(raw)
+		if err != nil {
+			return fmt.Errorf("%sallowed_hosts entry %q %w", prefix, raw, err)
+		}
+		allowed[host] = append(allowed[host], port)
+	}
+	if d.BaseURL != "" {
+		if err := validateDocumentDeliveryDestination(prefix, "base_url", d.BaseURL, allowed); err != nil {
+			return err
+		}
+	}
+	if d.PatronWebBaseURL != "" {
+		if err := validateDocumentDeliveryDestination(prefix, "patron_web_base_url", d.PatronWebBaseURL, allowed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // documentDeliveryKinds is the exhaustive set of document_delivery.kind
 // values v1's adapter has shipped (ADR-0017 Decision 2): a kind whose
 // implementation does not exist must not parse, the same fail-closed rule
@@ -1204,6 +1282,9 @@ func validateDocumentDelivery(prefix string, d *DocumentDelivery) error {
 			// amendment) ever reads this field.
 			return fmt.Errorf("%spatron_web_base_url is set but kind is %q, not \"illiad\" (a form-kind profile has no fulfilled-request retrieval route; this is dead config)", prefix, kind)
 		}
+	}
+	if err := validateDocumentDeliveryAllowedHosts(prefix, d); err != nil {
+		return err
 	}
 	return nil
 }

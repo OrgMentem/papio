@@ -215,6 +215,23 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **`document_delivery.allowed_hosts` now actually restricts where a request can
+  go.** The setting has been documented since it shipped as controlling the
+  hosts a prefilled request form or API base may reach, and the config
+  reference even carries an example setting it. Nothing read it. The field
+  parsed, `papio config save` wrote it back, and every request went wherever
+  `base_url` pointed — so an operator who listed their library's host believed
+  a control was in force when none was. *papio* now checks `base_url`, and
+  `patron_web_base_url` when it is set, against the list while loading the
+  config, so a mismatch is refused before any job runs rather than reported
+  from inside a fetch. An entry is a bare hostname with an optional port: an
+  entry without a port matches that host on any port, an entry with one must
+  match both, and matching ignores case. An entry carrying a scheme, a path, or
+  user information is rejected as malformed, since it cannot express a host.
+  An **empty list stays permissive**, exactly as before, so no existing config
+  changes behaviour by upgrading. If you have both a non-empty `allowed_hosts`
+  and a destination outside it, that config has never done what it said and the
+  daemon will now say so on startup: add the host, or clear the list.
 - **One open-access paper no longer freezes every other paper at your library.**
   *papio* runs one browser route at a time per provider, so that two papers
   cannot take an irreversible step at the same publisher at once. Every paper

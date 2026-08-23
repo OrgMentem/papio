@@ -1091,7 +1091,7 @@ func TestDocumentDeliveryConfigValidationFailsClosed(t *testing.T) {
 		"[browser.document_delivery]\n" +
 		"kind = \"illiad\"\n" +
 		"base_url = \"https://illiad.example.edu/ILLiadWebPlatform\"\n" +
-		"allowed_hosts = [\"illiad.example.edu\"]\n" +
+		"allowed_hosts = [\"illiad.example.edu\", \"illiadweb.example.edu\"]\n" +
 		"submit_policy = \"auto_if_unconditional\"\n" +
 		"request_classes = [\"digital_journal_article\"]\n" +
 		"legal_basis = \"institution_policy\"\n" +
@@ -1128,6 +1128,42 @@ func TestDocumentDeliveryConfigValidationFailsClosed(t *testing.T) {
 		{
 			name: "full valid illiad block on a named profile",
 			body: validIlliadNamed,
+		},
+		{
+			name: "empty allowed_hosts remains permissive",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://unlisted.example.edu/request\"\nallowed_hosts = []\n",
+		},
+		{
+			name: "listed base host is accepted",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu:8443/request\"\nallowed_hosts = [\"forms.example.edu\"]\n",
+		},
+		{
+			name:    "base host outside the allowlist is rejected",
+			body:    "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://unlisted.example.edu/request\"\nallowed_hosts = [\"forms.example.edu\"]\n",
+			wantErr: "base_url host \"unlisted.example.edu\" is not allowed by allowed_hosts",
+		},
+		{
+			name: "listed host port is accepted",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu:8443/request\"\nallowed_hosts = [\"forms.example.edu:8443\"]\n",
+		},
+		{
+			name:    "scheme in allowed host is rejected",
+			body:    "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu/request\"\nallowed_hosts = [\"https://forms.example.edu\"]\n",
+			wantErr: "allowed_hosts entry \"https://forms.example.edu\" must be a bare hostname",
+		},
+		{
+			name:    "path in allowed host is rejected",
+			body:    "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu/request\"\nallowed_hosts = [\"forms.example.edu/request\"]\n",
+			wantErr: "allowed_hosts entry \"forms.example.edu/request\" must be a bare hostname",
+		},
+		{
+			name: "allowed host matching is case insensitive",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://FORMS.Example.EDU/request\"\nallowed_hosts = [\"forms.example.edu\"]\n",
+		},
+		{
+			name:    "patron web host outside the allowlist is rejected",
+			body:    "[browser.document_delivery]\nkind = \"illiad\"\nbase_url = \"https://illiad.example.edu/ILLiadWebPlatform\"\npatron_web_base_url = \"https://web.example.edu/illiad/illiad.dll\"\nallowed_hosts = [\"illiad.example.edu\"]\n",
+			wantErr: "patron_web_base_url host \"web.example.edu\" is not allowed by allowed_hosts",
 		},
 		{
 			name:    "oclc kind is not implemented",
