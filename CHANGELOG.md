@@ -215,6 +215,26 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **One paper can no longer reach your library as two interlibrary-loan
+  requests.** *papio* keeps at most one live request per paper by digesting a
+  key from the paper's identity. That identity is not fixed: if a paper arrives
+  as a PMID and a resolver later supplies its DOI, *papio* prefers the DOI, and
+  the key it computes changes. The earlier request kept the old key, so a
+  lookup on the new one found nothing, *papio* concluded no request existed,
+  and it could lodge a second — while the first was still outstanding and its
+  outcome unknown. The uniqueness rule in the database could not catch this,
+  because the two keys really were different. Confirming a request absent made
+  it reachable in ordinary use, since that hands the paper back to the
+  scheduler before re-checking. *papio* now resolves a paper's request by the
+  paper's own record whenever the computed key finds nothing, so a renamed
+  identity cannot walk past a request that already exists. No existing request
+  changes, and nothing is resubmitted by upgrading.
+- **A reconciliation prompt is no longer shown for a paper that is not waiting
+  on you.** If *papio* failed to hand a paper back to you after a delivery
+  problem, it could leave the prompt on screen while the paper was already
+  moving again. Pressing it failed, because the paper was not parked. *papio*
+  now hands the paper back first and only then raises the prompt, so a failure
+  leaves no prompt rather than an unusable one.
 - **"Confirm absent" in the inbox now works at all.** When you check with your
   library, find that no interlibrary-loan request was ever lodged, and tell
   *papio* so from the extension, it cancelled the stale request and then failed
