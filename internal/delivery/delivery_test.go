@@ -172,6 +172,74 @@ func TestBranchTable(t *testing.T) {
 	}
 }
 
+// A job's work identity is mutable: promotion can fill a missing DOI, after
+// which Describe() prefers it and the idempotency key changes. The key alone
+// then names no row, and reporting evaluate_gate would let the gate send a
+// second provider request while this job's earlier row still holds the old
+// key — one paper reaching a library twice, which the UNIQUE constraint
+// cannot catch because the keys differ.
+func TestBranchForJobPrefersTheJobsRowWhenTheKeyWasRecomputed(t *testing.T) {
+	svc := testService(t, time.Now())
+	ctx := context.Background()
+	const jobID = "job_rekeyed"
+	testJob(t, svc, jobID)
+
+	// The row this job actually owns, keyed on the PMID it was created with.
+	created, err := svc.Create(ctx, CreateRequest{
+		JobID: jobID, InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "pmid:123456",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Its outcome is unknown, so a second request is the worst case: papio
+	// cannot tell whether the library already has one.
+	if err := svc.UpdateState(ctx, created.ID, StateUnknownOutcome); err != nil {
+		t.Fatal(err)
+	}
+
+	// Promotion filled the DOI, so the recomputed key digests a new identity.
+	rekeyed := IdempotencyKey("campus", "doi:10.1/promoted", "illiad", "digital_journal_article")
+	if rekeyed == created.IdempotencyKey {
+		t.Fatal("test is void: the recomputed key must differ from the row's")
+	}
+	if orphan, err := svc.Lookup(ctx, rekeyed); err != nil || orphan != nil {
+		t.Fatalf("Lookup(rekeyed) = %+v, %v, want no row: the key must name nothing", orphan, err)
+	}
+
+	branch, row, err := svc.BranchForJob(ctx, jobID, rekeyed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch != BranchReconcile {
+		t.Fatalf("BranchForJob(rekeyed) = %q, want reconcile: the job's unknown-outcome row governs, not the new key", branch)
+	}
+	if row == nil || row.ID != created.ID {
+		t.Fatalf("BranchForJob(rekeyed) row = %+v, want the job's existing row %d", row, created.ID)
+	}
+
+	// The key-only entry point keeps its documented contract: it cannot see
+	// across keys, which is why the delivery route no longer uses it.
+	keyOnly, keyRow, err := svc.Branch(ctx, rekeyed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyOnly != BranchEvaluateGate || keyRow != nil {
+		t.Fatalf("Branch(rekeyed) = %q, %+v, want evaluate_gate and no row", keyOnly, keyRow)
+	}
+
+	// A job with no row at all still reaches the gate, or nothing could ever
+	// take the delivery route in the first place.
+	testJob(t, svc, "job_never_routed")
+	fresh, freshRow, err := svc.BranchForJob(ctx, "job_never_routed", rekeyed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh != BranchEvaluateGate || freshRow != nil {
+		t.Fatalf("BranchForJob(no row) = %q, %+v, want evaluate_gate and no row", fresh, freshRow)
+	}
+}
+
 func TestUpdateStateStampsSubmittedAtOnce(t *testing.T) {
 	svc := testService(t, time.Now())
 	ctx := context.Background()

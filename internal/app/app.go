@@ -2385,7 +2385,7 @@ func (s *Service) deliveryRoute(ctx context.Context, row *job.Row, from string) 
 	workIdentity := row.Work.Describe()
 	key := delivery.IdempotencyKey(profileName, workIdentity, dd.Kind, requestClass)
 
-	branch, existing, err := s.Delivery.Branch(ctx, key)
+	branch, existing, err := s.Delivery.BranchForJob(ctx, row.ID, key)
 	if err != nil {
 		return DeliveryRouteResult{}, err
 	}

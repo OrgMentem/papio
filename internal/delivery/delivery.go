@@ -582,6 +582,9 @@ const (
 // Branch implements Decision 3B's idempotency branch for the given key,
 // evaluated strictly before the per-request gate (the former condition 8,
 // "not already submitted", was a state-machine bug, not a gate condition).
+//
+// Prefer BranchForJob wherever a job is in hand. A key alone cannot see a row
+// the same job owns under a DIFFERENT key.
 func (s *Service) Branch(ctx context.Context, key string) (BranchDecision, *Request, error) {
 	row, err := s.Lookup(ctx, key)
 	if err != nil {
@@ -590,15 +593,52 @@ func (s *Service) Branch(ctx context.Context, key string) (BranchDecision, *Requ
 	if row == nil {
 		return BranchEvaluateGate, nil, nil
 	}
+	return branchForRow(row), row, nil
+}
+
+// BranchForJob resolves Decision 3B's branch for a job whose key was just
+// recomputed, falling back to the row the job owns when the key names none.
+//
+// The key digests the job's CURRENT work identity (Decision 1), and that
+// identity is mutable: promotion can fill a missing DOI mid-flight, after
+// which Describe() prefers the DOI and the key changes. A key-only Branch
+// then finds nothing and reports evaluate_gate, so the gate can open and
+// send a SECOND provider request while this job's earlier row — perhaps a
+// live one whose outcome is unknown — still sits under the old key. The
+// UNIQUE constraint on idempotency_key cannot catch it, because the two keys
+// differ. One paper reaching a real library as two interlibrary-loan
+// requests is precisely what Decision 1 exists to prevent, so a job that
+// already owns a row is routed by that row.
+//
+// Falling back is strictly more conservative than recomputing: every branch
+// it can reach is one the unchanged key would have reached anyway.
+func (s *Service) BranchForJob(ctx context.Context, jobID, key string) (BranchDecision, *Request, error) {
+	row, err := s.Lookup(ctx, key)
+	if err != nil {
+		return "", nil, err
+	}
+	if row == nil {
+		if row, err = s.GetByJobID(ctx, jobID); err != nil {
+			return "", nil, err
+		}
+	}
+	if row == nil {
+		return BranchEvaluateGate, nil, nil
+	}
+	return branchForRow(row), row, nil
+}
+
+// branchForRow maps an existing row's state onto its Decision 3B branch.
+func branchForRow(row *Request) BranchDecision {
 	switch row.State {
 	case StateSubmitted, StatePending:
-		return BranchJoinPoll, row, nil
+		return BranchJoinPoll
 	case StateFulfilled:
-		return BranchAdoptFulfilled, row, nil
+		return BranchAdoptFulfilled
 	case StateUnknownOutcome:
-		return BranchReconcile, row, nil
+		return BranchReconcile
 	case StateDeclined, StateCancelled:
-		return BranchResubmissionPolicy, row, nil
+		return BranchResubmissionPolicy
 	default:
 		// StateOffered: the row exists (occupying the idempotency key) but
 		// no live submission was ever attempted — the gate previously
@@ -610,7 +650,7 @@ func (s *Service) Branch(ctx context.Context, key string) (BranchDecision, *Requ
 		// second row: a caller re-evaluating gets a fresh verdict (an
 		// acceptance recorded since the last offer, say), but any create it
 		// attempts resolves onto this same row.
-		return BranchEvaluateGate, row, nil
+		return BranchEvaluateGate
 	}
 }
 
