@@ -5995,167 +5995,130 @@ func TestOpenAccessCandidateDoesNotJoinTheInstitutionFence(t *testing.T) {
 }
 
 // The eligible rows already in a long-running store were minted under the old
-// rule, so correcting the mint is not enough: this machine runs two papio
-// binaries and either can have written one. A candidate that has not been
-// claimed is retired and replaced, and one that owns a live browser surface is
-// left alone - its fence is corrected by the next attempt, not underneath the
-// operator's tab.
-func TestMisfencedOpenAccessCandidateIsRetiredAndReminted(t *testing.T) {
-	b, jobs, _, _ := newBridge(t)
-	ctx := context.Background()
-	runSync(t, b, materializationHello(t))
-	id := parkInstitutional(t, jobs, "wr_refence", handoffWork(), "")
-	row, err := jobs.Get(ctx, id)
-	if err != nil {
-		t.Fatal(err)
+// rule, so correcting the mint is not enough. The fence is corrected IN PLACE
+// for every shape a stored candidate can have, including one holding a live
+// claim: a paper that re-claims every few minutes always holds one, so any
+// liveness guard defers forever on exactly the paper doing the harm - measured
+// live 2026-08-23, one open-access preprint renewed its lease across three
+// deploys while 23 siblings stayed suppressed. Nothing about the surface
+// depends on this value, so the claim and its tab must survive untouched.
+func TestMisfencedOpenAccessCandidateIsRefencedInPlace(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		claim func(t *testing.T, b *Bridge, jobs *job.Store, cand *job.BrowserCandidate)
+	}{
+		{name: "unclaimed"},
+		{
+			name: "holding a live claim",
+			claim: func(t *testing.T, b *Bridge, jobs *job.Store, cand *job.BrowserCandidate) {
+				t.Helper()
+				mustClaim(t, b, jobs, cand, b.epoch, b.now().UTC().Add(10*time.Minute))
+			},
+		},
+		{
+			name: "claimed by a superseded browser generation",
+			claim: func(t *testing.T, b *Bridge, jobs *job.Store, cand *job.BrowserCandidate) {
+				t.Helper()
+				mustClaim(t, b, jobs, cand, b.epoch-1, b.now().UTC().Add(10*time.Minute))
+			},
+		},
+		{
+			name: "claim lapsed in the live generation",
+			claim: func(t *testing.T, b *Bridge, jobs *job.Store, cand *job.BrowserCandidate) {
+				t.Helper()
+				mustClaim(t, b, jobs, cand, b.epoch, b.now().UTC().Add(time.Minute))
+				// The store refuses to record a lease already in the past, so
+				// the fixture ages a real one - which is how a live claim
+				// lapses.
+				if _, err := jobs.S.DB().ExecContext(context.Background(),
+					`UPDATE materialization_claims SET lease_until=? WHERE candidate_id=?`,
+					b.now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), cand.ID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			ctx := context.Background()
+			runSync(t, b, materializationHello(t))
+			id := parkInstitutional(t, jobs, "wr_refence", handoffWork(), "")
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stale, err := b.prepareMaterializationCandidate(ctx, *row)
+			if err != nil || stale == nil {
+				t.Fatalf("pre-fix candidate: %+v %v", stale, err)
+			}
+			if strings.HasPrefix(stale.SafetyDomainID, "oa:") {
+				t.Fatalf("fixture must start on the institution fence, got %q", stale.SafetyDomainID)
+			}
+			if tc.claim != nil {
+				tc.claim(t, b, jobs, stale)
+			}
+			// The job's route is open-access all along; only the recorded
+			// action says so, which is the shape of the rows in a live store.
+			if _, err := jobs.S.DB().ExecContext(ctx,
+				`UPDATE human_actions SET detail=? WHERE job_id=? AND status='open'`,
+				app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36", id); err != nil {
+				t.Fatal(err)
+			}
+			refenced, err := b.prepareMaterializationCandidate(ctx, *row)
+			if err != nil || refenced == nil {
+				t.Fatalf("refenced candidate: %+v %v", refenced, err)
+			}
+			if refenced.SafetyDomainID != "oa:doi.org" {
+				t.Fatalf("fence = %q, want oa:doi.org; the stale row keeps the library suppressed",
+					refenced.SafetyDomainID)
+			}
+			if refenced.ID != stale.ID {
+				t.Fatalf("the candidate was replaced (%q -> %q); correcting the fence must not move the surface",
+					stale.ID, refenced.ID)
+			}
+			if tc.claim == nil {
+				return
+			}
+			claims, err := jobs.S.DB().QueryContext(ctx,
+				`SELECT phase, tab_id FROM materialization_claims WHERE candidate_id=?`, stale.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer claims.Close()
+			surfaces := 0
+			for claims.Next() {
+				var phase string
+				var tabID int64
+				if err := claims.Scan(&phase, &tabID); err != nil {
+					t.Fatal(err)
+				}
+				if phase == "abandoned" {
+					t.Fatalf("correcting the fence abandoned a claim (tab %d); its tab is on screen", tabID)
+				}
+				surfaces++
+			}
+			if err := claims.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if surfaces != 1 {
+				t.Fatalf("claims surviving = %d, want 1", surfaces)
+			}
+		})
 	}
-	stale, err := b.prepareMaterializationCandidate(ctx, *row)
-	if err != nil || stale == nil {
-		t.Fatalf("pre-fix candidate: %+v %v", stale, err)
-	}
-	// The job's route is open-access all along; only the recorded action says
-	// so, which is exactly the shape of the rows in the live store.
-	if _, err := jobs.S.DB().ExecContext(ctx,
-		`UPDATE human_actions SET detail=? WHERE job_id=? AND status='open'`,
-		app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36", id); err != nil {
-		t.Fatal(err)
-	}
-	repaired, err := b.prepareMaterializationCandidate(ctx, *row)
-	if err != nil || repaired == nil {
-		t.Fatalf("repaired candidate: %+v %v", repaired, err)
-	}
-	if repaired.SafetyDomainID != "oa:doi.org" {
-		t.Fatalf("repaired fence = %q, want oa:doi.org; the stale row keeps the library fenced",
-			repaired.SafetyDomainID)
-	}
-	if repaired.ID == stale.ID {
-		t.Fatal("the replacement reused the retired candidate's id; the id must cover its fence")
-	}
-	retired, err := jobs.GetBrowserCandidate(ctx, stale.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if retired == nil || retired.Status != "abandoned" {
-		t.Fatalf("stale candidate status = %+v, want abandoned", retired)
-	}
-	// A claimed candidate owns a live browser surface, so a wrong fence on one
-	// must be left in place: retiring it would abandon the tab the operator can
-	// see. A second job reaches that state - misfenced AND claimed - because
-	// the first one's fence is already correct by now.
-	claimedID := parkInstitutional(t, jobs, "wr_refence_claimed", handoffWork(), "")
-	claimedRow, err := jobs.Get(ctx, claimedID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inFlight, err := b.prepareMaterializationCandidate(ctx, *claimedRow)
-	if err != nil || inFlight == nil {
-		t.Fatalf("in-flight candidate: %+v %v", inFlight, err)
-	}
-	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: inFlight.ID, BrowserHolderGeneration: b.epoch,
-		JobAttemptRevision:         inFlight.JobAttemptRevision,
-		InstitutionProfileRevision: inFlight.InstitutionProfileRevision,
-		RouteRevision:              inFlight.RouteRevision, MaterializationKind: "browser_tab",
-		LeaseUntil: b.now().UTC().Add(10 * time.Minute),
+}
+
+// mustClaim gives a candidate a real materialization claim, so a test asserts
+// against a surface the daemon recognises rather than a status label.
+func mustClaim(t *testing.T, b *Bridge, jobs *job.Store, cand *job.BrowserCandidate, generation int64, lease time.Time) {
+	t.Helper()
+	if _, err := jobs.ClaimMaterialization(context.Background(), job.MaterializationClaimInput{
+		CandidateID: cand.ID, BrowserHolderGeneration: generation,
+		JobAttemptRevision:         cand.JobAttemptRevision,
+		InstitutionProfileRevision: cand.InstitutionProfileRevision,
+		RouteRevision:              cand.RouteRevision, MaterializationKind: "browser_tab",
+		LeaseUntil: lease,
 	}); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := jobs.S.DB().ExecContext(ctx,
-		`UPDATE human_actions SET detail=? WHERE job_id=? AND status='open'`,
-		app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36", claimedID); err != nil {
-		t.Fatal(err)
-	}
-	held, err := b.prepareMaterializationCandidate(ctx, *claimedRow)
-	if err != nil || held == nil || held.ID != inFlight.ID {
-		t.Fatalf("a claimed candidate must be returned untouched: %+v %v", held, err)
-	}
-	stillClaimed, err := jobs.GetBrowserCandidate(ctx, inFlight.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stillClaimed == nil || stillClaimed.Status == "abandoned" {
-		t.Fatalf("the repair retired a candidate holding a live claim (%+v); its tab is on screen", stillClaimed)
-	}
-
-	// The live shape that a status label cannot express: a claim made by a
-	// browser generation that is gone leaves the candidate labelled `claimed`
-	// with no surface behind it. Measured live 2026-08-23 - the misfenced
-	// candidate sat exactly here across a drive, so gating the repair on the
-	// label made it unreachable for the one paper that needed it.
-	orphanID := parkInstitutional(t, jobs, "wr_refence_orphan", handoffWork(), "")
-	orphanRow, err := jobs.Get(ctx, orphanID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	orphan, err := b.prepareMaterializationCandidate(ctx, *orphanRow)
-	if err != nil || orphan == nil {
-		t.Fatalf("orphan candidate: %+v %v", orphan, err)
-	}
-	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: orphan.ID, BrowserHolderGeneration: b.epoch - 1,
-		JobAttemptRevision:         orphan.JobAttemptRevision,
-		InstitutionProfileRevision: orphan.InstitutionProfileRevision,
-		RouteRevision:              orphan.RouteRevision, MaterializationKind: "browser_tab",
-		LeaseUntil: b.now().UTC().Add(10 * time.Minute),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := jobs.S.DB().ExecContext(ctx,
-		`UPDATE human_actions SET detail=? WHERE job_id=? AND status='open'`,
-		app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36", orphanID); err != nil {
-		t.Fatal(err)
-	}
-	refenced, err := b.prepareMaterializationCandidate(ctx, *orphanRow)
-	if err != nil || refenced == nil {
-		t.Fatalf("orphan repair: %+v %v", refenced, err)
-	}
-	if refenced.SafetyDomainID != "oa:doi.org" {
-		t.Fatalf("a candidate claimed by a dead browser generation kept its fence (%q); the label is not proof of a surface",
-			refenced.SafetyDomainID)
-	}
-
-	// A claim stuck in an active phase whose lease has run out holds no
-	// surface, and it is in the CURRENT generation - so phase and generation
-	// alone would block the repair for as long as the browser lives, and a
-	// paper re-claiming every few minutes renews that block forever. Measured
-	// live 2026-08-23: job_9f8bec30da sat in `navigated` in the live
-	// generation while re-claiming across two reloads.
-	lapsedID := parkInstitutional(t, jobs, "wr_refence_lapsed", handoffWork(), "")
-	lapsedRow, err := jobs.Get(ctx, lapsedID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lapsedCand, err := b.prepareMaterializationCandidate(ctx, *lapsedRow)
-	if err != nil || lapsedCand == nil {
-		t.Fatalf("lapsed candidate: %+v %v", lapsedCand, err)
-	}
-	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: lapsedCand.ID, BrowserHolderGeneration: b.epoch,
-		JobAttemptRevision:         lapsedCand.JobAttemptRevision,
-		InstitutionProfileRevision: lapsedCand.InstitutionProfileRevision,
-		RouteRevision:              lapsedCand.RouteRevision, MaterializationKind: "browser_tab",
-		LeaseUntil: b.now().UTC().Add(time.Minute),
-	})
-	if err != nil || claim == nil {
-		t.Fatalf("claim: %+v %v", claim, err)
-	}
-	if _, err := jobs.S.DB().ExecContext(ctx,
-		`UPDATE materialization_claims SET phase='navigated', lease_until=? WHERE id=?`,
-		b.now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), claim.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := jobs.S.DB().ExecContext(ctx,
-		`UPDATE human_actions SET detail=? WHERE job_id=? AND status='open'`,
-		app.OABrowserHandoffDetail+"\nhttps://doi.org/10.26434/chemrxiv-2025-x8h36", lapsedID); err != nil {
-		t.Fatal(err)
-	}
-	lapsedFixed, err := b.prepareMaterializationCandidate(ctx, *lapsedRow)
-	if err != nil || lapsedFixed == nil {
-		t.Fatalf("lapsed repair: %+v %v", lapsedFixed, err)
-	}
-	if lapsedFixed.SafetyDomainID != "oa:doi.org" {
-		t.Fatalf("a lapsed claim in the live generation blocked the repair (%q); it holds no surface",
-			lapsedFixed.SafetyDomainID)
 	}
 }
 

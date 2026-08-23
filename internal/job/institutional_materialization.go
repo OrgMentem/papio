@@ -667,6 +667,37 @@ func (js *Store) SetBrowserCandidateStatus(ctx context.Context, id, expectedStat
 	return nil
 }
 
+// RefenceBrowserCandidate corrects a candidate's provider fence in place.
+//
+// The fence is derived state - which provider this route actually crosses - and
+// every candidate used to be minted with the institution's, including routes
+// that reach doi.org and never touch the library. The surface such a candidate
+// may already own is identified by its id, its binding, and its tab id, none of
+// which this touches, so correcting the value is strictly less invasive than
+// retiring the row: retiring abandons a tab the operator can see, and leaving
+// it blocks every sibling at the named provider through the scheduler's
+// anti-join. The compare-and-set makes a concurrent correction idempotent
+// rather than racing.
+func (js *Store) RefenceBrowserCandidate(ctx context.Context, id, expectedDomain, nextDomain string) error {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(nextDomain) == "" {
+		return errors.New("refencing a browser candidate requires an id and a domain")
+	}
+	res, err := js.S.DB().ExecContext(ctx,
+		`UPDATE browser_candidates SET safety_domain_id=?, updated_at=? WHERE id=? AND safety_domain_id=?`,
+		nextDomain, store.Now(), id, expectedDomain)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrMaterializationConflict
+	}
+	return nil
+}
+
 // MaterializationClaim is a fenced daemon claim. Routes are intentionally not
 // represented; only their issuance ordinal is durable.
 type MaterializationClaim struct {

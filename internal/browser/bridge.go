@@ -1611,46 +1611,37 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 	if existing, getErr := b.jobs.CurrentBrowserCandidateForJob(ctx, row.ID, attempt); getErr != nil {
 		return nil, getErr
 	} else if existing != nil {
-		// The repair is scoped to the ONE mismatch that is known wrong: this
+		// The repair is scoped to the ONE mismatch known to be wrong: this
 		// job's route is open-access and its stored candidate carries some
-		// other fence. Nothing in production rewrites a candidate's domain, so
-		// a general "any mismatch is stale" rule would be true today, but it
-		// is a wider claim than the defect needs and it would retire the
+		// other fence. Nothing else in production writes this column, so a
+		// general "any mismatch is stale" rule would also be true today, but
+		// it is a wider claim than the defect needs and it would rewrite the
 		// candidates that tests and future callers legitimately pre-create.
-		// What must not be retired is a candidate whose surface is LIVE, and
-		// the candidate's own status label does not say that: a lapsed claim is
-		// superseded inside the claim path, which returns the row to eligible
-		// and re-claims it in one transaction, so a paper cycling through
-		// claims is never observed `eligible` here. Gating on the label made
-		// this repair unreachable for exactly the paper that needed it -
-		// measured live 2026-08-23, the misfenced candidate stayed `claimed`
-		// against an abandoned claim across a drive. Claim liveness is the
-		// honest predicate, and it is already defined: an active phase in THIS
-		// holder generation, which a browser restart correctly ends.
+		//
+		// The fence is corrected in place rather than by retiring the row.
+		// Retiring looked safer and is not: a paper that re-claims every few
+		// minutes always holds a live claim, so any liveness guard defers
+		// forever on exactly the paper doing the harm - measured live
+		// 2026-08-23, one open-access preprint renewed its lease across three
+		// deploys while 23 siblings stayed suppressed. Nothing about the
+		// surface depends on this value: the tab is reached by candidate id,
+		// binding, and tab id, and the offer path re-reads the row every poll,
+		// so at worst one poll declines to offer and the next agrees.
 		misfenced := strings.HasPrefix(domain, "oa:") && existing.SafetyDomainID != domain
 		if !misfenced {
 			return existing, nil
 		}
-		liveClaim, _, claimErr := b.jobs.LiveMaterializationClaimForJob(ctx, row.ID, attempt, b.epoch)
-		if claimErr != nil {
-			return nil, claimErr
-		}
-		// LiveMaterializationClaimForJob asks about phase and generation, not
-		// the lease, so a claim stuck in `navigated` would block this repair
-		// for as long as the generation lasts - and a paper that re-claims
-		// every few minutes renews that block indefinitely, which is the
-		// paper doing the harm. A lapsed lease is already how papio decides a
-		// surface is no longer owned: the claim path supersedes exactly such a
-		// claim and returns its candidate to eligible. So the tab to protect
-		// is one whose lease has NOT run out.
-		if liveClaim != nil && claimLeaseHeld(liveClaim.LeaseUntil, b.now()) {
-			// The operator can see this tab; its fence is corrected by the
-			// next attempt rather than underneath them.
-			return existing, nil
-		}
-		if err := b.jobs.SetBrowserCandidateStatus(ctx, existing.ID, existing.Status, "abandoned"); err != nil {
+		if err := b.jobs.RefenceBrowserCandidate(ctx, existing.ID, existing.SafetyDomainID, domain); err != nil {
 			return nil, err
 		}
+		refenced, refencedErr := b.jobs.GetBrowserCandidate(ctx, existing.ID)
+		if refencedErr != nil {
+			return nil, refencedErr
+		}
+		if refenced != nil {
+			return refenced, nil
+		}
+		return existing, nil
 	}
 	strategy := "title"
 	switch {
@@ -1667,7 +1658,7 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 	}
 	routeRevision := materializationRevision(key, profile.ID, strategy, row.ID, strconv.FormatInt(attempt, 10), row.Work.DOI, row.Work.PMID, row.Work.ArXiv, row.Work.ISBN, row.Work.OpenAlex)
 	input := job.BrowserCandidateInput{
-		ID:    materializationMAC(key, "browser_candidate", profile.ID, strconv.FormatInt(profile.Revision, 10), profile.AuthorityDigest, strconv.FormatInt(routeRevision, 10), strategy, row.ID, strconv.FormatInt(attempt, 10), domain),
+		ID:    materializationMAC(key, "browser_candidate", profile.ID, strconv.FormatInt(profile.Revision, 10), profile.AuthorityDigest, strconv.FormatInt(routeRevision, 10), strategy, row.ID, strconv.FormatInt(attempt, 10)),
 		JobID: row.ID, JobAttemptRevision: attempt,
 		InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: routeRevision, RouteClass: "institutional", IdentifierStrategy: strategy,
@@ -12334,16 +12325,4 @@ func (b *Bridge) candidateSafetyDomain(ctx context.Context, key []byte, profileI
 		}
 	}
 	return institutional, nil
-}
-
-// claimLeaseHeld reports whether a materialization claim's lease still covers
-// its surface. An unparseable or empty lease is treated as held: the claim
-// record exists, and guessing "expired" from a value papio cannot read would
-// retire a candidate whose tab may be on screen.
-func claimLeaseHeld(leaseUntil string, now time.Time) bool {
-	at, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(leaseUntil))
-	if err != nil {
-		return true
-	}
-	return at.After(now)
 }
