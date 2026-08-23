@@ -225,9 +225,11 @@ execution records kept during the initial build.
   until it lapsed. Then the next attempt took the lane again. Measured on this
   machine: one open-access preprint held it while 22 papers queued behind it,
   each fresh attempt re-arming the hold. An open-access route is now filed
-  under the site it actually visits, and the papers already recorded the old
-  way are corrected the next time *papio* looks at them — except while one is
-  driving a tab you can see, which is left alone until it finishes.
+  under the site it actually visits, and a paper already recorded the old way
+  is corrected the next time *papio* looks at it — including while it is
+  driving a tab you can see, because only the filing changes and the tab
+  itself is never disturbed. Verified on the same preprint: correcting it
+  released all 22 papers at once, and its own tab kept going.
 - **`papio doctor` no longer counts open-access papers as blocked by a sign-in.**
   The line that names which paper holds your library's sign-in slot also counts
   the papers waiting on it, and it was counting every waiting paper — including
