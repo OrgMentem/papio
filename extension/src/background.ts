@@ -6006,8 +6006,7 @@ export class Bridge {
         continue;
       }
       if (tabID === undefined) {
-        this.send("job_reject", {}, request.jobID);
-        await this.removeJobWithOffer(request.jobID);
+        await this.parkUndrivableHandoff(request.jobID, "tab creation failed");
         continue;
       }
       this.beginProviderDrive(request.jobID);
@@ -12979,6 +12978,25 @@ export class Bridge {
     await this.update((s) => upsertJob(s, job));
   }
 
+  /** A browser that will not give papio a surface has said nothing about the
+   * paper. `job_reject` is terminal daemon-side (`browser_rejected` ->
+   * `unavailable`), so answering a local surface failure with it retires work a
+   * later epoch would drive: measured live, 19 papers between 2026-08-19 and
+   * 08-23 ended exactly that way, each with an empty `browser.job_reject {}` as
+   * its whole diagnosis, after two offers it had answered `queued`. Drop local
+   * tracking, free the drive slot, and let the daemon re-offer - the same
+   * disposition the MAX_AUTH_ATTEMPTS path already documents ("No job_reject -
+   * that is terminal; the job stays parked and is re-offered"). */
+  private async parkUndrivableHandoff(
+    jobID: string,
+    reason: string,
+  ): Promise<void> {
+    console.error(
+      `papio: no handoff surface for ${jobID} (${reason}); left parked for a later offer`,
+    );
+    await this.removeJobWithOffer(jobID);
+  }
+
   private async removeJobWithOffer(jobID: string): Promise<void> {
     this.destroyDeliveryChoicesForJob(jobID);
     const job = findByJob(this.store, jobID);
@@ -14386,8 +14404,10 @@ export class Bridge {
           }
           if (tabID === undefined) {
             this.pendingForcedReleases.delete(queued.job_id);
-            this.send("job_reject", {}, queued.job_id);
-            await this.removeJobWithOffer(queued.job_id);
+            await this.parkUndrivableHandoff(
+              queued.job_id,
+              "queued tab creation failed",
+            );
             continue;
           }
           this.beginProviderDrive(queued.job_id);
@@ -16098,7 +16118,10 @@ export class Bridge {
           }
           if (tabID === undefined) {
             this.wakeEffectGovernor();
-            this.send("job_reject", {}, jobID);
+            await this.parkUndrivableHandoff(
+              jobID,
+              "re-offer tab creation failed",
+            );
             return;
           }
           this.beginProviderDrive(jobID);
@@ -16258,7 +16281,7 @@ export class Bridge {
     }
     if (tabID === undefined) {
       this.wakeEffectGovernor();
-      this.send("job_reject", {}, jobID);
+      await this.parkUndrivableHandoff(jobID, "tab creation failed");
       return;
     }
     this.beginProviderDrive(jobID);

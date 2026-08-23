@@ -6949,15 +6949,33 @@ test("a changed re-offer reuses the live job tab for the institutional fallback"
   ).toHaveLength(2);
 });
 
-test("job_reject is sent when tab creation fails", async () => {
+// This test used to assert the opposite ("job_reject is sent when tab creation
+// fails"), and that assertion was the defect written down: `job_reject` is
+// terminal daemon-side (`browser_rejected` -> `unavailable`), so a browser that
+// would not give papio a surface retired the paper. Measured live, 19 papers
+// between 2026-08-19 and 08-23 ended that way, each with an empty
+// `browser.job_reject {}` as its whole diagnosis, after offers it had answered
+// `queued`. A surface failure is local and transient and says nothing about the
+// paper, so the job now stays parked for the daemon's next offer - the
+// disposition the MAX_AUTH_ATTEMPTS path already documents.
+test("a browser that cannot open a tab parks the job instead of retiring it", async () => {
   const h = makeHarness();
   h.tabs.failCreate = true;
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0002_fail"));
 
   expect(h.frames().some((f) => f.type === "job_accept")).toBe(false);
-  const reject = h.frames().find((f) => f.type === "job_reject");
-  expect(reject?.job_id).toBe("job_0002_fail");
+  expect(h.frames().some((f) => f.type === "job_reject")).toBe(false);
+  // Nothing is left tracked, so the drive slot is free for the re-offer.
+  expect(h.backend.store.activeJobs).toEqual([]);
+
+  // The re-offer drives once the browser is willing again.
+  h.tabs.failCreate = false;
+  await h.port.inbound(jobOffer("job_0002_fail"));
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_0002_fail")
+      ?.tab_id,
+  ).toBe(100);
 });
 
 test("IdP navigation emits auth_pending once and never leaks the URL/host", async () => {
