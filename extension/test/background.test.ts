@@ -1028,6 +1028,17 @@ function useUnknownProviderClassifier(
   };
 }
 
+/** Fire any pending challenge-confirmation timer. papio no longer turns the
+ * FIRST positive challenge reading into a human ask: a Cloudflare managed
+ * challenge resolves itself in seconds and publishes "Just a moment..." as a
+ * title-only update mid-navigation, so the reading has to persist across the
+ * confirmation window first (CHALLENGE_CONFIRM_MS). Tests that want the ask
+ * raised must therefore let that window elapse. Tolerant by design: a test
+ * whose page has already resolved has no timer to fire, and that is the point. */
+async function settleChallengeConfirmation(h: Harness): Promise<void> {
+  const pending = h.timers.filter((timer) => timer.ms === 8_000);
+  for (const timer of pending) await timer.fn();
+}
 async function classifyProviderUnknown(
   h: Harness,
   jobID: string,
@@ -1038,6 +1049,10 @@ async function classifyProviderUnknown(
   const url = `https://${PROVIDER_HOST}/stable/challenge`;
   h.tabs.seed({ id: tabID, url });
   await h.tabs.completeNavigation(tabID, url);
+  // A challenge reading only becomes an ask once it persists across the
+  // confirmation window, so every caller that wants the blocked state must let
+  // that window elapse. No-op when the page assessed normally.
+  await settleChallengeConfirmation(h);
   return tabID;
 }
 /** Exercise the planner's URL resolution directly. This mirror used to call
@@ -5949,6 +5964,7 @@ test("a Cloudflare challenge clears an earlier unknown streak and parks its prov
   h.clock.now += 5_000;
   const url = `https://${PROVIDER_HOST}/stable/challenge`;
   await h.tabs.completeNavigation(tabID, url);
+  await settleChallengeConfirmation(h);
 
   expect(h.backend.store.activeJobs[0]).toMatchObject({
     challenge_blocked: true,
@@ -6479,6 +6495,7 @@ test("a challenge parks only its provider and leaves another provider draining",
   const challengeURL = `https://${PROVIDER_HOST}/stable/challenge`;
   h.tabs.seed({ id: sourceTabID, url: challengeURL });
   await h.tabs.completeNavigation(sourceTabID, challengeURL);
+  await settleChallengeConfirmation(h);
 
   const parked = jobOffer("job_challenge_parked") as {
     payload: Record<string, unknown>;
@@ -6531,6 +6548,7 @@ test("an expired provider lease reclaims its queued handoff without a new offer"
   const challengeURL = `https://${PROVIDER_HOST}/stable/challenge`;
   h.tabs.seed({ id: sourceTabID, url: challengeURL });
   await h.tabs.completeNavigation(sourceTabID, challengeURL);
+  await settleChallengeConfirmation(h);
 
   const queued = jobOffer("job_lease_reclaim") as {
     payload: Record<string, unknown>;
@@ -21240,4 +21258,124 @@ test("reconciliation retires a positively owned duplicate as superseded, naming 
   expect(close.payload["binding_id"]).toBe(bindingID);
   expect(close.payload["disposition"]).toBe("surface_superseded");
   expect(close.payload["surface_tab_id"]).toBe(duplicateTab.id);
+});
+
+// The defect that opened this work, measured live 2026-08-22 on one paper: 25
+// challenge blocks, 2 clears, every block landing 0.4-1.0s after an
+// institutional effect while auth_returned came back inside a second. Those
+// were Cloudflare's managed challenge announcing itself as a title-only update
+// mid-navigation - a stage that clears itself in seconds with no human action.
+// papio asked the operator anyway, parked the provider drain, and charged the
+// epoch; by the time anyone looked, the page had resolved to the article with a
+// live download button.
+test("a security check that resolves itself never becomes a human ask", async () => {
+  let challenge = true;
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => challenge);
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_challenge_transient"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const url = `https://${PROVIDER_HOST}/stable/challenge`;
+  h.tabs.seed({ id: tabID, url });
+  await h.tabs.completeNavigation(tabID, url);
+
+  // Read, but not yet asked: nothing is asserted to the operator or the daemon
+  // on a first sighting.
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+  expect(h.backend.store.challengeCooldowns ?? {}).toEqual({});
+  expect(
+    h.frames().some((f) => f.payload?.["code"] === "challenge_blocked"),
+  ).toBe(false);
+
+  // Cloudflare finishes on its own before the window elapses.
+  challenge = false;
+  await settleChallengeConfirmation(h);
+
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+  expect(h.backend.store.challengeCooldowns ?? {}).toEqual({});
+  expect(
+    h.frames().some((f) => f.payload?.["code"] === "challenge_blocked"),
+  ).toBe(false);
+});
+
+// The other direction: a check that is still there when the window elapses is a
+// real wall and must still reach the operator. Clearing wrongly is cheap and
+// self-correcting; never asking at all would strand every genuinely walled paper.
+test("a security check that persists still becomes a human ask", async () => {
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => true);
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_challenge_persistent"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const url = `https://${PROVIDER_HOST}/stable/challenge`;
+  h.tabs.seed({ id: tabID, url });
+  await h.tabs.completeNavigation(tabID, url);
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+
+  await settleChallengeConfirmation(h);
+
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    challenge_blocked: true,
+    challenge_kind: "cloudflare",
+  });
+  expect(
+    h.frames().some((f) => f.payload?.["code"] === "challenge_blocked"),
+  ).toBe(true);
+});
+
+// A redirect loop is a dead end, not a stage: waiting only delays a refusal
+// that is already correct, so it is deliberately exempt from the window.
+test("a redirect loop asks immediately, with no confirmation window", async () => {
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => false);
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "redirect_loop" } }];
+    return [{ result: undefined }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_redirect_loop_now"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const url = `https://${PROVIDER_HOST}/stable/loop`;
+  h.tabs.seed({ id: tabID, url });
+  await h.tabs.completeNavigation(tabID, url);
+
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    challenge_blocked: true,
+    challenge_kind: "redirect_loop",
+  });
+});
+
+// The live path, specifically: Cloudflare publishes "Just a moment..." as a
+// TITLE-ONLY update while the document is still navigating, which reaches the
+// tracked-page assessment rather than the classifier. That is the update that
+// produced 25 asks on one paper. A title change is not a settled document.
+test("a title-only challenge update on a tracked page waits before asking", async () => {
+  let challenge = true;
+  const h = makeHarness();
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: challenge ? "challenge" : "normal" } }];
+    return [{ result: undefined }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck());
+  await h.port.inbound(jobOffer("job_challenge_title_only"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const url = `https://${PROVIDER_HOST}/stable/interstitial`;
+  h.tabs.seed({ id: tabID, url });
+
+  // Title-only: no status, exactly as Chrome delivers the interstitial.
+  await h.tabs.update(tabID, { title: "Just a moment..." });
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+
+  challenge = false;
+  await settleChallengeConfirmation(h);
+  expect(h.backend.store.activeJobs[0]?.challenge_blocked).toBeUndefined();
+  expect(
+    h.frames().some((f) => f.payload?.["code"] === "challenge_blocked"),
+  ).toBe(false);
 });

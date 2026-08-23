@@ -193,6 +193,18 @@ const CHALLENGE_COOLDOWN_MS = 10 * 60_000;
  * arrive, and each probe is a scripting call into a live tab — so the sweep is
  * bounded rather than proportional to the backlog. */
 const CHALLENGE_RECHECK_LIMIT = 3;
+/** How long a Cloudflare-style check must PERSIST before papio turns it into a
+ * human ask. Cloudflare's managed challenge resolves itself in a few seconds
+ * with no human action, and it publishes "Just a moment..." as a title-only
+ * update mid-navigation - which papio read as a wall, parked the drive, and
+ * asked the operator. Measured live on one paper: 25 blocks, 2 clears, every
+ * block landing 0.4-1.0s after an institutional effect while `auth_returned`
+ * came back inside a second. By the time the operator looked, the page had
+ * long since resolved to the article with a live download button - the defect
+ * that opened this work ("why is that paper not being grabbed, when the pdf
+ * button is there, clickable?"). A redirect loop is exempt: it is a dead end,
+ * not a stage, and waiting only delays a true refusal. */
+const CHALLENGE_CONFIRM_MS = 8_000;
 /** A title-only OpenAthens error update can precede its body render. Recheck
  * exactly once, late enough for the bounded DOM marker probe to see it. */
 const OPENATHENS_ERROR_RECHECK_MS = 1_500;
@@ -2795,6 +2807,10 @@ export class Bridge {
   private readonly challengeBlockedOutcomeSent = new Set<string>();
   /** Worker-local wakeups complement durable cooldown expiry timestamps. */
   private readonly challengeCooldownTimers = new Map<string, object>();
+  /** job_id -> the tab whose challenge reading is awaiting confirmation. Worker
+   * memory by design (see confirmThenBlockChallenge): losing it raises nothing,
+   * which is the safe direction. */
+  private readonly challengeConfirmations = new Map<string, number>();
   /** Jobs whose work window was already raised for a detected IdP failure this
    * worker lifetime, so a bounded re-drive loop cannot yank focus repeatedly.
    * Cleared on job removal. */
@@ -13248,6 +13264,52 @@ export class Bridge {
     return declaredHosts[0];
   }
 
+  /** Raise a challenge ask only for a check that PERSISTS. A Cloudflare
+   * managed challenge clears itself in seconds and announces itself as a
+   * title-only update mid-navigation, so the first positive reading is not yet
+   * evidence of a wall - see CHALLENGE_CONFIRM_MS for the live measurement.
+   *
+   * Deferral state is worker memory on purpose. A worker death loses the
+   * pending confirmation and therefore raises nothing, which is the same
+   * fail-open stance recheckChallengeBlocks already takes: an unraised ask
+   * costs one more classification pass, a false ask costs the operator a
+   * paper. The next assessment re-detects a real wall - that is demonstrably
+   * live, since it is how every one of these blocks was created.
+   */
+  private async confirmThenBlockChallenge(
+    job: ActiveJob,
+    currentHost: string,
+    kind: ChallengeBlockKind,
+    currentURL?: string,
+  ): Promise<void> {
+    // A dead end, not a stage: waiting only delays a refusal already correct.
+    if (kind === "redirect_loop") {
+      await this.blockChallenge(job, currentHost, kind, currentURL);
+      return;
+    }
+    if (job.challenge_blocked === true) {
+      // Already asked: re-stamp through the ordinary path, which is idempotent
+      // and emits no second outcome.
+      await this.blockChallenge(job, currentHost, kind, currentURL);
+      return;
+    }
+    const tabID = job.tab_id;
+    const pending = this.challengeConfirmations.get(job.job_id);
+    if (pending !== undefined && pending === tabID) return;
+    this.challengeConfirmations.set(job.job_id, tabID);
+    this.deps.setTimeout(async () => {
+      await this.ready;
+      if (this.challengeConfirmations.get(job.job_id) !== tabID) return;
+      this.challengeConfirmations.delete(job.job_id);
+      const current = findByJob(this.store, job.job_id);
+      // Gone, re-tabbed, or already asked: nothing left for this reading to say.
+      if (current === undefined || current.tab_id !== tabID) return;
+      if (current.challenge_blocked === true) return;
+      if (!(await this.challengeStillPresent(current))) return;
+      await this.blockChallenge(current, currentHost, kind, currentURL);
+    }, CHALLENGE_CONFIRM_MS);
+  }
+
   private async blockChallenge(
     job: ActiveJob,
     currentHost: string,
@@ -13311,6 +13373,13 @@ export class Bridge {
     await this.parkHandoffForManual(job.job_id);
     await this.syncConnectionBadge();
   }
+  /** Retire a challenge ask and report whether this job now HOLDS A DRIVE
+   * SLOT. The two callers use that as their gate, so the name undersells it:
+   * a clean page whose drive is only queued must not go on to classify, or a
+   * queued job would download out of turn (pinned by "challenge resume queues
+   * without a governor slot before classifying"). Evidence and scheduling are
+   * genuinely coupled here - the block is always cleared, the answer is about
+   * the slot. */
   private async clearChallengeBlock(job: ActiveJob): Promise<boolean> {
     if (job.challenge_blocked !== true) return false;
     const providerHost = job.challenge_host;
@@ -16331,12 +16400,14 @@ export class Bridge {
         assessment?.kind === "challenge" ||
         assessment?.kind === "redirect_loop"
       ) {
-        await this.blockChallenge(
+        await this.confirmThenBlockChallenge(
           job,
           host,
           assessment.kind === "challenge" ? "cloudflare" : "redirect_loop",
           url,
         );
+        // The handoff still stops on this pass: papio has read a check on the
+        // page, and a self-resolving one resumes on the next tab event.
         return true;
       }
       if (assessment?.kind === "normal" && job.challenge_blocked === true) {
@@ -17526,7 +17597,7 @@ export class Bridge {
       );
     }
     if (assessmentKind === "challenge" || assessmentKind === "redirect_loop") {
-      await this.blockChallenge(
+      await this.confirmThenBlockChallenge(
         currentJob,
         host,
         assessmentKind === "challenge" ? "cloudflare" : "redirect_loop",
@@ -17672,14 +17743,18 @@ export class Bridge {
   }
 
   /** A challenge is a provider-wide human step, not a page retry. Keep its
-   * existing tab available and park only siblings with a bounded lease. */
+   * existing tab available and park only siblings with a bounded lease.
+   *
+   * The name is now accurate: the wait is the confirmation window, because this
+   * path reaches an `unknown` verdict on a page that may still be mid-check.
+   * It never waited before. */
   private async waitForBotChallenge(
     job: ActiveJob,
     host: string,
     kind: ChallengeBlockKind = "cloudflare",
   ): Promise<void> {
     this.classifyRetries.delete(job.job_id);
-    await this.blockChallenge(job, host, kind);
+    await this.confirmThenBlockChallenge(job, host, kind);
   }
 
   private scheduleClassifyRetry(
