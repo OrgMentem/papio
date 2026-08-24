@@ -635,6 +635,10 @@ There is also a link check, because `zensical build` prints a broken link as an
   `rule://no-underscore-file-in-extension`.
 
 ### Adapters & fixtures
+- The procedure for building or repairing one lives in
+  `.agents/skills/papio-provider-adapter/SKILL.md` — evidence order, the
+  wrapper-versus-file test, route-boundary and localization rules, and the
+  verification ladder. The footguns below are the standing facts it assumes.
 - An adapter **cannot** enter `extension/src/adapters/types.ts` without captured fixtures —
   and `success.html` alone is only enough for an adapter whose rules are all `article`.
   `expectFixtureBackedRules` (`extension/test/adapters.test.ts`) derives the required
