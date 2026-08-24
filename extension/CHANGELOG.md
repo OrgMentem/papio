@@ -34,6 +34,15 @@ for the full pre-split extension history.
   signing in changes.
 
 ### Fixed
+- **A PDF reached through your library now stays connected to its paper when
+  the publisher changes.** A library route can end at a different publisher
+  host. After *papio* asked you to finish that download yourself, it remembered
+  only the library host, so Chrome saved the publisher's file to ordinary
+  Downloads and the popup did not recognise a Cochrane `/pdf/full` viewer as a
+  PDF. *papio* now recognises Cochrane's viewer and nested file routes, and an
+  exact DOI keeps one pending manual download bound across the host change.
+  Conflicting DOI signals or two pending jobs for the same DOI still claim
+  nothing.
 - **An open-access paper no longer reports that it is waiting for you to sign
   in.** *papio* gives each paper three minutes on screen to finish. When that
   time ran out it said the paper was waiting on your library sign-in, whatever

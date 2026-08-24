@@ -255,6 +255,33 @@ test("Cell's exact PII route is a direct PDF surface without a .pdf suffix", () 
   expect(isPDFURL("https://attacker.example/action/showPdf?pii=S240584401730308X")).toBe(false);
 });
 
+test("Cochrane PDF routes keep the DOI boundary and expose the viewer", () => {
+  const doi = "10.1002/14651858.CD013850.pub2";
+  const article = `https://www.cochranelibrary.com/cdsr/doi/${doi}/full`;
+  const viewer = `https://www.cochranelibrary.com/cdsr/doi/${doi}/pdf/full`;
+  const file =
+    `https://www.cochranelibrary.com/cdsr/doi/${doi}/pdf/CDSR/CD013850/CD013850.pdf`;
+
+  expect(doiFromURL(article)).toBe(doi);
+  expect(doiFromURL(viewer)).toBe(doi);
+  expect(doiFromURL(file)).toBe(doi);
+  expect(isPDFURL(article)).toBe(false);
+  expect(isPDFURL(viewer)).toBe(true);
+  expect(isPDFURL(file)).toBe(true);
+  expect(classifyPage(viewer)).toEqual({ kind: "pdf" });
+  expect(isPDFURL(viewer.replace("https:", "http:"))).toBe(false);
+  expect(
+    isPDFURL(viewer.replace("www.cochranelibrary.com", "attacker.example")),
+  ).toBe(false);
+  const ambiguous =
+    "https://www.cochranelibrary.com/cdsr/doi/10.1002/alpha/pdf/full";
+  expect(doiFromURL(ambiguous)).toBeUndefined();
+  expect(isPDFURL(ambiguous)).toBe(false);
+  const mismatchedFile =
+    `https://www.cochranelibrary.com/cdsr/doi/${doi}/pdf/CDSR/OTHER/OTHER.pdf`;
+  expect(doiFromURL(mismatchedFile)).toBeUndefined();
+});
+
 test("extractMetaDOI honors metadata priority and accepts DOI-bearing PDF URLs", () => {
   expect(
     extractMetaDOI([

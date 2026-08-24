@@ -111,6 +111,7 @@ import {
   isURLLike,
 } from "./state";
 import {
+  doiFromURL,
   isPDFPage,
   pdfGrabRefusalText,
   pdfSourceURL,
@@ -12473,6 +12474,52 @@ export class Bridge {
     this.tabTouchEpoch.set(tabID, (this.tabTouchEpoch.get(tabID) ?? 0) + 1);
   }
 
+  private downloadFilenameSuggestion(
+    item: DownloadItemLike,
+  ): { filename: string; conflictAction: "uniquify" } | undefined {
+    // An EXACT job binding means this extension started this download for that
+    // job, so nothing may hijack it. `correlate()` is different in kind: an
+    // inference from the tab, DOI or host.
+    const exactJobID =
+      this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
+    const exactJob = exactJobID
+      ? findByJob(this.store, exactJobID)
+      : undefined;
+    const grabID = this.trackedGrabFor(item.id);
+    const grab =
+      grabID === undefined
+        ? this.pendingGrabFor(item)
+        : this.grabDownloads.get(grabID);
+    const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
+    const conflict = this.downloadGrabConflict(item);
+    if (conflict !== undefined) {
+      // Same-tab delegated click job and armed grab both match; neither may
+      // steer. Firefox never reaches this listener.
+      this.surfaceDownloadGrabConflict(item.id, conflict);
+      return undefined;
+    }
+    // A grab outranks an inferred job. It is the researcher naming THIS
+    // document, in this tab, just now; the inference is about what the tab
+    // used to hold. Observed live: a handoff tab opened for one paper was
+    // reused to read another, and the viewer's own Download button — the only
+    // byte source that works once a signed provider URL has expired — was
+    // steered into the first paper's job directory while a grab for the
+    // second sat unfulfilled. The bytes then failed identity validation and
+    // parked for review, and the grab never settled at all.
+    if (grab !== undefined && base.length > 0 && exactJob === undefined) {
+      return {
+        filename: `${grab.steeringPath}${base}`,
+        conflictAction: "uniquify",
+      };
+    }
+    const job = exactJob ?? this.correlate(item);
+    if (!job || base.length === 0) return undefined;
+    return {
+      filename: `papio/${job.job_id}/${base}`,
+      conflictAction: "uniquify",
+    };
+  }
+
   private bindListeners(): void {
     if (this.listenersBound) return;
     this.listenersBound = true;
@@ -12497,49 +12544,41 @@ export class Bridge {
       return this.onDownloadChanged(delta);
     });
     this.deps.downloads.onDeterminingFilename?.addListener((item, suggest) => {
-      // An EXACT job binding means this extension started this download for
-      // that job, so nothing may hijack it. `correlate()` is different in kind:
-      // an inference from the tab (and its handoff group) that survives the tab
-      // navigating to a different document.
-      const exactJobID =
-        this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
-      const exactJob = exactJobID
-        ? findByJob(this.store, exactJobID)
-        : undefined;
-      const grabID = this.trackedGrabFor(item.id);
-      const grab =
-        grabID === undefined
-          ? this.pendingGrabFor(item)
-          : this.grabDownloads.get(grabID);
-      const base = (item.filename ?? "").split(/[\\/]/).pop() ?? "";
-      const conflict = this.downloadGrabConflict(item);
-      if (conflict !== undefined) {
-        // Same-tab delegated click job and armed grab both match; neither may
-        // steer. Firefox never reaches this listener.
-        this.surfaceDownloadGrabConflict(item.id, conflict);
+      const determine = (): void => {
+        const suggestion = this.downloadFilenameSuggestion(item);
+        if (suggestion !== undefined) suggest(suggestion);
+      };
+      if (this.hydrated) {
+        determine();
         return;
       }
-      // A grab outranks an inferred job. It is the researcher naming THIS
-      // document, in this tab, just now; the inference is about what the tab
-      // used to hold. Observed live: a handoff tab opened for one paper was
-      // reused to read another, and the viewer's own Download button — the only
-      // byte source that works once a signed provider URL has expired — was
-      // steered into the first paper's job directory while a grab for the
-      // second sat unfulfilled. The bytes then failed identity validation and
-      // parked for review, and the grab never settled at all.
-      if (grab !== undefined && base.length > 0 && exactJob === undefined) {
-        suggest({
-          filename: `${grab.steeringPath}${base}`,
-          conflictAction: "uniquify",
+      // Chrome can wake an MV3 worker with this event. Listener registration
+      // must stay synchronous, but the persisted manual-download window is not
+      // available until backend hydration finishes. Returning true keeps the
+      // browser's filename decision open for the asynchronous suggest call.
+      const releaseWithoutChange = (): void =>
+        (
+          suggest as unknown as (
+            suggestion?: {
+              filename: string;
+              conflictAction: "uniquify";
+            },
+          ) => void
+        )();
+      void this.ready
+        .then(() => {
+          const suggestion = this.downloadFilenameSuggestion(item);
+          if (suggestion === undefined) releaseWithoutChange();
+          else suggest(suggestion);
+        })
+        .catch((error) => {
+          console.error(
+            "papio: download filename correlation could not hydrate",
+            error,
+          );
+          releaseWithoutChange();
         });
-        return;
-      }
-      const job = exactJob ?? this.correlate(item);
-      if (!job || base.length === 0) return;
-      suggest({
-        filename: `papio/${job.job_id}/${base}`,
-        conflictAction: "uniquify",
-      });
+      return true;
     });
     this.deps.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name === KEEPALIVE_ALARM)
@@ -19657,27 +19696,77 @@ export class Bridge {
     await this.removeJobWithOffer(job.job_id);
   }
 
+  /** A DOI in the download route is stronger than a provider-host inference.
+   * It lets a manual-download window survive a resolver-to-publisher hop
+   * without treating every future download from that publisher as this job.
+   *
+   * `null` is a refusal, not "no match": conflicting URL fields, an internally
+   * rejected DOI-bearing URL, no matching pending DOI, or duplicate jobs must
+   * stop before the weaker host fallback can claim the file. */
+  private manualDownloadJobForDOI(
+    item: DownloadItemLike,
+  ): ActiveJob | null | undefined {
+    const windows = this.store.activeJobs.filter((job) =>
+      this.isManualDownloadWindow(job),
+    );
+    if (windows.length === 0) return undefined;
+    const observed = new Set<string>();
+    for (const value of [item.referrer, item.finalUrl, item.url]) {
+      if (typeof value !== "string" || value.length === 0) continue;
+      const doi = doiFromURL(value);
+      if (doi !== undefined) {
+        observed.add(doi.toLowerCase());
+        continue;
+      }
+      let decoded = value;
+      try {
+        decoded = decodeURIComponent(value);
+      } catch {
+        // The raw value remains safe to inspect for a DOI-shaped signal.
+      }
+      if (/10\.\d{4,9}(?:\/|%2f)/i.test(decoded)) return null;
+    }
+    if (observed.size === 0) return undefined;
+    if (observed.size !== 1) return null;
+    const doi = observed.values().next().value;
+    if (doi === undefined) return null;
+    const matches = windows.filter(
+      (job) => job.expected?.doi?.trim().toLowerCase() === doi,
+    );
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   private correlate(item: DownloadItemLike): ActiveJob | undefined {
     // Firefox cannot relocate native/manual downloads into papio/<job>. Only
     // exact IDs/URLs registered by downloads.download are safe there; those
     // bypass this broad tab/host correlation path.
     if (this.deps.downloads.onDeterminingFilename === undefined)
       return undefined;
-    if (typeof item.tabId === "number") {
+    const byDOI = this.manualDownloadJobForDOI(item);
+    if (byDOI === null) return undefined;
+    if (byDOI !== undefined) return byDOI;
+    if (
+      typeof item.tabId === "number" &&
+      Number.isSafeInteger(item.tabId) &&
+      item.tabId >= 0
+    ) {
       const byTab = findByTab(this.store, item.tabId);
       if (byTab) {
         if (this.isFirefoxClickDownload(byTab)) return undefined;
         return byTab;
       }
     }
-    const src = item.referrer ?? item.finalUrl ?? item.url;
-    if (src === undefined || src.length === 0) return undefined;
-    let host: string;
-    try {
-      host = new URL(src).hostname;
-    } catch {
-      return undefined;
+    let host: string | undefined;
+    for (const value of [item.referrer, item.finalUrl, item.url]) {
+      if (typeof value !== "string" || value.length === 0) continue;
+      try {
+        host = new URL(value).hostname;
+        break;
+      } catch {
+        // Another browser-supplied URL field can still be valid.
+      }
     }
+    if (host === undefined) return undefined;
     const initiated = this.store.activeJobs.filter((job: ActiveJob) => {
       if (
         this.isFirefoxClickDownload(job) ||

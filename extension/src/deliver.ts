@@ -228,6 +228,43 @@ function qualifyURLDOI(candidate: string, routed = false): string | undefined {
   return value;
 }
 
+/** Cochrane names the same article through an HTML view, a PDF viewer route,
+ * and a nested PDF file route. The route boundary is provider-specific:
+ * treating the file hierarchy as part of the DOI produces a different,
+ * syntactically valid identifier. */
+function cochraneDOIFromURL(url: URL): string | undefined {
+  const host = url.hostname.toLowerCase();
+  if (
+    host !== "cochranelibrary.com" &&
+    host !== "www.cochranelibrary.com"
+  )
+    return undefined;
+  const match =
+    /^\/cdsr\/doi\/(10\.1002\/14651858\.([A-Z]{2}\d+)(?:\.pub\d+)?)\/(full|pdf\/(?:full|CDSR\/[^/]+\/[^/]+\.pdf))$/i.exec(
+      decodeURLPart(url.pathname),
+    );
+  if (match?.[1] === undefined) return undefined;
+  const file = /^pdf\/CDSR\/([^/]+)\/([^/]+)\.pdf$/i.exec(match[3] ?? "");
+  if (
+    file !== null &&
+    (match[2]?.toLowerCase() !== file[1]?.toLowerCase() ||
+      match[2]?.toLowerCase() !== file[2]?.toLowerCase())
+  ) {
+    return undefined;
+  }
+  return qualifyURLDOI(match[1]);
+}
+
+function isCochraneDirectPDFRoute(url: URL): boolean {
+  return (
+    url.protocol === "https:" &&
+    cochraneDOIFromURL(url) !== undefined &&
+    /\/pdf\/(?:full|CDSR\/[^/]+\/[^/]+\.pdf)$/i.test(
+      decodeURLPart(url.pathname),
+    )
+  );
+}
+
 /**
  * Extract a DOI from a URL's structure, or decline.
  *
@@ -264,6 +301,15 @@ export function doiFromURL(value: string, base?: string, depth = 0): string | un
     }
   }
 
+  const cochraneDOI = cochraneDOIFromURL(url);
+  if (
+    cochraneDOI === undefined &&
+    (host === "cochranelibrary.com" ||
+      host === "www.cochranelibrary.com") &&
+    path.toLowerCase().startsWith("/cdsr/doi/")
+  ) {
+    return undefined;
+  }
   const candidates: string[] = [];
 
   // A library proxy or link resolver wraps the real URL in a parameter. Recurse
@@ -276,6 +322,7 @@ export function doiFromURL(value: string, base?: string, depth = 0): string | un
       if (nested !== undefined) candidates.push(nested);
     }
   }
+  if (cochraneDOI !== undefined) candidates.push(cochraneDOI);
 
   // An exact `doi` parameter is the publisher's own declaration and is bounded
   // by the query grammar, so a neighbouring token cannot be absorbed. It is a
@@ -286,19 +333,23 @@ export function doiFromURL(value: string, base?: string, depth = 0): string | un
     if (doi !== undefined) candidates.push(doi);
   }
 
-  if (isDOIResolver) {
-    // The whole path is the identifier by definition, so there is no route and
-    // no external suffix: `10.1234/article.pdf` is a DOI that ends in `.pdf`,
-    // not a PDF of `10.1234/article`.
-    const resolved = qualifyURLDOI(path.replace(/^\//, ""));
-    if (resolved !== undefined) candidates.push(resolved);
-  } else {
-    const start = /\/(10\.\d{4,9}\/.+)$/.exec(path);
-    // Here the DOI is a file path, so one declared external suffix may be removed.
-    const fromPath = start?.[1] === undefined
-      ? undefined
-      : qualifyURLDOI(start[1].replace(/\.pdf$/i, ""), true);
-    if (fromPath !== undefined) candidates.push(fromPath);
+  if (cochraneDOI === undefined) {
+    if (isDOIResolver) {
+      // The whole path is the identifier by definition, so there is no route
+      // and no external suffix: `10.1234/article.pdf` is a DOI that ends in
+      // `.pdf`, not a PDF of `10.1234/article`.
+      const resolved = qualifyURLDOI(path.replace(/^\//, ""));
+      if (resolved !== undefined) candidates.push(resolved);
+    } else {
+      const start = /\/(10\.\d{4,9}\/.+)$/.exec(path);
+      // Here the DOI is a file path, so one declared external suffix may be
+      // removed.
+      const fromPath =
+        start?.[1] === undefined
+          ? undefined
+          : qualifyURLDOI(start[1].replace(/\.pdf$/i, ""), true);
+      if (fromPath !== undefined) candidates.push(fromPath);
+    }
   }
 
   const first = candidates[0];
@@ -382,6 +433,7 @@ export function extractPageDOI(probe: PageDOIProbe): string | undefined {
  * exact and host-bound; HTML viewers that need endpoint conversion belong in
  * their declarative adapter's viewerRoutes contract instead. */
 function isKnownDirectPDFRoute(url: URL): boolean {
+  if (isCochraneDirectPDFRoute(url)) return true;
   if (url.protocol !== "https:") return false;
   if (url.hostname.toLowerCase() !== "www.cell.com") return false;
   if (url.pathname.toLowerCase() !== "/action/showpdf") return false;

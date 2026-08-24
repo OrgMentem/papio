@@ -1037,10 +1037,15 @@ async function settleChallengeConfirmation(h: Harness): Promise<void> {
 async function classifyProviderUnknown(
   h: Harness,
   jobID: string,
+  expectedDOI?: string,
 ): Promise<number> {
   await h.bridge.start();
-  await h.port.inbound(jobOffer(jobID));
-  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  if (expectedDOI !== undefined)
+    offer.payload["expected"] = { doi: expectedDOI };
+  await h.port.inbound(offer);
+  const tabID =
+    h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id ?? -1;
   const url = `https://${PROVIDER_HOST}/stable/challenge`;
   h.tabs.seed({ id: tabID, url });
   await h.tabs.completeNavigation(tabID, url);
@@ -6199,8 +6204,9 @@ test("unknown retries report ui_changed once per drive and again for a re-offere
 async function driveToManualDownloadOutcome(
   h: Harness,
   jobID: string,
+  expectedDOI?: string,
 ): Promise<number> {
-  const tabID = await classifyProviderUnknown(h, jobID);
+  const tabID = await classifyProviderUnknown(h, jobID, expectedDOI);
   for (let retry = 0; retry < 2; retry += 1) {
     const timer = h.timers.at(-1);
     expect(timer).toBeDefined();
@@ -6285,6 +6291,153 @@ test("a ui_changed outcome retains a steering window for the researcher's own do
       (frame) => frame.type === "download_complete" && frame.job_id === jobID,
     );
   expect(complete?.payload["filename"]).toBe("1234567.pdf");
+});
+test("a retained window follows one exact DOI across a provider hop", async () => {
+  const doi = "10.1002/14651858.cd013850.pub2";
+  const jobID = "job_manual_window_cross_provider";
+  const h = makeHarness();
+  useUnknownProviderClassifier(h, () => false);
+  await driveToManualDownloadOutcome(h, jobID, doi);
+  const item: DownloadItemLike = {
+    id: 951,
+    tabId: -1,
+    referrer:
+      `https://www.cochranelibrary.com/cdsr/doi/${doi}/full`,
+    url:
+      `https://www.cochranelibrary.com/cdsr/doi/${doi}/pdf/CDSR/CD013850/CD013850.pdf`,
+    filename: "CD013850.pdf",
+    state: "in_progress",
+  };
+
+  expect(await suggestFilenameFor(h, item)).toEqual([
+    `papio/${jobID}/CD013850.pdf`,
+  ]);
+  h.backend.store.activeJobs.push({
+    job_id: "job_unrelated_same_tab",
+    tab_id: 4242,
+    offered_at: 1_700_000_000_000,
+    expires_at: 1_900_000_000_000,
+    status: "accepted",
+    provider_hosts: ["www.cochranelibrary.com"],
+    access_mode: "delegated",
+    expected: { doi: "10.1002/different" },
+  });
+  expect(
+    await suggestFilenameFor(h, { ...item, id: 956, tabId: 4242 }),
+  ).toEqual([`papio/${jobID}/CD013850.pdf`]);
+  expect(
+    await suggestFilenameFor(h, {
+      ...item,
+      id: 957,
+      tabId: 4242,
+      referrer:
+        "https://www.cochranelibrary.com/cdsr/doi/10.1002/different/full",
+      url:
+        "https://www.cochranelibrary.com/cdsr/doi/10.1002/different/pdf/CDSR/OTHER/OTHER.pdf",
+    }),
+  ).toEqual([]);
+  h.backend.store.activeJobs.pop();
+  expect(
+    await suggestFilenameFor(h, {
+      ...item,
+      id: 955,
+      referrer: "",
+      finalUrl: item.url,
+    }),
+  ).toEqual([`papio/${jobID}/CD013850.pdf`]);
+  expect(
+    await suggestFilenameFor(h, {
+      ...item,
+      id: 952,
+      url:
+        "https://www.cochranelibrary.com/cdsr/doi/10.1002/different/pdf/CDSR/OTHER/OTHER.pdf",
+    }),
+  ).toEqual([]);
+  expect(
+    await suggestFilenameFor(h, {
+      ...item,
+      id: 954,
+      referrer: `https://${PROVIDER_HOST}/doi/pdf/10.1002/different.pdf`,
+      url: `https://${PROVIDER_HOST}/doi/pdf/10.1002/different.pdf`,
+    }),
+  ).toEqual([]);
+
+  const retained = h.backend.store.activeJobs[0];
+  expect(retained).toBeDefined();
+  h.backend.store.activeJobs.push({
+    ...retained!,
+    job_id: "job_manual_window_same_doi",
+  });
+  expect(await suggestFilenameFor(h, { ...item, id: 953 })).toEqual([]);
+
+  h.backend.store.activeJobs.pop();
+  h.downloads.items.set(951, {
+    id: 951,
+    filename: `/Users/x/Downloads/papio/${jobID}/CD013850.pdf`,
+    fileSize: 1_500_000,
+    mime: "application/pdf",
+    state: "complete",
+  });
+  await h.downloads.onCreated.emit(item);
+  await h.downloads.onChanged.emit({ id: 951, state: { current: "complete" } });
+  expect(
+    h
+      .frames()
+      .some(
+        (frame) =>
+          frame.type === "download_complete" && frame.job_id === jobID,
+      ),
+  ).toBe(true);
+});
+
+test("a filename wake waits for persisted manual correlation", async () => {
+  const doi = "10.1002/14651858.cd013850.pub2";
+  const jobID = "job_manual_window_hydration";
+  const seed = emptyStore();
+  seed.activeJobs = [
+    {
+      job_id: jobID,
+      tab_id: -1,
+      offered_at: 1_700_000_000_000,
+      expires_at: 1_900_000_000_000,
+      status: "awaiting_download",
+      provider_hosts: [PROVIDER_HOST],
+      expected: { doi },
+    },
+  ];
+  const h = makeHarness(seed);
+  let releaseLoad!: (store: StoreShape) => void;
+  const blockedLoad = new Promise<StoreShape>((resolve) => {
+    releaseLoad = resolve;
+  });
+  h.backend.load = () => blockedLoad;
+  const start = h.bridge.start();
+  const suggestions: { filename: string; conflictAction: string }[] = [];
+  await h.downloads.onDeterminingFilename.emit(
+    {
+      id: 954,
+      tabId: -1,
+      referrer:
+        `https://www.cochranelibrary.com/cdsr/doi/${doi}/full`,
+      url:
+        `https://www.cochranelibrary.com/cdsr/doi/${doi}/pdf/CDSR/CD013850/CD013850.pdf`,
+      filename: "CD013850.pdf",
+      state: "in_progress",
+    },
+    (suggestion) => {
+      if (suggestion !== undefined) suggestions.push(suggestion);
+    },
+  );
+  expect(suggestions).toEqual([]);
+
+  releaseLoad(seed);
+  await start;
+  expect(suggestions).toEqual([
+    {
+      filename: `papio/${jobID}/CD013850.pdf`,
+      conflictAction: "uniquify",
+    },
+  ]);
 });
 
 test("a retained steering window frees the governor slot and disarms its drive timeout", async () => {
