@@ -5,6 +5,7 @@ package doctor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -300,5 +301,56 @@ func TestZoteroFileStorageRefusedReportsBothCauses(t *testing.T) {
 		if !strings.Contains(got.Remediation, want) {
 			t.Fatalf("remediation = %q, missing %q - both causes are present so both need advice", got.Remediation, want)
 		}
+	}
+}
+
+// The sibling above asserts both causes are present and dated, which passed
+// under either ordering - so the defect it was written for survived it. This
+// pins the ordering itself, measured against the operator's own store on
+// 2026-08-24: the last quota refusal was 2026-08-17 and none followed, yet the
+// check still headlined it and led its remediation with "free space in
+// Zotero", advice for a plan the operator had already cleared to 20 MB.
+func TestZoteroFileStorageRefusedLeadsWithTheLiveCause(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	stale := time.Now().UTC().Add(-5 * 24 * time.Hour)
+	for i := range 10 {
+		seedFailedZotioApply(t, ctx, db, fmt.Sprintf("job_quota_%02d", i), stale.Format(time.RFC3339Nano), map[string]any{
+			"ok": false, "error": map[string]any{"http_status": 413, "message": "File would exceed quota (300.4 > 300)"},
+		})
+	}
+	live := time.Now().UTC().Add(-2 * time.Hour)
+	seedFailedZotioApplyError(t, ctx, db, "job_routing_live", live.Format(time.RFC3339Nano),
+		routingRefusalError, map[string]any{"ok": false})
+
+	got := zoteroFileStorageRefusedCheck(t, ctx, db)
+
+	// The live cause leads the sentence, and the superseded reading follows it.
+	liveAt := strings.Index(got.Detail, "no route to the file store")
+	quotaAt := strings.Index(got.Detail, "storage plan full")
+	if liveAt < 0 || quotaAt < 0 {
+		t.Fatalf("detail = %q, want both causes named", got.Detail)
+	}
+	if liveAt > quotaAt {
+		t.Fatalf("detail = %q, want the live routing cause before the superseded quota reading", got.Detail)
+	}
+	if !strings.Contains(got.Detail, "no refusal since has repeated it") {
+		t.Fatalf("detail = %q, want the quota reading marked superseded, not restated as live", got.Detail)
+	}
+
+	// And the advice follows the headline, so the first thing read is the
+	// action that can still change the outcome.
+	routeAdvice := strings.Index(got.Remediation, "--via connector")
+	spaceAdvice := strings.Index(got.Remediation, "free space in Zotero")
+	if routeAdvice < 0 || spaceAdvice < 0 {
+		t.Fatalf("remediation = %q, want both causes answered", got.Remediation)
+	}
+	if routeAdvice > spaceAdvice {
+		t.Fatalf("remediation = %q, want the live cause's advice first", got.Remediation)
 	}
 }

@@ -268,7 +268,21 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 			add("zotero_file_storage_refused", Pass, "no recent Zotero apply failed with HTTP 413 file-storage refusal", "")
 		default:
 			var detail string
+			// Lead with the cause that is actually live. A quota reading older
+			// than the newest routing refusal is a resolved measurement, and
+			// heading the check with it sends the operator to free space they
+			// have already freed while the one cause no retry can clear reads
+			// as a footnote. Dating the figure was not enough on its own: the
+			// precedence below is what decides which sentence is read first.
+			routingLeads := summary.routing > 0 && summary.quota > 0 && summary.quotaAt.Before(summary.routingAt)
 			switch {
+			case routingLeads:
+				when := ""
+				if !summary.routingAt.IsZero() {
+					when = fmt.Sprintf(" (last %s)", summary.routingAt.UTC().Format("2006-01-02"))
+				}
+				detail = fmt.Sprintf("%d recent Zotero apply %s could not upload the file; the live cause is that %d had no route to the file store%s: papio holds the PDF, and Zotero cannot attach a file to an item that already exists",
+					summary.count, plural(summary.count, "failure", "failures"), summary.routing, when)
 			case summary.quota > 0:
 				detail = fmt.Sprintf("%d recent Zotero apply %s could not upload the file",
 					summary.count, plural(summary.count, "failure", "failures"))
@@ -293,10 +307,20 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 				detail = fmt.Sprintf("%d recent Zotero apply %s returned HTTP 413 (file storage refused the upload)",
 					summary.count, plural(summary.count, "failure", "failures"))
 			}
+			// A superseded quota reading stays on the record, in the past
+			// tense. Dropping it would lose the history; stating it in the
+			// present tense is what made a cleared plan look live.
+			if routingLeads {
+				detail += fmt.Sprintf("; %d earlier %s reported Zotero's storage plan full", summary.quota, plural(summary.quota, "failure", "failures"))
+				if !summary.quotaAt.IsZero() {
+					detail += fmt.Sprintf(" (as measured %s)", summary.quotaAt.UTC().Format("2006-01-02"))
+				}
+				detail += ", and no refusal since has repeated it"
+			}
 			// Name the routing refusal rather than folding it into "another
 			// reason": it is the one cause here that no retry and no storage
 			// change can clear, so it must not hide behind a quota headline.
-			if summary.routing > 0 && summary.routing != summary.count {
+			if !routingLeads && summary.routing > 0 && summary.routing != summary.count {
 				detail += fmt.Sprintf("; %d had no route to the file store", summary.routing)
 				if !summary.routingAt.IsZero() {
 					detail += fmt.Sprintf(" (last %s)", summary.routingAt.UTC().Format("2006-01-02"))
@@ -311,7 +335,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 			if !summary.latest.IsZero() && !summary.latest.Equal(summary.first) {
 				detail += fmt.Sprintf(", last %s", summary.latest.UTC().Format("2006-01-02"))
 			}
-			add("zotero_file_storage_refused", Warn, detail, zoteroFileStorageRefusedRemediation(summary.quota > 0, summary.routing > 0))
+			add("zotero_file_storage_refused", Warn, detail, zoteroFileStorageRefusedRemediation(summary.quota > 0, summary.routing > 0, routingLeads))
 		}
 	}
 
@@ -695,7 +719,12 @@ func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store)
 // "attachments add" and returns its ordinary refusal with exit 0. Papio
 // therefore keeps asking for the connector route and fails closed on an old
 // install, and the operator needs to know an upgrade is what unblocks it.
-func zoteroFileStorageRefusedRemediation(quota, routing bool) string {
+//
+// Order follows the headline. When a superseded quota reading is present
+// beside a live routing refusal, quota advice first told the operator to free
+// space they had already freed, and the one cause no retry can clear came
+// second. routingFirst puts the live cause's advice first.
+func zoteroFileStorageRefusedRemediation(quota, routing, routingFirst bool) string {
 	const linkedFile = `set attachment_mode = "linked-file" under [zotio] so papio links PDFs from its own artifact store and needs no Zotero storage at all — linked files do not sync to other devices and break if the file moves`
 	var parts []string
 	if quota {
@@ -703,6 +732,9 @@ func zoteroFileStorageRefusedRemediation(quota, routing bool) string {
 	}
 	if routing {
 		parts = append(parts, `for the papers with no route: their Zotero item already exists, and a stored upload through the Web API would bill the bytes to Zotero's own plan rather than your file store, so freeing space will not help. Upgrade zotio to a release whose 'attachments add' accepts '--via connector' — that hands the bytes to Zotero desktop, so they land in your own file store — then run 'papio zotio import-backfill --include-not-requested --apply'. Papio already asks for that route and an older zotio ignores the request, so these papers wait for the upgrade. Otherwise `+linkedFile+`, or attach the PDF yourself in Zotero (right-click the item, Add Attachment, Attach Stored Copy of File) and run the same backfill command — papio then recognises the held PDF and files the paper with no upload attempted`)
+	}
+	if routingFirst && len(parts) == 2 {
+		parts[0], parts[1] = parts[1], parts[0]
 	}
 	if len(parts) == 0 {
 		return `check whether Zotero's own Sync pane reports the same HTTP 413 — if it does, the problem is upstream of papio; or ` + linkedFile + `. Papio retries once uploads are accepted again`
