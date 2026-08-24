@@ -17,6 +17,15 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Added
+- **Cochrane reviews now download by themselves.** Every PDF button on a
+  Cochrane review page, and the page's own PDF metadata, points at a viewer
+  page rather than at the file, so *papio* had no route there and asked you to
+  fetch the review by hand. *papio* now reads the review's own PDF link as the
+  proof that you have access, then fetches the exact file that viewer shows.
+  The review's abstract is a different document, so an abstract link is never
+  used as the paper. A Cochrane page that does not offer the full review still
+  stays with you, and *papio* does not treat Cochrane's sign-in panel as a
+  wall, because Cochrane shows that panel on pages you can already read.
 - **Scanning a page no longer asks you to approve the site first.** The
   **Select papers on this page** click is the consent for that one explicit,
   top-frame scan. The scanner has no standing site list, no background watcher,

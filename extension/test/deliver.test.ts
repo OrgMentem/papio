@@ -273,6 +273,19 @@ test("Cochrane PDF routes keep the DOI boundary and expose the viewer", () => {
   expect(
     isPDFURL(viewer.replace("www.cochranelibrary.com", "attacker.example")),
   ).toBe(false);
+  // The page's own PDF links carry a language segment; the tab that opened the
+  // live download did not. Both name the same review.
+  const localized = `${viewer}/en`;
+  expect(doiFromURL(localized)).toBe(doi);
+  expect(isPDFURL(localized)).toBe(true);
+  expect(classifyPage(localized)).toEqual({ kind: "pdf" });
+  // The live institutional hop landed on the French article route.
+  expect(doiFromURL(`${article}/fr`)).toBe(doi);
+  expect(isPDFURL(`${article}/fr`)).toBe(false);
+  // The abstract is a different document, whatever its route shape.
+  const abstract = `https://www.cochranelibrary.com/cdsr/doi/${doi}/pdf/abstract/en`;
+  expect(doiFromURL(abstract)).toBeUndefined();
+  expect(isPDFURL(abstract)).toBe(false);
   const ambiguous =
     "https://www.cochranelibrary.com/cdsr/doi/10.1002/alpha/pdf/full";
   expect(doiFromURL(ambiguous)).toBeUndefined();

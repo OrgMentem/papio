@@ -455,6 +455,85 @@ test("wiley download builds the /doi/pdfdirect endpoint from the DOI in the page
   );
 });
 
+// Cochrane Library: captured 2026-08-24 from an authenticated review page
+// (fixtures/cochrane/success.html). Every PDF affordance on the page — and
+// citation_pdf_url — names /pdf/full, an HTML viewer wrapper, so the adapter
+// builds the nested file the wrapper's iframe names instead.
+const cochraneArticle = loadFixture("cochrane", "success");
+test.skipIf(cochraneArticle === null)(
+  "captured Cochrane review classifies through its full-review PDF affordance",
+  () => {
+    const spec = adapters.find((a) => a.id === "cochrane") as AdapterSpec;
+    const verdict = interpret(cochraneArticle as Document, spec, ctx());
+    expect(verdict.kind).toBe("article");
+    expect(verdict.adapter_id).toBe("cochrane");
+  },
+);
+
+// The viewer wrapper is a real page a handoff can land on: 1.7 KB, one iframe,
+// no citation metadata. Nothing there confirms the requested paper, so papio
+// must stay assisted rather than treat the landing as an entitled article.
+const cochraneViewer = loadFixture("cochrane", "drift");
+test.skipIf(cochraneViewer === null)(
+  "captured Cochrane PDF viewer wrapper stays assisted",
+  () => {
+    const spec = adapters.find((a) => a.id === "cochrane") as AdapterSpec;
+    expect(interpret(cochraneViewer as Document, spec, ctx()).kind).toBe(
+      "unknown",
+    );
+  },
+);
+
+test("cochrane stays unknown when only the abstract PDF link is offered", () => {
+  const spec = adapters.find((a) => a.id === "cochrane") as AdapterSpec;
+  const page = parseHTML(
+    "<!doctype html><html><head>" +
+      "<meta name='citation_doi' content='10.1002/14651858.CD013850.pub2'>" +
+      "<meta name='citation_pdf_url' content='https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD013850.pub2/pdf/full'>" +
+      "</head><body><a class='download media pdf-link-abstract pdf-link' href='/cdsr/doi/10.1002/14651858.CD013850.pub2/pdf/abstract/en'>PDF</a></body></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
+
+test("cochrane download builds the nested review file from the page URL", () => {
+  const spec = adapters.find((a) => a.id === "cochrane") as AdapterSpec;
+  const rule = spec.download as DownloadRule;
+  expect(rule.method).toBe("url");
+  const build = (href: string): string | null => {
+    const m = href.match(new RegExp(rule.idPattern as string));
+    if (!m) return null;
+    return (rule.urlTemplate as string).replace(
+      /\{(\d+|id)\}/g,
+      (_, k: string) => m[k === "id" ? 1 : Number(k)] ?? "",
+    );
+  };
+  const base = "https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD013850.pub2";
+  const want = `${base}/pdf/CDSR/CD013850/CD013850.pdf`;
+  expect(build(`${base}/full`)).toBe(want);
+  expect(build(`${base}/abstract`)).toBe(want);
+  expect(build(`${base}/pdf/full`)).toBe(want);
+  expect(build(`${base}/pdf/full/en`)).toBe(want);
+  // The live institutional hop landed on /full/fr, so a language segment on
+  // any review route must still resolve to the same nested file.
+  expect(build(`${base}/full/fr`)).toBe(want);
+  expect(build(`${base}/full/es`)).toBe(want);
+  expect(build(`${base}/full/zh_hant`)).toBe(want);
+  expect(build(`${base}/abstract/en`)).toBe(want);
+  // A first-publication review carries no .pubN suffix.
+  expect(
+    build("https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD000146/full"),
+  ).toBe(
+    "https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD000146/pdf/CDSR/CD000146/CD000146.pdf",
+  );
+  // The abstract is a different document, and no other Wiley-hosted DOI
+  // family shares this route.
+  expect(build(`${base}/pdf/abstract/en`)).toBeNull();
+  expect(
+    build("https://www.cochranelibrary.com/cdsr/doi/10.1002/mar.21498/full"),
+  ).toBeNull();
+  expect(build(`${base}/pdf/CDSR/CD013850/CD013850.pdf`)).toBeNull();
+});
+
 // SAGE's View Options section signals entitled PDF access; its reader link is
 // deliberately not treated as a file endpoint.
 const sageArticle = loadFixture("sage", "success");
@@ -608,6 +687,21 @@ test("packaged journal viewers resolve only their declared direct PDF endpoints"
   expect(
     providerViewerPDFURL("https://onlinelibrary.wiley.com/doi/epdf/10.1111/jcpp.13440"),
   ).toBe("https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/jcpp.13440?download=true");
+  // Cochrane's viewer prefix cannot name the route on its own, because the DOI
+  // sits between it and /pdf/full — so the route pattern carries the boundary,
+  // and the article page under the same prefix must not resolve as a viewer.
+  expect(
+    providerViewerPDFURL("https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD013850.pub2/pdf/full"),
+  ).toBe("https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD013850.pub2/pdf/CDSR/CD013850/CD013850.pdf");
+  expect(
+    providerViewerPDFURL("https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD013850.pub2/pdf/full/en"),
+  ).toBe("https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD013850.pub2/pdf/CDSR/CD013850/CD013850.pdf");
+  expect(
+    providerViewerPDFURL("https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD013850.pub2/full"),
+  ).toBeUndefined();
+  expect(
+    providerViewerPDFURL("https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD013850.pub2/pdf/abstract/en"),
+  ).toBeUndefined();
   expect(
     providerViewerPDFURL("https://journals.sagepub.com/doi/full/10.1177/0146167207301014"),
   ).toBeUndefined();

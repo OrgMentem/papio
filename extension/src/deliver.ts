@@ -229,9 +229,10 @@ function qualifyURLDOI(candidate: string, routed = false): string | undefined {
 }
 
 /** Cochrane names the same article through an HTML view, a PDF viewer route,
- * and a nested PDF file route. The route boundary is provider-specific:
- * treating the file hierarchy as part of the DOI produces a different,
- * syntactically valid identifier. */
+ * and a nested PDF file route, each of which can carry a language segment —
+ * the live institutional hop lands on one (`/full/fr`, 2026-08-24). The route
+ * boundary is provider-specific: treating the file hierarchy as part of the
+ * DOI produces a different, syntactically valid identifier. */
 function cochraneDOIFromURL(url: URL): string | undefined {
   const host = url.hostname.toLowerCase();
   if (
@@ -240,7 +241,7 @@ function cochraneDOIFromURL(url: URL): string | undefined {
   )
     return undefined;
   const match =
-    /^\/cdsr\/doi\/(10\.1002\/14651858\.([A-Z]{2}\d+)(?:\.pub\d+)?)\/(full|pdf\/(?:full|CDSR\/[^/]+\/[^/]+\.pdf))$/i.exec(
+    /^\/cdsr\/doi\/(10\.1002\/14651858\.([A-Z]{2}\d+)(?:\.pub\d+)?)\/(full(?:\/[a-z]{2}(?:_[a-z]{2,4})?)?|pdf\/(?:full(?:\/[a-z]{2}(?:_[a-z]{2,4})?)?|CDSR\/[^/]+\/[^/]+\.pdf))$/i.exec(
       decodeURLPart(url.pathname),
     );
   if (match?.[1] === undefined) return undefined;
@@ -259,7 +260,7 @@ function isCochraneDirectPDFRoute(url: URL): boolean {
   return (
     url.protocol === "https:" &&
     cochraneDOIFromURL(url) !== undefined &&
-    /\/pdf\/(?:full|CDSR\/[^/]+\/[^/]+\.pdf)$/i.test(
+    /\/pdf\/(?:full(?:\/[a-z]{2}(?:_[a-z]{2,4})?)?|CDSR\/[^/]+\/[^/]+\.pdf)$/i.test(
       decodeURLPart(url.pathname),
     )
   );

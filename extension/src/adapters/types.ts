@@ -773,6 +773,55 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
+    // Verified live 2026-08-24 against two authenticated Cochrane reviews,
+    // CD013850.pub2 (fixtures/cochrane/success.html) and CD000072.pub3.
+    // citation_pdf_url and every in-page PDF link name
+    // /cdsr/doi/<doi>/pdf/full[/<lang>], which returns a 1.7 KB HTML wrapper
+    // whose iframe names the only real file,
+    // /cdsr/doi/<doi>/pdf/CDSR/<code>/<code>.pdf — the exact URL Chrome
+    // recorded when a human downloaded the same review. So classify on the
+    // full-review PDF affordance and build that nested file from the review
+    // code in the page URL. pdf-link-abstract names a different document and
+    // is never the target. Cochrane ships its institutional access panel on
+    // entitled pages too, so sign-in markup is not entitlement evidence and
+    // this adapter declares no login rule.
+    id: "cochrane",
+    version: "0.1.0",
+    hosts: ["cochranelibrary.com"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: ["meta[name='citation_doi']", "a.pdf-link-full"],
+      },
+    ],
+    download: {
+      selector: "meta[name='citation_pdf_url']",
+      requireKind: "article",
+      workTarget: {
+        kind: "doi",
+        selector: "meta[name='citation_doi']",
+        attribute: "content",
+      },
+      method: "url",
+      viewerRoutes: [{
+        pathPrefix: "/cdsr/doi/",
+        idPattern:
+          "^https://www\\.cochranelibrary\\.com/cdsr/doi/(10\\.1002/14651858\\.(CD\\d+)(?:\\.pub\\d+)?)/pdf/full(?:/[a-zA-Z]{2}(?:_[a-zA-Z]{2,4})?)?$",
+        urlTemplate:
+          "https://www.cochranelibrary.com/cdsr/doi/{1}/pdf/CDSR/{2}/{2}.pdf",
+      }],
+      // Every review route can carry a language segment, and the resolver hop
+      // lands on one: /full/fr was the live landing 2026-08-24. The nested
+      // review file is the same document in every case.
+      idPattern:
+        "^https://www\\.cochranelibrary\\.com/cdsr/doi/(10\\.1002/14651858\\.(CD\\d+)(?:\\.pub\\d+)?)/(?:full|abstract|pdf/full)(?:/[a-zA-Z]{2}(?:_[a-zA-Z]{2,4})?)?(?:[?#]|$)",
+      urlTemplate:
+        "https://www.cochranelibrary.com/cdsr/doi/{1}/pdf/CDSR/{2}/{2}.pdf",
+    },
+  },
+  {
     // The eReader link is an access affordance, not a PDF. SAGE's documented
     // direct route is derived only after its semantic PDF/EPUB section appears,
     // avoiding generic button styling and a viewer-specific href as evidence.
