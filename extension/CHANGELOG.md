@@ -34,6 +34,16 @@ for the full pre-split extension history.
   signing in changes.
 
 ### Fixed
+- **A paper whose PDF link was there all along is no longer handed back to you.**
+  *papio* opens library handoffs in a hidden background window, and some
+  publisher pages draw their download controls only once they are on screen.
+  ScienceDirect is one: hidden, its page arrives without a working **View PDF**
+  link, so *papio* concluded that the site had changed and asked you to fetch
+  the paper by hand — while your own browser, once you looked at it, showed the
+  link plainly. *papio* now brings that window into view without taking your
+  focus and fetches the page again, so it reads the page you would see. Nothing
+  is asked of you, and pages that draw correctly while hidden are still never
+  surfaced.
 - **A PDF reached through your library now stays connected to its paper when
   the publisher changes.** A library route can end at a different publisher
   host. After *papio* asked you to finish that download yourself, it remembered
