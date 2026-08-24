@@ -9039,6 +9039,35 @@ test("a directly matched visible-required handoff opens a normal unfocused windo
   expect(h.windows?.updated).toEqual([]);
 });
 
+test("a resolver-routed landing on a visible-required adapter reloads instead of drifting", async () => {
+  // The live failure this defends. The handoff enters on the institution's
+  // OpenURL host, so the open-time adapter lookup cannot see the provider and
+  // the window is created minimized. ScienceDirect then lands there and its
+  // access bar never paints, so classification used to report `ui_changed` and
+  // park the paper as a drift. Revealing the window is not enough on its own -
+  // the unpainted document stays - so the page must be fetched again while
+  // visible, and this landing must record no outcome at all.
+  const h = makeHarness(undefined, { windows: true });
+  h.deps.adapterSpecs = [{ ...PROVIDER_ADAPTER, requiresVisible: true }];
+  h.deps.permissions.contains = async () => true;
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_ww_resolver_reveal"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(h.windows?.created).toEqual([
+    { url: OPENURL, focused: false, state: "minimized" },
+  ]);
+
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/123`);
+
+  // Revealed without stealing focus, and fetched again so the SPA can paint.
+  expect(h.windows?.updated).toEqual([
+    { windowID: 500, props: { focused: false, state: "normal" } },
+  ]);
+  expect(h.tabs.reloaded).toContain(tabID);
+  // No verdict for the unpainted document: the reload's completion classifies.
+  expect(h.frames().filter((f) => f.type === "provider_outcome")).toEqual([]);
+});
+
 test("work window is reused across offers and recreated after the user closes it", async () => {
   // Warm auth evidence makes the first offer immediately occupy the single
   // governor slot; later offers remain queued until it releases.

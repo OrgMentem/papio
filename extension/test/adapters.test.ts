@@ -127,8 +127,20 @@ test("fixture backing rejects a rule without its matching fixture", () => {
   expect(() => expectFixtureBackedRules([spec], (_provider, scenario) => scenario === "success")).toThrow();
 });
 
-test("registered adapters leave work-window visibility at the default", () => {
-  for (const spec of adapters) expect(spec.requiresVisible).toBeUndefined();
+test("only ScienceDirect opts out of the minimized work window", () => {
+  // This guard is an inventory, not a ban. A revealed window costs the operator
+  // a reload and a visible surface, so every exception must carry measured live
+  // evidence in its spec comment. ScienceDirect earns it: the same entitled
+  // article at the same settle window renders 32 KB with a disabled View PDF
+  // control in the minimized window and 262 KB with an enabled /pdfft href in a
+  // visible tab. Adding an id here without that measurement is the failure this
+  // test exists to make loud.
+  const visible = adapters.filter((spec) => spec.requiresVisible === true).map((spec) => spec.id);
+  expect(visible).toEqual(["sciencedirect"]);
+  for (const spec of adapters) {
+    if (spec.id === "sciencedirect") continue;
+    expect(spec.requiresVisible).toBeUndefined();
+  }
 });
 
 test("interpret waits for late-upgraded custom elements when settleTimeoutMs is set", async () => {

@@ -5615,20 +5615,57 @@ export class Bridge {
     return tabID;
   }
 
-  /** Restore only adapters whose SPA cannot hydrate while the work window is hidden. */
-  private async restoreWorkWindowForAdapter(spec: AdapterSpec): Promise<void> {
-    if (!needsVisibleWindow(spec)) return;
+  /** Reveal the work window for an adapter whose SPA cannot paint while hidden,
+   * then reload so the page loads in a visible context. Answers whether the
+   * reload was issued; the reload's own completion re-enters classification, so
+   * this deliberately does not wait for the load.
+   *
+   * Un-minimizing alone is not enough, and that is the whole reason this exists.
+   * Measured 2026-08-24 on one entitled ScienceDirect article driven through the
+   * institutional resolver: the hidden window yields a 32 KB document whose View
+   * PDF control carries no href and `aria-disabled="true"`, so `article` cannot
+   * match and the job parks as a drift. The same article in a visible tab at the
+   * same 5000 ms settle yields 262 KB with `href=…/pdfft` enabled. Revealing the
+   * window after that first hidden load leaves the unpainted document in place,
+   * so the page has to be fetched again while visible. `onPageCaptureRequest`
+   * already relies on this fact for fixture capture (`surfaceWorkTab` there),
+   * which is why diagnostic captures always looked healthy while real drives
+   * parked.
+   *
+   * Focus is never taken: the window is restored with `focused: false` and the
+   * tab is only made active within it, so the operator keeps their foreground.
+   * The `minimized` test also terminates the reload cycle - the reload's own
+   * completion re-enters classification, and by then the window is `normal`, so
+   * this answers false without reloading again. */
+  private async revealForHydration(
+    spec: AdapterSpec,
+    tabID: number,
+  ): Promise<boolean> {
+    if (!needsVisibleWindow(spec)) return false;
     const windowID = this.store.workWindowID;
     const windows = this.deps.windows;
-    if (windowID === undefined || windows === undefined) return;
+    if (windowID === undefined || windows === undefined) return false;
     try {
       const win = await windows.get(windowID);
-      if (win.state === "minimized") {
-        await windows.update(windowID, { focused: false, state: "normal" });
-      }
+      if (win.state !== "minimized") return false;
+      await windows.update(windowID, { focused: false, state: "normal" });
     } catch {
       // The handoff continues assisted if the dedicated window disappeared.
+      return false;
     }
+    try {
+      await this.deps.tabs.update?.(tabID, { active: true });
+    } catch {
+      // A background tab in a visible window still paints; activation is a bonus.
+    }
+    try {
+      await this.deps.tabs.reload(tabID);
+    } catch {
+      // The tab is gone or refused the reload. Fall through to classify what is
+      // there rather than dropping the verdict for this landing.
+      return false;
+    }
+    return true;
   }
 
   /** The persisted singleton can name another window, so Chrome's membership
@@ -17776,8 +17813,17 @@ export class Bridge {
       }
       return;
     }
-    if (disposition === "apply" && this.hasDelegatedAuthority(job))
-      await this.restoreWorkWindowForAdapter(spec);
+    if (
+      disposition === "apply" &&
+      this.hasDelegatedAuthority(job) &&
+      job.tab_id >= 0 &&
+      (await this.revealForHydration(spec, job.tab_id))
+    ) {
+      // The reload's own completion re-enters this method against the painted
+      // document. Classifying the unpainted one here is what recorded a false
+      // `ui_changed` drift on every hidden-window ScienceDirect landing.
+      return undefined;
+    }
     const access = await this.hasEffectiveProviderAccess(host);
     if (access !== true) {
       if (disposition === "apply" && access === false) {

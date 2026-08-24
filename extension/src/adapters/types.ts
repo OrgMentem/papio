@@ -707,6 +707,19 @@ export const adapters: AdapterSpec[] = [
     hosts: ["sciencedirect.com"],
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
+    // ScienceDirect's access bar hydrates client-side and does not paint at all
+    // while the work window is minimized, so the View PDF control never gains an
+    // href and `article` cannot match. Measured 2026-08-24 on one entitled
+    // article (pii/S0747563216303168, doi 10.1016/j.chb.2016.04.041), same host
+    // and same session, varying only the surface:
+    //   minimized window, settle 5000  ->  32 KB, no href, aria-disabled=true
+    //   visible tab,      settle 5000  -> 262 KB, href=/pdfft, aria-disabled=false
+    //   visible tab,      settle 10000 -> 262 KB, href=/pdfft, aria-disabled=false
+    // The settle window is not the variable, so raising settleTimeoutMs cannot
+    // fix this: nothing arrives late, the SPA never paints. `revealForHydration`
+    // reveals the window without focus and reloads, because revealing after the
+    // hidden load leaves the unpainted document in place.
+    requiresVisible: true,
     classify: [
       {
         kind: "article",
