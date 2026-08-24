@@ -220,7 +220,17 @@ at one per host and adapter version per hour, 20 per day, keeping three digests.
 Nothing promotes those captures for comparison. Surface them, so a real drift is
 visible before it becomes a hand-fetch.
 
-**First, the drift latch must record which page defeated papio.** Diagnosing the
+**First, the drift latch must record which page defeated papio. SHIPPED
+2026-08-24 in `ffe8ffb` and `4950ab7`** — `provider_outcome` now carries an
+optional sanitized `host`, validated in all three protocol legs and pinned by
+nine shared corpus fixtures, and the daemon records it on the drift latch and
+on the durable outcome event. It is not purely diagnostic:
+`directRouteCandidates` matches that host against each compiled route's
+`AllowedOrigin`, so an attributed outcome can now select a direct route papio
+could not previously find. **No live drift has yet been observed carrying a
+host**, and the emit fails empty by design, so a systematic failure would look
+exactly like success — confirm against a real provider page before trusting any
+ranking built on it. Diagnosing the
 operator's own reported paper found the reason the queue cannot be trusted. Job
 `job_33be7342943fa7604f4d06e939` — the ScienceDirect paper from their report —
 parked on 2026-08-11 with a `job.latch` event carrying
