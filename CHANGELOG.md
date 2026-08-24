@@ -241,6 +241,15 @@ execution records kept during the initial build.
   the headline. Doctor now leads with whichever cause is most recent, keeps a
   superseded reading on the record in the past tense, and puts the advice for
   the live cause first.
+  The same check also counted refusals for papers *papio* had already sorted
+  out. When the Zotero item turns out to hold the PDF already, *papio* records
+  that conclusion in one place and the failed upload in another, and the check
+  only read the second — so a paper settled within the hour was still being
+  reported days later. On the author's library every one of the 129 recent
+  failures belonged to a paper that had since been filed, and the check named
+  one of them as having nowhere to put the file. It now ignores a refusal whose
+  paper has been filed, while still reporting one it cannot attribute to any
+  paper at all.
 - **A paper you have to fetch yourself now opens through your library, not at
   the paywall.** When *papio* asks you to download a PDF by hand, the page it
   needs you to reach is almost always behind your institution's sign-in: of 34
