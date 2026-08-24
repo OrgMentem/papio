@@ -215,6 +215,32 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Papers already filed in Zotero no longer sit in the queue as unfinished.**
+  Twenty-six papers on the author's own library had been delivered — the PDF
+  attached, the item created — and still read as outstanding for between 34 and
+  40 days. Every part of *papio* agreed there was nothing left to do, which is
+  exactly why nobody did it: the retry pass skips a paper whose import already
+  succeeded, and doctor's undelivered-imports check excludes it for the same
+  reason. The step that marks the paper finished runs inline with the import,
+  and these had missed it, so no later pass owned the repair. That left more
+  than a wrong number on a list: one of those papers refused a download that
+  arrived afterwards, because a finished paper was still holding an unfinished
+  paper's place. *papio* now marks a delivered paper finished on its next
+  maintenance pass, reading the Zotero keys it already recorded rather than
+  asking Zotero again — so nothing re-opens the library application to
+  re-learn something it already knows.
+- **`papio doctor` no longer reports a storage problem you have already
+  fixed.** Zotero's "storage plan is full" figure is not a live measurement;
+  it is the wording Zotero used when it last refused an upload, replayed from
+  *papio*'s own records. The author cleared their plan to about 20 MB and
+  doctor kept naming 300.4 of 300 MB, and led its advice with "free space in
+  Zotero" — for a plan with plenty of space. Worse for anyone whose files sync
+  to their own WebDAV server: *papio* uploads through Zotero's web API, which
+  bills Zotero's own plan rather than that server, so freeing space could
+  never have been the answer. An earlier fix dated the figure but left it as
+  the headline. Doctor now leads with whichever cause is most recent, keeps a
+  superseded reading on the record in the past tense, and puts the advice for
+  the live cause first.
 - **A paper you have to fetch yourself now opens through your library, not at
   the paywall.** When *papio* asks you to download a PDF by hand, the page it
   needs you to reach is almost always behind your institution's sign-in: of 34
