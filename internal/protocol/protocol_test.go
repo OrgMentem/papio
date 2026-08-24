@@ -1778,6 +1778,61 @@ func TestPageHostRejectsDotEdgeCases(t *testing.T) {
 	}
 }
 
+// provider_outcome.host reuses page_host's grammar, so it must reuse its
+// rejections too. A drift observation is the one place attribution matters
+// most, and a malformed host there would be recorded durably and then ranked.
+func TestProviderOutcomeHostRejectsDotEdgeCases(t *testing.T) {
+	const frame = `{"protocol":"papio-browser/1","type":"provider_outcome","msg_id":"m_po_host","job_id":"job_po_host","seq":1,"payload":{"outcome":"ui_changed","host":"%s"}}`
+	for _, host := range []string{".abc", "abc.", "a..b", "HAS.UPPER.CASE", "has space.edu"} {
+		if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, host))); err == nil {
+			t.Errorf("provider_outcome.host %q accepted; want rejected", host)
+		}
+	}
+	for _, host := range []string{"une.primo.exlibrisgroup.com", "www.sciencedirect.com"} {
+		if _, err := DecodeBrowserMessage([]byte(fmt.Sprintf(frame, host))); err != nil {
+			t.Errorf("provider_outcome.host %q rejected: %v", host, err)
+		}
+	}
+	// The field stays optional: an older extension omits it entirely.
+	const bare = `{"protocol":"papio-browser/1","type":"provider_outcome","msg_id":"m_po_bare","job_id":"job_po_bare","seq":1,"payload":{"outcome":"ui_changed"}}`
+	if _, err := DecodeBrowserMessage([]byte(bare)); err != nil {
+		t.Errorf("provider_outcome without host rejected: %v", err)
+	}
+}
+
+// provider_outcome.host reuses page_host's published grammar, so the schema's
+// pattern plus its "not" clause and the Go validator must reach the same
+// verdict on every shape. Same construction as
+// TestPageHostSchemaAndValidatorAgree above: derive each side independently
+// and compare, so a future edit to one leg fails here rather than silently
+// diverging on the wire.
+func TestProviderOutcomeHostSchemaAndValidatorAgree(t *testing.T) {
+	schemaPattern := regexp.MustCompile(`^[a-z0-9.-]{3,128}$`)
+	schemaNot := regexp.MustCompile(`(^\.)|(\.$)|(\.\.)`)
+	for _, host := range []string{
+		"une.primo.exlibrisgroup.com",
+		"www.sciencedirect.com",
+		"a.b",
+		"ab",
+		".abc",
+		"abc.",
+		"a..b",
+		".",
+		"..",
+		"UPPER.example.edu",
+		"has space.edu",
+		"host_underscore.edu",
+		strings.Repeat("a", 129),
+	} {
+		goOK := browserTextLen(host) <= 128 && hostRE.MatchString(host) &&
+			!strings.Contains(host, "..") && !strings.HasPrefix(host, ".") && !strings.HasSuffix(host, ".")
+		schemaOK := schemaPattern.MatchString(host) && !schemaNot.MatchString(host)
+		if goOK != schemaOK {
+			t.Errorf("provider_outcome.host %q: Go accept=%v schema accept=%v, want equal", host, goOK, schemaOK)
+		}
+	}
+}
+
 // TestOriginHintSchemaAndValidatorAgree keeps validateResolverOriginHint at
 // least as strict as the published schema pattern below, the same
 // one-directional shape TestBareRouteIsNeverLaxerThanThePublishedSchema

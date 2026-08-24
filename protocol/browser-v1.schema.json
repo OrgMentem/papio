@@ -2722,7 +2722,14 @@
                 "pattern": "^[A-Za-z0-9_-]{1,64}$"
               },
               "adapter_version": { "type": "string", "maxLength": 50 },
-              "detail": { "type": "string", "maxLength": 500 }
+              "detail": { "type": "string", "maxLength": 500 },
+              "host": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": "^[a-z0-9.-]{3,128}$",
+                "not": { "pattern": "(^\\.)|(\\.$)|(\\.\\.)" },
+                "description": "The sanitized hostname the observation was made on — a bare hostname, never a URL. A drift reported without it cannot be attributed to a provider, because the daemon's only other source is a prior page capture and an unmatched adapter produces none. Same three rejections as delivery_context.page_host, encoded in the 'not' clause and performed explicitly by both validators."
+              }
             }
           }
         }

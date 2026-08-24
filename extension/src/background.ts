@@ -17774,10 +17774,19 @@ export class Bridge {
           (evidence.length === 0
             ? ""
             : ` Generic evidence: ${evidence.join(", ")}.`);
+        // Confirm the tab is still on the page we classified before naming it:
+        // this branch runs after several awaits, so the operator may have
+        // navigated away, and a wrong host would aim adapter work at an
+        // innocent provider.
+        const reported = await this.reportableHost(job.tab_id, host);
         if (
           !this.send(
             "provider_outcome",
-            { outcome: "ui_changed", detail },
+            {
+              outcome: "ui_changed",
+              detail,
+              ...(reported === undefined ? {} : { host: reported }),
+            },
             job.job_id,
           )
         ) {
@@ -18282,6 +18291,7 @@ export class Bridge {
       const outcomeKey = `${job.job_id}:ui_changed`;
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
+        const reportedHost = await this.reportableHost(job.tab_id, host);
         if (
           !this.send(
             "provider_outcome",
@@ -18289,6 +18299,7 @@ export class Bridge {
               outcome: "ui_changed",
               adapter_id: adapter.id,
               adapter_version: adapter.version,
+              ...(reportedHost === undefined ? {} : { host: reportedHost }),
             },
             job.job_id,
           )
@@ -18736,6 +18747,50 @@ export class Bridge {
     );
   }
 
+  /** The hostname to report on a provider observation, or undefined.
+   *
+   * Fails empty on purpose. A drift with no host is merely unattributable; a
+   * drift with the WRONG host is confidently misattributed, and would aim
+   * adapter repair at a provider that never failed. Classification holds its
+   * host across several awaits (permission checks, capture, generic
+   * planning), so the tab can navigate in between. Passing `expected`
+   * re-reads the tab and refuses to report anything unless it is still on
+   * that host.
+   */
+  private async reportableHost(
+    tabID: number,
+    expected?: string,
+  ): Promise<string | undefined> {
+    if (tabID < 0) return undefined;
+    let current: string;
+    try {
+      const tab = await this.deps.tabs.get(tabID);
+      if (tab.url === undefined) return undefined;
+      current = new URL(tab.url).hostname.toLowerCase();
+      // A reported host must satisfy the wire grammar exactly, because `send`
+      // self-validates and DROPS an invalid frame — which would suppress the
+      // whole observation, not just its attribution. WHATWG hostname keeps a
+      // legitimate trailing dot, so strip one; about:blank, data:, and file:
+      // yield an empty hostname; an IPv6 literal keeps its brackets. Anything
+      // still outside the grammar reports nothing.
+      if (current.endsWith(".")) current = current.slice(0, -1);
+      if (
+        !/^[a-z0-9.-]{3,128}$/.test(current) ||
+        current.includes("..") ||
+        current.startsWith(".") ||
+        // Still needed after the single strip above: "abc.." reduces to "abc."
+        // and would otherwise pass, then be dropped by send's own validation.
+        current.endsWith(".")
+      )
+        return undefined;
+    } catch {
+      return undefined;
+    }
+    if (expected !== undefined && current !== expected.toLowerCase())
+      return undefined;
+    return current;
+  }
+
   private async emitGenericUnknown(jobID: string): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return;
@@ -18745,10 +18800,18 @@ export class Bridge {
       (evidence.length === 0
         ? ""
         : ` Generic evidence: ${evidence.join(", ")}.`);
+    // Best effort, and deliberately fail-empty. See reportableHost: a wrong
+    // host is worse than none, because adapter work would be aimed at the
+    // wrong provider.
+    const host = await this.reportableHost(job.tab_id);
     const outcomeKey = `${jobID}:ui_changed`;
     if (
       !this.handoffOutcomeSent.has(outcomeKey) &&
-      this.send("provider_outcome", { outcome: "ui_changed", detail }, jobID)
+      this.send(
+        "provider_outcome",
+        { outcome: "ui_changed", detail, ...(host === undefined ? {} : { host }) },
+        jobID,
+      )
     ) {
       this.handoffOutcomeSent.add(outcomeKey);
       await this.settleHandoffAfterOutcome(jobID, "ui_changed");
@@ -19333,17 +19396,28 @@ export class Bridge {
         }
         return;
       case "wrong_work":
-      case "wrong_work_check":
+      case "wrong_work_check": {
+        // Not for the drift latch — recordProviderLatch maps wrong_work to
+        // no_positive_effects and only a drift latch stores a host. This names
+        // the page on the durable provider_outcome event, which is what makes
+        // "papio reached a different work" diagnosable at all.
+        const wrongWorkHost = await this.reportableHost(job.tab_id, host);
         if (
           this.send(
             "provider_outcome",
-            { outcome: "wrong_work", adapter_id: spec.id, adapter_version: av },
+            {
+              outcome: "wrong_work",
+              adapter_id: spec.id,
+              adapter_version: av,
+              ...(wrongWorkHost === undefined ? {} : { host: wrongWorkHost }),
+            },
             jobID,
           )
         ) {
           await this.settleHandoffAfterOutcome(jobID, "wrong_work");
         }
         return;
+      }
       case "unknown": {
         const now = this.deps.now();
         const settled =
@@ -19365,6 +19439,10 @@ export class Bridge {
         const outcomeKey = `${jobID}:ui_changed`;
         if (!this.handoffOutcomeSent.has(outcomeKey)) {
           this.handoffOutcomeSent.add(outcomeKey);
+          // A real drift the daemon latches, so it needs attribution as much
+          // as the deferred branch — but only if the tab is still on the page
+          // that was classified.
+          const reported = await this.reportableHost(job.tab_id, host);
           if (
             !this.send(
               "provider_outcome",

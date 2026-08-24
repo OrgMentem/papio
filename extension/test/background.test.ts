@@ -5686,6 +5686,12 @@ test("an unregistered provider captures evidence and exits with a missing-adapte
     detail:
       "No source-controlled adapter matched this provider page. " +
       "A sanitized diagnostic was saved locally for adapter development.",
+    // Name the page. Without this the daemon records a drift it cannot
+    // attribute: its only other source is a prior page capture, and this is
+    // the branch where no adapter matched, so the capture carries no adapter
+    // id to join on. A live park showed exactly that — adapter_id,
+    // adapter_version and host all empty on the durable latch.
+    host: PROVIDER_HOST,
   });
   // The daemon opens a manual_download action from exactly this outcome, so the
   // job survives as an inert correlation window rather than being deleted: it

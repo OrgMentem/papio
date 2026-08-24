@@ -4422,6 +4422,7 @@ func TestProviderOutcomeRecordsAdapterDiagnostics(t *testing.T) {
 				"adapter_version": "sage-2026.07.27",
 				"adapter_id":      "sage",
 				"detail":          "download control was absent after provider landing",
+				"host":            "www.sciencedirect.com",
 			}))
 
 			events, err := jobs.Events(ctx, id)
@@ -4442,7 +4443,11 @@ func TestProviderOutcomeRecordsAdapterDiagnostics(t *testing.T) {
 					detail["adapter_id"] != "sage" ||
 					detail["adapter_version"] != "sage-2026.07.27" ||
 					detail["extension_version"] != "1.2.3" ||
-					detail["detail"] != "download control was absent after provider landing" {
+					detail["detail"] != "download control was absent after provider landing" ||
+					// Through Bridge.outcome, not recordProviderLatch: this is
+					// the half of the durable contract a direct latch call
+					// cannot reach.
+					detail["host"] != "www.sciencedirect.com" {
 					t.Fatalf("provider diagnostics = %#v", detail)
 				}
 			}
@@ -4685,6 +4690,69 @@ func TestProviderLatchDoesNotAffectUnrelatedJob(t *testing.T) {
 	}
 	if got := countJobOffersFor(msgs, otherID); got != 1 {
 		t.Fatalf("unrelated job offers = %d, want 1", got)
+	}
+}
+
+// A drift reported with no adapter and no prior capture must still name the
+// page. This is the exact shape that made the live queue unattributable: job
+// job_33be7342943fa7604f4d06e939 parked with a latch carrying empty adapter_id,
+// adapter_version and host, beside an outcome reading "No source-controlled
+// adapter matched this provider page". providerOutcomeHost can only read a
+// browser.page_capture, and an unmatched adapter takes no capture, so the
+// payload's own host is the only source that works for this case.
+func TestProviderOutcomeRecordsHostWithoutAdapterOrCapture(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_drift_host", handoffWork())
+	if err := b.recordProviderLatch(ctx, id, &protocol.ProviderOutcomePayload{
+		Outcome: "ui_changed",
+		Detail:  "No source-controlled adapter matched this provider page.",
+		Host:    "une.primo.exlibrisgroup.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A capture naming a DIFFERENT host, recorded before the outcome. The old
+	// derivation would have returned this one; the payload must win. Seeding it
+	// is what makes the assertion below discriminating — asserting that no
+	// capture exists would be a tautology, because nothing in this harness can
+	// create one.
+	if err := jobs.RecordEvent(ctx, id, "browser.page_capture", map[string]any{
+		"host": "stale.example.edu", "scenario": "observed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.recordProviderLatch(ctx, id, &protocol.ProviderOutcomePayload{
+		Outcome: "ui_changed",
+		Detail:  "A second drive on the same page.",
+		Host:    "une.primo.exlibrisgroup.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drifts := 0
+	latchHost := ""
+	for _, event := range events {
+		if event["kind"] != providerLatchEventKind {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if detail["kind"] != "drift" {
+			continue
+		}
+		drifts++
+		latchHost, _ = detail["host"].(string)
+	}
+	if latchHost != "une.primo.exlibrisgroup.com" {
+		t.Fatalf("drift latch host = %q, want the reported host to beat the "+
+			"capture scan's %q", latchHost, "stale.example.edu")
+	}
+	// Idempotency: the second outcome for the same adapter, version and host
+	// must not write another latch.
+	if drifts != 1 {
+		t.Fatalf("drift latches = %d, want 1", drifts)
 	}
 }
 

@@ -603,6 +603,37 @@ test("delivery_context.page_host rejects a leading dot, a trailing dot, and a '.
   ).toBe("publisher.example.edu");
 });
 
+test("provider_outcome.host is optional, sanitized, and rejects the dot shapes", () => {
+  // A drift with no host cannot be attributed to a provider, because the
+  // daemon's only other source is a prior page capture and the case that most
+  // needs attribution — no adapter matched — takes no capture. The field
+  // therefore exists, and reuses page_host's grammar and its three
+  // rejections rather than inventing a second host contract.
+  const frame = (payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type: "provider_outcome",
+    msg_id: "m_po_host_case",
+    job_id: "job_po_host_case",
+    seq: 1,
+    payload,
+  });
+  for (const host of [".abc", "abc.", "a..b", "HAS.UPPER.CASE"]) {
+    expect(
+      () => parseBrowserMessage(frame({ outcome: "ui_changed", host })),
+      host,
+    ).toThrow(ProtocolError);
+  }
+  expect(
+    parseBrowserMessage(
+      frame({ outcome: "ui_changed", host: "une.primo.exlibrisgroup.com" }),
+    ).payload["host"],
+  ).toBe("une.primo.exlibrisgroup.com");
+  // Optional: an older extension omits it and the frame still parses.
+  expect(
+    parseBrowserMessage(frame({ outcome: "ui_changed" })).payload["host"],
+  ).toBeUndefined();
+});
+
 test("session_evidence.origin_hint rejects a mixed-case host", () => {
   // papio-26fa531528e29798: Go, this parser, and the schema previously
   // disagreed on this shape. "https://EXAMPLE.com" was accepted by Go's

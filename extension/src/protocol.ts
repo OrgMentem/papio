@@ -288,11 +288,19 @@ export type ProviderOutcome =
   | "human_auth_required"
   | "cancelled";
 
+/**
+ * host is the sanitized hostname the observation was made on — a bare
+ * hostname, never a URL, and never carrying query, fragment, or userinfo. A
+ * drift reported without it cannot be attributed to a provider: the daemon's
+ * only other source is a prior page capture, and the case that most needs
+ * attribution — no adapter matched at all — is the case that produces none.
+ */
 export interface ProviderOutcomePayload {
   outcome: ProviderOutcome;
   adapter_id?: string;
   adapter_version?: string;
   detail?: string;
+  host?: string;
 }
 export interface ProviderDirectGetRequestPayload {
   drive_attempt_id: string;
@@ -3775,6 +3783,7 @@ function validatePayload(
         adapter_id: "optional",
         adapter_version: "optional",
         detail: "optional",
+        host: "optional",
       });
       const outcome = str(p, "outcome", "provider_outcome", 50);
       if (OUTCOMES[outcome] !== true)
@@ -3790,6 +3799,19 @@ function validatePayload(
       if ("adapter_version" in p)
         str(p, "adapter_version", "provider_outcome", 50);
       if ("detail" in p) str(p, "detail", "provider_outcome", 500);
+      if ("host" in p) {
+        const host = str(p, "host", "provider_outcome", 128);
+        if (
+          !HOST_RE.test(host) ||
+          host.includes("..") ||
+          host.startsWith(".") ||
+          host.endsWith(".")
+        ) {
+          fail(
+            "provider_outcome.host must be a bounded lowercase registrable hostname",
+          );
+        }
+      }
       break;
     }
     case "provider_direct_get_request": {

@@ -1671,12 +1671,19 @@ type DeliveryContextPayload struct {
 	SessionEvidence string `json:"session_evidence"`
 }
 
-// ProviderOutcomePayload is the adapter's terminal observation for a job.
+// ProviderOutcomePayload is the adapter's terminal observation for a job. Host
+// is the sanitized hostname the observation was made on — never a URL, and
+// never carrying query, fragment, or userinfo. It exists because a drift
+// reported without it cannot be attributed to a provider: the daemon's only
+// other source is a prior page capture, and the case that most needs
+// attribution — no adapter matched at all — is exactly the case that produces
+// no capture.
 type ProviderOutcomePayload struct {
 	Outcome        string `json:"outcome"`
 	AdapterID      string `json:"adapter_id,omitempty"`
 	AdapterVersion string `json:"adapter_version,omitempty"`
 	Detail         string `json:"detail,omitempty"`
+	Host           string `json:"host,omitempty"`
 }
 
 // ProviderDirectGetRequestPayload asks a feature-capable extension to fetch one
@@ -2918,6 +2925,12 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		if err == nil {
 			if _, present := payloadFields["adapter_id"]; present && p.AdapterID == "" {
 				err = fmt.Errorf("provider_outcome.adapter_id must not be empty when present")
+			}
+			// Same reason: TypeScript's str() and the schema's type:string both
+			// reject an empty or null host, so accepting one here would let the
+			// two parsers disagree about the same frame.
+			if _, present := payloadFields["host"]; present && p.Host == "" {
+				err = fmt.Errorf("provider_outcome.host must not be empty when present")
 			}
 		}
 		if err == nil {
@@ -4768,6 +4781,12 @@ func (p *ProviderOutcomePayload) validate() error {
 	}
 	if browserTextLen(p.Detail) > 500 {
 		return fmt.Errorf("detail exceeds 500 chars")
+	}
+	if p.Host != "" {
+		if browserTextLen(p.Host) > 128 || !hostRE.MatchString(p.Host) ||
+			strings.Contains(p.Host, "..") || strings.HasPrefix(p.Host, ".") || strings.HasSuffix(p.Host, ".") {
+			return fmt.Errorf("provider_outcome.host must be a bounded lowercase registrable hostname")
+		}
 	}
 	return nil
 }

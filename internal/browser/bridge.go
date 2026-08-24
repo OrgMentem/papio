@@ -7853,6 +7853,12 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 	if p.AdapterID != "" {
 		detail["adapter_id"] = p.AdapterID
 	}
+	// Durable attribution. Without this the ranked repair queue cannot name a
+	// provider: 124 of 160 historical outcomes carry no adapter and no host, so
+	// the pages that defeated papio are unknowable after the fact.
+	if host := strings.ToLower(strings.TrimSpace(p.Host)); host != "" {
+		detail["host"] = host
+	}
 	if err := b.jobs.RecordEvent(ctx, jobID, "browser.provider_outcome", detail); err != nil {
 		return err
 	}
@@ -8172,7 +8178,14 @@ func (b *Bridge) recordProviderLatch(ctx context.Context, jobID string, p *proto
 			return nil
 		}
 	}
-	host := providerOutcomeHost(events, p.AdapterID, p.AdapterVersion)
+	// The payload's own host is authoritative when present: the extension made
+	// the observation and knows where it stood. The capture scan below is the
+	// fallback for older extensions, and it cannot serve the case that most
+	// needs attribution — no adapter matched, so no capture was taken.
+	host := strings.ToLower(strings.TrimSpace(p.Host))
+	if host == "" {
+		host = providerOutcomeHost(events, p.AdapterID, p.AdapterVersion)
+	}
 	for _, event := range events {
 		if event["kind"] != providerLatchEventKind {
 			continue
@@ -8181,10 +8194,18 @@ func (b *Bridge) recordProviderLatch(ctx context.Context, jobID string, p *proto
 		if detail["kind"] != kind || stringDetail(detail, "safety_domain") != domain {
 			continue
 		}
+		storedHost := stringDetail(detail, "host")
+		// An empty stored host matches any host. Every latch written before the
+		// extension reported one carries "", and treating that as a distinct
+		// value would write a second latch for the same drift the first time an
+		// attributed outcome arrives — measured as one duplicate already in the
+		// live store. Gating is unaffected either way (browserOfferLatched
+		// skips latches with no adapter id), so this is log hygiene, not
+		// correctness.
 		if kind == "no_positive_effects" ||
 			(stringDetail(detail, "adapter_id") == p.AdapterID &&
 				stringDetail(detail, "adapter_version") == p.AdapterVersion &&
-				stringDetail(detail, "host") == host) {
+				(storedHost == host || storedHost == "")) {
 			return nil
 		}
 	}
