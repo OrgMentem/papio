@@ -157,8 +157,31 @@ func TestImportRetrierRunDueRetriesOnlyDueJobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(notDueAfter) != len(notDueBefore) {
-		t.Fatalf("not-due job events changed: before %d after %d, want untouched", len(notDueBefore), len(notDueAfter))
+	// The not-due job is not re-imported - but it is not left behind either.
+	// A delivered paper still sitting in ready is reconciled to imported.
+	// This assertion used to read "events untouched", which conflated those
+	// two and so held while 26 delivered papers sat in ready for 34-40 days on
+	// the operator's store, one of them blocking a later download's adoption.
+	if len(notDueAfter) != len(notDueBefore)+1 {
+		t.Fatalf("not-due job events: before %d after %d, want +1 for the lifecycle reconciliation", len(notDueBefore), len(notDueAfter))
+	}
+	reconciled := notDueAfter[len(notDueAfter)-1]
+	if reconciled["kind"] != "job.transition" {
+		t.Fatalf("not-due job last event kind = %v, want job.transition", reconciled["kind"])
+	}
+	rdetail, _ := reconciled["detail"].(map[string]any)
+	if rdetail["to"] != job.StateImported {
+		t.Fatalf("not-due job reconciled to %v, want imported", rdetail["to"])
+	}
+	if rdetail["reason"] != "import_reconciled" {
+		t.Fatalf("not-due job reconciliation reason = %v, want import_reconciled", rdetail["reason"])
+	}
+	// The keys come from the durable event, not a fresh Zotio call.
+	if rdetail["parent_key"] != "P1" || rdetail["attachment_key"] != "A1" {
+		t.Fatalf("reconciliation detail = %#v, want the keys the auto-import event recorded", rdetail)
+	}
+	if got, err := jobs.Get(ctx, notDueID); err != nil || got.State != job.StateImported {
+		t.Fatalf("not-due job state = %+v (err %v), want imported", got, err)
 	}
 }
 
@@ -268,6 +291,62 @@ func TestImportRetrierRunDueNilReceiver(t *testing.T) {
 	var r *ImportRetrier
 	if err := r.RunDue(context.Background()); err != nil {
 		t.Fatalf("nil RunDue = %v, want nil", err)
+	}
+}
+
+// A delivered paper must not be left in ready. Measured on the operator's
+// store: 26 jobs held a zotio.auto_import event reading applied, with the
+// attachment key Zotero returned, and had sat in ready for 34-40 days. Every
+// reader agreed there was nothing to do - this pass skips a successful
+// outcome, and doctor's undelivered_zotero_imports excludes it - so nothing
+// advanced the lifecycle. The row is not inert while it waits: one of those
+// jobs refused a later browser download with "job is not awaiting a human
+// handoff (state ready)".
+func TestImportRetrierReconcilesDeliveredReadyJob(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+
+	svc.AutoImporter = &fakeAutoImporter{status: "applied", parentKey: "PDELIV", attachmentKey: "ADELIV"}
+	id := seedReadyJobWithImportResult(t, svc, jobs, "wr_import_delivered_001")
+
+	// The importer must not be called again: the delivery is already a fact,
+	// and re-driving Zotio leaks a connector progress window per row.
+	capt := &selectiveImporter{status: "applied"}
+	svc.AutoImporter = capt
+
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatalf("RunDue = %v, want nil", err)
+	}
+	if capt.callCount() != 0 {
+		t.Fatalf("PlanAndApply calls = %d, want 0 - a delivered paper is reconciled from its durable event, never re-imported", capt.callCount())
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateImported {
+		t.Fatalf("state = %s, want imported - a delivered paper must not stay in ready", got.State)
+	}
+
+	// Idempotent: a second pass finds nothing in ready and must not fail.
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatalf("second RunDue = %v, want nil", err)
+	}
+	after, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transitions := 0
+	for _, event := range after {
+		detail, _ := event["detail"].(map[string]any)
+		if event["kind"] == "job.transition" && detail["reason"] == "import_reconciled" {
+			transitions++
+		}
+	}
+	if transitions != 1 {
+		t.Fatalf("import_reconciled transitions = %d, want exactly 1", transitions)
 	}
 }
 

@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log"
 	"strings"
 
@@ -130,6 +131,16 @@ func (s *Service) retryPendingImports(ctx context.Context) error {
 			continue // best-effort per job; the next pass retries this one
 		}
 		if !importNeedsRetry(events) {
+			// A delivered paper whose lifecycle never advanced stays in ready
+			// forever, because every reader of that state agrees there is
+			// nothing to do: this pass sees a successful outcome and skips it,
+			// and doctor's undelivered_zotero_imports excludes it for the same
+			// reason. Measured on the operator's store, 26 papers had sat that
+			// way for 34-40 days with the PDF attached in Zotero. The stale
+			// state is not cosmetic - a later browser download was refused
+			// adoption with "job is not awaiting a human handoff (state
+			// ready)", so the row also blocks work that arrives after it.
+			s.reconcileDeliveredReady(ctx, &row, events)
 			continue
 		}
 		s.autoImportReady(ctx, &row)
@@ -139,6 +150,56 @@ func (s *Service) retryPendingImports(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// reconcileDeliveredReady advances a ready job whose durable auto-import
+// outcome already succeeded. Apply does this inline through markImported, so
+// this is the repair path for rows that missed it - a dropped transition, or a
+// success recorded by a build that predates the lifecycle advance. The keys
+// come from the durable event rather than a fresh Zotio call: the delivery is
+// already a fact, and re-driving the connector to re-learn it would leak a
+// progress window per row (see maxImportsPerPass).
+//
+// A conflict means another actor moved the row first, which is the desired end
+// state either way.
+func (s *Service) reconcileDeliveredReady(ctx context.Context, row *job.Row, events []map[string]any) {
+	status, parentKey, attachmentKey := settledImport(events)
+	switch status {
+	case "applied", "no_op", "duplicate":
+	default:
+		return
+	}
+	detail := map[string]any{
+		"status": status,
+		"reason": "import_reconciled",
+	}
+	if parentKey != "" {
+		detail["parent_key"] = parentKey
+	}
+	if attachmentKey != "" {
+		detail["attachment_key"] = attachmentKey
+	}
+	if err := s.Jobs.Transition(ctx, row.ID, job.StateReady, job.StateImported, detail); err != nil {
+		if !errors.Is(err, job.ErrConflict) {
+			log.Printf("papio: reconciling delivered import for job %s: %v", row.ID, err)
+		}
+	}
+}
+
+// settledImport returns the latest durable auto-import outcome and its item
+// keys. The keys are read from the same event that carries the status, because
+// an earlier failed attempt can carry a parent key from a partial write.
+func settledImport(events []map[string]any) (status, parentKey, attachmentKey string) {
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != "zotio.auto_import" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		status, _ = detail["status"].(string)
+		parentKey, _ = detail["parent_key"].(string)
+		attachmentKey, _ = detail["attachment_key"].(string)
+	}
+	return status, parentKey, attachmentKey
 }
 
 // importNeedsRetry reports whether a ready job's latest durable auto-import
