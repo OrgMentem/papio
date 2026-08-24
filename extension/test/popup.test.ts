@@ -30,6 +30,7 @@ import {
   renderImpactSummary,
   derivePulseDisplay,
   formatPulseWhen,
+  renderInboxCount,
   renderWorkPulse,
   type PopupPulseCache,
   pageDeliveryJob,
@@ -43,6 +44,7 @@ import {
   wireInboxLauncher,
   wirePrimaryShortcut,
   wirePageBulkScanLauncher,
+  type PageBulkScanOutcome,
   wireSettings,
   startPageBulkScan,
   acknowledgeInPage,
@@ -343,15 +345,25 @@ test("puts every current-page action in one rail, in the accepted hierarchy", ()
   const doc = popupDocument();
 
   expect(doc.querySelector("h1")).toBeNull();
-  // The header offers the idle acquire action and nothing else: every acquire
-  // STATE element stays in the rail, so a hoisted icon can never be the thing
-  // that reports a refusal, a chooser, or an in-flight DOI.
+  // The header is two groups, not one row of three. Left: the brand and the
+  // route to the researcher's own queue, which carries the popup's most
+  // important number. Right: the idle acquire action and settings — acting on
+  // this page, and configuring papio. Every acquire STATE element stays in the
+  // rail, so a hoisted icon can never be the thing that reports a refusal, a
+  // chooser, or an in-flight DOI.
   const headerActions = doc.querySelector(".header-actions");
   expect(Array.from(headerActions?.children ?? []).map((child) => child.id)).toEqual([
     "header-acquire-btn",
-    "open-inbox-btn",
+    "header-add-more",
     "settings-btn",
   ]);
+  const headerLead = doc.querySelector(".header-lead");
+  expect(Array.from(headerLead?.children ?? []).map((child) => child.className)).toEqual([
+    "brand",
+    "settings-btn",
+  ]);
+  expect(doc.getElementById("open-inbox-btn")?.closest(".header-lead")).toBe(headerLead);
+  expect(doc.getElementById("open-inbox-btn")?.closest(".header-actions")).toBeNull();
   expect(doc.getElementById("header-acquire-btn")?.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-btn")?.closest("header")).toBeNull();
   const rail = doc.getElementById("current-page-actions");
@@ -389,7 +401,7 @@ test("puts every current-page action in one rail, in the accepted hierarchy", ()
   expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-btn")?.hidden).toBe(true);
   expect(doc.getElementById("page-bulk-scan-btn")?.hidden).toBe(true);
-  expect(doc.getElementById("page-bulk-consent")?.hidden).toBe(true);
+  expect(doc.getElementById("page-bulk-consent")).toBeNull();
   expect(doc.getElementById("page-acquire-doi")).toBeNull();
   expect(doc.getElementById("page-acquire-context")).toBeNull();
   expect(doc.getElementById("daemon-footer")).toBeNull();
@@ -3113,31 +3125,34 @@ function tabChrome(
   return { sent, injections };
 }
 
-test("an idle DOI page hoists the accented Acquire, leaving bulk selection labelled", () => {
+test("an idle DOI page moves both adds into the one header control", () => {
   const doc = popupDocument();
   renderPageContext(doc, binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }), []);
 
   const acquire = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
   const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  const more = doc.getElementById("header-add-more") as HTMLButtonElement;
   const scan = doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement;
   expect(header.hidden).toBe(false);
   // Accented, not a third grey glyph beside inbox and settings.
   expect(header.classList.contains("header-acquire")).toBe(true);
+  // Both rail controls are now carried by the header, so the rail is empty and
+  // reserves no pixels on a single-paper page. That is the whole point of the
+  // change: the body says nothing about the current page unless it must.
   expect(acquire.hidden).toBe(true);
   expect(acquire.classList.contains("primary")).toBe(true);
-  // Bulk selection is consequential and multi-step, so it keeps its label.
-  expect(scan.hidden).toBe(false);
-  expect(scan.classList.contains("ghost")).toBe(true);
-  // ADR-0019's exact visible label.
+  expect(scan.hidden).toBe(true);
   expect(scan.textContent).toBe("Select papers on this page");
-  expect(doc.getElementById("current-page-actions")?.hidden).toBe(false);
-  // With two actions, Enter means the specific one, wherever it now lives.
+  expect(doc.getElementById("current-page-actions")?.hidden).toBe(true);
+  // Two offers, so the second one gets its own deliberate target.
+  expect(more.hidden).toBe(false);
+  // Enter still means the specific action, wherever it now lives.
   expect(header.dataset.primaryAction).toBe("true");
   expect(acquire.dataset.primaryAction).toBeUndefined();
   expect(scan.dataset.primaryAction).toBeUndefined();
 });
 
-test("a PDF page hoists Send PDF beside bulk selection, preserving the PDF-grab entry", () => {
+test("a PDF page carries Send PDF in the header and keeps the bulk option", () => {
   const doc = popupDocument();
   renderPageContext(
     doc,
@@ -3151,7 +3166,10 @@ test("a PDF page hoists Send PDF beside bulk selection, preserving the PDF-grab 
   expect(header.hidden).toBe(false);
   expect(header.title).toBe("Send this PDF to papio");
   expect(acquire.title).toBe("Send this PDF to papio");
-  expect(scan.hidden).toBe(false);
+  // A PDF with no DOI still offers the specific action, so the split control
+  // keeps its chevron for the bulk alternative.
+  expect(scan.hidden).toBe(true);
+  expect((doc.getElementById("header-add-more") as HTMLButtonElement).hidden).toBe(false);
   expect(header.dataset.primaryAction).toBe("true");
 });
 
@@ -3221,9 +3239,16 @@ test("a daemon without the grab features renders Send PDF disabled carrying its 
   expect(button.getAttribute("aria-disabled")).toBe("true");
   expect(button.dataset.sendPdf).toBe("refused");
   // A refusal carries a remedy, so it stays where it can be read without
-  // hovering; the header offers nothing while the rail is refusing.
+  // hovering. The header still offers the bulk add — that action is genuinely
+  // available and the refusal says nothing about it — but it must NOT claim the
+  // Enter target, or a press would fire bulk selection at a researcher whose
+  // specific action just explained why it could not run.
   expect(button.hidden).toBe(false);
-  expect((doc.getElementById("header-acquire-btn") as HTMLButtonElement).hidden).toBe(true);
+  const headerDuringRefusal = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  expect(headerDuringRefusal.hidden).toBe(false);
+  expect(doc.getElementById("header-acquire-glyph-many")?.hasAttribute("hidden")).toBe(false);
+  expect(headerDuringRefusal.dataset.primaryAction).toBeUndefined();
+  expect((doc.getElementById("header-add-more") as HTMLButtonElement).hidden).toBe(true);
   expect(button.title).toBe(remedy);
   expect(button.getAttribute("aria-label")).toBe(
     `Send this PDF to papio — ${remedy}`,
@@ -3246,7 +3271,12 @@ test("a daemon without the grab features renders Send PDF disabled carrying its 
 // pending click is the one that would otherwise leave two live controls for the
 // same action: the researcher's own click has to be answered where the answer
 // will appear.
-test("a click hands the action back to the rail and clears the header offer", async () => {
+//
+// The bulk offer is independent and must SURVIVE, which is the bug this pins:
+// renderHeaderAddControl hides the bulk control when it takes it, so reading
+// `hidden` back concluded the page had stopped being scannable and silently
+// dropped "add all papers" for the whole of the pending click and its result.
+test("a click hands the specific action back to the rail and keeps the bulk offer", async () => {
   const doc = popupDocument();
   const acquisition = Promise.withResolvers<{ job_id: string }>();
   renderPageAcquire(doc, () => acquisition.promise);
@@ -3254,24 +3284,96 @@ test("a click hands the action back to the rail and clears the header offer", as
 
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
   const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  const more = doc.getElementById("header-add-more") as HTMLButtonElement;
   expect(header.hidden).toBe(false);
+  expect(more.hidden).toBe(false);
 
   header.click();
   await flushMicrotasks();
-  expect(header.hidden).toBe(true);
+  // The specific action is answered in the rail, where its answer appears.
   expect(button.hidden).toBe(false);
   expect(button.disabled).toBe(true);
   expect(button.textContent).toBe("Acquiring…");
+  // The page is still scannable, so the header still offers the bulk add — and
+  // with only one offer left, the chevron goes away.
+  expect(header.hidden).toBe(false);
+  expect(doc.getElementById("header-acquire-glyph-many")?.hasAttribute("hidden")).toBe(false);
+  expect(more.hidden).toBe(true);
+  // The rail owns the Enter target while its control is visible.
+  expect(header.dataset.primaryAction).toBeUndefined();
+  expect(button.dataset.primaryAction).toBe("true");
 
   // And the answer is a state, so it stays in the rail too.
   acquisition.resolve({ job_id: "job_page_acquire_001" });
   await flushMicrotasks();
-  expect(header.hidden).toBe(true);
   expect(button.hidden).toBe(false);
   expect(button.title).toBe("Added to papio");
+  expect(header.hidden).toBe(false);
 });
 
-test("an in-flight acquisition offers neither control, leaving the live card to speak", () => {
+// The header can be the ONLY visible representation of the bulk control, so an
+// enabled-state change it does not see leaves it looking live while its click
+test("the header goes inert while its bulk scan is in flight", async () => {
+  const doc = popupDocument();
+  const scan = Promise.withResolvers<PageBulkScanOutcome>();
+  wirePageBulkScanLauncher(doc, () => scan.promise);
+  renderPageAcquire(doc, async () => ({ job_id: "job_1" }));
+  renderPageContext(doc, binding({ url: "https://library.example.edu/list" }), []);
+
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  expect(header.hidden).toBe(false);
+
+  // Through the header, which is this page's only visible add control.
+  header.click();
+  await flushMicrotasks();
+  // Nothing to offer while the scan runs, so the header must not invite a click.
+  expect(header.hidden).toBe(true);
+  scan.resolve({ ok: false, error: "Could not scan this page" });
+  await flushMicrotasks();
+  // The offer returns with the control, and the failure is readable in the rail.
+  expect(header.hidden).toBe(false);
+  expect((doc.getElementById("page-bulk-scan-status") as HTMLElement).hidden).toBe(false);
+});
+
+// A page with nothing to scan must not keep a stale claim on the bulk control:
+// the header stayed visible, took the Enter target, and a press started a scan
+// on a page that had no scan to run.
+test("the header retires its claim when the page stops being scannable", () => {
+  const doc = popupDocument();
+  const scan = doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement;
+  renderPageContext(doc, binding({ url: "https://library.example.edu/list" }), []);
+  expect(scan.dataset.headerOwned).toBe("1");
+
+  renderPageContext(doc, undefined, []);
+  expect(scan.dataset.headerOwned).toBeUndefined();
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  expect(header.hidden).toBe(true);
+  expect(header.dataset.primaryAction).toBeUndefined();
+  expect(scan.dataset.primaryAction).toBeUndefined();
+});
+
+// Collapsing the row must not strand focus on a hidden descendant: a scan that
+// fails validation leaves the popup open, and the researcher needs a control.
+test("choosing the bulk add moves focus off the row before collapsing it", async () => {
+  const doc = popupDocument();
+  wirePageBulkScanLauncher(doc, async () => ({ ok: false, error: "no" }));
+  renderPageAcquire(doc, async () => ({ job_id: "job_1" }));
+  renderPageContext(doc, binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }), []);
+
+  const more = doc.getElementById("header-add-more") as HTMLButtonElement;
+  more.click();
+  expect(doc.activeElement?.id).toBe("header-add-many");
+
+  (doc.getElementById("header-add-many") as HTMLButtonElement).click();
+  await flushMicrotasks();
+  expect((doc.getElementById("header-add-menu") as HTMLElement).hidden).toBe(true);
+  // Focus is on a visible control, never on the hidden row.
+  const active = doc.activeElement as HTMLElement | null;
+  expect(active?.id).not.toBe("header-add-many");
+  expect(active?.hidden === true).toBe(false);
+});
+
+test("an in-flight acquisition offers no specific control, leaving the live card to speak", () => {
   const doc = popupDocument();
   renderPageContext(
     doc,
@@ -3281,8 +3383,15 @@ test("an in-flight acquisition offers neither control, leaving the live card to 
   const button = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
   const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
   expect(button.hidden).toBe(true);
-  expect(header.hidden).toBe(true);
   expect(doc.getElementById("page-acquire-live")?.hidden).toBe(false);
+  // The header keeps the bulk offer, which this job's standing says nothing
+  // about. It also becomes the Enter target, and correctly so: the specific
+  // action is genuinely unavailable, so bulk is the only thing a press could
+  // mean. That is the opposite of the refusal case, where the specific control
+  // stays VISIBLE carrying its remedy and therefore keeps the mark.
+  expect(header.hidden).toBe(false);
+  expect(doc.getElementById("header-acquire-glyph-many")?.hasAttribute("hidden")).toBe(false);
+  expect(header.dataset.primaryAction).toBe("true");
 });
 
 test("renderPageContext recognizes a URL-form page DOI for a bare expected DOI", () => {
@@ -3303,7 +3412,7 @@ test("renderPageContext recognizes a URL-form page DOI for a bare expected DOI",
 // `.settings-btn` declares its own `display`, which outranks the user-agent
 // `[hidden]` rule. Without an explicit override the hoisted control would stay
 // on screen through every state that belongs to the rail - and `hidden` is the
-// only thing hoistIdleAcquire sets, so no DOM test can see the difference.
+// only thing renderHeaderAddControl sets, so no DOM test sees the difference.
 test("the hoisted control's hidden state is not defeated by its own display rule", () => {
   const html = readFileSync(new URL("../src/popup.html", import.meta.url), "utf8");
   const styles = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((m) => m[1]).join("\n");
@@ -3444,17 +3553,22 @@ test("no Send-PDF string this popup can render names holdership or permits", () 
   for (const text of rendered) expect(text).not.toMatch(jargon);
 });
 
-test("an ordinary HTTPS page without a DOI shows bulk selection alone — no disabled Acquire placeholder", () => {
+test("an ordinary HTTPS page without a DOI offers bulk selection from the header alone", () => {
   const doc = popupDocument();
   renderPageContext(doc, binding({ url: "https://library.example.edu/list" }), []);
 
   const acquire = doc.getElementById("page-acquire-btn") as HTMLButtonElement;
   const scan = doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement;
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  // No disabled Acquire placeholder: a permanently dead control teaches
+  // nothing. And no rail card either — the header carries the one offer.
   expect(acquire.hidden).toBe(true);
-  expect(scan.hidden).toBe(false);
-  expect(doc.getElementById("current-page-actions")?.hidden).toBe(false);
-  // Enter falls to the only visible action.
-  expect(scan.dataset.primaryAction).toBe("true");
+  expect(scan.hidden).toBe(true);
+  expect(doc.getElementById("current-page-actions")?.hidden).toBe(true);
+  expect(header.hidden).toBe(false);
+  expect(doc.getElementById("header-acquire-glyph-many")?.hasAttribute("hidden")).toBe(false);
+  // One offer, so no chevron; Enter falls to the header, which performs it.
+  expect((doc.getElementById("header-add-more") as HTMLButtonElement).hidden).toBe(true);
   expect(acquire.dataset.primaryAction).toBeUndefined();
 });
 
@@ -3572,145 +3686,138 @@ test("a non-HTTPS bound page is refused before any scan request leaves the popup
   expect(stub.sent).toEqual([]);
 });
 
-test("the first scan of an unapproved site asks once, focuses Allow, and performs no scan", async () => {
+// ADR-0019 Decision 2 (amended): the per-site consent gate is gone. Decision 1
+// already forbids ambient scanning outright, so an explicit click on an
+// explicit control IS the consent, and papio is local-only.
+test("a scan on a never-before-scanned site proceeds with no consent step", async () => {
   const doc = popupDocument();
   const scans: PageActionBinding[] = [];
-  const allowed: string[] = [];
-  wirePageBulkScanLauncher(
-    doc,
-    async (bound) => {
-      scans.push(bound);
-      return {
-        ok: false,
-        code: "scanner_consent_required",
-        error: "Allow scanning on this site before papio reads the page",
-      };
-    },
-    async (origin) => {
-      allowed.push(origin);
-      return true;
-    },
-  );
+  wirePageBulkScanLauncher(doc, async (bound) => {
+    scans.push(bound);
+    return { ok: true };
+  });
   renderPageContext(doc, binding(), []);
   (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
   await flushMicrotasks();
 
-  const prompt = doc.getElementById("page-bulk-consent") as HTMLElement;
-  expect(prompt.hidden).toBe(false);
-  expect(doc.getElementById("page-bulk-consent-message")?.textContent).toBe(
-    "Scan scholar.example.edu for papers? Identifiers found go to your local papio app.",
-  );
-  // It must not claim that only selected papers are sent: opening the workspace
-  // sends every detected identifier to the local daemon for ownership marking.
-  expect(doc.getElementById("page-bulk-consent-message")?.textContent).not.toMatch(
-    /only papers you select/i,
-  );
-  // Focus lands on the affirmative choice, and nothing was stored yet.
-  expect(doc.activeElement?.id).toBe("page-bulk-consent-allow");
-  expect(allowed).toEqual([]);
-  // The refusal is a question, not an error: no error result is left behind.
-  expect((doc.getElementById("page-bulk-scan-status") as HTMLElement).hidden).toBe(true);
   expect(scans).toHaveLength(1);
+  expect(scans[0]?.url).toBe("https://scholar.example.edu/refs");
+  // Nothing asked, nothing stored, no prompt left in the document at all.
+  expect(doc.getElementById("page-bulk-consent")).toBeNull();
+  // The pending line is still up because the popup is about to close with the
+  // workspace tab taking focus. What matters is that it is not an error.
+  expect((doc.getElementById("page-bulk-scan-status") as HTMLElement).dataset.tone).not.toBe("error");
 });
 
-test("Allow and scan stores the exact origin and retries only after the write is acknowledged", async () => {
-  const doc = popupDocument();
-  const order: string[] = [];
-  let refuse = true;
-  wirePageBulkScanLauncher(
-    doc,
-    async () => {
-      order.push("scan");
-      if (refuse) {
-        return { ok: false, code: "scanner_consent_required", error: "nope" };
-      }
-      return { ok: true };
-    },
-    async (origin) => {
-      order.push(`allow:${origin}`);
-      refuse = false;
-      return true;
-    },
-  );
-  renderPageContext(doc, binding(), []);
-  (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
-  await flushMicrotasks();
-  (doc.getElementById("page-bulk-consent-allow") as HTMLButtonElement).click();
-  await flushMicrotasks();
-
-  expect(order).toEqual(["scan", "allow:https://scholar.example.edu", "scan"]);
-  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(true);
-});
-
-test("a failed consent write leaves a persistent error and does not scan", async () => {
+// A page with no specific paper offers only "everything here", so the header
+// carries the multi-add glyph and there is nothing to disambiguate.
+test("a page with no specific paper shows the multi-add glyph and acts directly", async () => {
   const doc = popupDocument();
   let scans = 0;
-  wirePageBulkScanLauncher(
-    doc,
-    async () => {
-      scans += 1;
-      return { ok: false, code: "scanner_consent_required", error: "nope" };
-    },
-    async () => false,
-  );
+  wirePageBulkScanLauncher(doc, async () => {
+    scans += 1;
+    return { ok: true };
+  });
+  renderPageAcquire(doc, async () => ({ job_id: "job_1" }));
   renderPageContext(doc, binding(), []);
-  (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
-  await flushMicrotasks();
-  (doc.getElementById("page-bulk-consent-allow") as HTMLButtonElement).click();
-  await flushMicrotasks();
 
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  expect(header.hidden).toBe(false);
+  expect(doc.getElementById("header-acquire-glyph-one")?.hasAttribute("hidden")).toBe(true);
+  expect(doc.getElementById("header-acquire-glyph-many")?.hasAttribute("hidden")).toBe(false);
+  // One offer, so no chevron and no row.
+  expect((doc.getElementById("header-add-more") as HTMLButtonElement).hidden).toBe(true);
+  header.click();
+  await flushMicrotasks();
   expect(scans).toBe(1);
-  const status = doc.getElementById("page-bulk-scan-status") as HTMLElement;
-  expect(status.hidden).toBe(false);
-  expect(status.textContent).toBe("Could not save scanning permission for this site");
-  expect(status.dataset.tone).toBe("error");
-  // The prompt stays available so the researcher can retry the write.
-  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(false);
-  expect((doc.getElementById("page-bulk-consent-allow") as HTMLButtonElement).disabled).toBe(false);
+  expect((doc.getElementById("header-add-menu") as HTMLElement).hidden).toBe(true);
 });
 
-test("Cancel clears the consent prompt, writes nothing, and returns focus to the action", async () => {
+// The common case must never cost two clicks: with both offers present the main
+// control still adds THIS paper, and the other option waits behind its chevron.
+test("a paper page that is also scannable adds the paper on one click", async () => {
   const doc = popupDocument();
-  let allows = 0;
-  wirePageBulkScanLauncher(
-    doc,
-    async () => ({ ok: false, code: "scanner_consent_required", error: "nope" }),
-    async () => {
-      allows += 1;
-      return true;
-    },
-  );
-  renderPageContext(doc, binding(), []);
-  (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
-  await flushMicrotasks();
-  (doc.getElementById("page-bulk-consent-cancel") as HTMLButtonElement).click();
-  await flushMicrotasks();
+  let scans = 0;
+  let acquires = 0;
+  wirePageBulkScanLauncher(doc, async () => {
+    scans += 1;
+    return { ok: true };
+  });
+  renderPageAcquire(doc, async () => {
+    acquires += 1;
+    return { job_id: "job_1" };
+  });
+  renderPageContext(doc, binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }), []);
 
-  expect(allows).toBe(0);
-  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(true);
-  expect(doc.activeElement?.id).toBe("page-bulk-scan-btn");
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  const more = doc.getElementById("header-add-more") as HTMLButtonElement;
+  // A specific paper is on offer, so the glyph says so and the chevron appears.
+  expect(doc.getElementById("header-acquire-glyph-one")?.hasAttribute("hidden")).toBe(false);
+  expect(doc.getElementById("header-acquire-glyph-many")?.hasAttribute("hidden")).toBe(true);
+  expect(more.hidden).toBe(false);
+  // The accessible name still carries the DOI, so an icon never hides its target.
+  expect(header.getAttribute("aria-label")).toContain("10.1000/x");
+
+  header.click();
+  await flushMicrotasks();
+  expect(acquires).toBe(1);
+  expect(scans).toBe(0);
 });
 
-test("a page change clears a pending consent prompt without writing anything", async () => {
+// The other option is reachable, deliberate, and keyboard-safe.
+test("the chevron expands a layout row offering the bulk add", async () => {
   const doc = popupDocument();
-  let allows = 0;
-  wirePageBulkScanLauncher(
-    doc,
-    async () => ({ ok: false, code: "scanner_consent_required", error: "nope" }),
-    async () => {
-      allows += 1;
-      return true;
-    },
-  );
-  renderPageContext(doc, binding(), []);
-  (doc.getElementById("page-bulk-scan-btn") as HTMLButtonElement).click();
-  await flushMicrotasks();
-  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(false);
+  let scans = 0;
+  wirePageBulkScanLauncher(doc, async () => {
+    scans += 1;
+    return { ok: true };
+  });
+  renderPageAcquire(doc, async () => ({ job_id: "job_1" }));
+  renderPageContext(doc, binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" }), []);
 
-  // The researcher navigated; the prompt belonged to the previous origin.
-  renderPageContext(doc, binding({ url: "https://other.example.edu/refs" }), []);
-  expect((doc.getElementById("page-bulk-consent") as HTMLElement).hidden).toBe(true);
-  expect(allows).toBe(0);
+  const more = doc.getElementById("header-add-more") as HTMLButtonElement;
+  const menu = doc.getElementById("header-add-menu") as HTMLElement;
+  expect(menu.hidden).toBe(true);
+  expect(more.getAttribute("aria-expanded")).toBe("false");
+
+  more.click();
+  expect(menu.hidden).toBe(false);
+  expect(more.getAttribute("aria-expanded")).toBe("true");
+  expect(doc.getElementById("header-add-many")?.textContent).toBe("Add all papers in this tab");
+  // Focus lands inside the row, so a keyboard user is never stranded.
+  expect(doc.activeElement?.id).toBe("header-add-many");
+
+  (doc.getElementById("header-add-many") as HTMLButtonElement).click();
+  await flushMicrotasks();
+  expect(scans).toBe(1);
+  expect(menu.hidden).toBe(true);
+  expect(more.getAttribute("aria-expanded")).toBe("false");
+});
+
+// The bulk offer must NOT be derived from the specific control's state. Acquire
+// hides itself while a job for that DOI is in flight, and hanging bulk off the
+// same condition made "add all papers" vanish for the whole acquisition.
+test("bulk selection survives an in-flight acquisition on the same page", () => {
+  const doc = popupDocument();
+  const page = binding({ url: "https://doi.org/10.1000/x", doi: "10.1000/x" });
+  renderPageContext(doc, page, [job({ expected: { doi: "10.1000/x", title: "Paper" } })]);
+
+  const header = doc.getElementById("header-acquire-btn") as HTMLButtonElement;
+  // The specific action is gone — the live card below states that job's standing
+  // — but the page is still scannable, so the header still offers the bulk add.
+  expect(header.hidden).toBe(false);
+  expect(doc.getElementById("header-acquire-glyph-many")?.hasAttribute("hidden")).toBe(false);
+  // One offer again, so the chevron goes away with the specific action.
+  expect((doc.getElementById("header-add-more") as HTMLButtonElement).hidden).toBe(true);
+});
+
+// A page offering neither add has no header control at all, and no stray row.
+test("a page with nothing to add hides the header control and its menu", () => {
+  const doc = popupDocument();
+  renderPageContext(doc, undefined, []);
+  expect((doc.getElementById("header-acquire-btn") as HTMLButtonElement).hidden).toBe(true);
+  expect((doc.getElementById("header-add-more") as HTMLButtonElement).hidden).toBe(true);
+  expect((doc.getElementById("header-add-menu") as HTMLElement).hidden).toBe(true);
 });
 
 test("a rail result survives a rerender and is keyed to its own page", async () => {
@@ -4408,50 +4515,137 @@ test("the popup stylesheet declares no viewport-relative length", () => {
 
 // "Waiting on you · 125 decisions" named the researcher as the blocker and then
 // offered nothing: the only buttons in the popup were about the current page.
-// The count is the most important fact in the lens, so it carries the route.
-test("the decision count offers the route to the decisions", () => {
-  const cache = pulseCache({ waiting_required: 34, nonterminal_total: 116 });
+// The count is the most important fact in the lens, so it carries the route —
+// and it now does so as the header inbox control itself, which is one element
+// instead of a card, a count line, and a button on its own row.
+test("the header inbox control carries the decision count and its route", () => {
   const doc = popupDocument();
-  renderWorkPulse(doc, cache, "connected", Date.now(), { pending_total: 35, turns_required: 35 });
-  const review = doc.getElementById("popup-pulse-review");
-  expect(review).toBeInstanceOf(doc.defaultView!.HTMLButtonElement);
-  expect(review!.hidden).toBe(false);
-  // The line directly above already says 35. The control says the verb once,
-  // and keeps the whole phrase as its accessible name and on hover.
-  expect(review!.textContent).toBe("Review");
-  expect(review!.getAttribute("aria-label")).toBe("Review 35 decisions");
-  expect(review!.getAttribute("title")).toBe("Review 35 decisions");
-  expect(doc.getElementById("popup-pulse-primary")?.textContent).toContain("35 decisions");
+  const display = renderInboxCount(doc, { pending_total: 35, turns_required: 35, required_turns_complete: true }, "required");
+  expect(display.showsExactTurns).toBe(true);
+  const button = doc.getElementById("open-inbox-btn");
+  expect(doc.getElementById("open-inbox-count")?.textContent).toBe("35");
+  expect(doc.getElementById("open-inbox-count")?.hidden).toBe(false);
+  expect(button?.classList.contains("has-count")).toBe(true);
+  // The label keeps its verb: a screen reader must never hear a bare number.
+  expect(button?.getAttribute("aria-label")).toBe("Open inbox · 35 decisions waiting");
 
-  // Same route as the header icon, wired by the same function.
   let opened = 0;
   wireInboxLauncher(doc, async () => {
     opened += 1;
   });
-  (review as HTMLButtonElement).click();
+  (button as HTMLButtonElement).click();
   expect(opened).toBe(1);
 
   // One decision is not "1 decisions", in the accessible name either.
-  renderWorkPulse(doc, cache, "connected", Date.now(), { pending_total: 1, turns_required: 1 });
-  expect(doc.getElementById("popup-pulse-review")?.textContent).toBe("Review");
-  expect(doc.getElementById("popup-pulse-review")?.getAttribute("aria-label")).toBe("Review 1 decision");
+  renderInboxCount(doc, { pending_total: 1, turns_required: 1, required_turns_complete: true }, "required");
+  expect(doc.getElementById("open-inbox-btn")?.getAttribute("aria-label")).toBe("Open inbox · 1 decision waiting");
 });
 
-// An offer to review nothing is worse than no offer, and papio being the one
-// working is not the researcher's turn.
-test("no route is offered when nothing is actually waiting on the reader", () => {
+// ADR-0023 Decision 7 ratifies a browser-local count mode. A header count is a
+// browser-local count, so "No number" must not be undone one click inside the
+// popup, and "Everything pending" is an inventory rather than a decision count.
+test("the header count obeys the researcher's count mode", () => {
   const doc = popupDocument();
-  renderWorkPulse(doc, pulseCache({ waiting_required: 3, nonterminal_total: 3 }), "connected", Date.now(), {
-    pending_total: 0,
-    turns_required: 0,
-  });
-  expect(doc.getElementById("popup-pulse-review")?.hidden).toBe(true);
+  const counts = { pending_total: 35, turns_required: 12, required_turns_complete: true };
+
+  const off = renderInboxCount(doc, counts, "off");
+  expect(off.text).toBe("");
+  expect(off.showsExactTurns).toBe(false);
+  expect(doc.getElementById("open-inbox-count")?.hidden).toBe(true);
+  expect(doc.getElementById("open-inbox-btn")?.classList.contains("has-count")).toBe(false);
+  expect(doc.getElementById("open-inbox-btn")?.getAttribute("aria-label")).toBe("Open inbox");
+
+  // Mode "all" prints the pending inventory, and must NOT claim to be the
+  // decision count — so it can never license hiding the pulse card.
+  const all = renderInboxCount(doc, counts, "all");
+  expect(all.text).toBe("35");
+  expect(all.showsExactTurns).toBe(false);
+  expect(doc.getElementById("open-inbox-btn")?.getAttribute("aria-label")).toBe("Open inbox · 35 pending items");
+});
+
+// `required_turns_complete` describes the per-ITEM projection LIST, not the
+// count. Past its cap the daemon drops the list and keeps the attention count
+// exact (internal/triage/triage.go:1006-1011), which is why the inbox shows the
+// exact total there too (inbox.ts:2240-2243, inbox.test.ts:367-375). Gating the
+// header number on that flag hid an exact daemon-supplied count on a live
+// 97-decision queue and left the pulse card as the only place showing it.
+//
+// The toolbar badge does blank itself there (background.ts:657-662), for a
+// reason that does not transfer: a 16px square cannot render four digits. This
+// control is `width: auto` and caps at 999+.
+test("the header count shows the exact total even without the per-item projection", () => {
+  const doc = popupDocument();
+  for (const counts of [
+    { pending_total: 97, turns_required: 97 },
+    { pending_total: 97, turns_required: 97, required_turns_complete: false },
+    { pending_total: 97, turns_required: 97, required_turns_complete: true },
+  ]) {
+    const display = renderInboxCount(doc, counts, "required");
+    expect(display.text).toBe("97");
+    expect(display.exact).toBe(97);
+    // The count is exact, so it may license hiding the pulse card's own line.
+    expect(display.showsExactTurns).toBe(true);
+  }
+});
+
+// A number is still refused where there is genuinely nothing to say.
+test("the header count stays empty when there is no count to show", () => {
+  const doc = popupDocument();
+  // Nothing waiting is not a count.
+  expect(renderInboxCount(doc, { pending_total: 9, turns_required: 0, required_turns_complete: true }, "required").text).toBe("");
+  // A daemon below schema 3 sends no turns_required at all.
+  expect(renderInboxCount(doc, { pending_total: 9 }, "required").text).toBe("");
+  expect(renderInboxCount(doc, undefined, "required").text).toBe("");
+});
+
+// turns_required validates to 1,000,000 on the wire and no header control
+// renders that legibly. Three digits do fit, so the cap is 999 and only a
+// genuinely four-digit queue is abbreviated. The cap is display-only: the exact
+// figure stays in the accessible name, so nothing reached by keyboard or screen
+// reader is capped.
+test("the header count shows three digits and caps only beyond them", () => {
+  const doc = popupDocument();
+  const paint = (turns: number) =>
+    renderInboxCount(doc, { pending_total: 0, turns_required: turns, required_turns_complete: true }, "required");
+
+  // The count the operator actually reported seeing. It is not abbreviated.
+  paint(102);
+  expect(doc.getElementById("open-inbox-count")?.textContent).toBe("102");
+  expect(doc.getElementById("open-inbox-btn")?.getAttribute("aria-label")).toBe("Open inbox · 102 decisions waiting");
+
+  paint(999);
+  expect(doc.getElementById("open-inbox-count")?.textContent).toBe("999");
+
+  // Four digits is the first abbreviation, and the exact figure survives in the
+  // accessible name.
+  paint(1000);
+  expect(doc.getElementById("open-inbox-count")?.textContent).toBe("999+");
+  expect(doc.getElementById("open-inbox-btn")?.getAttribute("aria-label")).toBe("Open inbox · 1000 decisions waiting");
+});
+
+// The card may only go quiet when the badge is carrying that exact figure AND
+// the card has nothing else to say. Every other state keeps it.
+test("the pulse card yields to the badge only when the count is all it has", () => {
+  const doc = popupDocument();
+  const counts = { pending_total: 35, turns_required: 35, required_turns_complete: true };
+  const bare = pulseCache({ waiting_required: 35, nonterminal_total: 35 });
+
+  renderWorkPulse(doc, bare, "connected", Date.now(), counts, true);
+  expect(doc.getElementById("popup-pulse")?.hidden).toBe(true);
+
+  // Same pulse, badge not carrying it: the count must stay on screen.
+  renderWorkPulse(doc, bare, "connected", Date.now(), counts, false);
+  expect(doc.getElementById("popup-pulse")?.hidden).toBe(false);
+  expect(doc.getElementById("popup-pulse-primary")?.textContent).toContain("35 decisions");
+
+  // papio working is not the researcher's turn, so the card is never redundant.
   renderWorkPulse(doc, pulseCache({ in_flight: 2, nonterminal_total: 2 }), "connected", Date.now(), {
     pending_total: 9,
     turns_required: 9,
-  });
+    required_turns_complete: true,
+  }, true);
   expect(doc.getElementById("popup-pulse-primary")?.textContent).toContain("Moving");
-  expect(doc.getElementById("popup-pulse-review")?.hidden).toBe(true);
+  expect(doc.getElementById("popup-pulse")?.hidden).toBe(false);
 });
 
 // Unlabelled, this line read as papio's whole library sitting beside a

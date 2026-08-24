@@ -392,7 +392,6 @@ interface Harness {
   frames(): BrowserMessage[];
   alarms: FakeAlarms;
   postedStrings(): string[];
-  scannerAllowlist: { origins: string[] };
   pageBulkScans: { current: PageBulkScanStore };
   sessionStorage: { clear(): void };
   detachBridgeListeners(): void;
@@ -502,10 +501,6 @@ function makeHarness(
   const navigationErrorMarkers: {
     current: Record<string, NavigationErrorMarkerEntry>;
   } = { current: {} };
-  // The scanner-consent record ADR-0019 Decision 2 gates DOM reads on. Real
-  // storage semantics (validated, deduplicated, sorted) live in realDeps; this
-  // is a bare cell so a test can seed or observe exactly what it means to.
-  const scannerAllowlist: { origins: string[] } = { origins: [] };
   const pageBulkScans: { current: PageBulkScanStore } = {
     current: emptyPageBulkScanStore(),
   };
@@ -551,12 +546,6 @@ function makeHarness(
       },
     },
     downloads,
-    scannerAllowlist: {
-      get: async () => scannerAllowlist.origins,
-      set: async (origins) => {
-        scannerAllowlist.origins = origins;
-      },
-    },
     epoch: {
       getSession: async () => epochSession.value,
       setSession: async (value) => {
@@ -629,7 +618,6 @@ function makeHarness(
     frames: () => ports.flatMap((p) => p.posted.map(parseBrowserMessage)),
     postedStrings: () =>
       ports.flatMap((p) => p.posted.map((f) => JSON.stringify(f))),
-    scannerAllowlist,
     pageBulkScans,
     sessionStorage: {
       clear: () => {
@@ -3077,7 +3065,7 @@ test("Slice 0: hydration still drops a persisted minted fresh link", () => {
   // so driving it through makeHarness/bridge.start() would test nothing).
   // The seeded top-level `offerURLs` key mirrors exactly where a
   // pre-Slice-2b persisted blob (dev history: 06892c7's StoreShape) carried
-  // this one-use minted URL; migratedState's allowlist reconstruction
+  // this one-use minted URL; migratedState reconstruction
   // (state.ts) must never read or forward an unrecognized key like this
   // one forward into a live store — the "no persisted URL anywhere"
   // invariant is structural, not a special-cased scrub.
@@ -9959,10 +9947,8 @@ const pageBulkRequestFixtures: {
   request: Record<string, unknown>;
   unauthorizedMessage: string;
   invalidMessage: string;
-  /** Which *papio* page(s) may send this type. `scan` is popup-only, most of
-   * the family is workspace-only, scanner-consent reads/writes accept the
-   * three consent surfaces, and the whole-list read is Options-only. */
-  gate: "popup" | "pageBulk" | "consent" | "options";
+  /** Which *papio* page may send this type. */
+  gate: "popup" | "pageBulk";
 }[] = [
   {
     type: "papio.pageBulk.load",
@@ -10012,32 +9998,11 @@ const pageBulkRequestFixtures: {
     invalidMessage: "Invalid page-bulk submit request",
     gate: "pageBulk",
   },
-  {
-    type: "papio.pageBulk.allowlist.get",
-    request: { origin: "https://scholar.example.edu" },
-    unauthorizedMessage: "This sender cannot read the scanner allowlist",
-    invalidMessage: "Invalid scanner allowlist request",
-    gate: "consent",
-  },
-  {
-    type: "papio.pageBulk.allowlist.set",
-    request: { origin: "https://scholar.example.edu", allowed: true },
-    unauthorizedMessage: "This sender cannot change the scanner allowlist",
-    invalidMessage: "Invalid scanner allowlist request",
-    gate: "consent",
-  },
-  {
-    type: "papio.pageBulk.allowlist.list",
-    request: {},
-    unauthorizedMessage: "This sender cannot list the scanner allowlist",
-    invalidMessage: "Invalid scanner allowlist request",
-    gate: "options",
-  },
 ];
 
 /** The pages a gate accepts, and *papio*'s own pages it must still refuse. */
 function gatePageURLs(
-  gate: "popup" | "pageBulk" | "consent" | "options",
+  gate: "popup" | "pageBulk",
   urls: typeof pageBulkTestURLs,
 ): { authorized: string[]; refusedOwnPages: string[] } {
   switch (gate) {
@@ -10050,21 +10015,6 @@ function gatePageURLs(
       return {
         authorized: [urls.pageBulkURL],
         refusedOwnPages: [urls.popupURL, urls.optionsURL, urls.inboxURL],
-      };
-    case "consent":
-      return {
-        authorized: [urls.popupURL, urls.pageBulkURL, urls.optionsURL],
-        refusedOwnPages: [urls.inboxURL, urls.historyURL],
-      };
-    case "options":
-      return {
-        authorized: [urls.optionsURL],
-        refusedOwnPages: [
-          urls.popupURL,
-          urls.pageBulkURL,
-          urls.inboxURL,
-          urls.historyURL,
-        ],
       };
   }
 }
@@ -10095,18 +10045,6 @@ function stubPageBulkBridge(h: Harness): { calls: number } {
     counter.calls += 1;
     return unreached;
   };
-  h.bridge.pageBulkAllowlistContains = async () => {
-    counter.calls += 1;
-    return unreached;
-  };
-  h.bridge.pageBulkAllowlistList = async () => {
-    counter.calls += 1;
-    return unreached;
-  };
-  h.bridge.setPageBulkAllowlist = async () => {
-    counter.calls += 1;
-    return unreached;
-  };
   return counter;
 }
 
@@ -10127,9 +10065,7 @@ test("papio.pageBulk.* rejects a foreign extension id and a foreign origin acros
       ...authorized.map((url) => ({ id: "other-extension", url })),
       // Correct id, but a content script on an arbitrary page.
       { id: urls.runtimeID, url: "https://provider.example/article" },
-      // Correct id on one of papio's OWN pages that this gate still refuses —
-      // the scanner-consent split is only real if the inbox cannot write it and
-      // the popup cannot enumerate it.
+      // Correct id on one of papio's OWN pages that this gate still refuses.
       ...refusedOwnPages.map((url) => ({ id: urls.runtimeID, url })),
     ]) {
       await expect(
@@ -10201,8 +10137,8 @@ test("papio.pageBulk.scan requires a bare-HTTPS expected_origin", async () => {
   const sender = { id: urls.runtimeID, url: urls.popupURL };
 
   for (const request of [
-    // Missing entirely — the pre-consent shape. It must not degrade to an
-    // unchecked scan of whatever the tab currently shows.
+    // Missing entirely — the bound origin is required. It must not degrade to
+    // an unchecked scan of whatever the tab currently shows.
     { tab_id: 5 },
     { tab_id: 5, expected_origin: "" },
     { tab_id: 5, expected_origin: "http://scholar.example.edu" },
@@ -10255,10 +10191,9 @@ test("papio.pageBulk.scan forwards the bound tab and origin to the bridge", asyn
   });
 });
 
-// --- ADR-0019 Decision 2: the click invokes the scan, the allowlist consents
-// to it. Every test here asserts on injection COUNT, because the whole point is
-// that no DOM is read before consent exists — a refusal that happens after
-// executeScript would be a privacy failure that still returns the right code.
+// --- ADR-0019 Decision 2: the explicit click consents to one local scan.
+// Every test here asserts on injection COUNT, because the scan must read only
+// the top frame and never more than the bounded candidate set.
 
 /** Count only scans (scanDocument injections); adapter/planner injections from
  * unrelated code paths must not be mistaken for a page read. */
@@ -10273,29 +10208,10 @@ function countScanInjections(h: Harness): () => number {
   return () => scans;
 }
 
-test("a first scan of an unapproved origin is refused before the page is read", async () => {
+test("a first scan of a never-before-scanned HTTPS origin reads the page and persists a snapshot", async () => {
   const h = makeHarness();
   const scans = countScanInjections(h);
   h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
-
-  await expect(
-    h.bridge.runPageBulkScan(42, "https://scholar.example.edu"),
-  ).resolves.toEqual({
-    ok: false,
-    error: {
-      code: "scanner_consent_required",
-      message: "Allow scanning on this site before papio reads the page",
-    },
-  });
-  expect(scans()).toBe(0);
-  expect(Object.keys(h.pageBulkScans.current.byId)).toEqual([]);
-});
-
-test("a scan of an allowlisted origin reads the page and persists a snapshot", async () => {
-  const h = makeHarness();
-  const scans = countScanInjections(h);
-  h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
-  h.scannerAllowlist.origins = ["https://scholar.example.edu"];
 
   const result = await h.bridge.runPageBulkScan(42, "https://scholar.example.edu");
   expect(result.ok).toBe(true);
@@ -10303,66 +10219,7 @@ test("a scan of an allowlisted origin reads the page and persists a snapshot", a
   if (!result.ok) throw new Error(result.error.message);
   expect(result.snapshot.sourceOrigin).toBe("https://scholar.example.edu");
   expect(result.snapshot.documentGeneration).toBe(1);
-});
-
-test("an allowlist grant for one origin never authorizes scanning a different origin", async () => {
-  const h = makeHarness();
-  const scans = countScanInjections(h);
-  h.tabs.seed({ id: 42, url: "https://other.example.edu/refs" });
-  h.scannerAllowlist.origins = ["https://scholar.example.edu"];
-
-  await expect(
-    h.bridge.runPageBulkScan(42, "https://other.example.edu"),
-  ).resolves.toEqual({
-    ok: false,
-    error: {
-      code: "scanner_consent_required",
-      message: "Allow scanning on this site before papio reads the page",
-    },
-  });
-  expect(scans()).toBe(0);
-});
-
-test("a tab that navigated away from the bound origin is refused as page_changed, not scanned under the bound consent", async () => {
-  const h = makeHarness();
-  const scans = countScanInjections(h);
-  // Both origins are allowlisted, so the ONLY thing that can refuse this is the
-  // binding check: consent for site A must not read site B just because the
-  // researcher happens to have allowed B too — they clicked on A.
-  h.tabs.seed({ id: 42, url: "https://elsewhere.example.edu/article" });
-  h.scannerAllowlist.origins = [
-    "https://scholar.example.edu",
-    "https://elsewhere.example.edu",
-  ];
-
-  await expect(
-    h.bridge.runPageBulkScan(42, "https://scholar.example.edu"),
-  ).resolves.toEqual({
-    ok: false,
-    error: {
-      code: "page_changed",
-      message: "The source page changed — try again",
-    },
-  });
-  expect(scans()).toBe(0);
-});
-
-test("scanner consent fails closed when there is no allowlist storage at all", async () => {
-  const h = makeHarness();
-  const scans = countScanInjections(h);
-  h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
-  delete h.deps.scannerAllowlist;
-
-  await expect(
-    h.bridge.runPageBulkScan(42, "https://scholar.example.edu"),
-  ).resolves.toEqual({
-    ok: false,
-    error: {
-      code: "scanner_consent_required",
-      message: "Allow scanning on this site before papio reads the page",
-    },
-  });
-  expect(scans()).toBe(0);
+  expect(Object.keys(h.pageBulkScans.current.byId)).toEqual([result.snapshot.scanId]);
 });
 
 function seedSnapshot(
@@ -10389,31 +10246,12 @@ function seedSnapshot(
   return snapshot;
 }
 
-test("Rescan is refused before reading the page once scanning consent is revoked", async () => {
+
+test("Rescan succeeds and bumps the generation", async () => {
   const h = makeHarness();
   const scans = countScanInjections(h);
   h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
   seedSnapshot(h);
-  // Consent was granted when the workspace opened and revoked since. The open
-  // workspace must not keep reading the page on the strength of a stale grant.
-  h.scannerAllowlist.origins = [];
-
-  await expect(h.bridge.requestPageBulkRescan("scan-1")).resolves.toEqual({
-    ok: false,
-    error: {
-      code: "scanner_consent_required",
-      message: "Allow scanning on this site before papio reads the page",
-    },
-  });
-  expect(scans()).toBe(0);
-});
-
-test("Rescan succeeds again once the origin is re-allowed, bumping the generation", async () => {
-  const h = makeHarness();
-  const scans = countScanInjections(h);
-  h.tabs.seed({ id: 42, url: "https://scholar.example.edu/refs" });
-  seedSnapshot(h);
-  h.scannerAllowlist.origins = ["https://scholar.example.edu"];
 
   const result = await h.bridge.requestPageBulkRescan("scan-1");
   expect(result.ok).toBe(true);
@@ -10428,10 +10266,6 @@ test("Rescan after the source tab moved to another site refuses instead of rebin
   const scans = countScanInjections(h);
   h.tabs.seed({ id: 42, url: "https://elsewhere.example.edu/article" });
   seedSnapshot(h);
-  h.scannerAllowlist.origins = [
-    "https://scholar.example.edu",
-    "https://elsewhere.example.edu",
-  ];
 
   await expect(h.bridge.requestPageBulkRescan("scan-1")).resolves.toEqual({
     ok: false,
@@ -10447,49 +10281,6 @@ test("Rescan after the source tab moved to another site refuses instead of rebin
   );
 });
 
-test("the scanner allowlist list read is validated, deduplicated, and sorted", async () => {
-  const h = makeHarness();
-  h.scannerAllowlist.origins = [
-    "https://zeta.example.edu",
-    "https://alpha.example.edu",
-    "https://zeta.example.edu",
-    "http://insecure.example.edu",
-    "https://alpha.example.edu/path",
-    "not a url",
-  ];
-
-  await expect(h.bridge.pageBulkAllowlistList()).resolves.toEqual({
-    ok: true,
-    origins: ["https://alpha.example.edu", "https://zeta.example.edu"],
-  });
-});
-
-test("the scanner allowlist list read is empty, not absent, with no storage", async () => {
-  const h = makeHarness();
-  delete h.deps.scannerAllowlist;
-  await expect(h.bridge.pageBulkAllowlistList()).resolves.toEqual({
-    ok: true,
-    origins: [],
-  });
-});
-
-test("allowing then revoking one origin leaves the others untouched", async () => {
-  const h = makeHarness();
-  h.scannerAllowlist.origins = ["https://kept.example.edu"];
-
-  await expect(
-    h.bridge.setPageBulkAllowlist("https://scholar.example.edu", true),
-  ).resolves.toEqual({ ok: true, allowed: true });
-  expect(h.scannerAllowlist.origins).toContain("https://scholar.example.edu");
-  await expect(
-    h.bridge.pageBulkAllowlistContains("https://scholar.example.edu"),
-  ).resolves.toEqual({ ok: true, allowed: true });
-
-  await expect(
-    h.bridge.setPageBulkAllowlist("https://scholar.example.edu", false),
-  ).resolves.toEqual({ ok: true, allowed: false });
-  expect(h.scannerAllowlist.origins).toEqual(["https://kept.example.edu"]);
-});
 
 test("isPageBulkSender strips the ?scan=<id> query when matching the workspace page", async () => {
   const h = makeHarness();

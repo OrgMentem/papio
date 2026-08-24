@@ -103,9 +103,6 @@ interface WorkspaceState {
   grabState: "idle" | "grabbed" | "awaiting_viewer" | "identifying" | "job_created" | "already_owned" | "needs_identifier" | "failed";
   grabID: string | null;
   grabDetail: string | null;
-  allowlistStored: boolean;
-  allowlistPending: boolean;
-  allowlistError: string | null;
   rescanRefusal: string | null;
   rescanSourceChanged: boolean;
 }
@@ -131,8 +128,6 @@ interface PageElements {
   primaryButton: HTMLButtonElement;
   submitStatus: HTMLElement;
   resultSummary: HTMLElement;
-  allowlistCheckbox: HTMLInputElement;
-  allowlistMessage: HTMLElement;
 }
 
 let elements: PageElements | null = null;
@@ -379,9 +374,6 @@ const state: WorkspaceState = {
   grabState: "idle",
   grabID: null,
   grabDetail: null,
-  allowlistStored: false,
-  allowlistPending: false,
-  allowlistError: null,
   rescanRefusal: null,
   rescanSourceChanged: false,
 };
@@ -440,48 +432,6 @@ function renderBanners(): void {
   elements.ownershipNote.hidden = !ownershipUnclearOnly();
 }
 
-function renderAllowlistRow(): void {
-  if (elements === null) return;
-  elements.allowlistCheckbox.disabled = state.allowlistPending || state.snapshot === null;
-  elements.allowlistCheckbox.checked = state.allowlistStored;
-  if (state.allowlistError === null) {
-    elements.allowlistMessage.hidden = true;
-    elements.allowlistMessage.textContent = "";
-  } else {
-    elements.allowlistMessage.hidden = false;
-    elements.allowlistMessage.textContent = state.allowlistError;
-  }
-}
-
-async function commitAllowlistChange(requested: boolean): Promise<void> {
-  if (elements === null || state.snapshot === null || state.allowlistPending) return;
-  state.allowlistPending = true;
-  state.allowlistError = null;
-  renderAllowlistRow();
-  let response: unknown;
-  try {
-    response = await runtimeMessage("papio.pageBulk.allowlist.set", {
-      origin: state.snapshot.sourceOrigin,
-      allowed: requested,
-    });
-  } catch (error) {
-    state.allowlistPending = false;
-    state.allowlistError = thrownErrorMessage(error);
-    renderAllowlistRow();
-    return;
-  }
-  state.allowlistPending = false;
-  const parsed = responseValue<boolean>(response, "allowed");
-  if (!parsed.ok) {
-    state.allowlistError = parsed.message;
-    renderAllowlistRow();
-    return;
-  }
-  state.allowlistStored = parsed.value;
-  state.allowlistError = null;
-  if (parsed.value) state.rescanRefusal = null;
-  renderAllowlistRow();
-}
 
 function rowStatusText(row: RowState): string {
   if (row.submitted) return "Submitted";
@@ -744,19 +694,9 @@ function render(): void {
 
   renderActionBar();
   renderResult();
-  renderAllowlistRow();
 }
 // -----------------------------------------------------------------------
 
-async function loadAllowlist(origin: string): Promise<void> {
-  const response = await runtimeMessage("papio.pageBulk.allowlist.get", { origin });
-  const parsed = responseValue<boolean>(response, "allowed");
-  if (parsed.ok) {
-    state.allowlistStored = parsed.value;
-    if (elements !== null) elements.allowlistCheckbox.checked = parsed.value;
-  }
-  renderAllowlistRow();
-}
 
 async function loadGrabStatus(): Promise<void> {
   const grabRow = state.rows.find((row) => row.kind === "pdf_grab" && row.grabID !== null);
@@ -898,7 +838,6 @@ function applySnapshot(snapshot: WorkspaceSnapshot): void {
     }
     if (typeof record["grab_detail"] === "string") state.grabDetail = record["grab_detail"];
   }
-  void loadAllowlist(snapshot.sourceOrigin);
 }
 
 async function loadInitial(): Promise<void> {
@@ -954,12 +893,6 @@ async function handleRescan(): Promise<void> {
   }
   if (errorCode(response) === "scan_not_found") {
     state.expired = true;
-    render();
-    return;
-  }
-  if (errorCode(response) === "scanner_consent_required") {
-    state.rescanRefusal =
-      `${errorFromResponse(response)} Your selection snapshot is still here — allow scanning below, then choose Rescan again.`;
     render();
     return;
   }
@@ -1084,14 +1017,12 @@ function bootstrap(): void {
   const primaryButton = document.getElementById("primary-btn");
   const submitStatus = document.getElementById("submit-status");
   const resultSummary = document.getElementById("result-summary");
-  const allowlistCheckbox = document.getElementById("allowlist-checkbox");
-  const allowlistMessage = document.getElementById("allowlist-message");
   if (
     scanTitle === null || scanMeta === null || scanSummary === null || scanError === null || scanExpired === null ||
     statusError === null || statusErrorMessage === null || statusRetryButton === null || truncatedNote === null ||
     ownershipNote === null || workspaceMain === null || rows === null || emptyState === null || actionBar === null ||
     returnButton === null || sourceClosedNote === null || rescanButton === null || primaryButton === null ||
-    submitStatus === null || resultSummary === null || allowlistCheckbox === null || allowlistMessage === null
+    submitStatus === null || resultSummary === null
   ) {
     return;
   }
@@ -1116,8 +1047,6 @@ function bootstrap(): void {
     primaryButton: primaryButton as HTMLButtonElement,
     submitStatus,
     resultSummary,
-    allowlistCheckbox: allowlistCheckbox as HTMLInputElement,
-    allowlistMessage,
   };
   returnButton.addEventListener("click", () => {
     void handleReturnToSource();
@@ -1130,12 +1059,6 @@ function bootstrap(): void {
   });
   statusRetryButton.addEventListener("click", () => {
     void loadStatus();
-  });
-  allowlistCheckbox.addEventListener("change", () => {
-    if (elements === null || state.snapshot === null || state.allowlistPending) return;
-    const requested = elements.allowlistCheckbox.checked;
-    elements.allowlistCheckbox.checked = state.allowlistStored;
-    void commitAllowlistChange(requested);
   });
   chrome.runtime?.onMessage?.addListener((message: unknown) => {
     if (!isRecord(message) || message["type"] !== "papio.pageBulk.grabState") return;

@@ -551,13 +551,32 @@ func TestPageAcquirePayloadRoundTripAndValidation(t *testing.T) {
 	}
 
 	ack, err := DecodeBrowserMessage(frame(MsgPageAcquireAck, PageAcquireAckPayload{
-		JobID: "job_page_acquire_001", Duplicate: true,
+		JobID: "job_page_acquire_001", Duplicate: true, Outcome: "already_queued",
 	}))
 	if err != nil {
 		t.Fatalf("decode page_acquire_ack: %v", err)
 	}
-	if got := ack.Payload.(*PageAcquireAckPayload); got.JobID != "job_page_acquire_001" || !got.Duplicate {
+	if got := ack.Payload.(*PageAcquireAckPayload); got.JobID != "job_page_acquire_001" || !got.Duplicate || got.Outcome != "already_queued" {
 		t.Fatalf("round-trip ack = %#v", got)
+	}
+	submitted, err := DecodeBrowserMessage(frame(MsgPageAcquireAck, PageAcquireAckPayload{
+		JobID: "job_page_acquire_002", Outcome: "submitted",
+	}))
+	if err != nil {
+		t.Fatalf("decode submitted page_acquire_ack: %v", err)
+	}
+	if got := submitted.Payload.(*PageAcquireAckPayload); got.Outcome != "submitted" || got.Duplicate {
+		t.Fatalf("round-trip submitted ack = %#v", got)
+	}
+	for _, payload := range []map[string]any{
+		{"job_id": "job_page_acquire_001", "outcome": "submitted", "duplicate": true},
+		{"job_id": "job_page_acquire_001", "outcome": "already_queued"},
+		{"job_id": "job_page_acquire_001", "outcome": "already_validated", "duplicate": false},
+		{"job_id": "job_page_acquire_001", "outcome": "unknown"},
+	} {
+		if _, err := DecodeBrowserMessage(frame(MsgPageAcquireAck, payload)); err == nil {
+			t.Fatalf("page_acquire_ack payload %#v was accepted", payload)
+		}
 	}
 	for _, payload := range []map[string]any{
 		{"job_id": nil},

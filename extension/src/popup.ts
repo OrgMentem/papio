@@ -25,6 +25,8 @@ import {
   type PendingDelivery,
   type StoreShape,
   TERMS_CONSENT_KEY,
+  TOOLBAR_COUNT_MODE_KEY,
+  type ToolbarCountMode,
 } from "./state";
 import type { ActivityEntryPayload, TriageCounts, WorkPulseResponsePayload } from "./protocol";
 import {
@@ -181,6 +183,8 @@ export function renderResolverGrants(
 interface PageAcquireResponse {
   job_id?: string;
   duplicate?: boolean;
+  /** Absent on an older daemon; `duplicate` is the fallback. */
+  outcome?: "submitted" | "already_queued" | "already_validated";
   error?: string | { code?: string; message?: string };
   state?: "sending" | "downloaded" | "failed" | "adopted" | "needs_choice";
   message?: string;
@@ -648,9 +652,11 @@ export async function readCurrentPageMetadata(): Promise<PageActionBinding> {
   };
 }
 
-/** The bare HTTPS origin scanner consent is granted for, or `null` when this
+/** The bare HTTPS origin a scan would be authorised for, or `null` when this
  * binding could never be a legitimate scan target. Derived from the bound
- * source URL so consent and the page actually read cannot diverge. */
+ * source URL so the authorised origin and the page actually read cannot
+ * diverge: it travels as `expected_origin`, which is what stops a scan
+ * authorised for THIS page being spent on wherever the tab navigates next. */
 export function scannerOriginForBinding(binding: PageActionBinding): string | null {
   try {
     const parsed = new URL(binding.url);
@@ -695,7 +701,6 @@ export async function openInbox(): Promise<void> {
 }
 
 export const PAGE_BULK_SCAN_MESSAGE = "papio.pageBulk.scan";
-export const PAGE_BULK_ALLOWLIST_SET_MESSAGE = "papio.pageBulk.allowlist.set";
 
 interface PageBulkScanResponse {
   ok?: boolean;
@@ -705,19 +710,20 @@ interface PageBulkScanResponse {
 
 export interface PageBulkScanOutcome {
   ok: boolean;
-  /** Structured failure code, so the caller can tell "you have not consented to
-   * this site yet" from every other refusal instead of matching on prose. */
+  /** Structured failure code, so the caller can tell a stale page binding from
+   * every other refusal instead of matching on prose. */
   code?: string;
   error?: string;
 }
 
 /** Ask the background to scan the bound page.
  *
- * ADR-0019 Decision 2: this click *invokes* the scan but is not the consent —
- * the background refuses a non-allowlisted origin before reading any DOM, and
- * answers `scanner_consent_required` so the popup can ask once. The bound origin
- * travels as `expected_origin` so consent granted for this page cannot be spent
- * on whatever the tab navigates to next. */
+ * ADR-0019 Decision 2 (amended): this click IS the consent. Decision 1 already
+ * forbids ambient scanning — one shot, `activeTab`-gated, top frame only — so
+ * there is nothing standing for a per-site gate to guard, and papio is
+ * local-only. The bound origin still travels as `expected_origin` so a scan
+ * authorised for THIS page cannot be spent on whatever the tab navigates to
+ * next. */
 export async function startPageBulkScan(binding: PageActionBinding): Promise<PageBulkScanOutcome> {
   if (!(await validatePageActionBinding(binding))) {
     return { ok: false, code: "page_changed", error: PAGE_CHANGED_MESSAGE };
@@ -742,75 +748,20 @@ export async function startPageBulkScan(binding: PageActionBinding): Promise<Pag
   };
 }
 
-/** Persist scanner consent for exactly this bare origin. Returns true only on a
- * validated `{ allowed: true }` reply: an unacknowledged write must never be
- * treated as stored consent. */
-export async function allowScannerOrigin(origin: string): Promise<boolean> {
-  const reply: unknown = await chrome.runtime.sendMessage({
-    type: PAGE_BULK_ALLOWLIST_SET_MESSAGE,
-    request: { origin, allowed: true },
-  });
-  if (typeof reply !== "object" || reply === null) return false;
-  const record = reply as Record<string, unknown>;
-  return record["ok"] === true && record["allowed"] === true;
-}
-
-/** Exact consent copy: the site, the action, and what leaves the browser.
- *
- * Deliberately does NOT promise that only *selected* papers are sent. Opening
- * the selection workspace sends every detected identifier to the local daemon so
- * it can mark what is already owned (`refreshStatus` in page-bulk.ts); only the
- * canonical keys of chosen rows are then acquired. A consent prompt that
- * overstates its own narrowness is worse than none, and the full disclosure
- * lives in Options and docs/privacy.md rather than in a 380px popup. */
-export function scannerConsentPrompt(host: string): string {
-  return `Scan ${host} for papers? Identifiers found go to your local papio app.`;
-}
-
-interface ScannerConsentElements {
-  prompt: HTMLElement;
-  message: HTMLElement;
-  allow: HTMLButtonElement;
-  cancel: HTMLButtonElement;
-}
-
-function scannerConsentElements(doc: Document): ScannerConsentElements | undefined {
-  const prompt = doc.getElementById("page-bulk-consent");
-  const message = doc.getElementById("page-bulk-consent-message");
-  const allow = doc.getElementById("page-bulk-consent-allow");
-  const cancel = doc.getElementById("page-bulk-consent-cancel");
-  if (
-    !(prompt instanceof HTMLElement) ||
-    !(message instanceof HTMLElement) ||
-    !(allow instanceof HTMLButtonElement) ||
-    !(cancel instanceof HTMLButtonElement)
-  ) {
-    return undefined;
-  }
-  return { prompt, message, allow, cancel };
-}
-
-/** The page key the visible consent prompt belongs to. A navigation or a page
- * change clears the prompt without writing anything. */
-let scannerConsentPageKey: string | undefined;
-
-export function clearScannerConsentPrompt(doc: Document): void {
-  scannerConsentPageKey = undefined;
-  const elements = scannerConsentElements(doc);
-  if (elements === undefined) return;
-  elements.prompt.hidden = true;
-  elements.message.textContent = "";
-  elements.allow.disabled = false;
-}
+/* The per-site scanner consent prompt is gone (ADR-0019 Decision 2, amended).
+ * Decision 1 already forbids ambient scanning outright — no persistent
+ * scanner, no dynamic content-script registration, no standing all-sites
+ * grant, one shot only — so every scan is an explicit per-invocation act on
+ * the tab in front of the researcher, and the click IS the consent. A second
+ * per-site gate guarded a scenario Decision 1 makes impossible, and papio is
+ * local-only: nothing detected leaves the machine. */
 
 export function wirePageBulkScanLauncher(
   doc: Document = document,
   onScan: (binding: PageActionBinding) => Promise<PageBulkScanOutcome> = startPageBulkScan,
-  onAllow: (origin: string) => Promise<boolean> = allowScannerOrigin,
 ): void {
   const button = doc.getElementById("page-bulk-scan-btn");
   const status = doc.getElementById("page-bulk-scan-status");
-  const consent = scannerConsentElements(doc);
   if (!(button instanceof HTMLButtonElement) || button.dataset.wired) return;
   button.dataset.wired = "1";
 
@@ -820,10 +771,15 @@ export function wirePageBulkScanLauncher(
     const generation = beginPopupOperation(doc, operationKey, pageKey, "Scanning this page…");
     if (status instanceof HTMLElement) paintPopupResult(status, popupOperation(doc, operationKey));
     announcePopupOperation(doc, "Scanning this page…");
+    // The header may be carrying this control, so every change to its enabled
+    // state has to be reflected there: a disabled-but-hidden scan button left
+    // the header looking live while its click did nothing.
     button.disabled = true;
+    syncHeaderAddControl(doc);
     void onScan(binding).then(
       (result) => {
         button.disabled = false;
+        syncHeaderAddControl(doc);
         if (result.ok) {
           // The workspace tab now owns this operation, and the popup is about to
           // disappear with it, so no result outlives the surface.
@@ -831,14 +787,6 @@ export function wirePageBulkScanLauncher(
           // Chrome dismisses the popup when the new workspace tab takes focus;
           // Firefox keeps it open, so close it explicitly once it's open.
           window.close();
-          return;
-        }
-        if (result.code === "scanner_consent_required" && consent !== undefined) {
-          // Not an error the researcher has to read as one: papio simply has no
-          // consent for this site yet. Clear the pending line and ask.
-          finishPopupOperation(doc, operationKey, generation, null);
-          if (status instanceof HTMLElement) paintPopupResult(status, undefined);
-          showScannerConsent(doc, binding, onAllow, runScan);
           return;
         }
         const text = result.error ?? "Could not scan this page";
@@ -852,6 +800,7 @@ export function wirePageBulkScanLauncher(
       },
       (error: unknown) => {
         button.disabled = false;
+        syncHeaderAddControl(doc);
         const text = error instanceof Error ? error.message : "Could not scan this page";
         finishPopupOperation(doc, operationKey, generation, {
           ownerKey: pageKey,
@@ -869,85 +818,10 @@ export function wirePageBulkScanLauncher(
     // touch the page the researcher was looking at when they clicked.
     const binding = boundPageAction(button);
     if (binding === undefined) return;
-    clearScannerConsentPrompt(doc);
     runScan(binding);
   });
-
-  if (consent !== undefined) {
-    consent.cancel.addEventListener("click", () => {
-      clearScannerConsentPrompt(doc);
-      // Cancel does nothing but return the researcher to the action they
-      // declined, which is where their attention already is.
-      if (!button.hidden && !button.disabled) button.focus();
-    });
-  }
 }
 
-function showScannerConsent(
-  doc: Document,
-  binding: PageActionBinding,
-  onAllow: (origin: string) => Promise<boolean>,
-  onRetry: (binding: PageActionBinding) => void,
-): void {
-  const elements = scannerConsentElements(doc);
-  const origin = scannerOriginForBinding(binding);
-  const status = doc.getElementById("page-bulk-scan-status");
-  if (elements === undefined || origin === null) return;
-  const pageKey = popupPageKey(binding);
-  scannerConsentPageKey = pageKey;
-  elements.message.textContent = scannerConsentPrompt(new URL(origin).host);
-  elements.prompt.hidden = false;
-  elements.allow.disabled = false;
-  announcePopupOperation(doc, elements.message.textContent);
-  elements.allow.focus();
-  if (elements.allow.dataset.wiredOrigin === origin) return;
-  elements.allow.dataset.wiredOrigin = origin;
-  const allowHandler = (): void => {
-    // A stale prompt left behind by a page change must not grant anything.
-    if (scannerConsentPageKey !== pageKey) return;
-    elements.allow.disabled = true;
-    void onAllow(origin).then(
-      (allowed) => {
-        if (scannerConsentPageKey !== pageKey) return;
-        if (!allowed) {
-          elements.allow.disabled = false;
-          const text = "Could not save scanning permission for this site";
-          if (status instanceof HTMLElement) {
-            paintPopupResult(status, {
-              generation: 0,
-              ownerKey: pageKey,
-              phase: "result",
-              text,
-              tone: "error",
-            });
-          }
-          announcePopupOperation(doc, text);
-          return;
-        }
-        // Retry only after the write is acknowledged: scanning on the strength
-        // of an unconfirmed grant is the failure this prompt exists to prevent.
-        clearScannerConsentPrompt(doc);
-        onRetry(binding);
-      },
-      () => {
-        if (scannerConsentPageKey !== pageKey) return;
-        elements.allow.disabled = false;
-        const text = "Could not save scanning permission for this site";
-        if (status instanceof HTMLElement) {
-          paintPopupResult(status, {
-            generation: 0,
-            ownerKey: pageKey,
-            phase: "result",
-            text,
-            tone: "error",
-          });
-        }
-        announcePopupOperation(doc, text);
-      },
-    );
-  };
-  elements.allow.addEventListener("click", allowHandler);
-}
 
 export const OPEN_HANDOFF_MESSAGE = "papio.handoff.open";
 
@@ -2221,29 +2095,26 @@ export function wireInboxLauncher(
   onOpen: () => Promise<void> = openInbox,
 ): void {
   const status = doc.getElementById("open-inbox-status");
-  // Two entry points, one route. The header icon is the durable affordance; the
-  // pulse's review button is the one the count itself offers, because "Waiting
-  // on you - 125 decisions" was inert text. The popup named the researcher as
-  // the blocker and then gave them nowhere to go.
-  for (const id of ["open-inbox-btn", "popup-pulse-review"]) {
-    const button = doc.getElementById(id);
-    if (!(button instanceof HTMLButtonElement) || button.dataset.wired) continue;
-    button.dataset.wired = "1";
-    button.addEventListener("click", () => {
-      button.disabled = true;
-      if (status) status.textContent = "Opening inbox…";
-      void onOpen()
-        .then(() => {
-          // Chrome dismisses the popup when the new tab takes focus; Firefox
-          // keeps it open, so close it explicitly once the inbox is open.
-          window.close();
-        })
-        .catch((error: unknown) => {
-          if (status) status.textContent = error instanceof Error ? error.message : "Could not open inbox";
-          button.disabled = false;
-        });
-    });
-  }
+  // One route, one control. The header inbox icon is the durable affordance and
+  // now carries the decision count itself, so the pulse card no longer needs a
+  // Review button of its own — the count and its route are the same element.
+  const button = doc.getElementById("open-inbox-btn");
+  if (!(button instanceof HTMLButtonElement) || button.dataset.wired) return;
+  button.dataset.wired = "1";
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    if (status) status.textContent = "Opening inbox…";
+    void onOpen()
+      .then(() => {
+        // Chrome dismisses the popup when the new tab takes focus; Firefox
+        // keeps it open, so close it explicitly once the inbox is open.
+        window.close();
+      })
+      .catch((error: unknown) => {
+        if (status) status.textContent = error instanceof Error ? error.message : "Could not open inbox";
+        button.disabled = false;
+      });
+  });
 }
 
 /**
@@ -2332,9 +2203,18 @@ function pageAcquireStatus(response: PageAcquireResponse): PopupResultCopy {
     return { text: response.message, tone: "info" };
   }
   if (typeof response.job_id === "string" && response.job_id.length > 0) {
-    return response.duplicate === true
-      ? { text: "Already in papio", tone: "info" }
-      : { text: "Added to papio", tone: "success" };
+    // `outcome` is absent on an older daemon, so `duplicate` remains the
+    // fallback — and the daemon keeps the two consistent for exactly this
+    // reason. ADR-0008 Decision 5 fixes the artifact wording: a `ready` or
+    // `imported` job proves papio validated a PDF, never that a reference
+    // manager received it, so this must not say "in your library".
+    if (response.outcome === "already_validated") {
+      return { text: "papio already has a validated artifact", tone: "info" };
+    }
+    if (response.outcome === "already_queued" || response.duplicate === true) {
+      return { text: "Already in papio", tone: "info" };
+    }
+    return { text: "Added to papio", tone: "success" };
   }
   return { text: "The daemon did not acknowledge this page.", tone: "error" };
 }
@@ -2441,6 +2321,103 @@ export async function requestTriageCounts(): Promise<TriageCounts | undefined> {
   } catch {
     return undefined;
   }
+}
+
+/** The researcher's browser-local count choice (ADR-0023 Decision 7). The
+ * header count is a browser-local count like the toolbar badge, so it obeys the
+ * same preference: a researcher who chose "No number" must not get the number
+ * back one click inside the popup. Defaults to "required", matching options.ts
+ * and background.ts. */
+export async function readToolbarCountMode(): Promise<ToolbarCountMode> {
+  try {
+    const values = await chrome.storage.local.get([TOOLBAR_COUNT_MODE_KEY]);
+    const mode = values[TOOLBAR_COUNT_MODE_KEY];
+    return mode === "all" || mode === "off" ? mode : "required";
+  } catch {
+    // Fail to the default rather than to a number: an unreadable preference is
+    // not permission to print a count the researcher may have switched off.
+    return "required";
+  }
+}
+
+/** Display cap for the header count. `turns_required` validates up to 1,000,000
+ * on the wire, which no header control renders legibly. Three digits fit: the
+ * control is `width: auto`, and the widest string it ever paints ("999+") was
+ * measured at 72px against a 356px content box, so the header still holds the
+ * brand plus two 32px pills beside it. The exact figure stays in the control's
+ * accessible name and title, so this cap is display-only. */
+export const HEADER_COUNT_CAP = 999;
+
+export interface InboxCountDisplay {
+  /** Digits to paint, or "" when the control shows no number at all. */
+  readonly text: string;
+  /** The exact figure, for the accessible name. Undefined when text is "". */
+  readonly exact?: number;
+  /** True ONLY when the badge is displaying the exact, complete required-turn
+   * count. renderWorkPulse reads this to decide whether its own "Waiting on
+   * you · N decisions" line is now redundant. Deliberately false for mode
+   * "all": a pending inventory is not a decision count. */
+  readonly showsExactTurns: boolean;
+}
+
+const NO_INBOX_COUNT: InboxCountDisplay = { text: "", showsExactTurns: false };
+
+export function deriveInboxCount(
+  counts: Pick<TriageCounts, "pending_total" | "turns_required" | "required_turns_complete"> | undefined,
+  mode: ToolbarCountMode,
+): InboxCountDisplay {
+  if (counts === undefined || mode === "off") return NO_INBOX_COUNT;
+  if (mode === "all") {
+    const total = counts.pending_total;
+    if (typeof total !== "number" || total <= 0) return NO_INBOX_COUNT;
+    return { text: cappedCount(total), exact: total, showsExactTurns: false };
+  }
+
+  // Mode "required". `required_turns_complete` describes the per-ITEM
+  // projection LIST, not the count: past the cap the daemon drops the list and
+  // "keeps the exact attention count" (internal/triage/triage.go:1006-1011),
+  // which `extension/src/inbox.ts` relies on too. So gating the number on it
+  // hid an exact daemon-supplied count and left the pulse card as the only
+  // place showing it.
+  //
+  // The toolbar badge DOES blank itself there (background.ts:657-662), but for
+  // a reason that does not transfer: a 16px toolbar square cannot render four
+  // digits. This control is `width: auto` and caps at 999+, so it can.
+  const turns = counts.turns_required;
+  if (typeof turns !== "number" || turns <= 0) return NO_INBOX_COUNT;
+  return { text: cappedCount(turns), exact: turns, showsExactTurns: true };
+}
+
+function cappedCount(value: number): string {
+  return value > HEADER_COUNT_CAP ? `${HEADER_COUNT_CAP}+` : String(value);
+}
+
+/** Paints the header inbox count. Returns the display so the caller can pass
+ * `showsExactTurns` to renderWorkPulse without deriving it twice. */
+export function renderInboxCount(
+  doc: Document,
+  counts: Pick<TriageCounts, "pending_total" | "turns_required" | "required_turns_complete"> | undefined,
+  mode: ToolbarCountMode,
+): InboxCountDisplay {
+  const display = deriveInboxCount(counts, mode);
+  const button = doc.getElementById("open-inbox-btn");
+  const slot = doc.getElementById("open-inbox-count");
+  // Optional by design, like the pulse's own controls: a caller assembling a
+  // partial DOM still gets a working launcher.
+  if (!(button instanceof HTMLElement) || !(slot instanceof HTMLElement)) return display;
+  slot.textContent = display.text;
+  slot.hidden = display.text === "";
+  button.classList.toggle("has-count", display.text !== "");
+  // The cap never reaches the accessible name, and the count is never the only
+  // thing a screen reader hears: the label keeps its verb.
+  const label = display.exact === undefined
+    ? "Open inbox"
+    : display.showsExactTurns
+      ? `Open inbox · ${display.exact} ${display.exact === 1 ? "decision" : "decisions"} waiting`
+      : `Open inbox · ${display.exact} pending ${display.exact === 1 ? "item" : "items"}`;
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  return display;
 }
 
 function pulseCount(pulse: WorkPulseResponsePayload, field: keyof WorkPulseResponsePayload): number | undefined {
@@ -2653,7 +2630,15 @@ export function renderWorkPulse(
   cache: PopupPulseCache | undefined,
   connectionStatus: StoreShape["connectionStatus"] = "connected",
   now = Date.now(),
-  counts?: Pick<TriageCounts, "pending_total" | "turns_required">,
+  // Same shape renderInboxCount takes, so a caller reads counts once and hands
+  // the identical value to both. `required_turns_complete` is unused here:
+  // `badgeShowsExactTurns` already encodes the only decision it feeds.
+  counts?: Pick<TriageCounts, "pending_total" | "turns_required" | "required_turns_complete">,
+  /** True when the header inbox control is already displaying this exact
+   * required-turn count (renderInboxCount's `showsExactTurns`). Only then may
+   * this card treat its own count line as redundant. Defaults false so a caller
+   * that does not paint the badge never loses the count. */
+  badgeShowsExactTurns = false,
 ): void {
   const section = doc.getElementById("popup-pulse");
   const primary = doc.getElementById("popup-pulse-primary");
@@ -2673,25 +2658,9 @@ export function renderWorkPulse(
       ? display.capacity
       : "";
   for (const node of [next, capacity]) node.hidden = node.textContent === "";
-  // Optional by design: the button is absent from any DOM a caller assembles
-  // by hand, and its absence must degrade to today's text-only pulse rather
-  // than abandoning the whole render.
-  const review = doc.getElementById("popup-pulse-review");
-  if (review instanceof HTMLButtonElement) {
-    const turns = counts?.turns_required ?? 0;
-    // The line directly above already carries the count, so the control needs
-    // only the verb. The number stays in the accessible name and on hover, so
-    // nothing reached by keyboard or screen reader is offered an unqualified
-    // "Review".
-    const full = `Review ${turns} ${turns === 1 ? "decision" : "decisions"}`;
-    review.textContent = "Review";
-    review.title = full;
-    review.setAttribute("aria-label", full);
-    // Only when the pulse itself says the researcher is the blocker AND the
-    // turn authority counts real turns. An offer to review nothing is worse
-    // than no offer.
-    review.hidden = !(display.primary === "Waiting on you" && turns > 0);
-  }
+  // The count route used to be a Review button on its own row here. It now
+  // rides the header inbox control, so this card only has to decide whether it
+  // still has anything to say.
   // Full validated measurements stay reachable without occupying a line: on
   // hover, and — because a bare `title` is not an accessibility path — as this
   // section's description.
@@ -2702,9 +2671,27 @@ export function renderWorkPulse(
   const description = doc.getElementById("popup-pulse-detail");
   if (description instanceof HTMLElement) description.textContent = detail;
   section.dataset.state = display.primary;
-  // Disconnected is the daemon band's story, not the pulse's, and an unmeasured
-  // pulse says nothing worth a line.
-  section.hidden = connectionStatus !== "connected" || pulseIsUnmeasured(display);
+  // Three independent reasons to say nothing:
+  //
+  //   1. Disconnected is the daemon band's story, not the pulse's.
+  //   2. An unmeasured pulse says nothing worth a line.
+  //   3. The card's ONLY remaining content is a count the header control is
+  //      already showing exactly. Every condition below is required: a
+  //      `Waiting on you` display can still carry a companion, a next action,
+  //      or a constraining capacity, and each of those is news the badge
+  //      cannot carry. The other five primaries are never redundant —
+  //      `Unknown` names its cause, `Idle` reports measured emptiness, and
+  //      `Moving`/`Stalled`/`Scheduled` are not decision counts at all.
+  const countIsTheOnlyContent =
+    badgeShowsExactTurns &&
+    display.primary === "Waiting on you" &&
+    display.companion === "" &&
+    // `batch` carries "Last submission: …", which the badge cannot say.
+    display.batch === "" &&
+    next.textContent === "" &&
+    capacity.textContent === "";
+  section.hidden =
+    connectionStatus !== "connected" || pulseIsUnmeasured(display) || countIsTheOnlyContent;
 }
 const POPUP_REFRESH_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 10 * 60_000;
@@ -3165,30 +3152,153 @@ function shortAcquireLabel(label: string): string {
   return label.length > 12 ? `${label.slice(0, 11)}…` : label;
 }
 
-/** The rail owns every acquire state; the header owns only the idle offer.
+/** `hidden` on an SVG element is an attribute only: SVGElement is not
+ * HTMLElement and has no `hidden` IDL property, so assigning one compiles and
+ * then does nothing at runtime. */
+function setGlyphHidden(glyph: Element | null, hidden: boolean): void {
+  if (glyph === null) return;
+  if (hidden) glyph.setAttribute("hidden", "");
+  else glyph.removeAttribute("hidden");
+}
+
+/** Collapses this page's "add" offers into the one header control.
  *
- * A visible, enabled rail control is the one state an icon can carry without
- * loss — one verb, nothing to disambiguate, nothing in flight — and it is also
- * the state that spends a whole bordered card to say almost nothing. Every
- * other state keeps the rail: a refusal's remedy, a pending click, an in-flight
- * DOI, a chooser. Deriving the hoist from the control's own settled state
- * rather than from renderPageContext's branches means a state added later
- * cannot forget to decide, and the two controls can never both be live.
+ * Two offers can exist independently: a SPECIFIC action for one paper (acquire
+ * a DOI, send this PDF), and a BULK action for every paper the page mentions.
+ * The header shows one glyph for whichever exist and, when both do, expands to
+ * let the researcher choose.
  *
- * The header button is a remote control, never a second implementation: the
- * rail button remains the only holder of the bound page, the mode, and the
- * handler. */
-function hoistIdleAcquire(button: HTMLButtonElement): void {
-  const header = button.ownerDocument.getElementById("header-acquire-btn");
+ * The rail still owns every acquire STATE. A visible, enabled rail control is
+ * the one state an icon can carry without loss — one verb, nothing to
+ * disambiguate, nothing in flight — and it is also the state that spends a
+ * whole bordered card to say almost nothing. Every other state keeps the rail:
+ * a refusal's remedy, a pending click, an in-flight DOI, a chooser. Deriving
+ * the specific offer from the control's own settled state rather than from
+ * renderPageContext's branches means a state added later cannot forget to
+ * decide, and the two controls can never both be live.
+ *
+ * The bulk offer is derived SEPARATELY and never from the specific control's
+ * state: hanging it off the same `hoistable` condition made "add all papers"
+ * vanish for the whole of an in-flight acquisition, because acquire hides
+ * itself while a job for that DOI runs.
+ *
+ * The header buttons are remote controls, never second implementations: the
+ * rail buttons remain the only holders of the bound page, the mode, and the
+ * handlers. */
+function renderHeaderAddControl(specific: HTMLButtonElement, bulk: HTMLButtonElement | undefined): void {
+  const doc = specific.ownerDocument;
+  const header = doc.getElementById("header-acquire-btn");
+  const more = doc.getElementById("header-add-more");
+  const one = doc.getElementById("header-acquire-glyph-one");
+  const many = doc.getElementById("header-acquire-glyph-many");
   if (!(header instanceof HTMLButtonElement)) return;
-  const hoistable = !button.hidden && !button.disabled;
-  header.hidden = !hoistable;
-  if (!hoistable) return;
-  // The full label, DOI and all: an icon's accessible name is the only place
-  // the researcher can still learn what this click will act on.
-  header.title = button.title;
-  header.setAttribute("aria-label", button.title);
-  button.hidden = true;
+  const hasSpecific = !specific.hidden && !specific.disabled;
+  // NOT `!bulk.hidden`: this function hides the bulk control when the header
+  // takes it, so reading `hidden` back would erase the offer on the next call.
+  // `headerOwned` records that the header is already carrying it.
+  //
+  // The claim outlives a TRANSIENT disable on purpose. A scan in flight
+  // disables the control, which correctly withdraws the offer for the moment;
+  // dropping the claim there left the control enabled-but-hidden afterwards,
+  // with nothing to re-show it, so the offer vanished until the next full
+  // render. Only `renderPageContext` retires the claim, because scannability is
+  // the only thing that genuinely ends it.
+  const owned = bulk?.dataset.headerOwned === "1";
+  const bulkOnOffer = bulk !== undefined && (!bulk.hidden || owned);
+  const hasBulk = bulkOnOffer && bulk.disabled === false;
+  header.hidden = !hasSpecific && !hasBulk;
+  if (header.hidden) {
+    collapseHeaderAddMenu(doc);
+    return;
+  }
+  // The glyph names what a click will do, so it must not claim a specific paper
+  // that is not on offer. Toggled by ATTRIBUTE, not the `hidden` IDL property:
+  // these are SVG elements, which are not HTMLElement and carry no `hidden`
+  // property, so a property assignment compiles and then does nothing.
+  setGlyphHidden(one, !hasSpecific);
+  setGlyphHidden(many, hasSpecific);
+  const both = hasSpecific && hasBulk;
+  if (more instanceof HTMLButtonElement) more.hidden = !both;
+  // A single click always DOES something. The disclosure is a separate control,
+  // so the common case — add the paper in front of me — never costs two clicks.
+  const label = hasSpecific ? specific.title : bulk?.textContent ?? "Select papers on this page";
+  header.title = label;
+  header.setAttribute("aria-label", label);
+  if (!both) collapseHeaderAddMenu(doc);
+  // The rail keeps a control only when the header cannot carry it.
+  if (hasSpecific) specific.hidden = true;
+  if (hasBulk && bulk !== undefined) {
+    bulk.hidden = true;
+    bulk.dataset.headerOwned = "1";
+  }
+}
+
+export function collapseHeaderAddMenu(doc: Document): void {
+  const more = doc.getElementById("header-add-more");
+  const menu = doc.getElementById("header-add-menu");
+  if (menu instanceof HTMLElement) menu.hidden = true;
+  if (more instanceof HTMLButtonElement) more.setAttribute("aria-expanded", "false");
+}
+
+/** The expanded choice is a DIRECT handler on the rail control, never routed
+ * through an intermediate step, so the click stays inside the researcher's own
+ * gesture. That matters beyond tidiness: `scripting.executeScript` under
+ * `activeTab` survives an extra hop, but anything that could later need
+ * `chrome.permissions.request` would not. */
+function wireHeaderAddMenu(doc: Document): void {
+  const more = doc.getElementById("header-add-more");
+  if (more instanceof HTMLButtonElement && more.dataset.wired === undefined) {
+    more.dataset.wired = "1";
+    more.addEventListener("click", () => {
+      const menu = doc.getElementById("header-add-menu");
+      if (!(menu instanceof HTMLElement)) return;
+      const open = menu.hidden;
+      menu.hidden = !open;
+      more.setAttribute("aria-expanded", String(open));
+      if (open) {
+        const first = doc.getElementById("header-add-many");
+        if (first instanceof HTMLButtonElement) first.focus();
+      }
+    });
+  }
+  const menu = doc.getElementById("header-add-menu");
+  if (!(menu instanceof HTMLElement) || menu.dataset.wired) return;
+  menu.dataset.wired = "1";
+  const bulkChoice = doc.getElementById("header-add-many");
+  if (bulkChoice instanceof HTMLButtonElement) {
+    bulkChoice.addEventListener("click", () => {
+      // Move focus BEFORE hiding this button: collapsing the row would
+      // otherwise leave focus on a hidden descendant, and a scan that fails
+      // validation leaves the popup open with no focused control at all.
+      //
+      // The main control, not the chevron: this click disables the bulk offer
+      // for the duration of the scan, which withdraws the chevron with it, so
+      // focusing the chevron would strand focus a second time.
+      const header = doc.getElementById("header-acquire-btn");
+      if (header instanceof HTMLButtonElement && !header.hidden) header.focus();
+      else {
+        const more = doc.getElementById("header-add-more");
+        if (more instanceof HTMLButtonElement && !more.hidden) more.focus();
+      }
+      collapseHeaderAddMenu(doc);
+      const scan = doc.getElementById("page-bulk-scan-btn");
+      if (scan instanceof HTMLButtonElement) scan.click();
+    });
+  }
+}
+
+/** Re-derive the header control from the CURRENT rail state.
+ *
+ * For callers that change one control's enabled state without going through
+ * `setAcquireButton` — the bulk scan lifecycle is the one that matters, because
+ * the header may be the only visible representation of a control it disables. */
+export function syncHeaderAddControl(doc: Document): void {
+  const acquire = doc.getElementById("page-acquire-btn");
+  const scan = doc.getElementById("page-bulk-scan-btn");
+  if (!(acquire instanceof HTMLButtonElement)) return;
+  const bulk = scan instanceof HTMLButtonElement ? scan : undefined;
+  renderHeaderAddControl(acquire, bulk);
+  markPrimaryRailAction(acquire, bulk);
 }
 
 function setAcquireButton(
@@ -3203,7 +3313,17 @@ function setAcquireButton(
   button.setAttribute("aria-disabled", String(disabled));
   button.disabled = disabled;
   button.hidden = hidden;
-  hoistIdleAcquire(button);
+  // The bulk offer is read live rather than passed in: this is called from many
+  // acquire branches, and none of them knows the page's scannability.
+  const scan = button.ownerDocument.getElementById("page-bulk-scan-btn");
+  const bulk = scan instanceof HTMLButtonElement ? scan : undefined;
+  renderHeaderAddControl(button, bulk);
+  // Re-mark here, not only from renderPageContext: every visibility change to
+  // these controls flows through this function, including the ones a click
+  // makes without a full re-render. Leaving it to the caller left the mark on
+  // the header through a pending click, so Enter fired bulk selection while the
+  // rail was mid-acquisition.
+  markPrimaryRailAction(button, bulk);
 }
 
 /** One visible, non-live result element per rail action. `section` collapses
@@ -3501,11 +3621,27 @@ export function renderPageAcquire(
   const header = doc.getElementById("header-acquire-btn");
   if (header instanceof HTMLButtonElement && header.dataset.wired === undefined) {
     header.dataset.wired = "1";
-    // Forwarded synchronously, so this stays the researcher's own gesture and
-    // the rail control keeps sole authority over what a click means. A hoisted
-    // rail button is hidden but never disabled, so the click always dispatches.
-    header.addEventListener("click", () => button.click());
+    // Click and Enter only: a browser-action popup opens UNDER the pointer, so
+    // a hover-triggered expansion fires unbidden and then shifts the layout
+    // beneath the cursor.
+    //
+    // Every branch forwards SYNCHRONOUSLY to a rail control, so this stays the
+    // researcher's own gesture and the rail keeps sole authority over what a
+    // click means. A hoisted rail button is hidden but never disabled, so the
+    // click always dispatches.
+    // A single click ALWAYS acts. The specific add wins when it is on offer,
+    // because "add the paper in front of me" is the common case and must never
+    // cost two clicks; the other option lives behind its own chevron.
+    header.addEventListener("click", () => {
+      if (!button.disabled) {
+        button.click();
+        return;
+      }
+      const scan = doc.getElementById("page-bulk-scan-btn");
+      if (scan instanceof HTMLButtonElement) scan.click();
+    });
   }
+  wireHeaderAddMenu(doc);
   if (button.dataset.wired) return;
   button.dataset.wired = "1";
   button.addEventListener("click", () => {
@@ -3649,23 +3785,40 @@ export function isBulkScannablePage(binding: PageActionBinding | undefined): boo
   return binding !== undefined && scannerOriginForBinding(binding) !== null;
 }
 
-/** Mark exactly one visible, enabled control as the Enter target. With both rail
- * actions present, Acquire/Send PDF wins because it is the specific one; when it
- * is hoisted, the mark travels to the header control that now offers it. */
+/** Mark EXACTLY ONE control as the Enter target.
+ *
+ * The header claims it whenever the header is visible and the rail's specific
+ * control is not: that covers both a hoisted specific action and a page whose
+ * only offer is bulk, and in each case a press does the one thing the header is
+ * offering.
+ *
+ * The rail keeps the mark whenever its specific control is visible — a refusal
+ * carrying its remedy, a pending click. Otherwise Enter would fire bulk
+ * selection at a researcher whose specific action just told them why it could
+ * not run. That precision matters because the Enter selector resolves in
+ * document order and the header precedes the rail, so two marks would silently
+ * hand the press to the header.
+ *
+ * Deliberately reads only the CONTROLS, never the enclosing rail section: this
+ * runs before `renderPageContext` computes that section's visibility, so a
+ * section read here would be one render stale. Any control that must not be a
+ * target is hidden by its own branch instead. */
 function markPrimaryRailAction(
   acquire: HTMLButtonElement,
   scan: HTMLButtonElement | undefined,
 ): void {
-  const header = acquire.ownerDocument.getElementById("header-acquire-btn");
-  const hoisted = header instanceof HTMLButtonElement && !header.hidden;
+  const doc = acquire.ownerDocument;
+  const header = doc.getElementById("header-acquire-btn");
+  const headerIsTarget =
+    header instanceof HTMLButtonElement && !header.hidden && acquire.hidden;
   if (header instanceof HTMLButtonElement) {
-    if (hoisted) header.dataset.primaryAction = "true";
+    if (headerIsTarget) header.dataset.primaryAction = "true";
     else delete header.dataset.primaryAction;
   }
   if (!acquire.hidden) acquire.dataset.primaryAction = "true";
   else delete acquire.dataset.primaryAction;
   if (scan === undefined) return;
-  if (!acquire.hidden || hoisted || scan.hidden) delete scan.dataset.primaryAction;
+  if (!acquire.hidden || headerIsTarget || scan.hidden) delete scan.dataset.primaryAction;
   else scan.dataset.primaryAction = "true";
 }
 
@@ -3715,12 +3868,6 @@ export function renderPageContext(
   section.hidden = true;
   paintPopupResult(status, undefined);
 
-  // A page change clears any pending consent decision. It is never carried over:
-  // consent belongs to the origin the researcher was actually shown.
-  if (scannerConsentPageKey !== undefined && scannerConsentPageKey !== pageKey) {
-    clearScannerConsentPrompt(doc);
-  }
-
   // Bind both buttons to this exact page before anything can be clicked.
   if (page !== undefined) {
     bindPageAction(button, page);
@@ -3732,6 +3879,12 @@ export function renderPageContext(
     scan.hidden = !scannable;
     // ADR-0019's exact visible label; the workspace is what "select" leads to.
     scan.textContent = "Select papers on this page";
+    // This is the authoritative scannability decision and it runs before any
+    // setAcquireButton call, so it is the only safe place to retire the
+    // header's claim on this control. Leaving it set made a stale claim outlive
+    // the offer: on a page with nothing to scan the header stayed visible, took
+    // the Enter target, and a press started a scan.
+    if (!scannable) delete scan.dataset.headerOwned;
   }
   if (scanStatus instanceof HTMLElement) {
     paintPopupResult(
@@ -3745,11 +3898,7 @@ export function renderPageContext(
     !button.hidden ||
     (scan !== undefined && !scan.hidden) ||
     !section.hidden ||
-    (scanStatus instanceof HTMLElement && !scanStatus.hidden) ||
-    (() => {
-      const consent = doc.getElementById("page-bulk-consent");
-      return consent instanceof HTMLElement && !consent.hidden;
-    })();
+    (scanStatus instanceof HTMLElement && !scanStatus.hidden);
 
   if (kind === "pdf") {
     const knownJob = pageDeliveryJob(jobs, { tab_id: page?.tab_id, doi: page?.doi });
@@ -4036,11 +4185,12 @@ export async function refresh(): Promise<void> {
   // synchronous pass. Sections revealing one by one over the next seconds
   // shift later cards mid-aim — a live mis-click hit "Focus" where the
   // leftover-tabs control had been a moment earlier.
-  const [freshActivity, _pulse, freshCounts, delivery, pageMetadata, session, orphanCount, consent, ungranted] =
+  const [freshActivity, _pulse, freshCounts, countMode, delivery, pageMetadata, session, orphanCount, consent, ungranted] =
     await Promise.all([
       readPopupActivity(),
       requestWorkPulse(),
       requestTriageCounts(),
+      readToolbarCountMode(),
       readDeliveryFeedback(store.pendingDelivery),
       readCurrentPageMetadata().catch(() => undefined),
       readSessionForRefresh(),
@@ -4083,7 +4233,19 @@ export async function refresh(): Promise<void> {
   // Pulse owns the liveness classification; counts-v3 owns any decision
   // number shown in the popup header. They intentionally differ for a
   // terminal-job turn that remains actionable in the inbox.
-  renderWorkPulse(document, popupPulseCache, store.connectionStatus, Date.now(), freshCounts);
+  //
+  // The header count is painted FIRST: the pulse card may only treat its own
+  // count line as redundant once the badge is actually carrying that exact
+  // figure, and renderInboxCount is what decides whether it is.
+  const inboxCount = renderInboxCount(document, freshCounts, countMode);
+  renderWorkPulse(
+    document,
+    popupPulseCache,
+    store.connectionStatus,
+    Date.now(),
+    freshCounts,
+    inboxCount.showsExactTurns,
+  );
   if (freshActivity !== undefined) {
     popupActivity = freshActivity.entries;
     await renderPopupCatchup(document, freshActivity);

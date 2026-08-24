@@ -2133,6 +2133,34 @@
                   "required": ["duplicate"]
                 },
                 "then": { "required": ["job_id"] }
+              },
+              {
+                "if": { "required": ["outcome"] },
+                "then": { "required": ["job_id"] }
+              },
+              {
+                "if": {
+                  "properties": { "outcome": { "const": "submitted" } },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "not": {
+                    "properties": { "duplicate": { "const": true } },
+                    "required": ["duplicate"]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "outcome": { "enum": ["already_queued", "already_validated"] }
+                  },
+                  "required": ["outcome"]
+                },
+                "then": {
+                  "required": ["job_id", "duplicate"],
+                  "properties": { "duplicate": { "const": true } }
+                }
               }
             ],
             "properties": {
@@ -2141,6 +2169,9 @@
                 "pattern": "^[A-Za-z0-9_-]{8,128}$"
               },
               "duplicate": { "type": "boolean" },
+              "outcome": {
+                "enum": ["submitted", "already_queued", "already_validated"]
+              },
               "error": {
                 "type": "string",
                 "minLength": 1,

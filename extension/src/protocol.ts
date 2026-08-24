@@ -158,6 +158,9 @@ export interface PageAcquirePayload {
 export interface PageAcquireAckPayload {
   job_id?: string;
   duplicate?: boolean;
+  /** Absent on an older daemon: fall back to `duplicate`, which stays
+   * consistent with this field for exactly that reason. */
+  outcome?: "submitted" | "already_queued" | "already_validated";
   error?: string;
 }
 
@@ -3276,6 +3279,7 @@ function validatePayload(
       requireFields<PageAcquireAckPayload>(p, "page_acquire_ack", {
         job_id: "optional",
         duplicate: "optional",
+        outcome: "optional",
         error: "optional",
       });
       const jobID =
@@ -3299,6 +3303,25 @@ function validatePayload(
       }
       if (duplicate === true && jobID === "") {
         fail("page_acquire_ack.duplicate requires job_id");
+      }
+      if ("outcome" in p) {
+        const outcome = str(p, "outcome", "page_acquire_ack", 32);
+        if (
+          outcome !== "submitted" &&
+          outcome !== "already_queued" &&
+          outcome !== "already_validated"
+        ) {
+          fail(`page_acquire_ack.outcome is invalid: ${JSON.stringify(outcome)}`);
+        }
+        if (outcome === "submitted" && duplicate === true) {
+          fail("page_acquire_ack.outcome submitted cannot be a duplicate");
+        }
+        if (outcome !== "submitted" && duplicate !== true) {
+          fail(`page_acquire_ack.outcome ${outcome} requires duplicate true`);
+        }
+        if (jobID === "") {
+          fail("page_acquire_ack.outcome requires job_id");
+        }
       }
       break;
     }

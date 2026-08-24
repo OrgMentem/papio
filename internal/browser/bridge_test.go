@@ -1831,7 +1831,7 @@ func TestPageAcquireSubmitsNormalizedDOI(t *testing.T) {
 		t.Fatalf("no page_acquire_ack in %v", msgs)
 	}
 	payload := ack.Payload.(*protocol.PageAcquireAckPayload)
-	if payload.JobID == "" || payload.Duplicate || payload.Error != "" {
+	if payload.JobID == "" || payload.Duplicate || payload.Outcome != "submitted" || payload.Error != "" {
 		t.Fatalf("page_acquire_ack = %#v", payload)
 	}
 	row, err := jobs.Get(context.Background(), payload.JobID)
@@ -1907,8 +1907,107 @@ func TestPageAcquireDuplicateSurfacesExistingJob(t *testing.T) {
 	}
 	firstPayload := firstAck.Payload.(*protocol.PageAcquireAckPayload)
 	secondPayload := secondAck.Payload.(*protocol.PageAcquireAckPayload)
-	if firstPayload.JobID == "" || secondPayload.JobID != firstPayload.JobID || !secondPayload.Duplicate {
+	if firstPayload.JobID == "" || firstPayload.Outcome != "submitted" ||
+		secondPayload.JobID != firstPayload.JobID || !secondPayload.Duplicate ||
+		secondPayload.Outcome != "already_queued" {
 		t.Fatalf("duplicate acknowledgements = %#v / %#v", firstPayload, secondPayload)
+	}
+}
+
+func TestPageAcquireOutcomesCoverQueuedValidatedImportedAndRetry(t *testing.T) {
+	acquire := func(t *testing.T, b *Bridge, doi string) *protocol.PageAcquireAckPayload {
+		t.Helper()
+		msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageAcquire, "", protocol.PageAcquirePayload{
+			URL: "https://publisher.example.edu/article/42", DOI: doi,
+		}))
+		ack := firstOfType(msgs, protocol.MsgPageAcquireAck)
+		if ack == nil {
+			t.Fatalf("page_acquire_ack missing: %v", msgs)
+		}
+		return ack.Payload.(*protocol.PageAcquireAckPayload)
+	}
+
+	t.Run("submitted", func(t *testing.T) {
+		b, _, _, _ := newBridge(t)
+		runSync(t, b, hello())
+		got := acquire(t, b, "10.1000/outcome-submitted")
+		if got.Outcome != "submitted" || got.Duplicate || got.JobID == "" {
+			t.Fatalf("submitted acknowledgement = %+v", got)
+		}
+	})
+
+	t.Run("already_queued", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, hello())
+		jobID := bulkJob(t, jobs, "wr_page_acquire_queued", "10.1000/outcome-queued")
+		got := acquire(t, b, "10.1000/outcome-queued")
+		if got.Outcome != "already_queued" || !got.Duplicate || got.JobID != jobID {
+			t.Fatalf("queued acknowledgement = %+v, want job %s", got, jobID)
+		}
+	})
+
+	t.Run("already_validated_ready", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, hello())
+		jobID := bulkReadyJob(t, jobs, "wr_page_acquire_ready", "10.1000/outcome-ready")
+		got := acquire(t, b, "10.1000/outcome-ready")
+		if got.Outcome != "already_validated" || !got.Duplicate || got.JobID != jobID {
+			t.Fatalf("ready acknowledgement = %+v, want job %s", got, jobID)
+		}
+	})
+
+	t.Run("already_validated_imported", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, hello())
+		jobID := bulkReadyJob(t, jobs, "wr_page_acquire_imported", "10.1000/outcome-imported")
+		if err := jobs.Transition(context.Background(), jobID, job.StateReady, job.StateImported, nil); err != nil {
+			t.Fatalf("ready -> imported: %v", err)
+		}
+		got := acquire(t, b, "10.1000/outcome-imported")
+		if got.Outcome != "already_validated" || !got.Duplicate || got.JobID != jobID {
+			t.Fatalf("imported acknowledgement = %+v, want job %s", got, jobID)
+		}
+	})
+
+	t.Run("previously_unavailable_retries", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, hello())
+		unavailableID := bulkUnavailableJob(t, jobs, "wr_page_acquire_unavailable", "10.1000/outcome-retry")
+		got := acquire(t, b, "10.1000/outcome-retry")
+		if got.Outcome != "submitted" || got.Duplicate || got.JobID == "" || got.JobID == unavailableID {
+			t.Fatalf("unavailable retry acknowledgement = %+v, unavailable job %s", got, unavailableID)
+		}
+	})
+}
+
+func TestPageAcquireExistingDOIMismatchReturnsStructuredError(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, hello())
+	request, err := pageAcquireRequest(&protocol.PageAcquirePayload{
+		URL: "https://publisher.example.edu/article/42", DOI: "10.1000/requested",
+	})
+	if err != nil {
+		t.Fatalf("page acquire request: %v", err)
+	}
+	conflictingID, err := jobs.CreateRequest(context.Background(), request.RequestID,
+		work.Work{DOI: "10.1000/other"}, "", "",
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20},
+		nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatalf("seed conflicting request: %v", err)
+	}
+
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgPageAcquire, "", protocol.PageAcquirePayload{
+		URL: "https://publisher.example.edu/article/42", DOI: "10.1000/requested",
+	}))
+	ack := firstOfType(msgs, protocol.MsgPageAcquireAck)
+	if ack == nil {
+		t.Fatalf("page_acquire_ack missing: %v", msgs)
+	}
+	payload := ack.Payload.(*protocol.PageAcquireAckPayload)
+	if payload.Error == "" || !strings.Contains(payload.Error, "canonical DOI mismatch") ||
+		payload.JobID != "" || payload.Duplicate || payload.Outcome != "" {
+		t.Fatalf("mismatched existing acknowledgement = %+v, want structured error for %s", payload, conflictingID)
 	}
 }
 

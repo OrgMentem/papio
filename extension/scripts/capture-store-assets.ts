@@ -129,11 +129,8 @@ const makePopupMock = (state: Record<string, unknown>) => `(() => {
     runtime: {
       getManifest: () => ({ version: ${JSON.stringify(VERSION)}, update_url: "https://clients2.google.com/service/update2/crx" }),
       sendMessage: async (message) => {
-        // Deterministic scanner-consent state: the capture must show the rail's
+        // Deterministic scan state: the capture must show the header control's
         // resting shape, never open a selection workspace mid-screenshot.
-        if (message && message.type === "papio.pageBulk.allowlist.get") {
-          return { ok: true, allowed: true };
-        }
         if (message && message.type === "papio.pageBulk.scan") {
           return { ok: true, scan_id: "scan-capture" };
         }
@@ -162,12 +159,7 @@ const optionsMock = `(() => {
   globalThis.chrome = {
     runtime: {
       getManifest: () => manifest,
-      sendMessage: async (message) => {
-        if (message && message.type === "papio.pageBulk.allowlist.list") {
-          return { ok: true, origins: ["https://journals.example"] };
-        }
-        return {};
-      },
+      sendMessage: async () => ({}),
       openOptionsPage: () => {},
     },
     storage: { local: { get: async (k) => (k === "papio_state_v1" ? { papio_state_v1: store } : {}), set: async () => {} } },

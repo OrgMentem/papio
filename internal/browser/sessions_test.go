@@ -115,7 +115,8 @@ func TestNonHolderStatelessFramesPassAndHandoffFramesBlock(t *testing.T) {
 	msgs, _ := runSyncAs(t, b, sessB, inFrame(t, protocol.MsgPageAcquire, "",
 		map[string]any{"url": "https://journals.example.test/article", "doi": "10.1234/arb-test"}))
 	ack := firstOfType(msgs, protocol.MsgPageAcquireAck)
-	if ack == nil || ack.Payload.(*protocol.PageAcquireAckPayload).JobID == "" {
+	if ack == nil || ack.Payload.(*protocol.PageAcquireAckPayload).JobID == "" ||
+		ack.Payload.(*protocol.PageAcquireAckPayload).Outcome != "submitted" {
 		t.Fatalf("page_acquire from pending session must submit, got %+v", msgs)
 	}
 

@@ -353,7 +353,7 @@ it will act on, DOI included. Everything else about that action — a refusal an
 its remedy, a *which paper is this?* choice, an acquisition already in
 progress — appears in the card below instead, so the icon is never the thing
 reporting a problem. **Select papers on this page** keeps its full label there:
-it is a different, multi-step action with its own consent step.
+it is a different, multi-step action that scans only after you click it.
 
 The inbox keeps itself current without a manual refresh: it updates as soon
 as you return to the tab, and checks in on its own every so often while the

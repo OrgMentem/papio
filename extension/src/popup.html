@@ -148,6 +148,16 @@
         margin-bottom: var(--space-2);
       }
 
+      /* Brand plus the work route. `.brand` keeps its own internal 12px between
+         mark and wordmark; this group owns only the separation between the
+         wordmark and the inbox control, so the two gaps stay independent. */
+      .header-lead {
+        align-items: center;
+        display: flex;
+        gap: var(--space-2);
+        min-width: 0;
+      }
+
       h2,
       p {
         margin: 0;
@@ -228,8 +238,12 @@
 
       .settings-btn {
         align-items: center;
-        background: var(--color-surface);
-        border-color: var(--color-border);
+        /* No fill and no border at rest: these read as bare glyphs beside the
+           wordmark, not as boxed controls. Both come back on hover, so the
+           control still confirms it is a control the moment the pointer is on
+           it, and `:focus-visible`'s outline is unaffected either way. */
+        background: transparent;
+        border-color: transparent;
         border-radius: var(--radius-pill);
         color: var(--color-muted);
         display: inline-flex;
@@ -240,7 +254,25 @@
         width: var(--control-height-compact);
       }
 
+      /* The inbox control widens to hold its count instead of overlaying a
+         corner badge. `width: auto` with a symmetric inline padding keeps the
+         pill silhouette while three digits stay at the label size; the 32px
+         min-height is unchanged, so the row's three controls stay aligned. */
+      .settings-btn.has-count {
+        gap: var(--space-1);
+        padding: 0 10px;
+        width: auto;
+      }
+
+      .header-count {
+        font-size: var(--font-size-label);
+        font-variant-numeric: tabular-nums;
+        font-weight: 600;
+        line-height: 1;
+      }
+
       .settings-btn:hover:not(:disabled) {
+        background: var(--color-surface);
         border-color: var(--color-control-border);
         color: var(--color-ink);
       }
@@ -318,16 +350,10 @@
         overflow-wrap: anywhere;
       }
 
-      /* Compact and start-aligned, deliberately not a full-width primary: the
-         line above it is already the loudest thing in the lens, and a 356px
-         block button would make the route louder than the fact. `width: auto`
-         alone never delivered that — a grid item stretches to its column — and
-         it showed the moment the label stopped being a sentence. */
-      .popup-pulse-review {
-        justify-self: start;
-        margin-top: var(--space-2);
-        width: auto;
-      }
+      /* The count that used to justify a Review button here now rides in the
+         header inbox control, which is the same route. Nothing in this card
+         offers a control any more; when the count is the card's ONLY content
+         renderWorkPulse hides the card outright. */
 
       .launcher {
         display: grid;
@@ -389,33 +415,21 @@
         min-width: 0;
       }
 
-      /* ADR-0019 Decision 2's consent decision, inline and local: it is a
-         researcher action, so it is primary-toned, and it never looks like an
-         error even though it blocks the scan. */
-      .page-consent {
-        border: 1px solid var(--color-primary-border);
-        border-radius: var(--radius-control);
-        background: var(--color-primary-surface);
+      /* The header add control's expansion. An ordinary grid row, deliberately
+         not an overlay: Chrome derives the popup window's height from this
+         document's layout, so an absolutely positioned menu contributes nothing
+         and gets clipped at the window edge on exactly the short single-paper
+         popup this control is for. Growing the document grows the window. */
+      .header-add-menu {
         display: grid;
-        gap: var(--space-2);
-        padding: var(--space-2) var(--space-3);
+        gap: var(--space-1);
+        margin-bottom: var(--space-2);
       }
 
-      .page-consent-message {
-        color: var(--color-primary);
-        font-size: var(--font-size-small);
-        overflow-wrap: anywhere;
-      }
-
-      .page-consent-controls {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--space-2);
-      }
-
-      .page-consent-controls > button {
-        flex: 1 1 auto;
-        min-width: max-content;
+      .header-add-menu > button {
+        justify-content: start;
+        text-align: start;
+        width: 100%;
       }
 
       .page-acquire-live {
@@ -940,32 +954,77 @@
   </head>
   <body>
     <header>
-      <div class="brand">
-        <svg viewBox="0 0 512 512" aria-hidden="true">
-          <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="var(--color-brand-ink)" stroke-width="46" stroke-linecap="round"/>
-          <g transform="translate(264 244) skewX(-10)">
-            <circle cx="0" cy="0" r="68" fill="none" stroke="var(--color-brand-accent)" stroke-width="42"/>
-          </g>
-          <path d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="var(--color-brand-accent)" stroke-width="42" stroke-linecap="round"/>
-          <path d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="var(--color-brand-accent)" stroke="var(--color-brand-accent)" stroke-width="10" stroke-linejoin="round"/>
-        </svg>
-        <span class="brand-name"><em>papio</em></span>
-      </div>
-      <div class="header-actions">
-        <!-- Hoisted out of the rail by hoistIdleAcquire for the one state an
-             icon can carry without loss: one verb, nothing to disambiguate,
-             nothing in flight. Its accessible name is replaced there with the
-             rail control's own full label, DOI included. -->
-        <button id="header-acquire-btn" class="settings-btn header-acquire" type="button" title="Acquire this page" aria-label="Acquire this page" hidden>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <line x1="12" y1="5" x2="12" y2="19"/>
-            <line x1="5" y1="12" x2="19" y2="12"/>
+      <!-- Two groups, not one row of three. The inbox control is navigation to
+           the researcher's OWN queue and carries the popup's most important
+           number, so it reads immediately after the wordmark; `+` acts on this
+           page and the gear configures papio, so they stay together on the
+           right. It also keeps the one variable-width control out from between
+           two fixed 32px circles, which left the right cluster visibly ragged
+           at three digits. -->
+      <div class="header-lead">
+        <div class="brand">
+          <svg viewBox="0 0 512 512" aria-hidden="true">
+            <path d="M 95.0 374.6 A 200 200 0 1 1 243.7 455.6" fill="none" stroke="var(--color-brand-ink)" stroke-width="46" stroke-linecap="round"/>
+            <g transform="translate(264 244) skewX(-10)">
+              <circle cx="0" cy="0" r="68" fill="none" stroke="var(--color-brand-accent)" stroke-width="42"/>
+            </g>
+            <path d="M 208.0 176.0 L 163.2 430.0" fill="none" stroke="var(--color-brand-accent)" stroke-width="42" stroke-linecap="round"/>
+            <path d="M 115.7 416.0 L 215.7 416.0 L 152.6 490.0 Z" fill="var(--color-brand-accent)" stroke="var(--color-brand-accent)" stroke-width="10" stroke-linejoin="round"/>
           </svg>
-        </button>
+          <span class="brand-name"><em>papio</em></span>
+        </div>
         <button id="open-inbox-btn" class="settings-btn" type="button" title="Open inbox" aria-label="Open inbox" aria-describedby="open-inbox-status">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/>
             <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>
+          </svg>
+          <!-- Inside the control, never an overlaid corner badge: an overlay on
+               a 32px circle collides with its neighbour at `--space-1`, and
+               three digits do not fit that circle at any legible size. The
+               control widens instead. The exact figure lives in the button's
+               aria-label and title, so the display cap loses nothing. -->
+          <span id="open-inbox-count" class="header-count" aria-hidden="true" hidden></span>
+        </button>
+      </div>
+      <div class="header-actions">
+        <!-- One control for every "add" this page offers. The rail still owns
+             every acquire STATE (a refusal's remedy, a pending click, an
+             in-flight DOI, a chooser); this is the idle offer only, and its
+             glyph says which offers exist:
+
+               plus    - one specific paper, possibly with a bulk option too
+               layers  - no specific paper, only "everything on this page"
+
+             When both exist the control opens the disclosure row below the
+             header rather than an overlaid menu: Chrome sizes the popup window
+             to its content, so an absolutely positioned menu adds no layout
+             height and is clipped at the window edge. Click and Enter only —
+             never hover, because a browser-action popup opens UNDER the pointer
+             and a hover menu would fire unbidden, then shift the layout beneath
+             the cursor. -->
+        <button id="header-acquire-btn" class="settings-btn header-acquire" type="button" title="Acquire this page" aria-label="Acquire this page" hidden>
+          <svg id="header-acquire-glyph-one" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="12" y1="5" x2="12" y2="19"/>
+            <line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          <!-- Stacked sheets plus a plus: "several of the same thing". A
+               list-shaped glyph was rejected because at 18px its rules are
+               indistinguishable from the inbox tray outline beside it. -->
+          <svg id="header-acquire-glyph-many" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden>
+            <rect x="9" y="9" width="12" height="12" rx="2"/>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            <line x1="15" y1="12" x2="15" y2="18"/>
+            <line x1="12" y1="15" x2="18" y2="15"/>
+          </svg>
+        </button>
+        <!-- Shown only when the page offers BOTH adds. The main control keeps
+             doing the specific one on a single click, so the common case never
+             costs two, and this is the deliberate target for the other option.
+             A separate button rather than a hover zone: a browser-action popup
+             opens UNDER the pointer, so a hover expansion fires unbidden. -->
+        <button id="header-add-more" class="settings-btn header-add-more" type="button" title="More ways to add" aria-label="More ways to add" aria-expanded="false" aria-controls="header-add-menu" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="6 9 12 15 18 9"/>
           </svg>
         </button>
         <button id="settings-btn" class="settings-btn" type="button" title="Settings" aria-label="Settings">
@@ -976,6 +1035,15 @@
         </button>
       </div>
     </header>
+    <!-- Directly under the header so it reads as that control's own expansion,
+         and OUTSIDE it so it is an ordinary grid row: participating in layout
+         is what makes Chrome grow the popup window to include it. The main
+         control already performs the specific add, so this row carries only the
+         other option. A direct handler, never routed through an intermediate
+         step, so the click stays inside the researcher's own gesture. -->
+    <div id="header-add-menu" class="header-add-menu" role="group" aria-label="More ways to add" hidden>
+      <button id="header-add-many" type="button">Add all papers in this tab</button>
+    </div>
     <div id="daemon-status" class="daemon-status" role="status" aria-live="polite" hidden>
       <div id="daemon-status-message" class="daemon-status-message"></div>
       <div id="daemon-status-hint" class="daemon-status-hint"></div>
@@ -997,11 +1065,6 @@
            aria-describedby is read for the description even while display:none
            keeps it out of the reading order, so nobody hears it twice. -->
       <div id="popup-pulse-detail" hidden></div>
-      <!-- The count is the most important fact in this popup and it used to be
-           inert text: the popup told the researcher they were the blocker and
-           then offered them nothing but the current page's two buttons. Same
-           route as the header icon, wired by the same function. -->
-      <button id="popup-pulse-review" class="ghost popup-pulse-review" type="button" hidden></button>
     </section>
     <main>
       <!-- One stable announcer for locally initiated operations. Local result
@@ -1011,9 +1074,12 @@
            separate liveness. -->
       <p id="popup-operation-status" class="visually-hidden" role="status" aria-live="polite"></p>
 
-      <!-- The current-page rail: the popup's reason to exist. Both actions are
-           siblings here so neither hides in the brand header, and the blocker
-           groups below it are capped so none of them can push it off screen. -->
+      <!-- The current-page rail. Both add actions now live in one header
+           control while they are idle offers, so on a single-paper page this
+           section is empty and reserves nothing. It comes back to hold acquire
+           STATE — a refusal and its remedy, a pending click, an in-flight DOI,
+           a chooser, a scan result — which an icon cannot carry. The blocker
+           groups below are capped so none can push it off screen. -->
       <section id="current-page-actions" class="current-page-actions" aria-label="This page" hidden>
         <div class="current-page-controls">
           <button
@@ -1034,13 +1100,6 @@
             aria-describedby="page-bulk-scan-status"
             hidden
           >Select papers on this page</button>
-        </div>
-        <div id="page-bulk-consent" class="page-consent" hidden>
-          <p id="page-bulk-consent-message" class="page-consent-message"></p>
-          <div class="page-consent-controls">
-            <button id="page-bulk-consent-allow" class="primary" type="button" aria-describedby="page-bulk-consent-message">Allow and scan</button>
-            <button id="page-bulk-consent-cancel" type="button">Cancel</button>
-          </div>
         </div>
         <p id="page-bulk-scan-status" class="popup-result" hidden></p>
         <div id="page-acquire" class="page-acquire-feedback" hidden>

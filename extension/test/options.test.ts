@@ -20,7 +20,6 @@ interface OptionsPage {
   containsCalls: string[][];
   grantedOrigins: Set<string>;
   storageValues: Record<string, unknown>;
-  scannerAllowlistOrigins: Set<string>;
   runtimeMessages: Array<{ type: string; request: Record<string, unknown> }>;
   storageGetKeys: string[];
   storageSetKeys: string[];
@@ -30,10 +29,6 @@ interface OptionsPageOptions {
   origins?: readonly string[];
   removeTakesEffect?: boolean;
   pageCaptureConsent?: boolean;
-  scannerAllowlistOrigins?: readonly string[];
-  allowlistSetFails?: Record<string, boolean>;
-  /** Hold an `allowlist.set` open so a genuinely pending row can be observed. */
-  allowlistSetGate?: (origin: string) => Promise<void>;
   storageSetFails?: Set<string>;
   storageGetFails?: Set<string>;
   resolverOrigins?: string[];
@@ -70,7 +65,6 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
   const containsCalls: string[][] = [];
   const grantedOrigins = new Set(options.origins ?? []);
   const removeTakesEffect = options.removeTakesEffect ?? true;
-  const scannerAllowlistOrigins = new Set(options.scannerAllowlistOrigins ?? []);
   const runtimeMessages: Array<{ type: string; request: Record<string, unknown> }> = [];
   const storageGetKeys: string[] = [];
   const storageSetKeys: string[] = [];
@@ -109,24 +103,6 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
         getManifest: () => ({ version: "0.0.0", host_permissions: [] }),
         sendMessage: async (message: { type: string; request?: Record<string, unknown> }) => {
           runtimeMessages.push({ type: message.type, request: message.request ?? {} });
-          if (message.type === "papio.pageBulk.allowlist.list") {
-            return { ok: true, origins: [...scannerAllowlistOrigins].sort() };
-          }
-          if (message.type === "papio.pageBulk.allowlist.set") {
-            const gate = options.allowlistSetGate;
-            if (gate !== undefined) await gate(message.request?.origin as string);
-            const origin = message.request?.origin as string;
-            const allowed = message.request?.allowed as boolean;
-            if (options.allowlistSetFails?.[origin]) {
-              return {
-                ok: false,
-                error: { code: "unavailable", message: "could not revoke page scanning for this site" },
-              };
-            }
-            if (allowed) scannerAllowlistOrigins.add(origin);
-            else scannerAllowlistOrigins.delete(origin);
-            return { ok: true, allowed };
-          }
           return {};
         },
       },
@@ -174,7 +150,6 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
     permissionRemovals,
     containsCalls,
     grantedOrigins,
-    scannerAllowlistOrigins,
     runtimeMessages,
     storageGetKeys,
     storageSetKeys,
@@ -368,108 +343,6 @@ test("persists feedback and interruption settings", async () => {
   expect(page.storageValues["papio_toolbar_count_mode_v1"]).toBe("all");
   expect(page.storageValues["papio_catch_up_enabled_v1"]).toBe(false);
   expect(page.storageValues["papio_success_ack_mode_v1"]).toBe("errors");
-});
-const SCANNER_ALLOWLIST_STORAGE_KEY = "papio_scanner_allowlist_v1";
-
-function scannerRow(document: Document, origin: string): HTMLLIElement | undefined {
-  return sourceRow(document, "scanner-allowlist", origin);
-}
-
-test("scanner allowlist empty state shows the exact sentence and hides the list", async () => {
-  const page = await optionsDocument();
-  const list = page.document.getElementById("scanner-allowlist");
-  const empty = page.document.getElementById("scanner-allowlist-empty") as HTMLElement;
-  expect(list?.hidden).toBe(true);
-  expect(empty.hidden).toBe(false);
-  expect(empty.textContent).toBe("No sites are allowed for page scanning.");
-});
-
-test("scanner allowlist lists each origin with its own Stop allowing control", async () => {
-  const origin = "https://journals.example";
-  const page = await optionsDocument({ scannerAllowlistOrigins: [origin] });
-  const row = scannerRow(page.document, origin);
-  expect(row).toBeDefined();
-  const button = row?.querySelector("button");
-  expect(button?.textContent).toBe("Stop allowing");
-});
-
-test("a scanner allowlist row shows the host once and keeps the exact origin reachable", async () => {
-  const origin = "https://journals.example";
-  const page = await optionsDocument({ scannerAllowlistOrigins: [origin] });
-  const row = scannerRow(page.document, origin);
-
-  expect(row?.querySelector(".source-label")?.textContent).toBe("journals.example");
-  expect(row?.getAttribute("data-tip")).toBe(origin);
-  expect(row?.querySelector(".source-host")?.textContent).toBe(origin);
-  expect(row?.querySelector(".source-host")?.getAttribute("aria-hidden")).toBeNull();
-  expect(row?.querySelector("button")?.getAttribute("aria-label")).toBe(
-    `Stop allowing page scanning on ${origin}`,
-  );
-});
-
-test("successful scanner revocation removes only that row", async () => {
-  const keep = "https://keep.example";
-  const drop = "https://drop.example";
-  const page = await optionsDocument({ scannerAllowlistOrigins: [keep, drop] });
-  const dropRow = scannerRow(page.document, drop);
-  (dropRow?.querySelector("button") as HTMLButtonElement).click();
-  await settle();
-  expect(page.scannerAllowlistOrigins.has(drop)).toBe(false);
-  expect(scannerRow(page.document, drop)).toBeUndefined();
-  expect(scannerRow(page.document, keep)).toBeDefined();
-});
-
-test("failed scanner allowlist.set keeps the row and shows local feedback", async () => {
-  const origin = "https://fail.example";
-  const page = await optionsDocument({
-    scannerAllowlistOrigins: [origin],
-    allowlistSetFails: { [origin]: true },
-  });
-  (scannerRow(page.document, origin)?.querySelector("button") as HTMLButtonElement).click();
-  await settle();
-  expect(scannerRow(page.document, origin)).toBeDefined();
-  const message = page.document.getElementById("scanner-allowlist-message") as HTMLElement;
-  expect(message.hidden).toBe(false);
-  expect(message.getAttribute("data-tone")).toBe("degraded");
-  expect(message.textContent).toContain("could not revoke");
-});
-
-test("a pending scanner revoke disables its own control and leaves the others usable", async () => {
-  const first = "https://first.example";
-  const second = "https://second.example";
-  const held = Promise.withResolvers<void>();
-  const page = await optionsDocument({
-    scannerAllowlistOrigins: [first, second],
-    allowlistSetGate: async (origin) => {
-      if (origin === first) await held.promise;
-    },
-  });
-  const firstButton = scannerRow(page.document, first)?.querySelector("button") as HTMLButtonElement;
-  const secondButton = scannerRow(page.document, second)?.querySelector("button") as HTMLButtonElement;
-  firstButton.click();
-  await settle();
-  // The first row is genuinely in flight and says so.
-  expect(firstButton.disabled).toBe(true);
-  expect(scannerRow(page.document, first)).toBeDefined();
-  expect(secondButton.disabled).toBe(false);
-
-  // The second row must actually work, not merely look enabled: a control that
-  // silently ignores a click is worse than a disabled one.
-  secondButton.click();
-  await settle();
-  expect(scannerRow(page.document, second)).toBeUndefined();
-  expect(scannerRow(page.document, first)).toBeDefined();
-
-  held.resolve();
-  await settle();
-  expect(scannerRow(page.document, first)).toBeUndefined();
-});
-
-test("scanner allowlist management never reads scanner storage directly", async () => {
-  const page = await optionsDocument({ scannerAllowlistOrigins: ["https://journals.example"] });
-  expect(page.storageGetKeys).not.toContain(SCANNER_ALLOWLIST_STORAGE_KEY);
-  expect(page.storageSetKeys).not.toContain(SCANNER_ALLOWLIST_STORAGE_KEY);
-  expect(page.runtimeMessages.some((entry) => entry.type === "papio.pageBulk.allowlist.list")).toBe(true);
 });
 
 test("feedback settings revert and show an error when storage.set rejects", async () => {

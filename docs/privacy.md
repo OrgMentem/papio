@@ -70,7 +70,7 @@ for the full field list.
 
 - **No OrgMentem data collection.** The extension has no backend and does not send data to OrgMentem. It communicates with the local native-messaging host `com.orgmentem.papio`.
 - **No browser credentials.** You enter institutional credentials and complete MFA or CAPTCHA in your browser. The extension does not read, store, or transmit your usernames, passwords, cookies, or session tokens.
-- **No background scraping, and scanning is separately consented.** Page scanning runs only when you click it, reads only the top frame of that one tab, and runs entirely inside the page: identifier detection is local JavaScript, not a network request. Before *papio* reads a page, the page's bare HTTPS origin must already be in a scanning allowlist that is separate from the host permissions used for downloads — granting a publisher page for acquisition never authorizes scanning it. The first scan of a new site asks once and performs no reading until you allow it. You can revoke any site later from the extension's **Page scanning** settings section or from the **Always allow scanning on this site** checkbox in the selection workspace; revoking blocks further reading immediately. Selection acts only on the papers you choose, with a maximum of 200 canonical keys per durable cohort, submitted in bounded chunks. It does not crawl, harvest, or auto-submit pages.
+- **No background scraping, and scanning is explicit.** Page scanning runs only when you click it, reads only the top frame of that one tab, and runs entirely inside the page: identifier detection is local JavaScript, not a network request. Your explicit click is the consent for that one scan; no separate site approval exists. Selection acts only on the papers you choose, with a maximum of 200 canonical keys per durable cohort, submitted in bounded chunks. It does not crawl, harvest, or auto-submit pages.
 - **What a scan sends to the local application.** The scan itself sends nothing. When the selection workspace opens, the detected identifiers (each a `doi`, `pmid`, `arxiv`, or `openalex` kind and value) plus a structural count of visible records go to the **local** *papio* application so it can mark which papers you already own and which are eligible. When you submit, only the canonical keys of the rows you selected are acquired, along with the page's bare lowercase HTTPS origin and the detector name. The short citation label shown beside each row — up to 240 characters of the nearest citation-shaped container's visible text — is display-only and stays in the browser; it is never sent. No page text, path, query, fragment, page title, or credential leaves the browser for a scan.
 - **The host-page action acknowledgement is ephemeral and local.** When a popup action succeeds and transient acknowledgements are set to show for all requests, the extension briefly draws a small chip in the page you acted on. It carries one of four fixed short phrases and nothing else — no identifier, title, URL, provider name, or job id — is not interactive, sends nothing anywhere, stores nothing, and removes itself after three seconds. It reads no page content and installs no watcher or content script.
 - **Focused-surface presence is minimal and local.** The feature-gated `surface_presence_v1` hint carries only an opaque per-instance id, the focused surface type (`popup` or `inbox`), a boolean focused value, and a timestamp. It goes to the local daemon only. It contains no URL, title, tab id, host, identifier, or page content.
@@ -90,11 +90,7 @@ and the ordered canonical keys, together with opaque cohort/chunk bookkeeping
 and timestamps. It never stores a path, query, fragment, page title, or bearer
 value.
 
-The `papio_scanner_allowlist_v1` browser-local record holds only the bare
-lowercase HTTPS origins you have allowed page scanning for — no path, query,
-fragment, page title, or visit history. It is a permission list, not a record of
-where you have been: a site appears only because you allowed it, and removing it
-from **Page scanning** in settings deletes the entry.
+**Browser storage for page scanning.** Page scanning requires an explicit click for each scan. The browser stores only the restart-safe page-bulk cohort record described above, with no path, query, fragment, page title, or bearer value.
 
 **Application storage.** The local application stores papers, metadata, and job
 records in its data directory. Validated PDFs live in `artifacts/`. Downloaded
@@ -136,10 +132,12 @@ only to you and are never transmitted anywhere.
 ## Permissions
 
 Each browser permission is used to perform a requested download, read a page needed
-for that job, or report the result to the local application. For example,
-`nativeMessaging` reaches the local daemon, `downloads` saves the requested PDF, and
-host permissions allow the extension to read library and publisher pages needed for
-a specific job. The extension store listing explains each permission in detail.
+for that job, run an explicit one-shot scan of the current tab, or report the
+result to the local application. For example, `nativeMessaging` reaches the
+local daemon, `downloads` saves the requested PDF, `activeTab` permits the
+top-frame scan only after you click it, and host permissions allow the extension
+to read library and publisher pages needed for a specific job. The extension
+store listing explains each permission in detail.
 
 ## Third parties
 

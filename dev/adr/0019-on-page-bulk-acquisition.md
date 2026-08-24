@@ -1,7 +1,7 @@
 # ADR-0019: On-page bulk acquisition
 
 Status: **Accepted** (2026-08-07; implemented and shipped — the selection
-workspace, allowlisted scanning, and batch submission landed across 0.18.0
+workspace, one-shot scanning, and batch submission landed across 0.18.0
 and 0.19.0, and ADR-0020 later extended the same workspace to PDF tabs).
 Consolidated from the integration consult rounds r3/r4
 (dev/scratch/oracle/) and the maintainer's UX picks.
@@ -85,7 +85,7 @@ is:
 - **no standing all-sites grant** — the scan uses only the ordinary
   `activeTab` grant already implied by clicking the extension action.
 
-## Decision 2: Scanner consent is its own allowlist
+## Decision 2: Scanner consent is its own allowlist (superseded 2026-08-24)
 
 An existing host permission — granted so *papio* can complete a requested
 handoff or run an adapter against a publisher page — is **not** scanner
@@ -100,6 +100,25 @@ identifiers on pages I browse here." Reusing one grant for the other purpose
 is exactly the convenient-signal-mistaken-for-authority failure ADR-0013's
 addenda already record for institution-session evidence; this decision
 avoids repeating it for scanner consent.
+
+## Amendment 2026-08-24: explicit one-shot scanning is consent
+
+The scanner-scoped origin allowlist is removed. This supersedes Decision 2's
+separate per-site consent requirement.
+
+**Justification.** Decision 2 was written against a standing host grant being
+spent ambiently. Decision 1 already forbids ambient scanning: there is no
+persistent scanner, no dynamic content-script registration, no standing
+all-sites grant, and each scan is one shot only. Every scan is an explicit
+per-invocation act on the tab in front of the operator under the temporary
+`activeTab` grant. The explicit click is therefore the scanner consent; a
+separate per-site gate adds no protection and no longer exists.
+
+*papio* is local-only. `scannerConsentPrompt` told the operator, "Identifiers
+found go to your local papio app", and nothing leaves the machine. The scan
+makes no network request; detected identifiers and the structural count go only
+to the local *papio* application when the selection workspace opens, and
+selected canonical keys go there when submitted.
 
 ## Decision 3: Detection is local-only, top-frame, container-scoped
 
@@ -440,13 +459,14 @@ difference from LibKey Nomad"; r3/r4 "Product shape 1").
   boundary, and truncation reporting, and both sides pin the 256 KiB frame
   cap the way `TestSyncRequestFitsMaxBrowserFrame` already pins it for other
   frame types.
-- **Store and privacy docs.** Shipping the scan requires updated Chrome/AMO
-  listing copy, an updated privacy policy describing local detection and
-  what crosses to the local daemon, an options-page explanation of the
-  scanner allowlist (Decision 2), and a permission-use disclosure — the
-  existing privacy text describing "reads library/publisher pages for a
-  specific job, no bulk scraping" no longer describes the product once this
-  ships (r4 §G).
+- **Store and privacy docs.** Shipping the scan required updated Chrome/AMO
+  listing copy, an updated privacy policy describing local detection and what
+  crosses to the local daemon, and a permission-use disclosure — the existing
+  privacy text describing "reads library/publisher pages for a specific job, no
+  bulk scraping" no longer described the product once this shipped (r4 §G).
+  The original scanner-allowlist explanation is superseded by the amendment
+  above; the current privacy text describes explicit per-invocation consent
+  instead.
 - **Extension release.** This is a store-review-bearing release like the
   triage inbox before it (ADR-0001): new UI route, new permission-adjacent
   behavior even without a new manifest permission, and a CWS/AMO review pass

@@ -408,8 +408,6 @@ const PDF_GRAB_CORRELATION_STATES = new Set<string>([
   "grabbed",
   "identifying",
 ]);
-/** ADR-0019 Decision 2: kept separate from acquisition/adapter host grants. */
-const PAGE_BULK_ALLOWLIST_KEY = "papio_scanner_allowlist_v1";
 const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
 const PAGE_CAPTURE_NAV_TIMEOUT_MS = 30_000;
 const TRIAGE_COUNTS_FRESH_MS = 3 * KEEPALIVE_ALARM_MINUTES * 60_000;
@@ -1353,15 +1351,6 @@ export interface BridgeDeps {
     get(): Promise<Record<string, NavigationErrorMarkerEntry>>;
     set(value: Record<string, NavigationErrorMarkerEntry>): Promise<void>;
   };
-  /** Scanner-scoped origin allowlist (chrome.storage.local), kept and
-   * revocable separately from acquisition/adapter host-permission grants
-   * (ADR-0019 Decision 2). An explicit scan click is v1's consent for that
-   * one scan regardless of allowlist membership; this list only records an
-   * "always allow on this site" choice for future ambient features. */
-  scannerAllowlist?: {
-    get(): Promise<string[]>;
-    set(origins: string[]): Promise<void>;
-  };
   /** Toolbar badge for connection health. Kept injectable so bridge logic has
    * no dependency on a particular browser global. */
   action: {
@@ -1601,9 +1590,6 @@ export const INBOX_RUNTIME_MESSAGE_TYPES = [
   "papio.pageBulk.rescan",
   "papio.pageBulk.status",
   "papio.pageBulk.submit",
-  "papio.pageBulk.allowlist.get",
-  "papio.pageBulk.allowlist.set",
-  "papio.pageBulk.allowlist.list",
   "papio.pageBulk.grabPdf",
   "papio.pageBulk.grabStatus",
   "papio.triage.waiting",
@@ -7415,6 +7401,19 @@ export class Bridge {
         duplicate = ack.duplicate === true;
         await this.inboundChain;
         job = findByJob(this.store, ack.job_id);
+        // KNOWN REGRESSION, deliberately left as a clear refusal rather than a
+        // silent data loss. Before `outcome` existed, a terminal ready/imported
+        // job was invisible to this check, so Send PDF created a fresh job and
+        // filed the file. Now it reports duplicate, and this refuses.
+        //
+        // Bypassing the refusal is WORSE: it synthesizes an ActiveJob for a
+        // terminal job, and `parkForBrowserAdoption` rejects terminal states
+        // (internal/app/browser_adopt.go), so `download_complete` returns
+        // ErrAdoptNotAwaiting and the PDF is dropped with no message. A refusal
+        // the researcher can read beats a file that vanishes.
+        //
+        // The real fix is a forced re-submission for this path, which needs a
+        // daemon-side option this change set does not add.
         if (job === undefined && duplicate) {
           return failure(
             "duplicate_not_live",
@@ -10801,15 +10800,8 @@ export class Bridge {
     );
   }
 
-  /** Scan tabID's top frame and persist a fresh snapshot (generation 1).
-   *
-   * ADR-0019 Decision 2: the explicit click *invokes* the scan, but it is not
-   * the consent — the origin must already sit in the separately revocable
-   * scanner allowlist before any DOM is read. `expectedOrigin` is the origin
-   * the popup bound its button to, so a page that navigated between the click
-   * and this call cannot have a different site read under the consent granted
-   * for the bound one. Both checks precede executePageScan; neither may move
-   * below it. */
+  /** Scan the tab's top frame and persist a fresh snapshot (generation 1).
+   * The explicit click is the consent for this one-shot local scan. */
   async runPageBulkScan(
     tabID: number,
     expectedOrigin: string,
@@ -10823,11 +10815,6 @@ export class Bridge {
     }
     if (meta.origin !== expectedOrigin)
       return failure("page_changed", "The source page changed — try again");
-    if (!(await this.scannerOriginAllowed(meta.origin)))
-      return failure(
-        "scanner_consent_required",
-        "Allow scanning on this site before papio reads the page",
-      );
     const scanned = await this.executePageScan(tabID);
     if (!scanned.ok) return scanned;
     const snapshot: PageBulkSnapshotView = {
@@ -10882,18 +10869,12 @@ export class Bridge {
         "tab_unavailable",
         "The source tab is no longer available",
       );
-    // The snapshot's consent was granted for sourceOrigin. A source tab that
-    // has since moved elsewhere must not be read under it, and rebinding the
-    // snapshot to the new site would silently launder that consent.
+    // Keep the snapshot bound to sourceOrigin. A source tab that has since
+    // moved elsewhere must not be scanned under the old snapshot binding.
     if (meta.origin !== existing.sourceOrigin)
       return failure(
         "source_changed",
         "The source tab moved to another site — start a new scan",
-      );
-    if (!(await this.scannerOriginAllowed(meta.origin)))
-      return failure(
-        "scanner_consent_required",
-        "Allow scanning on this site before papio reads the page",
       );
     const scanned = await this.executePageScan(existing.sourceTabId);
     if (!scanned.ok) return scanned;
@@ -11909,59 +11890,6 @@ export class Bridge {
       void this.resumePageBulkCohort(cohortID);
   }
 
-  /** Enforcement read for the scanner-scoped allowlist (ADR-0019 Decision 2).
-   * A missing dep means there is no storage that could hold consent, so this
-   * fails closed: no consent record, no scan. Distinct from
-   * pageBulkAllowlistContains only in intent — this one gates DOM reads and
-   * must never be relaxed into "assume allowed when unknown". */
-  private async scannerOriginAllowed(origin: string): Promise<boolean> {
-    if (this.deps.scannerAllowlist === undefined) return false;
-    if (!isBareHTTPSOrigin(origin)) return false;
-    try {
-      return (await this.deps.scannerAllowlist.get()).includes(origin);
-    } catch {
-      return false;
-    }
-  }
-
-  /** Membership read/write for the scanner-scoped allowlist (Decision 2).
-   * Absent dep degrades to "never allowlisted" rather than throwing. */
-  async pageBulkAllowlistContains(
-    origin: string,
-  ): Promise<BrokerReply<{ allowed: boolean }>> {
-    if (this.deps.scannerAllowlist === undefined)
-      return { ok: true, allowed: false };
-    const origins = await this.deps.scannerAllowlist.get();
-    return { ok: true, allowed: origins.includes(origin) };
-  }
-
-  /** Full allowlist enumeration for the Options revocation section. Options is
-   * the only sender permitted to read the whole list; the workspace and popup
-   * ask about one origin they already know. Sorted so the section renders
-   * stably across reads. */
-  async pageBulkAllowlistList(): Promise<BrokerReply<{ origins: string[] }>> {
-    if (this.deps.scannerAllowlist === undefined)
-      return { ok: true, origins: [] };
-    const origins = await this.deps.scannerAllowlist.get();
-    return {
-      ok: true,
-      origins: [...new Set(origins.filter(isBareHTTPSOrigin))].sort(),
-    };
-  }
-
-  async setPageBulkAllowlist(
-    origin: string,
-    allowed: boolean,
-  ): Promise<BrokerReply<{ allowed: boolean }>> {
-    if (this.deps.scannerAllowlist === undefined)
-      return { ok: true, allowed: false };
-    const origins = await this.deps.scannerAllowlist.get();
-    const next = allowed
-      ? [...origins.filter((o) => o !== origin), origin]
-      : origins.filter((o) => o !== origin);
-    await this.deps.scannerAllowlist.set(next);
-    return { ok: true, allowed };
-  }
 
   async requestTriageDecision(request: {
     item_id: string;
@@ -15720,6 +15648,18 @@ export class Bridge {
             ...(typeof msg.payload.duplicate === "boolean"
               ? { duplicate: msg.payload.duplicate }
               : {}),
+            // `outcome` MUST be forwarded, not just validated: the popup's
+            // third copy ("papio already has a validated artifact") is its only
+            // consumer, and dropping it here made that branch dead while every
+            // unit test still passed, because each side was tested alone.
+            // Narrowed rather than cast: the parser already refused any other
+            // value, so an unexpected one means the two sides disagree, and the
+            // field is better absent than wrong.
+            ...(msg.payload.outcome === "submitted" ||
+            msg.payload.outcome === "already_queued" ||
+            msg.payload.outcome === "already_validated"
+              ? { outcome: msg.payload.outcome }
+              : {}),
             ...(typeof msg.payload.error === "string"
               ? { error: msg.payload.error }
               : {}),
@@ -19450,6 +19390,7 @@ export class Bridge {
                 outcome: "ui_changed",
                 adapter_id: spec.id,
                 adapter_version: av,
+                ...(reported === undefined ? {} : { host: reported }),
                 ...(detail === undefined ? {} : { detail }),
               },
               jobID,
@@ -20610,27 +20551,6 @@ function isPageBulkSender(
   }
 }
 
-function isOptionsSender(
-  sender: InboxRuntimeSender,
-  urls: InboxRuntimeURLs,
-): boolean {
-  return sender.id === urls.runtimeID && sender.url === urls.optionsURL;
-}
-
-/** The three *papio* pages that may ask about scanner consent: the popup owns
- * the first-scan prompt, the workspace owns its per-site checkbox, and Options
- * owns revocation. Inbox, history, content scripts, and foreign extension ids
- * are not among them. */
-function isScannerConsentSender(
-  sender: InboxRuntimeSender,
-  urls: InboxRuntimeURLs,
-): boolean {
-  return (
-    isPopupSender(sender, urls) ||
-    isPageBulkSender(sender, urls) ||
-    isOptionsSender(sender, urls)
-  );
-}
 
 // Stats is a read consumed by the popup summary and the history page as well
 // as the inbox, so it accepts any of papio's own extension pages — never a
@@ -20874,9 +20794,8 @@ function isGrabConfirmRuntimeRequest(
 }
 
 /** `expected_origin` is the bare HTTPS origin the popup bound its scan button
- * to. It is required, not optional: without it the background cannot tell a
- * scan of the page the researcher consented to from a scan of whatever the tab
- * navigated to afterwards. */
+ * to. It is required, not optional: without it the background cannot bind the
+ * scan to the page shown when the operator clicked the button. */
 function isPageBulkScanRuntimeRequest(
   value: unknown,
 ): value is { tab_id: number; expected_origin: string } {
@@ -21027,26 +20946,6 @@ function isPageBulkSubmitRuntimeRequest(value: unknown): value is {
   return isPageBulkSubmitSource(value["source"]);
 }
 
-function isPageBulkAllowlistGetRuntimeRequest(
-  value: unknown,
-): value is { origin: string } {
-  return (
-    isObjectRecord(value) &&
-    hasOnlyKeys(value, ["origin"]) &&
-    isBareHTTPSOrigin(value["origin"])
-  );
-}
-
-function isPageBulkAllowlistSetRuntimeRequest(
-  value: unknown,
-): value is { origin: string; allowed: boolean } {
-  return (
-    isObjectRecord(value) &&
-    hasOnlyKeys(value, ["origin", "allowed"]) &&
-    isBareHTTPSOrigin(value["origin"]) &&
-    typeof value["allowed"] === "boolean"
-  );
-}
 
 function isHandoffOpenRuntimeRequest(
   value: unknown,
@@ -21444,57 +21343,6 @@ export async function handleInboxRuntimeMessage(
       return failure("invalid_request", "Invalid page-bulk submit request");
     }
     return bridge.requestPageBulkSubmit(request);
-  }
-  if (type === "papio.pageBulk.allowlist.get") {
-    if (!isScannerConsentSender(sender, urls)) {
-      return failure(
-        "unauthorized",
-        "This sender cannot read the scanner allowlist",
-      );
-    }
-    const request = message["request"];
-    if (
-      !hasOnlyKeys(message, ["type", "request"]) ||
-      !isPageBulkAllowlistGetRuntimeRequest(request)
-    ) {
-      return failure("invalid_request", "Invalid scanner allowlist request");
-    }
-    return bridge.pageBulkAllowlistContains(request.origin);
-  }
-  if (type === "papio.pageBulk.allowlist.set") {
-    if (!isScannerConsentSender(sender, urls)) {
-      return failure(
-        "unauthorized",
-        "This sender cannot change the scanner allowlist",
-      );
-    }
-    const request = message["request"];
-    if (
-      !hasOnlyKeys(message, ["type", "request"]) ||
-      !isPageBulkAllowlistSetRuntimeRequest(request)
-    ) {
-      return failure("invalid_request", "Invalid scanner allowlist request");
-    }
-    return bridge.setPageBulkAllowlist(request.origin, request.allowed);
-  }
-  if (type === "papio.pageBulk.allowlist.list") {
-    // Options only: the popup and workspace ask about the one origin in front
-    // of them, so nothing else needs — or gets — the whole consent list.
-    if (!isOptionsSender(sender, urls)) {
-      return failure(
-        "unauthorized",
-        "This sender cannot list the scanner allowlist",
-      );
-    }
-    const request = message["request"];
-    if (
-      !hasOnlyKeys(message, ["type", "request"]) ||
-      !isObjectRecord(request) ||
-      !hasOnlyKeys(request, [])
-    ) {
-      return failure("invalid_request", "Invalid scanner allowlist request");
-    }
-    return bridge.pageBulkAllowlistList();
   }
   if (type === "papio.pageBulk.grabPdf") {
     if (!isPageBulkSender(sender, urls))
@@ -21976,30 +21824,6 @@ function realDeps(): BridgeDeps {
         });
       },
     },
-    scannerAllowlist: {
-      // This list is a consent record that gates DOM reads, so storage is
-      // never taken as authority for its own shape: a legacy, hand-edited, or
-      // corrupted entry that is not a bare HTTPS origin cannot become a grant.
-      // Deduplicated and sorted so every consumer — enforcement, the Options
-      // list, and the workspace checkbox — sees one canonical order.
-      async get() {
-        try {
-          const got = await chrome.storage.local.get(PAGE_BULK_ALLOWLIST_KEY);
-          const stored = got[PAGE_BULK_ALLOWLIST_KEY];
-          if (!Array.isArray(stored)) return [];
-          return [...new Set(stored.filter(isBareHTTPSOrigin))].sort();
-        } catch {
-          return [];
-        }
-      },
-      async set(origins) {
-        await chrome.storage.local.set({
-          [PAGE_BULK_ALLOWLIST_KEY]: [
-            ...new Set(origins.filter(isBareHTTPSOrigin)),
-          ].sort(),
-        });
-      },
-    },
     action: {
       setBadgeText: (details) => chrome.action.setBadgeText(details),
       setBadgeBackgroundColor: (details) =>
@@ -22058,7 +21882,13 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   // Chrome leaves the worker dead (and the daemon unreachable) until an
   // unrelated tab or download event happens to fire. bridge.start() already
   // ran at module top level by then; the callbacks need no body.
-  chrome.runtime.onStartup.addListener(() => {});
+  chrome.runtime.onStartup.addListener(() => {
+    // Remove the scanner-consent allowlist left by older extension versions.
+    // This is cleanup only; no live code reads or writes the old key.
+    void chrome.storage.local
+      .remove("papio_scanner_allowlist_v1")
+      .catch(() => {});
+  });
   chrome.runtime.onInstalled.addListener(() => {});
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (isObjectRecord(message) && isInboxRuntimeMessageType(message["type"])) {

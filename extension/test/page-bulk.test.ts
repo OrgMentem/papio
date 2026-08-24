@@ -29,14 +29,13 @@ async function settle(): Promise<void> {
 
 /** Orphan the previous fixture's module instance before this one takes over.
  *
- * page-bulk starts un-awaited chains (loadStatus, loadAllowlist) whose
- * continuations can outlive the previous test's final settle(). Because the
- * module reads `chrome` off the global at call time, such a continuation would
- * otherwise reach the NEXT fixture's stub and push a stray entry into its
- * request log, failing an unrelated test. Swapping in a quarantine stub and
- * draining microtasks lets those stragglers finish somewhere harmless. Replies
- * are deliberately NOT awaited here: several fixtures hold one pending on
- * purpose to observe in-flight UI state. */
+ * page-bulk starts an un-awaited loadStatus chain whose continuation can outlive
+ * the previous test's final settle(). Because the module reads `chrome` off the
+ * global at call time, such a continuation would otherwise reach the NEXT
+ * fixture's stub and push a stray entry into its request log. Swapping in a
+ * quarantine stub and draining microtasks lets those stragglers finish somewhere
+ * harmless. Replies are deliberately NOT awaited here: several fixtures hold
+ * one pending on purpose to observe in-flight UI state. */
 async function orphanPreviousFixture(): Promise<void> {
   Object.assign(globalThis, {
     chrome: {
@@ -208,15 +207,12 @@ function eligibleStatus(localId: string, canonicalKey?: string): FixtureStatusIt
 }
 
 /** Standard reply router: load returns `snap`, status returns `items`
- * (defaulting to "eligible" for every item in `snap` when omitted),
- * allowlist reads back `allowed`. */
-function standardReply(snap: FixtureSnapshot, items?: FixtureStatusItem[], allowed = false): Reply {
+ * (defaulting to "eligible" for every item in `snap` when omitted). */
+function standardReply(snap: FixtureSnapshot, items?: FixtureStatusItem[]): Reply {
   const statusItems = items ?? snap.items.map((item) => eligibleStatus(item.localId));
   return (message) => {
     if (message.type === "papio.pageBulk.load") return { ok: true, snapshot: snap };
     if (message.type === "papio.pageBulk.status") return { ok: true, items: statusItems, truncated: false };
-    if (message.type === "papio.pageBulk.allowlist.get") return { ok: true, allowed };
-    if (message.type === "papio.pageBulk.allowlist.set") return { ok: true, allowed: message.request["allowed"] };
     return { ok: false, error: { code: "unexpected", message: `unexpected message ${message.type}` } };
   };
 }
@@ -246,8 +242,6 @@ test("loads the snapshot, binds the header (title/origin/timestamp), and sets do
     scan_id: "scan-1",
     identifiers: [{ local_id: "id-1", kind: "doi", value: "10.1234/abcd.5678" }],
   });
-  const allowlistRequest = page.requests.find((r) => r.type === "papio.pageBulk.allowlist.get");
-  expect(allowlistRequest?.request).toEqual({ origin: "https://scholar.example.edu" });
 });
 
 test("a snapshot with a rendered-record hint attaches it to the status request; a null hint sends nothing", async () => {
@@ -941,7 +935,7 @@ test("a status lookup failure shows the retry banner; Retry re-sends the request
       if (statusAttempts === 1) return { ok: false, error: { code: "unavailable", message: "status failed" } };
       return { ok: true, items: [eligibleStatus("id-1")], truncated: false };
     }
-    return { ok: true, allowed: false };
+    return { ok: false, error: { code: "unexpected", message: `unexpected message ${message.type}` } };
   });
 
   expect(page.document.getElementById("status-error")?.hidden).toBe(false);
@@ -973,115 +967,6 @@ test("an empty snapshot shows the empty state and disables the primary button", 
   expect(primary.disabled).toBe(true);
 });
 
-// --- scanner allowlist -----------------------------------------------------
-
-test("the allowlist checkbox reflects background state and persists a change", async () => {
-  const snap = snapshot();
-  const page = await pageBulkDocument("scan-1", standardReply(snap, [eligibleStatus("id-1")], true));
-  const box = page.document.getElementById("allowlist-checkbox") as HTMLInputElement;
-  expect(box.checked).toBe(true);
-
-  box.checked = false;
-  box.dispatchEvent(new Event("change", { bubbles: true }));
-  await settle();
-
-  const setRequest = page.requests.find((r) => r.type === "papio.pageBulk.allowlist.set");
-  expect(setRequest?.request).toEqual({ origin: "https://scholar.example.edu", allowed: false });
-  expect(box.checked).toBe(false);
-});
-
-test("the allowlist checkbox is disabled while its set request is pending", async () => {
-  const snap = snapshot();
-  let resolveSet: (value: unknown) => void = () => undefined;
-  const setPending = new Promise<unknown>((resolve) => {
-    resolveSet = resolve;
-  });
-  const page = await pageBulkDocument("scan-1", (message) => {
-    if (message.type === "papio.pageBulk.allowlist.set") return setPending;
-    return standardReply(snap, [eligibleStatus("id-1")], true)(message);
-  });
-  const box = page.document.getElementById("allowlist-checkbox") as HTMLInputElement;
-  expect(box.checked).toBe(true);
-
-  box.checked = false;
-  box.dispatchEvent(new Event("change", { bubbles: true }));
-  await settle();
-
-  expect(box.disabled).toBe(true);
-  expect(box.checked).toBe(true);
-
-  resolveSet({ ok: true, allowed: false });
-  await settle();
-
-  expect(box.disabled).toBe(false);
-  expect(box.checked).toBe(false);
-});
-
-test("a failed allowlist set reverts the checkbox and shows a row-local error", async () => {
-  const snap = snapshot();
-  const page = await pageBulkDocument("scan-1", (message) => {
-    if (message.type === "papio.pageBulk.allowlist.set") {
-      return { ok: false, error: { code: "internal", message: "Could not save scanner consent" } };
-    }
-    return standardReply(snap, [eligibleStatus("id-1")], true)(message);
-  });
-  const box = page.document.getElementById("allowlist-checkbox") as HTMLInputElement;
-  const message = page.document.getElementById("allowlist-message");
-
-  box.checked = false;
-  box.dispatchEvent(new Event("change", { bubbles: true }));
-  await settle();
-
-  expect(box.checked).toBe(true);
-  expect(message?.hidden).toBe(false);
-  expect(message?.textContent).toBe("Could not save scanner consent");
-});
-
-test("a scanner_consent_required rescan keeps the snapshot and refuses without a second rescan until consent returns", async () => {
-  const snap = snapshot();
-  let rescanCalls = 0;
-  const page = await pageBulkDocument("scan-1", (message) => {
-    if (message.type === "papio.pageBulk.rescan") {
-      rescanCalls += 1;
-      if (rescanCalls === 1) {
-        return {
-          ok: false,
-          error: {
-            code: "scanner_consent_required",
-            message: "Allow scanning on this site before papio reads the page",
-          },
-        };
-      }
-      return { ok: true, snapshot: { ...snap, documentGeneration: 2, items: snap.items } };
-    }
-    if (message.type === "papio.pageBulk.allowlist.set") {
-      return { ok: true, allowed: message.request["allowed"] === true };
-    }
-    return standardReply(snap, [eligibleStatus("id-1")], false)(message);
-  });
-
-  expect(row(page.document, "id-1")).not.toBeNull();
-  const rescanButton = page.document.getElementById("rescan-btn") as HTMLButtonElement;
-  rescanButton.click();
-  await settle();
-
-  expect(rescanCalls).toBe(1);
-  expect(row(page.document, "id-1")).not.toBeNull();
-  expect(page.document.getElementById("status-error-message")?.textContent).toContain(
-    "Allow scanning on this site before papio reads the page",
-  );
-
-  const box = page.document.getElementById("allowlist-checkbox") as HTMLInputElement;
-  box.checked = true;
-  box.dispatchEvent(new Event("change", { bubbles: true }));
-  await settle();
-
-  rescanButton.click();
-  await settle();
-
-  expect(rescanCalls).toBe(2);
-  expect(page.document.getElementById("status-error")?.hidden).toBe(true);
-});
 
 test("a source_changed rescan shows its detail and hides Rescan without rebinding", async () => {
   const snap = snapshot();

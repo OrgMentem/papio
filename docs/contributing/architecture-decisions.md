@@ -210,9 +210,9 @@ ADR-0010 also makes the daemon-wide `access_mode` a ceiling: a per-request `acce
 
 **Context:** A person looking at a page with many citations — a reference list, a syllabus, a table of contents — can visually pick out which ones matter in a way neither the CLI nor an automated crawl can. An early draft of this feature proposed a persistent, always-on content-script scanner watching every granted page for citations; that mechanism is rejected in favor of an explicit, one-shot scan.
 
-**Decision:** ADR-0019 proposes a popup action that runs a single scan of the current tab only when clicked, with no persistent scanner, no page-mutation watcher, and no badge count. Detected identifiers open a dedicated selection workspace, reusing the full-tab pattern from ADR-0001, where a person chooses which papers to submit as one ordinary batch under the same cap any other batch submission uses. An existing host permission granted for one publisher page does not by itself authorize scanning; scanning has its own separate, revocable consent.
+**Decision:** ADR-0019 proposes a popup action that runs a single scan of the current tab only when clicked, with no persistent scanner, no page-mutation watcher, and no badge count. Detected identifiers open a dedicated selection workspace, reusing the full-tab pattern from ADR-0001, where a person chooses which papers to submit as one ordinary batch under the same cap any other batch submission uses. The explicit click is the scan's consent; an existing host permission does not create any ambient scanning authority.
 
-**Why:** The feature's unique value is a human's visual selection, not ambient detection, so the design deliberately stays invoked-only and reuses *papio*'s existing batch-submission and consent machinery rather than adding a second, browser-only acquisition policy.
+**Why:** The feature's unique value is a human's visual selection, not ambient detection, so the design deliberately stays invoked-only. The explicit click supplies consent, and the local-only scan adds no browser-only acquisition policy.
 
 ## Grabbing the PDF you are already reading
 

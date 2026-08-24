@@ -1312,6 +1312,7 @@ type PageAcquirePayload struct {
 type PageAcquireAckPayload struct {
 	JobID     string `json:"job_id,omitempty"`
 	Duplicate bool   `json:"duplicate,omitempty"`
+	Outcome   string `json:"outcome,omitempty"`
 	Error     string `json:"error,omitempty"`
 }
 
@@ -2752,7 +2753,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		msg.Payload = p
 	case MsgPageAcquireAck:
 		p := &PageAcquireAckPayload{}
-		err = browserRejectNullFields(payloadFields, "job_id", "duplicate", "error")
+		err = browserRejectNullFields(payloadFields, "job_id", "duplicate", "outcome", "error")
 		if err == nil {
 			err = strictDecode(env.Payload, p)
 		}
@@ -2761,6 +2762,12 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 				err = fmt.Errorf("page_acquire_ack.job_id must be non-empty")
 			} else if _, ok := payloadFields["error"]; ok && p.Error == "" {
 				err = fmt.Errorf("page_acquire_ack.error must be non-empty")
+			} else if _, ok := payloadFields["outcome"]; ok && p.Outcome == "" {
+				// `omitempty` erases the difference between absent and empty
+				// after decode, so an explicit "" must be refused HERE or this
+				// side would accept a frame the TS parser and the JSON schema
+				// both reject.
+				err = fmt.Errorf("page_acquire_ack.outcome must be non-empty")
 			}
 		}
 		if err == nil {
@@ -2917,7 +2924,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 	case MsgProviderOutcome:
 		p := &ProviderOutcomePayload{}
 		if err = browserRequireFields(payloadFields, "outcome"); err == nil {
-			err = browserRejectNullFields(payloadFields, "adapter_id", "adapter_version", "detail")
+			err = browserRejectNullFields(payloadFields, "adapter_id", "adapter_version", "detail", "host")
 		}
 		if err == nil {
 			err = strictDecode(env.Payload, p)
@@ -4255,8 +4262,26 @@ func (p *PageAcquireAckPayload) validate() error {
 	if browserHasNUL(p.Error) {
 		return fmt.Errorf("page_acquire_ack.error cannot contain NUL")
 	}
+	switch p.Outcome {
+	case "", "submitted":
+		if p.Outcome == "submitted" && p.Duplicate {
+			return fmt.Errorf("page_acquire_ack.submitted outcome cannot be duplicate")
+		}
+	case "already_queued", "already_validated":
+		if !p.Duplicate {
+			return fmt.Errorf("page_acquire_ack.%s outcome requires duplicate", p.Outcome)
+		}
+	default:
+		return fmt.Errorf("page_acquire_ack.outcome is invalid")
+	}
 	if p.Duplicate && !hasJobID {
 		return fmt.Errorf("page_acquire_ack.duplicate requires job_id")
+	}
+	// An error ack carries no outcome: the bridge leaves it absent on that path,
+	// and the TS parser refuses `outcome` without `job_id` unconditionally, so
+	// accepting it here would let a frame through that the extension rejects.
+	if p.Outcome != "" && !hasJobID {
+		return fmt.Errorf("page_acquire_ack.outcome requires job_id")
 	}
 	return nil
 }

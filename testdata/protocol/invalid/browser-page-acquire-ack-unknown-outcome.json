@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"page_acquire_ack","msg_id":"page-acquire-ack-unknown-outcome","seq":2,"payload":{"job_id":"job_page_acquire_008","outcome":"unknown"}}

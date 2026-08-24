@@ -31,7 +31,7 @@ This extension is papio's browser half: it runs the institutional OpenURL handof
 
 What makes it different:
 - No credentials stored, no bulk scraping. papio never keeps your institution logins, and it fetches only the papers you explicitly request — one at a time — never mass-downloading from publishers.
-- Page scanning is separate, invoked, and revocable. When you ask papio to find papers on a page, it reads only the top frame of that one tab, only after you have allowed that specific site for scanning. That permission is separate from the site access used for downloads, is listed per site in papio's settings, and can be revoked there at any time. Detection runs inside the page; the identifiers it found go only to the local papio app, and only the papers you select are acquired.
+- Page scanning happens only when you ask, one page at a time. When you ask papio to find papers on a page, it reads only the top frame of that one tab, only at the moment you click, and never in the background. Detection runs inside the page; the identifiers it found go only to the local papio app, and only the papers you select are acquired.
 - Your real session, not a bot. Native messaging and extension APIs only — no WebDriver, no CDP, no stealth — so your browser never looks automated.
 - Validated before trusted. Every candidate PDF is checked for structure and identity; anything ambiguous parks for your review instead of importing the wrong paper.
 - Built for AI agents. papio runs as an MCP server, so an assistant can drive the whole workflow.
@@ -47,12 +47,11 @@ Docs: https://orgmentem.github.io/papio/
   locally running *papio* acquisition daemon.
 - **Data collection:** None. Declare that the extension does **not** collect or
   transmit user data. It communicates only with a local native-messaging host.
-- **Page scanning:** Invoked only by an explicit click, top frame only, and gated
-  on a per-site scanning allowlist that is separate from download host access and
-  revocable per site in the extension's **Page scanning** settings. Detection is
-  local page JavaScript; the detected identifiers and the page's bare origin go
-  only to the local *papio* application, and the display-only citation labels
-  never leave the browser.
+- **Page scanning:** Invoked only by an explicit click, top frame only, with no
+  standing access — no persistent scanner, no dynamically registered content
+  script, and no all-sites grant. Detection is local page JavaScript; the
+  detected identifiers and the page's bare origin go only to the local *papio*
+  application, and the display-only citation labels never leave the browser.
 - **Host-page acknowledgement:** After a successful popup action, and only when
   transient acknowledgements are set to all requests, a three-second
   noninteractive chip is drawn in the acted-on page. It carries one of four fixed
@@ -72,7 +71,7 @@ Docs: https://orgmentem.github.io/papio/
 | `downloads` | Performs the single requested PDF download per acquisition job. |
 | `tabs` / `activeTab` | Opens and manages the one handoff tab and correlates the download with the job. |
 | `tabGroups` | Groups the handoff tab into a collapsed "papio" tab group in the user's own window, so a provider sign-in/download flow stays visually separate from their own tabs. |
-| `scripting` | Runs a small routine on the current page to locate the requested paper's download link, to detect paper identifiers when the user clicks "Select papers on this page" for a site they have allowed for scanning, and to draw a three-second, noninteractive confirmation chip in the page after a popup action succeeds. |
+| `scripting` | Runs a small routine on the current page to locate the requested paper's download link, to detect paper identifiers when the user explicitly starts a scan, and to draw a three-second, noninteractive confirmation chip in the page after a popup action succeeds. |
 | `storage` | Stores extension settings and short-lived job/tab state across service-worker suspension. |
 | `alarms` | Schedules reconnect backoff to the local daemon without a persistently awake service worker. |
 | Host permissions (library resolver domains) | Read the library discovery/resolver pages needed to route a job to the right licensed source. |

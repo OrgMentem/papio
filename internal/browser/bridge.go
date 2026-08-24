@@ -5442,11 +5442,22 @@ func (b *Bridge) pageAcquire(ctx context.Context, payload *protocol.PageAcquireP
 	if err != nil {
 		return b.pageAcquireError(err)
 	}
-	if existing, err := b.liveJobForRequest(ctx, request.RequestID); err != nil {
+	liveJobID, validatedJobID, _, err := b.canonicalJobStatus(ctx, "doi", request.Identifiers.DOI)
+	if err != nil {
 		return b.pageAcquireError(err)
-	} else if existing != "" {
+	}
+	if liveJobID != "" {
 		ack, err := b.frame(protocol.MsgPageAcquireAck, "", protocol.PageAcquireAckPayload{
-			JobID: existing, Duplicate: true,
+			JobID: liveJobID, Duplicate: true, Outcome: "already_queued",
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{ack}, nil
+	}
+	if validatedJobID != "" {
+		ack, err := b.frame(protocol.MsgPageAcquireAck, "", protocol.PageAcquireAckPayload{
+			JobID: validatedJobID, Duplicate: true, Outcome: "already_validated",
 		})
 		if err != nil {
 			return nil, err
@@ -5456,11 +5467,46 @@ func (b *Bridge) pageAcquire(ctx context.Context, payload *protocol.PageAcquireP
 	// The browser session ID is in-memory transport state, not durable user
 	// identity. Persist the explicit unknown principal until a durable,
 	// non-secret multi-user identity is available at this boundary.
-	jobID, err := b.svc.SubmitAs(ctx, job.PrincipalUnknown, request)
+	result, err := b.svc.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, request, app.SubmitOptions{})
 	if err != nil {
 		return b.pageAcquireError(err)
 	}
-	ack, err := b.frame(protocol.MsgPageAcquireAck, "", protocol.PageAcquireAckPayload{JobID: jobID})
+	if result.Existing {
+		existing, err := b.jobs.Get(ctx, result.JobID)
+		if err != nil {
+			return b.pageAcquireError(err)
+		}
+		if existing.Work.DOI != request.Identifiers.DOI {
+			return b.pageAcquireError(fmt.Errorf(
+				"page acquire existing job canonical DOI mismatch: got %q, want %q",
+				existing.Work.DOI, request.Identifiers.DOI,
+			))
+		}
+		ack, err := b.frame(protocol.MsgPageAcquireAck, "", protocol.PageAcquireAckPayload{
+			JobID: result.JobID, Duplicate: true, Outcome: "already_queued",
+		})
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{ack}, nil
+	}
+	// The preflight cannot close the window between itself and the submit: another
+	// route can reach ready/imported in between, and canonical dedupe skips
+	// terminal states so `Existing` never reports it. Recheck rather than claim a
+	// bare "submitted" about a paper papio has already validated.
+	//
+	// The newly created job is still returned and still legitimate — papio
+	// supports re-acquisition, and `liveJobForCanonicalWork` skipping terminals
+	// is what makes that possible. Only the OUTCOME is corrected, so the
+	// researcher learns papio already holds a validated copy.
+	outcome := "submitted"
+	if _, revalidated, _, statusErr := b.canonicalJobStatus(ctx, "doi", request.Identifiers.DOI); statusErr == nil &&
+		revalidated != "" {
+		outcome = "already_validated"
+	}
+	ack, err := b.frame(protocol.MsgPageAcquireAck, "", protocol.PageAcquireAckPayload{
+		JobID: result.JobID, Duplicate: outcome != "submitted", Outcome: outcome,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -5875,42 +5921,49 @@ func normalizePageBulkIdentifier(kind, value string) (string, string, error) {
 // canonicalJobStatus looks up the given canonical identity directly against
 // the jobs/identifiers tables the bridge already reaches (the same join
 // liveJobForCanonicalWork uses internally in internal/job, unexported there).
-// The most recent live job wins; failing that, the most recent READY job —
-// papio's own validated bundle is the strongest artifact-present claim there
-// is, and the only one that exists under a zotio configuration, where the
-// generic holdings registry is deliberately empty (ADR-0008: zotio and
-// generic sources never mix) and every external lookup honestly reports
+// Each status class gets its own bounded probe. A global LIMIT could hide an
+// older live job behind newer terminal history for other request IDs.
+//
+// The most recent live job wins; failing that, the most recent READY or
+// IMPORTED job — papio's own validated bundle is the strongest artifact-present
+// claim there is, and the only one that exists under a zotio configuration,
+// where the generic holdings registry is deliberately empty (ADR-0008: zotio
+// and generic sources never mix) and every external lookup honestly reports
 // incomplete; failing that, any past terminal "unavailable" verdict
 // (ADR-0019 Decision 5).
 func (b *Bridge) canonicalJobStatus(ctx context.Context, kind, value string) (liveJobID, readyJobID string, previouslyUnavailable bool, err error) {
-	rows, err := b.jobs.S.DB().QueryContext(ctx, `
-		SELECT j.id, j.state FROM jobs j
-		JOIN identifiers i ON i.work_request_id = j.work_request_id
-		WHERE i.kind = ? AND i.value = ?
-		ORDER BY j.created_at DESC`, kind, value)
+	liveJobID, err = b.canonicalJobProbe(ctx, kind, value,
+		"j.state NOT IN ('ready','imported','failed','cancelled','unavailable')")
+	if err != nil || liveJobID != "" {
+		return liveJobID, "", false, err
+	}
+	readyJobID, err = b.canonicalJobProbe(ctx, kind, value, "j.state IN ('ready','imported')")
+	if err != nil || readyJobID != "" {
+		return "", readyJobID, false, err
+	}
+	unavailableJobID, err := b.canonicalJobProbe(ctx, kind, value, "j.state = 'unavailable'")
 	if err != nil {
 		return "", "", false, err
 	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var id, state string
-		if err := rows.Scan(&id, &state); err != nil {
-			return "", "", false, err
-		}
-		if !job.Terminal(state) {
-			return id, "", false, nil
-		}
-		if state == job.StateReady && readyJobID == "" {
-			readyJobID = id
-		}
-		if state == job.StateUnavailable {
-			previouslyUnavailable = true
-		}
+	return "", "", unavailableJobID != "", nil
+}
+
+func (b *Bridge) canonicalJobProbe(ctx context.Context, kind, value, stateClause string) (string, error) {
+	var jobID string
+	err := b.jobs.S.DB().QueryRowContext(ctx, `
+		SELECT j.id
+		FROM jobs j
+		JOIN identifiers i ON i.work_request_id = j.work_request_id
+		WHERE i.kind = ? AND i.value = ? AND `+stateClause+`
+		ORDER BY j.created_at DESC
+		LIMIT 1`, kind, value).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
 	}
-	if err := rows.Err(); err != nil {
-		return "", "", false, err
+	if err != nil {
+		return "", err
 	}
-	return "", readyJobID, previouslyUnavailable, nil
+	return jobID, nil
 }
 
 // pageBulkSubmit creates one ordinary batch of jobs from up to 50 canonical
