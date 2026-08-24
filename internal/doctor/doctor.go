@@ -637,15 +637,30 @@ type zoteroFileStorageRefusedSummary struct {
 
 // recentZoteroFileStorageRefusedApplies scans failed zotio_apply rows in the exports
 // ledger and re-classifies them from the durable hint plus Zotio envelope.
+//
+// A refusal whose job has since reached imported is excluded, because papio
+// itself already settled that paper and the operator has nothing to do. The
+// resolution is invisible from this table alone: when the Zotero item already
+// holds a PDF, plan.go records the outcome as a zotio.auto_import event with
+// status duplicate and writes no exports row at all, so the ledger keeps only
+// the failures. Measured on the operator's store, every one of the 139 failed
+// applies inside the window belonged to a job that had reached imported, and
+// the check still named one paper as having no route to the file store 2 days
+// after papio had confirmed that paper's item already carried a PDF.
+//
+// The join is a LEFT JOIN so a row with no job id still counts: an unattributed
+// refusal is exactly the kind this check exists to surface.
 func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store) (*zoteroFileStorageRefusedSummary, error) {
 	cutoff := time.Now().UTC().Add(-zoteroFileStorageRefusedRecency).Format(time.RFC3339Nano)
 	rows, err := db.DB().QueryContext(ctx, `
-		SELECT created_at, result_json
-		FROM exports
-		WHERE kind = 'zotio_apply'
-		  AND json_extract(result_json, '$.status') = 'failed'
-		  AND created_at >= ?
-		ORDER BY created_at`, cutoff)
+		SELECT e.created_at, e.result_json
+		FROM exports e
+		LEFT JOIN jobs j ON j.id = e.job_id
+		WHERE e.kind = 'zotio_apply'
+		  AND json_extract(e.result_json, '$.status') = 'failed'
+		  AND e.created_at >= ?
+		  AND COALESCE(j.state, '') <> 'imported'
+		ORDER BY e.created_at`, cutoff)
 	if err != nil {
 		return nil, err
 	}

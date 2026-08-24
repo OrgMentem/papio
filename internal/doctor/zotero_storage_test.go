@@ -267,6 +267,65 @@ func TestZoteroFileStorageRefusedNamesTheRoutingRefusal(t *testing.T) {
 	}
 }
 
+// seedJobState gives a seeded refusal an owning job in a chosen state, so a
+// test can distinguish a refusal papio has settled from one still outstanding.
+func seedJobState(t *testing.T, ctx context.Context, db *store.Store, jobID, state string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO work_requests (id, created_at, title) VALUES (?, ?, 'Example')`,
+		"wr_"+jobID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+		VALUES (?, ?, ?, '{}', ?, ?)`, jobID, "wr_"+jobID, state, now, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A refusal papio has already settled must not be reported. When the Zotero
+// item already holds a PDF, plan.go marks the job imported with a
+// zotio.auto_import event carrying status duplicate and writes no exports row,
+// so the ledger keeps only the failures and the check used to read them as
+// live. This is the operator's machine on 2026-08-24: every one of 139 failed
+// applies in the window belonged to a job that had reached imported, and the
+// check still named one paper as having no route to the file store two days
+// after papio confirmed that paper's item already carried a PDF.
+func TestZoteroFileStorageRefusedIgnoresSettledPapers(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	recent := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	seedFailedZotioApplyError(t, ctx, db, "job_settled", recent, routingRefusalError, map[string]any{"ok": false})
+	seedJobState(t, ctx, db, "job_settled", "imported")
+
+	got := zoteroFileStorageRefusedCheck(t, ctx, db)
+	if got.Status != Pass {
+		t.Fatalf("status = %q, want pass: a paper papio already filed is not waiting on storage: %+v", got.Status, got)
+	}
+
+	// The same refusal on a job still short of imported must still be reported,
+	// or the exclusion would silence the condition the check exists for.
+	seedFailedZotioApplyError(t, ctx, db, "job_live", recent, routingRefusalError, map[string]any{"ok": false})
+	seedJobState(t, ctx, db, "job_live", "ready")
+
+	got = zoteroFileStorageRefusedCheck(t, ctx, db)
+	if got.Status != Warn {
+		t.Fatalf("status = %q, want warn for an unsettled refusal: %+v", got.Status, got)
+	}
+	if !strings.Contains(got.Detail, "no route to the file store") {
+		t.Fatalf("detail = %q, want the routing refusal named", got.Detail)
+	}
+	if strings.Contains(got.Detail, "2 recent") {
+		t.Fatalf("detail = %q, must count only the unsettled refusal", got.Detail)
+	}
+}
+
 // A stale quota reading must not swallow the one live cause: this is the exact
 // shape of the operator's machine on 2026-08-22, where ten quota failures from
 // five days earlier were the headline and the single routing refusal from that
