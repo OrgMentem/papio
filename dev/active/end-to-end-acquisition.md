@@ -220,6 +220,25 @@ at one per host and adapter version per hour, 20 per day, keeping three digests.
 Nothing promotes those captures for comparison. Surface them, so a real drift is
 visible before it becomes a hand-fetch.
 
+**First, the drift latch must record which page defeated papio.** Diagnosing the
+operator's own reported paper found the reason the queue cannot be trusted. Job
+`job_33be7342943fa7604f4d06e939` — the ScienceDirect paper from their report —
+parked on 2026-08-11 with a `job.latch` event carrying
+`{"adapter_id":"","adapter_version":"","host":"","kind":"drift"}` and a provider
+outcome reading "No source-controlled adapter matched this provider page." Its
+only route evidence is the offer's `safety_domain`,
+`institution:une.primo.exlibrisgroup.com`.
+
+So papio recorded a drift with no host, no adapter, and no capture. That is not a
+historical gap: host matching is suffix-based
+(`extension/src/adapters/types.ts:1376`, `page.hostname === host ||
+page.hostname.endsWith('.' + host)`), and the `primo` adapter shipped 2026-08-03
+in `258727d`, eight days before this park — so `une.primo.exlibrisgroup.com`
+should have matched. Either the browser ended up on a fourth host nobody
+recorded, or the lookup did not run. **The record cannot distinguish those, and
+that is the defect.** Until a drift names its host, the ranked repair queue is
+guesswork and adapter work cannot be aimed.
+
 Surfacing captures is necessary but not sufficient, and the earlier draft's
 acceptance could not be met. The two target adapters declare no denial rule at
 all: ProQuest has only `login` and `article`
@@ -260,19 +279,27 @@ not by new code:** `RepairAdapterUpgrade` should return the matching parked
 papers to `resolving` on the next live holder. That is the acceptance test for
 this phase and the measurement for the whole plan.
 
-**19 of the 45 open hand-fetches are unreachable by that path, and the plan must
-say what happens to them.** They carry no diagnosis, and
+**6 of the 45 open hand-fetches were unreachable by that path — not 19, as an
+earlier draft said.** Repairability is not the same as having a diagnosis:
 `providerAdapterUpgradeSource` (`internal/app/handoff_repair.go:265-317`) needs a
-provider outcome frame naming an adapter version, falling back only to a capture
-from the same version. A row without one never satisfies its `ok` condition, so
-no adapter release will ever free it.
+provider outcome naming an adapter, and falls back to a capture from the same
+adapter version. Classifying all 45 that way gave 32 repairable from an outcome,
+7 more from the capture fallback, 3 with an outcome carrying no adapter id, and 3
+with no provider outcome at all. So **39 of 45 will self-release when the
+relevant adapter ships a version bump**, which is a far better position than the
+earlier drafts described.
 
-Do not give them a blanket automatic retry: their causes are mixed — validation
-rejects, landing-page parks, and missing adapters — so a blind retry would drive
-the wrong class of paper. The honest options are an operator-initiated sweep,
-which ADR-0007 and ADR-0013 already permit as an explicit action, or leaving them
-parked and saying so in the inbox. Pick one and record it; silently carrying 19
-permanently stuck papers is the state the plan exists to remove.
+The remaining 6 were swept on 2026-08-24 by operator instruction, using the
+existing `papio actions dismiss`. No new command was needed:
+`dismissalCancelsParkedJob` (`internal/job/job.go:3072-3083`) lists
+`manual_download` on an `awaiting_human` job, so a dismissal cancels the job with
+`user_dismissed` — an explicit operator action of the kind ADR-0007 and ADR-0013
+already permit. Two were `ProviderAdapterMissing` parks and four were rejected
+adopted files. The queue went from 115 to 109 papers.
+
+**Record this against the guard metric.** Those 6 moved into `cancelled` by
+deliberate operator action, not by a regression, so the completion-rate guard in
+section 5 must treat 2026-08-24 as a step change rather than a signal.
 
 ### Phase 4 — Try before asking
 
