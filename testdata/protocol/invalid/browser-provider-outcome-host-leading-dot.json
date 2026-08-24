@@ -1,0 +1,13 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "provider_outcome",
+  "msg_id": "m_out_host_003",
+  "job_id": "job_0007_drift",
+  "seq": 13,
+  "payload": {
+    "outcome": "ui_changed",
+    "adapter_id": "primo",
+    "adapter_version": "primo/0.4.0",
+    "host": ".primo.exlibrisgroup.com"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "provider_outcome",
+  "msg_id": "m_out_host_valid",
+  "job_id": "job_0007_drift",
+  "seq": 6,
+  "payload": {
+    "outcome": "ui_changed",
+    "detail": "No source-controlled adapter matched this provider page.",
+    "host": "une.primo.exlibrisgroup.com"
+  }
+}
