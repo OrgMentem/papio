@@ -1402,6 +1402,11 @@ func TestValidateCandidateHoldsEmbeddedAndEncryptedPDFsForReview(t *testing.T) {
 	// PDFs legitimately bundle supplementary files while returning Valid=false
 	// (plus HasEmbeddedFiles=true), so the encrypted/active branch must precede
 	// the generic invalid check.
+	//
+	// Sanitize is nil here, which is the seam's disabled contract: without it
+	// every embedded-file PDF still parks. The embedded-only cases reach a
+	// different outcome in production, pinned by
+	// TestValidateCandidateAdoptsSanitizedEmbeddedPDF.
 	cases := []struct {
 		name   string
 		report pdf.ValidationReport
@@ -1515,6 +1520,244 @@ func TestValidateCandidateHoldsEmbeddedAndEncryptedPDFsForReview(t *testing.T) {
 				if actions[i].JobID == id && actions[i].Kind == "manual_download" && actions[i].Status == "open" {
 					t.Fatalf("unexpected manual_download action alongside unsafe_pdf: %+v", &actions[i])
 				}
+			}
+		})
+	}
+}
+
+// A publisher PDF whose ONLY marker is an embedded file is stripped and adopted
+// instead of parked. Measured live 2026-08-27: three papers sat in needs_review
+// for up to twelve days, two of them embedded-file-only, correct titles, no
+// JavaScript and not encrypted, with no resolution path at all — `--accept` is
+// refused for unsafe_pdf and `--reject` only asks for a file papio already had.
+//
+// The rewrite must be re-validated end to end, so the second Validate call is
+// what supplies the adopted report: reusing the first would file a document
+// papio never checked.
+func TestValidateCandidateAdoptsSanitizedEmbeddedPDF(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	embedded := pdf.ValidationReport{
+		Payload:    pdf.PayloadReport{OK: true},
+		Structural: pdf.StructuralReport{Valid: true, Pages: 18, HasEmbeddedFiles: true},
+		Text:       pdf.TextReport{Chars: 2000},
+		Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+	}
+	clean := pdf.ValidationReport{
+		Payload:    pdf.PayloadReport{OK: true},
+		Structural: pdf.StructuralReport{Valid: true, Pages: 18},
+		Text:       pdf.TextReport{Chars: 2000},
+		Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+	}
+	var validated []string
+	svc.Validate = func(_ context.Context, path, _ string, _ work.Work) (pdf.ValidationReport, error) {
+		validated = append(validated, path)
+		if strings.HasSuffix(path, ".sanitized") {
+			return clean, nil
+		}
+		return embedded, nil
+	}
+	sanitizedBytes := pdfBytes("sanitized-copy")
+	svc.Sanitize = func(_ context.Context, _, dest string) (pdf.StructuralReport, error) {
+		if err := os.WriteFile(dest, sanitizedBytes, 0o600); err != nil {
+			return pdf.StructuralReport{}, err
+		}
+		return pdf.StructuralReport{Valid: true, Pages: 18}, nil
+	}
+
+	id, err := jobs.CreateRequest(ctx, "wr_sanitize", work.Work{DOI: "10.1177/example"}, "", "", job.Policy{
+		AccessMode: config.ModeConservative, DesiredVersion: "any",
+	}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "fixture", URLRedacted: "https://example.test/embedded.pdf", URLKey: "sanitize",
+		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, _ := jobs.NextPendingCandidate(ctx, id)
+	for _, edge := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+		{job.StateFetching, job.StateValidating},
+	} {
+		if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, _ := jobs.Get(ctx, id)
+	temp := t.TempDir() + "/candidate.pdf"
+	if err := os.WriteFile(temp, pdfBytes("embedded"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sourceSHA := strings.Repeat("c", 64)
+	accepted, parked, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+		TempPath: temp, SHA256: sourceSHA, SniffedMIME: "application/pdf",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accepted || parked {
+		t.Fatalf("sanitized embedded PDF: accepted=%t parked=%t, want accepted", accepted, parked)
+	}
+	if len(validated) != 2 || !strings.HasSuffix(validated[1], ".sanitized") {
+		t.Fatalf("validated paths = %v, want the rewrite re-validated", validated)
+	}
+	got, _ := jobs.Get(ctx, id)
+	if got.State != job.StateReady {
+		t.Fatalf("state = %s, want ready", got.State)
+	}
+	// The artifact must be the sanitized bytes, under their own digest.
+	adoptedSHA := sha256.Sum256(sanitizedBytes)
+	adopted := hex.EncodeToString(adoptedSHA[:])
+	if _, err := jobs.GetArtifact(ctx, adopted); err != nil {
+		t.Fatalf("artifact for the sanitized digest: %v", err)
+	}
+	if art, err := jobs.GetArtifact(ctx, sourceSHA); err == nil && art != nil {
+		t.Fatal("the publisher's unsanitized bytes must never be promoted")
+	}
+	// Both digests are recorded: neither alone describes the artifact honestly.
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event["kind"] != "job.pdf_sanitized" {
+			continue
+		}
+		found = true
+		detail, _ := event["detail"].(map[string]any)
+		if detail["source_sha256"] != sourceSHA || detail["adopted_sha256"] != adopted {
+			t.Fatalf("job.pdf_sanitized detail = %+v, want both digests", detail)
+		}
+	}
+	if !found {
+		t.Fatal("want a job.pdf_sanitized event recording the rewrite")
+	}
+	if _, err := os.Stat(temp); err == nil {
+		t.Fatal("the superseded original must not stay in quarantine")
+	}
+	actions, err := jobs.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range actions {
+		if actions[i].JobID == id {
+			t.Fatalf("a sanitized paper must ask nothing of the operator: %+v", &actions[i])
+		}
+	}
+}
+
+// Sanitizing is offered for exactly one marker. An encrypted PDF and one
+// carrying JavaScript are different rewrites with different risks, so the seam
+// must never be reached for them; and a rewrite that does not come back clean
+// must leave the review in place rather than adopt a file papio failed to fix.
+func TestValidateCandidateSanitizesOnlyWhatItCanMakeSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		structural pdf.StructuralReport
+		rewritten  pdf.StructuralReport
+		wantCalled bool
+	}{
+		{
+			name:       "encrypted is never rewritten",
+			structural: pdf.StructuralReport{Valid: true, Pages: 3, Encrypted: true, HasEmbeddedFiles: true},
+		},
+		{
+			name:       "javascript is never rewritten",
+			structural: pdf.StructuralReport{Valid: true, Pages: 3, HasJavaScript: true, HasEmbeddedFiles: true},
+		},
+		{
+			name:       "a rewrite that keeps the attachment is refused",
+			structural: pdf.StructuralReport{Valid: true, Pages: 3, HasEmbeddedFiles: true},
+			rewritten:  pdf.StructuralReport{Valid: true, Pages: 3, HasEmbeddedFiles: true},
+			wantCalled: true,
+		},
+		{
+			name:       "an invalid rewrite is refused",
+			structural: pdf.StructuralReport{Valid: true, Pages: 3, HasEmbeddedFiles: true},
+			rewritten:  pdf.StructuralReport{Valid: false, Reason: "pdfcpu validation"},
+			wantCalled: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			ctx := context.Background()
+			// A clean answer for the rewrite path, so the refusal below has to
+			// come from the cheap structural gate rather than from this
+			// re-validation covering for it.
+			svc.Validate = func(_ context.Context, path, _ string, _ work.Work) (pdf.ValidationReport, error) {
+				structural := tc.structural
+				if strings.HasSuffix(path, ".sanitized") {
+					structural = pdf.StructuralReport{Valid: true, Pages: 3}
+				}
+				return pdf.ValidationReport{
+					Payload:    pdf.PayloadReport{OK: true},
+					Structural: structural,
+					Text:       pdf.TextReport{Chars: 2000},
+					Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+				}, nil
+			}
+			called := false
+			svc.Sanitize = func(_ context.Context, _, dest string) (pdf.StructuralReport, error) {
+				called = true
+				if err := os.WriteFile(dest, pdfBytes("rewrite"), 0o600); err != nil {
+					return pdf.StructuralReport{}, err
+				}
+				return tc.rewritten, nil
+			}
+			id, err := jobs.CreateRequest(ctx, "wr_refuse_"+tc.name, work.Work{DOI: "10.1177/refuse"}, "", "", job.Policy{
+				AccessMode: config.ModeConservative, DesiredVersion: "any",
+			}, nil, job.PrincipalUnknown)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+				JobID: id, Source: "fixture", URLRedacted: "https://example.test/refuse.pdf", URLKey: tc.name,
+				Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			candidate, _ := jobs.NextPendingCandidate(ctx, id)
+			for _, edge := range [][2]string{
+				{job.StateQueued, job.StateResolving},
+				{job.StateResolving, job.StateFetching},
+				{job.StateFetching, job.StateValidating},
+			} {
+				if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			row, _ := jobs.Get(ctx, id)
+			temp := t.TempDir() + "/candidate.pdf"
+			if err := os.WriteFile(temp, pdfBytes(tc.name), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			accepted, parked, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+				TempPath: temp, SHA256: strings.Repeat("d", 64), SniffedMIME: "application/pdf",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if accepted || !parked {
+				t.Fatalf("accepted=%t parked=%t, want the unsafe_pdf review to stand", accepted, parked)
+			}
+			if called != tc.wantCalled {
+				t.Fatalf("sanitize called = %t, want %t", called, tc.wantCalled)
+			}
+			// The review must still bind the file the operator can inspect.
+			if _, err := os.Stat(temp); err != nil {
+				t.Fatalf("quarantined original missing: %v", err)
+			}
+			if _, err := os.Stat(temp + ".sanitized"); err == nil {
+				t.Fatal("a refused rewrite must leave no sanitized file behind")
+			}
+			got, _ := jobs.Get(ctx, id)
+			if got.State != job.StateNeedsReview {
+				t.Fatalf("state = %s, want needs_review", got.State)
 			}
 		})
 	}

@@ -45,6 +45,11 @@ type FetchFunc func(context.Context, resolver.Candidate, string) (fetch.Result, 
 // ValidateFunc validates one quarantined file against the requested work.
 type ValidateFunc func(context.Context, string, string, work.Work) (pdf.ValidationReport, error)
 
+// SanitizeFunc rewrites a quarantined PDF without its embedded files into dest
+// and reports on the rewrite. A nil seam disables sanitizing, which keeps every
+// embedded-file PDF parked for review exactly as before.
+type SanitizeFunc func(ctx context.Context, path, dest string) (pdf.StructuralReport, error)
+
 // AutoImporter plans and applies one ready job through the Zotio service.
 // Implementations must make replays idempotent.
 type AutoImporter interface {
@@ -119,6 +124,7 @@ type Service struct {
 	LandingReader     LandingReader
 	Fetch             FetchFunc
 	Validate          ValidateFunc
+	Sanitize          SanitizeFunc
 	AutoImporter      AutoImporter
 	Notifier          notify.Sink
 	// Delivery is ADR-0017's document-delivery/ILL service (Decisions 1,
@@ -3024,6 +3030,80 @@ func DeliveryReconciliationActionDetail(existing *delivery.Request) string {
 		existing.Provider, ref, existing.State, existing.JobID)
 }
 
+// sanitizeEmbeddedFiles strips a PDF's embedded files and re-validates the
+// rewrite, returning the replacement fetch result and report only when the
+// rewrite is clean. It reports false for every other case, so the caller's
+// unsafe_pdf review stays the answer whenever this cannot make the file safe.
+//
+// Only an embedded-file-ONLY marker qualifies. Encryption and JavaScript are
+// left alone deliberately: removing them would be a different rewrite with a
+// different risk, and neither is the common publisher case this exists for.
+//
+// The rewrite is re-validated end to end rather than patched into the old
+// report: text, metadata and identity must all be read from the bytes that
+// will actually be adopted, or papio would file a document it never checked.
+func (s *Service) sanitizeEmbeddedFiles(
+	ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result, report pdf.ValidationReport,
+) (fetch.Result, pdf.ValidationReport, bool) {
+	if s.Sanitize == nil || !report.Structural.HasEmbeddedFiles ||
+		report.Structural.Encrypted || report.Structural.HasJavaScript {
+		return result, report, false
+	}
+	dest := result.TempPath + ".sanitized"
+	structural, err := s.Sanitize(ctx, result.TempPath, dest)
+	if err != nil || !structural.Valid || structural.Encrypted ||
+		structural.HasJavaScript || structural.HasEmbeddedFiles {
+		_ = os.Remove(dest)
+		return result, report, false
+	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		_ = os.Remove(dest)
+		return result, report, false
+	}
+	sum, err := fileSHA256(dest)
+	if err != nil {
+		_ = os.Remove(dest)
+		return result, report, false
+	}
+	anchor, err := s.Jobs.SubmittedIdentity(ctx, row.ID)
+	if err != nil {
+		_ = os.Remove(dest)
+		return result, report, false
+	}
+	rewritten, err := s.Validate(ctx, dest, result.ContentType, validationTarget(anchor, row))
+	if err != nil || rewritten.Structural.HasEmbeddedFiles || rewritten.Structural.HasJavaScript ||
+		rewritten.Structural.Encrypted || !rewritten.Structural.Valid {
+		_ = os.Remove(dest)
+		return result, report, false
+	}
+	// The original digest is the durable record of what the publisher served;
+	// the sanitized one names the bytes papio adopts. Both are recorded because
+	// neither alone describes the artifact honestly.
+	_ = s.Jobs.RecordEvent(ctx, row.ID, "job.pdf_sanitized", map[string]any{
+		"candidate_id":   stored.ID,
+		"removed":        "embedded_files",
+		"source_sha256":  result.SHA256,
+		"adopted_sha256": sum,
+	})
+	_ = os.Remove(result.TempPath)
+	result.TempPath, result.SHA256, result.SizeBytes = dest, sum, info.Size()
+	return result, rewritten, true
+}
+
+func fileSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = file.Close() }()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
 func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result) (accepted, parked bool, err error) {
 	attempt, err := s.Jobs.StartAttempt(ctx, row.ID, stored.ID, "validate", stored.Source)
 	if err != nil {
@@ -3055,6 +3135,14 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		}
 		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
 			map[string]any{"reason": "validation_error"})
+	}
+	// An embedded file is the only active-content marker on most quarantined
+	// papers, because publisher PDFs routinely bundle one supplementary
+	// attachment. Strip it and re-validate the rewrite: that removes the risk
+	// instead of asking a human to accept it, and the review below still fires
+	// whenever the rewrite fails or the file carries anything else.
+	if sanitized, sanitizedReport, ok := s.sanitizeEmbeddedFiles(ctx, row, stored, result, report); ok {
+		result, report = sanitized, sanitizedReport
 	}
 	active := report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
 	needsIdentityReview := report.Text.NeedsReview || report.Identity.Result == pdf.IdentityReview

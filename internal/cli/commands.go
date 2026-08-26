@@ -663,7 +663,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 	var accept, reject bool
 	resolve := &cobra.Command{
 		Use:   "resolve <action-id>",
-		Short: "Accept or reject a parked identity review",
+		Short: "Accept or reject a parked identity or unsafe-PDF review",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if accept == reject {

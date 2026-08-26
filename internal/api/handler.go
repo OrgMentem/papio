@@ -1800,7 +1800,6 @@ func badParams(err error) ([]byte, *ipc.RPCError) {
 
 func failure(err error) ([]byte, *ipc.RPCError) {
 	var actionKind *job.ErrHumanActionKind
-	var acceptUnavailable *job.ErrReviewAcceptUnavailable
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, &ipc.RPCError{Code: "not_found", Message: "record not found"}
@@ -1808,10 +1807,6 @@ func failure(err error) ([]byte, *ipc.RPCError) {
 		return nil, &ipc.RPCError{Code: "conflict", Message: safeMessage(err, "state conflict")}
 	case errors.As(err, &actionKind):
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "unsupported human action")}
-	// Without this the operator's reason is logged daemon-side and answered as
-	// "operation failed", which is the same silence the message exists to end.
-	case errors.As(err, &acceptUnavailable):
-		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "accept is not offered for this review")}
 	default:
 		log.Printf("rpc internal error: %v", err)
 		return nil, &ipc.RPCError{Code: "internal", Message: "operation failed"}

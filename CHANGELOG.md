@@ -11,6 +11,18 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **A paper bundled with a supplementary file is now delivered instead of
+  parked.** Publishers routinely attach one extra file to a PDF, and *papio*
+  will not file a document that carries anything runnable, so those papers
+  stopped and asked you — for a decision you had no way to give: approving that
+  kind of review was refused outright, and rejecting it asked you to fetch by
+  hand a paper *papio* was already holding. Three papers were waiting that way,
+  the oldest for twelve days. *papio* now removes the attachments, re-checks the
+  result from scratch, and files it when it comes back clean. An encrypted paper
+  and one carrying a script are left alone deliberately: those are different
+  repairs with different risks. Your library keeps the paper, not the extra
+  file, and *papio* records both fingerprints - the publisher's file and the one
+  it filed - so the difference is never silent.
 - **`papio doctor` now tells you when the same paper is queued twice.** Two live
   jobs for one paper each open their own row, so the popup asks you to fetch the
   same paper twice with nothing marking the pair — and until now *papio* recorded
@@ -206,6 +218,13 @@ execution records kept during the initial build.
   unchanged.
 
 ### Changed
+- **Approving a held-back PDF now means "check it again", and is allowed.**
+  *papio* used to refuse approval for a paper held back over active content,
+  because filing it as it was would have broken its own rule. Now that *papio*
+  can repair the common case, approval re-runs the whole check on the same file:
+  a paper it can clean reaches your library, and one it cannot is held back
+  again rather than filed. The rule itself is unchanged - nothing you approve
+  can put a runnable document in your library.
 - **Retraction notices now name the affected paper.** The inbox used the same
   `Library update notice` title for every retraction and correction, so a list
   of five notices spent almost half its visible text repeating a label that did

@@ -175,7 +175,7 @@ func TestExplainWithOpenActionGuidance(t *testing.T) {
 		{
 			name: "unsafe pdf", kind: "unsafe_pdf",
 			wantCategory: "unsafe_pdf",
-			wantGuidance: []string{"encrypted or carries active/embedded content", "review it before adopting"},
+			wantGuidance: []string{"could not strip", "accept the review to re-check the same file"},
 		},
 		{
 			name: "verify identity", kind: "verify_identity",

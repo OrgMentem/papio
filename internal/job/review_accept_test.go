@@ -4,19 +4,20 @@ package job
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 )
 
-// papio deliberately never files a PDF carrying active or embedded content, so
-// an unsafe-PDF review offers reject and dismiss but not accept. The refusal
-// used to reuse ErrHumanActionKind, telling the operator the action's KIND was
-// unsupported - which is false, since reject resolves that exact action, and it
-// reads as papio not recognising its own ask. Measured on the live store: three
-// parked unsafe-PDF reviews, the oldest eight days old, whose only diagnosis
-// was `human action 965 has unsupported kind "unsafe_pdf"`.
-func TestUnsafePDFAcceptRefusalNamesTheRuleNotTheKind(t *testing.T) {
+// Accepting an unsafe-PDF review means "re-validate these exact bytes", never
+// "file them as they are". It used to be refused outright, which left the three
+// parked reviews measured on the live store 2026-08-27 with no resolution at
+// all: reject only asked for a file papio already held.
+//
+// Nothing here waives the active-content rule. The verdict re-queues the same
+// candidate for validation, and validateCandidate's encrypted/active branch has
+// no review_override escape (internal/app/app.go), so a file papio cannot
+// sanitize parks again rather than reaching the library.
+func TestUnsafePDFAcceptRequeuesTheCandidateForValidation(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
 
@@ -40,38 +41,41 @@ func TestUnsafePDFAcceptRefusalNamesTheRuleNotTheKind(t *testing.T) {
 	if err := js.Transition(ctx, id, StateResolving, StateNeedsReview, nil); err != nil {
 		t.Fatal(err)
 	}
+	sha := strings.Repeat("a", 64)
 	actionID, err := js.OpenHumanAction(ctx, id, "unsafe_pdf",
 		"PDF is encrypted or contains active/embedded content", Access(false, ""),
 		WithHumanActionBinding(HumanActionBinding{
 			CandidateID:      candidate.ID,
 			QuarantinePath:   "/tmp/quarantined.pdf",
-			QuarantineSHA256: strings.Repeat("a", 64),
+			QuarantineSHA256: sha,
 		}),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, _, err = js.ResolveReview(ctx, actionID, "accept")
-	if err == nil {
-		t.Fatal("accept on an unsafe-PDF review must be refused")
+	jobID, state, err := js.ResolveReview(ctx, actionID, "accept")
+	if err != nil {
+		t.Fatalf("accept on an unsafe-PDF review: %v", err)
 	}
-	var typed *ErrReviewAcceptUnavailable
-	if !errors.As(err, &typed) {
-		t.Fatalf("error = %T (%v), want *ErrReviewAcceptUnavailable", err, err)
+	if jobID != id {
+		t.Fatalf("job = %q, want %q", jobID, id)
 	}
-	message := err.Error()
-	for _, want := range []string{"active or embedded content", "reject", "dismiss"} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("refusal = %q, want it to mention %q", message, want)
-		}
+	if state != StateFetching {
+		t.Fatalf("state = %q, want %q so validation runs again", state, StateFetching)
 	}
-	if strings.Contains(message, "unsupported kind") {
-		t.Fatalf("refusal still blames the action kind: %q", message)
+	row, err := js.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// The same action resolves by rejection: the kind was never the problem.
-	if _, _, err := js.ResolveReview(ctx, actionID, "reject"); err != nil {
-		t.Fatalf("reject on the same action: %v", err)
+	if row.State != StateFetching {
+		t.Fatalf("state = %q, want %q so validation runs again", row.State, StateFetching)
+	}
+	again, err := js.GetCandidate(ctx, candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.ReviewOverride || again.Status != "pending" {
+		t.Fatalf("candidate = %+v, want a pending review override", again)
 	}
 }

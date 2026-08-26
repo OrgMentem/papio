@@ -44,7 +44,7 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 			"PDF validation could not finish within its bounds; inspect the quarantined file, then re-run or override."}
 	case "encrypted_or_active_content":
 		return Explanation{"unsafe_pdf",
-			"The PDF is encrypted or carries active/embedded content; review it before adopting."}
+			"The PDF is encrypted or carries active content papio could not strip; accept the review to re-check the same file, or reject it to try another source."}
 	case "semantic_or_identity_review":
 		return Explanation{"identity_review",
 			"Confirm the downloaded PDF is the requested paper; approve it to finish, or reject to try another source."}
@@ -150,7 +150,7 @@ func explainOpenAction(action job.HumanAction) Explanation {
 			"PDF validation could not finish within its bounds; inspect the quarantined file, then re-run or override."}
 	case "unsafe_pdf":
 		return Explanation{"unsafe_pdf",
-			"The PDF is encrypted or carries active/embedded content; review it before adopting."}
+			"The PDF is encrypted or carries active content papio could not strip; accept the review to re-check the same file, or reject it to try another source."}
 	case "verify_identity":
 		return Explanation{"identity_review",
 			"Confirm the downloaded PDF is the requested paper; approve it to finish, or reject to try another source."}

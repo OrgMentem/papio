@@ -256,23 +256,6 @@ func (e *ErrHumanActionKind) Error() string {
 	return fmt.Sprintf("human action %d has unsupported kind %q", e.ActionID, e.Kind)
 }
 
-// ErrReviewAcceptUnavailable reports a review kind papio resolves, but for
-// which "accept" is deliberately not on offer. It exists because the operator
-// used to be told the KIND was unsupported, which is false and reads as papio
-// not recognising its own ask: reject works on exactly this action. Measured on
-// the live store: three parked unsafe-PDF reviews, the oldest eight days old,
-// whose only diagnosis was `human action 965 has unsupported kind "unsafe_pdf"`.
-type ErrReviewAcceptUnavailable struct {
-	ActionID int64
-	Kind     string
-}
-
-func (e *ErrReviewAcceptUnavailable) Error() string {
-	return fmt.Sprintf(
-		"human action %d is an %s review: papio never files a PDF carrying active or embedded content, so accept is not offered - reject it (the paper keeps its other routes) or dismiss the ask",
-		e.ActionID, e.Kind)
-}
-
 // ErrCostExceeded means reserving a paid attempt would cross the job's
 // explicit maximum. The reservation is atomic across daemon workers/restarts.
 type ErrCostExceeded struct {
@@ -2844,9 +2827,6 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 	}
 	if action.Kind != "verify_identity" && action.Kind != "unsafe_pdf" {
 		return ReviewResolution{}, &ErrHumanActionKind{ActionID: input.ActionID, Kind: action.Kind}
-	}
-	if action.Kind == "unsafe_pdf" && input.Verdict == "accept" {
-		return ReviewResolution{}, &ErrReviewAcceptUnavailable{ActionID: input.ActionID, Kind: action.Kind}
 	}
 	if action.Status != "open" {
 		var state string

@@ -145,7 +145,7 @@ papio actions open [flags]
 
 ### `papio actions resolve`
 
-Accept or reject a parked identity review
+Accept or reject a parked identity or unsafe-PDF review
 
 ```
 papio actions resolve <action-id> [flags]

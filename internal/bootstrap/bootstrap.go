@@ -411,6 +411,9 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 			Target:       target,
 		}, validationOptions)
 	}
+	service.Sanitize = func(ctx context.Context, path, dest string) (pdf.StructuralReport, error) {
+		return pdf.SanitizeEmbeddedFiles(ctx, executable, path, dest, validationOptions.Structural)
+	}
 
 	bundleExporter := &bundle.Exporter{Jobs: jobs, Artifacts: artifacts, DataDir: cfg.DataDir}
 	zotioService := &zotio.Service{

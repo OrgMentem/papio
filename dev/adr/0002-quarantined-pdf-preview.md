@@ -104,3 +104,41 @@ separately under a restrictive CSP.
 This narrowly supersedes Option B's GET/HEAD-only and native-messaging-only
 verdict constraints. It does not create sessions, a general JSON API, or a
 daemon web application, so the scope-creep tripwire remains in force.
+
+## Addendum: embedded files are stripped, not reviewed (2026-08-27)
+
+papio never files a PDF carrying active content, and that stands. What changed
+is what papio does with the commonest cause of it. Publisher PDFs routinely
+bundle one supplementary attachment, so `has_embedded_files` was the ONLY
+marker on most quarantined papers, and the quarantine had no exit: `accept` was
+refused outright for `unsafe_pdf`, and `reject` asked the operator to fetch by
+hand a file papio already held. Measured on the live store 2026-08-27: three
+parked reviews, the oldest twelve days old, two of them embedded-file-only with
+correct titles, no JavaScript and no encryption.
+
+A PDF whose only marker is an embedded file is now REWRITTEN without its
+attachments and re-validated end to end, and the rewrite is adopted when it
+comes back clean. Encryption and JavaScript are deliberately excluded: each
+would be a different rewrite carrying a different risk, and neither is the
+publisher case this exists for.
+
+Three properties make this safe to do without asking:
+
+- The worker reports on the REWRITE, never on the source, so the parent never
+  has to trust that the removal was complete. A surviving marker simply keeps
+  the file quarantined.
+- The rewrite is re-validated in full, so text, metadata and identity are read
+  from the bytes that will actually be adopted. Reusing the source's report
+  would file a document papio never checked.
+- `validateCandidate`'s encrypted/active branch has no `review_override`
+  escape, so nothing here can launder a file papio fails to sanitize.
+
+The cost is that the adopted bytes are not the publisher's bytes. Provenance
+therefore records both digests: a `job.pdf_sanitized` event carries the source
+SHA-256 and the adopted SHA-256, and the artifact is stored under the digest of
+its own content.
+
+With sanitizing in place, accepting an `unsafe_pdf` review means "re-validate
+these exact bytes", so the blanket accept refusal is withdrawn — the operator
+can ask papio to re-check a file it once could not handle, and a file it still
+cannot make safe parks again rather than reaching the library.

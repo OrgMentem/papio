@@ -43,39 +43,65 @@ func DefaultStructuralOptions() StructuralOptions {
 type workerRequest struct {
 	Path     string `json:"path"`
 	MaxPages int    `json:"max_pages"`
+	// SanitizeTo asks the worker to write a copy of Path without its embedded
+	// files, and to report on THAT copy rather than on Path.
+	SanitizeTo string `json:"sanitize_to,omitempty"`
 }
 
 // ValidateStructural starts the supplied papio executable in worker mode. It
 // never opens or parses path in this process: the only parent-side payload is a
 // small JSON pathname request.
 func ValidateStructural(ctx context.Context, binary, path string, opt StructuralOptions) (StructuralReport, error) {
+	return runStructuralWorker(ctx, binary, workerRequest{Path: path}, path, opt)
+}
+
+// SanitizeEmbeddedFiles writes a copy of path without its embedded files to
+// dest and returns the structural report for THAT copy, never for path. A
+// caller may therefore trust the answer without trusting the removal: a report
+// that still carries HasEmbeddedFiles means the rewrite did not do the job, and
+// the original quarantine decision stands.
+//
+// Publisher PDFs routinely bundle one supplementary attachment, which is the
+// only active-content marker on most quarantined papers. Stripping it removes
+// the risk instead of asking a human to accept it (ADR-0022, amendment
+// 2026-08-27), at the cost of adopting bytes the publisher did not emit - which
+// is why provenance records both digests.
+func SanitizeEmbeddedFiles(ctx context.Context, binary, path, dest string, opt StructuralOptions) (StructuralReport, error) {
+	if dest == "" {
+		return StructuralReport{}, errors.New("sanitized PDF destination is required")
+	}
+	if dest == path {
+		return StructuralReport{}, errors.New("sanitized PDF destination must differ from the source")
+	}
+	return runStructuralWorker(ctx, binary, workerRequest{Path: path, SanitizeTo: dest}, dest, opt)
+}
+
+// runStructuralWorker starts the supplied papio executable in worker mode. It
+// never opens or parses a PDF in this process: the only parent-side payload is
+// a small JSON pathname request. reportPath names the file the returned report
+// describes, which is the rewrite destination for a sanitize request.
+func runStructuralWorker(ctx context.Context, binary string, req workerRequest, reportPath string, opt StructuralOptions) (StructuralReport, error) {
 	if binary == "" {
 		return StructuralReport{}, errors.New("pdf worker binary is required")
 	}
-	if path == "" {
+	if req.Path == "" {
 		return StructuralReport{}, errors.New("PDF path is required")
 	}
 	opt = normalizedStructuralOptions(opt)
-	req, err := json.Marshal(workerRequest{Path: path, MaxPages: opt.MaxPages})
+	req.MaxPages = opt.MaxPages
+	payload, err := json.Marshal(req)
 	if err != nil { // presently impossible, but keeps the contract total.
 		return StructuralReport{}, fmt.Errorf("encode pdf worker request: %w", err)
 	}
-	if len(req) > 16<<10 {
+	if len(payload) > 16<<10 {
 		return StructuralReport{}, errors.New("pdf worker request exceeds 16KiB")
 	}
 
 	workerCtx, cancel := context.WithTimeout(ctx, opt.Timeout)
 	defer cancel()
-	cmd := func() *exec.Cmd {
-		cmd := func() *exec.Cmd {
-			cmd := exec.CommandContext(workerCtx, binary, WorkerArgument)
-			configureProcessTree(cmd)
-			return cmd
-		}()
-		configureProcessTree(cmd)
-		return cmd
-	}()
-	cmd.Stdin = bytes.NewReader(req)
+	cmd := exec.CommandContext(workerCtx, binary, WorkerArgument)
+	configureProcessTree(cmd)
+	cmd.Stdin = bytes.NewReader(payload)
 	var stdout cappedBuffer
 	stdout.limit = opt.MaxOutputBytes
 	var stderr cappedBuffer
@@ -111,7 +137,7 @@ func ValidateStructural(ctx context.Context, binary, path string, opt Structural
 		report.Reason = err.Error()
 		return report, nil
 	}
-	if err := crossCheckPDFInfo(workerCtx, opt.PDFInfoPath, path, &report, opt.MaxOutputBytes); err != nil {
+	if err := crossCheckPDFInfo(workerCtx, opt.PDFInfoPath, reportPath, &report, opt.MaxOutputBytes); err != nil {
 		report.Valid = false
 		report.Reason = err.Error()
 	}
@@ -161,13 +187,35 @@ func RunStructuralWorker(in io.Reader, out io.Writer) error {
 		req.MaxPages = DefaultStructuralOptions().MaxPages
 	}
 
-	report := inspectWithPDFCPU(req)
+	// A sanitize request re-inspects its own rewrite, so inspecting the source
+	// as well would parse an untrusted file twice for one answer.
+	report := StructuralReport{}
+	if req.SanitizeTo == "" {
+		report = inspectWithPDFCPU(req)
+	} else {
+		report = sanitizeWithPDFCPU(req)
+	}
 	enc := json.NewEncoder(out)
 	return enc.Encode(report)
 }
 
 // WorkerMain is an IO-friendly alias for test binaries and executable dispatch.
 func WorkerMain(in io.Reader, out io.Writer) error { return RunStructuralWorker(in, out) }
+
+// sanitizeWithPDFCPU rewrites req.Path without its embedded files and reports
+// on the REWRITE, so the parent never has to trust that the removal was
+// complete: a surviving marker simply keeps the file quarantined. A failed
+// rewrite leaves no destination file behind.
+func sanitizeWithPDFCPU(req workerRequest) StructuralReport {
+	conf := model.NewDefaultConfiguration()
+	if err := api.RemoveAttachmentsFile(req.Path, req.SanitizeTo, nil, conf); err != nil {
+		_ = os.Remove(req.SanitizeTo)
+		// Same discipline as inspectWithPDFCPU: name the category, never the
+		// upstream text, which embeds the absolute quarantine path.
+		return StructuralReport{Reason: "strip embedded files failed"}
+	}
+	return inspectWithPDFCPU(workerRequest{Path: req.SanitizeTo, MaxPages: req.MaxPages})
+}
 
 func inspectWithPDFCPU(req workerRequest) StructuralReport {
 	f, err := os.Open(req.Path)
