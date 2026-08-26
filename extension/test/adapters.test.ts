@@ -980,6 +980,43 @@ test("ScienceDirect purchase-like links outside an identified article fail close
   }
 });
 
+const sciencedirectOpenAccess = loadFixture("sciencedirect", "open-access");
+test.skipIf(sciencedirectOpenAccess === null)(
+  "captured open-access ScienceDirect article routes on its own /pdf control",
+  () => {
+    const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+    const page = sciencedirectOpenAccess as Document;
+    // Measured live 2026-08-26. This entitled page carries NO `/pdfft` for its
+    // own paper: the enabled access-bar control is `/pdfft`-free and ends in
+    // `/pdf`. The rule used to require `/pdfft`, so this classified `unknown`
+    // and every open-access ScienceDirect paper stayed hand-assisted.
+    const own = "S1877042814012683";
+    expect(page.querySelector(`a[href='/science/article/pii/${own}/pdfft']`)).toBeNull();
+    const control = page.querySelector(spec.download?.selector as string);
+    expect(control?.getAttribute("href")).toBe(`/science/article/pii/${own}/pdf`);
+    expect(control?.getAttribute("aria-disabled")).toBe("false");
+    expect(interpret(page, spec, ctx()).kind).toBe("article");
+  },
+);
+
+test.skipIf(sciencedirectOpenAccess === null)(
+  "recommended-article PDF links are never the ScienceDirect download target",
+  () => {
+    const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+    const page = sciencedirectOpenAccess as Document;
+    // The only `/pdfft` hrefs on this page belong to three RECOMMENDED sibling
+    // articles. Accepting a bare `/pdf` path is safe solely because the
+    // selector stays scoped to `.accessbar .ViewPDF >`; widening it would file
+    // a different paper under this citation, the worst outcome papio has.
+    const siblings = [...page.querySelectorAll("a[href*='/pdfft']")];
+    expect(siblings.length).toBeGreaterThan(0);
+    for (const sibling of siblings) {
+      expect(sibling.getAttribute("href")).not.toContain("S1877042814012683");
+      expect(sibling.matches(spec.download?.selector as string)).toBe(false);
+    }
+  },
+);
+
 test("Taylor and Francis book metadata is outside the journal adapter host scope", () => {
   const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;
   expect(spec.hosts).not.toContain("taylorfrancis.com");

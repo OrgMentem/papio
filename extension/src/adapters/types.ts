@@ -704,7 +704,7 @@ export const adapters: AdapterSpec[] = [
     // sign-in slot occupied. `article` stays first so a transitional page that
     // briefly carries both still trusts the positive entitlement signal.
     id: "sciencedirect",
-    version: "0.5.0",
+    version: "0.6.0",
     hosts: ["sciencedirect.com"],
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
@@ -721,12 +721,24 @@ export const adapters: AdapterSpec[] = [
     // reveals the window without focus and reloads, because revealing after the
     // hidden load leaves the unpainted document in place.
     requiresVisible: true,
+    // The access bar's own control is not always `/pdfft`. Measured live
+    // 2026-08-26 on an entitled open-access Procedia article
+    // (pii/S1877042814012683, doi 10.1016/j.sbspro.2014.01.1251): the enabled
+    // `.ViewPDF` anchor is `aria-disabled="false"` with
+    // href=/science/article/pii/<own-pii>/pdf — no `/pdfft` anywhere on the
+    // page for this paper. The only `/pdfft` hrefs belong to three RECOMMENDED
+    // sibling articles (S1877042814011513/11525/11537) rendered as
+    // `div.buttons > a.anchor-primary`, so a rule matching `/pdfft` loosely
+    // would download a different paper. Both shapes are therefore accepted,
+    // and both stay scoped to `.accessbar .ViewPDF >` — that scoping, not the
+    // path, is what keeps the sibling anchors unreachable.
     classify: [
       {
         kind: "article",
-        all: [
-          "meta[name='citation_title']",
+        all: ["meta[name='citation_title']"],
+        any: [
           ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdfft']",
+          ".accessbar .ViewPDF > a.accessbar-utility-link[href$='/pdf']",
         ],
       },
       {
@@ -738,7 +750,8 @@ export const adapters: AdapterSpec[] = [
       },
     ],
     download: {
-      selector: ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdfft']",
+      selector:
+        ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdfft'], .accessbar .ViewPDF > a.accessbar-utility-link[href$='/pdf']",
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "click",
