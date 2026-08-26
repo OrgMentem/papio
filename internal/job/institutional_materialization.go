@@ -1038,6 +1038,52 @@ func (js *Store) LiveMaterializationClaimForJob(ctx context.Context, jobID strin
 	return claim, candidate, nil
 }
 
+// SupersededMaterializationClaim reports whether a strictly NEWER non-terminal
+// claim exists for the same job attempt, which is the exact fact "this claim no
+// longer drives this paper" rests on.
+//
+// LiveMaterializationClaimForJob cannot answer this: it orders by opaque claim
+// id and takes one row, so while two non-terminal claims coexist - the normal
+// state after a re-drive, since the previous claim is left to lapse rather than
+// abandoned - which one it names is arbitrary. Comparing a claim against that
+// answer would authorize retiring the live drive's own surface roughly half the
+// time. Ordering here is (created_at, id), and only a strictly newer sibling
+// counts, so the newest claim is never superseded by anything.
+//
+// A newer generation's claim also supersedes: the holder fence retires older
+// generations, never the reverse. The profile joins mirror the live query, so a
+// tombstoned or re-revised profile's claim never counts as a newer drive and
+// the answer stays false - refusing is always the safe direction here.
+func (js *Store) SupersededMaterializationClaim(ctx context.Context, claimID string) (bool, error) {
+	if strings.TrimSpace(claimID) == "" {
+		return false, nil
+	}
+	var superseded bool
+	err := js.S.DB().QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1
+		FROM materialization_claims self
+		JOIN browser_candidates selfc ON selfc.id = self.candidate_id
+		JOIN materialization_claims m ON m.id <> self.id
+		JOIN browser_candidates c ON c.id = m.candidate_id
+		JOIN institution_profiles p ON p.id = c.institution_profile_id
+		WHERE self.id = ?
+		  AND c.job_id = selfc.job_id
+		  AND c.job_attempt_revision = selfc.job_attempt_revision
+		  AND m.phase IN ('claimed','bound','route_issued','navigated')
+		  AND m.browser_holder_generation >= self.browser_holder_generation
+		  AND p.tombstoned_at IS NULL
+		  AND p.revision = c.institution_profile_revision
+		  AND (m.created_at > self.created_at
+		       OR (m.created_at = self.created_at AND m.id > self.id)))`, claimID).Scan(&superseded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return superseded, nil
+}
+
 // CandidateForAttempt returns this job attempt's browser candidate regardless
 // of whether a claim is live now, or nil when the attempt was never
 // institutional. Delivery uses it for two things: to decide that an attempt

@@ -215,6 +215,17 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A paper's stale tab can now be retired while the paper is still being
+  worked on.** *papio* keeps one tab per paper it has acquired, and a retry
+  opens a fresh one. Retiring the previous tab needs the daemon's permission,
+  and the daemon granted it only for a tab that was not the tab its own record
+  named - which is never true of a retry, because a retry records a new attempt
+  and leaves the previous one alone. The old attempt then held its tab for the
+  rest of the browsing session. The daemon now answers from the paper's CURRENT
+  attempt: a tab belonging to a superseded attempt may be retired, the tab of
+  the attempt actually driving the paper may not, and an unfinished publisher
+  action on the superseded attempt still refuses. One paper had six attempts and
+  six tabs when this was measured.
 - **A publisher that proves there is no access no longer keeps the whole
   library's sign-in slot.** The browser correctly ended that provider drive,
   but the daemon requeued the paper before its tab-close request arrived.

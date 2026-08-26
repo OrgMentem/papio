@@ -4733,10 +4733,17 @@ export class Bridge {
           (!inWorkWindow && !inPapioGroup)
         )
           continue;
+        // `surface_superseded` is the assertion that is actually true here,
+        // and the one the daemon can verify: this paper is driven from another
+        // surface now. `claim_abandoned` was tried first and is false in the
+        // common case - a re-drive mints a new claim and leaves the previous
+        // one in `navigated` until the next holder promotion sweeps it, so
+        // every ask was refused and the duplicates stayed (measured live
+        // 2026-08-26).
         const result = await this.closeOwnedSurface(
           tabID,
-          "claim_abandoned",
-          entry.claim?.gate_occurrence_id,
+          "surface_superseded",
+          undefined,
           true,
         );
         if (result.closed) closed += 1;

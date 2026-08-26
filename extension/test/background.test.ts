@@ -2230,10 +2230,14 @@ test("a cold superseded copy of a retained paper retires and the newest stays", 
     "surface_close_request",
     framesBefore,
   );
-  // The older copy, named by ITS binding - and under the one disposition whose
-  // truth the daemon verifies independently: this binding's claim is over.
+  // The older copy, named by ITS binding and ITS tab, under the one assertion
+  // that is true here and that the daemon verifies against the job's live
+  // claim: this paper is driven from another surface now. `claim_abandoned`
+  // was tried first and is false whenever a re-drive left the previous claim
+  // in `navigated`, which is the common case.
   expect(request.payload["binding_id"]).toBe(olderBinding);
-  expect(request.payload["disposition"]).toBe("claim_abandoned");
+  expect(request.payload["disposition"]).toBe("surface_superseded");
+  expect(request.payload["surface_tab_id"]).toBe(olderTabID);
   await h.port.inbound(
     nativeResult("surface_close_response", {
       request_id: request.payload["request_id"],

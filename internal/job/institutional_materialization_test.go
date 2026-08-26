@@ -1027,3 +1027,78 @@ func TestAbandonStaleMaterializationsReleasesOnlyOlderLiveClaims(t *testing.T) {
 		}
 	}
 }
+
+// The answer must not depend on claim-id ordering. LiveMaterializationClaimForJob
+// takes one row `ORDER BY m.id`, so with two non-terminal claims coexisting -
+// the normal state after a re-drive - it names an arbitrary one; a close rule
+// built on it authorized retiring the live drive's own surface whenever the
+// older claim happened to sort first. Only a strictly newer sibling supersedes,
+// so the newest claim is never superseded whichever way the ids fall.
+func TestSupersededMaterializationClaimIsOrderIndependent(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	jobID, err := js.CreateRequest(ctx, "materialization-superseded", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := institutionalProfile(t, js, "library", "digest-sup", "auth-sup")
+	claimFor := func(candidateID string, createdAt string) *MaterializationClaim {
+		t.Helper()
+		candidate := institutionalCandidate(t, js, profile, candidateID, jobID)
+		claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+			CandidateID: candidate.ID, BrowserHolderGeneration: 5, JobAttemptRevision: 1,
+			InstitutionProfileRevision: profile.Revision, RouteRevision: 7,
+			MaterializationKind: "browser_tab", LeaseUntil: time.Now().UTC().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// ClaimMaterialization stamps its own created_at, and two claims in one
+		// test can land on the same instant; the ordering under test is
+		// (created_at, id), so the fixture states the times explicitly.
+		if _, err := js.S.DB().ExecContext(ctx,
+			`UPDATE materialization_claims SET created_at=?, phase='navigated' WHERE id=?`, createdAt, claim.ID); err != nil {
+			t.Fatal(err)
+		}
+		claim.CreatedAt = createdAt
+		return claim
+	}
+	older := claimFor("candidate-superseded-older", "2026-08-26T01:00:00Z")
+	newer := claimFor("candidate-superseded-newer", "2026-08-26T02:00:00Z")
+
+	for _, tc := range []struct {
+		name  string
+		claim *MaterializationClaim
+		want  bool
+	}{
+		{name: "older claim is superseded", claim: older, want: true},
+		{name: "newest claim is never superseded", claim: newer, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := js.SupersededMaterializationClaim(ctx, tc.claim.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("superseded(%s) = %v, want %v", tc.claim.ID, got, tc.want)
+			}
+		})
+	}
+
+	// A terminal sibling is not a drive, so retiring the survivor's surface must
+	// not be authorized by it.
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='abandoned' WHERE id=?`, newer.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := js.SupersededMaterializationClaim(ctx, older.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got {
+		t.Fatal("an abandoned sibling must not supersede a live claim")
+	}
+	if got, err := js.SupersededMaterializationClaim(ctx, "claim-that-never-existed"); err != nil || got {
+		t.Fatalf("unknown claim = %v, %v; want false, nil", got, err)
+	}
+}

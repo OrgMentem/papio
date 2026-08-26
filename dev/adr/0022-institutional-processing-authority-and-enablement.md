@@ -500,8 +500,19 @@ A retained copy may be retired only as a superseded duplicate, and only on
 positive evidence: papio created it, a NEWER retained copy of the same paper
 exists, the surface is still content inside papio's container, the operator has
 not made it active or pinned it, and it has outlived the measured cold window.
-The daemon then decides independently under `claim_abandoned`, which it grants
-only when that binding's claim really is abandoned; a binding with no claim is
-browser-local by the existing contract. The newest copy is never a candidate,
-so the paper never leaves the operator's screen. This retires no
-operator-owned content tab, and rollback remains as stated above.
+The newest copy is never a candidate, so the paper never leaves the operator's
+screen. This retires no operator-owned content tab, and rollback remains as
+stated above.
+
+The daemon decides independently, and `surface_superseded` gains the one
+eligibility this needs. Its previous rule authorized only a tab OTHER than the
+named binding's driven tab, which fits duplicates that share one binding but
+refuses the case measured here: a re-drive mints a new claim for the same paper
+and abandons nothing, so the superseded claim keeps `navigated` and its own tab
+until the next holder promotion sweeps its lapsed lease. `claim_abandoned` is
+therefore false for it, and every ask was refused. The authority is now the
+JOB's live claim: a binding whose claim is not the job's live claim no longer
+drives that paper, so its surface may be retired, with the pre-existing effect
+veto retained — an unsettled provider effect on that exact claim still refuses.
+A binding that IS the job's live claim keeps its tab, and a binding with no
+claim at all remains browser-local by the existing contract.

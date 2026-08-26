@@ -2532,25 +2532,58 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 			eligible = permit == nil || permit.ClaimID != claim.ID
 		}
 	case "surface_superseded":
-		// The one disposition the daemon can settle without reasoning about the
-		// job at all: the browser names a tab, and papio compares it to the tab
-		// it believes drives this claim. A different tab is provably not the
-		// drive, in any phase, so retiring it cannot interrupt anything papio
-		// has a stake in - which is why no permit check follows. The same tab is
-		// refused outright: that IS the drive, and the browser asking to close
-		// it means the two sides disagree about which surface is live.
+		// The browser names a tab, and papio compares it to the tab it believes
+		// drives this claim. A different tab is provably not the drive, in any
+		// phase, so retiring it cannot interrupt anything papio has a stake in
+		// - which is why no permit check follows on that branch.
 		//
 		// This exists because a duplicate could previously only be retired by
 		// asserting scaffold_idle, a binding-wide claim that a navigated claim
 		// structurally fails. The operator's browser accumulated three tabs on
 		// one paper that way (measured live 2026-08-22).
+		//
+		// The named surface being this binding's OWN driven tab used to be
+		// refused outright, on the reasoning that the two sides disagreed about
+		// which surface is live. That reasoning holds only while this claim is
+		// still the newest one for the paper. It usually is not: a re-drive
+		// mints a NEW claim for the same paper and simply leaves the previous
+		// one behind, and a lapsed lease is swept only at the next holder
+		// promotion - so the superseded claim sits in `navigated` for the rest
+		// of the browser session while its tab sits on the operator's screen.
+		// Measured live 2026-08-26: six claims, six tabs, one paper, every
+		// close refused.
+		//
+		// The authority is a strictly NEWER non-terminal sibling claim on the
+		// same job attempt, never LiveMaterializationClaimForJob: that helper
+		// orders by opaque claim id and returns one row, so with two claims
+		// coexisting it names an arbitrary one and would have authorized
+		// retiring the live drive's own surface about half the time (caught by
+		// `-race` before this shipped). An unsettled effect for THIS claim
+		// still vetoes closure.
 		switch {
 		case p.SurfaceTabID == nil:
 			result.Detail = "surface_superseded requires the superseded tab"
-		case *p.SurfaceTabID == claim.TabID:
-			result.Detail = "the named surface is the binding's driven tab"
-		default:
+		case *p.SurfaceTabID != claim.TabID:
 			eligible = true
+		default:
+			superseded, supErr := b.jobs.SupersededMaterializationClaim(ctx, claim.ID)
+			if supErr != nil {
+				result.Outcome, result.Detail = "error", "binding claim state is unavailable"
+				return frame()
+			}
+			if !superseded {
+				result.Detail = "the named surface is the binding's driven tab"
+				break
+			}
+			permit, permitErr := b.jobs.LiveEffectPermit(ctx)
+			if permitErr != nil {
+				result.Outcome, result.Detail = "error", "effect permit state is unavailable"
+				return frame()
+			}
+			eligible = permit == nil || permit.ClaimID != claim.ID
+			if !eligible {
+				result.Detail = "the binding's provider effect is not settled"
+			}
 		}
 	case "job_inactive":
 		// A navigated surface is not closable merely because it looks old.

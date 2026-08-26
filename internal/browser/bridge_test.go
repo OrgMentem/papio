@@ -15218,6 +15218,89 @@ func TestSurfaceCloseSupersededAuthorizesOnlyANonDrivingTab(t *testing.T) {
 	}
 }
 
+// A re-drive mints a NEW claim for the same paper and leaves the previous one
+// in `navigated` with its tab still on the operator's screen; a lapsed lease is
+// swept only at the next holder promotion, so that superseded claim can sit
+// there for the whole browser session. Refusing every close because the named
+// tab is the SUPERSEDED claim's own driven tab is what kept those tabs:
+// measured live 2026-08-26, six claims and six tabs for one paper, every ask
+// refused. The job's own live claim decides which surface drives it.
+func TestSurfaceCloseSupersededRetiresAReDrivenClaimsOwnTab(t *testing.T) {
+	ctx := context.Background()
+	seedSuperseding := func(t *testing.T, b *Bridge, jobs *job.Store, first *job.MaterializationClaim, suffix string) *job.MaterializationClaim {
+		t.Helper()
+		candidate, err := jobs.GetBrowserCandidate(ctx, first.CandidateID)
+		if err != nil || candidate == nil {
+			t.Fatalf("candidate for %s: %+v %v", first.CandidateID, candidate, err)
+		}
+		if _, err := jobs.CreateBrowserCandidate(ctx, job.BrowserCandidateInput{
+			ID: "candidate-" + suffix, JobID: candidate.JobID, JobAttemptRevision: candidate.JobAttemptRevision,
+			InstitutionProfileID: candidate.InstitutionProfileID, InstitutionProfileRevision: candidate.InstitutionProfileRevision,
+			RouteRevision: candidate.RouteRevision + 1, RouteClass: "institutional", IdentifierStrategy: "doi",
+			PreRouteSafetyKey: "safety-" + suffix, SafetyDomainID: "domain-" + suffix,
+			AdapterRevision: "adapter", EffectContractID: "effect", Status: "eligible",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		second, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+			CandidateID: "candidate-" + suffix, BrowserHolderGeneration: b.epoch,
+			JobAttemptRevision: candidate.JobAttemptRevision, InstitutionProfileRevision: candidate.InstitutionProfileRevision,
+			RouteRevision: candidate.RouteRevision + 1, MaterializationKind: "browser_tab",
+			LeaseUntil: time.Now().UTC().Add(time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return second
+	}
+	ask := func(t *testing.T, b *Bridge, claim *job.MaterializationClaim, tabID int64) *protocol.SurfaceCloseResponsePayload {
+		t.Helper()
+		frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
+			RequestID: "req-close-redrive", BindingID: claim.BindingID,
+			BrowserHolderGeneration: b.epoch, Disposition: "surface_superseded",
+			SurfaceTabID: &tabID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decodeSurfaceCloseResponse(t, frames)
+	}
+
+	t.Run("superseded claim's own tab is authorized", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, materializationHello(t))
+		first := seedSurfaceCloseClaim(t, b, jobs, "redrive-first", "navigated")
+		seedSuperseding(t, b, jobs, first, "redrive-second")
+		got := ask(t, b, first, first.TabID)
+		if got.Outcome != "authorized" {
+			t.Fatalf("outcome = %q (detail %q), want authorized", got.Outcome, got.Detail)
+		}
+	})
+
+	t.Run("the job's live claim keeps its own tab", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, materializationHello(t))
+		first := seedSurfaceCloseClaim(t, b, jobs, "redrive-live", "navigated")
+		second := seedSuperseding(t, b, jobs, first, "redrive-live-second")
+		got := ask(t, b, second, second.TabID)
+		if got.Outcome != "not_eligible" || got.Detail != "the named surface is the binding's driven tab" {
+			t.Fatalf("outcome = %q detail = %q, want not_eligible on the driven tab", got.Outcome, got.Detail)
+		}
+	})
+
+	t.Run("an unsettled effect on the superseded claim still vetoes", func(t *testing.T) {
+		b, jobs, _, _ := newBridge(t)
+		runSync(t, b, materializationHello(t))
+		first := seedSurfaceCloseClaim(t, b, jobs, "redrive-permit", "navigated")
+		seedSuperseding(t, b, jobs, first, "redrive-permit-second")
+		seedLiveEffectPermitForClaim(t, jobs, first, "permit-redrive")
+		got := ask(t, b, first, first.TabID)
+		if got.Outcome != "not_eligible" || got.Detail != "the binding's provider effect is not settled" {
+			t.Fatalf("outcome = %q detail = %q, want the effect veto", got.Outcome, got.Detail)
+		}
+	})
+}
+
 func TestRequestDevReloadRequiresHolder(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	_, _, err := b.RequestDevReload()
