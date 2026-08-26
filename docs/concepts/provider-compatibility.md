@@ -60,7 +60,7 @@ invoke.
 | ProQuest | OpenURL handler; requires the `accountid` parameter | `proquest` | Verified working | 2026-07-18 | Appending `accountid` unlocks the institutional route before the provider's federated-login fallback. |
 | Psychiatry Online | Silverchair `data-article-access='full'` state plus a rendered `#downloadPdfUrl` anchor, read directly | `psychiatryonline` | Verified route | 2026-07-20 | Denied pages may still render `downloadPdfUrl`, so the full-access marker is checked first. |
 | SAGE Journals | Rendered `section.format--pdf_epub` panel gates a derived `/doi/pdf/<doi>?download=true` endpoint | `sage` | Verified route | 2026-07-27 | SAGE stopped rendering the earlier `a#downloadPdfUrl` anchor in July 2026; the adapter was rewritten to key on the semantic PDF/EPUB panel instead of a viewer-only eReader href. |
-| ScienceDirect | `citation_pdf_url` meta (the Highwire/Google-Scholar standard) fetched directly, gated on recorded terms consent | `sciencedirect` | Unverified | Not live-verified | Live observations now include the primary access-bar path, viewer adoption, and provider outcome, but no retained validated artifact reached `ready`; page capture or provider outcome alone is insufficient to call the exact route canary-qualified or **Verified working**. The `no_entitlement` rule remains live-verified (2026-08-06, from a real institutional handoff). |
+| ScienceDirect | Chrome: rendered access-bar **View PDF** anchor opens the provider viewer; viewer adoption captures its PDF. Firefox: human-assisted, because the route requires a click download | `sciencedirect` | Unverified | Not live-verified | An entitled capture proves the primary `/pdfft` control and the adapter keeps its work window visible because the control does not hydrate while minimized. No retained validated artifact has reached `ready`, so the exact route is not yet **Verified working**. The no-entitlement state was re-verified live on 2026-08-26 after a fresh institutional sign-in: ScienceDirect replaced `.PurchasePDF` with a labelled `/getaccess/pii/<pii>/purchase` anchor, which adapter 0.5.0 now recognizes. |
 | SpringerLink | Rendered `a[data-test='pdf-link']` anchor to `/content/pdf/`, read directly | `springer` | Verified route | 2026-07-14 | Verified live against both entitled and no-entitlement article states. |
 | Taylor & Francis Online | Rendered `.downloadPDFLink a.show-pdf` anchor to `/doi/pdf/`, gated on an Open Access or full-access badge | `tandfonline` | Verified route | 2026-08-06 | Journal platform only — distinct from `taylorfrancis.com` books, whose `citation_pdf_url` can be a preview only. `no_entitlement` runs first since Access Denial pages carry no download control at all. |
 | Thieme E-Journals | Rendered `#pdfLink` anchor, read directly, gated on the platform's full-text page state | `thieme` | Verified route | 2026-07-20 | Verified against public full-text pages; the abstract-only route stays unknown/assisted since `citation_pdf_url` and `#pdfLink` also appear there. |
@@ -70,11 +70,11 @@ invoke.
 
 Firefox does not expose Chrome's `downloads.onDeterminingFilename` hook, so
 *papio* cannot correlate a download back to its job by tab or provider host
-there. The three `click`-method adapters — `informit`, `jamanetwork`, and
-`annualreviews` — stay human-assisted in Firefox by design: the adapter does
-not invoke the page's download control at all, and the human clicks it and
-then uses **Send PDF to papio** to adopt the file. Direct `href`, `url`,
-`meta`, and `api` adapters carry their own job-scoped filename and are
+there. The four `click`-method adapters — `informit`, `sciencedirect`,
+`jamanetwork`, and `annualreviews` — stay human-assisted in Firefox by design:
+the adapter does not invoke the page's download control at all, and the human
+clicks it and then uses **Send PDF to papio** to adopt the file. Direct `href`,
+`url`, `meta`, and `api` adapters carry their own job-scoped filename and are
 unaffected; they remain subject to their individual route status above.
 
 ## Reporting a broken provider

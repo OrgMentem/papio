@@ -32,6 +32,19 @@ export function detectAuthFailure(url: string, title: string | undefined): AuthF
   }
   const host = parsed.hostname.toLowerCase();
   const path = parsed.pathname.toLowerCase();
+  // Elsevier's institutional OAuth handoff can end on this opaque session
+  // resume route after the organization choice. The route is also the live
+  // continuation endpoint, so URL shape alone is not a failure signal. The
+  // terminal page's exact title is the stable distinction measured on
+  // 2026-08-20, 2026-08-24, and 2026-08-26. Keep this outside the broad IdP
+  // marker scan: id.elsevier.com also serves working authorization pages.
+  if (
+    host === "id.elsevier.com" &&
+    /^\/as\/[^/]+\/resume\/as\/authorization\.ping$/i.test(path) &&
+    title?.trim().toLowerCase() === "sorry"
+  ) {
+    return "auth_error";
+  }
   if (!isIdPHost(host, path)) return undefined;
   const haystack = (path + " " + parsed.search + " " + (title ?? "")).toLowerCase();
   if (STALE_MARKERS.some((marker) => haystack.includes(marker))) return "stale_sso";

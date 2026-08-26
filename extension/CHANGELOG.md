@@ -43,6 +43,32 @@ for the full pre-split extension history.
   signing in changes.
 
 ### Fixed
+- **Elsevier's dead institutional return is no longer mistaken for a live
+  sign-in.** After a valid library sign-in, Elsevier can end its own
+  organization-choice flow at an opaque `/resume/as/authorization.ping` page
+  titled **Sorry**. *papio* treated that terminal page as ordinary
+  authentication machinery, so the one institution sign-in slot stayed
+  occupied while every other library paper waited behind it. *papio* now
+  reports and surfaces that exact page as an authentication error. It does not
+  click an organization choice or replay the expired OAuth state: both would
+  guess at account identity. The normal continuation at the same URL stays
+  untouched until Elsevier positively renders the terminal title.
+- **A ScienceDirect paywall no longer looks like a broken adapter.** After a
+  fresh institutional sign-in, ScienceDirect now renders **Purchase PDF** as a
+  labelled `/getaccess/pii/<pii>/purchase` link and no longer uses the
+  `.PurchasePDF` class *papio* knew. The real no-access page therefore fell
+  through as `ui_changed`, kept the institution sign-in slot occupied, and sent
+  you hunting for a PDF that your institution does not hold. *papio* now reads
+  the new provider-owned purchase link as positive no-entitlement evidence.
+  On Chrome, the **View PDF** rule still runs first, so a page that really
+  offers the paper remains automatic; Firefox keeps every click-method adapter
+  human-assisted because it has no filename-correlation hook. A no-access
+  verdict also has to carry the requested paper's DOI — another article's
+  purchase link cannot close this paper — and closes its parked provider
+  surface with the claim-safe `handoff_parked` disposition. This releases the
+  institution sign-in slot even when the daemon immediately requeues the paper
+  into document delivery, instead of leaving every later library paper behind
+  a browser claim whose work has already ended.
 - **A paper whose PDF link was there all along is no longer handed back to you.**
   *papio* opens library handoffs in a hidden background window, and some
   publisher pages draw their download controls only once they are on screen.

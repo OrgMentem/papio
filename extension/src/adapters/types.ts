@@ -696,14 +696,15 @@ export const adapters: AdapterSpec[] = [
     // captures. Fetching the bare href directly redirects to Cookie Notice HTML.
     //
     // The no_entitlement rule is separate live evidence (fixtures/
-    // sciencedirect/no-entitlement.html, captured 2026-08-06 from a real
-    // institutional handoff). Without it an unentitled article classified
-    // `unknown`, which papio reports as an adapter coverage gap rather than the
-    // actual lack of access. The paywall publishes PurchasePDF and no ViewPDF
-    // control. `article` stays first so the positive entitlement signal wins if
-    // a transitional page briefly carries both.
+    // sciencedirect/no-entitlement.html, captured 2026-08-26 after a fresh UNE
+    // institutional sign-in). The paywall publishes one provider-owned
+    // `/getaccess/pii/<pii>/purchase` anchor labelled "Purchase PDF" and no View
+    // PDF control. ScienceDirect removed the old `.PurchasePDF` class, so that
+    // page used to fall through as `ui_changed` and keep the institution's one
+    // sign-in slot occupied. `article` stays first so a transitional page that
+    // briefly carries both still trusts the positive entitlement signal.
     id: "sciencedirect",
-    version: "0.4.0",
+    version: "0.5.0",
     hosts: ["sciencedirect.com"],
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
@@ -730,7 +731,10 @@ export const adapters: AdapterSpec[] = [
       },
       {
         kind: "no_entitlement",
-        all: [".accessbar .PurchasePDF"],
+        all: [
+          "meta[name='citation_doi']",
+          ".access-options a.accessbar-utility-link[aria-label='Purchase PDF'][href^='/getaccess/pii/'][href$='/purchase']",
+        ],
       },
     ],
     download: {

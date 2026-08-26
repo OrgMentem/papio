@@ -13157,7 +13157,10 @@ export class Bridge {
     await this.removeJobWithOffer(jobID);
   }
 
-  private async removeJobWithOffer(jobID: string): Promise<void> {
+  private async removeJobWithOffer(
+    jobID: string,
+    closeDisposition: SurfaceCloseDisposition = "job_inactive",
+  ): Promise<void> {
     this.destroyDeliveryChoicesForJob(jobID);
     const job = findByJob(this.store, jobID);
     const materialization = this.materializationCorrelation(jobID);
@@ -13226,7 +13229,7 @@ export class Bridge {
     const closeTabID =
       tabID !== undefined && tabID >= 0 ? tabID : materializationTabID;
     if (closeTabID !== undefined && closeTabID >= 0)
-      void this.closeOwnedSurface(closeTabID, "job_inactive");
+      void this.closeOwnedSurface(closeTabID, closeDisposition);
   }
 
   /** A keepalive tab can outlive a cancellation, so clear its removed paper's
@@ -18894,8 +18897,8 @@ export class Bridge {
    * The steering window switched itself off at precisely the moment the
    * action asking the researcher to download was created.
    *
-   * `no_entitlement` opens no action — the daemon requeues or parks the job
-   * as unavailable — so it keeps the plain removal. */
+   * `no_entitlement` opens no browser action — the daemon requeues or parks
+   * the job elsewhere — so the browser record dies with its parked surface. */
   private async settleHandoffAfterOutcome(
     jobID: string,
     outcome: "ui_changed" | "wrong_work" | "no_entitlement",
@@ -18903,7 +18906,15 @@ export class Bridge {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return;
     if (outcome === "no_entitlement") {
-      await this.removeJobWithOffer(jobID);
+      // This browser-side drive is explicitly parked and has no provider
+      // effect left. `job_inactive` races the daemon's no-entitlement requeue:
+      // once rediscovery opens a document-delivery action the job is active
+      // again, so that disposition is refused and the navigated claim keeps
+      // the institution's one sign-in slot forever. `handoff_parked` states
+      // only the fact the browser owns; the daemon still vetoes it while an
+      // effect permit is live. The authorized tab removal then reports
+      // owner_closed and retires the binding plus its authentication lease.
+      await this.removeJobWithOffer(jobID, "handoff_parked");
       return;
     }
     await this.retainForManualDownload(jobID);

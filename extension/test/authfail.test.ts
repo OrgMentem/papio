@@ -54,6 +54,23 @@ test("IdP page with no failure markers stays undefined", () => {
   ).toBeUndefined();
 });
 
+test("Elsevier terminal authorization resume page classifies auth_error", () => {
+  const resume =
+    "https://id.elsevier.com/as/session-token/resume/as/authorization.ping?client_id=SDFE-v4";
+  expect(detectAuthFailure(resume, "Sorry")).toBe("auth_error");
+  // The same endpoint is the live OAuth continuation before Elsevier renders
+  // the terminal page. URL shape alone must never abort that continuation.
+  expect(detectAuthFailure(resume, undefined)).toBeUndefined();
+  expect(detectAuthFailure(resume, "ScienceDirect")).toBeUndefined();
+  // A publisher page with the same generic title is not identity machinery.
+  expect(
+    detectAuthFailure(
+      "https://www.sciencedirect.com/science/article/pii/S0747563216303168",
+      "Sorry",
+    ),
+  ).toBeUndefined();
+});
+
 test("malformed URL stays undefined", () => {
   expect(detectAuthFailure("not a url", "stale")).toBeUndefined();
 });

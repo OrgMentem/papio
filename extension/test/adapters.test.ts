@@ -937,8 +937,15 @@ test.skipIf(sciencedirectPaywall === null)(
     const page = sciencedirectPaywall as Document;
     // Reporting this as `unknown` told the user papio could not drive the page
     // and sent them hunting an adapter bug, when the resolver had simply
-    // routed them somewhere they have no access.
+    // routed them somewhere they have no access. The 2026-08-26 capture is the
+    // exact page that reproduced this: ScienceDirect removed `.PurchasePDF`
+    // and replaced it with a labelled `/getaccess/pii/.../purchase` anchor.
     expect(page.querySelector("meta[name='citation_pdf_url']")).toBeNull();
+    expect(
+      page.querySelector(
+        ".access-options a.accessbar-utility-link[aria-label='Purchase PDF'][href^='/getaccess/pii/'][href$='/purchase']",
+      ),
+    ).not.toBeNull();
     expect(interpret(page, spec, ctx()).kind).toBe("no_entitlement");
   },
 );
@@ -946,13 +953,31 @@ test.skipIf(sciencedirectPaywall === null)(
 test("an entitled ScienceDirect page still wins over the purchase-wall rule", () => {
   const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
   const page = parseHTML(
-    "<html><head><meta name='citation_title' content='A paper'></head>" +
+    "<html><head><meta name='citation_title' content='A paper'>" +
+      "<meta name='citation_doi' content='10.1016/example'></head>" +
       "<body><div class='accessbar'><ul>" +
       "<li class='ViewPDF'><a class='accessbar-utility-link' href='/science/article/pii/S1/pdfft'>View PDF</a></li>" +
-      "<li class='PurchasePDF'>Purchase PDF</li>" +
-      "</ul></div></body></html>",
+      "</ul></div>" +
+      "<div class='access-options'><a class='accessbar-utility-link' aria-label='Purchase PDF' href='/getaccess/pii/S1/purchase'>Purchase PDF</a></div></body></html>",
   );
   expect(interpret(page, spec, ctx()).kind).toBe("article");
+});
+
+test("ScienceDirect purchase-like links outside an identified article fail closed", () => {
+  const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+  for (const page of [
+    parseHTML(
+      "<html><head><meta name='citation_doi' content='10.1016/example'></head>" +
+        "<body><a class='accessbar-utility-link' aria-label='Purchase PDF' href='/getaccess/pii/S1/purchase'>Purchase PDF</a></body></html>",
+    ),
+    parseHTML(
+      "<html><body><div class='access-options'>" +
+        "<a class='accessbar-utility-link' aria-label='Purchase PDF' href='/getaccess/pii/S1/purchase'>Purchase PDF</a>" +
+        "</div></body></html>",
+    ),
+  ]) {
+    expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  }
 });
 
 test("Taylor and Francis book metadata is outside the journal adapter host scope", () => {

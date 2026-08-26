@@ -669,7 +669,12 @@ export function planExecution(
       return { assisted: "terms effect has no requested work binding" };
     }
     if (
-      (classified.verdict.kind === "article" || classified.verdict.kind === "terms") &&
+      (classified.verdict.kind === "article" ||
+        classified.verdict.kind === "terms" ||
+        (classified.verdict.kind === "no_entitlement" &&
+          ((spec.workEvidence?.kind === "doi" && requestedDOI !== null) ||
+            (spec.workEvidence?.kind === "title" &&
+              requestedTitle !== null)))) &&
       (requestedDOI !== null || requestedTitle !== null)
     ) {
       const evidence = workEvidenceFor(spec.workEvidence, requestedDOI, requestedTitle);

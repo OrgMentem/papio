@@ -5567,6 +5567,11 @@ test("a resolver no-entitlement route emits once and short-circuits provider cla
   const h = makeHarness();
   const injections: Parameters<BridgeDeps["scripting"]["executeScript"]>[0][] =
     [];
+  let closeDisposition: SurfaceCloseDisposition | undefined;
+  closeInternals(h).closeOwnedSurface = async (_tabID, disposition) => {
+    closeDisposition = disposition;
+    return { closed: true };
+  };
   h.deps.permissions.contains = async () => true;
   h.deps.adapterSpecs.push({
     ...PROVIDER_ADAPTER,
@@ -5597,6 +5602,12 @@ test("a resolver no-entitlement route emits once and short-circuits provider cla
   expect(
     injections.every((injection) => injection.func === routeResolverService),
   ).toBe(true);
+  // The daemon may already have requeued this work into document delivery by
+  // the time the close request arrives. `job_inactive` is false again in that
+  // state and was refused live, leaving the navigated claim holding the
+  // institution's one sign-in slot. The browser's exact fact is that this
+  // handoff is parked and has no effect in flight.
+  expect(closeDisposition).toBe("handoff_parked");
 });
 
 test("a resolver no-service route stays assisted without an outcome", async () => {
@@ -12596,6 +12607,36 @@ test("recoverable IdP errors surface without navigating away from their forms", 
       props: { focused: true, drawAttention: true, state: "normal" },
     });
   }
+});
+
+test("Elsevier terminal organization return surfaces as an authentication error", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const tabID = await offerIntoWorkWindow(h, "job_elsevier_auth_error");
+  const resume =
+    "https://id.elsevier.com/as/session-token/resume/as/authorization.ping?client_id=SDFE-v4";
+  h.tabs.seed({
+    id: tabID,
+    url: resume,
+    title: "Access through your organization",
+    windowId: 500,
+  });
+  await h.tabs.userNavigate(tabID, resume);
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+
+  const navigationsBeforeError = h.tabs.navigations.length;
+  h.tabs.seed({ id: tabID, url: resume, title: "Sorry", windowId: 500 });
+  await h.tabs.update(tabID, { title: "Sorry" });
+
+  expect(
+    h.frames().find((frame) => frame.type === "handoff_outcome")?.payload,
+  ).toMatchObject({
+    outcome: "auth_error",
+    final_host: "id.elsevier.com",
+  });
+  expect(h.tabs.navigations).toHaveLength(navigationsBeforeError);
+  expect(h.tabs.snapshot(tabID)?.url).toBe(resume);
+  expect(h.tabs.activated).toContain(tabID);
 });
 
 test("concurrent stale-page title and complete events spend one recovery attempt", async () => {

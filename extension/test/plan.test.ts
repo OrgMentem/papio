@@ -341,6 +341,77 @@ test("planExecution requires the exact unique citation DOI meta and declared met
   }
 });
 
+test("no-entitlement verdicts are bound to the requested work", () => {
+  const spec: AdapterSpec = {
+    id: "no-entitlement-bound",
+    version: "1",
+    hosts: ["publisher.test"],
+    workEvidence: {
+      kind: "doi",
+      selector: "meta[name='citation_doi']",
+      attribute: "content",
+    },
+    classify: [{ kind: "no_entitlement", all: [".purchase"] }],
+  };
+  const purchase = '<body><a class="purchase">Purchase PDF</a></body>';
+  const correct = planExecution(
+    parseHTML(
+      '<html><head><meta name="citation_doi" content="10.1000/right"></head>' +
+        purchase +
+        "</html>",
+      "https://publisher.test/article",
+    ),
+    spec,
+    { doi: "10.1000/right" },
+    {},
+  );
+  expect("assisted" in correct ? null : correct.verdict.kind).toBe(
+    "no_entitlement",
+  );
+  const wrongPage = parseHTML(
+    '<html><head><meta name="citation_doi" content="10.1000/other"></head>' +
+      purchase +
+      "</html>",
+    "https://publisher.test/article",
+  );
+  expect(
+    planExecution(wrongPage, spec, { doi: "10.1000/right" }, {}),
+  ).toHaveProperty("assisted");
+  // Older no-entitlement adapters such as Ex Libris Primo have no page
+  // identity contract. This shared hardening must not turn their passive
+  // terminal verdict into a coverage gap; only a declared contract can bind.
+  const { workEvidence: _workEvidence, ...unbound } = spec;
+  const compatible = planExecution(
+    wrongPage,
+    unbound,
+    { doi: "10.1000/right" },
+    {},
+  );
+  expect("assisted" in compatible ? null : compatible.verdict.kind).toBe(
+    "no_entitlement",
+  );
+  // A declared contract on an identity axis the offer does not carry cannot
+  // bind either. Existing title-backed adapters still settle a DOI-only offer;
+  // once the offer carries a title, the same contract becomes enforceable.
+  const titleOnly: AdapterSpec = {
+    ...spec,
+    workEvidence: {
+      kind: "title",
+      selector: "meta[name='citation_title']",
+      attribute: "content",
+    },
+  };
+  const doiOnly = planExecution(
+    wrongPage,
+    titleOnly,
+    { doi: "10.1000/right" },
+    {},
+  );
+  expect("assisted" in doiOnly ? null : doiOnly.verdict.kind).toBe(
+    "no_entitlement",
+  );
+});
+
 test("ACM work evidence uses the declared publication DOI and rejects absent, duplicate, or wrong evidence", () => {
   const spec = adapters.find((candidate) => candidate.id === "acm") as AdapterSpec;
   const html = fixtureHTML("acm", "success");
