@@ -9296,6 +9296,7 @@ test("a resolver-routed landing on a visible-required adapter reloads instead of
   // the unpainted document stays - so the page must be fetched again while
   // visible, and this landing must record no outcome at all.
   const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
   h.deps.adapterSpecs = [{ ...PROVIDER_ADAPTER, requiresVisible: true }];
   h.deps.permissions.contains = async () => true;
   await h.bridge.start();
@@ -9323,6 +9324,15 @@ test("a resolver-routed landing on a visible-required adapter reloads instead of
   expect(h.tabs.snapshot(tabID)?.active).toBe(true);
   expect(h.tabs.reloaded).toHaveLength(reloadsBeforeBackgroundReturn + 1);
   expect(h.frames().filter((f) => f.type === "provider_outcome")).toEqual([]);
+  // papio's own reveal must not read as the operator taking the tab over: the
+  // activation is papio's, so it carries a focus token and the birth record
+  // keeps its paper. A cede here erases the job binding, which is exactly how
+  // every revealed ScienceDirect surface lost its identity live on 2026-08-26
+  // (`ceded_reason: operator_activated`).
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const revealed = closeInternals(h).tabLedgerCache[String(tabID)];
+  expect(revealed?.ceded).toBeUndefined();
+  expect(revealed?.ceded_reason).toBeUndefined();
 });
 
 test("work window is reused across offers and recreated after the user closes it", async () => {

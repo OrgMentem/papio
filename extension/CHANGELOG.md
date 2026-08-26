@@ -93,6 +93,14 @@ for the full pre-split extension history.
   touched it for half an hour. The paper you can read never closes: pinning a
   tab, using it, or dragging it out of *papio*'s window hands it to you
   permanently, and a kept paper is never reused for a later attempt.
+- **Bringing a hidden paper into view no longer makes *papio* let go of it.**
+  When a publisher page will not draw while hidden, *papio* shows the window
+  and makes that paper the active tab. It then read its own action as you
+  taking the tab over, and let go of the tab for good — so the tab it had just
+  revealed could never be tidied up again, and nothing knew which paper it
+  held. *papio* now recognises its own action. A tab you activate yourself is
+  still yours permanently, and a kept tab now records why *papio* let go of
+  it, so a wrong hand-off can be seen instead of guessed at.
 - **A PDF reached through your library now stays connected to its paper when
   the publisher changes.** A library route can end at a different publisher
   host. After *papio* asked you to finish that download yourself, it remembered

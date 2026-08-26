@@ -5892,7 +5892,13 @@ export class Bridge {
       const tab = await this.deps.tabs.get(tabID);
       if (tab.active !== true) {
         if (this.deps.tabs.update === undefined) return false;
-        await this.deps.tabs.update(tabID, { active: true });
+        // Through focusOwnedTab, never a raw tabs.update: an activation papio
+        // does not claim is indistinguishable from an operator's click, so
+        // onTabActivated reads it as takeover and cedes the record - which
+        // erases the paper identity from the very surface this reveal exists
+        // to make usable. Measured live 2026-08-26: every revealed
+        // ScienceDirect surface came back `ceded_reason: operator_activated`.
+        await this.focusOwnedTab(tabID);
         changed = true;
       }
     } catch {
