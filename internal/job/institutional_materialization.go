@@ -1039,7 +1039,7 @@ func (js *Store) LiveMaterializationClaimForJob(ctx context.Context, jobID strin
 }
 
 // SupersededMaterializationClaim reports whether a strictly NEWER non-terminal
-// claim exists for the same job attempt, which is the exact fact "this claim no
+// claim exists for the same PAPER, which is the exact fact "this claim no
 // longer drives this paper" rests on.
 //
 // LiveMaterializationClaimForJob cannot answer this: it orders by opaque claim
@@ -1049,6 +1049,14 @@ func (js *Store) LiveMaterializationClaimForJob(ctx context.Context, jobID strin
 // answer would authorize retiring the live drive's own surface roughly half the
 // time. Ordering here is (created_at, id), and only a strictly newer sibling
 // counts, so the newest claim is never superseded by anything.
+//
+// The job, not the job ATTEMPT, is the scope, and that distinction is load
+// bearing: a requeue bumps the attempt revision, so a paper that went round
+// through document delivery has its newer drive on a later attempt entirely.
+// Scoping to one attempt found no newer sibling and refused every close, with
+// the superseded surface still on screen (measured live 2026-08-26). A newer
+// attempt supersedes an older one more definitively than a sibling within one
+// attempt does; an OLDER attempt never supersedes anything.
 //
 // A newer generation's claim also supersedes: the holder fence retires older
 // generations, never the reverse. The profile joins mirror the live query, so a
@@ -1068,7 +1076,7 @@ func (js *Store) SupersededMaterializationClaim(ctx context.Context, claimID str
 		JOIN institution_profiles p ON p.id = c.institution_profile_id
 		WHERE self.id = ?
 		  AND c.job_id = selfc.job_id
-		  AND c.job_attempt_revision = selfc.job_attempt_revision
+		  AND c.job_attempt_revision >= selfc.job_attempt_revision
 		  AND m.phase IN ('claimed','bound','route_issued','navigated')
 		  AND m.browser_holder_generation >= self.browser_holder_generation
 		  AND p.tombstoned_at IS NULL

@@ -1102,3 +1102,68 @@ func TestSupersededMaterializationClaimIsOrderIndependent(t *testing.T) {
 		t.Fatalf("unknown claim = %v, %v; want false, nil", got, err)
 	}
 }
+
+// A requeue bumps the job attempt revision, so a paper that went round through
+// document delivery has its newer drive on a LATER attempt. Scoping the
+// comparison to one attempt found no newer sibling, refused every close, and
+// left the superseded surface on screen (measured live 2026-08-26). An older
+// attempt must never supersede anything.
+func TestSupersededMaterializationClaimSpansJobAttempts(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	jobID, err := js.CreateRequest(ctx, "materialization-attempts", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := institutionalProfile(t, js, "library", "digest-att", "auth-att")
+	claimAt := func(candidateID string, attempt int64, createdAt string) *MaterializationClaim {
+		t.Helper()
+		// Claimed at attempt 1 through the real constructor, then re-dated: a
+		// live requeue bumps the job's own attempt revision, and this test is
+		// about the comparison, not about replaying a requeue.
+		if _, err := js.CreateBrowserCandidate(ctx, BrowserCandidateInput{
+			ID: candidateID, JobID: jobID, JobAttemptRevision: 1,
+			InstitutionProfileID: profile.ID, InstitutionProfileRevision: profile.Revision,
+			RouteRevision: 7, RouteClass: "institutional", IdentifierStrategy: "doi",
+			PreRouteSafetyKey: "safety-" + candidateID, SafetyDomainID: "domain-" + candidateID,
+			AdapterRevision: "adapter-1", EffectContractID: "effect-1", Status: "eligible",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+			CandidateID: candidateID, BrowserHolderGeneration: 5, JobAttemptRevision: 1,
+			InstitutionProfileRevision: profile.Revision, RouteRevision: 7,
+			MaterializationKind: "browser_tab", LeaseUntil: time.Now().UTC().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.S.DB().ExecContext(ctx,
+			`UPDATE materialization_claims SET created_at=?, phase='navigated' WHERE id=?`,
+			createdAt, claim.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.S.DB().ExecContext(ctx,
+			`UPDATE browser_candidates SET job_attempt_revision=? WHERE id=?`, attempt, candidateID); err != nil {
+			t.Fatal(err)
+		}
+		return claim
+	}
+	first := claimAt("candidate-attempt-1", 1, "2026-08-26T01:00:00Z")
+	second := claimAt("candidate-attempt-2", 2, "2026-08-26T02:00:00Z")
+
+	got, err := js.SupersededMaterializationClaim(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got {
+		t.Fatal("a later attempt's live claim must supersede the earlier attempt's surface")
+	}
+	got, err = js.SupersededMaterializationClaim(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got {
+		t.Fatal("an earlier attempt must never supersede the current one")
+	}
+}
