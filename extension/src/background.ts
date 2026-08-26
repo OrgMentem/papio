@@ -17660,11 +17660,7 @@ export class Bridge {
   ): Promise<void> {
     let job = findByJob(this.store, jobID);
     if (!this.hasDelegatedAuthority(job)) return;
-    if (
-      !job ||
-      (job.status !== "accepted" && job.status !== "awaiting_download")
-    )
-      return;
+    if (!job) return;
     if (this.isFirefoxClickDownload(job)) return;
     if (job.download_initiated === true || this.downloads.has(jobID)) return;
 
@@ -17679,6 +17675,21 @@ export class Bridge {
     }
     if (!viewer) viewer = isPDFPage(url) || this.isPDFNavigationURL(url);
     if (!viewer) return;
+    // The status gate follows the viewer gate on purpose. A settled PDF on the
+    // tracked tab is positive evidence that authentication is BEHIND this job,
+    // so `auth_pending` must not veto it: papio's own rule is that a solved
+    // wall retires its own ask rather than staying armed on memory of it.
+    // Measured live 2026-08-26 on doi 10.1016/j.sbspro.2014.01.1251: the
+    // institutional route latched `auth_pending` during the redirect chain,
+    // then the tab settled on the real file
+    // (pdf.sciencedirectassets.com/.../main.pdf) and adoption was discarded
+    // here, so an open-access paper already on screen was never filed.
+    if (
+      job.status !== "accepted" &&
+      job.status !== "awaiting_download" &&
+      job.status !== "auth_pending"
+    )
+      return;
 
     // Re-read after the permission/probe awaits: a content-disposition
     // download may have been correlated while this probe was in flight.

@@ -8109,6 +8109,27 @@ test("a PDF-viewer tab starts one download and leaves the adopted viewer open", 
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
 });
 
+// Measured live 2026-08-26 on doi 10.1016/j.sbspro.2014.01.1251. The
+// institutional route latched `auth_pending` mid-redirect, then the tracked
+// tab settled on the real file. Adoption was gated on status BEFORE the PDF
+// was recognised, so the paper sat on screen, fetched and unfiled, while the
+// job waited for a sign-in that had already happened.
+test("a PDF that lands after an auth wall is still adopted", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_0010_pdf_viewer"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const authURL = `https://idp.example.edu/idp/profile/SAML2/Redirect/SSO`;
+  const pdfURL = `https://cdn.example.net/1-s2.0-S1877042814012683/main.pdf?X-Amz-Security-Token=TOKEN`;
+
+  await h.tabs.completeNavigation(tabID, authURL);
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  expect(h.downloads.started).toEqual([]);
+
+  await h.tabs.completeNavigation(tabID, pdfURL);
+  expect(h.downloads.started.map((d) => d.url)).toEqual([pdfURL]);
+});
+
 // The adopted viewer is kept on purpose - and the record has to SAY so. The
 // old code called closeOwnedTab(tabID, "adopted-viewer"), which the primitive
 // refused unconditionally: cleanup in appearance, nothing in effect, and no
