@@ -81,6 +81,18 @@ for the full pre-split extension history.
   already open: a later paper can otherwise leave ScienceDirect in a
   background tab with the same disabled link. Nothing is asked of you, and
   pages that draw correctly while hidden are still never surfaced.
+- **One paper no longer collects a tab per attempt.** *papio* deliberately
+  leaves a tab open on a paper it has acquired: the paper on screen is your
+  confirmation, and *papio* never closes a paper you might be reading. It kept
+  one such tab per ATTEMPT, though, not one per paper — each new try on the
+  same paper opened another tab, and every earlier one stayed for good, because
+  *papio* had stopped recording which paper those tabs belonged to. One paper
+  reached fourteen tabs that way, in a window holding thirty-one *papio* pages
+  nothing could close. *papio* now remembers the paper behind a kept tab, keeps
+  the newest one, and retires an older copy of that same paper once nobody has
+  touched it for half an hour. The paper you can read never closes: pinning a
+  tab, using it, or dragging it out of *papio*'s window hands it to you
+  permanently, and a kept paper is never reused for a later attempt.
 - **A PDF reached through your library now stays connected to its paper when
   the publisher changes.** A library route can end at a different publisher
   host. After *papio* asked you to finish that download yourself, it remembered

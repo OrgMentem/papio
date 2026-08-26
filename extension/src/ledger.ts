@@ -58,6 +58,15 @@ export interface SurfaceBirthRecord {
    * detached, the record is retained for accounting, and it no longer
    * authorizes automation. */
   ceded?: boolean;
+  /** Set once the surface has become retained content: papio created it, it
+   * navigated to a PDF inside papio's own container, and the acquired paper
+   * is now on screen. Retention is deliberate (papio never auto-closes
+   * content), but it is retention of ONE confirmation surface per paper -
+   * so unlike `ceded` this keeps `job_id`, which is what lets a later
+   * duplicate for the same paper supersede an older cold copy. Ceding
+   * instead dropped that identity, so retention silently became
+   * per-attempt: measured live 2026-08-26, fourteen copies of one paper. */
+  content?: true;
   /** True only for entries migrated from the pre-v2 raw-URL ledger whose
    * provenance cannot be re-verified (e.g. no jobID to correlate against).
    * Marks a record listed for one-time manual review rather than
@@ -119,6 +128,7 @@ export function isSurfaceBirthRecord(value: unknown): value is SurfaceBirthRecor
   if (value.origin_digest !== undefined && typeof value.origin_digest !== "string") return false;
   if (value.job_id !== undefined && typeof value.job_id !== "string") return false;
   if (value.ceded !== undefined && typeof value.ceded !== "boolean") return false;
+  if (value.content !== undefined && value.content !== true) return false;
   if (value.legacy !== undefined && value.legacy !== true) return false;
   if (value.claim !== undefined) {
     if (!isPlainRecord(value.claim)) return false;

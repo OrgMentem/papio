@@ -477,3 +477,31 @@ for uncorrelated session evidence and opaque provider-domain cleanup remain
 deferred. Claim renewal reduces late-adoption exposure; exact correlated late
 bytes can release only their historical occupancy, while unresolved effects
 remain blocking and cannot be re-driven.
+
+## Amendment 2026-08-26: content retention is per paper, not per attempt
+
+papio never auto-closes content, and that stands. The rule's own justification
+is that one visible tab showing an acquired paper is confirmation rather than
+litter, so retention is scoped to ONE surface per paper. The implementation
+could not honour that scope: a papio-created tab that navigated to a PDF was
+ceded, and ceding deletes the record's job binding, so the retained copy lost
+the paper identity. No later drive could recognise it, every drive minted
+another copy, and each copy was retained in turn. Measured live on 2026-08-26:
+fourteen retained tabs for one paper, thirty-one stale papio surfaces in one
+work window, none reachable by any close path.
+
+A PDF surface still inside papio's own container is now RETAINED rather than
+ceded: the record keeps `job_id` and gains `content`. Pinning a tab, making it
+active, or moving it out of papio's container remains an operator takeover and
+still cedes permanently. Retained content is excluded from surface reuse, so a
+drive never navigates an acquired paper away.
+
+A retained copy may be retired only as a superseded duplicate, and only on
+positive evidence: papio created it, a NEWER retained copy of the same paper
+exists, the surface is still content inside papio's container, the operator has
+not made it active or pinned it, and it has outlived the measured cold window.
+The daemon then decides independently under `claim_abandoned`, which it grants
+only when that binding's claim really is abandoned; a binding with no claim is
+browser-local by the existing contract. The newest copy is never a candidate,
+so the paper never leaves the operator's screen. This retires no
+operator-owned content tab, and rollback remains as stated above.

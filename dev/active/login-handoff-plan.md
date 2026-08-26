@@ -117,8 +117,11 @@ per-caller transitions in Slice 1. These delivered none of the operator value an
 caused the final round's TOCTOU, persisted-URL, intentional-close and
 drive-release regressions.
 
-Relocated from the trimmed Slice 1-3 text: papio never auto-closes content —
-only papio's own scaffolding (job/handoff/capture tabs) closes. The forbidden
+Relocated from the trimmed Slice 1-3 text: papio never auto-closes content -
+only papio's own scaffolding (job/handoff/capture tabs) closes, plus the one
+narrow case ADR-0022's 2026-08-26 amendment ratifies (a cold duplicate copy of
+a paper a newer retained surface still shows).
+The forbidden
 pattern is UNRELATED awaits between check and act, not the one authoritative
 freshness read; no shadow-state reconstruction. The work window is never closed
 directly — Chrome discards it when its last tab closes. Do not auto-complete

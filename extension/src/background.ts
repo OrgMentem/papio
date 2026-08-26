@@ -3880,6 +3880,11 @@ export class Bridge {
         if (
           entry === undefined ||
           entry.purpose === PRIVATE_SURFACE_PURPOSE ||
+          // Retained content keeps its paper identity so duplicates can be
+          // counted, NOT so a drive can reuse it: a redrive navigates the tab
+          // it reuses, which would read the acquired paper away and leave the
+          // operator with no confirmation surface at all.
+          entry.content === true ||
           entry.job_id !== options.jobId
         )
           continue;
@@ -3965,7 +3970,12 @@ export class Bridge {
   /** The authoritative get is followed immediately by remove in this turn.
    * A failed fresh-link materialization is the one surface exception: the
    * private one-use tab never bound to a live job, so preserving it would let
-   * a sibling open a duplicate institutional login. PDF content still stays. */
+   * a sibling open a duplicate institutional login. PDF content still stays,
+   * with one narrow exception: `superseded-content`, a cold duplicate copy of
+   * a paper a NEWER retained surface still shows. That exemption is minted
+   * only by retireSupersededContent, behind a daemon authorization, so the
+   * promise this guard exists for - never close the paper someone may be
+   * reading - is kept by keeping the newest copy. */
   private async closeOwnedTab(
     tabID: number,
     reason: string,
@@ -3980,7 +3990,6 @@ export class Bridge {
       (entry === undefined || findByTab(this.store, tabID) !== undefined)
     )
       return false;
-    if (reason === "adopted-viewer") return false;
     // Captured before the only await below: any onActivated/onUpdated
     // listener that fires while the fresh tabs.get is in flight bumps this
     // tab's touch epoch synchronously (bindListeners), so a transient
@@ -3993,7 +4002,12 @@ export class Bridge {
     } catch {
       return false;
     }
-    if (tab.url !== undefined && isPDFPage(tab.url)) return false;
+    if (
+      reason !== "superseded-content" &&
+      tab.url !== undefined &&
+      isPDFPage(tab.url)
+    )
+      return false;
     if (materializationCleanup) {
       const base = this.deps.runtimeGetURL?.(MATERIALIZE_PAGE_PATH);
       if (
@@ -4088,6 +4102,41 @@ export class Bridge {
       const next: SurfaceBirthRecord = { ...current, ceded: true };
       delete next.pending_close;
       delete next.job_id;
+      ledger[String(tabID)] = next;
+      return { value: undefined, changed: true };
+    });
+  }
+  /** Mark a surface as retained content: papio opened it, it now shows a PDF
+   * inside papio's own container, and the acquired paper is on screen.
+   *
+   * This is the retention half of the same decision `cedeOwnedTab` makes for
+   * an operator takeover, and it deliberately differs in one field: the job
+   * binding STAYS. Ceding a content surface dropped it, which took the paper
+   * identity with it - so `openManagedTab` could no longer recognise the
+   * retained copy, every later drive minted another one, and each new copy
+   * was retained in turn. Retention is meant to be one confirmation surface
+   * per paper; without the identity it cannot count to one. The pending
+   * tombstone is cleared for the same reason ceding clears it: a close the
+   * operator's own content has overtaken must never be replayed.
+   *
+   * A no-op when the record is gone, already ceded, or binds elsewhere (a
+   * recycled tab id under a stale record). */
+  private async retainContentSurface(
+    tabID: number,
+    bindingID: string | undefined,
+  ): Promise<void> {
+    await this.runTabLedgerTransaction((ledger) => {
+      const current = ledger[String(tabID)];
+      if (
+        current === undefined ||
+        current.ceded === true ||
+        (bindingID !== undefined && current.binding_id !== bindingID)
+      )
+        return { value: undefined, changed: false };
+      if (current.content === true && current.pending_close === undefined)
+        return { value: undefined, changed: false };
+      const next: SurfaceBirthRecord = { ...current, content: true };
+      delete next.pending_close;
       ledger[String(tabID)] = next;
       return { value: undefined, changed: true };
     });
@@ -4512,6 +4561,11 @@ export class Bridge {
         !Number.isInteger(tabID) ||
         tabID < 0 ||
         entry.ceded === true ||
+        // Retained content is decided by the content pass below, and asserting
+        // job_inactive for it would be a request to close the operator's
+        // acquired paper. The PDF guards downstream refuse that anyway; not
+        // asking spares a daemon round trip on every pass.
+        entry.content === true ||
         entry.job_id === undefined ||
         entry.browser_epoch !== this.browserEpoch ||
         // The question is whether anything still POINTS AT this surface, not
@@ -4556,14 +4610,18 @@ export class Bridge {
         tab.groupId !== undefined &&
         tab.groupId >= 0 &&
         (await this.knownHandoffGroup(tab.groupId, tab.windowId)) !== undefined;
-      if (
-        tab.pinned === true ||
-        (tab.url !== undefined && isPDFPage(tab.url)) ||
-        (!inWorkWindow && !inPapioGroup)
-      ) {
-        // Pinning, a PDF viewer, and moving a tab out of papio's container
-        // are operator acts on the surface itself: positive takeover.
+      if (tab.pinned === true || (!inWorkWindow && !inPapioGroup)) {
+        // Pinning a tab, or moving it out of papio's container, is an operator
+        // act on the surface itself: positive takeover.
         await this.cedeOwnedTab(tabID, entry.binding_id);
+        continue;
+      }
+      if (tab.url !== undefined && isPDFPage(tab.url)) {
+        // Content papio must never auto-close, still inside papio's own
+        // container: retained rather than ceded, so the paper identity
+        // survives and the pass below can tell a second copy of THIS paper
+        // from the one confirmation surface retention promises.
+        await this.retainContentSurface(tabID, entry.binding_id);
         continue;
       }
       if (tab.active === true) {
@@ -4598,7 +4656,93 @@ export class Bridge {
       );
       if (result.closed) closed += 1;
     }
+    closed += await this.retireSupersededContent();
     return { closed };
+  }
+
+  /** Retire cold, superseded copies of a paper papio already retains.
+   *
+   * Retention of content is deliberate and stays deliberate: one visible tab
+   * showing an acquired paper is confirmation, not litter. The newest copy is
+   * always the one kept, so the paper never leaves the operator's screen.
+   * What this removes is the second, third and fourteenth copy of the SAME
+   * paper, minted by successive drives of one job that each ended on the same
+   * PDF - measured live 2026-08-26 at fourteen tabs for one paper.
+   *
+   * Every predicate is positive evidence, never age or title. papio created
+   * the surface (birth record), for THIS paper (`job_id`), at the same origin
+   * (`origin_digest`), in this browser session (`browser_epoch`), a newer copy
+   * of the same pair exists, the surface is still content inside papio's own
+   * container, the operator has not made it active or pinned it, and it has
+   * outlived PARKED_SURFACE_COLD_MS. The daemon then decides independently:
+   * `claim_abandoned` is eligible only when the binding's claim really is
+   * abandoned, and a binding with no claim at all answers `unclaimed`, which
+   * is browser-local by contract. A live or settled claim refuses, and the
+   * copy is retained. */
+  private async retireSupersededContent(): Promise<number> {
+    const ledger = await this.snapshotTabLedger();
+    const groups = new Map<
+      string,
+      { tabID: number; entry: SurfaceBirthRecord }[]
+    >();
+    for (const [key, entry] of Object.entries(ledger)) {
+      const tabID = Number(key);
+      if (
+        !Number.isInteger(tabID) ||
+        tabID < 0 ||
+        entry.content !== true ||
+        entry.ceded === true ||
+        entry.job_id === undefined ||
+        entry.browser_epoch !== this.browserEpoch
+      )
+        continue;
+      // The paper is the whole grouping key. Only content records reach here,
+      // and every content record is a PDF surface, so two records under one
+      // job are two copies of one acquired paper - even when they were born at
+      // different origins (a provider page and a CDN asset host digest
+      // differently, and the birth digest is never re-dated). Adding the
+      // digest to the key therefore only ever splits a real duplicate pair.
+      const bucket = groups.get(entry.job_id);
+      if (bucket === undefined) groups.set(entry.job_id, [{ tabID, entry }]);
+      else bucket.push({ tabID, entry });
+    }
+    let closed = 0;
+    for (const bucket of groups.values()) {
+      if (bucket.length < 2) continue;
+      bucket.sort((a, b) => b.entry.created_at - a.entry.created_at);
+      for (const { tabID, entry } of bucket.slice(1)) {
+        if (!this.surfaceIsCold(entry)) continue;
+        let tab: TabInfo;
+        try {
+          tab = await this.deps.tabs.get(tabID);
+        } catch {
+          continue;
+        }
+        const inWorkWindow =
+          tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
+        const inPapioGroup =
+          tab.groupId !== undefined &&
+          tab.groupId >= 0 &&
+          (await this.knownHandoffGroup(tab.groupId, tab.windowId)) !==
+            undefined;
+        if (
+          tab.active === true ||
+          tab.pinned === true ||
+          tab.url === undefined ||
+          !isPDFPage(tab.url) ||
+          (!inWorkWindow && !inPapioGroup)
+        )
+          continue;
+        const result = await this.closeOwnedSurface(
+          tabID,
+          "claim_abandoned",
+          entry.claim?.gate_occurrence_id,
+          true,
+        );
+        if (result.closed) closed += 1;
+      }
+    }
+    return closed;
   }
 
   /** Operator-initiated review focuses one bounded orphan surface; the
@@ -4944,14 +5088,27 @@ export class Bridge {
     tabID: number,
     disposition: SurfaceCloseDisposition,
     gateOccurrenceID?: string,
+    // Retained content is never closable by default: the two downstream PDF
+    // guards refuse it, which is the standing promise never to close a paper
+    // someone may be reading. retireSupersededContent is the one caller that
+    // may set this, and only for a copy a NEWER retained copy of the same
+    // paper supersedes, so the paper itself stays on screen either way.
+    supersededContent = false,
   ): Promise<{ closed: boolean }> {
     await this.surfaceReady;
     const ledger = await this.snapshotTabLedger();
     const record = ledger[String(tabID)];
     if (record === undefined || record.ceded === true)
       return { closed: false };
+    if (supersededContent && record.content !== true) return { closed: false };
     return this.inLifecycleChain(() =>
-      this.closeAuthorizedRecord(tabID, record, disposition, gateOccurrenceID),
+      this.closeAuthorizedRecord(
+        tabID,
+        record,
+        disposition,
+        gateOccurrenceID,
+        supersededContent,
+      ),
     );
   }
 
@@ -5030,6 +5187,7 @@ export class Bridge {
     record: SurfaceBirthRecord,
     disposition: SurfaceCloseDisposition,
     gateOccurrenceID: string | undefined,
+    supersededContent = false,
   ): Promise<{ closed: boolean }> {
     const authorization = await this.requestCloseAuthorization(
       record.binding_id,
@@ -5045,7 +5203,12 @@ export class Bridge {
       // timeout has always intended - that intent was simply refused every
       // time before the daemon could say which kind of "no" it meant.
       if (authorization.unclaimed === true)
-        return this.retireOwnedSurface(tabID, record.binding_id, "unclaimed");
+        return this.retireOwnedSurface(
+          tabID,
+          record.binding_id,
+          "unclaimed",
+          supersededContent,
+        );
       return { closed: false };
     }
     const bindingID = record.binding_id;
@@ -5066,7 +5229,12 @@ export class Bridge {
       return { value: true, changed: true };
     });
     if (!tombstoned) return { closed: false };
-    return this.retireOwnedSurface(tabID, bindingID, "authorized");
+    return this.retireOwnedSurface(
+      tabID,
+      bindingID,
+      "authorized",
+      supersededContent,
+    );
   }
 
   /** The one fresh tabs.get the plan requires before the awaited removal,
@@ -5089,6 +5257,11 @@ export class Bridge {
     tabID: number,
     bindingID: string,
     authority: "authorized" | "unclaimed",
+    // A superseded duplicate is content by construction, so the PDF predicate
+    // here would cede every one of them. The exemption is narrow on purpose:
+    // only a copy whose paper is retained on a NEWER surface reaches this, and
+    // pinning still cedes, because pinning is an operator act on this tab.
+    supersededContent = false,
   ): Promise<{ closed: boolean }> {
     let tab: TabInfo;
     try {
@@ -5097,7 +5270,10 @@ export class Bridge {
       // Already gone — nothing left to remove or cede.
       return { closed: true };
     }
-    if (tab.pinned === true || (tab.url !== undefined && isPDFPage(tab.url))) {
+    if (
+      tab.pinned === true ||
+      (!supersededContent && tab.url !== undefined && isPDFPage(tab.url))
+    ) {
       await this.cedeOwnedTab(tabID, bindingID);
       return { closed: false };
     }
@@ -5111,7 +5287,11 @@ export class Bridge {
     }
     const removed = await this.closeOwnedTab(
       tabID,
-      authority === "unclaimed" ? "unclaimed-close" : "authorized-close",
+      supersededContent
+        ? "superseded-content"
+        : authority === "unclaimed"
+          ? "unclaimed-close"
+          : "authorized-close",
     );
     return { closed: removed };
   }
@@ -16647,8 +16827,17 @@ export class Bridge {
     this.adoptedViewerTabs.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
     await this.removeJobWithOffer(jobID);
-    await this.ledgerManagedTab(tabID, "adopted-viewer");
-    void this.closeOwnedTab(tabID, "adopted-viewer");
+    // The viewer holding the just-adopted paper IS the confirmation surface,
+    // so it is retained on purpose - and it is marked as retained content
+    // here, at the one moment papio positively knows which paper it shows.
+    // The previous `closeOwnedTab(tabID, "adopted-viewer")` was dead code:
+    // the primitive refused that reason unconditionally, so it read as
+    // cleanup while doing nothing, and the record kept no content marker for
+    // a later duplicate to supersede. `job_id` is supplied because
+    // removeJobWithOffer above has already dropped the live job, so a record
+    // minted here would otherwise carry no paper identity at all.
+    await this.ledgerManagedTab(tabID, "adopted-viewer", false, jobID);
+    await this.retainContentSurface(tabID, undefined);
   }
 
   /** Run the bounded DOM probe for a tracked page and preserve the existing

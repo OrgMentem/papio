@@ -2153,6 +2153,190 @@ test("a parked surface is retired once cold, and never while it is warm", async 
   }
 });
 
+// Retention of content is deliberate: one visible tab showing an acquired
+// paper is confirmation, not litter. Retention was PER-ATTEMPT, though,
+// because ceding a PDF surface dropped its job_id and took the paper identity
+// with it - so every later drive minted another retained copy and nothing
+// could count them. Measured live 2026-08-26: fourteen tabs on one paper, none
+// reachable by any close path.
+async function seedRetainedCopies(
+  h: Harness,
+  opts: {
+    olderCreatedAt: number;
+    olderActive?: boolean;
+    olderPinned?: boolean;
+    copies?: number;
+  },
+): Promise<{ olderTabID: number; newerTabID: number; olderBinding: string }> {
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  const pdfURL = "https://pdf.assets.example/main.pdf";
+  const older = await h.tabs.create({ url: pdfURL, active: false, windowId: 1 });
+  const newer = await h.tabs.create({ url: pdfURL, active: false, windowId: 1 });
+  const olderTabID = older.id!;
+  const newerTabID = newer.id!;
+  if (opts.olderPinned === true) h.tabs.patch(olderTabID, { pinned: true });
+  if (opts.olderActive === true) h.tabs.patch(olderTabID, { active: true });
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    browserEpoch: string | undefined;
+    lastKnownBrowserHolderGeneration: number | undefined;
+    update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
+  };
+  const epoch = internals.browserEpoch ?? "test-epoch";
+  const olderBinding = "binding-content-older";
+  internals.tabLedgerCache = {
+    [String(olderTabID)]: fakeBirthRecord({
+      binding_id: olderBinding,
+      tab_hint: olderTabID,
+      browser_epoch: epoch,
+      created_at: opts.olderCreatedAt,
+      job_id: "job_one_paper",
+      content: true,
+    }),
+    ...((opts.copies ?? 2) < 2
+      ? {}
+      : {
+          [String(newerTabID)]: fakeBirthRecord({
+            binding_id: "binding-content-newer",
+            tab_hint: newerTabID,
+            browser_epoch: epoch,
+            created_at: h.clock.now,
+            job_id: "job_one_paper",
+            content: true,
+          }),
+        }),
+  };
+  internals.lastKnownBrowserHolderGeneration = 1;
+  await internals.update((s) => ({ ...s, workWindowID: 1 }));
+  return { olderTabID, newerTabID, olderBinding };
+}
+
+test("a cold superseded copy of a retained paper retires and the newest stays", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { olderTabID, newerTabID, olderBinding } = await seedRetainedCopies(h, {
+    olderCreatedAt: 1,
+  });
+
+  const framesBefore = h.frames().length;
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  const request = await h.port.waitForFrame(
+    "surface_close_request",
+    framesBefore,
+  );
+  // The older copy, named by ITS binding - and under the one disposition whose
+  // truth the daemon verifies independently: this binding's claim is over.
+  expect(request.payload["binding_id"]).toBe(olderBinding);
+  expect(request.payload["disposition"]).toBe("claim_abandoned");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth_dup_older",
+      nonce: "nonce_dup_older",
+      browser_holder_generation: 1,
+    }),
+  );
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+
+  expect(await reconciling).toEqual({ closed: 1 });
+  expect(h.tabs.removed).toEqual([olderTabID]);
+  // The promise this whole rule exists for: the paper is still on screen.
+  expect(h.tabs.snapshot(newerTabID)).toBeDefined();
+  // Exactly one ask, so the newest copy is never even a candidate.
+  expect(
+    h
+      .frames()
+      .slice(framesBefore)
+      .filter((frame) => frame.type === "surface_close_request"),
+  ).toHaveLength(1);
+});
+
+test("a warm superseded copy is retained, and a lone copy is never asked about", async () => {
+  for (const shape of ["warm-duplicate", "lone-copy"] as const) {
+    const h = makeHarness(undefined, { windows: true });
+    installManagedTabLedger(h, {});
+    await h.bridge.start();
+    const { olderTabID } = await seedRetainedCopies(h, {
+      // 30 minutes is PARKED_SURFACE_COLD_MS; one second short of it is warm.
+      olderCreatedAt:
+        shape === "warm-duplicate" ? h.clock.now - (30 * 60_000 - 1_000) : 1,
+      copies: shape === "lone-copy" ? 1 : 2,
+    });
+
+    const framesBefore = h.frames().length;
+    const reconciling = h.bridge.reconcileOwnedTabs();
+    for (let i = 0; i < 200; i += 1) await Promise.resolve();
+    expect(await reconciling).toEqual({ closed: 0 });
+    expect(h.tabs.removed).not.toContain(olderTabID);
+    expect(
+      h
+        .frames()
+        .slice(framesBefore)
+        .map((frame) => frame.type),
+    ).not.toContain("surface_close_request");
+  }
+});
+
+test("a superseded copy the operator touched is retained, never retired", async () => {
+  for (const touch of ["active", "pinned"] as const) {
+    const h = makeHarness(undefined, { windows: true });
+    installManagedTabLedger(h, {});
+    await h.bridge.start();
+    const { olderTabID } = await seedRetainedCopies(h, {
+      olderCreatedAt: 1,
+      olderActive: touch === "active",
+      olderPinned: touch === "pinned",
+    });
+
+    const framesBefore = h.frames().length;
+    const reconciling = h.bridge.reconcileOwnedTabs();
+    for (let i = 0; i < 200; i += 1) await Promise.resolve();
+    expect(await reconciling).toEqual({ closed: 0 });
+    expect(h.tabs.removed).not.toContain(olderTabID);
+    expect(
+      h
+        .frames()
+        .slice(framesBefore)
+        .map((frame) => frame.type),
+    ).not.toContain("surface_close_request");
+  }
+});
+
+test("a daemon refusal keeps a superseded copy open", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { olderTabID } = await seedRetainedCopies(h, { olderCreatedAt: 1 });
+
+  const framesBefore = h.frames().length;
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  const request = await h.port.waitForFrame(
+    "surface_close_request",
+    framesBefore,
+  );
+  // The claim is still navigated, so claim_abandoned is false for it. Papio
+  // asserts, the daemon decides, and a refusal keeps the paper on screen.
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "not_eligible",
+      detail: "disposition does not match the binding's current phase",
+    }),
+  );
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+
+  expect(await reconciling).toEqual({ closed: 0 });
+  expect(h.tabs.removed).not.toContain(olderTabID);
+  expect(h.tabs.snapshot(olderTabID)).toBeDefined();
+});
+
 // A drive says so, and a paper parked behind the single drive slot says the
 // opposite. The daemon charges a fruitless drive epoch per DRIVING accept and
 // retires a paper after three, so a queued accept reported as a drive retires
@@ -7919,6 +8103,55 @@ test("a PDF-viewer tab starts one download and leaves the adopted viewer open", 
   ).toBe(true);
   expect(h.tabs.removed).toEqual([]);
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
+});
+
+// The adopted viewer is kept on purpose - and the record has to SAY so. The
+// old code called closeOwnedTab(tabID, "adopted-viewer"), which the primitive
+// refused unconditionally: cleanup in appearance, nothing in effect, and no
+// content marker, so nothing could ever tell a second copy of this paper from
+// the first. Measured live 2026-08-26: fourteen copies of one paper.
+test("an adopted viewer is marked as this paper's retained content", async () => {
+  const h = makeHarness();
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_adopted_content"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const viewerURL = `https://${PROVIDER_HOST}/reader/kept-paper.pdf`;
+
+  await h.tabs.completeNavigation(tabID, viewerURL);
+  await h.tabs.completeNavigation(tabID, viewerURL);
+  expect(h.downloads.started).toHaveLength(1);
+  await h.downloads.onCreated.emit({
+    id: 901,
+    tabId: tabID,
+    state: "in_progress",
+  });
+  h.downloads.items.set(901, {
+    id: 901,
+    tabId: tabID,
+    filename: "/Users/x/Downloads/kept-paper.pdf",
+    fileSize: 128,
+    state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "ack",
+    msg_id: "ack_00000001",
+    job_id: "job_adopted_content",
+    seq: 1,
+    payload: {},
+  });
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+
+  const record = ledger.current()[String(tabID)] as
+    | SurfaceBirthRecord
+    | undefined;
+  // Retained, and retained AS this paper: both halves are load-bearing. The
+  // job identity is what a later duplicate is counted against.
+  expect(record?.content).toBe(true);
+  expect(record?.job_id).toBe("job_adopted_content");
+  expect(h.tabs.removed).toEqual([]);
 });
 
 test("Chrome's built-in PDF viewer downloads the memory-only offered URL", async () => {

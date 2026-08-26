@@ -152,6 +152,11 @@ test("isSurfaceBirthRecord rejects a url-carrying record and accepts a minimal v
   expect(isSurfaceBirthRecord({ ...minimal, tab_hint: "1" })).toBe(false);
   expect(isSurfaceBirthRecord({ ...minimal, legacy: false })).toBe(false);
   expect(isSurfaceBirthRecord({ ...minimal, legacy: true })).toBe(true);
+  // `content` is the retention marker duplicate accounting reads, so a
+  // hand-edited or foreign `content: false` must not decode as a record whose
+  // marker simply looks absent.
+  expect(isSurfaceBirthRecord({ ...minimal, content: false })).toBe(false);
+  expect(isSurfaceBirthRecord({ ...minimal, content: true })).toBe(true);
   expect(
     isSurfaceBirthRecord({
       ...minimal,
