@@ -58,6 +58,12 @@ export interface SurfaceBirthRecord {
    * detached, the record is retained for accounting, and it no longer
    * authorizes automation. */
   ceded?: boolean;
+  /** Which call site ceded it. Durable because ceding is terminal and erases
+   * the job binding, so nothing afterwards can attribute the decision; two
+   * live observation rounds on 2026-08-26 failed to. A fixed call-site name
+   * (background.ts `CedeReason`), never page-derived text. Absent on records
+   * ceded before this field existed. */
+  ceded_reason?: string;
   /** Set once the surface has become retained content: papio created it, it
    * navigated to a PDF inside papio's own container, and the acquired paper
    * is now on screen. Retention is deliberate (papio never auto-closes
@@ -129,6 +135,8 @@ export function isSurfaceBirthRecord(value: unknown): value is SurfaceBirthRecor
   if (value.job_id !== undefined && typeof value.job_id !== "string") return false;
   if (value.ceded !== undefined && typeof value.ceded !== "boolean") return false;
   if (value.content !== undefined && value.content !== true) return false;
+  if (value.ceded_reason !== undefined && typeof value.ceded_reason !== "string")
+    return false;
   if (value.legacy !== undefined && value.legacy !== true) return false;
   if (value.claim !== undefined) {
     if (!isPlainRecord(value.claim)) return false;

@@ -20898,8 +20898,10 @@ test("a settled materialization surface showing a PDF is retained with its paper
     expect(record?.pending_close).toBeUndefined();
     if (shape === "pinned") {
       // Pinning is an operator act on this tab: takeover, ceded permanently,
-      // identity dropped so nothing acts on it again.
+      // identity dropped so nothing acts on it again - and the record names
+      // the site that decided it, because nothing else can afterwards.
       expect(record?.ceded).toBe(true);
+      expect(record?.ceded_reason).toBe("pinned_at_close");
       expect(record?.content).toBeUndefined();
       expect(record?.job_id).toBeUndefined();
       continue;

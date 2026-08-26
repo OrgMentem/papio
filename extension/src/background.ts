@@ -939,6 +939,20 @@ function isSurfaceCloseDisposition(
     value === "surface_superseded"
   );
 }
+/** Why a surface was ceded. Fixed call-site names, never page-derived text:
+ * ceding is terminal and erases the job binding, so the record's own account
+ * of which site decided it is the only evidence that survives. */
+export type CedeReason =
+  /** The operator activated a tab papio did not focus itself. */
+  | "operator_activated"
+  /** A close attempt found the tab pinned: an operator act on this tab. */
+  | "pinned_at_close"
+  /** The reconcile pass found the tab pinned, or outside papio's container. */
+  | "pinned_or_moved_out"
+  /** A touch landed between the close decision and the removal. */
+  | "touched_mid_close"
+  /** Scaffold rediscovery found an operator-active or pinned duplicate. */
+  | "duplicate_operator_owned";
 export interface OpenManagedTabOptions {
   url: string;
   jobId?: string;
@@ -4050,7 +4064,7 @@ export class Bridge {
     // see because it already reverted — means the operator touched this
     // tab sometime during this close attempt. Cede rather than risk it.
     if ((this.tabTouchEpoch.get(tabID) ?? 0) !== epochAtStart) {
-      await this.cedeOwnedTab(tabID, entry?.binding_id);
+      await this.cedeOwnedTab(tabID, entry?.binding_id, "touched_mid_close");
       return false;
     }
     await this.deps.tabs.remove(tabID).catch(() => undefined);
@@ -4087,10 +4101,17 @@ export class Bridge {
    * cleared so nothing (a replay, a later reconcile pass) acts on it again.
    * A no-op when the ledger no longer has a matching record for `tabID`, or
    * when `bindingID` is given and the current record binds to a different
-   * one (the numeric id was reused under a stale record). */
+   * one (the numeric id was reused under a stale record).
+   *
+   * `reason` is durable on purpose. A cede is terminal and it erases the job
+   * binding, so a record that reached this call cannot afterwards say which
+   * of the five call sites decided it - and attributing one live took two
+   * full observation rounds on 2026-08-26 without an answer. The value is a
+   * fixed call-site name, never page-derived text. */
   private async cedeOwnedTab(
     tabID: number,
     bindingID: string | undefined,
+    reason: CedeReason,
   ): Promise<void> {
     await this.runTabLedgerTransaction((ledger) => {
       const current = ledger[String(tabID)];
@@ -4099,7 +4120,11 @@ export class Bridge {
         (bindingID !== undefined && current.binding_id !== bindingID)
       )
         return { value: undefined, changed: false };
-      const next: SurfaceBirthRecord = { ...current, ceded: true };
+      const next: SurfaceBirthRecord = {
+        ...current,
+        ceded: true,
+        ceded_reason: reason,
+      };
       delete next.pending_close;
       delete next.job_id;
       ledger[String(tabID)] = next;
@@ -4613,7 +4638,11 @@ export class Bridge {
       if (tab.pinned === true || (!inWorkWindow && !inPapioGroup)) {
         // Pinning a tab, or moving it out of papio's container, is an operator
         // act on the surface itself: positive takeover.
-        await this.cedeOwnedTab(tabID, entry.binding_id);
+        await this.cedeOwnedTab(
+          tabID,
+          entry.binding_id,
+          "pinned_or_moved_out",
+        );
         continue;
       }
       if (tab.url !== undefined && isPDFPage(tab.url)) {
@@ -5279,7 +5308,7 @@ export class Bridge {
     }
     if (tab.pinned === true) {
       // Pinning is an operator act on this tab: takeover, ceded permanently.
-      await this.cedeOwnedTab(tabID, bindingID);
+      await this.cedeOwnedTab(tabID, bindingID, "pinned_at_close");
       return { closed: false };
     }
     if (
@@ -9456,6 +9485,7 @@ export class Bridge {
         await this.cedeOwnedTab(
           candidate.id,
           ledger[String(candidate.id)]?.binding_id,
+          "duplicate_operator_owned",
         );
         continue;
       }
@@ -19763,7 +19793,7 @@ export class Bridge {
       record.browser_epoch !== this.browserEpoch
     )
       return;
-    await this.cedeOwnedTab(tabID, record.binding_id);
+    await this.cedeOwnedTab(tabID, record.binding_id, "operator_activated");
   }
 
   /** Retire one owned surface whose job papio no longer tracks, now that it
