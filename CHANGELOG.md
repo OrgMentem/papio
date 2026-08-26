@@ -215,6 +215,17 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A publisher that proves there is no access no longer keeps the whole
+  library's sign-in slot.** The browser correctly ended that provider drive,
+  but the daemon requeued the paper before its tab-close request arrived.
+  Rediscovery then parked the paper in document delivery, making it active
+  again, so the close was refused and the old navigated claim held the
+  institution's only sign-in slot without a deadline. Fifty-three other papers
+  were waiting behind one ScienceDirect paywall when this was measured.
+  *papio* now retires the exact materialization binding and its authentication
+  lease as part of accepting `no_entitlement`, before rediscovery runs. The tab
+  can still complete its one-use close transaction afterwards, but correctness
+  no longer depends on winning that race.
 - **A refused Zotero filing now says which of two very different things went
   wrong.** Both failures used to arrive as `unknown` with the explanation cut
   mid-word, so the same message covered "your library keeps files somewhere

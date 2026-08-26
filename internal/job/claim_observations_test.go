@@ -162,6 +162,50 @@ func TestAbandonMaterializationClaimByBindingOnlyTouchesLivePhases(t *testing.T)
 	}
 }
 
+func TestRetireMaterializationBindingAfterOutcomeReleasesInstitution(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID := seedJobAndCandidate(t, js, "retire-outcome")
+	authorizeEffectPermitJob(t, js, jobID)
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 7, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const authClaimID = "retire-outcome-profile-claim"
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: authClaimID, LeaseID: "lease-retire-outcome",
+		OwnerID: jobID, BrowserHolderGeneration: 7,
+		LeaseUntil: time.Now().UTC().Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(
+		ctx, authClaimID, jobID, 7, claim.BindingID, 99,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := js.RetireMaterializationBindingAfterOutcome(ctx, claim.BindingID); err != nil {
+		t.Fatal(err)
+	}
+	retired, err := js.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil || retired == nil || retired.Phase != "abandoned" {
+		t.Fatalf("retired claim = %+v, %v; want abandoned", retired, err)
+	}
+	lease, found, err := js.GetAuthenticationEntryLease(ctx, authClaimID)
+	if err != nil || !found || lease == nil {
+		t.Fatalf("retired lease = %+v, found=%v, err=%v", lease, found, err)
+	}
+	if lease.State != AuthenticationEntryLeaseExpired ||
+		lease.OwnerBindingID != "" || lease.OwnerTabHint != nil {
+		t.Fatalf("retired lease = %+v; want expired with no owner surface", lease)
+	}
+}
+
 func TestConsumeCloseAuthorizationForBindingMarksIssuedTokenConsumed(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

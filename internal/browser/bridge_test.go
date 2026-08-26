@@ -5270,6 +5270,47 @@ func TestInstitutionalNoEntitlementRequeuesExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestInstitutionalNoEntitlementRetiresItsSignInOccupancy(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	const prefix = "no-entitlement-retire"
+	claim := seedSurfaceCloseClaim(t, b, jobs, prefix, "navigated")
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("candidate = %+v, %v", candidate, err)
+	}
+	const authClaimID = "auth-" + prefix
+	if _, err := jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: authClaimID, LeaseID: "lease-" + prefix,
+		OwnerID: candidate.JobID, BrowserHolderGeneration: b.epoch,
+		LeaseUntil: time.Now().UTC().Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.SetAuthenticationEntryLeaseOwnerBinding(
+		ctx, authClaimID, candidate.JobID, b.epoch, claim.BindingID, 99,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, candidate.JobID,
+		map[string]any{"outcome": "no_entitlement"}))
+
+	retired, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil || retired == nil || retired.Phase != "abandoned" {
+		t.Fatalf("retired claim = %+v, %v; want abandoned", retired, err)
+	}
+	lease, found, err := jobs.GetAuthenticationEntryLease(ctx, authClaimID)
+	if err != nil || !found || lease == nil {
+		t.Fatalf("retired lease = %+v, found=%v, err=%v", lease, found, err)
+	}
+	if lease.State != job.AuthenticationEntryLeaseExpired ||
+		lease.OwnerBindingID != "" || lease.OwnerTabHint != nil {
+		t.Fatalf("retired lease = %+v; want expired with no owner surface", lease)
+	}
+}
+
 func TestRequeuedRouteNeverConvertsOAHandoffBackToInstitution(t *testing.T) {
 	const oaURL = "https://oa.example.org/articles/alternate-version.pdf"
 	b, jobs, _, _ := newBridge(t)

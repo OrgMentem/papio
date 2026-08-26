@@ -229,6 +229,34 @@ func (js *Store) AbandonMaterializationClaimByBinding(ctx context.Context, bindi
 	return tx.Commit()
 }
 
+// RetireMaterializationBindingAfterOutcome ends a browser materialization
+// whose provider outcome proves that this route has no work left to perform.
+// Unlike owner_closed, the outcome can arrive before the physical tab closes.
+// Retire the exact binding and its institution occupancy now; waiting for the
+// later tab-removal observation lets a fast daemon requeue race `job_inactive`
+// close authorization and leaves the institution's one sign-in slot occupied
+// by a job already parked in document delivery.
+//
+// A close authorization is deliberately not consumed here. The surface still
+// exists and must request its own one-use authorization after this transaction.
+// The later owner_closed observation is idempotent against the abandoned claim
+// and already-expired lease.
+func (js *Store) RetireMaterializationBindingAfterOutcome(ctx context.Context, bindingID string) error {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	if err := abandonMaterializationClaimByBindingTx(ctx, tx, bindingID, now); err != nil {
+		return err
+	}
+	if err := releaseAuthenticationEntryLeasesForBindingsTx(ctx, tx, []string{bindingID}, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func abandonMaterializationClaimByBindingTx(ctx context.Context, q dbtx, bindingID, now string) error {
 	if strings.TrimSpace(bindingID) == "" {
 		return errors.New("binding is required")

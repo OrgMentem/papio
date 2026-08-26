@@ -8011,6 +8011,31 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		return b.jobs.Cancel(ctx, jobID, job.TerminalReasonBrowserCancelled)
 
 	case "no_entitlement", "document_delivery_available":
+		// The provider has ended this browser drive. Release its exact
+		// institution occupancy before rediscovery can move the job into a new
+		// active state: the extension's later `job_inactive`/surface close used
+		// to lose that race, leaving one resolved no-entitlement page holding
+		// the library's only sign-in slot while every sibling waited behind it.
+		//
+		// This cleanup is best-effort like route suppression below. The outcome
+		// still has to resolve the user's handoff if bookkeeping is unavailable;
+		// doctor will continue to expose any lease that could not be retired.
+		if !b.materializationGenerationUnavailable {
+			attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
+			if attemptErr != nil {
+				log.Printf("papio: reading materialization attempt after %s for %s: %v", p.Outcome, jobID, attemptErr)
+			} else {
+				claim, _, claimErr := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.epoch)
+				switch {
+				case claimErr != nil:
+					log.Printf("papio: reading materialization claim after %s for %s: %v", p.Outcome, jobID, claimErr)
+				case claim != nil:
+					if retireErr := b.jobs.RetireMaterializationBindingAfterOutcome(ctx, claim.BindingID); retireErr != nil {
+						log.Printf("papio: retiring materialization binding after %s for %s: %v", p.Outcome, jobID, retireErr)
+					}
+				}
+			}
+		}
 		// This exact route proved it cannot serve this work. Fence it before
 		// any requeue so a rediscovery pass cannot re-select the same tuple.
 		if err := b.suppressCurrentRoute(ctx, jobID, job.RouteSuppressionNoEntitlement, storedEvidenceID); err != nil {
