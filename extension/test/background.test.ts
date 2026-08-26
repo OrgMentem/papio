@@ -20851,6 +20851,67 @@ test("Slice 2b: a browser restart's fresh epoch retains a stale pending tombston
   expect(record?.pending_close).toBeUndefined();
 });
 
+// The close path a settled or abandoned materialization surface takes runs
+// BEFORE any reconcile pass sees the tab, so retaining content only in the
+// reconcile left this site ceding it - and a cede drops the paper identity.
+// Measured live 2026-08-26: every duplicate copy of one paper was ledgered
+// `purpose: "materialization"` and `ceded: true` with no job_id, which is why
+// nothing could count them.
+test("a settled materialization surface showing a PDF is retained with its paper, not ceded", async () => {
+  for (const shape of ["content", "pinned"] as const) {
+    const h = makeHarness(undefined, { windows: true });
+    await h.bridge.start();
+    const { tabID, bindingID } = await seedOwnedScaffold(h);
+    const internals = closeInternals(h) as unknown as {
+      tabLedgerCache: Record<string, SurfaceBirthRecord>;
+      closeOwnedSurface: (
+        tabID: number,
+        disposition: SurfaceCloseDisposition,
+      ) => Promise<{ closed: boolean }>;
+    };
+    internals.tabLedgerCache[String(tabID)] = {
+      ...internals.tabLedgerCache[String(tabID)]!,
+      job_id: "job_settled_content",
+      purpose: "materialization",
+    };
+    // The scaffold ended on the paper itself, which is the normal successful
+    // shape: the tab papio opened now shows the acquired PDF.
+    h.tabs.patch(tabID, { url: "https://pdf.assets.example/main.pdf" });
+    if (shape === "pinned") h.tabs.patch(tabID, { pinned: true });
+
+    const closing = internals.closeOwnedSurface(tabID, "materialization_settled");
+    const request = await h.port.waitForFrame("surface_close_request");
+    await h.port.inbound(
+      nativeResult("surface_close_response", {
+        request_id: request.payload["request_id"],
+        outcome: "authorized",
+        close_authorization_id: `auth_settled_${shape}`,
+        nonce: `nonce_settled_${shape}`,
+        browser_holder_generation: 1,
+      }),
+    );
+    expect(await closing).toEqual({ closed: false });
+    expect(h.tabs.removed).not.toContain(tabID);
+
+    const record = internals.tabLedgerCache[String(tabID)];
+    expect(record?.binding_id).toBe(bindingID);
+    expect(record?.pending_close).toBeUndefined();
+    if (shape === "pinned") {
+      // Pinning is an operator act on this tab: takeover, ceded permanently,
+      // identity dropped so nothing acts on it again.
+      expect(record?.ceded).toBe(true);
+      expect(record?.content).toBeUndefined();
+      expect(record?.job_id).toBeUndefined();
+      continue;
+    }
+    // Content is papio's own confirmation surface: retained, and retained AS
+    // this paper, so a later copy can be counted against it.
+    expect(record?.content).toBe(true);
+    expect(record?.ceded).toBeUndefined();
+    expect(record?.job_id).toBe("job_settled_content");
+  }
+});
+
 test("Slice 2b: adoption ignores a papio-titled group with no owned member", async () => {
   const h = makeHarness(undefined, { tabGroups: true, handoffSurface: "tab-group" });
   const foreign = await h.tabs.create({

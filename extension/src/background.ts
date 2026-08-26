@@ -5277,11 +5277,24 @@ export class Bridge {
       // Already gone — nothing left to remove or cede.
       return { closed: true };
     }
-    if (
-      tab.pinned === true ||
-      (!supersededContent && tab.url !== undefined && isPDFPage(tab.url))
-    ) {
+    if (tab.pinned === true) {
+      // Pinning is an operator act on this tab: takeover, ceded permanently.
       await this.cedeOwnedTab(tabID, bindingID);
+      return { closed: false };
+    }
+    if (
+      !supersededContent &&
+      tab.url !== undefined &&
+      isPDFPage(tab.url)
+    ) {
+      // Content, which papio never auto-closes - but retaining it is not the
+      // same act as ceding it, and conflating the two is what made retention
+      // per-attempt. This is the close path a settled or abandoned
+      // MATERIALIZATION surface takes, and it runs before any reconcile pass
+      // sees the tab, so ceding here stripped the paper identity from every
+      // scaffold that ended on a PDF - which is every copy measured live on
+      // 2026-08-26, all of them `purpose: "materialization"`.
+      await this.retainContentSurface(tabID, bindingID);
       return { closed: false };
     }
     if (tab.active === true) {
