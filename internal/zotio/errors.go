@@ -19,6 +19,7 @@ import (
 const (
 	ErrorClassZoteroHTTP4xx            = "zotero_http_4xx"
 	ErrorClassZoteroFileStorageRefused = "zotero_file_storage_refused"
+	ErrorClassZoteroConnectorRefused   = "zotero_connector_refused"
 	ErrorClassZoteroStorageQuota       = "zotero_storage_quota_exceeded"
 	ErrorClassZoteroFieldValidation    = "zotero_field_validation"
 	ErrorClassMirrorSyncFailed         = "mirror_sync_failed"
@@ -142,8 +143,26 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 	// That refusal carries no HTTP status, so the 413 branch above never sees
 	// it and it used to fall through to `unknown` with a hint cut mid-word,
 	// leaving the operator no explanation and doctor no check for six papers.
-	if strings.Contains(lower, "precondition_unmet") && strings.Contains(lower, "zotero_file_storage") {
+	// The envelope goes to zotio's stdout while the error line papio reads names
+	// the precondition without the envelope's kind ("import apply requires
+	// zotero_file_storage: ..."), so requiring both words matched only the
+	// envelope path and left the preview path reporting `unknown` with a hint
+	// cut mid-word — the exact failure this branch exists to prevent. The
+	// precondition name is specific enough on its own.
+	if strings.Contains(lower, "zotero_file_storage") {
 		return safeErrorInfo(ErrorClassZoteroFileStorageRefused, "Zotero refused a stored upload: library files live on your own file store", 0)
+	}
+	// Zotero's connector is the only route that reaches a non-Zotero file store,
+	// so when the desktop itself rejects the save there is no fallback that
+	// respects the operator's storage choice. Measured live 2026-08-26: every
+	// regular-item save and every item read answered HTTP 500 while notes and
+	// attachments succeeded, because a plugin had broken Zotero's item layer.
+	// The paper is already in papio's store, so this names the fault instead of
+	// spending the operator's afternoon on it.
+	if strings.Contains(lower, "connector") &&
+		(strings.Contains(lower, "saveitems") || strings.Contains(lower, "saveattachment") ||
+			strings.Contains(lower, "temporary parent")) {
+		return safeErrorInfo(ErrorClassZoteroConnectorRefused, "Zotero desktop rejected the connector save: restart Zotero, then check its plugins", 0)
 	}
 	if strings.Contains(lower, "unknown item field") {
 		return safeErrorInfo(ErrorClassZoteroFieldValidation, "unknown item field", 0)
@@ -240,6 +259,7 @@ func IsErrorClass(class string) bool {
 	switch class {
 	case ErrorClassZoteroHTTP4xx,
 		ErrorClassZoteroFileStorageRefused,
+		ErrorClassZoteroConnectorRefused,
 		ErrorClassZoteroStorageQuota,
 		ErrorClassZoteroFieldValidation,
 		ErrorClassMirrorSyncFailed,

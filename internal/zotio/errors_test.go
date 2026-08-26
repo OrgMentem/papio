@@ -158,6 +158,41 @@ func TestClassifyZotioFileStoragePreconditionRefusal(t *testing.T) {
 	}
 }
 
+// The envelope reaches zotio's stdout, but the error papio wraps is the single
+// line zotio returns beside it, which names the precondition without the
+// envelope's kind. Measured live 2026-08-24: this shape reported `unknown` with
+// the hint cut at "import apply requires...", so the operator was told nothing
+// and the WebDAV doctor check counted nothing.
+func TestClassifyZotioFileStorageSingleLineRefusal(t *testing.T) {
+	err := errors.New("previewing Zotio mutation: zotio auto: Error: import apply requires zotero_file_storage: Zotero desktop keeps personal-library attachment files on WebDAV (webdav.example.com)")
+	info := ClassifyError(err)
+	if info.Class != ErrorClassZoteroFileStorageRefused {
+		t.Fatalf("class = %q, want %q", info.Class, ErrorClassZoteroFileStorageRefused)
+	}
+	if strings.Contains(strings.ToLower(info.Hint), "webdav.example.com") {
+		t.Fatalf("hint = %q, want no host", info.Hint)
+	}
+}
+
+// Zotero's connector is the only route to a non-Zotero file store, so its
+// failure is a distinct cause from the storage refusal above: nothing about the
+// operator's configuration is wrong. Measured live 2026-08-26 with a Zotero
+// whose item layer answered HTTP 500 for every regular item.
+func TestClassifyZoteroConnectorRefusal(t *testing.T) {
+	for _, text := range []string{
+		"applying Zotio mutation: creating temporary parent via connector: connector saveItems: HTTP 500:",
+		`zotio attachments add: temporary parent "ABCD1234" was created but its file did not attach: connector saveAttachment: HTTP 500:`,
+	} {
+		info := ClassifyError(errors.New(text))
+		if info.Class != ErrorClassZoteroConnectorRefused {
+			t.Fatalf("class = %q for %q, want %q", info.Class, text, ErrorClassZoteroConnectorRefused)
+		}
+		if info.HTTPStatus != 0 {
+			t.Fatalf("status = %d, want 0: the connector failure is not a Zotero Web API status", info.HTTPStatus)
+		}
+	}
+}
+
 // A byte-exact cut produced hints like "attachments add requir", which reads as
 // corruption rather than elision.
 func TestSanitizeErrorHintCutsOnWordBoundary(t *testing.T) {

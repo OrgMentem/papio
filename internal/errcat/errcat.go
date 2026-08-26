@@ -221,6 +221,11 @@ func ExplainZotioImportError(errorClass string) (Explanation, bool) {
 			Category: "zotero_file_storage_refused",
 			Guidance: "Papio has the paper and the PDF is safe in its own store; nothing is corrupted. Zotero returned HTTP 413 for the file upload without naming a reason, so papio is not guessing one. Zotero says so explicitly when a storage plan is full, and this response did not, which leaves a size or request limit on whatever serves Zotero's file uploads as the likelier cause. Check whether Zotero's own Sync pane reports the same failure — if it does, the problem is upstream of papio. Setting attachment_mode = \"linked-file\" under [zotio] sidesteps uploads entirely by linking the PDF papio already holds (linked files do not sync to other devices and break if the file moves).",
 		}, true
+	case zotio.ErrorClassZoteroConnectorRefused:
+		return Explanation{
+			Category: "zotero_connector_refused",
+			Guidance: "Papio has the paper and the PDF is safe in its own store; nothing is corrupted. Zotero desktop rejected the save that hands it the file, and that route is the only one that files bytes into a file store other than Zotero's own cloud — so papio will not switch to the cloud upload behind your back. Zotero must be running for it. When it is running and the save still fails, the fault is inside Zotero: restart it, then read one item through its local API (http://127.0.0.1:23119/api/users/0/items?limit=1). HTTP 500 there means Zotero's own item layer is broken, which a plugin update can do, and no papio setting will help until it reads items again. Papio retries this filing on its own once Zotero recovers.",
+		}, true
 	default:
 		return Explanation{}, false
 	}

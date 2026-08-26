@@ -215,6 +215,20 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A refused Zotero filing now says which of two very different things went
+  wrong.** Both failures used to arrive as `unknown` with the explanation cut
+  mid-word, so the same message covered "your library keeps files somewhere
+  Zotero's upload cannot reach" and "Zotero itself is broken right now". The
+  first refusal was recognised only when *papio* could read *zotio*'s machine
+  envelope; the plain error line beside it, which is what *papio* usually holds,
+  names the same cause and went unrecognised. The second was never recognised at
+  all: when Zotero desktop rejects the hand-off that files bytes into your own
+  file store, that is the only route that respects your storage choice, so
+  *papio* will not quietly upload to Zotero's cloud instead. It now names the
+  fault, tells you to restart Zotero and read one item back from its own local
+  API to see whether Zotero's item layer is the thing that is broken — a plugin
+  update can break it — and keeps retrying the filing by itself afterwards. The
+  paper is in *papio*'s store throughout; nothing is lost either way.
 - **Papers already filed in Zotero no longer sit in the queue as unfinished.**
   Twenty-six papers on the author's own library had been delivered — the PDF
   attached, the item created — and still read as outstanding for between 34 and
