@@ -43,6 +43,19 @@ for the full pre-split extension history.
   signing in changes.
 
 ### Fixed
+- **An open-access Elsevier paper is no longer left for you to fetch.** On a
+  free-to-read ScienceDirect article the **View PDF** button points somewhere
+  slightly different from the one on a subscription article, and *papio* only
+  recognised the subscription shape. So the one kind of Elsevier paper that
+  needs no sign-in at all was the kind *papio* handed back to you. It now
+  reads both. It still only ever reads the button belonging to the paper you
+  asked for: the same page carries PDF buttons for three suggested other
+  articles, and those are never followed.
+- **A paper that arrives after a sign-in is no longer ignored.** When a library
+  route passed through a sign-in page on its way to the file, *papio* kept
+  waiting for a sign-in that had already finished, while the paper itself sat
+  open on screen unfiled. Arriving at the paper is now treated as proof that
+  the sign-in is behind you.
 - **Elsevier's dead institutional return is no longer mistaken for a live
   sign-in.** After a valid library sign-in, Elsevier can end its own
   organization-choice flow at an opaque `/resume/as/authorization.ping` page
