@@ -925,7 +925,7 @@ func TestRepairParkWithActionRejectsMalformedBinding(t *testing.T) {
 	}
 }
 
-func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int64, int64) {
+func parkReview(t *testing.T, js *Store, requestID, kind string) (string, int64, int64) {
 	t.Helper()
 	ctx := context.Background()
 	id, err := js.CreateRequest(ctx, requestID, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
@@ -962,7 +962,7 @@ func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int6
 	if err := js.MarkCandidate(ctx, candidate.ID, "skipped"); err != nil {
 		t.Fatal(err)
 	}
-	actionID, err := js.OpenHumanAction(ctx, id, "verify_identity", "local quarantine file: /tmp/paper.pdf", Access(false, ""),
+	actionID, err := js.OpenHumanAction(ctx, id, kind, "local quarantine file: /tmp/paper.pdf", Access(false, ""),
 		WithHumanActionBinding(HumanActionBinding{
 			CandidateID: candidate.ID, QuarantinePath: "/tmp/paper.pdf",
 			QuarantineSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -972,6 +972,34 @@ func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int6
 		t.Fatal(err)
 	}
 	return id, candidate.ID, actionID
+}
+
+func parkIdentityReview(t *testing.T, js *Store, requestID string) (string, int64, int64) {
+	t.Helper()
+	return parkReview(t, js, requestID, "verify_identity")
+}
+
+// An accepted unsafe-PDF review carries the same binding and must be reusable
+// through the same path: papio holds the file the operator approved, so
+// re-resolving a stale URL instead of reading it loses the paper.
+func TestAcceptedReviewBindingReusesAnAcceptedUnsafePDF(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	js := testStore(t)
+	ctx := context.Background()
+	id, candidateID, actionID := parkReview(t, js, "wr_unsafe_binding", "unsafe_pdf")
+	if resolution, err := js.ResolveReviewCAS(ctx, ResolveReviewInput{
+		ActionID: actionID, Verdict: "accept", ExpectedRevision: 1, ExpectedSHA256: sha,
+	}); err != nil || resolution.Outcome != ReviewApplied {
+		t.Fatalf("ResolveReviewCAS() = %+v, %v", resolution, err)
+	}
+	binding, err := js.AcceptedReviewBinding(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding == nil || binding.CandidateID != candidateID ||
+		binding.QuarantinePath != "/tmp/paper.pdf" || binding.QuarantineSHA256 != sha {
+		t.Fatalf("binding = %+v, want the approved unsafe-PDF file", binding)
+	}
 }
 
 func TestResolveReviewCASOutcomes(t *testing.T) {

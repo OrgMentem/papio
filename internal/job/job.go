@@ -2517,7 +2517,14 @@ type HumanActionBinding struct {
 }
 
 // AcceptedReviewBinding returns the pending candidate and quarantined file
-// preserved by the latest accepted identity review, if it remains reusable.
+// preserved by the latest accepted review, if it remains reusable.
+//
+// Both review kinds that carry a binding qualify. Restricting this to
+// verify_identity made an accepted unsafe-PDF review re-resolve instead:
+// measured live 2026-08-27, a paper whose resolver URL had gone stale reached
+// `missing_live_candidate_after_recovery` and parked for a fresh browser
+// handoff, while the file the operator had just approved sat in quarantine
+// unread.
 func (js *Store) AcceptedReviewBinding(ctx context.Context, jobID string) (*HumanActionBinding, error) {
 	var binding HumanActionBinding
 	err := js.S.DB().QueryRowContext(ctx, `
@@ -2525,7 +2532,7 @@ func (js *Store) AcceptedReviewBinding(ctx context.Context, jobID string) (*Huma
 		FROM human_actions ha
 		JOIN candidates c ON c.id = ha.candidate_id AND c.job_id = ha.job_id
 		WHERE ha.job_id = ?
-		  AND ha.kind = 'verify_identity'
+		  AND ha.kind IN ('verify_identity', 'unsafe_pdf')
 		  AND ha.status = 'resolved'
 		  AND c.review_override = 1
 		  AND c.status = 'pending'
